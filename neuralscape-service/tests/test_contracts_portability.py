@@ -1874,7 +1874,7 @@ def test_nested_mapping_cannot_repair_initially_invalid_model_storage() -> None:
         validate_portable_manifest(manifest)
 
     assert raised.value.errors()[0]["loc"] == ("manifest_id",)
-    assert repairing_producer.item_calls == 2
+    assert repairing_producer.item_calls == 1  # a public view is observed once and replayed, never re-read
 
 
 def test_nested_mapping_with_initially_valid_model_storage_remains_valid() -> None:
@@ -1887,7 +1887,7 @@ def test_nested_mapping_with_initially_valid_model_storage_remains_valid() -> No
 
     assert revalidated.manifest_id == "manifest-7"
     assert revalidated.producer.implementation == "reference-exporter"
-    assert repairing_producer.item_calls == 2
+    assert repairing_producer.item_calls == 1  # a public view is observed once and replayed, never re-read
 
 
 @pytest.mark.parametrize(
@@ -1964,7 +1964,7 @@ def test_supported_hook_cannot_repair_frozen_model_storage(
     if hook_kind == "fields-set":
         assert hook.iteration_calls == 1
     else:
-        assert hook.item_calls == 2
+        assert hook.item_calls == 1  # a public view is observed once and replayed, never re-read
 
 
 @pytest.mark.parametrize(
@@ -2079,7 +2079,7 @@ def test_supported_hook_cannot_change_frozen_native_list_edge(
     if hook_kind == "fields-set":
         assert hook.iteration_calls == 1
     elif hook_kind == "mapping":
-        assert hook.item_calls == 2
+        assert hook.item_calls == 1  # a public view is observed once and replayed, never re-read
     else:
         assert hook.hash_calls >= 1
 
@@ -2159,13 +2159,15 @@ def test_list_subclass_public_view_remains_authoritative(
             validate_portable_manifest(manifest)
         assert raised.value.errors()[0]["loc"] == ("files", 0, "path")
 
-    assert files.iteration_calls == 2
+    assert files.iteration_calls == 1  # a public view is observed once and replayed, never re-read
 
 
 @pytest.mark.parametrize("late_container_kind", ["dict", "list"])
 def test_list_subclass_cannot_introduce_unvalidated_exact_container(
     late_container_kind: str,
 ) -> None:
+    # A later traversal that would expose a different container is never made:
+    # the first observation of a public view is the one validated and replayed.
     manifest = validate_portable_manifest(valid_manifest()).model_copy(deep=True)
     files = LateExactContainerFilesList(
         tuple(manifest.files),
@@ -2174,41 +2176,26 @@ def test_list_subclass_cannot_introduce_unvalidated_exact_container(
     native_manifest = _PYDANTIC_DICT_DESCRIPTOR.__get__(manifest, BaseModel)
     dict.__setitem__(native_manifest, "files", files)
 
-    with pytest.raises(ValidationError) as raised:
-        validate_portable_manifest(manifest)
+    revalidated = validate_portable_manifest(manifest)
 
-    errors = raised.value.errors()
-    assert len(errors) == 1
-    assert errors[0]["type"] == "value_error"
-    assert errors[0]["loc"] == ()
-    assert isinstance(raised.value.__cause__, ValueError)
-    assert "contract container was not present in the validated graph" in str(
-        raised.value.__cause__
-    )
-    assert files.iteration_calls == 2
+    assert [item.path for item in revalidated.files] == [item.path for item in files.public_items]
+    assert all(type(item) is ManifestFile for item in revalidated.files)
+    assert files.iteration_calls == 1
 
 
 def test_transient_exact_container_owner_survives_public_iterations() -> None:
+    # The transient container from the first (only) observation is retained with
+    # the observation, so its identity cannot be reused before reconstruction.
     manifest = validate_portable_manifest(valid_manifest()).model_copy(deep=True)
     files = TransientExactContainerFilesList(tuple(manifest.files))
     native_manifest = _PYDANTIC_DICT_DESCRIPTOR.__get__(manifest, BaseModel)
     dict.__setitem__(native_manifest, "files", files)
 
-    with pytest.raises(ValidationError) as raised:
-        validate_portable_manifest(manifest)
+    revalidated = validate_portable_manifest(manifest)
 
-    errors = raised.value.errors()
-    assert len(errors) == 1
-    assert errors[0]["type"] == "value_error"
-    assert errors[0]["loc"] == ()
-    assert isinstance(raised.value.__cause__, ValueError)
-    assert "contract container was not present in the validated graph" in str(
-        raised.value.__cause__
-    )
-    assert files.iteration_calls == 2
-    assert files.first_id is not None
-    assert files.second_id is not None
-    assert files.first_id != files.second_id
+    assert revalidated.files[0].path == files.public_items[0].path  # not the later blanked path
+    assert files.iteration_calls == 1
+    assert files.first_id is not None and files.second_id is None
 
 
 @pytest.mark.parametrize(
@@ -2382,33 +2369,23 @@ def test_model_inventories_require_exact_owner_identity(
 def test_transient_model_owner_survives_validation_and_reconstruction(
     replacement_path: str,
 ) -> None:
+    # The transient model yielded by the only observation is kept alive by that
+    # observation until reconstruction finishes, then released.
     manifest = validate_portable_manifest(valid_manifest()).model_copy(deep=True)
     files = TransientModelFilesList(tuple(manifest.files), replacement_path)
     native_manifest = _PYDANTIC_DICT_DESCRIPTOR.__get__(manifest, BaseModel)
     dict.__setitem__(native_manifest, "files", files)
 
-    with pytest.raises(ValidationError) as raised:
-        validate_portable_manifest(manifest)
+    revalidated = validate_portable_manifest(manifest)
 
-    errors = raised.value.errors()
-    assert len(errors) == 1
-    assert errors[0]["type"] == "value_error"
-    assert errors[0]["loc"] == ()
-    assert isinstance(raised.value.__cause__, ValueError)
-    assert "contract model was not present in the validated graph" in str(
-        raised.value.__cause__
-    )
-    assert files.iteration_calls == 2
+    assert revalidated.files[0].path == manifest.files[0].path
+    assert files.iteration_calls == 1
     assert files.first_reference is not None
     assert files.first_live_during_walk is True
-    assert files.first_live_during_rebuild is True
-    assert files.first_id is not None
-    assert files.second_id is not None
-    assert files.first_id != files.second_id
+    assert files.second_id is None
 
     first_reference = files.first_reference
-    del errors
-    del raised
+    del revalidated
     gc.collect()
     assert first_reference() is None
 
@@ -3467,3 +3444,147 @@ def test_no_exact_type_test_in_the_module_uses_tuple_membership() -> None:
                 ):
                     offenders.append(node.lineno)
     assert offenders == [], f"type membership via == at lines {offenders}"
+
+
+# --- review findings: every public observation is bounded; reconstruction is linear ---
+
+
+class _EndlessExtra(Mapping):
+    """A custom extra-storage mapping whose public views never end."""
+
+    def __init__(self, mode: str) -> None:
+        self.mode = mode
+
+    def __getitem__(self, key):
+        return key
+
+    def __len__(self) -> int:
+        return 1
+
+    def __iter__(self):
+        index = 0
+        while True:
+            yield f"name_{index}"
+            index += 1
+
+    def items(self):
+        if self.mode == "names":
+            return iter(())
+        return ((f"name_{i}", i) for i in iter(int, 1))
+
+
+@pytest.mark.parametrize("mode", ["names", "items"])
+def test_an_endless_custom_extra_mapping_is_stopped_by_the_budget(mode) -> None:
+    manifest = validate_portable_manifest(valid_manifest()).model_copy(deep=True)
+    _PYDANTIC_EXTRA_SLOT.__set__(manifest, _EndlessExtra(mode))
+    _assert_budget_rejection(manifest)
+
+
+def test_an_endless_fields_set_is_stopped_by_the_budget() -> None:
+    import itertools
+
+    manifest = validate_portable_manifest(valid_manifest()).model_copy(deep=True)
+    _PYDANTIC_FIELDS_SET_SLOT.__set__(manifest, itertools.repeat("manifest_id"))
+    _assert_budget_rejection(manifest)
+
+
+def test_a_finite_non_set_fields_set_keeps_its_ordinary_outcome() -> None:
+    manifest = validate_portable_manifest(valid_manifest()).model_copy(deep=True)
+    names = list(_PYDANTIC_FIELDS_SET_SLOT.__get__(manifest, type(manifest)))
+    _PYDANTIC_FIELDS_SET_SLOT.__set__(manifest, tuple(names))
+    validate_portable_manifest(manifest)  # a tuple of declared names is still fine
+
+
+def test_a_native_fields_set_is_not_charged_twice(monkeypatch) -> None:
+    manifest = validate_portable_manifest(valid_manifest())
+    _, edges_set = _budget_measure_ok(monkeypatch, manifest)
+    copy = manifest.model_copy(deep=True)
+    _PYDANTIC_FIELDS_SET_SLOT.__set__(copy, frozenset(_PYDANTIC_FIELDS_SET_SLOT.__get__(manifest, type(manifest))))
+    _, edges_frozen = _budget_measure_ok(monkeypatch, copy)
+    # a set is charged once at discovery; a non-set is charged once, per yielded name, at the walk
+    assert edges_set == edges_frozen
+
+
+def _budget_measure_ok(monkeypatch, manifest) -> tuple[int, int]:
+    _RecordingBudget.instances = []
+    monkeypatch.setattr(contracts_portability, "DiscoveryBudget", _RecordingBudget)
+    validate_portable_manifest(manifest)
+    budget = _RecordingBudget.instances[-1]
+    monkeypatch.undo()
+    return budget.nodes, budget.edges
+
+
+def test_shared_native_substructure_is_reconstructed_once_per_object() -> None:
+    import time
+
+    child: object = []
+    for _ in range(40):  # 2**40 paths, 40 nodes
+        child = [child, child]
+    manifest = _manifest_with_files(child)
+    started = time.monotonic()
+    with pytest.raises(ValidationError) as raised:
+        validate_portable_manifest(manifest)
+    assert time.monotonic() - started < 5
+    assert str(raised.value.__cause__) != contracts_portability.DISCOVERY_BUDGET_MESSAGE if hasattr(
+        contracts_portability, "DISCOVERY_BUDGET_MESSAGE") else True
+
+
+def test_a_public_view_is_observed_once_and_replayed() -> None:
+    """A public iterator that changes (here: becomes endless) after its first traversal."""
+
+    entry = {"path": "canonical/a.txt", "size_bytes": 1,
+             "checksum": {"algorithm": "sha256", "digest": "a" * 64}, "entry_type": "file"}
+
+    class ChangesAfterFirstLook(list):
+        traversals = 0
+
+        def __iter__(self):
+            type(self).traversals += 1
+            if type(self).traversals == 1:
+                return iter([entry])
+            def forever():
+                while True:
+                    yield entry
+            return forever()
+
+    view = ChangesAfterFirstLook()
+    manifest = _manifest_with_files(view)
+    with pytest.raises(ValidationError):  # a list subclass of one entry: still invalid as a file list type
+        validate_portable_manifest(manifest)
+    assert ChangesAfterFirstLook.traversals == 1
+
+
+def test_a_shared_public_view_reached_by_two_edges_is_replayed_identically() -> None:
+    entry = {"path": "canonical/a.txt", "size_bytes": 1,
+             "checksum": {"algorithm": "sha256", "digest": "a" * 64}, "entry_type": "file"}
+    looks: list[int] = []
+
+    class Counting(list):
+        def __iter__(self):
+            looks.append(1)
+            return iter([entry])
+
+    shared = Counting()
+    manifest = _manifest_with_files([shared, shared])
+    with pytest.raises(ValidationError):
+        validate_portable_manifest(manifest)
+    assert len(looks) == 1
+
+
+def test_reconstruction_still_detects_cycles_after_memoization() -> None:
+    cycle: list[object] = []
+    cycle.append(cycle)
+    with pytest.raises(ValidationError):
+        validate_portable_manifest(_manifest_with_files([cycle, cycle]))
+
+
+def test_a_valid_manifest_with_shared_models_still_validates() -> None:
+    document = valid_manifest()
+    manifest = validate_portable_manifest(document)
+    shared_checksum = manifest.files[0].checksum
+    copy = manifest.model_copy(deep=True)
+    files = list(copy.files)
+    files[1] = files[1].model_copy(update={"checksum": shared_checksum})
+    copy = copy.model_copy(update={"files": files})
+    validated = validate_portable_manifest(copy)
+    assert validated.files[1].checksum.digest == shared_checksum.digest

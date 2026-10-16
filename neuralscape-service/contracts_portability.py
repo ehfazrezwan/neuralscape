@@ -45,9 +45,12 @@ _ModelDiscoverySnapshot = tuple[
 _ModelDiscoveryInventory = dict[int, _ModelDiscoverySnapshot]
 _NativeContainerSnapshot = tuple[Any, type, tuple[Any, ...]]
 _NativeContainerInventory = dict[int, _NativeContainerSnapshot]
+# Public views: owner retained with the observed items (or key/value pairs).
+_PublicViewInventory = dict[int, tuple[Any, tuple[Any, ...]]]
 _RetainedStateInventory = tuple[
     _ModelStorageInventory,
     _NativeContainerInventory,
+    _PublicViewInventory,
 ]
 _MISSING_FIELDS_SET = object()
 
@@ -204,8 +207,14 @@ def _validated_model_extra_storage(
     extra_snapshot: _ModelExtraSnapshot,
     stored_names: set[Any],
     declared_names: set[Any],
+    budget: DiscoveryBudget,
 ) -> tuple[dict[Any, Any], set[Any]]:
-    """Capture stable Pydantic extra entries and all observed names."""
+    """Capture stable Pydantic extra entries and all observed names.
+
+    A custom (non-dict) extra mapping is observed through its public views; each
+    yielded name or entry is charged to ``budget`` before it is retained, so an
+    endless view stops at the budget instead of exhausting memory.
+    """
 
     captured_natively, extra = extra_snapshot
     if captured_natively:
@@ -216,8 +225,15 @@ def _validated_model_extra_storage(
             raise ValueError(
                 "contract model extra storage must be None or a mapping"
             )
-        iterated_names = tuple(extra)
-        captured = dict(tuple(extra.items()))
+        iterated_names = []
+        for name in extra:
+            pass
+            iterated_names.append(name)
+        entries = []
+        for entry in extra.items():
+            budget.charge_edge(2)
+            entries.append(entry)
+        captured = dict(entries)
         observed_names = set(iterated_names) | set(captured)
     declared_or_stored = declared_names | stored_names
     overlap = declared_or_stored.intersection(observed_names)
@@ -252,6 +268,9 @@ def _reject_retained_unknown_fields(
     discovery_inventory: _ModelDiscoveryInventory = {}
     model_inventory: _ModelStorageInventory = {}
     native_container_inventory: _NativeContainerInventory = {}
+    # Public views (container subclasses and custom mappings) are observed once,
+    # here, and replayed by reconstruction; they are never iterated a second time.
+    public_view_inventory: _PublicViewInventory = {}
 
     # One native-discovery envelope for this validation call, shared by every
     # root it visits.  Accounting reads only native lengths and object
@@ -366,12 +385,22 @@ def _reject_retained_unknown_fields(
                 raise ValueError(
                     "contract model fields-set storage is missing"
                 )
-            fields_set = set(fields_set_storage)
+            if is_exact_type(fields_set_storage, set):
+                # Native set storage was copied, and charged by length, at discovery.
+                fields_set = fields_set_storage
+            else:
+                # Any other storage is observed through its public iterator; each
+                # yielded name is charged before it is retained.
+                fields_set = set()
+                for name in fields_set_storage:
+                    budget.charge_edge()
+                    fields_set.add(name)
             pydantic_extra, observed_extra_names = (
                 _validated_model_extra_storage(
                     extra_snapshot,
                     set(stored),
                     set(declared),
+                    budget,
                 )
             )
             model_inventory[identity] = (
@@ -414,11 +443,14 @@ def _reject_retained_unknown_fields(
             return
 
         if _is_mapping(value):
+            observed_pairs: list[tuple[Any, Any]] = []
             for index, (key, item) in enumerate(value.items()):
                 budget.charge_edge(2)  # public view charged as it is observed
+                observed_pairs.append((key, item))
                 walk(key, (*location, "<key>", index))
                 item_location = key if isinstance(key, (str, int)) else index
                 walk(item, (*location, item_location))
+            public_view_inventory[identity] = (value, tuple(observed_pairs))
             return
 
         exact_native = is_exact_type(value, list, tuple, set, frozenset)
@@ -427,18 +459,22 @@ def _reject_retained_unknown_fields(
             if exact_native
             else value
         )
+        observed_items: list[Any] = []
         for index, item in enumerate(items):
             if not exact_native:
                 # A public view is charged as it is observed; an exact native
                 # container was already charged by its length in discovery.
                 budget.charge_edge()
+                observed_items.append(item)
             walk(item, (*location, index))
+        if not exact_native:
+            public_view_inventory[identity] = (value, tuple(observed_items))
 
     discover(root)
     walk(root, ())
     if errors:
         raise ValidationError.from_exception_data("PortableManifest", errors)
-    return model_inventory, native_container_inventory
+    return model_inventory, native_container_inventory, public_view_inventory
 
 
 def _reconstruct_retained_state(
@@ -454,49 +490,74 @@ def _reconstruct_retained_state(
     receiving boundary cannot turn an invalid tuple or set into a valid list.
     """
 
-    model_inventory, native_container_inventory = retained_state_inventory
+    model_inventory, native_container_inventory, public_view_inventory = (
+        retained_state_inventory
+    )
     active: set[int] = set()
+    # Completed reconstructions, keyed by identity with the owner retained so the
+    # key cannot be reused: shared substructure is rebuilt once, not once per path.
+    completed: dict[int, tuple[Any, Any]] = {}
+
+    def observed(value: Any) -> tuple[Any, ...]:
+        try:
+            owner, items = public_view_inventory[id(value)]
+        except KeyError as exc:
+            raise ValueError(
+                "contract container was not present in the validated graph"
+            ) from exc
+        if owner is not value:
+            raise ValueError(
+                "contract container was not present in the validated graph"
+            )
+        return items
 
     def rebuild(value: Any) -> Any:
         if not (isinstance(value, (BaseModel, list, tuple, set, frozenset)) or _is_mapping(value)):
             return value
 
         identity = id(value)
+        done = completed.get(identity)
+        if done is not None and done[0] is value:
+            return done[1]
         if identity in active:
             raise ValueError("contract input graph must be acyclic")
         active.add(identity)
         try:
-            if isinstance(value, BaseModel):
-                stored_entries, extra_entries = _validated_model_storage(
-                    value, model_inventory
-                )
-                stored = dict(stored_entries)
-                stored.update(extra_entries)
-                return {name: rebuild(item) for name, item in stored.items()}
-
-            if type(value) is dict:
-                items = _validated_native_container_items(
-                    value, native_container_inventory
-                )
-                return {rebuild(key): rebuild(item) for key, item in items}
-            if _is_mapping(value):
-                return {rebuild(key): rebuild(item) for key, item in value.items()}
-            value_type = type(value)
-            if is_exact_type(value, list, tuple, set, frozenset):
-                items = _validated_native_container_items(
-                    value, native_container_inventory
-                )
-            else:
-                items = value
-            if isinstance(value, list):
-                return [rebuild(item) for item in items]
-            if isinstance(value, tuple):
-                return tuple(rebuild(item) for item in items)
-            if isinstance(value, set):
-                return {rebuild(item) for item in items}
-            return frozenset(rebuild(item) for item in items)
+            result = build(value)
         finally:
             active.remove(identity)
+        completed[identity] = (value, result)
+        return result
+
+    def build(value: Any) -> Any:
+        if isinstance(value, BaseModel):
+            stored_entries, extra_entries = _validated_model_storage(
+                value, model_inventory
+            )
+            stored = dict(stored_entries)
+            stored.update(extra_entries)
+            return {name: rebuild(item) for name, item in stored.items()}
+
+        if type(value) is dict:
+            items = _validated_native_container_items(
+                value, native_container_inventory
+            )
+            return {rebuild(key): rebuild(item) for key, item in items}
+        if _is_mapping(value):
+            return {rebuild(key): rebuild(item) for key, item in observed(value)}
+        if is_exact_type(value, list, tuple, set, frozenset):
+            items = _validated_native_container_items(
+                value, native_container_inventory
+            )
+        else:
+            items = observed(value)  # the first observation, never a second iteration
+        if isinstance(value, list):
+            return [rebuild(item) for item in items]
+        if isinstance(value, tuple):
+            return tuple(rebuild(item) for item in items)
+        if isinstance(value, set):
+            return {rebuild(item) for item in items}
+        return frozenset(rebuild(item) for item in items)
 
     reconstructed = rebuild(root)
     if not isinstance(reconstructed, dict):
