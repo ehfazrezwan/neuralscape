@@ -8,7 +8,7 @@ projection.  Callers must establish those runtime properties separately.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from enum import Enum
 from collections.abc import Iterator
 from typing import Annotated, Any, Literal, TypeVar
@@ -18,9 +18,13 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    Strict,
+    WrapValidator,
     field_validator,
     model_validator,
 )
+
+from pydantic_core import PydanticCustomError
 
 from contracts_bodies import MemoryBody, OpaqueEnvelopeBody, PlaintextBody
 from contracts_common import ContractModel, OpaqueId, SafeCounter, VersionedContract
@@ -132,6 +136,49 @@ def _reserve_entries(budget: DiscoveryBudget, count: int) -> None:
 
 
 _UTC_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
+
+_DATE_FIELDS = tuple(date.__dict__[name] for name in ("year", "month", "day"))
+_TIME_FIELDS = tuple(datetime.__dict__[name] for name in ("hour", "minute", "second", "microsecond"))
+
+
+def _pinned_offset(value: object) -> object:
+    """Read a timestamp's UTC offset exactly once and return a fixed-offset copy of it.
+
+    A caller's ``tzinfo`` is asked for its offset when the value is validated and again whenever
+    it is compared, and a zone with state can answer differently each time, so ordering could
+    see another instant than validation did.  The copy carries the one answer as a fixed offset
+    (an exact ``datetime``, fields read through the base descriptors), so every later read of it
+    agrees.  A value with no offset becomes naive and is refused as such; anything that is not a
+    ``datetime`` (JSON text, for one) is left to the field's own validation.
+    """
+
+    if not isinstance(value, datetime):
+        return value
+    try:
+        offset = datetime.utcoffset(value)
+        fields = [descriptor.__get__(value) for descriptor in _DATE_FIELDS + _TIME_FIELDS]
+        return datetime(*fields, tzinfo=None if offset is None else timezone(offset))
+    except Exception as error:  # a zone that cannot answer, or answers out of range
+        raise ValueError("timestamp offset could not be read as a valid UTC offset") from error
+
+
+def _pin_timestamp(value: object, handler: Any, info: Any) -> object:
+    """Validate a timestamp from its one offset read (``_pinned_offset``).
+
+    Python input must be a ``datetime`` (as in strict mode); JSON input must be text, parsed by
+    the field's own validation.  The field is not strict itself only because a wrapped strict
+    field would refuse JSON text.
+    """
+
+    if isinstance(value, datetime):
+        return handler(_pinned_offset(value))
+    if info.mode == "json" and isinstance(value, str):
+        return handler(value)
+    raise PydanticCustomError("datetime_type", "Input should be a valid datetime")
+
+
+# An aware timestamp whose offset is read exactly once: validation and every comparison use it.
+PinnedAwareDatetime = Annotated[AwareDatetime, Strict(False), WrapValidator(_pin_timestamp)]
 
 
 def _utc_instant_before(earlier: datetime, later: datetime) -> bool:
@@ -575,8 +622,8 @@ class MemoryRecord(VersionedContract):
     required_parents: tuple[SourceVersion, ...]
     successor_id: OpaqueId | None
     retention_hold_ids: tuple[OpaqueId, ...]
-    occurred_at: AwareDatetime | None
-    recorded_at: AwareDatetime
+    occurred_at: PinnedAwareDatetime | None
+    recorded_at: PinnedAwareDatetime
 
     @model_validator(mode="after")
     def validate_record_semantics(self) -> MemoryRecord:
@@ -671,7 +718,7 @@ class Intent(VersionedContract):
     source_preconditions: tuple[SourceVersion, ...]
     stage_requirements: tuple[StageEvidenceRequirement, ...]
     correlation_id: OpaqueId
-    accepted_at: AwareDatetime
+    accepted_at: PinnedAwareDatetime
 
     @model_validator(mode="after")
     def validate_stage_requirements(self) -> Intent:
@@ -776,8 +823,8 @@ class StageReceipt(VersionedContract):
     committed_sources: tuple[SourceVersion, ...]
     output_refs: tuple[ReferenceHandle, ...]
     error: StageError | None
-    started_at: AwareDatetime | None
-    finished_at: AwareDatetime | None
+    started_at: PinnedAwareDatetime | None
+    finished_at: PinnedAwareDatetime | None
     # Additive (default empty, so receipts written before this field existed still parse): the
     # upstream applications this stage consumed.  Only APPLIED receipts may carry them.
     upstream_applications: tuple[UpstreamApplication, ...] = ()
