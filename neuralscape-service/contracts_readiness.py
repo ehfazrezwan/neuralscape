@@ -6,7 +6,7 @@ derived from process liveness, object construction, or another capability.
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Literal
 
 from pydantic import AwareDatetime, TypeAdapter, model_validator
@@ -130,11 +130,14 @@ def capability_is_ready(
     validated_max_age = _SAFE_COUNTER_ADAPTER.validate_python(
         max_probe_age_seconds, strict=True
     )
-    if validated_evaluation_time < observation.observed_at:
+    # Aware datetimes that share one tzinfo object are compared and subtracted
+    # in wall time, which misorders and mis-ages values around a daylight-saving
+    # fold or gap.  Order and age are measured on the absolute (UTC) timeline.
+    evaluated_utc = validated_evaluation_time.astimezone(timezone.utc)
+    observed_utc = observation.observed_at.astimezone(timezone.utc)
+    if evaluated_utc < observed_utc:
         raise ValueError("evaluated_at cannot precede observed_at")
-    age_seconds = (
-        validated_evaluation_time - observation.observed_at
-    ).total_seconds()
+    age_seconds = (evaluated_utc - observed_utc).total_seconds()
     return observation.status == "healthy" and age_seconds <= validated_max_age
 
 

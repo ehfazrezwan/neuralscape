@@ -2372,3 +2372,78 @@ def test_budget_error_is_value_free() -> None:
         validate_operation_transition(operation(), huge)
     assert secret not in str(raised.value)
     assert str(raised.value) == BUDGET_MESSAGE
+
+
+# ---------------------------------------------------------------------------
+# Rebuild is bounded by distinct objects; precedence survives an exhausted envelope.
+# ---------------------------------------------------------------------------
+
+
+def _shared_list_chain(depth: int) -> list:
+    node: list = []
+    for _ in range(depth):
+        node = [node, node]  # 2**depth paths over `depth` distinct lists
+    return node
+
+
+def test_rebuild_work_is_linear_in_distinct_objects() -> None:
+    import time
+
+    shared = operation().model_copy(update={"resource_manifests": _shared_list_chain(60)})
+    started = time.monotonic()
+    with pytest.raises(ValidationError):
+        validate_operation_transition(operation(), shared)
+    assert time.monotonic() - started < 2.0
+
+
+def test_rebuild_of_shared_exact_children_keeps_values() -> None:
+    shared = manifest()
+    current = operation(observed_state="running").model_copy(
+        update={"resource_manifests": [shared, shared]}
+    )
+    with pytest.raises(ValidationError):  # duplicate manifest identity is still rejected
+        validate_operation_transition(operation(), current)
+
+
+def test_public_view_chain_is_charged_per_observation_and_stays_bounded() -> None:
+    import time
+
+    class PublicPair(list):
+        def __init__(self, child):
+            super().__init__()  # empty native backing
+            self._child = child
+
+        def __iter__(self):
+            return iter((self._child, self._child))
+
+    node: object = []
+    for _ in range(40):
+        node = PublicPair(node)
+    hostile = operation().model_copy(update={"resource_manifests": node})
+    started = time.monotonic()
+    with pytest.raises(ValueError, match=BUDGET_MESSAGE):
+        validate_operation_transition(operation(), hostile)
+    assert time.monotonic() - started < 5.0
+
+
+def test_previous_public_view_error_is_kept_when_current_exhausts_the_capture_envelope(
+    monkeypatch,
+) -> None:
+    class PublicOnlyList(list):
+        def __init__(self, items):
+            super().__init__()  # native backing empty; the public view exposes the items
+            self._items = list(items)
+
+        def __iter__(self):
+            return iter(self._items)
+
+    bad_child = operation().resource_manifests[0]
+    _set_native_field(bad_child, "manifest_id", "")
+    previous = operation().model_copy(
+        update={"resource_manifests": PublicOnlyList([bad_child])}
+    )
+    over_budget_current = _operation_with_manifests(10, observed_state="running")
+    _with_tier(monkeypatch, nodes=6)
+
+    with pytest.raises(ValidationError):  # previous's own diagnostic outranks the budget error
+        validate_operation_transition(previous, over_budget_current)

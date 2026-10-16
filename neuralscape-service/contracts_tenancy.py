@@ -159,18 +159,28 @@ def _closed_graph_snapshot_session() -> tuple[
     capture of never-yet-exposed children is not promised.  Hidden native
     backing is never substituted for a public view.
 
-    One discovery budget covers every root captured through the returned
-    phases, so a previous and a current value share one envelope.  Native
-    capture is iterative and callback-free: it charges unique nodes, captured
-    edges (before copying them) and depth.  Entries observed through a public
-    view are charged as they are first observed.  Exceeding the budget raises
-    the stable budget error before any public view of the failing graph is read.
-    Rebuilding an already captured node does not touch the budget, so a root
-    whose capture succeeded keeps its own validation outcome when a later
-    root exhausts the envelope.
+    Two discovery envelopes cover a call, each shared by every root.  Native
+    capture of the entry state (a previous and a current value together) charges
+    the first: unique nodes, captured edges (before copying them) and depth,
+    iteratively and without callbacks.  Everything observed afterwards while
+    rebuilding (public-view entries, and nodes a public view exposes for the
+    first time) charges the second.  Keeping them apart means one root
+    exhausting the capture envelope cannot replace the diagnostics of another
+    root that was captured successfully: the previous value's own validation
+    error is still reported before a current value's budget error.  The call's
+    total bound is the sum of the two envelopes.  Exceeding either raises the
+    stable budget error before any public view of the failing graph is read in
+    that phase.
+
+    Rebuilding copies a subtree built only from native storage once per object
+    identity, so shared descendants cost work proportional to the distinct
+    objects, not to the number of paths.  A subtree that observed a public view
+    is never reused: every occurrence observes the view again and is charged.
     """
 
-    budget = DiscoveryBudget(STANDARD)
+    capture_budget = DiscoveryBudget(STANDARD)
+    view_budget = DiscoveryBudget(STANDARD)
+    budget = capture_budget  # envelope charged by the phase currently running
     frozen_models: dict[int, tuple[object, bool, object]] = {}
     frozen_containers: dict[int, object] = {}
     native_children: dict[int, tuple[object, ...]] = {}
@@ -256,18 +266,47 @@ def _closed_graph_snapshot_session() -> tuple[
             yield entry
 
     active: set[int] = set()
+    memo: dict[int, tuple[object, object]] = {}
+    phase_depth = 0
 
     def rebuild(item: object, depth: int = 0) -> object:
+        """Public rebuild phase: observations are charged to the view envelope."""
+
+        nonlocal budget, phase_depth
+        if phase_depth == 0:
+            budget = view_budget
+        phase_depth += 1
+        try:
+            return rebuild_node(item, depth)[0]
+        finally:
+            phase_depth -= 1
+            if phase_depth == 0:
+                budget = capture_budget
+
+    def rebuild_node(item: object, depth: int) -> tuple[object, bool]:
+        """Return ``(copy, reusable)``; reusable subtrees saw only native storage."""
+
         if not is_graph_node(item):
-            return item
+            return item, True
         item_type = type(item)
 
         identity = id(item)
+        cached = memo.get(identity)
+        if cached is not None and cached[0] is item:
+            return cached[1], True
         if identity not in native_children:
             freeze_native_graph(item, depth)
         if identity in active:
             raise ValueError("contract input graph must be acyclic")
         active.add(identity)
+        reusable = True
+
+        def child(value: object) -> object:
+            nonlocal reusable
+            copied, child_reusable = rebuild_node(value, depth + 1)
+            reusable = reusable and child_reusable
+            return copied
+
         try:
             if isinstance(item, BaseModel):
                 stored_entries, extras_are_native, frozen_extras = frozen_models[
@@ -287,6 +326,7 @@ def _closed_graph_snapshot_session() -> tuple[
                 elif not isinstance(frozen_extras, Mapping):
                     raise ValueError("contract extra storage must be a mapping")
                 else:
+                    reusable = False
                     observed_extra_length = len(frozen_extras)
                     iterated_extra_names = tuple(
                         name for name in charged(frozen_extras)
@@ -303,33 +343,26 @@ def _closed_graph_snapshot_session() -> tuple[
                     or extra_entries
                 ):
                     raise ValueError("contract input contains undeclared fields")
-                return {
-                    name: rebuild(field_value, depth + 1)
-                    for name, field_value in stored_entries
+                result: object = {
+                    name: child(field_value) for name, field_value in stored_entries
                 }
-            if isinstance(item, dict):
+            elif isinstance(item, dict):
+                exact = item_type is dict
+                reusable = exact
                 entries = (
-                    frozen_containers[identity]
-                    if item_type is dict
-                    else charged(item.items())
+                    frozen_containers[identity] if exact else charged(item.items())
                 )
-                return {
-                    key: rebuild(field_value, depth + 1)
-                    for key, field_value in entries
-                }
-            if isinstance(item, list):
-                items = (
-                    frozen_containers[identity]
-                    if item_type is list
-                    else charged(item)
-                )
-                return [rebuild(child, depth + 1) for child in items]
-            items = (
-                frozen_containers[identity]
-                if item_type is tuple
-                else charged(item)
-            )
-            return tuple(rebuild(child, depth + 1) for child in items)
+                result = {key: child(field_value) for key, field_value in entries}
+            else:
+                is_list = isinstance(item, list)
+                exact = item_type is (list if is_list else tuple)
+                reusable = exact
+                items = frozen_containers[identity] if exact else charged(item)
+                copied_items = [child(entry) for entry in items]
+                result = copied_items if is_list else tuple(copied_items)
+            if reusable:
+                memo[identity] = (item, result)
+            return result, reusable
         finally:
             active.remove(identity)
 

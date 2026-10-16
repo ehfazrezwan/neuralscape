@@ -1867,3 +1867,58 @@ def test_budget_error_is_value_free() -> None:
         _validate(candidate)
     assert secret not in str(raised.value)
     assert str(raised.value) == BUDGET_MESSAGE
+
+
+# ---------------------------------------------------------------------------
+# Ordering and age use absolute time, not wall time in a shared zone.
+# ---------------------------------------------------------------------------
+
+from zoneinfo import ZoneInfo  # noqa: E402
+
+_NEW_YORK = ZoneInfo("America/New_York")
+
+
+def _fold_observation(observed_at: datetime) -> CapabilityReadiness:
+    # Built from the datetime itself so the observation keeps its zone object.
+    return CapabilityReadiness(
+        schema_version="candidate-v1",
+        capability="exact_reads",
+        status="healthy",
+        observed_at=observed_at,
+    )
+
+
+def test_fold_does_not_make_a_stale_probe_ready() -> None:
+    # 2026-11-01 01:30 happens twice in New York: 05:30Z (fold=0) and 06:30Z (fold=1).
+    observed = datetime(2026, 11, 1, 1, 30, tzinfo=_NEW_YORK, fold=0)
+    evaluated = datetime(2026, 11, 1, 1, 35, tzinfo=_NEW_YORK, fold=1)  # 06:35Z: 65 minutes later
+    assert (evaluated - observed).total_seconds() == 300  # wall-time difference is wrong
+    observation = _fold_observation(observed)
+
+    assert capability_is_ready(observation, evaluated_at=evaluated, max_probe_age_seconds=600) is False
+    assert capability_is_ready(observation, evaluated_at=evaluated, max_probe_age_seconds=3900) is True
+
+
+def test_fold_does_not_reject_a_later_evaluation_as_preceding() -> None:
+    observed = datetime(2026, 11, 1, 1, 30, tzinfo=_NEW_YORK, fold=0)  # 05:30Z
+    evaluated = datetime(2026, 11, 1, 1, 10, tzinfo=_NEW_YORK, fold=1)  # 06:10Z: 40 minutes later
+    observation = _fold_observation(observed)
+
+    assert capability_is_ready(observation, evaluated_at=evaluated, max_probe_age_seconds=3600) is True
+
+
+def test_a_truly_earlier_evaluation_in_the_fold_is_still_rejected() -> None:
+    observed = datetime(2026, 11, 1, 1, 30, tzinfo=_NEW_YORK, fold=1)  # 06:30Z
+    evaluated = datetime(2026, 11, 1, 1, 45, tzinfo=_NEW_YORK, fold=0)  # 05:45Z: before the probe
+    with pytest.raises(ValueError, match="cannot precede"):
+        capability_is_ready(_fold_observation(observed), evaluated_at=evaluated, max_probe_age_seconds=3600)
+
+
+def test_mixed_zones_and_the_spring_gap_use_absolute_time() -> None:
+    observed = datetime(2026, 3, 8, 1, 30, tzinfo=_NEW_YORK)  # 06:30Z, before the gap
+    evaluated = datetime(2026, 3, 8, 3, 30, tzinfo=_NEW_YORK)  # 07:30Z, one hour later
+    observation = _fold_observation(observed)
+    assert capability_is_ready(observation, evaluated_at=evaluated, max_probe_age_seconds=3600) is True
+    assert capability_is_ready(observation, evaluated_at=evaluated, max_probe_age_seconds=3599) is False
+    utc_evaluated = datetime(2026, 3, 8, 7, 30, tzinfo=timezone.utc)
+    assert capability_is_ready(observation, evaluated_at=utc_evaluated, max_probe_age_seconds=3600) is True
