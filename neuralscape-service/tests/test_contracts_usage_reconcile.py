@@ -3735,3 +3735,206 @@ def test_independent_final_cancelled_root_does_not_infer_late_usage() -> None:
     result = reconcile_usage_events([independent])
 
     assert result.streams[0].late_after_cancellation is False
+
+
+# ── PR review follow-ups: determinism, bounded projection, public-view pin ──
+
+
+def _payload(**updates: object) -> dict[str, object]:
+    payload = _event().model_dump(mode="python")
+    payload.update(updates)
+    return payload
+
+
+def test_conflicting_id_error_names_smallest_id_for_every_input_order() -> None:
+    events = [
+        _event(event_id="b", attempt_id="attempt-b"),
+        _event(event_id="b", attempt_id="attempt-b", task_id="other-task"),
+        _event(event_id="a", attempt_id="attempt-a"),
+        _event(event_id="a", attempt_id="attempt-a", task_id="other-task"),
+    ]
+
+    messages = set()
+    for ordering in permutations(events):
+        with pytest.raises(UsageReconciliationError) as caught:
+            reconcile_usage_events(ordering)
+        assert caught.value.code == "conflicting_event_id"
+        messages.add(str(caught.value))
+
+    assert messages == {"conflicting_event_id: event ID a has two payloads"}
+
+
+def test_invalid_event_wins_over_conflict_regardless_of_position() -> None:
+    first = _event(event_id="a")
+    second = _event(event_id="a", task_id="other-task")
+    invalid = {"event_id": "broken"}
+
+    for ordering in permutations([first, second, invalid]):
+        with pytest.raises(UsageReconciliationError) as caught:
+            reconcile_usage_events(ordering)
+        assert caught.value.code == "invalid_event"
+
+
+class _CountingLeaf(Mapping[str, object]):
+    """A public-view mapping that counts how often its view is read."""
+
+    def __init__(self) -> None:
+        self.items_calls = 0
+
+    def __getitem__(self, key: str) -> object:
+        raise KeyError(key)
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(())
+
+    def __len__(self) -> int:
+        return 0
+
+    def items(self) -> ItemsView[str, object]:
+        self.items_calls += 1
+        return {}.items()
+
+
+def test_shared_descendants_are_projected_once_not_once_per_path() -> None:
+    leaf = _CountingLeaf()
+    shared: object = leaf
+    for _ in range(12):
+        shared = [shared, shared]  # 2**12 paths, 13 distinct objects
+    payload = _payload(attribution={**_payload()["attribution"], "recipients": shared})
+
+    assert _error_code([payload]) == "invalid_event"
+    assert leaf.items_calls == 1
+
+
+def test_deeply_shared_graph_is_rejected_in_bounded_time() -> None:
+    import threading
+
+    leaf = _CountingLeaf()
+    shared: object = leaf
+    for _ in range(80):  # 2**80 paths if projected per path
+        shared = [shared, shared]
+    payload = _payload(attribution={**_payload()["attribution"], "recipients": shared})
+    outcome: list[str] = []
+
+    worker = threading.Thread(
+        target=lambda: outcome.append(_error_code([payload])), daemon=True
+    )
+    worker.start()
+    worker.join(timeout=20)
+
+    assert not worker.is_alive(), "projection did not terminate in bounded time"
+    assert outcome == ["invalid_event"]
+    assert leaf.items_calls == 1
+
+
+class _HidingDict(dict[str, object]):
+    """Stored keys listed in ``hidden`` never appear in the public view."""
+
+    def __init__(self, entries: dict[str, object], hidden: tuple[str, ...]) -> None:
+        super().__init__(entries)
+        self.hidden = hidden
+        self.items_calls = 0
+
+    def items(self) -> ItemsView[str, object]:
+        self.items_calls += 1
+        return {
+            key: value for key, value in dict.items(self) if key not in self.hidden
+        }.items()
+
+
+class _ShowingDict(dict[str, object]):
+    """The public view lists an entry that is not stored."""
+
+    def __init__(self, entries: dict[str, object]) -> None:
+        super().__init__(entries)
+        self.items_calls = 0
+
+    def items(self) -> ItemsView[str, object]:
+        self.items_calls += 1
+        return {**dict.items(self), "invented": 1}.items()
+
+
+class _FlippingMapping(Mapping[str, object]):
+    """Public view that would give a different answer on any later read."""
+
+    def __init__(self, first: dict[str, object], later: dict[str, object]) -> None:
+        self.first = first
+        self.later = later
+        self.items_calls = 0
+
+    def __getitem__(self, key: str) -> object:
+        return self.later[key]
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self.later)
+
+    def __len__(self) -> int:
+        return len(self.later)
+
+    def items(self) -> ItemsView[str, object]:
+        self.items_calls += 1
+        return (self.first if self.items_calls == 1 else self.later).items()
+
+
+def test_public_view_decides_acceptance_like_plain_json_and_hides_nothing_stored() -> None:
+    clean = _payload()
+    expected = reconcile_usage_events([clean])
+    hiding = _HidingDict({**clean["attribution"], "unknown_field": 1}, ("unknown_field",))
+    proxy_root = MappingProxyType({**clean, "attribution": hiding})
+
+    result = reconcile_usage_events([proxy_root])
+
+    # The plain-JSON equivalent of the public view is the clean payload, which
+    # is accepted with exactly this result; the hidden stored field plays no
+    # part in the output.
+    assert result == expected
+    assert "unknown_field" not in json.dumps(result.model_dump(mode="json"))
+    assert hiding.items_calls == 1
+
+    # An entry that exists only in the public view is rejected, as it is for
+    # the equivalent plain JSON.
+    showing = _ShowingDict(clean["attribution"])
+    assert _error_code([MappingProxyType({**clean, "attribution": showing})]) == "invalid_event"
+    assert _error_code([{**clean, "attribution": {**clean["attribution"], "invented": 1}}]) == "invalid_event"
+
+
+@pytest.mark.parametrize("root", ["proxy", "dict"])
+def test_shared_public_view_is_read_once_per_call(root: str) -> None:
+    clean = _payload()
+    quantity = clean["usage"]["input_tokens"]
+    shared = _HidingDict({**quantity, "unknown_field": 1}, ("unknown_field",))
+    usage = {**clean["usage"], "input_tokens": shared, "output_tokens": shared}
+    payload = {**clean, "usage": usage}
+    supplied = MappingProxyType(payload) if root == "proxy" else payload
+
+    if root == "proxy":
+        # Public view is authoritative: the hidden stored field is invisible.
+        assert reconcile_usage_events([supplied]).streams[0].usage is not None
+    else:
+        # Stored dict edges are authoritative for a plain-dict root, so the
+        # stored unknown field is seen and rejected (fail closed).
+        assert _error_code([supplied]) == "invalid_event"
+
+    assert shared.items_calls == 1
+
+
+def test_reconciliation_derives_only_from_the_first_observed_snapshot() -> None:
+    clean = _payload()
+    first_view = dict(clean["usage"]["input_tokens"])
+    later_view = {"value": 999, "missing_reason": None}
+    flipping = _FlippingMapping(first_view, later_view)
+    payload = {**clean, "usage": {**clean["usage"], "input_tokens": flipping}}
+    expected = reconcile_usage_events([clean])
+
+    result = reconcile_usage_events([payload])
+    snapshot = result.model_dump(mode="json")
+
+    assert result == expected
+    assert flipping.items_calls == 1  # no consumer re-read the original later
+    assert snapshot["streams"][0]["usage"]["input_tokens"] == first_view
+
+    # Mutating the original after the call cannot change the returned result.
+    later_view["value"] = 1
+    first_view["value"] = 7
+    assert result.model_dump(mode="json") == snapshot
+    assert flipping.items_calls == 1
