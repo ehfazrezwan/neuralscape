@@ -642,6 +642,22 @@ def _error_code(events: list[UsageEvent]) -> str:
     return caught.value.code
 
 
+def _rejection_errors(event: object) -> list[tuple[str, tuple[object, ...]]]:
+    """The contract's own validation errors behind an ``invalid_event`` rejection.
+
+    Fails unless the rejection was caused by contract validation; a traversal
+    failure (for example a ``TypeError`` raised by a broken test helper) would
+    also reject the event but for the wrong reason.
+    """
+
+    with pytest.raises(UsageReconciliationError) as caught:
+        reconcile_usage_events([event])
+    assert caught.value.code == "invalid_event"
+    cause = caught.value.__cause__
+    assert isinstance(cause, ValidationError), type(cause)
+    return [(error["type"], tuple(error["loc"])) for error in cause.errors()]
+
+
 def _error_signature(events: tuple[UsageEvent, ...]) -> tuple[str, str]:
     with pytest.raises(UsageReconciliationError) as caught:
         reconcile_usage_events(events)
@@ -3851,7 +3867,7 @@ class _ShowingDict(dict[str, object]):
 
     def items(self) -> ItemsView[str, object]:
         self.items_calls += 1
-        return {**dict.items(self), "invented": 1}.items()
+        return {**dict(dict.items(self)), "invented": 1}.items()
 
 
 class _FlippingMapping(Mapping[str, object]):
@@ -3893,9 +3909,15 @@ def test_public_view_decides_acceptance_like_plain_json_and_hides_nothing_stored
 
     # An entry that exists only in the public view is rejected, as it is for
     # the equivalent plain JSON.
+    # Both are rejected for the same reason: the unknown field is forbidden.
     showing = _ShowingDict(clean["attribution"])
-    assert _error_code([MappingProxyType({**clean, "attribution": showing})]) == "invalid_event"
-    assert _error_code([{**clean, "attribution": {**clean["attribution"], "invented": 1}}]) == "invalid_event"
+    expected_error = [("extra_forbidden", ("attribution", "invented"))]
+    assert _rejection_errors(MappingProxyType({**clean, "attribution": showing})) == expected_error
+    assert showing.items_calls == 1
+    assert (
+        _rejection_errors({**clean, "attribution": {**clean["attribution"], "invented": 1}})
+        == expected_error
+    )
 
 
 @pytest.mark.parametrize("root", ["proxy", "dict"])
