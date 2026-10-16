@@ -6,12 +6,13 @@ allocate resources, grant authority, or select a shared-plane or cell topology.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
-from typing import Literal
+from collections.abc import Callable, Iterable, Iterator, Mapping
+from typing import Literal, TypeVar
 
 from pydantic import BaseModel, TypeAdapter, model_validator
 
 from contracts_common import OpaqueId, SafeCounter, VersionedContract
+from contracts_limits import STANDARD, DiscoveryBudget
 
 
 TenantOperationKind = Literal[
@@ -37,6 +38,8 @@ _DESIRED_STATE_BY_OPERATION: dict[TenantOperationKind, TenantDesiredState] = {
     "upgrade": "active",
     "delete": "deleted",
 }
+
+T = TypeVar("T")
 
 _OPAQUE_ID_ADAPTER = TypeAdapter(OpaqueId)
 _SAFE_COUNTER_ADAPTER = TypeAdapter(SafeCounter)
@@ -141,8 +144,8 @@ _ALLOWED_OBSERVED_TRANSITIONS: dict[
 
 
 def _closed_graph_snapshot_session() -> tuple[
-    Callable[[object], None],
-    Callable[[object], object],
+    Callable[..., None],
+    Callable[..., object],
 ]:
     """Return native capture and public rebuild phases sharing one inventory.
 
@@ -155,83 +158,113 @@ def _closed_graph_snapshot_session() -> tuple[
     earlier callback in the same call may still change them first; entry-time
     capture of never-yet-exposed children is not promised.  Hidden native
     backing is never substituted for a public view.
+
+    One discovery budget covers every root captured through the returned
+    phases, so a previous and a current value share one envelope.  Native
+    capture is iterative and callback-free: it charges unique nodes, captured
+    edges (before copying them) and depth.  Entries observed through a public
+    view are charged as they are first observed.  Exceeding the budget raises
+    the stable budget error before any public view of the failing graph is read.
+    Rebuilding an already captured node does not touch the budget, so a root
+    whose capture succeeded keeps its own validation outcome when a later
+    root exhausts the envelope.
     """
 
+    budget = DiscoveryBudget(STANDARD)
     frozen_models: dict[int, tuple[object, bool, object]] = {}
     frozen_containers: dict[int, object] = {}
-    discovered: set[int] = set()
+    native_children: dict[int, tuple[object, ...]] = {}
 
-    def freeze_native_graph(item: object) -> None:
-        """Discover model state and exact-container edges without callbacks."""
-
+    def is_graph_node(item: object) -> bool:
         item_type = type(item)
-        if not (
+        return (
             issubclass(item_type, BaseModel)
             or issubclass(item_type, dict)
             or issubclass(item_type, list)
             or issubclass(item_type, tuple)
-        ):
-            return
+        )
 
-        identity = id(item)
-        if identity in discovered:
-            return
-        discovered.add(identity)
+    def freeze_native_graph(item: object, depth: int = 0) -> None:
+        """Discover model state and exact-container edges without callbacks."""
 
-        if issubclass(item_type, BaseModel):
-            stored_entries = tuple(
-                dict.items(_PYDANTIC_DICT_DESCRIPTOR.__get__(item, BaseModel))
-            )
-            extras = _model_extra_storage(item)
-            if extras is not None and issubclass(type(extras), dict):
-                frozen_extras: object = tuple(dict.items(extras))
-                extras_are_native = True
+        stack: list[tuple[object, int]] = [(item, depth)]
+        while stack:
+            node, node_depth = stack.pop()
+            if not is_graph_node(node):
+                continue
+            identity = id(node)
+            expand = budget.visit(node, node_depth)
+            if not expand:
+                continue
+            if identity in native_children:
+                # A shallower authoritative path re-expands the children so
+                # their depth is accounted from the minimum depth; the edges
+                # are charged again and nothing is captured twice.
+                children = native_children[identity]
+                budget.charge_edge(len(children))
             else:
-                frozen_extras = extras
-                extras_are_native = False
+                children = capture_native_node(node, identity)
+                native_children[identity] = children
+            for child in reversed(children):
+                stack.append((child, node_depth + 1))
+
+    def capture_native_node(node: object, identity: int) -> tuple[object, ...]:
+        node_type = type(node)
+        if issubclass(node_type, BaseModel):
+            stored = _PYDANTIC_DICT_DESCRIPTOR.__get__(node, BaseModel)
+            extras = _model_extra_storage(node)
+            extras_are_native = extras is not None and issubclass(
+                type(extras), dict
+            )
+            edge_count = dict.__len__(stored)
+            if extras_are_native:
+                edge_count += dict.__len__(extras)
+            budget.charge_edge(edge_count)
+            stored_entries = tuple(dict.items(stored))
+            frozen_extras: object = (
+                tuple(dict.items(extras)) if extras_are_native else extras
+            )
             frozen_models[identity] = (
                 stored_entries,
                 extras_are_native,
                 frozen_extras,
             )
-            for _name, field_value in stored_entries:
-                freeze_native_graph(field_value)
-            return
+            return tuple(value for _name, value in stored_entries)
 
-        if issubclass(item_type, dict):
-            entries = tuple(dict.items(item))
-            if item_type is dict:
+        if issubclass(node_type, dict):
+            budget.charge_edge(dict.__len__(node))
+            entries = tuple(dict.items(node))
+            if node_type is dict:
                 frozen_containers[identity] = entries
-            for _key, field_value in entries:
-                freeze_native_graph(field_value)
-            return
+            return tuple(value for _key, value in entries)
 
-        if issubclass(item_type, list):
-            items = tuple(list.__iter__(item))
-            if item_type is list:
-                frozen_containers[identity] = items
+        if issubclass(node_type, list):
+            budget.charge_edge(list.__len__(node))
+            items = tuple(list.__iter__(node))
         else:
-            items = tuple(tuple.__iter__(item))
-            if item_type is tuple:
-                frozen_containers[identity] = items
-        for child in items:
-            freeze_native_graph(child)
+            budget.charge_edge(tuple.__len__(node))
+            items = tuple(tuple.__iter__(node))
+        if node_type is list or node_type is tuple:
+            frozen_containers[identity] = items
+        return items
+
+    def charged(entries: Iterable[T]) -> Iterator[T]:
+        """Charge each entry of a public view as it is first observed."""
+
+        for entry in entries:
+            budget.charge_edge()
+            yield entry
 
     active: set[int] = set()
 
-    def rebuild(item: object) -> object:
-        item_type = type(item)
-        if not (
-            issubclass(item_type, BaseModel)
-            or issubclass(item_type, dict)
-            or issubclass(item_type, list)
-            or issubclass(item_type, tuple)
-        ):
+    def rebuild(item: object, depth: int = 0) -> object:
+        if not is_graph_node(item):
             return item
+        item_type = type(item)
 
         identity = id(item)
-        if identity not in discovered:
-            freeze_native_graph(item)
+        if identity not in native_children:
+            freeze_native_graph(item, depth)
         if identity in active:
             raise ValueError("contract input graph must be acyclic")
         active.add(identity)
@@ -255,9 +288,11 @@ def _closed_graph_snapshot_session() -> tuple[
                     raise ValueError("contract extra storage must be a mapping")
                 else:
                     observed_extra_length = len(frozen_extras)
-                    iterated_extra_names = tuple(name for name in frozen_extras)
+                    iterated_extra_names = tuple(
+                        name for name in charged(frozen_extras)
+                    )
                     extra_entries = tuple(
-                        entry for entry in frozen_extras.items()
+                        entry for entry in charged(frozen_extras.items())
                     )
                 stored_names = {name for name, _field_value in stored_entries}
                 undeclared = stored_names - declared.keys()
@@ -269,32 +304,32 @@ def _closed_graph_snapshot_session() -> tuple[
                 ):
                     raise ValueError("contract input contains undeclared fields")
                 return {
-                    name: rebuild(field_value)
+                    name: rebuild(field_value, depth + 1)
                     for name, field_value in stored_entries
                 }
             if isinstance(item, dict):
                 entries = (
                     frozen_containers[identity]
                     if item_type is dict
-                    else item.items()
+                    else charged(item.items())
                 )
                 return {
-                    key: rebuild(field_value)
+                    key: rebuild(field_value, depth + 1)
                     for key, field_value in entries
                 }
             if isinstance(item, list):
                 items = (
                     frozen_containers[identity]
                     if item_type is list
-                    else item
+                    else charged(item)
                 )
-                return [rebuild(child) for child in items]
+                return [rebuild(child, depth + 1) for child in items]
             items = (
                 frozen_containers[identity]
                 if item_type is tuple
-                else item
+                else charged(item)
             )
-            return tuple(rebuild(child) for child in items)
+            return tuple(rebuild(child, depth + 1) for child in items)
         finally:
             active.remove(identity)
 

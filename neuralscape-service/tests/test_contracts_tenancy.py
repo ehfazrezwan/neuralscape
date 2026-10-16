@@ -658,11 +658,16 @@ def test_transition_preserves_previous_error_before_current_capture_failure() ->
         )
 
     assert competing_error.value.errors() == ordinary_error.value.errors()
-    with pytest.raises(RecursionError, match="maximum recursion depth exceeded"):
+    # Discovery is bounded: an over-deep graph is rejected with the stable
+    # budget error instead of exhausting the interpreter stack.
+    with pytest.raises(
+        ValueError, match="contract graph exceeds the native discovery budget"
+    ) as too_deep:
         validate_operation_transition(
             operation(),
             _operation_with_too_deep_manifest_graph(),
         )
+    assert type(too_deep.value) is ValueError
 
 
 def test_transition_does_not_capture_unsupported_current_before_its_turn() -> None:
@@ -2147,3 +2152,223 @@ def test_public_first_subclass_view_that_changes_between_occurrences_is_rejected
 
     with pytest.raises(ValidationError):
         validate_operation_transition(previous, current)
+
+
+# ---------------------------------------------------------------------------
+# Bounded native discovery (shared STANDARD budget): iterative, callback-free
+# capture; stable value-free rejection; one envelope per validation call.
+# ---------------------------------------------------------------------------
+
+import contracts_tenancy  # noqa: E402
+from contracts_limits import DiscoveryTier  # noqa: E402
+
+BUDGET_MESSAGE = "contract graph exceeds the native discovery budget"
+
+
+def _operation_with_manifests(count: int, **updates: object) -> TenantOperationState:
+    return operation(
+        resource_manifests=[manifest(manifest_id=f"m{i}") for i in range(count)],
+        **updates,
+    )
+
+
+def _with_tier(monkeypatch, nodes: int = 10**6, edges: int = 10**9, depth: int = 256):
+    monkeypatch.setattr(
+        contracts_tenancy, "STANDARD", DiscoveryTier("test", nodes, edges, depth)
+    )
+
+
+def _fits(graph_source, monkeypatch, **limits: int) -> bool:
+    _with_tier(monkeypatch, **limits)
+    try:
+        contracts_tenancy._snapshot_closed_graph(graph_source)
+    except ValueError as error:
+        if str(error) == BUDGET_MESSAGE:
+            return False
+        raise
+    return True
+
+
+def _minimal(graph_source, monkeypatch, key: str, ceiling: int = 64) -> int:
+    for value in range(1, ceiling):
+        if _fits(graph_source, monkeypatch, **{key: value}):
+            return value
+    raise AssertionError(f"no {key} up to {ceiling} fits")
+
+
+def _deeply_nested(kind: type, depth: int) -> object:
+    nested: object = kind()
+    for _ in range(depth - 1):
+        nested = (nested,) if kind is tuple else [nested]
+    return nested
+
+
+@pytest.mark.parametrize("kind", [tuple, list])
+def test_depth_1000_native_graph_is_a_stable_budget_error_not_recursion(kind) -> None:
+    deep = operation().model_copy(
+        update={"resource_manifests": _deeply_nested(kind, 1000)}
+    )
+
+    with pytest.raises(ValueError) as raised:
+        validate_operation_transition(operation(), deep)
+    assert type(raised.value) is ValueError
+    assert str(raised.value) == BUDGET_MESSAGE
+    with pytest.raises(ValueError) as previous_raised:
+        validate_operation_transition(deep, operation())
+    assert str(previous_raised.value) == BUDGET_MESSAGE
+    placement = TenantPlacement.model_validate_json(
+        json.dumps(
+            {
+                "schema_version": VERSION,
+                "tenant_id": "tenant-a",
+                "generation": 7,
+                "resource_manifests": [manifest()],
+            }
+        )
+    ).model_copy(update={"resource_manifests": _deeply_nested(kind, 1000)})
+    with pytest.raises(ValueError) as placement_raised:
+        validate_placement_publication(
+            placement, expected_tenant_id="tenant-a", current_generation=7
+        )
+    assert str(placement_raised.value) == BUDGET_MESSAGE
+
+
+def test_discovery_limits_are_exact_for_nodes_edges_and_depth(monkeypatch) -> None:
+    one = _operation_with_manifests(1)
+    three = _operation_with_manifests(3)
+    # operation + manifests tuple + one model per manifest
+    assert _minimal(one, monkeypatch, "nodes") == 3
+    assert _minimal(three, monkeypatch, "nodes") == 5
+    # 8 operation fields + tuple entries + 5 stored fields per manifest
+    assert _minimal(one, monkeypatch, "edges", ceiling=200) == 8 + 1 + 5
+    assert _minimal(three, monkeypatch, "edges", ceiling=200) == 8 + 3 + 15
+    # operation (0) -> manifests tuple (1) -> manifest (2)
+    assert _minimal(one, monkeypatch, "depth") == 2
+    for key, exact in (("nodes", 3), ("edges", 14), ("depth", 2)):
+        assert _fits(one, monkeypatch, **{key: exact})
+        assert not _fits(one, monkeypatch, **{key: exact - 1})
+    assert _fits(one, monkeypatch, nodes=4, edges=15, depth=3)
+
+
+def test_production_depth_limit_is_exact_at_the_real_tier() -> None:
+    def deep(levels: int) -> TenantOperationState:
+        return operation().model_copy(
+            update={"resource_manifests": _deeply_nested(list, levels)}
+        )
+
+    with pytest.raises(ValidationError):  # captured within budget, then invalid
+        validate_operation_transition(operation(), deep(256))
+    with pytest.raises(ValueError, match=BUDGET_MESSAGE) as over:
+        validate_operation_transition(operation(), deep(257))
+    assert type(over.value) is ValueError
+
+
+class _CountingHugeList(list):
+    """Native storage far over budget; every public protocol is counted."""
+
+    def __init__(self, size: int) -> None:
+        super().__init__(range(size))
+        self.public_calls: list[str] = []
+
+    def __iter__(self):
+        self.public_calls.append("iter")
+        return list.__iter__(self)
+
+    def __len__(self) -> int:
+        self.public_calls.append("len")
+        return list.__len__(self)
+
+    def __getitem__(self, index):
+        self.public_calls.append("getitem")
+        return list.__getitem__(self, index)
+
+    def __eq__(self, other: object) -> bool:
+        self.public_calls.append("eq")
+        return list.__eq__(self, other)
+
+    __hash__ = None  # type: ignore[assignment]
+
+
+def test_hidden_huge_native_graph_is_rejected_with_zero_public_reads() -> None:
+    huge = _CountingHugeList(200_000)
+    hidden = operation().model_copy(update={"resource_manifests": huge})
+
+    with pytest.raises(ValueError, match=BUDGET_MESSAGE):
+        validate_operation_transition(operation(), hidden)
+    with pytest.raises(ValueError, match=BUDGET_MESSAGE):
+        validate_operation_transition(hidden, operation())
+    assert huge.public_calls == []
+
+
+class _InfinitePublicView(list):
+    """Empty native storage; the public view never ends."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.reads = 0
+
+    def __iter__(self):
+        self.reads += 1
+        count = 0
+        while True:
+            count += 1
+            yield count
+
+
+def test_public_view_entries_are_charged_when_first_observed() -> None:
+    endless = _InfinitePublicView()
+    graph = operation().model_copy(update={"resource_manifests": endless})
+
+    with pytest.raises(ValueError, match=BUDGET_MESSAGE):
+        validate_operation_transition(operation(), graph)
+    assert endless.reads == 1
+
+
+def test_previous_and_current_share_one_discovery_envelope(monkeypatch) -> None:
+    previous = _operation_with_manifests(2)
+    current = _operation_with_manifests(2, observed_state="running")
+    nodes = 4  # exactly enough for one of them
+    assert _minimal(previous, monkeypatch, "nodes") == nodes
+    assert _fits(previous, monkeypatch, nodes=nodes)
+    assert _fits(current, monkeypatch, nodes=nodes)
+
+    _with_tier(monkeypatch, nodes=nodes)
+    with pytest.raises(ValueError, match=BUDGET_MESSAGE):
+        validate_operation_transition(previous, current)
+    _with_tier(monkeypatch, nodes=2 * nodes)
+    assert validate_operation_transition(previous, current).observed_state == "running"
+
+
+def test_over_budget_previous_is_reported_before_an_invalid_current(monkeypatch) -> None:
+    previous = _operation_with_manifests(3)
+    invalid_current = operation(observed_state="running").model_copy(
+        update={"tenant_id": ""}
+    )
+    _with_tier(monkeypatch, nodes=3)
+
+    with pytest.raises(ValueError) as raised:
+        validate_operation_transition(previous, invalid_current)
+    assert str(raised.value) == BUDGET_MESSAGE
+
+
+def test_valid_previous_outcome_is_kept_when_current_exhausts_the_envelope(
+    monkeypatch,
+) -> None:
+    invalid_previous = operation()
+    _set_native_field(invalid_previous.resource_manifests[0], "manifest_id", "")
+    over_budget_current = _operation_with_manifests(10, observed_state="running")
+    _with_tier(monkeypatch, nodes=6)
+
+    with pytest.raises(ValidationError):  # previous's own error comes first
+        validate_operation_transition(invalid_previous, over_budget_current)
+
+
+def test_budget_error_is_value_free() -> None:
+    secret = "tenant-secret-value"
+    huge = operation().model_copy(
+        update={"tenant_id": secret, "resource_manifests": list(range(200_000))}
+    )
+    with pytest.raises(ValueError) as raised:
+        validate_operation_transition(operation(), huge)
+    assert secret not in str(raised.value)
+    assert str(raised.value) == BUDGET_MESSAGE

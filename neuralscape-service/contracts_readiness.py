@@ -6,13 +6,13 @@ derived from process liveness, object construction, or another capability.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
 from datetime import datetime
 from typing import Literal
 
-from pydantic import AwareDatetime, BaseModel, TypeAdapter, model_validator
+from pydantic import AwareDatetime, TypeAdapter, model_validator
 
 from contracts_common import OpaqueId, SafeCounter, VersionedContract
+from contracts_tenancy import _closed_graph_snapshot_session
 
 
 ReadinessCapability = Literal[
@@ -28,17 +28,6 @@ CapabilityStatus = Literal[
 _AWARE_DATETIME_ADAPTER = TypeAdapter(AwareDatetime)
 _OPAQUE_ID_ADAPTER = TypeAdapter(OpaqueId)
 _SAFE_COUNTER_ADAPTER = TypeAdapter(SafeCounter)
-_PYDANTIC_DICT_DESCRIPTOR = BaseModel.__dict__["__dict__"]
-_PYDANTIC_EXTRA_DESCRIPTOR = BaseModel.__dict__["__pydantic_extra__"]
-
-
-def _model_extra_storage(value: BaseModel) -> object:
-    """Read Pydantic-owned extra storage without model instance dispatch."""
-
-    try:
-        return _PYDANTIC_EXTRA_DESCRIPTOR.__get__(value, type(value))
-    except AttributeError:
-        return None
 
 
 class CapabilityReadiness(VersionedContract):
@@ -72,159 +61,12 @@ class TenantReadinessPublication(VersionedContract):
 def _snapshot_closed_graph(value: object) -> object:
     """Copy a model/native graph without dropping stored undeclared fields.
 
-    Authority follows each supported container's public view.  Stored models
-    and exact built-in containers are fenced when the call begins and replayed
-    from that capture.  The public view of a container subclass is observed
-    once per occurrence in the graph, not once per call, so a view that
-    changes between two occurrences is rejected.  Children exposed only by a
-    public iterator are captured when that iterator first exposes them, so an
-    earlier callback in the same call may still change them first; entry-time
-    capture of never-yet-exposed children is not promised.  Hidden native
-    backing is never substituted for a public view.
+    Uses the same bounded, callback-free capture and public-view rebuild as the
+    tenant contracts, so both receiving boundaries share one set of limits.
     """
 
-    frozen_models: dict[int, tuple[object, bool, object]] = {}
-    frozen_containers: dict[int, object] = {}
-    discovered: set[int] = set()
-
-    def freeze_native_graph(item: object) -> None:
-        """Discover model state and exact-container edges without callbacks."""
-
-        item_type = type(item)
-        if not (
-            issubclass(item_type, BaseModel)
-            or issubclass(item_type, dict)
-            or issubclass(item_type, list)
-            or issubclass(item_type, tuple)
-        ):
-            return
-
-        identity = id(item)
-        if identity in discovered:
-            return
-        discovered.add(identity)
-
-        if issubclass(item_type, BaseModel):
-            stored_entries = tuple(
-                dict.items(_PYDANTIC_DICT_DESCRIPTOR.__get__(item, BaseModel))
-            )
-            extras = _model_extra_storage(item)
-            if extras is not None and issubclass(type(extras), dict):
-                frozen_extras: object = tuple(dict.items(extras))
-                extras_are_native = True
-            else:
-                frozen_extras = extras
-                extras_are_native = False
-            frozen_models[identity] = (
-                stored_entries,
-                extras_are_native,
-                frozen_extras,
-            )
-            for _name, field_value in stored_entries:
-                freeze_native_graph(field_value)
-            return
-
-        if issubclass(item_type, dict):
-            entries = tuple(dict.items(item))
-            if item_type is dict:
-                frozen_containers[identity] = entries
-            for _key, field_value in entries:
-                freeze_native_graph(field_value)
-            return
-
-        if issubclass(item_type, list):
-            items = tuple(list.__iter__(item))
-            if item_type is list:
-                frozen_containers[identity] = items
-        else:
-            items = tuple(tuple.__iter__(item))
-            if item_type is tuple:
-                frozen_containers[identity] = items
-        for child in items:
-            freeze_native_graph(child)
-
+    freeze_native_graph, rebuild = _closed_graph_snapshot_session()
     freeze_native_graph(value)
-    active: set[int] = set()
-
-    def rebuild(item: object) -> object:
-        item_type = type(item)
-        if not (
-            issubclass(item_type, BaseModel)
-            or issubclass(item_type, dict)
-            or issubclass(item_type, list)
-            or issubclass(item_type, tuple)
-        ):
-            return item
-
-        identity = id(item)
-        if identity not in discovered:
-            freeze_native_graph(item)
-        if identity in active:
-            raise ValueError("contract input graph must be acyclic")
-        active.add(identity)
-        try:
-            if isinstance(item, BaseModel):
-                stored_entries, extras_are_native, frozen_extras = frozen_models[
-                    identity
-                ]
-                declared = item_type.model_fields
-                if extras_are_native:
-                    extra_entries = frozen_extras
-                    observed_extra_length = len(extra_entries)
-                    iterated_extra_names = tuple(
-                        name for name, _field_value in extra_entries
-                    )
-                elif frozen_extras is None:
-                    observed_extra_length = 0
-                    iterated_extra_names = ()
-                    extra_entries = ()
-                elif not isinstance(frozen_extras, Mapping):
-                    raise ValueError("contract extra storage must be a mapping")
-                else:
-                    observed_extra_length = len(frozen_extras)
-                    iterated_extra_names = tuple(name for name in frozen_extras)
-                    extra_entries = tuple(
-                        entry for entry in frozen_extras.items()
-                    )
-                stored_names = {name for name, _field_value in stored_entries}
-                undeclared = stored_names - declared.keys()
-                if (
-                    undeclared
-                    or observed_extra_length
-                    or iterated_extra_names
-                    or extra_entries
-                ):
-                    raise ValueError("contract input contains undeclared fields")
-                return {
-                    name: rebuild(field_value)
-                    for name, field_value in stored_entries
-                }
-            if isinstance(item, dict):
-                entries = (
-                    frozen_containers[identity]
-                    if item_type is dict
-                    else item.items()
-                )
-                return {
-                    key: rebuild(field_value)
-                    for key, field_value in entries
-                }
-            if isinstance(item, list):
-                items = (
-                    frozen_containers[identity]
-                    if item_type is list
-                    else item
-                )
-                return [rebuild(child) for child in items]
-            items = (
-                frozen_containers[identity]
-                if item_type is tuple
-                else item
-            )
-            return tuple(rebuild(child) for child in items)
-        finally:
-            active.remove(identity)
-
     return rebuild(value)
 
 

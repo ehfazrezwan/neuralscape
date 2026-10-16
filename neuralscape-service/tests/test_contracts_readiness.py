@@ -1722,3 +1722,148 @@ def test_public_first_lazy_capability_is_frozen_once_first_observed() -> None:
     assert name.calls > 0
     assert divergent.calls == 1
     assert child.capability == "exact_reads"
+
+
+# ---------------------------------------------------------------------------
+# Bounded native discovery (shared STANDARD budget, same walk as the tenant
+# contracts): iterative, callback-free, stable value-free rejection.
+# ---------------------------------------------------------------------------
+
+import contracts_tenancy  # noqa: E402
+from contracts_limits import DiscoveryTier  # noqa: E402
+
+BUDGET_MESSAGE = "contract graph exceeds the native discovery budget"
+
+
+def _validate(candidate: TenantReadinessPublication) -> TenantReadinessPublication:
+    return validate_readiness_publication(
+        candidate,
+        expected_tenant_id="tenant-a",
+        current_placement_generation=12,
+    )
+
+
+def _with_capabilities(candidate: TenantReadinessPublication, value: object):
+    return candidate.model_copy(update={"capabilities": value})
+
+
+def _nested(kind: type, depth: int) -> object:
+    nested: object = kind()
+    for _ in range(depth - 1):
+        nested = (nested,) if kind is tuple else [nested]
+    return nested
+
+
+def _fits(candidate: object, monkeypatch, **limits: int) -> bool:
+    tier = {"nodes": 10**6, "edges": 10**9, "depth": 256}
+    tier.update(limits)
+    monkeypatch.setattr(
+        contracts_tenancy,
+        "STANDARD",
+        DiscoveryTier("test", tier["nodes"], tier["edges"], tier["depth"]),
+    )
+    from contracts_readiness import _snapshot_closed_graph
+
+    try:
+        _snapshot_closed_graph(candidate)
+    except ValueError as error:
+        if str(error) == BUDGET_MESSAGE:
+            return False
+        raise
+    return True
+
+
+@pytest.mark.parametrize("kind", [tuple, list])
+def test_depth_1000_native_graph_is_a_stable_budget_error_not_recursion(kind) -> None:
+    deep = _with_capabilities(publication(), _nested(kind, 1000))
+
+    with pytest.raises(ValueError) as raised:
+        _validate(deep)
+    assert type(raised.value) is ValueError
+    assert str(raised.value) == BUDGET_MESSAGE
+
+
+def test_discovery_limits_are_exact_for_nodes_edges_and_depth(monkeypatch) -> None:
+    candidate = publication()
+    # publication + capabilities tuple + four observations
+    # edges: 4 publication fields + 4 tuple entries + 5 stored fields x 4
+    # depth: publication (0) -> capabilities tuple (1) -> observation (2)
+    for key, exact in (("nodes", 6), ("edges", 28), ("depth", 2)):
+        assert _fits(candidate, monkeypatch, **{key: exact})
+        assert not _fits(candidate, monkeypatch, **{key: exact - 1})
+
+
+def test_production_depth_limit_is_exact_at_the_real_tier() -> None:
+    with pytest.raises(ValidationError):  # within budget, then structurally invalid
+        _validate(_with_capabilities(publication(), _nested(list, 256)))
+    with pytest.raises(ValueError, match=BUDGET_MESSAGE) as over:
+        _validate(_with_capabilities(publication(), _nested(list, 257)))
+    assert type(over.value) is ValueError
+
+
+class CountingHugeList(list):
+    """Native storage far over budget; every public protocol is counted."""
+
+    def __init__(self, size: int) -> None:
+        super().__init__(range(size))
+        self.public_calls: list[str] = []
+
+    def __iter__(self):
+        self.public_calls.append("iter")
+        return list.__iter__(self)
+
+    def __len__(self) -> int:
+        self.public_calls.append("len")
+        return list.__len__(self)
+
+    def __getitem__(self, index):
+        self.public_calls.append("getitem")
+        return list.__getitem__(self, index)
+
+    def __eq__(self, other: object) -> bool:
+        self.public_calls.append("eq")
+        return list.__eq__(self, other)
+
+    __hash__ = None  # type: ignore[assignment]
+
+
+def test_hidden_huge_native_graph_is_rejected_with_zero_public_reads() -> None:
+    huge = CountingHugeList(200_000)
+
+    with pytest.raises(ValueError, match=BUDGET_MESSAGE):
+        _validate(_with_capabilities(publication(), huge))
+    assert huge.public_calls == []
+
+
+class InfinitePublicView(list):
+    """Empty native storage; the public view never ends."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.reads = 0
+
+    def __iter__(self):
+        self.reads += 1
+        count = 0
+        while True:
+            count += 1
+            yield count
+
+
+def test_public_view_entries_are_charged_when_first_observed() -> None:
+    endless = InfinitePublicView()
+
+    with pytest.raises(ValueError, match=BUDGET_MESSAGE):
+        _validate(_with_capabilities(publication(), endless))
+    assert endless.reads == 1
+
+
+def test_budget_error_is_value_free() -> None:
+    secret = "tenant-secret-value"
+    candidate = publication().model_copy(
+        update={"tenant_id": secret, "capabilities": list(range(200_000))}
+    )
+    with pytest.raises(ValueError) as raised:
+        _validate(candidate)
+    assert secret not in str(raised.value)
+    assert str(raised.value) == BUDGET_MESSAGE
