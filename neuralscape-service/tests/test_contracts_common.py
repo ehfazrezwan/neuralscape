@@ -3446,3 +3446,38 @@ def test_a_colliding_extra_name_runs_no_hook_and_is_refused(order) -> None:
     with pytest.raises(ValueError, match="duplicate keys"):
         snapshot_contract_graph(value)
     assert _CountingName.calls == []
+
+
+def test_snapshot_capture_stack_is_bounded_by_the_tier_depth_not_the_recursion_limit() -> None:
+    # The stable error must come from the depth limit, not from running into the
+    # interpreter's recursion limit, so a caller that raised that limit is still bounded.
+    import sys
+
+    import contracts_common
+
+    deepest = 0
+    current = 0
+    capture_code = contracts_common._capture_native_graph.__code__
+
+    def profile(frame, event, arg):
+        nonlocal deepest, current
+        if frame.f_code is capture_code:
+            if event == "call":
+                current += 1
+                deepest = max(deepest, current)
+            elif event == "return":
+                current -= 1
+
+    value: object = ()
+    for _ in range(3_000):
+        value = (value,)
+    limit = sys.getrecursionlimit()
+    sys.setrecursionlimit(5_000)
+    sys.setprofile(profile)
+    try:
+        with pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):
+            snapshot_contract_graph(value)
+    finally:
+        sys.setprofile(None)
+        sys.setrecursionlimit(limit)
+    assert deepest <= STANDARD.max_depth + 2
