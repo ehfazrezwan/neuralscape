@@ -507,3 +507,97 @@ def test_a_downgrade_of_the_schema_version_is_not_a_bump() -> None:
     new = copy.deepcopy(old)
     downgrade(new)
     assert pack.check_compatibility(old, new)
+
+
+# ------------------------------------------- narrowing beside a union, and keyword pairs missing on one side
+
+
+def _pair(old: dict, new: dict) -> list[str]:
+    return pack.check_compatibility(old, new)
+
+
+_UNION = [{"type": "string"}, {"type": "null"}]
+
+
+@pytest.mark.parametrize(
+    "sibling, expected",
+    [({"maxLength": 2}, "maxLength lowered"), ({"minLength": 3}, "minLength raised"), ({"pattern": "^x"}, "pattern changed"),
+     ({"format": "date-time"}, "format changed"), ({"enum": ["a", None]}, "enum restriction added")],
+    ids=["maxLength", "minLength", "pattern", "format", "enum"],
+)
+@pytest.mark.parametrize("keyword", ["anyOf", "oneOf"])
+def test_a_constraint_added_beside_an_unchanged_union_is_breaking(keyword, sibling, expected) -> None:
+    assert _pair({keyword: _UNION}, {keyword: _UNION}) == []
+    problems = _pair({keyword: _UNION}, {keyword: _UNION, **sibling})
+    assert any(expected in p for p in problems), problems
+
+
+def test_a_constraint_added_to_a_plain_schema_that_becomes_a_union_is_breaking() -> None:
+    old = {"type": "string", "maxLength": 10}
+    assert _pair(old, {"anyOf": [{"type": "string"}, {"type": "null"}], "maxLength": 10}) == []
+    assert any("maxLength lowered" in p for p in _pair(old, {"anyOf": [{"type": "string"}, {"type": "null"}], "maxLength": 2}))
+    assert any("maxLength lowered" in p for p in _pair({"type": "string"}, {"anyOf": _UNION, "maxLength": 2}))
+
+
+def test_a_sibling_constraint_that_is_widened_or_kept_beside_a_union_is_compatible() -> None:
+    old = {"anyOf": _UNION, "maxLength": 5}
+    assert _pair(old, {"anyOf": _UNION, "maxLength": 5}) == []
+    assert _pair(old, {"anyOf": _UNION, "maxLength": 9}) == []
+    assert _pair(old, {"anyOf": _UNION}) == []
+    assert _pair(old, {"anyOf": _UNION + [{"type": "integer"}], "maxLength": 5}) == []
+
+
+def test_a_schema_with_both_union_keywords_is_compared_on_each() -> None:
+    old = {"anyOf": _UNION, "oneOf": [{"type": "string"}, {"type": "null"}, {"type": "integer"}]}
+    assert _pair(old, old) == []
+    narrowed = {"anyOf": _UNION, "oneOf": [{"type": "string"}, {"type": "null"}]}
+    assert any("no longer accepted" in p for p in _pair(old, narrowed))
+
+
+@pytest.mark.parametrize("old_form", ["absent", "true", "empty-schema"])
+def test_a_value_restriction_added_where_additional_properties_were_unrestricted_is_breaking(old_form) -> None:
+    old = {"type": "object", "properties": {"a": {"type": "string"}}}
+    if old_form == "true":
+        old["additionalProperties"] = True
+    elif old_form == "empty-schema":
+        old["additionalProperties"] = {}
+    new = {**old, "additionalProperties": {"type": "integer"}}
+    problems = _pair(old, new)
+    assert problems, "{'key': 'text'} was valid and is now rejected"
+    assert _pair(old, {**old, "additionalProperties": True}) == []
+
+
+def test_additional_property_value_schemas_still_compare_when_both_are_dicts_and_widening_is_compatible() -> None:
+    old = {"type": "object", "additionalProperties": {"type": "string", "maxLength": 5}}
+    assert _pair(old, {"type": "object", "additionalProperties": {"type": "string", "maxLength": 9}}) == []
+    assert any("maxLength lowered" in p for p in _pair(old, {"type": "object", "additionalProperties": {"type": "string", "maxLength": 2}}))
+    assert _pair({"type": "object", "additionalProperties": False}, {"type": "object", "additionalProperties": {"type": "integer"}}) == []
+    assert any("no longer accepted" in p for p in _pair({"type": "object", "additionalProperties": {"type": "string"}}, {"type": "object", "additionalProperties": False}))
+    assert any("no longer accepted" in p for p in _pair({"type": "object"}, {"type": "object", "additionalProperties": False}))
+
+
+@pytest.mark.parametrize(
+    "old, new, expected",
+    [
+        ({"type": "object"}, {"type": "object", "properties": {"a": {"type": "integer"}}}, "now requires type"),
+        ({"type": "object"}, {"type": "object", "required": ["a"]}, "now required"),
+        ({"type": "array"}, {"type": "array", "prefixItems": [{"type": "integer"}]}, "now requires type"),
+        ({"type": "object"}, {"type": "object", "patternProperties": {"^a": {"type": "integer"}}}, "patternProperties"),
+        ({"type": "object"}, {"type": "object", "propertyNames": {"maxLength": 3}}, "propertyNames"),
+        ({"type": "object"}, {"type": "object", "dependentRequired": {"a": ["b"]}}, "dependentRequired"),
+        ({"type": "string"}, {"type": "string", "not": {"const": "x"}}, "not"),
+        ({"type": "string"}, {"allOf": [{"type": "string"}, {"maxLength": 2}]}, "allOf"),
+        ({"type": "array"}, {"type": "array", "contains": {"type": "integer"}}, "contains"),
+        ({"type": "object"}, {"type": "object", "unevaluatedProperties": False}, "unevaluatedProperties"),
+    ],
+    ids=["properties", "required", "prefixItems", "patternProperties", "propertyNames", "dependentRequired", "not", "allOf", "contains", "unevaluatedProperties"],
+)
+def test_a_restriction_added_by_a_keyword_the_old_schema_did_not_have_is_breaking(old, new, expected) -> None:
+    problems = _pair(old, new)
+    assert any(expected in p for p in problems), problems
+    assert _pair(old, old) == []
+
+
+def test_the_exported_contracts_compare_clean_against_themselves() -> None:
+    schemas = pack.export_schemas()
+    assert pack.compare_schemas(schemas, copy.deepcopy(schemas)) == {}

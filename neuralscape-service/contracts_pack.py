@@ -184,6 +184,13 @@ def _types(schema: dict) -> set[str] | None:
 
 
 _MAX_COMPARE_DEPTH = 200
+_UNION_KEYS = ("anyOf", "oneOf")
+# Keywords the checker does not model: any addition or change is reported, never silently accepted.
+_UNVERIFIED_KEYWORDS = (
+    "allOf", "not", "if", "then", "else", "contains", "minContains", "maxContains",
+    "patternProperties", "propertyNames", "dependentRequired", "dependentSchemas",
+    "unevaluatedProperties", "unevaluatedItems", "additionalItems",
+)
 
 def _allowed_values(schema: dict) -> list | None:
     """The finite value set a schema restricts to, or ``None`` when unrestricted."""
@@ -227,23 +234,34 @@ def _compare(
             out.append(f"{path}: schema changed shape")
         return
 
-    old_branches = old.get("anyOf") or old.get("oneOf")
-    new_branches = new.get("anyOf") or new.get("oneOf")
-    if old_branches is not None or new_branches is not None:
-        # Every old alternative (an old single schema is one alternative) must
-        # still be accepted by some new alternative.
-        old_alternatives = old_branches if old_branches is not None else [old]
-        new_alternatives = new_branches if new_branches is not None else [new]
-        for index, branch in enumerate(old_alternatives):
-            matched = False
-            for candidate in new_alternatives:
-                trial: list[str] = []
-                _compare(branch, candidate, old_defs, new_defs, f"{path}|{index}", trial, depth + 1, active)
-                if not trial:
-                    matched = True
-                    break
-            if not matched:
-                out.append(f"{path}: a previously accepted alternative is no longer accepted")
+    old_unions = {key: old[key] for key in _UNION_KEYS if old.get(key)}
+    new_unions = {key: new[key] for key in _UNION_KEYS if new.get(key)}
+    if old_unions or new_unions:
+        # The schema is its sibling constraints AND its alternatives, so both are compared.
+        # Constraints beside a new union (``maxLength`` next to an unchanged ``anyOf``) narrow it
+        # whatever the alternatives say; the old side is its own siblings, or the whole old schema
+        # when it was not a union.
+        if new_unions:
+            _compare(
+                {key: value for key, value in old.items() if key not in _UNION_KEYS},
+                {key: value for key, value in new.items() if key not in _UNION_KEYS},
+                old_defs, new_defs, path, out, depth + 1, active,
+            )
+        # Every old alternative (an old single schema is one alternative) must still be accepted by
+        # some new alternative.  A schema with both union keywords is compared keyword by keyword.
+        for keyword in [key for key in _UNION_KEYS if key in old_unions or key in new_unions]:
+            old_alternatives = old_unions.get(keyword) or next(iter(old_unions.values()), None) or [old]
+            new_alternatives = new_unions.get(keyword) or next(iter(new_unions.values()), None) or [new]
+            for index, branch in enumerate(old_alternatives):
+                matched = False
+                for candidate in new_alternatives:
+                    trial: list[str] = []
+                    _compare(branch, candidate, old_defs, new_defs, f"{path}|{index}", trial, depth + 1, active)
+                    if not trial:
+                        matched = True
+                        break
+                if not matched:
+                    out.append(f"{path}: a previously accepted alternative is no longer accepted")
         return
 
     old_types, new_types = _types(old), _types(new)
@@ -289,33 +307,56 @@ def _compare(
         out.append(f"{path}: multipleOf narrowed")
 
     old_props = old.get("properties")
+    new_props = new.get("properties")
+    unconstrained: dict = {}
+    # What the old schema made of a property it did not list: its additionalProperties schema.
+    old_additional = old.get("additionalProperties", True)
+    if old_additional is True:
+        old_additional = unconstrained
     if isinstance(old_props, dict):
-        new_props = new.get("properties", {})
+        new_props_map = new_props if isinstance(new_props, dict) else {}
         for name, subschema in old_props.items():
-            if name not in new_props:
+            if name not in new_props_map:
                 out.append(f"{path}.{name}: property removed")
             else:
-                _compare(subschema, new_props[name], old_defs, new_defs, f"{path}.{name}", out, depth + 1, active)
-        added_required = set(new.get("required", [])) - set(old.get("required", []))
-        for name in sorted(added_required):
-            out.append(f"{path}.{name}: now required")
-        if old.get("additionalProperties") is not False and new.get("additionalProperties") is False:
-            out.append(f"{path}: additional properties no longer accepted")
+                _compare(subschema, new_props_map[name], old_defs, new_defs, f"{path}.{name}", out, depth + 1, active)
+    if isinstance(new_props, dict):
+        for name, subschema in new_props.items():
+            if isinstance(old_props, dict) and name in old_props:
+                continue
+            # A property the old schema did not list was accepted under its additionalProperties
+            # schema (anything when that was true or absent); the new schema may now restrict it.
+            if isinstance(old_additional, dict):
+                _compare(old_additional, subschema, old_defs, new_defs, f"{path}.{name}", out, depth + 1, active)
+    for name in sorted(set(new.get("required", [])) - set(old.get("required", []))):
+        out.append(f"{path}.{name}: now required")
+    new_additional = new.get("additionalProperties", True)
+    if new_additional is False and old.get("additionalProperties", True) is not False:
+        out.append(f"{path}: additional properties no longer accepted")
+    elif isinstance(new_additional, dict):
+        # Against an old schema that accepted anything (true, absent or {}) the new value schema is
+        # compared with the unconstrained schema; against False nothing extra was accepted before.
+        previous = old.get("additionalProperties", True)
+        if previous is True:
+            previous = unconstrained
+        if isinstance(previous, dict):
+            _compare(previous, new_additional, old_defs, new_defs, f"{path}{{}}", out, depth + 1, active)
     if "items" in old and "items" in new:
         _compare(old["items"], new["items"], old_defs, new_defs, f"{path}[]", out, depth + 1, active)
     elif "items" in new and "items" not in old:
         out.append(f"{path}: item schema added")
-    if "prefixItems" in old:
-        for index, item in enumerate(old["prefixItems"]):
-            if index >= len(new.get("prefixItems", [])):
-                out.append(f"{path}[{index}]: tuple position removed")
-            else:
-                _compare(item, new["prefixItems"][index], old_defs, new_defs, f"{path}[{index}]", out, depth + 1, active)
-    if isinstance(old.get("additionalProperties"), dict) and "additionalProperties" in new:
-        if isinstance(new["additionalProperties"], dict):
-            _compare(old["additionalProperties"], new["additionalProperties"], old_defs, new_defs, f"{path}{{}}", out, depth + 1, active)
-        elif new["additionalProperties"] is False:
-            out.append(f"{path}: additional properties no longer accepted")
+    old_prefix = old.get("prefixItems") if isinstance(old.get("prefixItems"), list) else []
+    new_prefix = new.get("prefixItems") if isinstance(new.get("prefixItems"), list) else []
+    for index, item in enumerate(old_prefix):
+        if index >= len(new_prefix):
+            out.append(f"{path}[{index}]: tuple position removed")
+        else:
+            _compare(item, new_prefix[index], old_defs, new_defs, f"{path}[{index}]", out, depth + 1, active)
+    for index in range(len(old_prefix), len(new_prefix)):
+        _compare(unconstrained, new_prefix[index], old_defs, new_defs, f"{path}[{index}]", out, depth + 1, active)
+    for key in _UNVERIFIED_KEYWORDS:
+        if key in new and new[key] != old.get(key):
+            out.append(f"{path}: {key} changed; compatibility not verified")
 
 
 def _version_number(version: object) -> tuple[str, int] | None:
