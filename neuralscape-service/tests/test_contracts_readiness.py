@@ -1922,3 +1922,90 @@ def test_mixed_zones_and_the_spring_gap_use_absolute_time() -> None:
     assert capability_is_ready(observation, evaluated_at=evaluated, max_probe_age_seconds=3599) is False
     utc_evaluated = datetime(2026, 3, 8, 7, 30, tzinfo=timezone.utc)
     assert capability_is_ready(observation, evaluated_at=utc_evaluated, max_probe_age_seconds=3600) is True
+
+
+# ---- a zone that answers differently on each read (a caller-owned tzinfo is arbitrary code)
+
+from datetime import tzinfo  # noqa: E402
+
+
+class FlappingZone(tzinfo):
+    """Reports ``script[0]`` on the first read after ``arm()``, then ``script[1]`` on every later read."""
+
+    def __init__(self, first: timedelta, later: timedelta) -> None:
+        self.first, self.later = first, later
+        self.reads: int | None = None
+
+    def arm(self) -> None:
+        self.reads = 0
+
+    def utcoffset(self, dt):
+        if self.reads is None:
+            return self.first
+        self.reads += 1
+        return self.first if self.reads == 1 else self.later
+
+    def dst(self, dt):
+        return timedelta(0)
+
+    def tzname(self, dt):
+        return "flap"
+
+
+def _flapping_observation(zone: FlappingZone, *, observed: datetime) -> CapabilityReadiness:
+    item = _fold_observation(observed.replace(tzinfo=zone))  # built while the zone is steady
+    zone.arm()
+    return item
+
+
+def test_an_observed_at_zone_that_changes_its_offset_between_reads_cannot_freshen_a_stale_probe() -> None:
+    # First read: UTC, so the probe is 2026-01-01 12:00Z.  Every later read: UTC-12, which would move it to
+    # 2026-01-02 00:00Z and make a probe 12 hours old look brand new at that evaluation time.
+    zone = FlappingZone(timedelta(0), timedelta(hours=-12))
+    observation = _flapping_observation(zone, observed=datetime(2026, 1, 1, 12, 0))
+    evaluated = datetime(2026, 1, 2, 0, 0, tzinfo=timezone.utc)
+    assert capability_is_ready(observation, evaluated_at=evaluated, max_probe_age_seconds=3600) is False
+    assert zone.reads == 1  # the caller's zone was asked once
+
+
+def test_an_evaluated_at_zone_that_changes_its_offset_between_reads_cannot_age_a_fresh_probe() -> None:
+    zone = FlappingZone(timedelta(0), timedelta(hours=-12))
+    observation = _fold_observation(datetime(2026, 1, 1, 11, 30, tzinfo=timezone.utc))
+    evaluated = datetime(2026, 1, 1, 12, 0, tzinfo=zone)
+    zone.arm()
+    assert capability_is_ready(observation, evaluated_at=evaluated, max_probe_age_seconds=3600) is True
+    assert zone.reads == 1
+
+
+def test_a_publication_pins_each_observation_time_once() -> None:
+    zone = FlappingZone(timedelta(0), timedelta(hours=-12))
+    item = _fold_observation(datetime(2026, 1, 1, 12, 0, tzinfo=zone))
+    publication = TenantReadinessPublication(
+        schema_version="candidate-v1", tenant_id="tenant-a", placement_generation=1, capabilities=(item,)
+    )
+    zone.arm()
+    checked = validate_readiness_publication(
+        publication, expected_tenant_id="tenant-a", current_placement_generation=1
+    )
+    assert zone.reads == 1
+    kept = checked.capabilities[0].observed_at
+    assert kept == datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)  # the first read decided the instant
+    # and the value handed back no longer depends on the caller's zone
+    assert capability_is_ready(
+        checked.capabilities[0], evaluated_at=datetime(2026, 1, 1, 12, 30, tzinfo=timezone.utc), max_probe_age_seconds=3600
+    ) is True
+    assert zone.reads == 1
+
+
+def test_pinning_keeps_ordinary_zones_equal_and_naive_values_refused() -> None:
+    ordinary = _fold_observation(datetime(2026, 7, 1, 9, 0, tzinfo=_NEW_YORK))
+    pub = TenantReadinessPublication(schema_version="candidate-v1", tenant_id="t", placement_generation=1, capabilities=(ordinary,))
+    checked = validate_readiness_publication(pub, expected_tenant_id="t", current_placement_generation=1)
+    assert checked == pub and checked.capabilities[0].observed_at.utcoffset() == timedelta(hours=-4)
+    # an ambiguous (fold) time keeps its instant and offset; only the zone object is replaced by the fixed offset
+    observation = _fold_observation(datetime(2026, 11, 1, 1, 30, tzinfo=_NEW_YORK, fold=1))
+    folded = TenantReadinessPublication(schema_version="candidate-v1", tenant_id="t", placement_generation=1, capabilities=(observation,))
+    kept = validate_readiness_publication(folded, expected_tenant_id="t", current_placement_generation=1).capabilities[0].observed_at
+    assert kept.utcoffset() == timedelta(hours=-5) and kept.astimezone(timezone.utc) == datetime(2026, 11, 1, 6, 30, tzinfo=timezone.utc)
+    with pytest.raises(ValueError):
+        capability_is_ready(observation, evaluated_at=datetime(2026, 11, 2), max_probe_age_seconds=1)  # naive

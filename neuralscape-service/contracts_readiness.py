@@ -12,7 +12,7 @@ from typing import Literal
 from pydantic import AwareDatetime, TypeAdapter, model_validator
 
 from contracts_common import OpaqueId, SafeCounter, VersionedContract
-from contracts_tenancy import _closed_graph_snapshot_session
+from contracts_tenancy import _closed_graph_snapshot_session, _inherits
 
 
 ReadinessCapability = Literal[
@@ -70,12 +70,48 @@ def _snapshot_closed_graph(value: object) -> object:
     return rebuild(value)
 
 
+_DATETIME_PARTS = (
+    datetime.year, datetime.month, datetime.day, datetime.hour, datetime.minute, datetime.second,
+    datetime.microsecond,
+)
+
+
+def _pin_datetime(value: object) -> object:
+    """A caller-owned aware ``datetime`` as a plain one with a fixed offset, read exactly once.
+
+    The offset is asked of the caller's ``tzinfo`` a single time (through the built-in accessor) and the
+    fields are read through the built-in descriptors, so a ``tzinfo`` or ``datetime`` subclass that answers
+    differently on each call cannot give validation one instant and the comparison another.  Anything
+    that is not a ``datetime``, and a naive ``datetime``, is returned unchanged for validation to refuse.
+    """
+
+    if not _inherits(type(value), datetime):
+        return value
+    offset = datetime.utcoffset(value)  # type: ignore[arg-type]
+    if offset is None:
+        return value
+    fields = [part.__get__(value, datetime) for part in _DATETIME_PARTS]
+    return datetime(*fields, tzinfo=timezone(offset))
+
+
+def _pin_datetimes(value: object) -> object:
+    """Pin every ``datetime`` in a captured (plain dict, tuple or list) snapshot."""
+
+    if type(value) is dict:
+        return {key: _pin_datetimes(item) for key, item in value.items()}
+    if type(value) in (tuple, list):
+        return type(value)(_pin_datetimes(item) for item in value)
+    return _pin_datetime(value)
+
+
 def _validated_observation_snapshot(
     observation: CapabilityReadiness,
 ) -> CapabilityReadiness:
     if not isinstance(observation, CapabilityReadiness):
         raise TypeError("observation must be a CapabilityReadiness")
-    return CapabilityReadiness.model_validate(_snapshot_closed_graph(observation))
+    return CapabilityReadiness.model_validate(
+        _pin_datetimes(_snapshot_closed_graph(observation))
+    )
 
 
 def _validated_publication_snapshot(
@@ -84,7 +120,7 @@ def _validated_publication_snapshot(
     if not isinstance(publication, TenantReadinessPublication):
         raise TypeError("publication must be a TenantReadinessPublication")
     return TenantReadinessPublication.model_validate(
-        _snapshot_closed_graph(publication)
+        _pin_datetimes(_snapshot_closed_graph(publication))
     )
 
 
@@ -112,18 +148,12 @@ def validate_readiness_publication(
     return publication
 
 
-_DATETIME_PARTS = (
-    datetime.year, datetime.month, datetime.day, datetime.hour, datetime.minute, datetime.second,
-    datetime.microsecond,
-)
-
-
 def _exact_utc(value: datetime) -> datetime:
     """The instant on the UTC timeline as a plain ``datetime``.
 
-    The fields and the offset are read once through the built-in accessors, so a ``datetime`` subclass
-    (an overridden ``astimezone`` or field) or a ``tzinfo`` that answers differently per call cannot
-    change the instant that is compared.
+    Callers pass a value already pinned by ``_pin_datetime`` (a plain ``datetime`` with a fixed offset), so
+    this read is the only one the compared instant depends on; the built-in accessors are used so a
+    ``datetime`` subclass (an overridden ``astimezone`` or field) cannot change it either.
     """
 
     offset = datetime.utcoffset(value)
@@ -148,8 +178,10 @@ def capability_is_ready(
     """
 
     observation = _validated_observation_snapshot(observation)
+    # The caller's timestamp is read once (offset and fields) before validation, and the pinned copy is
+    # what is validated and compared: a zone that answers differently per read cannot split the two.
     validated_evaluation_time = _AWARE_DATETIME_ADAPTER.validate_python(
-        evaluated_at, strict=True
+        _pin_datetime(evaluated_at), strict=True
     )
     validated_max_age = _SAFE_COUNTER_ADAPTER.validate_python(
         max_probe_age_seconds, strict=True
