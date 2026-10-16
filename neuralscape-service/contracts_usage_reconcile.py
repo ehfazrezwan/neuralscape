@@ -9,7 +9,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, GetCoreSchemaHandler, model_validator
 from pydantic_core import core_schema
 
-from contracts_common import ContractModel, OpaqueId, SafeCounter
+from contracts_common import ContractModel, MAX_SAFE_INTEGER, OpaqueId, SafeCounter
 from contracts_usage import (
     AttributionSnapshot,
     AttemptOutcome,
@@ -21,7 +21,7 @@ from contracts_usage import (
 )
 
 
-_MAX_SAFE_COUNTER = 9_007_199_254_740_991
+_MAX_SAFE_COUNTER = MAX_SAFE_INTEGER
 _MODEL_DICT_DESCRIPTOR = BaseModel.__dict__["__dict__"]
 _MODEL_EXTRAS_DESCRIPTOR = BaseModel.__dict__["__pydantic_extra__"]
 _FrozenModelStorage = tuple[
