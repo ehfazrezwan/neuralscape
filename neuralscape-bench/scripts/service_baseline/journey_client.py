@@ -59,6 +59,14 @@ def main():
                                                      "category": "preference", "user_id": USER, "visibility": "private"})
             codes[s] = codes.get(s, 0) + 1
         out = {"status_codes": codes, **drain()}
+    elif cmd == "writenodrain":
+        n, tag = int(sys.argv[2]), sys.argv[3]
+        codes = {}
+        for i in range(n):
+            st, _ = call("POST", "/v1/memories/raw", {"content": f"Journey fact {tag}-{i}: {hashlib.sha256(f'{tag}{i}'.encode()).hexdigest()[:20]}",
+                                                      "category": "preference", "user_id": USER, "visibility": "private"})
+            codes[st] = codes.get(st, 0) + 1
+        out = {"status_codes": codes}
     elif cmd == "drain":
         out = drain()
     elif cmd == "fingerprint":

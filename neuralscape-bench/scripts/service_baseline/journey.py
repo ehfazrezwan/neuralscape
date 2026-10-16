@@ -39,7 +39,7 @@ class Journey:
         self.image = old
 
     def env(self):
-        return {"NS_IMAGE": self.image, "BENCH_DIR": str(BENCH), "OUT_DIR": "/tmp", "TOKEN_SECRET": "bench-token-secret",
+        return {"NS_IMAGE": self.image, "BENCH_DIR": str(BENCH), "OUT_DIR": "/tmp", "TOKEN_SECRET": "",
                 **self.flags}
 
     def compose(self, *args, check=True):
@@ -140,8 +140,38 @@ class Journey:
         return json.loads(p.stdout.strip().splitlines()[-1]) if p.stdout.strip() else {"error": p.stderr[-200:]}
 
 
+def pending_scenario(old, new, out):
+    """Accepted-but-unprocessed intents must survive an image rollback and be applied after re-upgrade."""
+    j = Journey(old, new, out)
+    j.flags = {"LEDGER_ENABLED": "true"}
+    j.image = new
+    j.step("start datastores", lambda: j.start_data())
+    j.step("prepare shared state volume", lambda: j.compose("run", "--rm", "--no-deps", "--user", "0", "--entrypoint", "sh", "seed",
+                                                          "-c", "mkdir -p /state && chmod 777 /state") and "ok")
+    j.step("new: start application", j.start_app)
+    j.step("new: stop the ledger worker", lambda: j.compose("stop", "ledger-worker") and "stopped")
+    j.step("new: accept 10 writes with no worker", lambda: j.client("writenodrain", "10", "pending"))
+    j.step("new: ledger intents (expect pending)", j.intent_counts)
+    j.step("new: fingerprint (expect nothing stored yet)", lambda: j.client("fingerprint"))
+    j.stop_app()
+    j.image = old
+    j.step("rollback: start application (old image)", j.start_app)
+    j.step("old: fingerprint (pending writes are invisible, not lost)", lambda: j.client("fingerprint"))
+    j.step("old: ledger intents", j.intent_counts)
+    j.stop_app()
+    j.image = new
+    j.step("re-upgrade: start application (new image)", j.start_app)
+    j.step("re-upgrade: drain", lambda: j.client("drain"))
+    j.step("new: ledger intents (expect applied)", j.intent_counts)
+    j.step("new: fingerprint (expect 10 memories)", lambda: j.client("fingerprint"))
+    j.step("uninstall: compose down -v", lambda: j.compose("down", "-v", "--remove-orphans") and "ok")
+    Path(out).write_text(json.dumps({"steps": j.steps, "flags": {k: v for k, v in j.flags.items() if "PASSWORD" not in k}}, indent=2))
+
+
 def main():
     scenario, old, new, out = sys.argv[1:5]
+    if scenario == "ledger-pending":
+        return pending_scenario(old, new, out)
     j = Journey(old, new, out)
     sentinel = "ns-g-p6j-sentinel"
     run("docker", "volume", "create", sentinel)
@@ -196,6 +226,11 @@ def main():
     f5 = {}
     j.step("new (re-upgraded): fingerprint", lambda: f5.update(j.client("fingerprint")) or dict(f5))
     mid = j.volumes()
+    ids = run("docker", "ps", "-aq", "--filter", f"label=com.docker.compose.project={PROJECT}").stdout.split()
+    mounted = set()
+    if ids:
+        info = json.loads(run("docker", "inspect", *ids).stdout)
+        mounted = {m["Name"] for c in info for m in c.get("Mounts", []) if m.get("Type") == "volume"}
     j.step("uninstall: compose down -v", lambda: j.compose("down", "-v", "--remove-orphans") and "ok")
     after = j.volumes()
     own_before = [v for v in mid if v.startswith(PROJECT + "_")]
@@ -203,7 +238,9 @@ def main():
                     "project_volumes_after_down": [v for v in after if v.startswith(PROJECT + "_")],
                     "other_volumes_unchanged": [v for v in before if v in after] == before or sorted(set(before) - set(after)) == [],
                     "sentinel_present": sentinel in after,
-                    "volumes_removed_not_ours": sorted(v for v in set(mid) - set(after) if not v.startswith(PROJECT + "_"))})
+                    "volumes_removed_not_project_named": sorted(v for v in set(mid) - set(after) if not v.startswith(PROJECT + "_")),
+                    "removed_volumes_mounted_by_project_containers": sorted(v for v in set(mid) - set(after) if v in mounted),
+                    "removed_volumes_not_project_named_and_not_mounted_by_project": sorted(v for v in set(mid) - set(after) if not v.startswith(PROJECT + "_") and v not in mounted)})
     run("docker", "volume", "rm", sentinel, check=False)
     Path(out).write_text(json.dumps({"steps": j.steps, "flags": {k: v for k, v in j.flags.items() if "PASSWORD" not in k}}, indent=2))
 
