@@ -4314,3 +4314,128 @@ def test_an_unsupported_leaf_type_is_a_stable_error_before_validation(leaf) -> N
 def test_genuine_scalars_enums_and_datetimes_still_pass() -> None:
     manifest = _finish_with_resources((measured_memory(),))
     assert manifest.state is RunState.COMPLETED and manifest.started_at.tzinfo is not None
+
+
+def _shared_pairs(depth: int):
+    node = (measured_memory(),)
+    for _ in range(depth):
+        node = (node, node)  # 2**depth paths over depth+1 tuples
+    return node
+
+
+def test_shared_exact_subtrees_cannot_force_exponential_reconstruction() -> None:
+    import time
+
+    started = time.monotonic()
+    with pytest.raises(ValueError, match="native snapshot budget"):
+        finish_run(
+            planned_manifest(),
+            state=RunState.COMPLETED,
+            started_at=datetime(2026, 9, 28, 8, 0, tzinfo=timezone.utc),
+            finished_at=datetime(2026, 9, 28, 8, 1, tzinfo=timezone.utc),
+            resources=(measured_memory(),),
+            measurements=_shared_pairs(40),
+        )
+    assert time.monotonic() - started < 10
+
+
+def test_a_nesting_depth_past_the_bound_is_a_stable_budget_error() -> None:
+    node: object = ()
+    for _ in range(run_manifest_module.MAX_SNAPSHOT_DEPTH + 5):
+        node = (node,)
+    with pytest.raises(ValueError, match="native snapshot budget"):
+        finish_run(
+            planned_manifest(),
+            state=RunState.COMPLETED,
+            started_at=datetime(2026, 9, 28, 8, 0, tzinfo=timezone.utc),
+            finished_at=datetime(2026, 9, 28, 8, 1, tzinfo=timezone.utc),
+            resources=(measured_memory(),),
+            measurements=node,
+        )
+
+
+def test_an_ordinary_manifest_is_far_inside_the_snapshot_budget() -> None:
+    manifest = completed_manifest()
+    frozen = run_manifest_module._freeze_model_graphs(manifest)
+    run_manifest_module._snapshot_native(manifest, _frozen_graph=frozen)
+    assert frozen.visits[0] < run_manifest_module.MAX_SNAPSHOT_VISITS // 50
+
+
+def test_a_tzinfo_whose_offset_changes_between_calls_cannot_split_validation_from_serialization() -> None:
+    from datetime import timedelta, tzinfo
+
+    calls: list[int] = []
+
+    class Flipping(tzinfo):
+        def utcoffset(self, dt):
+            calls.append(1)
+            return timedelta(0) if len(calls) % 2 else timedelta(hours=5)
+
+        def dst(self, dt):
+            return None
+
+        def tzname(self, dt):
+            return "flip"
+
+    manifest = finish_run(
+        planned_manifest(),
+        state=RunState.COMPLETED,
+        started_at=datetime(2026, 9, 28, 8, 0, tzinfo=Flipping()),
+        finished_at=datetime(2026, 9, 28, 8, 1, tzinfo=timezone.utc),
+        resources=(measured_memory(),),
+        measurements=(timing(),),
+    )
+    after_capture = len(calls)
+    encoded = serialize_run_manifest(manifest)
+    reparsed = validate_run_manifest_json(encoded)
+    assert len(calls) == after_capture  # the hostile tzinfo is never consulted again
+    assert reparsed.started_at == manifest.started_at and serialize_run_manifest(reparsed) == encoded
+
+
+def test_a_tzinfo_with_an_out_of_range_offset_is_a_stable_error() -> None:
+    from datetime import timedelta, tzinfo
+
+    class TooFar(tzinfo):
+        def utcoffset(self, dt):
+            return timedelta(hours=30)
+
+        def dst(self, dt):
+            return None
+
+    with pytest.raises((ValueError, TypeError)):
+        finish_run(
+            planned_manifest(),
+            state=RunState.COMPLETED,
+            started_at=datetime(2026, 9, 28, 8, 0, tzinfo=TooFar()),
+            finished_at=datetime(2026, 9, 28, 8, 1, tzinfo=timezone.utc),
+            resources=(measured_memory(),),
+            measurements=(timing(),),
+        )
+
+
+def test_children_exposed_only_by_a_view_stay_distinct_when_nothing_else_holds_them() -> None:
+    import gc
+
+    base = timing()
+
+    class Fresh(tuple):
+        def __new__(cls, count):
+            instance = super().__new__(cls, ())
+            instance.count = count
+            return instance
+
+        def __iter__(self):
+            for index in range(self.count):
+                child = base.model_copy(update={"name": f"fresh-{index}"})
+                gc.collect()  # the child is referenced only by this generator frame
+                yield child
+
+    manifest = finish_run(
+        planned_manifest(),
+        state=RunState.COMPLETED,
+        started_at=datetime(2026, 9, 28, 8, 0, tzinfo=timezone.utc),
+        finished_at=datetime(2026, 9, 28, 8, 1, tzinfo=timezone.utc),
+        resources=(measured_memory(),),
+        measurements=Fresh(120),
+    )
+    assert [m.name for m in manifest.measurements] == [f"fresh-{i}" for i in range(120)]

@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping
 from types import MappingProxyType
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Annotated, Any, Literal, NamedTuple, Self
 
@@ -83,6 +83,7 @@ class _FrozenGraph(NamedTuple):
     public_sequence_queue: list[object]
     public_sequence_cursor: list[int]
     public_sequences: dict[int, _FrozenPublicSequence]
+    visits: list[int]
 
 
 class _ManifestContract(BaseModel):
@@ -1026,6 +1027,7 @@ def _freeze_model_graphs(*values: Any) -> _FrozenGraph:
         public_sequence_queue=[],
         public_sequence_cursor=[0],
         public_sequences={},
+        visits=[0],
     )
     visited: set[int] = set()
     for value in values:
@@ -1039,6 +1041,20 @@ def _freeze_model_graphs(*values: Any) -> _FrozenGraph:
 
 
 _LEAF_TYPES = (type(None), bool, int, float, str, datetime)
+# The manifest has a handful of levels and a few thousand values.  The snapshot visits each
+# *occurrence* (shared subtrees are not memoized because a public view must be observed once
+# per occurrence), so an unbounded input could do exponential work or exhaust the stack.
+MAX_SNAPSHOT_VISITS = 65_536
+MAX_SNAPSHOT_DEPTH = 64
+SNAPSHOT_BUDGET_MESSAGE = "manifest input exceeds the native snapshot budget"
+
+
+def _charge_snapshot(frozen_graph: _FrozenGraph, active: set[int]) -> None:
+    """Charge one visit and enforce the depth bound (depth = containers on the active path)."""
+
+    frozen_graph.visits[0] += 1
+    if frozen_graph.visits[0] > MAX_SNAPSHOT_VISITS or len(active) > MAX_SNAPSHOT_DEPTH:
+        raise ValueError(SNAPSHOT_BUDGET_MESSAGE)
 
 
 def _is_supported_leaf(value: Any) -> bool:
@@ -1080,6 +1096,25 @@ def _require_native_snapshot(snapshot: Any) -> Any:
     return snapshot
 
 
+def _fixed_offset(value: datetime, path: str) -> datetime:
+    """Read a datetime's UTC offset exactly once and keep a fixed-offset copy.
+
+    A ``tzinfo`` is caller code: its ``utcoffset`` can return a different answer on every
+    call (or depend on ``fold``), so a value validated against one reading could serialize
+    or compare against another.  The offset is read once here, at capture, and the
+    manifest keeps the same wall time under that fixed offset.  A naive value (no offset)
+    is left for validation to refuse.
+    """
+
+    offset = value.utcoffset()
+    if offset is None:
+        return value
+    try:
+        return value.replace(tzinfo=timezone(offset))
+    except (TypeError, ValueError):
+        raise ValueError(f"unsupported UTC offset at {path}") from None
+
+
 def _snapshot_native(
     value: Any,
     *,
@@ -1108,6 +1143,7 @@ def _snapshot_native(
         if identity in active:
             raise ValueError(f"cyclic native input at {path}")
         active.add(identity)
+    _charge_snapshot(_frozen_graph, active)
 
     try:
         if _is_instance(value, BaseModel):
@@ -1276,6 +1312,8 @@ def _snapshot_native(
                 )
                 for index, item in enumerate(list_items)
             ]
+        if type(value) is datetime:
+            return _fixed_offset(value, path)
         return value
     finally:
         if is_container:
