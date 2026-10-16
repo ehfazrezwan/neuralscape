@@ -189,7 +189,7 @@ def _freeze_reachable_model_inventories(
 
     Native dict entries are retained as they are first observed here, so the
     completion pass replays them instead of re-reading the live dict after any
-    public callback has run (ADR-P12-001 D1: first observation, then replay).
+    public callback has run (first observation, then replay).
     """
 
     if mapping_owners is None:
