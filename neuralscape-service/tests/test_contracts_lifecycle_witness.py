@@ -395,3 +395,119 @@ def test_public_first_public_only_receipt_repair_by_intent_callback_is_the_docum
     claim(command, divergent)  # the intent's callback repaired the later, not-yet-observed receipt
     assert divergent.iteration_calls == 1 and NestedRepairingTuple.iteration_calls == 1
     assert trigger.target is public_receipt
+
+
+# ------------------------- the root receipts collection shares the first-observation cache
+class TwoViewTuple(tuple):
+    """A tuple subclass whose public view changes between observations (outside the envelope)."""
+
+    def __new__(cls, native, *views):
+        instance = super().__new__(cls, native)
+        instance.views = list(views)
+        instance.iteration_calls = 0
+        return instance
+
+    def __iter__(self):
+        self.iteration_calls += 1
+        return iter(self.views[min(self.iteration_calls, len(self.views)) - 1])
+
+
+def test_a_root_receipts_tuple_shared_with_the_intent_replays_its_first_view() -> None:
+    """One stateful tuple as ``intent.target_refs`` and as the root ``receipts``: intent validation
+    observes its empty first view, so the root must replay that view (no receipts: only ACCEPTED is
+    legal), never read a second view holding an APPLIED receipt."""
+
+    applied = receipt(CANONICAL, StageStatus.APPLIED)
+
+    def aliased():
+        command = intent(CANONICAL)
+        shared = TwoViewTuple((applied,), (), (applied,))
+        _native_set(command, "target_refs", shared)
+        return command, shared
+
+    command, shared = aliased()
+    with pytest.raises(ValueError):
+        claim(command, shared)
+    assert shared.iteration_calls == 1
+
+    command, shared = aliased()
+    claim(command, shared, IntentStatus.ACCEPTED)  # what the first view supports
+    assert shared.iteration_calls == 1
+
+
+def test_a_root_receipts_subclass_not_shared_is_still_read_through_its_public_view() -> None:
+    applied = receipt(CANONICAL, StageStatus.APPLIED)
+    public = TwoViewTuple((), (applied,))  # the backing is never the answer: the public view is
+    claim(intent(CANONICAL), public)
+    assert public.iteration_calls == 1
+    hidden = TwoViewTuple((applied,), ())
+    with pytest.raises(ValueError):
+        claim(intent(CANONICAL), hidden)  # an APPLIED receipt only the backing holds is not evidence
+    claim(intent(CANONICAL), TwoViewTuple((applied,), ()), IntentStatus.ACCEPTED)
+
+
+# ------------------------------------------- witness resolution is one lookup per witness
+def _witness_heavy_claim(n: int):
+    command, committed = chain_intent()
+    receipts = []
+    for attempt in range(1, n + 1):
+        values = receipt(CANONICAL, StageStatus.APPLIED, committed=committed).model_dump()
+        values["attempt"] = attempt
+        receipts.append(StageReceipt.model_validate(values))
+    for attempt in range(1, n + 1):  # every downstream application cites the last upstream one
+        values = with_witness(receipt(GRAPH, StageStatus.APPLIED, sources=committed), (CANONICAL, n)).model_dump()
+        values["attempt"] = attempt
+        receipts.append(StageReceipt.model_validate(values))
+    return command, tuple(receipts)
+
+
+def _lines_executed_in_the_lifecycle_module(command, receipts) -> int:
+    import sys
+
+    module_file = lc.__file__
+    count = 0
+
+    def tracer(frame, event, arg):
+        nonlocal count
+        if frame.f_code.co_filename != module_file:
+            return None
+        if event == "line":
+            count += 1
+        return tracer
+
+    previous = sys.gettrace()
+    sys.settrace(tracer)
+    try:
+        claim(command, receipts)
+    finally:
+        sys.settrace(previous)
+    return count
+
+
+def test_witness_resolution_work_is_linear_in_the_number_of_applications() -> None:
+    """N upstream and N downstream applications all citing the last upstream attempt: a scan of the
+    upstream history per witness is N^2 work.  Measured deterministically (lines executed in this
+    module, not wall time, so the bound can be tight): doubling N doubles the work.  With a scan
+    per witness the N^2 term alone lifts the ratio to about 2.4 at these sizes."""
+
+    small = _lines_executed_in_the_lifecycle_module(*_witness_heavy_claim(300))
+    large = _lines_executed_in_the_lifecycle_module(*_witness_heavy_claim(600))
+    assert large <= 2.05 * small, (small, large)
+
+
+def test_a_witness_still_has_to_name_an_applied_attempt_with_its_effect() -> None:
+    command, committed = chain_intent()
+    failed = receipt(CANONICAL, StageStatus.FAILED).model_dump()
+    failed["attempt"] = 2
+    failed_attempt = StageReceipt.model_validate(failed)
+    canonical = receipt(CANONICAL, StageStatus.APPLIED, committed=committed)
+    cites_failed = with_witness(receipt(GRAPH, StageStatus.APPLIED, sources=committed), (CANONICAL, 2))
+    with pytest.raises(ValueError, match="upstream application witness"):
+        claim(command, (canonical, failed_attempt, cites_failed))
+    wrong_effect = cites_failed.model_dump()
+    wrong_effect["upstream_applications"] = (
+        lc.UpstreamApplication(intent_id="intent-1", stage=CANONICAL, attempt=1, effect_id="effect-other"),
+    )
+    with pytest.raises(ValueError, match="upstream application witness"):
+        claim(command, (canonical, StageReceipt.model_validate(wrong_effect)))
+    claim(command, (canonical, failed_attempt, with_witness(cites_failed, (CANONICAL, 1))))

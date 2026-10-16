@@ -295,6 +295,39 @@ def _capture_native_contract_graph(
     return _CapturedLeaf(value)
 
 
+def _observed_public_view(
+    source: object,
+    captured_by_identity: dict[Any, Any],
+    budget: DiscoveryBudget,
+) -> Iterator[_CapturedGraph]:
+    """Observe a public view once per call: later edges and revalidations replay it."""
+
+    def public_item(item: object) -> _CapturedGraph:
+        item_type = type(item)
+        if issubclass(item_type, (BaseModel, dict, list, tuple)):
+            frozen = _cached_identity_capture(item, captured_by_identity)
+            if frozen is not None:
+                return frozen
+            return _capture_native_contract_graph(
+                item,
+                captured_by_identity=captured_by_identity,
+                budget=budget,
+            )
+        budget.charge_edge()
+        return _CapturedLeaf(item)
+
+    memo = captured_by_identity.get(("view", id(source)))
+    if memo is not None and memo[0] is source:
+        yield from memo[1]
+        return
+    seen: list[_CapturedGraph] = []
+    for item in source:  # type: ignore[attr-defined]
+        frozen = public_item(item)
+        seen.append(frozen)
+        yield frozen
+    captured_by_identity[("view", id(source))] = (source, tuple(seen))
+
+
 def _materialize_captured_graph(
     value: _CapturedGraph,
     captured_by_identity: dict[Any, Any],
@@ -368,33 +401,8 @@ def _materialize_captured_graph(
                 for key, item in value.entries
             }
 
-        def public_item(item: object) -> _CapturedGraph:
-            item_type = type(item)
-            if issubclass(item_type, (BaseModel, dict, list, tuple)):
-                frozen = _cached_identity_capture(item, captured_by_identity)
-                if frozen is not None:
-                    return frozen
-                return _capture_native_contract_graph(
-                    item,
-                    captured_by_identity=captured_by_identity,
-                    budget=budget,
-                )
-            budget.charge_edge()
-            return _CapturedLeaf(item)
-
         def observed_view(source: object) -> Iterator[_CapturedGraph]:
-            """Observe a public view once per call: later edges and revalidations replay it."""
-
-            memo = captured_by_identity.get(("view", id(source)))
-            if memo is not None and memo[0] is source:
-                yield from memo[1]
-                return
-            seen: list[_CapturedGraph] = []
-            for item in source:  # type: ignore[attr-defined]
-                frozen = public_item(item)
-                seen.append(frozen)
-                yield frozen
-            captured_by_identity[("view", id(source))] = (source, tuple(seen))
+            return _observed_public_view(source, captured_by_identity, budget)
 
         if isinstance(value, _CapturedList):
             items = value.items if is_exact_type(value.source, list) else observed_view(value.source)
@@ -985,7 +993,17 @@ def _revalidated_claim_inputs(
             budget,
         )
 
-    checked = tuple(revalidate_receipt(receipt) for receipt in receipts)
+    if is_exact_type(receipts, tuple):
+        public_receipts: tuple[object, ...] = tuple(tuple.__iter__(receipts))
+    else:
+        # A tuple subclass's public view is read through the same first-observation cache as
+        # every nested view: if the intent already observed this object (one tuple shared
+        # between a field and the root), its first view is replayed, never a second one.
+        public_receipts = tuple(
+            item.value if isinstance(item, _CapturedLeaf) else item.source
+            for item in _observed_public_view(receipts, receipt_inventory, budget)
+        )
+    checked = tuple(revalidate_receipt(receipt) for receipt in public_receipts)
 
     requirements = {item.stage: item for item in checked_intent.stage_requirements}
     for receipt in checked:
@@ -1157,9 +1175,16 @@ def validate_required_stage_claim(
                     "applications it consumed"
                 )
             for upstream, witness in cited.items():
-                if witness.intent_id != intent.id or not any(
-                    (item.attempt, item.effect_id) == (witness.attempt, witness.effect_id)
-                    for item in applied_by_stage[upstream]
+                # One indexed lookup per witness (a scan of the upstream history would make
+                # many applications citing one upstream attempt quadratic).  An attempt with an
+                # APPLIED receipt is indexed by that receipt: any other receipt for the same
+                # attempt is either equal to it or refused as a conflict above.
+                upstream_receipt = attempt_receipts.get((upstream, witness.attempt))
+                if (
+                    witness.intent_id != intent.id
+                    or upstream_receipt is None
+                    or upstream_receipt.status is not StageStatus.APPLIED
+                    or upstream_receipt.effect_id != witness.effect_id
                 ):
                     raise ValueError(
                         "upstream application witness does not name an applied upstream receipt"
