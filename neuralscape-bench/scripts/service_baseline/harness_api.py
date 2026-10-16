@@ -25,4 +25,4 @@ if os.environ.get("HARNESS_WIRE_ENFORCER") == "1":
 
 import uvicorn  # noqa: E402
 
-uvicorn.run("main:app", host="0.0.0.0", port=8199, workers=1)
+uvicorn.run("main:app", host="0.0.0.0", port=8199, workers=int(os.environ.get("UVICORN_WORKERS", "1")))

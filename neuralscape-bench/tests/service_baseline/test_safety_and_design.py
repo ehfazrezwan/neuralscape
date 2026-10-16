@@ -99,3 +99,10 @@ def test_backend_evidence_reports_ledger_line_and_authority_tables(monkeypatch):
     assert evidence["ledger_log_lines"] == ["2026 TaskManager durable ledger enabled (backend=postgres)"]
     assert evidence["authority"] == {"backend": "postgres", "tables": {"subjects": 2, "policies": 5}}
     assert "authority" not in runner.backend_evidence({})  # authority off: nothing claimed
+
+
+def test_worker_scaling_arms_only_change_the_api_process_count():
+    from neuralscape_bench.service_baseline.runner import ARMS
+
+    assert ARMS["plain-w2"] == {"UVICORN_WORKERS": "2"} and ARMS["plain-w4"] == {"UVICORN_WORKERS": "4"}
+    assert ARMS["plain"] == {}

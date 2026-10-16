@@ -83,7 +83,7 @@ services:
     image: ${NS_IMAGE}
     restart: on-failure
     command: ["python", "/bench/scripts/service_baseline/harness_api.py"]
-    environment: {<<: *service-env, MCP_TRANSPORT: http, UVICORN_WORKERS: "1"}
+    environment: {<<: *service-env, MCP_TRANSPORT: http, UVICORN_WORKERS: "${UVICORN_WORKERS:-1}"}
     volumes: [ "${BENCH_DIR}:/bench:ro", "ingest_data:/data/ingest", "state:/state" ]
     depends_on:
       neo4j: {condition: service_healthy}

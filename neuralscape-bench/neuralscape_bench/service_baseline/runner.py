@@ -162,6 +162,8 @@ TOKEN_SECRET = "bench-token-secret"
 PG_OWNER_PASSWORD = "bench-owner-password"
 PG_DSN = "host=pg dbname=postgres user=ns_owner password=" + PG_OWNER_PASSWORD + " options='-c search_path={schema}'"
 ARMS: dict[str, dict[str, str]] = {
+    "plain-w2": {"UVICORN_WORKERS": "2"},
+    "plain-w4": {"UVICORN_WORKERS": "4"},
     "ledger-pg": {"LEDGER_ENABLED": "true", "LEDGER_BACKEND": "postgres",
                   "LEDGER_POSTGRES_DSN": PG_DSN.format(schema="ledger")},
     "governed-pg": {"LEDGER_ENABLED": "true", "LEDGER_BACKEND": "postgres",
