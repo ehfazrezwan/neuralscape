@@ -141,6 +141,22 @@ _MAPPING_BASES = (_AbcMapping, dict, MappingProxyType)
 _TYPE_DICT_DESCRIPTOR = type.__dict__["__dict__"]
 
 
+def _inherits(value: object, *bases: type) -> bool:
+    """Whether ``value``'s concrete class inherits from one of ``bases``, decided by identity.
+
+    ``isinstance`` reads ``value.__class__``, which an object can override to report any
+    class (a plain iterable reporting ``list``), and the ABC machinery behind ``BaseModel``
+    honours registration.  The concrete type's native MRO compared with ``is`` cannot be
+    spoofed and keeps genuine subclasses.
+    """
+
+    for base in _TYPE_MRO_DESCRIPTOR.__get__(type(value)):
+        for candidate in bases:
+            if base is candidate:
+                return True
+    return False
+
+
 def _is_mapping(value: object) -> bool:
     """Whether ``value`` is a mapping by inheritance, decided by identity only.
 
@@ -361,7 +377,7 @@ def _reject_retained_unknown_fields(
             pending.extend((item, child_depth) for item in reversed(items))
 
     def walk(value: Any, location: tuple[str | int, ...]) -> None:
-        if not (isinstance(value, (BaseModel, list, tuple, set, frozenset)) or _is_mapping(value)):
+        if not (_inherits(value, BaseModel, list, tuple, set, frozenset) or _is_mapping(value)):
             return
 
         identity = id(value)
@@ -371,7 +387,7 @@ def _reject_retained_unknown_fields(
         if identity not in discovered:
             discover(value, len(location))
 
-        if isinstance(value, BaseModel):
+        if _inherits(value, BaseModel):
             declared = _native_declared_field_names(type(value))
             if declared is None:
                 raise ValueError("contract model field storage is unavailable")
@@ -418,7 +434,7 @@ def _reject_retained_unknown_fields(
                 retained_value = (
                     stored[name] if name in stored else pydantic_extra.get(name)
                 )
-                error_location = name if isinstance(name, (str, int)) else repr(name)
+                error_location = name if _inherits(name, str, int) else repr(name)
                 errors.append(
                     {
                         "type": "extra_forbidden",
@@ -438,7 +454,7 @@ def _reject_retained_unknown_fields(
             )
             for index, (key, item) in enumerate(items):
                 walk(key, (*location, "<key>", index))
-                item_location = key if isinstance(key, (str, int)) else index
+                item_location = key if _inherits(key, str, int) else index
                 walk(item, (*location, item_location))
             return
 
@@ -448,7 +464,7 @@ def _reject_retained_unknown_fields(
                 budget.charge_edge(2)  # public view charged as it is observed
                 observed_pairs.append((key, item))
                 walk(key, (*location, "<key>", index))
-                item_location = key if isinstance(key, (str, int)) else index
+                item_location = key if _inherits(key, str, int) else index
                 walk(item, (*location, item_location))
             public_view_inventory[identity] = (value, tuple(observed_pairs))
             return
@@ -512,7 +528,7 @@ def _reconstruct_retained_state(
         return items
 
     def rebuild(value: Any) -> Any:
-        if not (isinstance(value, (BaseModel, list, tuple, set, frozenset)) or _is_mapping(value)):
+        if not (_inherits(value, BaseModel, list, tuple, set, frozenset) or _is_mapping(value)):
             return value
 
         identity = id(value)
@@ -530,7 +546,7 @@ def _reconstruct_retained_state(
         return result
 
     def build(value: Any) -> Any:
-        if isinstance(value, BaseModel):
+        if _inherits(value, BaseModel):
             stored_entries, extra_entries = _validated_model_storage(
                 value, model_inventory
             )
@@ -551,11 +567,11 @@ def _reconstruct_retained_state(
             )
         else:
             items = observed(value)  # the first observation, never a second iteration
-        if isinstance(value, list):
+        if _inherits(value, list):
             return [rebuild(item) for item in items]
-        if isinstance(value, tuple):
+        if _inherits(value, tuple):
             return tuple(rebuild(item) for item in items)
-        if isinstance(value, set):
+        if _inherits(value, set):
             return {rebuild(item) for item in items}
         return frozenset(rebuild(item) for item in items)
 

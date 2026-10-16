@@ -3679,3 +3679,60 @@ def test_the_receiving_boundary_never_reads_the_clock() -> None:
 
     source = inspect.getsource(contracts_portability)
     assert not [word for word in ("datetime.now", "time.time", "utcnow", "monotonic(") if word in source]
+
+
+# ---- concrete types decide traversal and reconstruction; a spoofed ``__class__`` is not a container
+
+
+def _spoofing(cls, items):
+    class Spoof:
+        @property
+        def __class__(self):
+            return cls
+
+        def __iter__(self):
+            return iter(items)
+
+        def __len__(self):
+            return len(items)
+
+    return Spoof()
+
+
+@pytest.mark.parametrize("claimed", [list, tuple])
+def test_an_object_spoofing_a_container_class_is_refused_with_an_otherwise_valid_inventory(claimed) -> None:
+    files = valid_manifest()["files"]  # the complete inventory, envelope included
+    assert validate_portable_manifest(_manifest_with_files(list(files)))  # the same items as a real list validate
+    with pytest.raises(ValidationError):
+        validate_portable_manifest(_manifest_with_files(_spoofing(claimed, files)))
+
+
+def test_an_object_spoofing_list_inside_a_nested_value_is_refused() -> None:
+    document = valid_manifest()
+    document["scope"]["project_ids"] = _spoofing(list, list(document["scope"]["project_ids"]))
+    with pytest.raises(ValidationError):
+        validate_portable_manifest(document)
+
+
+def test_a_genuine_list_subclass_with_the_valid_inventory_still_validates() -> None:
+    class Inventory(list):
+        pass
+
+    files = valid_manifest()["files"]
+    validated = validate_portable_manifest(_manifest_with_files(Inventory(files)))
+    assert [f.path for f in validated.files] == [f["path"] for f in files]
+
+
+def test_an_object_spoofing_the_manifest_class_is_refused() -> None:
+    real = validate_portable_manifest(valid_manifest())
+
+    class Impostor:
+        @property
+        def __class__(self):
+            return type(real)
+
+        def __getattr__(self, name):
+            return getattr(real, name)
+
+    with pytest.raises(ValidationError):
+        validate_portable_manifest(Impostor())
