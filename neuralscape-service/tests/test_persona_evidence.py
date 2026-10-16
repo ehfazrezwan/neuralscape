@@ -133,3 +133,102 @@ def test_two_oracle_files_naming_one_scenario_are_refused(tmp_path) -> None:
 
 def test_the_manifest_digest_is_pinned_by_this_reviewed_constant() -> None:
     assert hashlib.sha256((ORACLES / "ORACLE-MANIFEST.json").read_bytes()).hexdigest() == EXPECTED_MANIFEST_SHA256
+
+
+# ---- review corrections: relative paths, content-free errors, run identity, invalid values, report integrity
+
+import os
+
+
+def test_a_relative_service_dir_is_resolved_once(monkeypatch) -> None:
+    monkeypatch.chdir(SERVICE_DIR.parent)
+    observed = pe.observe(Path(SERVICE_DIR.name))  # relative, as a user would type it
+    assert set(observed) == set(persona_probes.SCENARIOS)
+    assert not all("absent" in item for item in observed.values()), observed  # the tree was found, not tree/tree
+
+
+def test_an_error_text_never_reaches_a_persisted_record(tmp_path) -> None:
+    secret = "s3cret-token /home/someone/private"
+    (tmp_path / "schemas.py").write_text(f"raise ValueError({secret!r})\n")
+    out = tmp_path / "evidence.jsonl"
+    records = pe.run(tmp_path, "baseline", "leaky-tree", ORACLES, out, "run-leak")
+    body = out.read_text()
+    assert "s3cret" not in body and "someone" not in body
+    assert any(item.verdict == "invalid_attempt" and "ValueError" in item.note for item in records), [i.note for i in records]
+
+
+def test_a_probe_error_message_is_reduced_to_a_class_name_in_the_note() -> None:
+    oracle = {"expected": {"candidate": {"verdict": "candidate_pass", "facts": {"a": "1"}}}}
+    verdict, _seen, note = pe.judge("candidate", {"error": "ValueError: s3cret /private/path"}, oracle)
+    assert verdict == "invalid_attempt" and "s3cret" not in note and "/private" not in note
+
+
+def test_a_reused_run_id_with_another_subject_is_refused_and_the_same_subject_is_idempotent(tmp_path) -> None:
+    out = tmp_path / "evidence.jsonl"
+    pe.run(tmp_path, "baseline", "tree-a", ORACLES, out, "run-1")
+    again = pe.run(tmp_path, "baseline", "tree-a", ORACLES, out, "run-1")
+    assert len(again) == len(persona_probes.SCENARIOS)
+    before = out.read_bytes()
+    with pytest.raises(pe.RunIdentityConflict):
+        pe.run(tmp_path, "baseline", "tree-b", ORACLES, out, "run-1")
+    assert out.read_bytes() == before  # nothing was written
+    assert len(pe.run(tmp_path, "baseline", "tree-b", ORACLES, out, "run-2")) == len(persona_probes.SCENARIOS)
+
+
+def test_a_reused_run_id_with_another_oracle_is_refused(tmp_path) -> None:
+    out = tmp_path / "evidence.jsonl"
+    pe.run(tmp_path, "baseline", "tree-a", ORACLES, out, "run-1")
+    copy = tmp_path / "oracles"
+    shutil.copytree(ORACLES, copy)
+    target = copy / "persona-lifecycle-state.json"
+    document = json.loads(target.read_text())
+    document["oracle_version"] = document["oracle_version"] + "-next"
+    target.write_text(json.dumps(document, indent=1, sort_keys=True) + "\n")
+    manifest = json.loads((copy / pe.MANIFEST).read_text())
+    manifest["oracles"]["persona-lifecycle-state.json"] = hashlib.sha256(target.read_bytes()).hexdigest()
+    (copy / pe.MANIFEST).write_text(json.dumps(manifest, indent=1, sort_keys=True) + "\n")
+    with pytest.raises(pe.RunIdentityConflict):
+        pe.run(tmp_path, "baseline", "tree-a", copy, out, "run-1")
+
+
+def test_a_probe_value_outside_the_fact_format_is_an_invalid_attempt_and_the_run_continues(tmp_path, monkeypatch) -> None:
+    oracle = {"expected": {"candidate": {"verdict": "candidate_pass", "facts": {"a": "1"}}}}
+    verdict, seen, note = pe.judge("candidate", {"facts": {"a": "?"}}, oracle)
+    assert verdict == "invalid_attempt" and seen == {"probe": "invalid-value"} and "?" not in note
+
+    real = pe.observe(SERVICE_DIR)
+    first = sorted(real)[0]
+    broken = {k: dict(v) for k, v in real.items()}
+    broken[first] = {"persona": "p", "facts": {"freshness": "?"}}
+    monkeypatch.setattr(pe, "observe", lambda _dir: broken)
+    out = tmp_path / "evidence.jsonl"
+    records = pe.run(SERVICE_DIR, "candidate", "this-tree", ORACLES, out, "run-bad")
+    assert len(records) == len(persona_probes.SCENARIOS)
+    assert {item.scenario_id: item.verdict for item in records}[first] == "invalid_attempt"
+    assert len(ev.EvidenceWriter(out).read().records) == len(persona_probes.SCENARIOS)
+
+
+def _evidence_with_damage(tmp_path, *, tail: str) -> Path:
+    out = tmp_path / "evidence.jsonl"
+    pe.run(tmp_path, "baseline", "tree-a", ORACLES, out, "run-1")
+    with out.open("ab") as handle:
+        handle.write(tail.encode())
+    return out
+
+
+def test_the_report_names_damaged_evidence_and_exits_nonzero(tmp_path, capsys) -> None:
+    report = tmp_path / "report.md"
+    for tail, marker in (("{not json}\n", "invalid"), ('{"partial": ', "partial")):
+        out = _evidence_with_damage(tmp_path, tail=tail)
+        code = pe.main(["report", "--evidence", str(out), "--out", str(report)])
+        text = report.read_text()
+        assert code != 0 and marker in text.lower(), (tail, code, text[-300:])
+        out.unlink()
+
+
+def test_the_report_of_clean_evidence_exits_zero_without_a_warning(tmp_path) -> None:
+    out = tmp_path / "evidence.jsonl"
+    pe.run(tmp_path, "baseline", "tree-a", ORACLES, out, "run-1")
+    report = tmp_path / "report.md"
+    assert pe.main(["report", "--evidence", str(out), "--out", str(report)]) == 0
+    assert "integrity" not in report.read_text().lower()

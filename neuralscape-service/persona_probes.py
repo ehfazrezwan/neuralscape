@@ -181,7 +181,7 @@ def observe_all() -> dict[str, dict[str, object]]:
             foreign = _foreign_modules()
             out[scenario_id] = {"persona": persona, "foreign": foreign} if foreign else {"persona": persona, "absent": str(error)}
         except Exception as error:  # noqa: BLE001 - recorded as an invalid attempt by the caller
-            out[scenario_id] = {"persona": persona, "error": f"{type(error).__name__}: {str(error)[:120]}"}
+            out[scenario_id] = {"persona": persona, "error": type(error).__name__}  # the class only: message text can hold content
     return out
 
 

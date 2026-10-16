@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -27,6 +28,20 @@ MANIFEST = "ORACLE-MANIFEST.json"
 
 class OracleError(Exception):
     """An oracle file is missing, altered or not listed in the manifest."""
+
+
+class RunIdentityConflict(Exception):
+    """A run id was reused for a different subject or oracle; the stored records belong to the first."""
+
+
+_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_.]{0,79}$")
+
+
+def _class_name(text: object) -> str:
+    """A probe failure reduced to an exception class name; message text never crosses this boundary."""
+
+    head = str(text).split(":", 1)[0].strip()
+    return head if _NAME.match(head) else "Exception"
 
 
 def load_oracles(directory: Path) -> dict[str, tuple[dict, str]]:  # noqa: C901
@@ -57,6 +72,7 @@ def observe(service_dir: Path) -> dict[str, dict]:
     the harness's tree.  A failing probe process is reported per scenario, so no run is lost.
     """
 
+    service_dir = Path(service_dir).resolve()  # once: the probe process runs inside this directory
     try:
         done = subprocess.run(
             [sys.executable, "-P", str(PROBES), "--service-dir", str(service_dir), "--harness-dir", str(PROBES.parent)],
@@ -76,10 +92,15 @@ def _scenario_ids() -> list[str]:
 def judge(role: str, observation: dict, oracle: dict) -> tuple[str, dict[str, str], str]:
     expected = oracle["expected"][role]
     if "error" in observation:
-        return "invalid_attempt", {"probe": "error"}, observation["error"][:300]
+        return "invalid_attempt", {"probe": "error"}, f"probe failed: {_class_name(observation['error'])}"
     if "foreign" in observation:
-        return "invalid_attempt", {"probe": "foreign-module"}, "a module came from the harness tree, not the target: " + ", ".join(observation["foreign"])[:200]
+        names = [name for name in map(str, observation["foreign"]) if _NAME.match(name)]
+        return "invalid_attempt", {"probe": "foreign-module"}, "a module came from the harness tree, not the target: " + ", ".join(names)[:200]
     seen = {"capability": "absent"} if "absent" in observation else dict(observation["facts"])
+    try:
+        facts(seen)
+    except ValueError:  # a value outside the token format: kept as an attempt, never as a verdict or a crash
+        return "invalid_attempt", {"probe": "invalid-value"}, "probe value outside the fact token format"
     verdict = expected["verdict"] if seen == expected["facts"] else "unexpected_failure"
     note = "" if verdict == expected["verdict"] else "observation differs from the oracle: investigate, do not relabel"
     return verdict, seen, note
@@ -90,6 +111,14 @@ def run(service_dir: Path, role: str, subject_ref: str, oracles_dir: Path, out: 
     observed = observe(service_dir)
     writer = EvidenceWriter(out)
     existing = {record.record_id: record for record in writer.read().records}
+    for scenario_id, (oracle, digest) in oracles.items():
+        stored = existing.get(f"{run_id}.{role}.{scenario_id}")
+        if stored is not None and (
+            stored.subject_ref != subject_ref or stored.oracle_sha256 != digest or stored.oracle_version != oracle["oracle_version"]
+        ):
+            raise RunIdentityConflict(
+                f"run id {run_id!r} already holds records for a different subject or oracle; use a new run id"
+            )
     written = []
     for scenario_id, (oracle, digest) in sorted(oracles.items()):
         observation = observed.get(scenario_id, {"error": "scenario is not defined in the probes"})
@@ -123,13 +152,28 @@ def main(argv: list[str] | None = None) -> int:
     reporter.add_argument("--out", required=True)
     args = parser.parse_args(argv)
     if args.command == "run":
-        records = run(Path(args.service_dir), args.role, args.subject_ref, Path(args.oracles), Path(args.out), args.run_id)
+        try:
+            records = run(Path(args.service_dir), args.role, args.subject_ref, Path(args.oracles), Path(args.out), args.run_id)
+        except RunIdentityConflict as conflict:
+            print(f"error: {conflict}", file=sys.stderr)
+            return 2
         for record in records:
             print(f"{record.scenario_id}: {record.verdict}")
         return 0
     read = EvidenceWriter(args.evidence).read()
-    Path(args.out).write_text(render_report(compare(read.records)))
-    return 0
+    text = render_report(compare(read.records))
+    damaged = bool(read.invalid_lines or read.partial_tail)
+    if damaged:
+        notes = ["", "## Evidence integrity", ""]
+        if read.invalid_lines:
+            notes.append(f"- {len(read.invalid_lines)} invalid line(s) at line number(s) {', '.join(map(str, read.invalid_lines[:20]))}")
+        if read.partial_tail:
+            notes.append("- partial tail: the file ends without a newline (an interrupted append)")
+        notes.append("- this comparison is built from the valid records only and is incomplete")
+        text = text.rstrip("\n") + "\n" + "\n".join(notes) + "\n"
+        print("error: the evidence file is damaged; see the report's integrity section", file=sys.stderr)
+    Path(args.out).write_text(text)
+    return 2 if damaged else 0
 
 
 if __name__ == "__main__":
