@@ -4194,3 +4194,35 @@ def test_the_module_no_longer_has_a_drain_then_freeze_mapping_reader() -> None:
     import contracts_policy_reference
 
     assert not hasattr(contracts_policy_reference, "_mapping_items")
+
+
+def _unpack_error(value) -> tuple[type, str]:
+    try:
+        key, item = value  # noqa: F841 - the reference behaviour
+    except Exception as error:
+        return type(error), str(error)
+    raise AssertionError("unpacking succeeded")
+
+
+class _IterReturnsList:
+    def __iter__(self):
+        return [1, 2]
+
+
+class _IterRaisesTypeError:
+    def __iter__(self):
+        raise TypeError("the object's own message")
+
+
+class _NoIteration:
+    __iter__ = None
+
+
+@pytest.mark.parametrize("value", [_IterReturnsList(), _IterRaisesTypeError(), _NoIteration(), 5, None, object()])
+def test_pair_reading_raises_exactly_what_unpacking_raises(value) -> None:
+    from contracts_policy_reference import _open_pair
+
+    expected = _unpack_error(value)
+    with pytest.raises(Exception) as caught:
+        _open_pair(value)
+    assert (type(caught.value), str(caught.value)) == expected

@@ -424,6 +424,8 @@ def _open_pair(raw_entry: object) -> tuple[object, object, Iterator[object] | No
     try:
         iterator = iter(raw_entry)  # type: ignore[call-overload]
     except TypeError:
+        if _defines_iter(type(raw_entry)):
+            raise  # unpacking reports the iteration protocol's own error unchanged
         raise TypeError(f"cannot unpack non-iterable {type(raw_entry).__name__} object") from None
     try:
         key = next(iterator)
@@ -434,6 +436,20 @@ def _open_pair(raw_entry: object) -> tuple[object, object, Iterator[object] | No
     except StopIteration:
         raise ValueError("not enough values to unpack (expected 2, got 1)") from None
     return key, value, iterator
+
+
+_CLASS_DICT = vars(type)["__dict__"]
+
+
+def _defines_iter(cls: type) -> bool:
+    """Whether any class on ``cls``'s own MRO defines ``__iter__`` (even as ``None``).
+
+    That is when unpacking reports ``iter()``'s own ``TypeError``; a type with no ``__iter__`` at
+    all gets "cannot unpack non-iterable".  The class dictionaries are read through the base
+    ``type`` descriptor, so no metaclass hook runs.
+    """
+
+    return any("__iter__" in _CLASS_DICT.__get__(base) for base in _TYPE_MRO.__get__(cls))
 
 
 def _close_pair(rest: Iterator[object] | None) -> None:
