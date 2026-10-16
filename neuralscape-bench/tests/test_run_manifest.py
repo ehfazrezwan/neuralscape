@@ -694,6 +694,28 @@ class PublicViewList(list[object]):
         return iter(self.public_values)
 
 
+class EventPublicList(list[object]):
+    """Expose a passive public list view and record observation order."""
+
+    def __init__(
+        self,
+        values: list[object],
+        public_values: list[object],
+        events: list[str],
+        name: str,
+    ):
+        super().__init__(values)
+        self.public_values = public_values
+        self.events = events
+        self.name = name
+        self.iteration_calls = 0
+
+    def __iter__(self):
+        self.iteration_calls += 1
+        self.events.append(f"{self.name}:iter")
+        return iter(self.public_values)
+
+
 class PublicResourceWithDeepNativeBacking(dict[str, object]):
     """Expose a valid resource while retaining a deep native-only graph."""
 
@@ -1260,6 +1282,190 @@ def test_mapping_inventory_completes_nested_public_tuple_before_parent_advance()
     assert public_exclusions.iteration_calls == 1
 
 
+@pytest.mark.parametrize("sequence_kind", ["tuple", "list"])
+def test_initial_public_sequence_inventory_replays_alias_once(
+    sequence_kind: str,
+):
+    public_values = ({"value": 1},)
+    if sequence_kind == "tuple":
+        sequence = PublicViewTuple((), public_values)
+        expected = public_values
+    else:
+        sequence = PublicViewList([], list(public_values))
+        expected = list(public_values)
+
+    frozen = _freeze_model_graphs(sequence, {"alias": sequence})
+
+    assert frozen.public_sequence_owners[id(sequence)] is sequence
+    assert sequence.iteration_calls == 1
+    assert _snapshot_native(sequence, _frozen_graph=frozen) == expected
+    assert _snapshot_native(
+        {"alias": sequence}, _frozen_graph=frozen
+    ) == {"alias": expected}
+    assert sequence.iteration_calls == 1
+
+
+@pytest.mark.parametrize("sequence_kind", ["tuple", "list"])
+def test_initial_public_sequence_inventory_ignores_hidden_subclass_backing(
+    sequence_kind: str,
+):
+    events: list[str] = []
+    hidden = EventPublicTuple((), ("hidden-public",), events, "hidden")
+    if sequence_kind == "tuple":
+        outer = EventPublicTuple(
+            (hidden,),
+            ("outer-public",),
+            events,
+            "outer",
+        )
+        expected = ("outer-public",)
+    else:
+        outer = EventPublicList(
+            [hidden],
+            ["outer-public"],
+            events,
+            "outer",
+        )
+        expected = ["outer-public"]
+
+    frozen = _freeze_model_graphs(outer)
+
+    assert _snapshot_native(outer, _frozen_graph=frozen) == expected
+    assert outer.iteration_calls == 1
+    assert hidden.iteration_calls == 0
+    assert id(hidden) not in frozen.public_sequence_owners
+
+
+@pytest.mark.parametrize("sequence_kind", ["tuple", "list"])
+def test_initial_public_sequence_inventory_precedes_public_mapping_observation(
+    sequence_kind: str,
+):
+    events: list[str] = []
+    if sequence_kind == "tuple":
+        sequence = EventPublicTuple((), (1,), events, "sequence")
+    else:
+        sequence = EventPublicList([], [1], events, "sequence")
+    mapping = InventoryMapping(
+        (("value", 1),),
+        name="mapping",
+        events=events,
+    )
+
+    _freeze_model_graphs(mapping, sequence)
+
+    assert events.index("sequence:iter") < events.index("mapping:items")
+    assert sequence.iteration_calls == 1
+    assert mapping.items_calls == 1
+
+
+@pytest.mark.parametrize(
+    ("sequence_type", "retains_prefix", "expected_advancement_calls"),
+    [
+        (IteratorAcquisitionErrorTuple, False, 0),
+        (IteratorAdvancementErrorTuple, True, 2),
+        (IteratorAcquisitionErrorList, False, 0),
+        (IteratorAdvancementErrorList, True, 2),
+    ],
+    ids=[
+        "tuple-iterator-acquisition",
+        "tuple-iterator-advancement",
+        "list-iterator-acquisition",
+        "list-iterator-advancement",
+    ],
+)
+def test_initial_public_sequence_inventory_defers_terminal_failure(
+    sequence_type,
+    retains_prefix: bool,
+    expected_advancement_calls: int,
+):
+    sequence = sequence_type("prefix")
+
+    frozen = _freeze_model_graphs(sequence)
+
+    retained = frozen.public_sequences[id(sequence)]
+    assert retained.owner is sequence
+    assert retained.entries == (("prefix",) if retains_prefix else ())
+    assert retained.failure is sequence.error
+    assert retained.complete is False
+    assert sequence.iteration_calls == 1
+    assert getattr(sequence, "advancement_calls", 0) == (
+        expected_advancement_calls
+    )
+    assert _snapshot_native(
+        {"safe": "value"}, _frozen_graph=frozen
+    ) == {"safe": "value"}
+
+    with pytest.raises(RuntimeError) as first_error:
+        _snapshot_native(sequence, _frozen_graph=frozen)
+    with pytest.raises(RuntimeError) as alias_error:
+        _snapshot_native({"alias": sequence}, _frozen_graph=frozen)
+
+    assert first_error.value is sequence.error
+    assert alias_error.value is sequence.error
+    assert sequence.iteration_calls == 1
+    assert getattr(sequence, "advancement_calls", 0) == (
+        expected_advancement_calls
+    )
+
+
+@pytest.mark.parametrize(
+    "sequence_type",
+    [
+        IteratorAcquisitionErrorTuple,
+        IteratorAdvancementErrorTuple,
+        IteratorAcquisitionErrorList,
+        IteratorAdvancementErrorList,
+    ],
+    ids=[
+        "tuple-iterator-acquisition",
+        "tuple-iterator-advancement",
+        "list-iterator-acquisition",
+        "list-iterator-advancement",
+    ],
+)
+def test_initial_public_sequence_inventory_preserves_finish_error_order(
+    sequence_type,
+):
+    resources = sequence_type(measured_memory())
+    invalid_planned = planned_manifest()
+    invalid_concurrency = invalid_planned.concurrency[0].model_copy(
+        update={"value": True}
+    )
+    invalid_planned = invalid_planned.model_copy(
+        update={"concurrency": (invalid_concurrency,)}
+    )
+
+    with pytest.raises(ValidationError) as invalid_error:
+        finish_run(
+            invalid_planned,
+            state=RunState.COMPLETED,
+            started_at=datetime(2026, 9, 28, 8, 0, tzinfo=timezone.utc),
+            finished_at=datetime(2026, 9, 28, 8, 1, tzinfo=timezone.utc),
+            resources=resources,
+            measurements=(timing(),),
+        )
+
+    assert invalid_error.value.errors()[0]["loc"] == (
+        "concurrency",
+        0,
+        "value",
+    )
+    assert resources.iteration_calls == 1
+
+    with pytest.raises(RuntimeError) as reached_error:
+        finish_run(
+            planned_manifest(),
+            state=RunState.COMPLETED,
+            started_at=datetime(2026, 9, 28, 8, 0, tzinfo=timezone.utc),
+            finished_at=datetime(2026, 9, 28, 8, 1, tzinfo=timezone.utc),
+            resources=resources,
+            measurements=(timing(),),
+        )
+
+    assert reached_error.value is resources.error
+    assert resources.iteration_calls == 2
+
+
 @pytest.mark.parametrize(
     ("sequence_type", "retains_prefix", "expected_advancement_calls"),
     [
@@ -1744,14 +1950,14 @@ def test_public_mapping_observation_failure_stays_deferred_to_receiver_order():
     assert reached_mapping.items_calls == 1
 
 
-def test_public_only_tuple_mapping_keeps_lazy_first_observation():
+def test_authoritative_tuple_mapping_is_inventoried_during_shared_freeze():
     mapping = InventoryMapping((("value", 1),))
     parent = PublicViewTuple((), (mapping,))
 
     frozen = _freeze_model_graphs(parent)
 
-    assert mapping.items_calls == 0
-    assert id(mapping) not in frozen.public_mapping_owners
+    assert mapping.items_calls == 1
+    assert frozen.public_mapping_owners[id(mapping)] is mapping
     assert _snapshot_native(parent, _frozen_graph=frozen) == ({"value": 1},)
     assert parent.iteration_calls == 1
     assert mapping.items_calls == 1
@@ -3342,8 +3548,8 @@ def test_finish_preserves_lazy_exact_dict_priority_and_shared_capture():
             resources=(measured_memory(),),
             measurements=measurements,
         )
-    assert measurements.iteration_calls == 0
-    assert public.items_calls == 0
+    assert measurements.iteration_calls == 1
+    assert public.items_calls == 1
     assert shared_trigger.iteration_calls == 0
     assert shared_callbacks == []
 
@@ -3502,3 +3708,212 @@ def test_receiving_boundaries_reject_lists_malformed_models_and_cycles():
     cyclic = completed_manifest().model_copy(update={"resources": cycle})
     with pytest.raises(ValueError, match="cyclic native input"):
         serialize_run_manifest(cyclic)
+
+
+class HybridMappingTuple(tuple[object, ...]):
+    """A tuple that is also a Mapping, with a side effect in sequence iteration."""
+
+    def __new__(cls, values: dict[str, object], action: Callable[[], None]):
+        instance = super().__new__(cls, ())
+        instance.values = values
+        instance.action = action
+        instance.sequence_iterations = 0
+        return instance
+
+    def __getitem__(self, key: object) -> object:
+        return self.values[key]
+
+    def __len__(self) -> int:
+        return len(self.values)
+
+    def __iter__(self):
+        self.sequence_iterations += 1
+        self.action()
+        return iter(self.values)
+
+    def items(self):
+        return iter(tuple(self.values.items()))
+
+
+class HybridMappingList(list[object]):
+    """A list that is also a Mapping, with a side effect in sequence iteration."""
+
+    def __init__(self, values: dict[str, object], action: Callable[[], None]):
+        super().__init__()
+        self.values = values
+        self.action = action
+        self.sequence_iterations = 0
+
+    def __getitem__(self, key: object) -> object:
+        return self.values[key]
+
+    def __len__(self) -> int:
+        return len(self.values)
+
+    def __iter__(self):
+        self.sequence_iterations += 1
+        self.action()
+        return iter(self.values)
+
+    def items(self):
+        return iter(tuple(self.values.items()))
+
+
+Mapping.register(HybridMappingTuple)
+Mapping.register(HybridMappingList)
+
+
+def _finish_with_measurement(measurement: object) -> RunManifest:
+    return finish_run(
+        planned_manifest(),
+        state=RunState.COMPLETED,
+        started_at=datetime(2026, 9, 28, 8, 0, tzinfo=timezone.utc),
+        finished_at=datetime(2026, 9, 28, 8, 1, tzinfo=timezone.utc),
+        resources=(measured_memory(),),
+        measurements=(measurement,),
+    )
+
+
+@pytest.mark.parametrize("hybrid_type", [HybridMappingTuple, HybridMappingList])
+def test_mapping_view_of_sequence_hybrid_is_observed_before_sequence_iteration(
+    hybrid_type,
+):
+    invalid_values = timing().model_dump(mode="python")
+    invalid_values["provenance"] = dict(
+        invalid_values["provenance"], clock="wall-clock"
+    )
+
+    # Equivalent plain data is rejected.
+    with pytest.raises(ValidationError):
+        _finish_with_measurement(invalid_values)
+
+    # The hybrid exposes the same mapping at first observation; its sequence
+    # iterator would repair the value if it were consulted first.
+    hybrid_values = dict(invalid_values)
+
+    def repair() -> None:
+        hybrid_values["provenance"] = timing().provenance.model_dump(
+            mode="python"
+        )
+
+    hybrid = hybrid_type(hybrid_values, repair)
+    with pytest.raises(ValidationError):
+        _finish_with_measurement(hybrid)
+    assert hybrid.sequence_iterations == 0
+
+
+@pytest.mark.parametrize("hybrid_type", [HybridMappingTuple, HybridMappingList])
+def test_mapping_view_of_sequence_hybrid_valid_control_is_accepted(hybrid_type):
+    values = timing().model_dump(mode="python")
+    hybrid = hybrid_type(values, lambda: None)
+
+    manifest = _finish_with_measurement(hybrid)
+
+    assert manifest.measurements[0] == timing()
+
+
+class HiddenAliasItemsDict(dict[object, object]):
+    """Public items are the supplied pairs; native backing is separate."""
+
+    def __init__(self, public_pairs: tuple[tuple[object, object], ...]):
+        super().__init__()
+        self.public_pairs = public_pairs
+
+    def items(self):
+        return iter(self.public_pairs)
+
+
+class PairsMapping(Mapping[str, object]):
+    def __init__(self, values: dict[str, object]):
+        self.values = values
+
+    def __getitem__(self, key: str) -> object:
+        return self.values[key]
+
+    def __iter__(self):
+        return iter(self.values)
+
+    def __len__(self) -> int:
+        return len(self.values)
+
+
+def _shared_exclusions_alias_shape(exclusion: dict[str, object]):
+    """Two measurements share one exclusions tuple subclass.
+
+    The tuple's public exclusion item is a dict subclass whose hidden native
+    backing refers to the first measurement Mapping, whose exclusions point
+    back to the tuple.  The public graph has no cycle.
+    """
+
+    first_values = timing().model_dump(mode="python")
+    first_values["name"] = "first"
+    first = PairsMapping(first_values)
+    item = HiddenAliasItemsDict(tuple(exclusion.items()))
+    item["hidden-alias"] = first
+    shared = PublicViewTuple((), (item,))
+    first_values["exclusions"] = shared
+    second = timing().model_dump(mode="python")
+    second["name"] = "second"
+    second["exclusions"] = shared
+    return first, second, shared
+
+
+def _plain_pair(exclusion: dict[str, object]):
+    plain = []
+    for name in ("first", "second"):
+        values = timing().model_dump(mode="python")
+        values["name"] = name
+        values["exclusions"] = (exclusion,)
+        plain.append(values)
+    return tuple(plain)
+
+
+@pytest.mark.parametrize("second_first", [False, True])
+def test_shared_exclusions_alias_through_hidden_backing_is_rejected(second_first):
+    """Pin: conservative rejection, never acceptance (input-envelope fail-closed).
+
+    Equivalent plain JSON is accepted; the hidden-backing alias shape is
+    rejected with the stable incomplete-inventory error rather than yielding a
+    manifest.  If a later change starts accepting this shape, the accepted
+    data must equal the plain public view and this test must be updated
+    deliberately.
+    """
+
+    exclusion = timing().model_dump(mode="python")["exclusions"][0]
+    plain = _plain_pair(exclusion)
+    assert _finish_with_measurements(
+        tuple(reversed(plain)) if second_first else plain
+    ).measurements
+
+    first, second, _shared = _shared_exclusions_alias_shape(exclusion)
+    measurements = (second, first) if second_first else (first, second)
+
+    with pytest.raises(ValueError, match="incomplete public mapping inventory"):
+        _finish_with_measurements(measurements)
+
+
+@pytest.mark.parametrize("second_first", [False, True])
+def test_shared_exclusions_alias_through_hidden_backing_never_accepts_invalid_data(
+    second_first,
+):
+    invalid = dict(timing().model_dump(mode="python")["exclusions"][0], count=0)
+    plain = _plain_pair(invalid)
+    with pytest.raises(ValidationError):
+        _finish_with_measurements(tuple(reversed(plain)) if second_first else plain)
+
+    first, second, _shared = _shared_exclusions_alias_shape(invalid)
+    measurements = (second, first) if second_first else (first, second)
+
+    with pytest.raises(ValueError):
+        _finish_with_measurements(measurements)
+
+
+def _finish_with_measurements(measurements: tuple[object, ...]) -> RunManifest:
+    return finish_run(
+        planned_manifest(),
+        state=RunState.COMPLETED,
+        started_at=datetime(2026, 9, 28, 8, 0, tzinfo=timezone.utc),
+        finished_at=datetime(2026, 9, 28, 8, 1, tzinfo=timezone.utc),
+        resources=(measured_memory(),),
+        measurements=measurements,
+    )

@@ -78,6 +78,9 @@ class _FrozenGraph(NamedTuple):
     public_mapping_queue: list[Mapping[Any, Any]]
     public_mappings: dict[int, _FrozenPublicMapping]
     completed_mapping_discoveries: dict[int, tuple[object, bool]]
+    public_sequence_owners: dict[int, object]
+    public_sequence_queue: list[object]
+    public_sequence_cursor: list[int]
     public_sequences: dict[int, _FrozenPublicSequence]
 
 
@@ -353,6 +356,30 @@ def _retain_public_mapping(value: Any, frozen_graph: _FrozenGraph) -> bool:
     return True
 
 
+def _retain_public_sequence(value: Any, frozen_graph: _FrozenGraph) -> bool:
+    """Retain a strong owner for one nonexact public sequence.
+
+    A tuple/list subclass that is also a Mapping is observed as a mapping, the
+    same way every other dispatcher treats it, so its sequence iterator is not
+    consulted before its mapping items.
+    """
+
+    if (
+        isinstance(value, (BaseModel, Mapping))
+        or type(value) in (tuple, list)
+        or not isinstance(value, (tuple, list))
+    ):
+        return False
+    identity = id(value)
+    owner = frozen_graph.public_sequence_owners.get(identity)
+    if owner is value:
+        return False
+    frozen_graph.public_sequence_owners[identity] = value
+    frozen_graph.public_sequence_queue.append(value)
+    frozen_graph.public_sequences.pop(identity, None)
+    return True
+
+
 def _retain_extra_mapping(
     value: Any,
     frozen_graph: _FrozenGraph,
@@ -519,6 +546,47 @@ def _freeze_model_storage(
         pending.extend(reversed(entries))
 
 
+def _retain_reachable_public_sequences(
+    value: Any,
+    frozen_graph: _FrozenGraph,
+) -> None:
+    """Retain public sequences on authoritative frozen-storage paths."""
+
+    pending = [(value, True)]
+    visited: dict[int, bool] = {}
+    while pending:
+        current, authoritative = pending.pop()
+        identity = id(current)
+        previous_authority = visited.get(identity)
+        if identity in visited and (
+            previous_authority is True or not authoritative
+        ):
+            continue
+        visited[identity] = authoritative
+
+        is_model = isinstance(current, BaseModel)
+        if not is_model and authoritative:
+            _retain_public_sequence(current, frozen_graph)
+
+        value_type = type(current)
+        if not issubclass(value_type, (BaseModel, tuple, list, dict)):
+            continue
+        frozen_replay = frozen_graph.replay_entries.get(identity)
+        if frozen_replay is None or frozen_replay[0] is not current:
+            _freeze_model_storage(current, frozen_graph, set())
+            frozen_replay = frozen_graph.replay_entries[identity]
+        _owner, entries = frozen_replay
+        local_authority = issubclass(value_type, BaseModel) or value_type in (
+            dict,
+            list,
+            tuple,
+        )
+        child_authority = authoritative and local_authority
+        pending.extend(
+            (item, child_authority) for item in reversed(entries)
+        )
+
+
 def _traverse_model_storage(
     value: Any,
     frozen_graph: _FrozenGraph,
@@ -621,6 +689,7 @@ def _inventory_reachable_public_mappings(
             and type(current) not in (tuple, list)
             and isinstance(current, (tuple, list))
         ):
+            _retain_public_sequence(current, frozen_graph)
             active_owner = observing.get(identity)
             if active_owner is current:
                 return False
@@ -728,6 +797,25 @@ def _inventory_public_sequence(
     return complete
 
 
+def _inventory_retained_public_sequences(frozen_graph: _FrozenGraph) -> None:
+    """Observe retained public sequences in deterministic discovery order."""
+
+    observing: dict[int, object] = {}
+    while frozen_graph.public_sequence_cursor[0] < len(
+        frozen_graph.public_sequence_queue
+    ):
+        cursor = frozen_graph.public_sequence_cursor[0]
+        owner = frozen_graph.public_sequence_queue[cursor]
+        frozen_graph.public_sequence_cursor[0] = cursor + 1
+        identity = id(owner)
+        if frozen_graph.public_sequence_owners.get(identity) is not owner:
+            continue
+        frozen = frozen_graph.public_sequences.get(identity)
+        if frozen is not None and frozen.owner is owner:
+            continue
+        _inventory_public_sequence(owner, frozen_graph, observing)
+
+
 def _inventory_yielded_public_shape(
     value: Any,
     frozen_graph: _FrozenGraph,
@@ -748,6 +836,7 @@ def _inventory_yielded_public_shape(
         ):
             if observing.get(identity) is value:
                 return False
+            _retain_public_sequence(value, frozen_graph)
             if not _inventory_public_sequence(value, frozen_graph, observing):
                 return False
 
@@ -848,7 +937,23 @@ def _inventory_retained_public_mappings(frozen_graph: _FrozenGraph) -> None:
 
 
 def _freeze_model_graphs(*values: Any) -> _FrozenGraph:
-    """Capture every supplied native graph in one shared inventory."""
+    """Capture every supplied native graph in one shared inventory.
+
+    Supported inputs are JSON-compatible data, the project's own models and
+    exact built-in containers, plus container subclasses read through their
+    public views once at first observation.  Native backing that a public view
+    hides is discovered defensively but is never authoritative.
+
+    Hidden-backing aliases can make the shared discovery conservative: for
+    example a shared exclusions tuple reachable from two measurements, whose
+    public item has hidden backing that refers to the other measurement, is
+    rejected with ``incomplete public mapping inventory`` even though its
+    public views are acyclic.  That is a supported fail-closed outcome for
+    in-process objects outside the input envelope (equivalent plain JSON is
+    accepted); what must never happen is acceptance of data that differs from
+    the public view captured at first observation.
+    ``test_shared_exclusions_alias_through_hidden_backing_*`` pin this shape.
+    """
 
     frozen_graph = _FrozenGraph(
         models={},
@@ -863,12 +968,18 @@ def _freeze_model_graphs(*values: Any) -> _FrozenGraph:
         public_mapping_queue=[],
         public_mappings={},
         completed_mapping_discoveries={},
+        public_sequence_owners={},
+        public_sequence_queue=[],
+        public_sequence_cursor=[0],
         public_sequences={},
     )
     visited: set[int] = set()
     for value in values:
         _freeze_model_storage(value, frozen_graph, visited)
+    for value in values:
+        _retain_reachable_public_sequences(value, frozen_graph)
     _inventory_retained_extra_mappings(frozen_graph)
+    _inventory_retained_public_sequences(frozen_graph)
     _inventory_retained_public_mappings(frozen_graph)
     return frozen_graph
 
@@ -996,26 +1107,28 @@ def _snapshot_native(
             else:
                 frozen_sequence = _frozen_graph.public_sequences.get(identity)
                 if (
-                    frozen_sequence is not None
-                    and frozen_sequence.owner is value
+                    frozen_sequence is None
+                    or frozen_sequence.owner is not value
                 ):
-                    projected = tuple(
-                        _snapshot_native(
-                            item,
-                            path=f"{path}[{index}]",
-                            active=active,
-                            _frozen_graph=_frozen_graph,
-                        )
-                        for index, item in enumerate(frozen_sequence.entries)
+                    _retain_public_sequence(value, _frozen_graph)
+                    _inventory_public_sequence(value, _frozen_graph, {})
+                    frozen_sequence = _frozen_graph.public_sequences[identity]
+                projected = tuple(
+                    _snapshot_native(
+                        item,
+                        path=f"{path}[{index}]",
+                        active=active,
+                        _frozen_graph=_frozen_graph,
                     )
-                    if frozen_sequence.failure is not None:
-                        raise frozen_sequence.failure
-                    if not frozen_sequence.complete:
-                        raise ValueError(
-                            f"incomplete public sequence inventory at {path}"
-                        )
-                    return projected
-                tuple_items = value
+                    for index, item in enumerate(frozen_sequence.entries)
+                )
+                if frozen_sequence.failure is not None:
+                    raise frozen_sequence.failure
+                if not frozen_sequence.complete:
+                    raise ValueError(
+                        f"incomplete public sequence inventory at {path}"
+                    )
+                return projected
             return tuple(
                 _snapshot_native(
                     item,
@@ -1036,26 +1149,28 @@ def _snapshot_native(
             else:
                 frozen_sequence = _frozen_graph.public_sequences.get(identity)
                 if (
-                    frozen_sequence is not None
-                    and frozen_sequence.owner is value
+                    frozen_sequence is None
+                    or frozen_sequence.owner is not value
                 ):
-                    projected = [
-                        _snapshot_native(
-                            item,
-                            path=f"{path}[{index}]",
-                            active=active,
-                            _frozen_graph=_frozen_graph,
-                        )
-                        for index, item in enumerate(frozen_sequence.entries)
-                    ]
-                    if frozen_sequence.failure is not None:
-                        raise frozen_sequence.failure
-                    if not frozen_sequence.complete:
-                        raise ValueError(
-                            f"incomplete public sequence inventory at {path}"
-                        )
-                    return projected
-                list_items = value
+                    _retain_public_sequence(value, _frozen_graph)
+                    _inventory_public_sequence(value, _frozen_graph, {})
+                    frozen_sequence = _frozen_graph.public_sequences[identity]
+                projected = [
+                    _snapshot_native(
+                        item,
+                        path=f"{path}[{index}]",
+                        active=active,
+                        _frozen_graph=_frozen_graph,
+                    )
+                    for index, item in enumerate(frozen_sequence.entries)
+                ]
+                if frozen_sequence.failure is not None:
+                    raise frozen_sequence.failure
+                if not frozen_sequence.complete:
+                    raise ValueError(
+                        f"incomplete public sequence inventory at {path}"
+                    )
+                return projected
             return [
                 _snapshot_native(
                     item,
