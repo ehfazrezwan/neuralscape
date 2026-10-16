@@ -67,6 +67,7 @@ MAX_MANIFEST_BYTES = 16 * 1024**2
 MAX_COMPRESSION_RATIO = 200
 RATIO_MIN_ENTRY_BYTES = 1024**2
 MAX_DIRECTORY_DEPTH = 64
+MAX_CENTRAL_DIRECTORY_BYTES = 64 * 1024**2
 _CHUNK = 64 * 1024
 _READ_ERRORS = (
     OSError,
@@ -400,9 +401,15 @@ def _inventory_zip(
 
     entries: list[_Entry] = []
     for info in infos:
-        is_dir = info.is_dir()
-        name = _classify_name(info.filename.rstrip("/") if is_dir else info.filename, report)
+        # ``filename`` is cut at the first NUL by the archive library; the raw name
+        # is what other extractors use, so classify that one.
+        raw_name = info.orig_filename
+        is_dir = raw_name.endswith("/")
+        name = _classify_name(raw_name.rstrip("/") if is_dir else raw_name, report)
         if name is None:
+            continue
+        if is_dir and info.file_size != 0:
+            report.add(ENTRY_CORRUPT, _safe_label(name), "directory record carries data")
             continue
         mode = info.external_attr >> 16
         problem = _mode_finding(mode) if mode else None
@@ -422,23 +429,28 @@ def _inventory_zip(
 def _walk_directory(root: str, report: VerificationReport) -> list[_Entry]:
     entries: list[_Entry] = []
     total = 0
+    observed = 0  # every child seen anywhere in the tree, accepted or not
     stack: list[tuple[str, str, int]] = [(root, "", 0)]
     while stack:
         directory, prefix, depth = stack.pop()
         if depth > MAX_DIRECTORY_DEPTH:
             report.add(ENTRY_COUNT_LIMIT, _safe_label(prefix), "directory depth")
             return []
+        unsorted: list[os.DirEntry] = []
         try:
             with os.scandir(directory) as scan:
-                children = sorted(scan, key=lambda item: item.name)
+                for child in scan:
+                    observed += 1
+                    if observed > MAX_BUNDLE_ENTRIES:
+                        report.add(ENTRY_COUNT_LIMIT)
+                        return []
+                    unsorted.append(child)
         except OSError:
             report.add(CONTAINER_UNREADABLE, _safe_label(prefix))
             return []
+        children = sorted(unsorted, key=lambda item: item.name)  # bounded by the limit above
         for child in children:
             relative = f"{prefix}{child.name}"
-            if len(entries) >= MAX_BUNDLE_ENTRIES:
-                report.add(ENTRY_COUNT_LIMIT)
-                return []
             try:
                 info = child.stat(follow_symlinks=False)
             except OSError:
@@ -648,6 +660,15 @@ def _verify_open(
     # Payload bytes are hashed only when every structural check above is clean.
     if report.findings:
         return
+    if zf is not None:
+        # A directory record must hold an empty stream, whatever its headers claim.
+        for entry in entries:
+            if entry.kind == "dir":
+                result = _hash_entry(entry, zf, 0)
+                if result is None or result[0] != 0:
+                    report.add(ENTRY_CORRUPT, _safe_label(entry.name), "directory record carries data")
+        if report.findings:
+            return
     for path, entry in candidates:
         descriptor = declared[path]
         result = _hash_entry(entry, zf, descriptor.size_bytes)
@@ -661,6 +682,67 @@ def _verify_open(
             report.add(DIGEST_MISMATCH, _safe_label(path))
         else:
             report.files_verified += 1
+
+
+def _precheck_central_directory(target: str, report: VerificationReport) -> bool:
+    """Bound the central directory with small reads before the archive is parsed.
+
+    The archive library reads the whole central directory and allocates one record
+    object per entry before any limit can apply.  This reads only the end record
+    (and the zip64 end record when present), refuses a directory larger than
+    ``MAX_CENTRAL_DIRECTORY_BYTES`` or declaring more than ``MAX_BUNDLE_ENTRIES``
+    records, then walks the directory itself counting records, so a lying end-record
+    count cannot bypass the limit.  An archive without a locatable end record is left
+    to the parser, which reports it unreadable.
+    """
+
+    try:
+        with open(target, "rb") as raw:
+            raw.seek(0, os.SEEK_END)
+            size = raw.tell()
+            window = min(size, _EOCD.size + 0xFFFF)
+            raw.seek(size - window)
+            tail = raw.read(window)
+            position = tail.rfind(_EOCD_SIGNATURE)
+            if position < 0 or len(tail) - position < _EOCD.size:
+                return True
+            fields = _EOCD.unpack(tail[position : position + _EOCD.size])
+            entries, cd_size, cd_offset = fields[4], fields[5], fields[6]
+            eocd_at = size - window + position
+            if entries == 0xFFFF or cd_size == _U32_MAX or cd_offset == _U32_MAX:
+                locator_at = eocd_at - 20
+                if locator_at < 0:
+                    return True
+                raw.seek(locator_at)
+                locator = raw.read(20)
+                if locator[:4] != _ZIP64_LOCATOR_SIGNATURE:
+                    return True
+                raw.seek(struct.unpack_from("<Q", locator, 8)[0])
+                record = raw.read(56)
+                if len(record) != 56 or record[:4] != _ZIP64_EOCD_SIGNATURE:
+                    return True
+                entries = struct.unpack_from("<Q", record, 32)[0]
+                cd_size, cd_offset = struct.unpack_from("<QQ", record, 40)
+            if cd_size > MAX_CENTRAL_DIRECTORY_BYTES:
+                report.add(SIZE_LIMIT, "<bundle>", "central directory")
+                return False
+            if entries > MAX_BUNDLE_ENTRIES:
+                report.add(ENTRY_COUNT_LIMIT)
+                return False
+            raw.seek(cd_offset)
+            directory = raw.read(cd_size)
+    except OSError:
+        return True
+    records = 0
+    cursor = 0
+    while cursor + 46 <= len(directory) and directory[cursor : cursor + 4] == b"PK\x01\x02":
+        records += 1
+        if records > MAX_BUNDLE_ENTRIES:
+            report.add(ENTRY_COUNT_LIMIT)
+            return False
+        name_length, extra_length, comment_length = struct.unpack_from("<HHH", directory, cursor + 28)
+        cursor += 46 + name_length + extra_length + comment_length
+    return True
 
 
 def verify_bundle(path: str | os.PathLike[str]) -> VerificationReport:
@@ -678,6 +760,8 @@ def verify_bundle(path: str | os.PathLike[str]) -> VerificationReport:
         return report
     if not os.path.isfile(target):
         report.add(CONTAINER_UNREADABLE, "<bundle>")
+        return report
+    if not _precheck_central_directory(target, report):
         return report
     try:
         archive = zipfile.ZipFile(target)

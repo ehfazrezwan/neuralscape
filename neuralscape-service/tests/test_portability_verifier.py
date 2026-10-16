@@ -721,3 +721,136 @@ def test_deflate_output_must_match_declared_length_and_crc(tmp_path, kind) -> No
     path.write_bytes(bytes(raw))
     assert _codes(verify_bundle(path)) <= {pv.ENTRY_CORRUPT, pv.SIZE_MISMATCH}
     assert not verify_bundle(path).ok
+
+
+# --- review findings: raw names, directory records, bounded enumeration -----------
+
+
+def _rename_member_in_both_headers(raw: bytearray, old: bytes, new: bytes) -> None:
+    """Rewrite a member name in its local and central headers (same length)."""
+
+    assert len(old) == len(new)
+    count = 0
+    position = raw.find(old)
+    while position != -1:
+        raw[position : position + len(old)] = new
+        count += 1
+        position = raw.find(old, position + len(new))
+    assert count == 2  # local header and central record
+
+
+def test_a_nul_in_a_raw_member_name_is_rejected_not_truncated(tmp_path) -> None:
+    # The archive library truncates names at the first NUL, so "safe\x00suffix" would
+    # otherwise be checked (and matched to the manifest) as "safe".
+    files = {"canonical/safe": b"payload\n"}
+    path = tmp_path / "b.zip"
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr("manifest.json", json.dumps(_manifest(files)))
+        archive.writestr("canonical/safeXsuffix.txt", files["canonical/safe"])
+    raw = bytearray(path.read_bytes())
+    _rename_member_in_both_headers(raw, b"canonical/safeXsuffix.txt", b"canonical/safe\x00suffix.txt")
+    path.write_bytes(bytes(raw))
+    with zipfile.ZipFile(path) as archive:
+        assert "canonical/safe" in archive.namelist()  # what a truncating reader sees
+    report = verify_bundle(path)
+    assert not report.ok
+    assert pv.PATH_UNSAFE in _codes(report)
+
+
+@pytest.mark.parametrize("method", [zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED])
+def test_a_directory_record_carrying_a_payload_is_rejected(tmp_path, method) -> None:
+    path = tmp_path / "b.zip"
+    with zipfile.ZipFile(path, "w", method) as archive:
+        archive.writestr("manifest.json", json.dumps(_manifest(PAYLOAD)))
+        for name, data in PAYLOAD.items():
+            archive.writestr(name, data)
+        archive.writestr("hidden/", b"secret bytes")
+    report = verify_bundle(path)
+    assert not report.ok
+
+
+def test_a_directory_record_whose_stream_lies_about_being_empty_is_rejected(tmp_path) -> None:
+    import struct
+
+    path = tmp_path / "b.zip"
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("manifest.json", json.dumps(_manifest(PAYLOAD)))
+        for name, data in PAYLOAD.items():
+            archive.writestr(name, data)
+        archive.writestr("hidden/", b"secret bytes")
+    raw = bytearray(path.read_bytes())
+    # Claim an uncompressed size of 0 (and CRC 0) in both headers; the deflate stream still holds bytes.
+    _patch_member(raw, "hidden/", local=True, central=True, usize=0, crc=0)
+    path.write_bytes(bytes(raw))
+    report = verify_bundle(path)
+    assert not report.ok
+
+
+def test_an_empty_directory_record_is_still_accepted(tmp_path) -> None:
+    path = tmp_path / "b.zip"
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr("manifest.json", json.dumps(_manifest(PAYLOAD)))
+        for name, data in PAYLOAD.items():
+            archive.writestr(name, data)
+        archive.writestr("canonical/", b"")
+    assert verify_bundle(path).ok
+
+
+def test_directory_enumeration_counts_every_child_including_rejected_ones(tmp_path, monkeypatch) -> None:
+    root = _write_dir(tmp_path / "b", PAYLOAD)
+    for index in range(40):
+        os.symlink("/etc/passwd", root / f"link-{index}")  # rejected entries still count
+    monkeypatch.setattr(pv, "MAX_BUNDLE_ENTRIES", 20)
+    report = verify_bundle(root)
+    assert pv.ENTRY_COUNT_LIMIT in _codes(report)
+    assert len(report.findings) <= 21  # bounded findings, not one per child
+
+
+def test_a_wide_directory_is_not_buffered_and_sorted_before_the_limit(tmp_path, monkeypatch) -> None:
+    root = _write_dir(tmp_path / "b", PAYLOAD)
+    for index in range(50):
+        (root / f"extra-{index}").write_bytes(b"x")
+    monkeypatch.setattr(pv, "MAX_BUNDLE_ENTRIES", 10)
+    real_sorted = sorted
+    sizes: list[int] = []
+
+    def watching_sorted(iterable, *args, **kwargs):
+        result = real_sorted(iterable, *args, **kwargs)
+        sizes.append(len(result))
+        return result
+
+    monkeypatch.setattr(pv, "sorted", watching_sorted, raising=False)
+    assert pv.ENTRY_COUNT_LIMIT in _codes(verify_bundle(root))
+    assert all(size <= 11 for size in sizes)
+
+
+def test_central_directory_limits_apply_before_the_archive_is_parsed(tmp_path, monkeypatch) -> None:
+    path = _write_zip(tmp_path / "b.zip", PAYLOAD)
+    monkeypatch.setattr(pv, "MAX_BUNDLE_ENTRIES", 2)
+
+    def must_not_parse(*args, **kwargs):
+        raise AssertionError("the archive was parsed before the central-directory limits")
+
+    monkeypatch.setattr(pv.zipfile, "ZipFile", must_not_parse)
+    assert _codes(verify_bundle(path)) == {pv.ENTRY_COUNT_LIMIT}
+
+
+def test_a_central_directory_larger_than_its_byte_limit_is_refused_unparsed(tmp_path, monkeypatch) -> None:
+    path = _write_zip(tmp_path / "b.zip", PAYLOAD)
+    monkeypatch.setattr(pv, "MAX_CENTRAL_DIRECTORY_BYTES", 64, raising=False)
+    monkeypatch.setattr(pv.zipfile, "ZipFile", lambda *a, **k: pytest.fail("parsed"))
+    assert _codes(verify_bundle(path)) == {pv.SIZE_LIMIT}
+
+
+def test_a_lying_end_record_count_does_not_bypass_the_record_limit(tmp_path, monkeypatch) -> None:
+    import struct
+
+    path = _write_zip(tmp_path / "b.zip", PAYLOAD)
+    raw = bytearray(path.read_bytes())
+    eocd = raw.rindex(b"PK\x05\x06")
+    struct.pack_into("<HH", raw, eocd + 8, 1, 1)  # claims one record; the directory holds three
+    path.write_bytes(bytes(raw))
+    monkeypatch.setattr(pv, "MAX_BUNDLE_ENTRIES", 2)
+    monkeypatch.setattr(pv.zipfile, "ZipFile", lambda *a, **k: pytest.fail("parsed"))
+    report = verify_bundle(path)
+    assert not report.ok and _codes(report) & {pv.ENTRY_COUNT_LIMIT, pv.ARCHIVE_FRAMING}
