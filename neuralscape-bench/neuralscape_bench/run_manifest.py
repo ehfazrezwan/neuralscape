@@ -84,6 +84,9 @@ class _FrozenGraph(NamedTuple):
     public_sequence_cursor: list[int]
     public_sequences: dict[int, _FrozenPublicSequence]
     visits: list[int]
+    # id -> (the caller's datetime, its fixed-offset copy): one offset per object per call.  The
+    # original is retained so its id cannot be reused by another object during the call.
+    fixed_datetimes: dict[int, tuple[datetime, datetime]]
 
 
 class _ManifestContract(BaseModel):
@@ -1087,6 +1090,7 @@ def _freeze_model_graphs(*values: Any) -> _FrozenGraph:
         public_sequence_cursor=[0],
         public_sequences={},
         visits=[0],
+        fixed_datetimes={},
     )
     visited: set[int] = set()
     for value in values:
@@ -1404,7 +1408,14 @@ def _snapshot_native(
                 for index, item in enumerate(list_items)
             ]
         if type(value) is datetime:
-            return _fixed_offset(value, path)
+            # One offset per object for the whole call: the same datetime supplied twice (for
+            # example as both timestamps) is read once, at its first occurrence.
+            cached = _frozen_graph.fixed_datetimes.get(identity)
+            if cached is not None and cached[0] is value:
+                return cached[1]
+            fixed = _fixed_offset(value, path)
+            _frozen_graph.fixed_datetimes[identity] = (value, fixed)
+            return fixed
         return value
     finally:
         if is_container:

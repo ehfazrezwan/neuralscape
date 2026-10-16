@@ -9,7 +9,7 @@ import subprocess
 import sys
 from abc import ABCMeta
 from collections.abc import Mapping
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, tzinfo
 from zoneinfo import ZoneInfo
 from pathlib import Path
 from types import MappingProxyType
@@ -4842,6 +4842,40 @@ def test_native_capture_is_charged_before_its_entries_are_retained(build) -> Non
 def test_native_capture_within_the_budget_is_kept() -> None:
     graph = run_manifest_module._freeze_model_graphs([[] for _ in range(1_000)])
     assert len(graph.replay_entries) == 1_001
+
+
+class _FlippingOffset(tzinfo):
+    """Reports one UTC offset on the first call and another on every later call."""
+
+    def __init__(self, first: timedelta, then: timedelta) -> None:
+        self.answers = [first, then]
+        self.calls = 0
+
+    def utcoffset(self, dt):
+        self.calls += 1
+        return self.answers[0] if self.calls == 1 else self.answers[1]
+
+    def dst(self, dt):
+        return None
+
+
+@pytest.mark.parametrize(
+    "first,then",
+    [(timedelta(0), timedelta(hours=-5)), (timedelta(hours=-5), timedelta(0))],
+    ids=["utc-then-minus-five", "minus-five-then-utc"],
+)
+def test_one_datetime_supplied_twice_is_read_with_one_offset(first, then) -> None:
+    shared = datetime(2026, 9, 28, 8, 0, tzinfo=_FlippingOffset(first, then))
+    finished = finish_run(
+        planned_manifest(),
+        state=RunState.COMPLETED,
+        started_at=shared,
+        finished_at=shared,
+        resources=(measured_memory(),),
+        measurements=(timing(),),
+    )
+    assert finished.started_at == finished.finished_at  # identical inputs: a zero-length interval
+    assert finished.started_at.utcoffset() == first  # the first observed offset is kept
 
 
 def test_an_oversized_native_container_is_refused_before_its_entries_are_copied() -> None:
