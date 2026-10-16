@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import subprocess
@@ -3996,3 +3997,65 @@ def test_finish_run_with_planned_state_does_not_return_a_planned_manifest():
             finished_at=None,
             resources=planned.resources,
         )
+
+
+def _hostile_metaclass(events: list[str]):
+    """A metaclass whose ``__eq__`` records a call made *directly by the manifest module*.
+
+    Comparisons issued inside the standard library (the ABC machinery behind
+    ``isinstance(value, Mapping)``) are not what an identity test replaces, so only a call
+    whose immediate caller is the manifest module counts.
+    """
+
+    def from_manifest() -> bool:
+        caller = sys._getframe(2).f_code.co_filename
+        return caller == run_manifest_module.__file__
+
+    class Meta(type):
+        def __eq__(cls, other):
+            if from_manifest():
+                events.append("eq")
+            return True
+
+        def __ne__(cls, other):
+            if from_manifest():
+                events.append("ne")
+            return False
+
+        __hash__ = type.__hash__
+
+    return Meta
+
+
+def test_exact_type_helper_uses_identity_not_metaclass_equality() -> None:
+    events: list[str] = []
+    meta = _hostile_metaclass(events)
+    hostile = meta("Hostile", (list,), {})
+    assert hostile == list and hostile in (dict, list, tuple)  # what ``==`` membership would believe
+    assert run_manifest_module._is_exact_type(hostile, (dict, list, tuple)) is False
+    assert run_manifest_module._is_exact_type(list, (dict, list, tuple)) is True
+    assert run_manifest_module._is_exact_type(type("Sub", (list,), {}), (list,)) is False
+    assert events == []
+
+
+@pytest.mark.parametrize("base", [list, tuple, dict])
+@pytest.mark.parametrize("field", ["resources", "measurements"])
+def test_a_hostile_metaclass_never_gets_its_eq_run_by_the_manifest_module(base, field) -> None:
+    events: list[str] = []
+    hostile = _hostile_metaclass(events)("Hostile", (base,), {})
+    planned = planned_manifest()
+    seed = planned.resources if field == "resources" else (timing(),)
+    value = hostile(seed) if base is not dict else hostile()
+    arguments = {"resources": (measured_memory(),), "measurements": (timing(),)}
+    arguments[field] = value
+
+    with contextlib.suppress(ValueError, TypeError, ValidationError):
+        finish_run(
+            planned,
+            state=RunState.COMPLETED,
+            started_at=datetime(2026, 9, 28, 8, 0, tzinfo=timezone.utc),
+            finished_at=datetime(2026, 9, 28, 8, 1, tzinfo=timezone.utc),
+            **arguments,
+        )
+
+    assert events == []

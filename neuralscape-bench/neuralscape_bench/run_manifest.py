@@ -360,6 +360,16 @@ def _retain_public_mapping(value: Any, frozen_graph: _FrozenGraph) -> bool:
     return True
 
 
+def _is_exact_type(value_type: type, exact: tuple[type, ...]) -> bool:
+    """Whether ``value_type`` *is* one of ``exact``, by identity.
+
+    ``value_type in (a, b)`` compares with ``==``, which for a class runs its
+    metaclass ``__eq__``: hostile caller code that could report itself as exact.
+    """
+
+    return any(value_type is candidate for candidate in exact)
+
+
 def _retain_public_sequence(value: Any, frozen_graph: _FrozenGraph) -> bool:
     """Retain a strong owner for one nonexact public sequence.
 
@@ -370,7 +380,7 @@ def _retain_public_sequence(value: Any, frozen_graph: _FrozenGraph) -> bool:
 
     if (
         isinstance(value, (BaseModel, Mapping))
-        or type(value) in (tuple, list)
+        or _is_exact_type(type(value), (tuple, list))
         or not isinstance(value, (tuple, list))
     ):
         return False
@@ -528,7 +538,7 @@ def _freeze_model_storage(
         else:
             existing_container = frozen_graph.native_containers.get(identity)
             if (
-                value_type in (dict, list, tuple)
+                _is_exact_type(value_type, (dict, list, tuple))
                 and existing_container is not None
                 and existing_container[0] is current
             ):
@@ -541,7 +551,7 @@ def _freeze_model_storage(
             else:
                 dict_entries = tuple(dict.items(current))
                 entries = tuple(item for _key, item in dict_entries)
-            if value_type in (dict, list, tuple):
+            if _is_exact_type(value_type, (dict, list, tuple)):
                 frozen_graph.native_containers[identity] = (
                     current,
                     dict_entries if value_type is dict else entries,
@@ -580,11 +590,9 @@ def _retain_reachable_public_sequences(
             _freeze_model_storage(current, frozen_graph, set())
             frozen_replay = frozen_graph.replay_entries[identity]
         _owner, entries = frozen_replay
-        local_authority = issubclass(value_type, BaseModel) or value_type in (
-            dict,
-            list,
-            tuple,
-        )
+        local_authority = issubclass(
+            value_type, BaseModel
+        ) or _is_exact_type(value_type, (dict, list, tuple))
         child_authority = authoritative and local_authority
         pending.extend(
             (item, child_authority) for item in reversed(entries)
@@ -690,7 +698,7 @@ def _inventory_reachable_public_mappings(
         elif (
             not is_model
             and authoritative
-            and type(current) not in (tuple, list)
+            and not _is_exact_type(type(current), (tuple, list))
             and isinstance(current, (tuple, list))
         ):
             _retain_public_sequence(current, frozen_graph)
@@ -722,11 +730,9 @@ def _inventory_reachable_public_mappings(
             _freeze_model_storage(current, frozen_graph, set())
             frozen_replay = frozen_graph.replay_entries[identity]
         _owner, entries = frozen_replay
-        local_authority = issubclass(value_type, BaseModel) or value_type in (
-            dict,
-            list,
-            tuple,
-        )
+        local_authority = issubclass(
+            value_type, BaseModel
+        ) or _is_exact_type(value_type, (dict, list, tuple))
         child_authority = authoritative and local_authority
         prior = discovered.get(identity)
         discovered[identity] = (
@@ -835,7 +841,7 @@ def _inventory_yielded_public_shape(
             _retain_public_mapping(value, frozen_graph)
             if not _inventory_public_mapping(value, frozen_graph, observing):
                 return False
-        elif type(value) not in (tuple, list) and isinstance(
+        elif not _is_exact_type(type(value), (tuple, list)) and isinstance(
             value, (tuple, list)
         ):
             if observing.get(identity) is value:
