@@ -1,5 +1,6 @@
 """Tests for the candidate contract pack: registry, schemas, examples, compatibility."""
 
+import ast
 import copy
 import importlib
 import inspect
@@ -46,16 +47,38 @@ def _json_schema_validator(name: str) -> jsonschema.Draft202012Validator:
 # --------------------------------------------------------------- registry
 
 
-def test_every_contract_model_in_every_contracts_module_is_registered() -> None:
+def _modules_declaring_contracts() -> list[str]:
+    """Every top-level service module that imports a contract base, by name-agnostic scan."""
+
+    found = []
+    for path in sorted(SERVICE_DIR.glob("*.py")):
+        if path.stem == "contracts_common":
+            continue
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        imported = {
+            alias.name
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ImportFrom) and node.module == "contracts_common"
+            for alias in node.names
+        }
+        if imported & {"ContractModel", "VersionedContract"}:
+            found.append(path.stem)
+    return found
+
+
+def test_every_contract_model_in_every_contract_declaring_module_is_registered() -> None:
     registered = {entry.name for entry in pack.CONTRACTS}
-    for path in sorted(SERVICE_DIR.glob("contracts_*.py")):
-        module_name = path.stem
+    scanned = _modules_declaring_contracts()
+    # The scan must not depend on a module's file name.
+    assert "engine_ports" in scanned
+    assert all(name in scanned for name in pack.MODULE_OWNERS)
+    for module_name in scanned:
         module = importlib.import_module(module_name)
         models = {
             name
             for name, value in vars(module).items()
             if inspect.isclass(value)
-            and issubclass(value, BaseModel)
+            and issubclass(value, ContractModel)
             and value.__module__ == module_name
             and value not in (ContractModel, VersionedContract)
             and not name.startswith("_")
@@ -64,8 +87,24 @@ def test_every_contract_model_in_every_contracts_module_is_registered() -> None:
             assert module_name in pack.MODULE_OWNERS, f"{module_name} has unowned models {sorted(models)}"
             assert models <= registered, sorted(models - registered)
         else:
-            assert module_name not in pack.MODULE_OWNERS or module_name == "contracts_common"
+            assert module_name not in pack.MODULE_OWNERS
     assert len(pack.CONTRACTS) == len(registered)
+
+
+def test_engine_port_contracts_are_registered_with_the_engines_owner() -> None:
+    expected = {
+        "ActivationReceipt",
+        "EngineRecord",
+        "GraphEdge",
+        "GraphEpisode",
+        "OperationContext",
+        "ProjectionReceipt",
+        "SearchHit",
+        "TenantFilter",
+    }
+    for name in expected:
+        entry = pack.get_contract(name)
+        assert entry.module == "engine_ports" and entry.owner_area == "engines"
 
 
 def test_every_entry_has_an_owner_and_known_producers_and_consumers() -> None:
