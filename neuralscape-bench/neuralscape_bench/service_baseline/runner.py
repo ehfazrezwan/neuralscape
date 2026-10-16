@@ -20,6 +20,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from neuralscape_bench.service_baseline.redact import redact_value
 from neuralscape_bench.run_manifest import (
     BuildIdentity,
     CacheCondition,
@@ -190,6 +191,40 @@ def start_postgres(env: dict[str, str]) -> None:
     compose("exec", "-T", "pg", "psql", "-U", "postgres", "-v", "ON_ERROR_STOP=1", "-c", statements, env=env)
 
 
+def backend_evidence(env: dict[str, str]) -> dict[str, Any]:
+    """Show which backends the run really used, from the services themselves.
+
+    Ledger: the line the API logs when the durable ledger opens. Authority store: the
+    tables and row counts in the configured store (an empty or missing store is evidence too).
+    """
+
+    evidence: dict[str, Any] = {}
+    try:
+        logs = compose("logs", "--no-color", "api", env=env)
+        evidence["ledger_log_lines"] = [ln.split("|", 1)[-1].strip() for ln in logs.splitlines()
+                                        if "durable ledger enabled" in ln][:2]
+    except Exception as error:  # noqa: BLE001 - evidence gathering must not fail a run
+        evidence["ledger_log_error"] = str(error)[:200]
+    if env.get("AUTHORITY_ENABLED") == "true":
+        try:
+            if env.get("AUTHORITY_BACKEND") == "postgres":
+                tables = compose("exec", "-T", "pg", "psql", "-U", "postgres", "-tA", "-c",
+                                 "select table_name from information_schema.tables where table_schema='authority' order by 1",
+                                 env=env).split()
+                counts = {t: int(compose("exec", "-T", "pg", "psql", "-U", "postgres", "-tA", "-c",
+                                         f'select count(*) from authority."{t}"', env=env).strip()) for t in tables}
+                evidence["authority"] = {"backend": "postgres", "tables": counts}
+            else:
+                code = ("import sqlite3,json;c=sqlite3.connect('/state/authority.db');"
+                        "t=[r[0] for r in c.execute(\"select name from sqlite_master where type='table' and name not like 'sqlite_%'\")];"
+                        "print(json.dumps({x:c.execute('select count(*) from \"%s\"'%x).fetchone()[0] for x in t}))")
+                out = compose("exec", "-T", "api", "python", "-c", code, env=env).strip().splitlines()[-1]
+                evidence["authority"] = {"backend": "sqlite", "tables": json.loads(out)}
+        except Exception as error:  # noqa: BLE001
+            evidence["authority_error"] = str(error)[:200]
+    return evidence
+
+
 def cold_start_seconds(env: dict[str, str], timeout_s: float = 420) -> float:
     start = time.monotonic()
     compose("up", "-d", "--wait", "--wait-timeout", str(int(timeout_s)), "neo4j", "redis", "qdrant", "fake-provider", env=env)
@@ -269,6 +304,9 @@ def main() -> None:
     parser.add_argument("--out-dir", required=True)
     parser.add_argument("--driver-args", default="")
     parser.add_argument("--arm", default="plain", choices=sorted(ARMS))
+    parser.add_argument("--series", default="", help="series id for interleaved comparisons")
+    parser.add_argument("--position", type=int, default=0, help="position of this run within its repetition")
+    parser.add_argument("--rep", type=int, default=0, help="repetition number within the series")
     args = parser.parse_args()
 
     out_dir = Path(args.out_dir)
@@ -276,7 +314,8 @@ def main() -> None:
     nonce = hashlib.sha256(f"{args.label}{time.time()}".encode()).hexdigest()[:10]
     env = {"NS_IMAGE": args.image, "BENCH_DIR": str(BENCH_DIR), "OUT_DIR": str(out_dir),
            "TOKEN_SECRET": TOKEN_SECRET, **ARMS[args.arm]}
-    record: dict[str, Any] = {"arm": args.arm, "arm_env": ARMS[args.arm], "label": args.label, "tree": args.tree, "image": args.image,
+    record: dict[str, Any] = {"series": args.series, "position_in_rep": args.position, "rep": args.rep,
+                              "arm": args.arm, "arm_env": ARMS[args.arm], "label": args.label, "tree": args.tree, "image": args.image,
                               "image_facts": image_facts(args.image), "host_before": host_facts()}
     sampler = StatsSampler()
     started = datetime.now(timezone.utc)
@@ -293,6 +332,7 @@ def main() -> None:
         if sampler.is_alive():
             sampler.join(timeout=30)
         finished = datetime.now(timezone.utc)
+        record["backend_evidence"] = backend_evidence(env)
         record["logs_tail"] = {s: compose("logs", "--no-color", "--tail", "40", s, env=env) for s in ("api", "worker", "graph-worker")}
         record["policy_log_lines"] = [line for line in compose("logs", "--no-color", "api", env=env).splitlines()
                                        if "policy_decision" in line or "policy" in line.lower() and "denied" in line.lower()][:20]
@@ -304,12 +344,12 @@ def main() -> None:
     record["other_containers_during_run"] = sorted(sampler.other_containers)
     workload_sha = "sha256:" + hashlib.sha256(json.dumps(results["args"] | {"nonce": None}, sort_keys=True).encode()).hexdigest()
     corpus_sha = "sha256:" + hashlib.sha256(b"service-baseline-corpus-v1:unique-notes-by-nonce-and-index").hexdigest()
-    (out_dir / "record.json").write_text(json.dumps(record, indent=2, default=str))
+    (out_dir / "record.json").write_text(json.dumps(redact_value(record), indent=2, default=str))
     (out_dir / "stats_samples.json").write_text(json.dumps(sampler.samples))
     manifest = build_manifest(f"{args.label}-{nonce}", args.tree, "sha256:" + args.lock_sha256.removeprefix("sha256:"),
                               record["image_facts"]["id"], results, record["resource_peaks"], started, finished, corpus_sha, workload_sha)
     (out_dir / "manifest.json").write_text(manifest.model_dump_json(indent=2))
-    (out_dir / "record.json").write_text(json.dumps(record, indent=2, default=str))
+    (out_dir / "record.json").write_text(json.dumps(redact_value(record), indent=2, default=str))
     (out_dir / "stats_samples.json").write_text(json.dumps(sampler.samples))
 
 

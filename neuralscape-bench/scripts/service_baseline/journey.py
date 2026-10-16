@@ -9,14 +9,22 @@ own volumes; unrelated volumes are checked before and after.
 
 import json
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 BENCH = HERE.parents[1]
+sys.path.insert(0, str(BENCH))
+from neuralscape_bench.service_baseline.journey_safety import (  # noqa: E402
+    JourneySafetyError, preflight, uninstall_is_safe, uninstall_report)
+from neuralscape_bench.service_baseline.redact import redact_value  # noqa: E402
+
 PROJECT = "ns-journey"
+SENTINEL = "ns-journey-sentinel"
 FILES = ["-f", str(HERE / "compose.yml"), "-f", str(HERE / "journey.override.yml")]
 APP = ["api", "worker", "graph-worker", "ingest-worker"]
 PG_PASSWORD = "bench-owner-password"
@@ -37,9 +45,10 @@ class Journey:
         self.steps = []
         self.flags = {}
         self.image = old
+        self.scratch = tempfile.mkdtemp(prefix="journey-")  # private; never a shared directory
 
     def env(self):
-        return {"NS_IMAGE": self.image, "BENCH_DIR": str(BENCH), "OUT_DIR": "/tmp", "TOKEN_SECRET": "",
+        return {"NS_IMAGE": self.image, "BENCH_DIR": str(BENCH), "OUT_DIR": self.scratch, "TOKEN_SECRET": "",
                 **self.flags}
 
     def compose(self, *args, check=True):
@@ -71,6 +80,11 @@ class Journey:
                     lines.append(f"{svc}: {line.strip()[:200]}")
         return lines[:8], len(lines)
 
+    def write(self, extra=None):
+        payload = {"steps": self.steps, "flags": self.flags}
+        payload.update(extra or {})
+        Path(self.out).write_text(json.dumps(redact_value(payload), indent=2))
+
     def step(self, name, fn):
         since = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         start = time.monotonic()
@@ -89,7 +103,7 @@ class Journey:
         except Exception as e:  # noqa: BLE001
             entry["log_error_lines"] = f"unavailable: {e}"
         self.steps.append(entry)
-        Path(self.out).write_text(json.dumps({"steps": self.steps, "flags": {k: v for k, v in self.flags.items() if "PASSWORD" not in k}}, indent=2))
+        self.write()
         print(f"[{entry['seconds']:>6}s] {name}: {'ok' if entry['ok'] else 'FAILED ' + entry.get('error', '')}", flush=True)
         return entry
 
@@ -140,11 +154,40 @@ class Journey:
         return json.loads(p.stdout.strip().splitlines()[-1]) if p.stdout.strip() else {"error": p.stderr[-200:]}
 
 
+def begin(j):
+    """Refuse to start over leftovers, then create the sentinel and note the existing volumes."""
+    try:
+        preflight(run, PROJECT, SENTINEL)
+    except JourneySafetyError as error:
+        shutil.rmtree(j.scratch, ignore_errors=True)
+        raise SystemExit(str(error))
+    run("docker", "volume", "create", SENTINEL)
+    return j.volumes()
+
+
+def project_mounts():
+    ids = run("docker", "ps", "-aq", "--filter", f"label=com.docker.compose.project={PROJECT}").stdout.split()
+    if not ids:
+        return set()
+    info = json.loads(run("docker", "inspect", *ids).stdout)
+    return {m["Name"] for c in info for m in c.get("Mounts", []) if m.get("Type") == "volume"}
+
+
+def uninstall(j, before):
+    """`down -v` for this project only, then compare volumes against the sentinel and the start."""
+    mid, mounted = j.volumes(), project_mounts()
+    j.step("uninstall: compose down -v", lambda: j.compose("down", "-v", "--remove-orphans") and "ok")
+    report = uninstall_report(before, mid, j.volumes(), PROJECT, SENTINEL, mounted)
+    j.steps.append({"step": "uninstall check", "safe": uninstall_is_safe(report), **report})
+    run("docker", "volume", "rm", SENTINEL, check=False)
+
+
 def pending_scenario(old, new, out):
     """Accepted-but-unprocessed intents must survive an image rollback and be applied after re-upgrade."""
     j = Journey(old, new, out)
     j.flags = {"LEDGER_ENABLED": "true"}
     j.image = new
+    before = begin(j)
     j.step("start datastores", lambda: j.start_data())
     j.step("prepare shared state volume", lambda: j.compose("run", "--rm", "--no-deps", "--user", "0", "--entrypoint", "sh", "seed",
                                                           "-c", "mkdir -p /state && chmod 777 /state") and "ok")
@@ -164,8 +207,9 @@ def pending_scenario(old, new, out):
     j.step("re-upgrade: drain", lambda: j.client("drain"))
     j.step("new: ledger intents (expect applied)", j.intent_counts)
     j.step("new: fingerprint (expect 10 memories)", lambda: j.client("fingerprint"))
-    j.step("uninstall: compose down -v", lambda: j.compose("down", "-v", "--remove-orphans") and "ok")
-    Path(out).write_text(json.dumps({"steps": j.steps, "flags": {k: v for k, v in j.flags.items() if "PASSWORD" not in k}}, indent=2))
+    uninstall(j, before)
+    j.write()
+    shutil.rmtree(j.scratch, ignore_errors=True)
 
 
 def main():
@@ -173,9 +217,7 @@ def main():
     if scenario == "ledger-pending":
         return pending_scenario(old, new, out)
     j = Journey(old, new, out)
-    sentinel = "ns-journey-sentinel"
-    run("docker", "volume", "create", sentinel)
-    before = j.volumes()
+    before = begin(j)
     # state: the shared volume must be writable by the service user
     ledger = scenario.startswith("ledger")
     if ledger:
@@ -225,24 +267,9 @@ def main():
     j.step("re-upgrade: start application (new image)", j.start_app)
     f5 = {}
     j.step("new (re-upgraded): fingerprint", lambda: f5.update(j.client("fingerprint")) or dict(f5))
-    mid = j.volumes()
-    ids = run("docker", "ps", "-aq", "--filter", f"label=com.docker.compose.project={PROJECT}").stdout.split()
-    mounted = set()
-    if ids:
-        info = json.loads(run("docker", "inspect", *ids).stdout)
-        mounted = {m["Name"] for c in info for m in c.get("Mounts", []) if m.get("Type") == "volume"}
-    j.step("uninstall: compose down -v", lambda: j.compose("down", "-v", "--remove-orphans") and "ok")
-    after = j.volumes()
-    own_before = [v for v in mid if v.startswith(PROJECT + "_")]
-    j.steps.append({"step": "uninstall check", "project_volumes_before_down": own_before,
-                    "project_volumes_after_down": [v for v in after if v.startswith(PROJECT + "_")],
-                    "other_volumes_unchanged": [v for v in before if v in after] == before or sorted(set(before) - set(after)) == [],
-                    "sentinel_present": sentinel in after,
-                    "volumes_removed_not_project_named": sorted(v for v in set(mid) - set(after) if not v.startswith(PROJECT + "_")),
-                    "removed_volumes_mounted_by_project_containers": sorted(v for v in set(mid) - set(after) if v in mounted),
-                    "removed_volumes_not_project_named_and_not_mounted_by_project": sorted(v for v in set(mid) - set(after) if not v.startswith(PROJECT + "_") and v not in mounted)})
-    run("docker", "volume", "rm", sentinel, check=False)
-    Path(out).write_text(json.dumps({"steps": j.steps, "flags": {k: v for k, v in j.flags.items() if "PASSWORD" not in k}}, indent=2))
+    uninstall(j, before)
+    j.write()
+    shutil.rmtree(j.scratch, ignore_errors=True)
 
 
 main()
