@@ -260,3 +260,59 @@ def test_a_spoofed_polling_status_is_not_mapped_by_its_own_hooks():
     observed = observe_task_status(response)
     assert observed.kind is LegacyAsyncObservationKind.WORKER_FAILED
     assert type(observed.task_id) is str and observed.task_id == "t"
+
+
+# ---- one shared budget from the shared limits module
+def test_the_budget_message_and_tier_are_the_shared_ones(monkeypatch):
+    import contracts_limits
+
+    assert BUDGET == contracts_limits.DISCOVERY_BUDGET_MESSAGE
+    assert not [name for name in vars(contracts_lifecycle) if name.startswith("_MAX_GRAPH") or name == "_GraphBudget"]
+    made = []
+    real = contracts_limits.DiscoveryBudget
+
+    def recording(*args, **kwargs):
+        made.append(real(*args, **kwargs))
+        return made[-1]
+
+    monkeypatch.setattr(contracts_lifecycle, "DiscoveryBudget", recording)
+    command = intent(ProcessingStage.CANONICAL)
+    validate_required_stage_claim(
+        claimed_status=IntentStatus.PROCESSING,
+        intent=command,
+        receipts=(receipt(ProcessingStage.CANONICAL, StageStatus.PROCESSING),) * 3,
+    )
+    assert len(made) == 1 and made[0].tier is contracts_limits.STANDARD  # one envelope for every root
+    made.clear()
+    source_versions_match(source("m"), source("m"))
+    assert len(made) == 1
+
+
+def test_the_depth_limit_is_the_shared_standard_depth():
+    import contracts_limits
+
+    def nested(depth):
+        value = ["x"]
+        for _ in range(depth - 1):
+            value = [value]
+        return value
+
+    within = intent(ProcessingStage.CANONICAL).model_copy(update={"id": nested(contracts_limits.STANDARD_MAX_DEPTH - 8)})
+    with pytest.raises(ValueError) as raised:
+        claim(within)
+    assert BUDGET not in str(raised.value)  # refused by the field type, not by the budget
+    beyond = intent(ProcessingStage.CANONICAL).model_copy(update={"id": nested(contracts_limits.STANDARD_MAX_DEPTH + 8)})
+    with pytest.raises(ValueError, match=BUDGET):
+        claim(beyond)
+
+
+def test_a_flood_of_edges_in_one_root_is_refused_by_the_shared_envelope():
+    flood = intent(ProcessingStage.CANONICAL).model_copy(
+        update={"id": [list(range(200)) for _ in range(900)]}
+    )
+    with pytest.raises(ValueError, match=BUDGET):
+        validate_required_stage_claim(
+            claimed_status=IntentStatus.ACCEPTED,
+            intent=flood,
+            receipts=(receipt(ProcessingStage.CANONICAL, StageStatus.PROCESSING),),
+        )

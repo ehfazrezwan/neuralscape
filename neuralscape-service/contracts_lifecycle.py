@@ -23,35 +23,13 @@ from pydantic import (
 
 from contracts_bodies import MemoryBody, OpaqueEnvelopeBody, PlaintextBody
 from contracts_common import ContractModel, OpaqueId, SafeCounter, VersionedContract
+from contracts_limits import DiscoveryBudget, is_exact_type
 from contracts_references import ReferenceHandle, SourceVersion
 
 
 _ModelT = TypeVar("_ModelT", bound=BaseModel)
 _BASE_MODEL_DICT_DESCRIPTOR = vars(BaseModel)["__dict__"]
 _BASE_MODEL_EXTRA_DESCRIPTOR = vars(BaseModel)["__pydantic_extra__"]
-
-
-_MAX_GRAPH_NODES = 16_384
-_MAX_GRAPH_DEPTH = 128
-_BUDGET_ERROR = "contract graph exceeds the native discovery budget"
-
-
-class _GraphBudget:
-    """Bounds one capture or reconstruction pass by the nodes it visits, per path, and by depth.
-
-    A shared native subtree is reconstructed once per path that reaches it and a public view is
-    observed once per edge, so an unbounded pass could be made exponential by a small input.
-    """
-
-    __slots__ = ("nodes",)
-
-    def __init__(self) -> None:
-        self.nodes = 0
-
-    def charge(self, depth: int) -> None:
-        self.nodes += 1
-        if self.nodes > _MAX_GRAPH_NODES or depth > _MAX_GRAPH_DEPTH:
-            raise ValueError(_BUDGET_ERROR)
 
 
 def _key_text(key: object) -> object:
@@ -144,7 +122,7 @@ def _capture_native_contract_graph(
     value: object,
     active_containers: set[int] | None = None,
     captured_by_identity: dict[int, _CapturedGraph] | None = None,
-    budget: _GraphBudget | None = None,
+    budget: DiscoveryBudget | None = None,
 ) -> _CapturedGraph:
     """Freeze supported native backing without invoking public protocols."""
 
@@ -154,8 +132,8 @@ def _capture_native_contract_graph(
     if captured_by_identity is None:
         captured_by_identity = {}
     if budget is None:
-        budget = _GraphBudget()
-    budget.charge(len(active_containers))
+        budget = DiscoveryBudget()
+    budget.charge_edge()
 
     if issubclass(value_type, (BaseModel, dict, list, tuple)):
         identity = id(value)
@@ -164,6 +142,7 @@ def _capture_native_contract_graph(
         cached = _cached_identity_capture(value, captured_by_identity)
         if cached is not None:
             return cached
+        budget.visit(value, len(active_containers))
         active_containers.add(identity)
         try:
             if issubclass(value_type, BaseModel):
@@ -271,15 +250,15 @@ def _materialize_captured_graph(
     value: _CapturedGraph,
     captured_by_identity: dict[int, _CapturedGraph],
     active_containers: set[int] | None = None,
-    budget: _GraphBudget | None = None,
+    budget: DiscoveryBudget | None = None,
 ) -> object:
     """Reconstruct one frozen graph with established diagnostic ordering."""
 
     if active_containers is None:
         active_containers = set()
     if budget is None:
-        budget = _GraphBudget()
-    budget.charge(len(active_containers))
+        budget = DiscoveryBudget()
+    budget.charge_edge()
     if isinstance(value, _CapturedCycle):
         raise ValueError("cyclic contract graph is not valid input")
     if isinstance(value, _CapturedLeaf):
@@ -287,6 +266,7 @@ def _materialize_captured_graph(
     identity = value.identity
     if identity in active_containers:
         raise ValueError("cyclic contract graph is not valid input")
+    budget.visit(value.source, len(active_containers))
     active_containers.add(identity)
     try:
         if isinstance(value, _CapturedModel):
@@ -345,11 +325,11 @@ def _materialize_captured_graph(
                     captured_by_identity=captured_by_identity,
                     budget=budget,
                 )
-            budget.charge(len(active_containers))
+            budget.charge_edge()
             return _CapturedLeaf(item)
 
         if isinstance(value, _CapturedList):
-            items = value.items if type(value.source) is list else (
+            items = value.items if is_exact_type(value.source, list) else (
                 public_item(item) for item in value.source
             )
             return [
@@ -361,7 +341,7 @@ def _materialize_captured_graph(
                 )
                 for item in items
             ]
-        items = value.items if type(value.source) is tuple else (
+        items = value.items if is_exact_type(value.source, tuple) else (
             public_item(item) for item in value.source
         )
         return tuple(
@@ -390,6 +370,7 @@ def _native_contract_graph(
 def _capture_contract_graph(
     value: object,
     active_containers: set[int] | None = None,
+    budget: DiscoveryBudget | None = None,
 ) -> _CapturedGraphSnapshot:
     """Capture one graph without running its public reconstruction views."""
 
@@ -398,17 +379,19 @@ def _capture_contract_graph(
         value,
         active_containers,
         captured_by_identity,
+        budget,
     )
     return captured, captured_by_identity
 
 
 def _materialize_contract_graph(
     captured: _CapturedGraphSnapshot,
+    budget: DiscoveryBudget | None = None,
 ) -> object:
     """Materialize one previously captured graph through established views."""
 
     root, captured_by_identity = captured
-    return _materialize_captured_graph(root, captured_by_identity)
+    return _materialize_captured_graph(root, captured_by_identity, None, budget)
 
 
 def _article(name: str) -> str:
@@ -427,9 +410,10 @@ def _captured_model(
 def _revalidated_captured_model(
     model_type: type[_ModelT],
     captured: _CapturedGraphSnapshot,
+    budget: DiscoveryBudget | None = None,
 ) -> _ModelT:
     return model_type.model_validate(
-        _materialize_contract_graph(captured),
+        _materialize_contract_graph(captured, budget),
         strict=True,
     )
 
@@ -438,6 +422,7 @@ def _revalidated_inventory_model(
     model_type: type[_ModelT],
     value: object,
     captured_by_identity: dict[int, _CapturedGraph],
+    budget: DiscoveryBudget | None = None,
 ) -> _ModelT:
     """Validate a public-view item, reusing entry-time state when available."""
 
@@ -448,10 +433,12 @@ def _revalidated_inventory_model(
         captured = _capture_native_contract_graph(
             value,
             captured_by_identity=captured_by_identity,
+            budget=budget,
         )
     return _revalidated_captured_model(
         model_type,
         (captured, captured_by_identity),
+        budget,
     )
 
 
@@ -569,7 +556,7 @@ class StageEvidenceRequirement(ContractModel):
     @field_validator("minimum_output_refs", mode="before")
     @classmethod
     def validate_native_output_minimum(cls, value: object) -> object:
-        if type(value) is not int or value not in {0, 1}:
+        if not is_exact_type(value, int) or value not in {0, 1}:
             raise ValueError("minimum_output_refs must be the native integer 0 or 1")
         return value
 
@@ -810,11 +797,11 @@ _LEGAL_INTENT_TRANSITIONS: dict[IntentStatus, frozenset[IntentStatus]] = {
 def is_legal_intent_transition(current: IntentStatus, target: IntentStatus) -> bool:
     """Return whether one persisted intent state may advance to another."""
 
-    if type(current) is not IntentStatus or not any(
+    if not is_exact_type(current, IntentStatus) or not any(
         current is member for member in IntentStatus
     ):
         raise TypeError("current must be an IntentStatus")
-    if type(target) is not IntentStatus or not any(
+    if not is_exact_type(target, IntentStatus) or not any(
         target is member for member in IntentStatus
     ):
         raise TypeError("target must be an IntentStatus")
@@ -829,8 +816,9 @@ def source_versions_match(
 
     if not isinstance(expected, SourceVersion):
         raise TypeError("value must be a SourceVersion")
+    budget = DiscoveryBudget()  # one envelope for both witnesses
     try:
-        captured_expected = _capture_contract_graph(expected)
+        captured_expected = _capture_contract_graph(expected, None, budget)
         expected_capture_error: Exception | None = None
     except Exception as exc:
         captured_expected = None
@@ -838,7 +826,7 @@ def source_versions_match(
 
     if isinstance(observed, SourceVersion):
         try:
-            captured_observed = _capture_contract_graph(observed)
+            captured_observed = _capture_contract_graph(observed, None, budget)
             observed_capture_error: Exception | None = None
         except Exception as exc:
             captured_observed = None
@@ -850,12 +838,12 @@ def source_versions_match(
     if expected_capture_error is not None:
         raise expected_capture_error
     assert captured_expected is not None
-    expected = _revalidated_captured_model(SourceVersion, captured_expected)
+    expected = _revalidated_captured_model(SourceVersion, captured_expected, budget)
 
     if observed_capture_error is not None:
         raise observed_capture_error
     assert captured_observed is not None
-    observed = _revalidated_captured_model(SourceVersion, captured_observed)
+    observed = _revalidated_captured_model(SourceVersion, captured_observed, budget)
 
     return (
         expected.record_id == observed.record_id
@@ -925,8 +913,9 @@ def validate_required_stage_claim(
 
     if not isinstance(intent, Intent):
         raise TypeError("value must be an Intent")
+    budget = DiscoveryBudget()  # one envelope for the intent and every receipt
     try:
-        captured_intent = _capture_contract_graph(intent)
+        captured_intent = _capture_contract_graph(intent, None, budget)
         intent_capture_error: Exception | None = None
     except Exception as exc:
         captured_intent = None
@@ -944,6 +933,7 @@ def validate_required_stage_claim(
             _capture_native_contract_graph(
                 receipt,
                 captured_by_identity=receipt_inventory,
+                budget=budget,
             )
         except Exception as exc:
             receipt_capture_errors[identity] = exc
@@ -951,7 +941,7 @@ def validate_required_stage_claim(
     if intent_capture_error is not None:
         raise intent_capture_error
     assert captured_intent is not None
-    intent = _revalidated_captured_model(Intent, captured_intent)
+    intent = _revalidated_captured_model(Intent, captured_intent, budget)
 
     def revalidate_receipt(receipt: object) -> StageReceipt:
         capture_error = receipt_capture_errors.get(id(receipt))
@@ -961,6 +951,7 @@ def validate_required_stage_claim(
             StageReceipt,
             receipt,
             receipt_inventory,
+            budget,
         )
 
     receipts = tuple(
