@@ -2831,3 +2831,1366 @@ def test_public_first_delegation_ceiling_follows_the_public_view(field: str) -> 
     )
     assert evaluate(widened, "read", resource_value, policy_value).outcome == "allow"
     assert evaluate(widened, "read", resource_value, policy()).outcome == "deny"
+
+
+# ── first-observation retention of native dict entries and of iterator children ──
+
+
+class _CallbackItemsExtras(Mapping[str, object]):
+    """A public mapping whose ``items()`` runs a callback and exposes nothing."""
+
+    def __init__(self, callback) -> None:
+        self._callback = callback
+
+    def __getitem__(self, key: str) -> object:
+        raise KeyError(key)
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(())
+
+    def __len__(self) -> int:
+        return 0
+
+    def items(self):  # type: ignore[override]
+        self._callback()
+        return {}.items()
+
+
+def _raw_statement(identifier: str, effect: str, resource_value: ReferenceHandle) -> dict[str, object]:
+    return {
+        "id": identifier,
+        "effect": effect,
+        "subject_id": "subject-a",
+        "credential_id": None,
+        "action": "read",
+        "resource": resource_value.model_dump(mode="python"),
+    }
+
+
+def test_native_dict_entries_are_replayed_not_reread_after_callbacks() -> None:
+    """A deny captured at the callback-free entry pass cannot be replaced by an allow."""
+
+    resource_value = reference("memory-1")
+    allow = statement("allow-read", "allow", "read", resource_value)
+    deny = _raw_statement("deny-read", "deny", resource_value)
+    policy_value = policy(allow)
+    object.__setattr__(policy_value, "statements", (allow, deny))
+    principal_value = principal()
+    object.__setattr__(
+        principal_value,
+        "__pydantic_extra__",
+        _CallbackItemsExtras(lambda: deny.__setitem__("effect", "allow")),
+    )
+
+    received = evaluate(principal_value, "read", resource_value, policy_value)
+
+    assert (received.outcome, received.reason_code) == ("deny", "not_authorized")
+    assert deny["effect"] == "allow"  # the callback ran; its effect was simply not observed
+
+
+def test_native_dict_entries_captured_first_stay_invalid_when_repaired_later() -> None:
+    resource_value = reference("memory-1")
+    broken = {"kind": "memory", "id": "memory-1", "tenant_id": 5, "resolver": "memory_by_id"}
+    evaluation = PolicyEvaluationInput(schema_version=VERSION, action="read", resource=resource_value)
+    object.__setattr__(evaluation, "resource", broken)
+    principal_value = principal()
+    object.__setattr__(
+        principal_value,
+        "__pydantic_extra__",
+        _CallbackItemsExtras(lambda: broken.__setitem__("tenant_id", "tenant-a")),
+    )
+
+    with pytest.raises(ValidationError):
+        evaluate_policy(
+            principal=principal_value,
+            evaluation=evaluation,
+            policy=policy(statement("allow-read", "allow", "read", resource_value)),
+        )
+
+
+def test_native_dict_without_callbacks_is_unchanged_by_retention() -> None:
+    resource_value = reference("memory-1")
+    allow = _raw_statement("allow-read", "allow", resource_value)
+    policy_value = policy(statement("seed", "allow", "read", reference("other")))
+    object.__setattr__(policy_value, "statements", (allow,))
+
+    assert evaluate(principal(), "read", resource_value, policy_value).outcome == "allow"
+
+
+def _delegated_principal(delegation_mapping) -> PrincipalContext:
+    ceiling = DelegationConstraints(
+        delegated_by_subject_id="subject-human",
+        delegated_by_credential_id="credential-human",
+        allowed_actions=("read",),
+        allowed_resources=(reference("memory-1"),),
+    )
+    value = principal(subject_kind="delegated_agent", delegation=ceiling)
+    object.__setattr__(value, "delegation", delegation_mapping)
+    return value
+
+
+class _GeneratorMapping(Mapping[str, object]):
+    """A public mapping whose pair iterator is a caller-supplied generator."""
+
+    def __init__(self, generator_factory) -> None:
+        self._factory = generator_factory
+
+    def __getitem__(self, key: str) -> object:
+        raise KeyError(key)
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(())
+
+    def __len__(self) -> int:
+        return 0
+
+    def items(self):  # type: ignore[override]
+        return self._factory()
+
+
+def _delegation_pairs(handle, *, repair: bool):
+    yield ("delegated_by_subject_id", "subject-human")
+    yield ("delegated_by_credential_id", "credential-human")
+    yield ("allowed_actions", ("read",))
+    yield ("allowed_resources", (handle,))
+    if repair:
+        # Resumed only when the consumer advances: repair the child already exposed.
+        handle.__dict__["tenant_id"] = "tenant-a"
+
+
+def _tampered_handle() -> ReferenceHandle:
+    handle = reference("memory-1")
+    handle.__dict__["tenant_id"] = 5  # invalid; bypasses the frozen model
+    return handle
+
+
+def test_iterator_children_are_frozen_before_the_iterator_advances() -> None:
+    resource_value = reference("memory-1")
+    handle = _tampered_handle()
+    mapping = _GeneratorMapping(lambda: _delegation_pairs(handle, repair=True))
+    principal_value = _delegated_principal(mapping)
+    grant = policy(statement("allow-read", "allow", "read", resource_value))
+
+    with pytest.raises(ValidationError):
+        evaluate(principal_value, "read", resource_value, grant)
+
+
+def test_the_same_generator_without_repair_is_rejected_and_a_valid_one_is_allowed() -> None:
+    resource_value = reference("memory-1")
+    grant = policy(statement("allow-read", "allow", "read", resource_value))
+    broken = _tampered_handle()
+    with pytest.raises(ValidationError):
+        evaluate(_delegated_principal(_GeneratorMapping(lambda: _delegation_pairs(broken, repair=False))),
+                 "read", resource_value, grant)
+    valid = reference("memory-1")
+    received = evaluate(_delegated_principal(_GeneratorMapping(lambda: _delegation_pairs(valid, repair=False))),
+                        "read", resource_value, grant)
+    assert received.outcome == "allow"
+
+
+def test_iterator_failures_stay_deferred_and_keep_their_class() -> None:
+    resource_value = reference("memory-1")
+    grant = policy(statement("allow-read", "allow", "read", resource_value))
+
+    def failing():
+        yield ("delegated_by_subject_id", "subject-human")
+        raise RuntimeError("iteration failed")
+
+    with pytest.raises(RuntimeError, match="iteration failed"):
+        evaluate(_delegated_principal(_GeneratorMapping(failing)), "read", resource_value, grant)
+
+    def malformed_then_failing():
+        yield ("delegated_by_subject_id", "subject-human")
+        yield 5  # not a pair: terminal
+        raise RuntimeError("late failure")
+
+    # The drain after the terminal pair keeps a later iteration error's precedence.
+    with pytest.raises(RuntimeError, match="late failure"):
+        evaluate(_delegated_principal(_GeneratorMapping(malformed_then_failing)), "read", resource_value, grant)
+
+
+def test_the_first_malformed_pair_is_terminal_and_later_pairs_are_ignored() -> None:
+    resource_value = reference("memory-1")
+    grant = policy(statement("allow-read", "allow", "read", resource_value))
+    seen: list[str] = []
+
+    def malformed_then_valid():
+        yield ("delegated_by_subject_id", "subject-human")
+        yield 5
+        seen.append("drained")
+        yield ("delegated_by_credential_id", "credential-human")  # never retained
+
+    with pytest.raises(TypeError):
+        evaluate(_delegated_principal(_GeneratorMapping(malformed_then_valid)), "read", resource_value, grant)
+    assert seen == ["drained"]
+
+
+# ── lazily discovered children: native dict snapshots are retained too ──────
+
+
+class _PublicOnlyTuple(tuple):
+    """A tuple whose native backing is empty: its items exist only through ``__iter__``."""
+
+    def __new__(cls, items):
+        instance = super().__new__(cls, ())
+        instance.public_items = tuple(items)
+        return instance
+
+    def __iter__(self):
+        return iter(self.public_items)
+
+
+def _invalid_resource_dict() -> dict[str, object]:
+    return {"kind": "memory", "id": "memory-1", "tenant_id": 5, "resolver": "memory_by_id"}
+
+
+def _repair_after_yield(resource: dict[str, object]) -> None:
+    resource["tenant_id"] = "tenant-a"
+
+
+def _policy_with_public_only_statements(*statements) -> AccessPolicy:
+    policy_value = policy(statement("seed", "allow", "read", reference("other")))
+    object.__setattr__(policy_value, "statements", _PublicOnlyTuple(statements))
+    return policy_value
+
+
+class _RepairingTuple(tuple):
+    """A public tuple whose iteration runs a callback (a public-view callback)."""
+
+    def __new__(cls, items, callback):
+        instance = super().__new__(cls, items)
+        instance.callback = callback
+        return instance
+
+    def __iter__(self):
+        self.callback()
+        return iter(tuple.__iter__(self))
+
+
+def _tampered_delegation(broken: dict[str, object]) -> DelegationConstraints:
+    """A model whose earlier field runs a callback when completed, before the dict child is copied."""
+
+    value = DelegationConstraints(
+        delegated_by_subject_id="subject-human",
+        delegated_by_credential_id="credential-human",
+        allowed_actions=("read",),
+        allowed_resources=(),
+    )
+    value.__dict__["allowed_actions"] = _RepairingTuple(("read",), lambda: _repair_after_yield(broken))
+    value.__dict__["allowed_resources"] = (broken,)
+    return value
+
+
+def test_a_lazily_discovered_model_keeps_the_first_observation_of_its_native_dicts() -> None:
+    """Completion discovers the model itself (it was not reached at entry): its native
+    dict child must be snapshotted at that discovery, not re-read after a callback."""
+
+    broken = _invalid_resource_dict()
+    completed = _complete_contract_input(_tampered_delegation(broken), set(), {}, {})
+
+    assert broken["tenant_id"] == "tenant-a"                       # the callback ran
+    assert completed["allowed_resources"][0]["tenant_id"] == 5     # the first observation was kept
+
+
+def test_a_lazily_discovered_mapping_keeps_the_first_observation_of_dicts_in_its_pairs() -> None:
+    broken = _invalid_resource_dict()
+
+    class _Pairs(Mapping[str, object]):
+        def __getitem__(self, key: str) -> object:
+            raise KeyError(key)
+
+        def __iter__(self) -> Iterator[str]:
+            return iter(())
+
+        def __len__(self) -> int:
+            return 0
+
+        def items(self):  # type: ignore[override]
+            yield ("allowed_actions", _RepairingTuple(("read",), lambda: _repair_after_yield(broken)))
+            yield ("allowed_resources", (broken,))
+
+    completed = _complete_contract_input(_Pairs(), set(), {}, {})
+
+    assert broken["tenant_id"] == "tenant-a"
+    assert completed["allowed_resources"][0]["tenant_id"] == 5
+
+
+def test_lazy_discovery_reuses_an_existing_snapshot_instead_of_taking_a_new_one() -> None:
+    """A dict already retained keeps its entries when a lazy path meets it again."""
+
+    broken = _invalid_resource_dict()
+    mapping_inventories: dict = {}
+    _complete_contract_input(
+        _tampered_delegation(broken), set(), {}, mapping_inventories
+    )  # first discovery retains the dict's entries
+    snapshot = mapping_inventories[id(broken)]
+    _repair_after_yield(broken)
+    again = _complete_contract_input(
+        _tampered_delegation(broken), set(), {}, mapping_inventories
+    )
+    assert mapping_inventories[id(broken)] is snapshot
+    assert again["allowed_resources"][0]["tenant_id"] == 5
+
+
+def test_a_lazily_discovered_mapping_keeps_dict_snapshots_taken_as_its_iterator_yields() -> None:
+    """Public-only child mapping; a generator repairs the dict it already yielded."""
+
+    resource_value = reference("memory-1")
+    broken = _invalid_resource_dict()
+
+    class _StatementMapping(Mapping[str, object]):
+        def __getitem__(self, key: str) -> object:
+            raise KeyError(key)
+
+        def __iter__(self) -> Iterator[str]:
+            return iter(())
+
+        def __len__(self) -> int:
+            return 0
+
+        def items(self):  # type: ignore[override]
+            return self._pairs()
+
+        def _pairs(self):
+            yield ("id", "lazy-allow")
+            yield ("effect", "allow")
+            yield ("subject_id", "subject-a")
+            yield ("credential_id", None)
+            yield ("action", "read")
+            yield ("resource", broken)
+            _repair_after_yield(broken)  # resumed only when the consumer advances
+
+    policy_value = _policy_with_public_only_statements(_StatementMapping())
+
+    with pytest.raises(ValidationError):
+        evaluate(principal(), "read", resource_value, policy_value)
+
+
+def test_a_lazily_discovered_mapping_with_a_valid_dict_is_accepted() -> None:
+    resource_value = reference("memory-1")
+    good = resource_value.model_dump(mode="python")
+
+    class _StatementMapping(Mapping[str, object]):
+        def __getitem__(self, key: str) -> object:
+            raise KeyError(key)
+
+        def __iter__(self) -> Iterator[str]:
+            return iter(())
+
+        def __len__(self) -> int:
+            return 0
+
+        def items(self):  # type: ignore[override]
+            yield ("id", "lazy-allow")
+            yield ("effect", "allow")
+            yield ("subject_id", "subject-a")
+            yield ("credential_id", None)
+            yield ("action", "read")
+            yield ("resource", good)
+
+    policy_value = _policy_with_public_only_statements(_StatementMapping())
+
+    assert evaluate(principal(), "read", resource_value, policy_value).outcome == "allow"
+
+
+# ── non-dict mapping children are captured before the parent iterator advances ──
+
+
+def test_a_mapping_proxy_child_is_captured_before_the_parent_iterator_advances() -> None:
+    broken = _invalid_resource_dict()
+
+    class _Pairs(Mapping[str, object]):
+        def __getitem__(self, key: str) -> object:
+            raise KeyError(key)
+
+        def __iter__(self) -> Iterator[str]:
+            return iter(())
+
+        def __len__(self) -> int:
+            return 0
+
+        def items(self):  # type: ignore[override]
+            yield ("allowed_resources", (MappingProxyType(broken),))
+            _repair_after_yield(broken)  # resumed only when the consumer advances
+
+    completed = _complete_contract_input(_Pairs(), set(), {}, {})
+
+    assert broken["tenant_id"] == "tenant-a"                                # the generator repaired it
+    assert dict(completed["allowed_resources"][0])["tenant_id"] == 5        # the first observation holds
+
+
+def test_a_mapping_proxy_resource_repaired_after_the_yield_is_still_refused() -> None:
+    resource_value = reference("memory-1")
+    broken = _invalid_resource_dict()
+
+    class _StatementMapping(Mapping[str, object]):
+        def __getitem__(self, key: str) -> object:
+            raise KeyError(key)
+
+        def __iter__(self) -> Iterator[str]:
+            return iter(())
+
+        def __len__(self) -> int:
+            return 0
+
+        def items(self):  # type: ignore[override]
+            yield ("id", "lazy-allow")
+            yield ("effect", "allow")
+            yield ("subject_id", "subject-a")
+            yield ("credential_id", None)
+            yield ("action", "read")
+            yield ("resource", MappingProxyType(broken))
+            _repair_after_yield(broken)
+
+    policy_value = _policy_with_public_only_statements(_StatementMapping())
+
+    with pytest.raises(ValidationError):
+        evaluate(principal(), "read", resource_value, policy_value)
+
+
+def test_a_custom_mapping_child_is_captured_before_the_parent_iterator_advances() -> None:
+    """A non-proxy public mapping child, nested inside a list, is captured at the same point."""
+
+    resource_value = reference("memory-1")
+    broken = _invalid_resource_dict()
+
+    class _Child(Mapping[str, object]):
+        def __getitem__(self, key: str) -> object:
+            return broken[key]
+
+        def __iter__(self) -> Iterator[str]:
+            return iter(tuple(broken))
+
+        def __len__(self) -> int:
+            return len(broken)
+
+    class _StatementMapping(Mapping[str, object]):
+        def __getitem__(self, key: str) -> object:
+            raise KeyError(key)
+
+        def __iter__(self) -> Iterator[str]:
+            return iter(())
+
+        def __len__(self) -> int:
+            return 0
+
+        def items(self):  # type: ignore[override]
+            yield ("id", "lazy-allow")
+            yield ("effect", "allow")
+            yield ("subject_id", "subject-a")
+            yield ("credential_id", None)
+            yield ("action", "read")
+            yield ("resource", _Child())
+            _repair_after_yield(broken)
+
+    policy_value = _policy_with_public_only_statements(_StatementMapping())
+
+    with pytest.raises(ValidationError):
+        evaluate(principal(), "read", resource_value, policy_value)
+
+
+def test_a_mapping_cycle_through_proxy_children_terminates_and_keeps_the_first_observation() -> None:
+    holder: dict[str, object] = {}
+
+    class _Loop(Mapping[str, object]):
+        def __getitem__(self, key: str) -> object:
+            raise KeyError(key)
+
+        def __iter__(self) -> Iterator[str]:
+            return iter(())
+
+        def __len__(self) -> int:
+            return 0
+
+        def items(self):  # type: ignore[override]
+            yield ("child", MappingProxyType(holder))
+            yield ("again", loop)
+
+    loop = _Loop()
+    holder["back"] = loop
+    inventories: dict = {}
+    with pytest.raises(ValueError, match="cyclic"):  # terminates with the existing cycle refusal
+        _complete_contract_input(loop, set(), {}, inventories)
+    assert id(loop) in inventories
+
+
+def test_a_valid_mapping_proxy_child_is_accepted() -> None:
+    resource_value = reference("memory-1")
+    good = resource_value.model_dump(mode="python")
+
+    class _StatementMapping(Mapping[str, object]):
+        def __getitem__(self, key: str) -> object:
+            raise KeyError(key)
+
+        def __iter__(self) -> Iterator[str]:
+            return iter(())
+
+        def __len__(self) -> int:
+            return 0
+
+        def items(self):  # type: ignore[override]
+            yield ("id", "lazy-allow")
+            yield ("effect", "allow")
+            yield ("subject_id", "subject-a")
+            yield ("credential_id", None)
+            yield ("action", "read")
+            yield ("resource", MappingProxyType(good))
+
+    policy_value = _policy_with_public_only_statements(_StatementMapping())
+
+    assert evaluate(principal(), "read", resource_value, policy_value).outcome == "allow"
+
+
+# ── bounded discovery: one shared budget per validation call ────────────────
+
+from contracts_limits import (  # noqa: E402
+    DISCOVERY_BUDGET_MESSAGE,
+    STANDARD_MAX_DEPTH,
+    STANDARD_MAX_EDGES,
+    DiscoveryBudget,
+)
+
+
+def _nested(kind: str, depth: int, leaf: object = None) -> object:
+    value: object = leaf
+    for _ in range(depth):
+        value = {"k": value} if kind == "dict" else ([value] if kind == "list" else (value,))
+    return value
+
+
+def _evaluate_budget_statements(*statements) -> object:
+    return evaluate(principal(), "read", reference("memory-1"), _policy_with_public_only_statements(*statements))
+
+
+@pytest.mark.parametrize("kind", ["tuple", "list", "dict"])
+def test_deep_nesting_is_refused_with_the_budget_error_not_a_crash(kind) -> None:
+    deep = _nested(kind, 5000)  # far past the recursion limit
+    with pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):
+        _complete_contract_input(deep, set(), {}, {})
+    with pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):
+        _evaluate_budget_statements(deep)
+
+
+@pytest.mark.parametrize("kind", ["tuple", "list", "dict"])
+def test_nesting_up_to_the_depth_limit_is_not_a_budget_error_and_cannot_overflow_the_stack(kind) -> None:
+    ok_depth = _nested(kind, STANDARD_MAX_DEPTH - 8)
+    completed = _complete_contract_input(ok_depth, set(), {}, {})  # accepted by the budget
+    assert completed is not None
+    with pytest.raises(ValidationError):  # and then judged by its shape, not by the budget
+        _evaluate_budget_statements(ok_depth)
+    with pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):
+        _complete_contract_input(_nested(kind, STANDARD_MAX_DEPTH + 2), set(), {}, {})
+
+
+def test_a_wide_container_is_refused_before_it_is_walked() -> None:
+    wide = tuple(range(STANDARD_MAX_EDGES + 10))
+    with pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):
+        _evaluate_budget_statements(*wide)
+    with pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):
+        _complete_contract_input(list(wide), set(), {}, {})
+    with pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):
+        _complete_contract_input({i: i for i in range(STANDARD_MAX_EDGES + 10)}, set(), {}, {})
+
+
+def test_native_shared_substructure_is_copied_once_per_object() -> None:
+    """A diamond chain is 2 nodes per level to discover and 2**n paths to reach: native
+    subtrees are pure, so each is copied once and shared by every path."""
+
+    import time
+
+    shared: object = ("leaf",)
+    for _ in range(40):  # 2**40 paths
+        shared = (shared, shared)
+    started = time.monotonic()
+    completed = _complete_contract_input(shared, set(), {}, {})
+    assert time.monotonic() - started < 5
+    assert completed[0] is completed[1]  # one copy, shared by both paths
+    with pytest.raises(ValidationError):  # and a contract still judges it by its shape, quickly
+        _evaluate_budget_statements(shared)
+
+
+def test_a_diamond_of_public_views_is_still_charged_per_path() -> None:
+    """A container subclass is observed again on every edge that reaches it, so reuse is
+    not allowed and the paths are charged: the budget refuses the explosion."""
+
+    class _View(tuple):
+        def __iter__(self):
+            return iter(tuple.__iter__(self))
+
+    shared: object = _View(("leaf",))
+    for _ in range(20):
+        shared = _View((shared, shared))
+    with pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):
+        _complete_contract_input(shared, set(), {}, {})
+
+
+def test_the_depth_limit_holds_on_a_path_that_reaches_a_reused_subtree() -> None:
+    deep = _nested("tuple", STANDARD_MAX_DEPTH - 1)
+    _complete_contract_input((deep,), set(), {}, {})                  # fits at depth 1
+    with pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):   # the same subtree, one level lower
+        _complete_contract_input((deep, ((deep,),)), set(), {}, {})
+
+
+def test_a_long_public_pair_iterator_is_cut_off_at_the_edge_limit() -> None:
+    produced = []
+
+    class _Many(Mapping[str, object]):
+        def __getitem__(self, key: str) -> object:
+            raise KeyError(key)
+
+        def __iter__(self) -> Iterator[str]:
+            return iter(())
+
+        def __len__(self) -> int:
+            return 0
+
+        def items(self):  # type: ignore[override]
+            for index in range(STANDARD_MAX_EDGES * 3):
+                produced.append(index)
+                yield (f"k{index}", index)
+
+    with pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):
+        _complete_contract_input(_Many(), set(), {}, {})
+    assert len(produced) <= STANDARD_MAX_EDGES + 2          # the iterator was not drained
+
+
+def test_a_long_public_pair_iterator_is_cut_off_even_after_a_terminal_pair() -> None:
+    produced = []
+
+    class _Drain(Mapping[str, object]):
+        def __getitem__(self, key: str) -> object:
+            raise KeyError(key)
+
+        def __iter__(self) -> Iterator[str]:
+            return iter(())
+
+        def __len__(self) -> int:
+            return 0
+
+        def items(self):  # type: ignore[override]
+            yield "not-a-pair"                                # terminal malformed pair
+            for index in range(STANDARD_MAX_EDGES * 3):       # then a long tail to drain
+                produced.append(index)
+                yield (f"k{index}", index)
+
+    with pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):
+        _complete_contract_input(_Drain(), set(), {}, {})
+    assert len(produced) <= STANDARD_MAX_EDGES + 2
+
+
+def test_a_long_public_sequence_view_is_cut_off_during_completion() -> None:
+    produced = []
+
+    class _Long(tuple):
+        def __iter__(self):
+            for index in range(STANDARD_MAX_EDGES * 3):
+                produced.append(index)
+                yield index
+
+    with pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):
+        _complete_contract_input(_Long(), set(), {}, {})
+    assert len(produced) <= STANDARD_MAX_EDGES + 2
+
+
+def test_accounting_runs_no_hook_of_the_caller_objects() -> None:
+    calls: list[str] = []
+
+    class _Hostile(tuple):
+        def __len__(self):
+            calls.append("len")
+            raise AssertionError("len")
+
+        def __eq__(self, other):
+            calls.append("eq")
+            raise AssertionError("eq")
+
+        def __hash__(self):
+            calls.append("hash")
+            raise AssertionError("hash")
+
+        def __bool__(self):
+            calls.append("bool")
+            raise AssertionError("bool")
+
+    resource_value = reference("memory-1")
+    grant = policy(statement("allow-1", "allow", "read", resource_value))
+    object.__setattr__(grant, "statements", _Hostile(grant.statements))
+    assert evaluate(principal(), "read", resource_value, grant).outcome == "allow"
+    assert calls == []
+
+
+def test_the_budget_is_shared_by_every_root_of_one_call() -> None:
+    budget = DiscoveryBudget()
+    half = list(range(STANDARD_MAX_EDGES // 2 + 1000))
+    _freeze_reachable_model_inventories(half, {}, set(), None, None, budget)
+    with pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):
+        _freeze_reachable_model_inventories(list(half), {}, set(), None, None, budget)
+    # the same two walks under separate budgets are fine: it is the sharing that bounds the call
+    _freeze_reachable_model_inventories(half, {}, set(), None, None, DiscoveryBudget())
+    _freeze_reachable_model_inventories(list(half), {}, set(), None, None, DiscoveryBudget())
+
+
+def test_depth_outcome_does_not_depend_on_the_order_of_aliased_references() -> None:
+    shared = _nested("tuple", STANDARD_MAX_DEPTH - 20)
+    for order in ((shared, shared), (shared, (shared,)), ((shared,), shared)):
+        _complete_contract_input(order, set(), {}, {})  # same outcome in every order
+    too_deep = _nested("tuple", STANDARD_MAX_DEPTH)  # fits when reached directly, not when wrapped
+    _complete_contract_input((too_deep, too_deep), set(), {}, {})
+    for order in (((too_deep,), too_deep), (too_deep, (too_deep,)), ((too_deep,), (too_deep,))):
+        with pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):
+            _complete_contract_input(order, set(), {}, {})
+
+
+def test_ordinary_policies_are_unaffected_by_the_budget() -> None:
+    resource_value = reference("memory-1")
+    grants = tuple(statement(f"allow-{i}", "allow", "read", resource_value) for i in range(200))
+    assert evaluate(principal(), "read", resource_value, policy(*grants)).outcome == "allow"
+    assert validate_policy_decision(
+        evaluate(principal(), "read", resource_value, policy(*grants))
+    ).outcome == "allow"
+
+
+def _proxy_chain(depth: int) -> object:
+    value: object = None
+    for _ in range(depth):
+        value = MappingProxyType({"k": value})
+    return value
+
+
+def test_a_deep_chain_of_public_mappings_is_refused_with_the_budget_error() -> None:
+    with pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):
+        _complete_contract_input(_proxy_chain(5000), set(), {}, {})
+    with pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):
+        _evaluate_budget_statements(_proxy_chain(5000))
+
+
+def test_a_public_mapping_chain_within_the_limit_cannot_overflow_the_stack() -> None:
+    completed = _complete_contract_input(_proxy_chain(STANDARD_MAX_DEPTH - 8), set(), {}, {})
+    assert completed is not None
+
+
+# ── a mapping is captured exactly once, at its first exposure ───────────────
+
+
+def _entry_flow(root: object) -> object:
+    """The full evaluator flow for one root: entry freeze, pending captures, completion."""
+
+    inventories: dict = {}
+    owners: dict = {}
+    mapping_inventories: dict = {}
+    native_dicts: dict = {}
+    visited: set = set()
+    budget = DiscoveryBudget()
+    reach: dict = {}
+    _freeze_reachable_model_inventories(root, inventories, visited, owners, native_dicts, budget, 0, True, reach)
+    _freeze_mapping_inventories(owners, mapping_inventories, inventories, visited, native_dicts, None, budget, reach)
+    mapping_inventories.update(native_dicts)
+    return _complete_contract_input(root, set(), inventories, mapping_inventories, budget)
+
+
+class _Items(Mapping[str, object]):
+    """A public mapping whose pairs come from a generator function."""
+
+    def __init__(self, pairs) -> None:
+        self._pairs = pairs
+
+    def __getitem__(self, key: str) -> object:
+        raise KeyError(key)
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(())
+
+    def __len__(self) -> int:
+        return 0
+
+    def items(self):  # type: ignore[override]
+        return self._pairs()
+
+
+def test_a_queued_mapping_finished_by_recursion_is_not_captured_a_second_time() -> None:
+    """A and B are queued; A exposes a new C; C exposes B.  B is captured when C exposes
+    it, and the outer loop must not read it again after A repaired it."""
+
+    broken = _invalid_resource_dict()
+    reads: list[str] = []
+    b = _Items(lambda: _b_pairs())
+
+    def _b_pairs():
+        reads.append("b")
+        yield ("tenant_id", broken["tenant_id"])
+
+    c = _Items(lambda: iter((("b", b),)))
+
+    def _a_pairs():
+        yield ("c", c)
+        _repair_after_yield(broken)  # runs when the walk advances A
+
+    a = _Items(_a_pairs)
+    completed = _entry_flow((a, b))
+
+    assert broken["tenant_id"] == "tenant-a"                       # A repaired the backing
+    assert completed[1]["tenant_id"] == 5                          # B's first observation was kept
+    assert completed[0]["c"]["b"]["tenant_id"] == 5
+    assert reads == ["b"]                                          # and B was read exactly once
+
+
+def test_a_child_mapping_the_entry_walk_already_queued_is_captured_when_it_is_exposed() -> None:
+    """The same proxy is queued by the entry walk (second root) and exposed by a generator
+    before that generator is advanced; its first observation is the one at exposure."""
+
+    broken = _invalid_resource_dict()
+    shared = MappingProxyType(broken)
+
+    def _generator_pairs():
+        yield ("allowed_resources", (shared,))
+        _repair_after_yield(broken)
+
+    completed = _entry_flow((_Items(_generator_pairs), shared))
+
+    assert broken["tenant_id"] == "tenant-a"
+    assert dict(completed[0]["allowed_resources"][0])["tenant_id"] == 5
+    assert dict(completed[1])["tenant_id"] == 5
+
+
+def test_each_mapping_is_read_once_however_the_walk_reaches_it() -> None:
+    reads: list[str] = []
+
+    def counted(name):
+        def pairs():
+            reads.append(name)
+            yield ("leaf", name)
+        return _Items(pairs)
+
+    leaf = counted("leaf")
+    middle = _Items(lambda: iter((("leaf", leaf), ("leaf-again", leaf))))
+    top = _Items(lambda: iter((("middle", middle), ("leaf", leaf))))
+    _entry_flow((top, middle, leaf, [leaf, middle]))
+    assert sorted(reads) == ["leaf"]
+
+
+# ── pre-emptive sweep: classes seen across reviews ──────────────────────────
+
+
+def _statement_dict(**overrides) -> dict:
+    value = {
+        "id": "dict-allow", "effect": "allow", "subject_id": "subject-a", "credential_id": None,
+        "action": "read", "resource": reference("memory-1").model_dump(mode="python"),
+    }
+    value.update(overrides)
+    return value
+
+
+def _with_statements(*statements) -> AccessPolicy:
+    return _policy_with_public_only_statements(*statements)
+
+
+# class 1: a registered-only ABC is not trusted as the real protocol
+
+
+class _NotReallyAMapping:
+    def __init__(self, entries):
+        self._entries = entries
+
+    def items(self):
+        return iter(self._entries.items())
+
+
+def test_a_registered_only_mapping_is_not_treated_as_a_mapping() -> None:
+    Mapping.register(_NotReallyAMapping)
+    resource_value = reference("memory-1")
+    grant = _NotReallyAMapping(_statement_dict())
+    with pytest.raises(ValidationError):
+        evaluate(principal(), "read", resource_value, _with_statements(grant))
+    # the completed copy is the object itself (not a rebuilt dict), so strict validation refuses it
+    assert isinstance(_complete_contract_input(grant, set(), {}, {}), _NotReallyAMapping)
+
+
+@pytest.mark.filterwarnings("ignore:For performance reasons")
+def test_a_registered_only_model_is_not_treated_as_a_model() -> None:
+    class Impostor:
+        pass
+
+    BaseModel.register(Impostor)
+    resource_value = reference("memory-1")
+    with pytest.raises((ValidationError, TypeError, ValueError)):
+        evaluate(principal(), "read", resource_value, _with_statements(Impostor()))
+
+
+# class 6: a str-subclass key is one key by its text; two keys with one text are refused
+
+
+class _DuplicateEffectKey(str):
+    def __hash__(self) -> int:
+        return hash("effect")
+
+    def __eq__(self, other: object) -> bool:
+        return False
+
+    def __ne__(self, other: object) -> bool:
+        return True
+
+
+class _TextKey(str):
+    """An ordinary str subclass (no hook overridden)."""
+
+
+def test_a_second_key_with_the_same_text_cannot_flip_an_allow_into_a_silent_pass() -> None:
+    resource_value = reference("memory-1")
+    mirrored = _statement_dict(effect="allow")
+    dict.__setitem__(mirrored, _DuplicateEffectKey("effect"), "deny")
+    with pytest.raises(ValueError):
+        evaluate(principal(), "read", resource_value, _with_statements(mirrored))
+    first = _statement_dict(effect="deny")
+    dict.__setitem__(first, _DuplicateEffectKey("effect"), "allow")
+    with pytest.raises(ValueError):
+        evaluate(principal(), "read", resource_value, _with_statements(first))
+
+
+def test_an_ordinary_str_subclass_key_is_read_as_its_text() -> None:
+    resource_value = reference("memory-1")
+    keyed = {_TextKey(name): value for name, value in _statement_dict().items()}
+    assert evaluate(principal(), "read", resource_value, _with_statements(keyed)).outcome == "allow"
+
+
+# class 3: a native dict first met lazily keeps its first observation for every later edge
+
+
+def test_a_lazily_met_dict_shared_by_two_edges_keeps_its_first_observation() -> None:
+    broken = _invalid_resource_dict()
+    mapping_inventories: dict = {}
+    first = _complete_contract_input((broken,), set(), {}, mapping_inventories)
+    _repair_after_yield(broken)
+    second = _complete_contract_input((broken,), set(), {}, mapping_inventories)
+    assert first[0]["tenant_id"] == 5
+    assert second[0]["tenant_id"] == 5  # the same snapshot, not a re-read of the repaired dict
+
+
+# class 5: each pair of a custom mapping is frozen as a plain tuple, read once
+
+
+def test_a_pair_that_is_a_tuple_subclass_with_a_changing_iterator_is_read_once() -> None:
+    reads = []
+
+    class _Pair(tuple):
+        def __iter__(self):
+            reads.append(1)
+            return iter(("k", len(reads)))
+
+    class _Pairs(Mapping[str, object]):
+        def __getitem__(self, key):
+            raise KeyError(key)
+
+        def __iter__(self):
+            return iter(())
+
+        def __len__(self):
+            return 0
+
+        def items(self):  # type: ignore[override]
+            return iter((_Pair(("ignored", "ignored")),))
+
+    completed = _complete_contract_input(_Pairs(), set(), {}, {})
+    assert completed == {"k": 1} and len(reads) == 1
+
+
+# class 8: the objects an inventory is keyed by are kept alive by the inventory
+
+
+def test_objects_keyed_by_identity_stay_alive_for_the_whole_call() -> None:
+    class _Weak(dict):
+        pass
+
+    child = _Weak({"k": 1})
+    reference_to_child = weakref.ref(child)
+    holder = [child]
+    native_dicts: dict = {}
+    _freeze_reachable_model_inventories(holder, {}, set(), None, native_dicts)
+    del child, holder
+    gc.collect()
+    assert reference_to_child() is not None  # an id() could not be recycled while the inventory is live
+
+
+# class 9: the evaluator takes no time from the wall clock
+
+
+def test_the_policy_modules_never_read_the_clock() -> None:
+    import ast
+    from pathlib import Path
+
+    import contracts_policy
+    import contracts_policy_reference
+
+    for module in (contracts_policy, contracts_policy_reference):
+        tree = ast.parse(Path(module.__file__).read_text(encoding="utf-8"))
+        imported = {
+            alias.name.split(".")[0]
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.Import, ast.ImportFrom))
+            for alias in (node.names if isinstance(node, ast.Import) else [ast.alias(name=node.module or "")])
+        }
+        assert not imported & {"time", "datetime", "calendar", "zoneinfo"}, module.__name__
+
+
+# ── discovery findings: depth through model-owned mappings, shared containers, fields-set charges ──
+
+
+def _extra_chain(length: int) -> object:
+    """Models linked through ``__pydantic_extra__`` = a read-only mapping holding the next model."""
+
+    tail: object = None
+    for index in range(length):
+        model = SourceVersionLike(index)
+        if tail is not None:
+            object.__setattr__(model, "__pydantic_extra__", MappingProxyType({"child": tail}))
+        tail = model
+    return tail
+
+
+def SourceVersionLike(index: int):
+    from contracts_references import SourceVersion
+
+    return SourceVersion(record_id=f"r{index}", content_revision=1, policy_epoch=1)
+
+
+def test_a_chain_of_models_linked_through_extra_mappings_keeps_its_depth() -> None:
+    chain = _extra_chain(200)  # two levels per link (the model, then its mapping): past the limit
+    with pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):
+        _entry_flow(chain)
+    assert _entry_flow(_extra_chain(20)) is not None  # a short chain is within the limit
+
+
+def test_a_mapping_reachable_through_an_already_visited_container_is_captured_at_exposure() -> None:
+    broken = _invalid_resource_dict()
+    shared = (MappingProxyType(broken),)
+
+    def _parent_pairs():
+        yield ("allowed_resources", shared)
+        _repair_after_yield(broken)  # resumed only when the walk advances the parent
+
+    completed = _entry_flow((_Items(_parent_pairs), shared))
+
+    assert broken["tenant_id"] == "tenant-a"
+    assert dict(completed[0]["allowed_resources"][0])["tenant_id"] == 5   # exposed first: first observation
+    assert dict(completed[1][0])["tenant_id"] == 5
+
+
+def test_a_merge_of_reaches_is_charged_so_the_bookkeeping_cannot_hold_memory_for_free() -> None:
+    proxies = _public_mappings(2000)
+    nested: object = (proxies,)
+    for _ in range(200):
+        nested = (nested, MappingProxyType({"extra": 1}))  # every level merges a growing reach with one more mapping
+    with pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):
+        _freeze_reachable_model_inventories(nested, {}, set(), None, None, DiscoveryBudget())
+
+
+def test_native_fields_set_names_are_charged_per_model() -> None:
+    from contracts_references import SourceVersion
+
+    names = {f"name-{i}" for i in range(2000)}
+    models = []
+    for index in range(100):
+        model = SourceVersion(record_id=f"r{index}", content_revision=1, policy_epoch=1)
+        _BASE_MODEL_FIELDS_SET_DESCRIPTOR.__set__(model, set(names))  # a large set per model
+        models.append(model)
+    budget = DiscoveryBudget()
+    with pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):  # 100 x 2000 names > the edge limit
+        _freeze_reachable_model_inventories(tuple(models), {}, set(), None, None, budget)
+
+
+def test_a_models_ordinary_fields_set_costs_nothing_extra() -> None:
+    from contracts_references import SourceVersion
+
+    model = SourceVersion(record_id="r", content_revision=1, policy_epoch=1)
+    budget = DiscoveryBudget()
+    _freeze_reachable_model_inventories(model, {}, set(), None, None, budget)
+    assert budget.edges == 3  # the three stored fields; the names of a legitimate set are those fields
+
+
+def test_only_names_beyond_the_stored_fields_are_charged() -> None:
+    from contracts_references import SourceVersion
+
+    model = SourceVersion(record_id="r", content_revision=1, policy_epoch=1)
+    _BASE_MODEL_FIELDS_SET_DESCRIPTOR.__set__(model, {f"n{i}" for i in range(1003)})  # 1,000 beyond the 3 stored
+    budget = DiscoveryBudget()
+    _freeze_reachable_model_inventories(model, {}, set(), None, None, budget)
+    assert budget.edges == 3 + 1000
+
+
+def test_a_large_legitimate_policy_fits_the_standard_budget() -> None:
+    """230 members with 25 distinct statements each (5,750 statements): the shape a hosted
+    tenant produces.  Charging every fields-set name used to refuse this above 162 members."""
+
+    statements = []
+    members = []
+    for member in range(230):
+        subject = f"subject-{member:04d}"
+        members.append(MembershipVersion(subject_id=subject, version=1))
+        for index in range(25):
+            statements.append(
+                PolicyStatement(
+                    id=f"s-{member}-{index}", effect="allow", subject_id=subject, credential_id=None,
+                    action="read", resource=reference(f"memory-{index}"),
+                )
+            )
+    big = AccessPolicy(
+        schema_version=VERSION, tenant_id="tenant-a", policy_epoch=1,
+        membership_versions=tuple(members), statements=tuple(statements),
+    )
+    decision = evaluate(
+        principal(subject_id="subject-0000", membership_version=1), "read", reference("memory-0"), big
+    )
+    assert decision.outcome == "allow"
+
+
+
+# ── the error for a shared invalid graph is bounded in size and in the time to render ──
+
+
+def _tuple_diamond(depth: int) -> object:
+    shared: object = ("leaf",)
+    for _ in range(depth):
+        shared = (shared, shared)
+    return shared
+
+
+def _dict_diamond(depth: int) -> object:
+    shared: object = {"leaf": 1}
+    for _ in range(depth):
+        shared = {"a": shared, "b": shared}
+    return shared
+
+
+@pytest.mark.parametrize("build,depth", [(_tuple_diamond, 22), (_dict_diamond, 19)])
+def test_the_error_for_a_shared_invalid_graph_renders_in_bounded_time_and_size(build, depth) -> None:
+    import time
+
+    resource_value = reference("memory-1")
+    with pytest.raises(ValidationError) as caught:
+        _evaluate_budget_statements(build(depth))
+    started = time.monotonic()
+    text = str(caught.value)
+    assert time.monotonic() - started < 1.0  # the base takes seconds at depth 22 and doubles per level
+    assert len(text) < 4096
+    assert "statements" in text  # the diagnostic still says where
+    assert caught.value.error_count() >= 1
+    with pytest.raises(ValidationError):  # policy and principal roots are bounded the same way
+        evaluate(principal(), "read", resource_value, _policy_with_public_only_statements(build(depth)))
+
+
+def test_diagnostics_for_ordinary_invalid_inputs_keep_their_input_echo() -> None:
+    with pytest.raises(ValidationError) as caught:
+        _evaluate_budget_statements(("not-a-statement",))
+    assert "input_value" in str(caught.value) and "not-a-statement" in str(caught.value)
+
+
+# ── the reach of a shared container is held by reference and charged once ──
+
+
+def _public_mappings(count: int) -> tuple:
+    return tuple(MappingProxyType({"k": index}) for index in range(count))
+
+
+def test_a_container_shared_by_many_parents_is_not_charged_once_per_parent() -> None:
+    shared = _public_mappings(20)
+    parents = tuple((shared,) for _ in range(2000))  # 2,000 parents, each holding the one container
+    budget = DiscoveryBudget()
+    _freeze_reachable_model_inventories(parents, {}, set(), None, None, budget)
+    # the walk itself costs ~6,000 entries; the reach bookkeeping must not add one copy per parent
+    assert budget.edges < 10_000, budget.edges
+
+
+def test_a_mapping_reached_through_two_children_is_recorded_once() -> None:
+    mapping = MappingProxyType({"k": 1})
+    holder = ((mapping,), [mapping])
+    reach: dict = {}
+    _freeze_reachable_model_inventories(holder, {}, set(), None, None, DiscoveryBudget(), 0, True, reach)
+    assert reach[id(holder)] == (mapping,)  # once, not once per path to it
+
+
+def test_the_unrebuildable_validation_error_falls_back_to_a_value_free_error(monkeypatch) -> None:
+    from pydantic_core import ValidationError as CoreValidationError
+
+    def refuse(*args, **kwargs):
+        raise TypeError("cannot rebuild")
+
+    monkeypatch.setattr(CoreValidationError, "from_exception_data", staticmethod(refuse))
+    with pytest.raises(ValueError) as caught:
+        _evaluate_budget_statements(_tuple_diamond(22))
+    assert not isinstance(caught.value, ValidationError)  # the bounded fallback, not the echoing error
+    text = str(caught.value)
+    assert len(text) < 256 and "validation error" in text and "AccessPolicy" in text
+
+
+# ── aliased inputs stay inside the memory and capture-depth bounds ──────────
+
+
+def test_a_repeated_wide_subgraph_does_not_multiply_the_reach_work() -> None:
+    """50,000 references to one tuple of 10,000 distinct proxies: discovery charges
+    ~80,000 edges, but merging each reference's reach used to touch 500 million entries."""
+
+    import time
+
+    wide = _public_mappings(10_000)
+    repeated = (wide,) * 50_000
+    budget = DiscoveryBudget()
+    reach: dict = {}
+    started = time.monotonic()
+    _freeze_reachable_model_inventories(repeated, {}, set(), None, None, budget, 0, True, reach)
+    assert time.monotonic() - started < 5.0
+    assert reach[id(repeated)] is reach[id(wide)]  # one distinct source: held by reference, no merge
+
+
+def test_merging_reaches_is_charged_before_it_is_built() -> None:
+    """Distinct reach tuples whose merge is far larger than the walk: refused quickly by the
+    charge taken before the merge, not after building it."""
+
+    import time
+
+    shared = _public_mappings(2_000)
+    # 400 distinct wrappers of the same 2,000 proxies: each wrapper has its own reach tuple
+    # (the shared proxies plus one of its own), so the root merges 400 x 2,001 entries.
+    wrappers = tuple((shared, MappingProxyType({"own": index})) for index in range(400))
+    started = time.monotonic()
+    with pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):
+        _freeze_reachable_model_inventories(wrappers, {}, set(), None, None, DiscoveryBudget())
+    assert time.monotonic() - started < 5.0
+
+
+def _proxy_chain_nodes(length: int) -> list:
+    nodes: list = []
+    tail: object = None
+    for _ in range(length):
+        tail = MappingProxyType({"next": tail})
+        nodes.append(tail)
+    return nodes
+
+
+def test_shallow_aliases_of_a_long_mapping_chain_end_in_the_budget_error() -> None:
+    nodes = _proxy_chain_nodes(5_000)
+    root = tuple(reversed(nodes))  # head first: capture follows the chain; every node is also at depth 1
+    with pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):  # previously a RecursionError
+        _entry_flow(root)
+    with pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):
+        _evaluate_budget_statements(root)
+
+
+def test_a_short_aliased_mapping_chain_is_still_captured() -> None:
+    nodes = _proxy_chain_nodes(40)
+    completed = _entry_flow(tuple(reversed(nodes)))
+    assert len(completed) == 40 and dict(completed[0])["next"] is not None
+
+
+# ── a pair is read incrementally: its value is frozen before the exhaustion check ──
+
+
+class _RepairingPair(tuple):
+    """A key/value pair whose public iterator repairs the value during the exhaustion check."""
+
+    def __new__(cls, key, value, repair):
+        instance = super().__new__(cls, (key, value))
+        instance.key, instance.value, instance.repair = key, value, repair
+        return instance
+
+    def __iter__(self):
+        yield self.key
+        yield self.value
+        self.repair()  # runs when the unpacking asks for a third item
+
+
+def _invalid_handle():
+    handle = reference("memory-1")
+    handle.__dict__["tenant_id"] = 5
+    return handle
+
+
+def test_a_pair_cannot_repair_its_value_during_the_exhaustion_check() -> None:
+    handle = _invalid_handle()
+
+    def repair():
+        handle.__dict__["tenant_id"] = "tenant-a"
+
+    pairs = _Items(lambda: iter((_RepairingPair("allowed_resources", (handle,), repair),)))
+    completed = _entry_flow(pairs)
+    assert handle.tenant_id == "tenant-a"                          # the repair ran
+    assert completed["allowed_resources"][0]["tenant_id"] == 5      # the first observation was kept
+
+
+def test_a_statement_value_repaired_during_the_exhaustion_check_is_still_refused() -> None:
+    resource_value = reference("memory-1")
+    handle = _invalid_handle()
+
+    def repair():
+        handle.__dict__["tenant_id"] = "tenant-a"
+
+    def pairs():
+        yield ("id", "lazy-allow")
+        yield ("effect", "allow")
+        yield ("subject_id", "subject-a")
+        yield ("credential_id", None)
+        yield ("action", "read")
+        yield _RepairingPair("resource", handle, repair)
+
+    with pytest.raises(ValidationError):
+        evaluate(principal(), "read", resource_value, _with_statements(_Items(pairs)))
+
+
+def test_pair_shape_errors_keep_their_types_and_terminal_ordering() -> None:
+    class Three(tuple):
+        def __iter__(self):
+            return iter(("a", 1, "extra"))
+
+    class One(tuple):
+        def __iter__(self):
+            return iter(("a",))
+
+    for bad, kind, text in ((Three(), ValueError, "too many values to unpack"),
+                            (One(), ValueError, "not enough values to unpack"),
+                            (5, TypeError, "cannot unpack non-iterable int object")):
+        later = []
+
+        def pairs(bad=bad):
+            yield ("first", 1)
+            yield bad
+            later.append("drained")
+            yield ("after", 2)  # drained, never retained
+
+        with pytest.raises(kind, match=text):
+            _entry_flow(_Items(pairs))
+        assert later == ["drained"]
+
+
+def test_freeze_mapping_entries_freezes_each_value_before_the_exhaustion_check() -> None:
+    handle = _invalid_handle()
+
+    def repair():
+        handle.__dict__["tenant_id"] = "tenant-a"
+
+    inventories: dict = {}
+    entries = _freeze_mapping_entries(
+        (_RepairingPair("resource", handle, repair),), {}, inventories, set(), {}, DiscoveryBudget()
+    )
+    assert entries[0].key == "resource"
+    frozen = inventories[id(handle)]
+    assert dict(frozen.stored_items)["tenant_id"] == 5  # captured before the repair ran
+
+
+@pytest.mark.parametrize("container", [list, tuple])
+def test_a_sequence_view_cannot_repair_an_item_it_already_yielded(container) -> None:
+    broken = _invalid_resource_dict()
+    handle = _invalid_handle()
+
+    class View(container):  # type: ignore[misc, valid-type]
+        def __iter__(self):
+            yield broken
+            yield handle
+            broken["tenant_id"] = "tenant-a"  # both repairs run on the advance after the last yield
+            handle.__dict__["tenant_id"] = "tenant-a"
+
+    completed = _complete_contract_input(View(), set(), {}, {})
+    assert completed[0]["tenant_id"] == 5 and completed[1]["tenant_id"] == 5
+
+
+def test_the_module_no_longer_has_a_drain_then_freeze_mapping_reader() -> None:
+    import contracts_policy_reference
+
+    assert not hasattr(contracts_policy_reference, "_mapping_items")
