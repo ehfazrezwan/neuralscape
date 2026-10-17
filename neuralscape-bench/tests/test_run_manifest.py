@@ -5517,3 +5517,112 @@ def test_a_manifest_built_from_datetime_subclasses_serializes_and_round_trips(pa
     assert type(manifest.started_at) is datetime and type(manifest.finished_at) is datetime
     text = serialize_run_manifest(manifest)  # an inexact leaf would be refused here as an unsupported value type
     assert validate_run_manifest_json(text) == manifest
+
+
+# ---- validation that nests inside another validation never erases the outer one's pending reading
+
+
+def _source_whose_finish_builds_another_manifest(zone, *, nest):
+    """An attribute source (for ``from_attributes``) whose ``finished_at`` property validates another manifest first."""
+
+    fields = completed_manifest().model_dump()
+    shared = datetime(2026, 10, 1, 8, 0, tzinfo=zone)
+    namespace = {name: value for name, value in fields.items() if name not in ("started_at", "finished_at")}
+    namespace["started_at"] = shared
+
+    def finished_at(self):
+        nest()  # a whole other manifest is validated while this one's finished_at is being read
+        return shared
+
+    namespace["finished_at"] = property(finished_at)
+    return type("Source", (), namespace)()
+
+
+def _another_manifest_through(route):
+    data = completed_manifest().model_dump()
+    if route == "init":
+        return RunManifest(**data)
+    if route == "model_validate":
+        return RunManifest.model_validate(data)
+    return pydantic.TypeAdapter(RunManifest).validate_python(data)
+
+
+@pytest.mark.parametrize("first, later", [(timedelta(0), timedelta(hours=-5)), (timedelta(hours=-5), timedelta(0))])
+@pytest.mark.parametrize("route", ["init", "model_validate", "type_adapter"])
+def test_a_manifest_built_while_reading_finished_at_leaves_the_outer_reading_alone(route, first, later):
+    zone = _FlipZone(first, later)
+    source = _source_whose_finish_builds_another_manifest(zone, nest=lambda: _another_manifest_through(route))
+    manifest = pydantic.TypeAdapter(RunManifest).validate_python(source, from_attributes=True)
+    assert manifest.started_at == manifest.finished_at  # one object, one reading
+    assert manifest.started_at.utcoffset() == first
+    assert zone.reads == 1
+
+
+def test_a_deeper_nest_and_a_nest_that_raises_still_leave_the_outer_reading_alone():
+    zone = _FlipZone(timedelta(hours=-5), timedelta(0))
+
+    def nest():
+        inner_zone = _FlipZone(timedelta(hours=1), timedelta(hours=2))
+        inner = _source_whose_finish_builds_another_manifest(inner_zone, nest=lambda: _another_manifest_through("type_adapter"))
+        pydantic.TypeAdapter(RunManifest).validate_python(inner, from_attributes=True)
+        assert inner_zone.reads == 1
+        with pytest.raises(ValidationError):
+            data = completed_manifest().model_dump()
+            data["finished_at"] = object()
+            pydantic.TypeAdapter(RunManifest).validate_python(data)
+
+    manifest = pydantic.TypeAdapter(RunManifest).validate_python(
+        _source_whose_finish_builds_another_manifest(zone, nest=nest), from_attributes=True
+    )
+    assert manifest.started_at == manifest.finished_at and zone.reads == 1
+
+
+def test_threads_that_nest_validations_never_cross_readings():
+    import threading
+
+    errors: list[BaseException] = []
+
+    def worker():
+        try:
+            for _ in range(20):
+                zone = _FlipZone(timedelta(hours=-5), timedelta(0))
+                source = _source_whose_finish_builds_another_manifest(zone, nest=lambda: _another_manifest_through("type_adapter"))
+                manifest = pydantic.TypeAdapter(RunManifest).validate_python(source, from_attributes=True)
+                assert manifest.started_at == manifest.finished_at and zone.reads == 1
+        except BaseException as error:  # noqa: BLE001
+            errors.append(error)
+
+    threads = [threading.Thread(target=worker) for _ in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert errors == []
+
+
+def test_nothing_is_pending_after_nested_validations_in_any_order():
+    from neuralscape_bench.run_manifest import _PENDING_STARTED_AT
+
+    zone = _FlipZone(timedelta(0), timedelta(hours=-5))
+    pydantic.TypeAdapter(RunManifest).validate_python(
+        _source_whose_finish_builds_another_manifest(zone, nest=lambda: _another_manifest_through("type_adapter")), from_attributes=True
+    )
+    assert not _PENDING_STARTED_AT.get()
+
+
+def test_validations_aborted_while_reading_finished_at_cannot_grow_the_table_or_pair_with_the_next():
+    from neuralscape_bench.run_manifest import _PENDING_LIMIT, _PENDING_STARTED_AT
+
+    def explode():
+        raise RuntimeError("the attribute source failed")
+
+    for _ in range(_PENDING_LIMIT + 40):
+        source = _source_whose_finish_builds_another_manifest(_FlipZone(timedelta(0), timedelta(0)), nest=explode)
+        with pytest.raises(ValidationError):  # pydantic reports a failing attribute as a validation error
+            pydantic.TypeAdapter(RunManifest).validate_python(source, from_attributes=True)
+    assert len(_PENDING_STARTED_AT.get() or {}) <= _PENDING_LIMIT
+    zone = _FlipZone(timedelta(hours=-5), timedelta(0))  # the next validation reads and pairs on its own
+    manifest = pydantic.TypeAdapter(RunManifest).validate_python(
+        _source_whose_finish_builds_another_manifest(zone, nest=lambda: None), from_attributes=True
+    )
+    assert manifest.started_at == manifest.finished_at and zone.reads == 1

@@ -344,15 +344,43 @@ _TIMESTAMP_PINS: ContextVar[dict[int, tuple[datetime, datetime]] | None] = Conte
 )
 
 
-# The started_at reading of the manifest whose fields are being validated, when no per-call pins are
+# The started_at readings held for the manifests whose fields are being validated, when no per-call pins are
 # open (a TypeAdapter, or a model that nests RunManifest, does not run RunManifest's own __init__ or
-# model_validate).  Fields are validated in declaration order, so finished_at of the same manifest
-# reuses the reading if it is the same datetime object; the slot is cleared once finished_at is done
-# (both fields validate their defaults, and a wrap step on finished_at (Python input) empties it whether or not
-# the value is valid, so a rejected validation leaves nothing behind).
-_PENDING_STARTED_AT: ContextVar[tuple[datetime, datetime] | None] = ContextVar(
+# model_validate).  Validations can nest (reading ``finished_at`` from an attribute source can validate
+# another manifest), so each reading belongs to ONE validation, found by the identity of its ``info.data``
+# (the dict both timestamp fields of that validation share; it is held with the entry, so its id cannot be
+# reused while the entry exists): a nested validation puts, takes and empties only its own entry and never
+# touches the outer one.  The finished_at wrap step of a validation takes its entry before the value is
+# checked and again afterwards, so a rejected validation leaves nothing behind; an empty table is ``None``.
+# The table is replaced, never mutated, so contexts that share it (tasks started from a copied context)
+# cannot disturb each other, and it is capped (a source whose attribute read fails never reaches the finished_at step, so its entry stays until pushed out).
+_PENDING_STARTED_AT: ContextVar[dict[int, tuple[object, datetime, datetime]] | None] = ContextVar(
     "_PENDING_STARTED_AT", default=None
 )
+_PENDING_LIMIT = 16
+
+
+def _pending_put(data: object, original: datetime, fixed: datetime) -> None:
+    table = dict(_PENDING_STARTED_AT.get() or {})
+    table.pop(id(data), None)
+    while len(table) >= _PENDING_LIMIT:
+        table.pop(next(iter(table)))  # the oldest: only an aborted validation can have left one that long
+    table[id(data)] = (data, original, fixed)
+    _PENDING_STARTED_AT.set(table)
+
+
+def _pending_take(data: object) -> tuple[object, datetime, datetime] | None:
+    """This validation's entry, removed (no other validation's entry is read or changed)."""
+
+    table = _PENDING_STARTED_AT.get()
+    if not table:
+        return None
+    entry = table.get(id(data))
+    if entry is None or entry[0] is not data:
+        return None
+    rest = {key: value for key, value in table.items() if key != id(data)}
+    _PENDING_STARTED_AT.set(rest or None)
+    return entry
 
 
 @contextmanager
@@ -370,23 +398,23 @@ def _pinned_timestamp_offsets() -> Iterator[None]:
         _TIMESTAMP_PINS.reset(token)
 
 
-def _take_started_reading(value: Any, handler: Any) -> Any:
-    """Check ``finished_at`` after taking, and in every case emptying, the started_at reading held for it.
+def _take_started_reading(value: Any, handler: Any, info: ValidationInfo) -> Any:
+    """Check ``finished_at`` after taking, and in every case emptying, this validation's started_at reading.
 
-    The slot is emptied before the value is checked and again afterwards, so it is empty whether the
-    value is valid or not: a rejected validation leaves nothing behind.  The same object supplied as
-    both timestamps is handed on as the reading already taken.  (A function validator on the whole
+    The entry is taken before the value is checked and again afterwards, so it is gone whether the value is
+    valid or not: a rejected validation leaves nothing behind.  The same object supplied as both
+    timestamps is handed on as the reading already taken.  Only this validation's entry is touched, so a
+    validation nested in the reading of this one cannot erase it.  (A function validator on the whole
     field would make JSON input reach the strict checks as Python objects; see ``_PairedFinish``.)
     """
 
-    held = _PENDING_STARTED_AT.get()
-    _PENDING_STARTED_AT.set(None)
+    held = _pending_take(info.data)
     try:
-        if held is not None and _TIMESTAMP_PINS.get() is None and held[0] is value:
-            value = held[1]
+        if held is not None and _TIMESTAMP_PINS.get() is None and held[1] is value:
+            value = held[2]
         return handler(value)
     finally:
-        _PENDING_STARTED_AT.set(None)
+        _pending_take(info.data)
 
 
 class _PairedFinish:
@@ -401,7 +429,7 @@ class _PairedFinish:
         inner = handler(source)
         return core_schema.json_or_python_schema(
             json_schema=inner,
-            python_schema=core_schema.no_info_wrap_validator_function(_take_started_reading, inner),
+            python_schema=core_schema.with_info_wrap_validator_function(_take_started_reading, inner),
         )
 
 
@@ -438,7 +466,7 @@ class RunManifest(_ManifestContract):
     def require_aware_timestamp(cls, value: datetime | None, info: ValidationInfo) -> datetime | None:
         pins = _TIMESTAMP_PINS.get()
         if pins is None and info.field_name == "started_at":
-            _PENDING_STARTED_AT.set(None)  # nothing from an earlier validation is ever paired with this one
+            _pending_take(info.data)  # an entry left under this very dict by nothing else: start clean
         if value is None:
             return None
         # Read the caller's tzinfo once and keep an exact fixed-offset copy, so nothing later (the
@@ -456,7 +484,7 @@ class RunManifest(_ManifestContract):
             elif info.field_name == "started_at" and info.mode == "python":
                 # Only Python input is paired (the emptying step is installed for it alone); a JSON value is a
                 # new object each time, so nothing is held for it.
-                _PENDING_STARTED_AT.set((value, fixed))
+                _pending_put(info.data, value, fixed)
             return fixed
         except ValueError:
             raise
