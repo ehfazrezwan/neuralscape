@@ -367,8 +367,10 @@ def _local_record_end(raw: BinaryIO, info: zipfile.ZipInfo, start_dir: int) -> i
         raise _Framing("local and central flags or method differ")
 
     # A size at its sentinel is resolved from the zip64 block before anything else is decided, streamed or not:
-    # the block must exist and carry every size the header defers to it.
-    if csize == _U32_MAX or usize == _U32_MAX:
+    # the block must exist and carry every size the header defers to it.  The sentinels also say which
+    # descriptor follows a streamed member: wide for zip64, narrow otherwise.
+    wide_descriptor = csize == _U32_MAX or usize == _U32_MAX
+    if wide_descriptor:
         zip64_usize, zip64_csize = _zip64_local_sizes(extra, usize == _U32_MAX, csize == _U32_MAX)
         if usize == _U32_MAX:
             usize = zip64_usize
@@ -391,8 +393,10 @@ def _local_record_end(raw: BinaryIO, info: zipfile.ZipInfo, start_dir: int) -> i
 
     raw.seek(data_end)
     probe = raw.read(24)
+    # One format, chosen by the local header: a wide descriptor of an empty member (signature, CRC, two zero
+    # sizes, then eight more zero bytes) begins exactly like a narrow one, so trying both would stop early.
     for with_signature in (True, False):
-        for width, fmt in ((4, "<III"), (8, "<IQQ")):
+        for width, fmt in (((8, "<IQQ"),) if wide_descriptor else ((4, "<III"),)):
             prefix = 4 if with_signature else 0
             size = prefix + struct.calcsize(fmt)
             if len(probe) < size:

@@ -2331,3 +2331,52 @@ def test_distinct_names_are_still_not_collisions() -> None:
     report = pv.VerificationReport()
     pv._collision_checks(_folded_entries("ΐ.txt", "ι.txt", "a/b.txt", "a/c.txt", "straße.txt", "strasse2.txt"), report)
     assert not {pv.CASE_COLLISION, pv.PATH_CONFLICT, pv.DUPLICATE_ENTRY} & set(_codes(report))
+
+
+# --- the descriptor format of a streamed member is chosen by its local-header sentinels --------------------
+
+
+def _streamed_bundle_with_empty_member(path: Path, *, zip64: bool, method: int) -> None:
+    """A valid bundle written to an unseekable sink, with an empty member among the others."""
+
+    files = {**PAYLOAD, "sources/empty.txt": b""}
+    sink = _DescriptorSink()
+    with zipfile.ZipFile(sink, "w", method) as archive:
+        archive.writestr("manifest.json", json.dumps(_manifest(files)))
+        for name, data in files.items():
+            with archive.open(zipfile.ZipInfo(name), "w", force_zip64=zip64) as member:
+                member.write(data)
+    path.write_bytes(bytes(sink.data))
+
+
+@pytest.mark.parametrize("method", [zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED])
+@pytest.mark.parametrize("zip64", [False, True])
+def test_a_streamed_bundle_with_an_empty_member_verifies(tmp_path, zip64, method) -> None:
+    """An empty member's 64-bit descriptor begins like a 32-bit one (signature, CRC, two zero sizes)."""
+
+    path = tmp_path / "b.zip"
+    _streamed_bundle_with_empty_member(path, zip64=zip64, method=method)
+    assert verify_bundle(path).ok
+
+
+def test_the_zip64_descriptor_of_an_empty_member_is_not_cut_short(tmp_path) -> None:
+    path = tmp_path / "b.zip"
+    _streamed_bundle_with_empty_member(path, zip64=True, method=zipfile.ZIP_STORED)
+    with zipfile.ZipFile(path) as archive:
+        info = archive.getinfo("sources/empty.txt")
+        assert info.file_size == 0 and info.compress_size == 0
+    report = verify_bundle(path)
+    assert report.ok, [(item.code, item.detail) for item in report.findings]
+
+
+def test_a_member_that_is_not_zip64_is_not_given_a_wide_descriptor(tmp_path) -> None:
+    """A 32-bit local header (no sentinel) is followed by a 32-bit descriptor: a 64-bit one would leave bytes
+    the framing accounts to nothing."""
+
+    path = tmp_path / "b.zip"
+    _streamed_bundle_with_empty_member(path, zip64=False, method=zipfile.ZIP_STORED)
+    data = bytearray(path.read_bytes())
+    position = data.index(b"PK\x07\x08")  # the first descriptor: widen it by inserting eight bytes
+    data[position + 16 : position + 16] = b"\0" * 8  # a 64-bit descriptor's size fields follow the CRC
+    path.write_bytes(bytes(data))
+    assert not verify_bundle(path).ok
