@@ -1290,6 +1290,62 @@ def _is_supported_leaf(value: Any) -> bool:
     return _is_exact_type(kind, _LEAF_TYPES) or _is_exact_type(kind, _ALLOWED_ENUMS)
 
 
+_KEY_LABEL_CHARS = 64
+_KEY_LABEL_INT_BITS = 128
+
+
+def _key_label(key: object) -> str:
+    """A short label for a mapping key, built only from its exact text or number.
+
+    A key can be a ``str`` subclass (or any hashable) whose ``__repr__`` is caller code that may run
+    side effects or return megabytes; only the base types' own methods are used here, and long text
+    is cut.
+    """
+
+    kind = type(key)
+    if _is_instance(key, str):
+        text = str.__getitem__(key, slice(0, _KEY_LABEL_CHARS))  # type: ignore[arg-type]
+        cut = str.__len__(key) > _KEY_LABEL_CHARS  # type: ignore[arg-type]
+        return str.__repr__(text) + ("…" if cut else "")
+    if kind is bool:
+        return "True" if key is True else "False"
+    if kind is int:
+        bits = int.bit_length(key)  # type: ignore[arg-type]
+        if bits > _KEY_LABEL_INT_BITS:
+            return f"<int key of {bits} bits>"
+        return int.__repr__(key)  # type: ignore[arg-type]
+    return f"<{type.__dict__['__name__'].__get__(kind)} key>"
+
+
+class _Path:
+    """A location in the caller's input, rendered only when an error names it.
+
+    Building ``f"{path}[{key!r}]"`` for every visited entry ran each key's ``__repr__`` on the success
+    path too; a ``_Path`` keeps the parent and the key and labels it with ``_key_label`` on demand.
+    """
+
+    __slots__ = ("parent", "step")
+
+    def __init__(self, parent: "_Path | str", step: object) -> None:
+        self.parent = parent
+        self.step = step  # ("field", name), ("key", key) or ("index", int)
+
+    def __str__(self) -> str:
+        parts: list[str] = []
+        node: _Path | str = self
+        while type(node) is _Path:
+            kind, item = node.step  # type: ignore[misc]
+            if kind == "field":
+                parts.append("." + str.__str__(item))
+            elif kind == "index":
+                parts.append(f"[{item}]")
+            else:
+                parts.append(f"[{_key_label(item)}]")
+            node = node.parent
+        parts.append(node)  # type: ignore[arg-type]
+        return "".join(reversed(parts))
+
+
 def _require_native_snapshot(snapshot: Any) -> Any:
     """Reject, with a stable error and before Pydantic sees it, any unsupported value.
 
@@ -1300,7 +1356,7 @@ def _require_native_snapshot(snapshot: Any) -> Any:
     its fields.  The walk is iterative and reads only real types.
     """
 
-    pending: list[tuple[Any, str]] = [(snapshot, "$")]
+    pending: list[tuple[Any, _Path | str]] = [(snapshot, "$")]
     seen: set[int] = set()
     while pending:
         value, path = pending.pop()
@@ -1310,15 +1366,15 @@ def _require_native_snapshot(snapshot: Any) -> Any:
                 continue
             seen.add(id(value))
             if kind is dict:
-                pending.extend((item, f"{path}[{key!r}]") for key, item in dict.items(value))
+                pending.extend((item, _Path(path, ("key", key))) for key, item in dict.items(value))
             else:
-                pending.extend((item, f"{path}[{index}]") for index, item in enumerate(value))
+                pending.extend((item, _Path(path, ("index", index))) for index, item in enumerate(value))
         elif not _is_supported_leaf(value):
             raise ValueError(f"unsupported value type at {path}")
     return snapshot
 
 
-def _fixed_offset(value: datetime, path: str) -> datetime:
+def _fixed_offset(value: datetime, path: _Path | str) -> datetime:
     """Read a datetime's UTC offset exactly once and keep a fixed-offset copy.
 
     A ``tzinfo`` is caller code: its ``utcoffset`` can return a different answer on every
@@ -1342,7 +1398,7 @@ def _fixed_offset(value: datetime, path: str) -> datetime:
 def _snapshot_native(
     value: Any,
     *,
-    path: str = "$",
+    path: _Path | str = "$",
     active: set[int] | None = None,
     _frozen_graph: _FrozenGraph | None = None,
 ) -> Any:
@@ -1400,12 +1456,12 @@ def _snapshot_native(
                 undeclared.update(iterated_extra_names)
                 undeclared.update(key for key, _ in extra_entries)
             if undeclared:
-                names = ", ".join(sorted(repr(name) for name in undeclared))
+                names = ", ".join(sorted(_key_label(name) for name in undeclared))
                 raise ValueError(f"undeclared stored fields at {path}: {names}")
             return {
                 name: _snapshot_native(
                     stored_values[name],
-                    path=f"{path}.{name}",
+                    path=_Path(path, ("field", name)),
                     active=active,
                     _frozen_graph=_frozen_graph,
                 )
@@ -1424,7 +1480,7 @@ def _snapshot_native(
                 return {
                     key: _snapshot_native(
                         item,
-                        path=f"{path}[{key!r}]",
+                        path=_Path(path, ("key", key)),
                         active=active,
                         _frozen_graph=_frozen_graph,
                     )
@@ -1440,7 +1496,7 @@ def _snapshot_native(
             projected: dict[Any, Any] = {}
             for key, item in frozen_mapping.entries:
                 _protect_yielded_model_storage(item, _frozen_graph)
-                item_path = f"{path}[{key!r}]"
+                item_path = _Path(path, ("key", key))
                 projected[key] = _snapshot_native(
                     item,
                     path=item_path,
@@ -1472,7 +1528,7 @@ def _snapshot_native(
                 projected = tuple(
                     _snapshot_native(
                         item,
-                        path=f"{path}[{index}]",
+                        path=_Path(path, ("index", index)),
                         active=active,
                         _frozen_graph=_frozen_graph,
                     )
@@ -1488,7 +1544,7 @@ def _snapshot_native(
             return tuple(
                 _snapshot_native(
                     item,
-                    path=f"{path}[{index}]",
+                    path=_Path(path, ("index", index)),
                     active=active,
                     _frozen_graph=_frozen_graph,
                 )
@@ -1514,7 +1570,7 @@ def _snapshot_native(
                 projected = [
                     _snapshot_native(
                         item,
-                        path=f"{path}[{index}]",
+                        path=_Path(path, ("index", index)),
                         active=active,
                         _frozen_graph=_frozen_graph,
                     )
@@ -1530,7 +1586,7 @@ def _snapshot_native(
             return [
                 _snapshot_native(
                     item,
-                    path=f"{path}[{index}]",
+                    path=_Path(path, ("index", index)),
                     active=active,
                     _frozen_graph=_frozen_graph,
                 )

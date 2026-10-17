@@ -5190,3 +5190,65 @@ def test_exact_datetimes_keep_wall_time_offset_and_fold():
     assert manifest.started_at.utcoffset() == timedelta(hours=-5)
     assert (manifest.started_at.hour, manifest.started_at.minute, manifest.started_at.fold) == (1, 30, 1)
     assert manifest.finished_at - manifest.started_at == timedelta(minutes=15)
+
+
+# ---- error locations never run a caller key's __repr__
+
+
+class _LoudKey(str):
+    reprs = 0
+
+    def __repr__(self):
+        _LoudKey.reprs += 1
+        return "X" * 1_000_000
+
+
+def test_an_undeclared_stored_key_is_named_without_running_its_repr():
+    manifest = completed_manifest()
+    dict.__setitem__(BASE_MODEL_DICT_DESCRIPTOR.__get__(manifest, BaseModel), _LoudKey("sneaky"), 1)
+    _LoudKey.reprs = 0
+    with pytest.raises(ValueError, match=r"undeclared stored fields at \$: 'sneaky'$"):
+        serialize_run_manifest(manifest)
+    assert _LoudKey.reprs == 0
+
+
+def test_mapping_keys_on_the_walk_are_never_asked_for_their_repr():
+    manifest = completed_manifest()
+    reading = manifest.resources[0].model_dump()
+
+    class KeyedResource(dict):
+        pass
+
+    resource = KeyedResource({_LoudKey(name): value for name, value in reading.items()})
+    dict.__setitem__(BASE_MODEL_DICT_DESCRIPTOR.__get__(manifest, BaseModel), "resources", (resource,))
+    _LoudKey.reprs = 0
+    with contextlib.suppress(ValueError, ValidationError):
+        serialize_run_manifest(manifest)
+    assert _LoudKey.reprs == 0
+
+
+@pytest.mark.parametrize(
+    "key, label",
+    [
+        ("plain", "$['plain']"),
+        (_LoudKey("loud"), "$['loud']"),
+        (7, "$[7]"),
+        (True, "$[True]"),
+        (2**10_000, "$[<int key of 10001 bits>]"),
+        ("k" * 500, "$['" + "k" * 64 + "'…]"),
+        (frozenset(), "$[<frozenset key>]"),
+    ],
+    ids=["str", "str-subclass", "int", "bool", "huge-int", "long-str", "other"],
+)
+def test_error_locations_label_keys_from_their_exact_text(key, label):
+    _LoudKey.reprs = 0
+    with pytest.raises(ValueError) as refused:
+        run_manifest_module._require_native_snapshot({key: object()})
+    assert str(refused.value) == f"unsupported value type at {label}"
+    assert _LoudKey.reprs == 0
+
+
+def test_error_locations_still_name_nested_fields_and_indexes():
+    with pytest.raises(ValueError) as refused:
+        run_manifest_module._require_native_snapshot({"resources": [{"name": [1, object()]}]})
+    assert str(refused.value) == "unsupported value type at $['resources'][0]['name'][1]"
