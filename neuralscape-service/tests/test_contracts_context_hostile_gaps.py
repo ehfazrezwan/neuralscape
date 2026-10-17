@@ -1823,3 +1823,54 @@ def test_str_subclass_and_unknown_keys_get_no_declared_contract() -> None:
 
     snapshot = snapshot_contract_graph({LoudKey("items"): (), "other": 1}, contract=Holder)
     assert snapshot == {"items": (), "other": 1}
+
+
+# ---- the shared-item cache is per item model; the expanded-size limit counts edges, not nodes
+
+
+def test_the_same_valid_snapshot_yielded_to_views_with_different_item_models_is_judged_by_each() -> None:
+    from contracts_common import ContractModel, snapshot_contract_graph
+
+    class Narrow(ContractModel):
+        x: int
+
+    class Strict(ContractModel):
+        x: int
+        y: int  # required: the shared dict below does not have it
+
+    class Holder(ContractModel):
+        first: tuple[Narrow, ...]
+        second: tuple[Strict, ...]
+
+    shared = {"x": 1}
+    tail_reads = {"n": 0}
+
+    class Second(tuple):
+        def __iter__(self):
+            yield shared  # valid as a Narrow, invalid as a Strict
+            for _ in range(500):
+                tail_reads["n"] += 1
+                yield shared
+
+    holder = Holder.model_construct(first=_GeneratedItems(lambda: iter([shared])), second=Second())
+    with pytest.raises(ValueError, match="not valid"):
+        snapshot_contract_graph(holder, contract=Holder)
+    assert tail_reads["n"] == 0  # the first entry of the second view stopped it, as it would for that model alone
+
+
+def test_the_same_snapshot_for_the_same_model_is_still_judged_once() -> None:
+    from contracts_common import snapshot_contract_graph
+
+    Item, Holder, calls = _counting_item_contract()
+    item = Item.model_construct(payload=(1, 2, 3))
+    snapshot_contract_graph(Holder.model_construct(items=_GeneratedItems(lambda: iter([item] * 100))), contract=Holder)
+    assert calls["n"] == 1
+
+
+def test_an_entry_of_exactly_the_edge_limit_is_accepted_and_one_more_is_refused() -> None:
+    from contracts_common import _private_copy
+
+    limit = 1_000
+    assert len(_private_copy(list(range(limit)), limit)) == limit  # `limit` edges (`limit + 1` nodes): admitted
+    with pytest.raises(ValueError, match="budget"):
+        _private_copy(list(range(limit + 1)), limit)
