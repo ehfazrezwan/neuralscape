@@ -3814,3 +3814,97 @@ def test_an_alias_whose_read_runs_code_makes_the_model_rebuilt_per_edge() -> Non
     snapshot = snapshot_contract_graph([model, view, model, view])
     assert snapshot[0] is not snapshot[2]  # never reused: reading its alias ran caller code
     assert snapshot[1] != snapshot[3]       # so each later observation sees its own hook run
+
+
+# ── reading configuration and alias storage runs no caller hook (or the subtree is not reused) ──
+
+
+def _hooked_text(counter, text):
+    class HookedText(str):
+        def __hash__(self):
+            counter[0] += 1
+            return str.__hash__(str.__str__(self))
+
+        def __eq__(self, other):
+            counter[0] += 1
+            return str.__eq__(str.__str__(self), other)
+
+    return HookedText(text)
+
+
+def _assert_consistent(counter, model) -> None:
+    view = _counter_view(counter)
+    counter[0] = 0
+    snapshot = snapshot_contract_graph([model, view, model, view])
+    ran = counter[0]
+    if ran == 0:
+        assert snapshot[1] == snapshot[3]      # no hook ran: both observations agree
+    else:
+        assert snapshot[1] != snapshot[3]      # a hook ran: the model is rebuilt per edge, not reused
+
+
+def test_a_str_subclass_key_in_the_model_configuration_cannot_skew_later_views() -> None:
+    counter = [0]
+
+    class Configured(BaseModel):
+        a: int = 1
+
+    config = vars(Configured)["model_config"]
+    dict.__setitem__(config, _hooked_text(counter, "validate_by_alias"), True)
+    _assert_consistent(counter, Configured())
+
+
+@pytest.mark.parametrize("shape", ["choices", "path"])
+def test_alias_storage_that_is_a_list_subclass_cannot_skew_later_views(shape) -> None:
+    from pydantic import AliasChoices, AliasPath, Field
+
+    counter = [0]
+
+    class HookedList(list):
+        def __iter__(self):
+            counter[0] += 1
+            return list.__iter__(self)
+
+        def __len__(self):
+            counter[0] += 1
+            return list.__len__(self)
+
+        def __getitem__(self, index):
+            counter[0] += 1
+            return list.__getitem__(self, index)
+
+    if shape == "choices":
+        alias = AliasChoices("a1", "a2")
+        object.__setattr__(alias, "choices", HookedList(["a1", "a2"]))
+    else:
+        alias = AliasPath("root_a", 0)
+        object.__setattr__(alias, "path", HookedList(["root_a", 0]))
+
+    class Aliased(BaseModel):
+        a: int = Field(1, validation_alias=alias)
+
+    _assert_consistent(counter, Aliased())
+
+
+def test_a_hooked_key_in_a_model_class_namespace_cannot_skew_later_views() -> None:
+    counter = [0]
+
+    class Colliding(str):  # hashes like "model_config", so looking that name up compares against it
+        def __hash__(self):
+            return str.__hash__("model_config")
+
+        def __eq__(self, other):
+            counter[0] += 1
+            return False
+
+    class Meta(type(BaseModel)):
+        @classmethod
+        def __prepare__(mcs, name, bases, **kwargs):
+            namespace = dict(super().__prepare__(name, bases, **kwargs))
+            dict.__setitem__(namespace, Colliding("__ns_shadow__"), None)
+            return namespace
+
+    class Hooked(BaseModel, metaclass=Meta):
+        a: int = 1
+
+    _assert_consistent(counter, Hooked())

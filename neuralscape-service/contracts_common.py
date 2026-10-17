@@ -7,7 +7,7 @@ is the wire representation.  Neither representation grants identity or
 authority merely because a value validates.
 """
 
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from types import MappingProxyType
 from dataclasses import dataclass, field
 from typing import Annotated, Literal
@@ -60,17 +60,59 @@ class VersionedContract(ContractModel):
     schema_version: Literal["candidate-v1"]
 
 
-def _class_namespace_entry(model_type: type, name: str) -> object:
-    """``name`` from the first class on ``model_type``'s native MRO whose own namespace defines it.
+def _exact_entry(items: Iterable[tuple[object, object]], name: str) -> tuple[object, bool, bool]:
+    """``(value, found, pure)`` for ``name`` among natively read ``items``, compared as exact text.
 
-    The namespaces are read directly, so no metaclass ``__getattribute__`` or descriptor runs.
+    No key's own hash or equality runs.  ``pure`` is False when a key that is not an exact ``str`` is
+    present: a lookup through the mapping could have run its hooks, so the subtree is not reused.  An
+    exact key wins over a ``str``-subclass key with the same text.
     """
 
+    value: object = None
+    found = exact = False
+    pure = True
+    for key, item in items:
+        if type(key) is str:
+            if key == name:
+                value, found, exact = item, True, True
+        else:
+            pure = False
+            if not exact and _is_subclass(type(key), str) and str.__str__(key) == name:
+                value, found = item, True
+    return value, found, pure
+
+
+def _class_namespace_entry(model_type: type, name: str) -> tuple[object, bool]:
+    """``(value, pure)``: ``name`` from the first class on ``model_type``'s native MRO whose own
+    namespace defines it.
+
+    The namespaces are read directly (their native items, compared as exact text), so no metaclass
+    ``__getattribute__``, descriptor or key hook runs.
+    """
+
+    pure = True
     for klass in _TYPE_MRO.__get__(model_type):
         namespace = _CLASS_NAMESPACE.__get__(klass)
-        if name in namespace:
-            return namespace[name]
-    return None
+        value, found, klass_pure = _exact_entry(MappingProxyType.items(namespace), name)
+        pure = pure and klass_pure
+        if found:
+            return value, pure
+    return None, pure
+
+
+def _native_sequence(value: object) -> tuple[tuple[object, ...], bool]:
+    """``(items, pure)`` of a list or tuple read through its native storage (no iteration, length or
+    indexing hook runs).  A subclass is still read natively but reported impure; anything else is unreadable."""
+
+    if type(value) is list:
+        return tuple(list.__iter__(value)), True  # type: ignore[arg-type]
+    if type(value) is tuple:
+        return value, True  # type: ignore[return-value]
+    if _is_subclass(type(value), list):
+        return tuple(list.__iter__(value)), False  # type: ignore[arg-type]
+    if _is_subclass(type(value), tuple):
+        return tuple(tuple.__iter__(value)), False  # type: ignore[arg-type]
+    return (), False
 
 
 def _text(value: object) -> object:
@@ -87,26 +129,28 @@ def _model_metadata(model_type: type[BaseModel]) -> tuple[dict[object, object], 
     reading it may run caller code, so the subtree must not be reused.
     """
 
-    fields = _class_namespace_entry(model_type, "__pydantic_fields__")
-    config = _class_namespace_entry(model_type, "model_config")
+    fields, fields_pure = _class_namespace_entry(model_type, "__pydantic_fields__")
+    config, config_pure = _class_namespace_entry(model_type, "model_config")
     if type(fields) is dict and (config is None or type(config) is dict):
-        return fields, config, True
+        return fields, config, fields_pure and config_pure
     return dict(model_type.model_fields), model_type.model_config, False
 
 
 def _validation_alias_owners(
-    fields: dict[object, object], config: object
+    fields: dict[object, object], config: object, budget: DiscoveryBudget
 ) -> tuple[dict[str, set[str]], bool]:
     """Each validation alias (or alias-path root) as exact text, with the fields it belongs to.
 
-    A ``str``-subclass alias is read as its text, so hashing it runs no hook.  The second value
-    is False when reading an alias may have run caller code (a subclass of a pydantic alias or
-    field type), which makes the subtree ineligible for reuse.
+    A ``str``-subclass alias is read as its text, so hashing it runs no hook; the configuration and
+    the alias storage (``choices``, ``path``) are read natively and the copies charged.  The second
+    value is False when reading may have run caller code (a subclass of a pydantic alias or field type,
+    hook-capable storage or keys), which makes the subtree ineligible for reuse.
     """
 
     pure = type(config) is dict or config is None
     if type(config) is dict:
-        validate_by_alias = dict.get(config, "validate_by_alias")
+        validate_by_alias, _found, config_pure = _exact_entry(dict.items(config), "validate_by_alias")
+        pure = pure and config_pure
     else:
         validate_by_alias = None if config is None else config.get("validate_by_alias")  # type: ignore[attr-defined]
     if validate_by_alias is False:
@@ -119,7 +163,9 @@ def _validation_alias_owners(
         validation_alias = field.validation_alias  # type: ignore[attr-defined]
         if _is_subclass(type(validation_alias), AliasChoices):
             pure = pure and type(validation_alias) is AliasChoices
-            choices = tuple(validation_alias.choices)
+            choices, choices_pure = _native_sequence(validation_alias.choices)
+            budget.charge_edge(len(choices))
+            pure = pure and choices_pure
         else:
             choices = (validation_alias,)
         name = _text(field_name)
@@ -128,7 +174,10 @@ def _validation_alias_owners(
                 owners.setdefault(_text(choice), set()).add(name)  # type: ignore[arg-type]
             elif _is_subclass(type(choice), AliasPath):
                 pure = pure and type(choice) is AliasPath
-                root = choice.path[0]
+                path, path_pure = _native_sequence(choice.path)
+                budget.charge_edge(len(path))
+                pure = pure and path_pure
+                root = path[0] if path else None
                 if _is_subclass(type(root), str):
                     owners.setdefault(_text(root), set()).add(name)  # type: ignore[arg-type]
     return owners, pure
@@ -525,7 +574,7 @@ def _snapshot_captured_graph(
             # that is not possible the subtree (and every ancestor) is not reused.
             declared_fields, config, metadata_pure = _model_metadata(model_type)
             declared_names = {_text(name) for name in dict.keys(declared_fields)}
-            alias_owners, aliases_pure = _validation_alias_owners(declared_fields, config)
+            alias_owners, aliases_pure = _validation_alias_owners(declared_fields, config, budget)
             if not (metadata_pure and aliases_pure):
                 inventory.impure_reads += 1
             alias_roots = set(alias_owners)
