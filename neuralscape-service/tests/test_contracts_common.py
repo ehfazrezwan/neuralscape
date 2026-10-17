@@ -3790,7 +3790,7 @@ def test_a_str_subclass_validation_alias_runs_no_hook_and_cannot_skew_later_view
     assert snapshot[1] == snapshot[3] == [0]
 
 
-def test_an_alias_whose_read_runs_code_makes_the_model_rebuilt_per_edge() -> None:
+def test_an_alias_whose_read_runs_code_is_read_once_per_call_before_any_view() -> None:
     from pydantic import AliasPath, Field
 
     counter = [0]
@@ -3812,8 +3812,10 @@ def test_an_alias_whose_read_runs_code_makes_the_model_rebuilt_per_edge() -> Non
     view = _counter_view(counter)
     counter[0] = 0
     snapshot = snapshot_contract_graph([model, view, model, view])
-    assert snapshot[0] is not snapshot[2]  # never reused: reading its alias ran caller code
-    assert snapshot[1] != snapshot[3]       # so each later observation sees its own hook run
+    # the class is snapshotted once, at capture: its alias hook runs once, before either view is read,
+    # and both observations of the view agree with that
+    assert counter[0] == 1
+    assert snapshot[1] == snapshot[3] == [1]
 
 
 # ── reading configuration and alias storage runs no caller hook (or the subtree is not reused) ──
@@ -3978,7 +3980,7 @@ def test_a_non_text_key_among_the_declared_fields_runs_no_hook_and_cannot_skew_l
 # ── cached class metadata is not reused across caller code, and the declared-field scans are charged ──
 
 
-def test_metadata_changed_by_caller_code_between_two_instances_is_read_again() -> None:
+def _aliased_pair():
     from collections.abc import Mapping
 
     from pydantic import ConfigDict, Field
@@ -3988,8 +3990,19 @@ def test_metadata_changed_by_caller_code_between_two_instances_is_read_again() -
         a: int = Field(1, validation_alias="alias_a")
 
     config = vars(Aliased)["model_config"]
+    first = Aliased()
+    second = Aliased()
+    vars(BaseModel)["__dict__"].__get__(second, BaseModel)["alias_a"] = 2  # an alias root, stored
+    return Aliased, config, first, second, Mapping
 
-    class Flipping(Mapping):  # a carrier's extra storage: its view runs while the graph is rebuilt
+
+def test_every_instance_is_judged_by_the_class_as_it_was_before_caller_code_ran() -> None:
+    """One snapshot of the class per call, taken before any caller code runs: a callback later in the call
+    (here a carrier's extra mapping, read while the graph is rebuilt) cannot change how any instance is judged."""
+
+    Aliased, config, first, second, Mapping = _aliased_pair()
+
+    class Flipping(Mapping):
         def __getitem__(self, key):
             raise KeyError(key)
 
@@ -4000,23 +4013,48 @@ def test_metadata_changed_by_caller_code_between_two_instances_is_read_again() -
             return 0
 
         def items(self):
-            dict.__setitem__(config, "validate_by_alias", True)  # the alias is active from now on
+            dict.__setitem__(config, "validate_by_alias", True)
             return iter(())
 
-    first = Aliased()
     carrier = Aliased()
     vars(BaseModel)["__pydantic_extra__"].__set__(carrier, Flipping())
-    second = Aliased()
-    vars(BaseModel)["__dict__"].__get__(second, BaseModel)["alias_a"] = 2  # an active alias root, stored
-
+    combined = snapshot_contract_graph([first, carrier, second])
+    assert combined[2] == {"a": 1, "alias_a": 2}  # judged as the class was when the call began
+    # a later call takes its own snapshot, of the class as it is then
     with pytest.raises(ValueError, match="conflicting declared and extra fields"):
-        snapshot_contract_graph([first, carrier, second])
-    dict.__setitem__(config, "validate_by_alias", True)
-    with pytest.raises(ValueError, match="conflicting declared and extra fields"):
-        snapshot_contract_graph(second)  # the same instance alone is refused
+        snapshot_contract_graph(second)
 
 
-def test_declared_field_scans_are_charged_to_the_shared_budget() -> None:
+def test_a_key_hook_between_two_instances_cannot_change_how_the_second_is_judged() -> None:
+    """The dict path: the first value's class is read, then a key hook flips the configuration before the
+    second value of the same class is rebuilt.  Both are judged by the one snapshot."""
+
+    Aliased, config, first, second, _ = _aliased_pair()
+
+    armed = [False]
+
+    class FlippingKey:  # a key the rebuilt dict hashes (a text key would be read as its text instead)
+        def __hash__(self):
+            if armed[0]:  # only once the call is running (building the dict below hashes the key too)
+                dict.__setitem__(config, "validate_by_alias", True)
+            return 1
+
+        def __eq__(self, other):
+            return self is other
+
+    key = FlippingKey()
+    graph = {key: first, "k2": second}
+    armed[0] = True
+    snapshot = snapshot_contract_graph(graph)
+    assert config["validate_by_alias"] is True  # the hook did run during the call
+    assert snapshot["k2"] == {"a": 1, "alias_a": 2}  # the same judgment as without the hook
+    armed[0] = False
+    dict.__setitem__(config, "validate_by_alias", False)
+    assert snapshot_contract_graph(graph)["k2"] == snapshot["k2"]
+
+
+def test_declared_fields_are_scanned_and_charged_once_per_class_per_call(monkeypatch) -> None:
+    import contracts_common
     from pydantic import create_model
 
     Many = create_model("Many", **{f"f{index}": (int, 0) for index in range(2_000)})
@@ -4029,16 +4067,23 @@ def test_declared_field_scans_are_charged_to_the_shared_budget() -> None:
             return self is other
 
     fields = vars(Many)["__pydantic_fields__"]
-    dict.__setitem__(fields, NonText(), fields["f0"])  # impure metadata: read again for every occurrence
+    dict.__setitem__(fields, NonText(), fields["f0"])  # a non-text declared key: never hashed
 
     def sparse():
         instance = Many()
         vars(BaseModel)["__dict__"].__get__(instance, BaseModel).clear()  # almost no captured storage
         return instance
 
-    with pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):
-        snapshot_contract_graph([sparse() for _ in range(200)])
+    reads = [0]
+    real = contracts_common._model_metadata
 
+    def counting(model_type, budget):
+        reads[0] += 1
+        return real(model_type, budget)
+
+    monkeypatch.setattr(contracts_common, "_model_metadata", counting)
+    snapshot_contract_graph([sparse() for _ in range(200)])
+    assert reads[0] == 1  # one charged scan for the class, not one per occurrence
 
 
 # ── the declared-field table is charged before it is read, and read from one copy ──
@@ -4060,11 +4105,13 @@ def _impure_wide_model(field_count: int) -> type[BaseModel]:
     return Wide
 
 
-def test_impure_model_metadata_is_charged_on_every_read() -> None:
+def test_impure_model_metadata_is_read_once_per_call_and_charged() -> None:
     Wide = _impure_wide_model(2_000)
+    # 200 instances of a class with a 2,001-entry declared table: the table is read (and charged) once
+    assert len(snapshot_contract_graph([Wide() for _ in range(200)])) == 200
+    huge = _impure_wide_model(200_000)
     with pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):
-        snapshot_contract_graph([Wide() for _ in range(200)])  # 200 reads of a 2,001-entry table
-    assert len(snapshot_contract_graph([_impure_wide_model(10)() for _ in range(200)])) == 200
+        snapshot_contract_graph([huge()])  # one read of a table past the edge allowance is still refused
 
 
 def test_a_declared_field_table_shared_by_many_classes_costs_its_size_per_class() -> None:

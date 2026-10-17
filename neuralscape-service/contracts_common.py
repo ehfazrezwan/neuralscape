@@ -149,34 +149,28 @@ def _model_metadata(
 
 def _declared_metadata(
     model_type: type[BaseModel], inventory: "_GraphInventory"
-) -> tuple[set[object], dict[str, set[str]], bool]:
-    """``(declared names, alias owners, pure)`` of ``model_type`` for this call.
+) -> tuple[set[object], dict[str, set[str]]]:
+    """``(declared names, alias owners)`` of ``model_type``: the call's one snapshot of the class.
 
-    Read without hooks from the class's own namespaces, charged as scanned, and kept while no caller code has
-    run since (the class stays alive with it), so N instances of one class cost one scan, not N, unless a
-    callback between them could have changed the class.  Impure metadata (read through the class, or through storage or keys that can run
-    code) is not kept: it is read, and charged, again for every instance, so each occurrence observes it.
-    A declared name that is not text is never hashed and makes the metadata impure.
+    Taken the first time the call meets the class, during capture (which runs no caller code), charged as
+    read, and kept with the class for the rest of the call.  Every reader (every instance, on every path)
+    uses this one snapshot, so caller code that runs later in the call (a public view, a key hook, an extra
+    mapping) cannot change how any instance is judged, and the class is read once however many instances
+    it has.  A declared name that is not text is never hashed.
     """
 
     cached = inventory.metadata.get(id(model_type))
-    if cached is not None and cached[0] is model_type and cached[4] == inventory.impure_reads:
-        return cached[1], cached[2], cached[3]
+    if cached is not None and cached[0] is model_type:
+        return cached[1], cached[2]
     budget = inventory.budget
-    declared_fields, config, metadata_pure = _model_metadata(model_type, budget)
+    declared_fields, config, _pure = _model_metadata(model_type, budget)
     declared_names: set[object] = set()
     for name, _field in declared_fields:  # the charged copy, never the live table
         if _is_subclass(type(name), str):
             declared_names.add(_text(name))
-        else:
-            metadata_pure = False
-    alias_owners, aliases_pure = _validation_alias_owners(declared_fields, config, budget)
-    pure = metadata_pure and aliases_pure
-    if pure:  # only metadata whose reading ran no caller code is kept; impure metadata is read on every edge
-        # Kept only until caller code next runs (``impure_reads`` moves): a hook-free read does not make the
-        # class immutable, and a callback may change its configuration before the next instance.
-        inventory.metadata[id(model_type)] = (model_type, declared_names, alias_owners, pure, inventory.impure_reads)
-    return declared_names, alias_owners, pure
+    alias_owners, _aliases_pure = _validation_alias_owners(declared_fields, config, budget)
+    inventory.metadata[id(model_type)] = (model_type, declared_names, alias_owners)
+    return declared_names, alias_owners
 
 
 def _validation_alias_owners(
@@ -357,8 +351,8 @@ class _GraphInventory:
     # reconstruction, so a released temporary's id cannot be reused by a later
     # object and alias its captured contents.
     retained: list[object] = field(default_factory=list)
-    # Hook-free model metadata per class for this call: ``id -> (class, declared names, alias owners, pure)``.
-    metadata: dict[int, tuple[type, set[object], dict[str, set[str]], bool, int]] = field(default_factory=dict)
+    # The call's one metadata snapshot per model class, taken at capture: ``id -> (class, declared names, alias owners)``.
+    metadata: dict[int, tuple[type, set[object], dict[str, set[str]]]] = field(default_factory=dict)
     # Completed reconstructions of pure subtrees, keyed by identity:
     # ``(object, copy, height)``.  A descendant shared by many paths is rebuilt once
     # and shared; ``height`` keeps the depth limit enforced on every path.
@@ -440,6 +434,9 @@ def _capture_native_graph(value: object, inventory: _GraphInventory, depth: int 
     below = depth + 1
 
     if _is_subclass(value_type, BaseModel):
+        # The class's metadata is snapshotted at its first native encounter, before any caller code runs
+        # (capture runs none); reconstruction reads only this snapshot.
+        _declared_metadata(value_type, inventory)
         stored = _BASE_MODEL_DICT_DESCRIPTOR.__get__(value, BaseModel)
         _precheck(budget, dict.__len__(stored))
         stored_entries, pure_stored, stored_colliding = _plain_keys(tuple(dict.items(stored)))
@@ -620,9 +617,9 @@ def _snapshot_captured_graph(
             stored_names = {key for key, _ in stored_entries}
             # Declared fields, configuration and aliases are read without running caller code; where
             # that is not possible the subtree (and every ancestor) is not reused.
-            declared_names, alias_owners, metadata_pure = _declared_metadata(model_type, inventory)
-            if not metadata_pure:
-                inventory.impure_reads += 1
+            # The class's snapshot for this call, taken at capture (before any caller code ran); reading
+            # it runs nothing, so it never makes this subtree impure.
+            declared_names, alias_owners = _declared_metadata(model_type, inventory)
             alias_roots = set(alias_owners)
             unknown_stored_names = stored_names - declared_names
             missing_owner_roots = {
