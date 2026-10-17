@@ -7,6 +7,7 @@ from types import MappingProxyType
 from typing import Any, NamedTuple, cast
 
 from pydantic import BaseModel, ValidationError
+from pydantic_core import PydanticCustomError
 
 from contracts_policy import (
     SUPPORTED_POLICY_ACTIONS,
@@ -51,6 +52,7 @@ class _MappingInventory(NamedTuple):
 
 
 _TYPE_MRO = vars(type)["__mro__"]
+_TYPE_NAME = vars(type)["__name__"]  # a class's name, read without any metaclass hook
 
 
 def _inherits(cls: type, base: type) -> bool:
@@ -236,7 +238,7 @@ def _validated_mapping_inventory(
 def _freeze_reachable_model_inventories(
     value: object,
     inventories: dict[int, _ModelInventory],
-    visited_containers: set[int],
+    visited_containers: dict[int, int],
     mapping_owners: dict[int, Mapping[object, object]] | None = None,
     native_dicts: dict[int, _MappingInventory] | None = None,
     budget: DiscoveryBudget | None = None,
@@ -321,7 +323,7 @@ def _freeze_reachable_model_inventories(
         if not budget.visit(value, depth, authoritative):
             return
         identity = id(value)
-        visited_containers.add(identity)
+        visited_containers[identity] = dict.__len__(value)
         existing = native_dicts.get(identity)
         if existing is not None:
             # Already observed: keep that snapshot (and the children frozen with
@@ -349,10 +351,10 @@ def _freeze_reachable_model_inventories(
     if issubclass(type(value), list):
         if not budget.visit(value, depth, authoritative):
             return
-        visited_containers.add(id(value))
         _precheck(budget, list.__len__(value))
         items = tuple(list.__iter__(value))
         budget.charge_edge(len(items))
+        visited_containers[id(value)] = len(items)  # completion's first copy gets these entries free
         for item in items:
             _freeze_reachable_model_inventories(
                 item, *below, authoritative and is_exact_type(value, list), reach
@@ -364,10 +366,10 @@ def _freeze_reachable_model_inventories(
     if issubclass(type(value), tuple):
         if not budget.visit(value, depth, authoritative):
             return
-        visited_containers.add(id(value))
         _precheck(budget, tuple.__len__(value))
         items = tuple(tuple.__iter__(value))
         budget.charge_edge(len(items))
+        visited_containers[id(value)] = len(items)
         for item in items:
             _freeze_reachable_model_inventories(
                 item, *below, authoritative and is_exact_type(value, tuple), reach
@@ -424,7 +426,9 @@ def _open_pair(raw_entry: object) -> tuple[object, object, Iterator[object] | No
     try:
         iterator = iter(raw_entry)  # type: ignore[call-overload]
     except TypeError:
-        raise TypeError(f"cannot unpack non-iterable {type(raw_entry).__name__} object") from None
+        if _defines_iter(type(raw_entry)):
+            raise  # unpacking reports the iteration protocol's own error unchanged
+        raise TypeError(f"cannot unpack non-iterable {_TYPE_NAME.__get__(type(raw_entry))} object") from None
     try:
         key = next(iterator)
     except StopIteration:
@@ -434,6 +438,20 @@ def _open_pair(raw_entry: object) -> tuple[object, object, Iterator[object] | No
     except StopIteration:
         raise ValueError("not enough values to unpack (expected 2, got 1)") from None
     return key, value, iterator
+
+
+_CLASS_DICT = vars(type)["__dict__"]
+
+
+def _defines_iter(cls: type) -> bool:
+    """Whether any class on ``cls``'s own MRO defines ``__iter__`` (even as ``None``).
+
+    That is when unpacking reports ``iter()``'s own ``TypeError``; a type with no ``__iter__`` at
+    all gets "cannot unpack non-iterable".  The class dictionaries are read through the base
+    ``type`` descriptor, so no metaclass hook runs.
+    """
+
+    return any("__iter__" in _CLASS_DICT.__get__(base) for base in _TYPE_MRO.__get__(cls))
 
 
 def _close_pair(rest: Iterator[object] | None) -> None:
@@ -452,12 +470,13 @@ def _freeze_mapping_inventories(
     owners: dict[int, Mapping[object, object]],
     mapping_inventories: dict[int, _MappingInventory],
     model_inventories: dict[int, _ModelInventory],
-    visited_containers: set[int],
+    visited_containers: dict[int, int],
     native_dicts: dict[int, _MappingInventory] | None = None,
     in_progress: set[int] | None = None,
     budget: DiscoveryBudget | None = None,
     reach: dict[int, tuple[Mapping[object, object], ...]] | None = None,
     active_depth: int = 0,
+    scanned: dict[int, tuple[Mapping[object, object], ...]] | None = None,
 ) -> None:
     """Observe each retained public mapping inventory exactly once.
 
@@ -480,6 +499,10 @@ def _freeze_mapping_inventories(
         in_progress = set()
     if reach is None:
         reach = {}
+    if scanned is None:
+        # Reach tuples already merged into ``owners`` during this capture, held by reference for the
+        # whole call: an id alone could be reused once a shallower visit releases the tuple.
+        scanned = {}
     budget = _new_budget(budget)
     while True:
         pending = tuple(
@@ -549,8 +572,16 @@ def _freeze_mapping_inventories(
                     True,
                     reach,
                 )
-                for found in reach.get(id(item), ()):  # including those behind containers the walk had already visited
-                    _retain_mapping_owner(found, exposed)
+                beneath = reach.get(id(item), ())
+                if beneath and scanned.get(id(beneath)) is not beneath:
+                    # Including those behind containers the walk had already visited.  A reach
+                    # tuple is scanned (and charged) once per capture: every mapping in it was
+                    # retained and captured, or is in progress, the first time it was exposed,
+                    # so a later pair exposing the same tuple has nothing new to find in it.
+                    scanned[id(beneath)] = beneath
+                    budget.charge_edge(len(beneath))
+                    for found in beneath:
+                        _retain_mapping_owner(found, exposed)
                 for found in exposed.values():
                     _retain_mapping_owner(found, owners)
                 discovered = {
@@ -570,6 +601,7 @@ def _freeze_mapping_inventories(
                         budget,
                         reach,
                         child_depth,
+                        scanned,
                     )
                 try:
                     _close_pair(rest)
@@ -589,7 +621,7 @@ def _freeze_mapping_entries(
     raw_entries: tuple[object, ...],
     owners: dict[int, Mapping[object, object]],
     model_inventories: dict[int, _ModelInventory],
-    visited_containers: set[int],
+    visited_containers: dict[int, int],
     native_dicts: dict[int, _MappingInventory] | None = None,
     budget: DiscoveryBudget | None = None,
     depth: int = 1,
@@ -647,7 +679,7 @@ def _retained_mapping_entries(
             owners,
             mapping_inventories,
             model_inventories,
-            set(),
+            {},
             mapping_inventories,
             None,
             budget,
@@ -692,7 +724,46 @@ def _native_entries(
 
 _DEEPEST = "deepest"  # memo bookkeeping keys (the memo's other keys are object ids)
 _IMPURE = "impure"
+_PAID = "paid"  # id -> how many entries discovery charged, for each native container it walked
+# Non-text key types whose hashing and equality run no caller code and never equal a string key.
+_PLAIN_NON_TEXT_KEYS = (int, float, bool, type(None), bytes)
+
+
+class _OpaqueKey:
+    """A non-text key held by identity: it hashes and compares as itself, never as the key.
+
+    Validation reports it as an invalid (non-string) key at the key's place; its representation
+    names only the key's type, so no hook of the key runs.
+    """
+
+    __slots__ = ("_key",)
+
+    def __init__(self, key: object) -> None:
+        self._key = key
+
+    def __repr__(self) -> str:
+        return f"<{_TYPE_NAME.__get__(type(self._key))} key>"
+_COPIED = "copied"  # ids of containers completion has copied at least once
+
+
+def _first_paid_copy(memo: dict[object, Any], value: object, paid: bool) -> bool:
+    """Whether copying ``value`` now needs no edge charges.
+
+    Discovery charges every entry of a container it walks.  The first copy of that container
+    replays exactly those entries, so charging them again would count each edge twice.  Any
+    later copy (an impure subtree rebuilt on another path) is new work and is charged in full,
+    which is what bounds exponential re-copying.
+    """
+
+    copied = memo.setdefault(_COPIED, set())
+    first = id(value) not in copied
+    copied.add(id(value))
+    return first and paid
 _REUSED = "reused"  # how many times a finished native subtree was shared between paths
+
+
+# At most this many validation errors are reported in full; the rest are counted, not listed.
+MAX_ERROR_ENTRIES = 100
 
 
 def _validated_without_echo(
@@ -703,19 +774,33 @@ def _validated_without_echo(
     A validation error normally repeats the offending input.  When the copy shares native
     subtrees between paths, the input's text is exponentially larger than the graph (a
     few hundred bytes of input can take minutes to render), so that error is rebuilt
-    without the input: the same types, locations and messages, nothing embedded.  Ordinary
-    inputs keep the full diagnostic.
+    without the input: the same types, locations and messages, nothing embedded.  An error with
+    more than ``MAX_ERROR_ENTRIES`` entries keeps that many (without inputs) plus one entry
+    counting the rest.  Ordinary inputs keep the full diagnostic.
     """
 
     try:
         return model_type.model_validate(native)
     except ValidationError as error:
-        if not memo.get(_REUSED):
+        count = error.error_count()
+        if not memo.get(_REUSED) and count <= MAX_ERROR_ENTRIES:
             raise
-        lines = [
-            {"type": e["type"], "loc": e["loc"], "input": "<omitted: input shares subtrees>", **({"ctx": e["ctx"]} if "ctx" in e else {})}
-            for e in error.errors(include_input=False, include_url=False)
+        # A shared input is never echoed; a very long error list keeps its first entries (without
+        # their inputs) and says how many more there were, so its text cannot grow with the input.
+        marker = "<omitted: input shares subtrees>" if memo.get(_REUSED) else "<omitted: error list bounded>"
+        lines: list[dict[str, Any]] = [
+            {"type": e["type"], "loc": e["loc"], "input": marker, **({"ctx": e["ctx"]} if "ctx" in e else {})}
+            for e in error.errors(include_input=False, include_url=False)[:MAX_ERROR_ENTRIES]
         ]
+        if count > MAX_ERROR_ENTRIES:
+            lines.append({
+                "type": PydanticCustomError(
+                    "too_many_errors", "{omitted} further validation errors omitted",
+                    {"omitted": count - MAX_ERROR_ENTRIES},
+                ),
+                "loc": (),
+                "input": marker,
+            })
         try:
             bounded: Exception = ValidationError.from_exception_data(error.title, lines)  # type: ignore[arg-type]
         except Exception:  # noqa: BLE001 - a type that cannot be rebuilt still gets a bounded, value-free error
@@ -794,7 +879,7 @@ def _complete_contract_input(
             inventory = _validated_model_inventory(value, inventories)
             if inventory is None:
                 _freeze_reachable_model_inventories(
-                    value, inventories, set(), None, mapping_inventories, budget, depth
+                    value, inventories, memo.setdefault(_PAID, {}), None, mapping_inventories, budget, depth
                 )
                 inventory = _validated_model_inventory(value, inventories)
                 if inventory is None:
@@ -860,8 +945,24 @@ def _complete_contract_input(
                     stored_values[field_name] = None
 
             completed_model: dict[object, object] = {}
+            free = _first_paid_copy(memo, value, True)  # a captured model's entries were charged
+            if free:
+                # Discovery paid for the stored and extra entries, and for the fields-set names
+                # beyond their count (``max`` of the two); names read just above from a non-set
+                # storage were each charged as read.  Names synthesized from a fields-set that does
+                # not name stored fields were not all paid for: charge the entries past that.
+                entries = (len(inventory.stored_items) if inventory.stored_items is not None else 0) + (
+                    len(inventory.extra_items) if inventory.extra_items is not None else 0
+                )
+                paid = (
+                    max(entries, len(fields_set_names))
+                    if inventory.fields_set_names is not None
+                    else entries + len(fields_set_names)
+                )
+                budget.charge_edge(max(0, len(stored_values) - paid))
             for key, item in stored_values.items():
-                budget.charge_edge()  # one stack frame per level: no helper closure
+                if not free:
+                    budget.charge_edge()  # one stack frame per level: no helper closure
                 completed_model[key] = _complete_contract_input(
                     item, active_ids, inventories, mapping_inventories, budget, depth + 1, memo
                 )
@@ -884,8 +985,10 @@ def _complete_contract_input(
         try:
             budget.visit(value, depth, True)
             # Keys are deliberately not stringified or otherwise normalized.
+            paid = True  # a public mapping's pairs were charged as it was captured
             if _is_native_dict(value):
                 retained_dict = _validated_mapping_inventory(value, mapping_inventories)
+                paid = retained_dict is not None and identity in memo.get(_PAID, ())
                 if retained_dict is None:
                     # First met here, through a public view: this read is its first
                     # observation, kept for every later edge that reaches the same dict.
@@ -903,6 +1006,7 @@ def _complete_contract_input(
                     budget,
                 )
             completed: dict[object, object] = {}
+            free = _first_paid_copy(memo, value, paid)
             for entry in entries:
                 retained = cast(
                     _MappingEntry,
@@ -915,7 +1019,13 @@ def _complete_contract_input(
                     key = str.__str__(key)
                     if key in completed:
                         raise ValueError("contract input mapping has colliding keys")
-                budget.charge_edge()  # one stack frame per level: no helper closure
+                elif not is_exact_type(key, *_PLAIN_NON_TEXT_KEYS):
+                    # Any other key is invalid for a contract, but inserting it would run its hash
+                    # and equality and could overwrite a real key; an identity box keeps it
+                    # separate so validation reports it as an invalid key at the same place.
+                    key = _OpaqueKey(key)
+                if not free:
+                    budget.charge_edge()  # one stack frame per level: no helper closure
                 completed[key] = _complete_contract_input(
                     retained.value, active_ids, inventories, mapping_inventories, budget, depth + 1, memo
                 )
@@ -934,8 +1044,17 @@ def _complete_contract_input(
         try:
             budget.visit(value, depth, True)
             completed_list: list[object] = []
-            for item in value:  # the public iterator: every item it yields is charged
-                budget.charge_edge()  # one stack frame per level: no helper closure
+            # An exact list discovery walked was charged entry by entry, but only for the entries
+            # it had then: the live list can grow afterwards (an earlier public iterator, or an
+            # item's own iterator during this loop), so every entry past that count is charged.
+            # A public view was never charged.
+            paid = memo.get(_PAID, {})
+            prepaid = paid[identity] if (
+                _first_paid_copy(memo, value, is_exact_type(value, list) and identity in paid)
+            ) else 0
+            for index, item in enumerate(value):  # the public iterator: each item it yields
+                if index >= prepaid:
+                    budget.charge_edge()  # one stack frame per level: no helper closure
                 completed_list.append(
                     _complete_contract_input(
                         item, active_ids, inventories, mapping_inventories, budget, depth + 1, memo
@@ -956,8 +1075,12 @@ def _complete_contract_input(
         try:
             budget.visit(value, depth, True)
             completed_items: list[object] = []
+            free = _first_paid_copy(
+                memo, value, is_exact_type(value, tuple) and identity in memo.get(_PAID, ())
+            )
             for item in value:  # the public iterator: every item it yields is charged
-                budget.charge_edge()  # one stack frame per level: no helper closure
+                if not free:
+                    budget.charge_edge()  # one stack frame per level: no helper closure
                 completed_items.append(
                     _complete_contract_input(
                         item, active_ids, inventories, mapping_inventories, budget, depth + 1, memo
@@ -979,8 +1102,9 @@ def _validated_principal_snapshot(
     inventories: dict[int, _ModelInventory],
     mapping_inventories: dict[int, _MappingInventory],
     budget: DiscoveryBudget | None = None,
+    paid: dict[int, int] | None = None,
 ) -> PrincipalContext:
-    memo: dict[object, Any] = {}
+    memo: dict[object, Any] = {} if paid is None else {_PAID: paid}
     native = _complete_contract_input(
         principal, set(), inventories, mapping_inventories, budget, 0, memo
     )
@@ -992,8 +1116,9 @@ def _validated_evaluation_snapshot(
     inventories: dict[int, _ModelInventory],
     mapping_inventories: dict[int, _MappingInventory],
     budget: DiscoveryBudget | None = None,
+    paid: dict[int, int] | None = None,
 ) -> PolicyEvaluationInput:
-    memo: dict[object, Any] = {}
+    memo: dict[object, Any] = {} if paid is None else {_PAID: paid}
     native = _complete_contract_input(
         evaluation, set(), inventories, mapping_inventories, budget, 0, memo
     )
@@ -1005,8 +1130,9 @@ def _validated_policy_snapshot(
     inventories: dict[int, _ModelInventory],
     mapping_inventories: dict[int, _MappingInventory],
     budget: DiscoveryBudget | None = None,
+    paid: dict[int, int] | None = None,
 ) -> AccessPolicy:
-    memo: dict[object, Any] = {}
+    memo: dict[object, Any] = {} if paid is None else {_PAID: paid}
     native = _complete_contract_input(
         policy, set(), inventories, mapping_inventories, budget, 0, memo
     )
@@ -1060,7 +1186,7 @@ def evaluate_policy(
     mapping_owners: dict[int, Mapping[object, object]] = {}
     mapping_inventories: dict[int, _MappingInventory] = {}
     native_dicts: dict[int, _MappingInventory] = {}
-    visited_containers: set[int] = set()
+    visited_containers: dict[int, int] = {}
     budget = DiscoveryBudget(STANDARD)  # one envelope across all three roots
     reach: dict[int, tuple[Mapping[object, object], ...]] = {}
     for value in (principal, evaluation, policy):
@@ -1091,18 +1217,21 @@ def evaluate_policy(
         inventories,
         mapping_inventories,
         budget,
+        visited_containers,
     )
     evaluation = _validated_evaluation_snapshot(
         evaluation,
         inventories,
         mapping_inventories,
         budget,
+        visited_containers,
     )
     policy = _validated_policy_snapshot(
         policy,
         inventories,
         mapping_inventories,
         budget,
+        visited_containers,
     )
 
     action = evaluation.action
@@ -1200,7 +1329,7 @@ def validate_policy_decision(decision: PolicyDecision) -> PolicyDecision:
     mapping_owners: dict[int, Mapping[object, object]] = {}
     mapping_inventories: dict[int, _MappingInventory] = {}
     native_dicts: dict[int, _MappingInventory] = {}
-    visited_containers: set[int] = set()
+    visited_containers: dict[int, int] = {}
     budget = DiscoveryBudget(STANDARD)
     reach: dict[int, tuple[Mapping[object, object], ...]] = {}
     _freeze_reachable_model_inventories(
@@ -1225,7 +1354,7 @@ def validate_policy_decision(decision: PolicyDecision) -> PolicyDecision:
         reach,
     )
     mapping_inventories.update(native_dicts)
-    memo: dict[object, Any] = {}
+    memo: dict[object, Any] = {_PAID: visited_containers}
     native = _complete_contract_input(
         decision, set(), inventories, mapping_inventories, budget, 0, memo
     )

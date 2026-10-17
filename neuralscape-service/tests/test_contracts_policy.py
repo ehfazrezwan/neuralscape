@@ -2166,7 +2166,7 @@ def test_model_inventory_consumers_require_exact_owner_identity(
                 _freeze_reachable_model_inventories(
                     candidate,
                     inventories,
-                    set(),
+                    {},
                 )
             else:
                 _complete_contract_input(candidate, set(), inventories)
@@ -2177,7 +2177,7 @@ def test_model_inventory_consumers_require_exact_owner_identity(
             _freeze_reachable_model_inventories(
                 candidate,
                 inventories,
-                set(),
+                {},
             )
             is None
         )
@@ -2194,7 +2194,7 @@ def test_mapping_inventory_retains_owner_entries_and_exposed_models() -> None:
     model_inventories = {}
     mapping_owners = {}
     mapping_inventories = {}
-    visited_containers: set[int] = set()
+    visited_containers: dict[int, int] = {}
 
     _freeze_reachable_model_inventories(
         candidate,
@@ -2235,7 +2235,7 @@ def test_model_extra_mapping_reuses_inventory_after_direct_edit() -> None:
     model_inventories = {}
     mapping_owners = {}
     mapping_inventories = {}
-    visited_containers: set[int] = set()
+    visited_containers: dict[int, int] = {}
 
     _freeze_reachable_model_inventories(
         candidate,
@@ -2269,7 +2269,7 @@ def test_mapping_inventory_consumer_requires_exact_owner_identity() -> None:
     other = MappingProxyType({"resource": reference("memory-2")})
     other_owners = {id(other): other}
     mapping_inventories = {}
-    _freeze_mapping_inventories(other_owners, mapping_inventories, {}, set())
+    _freeze_mapping_inventories(other_owners, mapping_inventories, {}, {})
     mismatched_inventories = {
         id(candidate): mapping_inventories[id(other)],
     }
@@ -2299,7 +2299,7 @@ def test_mapping_entries_stop_at_first_terminal_pair_failure() -> None:
         ),
         {},
         model_inventories,
-        set(),
+        {},
     )
 
     assert entries[0] == ("resource", retained)
@@ -3522,12 +3522,12 @@ def test_accounting_runs_no_hook_of_the_caller_objects() -> None:
 def test_the_budget_is_shared_by_every_root_of_one_call() -> None:
     budget = DiscoveryBudget()
     half = list(range(STANDARD_MAX_EDGES // 2 + 1000))
-    _freeze_reachable_model_inventories(half, {}, set(), None, None, budget)
+    _freeze_reachable_model_inventories(half, {}, {}, None, None, budget)
     with pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):
-        _freeze_reachable_model_inventories(list(half), {}, set(), None, None, budget)
+        _freeze_reachable_model_inventories(list(half), {}, {}, None, None, budget)
     # the same two walks under separate budgets are fine: it is the sharing that bounds the call
-    _freeze_reachable_model_inventories(half, {}, set(), None, None, DiscoveryBudget())
-    _freeze_reachable_model_inventories(list(half), {}, set(), None, None, DiscoveryBudget())
+    _freeze_reachable_model_inventories(half, {}, {}, None, None, DiscoveryBudget())
+    _freeze_reachable_model_inventories(list(half), {}, {}, None, None, DiscoveryBudget())
 
 
 def test_depth_outcome_does_not_depend_on_the_order_of_aliased_references() -> None:
@@ -3579,7 +3579,7 @@ def _entry_flow(root: object) -> object:
     owners: dict = {}
     mapping_inventories: dict = {}
     native_dicts: dict = {}
-    visited: set = set()
+    visited: dict = {}
     budget = DiscoveryBudget()
     reach: dict = {}
     _freeze_reachable_model_inventories(root, inventories, visited, owners, native_dicts, budget, 0, True, reach)
@@ -3804,7 +3804,7 @@ def test_objects_keyed_by_identity_stay_alive_for_the_whole_call() -> None:
     reference_to_child = weakref.ref(child)
     holder = [child]
     native_dicts: dict = {}
-    _freeze_reachable_model_inventories(holder, {}, set(), None, native_dicts)
+    _freeze_reachable_model_inventories(holder, {}, {}, None, native_dicts)
     del child, holder
     gc.collect()
     assert reference_to_child() is not None  # an id() could not be recycled while the inventory is live
@@ -3880,7 +3880,7 @@ def test_a_merge_of_reaches_is_charged_so_the_bookkeeping_cannot_hold_memory_for
     for _ in range(200):
         nested = (nested, MappingProxyType({"extra": 1}))  # every level merges a growing reach with one more mapping
     with pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):
-        _freeze_reachable_model_inventories(nested, {}, set(), None, None, DiscoveryBudget())
+        _freeze_reachable_model_inventories(nested, {}, {}, None, None, DiscoveryBudget())
 
 
 def test_native_fields_set_names_are_charged_per_model() -> None:
@@ -3894,7 +3894,7 @@ def test_native_fields_set_names_are_charged_per_model() -> None:
         models.append(model)
     budget = DiscoveryBudget()
     with pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):  # 100 x 2000 names > the edge limit
-        _freeze_reachable_model_inventories(tuple(models), {}, set(), None, None, budget)
+        _freeze_reachable_model_inventories(tuple(models), {}, {}, None, None, budget)
 
 
 def test_a_models_ordinary_fields_set_costs_nothing_extra() -> None:
@@ -3902,7 +3902,7 @@ def test_a_models_ordinary_fields_set_costs_nothing_extra() -> None:
 
     model = SourceVersion(record_id="r", content_revision=1, policy_epoch=1)
     budget = DiscoveryBudget()
-    _freeze_reachable_model_inventories(model, {}, set(), None, None, budget)
+    _freeze_reachable_model_inventories(model, {}, {}, None, None, budget)
     assert budget.edges == 3  # the three stored fields; the names of a legitimate set are those fields
 
 
@@ -3912,7 +3912,7 @@ def test_only_names_beyond_the_stored_fields_are_charged() -> None:
     model = SourceVersion(record_id="r", content_revision=1, policy_epoch=1)
     _BASE_MODEL_FIELDS_SET_DESCRIPTOR.__set__(model, {f"n{i}" for i in range(1003)})  # 1,000 beyond the 3 stored
     budget = DiscoveryBudget()
-    _freeze_reachable_model_inventories(model, {}, set(), None, None, budget)
+    _freeze_reachable_model_inventories(model, {}, {}, None, None, budget)
     assert budget.edges == 3 + 1000
 
 
@@ -3994,7 +3994,7 @@ def test_a_container_shared_by_many_parents_is_not_charged_once_per_parent() -> 
     shared = _public_mappings(20)
     parents = tuple((shared,) for _ in range(2000))  # 2,000 parents, each holding the one container
     budget = DiscoveryBudget()
-    _freeze_reachable_model_inventories(parents, {}, set(), None, None, budget)
+    _freeze_reachable_model_inventories(parents, {}, {}, None, None, budget)
     # the walk itself costs ~6,000 entries; the reach bookkeeping must not add one copy per parent
     assert budget.edges < 10_000, budget.edges
 
@@ -4003,7 +4003,7 @@ def test_a_mapping_reached_through_two_children_is_recorded_once() -> None:
     mapping = MappingProxyType({"k": 1})
     holder = ((mapping,), [mapping])
     reach: dict = {}
-    _freeze_reachable_model_inventories(holder, {}, set(), None, None, DiscoveryBudget(), 0, True, reach)
+    _freeze_reachable_model_inventories(holder, {}, {}, None, None, DiscoveryBudget(), 0, True, reach)
     assert reach[id(holder)] == (mapping,)  # once, not once per path to it
 
 
@@ -4035,7 +4035,7 @@ def test_a_repeated_wide_subgraph_does_not_multiply_the_reach_work() -> None:
     budget = DiscoveryBudget()
     reach: dict = {}
     started = time.monotonic()
-    _freeze_reachable_model_inventories(repeated, {}, set(), None, None, budget, 0, True, reach)
+    _freeze_reachable_model_inventories(repeated, {}, {}, None, None, budget, 0, True, reach)
     assert time.monotonic() - started < 5.0
     assert reach[id(repeated)] is reach[id(wide)]  # one distinct source: held by reference, no merge
 
@@ -4052,7 +4052,7 @@ def test_merging_reaches_is_charged_before_it_is_built() -> None:
     wrappers = tuple((shared, MappingProxyType({"own": index})) for index in range(400))
     started = time.monotonic()
     with pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):
-        _freeze_reachable_model_inventories(wrappers, {}, set(), None, None, DiscoveryBudget())
+        _freeze_reachable_model_inventories(wrappers, {}, {}, None, None, DiscoveryBudget())
     assert time.monotonic() - started < 5.0
 
 
@@ -4167,7 +4167,7 @@ def test_freeze_mapping_entries_freezes_each_value_before_the_exhaustion_check()
 
     inventories: dict = {}
     entries = _freeze_mapping_entries(
-        (_RepairingPair("resource", handle, repair),), {}, inventories, set(), {}, DiscoveryBudget()
+        (_RepairingPair("resource", handle, repair),), {}, inventories, {}, {}, DiscoveryBudget()
     )
     assert entries[0].key == "resource"
     frozen = inventories[id(handle)]
@@ -4194,3 +4194,401 @@ def test_the_module_no_longer_has_a_drain_then_freeze_mapping_reader() -> None:
     import contracts_policy_reference
 
     assert not hasattr(contracts_policy_reference, "_mapping_items")
+
+
+def _unpack_error(value) -> tuple[type, str]:
+    try:
+        key, item = value  # noqa: F841 - the reference behaviour
+    except Exception as error:
+        return type(error), str(error)
+    raise AssertionError("unpacking succeeded")
+
+
+class _IterReturnsList:
+    def __iter__(self):
+        return [1, 2]
+
+
+class _IterRaisesTypeError:
+    def __iter__(self):
+        raise TypeError("the object's own message")
+
+
+class _NoIteration:
+    __iter__ = None
+
+
+@pytest.mark.parametrize("value", [_IterReturnsList(), _IterRaisesTypeError(), _NoIteration(), 5, None, object()])
+def test_pair_reading_raises_exactly_what_unpacking_raises(value) -> None:
+    from contracts_policy_reference import _open_pair
+
+    expected = _unpack_error(value)
+    with pytest.raises(Exception) as caught:
+        _open_pair(value)
+    assert (type(caught.value), str(caught.value)) == expected
+
+
+# ── completion does not charge again what discovery already charged ─────────
+
+
+def _large_policy(members: int, per: int = 25) -> AccessPolicy:
+    statements, versions = [], []
+    for member in range(members):
+        subject = f"subject-{member:04d}"
+        versions.append(MembershipVersion(subject_id=subject, version=1))
+        statements.extend(
+            PolicyStatement(id=f"s-{member}-{i}", effect="allow", subject_id=subject, credential_id=None,
+                            action="read", resource=reference(f"memory-{i}"))
+            for i in range(per)
+        )
+    return AccessPolicy(schema_version=VERSION, tenant_id="tenant-a", policy_epoch=1,
+                        membership_versions=tuple(versions), statements=tuple(statements))
+
+
+def _charged_edges(policy_value) -> tuple[int, int]:
+    """(edges charged by the whole call, edges charged by discovery alone)."""
+
+    import contracts_policy_reference as module
+
+    budgets = []
+    original = module.DiscoveryBudget.__init__
+
+    def recording(self, *args, **kwargs):
+        original(self, *args, **kwargs)
+        budgets.append(self)
+
+    module.DiscoveryBudget.__init__ = recording
+    try:
+        evaluate(principal(subject_id="subject-0000", membership_version=1), "read", reference("memory-0"), policy_value)
+        whole = budgets[0].edges
+        discovery = DiscoveryBudget()
+        _freeze_reachable_model_inventories(policy_value, {}, {}, None, {}, discovery)
+    finally:
+        module.DiscoveryBudget.__init__ = original
+    return whole, discovery.edges
+
+
+def test_a_native_policy_is_charged_about_once_not_once_per_phase() -> None:
+    whole, discovery = _charged_edges(_large_policy(40))
+    # every native edge is paid once, at discovery; completion's first copy adds only what
+    # discovery could not see (the other two roots, a handful of edges)
+    assert whole <= discovery * 1.1, (whole, discovery)
+
+
+def test_a_policy_of_7500_statements_fits_the_standard_budget() -> None:
+    """Charging each edge once leaves room for richer statements: 300 members with 25
+    statements each (7,500 statements) fits.  The node limit (one per object) now binds first,
+    at about 321 members of this shape."""
+
+    decision = evaluate(principal(subject_id="subject-0000", membership_version=1), "read",
+                        reference("memory-0"), _large_policy(300))
+    assert decision.outcome == "allow"
+
+
+def test_a_re_copied_impure_subtree_is_still_charged_per_copy() -> None:
+    """A native tuple holding an empty public view is impure, so it is rebuilt on every path:
+    each re-copy is charged, so a diamond of such tuples is refused."""
+
+    class EmptyView(tuple):
+        def __iter__(self):
+            return iter(())
+
+    node: object = (EmptyView(),)
+    for _ in range(40):
+        node = (node, node, EmptyView())
+    with pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):
+        _complete_contract_input(node, set(), {}, {})
+
+
+def test_a_container_first_seen_through_a_public_view_is_charged_when_copied() -> None:
+    inner = list(range(STANDARD_MAX_EDGES // 2 + 1000))
+
+    class View(tuple):
+        def __iter__(self):
+            return iter((inner, list(inner)))  # two lists only the public view exposes
+
+    with pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):
+        _complete_contract_input(View(), set(), {}, {})
+
+
+# ── a non-string key cannot overwrite a real one; a cached reach is scanned once ──
+
+
+class _ImpersonatingKey:
+    """Hashes and compares equal to "effect": inserting it would overwrite the real key."""
+
+    calls: list = []
+
+    def __hash__(self):
+        _ImpersonatingKey.calls.append("hash")
+        return hash("effect")
+
+    def __eq__(self, other):
+        _ImpersonatingKey.calls.append("eq")
+        return other == "effect" or other is self
+
+
+def test_a_non_string_key_cannot_overwrite_a_denial() -> None:
+    resource_value = reference("memory-1")
+
+    def pairs():
+        yield ("id", "s-1")
+        yield ("effect", "deny")
+        yield ("subject_id", "subject-a")
+        yield ("credential_id", None)
+        yield ("action", "read")
+        yield ("resource", resource_value.model_dump(mode="python"))
+        yield (_ImpersonatingKey(), "allow")
+
+    _ImpersonatingKey.calls.clear()
+    with pytest.raises(ValidationError) as caught:
+        evaluate(principal(), "read", resource_value, _with_statements(_Items(pairs)))
+    assert any(error["type"] == "invalid_key" for error in caught.value.errors())
+    assert _ImpersonatingKey.calls == []  # its hash and equality never ran
+
+
+def test_plain_non_string_keys_keep_their_exact_diagnostics() -> None:
+    resource_value = reference("memory-1")
+    for key, expected_loc in ((1, 1), (b"k", "b'k'")):
+        bad = {**resource_value.model_dump(mode="python"), key: "x"}
+
+        def pairs(bad=bad):
+            yield ("id", "s-1")
+            yield ("effect", "allow")
+            yield ("subject_id", "subject-a")
+            yield ("credential_id", None)
+            yield ("action", "read")
+            yield ("resource", bad)
+
+        with pytest.raises(ValidationError) as caught:
+            evaluate(principal(), "read", resource_value, _with_statements(_Items(pairs)))
+        locations = [error["loc"] for error in caught.value.errors() if error["type"] == "invalid_key"]
+        assert locations and locations[0][-1] == expected_loc
+
+
+def test_mapping_capture_scans_a_shared_cached_reach_once() -> None:
+    import time
+
+    proxies = tuple(MappingProxyType({"k": i}) for i in range(10_000))
+
+    def pairs():
+        for index in range(50_000):
+            yield (f"k{index}", proxies)
+
+    started = time.monotonic()
+    try:
+        _entry_flow(_Items(pairs))
+    except ValueError as error:
+        assert DISCOVERY_BUDGET_MESSAGE in str(error)
+    assert time.monotonic() - started < 10.0  # was 500 million reach iterations
+
+
+class _HookedMeta(type):
+    """A metaclass whose attribute reads run (and fail) while armed."""
+
+    armed = False
+    calls: list = []
+
+    def __getattribute__(cls, name):
+        if type.__getattribute__(_HookedMeta, "armed"):
+            _HookedMeta.calls.append(name)
+            raise RuntimeError("metaclass hook ran")
+        return super().__getattribute__(name)
+
+
+class _Hooked(metaclass=_HookedMeta):
+    pass
+
+
+def _armed(call):
+    _HookedMeta.calls.clear()
+    _HookedMeta.armed = True
+    try:
+        return call()
+    except Exception as error:  # noqa: BLE001 - the test compares the outcome after disarming
+        return error
+    finally:
+        _HookedMeta.armed = False
+
+
+def test_a_non_iterable_pair_names_its_type_without_running_a_metaclass_hook() -> None:
+    outcome = _armed(lambda: _entry_flow(_Items(lambda: iter((_Hooked(),)))))
+    assert type(outcome) is TypeError
+    assert str(outcome) == "cannot unpack non-iterable _Hooked object"
+    assert _HookedMeta.calls == []
+
+
+def test_a_boxed_key_names_its_type_without_running_a_metaclass_hook() -> None:
+    from contracts_policy_reference import _OpaqueKey
+
+    key = _OpaqueKey(_Hooked())
+    assert _armed(lambda: repr(key)) == "<_Hooked key>"
+    assert _HookedMeta.calls == []
+
+
+def _evaluate_with_extra_values(**extra: object) -> None:
+    """Run the full evaluator on a native statement holding ``extra`` values.
+
+    Every container from the policy down is native (exact tuple, dict, list), so discovery
+    charges their entries and completion's first copy is free; completion runs before
+    validation refuses the extra keys.
+    """
+
+    resource_value = reference("memory-1")
+    native_statement = {
+        "id": "s-1", "effect": "allow", "subject_id": "subject-a", "credential_id": None,
+        "action": "read", "resource": resource_value.model_dump(mode="python"), **extra,
+    }
+    policy_value = policy(statement("seed", "allow", "read", reference("other")))
+    object.__setattr__(policy_value, "statements", (native_statement,))
+    evaluate(principal(), "read", resource_value, policy_value)
+
+
+def test_a_list_that_grows_during_its_own_completion_is_charged_for_the_growth() -> None:
+    import time
+
+    from contracts_limits import DISCOVERY_BUDGET_MESSAGE
+
+    grown = [0]
+    host: list[object] = []
+
+    class SelfAppending(tuple):
+        def __iter__(self):  # yields nothing, appends itself to the list being copied
+            if grown[0] < 400_000:  # bounded, so the pre-fix tree terminates (and accepts the growth)
+                grown[0] += 1
+                host.append(self)
+            return iter(())
+
+    host.append(SelfAppending())
+    started = time.monotonic()
+    with pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):
+        _evaluate_with_extra_values(extra=host)
+    assert time.monotonic() - started < 30
+    assert grown[0] < 200_000  # stopped by the edge budget, not by the probe's own bound
+
+
+def test_a_list_grown_by_an_earlier_iterator_is_charged_for_the_growth() -> None:
+    from contracts_limits import DISCOVERY_BUDGET_MESSAGE
+
+    target = [1, 2, 3]
+
+    class Grower(tuple):
+        def __iter__(self):  # runs during completion, after discovery charged ``target``'s 3 entries
+            target.extend(range(200_000))
+            return iter(())
+
+    with pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):
+        _evaluate_with_extra_values(grower=Grower(), target=target)  # completed in this order
+
+
+def _model_with_disjoint_fields_set(stored: int, fields_set: int, *, overlap: bool = False):
+    handle = reference("memory-1")
+    storage = object.__getattribute__(handle, "__dict__")
+    for index in range(stored):
+        storage[f"stored_{index}"] = index
+    names = {f"stored_{index}" if overlap else f"set_{index}" for index in range(fields_set)}
+    object.__setattr__(handle, "__pydantic_fields_set__", names)
+    return handle
+
+
+def _evaluate_with_statement_resource(resource_model) -> None:
+    """A native statement (exact tuple, dict) whose resource is ``resource_model``: discovery
+    charges it, so completion's first copy of the model is free."""
+
+    native_statement = {
+        "id": "s-1", "effect": "allow", "subject_id": "subject-a", "credential_id": None,
+        "action": "read", "resource": resource_model,
+    }
+    policy_value = policy(statement("seed", "allow", "read", reference("other")))
+    object.__setattr__(policy_value, "statements", (native_statement,))
+    evaluate(principal(), "read", reference("memory-1"), policy_value)
+
+
+def test_fields_set_names_disjoint_from_stored_fields_are_charged_when_synthesized() -> None:
+    """70,000 stored fields and 70,000 other fields-set names make 140,000 output fields:
+    completion must charge the synthesized ones discovery did not pay for."""
+
+    with pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):
+        _evaluate_with_statement_resource(_model_with_disjoint_fields_set(70_000, 70_000))
+
+
+def test_fields_set_names_that_name_stored_fields_are_not_charged_twice() -> None:
+    """70,000 stored fields all named by the fields-set make 70,000 output fields: charged once that
+    fits the 131,072-edge budget, charged twice (140,000) it would not."""
+
+    with pytest.raises(ValidationError):  # refused for its unknown fields, not by the budget
+        _evaluate_with_statement_resource(_model_with_disjoint_fields_set(70_000, 70_000, overlap=True))
+
+
+def test_a_validation_error_stays_bounded_for_a_statement_with_many_invalid_fields() -> None:
+    """100,000 unknown fields (inside the edge allowance) used to give about 20 MB of error text."""
+
+    resource_value = reference("memory-1")
+    native_statement = {
+        "id": "s-1", "effect": "allow", "subject_id": "subject-a", "credential_id": None,
+        "action": "read", "resource": resource_value.model_dump(mode="python"),
+        **{f"unknown_{index}": "x" * 20 for index in range(100_000)},
+    }
+    policy_value = policy(statement("seed", "allow", "read", reference("other")))
+    object.__setattr__(policy_value, "statements", (native_statement,))
+    with pytest.raises(ValidationError) as caught:
+        evaluate(principal(), "read", resource_value, policy_value)
+    text = str(caught.value)
+    assert len(text.encode()) < 2_000_000, len(text)
+    errors = caught.value.errors()
+    assert errors[0]["type"] == "extra_forbidden" and errors[0]["loc"][-1] == "unknown_0"
+    assert errors[-1]["type"] == "too_many_errors" and "further validation errors omitted" in errors[-1]["msg"]
+
+
+def test_a_small_validation_error_keeps_its_full_diagnostic() -> None:
+    resource_value = reference("memory-1")
+    native_statement = {
+        "id": "s-1", "effect": "allow", "subject_id": "subject-a", "credential_id": None,
+        "action": "read", "resource": resource_value.model_dump(mode="python"), "unknown": "visible",
+    }
+    policy_value = policy(statement("seed", "allow", "read", reference("other")))
+    object.__setattr__(policy_value, "statements", (native_statement,))
+    with pytest.raises(ValidationError) as caught:
+        evaluate(principal(), "read", resource_value, policy_value)
+    assert [(e["type"], e["input"]) for e in caught.value.errors()] == [("extra_forbidden", "visible")]
+
+
+def test_a_reach_tuple_that_reuses_a_scanned_id_is_still_scanned(monkeypatch) -> None:
+    """Scanned reach tuples are held by identity, not just by id.
+
+    An id is reused once its object is released (a shallower visit can replace a reach tuple).
+    The collision is forced here by having the module's ``id`` give the second reach tuple the id
+    of the first: that tuple must still be scanned, so the mapping behind an already-visited list
+    is captured at its exposure, before the parent iterator changes it.
+    """
+
+    import builtins
+
+    import contracts_policy_reference as reference_module
+
+    backing_a, backing_b = {"v": "a-first"}, {"v": "b-first"}
+    proxy_a, proxy_b = MappingProxyType(backing_a), MappingProxyType(backing_b)
+    list_a, list_b = [proxy_a], [proxy_b]
+
+    def pairs():
+        yield ("a", list_a)
+        yield ("b", list_b)
+        backing_b["v"] = "b-changed-after-exposure"  # runs only when the iterator is advanced again
+        yield ("c", 1)
+
+    owner = _Items(pairs)
+    root = (owner, list_a, list_b)  # the walk visits both lists before the owner's pairs expose them
+
+    real_id = builtins.id
+    first = {}
+
+    def colliding_id(obj):
+        if type(obj) is tuple and len(obj) == 1 and obj[0] is proxy_a:
+            first["id"] = real_id(obj)
+        if type(obj) is tuple and len(obj) == 1 and obj[0] is proxy_b and "id" in first:
+            return first["id"]
+        return real_id(obj)
+
+    monkeypatch.setattr(reference_module, "id", colliding_id, raising=False)
+    completed = _entry_flow(root)
+    assert completed[2][0] == {"v": "b-first"}  # captured at exposure, not after the change
