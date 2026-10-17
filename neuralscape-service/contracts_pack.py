@@ -52,6 +52,7 @@ import importlib
 import importlib.util
 import inspect
 import json
+import math
 import re
 import reprlib
 from dataclasses import dataclass
@@ -527,6 +528,7 @@ class _Run:
     def __init__(self) -> None:
         self.steps = 0
         self.values = 0  # walked by equality and canonical keys (``_MAX_EQUALITY_STEPS``)
+        self.shapes: dict[int, tuple[dict, tuple[str, ...]]] = {}  # node id -> (node, malformed keywords)
         # The lowest position, in the stack of references being compared, of a recursive reference assumed
         # compatible since the current frame began.  A pair that came out clean only because of an assumption
         # about a reference *above* it has proved nothing about itself, so it is not remembered as clean; an
@@ -745,6 +747,64 @@ def _alternatives_equivalent(
     return True
 
 
+_SIMPLE_TYPES = frozenset({"array", "boolean", "integer", "null", "number", "object", "string"})
+
+
+def _is_number(value: object) -> bool:
+    return type(value) in (int, float) and (type(value) is int or math.isfinite(value))
+
+
+def _is_count(value: object) -> bool:
+    """A non-negative integer as JSON Schema means it (``2.0`` is an integer)."""
+
+    return _is_number(value) and value >= 0 and (type(value) is int or value.is_integer())
+
+
+def _is_schema(value: object) -> bool:
+    return type(value) in (dict, bool)
+
+
+# The shape JSON Schema (2020-12) gives each modelled keyword's value; anything else is not understood.
+# (``items`` is compared as a schema whatever its value, by its shape, so it needs no entry.)
+_VALUE_SHAPES = {
+    "type": lambda v: (type(v) is str and v in _SIMPLE_TYPES) or (
+        type(v) is list and bool(v) and all(type(t) is str and t in _SIMPLE_TYPES for t in v) and len(set(v)) == len(v)),
+    "enum": lambda v: type(v) is list,
+    "minimum": _is_number, "exclusiveMinimum": _is_number, "maximum": _is_number, "exclusiveMaximum": _is_number,
+    "multipleOf": lambda v: _is_number(v) and v > 0,
+    "minLength": _is_count, "maxLength": _is_count, "minItems": _is_count, "maxItems": _is_count,
+    "minProperties": _is_count, "maxProperties": _is_count,
+    "pattern": lambda v: type(v) is str,
+    "uniqueItems": lambda v: type(v) is bool,
+    "properties": lambda v: type(v) is dict and all(_is_schema(item) for item in v.values()),
+    "required": lambda v: type(v) is list and all(type(name) is str for name in v),
+    "additionalProperties": _is_schema,
+    "prefixItems": lambda v: type(v) is list and bool(v) and all(_is_schema(item) for item in v),
+    "anyOf": lambda v: type(v) is list and bool(v) and all(_is_schema(item) for item in v),
+    "oneOf": lambda v: type(v) is list and bool(v) and all(_is_schema(item) for item in v),
+}
+
+
+def _malformed_keys(schema: dict) -> tuple[str, ...]:
+    """The modelled keywords of ``schema`` whose value is outside JSON Schema, checked once per node in a run."""
+
+    run = _RUN.get()
+    if run is not None:
+        known = run.shapes.get(id(schema))
+        if known is not None and known[0] is schema:
+            return known[1]
+    found = tuple(key for key, shape in _VALUE_SHAPES.items() if key in schema and not shape(schema[key]))
+    if run is not None:
+        run.shapes[id(schema)] = (schema, found)  # the node is kept, so its id is its own for the run
+    return found
+
+
+def _same_value(old: object, new: object) -> bool:
+    if old is _ABSENT or new is _ABSENT:
+        return old is new
+    return _json_equal(old, new)
+
+
 def _compare(
     old: object,
     new: object,
@@ -820,6 +880,15 @@ def _compare(
         # Not a plain #/$defs reference (or a reference chain that does not end): not modelled.
         out.append(_unverified(path, "a reference that is not a plain #/$defs one"))
         return
+    malformed = sorted(set(_malformed_keys(old)) | set(_malformed_keys(new)))
+    if malformed:
+        # A modelled keyword whose value is outside JSON Schema is not understood: a change to it is not
+        # verified, and it is left out of the keyword comparison (which would otherwise misread or raise).
+        for key in malformed:
+            if not _same_value(old.get(key, _ABSENT), new.get(key, _ABSENT)):
+                out.append(_unverified(path, f"{key} has a value outside JSON Schema"))
+        old = {key: value for key, value in old.items() if key not in malformed}
+        new = {key: value for key, value in new.items() if key not in malformed}
     for key in sorted((set(old) | set(new)) - _MODELED - _ANNOTATIONS):
         # Compared with its keyword, so the equality knows what the value is: in a map of names to schemas
         # (``patternProperties``, ``dependentSchemas``) a name such as ``const`` is a name, and the schema

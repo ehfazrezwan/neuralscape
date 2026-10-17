@@ -1870,3 +1870,60 @@ def test_a_wide_union_of_shared_alternatives_is_bounded(monkeypatch) -> None:
 def test_a_union_whose_alternatives_still_match_is_unchanged_by_the_charge() -> None:
     branch = {"type": "string"}
     assert _pair({"anyOf": [branch] * 20}, {"anyOf": [dict(branch) for _ in range(20)]}) == []
+
+
+# ---- a modelled keyword whose value is outside JSON Schema is not understood: reported, never a crash
+
+
+@pytest.mark.parametrize(
+    "keyword, old_value, new_value",
+    [
+        ("maxLength", 5, "3"), ("maxLength", None, 3), ("minimum", 0, None), ("exclusiveMaximum", "10", 10),
+        ("minItems", 1, [2]), ("maxProperties", 2, {}), ("required", ["a"], 5), ("type", "string", {"a": 1}),
+        ("anyOf", [{"type": "string"}], True), ("oneOf", None, [{}]), ("enum", ["a"], "a"), ("uniqueItems", False, "yes"),
+        ("minLength", 1, True), ("maximum", 10, float("inf")), ("multipleOf", 2, 0), ("type", "string", "int"),
+        ("properties", {"a": {}}, ["a"]), ("additionalProperties", True, "no"), ("prefixItems", [{}], {}),
+        ("pattern", "^a", 1),
+    ],
+)
+def test_a_malformed_value_in_a_modelled_keyword_is_reported_not_raised(keyword, old_value, new_value) -> None:
+    findings = _pair({keyword: old_value}, {keyword: new_value})
+    assert any(f"{keyword} has a value outside JSON Schema" in f for f in findings), findings
+    findings = _pair({keyword: new_value}, {keyword: old_value})
+    assert any(f"{keyword} has a value outside JSON Schema" in f for f in findings), findings
+
+
+@pytest.mark.parametrize("keyword, value", [("maxLength", None), ("required", 5), ("type", {"a": 1}), ("anyOf", True), ("enum", "a")])
+def test_an_unchanged_malformed_value_is_not_reported_and_the_rest_is_still_compared(keyword, value) -> None:
+    assert _pair({keyword: value}, {keyword: value}) == []
+    assert _pair({keyword: value, "minLength": 1}, {keyword: value, "minLength": 2}) == ["$: minLength raised"]
+
+
+def test_well_formed_values_are_compared_as_before() -> None:
+    assert _pair({"maxLength": 5}, {"maxLength": 3}) == ["$: maxLength lowered"]
+    assert _pair({"minItems": 2.0}, {"minItems": 2}) == []  # an integral number is an integer in JSON Schema
+    assert _pair({"type": ["string", "null"]}, {"type": "string"}) == ["$: type changed from ['null', 'string'] to ['string']"]
+
+
+def test_checking_values_scales_with_the_schema_not_beyond(monkeypatch) -> None:
+    calls = _bounded_value_walk(monkeypatch, limit=50_000)
+    names = [f"p{i}" for i in range(5000)]
+    schema = {"type": "object", "properties": {name: {"type": "string"} for name in names}, "required": names}
+    assert _pair(schema, copy.deepcopy(schema)) == []
+    assert calls["count"] < 50_000
+
+
+def test_a_shared_node_s_values_are_checked_once(monkeypatch) -> None:
+    calls = {"count": 0}
+    real = pack._is_schema
+
+    def counting(value):
+        calls["count"] += 1
+        return real(value)
+
+    monkeypatch.setattr(pack, "_is_schema", counting)
+    wide = {"type": "object", "properties": {f"p{i}": {} for i in range(2000)}}
+    parents = {f"q{i}": {"type": "object", "properties": {"w": wide, "i": {"const": i}}} for i in range(2000)}
+    schema = {"type": "object", "properties": parents}  # 2000 distinct parents share one wide node
+    assert _pair(schema, copy.deepcopy(schema)) == []
+    assert calls["count"] < 100_000, calls  # the wide node's values are checked once per side, not per parent
