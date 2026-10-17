@@ -1775,10 +1775,11 @@ def validate_run_manifest_json(data: str | bytes) -> RunManifest:
             result[key] = value
         return result
 
-    # One exact copy, read with the base types' own methods: a subclass's decode(), startswith() or buffer view
-    # cannot show one parser a different document from the other.
+    # One exact copy, read with the base types' own methods: a subclass's decode(), startswith(), __bytes__() or
+    # (from Python 3.12) __buffer__() cannot show the parsers, or the caller, a different document from the bytes
+    # the object holds.
     if _is_instance(data, bytes):
-        data = bytes(memoryview(data))
+        data = bytes.__bytes__(data)
     elif _is_instance(data, str):
         data = str.__str__(data)
     else:

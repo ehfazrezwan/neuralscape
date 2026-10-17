@@ -6207,3 +6207,42 @@ def test_other_input_types_are_refused() -> None:
     for bad in (None, 3, [], bytearray(b"{}")):
         with pytest.raises((TypeError, ValueError)):
             validate_run_manifest_json(bad)   # type: ignore[arg-type]
+
+
+def test_a_bytes_subclass_with_its_own_buffer_view_is_copied_from_its_real_bytes() -> None:
+    # A Python-level __buffer__ is consulted from Python 3.12 only; on earlier versions the hook is simply never asked.
+    log: list[str] = []
+    clean = serialize_run_manifest(completed_manifest())
+    dirty = _duplicate_key_document()
+
+    class CleanBuffer(bytes):
+        def __buffer__(self, flags):
+            log.append("__buffer__")
+            return memoryview(clean)
+
+    with pytest.raises(ValueError, match="duplicate JSON key"):
+        validate_run_manifest_json(CleanBuffer(dirty))
+    assert log == [], log
+
+
+def test_a_bytes_subclass_overriding_item_access_is_copied_from_its_real_bytes() -> None:
+    log: list[str] = []
+    clean = serialize_run_manifest(completed_manifest())
+    dirty = _duplicate_key_document()
+
+    class Slippery(bytes):
+        def __getitem__(self, index):
+            log.append("__getitem__")
+            return clean[index]
+
+        def __iter__(self):
+            log.append("__iter__")
+            return iter(clean)
+
+        def __len__(self):
+            log.append("__len__")
+            return len(clean)
+
+    with pytest.raises(ValueError, match="duplicate JSON key"):
+        validate_run_manifest_json(Slippery(dirty))
+    assert log == [], log
