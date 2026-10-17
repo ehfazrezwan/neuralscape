@@ -302,6 +302,9 @@ class _GraphInventory:
     entry_guard: "Callable[[object], object] | None" = None
     # The contract each root is validated against by the receiving boundary, by object identity (see ``contract``).
     contracts: dict[int, type] = field(default_factory=dict)
+    # Snapshots already validated early, by identity (held, so the identity cannot be reused): a pure subtree
+    # is reconstructed once and shared, so the same item yielded many times is judged once, not once per occurrence.
+    validated: dict[int, object] = field(default_factory=dict)
     # Completed reconstructions of pure subtrees, keyed by identity:
     # ``(object, copy, height)``.  A descendant shared by many paths is rebuilt once
     # and shared; ``height`` keeps the depth limit enforced on every path.
@@ -627,12 +630,15 @@ def _exposed_items(
         if item_model is not None and active_containers is not None and checked is not None:
             snapshot = _snapshot_captured_graph(item, active_containers, inventory, depth + 1, None, item_model)
             checked.append((item, snapshot))  # by position: the same object yielded twice is two entries
+            if inventory.validated.get(id(snapshot)) is snapshot:
+                continue  # the same shared snapshot, already guarded and validated (immutable, unreachable by callers)
             try:
                 if inventory.entry_guard is not None:
                     inventory.entry_guard(snapshot)  # the receiving boundary's type check, before pydantic sees it
                 # A private copy: the validators of the declared class may edit what they are given, and the
                 # retained snapshot is the evidence the caller will judge.
                 item_model.model_validate(_private_copy(snapshot), strict=True)
+                inventory.validated[id(snapshot)] = snapshot
             except Exception:  # noqa: BLE001 - the input is refused; a prefix is never returned as if it were the view
                 raise ValueError("a contract entry exposed by a public view is not valid") from None
     return tuple(items)

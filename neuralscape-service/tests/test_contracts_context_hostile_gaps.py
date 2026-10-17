@@ -1488,3 +1488,68 @@ def test_every_snapshot_call_site_in_the_service_passes_the_entry_guard() -> Non
                 if not any(keyword.arg == "entry_guard" for keyword in node.keywords):
                     offenders.append(f"{path.name}:{node.lineno}")
     assert offenders == []
+
+
+# ---- shared nodes cost once: the same pure item yielded many times is validated once
+
+
+def _counting_item_contract():
+    from pydantic import model_validator
+
+    from contracts_common import ContractModel
+
+    calls = {"n": 0}
+
+    class Item(ContractModel):
+        payload: tuple[int, ...]
+
+        @model_validator(mode="before")
+        @classmethod
+        def count(cls, data):
+            calls["n"] += 1
+            return data
+
+    class Holder(ContractModel):
+        items: tuple[Item, ...]
+
+    return Item, Holder, calls
+
+
+def test_the_same_pure_item_yielded_many_times_is_validated_once() -> None:
+    from contracts_common import snapshot_contract_graph
+
+    Item, Holder, calls = _counting_item_contract()
+    item = Item.model_construct(payload=tuple(range(50)))
+    holder = Holder.model_construct(items=_GeneratedItems(lambda: iter([item] * 500)))
+    snapshot = snapshot_contract_graph(holder, contract=Holder)
+    assert len(snapshot["items"]) == 500 and calls["n"] == 1
+
+
+def test_distinct_items_are_each_validated_and_a_view_bearing_item_is_validated_per_occurrence() -> None:
+    from contracts_common import snapshot_contract_graph
+
+    Item, Holder, calls = _counting_item_contract()
+    items = [Item.model_construct(payload=(i,)) for i in range(5)]
+    snapshot_contract_graph(Holder.model_construct(items=_GeneratedItems(lambda: iter(items))), contract=Holder)
+    assert calls["n"] == 5
+
+    class View(tuple):
+        def __iter__(self):
+            return iter((1, 2))
+
+    calls["n"] = 0
+    impure = Item.model_construct(payload=View((1, 2)))  # its payload is a public view: rebuilt (observed) per occurrence
+    snapshot_contract_graph(Holder.model_construct(items=_GeneratedItems(lambda: iter([impure, impure]))), contract=Holder)
+    assert calls["n"] == 2
+
+
+def test_a_shared_item_does_not_scale_the_work_with_its_occurrences() -> None:
+    import time
+
+    from contracts_common import snapshot_contract_graph
+
+    Item, Holder, _ = _counting_item_contract()
+    item = Item.model_construct(payload=tuple(range(20_000)))
+    started = time.monotonic()
+    snapshot_contract_graph(Holder.model_construct(items=_GeneratedItems(lambda: iter([item] * 4_000))), contract=Holder)
+    assert time.monotonic() - started < 10  # 80 million element validations if every occurrence were judged again
