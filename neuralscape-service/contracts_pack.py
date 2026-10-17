@@ -479,7 +479,7 @@ def _compare(
     path: str,
     out: list[str],
     depth: int = 0,
-    active: tuple[tuple[str, str], ...] = (),
+    active: tuple[tuple[str, str, int, int], ...] = (),
 ) -> None:
     if depth > _MAX_COMPARE_DEPTH:
         out.append(f"{path}: schema nesting exceeds the comparison depth limit; compatibility not verified")
@@ -490,7 +490,9 @@ def _compare(
         # already being compared is assumed compatible, but only for its target, never for siblings.
         if not _same(_beside(old), _beside(new), old_defs, new_defs):
             out.append(_unverified(path, "constraints beside a $ref changed"))
-        pair = (str(old["$ref"]), str(new["$ref"]))
+        # An assumption belongs to one direction and one pair of definition sets: the reverse comparison
+        # of the same references (new against old, definitions swapped) is a different question.
+        pair = (str(old["$ref"]), str(new["$ref"]), id(old_defs), id(new_defs))
         if pair in active:
             run = _RUN.get()
             if run is not None:  # assumed compatible: remember how far up the stack that assumption reaches
@@ -526,7 +528,7 @@ def _compare_checked(
     path: str,
     out: list[str],
     depth: int,
-    active: tuple[tuple[str, str], ...],
+    active: tuple[tuple[str, str, int, int], ...],
     base: int,
 ) -> None:
     """The keyword-by-keyword comparison of two resolved schemas, skipped for a pair already shown compatible.
@@ -583,7 +585,7 @@ def _compare_keywords(
     path: str,
     out: list[str],
     depth: int,
-    active: tuple[tuple[str, str], ...],
+    active: tuple[tuple[str, str, int, int], ...],
 ) -> None:
     old_unions = {key: old[key] for key in _UNION_KEYS if old.get(key)}
     new_unions = {key: new[key] for key in _UNION_KEYS if new.get(key)}

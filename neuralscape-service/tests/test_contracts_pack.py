@@ -1103,3 +1103,29 @@ def test_a_self_recursive_definition_used_on_two_paths_is_compared_once(monkeypa
     schema = {"$defs": {"Node": node}, "type": "object", "properties": {f"p{i}": _ref("Node") for i in range(30)}}
     assert _pair(schema, {**schema, "$defs": {"Node": dict(node)}}) == []
     assert calls["count"] < 10, calls  # 30 uses of one recursive definition, each settled once it is compared
+
+
+# ---- recursive references: direction
+
+
+def _direction_pair():
+    a = {
+        "type": "object",
+        "properties": {
+            "n": {"type": "string", "maxLength": 1},
+            "x": {"oneOf": [{"$ref": "#/$defs/B"}, {"const": {"back": {"n": "long"}}}]},
+        },
+    }
+    b = {"type": "object", "properties": {"back": {"$ref": "#/$defs/A"}}}
+    old = {"$ref": "#/$defs/A", "$defs": {"A": a, "B": b}}
+    new = copy.deepcopy(old)
+    del new["$defs"]["A"]["properties"]["n"]["maxLength"]
+    return old, new
+
+
+def test_an_assumption_made_going_forward_is_not_taken_for_the_reverse_comparison() -> None:
+    """Removing maxLength makes {n:'a', x:{back:{n:'long'}}} match both oneOf branches: the reverse
+    comparison of the alternatives must not inherit the forward 'B is compatible with B' assumption."""
+
+    old, new = _direction_pair()
+    assert _pair(old, new) != []
