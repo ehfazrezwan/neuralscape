@@ -177,15 +177,15 @@ def test_the_lifecycle_modules_never_read_the_clock():
 
 # ---- reconstruction cost
 def test_a_native_diamond_is_refused_not_reconstructed_per_path():
-    """Built once per object (2^40 paths, 41 objects): refused for what it is, with no echo of the input."""
+    """Built once per object (2^40 paths, 41 objects): each reuse is charged its expanded size, so the
+    budget refuses it at once (arithmetic over 41 objects, not a walk of the paths)."""
 
     shared = ("x",)
     for _ in range(40):
         shared = (shared, shared)
     command = intent(ProcessingStage.CANONICAL).model_copy(update={"id": shared})
-    with Alarm(20), pytest.raises(ValueError, match="Input should be a valid string") as refused:
+    with Alarm(20), pytest.raises(ValueError, match=BUDGET):
         claim(command)
-    assert "omitted: input shares subtrees" in str(refused.value)
 
 
 def test_a_diamond_of_public_views_is_refused():

@@ -137,6 +137,8 @@ def test_a_tiny_shared_graph_costs_work_per_object_not_per_path(kind) -> None:
 
     import time
 
+    from contracts_limits import DISCOVERY_BUDGET_MESSAGE
+
     from pydantic import BaseModel
 
     from tests.test_contracts_lifecycle import BASE_MODEL_DICT_DESCRIPTOR
@@ -148,7 +150,9 @@ def test_a_tiny_shared_graph_costs_work_per_object_not_per_path(kind) -> None:
         _claim((shared,))
     rendered = str(refused.value)  # an error naming the input must not expand it either
     elapsed = time.monotonic() - started
-    assert "budget" not in rendered  # refused for what it is, not for its path count
+    # Strict validation would walk all 2^20 paths, so the reused copy is charged per occurrence and the
+    # input is refused by the budget; the charge is arithmetic over the 20 objects, so it is immediate.
+    assert DISCOVERY_BUDGET_MESSAGE in rendered
     assert elapsed < 0.5, elapsed
     assert len(rendered) < 10_000
 
@@ -232,3 +236,72 @@ def test_a_flat_container_of_any_kind_repeated_many_times_is_not_echoed(kind) ->
     wrapper = [flat] * n if kind is list else tuple([flat] * n)
     error = _bad_intent_id(wrapper)
     assert len(repr(error.errors())) < 10_000
+
+
+# ---- strict validation walks a shared raw container once per occurrence: it is charged per occurrence
+
+
+def _requirements_sharing_one_raw_dict(n: int, ids: tuple[str, ...] | None = None):
+    from contracts_lifecycle import ProcessingStage as Stage
+
+    command = intent(CANONICAL)
+    shared = {  # strict input: the exact types the model expects
+        "stage": Stage.CANONICAL, "effect_id": "effect-canonical",
+        "precondition_source_ids": ids if ids is not None else tuple(f"memory-{i}" for i in range(n)),
+        "upstream_stages": (),
+        "committed_sources": (), "minimum_output_refs": 0, "no_source_witness": False,
+    }
+    return command.model_copy(update={"stage_requirements": (shared,) * n})
+
+
+def test_many_references_to_one_raw_requirement_are_charged_for_every_occurrence() -> None:
+    """N requirement entries naming one raw dict of N source ids: one dict to the graph walk, N * N entries
+    for strict validation.  Refused by the budget before validation, in bounded time."""
+
+    import time
+
+    from contracts_limits import DISCOVERY_BUDGET_MESSAGE
+
+    command = _requirements_sharing_one_raw_dict(2_000)
+    started = time.monotonic()
+    with pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):
+        _claim_with(command, ())
+    assert time.monotonic() - started < 2
+
+
+def test_receipts_sharing_one_raw_output_tuple_are_charged_for_every_occurrence() -> None:
+    import time
+
+    from pydantic import BaseModel
+
+    from contracts_limits import DISCOVERY_BUDGET_MESSAGE
+    from tests.test_contracts_lifecycle import BASE_MODEL_DICT_DESCRIPTOR
+
+    handles = tuple({"kind": "memory", "id": f"m{i}", "tenant_id": "tenant-1", "resolver": "ns:memory"}
+                    for i in range(1_500))
+    receipts = []
+    for attempt in range(1, 1_501):
+        one = receipt(CANONICAL, StageStatus.APPLIED).model_copy(update={"attempt": attempt})
+        dict.__setitem__(BASE_MODEL_DICT_DESCRIPTOR.__get__(one, BaseModel), "output_refs", handles)
+        receipts.append(one)
+    started = time.monotonic()
+    with pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):
+        _claim_with(intent(CANONICAL), tuple(receipts))
+    assert time.monotonic() - started < 3
+
+
+def test_a_raw_container_shared_a_few_times_still_validates() -> None:
+    from contracts_limits import DISCOVERY_BUDGET_MESSAGE
+
+    command = _requirements_sharing_one_raw_dict(1, ("memory-1",))  # one entry: nothing is repeated
+    _claim_with(command, (), IntentStatus.ACCEPTED)
+    shared = _requirements_sharing_one_raw_dict(3, ("memory-1",))
+    with pytest.raises(ValueError) as refused:  # three entries for one stage: the contract refuses it
+        _claim_with(shared, (), IntentStatus.ACCEPTED)
+    assert DISCOVERY_BUDGET_MESSAGE not in str(refused.value)
+
+
+def _claim_with(command, receipts, status=IntentStatus.APPLIED):
+    from contracts_lifecycle import validate_required_stage_claim
+
+    validate_required_stage_claim(claimed_status=status, intent=command, receipts=receipts)

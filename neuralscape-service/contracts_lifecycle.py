@@ -393,10 +393,13 @@ def _remember_pure_copy(
 
     Pure: an exact ``tuple``, ``list`` or ``dict`` (plain ``str`` keys) whose children are leaves or
     pure containers themselves, so rebuilding it on another path runs no caller code and gives
-    the same copy.  The subtree's height is kept so a later path is still depth-checked.
+    the same copy.  The subtree's height is kept so a later path is still depth-checked, and its
+    expanded size (every entry on every path through it) so a later path is charged for the work
+    strict validation does there.
     """
 
     height = 0
+    size = len(children)
     for child in children:
         if isinstance(child, _CapturedLeaf):
             continue
@@ -406,7 +409,8 @@ def _remember_pure_copy(
         if entry is None or entry[0] is not child.source:
             return
         height = max(height, entry[2] + 1)
-    captured_by_identity[(_MATERIALIZED, value.identity)] = (value.source, result, height)
+        size += entry[3]
+    captured_by_identity[(_MATERIALIZED, value.identity)] = (value.source, result, height, size)
 
 
 def _materialize_captured_graph(
@@ -439,6 +443,10 @@ def _materialize_captured_graph(
         # A pure native container already built on another path: reuse the copy (its subtree was
         # charged once), checking this path's depth against the subtree's height.
         budget.visit(value.source, len(active_containers) + reused[2])
+        # Strict validation walks the copy again on this path (one copy, validated per occurrence),
+        # so the occurrence is charged its expanded size: a shared raw container cannot multiply
+        # validation work past the budget.  The size is arithmetic over distinct objects.
+        budget.charge_edge(reused[3])
         # A shared copy that nests containers, or a flat one that holds entries: the input repeats it per
         # path, so an error must not echo it.  An empty container is one interned object that ordinary
         # models share everywhere; its rendering does not grow, so it must not suppress a diagnostic.
