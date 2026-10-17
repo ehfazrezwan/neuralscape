@@ -386,7 +386,8 @@ def _snapshot_native_value(
             if depth + height > budget.tier.max_depth:
                 raise ValueError(DISCOVERY_BUDGET_MESSAGE)
             if not guard:
-                # every occurrence of a reused subtree is walked again, JSON fields included
+                # every occurrence of a reused subtree is walked again, its typed collections and
+                # JSON fields included
                 _add_expansion(memo.get((_EXPANDED_WITHIN, identity), 0), budget, memo)
             return copied, height, True
         # A child first exposed through a public view is captured now; it is
@@ -539,6 +540,12 @@ def _snapshot_native_value(
                 for nested in _charged_entries(value.values, budget):
                     child(nested, f"{location}[value]")
             return value, 0, True
+        if own_cost and not guard:
+            # Strict revalidation walks typed collections path by path, like a JSON value: an exact
+            # container shared by many parents is one node to discovery but is validated (and its
+            # contract checks run) once per occurrence.  Each copy charges its entries to the call's
+            # single expansion allowance, and a reused subtree charges them again below.
+            _add_expansion(own_cost, budget, memo)
         if is_container and memoizable:
             table[identity] = (value, result, height)
             if not guard:
@@ -551,7 +558,8 @@ def _snapshot_native_value(
             active.remove(identity)
 
 
-#: Snapshot-memo keys for the call-level JSON expansion allowance (not object identities, which are ints).
+#: Snapshot-memo keys for the call-level expansion allowance (not object identities, which are ints).  The
+#: allowance covers everything strict revalidation walks per path: typed collections and JSON values.
 _EXPANDED_TOTAL = "json-expanded-total"
 _EXPANDED_SIZE = "json-expanded-size"
 _EXPANDED_WITHIN = "json-expanded-within"

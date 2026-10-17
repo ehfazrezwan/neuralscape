@@ -15,6 +15,7 @@ from contracts_engines import (
     QualificationClaim,
     validate_capability_requirements,
 )
+from contracts_limits import DISCOVERY_BUDGET_MESSAGE
 from contracts_references import ReferenceHandle
 
 
@@ -1761,7 +1762,8 @@ def test_shared_descendants_are_copied_once_per_object(monkeypatch):
     declared = manifest(state())
     _native_set(declared, "contract_schema_versions", _shared_chain(16))
 
-    with pytest.raises(ValidationError):
+    # 2**17 paths: more than revalidation may walk, so the expansion allowance refuses it
+    with pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):
         validate_capability_requirements(declared, ())
 
     assert calls < 500  # linear in distinct objects; the per-path copy makes 2**17 calls
@@ -1774,7 +1776,7 @@ def test_deeply_shared_graph_is_rejected_in_bounded_time():
     _native_set(declared, "contract_schema_versions", _shared_chain(60))
 
     started = time.monotonic()
-    with pytest.raises(ValidationError):
+    with pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):
         validate_capability_requirements(declared, ())
     assert time.monotonic() - started < 2.0
 
@@ -1787,7 +1789,7 @@ def test_shared_models_and_dicts_are_copied_once():
         nested = {"a": nested, "b": nested}
     _native_set(declared, "operations", (shared, nested))
 
-    with pytest.raises(ValidationError):
+    with pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):  # 2**40 paths for revalidation
         validate_capability_requirements(declared, ())
 
 

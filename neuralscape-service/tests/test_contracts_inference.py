@@ -2015,6 +2015,45 @@ def test_a_non_text_key_in_native_storage_is_refused_without_running_its_hooks()
     assert _ImpostorKey.hooks == []
 
 
+def test_a_shared_typed_collection_is_charged_for_every_occurrence_revalidation_walks():
+    """3,000 heads sharing one tuple of 3,000 candidate ids: one tuple to discovery, 9M entries to revalidation."""
+
+    import time
+
+    from contracts_limits import DISCOVERY_BUDGET_MESSAGE
+
+    count = 3_000
+    request = decision_request(batch=True)
+    shared_ids = tuple(f"candidate-{index}" for index in range(count))
+    request.__dict__["candidates"] = tuple(DecisionCandidate(candidate_id=c) for c in shared_ids)
+    request.__dict__["heads"] = tuple(
+        DecisionHead.model_construct(head_id=f"head-{index}", span_ids=("span-1",), candidate_ids=shared_ids, required=True)
+        for index in range(count)
+    )
+    result = DecisionBatchResult(
+        schema_version=VERSION, request_id="request-1", fallback_granularity=FallbackGranularity.WHOLE_BATCH,
+        publishable=False, head_results=(abstained("head-0"),), attempts=(),
+    )
+    started = time.monotonic()
+    with pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):
+        validate_decision_batch_result(request, result)
+    assert time.monotonic() - started < 2
+
+
+def test_a_shared_typed_collection_within_the_allowance_still_validates():
+    request = decision_request(batch=True)
+    shared_ids = request.heads[0].candidate_ids
+    request.__dict__["heads"] = tuple(
+        DecisionHead.model_construct(head_id=head.head_id, span_ids=head.span_ids, candidate_ids=shared_ids, required=True)
+        for head in request.heads
+    )
+    result = DecisionBatchResult(
+        schema_version=VERSION, request_id="request-1", fallback_granularity=FallbackGranularity.WHOLE_BATCH,
+        publishable=True, head_results=(selected("retain"), selected("category")), attempts=(usage(),),
+    )
+    assert validate_decision_batch_result(request, result).compliant
+
+
 def test_many_references_to_one_wide_list_are_sized_once():
     """40,000 references to one 40,000-element list: the size memo is consulted before the list is copied."""
 
