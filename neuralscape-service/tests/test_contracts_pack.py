@@ -2090,3 +2090,29 @@ def test_a_few_patterns_and_new_names_stay_within_the_budget() -> None:
     old = {"type": "object", "additionalProperties": False, "patternProperties": patterns}
     new = {**copy.deepcopy(old), "properties": {f"p{i}": {"type": "integer"} for i in range(5)}}
     assert _pair(old, new) == []  # the names were rejected before and are allowed now
+
+
+# ---- arrays of schemas compare what their references point at, in every keyword that holds one
+
+
+def _array_of_refs(keyword: str, name_type: str, *, under_not: bool = False) -> dict:
+    value: object = [{"$ref": "#/$defs/Name"}]
+    if keyword == "additionalItems":
+        node = {"items": [{}], "additionalItems": {"$ref": "#/$defs/Name"}}
+    else:
+        node = {keyword: value}
+    return {"$defs": {"Name": {"type": name_type}}, **({"not": node} if under_not else node)}
+
+
+@pytest.mark.parametrize("keyword", ["items", "prefixItems", "allOf", "anyOf", "oneOf", "additionalItems"])
+@pytest.mark.parametrize("under_not", [False, True])
+def test_a_changed_target_behind_an_array_of_schemas_is_reported(keyword, under_not) -> None:
+    old, new = (_array_of_refs(keyword, "string", under_not=under_not), _array_of_refs(keyword, "integer", under_not=under_not))
+    assert _pair(old, new) != [], (keyword, under_not)  # e.g. ["text"] valid before, rejected now
+
+
+@pytest.mark.parametrize("keyword", ["items", "prefixItems", "allOf", "anyOf", "oneOf", "additionalItems"])
+def test_an_unchanged_array_of_schemas_compares_clean(keyword) -> None:
+    schema = _array_of_refs(keyword, "string")
+    assert _pair(schema, copy.deepcopy(schema)) == []
+    assert _pair(_array_of_refs(keyword, "string", under_not=True), _array_of_refs(keyword, "string", under_not=True)) == []

@@ -925,7 +925,9 @@ def _compare(
     if _embedded_resource(old, new, path, out):
         return  # a reference led to one
     if not isinstance(old, dict) or not isinstance(new, dict):
-        if not _json_equal(old, new):
+        # A boolean schema or a shape outside the modelled subset (an array-form ``items``): compared by what
+        # it says, references expanded, so unchanged reference text cannot hide a changed target.
+        if not _same(old, new, old_defs, new_defs):
             out.append(f"{path}: schema changed shape")
         return
     if "$ref" in old or "$ref" in new:
