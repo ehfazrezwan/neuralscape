@@ -431,6 +431,8 @@ _HANDED_ENUMS = "handed-enums"  # memo key: enum members and detached ints hande
 _DETACHED = "detached"  # memo key prefix: one scalar subclass leaf's exact copy, made once per call
 _DETACHED_INT = "detached-int"  # memo key: this call's marker class for a detached int subclass
 _LEAF_CLASS = "leaf-class"  # memo key prefix: one leaf class's verdict, decided once per call
+_DICT_READ_COST = "dict-read-cost"  # memo key prefix: edges one native __dict__ read of a class costs
+_DERIVES = "derives"  # memo key prefix: whether one class derives from one contract base, decided once per call
 _KEY_CLASS = "key-class"  # memo key prefix: whether one key class derives from str, decided once per call
 _KEY_TEXT = "key-text"  # memo key prefix: one str-subclass mapping key's exact text, copied once per call
 
@@ -544,6 +546,7 @@ def _capture_native_contract_graph(
         active_containers.add(identity)
         try:
             if graph_kind is BaseModel:
+                budget.charge_edge(_dict_read_cost(value_type, captured_by_identity))
                 stored = _BASE_MODEL_DICT_DESCRIPTOR.__get__(value, BaseModel)
                 _reserve_entries(budget, dict.__len__(stored))
                 stored_entries = tuple(dict.items(stored))
@@ -556,7 +559,7 @@ def _capture_native_contract_graph(
                     malformed_extra = False
                 else:
                     extra_type = type(extra)
-                    malformed_extra = not _derives_from(extra_type, (dict,))
+                    malformed_extra = not _derives_once(extra_type, dict, captured_by_identity, budget)
                     if not malformed_extra:
                         _reserve_entries(budget, len(stored_entries) + dict.__len__(extra))
                     extra_entries = (
@@ -970,6 +973,38 @@ def _is_instance_by_type(value: object, model_type: type) -> bool:
     return _derives_from(type(value), (model_type,))
 
 
+def _dict_read_cost(kind: type, captured_by_identity: dict[Any, Any]) -> int:
+    """Edges to charge for reading one instance's native ``__dict__``: the descriptor finds the base that owns the
+    slot by walking the class chain in C (about 34 ns a class), so a deep model class makes every instance's read
+    cost its depth.  One edge per 64 classes (contract classes are far shallower and pay nothing); the MRO length
+    is read once per class per call."""
+
+    known = captured_by_identity.get((_DICT_READ_COST, id(kind)))
+    if known is not None and known[0] is kind:
+        return known[1]
+    cost = tuple.__len__(_TYPE_MRO.__get__(kind)) >> 6
+    captured_by_identity[(_DICT_READ_COST, id(kind))] = (kind, cost)
+    return cost
+
+
+def _derives_once(
+    kind: type, wanted: type, captured_by_identity: dict[Any, Any], budget: DiscoveryBudget | None
+) -> bool:
+    """``_derives_from`` for a check repeated per item (every receipt, every model with extras): decided once per
+    class per call, charged one edge per class in its MRO before the walk, and kept with the class (its ``id()``
+    is not recycled).  A class's bases cannot change across native layouts, so no generation is needed."""
+
+    known = captured_by_identity.get((_DERIVES, id(kind), id(wanted)))
+    if known is not None and known[0] is kind:
+        return known[1]
+    mro = _TYPE_MRO.__get__(kind)
+    if budget is not None:
+        budget.charge_edge(tuple.__len__(mro))
+    verdict = any(base is wanted for base in mro)
+    captured_by_identity[(_DERIVES, id(kind), id(wanted))] = (kind, verdict)
+    return verdict
+
+
 def _captured_model(
     model_type: type[_ModelT],
     value: object,
@@ -1034,7 +1069,7 @@ def _revalidated_inventory_model(
 ) -> _ModelT:
     """Validate a public-view item, reusing entry-time state when available."""
 
-    if not _is_instance_by_type(value, model_type):
+    if not _derives_once(type(value), model_type, captured_by_identity, budget):
         raise TypeError(f"value must be {_article(model_type.__name__)} {model_type.__name__}")
     captured = _cached_identity_capture(value, captured_by_identity)
     if captured is None:
@@ -1496,7 +1531,7 @@ def _revalidated_claim_inputs(
             budget.charge_edge()
         except ValueError:
             break
-        if not _derives_from(type(receipt), (StageReceipt,)):
+        if not _derives_once(type(receipt), StageReceipt, receipt_inventory, budget):
             continue
         identity = id(receipt)
         if identity in receipt_inventory or identity in receipt_capture_errors:
@@ -1518,7 +1553,7 @@ def _revalidated_claim_inputs(
 
     def revalidate_receipt(receipt: object) -> StageReceipt:
         capture_error = receipt_capture_errors.get(id(receipt))
-        if capture_error is not None and _is_instance_by_type(receipt, StageReceipt):
+        if capture_error is not None and _derives_once(type(receipt), StageReceipt, receipt_inventory, budget):
             raise capture_error
         return _revalidated_inventory_model(
             StageReceipt,

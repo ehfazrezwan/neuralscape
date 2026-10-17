@@ -2341,3 +2341,132 @@ def test_a_large_int_key_in_a_shared_models_extras_is_charged_on_every_path():
     set_native(applied, "applied_sources", (shared,) * 4_000)
     with pytest.raises(ValueError, match=BUDGET):
         contracts_lifecycle.validate_stage_receipts(command, (applied,))
+
+
+def _count_mro_reads(monkeypatch, kinds):
+    reads: list[type] = []
+    real = contracts_lifecycle._TYPE_MRO
+
+    class Counting:  # every read of a class's real MRO in the module goes through this descriptor
+        def __get__(self, kind, owner=None):
+            if kind in kinds:
+                reads.append(kind)
+            return real.__get__(kind)
+
+    monkeypatch.setattr(contracts_lifecycle, "_TYPE_MRO", Counting())
+    return reads
+
+
+@pytest.mark.parametrize("entry", ["record", "claim"])
+def test_a_deep_receipt_class_is_walked_once_per_call_not_per_receipt(monkeypatch, entry):
+    """Classifying each receipt by its real class walks that class's MRO; receipts of one class share one charged
+    walk per call instead of one or two uncharged walks per receipt."""
+
+    from tests.test_contracts_lifecycle import intent_with_requirements, requirement
+
+    kind: type = StageReceipt
+    for index in range(30):
+        kind = type(f"Receipt{index}", (kind,), {})
+    command = intent_with_requirements(requirement(ProcessingStage.CANONICAL))
+    receipts = []
+    for attempt in range(1, 201):
+        item = receipt(ProcessingStage.CANONICAL, StageStatus.FAILED, sources=(), attempt=attempt)
+        object.__setattr__(item, "__class__", kind)
+        receipts.append(item)
+    reads = _count_mro_reads(monkeypatch, {kind})
+    if entry == "record":
+        contracts_lifecycle.validate_stage_receipts(command, tuple(receipts))
+    else:
+        validate_required_stage_claim(claimed_status=IntentStatus.FAILED, intent=command, receipts=tuple(receipts))
+    assert len(reads) <= 4, len(reads)  # a few per class (classification, graph kind), never per receipt
+
+
+def test_a_deep_extras_class_is_walked_once_per_call_not_per_model(monkeypatch):
+    from tests.test_contracts_lifecycle import intent_with_requirements, requirement, source
+
+    kind: type = dict
+    for index in range(30):
+        kind = type(f"Extras{index}", (kind,), {})
+    command = intent_with_requirements(requirement(ProcessingStage.CANONICAL))
+    applied = receipt(ProcessingStage.CANONICAL, StageStatus.APPLIED)
+    sources = []
+    for index in range(200):
+        item = SourceVersion.model_construct(**vars(source(f"s{index}")))
+        EXTRA.__set__(item, kind())
+        sources.append(item)
+    set_native(applied, "applied_sources", tuple(sources))
+    reads = _count_mro_reads(monkeypatch, {kind})
+    contracts_lifecycle.validate_stage_receipts(command, (applied,))  # empty extras of a dict subclass are valid
+    assert len(reads) <= 2, len(reads)
+
+
+def test_the_one_walk_of_a_receipt_class_is_charged_by_its_depth():
+    from contracts_limits import DiscoveryBudget
+
+    from tests.test_contracts_lifecycle import intent_with_requirements, requirement
+
+    def charged(depth: int) -> int:
+        kind: type = StageReceipt
+        for index in range(depth):
+            kind = type(f"Charged{index}", (kind,), {})
+        command = intent_with_requirements(requirement(ProcessingStage.CANONICAL))
+        item = receipt(ProcessingStage.CANONICAL, StageStatus.FAILED, sources=())
+        object.__setattr__(item, "__class__", kind)
+        budgets: list[DiscoveryBudget] = []
+
+        class Recording(DiscoveryBudget):
+            __slots__ = ()
+
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                budgets.append(self)
+
+        real = contracts_lifecycle.DiscoveryBudget
+        contracts_lifecycle.DiscoveryBudget = Recording
+        try:
+            contracts_lifecycle.validate_stage_receipts(command, (item,))
+        finally:
+            contracts_lifecycle.DiscoveryBudget = real
+        return max(budget.edges for budget in budgets)
+
+    assert charged(120) - charged(10) >= 110  # the class walk is charged one edge per class in its MRO
+
+
+def test_every_instance_of_a_deep_model_class_is_charged_for_its_native_storage_read():
+    """Reading a model's native ``__dict__`` walks its class chain in C, once per instance: receipts of a 256-deep
+    class are charged for it per receipt, while shallow contract classes pay nothing extra."""
+
+    from contracts_limits import DiscoveryBudget
+
+    from tests.test_contracts_lifecycle import intent_with_requirements, requirement
+
+    deep: type = StageReceipt
+    for index in range(256):
+        deep = type(f"Stored{index}", (deep,), {})
+
+    def charged(kind: type, count: int) -> int:
+        command = intent_with_requirements(requirement(ProcessingStage.CANONICAL))
+        items = []
+        for attempt in range(1, count + 1):
+            item = receipt(ProcessingStage.CANONICAL, StageStatus.FAILED, sources=(), attempt=attempt)
+            object.__setattr__(item, "__class__", kind)
+            items.append(item)
+        budgets: list[DiscoveryBudget] = []
+
+        class Recording(DiscoveryBudget):
+            __slots__ = ()
+
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                budgets.append(self)
+
+        real = contracts_lifecycle.DiscoveryBudget
+        contracts_lifecycle.DiscoveryBudget = Recording
+        try:
+            contracts_lifecycle.validate_stage_receipts(command, tuple(items))
+        finally:
+            contracts_lifecycle.DiscoveryBudget = real
+        return max(budget.edges for budget in budgets)
+
+    per_receipt = (charged(deep, 101) - charged(deep, 1)) - (charged(StageReceipt, 101) - charged(StageReceipt, 1))
+    assert per_receipt >= 100 * (256 >> 6), per_receipt  # about one edge per 64 classes, for each receipt
