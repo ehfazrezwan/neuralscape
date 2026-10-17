@@ -612,6 +612,9 @@ def _expanded_size(native: Any, budget: DiscoveryBudget, memo: dict[Any, Any]) -
     """
 
     limit = budget.tier.max_edges
+    if is_subclass(type(native), str):
+        # A scalar text value: no container to size, but every occurrence is scanned.
+        return _string_units(native)
 
     def known(value: Any) -> int | None:
         held = memo.get((_EXPANDED_SIZE, id(value)))

@@ -2094,3 +2094,28 @@ def test_a_long_string_repeated_in_a_json_value_is_charged_for_every_occurrence(
 def test_one_long_distinct_string_is_still_accepted():
     request, result = _generation_with_output({"v": "x" * 5_000_000}, v={"type": "string"})
     assert validate_generation_result(request, result).compliant
+
+
+def test_a_long_scalar_output_shared_by_many_proposals_is_charged_for_every_occurrence():
+    """1,000 proposals sharing one 1 MiB scalar output: no containers, but every occurrence is scanned."""
+
+    import time
+
+    from contracts_limits import DISCOVERY_BUDGET_MESSAGE
+
+    request, result = _generation_with_output("x" * (1 << 20), v={"type": "string"})
+    result.__dict__["proposals"] = result.proposals * 1_000
+    started = time.monotonic()
+    with pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):
+        validate_generation_result(request, result)
+    assert time.monotonic() - started < 2
+
+
+def test_a_long_scalar_output_used_once_is_charged_once_and_admitted_to_validation():
+    from contracts_limits import DISCOVERY_BUDGET_MESSAGE
+
+    request, result = _generation_with_output("x" * (1 << 20), v={"type": "string"})
+    with pytest.raises(ValueError) as refused:  # not an object: the schema refuses it, the allowance does not
+        validate_generation_result(request, result)
+    assert DISCOVERY_BUDGET_MESSAGE not in str(refused.value)
+
