@@ -9,7 +9,9 @@ not be synthesized as a zero.
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
+from contextvars import ContextVar
 from types import MappingProxyType
 from datetime import datetime, timedelta, timezone
 from enum import Enum
@@ -307,6 +309,29 @@ def _instant_before(left: datetime, right: datetime) -> bool:
     return timedelta.__sub__(wall, timedelta.__sub__(left_offset, right_offset)) < timedelta(0)
 
 
+# id -> (the caller's datetime, its fixed-offset copy) for the manifest validation in progress.  One
+# offset is read per object per call, so the same datetime supplied as both timestamps cannot be
+# given two different readings.  The original is retained so its id cannot be reused mid-call.
+_TIMESTAMP_PINS: ContextVar[dict[int, tuple[datetime, datetime]] | None] = ContextVar(
+    "_TIMESTAMP_PINS", default=None
+)
+
+
+@contextmanager
+def _pinned_timestamp_offsets() -> Iterator[None]:
+    """Open the per-call offset pins for one manifest validation (nested calls get their own).
+
+    A model-level validator cannot do this: it would hand JSON input to the strict field checks as
+    Python objects.  The two entry points that take Python objects open the scope instead.
+    """
+
+    token = _TIMESTAMP_PINS.set({})
+    try:
+        yield
+    finally:
+        _TIMESTAMP_PINS.reset(token)
+
+
 class RunManifest(_ManifestContract):
     """A reproducible benchmark run envelope with explicit evidence state."""
 
@@ -321,6 +346,19 @@ class RunManifest(_ManifestContract):
     finished_at: datetime | None = None
     measurements: tuple[TimingMeasurement, ...] = ()
 
+    def __init__(self, /, **data: Any) -> None:
+        with _pinned_timestamp_offsets():
+            super().__init__(**data)
+
+    # An ``__init__`` that is not marked as pass-through makes pydantic route JSON input through it
+    # as Python objects, which would defeat the strict JSON checks.
+    __init__.__pydantic_base_init__ = True  # type: ignore[attr-defined]
+
+    @classmethod
+    def model_validate(cls, obj: Any, *args: Any, **kwargs: Any) -> Self:
+        with _pinned_timestamp_offsets():
+            return super().model_validate(obj, *args, **kwargs)
+
     @field_validator("started_at", "finished_at")
     @classmethod
     def require_aware_timestamp(cls, value: datetime | None) -> datetime | None:
@@ -328,11 +366,18 @@ class RunManifest(_ManifestContract):
             return None
         # Read the caller's tzinfo once and keep an exact fixed-offset copy, so nothing later (the
         # ordering check, serialization) asks caller code again or sees a different answer.
+        pins = _TIMESTAMP_PINS.get()
+        pinned = pins.get(id(value)) if pins is not None else None
+        if pinned is not None and pinned[0] is value:
+            return pinned[1]
         try:
             offset = datetime.utcoffset(value)
             if offset is None:
                 raise ValueError("run timestamps must include an explicit UTC offset")
-            return datetime.replace(value, tzinfo=timezone(_exact_offset(offset)))
+            fixed = datetime.replace(value, tzinfo=timezone(_exact_offset(offset)))
+            if pins is not None:
+                pins[id(value)] = (value, fixed)
+            return fixed
         except ValueError:
             raise
         except Exception:  # a tzinfo is caller code: it can raise, or return something that is no offset

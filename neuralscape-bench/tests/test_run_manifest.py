@@ -4812,6 +4812,49 @@ def test_a_tzinfo_whose_offset_changes_between_reads_is_read_once_in_direct_cons
     assert kept.finished_at.utcoffset() == timedelta(hours=1) == kept.finished_at.utcoffset()
 
 
+@pytest.mark.parametrize(
+    "first,then",
+    [(timedelta(0), timedelta(hours=-5)), (timedelta(hours=-5), timedelta(0))],
+    ids=["utc-then-minus-five", "minus-five-then-utc"],
+)
+@pytest.mark.parametrize("entry", ["constructor", "model_validate"])
+def test_one_datetime_supplied_twice_is_read_with_one_offset_in_direct_construction(
+    entry, first, then
+) -> None:
+    fields = _finish().model_dump(mode="python")
+    shared = datetime(2026, 9, 28, 8, 0, tzinfo=_ScriptedTz([first, then]))
+    fields.update(started_at=shared, finished_at=shared)
+    kept = RunManifest(**fields) if entry == "constructor" else RunManifest.model_validate(fields)
+    assert kept.started_at == kept.finished_at  # identical inputs: a zero-length interval
+    assert kept.started_at.utcoffset() == first  # the first observed offset is kept
+    assert kept.finished_at.utcoffset() == first
+
+
+def test_the_offset_is_pinned_per_object_only_within_one_validation_call() -> None:
+    fields = _finish().model_dump(mode="python")
+    tz = _ScriptedTz([timedelta(hours=1), timedelta(hours=-5)])
+    shared = datetime(2026, 9, 28, 8, 0, tzinfo=tz)
+    fields.update(started_at=shared, finished_at=shared)
+    assert RunManifest.model_validate(fields).started_at.utcoffset() == timedelta(hours=1)
+    assert tz.calls == 1
+    # A later call reads the caller's tzinfo afresh: nothing is remembered between calls.
+    assert RunManifest.model_validate(fields).started_at.utcoffset() == timedelta(hours=-5)
+    assert tz.calls == 2
+
+
+def test_two_distinct_datetimes_are_each_read_in_direct_construction() -> None:
+    fields = _finish().model_dump(mode="python")
+    tz_a, tz_b = _ScriptedTz([timedelta(hours=1)]), _ScriptedTz([timedelta(hours=2)])
+    fields.update(
+        started_at=datetime(2026, 9, 28, 8, 0, tzinfo=tz_a),
+        finished_at=datetime(2026, 9, 28, 9, 0, tzinfo=tz_b),
+    )
+    kept = RunManifest.model_validate(fields)
+    assert (tz_a.calls, tz_b.calls) == (1, 1)
+    assert kept.started_at.utcoffset() == timedelta(hours=1)
+    assert kept.finished_at.utcoffset() == timedelta(hours=2)
+
+
 # ── capture is charged before it retains; one datetime gets one offset per call ──
 
 
