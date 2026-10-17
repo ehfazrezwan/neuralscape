@@ -1,0 +1,112 @@
+{
+  "version": 1,
+  "excluded_suites": [
+    "tests/test_async_pipeline.py"
+  ],
+  "profiles": {
+    "host": {
+      "skips": [
+        {
+          "test": "tests.test_baseline_reproductions::test_compose_backup_tooling_covers_every_persistent_volume",
+          "reason_contains": "the compose profile ships no backup tooling that"
+        },
+        {
+          "test": "tests.test_baseline_reproductions::test_distinct_emails_have_distinct_user_ids",
+          "reason_contains": "legacy email slugging collapses every disallowed"
+        },
+        {
+          "test": "tests.test_baseline_reproductions::test_distinct_namespace_tuples_have_distinct_group_ids",
+          "reason_contains": "legacy group ids join user and project with a de"
+        },
+        {
+          "test": "tests.test_baseline_reproductions::test_graph_removal_keeps_edges_supported_by_other_episodes",
+          "reason_contains": "removing an episode deletes every edge whose fir"
+        },
+        {
+          "test": "tests.test_baseline_reproductions::test_health_reports_an_unreachable_vector_store",
+          "reason_contains": "health marks the vector store 'ok' once its clie"
+        },
+        {
+          "test": "tests.test_baseline_reproductions::test_patch_request_carries_an_expected_revision",
+          "reason_contains": "the edit request has no revision or etag precond"
+        },
+        {
+          "test": "tests.test_baseline_reproductions::test_queued_graph_job_publishes_current_visibility",
+          "reason_contains": "the graph job publishes the visibility it was en"
+        },
+        {
+          "test": "tests.test_baseline_reproductions::test_raw_job_id_depends_on_category_and_tags",
+          "reason_contains": "the raw-write job id covers visibility, scope, p"
+        },
+        {
+          "test": "tests.test_baseline_reproductions::test_store_job_id_depends_on_project_and_agent_scope",
+          "reason_contains": "the extraction job id is built from message text"
+        },
+        {
+          "test": "tests.test_canonical_fqn_conformance::test_native_canonical_conformance_ge_98pct",
+          "reason_contains": "small-py corpus not present"
+        },
+        {
+          "test": "tests.test_contracts_pack::test_engine_port_contracts_are_registered_with_the_engines_owner",
+          "reason_contains": "engine_ports is not part of this tree"
+        },
+        {
+          "test": "tests.test_okf::test_ingest_real_ga4_sample_bundle_if_present",
+          "reason_contains": "knowledge-catalog sample bundle not available"
+        }
+      ]
+    },
+    "container": {
+      "skips": [
+        {
+          "test": "tests.test_baseline_reproductions::test_compose_backup_tooling_covers_every_persistent_volume",
+          "reason_contains": "the compose profile ships no backup tooling that"
+        },
+        {
+          "test": "tests.test_baseline_reproductions::test_distinct_emails_have_distinct_user_ids",
+          "reason_contains": "legacy email slugging collapses every disallowed"
+        },
+        {
+          "test": "tests.test_baseline_reproductions::test_distinct_namespace_tuples_have_distinct_group_ids",
+          "reason_contains": "legacy group ids join user and project with a de"
+        },
+        {
+          "test": "tests.test_baseline_reproductions::test_graph_removal_keeps_edges_supported_by_other_episodes",
+          "reason_contains": "removing an episode deletes every edge whose fir"
+        },
+        {
+          "test": "tests.test_baseline_reproductions::test_health_reports_an_unreachable_vector_store",
+          "reason_contains": "health marks the vector store 'ok' once its clie"
+        },
+        {
+          "test": "tests.test_baseline_reproductions::test_patch_request_carries_an_expected_revision",
+          "reason_contains": "the edit request has no revision or etag precond"
+        },
+        {
+          "test": "tests.test_baseline_reproductions::test_queued_graph_job_publishes_current_visibility",
+          "reason_contains": "the graph job publishes the visibility it was en"
+        },
+        {
+          "test": "tests.test_baseline_reproductions::test_raw_job_id_depends_on_category_and_tags",
+          "reason_contains": "the raw-write job id covers visibility, scope, p"
+        },
+        {
+          "test": "tests.test_baseline_reproductions::test_store_job_id_depends_on_project_and_agent_scope",
+          "reason_contains": "the extraction job id is built from message text"
+        },
+        {
+          "test": "tests.test_canonical_fqn_conformance::test_native_canonical_conformance_ge_98pct",
+          "reason_contains": "small-py corpus not present"
+        },
+        {
+          "test": "tests.test_contracts_pack::test_engine_port_contracts_are_registered_with_the_engines_owner",
+          "reason_contains": "engine_ports is not part of this tree"
+        },
+        {
+          "test": "tests.test_okf::test_ingest_real_ga4_sample_bundle_if_present",
+          "reason_contains": "knowledge-catalog sample bundle not available"
+        }
+      ]
+    }
+  }
+}
