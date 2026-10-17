@@ -4592,3 +4592,90 @@ def test_a_reach_tuple_that_reuses_a_scanned_id_is_still_scanned(monkeypatch) ->
     monkeypatch.setattr(reference_module, "id", colliding_id, raising=False)
     completed = _entry_flow(root)
     assert completed[2][0] == {"v": "b-first"}  # captured at exposure, not after the change
+
+
+def test_every_statement_field_is_judged_by_the_evaluator() -> None:
+    """A field added to ``PolicyStatement`` (a condition, a scope) qualifies the grant; until the
+    evaluator judges it and lists it, a statement setting it must not authorize anything."""
+
+    from contracts_policy import PolicyStatement
+    from contracts_policy_reference import _JUDGED_STATEMENT_FIELDS
+
+    assert set(PolicyStatement.model_fields) == set(_JUDGED_STATEMENT_FIELDS)
+
+
+def test_a_statement_with_an_unjudged_term_is_reported_and_one_at_its_default_is_not() -> None:
+    from typing import Optional
+
+    from pydantic import create_model
+
+    from contracts_policy import PolicyStatement
+    from contracts_policy_reference import _unjudged_terms
+
+    # a term no evaluator judges (named so it cannot collide with a real contract field)
+    Qualified = create_model(
+        "Qualified", __base__=PolicyStatement, unjudged_future_term=(Optional[dict], None)
+    )
+    base = statement("s", "allow", "read", reference("memory-1")).model_dump()
+    assert _unjudged_terms(Qualified(**base, unjudged_future_term={"kind": "x"})) == ("unjudged_future_term",)
+    assert _unjudged_terms(Qualified(**base)) == ()
+    assert _unjudged_terms(PolicyStatement(**base)) == ()
+
+
+def test_a_required_unjudged_term_is_reported_whatever_its_value_and_every_default_kind_is_honoured() -> None:
+    from typing import Optional
+
+    from pydantic import Field, create_model
+
+    from contracts_policy import PolicyStatement
+    from contracts_policy_reference import _unjudged_terms
+
+    base = statement("s", "allow", "read", reference("memory-1")).model_dump()
+
+    # required and nullable: it has no default, so supplying None sets it (None is not its default)
+    Required = create_model("Required", __base__=PolicyStatement, unjudged_required_term=(Optional[dict], ...))
+    assert _unjudged_terms(Required(**base, unjudged_required_term=None)) == ("unjudged_required_term",)
+    assert _unjudged_terms(Required(**base, unjudged_required_term={"kind": "x"})) == ("unjudged_required_term",)
+
+    # optional with a non-None default: only a different value is a term
+    Limited = create_model("Limited", __base__=PolicyStatement, unjudged_limit_term=(int, 5))
+    assert _unjudged_terms(Limited(**base)) == ()
+    assert _unjudged_terms(Limited(**base, unjudged_limit_term=5)) == ()
+    assert _unjudged_terms(Limited(**base, unjudged_limit_term=6)) == ("unjudged_limit_term",)
+
+    # optional with a default factory: compared with what the factory produces
+    Listed = create_model(
+        "Listed", __base__=PolicyStatement, unjudged_list_term=(list[str], Field(default_factory=list))
+    )
+    assert _unjudged_terms(Listed(**base)) == ()
+    assert _unjudged_terms(Listed(**base, unjudged_list_term=["x"])) == ("unjudged_list_term",)
+
+
+def test_a_reach_tuple_is_scanned_and_charged_once_per_capture() -> None:
+    """A list of 1,000 mapping proxies, reachable from the root and exposed by each of 60 pairs: its
+    reach tuple is scanned (and charged) once per capture.  Each pair still walks the list it exposes
+    (about 2,100 edges per pair, 126,065 in all), so a rescan of the reach tuple for every pair (1,000
+    more each) would exceed the standard edge budget; this pins both the skip and the single charge."""
+
+    proxies = [MappingProxyType({"k": index}) for index in range(1_000)]
+
+    def pairs():
+        for index in range(60):
+            yield (f"k{index}", proxies)
+
+    budget_edges = []
+    original = DiscoveryBudget.charge_edge
+
+    def counting(self, count=1):
+        budget_edges.append(count)
+        return original(self, count)
+
+    import contracts_limits
+
+    contracts_limits.DiscoveryBudget.charge_edge = counting
+    try:
+        _entry_flow((proxies, _Items(pairs)))
+    finally:
+        contracts_limits.DiscoveryBudget.charge_edge = original
+    total = sum(budget_edges)
+    assert total <= 127_000, total  # inside the 131,072-edge budget only if the reach tuple is charged once
