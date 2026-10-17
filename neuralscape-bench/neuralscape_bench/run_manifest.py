@@ -73,6 +73,9 @@ class _FrozenGraph(NamedTuple):
     native_containers: dict[int, tuple[object, tuple[Any, ...]]]
     replay_entries: dict[int, tuple[object, tuple[Any, ...]]]
     completed_traversals: dict[int, object]
+    # id -> containers on the longest path below a completed subtree (itself included): a later wrapper
+    # reaching it is not walked again but is still depth-checked where it is reached.
+    completed_heights: dict[int, int]
     extra_mapping_owners: dict[int, Mapping[Any, Any]]
     extra_mapping_queue: list[Mapping[Any, Any]]
     extra_mapping_cursor: list[int]
@@ -651,6 +654,7 @@ def _freeze_model_storage(
         if existing_replay is not None and existing_replay[0] is current:
             continue
         frozen_graph.completed_traversals.pop(identity, None)
+        frozen_graph.completed_heights.pop(identity, None)
         frozen_graph.completed_mapping_discoveries.pop(identity, None)
 
         if _is_subclass(value_type, BaseModel):
@@ -752,22 +756,45 @@ def _traverse_model_storage(
     frozen_graph: _FrozenGraph,
     visited: set[int],
 ) -> None:
-    """Retain historical native-recursion failures at validation order."""
+    """Retain historical native-recursion failures at validation order.
 
-    traversed: dict[int, object] = {}
+    A subtree already walked (in this call or an earlier one on the same graph) is not walked again:
+    its recorded height is added to the depth where it is reached, so a subtree first seen shallow
+    and reached deep later is still refused, and the replay work of a call is bounded by the
+    containers it has not seen.
+    """
+
+    heights: dict[int, int] = {}
     depth = [0]
 
-    def visit(current: Any) -> None:
+    def visit(current: Any) -> int:
+        """The height of ``current`` in containers (0 for a leaf)."""
+
         value_type = type(current)
         is_native_container = _is_subclass(
             value_type, (BaseModel, tuple, list, dict)
         )
         if not is_native_container:
-            return
+            return 0
 
         identity = id(current)
         if identity in visited:
-            return
+            known = heights.get(identity)
+            if known is not None and depth[0] + known > MAX_SNAPSHOT_DEPTH:
+                raise ValueError(SNAPSHOT_BUDGET_MESSAGE)
+            return known if known is not None else 0
+        completed_height = frozen_graph.completed_heights.get(identity)
+        # The root is always walked (its own entries); only the subtrees below it are reused.
+        if (
+            depth[0] > 0
+            and completed_height is not None
+            and frozen_graph.completed_traversals.get(identity) is current
+        ):
+            visited.add(identity)
+            heights[identity] = completed_height
+            if depth[0] + completed_height > MAX_SNAPSHOT_DEPTH:
+                raise ValueError(SNAPSHOT_BUDGET_MESSAGE)
+            return completed_height
         visited.add(identity)
 
         frozen_replay = frozen_graph.replay_entries.get(identity)
@@ -775,18 +802,25 @@ def _traverse_model_storage(
             _freeze_model_storage(current, frozen_graph, set())
             frozen_replay = frozen_graph.replay_entries[identity]
         owner, entries = frozen_replay
-        traversed[identity] = owner
         # The walk recurses; the snapshot's depth bound applies here too, so nesting deeper than
         # the manifest allows is a stable budget error and never a RecursionError.
         depth[0] += 1
         if depth[0] > MAX_SNAPSHOT_DEPTH:
             raise ValueError(SNAPSHOT_BUDGET_MESSAGE)
+        height = 0
         for item in entries:
-            visit(item)
+            height = max(height, visit(item))
         depth[0] -= 1
+        heights[identity] = height + 1
+        traversed[identity] = owner
+        traversed_heights[identity] = height + 1
+        return height + 1
 
+    traversed: dict[int, object] = {}
+    traversed_heights: dict[int, int] = {}
     visit(value)
     frozen_graph.completed_traversals.update(traversed)
+    frozen_graph.completed_heights.update(traversed_heights)
 
 
 def _protect_yielded_model_storage(
@@ -805,8 +839,7 @@ def _protect_yielded_model_storage(
         _freeze_model_storage(value, frozen_graph, set())
         _inventory_retained_extra_mappings(frozen_graph)
 
-    completed_owner = frozen_graph.completed_traversals.get(identity)
-    if completed_owner is value:
+    if frozen_graph.completed_traversals.get(identity) is value:
         return False
 
     _traverse_model_storage(value, frozen_graph, set())
@@ -1125,6 +1158,7 @@ def _freeze_model_graphs(*values: Any) -> _FrozenGraph:
         native_containers={},
         replay_entries={},
         completed_traversals={},
+        completed_heights={},
         extra_mapping_owners={},
         extra_mapping_queue=[],
         extra_mapping_cursor=[0],

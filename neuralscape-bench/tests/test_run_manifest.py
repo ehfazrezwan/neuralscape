@@ -4855,6 +4855,81 @@ def test_two_distinct_datetimes_are_each_read_in_direct_construction() -> None:
     assert kept.finished_at.utcoffset() == timedelta(hours=2)
 
 
+class _WrapperView(tuple):
+    """A tuple whose public view yields fresh wrappers, each around the same shared subtree."""
+
+    def __iter__(self):
+        return iter(self.wrappers())
+
+
+def _wrapper_view(make_wrappers):
+    view_type = type("WrapperView", (_WrapperView,), {"wrappers": staticmethod(make_wrappers)})
+    return view_type()
+
+
+def _nested(depth: int, leaf: object = 0) -> list[object]:
+    value: list[object] = [leaf]
+    for _index in range(depth - 1):
+        value = [value]
+    return value
+
+
+def _enclosed(depth: int, inner: object) -> object:
+    for _index in range(depth):
+        inner = (inner,)
+    return inner
+
+
+def test_wrappers_around_one_shared_subtree_do_not_replay_it(monkeypatch) -> None:
+    shared = list(range(1_000))
+    counted = [0]
+    original = run_manifest_module._is_subclass
+
+    def counting(*args):
+        counted[0] += 1
+        return original(*args)
+
+    monkeypatch.setattr(run_manifest_module, "_is_subclass", counting)
+
+    def work(wrappers: int) -> int:
+        counted[0] = 0
+        graph = run_manifest_module._freeze_model_graphs(
+            _wrapper_view(lambda: [(shared,) for _ in range(wrappers)])
+        )
+        assert graph.visits[0] == wrappers
+        return counted[0]
+
+    few, many = work(20), work(80)
+    # Each added wrapper costs a constant number of checks; replaying the 1,000-element subtree
+    # for every wrapper would add about a thousand.
+    assert (many - few) / 60 < 100
+
+
+@pytest.mark.parametrize("shallow_first", [True, False], ids=["shallow-first", "deep-first"])
+def test_a_shared_subtree_reached_deep_is_depth_checked_in_either_order(shallow_first) -> None:
+    shared = _nested(40)  # 40 levels: fine alone, too deep below a 40-level wrapper
+    shallow, deep = (shared,), _enclosed(40, shared)
+
+    def wrappers():
+        return [shallow, deep] if shallow_first else [deep, shallow]
+
+    view = _wrapper_view(wrappers)
+    graph = run_manifest_module._freeze_model_graphs(view)
+    failure = graph.public_sequences[id(view)].failure
+    assert isinstance(failure, ValueError)
+    assert run_manifest_module.SNAPSHOT_BUDGET_MESSAGE in str(failure)
+    with pytest.raises(ValueError, match=run_manifest_module.SNAPSHOT_BUDGET_MESSAGE):
+        run_manifest_module._snapshot_native(view, _frozen_graph=graph)
+
+
+def test_a_shared_subtree_reached_only_within_the_depth_bound_is_accepted() -> None:
+    shared = _nested(20)
+    view = _wrapper_view(lambda: [(shared,), _enclosed(20, shared), (shared,)])
+    graph = run_manifest_module._freeze_model_graphs(view)
+    assert graph.public_sequences[id(view)].failure is None
+    assert graph.visits[0] == 3
+
+
 # ── capture is charged before it retains; one datetime gets one offset per call ──
 
 
