@@ -120,12 +120,16 @@ class EvidenceWriter:
         partial_tail = bool(raw) and not raw.endswith(b"\n")
         records: list[EvidenceRecord] = []
         invalid: list[int] = []
-        for number, line in enumerate(raw.decode("utf-8", "replace").split("\n"), start=1):
-            if not line.strip():
+        for number, chunk in enumerate(raw.split(b"\n"), start=1):
+            if not chunk.strip():
                 continue
             try:
+                # strict, per line: a replacement character would let corrupted text pass as a valid field
+                line = chunk.decode("utf-8")
+                if not line.strip():
+                    continue
                 records.append(EvidenceRecord.model_validate_json(line))
-            except (ValidationError, ValueError):
+            except (ValidationError, ValueError):   # UnicodeDecodeError is a ValueError
                 invalid.append(number)
         return ReadResult(tuple(records), tuple(invalid), partial_tail)
 

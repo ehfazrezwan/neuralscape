@@ -98,15 +98,34 @@ def project_preference() -> dict[str, str]:
     }
 
 
+def _is_missing_field(error: Exception, field: str) -> bool:
+    """True for a validation error whose only complaint is that ``field`` was not supplied."""
+
+    errors = getattr(error, "errors", None)
+    if not callable(errors):
+        return False
+    try:
+        details = errors()
+        return bool(details) and all(item.get("type") == "missing" and tuple(item.get("loc", ())) == (field,) for item in details)
+    except Exception:  # noqa: BLE001 - an unreadable error is not a recognised refusal
+        return False
+
+
 def citation_resolution() -> dict[str, str]:
     """Cam follows a citation: a handle names its tenant, and a foreign handle can be told apart."""
 
     references = _need("contracts_references")
     handle = references.ReferenceHandle
+    # A refusal only means something next to a success: a tenant-scoped handle must be accepted first.
+    # A failure here (or any failure that is not the missing tenant below) propagates and is recorded
+    # as an invalid attempt, never as a refusal.
+    handle(kind="memory", id="memory-2", tenant_id="tenant-1", resolver="resolve_memory")
     try:
         handle(kind="memory", id="memory-1", resolver="resolve_memory")
         without_tenant = "accepted"
-    except Exception:  # noqa: BLE001 - any validation failure is a refusal
+    except Exception as error:  # noqa: BLE001 - narrowed below: only a missing-tenant error is a refusal
+        if not _is_missing_field(error, "tenant_id"):
+            raise
         without_tenant = "refused"
     return {
         "handle_without_tenant": without_tenant,
