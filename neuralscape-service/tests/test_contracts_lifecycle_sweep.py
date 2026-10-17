@@ -1152,8 +1152,9 @@ def test_the_member_index_is_charged_to_the_discovery_budget_once_per_class():
     budget = DiscoveryBudget(contracts_lifecycle.LIFECYCLE_TIER)
     contracts_lifecycle._capture_native_contract_graph((large.M499,) * 400, budget=budget)
     mro_length = len(type.__dict__["__mro__"].__get__(large))
-    # the tuple, its items, one class walk, one namespace scan, the member map's lookup, one member index
-    assert budget.edges == 1 + 400 + mro_length + _namespace_charge(large) + len(vars(large)) + 500
+    # the tuple, its items, two class walks (graph kind, leaf verdict), one namespace scan, the member map's
+    # lookup, one member index
+    assert budget.edges == 1 + 400 + 2 * mro_length + _namespace_charge(large) + len(vars(large)) + 500
 
 
 def test_an_enum_with_more_members_than_the_budget_allows_is_refused():
@@ -1209,7 +1210,8 @@ def test_a_leaf_class_mro_is_charged_to_the_discovery_budget_once_per_class():
     mro_length = len(type.__dict__["__mro__"].__get__(kind))
     budget = DiscoveryBudget(contracts_lifecycle.LIFECYCLE_TIER)
     contracts_lifecycle._capture_native_contract_graph((kind("a"),) * 400, budget=budget)
-    assert budget.edges == 1 + 400 + mro_length + _namespace_charge(kind)
+    # the tuple, its items, two class walks (graph kind, leaf verdict), one namespace scan
+    assert budget.edges == 1 + 400 + 2 * mro_length + _namespace_charge(kind)
 
 
 def test_a_leaf_class_changed_by_a_view_is_classified_again_for_items_captured_after_it():
@@ -2470,3 +2472,64 @@ def test_every_instance_of_a_deep_model_class_is_charged_for_its_native_storage_
 
     per_receipt = (charged(deep, 101) - charged(deep, 1)) - (charged(StageReceipt, 101) - charged(StageReceipt, 1))
     assert per_receipt >= 100 * (256 >> 6), per_receipt  # about one edge per 64 classes, for each receipt
+
+
+def test_each_new_container_class_walk_is_charged_by_its_depth():
+    """Classifying a container's class (model, dict, list or tuple) walks its real MRO once per class per call:
+    N distinct subclasses of one deep dict class are charged for N walks of that depth, not one edge each."""
+
+    from contracts_limits import DiscoveryBudget
+
+    def charged(depth: int, count: int = 200) -> int:
+        base: type = dict
+        for index in range(depth):
+            base = type(f"Mapping{index}", (base,), {})
+        value = [type(f"Leafy{index}", (base,), {})() for index in range(count)]
+        budget = DiscoveryBudget(contracts_lifecycle.LIFECYCLE_TIER)
+        contracts_lifecycle._capture_native_contract_graph(value, budget=budget)
+        return budget.edges
+
+    assert charged(300) - charged(1) >= 200 * 299  # each of the 200 walks is charged its 300 extra classes
+
+
+def test_field_table_keys_of_one_deep_text_class_walk_it_once_and_are_charged(monkeypatch):
+    """The declared-field scan copies each key's text; keys sharing a deeply derived ``str`` class walk that class
+    once per call (charged), not once per key."""
+
+    from tests.test_contracts_lifecycle import intent_with_requirements, requirement, source
+
+    deep = _deep_text_class(200)
+    table = {deep(f"field{index}"): None for index in range(500)}
+    table.update(SourceVersion.__pydantic_fields__)
+    kind = type("WideKeys", (SourceVersion,), {})
+    type.__setattr__(kind, "__pydantic_fields__", table)
+    item = SourceVersion.model_construct(**vars(source("w")))
+    object.__setattr__(item, "__class__", kind)
+    EXTRA.__set__(item, {"extra_note": 1})  # forces the declared-name check
+    command = intent_with_requirements(requirement(ProcessingStage.CANONICAL))
+    applied = receipt(ProcessingStage.CANONICAL, StageStatus.APPLIED)
+    set_native(applied, "applied_sources", (item,))
+    reads = _count_mro_reads(monkeypatch, {deep})
+    with pytest.raises(ValueError):
+        contracts_lifecycle.validate_stage_receipts(command, (applied,))
+    assert len(reads) <= 1, len(reads)
+
+
+def test_namespace_keys_of_one_deep_text_class_walk_it_once_and_are_charged(monkeypatch):
+    """The impersonation scan reads every key of a leaf class's namespace; keys sharing a deeply derived ``str``
+    class walk that class once per call (charged), not once per key."""
+
+    from contracts_limits import DiscoveryBudget
+
+    deep = _deep_text_class(200)
+    namespace = {deep(f"name{index}"): index for index in range(500)}
+    leafy = type("Leafy", (str,), namespace)
+    reads = _count_mro_reads(monkeypatch, {deep})
+    budget = DiscoveryBudget(contracts_lifecycle.LIFECYCLE_TIER)
+    contracts_lifecycle._capture_native_contract_graph((leafy("x"),), budget=budget)
+    assert len(reads) <= 1, len(reads)
+    monkeypatch.undo()
+    shallow = type("Leafy", (str,), {str(key): value for key, value in namespace.items()})
+    flat = DiscoveryBudget(contracts_lifecycle.LIFECYCLE_TIER)
+    contracts_lifecycle._capture_native_contract_graph((shallow("x"),), budget=flat)
+    assert budget.edges - flat.edges >= 200  # the deep key class's one walk is charged

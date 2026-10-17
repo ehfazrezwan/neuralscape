@@ -308,7 +308,11 @@ def _declared_field_names(model_type: type, captured_by_identity: dict[Any, Any]
         fields = _namespace_value(_TYPE_NAMESPACE.__get__(base), "__pydantic_fields__", budget)
         if type(fields) is dict:
             budget.charge_edge(dict.__len__(fields))  # one edge per declared name read
-            names = frozenset(str.__str__(key) for key in dict.keys(fields) if _derives_from(type(key), (str,)))
+            names = frozenset(
+                str.__str__(key)
+                for key in dict.keys(fields)
+                if type(key) is str or _is_text_key_class(type(key), captured_by_identity, budget)
+            )
             break
     captured_by_identity[(_FIELDS, id(model_type))] = (model_type, names, generation)
     return names
@@ -317,18 +321,22 @@ def _declared_field_names(model_type: type, captured_by_identity: dict[Any, Any]
 _GRAPH_KIND = "graph-kind"  # memo key prefix: whether a class is a model, dict, list, tuple or a leaf
 
 
-def _graph_kind(kind: type, captured_by_identity: dict[Any, Any]) -> type | None:
+def _graph_kind(kind: type, captured_by_identity: dict[Any, Any], budget: DiscoveryBudget) -> type | None:
     """``BaseModel``, ``dict``, ``list`` or ``tuple`` when ``kind`` derives from it (in that order), else
-    ``None``; decided from the real MRO once per class and call.  The answer cannot change within a call:
-    CPython refuses a ``__bases__`` assignment that moves a class between these instance layouts, so the
-    memo needs no generation (a view stepping item by item would otherwise re-walk the MRO per item)."""
+    ``None``; decided from the real MRO once per class and call, charged one edge per class in it before the
+    walk.  The answer cannot change within a call: CPython refuses a ``__bases__`` assignment that moves a
+    class between these instance layouts, so the memo needs no generation (a view stepping item by item would
+    otherwise re-walk the MRO per item).  Exact containers and exact native scalars need no walk."""
 
     if kind is dict or kind is list or kind is tuple:
         return kind
+    if _is_exact_native_kind(kind):
+        return None
     memo = captured_by_identity.get((_GRAPH_KIND, id(kind)))
     if memo is not None and memo[0] is kind:
         return memo[1]
     mro = _TYPE_MRO.__get__(kind)
+    budget.charge_edge(tuple.__len__(mro))
     found = next((wanted for wanted in (BaseModel, dict, list, tuple) if any(base is wanted for base in mro)), None)
     captured_by_identity[(_GRAPH_KIND, id(kind))] = (kind, found)
     return found
@@ -403,7 +411,7 @@ _TYPE_FLAGS = type.__dict__["__flags__"]
 _HEAP_TYPE = 1 << 9  # Py_TPFLAGS_HEAPTYPE: a class created by a class statement (or ``type(...)``)
 
 
-def _claims_another_class(kind: type, budget: DiscoveryBudget) -> bool:
+def _claims_another_class(kind: type, captured_by_identity: dict[Any, Any], budget: DiscoveryBudget) -> bool:
     """Whether a class written in Python in ``kind``'s MRO defines ``__class__`` or ``__getattribute__``.
 
     Those are the two ways an object answers ``isinstance`` with a class it is not, or redirects the
@@ -413,7 +421,7 @@ def _claims_another_class(kind: type, budget: DiscoveryBudget) -> bool:
     slots define these names, are fixed); flags and namespaces are read natively, so no hook runs.
     A namespace can keep a ``str``-subclass key whose hash collides with a hook name, so the names are not
     looked up (that would call the stored key's ``__eq__``): every key is copied to exact text and
-    compared, and the scan is charged one edge per key.
+    compared, and the scan is charged one edge per key; a subclass key's class is judged once per call (charged).
     """
 
     for base in _TYPE_MRO.__get__(kind):
@@ -422,7 +430,9 @@ def _claims_another_class(kind: type, budget: DiscoveryBudget) -> bool:
         namespace = _TYPE_NAMESPACE.__get__(base)
         budget.charge_edge(len(namespace))
         for key in namespace:
-            if _derives_from(type(key), (str,)) and str.__str__(key) in _IMPERSONATION_HOOKS:
+            if (
+                type(key) is str or _is_text_key_class(type(key), captured_by_identity, budget)
+            ) and str.__str__(key) in _IMPERSONATION_HOOKS:
                 return True
     return False
 
@@ -456,7 +466,7 @@ def _leaf_class_verdict(
         return memo[1]
     mro = _TYPE_MRO.__get__(kind)
     budget.charge_edge(tuple.__len__(mro))
-    if _claims_another_class(kind, budget):
+    if _claims_another_class(kind, captured_by_identity, budget):
         verdict = "refused"
     elif any(base is Enum for base in mro):
         verdict = "enum"
@@ -534,7 +544,7 @@ def _capture_native_contract_graph(
         budget = DiscoveryBudget()
     budget.charge_edge()
 
-    graph_kind = _graph_kind(value_type, captured_by_identity)
+    graph_kind = _graph_kind(value_type, captured_by_identity, budget)
     if graph_kind is not None:
         identity = id(value)
         if identity in active_containers:
@@ -662,7 +672,7 @@ def _observed_public_view(
 
     def public_item(item: object) -> _CapturedGraph:
         item_type = type(item)
-        if _graph_kind(item_type, captured_by_identity) is not None:
+        if _graph_kind(item_type, captured_by_identity, budget) is not None:
             frozen = _cached_identity_capture(item, captured_by_identity)
             if frozen is not None:
                 # A cache hit is still one public item read: charged, so a view that keeps
@@ -995,13 +1005,13 @@ def _derives_once(
     is not recycled).  A class's bases cannot change across native layouts, so no generation is needed."""
 
     known = captured_by_identity.get((_DERIVES, id(kind), id(wanted)))
-    if known is not None and known[0] is kind:
+    if known is not None and known[0] is kind and known[2] is wanted:
         return known[1]
     mro = _TYPE_MRO.__get__(kind)
     if budget is not None:
         budget.charge_edge(tuple.__len__(mro))
     verdict = any(base is wanted for base in mro)
-    captured_by_identity[(_DERIVES, id(kind), id(wanted))] = (kind, verdict)
+    captured_by_identity[(_DERIVES, id(kind), id(wanted))] = (kind, verdict, wanted)
     return verdict
 
 
