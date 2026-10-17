@@ -3956,3 +3956,23 @@ def test_the_shared_budget_still_refuses_a_call_whose_nested_instances_exceed_it
     document["files"] = files
     with pytest.raises(ValidationError, match="discovery budget"):
         validate_portable_manifest(document)
+
+
+def test_a_refusal_by_the_schema_never_renders_a_caller_object() -> None:
+    """An object the traversal leaves to the schema is not carried into the refusal and rendered."""
+
+    class Loud:
+        calls = 0
+
+        def __repr__(self) -> str:
+            Loud.calls += 1
+            return "LOUD" * 100_000
+
+    document = valid_manifest()
+    document["manifest_id"] = Loud()
+    with pytest.raises(ValidationError) as raised:
+        validate_portable_manifest(document)
+    Loud.calls = 0
+    text = str(raised.value) + repr(raised.value) + raised.value.json()
+    assert Loud.calls == 0 and "LOUD" not in text
+    assert any(error["loc"][:1] == ("manifest_id",) for error in raised.value.errors())
