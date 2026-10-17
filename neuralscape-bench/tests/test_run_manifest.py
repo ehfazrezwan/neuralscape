@@ -4812,6 +4812,124 @@ def test_a_tzinfo_whose_offset_changes_between_reads_is_read_once_in_direct_cons
     assert kept.finished_at.utcoffset() == timedelta(hours=1) == kept.finished_at.utcoffset()
 
 
+@pytest.mark.parametrize(
+    "first,then",
+    [(timedelta(0), timedelta(hours=-5)), (timedelta(hours=-5), timedelta(0))],
+    ids=["utc-then-minus-five", "minus-five-then-utc"],
+)
+@pytest.mark.parametrize("entry", ["constructor", "model_validate"])
+def test_one_datetime_supplied_twice_is_read_with_one_offset_in_direct_construction(
+    entry, first, then
+) -> None:
+    fields = _finish().model_dump(mode="python")
+    shared = datetime(2026, 9, 28, 8, 0, tzinfo=_ScriptedTz([first, then]))
+    fields.update(started_at=shared, finished_at=shared)
+    kept = RunManifest(**fields) if entry == "constructor" else RunManifest.model_validate(fields)
+    assert kept.started_at == kept.finished_at  # identical inputs: a zero-length interval
+    assert kept.started_at.utcoffset() == first  # the first observed offset is kept
+    assert kept.finished_at.utcoffset() == first
+
+
+def test_the_offset_is_pinned_per_object_only_within_one_validation_call() -> None:
+    fields = _finish().model_dump(mode="python")
+    tz = _ScriptedTz([timedelta(hours=1), timedelta(hours=-5)])
+    shared = datetime(2026, 9, 28, 8, 0, tzinfo=tz)
+    fields.update(started_at=shared, finished_at=shared)
+    assert RunManifest.model_validate(fields).started_at.utcoffset() == timedelta(hours=1)
+    assert tz.calls == 1
+    # A later call reads the caller's tzinfo afresh: nothing is remembered between calls.
+    assert RunManifest.model_validate(fields).started_at.utcoffset() == timedelta(hours=-5)
+    assert tz.calls == 2
+
+
+def test_two_distinct_datetimes_are_each_read_in_direct_construction() -> None:
+    fields = _finish().model_dump(mode="python")
+    tz_a, tz_b = _ScriptedTz([timedelta(hours=1)]), _ScriptedTz([timedelta(hours=2)])
+    fields.update(
+        started_at=datetime(2026, 9, 28, 8, 0, tzinfo=tz_a),
+        finished_at=datetime(2026, 9, 28, 9, 0, tzinfo=tz_b),
+    )
+    kept = RunManifest.model_validate(fields)
+    assert (tz_a.calls, tz_b.calls) == (1, 1)
+    assert kept.started_at.utcoffset() == timedelta(hours=1)
+    assert kept.finished_at.utcoffset() == timedelta(hours=2)
+
+
+class _WrapperView(tuple):
+    """A tuple whose public view yields fresh wrappers, each around the same shared subtree."""
+
+    def __iter__(self):
+        return iter(self.wrappers())
+
+
+def _wrapper_view(make_wrappers):
+    view_type = type("WrapperView", (_WrapperView,), {"wrappers": staticmethod(make_wrappers)})
+    return view_type()
+
+
+def _nested(depth: int, leaf: object = 0) -> list[object]:
+    value: list[object] = [leaf]
+    for _index in range(depth - 1):
+        value = [value]
+    return value
+
+
+def _enclosed(depth: int, inner: object) -> object:
+    for _index in range(depth):
+        inner = (inner,)
+    return inner
+
+
+def test_wrappers_around_one_shared_subtree_do_not_replay_it(monkeypatch) -> None:
+    shared = list(range(1_000))
+    counted = [0]
+    original = run_manifest_module._is_subclass
+
+    def counting(*args):
+        counted[0] += 1
+        return original(*args)
+
+    monkeypatch.setattr(run_manifest_module, "_is_subclass", counting)
+
+    def work(wrappers: int) -> int:
+        counted[0] = 0
+        graph = run_manifest_module._freeze_model_graphs(
+            _wrapper_view(lambda: [(shared,) for _ in range(wrappers)])
+        )
+        assert graph.visits[0] == wrappers
+        return counted[0]
+
+    few, many = work(20), work(80)
+    # Each added wrapper costs a constant number of checks; replaying the 1,000-element subtree
+    # for every wrapper would add about a thousand.
+    assert (many - few) / 60 < 100
+
+
+@pytest.mark.parametrize("shallow_first", [True, False], ids=["shallow-first", "deep-first"])
+def test_a_shared_subtree_reached_deep_is_depth_checked_in_either_order(shallow_first) -> None:
+    shared = _nested(40)  # 40 levels: fine alone, too deep below a 40-level wrapper
+    shallow, deep = (shared,), _enclosed(40, shared)
+
+    def wrappers():
+        return [shallow, deep] if shallow_first else [deep, shallow]
+
+    view = _wrapper_view(wrappers)
+    graph = run_manifest_module._freeze_model_graphs(view)
+    failure = graph.public_sequences[id(view)].failure
+    assert isinstance(failure, ValueError)
+    assert run_manifest_module.SNAPSHOT_BUDGET_MESSAGE in str(failure)
+    with pytest.raises(ValueError, match=run_manifest_module.SNAPSHOT_BUDGET_MESSAGE):
+        run_manifest_module._snapshot_native(view, _frozen_graph=graph)
+
+
+def test_a_shared_subtree_reached_only_within_the_depth_bound_is_accepted() -> None:
+    shared = _nested(20)
+    view = _wrapper_view(lambda: [(shared,), _enclosed(20, shared), (shared,)])
+    graph = run_manifest_module._freeze_model_graphs(view)
+    assert graph.public_sequences[id(view)].failure is None
+    assert graph.visits[0] == 3
+
+
 # ── capture is charged before it retains; one datetime gets one offset per call ──
 
 
@@ -4947,3 +5065,583 @@ def test_native_entries_across_containers_are_bounded_together_before_any_is_cop
     finally:
         tracemalloc.stop()
     assert peak < 2_000_000, peak  # about 66 of the 100 lists were counted and copied, not all of them plus a snapshot
+
+
+# ---- one offset reading per datetime on every construction path
+
+class _FlipZone(tzinfo):
+    """Answers one offset on the first read and another afterwards (outside the envelope)."""
+
+    def __init__(self, first, later):
+        self.reads, self.first, self.later = 0, first, later
+
+    def utcoffset(self, dt):
+        self.reads += 1
+        return self.first if self.reads == 1 else self.later
+
+    def dst(self, dt):
+        return timedelta(0)
+
+def _completed_with_one_instant(zone):
+    data = completed_manifest().model_dump()
+    when = datetime(2026, 10, 1, 8, 0, tzinfo=zone)
+    data["started_at"] = data["finished_at"] = when
+    return data
+
+class _Envelope(BaseModel):
+    manifest: RunManifest
+
+@pytest.mark.parametrize("first, later", [(timedelta(hours=-5), timedelta(0)), (timedelta(0), timedelta(hours=-5))])
+@pytest.mark.parametrize("path", ["type_adapter", "nested_model", "list_of_manifests"])
+def test_one_datetime_supplied_twice_is_read_once_on_every_construction_path(path, first, later):
+    """A TypeAdapter or an enclosing model does not run RunManifest's own entry points; the same instant must
+    still be one reading (neither refused as reversed nor accepted as a five-hour run)."""
+
+    zone = _FlipZone(first, later)
+    data = _completed_with_one_instant(zone)
+    if path == "type_adapter":
+        manifest = pydantic.TypeAdapter(RunManifest).validate_python(data)
+    elif path == "nested_model":
+        manifest = _Envelope.model_validate({"manifest": data}).manifest
+    else:
+        manifest = pydantic.TypeAdapter(list[RunManifest]).validate_python([data, _completed_with_one_instant(_FlipZone(first, later))])[0]
+    assert manifest.started_at == manifest.finished_at
+    assert zone.reads == 1
+
+def test_two_distinct_datetimes_are_each_read_once_on_a_type_adapter():
+    data = completed_manifest().model_dump()
+    start_zone, finish_zone = _FlipZone(timedelta(0), timedelta(0)), _FlipZone(timedelta(0), timedelta(0))
+    data["started_at"] = datetime(2026, 10, 1, 8, 0, tzinfo=start_zone)
+    data["finished_at"] = datetime(2026, 10, 1, 9, 0, tzinfo=finish_zone)
+    manifest = pydantic.TypeAdapter(RunManifest).validate_python(data)
+    assert manifest.finished_at - manifest.started_at == timedelta(hours=1)
+    assert (start_zone.reads, finish_zone.reads) == (1, 1)
+
+
+def _refuse_started_at_only() -> Callable[[], tzinfo | None]:
+    import weakref
+
+    zone = _FlipZone(timedelta(0), timedelta(0))
+    data = completed_manifest().model_dump()
+    data["started_at"] = datetime(2026, 10, 1, 8, 0, tzinfo=zone)
+    data.pop("finished_at")
+    # The record is refused (a finished run needs both); pytest.raises would keep the traceback alive.
+    refused = False
+    try:
+        pydantic.TypeAdapter(RunManifest).validate_python(data)
+    except ValidationError as error:
+        refused = "requires started_at and finished_at" in str(error)
+    assert refused
+    return weakref.ref(zone)
+
+
+def test_started_at_without_finished_at_does_not_keep_the_caller_datetime():
+    """The pairing slot must not hold the caller's datetime past the manifest it came from."""
+    import gc
+
+    gone = _refuse_started_at_only()
+    gc.collect()
+    assert gone() is None
+
+
+# ---- datetime subclasses are kept as exact datetimes
+
+
+class _HookedDatetime(datetime):
+    hooks = 0
+
+    def __new__(cls, *args, **kwargs):
+        _HookedDatetime.hooks += 1
+        return super().__new__(cls, *args, **kwargs)
+
+    def __sub__(self, other):
+        _HookedDatetime.hooks += 1
+        return timedelta(days=-1)
+
+    def replace(self, *args, **kwargs):
+        _HookedDatetime.hooks += 1
+        return super().replace(*args, **kwargs)
+
+
+@pytest.mark.parametrize("path", ["init", "model_validate", "type_adapter"])
+def test_datetime_subclass_runs_no_caller_code_and_is_stored_as_an_exact_datetime(path):
+    start = _HookedDatetime(2026, 10, 1, 8, 0, 5, 7, tzinfo=timezone(timedelta(hours=2)), fold=1)
+    finish = _HookedDatetime(2026, 10, 1, 9, 0, tzinfo=timezone.utc)
+    data = {**completed_manifest().model_dump(), "started_at": start, "finished_at": finish}
+    _HookedDatetime.hooks = 0
+    if path == "init":
+        manifest = RunManifest(**data)
+    elif path == "model_validate":
+        manifest = RunManifest.model_validate(data)
+    else:
+        manifest = pydantic.TypeAdapter(RunManifest).validate_python(data)
+    assert _HookedDatetime.hooks == 0
+    assert type(manifest.started_at) is datetime and type(manifest.finished_at) is datetime
+    assert manifest.started_at == datetime(2026, 10, 1, 8, 0, 5, 7, tzinfo=timezone(timedelta(hours=2)))
+    assert manifest.started_at.fold == 1
+    assert manifest.finished_at - manifest.started_at == timedelta(hours=3, seconds=-5, microseconds=-7)
+
+
+def test_exact_datetimes_keep_wall_time_offset_and_fold():
+    zone = ZoneInfo("America/New_York")
+    start = datetime(2026, 11, 1, 1, 30, tzinfo=zone, fold=1)
+    finish = datetime(2026, 11, 1, 1, 45, tzinfo=zone, fold=1)
+    manifest = RunManifest(**{**completed_manifest().model_dump(), "started_at": start, "finished_at": finish})
+    assert manifest.started_at.utcoffset() == timedelta(hours=-5)
+    assert (manifest.started_at.hour, manifest.started_at.minute, manifest.started_at.fold) == (1, 30, 1)
+    assert manifest.finished_at - manifest.started_at == timedelta(minutes=15)
+
+
+# ---- error locations never run a caller key's __repr__
+
+
+class _LoudKey(str):
+    reprs = 0
+
+    def __repr__(self):
+        _LoudKey.reprs += 1
+        return "X" * 1_000_000
+
+
+def test_an_undeclared_stored_key_is_named_without_running_its_repr():
+    manifest = completed_manifest()
+    dict.__setitem__(BASE_MODEL_DICT_DESCRIPTOR.__get__(manifest, BaseModel), _LoudKey("sneaky"), 1)
+    _LoudKey.reprs = 0
+    with pytest.raises(ValueError, match=r"undeclared stored fields at \$: 'sneaky'$"):
+        serialize_run_manifest(manifest)
+    assert _LoudKey.reprs == 0
+
+
+def test_mapping_keys_on_the_walk_are_never_asked_for_their_repr():
+    manifest = completed_manifest()
+    reading = manifest.resources[0].model_dump()
+
+    class KeyedResource(dict):
+        pass
+
+    resource = KeyedResource({_LoudKey(name): value for name, value in reading.items()})
+    dict.__setitem__(BASE_MODEL_DICT_DESCRIPTOR.__get__(manifest, BaseModel), "resources", (resource,))
+    _LoudKey.reprs = 0
+    with contextlib.suppress(ValueError, ValidationError):
+        serialize_run_manifest(manifest)
+    assert _LoudKey.reprs == 0
+
+
+@pytest.mark.parametrize(
+    "key, label",
+    [
+        ("plain", "$['plain']"),
+        (_LoudKey("loud"), "$['loud']"),
+        (7, "$[7]"),
+        (True, "$[True]"),
+        (2**10_000, "$[<int key of 10001 bits>]"),
+        ("k" * 500, "$['" + "k" * 64 + "'…]"),
+        (frozenset(), "$[<frozenset key>]"),
+    ],
+    ids=["str", "str-subclass", "int", "bool", "huge-int", "long-str", "other"],
+)
+def test_error_locations_label_keys_from_their_exact_text(key, label):
+    _LoudKey.reprs = 0
+    with pytest.raises(ValueError) as refused:
+        run_manifest_module._require_native_snapshot({key: object()})
+    assert str(refused.value) == f"unsupported value type at {label}"
+    assert _LoudKey.reprs == 0
+
+
+def test_error_locations_still_name_nested_fields_and_indexes():
+    with pytest.raises(ValueError) as refused:
+        run_manifest_module._require_native_snapshot({"resources": [{"name": [1, object()]}]})
+    assert str(refused.value) == "unsupported value type at $['resources'][0]['name'][1]"
+
+
+# ---- the undeclared-field message lists a bounded number of names
+
+
+def test_many_undeclared_keys_give_a_bounded_error_naming_the_first_few_and_a_count():
+    manifest = completed_manifest()
+    storage = BASE_MODEL_DICT_DESCRIPTOR.__get__(manifest, BaseModel)
+    for index in range(20_000):
+        dict.__setitem__(storage, f"undeclared_{index:05d}_" + "y" * 200, 1)
+    with pytest.raises(ValueError) as refused:
+        serialize_run_manifest(manifest)
+    message = str(refused.value)
+    assert len(message) < 1_000
+    assert message.startswith("undeclared stored fields at $: 'undeclared_00000_")
+    assert message.endswith("… and 19995 more")
+    assert message.count("'undeclared_") == 5
+
+
+def test_a_few_undeclared_keys_are_all_listed():
+    manifest = completed_manifest()
+    storage = BASE_MODEL_DICT_DESCRIPTOR.__get__(manifest, BaseModel)
+    for name in ("zeta", "alpha", "mid"):
+        dict.__setitem__(storage, name, 1)
+    with pytest.raises(ValueError) as refused:
+        serialize_run_manifest(manifest)
+    assert str(refused.value) == "undeclared stored fields at $: 'alpha', 'mid', 'zeta'"
+
+
+# ---- a rejected validation leaves nothing behind (the pairing slot is scoped to one manifest)
+
+
+def _validate_on(path, data):
+    if path == "type_adapter":
+        return pydantic.TypeAdapter(RunManifest).validate_python(data)
+    if path == "nested_model":
+        return _Envelope.model_validate({"manifest": data}).manifest
+    if path == "list_of_manifests":
+        return pydantic.TypeAdapter(list[RunManifest]).validate_python([data])[0]
+    if path == "model_validate":
+        return RunManifest.model_validate(data)
+    return RunManifest(**data)
+
+
+_ALL_PATHS = ["type_adapter", "nested_model", "list_of_manifests", "model_validate", "init"]
+_BAD_FINISHES = [object(), "not a date", 12345, [], datetime(2026, 10, 1, 9, 0)]  # the last is naive
+
+
+def _reject_with_bad_finish(path, bad):
+    import weakref
+
+    zone = _FlipZone(timedelta(0), timedelta(0))
+    data = completed_manifest().model_dump()
+    data["started_at"] = datetime(2026, 10, 1, 8, 0, tzinfo=zone)
+    data["finished_at"] = bad
+    refused = False
+    try:
+        _validate_on(path, data)
+    except (ValidationError, ValueError):
+        refused = True
+    assert refused
+    return weakref.ref(zone)
+
+
+@pytest.mark.parametrize("bad", range(len(_BAD_FINISHES)))
+@pytest.mark.parametrize("path", _ALL_PATHS)
+def test_a_valid_start_with_an_invalid_finish_does_not_keep_the_caller_datetime(path, bad):
+    import gc
+
+    gone = _reject_with_bad_finish(path, _BAD_FINISHES[bad])
+    gc.collect()
+    assert gone() is None
+
+
+@pytest.mark.parametrize("path", ["type_adapter", "nested_model", "list_of_manifests"])
+def test_a_rejected_validation_cannot_change_the_next_objects_reading(path):
+    """The first call reads ``shared`` once (+1 h) and is refused for its finished_at.  In the second call the
+    started_at is refused and finished_at is the same object: it must be read afresh (-5 h), never taken from
+    the first call's pairing."""
+
+    zone = _FlipZone(timedelta(hours=1), timedelta(hours=-5))
+    shared = datetime(2026, 10, 1, 8, 0, tzinfo=zone)
+    first = completed_manifest().model_dump()
+    first["started_at"], first["finished_at"] = shared, object()
+    with pytest.raises((ValidationError, ValueError)):
+        _validate_on(path, first)
+    assert zone.reads == 1
+    second = completed_manifest().model_dump()
+    second["started_at"], second["finished_at"] = object(), shared
+    with pytest.raises((ValidationError, ValueError)):
+        _validate_on(path, second)
+    assert zone.reads == 2  # read again for this object's own validation, not replayed from the rejected one
+
+
+# ---- a key's class name is read natively, copied to an exact str and cut
+
+
+def _key_of_type_named(name):
+    key_type = type("K", (), {"__hash__": object.__hash__})
+    type.__dict__["__name__"].__set__(key_type, name)
+    return key_type()
+
+
+class _LoudName(str):
+    formats = 0
+
+    def __format__(self, spec):
+        _LoudName.formats += 1
+        raise RuntimeError("caller __format__ ran")
+
+
+def test_a_key_class_name_that_is_a_str_subclass_runs_no_caller_format():
+    from neuralscape_bench.run_manifest import _key_label
+
+    _LoudName.formats = 0
+    label = _key_label(_key_of_type_named(_LoudName("Sneaky")))
+    assert _LoudName.formats == 0
+    assert label == "<Sneaky key>" and type(label) is str
+
+
+def test_a_million_character_key_class_name_is_cut_to_the_label_bound():
+    from neuralscape_bench.run_manifest import _KEY_LABEL_CHARS, _key_label
+
+    label = _key_label(_key_of_type_named("N" * 1_000_000))
+    assert len(label) <= _KEY_LABEL_CHARS + len("<…")  + len(" key>")
+    assert label.startswith("<" + "N" * 10) and label.endswith("… key>")
+
+
+def test_a_str_subclass_class_name_cut_and_a_short_one_unchanged():
+    from neuralscape_bench.run_manifest import _key_label
+
+    assert _key_label(_key_of_type_named("Short")) == "<Short key>"
+    long_loud = _key_label(_key_of_type_named(_LoudName("L" * 500)))
+    assert type(long_loud) is str and len(long_loud) < 100
+
+
+def test_a_diagnostic_naming_a_hostile_key_type_stays_bounded_and_runs_no_caller_code():
+    manifest = completed_manifest()
+    _LoudName.formats = 0
+    dict.__setitem__(BASE_MODEL_DICT_DESCRIPTOR.__get__(manifest, BaseModel), _key_of_type_named(_LoudName("X" * 1_000_000)), 1)
+    with pytest.raises(ValueError) as caught:
+        serialize_run_manifest(manifest)
+    assert _LoudName.formats == 0 and len(str(caught.value)) < 2_000
+
+
+class _HostileName(str):
+    """A class name whose every str method is caller code."""
+
+    calls = 0
+
+    def _hit(self, *args, **kwargs):
+        _HostileName.calls += 1
+        raise RuntimeError("caller code ran")
+
+    __format__ = __str__ = __repr__ = __len__ = __getitem__ = __eq__ = __hash__ = __iter__ = __contains__ = _hit
+    startswith = endswith = encode = join = split = replace = lower = upper = strip = _hit
+
+
+def test_a_class_name_with_every_str_method_hostile_is_read_with_the_base_methods_only():
+    from neuralscape_bench.run_manifest import _key_label
+
+    key = _key_of_type_named(_HostileName("Quiet" * 40))
+    _HostileName.calls = 0
+    label = _key_label(key)
+    assert _HostileName.calls == 0
+    assert type(label) is str and label.startswith("<QuietQuiet") and label.endswith("… key>")
+
+
+def test_concurrent_validations_never_pair_across_threads():
+    import threading
+
+    errors: list[BaseException] = []
+
+    def worker(seed: int) -> None:
+        try:
+            for _ in range(25):
+                zone = _FlipZone(timedelta(hours=-5), timedelta(0))
+                manifest = pydantic.TypeAdapter(RunManifest).validate_python(_completed_with_one_instant(zone))
+                assert manifest.started_at == manifest.finished_at and zone.reads == 1
+                bad = completed_manifest().model_dump()
+                bad["started_at"], bad["finished_at"] = datetime(2026, 10, 1, 8, 0, tzinfo=_FlipZone(timedelta(0), timedelta(0))), object()
+                with pytest.raises(ValidationError):
+                    pydantic.TypeAdapter(RunManifest).validate_python(bad)
+        except BaseException as error:  # noqa: BLE001
+            errors.append(error)
+
+    threads = [threading.Thread(target=worker, args=(n,)) for n in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert errors == []
+
+
+def test_json_validation_is_unaffected_by_the_pairing_step():
+    manifest = completed_manifest()
+    again = RunManifest.model_validate_json(serialize_run_manifest(manifest))
+    assert again == manifest
+    assert pydantic.TypeAdapter(RunManifest).validate_json(serialize_run_manifest(manifest)) == manifest
+
+
+# ---- JSON validation never fills the pairing slot, so no input mode leaves anything behind
+
+
+def _pending_slot():
+    """What a finished validation leaves behind: nothing (the scope table is restored to ``None``)."""
+
+    from neuralscape_bench.run_manifest import _TIMESTAMP_PINS
+
+    return _TIMESTAMP_PINS.get()
+
+
+@pytest.mark.parametrize("entry", ["model_validate_json", "type_adapter_validate_json"])
+@pytest.mark.parametrize("outcome", ["valid", "rejected"])
+def test_json_validation_leaves_the_pairing_slot_empty(entry, outcome):
+    manifest = completed_manifest()
+    text = serialize_run_manifest(manifest)
+    if outcome == "rejected":
+        document = json.loads(text)
+        document["finished_at"] = "not a date"
+        text = json.dumps(document)
+    run = (
+        (lambda: RunManifest.model_validate_json(text))
+        if entry == "model_validate_json"
+        else (lambda: pydantic.TypeAdapter(RunManifest).validate_json(text))
+    )
+    if outcome == "valid":
+        run()
+    else:
+        with pytest.raises(ValidationError):
+            run()
+    assert _pending_slot() is None
+
+
+def test_the_pairing_slot_is_empty_after_every_python_outcome_too():
+    for bad in (object(), "x", datetime(2026, 10, 1, 9, 0)):
+        data = completed_manifest().model_dump()
+        data["finished_at"] = bad
+        with pytest.raises((ValidationError, ValueError)):
+            pydantic.TypeAdapter(RunManifest).validate_python(data)
+        assert _pending_slot() is None
+    pydantic.TypeAdapter(RunManifest).validate_python(completed_manifest().model_dump())
+    assert _pending_slot() is None
+
+
+# ---- a manifest built from datetime subclasses serializes and round-trips (the stored timestamps are exact)
+
+
+@pytest.mark.parametrize("path", ["init", "model_validate", "type_adapter"])
+def test_a_manifest_built_from_datetime_subclasses_serializes_and_round_trips(path):
+    class Benign(datetime):
+        pass
+
+    data = {
+        **completed_manifest().model_dump(),
+        "started_at": Benign(2026, 10, 1, 8, 0, tzinfo=timezone.utc),
+        "finished_at": Benign(2026, 10, 1, 12, 0, tzinfo=timezone(timedelta(hours=2))),
+    }
+    if path == "init":
+        manifest = RunManifest(**data)
+    elif path == "model_validate":
+        manifest = RunManifest.model_validate(data)
+    else:
+        manifest = pydantic.TypeAdapter(RunManifest).validate_python(data)
+    assert type(manifest.started_at) is datetime and type(manifest.finished_at) is datetime
+    text = serialize_run_manifest(manifest)  # an inexact leaf would be refused here as an unsupported value type
+    assert validate_run_manifest_json(text) == manifest
+
+
+# ---- validation that nests inside another validation never erases the outer one's pending reading
+
+
+def _source_whose_finish_builds_another_manifest(zone, *, nest):
+    """An attribute source (for ``from_attributes``) whose ``finished_at`` property validates another manifest first."""
+
+    fields = completed_manifest().model_dump()
+    shared = datetime(2026, 10, 1, 8, 0, tzinfo=zone)
+    namespace = {name: value for name, value in fields.items() if name not in ("started_at", "finished_at")}
+    namespace["started_at"] = shared
+
+    def finished_at(self):
+        nest()  # a whole other manifest is validated while this one's finished_at is being read
+        return shared
+
+    namespace["finished_at"] = property(finished_at)
+    return type("Source", (), namespace)()
+
+
+def _another_manifest_through(route):
+    data = completed_manifest().model_dump()
+    if route == "init":
+        return RunManifest(**data)
+    if route == "model_validate":
+        return RunManifest.model_validate(data)
+    return pydantic.TypeAdapter(RunManifest).validate_python(data)
+
+
+@pytest.mark.parametrize("first, later", [(timedelta(0), timedelta(hours=-5)), (timedelta(hours=-5), timedelta(0))])
+@pytest.mark.parametrize("route", ["init", "model_validate", "type_adapter"])
+def test_a_manifest_built_while_reading_finished_at_leaves_the_outer_reading_alone(route, first, later):
+    zone = _FlipZone(first, later)
+    source = _source_whose_finish_builds_another_manifest(zone, nest=lambda: _another_manifest_through(route))
+    manifest = pydantic.TypeAdapter(RunManifest).validate_python(source, from_attributes=True)
+    assert manifest.started_at == manifest.finished_at  # one object, one reading
+    assert manifest.started_at.utcoffset() == first
+    assert zone.reads == 1
+
+
+def test_a_deeper_nest_and_a_nest_that_raises_still_leave_the_outer_reading_alone():
+    zone = _FlipZone(timedelta(hours=-5), timedelta(0))
+
+    def nest():
+        inner_zone = _FlipZone(timedelta(hours=1), timedelta(hours=2))
+        inner = _source_whose_finish_builds_another_manifest(inner_zone, nest=lambda: _another_manifest_through("type_adapter"))
+        pydantic.TypeAdapter(RunManifest).validate_python(inner, from_attributes=True)
+        assert inner_zone.reads == 1
+        with pytest.raises(ValidationError):
+            data = completed_manifest().model_dump()
+            data["finished_at"] = object()
+            pydantic.TypeAdapter(RunManifest).validate_python(data)
+
+    manifest = pydantic.TypeAdapter(RunManifest).validate_python(
+        _source_whose_finish_builds_another_manifest(zone, nest=nest), from_attributes=True
+    )
+    assert manifest.started_at == manifest.finished_at and zone.reads == 1
+
+
+def test_threads_that_nest_validations_never_cross_readings():
+    import threading
+
+    errors: list[BaseException] = []
+
+    def worker():
+        try:
+            for _ in range(20):
+                zone = _FlipZone(timedelta(hours=-5), timedelta(0))
+                source = _source_whose_finish_builds_another_manifest(zone, nest=lambda: _another_manifest_through("type_adapter"))
+                manifest = pydantic.TypeAdapter(RunManifest).validate_python(source, from_attributes=True)
+                assert manifest.started_at == manifest.finished_at and zone.reads == 1
+        except BaseException as error:  # noqa: BLE001
+            errors.append(error)
+
+    threads = [threading.Thread(target=worker) for _ in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert errors == []
+
+
+def test_nothing_is_pending_after_nested_validations_in_any_order():
+    zone = _FlipZone(timedelta(0), timedelta(hours=-5))
+    pydantic.TypeAdapter(RunManifest).validate_python(
+        _source_whose_finish_builds_another_manifest(zone, nest=lambda: _another_manifest_through("type_adapter")), from_attributes=True
+    )
+    assert _pending_slot() is None
+
+
+def test_validations_aborted_while_reading_finished_at_leave_nothing_and_pair_nothing_with_the_next():
+    def explode():
+        raise RuntimeError("the attribute source failed")
+
+    for _ in range(100):
+        source = _source_whose_finish_builds_another_manifest(_FlipZone(timedelta(0), timedelta(0)), nest=explode)
+        with pytest.raises(ValidationError):  # pydantic reports a failing attribute as a validation error
+            pydantic.TypeAdapter(RunManifest).validate_python(source, from_attributes=True)
+        assert _pending_slot() is None  # the scope is restored in a finally, however the validation ended
+    zone = _FlipZone(timedelta(hours=-5), timedelta(0))  # the next validation reads and pairs on its own
+    manifest = pydantic.TypeAdapter(RunManifest).validate_python(
+        _source_whose_finish_builds_another_manifest(zone, nest=lambda: None), from_attributes=True
+    )
+    assert manifest.started_at == manifest.finished_at and zone.reads == 1
+
+
+@pytest.mark.parametrize("aborted", [1, 15, 16, 17, 40, 100])
+def test_many_aborted_nested_validations_cannot_evict_the_outer_validations_reading(aborted):
+    """The outer ``finished_at`` read runs ``aborted`` nested validations that each fail while reading an attribute."""
+
+    def explode():
+        raise RuntimeError("the attribute source failed")
+
+    def nest():
+        for _ in range(aborted):
+            inner = _source_whose_finish_builds_another_manifest(_FlipZone(timedelta(0), timedelta(0)), nest=explode)
+            with pytest.raises(ValidationError):
+                pydantic.TypeAdapter(RunManifest).validate_python(inner, from_attributes=True)
+
+    zone = _FlipZone(timedelta(hours=-5), timedelta(0))
+    manifest = pydantic.TypeAdapter(RunManifest).validate_python(
+        _source_whose_finish_builds_another_manifest(zone, nest=nest), from_attributes=True
+    )
+    assert manifest.started_at == manifest.finished_at  # one object, one reading, however many nested failures
+    assert manifest.started_at.utcoffset() == timedelta(hours=-5) and zone.reads == 1

@@ -8,8 +8,10 @@ not be synthesized as a zero.
 
 from __future__ import annotations
 
+import heapq
 import json
 from collections.abc import Mapping
+from contextvars import ContextVar
 from types import MappingProxyType
 from datetime import datetime, timedelta, timezone
 from enum import Enum
@@ -23,6 +25,7 @@ from pydantic import (
     field_validator,
     model_validator,
 )
+from pydantic_core import core_schema
 
 
 _MAX_SAFE_COUNTER = 9_007_199_254_740_991
@@ -71,6 +74,9 @@ class _FrozenGraph(NamedTuple):
     native_containers: dict[int, tuple[object, tuple[Any, ...]]]
     replay_entries: dict[int, tuple[object, tuple[Any, ...]]]
     completed_traversals: dict[int, object]
+    # id -> containers on the longest path below a completed subtree (itself included): a later wrapper
+    # reaching it is not walked again but is still depth-checked where it is reached.
+    completed_heights: dict[int, int]
     extra_mapping_owners: dict[int, Mapping[Any, Any]]
     extra_mapping_queue: list[Mapping[Any, Any]]
     extra_mapping_cursor: list[int]
@@ -290,6 +296,27 @@ def _exact_offset(offset: object) -> timedelta:
     )
 
 
+def _exact_datetime(value: datetime, zone: timezone) -> datetime:
+    """An exact ``datetime`` with the wall time and ``fold`` of ``value`` under ``zone``.
+
+    ``datetime.replace`` builds an instance of the caller's subclass (running its ``__new__``), and a
+    kept subclass would run caller arithmetic later; the fields are read with the base type's own
+    accessors and a fresh exact value is built.
+    """
+
+    return datetime(
+        datetime.year.__get__(value),  # type: ignore[attr-defined]
+        datetime.month.__get__(value),  # type: ignore[attr-defined]
+        datetime.day.__get__(value),  # type: ignore[attr-defined]
+        datetime.hour.__get__(value),  # type: ignore[attr-defined]
+        datetime.minute.__get__(value),  # type: ignore[attr-defined]
+        datetime.second.__get__(value),  # type: ignore[attr-defined]
+        datetime.microsecond.__get__(value),  # type: ignore[attr-defined]
+        tzinfo=zone,
+        fold=datetime.fold.__get__(value),  # type: ignore[attr-defined]
+    )
+
+
 def _instant_before(left: datetime, right: datetime) -> bool:
     """Whether ``left`` is an earlier instant than ``right``, without leaving the datetime range.
 
@@ -307,6 +334,36 @@ def _instant_before(left: datetime, right: datetime) -> bool:
     return timedelta.__sub__(wall, timedelta.__sub__(left_offset, right_offset)) < timedelta(0)
 
 
+# id -> (the caller's datetime, its fixed-offset copy) for the manifest validation in progress.  One
+# offset is read per object per call, so the same datetime supplied as both timestamps cannot be
+# given two different readings.  The original is retained so its id cannot be reused mid-call.
+_TIMESTAMP_PINS: ContextVar[dict[int, tuple[datetime, datetime]] | None] = ContextVar(
+    "_TIMESTAMP_PINS", default=None
+)
+
+
+# One validation of a manifest from Python objects owns one table (the object -> its fixed-offset copy), opened by
+# ``_open_validation_scope`` when the validation starts and restored in a ``finally`` when it ends, however it
+# ends.  The scope is a ContextVar token, so nested validations (reading ``finished_at`` from an attribute source
+# can validate another manifest, or fail while doing so) each get their own table and put the outer one back;
+# nothing is evicted or capped, and nothing outlives the validation.  The same datetime object supplied as both
+# timestamps is therefore read once, on every route (constructor, ``model_validate``, TypeAdapter, an enclosing
+# model, ``from_attributes``).  JSON input has no scope: each value is a new object, so there is nothing to pair.
+_TIMESTAMP_PINS: ContextVar[dict[int, tuple[datetime, datetime]] | None] = ContextVar(
+    "_TIMESTAMP_PINS", default=None
+)
+
+
+def _open_validation_scope(value: Any, handler: Any) -> Any:
+    """Run one Python-input validation of a manifest inside its own table of offset readings."""
+
+    token = _TIMESTAMP_PINS.set({})
+    try:
+        return handler(value)
+    finally:
+        _TIMESTAMP_PINS.reset(token)
+
+
 class RunManifest(_ManifestContract):
     """A reproducible benchmark run envelope with explicit evidence state."""
 
@@ -321,18 +378,39 @@ class RunManifest(_ManifestContract):
     finished_at: datetime | None = None
     measurements: tuple[TimingMeasurement, ...] = ()
 
+    @classmethod
+    def __get_pydantic_core_schema__(cls, source: Any, handler: Any) -> Any:
+        """Wrap the model's validation in its own offset scope for Python input only.
+
+        A function validator around the whole model would hand JSON input to the strict field checks as Python
+        objects, so JSON keeps the model schema as it is.
+        """
+
+        schema = handler(source)
+        return core_schema.json_or_python_schema(
+            json_schema=schema,
+            python_schema=core_schema.no_info_wrap_validator_function(_open_validation_scope, schema),
+        )
+
     @field_validator("started_at", "finished_at")
     @classmethod
     def require_aware_timestamp(cls, value: datetime | None) -> datetime | None:
+        pins = _TIMESTAMP_PINS.get()
         if value is None:
             return None
         # Read the caller's tzinfo once and keep an exact fixed-offset copy, so nothing later (the
         # ordering check, serialization) asks caller code again or sees a different answer.
+        pinned = pins.get(id(value)) if pins is not None else None
+        if pinned is not None and pinned[0] is value:
+            return pinned[1]
         try:
             offset = datetime.utcoffset(value)
             if offset is None:
                 raise ValueError("run timestamps must include an explicit UTC offset")
-            return datetime.replace(value, tzinfo=timezone(_exact_offset(offset)))
+            fixed = _exact_datetime(value, timezone(_exact_offset(offset)))
+            if pins is not None:
+                pins[id(value)] = (value, fixed)  # the original stays referenced: its id cannot be reused
+            return fixed
         except ValueError:
             raise
         except Exception:  # a tzinfo is caller code: it can raise, or return something that is no offset
@@ -606,6 +684,7 @@ def _freeze_model_storage(
         if existing_replay is not None and existing_replay[0] is current:
             continue
         frozen_graph.completed_traversals.pop(identity, None)
+        frozen_graph.completed_heights.pop(identity, None)
         frozen_graph.completed_mapping_discoveries.pop(identity, None)
 
         if _is_subclass(value_type, BaseModel):
@@ -707,22 +786,45 @@ def _traverse_model_storage(
     frozen_graph: _FrozenGraph,
     visited: set[int],
 ) -> None:
-    """Retain historical native-recursion failures at validation order."""
+    """Retain historical native-recursion failures at validation order.
 
-    traversed: dict[int, object] = {}
+    A subtree already walked (in this call or an earlier one on the same graph) is not walked again:
+    its recorded height is added to the depth where it is reached, so a subtree first seen shallow
+    and reached deep later is still refused, and the replay work of a call is bounded by the
+    containers it has not seen.
+    """
+
+    heights: dict[int, int] = {}
     depth = [0]
 
-    def visit(current: Any) -> None:
+    def visit(current: Any) -> int:
+        """The height of ``current`` in containers (0 for a leaf)."""
+
         value_type = type(current)
         is_native_container = _is_subclass(
             value_type, (BaseModel, tuple, list, dict)
         )
         if not is_native_container:
-            return
+            return 0
 
         identity = id(current)
         if identity in visited:
-            return
+            known = heights.get(identity)
+            if known is not None and depth[0] + known > MAX_SNAPSHOT_DEPTH:
+                raise ValueError(SNAPSHOT_BUDGET_MESSAGE)
+            return known if known is not None else 0
+        completed_height = frozen_graph.completed_heights.get(identity)
+        # The root is always walked (its own entries); only the subtrees below it are reused.
+        if (
+            depth[0] > 0
+            and completed_height is not None
+            and frozen_graph.completed_traversals.get(identity) is current
+        ):
+            visited.add(identity)
+            heights[identity] = completed_height
+            if depth[0] + completed_height > MAX_SNAPSHOT_DEPTH:
+                raise ValueError(SNAPSHOT_BUDGET_MESSAGE)
+            return completed_height
         visited.add(identity)
 
         frozen_replay = frozen_graph.replay_entries.get(identity)
@@ -730,18 +832,25 @@ def _traverse_model_storage(
             _freeze_model_storage(current, frozen_graph, set())
             frozen_replay = frozen_graph.replay_entries[identity]
         owner, entries = frozen_replay
-        traversed[identity] = owner
         # The walk recurses; the snapshot's depth bound applies here too, so nesting deeper than
         # the manifest allows is a stable budget error and never a RecursionError.
         depth[0] += 1
         if depth[0] > MAX_SNAPSHOT_DEPTH:
             raise ValueError(SNAPSHOT_BUDGET_MESSAGE)
+        height = 0
         for item in entries:
-            visit(item)
+            height = max(height, visit(item))
         depth[0] -= 1
+        heights[identity] = height + 1
+        traversed[identity] = owner
+        traversed_heights[identity] = height + 1
+        return height + 1
 
+    traversed: dict[int, object] = {}
+    traversed_heights: dict[int, int] = {}
     visit(value)
     frozen_graph.completed_traversals.update(traversed)
+    frozen_graph.completed_heights.update(traversed_heights)
 
 
 def _protect_yielded_model_storage(
@@ -760,8 +869,7 @@ def _protect_yielded_model_storage(
         _freeze_model_storage(value, frozen_graph, set())
         _inventory_retained_extra_mappings(frozen_graph)
 
-    completed_owner = frozen_graph.completed_traversals.get(identity)
-    if completed_owner is value:
+    if frozen_graph.completed_traversals.get(identity) is value:
         return False
 
     _traverse_model_storage(value, frozen_graph, set())
@@ -1080,6 +1188,7 @@ def _freeze_model_graphs(*values: Any) -> _FrozenGraph:
         native_containers={},
         replay_entries={},
         completed_traversals={},
+        completed_heights={},
         extra_mapping_owners={},
         extra_mapping_queue=[],
         extra_mapping_cursor=[0],
@@ -1170,6 +1279,70 @@ def _is_supported_leaf(value: Any) -> bool:
     return _is_exact_type(kind, _LEAF_TYPES) or _is_exact_type(kind, _ALLOWED_ENUMS)
 
 
+_KEY_LABEL_CHARS = 64
+_UNDECLARED_NAMES_LISTED = 5
+_KEY_LABEL_INT_BITS = 128
+
+
+def _key_label(key: object) -> str:
+    """A short label for a mapping key, built only from its exact text or number.
+
+    A key can be a ``str`` subclass (or any hashable) whose ``__repr__`` is caller code that may run
+    side effects or return megabytes; only the base types' own methods are used here, and long text
+    is cut.
+    """
+
+    kind = type(key)
+    if _is_instance(key, str):
+        text = str.__getitem__(key, slice(0, _KEY_LABEL_CHARS))  # type: ignore[arg-type]
+        cut = str.__len__(key) > _KEY_LABEL_CHARS  # type: ignore[arg-type]
+        return str.__repr__(text) + ("…" if cut else "")
+    if kind is bool:
+        return "True" if key is True else "False"
+    if kind is int:
+        bits = int.bit_length(key)  # type: ignore[arg-type]
+        if bits > _KEY_LABEL_INT_BITS:
+            return f"<int key of {bits} bits>"
+        return int.__repr__(key)  # type: ignore[arg-type]
+    # The class name is a native read, but it can be a ``str`` subclass (its __format__ is caller code) of any
+    # length: copy it to an exact str with the base slice, and cut it like a key's own text.
+    name = type.__dict__["__name__"].__get__(kind)
+    if not _is_instance(name, str):
+        return "<key>"
+    text = str.__getitem__(name, slice(0, _KEY_LABEL_CHARS))  # type: ignore[arg-type]
+    cut = "…" if str.__len__(name) > _KEY_LABEL_CHARS else ""  # type: ignore[arg-type]
+    return "<" + text + cut + " key>"
+
+
+class _Path:
+    """A location in the caller's input, rendered only when an error names it.
+
+    Building ``f"{path}[{key!r}]"`` for every visited entry ran each key's ``__repr__`` on the success
+    path too; a ``_Path`` keeps the parent and the key and labels it with ``_key_label`` on demand.
+    """
+
+    __slots__ = ("parent", "step")
+
+    def __init__(self, parent: "_Path | str", step: object) -> None:
+        self.parent = parent
+        self.step = step  # ("field", name), ("key", key) or ("index", int)
+
+    def __str__(self) -> str:
+        parts: list[str] = []
+        node: _Path | str = self
+        while type(node) is _Path:
+            kind, item = node.step  # type: ignore[misc]
+            if kind == "field":
+                parts.append("." + str.__str__(item))
+            elif kind == "index":
+                parts.append(f"[{item}]")
+            else:
+                parts.append(f"[{_key_label(item)}]")
+            node = node.parent
+        parts.append(node)  # type: ignore[arg-type]
+        return "".join(reversed(parts))
+
+
 def _require_native_snapshot(snapshot: Any) -> Any:
     """Reject, with a stable error and before Pydantic sees it, any unsupported value.
 
@@ -1180,7 +1353,7 @@ def _require_native_snapshot(snapshot: Any) -> Any:
     its fields.  The walk is iterative and reads only real types.
     """
 
-    pending: list[tuple[Any, str]] = [(snapshot, "$")]
+    pending: list[tuple[Any, _Path | str]] = [(snapshot, "$")]
     seen: set[int] = set()
     while pending:
         value, path = pending.pop()
@@ -1190,15 +1363,15 @@ def _require_native_snapshot(snapshot: Any) -> Any:
                 continue
             seen.add(id(value))
             if kind is dict:
-                pending.extend((item, f"{path}[{key!r}]") for key, item in dict.items(value))
+                pending.extend((item, _Path(path, ("key", key))) for key, item in dict.items(value))
             else:
-                pending.extend((item, f"{path}[{index}]") for index, item in enumerate(value))
+                pending.extend((item, _Path(path, ("index", index))) for index, item in enumerate(value))
         elif not _is_supported_leaf(value):
             raise ValueError(f"unsupported value type at {path}")
     return snapshot
 
 
-def _fixed_offset(value: datetime, path: str) -> datetime:
+def _fixed_offset(value: datetime, path: _Path | str) -> datetime:
     """Read a datetime's UTC offset exactly once and keep a fixed-offset copy.
 
     A ``tzinfo`` is caller code: its ``utcoffset`` can return a different answer on every
@@ -1222,7 +1395,7 @@ def _fixed_offset(value: datetime, path: str) -> datetime:
 def _snapshot_native(
     value: Any,
     *,
-    path: str = "$",
+    path: _Path | str = "$",
     active: set[int] | None = None,
     _frozen_graph: _FrozenGraph | None = None,
 ) -> Any:
@@ -1280,12 +1453,16 @@ def _snapshot_native(
                 undeclared.update(iterated_extra_names)
                 undeclared.update(key for key, _ in extra_entries)
             if undeclared:
-                names = ", ".join(sorted(repr(name) for name in undeclared))
+                # Name the first few (sorted by label) and count the rest, so the error stays small.
+                labels = heapq.nsmallest(_UNDECLARED_NAMES_LISTED, map(_key_label, undeclared))
+                names = ", ".join(labels)
+                if len(undeclared) > len(labels):
+                    names += f", … and {len(undeclared) - len(labels)} more"
                 raise ValueError(f"undeclared stored fields at {path}: {names}")
             return {
                 name: _snapshot_native(
                     stored_values[name],
-                    path=f"{path}.{name}",
+                    path=_Path(path, ("field", name)),
                     active=active,
                     _frozen_graph=_frozen_graph,
                 )
@@ -1304,7 +1481,7 @@ def _snapshot_native(
                 return {
                     key: _snapshot_native(
                         item,
-                        path=f"{path}[{key!r}]",
+                        path=_Path(path, ("key", key)),
                         active=active,
                         _frozen_graph=_frozen_graph,
                     )
@@ -1320,7 +1497,7 @@ def _snapshot_native(
             projected: dict[Any, Any] = {}
             for key, item in frozen_mapping.entries:
                 _protect_yielded_model_storage(item, _frozen_graph)
-                item_path = f"{path}[{key!r}]"
+                item_path = _Path(path, ("key", key))
                 projected[key] = _snapshot_native(
                     item,
                     path=item_path,
@@ -1352,7 +1529,7 @@ def _snapshot_native(
                 projected = tuple(
                     _snapshot_native(
                         item,
-                        path=f"{path}[{index}]",
+                        path=_Path(path, ("index", index)),
                         active=active,
                         _frozen_graph=_frozen_graph,
                     )
@@ -1368,7 +1545,7 @@ def _snapshot_native(
             return tuple(
                 _snapshot_native(
                     item,
-                    path=f"{path}[{index}]",
+                    path=_Path(path, ("index", index)),
                     active=active,
                     _frozen_graph=_frozen_graph,
                 )
@@ -1394,7 +1571,7 @@ def _snapshot_native(
                 projected = [
                     _snapshot_native(
                         item,
-                        path=f"{path}[{index}]",
+                        path=_Path(path, ("index", index)),
                         active=active,
                         _frozen_graph=_frozen_graph,
                     )
@@ -1410,7 +1587,7 @@ def _snapshot_native(
             return [
                 _snapshot_native(
                     item,
-                    path=f"{path}[{index}]",
+                    path=_Path(path, ("index", index)),
                     active=active,
                     _frozen_graph=_frozen_graph,
                 )
