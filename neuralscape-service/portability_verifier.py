@@ -276,6 +276,25 @@ class _Framing(Exception):
     """The archive bytes are not exactly the records the directory claims."""
 
 
+def _extra_tiling_problem(extra: bytes) -> str | None:
+    """Why an extra field's blocks do not tile it exactly, or ``None``.
+
+    Readers walk the blocks by their declared lengths.  A partial block header, or a block that runs past the
+    field, is a field each reader cuts differently (some stop, some read on into the next structure), so a
+    member whose sizes or name come from that field is not read alike everywhere.
+    """
+
+    position = 0
+    while position < len(extra):
+        if position + 4 > len(extra):
+            return "partial block header in the extra field"
+        length = struct.unpack_from("<H", extra, position + 2)[0]
+        if position + 4 + length > len(extra):
+            return "an extra field block runs past the extra field"
+        position += 4 + length
+    return None
+
+
 def _zip64_local_sizes(extra: bytes, want_usize: bool, want_csize: bool) -> tuple[int, int]:
     position = 0
     while position + 4 <= len(extra):
@@ -328,7 +347,7 @@ def _local_record_end(raw: BinaryIO, info: zipfile.ZipInfo, start_dir: int) -> i
         raise _Framing("undecodable local name") from None
     if decoded != info.orig_filename:
         raise _Framing("local and central names differ")
-    problem = _unicode_path_problem(extra, info.orig_filename)
+    problem = _unicode_path_problem(extra, info.orig_filename) or _extra_tiling_problem(extra)
     if problem is not None:
         raise _Framing(f"local header: {problem}")
     if flags != info.flag_bits or method != info.compress_type:

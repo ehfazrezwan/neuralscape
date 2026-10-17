@@ -1892,3 +1892,104 @@ def test_a_local_zip64_block_too_short_for_the_sizes_it_must_carry_is_rejected(t
     report = verify_bundle(path)
     assert not report.ok and pv.ARCHIVE_FRAMING in _codes(report)
     assert any("too short" in item.detail for item in report.findings)  # refused for this reason, not by accident
+
+
+class _DescriptorSink(io.RawIOBase):
+    """A write-only sink without seek, so ``zipfile`` streams members with data descriptors."""
+
+    def __init__(self) -> None:
+        self.data = bytearray()
+
+    def writable(self) -> bool:
+        return True
+
+    def write(self, chunk) -> int:
+        self.data += chunk
+        return len(chunk)
+
+
+def _streamed_zip64_bundle(path: Path) -> bytes:
+    """A valid bundle whose members are streamed with a local zip64 block (sizes zero, then a descriptor)."""
+
+    sink = _DescriptorSink()
+    with zipfile.ZipFile(sink, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("manifest.json", json.dumps(_manifest(PAYLOAD)))
+        for name, data in PAYLOAD.items():
+            with archive.open(zipfile.ZipInfo(name), "w", force_zip64=True) as member:
+                member.write(data)
+    path.write_bytes(bytes(sink.data))
+    return bytes(sink.data)
+
+
+def _local_extra_of(raw: bytes, member: str) -> tuple[int, int]:
+    """(offset, length) of ``member``'s local extra field."""
+
+    position = 0
+    while True:
+        position = raw.index(b"PK\x03\x04", position)
+        name_length, extra_length = struct.unpack_from("<HH", raw, position + 26)
+        if raw[position + 30 : position + 30 + name_length] == member.encode():
+            return position + 30 + name_length, extra_length
+        position += 4
+
+
+def test_a_streamed_zip64_bundle_still_verifies(tmp_path) -> None:
+    path = tmp_path / "b.zip"
+    _streamed_zip64_bundle(path)
+    assert verify_bundle(path).ok
+
+
+@pytest.mark.parametrize("declared", [17, 0x00EF, 0xFFFF])
+def test_a_streamed_local_zip64_block_longer_than_its_extra_field_is_rejected(tmp_path, declared) -> None:
+    """The block is never read for sizes (they follow in a descriptor), but readers still walk the field."""
+
+    path = tmp_path / "b.zip"
+    raw = bytearray(_streamed_zip64_bundle(path))
+    offset, length = _local_extra_of(raw, next(iter(PAYLOAD)))  # a streamed zip64 member
+    assert length >= 4 and struct.unpack_from("<H", raw, offset)[0] == 0x0001
+    struct.pack_into("<H", raw, offset + 2, declared)
+    path.write_bytes(bytes(raw))
+    report = verify_bundle(path)
+    assert not report.ok and pv.ARCHIVE_FRAMING in _codes(report)
+
+
+def _bundle_with_local_extra(path: Path, local_extra: bytes) -> None:
+    """A valid bundle whose first member carries ``local_extra`` in its local header only."""
+
+    filler = struct.pack("<HH", 0x9999, len(local_extra) - 4) + b"\0" * (len(local_extra) - 4)
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr("manifest.json", json.dumps(_manifest(PAYLOAD)))
+        for index, (name, data) in enumerate(PAYLOAD.items()):
+            info = zipfile.ZipInfo(name)
+            if index == 0:
+                info.extra = filler
+            archive.writestr(info, data)
+    raw = bytearray(path.read_bytes())
+    offset, length = _local_extra_of(raw, next(iter(PAYLOAD)))
+    assert length == len(local_extra)
+    raw[offset : offset + length] = local_extra
+    path.write_bytes(bytes(raw))
+
+
+def test_a_well_formed_unknown_local_extra_block_still_verifies(tmp_path) -> None:
+    path = tmp_path / "b.zip"
+    _bundle_with_local_extra(path, struct.pack("<HH", 0x9999, 4) + b"abcd")
+    assert verify_bundle(path).ok
+
+
+@pytest.mark.parametrize("declared", [0, 3, 5, 200])
+def test_a_local_extra_block_that_does_not_tile_its_field_is_rejected(tmp_path, declared) -> None:
+    """Any declared block length other than the one that fills the field leaves bytes readers parse differently."""
+
+    path = tmp_path / "b.zip"
+    _bundle_with_local_extra(path, struct.pack("<HH", 0x9999, declared) + b"abcd")
+    report = verify_bundle(path)
+    assert not report.ok and pv.ARCHIVE_FRAMING in _codes(report)
+
+
+def test_a_partial_block_header_at_the_end_of_a_local_extra_field_is_rejected(tmp_path) -> None:
+    path = tmp_path / "b.zip"
+    _bundle_with_local_extra(path, struct.pack("<HH", 0x9999, 4) + b"abcd" + b"\x99\x99")
+    report = verify_bundle(path)
+    assert not report.ok and pv.ARCHIVE_FRAMING in _codes(report)
+    assert any("partial block header" in item.detail for item in report.findings)  # refused for this reason
