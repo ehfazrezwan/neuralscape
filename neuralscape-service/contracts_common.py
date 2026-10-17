@@ -101,7 +101,9 @@ def _scan_enum_members(value: object, depth: int, seen: dict[int, object]) -> No
 def _annotation_holds_enum(annotation: object, _depth: int = 0) -> bool:
     if _depth > 8:
         return True  # unknown shape: check it
-    if isinstance(annotation, type):
+    # A parametrized builtin (``list[int]``) is an instance of ``type`` on Python 3.10 but has no class MRO of its
+    # own to read: anything with an origin is walked through its arguments, and only a plain class is read.
+    if typing.get_origin(annotation) is None and isinstance(annotation, type):
         return any(base is enum.Enum for base in _TYPE_MRO.__get__(annotation))
     return any(_annotation_holds_enum(arg, _depth + 1) for arg in typing.get_args(annotation))
 
