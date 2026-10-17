@@ -1065,14 +1065,32 @@ def _recursive_diamond(levels: int) -> dict:
     return {"$defs": defs, "$ref": f"#/$defs/L{levels}"}
 
 
-def test_a_recursive_diamond_is_bounded_and_never_reported_compatible_wrongly() -> None:
-    findings, seconds = _timed(_recursive_diamond(24), _recursive_diamond(24))
-    assert seconds < 8.0, seconds
+def _bounded_comparisons(monkeypatch) -> dict:
+    """Count keyword comparisons, failing at once past the documented budget (an unbounded expansion of a
+    24-level diamond would make millions; a wall-clock bound would depend on the host's load)."""
+
+    calls = {"count": 0}
+    real = pack._compare_keywords
+
+    def counting(*args, **kwargs):
+        calls["count"] += 1
+        if calls["count"] > pack._MAX_COMPARISONS:
+            pytest.fail(f"more than {pack._MAX_COMPARISONS} keyword comparisons: the comparison is not bounded")
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(pack, "_compare_keywords", counting)
+    return calls
+
+
+def test_a_recursive_diamond_is_bounded_and_never_reported_compatible_wrongly(monkeypatch) -> None:
+    calls = _bounded_comparisons(monkeypatch)
+    findings = _pair(_recursive_diamond(24), _recursive_diamond(24))
     assert findings == [] or any("budget exhausted" in f for f in findings), findings  # fail closed when it cannot finish
     narrowed = _recursive_diamond(12)
     narrowed["$defs"]["L0"]["properties"]["v"] = {"type": "string", "maxLength": 1}
-    findings, seconds = _timed(_recursive_diamond(12), narrowed)
-    assert findings and seconds < 8.0, (findings[:2], seconds)
+    calls["count"] = 0
+    findings = _pair(_recursive_diamond(12), narrowed)
+    assert findings and calls["count"] < 1000, (findings[:2], calls)  # the first difference is found directly
 
 
 def _nested_mutual_recursion(narrowed: bool, alternatives: list[str]) -> dict:
@@ -1218,3 +1236,45 @@ def test_a_cycle_marker_keeps_the_constraints_written_beside_the_reference() -> 
 def test_a_cycle_whose_siblings_are_unchanged_compares_clean() -> None:
     old = _recursive_node({"maxProperties": 0})
     assert _pair(old, copy.deepcopy(old)) == []
+
+
+# ---- a written "$cycle" key can never pass for a cut cycle
+
+
+def _node_and_leaf(back: dict) -> dict:
+    """Node and Leaf refer to each other; ``back`` is Leaf's way back, compared by equality under ``not``."""
+
+    return {
+        "$defs": {
+            "Node": {"type": "object", "properties": {"leaf": {"$ref": "#/$defs/Leaf"}}},
+            "Leaf": {"type": "object", "properties": {"n": back}},
+        },
+        "not": {"$ref": "#/$defs/Node"},
+    }
+
+
+def test_a_sibling_named_like_the_cycle_marker_does_not_hide_a_changed_reference() -> None:
+    old = _node_and_leaf({"$ref": "#/$defs/Node"})
+    new = _node_and_leaf({"$ref": "#/$defs/Leaf", "$cycle": "Node"})  # Leaf's way back now leads to Leaf
+    assert _pair(old, new) != []
+
+
+def test_a_changed_reference_at_a_cut_cycle_is_reported_without_any_cycle_key() -> None:
+    old = _node_and_leaf({"$ref": "#/$defs/Node"})
+    assert _pair(old, _node_and_leaf({"$ref": "#/$defs/Leaf"})) != []
+    assert _pair(old, copy.deepcopy(old)) == []
+
+
+def test_a_written_cycle_node_is_not_taken_for_a_cut_reference() -> None:
+    old = _recursive_node({})
+    new = copy.deepcopy(old)
+    new["$defs"]["Node"]["properties"]["child"] = {"$cycle": "Node"}  # an unknown keyword: accepts anything
+    assert _pair(old, new) != []
+
+
+def test_a_property_or_literal_named_like_the_cycle_marker_still_compares_clean() -> None:
+    old = _recursive_node({})
+    old["$defs"]["Node"]["properties"]["$cycle"] = {"type": "string", "const": {"$cycle": "Node"}}
+    new = copy.deepcopy(old)
+    new["$defs"]["Unused"] = {"type": "string"}  # the definitions differ, so the comparison expands references
+    assert _pair(old, new) == []

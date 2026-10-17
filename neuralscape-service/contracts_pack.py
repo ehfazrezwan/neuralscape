@@ -225,6 +225,8 @@ def _inline(
         return value
     if named:
         return {key: _inline(item, defs, stack, budget) for key, item in value.items()}
+    if "$cycle" in value:
+        raise _TooLarge  # written in the schema, it could pass for a cut cycle: not shown equal
 
     def inline_members(members: dict) -> dict:
         out = {}
