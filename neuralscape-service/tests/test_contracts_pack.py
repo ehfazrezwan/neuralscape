@@ -1811,13 +1811,14 @@ def test_a_pattern_is_never_executed(monkeypatch) -> None:
 @pytest.mark.parametrize(
     "pattern, name, may",
     [
-        ("^a$", "a", True), ("^a$", "ab", False), ("^x-", "x-y", True), ("^x-", "y", False),
-        ("^ab?c", "ac", True), ("^ab*", "a", True), ("^a{0}b", "b", True), ("^ba{2}", "c", False), ("^a|b", "b", True),
-        ("a$", "zzz", True), ("^[a-z]+$", "Q", True), ("^\\d", "x", True), ("^a+$", "aaa", True),
+        ("^a$", "a", True), ("^a$", "ab", False), ("^x-", "x-y", True), ("^x-", "y", False), ("b", "abc", True),
+        ("b", "a", False), ("-id$", "user-id", True), ("-id$", "id-x", False), ("^ab?c", "ac", None),
+        ("^ab*", "a", None), ("^a{0}b", "b", None), ("^ba{2}", "c", False), ("^a|b", "b", None),
+        ("^[a-z]+$", "Q", None), ("^\\d", "x", None), ("^a+$", "aaa", None), ("(?<n>a)", "a", None),
     ],
 )
 def test_which_names_a_pattern_may_match(pattern, name, may) -> None:
-    assert pack._pattern_may_match(pattern, name) is may
+    assert pack._pattern_matches(pattern, name) is may
 
 
 # ---- a schema map compared by equality keeps its keyword: its names are never taken for keywords
@@ -1927,3 +1928,74 @@ def test_a_shared_node_s_values_are_checked_once(monkeypatch) -> None:
     schema = {"type": "object", "properties": parents}  # 2000 distinct parents share one wide node
     assert _pair(schema, copy.deepcopy(schema)) == []
     assert calls["count"] < 100_000, calls  # the wide node's values are checked once per side, not per parent
+
+
+# ---- unevaluated* depends on what its siblings evaluate: any change around it is unverified
+
+
+def test_removing_an_evaluating_sibling_of_unevaluated_properties_is_reported() -> None:
+    old = {"type": "object", "additionalProperties": True, "unevaluatedProperties": False}
+    new = {"type": "object", "unevaluatedProperties": False}  # {"a": 1} is no longer evaluated, so now rejected
+    assert any("unevaluated" in f for f in _pair(old, new)), _pair(old, new)
+
+
+def test_removing_an_evaluating_sibling_of_unevaluated_items_is_reported() -> None:
+    old = {"type": "array", "items": True, "unevaluatedItems": False}
+    new = {"type": "array", "unevaluatedItems": False}  # [1] is now rejected
+    assert any("unevaluated" in f for f in _pair(old, new)), _pair(old, new)
+
+
+def test_a_referenced_schema_that_stops_evaluating_beside_unevaluated_properties_is_reported() -> None:
+    def schema(base: dict) -> dict:
+        return {"$defs": {"Base": {"type": "object", **base}}, "$ref": "#/$defs/Base", "unevaluatedProperties": False}
+
+    findings = _pair(schema({"additionalProperties": True}), schema({}))  # {"z": 1} was evaluated by Base, now rejected
+    assert any("unevaluated" in f for f in findings), findings
+
+
+def test_an_unchanged_schema_with_unevaluated_keywords_compares_clean() -> None:
+    schema = {"type": "object", "properties": {"a": {}}, "unevaluatedProperties": False}
+    assert _pair(schema, copy.deepcopy(schema)) == []
+    assert _pair(schema, {**copy.deepcopy(schema), "description": "d"}) == []
+    outer = {"type": "object", "properties": {"x": schema, "y": {"type": "string"}}}
+    widened = copy.deepcopy(outer)
+    widened["properties"]["y"] = {}
+    assert _pair(outer, widened) == []  # a change elsewhere does not touch the unevaluated node
+
+
+def test_an_unevaluated_node_shared_by_many_parents_is_judged_once(monkeypatch) -> None:
+    calls = {"count": 0}
+    real = pack._same
+
+    def counting(old, *args, **kwargs):
+        calls["count"] += isinstance(old, dict)  # a judgement of a whole node, not a keyword's scalar value
+        return real(old, *args, **kwargs)
+
+    monkeypatch.setattr(pack, "_same", counting)
+    node = {"type": "object", "properties": {f"p{i}": {} for i in range(200)}, "unevaluatedProperties": False}
+    parents = {f"q{i}": {"type": "object", "properties": {"w": node, "i": {"const": i}}} for i in range(500)}
+    assert _pair({"type": "object", "properties": parents}, copy.deepcopy({"type": "object", "properties": parents})) == []
+    assert calls["count"] < 20, calls  # once per node pair, not once per parent (500)
+
+
+# ---- only a pattern proven to match a name can vouch for a newly listed property
+
+
+def test_a_pattern_that_only_may_match_cannot_prove_compatibility() -> None:
+    old = {"type": "object", "additionalProperties": False,
+           "patternProperties": {"^a$": {"type": "string"}, "b": {"type": "integer"}}}
+    new = {**copy.deepcopy(old), "properties": {"a": {"type": "integer"}}}  # {"a": "text"} is now rejected
+    assert any("patternProperties" in f for f in _pair(old, new)), _pair(old, new)
+
+
+def test_a_property_accepting_what_every_proven_match_accepted_compares_clean() -> None:
+    old = {"type": "object", "additionalProperties": False,
+           "patternProperties": {"^a$": {"type": "string"}, "b": {"type": "integer"}}}
+    new = {**copy.deepcopy(old), "properties": {"a": {"type": "string"}}}
+    assert _pair(old, new) == []
+
+
+def test_a_possible_but_unproven_match_alone_is_reported() -> None:
+    old = {"type": "object", "additionalProperties": False, "patternProperties": {"^[a-z]$": {"type": "string"}}}
+    new = {**copy.deepcopy(old), "properties": {"a": {"type": "string"}}}  # the property accepts what the pattern did
+    assert any("patternProperties" in f for f in _pair(old, new))  # but the match is not proven: unverified

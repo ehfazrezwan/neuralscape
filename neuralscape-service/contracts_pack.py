@@ -529,6 +529,7 @@ class _Run:
         self.steps = 0
         self.values = 0  # walked by equality and canonical keys (``_MAX_EQUALITY_STEPS``)
         self.shapes: dict[int, tuple[dict, tuple[str, ...]]] = {}  # node id -> (node, malformed keywords)
+        self.unevaluated: dict[tuple[int, int, int, int], tuple[object, object, bool]] = {}
         # The lowest position, in the stack of references being compared, of a recursive reference assumed
         # compatible since the current frame began.  A pair that came out clean only because of an assumption
         # about a reference *above* it has proved nothing about itself, so it is not remembered as clean; an
@@ -805,6 +806,33 @@ def _same_value(old: object, new: object) -> bool:
     return _json_equal(old, new)
 
 
+_UNEVALUATED = frozenset({"unevaluatedProperties", "unevaluatedItems"})
+
+
+def _keys(schema: object) -> set:
+    return set(schema) if isinstance(schema, dict) else set()
+
+
+def _unevaluated_node_same(old: object, new: object, old_defs: dict, new_defs: dict) -> bool:
+    """Whether two nodes carrying unevaluated* are the same schema, references expanded and annotations aside
+    (judged once per node pair in a comparison)."""
+
+    run = _RUN.get()
+    key = (id(old), id(new), id(old_defs), id(new_defs))
+    if run is not None:
+        known = run.unevaluated.get(key)
+        if known is not None and known[0] is old and known[1] is new:
+            return known[2]
+
+    def bare(schema: object) -> object:
+        return {k: v for k, v in schema.items() if k not in _ANNOTATIONS} if isinstance(schema, dict) else schema
+
+    same = _same(bare(old), bare(new), old_defs, new_defs)
+    if run is not None:
+        run.unevaluated[key] = (old, new, same)  # the nodes are kept, so their ids are their own for the run
+    return same
+
+
 def _compare(
     old: object,
     new: object,
@@ -818,6 +846,14 @@ def _compare(
     if depth > _MAX_COMPARE_DEPTH:
         out.append(f"{path}: schema nesting exceeds the comparison depth limit; compatibility not verified")
         return
+    if (
+        (_UNEVALUATED & _keys(old) or _UNEVALUATED & _keys(new))
+        and all(_same_value(old.get(k, _ABSENT), new.get(k, _ABSENT)) for k in _UNEVALUATED)  # else reported below
+        and not _unevaluated_node_same(old, new, old_defs, new_defs)
+    ):
+        # What an unchanged unevaluatedProperties/unevaluatedItems rejects depends on what every sibling (and
+        # every schema they reference) evaluates, which is not tracked: any change around it is not verified.
+        out.append(_unverified(path, "a schema with unevaluatedProperties or unevaluatedItems changed"))
     base = len(active)  # references already being compared above this node
     if isinstance(old, dict) and isinstance(new, dict) and "$ref" in old and "$ref" in new:
         # Constraints beside this reference are compared before any shortcut: a recursive reference
@@ -972,35 +1008,51 @@ def _cap(findings: list[str]) -> list[str]:
 _REGEX_SPECIAL = frozenset(".^$*+?{}[]\\|()")
 
 
-def _pattern_may_match(pattern: object, name: str) -> bool:
-    """Whether an ECMA-262 ``patternProperties`` pattern may match ``name``, decided without running it.
+def _pattern_matches(pattern: object, name: str) -> bool | None:
+    """Whether an ECMA-262 ``patternProperties`` pattern matches ``name``: ``True``, ``False``, or ``None`` when
+    it cannot be told without running the pattern.
 
-    A pattern from a document could backtrack for ever (``(a+)+b``), so none is executed: only an anchored
-    literal prefix (``^x-``) or a fully literal anchored pattern (``^a$``) rules a name out, and anything
-    else (alternation, classes, escapes, an unanchored pattern) may match.
+    A pattern from a document could backtrack for ever (``(a+)+b``), so none is executed.  A pattern that is
+    only literal characters, optionally anchored (``^a$``, ``^x-``, ``-id$``, ``b``), is decided exactly:
+    without the multiline flag ``^`` and ``$`` are the ends of the input.  Otherwise only an anchored literal
+    prefix can rule a name out, and anything else may match.
     """
 
-    if not isinstance(pattern, str) or not pattern.startswith("^") or "|" in pattern:
-        return True
-    body = pattern[1:]
-    literal: list[str] = []
-    for index, char in enumerate(body):
+    if not isinstance(pattern, str):
+        return None
+    body = pattern[1:] if pattern.startswith("^") else pattern
+    anchored_end = body.endswith("$") and not body.endswith("\\$")
+    literal = body[:-1] if anchored_end else body
+    if not (_REGEX_SPECIAL & set(literal)):
+        if pattern.startswith("^"):
+            return name == literal if anchored_end else name.startswith(literal)
+        return name.endswith(literal) if anchored_end else literal in name
+    if not pattern.startswith("^") or "|" in pattern:
+        return None
+    prefix: list[str] = []
+    for char in pattern[1:]:
         if char in _REGEX_SPECIAL:
-            if char == "$" and index == len(body) - 1:
-                return name == "".join(literal)  # without the multiline flag, ``$`` is the end of the input
-            if char in "*?{" and literal:
-                literal.pop()  # the literal before an optional quantifier may be absent
+            if char in "*?{" and prefix:
+                prefix.pop()  # the literal before an optional quantifier may be absent
             break
-        literal.append(char)
-    return name.startswith("".join(literal))
+        prefix.append(char)
+    return None if name.startswith("".join(prefix)) else False
 
 
-def _matching_patterns(patterns: object, name: str) -> list:
-    """The ``patternProperties`` schemas whose pattern may match ``name`` (see :func:`_pattern_may_match`)."""
+def _matching_patterns(patterns: object, name: str) -> tuple[list, list]:
+    """The ``patternProperties`` schemas whose pattern is proven to match ``name``, and those that may match
+    (see :func:`_pattern_matches`)."""
 
-    if not isinstance(patterns, dict):
-        return []
-    return [schema for pattern, schema in patterns.items() if _pattern_may_match(pattern, name)]
+    proven: list = []
+    possible: list = []
+    if isinstance(patterns, dict):
+        for pattern, schema in patterns.items():
+            decision = _pattern_matches(pattern, name)
+            if decision is True:
+                proven.append(schema)
+            elif decision is None:
+                possible.append(schema)
+    return proven, possible
 
 
 def _trial(
@@ -1123,12 +1175,13 @@ def _compare_keywords(
             # schema (anything when that was true or absent); the new schema may now restrict it.
             if isinstance(old_additional, dict):
                 _compare(old_additional, subschema, old_defs, new_defs, f"{path}.{name}", out, depth + 1, active)
-            # ... unless an old pattern matched its name: then that pattern's schema governed it, whatever
-            # additionalProperties said.  The new property must accept all that one matching pattern accepted.
-            patterns = _matching_patterns(old.get("patternProperties"), name)
-            if patterns and not any(
+            # ... unless an old pattern matched its name: then the matching patterns' schemas governed it,
+            # whatever additionalProperties said.  The new property must accept all that one pattern proven to
+            # match accepted (a pattern that only may match proves nothing).
+            proven, possible = _matching_patterns(old.get("patternProperties"), name)
+            if (proven or possible) and not any(
                 not _trial(pattern, subschema, old_defs, new_defs, f"{path}.{name}", depth + 1, active)
-                for pattern in patterns
+                for pattern in proven
             ):
                 out.append(_unverified(f"{path}.{name}", "a listed property narrows what patternProperties accepted"))
     for name in sorted(set(new.get("required", [])) - set(old.get("required", []))):
