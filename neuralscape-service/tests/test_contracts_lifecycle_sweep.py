@@ -2147,7 +2147,7 @@ def _arm_detached_int_markers(delegate, reads):
     def arm():
         for kind in gc.get_objects():
             if (
-                isinstance(kind, type)
+                issubclass(type(kind), type)  # type(): other tests leave objects whose __class__ raises
                 and kind.__name__ == "DetachedInt"
                 and kind.__module__ == contracts_lifecycle.__name__
                 and "__getattribute__" not in vars(kind)
