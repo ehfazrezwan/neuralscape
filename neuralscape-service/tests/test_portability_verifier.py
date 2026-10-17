@@ -5,9 +5,11 @@ import io
 import json
 import os
 import stat
+import struct
 import subprocess
 import sys
 import zipfile
+import zlib
 from pathlib import Path
 
 import pytest
@@ -1406,3 +1408,71 @@ def test_a_bundle_root_swapped_for_a_link_after_the_check_is_never_followed(tmp_
 
 def test_an_untouched_directory_bundle_still_verifies(tmp_path) -> None:
     assert verify_bundle(_write_dir(tmp_path / "bundle", PAYLOAD)).ok
+
+
+# --- a Unicode Path extra field (0x7075) names the member for the readers that honour it ----------
+
+
+def _unicode_path_extra(alternate: str, *, version: int = 1, primary: str = "safe.txt", truncate: int = 0) -> bytes:
+    name = alternate.encode()
+    data = struct.pack("<BI", version, zlib.crc32(primary.encode())) + name
+    return struct.pack("<HH", 0x7075, len(data) - truncate) + data[: len(data) - truncate]
+
+
+def _zip_with_unicode_path(tmp_path, extra: bytes, where: str) -> Path:
+    """A one-file bundle whose member ``safe.txt`` carries ``extra`` in the headers named by ``where``
+    (``both``, ``local`` or ``central``): the block is written to both and its id is neutralised, same
+    length, in the other so every offset and the framing checks stay intact."""
+
+    path = tmp_path / "unicode.zip"
+    payload = {"safe.txt": b"x" * 10}
+    info = zipfile.ZipInfo("safe.txt")
+    info.extra = extra
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr("manifest.json", json.dumps(_manifest(payload)))
+        archive.writestr(info, payload["safe.txt"])
+    raw = bytearray(path.read_bytes())
+    marker = struct.pack("<H", 0x7075)
+    neutral = struct.pack("<H", 0x7076)
+    central_start = raw.find(b"PK\x01\x02", raw.find(b"PK\x01\x02") + 1)  # second record: safe.txt
+    if where == "local":
+        at = raw.find(marker, central_start)
+        raw[at : at + 2] = neutral
+    elif where == "central":
+        at = raw.find(marker)
+        raw[at : at + 2] = neutral
+    path.write_bytes(bytes(raw))
+    return path
+
+
+@pytest.mark.parametrize("where", ["both", "local", "central"])
+@pytest.mark.parametrize("alternate", ["../escape.txt", "other.txt", "/abs.txt"])
+def test_a_unicode_path_field_that_disagrees_with_the_name_is_refused(tmp_path, where, alternate) -> None:
+    path = _zip_with_unicode_path(tmp_path, _unicode_path_extra(alternate), where)
+    report = verify_bundle(path)
+    assert not report.ok, "a field naming another path was reported clean"
+
+
+@pytest.mark.parametrize("where", ["both", "local", "central"])
+def test_a_unicode_path_field_that_agrees_with_the_name_is_accepted(tmp_path, where) -> None:
+    report = verify_bundle(_zip_with_unicode_path(tmp_path, _unicode_path_extra("safe.txt"), where))
+    assert report.ok, report.findings
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        _unicode_path_extra("safe.txt", version=2),
+        _unicode_path_extra("safe.txt", truncate=len(b"safe.txt") + 2),
+        struct.pack("<HH", 0x7075, 5) + struct.pack("<BI", 1, 0) + b"",  # a version and checksum, no name
+        struct.pack("<HH", 0x7075, 9) + struct.pack("<BI", 1, 0) + b"\xff\xfe\xfd\xfc",  # not UTF-8
+    ],
+    ids=["unknown-version", "too-short", "empty-name", "not-utf8"],
+)
+def test_a_malformed_unicode_path_field_is_refused(tmp_path, extra) -> None:
+    assert not verify_bundle(_zip_with_unicode_path(tmp_path, extra, "both")).ok
+
+
+def test_other_extra_fields_are_left_alone(tmp_path) -> None:
+    other = struct.pack("<HH", 0x5455, 5) + b"\x01" + struct.pack("<I", 1700000000)  # extended timestamp
+    assert verify_bundle(_zip_with_unicode_path(tmp_path, other, "both")).ok

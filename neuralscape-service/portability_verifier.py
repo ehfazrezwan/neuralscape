@@ -187,6 +187,38 @@ def _classify_name(raw: str, report: VerificationReport) -> str | None:
         return None
 
 
+_UNICODE_PATH_FIELD = 0x7075  # Info-ZIP Unicode Path: the name some readers use instead of the header's
+
+
+def _unicode_path_problem(extra: bytes, declared: str) -> str | None:
+    """Why an extra-field area is not acceptable for a member declared as ``declared``, or ``None``.
+
+    A Unicode Path field names the member for every reader that honours it, whatever the header says, so a
+    bundle whose bytes and manifest match the declared name could still extract elsewhere.  A field is
+    accepted only if it is well formed and names exactly the declared name; any other is refused.  Blocks are
+    read as extractors read them: an area that stops making sense ends the walk.
+    """
+
+    position = 0
+    while position + 4 <= len(extra):
+        identifier, size = struct.unpack_from("<HH", extra, position)
+        data = extra[position + 4 : position + 4 + size]
+        if len(data) != size:
+            break  # a truncated block ends the area for every reader
+        position += 4 + size
+        if identifier != _UNICODE_PATH_FIELD:
+            continue
+        if size < 6 or data[0] != 1:
+            return "malformed unicode path field"
+        try:
+            alternate = data[5:].decode("utf-8")
+        except UnicodeDecodeError:
+            return "undecodable unicode path field"
+        if alternate != declared:
+            return "unicode path field names another path"
+    return None
+
+
 def _mode_finding(mode: int) -> str | None:
     if stat.S_ISLNK(mode):
         return SYMLINK_ENTRY
@@ -282,6 +314,9 @@ def _local_record_end(raw: BinaryIO, info: zipfile.ZipInfo, start_dir: int) -> i
         raise _Framing("undecodable local name") from None
     if decoded != info.orig_filename:
         raise _Framing("local and central names differ")
+    problem = _unicode_path_problem(extra, info.orig_filename)
+    if problem is not None:
+        raise _Framing(f"local header: {problem}")
     if flags != info.flag_bits or method != info.compress_type:
         raise _Framing("local and central flags or method differ")
 
@@ -457,6 +492,10 @@ def _inventory_zip(
         is_dir = raw_name.endswith("/")
         name = _classify_name(raw_name.rstrip("/") if is_dir else raw_name, report)
         if name is None:
+            continue
+        problem = _unicode_path_problem(info.extra, raw_name)
+        if problem is not None:
+            report.add(PATH_UNSAFE, _safe_label(name), problem)
             continue
         # The same depth rule as a directory bundle: a directory may sit at most
         # MAX_DIRECTORY_DEPTH levels down, so a bundle cannot verify as a zip and fail
