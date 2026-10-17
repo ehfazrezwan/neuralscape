@@ -4391,3 +4391,41 @@ def test_containers_exposed_only_by_a_public_view_are_charged_as_nodes() -> None
     with pytest.raises(ValueError, match=run_discovery_message()):
         usage_reconcile_contracts._native_snapshot({"k": PublicOnly()})  # public-only: the same limit
     assert len(usage_reconcile_contracts._native_snapshot({"k": [[] for _ in range(10)]})["k"]) == 10
+
+
+class _TupleMapping(tuple, Mapping):  # dispatched as a mapping, though it is also a tuple
+    def __getitem__(self, key):
+        raise KeyError(key)
+
+    def __iter__(self):
+        return iter(())
+
+    def __len__(self):
+        return 0
+
+
+class _ListMapping(list, Mapping):
+    def __getitem__(self, key):
+        raise KeyError(key)
+
+    def __iter__(self):
+        return iter(())
+
+    def __len__(self):
+        return 0
+
+
+@pytest.mark.parametrize("hybrid", [_TupleMapping, _ListMapping], ids=["tuple+Mapping", "list+Mapping"])
+def test_containers_of_any_kind_exposed_only_by_a_view_are_charged_as_nodes(hybrid) -> None:
+    from contracts_limits import STANDARD
+
+    count = STANDARD.max_nodes + 1
+
+    class PublicOnly(list):  # empty native backing; the view exposes the hybrids
+        def __iter__(self):
+            return iter([hybrid() for _ in range(count)])
+
+    with pytest.raises(ValueError, match=run_discovery_message()):
+        usage_reconcile_contracts._native_snapshot({"k": PublicOnly()})
+    small = type("Small", (list,), {"__iter__": lambda self: iter([hybrid() for _ in range(10)])})
+    assert len(usage_reconcile_contracts._native_snapshot({"k": small()})["k"]) == 10

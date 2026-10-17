@@ -500,7 +500,8 @@ def _freeze_model_storage_body(
     if identity in visited:
         return
     visited.add(identity)
-    if not budget.charge_node(value):
+    budget.charge_node(value)  # by identity: an object already charged (wherever) costs nothing more
+    if _already_frozen(value, frozen_models, frozen_dicts, frozen_tuples):
         return  # already captured in this call (a later freeze starts with a fresh ``visited``)
 
     if inherits_native(value_type, BaseModel):
@@ -614,6 +615,22 @@ def _checked_native_names(
         raise ValueError("contract extra storage overlaps stored fields")
 
 
+def _already_frozen(
+    value: object,
+    frozen_models: dict[int, _FrozenModelStorage],
+    frozen_dicts: dict[int, _FrozenDictStorage],
+    frozen_tuples: dict[int, _FrozenTupleStorage],
+) -> bool:
+    """Whether this exact object's storage was already captured in this call (owner checked by identity)."""
+
+    identity = id(value)
+    for store in (frozen_models, frozen_dicts, frozen_tuples):
+        held = store.get(identity)
+        if held is not None and held[0] is value:
+            return True
+    return False
+
+
 def _native_snapshot(
     value: object,
     active: set[int] | None = None,
@@ -693,12 +710,11 @@ def _snapshot_uncached(
         # so it cannot match a literal it does not spell.
         return _plain_name(value)
 
-    # A container first met here (exposed only by a public view) is charged as a node, like any natively
-    # reachable one; its entries are charged as its view is read.  It is not frozen natively: a subtree a
-    # public view exposed keeps that view authoritative.  (Models and tuples are frozen, and charged, by
-    # their own branches below; charging is by identity, so an already captured container costs nothing.)
-    if not is_native_instance(value, BaseModel, tuple):
-        budget.charge_node(value)
+    # The one charging point for every container kind, before any branch is chosen: a container first met
+    # here (exposed only by a public view) costs a node like any natively reachable one, whichever branch then
+    # rebuilds it (a tuple that is also a mapping takes the mapping branch).  Charging is by identity, so an
+    # already captured container costs nothing more; capture decides what it has frozen by its own stores.
+    budget.charge_node(value)
     identity = id(value)
     if identity in active:
         raise ValueError("cyclic input graph")
