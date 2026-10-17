@@ -84,6 +84,9 @@ class _FrozenGraph(NamedTuple):
     public_sequence_cursor: list[int]
     public_sequences: dict[int, _FrozenPublicSequence]
     visits: list[int]
+    # Entries of native containers charged before they are copied (see ``_charge_native``): its own
+    # counter, so the pre-copy check does not spend the visit budget the snapshot uses for the same nodes.
+    native_entries: list[int]
     # id -> (the caller's datetime, its fixed-offset copy): one offset per object per call.  The
     # original is retained so its id cannot be reused by another object during the call.
     fixed_datetimes: dict[int, tuple[datetime, datetime]]
@@ -617,7 +620,7 @@ def _freeze_model_storage(
             extra_count = (
                 dict.__len__(extras) if extras is not None and _is_subclass(type(extras), dict) else 0
             )
-            _charge_native(frozen_graph, 1 + dict.__len__(stored) + extra_count)
+            _charge_native(frozen_graph, dict.__len__(stored) + extra_count)
             stored_entries = tuple(dict.items(stored))
             native_extra_entries = (
                 tuple(dict.items(extras))
@@ -642,13 +645,13 @@ def _freeze_model_storage(
                 continue
 
             if _is_subclass(value_type, tuple):
-                _charge_native(frozen_graph, 1 + tuple.__len__(current))
+                _charge_native(frozen_graph, tuple.__len__(current))
                 entries = tuple(tuple.__iter__(current))
             elif _is_subclass(value_type, list):
-                _charge_native(frozen_graph, 1 + list.__len__(current))
+                _charge_native(frozen_graph, list.__len__(current))
                 entries = tuple(list.__iter__(current))
             else:
-                _charge_native(frozen_graph, 1 + dict.__len__(current))
+                _charge_native(frozen_graph, dict.__len__(current))
                 dict_entries = tuple(dict.items(current))
                 entries = tuple(item for _key, item in dict_entries)
             if _is_exact_type(value_type, (dict, list, tuple)):
@@ -1090,6 +1093,7 @@ def _freeze_model_graphs(*values: Any) -> _FrozenGraph:
         public_sequence_cursor=[0],
         public_sequences={},
         visits=[0],
+        native_entries=[0],
         fixed_datetimes={},
     )
     visited: set[int] = set()
@@ -1125,16 +1129,21 @@ def _charge_capture(frozen_graph: _FrozenGraph) -> None:
 
 
 def _charge_native(frozen_graph: _FrozenGraph, count: int) -> None:
-    """Charge one native container and its entries *before* they are copied and retained.
+    """Charge a native container's entries *before* they are copied and retained.
 
     The count comes from the container's own length slot (no caller code runs), so an oversized
-    native graph is refused before it is materialized, against the same shared budget.
+    native graph is refused before it is materialized.  Every container but the root is an entry of
+    its parent, so counting entries bounds the nodes that are copied.  The limit is the snapshot's own
+    (``MAX_SNAPSHOT_VISITS``) but the counter is separate: a graph the snapshot accepts has at most that
+    many entries, so the check never refuses an input the snapshot would take, and the two phases do
+    not add up.
     """
 
-    if count > MAX_SNAPSHOT_VISITS - frozen_graph.visits[0]:
+    if count > MAX_SNAPSHOT_VISITS - frozen_graph.native_entries[0]:
+        frozen_graph.native_entries[0] = MAX_SNAPSHOT_VISITS + 1
         frozen_graph.visits[0] = MAX_SNAPSHOT_VISITS + 1
         raise ValueError(SNAPSHOT_BUDGET_MESSAGE)
-    frozen_graph.visits[0] += count
+    frozen_graph.native_entries[0] += count
 
 
 def _charge_snapshot(frozen_graph: _FrozenGraph, active: set[int]) -> None:

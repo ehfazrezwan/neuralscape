@@ -4892,3 +4892,58 @@ def test_an_oversized_native_container_is_refused_before_its_entries_are_copied(
     # Copying the 65,537 entries would allocate a tuple of about half a megabyte; refusing first
     # allocates only bookkeeping.
     assert peak < 128 * 1024, peak
+
+
+# ---- the pre-copy size check does not spend the snapshot's own budget a second time
+
+def test_a_flat_native_list_within_the_declared_budget_is_still_accepted() -> None:
+    """``MAX_SNAPSHOT_VISITS`` bounds the snapshot; a 40,000-entry list inside it keeps passing capture and snapshot."""
+
+    value = list(range(40_000))
+    frozen = run_manifest_module._freeze_model_graphs(value)
+    run_manifest_module._snapshot_native(value, _frozen_graph=frozen)
+
+
+def test_the_largest_accepted_native_list_is_the_snapshots_own_limit() -> None:
+    limit = run_manifest_module.MAX_SNAPSHOT_VISITS
+    for size, accepted in ((limit - 1, True), (limit, False)):
+        value = list(range(size))
+        try:
+            frozen = run_manifest_module._freeze_model_graphs(value)
+            run_manifest_module._snapshot_native(value, _frozen_graph=frozen)
+            verdict = True
+        except ValueError as error:
+            assert str(error) == run_manifest_module.SNAPSHOT_BUDGET_MESSAGE
+            verdict = False
+        assert verdict is accepted, size
+
+
+def test_finish_run_keeps_its_capacity_for_timing_measurements() -> None:
+    """3,000 distinct timing measurements were accepted before the pre-copy charge (the limit was 3,444)."""
+
+    base = timing()
+    measurements = tuple(base.model_copy(update={"name": f"m{i}"}) for i in range(3_000))
+    finish_run(
+        planned_manifest(),
+        state=RunState.COMPLETED,
+        started_at=datetime(2026, 9, 28, 8, 0, tzinfo=timezone.utc),
+        finished_at=datetime(2026, 9, 28, 9, 0, tzinfo=timezone.utc),
+        resources=(measured_memory(),),
+        measurements=measurements,
+    )
+
+
+def test_native_entries_across_containers_are_bounded_together_before_any_is_copied() -> None:
+    """Many containers that are each within the budget add up: the freeze refuses the graph, not just one container."""
+
+    import tracemalloc
+
+    graph = [list(range(1_000)) for _ in range(100)]  # 100,100 entries in total
+    tracemalloc.start()
+    try:
+        with pytest.raises(ValueError, match=run_manifest_module.SNAPSHOT_BUDGET_MESSAGE):
+            run_manifest_module._freeze_model_graphs(graph)
+        _current, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert peak < 2_000_000, peak  # about 66 of the 100 lists were counted and copied, not all of them plus a snapshot
