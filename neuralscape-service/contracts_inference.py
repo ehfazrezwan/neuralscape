@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import math
 import re
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from datetime import date
 from enum import Enum
 from ipaddress import AddressValueError, IPv4Address, IPv6Address
@@ -20,6 +20,7 @@ from pydantic import BaseModel, Field, JsonValue, model_validator
 
 from contracts_common import ContractModel, OpaqueId, SafeCounter, VersionedContract
 from contracts_engines import QualificationClaim, _validated_contract_snapshots
+from contracts_limits import STANDARD_MAX_EDGES
 from contracts_native import is_subclass
 from contracts_references import ReferenceHandle, SourceVersion
 
@@ -788,7 +789,88 @@ def _validate_json_value(value: JsonValue, location: str = "$") -> None:
             _validate_json_value(item, f"{location}/value/{index}")
 
 
-def _build_output_validator(schema: Mapping[str, JsonValue]) -> Any:
+# Schema execution is bounded on its own: the discovery and expansion budgets bound the schema and the
+# outputs, not the work of applying one to the other, which multiplies (every subschema of an applicator
+# runs against every item it reaches) and, for a few keywords, grows faster than either input.
+SCHEMA_EXECUTION_MESSAGE = "output schema execution exceeds its budget"
+MAX_SCHEMA_EXECUTION_UNITS = 8 * STANDARD_MAX_EDGES
+# One keyword application weighs as much as this many entries: about 130,000 applications per call.
+_KEYWORD_UNITS = 8
+
+
+class _SchemaExecutionMeter:
+    """Work of applying an output schema during one validation call; refuses past the limit."""
+
+    __slots__ = ("left",)
+
+    def __init__(self, limit: int = MAX_SCHEMA_EXECUTION_UNITS) -> None:
+        self.left = limit
+
+    def charge(self, units: int) -> None:
+        self.left -= units
+        if self.left < 0:
+            raise ValueError(SCHEMA_EXECUTION_MESSAGE)
+
+
+def _container_size(value: object) -> int:
+    return len(value) if is_subclass(type(value), (list, dict)) else 0  # type: ignore[arg-type]
+
+
+def _json_identity(value: object, meter: _SchemaExecutionMeter) -> object:
+    """A hashable form of a JSON value with JSON Schema equality: a boolean is not a number, 1 equals
+    1.0, arrays compare in order and objects by their key set, at any depth.  One unit per node."""
+
+    meter.charge(1)
+    kind = type(value)
+    if kind is bool:
+        return ("bool", value)
+    if is_subclass(kind, str):
+        return ("str", str.__str__(value))  # type: ignore[arg-type]
+    if is_subclass(kind, list):
+        return ("array", tuple(_json_identity(item, meter) for item in value))  # type: ignore[union-attr]
+    if is_subclass(kind, dict):
+        return ("object", frozenset((key, _json_identity(item, meter)) for key, item in value.items()))  # type: ignore[union-attr]
+    return ("value", value)  # a number (1 == 1.0 and hash alike) or null
+
+
+def _metered_validator_class(validator_class: Any, meter: _SchemaExecutionMeter) -> Any:
+    """The same validator with every keyword charged to ``meter`` and uniqueItems checked in linear time.
+
+    A keyword application costs ``_KEYWORD_UNITS`` (descending into a subschema is the expensive step)
+    plus one unit per entry of the instance it inspects and of its own
+    value (an enum list, required names, the subschemas of an applicator), the work it does itself; work
+    it delegates to subschemas is charged when they run.  jsonschema's uniqueItems falls back to comparing
+    every pair of items that cannot be sorted (objects), so it is replaced by a hashed check.
+    """
+
+    from jsonschema.exceptions import ValidationError as SchemaError
+    from jsonschema.validators import extend
+
+    def metered(keyword: Callable[..., Any]) -> Callable[..., Any]:
+        def apply(validator: Any, value: Any, instance: Any, schema: Any) -> Any:
+            meter.charge(_KEYWORD_UNITS + _container_size(instance) + _container_size(value))
+            yield from keyword(validator, value, instance, schema)
+
+        return apply
+
+    def unique_items(validator: Any, unique: Any, instance: Any, schema: Any) -> Any:
+        if unique and validator.is_type(instance, "array"):
+            seen: set[object] = set()
+            for item in instance:
+                identity = _json_identity(item, meter)
+                if identity in seen:
+                    yield SchemaError("array has non-unique elements")
+                    return
+                seen.add(identity)
+
+    keywords = {name: metered(keyword) for name, keyword in validator_class.VALIDATORS.items()}
+    keywords["uniqueItems"] = metered(unique_items)
+    return extend(validator_class, keywords)
+
+
+def _build_output_validator(
+    schema: Mapping[str, JsonValue], meter: _SchemaExecutionMeter | None = None
+) -> Any:
     validator_class, format_checker_class = _jsonschema_types()
     format_checker = _contract_format_checker(format_checker_class)
     if schema.get("$schema") != JSON_SCHEMA_DIALECT:
@@ -799,7 +881,8 @@ def _build_output_validator(schema: Mapping[str, JsonValue]) -> Any:
         validator_class.check_schema(schema)
     except Exception as exc:
         raise ValueError(f"invalid output schema: {exc}") from exc
-    return validator_class(schema, format_checker=format_checker)
+    metered_class = _metered_validator_class(validator_class, meter or _SchemaExecutionMeter())
+    return metered_class(schema, format_checker=format_checker)
 
 
 class GenerationRequest(VersionedContract):

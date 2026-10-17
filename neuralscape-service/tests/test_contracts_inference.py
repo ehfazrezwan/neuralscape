@@ -2133,3 +2133,71 @@ def test_repeated_string_subclass_leaves_are_charged_like_strings():
     request, result = _generation_with_output({"v": [leaf] * 1_000}, v={"type": "array"})
     with pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):
         validate_generation_result(request, result)
+
+
+# ---- schema execution is bounded, not only the inputs it runs on
+
+
+def test_unique_items_over_many_distinct_objects_is_checked_in_linear_time():
+    """8,000 distinct objects under uniqueItems: jsonschema's object fallback compares every pair."""
+
+    import time
+
+    request, result = _generation_with_output(
+        {"v": [{"id": index} for index in range(8_000)]}, v={"type": "array", "uniqueItems": True}
+    )
+    started = time.monotonic()
+    assert validate_generation_result(request, result).compliant
+    assert time.monotonic() - started < 2
+
+
+@pytest.mark.parametrize(
+    "items, unique",
+    [
+        ([1, 1.0], False),  # one number, two spellings
+        ([1, True], True),  # a boolean is not a number
+        ([0, False], True),
+        ([[True], [1]], True),  # also inside arrays
+        ([{"a": 1}, {"a": 1.0}], False),
+        ([{"a": 1, "b": 2}, {"b": 2, "a": 1}], False),  # key order does not matter
+        ([[1, 2], [2, 1]], True),  # item order does
+        (["1", 1], True),
+        ([None, None], False),
+    ],
+)
+def test_unique_items_keeps_json_schema_equality(items, unique):
+    request, result = _generation_with_output({"v": items}, v={"type": "array", "uniqueItems": True})
+    if unique:
+        assert validate_generation_result(request, result).compliant
+    else:
+        with pytest.raises(ValueError, match="does not match declared schema"):
+            validate_generation_result(request, result)
+
+
+def test_a_schema_whose_work_multiplies_with_the_output_is_refused_in_bounded_time():
+    """300 subschemas applied to each of 3,000 items: both fit the input budgets, the product does not."""
+
+    import time
+
+    request, result = _generation_with_output(
+        {"v": list(range(3_000))},
+        v={"type": "array", "items": {"allOf": [{"type": "number"}] * 300}},
+    )
+    started = time.monotonic()
+    with pytest.raises(ValueError, match="schema execution"):
+        validate_generation_result(request, result)
+    assert time.monotonic() - started < 3  # about 10 s when execution was unbounded
+
+
+def test_a_large_enum_applied_to_many_items_is_refused_in_bounded_time():
+    import time
+
+    allowed = [{"id": index} for index in range(3_000)]
+    request, result = _generation_with_output(
+        {"v": [{"id": index} for index in range(3_000)]},
+        v={"type": "array", "items": {"enum": allowed}},
+    )
+    started = time.monotonic()
+    with pytest.raises(ValueError, match="schema execution"):
+        validate_generation_result(request, result)
+    assert time.monotonic() - started < 2
