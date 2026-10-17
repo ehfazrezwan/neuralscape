@@ -1081,3 +1081,124 @@ def test_plain_scalar_subclasses_are_still_admitted_in_scalar_fields():
     applied = receipt(ProcessingStage.CANONICAL, StageStatus.APPLIED)
     kept_intent, _kept = contracts_lifecycle.validate_stage_receipts(command, (applied,))
     assert kept_intent.request_digest == "sha256:abc"
+
+
+def _large_enum(size: int):
+    import enum
+
+    return enum.Enum("Large", {f"M{index}": f"m{index}" for index in range(size)}, type=str)
+
+
+def _lifecycle_lines(call) -> int:
+    """Lines executed inside ``contracts_lifecycle`` while ``call`` runs: the module's own work, by count."""
+
+    import sys
+
+    module_file = contracts_lifecycle.__file__
+    count = [0]
+
+    def tracer(frame, event, arg):
+        if frame.f_code.co_filename != module_file:
+            return None
+
+        def local(frame, event, arg):
+            if event == "line":
+                count[0] += 1
+            return local
+
+        return local(frame, event, arg)
+
+    sys.settrace(tracer)
+    try:
+        call()
+    finally:
+        sys.settrace(None)
+    return count[0]
+
+
+def test_repeating_a_member_of_a_large_enum_does_not_rescan_its_members():
+    """Membership is decided from an identity index built once per class and call: 400 repeats of the last
+    member of a 500-member enum cost about the same as 400 repeats of a member of a 2-member enum."""
+
+    from tests.test_contracts_lifecycle import intent_with_requirements, requirement
+
+    def run(member) -> int:
+        command = intent_with_requirements(requirement(ProcessingStage.CANONICAL))
+        set_native(command, "request_digest", (member,) * 400)  # captured (and charged) before validation refuses it
+        applied = receipt(ProcessingStage.CANONICAL, StageStatus.APPLIED)
+
+        def call():
+            with pytest.raises(ValueError):
+                contracts_lifecycle.validate_stage_receipts(command, (applied,))
+
+        return _lifecycle_lines(call)
+
+    small = run(_large_enum(2).M1)
+    large = run(_large_enum(500).M499)
+    assert large - small < 10_000, (small, large)  # a rescan per leaf is about 200,000 lines
+
+
+def test_the_member_index_is_charged_to_the_discovery_budget_once_per_class():
+    from contracts_limits import DiscoveryBudget
+
+    large = _large_enum(500)
+    budget = DiscoveryBudget(contracts_lifecycle.LIFECYCLE_TIER)
+    contracts_lifecycle._capture_native_contract_graph((large.M499,) * 400, budget=budget)
+    mro_length = len(type.__dict__["__mro__"].__get__(large))
+    assert budget.edges == 1 + 400 + mro_length + 500  # the tuple, its items, one class walk, one member index
+
+
+def test_an_enum_with_more_members_than_the_budget_allows_is_refused():
+    from contracts_limits import DiscoveryBudget
+
+    budget = DiscoveryBudget(contracts_lifecycle.LIFECYCLE_TIER)
+    budget.charge_edge(budget.tier.max_edges - 10)
+    with pytest.raises(ValueError, match=BUDGET):
+        contracts_lifecycle._capture_native_contract_graph(_large_enum(20).M0, budget=budget)
+
+
+def test_a_forged_instance_of_a_large_enum_is_still_refused_after_its_index_is_built():
+    large = _large_enum(500)
+    forged = str.__new__(large, "m499")
+    shared: dict = {}
+    contracts_lifecycle._capture_native_contract_graph(large.M499, captured_by_identity=shared)
+    with pytest.raises(ValueError, match="declared member"):
+        contracts_lifecycle._capture_native_contract_graph(forged, captured_by_identity=shared)
+
+
+def _deep_str_class(depth: int) -> type:
+    kind = str
+    for _ in range(depth):
+        kind = type("Deeper", (kind,), {})
+    return kind
+
+
+def test_repeating_a_leaf_of_a_deeply_derived_class_does_not_rewalk_its_mro():
+    """A leaf's class is classified once per call (its MRO walked and charged once), not once per leaf."""
+
+    from tests.test_contracts_lifecycle import intent_with_requirements, requirement
+
+    def run(kind) -> int:
+        command = intent_with_requirements(requirement(ProcessingStage.CANONICAL))
+        set_native(command, "request_digest", (kind("sha256:abc"),) * 400)
+        applied = receipt(ProcessingStage.CANONICAL, StageStatus.APPLIED)
+
+        def call():
+            with pytest.raises(ValueError):
+                contracts_lifecycle.validate_stage_receipts(command, (applied,))
+
+        return _lifecycle_lines(call)
+
+    shallow = run(_deep_str_class(1))
+    deep = run(_deep_str_class(300))
+    assert deep - shallow < 10_000, (shallow, deep)
+
+
+def test_a_leaf_class_mro_is_charged_to_the_discovery_budget_once_per_class():
+    from contracts_limits import DiscoveryBudget
+
+    kind = _deep_str_class(300)
+    mro_length = len(type.__dict__["__mro__"].__get__(kind))
+    budget = DiscoveryBudget(contracts_lifecycle.LIFECYCLE_TIER)
+    contracts_lifecycle._capture_native_contract_graph((kind("a"),) * 400, budget=budget)
+    assert budget.edges == 1 + 400 + mro_length

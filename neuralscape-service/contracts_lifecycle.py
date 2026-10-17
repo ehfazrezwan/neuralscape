@@ -199,17 +199,36 @@ _TYPE_NAMESPACE = type.__dict__["__dict__"]  # a class's own namespace, read wit
 _NATIVE_LEAF_TYPES = (str, int, float, bytes, type(None), date, timedelta)
 
 
-def _is_declared_member(value: object) -> bool:
+_MEMBERS = "members"  # memo key prefix: one enum class's member identities, indexed once per call
+
+
+def _is_declared_member(
+    value: object,
+    captured_by_identity: dict[Any, Any],
+    budget: DiscoveryBudget,
+) -> bool:
     """Whether an enum instance is one of its class's declared members, read without any hook.
 
     ``type(value).__members__`` is an attribute lookup on the enum's class, so a caller's enum metaclass
     (its ``__getattribute__``, or a ``__members__`` it overrides) would run during capture and could change
     a later value before that value is captured.  The member map is read from the class's own namespace
-    instead, and iterated with the base ``dict`` method.
+    instead, and iterated with the base ``dict`` method.  It is indexed by identity once per class and
+    call, each member charged one edge before the index is built, so repeated leaves of a large enum do
+    not rescan it.  The index keeps the class and its members alive, so no indexed ``id()`` is recycled.
     """
 
-    members = _TYPE_NAMESPACE.__get__(type(value)).get("_member_map_")
-    return type(members) is dict and any(member is value for member in dict.values(members))
+    kind = type(value)
+    memo = captured_by_identity.get((_MEMBERS, id(kind)))
+    if memo is None or memo[0] is not kind:
+        members = _TYPE_NAMESPACE.__get__(kind).get("_member_map_")
+        if type(members) is dict:
+            budget.charge_edge(dict.__len__(members))
+            declared = tuple(dict.values(members))
+        else:
+            declared = ()
+        memo = (kind, declared, frozenset(id(member) for member in declared))
+        captured_by_identity[(_MEMBERS, id(kind))] = memo
+    return id(value) in memo[2]
 
 
 _IMPERSONATION_HOOKS = ("__class__", "__getattribute__")
@@ -236,7 +255,43 @@ def _claims_another_class(kind: type) -> bool:
     return False
 
 
-def _native_leaf(value: object) -> object:
+_LEAF_CLASS = "leaf-class"  # memo key prefix: one leaf class's verdict, decided once per call
+
+
+def _leaf_class_verdict(
+    kind: type,
+    captured_by_identity: dict[Any, Any],
+    budget: DiscoveryBudget,
+) -> str:
+    """Classify a leaf's class once per call: ``"enum"``, ``"native"`` or ``"refused"``.
+
+    Every check walks the class's MRO, which a caller can make arbitrarily deep; the walk is charged one
+    edge per class in it and its verdict kept (with the class, so its ``id()`` is not recycled), so
+    repeated leaves of one class do not walk it again.
+    """
+
+    memo = captured_by_identity.get((_LEAF_CLASS, id(kind)))
+    if memo is not None and memo[0] is kind:
+        return memo[1]
+    mro = _TYPE_MRO.__get__(kind)
+    budget.charge_edge(tuple.__len__(mro))
+    if _claims_another_class(kind):
+        verdict = "refused"
+    elif any(base is Enum for base in mro):
+        verdict = "enum"
+    elif any(base is native for base in mro for native in _NATIVE_LEAF_TYPES):
+        verdict = "native"
+    else:
+        verdict = "refused"
+    captured_by_identity[(_LEAF_CLASS, id(kind))] = (kind, verdict)
+    return verdict
+
+
+def _native_leaf(
+    value: object,
+    captured_by_identity: dict[Any, Any],
+    budget: DiscoveryBudget,
+) -> object:
     """Admit a leaf only when its real type is a native scalar, or an enum member by identity.
 
     Validation reads any other object through its own attribute protocol: a proxy claiming a contract
@@ -245,14 +300,12 @@ def _native_leaf(value: object) -> object:
     misjudge it.  Both are refused here, before validation sees them; no hook runs to decide.
     """
 
-    mro = _TYPE_MRO.__get__(type(value))
-    if _claims_another_class(type(value)):
-        raise ValueError("a contract value must be a native scalar, an enum member, a model or a container")
-    if any(base is Enum for base in mro):
-        if not _is_declared_member(value):
+    verdict = _leaf_class_verdict(type(value), captured_by_identity, budget)
+    if verdict == "enum":
+        if not _is_declared_member(value, captured_by_identity, budget):
             raise ValueError("an enum value must be a declared member of its enum")
         return value
-    if any(base is native for base in mro for native in _NATIVE_LEAF_TYPES):
+    if verdict == "native":
         return value
     raise ValueError("a contract value must be a native scalar, an enum member, a model or a container")
 
@@ -403,7 +456,7 @@ def _capture_native_contract_graph(
             return captured
         finally:
             active_containers.remove(identity)
-    return _CapturedLeaf(_native_leaf(value))
+    return _CapturedLeaf(_native_leaf(value, captured_by_identity, budget))
 
 
 def _observed_public_view(
@@ -428,7 +481,7 @@ def _observed_public_view(
                 budget=budget,
             )
         budget.charge_edge()
-        return _CapturedLeaf(_native_leaf(item))
+        return _CapturedLeaf(_native_leaf(item, captured_by_identity, budget))
 
     memo = captured_by_identity.get(("view", id(source)))
     if memo is not None and memo[0] is source:
