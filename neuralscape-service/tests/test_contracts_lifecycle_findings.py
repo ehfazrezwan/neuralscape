@@ -120,3 +120,58 @@ def test_the_first_unreadable_receipt_still_reports_its_own_error_in_order() -> 
         _claim((readable, _unreadable_receipt(), _unreadable_receipt()))
     with pytest.raises(TypeError, match="value must be a StageReceipt"):
         _claim((object(), _unreadable_receipt()))  # an earlier receipt's own error comes first
+
+
+# ------------------------------------- shared native structure: work per object, not per path
+def _diamond(depth: int, kind=tuple):
+    node = kind()
+    for _ in range(depth):
+        node = kind((node, node)) if kind is not dict else {"a": node, "b": node}
+    return node
+
+
+@pytest.mark.parametrize("kind", [tuple, list, dict])
+def test_a_tiny_shared_graph_costs_work_per_object_not_per_path(kind) -> None:
+    """20 objects, each holding the next twice (2^20 paths): materialization must reuse what it already
+    built for an object instead of rebuilding (and charging) every path through it."""
+
+    import time
+
+    from pydantic import BaseModel
+
+    from tests.test_contracts_lifecycle import BASE_MODEL_DICT_DESCRIPTOR
+
+    shared = receipt(CANONICAL, StageStatus.APPLIED)
+    dict.__setitem__(BASE_MODEL_DICT_DESCRIPTOR.__get__(shared, BaseModel), "output_refs", (_diamond(20, kind),))
+    started = time.monotonic()
+    with pytest.raises(ValueError) as refused:
+        _claim((shared,))
+    rendered = str(refused.value)  # an error naming the input must not expand it either
+    elapsed = time.monotonic() - started
+    assert "budget" not in rendered  # refused for what it is, not for its path count
+    assert elapsed < 0.5, elapsed
+    assert len(rendered) < 10_000
+
+
+def test_a_shared_subtree_too_deep_on_one_path_is_still_refused_by_depth() -> None:
+    """Reuse keeps the depth check per path: a subtree built first on a shallow path and then reached on a
+    deep one is refused when the deep path exceeds the depth limit, exactly as without reuse."""
+
+    from pydantic import BaseModel
+
+    from contracts_limits import DISCOVERY_BUDGET_MESSAGE, PORTABILITY_MAX_DEPTH
+    from tests.test_contracts_lifecycle import BASE_MODEL_DICT_DESCRIPTOR
+
+    def claim_with(subtree):
+        deep = subtree
+        for _ in range(PORTABILITY_MAX_DEPTH - 6):  # the wrappers alone stay within the limit ...
+            deep = (deep,)
+        shared = receipt(CANONICAL, StageStatus.APPLIED)
+        dict.__setitem__(BASE_MODEL_DICT_DESCRIPTOR.__get__(shared, BaseModel), "output_refs", (subtree, deep))
+        _claim((shared,))
+
+    with pytest.raises(ValueError) as shallow:
+        claim_with(_diamond(0))
+    assert DISCOVERY_BUDGET_MESSAGE not in str(shallow.value)  # ... refused only as invalid refs
+    with pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):
+        claim_with(_diamond(8))  # ... but a subtree of height 8 under them is too deep on that path

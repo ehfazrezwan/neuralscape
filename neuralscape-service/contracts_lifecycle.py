@@ -19,6 +19,7 @@ from pydantic import (
     ConfigDict,
     Field,
     Strict,
+    ValidationError,
     WrapValidator,
     field_validator,
     model_validator,
@@ -378,6 +379,36 @@ def _observed_public_view(
     captured_by_identity[("view", id(source))] = (source, tuple(seen))
 
 
+_MATERIALIZED = "materialized"  # memo key prefix: the finished copy of a pure native container
+_REUSED = "reused"  # memo key: set once a copy nesting containers was shared between paths
+
+
+def _remember_pure_copy(
+    value: _CapturedGraph,
+    children: tuple[_CapturedGraph, ...],
+    result: object,
+    captured_by_identity: dict[Any, Any],
+) -> None:
+    """Keep ``result`` for reuse when ``value`` is a pure native container.
+
+    Pure: an exact ``tuple``, ``list`` or ``dict`` (plain ``str`` keys) whose children are leaves or
+    pure containers themselves, so rebuilding it on another path runs no caller code and gives
+    the same copy.  The subtree's height is kept so a later path is still depth-checked.
+    """
+
+    height = 0
+    for child in children:
+        if isinstance(child, _CapturedLeaf):
+            continue
+        if not isinstance(child, (_CapturedDict, _CapturedList, _CapturedTuple)):
+            return
+        entry = captured_by_identity.get((_MATERIALIZED, child.identity))
+        if entry is None or entry[0] is not child.source:
+            return
+        height = max(height, entry[2] + 1)
+    captured_by_identity[(_MATERIALIZED, value.identity)] = (value.source, result, height)
+
+
 def _materialize_captured_graph(
     value: _CapturedGraph,
     captured_by_identity: dict[Any, Any],
@@ -403,6 +434,14 @@ def _materialize_captured_graph(
     identity = value.identity
     if identity in active_containers:
         raise ValueError("cyclic contract graph is not valid input")
+    reused = captured_by_identity.get((_MATERIALIZED, identity))
+    if reused is not None and reused[0] is value.source:
+        # A pure native container already built on another path: reuse the copy (its subtree was
+        # charged once), checking this path's depth against the subtree's height.
+        budget.visit(value.source, len(active_containers) + reused[2])
+        if reused[2]:  # a shared copy that nests containers: its rendering grows per path
+            captured_by_identity[_REUSED] = True
+        return reused[1]
     budget.visit(value.source, len(active_containers))
     active_containers.add(identity)
     try:
@@ -441,7 +480,7 @@ def _materialize_captured_graph(
                 )
             return fields
         if isinstance(value, _CapturedDict):
-            return {
+            built = {
                 key: _materialize_captured_graph(
                     item,
                     captured_by_identity,
@@ -450,13 +489,17 @@ def _materialize_captured_graph(
                 )
                 for key, item in value.entries
             }
+            if is_exact_type(value.source, dict) and all(is_exact_type(key, str) for key, _ in value.entries):
+                _remember_pure_copy(value, tuple(item for _, item in value.entries), built, captured_by_identity)
+            return built
 
         def observed_view(source: object) -> Iterator[_CapturedGraph]:
             return _observed_public_view(source, captured_by_identity, budget)
 
         if isinstance(value, _CapturedList):
-            items = value.items if is_exact_type(value.source, list) else observed_view(value.source)
-            return [
+            exact = is_exact_type(value.source, list)
+            items = value.items if exact else observed_view(value.source)
+            built_list = [
                 _materialize_captured_graph(
                     item,
                     captured_by_identity,
@@ -465,8 +508,12 @@ def _materialize_captured_graph(
                 )
                 for item in items
             ]
-        items = value.items if is_exact_type(value.source, tuple) else observed_view(value.source)
-        return tuple(
+            if exact:
+                _remember_pure_copy(value, value.items, built_list, captured_by_identity)
+            return built_list
+        exact = is_exact_type(value.source, tuple)
+        items = value.items if exact else observed_view(value.source)
+        built_tuple = tuple(
             _materialize_captured_graph(
                 item,
                 captured_by_identity,
@@ -475,6 +522,9 @@ def _materialize_captured_graph(
             )
             for item in items
         )
+        if exact:
+            _remember_pure_copy(value, value.items, built_tuple, captured_by_identity)
+        return built_tuple
     finally:
         active_containers.remove(identity)
 
@@ -536,10 +586,30 @@ def _revalidated_captured_model(
     captured: _CapturedGraphSnapshot,
     budget: DiscoveryBudget | None = None,
 ) -> _ModelT:
-    return model_type.model_validate(
-        _materialize_contract_graph(captured, budget),
-        strict=True,
-    )
+    """Strictly validate a materialized graph; if it shares subtrees, never echo it in an error.
+
+    A validation error normally repeats the offending input.  When the copy shares subtrees
+    between paths, the input's text is exponentially larger than the graph, so the error is
+    rebuilt without the input: the same types, locations and messages, nothing embedded.
+    Ordinary inputs keep the full diagnostic.
+    """
+
+    native = _materialize_contract_graph(captured, budget)
+    try:
+        return model_type.model_validate(native, strict=True)
+    except ValidationError as error:
+        if not captured[1].get(_REUSED):
+            raise
+        lines = [
+            {"type": e["type"], "loc": e["loc"], "input": "<omitted: input shares subtrees>",
+             **({"ctx": e["ctx"]} if "ctx" in e else {})}
+            for e in error.errors(include_input=False, include_url=False)
+        ]
+        try:
+            bounded: Exception = ValidationError.from_exception_data(error.title, lines)  # type: ignore[arg-type]
+        except Exception:  # noqa: BLE001 - a type that cannot be rebuilt still gets a bounded, value-free error
+            bounded = ValueError(f"{error.title}: {error.error_count()} validation error(s)")
+        raise bounded from None
 
 
 def _revalidated_inventory_model(
