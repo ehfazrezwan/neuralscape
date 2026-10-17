@@ -900,6 +900,8 @@ def _snapshot_captured_graph(
             for key, item in stored_entries:
                 if again:
                     budget.charge_edge()
+                if not captured.pure_names:
+                    _charge_key_hash(key, budget)  # an impure model is rebuilt, and its keys hashed, on every path
                 fields[key] = _snapshot_captured_graph(
                     item, active_containers, inventory, below,
                     item_models.get(key) if item_models else None, declared_children.get(key),
@@ -921,6 +923,8 @@ def _snapshot_captured_graph(
             for key, item in extra_entries:
                 if again:
                     budget.charge_edge()
+                if not captured.pure_names:
+                    _charge_key_hash(key, budget)
                 fields[key] = _snapshot_captured_graph(item, active_containers, inventory, below)
                 height = _taller(height, item, completed)
             result: object = fields

@@ -2104,3 +2104,32 @@ def test_the_same_entry_yielded_repeatedly_is_not_charged_again() -> None:
     value = Holder.model_construct(items=_GeneratedItems(lambda: iter([entry] * 100)))  # one entry, 100 times
     snapshot_contract_graph(value, contract=Holder)  # judged once and charged once at this stage
     assert calls["n"] == 1
+
+
+# ---- a model with a key whose hash is not remembered pays for it on every rebuild, in storage and in extras
+
+
+def _model_with_impure_key(where: str):
+    from contracts_common import ContractModel
+
+    class Leaf(ContractModel):
+        x: int = 0
+
+    leaf = Leaf.model_construct(x=1)
+    huge = _IntKey(1 << (1 << 20))
+    if where == "stored":
+        dict.__setitem__(_STORED(leaf, BaseModel), huge, 1)
+    else:
+        object.__setattr__(leaf, "__pydantic_extra__", {huge: 1})
+    return leaf
+
+
+@pytest.mark.parametrize("where", ["stored", "extra"])
+def test_a_model_with_an_integer_subclass_key_pays_for_it_on_every_path_that_rebuilds_it(where) -> None:
+    from contracts_common import snapshot_contract_graph
+    from contracts_limits import DISCOVERY_BUDGET_MESSAGE
+
+    leaf = _model_with_impure_key(where)  # impure: rebuilt, and its key hashed, once per path that reaches it
+    snapshot_contract_graph([leaf] * 20)
+    with pytest.raises(ValueError, match=re.escape(DISCOVERY_BUDGET_MESSAGE)):
+        snapshot_contract_graph([leaf] * 4_000)
