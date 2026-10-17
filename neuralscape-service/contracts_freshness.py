@@ -484,6 +484,15 @@ def _version_maps(*sequences: Sequence[SourceVersion]) -> tuple[dict[str, tuple[
     3. A model reachable twice is captured once, at its first exposure, and that capture is reused.
     """
 
+    # The native entries count against the same budget as the iterated ones, and are counted from their built-in
+    # lengths before anything is copied, so an oversized native sequence is refused without being read.
+    native_entries = sum(
+        tuple.__len__(sequence) if type(sequence) is tuple else list.__len__(sequence)  # type: ignore[arg-type]
+        for sequence in sequences
+        if type(sequence) in (tuple, list)
+    )
+    if native_entries > _MAX_SEQUENCE_ENTRIES:
+        raise ValueError(_SEQUENCE_BUDGET_MESSAGE)
     native: list[tuple[object, ...] | None] = []
     for sequence in sequences:
         kind = type(sequence)
@@ -511,7 +520,7 @@ def _version_maps(*sequences: Sequence[SourceVersion]) -> tuple[dict[str, tuple[
             raise ValueError(f"duplicate source version for record_id {record_id!r}")
         result[record_id] = (version.content_revision, version.policy_epoch)
 
-    read = 0
+    read = native_entries  # carried into the iterated entries: one combined limit
     maps = []
     for sequence, group in zip(sequences, native):
         result: dict[str, tuple[int, int]] = {}

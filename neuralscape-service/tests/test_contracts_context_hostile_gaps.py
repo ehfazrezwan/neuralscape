@@ -252,3 +252,108 @@ def test_a_pinned_offset_is_an_exact_timedelta_whatever_the_zone_returned() -> N
     pinned = pin_datetime(datetime(*_NOON, tzinfo=Zone()))
     assert type(pinned.utcoffset()) is timedelta and pinned.utcoffset() == timedelta(hours=2)
     assert pinned - datetime(*_NOON, tzinfo=UTC) == timedelta(hours=-2)
+
+
+# ---- review round: offsets with their own subtraction, hostile and foreign-enum keys, the combined entry budget
+
+import enum  # noqa: E402
+
+import contracts_freshness  # noqa: E402
+from contracts_freshness import projection_status_for  # noqa: E402
+from contracts_references import SourceVersion  # noqa: E402
+
+
+def test_an_offset_with_its_own_subtraction_cannot_make_a_later_verification_look_earlier_for_a_direct_receiver() -> None:
+    class Zone(tzinfo):
+        def utcoffset(self, dt):
+            return OffsetWithOwnArithmetic(0)  # really UTC; its subtraction claims otherwise
+
+        def dst(self, dt):
+            return timedelta(0)
+
+    with pytest.raises(ValidationError):  # 13:00 is after the 12:00 observation, whatever the offset's arithmetic says
+        _direct(datetime(2026, 9, 28, 12, tzinfo=UTC), datetime(2026, 9, 28, 13, tzinfo=Zone()))
+    with pytest.raises(ValidationError):
+        _direct(datetime(2026, 9, 28, 12, tzinfo=Zone()), datetime(2026, 9, 28, 13, tzinfo=Zone()))
+
+
+def test_a_hostile_key_runs_none_of_its_callbacks_and_is_refused() -> None:
+    calls: list[str] = []
+
+    class HostileKey:
+        def __repr__(self):
+            calls.append("repr")
+            return "key"
+
+        def __hash__(self):
+            calls.append("hash")
+            return 1
+
+        def __eq__(self, other):
+            calls.append("eq")
+            return False
+
+        def __str__(self):
+            calls.append("str")
+            return "key"
+
+    snapshot = {HostileKey(): 1}
+    calls.clear()  # inserting the key hashed it; only what the check does counts
+    with pytest.raises(ValueError, match="unsupported key type"):
+        require_native_snapshot({"outer": [snapshot]})
+    assert calls == []
+
+
+def test_a_foreign_enum_key_is_refused_like_a_foreign_enum_value() -> None:
+    class Foreign(enum.Enum):
+        A = "a"
+
+    with pytest.raises(ValueError, match="unsupported key type"):
+        require_native_snapshot({Foreign.A: 1})
+    with pytest.raises(ValueError, match="unsupported value type"):
+        require_native_snapshot({"a": Foreign.A})
+
+
+def _versions(count: int, start: int = 0) -> list[SourceVersion]:
+    return [SourceVersion(record_id=f"r{start + index}", content_revision=1, policy_epoch=1) for index in range(count)]
+
+
+class _View(list):
+    """A list subclass: its public iterator is the only way in, so every entry counts against the budget."""
+
+
+def test_native_entries_count_against_the_combined_entry_budget(monkeypatch) -> None:
+    monkeypatch.setattr(contracts_freshness, "_MAX_SEQUENCE_ENTRIES", 10)
+    native = _versions(3)
+    assert projection_status_for(_View(_versions(7, 100)), native) is not None  # 3 native + 7 iterated = 10: allowed
+    with pytest.raises(ValueError, match="budget"):
+        projection_status_for(_View(_versions(8, 100)), native)  # 11 in all: one over
+
+
+def test_a_native_group_over_the_budget_is_refused_before_anything_is_copied(monkeypatch) -> None:
+    monkeypatch.setattr(contracts_freshness, "_MAX_SEQUENCE_ENTRIES", 10)
+    captured: list[object] = []
+    real = contracts_freshness.snapshot_contract_graph
+    monkeypatch.setattr(contracts_freshness, "snapshot_contract_graph", lambda value, *a, **k: captured.append(value) or real(value, *a, **k))
+    with pytest.raises(ValueError, match="budget"):
+        projection_status_for(_versions(11), _versions(1, 100))
+    assert captured == []
+
+
+def test_the_budget_counts_both_native_sequences_together(monkeypatch) -> None:
+    monkeypatch.setattr(contracts_freshness, "_MAX_SEQUENCE_ENTRIES", 10)
+    assert projection_status_for(_versions(5), _versions(5, 100)) is not None
+    with pytest.raises(ValueError, match="budget"):
+        projection_status_for(_versions(6), _versions(5, 100))
+
+
+def test_the_documented_limit_holds_at_its_real_size_for_one_native_and_a_full_iterator() -> None:
+    limit = contracts_freshness._MAX_SEQUENCE_ENTRIES
+    entries = _versions(limit + 1)  # distinct sources, one more than the limit allows in all
+
+    class Lazy(_View):
+        def __iter__(self):
+            return iter(entries[1:])  # `limit` iterated entries: with one native entry, one over
+
+    with pytest.raises(ValueError, match="budget"):
+        projection_status_for(Lazy(), [entries[0]])
