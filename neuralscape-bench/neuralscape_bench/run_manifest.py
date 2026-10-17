@@ -673,6 +673,8 @@ def _unique_items(entries: Any, where: str) -> dict[Any, Any]:
 
     rebuilt: dict[Any, Any] = {}
     for key, item in entries:
+        if type(key) is not str:  # text was copied to exact text at capture; any other key could change how it compares
+            raise ValueError(f"unsupported key type in {where}")
         size = len(rebuilt)
         rebuilt[key] = item
         if len(rebuilt) == size:
@@ -1475,8 +1477,11 @@ def _snapshot_native(
                         raise extra_inventory.failure
                     iterated_extra_names = extra_inventory.iterated_names
                     extra_entries = extra_inventory.item_entries
-                undeclared.update(_exact_key(name) for name in iterated_extra_names)
-                undeclared.update(_exact_key(key) for key, _ in extra_entries)
+                extra_names = [_exact_key(name) for name in iterated_extra_names]
+                extra_names.extend(_exact_key(key) for key, _ in extra_entries)
+                if any(type(name) is not str for name in extra_names):
+                    raise ValueError(f"unsupported key type in extras at {path}")
+                undeclared.update(extra_names)
             if undeclared:
                 # Name the first few (sorted by label) and count the rest, so the error stays small.
                 labels = heapq.nsmallest(_UNDECLARED_NAMES_LISTED, map(_key_label, undeclared))
@@ -1528,6 +1533,8 @@ def _snapshot_native(
             projected: dict[Any, Any] = {}
             for key, item in frozen_mapping.entries:
                 key = _exact_key(key)  # read as exact text: no hook runs, and a twin of another key's text is a repeat
+                if type(key) is not str:
+                    raise ValueError(f"unsupported key type in public mapping at {path}")
                 _protect_yielded_model_storage(item, _frozen_graph)
                 item_path = _Path(path, ("key", key))
                 size = len(projected)
