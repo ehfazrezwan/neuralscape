@@ -349,6 +349,10 @@ class _GraphInventory:
     # neither identity can be reused): a pure subtree is reconstructed once and shared, so the same item yielded
     # many times for one model is judged once, while a different model judges it afresh.
     validated: dict[tuple[int, int], tuple[object, type]] = field(default_factory=dict)
+    # The expanded size of every snapshot node measured so far, by identity: ``(node, nodes counted per path)``
+    # (held, so its id cannot be reused), and the running total charged by the eager validation of this call.
+    expanded_sizes: dict[int, tuple[object, int]] = field(default_factory=dict)
+    expanded_work: int = 0
     # ``str``-subclass keys already read as text, by identity: ``(the key, its text)``.  The key stays referenced.
     key_texts: dict[int, tuple[object, str]] = field(default_factory=dict)
     # Completed reconstructions of pure subtrees, keyed by identity:
@@ -576,6 +580,41 @@ def _private_copy(value: object, limit: int) -> object:
     return copy(value)[0]
 
 
+def _charge_expanded_work(snapshot: object, inventory: "_GraphInventory") -> None:
+    """Add the expanded size of one entry about to be validated to the call's running total; refuse past the limit.
+
+    Eager validation walks a shared subtree once per path, and every distinct entry is validated separately, so
+    the work is the sum of the entries' expanded sizes, not the largest.  Sizes are measured once per node
+    (memoized by identity), so measuring costs the distinct nodes only.  The limit is the same as for one entry:
+    the tier's edge limit, in nodes (``limit`` edges is ``limit + 1`` nodes).
+    """
+
+    sizes = inventory.expanded_sizes
+    limit = inventory.budget.tier.max_edges
+
+    def size_of(node: object) -> int:
+        kind = type(node)
+        if kind is not dict and kind is not list and kind is not tuple:
+            return 1
+        known = sizes.get(id(node))
+        if known is not None and known[0] is node:
+            return known[1]
+        total = 1
+        children = (
+            dict.values(node) if kind is dict else (list.__iter__(node) if kind is list else tuple.__iter__(node))  # type: ignore[arg-type]
+        )
+        for child in children:
+            total += size_of(child)
+            if total > limit + 1:
+                raise ValueError(DISCOVERY_BUDGET_MESSAGE)
+        sizes[id(node)] = (node, total)
+        return total
+
+    inventory.expanded_work += size_of(snapshot)
+    if inventory.expanded_work > limit + 1:
+        raise ValueError(DISCOVERY_BUDGET_MESSAGE)
+
+
 def bounded_private_copy(value: object) -> object:
     """``_private_copy`` held to the standard tier's edge limit: the gate every final validation passes first.
 
@@ -729,6 +768,7 @@ def _exposed_items(
             done = inventory.validated.get((id(snapshot), id(item_model)))
             if done is not None and done[0] is snapshot and done[1] is item_model:
                 continue  # the same shared snapshot, already guarded and validated (immutable, unreachable by callers)
+            _charge_expanded_work(snapshot, inventory)  # before any copy or validation: the call's total is bounded
             try:
                 if inventory.entry_guard is not None:
                     inventory.entry_guard(snapshot)  # the receiving boundary's type check, before pydantic sees it

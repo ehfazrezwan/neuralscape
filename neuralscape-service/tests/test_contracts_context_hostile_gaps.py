@@ -1929,7 +1929,7 @@ def test_receipt_matches_refuses_an_oversized_expansion_before_validating_it(mon
 
 def test_a_small_repeating_bundle_is_still_judged() -> None:
     request, bundle = _bundle_repeating_one_nested_item(repeats=3, nested=1)
-    assert bundle_matches_reported_evidence(request, bundle) in (True, False)  # no budget refusal for a small graph
+    assert bundle_matches_reported_evidence(request, bundle) is True  # the fixture's evidence matches: a refusal is over-rejection
 
 
 def test_a_pipe_none_declared_child_and_sequence_keep_their_declared_contract() -> None:
@@ -2070,3 +2070,37 @@ def test_an_impure_dictionary_reached_by_many_paths_pays_for_its_key_each_time_i
     snapshot_contract_graph([shared] * 20)
     with pytest.raises(ValueError, match=re.escape(DISCOVERY_BUDGET_MESSAGE)):
         snapshot_contract_graph([shared] * 4_000)
+
+
+# ---- the eager work of one call is bounded in total, not once per distinct entry
+
+
+def test_distinct_entries_sharing_a_large_subtree_share_one_call_wide_work_budget() -> None:
+    from contracts_common import snapshot_contract_graph
+    from contracts_limits import DISCOVERY_BUDGET_MESSAGE
+
+    Item, Holder, calls = _counting_item_contract()
+    payload = tuple(range(2_000))  # one shared subtree: cheap to discover, 2,000 entries to validate per item
+
+    # each entry is distinct (its own dictionary) yet shares the payload: 100 x 2,000 expanded entries
+    entries = [{"payload": payload} for _ in range(100)]
+    value = Holder.model_construct(items=_GeneratedItems(lambda: iter(entries)))
+    with pytest.raises(ValueError, match=re.escape(DISCOVERY_BUDGET_MESSAGE)):
+        snapshot_contract_graph(value, contract=Holder)
+    assert calls["n"] <= 66  # refused once the cumulative expanded size passed the limit (about 65 entries), not after all 100
+
+    calls["n"] = 0
+    few = Holder.model_construct(items=_GeneratedItems(lambda: iter(entries[:20])))
+    snapshot_contract_graph(few, contract=Holder)  # 20 x 2,000 is within the limit
+    assert calls["n"] == 20
+
+
+def test_the_same_entry_yielded_repeatedly_is_not_charged_again() -> None:
+    from contracts_common import snapshot_contract_graph
+
+    Item, Holder, calls = _counting_item_contract()
+    payload = tuple(range(2_000))
+    entry = {"payload": payload}
+    value = Holder.model_construct(items=_GeneratedItems(lambda: iter([entry] * 100)))  # one entry, 100 times
+    snapshot_contract_graph(value, contract=Holder)  # judged once and charged once at this stage
+    assert calls["n"] == 1
