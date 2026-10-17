@@ -4297,3 +4297,40 @@ def test_alias_storage_that_cannot_be_read_natively_is_refused_not_dropped(shape
     vars(BaseModel)["__dict__"].__get__(both, BaseModel)["alias_a"] = 2  # the field and its alias root, stored
     with pytest.raises(ValueError, match="metadata"):
         snapshot_contract_graph(both)  # used to drop the alias silently and accept the conflicting storage
+
+
+# ── metadata is judged when a model is projected, not when it is merely captured ──
+
+
+class _HiddenBacking(list):
+    """A list whose public view is empty: what its native backing holds is never projected."""
+
+    def __iter__(self):
+        return iter(())
+
+
+def _model_with_refused_metadata() -> BaseModel:
+    class NonText:
+        def __hash__(self):
+            return 5
+
+        def __eq__(self, other):
+            return self is other
+
+    class Refused(BaseModel):
+        a: int = 1
+
+    fields = vars(Refused)["__pydantic_fields__"]
+    model = Refused()
+    dict.__setitem__(fields, NonText(), fields["a"])  # metadata that is refused when the model is projected
+    return model
+
+
+def test_a_model_that_is_never_projected_is_not_refused_for_its_metadata() -> None:
+    hidden = _HiddenBacking([_model_with_refused_metadata()])
+    assert snapshot_contract_graph({"items": hidden}) == {"items": []}  # the public view is what is rebuilt
+
+
+def test_the_same_model_is_refused_when_it_is_projected() -> None:
+    with pytest.raises(ValueError, match="metadata"):
+        snapshot_contract_graph({"items": [_model_with_refused_metadata()]})

@@ -96,7 +96,7 @@ def _class_namespace_entry(model_type: type, name: str, budget: DiscoveryBudget)
         budget.charge_edge(MappingProxyType.__len__(namespace))  # every entry scanned is charged
         value, found, klass_pure = _exact_entry(MappingProxyType.items(namespace), name)
         if not klass_pure:
-            raise ValueError(_METADATA_REFUSAL)  # a key that is not exact text could answer a lookup itself
+            raise _MetadataRefused(_METADATA_REFUSAL)  # a key that is not exact text could answer a lookup itself
         if found:
             return value, pure
     return None, pure
@@ -116,7 +116,7 @@ def _native_sequence(value: object, budget: DiscoveryBudget) -> tuple[object, ..
     if type(value) is tuple:
         budget.charge_edge(tuple.__len__(value))  # type: ignore[arg-type]
         return value  # type: ignore[return-value]
-    raise ValueError(_METADATA_REFUSAL)
+    raise _MetadataRefused(_METADATA_REFUSAL)
 
 
 def _text(value: object) -> object:
@@ -141,7 +141,7 @@ def _model_metadata(
     config, config_pure = _class_namespace_entry(model_type, "model_config", budget)
     if type(fields) is not dict or (config is not None and type(config) is not dict):
         # A replaced or exotic store could only be read through the class, where caller code can run.
-        raise ValueError(_METADATA_REFUSAL)
+        raise _MetadataRefused(_METADATA_REFUSAL)
     budget.charge_edge(dict.__len__(fields))  # type: ignore[arg-type]
     return tuple(dict.items(fields)), config, fields_pure and config_pure  # type: ignore[arg-type]
 
@@ -160,17 +160,39 @@ def _declared_metadata(
 
     cached = inventory.metadata.get(id(model_type))
     if cached is not None and cached[0] is model_type:
+        if cached[1] is None:
+            raise _MetadataRefused(_METADATA_REFUSAL)  # recorded at capture, raised now that it is projected
         return cached[1], cached[2]
+    try:
+        return _read_declared_metadata(model_type, inventory)
+    except _MetadataRefused:
+        inventory.metadata[id(model_type)] = (model_type, None, None)  # a budget error is not caught: it stops the call
+        raise
+
+
+def _snapshot_class_metadata(model_type: type[BaseModel], inventory: "_GraphInventory") -> None:
+    """Take the class's snapshot at capture; a refusal is recorded, not raised, so a model the rebuild never
+    projects (one only a hidden native backing holds) is not refused for it.  Budget errors still stop capture."""
+
+    try:
+        _declared_metadata(model_type, inventory)
+    except _MetadataRefused:
+        pass  # raised by _declared_metadata when an instance of the class is projected
+
+
+def _read_declared_metadata(
+    model_type: type[BaseModel], inventory: "_GraphInventory"
+) -> tuple[set[object], dict[str, set[str]]]:
     budget = inventory.budget
     declared_fields, config, _pure = _model_metadata(model_type, budget)
     declared_names: set[object] = set()
     for name, _field in declared_fields:  # the charged copy, never the live table
         if not _is_subclass(type(name), str):
-            raise ValueError(_METADATA_REFUSAL)  # a declared name that is not text (never hashed)
+            raise _MetadataRefused(_METADATA_REFUSAL)  # a declared name that is not text (never hashed)
         declared_names.add(_text(name))
     alias_owners, aliases_pure = _validation_alias_owners(declared_fields, config, budget)
     if not (_pure and aliases_pure):
-        raise ValueError(_METADATA_REFUSAL)  # every read above is exact and native, or refused: never cache otherwise
+        raise _MetadataRefused(_METADATA_REFUSAL)  # every read above is exact and native, or refused: never cache otherwise
     inventory.metadata[id(model_type)] = (model_type, declared_names, alias_owners)
     return declared_names, alias_owners
 
@@ -192,9 +214,9 @@ def _validation_alias_owners(
         budget.charge_edge(dict.__len__(config))
         validate_by_alias, _found, config_pure = _exact_entry(dict.items(config), "validate_by_alias")
         if not config_pure:
-            raise ValueError(_METADATA_REFUSAL)  # a configuration key that is not exact text
+            raise _MetadataRefused(_METADATA_REFUSAL)  # a configuration key that is not exact text
     elif config is not None:
-        raise ValueError(_METADATA_REFUSAL)
+        raise _MetadataRefused(_METADATA_REFUSAL)
     if validate_by_alias is False:
         return {}, pure
 
@@ -202,16 +224,16 @@ def _validation_alias_owners(
     budget.charge_edge(len(fields))  # this walk scans every declared field again: charged again
     for field_name, field in fields:  # the copy: nothing read here can change what is walked
         if not _is_subclass(type(field_name), str):
-            raise ValueError(_METADATA_REFUSAL)  # a declared name that is not text (never hashed)
+            raise _MetadataRefused(_METADATA_REFUSAL)  # a declared name that is not text (never hashed)
         # Only pydantic's own field and alias types are read, through their own slots: a subclass could
         # run code from a property while the metadata is read, before the input's storage is all captured.
         if type(field) is not FieldInfo:
-            raise ValueError(_METADATA_REFUSAL)
+            raise _MetadataRefused(_METADATA_REFUSAL)
         validation_alias = object.__getattribute__(field, "validation_alias")
         if type(validation_alias) is AliasChoices:
             choices = _native_sequence(object.__getattribute__(validation_alias, "choices"), budget)
         elif _is_subclass(type(validation_alias), (AliasChoices, AliasPath)) and type(validation_alias) is not AliasPath:
-            raise ValueError(_METADATA_REFUSAL)
+            raise _MetadataRefused(_METADATA_REFUSAL)
         else:
             choices = (validation_alias,)
         name = _text(field_name)
@@ -224,8 +246,12 @@ def _validation_alias_owners(
                 if _is_subclass(type(root), str):
                     owners.setdefault(_text(root), set()).add(name)  # type: ignore[arg-type]
             elif choice is not None:
-                raise ValueError(_METADATA_REFUSAL)  # an alias subclass, or anything else
+                raise _MetadataRefused(_METADATA_REFUSAL)  # an alias subclass, or anything else
     return owners, pure
+
+
+class _MetadataRefused(ValueError):
+    """Model metadata that cannot be read through pydantic's own types: refused when the model is projected."""
 
 
 _METADATA_REFUSAL = (
@@ -361,7 +387,7 @@ class _GraphInventory:
     # object and alias its captured contents.
     retained: list[object] = field(default_factory=list)
     # The call's one metadata snapshot per model class, taken at capture: ``id -> (class, declared names, alias owners)``.
-    metadata: dict[int, tuple[type, set[object], dict[str, set[str]]]] = field(default_factory=dict)
+    metadata: dict[int, tuple[type, set[object] | None, dict[str, set[str]] | None]] = field(default_factory=dict)
     # Completed reconstructions of pure subtrees, keyed by identity:
     # ``(object, copy, height)``.  A descendant shared by many paths is rebuilt once
     # and shared; ``height`` keeps the depth limit enforced on every path.
@@ -445,7 +471,7 @@ def _capture_native_graph(value: object, inventory: _GraphInventory, depth: int 
     if _is_subclass(value_type, BaseModel):
         # The class's metadata is snapshotted at its first native encounter, before any caller code runs
         # (capture runs none); reconstruction reads only this snapshot.
-        _declared_metadata(value_type, inventory)
+        _snapshot_class_metadata(value_type, inventory)
         stored = _BASE_MODEL_DICT_DESCRIPTOR.__get__(value, BaseModel)
         _precheck(budget, dict.__len__(stored))
         stored_entries, pure_stored, stored_colliding = _plain_keys(tuple(dict.items(stored)))
