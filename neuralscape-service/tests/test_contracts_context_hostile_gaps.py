@@ -383,3 +383,43 @@ def test_a_sequence_class_with_a_metaclass_eq_runs_no_code_before_the_arguments_
         with pytest.raises(Exception):
             projection_status_for(Public([_sv("rec-1", 1)]), hold([bad]))
         assert calls == []  # the class was judged by identity: its hook never ran
+
+
+# ---- a zone that stops answering
+class _StopsAnswering(tzinfo):
+    """Gives an offset for the first ``answers`` reads (validation), then ``None`` (the pin)."""
+
+    def __init__(self, answers: int) -> None:
+        self.answers, self.reads = answers, 0
+
+    def utcoffset(self, dt):
+        self.reads += 1
+        return timedelta(0) if self.reads <= self.answers else None
+
+    def dst(self, dt):
+        return timedelta(0)
+
+
+@pytest.mark.parametrize("answers", [1, 2, 3])
+def test_a_zone_that_stops_answering_never_leaves_a_caller_zone_on_a_stored_datetime(answers) -> None:
+    from pydantic import BaseModel
+
+    from contracts_freshness import PinnedAwareDatetime
+
+    class Holder(BaseModel):
+        at: PinnedAwareDatetime
+
+    zone = _StopsAnswering(answers)
+    try:
+        held = Holder(at=datetime(*_NOON, tzinfo=zone))
+    except ValidationError:
+        return  # refused is fine
+    assert type(held.at) is datetime and type(held.at.tzinfo) is timezone, type(held.at.tzinfo)
+
+
+def test_ordering_two_datetimes_refuses_a_zone_that_stops_answering() -> None:
+    from contracts_freshness import _instant_after
+
+    zone = _StopsAnswering(0)
+    with pytest.raises(ValueError):
+        _instant_after(datetime(*_NOON, tzinfo=zone), datetime(*_EVENING, tzinfo=UTC))

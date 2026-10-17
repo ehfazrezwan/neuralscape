@@ -90,11 +90,21 @@ def pin_datetime(value: object) -> object:
         raise ValueError("a datetime must have a usable UTC offset") from None
 
 
+def _is_pinned(value: object) -> bool:
+    """Whether ``value`` is what a successful pin produces: a plain datetime on an exact fixed-offset zone.
+
+    ``pin_datetime`` hands back the caller's own object when the zone reports no offset at the pin, and that
+    object still has a (caller-owned) zone, so "aware" is not enough to tell the two apart.
+    """
+
+    return type(value) is datetime and type(value.tzinfo) is timezone
+
+
 def _pin_validated(value: datetime) -> datetime:
     """Pin a datetime pydantic has just accepted as aware (a zone that now reports no offset is refused)."""
 
     pinned = pin_datetime(value)
-    if type(pinned) is not datetime or pinned.tzinfo is None:
+    if not _is_pinned(pinned):
         raise ValueError("a datetime must have a usable UTC offset")
     return pinned
 
@@ -113,7 +123,7 @@ def _instant_after(left: datetime, right: datetime) -> bool:
     """
 
     pinned = [pin_datetime(value) for value in (left, right)]
-    if not all(type(value) is datetime and value.tzinfo is not None for value in pinned):
+    if not all(_is_pinned(value) for value in pinned):
         raise ValueError("a datetime must have a usable UTC offset")
     return pinned[0] > pinned[1]  # plain aware datetimes with fixed offsets compare by instant
 
