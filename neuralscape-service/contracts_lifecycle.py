@@ -72,15 +72,14 @@ def _require_distinct_key_text(
     seen: set[object] = set()
     keyed: list[tuple[object, object]] = []
     for key, item in entries:
+        memo = None if type(key) is str else captured_by_identity.get((_KEY_TEXT, id(key)))
         if type(key) is str:
             text: object = key
-        elif _derives_from(type(key), (str,)):
-            memo = captured_by_identity.get((_KEY_TEXT, id(key)))
-            if memo is not None and memo[0] is key:
-                text = memo[1]
-            else:
-                text = str.__str__(key)
-                captured_by_identity[(_KEY_TEXT, id(key))] = (key, text)
+        elif memo is not None and memo[0] is key:
+            text = memo[1]  # this key's text, copied when it was first met: no walk of its class again
+        elif _is_text_key_class(type(key), captured_by_identity, budget):
+            text = str.__str__(key)
+            captured_by_identity[(_KEY_TEXT, id(key))] = (key, text)
         elif _is_exact_native_kind(type(key)):
             if type(key) is int:
                 budget.charge_edge(int.bit_length(key) >> 12)  # one edge per 4,096 bits hashed
@@ -92,6 +91,22 @@ def _require_distinct_key_text(
         seen.add(text)
         keyed.append((text, item))
     return tuple(keyed)
+
+
+def _is_text_key_class(kind: type, captured_by_identity: dict[Any, Any], budget: DiscoveryBudget) -> bool:
+    """Whether a key class derives from ``str``, decided once per class per call and charged by its MRO.
+
+    Deriving from ``str`` cannot change during the call (CPython refuses a ``__bases__`` change across native
+    layouts), so the verdict is kept with the class (its ``id()`` is not recycled) for every later key."""
+
+    known = captured_by_identity.get((_KEY_CLASS, id(kind)))
+    if known is not None and known[0] is kind:
+        return known[1]
+    mro = _TYPE_MRO.__get__(kind)
+    budget.charge_edge(tuple.__len__(mro))
+    verdict = any(base is str for base in mro)
+    captured_by_identity[(_KEY_CLASS, id(kind))] = (kind, verdict)
+    return verdict
 
 
 class _CapturedGraph:
@@ -416,6 +431,7 @@ _HANDED_ENUMS = "handed-enums"  # memo key: enum members and detached ints hande
 _DETACHED = "detached"  # memo key prefix: one scalar subclass leaf's exact copy, made once per call
 _DETACHED_INT = "detached-int"  # memo key: this call's marker class for a detached int subclass
 _LEAF_CLASS = "leaf-class"  # memo key prefix: one leaf class's verdict, decided once per call
+_KEY_CLASS = "key-class"  # memo key prefix: whether one key class derives from str, decided once per call
 _KEY_TEXT = "key-text"  # memo key prefix: one str-subclass mapping key's exact text, copied once per call
 
 
@@ -752,6 +768,15 @@ def _judge_handed_leaf(leaf: object, captured_by_identity: dict[Any, Any], budge
         raise ValueError("a contract value must be a native scalar, an enum member, a model or a container")
 
 
+def _charge_int_key_hashes(entries: tuple[tuple[object, object], ...], budget: DiscoveryBudget) -> None:
+    """Charge the int keys a rebuild is about to hash, at capture's rate: an int's hash is not cached and costs its
+    size, and a container that is not reused as a pure copy is rebuilt (its keys hashed again) on every path."""
+
+    for key, _ in entries:
+        if type(key) is int:
+            budget.charge_edge(int.bit_length(key) >> 12)
+
+
 def _materialize_captured_graph(
     value: _CapturedGraph,
     captured_by_identity: dict[Any, Any],
@@ -813,6 +838,8 @@ def _materialize_captured_graph(
     active_containers.add(identity)
     try:
         if isinstance(value, _CapturedModel):
+            _charge_int_key_hashes(value.stored_entries, budget)
+            _charge_int_key_hashes(value.extra_entries, budget)
             declared_fields = _declared_field_names(value.model_type, captured_by_identity, budget)
             # Keys reach validation as their own text: a str subclass's hash and equality would
             # otherwise decide which field a value fills (the text was checked distinct at capture).
@@ -844,6 +871,7 @@ def _materialize_captured_graph(
                 )
             return fields
         if isinstance(value, _CapturedDict):
+            _charge_int_key_hashes(value.entries, budget)
             built = {
                 _key_text(key): _materialize_captured_graph(
                     item,
@@ -1869,9 +1897,11 @@ def _reference_sets_match(
 def _require_unique_reference_handles(
     references: tuple[ReferenceHandle, ...], field: str
 ) -> None:
+    # Two handles naming one record are duplicates whatever their cross_tenant marker: a list may not hold one
+    # record twice, marked and unmarked.
     seen: set[tuple[str, str, str, str]] = set()
     for reference in references:
-        key = _reference_identity_key(reference)
+        key = _reference_identity_key(reference)[:4]
         if key in seen:
             raise ValueError(f"{field} must not contain duplicate handles")
         seen.add(key)
@@ -1879,12 +1909,15 @@ def _require_unique_reference_handles(
 
 def _reference_identity_key(
     reference: ReferenceHandle,
-) -> tuple[str, str, str, str]:
+) -> tuple[str, str, str, str, bool]:
+    """Every field of a handle, the cross_tenant marker included: a marked handle is not the unmarked one."""
+
     return (
         reference.kind,
         reference.id,
         reference.tenant_id,
         reference.resolver,
+        reference.cross_tenant,
     )
 
 

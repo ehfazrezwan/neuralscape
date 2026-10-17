@@ -2241,3 +2241,103 @@ def test_a_detached_int_in_a_reused_pure_copy_is_judged_again_after_its_marker_i
     finally:
         restore()
     assert reads == []
+
+
+def _deep_text_class(depth: int) -> type:
+    kind: type = str
+    for index in range(depth):
+        kind = type(f"Text{index}", (kind,), {})
+    return kind
+
+
+def test_a_shared_text_subclass_key_walks_its_class_once_not_per_container(monkeypatch):
+    """The key-text cache is consulted before any inheritance walk, and a key class is judged once per call: one
+    deeply derived key in 2,000 containers (or 2,000 keys of that class) walks the class's MRO once."""
+
+    from tests.test_contracts_lifecycle import intent_with_requirements, requirement
+
+    deep = _deep_text_class(200)
+    walks: list[type] = []
+    real = contracts_lifecycle._TYPE_MRO
+
+    class Counting:  # every read of a class's real MRO in the module goes through this descriptor
+        def __get__(self, kind, owner=None):
+            if kind is deep:
+                walks.append(kind)
+            return real.__get__(kind)
+
+    monkeypatch.setattr(contracts_lifecycle, "_TYPE_MRO", Counting())
+    for keys in ([deep("k")] * 2_000, [deep(f"k{index}") for index in range(2_000)]):
+        command = intent_with_requirements(requirement(ProcessingStage.CANONICAL))
+        applied = receipt(ProcessingStage.CANONICAL, StageStatus.APPLIED)
+        EXTRA.__set__(applied, {"note": [{key: index} for index, key in enumerate(keys)]})
+        walks.clear()
+        with pytest.raises(ValueError):
+            contracts_lifecycle.validate_stage_receipts(command, (applied,))
+        assert len(walks) <= 1, len(walks)
+
+
+def test_the_one_walk_of_a_key_class_is_charged_by_its_depth():
+    from contracts_limits import DiscoveryBudget
+
+    def charged(depth: int) -> int:
+        budget = DiscoveryBudget(contracts_lifecycle.LIFECYCLE_TIER)
+        contracts_lifecycle._capture_native_contract_graph({_deep_text_class(depth)("k"): 1}, budget=budget)
+        return budget.edges
+
+    assert charged(400) - charged(10) >= 390  # the MRO is charged one edge per class walked
+
+
+def test_a_large_int_key_is_charged_on_every_path_that_rebuilds_its_container():
+    """Capture charges a large int key once per container, but materialization rebuilds an int-keyed container on
+    every path that reaches it and hashes the key again each time: those hashes are charged too."""
+
+    from tests.test_contracts_lifecycle import intent_with_requirements, requirement
+
+    shared = {1 << 2**20: 0}  # one container, captured (and charged) once
+    command = intent_with_requirements(requirement(ProcessingStage.CANONICAL))
+    applied = receipt(ProcessingStage.CANONICAL, StageStatus.APPLIED)
+    EXTRA.__set__(applied, {"note": [shared] * 4_000})  # 4,000 paths, each rebuilding it
+    with pytest.raises(ValueError, match=BUDGET):
+        contracts_lifecycle.validate_stage_receipts(command, (applied,))
+
+
+def test_a_small_int_key_on_many_paths_still_reaches_validation():
+    from pydantic import ValidationError
+
+    from tests.test_contracts_lifecycle import intent_with_requirements, requirement
+
+    command = intent_with_requirements(requirement(ProcessingStage.CANONICAL))
+    applied = receipt(ProcessingStage.CANONICAL, StageStatus.APPLIED)
+    EXTRA.__set__(applied, {"note": [{1 << 4_000: 0}] * 4_000})
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        contracts_lifecycle.validate_stage_receipts(command, (applied,))
+
+
+def test_output_reference_sets_compare_the_cross_tenant_marker():
+    """Two handles that differ only in ``cross_tenant`` are not the same reference: a set comparison tells them
+    apart, while one receipt still may not list both (they name one record)."""
+
+    from tests.test_contracts_lifecycle import reference
+
+    plain = reference("out-1")
+    marked = plain.model_copy(update={"cross_tenant": True})
+    assert contracts_lifecycle._reference_sets_match((plain,), (plain,))
+    assert not contracts_lifecycle._reference_sets_match((plain,), (marked,))
+    with pytest.raises(ValueError, match="duplicate handles"):
+        contracts_lifecycle._require_unique_reference_handles((plain, marked), "output_refs")
+
+
+def test_a_large_int_key_in_a_shared_models_extras_is_charged_on_every_path():
+    """A model is rebuilt on every path that reaches it (models are never reused as pure copies), so an int key in
+    its stored or extra entries is hashed, and charged, on each one."""
+
+    from tests.test_contracts_lifecycle import intent_with_requirements, requirement, source
+
+    shared = SourceVersion.model_construct(**vars(source("shared")))
+    EXTRA.__set__(shared, {1 << 2**20: 1})
+    command = intent_with_requirements(requirement(ProcessingStage.CANONICAL))
+    applied = receipt(ProcessingStage.CANONICAL, StageStatus.APPLIED)
+    set_native(applied, "applied_sources", (shared,) * 4_000)
+    with pytest.raises(ValueError, match=BUDGET):
+        contracts_lifecycle.validate_stage_receipts(command, (applied,))
