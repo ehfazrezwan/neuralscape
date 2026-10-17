@@ -1,0 +1,22 @@
+{
+ "expected": {
+  "baseline": {
+   "facts": {
+    "convention_scope": "project",
+    "preference_scope": "global"
+   },
+   "verdict": "baseline_pass"
+  },
+  "candidate": {
+   "facts": {
+    "convention_scope": "project",
+    "preference_scope": "global"
+   },
+   "verdict": "candidate_pass"
+  }
+ },
+ "oracle_version": "oracle-v1",
+ "owner": "independent reviewer (not the author of the probes); not yet accepted",
+ "persona": "persona-bea",
+ "scenario_id": "persona-project-preference"
+}

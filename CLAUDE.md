@@ -143,8 +143,13 @@ docker build --target runtime -f neuralscape-service/Dockerfile -t ns-gate-rt .
 
 When adding ANY new top-level file or directory under `neuralscape-service/`,
 update the COPY lists in **all three** Dockerfile stages (builder, runtime,
-test). The upcoming CI pipeline makes this gate a required PR check; until
-then it is a manual, non-negotiable step.
+test). The `service-ci` workflow runs the required subtree, host-test,
+container-test, and runtime-image qualifications on every pull request,
+including documentation-only changes. Its aggregate `service-gate` succeeds
+only when every qualification job succeeds; skipped, cancelled, or failed jobs
+do not satisfy the gate. The exact-tree rule still applies: when CI is
+unavailable, run the local Docker commands above and retain that manual proof
+before merging.
 
 ## Git Workflow
 
