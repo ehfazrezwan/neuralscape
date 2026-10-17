@@ -669,9 +669,17 @@ def _is_ipv6(value: object) -> bool:
     return not getattr(address, "scope_id", "")
 
 
+# The longest regex the format check will compile.  Python's compiler is superlinear in the length (alternatives
+# with long shared prefixes take quadratic time: about 12 ms at this length, seconds at 320,000 characters), and a
+# schema-sized regex is a few hundred characters, so a longer one is refused as over budget rather than judged.
+MAX_REGEX_CHARACTERS = 8_192
+
+
 def _is_regex(value: object) -> bool:
     if not is_subclass(type(value), str):
         return True
+    if str.__len__(value) > MAX_REGEX_CHARACTERS:  # type: ignore[arg-type]
+        raise ValueError(SCHEMA_EXECUTION_MESSAGE)
     return bool(re.compile(value))
 
 
@@ -1029,6 +1037,19 @@ _LIMB_BITS = 30
 _LIMB_PRODUCTS_PER_UNIT = 4_096
 
 
+# Comparing two integers whose high limbs match scans the shorter one: about 0.35 ns per limb, a unit being about
+# a microsecond.
+_LIMBS_PER_COMPARE_UNIT = 2_048
+_BOUND_KEYWORDS = frozenset({"minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum"})
+
+
+def _comparison_units(bound: object, instance: object) -> int:
+    def limbs(value: object) -> int:
+        return int.bit_length(value) // _LIMB_BITS + 1 if is_subclass(type(value), int) and type(value) is not bool else 0  # type: ignore[arg-type]
+
+    return min(limbs(bound), limbs(instance)) // _LIMBS_PER_COMPARE_UNIT
+
+
 def _division_units(dividend: object, divisor: object) -> int:
     """Units for the arbitrary-precision division behind multipleOf: schoolbook cost, limbs times limbs."""
 
@@ -1075,11 +1096,15 @@ def _metered_validator_class(validator_class: Any, meter: _SchemaExecutionMeter)
     from jsonschema.exceptions import ValidationError as SchemaError
     from jsonschema.validators import extend
 
-    def metered(keyword: Callable[..., Any], scans_strings: bool = False) -> Callable[..., Any]:
+    def metered(
+        keyword: Callable[..., Any], scans_strings: bool = False, compares_integers: bool = False
+    ) -> Callable[..., Any]:
         def apply(validator: Any, value: Any, instance: Any, schema: Any) -> Any:
             meter.charge(_KEYWORD_UNITS + _container_size(instance) + _container_size(value))
             if scans_strings:
                 meter.charge(_string_units(instance))
+            if compares_integers:
+                meter.charge(_comparison_units(value, instance))
             for error in keyword(validator, value, instance, schema):
                 # jsonschema's own messages quote the whole instance (a type, length or range mismatch) and are
                 # built even when an enclosing not or anyOf discards them: charge the construction by its
@@ -1190,7 +1215,8 @@ def _metered_validator_class(validator_class: Any, meter: _SchemaExecutionMeter)
             yield SchemaError(known[1])
 
     keywords = {
-        name: metered(keyword, scans_strings=name == "format") for name, keyword in validator_class.VALIDATORS.items()
+        name: metered(keyword, scans_strings=name == "format", compares_integers=name in _BOUND_KEYWORDS)
+        for name, keyword in validator_class.VALIDATORS.items()
     }
     keywords["multipleOf"] = metered(multiple_of)
     keywords["format"] = metered(format_, scans_strings=True)

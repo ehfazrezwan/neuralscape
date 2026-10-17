@@ -3022,16 +3022,16 @@ def _regex_work(count, groups, monkeypatch):
 
 
 def test_an_invalid_regex_is_compiled_once_however_many_applications(monkeypatch):
-    spent_one, compiled_one, _ = _regex_work(1, 4_096, monkeypatch)
-    spent_many, compiled_many, errors = _regex_work(200, 4_096, monkeypatch)
+    spent_one, compiled_one, _ = _regex_work(1, 1_024, monkeypatch)
+    spent_many, compiled_many, errors = _regex_work(200, 1_024, monkeypatch)
     assert errors == [] and compiled_one == compiled_many == 1  # it was one compile per application
-    assert spent_many < spent_one + 199 * ((3 * 4_096 + 1) // 32 + 40)  # only the per-application scan charge, no recompile weight
+    assert spent_many < spent_one + 199 * ((3 * 1_024 + 1) // 32 + 40)  # only the per-application scan charge, no recompile weight
 
 
 def test_regex_work_doubles_with_the_pattern_length(monkeypatch):
-    units = [_regex_work(1, groups, monkeypatch)[0] for groups in (2_048, 4_096, 8_192)]
+    units = [_regex_work(1, groups, monkeypatch)[0] for groups in (512, 1_024, 2_048)]
     assert 1.8 < units[1] / units[0] < 2.2 and 1.8 < units[2] / units[1] < 2.2, units
-    assert units[0] > 3 * 2_048  # weighted by the pattern's characters, not a 32nd of them
+    assert units[0] > 3 * 512  # weighted by the pattern's characters, not a 32nd of them
 
 
 def test_a_format_result_is_shared_by_equal_values_and_still_reported():
@@ -3040,8 +3040,8 @@ def test_a_format_result_is_shared_by_equal_values_and_still_reported():
 
 
 def test_the_repeated_invalid_regex_shape_compiles_once(monkeypatch):
-    spent, compiled, errors = _regex_work(100, 65_536, monkeypatch)  # 100 negated checks of a 196 KB pattern
-    assert errors == [] and compiled == 1  # it was 100 compiles and 43 seconds
+    spent, compiled, errors = _regex_work(100, 2_700, monkeypatch)  # 100 negated checks of an 8 KB pattern
+    assert errors == [] and compiled == 1  # it was 100 compiles (43 seconds at the size that is now refused)
 
 
 def test_string_and_division_charges_grow_with_the_size_of_the_values():
@@ -3053,3 +3053,55 @@ def test_string_and_division_charges_grow_with_the_size_of_the_values():
         _units_spent({"multipleOf": (1 << bits) + 1}, (1 << (2 * bits)) + 7)[0] for bits in (65_536, 131_072, 262_144)
     ]
     assert 3.5 < divisions[1] / divisions[0] < 4.5 and 3.5 < divisions[2] / divisions[1] < 4.5, divisions  # quadratic
+
+
+# ---- a regex is refused beyond a fixed length (compiling is superlinear), and numeric bounds are charged by size
+
+def test_a_regex_longer_than_the_limit_is_refused_before_it_is_compiled(monkeypatch):
+    compiled = [0]
+    original = contracts_inference.re.compile
+
+    def counting(pattern, *args, **kwargs):
+        compiled[0] += isinstance(pattern, str) and pattern.startswith("(?:a")
+        return original(pattern, *args, **kwargs)
+
+    monkeypatch.setattr(contracts_inference.re, "compile", counting)
+    limit = contracts_inference.MAX_REGEX_CHARACTERS
+    prefix = "a" * limit
+    pattern = "(?:" + prefix + "b|" + prefix + "c)"  # shared prefixes: compiling is quadratic in it
+    request, result = _generation_with_output({"v": pattern}, v={"format": "regex"})
+    with pytest.raises(ValueError, match="exceeds its budget"):
+        validate_generation_result(request, result)
+    assert compiled[0] == 0
+    request, result = _generation_with_output({"v": "(?:" + "a" * 100 + "b|" + "a" * 100 + "c)"}, v={"format": "regex"})
+    assert validate_generation_result(request, result).compliant  # an ordinary pattern is unchanged
+    assert contracts_inference.MAX_REGEX_CHARACTERS <= 8_192  # the bound: worst case about 12 ms to compile
+
+
+def test_the_worst_regex_inside_the_limit_compiles_in_bounded_time():
+    import time
+
+    half = (contracts_inference.MAX_REGEX_CHARACTERS - 7) // 2
+    pattern = "(?:" + "a" * half + "b|" + "a" * half + "c)"
+    started = time.monotonic()
+    assert _errors({"format": "regex"}, pattern) == []
+    assert time.monotonic() - started < 0.5  # 8 KiB of shared prefixes: about 12 ms; the unbounded form took seconds
+
+
+def test_numeric_bound_charges_double_with_the_size_of_the_integers():
+    for keyword in ("minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum"):
+        spent = []
+        for bits in (1 << 20, 1 << 21, 1 << 22):
+            bound = (1 << bits) + 5
+            instance = (1 << bits) + (7 if keyword in ("minimum", "exclusiveMinimum") else 3)
+            spent.append(_units_spent({keyword: bound}, instance)[0])
+        assert 1.6 < spent[1] / spent[0] < 2.2 and 1.8 < spent[2] / spent[1] < 2.2, (keyword, spent)
+    small, _ = _units_spent({"minimum": 3}, 12)
+    assert small < 30
+
+
+def test_many_bounds_sharing_a_large_integer_are_charged_for_every_comparison():
+    bound = (1 << (8 << 20)) + 5  # 1 MiB
+    instance = (1 << (8 << 20)) + 7  # matching high bits: every comparison scans the whole number
+    spent, errors = _units_spent({"allOf": [{"minimum": bound}] * 200}, instance)
+    assert errors == [] and spent >= 200 * (1 << 20) * 8 // 30 // 2_048  # it was 8 units per comparison
