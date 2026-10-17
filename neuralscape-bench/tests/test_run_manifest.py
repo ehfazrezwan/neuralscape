@@ -6113,28 +6113,45 @@ def _resource_with_a_stateful_field_inventory():
     return StatefulReading.model_construct(**values), StatefulReading._inventory
 
 
+def _error_locations(error) -> set[str]:
+    return {".".join(str(part) for part in item["loc"]) for item in error.errors()}
+
+
 def test_a_field_inventory_that_changes_between_reads_cannot_drop_a_captured_value_through_serialization() -> None:
     resource, inventory = _resource_with_a_stateful_field_inventory()
     manifest = completed_manifest()
     object.__setattr__(manifest, "resources", (resource,))
-    with pytest.raises(ValueError):          # limit_value=True is invalid; a dropped value would let the default None through
+    with pytest.raises(ValidationError) as caught:   # limit_value=True is invalid; a dropped value would let the default None through
         serialize_run_manifest(manifest)
+    assert any(location.endswith("limit_value") for location in _error_locations(caught.value)), caught.value
     assert inventory.iterations >= 1
 
 
 def test_a_field_inventory_that_changes_between_reads_cannot_drop_a_captured_value_through_finish() -> None:
+    """The planned envelope is unbounded too, so a dropped ``limit_value`` would be the only difference: it would be accepted."""
+
     resource, _inventory = _resource_with_a_stateful_field_inventory()
-    with pytest.raises(ValueError):
-        _finish_with_resource(resource)
+    unbounded = ResourceReading(
+        schema_version=VERSION, scope="api-container", resource="memory", unit="bytes",
+        limit_kind=LimitKind.UNBOUNDED, limit_value=None, observation_kind=ObservationKind.PENDING,
+    )
+    planned = planned_manifest().model_copy(update={"resources": (unbounded,)})
+    with pytest.raises(ValidationError) as caught:
+        finish_run(
+            planned,
+            state=RunState.COMPLETED,
+            started_at=datetime(2026, 9, 28, 8, 0, tzinfo=timezone.utc),
+            finished_at=datetime(2026, 9, 28, 8, 1, tzinfo=timezone.utc),
+            resources=(resource,),
+            measurements=(timing(),),
+        )
+    assert any(location.endswith("limit_value") for location in _error_locations(caught.value)), caught.value
 
 
 def test_the_snapshot_keeps_every_captured_stored_entry_whatever_the_field_inventory_says() -> None:
     resource, inventory = _resource_with_a_stateful_field_inventory()
-    try:
-        snapshot = _snapshot_native(resource)
-    except ValueError:
-        return
-    assert "limit_value" in snapshot, snapshot
+    snapshot = _snapshot_native(resource)    # the snapshot does not validate: it must simply keep what was captured
+    assert snapshot["limit_value"] is True and set(snapshot) == set(dict.keys(BASE_MODEL_DICT_DESCRIPTOR.__get__(resource, pydantic.BaseModel))), snapshot
 
 
 def test_an_honest_resource_snapshot_still_lists_its_fields_in_declaration_order() -> None:
@@ -6205,7 +6222,7 @@ def test_a_bytes_subclass_is_read_as_its_own_bytes() -> None:
 
 def test_other_input_types_are_refused() -> None:
     for bad in (None, 3, [], bytearray(b"{}")):
-        with pytest.raises((TypeError, ValueError)):
+        with pytest.raises(TypeError, match="text or bytes"):
             validate_run_manifest_json(bad)   # type: ignore[arg-type]
 
 
