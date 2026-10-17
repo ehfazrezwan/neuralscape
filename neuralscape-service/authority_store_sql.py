@@ -1554,26 +1554,33 @@ def _owner_only(path: str) -> None:
 
     The authority database holds invite and credential secret hashes and the credential pepper.  SQLite
     creates its WAL and shared-memory files with the database file's mode, so the main file is created
-    0600 before the first connection; files left looser by an earlier version are tightened here.
+    0600 before the first connection; files left looser by an earlier version are tightened here.  Each
+    name is opened without following a symbolic link or blocking on a pipe and must be a regular file
+    (``OSError`` otherwise), and the mode is changed through that descriptor, so a link planted at the
+    path is refused and its target never touched.  A regular file that cannot be tightened (owned by
+    another user, for example) is logged, not refused.
     """
 
     if path == ":memory:" or path.startswith("file:"):
         return
-    try:
-        descriptor = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)  # 0600 & ~umask when it is created now
-        os.close(descriptor)
-    except OSError:
-        return  # let sqlite report the path
     for suffix in _SQLITE_SIDECARS:
-        target = path + suffix
+        name = path + suffix
+        flags = os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK | (os.O_CREAT if not suffix else 0)
         try:
-            mode = stat.S_IMODE(os.stat(target).st_mode)
-            if mode & 0o077:
-                os.chmod(target, mode & 0o700)
+            descriptor = os.open(name, flags, 0o600)  # 0600 & ~umask when the database is created now
         except FileNotFoundError:
-            continue
-        except OSError:
-            _logger.warning("the authority database file %s could not be made owner-only", target)
+            continue  # a sidecar created later takes the database file's mode
+        try:
+            info = os.fstat(descriptor)
+            if not stat.S_ISREG(info.st_mode):
+                raise OSError(f"the authority database file {name} is not a regular file")
+            if stat.S_IMODE(info.st_mode) & 0o077:
+                try:
+                    os.fchmod(descriptor, stat.S_IMODE(info.st_mode) & 0o700)
+                except OSError:
+                    _logger.warning("the authority database file %s could not be made owner-only", name)
+        finally:
+            os.close(descriptor)
 
 
 class SqliteAuthorityStore(SqlAuthorityStore):

@@ -689,3 +689,46 @@ def test_an_owner_only_database_is_left_as_it_is(tmp_path):
     os.chmod(path, 0o400 | 0o200)
     SqliteAuthorityStore(str(path)).close()
     assert _mode(path) == 0o600
+
+
+@pytest.mark.parametrize("suffix", ["", "-wal", "-shm"])
+def test_a_link_at_the_database_or_a_sidecar_path_is_refused_and_its_target_untouched(tmp_path, suffix):
+    import os
+
+    from authority_store_sql import SqliteAuthorityStore
+
+    target = tmp_path / "elsewhere"
+    target.write_bytes(b"not the authority database")
+    os.chmod(target, 0o644)
+    path = tmp_path / "authority.db"
+    if suffix:
+        SqliteAuthorityStore(str(path)).close()  # a real database; only the sidecar is a link
+        for name in ("-wal", "-shm"):
+            if os.path.exists(f"{path}{name}"):
+                os.remove(f"{path}{name}")
+    os.symlink(target, f"{path}{suffix}")
+    with pytest.raises(OSError):
+        SqliteAuthorityStore(str(path))
+    assert target.read_bytes() == b"not the authority database" and _mode(target) == 0o644
+
+
+def test_a_fifo_at_the_database_path_is_refused_without_blocking(tmp_path):
+    import os
+    import threading
+
+    from authority_store_sql import SqliteAuthorityStore
+
+    path = tmp_path / "authority.db"
+    os.mkfifo(path)
+    outcome = {}
+
+    def open_store():
+        try:
+            SqliteAuthorityStore(str(path))
+        except Exception as error:  # noqa: BLE001
+            outcome["error"] = error
+
+    thread = threading.Thread(target=open_store, daemon=True)
+    thread.start()
+    thread.join(5)
+    assert not thread.is_alive() and isinstance(outcome.get("error"), OSError), outcome
