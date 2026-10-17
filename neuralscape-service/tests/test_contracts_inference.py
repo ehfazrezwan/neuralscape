@@ -2832,3 +2832,98 @@ def test_a_hostname_longer_than_any_hostname_is_refused_without_a_scan():
         {"v": "a" * (1 << 20)}, v={"allOf": [{"not": {"format": "idn-hostname"}} for _ in range(16)]}
     )
     assert validate_generation_result(request, result).compliant  # 16 refusals, none of them a megabyte scan
+
+
+# ---- a huge integer never reaches a diagnostic's str(), and a hostname may carry its root dot
+
+@pytest.fixture
+def default_int_digit_limit():
+    import sys
+
+    previous = sys.get_int_max_str_digits()
+    sys.set_int_max_str_digits(4300)  # Python's default: str() and repr() of a longer integer raise
+    yield
+    sys.set_int_max_str_digits(previous)
+
+
+HUGE = 1 << 16_000  # 4,817 digits
+
+
+def test_a_huge_integer_is_accepted_by_a_union_whose_first_branch_fails(default_int_digit_limit):
+    union = {"anyOf": [{"type": "string"}, {"type": "integer"}]}
+    request, result = _generation_with_output({"v": HUGE}, v=union)
+    assert validate_generation_result(request, result).compliant
+    request, result = _generation_with_output({"v": [HUGE], "w": {"k": HUGE}}, v={"anyOf": [{"type": "string"}, {"type": "array"}]},
+                                              w={"anyOf": [{"type": "string"}, {"type": "object"}]})
+    assert validate_generation_result(request, result).compliant
+
+
+def test_a_negated_mismatch_over_a_huge_integer_is_accepted(default_int_digit_limit):
+    request, result = _generation_with_output({"v": HUGE}, v={"not": {"type": "string"}})
+    assert validate_generation_result(request, result).compliant
+    request, result = _generation_with_output({"v": HUGE}, v={"not": {"enum": ["a"]}})
+    assert validate_generation_result(request, result).compliant
+    request, result = _generation_with_output({"v": HUGE}, v={"not": {"const": "a"}})
+    assert validate_generation_result(request, result).compliant
+
+
+def test_a_huge_integer_in_the_schema_does_not_break_a_discarded_branch(default_int_digit_limit):
+    union = {"anyOf": [{"type": "integer", "minimum": HUGE}, {"type": "integer"}]}
+    request, result = _generation_with_output({"v": 5}, v=union)
+    assert validate_generation_result(request, result).compliant
+
+
+def test_huge_integers_keep_their_numeric_semantics(default_int_digit_limit):
+    cases = [
+        ({"type": "integer"}, HUGE, True), ({"type": "number"}, HUGE, True), ({"type": "string"}, HUGE, False),
+        ({"minimum": HUGE}, HUGE, True), ({"minimum": HUGE}, HUGE - 1, False), ({"maximum": HUGE}, HUGE + 1, False),
+        ({"enum": [HUGE]}, HUGE, True), ({"enum": [HUGE]}, HUGE + 1, False), ({"const": HUGE}, HUGE, True),
+        ({"const": HUGE}, HUGE + 1, False), ({"enum": [1, 2.0]}, 2, True),
+        ({"multipleOf": 2}, HUGE, True), ({"multipleOf": 2}, HUGE + 1, False),
+    ]
+    for schema, instance, valid in cases:
+        request, result = _generation_with_output({"v": instance}, v=schema)
+        if valid:
+            assert validate_generation_result(request, result).compliant, (schema, instance)
+        else:
+            with pytest.raises(ValueError, match="does not match declared schema"):
+                validate_generation_result(request, result)
+    request, result = _generation_with_output({"v": [HUGE, HUGE]}, v={"type": "array", "uniqueItems": True})
+    with pytest.raises(ValueError, match="does not match declared schema"):
+        validate_generation_result(request, result)
+
+
+def test_a_message_about_a_huge_integer_is_short(default_int_digit_limit):
+    for schema in ({"type": "string"}, {"enum": ["a"]}, {"const": "a"}):
+        validator = contracts_inference._build_output_validator({**_SCHEMA, **schema})
+        (error,) = validator.iter_errors(contracts_inference._bounded_view(HUGE))
+        assert len(error.message) < 200, (schema, error.message)
+
+
+def _hostname(length: int, dot: bool) -> str:
+    label = "a" * 63
+    core = ".".join([label, label, label, "a" * (length - 3 * 64 - (1 if dot else 0))])
+    return core + ("." if dot else "")
+
+
+@pytest.mark.parametrize(
+    ("length", "dot", "valid"),
+    [(253, False, True), (254, False, False), (255, False, False), (253, True, True), (254, True, True), (255, True, False)],
+)
+def test_the_hostname_length_limit_allows_one_more_character_for_the_root_dot(length, dot, valid):
+    name = _hostname(length, dot)
+    assert len(name) == length and name.endswith(".") == dot
+    assert (_errors({"format": "idn-hostname"}, name) == []) is valid
+
+
+def test_a_float_instance_against_a_divisor_past_the_float_range_is_judged_exactly(default_int_digit_limit):
+    union = {"anyOf": [{"multipleOf": HUGE}, {"type": "number"}]}
+    request, result = _generation_with_output({"v": 2.0**1000}, v=union)
+    assert validate_generation_result(request, result).compliant  # not a multiple, so the second branch decides
+    for instance, multiple in ((0.0, True), (2.0**1000, False), (3.5, False)):
+        request, result = _generation_with_output({"v": instance}, v={"multipleOf": HUGE})
+        if multiple:
+            assert validate_generation_result(request, result).compliant
+        else:
+            with pytest.raises(ValueError, match="does not match declared schema"):
+                validate_generation_result(request, result)

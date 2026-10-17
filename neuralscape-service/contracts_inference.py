@@ -24,6 +24,7 @@ not a service-level commitment.
 from __future__ import annotations
 
 import math
+from fractions import Fraction
 import struct
 import re
 from collections.abc import Callable, Mapping
@@ -647,8 +648,10 @@ def _is_email(value: object) -> bool:
 def _is_idn_hostname(value: object) -> bool:
     if not is_subclass(type(value), str):
         return True
-    if str.__len__(value) > 253:  # type: ignore[arg-type]
-        return False  # no hostname is longer (its ASCII form is never shorter than its text); idna would scan all of it
+    # No hostname is longer than 253 characters, or 254 with its root dot (its ASCII form is never shorter
+    # than its text); idna enforces the exact encoded limits, but would scan all of a longer string first.
+    if str.__len__(value) > (254 if str.endswith(value, ".") else 253):  # type: ignore[arg-type]
+        return False
     idna.encode(value)
     return True
 
@@ -869,9 +872,9 @@ def _brief(value: object) -> str:
         text = repr(str.__getitem__(value, slice(0, _MESSAGE_TEXT)))  # type: ignore[arg-type]
         length = str.__len__(value)  # type: ignore[arg-type]
         return text if length <= _MESSAGE_TEXT else f"{text}... ({length} characters)"
-    if kind is int:
+    if kind is int or kind is _LargeInt:
         bits = int.bit_length(value)  # type: ignore[arg-type]
-        return repr(value) if bits <= 64 else f"<integer of {bits} bits>"
+        return repr(value) if bits <= _LARGE_INT_BITS else f"<integer of {bits} bits>"
     if kind is bool or kind is float or value is None:
         return repr(value)
     if is_subclass(kind, list):
@@ -885,6 +888,7 @@ def _brief(value: object) -> str:
 # in the messages jsonschema builds from the instance.
 _LONG_TEXT = 256
 _SMALL_NODES = 16
+_LARGE_INT_BITS = 64
 
 
 class _LongText(str):
@@ -894,6 +898,18 @@ class _LongText(str):
 
     def __repr__(self) -> str:
         return _brief(self)
+
+
+class _LargeInt(int):
+    """An integer too large for its repr to be cheap or safe (str() of a very large int raises); the
+    value is unchanged: equal, hashed and measured as the integer it copies."""
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        return _brief(self)
+
+    __str__ = __repr__
 
 
 class _LargeList(list):  # type: ignore[type-arg]
@@ -925,6 +941,8 @@ def _bounded_view(value: object) -> object:
         if is_subclass(kind, str):
             text = str.__str__(item)  # type: ignore[arg-type]
             return (str.__new__(_LongText, text) if len(text) > _LONG_TEXT else text), 1
+        if kind is int and int.bit_length(item) > _LARGE_INT_BITS:  # type: ignore[arg-type]
+            return int.__new__(_LargeInt, item), 1  # type: ignore[call-overload]
         if not is_subclass(kind, (list, dict)):
             return item, 1
         known = memo.get(id(item))
@@ -1009,8 +1027,8 @@ def _json_identity(value: object, meter: _SchemaExecutionMeter) -> _Identity:
         return _Identity(
             ("object", frozenset((str.__str__(key), _json_identity(item, meter)) for key, item in value.items()))  # type: ignore[union-attr]
         )
-    if kind is int or kind is float:
-        if kind is int:  # the key is the integer's whole byte string: charged by length before it is built
+    if kind is int or kind is float or kind is _LargeInt:
+        if kind is int or kind is _LargeInt:  # the key is the integer's whole byte string: charged by length before it is built
             meter.charge((int.bit_length(value) + 8) // 8 // _BYTES_PER_UNIT)  # type: ignore[arg-type]
         return _Identity(_number_key(value))  # type: ignore[arg-type]
     return _Identity(("value", value))  # null, or anything else a schema may carry
@@ -1111,9 +1129,21 @@ def _metered_validator_class(validator_class: Any, meter: _SchemaExecutionMeter)
         if identity_of(instance) is not known[1]:
             yield SchemaError(f"{_brief(expected)} was expected")
 
+    jsonschema_multiple_of = validator_class.VALIDATORS["multipleOf"]
+
+    def multiple_of(validator: Any, divisor: Any, instance: Any, schema: Any) -> Any:
+        # jsonschema converts an integer divisor to a float for a float instance, which raises OverflowError
+        # for a divisor past the float range; the exact answer is the rational quotient being whole.
+        try:
+            yield from jsonschema_multiple_of(validator, divisor, instance, schema)
+        except OverflowError:
+            if validator.is_type(instance, "number") and (Fraction(instance) / Fraction(divisor)).denominator != 1:
+                yield SchemaError(f"{_brief(instance)} is not a multiple of {_brief(divisor)}")
+
     keywords = {
         name: metered(keyword, scans_strings=name == "format") for name, keyword in validator_class.VALIDATORS.items()
     }
+    keywords["multipleOf"] = metered(multiple_of)
     keywords["uniqueItems"] = metered(unique_items)
     keywords["enum"] = metered(enum)
     keywords["const"] = metered(const)
@@ -1141,6 +1171,8 @@ def _executable_schema(schema: Any, root: bool = True) -> Any:
             value = _executable_schema(value, False)
         elif keyword in _SCHEMA_ARRAY_KEYWORDS and is_subclass(type(value), list):
             value = [_executable_schema(nested, False) for nested in value]
+        elif type(value) is int and int.bit_length(value) > _LARGE_INT_BITS:
+            value = int.__new__(_LargeInt, value)  # a bound or divisor that a discarded branch would quote
         copied[keyword] = value
     return copied
 
