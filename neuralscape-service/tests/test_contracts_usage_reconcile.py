@@ -4628,3 +4628,63 @@ def test_a_shared_text_subclass_key_is_copied_once_including_the_shape_check() -
     # The shape check copied it once per dictionary (16 -> 17, 32 -> 33), besides the shared rebuild copy.
     for dictionaries in (16, 32):
         assert _text_normalizations(dictionaries) == 1
+
+
+def _wide_event_class(helpers: int) -> type:
+    namespace = {f"helper_{index}": (lambda self: None) for index in range(helpers)}
+    return type("WideEvent", (UsageEvent,), namespace)
+
+
+def _wide_events(model: type, count: int) -> list:
+    events = []
+    for _ in range(count):
+        event = model.model_construct(**dict(_event()))
+        object.__setattr__(event, "__pydantic_extra__", {})
+        events.append(event)
+    return events
+
+
+def test_many_instances_of_one_wide_class_read_its_namespace_once() -> None:
+    # Each instance scanned and charged the whole class namespace: 200 instances of a class with 2,000
+    # helpers exhausted the envelope.
+    model = _wide_event_class(2_000)
+    reads = [0]
+    real = usage_reconcile_contracts._declared_field_names
+
+    def counting(model_type, budget):
+        reads[0] += 1
+        return real(model_type, budget)
+
+    usage_reconcile_contracts._declared_field_names = counting
+    try:
+        snapshot = usage_reconcile_contracts._native_snapshot(_wide_events(model, 200))
+    finally:
+        usage_reconcile_contracts._declared_field_names = real
+    assert len(snapshot) == 200 and reads[0] == 1
+
+
+def test_declared_names_are_captured_before_a_public_extras_callback_runs() -> None:
+    class Sub(UsageEvent):
+        pass
+
+    declared = vars(Sub)["__pydantic_fields__"]
+
+    class Extras(Mapping):
+        def __getitem__(self, key):
+            return "x"
+
+        def __iter__(self):
+            dict.pop(declared, "session_id", None)  # tries to hide the overlap after capture
+            return iter(("session_id",))
+
+        def __len__(self):
+            return 1
+
+        def items(self):
+            yield ("session_id", "x")
+
+    event = Sub.model_construct(**dict(_event()))
+    dict.pop(_MODEL_DICT_DESCRIPTOR.__get__(event, BaseModel), "session_id")
+    object.__setattr__(event, "__pydantic_extra__", Extras())
+    with pytest.raises(ValueError, match="extra storage overlaps stored fields"):
+        usage_reconcile_contracts._native_snapshot(event)

@@ -418,6 +418,14 @@ def _inherits_str(candidate: type) -> bool:
 _CLASS_NAMESPACE = type.__dict__["__dict__"]
 
 
+class _UnreadableMetadata(ValueError):
+    """Model metadata that cannot be read natively: recorded at capture, refused when the model is projected."""
+
+
+_METADATA_UNREADABLE = "contract model metadata must be read natively"
+_DECLARED_NAMES_KEY = "declared-names"  # (key, id(class)) entries in the frozen model store, apart from ids
+
+
 def _declared_field_names(model_type: type, budget: DiscoveryBudget) -> set[object]:
     """The model's declared field names, from the first namespace on its native MRO that defines them.
 
@@ -431,17 +439,46 @@ def _declared_field_names(model_type: type, budget: DiscoveryBudget) -> set[obje
         budget.charge_edge(MappingProxyType.__len__(namespace))
         for key, fields in MappingProxyType.items(namespace):
             if type(key) is not str:
-                raise ValueError("contract model metadata must be read natively")
+                raise _UnreadableMetadata(_METADATA_UNREADABLE)
             if key == "__pydantic_fields__":
                 if type(fields) is not dict:
-                    raise ValueError("contract model metadata must be read natively")
+                    raise _UnreadableMetadata(_METADATA_UNREADABLE)
                 budget.charge_edge(dict.__len__(fields))
                 names = tuple(dict.__iter__(fields))
                 if any(type(name) is not str for name in names):
-                    raise ValueError("contract model metadata must be read natively")
+                    raise _UnreadableMetadata(_METADATA_UNREADABLE)
                 return set(names)
-    raise ValueError("contract model metadata must be read natively")
+    raise _UnreadableMetadata(_METADATA_UNREADABLE)
 
+
+
+def _capture_declared_names(model_type: type, store: dict, budget: DiscoveryBudget) -> None:
+    """Snapshot ``model_type``'s declared field names once per call, when its first instance is captured.
+
+    Taken before any public view or callback of the call can run, charged once, and kept with the class
+    (held, so its id cannot be reused): every instance is judged by this one snapshot, however many there
+    are and whatever runs later.  An unreadable class is recorded and refused only if an instance of it is
+    projected; a budget error still stops capture.
+    """
+
+    slot = (_DECLARED_NAMES_KEY, id(model_type))
+    held = store.get(slot)
+    if held is not None and held[0] is model_type:
+        return
+    try:
+        store[slot] = (model_type, _declared_field_names(model_type, budget))
+    except _UnreadableMetadata:
+        store[slot] = (model_type, None)
+
+
+def _captured_declared_names(model_type: type, store: dict, budget: DiscoveryBudget) -> set[object]:
+    """The call's snapshot of ``model_type``'s declared field names (taken now if capture never met it)."""
+
+    _capture_declared_names(model_type, store, budget)
+    names = store[(_DECLARED_NAMES_KEY, id(model_type))][1]
+    if names is None:
+        raise _UnreadableMetadata(_METADATA_UNREADABLE)
+    return names
 
 def _plain_name(name: object) -> object:
     """A stored field name as plain text (read without running a text subclass's own hooks).
@@ -600,6 +637,8 @@ def _freeze_model_storage_body(
         except AttributeError:
             extras = None
         native_extra_items = None
+        if extras is not None:
+            _capture_declared_names(value_type, frozen_models, budget)  # before any callback of the call
         if extras is not None and inherits_native(type(extras), dict):
             _precheck(budget, dict.__len__(extras))
             native_extra_items = tuple(dict.items(extras))
@@ -837,7 +876,7 @@ def _snapshot_uncached(
                         _memo_text(name, _memo)
                         for name in (*iterated_extra_names, *(name for name, _ in extra_items))
                     }
-                declared_fields = _declared_field_names(type(value), budget)
+                declared_fields = _captured_declared_names(type(value), _frozen_models, budget)
                 stored_names = {_memo_text(name, _memo) for name, _ in stored_items}
                 if (stored_names | set(declared_fields)).intersection(extra_names):
                     raise ValueError("contract extra storage overlaps stored fields")

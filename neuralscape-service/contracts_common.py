@@ -147,23 +147,20 @@ class VersionedContract(ContractModel):
 def _exact_entry(items: Iterable[tuple[object, object]], name: str) -> tuple[object, bool, bool]:
     """``(value, found, pure)`` for ``name`` among natively read ``items``, compared as exact text.
 
-    No key's own hash or equality runs.  ``pure`` is False when a key that is not an exact ``str`` is
-    present: a lookup through the mapping could have run its hooks, so the subtree is not reused.  An
-    exact key wins over a ``str``-subclass key with the same text.
+    No key's own hash or equality runs.  ``pure`` is False as soon as a key that is not an exact ``str`` is
+    met: a lookup through the mapping could have run its hooks, and every caller refuses the metadata then,
+    so the scan stops there and the key is never read (a ``str`` subclass is not copied as text only to be
+    refused).
     """
 
     value: object = None
-    found = exact = False
-    pure = True
+    found = False
     for key, item in items:
-        if type(key) is str:
-            if key == name:
-                value, found, exact = item, True, True
-        else:
-            pure = False
-            if not exact and _is_subclass(type(key), str) and str.__str__(key) == name:
-                value, found = item, True
-    return value, found, pure
+        if type(key) is not str:
+            return None, False, False
+        if key == name:
+            value, found = item, True
+    return value, found, True
 
 
 def _class_namespace_entry(model_type: type, name: str, budget: DiscoveryBudget) -> tuple[object, bool]:

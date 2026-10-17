@@ -4504,3 +4504,36 @@ def test_a_text_subclass_alias_shared_by_many_classes_is_copied_once_per_call() 
         distinct, snapshotted, exact = _alias_texts_seen(classes)
         assert snapshotted == classes and exact
         assert distinct == 1
+
+
+def _refused_key_text_checks(classes: int) -> int:
+    """How many times the metadata reads look at one long ``str``-subclass configuration key shared by
+    ``classes`` model classes (each check of it as text preceded a full copy of it)."""
+
+    import contracts_common
+
+    key = _SharedAlias("c" * 4096)
+    models = [type(f"Refused{index}", (BaseModel,), {"__annotations__": {"x": int}, "x": 0}) for index in range(classes)]
+    for model in models:
+        dict.__setitem__(vars(model)["model_config"], key, True)
+    checks = [0]
+    real = contracts_common._is_subclass
+
+    def counting(kind, bases):
+        if kind is _SharedAlias:
+            checks[0] += 1
+        return real(kind, bases)
+
+    contracts_common._is_subclass = counting
+    try:
+        with pytest.raises(ValueError):
+            snapshot_contract_graph([model() for model in models])
+    finally:
+        contracts_common._is_subclass = real
+    return checks[0]
+
+
+def test_a_key_that_refuses_the_metadata_is_not_copied_as_text() -> None:
+    # Each class copied the shared refused key (4 -> 4, 8 -> 8) before refusing its metadata.
+    for classes in (4, 8):
+        assert _refused_key_text_checks(classes) == 0
