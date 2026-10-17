@@ -1451,7 +1451,9 @@ def _snapshot_native(
 
     try:
         if _is_instance(value, BaseModel):
-            fields = type(value).model_fields
+            # The field inventory comes from the caller's class and may answer differently each time it is iterated:
+            # it is read once into exact names, and the model is rebuilt from the captured entries, not from it.
+            fields = frozenset(_exact_key(name) for name in type(value).model_fields)
             frozen = _frozen_graph.models.get(identity)
             if frozen is None or frozen[0] is not value:
                 _freeze_model_storage(value, _frozen_graph, set())
@@ -1491,13 +1493,12 @@ def _snapshot_native(
                 raise ValueError(f"undeclared stored fields at {path}: {names}")
             return {
                 name: _snapshot_native(
-                    stored_values[name],
+                    stored_item,
                     path=_Path(path, ("field", name)),
                     active=active,
                     _frozen_graph=_frozen_graph,
                 )
-                for name in fields
-                if name in stored_values
+                for name, stored_item in stored_values.items()
             }
 
         if _is_instance(value, Mapping):
@@ -1774,6 +1775,14 @@ def validate_run_manifest_json(data: str | bytes) -> RunManifest:
             result[key] = value
         return result
 
+    # One exact copy, read with the base types' own methods: a subclass's decode(), startswith() or buffer view
+    # cannot show one parser a different document from the other.
+    if _is_instance(data, bytes):
+        data = bytes(memoryview(data))
+    elif _is_instance(data, str):
+        data = str.__str__(data)
+    else:
+        raise TypeError("a run manifest document must be text or bytes")
     decoded = json.loads(data, object_pairs_hook=reject_duplicate_keys)
     if not isinstance(decoded, dict):
         raise ValueError("a run manifest must be a JSON object")
