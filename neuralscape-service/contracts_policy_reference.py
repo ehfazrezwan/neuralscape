@@ -667,8 +667,13 @@ def _retained_mapping_entries(
     mapping_inventories: dict[int, _MappingInventory],
     model_inventories: dict[int, _ModelInventory],
     budget: DiscoveryBudget | None = None,
+    paid: dict[int, int] | None = None,
 ) -> tuple[_MappingEntry | _CapturedFailure, ...]:
-    """Return one authenticated public inventory, capturing it if newly seen."""
+    """Return one authenticated public inventory, capturing it if newly seen.
+
+    ``paid`` is completion's map of what discovery already charged: a mapping first captured here
+    records its native descendants in it, so completion does not charge their entries a second time.
+    """
 
     budget = _new_budget(budget)
 
@@ -680,7 +685,7 @@ def _retained_mapping_entries(
             owners,
             mapping_inventories,
             model_inventories,
-            {},
+            {} if paid is None else paid,
             mapping_inventories,
             None,
             budget,
@@ -699,6 +704,7 @@ def _retained_mapping_items(
     mapping_inventories: dict[int, _MappingInventory],
     model_inventories: dict[int, _ModelInventory],
     budget: DiscoveryBudget | None = None,
+    paid: dict[int, int] | None = None,
 ) -> tuple[tuple[object, object], ...]:
     """Rebuild model-owned items while retaining per-entry error priority."""
 
@@ -708,6 +714,7 @@ def _retained_mapping_items(
         mapping_inventories,
         model_inventories,
         budget,
+        paid,
     ):
         retained = cast(_MappingEntry, _raise_captured_failure(entry))
         items.append((retained.key, retained.value))
@@ -917,6 +924,7 @@ def _complete_contract_input(
                     mapping_inventories,
                     inventories,
                     budget,
+                    memo.setdefault(_PAID, {}),
                 )
             )
             stored_items = _normalize_model_items(native_stored_items)
@@ -939,6 +947,7 @@ def _complete_contract_input(
                         mapping_inventories,
                         inventories,
                         budget,
+                        memo.setdefault(_PAID, {}),
                     )
                 )
                 extra_items = _normalize_model_items(native_extra_items)
@@ -1027,6 +1036,7 @@ def _complete_contract_input(
                     mapping_inventories,
                     inventories,
                     budget,
+                    memo.setdefault(_PAID, {}),
                 )
             completed: dict[object, object] = {}
             free = _first_paid_copy(memo, value, paid)
