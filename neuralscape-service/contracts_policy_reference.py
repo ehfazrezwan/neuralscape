@@ -1168,14 +1168,23 @@ def _decision(
 _JUDGED_STATEMENT_FIELDS = frozenset({"id", "effect", "subject_id", "credential_id", "action", "resource"})
 
 
+def _is_set_unjudged(statement: PolicyStatement, name: str, field: Any) -> bool:
+    """Whether an unjudged field carries a term: a required field always does (it has no default, so
+    any value, ``None`` included, was provided); an optional one does when it differs from its real
+    default, a default factory's product included."""
+
+    if field.is_required():
+        return True
+    return getattr(statement, name, None) != field.get_default(call_default_factory=True)
+
+
 def _unjudged_terms(statement: PolicyStatement) -> tuple[str, ...]:
-    """The fields of ``statement`` outside ``_JUDGED_STATEMENT_FIELDS`` that differ from their default."""
+    """The fields of ``statement`` outside ``_JUDGED_STATEMENT_FIELDS`` that carry a term."""
 
     return tuple(
         name
         for name, field in type(statement).model_fields.items()
-        if name not in _JUDGED_STATEMENT_FIELDS
-        and getattr(statement, name, None) != (None if field.is_required() else field.default)
+        if name not in _JUDGED_STATEMENT_FIELDS and _is_set_unjudged(statement, name, field)
     )
 
 

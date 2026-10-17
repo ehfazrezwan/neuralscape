@@ -4622,6 +4622,35 @@ def test_a_statement_with_an_unjudged_term_is_reported_and_one_at_its_default_is
     assert _unjudged_terms(PolicyStatement(**base)) == ()
 
 
+def test_a_required_unjudged_term_is_reported_whatever_its_value_and_every_default_kind_is_honoured() -> None:
+    from typing import Optional
+
+    from pydantic import Field, create_model
+
+    from contracts_policy import PolicyStatement
+    from contracts_policy_reference import _unjudged_terms
+
+    base = statement("s", "allow", "read", reference("memory-1")).model_dump()
+
+    # required and nullable: it has no default, so supplying None sets it (None is not its default)
+    Required = create_model("Required", __base__=PolicyStatement, unjudged_required_term=(Optional[dict], ...))
+    assert _unjudged_terms(Required(**base, unjudged_required_term=None)) == ("unjudged_required_term",)
+    assert _unjudged_terms(Required(**base, unjudged_required_term={"kind": "x"})) == ("unjudged_required_term",)
+
+    # optional with a non-None default: only a different value is a term
+    Limited = create_model("Limited", __base__=PolicyStatement, unjudged_limit_term=(int, 5))
+    assert _unjudged_terms(Limited(**base)) == ()
+    assert _unjudged_terms(Limited(**base, unjudged_limit_term=5)) == ()
+    assert _unjudged_terms(Limited(**base, unjudged_limit_term=6)) == ("unjudged_limit_term",)
+
+    # optional with a default factory: compared with what the factory produces
+    Listed = create_model(
+        "Listed", __base__=PolicyStatement, unjudged_list_term=(list[str], Field(default_factory=list))
+    )
+    assert _unjudged_terms(Listed(**base)) == ()
+    assert _unjudged_terms(Listed(**base, unjudged_list_term=["x"])) == ("unjudged_list_term",)
+
+
 def test_a_reach_tuple_is_scanned_and_charged_once_per_capture() -> None:
     """A list of 1,000 mapping proxies, reachable from the root and exposed by each of 60 pairs: its
     reach tuple is scanned (and charged) once per capture.  Each pair still walks the list it exposes
