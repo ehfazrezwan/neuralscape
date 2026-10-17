@@ -1202,3 +1202,19 @@ def test_a_property_named_like_a_literal_keyword_is_still_a_schema() -> None:
     new = copy.deepcopy(old)
     new["not"]["properties"]["const"] = {"$ref": "#/$defs/B"}
     assert _pair(old, new) == []
+
+
+def _recursive_node(child_siblings: dict) -> dict:
+    node = {"type": "object", "properties": {"child": {"$ref": "#/$defs/Node", **child_siblings}}}
+    return {"$defs": {"Node": node}, "not": {"$ref": "#/$defs/Node"}}
+
+
+def test_a_cycle_marker_keeps_the_constraints_written_beside_the_reference() -> None:
+    old = _recursive_node({"maxProperties": 0})
+    new = _recursive_node({})  # {"child": {"child": {}}} was valid (not Node); it is now invalid
+    assert _pair(old, new) != []
+
+
+def test_a_cycle_whose_siblings_are_unchanged_compares_clean() -> None:
+    old = _recursive_node({"maxProperties": 0})
+    assert _pair(old, copy.deepcopy(old)) == []

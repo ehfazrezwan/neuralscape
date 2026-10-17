@@ -241,7 +241,8 @@ def _inline(
     if isinstance(ref, str) and ref.startswith("#/$defs/"):
         name = ref.removeprefix("#/$defs/")
         if name in stack:
-            return {"$cycle": name}
+            # The cycle is cut here, but what is written beside the reference still constrains.
+            return {"$cycle": name, **inline_members({key: item for key, item in value.items() if key != "$ref"})}
         if name in defs:
             rest = inline_members({key: item for key, item in value.items() if key != "$ref"})
             return {"$ref": _inline(defs[name], defs, stack + (name,), budget), **rest}
