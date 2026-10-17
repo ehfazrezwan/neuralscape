@@ -79,7 +79,7 @@ def observe(service_dir: Path) -> dict[str, dict]:
             capture_output=True, text=True, check=True, cwd=str(service_dir), timeout=300,
         )
         return json.loads(done.stdout.strip().splitlines()[-1])
-    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, ValueError, IndexError) as error:
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError, ValueError, IndexError) as error:   # OSError: the process could not start (missing, non-directory or inaccessible service dir)
         reason = f"probe process failed: {type(error).__name__}"
         return {scenario: {"error": reason} for scenario in _scenario_ids()}
 
