@@ -2644,3 +2644,43 @@ def test_the_enum_check_visits_a_shared_container_once_not_once_per_path(monkeyp
         bad = (bad, bad)
     with pytest.raises(ValueError, match="declared member"):
         contracts_common.require_canonical_enum_members(bad)
+
+
+# ---- a successful enum lookup does no deep equality per application
+
+def test_enum_lookups_that_match_do_equality_work_per_distinct_value_not_per_application(monkeypatch):
+    """200 singleton enum branches (separate copies of an object of 200 numbers) over 200 matching objects: every
+    lookup hits, which used to walk the whole value per application (8 million node comparisons).  Counted as
+    Python-level equality calls per node."""
+
+    walks = [0]
+    original = contracts_inference._Identity.__eq__
+
+    def counting(self, other):
+        walks[0] += 1
+        return original(self, other)
+
+    monkeypatch.setattr(contracts_inference._Identity, "__eq__", counting)
+    request, result = _generation_with_output(
+        {"v": [{"k": list(range(200))} for _ in range(200)]},
+        v={"type": "array", "items": {"allOf": [{"enum": [{"k": list(range(200))}]} for _ in range(200)]}},
+    )
+    assert validate_generation_result(request, result).compliant
+    assert walks[0] < 300_000, walks[0]  # about 200 + 200 distinct objects compared once with their pooled twin
+
+
+def test_unique_items_over_equal_large_items_stops_at_the_first_duplicate(monkeypatch):
+    walks = [0]
+    original = contracts_inference._Identity.__eq__
+
+    def counting(self, other):
+        walks[0] += 1
+        return original(self, other)
+
+    monkeypatch.setattr(contracts_inference._Identity, "__eq__", counting)
+    request, result = _generation_with_output(
+        {"v": [{"k": list(range(200))} for _ in range(500)]}, v={"type": "array", "uniqueItems": True}
+    )
+    with pytest.raises(ValueError, match="does not match declared schema"):
+        validate_generation_result(request, result)
+    assert walks[0] < 2_000, walks[0]  # the second item equals the first; nothing after it is compared
