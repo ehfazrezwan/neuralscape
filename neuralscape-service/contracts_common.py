@@ -213,10 +213,22 @@ def _native_sequence(value: object, budget: DiscoveryBudget) -> tuple[object, ..
     raise _MetadataRefused(_METADATA_REFUSAL)
 
 
-def _text(value: object) -> object:
-    """A ``str`` subclass as its exact text (no hook of it runs); anything else unchanged."""
+def _text(value: object, inventory: "_GraphInventory") -> object:
+    """A ``str`` subclass as its exact text (no hook of it runs); anything else unchanged.
 
-    return str.__str__(value) if type(value) is not str and _is_subclass(type(value), str) else value
+    The text is copied once per call per object (``inventory.key_texts``, holding the object so its id cannot
+    be reused): one subclass shared by many keys, choices, fields or classes is copied and hashed once, and
+    every reader keeps that one copy.
+    """
+
+    if type(value) is str or not _is_subclass(type(value), str):
+        return value
+    known = inventory.key_texts.get(id(value))
+    if known is not None and known[0] is value:
+        return known[1]
+    text = str.__str__(value)  # type: ignore[arg-type]
+    inventory.key_texts[id(value)] = (value, text)
+    return text
 
 
 def _model_metadata(
@@ -283,8 +295,8 @@ def _read_declared_metadata(
     for name, _field in declared_fields:  # the charged copy, never the live table
         if not _is_subclass(type(name), str):
             raise _MetadataRefused(_METADATA_REFUSAL)  # a declared name that is not text (never hashed)
-        declared_names.add(_text(name))
-    alias_owners, aliases_pure = _validation_alias_owners(declared_fields, config, budget)
+        declared_names.add(_text(name, inventory))
+    alias_owners, aliases_pure = _validation_alias_owners(declared_fields, config, inventory)
     if not (_pure and aliases_pure):
         raise _MetadataRefused(_METADATA_REFUSAL)  # every read above is exact and native, or refused: never cache otherwise
     inventory.metadata[id(model_type)] = (model_type, declared_names, alias_owners)
@@ -292,16 +304,17 @@ def _read_declared_metadata(
 
 
 def _validation_alias_owners(
-    fields: tuple[tuple[object, object], ...], config: object, budget: DiscoveryBudget
+    fields: tuple[tuple[object, object], ...], config: object, inventory: "_GraphInventory"
 ) -> tuple[dict[str, set[str]], bool]:
     """Each validation alias (or alias-path root) as exact text, with the fields it belongs to.
 
-    A ``str``-subclass alias is read as its text, so hashing it runs no hook; the configuration and
-    the alias storage (``choices``, ``path``) are read natively and the copies charged.  The second
-    value is False when reading may have run caller code (a subclass of a pydantic alias or field type,
-    hook-capable storage or keys), which makes the subtree ineligible for reuse.
+    A ``str``-subclass alias is read as its text (once per call, see ``_text``), so hashing it runs no
+    hook; the configuration and the alias storage (``choices``, ``path``) are read natively and the copies
+    charged.  The second value is False when reading may have run caller code (a subclass of a pydantic
+    alias or field type, hook-capable storage or keys), which makes the subtree ineligible for reuse.
     """
 
+    budget = inventory.budget
     pure = True
     validate_by_alias = None
     if type(config) is dict:
@@ -330,15 +343,15 @@ def _validation_alias_owners(
             raise _MetadataRefused(_METADATA_REFUSAL)
         else:
             choices = (validation_alias,)
-        name = _text(field_name)
+        name = _text(field_name, inventory)
         for choice in choices:
             if _is_subclass(type(choice), str):
-                owners.setdefault(_text(choice), set()).add(name)  # type: ignore[arg-type]
+                owners.setdefault(_text(choice, inventory), set()).add(name)  # type: ignore[arg-type]
             elif type(choice) is AliasPath:
                 path = _native_sequence(_native_slot(choice, "path"), budget)
                 root = path[0] if path else None
                 if _is_subclass(type(root), str):
-                    owners.setdefault(_text(root), set()).add(name)  # type: ignore[arg-type]
+                    owners.setdefault(_text(root, inventory), set()).add(name)  # type: ignore[arg-type]
             elif choice is not None:
                 raise _MetadataRefused(_METADATA_REFUSAL)  # an alias subclass, or anything else
     return owners, pure
@@ -440,13 +453,7 @@ def _plain_keys(
     for key, item in entries:
         if not is_exact_type(key, *_PLAIN_KEY_TYPES):
             if _is_subclass(type(key), str):
-                known = inventory.key_texts.get(id(key))
-                if known is not None and known[0] is key:
-                    key = known[1]
-                else:
-                    text = str.__str__(key)  # type: ignore[arg-type]
-                    inventory.key_texts[id(key)] = (key, text)  # holds the key: its id cannot be reused
-                    key = text
+                key = _text(key, inventory)
             else:
                 pure = False
         _charge_key_hash(key, inventory.budget)

@@ -1681,12 +1681,14 @@ def test_python_prefreeze_precedes_mapping_key_hooks(receiver_name: str) -> None
 
     signature = _python_validation_signature(receiver, payload, "model_validate")
 
-    assert key.calls == 1
+    # The key is read as its text, so its hook (and the repair it would make) never runs: the frozen,
+    # invalid child is what is validated.
+    assert key.calls == 0
     assert signature[0][1] == expected_location
     if receiver_name == "stream":
-        assert child_backing["provider"] == "provider-1"
+        assert child_backing["provider"] == ""
     else:
-        assert child_backing["known_token_subtotal"] == 15
+        assert child_backing["known_token_subtotal"] == 0
 
 
 @pytest.mark.parametrize(
@@ -4429,3 +4431,171 @@ def test_containers_of_any_kind_exposed_only_by_a_view_are_charged_as_nodes(hybr
         usage_reconcile_contracts._native_snapshot({"k": PublicOnly()})
     small = type("Small", (list,), {"__iter__": lambda self: iter([hybrid() for _ in range(10)])})
     assert len(usage_reconcile_contracts._native_snapshot({"k": small()})["k"]) == 10
+
+
+# ---- one text-subclass object referenced many times is copied once per call
+
+
+class _SharedText(str):
+    pass
+
+
+def _distinct_text_copies(references: int) -> tuple[int, bool]:
+    text = _SharedText("r" * 4096)
+    snapshot = usage_reconcile_contracts._native_snapshot(
+        {"recipients": (text,) * references, "by_key": [{text: index} for index in range(references)]}
+    )
+    leaves = snapshot["recipients"]
+    keys = [next(iter(entry)) for entry in snapshot["by_key"]]
+    copies = {id(item): item for item in (*leaves, *keys)}
+    return len(copies), all(type(item) is str and item == text for item in copies.values())
+
+
+def test_repeated_references_to_one_text_subclass_share_one_copy() -> None:
+    # The copies grew with the references (2 x 16 -> 32, 2 x 32 -> 64): each leaf and key made its own.
+    for references in (16, 32):
+        distinct, exact = _distinct_text_copies(references)
+        assert exact and distinct == 1
+
+
+def test_a_text_that_is_also_a_mapping_keeps_its_text_and_its_projection_apart() -> None:
+    from collections.abc import Mapping
+
+    class TextMapping(str, Mapping):
+        def __getitem__(self, key):
+            return 1
+
+        def __iter__(self):
+            return iter(("inner",))
+
+        def __len__(self):
+            return 1
+
+        def items(self):
+            yield ("inner", 1)
+
+    both = TextMapping("outer")
+    cases = (
+        ({both: both}, {"outer": {"inner": 1}}),
+        ([both, {both: 0}], [{"inner": 1}, {"outer": 0}]),
+        ([{both: 0}, both], [{"outer": 0}, {"inner": 1}]),
+    )
+    for document, expected in cases:
+        snapshot = usage_reconcile_contracts._native_snapshot(document)
+        assert snapshot == expected
+        keyed = snapshot if type(snapshot) is dict else next(e for e in snapshot if "outer" in e)
+        assert all(type(key) is str for key in keyed)
+
+
+# ---- one call's work follows its input, not the number of validators that look at it
+
+
+def _recipient_projections(events: int, recipients: int) -> tuple[int, int]:
+    """``(projections of the shared recipients tuple, container checks)`` for one reconciliation of ``events``
+    distinct events that share one ``recipients``-long tuple."""
+
+    shared = tuple(f"recipient-{index}" for index in range(recipients))
+    supplied = [
+        _event(event_id=f"event-{index}", attempt_id=f"attempt-{index}", attribution=_attribution(recipients=shared))
+        for index in range(events)
+    ]
+    projections = [0, 0]
+    real_uncached, real_is_node = usage_reconcile_contracts._snapshot_uncached, usage_reconcile_contracts._is_node
+
+    def counting_uncached(value, *args, **kwargs):
+        if type(value) is tuple and len(value) == recipients:
+            projections[0] += 1
+        return real_uncached(value, *args, **kwargs)
+
+    def counting_is_node(value):
+        projections[1] += 1
+        return real_is_node(value)
+
+    usage_reconcile_contracts._snapshot_uncached = counting_uncached
+    usage_reconcile_contracts._is_node = counting_is_node
+    try:
+        usage_reconcile_contracts.reconcile_usage_events(supplied)
+    finally:
+        usage_reconcile_contracts._snapshot_uncached = real_uncached
+        usage_reconcile_contracts._is_node = real_is_node
+    return projections[0], projections[1]
+
+
+def test_a_validated_result_is_not_snapshotted_again_by_its_own_after_validators() -> None:
+    # Each event's recipients were projected 12 times: twice more by after-validators re-snapshotting values
+    # their before-validator had just snapshotted and validated.
+    for events in (1, 2):
+        projections, _checks = _recipient_projections(events, 64)
+        assert projections == 6 * events
+
+
+def test_exact_text_leaves_are_not_put_through_the_container_checks() -> None:
+    # The container checks grew with the leaves (each exact text was checked on every pass).
+    _projections, small = _recipient_projections(1, 1_000)
+    _projections, large = _recipient_projections(1, 2_000)
+    assert large == small
+
+
+# ---- no caller hook runs while names and keys are read
+
+
+def test_declared_field_names_are_read_without_the_model_metaclass() -> None:
+    from pydantic._internal._model_construction import ModelMetaclass
+
+    reads = [0]
+
+    class CountingMeta(ModelMetaclass):
+        def __getattribute__(cls, name):
+            if name == "model_fields":
+                reads[0] += 1
+            return super().__getattribute__(name)
+
+    class CountedEvent(UsageEvent, metaclass=CountingMeta):
+        pass
+
+    event = CountedEvent.model_construct(**dict(_event()))
+    object.__setattr__(event, "__pydantic_extra__", {})
+    reads[0] = 0
+    usage_reconcile_contracts._native_snapshot(event)
+    assert reads[0] == 0
+
+
+class _CountingTextKey(str):
+    hashes = 0
+
+    def __hash__(self):
+        type(self).hashes += 1
+        return str.__hash__(self)
+
+
+@pytest.mark.parametrize("container", [dict, type("PlainDict", (dict,), {})])
+def test_a_text_subclass_key_is_never_hashed_through_its_own_hook(container: type) -> None:
+    payload = container(_event().model_dump())
+    value = payload.pop("operation")
+    key = _CountingTextKey("operation")
+    payload[key] = value
+    _CountingTextKey.hashes = 0
+    result = reconcile_usage_events([payload])
+    assert _CountingTextKey.hashes == 0
+    assert result.streams[0].operation == "extract"
+
+
+def test_a_key_that_is_not_text_is_refused_before_any_hook_of_it_runs() -> None:
+    calls = [0]
+
+    class Odd:
+        def __hash__(self):
+            calls[0] += 1
+            return 0
+
+        def __eq__(self, other):
+            calls[0] += 1
+            return False
+
+    payload = _event().model_dump()
+    payload[Odd()] = "extra"
+    calls[0] = 0  # inserting it above hashed it once
+    with pytest.raises(UsageReconciliationError) as caught:
+        reconcile_usage_events([payload])
+    assert caught.value.code == "invalid_event"
+    assert calls[0] == 0

@@ -4450,3 +4450,57 @@ def test_a_model_with_generic_enum_annotations_defines_and_records_its_enum_fiel
         numbers: list[int] = []
 
     assert set(Holder._enum_field_names) == {"one", "many", "fixed", "mapping", "maybe", "optional", "annotated"}
+
+
+# ── a shared text-subclass alias is read as text once per call ──
+
+
+class _SharedAlias(str):
+    pass
+
+
+def _alias_texts_seen(classes: int) -> tuple[int, int, bool]:
+    """``(distinct alias texts across the class snapshots, classes snapshotted, all exact text)`` for ``classes``
+    model classes whose every field shares one long text-subclass alias (twice in each choice list)."""
+
+    import contracts_common
+    from pydantic import Field
+
+    alias = _SharedAlias("a" * 4096)
+    models = []
+    for index in range(classes):
+        namespace = {
+            "__annotations__": {"first": int, "second": int},
+            "first": Field(0, validation_alias=AliasChoices(alias, alias)),
+            "second": Field(0, validation_alias=AliasPath(alias, 0)),
+        }
+        models.append(type(f"Shares{index}", (BaseModel,), namespace))
+    inventories = []
+    real = contracts_common._GraphInventory
+
+    def recording(*args, **kwargs):
+        inventories.append(real(*args, **kwargs))
+        return inventories[-1]
+
+    contracts_common._GraphInventory = recording
+    try:
+        snapshot_contract_graph([model() for model in models])
+    finally:
+        contracts_common._GraphInventory = real
+    (inventory,) = inventories
+    texts = {
+        id(text): text
+        for entry in inventory.metadata.values()
+        if entry[2] is not None
+        for text in entry[2]
+    }
+    snapshotted = sum(1 for entry in inventory.metadata.values() if entry[2] is not None)
+    return len(texts), snapshotted, all(type(text) is str for text in texts.values())
+
+
+def test_a_text_subclass_alias_shared_by_many_classes_is_copied_once_per_call() -> None:
+    # The copies grew with the classes (4 -> 4, 8 -> 8): each class snapshot made and kept its own.
+    for classes in (4, 8):
+        distinct, snapshotted, exact = _alias_texts_seen(classes)
+        assert snapshotted == classes and exact
+        assert distinct == 1
