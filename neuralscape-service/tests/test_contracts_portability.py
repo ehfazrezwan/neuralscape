@@ -4703,3 +4703,102 @@ def test_the_declared_field_charge_counts_both_scans_of_every_instance(instances
     with pytest.raises(ValidationError) as raised:
         validate_portable_manifest(manifest)
     assert (str(raised.value.__cause__) == DISCOVERY_BUDGET_MESSAGE) is over_budget
+
+
+# ---- classification is by native class identity, and the depth outcome does not depend on sibling order
+
+def _count_model_class_checks(monkeypatch):
+    """Counts the ``isinstance``/``issubclass`` checks against model classes that ``contracts_portability`` itself
+    makes: the checks dispatch through the model metaclass, which a caller can replace or extend."""
+
+    import sys
+
+    calls: list[str] = []
+    metaclass = type(PortableManifest)
+    original = {name: getattr(metaclass, name) for name in ("__instancecheck__", "__subclasscheck__")}
+
+    def counting(name):
+        def check(cls, other):
+            if sys._getframe(1).f_globals.get("__name__") == "contracts_portability":
+                calls.append(name)
+            return original[name](cls, other)
+
+        return check
+
+    for name in original:
+        monkeypatch.setattr(metaclass, name, counting(name))
+    return calls
+
+
+def test_discovery_and_dispatch_classify_by_native_class_identity(monkeypatch) -> None:
+    calls = _count_model_class_checks(monkeypatch)
+    manifest = validate_portable_manifest(valid_manifest()).model_copy(deep=True)
+    assert validate_portable_manifest(manifest).manifest_id == "manifest-7"
+    assert validate_portable_manifest(valid_manifest()).manifest_id == "manifest-7"  # the mapping route too
+    assert calls == [], calls  # none of the classification went through the metaclass check hooks
+
+
+def test_classification_reads_no_attribute_of_a_hooked_model_instance() -> None:
+    reads: list[str] = []
+
+    class Spoofing(PortableManifest):
+        def __getattribute__(self, name):
+            reads.append(name)
+            return super().__getattribute__(name)
+
+    manifest = validate_portable_manifest(valid_manifest())
+    spoofing = object.__new__(Spoofing)
+    _PYDANTIC_DICT_DESCRIPTOR.__set__(spoofing, dict(_PYDANTIC_DICT_DESCRIPTOR.__get__(manifest, BaseModel)))
+    _PYDANTIC_FIELDS_SET_SLOT.__set__(spoofing, set(_PYDANTIC_FIELDS_SET_SLOT.__get__(manifest, type(manifest))))
+    _PYDANTIC_EXTRA_SLOT.__set__(spoofing, None)
+    del reads[:]
+    validate_portable_manifest(spoofing)
+    assert reads == [], reads
+
+
+@pytest.mark.parametrize("shared_first", [True, False])
+def test_the_depth_outcome_does_not_depend_on_sibling_order(monkeypatch, shared_first) -> None:
+    """Depth is judged at each node's minimum depth: ``[shared, wrapper]`` and ``[wrapper, shared]`` agree."""
+
+    from contracts_limits import DiscoveryTier
+
+    monkeypatch.setattr(contracts_portability, "PORTABILITY", DiscoveryTier("tiny", 1_000, 100_000, 3))
+    shared = [[]]
+    wrapper = [shared]
+    manifest = validate_portable_manifest(valid_manifest()).model_copy(deep=True)
+    dict.__setitem__(_PYDANTIC_DICT_DESCRIPTOR.__get__(manifest, BaseModel), "files", [shared, wrapper] if shared_first else [wrapper, shared])
+    with pytest.raises(ValidationError) as raised:
+        validate_portable_manifest(manifest)
+    assert str(raised.value.__cause__) != DISCOVERY_BUDGET_MESSAGE  # refused for its content, never for depth
+
+
+def test_a_node_that_is_deep_on_every_path_is_still_refused_for_depth(monkeypatch) -> None:
+    from contracts_limits import DiscoveryTier
+
+    monkeypatch.setattr(contracts_portability, "PORTABILITY", DiscoveryTier("tiny", 1_000, 100_000, 3))
+    deep = [[[[]]]]  # four levels below the field's list: over the limit on its only path
+    manifest = validate_portable_manifest(valid_manifest()).model_copy(deep=True)
+    dict.__setitem__(_PYDANTIC_DICT_DESCRIPTOR.__get__(manifest, BaseModel), "files", [deep])
+    with pytest.raises(ValidationError) as raised:
+        validate_portable_manifest(manifest)
+    assert str(raised.value.__cause__) == DISCOVERY_BUDGET_MESSAGE
+
+
+@pytest.mark.parametrize("limit", [3, 4, 5, 6])
+def test_every_sibling_permutation_gets_the_same_depth_outcome(monkeypatch, limit) -> None:
+    import itertools
+
+    from contracts_limits import DiscoveryTier
+
+    monkeypatch.setattr(contracts_portability, "PORTABILITY", DiscoveryTier("tiny", 1_000, 100_000, limit))
+    chain = [[[]]]
+    shared = [chain]
+    siblings = {"shared": shared, "wrapper": [shared], "deeper": [[shared]], "chain": chain, "leaf": []}
+    outcomes = set()
+    for order in itertools.permutations(siblings):
+        manifest = validate_portable_manifest(valid_manifest()).model_copy(deep=True)
+        dict.__setitem__(_PYDANTIC_DICT_DESCRIPTOR.__get__(manifest, BaseModel), "files", [siblings[name] for name in order])
+        with pytest.raises(ValidationError) as raised:
+            validate_portable_manifest(manifest)
+        outcomes.add(str(raised.value.__cause__) == DISCOVERY_BUDGET_MESSAGE)
+    assert len(outcomes) == 1, outcomes  # budget refusal for all orders, or for none

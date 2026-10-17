@@ -412,109 +412,114 @@ def _reject_retained_unknown_fields(
     first_expansion = state.first_expansion
 
     def discover(value: Any, depth: int = 0) -> None:
-        pending = [(value, depth)]
+        # Level by level: every node is first reached by a shortest path, so the depth it is judged at is its
+        # minimum depth whatever order its siblings are stored in.  (A depth-first walk could reach a shared
+        # node by a long path first and refuse it, where the same graph with its siblings swapped reaches it
+        # by a short one and accepts.)
+        pending: list[Any] = [value]
+        level_depth = depth
         while pending:
-            current, current_depth = pending.pop()
-            value_type = type(current)
-            if not issubclass(
-                value_type,
-                (BaseModel, dict, list, tuple, set, frozenset),
-            ):
-                continue
+            level, pending = pending, []
+            for current in level:
+                discover_node(current, level_depth, pending)
+            level_depth += 1
 
-            identity = id(current)
-            # Unique nodes are charged once; a shallower path re-expands a node
-            # so the depth outcome does not depend on traversal order.
-            if not budget.visit(current, current_depth):
-                continue
-            discovered.add(identity)
-            child_depth = current_depth + 1
+    def discover_node(current: Any, current_depth: int, pending: list[Any]) -> None:
+        value_type = type(current)
+        if not _inherits(current, BaseModel, dict, list, tuple, set, frozenset):
+            return
 
-            first = first_expansion.get(identity)
-            if first is not None and first[0] is not current:
-                first = None
-            if issubclass(value_type, BaseModel):
-                if first is not None:
-                    # A shallower revisit: the first snapshot stands (its edges are charged again, as a
-                    # re-expansion is), and nothing is read from the live model.
-                    stored_entries = first[1][0]
-                    budget.charge_edge(len(stored_entries))
-                else:
-                    native_stored = _PYDANTIC_DICT_DESCRIPTOR.__get__(
-                        current, BaseModel
-                    )
-                    budget.charge_edge(dict.__len__(native_stored))
-                    stored_entries = _exact_names(tuple(dict.items(native_stored)), "stored field")
-                    try:
-                        fields_set_storage = _PYDANTIC_FIELDS_SET_SLOT.__get__(
-                            current, value_type
-                        )
-                    except AttributeError:
-                        fields_set_storage = _MISSING_FIELDS_SET
-                    if issubclass(type(fields_set_storage), set):
-                        budget.charge_edge(set.__len__(fields_set_storage))
-                        # Copied as exact text (the set's own iteration; no name hook runs), so a name that
-                        # hashes and compares like a field cannot vanish when the sets are united below.
-                        fields_set_storage = _exact_name_set(set.__iter__(fields_set_storage), "fields-set")
-                    extra_snapshot = _snapshot_model_extra_storage(current, budget)
-                    discovery_inventory[identity] = (
-                        current,
-                        stored_entries,
-                        fields_set_storage,
-                        extra_snapshot,
-                    )
-                    first_expansion[identity] = (current, (stored_entries,))
-                # Exact strings can be classified from the class field mapping
-                # without invoking a user-defined name protocol.  Other names
-                # remain conservative candidates for later hash authority.
-                pending.extend(
-                    (item, child_depth)
-                    for item in _model_discovery_values(value_type, stored_entries, budget, state.field_tables)
+        identity = id(current)
+        # Unique nodes are charged once; a shallower path re-expands a node
+        # so the depth outcome does not depend on traversal order.
+        if not budget.visit(current, current_depth):
+            return
+        discovered.add(identity)
+
+        first = first_expansion.get(identity)
+        if first is not None and first[0] is not current:
+            first = None
+        if _inherits(current, BaseModel):
+            if first is not None:
+                # A shallower revisit: the first snapshot stands (its edges are charged again, as a
+                # re-expansion is), and nothing is read from the live model.
+                stored_entries = first[1][0]
+                budget.charge_edge(len(stored_entries))
+            else:
+                native_stored = _PYDANTIC_DICT_DESCRIPTOR.__get__(
+                    current, BaseModel
                 )
-                continue
-
-            if issubclass(value_type, dict):
-                if first is not None:
-                    items = first[1]
-                    budget.charge_edge(2 * len(items))
-                else:
-                    budget.charge_edge(2 * dict.__len__(current))
-                    items = tuple(dict.items(current))
-                    first_expansion[identity] = (current, items)
-                if value_type is dict and first is None:
-                    native_container_inventory[identity] = (
-                        current,
-                        dict,
-                        items,
+                budget.charge_edge(dict.__len__(native_stored))
+                stored_entries = _exact_names(tuple(dict.items(native_stored)), "stored field")
+                try:
+                    fields_set_storage = _PYDANTIC_FIELDS_SET_SLOT.__get__(
+                        current, value_type
                     )
-                for key, item in reversed(items):
-                    pending.append((item, child_depth))
-                    pending.append((key, child_depth))
-                continue
+                except AttributeError:
+                    fields_set_storage = _MISSING_FIELDS_SET
+                if issubclass(type(fields_set_storage), set):
+                    budget.charge_edge(set.__len__(fields_set_storage))
+                    # Copied as exact text (the set's own iteration; no name hook runs), so a name that
+                    # hashes and compares like a field cannot vanish when the sets are united below.
+                    fields_set_storage = _exact_name_set(set.__iter__(fields_set_storage), "fields-set")
+                extra_snapshot = _snapshot_model_extra_storage(current, budget)
+                discovery_inventory[identity] = (
+                    current,
+                    stored_entries,
+                    fields_set_storage,
+                    extra_snapshot,
+                )
+                first_expansion[identity] = (current, (stored_entries,))
+            # Exact strings can be classified from the class field mapping
+            # without invoking a user-defined name protocol.  Other names
+            # remain conservative candidates for later hash authority.
+            pending.extend(
+                _model_discovery_values(value_type, stored_entries, budget, state.field_tables)
+            )
+            return
+
+        if _inherits(current, dict):
             if first is not None:
                 items = first[1]
-                budget.charge_edge(len(items))
+                budget.charge_edge(2 * len(items))
             else:
-                if issubclass(value_type, list):
-                    budget.charge_edge(list.__len__(current))
-                    items = tuple(list.__iter__(current))
-                elif issubclass(value_type, tuple):
-                    budget.charge_edge(tuple.__len__(current))
-                    items = tuple(tuple.__iter__(current))
-                elif issubclass(value_type, set):
-                    budget.charge_edge(set.__len__(current))
-                    items = tuple(set.__iter__(current))
-                else:
-                    budget.charge_edge(frozenset.__len__(current))
-                    items = tuple(frozenset.__iter__(current))
+                budget.charge_edge(2 * dict.__len__(current))
+                items = tuple(dict.items(current))
                 first_expansion[identity] = (current, items)
-            if first is None and is_exact_type(current, list, tuple, set, frozenset):
+            if value_type is dict and first is None:
                 native_container_inventory[identity] = (
                     current,
-                    value_type,
+                    dict,
                     items,
                 )
-            pending.extend((item, child_depth) for item in reversed(items))
+            for key, item in reversed(items):
+                pending.append(key)
+                pending.append(item)
+            return
+        if first is not None:
+            items = first[1]
+            budget.charge_edge(len(items))
+        else:
+            if _inherits(current, list):
+                budget.charge_edge(list.__len__(current))
+                items = tuple(list.__iter__(current))
+            elif _inherits(current, tuple):
+                budget.charge_edge(tuple.__len__(current))
+                items = tuple(tuple.__iter__(current))
+            elif _inherits(current, set):
+                budget.charge_edge(set.__len__(current))
+                items = tuple(set.__iter__(current))
+            else:
+                budget.charge_edge(frozenset.__len__(current))
+                items = tuple(frozenset.__iter__(current))
+            first_expansion[identity] = (current, items)
+        if first is None and is_exact_type(current, list, tuple, set, frozenset):
+            native_container_inventory[identity] = (
+                current,
+                value_type,
+                items,
+            )
+        pending.extend(items)
 
     def walk(value: Any, location: tuple[str | int, ...]) -> None:
         if not (_inherits(value, BaseModel, list, tuple, set, frozenset) or _is_mapping(value)):
@@ -1113,7 +1118,7 @@ def validate_portable_manifest(
 
     failure: ValidationError | None = None
     cause: BaseException | None = None
-    if isinstance(document, PortableManifest):
+    if _inherits(document, PortableManifest):
         try:
             model_inventory = _reject_retained_unknown_fields(document)
             candidate = _reconstruct_retained_state(document, model_inventory)
