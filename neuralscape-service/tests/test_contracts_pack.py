@@ -1169,3 +1169,36 @@ def test_a_root_reference_reached_through_a_definition_is_compared_too() -> None
     new = copy.deepcopy(old)
     del new["required"]
     assert _pair(old, new) != []
+
+
+# ---- literal keywords hold data, not schemas; a cycle marker keeps what is written beside the reference
+
+
+def _two_equal_definitions() -> dict:
+    return {"A": {"type": "string"}, "B": {"type": "string"}}
+
+
+@pytest.mark.parametrize("keyword", ["const", "enum", "examples", "default"])
+def test_a_reference_inside_a_literal_keyword_is_data_and_is_not_expanded(keyword) -> None:
+    def literal(target: str):
+        value = {"$ref": f"#/$defs/{target}"}
+        return [value] if keyword in ("enum", "examples") else value
+
+    old = {"$defs": _two_equal_definitions(), "not": {keyword: literal("A")}}
+    new = copy.deepcopy(old)
+    new["not"][keyword] = literal("B")
+    # {"$ref": "#/$defs/B"} was accepted by the old document and is a different literal in the new one
+    assert _pair(old, new) != []
+
+
+def test_an_unchanged_literal_that_looks_like_a_reference_compares_clean() -> None:
+    old = {"$defs": _two_equal_definitions(), "not": {"const": {"$ref": "#/$defs/A"}}}
+    assert _pair(old, copy.deepcopy(old)) == []
+
+
+def test_a_property_named_like_a_literal_keyword_is_still_a_schema() -> None:
+    # "const" here is a property name: its value is a schema, so two references to equal definitions are one schema
+    old = {"$defs": _two_equal_definitions(), "not": {"properties": {"const": {"$ref": "#/$defs/A"}}}}
+    new = copy.deepcopy(old)
+    new["not"]["properties"]["const"] = {"$ref": "#/$defs/B"}
+    assert _pair(old, new) == []

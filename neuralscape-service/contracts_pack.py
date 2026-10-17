@@ -198,8 +198,21 @@ class _TooLarge(Exception):
     pass
 
 
-def _inline(value: object, defs: dict, stack: tuple[str, ...] = (), budget: list[int] | None = None) -> object:
-    """``value`` with every ``#/$defs`` reference expanded (a cycle becomes a marker), so equality sees through refs."""
+# Keywords whose value is data, not a schema: a ``{"$ref": ...}`` inside one is a literal object.
+_LITERAL_KEYWORDS = frozenset({"const", "enum", "examples", "default"})
+# Keywords whose value maps names to schemas: inside one, a key such as "const" is a name, not a keyword.
+_SCHEMA_MAPS = frozenset({"properties", "patternProperties", "$defs", "definitions", "dependentSchemas"})
+
+
+def _inline(
+    value: object, defs: dict, stack: tuple[str, ...] = (), budget: list[int] | None = None, named: bool = False
+) -> object:
+    """``value`` with every ``#/$defs`` reference expanded (a cycle becomes a marker), so equality sees through refs.
+
+    Literal keywords (``const``, ``enum``, ``examples``, ``default``) are copied as written: a reference
+    object there is data, and expanding it would make two different literals look equal.  ``named`` is set
+    for a mapping of names to schemas, whose keys are never keywords.
+    """
 
     if budget is None:
         budget = [_INLINE_BUDGET]
@@ -210,15 +223,29 @@ def _inline(value: object, defs: dict, stack: tuple[str, ...] = (), budget: list
         return [_inline(item, defs, stack, budget) for item in value]
     if not isinstance(value, dict):
         return value
+    if named:
+        return {key: _inline(item, defs, stack, budget) for key, item in value.items()}
+
+    def inline_members(members: dict) -> dict:
+        out = {}
+        for key, item in members.items():
+            if key in _LITERAL_KEYWORDS:
+                out[key] = item
+            elif key in _SCHEMA_MAPS and isinstance(item, dict):
+                out[key] = _inline(item, defs, stack, budget, named=True)
+            else:
+                out[key] = _inline(item, defs, stack, budget)
+        return out
+
     ref = value.get("$ref")
     if isinstance(ref, str) and ref.startswith("#/$defs/"):
         name = ref.removeprefix("#/$defs/")
         if name in stack:
             return {"$cycle": name}
         if name in defs:
-            rest = {key: _inline(item, defs, stack, budget) for key, item in value.items() if key != "$ref"}
+            rest = inline_members({key: item for key, item in value.items() if key != "$ref"})
             return {"$ref": _inline(defs[name], defs, stack + (name,), budget), **rest}
-    return {key: _inline(item, defs, stack, budget) for key, item in value.items()}
+    return inline_members(value)
 
 
 _REPR = reprlib.Repr()
