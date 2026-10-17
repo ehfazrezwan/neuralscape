@@ -1866,3 +1866,77 @@ def test_a_native_key_that_is_not_text_still_reaches_validation(key):
     EXTRA.__set__(applied, {"note": [{key: index} for index in range(4_000)]})
     with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
         contracts_lifecycle.validate_stage_receipts(command, (applied,))
+
+
+def _reused_enum_case(shared_tuple: bool):
+    """A caller str-enum member in a tuple the intent holds; the receipt holds the same tuple object (or a
+    fresh one), and the receipts view arms the enum's class before the receipt is materialized."""
+
+    import enum
+
+    from tests.test_contracts_lifecycle import intent_with_requirements, reference, requirement
+
+    class SourceId(str, enum.Enum):
+        MEMORY = "memory-1"
+
+    delegate = reference("r1")
+    reads: list[str] = []
+
+    def impersonate(self, name):
+        if name == "__class__":
+            return type(delegate)
+        if name.startswith("_") and name not in ("__dict__", "__pydantic_fields_set__", "__pydantic_extra__"):
+            return object.__getattribute__(self, name)
+        reads.append(name)
+        return getattr(delegate, name)
+
+    held = (SourceId.MEMORY,)
+    command = intent_with_requirements(requirement(ProcessingStage.CANONICAL))
+    set_native(command.stage_requirements[0], "precondition_source_ids", held)
+    applied = receipt(ProcessingStage.CANONICAL, StageStatus.APPLIED)
+    set_native(applied, "output_refs", held if shared_tuple else (SourceId.MEMORY,))
+
+    class Arming(tuple):
+        def __iter__(self):
+            type.__setattr__(SourceId, "__getattribute__", impersonate)
+            return tuple.__iter__(self)
+
+    return command, Arming((applied,)), reads, SourceId
+
+
+@pytest.mark.parametrize("shared_tuple", [True, False], ids=["reused-copy", "fresh-tuple"])
+@pytest.mark.parametrize("entry", ["record", "claim"])
+def test_an_enum_member_in_a_reused_pure_copy_is_judged_again_after_caller_code(shared_tuple, entry):
+    """A pure copy built for the intent is reused for the receipt; the enum members inside it are judged again
+    when caller code ran since the copy was made, as a freshly materialized member is."""
+
+    command, receipts, reads, kind = _reused_enum_case(shared_tuple)
+    try:
+        with pytest.raises((ValueError, TypeError)):
+            if entry == "record":
+                contracts_lifecycle.validate_stage_receipts(command, receipts)
+            else:
+                validate_required_stage_claim(claimed_status=IntentStatus.APPLIED, intent=command, receipts=receipts)
+    finally:
+        if "__getattribute__" in vars(kind):
+            type.__delattr__(kind, "__getattribute__")
+    assert reads == []
+
+
+def test_an_honest_enum_member_in_a_copy_reused_after_caller_code_is_still_accepted():
+    """The same root materialized again after the generation moved reuses its pure copies; their honest
+    members pass the new judgement and the model validates as before."""
+
+    from contracts_lifecycle import Intent
+    from tests.test_contracts_lifecycle import intent_with_requirements, requirement
+
+    command = intent_with_requirements(
+        requirement(ProcessingStage.CANONICAL),
+        requirement(ProcessingStage.EXTRACT, upstream_stages=(ProcessingStage.CANONICAL,)),
+    )
+    captured = contracts_lifecycle._capture_contract_graph(command)
+    memo = captured[1]
+    first = contracts_lifecycle._revalidated_captured_model(Intent, captured)
+    memo[contracts_lifecycle._GENERATION] = contracts_lifecycle._generation(memo) + 1  # as a public view does
+    second = contracts_lifecycle._revalidated_captured_model(Intent, captured)
+    assert second == first and second.stage_requirements[1].upstream_stages == (ProcessingStage.CANONICAL,)

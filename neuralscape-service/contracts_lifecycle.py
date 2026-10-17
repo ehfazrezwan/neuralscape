@@ -672,13 +672,18 @@ def _remember_pure_copy(
     pure containers themselves, so rebuilding it on another path runs no caller code and gives
     the same copy.  The subtree's height is kept so a later path is still depth-checked, and its
     expanded size (every entry on every path through it) so a later path is charged for the work
-    strict validation does there.
+    strict validation does there.  The subtree's distinct enum members (by identity, never hashed) and
+    the generation the copy was made in are kept too: a later path reusing the copy after caller code ran
+    judges those members again, as it would had it materialized them itself.
     """
 
     height = 0
     size = len(children)
+    members: dict[int, object] = {}
     for child in children:
         if isinstance(child, _CapturedLeaf):
+            if not _is_exact_native_kind(type(child.value)):
+                members[id(child.value)] = child.value  # an enum member: materialization admits no other
             continue
         if not isinstance(child, (_CapturedDict, _CapturedList, _CapturedTuple)):
             return
@@ -687,7 +692,25 @@ def _remember_pure_copy(
             return
         height = max(height, entry[2] + 1)
         size += entry[3]
-    captured_by_identity[(_MATERIALIZED, value.identity)] = (value.source, result, height, size)
+        for member in entry[4]:
+            members[id(member)] = member
+    captured_by_identity[(_MATERIALIZED, value.identity)] = (
+        value.source,
+        result,
+        height,
+        size,
+        tuple(members.values()),
+        _generation(captured_by_identity),
+    )
+
+
+def _judge_handed_enum(leaf: object, captured_by_identity: dict[Any, Any], budget: DiscoveryBudget) -> None:
+    """Refuse an enum member handed to validation unless its class is still an enum and it is a member."""
+
+    if _leaf_class_verdict(type(leaf), captured_by_identity, budget) != "enum" or not _is_declared_member(
+        leaf, captured_by_identity, budget
+    ):
+        raise ValueError("a contract value must be a native scalar, an enum member, a model or a container")
 
 
 def _materialize_captured_graph(
@@ -716,12 +739,7 @@ def _materialize_captured_graph(
         if not (_is_exact_native_kind(kind)):
             # Only an enum member is kept as itself (its identity is the value).  Caller code may have run
             # since it was captured and changed its class, so the class and membership are judged again.
-            if _leaf_class_verdict(kind, captured_by_identity, budget) != "enum" or not _is_declared_member(
-                leaf, captured_by_identity, budget
-            ):
-                raise ValueError(
-                    "a contract value must be a native scalar, an enum member, a model or a container"
-                )
+            _judge_handed_enum(leaf, captured_by_identity, budget)
             handed = captured_by_identity.get(_HANDED_ENUMS)
             if handed is not None:
                 handed.append(leaf)
@@ -743,6 +761,17 @@ def _materialize_captured_graph(
         # models share everywhere; its rendering does not grow, so it must not suppress a diagnostic.
         if reused[2] or reused[1]:
             captured_by_identity[_REUSED] = True
+        members = reused[4]
+        if members:
+            # Its members were judged when the copy was made; caller code that ran since may have changed
+            # their classes, so they are judged again (once per generation), and recorded for this root.
+            if reused[5] != _generation(captured_by_identity):
+                for leaf in members:
+                    _judge_handed_enum(leaf, captured_by_identity, budget)
+                captured_by_identity[(_MATERIALIZED, identity)] = (*reused[:5], _generation(captured_by_identity))
+            handed = captured_by_identity.get(_HANDED_ENUMS)
+            if handed is not None:
+                handed.extend(members)
         return reused[1]
     budget.visit(value.source, len(active_containers))
     active_containers.add(identity)
@@ -911,12 +940,7 @@ def _revalidated_captured_model(
         # judge every member handed out for this root again, before validation reads any of them.
         check_budget = DiscoveryBudget() if budget is None else budget
         for leaf in handed:
-            if _leaf_class_verdict(type(leaf), memo, check_budget) != "enum" or not _is_declared_member(
-                leaf, memo, check_budget
-            ):
-                raise ValueError(
-                    "a contract value must be a native scalar, an enum member, a model or a container"
-                )
+            _judge_handed_enum(leaf, memo, check_budget)
     try:
         return model_type.model_validate(native, strict=True)
     except ValidationError as error:
