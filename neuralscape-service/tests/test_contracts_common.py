@@ -4334,3 +4334,35 @@ def test_a_model_that_is_never_projected_is_not_refused_for_its_metadata() -> No
 def test_the_same_model_is_refused_when_it_is_projected() -> None:
     with pytest.raises(ValueError, match="metadata"):
         snapshot_contract_graph({"items": [_model_with_refused_metadata()]})
+
+
+# ── a missing slot on pydantic's own metadata types is the same deferred metadata refusal ──
+
+
+def _model_missing_slot(shape) -> BaseModel:
+    from pydantic import AliasChoices, AliasPath, Field
+
+    alias = {"path": AliasPath("alias_a", 0), "choices": AliasChoices("alias_a"), "field": "alias_a"}[shape]
+
+    class Slotted(BaseModel):
+        a: int = Field(1, validation_alias=alias)
+
+    model = Slotted()
+    if shape == "path":
+        object.__delattr__(alias, "path")
+    elif shape == "choices":
+        object.__delattr__(alias, "choices")
+    else:
+        object.__delattr__(vars(Slotted)["__pydantic_fields__"]["a"], "validation_alias")
+    return model
+
+
+@pytest.mark.parametrize("shape", ["path", "choices", "field"])
+def test_a_missing_metadata_slot_on_a_hidden_model_does_not_abort_capture(shape) -> None:
+    assert snapshot_contract_graph({"items": _HiddenBacking([_model_missing_slot(shape)])}) == {"items": []}
+
+
+@pytest.mark.parametrize("shape", ["path", "choices", "field"])
+def test_a_missing_metadata_slot_on_a_projected_model_is_the_metadata_refusal(shape) -> None:
+    with pytest.raises(ValueError, match="metadata"):
+        snapshot_contract_graph({"items": [_model_missing_slot(shape)]})

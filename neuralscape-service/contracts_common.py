@@ -102,6 +102,16 @@ def _class_namespace_entry(model_type: type, name: str, budget: DiscoveryBudget)
     return None, pure
 
 
+def _native_slot(value: object, name: str) -> object:
+    """A slot of one of pydantic's own metadata objects, read natively; a missing slot (deleted after the
+    model was built) is the metadata refusal, deferred like any other, never an ``AttributeError``."""
+
+    try:
+        return object.__getattribute__(value, name)
+    except AttributeError:
+        raise _MetadataRefused(_METADATA_REFUSAL) from None
+
+
 def _native_sequence(value: object, budget: DiscoveryBudget) -> tuple[object, ...]:
     """The items of an alias's storage, which must be an exact list or tuple.
 
@@ -229,9 +239,9 @@ def _validation_alias_owners(
         # run code from a property while the metadata is read, before the input's storage is all captured.
         if type(field) is not FieldInfo:
             raise _MetadataRefused(_METADATA_REFUSAL)
-        validation_alias = object.__getattribute__(field, "validation_alias")
+        validation_alias = _native_slot(field, "validation_alias")
         if type(validation_alias) is AliasChoices:
-            choices = _native_sequence(object.__getattribute__(validation_alias, "choices"), budget)
+            choices = _native_sequence(_native_slot(validation_alias, "choices"), budget)
         elif _is_subclass(type(validation_alias), (AliasChoices, AliasPath)) and type(validation_alias) is not AliasPath:
             raise _MetadataRefused(_METADATA_REFUSAL)
         else:
@@ -241,7 +251,7 @@ def _validation_alias_owners(
             if _is_subclass(type(choice), str):
                 owners.setdefault(_text(choice), set()).add(name)  # type: ignore[arg-type]
             elif type(choice) is AliasPath:
-                path = _native_sequence(object.__getattribute__(choice, "path"), budget)
+                path = _native_sequence(_native_slot(choice, "path"), budget)
                 root = path[0] if path else None
                 if _is_subclass(type(root), str):
                     owners.setdefault(_text(root), set()).add(name)  # type: ignore[arg-type]
