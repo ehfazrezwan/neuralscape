@@ -848,13 +848,25 @@ def _plain_text_keys(document: Any) -> Any:
     its text without running its hooks, and two keys with one text are refused.
     Native dicts, lists and tuples (subclasses included) are walked once per object,
     so a shared subtree costs one copy however many paths reach it; nesting is
-    bounded by the portability tier's depth.  Anything else is left to the schema.
+    bounded by the portability tier's depth.  A model instance is rebuilt through the
+    budgeted traversal first.  Anything else is left to the schema.
     """
 
     copies: dict[int, Any] = {}
     originals: list[Any] = []  # keeps every walked object alive, so ids stay unique
 
     def walk(value: Any, depth: int) -> Any:
+        if _inherits(value, BaseModel):
+            # A model instance inside a mapping goes through the same budgeted traversal
+            # and reconstruction as a top-level model, so its retained state (including
+            # a custom extra view) is read within the discovery budget, never by the schema.
+            identity = id(value)
+            if identity in copies:
+                return copies[identity]
+            originals.append(value)
+            rebuilt = _reconstruct_retained_state(value, _reject_retained_unknown_fields(value))
+            copies[identity] = walk(rebuilt, depth)
+            return copies[identity]
         if not _inherits(value, dict, list, tuple):
             return value
         if depth > PORTABILITY.max_depth:
@@ -960,6 +972,8 @@ def validate_portable_manifest(
     else:
         try:
             candidate = _plain_text_keys(document)
+        except ValidationError as exc:
+            failure = _value_free(exc)
         except (TypeError, ValueError, RecursionError) as exc:
             failure, cause = _refusal(exc), exc
     if failure is None:

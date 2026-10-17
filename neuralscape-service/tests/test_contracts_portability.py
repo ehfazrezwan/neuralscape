@@ -3875,6 +3875,20 @@ def test_rendering_a_refused_model_never_reads_its_extra_view_again() -> None:
     assert extra.reads == after_validation, f"rendering read {extra.reads - after_validation} more entries"
 
 
+def test_rendering_a_refused_mapping_never_reads_a_nested_models_extra_view() -> None:
+    manifest = validate_portable_manifest(valid_manifest())
+    scope = manifest.scope.model_copy(deep=True)
+    extra = _CountingEndlessExtra()
+    _PYDANTIC_EXTRA_SLOT.__set__(scope, extra)
+    document = valid_manifest()
+    document["scope"] = scope
+    with pytest.raises(ValidationError) as raised:
+        validate_portable_manifest(document)
+    after_validation = extra.reads
+    _render_everything(raised.value)
+    assert extra.reads == after_validation, f"rendering read {extra.reads - after_validation} more entries"
+
+
 def test_an_ordinary_refusal_still_names_the_field_and_the_error_type() -> None:
     document = valid_manifest()
     document["manifest_id"] = 5
@@ -3884,3 +3898,20 @@ def test_an_ordinary_refusal_still_names_the_field_and_the_error_type() -> None:
     assert any(error["loc"][:1] == ("manifest_id",) for error in details)
     assert all("type" in error for error in details)
     assert "manifest_id" in str(raised.value)
+
+
+def test_a_nested_model_instance_in_a_mapping_input_still_validates() -> None:
+    manifest = validate_portable_manifest(valid_manifest())
+    document = valid_manifest()
+    document["scope"] = manifest.scope  # an ordinary validated instance, no retained extras
+    assert validate_portable_manifest(document).scope == manifest.scope
+
+
+def test_a_nested_model_instance_with_a_smuggled_extra_is_refused_in_a_mapping_input() -> None:
+    manifest = validate_portable_manifest(valid_manifest())
+    scope = manifest.scope.model_copy(deep=True)
+    _PYDANTIC_EXTRA_SLOT.__set__(scope, MappingProxyType({"smuggled": "value"}))
+    document = valid_manifest()
+    document["scope"] = scope
+    with pytest.raises(ValidationError):
+        validate_portable_manifest(document)
