@@ -200,6 +200,11 @@ _NATIVE_LEAF_TYPES = (str, int, float, bytes, type(None), date, timedelta)
 
 
 _MEMBERS = "members"  # memo key prefix: one enum class's member identities, indexed once per call
+_GENERATION = "generation"  # memo key: advanced whenever a public view has run caller code
+
+
+def _generation(captured_by_identity: dict[Any, Any]) -> int:
+    return captured_by_identity.get(_GENERATION, 0)
 
 
 def _is_declared_member(
@@ -214,19 +219,21 @@ def _is_declared_member(
     a later value before that value is captured.  The member map is read from the class's own namespace
     instead, and iterated with the base ``dict`` method.  It is indexed by identity once per class and
     call, each member charged one edge before the index is built, so repeated leaves of a large enum do
-    not rescan it.  The index keeps the class and its members alive, so no indexed ``id()`` is recycled.
+    not rescan it.  The index keeps the class and its members alive, so no indexed ``id()`` is recycled,
+    and holds only until caller code runs (a public view can change the class).
     """
 
     kind = type(value)
+    generation = _generation(captured_by_identity)
     memo = captured_by_identity.get((_MEMBERS, id(kind)))
-    if memo is None or memo[0] is not kind:
+    if memo is None or memo[0] is not kind or memo[3] != generation:
         members = _TYPE_NAMESPACE.__get__(kind).get("_member_map_")
         if type(members) is dict:
             budget.charge_edge(dict.__len__(members))
             declared = tuple(dict.values(members))
         else:
             declared = ()
-        memo = (kind, declared, frozenset(id(member) for member in declared))
+        memo = (kind, declared, frozenset(id(member) for member in declared), generation)
         captured_by_identity[(_MEMBERS, id(kind))] = memo
     return id(value) in memo[2]
 
@@ -267,11 +274,13 @@ def _leaf_class_verdict(
 
     Every check walks the class's MRO, which a caller can make arbitrarily deep; the walk is charged one
     edge per class in it and its verdict kept (with the class, so its ``id()`` is not recycled), so
-    repeated leaves of one class do not walk it again.
+    repeated leaves of one class do not walk it again.  A verdict holds only until caller code runs:
+    a public view can give an admitted class a ``__class__`` claim before its next instance is captured.
     """
 
+    generation = _generation(captured_by_identity)
     memo = captured_by_identity.get((_LEAF_CLASS, id(kind)))
-    if memo is not None and memo[0] is kind:
+    if memo is not None and memo[0] is kind and memo[2] == generation:
         return memo[1]
     mro = _TYPE_MRO.__get__(kind)
     budget.charge_edge(tuple.__len__(mro))
@@ -283,7 +292,7 @@ def _leaf_class_verdict(
         verdict = "native"
     else:
         verdict = "refused"
-    captured_by_identity[(_LEAF_CLASS, id(kind))] = (kind, verdict)
+    captured_by_identity[(_LEAF_CLASS, id(kind))] = (kind, verdict, generation)
     return verdict
 
 
@@ -489,9 +498,11 @@ def _observed_public_view(
         return
     seen: list[_CapturedGraph] = []
     for item in source:  # type: ignore[attr-defined]
+        captured_by_identity[_GENERATION] = _generation(captured_by_identity) + 1  # caller code ran
         frozen = public_item(item)
         seen.append(frozen)
         yield frozen
+    captured_by_identity[_GENERATION] = _generation(captured_by_identity) + 1
     captured_by_identity[("view", id(source))] = (source, tuple(seen))
 
 

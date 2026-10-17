@@ -24,6 +24,7 @@ from contracts_lifecycle import (
     Intent,
     IntentStatus,
     ProcessingStage,
+    StageError,
     StageReceipt,
     StageStatus,
     source_versions_match,
@@ -1202,3 +1203,87 @@ def test_a_leaf_class_mro_is_charged_to_the_discovery_budget_once_per_class():
     budget = DiscoveryBudget(contracts_lifecycle.LIFECYCLE_TIER)
     contracts_lifecycle._capture_native_contract_graph((kind("a"),) * 400, budget=budget)
     assert budget.edges == 1 + 400 + mro_length
+
+
+def test_a_leaf_class_changed_by_a_view_is_classified_again_for_items_captured_after_it():
+    """A class verdict kept in the call's memo must not outlive caller code: a receipts view that gives an
+    admitted ``str`` subclass a ``__class__`` claim, then yields a receipt its backing never held, does not get
+    that receipt's instance past capture on a stale verdict."""
+
+    from tests.test_contracts_lifecycle import intent_with_requirements, requirement
+
+    command = intent_with_requirements(requirement(ProcessingStage.CANONICAL))
+    error = StageError(code="projection_failed", retryable=False, safe_message="Projection failed")
+    reads: list[str] = []
+
+    class Plain(str):
+        pass
+
+    def impersonate(self, name):
+        if name == "__class__":
+            return StageError
+        if name in ("__dict__", "__pydantic_fields_set__", "__pydantic_extra__"):
+            reads.append(name)
+            return getattr(error, name)
+        return str.__getattribute__(self, name)
+
+    def receipts():
+        first = receipt(ProcessingStage.CANONICAL, StageStatus.APPLIED)
+        set_native(first, "effect_id", Plain(first.effect_id))  # admitted at inventory, its class verdict kept
+        unseen = receipt(ProcessingStage.CANONICAL, StageStatus.FAILED)
+        set_native(unseen, "error", Plain("error"))
+
+        class Receipts(tuple):
+            def __iter__(self):
+                yield first
+                Plain.__getattribute__ = impersonate  # caller code between items
+                yield unseen  # only in the public view: captured after the class changed
+
+        return Receipts((first,))
+
+    try:
+        with pytest.raises(ValueError, match="native"):
+            contracts_lifecycle.validate_stage_receipts(command, receipts())
+        del Plain.__getattribute__
+        with pytest.raises(ValueError, match="native"):
+            validate_required_stage_claim(claimed_status=IntentStatus.FAILED, intent=command, receipts=receipts())
+    finally:
+        if "__getattribute__" in vars(Plain):
+            del Plain.__getattribute__
+    assert reads == []
+
+
+def test_an_enum_member_map_changed_by_a_view_is_indexed_again_for_items_captured_after_it():
+    """The member index holds only until caller code runs: a member a receipts view removes from its class's
+    map is no longer a declared member for a receipt captured after the view stepped."""
+
+    import enum
+
+    from tests.test_contracts_lifecycle import intent_with_requirements, requirement
+
+    command = intent_with_requirements(requirement(ProcessingStage.CANONICAL))
+    first = receipt(ProcessingStage.CANONICAL, StageStatus.APPLIED)
+    Ids = enum.Enum("Ids", {"INTENT": first.intent_id, "OTHER": "other"}, type=str)
+    members = vars(Ids)["_member_map_"]
+    set_native(first, "intent_id", Ids.INTENT)  # indexed at inventory
+
+    def receipts():
+        unseen = receipt(ProcessingStage.CANONICAL, StageStatus.APPLIED)
+        set_native(unseen, "intent_id", Ids.INTENT)
+
+        class Receipts(tuple):
+            def __iter__(self):
+                yield first
+                del members["INTENT"]  # caller code between items
+                yield unseen  # only in the public view: captured after the map changed
+
+        return Receipts((first,))
+
+    try:
+        with pytest.raises(ValueError, match="declared member"):
+            contracts_lifecycle.validate_stage_receipts(command, receipts())
+        members["INTENT"] = Ids.INTENT
+        with pytest.raises(ValueError, match="declared member"):
+            validate_required_stage_claim(claimed_status=IntentStatus.APPLIED, intent=command, receipts=receipts())
+    finally:
+        members["INTENT"] = Ids.INTENT
