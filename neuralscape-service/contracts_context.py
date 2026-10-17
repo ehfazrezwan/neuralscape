@@ -44,7 +44,7 @@ def _revalidated_snapshot(
 
     try:
         return model_type.model_validate(
-            pin_native_snapshot(require_native_snapshot(snapshot_pinned(value))),
+            pin_native_snapshot(require_native_snapshot(snapshot_pinned(value, model_type))),
             strict=True,
         )
     except Exception:
@@ -62,7 +62,7 @@ def _revalidated_pair(
     """
 
     try:
-        pair = pin_native_snapshot(require_native_snapshot(snapshot_pinned((first, second))))
+        pair = pin_native_snapshot(require_native_snapshot(snapshot_pinned((first, second), (first_type, second_type))))
         return (
             first_type.model_validate(pair[0], strict=True),  # type: ignore[index]
             second_type.model_validate(pair[1], strict=True),  # type: ignore[index]

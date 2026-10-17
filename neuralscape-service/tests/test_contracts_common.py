@@ -2574,8 +2574,17 @@ def test_public_first_unrepaired_public_only_child_is_exposed_and_rejected(
 ) -> None:
     value, child, public_view = _public_only_envelope(container_kind, placement)
 
+    if placement == "direct":
+        # The exposed entry is invalid as it is yielded: the whole input is refused (a prefix is never returned
+        # in its place), after exactly one read of the view.
+        with pytest.raises(ValueError, match="not valid"):
+            snapshot_contract_graph(value)
+        assert public_view.iteration_calls == 1
+        assert child.count == -1
+        return
+    # A view held inside an outer sequence has no single declared entry model: it is exposed and the receiving
+    # model rejects it.
     snapshot = snapshot_contract_graph(value)
-
     assert list(_exposed_children(snapshot, placement)) == [{"count": -1}]
     assert public_view.iteration_calls == 1
     assert child.count == -1
@@ -2601,16 +2610,20 @@ def test_public_first_public_only_child_repaired_by_earlier_stored_name_hook(
     stored_name.armed = True
     stored_name.hash_calls = stored_name.equality_calls = 0
 
-    snapshot = snapshot_contract_graph(value)
-
     # A stored name is read as its text, so no hook runs before the public view is first
-    # observed: the child is exposed as it is (invalid) and the receiving model rejects it.
+    # observed: the child is exposed as it is (invalid) and is refused (directly) or rejected by the model.
+    if placement == "direct":
+        with pytest.raises(ValueError, match="not valid"):
+            snapshot_contract_graph(value)
+    else:
+        snapshot = snapshot_contract_graph(value)
+        assert list(_exposed_children(snapshot, placement)) == [{"count": -1}]
+        with pytest.raises(ValidationError):
+            type(value).model_validate(snapshot, strict=True)
+
     assert stored_name.hash_calls == stored_name.equality_calls == 0
     assert child.count == -1
-    assert list(_exposed_children(snapshot, placement)) == [{"count": -1}]
     assert public_view.iteration_calls == 1
-    with pytest.raises(ValidationError):
-        type(value).model_validate(snapshot, strict=True)
 
 
 @pytest.mark.parametrize("placement", ["direct", "nested"])
@@ -2669,17 +2682,15 @@ def test_public_first_native_stored_child_stays_fenced_against_the_same_callback
 def test_public_first_public_view_is_read_once_per_edge_not_per_snapshot(
     container_kind: str,
 ) -> None:
-    value, _, public_view = _public_only_envelope(container_kind, "direct")
-    native = _BASE_MODEL_DICT_DESCRIPTOR.__get__(value, BaseModel)
-    outer: object = (public_view,) if container_kind == "tuple" else [public_view]
-    dict.__setitem__(native, "groups", outer)
+    _, _, public_view = _public_only_envelope(container_kind, "direct")
 
-    snapshot = snapshot_contract_graph(value)
+    # Not a model field, so there is no early check: two edges reach the one view.
+    snapshot = snapshot_contract_graph({"one": public_view, "two": [public_view]})
 
-    # One read for each edge that reaches the view (the direct field and the
-    # nested one); a single edge reads it exactly once (see the tests above).
+    # One read for each edge that reaches the view (the direct one and the nested one); a single
+    # edge reads it exactly once (see the tests above).
     assert public_view.iteration_calls == 2
-    assert list(snapshot["children"]) == list(snapshot["groups"][0]) == [{"count": -1}]
+    assert list(snapshot["one"]) == list(snapshot["two"][0]) == [{"count": -1}]
 
 
 # ---------------------------------------------------------------------------

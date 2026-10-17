@@ -132,10 +132,14 @@ def _pin_at_capture(value: object) -> object:
     return pinned
 
 
-def snapshot_pinned(value: object) -> object:
-    """``snapshot_contract_graph`` with every datetime leaf pinned at capture, before any iterator advances."""
+def snapshot_pinned(value: object, contract: object = None) -> object:
+    """``snapshot_contract_graph`` with every datetime leaf pinned at capture, before any iterator advances.
 
-    return snapshot_contract_graph(value, pin_leaf=_pin_at_capture, entry_guard=require_native_snapshot)
+    ``contract`` is the class (or, for a tuple of two roots, the classes) the caller validates the snapshot
+    against: public-view entries are validated early against that declared contract.
+    """
+
+    return snapshot_contract_graph(value, pin_leaf=_pin_at_capture, entry_guard=require_native_snapshot, contract=contract)  # type: ignore[arg-type]
 
 
 PinnedAwareDatetime = Annotated[AwareDatetime, AfterValidator(_pin_validated)]

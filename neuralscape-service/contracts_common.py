@@ -300,6 +300,8 @@ class _GraphInventory:
     # An optional check applied to each snapshotted entry of a public view before it is validated eagerly (the
     # receiving boundary's supported-type and enum check): a refusal ends the read like an invalid entry.
     entry_guard: "Callable[[object], object] | None" = None
+    # The contract each root is validated against by the receiving boundary, by object identity (see ``contract``).
+    contracts: dict[int, type] = field(default_factory=dict)
     # Completed reconstructions of pure subtrees, keyed by identity:
     # ``(object, copy, height)``.  A descendant shared by many paths is rebuilt once
     # and shared; ``height`` keeps the depth limit enforced on every path.
@@ -510,6 +512,33 @@ def _capture_entry(value: object, inventory: _GraphInventory, depth: int) -> int
     return height
 
 
+def _unwrapped(annotation: object) -> object:
+    for _ in range(4):  # Annotated[...] and Optional[...] wrappers
+        args = typing.get_args(annotation)
+        origin = typing.get_origin(annotation)
+        if origin is Annotated or (origin is typing.Union and len(args) == 2 and type(None) in args):
+            annotation = args[0] if origin is Annotated else next(a for a in args if a is not type(None))
+            continue
+        break
+    return annotation
+
+
+@functools.lru_cache(maxsize=256)  # bounded: classes a caller creates dynamically cannot accumulate
+def _declared_models(model_type: type[BaseModel]) -> dict[str, type]:
+    """The fields of ``model_type`` declared as exactly one model class, mapped to that class.
+
+    A value held there is judged by the declared class, not by its own (possibly narrower) class, because the
+    contract the receiving helper validates against is the declared one.
+    """
+
+    found: dict[str, type] = {}
+    for name, info in model_type.model_fields.items():
+        element = _unwrapped(info.annotation)
+        if isinstance(element, type) and issubclass(element, BaseModel):
+            found[name] = element
+    return found
+
+
 @functools.lru_cache(maxsize=256)  # bounded: classes a caller creates dynamically cannot accumulate
 def _item_models(model_type: type[BaseModel]) -> dict[str, type]:
     """The fields of ``model_type`` that hold a homogeneous sequence of one model class, mapped to that class.
@@ -560,7 +589,7 @@ def _exposed_items(
 
     When the view is a field of a model whose items are a known model (``item_model``), each yielded entry
     is also snapshotted, passed through the receiving boundary's ``entry_guard`` and strictly validated right then, before the iterator is advanced; the first invalid
-    entry ends the read (it stays in the result, so the caller's own validation refuses it) and the tail is
+    entry refuses the whole input (a prefix of the view is never returned in its place) and the tail is
     never produced.  The snapshots are kept in ``checked`` for the caller to reuse, so no entry is
     reconstructed twice.
     """
@@ -580,14 +609,14 @@ def _exposed_items(
         _capture_entry(item, inventory, depth + 1)
         items.append(item)
         if item_model is not None and active_containers is not None and checked is not None:
-            snapshot = _snapshot_captured_graph(item, active_containers, inventory, depth + 1)
+            snapshot = _snapshot_captured_graph(item, active_containers, inventory, depth + 1, None, item_model)
             checked.append((item, snapshot))  # by position: the same object yielded twice is two entries
             try:
                 if inventory.entry_guard is not None:
                     inventory.entry_guard(snapshot)  # the receiving boundary's type check, before pydantic sees it
                 item_model.model_validate(snapshot, strict=True)
-            except Exception:  # noqa: BLE001 - any refusal ends the read; the caller's validation reports it
-                break
+            except Exception:  # noqa: BLE001 - the input is refused; a prefix is never returned as if it were the view
+                raise ValueError("a contract entry exposed by a public view is not valid") from None
     return tuple(items)
 
 
@@ -597,6 +626,7 @@ def _snapshot_captured_graph(
     inventory: _GraphInventory,
     depth: int = 0,
     item_model: "type[BaseModel] | None" = None,
+    contract: "type[BaseModel] | None" = None,
 ) -> object:
     """Reconstruct one graph after its reachable native backing is frozen.
 
@@ -695,12 +725,18 @@ def _snapshot_captured_graph(
                     _grow_height(inventory, value_id, late_height)
 
             fields: dict[object, object] = {}
-            item_models = _item_models(model_type)
+            # Early validation of a view's entries uses the contract the receiving helper validates against (the
+            # declared one, from the root down), never a narrower class the caller's own object happens to have.
+            declared = contract if contract is not None else inventory.contracts.get(value_id)
+            effective = declared if declared is not None and _is_subclass(model_type, declared) else model_type
+            item_models = _item_models(effective)
+            declared_children = _declared_models(effective)
             for key, item in stored_entries:
                 if again:
                     budget.charge_edge()
                 fields[key] = _snapshot_captured_graph(
-                    item, active_containers, inventory, below, item_models.get(key) if item_models else None
+                    item, active_containers, inventory, below,
+                    item_models.get(key) if item_models else None, declared_children.get(key),
                 )
                 height = _taller(height, item, completed)
             if captured.colliding_names:
@@ -739,7 +775,7 @@ def _snapshot_captured_graph(
                 if done is not None and done[0] is item:
                     copies.append(done[1])  # snapshotted and validated when it was yielded
                 else:
-                    copies.append(_snapshot_captured_graph(item, active_containers, inventory, below))
+                    copies.append(_snapshot_captured_graph(item, active_containers, inventory, below, None, item_model))
                 height = _taller(height, item, completed)
             result = tuple(copies) if is_tuple else copies
         else:
@@ -781,6 +817,7 @@ def snapshot_contract_graph(
     *,
     pin_leaf: "Callable[[object], object] | None" = None,
     entry_guard: "Callable[[object], object] | None" = None,
+    contract: "type[BaseModel] | tuple[type[BaseModel] | None, ...] | None" = None,
 ) -> object:
     """Reconstruct stored contract graphs while rejecting structural defects.
 
@@ -803,11 +840,20 @@ def snapshot_contract_graph(
     public view that yielded it is advanced), and the snapshot holds the result instead of the caller's object.
     ``entry_guard`` is the receiving boundary's check of one snapshotted entry (supported types, allowed enums),
     run before an eager validation so that a value the boundary would refuse is never shown to pydantic.
+    ``contract`` is the model class the root will be validated against (a tuple gives one per element of a tuple
+    root): entries of a public view are validated early against the contract declared there, from the root down,
+    never against a narrower class the caller's own object has.
     """
 
     if active_containers is None:
         active_containers = set()
     inventory = _GraphInventory(pin_leaf=pin_leaf, entry_guard=entry_guard)  # one discovery budget for the whole call
+    if contract is not None:
+        if type(contract) is tuple:  # one declared contract per element of an exact tuple root
+            if type(value) is tuple and len(value) == len(contract):
+                inventory.contracts.update({id(v): c for v, c in zip(value, contract) if c is not None})
+        else:
+            inventory.contracts[id(value)] = contract  # type: ignore[assignment]
     try:
         _capture_native_graph(value, inventory)
         inventory.collecting = False

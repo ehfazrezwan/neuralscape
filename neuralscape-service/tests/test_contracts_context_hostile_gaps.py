@@ -1124,7 +1124,7 @@ def test_a_fixed_heterogeneous_tuple_is_read_whole_not_cut_at_its_second_entry()
         type(holder).model_validate(snapshot, strict=True)
 
 
-def test_a_valid_fixed_tuple_still_validates_and_homogeneous_views_still_stop_early() -> None:
+def test_a_valid_fixed_tuple_still_validates_and_homogeneous_views_stop_early_and_refuse() -> None:
     from contracts_common import snapshot_contract_graph
 
     Left, Right, Fixed, Open, Listed = _holder_models()
@@ -1134,10 +1134,9 @@ def test_a_valid_fixed_tuple_still_validates_and_homogeneous_views_still_stop_ea
     for model, field in ((Open, "many"), (Listed, "many")):
         read = [0]
         bad = model.model_construct(**{field: _view([{"x": -1.5}] + [{"x": 1}] * 1_000, read)})
-        snapshot = snapshot_contract_graph(bad)
-        assert read[0] == 1 and len(snapshot[field]) == 1  # the invalid first entry ends the read
-        with pytest.raises(ValidationError):
-            model.model_validate(snapshot, strict=True)
+        with pytest.raises(ValueError, match="not valid"):  # the invalid first entry refuses the whole input
+            snapshot_contract_graph(bad)
+        assert read[0] == 1  # and ends the read: the other 1,000 entries are never produced
 
 
 def test_the_item_model_cache_does_not_grow_with_caller_created_classes() -> None:
@@ -1273,3 +1272,91 @@ def test_a_noncanonical_enum_yielded_by_a_public_view_is_refused_before_validati
 
     receipt, bundle = _receipt_and_bundle_with_source_versions(make)
     assert receipt_matches_bundle(receipt, bundle) is False
+
+
+# ---- an early refusal of a yielded entry refuses the whole input, and early validation uses the contract the helper uses
+
+
+def _strict_receipt_view(*entries):
+    """A ``ContextAssemblyReceipt`` subclass instance whose ``source_versions`` view yields ``entries`` and that
+    requires a stricter ``SourceVersion`` (revision at least 5) than the base contract the helper validates."""
+
+    from typing import Annotated
+
+    from pydantic import Field
+
+    from contracts_context import ContextAssemblyReceipt
+    from contracts_references import SourceVersion
+    from tests.test_contracts_context import _receipt
+
+    class StrictVersion(SourceVersion):
+        content_revision: Annotated[int, Field(strict=True, ge=5)]
+
+    class StrictReceipt(ContextAssemblyReceipt):
+        source_versions: tuple[StrictVersion, ...]
+
+    base = _validate(ContextAssemblyReceipt, _receipt())
+    values = dict(_STORED(base, BaseModel))
+    values["source_versions"] = _GeneratedItems(lambda: iter(list(entries)))
+    receipt = StrictReceipt.model_construct(**values)
+    return receipt
+
+
+def test_a_stricter_subclass_does_not_truncate_the_snapshot_the_base_contract_sees() -> None:
+    from contracts_context import receipt_matches_bundle
+
+    bundle = _validate(ContextBundle, _bundle())  # its only source is source-a at revision 4
+    extra = {"record_id": "source-b", "content_revision": 1, "policy_epoch": 1}
+    first = {"record_id": "source-a", "content_revision": 4, "policy_epoch": 2}
+    receipt = _strict_receipt_view(first, extra)
+    # The base contract accepts revision 4, so the receipt lists source-a AND source-b: it is not the bundle's evidence.
+    assert receipt_matches_bundle(receipt, bundle) is False
+
+
+def test_the_same_receipt_without_the_extra_source_still_matches_under_the_base_contract() -> None:
+    from contracts_context import receipt_matches_bundle
+
+    bundle = _validate(ContextBundle, _bundle())
+    receipt = _strict_receipt_view({"record_id": "source-a", "content_revision": 4, "policy_epoch": 2})
+    assert receipt_matches_bundle(receipt, bundle) is True  # the subclass's stricter rule is not the helper's contract
+
+
+def test_an_entry_refused_early_refuses_the_input_instead_of_returning_a_prefix() -> None:
+    from contracts_context import receipt_matches_bundle
+
+    bundle = _validate(ContextBundle, _bundle())
+    bad = {"record_id": "source-a", "content_revision": -1, "policy_epoch": 2}
+    later = {"record_id": "source-a", "content_revision": 4, "policy_epoch": 2}
+    receipt, _ = _receipt_and_bundle_with_source_versions(lambda: iter([bad, later]))
+    assert receipt_matches_bundle(receipt, bundle) is False
+    from contracts_common import snapshot_contract_graph
+    from contracts_context import ContextAssemblyReceipt
+
+    with pytest.raises(ValueError):
+        snapshot_contract_graph(receipt, contract=ContextAssemblyReceipt)
+
+
+def test_the_declared_contract_is_used_all_the_way_down_not_a_narrower_nested_class() -> None:
+    """A nested model that is an instance of a stricter subclass is still judged by what the root declares."""
+
+    from typing import Annotated
+
+    from pydantic import Field
+
+    from contracts_references import SourceVersion
+
+    request, bundle = _matching_pair()
+    item = bundle.selected_items[0]
+    projection = item.freshness.projection
+
+    class StrictVersion(SourceVersion):
+        content_revision: Annotated[int, Field(strict=True, ge=5)]
+
+    class StrictProjection(type(projection)):
+        applied_sources: tuple[StrictVersion, ...]
+
+    values = dict(_STORED(projection, BaseModel))
+    values["applied_sources"] = _GeneratedItems(lambda: iter([{"record_id": "source-a", "content_revision": 4, "policy_epoch": 2}]))
+    dict.__setitem__(_STORED(item.freshness, BaseModel), "projection", StrictProjection.model_construct(**values))
+    # the base contract accepts revision 4; the narrower nested class does not, and it is not the helper's contract
+    assert bundle_matches_reported_evidence(request, bundle) is True
