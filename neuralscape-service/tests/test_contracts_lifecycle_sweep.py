@@ -207,6 +207,27 @@ def test_a_proxy_at_a_nested_position_is_refused_before_validation_reads_it(posi
     assert object.__getattribute__(proxy, "reads") == 0
 
 
+def test_a_proxy_yielded_by_a_public_view_is_refused_before_validation_reads_it():
+    """A tuple subclass's public view is read item by item: a yielded proxy is refused like a nested one."""
+
+    from contracts_references import ReferenceHandle
+    from tests.test_contracts_lifecycle import intent_with_requirements, reference, requirement
+
+    class View(tuple):
+        def __iter__(self):
+            yield proxy
+
+    command = intent_with_requirements(requirement(ProcessingStage.CANONICAL))
+    applied = receipt(ProcessingStage.CANONICAL, StageStatus.APPLIED)
+    proxy = CountingSpoof(reference("o1"), ReferenceHandle)
+    set_native(applied, "output_refs", View((reference("o1"),)))  # native backing is a real handle
+    with pytest.raises(ValueError, match="native"):
+        contracts_lifecycle.validate_stage_receipts(command, (applied,))
+    with pytest.raises(ValueError, match="native"):
+        validate_required_stage_claim(claimed_status=IntentStatus.APPLIED, intent=command, receipts=(applied,))
+    assert object.__getattribute__(proxy, "reads") == 0
+
+
 def test_the_receipts_and_model_entry_checks_decide_by_the_real_type():
     """Pins the two entry checks no other test tells apart from ``isinstance``."""
 
