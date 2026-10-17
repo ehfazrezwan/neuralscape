@@ -17,9 +17,9 @@ from contracts_common import (
     OpaqueId,
     SafeCounter,
     VersionedContract,
-    snapshot_contract_graph,
 )
 from contracts_freshness import (
+    snapshot_pinned,
     FreshnessWitness,
     PinnedAwareDatetime,
     ProjectionStatus,
@@ -44,7 +44,7 @@ def _revalidated_snapshot(
 
     try:
         return model_type.model_validate(
-            pin_native_snapshot(require_native_snapshot(snapshot_contract_graph(value))),
+            pin_native_snapshot(require_native_snapshot(snapshot_pinned(value))),
             strict=True,
         )
     except Exception:
@@ -62,7 +62,7 @@ def _revalidated_pair(
     """
 
     try:
-        pair = pin_native_snapshot(require_native_snapshot(snapshot_contract_graph((first, second))))
+        pair = pin_native_snapshot(require_native_snapshot(snapshot_pinned((first, second))))
         return (
             first_type.model_validate(pair[0], strict=True),  # type: ignore[index]
             second_type.model_validate(pair[1], strict=True),  # type: ignore[index]

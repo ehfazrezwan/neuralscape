@@ -9,7 +9,8 @@ authority merely because a value validates.
 
 import enum
 import typing
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
+from datetime import datetime
 from types import MappingProxyType
 from dataclasses import dataclass, field
 from typing import Annotated, Literal
@@ -273,6 +274,16 @@ class _GraphInventory:
     # reconstruction, so a released temporary's id cannot be reused by a later
     # object and alias its captured contents.
     retained: list[object] = field(default_factory=list)
+    # An optional function applied to every ``datetime`` leaf the moment its entry is captured (before any public
+    # iterator is advanced), and the results by identity: ``(the caller's datetime, its pinned copy)``.  The
+    # original stays referenced, so its id cannot be reused by another object during the call.
+    pin_leaf: "Callable[[object], object] | None" = None
+    pinned: dict[int, tuple[object, object]] = field(default_factory=dict)
+    # While the initial native capture runs, a datetime is only recorded here (pinning asks its zone, which is
+    # caller code, and every native backing must be frozen before any caller code runs); the recorded ones are
+    # pinned once that capture is complete, and any later one (captured as a public view yields it) at once.
+    collecting: bool = True
+    collected: list[object] = field(default_factory=list)
     # Completed reconstructions of pure subtrees, keyed by identity:
     # ``(object, copy, height)``.  A descendant shared by many paths is rebuilt once
     # and shared; ``height`` keeps the depth limit enforced on every path.
@@ -334,6 +345,11 @@ def _capture_native_graph(value: object, inventory: _GraphInventory, depth: int 
 
     value_type = type(value)
     if not _is_subclass(value_type, (BaseModel, tuple, list, dict)):
+        if inventory.pin_leaf is not None and _is_subclass(value_type, datetime) and id(value) not in inventory.pinned:
+            if inventory.collecting:
+                inventory.collected.append(value)  # pinned when the native capture is complete
+            else:
+                inventory.pinned[id(value)] = (value, inventory.pin_leaf(value))  # pinned now, read once
         return -1
     budget = inventory.budget
     if depth > budget.tier.max_depth:
@@ -502,7 +518,8 @@ def _snapshot_captured_graph(
 
     value_type = type(value)
     if not _is_subclass(value_type, (BaseModel, tuple, list, dict)):
-        return value
+        known = inventory.pinned.get(id(value))
+        return known[1] if known is not None and known[0] is value else value
 
     budget = inventory.budget
     if depth > budget.tier.max_depth:
@@ -649,7 +666,10 @@ def _taller(height: int, item: object, completed: dict[int, tuple[object, object
 
 
 def snapshot_contract_graph(
-    value: object, active_containers: set[int] | None = None
+    value: object,
+    active_containers: set[int] | None = None,
+    *,
+    pin_leaf: "Callable[[object], object] | None" = None,
 ) -> object:
     """Reconstruct stored contract graphs while rejecting structural defects.
 
@@ -667,13 +687,21 @@ def snapshot_contract_graph(
     read, the native backing of every item it exposes is frozen before the
     first item is reconstructed, and all captured objects stay referenced until
     reconstruction finishes.
+
+    ``pin_leaf``, when given, is applied once to every ``datetime`` leaf as its entry is captured (so before a
+    public view that yielded it is advanced), and the snapshot holds the result instead of the caller's object.
     """
 
     if active_containers is None:
         active_containers = set()
-    inventory = _GraphInventory()  # one discovery budget for the whole call
+    inventory = _GraphInventory(pin_leaf=pin_leaf)  # one discovery budget for the whole call
     try:
         _capture_native_graph(value, inventory)
+        inventory.collecting = False
+        for leaf in inventory.collected:  # all native backing is frozen: now the zones may be asked, once each
+            if id(leaf) not in inventory.pinned:
+                inventory.pinned[id(leaf)] = (leaf, inventory.pin_leaf(leaf))  # type: ignore[misc]
+        inventory.collected.clear()
         return _snapshot_captured_graph(value, active_containers, inventory)
     except RecursionError:
         # One frame per level keeps every admitted depth far inside the interpreter's limit;

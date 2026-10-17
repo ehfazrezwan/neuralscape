@@ -115,6 +115,25 @@ def _pin_validated(value: datetime) -> datetime:
     return pinned
 
 
+def _pin_at_capture(value: object) -> object:
+    """The pin a snapshot applies to a datetime leaf as its entry is captured.
+
+    Aware datetimes become exact fixed-offset copies; a zone that is present but reports no usable offset is
+    refused here (never kept to be read again later); a naive datetime is left for validation to refuse.
+    """
+
+    pinned = pin_datetime(value)
+    if datetime.tzinfo.__get__(value) is not None and not _is_pinned(pinned):  # type: ignore[arg-type]
+        raise ValueError("a datetime must have a usable UTC offset")
+    return pinned
+
+
+def snapshot_pinned(value: object) -> object:
+    """``snapshot_contract_graph`` with every datetime leaf pinned at capture, before any iterator advances."""
+
+    return snapshot_contract_graph(value, pin_leaf=_pin_at_capture)
+
+
 PinnedAwareDatetime = Annotated[AwareDatetime, AfterValidator(_pin_validated)]
 """An aware datetime stored as a plain fixed-offset one, so no later check can see a different instant."""
 
@@ -614,6 +633,7 @@ __all__ = [
     "FreshnessWitness",
     "PinnedAwareDatetime",
     "pin_datetime",
+    "snapshot_pinned",
     "pin_native_snapshot",
     "ProjectionFreshness",
     "ProjectionStatus",

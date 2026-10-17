@@ -806,3 +806,114 @@ def test_pinning_still_passes_a_naive_datetime_on_to_validation_and_pins_a_good_
     out = pin_native_snapshot({"n": naive, "g": good})
     assert out["n"] is naive  # refused later by validation, as before
     assert type(out["g"]) is datetime and type(out["g"].tzinfo) is timezone and out["g"] == good
+
+
+# ---- a datetime is pinned when its entry is captured, before the public iterator that yielded it advances
+
+
+class _SteerableZone(tzinfo):
+    """A fixed offset that the test changes from outside (as an iterator can when it is resumed)."""
+
+    def __init__(self, offset: timedelta) -> None:
+        self.offset, self.reads = offset, 0
+
+    def utcoffset(self, dt):
+        self.reads += 1
+        return self.offset
+
+    def dst(self, dt):
+        return timedelta(0)
+
+
+class _GeneratedItems(tuple):
+    """A tuple with nothing in its native backing: its items exist only through the generator ``make`` returns."""
+
+    def __new__(cls, make):
+        instance = super().__new__(cls, ())
+        instance.make = make
+        return instance
+
+    def __iter__(self):
+        return self.make()
+
+
+def _bundle_whose_item_is_generated(observed_utc, verified_wall, zone, after_resume):
+    request, bundle = _matching_pair()
+    item = bundle.selected_items[0]
+    checkpoint = _stored_checkpoint(bundle)
+    dict.__setitem__(_STORED(checkpoint, BaseModel), "observed_at", observed_utc)
+    dict.__setitem__(_STORED(checkpoint, BaseModel), "last_successful_verification_at", datetime(*verified_wall, tzinfo=zone))
+
+    def make():
+        yield item
+        after_resume()  # the consumer asked for the next entry: the iterator changes what it just yielded
+
+    dict.__setitem__(_STORED(bundle, BaseModel), "selected_items", _GeneratedItems(make))
+    return request, bundle
+
+
+# A verification must not be later than the observation it reports (the matching control: verification first).
+@pytest.mark.parametrize(
+    "verified, changed_to, expected",
+    [
+        ((2026, 9, 28, 6), timedelta(hours=-12), True),  # 06:00Z as yielded (before 12:00Z); -12 h would make it 18:00Z
+        (_EVENING, timedelta(hours=12), False),  # 18:00Z as yielded (after 12:00Z); +12 h would make it 06:00Z
+    ],
+    ids=["valid-then-moved-after", "invalid-then-moved-before"],
+)
+def test_a_zone_changed_when_the_iterator_resumes_is_judged_as_it_was_yielded(verified, changed_to, expected) -> None:
+    zone = _SteerableZone(timedelta(0))
+    request, bundle = _bundle_whose_item_is_generated(
+        datetime(*_NOON, tzinfo=UTC), verified, zone, lambda: setattr(zone, "offset", changed_to)
+    )
+    assert bundle_matches_reported_evidence(request, bundle) is expected
+
+
+def test_an_honest_generated_item_with_a_steady_zone_still_matches() -> None:
+    zone = _SteerableZone(timedelta(0))
+    request, bundle = _bundle_whose_item_is_generated(datetime(*_NOON, tzinfo=UTC), (2026, 9, 28, 6), zone, lambda: None)
+    assert bundle_matches_reported_evidence(request, bundle) is True
+    assert zone.reads >= 1
+
+
+def test_a_native_datetime_is_pinned_before_any_public_iterator_runs() -> None:
+    from contracts_freshness import snapshot_pinned
+
+    zone = _SteerableZone(timedelta(0))
+    leaf = datetime(*_NOON, tzinfo=zone)
+
+    def make():
+        yield {"x": 1}
+        zone.offset = timedelta(hours=12)  # a different view is resumed: the native datetime's zone changes
+
+    snapshot = snapshot_pinned(({"leaf": leaf}, _GeneratedItems(make)))
+    assert snapshot[0]["leaf"] == datetime(*_NOON, tzinfo=UTC)
+    assert type(snapshot[0]["leaf"]) is datetime and type(snapshot[0]["leaf"].tzinfo) is timezone
+
+
+def test_every_datetime_is_asked_once_and_an_unusable_zone_is_refused_at_capture() -> None:
+    from contracts_freshness import snapshot_pinned
+
+    zone = _SteerableZone(timedelta(hours=2))
+    shared = datetime(*_NOON, tzinfo=zone)
+    out = snapshot_pinned({"a": shared, "b": [shared]})
+    assert zone.reads == 1 and out["a"] is out["b"][0]
+
+    class NoOffset(tzinfo):
+        def utcoffset(self, dt):
+            return None
+
+        def dst(self, dt):
+            return None
+
+    with pytest.raises(ValueError, match="usable UTC offset"):
+        snapshot_pinned({"a": datetime(*_NOON, tzinfo=NoOffset())})
+    naive = datetime(*_NOON)
+    assert snapshot_pinned({"n": naive})["n"] is naive
+
+
+def test_a_snapshot_without_a_pin_function_still_returns_the_callers_datetime() -> None:
+    from contracts_common import snapshot_contract_graph
+
+    leaf = datetime(*_NOON, tzinfo=UTC)
+    assert snapshot_contract_graph({"a": leaf})["a"] is leaf
