@@ -1008,3 +1008,8 @@ def test_a_const_and_an_enum_that_agree_change_nothing() -> None:
     assert _pair({"const": 1, "enum": [1, 2]}, {"const": 1}) == []  # the enum only repeated the const: a widening
     assert _pair({"const": 1, "enum": [1, 2]}, {"const": 1, "enum": [1, 2]}) == []
 
+
+def test_a_boolean_root_schema_is_compared_not_crashed_on() -> None:
+    assert _pair(True, {"type": "string"}), "everything was valid, now only strings"
+    assert _pair({"type": "string"}, False)
+    assert _pair(True, True) == []

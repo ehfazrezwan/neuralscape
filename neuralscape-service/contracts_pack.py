@@ -707,6 +707,14 @@ def _is_version_bump(old_version: object, new_version: object) -> bool:
     return True
 
 
+def _declared_version(schema: object) -> object:
+    """The ``schema_version`` constant a contract schema declares, or ``None`` (a boolean or odd root declares none)."""
+
+    properties = schema.get("properties") if isinstance(schema, dict) else None
+    declared = properties.get("schema_version") if isinstance(properties, dict) else None
+    return declared.get("const") if isinstance(declared, dict) else None
+
+
 def check_compatibility(old: dict, new: dict) -> list[str]:
     """Return breaking-change findings from ``old`` to ``new`` (empty = compatible).
 
@@ -720,14 +728,19 @@ def check_compatibility(old: dict, new: dict) -> list[str]:
     the module docstring is reported as an unverified change, never accepted silently.
     """
 
-    old_version = old.get("properties", {}).get("schema_version", {}).get("const")
-    new_version = new.get("properties", {}).get("schema_version", {}).get("const")
+    old_version = _declared_version(old)
+    new_version = _declared_version(new)
     if old_version is not None and new_version is not None and _is_version_bump(old_version, new_version):
         return []
     problems: list[str] = []
     token = _RUN.set(_Run())
     try:
-        _compare(old, new, old.get("$defs", {}), new.get("$defs", {}), "$", problems)
+        _compare(
+            old, new,
+            old.get("$defs", {}) if isinstance(old, dict) else {},
+            new.get("$defs", {}) if isinstance(new, dict) else {},
+            "$", problems,
+        )
     except _BudgetExhausted:
         problems.append(_BUDGET_MESSAGE)
     finally:
