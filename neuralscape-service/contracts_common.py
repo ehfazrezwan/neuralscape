@@ -186,14 +186,22 @@ def _exposed_items(value: object, inventory: _GraphInventory) -> tuple[object, .
 
     The native backing of all exposed items is captured before the first one is
     reconstructed, so a callback run while reconstructing an earlier item cannot
-    change a later sibling's captured state.  The items are retained.
+    change a later sibling's captured state.  Each item is captured the moment the
+    iterator yields it, before the iterator is advanced: a generator resumed to
+    produce the next item cannot repair what it just exposed.  The items are retained.
     """
 
-    items = tuple(iter(value))  # type: ignore[call-overload]
-    inventory.retained.append(items)
-    for item in items:
+    iterator = iter(value)  # type: ignore[call-overload]
+    items: list[object] = []
+    inventory.retained.append(items)  # kept alive from the first item, whatever the iterator does next
+    while True:
+        try:
+            item = next(iterator)
+        except StopIteration:
+            break
         _capture_native_graph(item, inventory)
-    return items
+        items.append(item)
+    return tuple(items)
 
 
 def _snapshot_captured_graph(

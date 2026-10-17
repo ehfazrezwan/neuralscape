@@ -535,3 +535,69 @@ def test_the_pair_snapshot_keeps_the_predicates_true_for_valid_arguments_with_ca
     assert seen  # the zone was consulted
     object.__setattr__(receipt, "source_versions", _IteratorThatRepairs(receipt.source_versions, lambda: seen.append(2)))
     assert receipt_matches_bundle(receipt, plain_bundle)
+
+
+# ---- an entry exposed only by a public iterator is captured before that iterator advances
+
+
+class _EmptyBackedGenerated(tuple):
+    """A tuple with nothing in its native backing: every item exists only through the generator ``make`` returns."""
+
+    def __new__(cls, make):
+        instance = super().__new__(cls, ())
+        instance.make = make
+        return instance
+
+    def __iter__(self):
+        return self.make()
+
+
+def _receipt_and_bundle_with_source_versions(make):
+    from contracts_context import ContextAssemblyReceipt
+    from tests.test_contracts_context import _receipt
+
+    receipt = _validate(ContextAssemblyReceipt, _receipt())
+    bundle = _validate(ContextBundle, _bundle())
+    object.__setattr__(receipt, "source_versions", _EmptyBackedGenerated(make))
+    return receipt, bundle
+
+
+def test_an_entry_yielded_then_repaired_on_resume_is_judged_as_it_was_yielded() -> None:
+    from contracts_context import receipt_matches_bundle
+
+    def make():
+        entry = {"record_id": "source-a", "content_revision": -1, "policy_epoch": 2}  # invalid as yielded
+        yield entry
+        entry["content_revision"] = 4  # repaired when the consumer asks for the next item (the bundle's value)
+
+    receipt, bundle = _receipt_and_bundle_with_source_versions(make)
+    assert receipt_matches_bundle(receipt, bundle) is False
+
+
+def test_an_honest_generated_entry_still_matches() -> None:
+    from contracts_context import receipt_matches_bundle
+
+    def make():
+        yield {"record_id": "source-a", "content_revision": 4, "policy_epoch": 2}
+
+    receipt, bundle = _receipt_and_bundle_with_source_versions(make)
+    assert receipt_matches_bundle(receipt, bundle) is True
+
+
+def test_a_generated_entry_repaired_on_resume_in_the_bundle_is_judged_as_it_was_yielded() -> None:
+    """The bundle's own public sequence is read the same way."""
+
+    from contracts_context import ContextAssemblyReceipt, receipt_matches_bundle
+    from tests.test_contracts_context import _receipt
+
+    receipt = _validate(ContextAssemblyReceipt, _receipt())
+    bundle = _validate(ContextBundle, _bundle())
+    item = bundle.selected_items[0]
+
+    def make():
+        entry = {"record_id": "source-a", "content_revision": -1, "policy_epoch": 2}
+        yield entry
+        entry["content_revision"] = 4
+
+    object.__setattr__(item, "source_versions", _EmptyBackedGenerated(make))
+    assert receipt_matches_bundle(receipt, bundle) is False
