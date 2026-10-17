@@ -932,6 +932,12 @@ _SIBLING_INDEPENDENT = frozenset({
 _PLAIN_DIALECT = "https://json-schema.org/draft/2020-12/schema"
 
 
+def _sibling_sensitive(schema: dict) -> set[str]:
+    """The keywords of ``schema`` the checker does not understand and whose meaning may depend on what is beside them."""
+
+    return {key for key in set(schema) - _MODELED - _ANNOTATIONS - _SIBLING_INDEPENDENT if not _plain_dialect(key, schema, schema)}
+
+
 def _plain_dialect(key: str, old: dict, new: dict) -> bool:
     """A ``$schema`` naming the dialect the checker implements, on both sides, changes nothing beside it."""
 
@@ -1049,11 +1055,19 @@ def _compare(
         # Resolving a reference replaces the schema, so constraints written beside it (``maxLength``
         # next to ``$ref``) would be dropped; a change in them is not verified.
         out.append(_unverified(path, "constraints beside a $ref changed"))
-    elif any(_UNEVALUATED & set(beside) for beside in (*old_beside, *new_beside)) and not _unevaluated_node_same(
-        written_old, written_new, old_defs, new_defs
-    ):
-        # An unchanged unevaluated keyword beside a reference in the chain depends on what the targets evaluate.
-        out.append(_unverified(path, "a schema with unevaluatedProperties or unevaluatedItems changed"))
+    elif old_beside or new_beside:
+        # Constraints beside a reference in the chain are unchanged, but they may depend on the target.
+        besides = (*old_beside, *new_beside)
+        sensitive = sorted({key for beside in besides for key in _sibling_sensitive(beside)})
+        if (any(_UNEVALUATED & set(beside) for beside in besides) or sensitive) and not _unevaluated_node_same(
+            written_old, written_new, old_defs, new_defs
+        ):
+            if any(_UNEVALUATED & set(beside) for beside in besides):
+                # An unevaluated keyword depends on what the targets evaluate.
+                out.append(_unverified(path, "a schema with unevaluatedProperties or unevaluatedItems changed"))
+            if sensitive:
+                # A keyword not understood beside a reference may depend on the target, as on the target itself.
+                out.append(_unverified(path, f"a schema with a keyword not modelled ({', '.join(sensitive[:3])}) changed around it"))
     if old is not written_old or new is not written_new:
         _unevaluated_guard(old, new, old_defs, new_defs, path, out)  # the reference's target carries its own
     if isinstance(old, dict) and isinstance(new, dict) and old.get("$ref") == "#" and new.get("$ref") == "#":
@@ -1096,7 +1110,7 @@ def _compare(
         new = {key: value for key, value in new.items() if key not in malformed}
     _charge_walk(len(old) + len(new))  # the node's keys are scanned on every visit, memoized pair or not
     unmodelled = (set(old) | set(new)) - _MODELED - _ANNOTATIONS
-    sensitive = sorted(key for key in unmodelled - _SIBLING_INDEPENDENT if not _plain_dialect(key, old, new))
+    sensitive = sorted(key for key in unmodelled - _SIBLING_INDEPENDENT if not _plain_dialect(key, old, new))  # see _sibling_sensitive
     if (
         sensitive
         and all(_same_value(old.get(k, _ABSENT), new.get(k, _ABSENT)) for k in sensitive)  # a change to one: below
