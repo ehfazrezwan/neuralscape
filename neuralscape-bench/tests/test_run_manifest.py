@@ -7,6 +7,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from abc import ABCMeta
 from collections.abc import Mapping
 from datetime import datetime, timedelta, timezone, tzinfo
@@ -6263,3 +6264,260 @@ def test_a_bytes_subclass_overriding_item_access_is_copied_from_its_real_bytes()
     with pytest.raises(ValueError, match="duplicate JSON key"):
         validate_run_manifest_json(Slippery(dirty))
     assert log == [], log
+
+
+# ---- the single read of a caller-overridable field inventory is bounded
+
+import signal as _signal
+
+
+class _Alarm(Exception):
+    pass
+
+
+def _within(seconds, call):
+    def on_alarm(signum, frame):
+        raise _Alarm()
+
+    previous = _signal.signal(_signal.SIGALRM, on_alarm)
+    _signal.setitimer(_signal.ITIMER_REAL, seconds)
+    try:
+        return call()
+    finally:
+        _signal.setitimer(_signal.ITIMER_REAL, 0)
+        _signal.signal(_signal.SIGALRM, previous)
+
+
+class _InventoryFrom(dict):
+    """A field inventory whose iteration yields whatever ``factory`` makes (after the real names, when asked)."""
+
+    def __init__(self, fields, factory):
+        super().__init__(fields)
+        self.factory = factory
+        self.reads = 0
+
+    def __iter__(self):
+        self.reads += 1
+        return iter(self.factory(list(dict.__iter__(self))))
+
+
+def _resource_with_inventory(factory):
+    base_meta = type(ResourceReading)
+
+    class InventoryMeta(base_meta):
+        @property
+        def model_fields(cls):   # type: ignore[override]
+            return cls._inventory
+
+    class InventoryReading(ResourceReading, metaclass=InventoryMeta):
+        pass
+
+    InventoryReading._inventory = _InventoryFrom(ResourceReading.model_fields, factory)
+    return InventoryReading.model_construct(**measured_memory().model_dump()), InventoryReading._inventory
+
+
+def _endless(real):
+    def names():
+        yield from real
+        index = 0
+        while True:
+            yield f"extra-{index}"
+            index += 1
+    return names()
+
+
+def _huge_distinct(real):
+    return iter([*real, *(f"extra-{index}" for index in range(200_000))])
+
+
+def _huge_repeated(real):
+    return iter(["observed_value"] * 200_000)
+
+
+@pytest.mark.parametrize("factory", [_endless, _huge_distinct, _huge_repeated], ids=["nonterminating", "huge-distinct", "huge-repeated"])
+def test_an_oversized_or_endless_field_inventory_is_refused_by_the_snapshot_budget(factory) -> None:
+    resource, inventory = _resource_with_inventory(factory)
+    with pytest.raises(ValueError) as caught:
+        _within(10, lambda: _snapshot_native(resource))
+    assert str(caught.value) == run_manifest_module.SNAPSHOT_BUDGET_MESSAGE
+    assert inventory.reads == 1
+
+
+def test_an_oversized_inventory_is_refused_through_serialization_too() -> None:
+    resource, _inventory = _resource_with_inventory(_huge_distinct)
+    manifest = completed_manifest()
+    object.__setattr__(manifest, "resources", (resource,))
+    with pytest.raises(ValueError) as caught:
+        _within(10, lambda: serialize_run_manifest(manifest))
+    assert str(caught.value) == run_manifest_module.SNAPSHOT_BUDGET_MESSAGE
+
+
+def test_an_inventory_at_the_limit_is_read_once_and_one_more_is_refused() -> None:
+    limit = run_manifest_module._MAX_FIELD_INVENTORY
+    real = list(ResourceReading.model_fields)
+
+    def exactly(count):
+        def make(names):
+            return iter([*names, *(f"pad-{index}" for index in range(count - len(names)))])
+        return make
+
+    at_limit, inventory = _resource_with_inventory(exactly(limit))
+    try:
+        _snapshot_native(at_limit)   # padding names are not stored fields: refused as undeclared, but not by the budget
+    except ValueError as error:
+        assert str(error) != run_manifest_module.SNAPSHOT_BUDGET_MESSAGE
+    assert inventory.reads == 1
+    over, _inventory = _resource_with_inventory(exactly(limit + 1))
+    with pytest.raises(ValueError) as caught:
+        _snapshot_native(over)
+    assert str(caught.value) == run_manifest_module.SNAPSHOT_BUDGET_MESSAGE
+    assert limit > len(real)
+
+
+def test_an_honest_resource_reads_its_inventory_once_and_is_unchanged() -> None:
+    resource, inventory = _resource_with_inventory(lambda names: iter(names))
+    snapshot = _snapshot_native(resource)
+    assert inventory.reads == 1 and set(snapshot) == set(measured_memory().model_dump())
+
+
+# ---- an inventory is bounded in the size of its names and read once per class per call
+
+class _BigName(str):
+    """A text name of a given length (a str subclass, so copying it is linear in its length)."""
+
+
+def _resource_class_with_names(names):
+    base_meta = type(ResourceReading)
+
+    class NamesMeta(base_meta):
+        @property
+        def model_fields(cls):   # type: ignore[override]
+            cls._reads += 1
+            return {**ResourceReading.model_fields, **{name: ResourceReading.model_fields["scope"] for name in names}}
+
+    class NamedReading(ResourceReading, metaclass=NamesMeta):
+        pass
+
+    NamedReading._reads = 0
+    return NamedReading
+
+
+def _manifest_of_instances(cls, count):
+    values = measured_memory().model_dump()
+    resources = tuple(cls.model_construct(**{**values, "scope": f"scope-{index}"}) for index in range(count))
+    manifest = completed_manifest()
+    object.__setattr__(manifest, "resources", resources)
+    return manifest
+
+
+def test_oversized_inventory_names_are_refused_before_they_are_copied_or_hashed() -> None:
+    cls = _resource_class_with_names([_BigName("n" * (1 << 20)) + str(index) for index in range(55)])
+    manifest = _manifest_of_instances(cls, 100)
+    started = time.monotonic()
+    with pytest.raises(ValueError) as caught:
+        serialize_run_manifest(manifest)
+    elapsed = time.monotonic() - started
+    assert str(caught.value) == run_manifest_module.SNAPSHOT_BUDGET_MESSAGE
+    assert elapsed < 2, elapsed      # unfixed: about 5 s for 100 instances of 55 one-mebibyte names
+
+
+def test_a_name_that_is_not_text_is_refused_by_the_inventory_bound() -> None:
+    cls = _resource_class_with_names([(1 << 2_000_000) + index for index in range(8)])
+    with pytest.raises(ValueError) as caught:
+        serialize_run_manifest(_manifest_of_instances(cls, 20))
+    assert str(caught.value) == run_manifest_module.SNAPSHOT_BUDGET_MESSAGE
+
+
+def test_a_class_inventory_is_read_once_per_call_however_many_instances() -> None:
+    cls = _resource_class_with_names([f"pad-{index}" for index in range(10)])
+    manifest = _manifest_of_instances(cls, 200)
+    serialize_run_manifest(manifest)                 # the padding names are inventory entries only: nothing is stored under them
+    assert cls._reads == 1, cls._reads
+
+
+def test_each_call_reads_the_inventory_afresh() -> None:
+    cls = _resource_class_with_names([f"pad-{index}" for index in range(3)])
+    for call in range(3):
+        serialize_run_manifest(_manifest_of_instances(cls, 5))
+    assert cls._reads == 3, cls._reads
+
+
+def test_field_names_of_ordinary_length_are_still_accepted() -> None:
+    manifest = _manifest_of_instances(_resource_class_with_names([]), 50)
+    manifest_bytes = serialize_run_manifest(manifest)
+    assert b"scope-49" in manifest_bytes
+
+
+def test_an_inventory_name_that_lies_about_its_length_is_measured_by_the_base_method() -> None:
+    log: list[str] = []
+
+    class Liar(str):
+        def __len__(self):
+            log.append("__len__")
+            return 1
+
+    cls = _resource_class_with_names([Liar("x" * (1 << 20) + str(index)) for index in range(3)])
+    with pytest.raises(ValueError) as caught:
+        serialize_run_manifest(_manifest_of_instances(cls, 5))
+    assert str(caught.value) == run_manifest_module.SNAPSHOT_BUDGET_MESSAGE and log == [], log
+
+
+# ---- a self-iterating inventory is iterated exactly once
+
+class _SelfIteratingInventory:
+    """``__iter__`` returns the object itself and refuses a second call: the inventory can be iterated once only."""
+
+    def __init__(self, names):
+        self.names = list(names)
+        self.iter_calls = 0
+        self.position = 0
+
+    def __iter__(self):
+        self.iter_calls += 1
+        if self.iter_calls > 1:
+            raise RuntimeError("this inventory cannot be iterated twice")
+        return self
+
+    def __next__(self):
+        if self.position >= len(self.names):
+            raise StopIteration
+        self.position += 1
+        return self.names[self.position - 1]
+
+
+def _resource_with_a_self_iterating_inventory():
+    base_meta = type(ResourceReading)
+
+    class OnceMeta(base_meta):
+        @property
+        def model_fields(cls):   # type: ignore[override]
+            return cls._inventory
+
+    class OnceReading(ResourceReading, metaclass=OnceMeta):
+        pass
+
+    OnceReading._inventory = _SelfIteratingInventory(ResourceReading.model_fields)
+    return OnceReading.model_construct(**measured_memory().model_dump()), OnceReading._inventory
+
+
+def test_a_self_iterating_inventory_is_iterated_exactly_once() -> None:
+    resource, inventory = _resource_with_a_self_iterating_inventory()
+    snapshot = _snapshot_native(resource)
+    assert inventory.iter_calls == 1
+    assert set(snapshot) == set(measured_memory().model_dump())
+
+
+def test_a_self_iterating_inventory_works_through_serialization() -> None:
+    resource, inventory = _resource_with_a_self_iterating_inventory()
+    manifest = completed_manifest()
+    object.__setattr__(manifest, "resources", (resource,))
+    assert serialize_run_manifest(manifest)
+    assert inventory.iter_calls == 1
+
+
+def test_a_self_iterating_inventory_over_the_bound_is_still_refused_after_one_iteration() -> None:
+    resource, inventory = _resource_with_a_self_iterating_inventory()
+    inventory.names = [f"extra-{index}" for index in range(200)]
+    with pytest.raises(ValueError) as caught:
+        _snapshot_native(resource)
+    assert str(caught.value) == run_manifest_module.SNAPSHOT_BUDGET_MESSAGE and inventory.iter_calls == 1

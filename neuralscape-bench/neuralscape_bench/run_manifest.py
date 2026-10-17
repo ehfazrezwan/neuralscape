@@ -9,6 +9,7 @@ not be synthesized as a zero.
 from __future__ import annotations
 
 import heapq
+import itertools
 import json
 from collections.abc import Mapping
 from contextvars import ContextVar
@@ -96,6 +97,9 @@ class _FrozenGraph(NamedTuple):
     # id -> (the caller's datetime, its fixed-offset copy): one offset per object per call.  The
     # original is retained so its id cannot be reused by another object during the call.
     fixed_datetimes: dict[int, tuple[datetime, datetime]]
+    # id of a model class -> (the class, its field names read once): the inventory is the caller's, so one call
+    # reads it once per class however many instances of the class the graph holds.
+    field_inventories: dict[int, tuple[type, frozenset[Any]]]
 
 
 class _ManifestContract(BaseModel):
@@ -1231,6 +1235,7 @@ def _freeze_model_graphs(*values: Any) -> _FrozenGraph:
         visits=[0],
         native_entries=[0],
         fixed_datetimes={},
+        field_inventories={},
     )
     visited: set[int] = set()
     for value in values:
@@ -1250,6 +1255,33 @@ _LEAF_TYPES = (type(None), bool, int, float, str, datetime)
 MAX_SNAPSHOT_VISITS = 65_536
 MAX_SNAPSHOT_DEPTH = 64
 SNAPSHOT_BUDGET_MESSAGE = "manifest input exceeds the native snapshot budget"
+# The most names one read of a model's field inventory may produce, repeated names included: the project's own
+# models have about a dozen fields, and the inventory belongs to the caller's class, so it is read through a bound.
+_MAX_FIELD_INVENTORY = 64
+# The longest a field name can be: a longer name is refused before it is copied or hashed.
+_MAX_FIELD_NAME = 256
+
+
+def _read_field_inventory(model_type: type, frozen_graph: _FrozenGraph) -> frozenset[Any]:
+    """The names of ``model_type.model_fields`` as exact text.
+
+    The inventory is the caller's: it is read once per class per call (instances of one class share the read), never
+    past ``_MAX_FIELD_INVENTORY`` entries (repeated names included), and a name that is not text, or is longer than
+    ``_MAX_FIELD_NAME`` characters, is refused by its type and length alone, before it is copied or hashed.
+    """
+
+    known = frozen_graph.field_inventories.get(id(model_type))
+    if known is not None and known[0] is model_type:
+        return known[1]
+    produced = list(itertools.islice(model_type.model_fields, _MAX_FIELD_INVENTORY + 1))  # type: ignore[attr-defined]  # islice takes the one iter() itself
+    if len(produced) > _MAX_FIELD_INVENTORY:
+        raise ValueError(SNAPSHOT_BUDGET_MESSAGE)
+    for name in produced:
+        if not _is_instance(name, str) or str.__len__(name) > _MAX_FIELD_NAME:  # type: ignore[arg-type]
+            raise ValueError(SNAPSHOT_BUDGET_MESSAGE)
+    names = frozenset(_exact_key(name) for name in produced)
+    frozen_graph.field_inventories[id(model_type)] = (model_type, names)
+    return names
 
 
 def _charge_capture(frozen_graph: _FrozenGraph) -> None:
@@ -1453,7 +1485,7 @@ def _snapshot_native(
         if _is_instance(value, BaseModel):
             # The field inventory comes from the caller's class and may answer differently each time it is iterated:
             # it is read once into exact names, and the model is rebuilt from the captured entries, not from it.
-            fields = frozenset(_exact_key(name) for name in type(value).model_fields)
+            fields = _read_field_inventory(type(value), _frozen_graph)
             frozen = _frozen_graph.models.get(identity)
             if frozen is None or frozen[0] is not value:
                 _freeze_model_storage(value, _frozen_graph, set())
