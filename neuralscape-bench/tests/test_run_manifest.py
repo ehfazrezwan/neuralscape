@@ -5719,10 +5719,21 @@ def test_a_repeated_key_in_a_public_mapping_is_refused_not_overwritten(pair_orde
         _finish_with_resource(_PairsMapping(others + [("observed_value", first), ("observed_value", second)]))
 
 
-def test_keys_that_compare_equal_are_a_repeat() -> None:
+def test_keys_that_compare_equal_but_are_distinct_objects_are_a_repeat() -> None:
+    class SpelledAgain(str):
+        """Equal to, and hashing like, its base text, but a different object."""
+
     base = measured_memory().model_dump()
-    pairs = [(key, value) for key, value in base.items()] + [(1, "a"), (True, "b")]
-    with pytest.raises(ValueError):
+    others = [(key, value) for key, value in base.items() if key != "observed_value"]
+    pairs = others + [("observed_value", True), (SpelledAgain("observed_value"), 1)]
+    with pytest.raises(ValueError, match="duplicate key"):
+        _finish_with_resource(_PairsMapping(pairs))
+
+
+def test_non_text_keys_that_compare_equal_are_a_repeat_named_as_such() -> None:
+    base = measured_memory().model_dump()
+    pairs = list(base.items()) + [(1, "a"), (True, "b")]   # 1 == True: one key, written twice
+    with pytest.raises(ValueError, match="duplicate key"):
         _finish_with_resource(_PairsMapping(pairs))
 
 
@@ -5742,9 +5753,6 @@ def test_a_key_is_hashed_once_when_it_is_stored() -> None:
 
     base = measured_memory().model_dump()
     pairs = [(CountedKey(key), value) for key, value in base.items()]
-    try:
-        _finish_with_resource(_PairsMapping(pairs))
-    except (ValueError, TypeError):
-        pass
+    _finish_with_resource(_PairsMapping(pairs))   # accepted: the keys are the model's own field names
     assert len(calls) == len(pairs)   # one hash per stored key: the repeat check adds none of its own
 
