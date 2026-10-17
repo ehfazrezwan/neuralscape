@@ -886,6 +886,55 @@ def _plain_text_keys(document: Any) -> Any:
     return walk(document, 0)
 
 
+_OMITTED_INPUT = "<omitted: caller input is never rendered>"
+_MAX_REFUSAL_TEXT = 1_000
+
+
+def _value_free(error: ValidationError) -> ValidationError:
+    """The same refusal with no caller input in it, so rendering it reads nothing of the caller.
+
+    Pydantic keeps the rejected object as each error's input, and rendering the error
+    (``str``, ``repr``, ``json``, logging) then runs that object's ``repr``: for a
+    model carrying a custom extra view, an unbounded read.  Locations, error types and
+    context are kept; an input is kept only when it is a short plain scalar.
+    """
+
+    details = []
+    for item in error.errors(include_url=False):
+        detail = {"type": item["type"], "loc": item["loc"], "input": _renderable_input(item.get("input"))}
+        if "ctx" in item:
+            detail["ctx"] = item["ctx"]
+        details.append(detail)
+    return ValidationError.from_exception_data(error.title, details)
+
+
+_MAX_RENDERED_INPUT = 256
+
+
+def _renderable_input(value: Any) -> Any:
+    """Keep a plain, short scalar input (a useful diagnostic); anything else is omitted.
+
+    Exact ``str`` (bounded length), ``int``, ``float``, ``bool`` and ``None`` render
+    without running caller code; models, mappings, containers and other objects may
+    not, so they become the placeholder.
+    """
+
+    if value is None or is_exact_type(value, bool, int, float):
+        return value
+    if is_exact_type(value, str) and len(value) <= _MAX_RENDERED_INPUT:
+        return value
+    return _OMITTED_INPUT
+
+
+def _refusal(cause: BaseException) -> ValidationError:
+    text = str(cause)
+    bounded = ValueError(text if len(text) <= _MAX_REFUSAL_TEXT else text[:_MAX_REFUSAL_TEXT] + "...")
+    return ValidationError.from_exception_data(
+        "PortableManifest",
+        [{"type": "value_error", "loc": (), "input": _OMITTED_INPUT, "ctx": {"error": bounded}}],
+    )
+
+
 def validate_portable_manifest(
     document: PortableManifest | Mapping[str, Any],
 ) -> PortableManifest:
@@ -893,36 +942,34 @@ def validate_portable_manifest(
 
     This function performs no filesystem, archive, network, authorization, or
     cryptographic work.  Callers must compare the returned file descriptors to
-    actual bytes before any mutation.
+    actual bytes before any mutation.  A refusal never carries the caller's input
+    (see ``_value_free``) and is raised outside the handler that caught the
+    original error, so no rendering re-reads caller objects.
     """
 
+    failure: ValidationError | None = None
+    cause: BaseException | None = None
     if isinstance(document, PortableManifest):
         try:
             model_inventory = _reject_retained_unknown_fields(document)
             candidate = _reconstruct_retained_state(document, model_inventory)
-        except ValidationError:
-            raise
+        except ValidationError as exc:
+            failure = _value_free(exc)
         except (TypeError, ValueError, RecursionError) as exc:
-            raise ValidationError.from_exception_data(
-                "PortableManifest",
-                [
-                    {
-                        "type": "value_error",
-                        "loc": (),
-                        "input": document,
-                        "ctx": {"error": exc},
-                    }
-                ],
-            ) from exc
+            failure, cause = _refusal(exc), exc
     else:
         try:
             candidate = _plain_text_keys(document)
         except (TypeError, ValueError, RecursionError) as exc:
-            raise ValidationError.from_exception_data(
-                "PortableManifest",
-                [{"type": "value_error", "loc": (), "input": None, "ctx": {"error": exc}}],
-            ) from exc
-    return PortableManifest.model_validate(candidate)
+            failure, cause = _refusal(exc), exc
+    if failure is None:
+        try:
+            return PortableManifest.model_validate(candidate)
+        except ValidationError as exc:
+            failure = _value_free(exc)
+    if cause is not None:
+        raise failure from cause  # the traversal's own bounded error, never caller objects
+    raise failure
 
 
 __all__ = [

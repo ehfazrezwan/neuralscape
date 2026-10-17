@@ -3074,7 +3074,10 @@ def test_deep_unknown_value_preserves_extra_forbidden_priority(
     assert len(errors) == 1
     assert errors[0]["type"] == "extra_forbidden"
     assert errors[0]["loc"] == ("future_entry_semantics",)
-    assert errors[0]["input"] is deeply_nested
+    # The caller's object is not carried (rendering a list nested past the recursion
+    # limit would itself fail); the refusal renders.
+    assert errors[0]["input"] == contracts_portability._OMITTED_INPUT
+    assert "future_entry_semantics" in str(raised.value)
 
 
 @pytest.mark.parametrize("value_kind", ["shallow", "deep"])
@@ -3819,3 +3822,65 @@ def test_an_ordinary_pair_in_a_custom_extra_view_keeps_its_outcome() -> None:
     _PYDANTIC_EXTRA_SLOT.__set__(manifest, _OnePairExtra(("smuggled", "value")))
     with pytest.raises(ValidationError):  # an unknown field is still refused
         validate_portable_manifest(manifest)
+
+
+# ---- rendering a refusal never re-reads caller objects: errors are value-free and bounded
+
+
+class _CountingEndlessExtra(Mapping):
+    """An extra-storage view of well-formed pairs that never ends; counts every read."""
+
+    def __init__(self) -> None:
+        self.reads = 0
+
+    def __getitem__(self, key):
+        return key
+
+    def __len__(self) -> int:
+        return 1
+
+    def _next(self) -> int:
+        self.reads += 1
+        if self.reads > 2_000_000:  # a guard for the unfixed tree: never reached when bounded
+            raise RuntimeError("kept reading")
+        return self.reads
+
+    def __iter__(self):
+        while True:
+            yield f"name_{self._next()}"
+
+    def items(self):
+        return ((f"name_{n}", n) for n in iter(self._next, -1))
+
+
+def _render_everything(error: ValidationError) -> None:
+    import time
+
+    started = time.monotonic()
+    for render in (str, repr):
+        assert len(render(error)) < 20_000
+    assert len(error.json()) < 20_000
+    error.errors()
+    assert time.monotonic() - started < 5
+
+
+def test_rendering_a_refused_model_never_reads_its_extra_view_again() -> None:
+    manifest = validate_portable_manifest(valid_manifest()).model_copy(deep=True)
+    extra = _CountingEndlessExtra()
+    _PYDANTIC_EXTRA_SLOT.__set__(manifest, extra)
+    with pytest.raises(ValidationError) as raised:
+        validate_portable_manifest(manifest)
+    after_validation = extra.reads
+    _render_everything(raised.value)
+    assert extra.reads == after_validation, f"rendering read {extra.reads - after_validation} more entries"
+
+
+def test_an_ordinary_refusal_still_names_the_field_and_the_error_type() -> None:
+    document = valid_manifest()
+    document["manifest_id"] = 5
+    with pytest.raises(ValidationError) as raised:
+        validate_portable_manifest(document)
+    details = raised.value.errors()
+    assert any(error["loc"][:1] == ("manifest_id",) for error in details)
+    assert all("type" in error for error in details)
+    assert "manifest_id" in str(raised.value)
