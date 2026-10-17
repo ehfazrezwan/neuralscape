@@ -7,11 +7,11 @@ and internally current while its last successful upstream verification is old.
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from enum import Enum
-from typing import Sequence
+from typing import Annotated, Sequence
 
-from pydantic import AwareDatetime, Field, model_validator
+from pydantic import AfterValidator, AwareDatetime, Field, model_validator
 
 from contracts_common import ContractModel, OpaqueId, VersionedContract, snapshot_contract_graph
 from contracts_references import ReferenceHandle, SourceVersion
@@ -59,6 +59,50 @@ class ProjectionStatus(str, Enum):
     UNKNOWN = "unknown"
 
 
+_DATETIME_PARTS = (
+    datetime.year, datetime.month, datetime.day, datetime.hour, datetime.minute, datetime.second,
+    datetime.microsecond,
+)
+_TIMEDELTA_PARTS = (timedelta.days, timedelta.seconds, timedelta.microseconds)
+
+
+def pin_datetime(value: object) -> object:
+    """A caller-owned aware ``datetime`` as a plain one with a fixed offset, its zone asked exactly once.
+
+    The offset is read through the built-in accessor (a ``datetime`` subclass's own ``utcoffset`` is never
+    called) and rebuilt as an exact ``timedelta`` from its base fields (a ``timedelta`` subclass's arithmetic is
+    never run); the fields are read through the built-in descriptors.  Every later comparison is then between
+    plain values, so a zone that answers differently on a later read, or fails on it, cannot split validation
+    from the check that follows.  A failing or unusable zone is a value error.  Anything that is not a
+    ``datetime``, and a naive one, is returned unchanged for validation to refuse.
+    """
+
+    if not any(base is datetime for base in vars(type)["__mro__"].__get__(type(value))):
+        return value
+    try:
+        offset = datetime.utcoffset(value)  # type: ignore[arg-type]
+        if offset is None:
+            return value
+        exact = timedelta(*(part.__get__(offset, timedelta) for part in _TIMEDELTA_PARTS))
+        fields = [part.__get__(value, datetime) for part in _DATETIME_PARTS]
+        return datetime(*fields, tzinfo=timezone(exact))
+    except Exception:
+        raise ValueError("a datetime must have a usable UTC offset") from None
+
+
+def _pin_validated(value: datetime) -> datetime:
+    """Pin a datetime pydantic has just accepted as aware (a zone that now reports no offset is refused)."""
+
+    pinned = pin_datetime(value)
+    if type(pinned) is not datetime or pinned.tzinfo is None:
+        raise ValueError("a datetime must have a usable UTC offset")
+    return pinned
+
+
+PinnedAwareDatetime = Annotated[AwareDatetime, AfterValidator(_pin_validated)]
+"""An aware datetime stored as a plain fixed-offset one, so no later check can see a different instant."""
+
+
 def _instant_after(left: datetime, right: datetime) -> bool:
     """Whether ``left`` is a later instant than ``right``, read without leaving the datetime range.
 
@@ -68,14 +112,10 @@ def _instant_after(left: datetime, right: datetime) -> bool:
     the difference of two offsets cannot.  Each offset is read once.
     """
 
-    offsets = []
-    for value in (left, right):
-        offset = value.utcoffset()
-        if not isinstance(offset, timedelta):
-            raise ValueError("a datetime must have a usable UTC offset")
-        offsets.append(offset)
-    wall = left.replace(tzinfo=None) - right.replace(tzinfo=None)
-    return wall - (offsets[0] - offsets[1]) > timedelta(0)
+    pinned = [pin_datetime(value) for value in (left, right)]
+    if not all(type(value) is datetime and value.tzinfo is not None for value in pinned):
+        raise ValueError("a datetime must have a usable UTC offset")
+    return pinned[0] > pinned[1]  # plain aware datetimes with fixed offsets compare by instant
 
 
 class SourceCheckpoint(VersionedContract):
@@ -93,8 +133,8 @@ class SourceCheckpoint(VersionedContract):
     source: ReferenceHandle
     verification_status: UpstreamVerificationStatus
     verification_method: VerificationMethod
-    observed_at: AwareDatetime
-    last_successful_verification_at: AwareDatetime | None
+    observed_at: PinnedAwareDatetime
+    last_successful_verification_at: PinnedAwareDatetime | None
     provider_revision: OpaqueId | None
     opaque_cursor: OpaqueId | None
     processed_through: OpaqueId | None
@@ -163,7 +203,7 @@ class ProjectionFreshness(ContractModel):
 
     status: ProjectionStatus
     applied_sources: tuple[SourceVersion, ...] = Field(min_length=1)
-    verified_at: AwareDatetime
+    verified_at: PinnedAwareDatetime
 
     @model_validator(mode="after")
     def require_unique_sources(self) -> "ProjectionFreshness":
@@ -325,6 +365,50 @@ def require_native_snapshot(snapshot: object) -> object:
     return snapshot
 
 
+def pin_native_snapshot(snapshot: object) -> object:
+    """A copy of a checked native snapshot with every ``datetime`` leaf pinned (its zone asked once, now).
+
+    ``snapshot_contract_graph`` hands a stored datetime back as the caller's own object, zone included.
+    Replacing each with a plain fixed-offset value here, once and before anything is validated or compared,
+    means no later step can read a different offset.  Iterative; the snapshot is acyclic and its containers
+    are exact ``dict``, ``list`` and ``tuple`` (``require_native_snapshot`` has checked that).
+    """
+
+    order: list[object] = []
+    seen: set[int] = set()
+    stack = [snapshot]
+    while stack:
+        node = stack.pop()
+        kind = type(node)
+        if kind not in _NATIVE_CONTAINERS or id(node) in seen:
+            continue
+        seen.add(id(node))
+        order.append(node)
+        stack.extend(dict.values(node) if kind is dict else node)  # type: ignore[arg-type]
+    rebuilt: dict[int, object] = {}
+
+    pinned: dict[int, tuple[object, object]] = {}  # one datetime object, however often it appears, is read once
+
+    def leaf(value: object) -> object:
+        kind = type(value)
+        if kind is datetime:
+            known = pinned.get(id(value))
+            if known is None:
+                known = pinned[id(value)] = (value, pin_datetime(value))  # the original stays alive: no id reuse
+            return known[1]
+        return rebuilt.get(id(value), value) if kind in _NATIVE_CONTAINERS else value
+
+    for node in reversed(order):  # children before their parents
+        kind = type(node)
+        if kind is dict:
+            rebuilt[id(node)] = {key: leaf(item) for key, item in dict.items(node)}
+        elif kind is list:
+            rebuilt[id(node)] = [leaf(item) for item in node]  # type: ignore[attr-defined]
+        else:
+            rebuilt[id(node)] = tuple(leaf(item) for item in node)  # type: ignore[attr-defined]
+    return leaf(snapshot)
+
+
 def projection_status_for(
     applied_sources: Sequence[SourceVersion],
     required_sources: Sequence[SourceVersion],
@@ -427,6 +511,9 @@ def _version_maps(*sequences: Sequence[SourceVersion]) -> tuple[dict[str, tuple[
 
 __all__ = [
     "FreshnessWitness",
+    "PinnedAwareDatetime",
+    "pin_datetime",
+    "pin_native_snapshot",
     "ProjectionFreshness",
     "ProjectionStatus",
     "allow_native_enums",

@@ -9,7 +9,7 @@ from __future__ import annotations
 from enum import Enum
 from typing import Literal, TypeVar
 
-from pydantic import AwareDatetime, Field, TypeAdapter, model_validator
+from pydantic import Field, TypeAdapter, model_validator
 
 from contracts_common import (
     ContractModel,
@@ -20,10 +20,12 @@ from contracts_common import (
 )
 from contracts_freshness import (
     FreshnessWitness,
+    PinnedAwareDatetime,
     ProjectionStatus,
     UpstreamVerificationStatus,
     VerificationMethod,
     allow_native_enums,
+    pin_native_snapshot,
     projection_status_for,
     require_native_snapshot,
 )
@@ -40,7 +42,7 @@ def _revalidated_snapshot(
 
     try:
         return model_type.model_validate(
-            require_native_snapshot(snapshot_contract_graph(value)),
+            pin_native_snapshot(require_native_snapshot(snapshot_contract_graph(value))),
             strict=True,
         )
     except Exception:
@@ -172,9 +174,9 @@ class ContextRequest(VersionedContract):
     task_intent: str = Field(min_length=1, max_length=8192)
     requested_applicability: ContextApplicability | None
     time_perspective: TimePerspective
-    as_of: AwareDatetime | None
+    as_of: PinnedAwareDatetime | None
     response_budget: SerializedResponseBudget
-    deadline: AwareDatetime
+    deadline: PinnedAwareDatetime
     freshness_requirement: FreshnessRequirement
     prerequisite_receipt: ReferenceHandle | None
 
