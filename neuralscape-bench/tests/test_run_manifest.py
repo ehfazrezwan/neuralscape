@@ -5645,3 +5645,106 @@ def test_many_aborted_nested_validations_cannot_evict_the_outer_validations_read
     )
     assert manifest.started_at == manifest.finished_at  # one object, one reading, however many nested failures
     assert manifest.started_at.utcoffset() == timedelta(hours=-5) and zone.reads == 1
+
+
+# ---- a public subclass shared by many wrappers is discovered once, and a repeated key is refused
+
+class _HiddenBackingTuple(tuple):
+    """A tuple subclass whose public view is empty: its native backing is reachable only defensively."""
+
+    def __iter__(self):
+        return iter(())
+
+
+def test_wrappers_around_one_shared_public_subclass_do_not_rescan_its_hidden_backing(monkeypatch) -> None:
+    shared = _HiddenBackingTuple(range(1_000))
+    counted = [0]
+
+    def counting(original):
+        def wrapper(*args):
+            counted[0] += 1
+            return original(*args)
+        return wrapper
+
+    for name in ("_is_subclass", "_is_instance", "_is_exact_type"):
+        monkeypatch.setattr(run_manifest_module, name, counting(getattr(run_manifest_module, name)))
+
+    def work(wrappers: int) -> int:
+        counted[0] = 0
+        run_manifest_module._freeze_model_graphs(_wrapper_view(lambda: [(shared,) for _ in range(wrappers)]))
+        return counted[0]
+
+    few, many = work(20), work(80)
+    # Each added wrapper costs a constant number of checks; rescanning the 1,000-entry backing for every
+    # wrapper would add about a thousand per wrapper.
+    assert (many - few) / 60 < 100, (few, many)
+
+
+class _PairsMapping(Mapping):
+    """A public mapping whose ``items()`` yields exactly the pairs given, repeats included."""
+
+    def __init__(self, pairs):
+        self.pairs = list(pairs)
+
+    def __iter__(self):
+        return iter(dict(self.pairs))
+
+    def __len__(self):
+        return len(dict(self.pairs))
+
+    def __getitem__(self, key):
+        return dict(self.pairs)[key]
+
+    def items(self):
+        return iter(self.pairs)
+
+
+def _finish_with_resource(resource):
+    return finish_run(
+        planned_manifest(),
+        state=RunState.COMPLETED,
+        started_at=datetime(2026, 9, 28, 8, 0, tzinfo=timezone.utc),
+        finished_at=datetime(2026, 9, 28, 8, 1, tzinfo=timezone.utc),
+        resources=(resource,),
+        measurements=(timing(),),
+    )
+
+
+@pytest.mark.parametrize("pair_order", [(True, 1), (1, True), (5, 7)], ids=["bool-then-int", "int-then-bool", "two-ints"])
+def test_a_repeated_key_in_a_public_mapping_is_refused_not_overwritten(pair_order) -> None:
+    base = measured_memory().model_dump()
+    others = [(key, value) for key, value in base.items() if key != "observed_value"]
+    first, second = pair_order
+    with pytest.raises(ValueError, match="duplicate key"):
+        _finish_with_resource(_PairsMapping(others + [("observed_value", first), ("observed_value", second)]))
+
+
+def test_keys_that_compare_equal_are_a_repeat() -> None:
+    base = measured_memory().model_dump()
+    pairs = [(key, value) for key, value in base.items()] + [(1, "a"), (True, "b")]
+    with pytest.raises(ValueError):
+        _finish_with_resource(_PairsMapping(pairs))
+
+
+def test_a_public_mapping_without_a_repeat_is_still_accepted() -> None:
+    base = measured_memory().model_dump()
+    manifest = _finish_with_resource(_PairsMapping(list(base.items())))
+    assert manifest.resources[0].observed_value == base["observed_value"]
+
+
+def test_a_key_is_hashed_once_when_it_is_stored() -> None:
+    calls: list[int] = []
+
+    class CountedKey(str):
+        def __hash__(self):
+            calls.append(1)
+            return str.__hash__(self)
+
+    base = measured_memory().model_dump()
+    pairs = [(CountedKey(key), value) for key, value in base.items()]
+    try:
+        _finish_with_resource(_PairsMapping(pairs))
+    except (ValueError, TypeError):
+        pass
+    assert len(calls) == len(pairs)   # one hash per stored key: the repeat check adds none of its own
+
