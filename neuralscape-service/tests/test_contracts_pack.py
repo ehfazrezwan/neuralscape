@@ -103,17 +103,35 @@ def test_every_contract_model_in_every_contract_declaring_module_is_registered()
 # ---- non-product modules: an explicit, exact-name exclusion that a product module cannot fall into
 
 
-def _top_level_modules_importing(directory, target: str) -> set[str]:
-    """Top-level modules in ``directory`` that import ``target`` (``import x`` or ``from x import ...``)."""
+# Directories that are not product code: tests, third-party trees, documentation, tooling scripts and caches.
+_NOT_PRODUCT_DIRS = frozenset({"tests", "vendor", "docs", "scripts", "__pycache__", "node_modules"})
+
+
+def _modules_importing(directory, target: str) -> set[str]:
+    """Dotted names of the modules under ``directory`` (packages included) that import ``target``.
+
+    Both ``import x`` and ``from x import ...`` count.  The walk is recursive, so a module inside a package
+    (``memory/write.py`` is ``memory.write``) is seen as well as a top-level file; test, vendored, documentation
+    and script directories, hidden directories and caches are not product code and are skipped.
+    """
 
     importers = set()
-    for path in sorted(directory.glob("*.py")):
+    for path in sorted(directory.rglob("*.py")):
+        relative = path.relative_to(directory)
+        if any(part in _NOT_PRODUCT_DIRS or part.startswith(".") or part.startswith("venv") for part in relative.parts[:-1]):
+            continue
+        parts = list(relative.with_suffix("").parts)
+        if parts[-1] == "__init__":
+            parts.pop()
+        dotted = ".".join(parts)
+        if not dotted:
+            continue
         tree = ast.parse(path.read_text(encoding="utf-8"))
         for node in ast.walk(tree):
-            if isinstance(node, ast.ImportFrom) and node.module == target:
-                importers.add(path.stem)
+            if isinstance(node, ast.ImportFrom) and node.level == 0 and node.module == target:
+                importers.add(dotted)
             elif isinstance(node, ast.Import) and any(alias.name == target for alias in node.names):
-                importers.add(path.stem)
+                importers.add(dotted)
     return importers - {target}
 
 
@@ -155,7 +173,7 @@ def test_only_the_declared_tooling_imports_a_non_product_module() -> None:
     for name, (_reason, importers) in pack.NON_PRODUCT_MODULES.items():
         if importlib.util.find_spec(name) is None:
             continue
-        actual = _top_level_modules_importing(SERVICE_DIR, name)
+        actual = _modules_importing(SERVICE_DIR, name)
         assert actual <= set(importers), f"{name} is imported by {sorted(actual - set(importers))}, which is not declared tooling"
         for importer in importers:
             assert importer not in pack.MODULE_OWNERS
@@ -194,7 +212,46 @@ def test_a_product_module_importing_an_excluded_module_is_detected(tmp_path) -> 
     (tmp_path / "product_feature.py").write_text("from evidence_records import x\n", encoding="utf-8")
     (tmp_path / "other_feature.py").write_text("import evidence_records\n", encoding="utf-8")
     (tmp_path / "unrelated.py").write_text("import json\n", encoding="utf-8")
-    assert _top_level_modules_importing(tmp_path, "evidence_records") == {"product_feature", "other_feature"}
+    assert _modules_importing(tmp_path, "evidence_records") == {"product_feature", "other_feature"}
+
+
+def test_an_importer_inside_a_package_is_reported(tmp_path) -> None:
+    (tmp_path / "evidence_records.py").write_text("x = 1\n", encoding="utf-8")
+    for relative, source in (
+        ("memory/write.py", "from evidence_records import x\n"),
+        ("memory/__init__.py", "import evidence_records\n"),
+        ("extensions/dreaming/deep/job.py", "import evidence_records as ev\n"),
+        ("memory/clean.py", "import json\n"),
+    ):
+        path = tmp_path / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(source, encoding="utf-8")
+    assert _modules_importing(tmp_path, "evidence_records") == {"memory.write", "memory", "extensions.dreaming.deep.job"}
+
+
+def test_tests_vendored_code_scripts_docs_and_caches_are_not_product_importers(tmp_path) -> None:
+    (tmp_path / "evidence_records.py").write_text("x = 1\n", encoding="utf-8")
+    for relative in ("tests/test_x.py", "vendor/lib/mod.py", "scripts/tool.py", "docs/example.py", "__pycache__/c.py", ".venv/lib/m.py", "memory/__pycache__/c.py"):
+        path = tmp_path / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("import evidence_records\n", encoding="utf-8")
+    assert _modules_importing(tmp_path, "evidence_records") == set()
+
+
+def test_a_relative_import_of_a_sibling_is_not_the_top_level_module(tmp_path) -> None:
+    (tmp_path / "evidence_records.py").write_text("x = 1\n", encoding="utf-8")
+    (tmp_path / "memory").mkdir()
+    (tmp_path / "memory" / "evidence_records.py").write_text("y = 1\n", encoding="utf-8")
+    (tmp_path / "memory" / "use.py").write_text("from .evidence_records import y\nfrom . import evidence_records\n", encoding="utf-8")
+    assert _modules_importing(tmp_path, "evidence_records") == set()
+
+
+def test_no_product_package_module_imports_a_non_product_module() -> None:
+    """The live tree, recursively: only the declared tooling imports an excluded module, wherever it lives."""
+
+    for name, (_reason, importers) in pack.NON_PRODUCT_MODULES.items():
+        actual = _modules_importing(SERVICE_DIR, name)
+        assert actual <= set(importers), f"{name} is imported by {sorted(actual - set(importers))}"
 
 
 def test_engine_port_contracts_are_registered_with_the_engines_owner() -> None:
