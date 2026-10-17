@@ -2250,3 +2250,84 @@ def test_member_fields_that_no_reader_acts_on_still_verify(tmp_path, offset, fmt
     path = _write_zip(tmp_path / "b.zip", PAYLOAD)
     _set_central_field(path, offset, fmt, value)  # internal attributes; version made by
     assert verify_bundle(path).ok
+
+
+# --- a streamed member's zip64 size sentinels must be resolved from a zip64 block that carries them ----------
+
+
+def _streamed_zip64_with_local_block(tmp_path, block: bytes) -> Path:
+    """A streamed zip64 bundle whose first payload member's local zip64 block (20 bytes: header + two sizes) is
+    replaced by ``block`` (padded or ended by a filler block so the extra field still tiles)."""
+
+    path = tmp_path / "b.zip"
+    raw = bytearray(_streamed_zip64_bundle(path))
+    offset, length = _local_extra_of(raw, next(iter(PAYLOAD)))
+    assert length == 20 and struct.unpack_from("<HH", raw, offset)[:1] == (0x0001,)
+    assert len(block) == length
+    raw[offset : offset + length] = block
+    path.write_bytes(bytes(raw))
+    return path
+
+
+def _central_sizes(path: Path) -> tuple[int, int]:
+    with zipfile.ZipFile(path) as archive:
+        info = archive.getinfo(next(iter(PAYLOAD)))
+        return info.file_size, info.compress_size
+
+
+def test_a_streamed_member_without_the_zip64_block_its_sentinels_defer_to_is_refused(tmp_path) -> None:
+    # the block's id is changed, so the sentinel sizes have nothing to resolve against
+    path = _streamed_zip64_with_local_block(tmp_path, struct.pack("<HHQQ", 0xCAFE, 16, 0, 0))
+    report = verify_bundle(path)
+    assert not report.ok and pv.ARCHIVE_FRAMING in _codes(report)
+
+
+@pytest.mark.parametrize("size", [0, 8])
+def test_a_streamed_member_whose_zip64_block_is_too_short_for_its_sentinels_is_refused(tmp_path, size) -> None:
+    short = struct.pack("<HH", 0x0001, size) + b"\0" * size  # a zip64 block with fewer bytes than two sizes need
+    filler_data = 20 - len(short) - 4  # so the 20 bytes of the extra field still tile exactly
+    block = short + struct.pack("<HH", 0xCAFE, filler_data) + b"\0" * filler_data
+    path = _streamed_zip64_with_local_block(tmp_path, block)
+    report = verify_bundle(path)
+    assert not report.ok and pv.ARCHIVE_FRAMING in _codes(report)
+
+
+def test_a_streamed_member_whose_zip64_sizes_disagree_with_the_directory_is_refused(tmp_path) -> None:
+    path = _streamed_zip64_with_local_block(tmp_path, struct.pack("<HHQQ", 0x0001, 16, 12_345, 678))
+    report = verify_bundle(path)
+    assert not report.ok and pv.ARCHIVE_FRAMING in _codes(report)
+
+
+def test_a_streamed_member_with_placeholder_or_matching_zip64_sizes_still_verifies(tmp_path) -> None:
+    placeholder = _streamed_zip64_with_local_block(tmp_path, struct.pack("<HHQQ", 0x0001, 16, 0, 0))
+    assert verify_bundle(placeholder).ok
+    uncompressed, compressed = _central_sizes(placeholder)
+    matching = _streamed_zip64_with_local_block(tmp_path, struct.pack("<HHQQ", 0x0001, 16, uncompressed, compressed))
+    assert verify_bundle(matching).ok
+
+
+# --- case folding can produce decomposed text: aliases are compared after folding and normalizing again -------
+
+
+def _folded_entries(*names: str):
+    return [pv._Entry(name, 1, "file", None) for name in names]
+
+
+def test_names_that_are_aliases_only_after_case_folding_are_a_collision() -> None:
+    first, second = "ΐ.txt", "Ϊ́.txt"  # dialytika-tonos, and capital iota with dialytika and tonos
+    assert first != second
+    report = pv.VerificationReport()
+    pv._collision_checks(_folded_entries(first, second), report)
+    assert pv.CASE_COLLISION in _codes(report)
+
+
+def test_an_ancestor_that_is_an_alias_of_a_file_only_after_case_folding_is_a_conflict() -> None:
+    report = pv.VerificationReport()
+    pv._collision_checks(_folded_entries("ΐ", "Ϊ́/inner.txt"), report)
+    assert pv.PATH_CONFLICT in _codes(report)
+
+
+def test_distinct_names_are_still_not_collisions() -> None:
+    report = pv.VerificationReport()
+    pv._collision_checks(_folded_entries("ΐ.txt", "ι.txt", "a/b.txt", "a/c.txt", "straße.txt", "strasse2.txt"), report)
+    assert not {pv.CASE_COLLISION, pv.PATH_CONFLICT, pv.DUPLICATE_ENTRY} & set(_codes(report))

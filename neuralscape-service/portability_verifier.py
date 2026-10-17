@@ -175,7 +175,12 @@ class _Entry:
 
 
 def _fold(name: str) -> str:
-    return unicodedata.normalize("NFC", name).casefold()
+    """The key under which two names are aliases: canonical caseless matching (normalize, fold, normalize,
+    fold, normalize).  Case folding can produce decomposed text, so a single normalization before it misses
+    names that only become equal afterwards."""
+
+    folded = unicodedata.normalize("NFD", name).casefold()
+    return unicodedata.normalize("NFD", unicodedata.normalize("NFD", folded).casefold())
 
 
 def _safe_label(value: str) -> str:
@@ -361,20 +366,18 @@ def _local_record_end(raw: BinaryIO, info: zipfile.ZipInfo, start_dir: int) -> i
     if flags != info.flag_bits or method != info.compress_type:
         raise _Framing("local and central flags or method differ")
 
+    # A size at its sentinel is resolved from the zip64 block before anything else is decided, streamed or not:
+    # the block must exist and carry every size the header defers to it.
+    if csize == _U32_MAX or usize == _U32_MAX:
+        zip64_usize, zip64_csize = _zip64_local_sizes(extra, usize == _U32_MAX, csize == _U32_MAX)
+        if usize == _U32_MAX:
+            usize = zip64_usize
+        if csize == _U32_MAX:
+            csize = zip64_csize
     if not flags & _FLAG_DESCRIPTOR:
-        if csize == _U32_MAX or usize == _U32_MAX:
-            zip64_usize, zip64_csize = _zip64_local_sizes(
-                extra, usize == _U32_MAX, csize == _U32_MAX
-            )
-            if usize == _U32_MAX:
-                usize = zip64_usize
-            if csize == _U32_MAX:
-                csize = zip64_csize
         if (crc, csize, usize) != (info.CRC, info.compress_size, info.file_size):
             raise _Framing("local and central CRC or sizes differ")
-    elif (csize, usize) not in ((0, 0), (info.compress_size, info.file_size)) and not (
-        csize == _U32_MAX or usize == _U32_MAX
-    ):
+    elif (csize, usize) not in ((0, 0), (info.compress_size, info.file_size)):
         raise _Framing("local sizes conflict with the central directory")
     elif crc not in (0, info.CRC):
         # A streamed member's local CRC is a placeholder (zero) or the real one, never anything else.
