@@ -1663,3 +1663,57 @@ def test_rewriting_the_file_in_place_after_the_precheck_cannot_change_what_is_pa
 
 def test_an_untouched_archive_is_unchanged_by_the_pinned_parse(tmp_path) -> None:
     assert verify_bundle(_write_zip(tmp_path / "b.zip", PAYLOAD)).ok
+
+
+# --- the path argument is copied to exact text once; a str or bytes subclass cannot redirect the verifier ----
+
+
+def _good_and_corrupt_bundles(tmp_path):
+    good = _write_dir(tmp_path / "good", PAYLOAD)
+    bad = _write_dir(tmp_path / "bad", PAYLOAD)
+    (bad / "canonical" / "records.jsonl").write_bytes(b"tampered")  # size and digest no longer match
+    assert verify_bundle(good).ok and not verify_bundle(bad).ok
+    return good, bad
+
+
+def test_a_bytes_subclass_path_cannot_make_the_verifier_read_another_bundle(tmp_path) -> None:
+    good, bad = _good_and_corrupt_bundles(tmp_path)
+
+    class Redirecting(bytes):
+        def decode(self, *args, **kwargs):  # answers with the good bundle's path
+            return str(good)
+
+    assert not verify_bundle(Redirecting(os.fsencode(bad))).ok  # names the corrupt bundle: refused, not "ok"
+
+
+def test_a_str_subclass_path_cannot_make_the_verifier_read_another_bundle(tmp_path) -> None:
+    good, bad = _good_and_corrupt_bundles(tmp_path)
+
+    class Redirecting(str):
+        def endswith(self, *args, **kwargs):
+            return True
+
+        def rstrip(self, *args, **kwargs):
+            return str(good)
+
+    assert not verify_bundle(Redirecting(str(bad))).ok
+
+
+def test_a_pathlike_is_asked_for_its_path_once_and_verified_by_that_text(tmp_path) -> None:
+    good, bad = _good_and_corrupt_bundles(tmp_path)
+    asked = []
+
+    class Flipping:
+        def __fspath__(self):
+            asked.append(1)
+            return str(bad) if len(asked) == 1 else str(good)
+
+    assert not verify_bundle(Flipping()).ok
+    assert len(asked) == 1
+
+
+def test_ordinary_paths_still_verify_in_every_form(tmp_path) -> None:
+    good, _ = _good_and_corrupt_bundles(tmp_path)
+    zipped = _write_zip(tmp_path / "b.zip", PAYLOAD)
+    assert verify_bundle(good).ok and verify_bundle(str(good)).ok and verify_bundle(os.fsencode(good)).ok
+    assert verify_bundle(zipped).ok and verify_bundle(str(zipped)).ok and verify_bundle(os.fsencode(zipped)).ok

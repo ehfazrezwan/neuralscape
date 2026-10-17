@@ -887,7 +887,7 @@ def _precheck_central_directory(target: str | os.PathLike[str] | BinaryIO, repor
 
     if isinstance(target, (str, bytes, os.PathLike)):
         try:
-            with open(target, "rb") as opened:
+            with open(_exact_path(target), "rb") as opened:
                 return _precheck_central_directory(opened, report)
         except OSError:
             report.add(CONTAINER_UNREADABLE, "<bundle>")
@@ -1026,6 +1026,21 @@ class _PinnedTail:
         pass
 
 
+def _exact_path(path: "str | bytes | os.PathLike[str] | os.PathLike[bytes]") -> str:
+    """The path argument as exact text, copied once with the base types' own methods.
+
+    ``os.fspath`` asks a path-like object once (its own ``__fspath__``); the result may be a ``str`` or
+    ``bytes`` subclass whose ``endswith``, ``rstrip`` or ``decode`` is caller code that could answer with
+    another bundle's path, so it is copied to an exact ``str`` without running any method of the
+    subclass.  Every later use is of the copy.
+    """
+
+    target = os.fspath(path)
+    if issubclass(type(target), str):
+        return str.__str__(target)
+    return bytes.decode(target, sys.getfilesystemencoding(), sys.getfilesystemencodeerrors())  # type: ignore[arg-type]
+
+
 def _root_name(target: str | bytes) -> str:
     """The bundle path without trailing directory spellings (``alias/``, ``alias//``, ``alias/.``).
 
@@ -1034,7 +1049,7 @@ def _root_name(target: str | bytes) -> str:
     real component is checked and opened instead (``/`` and ``.`` themselves are left alone).
     """
 
-    text = os.fsdecode(target)
+    text = target if type(target) is str else _exact_path(target)
     while True:
         if len(text) > 1 and text.endswith("/"):
             text = text.rstrip("/") or "/"
@@ -1061,7 +1076,7 @@ def verify_bundle(path: str | os.PathLike[str]) -> VerificationReport:
     """
 
     report = VerificationReport()
-    target = os.fspath(path)
+    target = _exact_path(path)  # exact text, copied once: every use below is of this copy
     # The root is judged and opened by the name of its last real component: a trailing ``/`` or ``/.``
     # makes the kernel (and ``islink``) follow a link there.  An archive keeps the path as spelled, so a
     # file named with a trailing slash is still not a readable archive.
