@@ -723,3 +723,86 @@ def test_a_noncanonical_enum_in_either_argument_makes_the_predicates_false(where
     assert bundle_matches_reported_evidence(request, bundle) is False
     receipt = _validate(ContextAssemblyReceipt, _receipt())
     assert receipt_matches_bundle(receipt, _validate(ContextBundle, _bundle())) in (True, False)  # control: callable
+
+
+# ---- a key's label in a diagnostic is fixed or bounded, and a pin must succeed before it is cached
+
+
+class _ZoneWithHostileText(tzinfo):
+    """Fixed offset, but its repr and str are caller code that raises (and counts)."""
+
+    texts = 0
+
+    def utcoffset(self, dt):
+        return timedelta(0)
+
+    def dst(self, dt):
+        return None
+
+    def __repr__(self):
+        _ZoneWithHostileText.texts += 1
+        raise RuntimeError("caller zone repr")
+
+    __str__ = __repr__
+
+
+@pytest.mark.parametrize(
+    "build",
+    [
+        lambda key: {key: {"x": object()}},
+        lambda key: {key: {object(): 1}},
+        lambda key: {key: {key: [object()]}},
+        lambda key: {"a": [{key: {"b": object()}}]},
+    ],
+    ids=["value-beneath", "key-beneath", "two-levels", "nested-in-a-list"],
+)
+def test_a_datetime_key_is_labelled_without_running_its_zone_text(build) -> None:
+    from contracts_freshness import require_native_snapshot
+
+    key = datetime(2026, 1, 1, tzinfo=_ZoneWithHostileText())
+    _ZoneWithHostileText.texts = 0
+    with pytest.raises(ValueError) as caught:
+        require_native_snapshot(build(key))
+    assert _ZoneWithHostileText.texts == 0
+    assert "unsupported" in str(caught.value) and len(str(caught.value)) < 400
+
+
+def test_other_native_key_kinds_keep_a_short_label_and_a_huge_int_key_is_bounded() -> None:
+    from contracts_freshness import require_native_snapshot
+
+    for key, shown in ((True, "True"), (None, "None"), (7, "7"), (1.5, "1.5"), ("name", "'name'")):
+        with pytest.raises(ValueError, match=r"unsupported value type at \$\[" + shown.replace(".", r"\.") + r"\]"):
+            require_native_snapshot({key: object()})
+    with pytest.raises(ValueError) as caught:
+        require_native_snapshot({10**5000: object()})
+    assert len(str(caught.value)) < 400 and "unsupported value type" in str(caught.value)
+
+
+class _NoOffsetOnce(tzinfo):
+    """The first offset read answers ``None``; every later one answers +3 h."""
+
+    reads = 0
+
+    def utcoffset(self, dt):
+        _NoOffsetOnce.reads += 1
+        return None if _NoOffsetOnce.reads == 1 else timedelta(hours=3)
+
+    def dst(self, dt):
+        return None
+
+
+def test_pinning_a_snapshot_refuses_a_zone_that_reported_no_offset_at_the_pin() -> None:
+    zone = _NoOffsetOnce()
+    when = datetime(2026, 1, 1, 8, 0, tzinfo=zone)
+    _NoOffsetOnce.reads = 0
+    with pytest.raises(ValueError, match="usable UTC offset"):
+        pin_native_snapshot({"a": when, "b": [when]})
+    assert _NoOffsetOnce.reads == 1  # asked once; the unusable answer is never cached as a result
+
+
+def test_pinning_still_passes_a_naive_datetime_on_to_validation_and_pins_a_good_one() -> None:
+    naive = datetime(2026, 1, 1, 8, 0)
+    good = datetime(2026, 1, 1, 8, 0, tzinfo=timezone(timedelta(hours=1)))
+    out = pin_native_snapshot({"n": naive, "g": good})
+    assert out["n"] is naive  # refused later by validation, as before
+    assert type(out["g"]) is datetime and type(out["g"].tzinfo) is timezone and out["g"] == good

@@ -353,6 +353,36 @@ _PATH_LIMIT = 200
 _KEY_SHOWN = 40
 
 
+_INT_LABEL_BITS = 128
+
+
+def _label_text(label: object) -> str:
+    """A short label for a key or position, built with the base types' own methods only.
+
+    A key is an exact native scalar, but its text can still run caller code (a ``datetime``'s zone has its own
+    ``repr``) or be very large (an ``int`` with thousands of digits), and a message is built while the value is
+    being refused.  Text is cut and quoted by ``str``, integers and floats use their base ``repr`` (a huge integer
+    is named by its size), and a datetime or anything else is a fixed word.
+    """
+
+    kind = type(label)
+    if kind is str:
+        text = str.__getitem__(label, slice(0, _KEY_SHOWN))
+        return str.__repr__(text) + ("..." if str.__len__(label) > _KEY_SHOWN else "")
+    if kind is bool:
+        return "True" if label is True else "False"
+    if kind is type(None):
+        return "None"
+    if kind is int:
+        bits = int.bit_length(label)  # type: ignore[arg-type]
+        return f"<int of {bits} bits>" if bits > _INT_LABEL_BITS else int.__repr__(label)  # type: ignore[arg-type]
+    if kind is float:
+        return float.__repr__(label)  # type: ignore[arg-type]
+    if kind is datetime:
+        return "<datetime key>"
+    return "<key>"
+
+
 def _trail_path(trail: list[tuple[int, object]], index: int, tail: str = "") -> str:
     """The path to a record in ``trail`` (exact text keys and integer positions only), shortened for a message."""
 
@@ -361,10 +391,8 @@ def _trail_path(trail: list[tuple[int, object]], index: int, tail: str = "") -> 
         parent, label = trail[index]
         if parent < 0:
             parts.append("$")  # the root of the snapshot
-        elif type(label) is str:
-            parts.append(f"[{label[:_KEY_SHOWN]!r}{'...' if len(label) > _KEY_SHOWN else ''}]")
         else:
-            parts.append(f"[{label!r}]")  # an integer position, or an exact native scalar key
+            parts.append(f"[{_label_text(label)}]")
         index = parent
     text = "".join(reversed(parts)) + tail
     return text if len(text) <= _PATH_LIMIT else text[:_PATH_LIMIT] + "..."
@@ -439,7 +467,12 @@ def pin_native_snapshot(snapshot: object) -> object:
         if kind is datetime:
             known = pinned.get(id(value))
             if known is None:
-                known = pinned[id(value)] = (value, pin_datetime(value))  # the original stays alive: no id reuse
+                result = pin_datetime(value)
+                if datetime.tzinfo.__get__(value) is not None and not _is_pinned(result):
+                    # a zone that is there but reported no offset at the pin: never kept as the result, or a later
+                    # read of the caller's zone could accept what was unusable when captured
+                    raise ValueError("a datetime must have a usable UTC offset")
+                known = pinned[id(value)] = (value, result)  # the original stays alive: no id reuse
             return known[1]
         return rebuilt.get(id(value), value) if is_container(kind) else value
 
