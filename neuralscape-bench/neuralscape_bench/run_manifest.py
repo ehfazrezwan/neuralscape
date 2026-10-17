@@ -348,7 +348,7 @@ _TIMESTAMP_PINS: ContextVar[dict[int, tuple[datetime, datetime]] | None] = Conte
 # open (a TypeAdapter, or a model that nests RunManifest, does not run RunManifest's own __init__ or
 # model_validate).  Fields are validated in declaration order, so finished_at of the same manifest
 # reuses the reading if it is the same datetime object; the slot is cleared once finished_at is done
-# (both fields validate their defaults, and a before-validator on finished_at empties it whether or not
+# (both fields validate their defaults, and a wrap step on finished_at (Python input) empties it whether or not
 # the value is valid, so a rejected validation leaves nothing behind).
 _PENDING_STARTED_AT: ContextVar[tuple[datetime, datetime] | None] = ContextVar(
     "_PENDING_STARTED_AT", default=None
@@ -453,7 +453,9 @@ class RunManifest(_ManifestContract):
             fixed = _exact_datetime(value, timezone(_exact_offset(offset)))
             if pins is not None:
                 pins[id(value)] = (value, fixed)
-            elif info.field_name == "started_at":
+            elif info.field_name == "started_at" and info.mode == "python":
+                # Only Python input is paired (the emptying step is installed for it alone); a JSON value is a
+                # new object each time, so nothing is held for it.
                 _PENDING_STARTED_AT.set((value, fixed))
             return fixed
         except ValueError:

@@ -5451,3 +5451,45 @@ def test_json_validation_is_unaffected_by_the_pairing_step():
     again = RunManifest.model_validate_json(serialize_run_manifest(manifest))
     assert again == manifest
     assert pydantic.TypeAdapter(RunManifest).validate_json(serialize_run_manifest(manifest)) == manifest
+
+
+# ---- JSON validation never fills the pairing slot, so no input mode leaves anything behind
+
+
+def _pending_slot():
+    from neuralscape_bench.run_manifest import _PENDING_STARTED_AT
+
+    return _PENDING_STARTED_AT.get()
+
+
+@pytest.mark.parametrize("entry", ["model_validate_json", "type_adapter_validate_json"])
+@pytest.mark.parametrize("outcome", ["valid", "rejected"])
+def test_json_validation_leaves_the_pairing_slot_empty(entry, outcome):
+    manifest = completed_manifest()
+    text = serialize_run_manifest(manifest)
+    if outcome == "rejected":
+        document = json.loads(text)
+        document["finished_at"] = "not a date"
+        text = json.dumps(document)
+    run = (
+        (lambda: RunManifest.model_validate_json(text))
+        if entry == "model_validate_json"
+        else (lambda: pydantic.TypeAdapter(RunManifest).validate_json(text))
+    )
+    if outcome == "valid":
+        run()
+    else:
+        with pytest.raises(ValidationError):
+            run()
+    assert _pending_slot() is None
+
+
+def test_the_pairing_slot_is_empty_after_every_python_outcome_too():
+    for bad in (object(), "x", datetime(2026, 10, 1, 9, 0)):
+        data = completed_manifest().model_dump()
+        data["finished_at"] = bad
+        with pytest.raises((ValidationError, ValueError)):
+            pydantic.TypeAdapter(RunManifest).validate_python(data)
+        assert _pending_slot() is None
+    pydantic.TypeAdapter(RunManifest).validate_python(completed_manifest().model_dump())
+    assert _pending_slot() is None
