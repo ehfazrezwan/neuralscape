@@ -4624,24 +4624,32 @@ def _statement_with_proxy_resource_and_extra(resource_id: str, flip_to: str | No
     return value, backing
 
 
-def _outcome(make_policy) -> str:
-    try:
-        return evaluate(principal(), "read", reference("memory-1"), make_policy()).outcome
-    except ValidationError:
-        return "refused"
+def _policy_with_native_statements(*statements) -> AccessPolicy:
+    """The statements sit in the policy's own tuple: built first, then tampered, so entry discovery sees them."""
+
+    policy_value = policy(statement("seed", "allow", "read", reference("other")))
+    object.__setattr__(policy_value, "statements", tuple(statements))
+    return policy_value
+
+
+def _decide(policy_value) -> str:
+    return evaluate(principal(), "read", reference("memory-1"), policy_value).outcome
 
 
 def test_a_public_iterator_only_statement_cannot_have_its_resource_rewritten_by_its_extra_mapping() -> None:
     entry_visible, _ = _statement_with_proxy_resource_and_extra("other", "memory-1")
     public_only, backing = _statement_with_proxy_resource_and_extra("other", "memory-1")
 
-    assert _outcome(lambda: policy(entry_visible)) != "allow"
-    assert _outcome(lambda: _policy_with_public_only_statements(public_only)) != "allow"  # was "allow": id flipped first
+    expected = _decide(_policy_with_native_statements(entry_visible))
+    assert expected == "deny"  # the entry-visible statement keeps its original resource: no match
+    assert _decide(_policy_with_public_only_statements(public_only)) == expected  # was "allow": the id flipped first
     assert backing["id"] == "memory-1"  # the callback did run; the captured resource was already frozen
 
 
-def test_a_public_iterator_only_statement_with_an_honest_extra_mapping_is_evaluated_as_written() -> None:
-    honest, _ = _statement_with_proxy_resource_and_extra("memory-1", None)
-    assert _outcome(lambda: _policy_with_public_only_statements(honest)) in {"allow", "refused"}
+def test_a_public_iterator_only_statement_with_an_honest_extra_mapping_is_still_granted() -> None:
+    honest_entry, _ = _statement_with_proxy_resource_and_extra("memory-1", None)
+    honest_public, _ = _statement_with_proxy_resource_and_extra("memory-1", None)
+    assert _decide(_policy_with_native_statements(honest_entry)) == "allow"
+    assert _decide(_policy_with_public_only_statements(honest_public)) == "allow"  # valid grants survive lazy discovery
     other, _ = _statement_with_proxy_resource_and_extra("other", None)
-    assert _outcome(lambda: _policy_with_public_only_statements(other)) != "allow"
+    assert _decide(_policy_with_public_only_statements(other)) == "deny"
