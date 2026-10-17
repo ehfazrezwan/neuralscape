@@ -608,6 +608,7 @@ def test_snapshot_contract_graph_exposes_hidden_cross_tenant_target() -> None:
             "id": "artifact-1",
             "tenant_id": "tenant-2",
             "resolver": "resolve_artifact",
+            "cross_tenant": False,
         },
     )
     assert target_refs.iteration_calls == 1
@@ -2312,6 +2313,7 @@ def test_native_and_json_representations_preserve_values() -> None:
         "id": " Edge/01 ",
         "tenant_id": "Tenant-A",
         "resolver": "graph_resolve",
+        "cross_tenant": False,  # additive marker, default False
     }
     assert ReferenceHandle.model_validate_json(handle.model_dump_json()) == handle
 
@@ -2328,7 +2330,8 @@ def test_generated_json_schemas_are_closed_and_express_bounds() -> None:
     source_schema = SourceVersion.model_json_schema()
 
     assert reference_schema["additionalProperties"] is False
-    assert reference_schema["required"] == ["kind", "id", "tenant_id", "resolver"]
+    assert reference_schema["required"] == ["kind", "id", "tenant_id", "resolver"]  # cross_tenant is optional (default False)
+    assert reference_schema["properties"]["cross_tenant"]["default"] is False
     assert set(reference_schema["properties"]["kind"]["enum"]) == set(
         get_args(ReferenceKind)
     )
@@ -3730,6 +3733,7 @@ def test_a_height_found_late_inside_late_extras_reaches_the_outer_model_and_its_
     siblings = [hidden, outer] if hidden_first else [outer, hidden]
     with pytest.raises(ValueError, match="budget"):
         snapshot_contract_graph(siblings)
+
 
 # ---- the enum-annotation helper runs on every supported Python (on 3.10 ``list[int]`` is an instance of ``type``)
 

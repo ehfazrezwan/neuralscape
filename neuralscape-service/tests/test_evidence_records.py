@@ -93,6 +93,25 @@ def test_a_partial_tail_and_an_invalid_line_are_reported_not_hidden(tmp_path) ->
     assert read.invalid_lines == (2, 3) and read.partial_tail is True
 
 
+@pytest.mark.parametrize("field", ["subject_ref", "note"])
+def test_invalid_utf8_inside_a_field_is_an_invalid_line_not_a_silent_replacement(tmp_path, field) -> None:
+    writer = ev.EvidenceWriter(tmp_path / "e.jsonl")
+    writer.write(record("r1"))
+    damaged = record("r2", **{field: "abcdef"}).model_dump_json().encode().replace(b"abcdef", b"abc\xffdef")
+    with open(writer.path, "ab") as handle:
+        handle.write(damaged + b"\n")
+    read = writer.read()
+    assert [item.record_id for item in read.records] == ["r1"]   # not a record whose field holds U+FFFD
+    assert read.invalid_lines == (2,) and read.partial_tail is False
+
+
+def test_valid_non_ascii_text_is_still_read(tmp_path) -> None:
+    writer = ev.EvidenceWriter(tmp_path / "e.jsonl")
+    writer.write(record("r1", note="caf\u00e9 \u2713"))
+    read = writer.read()
+    assert [item.note for item in read.records] == ["caf\u00e9 \u2713"] and read.invalid_lines == ()
+
+
 # ---- cleanup deletes only recorded ids
 
 def test_cleanup_deletes_only_the_manifest_ids() -> None:
