@@ -1661,6 +1661,42 @@ def test_rewriting_the_file_in_place_after_the_precheck_cannot_change_what_is_pa
     assert not report.ok  # and the change itself is refused
 
 
+def test_bytes_appended_in_place_after_the_precheck_are_a_framing_change(tmp_path, monkeypatch) -> None:
+    path = _write_zip(tmp_path / "b.zip", PAYLOAD)
+    assert verify_bundle(path).ok
+    real_precheck = pv._precheck_central_directory
+
+    def precheck_then_append(source, report):
+        accepted = real_precheck(source, report)
+        with open(path, "ab") as writer:  # same inode, the checked bytes untouched, only the size changes
+            writer.write(b"trailing bytes")
+        return accepted
+
+    monkeypatch.setattr(pv, "_precheck_central_directory", precheck_then_append)
+    report = verify_bundle(path)
+    assert not report.ok
+    assert (pv.ARCHIVE_FRAMING, "file changed during verification") in [
+        (item.code, item.detail) for item in report.findings
+    ]
+
+
+def test_a_file_touched_in_place_after_the_precheck_is_a_framing_change(tmp_path, monkeypatch) -> None:
+    path = _write_zip(tmp_path / "b.zip", PAYLOAD)
+    real_precheck = pv._precheck_central_directory
+
+    def precheck_then_touch(source, report):
+        accepted = real_precheck(source, report)
+        stat = os.stat(path)
+        os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 5_000_000_000))  # content and size untouched
+        return accepted
+
+    monkeypatch.setattr(pv, "_precheck_central_directory", precheck_then_touch)
+    report = verify_bundle(path)
+    assert [(item.code, item.detail) for item in report.findings] == [
+        (pv.ARCHIVE_FRAMING, "file changed during verification")
+    ]
+
+
 def test_an_untouched_archive_is_unchanged_by_the_pinned_parse(tmp_path) -> None:
     assert verify_bundle(_write_zip(tmp_path / "b.zip", PAYLOAD)).ok
 
