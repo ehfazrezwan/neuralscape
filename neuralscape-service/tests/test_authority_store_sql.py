@@ -630,29 +630,62 @@ def test_enforce_mode_end_to_end_on_the_real_app(sqlite_backend, monkeypatch) ->
         policy_enforcement.configure(None)
 
 
-def test_a_new_sqlite_authority_database_is_readable_by_its_owner_only(tmp_path) -> None:
-    """It holds invite hashes, credential secret hashes and the credential pepper."""
+# ---- the SQLite authority database holds secrets: owner-only file modes
 
+
+def _mode(path) -> int:
     import os
     import stat
 
-    old = os.umask(0o022)
+    return stat.S_IMODE(os.stat(path).st_mode)
+
+
+def test_a_new_authority_database_and_its_wal_files_are_owner_only(tmp_path):
+    import os
+
+    from authority_store_sql import SqliteAuthorityStore
+
+    previous = os.umask(0o022)  # the usual umask would make a plain create world-readable
     try:
-        store = SqliteAuthorityStore(str(tmp_path / "authority.db"))
-        store.add_subject("sub_a", "tenant-a", "human", "cred-a")  # writes the WAL too
-        modes = {p.name: stat.S_IMODE(p.stat().st_mode) for p in tmp_path.iterdir()}
-        store.close()
+        path = tmp_path / "authority.db"
+        store = SqliteAuthorityStore(str(path))
+        try:
+            for suffix in ("", "-wal", "-shm"):
+                target = f"{path}{suffix}"
+                assert os.path.exists(target), target
+                assert _mode(target) == 0o600, (suffix, oct(_mode(target)))
+        finally:
+            store.close()
     finally:
-        os.umask(old)
-    assert modes and all(mode & 0o077 == 0 for mode in modes.values()), {k: oct(v) for k, v in modes.items()}
+        os.umask(previous)
 
 
-def test_an_existing_database_keeps_its_own_mode(tmp_path) -> None:
+def test_an_existing_looser_authority_database_is_tightened_on_open(tmp_path):
     import os
-    import stat
+
+    from authority_store_sql import SqliteAuthorityStore
 
     path = tmp_path / "authority.db"
     SqliteAuthorityStore(str(path)).close()
-    os.chmod(path, 0o640)  # an operator's deliberate choice is not changed on reopen
+    for suffix in ("", "-wal", "-shm"):
+        if os.path.exists(f"{path}{suffix}"):
+            os.chmod(f"{path}{suffix}", 0o644)
+    store = SqliteAuthorityStore(str(path))
+    try:
+        for suffix in ("", "-wal", "-shm"):
+            if os.path.exists(f"{path}{suffix}"):
+                assert _mode(f"{path}{suffix}") == 0o600, suffix
+    finally:
+        store.close()
+
+
+def test_an_owner_only_database_is_left_as_it_is(tmp_path):
+    import os
+
+    from authority_store_sql import SqliteAuthorityStore
+
+    path = tmp_path / "authority.db"
+    path.touch(mode=0o600)
+    os.chmod(path, 0o400 | 0o200)
     SqliteAuthorityStore(str(path)).close()
-    assert stat.S_IMODE(path.stat().st_mode) == 0o640
+    assert _mode(path) == 0o600

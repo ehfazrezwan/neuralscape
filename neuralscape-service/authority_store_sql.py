@@ -28,8 +28,10 @@ import contextlib
 import hashlib
 import hmac
 import json
+import logging
 import os
 import sqlite3
+import stat
 import threading
 import time
 from collections.abc import Callable, Iterator, Sequence
@@ -1521,19 +1523,6 @@ class SqlAuthorityStore:
             return body(c)
 
 
-def _create_private(path: str) -> None:
-    """Create a new database file readable by its owner only (SQLite gives its WAL and shared-memory
-    files the database file's mode).  An existing file, or an in-memory database, is left as it is."""
-
-    if not path or path == ":memory:" or path.startswith("file:"):
-        return
-    try:
-        descriptor = os.open(path, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
-    except FileExistsError:
-        return
-    os.close(descriptor)
-
-
 def _ident(name: str, value: object) -> str:
     """An identifier accepted identically by every backend.
 
@@ -1556,6 +1545,37 @@ def _load_delegation(text: str | None) -> DelegationConstraints | None:
     return None if text is None else DelegationConstraints.model_validate_json(text)
 
 
+_logger = logging.getLogger(__name__)
+_SQLITE_SIDECARS = ("", "-wal", "-shm", "-journal")
+
+
+def _owner_only(path: str) -> None:
+    """Create the database file owner-only if it is missing, and tighten it and its sidecars if looser.
+
+    The authority database holds invite and credential secret hashes and the credential pepper.  SQLite
+    creates its WAL and shared-memory files with the database file's mode, so the main file is created
+    0600 before the first connection; files left looser by an earlier version are tightened here.
+    """
+
+    if path == ":memory:" or path.startswith("file:"):
+        return
+    try:
+        descriptor = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)  # 0600 & ~umask when it is created now
+        os.close(descriptor)
+    except OSError:
+        return  # let sqlite report the path
+    for suffix in _SQLITE_SIDECARS:
+        target = path + suffix
+        try:
+            mode = stat.S_IMODE(os.stat(target).st_mode)
+            if mode & 0o077:
+                os.chmod(target, mode & 0o700)
+        except FileNotFoundError:
+            continue
+        except OSError:
+            _logger.warning("the authority database file %s could not be made owner-only", target)
+
+
 class SqliteAuthorityStore(SqlAuthorityStore):
     """Embedded profile: one owning host, local disk, WAL, ``synchronous=FULL``."""
 
@@ -1571,7 +1591,7 @@ class SqliteAuthorityStore(SqlAuthorityStore):
         busy_timeout_ms: int = 30_000,
     ) -> None:
         super().__init__(clock)
-        _create_private(path)
+        _owner_only(path)
         self._conn = sqlite3.connect(
             path, isolation_level=None, timeout=busy_timeout_ms / 1000, check_same_thread=False
         )
@@ -1586,6 +1606,7 @@ class SqliteAuthorityStore(SqlAuthorityStore):
         self._rconn = sqlite3.connect(
             path, isolation_level=None, timeout=busy_timeout_ms / 1000, check_same_thread=False
         )
+        _owner_only(path)  # sidecars left looser by an earlier version (new ones follow the main file)
         self._rconn.execute("PRAGMA query_only=ON")
         self._rconn.execute(f"PRAGMA busy_timeout={int(busy_timeout_ms)}")
 
