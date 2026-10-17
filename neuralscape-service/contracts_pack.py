@@ -312,8 +312,12 @@ def _inline(
     budget: list[int] | None = None,
     named: bool = False,
     root: object = None,
+    bare: bool = False,
 ) -> object:
     """``value`` with every reference expanded (a cycle becomes a marker), so equality sees through refs.
+
+    ``bare`` leaves annotations out at every schema position (never inside literal data or as a name), for
+    judgements that a documentation-only edit must not decide.
 
     A ``#/$defs`` reference expands to its definition; any other local pointer (``#``, ``#/properties/n``)
     to the node it names in ``root``, the document it is written in.  An anchor, a reference to another
@@ -332,11 +336,11 @@ def _inline(
         raise _TooLarge
     _charge_walk()  # each expansion has its own limit, but repeated expansions spend the shared budget
     if isinstance(value, list):
-        return [_inline(item, defs, stack, budget, root=root) for item in value]
+        return [_inline(item, defs, stack, budget, root=root, bare=bare) for item in value]
     if not isinstance(value, dict):
         return value
     if named:
-        return {key: _inline(item, defs, stack, budget, root=root) for key, item in value.items()}
+        return {key: _inline(item, defs, stack, budget, root=root, bare=bare) for key, item in value.items()}
     if "$cycle" in value:
         raise _TooLarge  # written in the schema, it could pass for a cut cycle: not shown equal
     if _DYNAMIC_REFERENCES & value.keys():
@@ -347,12 +351,14 @@ def _inline(
     def inline_members(members: dict) -> dict:
         out = {}
         for key, item in members.items():
+            if bare and key in _ANNOTATIONS:
+                continue  # documentation (or a definitions table) never decides this judgement
             if key in _LITERAL_KEYWORDS:
                 out[key] = item
             elif key in _SCHEMA_MAPS and isinstance(item, dict):
-                out[key] = _inline(item, defs, stack, budget, named=True, root=root)
+                out[key] = _inline(item, defs, stack, budget, named=True, root=root, bare=bare)
             else:
-                out[key] = _inline(item, defs, stack, budget, root=root)
+                out[key] = _inline(item, defs, stack, budget, root=root, bare=bare)
         return out
 
     if "$ref" not in value:
@@ -368,7 +374,7 @@ def _inline(
     if name in stack:
         return {"$cycle": name, **rest}
     target = defs[name] if not name.startswith("\0") else _pointer_target(root, ref)
-    return {"$ref": _inline(target, defs, stack + (name,), budget, root=root), **rest}
+    return {"$ref": _inline(target, defs, stack + (name,), budget, root=root, bare=bare), **rest}
 
 
 class _FindingRepr(reprlib.Repr):
@@ -736,7 +742,7 @@ def _roots_equal() -> bool:
     return run.roots_equal
 
 
-def _same(old: object, new: object, old_defs: dict, new_defs: dict) -> bool:
+def _same(old: object, new: object, old_defs: dict, new_defs: dict, bare: bool = False) -> bool:
     if old is _ABSENT or new is _ABSENT:
         return old is new  # absence equals no JSON value
     # A pointer inside either side (``#``, ``#/properties/n``) points into that side's own document, which
@@ -756,7 +762,7 @@ def _same(old: object, new: object, old_defs: dict, new_defs: dict) -> bool:
         old_root, new_root = run.roots[::-1] if run.reversed else run.roots
     try:
         # Otherwise compare what each side points at, each in its own document.
-        return _json_equal(_inline(old, old_defs, root=old_root), _inline(new, new_defs, root=new_root))
+        return _json_equal(_inline(old, old_defs, root=old_root, bare=bare), _inline(new, new_defs, root=new_root, bare=bare))
     except (_TooLarge, RecursionError):
         return False  # too large, too deep or not resolvable: not shown equal
 
@@ -969,10 +975,27 @@ def _unevaluated_node_same(old: object, new: object, old_defs: dict, new_defs: d
         drop = _ANNOTATIONS | {"$id"} if any(schema is root for root in roots) else _ANNOTATIONS
         return {k: v for k, v in schema.items() if k not in drop}
 
-    same = _same(bare(old), bare(new), old_defs, new_defs)
+    same = _same(bare(old), bare(new), old_defs, new_defs, bare=True)  # annotations aside, at the targets too
     if run is not None:
         run.unevaluated[key] = (old, new, same)  # the nodes are kept, so their ids are their own for the run
     return same
+
+
+def _beside_context_guard(
+    written_old: object, written_new: object, besides: tuple, old_defs: dict, new_defs: dict, path: str, out: list[str]
+) -> None:
+    """Unchanged constraints beside a reference that may depend on its target: an unevaluated keyword or a
+    keyword the checker does not understand.  If so, the written pair is judged with references expanded
+    (annotations aside), and any change is not verified."""
+
+    unevaluated = any(_UNEVALUATED & set(beside) for beside in besides)
+    sensitive = sorted({key for beside in besides for key in _sibling_sensitive(beside)})
+    if not (unevaluated or sensitive) or _unevaluated_node_same(written_old, written_new, old_defs, new_defs):
+        return
+    if unevaluated:
+        out.append(_unverified(path, "a schema with unevaluatedProperties or unevaluatedItems changed"))
+    if sensitive:
+        out.append(_unverified(path, f"a schema with a keyword not modelled ({', '.join(sensitive[:3])}) changed around it"))
 
 
 def _unevaluated_guard(old: object, new: object, old_defs: dict, new_defs: dict, path: str, out: list[str]) -> None:
@@ -1036,6 +1059,10 @@ def _compare(
         # already being compared is assumed compatible, but only for its target, never for siblings.
         if not _same(_beside(old), _beside(new), old_defs, new_defs):
             out.append(_unverified(path, "constraints beside a $ref changed"))
+        else:
+            # Before the recursion shortcut below: an unchanged keyword beside a recursive reference may still
+            # depend on its (changed) target.
+            _beside_context_guard(old, new, (_beside(old), _beside(new)), old_defs, new_defs, path, out)
         # An assumption belongs to one direction and one pair of definition sets: the reverse comparison
         # of the same references (new against old, definitions swapped) is a different question.
         pair = (str(old["$ref"]), str(new["$ref"]), id(old_defs), id(new_defs))
@@ -1056,18 +1083,7 @@ def _compare(
         # next to ``$ref``) would be dropped; a change in them is not verified.
         out.append(_unverified(path, "constraints beside a $ref changed"))
     elif old_beside or new_beside:
-        # Constraints beside a reference in the chain are unchanged, but they may depend on the target.
-        besides = (*old_beside, *new_beside)
-        sensitive = sorted({key for beside in besides for key in _sibling_sensitive(beside)})
-        if (any(_UNEVALUATED & set(beside) for beside in besides) or sensitive) and not _unevaluated_node_same(
-            written_old, written_new, old_defs, new_defs
-        ):
-            if any(_UNEVALUATED & set(beside) for beside in besides):
-                # An unevaluated keyword depends on what the targets evaluate.
-                out.append(_unverified(path, "a schema with unevaluatedProperties or unevaluatedItems changed"))
-            if sensitive:
-                # A keyword not understood beside a reference may depend on the target, as on the target itself.
-                out.append(_unverified(path, f"a schema with a keyword not modelled ({', '.join(sensitive[:3])}) changed around it"))
+        _beside_context_guard(written_old, written_new, (*old_beside, *new_beside), old_defs, new_defs, path, out)
     if old is not written_old or new is not written_new:
         _unevaluated_guard(old, new, old_defs, new_defs, path, out)  # the reference's target carries its own
     if isinstance(old, dict) and isinstance(new, dict) and old.get("$ref") == "#" and new.get("$ref") == "#":
