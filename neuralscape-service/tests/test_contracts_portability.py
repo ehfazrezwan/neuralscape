@@ -4864,3 +4864,61 @@ def test_bidirectional_and_c1_control_characters_in_a_name_are_refused(name) -> 
 @pytest.mark.parametrize("name", ["café.txt", "日本語/ファイル.txt", "emoji-👨‍👩.txt", "a b.txt"])
 def test_ordinary_international_names_are_still_accepted(name) -> None:
     assert normalize_bundle_path(name) == name
+
+
+# ---- a refusal keeps only bounded exact text and never the caller's exception or its rendering
+
+class _HostileError(ValueError):
+    renders = 0
+
+    def __str__(self) -> str:
+        type(self).renders += 1
+        return "SECRET-RENDERING " + "x" * 10_000_000
+
+    __repr__ = __str__
+
+
+def _manifest_with_a_raising_view(error: BaseException):
+    class Exploding(list):
+        def __iter__(self):
+            raise error
+
+    manifest = validate_portable_manifest(valid_manifest()).model_copy(deep=True)
+    dict.__setitem__(_PYDANTIC_DICT_DESCRIPTOR.__get__(manifest, BaseModel), "files", Exploding([manifest.files[0]]))
+    return manifest
+
+
+def test_a_refusal_never_renders_a_caller_exception_or_chains_it() -> None:
+    import traceback
+
+    _HostileError.renders = 0
+    manifest = _manifest_with_a_raising_view(_HostileError("hostile"))
+    with pytest.raises(ValidationError) as raised:
+        validate_portable_manifest(manifest)
+    assert _HostileError.renders == 0  # its __str__ never ran, before or after the cap
+    cause = raised.value.__cause__
+    assert type(cause) is ValueError and len(str(cause)) < 200 and "SECRET" not in str(cause)  # a fixed, exact text
+    rendered = "".join(traceback.format_exception(raised.value))
+    assert "SECRET" not in rendered and "_HostileError" not in rendered and len(rendered) < 20_000
+    assert _HostileError.renders == 0  # nor did rendering the traceback
+
+
+def test_a_builtin_error_with_an_exact_text_keeps_a_bounded_copy_of_it() -> None:
+    manifest = _manifest_with_a_raising_view(ValueError("failing because of " + "y" * 50_000))
+    with pytest.raises(ValidationError) as raised:
+        validate_portable_manifest(manifest)
+    cause = raised.value.__cause__
+    assert type(cause) is ValueError and str(cause).startswith("failing because of ") and len(str(cause)) <= 1_100
+
+
+def test_our_own_refusals_keep_their_exact_message() -> None:
+    from contracts_limits import DISCOVERY_BUDGET_MESSAGE as budget_message
+
+    manifest = validate_portable_manifest(valid_manifest()).model_copy(deep=True)
+    deep: list = []
+    for _ in range(400):
+        deep = [deep]
+    dict.__setitem__(_PYDANTIC_DICT_DESCRIPTOR.__get__(manifest, BaseModel), "files", deep)
+    with pytest.raises(ValidationError) as raised:
+        validate_portable_manifest(manifest)
+    assert str(raised.value.__cause__) == budget_message

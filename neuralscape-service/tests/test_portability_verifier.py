@@ -2507,3 +2507,49 @@ def test_the_zip64_helpers_write_the_compression_they_claim(tmp_path) -> None:
     for path in (forced, streamed):
         with zipfile.ZipFile(path) as archive:
             assert {info.compress_type for info in archive.infolist()} == {zipfile.ZIP_DEFLATED}
+
+
+# --- parent directories that differ only in case collide whether or not the container has records for them ----
+
+
+def _zip_of(tmp_path, files: dict[str, bytes], *, directory_records: bool = False) -> Path:
+    path = tmp_path / "b.zip"
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr("manifest.json", json.dumps(_manifest(files)))
+        if directory_records:
+            for directory in sorted({name.rsplit("/", 1)[0] + "/" for name in files if "/" in name}):
+                archive.writestr(zipfile.ZipInfo(directory), b"")
+        for name, data in files.items():
+            archive.writestr(name, data)
+    return path
+
+
+@pytest.mark.parametrize("records", [False, True], ids=["implicit-parents", "directory-records"])
+@pytest.mark.parametrize(
+    "names",
+    [("A/one.txt", "a/two.txt"), ("a/B/x.txt", "a/b/y.txt"), ("Ünï/a.txt", "ünï/b.txt")],
+)
+def test_parent_directories_that_differ_only_in_case_are_a_collision_either_way(tmp_path, records, names) -> None:
+    path = _zip_of(tmp_path, {name: b"x" for name in names}, directory_records=records)
+    report = verify_bundle(path)
+    assert not report.ok and pv.CASE_COLLISION in _codes(report), [(f.code, f.path) for f in report.findings]
+
+
+def test_parent_directories_that_differ_only_in_case_collide_in_a_directory_bundle(tmp_path) -> None:
+    files = {"A/one.txt": b"x", "a/two.txt": b"x"}
+    root = tmp_path / "bundle"
+    root.mkdir()
+    (root / "manifest.json").write_text(json.dumps(_manifest(files)))
+    for name, data in files.items():
+        (root / name).parent.mkdir(exist_ok=True)
+        (root / name).write_bytes(data)
+    if len({entry.name for entry in root.iterdir()}) < 3:
+        pytest.skip("the file system folds case: the two parents are one directory")
+    report = verify_bundle(root)
+    assert not report.ok and pv.CASE_COLLISION in _codes(report)
+
+
+@pytest.mark.parametrize("records", [False, True])
+def test_shared_and_distinct_parents_are_not_collisions(tmp_path, records) -> None:
+    files = {"a/one.txt": b"x", "a/two.txt": b"x", "a/b/three.txt": b"x", "c/four.txt": b"x"}
+    assert verify_bundle(_zip_of(tmp_path, files, directory_records=records)).ok

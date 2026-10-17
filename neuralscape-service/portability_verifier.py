@@ -47,7 +47,7 @@ import unicodedata
 import zipfile
 import zlib
 from dataclasses import dataclass, field
-from typing import Any, BinaryIO, Iterator, NamedTuple, Sequence
+from typing import Any, BinaryIO, Iterable, Iterator, NamedTuple, Sequence
 
 from pydantic import ValidationError
 
@@ -725,6 +725,36 @@ def _collision_checks(entries: list[_Entry], report: VerificationReport) -> None
         other = seen_folded.setdefault(folded, name)
         if other != name:
             report.add(CASE_COLLISION, _safe_label(name))
+    _parent_collisions(seen_exact, report)
+
+
+def _parent_collisions(names: Iterable[str], report: VerificationReport) -> None:
+    """Parent directories that differ only in case or normalization, whether or not the container has records
+    for them: ``A/one.txt`` and ``a/two.txt`` are as much a collision as the same inventory with ``A/`` and
+    ``a/`` listed, so an optional directory record can never change the verdict.  The names are walked once
+    through a trie of folded components (linear in their total length); only parent components are judged
+    here, the final components having been compared as whole names above."""
+
+    trie: dict[str, tuple[str, dict]] = {}
+    reported: set[str] = set()
+    folded: dict[str, str] = {}  # a component is folded once, however many names share it
+    for name in names:
+        node = trie
+        parts = name.split("/")
+        for depth, part in enumerate(parts[:-1]):
+            key = folded.get(part)
+            if key is None:
+                key = folded[part] = _fold(part)
+            known = node.get(key)
+            if known is None:
+                known = node[key] = (part, {})
+            elif known[0] != part:
+                parent = "/".join(parts[: depth + 1])
+                if parent not in reported:
+                    reported.add(parent)
+                    report.add(CASE_COLLISION, _safe_label(parent), "parent directories differ only in case")
+                # judged once; the walk continues under the first spelling so deeper levels are still compared
+            node = known[1]
 
 
 def _zip_member_chunks(info: zipfile.ZipInfo, raw: BinaryIO) -> Iterator[bytes]:

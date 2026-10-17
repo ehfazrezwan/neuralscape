@@ -1103,13 +1103,35 @@ def _renderable_input(value: Any) -> Any:
     return _OMITTED_INPUT
 
 
-def _refusal(cause: BaseException) -> ValidationError:
-    text = str(cause)
-    bounded = ValueError(text if len(text) <= _MAX_REFUSAL_TEXT else text[:_MAX_REFUSAL_TEXT] + "...")
-    return ValidationError.from_exception_data(
+_BUILTIN_REFUSAL_ERRORS = (TypeError, ValueError, RecursionError)
+_UNREADABLE_INPUT = "contract input could not be read"
+
+
+def _bounded_cause(cause: BaseException) -> ValueError:
+    """A fresh, bounded stand-in for an exception met while reading the input.
+
+    The exception can come from a supported public iterator, so ``str(cause)`` would run caller-controlled
+    rendering before any cap.  Only an exception of exactly a built-in type whose single argument is exactly
+    ``str`` is quoted, cut at the cap; anything else gets a fixed text.
+    """
+
+    text = _UNREADABLE_INPUT
+    if any(type(cause) is kind for kind in _BUILTIN_REFUSAL_ERRORS):
+        arguments = cause.args
+        if len(arguments) == 1 and type(arguments[0]) is str:
+            text = arguments[0]
+            if len(text) > _MAX_REFUSAL_TEXT:
+                text = text[:_MAX_REFUSAL_TEXT] + "..."
+    return ValueError(text)
+
+
+def _refusal(cause: BaseException) -> tuple[ValidationError, ValueError]:
+    bounded = _bounded_cause(cause)
+    failure = ValidationError.from_exception_data(
         "PortableManifest",
         [{"type": "value_error", "loc": (), "input": _OMITTED_INPUT, "ctx": {"error": bounded}}],
     )
+    return failure, bounded
 
 
 def validate_portable_manifest(
@@ -1133,21 +1155,21 @@ def validate_portable_manifest(
         except ValidationError as exc:
             failure = _value_free(exc)
         except (TypeError, ValueError, RecursionError) as exc:
-            failure, cause = _refusal(exc), exc
+            failure, cause = _refusal(exc)
     else:
         try:
             candidate = _plain_text_keys(document)
         except ValidationError as exc:
             failure = _value_free(exc)
         except (TypeError, ValueError, RecursionError) as exc:
-            failure, cause = _refusal(exc), exc
+            failure, cause = _refusal(exc)
     if failure is None:
         try:
             return PortableManifest.model_validate(candidate)
         except ValidationError as exc:
             failure = _value_free(exc)
     if cause is not None:
-        raise failure from cause  # the traversal's own bounded error, never caller objects
+        raise failure from cause  # a fresh bounded error: the original exception is never chained or rendered
     raise failure
 
 
