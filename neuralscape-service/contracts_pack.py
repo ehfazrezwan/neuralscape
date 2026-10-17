@@ -246,6 +246,22 @@ def _def_name(ref: object, defs: dict) -> str | None:
 _DYNAMIC_REFERENCES = frozenset({"$dynamicRef", "$recursiveRef"})
 
 
+def _array_index(token: str, length: int) -> int | None:
+    """The array index a JSON pointer token names (RFC 6901: ASCII digits, no leading zero), or ``None``.
+
+    The token's length is checked against the array's before it is read as a number, so a token of thousands
+    of digits never reaches the interpreter's integer-from-text limit; any other digit (``²``, ``٠``) is not
+    an index.
+    """
+
+    if not (token.isascii() and token.isdigit()) or (token != "0" and token.startswith("0")):
+        return None
+    if len(token) > len(str(length)):
+        return None
+    index = int(token)
+    return index if index < length else None
+
+
 def _pointer_target(root: object, ref: str) -> object:
     """The node a local JSON pointer (``#`` or ``#/a/b``) names in ``root``; anything else cannot be resolved."""
 
@@ -260,8 +276,8 @@ def _pointer_target(root: object, ref: str) -> object:
         token = token.replace("~1", "/").replace("~0", "~")
         if isinstance(node, dict) and token in node:
             node = node[token]
-        elif isinstance(node, list) and token.isdigit() and (token == "0" or not token.startswith("0")) and int(token) < len(node):
-            node = node[int(token)]
+        elif isinstance(node, list) and _array_index(token, len(node)) is not None:
+            node = node[_array_index(token, len(node))]
         else:
             raise _TooLarge  # it resolves nowhere
     return node

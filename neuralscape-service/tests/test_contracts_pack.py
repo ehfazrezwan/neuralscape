@@ -2439,3 +2439,39 @@ def test_a_huge_integer_is_named_by_its_size_in_a_finding() -> None:
 def test_multiple_of_compares_huge_integers_exactly(old_step, new_step, narrowed) -> None:
     findings = _pair({"type": "number", "multipleOf": old_step}, {"type": "number", "multipleOf": new_step})
     assert (findings == ["$: multipleOf narrowed"]) is narrowed, findings
+
+
+# ---- a JSON pointer's array token is ASCII digits only, read without the integer-to-text limit
+
+
+def _pointer_token_pair(token: str) -> tuple[dict, dict]:
+    old = {"allOf": [{}], "x-k": {"$ref": f"#/allOf/{token}"}}
+    return old, {**copy.deepcopy(old), "z": 1}  # the documents differ, so the pointer is resolved
+
+
+@pytest.mark.parametrize("token", ["1" * 5000, "²", "٠", "０", "00", "01"], ids=["5000-digits", "superscript", "arabic-indic", "fullwidth", "zeros", "leading-zero"])
+def test_a_pointer_token_that_is_not_a_plain_index_resolves_nowhere(token) -> None:
+    old, new = _pointer_token_pair(token)
+    findings = _pair(old, new)  # reported (not raised, not resolved to index 0)
+    assert any("x-k changed" in f for f in findings), findings
+    assert pack.compare_schemas({"C": old}, {"C": new}).get("C") == findings
+
+
+def test_a_plain_index_token_still_resolves() -> None:
+    old, new = _pointer_token_pair("0")
+    assert not any("x-k changed" in f for f in _pair(old, new))
+
+
+def test_a_value_that_cannot_be_rendered_under_a_lowered_limit_is_still_reported(monkeypatch) -> None:
+    limit = sys.get_int_max_str_digits()
+    sys.set_int_max_str_digits(640)
+    try:
+        findings = _pair({"enum": [10**999, 0]}, {"enum": [0]})
+    finally:
+        sys.set_int_max_str_digits(limit)
+    assert findings == ["$: enum values removed <a value too large to show>"], findings  # the fallback, not a raise
+
+
+def test_an_integer_at_the_text_limit_is_named_by_its_size() -> None:
+    findings = _pair({"enum": [10**4299, 0]}, {"enum": [0]})
+    assert findings == ["$: enum values removed [<integer of about 4300 digits>]"], findings
