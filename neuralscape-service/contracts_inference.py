@@ -9,10 +9,11 @@ from __future__ import annotations
 
 import math
 import re
+from collections.abc import Mapping
 from datetime import date
 from enum import Enum
 from ipaddress import AddressValueError, IPv4Address, IPv6Address
-from typing import Annotated, Any, Literal, Mapping
+from typing import Annotated, Any, Literal
 from uuid import UUID
 
 import idna
@@ -20,6 +21,7 @@ from pydantic import BaseModel, Field, JsonValue, model_validator
 
 from contracts_common import ContractModel, OpaqueId, SafeCounter, VersionedContract
 from contracts_engines import QualificationClaim, _validated_contract_snapshots
+from contracts_native import is_subclass
 from contracts_references import ReferenceHandle, SourceVersion
 
 FiniteNumber = Annotated[float, Field(allow_inf_nan=False)]
@@ -607,45 +609,45 @@ def _jsonschema_types() -> tuple[Any, Any]:
 
 
 def _is_date(value: object) -> bool:
-    if not isinstance(value, str):
+    if not is_subclass(type(value), str):
         return True
     return bool(_DATE_PATTERN.fullmatch(value) and date.fromisoformat(value))
 
 
 def _is_email(value: object) -> bool:
-    if not isinstance(value, str):
+    if not is_subclass(type(value), str):
         return True
     return "@" in value
 
 
 def _is_idn_hostname(value: object) -> bool:
-    if not isinstance(value, str):
+    if not is_subclass(type(value), str):
         return True
     idna.encode(value)
     return True
 
 
 def _is_ipv4(value: object) -> bool:
-    if not isinstance(value, str):
+    if not is_subclass(type(value), str):
         return True
     return bool(IPv4Address(value))
 
 
 def _is_ipv6(value: object) -> bool:
-    if not isinstance(value, str):
+    if not is_subclass(type(value), str):
         return True
     address = IPv6Address(value)
     return not getattr(address, "scope_id", "")
 
 
 def _is_regex(value: object) -> bool:
-    if not isinstance(value, str):
+    if not is_subclass(type(value), str):
         return True
     return bool(re.compile(value))
 
 
 def _is_time(value: object) -> bool:
-    if not isinstance(value, str):
+    if not is_subclass(type(value), str):
         return True
     match = _TIME_PATTERN.fullmatch(value)
     if match is None:
@@ -666,7 +668,7 @@ def _is_time(value: object) -> bool:
 
 
 def _is_uuid(value: object) -> bool:
-    if not isinstance(value, str):
+    if not is_subclass(type(value), str):
         return True
     UUID(value)
     return all(value[position] == "-" for position in (8, 13, 18, 23))
@@ -704,7 +706,7 @@ def _reject_unknown_schema_semantics(
     validator_class: Any,
     location: str = "$",
 ) -> None:
-    if isinstance(schema, bool):
+    if is_subclass(type(schema), bool):
         return
     declared_dialect = schema.get("$schema")
     if "$schema" in schema and declared_dialect != JSON_SCHEMA_DIALECT:
@@ -732,27 +734,27 @@ def _reject_unknown_schema_semantics(
         if keyword not in known:
             raise ValueError(f"unsupported output schema keyword at {location}: {keyword}")
         if keyword == "format" and (
-            not isinstance(value, str)
+            not is_subclass(type(value), str)
             or value not in _SUPPORTED_OUTPUT_SCHEMA_FORMATS
         ):
             raise ValueError(f"unsupported output schema format at {location}: {value}")
-        if keyword in _SCHEMA_CONTAINER_KEYWORDS and isinstance(value, Mapping):
+        if keyword in _SCHEMA_CONTAINER_KEYWORDS and is_subclass(type(value), Mapping):
             for name, nested in value.items():
-                if isinstance(nested, (bool, Mapping)):
+                if is_subclass(type(nested), (bool, Mapping)):
                     _reject_unknown_schema_semantics(
                         nested,
                         validator_class,
                         f"{location}/{keyword}/{name}",
                     )
-        elif keyword in _SCHEMA_SINGLE_KEYWORDS and isinstance(value, (bool, Mapping)):
+        elif keyword in _SCHEMA_SINGLE_KEYWORDS and is_subclass(type(value), (bool, Mapping)):
             _reject_unknown_schema_semantics(
                 value,
                 validator_class,
                 f"{location}/{keyword}",
             )
-        elif keyword in _SCHEMA_ARRAY_KEYWORDS and isinstance(value, list):
+        elif keyword in _SCHEMA_ARRAY_KEYWORDS and is_subclass(type(value), list):
             for index, nested in enumerate(value):
-                if isinstance(nested, (bool, Mapping)):
+                if is_subclass(type(nested), (bool, Mapping)):
                     _reject_unknown_schema_semantics(
                         nested,
                         validator_class,
@@ -763,17 +765,17 @@ def _reject_unknown_schema_semantics(
 def _validate_json_value(value: JsonValue, location: str = "$") -> None:
     """Reject JSON values that cannot cross the finite UTF-8 wire boundary."""
 
-    if isinstance(value, str):
+    if is_subclass(type(value), str):
         try:
             value.encode("utf-8")
         except UnicodeEncodeError as exc:
             raise ValueError(f"invalid Unicode JSON string at {location}") from exc
-    if isinstance(value, float) and not math.isfinite(value):
+    if is_subclass(type(value), float) and not math.isfinite(value):
         raise ValueError(f"non-finite JSON number at {location}")
-    if isinstance(value, list):
+    if is_subclass(type(value), list):
         for index, item in enumerate(value):
             _validate_json_value(item, f"{location}/{index}")
-    elif isinstance(value, dict):
+    elif is_subclass(type(value), dict):
         for index, (key, item) in enumerate(value.items()):
             _validate_json_value(key, f"{location}/key/{index}")
             _validate_json_value(item, f"{location}/value/{index}")

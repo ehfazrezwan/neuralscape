@@ -16,6 +16,7 @@ from pydantic import BaseModel, TypeAdapter, model_validator
 
 from contracts_common import ContractModel, OpaqueId, VersionedContract
 from contracts_limits import DISCOVERY_BUDGET_MESSAGE, DiscoveryBudget
+from contracts_native import is_subclass
 from contracts_references import ReferenceHandle
 
 
@@ -76,7 +77,7 @@ def _model_storage(descriptor: Any, value: BaseModel) -> Any:
 def _native_set_members(value: set[Any] | frozenset[Any]) -> tuple[Any, ...]:
     """Capture concrete set members without subclass iteration hooks."""
 
-    if issubclass(type(value), set):
+    if is_subclass(type(value), set):
         return tuple(set.__iter__(value))
     return tuple(frozenset.__iter__(value))
 
@@ -85,13 +86,13 @@ def _native_len(value: Any) -> int:
     """Length of a concrete native container without subclass hooks."""
 
     value_type = type(value)
-    if issubclass(value_type, dict):
+    if is_subclass(value_type, dict):
         return dict.__len__(value)
-    if issubclass(value_type, list):
+    if is_subclass(value_type, list):
         return list.__len__(value)
-    if issubclass(value_type, tuple):
+    if is_subclass(value_type, tuple):
         return tuple.__len__(value)
-    if issubclass(value_type, set):
+    if is_subclass(value_type, set):
         return set.__len__(value)
     return frozenset.__len__(value)
 
@@ -121,7 +122,7 @@ def _freeze_native_model_graph(
     while pending:
         current, depth, authoritative = pending.pop()
         current_type = type(current)
-        if not issubclass(current_type, (BaseModel, dict, list, tuple)):
+        if not is_subclass(current_type, (BaseModel, dict, list, tuple)):
             continue
         identity = id(current)
         if not budget.visit(current, depth, authoritative):
@@ -131,7 +132,7 @@ def _freeze_native_model_graph(
         children: tuple[Any, ...] = ()
         children_authoritative = authoritative
 
-        if issubclass(current_type, BaseModel):
+        if is_subclass(current_type, BaseModel):
             frozen = frozen_models.get(identity)
             if frozen is None or frozen.owner is not current:
                 storage = _model_storage(_MODEL_DICT_DESCRIPTOR, current)
@@ -140,8 +141,8 @@ def _freeze_native_model_graph(
                     current,
                 )
                 extras_value = _model_storage(_MODEL_EXTRAS_DESCRIPTOR, current)
-                storage_is_dict = issubclass(type(storage), dict)
-                fields_set_is_set = issubclass(
+                storage_is_dict = is_subclass(type(storage), dict)
+                fields_set_is_set = is_subclass(
                     type(fields_set_value),
                     (set, frozenset),
                 )
@@ -191,7 +192,7 @@ def _freeze_native_model_graph(
                 )
             children = tuple(item for _, item in frozen.stored_items)
         else:
-            if issubclass(current_type, dict):
+            if is_subclass(current_type, dict):
                 kind, exact = "dict", current_type is dict
                 state = frozen_containers.get(identity)
                 if state is None or state.owner is not current:
@@ -202,7 +203,7 @@ def _freeze_native_model_graph(
                     entries = state.entries
                 children = tuple(item for _, item in entries)
             else:
-                if issubclass(current_type, list):
+                if is_subclass(current_type, list):
                     kind, exact = "list", current_type is list
                     reader = list.__iter__
                 else:
@@ -242,7 +243,7 @@ def _normalize_field_names(
     normalized: list[str] = []
     seen: set[str] = set()
     for candidate in names:
-        if not issubclass(type(candidate), str):
+        if not is_subclass(type(candidate), str):
             raise ValueError(
                 f"malformed contract {storage_kind} at {location}: "
                 "field names must be strings"
@@ -321,14 +322,14 @@ def _snapshot_native_value(
         raise ValueError(DISCOVERY_BUDGET_MESSAGE)  # the tier applies to every occurrence, not only to discovery
 
     value_type = type(value)
-    if guard and issubclass(value_type, BaseModel):
+    if guard and is_subclass(value_type, BaseModel):
         # Inside a JSON-valued field a model object would be flattened into a plain mapping and
         # lose its unchecked state, so it is rejected in the same replay that validates the value.
         raise ValueError(f"JSON value contains a model object at {location}")
     if guard and guard_memo is None:
         guard_memo = {}
     table = guard_memo if guard else memo  # a subtree cached outside a JSON field is never reused inside one
-    is_container = issubclass(value_type, (BaseModel, dict, list, tuple))
+    is_container = is_subclass(value_type, (BaseModel, dict, list, tuple))
     identity = id(value)
     if is_container:
         cached = table.get(identity)
@@ -390,7 +391,7 @@ def _snapshot_native_value(
         return copied_item
 
     try:
-        if issubclass(value_type, BaseModel):
+        if is_subclass(value_type, BaseModel):
             frozen = frozen_models[identity]
             if not frozen.storage_is_dict or not frozen.fields_set_is_set:
                 raise ValueError(f"malformed contract model at {location}")
@@ -439,7 +440,7 @@ def _snapshot_native_value(
             result: Any = {
                 name: child(item, f"{location}.{name}", name) for name, item in stored_values
             }
-        elif issubclass(value_type, dict):
+        elif is_subclass(value_type, dict):
             frozen = frozen_containers.get(identity)
             exact = (
                 frozen is not None and frozen.owner is value and frozen.kind == "dict"
@@ -453,13 +454,13 @@ def _snapshot_native_value(
                 # name to the JSON guard: an exact-str-only test would withhold the name.  Its
                 # text is read without running its hooks and stored as a plain str; two keys
                 # that collapse to one name are refused rather than one silently winning.
-                if issubclass(type(key), str):
+                if is_subclass(type(key), str):
                     key = str.__str__(key)
                     if key in result:
                         raise ValueError(f"contract mapping has colliding keys at {location}")
                 result[key] = child(item, f"{location}[key]", key if type(key) is str else None)
-        elif issubclass(value_type, (list, tuple)):
-            is_list = issubclass(value_type, list)
+        elif is_subclass(value_type, (list, tuple)):
+            is_list = is_subclass(value_type, list)
             frozen = frozen_containers.get(identity)
             exact = (
                 frozen is not None
@@ -570,7 +571,7 @@ def _validated_contract_snapshot(
 ) -> _ContractT:
     """Return a fresh, fully validated closed-contract snapshot."""
 
-    if not issubclass(type(value), expected_type):
+    if not is_subclass(type(value), expected_type):
         raise TypeError(f"{label} must be a {expected_type.__name__}")
     frozen_models: dict[int, _FrozenModelState] = {}
     frozen_containers: dict[int, _FrozenContainerState] = {}
@@ -611,7 +612,7 @@ def _validated_contract_snapshot_from_frozen(
 ) -> _ContractT:
     """Validate using entry state already frozen for the enclosing boundary."""
 
-    if not issubclass(type(value), expected_type):
+    if not is_subclass(type(value), expected_type):
         raise TypeError(f"{label} must be a {expected_type.__name__}")
     try:
         native, _, _ = _snapshot_native_value(
@@ -640,7 +641,7 @@ def _validated_contract_tuple(
 ) -> tuple[_ContractT, ...]:
     """Validate a tuple argument without normalizing another container type."""
 
-    if not issubclass(type(values), tuple):
+    if not is_subclass(type(values), tuple):
         raise TypeError(f"{label} must be a tuple")
     frozen_models: dict[int, _FrozenModelState] = {}
     frozen_containers: dict[int, _FrozenContainerState] = {}
@@ -679,7 +680,7 @@ def _validated_contract_tuple_from_frozen(
 ) -> tuple[_ContractT, ...]:
     """Validate a tuple using entry state frozen for the enclosing boundary."""
 
-    if not issubclass(type(values), tuple):
+    if not is_subclass(type(values), tuple):
         raise TypeError(f"{label} must be a tuple")
     frozen = frozen_containers.get(id(values))
     if frozen is not None and frozen.owner is values and frozen.kind == "tuple":
@@ -718,7 +719,7 @@ def _validated_contract_snapshots(
     """
 
     for value, expected_type, label in specs:
-        if not issubclass(type(value), expected_type):
+        if not is_subclass(type(value), expected_type):
             raise TypeError(f"{label} must be a {expected_type.__name__}")
     frozen_models: dict[int, _FrozenModelState] = {}
     frozen_containers: dict[int, _FrozenContainerState] = {}
@@ -902,10 +903,10 @@ def validate_capability_requirements(
     resolve and evaluate the referenced qualification evidence.
     """
 
-    if not issubclass(type(manifest), CapabilityManifest):
+    if not is_subclass(type(manifest), CapabilityManifest):
         raise TypeError("capability manifest must be a CapabilityManifest")
 
-    requirements_is_tuple = issubclass(type(requirements), tuple)
+    requirements_is_tuple = is_subclass(type(requirements), tuple)
     frozen_models: dict[int, _FrozenModelState] = {}
     frozen_containers: dict[int, _FrozenContainerState] = {}
     discovered: dict[int, Any] = {}

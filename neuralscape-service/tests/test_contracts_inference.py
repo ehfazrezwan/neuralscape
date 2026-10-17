@@ -1860,3 +1860,47 @@ def test_the_output_schema_and_the_proposals_share_the_call_allowance():
     validate_generation_result(request, generation_result().model_copy(update={"proposals": _proposals(["x"], 1)}))
     with pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):
         validate_generation_result(request, generation_result().model_copy(update={"proposals": _proposals(flat, 1)}))
+
+
+def test_a_metaclass_hook_cannot_repair_the_result_while_the_request_is_captured(monkeypatch):
+    """Classifying a caller's container type never runs a caller's metaclass hook.
+
+    Under an ABC-based model subclass check (``ABCMeta.__subclasscheck__``, which pydantic releases
+    other than the locked one use), ``issubclass(t, BaseModel)`` walks every model subclass; one whose
+    metaclass defines ``__subclasscheck__`` would run while the request is captured, before the
+    result's entry state is frozen, and could swap an invalid result for a valid one.  The capture
+    classifies types by their own MRO, so no pydantic version can open that window.
+    """
+
+    import abc
+
+    from pydantic._internal._model_construction import ModelMetaclass
+
+    monkeypatch.setattr(ModelMetaclass, "__subclasscheck__", abc.ABCMeta.__subclasscheck__)
+    request = decision_request()
+    result = DecisionResult(
+        schema_version=VERSION,
+        request_id="request-1",
+        head_result=selected(candidate_id="candidate-unknown"),  # invalid for this request
+        attempts=(usage(),),
+    )
+    fired: list[str] = []
+
+    class Sneaky(tuple):
+        pass
+
+    class HookMeta(type(BaseModel)):
+        def __subclasscheck__(cls, subclass):
+            if subclass is Sneaky and not fired:
+                fired.append("hook ran during capture")
+                result.__dict__["head_result"] = selected()  # the repair a hook would attempt
+            return super().__subclasscheck__(subclass)
+
+    class Hooked(BaseModel, metaclass=HookMeta):
+        pass
+
+    request.head.__dict__["candidate_ids"] = Sneaky(request.head.candidate_ids)
+    with pytest.raises(ValueError, match="unknown candidate"):
+        validate_decision_result(request, result)
+    assert fired == []
+    assert Hooked  # kept alive: it must stay among BaseModel's subclasses during the call
