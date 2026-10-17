@@ -83,18 +83,22 @@ def _pin_datetime(value: object) -> object:
     The offset is asked of the caller's ``tzinfo`` a single time (through the built-in accessor) and the
     fields are read through the built-in descriptors, so a ``tzinfo`` or ``datetime`` subclass that answers
     differently on each call cannot give validation one instant and the comparison another.  A
-    ``datetime`` that has no offset on that one read becomes a plain naive ``datetime`` (the caller's
-    zone is dropped, so a later read cannot find an offset that was not there) and validation refuses it.
+    ``datetime`` that has no usable offset on that one read (``None``, a non-offset answer, or an exception
+    from the zone) becomes a plain naive ``datetime`` (the caller's zone is dropped, so a later read cannot
+    find an offset that was not there) and validation refuses it.
     Anything that is not a ``datetime`` is returned unchanged for validation to refuse.
     """
 
     if not _inherits(type(value), datetime):
         return value
-    offset = datetime.utcoffset(value)  # type: ignore[arg-type]
     fields = [part.__get__(value, datetime) for part in _DATETIME_PARTS]
-    if offset is None:
+    try:
+        offset = datetime.utcoffset(value)  # type: ignore[arg-type]
+        return datetime(*fields) if offset is None else datetime(*fields, tzinfo=timezone(offset))
+    except Exception:  # noqa: BLE001 - a tzinfo is caller code: it can raise or answer with a non-offset
+        # No usable offset: the same plain naive value, which validation refuses with a value error
+        # (the contract for a malformed timestamp), instead of the caller's own exception or a TypeError.
         return datetime(*fields)
-    return datetime(*fields, tzinfo=timezone(offset))
 
 
 def _pin_datetimes(value: object, memo: dict[int, tuple[object, object]] | None = None) -> object:

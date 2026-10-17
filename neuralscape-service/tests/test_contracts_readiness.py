@@ -2152,3 +2152,56 @@ def test_an_object_claiming_the_publication_class_is_refused_by_the_gate() -> No
             return TenantReadinessPublication
     with pytest.raises(TypeError, match="publication must be a TenantReadinessPublication"):
         validate_readiness_publication(Spoof(), expected_tenant_id="t", current_placement_generation=1)  # type: ignore[arg-type]
+
+
+# ---- a hostile zone is a value error, never the caller's exception or a TypeError
+
+class _HostileZone(tzinfo):
+    def __init__(self, mode: str) -> None:
+        self.mode, self.armed, self.reads = mode, False, 0
+
+    def utcoffset(self, dt):
+        if not self.armed:
+            return timedelta(0)
+        self.reads += 1
+        if self.mode == "raises":
+            raise RuntimeError("zone trap")
+        return "not an offset"
+
+    def dst(self, dt):
+        return timedelta(0)
+
+    def tzname(self, dt):
+        return "hostile"
+
+
+@pytest.mark.parametrize("mode", ["raises", "non-offset"])
+def test_a_hostile_zone_on_observed_at_is_a_value_error(mode: str) -> None:
+    zone = _HostileZone(mode)
+    item = _fold_observation(datetime(2026, 1, 1, 12, 0, tzinfo=zone))
+    zone.armed = True
+    with pytest.raises(ValidationError):
+        capability_is_ready(item, evaluated_at=datetime(2026, 1, 1, 12, 30, tzinfo=timezone.utc), max_probe_age_seconds=3600)
+    assert zone.reads == 1
+
+
+@pytest.mark.parametrize("mode", ["raises", "non-offset"])
+def test_a_hostile_zone_on_evaluated_at_is_a_value_error(mode: str) -> None:
+    zone = _HostileZone(mode)
+    item = _fold_observation(datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc))
+    evaluated = datetime(2026, 1, 1, 12, 30, tzinfo=zone)
+    zone.armed = True
+    with pytest.raises(ValidationError):
+        capability_is_ready(item, evaluated_at=evaluated, max_probe_age_seconds=3600)
+    assert zone.reads == 1
+
+
+@pytest.mark.parametrize("mode", ["raises", "non-offset"])
+def test_a_hostile_zone_inside_a_publication_is_a_value_error(mode: str) -> None:
+    zone = _HostileZone(mode)
+    item = _fold_observation(datetime(2026, 1, 1, 12, 0, tzinfo=zone))
+    publication = TenantReadinessPublication(schema_version="candidate-v1", tenant_id="t", placement_generation=1, capabilities=(item,))
+    zone.armed = True
+    with pytest.raises(ValidationError):
+        validate_readiness_publication(publication, expected_tenant_id="t", current_placement_generation=1)
+    assert zone.reads == 1
