@@ -3135,3 +3135,96 @@ def test_an_over_limit_regex_value_refuses_the_whole_output_even_inside_a_branch
         {"v": "a" * contracts_inference.MAX_REGEX_CHARACTERS}, v={"anyOf": [{"format": "regex"}, {"type": "string"}]}
     )
     assert validate_generation_result(request, result).compliant  # at the bound it is judged as before
+
+
+# ---- big integers and long strings in data positions of the schema, and unevaluated* in linear time
+
+def test_a_huge_integer_inside_enum_or_const_data_does_not_break_a_discarded_branch(default_int_digit_limit):
+    for data in (
+        {"not": {"enum": [HUGE]}},
+        {"not": {"enum": [[HUGE], {"k": HUGE}]}},
+        {"not": {"const": {"k": [HUGE]}}},
+        {"not": {"const": [HUGE, "x" * 1000]}},
+    ):
+        union = {"anyOf": [data, {"type": "integer"}]}
+        request, result = _generation_with_output({"v": HUGE}, v=union)
+        assert validate_generation_result(request, result).compliant, data
+    # the data still means what it said
+    request, result = _generation_with_output({"v": [HUGE]}, v={"enum": [[HUGE], 3]})
+    assert validate_generation_result(request, result).compliant
+    request, result = _generation_with_output({"v": [HUGE + 1]}, v={"enum": [[HUGE], 3]})
+    with pytest.raises(ValueError, match="does not match declared schema"):
+        validate_generation_result(request, result)
+
+
+def test_data_positions_of_the_executable_schema_are_bounded_and_shared():
+    big = 1 << (8 * 4_096)
+    long_text = "t" * 100_000
+    schema = {**_SCHEMA, "allOf": [{"enum": [[big, long_text, {"k": big}]]}] * 4, "required": [long_text]}
+    executable = contracts_inference._executable_schema(schema)
+    first, last = executable["allOf"][0]["enum"], executable["allOf"][3]["enum"]
+    assert len(repr(first)) < 300 and len(repr(executable["required"])) < 300
+    assert first == [[big, long_text, {"k": big}]]  # equal to the data it copies
+    assert type(first[0][0]) is contracts_inference._LargeInt and first[0][0] is last[0][0]  # copied once
+
+
+def _unevaluated_scan_work(monkeypatch):
+    """Counts the membership scans the evaluated-entry lists of the schema library would be asked for."""
+
+    from jsonschema import _keywords, _utils
+
+    scanned = [0]
+
+    class CountingList(list):
+        def __contains__(self, item):
+            scanned[0] += len(self)
+            return list.__contains__(self, item)
+
+    for module in (_keywords, _utils):
+        for name in ("find_evaluated_item_indexes_by_schema", "find_evaluated_property_keys_by_schema"):
+            original = getattr(module, name, None)
+            if original is not None:
+                monkeypatch.setattr(module, name, lambda *a, _o=original, **k: CountingList(_o(*a, **k)))
+    return scanned
+
+
+@pytest.mark.parametrize(
+    ("keyword", "build"),
+    [
+        ("unevaluatedItems", lambda n: [None] * n),
+        ("unevaluatedProperties", lambda n: {f"k{i}": None for i in range(n)}),
+    ],
+)
+def test_unevaluated_keywords_scan_in_linear_time(monkeypatch, keyword, build):
+    scanned = _unevaluated_scan_work(monkeypatch)
+    schema = {"items": True, keyword: False} if keyword == "unevaluatedItems" else {"properties": {}, keyword: True}
+    for size in (2_000, 4_000, 8_000):
+        _units_spent(schema, build(size))
+    assert scanned[0] == 0, scanned[0]  # it was quadratic: a scan of the evaluated entries for every item or key
+
+
+@pytest.mark.parametrize(
+    ("schema", "instance", "valid"),
+    [
+        ({"items": True, "unevaluatedItems": False}, [1, 2, 3], True),
+        ({"prefixItems": [{"type": "integer"}], "unevaluatedItems": False}, [1, 2], False),
+        ({"prefixItems": [{"type": "integer"}], "unevaluatedItems": {"type": "string"}}, [1, "a"], True),
+        ({"prefixItems": [{"type": "integer"}], "unevaluatedItems": {"type": "string"}}, [1, 2], False),
+        ({"properties": {"a": True}, "unevaluatedProperties": False}, {"a": 1}, True),
+        ({"properties": {"a": True}, "unevaluatedProperties": False}, {"a": 1, "b": 2}, False),
+        ({"properties": {"a": True}, "unevaluatedProperties": {"type": "string"}}, {"a": 1, "b": "x"}, True),
+        ({"allOf": [{"properties": {"a": True}}], "unevaluatedProperties": False}, {"a": 1, "b": 2}, False),
+    ],
+)
+def test_unevaluated_keywords_keep_their_meaning(schema, instance, valid):
+    spent, errors = _units_spent(schema, instance)
+    assert (errors == []) is valid
+    for error in errors:
+        assert len(error.message) < 300
+
+
+def test_an_unevaluated_message_over_a_large_instance_is_short():
+    spent, errors = _units_spent({"properties": {}, "unevaluatedProperties": False}, {f"k{i}": 1 for i in range(5_000)})
+    assert len(errors) == 1 and len(errors[0].message) < 300
+    spent, errors = _units_spent({"prefixItems": [{"type": "integer"}], "unevaluatedItems": False}, [1] * 5_000)
+    assert len(errors) == 1 and len(errors[0].message) < 300

@@ -946,15 +946,17 @@ class _LargeDict(dict):  # type: ignore[type-arg]
         return _brief(self)
 
 
-def _bounded_view(value: object) -> object:
+def _bounded_view(value: object, memo: "dict[int, tuple[object, object, int]] | None" = None) -> object:
     """A copy of an output with every long string and large container replaced by an equal one whose repr
     is short.  jsonschema builds a message quoting the instance whenever a keyword fails, including inside
     anyOf and not where the failure is discarded, so a large instance would otherwise cost its full length
     per application; with this view no message is long and nothing needs refusing for having built one.
     Shared containers are copied once (a value repeated by reference stays repeated), and every original is
-    kept alive by the memo for the copy's lifetime, so its id is its own."""
+    kept alive by the memo for the copy's lifetime, so its id is its own.  A caller that views several values
+    passes one ``memo`` so a value shared among them is copied once."""
 
-    memo: dict[int, tuple[object, object, int]] = {}
+    if memo is None:
+        memo = {}
 
     def walk(item: object) -> tuple[object, int]:
         kind = type(item)
@@ -1206,6 +1208,33 @@ def _metered_validator_class(validator_class: Any, meter: _SchemaExecutionMeter)
             if validator.is_type(instance, "number") and (Fraction(instance) / Fraction(divisor)).denominator != 1:
                 yield SchemaError(f"{_brief(instance)} is not a multiple of {_brief(divisor)}")
 
+    from jsonschema._utils import find_evaluated_item_indexes_by_schema, find_evaluated_property_keys_by_schema
+
+    def unevaluated_items(validator: Any, unevaluated: Any, instance: Any, schema: Any) -> Any:
+        # jsonschema tests each index against a list of evaluated indexes (quadratic in the array); the same
+        # evaluation is used, with a set, and the message does not quote the items.
+        if not validator.is_type(instance, "array"):
+            return
+        evaluated = set(find_evaluated_item_indexes_by_schema(validator, instance, schema))
+        count = sum(1 for index in range(len(instance)) if index not in evaluated)
+        if count:
+            yield SchemaError(f"Unevaluated items are not allowed ({count} unexpected)")
+
+    def unevaluated_properties(validator: Any, unevaluated: Any, instance: Any, schema: Any) -> Any:
+        if not validator.is_type(instance, "object"):
+            return
+        evaluated = set(find_evaluated_property_keys_by_schema(validator, instance, schema))
+        count = 0
+        for name in instance:
+            if name not in evaluated:
+                for _ in validator.descend(instance[name], unevaluated, path=name, schema_path=name):
+                    count += 1
+        if count:
+            if unevaluated is False:
+                yield SchemaError(f"Unevaluated properties are not allowed ({count} unexpected)")
+            else:
+                yield SchemaError(f"Unevaluated properties are not valid under the given schema ({count} unevaluated and invalid)")
+
     jsonschema_format = validator_class.VALIDATORS["format"]
     format_results: dict[tuple[str, str], tuple[str, str | None]] = {}
 
@@ -1231,6 +1260,8 @@ def _metered_validator_class(validator_class: Any, meter: _SchemaExecutionMeter)
         for name, keyword in validator_class.VALIDATORS.items()
     }
     keywords["multipleOf"] = metered(multiple_of)
+    keywords["unevaluatedItems"] = metered(unevaluated_items)
+    keywords["unevaluatedProperties"] = metered(unevaluated_properties)
     keywords["format"] = metered(format_, scans_strings=True)
     keywords["uniqueItems"] = metered(unique_items)
     keywords["enum"] = metered(enum)
@@ -1238,14 +1269,19 @@ def _metered_validator_class(validator_class: Any, meter: _SchemaExecutionMeter)
     return extend(validator_class, keywords)
 
 
-def _executable_schema(schema: Any, root: bool = True, shared: "dict[int, tuple[object, object]] | None" = None) -> Any:
+def _executable_schema(
+    schema: Any, root: bool = True, shared: "dict[int, tuple[object, object, int]] | None" = None
+) -> Any:
     """A copy of the schema without nested ``$schema`` keys, for execution.
 
     jsonschema runs a subschema that declares ``$schema`` on the validator registered for that dialect,
     not on the metered one, so a nested declaration would escape the execution budget.  Nested
     declarations must equal the root dialect (checked earlier), so removing them changes nothing.  Only
-    schema positions are rewritten; data positions (enum, const, default, examples) are kept as they are.
-    A large integer is wrapped once per object (``shared``), however many occurrences of it the schema has.
+    schema positions are rewritten; every other keyword value (enum, const, bounds, names) is data, and is
+    replaced by an equal value whose repr is short (``_bounded_view``): a discarded branch's message quotes
+    the schema it failed, and a large integer in it would raise where the integer-to-text limit applies, a
+    long string or large list would cost its length for every application.  The copy is shared (``shared``),
+    so a value occurring many times is copied once.
     """
 
     if not is_subclass(type(schema), dict):
@@ -1262,11 +1298,8 @@ def _executable_schema(schema: Any, root: bool = True, shared: "dict[int, tuple[
             value = _executable_schema(value, False, shared)
         elif keyword in _SCHEMA_ARRAY_KEYWORDS and is_subclass(type(value), list):
             value = [_executable_schema(nested, False, shared) for nested in value]
-        elif type(value) is int and int.bit_length(value) > _LARGE_INT_BITS:
-            known = shared.get(id(value))  # a bound or divisor that a discarded branch would quote
-            if known is None or known[0] is not value:
-                known = shared[id(value)] = (value, int.__new__(_LargeInt, value))
-            value = known[1]
+        else:
+            value = _bounded_view(value, shared)
         copied[keyword] = value
     return copied
 
