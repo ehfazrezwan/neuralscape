@@ -103,16 +103,18 @@ def test_every_contract_model_in_every_contract_declaring_module_is_registered()
 # ---- non-product modules: an explicit, exact-name exclusion that a product module cannot fall into
 
 
-# Directories that are not product code: tests, third-party trees, documentation, tooling scripts and caches.
-_NOT_PRODUCT_DIRS = frozenset({"tests", "vendor", "docs", "scripts", "__pycache__", "node_modules"})
+# Directories that are not product code: tests, third-party trees, documentation and caches.  ``scripts/`` ships
+# in the runtime image (operator tools), so a script is product code here.
+_NOT_PRODUCT_DIRS = frozenset({"tests", "vendor", "docs", "__pycache__", "node_modules"})
 
 
 def _modules_importing(directory, target: str) -> set[str]:
     """Dotted names of the modules under ``directory`` (packages included) that import ``target``.
 
     Both ``import x`` and ``from x import ...`` count.  The walk is recursive, so a module inside a package
-    (``memory/write.py`` is ``memory.write``) is seen as well as a top-level file; test, vendored, documentation
-    and script directories, hidden directories and caches are not product code and are skipped.
+    (``memory/write.py`` is ``memory.write``) is seen as well as a top-level file, and so is a runtime script
+    (``scripts/tool.py``); test, vendored and documentation directories, hidden directories and caches are
+    not product code and are skipped.
     """
 
     importers = set()
@@ -229,13 +231,21 @@ def test_an_importer_inside_a_package_is_reported(tmp_path) -> None:
     assert _modules_importing(tmp_path, "evidence_records") == {"memory.write", "memory", "extensions.dreaming.deep.job"}
 
 
-def test_tests_vendored_code_scripts_docs_and_caches_are_not_product_importers(tmp_path) -> None:
+def test_tests_vendored_code_docs_and_caches_are_not_product_importers(tmp_path) -> None:
     (tmp_path / "evidence_records.py").write_text("x = 1\n", encoding="utf-8")
-    for relative in ("tests/test_x.py", "vendor/lib/mod.py", "scripts/tool.py", "docs/example.py", "__pycache__/c.py", ".venv/lib/m.py", "memory/__pycache__/c.py"):
+    for relative in ("tests/test_x.py", "vendor/lib/mod.py", "docs/example.py", "__pycache__/c.py", ".venv/lib/m.py", "memory/__pycache__/c.py"):
         path = tmp_path / relative
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("import evidence_records\n", encoding="utf-8")
     assert _modules_importing(tmp_path, "evidence_records") == set()
+
+
+def test_a_script_shipped_in_the_runtime_image_is_a_product_importer(tmp_path) -> None:
+    (tmp_path / "evidence_records.py").write_text("x = 1\n", encoding="utf-8")
+    (tmp_path / "scripts").mkdir()
+    (tmp_path / "scripts" / "tool.py").write_text("import evidence_records\n", encoding="utf-8")
+    (tmp_path / "scripts" / "other.py").write_text("import json\n", encoding="utf-8")
+    assert _modules_importing(tmp_path, "evidence_records") == {"scripts.tool"}
 
 
 def test_a_relative_import_of_a_sibling_is_not_the_top_level_module(tmp_path) -> None:
@@ -1614,3 +1624,48 @@ def test_compare_schemas_reads_the_sets_natively() -> None:
     schema = {"type": "object"}
     assert pack.compare_schemas(Hiding({"A": schema, "B": schema}), {"A": schema}) == {"B": ["contract removed"]}
     assert pack.compare_schemas({"A": schema}, {"A": schema}) == {}
+
+
+# ---- two keys with one text: neither can silently replace the other
+
+
+class _TwinKey(str):
+    """A key whose text is a plain key's text but which hashes and compares apart from it."""
+
+    def __hash__(self) -> int:
+        return hash(("twin", str.__str__(self)))
+
+    def __eq__(self, other: object) -> bool:
+        return self is other
+
+    __ne__ = object.__ne__
+
+
+@pytest.mark.parametrize("twin_last", [True, False])
+def test_two_keys_with_one_text_are_not_plain_json(twin_last: bool) -> None:
+    old = {"type": "object", "properties": {"a": {"type": "string"}}}
+    entries = [("a", {"type": "string"}), (_TwinKey("a"), {"type": "integer"})]
+    properties = dict(entries if twin_last else entries[::-1])
+    assert len(properties) == 2
+    findings = _pair(old, {"type": "object", "properties": properties})
+    assert len(findings) == 1 and "not plain JSON" in findings[0], findings
+
+
+def test_a_class_hooking_its_hierarchy_never_answers_for_a_value() -> None:
+    calls = {"mro": 0, "name": 0}
+
+    class Meta(type):
+        def __getattribute__(cls, name):
+            if name == "__mro__":
+                calls["mro"] += 1
+                return (cls, dict, object)  # claims to be a mapping
+            if name == "__name__":
+                calls["name"] += 1
+            return super().__getattribute__(name)
+
+    class Plain(metaclass=Meta):
+        pass
+
+    findings = _pair({"type": "object"}, {"type": "object", "properties": {"a": Plain()}})
+    assert len(findings) == 1 and "not plain JSON" in findings[0], findings
+    assert calls == {"mro": 0, "name": 0}, calls  # the real hierarchy is read, and no hook runs

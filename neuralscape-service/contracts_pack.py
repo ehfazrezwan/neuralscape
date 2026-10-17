@@ -968,14 +968,27 @@ class _NotJson(Exception):
     pass
 
 
+_TYPE_MRO = type.__dict__["__mro__"]  # the hierarchy a class really has: no metaclass hook answers for it
+
+
+def _bases(item: object) -> tuple:
+    return _TYPE_MRO.__get__(type(item))
+
+
+def _has(bases: tuple, kind: type) -> bool:
+    return any(base is kind for base in bases)
+
+
 def _native_json(value: object) -> object:
     """An exact-native copy of a JSON document, read once.
 
-    Types are decided by the value's own class hierarchy, never by ``isinstance`` (which a spoofed
-    ``__class__`` answers); strings and numbers are copied through their base type, and mappings and
-    sequences are read natively, so an override (``startswith``, ``get``, ``items``) can never answer for
-    the document.  A node shared by several parents is copied once (and stays shared); a cycle, a key that is
-    not a string, any other type or more than ``_MAX_NATIVE_NODES`` nodes is not JSON.
+    Types are decided by the value's own class hierarchy, read through ``type``'s descriptor and compared by
+    identity, never by ``isinstance`` (which a spoofed ``__class__`` answers) or a metaclass attribute;
+    strings and numbers are copied through their base type, and mappings and sequences are read natively, so
+    an override (``startswith``, ``get``, ``items``) can never answer for the document.  A node shared by
+    several parents is copied once (and stays shared); a cycle, a key that is not a string, two keys with one
+    text (one would silently replace the other), any other type or more than ``_MAX_NATIVE_NODES`` nodes is
+    not JSON.
     """
 
     memo: dict[int, object] = {}
@@ -990,31 +1003,36 @@ def _native_json(value: object) -> object:
             raise _NotJson("too many nodes")
         if item is None or item is True or item is False:
             return item, None
-        mro = type(item).__mro__
-        if str in mro:
+        mro = _bases(item)
+        if _has(mro, str):
             return str.__str__(item), None
-        if float in mro:
+        if _has(mro, float):
             return float.__float__(item), None
-        if int in mro:
+        if _has(mro, int):
             return int.__int__(item), None
         key = id(item)
         if key in open_ids:
             raise _NotJson("a cycle")
         if key in memo:
             return memo[key], None
-        if dict in mro:
+        if _has(mro, dict):
             children = []
+            texts: set[str] = set()
             for name, child in list(dict.items(item)):
-                if str not in type(name).__mro__:
+                if not _has(_bases(name), str):
                     raise _NotJson("a key that is not a string")
-                children.append((str.__str__(name), child))
+                text = str.__str__(name)
+                if text in texts:
+                    raise _NotJson("two keys with one text")
+                texts.add(text)
+                children.append((text, child))
             shell: object = {}
-        elif list in mro or tuple in mro:
-            sequence = list.__getitem__(item, slice(None)) if list in mro else tuple.__getitem__(item, slice(None))
+        elif _has(mro, list) or _has(mro, tuple):
+            sequence = list.__getitem__(item, slice(None)) if _has(mro, list) else tuple.__getitem__(item, slice(None))
             children = [(None, child) for child in sequence]
             shell = []
         else:
-            raise _NotJson(f"a {type(item).__name__} value")
+            raise _NotJson("a value of another type")
         memo[key] = shell
         keep.append(item)
         open_ids.add(key)
