@@ -277,6 +277,7 @@ def _self_contained(value: object, budget: list[int]) -> object:
         budget[0] -= 1
         if budget[0] < 0:
             raise _TooLarge
+        _charge_walk()
         if isinstance(node, dict):
             ref = node.get("$ref")
             if (ref is not None and not (isinstance(ref, str) and ref.startswith("#"))) or _DYNAMIC_REFERENCES & node.keys():
@@ -312,6 +313,7 @@ def _inline(
     budget[0] -= 1
     if budget[0] < 0:
         raise _TooLarge
+    _charge_walk()  # each expansion has its own limit, but repeated expansions spend the shared budget
     if isinstance(value, list):
         return [_inline(item, defs, stack, budget, root=root) for item in value]
     if not isinstance(value, dict):
@@ -398,6 +400,18 @@ def _charge_values(count: int, local: list[int]) -> bool:
         return True
     local[0] += count
     return local[0] <= _MAX_EQUALITY_STEPS
+
+
+def _charge_walk() -> None:
+    """Spend one walked value of the running comparison's (and call's) budget: an expansion or one of its
+    helper walks has a local limit per call, but repeated calls must still add up.  Free outside a run."""
+
+    run = _RUN.get()
+    if run is not None:
+        run.values += 1
+        run.call.values += 1
+        if run.values > _MAX_EQUALITY_STEPS or run.call.values > _MAX_CALL_VALUES:
+            raise _BudgetExhausted
 
 
 def _json_equal(left: object, right: object) -> bool:
@@ -611,6 +625,7 @@ def _depends_on_document(value: object, defs: dict, seen: set | None = None, bud
     budget[0] -= 1
     if budget[0] < 0:
         return True  # too large to tell: assume it does
+    _charge_walk()
     if not isinstance(value, (list, dict)):
         return False
     if id(value) in seen:
@@ -1045,16 +1060,18 @@ def _compare_checked(
     run = _RUN.get()
     key = (id(old), id(new), id(old_defs), id(new_defs))
     if run is not None:
+        # Every attempt is charged, remembered or not: distinct parents sharing a large map visit each of
+        # its fields once per parent, and that traversal must count.
+        run.steps += 1
+        run.call.steps += 1
+        if run.steps > _MAX_COMPARISONS or run.call.steps > _MAX_CALL_COMPARISONS:
+            raise _BudgetExhausted
         if key in run.clean:
             return
         remembered = run.dirty.get(key)
         if remembered is not None:
             out.extend(f"{path}{suffix}" for suffix in remembered[1])
             return
-        run.steps += 1
-        run.call.steps += 1
-        if run.steps > _MAX_COMPARISONS or run.call.steps > _MAX_CALL_COMPARISONS:
-            raise _BudgetExhausted
     before = len(out)
     outer = _NO_ASSUMPTION
     if run is not None:

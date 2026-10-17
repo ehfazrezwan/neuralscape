@@ -2264,8 +2264,14 @@ def test_a_version_is_split_without_a_backtracking_pattern(monkeypatch) -> None:
 
 
 def test_compare_schemas_shares_one_budget_across_its_contracts(monkeypatch) -> None:
-    monkeypatch.setattr(pack, "_MAX_CALL_COMPARISONS", 1500)
-    schema = _recursive_diamond(8)  # 512 comparisons each, well within one contract's own budget
+    schema = _recursive_diamond(8)  # well within one contract's own budget
+    probe = pack._CallBudget()
+    token = pack._CALL.set(probe)
+    try:
+        pack.check_compatibility(schema, copy.deepcopy(schema))
+    finally:
+        pack._CALL.reset(token)
+    monkeypatch.setattr(pack, "_MAX_CALL_COMPARISONS", probe.steps * 5 // 2)  # two and a half contracts' worth
     report = pack.compare_schemas({f"c{i}": schema for i in range(6)}, {f"c{i}": copy.deepcopy(schema) for i in range(6)})
     assert "c0" not in report and "c1" not in report, report  # the first contracts fit the call's budget
     assert report.get("c5") == [pack._BUDGET_MESSAGE], report  # the rest are reported, not compared for free
@@ -2361,3 +2367,43 @@ def test_a_small_enum_is_still_compared_within_budget() -> None:
     narrowed = copy.deepcopy(old)
     narrowed["properties"]["p0"]["enum"] = members[:-1]  # the const value is no longer allowed: nothing is
     assert any("p0" in f for f in _pair(old, narrowed)), _pair(old, narrowed)
+
+
+# ---- expansion and memoized comparisons spend the shared budgets too
+
+
+def _branching_defs(levels: int, leaf: dict) -> dict:
+    defs = {"L0": leaf}
+    for level in range(1, levels + 1):
+        defs[f"L{level}"] = {"anyOf": [{"$ref": f"#/$defs/L{level - 1}"}, {"$ref": f"#/$defs/L{level - 1}"}]}
+    return defs
+
+
+def test_repeated_references_spend_the_shared_expansion_budget(monkeypatch) -> None:
+    monkeypatch.setattr(pack, "_MAX_EQUALITY_STEPS", 100_000)
+
+    def schema(leaf: dict) -> dict:
+        defs = _branching_defs(14, leaf)  # each expansion of L14 stops at the per-expansion limit
+        return {"$defs": defs, "type": "object",
+                "properties": {f"p{i}": {"not": {"$ref": "#/$defs/L14"}, "description": f"{i}"} for i in range(60)}}
+
+    findings = _pair(schema({"type": "string"}), schema({"type": "string", "maxLength": 1}))
+    assert pack._BUDGET_MESSAGE in findings, findings[:2]  # 60 x 2 expansions of 20,000 nodes, now charged
+
+
+def test_memoized_comparisons_spend_the_comparison_budget(monkeypatch) -> None:
+    monkeypatch.setattr(pack, "_MAX_COMPARISONS", 10_000)
+    shared = {f"f{i}": {"type": "string"} for i in range(1000)}  # one property map shared by every parent
+    parents = {f"q{i}": {"type": "object", "properties": shared, "description": f"{i}"} for i in range(300)}
+    schema = {"type": "object", "properties": parents}
+    assert _pair(schema, copy.deepcopy(schema)) == [pack._BUDGET_MESSAGE]  # 300 x 1000 attempts, now charged
+
+
+def test_shared_maps_and_repeated_references_within_budget_still_compare() -> None:
+    shared = {f"f{i}": {"type": "string"} for i in range(20)}
+    parents = {f"q{i}": {"type": "object", "properties": shared} for i in range(10)}
+    schema = {"type": "object", "properties": parents}
+    assert _pair(schema, copy.deepcopy(schema)) == []
+    narrowed = copy.deepcopy(schema)
+    narrowed["properties"]["q3"]["properties"]["f0"] = {"type": "string", "maxLength": 1}
+    assert any("q3.f0" in f for f in _pair(schema, narrowed))
