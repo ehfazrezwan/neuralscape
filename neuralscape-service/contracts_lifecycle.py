@@ -56,15 +56,28 @@ def _key_text(key: object) -> object:
 def _require_distinct_key_text(
     entries: tuple[tuple[object, object], ...],
 ) -> tuple[tuple[object, object], ...]:
-    """Refuse keys that spell one name, however their own hash and equality disagree."""
+    """The entries keyed by each key's exact text, refusing keys that spell one name.
+
+    The text is copied once here, at capture, so later uses (materialization, conflict checks) neither
+    copy nor hash the caller's key again, and a container keyed by text is as pure as one keyed by exact
+    strings.  A key that is neither text nor an exact native scalar is refused before it is hashed: hashing
+    a caller's object would run its code (an exact native key reaches validation, which refuses it).
+    """
 
     seen: set[object] = set()
-    for key, _ in entries:
-        text = _key_text(key)
+    keyed: list[tuple[object, object]] = []
+    for key, item in entries:
+        if _derives_from(type(key), (str,)):
+            text: object = str.__str__(key)
+        elif _is_exact_native_kind(type(key)):
+            text = key  # its hash is native; validation refuses a non-text key with its own message
+        else:
+            raise ValueError("contract mapping keys must be text")
         if text in seen:
             raise ValueError("contract mapping has colliding keys")
         seen.add(text)
-    return entries
+        keyed.append((text, item))
+    return tuple(keyed)
 
 
 class _CapturedGraph:
@@ -254,6 +267,7 @@ def _declared_field_names(model_type: type, captured_by_identity: dict[Any, Any]
     for base in _TYPE_MRO.__get__(model_type):
         fields = _namespace_value(_TYPE_NAMESPACE.__get__(base), "__pydantic_fields__", budget)
         if type(fields) is dict:
+            budget.charge_edge(dict.__len__(fields))  # one edge per declared name read
             names = frozenset(str.__str__(key) for key in dict.keys(fields) if _derives_from(type(key), (str,)))
             break
     captured_by_identity[(_FIELDS, id(model_type))] = (model_type, names, generation)
@@ -374,6 +388,7 @@ def _claims_another_class(kind: type, budget: DiscoveryBudget) -> bool:
 
 
 _HANDED_ENUMS = "handed-enums"  # memo key: enum members handed out while the current root materializes
+_DETACHED = "detached"  # memo key prefix: one scalar subclass leaf's exact copy, made once per call
 _LEAF_CLASS = "leaf-class"  # memo key prefix: one leaf class's verdict, decided once per call
 
 
@@ -427,7 +442,14 @@ def _native_leaf(
     if verdict != "refused":
         if _is_exact_native_kind(type(value)):
             return value
-        return _exact_native(value, verdict)  # detached: a hook installed on the subclass later never travels
+        # Detached: a hook installed on the subclass later never travels.  One copy per source object (kept
+        # with its owner, so its id() is not recycled), so repeated references cost a reference, not a copy.
+        memo = captured_by_identity.get((_DETACHED, id(value)))
+        if memo is not None and memo[0] is value:
+            return memo[1]
+        detached = _exact_native(value, verdict)
+        captured_by_identity[(_DETACHED, id(value))] = (value, detached)
+        return detached
     raise ValueError("a contract value must be a native scalar, an enum member, a model or a container")
 
 
@@ -1723,6 +1745,19 @@ def _settled_aggregate(
     return IntentStatus.PARTIAL
 
 
+def _same_source_version(expected: SourceVersion, observed: SourceVersion) -> bool:
+    """Equality of two source versions the claim has already strictly revalidated (exact values).
+
+    The public ``source_versions_match`` re-captures and re-validates under a fresh budget, which here
+    would only repeat work outside the call's envelope."""
+
+    return (
+        expected.record_id == observed.record_id
+        and expected.content_revision == observed.content_revision
+        and expected.policy_epoch == observed.policy_epoch
+    )
+
+
 def _source_sets_match(
     expected: tuple[SourceVersion, ...],
     observed: tuple[SourceVersion, ...],
@@ -1732,7 +1767,7 @@ def _source_sets_match(
     observed_by_id = {item.record_id: item for item in observed}
     return len(observed_by_id) == len(observed) and all(
         source.record_id in observed_by_id
-        and source_versions_match(source, observed_by_id[source.record_id])
+        and _same_source_version(source, observed_by_id[source.record_id])
         for source in expected
     )
 

@@ -1680,3 +1680,120 @@ def test_declared_field_names_are_never_read_through_the_model_metaclass():
     with pytest.raises(ValueError):
         contracts_lifecycle.validate_stage_receipts(command, (applied,))
     assert reads == []
+
+
+def test_a_repeated_text_subclass_leaf_is_detached_once_not_per_occurrence():
+    """Capture copies a subclass leaf to exact text; the copy is kept per source object, so 400 references to
+    one large leaf cost one copy, as 400 references to an exact string cost none."""
+
+    import tracemalloc
+
+    from tests.test_contracts_lifecycle import intent_with_requirements, requirement
+
+    class Text(str):
+        pass
+
+    command = intent_with_requirements(requirement(ProcessingStage.CANONICAL))
+    applied = receipt(ProcessingStage.CANONICAL, StageStatus.APPLIED)
+    set_native(applied, "effect_id", (Text("x" * (256 * 1024)),) * 400)
+    tracemalloc.start()
+    try:
+        with pytest.raises(ValueError):
+            contracts_lifecycle.validate_stage_receipts(command, (applied,))
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert peak < 8 * 2**20, peak  # one copy of 256 KiB (and bookkeeping), not 400 (100 MiB)
+
+
+def test_a_shared_container_with_a_text_subclass_key_is_not_copied_per_path():
+    """A key's exact text is kept once at capture, so a container shared by many paths is rebuilt once."""
+
+    import tracemalloc
+
+    from tests.test_contracts_lifecycle import intent_with_requirements, requirement
+
+    class Text(str):
+        pass
+
+    command = intent_with_requirements(requirement(ProcessingStage.CANONICAL))
+    applied = receipt(ProcessingStage.CANONICAL, StageStatus.APPLIED)
+    shared = {Text("k" * (256 * 1024)): 1}
+    EXTRA.__set__(applied, {f"note{i}": shared for i in range(200)})
+    tracemalloc.start()
+    try:
+        with pytest.raises(ValueError):
+            contracts_lifecycle.validate_stage_receipts(command, (applied,))
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert peak < 8 * 2**20, peak  # one 256 KiB key text, not one per path (50 MiB and more)
+
+
+def test_declared_field_tables_are_charged_to_the_discovery_budget():
+    """Reading a model class's declared names costs one edge per name: 200 classes sharing a 20,000-entry
+    table exceed the envelope instead of being read for free."""
+
+    from tests.test_contracts_lifecycle import intent_with_requirements, requirement, source
+
+    table = {f"field{i}": None for i in range(20_000)}
+    table.update(SourceVersion.__pydantic_fields__)
+    classes = [type(f"Wide{i}", (SourceVersion,), {}) for i in range(200)]
+    for kind in classes:
+        type.__setattr__(kind, "__pydantic_fields__", table)
+    command = intent_with_requirements(requirement(ProcessingStage.CANONICAL))
+    applied = receipt(ProcessingStage.CANONICAL, StageStatus.APPLIED)
+    sources = []
+    for index, kind in enumerate(classes):
+        item = SourceVersion.model_construct(**vars(source(f"w{index}")))
+        object.__setattr__(item, "__class__", kind)
+        EXTRA.__set__(item, {"extra_note": 1})  # forces the declared-name check
+        sources.append(item)
+    set_native(applied, "applied_sources", tuple(sources))
+    with pytest.raises(ValueError, match=BUDGET):
+        contracts_lifecycle.validate_stage_receipts(command, (applied,))
+
+
+def test_the_claim_compares_its_revalidated_sources_without_new_budgets(monkeypatch):
+    """Source sets are compared on the claim's own strict copies: no further envelope (and no second
+    capture and validation per source pair) is created outside the call's budget."""
+
+    import contracts_limits
+    from tests.test_contracts_lifecycle import intent_with_requirements, requirement, source
+
+    created: list[object] = []
+    real = contracts_lifecycle.DiscoveryBudget
+
+    class Counting(real):
+        def __init__(self, *args, **kwargs):
+            created.append(self)
+            super().__init__(*args, **kwargs)
+
+    command = intent_with_requirements(requirement(ProcessingStage.CANONICAL))
+    applied = receipt(ProcessingStage.CANONICAL, StageStatus.APPLIED)
+    monkeypatch.setattr(contracts_lifecycle, "DiscoveryBudget", Counting)
+    validate_required_stage_claim(claimed_status=IntentStatus.APPLIED, intent=command, receipts=(applied,) * 20)
+    assert len(created) == 1  # the call's own envelope only
+
+
+def test_a_mapping_key_object_is_refused_before_its_hash_runs():
+    from tests.test_contracts_lifecycle import intent_with_requirements, requirement
+
+    calls: list[str] = []
+
+    class Key:
+        def __hash__(self):
+            calls.append("hash")
+            return 1
+
+        def __eq__(self, other):
+            calls.append("eq")
+            return False
+
+    command = intent_with_requirements(requirement(ProcessingStage.CANONICAL))
+    applied = receipt(ProcessingStage.CANONICAL, StageStatus.APPLIED)
+    EXTRA.__set__(applied, {"note": {Key(): 1}})
+    calls.clear()  # building the dict above hashed the key once
+    with pytest.raises(ValueError, match="keys must be text"):
+        contracts_lifecycle.validate_stage_receipts(command, (applied,))
+    assert calls == []
