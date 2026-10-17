@@ -296,6 +296,27 @@ def _exact_offset(offset: object) -> timedelta:
     )
 
 
+def _exact_datetime(value: datetime, zone: timezone) -> datetime:
+    """An exact ``datetime`` with the wall time and ``fold`` of ``value`` under ``zone``.
+
+    ``datetime.replace`` builds an instance of the caller's subclass (running its ``__new__``), and a
+    kept subclass would run caller arithmetic later; the fields are read with the base type's own
+    accessors and a fresh exact value is built.
+    """
+
+    return datetime(
+        datetime.year.__get__(value),  # type: ignore[attr-defined]
+        datetime.month.__get__(value),  # type: ignore[attr-defined]
+        datetime.day.__get__(value),  # type: ignore[attr-defined]
+        datetime.hour.__get__(value),  # type: ignore[attr-defined]
+        datetime.minute.__get__(value),  # type: ignore[attr-defined]
+        datetime.second.__get__(value),  # type: ignore[attr-defined]
+        datetime.microsecond.__get__(value),  # type: ignore[attr-defined]
+        tzinfo=zone,
+        fold=datetime.fold.__get__(value),  # type: ignore[attr-defined]
+    )
+
+
 def _instant_before(left: datetime, right: datetime) -> bool:
     """Whether ``left`` is an earlier instant than ``right``, without leaving the datetime range.
 
@@ -395,7 +416,7 @@ class RunManifest(_ManifestContract):
             offset = datetime.utcoffset(value)
             if offset is None:
                 raise ValueError("run timestamps must include an explicit UTC offset")
-            fixed = datetime.replace(value, tzinfo=timezone(_exact_offset(offset)))
+            fixed = _exact_datetime(value, timezone(_exact_offset(offset)))
             if pins is not None:
                 pins[id(value)] = (value, fixed)
             elif info.field_name == "started_at":

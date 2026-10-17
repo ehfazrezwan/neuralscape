@@ -5142,3 +5142,51 @@ def test_started_at_without_finished_at_does_not_keep_the_caller_datetime():
     gone = _refuse_started_at_only()
     gc.collect()
     assert gone() is None
+
+
+# ---- datetime subclasses are kept as exact datetimes
+
+
+class _HookedDatetime(datetime):
+    hooks = 0
+
+    def __new__(cls, *args, **kwargs):
+        _HookedDatetime.hooks += 1
+        return super().__new__(cls, *args, **kwargs)
+
+    def __sub__(self, other):
+        _HookedDatetime.hooks += 1
+        return timedelta(days=-1)
+
+    def replace(self, *args, **kwargs):
+        _HookedDatetime.hooks += 1
+        return super().replace(*args, **kwargs)
+
+
+@pytest.mark.parametrize("path", ["init", "model_validate", "type_adapter"])
+def test_datetime_subclass_runs_no_caller_code_and_is_stored_as_an_exact_datetime(path):
+    start = _HookedDatetime(2026, 10, 1, 8, 0, 5, 7, tzinfo=timezone(timedelta(hours=2)), fold=1)
+    finish = _HookedDatetime(2026, 10, 1, 9, 0, tzinfo=timezone.utc)
+    data = {**completed_manifest().model_dump(), "started_at": start, "finished_at": finish}
+    _HookedDatetime.hooks = 0
+    if path == "init":
+        manifest = RunManifest(**data)
+    elif path == "model_validate":
+        manifest = RunManifest.model_validate(data)
+    else:
+        manifest = pydantic.TypeAdapter(RunManifest).validate_python(data)
+    assert _HookedDatetime.hooks == 0
+    assert type(manifest.started_at) is datetime and type(manifest.finished_at) is datetime
+    assert manifest.started_at == datetime(2026, 10, 1, 8, 0, 5, 7, tzinfo=timezone(timedelta(hours=2)))
+    assert manifest.started_at.fold == 1
+    assert manifest.finished_at - manifest.started_at == timedelta(hours=3, seconds=-5, microseconds=-7)
+
+
+def test_exact_datetimes_keep_wall_time_offset_and_fold():
+    zone = ZoneInfo("America/New_York")
+    start = datetime(2026, 11, 1, 1, 30, tzinfo=zone, fold=1)
+    finish = datetime(2026, 11, 1, 1, 45, tzinfo=zone, fold=1)
+    manifest = RunManifest(**{**completed_manifest().model_dump(), "started_at": start, "finished_at": finish})
+    assert manifest.started_at.utcoffset() == timedelta(hours=-5)
+    assert (manifest.started_at.hour, manifest.started_at.minute, manifest.started_at.fold) == (1, 30, 1)
+    assert manifest.finished_at - manifest.started_at == timedelta(minutes=15)
