@@ -47,3 +47,22 @@ def test_missing_run_404(client):
 def test_path_traversal_blocked(client):
     # name with a slash can't escape RESULTS_DIR
     assert client.get("/api/runs/..%2f..%2fetc%2fpasswd").status_code in (404, 400)
+
+
+def test_dashboard_serves_assets(client):
+    response = client.get("/")
+    assert response.status_code == 200
+    assert "<title>Neuralscape Benchmark</title>" in response.text
+    assert client.get("/static/app.js").status_code == 200
+
+
+def test_static_dir_prefers_packaged_assets(tmp_path):
+    package_dir = tmp_path / "neuralscape_bench"
+    source_static = tmp_path / "static"
+    source_static.mkdir()
+
+    assert dashboard._resolve_static_dir(package_dir) == source_static
+
+    packaged_static = package_dir / "static"
+    packaged_static.mkdir(parents=True)
+    assert dashboard._resolve_static_dir(package_dir) == packaged_static

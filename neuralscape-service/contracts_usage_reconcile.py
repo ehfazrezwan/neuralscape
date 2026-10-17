@@ -91,8 +91,9 @@ class _ValidatedPublicMappingEntries:
 
 
 _BUDGET_KEY = ("discovery-budget",)
-# The envelope of the snapshot that is validating a public mapping view right now (per thread).  It is
-# passed this way because the validator's signature is part of what the existing tests replace.
+_TEXT_KEY = "text-copy"  # memo entries for text copies are keyed (_TEXT_KEY, id), apart from node ids
+# The envelope and memo of the snapshot that is validating a public mapping view right now (per thread).
+# They are passed this way because the validator's signature is part of what the existing tests replace.
 _view_state = threading.local()
 
 
@@ -103,6 +104,33 @@ def _session_budget(memo: dict) -> DiscoveryBudget:
     if budget is None:
         budget = memo[_BUDGET_KEY] = DiscoveryBudget(STANDARD)
     return budget
+
+
+def _precheck(budget: DiscoveryBudget, count: int) -> None:
+    """Refuse to copy native storage that cannot fit the remaining edge allowance (before copying it)."""
+
+    if count > budget.tier.max_edges - budget.edges:
+        budget.charge_edge(count)  # raises the stable budget error
+
+
+def _sequence_items(
+    value: object,
+    exact: type,
+    captured: dict[int, tuple[object, tuple[object, ...]]],
+    budget: DiscoveryBudget,
+) -> Iterable[object]:
+    """The items a list or set is rebuilt from.
+
+    An instance of exactly ``exact`` is rebuilt from what its capture copied (and charged), not read
+    again: a callback that ran since then cannot grow it past the envelope.  A subclass keeps its
+    public view, which is a further read and is charged as it is read.
+    """
+
+    if type(value) is exact:
+        held = captured.get(id(value))
+        if held is not None and held[0] is value:
+            return held[1]
+    return _charged(value, budget)
 
 
 def _charged(entries: Iterable[object], budget: DiscoveryBudget) -> Iterator[object]:
@@ -132,6 +160,7 @@ def _validate_public_mapping_entries(
         except Exception as exc:
             return _FailedNativeDictTraversal(exc)
         shared = getattr(_view_state, "budget", None)
+        memo = getattr(_view_state, "memo", None)
         if shared is not None:
             shared.charge_edge()  # every pair read is charged to the snapshot's one envelope
         elif len(retained_entries) >= STANDARD.max_edges:
@@ -141,7 +170,7 @@ def _validate_public_mapping_entries(
         except Exception as exc:
             return _FailedNativeDictTraversal(exc)
         try:
-            public_entries[key] = None
+            public_entries[_hook_free_key(key, memo, shared)] = None  # the shape check hashes no key of the caller's
         except Exception as exc:
             return _FailedNativeDictTraversal(exc)
         retained_entries.append((pair, key, public_value))
@@ -206,17 +235,6 @@ class ReconciledUsageStream(ContractModel):
 
     @model_validator(mode="after")
     def validate_usage_summary(self) -> "ReconciledUsageStream":
-        try:
-            self.attribution = AttributionSnapshot.model_validate(
-                _native_snapshot(self.attribution)
-            )
-        except Exception as exc:
-            raise ValueError("stream attribution is invalid") from exc
-        if self.usage is not None:
-            try:
-                self.usage = TokenUsage.model_validate(_native_snapshot(self.usage))
-            except Exception as exc:
-                raise ValueError("stream usage is invalid") from exc
         if self.status == "unavailable":
             if self.usage is not None or self.usage_missing_reason is None:
                 raise ValueError(
@@ -326,20 +344,6 @@ class UsageReconciliation(ContractModel):
 
     @model_validator(mode="after")
     def validate_result_graph(self) -> "UsageReconciliation":
-        try:
-            self.streams = tuple(
-                ReconciledUsageStream.model_validate(_native_snapshot(stream))
-                for stream in self.streams
-            )
-            self.ledgers = tuple(
-                ReconciledLedger.model_validate(_native_snapshot(ledger))
-                for ledger in self.ledgers
-            )
-        except Exception as exc:
-            raise ValueError(
-                "reconciliation result contains an invalid nested value"
-            ) from exc
-
         if not self.streams:
             raise ValueError("reconciliation result requires at least one stream")
         if any(stream.tenant_id != self.tenant_id for stream in self.streams):
@@ -411,6 +415,71 @@ def _inherits_str(candidate: type) -> bool:
     return any(entry is str for entry in _TYPE_MRO.__get__(candidate))
 
 
+_CLASS_NAMESPACE = type.__dict__["__dict__"]
+
+
+class _UnreadableMetadata(ValueError):
+    """Model metadata that cannot be read natively: recorded at capture, refused when the model is projected."""
+
+
+_METADATA_UNREADABLE = "contract model metadata must be read natively"
+_DECLARED_NAMES_KEY = "declared-names"  # (key, id(class)) entries in the frozen model store, apart from ids
+
+
+def _declared_field_names(model_type: type, budget: DiscoveryBudget) -> set[object]:
+    """The model's declared field names, from the first namespace on its native MRO that defines them.
+
+    pydantic keeps them as a plain dict in every model class's own namespace.  Namespaces and that dict are
+    read natively (only exact-text keys are compared, and the entries scanned are charged), so no metaclass
+    ``__getattribute__``, descriptor or key hook runs.  Anything else is refused.
+    """
+
+    for klass in _TYPE_MRO.__get__(model_type):
+        namespace = _CLASS_NAMESPACE.__get__(klass)
+        budget.charge_edge(MappingProxyType.__len__(namespace))
+        for key, fields in MappingProxyType.items(namespace):
+            if type(key) is not str:
+                raise _UnreadableMetadata(_METADATA_UNREADABLE)
+            if key == "__pydantic_fields__":
+                if type(fields) is not dict:
+                    raise _UnreadableMetadata(_METADATA_UNREADABLE)
+                budget.charge_edge(dict.__len__(fields))
+                names = tuple(dict.__iter__(fields))
+                if any(type(name) is not str for name in names):
+                    raise _UnreadableMetadata(_METADATA_UNREADABLE)
+                return set(names)
+    raise _UnreadableMetadata(_METADATA_UNREADABLE)
+
+
+
+def _capture_declared_names(model_type: type, store: dict, budget: DiscoveryBudget) -> None:
+    """Snapshot ``model_type``'s declared field names once per call, when its first instance is captured.
+
+    Taken before any public view or callback of the call can run, charged once, and kept with the class
+    (held, so its id cannot be reused): every instance is judged by this one snapshot, however many there
+    are and whatever runs later.  An unreadable class is recorded and refused only if an instance of it is
+    projected; a budget error still stops capture.
+    """
+
+    slot = (_DECLARED_NAMES_KEY, id(model_type))
+    held = store.get(slot)
+    if held is not None and held[0] is model_type:
+        return
+    try:
+        store[slot] = (model_type, _declared_field_names(model_type, budget))
+    except _UnreadableMetadata:
+        store[slot] = (model_type, None)
+
+
+def _captured_declared_names(model_type: type, store: dict, budget: DiscoveryBudget) -> set[object]:
+    """The call's snapshot of ``model_type``'s declared field names (taken now if capture never met it)."""
+
+    _capture_declared_names(model_type, store, budget)
+    names = store[(_DECLARED_NAMES_KEY, id(model_type))][1]
+    if names is None:
+        raise _UnreadableMetadata(_METADATA_UNREADABLE)
+    return names
+
 def _plain_name(name: object) -> object:
     """A stored field name as plain text (read without running a text subclass's own hooks).
 
@@ -420,6 +489,82 @@ def _plain_name(name: object) -> object:
     if type(name) is str or not _inherits_str(type(name)):
         return name
     return str.__str__(name)  # type: ignore[arg-type]
+
+
+def _memo_text(name: object, memo: dict) -> object:
+    """``_plain_name`` once per call per text-subclass object: the copy is kept in the call's memo with the
+    object (so its id cannot be reused), and every later reference (a leaf, a key, a field name) shares it.
+
+    Its entries have their own key space in the memo, so a text subclass that is also projected as a
+    container keeps the two results apart.
+    """
+
+    if type(name) is str or not _inherits_str(type(name)):
+        return name
+    slot = (_TEXT_KEY, id(name))
+    cached = memo.get(slot)
+    if cached is not None and cached[0] is name:
+        return cached[1]
+    text = _plain_name(name)
+    memo[slot] = (name, text)
+    return text
+
+
+def _hashes_natively(kind: type, budget: DiscoveryBudget | None) -> bool:
+    """Whether hashing an instance of ``kind`` runs no caller code: its ``__hash__`` and ``__eq__`` are
+    ``object``'s own, or it is unhashable (hashing raises natively before anything is compared).
+
+    The native MRO's namespaces are scanned directly, comparing only exact-text names (charged when the call
+    has an envelope), so no metaclass or descriptor runs; a namespace with any other name is not trusted.
+    """
+
+    hash_found = eq_found = False
+    for klass in _TYPE_MRO.__get__(kind):
+        namespace = _CLASS_NAMESPACE.__get__(klass)
+        if budget is not None:
+            budget.charge_edge(MappingProxyType.__len__(namespace))
+        for name, entry in MappingProxyType.items(namespace):
+            if type(name) is not str:
+                return False
+            if name == "__hash__" and not hash_found:
+                if entry is None:
+                    return True
+                if klass is not object:
+                    return False
+                hash_found = True
+            elif name == "__eq__" and not eq_found:
+                if klass is not object:
+                    return False
+                eq_found = True
+        if hash_found and eq_found:
+            return True
+    return False
+
+
+def _hook_free_key(key: object, memo: dict | None = None, budget: DiscoveryBudget | None = None) -> object:
+    """A mapping key as something that hashes and compares without caller code: a text subclass as its
+    text, an exact native scalar as itself, and an object hashed by ``object``'s own slots (or unhashable,
+    which fails natively) unchanged.  Any other key is refused before it is hashed or compared."""
+
+    kind = type(key)
+    if kind is str or kind is int or kind is bool or kind is float or kind is bytes or key is None:
+        return key
+    if _inherits_str(kind):
+        return _plain_name(key) if memo is None else _memo_text(key, memo)
+    if _hashes_natively(kind, budget):
+        return key
+    raise ValueError("contract input keys must be text")
+
+
+def _is_plain_leaf(value: object) -> bool:
+    """An exact ``str``, ``int``, ``bool``, ``float`` or ``None``: captured and rebuilt as itself.
+
+    Compared by identity (never by hashing the type, which could run a metaclass hook), so the common leaf
+    skips the container checks of every capture and rebuild pass.
+    """
+
+    kind = type(value)
+    return kind is str or kind is int or kind is bool or kind is float or value is None
 
 
 def _is_node(value: object) -> bool:
@@ -435,15 +580,22 @@ def _freeze_model_storage(
     frozen_dicts: dict[int, _FrozenDictStorage],
     frozen_tuples: dict[int, _FrozenTupleStorage],
     visited: set[int],
+    budget: DiscoveryBudget,
 ) -> None:
-    """Capture reachable native model stores without public traversal hooks."""
+    """Capture reachable native model stores without public traversal hooks.
 
+    Every capture is charged to the call's one envelope: each object once as a node, and each
+    container's native entries as edges, checked against what is left before they are copied.
+    """
+
+    if _is_plain_leaf(value):
+        return  # nothing to capture
     depth = getattr(_freeze_state, "depth", 0)
     if depth > STANDARD.max_depth:
         raise ValueError(DISCOVERY_BUDGET_MESSAGE)  # nesting beyond the envelope is refused, not recursed into
     _freeze_state.depth = depth + 1
     try:
-        _freeze_model_storage_body(value, frozen_models, frozen_dicts, frozen_tuples, visited)
+        _freeze_model_storage_body(value, frozen_models, frozen_dicts, frozen_tuples, visited, budget)
     finally:
         _freeze_state.depth = depth
 
@@ -454,6 +606,7 @@ def _freeze_model_storage_body(
     frozen_dicts: dict[int, _FrozenDictStorage],
     frozen_tuples: dict[int, _FrozenTupleStorage],
     visited: set[int],
+    budget: DiscoveryBudget,
 ) -> None:
 
     value_type = type(value)
@@ -467,34 +620,31 @@ def _freeze_model_storage_body(
     if identity in visited:
         return
     visited.add(identity)
+    budget.charge_node(value)  # by identity: an object already charged (wherever) costs nothing more
+    if _already_frozen(value, frozen_models, frozen_dicts, frozen_tuples):
+        return  # already captured in this call (a later freeze starts with a fresh ``visited``)
 
     if inherits_native(value_type, BaseModel):
         frozen_model = frozen_models.get(identity)
         if frozen_model is not None and frozen_model[0] is value:
             return
         stored = _MODEL_DICT_DESCRIPTOR.__get__(value, BaseModel)
+        _precheck(budget, dict.__len__(stored))
         stored_items = tuple(dict.items(stored))
+        budget.charge_edge(len(stored_items))
         try:
             extras = _MODEL_EXTRAS_DESCRIPTOR.__get__(value, BaseModel)
         except AttributeError:
             extras = None
-        native_extra_items = (
-            tuple(dict.items(extras))
-            if extras is not None and inherits_native(type(extras), dict)
-            else None
-        )
-        group_texts: list[set[object]] = []
-        for group in (stored_items, native_extra_items or ()):
-            if any(not _inherits_str(type(name)) for name, _item in group):
-                raise ValueError("contract input field names must be text")
-            texts = [_plain_name(name) for name, _item in group]
-            if len(set(texts)) != len(texts):
-                raise ValueError("contract input field names must be unique text")
-            group_texts.append(set(texts))
-        # The two native stores are one namespace: compare their names as plain text, never through a
-        # key's own hash and equality (a text subclass could otherwise sit in both under one text).
-        if group_texts[0] & group_texts[1]:
-            raise ValueError("contract extra storage overlaps stored fields")
+        native_extra_items = None
+        if extras is not None:
+            _capture_declared_names(value_type, frozen_models, budget)  # before any callback of the call
+        if extras is not None and inherits_native(type(extras), dict):
+            _precheck(budget, dict.__len__(extras))
+            native_extra_items = tuple(dict.items(extras))
+            budget.charge_edge(len(native_extra_items))
+        # The names are checked when the model is projected (``_checked_native_names``), not here: a model
+        # captured from a list subclass's native backing is never projected when its public view hides it.
         frozen_models[identity] = (
             value,
             stored_items,
@@ -508,6 +658,7 @@ def _freeze_model_storage_body(
                 frozen_dicts,
                 frozen_tuples,
                 visited,
+                budget,
             )
         if native_extra_items is not None:
             for _name, field_value in native_extra_items:
@@ -517,6 +668,7 @@ def _freeze_model_storage_body(
                     frozen_dicts,
                     frozen_tuples,
                     visited,
+                    budget,
                 )
         return
 
@@ -524,22 +676,36 @@ def _freeze_model_storage_body(
         frozen_dict = frozen_dicts.get(identity)
         if frozen_dict is not None and frozen_dict[0] is value:
             return
+        _precheck(budget, dict.__len__(value))
         native_items = tuple(dict.items(value))
+        budget.charge_edge(len(native_items))
         frozen_dicts[identity] = (value, native_items)
         items = (item for _key, item in native_items)
     elif inherits_native(value_type, list):
-        items = list.__iter__(value)
+        _precheck(budget, list.__len__(value))
+        items = tuple(list.__iter__(value))
+        budget.charge_edge(len(items))
+        # rebuilt from this capture (owner retained): a callback that grows the list later is not read
+        frozen_tuples[identity] = (value, items)
     elif inherits_native(value_type, tuple):
         frozen_tuple = frozen_tuples.get(identity)
         if frozen_tuple is not None and frozen_tuple[0] is value:
             return
+        _precheck(budget, tuple.__len__(value))
         native_items = tuple(tuple.__iter__(value))
+        budget.charge_edge(len(native_items))
         frozen_tuples[identity] = (value, native_items)
         items = iter(native_items)
     elif inherits_native(value_type, set):
-        items = set.__iter__(value)
+        _precheck(budget, set.__len__(value))
+        items = tuple(set.__iter__(value))
+        budget.charge_edge(len(items))
+        frozen_tuples[identity] = (value, items)
     else:
-        items = frozenset.__iter__(value)
+        _precheck(budget, frozenset.__len__(value))
+        items = tuple(frozenset.__iter__(value))
+        budget.charge_edge(len(items))
+        frozen_tuples[identity] = (value, items)
     for item in items:
         _freeze_model_storage(
             item,
@@ -547,7 +713,45 @@ def _freeze_model_storage_body(
             frozen_dicts,
             frozen_tuples,
             visited,
+            budget,
         )
+
+
+def _checked_native_names(
+    stored_items: tuple[tuple[object, object], ...],
+    native_extra_items: tuple[tuple[object, object], ...] | None,
+    memo: dict,
+) -> None:
+    """Refuse a projected model whose native field names are not unique text in one namespace."""
+
+    group_texts: list[set[object]] = []
+    for group in (stored_items, native_extra_items or ()):
+        if any(not _inherits_str(type(name)) for name, _item in group):
+            raise ValueError("contract input field names must be text")
+        texts = [_memo_text(name, memo) for name, _item in group]
+        if len(set(texts)) != len(texts):
+            raise ValueError("contract input field names must be unique text")
+        group_texts.append(set(texts))
+    # The two native stores are one namespace: compare their names as plain text, never through a
+    # key's own hash and equality (a text subclass could otherwise sit in both under one text).
+    if group_texts[0] & group_texts[1]:
+        raise ValueError("contract extra storage overlaps stored fields")
+
+
+def _already_frozen(
+    value: object,
+    frozen_models: dict[int, _FrozenModelStorage],
+    frozen_dicts: dict[int, _FrozenDictStorage],
+    frozen_tuples: dict[int, _FrozenTupleStorage],
+) -> bool:
+    """Whether this exact object's storage was already captured in this call (owner checked by identity)."""
+
+    identity = id(value)
+    for store in (frozen_models, frozen_dicts, frozen_tuples):
+        held = store.get(identity)
+        if held is not None and held[0] is value:
+            return True
+    return False
 
 
 def _native_snapshot(
@@ -568,6 +772,8 @@ def _native_snapshot(
     object per call.
     """
 
+    if _is_plain_leaf(value):
+        return value  # rebuilt as itself, whatever the pass
     if _memo is None:
         _memo = {}
     if _is_node(value):
@@ -602,6 +808,7 @@ def _snapshot_uncached(
     unchecked model copies so the destination contract can reject them.
     """
 
+    budget = _session_budget(_memo)  # the one envelope of this call, shared by capture and rebuild
     if (
         _frozen_models is None
         or _frozen_dicts is None
@@ -619,17 +826,24 @@ def _snapshot_uncached(
             _frozen_dicts,
             _frozen_tuples,
             set(),
+            budget,
         )
     if active is None:
         active = set()
     if not _is_node(value):
-        return value
+        # A text subclass reaches validation as its exact text: its own hash and equality never run there,
+        # so it cannot match a literal it does not spell.
+        return _memo_text(value, _memo)
 
+    # The one charging point for every container kind, before any branch is chosen: a container first met
+    # here (exposed only by a public view) costs a node like any natively reachable one, whichever branch then
+    # rebuilds it (a tuple that is also a mapping takes the mapping branch).  Charging is by identity, so an
+    # already captured container costs nothing more; capture decides what it has frozen by its own stores.
+    budget.charge_node(value)
     identity = id(value)
     if identity in active:
         raise ValueError("cyclic input graph")
     active.add(identity)
-    budget = _session_budget(_memo)
     try:
         if len(active) > STANDARD.max_depth:
             raise ValueError(DISCOVERY_BUDGET_MESSAGE)
@@ -642,14 +856,16 @@ def _snapshot_uncached(
                     _frozen_dicts,
                     _frozen_tuples,
                     set(),
+                    budget,
                 )
                 frozen = _frozen_models[identity]
             _model, stored_items, extras, native_extra_items = frozen
+            _checked_native_names(stored_items, native_extra_items, _memo)
             extra_items: tuple[tuple[object, object], ...] = ()
             if extras is not None:
                 if native_extra_items is not None:
                     extra_items = native_extra_items
-                    extra_names = {_plain_name(name) for name, _ in extra_items}
+                    extra_names = {_memo_text(name, _memo) for name, _ in extra_items}
                 else:
                     if not _is_real_mapping(extras):
                         raise ValueError("contract extra storage must be a mapping")
@@ -657,15 +873,15 @@ def _snapshot_uncached(
                     # One unpacking per pair: the name check and the field build share these tuples.
                     extra_items = unpack_pairs(_charged(extras.items(), budget))
                     extra_names = {
-                        _plain_name(name)
+                        _memo_text(name, _memo)
                         for name in (*iterated_extra_names, *(name for name, _ in extra_items))
                     }
-                declared_fields = type(value).model_fields
-                stored_names = {_plain_name(name) for name, _ in stored_items}
+                declared_fields = _captured_declared_names(type(value), _frozen_models, budget)
+                stored_names = {_memo_text(name, _memo) for name, _ in stored_items}
                 if (stored_names | set(declared_fields)).intersection(extra_names):
                     raise ValueError("contract extra storage overlaps stored fields")
             fields = {
-                _plain_name(name): _native_snapshot(
+                _memo_text(name, _memo): _native_snapshot(
                     field_value,
                     active,
                     _frozen_models=_frozen_models,
@@ -678,7 +894,7 @@ def _snapshot_uncached(
             if extra_items:
                 fields.update(
                 {
-                    _plain_name(name): _native_snapshot(
+                    _memo_text(name, _memo): _native_snapshot(
                         field_value,
                         active,
                         _frozen_models=_frozen_models,
@@ -700,11 +916,14 @@ def _snapshot_uncached(
                 except Exception as exc:
                     return _FailedNativeDictTraversal(exc)
                 outer_budget = getattr(_view_state, "budget", None)
+                outer_memo = getattr(_view_state, "memo", None)
                 _view_state.budget = budget
+                _view_state.memo = _memo  # the shape check shares the call's text copies
                 try:
                     validated_entries = _validate_public_mapping_entries(public_items)
                 finally:
                     _view_state.budget = outer_budget
+                    _view_state.memo = outer_memo
                 if isinstance(validated_entries, _FailedNativeDictTraversal):
                     return validated_entries
                 # Keep the iterator, retained keys, and all entry components
@@ -739,7 +958,7 @@ def _snapshot_uncached(
                     )
                     try:
                         # A text-subclass key is reduced to its text; a repeated text is ambiguous input.
-                        plain = _plain_name(key)
+                        plain = _hook_free_key(key, _memo, budget)
                         if plain in projected and (type(key) is not str or plain in subclass_keys):
                             raise ValueError("contract input field names must be unique text")
                         if type(key) is not str:
@@ -760,7 +979,7 @@ def _snapshot_uncached(
                     _memo=_memo,
                 )
                 try:
-                    plain = _plain_name(key)
+                    plain = _hook_free_key(key, _memo, budget)
                     if plain in projected and (type(key) is not str or plain in subclass_keys):
                         raise ValueError("contract input field names must be unique text")
                     if type(key) is not str:
@@ -780,7 +999,7 @@ def _snapshot_uncached(
                     _frozen_tuples=_frozen_tuples,
                     _memo=_memo,
                 )
-                for item in _charged(value, budget)
+                for item in _sequence_items(value, list, _frozen_tuples, budget)
             ]
         if is_native_instance(value, tuple):
             frozen_tuple = _frozen_tuples.get(identity)
@@ -791,6 +1010,7 @@ def _snapshot_uncached(
                     _frozen_dicts,
                     _frozen_tuples,
                     set(),
+                    budget,
                 )
                 frozen_tuple = _frozen_tuples[identity]
             return tuple(
@@ -813,7 +1033,9 @@ def _snapshot_uncached(
                 _frozen_tuples=_frozen_tuples,
                 _memo=_memo,
             )
-            for item in _charged(value, budget)
+            for item in _sequence_items(
+                value, set if is_native_instance(value, set) else frozenset, _frozen_tuples, budget
+            )
         ]
         try:
             return set(members) if is_native_instance(value, set) else frozenset(members)
