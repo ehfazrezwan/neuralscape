@@ -4080,3 +4080,30 @@ def test_a_container_claiming_a_model_class_is_a_validation_error_for_a_result_r
 
     with pytest.raises(ValueError):  # ValidationError is a ValueError; a KeyError or AttributeError is a leak
         ReconciledUsageStream.model_validate({"usage": Tuple()})
+
+
+# ---- a set holding a mapping is a validation error, not an unhashable-type leak
+
+@pytest.mark.parametrize("shape", ["mapping-in-frozenset", "mapping-in-tuple-in-set"])
+@pytest.mark.parametrize("receiver", [ReconciledUsageStream, UsageReconciliation])
+def test_a_set_holding_a_mapping_is_a_validation_error_for_a_result_receiver(shape: str, receiver) -> None:
+    from collections.abc import Mapping
+
+    class HashableMapping(Mapping):
+        def __getitem__(self, key):
+            return {"a": 1}[key]
+
+        def __iter__(self):
+            return iter(("a",))
+
+        def __len__(self):
+            return 1
+
+        def __hash__(self) -> int:
+            return 1
+
+    member = HashableMapping()
+    value = frozenset({member}) if shape == "mapping-in-frozenset" else {(member,)}
+    field = "streams" if receiver is UsageReconciliation else "usage"
+    with pytest.raises(ValueError):  # ValidationError is a ValueError; a TypeError is the leak
+        receiver.model_validate({field: value})

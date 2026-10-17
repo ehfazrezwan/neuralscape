@@ -739,19 +739,7 @@ def _snapshot_uncached(
                 )
                 for item in frozen_tuple[1]
             )
-        if is_native_instance(value, set):
-            return {
-                _native_snapshot(
-                    item,
-                    active,
-                    _frozen_models=_frozen_models,
-                    _frozen_dicts=_frozen_dicts,
-                    _frozen_tuples=_frozen_tuples,
-                    _memo=_memo,
-                )
-                for item in value
-            }
-        return frozenset(
+        members = [
             _native_snapshot(
                 item,
                 active,
@@ -761,7 +749,13 @@ def _snapshot_uncached(
                 _memo=_memo,
             )
             for item in value
-        )
+        ]
+        try:
+            return set(members) if is_native_instance(value, set) else frozenset(members)
+        except TypeError:
+            # The snapshot rebuilds a mapping as a dict, which a set cannot hold: refuse it as bad input,
+            # not as an unhashable-type leak.
+            raise ValueError("contract input set holds an unhashable member") from None
     finally:
         active.remove(identity)
 
