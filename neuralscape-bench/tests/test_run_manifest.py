@@ -9,7 +9,7 @@ import subprocess
 import sys
 from abc import ABCMeta
 from collections.abc import Mapping
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, tzinfo
 from zoneinfo import ZoneInfo
 from pathlib import Path
 from types import MappingProxyType
@@ -17,7 +17,7 @@ from typing import Callable
 
 import pydantic
 import pytest
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 
 import neuralscape_bench.run_manifest as run_manifest_module
 from neuralscape_bench.run_manifest import (
@@ -1119,7 +1119,7 @@ def test_failed_yielded_child_traversal_is_not_marked_complete():
     value: list[object] = [alias, deep, alias]
     frozen = _freeze_model_graphs(value)
 
-    with pytest.raises(RecursionError, match="maximum recursion depth exceeded"):
+    with pytest.raises(ValueError, match="exceeds the native snapshot budget"):
         _protect_yielded_model_storage(value, frozen)
 
     assert frozen.completed_traversals == {}
@@ -3231,7 +3231,7 @@ def test_finish_preserves_deep_later_native_failure_for_valid_planned():
     assert shallow.items_calls == 1
 
     deep = PublicResourceWithDeepNativeBacking(sys.getrecursionlimit() + 600)
-    with pytest.raises(RecursionError, match="maximum recursion depth exceeded"):
+    with pytest.raises(ValueError, match="exceeds the native snapshot budget"):
         finish_run(
             planned_manifest(),
             state=RunState.COMPLETED,
@@ -3394,7 +3394,7 @@ def test_finish_replays_new_exact_dict_before_snapshotting_its_entries():
     values["provenance"] = provenance
     measurement = LazyProvenanceMapping(values)
 
-    with pytest.raises(RecursionError, match="maximum recursion depth exceeded"):
+    with pytest.raises(ValueError, match="exceeds the native snapshot budget"):
         finish_run(
             planned_manifest(),
             state=RunState.COMPLETED,
@@ -3541,7 +3541,7 @@ def test_finish_preserves_lazy_exact_dict_priority_and_shared_capture():
     native = timing().model_dump(mode="python")
     native["provenance"] = shared_provenance
     measurements = PublicViewTuple((native,), (public,))
-    with pytest.raises(RecursionError, match="maximum recursion depth exceeded"):
+    with pytest.raises(ValueError, match="exceeds the native snapshot budget"):
         finish_run(
             planned_manifest(),
             state=RunState.COMPLETED,
@@ -3712,7 +3712,7 @@ def test_receiving_boundaries_reject_lists_malformed_models_and_cycles():
         serialize_run_manifest(cyclic)
 
 
-class HybridMappingTuple(tuple[object, ...]):
+class HybridMappingTuple(tuple, Mapping):
     """A tuple that is also a Mapping, with a side effect in sequence iteration."""
 
     def __new__(cls, values: dict[str, object], action: Callable[[], None]):
@@ -3737,7 +3737,7 @@ class HybridMappingTuple(tuple[object, ...]):
         return iter(tuple(self.values.items()))
 
 
-class HybridMappingList(list[object]):
+class HybridMappingList(list, Mapping):
     """A list that is also a Mapping, with a side effect in sequence iteration."""
 
     def __init__(self, values: dict[str, object], action: Callable[[], None]):
@@ -3761,8 +3761,6 @@ class HybridMappingList(list[object]):
         return iter(tuple(self.values.items()))
 
 
-Mapping.register(HybridMappingTuple)
-Mapping.register(HybridMappingList)
 
 
 def _finish_with_measurement(measurement: object) -> RunManifest:
@@ -4059,3 +4057,893 @@ def test_a_hostile_metaclass_never_gets_its_eq_run_by_the_manifest_module(base, 
         )
 
     assert events == []
+
+
+def _class_spy(base, events: list[str]):
+    """A container subclass whose ``__class__`` is a callback; ``type()`` is unaffected."""
+
+    namespace = {
+        "__class__": property(lambda self: events.append("__class__") or base),
+    }
+    if base is Mapping:
+        namespace.update(
+            __getitem__=lambda self, key: {}[key],
+            __iter__=lambda self: iter(()),
+            __len__=lambda self: 0,
+        )
+        return type("ClassSpy", (Mapping,), namespace)
+    return type("ClassSpy", (base,), namespace)
+
+
+@pytest.mark.parametrize("base", [list, tuple, dict, Mapping])
+def test_discovery_never_reads_a_containers_class_attribute(base) -> None:
+    events: list[str] = []
+    spy = _class_spy(base, events)
+    value = spy(()) if base is not dict and base is not Mapping else spy()
+
+    run_manifest_module._freeze_model_graphs(value)
+
+    assert events == []
+
+
+@pytest.mark.parametrize("field", ["resources", "measurements"])
+@pytest.mark.parametrize("base", [list, tuple, dict, Mapping])
+def test_finish_run_never_runs_a_class_callback_before_capture(base, field) -> None:
+    events: list[str] = []
+    spy = _class_spy(base, events)
+    value = spy(()) if base is not dict and base is not Mapping else spy()
+    planned = planned_manifest()
+    arguments = {"resources": (measured_memory(),), "measurements": (timing(),)}
+    arguments[field] = value
+
+    with contextlib.suppress(ValueError, TypeError, ValidationError):
+        finish_run(
+            planned,
+            state=RunState.COMPLETED,
+            started_at=datetime(2026, 9, 28, 8, 0, tzinfo=timezone.utc),
+            finished_at=datetime(2026, 9, 28, 8, 1, tzinfo=timezone.utc),
+            **arguments,
+        )
+
+    assert events == []
+
+
+def test_a_class_callback_cannot_repair_invalid_evidence_before_capture() -> None:
+    """A hostile ``__class__`` that rewrites a resource's invalid observed_value before it is captured."""
+
+    planned = planned_manifest()
+    resource = measured_memory()
+    repaired: list[str] = []
+
+    class Repairing(tuple):
+        @property
+        def __class__(self):  # noqa: D401 - the callback under test
+            repaired.append("repair")
+            dict.__setitem__(BaseModel.__dict__["__dict__"].__get__(resource, BaseModel), "observed_value", 1)
+            return tuple
+
+    dict.__setitem__(BaseModel.__dict__["__dict__"].__get__(resource, BaseModel), "observed_value", True)
+
+    with pytest.raises((ValueError, TypeError, ValidationError)):
+        finish_run(
+            planned,
+            state=RunState.COMPLETED,
+            started_at=datetime(2026, 9, 28, 8, 0, tzinfo=timezone.utc),
+            finished_at=datetime(2026, 9, 28, 8, 1, tzinfo=timezone.utc),
+            resources=Repairing((resource,)),
+            measurements=(timing(),),
+        )
+
+    assert repaired == []
+
+
+def test_an_extras_class_callback_cannot_repair_invalid_evidence_before_capture() -> None:
+    """A hostile ``__class__`` on a model's non-dict extras that rewrites a sibling resource's
+    invalid observed_value before that resource is captured."""
+
+    planned = planned_manifest()
+    carrier = measured_memory()
+    invalid = measured_memory()
+    repaired: list[str] = []
+    stored = BaseModel.__dict__["__dict__"].__get__
+
+    class RepairingExtras(Mapping[str, object]):
+        @property
+        def __class__(self):  # noqa: D401 - the callback under test
+            repaired.append("repair")
+            dict.__setitem__(stored(invalid, BaseModel), "observed_value", 1)
+            return dict
+
+        def __getitem__(self, key: str) -> object:
+            raise KeyError(key)
+
+        def __iter__(self):
+            return iter(())
+
+        def __len__(self) -> int:
+            return 0
+
+    dict.__setitem__(stored(invalid, BaseModel), "observed_value", True)
+    object.__setattr__(carrier, "__pydantic_extra__", RepairingExtras())
+
+    with pytest.raises((ValueError, TypeError, ValidationError)):
+        finish_run(
+            planned,
+            state=RunState.COMPLETED,
+            started_at=datetime(2026, 9, 28, 8, 0, tzinfo=timezone.utc),
+            finished_at=datetime(2026, 9, 28, 8, 1, tzinfo=timezone.utc),
+            resources=(carrier, invalid),
+            measurements=(timing(),),
+        )
+
+    assert repaired == []
+
+
+def _hooked_metaclass(base_meta, events: list[str]):
+    """A metaclass whose hash, equality and subclass-check hooks all record a call."""
+
+    class Meta(base_meta):
+        def __hash__(cls):
+            events.append("hash")
+            return id(cls)
+
+        def __eq__(cls, other):
+            events.append("eq")
+            return False
+
+        def __ne__(cls, other):
+            events.append("ne")
+            return True
+
+        def __subclasscheck__(cls, subclass):
+            events.append("subclasscheck")
+            return False
+
+        def __instancecheck__(cls, instance):
+            events.append("instancecheck")
+            return False
+
+    return Meta
+
+
+def _hostile_instances(events: list[str]) -> dict[str, object]:
+    from abc import ABCMeta
+
+    plain = _hooked_metaclass(type, events)
+    abstract = _hooked_metaclass(ABCMeta, events)
+    return {
+        "list": plain("HostileList", (list,), {})(),
+        "tuple": plain("HostileTuple", (tuple,), {})(),
+        "dict": plain("HostileDict", (dict,), {})(),
+        "object": plain("HostileObject", (), {})(),
+        "mapping-abc": abstract(
+            "HostileMapping",
+            (Mapping,),
+            {"__getitem__": lambda s, k: {}[k], "__iter__": lambda s: iter(()), "__len__": lambda s: 0},
+        )(),
+    }
+
+
+def test_type_checks_never_run_metaclass_hooks() -> None:
+    from pydantic import BaseModel
+
+    events: list[str] = []
+    values = _hostile_instances(events)
+    events.clear()  # building the classes is not under test
+
+    for value in values.values():
+        run_manifest_module._is_instance(value, (BaseModel, Mapping, tuple, list, dict))
+        run_manifest_module._is_instance(value, BaseModel)
+        run_manifest_module._is_instance(value, Mapping)
+        run_manifest_module._is_subclass(type(value), (BaseModel, Mapping, tuple, list, dict))
+
+    assert events == []
+
+
+def test_type_checks_decide_by_native_inheritance() -> None:
+    from types import MappingProxyType
+
+    from pydantic import BaseModel
+
+    is_instance = run_manifest_module._is_instance
+    assert is_instance({}, Mapping) and is_instance(MappingProxyType({}), Mapping)
+    assert is_instance(planned_manifest(), BaseModel)
+    assert is_instance((), tuple) and is_instance([], list) and is_instance((), (list, tuple))
+    assert not is_instance("text", Mapping) and not is_instance(5, (tuple, list)) and not is_instance(None, BaseModel)
+
+    class Custom(Mapping):
+        def __getitem__(self, key):
+            raise KeyError(key)
+
+        def __iter__(self):
+            return iter(())
+
+        def __len__(self):
+            return 0
+
+    assert is_instance(Custom(), Mapping)
+
+
+def test_a_class_only_registered_as_a_mapping_is_not_a_mapping() -> None:
+    iterated: list[str] = []
+
+    class RegisteredOnly:
+        def __getitem__(self, key):
+            iterated.append("getitem")
+            return 1
+
+        def __iter__(self):
+            iterated.append("iter")
+            return iter(())
+
+        def __len__(self):
+            return 0
+
+        def items(self):
+            iterated.append("items")
+            return ()
+
+    Mapping.register(RegisteredOnly)
+    value = RegisteredOnly()
+    assert isinstance(value, Mapping)  # the ABC machinery believes the registration
+    assert run_manifest_module._is_instance(value, Mapping) is False  # fail closed
+
+    planned = planned_manifest()
+    with pytest.raises((ValueError, TypeError, ValidationError)):
+        finish_run(
+            planned,
+            state=RunState.COMPLETED,
+            started_at=datetime(2026, 9, 28, 8, 0, tzinfo=timezone.utc),
+            finished_at=datetime(2026, 9, 28, 8, 1, tzinfo=timezone.utc),
+            resources=(value,),
+            measurements=(timing(),),
+        )
+    assert iterated == []  # never iterated as if it were a mapping
+
+
+class DelegatingProxy:
+    """Reports ``ResourceReading`` through ``__class__`` and delegates every attribute to a target."""
+
+    def __init__(self, target: object, events: list[str]) -> None:
+        object.__setattr__(self, "_target", target)
+        object.__setattr__(self, "_events", events)
+
+    @property
+    def __class__(self):  # noqa: D401 - the callback under test
+        object.__getattribute__(self, "_events").append("__class__")
+        return ResourceReading
+
+    def __getattr__(self, name: str):
+        return getattr(object.__getattribute__(self, "_target"), name)
+
+
+def _finish_with_resources(resources):
+    return finish_run(
+        planned_manifest(),
+        state=RunState.COMPLETED,
+        started_at=datetime(2026, 9, 28, 8, 0, tzinfo=timezone.utc),
+        finished_at=datetime(2026, 9, 28, 8, 1, tzinfo=timezone.utc),
+        resources=resources,
+        measurements=(timing(),),
+    )
+
+
+def test_a_delegating_proxy_cannot_smuggle_invalid_evidence_past_validation() -> None:
+    events: list[str] = []
+    invalid = measured_memory().model_copy(update={"observed_value": True})  # unchecked copy: a bool observation
+    with pytest.raises((ValueError, TypeError, ValidationError)):
+        _finish_with_resources((DelegatingProxy(invalid, events),))
+    assert events == []  # and rejecting it never ran the proxy's class callback
+
+
+def test_a_delegating_proxy_over_valid_evidence_is_also_refused() -> None:
+    events: list[str] = []
+    with pytest.raises((ValueError, TypeError, ValidationError)):
+        _finish_with_resources((DelegatingProxy(measured_memory(), events),))
+    assert events == []
+
+
+@pytest.mark.parametrize("leaf", [object(), b"bytes", {1, 2}, 1 + 2j, type, len])
+def test_an_unsupported_leaf_type_is_a_stable_error_before_validation(leaf) -> None:
+    from pydantic import BaseModel as _Base
+
+    resource = measured_memory()
+    dict.__setitem__(_Base.__dict__["__dict__"].__get__(resource, _Base), "unit", leaf)
+    with pytest.raises(ValueError, match="unsupported"):
+        _finish_with_resources((resource,))
+
+
+def test_genuine_scalars_enums_and_datetimes_still_pass() -> None:
+    manifest = _finish_with_resources((measured_memory(),))
+    assert manifest.state is RunState.COMPLETED and manifest.started_at.tzinfo is not None
+
+
+def _shared_pairs(depth: int):
+    node = (measured_memory(),)
+    for _ in range(depth):
+        node = (node, node)  # 2**depth paths over depth+1 tuples
+    return node
+
+
+def test_shared_exact_subtrees_cannot_force_exponential_reconstruction() -> None:
+    import time
+
+    started = time.monotonic()
+    with pytest.raises(ValueError, match="native snapshot budget"):
+        finish_run(
+            planned_manifest(),
+            state=RunState.COMPLETED,
+            started_at=datetime(2026, 9, 28, 8, 0, tzinfo=timezone.utc),
+            finished_at=datetime(2026, 9, 28, 8, 1, tzinfo=timezone.utc),
+            resources=(measured_memory(),),
+            measurements=_shared_pairs(40),
+        )
+    assert time.monotonic() - started < 10
+
+
+def test_a_nesting_depth_past_the_bound_is_a_stable_budget_error() -> None:
+    node: object = ()
+    for _ in range(run_manifest_module.MAX_SNAPSHOT_DEPTH + 5):
+        node = (node,)
+    with pytest.raises(ValueError, match="native snapshot budget"):
+        finish_run(
+            planned_manifest(),
+            state=RunState.COMPLETED,
+            started_at=datetime(2026, 9, 28, 8, 0, tzinfo=timezone.utc),
+            finished_at=datetime(2026, 9, 28, 8, 1, tzinfo=timezone.utc),
+            resources=(measured_memory(),),
+            measurements=node,
+        )
+
+
+def test_an_ordinary_manifest_is_far_inside_the_snapshot_budget() -> None:
+    manifest = completed_manifest()
+    frozen = run_manifest_module._freeze_model_graphs(manifest)
+    run_manifest_module._snapshot_native(manifest, _frozen_graph=frozen)
+    assert frozen.visits[0] < run_manifest_module.MAX_SNAPSHOT_VISITS // 50
+
+
+def test_a_tzinfo_whose_offset_changes_between_calls_cannot_split_validation_from_serialization() -> None:
+    from datetime import timedelta, tzinfo
+
+    calls: list[int] = []
+
+    class Flipping(tzinfo):
+        def utcoffset(self, dt):
+            calls.append(1)
+            return timedelta(0) if len(calls) % 2 else timedelta(hours=5)
+
+        def dst(self, dt):
+            return None
+
+        def tzname(self, dt):
+            return "flip"
+
+    manifest = finish_run(
+        planned_manifest(),
+        state=RunState.COMPLETED,
+        started_at=datetime(2026, 9, 28, 8, 0, tzinfo=Flipping()),
+        finished_at=datetime(2026, 9, 28, 8, 1, tzinfo=timezone.utc),
+        resources=(measured_memory(),),
+        measurements=(timing(),),
+    )
+    after_capture = len(calls)
+    encoded = serialize_run_manifest(manifest)
+    reparsed = validate_run_manifest_json(encoded)
+    assert len(calls) == after_capture  # the hostile tzinfo is never consulted again
+    assert reparsed.started_at == manifest.started_at and serialize_run_manifest(reparsed) == encoded
+
+
+def test_a_tzinfo_with_an_out_of_range_offset_is_a_stable_error() -> None:
+    from datetime import timedelta, tzinfo
+
+    class TooFar(tzinfo):
+        def utcoffset(self, dt):
+            return timedelta(hours=30)
+
+        def dst(self, dt):
+            return None
+
+    with pytest.raises((ValueError, TypeError)):
+        finish_run(
+            planned_manifest(),
+            state=RunState.COMPLETED,
+            started_at=datetime(2026, 9, 28, 8, 0, tzinfo=TooFar()),
+            finished_at=datetime(2026, 9, 28, 8, 1, tzinfo=timezone.utc),
+            resources=(measured_memory(),),
+            measurements=(timing(),),
+        )
+
+
+def test_children_exposed_only_by_a_view_stay_distinct_when_nothing_else_holds_them() -> None:
+    import gc
+
+    base = timing()
+
+    class Fresh(tuple):
+        def __new__(cls, count):
+            instance = super().__new__(cls, ())
+            instance.count = count
+            return instance
+
+        def __iter__(self):
+            for index in range(self.count):
+                child = base.model_copy(update={"name": f"fresh-{index}"})
+                gc.collect()  # the child is referenced only by this generator frame
+                yield child
+
+    manifest = finish_run(
+        planned_manifest(),
+        state=RunState.COMPLETED,
+        started_at=datetime(2026, 9, 28, 8, 0, tzinfo=timezone.utc),
+        finished_at=datetime(2026, 9, 28, 8, 1, tzinfo=timezone.utc),
+        resources=(measured_memory(),),
+        measurements=Fresh(120),
+    )
+    assert [m.name for m in manifest.measurements] == [f"fresh-{i}" for i in range(120)]
+
+
+class _ClassCallbackMixin:
+    """An enum-member base that reports ``ResourceReading`` through ``__class__`` and delegates to a target."""
+
+    events: list[str] = []
+    target: object = None
+
+    @property
+    def __class__(self):  # noqa: D401 - the callback under test
+        type(self).events.append("__class__")
+        return ResourceReading
+
+    def __getattr__(self, name: str):
+        return getattr(type(self).target, name)
+
+
+def _hostile_enum_member(target: object, events: list[str]):
+    from enum import Enum as _Enum
+
+    class Hostile(_ClassCallbackMixin, str, _Enum):
+        spoof = "measured"
+
+    Hostile.events = events
+    Hostile.target = target
+    return Hostile.spoof
+
+
+def test_an_enum_member_of_a_foreign_enum_cannot_carry_a_proxy_to_validation() -> None:
+    events: list[str] = []
+    invalid = measured_memory().model_copy(update={"observed_value": True})  # unchecked copy: a bool observation
+    member = _hostile_enum_member(invalid, events)
+    with pytest.raises(ValueError, match="unsupported value type"):
+        _finish_with_resources((member,))
+    assert events == []
+
+
+def test_a_foreign_enum_member_in_a_scalar_position_is_refused_without_a_callback() -> None:
+    events: list[str] = []
+    resource = measured_memory()
+    member = _hostile_enum_member(resource, events)
+    from pydantic import BaseModel as _Base
+
+    dict.__setitem__(_Base.__dict__["__dict__"].__get__(resource, _Base), "observation_kind", member)
+    with pytest.raises(ValueError, match="unsupported value type"):
+        _finish_with_resources((resource,))
+    assert events == []
+
+
+@pytest.mark.parametrize(
+    "member", [RunState.COMPLETED, CacheCondition.WARM, LimitKind.BOUNDED, ObservationKind.MEASURED],
+    ids=lambda m: type(m).__name__,
+)
+def test_members_of_the_projects_own_enums_are_supported_leaves(member) -> None:
+    assert run_manifest_module._is_supported_leaf(member)
+
+
+def test_the_allowed_enums_are_exactly_the_projects_own_by_identity() -> None:
+    from enum import Enum as _Enum
+
+    class RunState(_Enum):  # same name, different class
+        COMPLETED = "completed"
+
+    assert not run_manifest_module._is_supported_leaf(RunState.COMPLETED)
+    assert not run_manifest_module._is_supported_leaf(_Enum("Anything", {"a": 1}).a)
+
+
+# ── the capture phase is bounded, depth is a stable error, and offsets and extremes are stable ──
+
+_FINISH_WINDOW = dict(
+    started_at=datetime(2026, 9, 28, 8, 0, tzinfo=timezone.utc),
+    finished_at=datetime(2026, 9, 28, 8, 1, tzinfo=timezone.utc),
+)
+
+
+def _finish(**overrides):
+    values = dict(
+        state=RunState.COMPLETED, resources=(measured_memory(),), measurements=(timing(),), **_FINISH_WINDOW
+    )
+    values.update(overrides)
+    return finish_run(planned_manifest(), **values)
+
+
+def test_a_public_sequence_that_never_ends_is_stopped_by_the_budget_while_it_is_read():
+    produced = []
+
+    class Endless(tuple):
+        def __iter__(self):
+            for index in range(5_000_000):
+                produced.append(index)
+                yield measured_memory()
+
+    with pytest.raises(ValueError, match="exceeds the native snapshot budget"):
+        _finish(resources=Endless())
+    assert len(produced) <= run_manifest_module.MAX_SNAPSHOT_VISITS + 2
+
+
+def test_a_public_mapping_that_never_ends_is_stopped_by_the_budget_while_it_is_read():
+    produced = []
+
+    class Endless(Mapping):
+        def __getitem__(self, key):
+            raise KeyError(key)
+
+        def __iter__(self):
+            return iter(())
+
+        def __len__(self):
+            return 0
+
+        def items(self):
+            for index in range(5_000_000):
+                produced.append(index)
+                yield f"key-{index}", index
+
+    with pytest.raises(ValueError, match="exceeds the native snapshot budget"):
+        _finish(measurements=(Endless(),))
+    assert len(produced) <= run_manifest_module.MAX_SNAPSHOT_VISITS + 2
+
+
+def test_deep_nesting_is_a_budget_error_and_not_a_recursion_error():
+    deep: tuple = ()
+    for _ in range(5_000):
+        deep = (deep,)
+    values = timing().model_dump(mode="python")
+    values["provenance"] = {**timing().provenance.model_dump(mode="python"), "deep": deep}
+    with pytest.raises(ValueError, match="exceeds the native snapshot budget"):
+        _finish(measurements=(values,))
+
+
+@pytest.mark.parametrize(
+    "tzinfo_factory",
+    [
+        pytest.param(lambda: _OffsetRaises(), id="raises"),
+        pytest.param(lambda: _OffsetWrongType(), id="not-a-timedelta"),
+    ],
+)
+def test_a_tzinfo_that_fails_to_report_an_offset_is_a_stable_error(tzinfo_factory):
+    when = datetime(2026, 9, 28, 8, 1, tzinfo=tzinfo_factory())
+    with pytest.raises(ValueError, match="unsupported UTC offset"):
+        _finish(finished_at=when)
+
+
+class _OffsetRaises(__import__("datetime").tzinfo):
+    def utcoffset(self, value):
+        raise RuntimeError("no offset")
+
+    def dst(self, value):
+        return None
+
+
+class _OffsetWrongType(__import__("datetime").tzinfo):
+    def utcoffset(self, value):
+        return 3600
+
+    def dst(self, value):
+        return None
+
+
+def test_extreme_instants_are_ordered_without_overflow_in_either_position():
+    minus_five = timezone(-timedelta(hours=5))
+    late = datetime(9999, 12, 31, 23, 0, tzinfo=minus_five)
+    early = datetime(9999, 12, 31, 20, 0, tzinfo=minus_five)
+    assert _finish(started_at=early, finished_at=late).finished_at == late
+    with pytest.raises(ValueError, match="finished_at cannot precede started_at"):
+        _finish(started_at=late, finished_at=early)
+    plus_three = timezone(timedelta(hours=3))
+    first = datetime(1, 1, 1, 3, 30, tzinfo=plus_three)
+    assert _finish(started_at=first, finished_at=datetime(1, 1, 1, 12, tzinfo=timezone.utc)).started_at == first
+    with pytest.raises(ValueError, match="finished_at cannot precede started_at"):
+        _finish(started_at=datetime(1, 1, 1, 12, tzinfo=timezone.utc), finished_at=first)
+
+
+def test_every_enum_a_manifest_field_uses_is_in_the_allow_list():
+    import typing
+
+    used = set()
+    for model in (RunManifest, ResourceReading, TimingMeasurement):
+        for field in model.model_fields.values():
+            for part in (field.annotation, *typing.get_args(field.annotation)):
+                if isinstance(part, type) and issubclass(part, run_manifest_module.Enum):
+                    used.add(part)
+    assert used and used <= set(run_manifest_module._ALLOWED_ENUMS)
+
+
+@pytest.mark.parametrize("endless", ["names", "items"])
+def test_a_model_extra_mapping_that_never_ends_is_stopped_by_the_budget_while_it_is_read(endless):
+    produced = []
+
+    class EndlessExtra(Mapping):
+        def __getitem__(self, key):
+            raise KeyError(key)
+
+        def __len__(self):
+            return 0
+
+        def __iter__(self):
+            if endless == "items":
+                return iter(())
+            for index in range(3_000_000):
+                produced.append(index)
+                yield f"extra-{index}"
+
+        def items(self):
+            for index in range(3_000_000):
+                produced.append(index)
+                yield f"extra-{index}", index
+
+    resource = measured_memory()
+    object.__setattr__(resource, "__pydantic_extra__", EndlessExtra())
+    with pytest.raises(ValueError, match="exceeds the native snapshot budget"):
+        _finish(resources=(resource,))
+    assert len(produced) <= run_manifest_module.MAX_SNAPSHOT_VISITS + 2
+
+
+def test_a_model_extra_mapping_within_the_budget_is_still_read_once():
+    calls = []
+
+    class SmallExtra(Mapping):
+        def __getitem__(self, key):
+            raise KeyError(key)
+
+        def __len__(self):
+            return 0
+
+        def __iter__(self):
+            calls.append("iter")
+            return iter(())
+
+        def items(self):
+            calls.append("items")
+            return iter(())
+
+    resource = measured_memory()
+    object.__setattr__(resource, "__pydantic_extra__", SmallExtra())
+    try:
+        _finish(resources=(resource,))
+    except ValueError:
+        pass  # a closed model may refuse extras; only the single read is pinned here
+    assert calls.count("iter") <= 1 and calls.count("items") <= 1
+
+
+# ── an offset is read once and is an exact timedelta; a missing offset at capture stays missing ──
+
+
+class _EvilOffset(timedelta):
+    """A timedelta subclass whose subtraction lies: any difference it takes part in is minus one day."""
+
+    def __sub__(self, other):
+        return timedelta(days=-1)
+
+    def __rsub__(self, other):
+        return timedelta(days=-1)
+
+
+class _FixedTz(__import__("datetime").tzinfo):
+    def __init__(self, offset):
+        self._offset = offset
+
+    def utcoffset(self, value):
+        return self._offset
+
+    def dst(self, value):
+        return None
+
+
+class _ScriptedTz(__import__("datetime").tzinfo):
+    """Answers each utcoffset call from a script, then repeats the last answer."""
+
+    def __init__(self, answers):
+        self._answers, self.calls = list(answers), 0
+
+    def utcoffset(self, value):
+        answer = self._answers[min(self.calls, len(self._answers) - 1)]
+        self.calls += 1
+        return answer
+
+    def dst(self, value):
+        return None
+
+
+def _revalidated(manifest, **fields):
+    return RunManifest.model_validate({**manifest.model_dump(mode="python"), **fields})
+
+
+def _reversed_by_a_lying_offset():
+    finished = datetime(2026, 9, 28, 8, 0, tzinfo=_FixedTz(_EvilOffset(hours=1)))  # 07:00 UTC
+    started = datetime(2026, 9, 28, 9, 0, tzinfo=timezone.utc)  # 09:00 UTC: the run ends before it starts
+    return started, finished
+
+
+def test_a_timedelta_subclass_offset_cannot_reverse_a_run_interval_when_captured():
+    started, finished = _reversed_by_a_lying_offset()
+    with pytest.raises(ValueError, match="finished_at cannot precede started_at"):
+        _finish(started_at=started, finished_at=finished)
+
+
+def test_a_timedelta_subclass_offset_cannot_reverse_a_run_interval_in_direct_construction():
+    manifest = _finish()
+    started, finished = _reversed_by_a_lying_offset()
+    with pytest.raises(ValueError, match="finished_at cannot precede started_at"):
+        _revalidated(manifest, started_at=started, finished_at=finished)
+    with pytest.raises(ValueError, match="finished_at cannot precede started_at"):
+        _revalidated(manifest, started_at=finished.replace(tzinfo=_FixedTz(_EvilOffset(hours=-1))), finished_at=started.replace(tzinfo=timezone.utc) - timedelta(hours=3))
+
+
+def test_a_stored_timestamp_keeps_an_exact_fixed_offset_after_validation():
+    manifest = _finish()
+    shifted = datetime(2026, 9, 28, 9, 30, tzinfo=_FixedTz(_EvilOffset(hours=1)))
+    kept = _revalidated(manifest, started_at=datetime(2026, 9, 28, 8, 0, tzinfo=timezone.utc), finished_at=shifted)
+    offset = kept.finished_at.utcoffset()
+    assert type(offset) is timedelta and offset == timedelta(hours=1)
+    assert kept.finished_at.tzinfo is not shifted.tzinfo  # the caller's tzinfo is not retained
+
+
+def test_a_tzinfo_that_reports_no_offset_once_and_a_valid_one_afterwards_is_refused_at_capture():
+    tz = _ScriptedTz([None, timedelta(0), timedelta(0)])
+    when = datetime(2026, 9, 28, 8, 1, tzinfo=tz)
+    with pytest.raises(ValueError, match="explicit UTC offset"):
+        _finish(finished_at=when)
+
+
+def test_a_tzinfo_whose_offset_changes_between_reads_is_read_once_in_direct_construction():
+    manifest = _finish()
+    tz = _ScriptedTz([timedelta(hours=1), timedelta(hours=-5), timedelta(hours=9)])
+    when = datetime(2026, 9, 28, 9, 30, tzinfo=tz)
+    kept = _revalidated(manifest, started_at=datetime(2026, 9, 28, 8, 0, tzinfo=timezone.utc), finished_at=when)
+    assert tz.calls == 1  # one read by the validator; nothing later asks the caller's tzinfo again
+    assert kept.finished_at.utcoffset() == timedelta(hours=1) == kept.finished_at.utcoffset()
+
+
+# ── capture is charged before it retains; one datetime gets one offset per call ──
+
+
+def _model_with_stored_entries(n: int):
+    model = measured_memory()
+    stored = BaseModel.__dict__["__dict__"].__get__(model, BaseModel)
+    for index in range(n):
+        dict.__setitem__(stored, f"extra_{index}", index)
+    return model
+
+
+@pytest.mark.parametrize(
+    "build",
+    [
+        lambda n: list(range(n)),
+        lambda n: tuple(range(n)),
+        lambda n: {f"k{i}": i for i in range(n)},
+        lambda n: _model_with_stored_entries(n),
+    ],
+    ids=["list", "tuple", "dict", "model"],
+)
+def test_native_capture_is_charged_before_its_entries_are_retained(build) -> None:
+    oversized = build(run_manifest_module.MAX_SNAPSHOT_VISITS + 1)
+    with pytest.raises(ValueError, match=run_manifest_module.SNAPSHOT_BUDGET_MESSAGE):
+        run_manifest_module._freeze_model_graphs(oversized)
+
+
+def test_native_capture_within_the_budget_is_kept() -> None:
+    graph = run_manifest_module._freeze_model_graphs([[] for _ in range(1_000)])
+    assert len(graph.replay_entries) == 1_001
+
+
+class _FlippingOffset(tzinfo):
+    """Reports one UTC offset on the first call and another on every later call."""
+
+    def __init__(self, first: timedelta, then: timedelta) -> None:
+        self.answers = [first, then]
+        self.calls = 0
+
+    def utcoffset(self, dt):
+        self.calls += 1
+        return self.answers[0] if self.calls == 1 else self.answers[1]
+
+    def dst(self, dt):
+        return None
+
+
+@pytest.mark.parametrize(
+    "first,then",
+    [(timedelta(0), timedelta(hours=-5)), (timedelta(hours=-5), timedelta(0))],
+    ids=["utc-then-minus-five", "minus-five-then-utc"],
+)
+def test_one_datetime_supplied_twice_is_read_with_one_offset(first, then) -> None:
+    shared = datetime(2026, 9, 28, 8, 0, tzinfo=_FlippingOffset(first, then))
+    finished = finish_run(
+        planned_manifest(),
+        state=RunState.COMPLETED,
+        started_at=shared,
+        finished_at=shared,
+        resources=(measured_memory(),),
+        measurements=(timing(),),
+    )
+    assert finished.started_at == finished.finished_at  # identical inputs: a zero-length interval
+    assert finished.started_at.utcoffset() == first  # the first observed offset is kept
+
+
+def test_an_oversized_native_container_is_refused_before_its_entries_are_copied() -> None:
+    import tracemalloc
+
+    oversized = [[] for _ in range(run_manifest_module.MAX_SNAPSHOT_VISITS + 1)]
+    tracemalloc.start()
+    try:
+        with pytest.raises(ValueError, match=run_manifest_module.SNAPSHOT_BUDGET_MESSAGE):
+            run_manifest_module._freeze_model_graphs(oversized)
+        _current, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    # Copying the 65,537 entries would allocate a tuple of about half a megabyte; refusing first
+    # allocates only bookkeeping.
+    assert peak < 128 * 1024, peak
+
+
+# ---- the pre-copy size check does not spend the snapshot's own budget a second time
+
+def test_a_flat_native_list_within_the_declared_budget_is_still_accepted() -> None:
+    """``MAX_SNAPSHOT_VISITS`` bounds the snapshot; a 40,000-entry list inside it keeps passing capture and snapshot."""
+
+    value = list(range(40_000))
+    frozen = run_manifest_module._freeze_model_graphs(value)
+    run_manifest_module._snapshot_native(value, _frozen_graph=frozen)
+
+
+def test_the_largest_accepted_native_list_is_the_snapshots_own_limit() -> None:
+    limit = run_manifest_module.MAX_SNAPSHOT_VISITS
+    for size, accepted in ((limit - 1, True), (limit, False)):
+        value = list(range(size))
+        try:
+            frozen = run_manifest_module._freeze_model_graphs(value)
+            run_manifest_module._snapshot_native(value, _frozen_graph=frozen)
+            verdict = True
+        except ValueError as error:
+            assert str(error) == run_manifest_module.SNAPSHOT_BUDGET_MESSAGE
+            verdict = False
+        assert verdict is accepted, size
+
+
+def test_finish_run_keeps_its_capacity_for_timing_measurements() -> None:
+    """3,000 distinct timing measurements were accepted before the pre-copy charge (the limit was 3,444)."""
+
+    base = timing()
+    measurements = tuple(base.model_copy(update={"name": f"m{i}"}) for i in range(3_000))
+    finish_run(
+        planned_manifest(),
+        state=RunState.COMPLETED,
+        started_at=datetime(2026, 9, 28, 8, 0, tzinfo=timezone.utc),
+        finished_at=datetime(2026, 9, 28, 9, 0, tzinfo=timezone.utc),
+        resources=(measured_memory(),),
+        measurements=measurements,
+    )
+
+
+def test_native_entries_across_containers_are_bounded_together_before_any_is_copied() -> None:
+    """Many containers that are each within the budget add up: the freeze refuses the graph, not just one container."""
+
+    import tracemalloc
+
+    graph = [list(range(1_000)) for _ in range(100)]  # 100,100 entries in total
+    tracemalloc.start()
+    try:
+        with pytest.raises(ValueError, match=run_manifest_module.SNAPSHOT_BUDGET_MESSAGE):
+            run_manifest_module._freeze_model_graphs(graph)
+        _current, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert peak < 2_000_000, peak  # about 66 of the 100 lists were counted and copied, not all of them plus a snapshot

@@ -10,7 +10,8 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping
-from datetime import datetime, timezone
+from types import MappingProxyType
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Annotated, Any, Literal, NamedTuple, Self
 
@@ -82,12 +83,23 @@ class _FrozenGraph(NamedTuple):
     public_sequence_queue: list[object]
     public_sequence_cursor: list[int]
     public_sequences: dict[int, _FrozenPublicSequence]
+    visits: list[int]
+    # Entries of native containers charged before they are copied (see ``_charge_native``): its own
+    # counter, so the pre-copy check does not spend the visit budget the snapshot uses for the same nodes.
+    native_entries: list[int]
+    # id -> (the caller's datetime, its fixed-offset copy): one offset per object per call.  The
+    # original is retained so its id cannot be reused by another object during the call.
+    fixed_datetimes: dict[int, tuple[datetime, datetime]]
 
 
 class _ManifestContract(BaseModel):
     """Strict, immutable base local to the standalone benchmark package."""
 
-    model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
+    # ``revalidate_instances`` is defense in depth: a model instance that ever reached
+    # validation would have its fields checked again instead of being trusted.
+    model_config = ConfigDict(
+        extra="forbid", strict=True, frozen=True, revalidate_instances="always"
+    )
     schema_version: Literal["candidate-v1"]
 
 
@@ -264,6 +276,37 @@ class TimingMeasurement(_ManifestContract):
         return self
 
 
+def _exact_offset(offset: object) -> timedelta:
+    """An exact ``timedelta`` with the value of ``offset``, read through the built-in slots.
+
+    A ``tzinfo`` may return a ``timedelta`` subclass whose arithmetic or attributes run caller code;
+    the three fields are read with the base type's own accessors and a fresh exact value is built.
+    """
+
+    return timedelta(
+        days=timedelta.days.__get__(offset),  # type: ignore[arg-type]
+        seconds=timedelta.seconds.__get__(offset),  # type: ignore[arg-type]
+        microseconds=timedelta.microseconds.__get__(offset),  # type: ignore[arg-type]
+    )
+
+
+def _instant_before(left: datetime, right: datetime) -> bool:
+    """Whether ``left`` is an earlier instant than ``right``, without leaving the datetime range.
+
+    Converting to UTC raises ``OverflowError`` at the ends of the range.  The difference of the two
+    naive wall times and the difference of the two offsets cannot overflow, and ``fold`` is honoured
+    because each offset is the datetime's own.
+    """
+
+    offsets = (datetime.utcoffset(left), datetime.utcoffset(right))
+    if offsets[0] is None or offsets[1] is None:
+        raise ValueError("run timestamps must include an explicit UTC offset")
+    left_offset, right_offset = _exact_offset(offsets[0]), _exact_offset(offsets[1])
+    # Built-in arithmetic only: no operand's own __sub__ or __rsub__ can run.
+    wall = datetime.__sub__(datetime.replace(left, tzinfo=None), datetime.replace(right, tzinfo=None))
+    return timedelta.__sub__(wall, timedelta.__sub__(left_offset, right_offset)) < timedelta(0)
+
+
 class RunManifest(_ManifestContract):
     """A reproducible benchmark run envelope with explicit evidence state."""
 
@@ -281,9 +324,19 @@ class RunManifest(_ManifestContract):
     @field_validator("started_at", "finished_at")
     @classmethod
     def require_aware_timestamp(cls, value: datetime | None) -> datetime | None:
-        if value is not None and (value.tzinfo is None or value.utcoffset() is None):
-            raise ValueError("run timestamps must include an explicit UTC offset")
-        return value
+        if value is None:
+            return None
+        # Read the caller's tzinfo once and keep an exact fixed-offset copy, so nothing later (the
+        # ordering check, serialization) asks caller code again or sees a different answer.
+        try:
+            offset = datetime.utcoffset(value)
+            if offset is None:
+                raise ValueError("run timestamps must include an explicit UTC offset")
+            return datetime.replace(value, tzinfo=timezone(_exact_offset(offset)))
+        except ValueError:
+            raise
+        except Exception:  # a tzinfo is caller code: it can raise, or return something that is no offset
+            raise ValueError("run timestamps must have a usable UTC offset") from None
 
     @model_validator(mode="after")
     def validate_run_evidence(self) -> Self:
@@ -305,9 +358,7 @@ class RunManifest(_ManifestContract):
         if self.finished_at is not None and self.started_at is not None:
             # Same-zone datetimes compare by wall time and ignore fold, so
             # order the instants themselves.
-            if self.finished_at.astimezone(timezone.utc) < self.started_at.astimezone(
-                timezone.utc
-            ):
+            if _instant_before(self.finished_at, self.started_at):
                 raise ValueError("finished_at cannot precede started_at")
 
         if self.state is RunState.PLANNED:
@@ -345,9 +396,9 @@ def _retain_public_mapping(value: Any, frozen_graph: _FrozenGraph) -> bool:
     """Retain a strong owner for a supported nonexact public mapping."""
 
     if (
-        isinstance(value, BaseModel)
+        _is_instance(value, BaseModel)
         or type(value) is dict
-        or not isinstance(value, Mapping)
+        or not _is_instance(value, Mapping)
     ):
         return False
     identity = id(value)
@@ -358,6 +409,47 @@ def _retain_public_mapping(value: Any, frozen_graph: _FrozenGraph) -> bool:
     frozen_graph.public_mapping_queue.append(value)
     frozen_graph.public_mappings.pop(identity, None)
     return True
+
+
+_TYPE_MRO = vars(type)["__mro__"]
+_MAPPING_BASES = (Mapping, dict, MappingProxyType)
+
+
+def _is_subclass(cls: type, types: type | tuple[type, ...]) -> bool:
+    """Whether ``cls`` inherits from one of ``types``, decided by identity on the native MRO.
+
+    ``issubclass`` against an ABC (``Mapping``) or pydantic's ABC-based metaclass
+    (``BaseModel``) runs ``ABCMeta.__subclasscheck__``: registry lookups that hash and
+    compare ``cls`` and honour ``__subclasshook__``, so a class with a hostile metaclass
+    ``__hash__``/``__eq__``/``__subclasscheck__`` could run code or be matched by
+    spoofing.  This reads the class's real MRO through the base ``type`` descriptor and
+    compares with ``is``.  ``Mapping`` also recognises ``dict`` and ``mappingproxy``
+    bases explicitly; a class only *registered* as a mapping is not treated as one.
+    """
+
+    wanted: list[type] = []
+    for candidate in types if type(types) is tuple else (types,):
+        if candidate is Mapping:
+            wanted.extend(_MAPPING_BASES)
+        else:
+            wanted.append(candidate)
+    for base in _TYPE_MRO.__get__(cls):
+        for candidate in wanted:
+            if base is candidate:
+                return True
+    return False
+
+
+def _is_instance(value: Any, types: type | tuple[type, ...]) -> bool:
+    """``isinstance`` that runs no caller-controlled code: no ``__class__``, no ABC registry.
+
+    ``isinstance`` consults ``value.__class__`` (a hostile container can make that a
+    callback that runs before its contents are captured), and ABC or pydantic metaclass
+    checks run ``__subclasscheck__`` machinery.  ``type(value)`` is not overridable and
+    :func:`_is_subclass` compares native MRO entries by identity.
+    """
+
+    return _is_subclass(type(value), types)
 
 
 def _is_exact_type(value_type: type, exact: tuple[type, ...]) -> bool:
@@ -379,9 +471,9 @@ def _retain_public_sequence(value: Any, frozen_graph: _FrozenGraph) -> bool:
     """
 
     if (
-        isinstance(value, (BaseModel, Mapping))
+        _is_instance(value, (BaseModel, Mapping))
         or _is_exact_type(type(value), (tuple, list))
-        or not isinstance(value, (tuple, list))
+        or not _is_instance(value, (tuple, list))
     ):
         return False
     identity = id(value)
@@ -402,8 +494,8 @@ def _retain_extra_mapping(
 
     if (
         value is None
-        or issubclass(type(value), dict)
-        or not isinstance(value, Mapping)
+        or _is_subclass(type(value), dict)
+        or not _is_instance(value, Mapping)
     ):
         return False
     identity = id(value)
@@ -437,12 +529,14 @@ def _inventory_extra_mapping(
     else:
         while True:
             try:
-                iterated_names.append(next(name_iterator))
+                name = next(name_iterator)
             except StopIteration:
                 break
             except Exception as error:
                 failure = error
                 break
+            _charge_capture(frozen_graph)
+            iterated_names.append(name)
 
     if failure is None:
         try:
@@ -452,12 +546,14 @@ def _inventory_extra_mapping(
         else:
             while True:
                 try:
-                    item_entries.append(next(item_iterator))
+                    entry = next(item_iterator)
                 except StopIteration:
                     break
                 except Exception as error:
                     failure = error
                     break
+                _charge_capture(frozen_graph)
+                item_entries.append(entry)
 
     frozen = _FrozenExtraInventory(
         owner=value,
@@ -495,7 +591,7 @@ def _freeze_model_storage(
         current = pending.pop()
         _retain_public_mapping(current, frozen_graph)
         value_type = type(current)
-        is_native_container = issubclass(
+        is_native_container = _is_subclass(
             value_type, (BaseModel, tuple, list, dict)
         )
         if not is_native_container:
@@ -512,19 +608,23 @@ def _freeze_model_storage(
         frozen_graph.completed_traversals.pop(identity, None)
         frozen_graph.completed_mapping_discoveries.pop(identity, None)
 
-        if issubclass(value_type, BaseModel):
+        if _is_subclass(value_type, BaseModel):
             existing_model = frozen_graph.models.get(identity)
             if existing_model is not None and existing_model[0] is current:
                 continue
             stored = _BASE_MODEL_DICT_DESCRIPTOR.__get__(current, BaseModel)
-            stored_entries = tuple(dict.items(stored))
             try:
                 extras = _BASE_MODEL_EXTRA_DESCRIPTOR.__get__(current, BaseModel)
             except AttributeError:
                 extras = None
+            extra_count = (
+                dict.__len__(extras) if extras is not None and _is_subclass(type(extras), dict) else 0
+            )
+            _charge_native(frozen_graph, dict.__len__(stored) + extra_count)
+            stored_entries = tuple(dict.items(stored))
             native_extra_entries = (
                 tuple(dict.items(extras))
-                if extras is not None and issubclass(type(extras), dict)
+                if extras is not None and _is_subclass(type(extras), dict)
                 else None
             )
             _retain_extra_mapping(extras, frozen_graph)
@@ -544,11 +644,14 @@ def _freeze_model_storage(
             ):
                 continue
 
-            if issubclass(value_type, tuple):
+            if _is_subclass(value_type, tuple):
+                _charge_native(frozen_graph, tuple.__len__(current))
                 entries = tuple(tuple.__iter__(current))
-            elif issubclass(value_type, list):
+            elif _is_subclass(value_type, list):
+                _charge_native(frozen_graph, list.__len__(current))
                 entries = tuple(list.__iter__(current))
             else:
+                _charge_native(frozen_graph, dict.__len__(current))
                 dict_entries = tuple(dict.items(current))
                 entries = tuple(item for _key, item in dict_entries)
             if _is_exact_type(value_type, (dict, list, tuple)):
@@ -578,19 +681,19 @@ def _retain_reachable_public_sequences(
             continue
         visited[identity] = authoritative
 
-        is_model = isinstance(current, BaseModel)
+        is_model = _is_instance(current, BaseModel)
         if not is_model and authoritative:
             _retain_public_sequence(current, frozen_graph)
 
         value_type = type(current)
-        if not issubclass(value_type, (BaseModel, tuple, list, dict)):
+        if not _is_subclass(value_type, (BaseModel, tuple, list, dict)):
             continue
         frozen_replay = frozen_graph.replay_entries.get(identity)
         if frozen_replay is None or frozen_replay[0] is not current:
             _freeze_model_storage(current, frozen_graph, set())
             frozen_replay = frozen_graph.replay_entries[identity]
         _owner, entries = frozen_replay
-        local_authority = issubclass(
+        local_authority = _is_subclass(
             value_type, BaseModel
         ) or _is_exact_type(value_type, (dict, list, tuple))
         child_authority = authoritative and local_authority
@@ -607,10 +710,11 @@ def _traverse_model_storage(
     """Retain historical native-recursion failures at validation order."""
 
     traversed: dict[int, object] = {}
+    depth = [0]
 
     def visit(current: Any) -> None:
         value_type = type(current)
-        is_native_container = issubclass(
+        is_native_container = _is_subclass(
             value_type, (BaseModel, tuple, list, dict)
         )
         if not is_native_container:
@@ -627,8 +731,14 @@ def _traverse_model_storage(
             frozen_replay = frozen_graph.replay_entries[identity]
         owner, entries = frozen_replay
         traversed[identity] = owner
+        # The walk recurses; the snapshot's depth bound applies here too, so nesting deeper than
+        # the manifest allows is a stable budget error and never a RecursionError.
+        depth[0] += 1
+        if depth[0] > MAX_SNAPSHOT_DEPTH:
+            raise ValueError(SNAPSHOT_BUDGET_MESSAGE)
         for item in entries:
             visit(item)
+        depth[0] -= 1
 
     visit(value)
     frozen_graph.completed_traversals.update(traversed)
@@ -641,7 +751,7 @@ def _protect_yielded_model_storage(
     """Capture and successfully traverse yielded supported storage once."""
 
     value_type = type(value)
-    if not issubclass(value_type, (BaseModel, tuple, list, dict)):
+    if not _is_subclass(value_type, (BaseModel, tuple, list, dict)):
         return False
 
     identity = id(value)
@@ -678,11 +788,11 @@ def _inventory_reachable_public_mappings(
             continue
         visited[identity] = authoritative
 
-        is_model = isinstance(current, BaseModel)
+        is_model = _is_instance(current, BaseModel)
         if (
             not is_model
             and type(current) is not dict
-            and isinstance(current, Mapping)
+            and _is_instance(current, Mapping)
         ):
             _retain_public_mapping(current, frozen_graph)
             active_owner = observing.get(identity)
@@ -699,7 +809,7 @@ def _inventory_reachable_public_mappings(
             not is_model
             and authoritative
             and not _is_exact_type(type(current), (tuple, list))
-            and isinstance(current, (tuple, list))
+            and _is_instance(current, (tuple, list))
         ):
             _retain_public_sequence(current, frozen_graph)
             active_owner = observing.get(identity)
@@ -723,14 +833,14 @@ def _inventory_reachable_public_mappings(
             continue
 
         value_type = type(current)
-        if not issubclass(value_type, (BaseModel, tuple, list, dict)):
+        if not _is_subclass(value_type, (BaseModel, tuple, list, dict)):
             continue
         frozen_replay = frozen_graph.replay_entries.get(identity)
         if frozen_replay is None or frozen_replay[0] is not current:
             _freeze_model_storage(current, frozen_graph, set())
             frozen_replay = frozen_graph.replay_entries[identity]
         _owner, entries = frozen_replay
-        local_authority = issubclass(
+        local_authority = _is_subclass(
             value_type, BaseModel
         ) or _is_exact_type(value_type, (dict, list, tuple))
         child_authority = authoritative and local_authority
@@ -782,6 +892,7 @@ def _inventory_public_sequence(
                 except Exception as error:
                     failure = error
                     break
+                _charge_capture(frozen_graph)
                 entries.append(item)
                 try:
                     _protect_yielded_model_storage(item, frozen_graph)
@@ -834,16 +945,14 @@ def _inventory_yielded_public_shape(
     """Protect one yielded value's authoritative public shape."""
 
     identity = id(value)
-    if not isinstance(value, BaseModel):
-        if type(value) is not dict and isinstance(value, Mapping):
+    if not _is_instance(value, BaseModel):
+        if type(value) is not dict and _is_instance(value, Mapping):
             if observing.get(identity) is value:
                 return False
             _retain_public_mapping(value, frozen_graph)
             if not _inventory_public_mapping(value, frozen_graph, observing):
                 return False
-        elif not _is_exact_type(type(value), (tuple, list)) and isinstance(
-            value, (tuple, list)
-        ):
+        elif not _is_exact_type(type(value), (tuple, list)) and _is_instance(value, (tuple, list)):
             if observing.get(identity) is value:
                 return False
             _retain_public_sequence(value, frozen_graph)
@@ -898,6 +1007,7 @@ def _inventory_public_mapping(
                 except Exception as error:
                     failure = error
                     break
+                _charge_capture(frozen_graph)
                 entries.append((key, item))
 
                 try:
@@ -982,6 +1092,9 @@ def _freeze_model_graphs(*values: Any) -> _FrozenGraph:
         public_sequence_queue=[],
         public_sequence_cursor=[0],
         public_sequences={},
+        visits=[0],
+        native_entries=[0],
+        fixed_datetimes={},
     )
     visited: set[int] = set()
     for value in values:
@@ -992,6 +1105,118 @@ def _freeze_model_graphs(*values: Any) -> _FrozenGraph:
     _inventory_retained_public_sequences(frozen_graph)
     _inventory_retained_public_mappings(frozen_graph)
     return frozen_graph
+
+
+_LEAF_TYPES = (type(None), bool, int, float, str, datetime)
+# The manifest has a handful of levels and a few thousand values.  The snapshot visits each
+# *occurrence* (shared subtrees are not memoized because a public view must be observed once
+# per occurrence), so an unbounded input could do exponential work or exhaust the stack.
+MAX_SNAPSHOT_VISITS = 65_536
+MAX_SNAPSHOT_DEPTH = 64
+SNAPSHOT_BUDGET_MESSAGE = "manifest input exceeds the native snapshot budget"
+
+
+def _charge_capture(frozen_graph: _FrozenGraph) -> None:
+    """Charge one public-view entry as it is read, so an iterator that never ends is cut off.
+
+    The capture and the snapshot share one budget: an entry read here is charged before it is
+    kept, and the same counter then bounds the snapshot that follows.
+    """
+
+    frozen_graph.visits[0] += 1
+    if frozen_graph.visits[0] > MAX_SNAPSHOT_VISITS:
+        raise ValueError(SNAPSHOT_BUDGET_MESSAGE)
+
+
+def _charge_native(frozen_graph: _FrozenGraph, count: int) -> None:
+    """Charge a native container's entries *before* they are copied and retained.
+
+    The count comes from the container's own length slot (no caller code runs), so an oversized
+    native graph is refused before it is materialized.  Every container but the root is an entry of
+    its parent, so counting entries bounds the nodes that are copied.  The limit is the snapshot's own
+    (``MAX_SNAPSHOT_VISITS``) but the counter is separate: a graph the snapshot accepts has at most that
+    many entries, so the check never refuses an input the snapshot would take, and the two phases do
+    not add up.
+    """
+
+    if count > MAX_SNAPSHOT_VISITS - frozen_graph.native_entries[0]:
+        frozen_graph.native_entries[0] = MAX_SNAPSHOT_VISITS + 1
+        frozen_graph.visits[0] = MAX_SNAPSHOT_VISITS + 1
+        raise ValueError(SNAPSHOT_BUDGET_MESSAGE)
+    frozen_graph.native_entries[0] += count
+
+
+def _charge_snapshot(frozen_graph: _FrozenGraph, active: set[int]) -> None:
+    """Charge one visit and enforce the depth bound (depth = containers on the active path)."""
+
+    frozen_graph.visits[0] += 1
+    if frozen_graph.visits[0] > MAX_SNAPSHOT_VISITS or len(active) > MAX_SNAPSHOT_DEPTH:
+        raise ValueError(SNAPSHOT_BUDGET_MESSAGE)
+
+
+_ALLOWED_ENUMS = (RunState, CacheCondition, LimitKind, ObservationKind)
+
+
+def _is_supported_leaf(value: Any) -> bool:
+    """Whether ``value`` is a JSON-style scalar, a datetime or a member of a project enum.
+
+    Everything is decided on the value's real type by identity.  Only members of the
+    manifest's own enum classes are accepted, never a generic ``Enum`` subclass: an enum
+    member can define a ``__class__`` callback and delegate model storage to another
+    object, and Pydantic would read that ``__class__`` while validating.
+    """
+
+    kind = type(value)
+    return _is_exact_type(kind, _LEAF_TYPES) or _is_exact_type(kind, _ALLOWED_ENUMS)
+
+
+def _require_native_snapshot(snapshot: Any) -> Any:
+    """Reject, with a stable error and before Pydantic sees it, any unsupported value.
+
+    ``_snapshot_native`` rebuilds models, mappings and sequences as exact dicts, lists and
+    tuples and returns every other value untouched.  An object that merely *reports* a model
+    class through ``__class__`` (or delegates attributes to one) would otherwise reach
+    Pydantic, which can recognise it as an already-validated instance and skip revalidating
+    its fields.  The walk is iterative and reads only real types.
+    """
+
+    pending: list[tuple[Any, str]] = [(snapshot, "$")]
+    seen: set[int] = set()
+    while pending:
+        value, path = pending.pop()
+        kind = type(value)
+        if _is_exact_type(kind, (dict, list, tuple)):
+            if id(value) in seen:
+                continue
+            seen.add(id(value))
+            if kind is dict:
+                pending.extend((item, f"{path}[{key!r}]") for key, item in dict.items(value))
+            else:
+                pending.extend((item, f"{path}[{index}]") for index, item in enumerate(value))
+        elif not _is_supported_leaf(value):
+            raise ValueError(f"unsupported value type at {path}")
+    return snapshot
+
+
+def _fixed_offset(value: datetime, path: str) -> datetime:
+    """Read a datetime's UTC offset exactly once and keep a fixed-offset copy.
+
+    A ``tzinfo`` is caller code: its ``utcoffset`` can return a different answer on every
+    call (or depend on ``fold``), so a value validated against one reading could serialize
+    or compare against another.  The offset is read once here, at capture, and the
+    manifest keeps the same wall time under that fixed offset (an exact ``timedelta``).  A value with
+    no offset becomes naive, which validation refuses.
+    """
+
+    try:
+        offset = datetime.utcoffset(value)
+        if offset is None:
+            # No offset at capture: drop the caller's tzinfo, so validation refuses the naive value
+            # and a later read cannot find an offset that was not there.
+            return datetime.replace(value, tzinfo=None)
+        return datetime.replace(value, tzinfo=timezone(_exact_offset(offset)))
+    except Exception:  # a tzinfo is caller code: it can raise, or return something that is no offset
+        raise ValueError(f"unsupported UTC offset at {path}") from None
 
 
 def _snapshot_native(
@@ -1016,15 +1241,16 @@ def _snapshot_native(
     if active is None:
         active = set()
 
-    is_container = isinstance(value, (BaseModel, Mapping, tuple, list))
+    is_container = _is_instance(value, (BaseModel, Mapping, tuple, list))
     identity = id(value)
     if is_container:
         if identity in active:
             raise ValueError(f"cyclic native input at {path}")
         active.add(identity)
+    _charge_snapshot(_frozen_graph, active)
 
     try:
-        if isinstance(value, BaseModel):
+        if _is_instance(value, BaseModel):
             fields = type(value).model_fields
             frozen = _frozen_graph.models.get(identity)
             if frozen is None or frozen[0] is not value:
@@ -1040,7 +1266,7 @@ def _snapshot_native(
                     extra_entries = native_extra_entries
                     iterated_extra_names = tuple(key for key, _ in extra_entries)
                 else:
-                    if not isinstance(extras, Mapping):
+                    if not _is_instance(extras, Mapping):
                         raise ValueError(f"malformed stored extras at {path}")
                     _retain_extra_mapping(extras, _frozen_graph)
                     _inventory_retained_extra_mappings(_frozen_graph)
@@ -1067,7 +1293,7 @@ def _snapshot_native(
                 if name in stored_values
             }
 
-        if isinstance(value, Mapping):
+        if _is_instance(value, Mapping):
             if type(value) is dict:
                 frozen_container = _frozen_graph.native_containers.get(identity)
                 if frozen_container is None or frozen_container[0] is not value:
@@ -1106,7 +1332,7 @@ def _snapshot_native(
             if not frozen_mapping.complete:
                 raise ValueError(f"incomplete public mapping inventory at {path}")
             return projected
-        if isinstance(value, tuple):
+        if _is_instance(value, tuple):
             if type(value) is tuple:
                 frozen_container = _frozen_graph.native_containers.get(identity)
                 if frozen_container is None or frozen_container[0] is not value:
@@ -1148,7 +1374,7 @@ def _snapshot_native(
                 )
                 for index, item in enumerate(tuple_items)
             )
-        if isinstance(value, list):
+        if _is_instance(value, list):
             if type(value) is list:
                 frozen_container = _frozen_graph.native_containers.get(identity)
                 if frozen_container is None or frozen_container[0] is not value:
@@ -1190,6 +1416,15 @@ def _snapshot_native(
                 )
                 for index, item in enumerate(list_items)
             ]
+        if type(value) is datetime:
+            # One offset per object for the whole call: the same datetime supplied twice (for
+            # example as both timestamps) is read once, at its first occurrence.
+            cached = _frozen_graph.fixed_datetimes.get(identity)
+            if cached is not None and cached[0] is value:
+                return cached[1]
+            fixed = _fixed_offset(value, path)
+            _frozen_graph.fixed_datetimes[identity] = (value, fixed)
+            return fixed
         return value
     finally:
         if is_container:
@@ -1203,10 +1438,10 @@ def _validated_manifest_snapshot(
 ) -> RunManifest:
     """Return a fresh, deeply validated manifest graph from native evidence."""
 
-    if not isinstance(manifest, RunManifest):
+    if not _is_instance(manifest, RunManifest):
         raise TypeError("manifest must be a RunManifest")
     return RunManifest.model_validate(
-        _snapshot_native(manifest, _frozen_graph=_frozen_graph)
+        _require_native_snapshot(_snapshot_native(manifest, _frozen_graph=_frozen_graph))
     )
 
 
@@ -1279,7 +1514,7 @@ def finish_run(
         resources=frozen_resources,
         measurements=frozen_measurements,
     )
-    candidate = RunManifest.model_validate(candidate_data)
+    candidate = RunManifest.model_validate(_require_native_snapshot(candidate_data))
     if candidate.state is RunState.PLANNED:
         raise ValueError("finish_run requires a terminal state (completed or aborted)")
 
