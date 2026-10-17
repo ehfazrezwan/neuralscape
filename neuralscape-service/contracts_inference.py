@@ -14,7 +14,6 @@ from datetime import date
 from enum import Enum
 from ipaddress import AddressValueError, IPv4Address, IPv6Address
 from typing import Annotated, Any, Literal
-from uuid import UUID
 
 import idna
 from pydantic import BaseModel, Field, JsonValue, model_validator
@@ -41,6 +40,9 @@ _SUPPORTED_OUTPUT_SCHEMA_FORMATS = frozenset(
     }
 )
 _DATE_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}$", re.ASCII)
+_UUID_PATTERN = re.compile(
+    r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+)
 _TIME_PATTERN = re.compile(
     r"(?P<hour>[01][0-9]|2[0-3]):"
     r"(?P<minute>[0-5][0-9]):"
@@ -668,10 +670,11 @@ def _is_time(value: object) -> bool:
 
 
 def _is_uuid(value: object) -> bool:
+    # Only the canonical 36-character hex-and-hyphen form: ``UUID()`` alone also accepts braces, a
+    # ``urn:uuid:`` prefix, missing or trailing hyphens and non-ASCII digits.
     if not is_subclass(type(value), str):
         return True
-    UUID(value)
-    return all(value[position] == "-" for position in (8, 13, 18, 23))
+    return _UUID_PATTERN.fullmatch(value) is not None
 
 
 def _contract_format_checker(format_checker_class: Any) -> Any:
@@ -697,7 +700,7 @@ def _contract_format_checker(format_checker_class: Any) -> Any:
         raises=(re.error, RecursionError, OverflowError),
     )(_is_regex)
     checker.checks("time", raises=ValueError)(_is_time)
-    checker.checks("uuid", raises=ValueError)(_is_uuid)
+    checker.checks("uuid")(_is_uuid)
     return checker
 
 

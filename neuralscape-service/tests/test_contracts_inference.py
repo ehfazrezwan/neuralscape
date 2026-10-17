@@ -1904,3 +1904,26 @@ def test_a_metaclass_hook_cannot_repair_the_result_while_the_request_is_captured
         validate_decision_result(request, result)
     assert fired == []
     assert Hooked  # kept alive: it must stay among BaseModel's subclasses during the call
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "123e4567-e89b-12d3-a456-426614174000-",  # trailing hyphen
+        "123e4567-e89b-12d3-a456-426614174000}",  # trailing brace
+        "{123e4567-e89b-12d3-a456-426614174000}",
+        "urn:uuid:123e4567-e89b-12d3-a456-426614174000",
+        "123e4567e89b12d3a456426614174000",
+        "123e4567-e89b-12d3-a456-42661417400٠",  # a non-ASCII digit
+    ],
+)
+def test_generation_uuid_format_requires_the_canonical_form(value):
+    schema = output_schema(
+        properties={"id": {"type": "string", "format": "uuid"}},
+        required=["id"],
+    )
+    request = generation_request(schema=schema)
+    for canonical in ("123e4567-e89b-12d3-a456-426614174000", "123E4567-E89B-12D3-A456-426614174000"):
+        assert validate_generation_result(request, generation_result(output={"id": canonical})).compliant
+    with pytest.raises(ValueError, match="does not match declared schema"):
+        validate_generation_result(request, generation_result(output={"id": value}))
