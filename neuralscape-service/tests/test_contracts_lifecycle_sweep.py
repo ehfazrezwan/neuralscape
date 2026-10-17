@@ -1437,7 +1437,9 @@ def test_entry_checks_ignore_a_virtual_subclass_registration():
 
 
 def test_scalar_leaves_of_subclasses_are_captured_as_exact_natives():
-    """A captured scalar carries nothing of its subclass on to validation: exact text, number or timestamp."""
+    """A captured scalar carries nothing of its subclass on to validation: exact text, number or timestamp.  An
+    int subclass becomes the call's own hook-free marker, so a validator that reads the type still sees "not an
+    exact int"."""
 
     from datetime import timedelta
 
@@ -1453,9 +1455,15 @@ def test_scalar_leaves_of_subclasses_are_captured_as_exact_natives():
     class T(timedelta):
         pass
 
-    for value, exact in ((S("x"), str), (I(7), int), (D(2026, 1, 1, tzinfo=timezone.utc), datetime), (T(seconds=5), timedelta)):
+    for value, exact in ((S("x"), str), (D(2026, 1, 1, tzinfo=timezone.utc), datetime), (T(seconds=5), timedelta)):
         captured = contracts_lifecycle._capture_native_contract_graph(value)
         assert type(captured.value) is exact and captured.value == value
+    memo: dict = {}
+    captured = contracts_lifecycle._capture_native_contract_graph(I(7), captured_by_identity=memo)
+    marker = type(captured.value)
+    assert marker is memo[contracts_lifecycle._DETACHED_INT] and marker.__bases__ == (int,) and marker is not I
+    assert set(vars(marker)) <= {"__slots__", "__module__", "__doc__"} and int.__int__(captured.value) == 7
+    assert type(contracts_lifecycle._capture_native_contract_graph(I(7)).value) is not marker  # one class per call
 
 
 def test_an_enum_namespace_key_colliding_with_the_member_map_never_runs_its_comparison():
@@ -2008,3 +2016,113 @@ def test_an_enum_member_in_a_reused_copy_is_judged_again_when_a_later_view_of_it
         if "__getattribute__" in vars(kind):
             type.__delattr__(kind, "__getattribute__")
     assert reads == []
+
+
+@pytest.mark.parametrize("entry", ["record", "claim"])
+def test_an_int_subclass_minimum_is_still_refused_by_its_exactness_check(entry):
+    """Detaching a subclass leaf must not erase what a validator reads from its type: the requirement's minimum
+    must be the native integer 0 or 1, so an int subclass holding 1 is refused as it was before capture."""
+
+    from tests.test_contracts_lifecycle import intent_with_requirements, requirement
+
+    command = intent_with_requirements(requirement(ProcessingStage.CANONICAL))
+    set_native(command.stage_requirements[0], "minimum_output_refs", type("Minimum", (int,), {})(1))
+    applied = receipt(ProcessingStage.CANONICAL, StageStatus.APPLIED)
+    with pytest.raises(ValueError, match="native integer 0 or 1"):
+        if entry == "record":
+            contracts_lifecycle.validate_stage_receipts(command, (applied,))
+        else:
+            validate_required_stage_claim(claimed_status=IntentStatus.APPLIED, intent=command, receipts=(applied,))
+
+
+def test_a_detached_int_subclass_runs_none_of_its_methods_and_leaves_validation_as_an_exact_int():
+    from tests.test_contracts_lifecycle import intent_with_requirements, requirement
+
+    calls: list[str] = []
+
+    class Count(int):
+        def __index__(self):
+            calls.append("index")
+            return 1
+
+        def __int__(self):
+            calls.append("int")
+            return 1
+
+        def __eq__(self, other):
+            calls.append("eq")
+            return int.__eq__(self, other)
+
+        __hash__ = int.__hash__
+
+    command = intent_with_requirements(requirement(ProcessingStage.CANONICAL))
+    applied = receipt(ProcessingStage.CANONICAL, StageStatus.APPLIED)
+    set_native(applied, "attempt", Count(2))
+    calls.clear()
+    _, kept = contracts_lifecycle.validate_stage_receipts(command, (applied,))
+    assert type(kept[0].attempt) is int and kept[0].attempt == 2
+    assert calls == []
+
+
+def _nested_member_tuples(members: int, depth: int):
+    import enum
+
+    from tests.test_contracts_lifecycle import intent_with_requirements, requirement
+
+    Wide = enum.Enum("Wide", {f"M{index}": f"m{index}" for index in range(members)}, type=str)
+    nested: object = tuple(Wide)
+    for _ in range(depth):
+        nested = (nested,)
+    command = intent_with_requirements(requirement(ProcessingStage.CANONICAL))
+    set_native(command.stage_requirements[0], "precondition_source_ids", nested)
+    return command
+
+
+def test_nested_pure_copies_do_not_each_keep_their_descendants_members():
+    """Every pure ancestor of a tuple of distinct enum members used to copy those members into its own table:
+    work and retention grew with depth times members, uncharged.  The members are kept once per call."""
+
+    import tracemalloc
+
+    from contracts_lifecycle import Intent
+
+    peaks = []
+    for depth in (8, 32):
+        command = _nested_member_tuples(20_000, depth)
+        captured = contracts_lifecycle._capture_contract_graph(command)
+        tracemalloc.start()
+        try:
+            with pytest.raises(ValueError):
+                contracts_lifecycle._revalidated_captured_model(Intent, captured)
+            _, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        peaks.append(peak)
+    assert peaks[1] < peaks[0] * 1.5, peaks  # four times the depth: not four times the members kept
+
+
+def test_reusing_copies_judges_the_member_registry_once_per_generation(monkeypatch):
+    """A copy reused many times in one generation costs one judgement of the members, not one per reuse."""
+
+    from contracts_lifecycle import Intent
+
+    judged: list[object] = []
+    real = contracts_lifecycle._judge_handed_enum
+
+    def counting(leaf, memo, budget):
+        judged.append(leaf)
+        return real(leaf, memo, budget)
+
+    command = _nested_member_tuples(50, 0)
+    shared = command.stage_requirements[0].precondition_source_ids
+    set_native(command.stage_requirements[0], "precondition_source_ids", (shared,) * 40)  # 1 build, 39 reuses
+    captured = contracts_lifecycle._capture_contract_graph(command)
+    memo = captured[1]
+    memo[contracts_lifecycle._GENERATION] = 1  # the copy is built in generation 1 ...
+    monkeypatch.setattr(contracts_lifecycle, "_judge_handed_enum", counting)
+    with pytest.raises(ValueError):
+        contracts_lifecycle._revalidated_captured_model(Intent, captured)
+    built_and_reused = len(judged)
+    # each member at build, the registry once more at the first reuse, and the intent's own stage member; judging
+    # it again on every reuse would be about 50 + 39 * 50
+    assert built_and_reused <= 2 * 50 + 1, built_and_reused

@@ -241,6 +241,23 @@ def _derives_from(kind: type, bases: tuple[type, ...]) -> bool:
 _EXACT_NATIVE_KINDS = (str, int, float, bytes, bool, type(None), date, datetime, timedelta)
 
 
+def _detached_int_class(captured_by_identity: dict[Any, Any]) -> type:
+    """This call's marker class for a detached int subclass: methods all native, made once per call, so an
+    instance that escapes in an error never lends a later call a class the caller could have changed."""
+
+    marker = captured_by_identity.get(_DETACHED_INT)
+    if marker is None:
+        marker = type("DetachedInt", (int,), {"__slots__": (), "__module__": __name__})
+        captured_by_identity[_DETACHED_INT] = marker
+    return marker
+
+
+def _is_handed_native(kind: type, captured_by_identity: dict[Any, Any]) -> bool:
+    """Whether a captured leaf's type is a native scalar: exact, or this call's detached-int marker."""
+
+    return _is_exact_native_kind(kind) or kind is captured_by_identity.get(_DETACHED_INT)
+
+
 def _is_exact_native_kind(kind: type) -> bool:
     """Whether ``kind`` is itself one of the native scalar types, by identity (never ``==``, which a
     metaclass can answer)."""
@@ -403,6 +420,7 @@ def _claims_another_class(kind: type, budget: DiscoveryBudget) -> bool:
 
 _HANDED_ENUMS = "handed-enums"  # memo key: enum members handed out while the current root materializes
 _DETACHED = "detached"  # memo key prefix: one scalar subclass leaf's exact copy, made once per call
+_DETACHED_INT = "detached-int"  # memo key: this call's marker class for a detached int subclass
 _LEAF_CLASS = "leaf-class"  # memo key prefix: one leaf class's verdict, decided once per call
 _KEY_TEXT = "key-text"  # memo key prefix: one str-subclass mapping key's exact text, copied once per call
 
@@ -463,6 +481,10 @@ def _native_leaf(
         if memo is not None and memo[0] is value:
             return memo[1]
         detached = _exact_native(value, verdict)
+        if verdict is int:
+            # A validator may read the type itself (a field that must be the native integer): the copy keeps
+            # "not an exact int" through a hook-free class of this call's own, never the caller's.
+            detached = _detached_int_class(captured_by_identity)(detached)
         captured_by_identity[(_DETACHED, id(value))] = (value, detached)
         return detached
     raise ValueError("a contract value must be a native scalar, an enum member, a model or a container")
@@ -658,6 +680,9 @@ def _observed_public_view(
 
 _MATERIALIZED = "materialized"  # memo key prefix: the finished copy of a pure native container
 _REUSED = "reused"  # memo key: set once a copy nesting containers was shared between paths
+_COPY_MEMBERS = "copy-members"  # memo key: every enum member inside this call's pure copies, by identity
+_COPY_MEMBERS_JUDGED = "copy-members-judged"  # memo key: the generation the whole registry was last judged in
+_ROOT_REUSED_MEMBERS = "root-reused-members"  # memo key: the current root reused a copy holding members
 
 
 def _remember_pure_copy(
@@ -672,18 +697,21 @@ def _remember_pure_copy(
     pure containers themselves, so rebuilding it on another path runs no caller code and gives
     the same copy.  The subtree's height is kept so a later path is still depth-checked, and its
     expanded size (every entry on every path through it) so a later path is charged for the work
-    strict validation does there.  The subtree's distinct enum members (by identity, never hashed) and
-    the generation the copy was made in are kept too: a later path reusing the copy after caller code ran
-    judges those members again, as it would had it materialized them itself.
+    strict validation does there.  Whether the subtree holds enum members is kept too; the members
+    themselves go once into the call's registry (by identity, never hashed), not into every ancestor's
+    entry, so a later path reusing the copy after caller code ran can judge them again.
     """
 
     height = 0
     size = len(children)
-    members: dict[int, object] = {}
+    has_members = False
     for child in children:
         if isinstance(child, _CapturedLeaf):
-            if not _is_exact_native_kind(type(child.value)):
-                members[id(child.value)] = child.value  # an enum member: materialization admits no other
+            if not _is_handed_native(type(child.value), captured_by_identity):
+                # An enum member (materialization admits no other leaf), just judged in this generation.
+                registry = captured_by_identity.setdefault(_COPY_MEMBERS, {})
+                registry[id(child.value)] = child.value
+                has_members = True
             continue
         if not isinstance(child, (_CapturedDict, _CapturedList, _CapturedTuple)):
             return
@@ -692,16 +720,24 @@ def _remember_pure_copy(
             return
         height = max(height, entry[2] + 1)
         size += entry[3]
-        for member in entry[4]:
-            members[id(member)] = member
-    captured_by_identity[(_MATERIALIZED, value.identity)] = (
-        value.source,
-        result,
-        height,
-        size,
-        tuple(members.values()),
-        _generation(captured_by_identity),
-    )
+        has_members = has_members or entry[4]
+    captured_by_identity[(_MATERIALIZED, value.identity)] = (value.source, result, height, size, has_members)
+
+
+def _judge_copy_members(captured_by_identity: dict[Any, Any], budget: DiscoveryBudget) -> None:
+    """Judge every enum member kept in this call's pure copies again, once per generation (charged).
+
+    The registry can hold members of copies the current path does not reuse: one changed member class is
+    caller code tampering with this call, so refusing for it fails closed."""
+
+    generation = _generation(captured_by_identity)
+    if captured_by_identity.get(_COPY_MEMBERS_JUDGED) == generation:
+        return
+    registry = captured_by_identity.get(_COPY_MEMBERS, {})
+    budget.charge_edge(len(registry))
+    for leaf in tuple(registry.values()):
+        _judge_handed_enum(leaf, captured_by_identity, budget)
+    captured_by_identity[_COPY_MEMBERS_JUDGED] = generation
 
 
 def _judge_handed_enum(leaf: object, captured_by_identity: dict[Any, Any], budget: DiscoveryBudget) -> None:
@@ -736,7 +772,7 @@ def _materialize_captured_graph(
     if isinstance(value, _CapturedLeaf):
         leaf = value.value
         kind = type(leaf)
-        if not (_is_exact_native_kind(kind)):
+        if not _is_handed_native(kind, captured_by_identity):
             # Only an enum member is kept as itself (its identity is the value).  Caller code may have run
             # since it was captured and changed its class, so the class and membership are judged again.
             _judge_handed_enum(leaf, captured_by_identity, budget)
@@ -761,17 +797,13 @@ def _materialize_captured_graph(
         # models share everywhere; its rendering does not grow, so it must not suppress a diagnostic.
         if reused[2] or reused[1]:
             captured_by_identity[_REUSED] = True
-        members = reused[4]
-        if members:
+        if reused[4]:
             # Its members were judged when the copy was made; caller code that ran since may have changed
-            # their classes, so they are judged again (once per generation), and recorded for this root.
-            if reused[5] != _generation(captured_by_identity):
-                for leaf in members:
-                    _judge_handed_enum(leaf, captured_by_identity, budget)
-                captured_by_identity[(_MATERIALIZED, identity)] = (*reused[:5], _generation(captured_by_identity))
-            handed = captured_by_identity.get(_HANDED_ENUMS)
-            if handed is not None:
-                handed.extend(members)
+            # their classes, so they are judged again (once per generation), and again after this root if a
+            # view materialized later in it moves the generation.
+            _judge_copy_members(captured_by_identity, budget)
+            if _HANDED_ENUMS in captured_by_identity:
+                captured_by_identity[_ROOT_REUSED_MEMBERS] = True
         return reused[1]
     budget.visit(value.source, len(active_containers))
     active_containers.add(identity)
@@ -931,16 +963,20 @@ def _revalidated_captured_model(
     memo = captured[1]
     started = _generation(memo)
     memo[_HANDED_ENUMS] = handed = []
+    memo[_ROOT_REUSED_MEMBERS] = False
     try:
         native = _materialize_contract_graph(captured, budget)
     finally:
         memo.pop(_HANDED_ENUMS, None)
+        reused_members = memo.pop(_ROOT_REUSED_MEMBERS, False)
     if _generation(memo) != started:
         # A view materialized after an enum leaf may have changed its class once that leaf was judged:
         # judge every member handed out for this root again, before validation reads any of them.
         check_budget = DiscoveryBudget() if budget is None else budget
         for leaf in handed:
             _judge_handed_enum(leaf, memo, check_budget)
+        if reused_members:
+            _judge_copy_members(memo, check_budget)
     try:
         return model_type.model_validate(native, strict=True)
     except ValidationError as error:
