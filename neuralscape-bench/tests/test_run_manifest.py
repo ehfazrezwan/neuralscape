@@ -1885,7 +1885,7 @@ def test_public_mapping_inventory_defers_malformed_pair_and_cycle_diagnostics():
     deferred_key_graph = _freeze_model_graphs(deferred_key)
 
     assert deferred_key.items_calls == 1
-    with pytest.raises(TypeError, match="unhashable type"):
+    with pytest.raises(ValueError, match="unsupported key type"):   # refused by type before any hashing
         _snapshot_native(deferred_key, _frozen_graph=deferred_key_graph)
 
     cycle = InventoryMapping(())
@@ -3688,12 +3688,17 @@ def test_serializer_rejects_unchecked_invalid_manifest_copies(manifest):
 
 
 def test_native_snapshot_preserves_mapping_keys_and_sequence_types():
-    value = {"01": [1, 2], 1: ("a", "b")}
+    value = {"01": [1, 2], "1": ("a", "b")}
     snapshot = _snapshot_native(value)
 
-    assert tuple(snapshot) == ("01", 1)
+    assert tuple(snapshot) == ("01", "1")
     assert isinstance(snapshot["01"], list)
-    assert isinstance(snapshot[1], tuple)
+    assert isinstance(snapshot["1"], tuple)
+
+
+def test_native_snapshot_refuses_a_key_that_is_not_text():
+    with pytest.raises(ValueError, match="unsupported key type"):
+        _snapshot_native({"01": [1, 2], 1: ("a", "b")})
 
 
 def test_receiving_boundaries_reject_lists_malformed_models_and_cycles():
@@ -5732,10 +5737,10 @@ def test_keys_that_compare_equal_but_are_distinct_objects_are_a_repeat() -> None
         _finish_with_resource(_PairsMapping(pairs))
 
 
-def test_non_text_keys_that_compare_equal_are_a_repeat_named_as_such() -> None:
+def test_non_text_keys_that_compare_equal_are_refused_by_type() -> None:
     base = measured_memory().model_dump()
-    pairs = list(base.items()) + [(1, "a"), (True, "b")]   # 1 == True: one key, written twice
-    with pytest.raises(ValueError, match="duplicate key"):
+    pairs = list(base.items()) + [(1, "a"), (True, "b")]   # 1 == True: never reaches a rebuild
+    with pytest.raises(ValueError, match="unsupported key type"):
         _finish_with_resource(_PairsMapping(pairs))
 
 
@@ -5986,3 +5991,85 @@ def test_a_text_subclass_key_in_model_extras_runs_no_hook_and_is_refused_as_unde
     with pytest.raises(ValueError):
         _finish_with_resource(reading)
     assert log == [], log
+
+
+# ---- a key that is not text cannot be rebuilt into a dictionary: a stateful key must not hide a value
+
+class _StatefulKey:
+    """Hashes like ``observed_value``; it compares unequal to the text for its first two comparisons and equal after that."""
+
+    def __init__(self):
+        self.comparisons = 0
+
+    def __hash__(self):
+        return str.__hash__("observed_value")
+
+    def __eq__(self, other):
+        self.comparisons += 1
+        return self.comparisons > 2
+
+
+def _stateful_pairs():
+    others = [(key, value) for key, value in measured_memory().model_dump().items() if key != "observed_value"]
+    return others, [(_StatefulKey(), 1), ("observed_value", True)]   # the invalid boolean comes after the stateful twin
+
+
+def test_a_stateful_non_text_key_in_model_storage_is_refused_not_collapsed() -> None:
+    reading = measured_memory()
+    storage = BASE_MODEL_DICT_DESCRIPTOR.__get__(reading, pydantic.BaseModel)
+    dict.pop(storage, "observed_value")
+    _others, pairs = _stateful_pairs()
+    for key, value in pairs:
+        dict.__setitem__(storage, key, value)
+    with pytest.raises(ValueError, match="unsupported key type"):
+        _finish_with_resource(reading)
+
+
+def test_a_stateful_non_text_key_in_an_exact_dict_is_refused_not_collapsed() -> None:
+    others, pairs = _stateful_pairs()
+    fields: dict = {}
+    for key, value in pairs + others:
+        dict.__setitem__(fields, key, value)
+    with pytest.raises(ValueError, match="unsupported key type"):
+        _finish_with_resource(fields)
+
+
+def test_a_stateful_non_text_key_in_a_public_mapping_is_refused_not_collapsed() -> None:
+    others, pairs = _stateful_pairs()
+    with pytest.raises(ValueError, match="unsupported key type"):
+        _finish_with_resource(_PairsMapping(pairs + others))
+
+
+def test_a_stateful_non_text_key_never_yields_a_manifest_that_serializes() -> None:
+    """Through serialization, the reported route: the manifest is either refused or keeps the invalid boolean's refusal."""
+    reading = measured_memory()
+    storage = BASE_MODEL_DICT_DESCRIPTOR.__get__(reading, pydantic.BaseModel)
+    dict.pop(storage, "observed_value")
+    for key, value in _stateful_pairs()[1]:
+        dict.__setitem__(storage, key, value)
+    manifest = completed_manifest()
+    object.__setattr__(manifest, "resources", (reading,))
+    with pytest.raises(ValueError, match="unsupported key type"):
+        serialize_run_manifest(manifest)
+
+
+def test_a_stateful_non_text_key_in_model_extras_is_refused_by_type() -> None:
+    reading = measured_memory()
+    BASE_MODEL_EXTRA_DESCRIPTOR.__set__(reading, {_StatefulKey(): 1})
+    with pytest.raises(ValueError, match="unsupported key type"):
+        _finish_with_resource(reading)
+
+
+def test_a_stateful_key_that_claims_to_be_text_is_refused_by_type_not_by_its_claim() -> None:
+    class ClaimsText(_StatefulKey):
+        @property
+        def __class__(self):   # type: ignore[override]
+            return str
+
+    reading = measured_memory()
+    storage = BASE_MODEL_DICT_DESCRIPTOR.__get__(reading, pydantic.BaseModel)
+    dict.pop(storage, "observed_value")
+    dict.__setitem__(storage, ClaimsText(), 1)
+    dict.__setitem__(storage, "observed_value", True)
+    with pytest.raises(ValueError, match="unsupported key type"):
+        _finish_with_resource(reading)
