@@ -4318,3 +4318,18 @@ def test_a_malformed_model_in_a_tuple_is_still_rejected(bad_name) -> None:
     hidden = _stream_with_bad_name(bad_name if bad_name == 7 else Twin(bad_name))
     with pytest.raises(ValueError, match="field names"):
         usage_reconcile_contracts._native_snapshot((hidden,))
+
+
+def test_edges_are_charged_cumulatively_across_the_call() -> None:
+    """Every tuple fits the remaining allowance on its own; only their sum is over the edge limit."""
+
+    from contracts_limits import STANDARD
+
+    each = 1_000
+    over = STANDARD.max_edges // each + 50   # 181 tuples: 181,000 edges in all
+    under = STANDARD.max_edges // each // 2  # 65 tuples: well inside
+    refused = {f"k{index}": tuple(range(index, index + each)) for index in range(over)}
+    with pytest.raises(ValueError, match=run_discovery_message()):
+        usage_reconcile_contracts._native_snapshot(refused)
+    captured = {f"k{index}": tuple(range(index, index + each)) for index in range(under)}
+    assert len(usage_reconcile_contracts._native_snapshot(captured)) == under
