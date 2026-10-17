@@ -246,7 +246,11 @@ _EOCD_SIGNATURE = b"PK\x05\x06"
 _ZIP64_LOCATOR_SIGNATURE = b"PK\x06\x07"
 _ZIP64_EOCD_SIGNATURE = b"PK\x06\x06"
 _DESCRIPTOR_SIGNATURE = b"PK\x07\x08"
+_FLAG_ENCRYPTED = 0x1
 _FLAG_DESCRIPTOR = 0x8
+_FLAG_PATCHED_DATA = 0x20
+_FLAG_STRONG_ENCRYPTION = 0x40
+_FLAG_MASKED_HEADERS = 0x2000
 _FLAG_UTF8 = 0x800
 _DOS_DIRECTORY = 0x10  # low byte of external_attr: the MS-DOS directory attribute
 _LOCAL_HEADER = struct.Struct("<4sHHHHHIIIHH")
@@ -553,8 +557,12 @@ def _inventory_zip(
         if problem is not None:
             report.add(problem, _safe_label(name))
             continue
-        if info.flag_bits & 0x1:
+        if info.flag_bits & (_FLAG_ENCRYPTED | _FLAG_STRONG_ENCRYPTION):
             report.add(ENTRY_ENCRYPTED, _safe_label(name))
+            continue
+        if info.flag_bits & (_FLAG_PATCHED_DATA | _FLAG_MASKED_HEADERS):
+            # The standard reader refuses patched data; masked header values mean an encrypted directory.
+            report.add(CONTAINER_UNSUPPORTED, _safe_label(name), "unsupported general-purpose flag")
             continue
         if info.compress_type not in (zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED):
             report.add(CONTAINER_UNSUPPORTED, _safe_label(name), "compression method")

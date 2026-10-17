@@ -2012,8 +2012,10 @@ def test_benign_field_name_hash_cannot_repair_frozen_model_storage(
             validate_portable_manifest(manifest)
         assert raised.value.errors()[0]["loc"] == expected_location
 
-    assert repairing_name.hash_calls >= 1
-    assert dict.__getitem__(native_target, field_name) == valid_value
+    # The name is read as exact text when the fields-set is captured, so its hash never runs: nothing can repair
+    # the storage (it ran at least once before).
+    assert repairing_name.hash_calls == 0
+    assert dict.__getitem__(native_target, field_name) == (valid_value if initially_valid else "")
 
 
 @pytest.mark.parametrize("hook_kind", ["fields-set", "mapping", "stored-key"])
@@ -2072,7 +2074,10 @@ def test_supported_hook_cannot_change_frozen_native_list_edge(
         assert raised.value.errors()[0]["type"] == "string_too_short"
         assert raised.value.errors()[0]["loc"] == ("files", 0, "path")
 
-    if replacement is None:
+    if hook_kind == "stored-key":
+        # A fields-set name is read as exact text at capture: its hook never runs, so the list is untouched.
+        assert len(files) == 2 and list.__getitem__(files, 0) is original
+    elif replacement is None:
         assert len(files) == 1
         assert list.__getitem__(files, 0).path == "crypto/envelope.bin"
     else:
@@ -2082,7 +2087,7 @@ def test_supported_hook_cannot_change_frozen_native_list_edge(
     elif hook_kind == "mapping":
         assert hook.item_calls == 1  # a public view is observed once and replayed, never re-read
     else:
-        assert hook.hash_calls >= 1
+        assert hook.hash_calls == 0
 
 
 @pytest.mark.parametrize(
@@ -4497,3 +4502,70 @@ def test_a_stored_name_that_only_claims_to_be_text_is_refused_as_no_text() -> No
         with pytest.raises(ValidationError) as raised:
             validate_portable_manifest(target)
         assert "names must be text" in str(raised.value.__cause__)
+
+
+# ---- fields-set names are read as exact text (the twin of a field name cannot make an unknown name disappear)
+
+
+class _FieldsSetTwin(str):
+    """Its text is ``phantom_only``; once settled it hashes and compares like ``path``."""
+
+    def __init__(self, value: str) -> None:
+        self.settled = False
+        self.calls = 0
+
+    def __hash__(self) -> int:
+        if self.settled:
+            self.calls += 1
+            return hash("path")
+        return str.__hash__(self)
+
+    def __eq__(self, other: object) -> bool:
+        if self.settled:
+            self.calls += 1
+            return other == "path" or other is self
+        return str.__eq__(self, other)
+
+
+@pytest.mark.parametrize("storage", ["native-set", "frozenset", "tuple", "list"])
+def test_a_fields_set_twin_of_a_field_name_cannot_hide_an_unknown_name(storage) -> None:
+    file = validate_portable_manifest(valid_manifest()).files[0].model_copy()
+    twin = _FieldsSetTwin("phantom_only")
+    names = set.copy(_PYDANTIC_FIELDS_SET_SLOT.__get__(file, type(file)))
+    assert "path" in names
+    if storage == "native-set":
+        _PYDANTIC_FIELDS_SET_SLOT.__get__(file, type(file)).add(twin)  # stored while unequal to "path"
+        twin.settled = True
+    else:
+        names.add(twin)
+        twin.settled = True
+        replacement = {"frozenset": frozenset, "tuple": tuple, "list": list}[storage](names)
+        _PYDANTIC_FIELDS_SET_SLOT.__set__(file, replacement)
+    manifest = validate_portable_manifest(valid_manifest()).model_copy(deep=True)
+    list.__setitem__(manifest.files, 0, file)
+    document = valid_manifest()
+    document["files"] = [file, *document["files"][1:]]
+    for target in (manifest, document):
+        with pytest.raises(ValidationError) as raised:
+            validate_portable_manifest(target)
+        assert any(error["type"] == "extra_forbidden" and error["loc"][-1] == "phantom_only" for error in raised.value.errors())
+    assert twin.calls == 0  # read once as text; its own hash and equality never run
+
+
+def test_a_non_text_fields_set_name_is_refused_before_it_joins_a_set() -> None:
+    manifest = validate_portable_manifest(valid_manifest()).model_copy(deep=True)
+    _PYDANTIC_FIELDS_SET_SLOT.__get__(manifest, type(manifest)).add(7)
+    with pytest.raises(ValidationError) as raised:
+        validate_portable_manifest(manifest)
+    assert "names must be text" in str(raised.value.__cause__) or "text" in str(raised.value)
+
+
+def test_ordinary_fields_set_names_still_validate_as_text() -> None:
+    class Plain(str):
+        pass
+
+    manifest = validate_portable_manifest(valid_manifest()).model_copy(deep=True)
+    fields = _PYDANTIC_FIELDS_SET_SLOT.__get__(manifest, type(manifest))
+    fields.discard("manifest_id")
+    fields.add(Plain("manifest_id"))
+    assert validate_portable_manifest(manifest).manifest_id == "manifest-7"

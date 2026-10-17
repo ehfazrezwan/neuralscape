@@ -2163,3 +2163,52 @@ def test_a_zip64_locator_written_before_an_empty_directory_after_the_precheck_ca
     verify_bundle(path)
     assert accepted == [True]  # the honest empty directory passes the precheck
     assert parsed == [0], parsed  # and the parser read the copy's empty directory, never the plant
+
+
+# --- general-purpose flags the standard reader refuses are refused by the raw stream reader too -------------
+
+
+def _with_flag_in_both_headers(path: Path, bit: int) -> None:
+    data = bytearray(path.read_bytes())
+    with zipfile.ZipFile(path) as archive:
+        offsets = [info.header_offset for info in archive.infolist()]
+    for offset in offsets:
+        flags = struct.unpack_from("<H", data, offset + 6)[0]
+        struct.pack_into("<H", data, offset + 6, flags | bit)  # local header
+    position = data.rindex(b"PK\x01\x02")
+    while position != -1 and position >= 0:
+        flags = struct.unpack_from("<H", data, position + 8)[0]
+        struct.pack_into("<H", data, position + 8, flags | bit)  # central record
+        position = data.rfind(b"PK\x01\x02", 0, position)
+    path.write_bytes(bytes(data))
+
+
+@pytest.mark.parametrize(
+    ("bit", "code"),
+    [
+        (0x20, pv.CONTAINER_UNSUPPORTED),  # compressed patched data
+        (0x2000, pv.CONTAINER_UNSUPPORTED),  # masked local header values (encrypted central directory)
+        (0x40, pv.ENTRY_ENCRYPTED),  # strong encryption
+        (0x1, pv.ENTRY_ENCRYPTED),
+    ],
+)
+def test_an_entry_with_a_flag_the_reader_refuses_is_not_a_clean_report(tmp_path, bit, code) -> None:
+    path = _write_zip(tmp_path / "b.zip", PAYLOAD)
+    _with_flag_in_both_headers(path, bit)
+    report = verify_bundle(path)
+    assert not report.ok and code in {item.code for item in report.findings}
+
+
+@pytest.mark.parametrize("bit", [0x2, 0x4, 0x800])
+def test_flags_that_only_describe_options_still_verify(tmp_path, bit) -> None:
+    path = _write_zip(tmp_path / "b.zip", PAYLOAD)
+    _with_flag_in_both_headers(path, bit)
+    assert verify_bundle(path).ok
+
+
+def test_the_flags_refused_here_are_the_ones_the_standard_reader_refuses(tmp_path) -> None:
+    for bit in (0x20, 0x40):
+        path = _write_zip(tmp_path / f"r{bit}.zip", PAYLOAD)
+        _with_flag_in_both_headers(path, bit)
+        with zipfile.ZipFile(path) as archive, pytest.raises(NotImplementedError):
+            archive.open(archive.infolist()[0]).read()

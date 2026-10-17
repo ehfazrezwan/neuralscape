@@ -143,6 +143,23 @@ def _validated_native_container_items(
     return items
 
 
+def _exact_name(name: Any, where: str) -> str:
+    """A name as exact text: a ``str`` subclass is copied with the base method (none of its hooks runs) and
+    anything that is not text is refused."""
+
+    if type(name) is str:
+        return name
+    if not _inherits(name, str):
+        raise ValueError(f"contract model {where} names must be text")
+    return str.__str__(name)
+
+
+def _exact_name_set(names: Any, where: str) -> set[str]:
+    """A set of exact names; a repeated text is one name (a set cannot hold it twice)."""
+
+    return {_exact_name(name, where) for name in names}
+
+
 def _exact_names(entries: Any, where: str) -> tuple[tuple[str, Any], ...]:
     """Captured model-storage entries with every name as exact text; a non-text name or a repeat is refused.
 
@@ -155,10 +172,7 @@ def _exact_names(entries: Any, where: str) -> tuple[tuple[str, Any], ...]:
     names: set[str] = set()
     exact: list[tuple[str, Any]] = []
     for name, item in entries:
-        if type(name) is not str:
-            if not _inherits(name, str):
-                raise ValueError(f"contract model {where} names must be text")
-            name = str.__str__(name)
+        name = _exact_name(name, where)
         size = len(names)
         names.add(name)
         if len(names) == size:
@@ -398,7 +412,9 @@ def _reject_retained_unknown_fields(
                         fields_set_storage = _MISSING_FIELDS_SET
                     if issubclass(type(fields_set_storage), set):
                         budget.charge_edge(set.__len__(fields_set_storage))
-                        fields_set_storage = set.copy(fields_set_storage)
+                        # Copied as exact text (the set's own iteration; no name hook runs), so a name that
+                        # hashes and compares like a field cannot vanish when the sets are united below.
+                        fields_set_storage = _exact_name_set(set.__iter__(fields_set_storage), "fields-set")
                     extra_snapshot = _snapshot_model_extra_storage(current, budget)
                     discovery_inventory[identity] = (
                         current,
@@ -493,7 +509,7 @@ def _reject_retained_unknown_fields(
                 fields_set = set()
                 for name in fields_set_storage:
                     budget.charge_edge()
-                    fields_set.add(name)
+                    fields_set.add(_exact_name(name, "fields-set"))
             pydantic_extra, observed_extra_names = (
                 _validated_model_extra_storage(
                     extra_snapshot,
