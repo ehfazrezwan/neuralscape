@@ -2196,3 +2196,41 @@ def test_unchanged_referenced_unevaluated_schemas_compare_clean() -> None:
     ):
         assert _pair(schema, copy.deepcopy(schema)) == []
         assert _pair(schema, {**copy.deepcopy(schema), "description": "d"}) == []
+
+
+# ---- a nesting deeper than the interpreter can follow is reported, never raised
+
+
+def _pattern_chain(levels: int, *, listed: bool) -> dict:
+    node: dict = {"type": "string"}
+    for _ in range(levels):
+        wrapper = {"type": "object", "additionalProperties": False, "patternProperties": {"^x$": node}}
+        if listed:
+            wrapper["properties"] = {"x": node}
+        node = wrapper
+    return node
+
+
+@pytest.mark.parametrize("levels", [205, 2000])
+def test_deep_pattern_trials_are_reported_not_raised(levels) -> None:
+    old, new = _pattern_chain(levels, listed=False), _pattern_chain(levels, listed=True)
+    findings = _pair(old, new)
+    assert findings and any("unverified change" in f for f in findings), findings[:3]
+    report = pack.compare_schemas({"C": old}, {"C": new})
+    assert report.get("C") and any("unverified change" in f for f in report["C"]), report
+
+
+def test_a_recursion_limit_anywhere_in_a_comparison_is_reported_not_raised(monkeypatch) -> None:
+    def exhausted(*args, **kwargs):
+        raise RecursionError("maximum recursion depth exceeded")
+
+    monkeypatch.setattr(pack, "_compare_checked", exhausted)
+    findings = _pair({"type": "object", "properties": {"a": {}}}, {"type": "object", "properties": {"a": {"type": "string"}}})
+    assert findings == [pack._RECURSION_MESSAGE], findings
+
+
+def test_a_shallow_pattern_chain_is_compared_as_before() -> None:
+    old, new = _pattern_chain(3, listed=False), _pattern_chain(3, listed=True)
+    assert _pair(old, copy.deepcopy(old)) == []
+    findings = _pair(old, new)  # the inner schemas differ: an ordinary unverified change, not the depth marker
+    assert any("patternProperties changed" in f for f in findings) and pack._RECURSION_MESSAGE not in findings, findings

@@ -516,6 +516,7 @@ _MAX_COMPARISONS = 200_000
 _MAX_FINDINGS = 1000
 _MAX_PAIR_FINDINGS = 20
 _LIMIT_MESSAGE = "$: unverified change: finding limit reached; further findings omitted (needs a version bump or a reviewer waiver)"
+_RECURSION_MESSAGE = "$: unverified change: schema nesting exceeds what the comparison can follow; compatibility not verified (needs a version bump or a reviewer waiver)"
 _BUDGET_MESSAGE = "$: unverified change: comparison budget exhausted; compatibility not verified (needs a version bump or a reviewer waiver)"
 
 
@@ -1108,7 +1109,10 @@ def _trial(
     """The findings of comparing ``old`` with ``new``, without adding them to the report."""
 
     trial: list[str] = []
-    _compare(old, new, old_defs, new_defs, path, trial, depth, active)
+    try:
+        _compare(old, new, old_defs, new_defs, path, trial, depth, active)
+    except RecursionError:  # nested deeper than the interpreter can follow: not shown compatible
+        return trial + [_unverified(path, "schema nesting exceeds what the comparison can follow")]
     return trial
 
 
@@ -1416,6 +1420,8 @@ def check_compatibility(old: dict, new: dict) -> list[str]:
         )
     except _BudgetExhausted:
         problems.append(_BUDGET_MESSAGE)
+    except RecursionError:  # on any path: fail closed with what was found so far
+        problems.append(_RECURSION_MESSAGE)
     finally:
         _RUN.reset(token)
     return _cap(list(dict.fromkeys(problems)))
