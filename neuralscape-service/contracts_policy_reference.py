@@ -7,6 +7,7 @@ from types import MappingProxyType
 from typing import Any, NamedTuple, cast
 
 from pydantic import BaseModel, ValidationError
+from pydantic_core import PydanticCustomError
 
 from contracts_policy import (
     SUPPORTED_POLICY_ACTIONS,
@@ -759,6 +760,10 @@ def _first_paid_copy(memo: dict[object, Any], value: object, paid: bool) -> bool
 _REUSED = "reused"  # how many times a finished native subtree was shared between paths
 
 
+# At most this many validation errors are reported in full; the rest are counted, not listed.
+MAX_ERROR_ENTRIES = 100
+
+
 def _validated_without_echo(
     model_type: type[BaseModel], native: object, memo: dict[object, Any]
 ) -> Any:
@@ -767,19 +772,33 @@ def _validated_without_echo(
     A validation error normally repeats the offending input.  When the copy shares native
     subtrees between paths, the input's text is exponentially larger than the graph (a
     few hundred bytes of input can take minutes to render), so that error is rebuilt
-    without the input: the same types, locations and messages, nothing embedded.  Ordinary
-    inputs keep the full diagnostic.
+    without the input: the same types, locations and messages, nothing embedded.  An error with
+    more than ``MAX_ERROR_ENTRIES`` entries keeps that many (without inputs) plus one entry
+    counting the rest.  Ordinary inputs keep the full diagnostic.
     """
 
     try:
         return model_type.model_validate(native)
     except ValidationError as error:
-        if not memo.get(_REUSED):
+        count = error.error_count()
+        if not memo.get(_REUSED) and count <= MAX_ERROR_ENTRIES:
             raise
-        lines = [
-            {"type": e["type"], "loc": e["loc"], "input": "<omitted: input shares subtrees>", **({"ctx": e["ctx"]} if "ctx" in e else {})}
-            for e in error.errors(include_input=False, include_url=False)
+        # A shared input is never echoed; a very long error list keeps its first entries (without
+        # their inputs) and says how many more there were, so its text cannot grow with the input.
+        marker = "<omitted: input shares subtrees>" if memo.get(_REUSED) else "<omitted: error list bounded>"
+        lines: list[dict[str, Any]] = [
+            {"type": e["type"], "loc": e["loc"], "input": marker, **({"ctx": e["ctx"]} if "ctx" in e else {})}
+            for e in error.errors(include_input=False, include_url=False)[:MAX_ERROR_ENTRIES]
         ]
+        if count > MAX_ERROR_ENTRIES:
+            lines.append({
+                "type": PydanticCustomError(
+                    "too_many_errors", "{omitted} further validation errors omitted",
+                    {"omitted": count - MAX_ERROR_ENTRIES},
+                ),
+                "loc": (),
+                "input": marker,
+            })
         try:
             bounded: Exception = ValidationError.from_exception_data(error.title, lines)  # type: ignore[arg-type]
         except Exception:  # noqa: BLE001 - a type that cannot be rebuilt still gets a bounded, value-free error

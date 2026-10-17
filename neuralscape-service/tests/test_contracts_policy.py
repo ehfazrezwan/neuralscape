@@ -4518,3 +4518,36 @@ def test_fields_set_names_that_name_stored_fields_are_not_charged_twice() -> Non
 
     with pytest.raises(ValidationError):  # refused for its unknown fields, not by the budget
         _evaluate_with_statement_resource(_model_with_disjoint_fields_set(70_000, 70_000, overlap=True))
+
+
+def test_a_validation_error_stays_bounded_for_a_statement_with_many_invalid_fields() -> None:
+    """100,000 unknown fields (inside the edge allowance) used to give about 20 MB of error text."""
+
+    resource_value = reference("memory-1")
+    native_statement = {
+        "id": "s-1", "effect": "allow", "subject_id": "subject-a", "credential_id": None,
+        "action": "read", "resource": resource_value.model_dump(mode="python"),
+        **{f"unknown_{index}": "x" * 20 for index in range(100_000)},
+    }
+    policy_value = policy(statement("seed", "allow", "read", reference("other")))
+    object.__setattr__(policy_value, "statements", (native_statement,))
+    with pytest.raises(ValidationError) as caught:
+        evaluate(principal(), "read", resource_value, policy_value)
+    text = str(caught.value)
+    assert len(text.encode()) < 2_000_000, len(text)
+    errors = caught.value.errors()
+    assert errors[0]["type"] == "extra_forbidden" and errors[0]["loc"][-1] == "unknown_0"
+    assert errors[-1]["type"] == "too_many_errors" and "further validation errors omitted" in errors[-1]["msg"]
+
+
+def test_a_small_validation_error_keeps_its_full_diagnostic() -> None:
+    resource_value = reference("memory-1")
+    native_statement = {
+        "id": "s-1", "effect": "allow", "subject_id": "subject-a", "credential_id": None,
+        "action": "read", "resource": resource_value.model_dump(mode="python"), "unknown": "visible",
+    }
+    policy_value = policy(statement("seed", "allow", "read", reference("other")))
+    object.__setattr__(policy_value, "statements", (native_statement,))
+    with pytest.raises(ValidationError) as caught:
+        evaluate(principal(), "read", resource_value, policy_value)
+    assert [(e["type"], e["input"]) for e in caught.value.errors()] == [("extra_forbidden", "visible")]
