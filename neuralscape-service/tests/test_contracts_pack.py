@@ -88,12 +88,113 @@ def test_every_contract_model_in_every_contract_declaring_module_is_registered()
             and value not in (ContractModel, VersionedContract)
             and not name.startswith("_")
         }
-        if models:
+        if module_name in pack.NON_PRODUCT_MODULES:
+            # An explicit, documented exclusion (see the tests below): never also a catalogued module.
+            assert module_name not in pack.MODULE_OWNERS
+            assert not models & registered
+        elif models:
             assert module_name in pack.MODULE_OWNERS, f"{module_name} has unowned models {sorted(models)}"
             assert models <= registered, sorted(models - registered)
         else:
             assert module_name not in pack.MODULE_OWNERS
     assert len(pack.CONTRACTS) == len(registered)
+
+
+# ---- non-product modules: an explicit, exact-name exclusion that a product module cannot fall into
+
+
+def _top_level_modules_importing(directory, target: str) -> set[str]:
+    """Top-level modules in ``directory`` that import ``target`` (``import x`` or ``from x import ...``)."""
+
+    importers = set()
+    for path in sorted(directory.glob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and node.module == target:
+                importers.add(path.stem)
+            elif isinstance(node, ast.Import) and any(alias.name == target for alias in node.names):
+                importers.add(path.stem)
+    return importers - {target}
+
+
+def _declares_a_contract(path) -> bool:
+    """Whether the file defines a class directly based on a contract base (the scan's shape, by syntax)."""
+
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    return any(
+        isinstance(node, ast.ClassDef)
+        and any(isinstance(base, ast.Name) and base.id in {"ContractModel", "VersionedContract"} for base in node.bases)
+        for node in ast.walk(tree)
+    )
+
+
+def _unclassified_contract_modules(directory) -> list[str]:
+    """Contract-declaring modules that are neither catalogued nor an explicit non-product module."""
+
+    return [
+        path.stem
+        for path in sorted(directory.glob("*.py"))
+        if path.stem != "contracts_common"
+        and _declares_a_contract(path)
+        and path.stem not in pack.MODULE_OWNERS
+        and path.stem not in pack.NON_PRODUCT_MODULES
+    ]
+
+
+def test_the_non_product_exclusion_is_explicit_and_disjoint_from_the_catalogue() -> None:
+    assert pack.NON_PRODUCT_MODULES, "the exclusion is the documented home of evidence modules"
+    for name, (reason, importers) in pack.NON_PRODUCT_MODULES.items():
+        assert name.isidentifier() and "*" not in name and not name.startswith("contracts_")  # exact names, never a pattern
+        assert reason.strip() and isinstance(importers, tuple)
+        assert name not in pack.MODULE_OWNERS
+
+
+def test_only_the_declared_tooling_imports_a_non_product_module() -> None:
+    """A product module that imports evidence tooling would have to be catalogued instead."""
+
+    for name, (_reason, importers) in pack.NON_PRODUCT_MODULES.items():
+        if importlib.util.find_spec(name) is None:
+            continue
+        actual = _top_level_modules_importing(SERVICE_DIR, name)
+        assert actual <= set(importers), f"{name} is imported by {sorted(actual - set(importers))}, which is not declared tooling"
+        for importer in importers:
+            assert importer not in pack.MODULE_OWNERS
+
+
+def test_excluded_models_are_never_part_of_the_pack() -> None:
+    for name in pack.NON_PRODUCT_MODULES:
+        if importlib.util.find_spec(name) is None:
+            continue
+        module = importlib.import_module(name)
+        excluded = {
+            n
+            for n, value in vars(module).items()
+            if inspect.isclass(value) and issubclass(value, ContractModel) and value.__module__ == name and not n.startswith("_")
+        }
+        assert excluded
+        assert not excluded & {entry.name for entry in pack.CONTRACTS}
+        assert not excluded & set(pack.export_schemas())
+
+
+def test_a_new_product_module_shaped_like_the_evidence_module_is_not_excluded(tmp_path) -> None:
+    (tmp_path / "evidence_records_v2.py").write_text(
+        "from contracts_common import VersionedContract\n\n\nclass Thing(VersionedContract):\n    pass\n", encoding="utf-8"
+    )
+    (tmp_path / "records_evidence.py").write_text(
+        "from contracts_common import ContractModel\n\n\nclass Other(ContractModel):\n    pass\n", encoding="utf-8"
+    )
+    assert _unclassified_contract_modules(tmp_path) == ["evidence_records_v2", "records_evidence"]  # no name pattern excuses them
+    for name in pack.NON_PRODUCT_MODULES:
+        (tmp_path / f"{name}.py").write_text("from contracts_common import ContractModel\n\n\nclass M(ContractModel):\n    pass\n", encoding="utf-8")
+    assert _unclassified_contract_modules(tmp_path) == ["evidence_records_v2", "records_evidence"]  # only the exact names are excused
+
+
+def test_a_product_module_importing_an_excluded_module_is_detected(tmp_path) -> None:
+    (tmp_path / "evidence_records.py").write_text("x = 1\n", encoding="utf-8")
+    (tmp_path / "product_feature.py").write_text("from evidence_records import x\n", encoding="utf-8")
+    (tmp_path / "other_feature.py").write_text("import evidence_records\n", encoding="utf-8")
+    (tmp_path / "unrelated.py").write_text("import json\n", encoding="utf-8")
+    assert _top_level_modules_importing(tmp_path, "evidence_records") == {"product_feature", "other_feature"}
 
 
 def test_engine_port_contracts_are_registered_with_the_engines_owner() -> None:

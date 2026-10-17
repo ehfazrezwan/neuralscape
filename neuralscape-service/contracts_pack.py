@@ -82,6 +82,21 @@ MODULE_OWNERS: dict[str, tuple[str, tuple[str, ...], tuple[str, ...]]] = {
     "engine_ports": ("engines", ("engines",), ("lifecycle", "portability", "context", "usage")),
 }
 
+# Modules that build on the contract bases but are test and evidence tooling, not product contracts: their
+# models describe records a reviewer's harness writes about runs of the service, are never sent to or from
+# the service, and are not part of the exported schemas or the pinned digests.  The exclusion is by exact module
+# name and carries its reason and the only modules allowed to import it (name -> (reason, importers)); a test
+# fails if any other module imports an excluded one (it would then be a product dependency and has to be
+# catalogued in ``MODULE_OWNERS`` instead), and a module that is neither catalogued nor listed here fails the
+# registry test, whatever it is called.
+NON_PRODUCT_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
+    "evidence_records": (
+        "machine-readable evidence records, writer and baseline/candidate comparison for the persona probes; "
+        "harness output, not a service wire contract",
+        ("persona_evidence",),
+    ),
+}
+
 _BASES = (ContractModel, VersionedContract)
 
 
