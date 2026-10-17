@@ -953,9 +953,11 @@ def _inventory_reachable_public_mappings(
         ) or _is_exact_type(value_type, (dict, list, tuple))
         child_authority = authoritative and local_authority
         prior = discovered.get(identity)
+        # The authority this node was reached with, not the one it passes on: a public subclass passes none on,
+        # and recording that would make every later wrapper that names it rescan its hidden backing.
         discovered[identity] = (
             current,
-            child_authority or (prior is not None and prior[1]),
+            authoritative or (prior is not None and prior[1]),
         )
         pending.extend(
             (item, child_authority) for item in reversed(entries)
@@ -1498,12 +1500,15 @@ def _snapshot_native(
             for key, item in frozen_mapping.entries:
                 _protect_yielded_model_storage(item, _frozen_graph)
                 item_path = _Path(path, ("key", key))
+                size = len(projected)
                 projected[key] = _snapshot_native(
                     item,
                     path=item_path,
                     active=active,
                     _frozen_graph=_frozen_graph,
                 )
+                if len(projected) == size:  # one store, no second key operation: a repeated key never overwrites
+                    raise ValueError(f"duplicate key in public mapping at {path}")
             if frozen_mapping.failure is not None:
                 raise frozen_mapping.failure
             if not frozen_mapping.complete:
