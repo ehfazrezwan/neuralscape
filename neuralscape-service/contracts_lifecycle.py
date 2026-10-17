@@ -252,12 +252,6 @@ def _detached_int_class(captured_by_identity: dict[Any, Any]) -> type:
     return marker
 
 
-def _is_handed_native(kind: type, captured_by_identity: dict[Any, Any]) -> bool:
-    """Whether a captured leaf's type is a native scalar: exact, or this call's detached-int marker."""
-
-    return _is_exact_native_kind(kind) or kind is captured_by_identity.get(_DETACHED_INT)
-
-
 def _is_exact_native_kind(kind: type) -> bool:
     """Whether ``kind`` is itself one of the native scalar types, by identity (never ``==``, which a
     metaclass can answer)."""
@@ -418,7 +412,7 @@ def _claims_another_class(kind: type, budget: DiscoveryBudget) -> bool:
     return False
 
 
-_HANDED_ENUMS = "handed-enums"  # memo key: enum members handed out while the current root materializes
+_HANDED_ENUMS = "handed-enums"  # memo key: enum members and detached ints handed out while a root materializes
 _DETACHED = "detached"  # memo key prefix: one scalar subclass leaf's exact copy, made once per call
 _DETACHED_INT = "detached-int"  # memo key: this call's marker class for a detached int subclass
 _LEAF_CLASS = "leaf-class"  # memo key prefix: one leaf class's verdict, decided once per call
@@ -707,8 +701,8 @@ def _remember_pure_copy(
     has_members = False
     for child in children:
         if isinstance(child, _CapturedLeaf):
-            if not _is_handed_native(type(child.value), captured_by_identity):
-                # An enum member (materialization admits no other leaf), just judged in this generation.
+            if not _is_exact_native_kind(type(child.value)):
+                # An enum member or a detached int (materialization admits no other leaf), just judged.
                 registry = captured_by_identity.setdefault(_COPY_MEMBERS, {})
                 registry[id(child.value)] = child.value
                 has_members = True
@@ -736,13 +730,22 @@ def _judge_copy_members(captured_by_identity: dict[Any, Any], budget: DiscoveryB
     registry = captured_by_identity.get(_COPY_MEMBERS, {})
     budget.charge_edge(len(registry))
     for leaf in tuple(registry.values()):
-        _judge_handed_enum(leaf, captured_by_identity, budget)
+        _judge_handed_leaf(leaf, captured_by_identity, budget)
     captured_by_identity[_COPY_MEMBERS_JUDGED] = generation
 
 
-def _judge_handed_enum(leaf: object, captured_by_identity: dict[Any, Any], budget: DiscoveryBudget) -> None:
-    """Refuse an enum member handed to validation unless its class is still an enum and it is a member."""
+def _judge_handed_leaf(leaf: object, captured_by_identity: dict[Any, Any], budget: DiscoveryBudget) -> None:
+    """Refuse a leaf handed to validation as itself unless its class is still what admitted it.
 
+    An enum member must still belong to an enum class and be a declared member.  A detached int is an instance
+    of this call's marker class, a heap class that caller code can reach and change like any other, so the
+    marker must still be a plain int class (no claim to another class)."""
+
+    kind = type(leaf)
+    if kind is captured_by_identity.get(_DETACHED_INT):
+        if _leaf_class_verdict(kind, captured_by_identity, budget) is not int:
+            raise ValueError("a contract value must be a native scalar, an enum member, a model or a container")
+        return
     if _leaf_class_verdict(type(leaf), captured_by_identity, budget) != "enum" or not _is_declared_member(
         leaf, captured_by_identity, budget
     ):
@@ -772,10 +775,11 @@ def _materialize_captured_graph(
     if isinstance(value, _CapturedLeaf):
         leaf = value.value
         kind = type(leaf)
-        if not _is_handed_native(kind, captured_by_identity):
-            # Only an enum member is kept as itself (its identity is the value).  Caller code may have run
-            # since it was captured and changed its class, so the class and membership are judged again.
-            _judge_handed_enum(leaf, captured_by_identity, budget)
+        if not _is_exact_native_kind(kind):
+            # Only an enum member (its identity is the value) or a detached int (this call's marker class) is
+            # kept as itself.  Caller code may have run since it was captured and changed its class, so the
+            # class (and an enum member's membership) is judged again, and again after the root if needed.
+            _judge_handed_leaf(leaf, captured_by_identity, budget)
             handed = captured_by_identity.get(_HANDED_ENUMS)
             if handed is not None:
                 handed.append(leaf)
@@ -974,7 +978,7 @@ def _revalidated_captured_model(
         # judge every member handed out for this root again, before validation reads any of them.
         check_budget = DiscoveryBudget() if budget is None else budget
         for leaf in handed:
-            _judge_handed_enum(leaf, memo, check_budget)
+            _judge_handed_leaf(leaf, memo, check_budget)
         if reused_members:
             _judge_copy_members(memo, check_budget)
     try:

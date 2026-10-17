@@ -2107,7 +2107,7 @@ def test_reusing_copies_judges_the_member_registry_once_per_generation(monkeypat
     from contracts_lifecycle import Intent
 
     judged: list[object] = []
-    real = contracts_lifecycle._judge_handed_enum
+    real = contracts_lifecycle._judge_handed_leaf
 
     def counting(leaf, memo, budget):
         judged.append(leaf)
@@ -2119,10 +2119,125 @@ def test_reusing_copies_judges_the_member_registry_once_per_generation(monkeypat
     captured = contracts_lifecycle._capture_contract_graph(command)
     memo = captured[1]
     memo[contracts_lifecycle._GENERATION] = 1  # the copy is built in generation 1 ...
-    monkeypatch.setattr(contracts_lifecycle, "_judge_handed_enum", counting)
+    monkeypatch.setattr(contracts_lifecycle, "_judge_handed_leaf", counting)
     with pytest.raises(ValueError):
         contracts_lifecycle._revalidated_captured_model(Intent, captured)
     built_and_reused = len(judged)
     # each member at build, the registry once more at the first reuse, and the intent's own stage member; judging
     # it again on every reuse would be about 50 + 39 * 50
     assert built_and_reused <= 2 * 50 + 1, built_and_reused
+
+
+def _arm_detached_int_markers(delegate, reads):
+    """What caller code in a view can do: find this module's detached-int marker classes and make them claim and
+    delegate to a model.  Returns a restore function."""
+
+    import gc
+
+    armed = []
+
+    def impersonate(self, name):
+        if name == "__class__":
+            return type(delegate)
+        if name.startswith("_") and name not in ("__dict__", "__pydantic_fields_set__", "__pydantic_extra__"):
+            return object.__getattribute__(self, name)
+        reads.append(name)
+        return getattr(delegate, name)
+
+    def arm():
+        for kind in gc.get_objects():
+            if (
+                isinstance(kind, type)
+                and kind.__name__ == "DetachedInt"
+                and kind.__module__ == contracts_lifecycle.__name__
+                and "__getattribute__" not in vars(kind)
+            ):
+                type.__setattr__(kind, "__getattribute__", impersonate)
+                armed.append(kind)
+
+    def restore():
+        for kind in armed:
+            if "__getattribute__" in vars(kind):
+                type.__delattr__(kind, "__getattribute__")
+
+    return arm, restore
+
+
+@pytest.mark.parametrize("entry", ["record", "claim"])
+def test_a_detached_int_marker_armed_by_a_later_view_is_refused_before_validation_reads_it(entry):
+    """The marker class is this call's own, but a heap class all the same: caller code in a view materialized after
+    the leaf can reach it and make it claim a model.  Its leaves are judged again, like enum members."""
+
+    from contracts_lifecycle import StageError
+    from tests.test_contracts_lifecycle import intent_with_requirements, requirement
+
+    reads: list[str] = []
+    arm, restore = _arm_detached_int_markers(StageError(code="c", retryable=False, safe_message="m"), reads)
+
+    class Arming(tuple):
+        def __iter__(self):
+            arm()
+            return iter(())
+
+    command = intent_with_requirements(requirement(ProcessingStage.CANONICAL))
+    failed = receipt(ProcessingStage.CANONICAL, StageStatus.FAILED, sources=())
+    set_native(failed, "error", type("Count", (int,), {})(5))
+    set_native(failed, "upstream_applications", Arming(()))  # materialized after error, valid when empty
+    try:
+        with pytest.raises((ValueError, TypeError)):
+            if entry == "record":
+                contracts_lifecycle.validate_stage_receipts(command, (failed,))
+            else:
+                validate_required_stage_claim(claimed_status=IntentStatus.FAILED, intent=command, receipts=(failed,))
+    finally:
+        restore()
+    assert reads == []
+
+
+def test_a_detached_int_marker_armed_by_a_later_view_of_the_intent_is_never_read_through():
+    from tests.test_contracts_lifecycle import intent_with_requirements, requirement
+
+    command = intent_with_requirements(requirement(ProcessingStage.CANONICAL))
+    reads: list[str] = []
+    arm, restore = _arm_detached_int_markers(command.stage_requirements[0], reads)
+
+    class Arming(tuple):
+        def __iter__(self):
+            arm()
+            return iter(())
+
+    set_native(command, "stage_requirements", (type("Count", (int,), {})(5),))
+    set_native(command, "correlation_id", Arming(()))  # materialized after stage_requirements
+    applied = receipt(ProcessingStage.CANONICAL, StageStatus.APPLIED)
+    try:
+        with pytest.raises((ValueError, TypeError)):
+            contracts_lifecycle.validate_stage_receipts(command, (applied,))
+    finally:
+        restore()
+    assert reads == []
+
+
+def test_a_detached_int_in_a_reused_pure_copy_is_judged_again_after_its_marker_is_armed():
+    """A pure copy holding a detached int is reused in a later generation after the marker class was armed: the
+    copy's leaves are judged again (the registry holds detached ints as well as enum members), so validation never
+    reads through it.  Driven at the root step: no lifecycle position both validates and holds a tuple of ints."""
+
+    from contracts_lifecycle import Intent
+    from tests.test_contracts_lifecycle import intent_with_requirements, requirement
+
+    command = intent_with_requirements(requirement(ProcessingStage.CANONICAL))
+    reads: list[str] = []
+    arm, restore = _arm_detached_int_markers(command.stage_requirements[0], reads)
+    set_native(command.stage_requirements[0], "precondition_source_ids", (type("Count", (int,), {})(5),))
+    captured = contracts_lifecycle._capture_contract_graph(command)
+    memo = captured[1]
+    with pytest.raises(ValueError):  # an int is no source id; the copy is built all the same
+        contracts_lifecycle._revalidated_captured_model(Intent, captured)
+    arm()
+    try:
+        memo[contracts_lifecycle._GENERATION] = contracts_lifecycle._generation(memo) + 1  # as a public view does
+        with pytest.raises(ValueError, match="native scalar, an enum member"):
+            contracts_lifecycle._revalidated_captured_model(Intent, captured)
+    finally:
+        restore()
+    assert reads == []
