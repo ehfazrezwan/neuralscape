@@ -11,7 +11,7 @@ import enum
 import functools
 import types
 import typing
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from datetime import datetime
 from types import MappingProxyType
 from dataclasses import dataclass, field
@@ -27,6 +27,7 @@ from pydantic import (
     StringConstraints,
     model_validator,
 )
+from pydantic.fields import FieldInfo
 
 
 MAX_SAFE_INTEGER = 9_007_199_254_740_991
@@ -143,27 +144,226 @@ class VersionedContract(ContractModel):
     schema_version: Literal["candidate-v1"]
 
 
-def _validation_alias_owners(model_type: type[BaseModel]) -> dict[str, set[str]]:
-    if model_type.model_config.get("validate_by_alias") is False:
-        return {}
+def _exact_entry(items: Iterable[tuple[object, object]], name: str) -> tuple[object, bool, bool]:
+    """``(value, found, pure)`` for ``name`` among natively read ``items``, compared as exact text.
+
+    No key's own hash or equality runs.  ``pure`` is False as soon as a key that is not an exact ``str`` is
+    met: a lookup through the mapping could have run its hooks, and every caller refuses the metadata then,
+    so the scan stops there and the key is never read (a ``str`` subclass is not copied as text only to be
+    refused).
+    """
+
+    value: object = None
+    found = False
+    for key, item in items:
+        if type(key) is not str:
+            return None, False, False
+        if key == name:
+            value, found = item, True
+    return value, found, True
+
+
+def _class_namespace_entry(model_type: type, name: str, budget: DiscoveryBudget) -> tuple[object, bool]:
+    """``(value, pure)``: ``name`` from the first class on ``model_type``'s native MRO whose own
+    namespace defines it.
+
+    The namespaces are read directly (their native items, compared as exact text), so no metaclass
+    ``__getattribute__``, descriptor or key hook runs.
+    """
+
+    pure = True
+    for klass in _TYPE_MRO.__get__(model_type):
+        namespace = _CLASS_NAMESPACE.__get__(klass)
+        budget.charge_edge(MappingProxyType.__len__(namespace))  # every entry scanned is charged
+        value, found, klass_pure = _exact_entry(MappingProxyType.items(namespace), name)
+        if not klass_pure:
+            raise _MetadataRefused(_METADATA_REFUSAL)  # a key that is not exact text could answer a lookup itself
+        if found:
+            return value, pure
+    return None, pure
+
+
+def _native_slot(value: object, name: str) -> object:
+    """A slot of one of pydantic's own metadata objects, read natively; a missing slot (deleted after the
+    model was built) is the metadata refusal, deferred like any other, never an ``AttributeError``."""
+
+    try:
+        return object.__getattribute__(value, name)
+    except AttributeError:
+        raise _MetadataRefused(_METADATA_REFUSAL) from None
+
+
+def _native_sequence(value: object, budget: DiscoveryBudget) -> tuple[object, ...]:
+    """The items of an alias's storage, which must be an exact list or tuple.
+
+    Its native length is charged before anything is copied, so an oversized one is refused without the
+    copy.  Anything else (a subclass, a ``UserList``, any other object) cannot be read the way pydantic read
+    it, so it is refused rather than read as empty or through its own protocol.
+    """
+
+    if type(value) is list:
+        budget.charge_edge(list.__len__(value))  # type: ignore[arg-type]
+        return tuple(list.__iter__(value))  # type: ignore[arg-type]
+    if type(value) is tuple:
+        budget.charge_edge(tuple.__len__(value))  # type: ignore[arg-type]
+        return value  # type: ignore[return-value]
+    raise _MetadataRefused(_METADATA_REFUSAL)
+
+
+def _text(value: object, inventory: "_GraphInventory") -> object:
+    """A ``str`` subclass as its exact text (no hook of it runs); anything else unchanged.
+
+    The text is copied once per call per object (``inventory.key_texts``, holding the object so its id cannot
+    be reused): one subclass shared by many keys, choices, fields or classes is copied and hashed once, and
+    every reader keeps that one copy.
+    """
+
+    if type(value) is str or not _is_subclass(type(value), str):
+        return value
+    known = inventory.key_texts.get(id(value))
+    if known is not None and known[0] is value:
+        return known[1]
+    text = str.__str__(value)  # type: ignore[arg-type]
+    inventory.key_texts[id(value)] = (value, text)
+    return text
+
+
+def _model_metadata(
+    model_type: type[BaseModel], budget: DiscoveryBudget
+) -> tuple[tuple[tuple[object, object], ...], object, bool]:
+    """The model's declared field entries and configuration, read without caller hooks.
+
+    pydantic keeps both as plain dicts in every model class's own namespace.  Anything else
+    (a replaced or exotic store) is read through the class as before, and reported as impure:
+    reading it may run caller code, so the subtree must not be reused.  The declared entries are
+    charged before they are copied, and the copy is what every later scan reads: a hook that runs
+    meanwhile cannot change them, and a large table costs its size wherever it is read.
+    """
+
+    fields, fields_pure = _class_namespace_entry(model_type, "__pydantic_fields__", budget)
+    config, config_pure = _class_namespace_entry(model_type, "model_config", budget)
+    if type(fields) is not dict or (config is not None and type(config) is not dict):
+        # A replaced or exotic store could only be read through the class, where caller code can run.
+        raise _MetadataRefused(_METADATA_REFUSAL)
+    budget.charge_edge(dict.__len__(fields))  # type: ignore[arg-type]
+    return tuple(dict.items(fields)), config, fields_pure and config_pure  # type: ignore[arg-type]
+
+
+def _declared_metadata(
+    model_type: type[BaseModel], inventory: "_GraphInventory"
+) -> tuple[set[object], dict[str, set[str]]]:
+    """``(declared names, alias owners)`` of ``model_type``: the call's one snapshot of the class.
+
+    Taken the first time the call meets the class, during capture (which runs no caller code), charged as
+    read, and kept with the class for the rest of the call.  Every reader (every instance, on every path)
+    uses this one snapshot, so caller code that runs later in the call (a public view, a key hook, an extra
+    mapping) cannot change how any instance is judged, and the class is read once however many instances
+    it has.  A declared name that is not text is never hashed.
+    """
+
+    cached = inventory.metadata.get(id(model_type))
+    if cached is not None and cached[0] is model_type:
+        if cached[1] is None:
+            raise _MetadataRefused(_METADATA_REFUSAL)  # recorded at capture, raised now that it is projected
+        return cached[1], cached[2]
+    try:
+        return _read_declared_metadata(model_type, inventory)
+    except _MetadataRefused:
+        inventory.metadata[id(model_type)] = (model_type, None, None)  # a budget error is not caught: it stops the call
+        raise
+
+
+def _snapshot_class_metadata(model_type: type[BaseModel], inventory: "_GraphInventory") -> None:
+    """Take the class's snapshot at capture; a refusal is recorded, not raised, so a model the rebuild never
+    projects (one only a hidden native backing holds) is not refused for it.  Budget errors still stop capture."""
+
+    try:
+        _declared_metadata(model_type, inventory)
+    except _MetadataRefused:
+        pass  # raised by _declared_metadata when an instance of the class is projected
+
+
+def _read_declared_metadata(
+    model_type: type[BaseModel], inventory: "_GraphInventory"
+) -> tuple[set[object], dict[str, set[str]]]:
+    budget = inventory.budget
+    declared_fields, config, _pure = _model_metadata(model_type, budget)
+    declared_names: set[object] = set()
+    for name, _field in declared_fields:  # the charged copy, never the live table
+        if not _is_subclass(type(name), str):
+            raise _MetadataRefused(_METADATA_REFUSAL)  # a declared name that is not text (never hashed)
+        declared_names.add(_text(name, inventory))
+    alias_owners, aliases_pure = _validation_alias_owners(declared_fields, config, inventory)
+    if not (_pure and aliases_pure):
+        raise _MetadataRefused(_METADATA_REFUSAL)  # every read above is exact and native, or refused: never cache otherwise
+    inventory.metadata[id(model_type)] = (model_type, declared_names, alias_owners)
+    return declared_names, alias_owners
+
+
+def _validation_alias_owners(
+    fields: tuple[tuple[object, object], ...], config: object, inventory: "_GraphInventory"
+) -> tuple[dict[str, set[str]], bool]:
+    """Each validation alias (or alias-path root) as exact text, with the fields it belongs to.
+
+    A ``str``-subclass alias is read as its text (once per call, see ``_text``), so hashing it runs no
+    hook; the configuration and the alias storage (``choices``, ``path``) are read natively and the copies
+    charged.  The second value is False when reading may have run caller code (a subclass of a pydantic
+    alias or field type, hook-capable storage or keys), which makes the subtree ineligible for reuse.
+    """
+
+    budget = inventory.budget
+    pure = True
+    validate_by_alias = None
+    if type(config) is dict:
+        budget.charge_edge(dict.__len__(config))
+        validate_by_alias, _found, config_pure = _exact_entry(dict.items(config), "validate_by_alias")
+        if not config_pure:
+            raise _MetadataRefused(_METADATA_REFUSAL)  # a configuration key that is not exact text
+    elif config is not None:
+        raise _MetadataRefused(_METADATA_REFUSAL)
+    if validate_by_alias is False:
+        return {}, pure
 
     owners: dict[str, set[str]] = {}
-    for field_name, field in model_type.model_fields.items():
-        validation_alias = field.validation_alias
-        choices = (
-            validation_alias.choices
-            if isinstance(validation_alias, AliasChoices)
-            else (validation_alias,)
-        )
+    budget.charge_edge(len(fields))  # this walk scans every declared field again: charged again
+    for field_name, field in fields:  # the copy: nothing read here can change what is walked
+        if not _is_subclass(type(field_name), str):
+            raise _MetadataRefused(_METADATA_REFUSAL)  # a declared name that is not text (never hashed)
+        # Only pydantic's own field and alias types are read, through their own slots: a subclass could
+        # run code from a property while the metadata is read, before the input's storage is all captured.
+        if type(field) is not FieldInfo:
+            raise _MetadataRefused(_METADATA_REFUSAL)
+        validation_alias = _native_slot(field, "validation_alias")
+        if type(validation_alias) is AliasChoices:
+            choices = _native_sequence(_native_slot(validation_alias, "choices"), budget)
+        elif _is_subclass(type(validation_alias), (AliasChoices, AliasPath)) and type(validation_alias) is not AliasPath:
+            raise _MetadataRefused(_METADATA_REFUSAL)
+        else:
+            choices = (validation_alias,)
+        name = _text(field_name, inventory)
         for choice in choices:
-            if isinstance(choice, str):
-                owners.setdefault(choice, set()).add(field_name)
-            elif isinstance(choice, AliasPath):
-                owners.setdefault(choice.path[0], set()).add(field_name)
-    return owners
+            if _is_subclass(type(choice), str):
+                owners.setdefault(_text(choice, inventory), set()).add(name)  # type: ignore[arg-type]
+            elif type(choice) is AliasPath:
+                path = _native_sequence(_native_slot(choice, "path"), budget)
+                root = path[0] if path else None
+                if _is_subclass(type(root), str):
+                    owners.setdefault(_text(root, inventory), set()).add(name)  # type: ignore[arg-type]
+            elif choice is not None:
+                raise _MetadataRefused(_METADATA_REFUSAL)  # an alias subclass, or anything else
+    return owners, pure
 
 
+class _MetadataRefused(ValueError):
+    """Model metadata that cannot be read through pydantic's own types: refused when the model is projected."""
+
+
+_METADATA_REFUSAL = (
+    "contract model metadata must use pydantic's own field, alias and configuration types "
+    "(a subclass or replacement could run code while it is read)"
+)
 _TYPE_MRO = vars(type)["__mro__"]
+_CLASS_NAMESPACE = vars(type)["__dict__"]
 _MAPPING_BASES = (Mapping, dict, MappingProxyType)
 # Key types whose hashing and equality run no caller code.  A ``str`` subclass is read as its
 # text instead; any other key type can run a hook while a dict is rebuilt, so a subtree that
@@ -250,13 +450,7 @@ def _plain_keys(
     for key, item in entries:
         if not is_exact_type(key, *_PLAIN_KEY_TYPES):
             if _is_subclass(type(key), str):
-                known = inventory.key_texts.get(id(key))
-                if known is not None and known[0] is key:
-                    key = known[1]
-                else:
-                    text = str.__str__(key)  # type: ignore[arg-type]
-                    inventory.key_texts[id(key)] = (key, text)  # holds the key: its id cannot be reused
-                    key = text
+                key = _text(key, inventory)
             else:
                 pure = False
         _charge_key_hash(key, inventory.budget)
@@ -332,6 +526,8 @@ class _GraphInventory:
     # reconstruction, so a released temporary's id cannot be reused by a later
     # object and alias its captured contents.
     retained: list[object] = field(default_factory=list)
+    # The call's one metadata snapshot per model class, taken at capture: ``id -> (class, declared names, alias owners)``.
+    metadata: dict[int, tuple[type, set[object] | None, dict[str, set[str]] | None]] = field(default_factory=dict)
     # An optional function applied to every ``datetime`` leaf the moment its entry is captured (before any public
     # iterator is advanced), and the results by identity: ``(the caller's datetime, its pinned copy)``.  The
     # original stays referenced, so its id cannot be reused by another object during the call.
@@ -443,6 +639,9 @@ def _capture_native_graph(value: object, inventory: _GraphInventory, depth: int 
     below = depth + 1
 
     if _is_subclass(value_type, BaseModel):
+        # The class's metadata is snapshotted at its first native encounter, before any caller code runs
+        # (capture runs none); reconstruction reads only this snapshot.
+        _snapshot_class_metadata(value_type, inventory)
         stored = _BASE_MODEL_DICT_DESCRIPTOR.__get__(value, BaseModel)
         _precheck(budget, dict.__len__(stored))
         stored_entries, pure_stored, stored_colliding = _plain_keys(tuple(dict.items(stored)), inventory)
@@ -845,8 +1044,11 @@ def _snapshot_captured_graph(
             model_type = captured.model_type
             stored_entries = captured.stored_entries
             stored_names = {key for key, _ in stored_entries}
-            declared_names = set(model_type.model_fields)
-            alias_owners = _validation_alias_owners(model_type)
+            # Declared fields, configuration and aliases are read without running caller code; where
+            # that is not possible the subtree (and every ancestor) is not reused.
+            # The class's snapshot for this call, taken at capture (before any caller code ran); reading
+            # it runs nothing, so it never makes this subtree impure.
+            declared_names, alias_owners = _declared_metadata(model_type, inventory)
             alias_roots = set(alias_owners)
             unknown_stored_names = stored_names - declared_names
             missing_owner_roots = {

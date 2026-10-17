@@ -3735,6 +3735,650 @@ def test_a_height_found_late_inside_late_extras_reaches_the_outer_model_and_its_
         snapshot_contract_graph(siblings)
 
 
+# ── model metadata is read without caller hooks, so a reused subtree ran no caller code ──
+
+
+def _counter_view(counter):
+    class CounterView(list):
+        def __iter__(self):
+            return iter([counter[0]])
+
+    return CounterView()
+
+
+def test_a_metaclass_hook_on_model_metadata_never_runs_and_cannot_skew_later_views() -> None:
+    from pydantic._internal._model_construction import ModelMetaclass
+
+    counter = [0]
+
+    class Meta(ModelMetaclass):
+        def __getattribute__(cls, name):
+            if name in ("model_fields", "model_config", "__pydantic_fields__"):
+                counter[0] += 1
+            return super().__getattribute__(name)
+
+    class Hooked(BaseModel, metaclass=Meta):
+        a: int = 1
+
+    model = Hooked()
+    view = _counter_view(counter)
+    counter[0] = 0
+    snapshot = snapshot_contract_graph([model, view, model, view])
+    assert counter[0] == 0                     # the fields and configuration are read natively
+    assert snapshot[1] == snapshot[3] == [0]   # so both observations of the view agree
+    assert snapshot[0] == snapshot[2] == {"a": 1}
+
+
+@pytest.mark.parametrize("shape", ["alias", "path-root", "choices"])
+def test_a_str_subclass_validation_alias_runs_no_hook_and_cannot_skew_later_views(shape) -> None:
+    from pydantic import AliasChoices, AliasPath, Field
+
+    counter = [0]
+
+    class CountingAlias(str):
+        def __hash__(self):
+            counter[0] += 1
+            return str.__hash__(self)
+
+        def __eq__(self, other):
+            counter[0] += 1
+            return str.__eq__(self, other)
+
+    alias = {
+        "alias": CountingAlias("alias_a"),
+        "path-root": AliasPath(CountingAlias("root_a"), 0),
+        "choices": AliasChoices(CountingAlias("a1"), AliasPath(CountingAlias("a2"), "x")),
+    }[shape]
+
+    class Aliased(BaseModel):
+        a: int = Field(1, validation_alias=alias)
+
+    model = Aliased()
+    view = _counter_view(counter)
+    counter[0] = 0
+    snapshot = snapshot_contract_graph([model, view, model, view])
+    assert counter[0] == 0                     # an alias is read as its text, never hashed through its hooks
+    assert snapshot[1] == snapshot[3] == [0]
+
+
+def test_an_alias_whose_read_runs_code_is_refused_without_running_it() -> None:
+    from pydantic import AliasPath, Field
+
+    counter = [0]
+
+    class CountingPath(AliasPath):
+        @property
+        def path(self):
+            counter[0] += 1
+            return ["root_a", 0]
+
+        @path.setter
+        def path(self, value):
+            pass
+
+    class Aliased(BaseModel):
+        a: int = Field(1, validation_alias=CountingPath("root_a", 0))
+
+    model = Aliased()
+    counter[0] = 0  # pydantic read the alias while it built the class; only the snapshot is under test
+    with pytest.raises(ValueError, match="metadata"):
+        snapshot_contract_graph([model, _counter_view(counter), model])
+    assert counter[0] == 0  # refused by its type, never read through its property
+
+
+# ── reading configuration and alias storage runs no caller hook (or the subtree is not reused) ──
+
+
+def _hooked_text(counter, text):
+    class HookedText(str):
+        def __hash__(self):
+            counter[0] += 1
+            return str.__hash__(str.__str__(self))
+
+        def __eq__(self, other):
+            counter[0] += 1
+            return str.__eq__(str.__str__(self), other)
+
+    return HookedText(text)
+
+
+def _assert_consistent(counter, model) -> None:
+    """Metadata that could only be read through hook-capable storage or keys is refused, and no hook runs."""
+
+    view = _counter_view(counter)
+    counter[0] = 0
+    with pytest.raises(ValueError, match="metadata"):
+        snapshot_contract_graph([model, view, model, view])
+    assert counter[0] == 0
+
+
+def test_a_str_subclass_key_in_the_model_configuration_is_refused_without_running_it() -> None:
+    counter = [0]
+
+    class Configured(BaseModel):
+        a: int = 1
+
+    config = vars(Configured)["model_config"]
+    dict.__setitem__(config, _hooked_text(counter, "validate_by_alias"), True)
+    _assert_consistent(counter, Configured())
+
+
+@pytest.mark.parametrize("shape", ["choices", "path"])
+def test_alias_storage_that_is_a_list_subclass_is_refused_without_running_it(shape) -> None:
+    from pydantic import AliasChoices, AliasPath, Field
+
+    counter = [0]
+
+    class HookedList(list):
+        def __iter__(self):
+            counter[0] += 1
+            return list.__iter__(self)
+
+        def __len__(self):
+            counter[0] += 1
+            return list.__len__(self)
+
+        def __getitem__(self, index):
+            counter[0] += 1
+            return list.__getitem__(self, index)
+
+    if shape == "choices":
+        alias = AliasChoices("a1", "a2")
+        object.__setattr__(alias, "choices", HookedList(["a1", "a2"]))
+    else:
+        alias = AliasPath("root_a", 0)
+        object.__setattr__(alias, "path", HookedList(["root_a", 0]))
+
+    class Aliased(BaseModel):
+        a: int = Field(1, validation_alias=alias)
+
+    _assert_consistent(counter, Aliased())
+
+
+def test_a_hooked_key_in_a_model_class_namespace_is_refused_without_running_it() -> None:
+    counter = [0]
+
+    class Colliding(str):  # hashes like "model_config", so looking that name up compares against it
+        def __hash__(self):
+            return str.__hash__("model_config")
+
+        def __eq__(self, other):
+            counter[0] += 1
+            return False
+
+    class Meta(type(BaseModel)):
+        @classmethod
+        def __prepare__(mcs, name, bases, **kwargs):
+            namespace = dict(super().__prepare__(name, bases, **kwargs))
+            dict.__setitem__(namespace, Colliding("__ns_shadow__"), None)
+            return namespace
+
+    class Hooked(BaseModel, metaclass=Meta):
+        a: int = 1
+
+    _assert_consistent(counter, Hooked())
+
+
+# ── model metadata is scanned once per class per call, bounded, and a non-text field key runs no hook ──
+
+
+def test_model_metadata_is_scanned_once_per_class_however_many_instances(monkeypatch) -> None:
+    import contracts_common
+
+    attributes = {f"helper_{index}": staticmethod(lambda: None) for index in range(2_000)}
+    Wide = type("Wide", (BaseModel,), {"__annotations__": {"a": int}, "a": 1, **attributes})
+    scanned = [0]
+    real = contracts_common._exact_entry
+
+    def counting(items, name):
+        listed = list(items)
+        scanned[0] += len(listed)
+        return real(listed, name)
+
+    monkeypatch.setattr(contracts_common, "_exact_entry", counting)
+    snapshot_contract_graph([Wide() for _ in range(500)])
+    # one class: its namespace is scanned for the fields and the configuration once, not once per instance
+    assert scanned[0] < 3 * 2_100, scanned[0]
+
+
+def test_an_oversized_alias_list_is_refused_before_it_is_copied() -> None:
+    import tracemalloc
+
+    from pydantic import AliasChoices, Field
+
+    alias = AliasChoices("a1", "a2")
+    choices = ["a1"] * 2_000_000  # far past the edge allowance
+    object.__setattr__(alias, "choices", choices)
+
+    class Aliased(BaseModel):
+        a: int = Field(1, validation_alias=alias)
+
+    model = Aliased()
+    tracemalloc.start()
+    try:
+        with pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):
+            snapshot_contract_graph(model)
+        _current, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert peak < 4_000_000, peak  # the 16 MB copy of the list was never made
+
+
+def test_a_non_text_key_among_the_declared_fields_is_refused_without_running_it() -> None:
+    counter = [0]
+
+    class HookedKey:
+        def __hash__(self):
+            counter[0] += 1
+            return 7
+
+        def __eq__(self, other):
+            counter[0] += 1
+            return self is other
+
+    class Declared(BaseModel):
+        a: int = 1
+
+    model = Declared()
+    dict.__setitem__(vars(Declared)["__pydantic_fields__"], HookedKey(), vars(Declared)["__pydantic_fields__"]["a"])
+    _assert_consistent(counter, model)
+
+
+# ── cached class metadata is not reused across caller code, and the declared-field scans are charged ──
+
+
+def _aliased_pair():
+    from collections.abc import Mapping
+
+    from pydantic import ConfigDict, Field
+
+    class Aliased(BaseModel):
+        model_config = ConfigDict(validate_by_alias=False, validate_by_name=True, extra="allow")
+        a: int = Field(1, validation_alias="alias_a")
+
+    config = vars(Aliased)["model_config"]
+    first = Aliased()
+    second = Aliased()
+    vars(BaseModel)["__dict__"].__get__(second, BaseModel)["alias_a"] = 2  # an alias root, stored
+    return Aliased, config, first, second, Mapping
+
+
+def test_every_instance_is_judged_by_the_class_as_it_was_before_caller_code_ran() -> None:
+    """One snapshot of the class per call, taken before any caller code runs: a callback later in the call
+    (here a carrier's extra mapping, read while the graph is rebuilt) cannot change how any instance is judged."""
+
+    Aliased, config, first, second, Mapping = _aliased_pair()
+
+    class Flipping(Mapping):
+        def __getitem__(self, key):
+            raise KeyError(key)
+
+        def __iter__(self):
+            return iter(())
+
+        def __len__(self):
+            return 0
+
+        def items(self):
+            dict.__setitem__(config, "validate_by_alias", True)
+            return iter(())
+
+    carrier = Aliased()
+    vars(BaseModel)["__pydantic_extra__"].__set__(carrier, Flipping())
+    combined = snapshot_contract_graph([first, carrier, second])
+    assert combined[2] == {"a": 1, "alias_a": 2}  # judged as the class was when the call began
+    # a later call takes its own snapshot, of the class as it is then
+    with pytest.raises(ValueError, match="conflicting declared and extra fields"):
+        snapshot_contract_graph(second)
+
+
+def test_a_key_hook_between_two_instances_cannot_change_how_the_second_is_judged() -> None:
+    """The dict path: the first value's class is read, then a key hook flips the configuration before the
+    second value of the same class is rebuilt.  Both are judged by the one snapshot."""
+
+    Aliased, config, first, second, _ = _aliased_pair()
+
+    armed = [False]
+
+    class FlippingKey:  # a key the rebuilt dict hashes (a text key would be read as its text instead)
+        def __hash__(self):
+            if armed[0]:  # only once the call is running (building the dict below hashes the key too)
+                dict.__setitem__(config, "validate_by_alias", True)
+            return 1
+
+        def __eq__(self, other):
+            return self is other
+
+    key = FlippingKey()
+    graph = {key: first, "k2": second}
+    armed[0] = True
+    snapshot = snapshot_contract_graph(graph)
+    assert config["validate_by_alias"] is True  # the hook did run during the call
+    assert snapshot["k2"] == {"a": 1, "alias_a": 2}  # the same judgment as without the hook
+    armed[0] = False
+    dict.__setitem__(config, "validate_by_alias", False)
+    assert snapshot_contract_graph(graph)["k2"] == snapshot["k2"]
+
+
+def test_declared_fields_are_scanned_and_charged_once_per_class_per_call(monkeypatch) -> None:
+    import contracts_common
+    from pydantic import create_model
+
+    Many = create_model("Many", **{f"f{index}": (int, 0) for index in range(2_000)})
+
+    def sparse():
+        instance = Many()
+        vars(BaseModel)["__dict__"].__get__(instance, BaseModel).clear()  # almost no captured storage
+        return instance
+
+    reads = [0]
+    real = contracts_common._model_metadata
+
+    def counting(model_type, budget):
+        reads[0] += 1
+        return real(model_type, budget)
+
+    monkeypatch.setattr(contracts_common, "_model_metadata", counting)
+    snapshot_contract_graph([sparse() for _ in range(200)])
+    assert reads[0] == 1  # one charged scan for the class, not one per occurrence
+
+
+# ── the declared-field table is charged before it is read, and read from one copy ──
+
+
+def _impure_wide_model(field_count: int) -> type[BaseModel]:
+    """A model with ``field_count`` declared fields whose metadata is impure (one non-text key), so it is
+    read again for every instance."""
+
+    class Hashless:
+        def __hash__(self):
+            return 7
+
+    Wide = type("Wide", (BaseModel,), {"__annotations__": {"a": int}, "a": 1})
+    fields = vars(Wide)["__pydantic_fields__"]
+    for index in range(field_count):
+        dict.__setitem__(fields, f"f{index}", fields["a"])
+    dict.__setitem__(fields, Hashless(), fields["a"])
+    return Wide
+
+
+def test_wide_model_metadata_is_read_once_per_call_and_charged() -> None:
+    def wide(field_count):
+        Wide = type("Wide", (BaseModel,), {"__annotations__": {"a": int}, "a": 1})
+        fields = vars(Wide)["__pydantic_fields__"]
+        for index in range(field_count):
+            dict.__setitem__(fields, f"f{index}", fields["a"])
+        return Wide
+
+    Wide = wide(2_000)
+    # 200 instances of a class with a 2,001-entry declared table: the table is read (and charged) once
+    assert len(snapshot_contract_graph([Wide() for _ in range(200)])) == 200
+    with pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):
+        snapshot_contract_graph([wide(200_000)()])  # one read of a table past the edge allowance is refused
+    with pytest.raises(ValueError, match="metadata"):
+        snapshot_contract_graph([_impure_wide_model(10)()])  # a non-text declared key is refused
+
+
+def test_a_declared_field_table_shared_by_many_classes_costs_its_size_per_class() -> None:
+    class Base(BaseModel):
+        a: int = 1
+
+    def classes(field_count: int) -> list[BaseModel]:
+        table = dict(vars(Base)["__pydantic_fields__"])
+        for index in range(field_count):
+            table[f"f{index}"] = table["a"]
+        instances = []
+        for index in range(100):
+            Shared = type(f"Shared{index}", (Base,), {})
+            type.__setattr__(Shared, "__pydantic_fields__", table)
+            instances.append(Shared())
+        return instances
+
+    with pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):
+        snapshot_contract_graph(classes(2_000))  # 100 classes, one 2,001-entry table each
+    assert len(snapshot_contract_graph(classes(10))) == 100
+
+
+def test_a_replaced_declared_field_table_is_refused_before_it_is_copied() -> None:
+    import tracemalloc
+
+    class Table(dict):
+        pass
+
+    class Replaced(BaseModel):
+        a: int = 1
+
+    table = Table(vars(Replaced)["__pydantic_fields__"])
+    for index in range(300_000):
+        dict.__setitem__(table, f"f{index}", table["a"])
+    type.__setattr__(Replaced, "__pydantic_fields__", table)
+    model = Replaced()
+    tracemalloc.start()
+    try:
+        with pytest.raises(ValueError, match="metadata"):  # a replaced table is refused by its type
+            snapshot_contract_graph(model)
+        _current, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert peak < 4_000_000, peak  # the table was never copied
+
+
+@pytest.mark.parametrize("hook", ["field", "choices", "path"])
+def test_a_metadata_hook_that_grows_the_declared_table_cannot_break_the_scan(hook) -> None:
+    from pydantic import AliasChoices, AliasPath
+    from pydantic.fields import FieldInfo
+
+    class Model(BaseModel):
+        a: int = 1
+        b: int = 2
+
+    fields = vars(Model)["__pydantic_fields__"]
+
+    def grow():
+        dict.__setitem__(fields, f"late{len(fields)}", fields["b"])
+
+    if hook == "field":
+        class GrowingField(FieldInfo):
+            __slots__ = ()
+
+            @property
+            def validation_alias(self):
+                grow()
+                return None
+
+        replacement = GrowingField.__new__(GrowingField)
+        for slot in FieldInfo.__slots__:
+            try:
+                object.__setattr__(replacement, slot, getattr(fields["a"], slot))
+            except AttributeError:
+                pass
+        dict.__setitem__(fields, "a", replacement)
+    elif hook == "choices":
+        class GrowingChoices(AliasChoices):
+            @property
+            def choices(self):
+                grow()
+                return ["a1"]
+
+        object.__setattr__(fields["a"], "validation_alias", GrowingChoices.__new__(GrowingChoices))
+    else:
+        class GrowingPath(AliasPath):
+            @property
+            def path(self):
+                grow()
+                return ["root"]
+
+        object.__setattr__(fields["a"], "validation_alias", GrowingPath.__new__(GrowingPath))
+
+    size = len(fields)
+    with pytest.raises(ValueError, match="metadata"):  # hook-capable metadata types are refused, never read
+        snapshot_contract_graph(Model())
+    assert len(fields) == size  # no hook ran
+
+
+# ── metadata reading runs no caller code at all: hook-capable metadata types are refused ──
+
+
+def test_a_metadata_hook_cannot_repair_a_sibling_before_it_is_captured() -> None:
+    from pydantic import AliasPath, Field
+
+    class Counted(BaseModel):
+        count: int = 0
+
+    sibling = Counted()
+    vars(BaseModel)["__dict__"].__get__(sibling, BaseModel)["count"] = -1  # unchecked, invalid
+
+    armed = [False]
+
+    class RepairingPath(AliasPath):
+        @property
+        def path(self):
+            if armed[0]:  # pydantic reads the alias while it builds the class: only the snapshot is under test
+                vars(BaseModel)["__dict__"].__get__(sibling, BaseModel)["count"] = 1  # repairs the sibling
+            return ["root_a", 0]
+
+        @path.setter
+        def path(self, value):
+            pass
+
+    class Aliased(BaseModel):
+        a: int = Field(1, validation_alias=RepairingPath("root_a", 0))
+
+    model = Aliased()
+    armed[0] = True
+    with pytest.raises(ValueError, match="metadata"):
+        snapshot_contract_graph([model, sibling])
+    assert vars(BaseModel)["__dict__"].__get__(sibling, BaseModel)["count"] == -1  # no hook ran
+
+
+@pytest.mark.parametrize("shape", ["field-subclass", "choices-subclass", "fields-dict-subclass", "config-not-dict"])
+def test_hook_capable_metadata_types_are_refused(shape) -> None:
+    from pydantic import AliasChoices, Field
+    from pydantic.fields import FieldInfo
+
+    class Model(BaseModel):
+        a: int = Field(1, validation_alias="alias_a")
+
+    if shape == "field-subclass":
+        class Sub(FieldInfo):
+            __slots__ = ()
+        fields = vars(Model)["__pydantic_fields__"]
+        replacement = Sub.__new__(Sub)
+        for slot in FieldInfo.__slots__:
+            try:
+                object.__setattr__(replacement, slot, object.__getattribute__(fields["a"], slot))
+            except AttributeError:
+                pass
+        dict.__setitem__(fields, "a", replacement)
+    elif shape == "choices-subclass":
+        class Choices(AliasChoices):
+            pass
+        object.__setattr__(vars(Model)["__pydantic_fields__"]["a"], "validation_alias", Choices("x", "y"))
+    elif shape == "fields-dict-subclass":
+        class Table(dict):
+            pass
+        type.__setattr__(Model, "__pydantic_fields__", Table(vars(Model)["__pydantic_fields__"]))
+    else:
+        from types import MappingProxyType
+        type.__setattr__(Model, "model_config", MappingProxyType(dict(vars(Model)["model_config"])))
+    with pytest.raises(ValueError, match="metadata"):
+        snapshot_contract_graph(Model())
+
+
+# ── alias storage that is not a native list or tuple is refused, never read as empty ──
+
+
+@pytest.mark.parametrize("shape", ["choices", "path"])
+def test_alias_storage_that_cannot_be_read_natively_is_refused_not_dropped(shape) -> None:
+    from collections import UserList
+
+    from pydantic import AliasChoices, AliasPath, ConfigDict, Field
+
+    alias = AliasChoices("alias_a") if shape == "choices" else AliasPath("alias_a", 0)
+
+    class Aliased(BaseModel):
+        model_config = ConfigDict(validate_by_alias=True, validate_by_name=True, extra="allow")
+        a: int = Field(1, validation_alias=alias)
+
+    if shape == "choices":
+        object.__setattr__(alias, "choices", UserList(["alias_a"]))
+    else:
+        object.__setattr__(alias, "path", UserList(["alias_a", 0]))
+    both = Aliased()
+    vars(BaseModel)["__dict__"].__get__(both, BaseModel)["alias_a"] = 2  # the field and its alias root, stored
+    with pytest.raises(ValueError, match="metadata"):
+        snapshot_contract_graph(both)  # used to drop the alias silently and accept the conflicting storage
+
+
+# ── metadata is judged when a model is projected, not when it is merely captured ──
+
+
+class _HiddenBacking(list):
+    """A list whose public view is empty: what its native backing holds is never projected."""
+
+    def __iter__(self):
+        return iter(())
+
+
+def _model_with_refused_metadata() -> BaseModel:
+    class NonText:
+        def __hash__(self):
+            return 5
+
+        def __eq__(self, other):
+            return self is other
+
+    class Refused(BaseModel):
+        a: int = 1
+
+    fields = vars(Refused)["__pydantic_fields__"]
+    model = Refused()
+    dict.__setitem__(fields, NonText(), fields["a"])  # metadata that is refused when the model is projected
+    return model
+
+
+def test_a_model_that_is_never_projected_is_not_refused_for_its_metadata() -> None:
+    hidden = _HiddenBacking([_model_with_refused_metadata()])
+    assert snapshot_contract_graph({"items": hidden}) == {"items": []}  # the public view is what is rebuilt
+
+
+def test_the_same_model_is_refused_when_it_is_projected() -> None:
+    with pytest.raises(ValueError, match="metadata"):
+        snapshot_contract_graph({"items": [_model_with_refused_metadata()]})
+
+
+# ── a missing slot on pydantic's own metadata types is the same deferred metadata refusal ──
+
+
+def _model_missing_slot(shape) -> BaseModel:
+    from pydantic import AliasChoices, AliasPath, Field
+
+    alias = {"path": AliasPath("alias_a", 0), "choices": AliasChoices("alias_a"), "field": "alias_a"}[shape]
+
+    class Slotted(BaseModel):
+        a: int = Field(1, validation_alias=alias)
+
+    model = Slotted()
+    if shape == "path":
+        object.__delattr__(alias, "path")
+    elif shape == "choices":
+        object.__delattr__(alias, "choices")
+    else:
+        object.__delattr__(vars(Slotted)["__pydantic_fields__"]["a"], "validation_alias")
+    return model
+
+
+@pytest.mark.parametrize("shape", ["path", "choices", "field"])
+def test_a_missing_metadata_slot_on_a_hidden_model_does_not_abort_capture(shape) -> None:
+    assert snapshot_contract_graph({"items": _HiddenBacking([_model_missing_slot(shape)])}) == {"items": []}
+
+
+@pytest.mark.parametrize("shape", ["path", "choices", "field"])
+def test_a_missing_metadata_slot_on_a_projected_model_is_the_metadata_refusal(shape) -> None:
+    with pytest.raises(ValueError, match="metadata"):
+        snapshot_contract_graph({"items": [_model_missing_slot(shape)]})
+
+
 # ---- the enum-annotation helper runs on every supported Python (on 3.10 ``list[int]`` is an instance of ``type``)
 
 def test_the_enum_annotation_helper_handles_generic_aliases_and_unions() -> None:
@@ -3806,3 +4450,90 @@ def test_a_model_with_generic_enum_annotations_defines_and_records_its_enum_fiel
         numbers: list[int] = []
 
     assert set(Holder._enum_field_names) == {"one", "many", "fixed", "mapping", "maybe", "optional", "annotated"}
+
+
+# ── a shared text-subclass alias is read as text once per call ──
+
+
+class _SharedAlias(str):
+    pass
+
+
+def _alias_texts_seen(classes: int) -> tuple[int, int, bool]:
+    """``(distinct alias texts across the class snapshots, classes snapshotted, all exact text)`` for ``classes``
+    model classes whose every field shares one long text-subclass alias (twice in each choice list)."""
+
+    import contracts_common
+    from pydantic import Field
+
+    alias = _SharedAlias("a" * 4096)
+    models = []
+    for index in range(classes):
+        namespace = {
+            "__annotations__": {"first": int, "second": int},
+            "first": Field(0, validation_alias=AliasChoices(alias, alias)),
+            "second": Field(0, validation_alias=AliasPath(alias, 0)),
+        }
+        models.append(type(f"Shares{index}", (BaseModel,), namespace))
+    inventories = []
+    real = contracts_common._GraphInventory
+
+    def recording(*args, **kwargs):
+        inventories.append(real(*args, **kwargs))
+        return inventories[-1]
+
+    contracts_common._GraphInventory = recording
+    try:
+        snapshot_contract_graph([model() for model in models])
+    finally:
+        contracts_common._GraphInventory = real
+    (inventory,) = inventories
+    texts = {
+        id(text): text
+        for entry in inventory.metadata.values()
+        if entry[2] is not None
+        for text in entry[2]
+    }
+    snapshotted = sum(1 for entry in inventory.metadata.values() if entry[2] is not None)
+    return len(texts), snapshotted, all(type(text) is str for text in texts.values())
+
+
+def test_a_text_subclass_alias_shared_by_many_classes_is_copied_once_per_call() -> None:
+    # The copies grew with the classes (4 -> 4, 8 -> 8): each class snapshot made and kept its own.
+    for classes in (4, 8):
+        distinct, snapshotted, exact = _alias_texts_seen(classes)
+        assert snapshotted == classes and exact
+        assert distinct == 1
+
+
+def _refused_key_text_checks(classes: int) -> int:
+    """How many times the metadata reads look at one long ``str``-subclass configuration key shared by
+    ``classes`` model classes (each check of it as text preceded a full copy of it)."""
+
+    import contracts_common
+
+    key = _SharedAlias("c" * 4096)
+    models = [type(f"Refused{index}", (BaseModel,), {"__annotations__": {"x": int}, "x": 0}) for index in range(classes)]
+    for model in models:
+        dict.__setitem__(vars(model)["model_config"], key, True)
+    checks = [0]
+    real = contracts_common._is_subclass
+
+    def counting(kind, bases):
+        if kind is _SharedAlias:
+            checks[0] += 1
+        return real(kind, bases)
+
+    contracts_common._is_subclass = counting
+    try:
+        with pytest.raises(ValueError):
+            snapshot_contract_graph([model() for model in models])
+    finally:
+        contracts_common._is_subclass = real
+    return checks[0]
+
+
+def test_a_key_that_refuses_the_metadata_is_not_copied_as_text() -> None:
+    # Each class copied the shared refused key (4 -> 4, 8 -> 8) before refusing its metadata.
+    for classes in (4, 8):
+        assert _refused_key_text_checks(classes) == 0
