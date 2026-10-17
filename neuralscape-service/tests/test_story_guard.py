@@ -11,14 +11,34 @@ SERVICE_DIR = Path(__file__).resolve().parents[1]
 REPO_DIR = SERVICE_DIR.parent
 
 
+# Loaded as a plugin from the scratch directory: the tests' conftest puts the service directory first on the
+# import path, so the scratch directory is put back in front just before each module is collected (and the
+# story is imported in append mode), and a planted module wins even when the service ships one of that name.
+_SCRATCH_FIRST = """
+import sys
+from pathlib import Path
+
+SCRATCH = str(Path(__file__).resolve().parent)
+PLANTED = [path.stem for path in Path(SCRATCH).glob("*.py") if path.stem != "story_guard_scratch_first"]
+
+
+def pytest_pycollect_makemodule(module_path, parent):
+    if SCRATCH in sys.path:
+        sys.path.remove(SCRATCH)
+    sys.path.insert(0, SCRATCH)
+    for name in PLANTED:
+        sys.modules.pop(name, None)
+"""
+
+
 def _run_story(extra_path: Path | None) -> tuple[int, str]:
     env = dict(os.environ)
+    command = [sys.executable, "-m", "pytest", "tests/test_integrated_reference_story.py", "-q", "-p", "no:cacheprovider", "-rs"]
     if extra_path is not None:
+        (extra_path / "story_guard_scratch_first.py").write_text(_SCRATCH_FIRST)
         env["PYTHONPATH"] = str(extra_path) + os.pathsep + env.get("PYTHONPATH", "")
-    done = subprocess.run(
-        [sys.executable, "-m", "pytest", "tests/test_integrated_reference_story.py", "-q", "-p", "no:cacheprovider", "-rs"],
-        cwd=SERVICE_DIR, env=env, capture_output=True, text=True, timeout=300,
-    )
+        command += ["-p", "story_guard_scratch_first", "--import-mode=append"]  # (prepend would put the service first again)
+    done = subprocess.run(command, cwd=SERVICE_DIR, env=env, capture_output=True, text=True, timeout=300)
     return done.returncode, done.stdout + done.stderr
 
 
