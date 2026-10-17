@@ -657,6 +657,29 @@ def _inventory_retained_extra_mappings(frozen_graph: _FrozenGraph) -> None:
         _inventory_extra_mapping(owner, frozen_graph)
 
 
+def _exact_key(key: Any) -> Any:
+    """A text key as an exact ``str`` copy of its text; any other key as it is.
+
+    A ``str`` subclass can change what it hashes and compares as after it was captured, so two captured entries
+    could collapse into one when the entries are rebuilt into a dictionary.  The copy is made with the base
+    type's own method (no key hook runs) and a repeat is then detected on the copies by ``_unique_items``.
+    """
+
+    return str.__str__(key) if _is_instance(key, str) else key
+
+
+def _unique_items(entries: Any, where: str) -> dict[Any, Any]:
+    """The captured entries as a dictionary; a repeated key is refused, never overwritten."""
+
+    rebuilt: dict[Any, Any] = {}
+    for key, item in entries:
+        size = len(rebuilt)
+        rebuilt[key] = item
+        if len(rebuilt) == size:
+            raise ValueError(f"duplicate key in {where}")
+    return rebuilt
+
+
 def _freeze_model_storage(
     value: Any,
     frozen_graph: _FrozenGraph,
@@ -700,7 +723,7 @@ def _freeze_model_storage(
                 dict.__len__(extras) if extras is not None and _is_subclass(type(extras), dict) else 0
             )
             _charge_native(frozen_graph, dict.__len__(stored) + extra_count)
-            stored_entries = tuple(dict.items(stored))
+            stored_entries = tuple((_exact_key(name), item) for name, item in dict.items(stored))
             native_extra_entries = (
                 tuple(dict.items(extras))
                 if extras is not None and _is_subclass(type(extras), dict)
@@ -731,7 +754,7 @@ def _freeze_model_storage(
                 entries = tuple(list.__iter__(current))
             else:
                 _charge_native(frozen_graph, dict.__len__(current))
-                dict_entries = tuple(dict.items(current))
+                dict_entries = tuple((_exact_key(name), item) for name, item in dict.items(current))
                 entries = tuple(item for _key, item in dict_entries)
             if _is_exact_type(value_type, (dict, list, tuple)):
                 frozen_graph.native_containers[identity] = (
@@ -1434,7 +1457,7 @@ def _snapshot_native(
                 _traverse_model_storage(value, _frozen_graph, set())
                 frozen = _frozen_graph.models[identity]
             _model, stored_entries, extras, native_extra_entries = frozen
-            stored_values = dict(stored_entries)
+            stored_values = _unique_items(stored_entries, f"stored values at {path}")
             undeclared = set(stored_values).difference(fields)
             if extras is not None:
                 if native_extra_entries is not None:
@@ -1452,8 +1475,8 @@ def _snapshot_native(
                         raise extra_inventory.failure
                     iterated_extra_names = extra_inventory.iterated_names
                     extra_entries = extra_inventory.item_entries
-                undeclared.update(iterated_extra_names)
-                undeclared.update(key for key, _ in extra_entries)
+                undeclared.update(_exact_key(name) for name in iterated_extra_names)
+                undeclared.update(_exact_key(key) for key, _ in extra_entries)
             if undeclared:
                 # Name the first few (sorted by label) and count the rest, so the error stays small.
                 labels = heapq.nsmallest(_UNDECLARED_NAMES_LISTED, map(_key_label, undeclared))
@@ -1480,15 +1503,21 @@ def _snapshot_native(
                     _traverse_model_storage(value, _frozen_graph, set())
                     frozen_container = _frozen_graph.native_containers[identity]
                 mapping_items = frozen_container[1]
-                return {
-                    key: _snapshot_native(
-                        item,
-                        path=_Path(path, ("key", key)),
-                        active=active,
-                        _frozen_graph=_frozen_graph,
-                    )
-                    for key, item in mapping_items
-                }
+                return _unique_items(
+                    (
+                        (
+                            key,
+                            _snapshot_native(
+                                item,
+                                path=_Path(path, ("key", key)),
+                                active=active,
+                                _frozen_graph=_frozen_graph,
+                            ),
+                        )
+                        for key, item in mapping_items
+                    ),
+                    f"dictionary at {path}",
+                )
 
             _retain_public_mapping(value, _frozen_graph)
             frozen_mapping = _frozen_graph.public_mappings.get(identity)
@@ -1498,6 +1527,7 @@ def _snapshot_native(
 
             projected: dict[Any, Any] = {}
             for key, item in frozen_mapping.entries:
+                key = _exact_key(key)  # read as exact text: no hook runs, and a twin of another key's text is a repeat
                 _protect_yielded_model_storage(item, _frozen_graph)
                 item_path = _Path(path, ("key", key))
                 size = len(projected)
