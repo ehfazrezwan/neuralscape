@@ -2234,3 +2234,65 @@ def test_a_shallow_pattern_chain_is_compared_as_before() -> None:
     assert _pair(old, copy.deepcopy(old)) == []
     findings = _pair(old, new)  # the inner schemas differ: an ordinary unverified change, not the depth marker
     assert any("patternProperties changed" in f for f in findings) and pack._RECURSION_MESSAGE not in findings, findings
+
+
+# ---- version numbers of any length, read in linear time; one budget per call; digests of plain JSON only
+
+
+def _versioned(version: str) -> dict:
+    return {"type": "object", "properties": {"schema_version": {"const": version}}}
+
+
+def test_a_version_with_a_very_long_number_is_compared_not_raised() -> None:
+    assert _pair(_versioned("v" + "1" * 5000), _versioned("v" + "1" * 5001)) == []  # newer: an explicit bump
+    assert _pair(_versioned("v" + "1" * 5001), _versioned("v" + "1" * 5000)) != []  # older: compared like any change
+    assert _pair(_versioned("v010"), _versioned("v9")) != []  # 10 > 9: an older version is not a bump
+    assert _pair(_versioned("v9"), _versioned("v010")) == []
+    assert _pair(_versioned("v١"), _versioned("v٢")) == []  # decimal digits of any script, as before
+
+
+def test_a_version_is_split_without_a_backtracking_pattern(monkeypatch) -> None:
+    real = pack.re.fullmatch
+
+    def guarded(pattern, string, *args, **kwargs):
+        assert pattern != r"(.*?)(\d+)", "the version split must not backtrack"
+        return real(pattern, string, *args, **kwargs)
+
+    monkeypatch.setattr(pack.re, "fullmatch", guarded)
+    old, new = _versioned("1" * 80_000 + "x"), _versioned("1" * 80_000 + "y")
+    assert _pair(old, new) == []  # different, not provably older: an explicit bump, decided in linear time
+
+
+def test_compare_schemas_shares_one_budget_across_its_contracts(monkeypatch) -> None:
+    monkeypatch.setattr(pack, "_MAX_CALL_COMPARISONS", 1500)
+    schema = _recursive_diamond(8)  # 512 comparisons each, well within one contract's own budget
+    report = pack.compare_schemas({f"c{i}": schema for i in range(6)}, {f"c{i}": copy.deepcopy(schema) for i in range(6)})
+    assert "c0" not in report and "c1" not in report, report  # the first contracts fit the call's budget
+    assert report.get("c5") == [pack._BUDGET_MESSAGE], report  # the rest are reported, not compared for free
+    assert pack.compare_schemas({"c": schema}, {"c": copy.deepcopy(schema)}) == {}  # a fresh call has a fresh budget
+
+
+def test_compare_schemas_work_is_bounded_by_the_call_budget(monkeypatch) -> None:
+    calls = {"count": 0}
+    real = pack._compare_keywords
+
+    def counting(*args, **kwargs):
+        calls["count"] += 1
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(pack, "_compare_keywords", counting)
+    monkeypatch.setattr(pack, "_MAX_CALL_COMPARISONS", 3 * pack._MAX_COMPARISONS)
+    schema = _recursive_diamond(24)
+    pack.compare_schemas({f"c{i}": schema for i in range(8)}, {f"c{i}": copy.deepcopy(schema) for i in range(8)})
+    assert calls["count"] <= 3 * pack._MAX_COMPARISONS + 8, calls  # not 8 x the per-contract budget
+
+
+def test_a_digest_of_a_value_beyond_plain_json_is_a_clear_error() -> None:
+    with pytest.raises(ValueError, match="plain JSON"):
+        pack.schema_digest({"const": 10**5000})
+    deep: object = "leaf"
+    for _ in range(100_000):
+        deep = [deep]
+    with pytest.raises(ValueError, match="plain JSON"):
+        pack.schema_digest({"const": deep})
+    assert pack.schema_digest({"type": "string"}) == pack.schema_digest({"type": "string"})

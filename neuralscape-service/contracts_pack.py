@@ -55,6 +55,7 @@ import json
 import math
 import re
 import reprlib
+import unicodedata
 from dataclasses import dataclass
 from fractions import Fraction
 
@@ -189,7 +190,16 @@ def export_schemas() -> dict[str, dict]:
 
 
 def canonical_json(value: object) -> str:
-    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    """The canonical text of a plain JSON value (an exported schema).
+
+    A value JSON text cannot carry within the interpreter's limits (an integer of thousands of digits, a
+    nesting deeper than the recursion limit) is not a plain JSON schema: one clear ``ValueError``.
+    """
+
+    try:
+        return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    except (ValueError, RecursionError) as exc:
+        raise ValueError(f"not a plain JSON value within limits: {type(exc).__name__}") from None
 
 
 def schema_digest(schema: dict) -> str:
@@ -382,7 +392,8 @@ def _charge_values(count: int, local: list[int]) -> bool:
     run = _RUN.get()
     if run is not None:
         run.values += count
-        if run.values > _MAX_EQUALITY_STEPS:
+        run.call.values += count
+        if run.values > _MAX_EQUALITY_STEPS or run.call.values > _MAX_CALL_VALUES:
             raise _BudgetExhausted
         return True
     local[0] += count
@@ -513,6 +524,10 @@ def _removed_values(old_values: list, new_values: list) -> list:
 # Bounds on one comparison, so a schema generated from models can never hang CI or exhaust memory:
 # keyword comparisons performed, findings listed, and findings remembered per shared node pair.
 _MAX_COMPARISONS = 200_000
+# Bounds on one call across all its contracts (``compare_schemas`` compares many): each contract keeps its own
+# budget, and the call as a whole stops at these, the remaining contracts reported as not verified.
+_MAX_CALL_COMPARISONS = 1_000_000
+_MAX_CALL_VALUES = 25_000_000
 _MAX_FINDINGS = 1000
 _MAX_PAIR_FINDINGS = 20
 _LIMIT_MESSAGE = "$: unverified change: finding limit reached; further findings omitted (needs a version bump or a reviewer waiver)"
@@ -527,12 +542,21 @@ class _BudgetExhausted(Exception):
     pass
 
 
+class _CallBudget:
+    """Comparisons and walked values spent by one public call, across every contract it compares."""
+
+    def __init__(self) -> None:
+        self.steps = 0
+        self.values = 0
+
+
 class _Run:
     """State shared by one ``check_compatibility`` call: definition-set equality and node pairs already compared."""
 
     def __init__(self) -> None:
         self.steps = 0
         self.values = 0  # walked by equality and canonical keys (``_MAX_EQUALITY_STEPS``)
+        self.call = _CallBudget()  # replaced by the caller's when one call compares many contracts
         self.shapes: dict[int, tuple[dict, tuple[str, ...]]] = {}  # node id -> (node, malformed keywords)
         self.unevaluated: dict[tuple[int, int, int, int], tuple[object, object, bool]] = {}
         # The lowest position, in the stack of references being compared, of a recursive reference assumed
@@ -557,6 +581,7 @@ class _Run:
 
 
 _RUN: contextvars.ContextVar[_Run | None] = contextvars.ContextVar("contracts_pack_run", default=None)
+_CALL: contextvars.ContextVar[_CallBudget | None] = contextvars.ContextVar("contracts_pack_call", default=None)
 
 
 def _defs_equal(old_defs: dict, new_defs: dict) -> bool:
@@ -991,7 +1016,8 @@ def _charge_comparison() -> None:
     run = _RUN.get()
     if run is not None:
         run.steps += 1
-        if run.steps > _MAX_COMPARISONS:
+        run.call.steps += 1
+        if run.steps > _MAX_COMPARISONS or run.call.steps > _MAX_CALL_COMPARISONS:
             raise _BudgetExhausted
 
 
@@ -1022,7 +1048,8 @@ def _compare_checked(
             out.extend(f"{path}{suffix}" for suffix in remembered[1])
             return
         run.steps += 1
-        if run.steps > _MAX_COMPARISONS:
+        run.call.steps += 1
+        if run.steps > _MAX_COMPARISONS or run.call.steps > _MAX_CALL_COMPARISONS:
             raise _BudgetExhausted
     before = len(out)
     outer = _NO_ASSUMPTION
@@ -1362,9 +1389,27 @@ def _native_json(value: object) -> object:
 _NOT_JSON = (_NotJson, TypeError, ValueError, OverflowError, RecursionError)
 
 
-def _version_number(version: object) -> tuple[str, int] | None:
-    match = re.fullmatch(r"(.*?)(\d+)", version) if isinstance(version, str) else None
-    return (match.group(1), int(match.group(2))) if match else None
+def _version_number(version: object) -> tuple[str, str] | None:
+    """``version`` split into its prefix and its trailing decimal number, or ``None`` without one.
+
+    One linear scan from the end (no backtracking pattern), and the number is kept as its digits (leading
+    zeros removed, every script's decimal digits as ASCII) rather than converted, so a number of any length
+    compares without the interpreter's integer-conversion limit.
+    """
+
+    if not isinstance(version, str):
+        return None
+    start = len(version)
+    while start > 0 and version[start - 1].isdecimal():
+        start -= 1
+    if start == len(version):
+        return None
+    digits = "".join(str(unicodedata.decimal(char)) for char in version[start:]).lstrip("0") or "0"
+    return version[:start], digits
+
+
+def _number_greater(new: str, old: str) -> bool:
+    return (len(new), new) > (len(old), old)
 
 
 def _is_version_bump(old_version: object, new_version: object) -> bool:
@@ -1374,7 +1419,7 @@ def _is_version_bump(old_version: object, new_version: object) -> bool:
         return False
     old_number, new_number = _version_number(old_version), _version_number(new_version)
     if old_number and new_number and old_number[0] == new_number[0]:
-        return new_number[1] > old_number[1]
+        return _number_greater(new_number[1], old_number[1])
     return True
 
 
@@ -1409,6 +1454,7 @@ def check_compatibility(old: dict, new: dict) -> list[str]:
         return []
     problems: list[str] = []
     run = _Run()
+    run.call = _CALL.get() or run.call  # one budget across the contracts of one call
     run.roots = (old, new)
     token = _RUN.set(run)
     try:
@@ -1437,13 +1483,17 @@ def compare_schemas(old: dict[str, dict], new: dict[str, dict]) -> dict[str, lis
     if type(old) is not dict or type(new) is not dict:
         return {"$": [_unverified("$", "schema sets that are not JSON objects")]}
     report: dict[str, list[str]] = {}
-    for name, old_schema in old.items():
-        if name not in new:
-            report[name] = ["contract removed"]
-            continue
-        problems = check_compatibility(old_schema, new[name])
-        if problems:
-            report[name] = problems
+    token = _CALL.set(_CallBudget())  # every contract spends from one budget: the call as a whole is bounded
+    try:
+        for name, old_schema in old.items():
+            if name not in new:
+                report[name] = ["contract removed"]
+                continue
+            problems = check_compatibility(old_schema, new[name])
+            if problems:
+                report[name] = problems
+    finally:
+        _CALL.reset(token)
     return report
 
 
