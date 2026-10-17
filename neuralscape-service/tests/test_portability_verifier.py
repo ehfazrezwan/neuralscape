@@ -2380,3 +2380,79 @@ def test_a_member_that_is_not_zip64_is_not_given_a_wide_descriptor(tmp_path) -> 
     data[position + 16 : position + 16] = b"\0" * 8  # a 64-bit descriptor's size fields follow the CRC
     path.write_bytes(bytes(data))
     assert not verify_bundle(path).ok
+
+
+# --- entry declarations the extractor would honour differently: version, name encoding, modes -----------------
+
+
+def _patch_headers(path: Path, signature: bytes, offset: int, fmt: str, value: int) -> None:
+    data = bytearray(path.read_bytes())
+    position = data.find(signature)
+    while position != -1:
+        struct.pack_into(fmt, data, position + offset, value)
+        position = data.find(signature, position + 4)
+    path.write_bytes(bytes(data))
+
+
+@pytest.mark.parametrize(("version", "ok"), [(20, True), (63, True), (64, False), (99, False)])
+def test_a_local_version_needed_beyond_what_the_reader_supports_is_refused(tmp_path, version, ok) -> None:
+    path = _write_zip(tmp_path / "b.zip", PAYLOAD)
+    _patch_headers(path, b"PK\x03\x04", 4, "<H", version)  # the local headers only
+    assert verify_bundle(path).ok is ok
+
+
+def test_a_non_ascii_name_without_the_utf8_flag_is_refused(tmp_path) -> None:
+    files = {**PAYLOAD, "sources/é.txt": b"x"}
+    path = tmp_path / "b.zip"
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr("manifest.json", json.dumps(_manifest(files)))
+        for name, data in files.items():
+            archive.writestr(name, data)
+    assert verify_bundle(path).ok  # zipfile flags a non-ASCII name as UTF-8
+    data = bytearray(path.read_bytes())
+    for signature, offset in ((b"PK\x03\x04", 6), (b"PK\x01\x02", 8)):
+        position = data.find(signature)
+        while position != -1:
+            flags = struct.unpack_from("<H", data, position + offset)[0]
+            struct.pack_into("<H", data, position + offset, flags & ~0x800)
+            position = data.find(signature, position + 4)
+    path.write_bytes(bytes(data))
+    report = verify_bundle(path)
+    assert not report.ok and pv.CONTAINER_UNSUPPORTED in _codes(report)
+
+
+@pytest.mark.parametrize(
+    ("mode", "ok"),
+    [
+        (0o100644, True),
+        (0o100755, True),
+        (0o100600, True),
+        (0o104755, False),  # set-user-id
+        (0o102755, False),  # set-group-id
+        (0o101755, False),  # sticky
+        (0o100666, False),  # world-writable file
+        (0o100000, False),  # no permission bits
+    ],
+)
+def test_member_modes_that_an_extractor_would_honour_unsafely_are_refused(tmp_path, mode, ok) -> None:
+    path = _write_zip(tmp_path / "b.zip", PAYLOAD)
+    data = bytearray(path.read_bytes())
+    position = data.find(b"PK\x01\x02")
+    while position != -1:
+        struct.pack_into("<I", data, position + 38, mode << 16)
+        position = data.find(b"PK\x01\x02", position + 4)
+    path.write_bytes(bytes(data))
+    report = verify_bundle(path)
+    assert report.ok is ok
+    if not ok:
+        assert pv.UNSAFE_MODE in _codes(report)
+
+
+def test_a_world_writable_directory_written_by_the_standard_library_is_accepted(tmp_path) -> None:
+    path = tmp_path / "b.zip"
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.mkdir("canonical")  # 0o777, as ZipFile.mkdir always writes
+        archive.writestr("manifest.json", json.dumps(_manifest(PAYLOAD)))
+        for name, data in PAYLOAD.items():
+            archive.writestr(name, data)
+    assert verify_bundle(path).ok

@@ -4835,3 +4835,32 @@ def test_other_inputs_are_still_refused_as_validation_errors(document) -> None:
     with pytest.raises(ValidationError) as raised:
         validate_portable_manifest(document)
     assert raised.value.errors()  # a bounded, value-free refusal
+
+
+# ---- a str subclass value is judged by its text; names with display-reordering characters are refused
+
+def test_a_str_subclass_value_that_claims_to_equal_a_literal_is_judged_by_its_text() -> None:
+    class Look(str):
+        def __eq__(self, other: object) -> bool:
+            return str.__eq__("file", other) if isinstance(other, str) else False
+
+        __hash__ = lambda self: hash("file")  # noqa: E731
+
+    document = valid_manifest()
+    document["files"][0]["entry_type"] = Look("dir")
+    try:
+        accepted = validate_portable_manifest(document)
+    except ValidationError:
+        return  # judged as the directory it spells: refused for its content
+    assert accepted.files[0].entry_type == "dir" and type(accepted.files[0].entry_type) is str
+
+
+@pytest.mark.parametrize("name", ["a‮b.txt", "a⁦b.txt", "a‎b.txt", "a؜b.txt", "a\u0085b.txt", "a\u009fb.txt", "a\u007fb.txt"])
+def test_bidirectional_and_c1_control_characters_in_a_name_are_refused(name) -> None:
+    with pytest.raises(ValueError):
+        normalize_bundle_path(name)
+
+
+@pytest.mark.parametrize("name", ["café.txt", "日本語/ファイル.txt", "emoji-👨‍👩.txt", "a b.txt"])
+def test_ordinary_international_names_are_still_accepted(name) -> None:
+    assert normalize_bundle_path(name) == name

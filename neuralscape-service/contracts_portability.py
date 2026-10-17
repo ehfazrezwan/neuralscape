@@ -675,6 +675,8 @@ def _reconstruct_retained_state(
         return items
 
     def rebuild(value: Any) -> Any:
+        if type(value) is not str and _inherits(value, str):
+            return str.__str__(value)  # its text, so no subclass's equality or hash decides what the schema judges
         if not (_inherits(value, BaseModel, list, tuple, set, frozenset) or _is_mapping(value)):
             return value
 
@@ -747,6 +749,10 @@ def _reconstruct_retained_state(
     return reconstructed
 
 
+# Characters that reorder or hide the text of a name when it is displayed (bidirectional controls and marks).
+_BIDI_CONTROL_CHARACTERS = frozenset("\u061c\u200e\u200f\u202a\u202b\u202c\u202d\u202e\u2066\u2067\u2068\u2069")
+
+
 def _normalized_bundle_path(value: str) -> str:
     """Return a canonical relative POSIX bundle path or raise ``ValueError``.
 
@@ -786,6 +792,8 @@ def _normalized_bundle_path(value: str) -> str:
             )
         if any(
             ord(character) < 32
+            or 0x7F <= ord(character) <= 0x9F
+            or character in _BIDI_CONTROL_CHARACTERS
             or character in _WINDOWS_FORBIDDEN_COMPONENT_CHARACTERS
             for character in component
         ):

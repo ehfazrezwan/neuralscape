@@ -97,6 +97,7 @@ PATH_UNSAFE = "path_unsafe"
 SYMLINK_ENTRY = "symlink_entry"
 HARDLINK_ENTRY = "hardlink_entry"
 SPECIAL_ENTRY = "special_entry"
+UNSAFE_MODE = "unsafe_entry_mode"
 ENTRY_ENCRYPTED = "entry_encrypted"
 DUPLICATE_ENTRY = "duplicate_entry"
 CASE_COLLISION = "case_collision"
@@ -231,12 +232,24 @@ def _unicode_path_problem(extra: bytes, declared: str) -> str | None:
     return None
 
 
-def _mode_finding(mode: int) -> str | None:
+def _mode_finding(mode: int, *, declared: bool = False) -> str | None:
+    """A refusal code for an entry's mode, or ``None``.
+
+    A set-user-id, set-group-id or sticky bit is refused wherever the mode comes from.  A zip member's mode
+    is a declaration the extractor honours, so there it must also be usable and, for a file, not writable by
+    everyone: world-writable files and members with no permission bits at all (which cannot be read back)
+    are refused.  A directory may be world-writable: ``ZipFile.mkdir`` writes every directory as 0o777.
+    """
+
     if stat.S_ISLNK(mode):
         return SYMLINK_ENTRY
-    if stat.S_IFMT(mode) in (0, stat.S_IFREG, stat.S_IFDIR):
-        return None  # type bits are absent in many zip writers: plain file
-    return SPECIAL_ENTRY
+    if stat.S_IFMT(mode) not in (0, stat.S_IFREG, stat.S_IFDIR):
+        return SPECIAL_ENTRY  # type bits are absent in many zip writers: plain file
+    if mode & (stat.S_ISUID | stat.S_ISGID | stat.S_ISVTX):
+        return UNSAFE_MODE
+    if declared and (not mode & 0o777 or (mode & stat.S_IWOTH and stat.S_IFMT(mode) != stat.S_IFDIR)):
+        return UNSAFE_MODE
+    return None
 
 
 class _ZipSource(NamedTuple):
@@ -341,11 +354,13 @@ def _local_record_end(raw: BinaryIO, info: zipfile.ZipInfo, start_dir: int) -> i
     head = raw.read(_LOCAL_HEADER.size)
     if len(head) != _LOCAL_HEADER.size:
         raise _Framing("short local header")
-    (signature, _version, flags, method, _time, _date, crc, csize, usize, name_length, extra_length) = (
+    (signature, version_needed, flags, method, _time, _date, crc, csize, usize, name_length, extra_length) = (
         _LOCAL_HEADER.unpack(head)
     )
     if signature != _LOCAL_SIGNATURE:
         raise _Framing("bad local header signature")
+    if version_needed > zipfile.MAX_EXTRACT_VERSION:
+        raise _Framing("version needed to extract is not supported")
     if info.volume != 0:
         # The end records say one disk; a member whose own start-disk field says otherwise is expected
         # elsewhere by every reader that honours the field.
@@ -564,9 +579,14 @@ def _inventory_zip(
             # file: extractors disagree on what it is.
             report.add(ENTRY_CORRUPT, _safe_label(name), "directory type without a directory name")
             continue
-        problem = _mode_finding(mode) if mode else None
+        problem = _mode_finding(mode, declared=True) if mode else None
         if problem is not None:
             report.add(problem, _safe_label(name))
+            continue
+        if not info.flag_bits & _FLAG_UTF8 and not info.orig_filename.isascii():
+            # Read as cp437 here, but a reader that guesses UTF-8 reads the same bytes as other text: the
+            # name a manifest declared for these bytes is not the name every extractor would write.
+            report.add(CONTAINER_UNSUPPORTED, _safe_label(name), "non-ASCII name without the UTF-8 flag")
             continue
         if info.flag_bits & (_FLAG_ENCRYPTED | _FLAG_STRONG_ENCRYPTION):
             report.add(ENTRY_ENCRYPTED, _safe_label(name))
