@@ -79,8 +79,12 @@ def pin_datetime(value: object) -> object:
     called) and rebuilt as an exact ``timedelta`` from its base fields (a ``timedelta`` subclass's arithmetic is
     never run); the fields are read through the built-in descriptors.  Every later comparison is then between
     plain values, so a zone that answers differently on a later read, or fails on it, cannot split validation
-    from the check that follows.  A failing or unusable zone is a value error.  Anything that is not a
-    ``datetime``, and a naive one, is returned unchanged for validation to refuse.
+    from the check that follows.  A zone that raises, or answers with something that is no offset, is a value
+    error.  Anything that is not a ``datetime``, and a naive one, is returned unchanged for validation to refuse.
+
+    A zone that is present but answers ``None`` also comes back as the caller's own object, so a caller that keeps
+    the result must check it (``_is_pinned``) and never cache it: a later read of that zone could accept what was
+    unusable when it was captured.
     """
 
     if not any(base is datetime for base in vars(type)["__mro__"].__get__(type(value))):
@@ -346,6 +350,9 @@ class FreshnessWitness(ContractModel):
 _NATIVE_SCALARS = (type(None), bool, int, float, str, datetime)
 _NATIVE_CONTAINERS = (dict, list, tuple)
 _TYPE_MRO = vars(type)["__mro__"]
+# The scalar kinds a mapping key may have (a datetime is a value only).
+_NATIVE_KEY_KINDS = (type(None), bool, int, float, str)
+
 _ALLOWED_ENUMS: tuple[type, ...] = (
     UpstreamVerificationStatus,
     VerificationMethod,
@@ -445,9 +452,11 @@ def require_native_snapshot(snapshot: object) -> object:
             here = len(trail) - 1
             if kind is dict:
                 for key, item in dict.items(value):
-                    if not any(type(key) is scalar for scalar in _NATIVE_SCALARS):
+                    if not any(type(key) is scalar for scalar in _NATIVE_KEY_KINDS):
                         # A key is judged like any other leaf: exact native kinds only (strict validation then
-                        # refuses a non-text key itself), never an object whose hooks or repr could run.
+                        # refuses a non-text key itself), never an object whose hooks or repr could run.  A
+                        # datetime is a value, never a key: no contract has a datetime-keyed field, and strict
+                        # validation would format the key (and its caller-owned zone) in its error.
                         raise ValueError(f"unsupported key type at {_trail_path(trail, here, '<key>')}")
                     pending.append((item, here, key))
             else:

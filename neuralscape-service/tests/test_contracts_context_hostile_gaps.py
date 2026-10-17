@@ -994,3 +994,86 @@ def test_a_snapshot_without_a_pin_function_still_returns_the_callers_datetime() 
 
     leaf = datetime(*_NOON, tzinfo=UTC)
     assert snapshot_contract_graph({"a": leaf})["a"] is leaf
+
+
+# ---- a datetime is never a mapping key: strict validation would format it (and its zone) in its error
+
+
+class _ZoneThatCountsItsText(tzinfo):
+    reprs = 0
+
+    def utcoffset(self, dt):
+        return timedelta(0)
+
+    def dst(self, dt):
+        return None
+
+    def __repr__(self):
+        _ZoneThatCountsItsText.reprs += 1
+        raise RuntimeError("zone repr")
+
+    __str__ = __repr__
+
+
+def _entry_with_a_datetime_key():
+    key = datetime(2026, 1, 1, tzinfo=_ZoneThatCountsItsText())
+    return {"record_id": "r1", "content_revision": 1, "policy_epoch": 1, key: 1}
+
+
+def test_a_snapshot_with_a_datetime_key_is_refused_before_validation_can_format_it() -> None:
+    entry = _entry_with_a_datetime_key()
+    _ZoneThatCountsItsText.reprs = 0
+    with pytest.raises(ValueError, match="unsupported key type"):
+        require_native_snapshot({"a": [entry]})
+    assert _ZoneThatCountsItsText.reprs == 0
+
+
+def test_a_datetime_keyed_source_entry_never_reaches_the_validator_error_that_formats_the_zone() -> None:
+    from contracts_freshness import projection_status_for
+
+    _ZoneThatCountsItsText.reprs = 0
+    with pytest.raises(ValueError):
+        projection_status_for((_entry_with_a_datetime_key(),), ())
+    assert _ZoneThatCountsItsText.reprs == 0
+
+
+def test_the_other_scalar_kinds_are_still_accepted_as_keys() -> None:
+    snapshot = {"text": 1, 7: 2, 1.5: 3, True: 4, None: 5}
+    assert require_native_snapshot(snapshot) is snapshot
+
+
+# ---- labels: text is cut, and a kind with no label never falls back to its repr
+
+
+def test_a_long_text_key_is_cut_in_the_label_and_a_short_one_is_not() -> None:
+    from contracts_freshness import _label_text
+
+    assert _label_text("k" * 500) == repr("k" * 40) + "..."
+    assert _label_text("short") == "'short'"
+    assert _label_text("k" * 40) == repr("k" * 40)  # exactly at the bound: not cut
+
+
+def test_a_kind_with_no_label_is_a_fixed_word_whatever_its_repr_says() -> None:
+    from contracts_freshness import _label_text
+
+    class Loud:
+        def __repr__(self):
+            raise RuntimeError("repr ran")
+
+        __str__ = __format__ = __repr__
+
+    assert _label_text(Loud()) == "<key>"
+    assert _label_text(datetime(2026, 1, 1, tzinfo=_ZoneThatCountsItsText())) == "<datetime key>"
+
+
+def test_pin_datetime_keeps_returning_the_callers_own_object_for_an_unusable_zone_and_says_so() -> None:
+    class NoOffset(tzinfo):
+        def utcoffset(self, dt):
+            return None
+
+        def dst(self, dt):
+            return None
+
+    value = datetime(2026, 1, 1, tzinfo=NoOffset())
+    assert pin_datetime(value) is value  # documented: the caller must check the result (see the docstring)
+    assert "never cache" in (pin_datetime.__doc__ or "")
