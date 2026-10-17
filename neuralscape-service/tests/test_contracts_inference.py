@@ -2304,3 +2304,30 @@ def test_enum_keeps_json_schema_equality(allowed, value, member):
     else:
         with pytest.raises(ValueError, match="does not match declared schema"):
             validate_generation_result(request, result)
+
+
+# ---- the documented schema-execution refusal
+
+def test_the_schema_execution_refusal_is_the_documented_message_on_both_paths():
+    """The module documents one refusal text for both bounds (the meter and the subschema cap); a change to
+    either the text or the documentation must be deliberate."""
+
+    documented = "output schema execution exceeds its budget"
+    assert contracts_inference.SCHEMA_EXECUTION_MESSAGE == documented
+    assert documented in " ".join(contracts_inference.__doc__.split())
+    # the meter
+    request, result = _generation_with_output(
+        {"v": list(range(3_000))}, v={"type": "array", "items": {"allOf": [{"type": "number"}] * 300}}
+    )
+    with pytest.raises(ValueError) as meter:
+        validate_generation_result(request, result)
+    assert str(meter.value).endswith(documented) or documented in str(meter.value)
+    # the subschema cap
+    with pytest.raises((ValidationError, ValueError)) as cap:
+        generation_request(
+            schema=output_schema(
+                properties={"v": {"allOf": [{"type": "number"}] * (contracts_inference.MAX_OUTPUT_SCHEMA_SUBSCHEMAS + 1)}},
+                required=["v"],
+            )
+        )
+    assert documented in str(cap.value)

@@ -3,6 +3,19 @@
 Decision operations may only select supplied candidate identities. Generation
 operations return schema-checked, machine-authored proposals with explicit
 source support. Neither kind of result grants authority or publishes content.
+
+Output-schema execution has its own bound, separate from the input budgets
+(``MAX_SCHEMA_EXECUTION_UNITS``, ``_KEYWORD_UNITS`` and
+``MAX_OUTPUT_SCHEMA_SUBSCHEMAS`` below): every keyword application and every
+node hashed for ``uniqueItems`` or ``enum`` is charged to a per-call meter.  An
+output schema or result that fits every input budget can still be refused when
+applying the one to the other costs more than the meter allows (a strict schema
+over very many small objects, or one with more than
+``MAX_OUTPUT_SCHEMA_SUBSCHEMAS`` subschemas).  The refusal is a ``ValueError``
+whose message is exactly ``SCHEMA_EXECUTION_MESSAGE`` ("output schema execution
+exceeds its budget"), raised before any output is accepted, never a partial
+validation; shrink the output or simplify the schema.  The constants are
+implementation limits of this candidate, not a service-level commitment.
 """
 
 from __future__ import annotations
