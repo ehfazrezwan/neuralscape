@@ -4333,3 +4333,45 @@ def test_edges_are_charged_cumulatively_across_the_call() -> None:
         usage_reconcile_contracts._native_snapshot(refused)
     captured = {f"k{index}": tuple(range(index, index + each)) for index in range(under)}
     assert len(usage_reconcile_contracts._native_snapshot(captured)) == under
+
+
+
+class _LedgerLookalike(str):
+    """Spells something else, but hashes and compares like the ``service`` ledger."""
+
+    calls = 0
+
+    def __hash__(self):
+        type(self).calls += 1
+        return str.__hash__("service")
+
+    def __eq__(self, other):
+        type(self).calls += 1
+        return True
+
+    def __ne__(self, other):
+        return False
+
+
+def test_a_text_subclass_cannot_pass_a_literal_it_does_not_spell() -> None:
+    event = _event()
+    event.__dict__["ledger"] = _LedgerLookalike("attacker")
+    _LedgerLookalike.calls = 0
+
+    with pytest.raises(UsageReconciliationError, match="invalid_event"):
+        reconcile_usage_events([event])  # used to be accepted as ledger "service"
+    assert _LedgerLookalike.calls == 0  # its hash and equality never ran
+
+
+def test_a_text_subclass_that_spells_the_literal_reaches_validation_as_plain_text() -> None:
+    class Text(str):
+        pass
+
+    event = _event()
+    event.__dict__["ledger"] = Text("service")
+    event.__dict__["event_id"] = Text("event-1")
+
+    result = reconcile_usage_events([event])
+
+    assert result == reconcile_usage_events([_event()])
+    assert type(result.streams[0].ledger) is str and type(result.streams[0].head_event_id) is str

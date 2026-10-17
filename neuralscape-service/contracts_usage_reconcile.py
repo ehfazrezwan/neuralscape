@@ -689,7 +689,9 @@ def _snapshot_uncached(
     if active is None:
         active = set()
     if not _is_node(value):
-        return value
+        # A text subclass reaches validation as its exact text: its own hash and equality never run there,
+        # so it cannot match a literal it does not spell.
+        return _plain_name(value)
 
     identity = id(value)
     if identity in active:

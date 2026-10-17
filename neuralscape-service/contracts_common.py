@@ -122,19 +122,29 @@ def _text(value: object) -> object:
     return str.__str__(value) if type(value) is not str and _is_subclass(type(value), str) else value
 
 
-def _model_metadata(model_type: type[BaseModel], budget: DiscoveryBudget) -> tuple[dict[object, object], object, bool]:
-    """The model's declared fields and configuration, read without caller hooks.
+def _model_metadata(
+    model_type: type[BaseModel], budget: DiscoveryBudget
+) -> tuple[tuple[tuple[object, object], ...], object, bool]:
+    """The model's declared field entries and configuration, read without caller hooks.
 
     pydantic keeps both as plain dicts in every model class's own namespace.  Anything else
     (a replaced or exotic store) is read through the class as before, and reported as impure:
-    reading it may run caller code, so the subtree must not be reused.
+    reading it may run caller code, so the subtree must not be reused.  The declared entries are
+    charged before they are copied, and the copy is what every later scan reads: a hook that runs
+    meanwhile cannot change them, and a large table costs its size wherever it is read.
     """
 
     fields, fields_pure = _class_namespace_entry(model_type, "__pydantic_fields__", budget)
     config, config_pure = _class_namespace_entry(model_type, "model_config", budget)
-    if type(fields) is dict and (config is None or type(config) is dict):
-        return fields, config, fields_pure and config_pure
-    return dict(model_type.model_fields), model_type.model_config, False
+    pure = fields_pure and config_pure
+    if type(fields) is not dict or (config is not None and type(config) is not dict):
+        fields, config, pure = model_type.model_fields, model_type.model_config, False
+        if not _is_subclass(type(fields), dict):
+            if not _is_subclass(type(fields), Mapping):
+                raise ValueError("contract model fields must be a mapping")
+            return _mapping_entries(fields, type(fields), budget), config, pure  # each entry charged as read
+    budget.charge_edge(dict.__len__(fields))  # type: ignore[arg-type]
+    return tuple(dict.items(fields)), config, pure  # type: ignore[arg-type]
 
 
 def _declared_metadata(
@@ -155,8 +165,7 @@ def _declared_metadata(
     budget = inventory.budget
     declared_fields, config, metadata_pure = _model_metadata(model_type, budget)
     declared_names: set[object] = set()
-    budget.charge_edge(dict.__len__(declared_fields))  # every declared field scanned is charged
-    for name in dict.keys(declared_fields):
+    for name, _field in declared_fields:  # the charged copy, never the live table
         if _is_subclass(type(name), str):
             declared_names.add(_text(name))
         else:
@@ -171,7 +180,7 @@ def _declared_metadata(
 
 
 def _validation_alias_owners(
-    fields: dict[object, object], config: object, budget: DiscoveryBudget
+    fields: tuple[tuple[object, object], ...], config: object, budget: DiscoveryBudget
 ) -> tuple[dict[str, set[str]], bool]:
     """Each validation alias (or alias-path root) as exact text, with the fields it belongs to.
 
@@ -192,8 +201,8 @@ def _validation_alias_owners(
         return {}, pure
 
     owners: dict[str, set[str]] = {}
-    budget.charge_edge(dict.__len__(fields))  # this walk scans every declared field again: charged again
-    for field_name, field in dict.items(fields):
+    budget.charge_edge(len(fields))  # this walk scans every declared field again: charged again
+    for field_name, field in fields:  # the copy: a hook run by a field or alias cannot change what is walked
         if not _is_subclass(type(field_name), str):
             pure = False  # a non-text name can hash or compare through caller code: never hashed, never reused
             continue

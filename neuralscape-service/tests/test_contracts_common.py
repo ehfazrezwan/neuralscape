@@ -4038,3 +4038,124 @@ def test_declared_field_scans_are_charged_to_the_shared_budget() -> None:
 
     with pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):
         snapshot_contract_graph([sparse() for _ in range(200)])
+
+
+
+# ── the declared-field table is charged before it is read, and read from one copy ──
+
+
+def _impure_wide_model(field_count: int) -> type[BaseModel]:
+    """A model with ``field_count`` declared fields whose metadata is impure (one non-text key), so it is
+    read again for every instance."""
+
+    class Hashless:
+        def __hash__(self):
+            return 7
+
+    Wide = type("Wide", (BaseModel,), {"__annotations__": {"a": int}, "a": 1})
+    fields = vars(Wide)["__pydantic_fields__"]
+    for index in range(field_count):
+        dict.__setitem__(fields, f"f{index}", fields["a"])
+    dict.__setitem__(fields, Hashless(), fields["a"])
+    return Wide
+
+
+def test_impure_model_metadata_is_charged_on_every_read() -> None:
+    Wide = _impure_wide_model(2_000)
+    with pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):
+        snapshot_contract_graph([Wide() for _ in range(200)])  # 200 reads of a 2,001-entry table
+    assert len(snapshot_contract_graph([_impure_wide_model(10)() for _ in range(200)])) == 200
+
+
+def test_a_declared_field_table_shared_by_many_classes_costs_its_size_per_class() -> None:
+    class Base(BaseModel):
+        a: int = 1
+
+    def classes(field_count: int) -> list[BaseModel]:
+        table = dict(vars(Base)["__pydantic_fields__"])
+        for index in range(field_count):
+            table[f"f{index}"] = table["a"]
+        instances = []
+        for index in range(100):
+            Shared = type(f"Shared{index}", (Base,), {})
+            type.__setattr__(Shared, "__pydantic_fields__", table)
+            instances.append(Shared())
+        return instances
+
+    with pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):
+        snapshot_contract_graph(classes(2_000))  # 100 classes, one 2,001-entry table each
+    assert len(snapshot_contract_graph(classes(10))) == 100
+
+
+def test_a_replaced_declared_field_table_is_refused_before_it_is_copied() -> None:
+    import tracemalloc
+
+    class Table(dict):
+        pass
+
+    class Replaced(BaseModel):
+        a: int = 1
+
+    table = Table(vars(Replaced)["__pydantic_fields__"])
+    for index in range(300_000):
+        dict.__setitem__(table, f"f{index}", table["a"])
+    type.__setattr__(Replaced, "__pydantic_fields__", table)
+    model = Replaced()
+    tracemalloc.start()
+    try:
+        with pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):
+            snapshot_contract_graph(model)
+        _current, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert peak < 4_000_000, peak  # the table was never copied
+
+
+@pytest.mark.parametrize("hook", ["field", "choices", "path"])
+def test_a_metadata_hook_that_grows_the_declared_table_cannot_break_the_scan(hook) -> None:
+    from pydantic import AliasChoices, AliasPath
+    from pydantic.fields import FieldInfo
+
+    class Model(BaseModel):
+        a: int = 1
+        b: int = 2
+
+    fields = vars(Model)["__pydantic_fields__"]
+
+    def grow():
+        dict.__setitem__(fields, f"late{len(fields)}", fields["b"])
+
+    if hook == "field":
+        class GrowingField(FieldInfo):
+            __slots__ = ()
+
+            @property
+            def validation_alias(self):
+                grow()
+                return None
+
+        replacement = GrowingField.__new__(GrowingField)
+        for slot in FieldInfo.__slots__:
+            try:
+                object.__setattr__(replacement, slot, getattr(fields["a"], slot))
+            except AttributeError:
+                pass
+        dict.__setitem__(fields, "a", replacement)
+    elif hook == "choices":
+        class GrowingChoices(AliasChoices):
+            @property
+            def choices(self):
+                grow()
+                return ["a1"]
+
+        object.__setattr__(fields["a"], "validation_alias", GrowingChoices.__new__(GrowingChoices))
+    else:
+        class GrowingPath(AliasPath):
+            @property
+            def path(self):
+                grow()
+                return ["root"]
+
+        object.__setattr__(fields["a"], "validation_alias", GrowingPath.__new__(GrowingPath))
+
+    assert snapshot_contract_graph(Model()) == {"a": 1, "b": 2}  # used to raise "dictionary changed size"
