@@ -2407,3 +2407,35 @@ def test_shared_maps_and_repeated_references_within_budget_still_compare() -> No
     narrowed = copy.deepcopy(schema)
     narrowed["properties"]["q3"]["properties"]["f0"] = {"type": "string", "maxLength": 1}
     assert any("q3.f0" in f for f in _pair(schema, narrowed))
+
+
+# ---- integers beyond the interpreter's integer-to-text limit are rendered by size and compared exactly
+
+
+_HUGE = 10**5000
+
+
+@pytest.mark.parametrize(
+    "old, new",
+    [({"enum": [_HUGE, 0]}, {"enum": [0]}), ({"enum": [{"a": [_HUGE]}, 1]}, {"enum": [1]})],
+    ids=["integer", "nested"],
+)
+def test_removing_a_huge_integer_from_an_enum_is_reported_at_both_entry_points(old, new) -> None:
+    findings = _pair(old, new)
+    assert findings and findings[0].startswith("$: enum values removed"), findings
+    assert pack.compare_schemas({"C": old}, {"C": new}) == {"C": findings}
+
+
+def test_a_huge_integer_is_named_by_its_size_in_a_finding() -> None:
+    assert _pair({"enum": [_HUGE, 0]}, {"enum": [0]}) == ["$: enum values removed [<integer of about 5001 digits>]"]
+    assert _pair({"enum": [12345, 0]}, {"enum": [0]}) == ["$: enum values removed [12345]"]  # ordinary values as before
+
+
+@pytest.mark.parametrize(
+    "old_step, new_step, narrowed",
+    [(_HUGE, _HUGE, False), (_HUGE * 2, _HUGE, False), (_HUGE, _HUGE * 2, True), (0.5, 0.25, False), (0.1, 0.3, True)],
+    ids=["huge-same", "huge-finer", "huge-coarser", "decimal-finer", "decimal-coarser"],
+)
+def test_multiple_of_compares_huge_integers_exactly(old_step, new_step, narrowed) -> None:
+    findings = _pair({"type": "number", "multipleOf": old_step}, {"type": "number", "multipleOf": new_step})
+    assert (findings == ["$: multipleOf narrowed"]) is narrowed, findings

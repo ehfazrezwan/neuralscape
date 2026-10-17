@@ -354,14 +354,30 @@ def _inline(
     return {"$ref": _inline(target, defs, stack + (name,), budget, root=root), **rest}
 
 
-_REPR = reprlib.Repr()
+class _FindingRepr(reprlib.Repr):
+    """``reprlib`` renders an integer in full before shortening it, which fails past the interpreter's
+    integer-to-text limit: a long integer is named by its size instead."""
+
+    def repr_int(self, x: int, level: int) -> str:
+        if x.bit_length() > 10_000:  # about 3,000 digits, well inside the limit
+            return f"<integer of about {int(x.bit_length() * 0.30103) + 1} digits>"
+        return super().repr_int(x, level)
+
+
+_REPR = _FindingRepr()
 _REPR.maxlevel, _REPR.maxlist, _REPR.maxdict, _REPR.maxstring, _REPR.maxother = 3, 5, 5, 40, 40
 
 
 def _bounded_repr(value: object) -> str:
-    """A short, depth-limited rendering for a finding (a schema value can be arbitrarily large or deep)."""
+    """A short, depth-limited rendering for a finding (a schema value can be arbitrarily large or deep).
 
-    return _REPR.repr(value)
+    Rendering never decides a finding: a value that still cannot be rendered is named as such.
+    """
+
+    try:
+        return _REPR.repr(value)
+    except (ValueError, RecursionError, OverflowError):
+        return "<a value too large to show>"
 
 
 def _json_kind(value: object) -> str:
@@ -767,10 +783,15 @@ def _allowed_values(schema: dict) -> list | None:
     return None
 
 
+def _exact_step(step: object) -> Fraction:
+    # An integer is taken exactly (no text, so no integer-to-text limit); a decimal by its shortest text.
+    return Fraction(step) if type(step) is int else Fraction(str(step))
+
+
 def _multiple_of_narrowed(old_step: object, new_step: object) -> bool:
     try:
-        return Fraction(str(old_step)) % Fraction(str(new_step)) != 0
-    except (ValueError, ZeroDivisionError):
+        return _exact_step(old_step) % _exact_step(new_step) != 0
+    except (ValueError, ZeroDivisionError, TypeError, OverflowError):
         return True
 
 
