@@ -66,6 +66,7 @@ class _CallState:
     __slots__ = (
         "budget", "visited", "discovered", "discovery_inventory", "model_inventory",
         "native_container_inventory", "public_view_inventory", "completed", "first_expansion",
+        "field_tables",
     )
 
     def __init__(self) -> None:
@@ -81,6 +82,8 @@ class _CallState:
         # What a node held when discovery first expanded it (owner retained): a shallower path that reaches
         # it again re-expands these saved edges, never the live storage, which a callback may have changed.
         self.first_expansion: dict[int, tuple[Any, tuple[Any, ...]]] = {}
+        # The declared-field table found in each class's namespace (class retained), scanned once per call.
+        self.field_tables: dict[int, tuple[Any, Any]] = {}
 _MISSING_FIELDS_SET = object()
 
 
@@ -242,9 +245,41 @@ def _is_mapping(value: object) -> bool:
     return False
 
 
+_NO_TABLE = object()
+
+
+def _namespace_fields_table(
+    klass: type, budget: DiscoveryBudget | None, tables: "dict[int, tuple[Any, Any]] | None"
+) -> Any:
+    """The ``__pydantic_fields__`` entry of one class's namespace, or ``_NO_TABLE``.
+
+    The namespace is scanned, never probed by name: a probe compares the name with every key that shares its
+    hash, and a model metaclass can plant a ``str``-subclass key there whose equality is caller code (it ran in
+    the middle of validation and could repair a file captured earlier).  Only a key of exact type ``str`` is
+    compared, with the base method.  The scan costs the namespace's size, charged once per class per call.
+    """
+
+    if tables is not None:
+        known = tables.get(id(klass))
+        if known is not None and known[0] is klass:
+            return known[1]
+    raw = _TYPE_DICT_DESCRIPTOR.__get__(klass)
+    if budget is not None:
+        budget.charge_edge(len(raw))
+    found = _NO_TABLE
+    for key, value in raw.items():
+        if type(key) is str and str.__eq__(key, "__pydantic_fields__"):
+            found = value
+            break
+    if tables is not None:
+        tables[id(klass)] = (klass, found)
+    return found
+
+
 def _native_declared_field_names(
     model_type: type[BaseModel],
     budget: DiscoveryBudget | None = None,
+    tables: "dict[int, tuple[Any, Any]] | None" = None,
 ) -> tuple[str, ...] | None:
     """Return ordered declared field names from raw class storage, or ``None``.
 
@@ -257,10 +292,9 @@ def _native_declared_field_names(
     """
 
     for klass in _TYPE_MRO_DESCRIPTOR.__get__(model_type):
-        raw = _TYPE_DICT_DESCRIPTOR.__get__(klass)
-        if "__pydantic_fields__" not in raw:
+        fields = _namespace_fields_table(klass, budget, tables)
+        if fields is _NO_TABLE:
             continue
-        fields = raw["__pydantic_fields__"]
         if not issubclass(type(fields), dict):
             return None
         # Every use of the names (this copy, the type scan, and the per-instance scans of the caller) costs
@@ -278,10 +312,11 @@ def _model_discovery_values(
     model_type: type[BaseModel],
     stored_entries: _ModelStorageEntries,
     budget: DiscoveryBudget | None = None,
+    tables: "dict[int, tuple[Any, Any]] | None" = None,
 ) -> tuple[Any, ...]:
     """Select stored values needing callback-free graph discovery."""
 
-    declared = _native_declared_field_names(model_type, budget)
+    declared = _native_declared_field_names(model_type, budget, tables)
     if declared is None:
         return tuple(item for _, item in reversed(stored_entries))
     declared_names = frozenset(declared)
@@ -434,7 +469,7 @@ def _reject_retained_unknown_fields(
                 # remain conservative candidates for later hash authority.
                 pending.extend(
                     (item, child_depth)
-                    for item in _model_discovery_values(value_type, stored_entries, budget)
+                    for item in _model_discovery_values(value_type, stored_entries, budget, state.field_tables)
                 )
                 continue
 
@@ -493,7 +528,7 @@ def _reject_retained_unknown_fields(
             discover(value, len(location))
 
         if _inherits(value, BaseModel):
-            declared = _native_declared_field_names(type(value), budget)
+            declared = _native_declared_field_names(type(value), budget, state.field_tables)
             if declared is None:
                 raise ValueError("contract model field storage is unavailable")
             stored_entries, fields_set_storage, extra_snapshot = (

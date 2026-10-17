@@ -4603,3 +4603,103 @@ def test_a_few_instances_of_a_wide_class_stay_within_the_budget() -> None:
     with pytest.raises(ValidationError) as raised:
         validate_portable_manifest(manifest)
     assert str(raised.value.__cause__) != DISCOVERY_BUDGET_MESSAGE  # refused for its content, not its budget
+
+
+# ---- the declared-field table is found by scanning the class namespace: a planted twin key never runs code
+
+class _TwinNamespaceKey(str):
+    """Hashes like ``__pydantic_fields__``; its equality is caller code (a hook, armed after the model exists)."""
+
+    hook = None
+    armed = False
+    calls = 0
+
+    def __hash__(self) -> int:
+        return str.__hash__("__pydantic_fields__")
+
+    def __eq__(self, other: object) -> bool:
+        if type(self).armed:
+            type(self).calls += 1
+            if type(self).hook is not None:
+                type(self).hook()
+        return False
+
+
+def _planted_manifest():
+    """A manifest whose first file is an instance of a class with a planted twin namespace key, and whose
+    second file is invalid until a hook (run by the twin's equality) repairs it."""
+
+    twin_class = type("Twin", (_TwinNamespaceKey,), {"hook": None, "armed": False, "calls": 0})
+    twin = twin_class("__pydantic_fields__")
+
+    class Meta(type(ManifestFile)):
+        @classmethod
+        def __prepare__(mcls, name, bases, **kwargs):
+            namespace = super().__prepare__(name, bases, **kwargs)
+            namespace[twin] = None
+            return namespace
+
+    class Planted(ManifestFile, metaclass=Meta):  # a class statement, so the metaclass's __prepare__ runs
+        pass
+
+    manifest = validate_portable_manifest(valid_manifest()).model_copy(deep=True)
+    good = manifest.files[0]
+    planted = object.__new__(Planted)
+    _PYDANTIC_DICT_DESCRIPTOR.__set__(planted, dict(_PYDANTIC_DICT_DESCRIPTOR.__get__(good, BaseModel)))
+    _PYDANTIC_FIELDS_SET_SLOT.__set__(planted, set(_PYDANTIC_FIELDS_SET_SLOT.__get__(good, type(good))))
+    _PYDANTIC_EXTRA_SLOT.__set__(planted, None)
+    bad = good.model_copy(update={"path": "../escape"})
+    list.__setitem__(manifest.files, 0, planted)
+    list.append(manifest.files, bad)
+
+    def repair() -> None:
+        dict.__setitem__(_PYDANTIC_DICT_DESCRIPTOR.__get__(bad, BaseModel), "path", "sources/note.md")
+
+    twin_class.hook = staticmethod(repair)
+    return manifest, twin_class, bad
+
+
+def test_a_planted_twin_namespace_key_cannot_run_code_or_repair_a_later_file() -> None:
+    manifest, twin_class, bad = _planted_manifest()
+    with pytest.raises(ValidationError):  # the unarmed control: the invalid second file is refused
+        validate_portable_manifest(manifest)
+    twin_class.armed = True
+    with pytest.raises(ValidationError):  # armed, the hook would repair it if it ran
+        validate_portable_manifest(manifest)
+    assert twin_class.calls == 0  # the namespace is scanned, never probed by name, so the twin is never compared
+    assert dict.__getitem__(_PYDANTIC_DICT_DESCRIPTOR.__get__(bad, BaseModel), "path") == "../escape"
+
+
+def test_an_honest_manifest_runs_no_namespace_key_code() -> None:
+    manifest, twin_class, bad = _planted_manifest()
+    list.pop(manifest.files)  # the invalid file removed: only the planted instance remains
+    twin_class.armed = True
+    assert validate_portable_manifest(manifest).files[0].path == "canonical/records.jsonl"
+    assert twin_class.calls == 0
+
+
+def test_the_declared_field_table_is_charged_once_per_class_per_call_not_per_instance() -> None:
+    manifest = validate_portable_manifest(valid_manifest()).model_copy(deep=True)
+    for _ in range(50):
+        list.append(manifest.files, manifest.files[0].model_copy(update={"path": f"canonical/extra-{_}.bin"}))
+    assert len(validate_portable_manifest(manifest).files) == len(manifest.files)
+
+
+@pytest.mark.parametrize(("instances", "over_budget"), [(40, False), (60, True)])
+def test_the_declared_field_charge_counts_both_scans_of_every_instance(instances, over_budget) -> None:
+    """One instance of an 8,000-field class costs 16,000 edges (the discovery scan and the walk's), so 40 fit
+    under the 786,432-edge tier and 60 do not; half a charge (one scan) would let 60 through."""
+
+    from pydantic import create_model
+
+    wide = create_model("Wide", __base__=ManifestFile, **{f"extra_{i}": (int | None, None) for i in range(8_000)})
+    manifest = validate_portable_manifest(valid_manifest()).model_copy(deep=True)
+    for _ in range(instances):
+        sparse = object.__new__(wide)
+        _PYDANTIC_DICT_DESCRIPTOR.__set__(sparse, {})
+        _PYDANTIC_FIELDS_SET_SLOT.__set__(sparse, set())
+        _PYDANTIC_EXTRA_SLOT.__set__(sparse, None)
+        list.append(manifest.files, sparse)
+    with pytest.raises(ValidationError) as raised:
+        validate_portable_manifest(manifest)
+    assert (str(raised.value.__cause__) == DISCOVERY_BUDGET_MESSAGE) is over_budget
