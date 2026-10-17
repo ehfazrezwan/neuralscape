@@ -2236,3 +2236,71 @@ def test_data_that_looks_like_a_dialect_declaration_is_kept():
     value = {"$schema": "not-a-dialect", "x": 1}
     request, result = _generation_with_output({"v": value}, v={"enum": [value]})
     assert validate_generation_result(request, result).compliant
+
+
+# ---- enum equality recurses: the work is bounded by the nodes of the entries and the instance
+
+def _enum_shape(entries: int, items: int, width: int):
+    """Entries and items that keep their size one level down (``[0] * width + [j]``): the top-level sizes are
+    small, but the equality jsonschema runs for every (item, entry) pair walks ``width`` nodes each."""
+
+    allowed = [[0] * width + [j] for j in range(entries)]
+    values = [[0] * width + [entries - 1] for _ in range(items)]  # every item matches the last entry
+    return _generation_with_output({"v": values}, v={"type": "array", "items": {"enum": allowed}})
+
+
+def _enum_and_input_only_seconds(entries: int, items: int, width: int):
+    """Seconds to validate the shape with the list as an enum, and with the same list as ``examples`` (the input
+    budgets and contract checks alone, which are not what is bounded here), and the enum run's outcome."""
+
+    import time
+
+    allowed = [[0] * width + [j] for j in range(entries)]
+    values = [[0] * width + [entries - 1] for _ in range(items)]
+    request, result = _generation_with_output({"v": values}, v={"type": "array", "items": {"examples": allowed}})
+    started = time.monotonic()
+    validate_generation_result(request, result)
+    baseline = time.monotonic() - started
+    request, result = _enum_shape(entries, items, width)
+    started = time.monotonic()
+    try:
+        validate_generation_result(request, result)
+        outcome = None
+    except ValueError as error:
+        outcome = str(error)
+    return time.monotonic() - started, baseline, outcome
+
+
+def test_an_enum_whose_entries_hide_their_size_is_refused_in_bounded_time():
+    elapsed, baseline, outcome = _enum_and_input_only_seconds(entries=1_000, items=1_000, width=60)
+    assert outcome is not None and "schema execution" in outcome
+    # The execution share (elapsed minus the input-only cost) was about 5-7 s before the nodes were charged;
+    # the refusal is the deterministic assertion, the bound is relative to the same machine's baseline.
+    assert elapsed - baseline < 2.5
+
+
+def test_a_modest_enum_over_nested_entries_still_validates():
+    request, result = _enum_shape(entries=50, items=50, width=20)
+    assert validate_generation_result(request, result).compliant
+
+
+@pytest.mark.parametrize(
+    "allowed, value, member",
+    [
+        ([1, 2], 1.0, True),  # one number, two spellings
+        ([1, 2], True, False),  # a boolean is not a number
+        ([[True]], [1], False),  # also inside arrays
+        ([{"a": 1, "b": [1.0]}], {"b": [1], "a": 1.0}, True),  # key order does not matter, depth does not matter
+        ([[1, 2]], [2, 1], False),  # item order does
+        (["1"], 1, False),
+        ([None], None, True),
+        ([{"a": [{"b": 1}]}], {"a": [{"b": 2}]}, False),
+    ],
+)
+def test_enum_keeps_json_schema_equality(allowed, value, member):
+    request, result = _generation_with_output({"v": value}, v={"enum": allowed})
+    if member:
+        assert validate_generation_result(request, result).compliant
+    else:
+        with pytest.raises(ValueError, match="does not match declared schema"):
+            validate_generation_result(request, result)

@@ -875,8 +875,23 @@ def _metered_validator_class(validator_class: Any, meter: _SchemaExecutionMeter)
                     return
                 seen.add(identity)
 
+    # jsonschema's enum compares the instance with every entry, and its equality recurses through nested
+    # arrays and objects, so entries and items that keep their size one level down cost entries x items x
+    # depth while the top-level sizes charged above stay small.  Each enum list is hashed once per call
+    # (one unit per node, cached by the list object), the instance is hashed per application, and
+    # membership is a set lookup.
+    enum_sets: dict[int, tuple[object, frozenset[object]]] = {}
+
+    def enum(validator: Any, enums: Any, instance: Any, schema: Any) -> Any:
+        known = enum_sets.get(id(enums))
+        if known is None or known[0] is not enums:  # the list is kept alive, so its id is its own
+            known = enum_sets[id(enums)] = (enums, frozenset(_json_identity(entry, meter) for entry in enums))
+        if _json_identity(instance, meter) not in known[1]:
+            yield SchemaError(f"{instance!r} is not one of {enums!r}")
+
     keywords = {name: metered(keyword) for name, keyword in validator_class.VALIDATORS.items()}
     keywords["uniqueItems"] = metered(unique_items)
+    keywords["enum"] = metered(enum)
     return extend(validator_class, keywords)
 
 
