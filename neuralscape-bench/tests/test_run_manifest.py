@@ -5493,3 +5493,27 @@ def test_the_pairing_slot_is_empty_after_every_python_outcome_too():
         assert _pending_slot() is None
     pydantic.TypeAdapter(RunManifest).validate_python(completed_manifest().model_dump())
     assert _pending_slot() is None
+
+
+# ---- a manifest built from datetime subclasses serializes and round-trips (the stored timestamps are exact)
+
+
+@pytest.mark.parametrize("path", ["init", "model_validate", "type_adapter"])
+def test_a_manifest_built_from_datetime_subclasses_serializes_and_round_trips(path):
+    class Benign(datetime):
+        pass
+
+    data = {
+        **completed_manifest().model_dump(),
+        "started_at": Benign(2026, 10, 1, 8, 0, tzinfo=timezone.utc),
+        "finished_at": Benign(2026, 10, 1, 12, 0, tzinfo=timezone(timedelta(hours=2))),
+    }
+    if path == "init":
+        manifest = RunManifest(**data)
+    elif path == "model_validate":
+        manifest = RunManifest.model_validate(data)
+    else:
+        manifest = pydantic.TypeAdapter(RunManifest).validate_python(data)
+    assert type(manifest.started_at) is datetime and type(manifest.finished_at) is datetime
+    text = serialize_run_manifest(manifest)  # an inexact leaf would be refused here as an unsupported value type
+    assert validate_run_manifest_json(text) == manifest
