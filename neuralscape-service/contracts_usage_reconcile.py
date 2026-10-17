@@ -11,6 +11,7 @@ from pydantic import BaseModel, ConfigDict, GetCoreSchemaHandler, model_validato
 from pydantic_core import core_schema
 
 from contracts_common import ContractModel, MAX_SAFE_INTEGER, OpaqueId, SafeCounter
+from contracts_limits import inherits_native, is_native_instance
 from contracts_tenancy import unpack_pairs
 from contracts_usage import (
     AttributionSnapshot,
@@ -387,7 +388,7 @@ def _plain_name(name: object) -> object:
 
 
 def _is_node(value: object) -> bool:
-    return isinstance(value, (BaseModel, list, tuple, set, frozenset)) or _is_real_mapping(value)
+    return is_native_instance(value, BaseModel, list, tuple, set, frozenset) or _is_real_mapping(value)
 
 
 def _freeze_model_storage(
@@ -400,9 +401,8 @@ def _freeze_model_storage(
     """Capture reachable native model stores without public traversal hooks."""
 
     value_type = type(value)
-    is_native_container = issubclass(
-        value_type,
-        (BaseModel, dict, list, tuple, set, frozenset),
+    is_native_container = any(
+        inherits_native(value_type, base) for base in (BaseModel, dict, list, tuple, set, frozenset)
     )
     if not is_native_container:
         return
@@ -412,7 +412,7 @@ def _freeze_model_storage(
         return
     visited.add(identity)
 
-    if issubclass(value_type, BaseModel):
+    if inherits_native(value_type, BaseModel):
         frozen_model = frozen_models.get(identity)
         if frozen_model is not None and frozen_model[0] is value:
             return
@@ -424,7 +424,7 @@ def _freeze_model_storage(
             extras = None
         native_extra_items = (
             tuple(dict.items(extras))
-            if extras is not None and issubclass(type(extras), dict)
+            if extras is not None and inherits_native(type(extras), dict)
             else None
         )
         group_texts: list[set[object]] = []
@@ -464,23 +464,23 @@ def _freeze_model_storage(
                 )
         return
 
-    if issubclass(value_type, dict):
+    if inherits_native(value_type, dict):
         frozen_dict = frozen_dicts.get(identity)
         if frozen_dict is not None and frozen_dict[0] is value:
             return
         native_items = tuple(dict.items(value))
         frozen_dicts[identity] = (value, native_items)
         items = (item for _key, item in native_items)
-    elif issubclass(value_type, list):
+    elif inherits_native(value_type, list):
         items = list.__iter__(value)
-    elif issubclass(value_type, tuple):
+    elif inherits_native(value_type, tuple):
         frozen_tuple = frozen_tuples.get(identity)
         if frozen_tuple is not None and frozen_tuple[0] is value:
             return
         native_items = tuple(tuple.__iter__(value))
         frozen_tuples[identity] = (value, native_items)
         items = iter(native_items)
-    elif issubclass(value_type, set):
+    elif inherits_native(value_type, set):
         items = set.__iter__(value)
     else:
         items = frozenset.__iter__(value)
@@ -574,7 +574,7 @@ def _snapshot_uncached(
         raise ValueError("cyclic input graph")
     active.add(identity)
     try:
-        if isinstance(value, BaseModel):
+        if is_native_instance(value, BaseModel):
             frozen = _frozen_models.get(identity)
             if frozen is None or frozen[0] is not value:
                 _freeze_model_storage(
@@ -705,7 +705,7 @@ def _snapshot_uncached(
                     return _FailedNativeDictTraversal(exc)
             del validated_entries
             return projected
-        if isinstance(value, list):
+        if is_native_instance(value, list):
             return [
                 _native_snapshot(
                     item,
@@ -717,7 +717,7 @@ def _snapshot_uncached(
                 )
                 for item in value
             ]
-        if isinstance(value, tuple):
+        if is_native_instance(value, tuple):
             frozen_tuple = _frozen_tuples.get(identity)
             if frozen_tuple is None or frozen_tuple[0] is not value:
                 _freeze_model_storage(
@@ -739,7 +739,7 @@ def _snapshot_uncached(
                 )
                 for item in frozen_tuple[1]
             )
-        if isinstance(value, set):
+        if is_native_instance(value, set):
             return {
                 _native_snapshot(
                     item,

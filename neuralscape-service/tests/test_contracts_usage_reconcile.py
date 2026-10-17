@@ -4057,3 +4057,26 @@ def test_a_public_mapping_with_a_repeated_text_is_refused_by_the_snapshot() -> N
 def test_a_lone_text_subclass_key_in_a_mapping_is_emitted_as_plain_text() -> None:
     result = usage_reconcile_contracts._native_snapshot({_SameTextKey("event_id"): "event-1"})
     assert result == {"event_id": "event-1"} and all(type(key) is str for key in result)
+
+
+# ---- type gates classify by the object's real type, never by its own ``__class__``
+
+@pytest.mark.parametrize("claimed", [BaseModel, dict, list, set])
+def test_a_container_claiming_a_node_class_is_snapshotted_as_what_it_is(claimed: type) -> None:
+    class Tuple(tuple):
+        @property
+        def __class__(self):  # type: ignore[override]
+            return claimed
+
+    result = usage_reconcile_contracts._native_snapshot(Tuple((1, 2)))
+    assert result == (1, 2) and type(result) is tuple
+
+
+def test_a_container_claiming_a_model_class_is_a_validation_error_for_a_result_receiver() -> None:
+    class Tuple(tuple):
+        @property
+        def __class__(self):  # type: ignore[override]
+            return BaseModel
+
+    with pytest.raises(ValueError):  # ValidationError is a ValueError; a KeyError or AttributeError is a leak
+        ReconciledUsageStream.model_validate({"usage": Tuple()})

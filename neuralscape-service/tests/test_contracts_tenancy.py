@@ -735,10 +735,12 @@ def test_transition_defers_unsupported_current_classification() -> None:
     assert competing_error.value.errors() == ordinary_error.value.errors()
     assert invalid_current.calls == 0
 
+    # The gate classifies by the object's real type: its own ``__class__`` is never consulted, so a
+    # non-operation is refused as such and the trap never runs.
     valid_current = RaisingClass()
-    with pytest.raises(RuntimeError, match="classification trap"):
+    with pytest.raises(TypeError, match="operation must be a TenantOperationState"):
         validate_operation_transition(operation(), valid_current)
-    assert valid_current.calls == 1
+    assert valid_current.calls == 0
 
 
 @pytest.mark.parametrize(
@@ -2676,3 +2678,48 @@ def test_native_extras_sharing_a_stored_text_are_refused_whatever_the_key_type()
     object.__setattr__(candidate, "__pydantic_extra__", extras)
     with pytest.raises(ValueError, match="undeclared fields"):
         invoke(candidate)
+
+
+# ---- type gates classify by the object's real type, never by its own ``__class__``
+
+class _ClaimsClass:
+    """Not a model: its ``__class__`` property says it is one."""
+
+    def __init__(self, claimed: type, **fields: object) -> None:
+        self._claimed = claimed
+        self.__dict__.update(fields)
+
+    @property
+    def __class__(self):  # type: ignore[override]
+        return self._claimed
+
+
+def test_an_object_claiming_to_be_a_placement_is_refused_by_the_gate() -> None:
+    spoof = _ClaimsClass(TenantPlacement, tenant_id="tenant-a", generation=7, resource_manifests=())
+    with pytest.raises(TypeError, match="placement must be a TenantPlacement"):
+        validate_placement_publication(spoof, expected_tenant_id="tenant-a", current_generation=7)  # type: ignore[arg-type]
+
+
+def test_an_object_claiming_to_be_an_operation_is_refused_as_current_and_as_previous() -> None:
+    spoof = _ClaimsClass(TenantOperationState)
+    with pytest.raises(TypeError):
+        validate_operation_transition(operation(), spoof)  # type: ignore[arg-type]
+    with pytest.raises(TypeError):
+        validate_operation_transition(spoof, operation())  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("claimed", [BaseModel, dict, list])
+def test_a_container_claiming_a_node_class_is_refused_as_a_value_error(claimed: type) -> None:
+    class Tuple(tuple):
+        @property
+        def __class__(self):  # type: ignore[override]
+            return claimed
+
+    candidate, _child, invoke = _tenancy_nested_boundary_case("placement")
+    _set_native_field(candidate, "resource_manifests", Tuple())
+    try:
+        invoke(candidate)
+    except ValueError:  # includes pydantic's ValidationError: the value-error contract
+        pass
+    except Exception as error:  # pragma: no cover - the failure being pinned
+        raise AssertionError(f"leaked {type(error).__name__}: {error}") from error

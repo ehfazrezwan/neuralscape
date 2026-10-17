@@ -2109,3 +2109,46 @@ def test_a_publication_with_a_first_read_of_none_is_refused() -> None:
     with pytest.raises(ValidationError):
         validate_readiness_publication(publication, expected_tenant_id="t", current_placement_generation=1)
     assert zone.reads == 1
+
+
+# ---- type gates classify by the object's real type, never by its own ``__class__``
+
+class _ClaimsObservation:
+    """Not a ``CapabilityReadiness``: its ``__class__`` says it is, and its ``__dict__`` holds a flapping zone."""
+
+    def __init__(self, observed_at: datetime) -> None:
+        self.__dict__.update(
+            schema_version="candidate-v1", capability="exact_reads", status="healthy",
+            observed_at=observed_at, detail_code=None,
+        )
+        self.__pydantic_fields_set__ = set(self.__dict__)
+
+    @property
+    def __class__(self):  # type: ignore[override]
+        return CapabilityReadiness
+
+
+def test_an_object_claiming_the_observation_class_cannot_skip_the_timestamp_pinning() -> None:
+    zone = FlappingZone(timedelta(0), timedelta(hours=-12))
+    spoof = _ClaimsObservation(datetime(2026, 1, 1, 12, 0, tzinfo=zone))
+    zone.arm()
+    with pytest.raises(TypeError, match="observation must be a CapabilityReadiness"):
+        capability_is_ready(spoof, evaluated_at=datetime(2026, 1, 2, 0, 0, tzinfo=timezone.utc), max_probe_age_seconds=60)  # type: ignore[arg-type]
+    assert zone.reads in (0, None)  # the caller's zone was never consulted
+
+
+def test_the_genuine_observation_with_the_same_zone_is_not_ready() -> None:
+    zone = FlappingZone(timedelta(0), timedelta(hours=-12))
+    observation = _fold_observation(datetime(2026, 1, 1, 12, 0, tzinfo=zone))
+    zone.arm()
+    assert capability_is_ready(observation, evaluated_at=datetime(2026, 1, 2, 0, 0, tzinfo=timezone.utc), max_probe_age_seconds=60) is False
+    assert zone.reads == 1
+
+
+def test_an_object_claiming_the_publication_class_is_refused_by_the_gate() -> None:
+    class Spoof:
+        @property
+        def __class__(self):  # type: ignore[override]
+            return TenantReadinessPublication
+    with pytest.raises(TypeError, match="publication must be a TenantReadinessPublication"):
+        validate_readiness_publication(Spoof(), expected_tenant_id="t", current_placement_generation=1)  # type: ignore[arg-type]

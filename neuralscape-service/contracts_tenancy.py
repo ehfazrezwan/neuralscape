@@ -258,10 +258,10 @@ def _closed_graph_snapshot_session() -> tuple[
     def is_graph_node(item: object) -> bool:
         item_type = type(item)
         return (
-            issubclass(item_type, BaseModel)
-            or issubclass(item_type, dict)
-            or issubclass(item_type, list)
-            or issubclass(item_type, tuple)
+            _inherits(item_type, BaseModel)
+            or _inherits(item_type, dict)
+            or _inherits(item_type, list)
+            or _inherits(item_type, tuple)
         )
 
     def freeze_native_graph(item: object, depth: int = 0) -> None:
@@ -290,10 +290,10 @@ def _closed_graph_snapshot_session() -> tuple[
 
     def capture_native_node(node: object, identity: int) -> tuple[object, ...]:
         node_type = type(node)
-        if issubclass(node_type, BaseModel):
+        if _inherits(node_type, BaseModel):
             stored = _PYDANTIC_DICT_DESCRIPTOR.__get__(node, BaseModel)
             extras = _model_extra_storage(node)
-            extras_are_native = extras is not None and issubclass(
+            extras_are_native = extras is not None and _inherits(
                 type(extras), dict
             )
             edge_count = dict.__len__(stored)
@@ -313,14 +313,14 @@ def _closed_graph_snapshot_session() -> tuple[
             )
             return tuple(value for _name, value in stored_entries)
 
-        if issubclass(node_type, dict):
+        if _inherits(node_type, dict):
             budget.charge_edge(dict.__len__(node))
             entries = tuple(dict.items(node))
             if node_type is dict:
                 frozen_containers[identity] = entries
             return tuple(value for _key, value in entries)
 
-        if issubclass(node_type, list):
+        if _inherits(node_type, list):
             budget.charge_edge(list.__len__(node))
             items = tuple(list.__iter__(node))
         else:
@@ -421,7 +421,7 @@ def _closed_graph_snapshot_session() -> tuple[
             return copied
 
         try:
-            if isinstance(item, BaseModel):
+            if _inherits(item_type, BaseModel):
                 stored_entries, extras_are_native, frozen_extras = frozen_models[
                     identity
                 ]
@@ -463,7 +463,7 @@ def _closed_graph_snapshot_session() -> tuple[
                 result: object = {
                     name: child(field_value) for name, field_value in stored_entries
                 }
-            elif isinstance(item, dict):
+            elif _inherits(item_type, dict):
                 exact = item_type is dict
                 reusable = exact
                 entries = (
@@ -487,7 +487,7 @@ def _closed_graph_snapshot_session() -> tuple[
                         raise ValueError("contract input field names must be unique text")
                     result[plain] = child(field_value)
             else:
-                is_list = isinstance(item, list)
+                is_list = _inherits(item_type, list)
                 exact = item_type is (list if is_list else tuple)
                 reusable = exact
                 items = (
@@ -523,7 +523,7 @@ def _validated_operation_snapshot(
     *,
     rebuild: Callable[[object], object] | None = None,
 ) -> TenantOperationState:
-    if not isinstance(operation, TenantOperationState):
+    if not _inherits(type(operation), TenantOperationState):
         raise TypeError("operation must be a TenantOperationState")
     snapshot = (
         _snapshot_closed_graph(operation)
@@ -534,7 +534,7 @@ def _validated_operation_snapshot(
 
 
 def _validated_placement_snapshot(placement: TenantPlacement) -> TenantPlacement:
-    if not isinstance(placement, TenantPlacement):
+    if not _inherits(type(placement), TenantPlacement):
         raise TypeError("placement must be a TenantPlacement")
     return TenantPlacement.model_validate(_snapshot_closed_graph(placement))
 
@@ -544,7 +544,7 @@ def validate_operation_transition(
 ) -> TenantOperationState:
     """Reject identity changes, generation rollback, and invalid progress changes."""
 
-    if not isinstance(previous, TenantOperationState):
+    if not _inherits(type(previous), TenantOperationState):
         raise TypeError("operation must be a TenantOperationState")
 
     freeze_native_graph, rebuild = _closed_graph_snapshot_session()
@@ -555,7 +555,7 @@ def validate_operation_transition(
         previous_capture_error = error
 
     current_capture_error: Exception | None = None
-    if issubclass(type(current), TenantOperationState):
+    if _inherits(type(current), TenantOperationState):
         try:
             freeze_native_graph(current)
         except Exception as error:

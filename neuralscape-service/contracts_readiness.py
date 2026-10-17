@@ -12,6 +12,7 @@ from typing import Literal
 from pydantic import AwareDatetime, TypeAdapter, model_validator
 
 from contracts_common import OpaqueId, SafeCounter, VersionedContract
+from contracts_limits import is_native_instance
 from contracts_tenancy import _closed_graph_snapshot_session, _inherits
 
 
@@ -133,7 +134,7 @@ def _pin_datetimes(value: object, memo: dict[int, tuple[object, object]] | None 
 def _validated_observation_snapshot(
     observation: CapabilityReadiness,
 ) -> CapabilityReadiness:
-    if not isinstance(observation, CapabilityReadiness):
+    if not is_native_instance(observation, CapabilityReadiness):
         raise TypeError("observation must be a CapabilityReadiness")
     return CapabilityReadiness.model_validate(
         _pin_datetimes(_snapshot_closed_graph(observation))
@@ -143,7 +144,7 @@ def _validated_observation_snapshot(
 def _validated_publication_snapshot(
     publication: TenantReadinessPublication,
 ) -> TenantReadinessPublication:
-    if not isinstance(publication, TenantReadinessPublication):
+    if not is_native_instance(publication, TenantReadinessPublication):
         raise TypeError("publication must be a TenantReadinessPublication")
     return TenantReadinessPublication.model_validate(
         _pin_datetimes(_snapshot_closed_graph(publication))
