@@ -1475,8 +1475,8 @@ def _snapshot_native(
                         raise extra_inventory.failure
                     iterated_extra_names = extra_inventory.iterated_names
                     extra_entries = extra_inventory.item_entries
-                undeclared.update(iterated_extra_names)
-                undeclared.update(key for key, _ in extra_entries)
+                undeclared.update(_exact_key(name) for name in iterated_extra_names)
+                undeclared.update(_exact_key(key) for key, _ in extra_entries)
             if undeclared:
                 # Name the first few (sorted by label) and count the rest, so the error stays small.
                 labels = heapq.nsmallest(_UNDECLARED_NAMES_LISTED, map(_key_label, undeclared))
@@ -1527,6 +1527,7 @@ def _snapshot_native(
 
             projected: dict[Any, Any] = {}
             for key, item in frozen_mapping.entries:
+                key = _exact_key(key)  # read as exact text: no hook runs, and a twin of another key's text is a repeat
                 _protect_yielded_model_storage(item, _frozen_graph)
                 item_path = _Path(path, ("key", key))
                 size = len(projected)

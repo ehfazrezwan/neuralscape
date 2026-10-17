@@ -1516,7 +1516,8 @@ def test_public_sequence_iterator_failure_is_retained_and_replayed_once(
 
     with pytest.raises(RuntimeError) as alias_error:
         _snapshot_native(alias, _frozen_graph=frozen)
-    assert projection_key.hash_calls == (1 if retains_prefix else 0)
+    # the replay is pinned by the retained failure below; the key is read as exact text, so no key hook runs
+    assert projection_key.hash_calls == 0
     with pytest.raises(RuntimeError) as primary_error:
         _snapshot_native(primary, _frozen_graph=frozen)
 
@@ -1529,7 +1530,7 @@ def test_public_sequence_iterator_failure_is_retained_and_replayed_once(
     assert primary.items_calls == 1
     assert alias.items_calls == 1
     assert prefix.items_calls == (1 if retains_prefix else 0)
-    assert projection_key.hash_calls == (2 if retains_prefix else 0)
+    assert projection_key.hash_calls == 0   # read as exact text: no key hook runs on either replay
 
 
 @pytest.mark.parametrize(
@@ -1666,7 +1667,7 @@ def test_recursive_public_shape_failure_is_deferred_and_replayed_once(
 
     with pytest.raises(RuntimeError) as alias_error:
         _snapshot_native(alias, _frozen_graph=frozen)
-    assert projection_key.hash_calls == 1
+    assert projection_key.hash_calls == 0   # read as exact text: no key hook runs; the replay is pinned below
     with pytest.raises(RuntimeError) as primary_error:
         _snapshot_native(primary, _frozen_graph=frozen)
 
@@ -1674,7 +1675,7 @@ def test_recursive_public_shape_failure_is_deferred_and_replayed_once(
     assert primary_error.value is failure
     assert failure_calls == 1
     assert prefix.items_calls == 1
-    assert projection_key.hash_calls == 2
+    assert projection_key.hash_calls == 0   # read as exact text: no key hook runs on either replay
     assert primary.items_calls == 1
     assert alias.items_calls == 1
     if boundary == "mapping":
@@ -5744,7 +5745,7 @@ def test_a_public_mapping_without_a_repeat_is_still_accepted() -> None:
     assert manifest.resources[0].observed_value == base["observed_value"]
 
 
-def test_a_key_is_hashed_once_when_it_is_stored() -> None:
+def test_a_text_subclass_key_in_a_public_mapping_is_never_hashed_by_the_snapshot() -> None:
     calls: list[int] = []
 
     class CountedKey(str):
@@ -5754,8 +5755,10 @@ def test_a_key_is_hashed_once_when_it_is_stored() -> None:
 
     base = measured_memory().model_dump()
     pairs = [(CountedKey(key), value) for key, value in base.items()]
-    _finish_with_resource(_PairsMapping(pairs))   # accepted: the keys are the model's own field names
-    assert len(calls) == len(pairs)   # one hash per stored key: the repeat check adds none of its own
+    resource = _PairsMapping(pairs)
+    calls.clear()                      # building the caller's own pairs is not the snapshot's doing
+    _finish_with_resource(resource)    # accepted: the keys are the model's own field names
+    assert calls == [], len(calls)     # read as exact text: the snapshot runs no key hook
 
 
 # ---- a text key whose hash changes after capture cannot collapse two captured entries
@@ -5856,3 +5859,130 @@ def test_an_object_that_only_claims_to_be_text_is_not_copied_as_text() -> None:
     fields[Claims()] = 1
     with pytest.raises(ValueError):   # an unsupported key is refused as an undeclared field, never a TypeError from a bad copy
         _finish_with_resource(fields)
+
+
+# ---- the public-mapping projection reads keys as exact text too: a twin of a field name cannot hide a value
+
+class _NeverEqualKey(str):
+    """Hashes like its text but never compares equal to anything: two keys of the same text stay two entries."""
+
+    def __eq__(self, other):
+        return False
+
+    def __ne__(self, other):
+        return True
+
+    def __hash__(self):
+        return str.__hash__(self)
+
+
+def _twin_pairs(kind, exact_value, twin_value, twin_first):
+    base = measured_memory().model_dump()
+    others = [(key, value) for key, value in base.items() if key != "observed_value"]
+    twin = _NeverEqualKey("observed_value") if kind == "never-equal" else _ShiftyKey("observed_value")
+    pairs = [("observed_value", exact_value), (twin, twin_value)]
+    if twin_first:
+        pairs.reverse()
+    return others, pairs, twin
+
+
+class _PublicDict(dict):
+    """A dict subclass: it is read through the public-mapping route, not as an exact dictionary."""
+
+
+def kind_settles(twin):
+    return getattr(twin, "will_settle", True)
+
+
+def _public_dict_from(others, pairs, twin):
+    container = _PublicDict()
+    for key, value in others:
+        dict.__setitem__(container, key, value)
+    for key, value in pairs:
+        dict.__setitem__(container, key, value)
+    if isinstance(twin, _ShiftyKey) and kind_settles(twin):
+        twin.settle()
+    return container
+
+
+@pytest.mark.parametrize("container", ["mapping", "dict-subclass"])
+@pytest.mark.parametrize("twin_first", [False, True], ids=["exact-first", "twin-first"])
+@pytest.mark.parametrize("values", [(True, 1), (1, True)], ids=["exact-invalid", "twin-invalid"])
+@pytest.mark.parametrize("kind", ["shifty-settled", "shifty-unsettled", "never-equal"])
+def test_a_twin_of_a_field_name_in_a_public_mapping_is_refused_as_a_repeat(kind, values, twin_first, container) -> None:
+    others, pairs, twin = _twin_pairs(kind, values[0], values[1], twin_first)
+    if kind == "shifty-unsettled":
+        twin.will_settle = False       # its hash still differs from the text's hash while the input is read
+    if container == "mapping":
+        if isinstance(twin, _ShiftyKey) and kind_settles(twin):
+            twin.settle()
+        resource = _PairsMapping(others + pairs)
+    else:
+        resource = _public_dict_from(others, pairs, twin)
+    with pytest.raises(ValueError, match="duplicate key"):
+        _finish_with_resource(resource)
+
+
+def test_a_lone_text_subclass_key_in_a_public_mapping_is_read_as_its_text_and_runs_no_hook() -> None:
+    log: list[str] = []
+
+    class Counting(str):
+        def __hash__(self):
+            log.append("hash"); return str.__hash__(self)
+
+        def __eq__(self, other):
+            log.append("eq"); return str.__eq__(self, other)
+
+    pairs = [(Counting(key) if key == "observed_value" else key, value) for key, value in measured_memory().model_dump().items()]
+    resource = _PairsMapping(pairs)
+    log.clear()
+    manifest = _finish_with_resource(resource)
+    assert manifest.resources[0].observed_value == measured_memory().observed_value
+    assert log == [], log
+
+
+def test_a_public_mapping_key_is_copied_with_the_base_method_not_its_own_str() -> None:
+    log: list[str] = []
+
+    class Hostile(str):
+        def __str__(self):
+            log.append("__str__")
+            return "something-else"
+
+    pairs = [(Hostile(key) if key == "observed_value" else key, value) for key, value in measured_memory().model_dump().items()]
+    manifest = _finish_with_resource(_PairsMapping(pairs))
+    assert manifest.resources[0].observed_value == measured_memory().observed_value and log == []
+
+
+def test_an_object_claiming_to_be_text_in_a_public_mapping_is_refused_not_copied() -> None:
+    class Claims:
+        @property
+        def __class__(self):   # type: ignore[override]
+            return str
+
+        def __hash__(self):
+            return 1
+
+    pairs = list(measured_memory().model_dump().items()) + [(Claims(), 1)]
+    with pytest.raises(ValueError):
+        _finish_with_resource(_PairsMapping(pairs))
+
+
+def test_a_text_subclass_key_in_model_extras_runs_no_hook_and_is_refused_as_undeclared() -> None:
+    log: list[str] = []
+
+    class Counting(str):
+        def __hash__(self):
+            log.append("hash")
+            return str.__hash__(self)
+
+        def __eq__(self, other):
+            log.append("eq")
+            return str.__eq__(self, other)
+
+    reading = measured_memory()
+    BASE_MODEL_EXTRA_DESCRIPTOR.__set__(reading, {Counting("surprise"): 1})
+    log.clear()
+    with pytest.raises(ValueError):
+        _finish_with_resource(reading)
+    assert log == [], log
