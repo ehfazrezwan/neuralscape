@@ -4599,3 +4599,32 @@ def test_a_key_that_is_not_text_is_refused_before_any_hook_of_it_runs() -> None:
         reconcile_usage_events([payload])
     assert caught.value.code == "invalid_event"
     assert calls[0] == 0
+
+
+def _text_normalizations(dictionaries: int) -> int:
+    """How many times one ``str``-subclass key shared by ``dictionaries`` plain dicts is copied as text in one
+    snapshot (the public-entry shape check included)."""
+
+    key = _SharedText("k" * 4096)
+    document = [{key: index} for index in range(dictionaries)]
+    copies = [0]
+    real = usage_reconcile_contracts._plain_name
+
+    def counting(name):
+        if name is key:
+            copies[0] += 1
+        return real(name)
+
+    usage_reconcile_contracts._plain_name = counting
+    try:
+        snapshot = usage_reconcile_contracts._native_snapshot(document)
+    finally:
+        usage_reconcile_contracts._plain_name = real
+    assert [next(iter(entry)) for entry in snapshot] == ["k" * 4096] * dictionaries
+    return copies[0]
+
+
+def test_a_shared_text_subclass_key_is_copied_once_including_the_shape_check() -> None:
+    # The shape check copied it once per dictionary (16 -> 17, 32 -> 33), besides the shared rebuild copy.
+    for dictionaries in (16, 32):
+        assert _text_normalizations(dictionaries) == 1

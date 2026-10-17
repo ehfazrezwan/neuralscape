@@ -92,8 +92,8 @@ class _ValidatedPublicMappingEntries:
 
 _BUDGET_KEY = ("discovery-budget",)
 _TEXT_KEY = "text-copy"  # memo entries for text copies are keyed (_TEXT_KEY, id), apart from node ids
-# The envelope of the snapshot that is validating a public mapping view right now (per thread).  It is
-# passed this way because the validator's signature is part of what the existing tests replace.
+# The envelope and memo of the snapshot that is validating a public mapping view right now (per thread).
+# They are passed this way because the validator's signature is part of what the existing tests replace.
 _view_state = threading.local()
 
 
@@ -160,6 +160,7 @@ def _validate_public_mapping_entries(
         except Exception as exc:
             return _FailedNativeDictTraversal(exc)
         shared = getattr(_view_state, "budget", None)
+        memo = getattr(_view_state, "memo", None)
         if shared is not None:
             shared.charge_edge()  # every pair read is charged to the snapshot's one envelope
         elif len(retained_entries) >= STANDARD.max_edges:
@@ -169,7 +170,7 @@ def _validate_public_mapping_entries(
         except Exception as exc:
             return _FailedNativeDictTraversal(exc)
         try:
-            public_entries[_hook_free_key(key, budget=shared)] = None  # the shape check hashes no key of the caller's
+            public_entries[_hook_free_key(key, memo, shared)] = None  # the shape check hashes no key of the caller's
         except Exception as exc:
             return _FailedNativeDictTraversal(exc)
         retained_entries.append((pair, key, public_value))
@@ -876,11 +877,14 @@ def _snapshot_uncached(
                 except Exception as exc:
                     return _FailedNativeDictTraversal(exc)
                 outer_budget = getattr(_view_state, "budget", None)
+                outer_memo = getattr(_view_state, "memo", None)
                 _view_state.budget = budget
+                _view_state.memo = _memo  # the shape check shares the call's text copies
                 try:
                     validated_entries = _validate_public_mapping_entries(public_items)
                 finally:
                     _view_state.budget = outer_budget
+                    _view_state.memo = outer_memo
                 if isinstance(validated_entries, _FailedNativeDictTraversal):
                     return validated_entries
                 # Keep the iterator, retained keys, and all entry components
