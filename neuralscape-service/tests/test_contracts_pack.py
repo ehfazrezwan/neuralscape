@@ -2595,3 +2595,85 @@ def test_removed_names_under_a_shared_node_stop_at_the_budget(monkeypatch, entry
     findings = _pair(old, new) if entry == "check_compatibility" else pack.compare_schemas({"C": old}, {"C": new})["C"]
     assert findings[-1] in (pack._BUDGET_MESSAGE, pack._LIMIT_MESSAGE), findings[-1]
     assert accumulated and max(accumulated) <= 50_000 + _M, accumulated  # stopped at the budget, not after a million
+
+
+# ---- the document-wide reference scan, and the length of strings, spend the shared budgets
+
+
+def _shared_definitions_contract(defs: dict, const: str) -> dict:
+    return {"$defs": defs, "type": "object", "not": {"const": const}}
+
+
+def test_the_document_scan_spends_the_call_budget(monkeypatch) -> None:
+    monkeypatch.setattr(pack, "_MAX_CALL_VALUES", 1000)
+    defs = {f"D{i}": {"type": "object", "properties": {"a": {"type": "string"}}} for i in range(100)}  # shared
+    old = {f"c{i}": _shared_definitions_contract(defs, "a") for i in range(20)}
+    new = {f"c{i}": _shared_definitions_contract(defs, "b") for i in range(20)}  # Copilot's shape
+    report = pack.compare_schemas(old, new)
+    assert any(findings == [pack._BUDGET_MESSAGE] for findings in report.values()), report
+
+
+def test_the_document_scan_spends_the_comparison_budget(monkeypatch) -> None:
+    monkeypatch.setattr(pack, "_MAX_EQUALITY_STEPS", 100)
+    defs = {f"D{i}": {"type": "object", "properties": {"a": {"type": "string"}}} for i in range(100)}
+    findings = _pair(_shared_definitions_contract(defs, "a"), _shared_definitions_contract(defs, "b"))
+    assert pack._BUDGET_MESSAGE in findings, findings
+
+
+def _long_text(length: int) -> str:
+    return "".join(["a"] * length)  # a distinct string object each call, as after two separate parses
+
+
+def test_a_long_pattern_scanned_for_many_new_names_spends_the_budget() -> None:
+    pattern = "^" + _long_text(1_000_000)
+    old = {"type": "object", "additionalProperties": False, "patternProperties": {pattern: {}}}
+    new = {**old, "properties": {f"n{i}": {} for i in range(2000)}}  # S-1: each name scanned the pattern for one step
+    assert pack._BUDGET_MESSAGE in _pair(old, new)
+
+
+@pytest.mark.parametrize("keyword", ["pattern", "const"])
+def test_long_strings_compared_in_many_pairs_spend_the_budget(monkeypatch, keyword) -> None:
+    monkeypatch.setattr(pack, "_MAX_EQUALITY_STEPS", 100_000)
+
+    def schema() -> dict:
+        return {"type": "object", "properties": {f"p{i}": {"type": "string", keyword: _long_text(100_000), "description": f"{i}"}
+                                                 for i in range(100)}}
+
+    assert _pair(schema(), schema()) == [pack._BUDGET_MESSAGE]  # S-2 / S-3: a full comparison per pair cost one value
+
+
+def test_ordinary_strings_and_documents_still_compare() -> None:
+    schema = {"type": "object", "properties": {f"p{i}": {"type": "string", "pattern": "^[a-z]+$", "const": "abc"} for i in range(50)}}
+    assert _pair(schema, copy.deepcopy(schema)) == []
+    changed = copy.deepcopy(schema)
+    changed["properties"]["p7"]["pattern"] = "^[a-y]+$"
+    assert "$.p7: pattern changed" in _pair(schema, changed)
+
+
+_LONG = "".join(["a"] * 100_000)
+_PER_TEXT = len(_LONG) // 64  # the walked values a 100,000-character text costs to read
+
+
+def _pointer_doc(extra: dict) -> dict:
+    doc = {"type": "object", "properties": {_LONG: {"type": "string"},
+                                            **{f"p{i}": {"not": {"$ref": "#/properties/" + _LONG}, "description": f"{i}"} for i in range(40)}}}
+    doc.update(extra)
+    return doc
+
+
+@pytest.mark.parametrize(
+    "pair, at_least",
+    [
+        pytest.param(({"type": "object", "properties": {f"p{i}": {"x-note": "".join(["a"] * 100_000), "description": f"{i}"} for i in range(40)}},
+                      {"type": "object", "properties": {f"p{i}": {"x-note": "".join(["a"] * 100_000), "description": f"{i}"} for i in range(40)}}),
+                     40 * _PER_TEXT, id="string-comparison"),
+        pytest.param(({"$defs": {_LONG: {"type": "string"}}, "type": "object",
+                       "properties": {f"p{i}": {"$ref": "#/$defs/" + _LONG, "description": f"{i}"} for i in range(40)}},
+                      {"$defs": {_LONG: {"type": "string"}}, "type": "object",
+                       "properties": {f"p{i}": {"$ref": "#/$defs/" + _LONG, "description": f"{i}"} for i in range(40)}}),
+                     2 * 40 * _PER_TEXT, id="definition-reference-text"),
+        pytest.param((_pointer_doc({}), _pointer_doc({"title": "t"})), 6 * 40 * _PER_TEXT, id="pointer-text"),
+    ],
+)
+def test_each_long_text_read_is_charged(pair, at_least) -> None:
+    assert _walked(*pair) >= at_least

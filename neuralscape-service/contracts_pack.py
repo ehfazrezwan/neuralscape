@@ -267,6 +267,7 @@ def _pointer_target(root: object, ref: str) -> object:
 
     if root is None or not ref.startswith("#") or (ref != "#" and not ref.startswith("#/")) or "%" in ref:
         raise _TooLarge  # an anchor, another document or an encoded pointer: not resolved, so not shown equal
+    _charge_walk(_text_cost(ref))  # split and walked on every expansion
     node = root
     for token in ref[2:].split("/") if ref != "#" else ():
         if node is not root and isinstance(node, dict) and "$id" in node:
@@ -447,6 +448,12 @@ def _charge_walk(count: int = 1) -> None:
             raise _BudgetExhausted
 
 
+def _text_cost(*texts: object) -> int:
+    """Extra walked values for reading strings: one per 64 characters, so a long text costs its length."""
+
+    return sum(len(text) // 64 for text in texts if type(text) is str)
+
+
 def _json_equal(left: object, right: object) -> bool:
     """JSON value equality: ``true`` is not ``1`` and ``false`` is not ``0``, ``1`` equals ``1.0``.
 
@@ -481,8 +488,13 @@ def _json_equal(left: object, right: object) -> bool:
             if len(first) != len(second):  # type: ignore[arg-type]
                 return False
             work.extend(zip(first, second))  # type: ignore[arg-type]
-        elif first != second:
-            return False
+        else:
+            if kind == "string":
+                cost = _text_cost(first, second)
+                if cost and not _charge_values(cost, local):
+                    return False  # too long to tell outside a comparison: not shown equal
+            if first != second:
+                return False
     return True
 
 
@@ -508,7 +520,7 @@ class _Keys:
     def key(self, value: object, depth: int = 0) -> object:
         kind = _json_kind(value)
         if kind in ("boolean", "number", "string", "null"):
-            if not _charge_values(1, self.local):  # every scalar keyed is charged (a large shared enum)
+            if not _charge_values(1 + _text_cost(value), self.local):  # every scalar keyed is charged, text by length
                 return None
             return (kind, value)
         if kind not in ("array", "object"):
@@ -680,7 +692,10 @@ def _depends_on_document(value: object, defs: dict, seen: set | None = None, bud
 
 
 def _plain_definition_reference(ref: object) -> bool:
-    return isinstance(ref, str) and ref.startswith("#/$defs/") and not {"/", "~", "%"} & set(ref[8:])
+    if not isinstance(ref, str):
+        return False
+    _charge_walk(_text_cost(ref))  # the reference text is scanned on every use
+    return ref.startswith("#/$defs/") and not {"/", "~", "%"} & set(ref[8:])
 
 
 def _scan_document_references(run: _Run) -> bool:
@@ -698,6 +713,7 @@ def _scan_document_references(run: _Run) -> bool:
                 continue
             visited.add(id(node))
         budget -= 1
+        _charge_walk()  # once per run, but once per contract too: the call's budget counts every scan
         if budget < 0:
             found = True  # too large to tell: assume it does
         elif isinstance(node, dict):
@@ -1158,6 +1174,7 @@ def _pattern_matches(pattern: object, name: str) -> bool | None:
 
     if not isinstance(pattern, str):
         return None
+    _charge_walk(_text_cost(pattern, name))  # read per name: a long pattern costs its length every time
     body = pattern[1:] if pattern.startswith("^") else pattern
     anchored_end = body.endswith("$") and not body.endswith("\\$")
     literal = body[:-1] if anchored_end else body
@@ -1288,6 +1305,7 @@ def _compare_keywords(
     for key in ("maximum", "exclusiveMaximum", "maxLength", "maxItems", "maxProperties"):
         if key in new and (key not in old or new[key] < old[key]):
             out.append(f"{path}: {key} lowered")
+    _charge_walk(_text_cost(new.get("pattern"), old.get("pattern")))  # compared in full on every visit
     if "pattern" in new and new.get("pattern") != old.get("pattern"):
         out.append(f"{path}: pattern changed")
     if new.get("uniqueItems") and not old.get("uniqueItems"):
