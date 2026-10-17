@@ -9,6 +9,7 @@ authority merely because a value validates.
 
 import enum
 import functools
+import types
 import typing
 from collections.abc import Callable, Mapping
 from datetime import datetime
@@ -531,6 +532,17 @@ def _private_copy(value: object, limit: int) -> object:
     return copy(value)[0]
 
 
+def bounded_private_copy(value: object) -> object:
+    """``_private_copy`` held to the standard tier's edge limit: the gate every final validation passes first.
+
+    The strict validation that follows walks a shared subtree once per path, so the expanded size of the whole
+    graph is charged here, before any ``model_validate`` sees it; an oversized graph is refused with the stable
+    budget error.
+    """
+
+    return _private_copy(value, STANDARD.max_edges)
+
+
 def _pin_collected(inventory: _GraphInventory) -> None:
     """Pin, once each, the datetimes recorded while a capture was running (their zones are asked now)."""
 
@@ -559,11 +571,17 @@ def _capture_entry(value: object, inventory: _GraphInventory, depth: int) -> int
     return height
 
 
+def _is_union(origin: object) -> bool:
+    """Both spellings of a union: ``typing.Union[X, None]`` / ``Optional[X]`` and ``X | None``."""
+
+    return origin is typing.Union or origin is types.UnionType
+
+
 def _unwrapped(annotation: object) -> object:
     for _ in range(4):  # Annotated[...] and Optional[...] wrappers
         args = typing.get_args(annotation)
         origin = typing.get_origin(annotation)
-        if origin is Annotated or (origin is typing.Union and len(args) == 2 and type(None) in args):
+        if origin is Annotated or (_is_union(origin) and len(args) == 2 and type(None) in args):
             annotation = args[0] if origin is Annotated else next(a for a in args if a is not type(None))
             continue
         break
@@ -610,14 +628,7 @@ def _item_models(model_type: type[BaseModel]) -> dict[str, type]:
 
     found: dict[str, type] = {}
     for name, info in model_type.model_fields.items():
-        annotation = info.annotation
-        for _ in range(4):  # Annotated[...] and Optional[...] wrappers
-            args = typing.get_args(annotation)
-            origin = typing.get_origin(annotation)
-            if origin is Annotated or (origin is typing.Union and len(args) == 2 and type(None) in args):
-                annotation = args[0] if origin is Annotated else next(a for a in args if a is not type(None))
-                continue
-            break
+        annotation = _unwrapped(info.annotation)
         origin = typing.get_origin(annotation)
         args = typing.get_args(annotation)
         homogeneous = (origin is tuple and len(args) == 2 and args[1] is Ellipsis) or (
@@ -955,5 +966,6 @@ __all__ = [
     "OpaqueId",
     "SafeCounter",
     "VersionedContract",
+    "bounded_private_copy",
     "snapshot_contract_graph",
 ]

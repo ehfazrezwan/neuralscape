@@ -13,6 +13,7 @@ from pydantic import Field, TypeAdapter, model_validator
 
 from contracts_common import (
     ContractModel,
+    bounded_private_copy,
     is_canonical_enum_member,
     OpaqueId,
     SafeCounter,
@@ -44,7 +45,7 @@ def _revalidated_snapshot(
 
     try:
         return model_type.model_validate(
-            pin_native_snapshot(require_native_snapshot(snapshot_pinned(value, model_type))),
+            bounded_private_copy(pin_native_snapshot(require_native_snapshot(snapshot_pinned(value, model_type)))),
             strict=True,
         )
     except Exception:
@@ -62,7 +63,10 @@ def _revalidated_pair(
     """
 
     try:
-        pair = pin_native_snapshot(require_native_snapshot(snapshot_pinned((first, second), (first_type, second_type))))
+        # The whole pair is charged for its expanded size (shared subtrees counted per path) before either is validated.
+        pair = bounded_private_copy(
+            pin_native_snapshot(require_native_snapshot(snapshot_pinned((first, second), (first_type, second_type))))
+        )
         return (
             first_type.model_validate(pair[0], strict=True),  # type: ignore[index]
             second_type.model_validate(pair[1], strict=True),  # type: ignore[index]

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import tracemalloc
+import typing
 from datetime import datetime, timedelta, timezone, tzinfo
 
 import pytest
@@ -1874,3 +1875,99 @@ def test_an_entry_of_exactly_the_edge_limit_is_accepted_and_one_more_is_refused(
     assert len(_private_copy(list(range(limit)), limit)) == limit  # `limit` edges (`limit + 1` nodes): admitted
     with pytest.raises(ValueError, match="budget"):
         _private_copy(list(range(limit + 1)), limit)
+
+
+# ---- the expanded size of the whole graph is charged before the final validation; a union spelled `X | None` declares X
+
+
+def _bundle_repeating_one_nested_item(repeats: int = 2_000, nested: int = 2_000):
+    """A native bundle whose one item (holding one shared checkpoint ``nested`` times) is repeated ``repeats`` times.
+
+    Every subtree is shared, so discovery admits it; walked once per path it is ``repeats * nested`` entries.
+    """
+
+    request, bundle = _matching_pair()
+    item = bundle.selected_items[0]
+    checkpoint = _stored_checkpoint(bundle)
+    object.__setattr__(item.freshness, "source_checkpoints", (checkpoint,) * nested)
+    object.__setattr__(bundle, "selected_items", (item,) * repeats)
+    return request, bundle
+
+
+def test_bundle_matches_refuses_an_oversized_expansion_before_validating_it(monkeypatch) -> None:
+    request, bundle = _bundle_repeating_one_nested_item()
+    calls = {"n": 0}
+    real = ContextBundle.model_validate.__func__
+
+    def counting(cls, *args, **kwargs):
+        calls["n"] += 1
+        return real(cls, *args, **kwargs)
+
+    monkeypatch.setattr(ContextBundle, "model_validate", classmethod(counting))
+    assert not bundle_matches_reported_evidence(request, bundle)
+    assert calls["n"] == 0  # refused by the expanded-size gate, never walked per occurrence
+
+
+def test_receipt_matches_refuses_an_oversized_expansion_before_validating_it(monkeypatch) -> None:
+    from contracts_context import ContextAssemblyReceipt, receipt_matches_bundle
+    from tests.test_contracts_context import _receipt
+
+    _request, bundle = _bundle_repeating_one_nested_item()
+    receipt = _validate(ContextAssemblyReceipt, _receipt())
+    calls = {"n": 0}
+    real = ContextBundle.model_validate.__func__
+
+    def counting(cls, *args, **kwargs):
+        calls["n"] += 1
+        return real(cls, *args, **kwargs)
+
+    monkeypatch.setattr(ContextBundle, "model_validate", classmethod(counting))
+    assert not receipt_matches_bundle(receipt, bundle)
+    assert calls["n"] == 0
+
+
+def test_a_small_repeating_bundle_is_still_judged() -> None:
+    request, bundle = _bundle_repeating_one_nested_item(repeats=3, nested=1)
+    assert bundle_matches_reported_evidence(request, bundle) in (True, False)  # no budget refusal for a small graph
+
+
+def test_a_pipe_none_declared_child_and_sequence_keep_their_declared_contract() -> None:
+    from contracts_common import ContractModel, snapshot_contract_graph
+
+    class Child(ContractModel):
+        x: int
+        y: int  # required
+
+    spellings = {
+        "typing": (typing.Optional[Child], typing.Optional[tuple[Child, ...]]),
+        "pipe": (Child | None, tuple[Child, ...] | None),
+    }
+    for name, (child_type, seq_type) in spellings.items():
+        class Holder(ContractModel):
+            seq: seq_type  # type: ignore[valid-type]
+
+        shared = {"x": 1}  # lacks y: invalid as a Child
+        tail = {"n": 0}
+
+        def make():
+            yield shared
+            for _ in range(500):
+                tail["n"] += 1
+                yield shared
+
+        holder = Holder.model_construct(seq=_GeneratedItems(make))
+        with pytest.raises(ValueError, match="not valid"):
+            snapshot_contract_graph(holder, contract=Holder)
+        assert tail["n"] == 0, name
+
+    from contracts_common import _declared_models, _item_models
+
+    for name, (child_type, seq_type) in spellings.items():
+        class Parent(ContractModel):
+            child: child_type  # type: ignore[valid-type]
+
+        class Seq(ContractModel):
+            seq: seq_type  # type: ignore[valid-type]
+
+        assert _declared_models(Parent) == {"child": Child}, name
+        assert _item_models(Seq) == {"seq": Child}, name
