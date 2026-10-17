@@ -2052,8 +2052,8 @@ def test_aggregate_boundary_freezes_later_nested_model_before_earlier_hook(
     assert attacked_source.content_revision == 1
     assert NestedRepairingTuple.iteration_calls == (1 if trigger_kind == "tuple" else 0)
     if hostile_name is not None:
-        assert hostile_name.hash_calls == 2
-        assert hostile_name.equality_calls == 1
+        assert hostile_name.hash_calls == 1
+        assert hostile_name.equality_calls == 0
 
 
 @pytest.mark.parametrize("trigger_kind", ["tuple", "stored-name"])
@@ -2109,8 +2109,8 @@ def test_aggregate_boundary_preserves_invalid_root_before_earlier_hook(
     assert attacked.request_digest == "sha256:repaired"
     assert NestedRepairingTuple.iteration_calls == (1 if trigger_kind == "tuple" else 0)
     if hostile_name is not None:
-        assert hostile_name.hash_calls == 2
-        assert hostile_name.equality_calls == 1
+        assert hostile_name.hash_calls == 1
+        assert hostile_name.equality_calls == 0
 
 
 @pytest.mark.parametrize("trigger_kind", ["tuple", "stored-name"])
@@ -2133,8 +2133,8 @@ def test_aggregate_boundary_accepts_benign_supported_subclasses(
 
     assert NestedRepairingTuple.iteration_calls == (1 if trigger_kind == "tuple" else 0)
     if benign_name is not None:
-        assert benign_name.hash_calls == 2
-        assert benign_name.equality_calls == 1
+        assert benign_name.hash_calls == 1
+        assert benign_name.equality_calls == 0
 
 
 @pytest.mark.parametrize(
@@ -2242,8 +2242,8 @@ def test_source_boundary_scalar_invalidity_remains_frozen_before_name_hook() -> 
     ]
     assert attacked_diagnostics == ordinary_diagnostics
     assert attacked.content_revision == 1
-    assert hostile_name.hash_calls == 2
-    assert hostile_name.equality_calls == 1
+    assert hostile_name.hash_calls == 1
+    assert hostile_name.equality_calls == 0
 
 
 def test_source_boundary_captures_observed_before_expected_name_hook() -> None:
@@ -2271,8 +2271,8 @@ def test_source_boundary_captures_observed_before_expected_name_hook() -> None:
         ordinary_error.value.errors(include_url=False)
     )
     assert attacked_observed.content_revision == 3
-    assert hostile_name.hash_calls == 2
-    assert hostile_name.equality_calls == 1
+    assert hostile_name.hash_calls == 1
+    assert hostile_name.equality_calls == 0
 
 
 def test_source_boundary_preserves_expected_error_before_observed_type() -> None:

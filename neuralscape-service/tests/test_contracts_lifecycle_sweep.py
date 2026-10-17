@@ -117,6 +117,108 @@ def test_a_spoofed_source_version_is_refused_on_either_side():
         source_versions_match(source("m"), Spoof(invalid, SourceVersion))
 
 
+def test_a_spoof_of_a_valid_contract_is_refused_at_every_entry():
+    """``isinstance`` honours ``__class__``: a proxy of a valid model must not stand in for one."""
+
+    from tests.test_contracts_lifecycle import intent_with_requirements, requirement
+
+    command = intent_with_requirements(requirement(ProcessingStage.CANONICAL))
+    applied = receipt(ProcessingStage.CANONICAL, StageStatus.APPLIED)
+    validate_required_stage_claim(claimed_status=IntentStatus.APPLIED, intent=command, receipts=(applied,))
+    for entry in (
+        lambda: contracts_lifecycle.validate_stage_receipts(Spoof(command, Intent), (applied,)),
+        lambda: contracts_lifecycle.validate_stage_receipts(command, (Spoof(applied, StageReceipt),)),
+        lambda: validate_required_stage_claim(
+            claimed_status=IntentStatus.APPLIED, intent=Spoof(command, Intent), receipts=(applied,)
+        ),
+        lambda: validate_required_stage_claim(
+            claimed_status=IntentStatus.APPLIED, intent=command, receipts=(Spoof(applied, StageReceipt),)
+        ),
+        lambda: contracts_lifecycle.validate_stage_receipts(command, Spoof((applied,), tuple)),
+        lambda: source_versions_match(Spoof(source("m"), SourceVersion), source("m")),
+        lambda: source_versions_match(source("m"), Spoof(source("m"), SourceVersion)),
+    ):
+        with pytest.raises(TypeError):
+            entry()
+
+
+def test_a_spoofed_receipt_cannot_carry_a_graph_past_the_claim_budget():
+    import time
+
+    from tests.test_contracts_lifecycle import intent_with_requirements, reference, requirement
+
+    command = intent_with_requirements(requirement(ProcessingStage.CANONICAL))
+    large = receipt(ProcessingStage.CANONICAL, StageStatus.APPLIED)
+    set_native(large, "output_refs", tuple(reference(f"o{i}") for i in range(70_000)))
+    with pytest.raises(ValueError, match=BUDGET):  # beyond the tier, read natively
+        validate_required_stage_claim(claimed_status=IntentStatus.APPLIED, intent=command, receipts=(large,))
+    started = time.monotonic()
+    with pytest.raises((TypeError, ValueError)):  # the proxy's own view is never read outside the budget
+        validate_required_stage_claim(
+            claimed_status=IntentStatus.APPLIED, intent=command, receipts=(Spoof(large, StageReceipt),)
+        )
+    assert time.monotonic() - started < 30
+
+
+class Alias(str):
+    """A key whose text names one field while its hash and equality name another."""
+
+    def __new__(cls, text, claimed):
+        made = str.__new__(cls, text)
+        made.claimed = claimed
+        return made
+
+    def __hash__(self):
+        return hash(self.claimed)
+
+    def __eq__(self, other):
+        return str.__eq__(self.claimed, other) if isinstance(other, str) else NotImplemented
+
+    def __ne__(self, other):
+        equal = self.__eq__(other)
+        return equal if equal is NotImplemented else not equal
+
+
+def alias_storage(stored, first, second):
+    """Keep each value under its own text, with the two keys' hash and equality swapped."""
+
+    first_value, second_value = stored[first], stored[second]
+    del stored[first]
+    del stored[second]
+    stored[Alias(first, second)] = first_value
+    stored[Alias(second, first)] = second_value
+
+
+def test_model_storage_keys_are_read_by_their_text_not_their_hash():
+    from tests.test_contracts_lifecycle import intent_with_requirements, requirement
+
+    command = intent_with_requirements(requirement(ProcessingStage.CANONICAL)).model_copy(
+        update={"actor_id": "tenant-evil"}
+    )
+    alias_storage(NATIVE_DICT.__get__(command, BaseModel), "tenant_id", "actor_id")
+    applied = receipt(ProcessingStage.CANONICAL, StageStatus.APPLIED)
+    effect = applied.effect_id
+    alias_storage(NATIVE_DICT.__get__(applied, BaseModel), "intent_id", "effect_id")
+    kept_intent, kept = contracts_lifecycle.validate_stage_receipts(command, (applied,))
+    assert (kept_intent.tenant_id, kept_intent.actor_id) == ("tenant-1", "tenant-evil")  # as the text says
+    assert kept[0].intent_id == kept_intent.id and kept[0].effect_id == effect
+    assert type(next(iter(NATIVE_DICT.__get__(kept_intent, BaseModel)))) is str
+
+
+def test_raw_mapping_keys_are_read_by_their_text_not_their_hash():
+    from tests.test_contracts_lifecycle import intent_with_requirements, requirement
+
+    command = intent_with_requirements(requirement(ProcessingStage.CANONICAL))
+    handle = {"kind": "artifact", "id": "tenant-1", "tenant_id": "other-tenant", "resolver": "resolve_artifact"}
+    alias_storage(handle, "id", "tenant_id")  # by text the handle names another tenant
+    applied = receipt(ProcessingStage.CANONICAL, StageStatus.APPLIED)
+    set_native(applied, "output_refs", (handle,))
+    with pytest.raises(ValueError, match="output_refs must match intent tenant_id"):
+        contracts_lifecycle.validate_stage_receipts(command, (applied,))
+    with pytest.raises(ValueError, match="output_refs must match intent tenant_id"):
+        validate_required_stage_claim(claimed_status=IntentStatus.APPLIED, intent=command, receipts=(applied,))
+
+
 # ---- str subclasses
 def test_two_source_ids_with_one_text_stay_duplicates_when_one_is_a_str_subclass():
     values = intent(ProcessingStage.CANONICAL).model_dump()

@@ -459,8 +459,10 @@ def _materialize_captured_graph(
         if isinstance(value, _CapturedModel):
             stored_names = {key for key, _ in value.stored_entries}
             declared_fields = value.model_type.model_fields
+            # Keys reach validation as their own text: a str subclass's hash and equality would
+            # otherwise decide which field a value fills (the text was checked distinct at capture).
             fields = {
-                key: _materialize_captured_graph(
+                _key_text(key): _materialize_captured_graph(
                     item,
                     captured_by_identity,
                     active_containers,
@@ -483,7 +485,7 @@ def _materialize_captured_graph(
                     raise ValueError(
                         "conflicting stored contract field is not valid input"
                     )
-                fields[key] = _materialize_captured_graph(
+                fields[_key_text(key)] = _materialize_captured_graph(
                     item,
                     captured_by_identity,
                     active_containers,
@@ -492,7 +494,7 @@ def _materialize_captured_graph(
             return fields
         if isinstance(value, _CapturedDict):
             built = {
-                key: _materialize_captured_graph(
+                _key_text(key): _materialize_captured_graph(
                     item,
                     captured_by_identity,
                     active_containers,
@@ -583,11 +585,17 @@ def _article(name: str) -> str:
     return "an" if name[:1] in "AEIOU" else "a"
 
 
+def _is_instance_by_type(value: object, model_type: type) -> bool:
+    """``isinstance`` by the object's real type: a ``__class__`` claim is never consulted."""
+
+    return issubclass(type(value), model_type)
+
+
 def _captured_model(
     model_type: type[_ModelT],
     value: object,
 ) -> _CapturedGraphSnapshot:
-    if not isinstance(value, model_type):
+    if not _is_instance_by_type(value, model_type):
         raise TypeError(f"value must be {_article(model_type.__name__)} {model_type.__name__}")
     return _capture_contract_graph(value)
 
@@ -631,7 +639,7 @@ def _revalidated_inventory_model(
 ) -> _ModelT:
     """Validate a public-view item, reusing entry-time state when available."""
 
-    if not isinstance(value, model_type):
+    if not _is_instance_by_type(value, model_type):
         raise TypeError(f"value must be {_article(model_type.__name__)} {model_type.__name__}")
     captured = _cached_identity_capture(value, captured_by_identity)
     if captured is None:
@@ -1019,7 +1027,7 @@ def source_versions_match(
 ) -> bool:
     """Require exact equality after deep validation of both version witnesses."""
 
-    if not isinstance(expected, SourceVersion):
+    if not _is_instance_by_type(expected, SourceVersion):
         raise TypeError("value must be a SourceVersion")
     budget = DiscoveryBudget()  # one envelope for both witnesses
     shared: dict[Any, Any] = {}  # and one observation of any view they share
@@ -1030,7 +1038,7 @@ def source_versions_match(
         captured_expected = None
         expected_capture_error = exc
 
-    if isinstance(observed, SourceVersion):
+    if _is_instance_by_type(observed, SourceVersion):
         try:
             captured_observed = _capture_contract_graph(observed, None, budget, shared)
             observed_capture_error: Exception | None = None
@@ -1068,10 +1076,10 @@ def _revalidated_claim_inputs(
     stores is always one the claim can read.  Public views are observed once per call.
     """
 
-    if not isinstance(receipts, tuple):
+    if not _is_instance_by_type(receipts, tuple):
         raise TypeError("receipts must be a tuple")
 
-    if not isinstance(intent, Intent):
+    if not _is_instance_by_type(intent, Intent):
         raise TypeError("value must be an Intent")
     budget = DiscoveryBudget(LIFECYCLE_TIER)  # one envelope for the intent and every receipt
     receipt_inventory: dict[Any, Any] = {}  # and one observation of any view they share
@@ -1115,7 +1123,7 @@ def _revalidated_claim_inputs(
 
     def revalidate_receipt(receipt: object) -> StageReceipt:
         capture_error = receipt_capture_errors.get(id(receipt))
-        if capture_error is not None and isinstance(receipt, StageReceipt):
+        if capture_error is not None and _is_instance_by_type(receipt, StageReceipt):
             raise capture_error
         return _revalidated_inventory_model(
             StageReceipt,
