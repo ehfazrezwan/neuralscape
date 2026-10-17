@@ -82,7 +82,7 @@ def _exact_entry(items: Iterable[tuple[object, object]], name: str) -> tuple[obj
     return value, found, pure
 
 
-def _class_namespace_entry(model_type: type, name: str) -> tuple[object, bool]:
+def _class_namespace_entry(model_type: type, name: str, budget: DiscoveryBudget) -> tuple[object, bool]:
     """``(value, pure)``: ``name`` from the first class on ``model_type``'s native MRO whose own
     namespace defines it.
 
@@ -93,6 +93,7 @@ def _class_namespace_entry(model_type: type, name: str) -> tuple[object, bool]:
     pure = True
     for klass in _TYPE_MRO.__get__(model_type):
         namespace = _CLASS_NAMESPACE.__get__(klass)
+        budget.charge_edge(MappingProxyType.__len__(namespace))  # every entry scanned is charged
         value, found, klass_pure = _exact_entry(MappingProxyType.items(namespace), name)
         pure = pure and klass_pure
         if found:
@@ -100,18 +101,18 @@ def _class_namespace_entry(model_type: type, name: str) -> tuple[object, bool]:
     return None, pure
 
 
-def _native_sequence(value: object) -> tuple[tuple[object, ...], bool]:
+def _native_sequence(value: object, budget: DiscoveryBudget) -> tuple[tuple[object, ...], bool]:
     """``(items, pure)`` of a list or tuple read through its native storage (no iteration, length or
-    indexing hook runs).  A subclass is still read natively but reported impure; anything else is unreadable."""
+    indexing hook runs).  Its native length is charged before anything is copied, so an oversized one is
+    refused without the copy.  A subclass is still read natively but reported impure; anything else is
+    unreadable."""
 
-    if type(value) is list:
-        return tuple(list.__iter__(value)), True  # type: ignore[arg-type]
-    if type(value) is tuple:
-        return value, True  # type: ignore[return-value]
     if _is_subclass(type(value), list):
-        return tuple(list.__iter__(value)), False  # type: ignore[arg-type]
+        budget.charge_edge(list.__len__(value))  # type: ignore[arg-type]
+        return tuple(list.__iter__(value)), type(value) is list  # type: ignore[arg-type]
     if _is_subclass(type(value), tuple):
-        return tuple(tuple.__iter__(value)), False  # type: ignore[arg-type]
+        budget.charge_edge(tuple.__len__(value))  # type: ignore[arg-type]
+        return (value if type(value) is tuple else tuple(tuple.__iter__(value))), type(value) is tuple  # type: ignore[return-value,arg-type]
     return (), False
 
 
@@ -121,7 +122,7 @@ def _text(value: object) -> object:
     return str.__str__(value) if type(value) is not str and _is_subclass(type(value), str) else value
 
 
-def _model_metadata(model_type: type[BaseModel]) -> tuple[dict[object, object], object, bool]:
+def _model_metadata(model_type: type[BaseModel], budget: DiscoveryBudget) -> tuple[dict[object, object], object, bool]:
     """The model's declared fields and configuration, read without caller hooks.
 
     pydantic keeps both as plain dicts in every model class's own namespace.  Anything else
@@ -129,11 +130,41 @@ def _model_metadata(model_type: type[BaseModel]) -> tuple[dict[object, object], 
     reading it may run caller code, so the subtree must not be reused.
     """
 
-    fields, fields_pure = _class_namespace_entry(model_type, "__pydantic_fields__")
-    config, config_pure = _class_namespace_entry(model_type, "model_config")
+    fields, fields_pure = _class_namespace_entry(model_type, "__pydantic_fields__", budget)
+    config, config_pure = _class_namespace_entry(model_type, "model_config", budget)
     if type(fields) is dict and (config is None or type(config) is dict):
         return fields, config, fields_pure and config_pure
     return dict(model_type.model_fields), model_type.model_config, False
+
+
+def _declared_metadata(
+    model_type: type[BaseModel], inventory: "_GraphInventory"
+) -> tuple[set[object], dict[str, set[str]], bool]:
+    """``(declared names, alias owners, pure)`` of ``model_type`` for this call.
+
+    Read without hooks from the class's own namespaces, charged as scanned, and kept for the rest of the
+    call when that reading ran no caller code (the class stays alive with it), so N instances of one class
+    cost one scan, not N.  Impure metadata (read through the class, or through storage or keys that can run
+    code) is not kept: it is read, and charged, again for every instance, so each occurrence observes it.
+    A declared name that is not text is never hashed and makes the metadata impure.
+    """
+
+    cached = inventory.metadata.get(id(model_type))
+    if cached is not None and cached[0] is model_type:
+        return cached[1], cached[2], cached[3]
+    budget = inventory.budget
+    declared_fields, config, metadata_pure = _model_metadata(model_type, budget)
+    declared_names: set[object] = set()
+    for name in dict.keys(declared_fields):
+        if _is_subclass(type(name), str):
+            declared_names.add(_text(name))
+        else:
+            metadata_pure = False
+    alias_owners, aliases_pure = _validation_alias_owners(declared_fields, config, budget)
+    pure = metadata_pure and aliases_pure
+    if pure:  # only metadata whose reading ran no caller code is kept; impure metadata is read on every edge
+        inventory.metadata[id(model_type)] = (model_type, declared_names, alias_owners, pure)
+    return declared_names, alias_owners, pure
 
 
 def _validation_alias_owners(
@@ -149,6 +180,7 @@ def _validation_alias_owners(
 
     pure = type(config) is dict or config is None
     if type(config) is dict:
+        budget.charge_edge(dict.__len__(config))
         validate_by_alias, _found, config_pure = _exact_entry(dict.items(config), "validate_by_alias")
         pure = pure and config_pure
     else:
@@ -158,13 +190,15 @@ def _validation_alias_owners(
 
     owners: dict[str, set[str]] = {}
     for field_name, field in dict.items(fields):
+        if not _is_subclass(type(field_name), str):
+            pure = False  # a non-text name can hash or compare through caller code: never hashed, never reused
+            continue
         if type(field) is not FieldInfo:
             pure = False
         validation_alias = field.validation_alias  # type: ignore[attr-defined]
         if _is_subclass(type(validation_alias), AliasChoices):
             pure = pure and type(validation_alias) is AliasChoices
-            choices, choices_pure = _native_sequence(validation_alias.choices)
-            budget.charge_edge(len(choices))
+            choices, choices_pure = _native_sequence(validation_alias.choices, budget)
             pure = pure and choices_pure
         else:
             choices = (validation_alias,)
@@ -174,8 +208,7 @@ def _validation_alias_owners(
                 owners.setdefault(_text(choice), set()).add(name)  # type: ignore[arg-type]
             elif _is_subclass(type(choice), AliasPath):
                 pure = pure and type(choice) is AliasPath
-                path, path_pure = _native_sequence(choice.path)
-                budget.charge_edge(len(path))
+                path, path_pure = _native_sequence(choice.path, budget)
                 pure = pure and path_pure
                 root = path[0] if path else None
                 if _is_subclass(type(root), str):
@@ -311,6 +344,8 @@ class _GraphInventory:
     # reconstruction, so a released temporary's id cannot be reused by a later
     # object and alias its captured contents.
     retained: list[object] = field(default_factory=list)
+    # Hook-free model metadata per class for this call: ``id -> (class, declared names, alias owners, pure)``.
+    metadata: dict[int, tuple[type, set[object], dict[str, set[str]], bool]] = field(default_factory=dict)
     # Completed reconstructions of pure subtrees, keyed by identity:
     # ``(object, copy, height)``.  A descendant shared by many paths is rebuilt once
     # and shared; ``height`` keeps the depth limit enforced on every path.
@@ -572,10 +607,8 @@ def _snapshot_captured_graph(
             stored_names = {key for key, _ in stored_entries}
             # Declared fields, configuration and aliases are read without running caller code; where
             # that is not possible the subtree (and every ancestor) is not reused.
-            declared_fields, config, metadata_pure = _model_metadata(model_type)
-            declared_names = {_text(name) for name in dict.keys(declared_fields)}
-            alias_owners, aliases_pure = _validation_alias_owners(declared_fields, config, budget)
-            if not (metadata_pure and aliases_pure):
+            declared_names, alias_owners, metadata_pure = _declared_metadata(model_type, inventory)
+            if not metadata_pure:
                 inventory.impure_reads += 1
             alias_roots = set(alias_owners)
             unknown_stored_names = stored_names - declared_names

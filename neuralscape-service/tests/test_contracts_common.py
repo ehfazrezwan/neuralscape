@@ -3908,3 +3908,68 @@ def test_a_hooked_key_in_a_model_class_namespace_cannot_skew_later_views() -> No
         a: int = 1
 
     _assert_consistent(counter, Hooked())
+
+
+# ── model metadata is scanned once per class per call, bounded, and a non-text field key runs no hook ──
+
+
+def test_model_metadata_is_scanned_once_per_class_however_many_instances(monkeypatch) -> None:
+    import contracts_common
+
+    attributes = {f"helper_{index}": staticmethod(lambda: None) for index in range(2_000)}
+    Wide = type("Wide", (BaseModel,), {"__annotations__": {"a": int}, "a": 1, **attributes})
+    scanned = [0]
+    real = contracts_common._exact_entry
+
+    def counting(items, name):
+        listed = list(items)
+        scanned[0] += len(listed)
+        return real(listed, name)
+
+    monkeypatch.setattr(contracts_common, "_exact_entry", counting)
+    snapshot_contract_graph([Wide() for _ in range(500)])
+    # one class: its namespace is scanned for the fields and the configuration once, not once per instance
+    assert scanned[0] < 3 * 2_100, scanned[0]
+
+
+def test_an_oversized_alias_list_is_refused_before_it_is_copied() -> None:
+    import tracemalloc
+
+    from pydantic import AliasChoices, Field
+
+    alias = AliasChoices("a1", "a2")
+    choices = ["a1"] * 2_000_000  # far past the edge allowance
+    object.__setattr__(alias, "choices", choices)
+
+    class Aliased(BaseModel):
+        a: int = Field(1, validation_alias=alias)
+
+    model = Aliased()
+    tracemalloc.start()
+    try:
+        with pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):
+            snapshot_contract_graph(model)
+        _current, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert peak < 4_000_000, peak  # the 16 MB copy of the list was never made
+
+
+def test_a_non_text_key_among_the_declared_fields_runs_no_hook_and_cannot_skew_later_views() -> None:
+    counter = [0]
+
+    class HookedKey:
+        def __hash__(self):
+            counter[0] += 1
+            return 7
+
+        def __eq__(self, other):
+            counter[0] += 1
+            return self is other
+
+    class Declared(BaseModel):
+        a: int = 1
+
+    model = Declared()
+    dict.__setitem__(vars(Declared)["__pydantic_fields__"], HookedKey(), vars(Declared)["__pydantic_fields__"]["a"])
+    _assert_consistent(counter, model)
