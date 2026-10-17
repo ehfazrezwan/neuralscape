@@ -2567,3 +2567,32 @@ def test_model_classes_sharing_a_field_table_share_one_copy_of_each_subclass_key
     finally:
         tracemalloc.stop()
     assert peak < 8 * 2**20, peak  # one 256 KiB text, not one per class (50 MiB)
+
+
+def test_a_long_namespace_key_is_never_copied_to_be_compared_with_the_hook_names():
+    """The impersonation scan compares namespace keys with short hook names: a ``str``-subclass key longer than any
+    of them cannot spell one, so it is ruled out by its native length, never copied (once per inheriting class)."""
+
+    import tracemalloc
+
+    class Text(str):
+        pass
+
+    base = type("Holder", (str,), {Text("k" * (16 * 2**20)): 1})
+    leaves = tuple(type(f"Holder{index}", (base,), {})("x") for index in range(40))
+    tracemalloc.start()
+    try:
+        contracts_lifecycle._capture_native_contract_graph(leaves)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert peak < 4 * 2**20, peak  # no 16 MiB copy of the key, for any of the 40 classes
+
+
+def test_a_short_subclass_key_spelling_a_hook_name_still_claims():
+    class Text(str):
+        pass
+
+    kind = type("Claiming", (str,), {Text("__getattribute__"): lambda self, name: object.__getattribute__(self, name)})
+    with pytest.raises(ValueError):
+        contracts_lifecycle._capture_native_contract_graph((kind("x"),))

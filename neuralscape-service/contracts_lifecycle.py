@@ -419,6 +419,7 @@ def _is_declared_member(
 
 
 _IMPERSONATION_HOOKS = ("__class__", "__getattribute__")
+_LONGEST_HOOK = max(map(len, _IMPERSONATION_HOOKS))  # a longer key cannot spell a hook name
 _TYPE_FLAGS = type.__dict__["__flags__"]
 _HEAP_TYPE = 1 << 9  # Py_TPFLAGS_HEAPTYPE: a class created by a class statement (or ``type(...)``)
 
@@ -442,9 +443,13 @@ def _claims_another_class(kind: type, captured_by_identity: dict[Any, Any], budg
         namespace = _TYPE_NAMESPACE.__get__(base)
         budget.charge_edge(len(namespace))
         for key in namespace:
+            # Ruled out by its native length first: a subclass key's text is copied only when it could spell a
+            # hook name, so one long key inherited by many classes is never copied once per class.
             if (
-                type(key) is str or _is_text_key_class(type(key), captured_by_identity, budget)
-            ) and str.__str__(key) in _IMPERSONATION_HOOKS:
+                (type(key) is str or _is_text_key_class(type(key), captured_by_identity, budget))
+                and str.__len__(key) <= _LONGEST_HOOK
+                and str.__str__(key) in _IMPERSONATION_HOOKS
+            ):
                 return True
     return False
 
