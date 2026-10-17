@@ -647,6 +647,8 @@ def _is_email(value: object) -> bool:
 def _is_idn_hostname(value: object) -> bool:
     if not is_subclass(type(value), str):
         return True
+    if str.__len__(value) > 253:  # type: ignore[arg-type]
+        return False  # no hostname is longer (its ASCII form is never shorter than its text); idna would scan all of it
     idna.encode(value)
     return True
 
@@ -877,6 +879,80 @@ def _brief(value: object) -> str:
     if is_subclass(kind, dict):
         return f"<object of {len(value)} members>"  # type: ignore[arg-type]
     return f"<{kind.__name__}>"
+
+
+# A string longer than this, or a container with more nodes than _SMALL_NODES, is quoted by a short description
+# in the messages jsonschema builds from the instance.
+_LONG_TEXT = 256
+_SMALL_NODES = 16
+
+
+class _LongText(str):
+    """A long string whose repr is bounded; equal to, hashed and measured as the string it copies."""
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        return _brief(self)
+
+
+class _LargeList(list):  # type: ignore[type-arg]
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        return _brief(self)
+
+
+class _LargeDict(dict):  # type: ignore[type-arg]
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        return _brief(self)
+
+
+def _bounded_view(value: object) -> object:
+    """A copy of an output with every long string and large container replaced by an equal one whose repr
+    is short.  jsonschema builds a message quoting the instance whenever a keyword fails, including inside
+    anyOf and not where the failure is discarded, so a large instance would otherwise cost its full length
+    per application; with this view no message is long and nothing needs refusing for having built one.
+    Shared containers are copied once (a value repeated by reference stays repeated), and every original is
+    kept alive by the memo for the copy's lifetime, so its id is its own."""
+
+    memo: dict[int, tuple[object, object, int]] = {}
+
+    def walk(item: object) -> tuple[object, int]:
+        kind = type(item)
+        if is_subclass(kind, str):
+            text = str.__str__(item)  # type: ignore[arg-type]
+            return (str.__new__(_LongText, text) if len(text) > _LONG_TEXT else text), 1
+        if not is_subclass(kind, (list, dict)):
+            return item, 1
+        known = memo.get(id(item))
+        if known is not None and known[0] is item:
+            return known[1], known[2]
+        nodes = 1
+        if is_subclass(kind, list):
+            elements = []
+            for element in item:  # type: ignore[attr-defined]
+                copied, count = walk(element)
+                elements.append(copied)
+                nodes += count
+            copy: object = _LargeList(elements) if nodes > _SMALL_NODES else elements
+        else:
+            members = {}
+            for key, element in item.items():  # type: ignore[attr-defined]
+                copied_key, key_count = walk(key)
+                copied, count = walk(element)
+                members[copied_key] = copied
+                nodes += key_count + count
+            copy = _LargeDict(members) if nodes > _SMALL_NODES else members
+        memo[id(item)] = (item, copy, nodes)
+        return copy, nodes
+
+    try:
+        return walk(value)[0]
+    except RecursionError:
+        raise ValueError(SCHEMA_EXECUTION_MESSAGE) from None
 
 
 class _Identity:
@@ -1188,7 +1264,7 @@ def validate_generation_result(
         _validate_json_value(proposal.output)
         if not set(proposal.support_span_ids).issubset(allowed_span_ids):
             raise ValueError("proposal references an unknown support span ID")
-        first_error = next(output_validator.iter_errors(proposal.output), None)
+        first_error = next(output_validator.iter_errors(_bounded_view(proposal.output)), None)
         if first_error is not None:
             raise ValueError(
                 "proposal output does not match declared schema: "

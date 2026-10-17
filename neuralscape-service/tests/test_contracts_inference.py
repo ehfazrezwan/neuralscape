@@ -2765,16 +2765,16 @@ def test_any_keywords_mismatch_message_is_charged_and_bounded():
         assert len(error.message) < 300, (schema, len(error.message))
 
 
-def test_repeated_negated_keywords_over_a_large_string_are_refused_by_the_meter():
-    """Each negated mismatch builds a message quoting the instance, which nothing ever reads."""
+def test_repeated_negated_keywords_over_a_large_string_stay_cheap_and_compliant():
+    """Each negated mismatch used to build a message quoting the whole instance; the output is valid and the
+    work is constant per application, so it is neither slow nor refused."""
 
     big = "x" * (5 << 20)
-    for keyword in ({"type": "integer"}, {"maxLength": 1}):
+    for keyword in ({"type": "integer"}, {"maxLength": 1}, {"minLength": 10**7}):
         request, result = _generation_with_output(
             {"v": big}, v={"allOf": [{"not": keyword} for _ in range(1000)]}
         )
-        with pytest.raises(ValueError, match="exceeds its budget"):
-            validate_generation_result(request, result)
+        assert validate_generation_result(request, result).compliant
 
 
 def test_repeated_negated_enum_and_const_mismatches_over_a_large_string_stay_cheap():
@@ -2784,3 +2784,51 @@ def test_repeated_negated_enum_and_const_mismatches_over_a_large_string_stay_che
             {"v": big}, v={"allOf": [{"not": keyword} for _ in range(1000)]}
         )
         assert validate_generation_result(request, result).compliant
+
+
+# ---- a valid output that the base accepted is not refused for the messages of its discarded failures
+
+def test_optional_fields_that_are_large_strings_are_accepted():
+    """anyOf [null, string] fails its first branch for every string, building a message that quotes it."""
+
+    optional = {"anyOf": [{"type": "null"}, {"type": "string"}]}
+    for count, size in ((8, 5 << 20), (40, 1 << 20)):
+        properties = {f"f{i}": optional for i in range(count)}
+        request, result = _generation_with_output({f"f{i}": "x" * size for i in range(count)}, **properties)
+        assert validate_generation_result(request, result).compliant
+
+
+def test_a_negated_type_applied_repeatedly_to_one_large_string_is_accepted():
+    big = "x" * (5 << 20)
+    request, result = _generation_with_output({"v": big}, v={"allOf": [{"not": {"type": "integer"}}] * 7})
+    assert validate_generation_result(request, result).compliant
+
+
+def test_the_bounded_view_quotes_large_values_briefly_and_small_ones_in_full():
+    view = contracts_inference._bounded_view
+    for large in ("x" * (5 << 20), ["y"] * 100_000, {f"k{i}": i for i in range(100_000)}):
+        assert len(repr(view(large))) < 100
+        assert view(large) == large
+    assert repr(view({"a": [1, "b"]})) == "{'a': [1, 'b']}"
+    assert repr(view("x" * 256)) == repr("x" * 256)
+
+
+def test_the_bounded_view_keeps_shared_containers_shared_and_does_not_expand_them():
+    layer: object = ["x" * 300]
+    for _ in range(40):
+        layer = [layer, layer]  # 2**40 paths, 41 distinct containers
+    copied = contracts_inference._bounded_view(layer)
+    assert copied[0] is copied[1]  # type: ignore[index]
+    assert copied[0][0] is copied[0][1]  # type: ignore[index]
+
+
+def test_a_hostname_longer_than_any_hostname_is_refused_without_a_scan():
+    label = "a" * 63
+    longest = ".".join([label, label, label, "a" * 61])  # 253 characters
+    assert len(longest) == 253
+    assert _errors({"format": "idn-hostname"}, longest) == []
+    assert _errors({"format": "idn-hostname"}, "a" * 254)
+    request, result = _generation_with_output(
+        {"v": "a" * (1 << 20)}, v={"allOf": [{"not": {"format": "idn-hostname"}} for _ in range(16)]}
+    )
+    assert validate_generation_result(request, result).compliant  # 16 refusals, none of them a megabyte scan
