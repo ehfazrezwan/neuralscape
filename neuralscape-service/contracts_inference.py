@@ -841,8 +841,42 @@ class _SchemaExecutionMeter:
             raise ValueError(SCHEMA_EXECUTION_MESSAGE)
 
 
+# Work that scales with the length of one value (an integer's bytes, a string a format check scans) is
+# charged by that length: one unit per this many bytes or characters, on top of the per-node unit.
+_BYTES_PER_UNIT = 32
+# Longest text of a value a mismatch message quotes.
+_MESSAGE_TEXT = 40
+
+
 def _container_size(value: object) -> int:
     return len(value) if is_subclass(type(value), (list, dict)) else 0  # type: ignore[arg-type]
+
+
+def _string_units(value: object) -> int:
+    """The length of a string instance in units (0 for anything else), read without the value's own hooks."""
+
+    return str.__len__(value) // _BYTES_PER_UNIT if is_subclass(type(value), str) else 0  # type: ignore[arg-type]
+
+
+def _brief(value: object) -> str:
+    """A bounded description of a value for a message: never longer than a few dozen characters, however
+    large the value is, and built without walking it (repr of a large value is linear, of a huge integer an error)."""
+
+    kind = type(value)
+    if is_subclass(kind, str):
+        text = repr(str.__getitem__(value, slice(0, _MESSAGE_TEXT)))  # type: ignore[arg-type]
+        length = str.__len__(value)  # type: ignore[arg-type]
+        return text if length <= _MESSAGE_TEXT else f"{text}... ({length} characters)"
+    if kind is int:
+        bits = int.bit_length(value)  # type: ignore[arg-type]
+        return repr(value) if bits <= 64 else f"<integer of {bits} bits>"
+    if kind is bool or kind is float or value is None:
+        return repr(value)
+    if is_subclass(kind, list):
+        return f"<array of {len(value)} items>"  # type: ignore[arg-type]
+    if is_subclass(kind, dict):
+        return f"<object of {len(value)} members>"  # type: ignore[arg-type]
+    return f"<{kind.__name__}>"
 
 
 class _Identity:
@@ -900,6 +934,8 @@ def _json_identity(value: object, meter: _SchemaExecutionMeter) -> _Identity:
             ("object", frozenset((str.__str__(key), _json_identity(item, meter)) for key, item in value.items()))  # type: ignore[union-attr]
         )
     if kind is int or kind is float:
+        if kind is int:  # the key is the integer's whole byte string: charged by length before it is built
+            meter.charge((int.bit_length(value) + 8) // 8 // _BYTES_PER_UNIT)  # type: ignore[arg-type]
         return _Identity(_number_key(value))  # type: ignore[arg-type]
     return _Identity(("value", value))  # null, or anything else a schema may carry
 
@@ -917,10 +953,20 @@ def _metered_validator_class(validator_class: Any, meter: _SchemaExecutionMeter)
     from jsonschema.exceptions import ValidationError as SchemaError
     from jsonschema.validators import extend
 
-    def metered(keyword: Callable[..., Any]) -> Callable[..., Any]:
+    def metered(keyword: Callable[..., Any], scans_strings: bool = False) -> Callable[..., Any]:
         def apply(validator: Any, value: Any, instance: Any, schema: Any) -> Any:
             meter.charge(_KEYWORD_UNITS + _container_size(instance) + _container_size(value))
-            yield from keyword(validator, value, instance, schema)
+            if scans_strings:
+                meter.charge(_string_units(instance))
+            for error in keyword(validator, value, instance, schema):
+                # jsonschema's own messages quote the whole instance (a type, length or range mismatch) and are
+                # built even when an enclosing not or anyOf discards them: charge the construction by its
+                # length, and keep only a bounded prefix of what a caller can see.
+                message = error.message
+                if len(message) > _MESSAGE_TEXT * 4:
+                    meter.charge(len(message) // _BYTES_PER_UNIT)
+                    error.message = message[: _MESSAGE_TEXT * 4] + "..."
+                yield error
 
         return apply
 
@@ -976,7 +1022,7 @@ def _metered_validator_class(validator_class: Any, meter: _SchemaExecutionMeter)
                 frozenset(canonical(_json_identity(entry, meter)) for entry in enums),
             )
         if identity_of(instance) not in known[1]:
-            yield SchemaError(f"{instance!r} is not one of {enums!r}")
+            yield SchemaError(f"{_brief(instance)} is not one of {_container_size(enums)} allowed values")
 
     def const(validator: Any, expected: Any, instance: Any, schema: Any) -> Any:
         # jsonschema's const equality recurses through the whole value, which the generic charge (top-level
@@ -987,9 +1033,11 @@ def _metered_validator_class(validator_class: Any, meter: _SchemaExecutionMeter)
         if known is None or known[0] is not expected:
             known = const_identities[id(expected)] = (expected, canonical(_json_identity(expected, meter)))
         if identity_of(instance) is not known[1]:
-            yield SchemaError(f"{expected!r} was expected")
+            yield SchemaError(f"{_brief(expected)} was expected")
 
-    keywords = {name: metered(keyword) for name, keyword in validator_class.VALIDATORS.items()}
+    keywords = {
+        name: metered(keyword, scans_strings=name == "format") for name, keyword in validator_class.VALIDATORS.items()
+    }
     keywords["uniqueItems"] = metered(unique_items)
     keywords["enum"] = metered(enum)
     keywords["const"] = metered(const)

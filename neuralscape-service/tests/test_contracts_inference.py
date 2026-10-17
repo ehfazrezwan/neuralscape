@@ -2684,3 +2684,103 @@ def test_unique_items_over_equal_large_items_stops_at_the_first_duplicate(monkey
     with pytest.raises(ValueError, match="does not match declared schema"):
         validate_generation_result(request, result)
     assert walks[0] < 2_000, walks[0]  # the second item equals the first; nothing after it is compared
+
+
+# ---- execution work that scales with the length of a value is charged by that length
+
+_SCHEMA = {"$schema": contracts_inference.JSON_SCHEMA_DIALECT}
+
+
+def _errors(schema, instance):
+    validator = contracts_inference._build_output_validator({**_SCHEMA, **schema})
+    return list(validator.iter_errors(instance))
+
+
+def test_an_integer_is_charged_by_its_length_before_its_key_is_built():
+    small, large = contracts_inference._SchemaExecutionMeter(), contracts_inference._SchemaExecutionMeter()
+    contracts_inference._json_identity(12345, small)
+    contracts_inference._json_identity(1 << (8 * 262_144), large)  # 256 KiB
+    assert small.left == contracts_inference.MAX_SCHEMA_EXECUTION_UNITS - 1
+    assert contracts_inference.MAX_SCHEMA_EXECUTION_UNITS - large.left >= 262_144 // 64
+    refusing = contracts_inference._SchemaExecutionMeter(limit=100)
+    with pytest.raises(ValueError, match="exceeds its budget"):
+        contracts_inference._json_identity(1 << (8 * 262_144), refusing)
+
+
+def test_many_references_to_one_large_integer_are_refused_by_the_meter():
+    """256 references to one 256 KiB integer converted 64 MiB while charging 256 units."""
+
+    request, result = _generation_with_output({"v": 1}, v={"enum": [1 << (8 * 262_144)] * 256})
+    with pytest.raises(ValueError, match="exceeds its budget"):
+        validate_generation_result(request, result)
+
+
+def test_repeated_format_checks_over_one_large_string_are_charged_by_its_length():
+    text = "12:00:00." + "1" * (1 << 20) + "Z"  # a valid 1 MiB time
+    request, result = _generation_with_output(
+        {"v": text}, v={"allOf": [{"format": "time"} for _ in range(512)]}
+    )
+    with pytest.raises(ValueError, match="exceeds its budget"):
+        validate_generation_result(request, result)
+    short = "12:00:00Z"
+    request, result = _generation_with_output(
+        {"v": short}, v={"allOf": [{"format": "time"} for _ in range(512)]}
+    )
+    assert validate_generation_result(request, result).compliant
+
+
+def test_one_format_check_over_a_large_string_is_still_allowed():
+    text = "12:00:00." + "1" * (1 << 20) + "Z"
+    request, result = _generation_with_output({"v": text}, v={"format": "time"})
+    assert validate_generation_result(request, result).compliant
+
+
+@pytest.mark.parametrize("keyword", ["enum", "const"])
+def test_a_mismatch_message_is_bounded_whatever_the_size_of_the_values(keyword):
+    big = "x" * (5 << 20)
+    value = ["y"] if keyword == "enum" else "y"
+    (error,) = _errors({keyword: value}, big)
+    assert len(error.message) < 300, len(error.message)
+    value = [big] if keyword == "enum" else big  # a large expected value as well
+    (error,) = _errors({keyword: value}, "y")
+    assert len(error.message) < 300, len(error.message)
+    nested = {"k": [big]}
+    (error,) = _errors({keyword: [nested] if keyword == "enum" else nested}, ["z"])
+    assert len(error.message) < 300, len(error.message)
+    (error,) = _errors({keyword: [1 << 100_000] if keyword == "enum" else 1 << 100_000}, 3)
+    assert len(error.message) < 300, len(error.message)  # (repr of a huge integer would raise)
+
+
+def test_a_mismatch_message_still_says_what_was_expected_for_small_values():
+    (error,) = _errors({"enum": ["a", "b"]}, "c")
+    assert error.message == "'c' is not one of 2 allowed values"
+    (error,) = _errors({"const": "a"}, "c")
+    assert "'a'" in error.message
+
+
+def test_any_keywords_mismatch_message_is_charged_and_bounded():
+    big = "x" * (5 << 20)
+    for schema in ({"type": "integer"}, {"minLength": 10**7}, {"maxLength": 1}, {"format": "email"}):
+        (error,) = _errors(schema, big)
+        assert len(error.message) < 300, (schema, len(error.message))
+
+
+def test_repeated_negated_keywords_over_a_large_string_are_refused_by_the_meter():
+    """Each negated mismatch builds a message quoting the instance, which nothing ever reads."""
+
+    big = "x" * (5 << 20)
+    for keyword in ({"type": "integer"}, {"maxLength": 1}):
+        request, result = _generation_with_output(
+            {"v": big}, v={"allOf": [{"not": keyword} for _ in range(1000)]}
+        )
+        with pytest.raises(ValueError, match="exceeds its budget"):
+            validate_generation_result(request, result)
+
+
+def test_repeated_negated_enum_and_const_mismatches_over_a_large_string_stay_cheap():
+    big = "x" * (5 << 20)
+    for keyword in ({"enum": ["y"]}, {"const": "y"}):
+        request, result = _generation_with_output(
+            {"v": big}, v={"allOf": [{"not": keyword} for _ in range(1000)]}
+        )
+        assert validate_generation_result(request, result).compliant
