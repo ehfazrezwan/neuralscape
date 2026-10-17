@@ -1993,3 +1993,173 @@ def test_a_partial_block_header_at_the_end_of_a_local_extra_field_is_rejected(tm
     report = verify_bundle(path)
     assert not report.ok and pv.ARCHIVE_FRAMING in _codes(report)
     assert any("partial block header" in item.detail for item in report.findings)  # refused for this reason
+
+
+# --- the end records are rewritten in place while the precheck reads them ------------------------
+
+
+class _RewriteBeforeRead:
+    """A file view that rewrites ``data`` at ``at`` in the underlying file just before its ``rewrite_before``-th read.
+
+    Reads go straight to the descriptor (``os.pread``), so no buffer can hide the rewrite from a later read."""
+
+    def __init__(self, raw, path: Path, rewrite_before: int, at: int, data: bytes) -> None:
+        self._raw, self._path, self._before, self._at, self._data = raw, path, rewrite_before, at, data
+        self._position, self.reads = 0, 0
+
+    def seek(self, offset: int, whence: int = os.SEEK_SET) -> int:
+        base = {os.SEEK_SET: 0, os.SEEK_CUR: self._position, os.SEEK_END: os.fstat(self._raw.fileno()).st_size}[whence]
+        self._position = base + offset
+        return self._position
+
+    def tell(self) -> int:
+        return self._position
+
+    def read(self, count: int = -1) -> bytes:
+        self.reads += 1
+        if self.reads == self._before:
+            with open(self._path, "r+b") as writer:  # another writer, same inode, in place
+                writer.seek(self._at)
+                writer.write(self._data)
+        if count is None or count < 0:
+            count = max(0, os.fstat(self._raw.fileno()).st_size - self._position)
+        out = os.pread(self._raw.fileno(), count, self._position)
+        self._position += len(out)
+        return out
+
+
+def _zip64_end(entries: int, cd_size: int, cd_offset: int) -> bytes:
+    return struct.pack("<4sQ2H2I4Q", b"PK\x06\x06", 44, 45, 45, 0, 0, entries, entries, cd_size, cd_offset)
+
+
+def _end_records_rewritten_during_the_precheck(tmp_path, monkeypatch, *, rewritten: str):
+    """Six central records; the end records first bound only the last three, then a rewrite between the precheck's
+    reads makes them declare all six, starting before the bounded slice."""
+
+    cd = _central_records(6)
+    first = len(_central_records(3))
+    if rewritten in ("zip64-end-record", "zip64-locator"):
+        bounded = _zip64_end(3, len(cd) - first, first)
+        locator = struct.pack("<4sIQI", b"PK\x06\x07", 0, len(cd), 1)
+        data = cd + bounded + locator + _end_record(0xFFFF, _U32, _U32)
+        if rewritten == "zip64-end-record":
+            rewrite = dict(rewrite_before=4, at=len(cd), data=_zip64_end(6, len(cd), 0))  # after the record is read
+        else:  # the locator points elsewhere once the record it pointed to was read
+            rewrite = dict(rewrite_before=4, at=len(cd) + len(bounded), data=struct.pack("<4sIQI", b"PK\x06\x07", 0, 0, 1))
+    else:
+        data = cd + _end_record(3, len(cd) - first, first)
+        if rewritten == "end-record":
+            rewrite = dict(rewrite_before=2, at=len(cd), data=_end_record(6, len(cd), 0))  # after the end record is read
+        else:  # only the last byte (the comment length's high byte): a comment the parser would look past
+            rewrite = dict(rewrite_before=2, at=len(data) - 1, data=b"\x01")
+    path = tmp_path / "b.zip"
+    path.write_bytes(data)
+    monkeypatch.setattr(pv, "MAX_BUNDLE_ENTRIES", 3)
+    real_precheck, real_zipfile = pv._precheck_central_directory, pv.zipfile.ZipFile
+    views: list[_RewriteBeforeRead] = []
+    parsed: list[int] = []
+
+    def precheck_through_rewriting_view(source, report):
+        view = _RewriteBeforeRead(source, path, **rewrite)
+        views.append(view)
+        return real_precheck(view, report)
+
+    def counting_zipfile(*args, **kwargs):
+        archive = real_zipfile(*args, **kwargs)
+        parsed.append(len(archive.infolist()))
+        return archive
+
+    monkeypatch.setattr(pv, "_precheck_central_directory", precheck_through_rewriting_view)
+    monkeypatch.setattr(pv.zipfile, "ZipFile", counting_zipfile)
+    report = verify_bundle(path)
+    assert views and views[0].reads >= rewrite["rewrite_before"]  # the rewrite happened inside the precheck
+    return report, parsed
+
+
+@pytest.mark.parametrize("rewritten", ["end-record", "end-record-last-byte", "zip64-end-record", "zip64-locator"])
+def test_end_records_rewritten_while_the_precheck_reads_them_are_refused_before_parsing(tmp_path, monkeypatch, rewritten) -> None:
+    report, parsed = _end_records_rewritten_during_the_precheck(tmp_path, monkeypatch, rewritten=rewritten)
+    assert parsed == []  # never parsed: a rewritten end record could direct the parser past the entry limit
+    assert (pv.ARCHIVE_FRAMING, "end records changed while they were read") in [
+        (item.code, item.detail) for item in report.findings
+    ]
+
+
+def test_end_records_left_alone_during_the_precheck_still_verify(tmp_path, monkeypatch) -> None:
+    path = _zip64_end_record_archive(tmp_path, monkeypatch)
+    assert verify_bundle(path).ok
+    assert verify_bundle(_write_zip(tmp_path / "plain.zip", PAYLOAD)).ok
+
+
+def _zip64_pointer(entries: int, cd_size: int, record_at: int) -> bytes:
+    """A zip64 end record (directory at offset 0) followed by a locator that points at it: 76 bytes."""
+
+    return _zip64_end(entries, cd_size, 0) + struct.pack("<4sIQI", b"PK\x06\x07", 0, record_at, 1)
+
+
+def test_a_zip64_locator_planted_in_the_directory_while_the_precheck_reads_is_refused(tmp_path, monkeypatch) -> None:
+    """No locator when the end records are read, so the ordinary end record is bounded; then a locator and a zip64
+    record are written into the last central record's name before the copy is taken.  The parser would follow them."""
+
+    extra = _central_records(3)
+    long_name = b"n" * 100
+    last = _CENTRAL.pack(b"PK\x01\x02", 20, 20, 0, 0, 0, 0, 0, 0, 0, len(long_name), 0, 0, 0, 0, 0, 0) + long_name
+    cd = _central_records(5) + last
+    data = extra + cd + _end_record(6, len(cd), len(extra))
+    path = tmp_path / "b.zip"
+    path.write_bytes(data)
+    eocd_at = len(data) - 22
+    planted = _zip64_pointer(9, eocd_at - 76, eocd_at - 76)  # inside the long name: the record walk still passes
+    monkeypatch.setattr(pv, "MAX_BUNDLE_ENTRIES", 6)
+    real_precheck, real_zipfile = pv._precheck_central_directory, pv.zipfile.ZipFile
+    parsed: list[int] = []
+
+    def precheck_through_rewriting_view(source, report):
+        return real_precheck(_RewriteBeforeRead(source, path, 3, eocd_at - 76, planted), report)  # before the copy
+
+    def counting_zipfile(*args, **kwargs):
+        archive = real_zipfile(*args, **kwargs)
+        parsed.append(len(archive.infolist()))
+        return archive
+
+    monkeypatch.setattr(pv, "_precheck_central_directory", precheck_through_rewriting_view)
+    monkeypatch.setattr(pv.zipfile, "ZipFile", counting_zipfile)
+    report = verify_bundle(path)
+    assert parsed == []
+    assert (pv.ARCHIVE_FRAMING, "end records changed while they were read") in [
+        (item.code, item.detail) for item in report.findings
+    ]
+
+
+def test_a_zip64_locator_written_before_an_empty_directory_after_the_precheck_cannot_be_parsed(tmp_path, monkeypatch) -> None:
+    """An empty directory: the bytes the parser searches for a zip64 locator lie before the directory, outside a copy
+    that starts at it.  A writer that plants a locator there after the precheck must not reach the parser."""
+
+    prefix = _central_records(3) + b"\x00" * 76
+    data = prefix + _end_record(0, 0, len(prefix))
+    path = tmp_path / "b.zip"
+    path.write_bytes(data)
+    planted = _zip64_pointer(3, len(prefix) - 76, len(prefix) - 76)
+    monkeypatch.setattr(pv, "MAX_BUNDLE_ENTRIES", 2)
+    real_precheck, real_zipfile = pv._precheck_central_directory, pv.zipfile.ZipFile
+    parsed: list[int] = []
+
+    accepted: list[bool] = []
+
+    def precheck_then_plant(source, report):
+        accepted.append(real_precheck(source, report))
+        with open(path, "r+b") as writer:  # same inode, in place, after the precheck
+            writer.seek(len(prefix) - 76)
+            writer.write(planted)
+        return accepted[-1]
+
+    def counting_zipfile(*args, **kwargs):
+        archive = real_zipfile(*args, **kwargs)
+        parsed.append(len(archive.infolist()))
+        return archive
+
+    monkeypatch.setattr(pv, "_precheck_central_directory", precheck_then_plant)
+    monkeypatch.setattr(pv.zipfile, "ZipFile", counting_zipfile)
+    verify_bundle(path)
+    assert accepted == [True]  # the honest empty directory passes the precheck
+    assert parsed == [0], parsed  # and the parser read the copy's empty directory, never the plant

@@ -937,16 +937,22 @@ def _precheck_central_directory(target: str | os.PathLike[str] | BinaryIO, repor
             report.add(CONTAINER_UNREADABLE, "<bundle>")
             return False
         eocd_at = size - _EOCD.size
+        end_record = tail[-_EOCD.size:]
         (signature, disk, cd_disk, entries_here, entries, cd_size, cd_offset, comment_length) = (
-            _EOCD.unpack(tail[-_EOCD.size:])
+            _EOCD.unpack(end_record)
         )
         if signature != _EOCD_SIGNATURE or comment_length != 0:
             return refuse(ARCHIVE_FRAMING, "trailing data or archive comment after the end record")
         ordinary = (disk, cd_disk, entries_here, entries, cd_size, cd_offset)
+        # Every end-record byte the bounds below are derived from, by file offset: the copy taken
+        # after them must hold exactly these bytes, or the parser would read other end records.
+        bounded_end_records = [(eocd_at, end_record)]
         locator = b""
         if eocd_at >= _ZIP64_LOCATOR.size:
             raw.seek(eocd_at - _ZIP64_LOCATOR.size)
             locator = raw.read(_ZIP64_LOCATOR.size)
+            # Locator or not, the parser decides by these bytes: the copy must hold the ones judged here.
+            bounded_end_records.append((eocd_at - _ZIP64_LOCATOR.size, locator))
         if locator[:4] == _ZIP64_LOCATOR_SIGNATURE:
             locator_at = eocd_at - _ZIP64_LOCATOR.size
             _sig, locator_disk, record_at, disks = _ZIP64_LOCATOR.unpack(locator)
@@ -963,6 +969,7 @@ def _precheck_central_directory(target: str | os.PathLike[str] | BinaryIO, repor
                 return refuse(ARCHIVE_FRAMING, "bad zip64 end record")
             if not _end_record_agrees(ordinary, (disk, cd_disk, entries_here, entries, cd_size, cd_offset)):
                 return refuse(ARCHIVE_FRAMING, "end record disagrees with the zip64 end record")
+            bounded_end_records.append((record_at, record))
             directory_end = record_at
         else:
             if entries == 0xFFFF or entries_here == 0xFFFF or cd_size == _U32_MAX or cd_offset == _U32_MAX:
@@ -983,14 +990,22 @@ def _precheck_central_directory(target: str | os.PathLike[str] | BinaryIO, repor
         # change the member data, which is hashed as it is read, but not what is parsed or counted.
         if size - cd_offset > cd_size + _MAX_END_RECORD_BYTES:
             return refuse(ARCHIVE_FRAMING, "oversized end records")
-        raw.seek(cd_offset)
-        tail_bytes = raw.read(size - cd_offset)
-        directory = tail_bytes[:cd_size]
+        # The copy also holds the bytes where the parser looks for a zip64 locator, even when the directory
+        # is shorter than a locator (a zip64 record it would then read starts at or after the directory).
+        capture_start = max(0, min(cd_offset, eocd_at - _ZIP64_LOCATOR.size))
+        raw.seek(capture_start)
+        tail_bytes = raw.read(size - capture_start)
+        directory = tail_bytes[cd_offset - capture_start : cd_offset - capture_start + cd_size]
     except OSError:
         report.add(CONTAINER_UNREADABLE, "<bundle>")
         return False
-    if len(directory) != cd_size or len(tail_bytes) != size - cd_offset:
+    if len(directory) != cd_size or len(tail_bytes) != size - capture_start:
         return refuse(ARCHIVE_FRAMING, "short central directory")
+    # The end records were read before the copy: a writer that rewrites them in place in between would
+    # leave the bounded directory slice in the copy but hand the parser end records that were never
+    # bounded (a directory starting before the copy, more records than the limit).
+    if any(tail_bytes[at - capture_start : at - capture_start + len(data)] != data for at, data in bounded_end_records):
+        return refuse(ARCHIVE_FRAMING, "end records changed while they were read")
     records = 0
     cursor = 0
     while cursor < cd_size:
@@ -1005,7 +1020,7 @@ def _precheck_central_directory(target: str | os.PathLike[str] | BinaryIO, repor
         return refuse(ARCHIVE_FRAMING, "central directory does not match its declared size and count")
     pin = _PINNED_TAIL.get()
     if pin is not None:
-        pin.append((cd_offset, tail_bytes))
+        pin.append((capture_start, tail_bytes))
     return True
 
 
