@@ -270,7 +270,8 @@ def _leaf_class_verdict(
     captured_by_identity: dict[Any, Any],
     budget: DiscoveryBudget,
 ) -> str:
-    """Classify a leaf's class once per call: ``"enum"``, ``"native"`` or ``"refused"``.
+    """Classify a leaf's class once per call: ``"enum"``, ``"text"`` (a ``str`` subclass), ``"native"`` or
+    ``"refused"``.
 
     Every check walks the class's MRO, which a caller can make arbitrarily deep; the walk is charged one
     edge per class in it and its verdict kept (with the class, so its ``id()`` is not recycled), so
@@ -288,6 +289,8 @@ def _leaf_class_verdict(
         verdict = "refused"
     elif any(base is Enum for base in mro):
         verdict = "enum"
+    elif kind is not str and any(base is str for base in mro):
+        verdict = "text"
     elif any(base is native for base in mro for native in _NATIVE_LEAF_TYPES):
         verdict = "native"
     else:
@@ -306,7 +309,8 @@ def _native_leaf(
     Validation reads any other object through its own attribute protocol: a proxy claiming a contract
     class (``__class__``) would run caller code inside the validator, outside the discovery budget.
     An enum instance built with ``str.__new__(Enum, value)`` is no member: every ``is`` test would
-    misjudge it.  Both are refused here, before validation sees them; no hook runs to decide.
+    misjudge it.  Both are refused here, before validation sees them; no hook runs to decide.  A ``str``
+    subclass is passed on as its exact text.
     """
 
     verdict = _leaf_class_verdict(type(value), captured_by_identity, budget)
@@ -314,6 +318,10 @@ def _native_leaf(
         if not _is_declared_member(value, captured_by_identity, budget):
             raise ValueError("an enum value must be a declared member of its enum")
         return value
+    if verdict == "text":
+        # A text subclass reaches validation as its exact text: its own hash and equality never run
+        # there, so it cannot match a literal it does not spell.
+        return str.__str__(value)  # type: ignore[arg-type]
     if verdict == "native":
         return value
     raise ValueError("a contract value must be a native scalar, an enum member, a model or a container")

@@ -1287,3 +1287,51 @@ def test_an_enum_member_map_changed_by_a_view_is_indexed_again_for_items_capture
             validate_required_stage_claim(claimed_status=IntentStatus.APPLIED, intent=command, receipts=receipts())
     finally:
         members["INTENT"] = Ids.INTENT
+
+
+class _VersionLookalike(str):
+    """Spells something else, but hashes and compares like the schema version."""
+
+    calls = 0
+
+    def __hash__(self):
+        type(self).calls += 1
+        return str.__hash__("candidate-v1")
+
+    def __eq__(self, other):
+        type(self).calls += 1
+        return True
+
+    def __ne__(self, other):
+        return False
+
+
+@pytest.mark.parametrize("position", ["receipt", "intent"])
+def test_a_text_subclass_cannot_pass_a_literal_it_does_not_spell(position):
+    from tests.test_contracts_lifecycle import intent_with_requirements, requirement
+
+    command = intent_with_requirements(requirement(ProcessingStage.CANONICAL))
+    applied = receipt(ProcessingStage.CANONICAL, StageStatus.APPLIED)
+    set_native(applied if position == "receipt" else command, "schema_version", _VersionLookalike("attacker"))
+    _VersionLookalike.calls = 0
+
+    with pytest.raises(ValueError, match="schema_version"):  # used to be accepted as "candidate-v1"
+        contracts_lifecycle.validate_stage_receipts(command, (applied,))
+    assert _VersionLookalike.calls == 0  # its hash and equality never ran
+
+
+def test_a_text_subclass_that_spells_its_value_reaches_validation_as_plain_text():
+    from tests.test_contracts_lifecycle import intent_with_requirements, requirement
+
+    class Text(str):
+        pass
+
+    command = intent_with_requirements(requirement(ProcessingStage.CANONICAL))
+    applied = receipt(ProcessingStage.CANONICAL, StageStatus.APPLIED)
+    set_native(applied, "schema_version", Text("candidate-v1"))
+    set_native(applied, "effect_id", Text("effect-canonical"))
+
+    _, (kept,) = contracts_lifecycle.validate_stage_receipts(command, (applied,))
+
+    assert kept == contracts_lifecycle.validate_stage_receipts(command, (receipt(ProcessingStage.CANONICAL, StageStatus.APPLIED),))[1][0]
+    assert type(kept.schema_version) is str and type(kept.effect_id) is str
