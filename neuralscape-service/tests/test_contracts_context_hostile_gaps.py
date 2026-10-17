@@ -1155,3 +1155,121 @@ def test_the_item_model_cache_does_not_grow_with_caller_created_classes() -> Non
         del model
     gc.collect()
     assert sum(1 for reference in references if reference() is not None) <= 256
+
+
+# ---- an entry exposed by a public view: captured whole before its datetimes are pinned; kept by position; guarded before validation
+
+
+def _generated_item_view(items):
+    return _GeneratedItems(lambda: iter(items))
+
+
+def test_a_zone_callback_cannot_repair_a_later_part_of_the_entry_it_is_pinned_in() -> None:
+    """The checkpoint's zone (captured first) repairs a negative revision in the same item's later projection."""
+
+    request, bundle = _matching_pair()
+    item = bundle.selected_items[0]
+    applied = item.freshness.projection.applied_sources[0]
+    good = applied.content_revision
+    dict.__setitem__(_STORED(applied, BaseModel), "content_revision", -1)  # invalid as yielded
+
+    class Repairing(tzinfo):
+        def utcoffset(self, dt):
+            dict.__setitem__(_STORED(applied, BaseModel), "content_revision", good)
+            return timedelta(0)
+
+        def dst(self, dt):
+            return None
+
+    checkpoint = _stored_checkpoint(bundle)
+    dict.__setitem__(_STORED(checkpoint, BaseModel), "last_successful_verification_at", datetime(2026, 9, 28, 6, tzinfo=Repairing()))
+    dict.__setitem__(_STORED(bundle, BaseModel), "selected_items", _generated_item_view([item]))
+    assert bundle_matches_reported_evidence(request, bundle) is False
+
+
+def test_the_same_item_yielded_twice_is_snapshotted_at_each_position() -> None:
+    """The item's public views report one revision the first time it is yielded and another the second time (each
+    entry consistent in itself): the two positions disagree about source-a, whichever order they come in."""
+
+    from contracts_references import SourceVersion
+
+    class Occurrence:
+        number = 0
+
+    def views(revisions):
+        class ByOccurrence(tuple):
+            def __iter__(self):
+                revision = revisions[min(Occurrence.number, len(revisions) - 1)]
+                return iter([{"record_id": "source-a", "content_revision": revision, "policy_epoch": 2}])
+
+        return ByOccurrence
+
+    def run(revisions) -> bool:
+        request, bundle = _matching_pair()
+        item = bundle.selected_items[0]
+        proto = (SourceVersion(record_id="source-a", content_revision=4, policy_epoch=2),)
+        kind = views(revisions)
+        dict.__setitem__(_STORED(item, BaseModel), "source_versions", kind(proto))
+        dict.__setitem__(_STORED(item.freshness.projection, BaseModel), "applied_sources", kind(proto))
+
+        class Twice(tuple):
+            def __new__(cls):
+                return super().__new__(cls, ())
+
+            def __iter__(self):
+                Occurrence.number = 0
+                yield item
+                Occurrence.number = 1
+                yield item
+
+        dict.__setitem__(_STORED(bundle, BaseModel), "selected_items", Twice())
+        return bundle_matches_reported_evidence(request, bundle)
+
+    assert run([4, 4]) is True  # the same entry twice agrees with itself
+    assert run([4, 5]) is False
+    assert run([5, 4]) is False
+
+
+def test_the_same_pure_item_yielded_twice_still_matches() -> None:
+    request, bundle = _matching_pair()
+    item = bundle.selected_items[0]
+    dict.__setitem__(_STORED(bundle, BaseModel), "selected_items", _generated_item_view([item, item]))
+    assert bundle_matches_reported_evidence(request, bundle) is True
+
+
+def test_a_proxy_yielded_by_a_public_view_is_refused_before_pydantic_reads_its_class() -> None:
+    from contracts_context import receipt_matches_bundle
+    from contracts_references import SourceVersion
+
+    reads = {"class": 0}
+
+    class Proxy:
+        def __init__(self, target):
+            object.__setattr__(self, "_target", target)
+
+        def __getattribute__(self, name):
+            if name == "__class__":
+                reads["class"] += 1
+                return SourceVersion
+            return getattr(object.__getattribute__(self, "_target"), name)
+
+    def make():
+        yield Proxy(SourceVersion(record_id="source-a", content_revision=4, policy_epoch=2))
+
+    receipt, bundle = _receipt_and_bundle_with_source_versions(make)
+    assert receipt_matches_bundle(receipt, bundle) is False
+    assert reads["class"] == 0, "pydantic read the proxy's __class__ before the supported-type guard refused it"
+
+
+def test_a_noncanonical_enum_yielded_by_a_public_view_is_refused_before_validation() -> None:
+    from contracts_context import receipt_matches_bundle
+
+    from contracts_freshness import ProjectionStatus
+
+    fake = str.__new__(ProjectionStatus, "current")
+
+    def make():
+        yield {"record_id": "source-a", "content_revision": 4, "policy_epoch": 2, "extra": fake}
+
+    receipt, bundle = _receipt_and_bundle_with_source_versions(make)
+    assert receipt_matches_bundle(receipt, bundle) is False

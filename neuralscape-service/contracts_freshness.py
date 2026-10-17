@@ -135,7 +135,7 @@ def _pin_at_capture(value: object) -> object:
 def snapshot_pinned(value: object) -> object:
     """``snapshot_contract_graph`` with every datetime leaf pinned at capture, before any iterator advances."""
 
-    return snapshot_contract_graph(value, pin_leaf=_pin_at_capture)
+    return snapshot_contract_graph(value, pin_leaf=_pin_at_capture, entry_guard=require_native_snapshot)
 
 
 PinnedAwareDatetime = Annotated[AwareDatetime, AfterValidator(_pin_validated)]

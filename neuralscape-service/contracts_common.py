@@ -297,6 +297,9 @@ class _GraphInventory:
     # pinned once that capture is complete, and any later one (captured as a public view yields it) at once.
     collecting: bool = True
     collected: list[object] = field(default_factory=list)
+    # An optional check applied to each snapshotted entry of a public view before it is validated eagerly (the
+    # receiving boundary's supported-type and enum check): a refusal ends the read like an invalid entry.
+    entry_guard: "Callable[[object], object] | None" = None
     # Completed reconstructions of pure subtrees, keyed by identity:
     # ``(object, copy, height)``.  A descendant shared by many paths is rebuilt once
     # and shared; ``height`` keeps the depth limit enforced on every path.
@@ -479,6 +482,34 @@ def _capture_native_graph(value: object, inventory: _GraphInventory, depth: int 
     return height
 
 
+def _pin_collected(inventory: _GraphInventory) -> None:
+    """Pin, once each, the datetimes recorded while a capture was running (their zones are asked now)."""
+
+    pending = list(inventory.collected)
+    inventory.collected.clear()
+    for leaf in pending:
+        if id(leaf) not in inventory.pinned:
+            inventory.pinned[id(leaf)] = (leaf, inventory.pin_leaf(leaf))  # type: ignore[misc]
+
+
+def _capture_entry(value: object, inventory: _GraphInventory, depth: int) -> int:
+    """Capture an entry met after the initial capture: freeze all of its native backing, then pin its datetimes.
+
+    Asking a zone is caller code, so no datetime in the entry is pinned until every part of the entry has been
+    frozen: a zone callback cannot repair a later sibling of what it sits in before that is captured.
+    """
+
+    if inventory.pin_leaf is None or inventory.collecting:
+        return _capture_native_graph(value, inventory, depth)
+    inventory.collecting = True
+    try:
+        height = _capture_native_graph(value, inventory, depth)
+    finally:
+        inventory.collecting = False
+    _pin_collected(inventory)
+    return height
+
+
 @functools.lru_cache(maxsize=256)  # bounded: classes a caller creates dynamically cannot accumulate
 def _item_models(model_type: type[BaseModel]) -> dict[str, type]:
     """The fields of ``model_type`` that hold a homogeneous sequence of one model class, mapped to that class.
@@ -516,7 +547,7 @@ def _exposed_items(
     depth: int,
     active_containers: set[int] | None = None,
     item_model: "type[BaseModel] | None" = None,
-    checked: "dict[int, tuple[object, object]] | None" = None,
+    checked: "list[tuple[object, object]] | None" = None,
 ) -> tuple[object, ...]:
     """Read a sequence subclass's public view and freeze every sibling.
 
@@ -528,7 +559,7 @@ def _exposed_items(
     item it yields are charged as they are read, so an endless view is cut off by the budget.
 
     When the view is a field of a model whose items are a known model (``item_model``), each yielded entry
-    is also snapshotted and strictly validated right then, before the iterator is advanced; the first invalid
+    is also snapshotted, passed through the receiving boundary's ``entry_guard`` and strictly validated right then, before the iterator is advanced; the first invalid
     entry ends the read (it stays in the result, so the caller's own validation refuses it) and the tail is
     never produced.  The snapshots are kept in ``checked`` for the caller to reuse, so no entry is
     reconstructed twice.
@@ -546,12 +577,14 @@ def _exposed_items(
         except StopIteration:
             break
         budget.charge_edge()
-        _capture_native_graph(item, inventory, depth + 1)
+        _capture_entry(item, inventory, depth + 1)
         items.append(item)
         if item_model is not None and active_containers is not None and checked is not None:
             snapshot = _snapshot_captured_graph(item, active_containers, inventory, depth + 1)
-            checked[id(item)] = (item, snapshot)
+            checked.append((item, snapshot))  # by position: the same object yielded twice is two entries
             try:
+                if inventory.entry_guard is not None:
+                    inventory.entry_guard(snapshot)  # the receiving boundary's type check, before pydantic sees it
                 item_model.model_validate(snapshot, strict=True)
             except Exception:  # noqa: BLE001 - any refusal ends the read; the caller's validation reports it
                 break
@@ -591,7 +624,7 @@ def _snapshot_captured_graph(
         budget.charge_edge(budget.tier.max_edges + 1)  # the stable budget error
     value_id = id(value)
     if value_id not in inventory.visited:
-        _capture_native_graph(value, inventory, depth)
+        _capture_entry(value, inventory, depth)
     completed = inventory.completed
     cached = completed.get(value_id)
     if cached is not None and cached[0] is value:
@@ -658,7 +691,7 @@ def _snapshot_captured_graph(
                 # occurrence may be far deeper than the path that found them).
                 for _, item in extra_entries:
                     _adopt(inventory, value_id, item)
-                    late_height = _capture_native_graph(item, inventory, below) + 1
+                    late_height = _capture_entry(item, inventory, below) + 1
                     _grow_height(inventory, value_id, late_height)
 
             fields: dict[object, object] = {}
@@ -692,17 +725,17 @@ def _snapshot_captured_graph(
         elif _is_subclass(value_type, (tuple, list)):
             is_tuple = _is_subclass(value_type, tuple)
             exact = value_type is tuple if is_tuple else value_type is list
-            checked: dict[int, tuple[object, object]] = {}
+            checked: list[tuple[object, object]] = []
             items = (
                 inventory.sequences[value_id]
                 if exact
                 else _exposed_items(value, inventory, depth, active_containers, item_model, checked)
             )
             copies: list[object] = []
-            for item in items:
+            for position, item in enumerate(items):
                 if exact and again:
                     budget.charge_edge()
-                done = checked.get(id(item))
+                done = checked[position] if position < len(checked) else None
                 if done is not None and done[0] is item:
                     copies.append(done[1])  # snapshotted and validated when it was yielded
                 else:
@@ -747,6 +780,7 @@ def snapshot_contract_graph(
     active_containers: set[int] | None = None,
     *,
     pin_leaf: "Callable[[object], object] | None" = None,
+    entry_guard: "Callable[[object], object] | None" = None,
 ) -> object:
     """Reconstruct stored contract graphs while rejecting structural defects.
 
@@ -767,18 +801,17 @@ def snapshot_contract_graph(
 
     ``pin_leaf``, when given, is applied once to every ``datetime`` leaf as its entry is captured (so before a
     public view that yielded it is advanced), and the snapshot holds the result instead of the caller's object.
+    ``entry_guard`` is the receiving boundary's check of one snapshotted entry (supported types, allowed enums),
+    run before an eager validation so that a value the boundary would refuse is never shown to pydantic.
     """
 
     if active_containers is None:
         active_containers = set()
-    inventory = _GraphInventory(pin_leaf=pin_leaf)  # one discovery budget for the whole call
+    inventory = _GraphInventory(pin_leaf=pin_leaf, entry_guard=entry_guard)  # one discovery budget for the whole call
     try:
         _capture_native_graph(value, inventory)
         inventory.collecting = False
-        for leaf in inventory.collected:  # all native backing is frozen: now the zones may be asked, once each
-            if id(leaf) not in inventory.pinned:
-                inventory.pinned[id(leaf)] = (leaf, inventory.pin_leaf(leaf))  # type: ignore[misc]
-        inventory.collected.clear()
+        _pin_collected(inventory)  # all native backing is frozen: now the zones may be asked, once each
         return _snapshot_captured_graph(value, active_containers, inventory)
     except RecursionError:
         # One frame per level keeps every admitted depth far inside the interpreter's limit;
