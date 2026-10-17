@@ -33,6 +33,7 @@ from contracts_references import ReferenceHandle, SourceVersion
 
 
 _ContractT = TypeVar("_ContractT", bound=ContractModel)
+_ContractT2 = TypeVar("_ContractT2", bound=ContractModel)
 
 
 def _revalidated_snapshot(
@@ -44,6 +45,26 @@ def _revalidated_snapshot(
         return model_type.model_validate(
             pin_native_snapshot(require_native_snapshot(snapshot_contract_graph(value))),
             strict=True,
+        )
+    except Exception:
+        return None
+
+
+def _revalidated_pair(
+    first_type: type[_ContractT], first: object, second_type: type[_ContractT2], second: object
+) -> tuple[_ContractT, _ContractT2] | None:
+    """Strictly rebuild two complete contract graphs captured together, failing closed on any defect.
+
+    Both arguments are snapshotted in one call, before pinning or validating either, so a callback in one
+    (a public iterator, a zone's offset) can no longer repair invalid native data in the other before that
+    is captured.
+    """
+
+    try:
+        pair = pin_native_snapshot(require_native_snapshot(snapshot_contract_graph((first, second))))
+        return (
+            first_type.model_validate(pair[0], strict=True),  # type: ignore[index]
+            second_type.model_validate(pair[1], strict=True),  # type: ignore[index]
         )
     except Exception:
         return None
@@ -434,12 +455,10 @@ def bundle_matches_reported_evidence(
     bundles remain valid, informative responses.
     """
 
-    request_snapshot = _revalidated_snapshot(ContextRequest, request)
-    bundle_snapshot = _revalidated_snapshot(ContextBundle, bundle)
-    if request_snapshot is None or bundle_snapshot is None:
+    snapshots = _revalidated_pair(ContextRequest, request, ContextBundle, bundle)
+    if snapshots is None:
         return False
-    request = request_snapshot
-    bundle = bundle_snapshot
+    request, bundle = snapshots
 
     if (
         bundle.request_id != request.request_id
@@ -527,12 +546,10 @@ def receipt_matches_bundle(
     and other intentionally ordered fields retain their existing comparisons.
     """
 
-    receipt_snapshot = _revalidated_snapshot(ContextAssemblyReceipt, receipt)
-    bundle_snapshot = _revalidated_snapshot(ContextBundle, bundle)
-    if receipt_snapshot is None or bundle_snapshot is None:
+    snapshots = _revalidated_pair(ContextAssemblyReceipt, receipt, ContextBundle, bundle)
+    if snapshots is None:
         return False
-    receipt = receipt_snapshot
-    bundle = bundle_snapshot
+    receipt, bundle = snapshots
 
     selected = tuple(item.reference for item in bundle.selected_items)
     source_versions = {

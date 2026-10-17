@@ -450,3 +450,88 @@ def test_pinning_a_snapshot_that_contains_itself_terminates() -> None:
     loop.append(loop)
     pinned = pin_native_snapshot({"loop": loop})
     assert type(pinned["loop"][0]) is datetime
+
+
+# ---- both predicates capture their two arguments together, before any callback runs
+
+
+def _bundle_with_a_negative_source_revision():
+    """A bundle that is invalid on entry (an unchecked copy holds source revision -1) and the object to repair."""
+
+    from contracts_context import ContextAssemblyReceipt
+    from tests.test_contracts_context import _receipt
+
+    request, _ = _matching_pair()
+    bundle = _validate(ContextBundle, _bundle())  # the bundle the default receipt describes
+    item = bundle.selected_items[0]
+    bad = item.source_versions[0].model_copy(update={"content_revision": -1})
+    broken = bundle.model_copy(update={"selected_items": (item.model_copy(update={"source_versions": (bad,)}),)})
+    receipt = _validate(ContextAssemblyReceipt, _receipt())
+    return request, receipt, broken, bad
+
+
+def _repair(bad) -> None:
+    object.__setattr__(bad, "content_revision", 4)  # the revision the matching receipt names
+
+
+class _IteratorThatRepairs(tuple):
+    """A public tuple whose iterator repairs an invalid model held natively by the other argument."""
+
+    def __new__(cls, items, callback):
+        instance = super().__new__(cls, items)
+        instance.callback = callback
+        return instance
+
+    def __iter__(self):
+        self.callback()
+        return iter(tuple.__iter__(self))
+
+
+class _ZoneThatRepairs(tzinfo):
+    """A zone whose offset read repairs an invalid model held natively by the other argument."""
+
+    def __init__(self, callback) -> None:
+        self.callback = callback
+
+    def utcoffset(self, dt):
+        self.callback()
+        return timedelta(0)
+
+    def dst(self, dt):
+        return timedelta(0)
+
+
+def test_a_public_iterator_in_the_receipt_cannot_repair_the_bundle_before_it_is_captured() -> None:
+    from contracts_context import receipt_matches_bundle
+
+    _, receipt, broken, bad = _bundle_with_a_negative_source_revision()
+    assert not receipt_matches_bundle(receipt, broken)  # control: invalid on entry
+    object.__setattr__(
+        receipt, "source_versions", _IteratorThatRepairs(receipt.source_versions, lambda: _repair(bad))
+    )
+    assert not receipt_matches_bundle(receipt, broken)
+    assert bad.content_revision == 4  # the callback did run, after the bundle had been captured
+
+
+def test_a_deadline_zone_callback_cannot_repair_the_bundle_before_it_is_captured() -> None:
+    request, _, broken, bad = _bundle_with_a_negative_source_revision()
+    assert not bundle_matches_reported_evidence(request, broken)  # control: invalid on entry
+    stored = _STORED(request, BaseModel)
+    dict.__setitem__(stored, "deadline", datetime(*_NOON, tzinfo=_ZoneThatRepairs(lambda: _repair(bad))))
+    assert not bundle_matches_reported_evidence(request, broken)
+    assert bad.content_revision == 4
+
+
+def test_the_pair_snapshot_keeps_the_predicates_true_for_valid_arguments_with_callbacks() -> None:
+    from contracts_context import receipt_matches_bundle
+
+    request, receipt, _, _ = _bundle_with_a_negative_source_revision()
+    _, bundle = _matching_pair()
+    plain_bundle = _validate(ContextBundle, _bundle())
+    stored = _STORED(request, BaseModel)
+    seen = []
+    dict.__setitem__(stored, "deadline", datetime(*_NOON, tzinfo=_ZoneThatRepairs(lambda: seen.append(1))))
+    assert bundle_matches_reported_evidence(request, bundle)
+    assert seen  # the zone was consulted
+    object.__setattr__(receipt, "source_versions", _IteratorThatRepairs(receipt.source_versions, lambda: seen.append(2)))
+    assert receipt_matches_bundle(receipt, plain_bundle)
