@@ -1051,6 +1051,8 @@ _LIMB_BITS = 30
 _LIMB_PRODUCTS_PER_UNIT = 4_096
 
 
+# Names tested against an object per unit (a membership test is about 50 ns, a unit about a microsecond).
+_NAMES_PER_UNIT = 16
 # Comparing two integers whose high limbs match scans the shorter one: about 0.35 ns per limb, a unit being about
 # a microsecond.
 _LIMBS_PER_COMPARE_UNIT = 2_048
@@ -1235,6 +1237,22 @@ def _metered_validator_class(validator_class: Any, meter: _SchemaExecutionMeter)
             else:
                 yield SchemaError(f"Unevaluated properties are not valid under the given schema ({count} unevaluated and invalid)")
 
+    def dependent_required(validator: Any, dependencies: Any, instance: Any, schema: Any) -> Any:
+        # jsonschema yields one error per missing name, so a long list that fails inside anyOf builds as many
+        # errors as it has names, for every application, while the generic charge counts only the mapping.  Each
+        # triggered list is charged by its length (one unit per 16 names, about a microsecond) and reports one
+        # bounded error for its first missing name.
+        if not validator.is_type(instance, "object"):
+            return
+        for name, required in dependencies.items():
+            if name not in instance:
+                continue
+            meter.charge((len(required) + _NAMES_PER_UNIT - 1) // _NAMES_PER_UNIT)
+            for each in required:
+                if each not in instance:
+                    yield SchemaError(f"{_brief(each)} is a dependency of {_brief(name)}")
+                    break
+
     jsonschema_format = validator_class.VALIDATORS["format"]
     format_results: dict[tuple[str, str], tuple[str, str | None]] = {}
 
@@ -1260,6 +1278,7 @@ def _metered_validator_class(validator_class: Any, meter: _SchemaExecutionMeter)
         for name, keyword in validator_class.VALIDATORS.items()
     }
     keywords["multipleOf"] = metered(multiple_of)
+    keywords["dependentRequired"] = metered(dependent_required)
     keywords["unevaluatedItems"] = metered(unevaluated_items)
     keywords["unevaluatedProperties"] = metered(unevaluated_properties)
     keywords["format"] = metered(format_, scans_strings=True)

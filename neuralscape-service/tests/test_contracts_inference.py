@@ -3168,24 +3168,43 @@ def test_data_positions_of_the_executable_schema_are_bounded_and_shared():
     assert type(first[0][0]) is contracts_inference._LargeInt and first[0][0] is last[0][0]  # copied once
 
 
-def _unevaluated_scan_work(monkeypatch):
-    """Counts the membership scans the evaluated-entry lists of the schema library would be asked for."""
+def _unevaluated_membership_work(monkeypatch):
+    """Counts the equality tests made against the evaluated entries the schema library reports.
+
+    The helpers return the evaluated indexes or keys; here each one is an object that counts every equality test
+    it takes part in.  A set asks at most once per hit; scanning a list asks once per element, so a return to a
+    list (however it is copied) makes the count quadratic."""
 
     from jsonschema import _keywords, _utils
 
-    scanned = [0]
+    tests = [0]
 
-    class CountingList(list):
-        def __contains__(self, item):
-            scanned[0] += len(self)
-            return list.__contains__(self, item)
+    class Index(int):
+        def __eq__(self, other):
+            tests[0] += 1
+            return int.__eq__(self, other)
+
+        __hash__ = int.__hash__
+
+    class Name(str):
+        def __eq__(self, other):
+            tests[0] += 1
+            return str.__eq__(self, other)
+
+        __hash__ = str.__hash__
+
+    def counting(original, kind):
+        return lambda *a, **k: [kind(entry) for entry in original(*a, **k)]
 
     for module in (_keywords, _utils):
-        for name in ("find_evaluated_item_indexes_by_schema", "find_evaluated_property_keys_by_schema"):
+        for name, kind in (
+            ("find_evaluated_item_indexes_by_schema", Index),
+            ("find_evaluated_property_keys_by_schema", Name),
+        ):
             original = getattr(module, name, None)
             if original is not None:
-                monkeypatch.setattr(module, name, lambda *a, _o=original, **k: CountingList(_o(*a, **k)))
-    return scanned
+                monkeypatch.setattr(module, name, counting(original, kind))
+    return tests
 
 
 @pytest.mark.parametrize(
@@ -3195,12 +3214,20 @@ def _unevaluated_scan_work(monkeypatch):
         ("unevaluatedProperties", lambda n: {f"k{i}": None for i in range(n)}),
     ],
 )
-def test_unevaluated_keywords_scan_in_linear_time(monkeypatch, keyword, build):
-    scanned = _unevaluated_scan_work(monkeypatch)
+def test_unevaluated_keywords_test_membership_in_linear_time(monkeypatch, keyword, build):
+    tests = _unevaluated_membership_work(monkeypatch)
     schema = {"items": True, keyword: False} if keyword == "unevaluatedItems" else {"properties": {}, keyword: True}
+    counts = []
     for size in (2_000, 4_000, 8_000):
+        before = tests[0]
         _units_spent(schema, build(size))
-    assert scanned[0] == 0, scanned[0]  # it was quadratic: a scan of the evaluated entries for every item or key
+        counts.append(tests[0] - before)
+    assert counts[2] <= 2 * size_of(8_000), counts  # a hit costs one equality test; a list scan costs one per entry
+    assert counts[1] < 2.5 * counts[0] + 100 and counts[2] < 2.5 * counts[1] + 100, counts
+
+
+def size_of(n):
+    return n
 
 
 @pytest.mark.parametrize(
@@ -3228,3 +3255,40 @@ def test_an_unevaluated_message_over_a_large_instance_is_short():
     assert len(errors) == 1 and len(errors[0].message) < 300
     spent, errors = _units_spent({"prefixItems": [{"type": "integer"}], "unevaluatedItems": False}, [1] * 5_000)
     assert len(errors) == 1 and len(errors[0].message) < 300
+
+
+# ---- dependentRequired: every triggered dependency list is charged by its length
+
+def test_dependent_required_charges_each_triggered_list_by_its_length():
+    spent = []
+    for names in (1_000, 2_000, 4_000):
+        schema = {"allOf": [{"anyOf": [{"dependentRequired": {"x": [f"m{i}" for i in range(names)]}}, {}]}] * 50}
+        spent.append(_units_spent(schema, {"x": 1})[0])
+    first, second = spent[1] - spent[0], spent[2] - spent[1]
+    assert first >= 50 * 1_000 // 16 * 0.9 and 1.8 < second / first < 2.2, spent  # one unit per 16 names, per application
+    untriggered = _units_spent({"dependentRequired": {"y": [f"m{i}" for i in range(4_000)]}}, {"x": 1})[0]
+    assert untriggered < 100  # a dependency that is not triggered costs nothing beyond the keyword
+
+
+def test_a_triggered_dependency_list_over_many_items_is_charged_for_every_application():
+    names = [f"m{i}" for i in range(10_000)]
+    schema = {"type": "array", "items": {"anyOf": [{"dependentRequired": {"x": names}}, {}]}}
+    spent, errors = _units_spent(schema, [{"x": 1}] * 200)
+    assert errors == [] and spent >= 200 * (10_000 // 16)  # it was 8 units per application
+    request, result = _generation_with_output({"v": [{"x": 1}] * 2_000}, v=schema)
+    with pytest.raises(ValueError, match="exceeds its budget"):
+        validate_generation_result(request, result)  # 20 million names: refused rather than scanned
+
+
+def test_dependent_required_keeps_its_meaning_and_reports_one_bounded_error():
+    for dependencies, instance, valid in (
+        ({"x": ["a", "b"]}, {"x": 1, "a": 1, "b": 2}, True),
+        ({"x": ["a", "b"]}, {"x": 1, "a": 1}, False),
+        ({"x": ["a"]}, {"y": 1}, True),
+        ({"x": ["a"], "y": ["b"]}, {"x": 1, "a": 1, "y": 2}, False),
+    ):
+        spent, errors = _units_spent({"dependentRequired": dependencies}, instance)
+        assert (errors == []) is valid, (dependencies, instance)
+        assert len(errors) <= len(dependencies) and all(len(error.message) < 200 for error in errors)
+    spent, errors = _units_spent({"dependentRequired": {"x": [f"m{i}" for i in range(5_000)]}}, {"x": 1})
+    assert len(errors) == 1 and len(errors[0].message) < 200  # it was 5,000 errors
