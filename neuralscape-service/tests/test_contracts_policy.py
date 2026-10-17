@@ -4805,3 +4805,12 @@ def test_an_invalid_key_diagnostic_never_formats_a_hooked_type_name() -> None:
     assert repr(reference_module._OpaqueKey(Key())) == "<Key key>"
     assert calls == []
 
+
+def test_the_evaluator_denies_a_statement_with_an_unjudged_term(monkeypatch) -> None:
+    resource_value = reference("memory-1")
+    grant = statement("s", "allow", "read", resource_value)
+    assert evaluate(principal(), "read", resource_value, policy(grant)).outcome == "allow"
+    # the same statement, once one of its fields is no longer judged, must not authorize
+    monkeypatch.setattr(reference_module, "_JUDGED_STATEMENT_FIELDS", reference_module._JUDGED_STATEMENT_FIELDS - {"id"})
+    decision = evaluate(principal(), "read", resource_value, policy(grant))
+    assert (decision.outcome, decision.reason_code) == ("deny", "unsupported_policy_semantics")
