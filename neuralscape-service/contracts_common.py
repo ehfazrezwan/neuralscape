@@ -136,15 +136,11 @@ def _model_metadata(
 
     fields, fields_pure = _class_namespace_entry(model_type, "__pydantic_fields__", budget)
     config, config_pure = _class_namespace_entry(model_type, "model_config", budget)
-    pure = fields_pure and config_pure
     if type(fields) is not dict or (config is not None and type(config) is not dict):
-        fields, config, pure = model_type.model_fields, model_type.model_config, False
-        if not _is_subclass(type(fields), dict):
-            if not _is_subclass(type(fields), Mapping):
-                raise ValueError("contract model fields must be a mapping")
-            return _mapping_entries(fields, type(fields), budget), config, pure  # each entry charged as read
+        # A replaced or exotic store could only be read through the class, where caller code can run.
+        raise ValueError(_METADATA_REFUSAL)
     budget.charge_edge(dict.__len__(fields))  # type: ignore[arg-type]
-    return tuple(dict.items(fields)), config, pure  # type: ignore[arg-type]
+    return tuple(dict.items(fields)), config, fields_pure and config_pure  # type: ignore[arg-type]
 
 
 def _declared_metadata(
@@ -184,45 +180,54 @@ def _validation_alias_owners(
     hook-capable storage or keys), which makes the subtree ineligible for reuse.
     """
 
-    pure = type(config) is dict or config is None
+    pure = True
+    validate_by_alias = None
     if type(config) is dict:
         budget.charge_edge(dict.__len__(config))
         validate_by_alias, _found, config_pure = _exact_entry(dict.items(config), "validate_by_alias")
-        pure = pure and config_pure
-    else:
-        validate_by_alias = None if config is None else config.get("validate_by_alias")  # type: ignore[attr-defined]
+        pure = config_pure
+    elif config is not None:
+        raise ValueError(_METADATA_REFUSAL)
     if validate_by_alias is False:
         return {}, pure
 
     owners: dict[str, set[str]] = {}
     budget.charge_edge(len(fields))  # this walk scans every declared field again: charged again
-    for field_name, field in fields:  # the copy: a hook run by a field or alias cannot change what is walked
+    for field_name, field in fields:  # the copy: nothing read here can change what is walked
         if not _is_subclass(type(field_name), str):
-            pure = False  # a non-text name can hash or compare through caller code: never hashed, never reused
+            pure = False  # a non-text name can hash or compare through caller code: never hashed
             continue
+        # Only pydantic's own field and alias types are read, through their own slots: a subclass could
+        # run code from a property while the metadata is read, before the input's storage is all captured.
         if type(field) is not FieldInfo:
-            pure = False
-        validation_alias = field.validation_alias  # type: ignore[attr-defined]
-        if _is_subclass(type(validation_alias), AliasChoices):
-            pure = pure and type(validation_alias) is AliasChoices
-            choices, choices_pure = _native_sequence(validation_alias.choices, budget)
+            raise ValueError(_METADATA_REFUSAL)
+        validation_alias = object.__getattribute__(field, "validation_alias")
+        if type(validation_alias) is AliasChoices:
+            choices, choices_pure = _native_sequence(object.__getattribute__(validation_alias, "choices"), budget)
             pure = pure and choices_pure
+        elif _is_subclass(type(validation_alias), (AliasChoices, AliasPath)) and type(validation_alias) is not AliasPath:
+            raise ValueError(_METADATA_REFUSAL)
         else:
             choices = (validation_alias,)
         name = _text(field_name)
         for choice in choices:
             if _is_subclass(type(choice), str):
                 owners.setdefault(_text(choice), set()).add(name)  # type: ignore[arg-type]
-            elif _is_subclass(type(choice), AliasPath):
-                pure = pure and type(choice) is AliasPath
-                path, path_pure = _native_sequence(choice.path, budget)
+            elif type(choice) is AliasPath:
+                path, path_pure = _native_sequence(object.__getattribute__(choice, "path"), budget)
                 pure = pure and path_pure
                 root = path[0] if path else None
                 if _is_subclass(type(root), str):
                     owners.setdefault(_text(root), set()).add(name)  # type: ignore[arg-type]
+            elif choice is not None:
+                raise ValueError(_METADATA_REFUSAL)  # an alias subclass, or anything else
     return owners, pure
 
 
+_METADATA_REFUSAL = (
+    "contract model metadata must use pydantic's own field, alias and configuration types "
+    "(a subclass or replacement could run code while it is read)"
+)
 _TYPE_MRO = vars(type)["__mro__"]
 _CLASS_NAMESPACE = vars(type)["__dict__"]
 _MAPPING_BASES = (Mapping, dict, MappingProxyType)

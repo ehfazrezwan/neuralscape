@@ -4375,3 +4375,19 @@ def test_a_text_subclass_that_spells_the_literal_reaches_validation_as_plain_tex
 
     assert result == reconcile_usage_events([_event()])
     assert type(result.streams[0].ledger) is str and type(result.streams[0].head_event_id) is str
+
+
+def test_containers_exposed_only_by_a_public_view_are_charged_as_nodes() -> None:
+    from contracts_limits import STANDARD
+
+    count = STANDARD.max_nodes + 1
+
+    class PublicOnly(list):  # empty native backing; the public view exposes the containers
+        def __iter__(self):
+            return iter([[] for _ in range(count)])
+
+    with pytest.raises(ValueError, match=run_discovery_message()):
+        usage_reconcile_contracts._native_snapshot({"k": [[] for _ in range(count)]})  # native-backed: refused
+    with pytest.raises(ValueError, match=run_discovery_message()):
+        usage_reconcile_contracts._native_snapshot({"k": PublicOnly()})  # public-only: the same limit
+    assert len(usage_reconcile_contracts._native_snapshot({"k": [[] for _ in range(10)]})["k"]) == 10

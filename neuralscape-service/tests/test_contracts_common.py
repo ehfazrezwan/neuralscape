@@ -3790,7 +3790,7 @@ def test_a_str_subclass_validation_alias_runs_no_hook_and_cannot_skew_later_view
     assert snapshot[1] == snapshot[3] == [0]
 
 
-def test_an_alias_whose_read_runs_code_is_read_once_per_call_before_any_view() -> None:
+def test_an_alias_whose_read_runs_code_is_refused_without_running_it() -> None:
     from pydantic import AliasPath, Field
 
     counter = [0]
@@ -3809,13 +3809,10 @@ def test_an_alias_whose_read_runs_code_is_read_once_per_call_before_any_view() -
         a: int = Field(1, validation_alias=CountingPath("root_a", 0))
 
     model = Aliased()
-    view = _counter_view(counter)
-    counter[0] = 0
-    snapshot = snapshot_contract_graph([model, view, model, view])
-    # the class is snapshotted once, at capture: its alias hook runs once, before either view is read,
-    # and both observations of the view agree with that
-    assert counter[0] == 1
-    assert snapshot[1] == snapshot[3] == [1]
+    counter[0] = 0  # pydantic read the alias while it built the class; only the snapshot is under test
+    with pytest.raises(ValueError, match="metadata"):
+        snapshot_contract_graph([model, _counter_view(counter), model])
+    assert counter[0] == 0  # refused by its type, never read through its property
 
 
 # ── reading configuration and alias storage runs no caller hook (or the subtree is not reused) ──
@@ -4150,7 +4147,7 @@ def test_a_replaced_declared_field_table_is_refused_before_it_is_copied() -> Non
     model = Replaced()
     tracemalloc.start()
     try:
-        with pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):
+        with pytest.raises(ValueError, match="metadata"):  # a replaced table is refused by its type
             snapshot_contract_graph(model)
         _current, peak = tracemalloc.get_traced_memory()
     finally:
@@ -4205,4 +4202,76 @@ def test_a_metadata_hook_that_grows_the_declared_table_cannot_break_the_scan(hoo
 
         object.__setattr__(fields["a"], "validation_alias", GrowingPath.__new__(GrowingPath))
 
-    assert snapshot_contract_graph(Model()) == {"a": 1, "b": 2}  # used to raise "dictionary changed size"
+    size = len(fields)
+    with pytest.raises(ValueError, match="metadata"):  # hook-capable metadata types are refused, never read
+        snapshot_contract_graph(Model())
+    assert len(fields) == size  # no hook ran
+
+
+# ── metadata reading runs no caller code at all: hook-capable metadata types are refused ──
+
+
+def test_a_metadata_hook_cannot_repair_a_sibling_before_it_is_captured() -> None:
+    from pydantic import AliasPath, Field
+
+    class Counted(BaseModel):
+        count: int = 0
+
+    sibling = Counted()
+    vars(BaseModel)["__dict__"].__get__(sibling, BaseModel)["count"] = -1  # unchecked, invalid
+
+    armed = [False]
+
+    class RepairingPath(AliasPath):
+        @property
+        def path(self):
+            if armed[0]:  # pydantic reads the alias while it builds the class: only the snapshot is under test
+                vars(BaseModel)["__dict__"].__get__(sibling, BaseModel)["count"] = 1  # repairs the sibling
+            return ["root_a", 0]
+
+        @path.setter
+        def path(self, value):
+            pass
+
+    class Aliased(BaseModel):
+        a: int = Field(1, validation_alias=RepairingPath("root_a", 0))
+
+    model = Aliased()
+    armed[0] = True
+    with pytest.raises(ValueError, match="metadata"):
+        snapshot_contract_graph([model, sibling])
+    assert vars(BaseModel)["__dict__"].__get__(sibling, BaseModel)["count"] == -1  # no hook ran
+
+
+@pytest.mark.parametrize("shape", ["field-subclass", "choices-subclass", "fields-dict-subclass", "config-not-dict"])
+def test_hook_capable_metadata_types_are_refused(shape) -> None:
+    from pydantic import AliasChoices, Field
+    from pydantic.fields import FieldInfo
+
+    class Model(BaseModel):
+        a: int = Field(1, validation_alias="alias_a")
+
+    if shape == "field-subclass":
+        class Sub(FieldInfo):
+            __slots__ = ()
+        fields = vars(Model)["__pydantic_fields__"]
+        replacement = Sub.__new__(Sub)
+        for slot in FieldInfo.__slots__:
+            try:
+                object.__setattr__(replacement, slot, object.__getattribute__(fields["a"], slot))
+            except AttributeError:
+                pass
+        dict.__setitem__(fields, "a", replacement)
+    elif shape == "choices-subclass":
+        class Choices(AliasChoices):
+            pass
+        object.__setattr__(vars(Model)["__pydantic_fields__"]["a"], "validation_alias", Choices("x", "y"))
+    elif shape == "fields-dict-subclass":
+        class Table(dict):
+            pass
+        type.__setattr__(Model, "__pydantic_fields__", Table(vars(Model)["__pydantic_fields__"]))
+    else:
+        from types import MappingProxyType
+        type.__setattr__(Model, "model_config", MappingProxyType(dict(vars(Model)["model_config"])))
+    with pytest.raises(ValueError, match="metadata"):
+        snapshot_contract_graph(Model())

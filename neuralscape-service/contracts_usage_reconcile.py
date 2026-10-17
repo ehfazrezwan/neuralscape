@@ -693,6 +693,12 @@ def _snapshot_uncached(
         # so it cannot match a literal it does not spell.
         return _plain_name(value)
 
+    # A container first met here (exposed only by a public view) is charged as a node, like any natively
+    # reachable one; its entries are charged as its view is read.  It is not frozen natively: a subtree a
+    # public view exposed keeps that view authoritative.  (Models and tuples are frozen, and charged, by
+    # their own branches below; charging is by identity, so an already captured container costs nothing.)
+    if not is_native_instance(value, BaseModel, tuple):
+        budget.charge_node(value)
     identity = id(value)
     if identity in active:
         raise ValueError("cyclic input graph")
