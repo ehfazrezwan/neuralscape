@@ -3719,3 +3719,76 @@ def test_a_height_found_late_inside_late_extras_reaches_the_outer_model_and_its_
     siblings = [hidden, outer] if hidden_first else [outer, hidden]
     with pytest.raises(ValueError, match="budget"):
         snapshot_contract_graph(siblings)
+
+
+# ---- the enum-annotation helper runs on every supported Python (on 3.10 ``list[int]`` is an instance of ``type``)
+
+def test_the_enum_annotation_helper_handles_generic_aliases_and_unions() -> None:
+    import enum
+    import typing
+
+    from contracts_common import _annotation_holds_enum
+
+    class Color(enum.Enum):
+        RED = "red"
+
+    class Plain:
+        pass
+
+    holds = [
+        Color,
+        list[Color],
+        tuple[Color, ...],
+        tuple[str, Color],
+        dict[str, Color],
+        dict[Color, int],
+        Color | None,
+        typing.Optional[Color],
+        typing.Union[int, Color],
+        typing.Annotated[Color, "note"],
+        list[dict[str, tuple[Color, ...]]],
+        typing.Annotated[list[Color], "note"],
+    ]
+    does_not = [
+        Plain,
+        str,
+        int,
+        list,
+        list[int],
+        tuple[str, ...],
+        dict[str, int],
+        int | None,
+        typing.Optional[str],
+        typing.Annotated[str, "note"],
+        typing.Any,
+        typing.Literal["a"],
+        None,
+        list[Plain],
+    ]
+    for annotation in holds:
+        assert _annotation_holds_enum(annotation) is True, annotation
+    for annotation in does_not:
+        assert _annotation_holds_enum(annotation) is False, annotation
+
+
+def test_a_model_with_generic_enum_annotations_defines_and_records_its_enum_fields() -> None:
+    import enum
+    import typing
+
+    from contracts_common import ContractModel
+
+    class Color(enum.Enum):
+        RED = "red"
+
+    class Holder(ContractModel):
+        one: Color
+        many: list[Color]
+        fixed: tuple[Color, ...]
+        mapping: dict[str, Color]
+        maybe: Color | None = None
+        optional: typing.Optional[Color] = None
+        annotated: typing.Annotated[Color, "note"] = Color.RED
+        text: str = ""
+        numbers: list[int] = []
+
+    assert set(Holder._enum_field_names) == {"one", "many", "fixed", "mapping", "maybe", "optional", "annotated"}
