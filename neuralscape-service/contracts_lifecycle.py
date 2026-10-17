@@ -78,8 +78,7 @@ def _require_distinct_key_text(
         elif memo is not None and memo[0] is key:
             text = memo[1]  # this key's text, copied when it was first met: no walk of its class again
         elif _is_text_key_class(type(key), captured_by_identity, budget):
-            text = str.__str__(key)
-            captured_by_identity[(_KEY_TEXT, id(key))] = (key, text)
+            text = _subclass_key_text(key, captured_by_identity)
         elif _is_exact_native_kind(type(key)):
             if type(key) is int:
                 budget.charge_edge(int.bit_length(key) >> 12)  # one edge per 4,096 bits hashed
@@ -91,6 +90,18 @@ def _require_distinct_key_text(
         seen.add(text)
         keyed.append((text, item))
     return tuple(keyed)
+
+
+def _subclass_key_text(key: object, captured_by_identity: dict[Any, Any]) -> str:
+    """A ``str``-subclass key's exact text, copied once per key object per call (kept with the key, so its
+    ``id()`` is not recycled): every container and every class scan holding the key shares the one copy."""
+
+    memo = captured_by_identity.get((_KEY_TEXT, id(key)))
+    if memo is not None and memo[0] is key:
+        return memo[1]
+    text = str.__str__(key)
+    captured_by_identity[(_KEY_TEXT, id(key))] = (key, text)
+    return text
 
 
 def _is_text_key_class(kind: type, captured_by_identity: dict[Any, Any], budget: DiscoveryBudget) -> bool:
@@ -308,8 +319,9 @@ def _declared_field_names(model_type: type, captured_by_identity: dict[Any, Any]
         fields = _namespace_value(_TYPE_NAMESPACE.__get__(base), "__pydantic_fields__", budget)
         if type(fields) is dict:
             budget.charge_edge(dict.__len__(fields))  # one edge per declared name read
+            # A subclass key's text comes from the per-key cache, so classes sharing one table share its copies.
             names = frozenset(
-                str.__str__(key)
+                key if type(key) is str else _subclass_key_text(key, captured_by_identity)
                 for key in dict.keys(fields)
                 if type(key) is str or _is_text_key_class(type(key), captured_by_identity, budget)
             )

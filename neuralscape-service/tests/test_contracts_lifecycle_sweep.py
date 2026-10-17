@@ -2533,3 +2533,37 @@ def test_namespace_keys_of_one_deep_text_class_walk_it_once_and_are_charged(monk
     flat = DiscoveryBudget(contracts_lifecycle.LIFECYCLE_TIER)
     contracts_lifecycle._capture_native_contract_graph((shallow("x"),), budget=flat)
     assert budget.edges - flat.edges >= 200  # the deep key class's one walk is charged
+
+
+def test_model_classes_sharing_a_field_table_share_one_copy_of_each_subclass_key():
+    """Each class's declared-name set is kept per class, but a ``str``-subclass key's text is copied once per call
+    and shared: 200 classes sharing one table with a 256 KiB subclass key keep one copy, not 200."""
+
+    import tracemalloc
+
+    from tests.test_contracts_lifecycle import intent_with_requirements, requirement, source
+
+    class Text(str):
+        pass
+
+    table = {Text("k" * (256 * 1024)): None}
+    table.update(SourceVersion.__pydantic_fields__)
+    sources = []
+    for index in range(200):
+        kind = type(f"SharedTable{index}", (SourceVersion,), {})
+        type.__setattr__(kind, "__pydantic_fields__", table)
+        item = SourceVersion.model_construct(**vars(source(f"t{index}")))
+        object.__setattr__(item, "__class__", kind)
+        EXTRA.__set__(item, {"extra_note": 1})  # forces the declared-name check
+        sources.append(item)
+    command = intent_with_requirements(requirement(ProcessingStage.CANONICAL))
+    applied = receipt(ProcessingStage.CANONICAL, StageStatus.APPLIED)
+    set_native(applied, "applied_sources", tuple(sources))
+    tracemalloc.start()
+    try:
+        with pytest.raises(ValueError):
+            contracts_lifecycle.validate_stage_receipts(command, (applied,))
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert peak < 8 * 2**20, peak  # one 256 KiB text, not one per class (50 MiB)
