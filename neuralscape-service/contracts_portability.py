@@ -1043,13 +1043,13 @@ def _plain_text_keys(document: Any) -> Any:
     native storage frozen and every public view of a container subclass or custom mapping observed once
     and charged, under one budget, before anything is rebuilt: a callback met while one part is read
     cannot repair another part that has not been snapshotted yet.  The copy is then rebuilt from those
-    snapshots only.  A key that is a ``str`` subclass is read as its text without running its hooks, and
-    two keys with one text are refused (see ``_reconstruct_retained_state``).  Anything that is not a
-    container is left to the schema.
+    snapshots only.  Anything that is not a dict is refused here: handed on, the schema's own instance check
+    honours ``__class__``, so an object claiming to be a manifest or a mapping would be read by its own
+    attribute hooks inside validation.
     """
 
     if not _inherits(document, dict):
-        return document  # not a mapping: the schema refuses it
+        raise TypeError("a portable manifest must be a PortableManifest or a mapping")
     state = _CallState()
     inventory = _reject_retained_unknown_fields(document, state)  # type: ignore[arg-type]
     return _reconstruct_retained_state(document, inventory, state)  # type: ignore[arg-type]

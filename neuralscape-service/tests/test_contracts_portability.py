@@ -4802,3 +4802,36 @@ def test_every_sibling_permutation_gets_the_same_depth_outcome(monkeypatch, limi
             validate_portable_manifest(manifest)
         outcomes.add(str(raised.value.__cause__) == DISCOVERY_BUDGET_MESSAGE)
     assert len(outcomes) == 1, outcomes  # budget refusal for all orders, or for none
+
+
+# ---- an input that is neither a manifest nor a mapping is refused without the schema reading it
+
+class _ClassLiar:
+    """Not a manifest, but claims to be one through ``__class__`` (which an instance check honours)."""
+
+    reads: list[str] = []
+
+    def __init__(self, claimed):
+        object.__setattr__(self, "_claimed", claimed)
+
+    def __getattribute__(self, name):
+        _ClassLiar.reads.append(name)
+        if name == "__class__":
+            return object.__getattribute__(self, "_claimed")
+        return object.__getattribute__(self, name)
+
+
+@pytest.mark.parametrize("claimed", [PortableManifest, dict, list])
+def test_an_object_claiming_a_class_is_refused_as_a_validation_error_without_a_read(claimed) -> None:
+    liar = _ClassLiar(claimed)
+    _ClassLiar.reads.clear()
+    with pytest.raises(ValidationError):
+        validate_portable_manifest(liar)
+    assert _ClassLiar.reads == [], _ClassLiar.reads  # no attribute of the object is read by the refusal
+
+
+@pytest.mark.parametrize("document", [None, 7, "text", b"bytes", ["a"], ("a",), {"a"}, object()])
+def test_other_inputs_are_still_refused_as_validation_errors(document) -> None:
+    with pytest.raises(ValidationError) as raised:
+        validate_portable_manifest(document)
+    assert raised.value.errors()  # a bounded, value-free refusal
