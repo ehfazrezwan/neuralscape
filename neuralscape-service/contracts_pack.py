@@ -342,6 +342,9 @@ _LIMIT_MESSAGE = "$: unverified change: finding limit reached; further findings 
 _BUDGET_MESSAGE = "$: unverified change: comparison budget exhausted; compatibility not verified (needs a version bump or a reviewer waiver)"
 
 
+_NO_ASSUMPTION = 1 << 30
+
+
 class _BudgetExhausted(Exception):
     pass
 
@@ -351,6 +354,11 @@ class _Run:
 
     def __init__(self) -> None:
         self.steps = 0
+        # The lowest position, in the stack of references being compared, of a recursive reference assumed
+        # compatible since the current frame began.  A pair that came out clean only because of an assumption
+        # about a reference *above* it has proved nothing about itself, so it is not remembered as clean; an
+        # assumption about itself or a reference below it is settled by the time it finishes.
+        self.lowest_assumed = _NO_ASSUMPTION
         # A pair that produced findings remembers them relative to its own path, so another path to the same
         # shared definition reports them again (bounded) without walking it again.
         self.dirty: dict[tuple[int, int, int, int], tuple[tuple[object, ...], list[str]]] = {}
@@ -449,7 +457,7 @@ _ABSENT = {"$absent": True}
 
 
 def _alternatives_equivalent(
-    old: object, new: object, old_defs: dict, new_defs: dict, path: str, depth: int, active: frozenset
+    old: object, new: object, old_defs: dict, new_defs: dict, path: str, depth: int, active: tuple
 ) -> bool:
     if not (isinstance(old, list) and isinstance(new, list) and len(old) == len(new)):
         return False
@@ -471,11 +479,12 @@ def _compare(
     path: str,
     out: list[str],
     depth: int = 0,
-    active: frozenset[tuple[str, str]] = frozenset(),
+    active: tuple[tuple[str, str], ...] = (),
 ) -> None:
     if depth > _MAX_COMPARE_DEPTH:
         out.append(f"{path}: schema nesting exceeds the comparison depth limit; compatibility not verified")
         return
+    base = len(active)  # references already being compared above this node
     if isinstance(old, dict) and isinstance(new, dict) and "$ref" in old and "$ref" in new:
         # Constraints beside this reference are compared before any shortcut: a recursive reference
         # already being compared is assumed compatible, but only for its target, never for siblings.
@@ -483,8 +492,11 @@ def _compare(
             out.append(_unverified(path, "constraints beside a $ref changed"))
         pair = (str(old["$ref"]), str(new["$ref"]))
         if pair in active:
+            run = _RUN.get()
+            if run is not None:  # assumed compatible: remember how far up the stack that assumption reaches
+                run.lowest_assumed = min(run.lowest_assumed, active.index(pair))
             return
-        active = active | {pair}
+        active = (*active, pair)
     old, old_beside = _resolve(old, old_defs)
     new, new_beside = _resolve(new, new_defs)
     if (old_beside or new_beside) and not _same(old_beside, new_beside, old_defs, new_defs):
@@ -503,7 +515,7 @@ def _compare(
     for key in sorted((set(old) | set(new)) - _MODELED - _ANNOTATIONS):
         if not _same(old.get(key, _ABSENT), new.get(key, _ABSENT), old_defs, new_defs):
             out.append(_unverified(path, f"{key} changed"))
-    _compare_checked(old, new, old_defs, new_defs, path, out, depth, active)
+    _compare_checked(old, new, old_defs, new_defs, path, out, depth, active, base)
 
 
 def _compare_checked(
@@ -514,7 +526,8 @@ def _compare_checked(
     path: str,
     out: list[str],
     depth: int,
-    active: frozenset[tuple[str, str]],
+    active: tuple[tuple[str, str], ...],
+    base: int,
 ) -> None:
     """The keyword-by-keyword comparison of two resolved schemas, skipped for a pair already shown compatible.
 
@@ -535,9 +548,15 @@ def _compare_checked(
         if run.steps > _MAX_COMPARISONS:
             raise _BudgetExhausted
     before = len(out)
+    outer = _NO_ASSUMPTION
+    if run is not None:
+        outer, run.lowest_assumed = run.lowest_assumed, _NO_ASSUMPTION
     _compare_keywords(old, new, old_defs, new_defs, path, out, depth, active)
     if run is not None:
+        lowest, run.lowest_assumed = run.lowest_assumed, min(outer, run.lowest_assumed)
         if len(out) == before:
+            if lowest < base:
+                return  # clean only under an assumption about a reference above this pair
             run.clean[key] = (old, new, old_defs, new_defs)
         else:
             suffixes = [f[len(path):] for f in out[before:before + _MAX_PAIR_FINDINGS] if f.startswith(path)]
@@ -564,7 +583,7 @@ def _compare_keywords(
     path: str,
     out: list[str],
     depth: int,
-    active: frozenset[tuple[str, str]],
+    active: tuple[tuple[str, str], ...],
 ) -> None:
     old_unions = {key: old[key] for key in _UNION_KEYS if old.get(key)}
     new_unions = {key: new[key] for key in _UNION_KEYS if new.get(key)}

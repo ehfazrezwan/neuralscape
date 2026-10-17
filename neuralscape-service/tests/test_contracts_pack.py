@@ -1013,3 +1013,93 @@ def test_a_boolean_root_schema_is_compared_not_crashed_on() -> None:
     assert _pair(True, {"type": "string"}), "everything was valid, now only strings"
     assert _pair({"type": "string"}, False)
     assert _pair(True, True) == []
+
+
+# ---------------------------------- a pair compared clean under a recursive assumption is not a fact about that pair
+
+
+def _ref(name: str) -> dict:
+    return {"$ref": f"#/$defs/{name}"}
+
+
+def _mutual_recursion(narrowed: bool, alternatives: list[str], *, as_property: bool = False) -> dict:
+    """A = {x: B, n}, B = {y: A} (recursive); A2/B2 an independent wider copy; W = {a: A, b: B}; C2 = {a: A2, b: B}."""
+
+    leaf = {"type": "string", "maxLength": 1} if narrowed else {"type": "string"}
+    defs = {
+        "A": {"type": "object", "properties": {"x": _ref("B"), "n": leaf}},
+        "B": {"type": "object", "properties": {"y": _ref("A")}},
+        "A2": {"type": "object", "properties": {"x": _ref("B2"), "n": {"type": "string"}}},
+        "B2": {"type": "object", "properties": {"y": _ref("A2")}},
+        "W": {"type": "object", "properties": {"a": _ref("A"), "b": _ref("B")}},
+        "C2": {"type": "object", "properties": {"a": _ref("A2"), "b": _ref("B")}},
+    }
+    properties = {"a": _ref("A"), "b": _ref("B")} if as_property else {"f": {"anyOf": [_ref(name) for name in alternatives]}}
+    return {"$defs": defs, "type": "object", "properties": properties}
+
+
+def test_a_candidate_whose_match_rested_on_a_recursive_assumption_is_not_accepted_later() -> None:
+    old = _mutual_recursion(False, ["W"])
+    new = _mutual_recursion(True, ["W", "C2"])
+    findings = _pair(old, new)
+    assert any("no longer accepted" in f for f in findings), findings  # was [] when the memo reused B against B'
+    control = _pair(old, _mutual_recursion(True, ["C2"]))
+    assert any("no longer accepted" in f for f in control)
+
+
+def test_every_path_to_a_narrowed_definition_is_reported_through_a_recursive_pair() -> None:
+    findings = _pair(_mutual_recursion(False, [], as_property=True), _mutual_recursion(True, [], as_property=True))
+    assert {"$.a.n: maxLength lowered", "$.b.y.n: maxLength lowered"} <= set(findings), findings
+
+
+def test_recursive_schemas_that_did_not_change_stay_clean_and_a_real_narrowing_is_still_found() -> None:
+    clean = _mutual_recursion(False, ["W", "C2"])
+    assert _pair(clean, _mutual_recursion(False, ["W", "C2"])) == []
+    assert _pair(_mutual_recursion(False, [], as_property=True), _mutual_recursion(False, [], as_property=True)) == []
+
+
+def _recursive_diamond(levels: int) -> dict:
+    defs = {"L0": {"type": "object", "properties": {"back": _ref(f"L{levels}"), "v": {"type": "string"}}}}
+    for level in range(1, levels + 1):
+        defs[f"L{level}"] = {"type": "object", "properties": {"a": _ref(f"L{level - 1}"), "b": _ref(f"L{level - 1}")}}
+    return {"$defs": defs, "$ref": f"#/$defs/L{levels}"}
+
+
+def test_a_recursive_diamond_is_bounded_and_never_reported_compatible_wrongly() -> None:
+    findings, seconds = _timed(_recursive_diamond(24), _recursive_diamond(24))
+    assert seconds < 8.0, seconds
+    assert findings == [] or any("budget exhausted" in f for f in findings), findings  # fail closed when it cannot finish
+    narrowed = _recursive_diamond(12)
+    narrowed["$defs"]["L0"]["properties"]["v"] = {"type": "string", "maxLength": 1}
+    findings, seconds = _timed(_recursive_diamond(12), narrowed)
+    assert findings and seconds < 8.0, (findings[:2], seconds)
+
+
+def _nested_mutual_recursion(narrowed: bool, alternatives: list[str]) -> dict:
+    """Like ``_mutual_recursion`` but the way back to A runs through an inline object, so the assumption is
+    made two frames below the pair that depends on it."""
+
+    schema = _mutual_recursion(narrowed, alternatives)
+    schema["$defs"]["B"] = {"type": "object", "properties": {"y": {"type": "object", "properties": {"z": _ref("A")}}}}
+    schema["$defs"]["B2"] = {"type": "object", "properties": {"y": {"type": "object", "properties": {"z": _ref("A2")}}}}
+    return schema
+
+
+def test_an_assumption_made_deeper_than_the_dependent_pair_still_blocks_its_reuse() -> None:
+    findings = _pair(_nested_mutual_recursion(False, ["W"]), _nested_mutual_recursion(True, ["W", "C2"]))
+    assert any("no longer accepted" in f for f in findings), findings
+
+
+def test_a_self_recursive_definition_used_on_two_paths_is_compared_once(monkeypatch) -> None:
+    calls = {"count": 0}
+    real = pack._compare_keywords
+
+    def counting(*args, **kwargs):
+        calls["count"] += 1
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(pack, "_compare_keywords", counting)
+    node = {"type": "object", "properties": {"child": _ref("Node"), "label": {"type": "string"}}}
+    schema = {"$defs": {"Node": node}, "type": "object", "properties": {f"p{i}": _ref("Node") for i in range(30)}}
+    assert _pair(schema, {**schema, "$defs": {"Node": dict(node)}}) == []
+    assert calls["count"] < 10, calls  # 30 uses of one recursive definition, each settled once it is compared
