@@ -3960,3 +3960,241 @@ def test_reconciliation_derives_only_from_the_first_observed_snapshot() -> None:
     first_view["value"] = 7
     assert result.model_dump(mode="json") == snapshot
     assert flipping.items_calls == 1
+
+
+# ---- two native name stores are one namespace, compared as plain text
+
+class _SameTextKey(str):
+    """Reads as the same text as another key but never compares or hashes like it."""
+
+    def __hash__(self) -> int:
+        return id(self)
+
+    def __eq__(self, other: object) -> bool:
+        return self is other
+
+    def __ne__(self, other: object) -> bool:
+        return self is not other
+
+
+def _event_with_extra_name(extra_name: str, *, stored_name: str | None = None):
+    event = _event()
+    if stored_name is not None:
+        assert stored_name in event.__dict__
+    object.__setattr__(event, "__pydantic_extra__", {extra_name: "duplicate"})
+    return event
+
+
+def test_a_text_subclass_key_in_native_extras_cannot_duplicate_a_stored_field() -> None:
+    event = _event_with_extra_name(_SameTextKey("event_id"), stored_name="event_id")
+    with pytest.raises(ValueError, match="extra storage overlaps stored fields"):
+        usage_reconcile_contracts._native_snapshot(event)
+    _assert_canonical_invalid_event(event)
+
+
+def test_a_plain_duplicate_between_model_storage_and_extras_is_still_refused() -> None:
+    event = _event_with_extra_name("event_id", stored_name="event_id")
+    with pytest.raises(ValueError, match="extra storage overlaps stored fields"):
+        usage_reconcile_contracts._native_snapshot(event)
+
+
+def test_a_text_subclass_key_in_public_extras_cannot_duplicate_a_stored_field() -> None:
+    from collections.abc import Mapping
+
+    class PublicExtras(Mapping):
+        def __init__(self, key):
+            self.key = key
+
+        def __getitem__(self, name):
+            return "duplicate"
+
+        def __iter__(self):
+            return iter((self.key,))
+
+        def __len__(self):
+            return 1
+
+    event = _event()
+    object.__setattr__(event, "__pydantic_extra__", PublicExtras(_SameTextKey("event_id")))
+    with pytest.raises(ValueError, match="extra storage overlaps stored fields"):
+        usage_reconcile_contracts._native_snapshot(event)
+
+
+def test_a_stored_text_subclass_name_is_emitted_as_plain_text() -> None:
+    event = _event()
+    value = event.__dict__.pop("event_id")
+    event.__dict__[_SameTextKey("event_id")] = value
+    snapshot = usage_reconcile_contracts._native_snapshot(event)
+    assert all(type(key) is str for key in snapshot) and "event_id" in snapshot
+
+
+def test_a_dict_with_two_keys_of_one_text_is_refused_by_the_snapshot() -> None:
+    document = {"event_id": "event-1", _SameTextKey("event_id"): "event-2"}
+    result = usage_reconcile_contracts._native_snapshot(document)
+    assert isinstance(result, usage_reconcile_contracts._FailedNativeDictTraversal)
+
+
+def test_a_public_mapping_with_a_repeated_text_is_refused_by_the_snapshot() -> None:
+    from collections.abc import Mapping
+
+    class View(Mapping):
+        def __getitem__(self, key):
+            return 1
+
+        def __iter__(self):
+            return iter(("event_id", _SameTextKey("event_id")))
+
+        def __len__(self):
+            return 2
+
+        def items(self):
+            yield ("event_id", 1)
+            yield (_SameTextKey("event_id"), 2)
+
+    assert isinstance(usage_reconcile_contracts._native_snapshot(View()), usage_reconcile_contracts._FailedNativeDictTraversal)
+
+
+def test_a_lone_text_subclass_key_in_a_mapping_is_emitted_as_plain_text() -> None:
+    result = usage_reconcile_contracts._native_snapshot({_SameTextKey("event_id"): "event-1"})
+    assert result == {"event_id": "event-1"} and all(type(key) is str for key in result)
+
+
+# ---- type gates classify by the object's real type, never by its own ``__class__``
+
+@pytest.mark.parametrize("claimed", [BaseModel, dict, list, set])
+def test_a_container_claiming_a_node_class_is_snapshotted_as_what_it_is(claimed: type) -> None:
+    class Tuple(tuple):
+        @property
+        def __class__(self):  # type: ignore[override]
+            return claimed
+
+    result = usage_reconcile_contracts._native_snapshot(Tuple((1, 2)))
+    assert result == (1, 2) and type(result) is tuple
+
+
+def test_a_container_claiming_a_model_class_is_a_validation_error_for_a_result_receiver() -> None:
+    class Tuple(tuple):
+        @property
+        def __class__(self):  # type: ignore[override]
+            return BaseModel
+
+    with pytest.raises(ValueError):  # ValidationError is a ValueError; a KeyError or AttributeError is a leak
+        ReconciledUsageStream.model_validate({"usage": Tuple()})
+
+
+# ---- a set holding a mapping is a validation error, not an unhashable-type leak
+
+@pytest.mark.parametrize("shape", ["mapping-in-frozenset", "mapping-in-tuple-in-set"])
+@pytest.mark.parametrize("receiver", [ReconciledUsageStream, UsageReconciliation])
+def test_a_set_holding_a_mapping_is_a_validation_error_for_a_result_receiver(shape: str, receiver) -> None:
+    from collections.abc import Mapping
+
+    class HashableMapping(Mapping):
+        def __getitem__(self, key):
+            return {"a": 1}[key]
+
+        def __iter__(self):
+            return iter(("a",))
+
+        def __len__(self):
+            return 1
+
+        def __hash__(self) -> int:
+            return 1
+
+    member = HashableMapping()
+    value = frozenset({member}) if shape == "mapping-in-frozenset" else {(member,)}
+    field = "streams" if receiver is UsageReconciliation else "usage"
+    with pytest.raises(ValueError):  # ValidationError is a ValueError; a TypeError is the leak
+        receiver.model_validate({field: value})
+
+
+# ---- the usage snapshot has a discovery envelope: depth and public-view breadth
+
+def test_deep_nesting_is_a_validation_error_for_a_result_receiver() -> None:
+    node: object = ()
+    for _ in range(20_000):
+        node = (node,)
+    with pytest.raises(ValueError):  # a RecursionError is the leak
+        ReconciledUsageStream.model_validate({"usage": node})
+
+
+@pytest.mark.parametrize("kind", ["list-view", "dict-items-view", "public-mapping", "set-view"])
+def test_a_public_view_is_not_read_past_a_bounded_number_of_entries(kind: str) -> None:
+    from collections.abc import Mapping
+
+    produced = {"n": 0}
+    limit = 400_000
+
+    def endless():
+        while produced["n"] < limit:
+            produced["n"] += 1
+            yield produced["n"]
+
+    class ListView(list):
+        def __iter__(self):
+            return endless()
+
+    class DictView(dict):
+        def items(self):
+            return ((k, k) for k in endless())
+
+    class PublicMapping(Mapping):
+        def __getitem__(self, key):
+            return key
+
+        def __iter__(self):
+            return endless()
+
+        def __len__(self):
+            return 0
+
+        def items(self):
+            return ((k, k) for k in endless())
+
+    class SetView(set):
+        def __iter__(self):
+            return endless()
+
+    value = {"list-view": ListView(), "dict-items-view": DictView(), "public-mapping": PublicMapping(), "set-view": SetView()}[kind]
+    with pytest.raises(ValueError):
+        usage_reconcile_contracts._native_snapshot({"k": value})
+    assert produced["n"] < limit, "the view was read to its end"
+
+
+# ---- public views share one envelope: views that each fit the limit but together exceed it are refused
+
+def test_dict_views_that_each_fit_but_together_exceed_the_envelope_are_refused() -> None:
+    from contracts_limits import STANDARD
+
+    each = STANDARD.max_edges // 2 + 1  # 65,537: under the limit alone, over it with a sibling
+    produced = {"n": 0}
+
+    class EmptyBackedView(dict):
+        def items(self):
+            for index in range(each):
+                produced["n"] += 1
+                yield (f"k{index}", index)
+
+    with pytest.raises(ValueError, match=run_discovery_message()):
+        usage_reconcile_contracts._native_snapshot({"first": EmptyBackedView(), "second": EmptyBackedView()})
+    assert produced["n"] < 2 * each, "both views were read to their ends"
+
+
+def test_one_view_inside_the_envelope_is_still_read_in_full() -> None:
+    produced = {"n": 0}
+
+    class EmptyBackedView(dict):
+        def items(self):
+            for index in range(1000):
+                produced["n"] += 1
+                yield (f"k{index}", index)
+
+    usage_reconcile_contracts._native_snapshot({"only": EmptyBackedView()})
+    assert produced["n"] == 1000
+
+
+def run_discovery_message() -> str:
+    from contracts_limits import DISCOVERY_BUDGET_MESSAGE
+
+    return DISCOVERY_BUDGET_MESSAGE

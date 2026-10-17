@@ -2,14 +2,24 @@
 
 from __future__ import annotations
 
+import threading
 from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass
+from types import MappingProxyType
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, GetCoreSchemaHandler, model_validator
 from pydantic_core import core_schema
 
 from contracts_common import ContractModel, MAX_SAFE_INTEGER, OpaqueId, SafeCounter
+from contracts_limits import (
+    DISCOVERY_BUDGET_MESSAGE,
+    STANDARD,
+    DiscoveryBudget,
+    inherits_native,
+    is_native_instance,
+)
+from contracts_tenancy import unpack_pairs
 from contracts_usage import (
     AttributionSnapshot,
     AttemptOutcome,
@@ -80,6 +90,29 @@ class _ValidatedPublicMappingEntries:
     retained_entries: tuple[tuple[object, object, object], ...]
 
 
+_BUDGET_KEY = ("discovery-budget",)
+# The envelope of the snapshot that is validating a public mapping view right now (per thread).  It is
+# passed this way because the validator's signature is part of what the existing tests replace.
+_view_state = threading.local()
+
+
+def _session_budget(memo: dict) -> DiscoveryBudget:
+    """The one discovery envelope of this snapshot call (it lives in the call's memo)."""
+
+    budget = memo.get(_BUDGET_KEY)
+    if budget is None:
+        budget = memo[_BUDGET_KEY] = DiscoveryBudget(STANDARD)
+    return budget
+
+
+def _charged(entries: Iterable[object], budget: DiscoveryBudget) -> Iterator[object]:
+    """Yield each entry of a public view after charging it, so an endless or huge view is cut off."""
+
+    for entry in entries:
+        budget.charge_edge()
+        yield entry
+
+
 def _validate_public_mapping_entries(
     entries: Iterable[object],
 ) -> _FailedNativeDictTraversal | _ValidatedPublicMappingEntries:
@@ -98,6 +131,11 @@ def _validate_public_mapping_entries(
             break
         except Exception as exc:
             return _FailedNativeDictTraversal(exc)
+        shared = getattr(_view_state, "budget", None)
+        if shared is not None:
+            shared.charge_edge()  # every pair read is charged to the snapshot's one envelope
+        elif len(retained_entries) >= STANDARD.max_edges:
+            raise ValueError(DISCOVERY_BUDGET_MESSAGE)  # no envelope given: this one view is still bounded
         try:
             key, public_value = pair
         except Exception as exc:
@@ -357,6 +395,40 @@ class UsageReconciliation(ContractModel):
         return self
 
 
+_TYPE_MRO = type.__dict__["__mro__"]
+
+
+def _is_real_mapping(value: object) -> bool:
+    """A mapping subclass or the read-only view; a class that only registers with the ABC is not one."""
+
+    candidate = type(value)
+    return candidate is MappingProxyType or any(
+        entry is Mapping or entry is dict for entry in _TYPE_MRO.__get__(candidate)
+    )
+
+
+def _inherits_str(candidate: type) -> bool:
+    return any(entry is str for entry in _TYPE_MRO.__get__(candidate))
+
+
+def _plain_name(name: object) -> object:
+    """A stored field name as plain text (read without running a text subclass's own hooks).
+
+    Anything that is not text is returned unchanged for the caller's text checks to refuse.
+    """
+
+    if type(name) is str or not _inherits_str(type(name)):
+        return name
+    return str.__str__(name)  # type: ignore[arg-type]
+
+
+def _is_node(value: object) -> bool:
+    return is_native_instance(value, BaseModel, list, tuple, set, frozenset) or _is_real_mapping(value)
+
+
+_freeze_state = threading.local()  # the current depth of the recursive freeze, per thread
+
+
 def _freeze_model_storage(
     value: object,
     frozen_models: dict[int, _FrozenModelStorage],
@@ -366,10 +438,27 @@ def _freeze_model_storage(
 ) -> None:
     """Capture reachable native model stores without public traversal hooks."""
 
+    depth = getattr(_freeze_state, "depth", 0)
+    if depth > STANDARD.max_depth:
+        raise ValueError(DISCOVERY_BUDGET_MESSAGE)  # nesting beyond the envelope is refused, not recursed into
+    _freeze_state.depth = depth + 1
+    try:
+        _freeze_model_storage_body(value, frozen_models, frozen_dicts, frozen_tuples, visited)
+    finally:
+        _freeze_state.depth = depth
+
+
+def _freeze_model_storage_body(
+    value: object,
+    frozen_models: dict[int, _FrozenModelStorage],
+    frozen_dicts: dict[int, _FrozenDictStorage],
+    frozen_tuples: dict[int, _FrozenTupleStorage],
+    visited: set[int],
+) -> None:
+
     value_type = type(value)
-    is_native_container = issubclass(
-        value_type,
-        (BaseModel, dict, list, tuple, set, frozenset),
+    is_native_container = any(
+        inherits_native(value_type, base) for base in (BaseModel, dict, list, tuple, set, frozenset)
     )
     if not is_native_container:
         return
@@ -379,7 +468,7 @@ def _freeze_model_storage(
         return
     visited.add(identity)
 
-    if issubclass(value_type, BaseModel):
+    if inherits_native(value_type, BaseModel):
         frozen_model = frozen_models.get(identity)
         if frozen_model is not None and frozen_model[0] is value:
             return
@@ -391,9 +480,21 @@ def _freeze_model_storage(
             extras = None
         native_extra_items = (
             tuple(dict.items(extras))
-            if extras is not None and issubclass(type(extras), dict)
+            if extras is not None and inherits_native(type(extras), dict)
             else None
         )
+        group_texts: list[set[object]] = []
+        for group in (stored_items, native_extra_items or ()):
+            if any(not _inherits_str(type(name)) for name, _item in group):
+                raise ValueError("contract input field names must be text")
+            texts = [_plain_name(name) for name, _item in group]
+            if len(set(texts)) != len(texts):
+                raise ValueError("contract input field names must be unique text")
+            group_texts.append(set(texts))
+        # The two native stores are one namespace: compare their names as plain text, never through a
+        # key's own hash and equality (a text subclass could otherwise sit in both under one text).
+        if group_texts[0] & group_texts[1]:
+            raise ValueError("contract extra storage overlaps stored fields")
         frozen_models[identity] = (
             value,
             stored_items,
@@ -419,23 +520,23 @@ def _freeze_model_storage(
                 )
         return
 
-    if issubclass(value_type, dict):
+    if inherits_native(value_type, dict):
         frozen_dict = frozen_dicts.get(identity)
         if frozen_dict is not None and frozen_dict[0] is value:
             return
         native_items = tuple(dict.items(value))
         frozen_dicts[identity] = (value, native_items)
         items = (item for _key, item in native_items)
-    elif issubclass(value_type, list):
+    elif inherits_native(value_type, list):
         items = list.__iter__(value)
-    elif issubclass(value_type, tuple):
+    elif inherits_native(value_type, tuple):
         frozen_tuple = frozen_tuples.get(identity)
         if frozen_tuple is not None and frozen_tuple[0] is value:
             return
         native_items = tuple(tuple.__iter__(value))
         frozen_tuples[identity] = (value, native_items)
         items = iter(native_items)
-    elif issubclass(value_type, set):
+    elif inherits_native(value_type, set):
         items = set.__iter__(value)
     else:
         items = frozenset.__iter__(value)
@@ -469,7 +570,7 @@ def _native_snapshot(
 
     if _memo is None:
         _memo = {}
-    if isinstance(value, (BaseModel, Mapping, list, tuple, set, frozenset)):
+    if _is_node(value):
         cached = _memo.get(id(value))
         if cached is not None and cached[0] is value:
             return cached[1]
@@ -481,7 +582,7 @@ def _native_snapshot(
         _frozen_tuples=_frozen_tuples,
         _memo=_memo,
     )
-    if isinstance(value, (BaseModel, Mapping, list, tuple, set, frozenset)):
+    if _is_node(value):
         _memo[id(value)] = (value, result)
     return result
 
@@ -521,18 +622,18 @@ def _snapshot_uncached(
         )
     if active is None:
         active = set()
-    if not isinstance(
-        value,
-        (BaseModel, Mapping, list, tuple, set, frozenset),
-    ):
+    if not _is_node(value):
         return value
 
     identity = id(value)
     if identity in active:
         raise ValueError("cyclic input graph")
     active.add(identity)
+    budget = _session_budget(_memo)
     try:
-        if isinstance(value, BaseModel):
+        if len(active) > STANDARD.max_depth:
+            raise ValueError(DISCOVERY_BUDGET_MESSAGE)
+        if is_native_instance(value, BaseModel):
             frozen = _frozen_models.get(identity)
             if frozen is None or frozen[0] is not value:
                 _freeze_model_storage(
@@ -548,21 +649,23 @@ def _snapshot_uncached(
             if extras is not None:
                 if native_extra_items is not None:
                     extra_items = native_extra_items
-                    extra_names = {name for name, _ in extra_items}
+                    extra_names = {_plain_name(name) for name, _ in extra_items}
                 else:
-                    if not isinstance(extras, Mapping):
+                    if not _is_real_mapping(extras):
                         raise ValueError("contract extra storage must be a mapping")
-                    iterated_extra_names = tuple(extras)
-                    extra_items = tuple(extras.items())
-                    extra_names = set(iterated_extra_names) | {
-                        name for name, _ in extra_items
+                    iterated_extra_names = tuple(_charged(extras, budget))
+                    # One unpacking per pair: the name check and the field build share these tuples.
+                    extra_items = unpack_pairs(_charged(extras.items(), budget))
+                    extra_names = {
+                        _plain_name(name)
+                        for name in (*iterated_extra_names, *(name for name, _ in extra_items))
                     }
                 declared_fields = type(value).model_fields
-                stored_names = {name for name, _ in stored_items}
+                stored_names = {_plain_name(name) for name, _ in stored_items}
                 if (stored_names | set(declared_fields)).intersection(extra_names):
                     raise ValueError("contract extra storage overlaps stored fields")
             fields = {
-                name: _native_snapshot(
+                _plain_name(name): _native_snapshot(
                     field_value,
                     active,
                     _frozen_models=_frozen_models,
@@ -575,7 +678,7 @@ def _snapshot_uncached(
             if extra_items:
                 fields.update(
                 {
-                    name: _native_snapshot(
+                    _plain_name(name): _native_snapshot(
                         field_value,
                         active,
                         _frozen_models=_frozen_models,
@@ -587,7 +690,7 @@ def _snapshot_uncached(
                 }
             )
             return fields
-        if isinstance(value, Mapping):
+        if _is_real_mapping(value):
             frozen_dict = _frozen_dicts.get(identity)
             if frozen_dict is not None and frozen_dict[0] is value:
                 # Preserve the public traversal callback, but retain the native
@@ -596,7 +699,12 @@ def _snapshot_uncached(
                     public_items = value.items()
                 except Exception as exc:
                     return _FailedNativeDictTraversal(exc)
-                validated_entries = _validate_public_mapping_entries(public_items)
+                outer_budget = getattr(_view_state, "budget", None)
+                _view_state.budget = budget
+                try:
+                    validated_entries = _validate_public_mapping_entries(public_items)
+                finally:
+                    _view_state.budget = outer_budget
                 if isinstance(validated_entries, _FailedNativeDictTraversal):
                     return validated_entries
                 # Keep the iterator, retained keys, and all entry components
@@ -608,6 +716,7 @@ def _snapshot_uncached(
                 except Exception as exc:
                     return _FailedNativeDictTraversal(exc)
                 projected: dict[object, object] = {}
+                subclass_keys: set[object] = set()  # texts that arrived as a text subclass
                 while True:
                     try:
                         pair = next(source_iterator)
@@ -615,6 +724,7 @@ def _snapshot_uncached(
                         break
                     except Exception as exc:
                         return _FailedNativeDictTraversal(exc)
+                    budget.charge_edge()  # a view is read only as far as the envelope allows
                     try:
                         key, field_value = pair
                     except Exception as exc:
@@ -628,11 +738,18 @@ def _snapshot_uncached(
                         _memo=_memo,
                     )
                     try:
-                        projected[key] = projected_value
+                        # A text-subclass key is reduced to its text; a repeated text is ambiguous input.
+                        plain = _plain_name(key)
+                        if plain in projected and (type(key) is not str or plain in subclass_keys):
+                            raise ValueError("contract input field names must be unique text")
+                        if type(key) is not str:
+                            subclass_keys.add(plain)
+                        projected[plain] = projected_value
                     except Exception as exc:
                         return _FailedNativeDictTraversal(exc)
                 return projected
             projected = {}
+            subclass_keys = set()
             for key, field_value in source_items:
                 projected_value = _native_snapshot(
                     field_value,
@@ -643,12 +760,17 @@ def _snapshot_uncached(
                     _memo=_memo,
                 )
                 try:
-                    projected[key] = projected_value
+                    plain = _plain_name(key)
+                    if plain in projected and (type(key) is not str or plain in subclass_keys):
+                        raise ValueError("contract input field names must be unique text")
+                    if type(key) is not str:
+                        subclass_keys.add(plain)
+                    projected[plain] = projected_value
                 except Exception as exc:
                     return _FailedNativeDictTraversal(exc)
             del validated_entries
             return projected
-        if isinstance(value, list):
+        if is_native_instance(value, list):
             return [
                 _native_snapshot(
                     item,
@@ -658,9 +780,9 @@ def _snapshot_uncached(
                     _frozen_tuples=_frozen_tuples,
                     _memo=_memo,
                 )
-                for item in value
+                for item in _charged(value, budget)
             ]
-        if isinstance(value, tuple):
+        if is_native_instance(value, tuple):
             frozen_tuple = _frozen_tuples.get(identity)
             if frozen_tuple is None or frozen_tuple[0] is not value:
                 _freeze_model_storage(
@@ -682,19 +804,7 @@ def _snapshot_uncached(
                 )
                 for item in frozen_tuple[1]
             )
-        if isinstance(value, set):
-            return {
-                _native_snapshot(
-                    item,
-                    active,
-                    _frozen_models=_frozen_models,
-                    _frozen_dicts=_frozen_dicts,
-                    _frozen_tuples=_frozen_tuples,
-                    _memo=_memo,
-                )
-                for item in value
-            }
-        return frozenset(
+        members = [
             _native_snapshot(
                 item,
                 active,
@@ -703,8 +813,14 @@ def _snapshot_uncached(
                 _frozen_tuples=_frozen_tuples,
                 _memo=_memo,
             )
-            for item in value
-        )
+            for item in _charged(value, budget)
+        ]
+        try:
+            return set(members) if is_native_instance(value, set) else frozenset(members)
+        except TypeError:
+            # The snapshot rebuilds a mapping as a dict, which a set cannot hold: refuse it as bad input,
+            # not as an unhashable-type leak.
+            raise ValueError("contract input set holds an unhashable member") from None
     finally:
         active.remove(identity)
 

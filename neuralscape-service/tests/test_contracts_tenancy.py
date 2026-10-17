@@ -735,10 +735,12 @@ def test_transition_defers_unsupported_current_classification() -> None:
     assert competing_error.value.errors() == ordinary_error.value.errors()
     assert invalid_current.calls == 0
 
+    # The gate classifies by the object's real type: its own ``__class__`` is never consulted, so a
+    # non-operation is refused as such and the trap never runs.
     valid_current = RaisingClass()
-    with pytest.raises(RuntimeError, match="classification trap"):
+    with pytest.raises(TypeError, match="operation must be a TenantOperationState"):
         validate_operation_transition(operation(), valid_current)
-    assert valid_current.calls == 1
+    assert valid_current.calls == 0
 
 
 @pytest.mark.parametrize(
@@ -1348,7 +1350,7 @@ def test_tenancy_boundaries_keep_spoofing_non_dict_on_mapping_path(
     else:
         validate()
 
-    assert extras.class_calls == 1
+    assert extras.class_calls == 0  # the claimed class is never consulted: the real type decides
     assert extras.length_calls == 1
     assert extras.iteration_calls == 1
     assert extras.items_calls == 1
@@ -2557,3 +2559,167 @@ def test_previous_first_diagnostics_survive_replay_charging(monkeypatch) -> None
     _with_tier(monkeypatch, nodes=6)
     with pytest.raises(ValidationError):
         validate_operation_transition(previous, _operation_with_manifests(10, observed_state="running"))
+
+
+# ---- a public view is captured child by child, before the iterator advances
+
+class _RepairsAfterYield(tuple):
+    """An empty-backed tuple whose public view yields one child, then repairs it before it ends."""
+
+    def __new__(cls, exposed, repair):
+        instance = super().__new__(cls)
+        instance.exposed, instance.repair = exposed, repair
+        return instance
+
+    def __iter__(self):
+        yield self.exposed
+        self.repair()
+
+
+class _DictViewRepairsAfterYield(dict):
+    """A dict subclass whose public items yield one pair, then repair the exposed value."""
+
+    def __init__(self, key, exposed, repair):
+        super().__init__()
+        self.key, self.exposed, self.repair = key, exposed, repair
+
+    def items(self):
+        yield (self.key, self.exposed)
+        self.repair()
+
+
+def _rebuilt(root):
+    freeze, rebuild = contracts_tenancy._closed_graph_snapshot_session()
+    freeze(root)
+    return rebuild(root)
+
+
+def test_a_tuple_view_cannot_repair_a_child_it_already_exposed() -> None:
+    child = {"placement_generation": 99}
+    view = _RepairsAfterYield(child, lambda: child.__setitem__("placement_generation", 1))
+    assert _rebuilt({"items": view})["items"] == ({"placement_generation": 99},)  # as exposed, not as repaired
+
+
+def test_a_dict_view_cannot_repair_a_value_it_already_exposed() -> None:
+    child = {"placement_generation": 99}
+    view = _DictViewRepairsAfterYield("manifest", child, lambda: child.__setitem__("placement_generation", 1))
+    assert _rebuilt({"view": view})["view"] == {"manifest": {"placement_generation": 99}}
+
+
+def test_an_empty_backed_tuple_view_cannot_repair_a_stale_manifest_into_the_current_generation() -> None:
+    candidate, _child, invoke = _tenancy_nested_boundary_case("placement")
+    stale = manifest(generation=99)  # generation 99 is not the current placement generation 7
+    view = _RepairsAfterYield(stale, lambda: stale.__setitem__("placement_generation", 7))
+    _set_native_field(candidate, "resource_manifests", view)
+    with pytest.raises(ValidationError, match="placement_generation"):
+        invoke(candidate)
+
+
+def test_siblings_exposed_by_one_view_are_all_captured_before_the_first_is_rebuilt() -> None:
+    first, second = {"n": 1}, {"n": 2}
+
+    class Pair(tuple):
+        def __new__(cls):
+            return super().__new__(cls)
+
+        def __iter__(self):
+            yield first
+            yield second
+
+    seen = []
+
+    class Spy(dict):  # a dict subclass child: its public view runs while the first child is rebuilt
+        def items(self):
+            second["n"] = 22  # a callback during rebuild changes a later sibling
+            seen.append("ran")
+            return iter(())
+
+    result = _rebuilt({"pair": (Pair(), Spy())})
+    assert result["pair"][0] == ({"n": 1}, {"n": 2})
+    assert seen == ["ran"]
+
+
+# ---- text-subclass keys are reduced to plain text and a repeated text is refused
+
+class _KeyWithOwnHooks(str):
+    def __hash__(self) -> int:
+        return id(self)
+
+    def __eq__(self, other: object) -> bool:
+        return self is other
+
+    def __ne__(self, other: object) -> bool:
+        return self is not other
+
+
+def test_a_second_key_with_the_same_text_in_a_native_dict_is_refused() -> None:
+    with pytest.raises(ValueError, match="unique text"):
+        _rebuilt({"item": {"manifest_id": "primary", _KeyWithOwnHooks("manifest_id"): "other"}})
+
+
+def test_a_dict_view_with_a_repeated_text_is_refused() -> None:
+    class View(dict):
+        def items(self):
+            yield ("manifest_id", "primary")
+            yield (_KeyWithOwnHooks("manifest_id"), "other")
+
+    with pytest.raises(ValueError, match="unique text"):
+        _rebuilt({"item": View()})
+
+
+def test_a_lone_text_subclass_key_is_emitted_as_plain_text() -> None:
+    rebuilt = _rebuilt({"item": {_KeyWithOwnHooks("manifest_id"): "primary"}})
+    assert all(type(key) is str for key in rebuilt["item"]) and rebuilt["item"] == {"manifest_id": "primary"}
+
+
+def test_native_extras_sharing_a_stored_text_are_refused_whatever_the_key_type() -> None:
+    candidate, _child, invoke = _tenancy_nested_boundary_case("placement")
+    extras = {_KeyWithOwnHooks("tenant_id"): "tenant-b"}
+    object.__setattr__(candidate, "__pydantic_extra__", extras)
+    with pytest.raises(ValueError, match="undeclared fields"):
+        invoke(candidate)
+
+
+# ---- type gates classify by the object's real type, never by its own ``__class__``
+
+class _ClaimsClass:
+    """Not a model: its ``__class__`` property says it is one."""
+
+    def __init__(self, claimed: type, **fields: object) -> None:
+        self._claimed = claimed
+        self.__dict__.update(fields)
+
+    @property
+    def __class__(self):  # type: ignore[override]
+        return self._claimed
+
+
+def test_an_object_claiming_to_be_a_placement_is_refused_by_the_gate() -> None:
+    spoof = _ClaimsClass(TenantPlacement, tenant_id="tenant-a", generation=7, resource_manifests=())
+    with pytest.raises(TypeError, match="placement must be a TenantPlacement"):
+        validate_placement_publication(spoof, expected_tenant_id="tenant-a", current_generation=7)  # type: ignore[arg-type]
+
+
+def test_an_object_claiming_to_be_an_operation_is_refused_as_current_and_as_previous() -> None:
+    spoof = _ClaimsClass(TenantOperationState)
+    with pytest.raises(TypeError):
+        validate_operation_transition(operation(), spoof)  # type: ignore[arg-type]
+    with pytest.raises(TypeError):
+        validate_operation_transition(spoof, operation())  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("claimed", [BaseModel, dict, list])
+def test_a_container_claiming_a_node_class_is_refused_as_a_value_error(claimed: type) -> None:
+    class Tuple(tuple):
+        @property
+        def __class__(self):  # type: ignore[override]
+            return claimed
+
+    candidate, _child, invoke = _tenancy_nested_boundary_case("placement")
+    _set_native_field(candidate, "resource_manifests", Tuple())
+    try:
+        invoke(candidate)
+    except ValueError:  # includes pydantic's ValidationError: the value-error contract
+        pass
+    except Exception as error:  # pragma: no cover - the failure being pinned
+        raise AssertionError(f"leaked {type(error).__name__}: {error}") from error
