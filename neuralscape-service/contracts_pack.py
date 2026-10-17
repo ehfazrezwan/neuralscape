@@ -1304,12 +1304,14 @@ def _compare_keywords(
         old_additional = unconstrained
     if isinstance(old_props, dict):
         new_props_map = new_props if isinstance(new_props, dict) else {}
+        _charge_walk(len(old_props))  # scanned (and findings appended) on every visit, compared or not
         for name, subschema in old_props.items():
             if name not in new_props_map:
                 out.append(f"{path}.{name}: property removed")
             else:
                 _compare(subschema, new_props_map[name], old_defs, new_defs, f"{path}.{name}", out, depth + 1, active)
     if isinstance(new_props, dict):
+        _charge_walk(len(new_props))  # scanned on every visit, even when no name is compared
         for name, subschema in new_props.items():
             if isinstance(old_props, dict) and name in old_props:
                 continue

@@ -2517,3 +2517,81 @@ def test_shared_lists_within_budget_still_compare() -> None:
     narrowed = copy.deepcopy(schema)
     narrowed["properties"]["o2"]["required"] = narrowed["properties"]["o2"]["required"] + ["extra"]
     assert "$.o2.extra: now required" in _pair(schema, narrowed)
+
+
+# ---- every repeated scan is charged: each site pinned by the walked values it must add
+
+
+_N, _M = 40, 500
+_NAMES = [f"n{i}" for i in range(_M)]
+
+
+def _walked(old: dict, new: dict) -> int:
+    """The values a comparison walks, read through a call budget of its own."""
+
+    probe = pack._CallBudget()
+    token = pack._CALL.set(probe)
+    try:
+        pack.check_compatibility(old, new)
+    finally:
+        pack._CALL.reset(token)
+    return probe.values
+
+
+def _self_pair(schema: dict) -> tuple[dict, dict]:
+    return schema, copy.deepcopy(schema)
+
+
+_SHARED_NEW = {"type": "object", "properties": {f"q{k}": {} for k in range(_M)}}
+_SHARED_OLD = {"type": "object", "properties": {f"q{k}": {} for k in range(_M)}}
+_PREFIX = [{} for _ in range(_M)]
+
+
+@pytest.mark.parametrize(
+    "pair, at_least",
+    [
+        pytest.param(_self_pair({"properties": {f"p{i}": {"type": "array", "prefixItems": _PREFIX, "description": f"{i}"} for i in range(_N)}}),
+                     2 * _N * _M, id="shape-check-of-a-shared-list"),
+        pytest.param(_self_pair({"type": "object", "properties": {f"o{i}": {"type": "object", "required": _NAMES, "description": f"{i}"} for i in range(_N)}}),
+                     3 * _N * _M, id="required-names"),
+        pytest.param(_self_pair({"type": "object", "properties": {f"p{i}": {"enum": _NAMES, "description": f"{i}"} for i in range(_N)}}),
+                     5 * _N * _M, id="enum-copy"),
+        pytest.param(_self_pair({"type": "object", "properties": {f"p{i}": {**{f"x-{k}": k for k in range(_M)}, "description": f"{i}"} for i in range(_N)}}),
+                     2 * _N * _M, id="node-keys"),
+        pytest.param(({"type": "object", "properties": {f"p{i}": {"type": "object", "additionalProperties": False, "description": f"{i}"} for i in range(_N)}},
+                      {"type": "object", "properties": {f"p{i}": _SHARED_NEW for i in range(_N)}}),
+                     _N * _M, id="new-properties-loop"),
+        pytest.param(({"type": "object", "properties": {f"p{i}": _SHARED_OLD for i in range(_N)}},
+                      {"type": "object", "properties": {f"p{i}": {"type": "object", "description": f"{i}"} for i in range(_N)}}),
+                     _N * _M, id="old-properties-loop"),
+    ],
+)
+def test_each_repeated_scan_is_charged(pair, at_least) -> None:
+    assert _walked(*pair) >= at_least
+
+
+@pytest.mark.parametrize("entry", ["check_compatibility", "compare_schemas"])
+def test_new_names_scanned_against_closed_parents_reach_the_budget(monkeypatch, entry) -> None:
+    monkeypatch.setattr(pack, "_MAX_EQUALITY_STEPS", 50_000)
+    old = {"type": "object", "properties": {f"p{i}": {"type": "object", "additionalProperties": False, "description": f"{i}"} for i in range(500)}}
+    new = {"type": "object", "properties": {f"p{i}": _SHARED_NEW for i in range(500)}}
+    findings = _pair(old, new) if entry == "check_compatibility" else pack.compare_schemas({"C": old}, {"C": new})["C"]
+    assert findings == [pack._BUDGET_MESSAGE], findings[:2]
+
+
+@pytest.mark.parametrize("entry", ["check_compatibility", "compare_schemas"])
+def test_removed_names_under_a_shared_node_stop_at_the_budget(monkeypatch, entry) -> None:
+    monkeypatch.setattr(pack, "_MAX_EQUALITY_STEPS", 50_000)
+    old = {"type": "object", "properties": {f"p{i}": _SHARED_OLD for i in range(2000)}}  # 1,000,000 removals uncharged before
+    new = {"type": "object", "properties": {f"p{i}": {"type": "object", "description": f"{i}"} for i in range(2000)}}
+    accumulated = []
+    real_cap = pack._cap
+
+    def recording(findings):
+        accumulated.append(len(findings))
+        return real_cap(findings)
+
+    monkeypatch.setattr(pack, "_cap", recording)
+    findings = _pair(old, new) if entry == "check_compatibility" else pack.compare_schemas({"C": old}, {"C": new})["C"]
+    assert findings[-1] in (pack._BUDGET_MESSAGE, pack._LIMIT_MESSAGE), findings[-1]
+    assert accumulated and max(accumulated) <= 50_000 + _M, accumulated  # stopped at the budget, not after a million
