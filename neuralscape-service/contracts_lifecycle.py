@@ -48,6 +48,8 @@ _BASE_MODEL_EXTRA_DESCRIPTOR = vars(BaseModel)["__pydantic_extra__"]
 def _key_text(key: object) -> object:
     """A key's own text for comparison; a str subclass is read without running its hooks."""
 
+    if type(key) is str:
+        return key
     return str.__str__(key) if _derives_from(type(key), (str,)) else key
 
 
@@ -230,7 +232,9 @@ def _namespace_value(namespace: Any, name: str, budget: DiscoveryBudget) -> obje
 
     budget.charge_edge(len(namespace))
     for key, item in namespace.items():
-        if _derives_from(type(key), (str,)) and str.__str__(key) == name:
+        # Only an exact-str key: the type machinery writes these names as exact strings, so a subclass key
+        # spelling the name (planted through a metaclass's __prepare__) is never the real entry.
+        if type(key) is str and key == name:
             return item
     return None
 
@@ -261,18 +265,18 @@ _GRAPH_KIND = "graph-kind"  # memo key prefix: whether a class is a model, dict,
 
 def _graph_kind(kind: type, captured_by_identity: dict[Any, Any]) -> type | None:
     """``BaseModel``, ``dict``, ``list`` or ``tuple`` when ``kind`` derives from it (in that order), else
-    ``None``; decided from the real MRO once per class and call (until caller code runs: a heap class's
-    ``__bases__`` can be reassigned)."""
+    ``None``; decided from the real MRO once per class and call.  The answer cannot change within a call:
+    CPython refuses a ``__bases__`` assignment that moves a class between these instance layouts, so the
+    memo needs no generation (a view stepping item by item would otherwise re-walk the MRO per item)."""
 
     if kind is dict or kind is list or kind is tuple:
         return kind
-    generation = _generation(captured_by_identity)
     memo = captured_by_identity.get((_GRAPH_KIND, id(kind)))
-    if memo is not None and memo[0] is kind and memo[2] == generation:
+    if memo is not None and memo[0] is kind:
         return memo[1]
     mro = _TYPE_MRO.__get__(kind)
     found = next((wanted for wanted in (BaseModel, dict, list, tuple) if any(base is wanted for base in mro)), None)
-    captured_by_identity[(_GRAPH_KIND, id(kind))] = (kind, found, generation)
+    captured_by_identity[(_GRAPH_KIND, id(kind))] = (kind, found)
     return found
 
 
@@ -369,6 +373,7 @@ def _claims_another_class(kind: type, budget: DiscoveryBudget) -> bool:
     return False
 
 
+_HANDED_ENUMS = "handed-enums"  # memo key: enum members handed out while the current root materializes
 _LEAF_CLASS = "leaf-class"  # memo key prefix: one leaf class's verdict, decided once per call
 
 
@@ -680,6 +685,9 @@ def _materialize_captured_graph(
                 raise ValueError(
                     "a contract value must be a native scalar, an enum member, a model or a container"
                 )
+            handed = captured_by_identity.get(_HANDED_ENUMS)
+            if handed is not None:
+                handed.append(leaf)
         return leaf
     identity = value.identity
     if identity in active_containers:
@@ -854,7 +862,24 @@ def _revalidated_captured_model(
     Ordinary inputs keep the full diagnostic.
     """
 
-    native = _materialize_contract_graph(captured, budget)
+    memo = captured[1]
+    started = _generation(memo)
+    memo[_HANDED_ENUMS] = handed = []
+    try:
+        native = _materialize_contract_graph(captured, budget)
+    finally:
+        memo.pop(_HANDED_ENUMS, None)
+    if _generation(memo) != started:
+        # A view materialized after an enum leaf may have changed its class once that leaf was judged:
+        # judge every member handed out for this root again, before validation reads any of them.
+        check_budget = DiscoveryBudget() if budget is None else budget
+        for leaf in handed:
+            if _leaf_class_verdict(type(leaf), memo, check_budget) != "enum" or not _is_declared_member(
+                leaf, memo, check_budget
+            ):
+                raise ValueError(
+                    "a contract value must be a native scalar, an enum member, a model or a container"
+                )
     try:
         return model_type.model_validate(native, strict=True)
     except ValidationError as error:

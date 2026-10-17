@@ -1532,6 +1532,8 @@ def test_a_text_subclass_cannot_pass_a_literal_it_does_not_spell(position):
 
     with pytest.raises(ValueError, match="schema_version"):  # used to be accepted as "candidate-v1"
         contracts_lifecycle.validate_stage_receipts(command, (applied,))
+    with pytest.raises(ValueError, match="schema_version"):  # and the claim reads it the same way
+        validate_required_stage_claim(claimed_status=IntentStatus.APPLIED, intent=command, receipts=(applied,))
     assert _VersionLookalike.calls == 0  # its hash and equality never ran
 
 
@@ -1550,3 +1552,131 @@ def test_a_text_subclass_that_spells_its_value_reaches_validation_as_plain_text(
 
     assert kept == contracts_lifecycle.validate_stage_receipts(command, (receipt(ProcessingStage.CANONICAL, StageStatus.APPLIED),))[1][0]
     assert type(kept.schema_version) is str and type(kept.effect_id) is str
+
+
+def _arming_enum_case(position):
+    """An enum member, and a tuple-subclass view materialized after it that gives the enum class a
+    delegating ``__getattribute__`` once capture and the materialization-time re-check have passed."""
+
+    import enum
+
+    from contracts_lifecycle import StageError
+    from tests.test_contracts_lifecycle import intent_with_requirements, requirement
+
+    command = intent_with_requirements(requirement(ProcessingStage.CANONICAL))
+    applied = receipt(ProcessingStage.CANONICAL, StageStatus.FAILED, sources=())
+    delegate = StageError(code="c", retryable=False, safe_message="m") if position == "error" else command.stage_requirements[0]
+    reads: list[str] = []
+
+    class Kind(str, enum.Enum):
+        A = "a"
+
+    def impersonate(self, name):
+        if name == "__class__":
+            return type(delegate)
+        if name.startswith("_") and name not in ("__dict__", "__pydantic_fields_set__", "__pydantic_extra__"):
+            return object.__getattribute__(self, name)
+        reads.append(name)
+        return getattr(delegate, name)
+
+    class Arming(tuple):
+        def __iter__(self):
+            type.__setattr__(Kind, "__getattribute__", impersonate)
+            return iter(())
+
+    if position == "error":
+        set_native(applied, "error", Kind.A)
+        set_native(applied, "upstream_applications", Arming(()))  # materialized after error
+    else:
+        set_native(command, "stage_requirements", (Kind.A,))
+        set_native(command, "correlation_id", Arming(()))  # materialized after stage_requirements
+    return command, applied, reads, Kind
+
+
+@pytest.mark.parametrize("position", ["error", "stage_requirement"])
+def test_an_enum_member_armed_by_a_view_materialized_after_it_is_refused_before_validation_reads_it(position):
+    for entry in ("record", "claim"):
+        command, applied, reads, kind = _arming_enum_case(position)
+        try:
+            with pytest.raises((ValueError, TypeError)):
+                if entry == "record":
+                    contracts_lifecycle.validate_stage_receipts(command, (applied,))
+                else:
+                    validate_required_stage_claim(claimed_status=IntentStatus.FAILED, intent=command, receipts=(applied,))
+        finally:
+            if "__getattribute__" in vars(kind):
+                type.__delattr__(kind, "__getattribute__")
+        assert reads == [], (entry, reads)
+
+
+def test_a_planted_twin_of_the_member_map_never_chooses_the_members():
+    """A str-subclass key spelling ``_member_map_`` (planted ahead of the real one) is not the type machinery's
+    entry: only an exact-``str`` key is read, so a forged instance listed only in the twin map stays refused."""
+
+    import enum
+
+    from tests.test_contracts_lifecycle import intent_with_requirements, requirement
+
+    forged_holder: list[object] = []
+
+    class Twin(str):
+        def __hash__(self):
+            return str.__hash__("_member_map_")
+
+        def __eq__(self, other):
+            return False
+
+    class TwinMap(dict):
+        pass
+
+    twin_map: dict = {}
+
+    class Planting(type(enum.Enum)):
+        @classmethod
+        def __prepare__(mcls, name, bases, **kwargs):
+            namespace = super().__prepare__(name, bases, **kwargs)
+            dict.__setitem__(namespace, Twin("_member_map_"), twin_map)
+            return namespace
+
+    class Digest(str, enum.Enum, metaclass=Planting):
+        ABC = "sha256:abc"
+
+    forged = str.__new__(Digest, "sha256:abc")
+    twin_map["ABC"] = forged
+    keys = list(vars(Digest))
+    assert any(type(key) is Twin for key in keys) and "_member_map_" in [str.__str__(k) for k in keys if type(k) is str]
+    command = intent_with_requirements(requirement(ProcessingStage.CANONICAL))
+    set_native(command, "request_digest", forged)
+    applied = receipt(ProcessingStage.CANONICAL, StageStatus.APPLIED)
+    with pytest.raises(ValueError, match="declared member"):
+        contracts_lifecycle.validate_stage_receipts(command, (applied,))
+    with pytest.raises(ValueError, match="declared member"):
+        validate_required_stage_claim(claimed_status=IntentStatus.APPLIED, intent=command, receipts=(applied,))
+
+
+def test_declared_field_names_are_never_read_through_the_model_metaclass():
+    """The extras conflict check needs a model class's declared names; they are read from the class
+    namespaces, so a caller's model metaclass answering ``model_fields`` is never consulted."""
+
+    from tests.test_contracts_lifecycle import intent_with_requirements, requirement, source
+
+    reads: list[str] = []
+
+    class Counting(type(SourceVersion)):
+        def __getattribute__(cls, name):
+            if name in ("model_fields", "__pydantic_fields__"):
+                reads.append(name)
+            return super().__getattribute__(name)
+
+    class Counted(SourceVersion, metaclass=Counting):
+        pass
+
+    command = intent_with_requirements(requirement(ProcessingStage.CANONICAL))
+    applied = receipt(ProcessingStage.CANONICAL, StageStatus.APPLIED)
+    item = Counted.model_construct(**vars(source("c1")))
+    EXTRA.__set__(item, {"extra_note": 1})  # forces the declared-name check
+    set_native(applied, "applied_sources", (item,))
+    reads.clear()
+    with pytest.raises(ValueError):
+        contracts_lifecycle.validate_stage_receipts(command, (applied,))
+    assert reads == []
