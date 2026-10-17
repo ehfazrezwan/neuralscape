@@ -5065,3 +5065,80 @@ def test_native_entries_across_containers_are_bounded_together_before_any_is_cop
     finally:
         tracemalloc.stop()
     assert peak < 2_000_000, peak  # about 66 of the 100 lists were counted and copied, not all of them plus a snapshot
+
+
+# ---- one offset reading per datetime on every construction path
+
+class _FlipZone(tzinfo):
+    """Answers one offset on the first read and another afterwards (outside the envelope)."""
+
+    def __init__(self, first, later):
+        self.reads, self.first, self.later = 0, first, later
+
+    def utcoffset(self, dt):
+        self.reads += 1
+        return self.first if self.reads == 1 else self.later
+
+    def dst(self, dt):
+        return timedelta(0)
+
+def _completed_with_one_instant(zone):
+    data = completed_manifest().model_dump()
+    when = datetime(2026, 10, 1, 8, 0, tzinfo=zone)
+    data["started_at"] = data["finished_at"] = when
+    return data
+
+class _Envelope(BaseModel):
+    manifest: RunManifest
+
+@pytest.mark.parametrize("first, later", [(timedelta(hours=-5), timedelta(0)), (timedelta(0), timedelta(hours=-5))])
+@pytest.mark.parametrize("path", ["type_adapter", "nested_model", "list_of_manifests"])
+def test_one_datetime_supplied_twice_is_read_once_on_every_construction_path(path, first, later):
+    """A TypeAdapter or an enclosing model does not run RunManifest's own entry points; the same instant must
+    still be one reading (neither refused as reversed nor accepted as a five-hour run)."""
+
+    zone = _FlipZone(first, later)
+    data = _completed_with_one_instant(zone)
+    if path == "type_adapter":
+        manifest = pydantic.TypeAdapter(RunManifest).validate_python(data)
+    elif path == "nested_model":
+        manifest = _Envelope.model_validate({"manifest": data}).manifest
+    else:
+        manifest = pydantic.TypeAdapter(list[RunManifest]).validate_python([data, _completed_with_one_instant(_FlipZone(first, later))])[0]
+    assert manifest.started_at == manifest.finished_at
+    assert zone.reads == 1
+
+def test_two_distinct_datetimes_are_each_read_once_on_a_type_adapter():
+    data = completed_manifest().model_dump()
+    start_zone, finish_zone = _FlipZone(timedelta(0), timedelta(0)), _FlipZone(timedelta(0), timedelta(0))
+    data["started_at"] = datetime(2026, 10, 1, 8, 0, tzinfo=start_zone)
+    data["finished_at"] = datetime(2026, 10, 1, 9, 0, tzinfo=finish_zone)
+    manifest = pydantic.TypeAdapter(RunManifest).validate_python(data)
+    assert manifest.finished_at - manifest.started_at == timedelta(hours=1)
+    assert (start_zone.reads, finish_zone.reads) == (1, 1)
+
+
+def _refuse_started_at_only() -> Callable[[], tzinfo | None]:
+    import weakref
+
+    zone = _FlipZone(timedelta(0), timedelta(0))
+    data = completed_manifest().model_dump()
+    data["started_at"] = datetime(2026, 10, 1, 8, 0, tzinfo=zone)
+    data.pop("finished_at")
+    # The record is refused (a finished run needs both); pytest.raises would keep the traceback alive.
+    refused = False
+    try:
+        pydantic.TypeAdapter(RunManifest).validate_python(data)
+    except ValidationError as error:
+        refused = "requires started_at and finished_at" in str(error)
+    assert refused
+    return weakref.ref(zone)
+
+
+def test_started_at_without_finished_at_does_not_keep_the_caller_datetime():
+    """The pairing slot must not hold the caller's datetime past the manifest it came from."""
+    import gc
+
+    gone = _refuse_started_at_only()
+    gc.collect()
+    assert gone() is None

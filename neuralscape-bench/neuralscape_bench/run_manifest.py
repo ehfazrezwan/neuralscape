@@ -22,6 +22,7 @@ from pydantic import (
     ConfigDict,
     Field,
     StringConstraints,
+    ValidationInfo,
     field_validator,
     model_validator,
 )
@@ -320,6 +321,16 @@ _TIMESTAMP_PINS: ContextVar[dict[int, tuple[datetime, datetime]] | None] = Conte
 )
 
 
+# The started_at reading of the manifest whose fields are being validated, when no per-call pins are
+# open (a TypeAdapter, or a model that nests RunManifest, does not run RunManifest's own __init__ or
+# model_validate).  Fields are validated in declaration order, so finished_at of the same manifest
+# reuses the reading if it is the same datetime object; the slot is cleared once finished_at is done
+# (both fields validate their defaults, so it is cleared even when finished_at is omitted).
+_PENDING_STARTED_AT: ContextVar[tuple[datetime, datetime] | None] = ContextVar(
+    "_PENDING_STARTED_AT", default=None
+)
+
+
 @contextmanager
 def _pinned_timestamp_offsets() -> Iterator[None]:
     """Open the per-call offset pins for one manifest validation (nested calls get their own).
@@ -345,8 +356,9 @@ class RunManifest(_ManifestContract):
     cache_condition: CacheCondition
     concurrency: tuple[ConcurrencySetting, ...]
     resources: tuple[ResourceReading, ...]
-    started_at: datetime | None = None
-    finished_at: datetime | None = None
+    # Validated even when omitted, so the started_at/finished_at pairing slot is always cleared.
+    started_at: datetime | None = Field(default=None, validate_default=True)
+    finished_at: datetime | None = Field(default=None, validate_default=True)
     measurements: tuple[TimingMeasurement, ...] = ()
 
     def __init__(self, /, **data: Any) -> None:
@@ -364,12 +376,18 @@ class RunManifest(_ManifestContract):
 
     @field_validator("started_at", "finished_at")
     @classmethod
-    def require_aware_timestamp(cls, value: datetime | None) -> datetime | None:
+    def require_aware_timestamp(cls, value: datetime | None, info: ValidationInfo) -> datetime | None:
+        pins = _TIMESTAMP_PINS.get()
+        if pins is None:
+            # No per-call pins on this construction path: pair the two fields of this manifest.
+            held = _PENDING_STARTED_AT.get()
+            _PENDING_STARTED_AT.set(None)
+            if info.field_name == "finished_at" and held is not None and held[0] is value:
+                return held[1]
         if value is None:
             return None
         # Read the caller's tzinfo once and keep an exact fixed-offset copy, so nothing later (the
         # ordering check, serialization) asks caller code again or sees a different answer.
-        pins = _TIMESTAMP_PINS.get()
         pinned = pins.get(id(value)) if pins is not None else None
         if pinned is not None and pinned[0] is value:
             return pinned[1]
@@ -380,6 +398,8 @@ class RunManifest(_ManifestContract):
             fixed = datetime.replace(value, tzinfo=timezone(_exact_offset(offset)))
             if pins is not None:
                 pins[id(value)] = (value, fixed)
+            elif info.field_name == "started_at":
+                _PENDING_STARTED_AT.set((value, fixed))
             return fixed
         except ValueError:
             raise
