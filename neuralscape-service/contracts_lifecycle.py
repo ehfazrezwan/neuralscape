@@ -8,7 +8,7 @@ projection.  Callers must establish those runtime properties separately.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from enum import Enum
 from collections.abc import Iterator
 from typing import Annotated, Any, Literal, TypeVar
@@ -194,6 +194,29 @@ def _utc_instant_before(earlier: datetime, later: datetime) -> bool:
     return datetime.__sub__(later, _UTC_EPOCH) < datetime.__sub__(earlier, _UTC_EPOCH)
 
 
+_TYPE_MRO = type.__dict__["__mro__"]  # the real MRO, never a metaclass's answer
+_NATIVE_LEAF_TYPES = (str, int, float, bytes, type(None), date, timedelta)
+
+
+def _native_leaf(value: object) -> object:
+    """Admit a leaf only when its real type is a native scalar, or an enum member by identity.
+
+    Validation reads any other object through its own attribute protocol: a proxy claiming a contract
+    class (``__class__``) would run caller code inside the validator, outside the discovery budget.
+    An enum instance built with ``str.__new__(Enum, value)`` is no member: every ``is`` test would
+    misjudge it.  Both are refused here, before validation sees them; no hook runs to decide.
+    """
+
+    mro = _TYPE_MRO.__get__(type(value))
+    if any(base is Enum for base in mro):
+        if not any(member is value for member in type(value).__members__.values()):
+            raise ValueError("an enum value must be a declared member of its enum")
+        return value
+    if any(base is native for base in mro for native in _NATIVE_LEAF_TYPES):
+        return value
+    raise ValueError("a contract value must be a native scalar, an enum member, a model or a container")
+
+
 def _cached_identity_capture(
     value: object,
     captured_by_identity: dict[Any, Any],
@@ -340,7 +363,7 @@ def _capture_native_contract_graph(
             return captured
         finally:
             active_containers.remove(identity)
-    return _CapturedLeaf(value)
+    return _CapturedLeaf(_native_leaf(value))
 
 
 def _observed_public_view(
@@ -365,7 +388,7 @@ def _observed_public_view(
                 budget=budget,
             )
         budget.charge_edge()
-        return _CapturedLeaf(item)
+        return _CapturedLeaf(_native_leaf(item))
 
     memo = captured_by_identity.get(("view", id(source)))
     if memo is not None and memo[0] is source:
@@ -1245,8 +1268,10 @@ def validate_required_stage_claim(
     retry exhaustion, or select a runtime retry policy.
     """
 
-    if not isinstance(claimed_status, IntentStatus):
-        raise TypeError("claimed_status must be an IntentStatus")
+    if not is_exact_type(claimed_status, IntentStatus) or not any(
+        claimed_status is member for member in IntentStatus
+    ):
+        raise TypeError("claimed_status must be an IntentStatus member")
     intent, receipts = _revalidated_claim_inputs(intent, receipts)
 
     requirements = {item.stage: item for item in intent.stage_requirements}

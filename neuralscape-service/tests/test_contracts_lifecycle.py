@@ -2606,7 +2606,8 @@ def test_aggregate_boundary_rejects_declared_overlap_hidden_in_native_backing(
     field_name: str,
 ) -> None:
     command, receipts, target = receiving_graph_with_extra_target(target_name)
-    hidden = HiddenBackingDict({field_name: object()})
+    # a native value, so the overlap itself is what is refused (a non-native one is refused as such first)
+    hidden = HiddenBackingDict({field_name: "hidden"})
     object.__setattr__(target, "__pydantic_extra__", hidden)
 
     with pytest.raises(ValueError, match="conflicting stored contract field"):

@@ -160,6 +160,110 @@ def test_a_spoofed_receipt_cannot_carry_a_graph_past_the_claim_budget():
     assert time.monotonic() - started < 30
 
 
+class CountingSpoof:
+    """A proxy that claims ``cls`` and counts every attribute read made through it."""
+
+    def __init__(self, target, cls):
+        object.__setattr__(self, "_target", target)
+        object.__setattr__(self, "_cls", cls)
+        object.__setattr__(self, "reads", 0)
+
+    def __getattribute__(self, name):
+        if name in ("_target", "_cls", "reads"):
+            return object.__getattribute__(self, name)
+        object.__setattr__(self, "reads", object.__getattribute__(self, "reads") + 1)
+        if name == "__class__":
+            return object.__getattribute__(self, "_cls")
+        return getattr(object.__getattribute__(self, "_target"), name)
+
+
+@pytest.mark.parametrize("position", ["output_ref", "source_precondition", "stage_requirement", "upstream_witness"])
+def test_a_proxy_at_a_nested_position_is_refused_before_validation_reads_it(position):
+    """A nested proxy is not a native value: capture refuses it, so no caller hook runs inside validation."""
+
+    from contracts_lifecycle import StageEvidenceRequirement, UpstreamApplication
+    from contracts_references import ReferenceHandle
+    from tests.test_contracts_lifecycle import intent_with_requirements, reference, requirement
+
+    command = intent_with_requirements(requirement(ProcessingStage.CANONICAL))
+    applied = receipt(ProcessingStage.CANONICAL, StageStatus.APPLIED)
+    if position == "output_ref":
+        proxy = CountingSpoof(reference("o1"), ReferenceHandle)
+        set_native(applied, "output_refs", (proxy,))
+    elif position == "source_precondition":
+        proxy = CountingSpoof(command.source_preconditions[0], SourceVersion)
+        set_native(command, "source_preconditions", (proxy,) + command.source_preconditions[1:])
+    elif position == "stage_requirement":
+        proxy = CountingSpoof(command.stage_requirements[0], StageEvidenceRequirement)
+        set_native(command, "stage_requirements", (proxy,))
+    else:
+        witness = UpstreamApplication(intent_id=applied.intent_id, stage=ProcessingStage.CANONICAL, attempt=1, effect_id="e")
+        proxy = CountingSpoof(witness, UpstreamApplication)
+        set_native(applied, "upstream_applications", (proxy,))
+    with pytest.raises(ValueError, match="native"):
+        contracts_lifecycle.validate_stage_receipts(command, (applied,))
+    with pytest.raises(ValueError, match="native"):
+        validate_required_stage_claim(claimed_status=IntentStatus.APPLIED, intent=command, receipts=(applied,))
+    assert object.__getattribute__(proxy, "reads") == 0
+
+
+def test_the_receipts_and_model_entry_checks_decide_by_the_real_type():
+    """Pins the two entry checks no other test tells apart from ``isinstance``."""
+
+    from tests.test_contracts_lifecycle import intent_with_requirements, requirement
+
+    command = intent_with_requirements(requirement(ProcessingStage.CANONICAL))
+    applied = receipt(ProcessingStage.CANONICAL, StageStatus.APPLIED)
+    with pytest.raises(TypeError, match="receipts must be a tuple"):
+        contracts_lifecycle.validate_stage_receipts(command, Spoof((applied,), tuple))
+    with pytest.raises(TypeError, match="value must be an Intent"):
+        contracts_lifecycle._revalidated_model(Intent, Spoof(command, Intent))
+
+
+def test_a_noncanonical_enum_instance_is_refused_at_every_position():
+    """``str.__new__(Enum, value)`` is an instance of the enum but no member: identity tests would misjudge it."""
+
+    from tests.test_contracts_lifecycle import intent_with_requirements, requirement
+
+    command = intent_with_requirements(requirement(ProcessingStage.CANONICAL))
+    for field, odd in (
+        ("status", str.__new__(StageStatus, "applied")),
+        ("stage", str.__new__(ProcessingStage, "canonical")),
+    ):
+        applied = receipt(ProcessingStage.CANONICAL, StageStatus.APPLIED)
+        set_native(applied, field, odd)
+        with pytest.raises(ValueError, match="declared member"):
+            contracts_lifecycle.validate_stage_receipts(command, (applied,))
+        with pytest.raises(ValueError, match="declared member"):
+            validate_required_stage_claim(claimed_status=IntentStatus.PARTIAL, intent=command, receipts=(applied,))
+    odd_requirement = intent_with_requirements(requirement(ProcessingStage.CANONICAL))
+    set_native(odd_requirement.stage_requirements[0], "stage", str.__new__(ProcessingStage, "canonical"))
+    with pytest.raises(ValueError, match="declared member"):
+        validate_required_stage_claim(claimed_status=IntentStatus.ACCEPTED, intent=odd_requirement, receipts=())
+    applied = receipt(ProcessingStage.CANONICAL, StageStatus.APPLIED)
+    with pytest.raises(TypeError, match="claimed_status"):
+        validate_required_stage_claim(
+            claimed_status=str.__new__(IntentStatus, "applied"), intent=command, receipts=(applied,)
+        )
+    validate_required_stage_claim(claimed_status=IntentStatus.APPLIED, intent=command, receipts=(applied,))
+
+
+def test_native_scalars_and_their_subclasses_still_reach_validation():
+    """Only non-native leaves are refused: an int subclass or datetime subclass is still judged by validation."""
+
+    from tests.test_contracts_lifecycle import intent_with_requirements, requirement
+
+    command = intent_with_requirements(requirement(ProcessingStage.CANONICAL))
+    applied = receipt(ProcessingStage.CANONICAL, StageStatus.APPLIED)
+    set_native(applied, "attempt", type("Count", (int,), {})(1))
+    kept_intent, kept = contracts_lifecycle.validate_stage_receipts(command, (applied,))
+    assert kept[0].attempt == 1
+    late = receipt(ProcessingStage.CANONICAL, StageStatus.APPLIED)
+    set_native(late, "finished_at", Late(2000, 1, 1, tzinfo=timezone.utc))
+    with pytest.raises(ValueError, match="finished_at cannot precede started_at"):
+        contracts_lifecycle.validate_stage_receipts(command, (late,))
+
+
 class Alias(str):
     """A key whose text names one field while its hash and equality name another."""
 
