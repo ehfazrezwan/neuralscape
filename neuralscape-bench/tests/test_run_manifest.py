@@ -5279,3 +5279,175 @@ def test_a_few_undeclared_keys_are_all_listed():
     with pytest.raises(ValueError) as refused:
         serialize_run_manifest(manifest)
     assert str(refused.value) == "undeclared stored fields at $: 'alpha', 'mid', 'zeta'"
+
+
+# ---- a rejected validation leaves nothing behind (the pairing slot is scoped to one manifest)
+
+
+def _validate_on(path, data):
+    if path == "type_adapter":
+        return pydantic.TypeAdapter(RunManifest).validate_python(data)
+    if path == "nested_model":
+        return _Envelope.model_validate({"manifest": data}).manifest
+    if path == "list_of_manifests":
+        return pydantic.TypeAdapter(list[RunManifest]).validate_python([data])[0]
+    if path == "model_validate":
+        return RunManifest.model_validate(data)
+    return RunManifest(**data)
+
+
+_ALL_PATHS = ["type_adapter", "nested_model", "list_of_manifests", "model_validate", "init"]
+_BAD_FINISHES = [object(), "not a date", 12345, [], datetime(2026, 10, 1, 9, 0)]  # the last is naive
+
+
+def _reject_with_bad_finish(path, bad):
+    import weakref
+
+    zone = _FlipZone(timedelta(0), timedelta(0))
+    data = completed_manifest().model_dump()
+    data["started_at"] = datetime(2026, 10, 1, 8, 0, tzinfo=zone)
+    data["finished_at"] = bad
+    refused = False
+    try:
+        _validate_on(path, data)
+    except (ValidationError, ValueError):
+        refused = True
+    assert refused
+    return weakref.ref(zone)
+
+
+@pytest.mark.parametrize("bad", range(len(_BAD_FINISHES)))
+@pytest.mark.parametrize("path", _ALL_PATHS)
+def test_a_valid_start_with_an_invalid_finish_does_not_keep_the_caller_datetime(path, bad):
+    import gc
+
+    gone = _reject_with_bad_finish(path, _BAD_FINISHES[bad])
+    gc.collect()
+    assert gone() is None
+
+
+@pytest.mark.parametrize("path", ["type_adapter", "nested_model", "list_of_manifests"])
+def test_a_rejected_validation_cannot_change_the_next_objects_reading(path):
+    """The first call reads ``shared`` once (+1 h) and is refused for its finished_at.  In the second call the
+    started_at is refused and finished_at is the same object: it must be read afresh (-5 h), never taken from
+    the first call's pairing."""
+
+    zone = _FlipZone(timedelta(hours=1), timedelta(hours=-5))
+    shared = datetime(2026, 10, 1, 8, 0, tzinfo=zone)
+    first = completed_manifest().model_dump()
+    first["started_at"], first["finished_at"] = shared, object()
+    with pytest.raises((ValidationError, ValueError)):
+        _validate_on(path, first)
+    assert zone.reads == 1
+    second = completed_manifest().model_dump()
+    second["started_at"], second["finished_at"] = object(), shared
+    with pytest.raises((ValidationError, ValueError)):
+        _validate_on(path, second)
+    assert zone.reads == 2  # read again for this object's own validation, not replayed from the rejected one
+
+
+# ---- a key's class name is read natively, copied to an exact str and cut
+
+
+def _key_of_type_named(name):
+    key_type = type("K", (), {"__hash__": object.__hash__})
+    type.__dict__["__name__"].__set__(key_type, name)
+    return key_type()
+
+
+class _LoudName(str):
+    formats = 0
+
+    def __format__(self, spec):
+        _LoudName.formats += 1
+        raise RuntimeError("caller __format__ ran")
+
+
+def test_a_key_class_name_that_is_a_str_subclass_runs_no_caller_format():
+    from neuralscape_bench.run_manifest import _key_label
+
+    _LoudName.formats = 0
+    label = _key_label(_key_of_type_named(_LoudName("Sneaky")))
+    assert _LoudName.formats == 0
+    assert label == "<Sneaky key>" and type(label) is str
+
+
+def test_a_million_character_key_class_name_is_cut_to_the_label_bound():
+    from neuralscape_bench.run_manifest import _KEY_LABEL_CHARS, _key_label
+
+    label = _key_label(_key_of_type_named("N" * 1_000_000))
+    assert len(label) <= _KEY_LABEL_CHARS + len("<…")  + len(" key>")
+    assert label.startswith("<" + "N" * 10) and label.endswith("… key>")
+
+
+def test_a_str_subclass_class_name_cut_and_a_short_one_unchanged():
+    from neuralscape_bench.run_manifest import _key_label
+
+    assert _key_label(_key_of_type_named("Short")) == "<Short key>"
+    long_loud = _key_label(_key_of_type_named(_LoudName("L" * 500)))
+    assert type(long_loud) is str and len(long_loud) < 100
+
+
+def test_a_diagnostic_naming_a_hostile_key_type_stays_bounded_and_runs_no_caller_code():
+    manifest = completed_manifest()
+    _LoudName.formats = 0
+    dict.__setitem__(BASE_MODEL_DICT_DESCRIPTOR.__get__(manifest, BaseModel), _key_of_type_named(_LoudName("X" * 1_000_000)), 1)
+    with pytest.raises(ValueError) as caught:
+        serialize_run_manifest(manifest)
+    assert _LoudName.formats == 0 and len(str(caught.value)) < 2_000
+
+
+class _HostileName(str):
+    """A class name whose every str method is caller code."""
+
+    calls = 0
+
+    def _hit(self, *args, **kwargs):
+        _HostileName.calls += 1
+        raise RuntimeError("caller code ran")
+
+    __format__ = __str__ = __repr__ = __len__ = __getitem__ = __eq__ = __hash__ = __iter__ = __contains__ = _hit
+    startswith = endswith = encode = join = split = replace = lower = upper = strip = _hit
+
+
+def test_a_class_name_with_every_str_method_hostile_is_read_with_the_base_methods_only():
+    from neuralscape_bench.run_manifest import _key_label
+
+    key = _key_of_type_named(_HostileName("Quiet" * 40))
+    _HostileName.calls = 0
+    label = _key_label(key)
+    assert _HostileName.calls == 0
+    assert type(label) is str and label.startswith("<QuietQuiet") and label.endswith("… key>")
+
+
+def test_concurrent_validations_never_pair_across_threads():
+    import threading
+
+    errors: list[BaseException] = []
+
+    def worker(seed: int) -> None:
+        try:
+            for _ in range(25):
+                zone = _FlipZone(timedelta(hours=-5), timedelta(0))
+                manifest = pydantic.TypeAdapter(RunManifest).validate_python(_completed_with_one_instant(zone))
+                assert manifest.started_at == manifest.finished_at and zone.reads == 1
+                bad = completed_manifest().model_dump()
+                bad["started_at"], bad["finished_at"] = datetime(2026, 10, 1, 8, 0, tzinfo=_FlipZone(timedelta(0), timedelta(0))), object()
+                with pytest.raises(ValidationError):
+                    pydantic.TypeAdapter(RunManifest).validate_python(bad)
+        except BaseException as error:  # noqa: BLE001
+            errors.append(error)
+
+    threads = [threading.Thread(target=worker, args=(n,)) for n in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert errors == []
+
+
+def test_json_validation_is_unaffected_by_the_pairing_step():
+    manifest = completed_manifest()
+    again = RunManifest.model_validate_json(serialize_run_manifest(manifest))
+    assert again == manifest
+    assert pydantic.TypeAdapter(RunManifest).validate_json(serialize_run_manifest(manifest)) == manifest

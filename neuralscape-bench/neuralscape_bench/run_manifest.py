@@ -27,6 +27,7 @@ from pydantic import (
     field_validator,
     model_validator,
 )
+from pydantic_core import core_schema
 
 
 _MAX_SAFE_COUNTER = 9_007_199_254_740_991
@@ -347,7 +348,8 @@ _TIMESTAMP_PINS: ContextVar[dict[int, tuple[datetime, datetime]] | None] = Conte
 # open (a TypeAdapter, or a model that nests RunManifest, does not run RunManifest's own __init__ or
 # model_validate).  Fields are validated in declaration order, so finished_at of the same manifest
 # reuses the reading if it is the same datetime object; the slot is cleared once finished_at is done
-# (both fields validate their defaults, so it is cleared even when finished_at is omitted).
+# (both fields validate their defaults, and a before-validator on finished_at empties it whether or not
+# the value is valid, so a rejected validation leaves nothing behind).
 _PENDING_STARTED_AT: ContextVar[tuple[datetime, datetime] | None] = ContextVar(
     "_PENDING_STARTED_AT", default=None
 )
@@ -368,6 +370,41 @@ def _pinned_timestamp_offsets() -> Iterator[None]:
         _TIMESTAMP_PINS.reset(token)
 
 
+def _take_started_reading(value: Any, handler: Any) -> Any:
+    """Check ``finished_at`` after taking, and in every case emptying, the started_at reading held for it.
+
+    The slot is emptied before the value is checked and again afterwards, so it is empty whether the
+    value is valid or not: a rejected validation leaves nothing behind.  The same object supplied as
+    both timestamps is handed on as the reading already taken.  (A function validator on the whole
+    field would make JSON input reach the strict checks as Python objects; see ``_PairedFinish``.)
+    """
+
+    held = _PENDING_STARTED_AT.get()
+    _PENDING_STARTED_AT.set(None)
+    try:
+        if held is not None and _TIMESTAMP_PINS.get() is None and held[0] is value:
+            value = held[1]
+        return handler(value)
+    finally:
+        _PENDING_STARTED_AT.set(None)
+
+
+class _PairedFinish:
+    """Annotation for ``finished_at``: the pairing step applies to Python input only.
+
+    JSON input keeps the field's own schema (each value is a new object, so there is nothing to pair)
+    and so stays on the strict JSON path.
+    """
+
+    @classmethod
+    def __get_pydantic_core_schema__(cls, source: Any, handler: Any) -> Any:
+        inner = handler(source)
+        return core_schema.json_or_python_schema(
+            json_schema=inner,
+            python_schema=core_schema.no_info_wrap_validator_function(_take_started_reading, inner),
+        )
+
+
 class RunManifest(_ManifestContract):
     """A reproducible benchmark run envelope with explicit evidence state."""
 
@@ -380,7 +417,7 @@ class RunManifest(_ManifestContract):
     resources: tuple[ResourceReading, ...]
     # Validated even when omitted, so the started_at/finished_at pairing slot is always cleared.
     started_at: datetime | None = Field(default=None, validate_default=True)
-    finished_at: datetime | None = Field(default=None, validate_default=True)
+    finished_at: Annotated[datetime | None, _PairedFinish] = Field(default=None, validate_default=True)
     measurements: tuple[TimingMeasurement, ...] = ()
 
     def __init__(self, /, **data: Any) -> None:
@@ -400,12 +437,8 @@ class RunManifest(_ManifestContract):
     @classmethod
     def require_aware_timestamp(cls, value: datetime | None, info: ValidationInfo) -> datetime | None:
         pins = _TIMESTAMP_PINS.get()
-        if pins is None:
-            # No per-call pins on this construction path: pair the two fields of this manifest.
-            held = _PENDING_STARTED_AT.get()
-            _PENDING_STARTED_AT.set(None)
-            if info.field_name == "finished_at" and held is not None and held[0] is value:
-                return held[1]
+        if pins is None and info.field_name == "started_at":
+            _PENDING_STARTED_AT.set(None)  # nothing from an earlier validation is ever paired with this one
         if value is None:
             return None
         # Read the caller's tzinfo once and keep an exact fixed-offset copy, so nothing later (the
@@ -1316,7 +1349,14 @@ def _key_label(key: object) -> str:
         if bits > _KEY_LABEL_INT_BITS:
             return f"<int key of {bits} bits>"
         return int.__repr__(key)  # type: ignore[arg-type]
-    return f"<{type.__dict__['__name__'].__get__(kind)} key>"
+    # The class name is a native read, but it can be a ``str`` subclass (its __format__ is caller code) of any
+    # length: copy it to an exact str with the base slice, and cut it like a key's own text.
+    name = type.__dict__["__name__"].__get__(kind)
+    if not _is_instance(name, str):
+        return "<key>"
+    text = str.__getitem__(name, slice(0, _KEY_LABEL_CHARS))  # type: ignore[arg-type]
+    cut = "…" if str.__len__(name) > _KEY_LABEL_CHARS else ""  # type: ignore[arg-type]
+    return "<" + text + cut + " key>"
 
 
 class _Path:
