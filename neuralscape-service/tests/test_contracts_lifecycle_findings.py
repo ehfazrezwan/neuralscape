@@ -194,3 +194,41 @@ def test_a_malformed_first_receipt_does_not_copy_an_uncharged_tail() -> None:
     finally:
         tracemalloc.stop()
     assert peak < 8 * 1024 * 1024, peak  # a copy of the tail alone is 40 MB
+
+
+def _bad_intent_id(value):
+    from pydantic import ValidationError
+
+    from contracts_lifecycle import validate_required_stage_claim
+
+    bad = intent(CANONICAL).model_copy(update={"id": value})
+    with pytest.raises(ValidationError) as refused:
+        validate_required_stage_claim(claimed_status=IntentStatus.APPLIED, intent=bad, receipts=())
+    return refused.value
+
+
+def test_a_flat_container_repeated_many_times_is_not_echoed_in_the_error() -> None:
+    """A container with no nested containers is reused too, so (flat,) * n holds one copy of flat; an error that
+    named the input would render n * n entries."""
+
+    n = 300
+    flat = ("x",) * n
+    error = _bad_intent_id((flat,) * n)
+    assert len(repr(error.errors())) < 10_000  # the input would be about 450,000 characters
+    assert "omitted: input shares subtrees" in repr(error.errors())
+
+
+def test_an_input_that_shares_nothing_keeps_its_full_diagnostic() -> None:
+    error = _bad_intent_id(("x",) * 3)
+    assert "('x', 'x', 'x')" in repr(error.errors())
+
+
+@pytest.mark.parametrize("kind", [list, tuple, dict])
+def test_a_flat_container_of_any_kind_repeated_many_times_is_not_echoed(kind) -> None:
+    n = 300
+    flat = {"k": "x"} if kind is dict else kind(("x",) * n)
+    if kind is dict:
+        flat = {f"k{i}": "x" for i in range(n)}
+    wrapper = [flat] * n if kind is list else tuple([flat] * n)
+    error = _bad_intent_id(wrapper)
+    assert len(repr(error.errors())) < 10_000

@@ -439,7 +439,10 @@ def _materialize_captured_graph(
         # A pure native container already built on another path: reuse the copy (its subtree was
         # charged once), checking this path's depth against the subtree's height.
         budget.visit(value.source, len(active_containers) + reused[2])
-        if reused[2]:  # a shared copy that nests containers: its rendering grows per path
+        # A shared copy that nests containers, or a flat one that holds entries: the input repeats it per
+        # path, so an error must not echo it.  An empty container is one interned object that ordinary
+        # models share everywhere; its rendering does not grow, so it must not suppress a diagnostic.
+        if reused[2] or reused[1]:
             captured_by_identity[_REUSED] = True
         return reused[1]
     budget.visit(value.source, len(active_containers))
