@@ -237,8 +237,8 @@ def _mode_finding(mode: int, *, declared: bool = False) -> str | None:
 
     A set-user-id, set-group-id or sticky bit is refused wherever the mode comes from.  A zip member's mode
     is a declaration the extractor honours, so there it must also be usable and, for a file, not writable by
-    everyone: world-writable files and members with no permission bits at all (which cannot be read back)
-    are refused.  A directory may be world-writable: ``ZipFile.mkdir`` writes every directory as 0o777.
+    everyone: a member the owner cannot read (which extracts unreadable) and a world-writable file are
+    refused.  A directory may be world-writable: ``ZipFile.mkdir`` writes every directory as 0o777.
     """
 
     if stat.S_ISLNK(mode):
@@ -247,7 +247,7 @@ def _mode_finding(mode: int, *, declared: bool = False) -> str | None:
         return SPECIAL_ENTRY  # type bits are absent in many zip writers: plain file
     if mode & (stat.S_ISUID | stat.S_ISGID | stat.S_ISVTX):
         return UNSAFE_MODE
-    if declared and (not mode & 0o777 or (mode & stat.S_IWOTH and stat.S_IFMT(mode) != stat.S_IFDIR)):
+    if declared and (not mode & stat.S_IRUSR or (mode & stat.S_IWOTH and stat.S_IFMT(mode) != stat.S_IFDIR)):
         return UNSAFE_MODE
     return None
 
@@ -269,6 +269,9 @@ _FLAG_DESCRIPTOR = 0x8
 _FLAG_PATCHED_DATA = 0x20
 _FLAG_STRONG_ENCRYPTION = 0x40
 _FLAG_MASKED_HEADERS = 0x2000
+_INTERNAL_TEXT_FLAG = 0x1
+# The newest version needed to extract the reference writer emits (4.5, zip64); the common extractor stops at 4.6.
+_MAX_VERSION_NEEDED = 45
 _FLAG_UTF8 = 0x800
 _DOS_DIRECTORY = 0x10  # low byte of external_attr: the MS-DOS directory attribute
 _LOCAL_HEADER = struct.Struct("<4sHHHHHIIIHH")
@@ -359,8 +362,8 @@ def _local_record_end(raw: BinaryIO, info: zipfile.ZipInfo, start_dir: int) -> i
     )
     if signature != _LOCAL_SIGNATURE:
         raise _Framing("bad local header signature")
-    if version_needed > zipfile.MAX_EXTRACT_VERSION:
-        raise _Framing("version needed to extract is not supported")
+    if version_needed > _MAX_VERSION_NEEDED or version_needed != info.extract_version:
+        raise _Framing("version needed to extract is unsupported or differs from the directory")
     if info.volume != 0:
         # The end records say one disk; a member whose own start-disk field says otherwise is expected
         # elsewhere by every reader that honours the field.
@@ -582,6 +585,13 @@ def _inventory_zip(
         problem = _mode_finding(mode, declared=True) if mode else None
         if problem is not None:
             report.add(problem, _safe_label(name))
+            continue
+        if info.extract_version > _MAX_VERSION_NEEDED:
+            report.add(CONTAINER_UNSUPPORTED, _safe_label(name), "version needed to extract")
+            continue
+        if info.internal_attr & ~_INTERNAL_TEXT_FLAG:
+            # Bit 0 only says "probably text"; an extractor derives the file's mode from the others.
+            report.add(UNSAFE_MODE, _safe_label(name))
             continue
         if not info.flag_bits & _FLAG_UTF8 and not info.orig_filename.isascii():
             # Read as cp437 here, but a reader that guesses UTF-8 reads the same bytes as other text: the

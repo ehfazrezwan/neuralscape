@@ -2245,7 +2245,7 @@ def test_one_member_on_another_disk_is_enough(tmp_path) -> None:
     assert not verify_bundle(path).ok
 
 
-@pytest.mark.parametrize(("offset", "fmt", "value"), [(36, "<H", 1), (36, "<H", 0xFFFF), (4, "<H", 0x0A63)])
+@pytest.mark.parametrize(("offset", "fmt", "value"), [(36, "<H", 1), (4, "<H", 0x0A63)])  # the text flag; version made by (0xFFFF attributes: refused now)
 def test_member_fields_that_no_reader_acts_on_still_verify(tmp_path, offset, fmt, value) -> None:
     path = _write_zip(tmp_path / "b.zip", PAYLOAD)
     _set_central_field(path, offset, fmt, value)  # internal attributes; version made by
@@ -2394,11 +2394,25 @@ def _patch_headers(path: Path, signature: bytes, offset: int, fmt: str, value: i
     path.write_bytes(bytes(data))
 
 
-@pytest.mark.parametrize(("version", "ok"), [(20, True), (63, True), (64, False), (99, False)])
-def test_a_local_version_needed_beyond_what_the_reader_supports_is_refused(tmp_path, version, ok) -> None:
-    path = _write_zip(tmp_path / "b.zip", PAYLOAD)
+@pytest.mark.parametrize(("version", "ok"), [(20, False), (45, False), (46, False), (63, False), (99, False)])
+def test_a_local_version_needed_that_differs_from_the_directory_is_refused(tmp_path, version, ok) -> None:
+    path = _write_zip(tmp_path / "b.zip", PAYLOAD)  # written with version 20 in both headers
+    assert verify_bundle(path).ok
     _patch_headers(path, b"PK\x03\x04", 4, "<H", version)  # the local headers only
-    assert verify_bundle(path).ok is ok
+    assert verify_bundle(path).ok is (version == 20)
+
+
+@pytest.mark.parametrize(("version", "ok"), [(10, True), (20, True), (45, True), (46, False), (47, False), (52, False), (63, False)])
+def test_a_version_needed_beyond_what_the_common_extractor_honours_is_refused(tmp_path, version, ok) -> None:
+    """Version 4.5 (zip64) is the newest the reference writer emits; Info-ZIP skips members that need 4.7."""
+
+    path = _write_zip(tmp_path / "b.zip", PAYLOAD)
+    _patch_headers(path, b"PK\x03\x04", 4, "<H", version)
+    _patch_headers(path, b"PK\x01\x02", 6, "<H", version)  # both copies agree
+    report = verify_bundle(path)
+    assert report.ok is ok
+    if not ok:
+        assert {pv.CONTAINER_UNSUPPORTED, pv.ARCHIVE_FRAMING} & _codes(report)
 
 
 def test_a_non_ascii_name_without_the_utf8_flag_is_refused(tmp_path) -> None:
@@ -2432,6 +2446,11 @@ def test_a_non_ascii_name_without_the_utf8_flag_is_refused(tmp_path) -> None:
         (0o101755, False),  # sticky
         (0o100666, False),  # world-writable file
         (0o100000, False),  # no permission bits
+        (0o100200, False),  # owner-unreadable
+        (0o100020, False),
+        (0o100001, False),
+        (0o100044, False),
+        (0o000200, False),  # no type bits, owner-unreadable
     ],
 )
 def test_member_modes_that_an_extractor_would_honour_unsafely_are_refused(tmp_path, mode, ok) -> None:
@@ -2456,3 +2475,15 @@ def test_a_world_writable_directory_written_by_the_standard_library_is_accepted(
         for name, data in PAYLOAD.items():
             archive.writestr(name, data)
     assert verify_bundle(path).ok
+
+
+@pytest.mark.parametrize(("attributes", "ok"), [(0x0000, True), (0x0001, True), (0x0004, False), (0x00FF, False), (0x0100, False)])
+def test_internal_file_attributes_other_than_the_text_flag_are_refused(tmp_path, attributes, ok) -> None:
+    """The extractor derives the mode of the file it writes from the other bits."""
+
+    path = _write_zip(tmp_path / "b.zip", PAYLOAD)
+    _patch_headers(path, b"PK\x01\x02", 36, "<H", attributes)
+    report = verify_bundle(path)
+    assert report.ok is ok
+    if not ok:
+        assert pv.UNSAFE_MODE in _codes(report)
