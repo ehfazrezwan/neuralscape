@@ -1169,10 +1169,31 @@ def _metered_validator_class(validator_class: Any, meter: _SchemaExecutionMeter)
             if validator.is_type(instance, "number") and (Fraction(instance) / Fraction(divisor)).denominator != 1:
                 yield SchemaError(f"{_brief(instance)} is not a multiple of {_brief(divisor)}")
 
+    jsonschema_format = validator_class.VALIDATORS["format"]
+    format_results: dict[tuple[str, str], tuple[str, str | None]] = {}
+
+    def format_(validator: Any, format_name: Any, instance: Any, schema: Any) -> Any:
+        # A format result is computed once per distinct value and format in a call.  A failed regex compile is
+        # not cached by ``re`` (a successful one is), so under not or anyOf every application would recompile;
+        # a regex is also weighted by its length, since compiling costs far more per character than a scan.
+        if not is_subclass(type(format_name), str) or not (type(instance) is str or type(instance) is _LongText):
+            yield from jsonschema_format(validator, format_name, instance, schema)
+            return
+        key = (str.__str__(format_name), instance)  # type: ignore[arg-type]
+        known = format_results.get(key)
+        if known is None:
+            if key[0] == "regex":
+                meter.charge(str.__len__(instance))
+            errors = list(jsonschema_format(validator, format_name, instance, schema))
+            known = format_results[key] = (str.__str__(instance), errors[0].message if errors else None)
+        if known[1] is not None:
+            yield SchemaError(known[1])
+
     keywords = {
         name: metered(keyword, scans_strings=name == "format") for name, keyword in validator_class.VALIDATORS.items()
     }
     keywords["multipleOf"] = metered(multiple_of)
+    keywords["format"] = metered(format_, scans_strings=True)
     keywords["uniqueItems"] = metered(unique_items)
     keywords["enum"] = metered(enum)
     keywords["const"] = metered(const)

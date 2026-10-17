@@ -3004,3 +3004,52 @@ def test_a_long_string_or_integer_repeated_by_reference_is_copied_once_into_the_
         tracemalloc.stop()
     assert peak < 4 << 20, peak  # it was a copy per reference: 300 MiB
     assert view[0] is view[1] and view[300] is view[301]  # type: ignore[index]
+
+
+# ---- a format result is computed once per distinct value in a call, and a regex is weighted by its length
+
+def _regex_work(count, groups, monkeypatch):
+    compiled = [0]
+    original = contracts_inference.re.compile
+
+    def counting(pattern, *args, **kwargs):
+        compiled[0] += isinstance(pattern, str) and pattern.startswith("(a)")  # only the pattern under test
+        return original(pattern, *args, **kwargs)
+
+    monkeypatch.setattr(contracts_inference.re, "compile", counting)
+    spent, errors = _units_spent({"allOf": [{"not": {"format": "regex"}}] * count}, "(a)" * groups + "[")
+    return spent, compiled[0], errors
+
+
+def test_an_invalid_regex_is_compiled_once_however_many_applications(monkeypatch):
+    spent_one, compiled_one, _ = _regex_work(1, 4_096, monkeypatch)
+    spent_many, compiled_many, errors = _regex_work(200, 4_096, monkeypatch)
+    assert errors == [] and compiled_one == compiled_many == 1  # it was one compile per application
+    assert spent_many < spent_one + 199 * ((3 * 4_096 + 1) // 32 + 40)  # only the per-application scan charge, no recompile weight
+
+
+def test_regex_work_doubles_with_the_pattern_length(monkeypatch):
+    units = [_regex_work(1, groups, monkeypatch)[0] for groups in (2_048, 4_096, 8_192)]
+    assert 1.8 < units[1] / units[0] < 2.2 and 1.8 < units[2] / units[1] < 2.2, units
+    assert units[0] > 3 * 2_048  # weighted by the pattern's characters, not a 32nd of them
+
+
+def test_a_format_result_is_shared_by_equal_values_and_still_reported():
+    spent, errors = _units_spent({"allOf": [{"format": "ipv4"}] * 3}, "999.1.1.1")
+    assert len(errors) == 3 and all("is not a 'ipv4'" in error.message for error in errors)  # one per branch
+
+
+def test_the_repeated_invalid_regex_shape_compiles_once(monkeypatch):
+    spent, compiled, errors = _regex_work(100, 65_536, monkeypatch)  # 100 negated checks of a 196 KB pattern
+    assert errors == [] and compiled == 1  # it was 100 compiles and 43 seconds
+
+
+def test_string_and_division_charges_grow_with_the_size_of_the_values():
+    strings = [_units_spent({"uniqueItems": True}, [f"{i}" + "s" * size for i in range(4)])[0] for size in (65_536, 131_072, 262_144)]
+    assert 1.8 < strings[1] / strings[0] < 2.2 and 1.8 < strings[2] / strings[1] < 2.2, strings
+    keys = [_units_spent({"uniqueItems": True}, [{"k" * size: 1}])[0] for size in (65_536, 131_072, 262_144)]
+    assert 1.6 < keys[1] / keys[0] < 2.2 and 1.6 < keys[2] / keys[1] < 2.2, keys
+    divisions = [
+        _units_spent({"multipleOf": (1 << bits) + 1}, (1 << (2 * bits)) + 7)[0] for bits in (65_536, 131_072, 262_144)
+    ]
+    assert 3.5 < divisions[1] / divisions[0] < 4.5 and 3.5 < divisions[2] / divisions[1] < 4.5, divisions  # quadratic
