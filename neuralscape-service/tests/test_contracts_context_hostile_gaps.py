@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import tracemalloc
 from datetime import datetime, timedelta, timezone, tzinfo
 
 import pytest
@@ -14,6 +15,7 @@ from contracts_freshness import (
     SourceCheckpoint,
     pin_datetime,
     pin_native_snapshot,
+    require_native_snapshot,
 )
 from tests.test_contracts_context import _bundle, _item, _request, _validate
 from tests.test_contracts_freshness import _checkpoint
@@ -182,6 +184,53 @@ def test_pin_datetime_leaves_non_datetimes_and_naive_values_for_validation_to_re
     naive = datetime(*_NOON)
     assert pin_datetime(naive) is naive
     assert pin_datetime(7) == 7
+
+
+# ---- F-3: the path strings
+
+def test_the_native_snapshot_check_does_not_copy_a_key_into_every_descendant_path() -> None:
+    key = "k" * (1 << 20)  # 1 MiB
+    snapshot = {key: [{"leaf": index} for index in range(200)]}
+    tracemalloc.start()
+    try:
+        require_native_snapshot(snapshot)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert peak < 8 * (1 << 20), peak  # 200 copies of the key (about 200 MiB) before the fix
+
+
+def test_a_refusal_names_a_bounded_path_not_the_whole_key() -> None:
+    key = "k" * (1 << 20)
+    with pytest.raises(ValueError) as refused:
+        require_native_snapshot({key: [object()]})
+    assert len(str(refused.value)) < 400 and "unsupported value type at $" in str(refused.value)
+
+
+# ---- F-4: keys
+
+@pytest.mark.parametrize(
+    "make_key", [lambda: object(), lambda: type("Text", (str,), {"__hash__": lambda self: 1})("a")],
+    ids=["non-text-key", "text-subclass-key-with-hooks"],
+)
+def test_the_native_snapshot_check_refuses_unsupported_keys_as_a_value_error(make_key) -> None:
+    with pytest.raises(ValueError, match="unsupported key type"):
+        require_native_snapshot({make_key(): 1})
+
+
+def test_a_key_whose_repr_raises_never_reaches_the_caller() -> None:
+    class Hostile:
+        def __repr__(self):
+            raise RuntimeError("repr ran")
+
+        __hash__ = object.__hash__
+
+    with pytest.raises(ValueError, match="unsupported key type"):
+        require_native_snapshot({Hostile(): 1})
+
+
+def test_exact_native_scalar_keys_are_still_left_to_strict_validation() -> None:
+    assert require_native_snapshot({7: "x", "a": 1, None: 2}) == {7: "x", "a": 1, None: 2}
 
 
 def test_the_verification_time_is_pinned_like_the_observation() -> None:

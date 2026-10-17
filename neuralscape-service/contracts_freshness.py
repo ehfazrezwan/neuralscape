@@ -333,6 +333,27 @@ def allow_native_enums(*enums: type) -> None:
     _ALLOWED_ENUMS = _ALLOWED_ENUMS + tuple(enum for enum in enums if not any(enum is known for known in _ALLOWED_ENUMS))
 
 
+_PATH_LIMIT = 200
+_KEY_SHOWN = 40
+
+
+def _trail_path(trail: list[tuple[int, object]], index: int, tail: str = "") -> str:
+    """The path to a record in ``trail`` (exact text keys and integer positions only), shortened for a message."""
+
+    parts: list[str] = []
+    while index >= 0:
+        parent, label = trail[index]
+        if parent < 0:
+            parts.append("$")  # the root of the snapshot
+        elif type(label) is str:
+            parts.append(f"[{label[:_KEY_SHOWN]!r}{'...' if len(label) > _KEY_SHOWN else ''}]")
+        else:
+            parts.append(f"[{label!r}]")  # an integer position, or an exact native scalar key
+        index = parent
+    text = "".join(reversed(parts)) + tail
+    return text if len(text) <= _PATH_LIMIT else text[:_PATH_LIMIT] + "..."
+
+
 def require_native_snapshot(snapshot: object) -> object:
     """Reject, before Pydantic sees it, any value that is not a supported native kind.
 
@@ -344,24 +365,36 @@ def require_native_snapshot(snapshot: object) -> object:
     The walk is iterative.
     """
 
-    pending: list[tuple[object, str]] = [(snapshot, "$")]
+    # Each container visited gets one small record, (index of its parent's record, the key or position that
+    # leads to it); a path string is built from that chain only when a value is refused, so a long key is held
+    # once however many descendants lie below it.
+    trail: list[tuple[int, object]] = []
+    pending: list[tuple[object, int, object]] = [(snapshot, -1, None)]
     seen: set[int] = set()
     while pending:
-        value, path = pending.pop()
+        value, parent, label = pending.pop()
         kind = type(value)
         if any(kind is container for container in _NATIVE_CONTAINERS):
             if id(value) in seen:
                 continue
             seen.add(id(value))
+            trail.append((parent, label))
+            here = len(trail) - 1
             if kind is dict:
-                pending.extend((item, f"{path}[{key!r}]") for key, item in dict.items(value))
+                for key, item in dict.items(value):
+                    if not any(type(key) is scalar for scalar in _NATIVE_SCALARS):
+                        # A key is judged like any other leaf: exact native kinds only (strict validation then
+                        # refuses a non-text key itself), never an object whose hooks or repr could run.
+                        raise ValueError(f"unsupported key type at {_trail_path(trail, here, '<key>')}")
+                    pending.append((item, here, key))
             else:
-                pending.extend((item, f"{path}[{index}]") for index, item in enumerate(value))
+                pending.extend((item, here, index) for index, item in enumerate(value))
         elif not (
             any(kind is scalar for scalar in _NATIVE_SCALARS)
             or any(kind is allowed for allowed in _ALLOWED_ENUMS)
         ):
-            raise ValueError(f"unsupported value type at {path}")
+            trail.append((parent, label))
+            raise ValueError(f"unsupported value type at {_trail_path(trail, len(trail) - 1)}")
     return snapshot
 
 
