@@ -11,7 +11,7 @@ perform migration transaction and replay checks.
 from __future__ import annotations
 
 from pathlib import PurePosixPath, PureWindowsPath
-from collections.abc import Mapping as _AbcMapping
+from collections.abc import Callable, Iterable, Mapping as _AbcMapping
 from types import MappingProxyType
 from typing import Any, Literal, Mapping
 
@@ -714,6 +714,37 @@ def normalize_bundle_path(value: str) -> str:
     return _normalized_bundle_path(value)
 
 
+def names_below_a_file(
+    names: Iterable[str], file_names: Iterable[str], fold: Callable[[str], str] = str
+) -> list[str]:
+    """The names that have a proper ancestor which is itself a file name, compared component by component.
+
+    A regular file cannot also be the directory of another entry.  ``file_names`` are the regular files; every
+    name in ``names`` (files and directories) is walked through a trie of them, so the work is linear in the
+    total length of the names whatever their depth, and ``fold`` (identity, ``str.lower``, a Unicode
+    casefold) is applied to each component, so folded aliases and implicit parents are caught too.
+    """
+
+    trie: dict[str, dict[str, Any]] = {}
+    for name in file_names:
+        node = trie
+        for component in name.split("/"):
+            node = node.setdefault(fold(component), {})
+        node[""] = {}  # a file ends here (no real component is empty)
+    below: list[str] = []
+    for name in names:
+        node = trie
+        parts = name.split("/")
+        for depth, component in enumerate(parts):
+            node = node.get(fold(component))  # type: ignore[assignment]
+            if node is None:
+                break
+            if depth < len(parts) - 1 and "" in node:
+                below.append(name)
+                break
+    return below
+
+
 class CanonicalObjectId(ContractModel):
     """An exact canonical object identity carried by the bundle inventory."""
 
@@ -877,6 +908,10 @@ class PortableManifest(VersionedContract):
         windows_file_paths = [PureWindowsPath(path) for path in file_paths]
         if len(set(windows_file_paths)) != len(windows_file_paths):
             raise ValueError("manifest contains colliding Windows file paths")
+        # A declared file cannot also be the directory of another declared file (Windows folding covers the
+        # exact case too).
+        if names_below_a_file(file_paths, file_paths, str.lower):
+            raise ValueError("manifest declares a file that is also a directory of another file")
 
         object_keys = [(item.kind, item.id) for item in self.canonical_ids]
         if len(set(object_keys)) != len(object_keys):

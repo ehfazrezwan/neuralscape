@@ -4169,3 +4169,55 @@ def test_an_endless_public_view_inside_a_mapping_input_is_observed_and_cut_off_b
     # the public view is observed (charged as it is read) and stopped by the discovery budget; the native,
     # empty backing used to be copied without ever asking the view
     assert 0 < produced[0] <= PORTABILITY_MAX_EDGES + 1
+
+
+# --- a declared file cannot also be the directory of another declared file -------------------------
+
+
+def _manifest_with_paths(paths: list[str]) -> dict:
+    document = valid_manifest()
+    base = document["files"][0]
+    document["files"] = [
+        {**base, "path": path, "checksum": dict(base["checksum"])} for path in [*paths, "crypto/envelope.bin"]
+    ]
+    return document
+
+
+@pytest.mark.parametrize(
+    "paths",
+    [["node", "node/child"], ["Node", "node/child"], ["a", "a/b/c"], ["x/y", "x/y/z/w"], ["X/Y", "x/y/z"]],
+    ids=["exact", "folded", "deep", "nested", "nested-folded"],
+)
+def test_a_declared_file_that_is_the_directory_of_another_is_refused(paths) -> None:
+    with pytest.raises(ValidationError) as raised:
+        validate_portable_manifest(_manifest_with_paths(paths))
+    assert "also a directory" in str(raised.value.__cause__ or raised.value)
+
+
+def test_declared_paths_that_only_share_a_prefix_are_accepted() -> None:
+    assert validate_portable_manifest(_manifest_with_paths(["a/b", "a/c", "a2", "a/b2/c"]))
+
+
+def test_the_same_conflict_is_refused_inside_a_manifest_model() -> None:
+    manifest = validate_portable_manifest(_manifest_with_paths(["a/b", "a2"]))
+    conflicting = manifest.files[0].model_copy(update={"path": "a"})
+    with pytest.raises(ValidationError):
+        validate_portable_manifest(manifest.model_copy(update={"files": [conflicting, *manifest.files]}))
+
+
+def test_the_ancestor_check_does_work_linear_in_the_components_not_the_depth_squared() -> None:
+    from contracts_portability import names_below_a_file
+
+    calls = [0]
+
+    def counting(component: str) -> str:
+        calls[0] += 1
+        return component
+
+    paths = ["/".join(["a"] * 1_000) + f"/x{i}" for i in range(50)]
+    assert names_below_a_file(paths, paths, counting) == []
+    components = 50 * 1_001
+    assert calls[0] <= 2 * components + 10, calls[0]  # once to build the trie, once to walk each name
+    # and the answer is right: a file below a file is reported, a sibling is not
+    assert names_below_a_file(["a", "a/b", "a2"], ["a", "a/b", "a2"]) == ["a/b"]
+    assert names_below_a_file(["A/b"], ["a"], str.lower) == ["A/b"]

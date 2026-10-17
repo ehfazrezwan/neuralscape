@@ -1476,3 +1476,102 @@ def test_a_malformed_unicode_path_field_is_refused(tmp_path, extra) -> None:
 def test_other_extra_fields_are_left_alone(tmp_path) -> None:
     other = struct.pack("<HH", 0x5455, 5) + b"\x01" + struct.pack("<I", 1700000000)  # extended timestamp
     assert verify_bundle(_zip_with_unicode_path(tmp_path, other, "both")).ok
+
+
+# --- root spellings, DOS directory bit, deflate chunk boundaries, file/directory conflicts ---------
+
+
+def _bundle_zip(tmp_path, files: dict[str, bytes], *, infos=None, level=None, name="conflict.zip") -> Path:
+    path = tmp_path / name
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("manifest.json", json.dumps(_manifest(files)))
+        for member, data in files.items():
+            info = (infos or {}).get(member) or zipfile.ZipInfo(member)
+            info.compress_type = zipfile.ZIP_DEFLATED
+            archive.writestr(info, data, compresslevel=level)
+    return path
+
+
+@pytest.mark.parametrize("spelling", ["alias", "alias/", "alias//", "alias/.", "alias/./", "alias/././."])
+def test_a_symlinked_bundle_root_is_refused_whatever_its_trailing_spelling(tmp_path, spelling) -> None:
+    real = _write_dir(tmp_path / "real", {"a.txt": b"x"}, _manifest({"a.txt": b"x"}))
+    (tmp_path / "alias").symlink_to(real)
+    report = verify_bundle(str(tmp_path) + "/" + spelling)
+    assert pv.SYMLINK_ENTRY in _codes(report), report.findings
+
+
+@pytest.mark.parametrize("spelling", ["real", "real/", "real//", "real/.", "real/./"])
+def test_a_real_directory_root_still_verifies_in_every_spelling(tmp_path, spelling) -> None:
+    _write_dir(tmp_path / "real", {"a.txt": b"x"}, _manifest({"a.txt": b"x"}))
+    assert verify_bundle(str(tmp_path) + "/" + spelling).ok
+
+
+def test_a_member_marked_as_a_dos_directory_without_a_directory_name_is_corrupt(tmp_path) -> None:
+    info = zipfile.ZipInfo("dosdir")
+    info.external_attr = 0x10  # the DOS directory bit; no Unix mode, no trailing slash
+    info.create_system = 0
+    assert pv.ENTRY_CORRUPT in _codes(verify_bundle(_bundle_zip(tmp_path, {"dosdir": b""}, infos={"dosdir": info})))
+
+
+def test_a_directory_named_member_with_a_dos_directory_bit_is_still_a_directory(tmp_path) -> None:
+    path = tmp_path / "d.zip"
+    info = zipfile.ZipInfo("emptydir/")
+    info.external_attr = 0x10
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr("manifest.json", json.dumps(_manifest({})))
+        archive.writestr(info, b"")
+    assert verify_bundle(path).ok
+
+
+@pytest.mark.parametrize("size", [65_535, 65_536, 65_537, 131_073, 200_001])
+@pytest.mark.parametrize("level", [1, 6, 9])
+def test_a_compressible_member_across_the_chunk_boundary_verifies(tmp_path, size, level) -> None:
+    report = verify_bundle(_bundle_zip(tmp_path, {"big.bin": b"a" * size}, level=level))
+    assert report.ok, (size, level, report.findings)
+
+
+def test_a_truncated_deflate_stream_is_still_corrupt_after_the_drain(tmp_path) -> None:
+    path = _bundle_zip(tmp_path, {"big.bin": b"a" * 70_000}, level=1)
+    raw = bytearray(path.read_bytes())
+    # cut the stored deflate stream short by lying about the compressed size in both headers is covered by
+    # the central-size tests; here flip a byte inside the stream so the stream is invalid or short
+    offset = raw.find(b"big.bin") + len("big.bin") + 8
+    raw[offset] ^= 0xFF
+    path.write_bytes(bytes(raw))
+    assert not verify_bundle(path).ok
+
+
+@pytest.mark.parametrize(
+    "files",
+    [
+        {"node": b"1", "node/child.txt": b"2"},
+        {"a": b"1", "a/b.txt": b"2"},
+        {"A": b"1", "a/b.txt": b"2"},  # a folded alias of the parent
+        {"a/b": b"1", "a/b/c/d.txt": b"2"},  # a deeper implicit parent
+        {"manifest.json/data.txt": b"2"},  # beneath the manifest file itself
+        {"manifest.json/payload.bin": b"zz"},
+        {"Manifest.JSON/payload.bin": b"zz"},
+    ],
+    ids=["file-and-child", "short", "folded", "deep", "beneath-manifest", "beneath-manifest-payload", "folded-manifest"],
+)
+def test_a_file_that_is_also_a_directory_is_refused_before_hashing(tmp_path, files) -> None:
+    report = verify_bundle(_bundle_zip(tmp_path, files))
+    assert pv.PATH_CONFLICT in _codes(report), report.findings
+
+
+def test_names_that_only_look_alike_are_not_a_conflict(tmp_path) -> None:
+    assert verify_bundle(_bundle_zip(tmp_path, {"a/b.txt": b"1", "a2.txt": b"2", "a/c/d.txt": b"3"})).ok
+
+
+def test_a_file_and_a_directory_of_one_name_are_refused_in_a_directory_bundle_too(tmp_path) -> None:
+    root = _write_dir(tmp_path / "b", {"A": b"1"}, _manifest({"A": b"1"}))
+    (root / "a").mkdir()
+    (root / "a" / "b.txt").write_bytes(b"2")
+    report = verify_bundle(root)
+    assert not report.ok
+
+
+def test_an_archive_named_with_a_trailing_slash_is_still_not_a_readable_archive(tmp_path) -> None:
+    path = _bundle_zip(tmp_path, {"a.txt": b"x"}, name="plain.zip")
+    assert verify_bundle(path).ok
+    assert pv.CONTAINER_UNREADABLE in _codes(verify_bundle(str(path) + "/"))  # ENOTDIR semantics preserved

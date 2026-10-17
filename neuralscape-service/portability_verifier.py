@@ -52,6 +52,7 @@ from pydantic import ValidationError
 
 from contracts_portability import (
     PortableManifest,
+    names_below_a_file,
     normalize_bundle_path,
     validate_portable_manifest,
 )
@@ -94,6 +95,7 @@ SPECIAL_ENTRY = "special_entry"
 ENTRY_ENCRYPTED = "entry_encrypted"
 DUPLICATE_ENTRY = "duplicate_entry"
 CASE_COLLISION = "case_collision"
+PATH_CONFLICT = "path_conflict"
 MANIFEST_MISSING = "manifest_missing"
 MANIFEST_INVALID = "manifest_invalid"
 MANIFEST_SELF_LISTED = "manifest_self_listed"
@@ -241,6 +243,7 @@ _ZIP64_EOCD_SIGNATURE = b"PK\x06\x06"
 _DESCRIPTOR_SIGNATURE = b"PK\x07\x08"
 _FLAG_DESCRIPTOR = 0x8
 _FLAG_UTF8 = 0x800
+_DOS_DIRECTORY = 0x10  # low byte of external_attr: the MS-DOS directory attribute
 _LOCAL_HEADER = struct.Struct("<4sHHHHHIIIHH")
 _EOCD = struct.Struct("<4sHHHHIIH")
 _U32_MAX = 0xFFFFFFFF
@@ -508,8 +511,9 @@ def _inventory_zip(
             report.add(ENTRY_CORRUPT, _safe_label(name), "directory record carries data")
             continue
         mode = info.external_attr >> 16
-        if stat.S_ISDIR(mode) and not is_dir:
-            # Typed as a directory but named as a file: extractors disagree on what it is.
+        if (stat.S_ISDIR(mode) or info.external_attr & _DOS_DIRECTORY) and not is_dir:
+            # Typed as a directory (a Unix mode, or the DOS attribute a Windows writer sets) but named as a
+            # file: extractors disagree on what it is.
             report.add(ENTRY_CORRUPT, _safe_label(name), "directory type without a directory name")
             continue
         problem = _mode_finding(mode) if mode else None
@@ -620,6 +624,14 @@ def _walk_directory(root: int, report: VerificationReport) -> list[_Entry]:
 
 
 def _collision_checks(entries: list[_Entry], report: VerificationReport) -> None:
+    # A regular file cannot also be a directory: every entry (an implicit parent too, and the manifest file
+    # itself) is checked against the regular-file names under the same folding, component by component.
+    for name in names_below_a_file(
+        (entry.name for entry in entries),
+        (entry.name for entry in entries if entry.kind == "file"),
+        _fold,
+    ):
+        report.add(PATH_CONFLICT, _safe_label(name), "an ancestor is a file")
     seen_exact: dict[str, int] = {}
     seen_folded: dict[str, str] = {}
     for entry in entries:
@@ -667,9 +679,12 @@ def _zip_member_chunks(info: zipfile.ZipInfo, raw: BinaryIO) -> Iterator[bytes]:
                 if not pending:
                     raise ValueError("truncated member")
                 remaining -= len(pending)
-            if not pending and not decompressor.eof:
-                raise ValueError("deflate stream ended early")
+            # All the compressed input may be consumed while zlib still holds buffered output (a stream of
+            # 65,537 identical bytes inflates past one chunk); ``decompress(b"", n)`` drains it.  The stream
+            # is truncated only when that yields nothing and it has not ended.
             chunk = decompressor.decompress(pending, _CHUNK)
+            if not pending and not chunk and not decompressor.eof:
+                raise ValueError("deflate stream ended early")
             pending = decompressor.unconsumed_tail
             if decompressor.eof:
                 if decompressor.unused_data or pending or remaining:
@@ -941,21 +956,43 @@ def _precheck_central_directory(target: str | os.PathLike[str] | BinaryIO, repor
     return True
 
 
+def _root_name(target: str | bytes) -> str:
+    """The bundle path without trailing directory spellings (``alias/``, ``alias//``, ``alias/.``).
+
+    ``os.path.islink("alias/")`` and an ``O_NOFOLLOW`` open of ``"alias/."`` follow the link on Linux, so a
+    symlinked root spelled with a trailing slash or dot would verify clean.  Whatever names the root's last
+    real component is checked and opened instead (``/`` and ``.`` themselves are left alone).
+    """
+
+    text = os.fsdecode(target)
+    while True:
+        if len(text) > 1 and text.endswith("/"):
+            text = text.rstrip("/") or "/"
+        elif text.endswith("/."):
+            text = text[:-2] or "/"
+        else:
+            return text
+
+
 def verify_bundle(path: str | os.PathLike[str]) -> VerificationReport:
     """Verify a bundle directory or zip file; never extracts or mutates it."""
 
     report = VerificationReport()
     target = os.fspath(path)
-    if os.path.islink(target):
+    # The root is judged and opened by the name of its last real component: a trailing ``/`` or ``/.``
+    # makes the kernel (and ``islink``) follow a link there.  An archive keeps the path as spelled, so a
+    # file named with a trailing slash is still not a readable archive.
+    named = _root_name(target)
+    if os.path.islink(named):
         report.add(SYMLINK_ENTRY, "<bundle>")
         return report
     # A directory is opened once, without following a link, and walked and read beneath
     # that descriptor, so a root or directory swapped for a link later is never followed.
     try:
-        root = os.open(target, os.O_RDONLY | os.O_DIRECTORY | _NOFOLLOW | _CLOEXEC)
+        root = os.open(named, os.O_RDONLY | os.O_DIRECTORY | _NOFOLLOW | _CLOEXEC)
     except OSError as exc:
         try:
-            linked = exc.errno in (errno.ELOOP, errno.ENOTDIR) and stat.S_ISLNK(os.lstat(target).st_mode)
+            linked = exc.errno in (errno.ELOOP, errno.ENOTDIR) and stat.S_ISLNK(os.lstat(named).st_mode)
         except OSError:
             linked = False
         if linked:
