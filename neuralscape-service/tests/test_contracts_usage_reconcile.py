@@ -4107,3 +4107,56 @@ def test_a_set_holding_a_mapping_is_a_validation_error_for_a_result_receiver(sha
     field = "streams" if receiver is UsageReconciliation else "usage"
     with pytest.raises(ValueError):  # ValidationError is a ValueError; a TypeError is the leak
         receiver.model_validate({field: value})
+
+
+# ---- the usage snapshot has a discovery envelope: depth and public-view breadth
+
+def test_deep_nesting_is_a_validation_error_for_a_result_receiver() -> None:
+    node: object = ()
+    for _ in range(20_000):
+        node = (node,)
+    with pytest.raises(ValueError):  # a RecursionError is the leak
+        ReconciledUsageStream.model_validate({"usage": node})
+
+
+@pytest.mark.parametrize("kind", ["list-view", "dict-items-view", "public-mapping", "set-view"])
+def test_a_public_view_is_not_read_past_a_bounded_number_of_entries(kind: str) -> None:
+    from collections.abc import Mapping
+
+    produced = {"n": 0}
+    limit = 400_000
+
+    def endless():
+        while produced["n"] < limit:
+            produced["n"] += 1
+            yield produced["n"]
+
+    class ListView(list):
+        def __iter__(self):
+            return endless()
+
+    class DictView(dict):
+        def items(self):
+            return ((k, k) for k in endless())
+
+    class PublicMapping(Mapping):
+        def __getitem__(self, key):
+            return key
+
+        def __iter__(self):
+            return endless()
+
+        def __len__(self):
+            return 0
+
+        def items(self):
+            return ((k, k) for k in endless())
+
+    class SetView(set):
+        def __iter__(self):
+            return endless()
+
+    value = {"list-view": ListView(), "dict-items-view": DictView(), "public-mapping": PublicMapping(), "set-view": SetView()}[kind]
+    with pytest.raises(ValueError):
+        usage_reconcile_contracts._native_snapshot({"k": value})
+    assert produced["n"] < limit, "the view was read to its end"

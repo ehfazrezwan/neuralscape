@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
@@ -11,7 +12,13 @@ from pydantic import BaseModel, ConfigDict, GetCoreSchemaHandler, model_validato
 from pydantic_core import core_schema
 
 from contracts_common import ContractModel, MAX_SAFE_INTEGER, OpaqueId, SafeCounter
-from contracts_limits import inherits_native, is_native_instance
+from contracts_limits import (
+    DISCOVERY_BUDGET_MESSAGE,
+    STANDARD,
+    DiscoveryBudget,
+    inherits_native,
+    is_native_instance,
+)
 from contracts_tenancy import unpack_pairs
 from contracts_usage import (
     AttributionSnapshot,
@@ -83,6 +90,26 @@ class _ValidatedPublicMappingEntries:
     retained_entries: tuple[tuple[object, object, object], ...]
 
 
+_BUDGET_KEY = ("discovery-budget",)
+
+
+def _session_budget(memo: dict) -> DiscoveryBudget:
+    """The one discovery envelope of this snapshot call (it lives in the call's memo)."""
+
+    budget = memo.get(_BUDGET_KEY)
+    if budget is None:
+        budget = memo[_BUDGET_KEY] = DiscoveryBudget(STANDARD)
+    return budget
+
+
+def _charged(entries: Iterable[object], budget: DiscoveryBudget) -> Iterator[object]:
+    """Yield each entry of a public view after charging it, so an endless or huge view is cut off."""
+
+    for entry in entries:
+        budget.charge_edge()
+        yield entry
+
+
 def _validate_public_mapping_entries(
     entries: Iterable[object],
 ) -> _FailedNativeDictTraversal | _ValidatedPublicMappingEntries:
@@ -101,6 +128,8 @@ def _validate_public_mapping_entries(
             break
         except Exception as exc:
             return _FailedNativeDictTraversal(exc)
+        if len(retained_entries) >= STANDARD.max_edges:
+            raise ValueError(DISCOVERY_BUDGET_MESSAGE)  # a view is read only as far as the envelope allows
         try:
             key, public_value = pair
         except Exception as exc:
@@ -391,6 +420,9 @@ def _is_node(value: object) -> bool:
     return is_native_instance(value, BaseModel, list, tuple, set, frozenset) or _is_real_mapping(value)
 
 
+_freeze_state = threading.local()  # the current depth of the recursive freeze, per thread
+
+
 def _freeze_model_storage(
     value: object,
     frozen_models: dict[int, _FrozenModelStorage],
@@ -399,6 +431,24 @@ def _freeze_model_storage(
     visited: set[int],
 ) -> None:
     """Capture reachable native model stores without public traversal hooks."""
+
+    depth = getattr(_freeze_state, "depth", 0)
+    if depth > STANDARD.max_depth:
+        raise ValueError(DISCOVERY_BUDGET_MESSAGE)  # nesting beyond the envelope is refused, not recursed into
+    _freeze_state.depth = depth + 1
+    try:
+        _freeze_model_storage_body(value, frozen_models, frozen_dicts, frozen_tuples, visited)
+    finally:
+        _freeze_state.depth = depth
+
+
+def _freeze_model_storage_body(
+    value: object,
+    frozen_models: dict[int, _FrozenModelStorage],
+    frozen_dicts: dict[int, _FrozenDictStorage],
+    frozen_tuples: dict[int, _FrozenTupleStorage],
+    visited: set[int],
+) -> None:
 
     value_type = type(value)
     is_native_container = any(
@@ -573,7 +623,10 @@ def _snapshot_uncached(
     if identity in active:
         raise ValueError("cyclic input graph")
     active.add(identity)
+    budget = _session_budget(_memo)
     try:
+        if len(active) > STANDARD.max_depth:
+            raise ValueError(DISCOVERY_BUDGET_MESSAGE)
         if is_native_instance(value, BaseModel):
             frozen = _frozen_models.get(identity)
             if frozen is None or frozen[0] is not value:
@@ -594,9 +647,9 @@ def _snapshot_uncached(
                 else:
                     if not _is_real_mapping(extras):
                         raise ValueError("contract extra storage must be a mapping")
-                    iterated_extra_names = tuple(extras)
+                    iterated_extra_names = tuple(_charged(extras, budget))
                     # One unpacking per pair: the name check and the field build share these tuples.
-                    extra_items = unpack_pairs(extras.items())
+                    extra_items = unpack_pairs(_charged(extras.items(), budget))
                     extra_names = {
                         _plain_name(name)
                         for name in (*iterated_extra_names, *(name for name, _ in extra_items))
@@ -660,6 +713,7 @@ def _snapshot_uncached(
                         break
                     except Exception as exc:
                         return _FailedNativeDictTraversal(exc)
+                    budget.charge_edge()  # a view is read only as far as the envelope allows
                     try:
                         key, field_value = pair
                     except Exception as exc:
@@ -715,7 +769,7 @@ def _snapshot_uncached(
                     _frozen_tuples=_frozen_tuples,
                     _memo=_memo,
                 )
-                for item in value
+                for item in _charged(value, budget)
             ]
         if is_native_instance(value, tuple):
             frozen_tuple = _frozen_tuples.get(identity)
@@ -748,7 +802,7 @@ def _snapshot_uncached(
                 _frozen_tuples=_frozen_tuples,
                 _memo=_memo,
             )
-            for item in value
+            for item in _charged(value, budget)
         ]
         try:
             return set(members) if is_native_instance(value, set) else frozenset(members)
