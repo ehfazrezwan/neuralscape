@@ -4551,3 +4551,44 @@ def test_a_small_validation_error_keeps_its_full_diagnostic() -> None:
     with pytest.raises(ValidationError) as caught:
         evaluate(principal(), "read", resource_value, policy_value)
     assert [(e["type"], e["input"]) for e in caught.value.errors()] == [("extra_forbidden", "visible")]
+
+
+def test_a_reach_tuple_that_reuses_a_scanned_id_is_still_scanned(monkeypatch) -> None:
+    """Scanned reach tuples are held by identity, not just by id.
+
+    An id is reused once its object is released (a shallower visit can replace a reach tuple).
+    The collision is forced here by having the module's ``id`` give the second reach tuple the id
+    of the first: that tuple must still be scanned, so the mapping behind an already-visited list
+    is captured at its exposure, before the parent iterator changes it.
+    """
+
+    import builtins
+
+    import contracts_policy_reference as reference_module
+
+    backing_a, backing_b = {"v": "a-first"}, {"v": "b-first"}
+    proxy_a, proxy_b = MappingProxyType(backing_a), MappingProxyType(backing_b)
+    list_a, list_b = [proxy_a], [proxy_b]
+
+    def pairs():
+        yield ("a", list_a)
+        yield ("b", list_b)
+        backing_b["v"] = "b-changed-after-exposure"  # runs only when the iterator is advanced again
+        yield ("c", 1)
+
+    owner = _Items(pairs)
+    root = (owner, list_a, list_b)  # the walk visits both lists before the owner's pairs expose them
+
+    real_id = builtins.id
+    first = {}
+
+    def colliding_id(obj):
+        if type(obj) is tuple and len(obj) == 1 and obj[0] is proxy_a:
+            first["id"] = real_id(obj)
+        if type(obj) is tuple and len(obj) == 1 and obj[0] is proxy_b and "id" in first:
+            return first["id"]
+        return real_id(obj)
+
+    monkeypatch.setattr(reference_module, "id", colliding_id, raising=False)
+    completed = _entry_flow(root)
+    assert completed[2][0] == {"v": "b-first"}  # captured at exposure, not after the change

@@ -476,7 +476,7 @@ def _freeze_mapping_inventories(
     budget: DiscoveryBudget | None = None,
     reach: dict[int, tuple[Mapping[object, object], ...]] | None = None,
     active_depth: int = 0,
-    scanned: set[int] | None = None,
+    scanned: dict[int, tuple[Mapping[object, object], ...]] | None = None,
 ) -> None:
     """Observe each retained public mapping inventory exactly once.
 
@@ -500,7 +500,9 @@ def _freeze_mapping_inventories(
     if reach is None:
         reach = {}
     if scanned is None:
-        scanned = set()  # reach tuples already merged into ``owners`` during this capture
+        # Reach tuples already merged into ``owners`` during this capture, held by reference for the
+        # whole call: an id alone could be reused once a shallower visit releases the tuple.
+        scanned = {}
     budget = _new_budget(budget)
     while True:
         pending = tuple(
@@ -571,12 +573,12 @@ def _freeze_mapping_inventories(
                     reach,
                 )
                 beneath = reach.get(id(item), ())
-                if beneath and id(beneath) not in scanned:
+                if beneath and scanned.get(id(beneath)) is not beneath:
                     # Including those behind containers the walk had already visited.  A reach
                     # tuple is scanned (and charged) once per capture: every mapping in it was
                     # retained and captured, or is in progress, the first time it was exposed,
                     # so a later pair exposing the same tuple has nothing new to find in it.
-                    scanned.add(id(beneath))
+                    scanned[id(beneath)] = beneath
                     budget.charge_edge(len(beneath))
                     for found in beneath:
                         _retain_mapping_owner(found, exposed)
