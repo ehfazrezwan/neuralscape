@@ -502,6 +502,61 @@ def test_record_time_applies_the_same_identity_checks_as_the_claim():
         contracts_lifecycle.validate_stage_receipts(command, [wrong_effect])  # type: ignore[arg-type]
 
 
+# ---- the copies record time returns are qualified: schema defaults cannot carry them past the claim
+def unchecked_outputs(count, form):
+    """An applied receipt whose stored handles lack ``cross_tenant``, which validation adds."""
+
+    from contracts_references import ReferenceHandle
+
+    fields = [
+        {"kind": "artifact", "id": f"o{i}", "tenant_id": "tenant-1", "resolver": "resolve_artifact"}
+        for i in range(count)
+    ]
+    applied = receipt(ProcessingStage.CANONICAL, StageStatus.APPLIED)
+    if form == "dict":
+        outputs = tuple(fields)
+    else:
+        outputs = tuple(ReferenceHandle.model_construct(_fields_set=set(item), **item) for item in fields)
+        for handle in outputs:  # model_construct fills the default; drop it from storage
+            dict.__delitem__(NATIVE_DICT.__get__(handle, BaseModel), "cross_tenant")
+    set_native(applied, "output_refs", outputs)
+    return applied
+
+
+@pytest.mark.parametrize("form", ["dict", "constructed"])
+def test_record_time_refuses_a_set_whose_normalized_copies_the_claim_could_not_read(form):
+    import time
+    import tracemalloc
+
+    from tests.test_contracts_lifecycle import intent_with_requirements, requirement
+
+    command = intent_with_requirements(requirement(ProcessingStage.CANONICAL))
+    expanding = unchecked_outputs(70_000, form)  # fits as stored; one more field per handle once validated
+    started = time.monotonic()
+    tracemalloc.start()
+    try:
+        with pytest.raises(ValueError, match=BUDGET):
+            contracts_lifecycle.validate_stage_receipts(command, (expanding,))
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert time.monotonic() - started < 60
+    assert peak < 512 * 2**20, peak
+
+
+@pytest.mark.parametrize("form", ["dict", "constructed"])
+def test_copies_returned_at_record_time_are_settled_by_the_claim_and_are_a_fixed_point(form):
+    from tests.test_contracts_lifecycle import intent_with_requirements, requirement
+
+    command = intent_with_requirements(requirement(ProcessingStage.CANONICAL))
+    kept_intent, kept = contracts_lifecycle.validate_stage_receipts(command, (unchecked_outputs(60_000, form),))
+    assert all(handle.cross_tenant is False for handle in kept[0].output_refs)
+    validate_required_stage_claim(claimed_status=IntentStatus.APPLIED, intent=kept_intent, receipts=kept)
+    assert contracts_lifecycle.validate_stage_receipts(kept_intent, kept) == (kept_intent, kept)
+    received = tuple(StageReceipt.model_validate_json(item.model_dump_json()) for item in kept)
+    validate_required_stage_claim(claimed_status=IntentStatus.APPLIED, intent=kept_intent, receipts=received)
+
+
 # ---- a native container is sized against the remaining budget before it is copied
 def test_a_wide_native_container_is_refused_before_it_is_copied():
     import tracemalloc

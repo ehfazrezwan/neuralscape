@@ -1165,9 +1165,16 @@ def validate_stage_receipts(
     ``validate_required_stage_claim``, and returns the revalidated copies.  A set that is refused
     here (for example ``contract graph exceeds the native discovery budget``) is one the claim
     could never settle, so it can be refused up front instead of stranding the intent.
+
+    The returned copies are what a store persists and what the claim later reads, and validation
+    fills schema defaults (every handle gains ``cross_tenant``), so a copy can cost more to read
+    than its input.  The copies are therefore read once more under a fresh envelope of the same
+    tier, exactly as the claim will read them: a set whose copies exceed it is refused here.
+    Revalidating copies adds nothing, so what this returns is a fixed point the claim can read.
     """
 
-    return _revalidated_claim_inputs(intent, receipts)
+    checked_intent, checked = _revalidated_claim_inputs(intent, receipts)
+    return _revalidated_claim_inputs(checked_intent, checked)
 
 
 def validate_required_stage_claim(
