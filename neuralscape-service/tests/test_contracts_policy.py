@@ -4592,3 +4592,56 @@ def test_a_reach_tuple_that_reuses_a_scanned_id_is_still_scanned(monkeypatch) ->
     monkeypatch.setattr(reference_module, "id", colliding_id, raising=False)
     completed = _entry_flow(root)
     assert completed[2][0] == {"v": "b-first"}  # captured at exposure, not after the change
+
+
+# ── a statement exposed only by a tuple's public iterator keeps the mappings it exposes ──
+
+
+def _statement_with_proxy_resource_and_extra(resource_id: str, flip_to: str | None):
+    """An allow statement whose resource is a mapping proxy and whose (empty) extra storage is a Mapping whose
+    ``items()`` rewrites the proxy's backing dict when it is read."""
+
+    backing = {"kind": "memory", "id": resource_id, "tenant_id": "tenant-a", "resolver": "memory_by_id"}
+
+    class _MutatingExtra(Mapping[str, object]):
+        def __getitem__(self, key: str) -> object:
+            raise KeyError(key)
+
+        def __iter__(self) -> Iterator[str]:
+            return iter(())
+
+        def __len__(self) -> int:
+            return 0
+
+        def items(self):  # type: ignore[override]
+            if flip_to is not None:
+                backing["id"] = flip_to
+            return iter(())
+
+    value = statement("allow-it", "allow", "read", reference(resource_id))
+    object.__setattr__(value, "resource", MappingProxyType(backing))
+    _BASE_MODEL_EXTRA_DESCRIPTOR.__set__(value, _MutatingExtra())
+    return value, backing
+
+
+def _outcome(make_policy) -> str:
+    try:
+        return evaluate(principal(), "read", reference("memory-1"), make_policy()).outcome
+    except ValidationError:
+        return "refused"
+
+
+def test_a_public_iterator_only_statement_cannot_have_its_resource_rewritten_by_its_extra_mapping() -> None:
+    entry_visible, _ = _statement_with_proxy_resource_and_extra("other", "memory-1")
+    public_only, backing = _statement_with_proxy_resource_and_extra("other", "memory-1")
+
+    assert _outcome(lambda: policy(entry_visible)) != "allow"
+    assert _outcome(lambda: _policy_with_public_only_statements(public_only)) != "allow"  # was "allow": id flipped first
+    assert backing["id"] == "memory-1"  # the callback did run; the captured resource was already frozen
+
+
+def test_a_public_iterator_only_statement_with_an_honest_extra_mapping_is_evaluated_as_written() -> None:
+    honest, _ = _statement_with_proxy_resource_and_extra("memory-1", None)
+    assert _outcome(lambda: _policy_with_public_only_statements(honest)) in {"allow", "refused"}
+    other, _ = _statement_with_proxy_resource_and_extra("other", None)
+    assert _outcome(lambda: _policy_with_public_only_statements(other)) != "allow"
