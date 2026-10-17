@@ -426,10 +426,15 @@ def _unverified(path: str, what: str) -> str:
 def _allowed_values(schema: dict) -> list | None:
     """The finite value set a schema restricts to, or ``None`` when unrestricted."""
 
-    if "const" in schema:
+    has_const, has_enum = "const" in schema, "enum" in schema
+    if has_const and has_enum:
+        # Both constrain the value, so only what satisfies both is allowed (possibly nothing).
+        enum = schema["enum"] if isinstance(schema["enum"], list) else []
+        return [schema["const"]] if any(_json_equal(schema["const"], member) for member in enum) else []
+    if has_const:
         return [schema["const"]]
-    if "enum" in schema:
-        return list(schema["enum"])
+    if has_enum:
+        return list(schema["enum"]) if isinstance(schema["enum"], list) else []
     return None
 
 

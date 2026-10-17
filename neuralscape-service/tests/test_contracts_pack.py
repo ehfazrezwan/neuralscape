@@ -982,3 +982,29 @@ def test_a_dirty_shared_pair_inside_a_union_trial_still_fails_the_match() -> Non
     # the first path (property a) records P as narrowed; the union trial under b must not read it as clean
     assert any(f.startswith("$.a") and "maxLength lowered" in f for f in findings)
     assert any(f.startswith("$.b") and ("no longer accepted" in f or "maxLength lowered" in f) for f in findings), findings
+
+
+# --------------------------------------------------------------- sweep: const and enum together, non-dict roots
+
+
+@pytest.mark.parametrize(
+    "old, new",
+    [
+        ({"const": "abc"}, {"const": "abc", "enum": []}),
+        ({"const": "abc"}, {"const": "abc", "enum": ["x", "y"]}),
+        ({"const": 1}, {"const": 1, "enum": [True]}),
+        ({"enum": [1, 2, 3]}, {"enum": [1, 2, 3], "const": 4}),
+        ({"enum": [1, 2, 3]}, {"enum": [1, 2, 3], "const": 2}),
+    ],
+    ids=["enum-empty-beside-const", "enum-without-the-const", "enum-true-is-not-the-const-one", "const-outside-the-enum",
+         "const-inside-the-enum-narrows"],
+)
+def test_a_const_and_an_enum_together_allow_only_what_satisfies_both(old, new) -> None:
+    assert _pair(old, new), "values the old schema accepted are rejected"
+
+
+def test_a_const_and_an_enum_that_agree_change_nothing() -> None:
+    assert _pair({"const": 2}, {"const": 2, "enum": [1, 2.0]}) == []  # 2 equals 2.0 as JSON
+    assert _pair({"const": 1, "enum": [1, 2]}, {"const": 1}) == []  # the enum only repeated the const: a widening
+    assert _pair({"const": 1, "enum": [1, 2]}, {"const": 1, "enum": [1, 2]}) == []
+
