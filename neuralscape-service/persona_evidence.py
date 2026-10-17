@@ -160,7 +160,11 @@ def main(argv: list[str] | None = None) -> int:
         for record in records:
             print(f"{record.scenario_id}: {record.verdict}")
         return 0
-    read = EvidenceWriter(args.evidence).read()
+    evidence = Path(args.evidence)
+    if not evidence.is_file():   # a mistyped path must not become an empty, successful report
+        print(f"error: evidence file not found: {evidence}", file=sys.stderr)
+        return 2
+    read = EvidenceWriter(evidence).read()
     text = render_report(compare(read.records))
     damaged = bool(read.invalid_lines or read.partial_tail)
     if damaged:

@@ -232,3 +232,29 @@ def test_the_report_of_clean_evidence_exits_zero_without_a_warning(tmp_path) -> 
     report = tmp_path / "report.md"
     assert pe.main(["report", "--evidence", str(out), "--out", str(report)]) == 0
     assert "integrity" not in report.read_text().lower()
+
+
+def test_a_missing_evidence_file_is_refused_not_reported_as_an_empty_success(tmp_path, capsys) -> None:
+    report = tmp_path / "report.md"
+    missing = tmp_path / "nowhere" / "evidence.jsonl"
+    code = pe.main(["report", "--evidence", str(missing), "--out", str(report)])
+    assert code != 0 and not report.exists()
+    assert "evidence" in capsys.readouterr().err
+    assert not missing.parent.exists()   # reading must not create the directory it was told to read
+
+
+def test_a_directory_is_not_accepted_as_the_evidence_file(tmp_path) -> None:
+    report = tmp_path / "report.md"
+    assert pe.main(["report", "--evidence", str(tmp_path), "--out", str(report)]) != 0 and not report.exists()
+
+
+def test_the_report_flags_invalid_utf8_in_a_record_and_exits_nonzero(tmp_path) -> None:
+    out = tmp_path / "evidence.jsonl"
+    pe.run(tmp_path, "baseline", "tree-a", ORACLES, out, "run-1")
+    lines = out.read_bytes().split(b"\n")
+    assert b"tree-a" in lines[0]
+    lines[0] = lines[0].replace(b"tree-a", b"tree-\xff")
+    out.write_bytes(b"\n".join(lines))
+    report = tmp_path / "report.md"
+    code = pe.main(["report", "--evidence", str(out), "--out", str(report)])
+    assert code != 0 and "invalid line" in report.read_text().lower()
