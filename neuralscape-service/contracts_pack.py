@@ -917,6 +917,26 @@ def _same_value(old: object, new: object) -> bool:
 
 _UNEVALUATED = frozenset({"unevaluatedProperties", "unevaluatedItems"})
 
+# Unmodelled keywords whose meaning does not depend on their siblings: each one constrains the instance on
+# its own (in conjunction with the rest), so with its value unchanged a change beside it is judged by the
+# siblings' own comparison.  A change to the keyword's value is still an unverified change.  Every other
+# unmodelled keyword (an extension, a dialect or vocabulary declaration, a dynamic anchor or reference,
+# additionalItems, ...) may depend on what is beside it, so any change around it is not verified.
+_SIBLING_INDEPENDENT = frozenset({
+    "not", "allOf", "if", "then", "else", "contains", "minContains", "maxContains", "propertyNames",
+    "dependentRequired", "dependentSchemas", "dependencies", "patternProperties", "format", "contentEncoding",
+    "contentMediaType", "contentSchema", "definitions", "$anchor", "$id",
+    "discriminator",  # (an OpenAPI hint the generated contracts carry: a 2020-12 validator treats it as an annotation)
+    "unevaluatedProperties", "unevaluatedItems",  # (guarded on their own, with referenced targets)
+})
+_PLAIN_DIALECT = "https://json-schema.org/draft/2020-12/schema"
+
+
+def _plain_dialect(key: str, old: dict, new: dict) -> bool:
+    """A ``$schema`` naming the dialect the checker implements, on both sides, changes nothing beside it."""
+
+    return key == "$schema" and old.get(key) == _PLAIN_DIALECT and new.get(key) == _PLAIN_DIALECT
+
 
 def _keys(schema: object) -> set:
     return set(schema) if isinstance(schema, dict) else set()
@@ -1075,12 +1095,22 @@ def _compare(
         old = {key: value for key, value in old.items() if key not in malformed}
         new = {key: value for key, value in new.items() if key not in malformed}
     _charge_walk(len(old) + len(new))  # the node's keys are scanned on every visit, memoized pair or not
-    for key in sorted((set(old) | set(new)) - _MODELED - _ANNOTATIONS):
+    unmodelled = (set(old) | set(new)) - _MODELED - _ANNOTATIONS
+    sensitive = sorted(key for key in unmodelled - _SIBLING_INDEPENDENT if not _plain_dialect(key, old, new))
+    if (
+        sensitive
+        and all(_same_value(old.get(k, _ABSENT), new.get(k, _ABSENT)) for k in sensitive)  # a change to one: below
+        and not _unevaluated_node_same(old, new, old_defs, new_defs)
+    ):
+        # A keyword the checker does not understand may depend on anything beside it (an extension, a dialect,
+        # a dynamic scope): with it unchanged, any other change to the node is not verified.
+        out.append(_unverified(path, f"a schema with a keyword not modelled ({', '.join(sensitive[:3])}) changed around it"))
+    for key in sorted(unmodelled):
         # Compared with its keyword, so the equality knows what the value is: in a map of names to schemas
         # (``patternProperties``, ``dependentSchemas``) a name such as ``const`` is a name, and the schema
         # it maps to is expanded like any other.
         before, after = old.get(key, _ABSENT), new.get(key, _ABSENT)
-        if key in _SCHEMA_MAPS or key in _LITERAL_KEYWORDS:
+        if key in _SCHEMA_MAPS or key in _LITERAL_KEYWORDS or key in _DYNAMIC_REFERENCES:
             before = {key: before} if before is not _ABSENT else before
             after = {key: after} if after is not _ABSENT else after
         if not _same(before, after, old_defs, new_defs):

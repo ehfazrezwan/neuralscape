@@ -844,7 +844,11 @@ def test_an_unmodelled_keyword_added_changed_or_removed_is_an_unverified_change(
     assert _unverified(_pair(base, with_keyword), f"{keyword} changed")
     assert _unverified(_pair(with_keyword, base), f"{keyword} changed")  # removal is not assumed to widen
     assert _pair(with_keyword, with_keyword) == []
-    assert _pair(with_keyword, {"type": "object", "description": "x", keyword: value}) == []
+    annotated = _pair(with_keyword, {"type": "object", "description": "x", keyword: value})
+    if keyword in pack._DYNAMIC_REFERENCES:
+        assert annotated, annotated  # resolved at validation time: any change to the document fails closed
+    else:
+        assert annotated == []
 
 
 def test_an_unmodelled_keyword_beside_a_union_is_still_checked() -> None:
@@ -2677,3 +2681,42 @@ def _pointer_doc(extra: dict) -> dict:
 )
 def test_each_long_text_read_is_charged(pair, at_least) -> None:
     assert _walked(*pair) >= at_least
+
+
+# ---- reference-like and unmodelled keywords fail closed: never compared as plain text, never silently around
+
+
+@pytest.mark.parametrize("keyword", ["$dynamicRef", "$recursiveRef"])
+@pytest.mark.parametrize("entry", ["check_compatibility", "compare_schemas"])
+def test_an_unchanged_dynamic_reference_with_a_changed_target_is_reported(keyword, entry) -> None:
+    def schema(name_type: str) -> dict:
+        return {"$defs": {"Name": {"type": name_type}}, keyword: "#/$defs/Name"}
+
+    old, new = schema("string"), schema("integer")  # "text" was valid, now rejected
+    findings = _pair(old, new) if entry == "check_compatibility" else pack.compare_schemas({"C": old}, {"C": new}).get("C", [])
+    assert any(keyword in f for f in findings), findings
+    unchanged = _pair(schema("string"), schema("string")) if entry == "check_compatibility" else pack.compare_schemas({"C": schema("string")}, {"C": schema("string")}).get("C", [])
+    assert unchanged == []
+
+
+@pytest.mark.parametrize(
+    "keyword, value",
+    [("x-vendor", {"mode": "strict"}), ("additionalItems", False), ("$vocabulary", {"https://example.com/v": True}),
+     ("$dynamicAnchor", "node"), ("nullable", True), ("$schema", "http://json-schema.org/draft-04/schema#")],
+)
+@pytest.mark.parametrize("entry", ["check_compatibility", "compare_schemas"])
+def test_a_keyword_not_understood_fails_closed_when_its_siblings_change(keyword, value, entry) -> None:
+    old = {"type": "string", "maxLength": 5, keyword: value}
+    new = {"type": "string", "maxLength": 10, keyword: value}  # a widening, but the keyword may depend on it
+    findings = _pair(old, new) if entry == "check_compatibility" else pack.compare_schemas({"C": old}, {"C": new}).get("C", [])
+    assert any("not modelled" in f for f in findings), findings
+    assert _pair(old, copy.deepcopy(old)) == []  # unchanged: clean
+
+
+@pytest.mark.parametrize(
+    "keyword, value",
+    [("format", "date-time"), ("not", {"const": "x"}), ("propertyNames", {"maxLength": 9}), ("$schema", "https://json-schema.org/draft/2020-12/schema"),
+     ("$anchor", "here"), ("contentMediaType", "text/plain"), ("discriminator", {"propertyName": "kind"})],
+)
+def test_an_understood_keyword_does_not_fail_closed_on_an_independent_sibling_change(keyword, value) -> None:
+    assert _pair({"type": "string", "maxLength": 5, keyword: value}, {"type": "string", "maxLength": 10, keyword: value}) == []
