@@ -15,7 +15,7 @@ from typing import Any, Callable, Iterator, NamedTuple, TypeVar
 from pydantic import BaseModel, TypeAdapter, model_validator
 
 from contracts_common import ContractModel, OpaqueId, VersionedContract
-from contracts_limits import DISCOVERY_BUDGET_MESSAGE, DiscoveryBudget
+from contracts_limits import DISCOVERY_BUDGET_MESSAGE, DiscoveryBudget, is_exact_type
 from contracts_native import is_subclass
 from contracts_references import ReferenceHandle
 
@@ -50,6 +50,8 @@ class _FrozenContainerState(NamedTuple):
 
 
 _TYPE_MRO = vars(type)["__mro__"]
+# Non-text keys whose hashing and comparison run no caller code and never equal a text key.
+_INERT_NON_TEXT_KEYS = (int, float, bool, type(None))
 
 
 def _is_real_mapping(value: Any) -> bool:
@@ -501,10 +503,17 @@ def _snapshot_native_value(
                 # name to the JSON guard: an exact-str-only test would withhold the name.  Its
                 # text is read without running its hooks and stored as a plain str; two keys
                 # that collapse to one name are refused rather than one silently winning.
+                # Every contract mapping is keyed by text.  A key of any other caller-defined type is
+                # refused before it is inserted: inserting it would run its hash and equality hooks,
+                # and one that matches a text key would silently overwrite that key's value.  An exact
+                # built-in number, bool or None runs no code and never equals a text key, so it is left
+                # to strict validation, which reports it as before.
                 if is_subclass(type(key), str):
                     key = str.__str__(key)
                     if key in result:
                         raise ValueError(f"contract mapping has colliding keys at {location}")
+                elif not is_exact_type(key, *_INERT_NON_TEXT_KEYS):
+                    raise ValueError(f"contract mapping keys must be text at {location}")
                 result[key] = child(item, f"{location}[key]", key if type(key) is str else None)
                 _close_pair(rest)
         elif is_subclass(value_type, (list, tuple)):

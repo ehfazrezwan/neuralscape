@@ -1977,3 +1977,39 @@ def test_a_malformed_mapping_pair_is_refused_as_unpacking_would(pair, message):
     request, result = _generation_with_output(Output(answer=None), answer={"type": "array"})
     with pytest.raises(ValueError, match=message):
         validate_generation_result(request, result)
+
+
+class _ImpostorKey:
+    """A non-text key that hashes and compares like ``"score"`` and records its hooks."""
+
+    hooks: list[str] = []
+
+    def __hash__(self):
+        _ImpostorKey.hooks.append("hash")
+        return hash("score")
+
+    def __eq__(self, other):
+        _ImpostorKey.hooks.append("eq")
+        return other == "score"
+
+
+def test_a_non_text_key_in_a_public_view_cannot_overwrite_a_text_key_or_run_its_hooks():
+    class Output(dict):
+        def items(self):
+            return iter([("score", 999), (_ImpostorKey(), 5)])  # 999 breaks the schema; the impostor would "fix" it
+
+    request, result = _generation_with_output(Output(score=999), score={"type": "integer", "maximum": 10})
+    _ImpostorKey.hooks = []
+    with pytest.raises(ValueError, match="keys must be text"):
+        validate_generation_result(request, result)
+    assert _ImpostorKey.hooks == []
+
+
+def test_a_non_text_key_in_native_storage_is_refused_without_running_its_hooks():
+    output = {}
+    output[_ImpostorKey()] = 5  # stored before the call; the call itself must not hash or compare it
+    request, result = _generation_with_output(output, score={"type": "integer", "maximum": 10})
+    _ImpostorKey.hooks = []
+    with pytest.raises(ValueError, match="keys must be text"):
+        validate_generation_result(request, result)
+    assert _ImpostorKey.hooks == []
