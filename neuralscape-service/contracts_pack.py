@@ -830,13 +830,37 @@ def _unevaluated_node_same(old: object, new: object, old_defs: dict, new_defs: d
         if known is not None and known[0] is old and known[1] is new:
             return known[2]
 
+    roots = run.roots if run is not None and run.roots is not None else ()
+
     def bare(schema: object) -> object:
-        return {k: v for k, v in schema.items() if k not in _ANNOTATIONS} if isinstance(schema, dict) else schema
+        if not isinstance(schema, dict):
+            return schema
+        # A copy of a document root stands in for the root: its $id names the document, not an embedded
+        # resource, so it is left out with the annotations (or the copy would not expand its references).
+        drop = _ANNOTATIONS | {"$id"} if any(schema is root for root in roots) else _ANNOTATIONS
+        return {k: v for k, v in schema.items() if k not in drop}
 
     same = _same(bare(old), bare(new), old_defs, new_defs)
     if run is not None:
         run.unevaluated[key] = (old, new, same)  # the nodes are kept, so their ids are their own for the run
     return same
+
+
+def _unevaluated_guard(old: object, new: object, old_defs: dict, new_defs: dict, path: str, out: list[str]) -> None:
+    """Report a change around an unchanged unevaluatedProperties/unevaluatedItems in this node pair.
+
+    What such a keyword rejects depends on what every sibling (and every schema they reference) evaluates,
+    which is not tracked: any other change to the node is not verified.  A change to the keyword itself is
+    reported as an unmodelled keyword change; a boolean on either side is a change of shape.
+    """
+
+    if (
+        isinstance(old, dict) and isinstance(new, dict)
+        and (_UNEVALUATED & _keys(old) or _UNEVALUATED & _keys(new))
+        and all(_same_value(old.get(k, _ABSENT), new.get(k, _ABSENT)) for k in _UNEVALUATED)
+        and not _unevaluated_node_same(old, new, old_defs, new_defs)
+    ):
+        out.append(_unverified(path, "a schema with unevaluatedProperties or unevaluatedItems changed"))
 
 
 def _embedded_resource(old: object, new: object, path: str, out: list[str]) -> bool:
@@ -874,15 +898,7 @@ def _compare(
     if depth > _MAX_COMPARE_DEPTH:
         out.append(f"{path}: schema nesting exceeds the comparison depth limit; compatibility not verified")
         return
-    if (
-        isinstance(old, dict) and isinstance(new, dict)  # a boolean on either side is a change of shape, reported below
-        and (_UNEVALUATED & _keys(old) or _UNEVALUATED & _keys(new))
-        and all(_same_value(old.get(k, _ABSENT), new.get(k, _ABSENT)) for k in _UNEVALUATED)  # else reported below
-        and not _unevaluated_node_same(old, new, old_defs, new_defs)
-    ):
-        # What an unchanged unevaluatedProperties/unevaluatedItems rejects depends on what every sibling (and
-        # every schema they reference) evaluates, which is not tracked: any change around it is not verified.
-        out.append(_unverified(path, "a schema with unevaluatedProperties or unevaluatedItems changed"))
+    _unevaluated_guard(old, new, old_defs, new_defs, path, out)
     base = len(active)  # references already being compared above this node
     if _embedded_resource(old, new, path, out):
         return  # before any reference is followed: its own $ref resolves inside it
@@ -903,12 +919,20 @@ def _compare(
             return
         if pair is not None:
             active = (*active, pair)
+    written_old, written_new = old, new
     old, old_beside = _resolve(old, old_defs)
     new, new_beside = _resolve(new, new_defs)
     if (old_beside or new_beside) and not _same(old_beside, new_beside, old_defs, new_defs):
         # Resolving a reference replaces the schema, so constraints written beside it (``maxLength``
         # next to ``$ref``) would be dropped; a change in them is not verified.
         out.append(_unverified(path, "constraints beside a $ref changed"))
+    elif any(_UNEVALUATED & set(beside) for beside in (*old_beside, *new_beside)) and not _unevaluated_node_same(
+        written_old, written_new, old_defs, new_defs
+    ):
+        # An unchanged unevaluated keyword beside a reference in the chain depends on what the targets evaluate.
+        out.append(_unverified(path, "a schema with unevaluatedProperties or unevaluatedItems changed"))
+    if old is not written_old or new is not written_new:
+        _unevaluated_guard(old, new, old_defs, new_defs, path, out)  # the reference's target carries its own
     if isinstance(old, dict) and isinstance(new, dict) and old.get("$ref") == "#" and new.get("$ref") == "#":
         # A root reference points at the root of the document it is written in, and the two documents differ:
         # compare those roots (a root already being compared is assumed, as any recursive reference is).

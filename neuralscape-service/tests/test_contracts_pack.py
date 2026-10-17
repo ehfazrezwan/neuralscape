@@ -2148,3 +2148,51 @@ def test_a_pointer_to_the_embedded_resource_itself_is_judged_as_the_resource() -
     widened = copy.deepcopy(old)
     widened["properties"] = {"y": {}}
     assert _pair(old, widened) == []  # the resource is unchanged and self-contained: still compared, still equal
+
+
+# ---- unevaluated keywords: a root with $id keeps its scope, and referenced targets are guarded too
+
+
+def test_a_root_with_an_id_still_expands_its_references_beside_unevaluated_properties() -> None:
+    def schema(base: dict) -> dict:
+        return {"$id": "https://example.com/root", "$defs": {"Base": {"type": "object", **base}},
+                "$ref": "#/$defs/Base", "unevaluatedProperties": False}
+
+    findings = _pair(schema({"additionalProperties": True}), schema({}))  # {"z": 1} is now rejected
+    assert any("unevaluated" in f for f in findings), findings
+
+
+@pytest.mark.parametrize(
+    "evaluating, keyword",
+    [({"type": "object", "additionalProperties": True}, "unevaluatedProperties"),
+     ({"type": "array", "items": True}, "unevaluatedItems")],
+)
+def test_a_referenced_target_carrying_unevaluated_is_guarded(evaluating, keyword) -> None:
+    def schema(base: dict) -> dict:
+        return {"$defs": {"Base": {**base, keyword: False}}, "$ref": "#/$defs/Base"}
+
+    stripped = {k: v for k, v in evaluating.items() if k == "type"}
+    findings = _pair(schema(evaluating), schema(stripped))  # {"z": 1} / [1] is now rejected
+    assert any("unevaluated" in f for f in findings), findings
+
+
+def test_an_intermediate_reference_carrying_unevaluated_is_guarded() -> None:
+    def schema(base: dict) -> dict:
+        return {"$defs": {"Base": {"type": "object", **base},
+                          "Middle": {"$ref": "#/$defs/Base", "unevaluatedProperties": False}},
+                "$ref": "#/$defs/Middle"}
+
+    findings = _pair(schema({"additionalProperties": True}), schema({}))
+    assert any("unevaluated" in f for f in findings), findings
+
+
+def test_unchanged_referenced_unevaluated_schemas_compare_clean() -> None:
+    for schema in (
+        {"$id": "https://example.com/root", "$defs": {"Base": {"type": "object", "additionalProperties": True}},
+         "$ref": "#/$defs/Base", "unevaluatedProperties": False},
+        {"$defs": {"Base": {"type": "object", "additionalProperties": True, "unevaluatedProperties": False}}, "$ref": "#/$defs/Base"},
+        {"$defs": {"Base": {"type": "object"}, "Middle": {"$ref": "#/$defs/Base", "unevaluatedProperties": False}},
+         "$ref": "#/$defs/Middle"},
+    ):
+        assert _pair(schema, copy.deepcopy(schema)) == []
+        assert _pair(schema, {**copy.deepcopy(schema), "description": "d"}) == []
