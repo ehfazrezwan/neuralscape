@@ -243,6 +243,10 @@ def _pointer_target(root: object, ref: str) -> object:
         raise _TooLarge  # an anchor, another document or an encoded pointer: not resolved, so not shown equal
     node = root
     for token in ref[2:].split("/") if ref != "#" else ():
+        if node is not root and isinstance(node, dict) and "$id" in node:
+            # The pointer passes through an embedded resource: what it reaches resolves its own references in
+            # that resource's scope, which is not modelled, so it is not shown equal.
+            raise _TooLarge
         token = token.replace("~1", "/").replace("~0", "~")
         if isinstance(node, dict) and token in node:
             node = node[token]

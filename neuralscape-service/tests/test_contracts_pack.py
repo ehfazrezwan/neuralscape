@@ -2116,3 +2116,35 @@ def test_an_unchanged_array_of_schemas_compares_clean(keyword) -> None:
     schema = _array_of_refs(keyword, "string")
     assert _pair(schema, copy.deepcopy(schema)) == []
     assert _pair(_array_of_refs(keyword, "string", under_not=True), _array_of_refs(keyword, "string", under_not=True)) == []
+
+
+# ---- a local pointer that passes through an embedded resource cannot keep that resource's scope
+
+
+def _through_resource(local_name: dict, pointer: str = "#/$defs/Resource/properties/x") -> dict:
+    return {
+        "$defs": {
+            "Name": {"type": "integer"},
+            "Resource": {"$id": "https://example.com/resource", "$defs": {"Name": local_name},
+                         "properties": {"x": {"$ref": "#/$defs/Name"}}},
+        },
+        "not": {"$ref": pointer},
+    }
+
+
+def test_a_pointer_through_an_embedded_resource_is_not_shown_equal() -> None:
+    findings = _pair(_through_resource({"type": "integer"}), _through_resource({"type": "string"}))  # "text" now invalid
+    assert any("not changed" in f for f in findings), findings
+
+
+def test_a_pointer_through_an_unchanged_embedded_resource_in_an_unchanged_document_compares_clean() -> None:
+    schema = _through_resource({"type": "integer"})
+    assert _pair(schema, copy.deepcopy(schema)) == []
+
+
+def test_a_pointer_to_the_embedded_resource_itself_is_judged_as_the_resource() -> None:
+    old = _through_resource({"type": "integer"}, "#/$defs/Resource")
+    assert any("not changed" in f for f in _pair(old, _through_resource({"type": "string"}, "#/$defs/Resource")))
+    widened = copy.deepcopy(old)
+    widened["properties"] = {"y": {}}
+    assert _pair(old, widened) == []  # the resource is unchanged and self-contained: still compared, still equal
