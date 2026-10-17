@@ -8,7 +8,7 @@
       "skips": [
         {
           "test": "::tests.test_integrated_reference_story",
-          "reason_contains": "absent module(s): contracts_lifecycle, contracts_policy, contracts_policy_reference, contracts_freshness, contracts_inference, contracts_portability"
+          "reason_contains": "absent module(s): contracts_freshness, contracts_portability"
         },
         {
           "test": "tests.test_baseline_reproductions::test_compose_backup_tooling_covers_every_persistent_volume",
@@ -64,7 +64,7 @@
       "skips": [
         {
           "test": "::tests.test_integrated_reference_story",
-          "reason_contains": "absent module(s): contracts_lifecycle, contracts_policy, contracts_policy_reference, contracts_freshness, contracts_inference, contracts_portability"
+          "reason_contains": "absent module(s): contracts_freshness, contracts_portability"
         },
         {
           "test": "tests.test_baseline_reproductions::test_compose_backup_tooling_covers_every_persistent_volume",

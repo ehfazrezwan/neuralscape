@@ -83,8 +83,11 @@ def build(model, name: str, **overrides):
     return model.model_validate_json(json.dumps(document))
 
 
-def reference(identifier: str, *, tenant: str) -> dict:
-    return {"kind": "memory", "id": identifier, "tenant_id": tenant, "resolver": "memory_by_id"}
+def reference(identifier: str, *, tenant: str, cross_tenant: bool = False) -> dict:
+    handle = {"kind": "memory", "id": identifier, "tenant_id": tenant, "resolver": "memory_by_id"}
+    if cross_tenant:
+        handle["cross_tenant"] = True  # lineage that names another tenant's record is marked as such
+    return handle
 
 
 def principal(subject: str, *, tenant: str = "tenant-a", credential: str | None = None) -> PrincipalContext:
@@ -304,9 +307,12 @@ def test_two_tenants_cannot_reach_each_others_resources_or_references() -> None:
     with pytest.raises(ValidationError):  # an intent cannot target another tenant's reference
         build(Intent, "Intent", tenant_id="tenant-b", target_refs=[reference("memory-1", tenant="tenant-a")])
     # A record may carry a cross-tenant reference as a value (references are not authority; cross-tenant
-    # lineage is a confirmed direction), but resolving it needs current authorization in the owning tenant:
-    cited = record(1, 7, source_refs=[reference("memory-9", tenant="tenant-b")])
-    assert cited.source_refs[0].tenant_id == "tenant-b"
+    # lineage is a confirmed direction), marked as such, but resolving it needs current authorization in the
+    # owning tenant:
+    cited = record(1, 7, source_refs=[reference("memory-9", tenant="tenant-b", cross_tenant=True)])
+    assert cited.source_refs[0].tenant_id == "tenant-b" and cited.source_refs[0].cross_tenant is True
+    with pytest.raises(ValidationError):  # unmarked foreign lineage is refused
+        record(1, 7, source_refs=[reference("memory-9", tenant="tenant-b")])
     foreign = build(PolicyEvaluationInput, "PolicyEvaluationInput", action="read", resource=reference("memory-9", tenant="tenant-b"))
     assert evaluate_policy(principal=ALICE, evaluation=foreign, policy=policy(19, ("alice", "read"))).outcome == "deny"
 
