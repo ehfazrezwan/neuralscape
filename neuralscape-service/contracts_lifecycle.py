@@ -48,7 +48,7 @@ _BASE_MODEL_EXTRA_DESCRIPTOR = vars(BaseModel)["__pydantic_extra__"]
 def _key_text(key: object) -> object:
     """A key's own text for comparison; a str subclass is read without running its hooks."""
 
-    return str.__str__(key) if issubclass(type(key), str) else key
+    return str.__str__(key) if _derives_from(type(key), (str,)) else key
 
 
 def _require_distinct_key_text(
@@ -199,6 +199,108 @@ _TYPE_NAMESPACE = type.__dict__["__dict__"]  # a class's own namespace, read wit
 _NATIVE_LEAF_TYPES = (str, int, float, bytes, type(None), date, timedelta)
 
 
+def _derives_from(kind: type, bases: tuple[type, ...]) -> bool:
+    """Whether ``kind``'s real MRO holds one of ``bases``, by identity.
+
+    ``issubclass`` dispatches to the base's metaclass (``__subclasscheck__``), which an ABC answers from
+    registrations and caches keyed by the caller's class; the MRO read through ``type`` runs no hook.
+    """
+
+    return any(base is wanted for base in _TYPE_MRO.__get__(kind) for wanted in bases)
+
+
+_EXACT_NATIVE_KINDS = (str, int, float, bytes, bool, type(None), date, datetime, timedelta)
+
+
+def _is_exact_native_kind(kind: type) -> bool:
+    """Whether ``kind`` is itself one of the native scalar types, by identity (never ``==``, which a
+    metaclass can answer)."""
+
+    return any(kind is native for native in _EXACT_NATIVE_KINDS)
+
+
+_NATIVE_BASES = (str, bytes, int, float, datetime, date, timedelta, type(None))  # most derived first
+
+
+def _namespace_value(namespace: Any, name: str, budget: DiscoveryBudget) -> object:
+    """The entry named ``name`` in a class namespace, found by scanning keys as exact text (charged).
+
+    A namespace can keep a ``str``-subclass key whose hash collides with ``name``: looking the name up
+    would call that key's ``__eq__``.  ``None`` when absent."""
+
+    budget.charge_edge(len(namespace))
+    for key, item in namespace.items():
+        if _derives_from(type(key), (str,)) and str.__str__(key) == name:
+            return item
+    return None
+
+
+_FIELDS = "fields"  # memo key prefix: one model class's declared field names, read natively once per call
+
+
+def _declared_field_names(model_type: type, captured_by_identity: dict[Any, Any], budget: DiscoveryBudget) -> frozenset:
+    """The declared field names of ``model_type``, read from the real MRO's namespaces, never through its
+    metaclass (``model_fields`` is an attribute read a caller's model metaclass would answer)."""
+
+    generation = _generation(captured_by_identity)
+    memo = captured_by_identity.get((_FIELDS, id(model_type)))
+    if memo is not None and memo[0] is model_type and memo[2] == generation:
+        return memo[1]
+    names: frozenset = frozenset()
+    for base in _TYPE_MRO.__get__(model_type):
+        fields = _namespace_value(_TYPE_NAMESPACE.__get__(base), "__pydantic_fields__", budget)
+        if type(fields) is dict:
+            names = frozenset(str.__str__(key) for key in dict.keys(fields) if _derives_from(type(key), (str,)))
+            break
+    captured_by_identity[(_FIELDS, id(model_type))] = (model_type, names, generation)
+    return names
+
+
+_GRAPH_KIND = "graph-kind"  # memo key prefix: whether a class is a model, dict, list, tuple or a leaf
+
+
+def _graph_kind(kind: type, captured_by_identity: dict[Any, Any]) -> type | None:
+    """``BaseModel``, ``dict``, ``list`` or ``tuple`` when ``kind`` derives from it (in that order), else
+    ``None``; decided from the real MRO once per class and call (until caller code runs: a heap class's
+    ``__bases__`` can be reassigned)."""
+
+    if kind is dict or kind is list or kind is tuple:
+        return kind
+    generation = _generation(captured_by_identity)
+    memo = captured_by_identity.get((_GRAPH_KIND, id(kind)))
+    if memo is not None and memo[0] is kind and memo[2] == generation:
+        return memo[1]
+    mro = _TYPE_MRO.__get__(kind)
+    found = next((wanted for wanted in (BaseModel, dict, list, tuple) if any(base is wanted for base in mro)), None)
+    captured_by_identity[(_GRAPH_KIND, id(kind))] = (kind, found, generation)
+    return found
+
+
+def _exact_native(value: object, base: type) -> object:
+    """An exact copy of a native scalar of a subclass, read through its native ``base``, so nothing of the
+    subclass (its methods, or a hook installed on it later) travels on from capture."""
+
+    if base is str:
+        return str.__str__(value)
+    if base is bytes:
+        return bytes.__bytes__(value)
+    if base is int:
+        return int.__int__(value)
+    if base is float:
+        return float.__float__(value)
+    if base is datetime:
+        fields = [descriptor.__get__(value) for descriptor in _DATE_FIELDS + _TIME_FIELDS]
+        return datetime(*fields, tzinfo=datetime.__dict__["tzinfo"].__get__(value),
+                        fold=datetime.__dict__["fold"].__get__(value))
+    if base is date:
+        return date(*(descriptor.__get__(value) for descriptor in _DATE_FIELDS))
+    if base is timedelta:
+        return timedelta(days=timedelta.__dict__["days"].__get__(value),
+                         seconds=timedelta.__dict__["seconds"].__get__(value),
+                         microseconds=timedelta.__dict__["microseconds"].__get__(value))
+    return value
+
+
 _MEMBERS = "members"  # memo key prefix: one enum class's member identities, indexed once per call
 _GENERATION = "generation"  # memo key: advanced whenever a public view has run caller code
 
@@ -227,7 +329,7 @@ def _is_declared_member(
     generation = _generation(captured_by_identity)
     memo = captured_by_identity.get((_MEMBERS, id(kind)))
     if memo is None or memo[0] is not kind or memo[3] != generation:
-        members = _TYPE_NAMESPACE.__get__(kind).get("_member_map_")
+        members = _namespace_value(_TYPE_NAMESPACE.__get__(kind), "_member_map_", budget)
         if type(members) is dict:
             budget.charge_edge(dict.__len__(members))
             declared = tuple(dict.values(members))
@@ -243,7 +345,7 @@ _TYPE_FLAGS = type.__dict__["__flags__"]
 _HEAP_TYPE = 1 << 9  # Py_TPFLAGS_HEAPTYPE: a class created by a class statement (or ``type(...)``)
 
 
-def _claims_another_class(kind: type) -> bool:
+def _claims_another_class(kind: type, budget: DiscoveryBudget) -> bool:
     """Whether a class written in Python in ``kind``'s MRO defines ``__class__`` or ``__getattribute__``.
 
     Those are the two ways an object answers ``isinstance`` with a class it is not, or redirects the
@@ -251,14 +353,19 @@ def _claims_another_class(kind: type) -> bool:
     class would otherwise reach a model-typed position as a "scalar" and hand validation storage that
     capture never traversed or charged.  Only heap types are inspected (the built-in types, whose own
     slots define these names, are fixed); flags and namespaces are read natively, so no hook runs.
+    A namespace can keep a ``str``-subclass key whose hash collides with a hook name, so the names are not
+    looked up (that would call the stored key's ``__eq__``): every key is copied to exact text and
+    compared, and the scan is charged one edge per key.
     """
 
     for base in _TYPE_MRO.__get__(kind):
         if not _TYPE_FLAGS.__get__(base) & _HEAP_TYPE:
             continue
         namespace = _TYPE_NAMESPACE.__get__(base)
-        if any(hook in namespace for hook in _IMPERSONATION_HOOKS):
-            return True
+        budget.charge_edge(len(namespace))
+        for key in namespace:
+            if _derives_from(type(key), (str,)) and str.__str__(key) in _IMPERSONATION_HOOKS:
+                return True
     return False
 
 
@@ -269,9 +376,8 @@ def _leaf_class_verdict(
     kind: type,
     captured_by_identity: dict[Any, Any],
     budget: DiscoveryBudget,
-) -> str:
-    """Classify a leaf's class once per call: ``"enum"``, ``"text"`` (a ``str`` subclass), ``"native"`` or
-    ``"refused"``.
+) -> object:
+    """Classify a leaf's class once per call: ``"enum"``, ``"refused"``, or its native scalar base type.
 
     Every check walks the class's MRO, which a caller can make arbitrarily deep; the walk is charged one
     edge per class in it and its verdict kept (with the class, so its ``id()`` is not recycled), so
@@ -285,16 +391,12 @@ def _leaf_class_verdict(
         return memo[1]
     mro = _TYPE_MRO.__get__(kind)
     budget.charge_edge(tuple.__len__(mro))
-    if _claims_another_class(kind):
+    if _claims_another_class(kind, budget):
         verdict = "refused"
     elif any(base is Enum for base in mro):
         verdict = "enum"
-    elif kind is not str and any(base is str for base in mro):
-        verdict = "text"
-    elif any(base is native for base in mro for native in _NATIVE_LEAF_TYPES):
-        verdict = "native"
     else:
-        verdict = "refused"
+        verdict = next((native for native in _NATIVE_BASES if any(base is native for base in mro)), "refused")
     captured_by_identity[(_LEAF_CLASS, id(kind))] = (kind, verdict, generation)
     return verdict
 
@@ -309,8 +411,7 @@ def _native_leaf(
     Validation reads any other object through its own attribute protocol: a proxy claiming a contract
     class (``__class__``) would run caller code inside the validator, outside the discovery budget.
     An enum instance built with ``str.__new__(Enum, value)`` is no member: every ``is`` test would
-    misjudge it.  Both are refused here, before validation sees them; no hook runs to decide.  A ``str``
-    subclass is passed on as its exact text.
+    misjudge it.  Both are refused here, before validation sees them; no hook runs to decide.
     """
 
     verdict = _leaf_class_verdict(type(value), captured_by_identity, budget)
@@ -318,12 +419,10 @@ def _native_leaf(
         if not _is_declared_member(value, captured_by_identity, budget):
             raise ValueError("an enum value must be a declared member of its enum")
         return value
-    if verdict == "text":
-        # A text subclass reaches validation as its exact text: its own hash and equality never run
-        # there, so it cannot match a literal it does not spell.
-        return str.__str__(value)  # type: ignore[arg-type]
-    if verdict == "native":
-        return value
+    if verdict != "refused":
+        if _is_exact_native_kind(type(value)):
+            return value
+        return _exact_native(value, verdict)  # detached: a hook installed on the subclass later never travels
     raise ValueError("a contract value must be a native scalar, an enum member, a model or a container")
 
 
@@ -359,7 +458,8 @@ def _capture_native_contract_graph(
         budget = DiscoveryBudget()
     budget.charge_edge()
 
-    if issubclass(value_type, (BaseModel, dict, list, tuple)):
+    graph_kind = _graph_kind(value_type, captured_by_identity)
+    if graph_kind is not None:
         identity = id(value)
         if identity in active_containers:
             return _CapturedBackReference(identity=identity, source=value)
@@ -369,7 +469,7 @@ def _capture_native_contract_graph(
         budget.visit(value, len(active_containers))
         active_containers.add(identity)
         try:
-            if issubclass(value_type, BaseModel):
+            if graph_kind is BaseModel:
                 stored = _BASE_MODEL_DICT_DESCRIPTOR.__get__(value, BaseModel)
                 _reserve_entries(budget, dict.__len__(stored))
                 stored_entries = tuple(dict.items(stored))
@@ -382,7 +482,7 @@ def _capture_native_contract_graph(
                     malformed_extra = False
                 else:
                     extra_type = type(extra)
-                    malformed_extra = not issubclass(extra_type, dict)
+                    malformed_extra = not _derives_from(extra_type, (dict,))
                     if not malformed_extra:
                         _reserve_entries(budget, len(stored_entries) + dict.__len__(extra))
                     extra_entries = (
@@ -418,7 +518,7 @@ def _capture_native_contract_graph(
                     ),
                     malformed_extra=malformed_extra,
                 )
-            elif issubclass(value_type, dict):
+            elif graph_kind is dict:
                 _reserve_entries(budget, dict.__len__(value))
                 entries = tuple(dict.items(value))
                 captured = _CapturedDict(
@@ -437,7 +537,7 @@ def _capture_native_contract_graph(
                         for key, item in _require_distinct_key_text(entries)
                     ),
                 )
-            elif issubclass(value_type, list):
+            elif graph_kind is list:
                 _reserve_entries(budget, list.__len__(value))
                 native_items = tuple(list.__iter__(value))
                 captured = _CapturedList(
@@ -485,7 +585,7 @@ def _observed_public_view(
 
     def public_item(item: object) -> _CapturedGraph:
         item_type = type(item)
-        if issubclass(item_type, (BaseModel, dict, list, tuple)):
+        if _graph_kind(item_type, captured_by_identity) is not None:
             frozen = _cached_identity_capture(item, captured_by_identity)
             if frozen is not None:
                 # A cache hit is still one public item read: charged, so a view that keeps
@@ -569,7 +669,18 @@ def _materialize_captured_graph(
             resolved, captured_by_identity, active_containers, budget
         )
     if isinstance(value, _CapturedLeaf):
-        return value.value
+        leaf = value.value
+        kind = type(leaf)
+        if not (_is_exact_native_kind(kind)):
+            # Only an enum member is kept as itself (its identity is the value).  Caller code may have run
+            # since it was captured and changed its class, so the class and membership are judged again.
+            if _leaf_class_verdict(kind, captured_by_identity, budget) != "enum" or not _is_declared_member(
+                leaf, captured_by_identity, budget
+            ):
+                raise ValueError(
+                    "a contract value must be a native scalar, an enum member, a model or a container"
+                )
+        return leaf
     identity = value.identity
     if identity in active_containers:
         raise ValueError("cyclic contract graph is not valid input")
@@ -592,8 +703,7 @@ def _materialize_captured_graph(
     active_containers.add(identity)
     try:
         if isinstance(value, _CapturedModel):
-            stored_names = {key for key, _ in value.stored_entries}
-            declared_fields = value.model_type.model_fields
+            declared_fields = _declared_field_names(value.model_type, captured_by_identity, budget)
             # Keys reach validation as their own text: a str subclass's hash and equality would
             # otherwise decide which field a value fills (the text was checked distinct at capture).
             fields = {
@@ -611,12 +721,8 @@ def _materialize_captured_graph(
                 )
             stored_texts = {_key_text(key) for key, _ in value.stored_entries}
             for key, item in value.extra_entries:
-                if (
-                    key in stored_names
-                    or key in declared_fields
-                    or _key_text(key) in stored_texts
-                    or _key_text(key) in declared_fields
-                ):
+                # Compared as exact text only: a stored key's own hash or equality never runs.
+                if _key_text(key) in stored_texts or _key_text(key) in declared_fields:
                     raise ValueError(
                         "conflicting stored contract field is not valid input"
                     )
@@ -723,7 +829,7 @@ def _article(name: str) -> str:
 def _is_instance_by_type(value: object, model_type: type) -> bool:
     """``isinstance`` by the object's real type: a ``__class__`` claim is never consulted."""
 
-    return issubclass(type(value), model_type)
+    return _derives_from(type(value), (model_type,))
 
 
 def _captured_model(
@@ -1236,7 +1342,7 @@ def _revalidated_claim_inputs(
             budget.charge_edge()
         except ValueError:
             break
-        if not issubclass(type(receipt), StageReceipt):
+        if not _derives_from(type(receipt), (StageReceipt,)):
             continue
         identity = id(receipt)
         if identity in receipt_inventory or identity in receipt_capture_errors:
