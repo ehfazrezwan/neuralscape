@@ -1753,3 +1753,87 @@ def test_ordinary_paths_still_verify_in_every_form(tmp_path) -> None:
     zipped = _write_zip(tmp_path / "b.zip", PAYLOAD)
     assert verify_bundle(good).ok and verify_bundle(str(good)).ok and verify_bundle(os.fsencode(good)).ok
     assert verify_bundle(zipped).ok and verify_bundle(str(zipped)).ok and verify_bundle(os.fsencode(zipped)).ok
+
+
+# --- a file that changes after the inventory is a failed report, never an exception ------------------------
+
+
+def _noise(label: str, size: int) -> bytes:
+    """Deterministic incompressible bytes."""
+
+    out, block = bytearray(), label.encode()
+    while len(out) < size:
+        block = hashlib.sha256(block).digest()
+        out += block
+    return bytes(out[:size])
+
+
+# several 100 KiB members: far more than the reader's buffer, so a read after the change reaches the file
+BIG_PAYLOAD = {f"canonical/part{i}.bin": _noise(f"part{i}", 100_000) for i in range(3)}
+
+
+def _big_zip(path: Path) -> Path:
+    return _write_zip(path, BIG_PAYLOAD, manifest=_manifest(BIG_PAYLOAD))
+
+
+def _after_inventory(monkeypatch, change) -> None:
+    real_inventory = pv._inventory_zip
+
+    def inventory_then_change(source, report):
+        entries = real_inventory(source, report)
+        change(entries)
+        return entries
+
+    monkeypatch.setattr(pv, "_inventory_zip", inventory_then_change)
+
+
+def _assert_failed_report(report) -> None:
+    assert not report.ok
+    assert all(isinstance(item.code, str) for item in report.findings)
+    json.dumps(report.to_dict())  # what the command line prints
+
+
+def test_truncating_the_archive_right_after_the_inventory_is_a_failed_report(tmp_path, monkeypatch) -> None:
+    path = _big_zip(tmp_path / "b.zip")
+
+    def truncate(entries) -> None:
+        os.truncate(path, 10)  # shorter than the first local header
+
+    _after_inventory(monkeypatch, truncate)
+    _assert_failed_report(verify_bundle(path))
+
+
+@pytest.mark.parametrize("keep", [0, 1, 29, 30, 31, 45, 9_000, 100_000, 150_000, 299_999])
+def test_truncating_to_any_length_after_the_inventory_is_a_failed_report(tmp_path, monkeypatch, keep) -> None:
+    path = _big_zip(tmp_path / "b.zip")
+    size = path.stat().st_size
+    _after_inventory(monkeypatch, lambda entries: os.truncate(path, min(keep, size - 1)))
+    _assert_failed_report(verify_bundle(path))
+
+
+def test_a_member_whose_offset_cannot_be_seeked_is_a_failed_report(tmp_path, monkeypatch) -> None:
+    path = _big_zip(tmp_path / "b.zip")
+
+    def move_offsets(entries) -> None:
+        for entry in entries:
+            if entry.handle is not None:
+                entry.handle.header_offset = 1 << 64  # beyond what a seek accepts
+
+    _after_inventory(monkeypatch, move_offsets)
+    _assert_failed_report(verify_bundle(path))
+
+
+def test_every_prefix_and_byte_flip_of_a_valid_archive_is_a_report_not_a_traceback(tmp_path, monkeypatch) -> None:
+    good = _big_zip(tmp_path / "good.zip").read_bytes()
+    for keep in range(0, len(good), 9_973):
+        target = tmp_path / f"cut{keep}.zip"
+        target.write_bytes(good)
+        _after_inventory(monkeypatch, lambda entries, target=target, keep=keep: os.truncate(target, keep))
+        verify_bundle(target)  # must not raise
+    for position in range(0, len(good), 7_919):
+        target = tmp_path / f"flip{position}.zip"
+        mutated = bytearray(good)
+        mutated[position] ^= 0xFF
+        target.write_bytes(bytes(mutated))
+        monkeypatch.undo()
+        verify_bundle(target)  # must not raise

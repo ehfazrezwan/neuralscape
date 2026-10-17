@@ -72,6 +72,8 @@ RATIO_MIN_ENTRY_BYTES = 1024**2
 MAX_DIRECTORY_DEPTH = 64
 MAX_CENTRAL_DIRECTORY_BYTES = 64 * 1024**2
 _CHUNK = 64 * 1024
+# Everything reading a zip that another writer may truncate or change can raise: a short header unpacks to a
+# struct.error, an offset beyond what a seek accepts to an OverflowError, a damaged stream to a zlib.error.
 _READ_ERRORS = (
     OSError,
     zipfile.BadZipFile,
@@ -79,6 +81,8 @@ _READ_ERRORS = (
     EOFError,
     ValueError,
     NotImplementedError,
+    struct.error,
+    OverflowError,
 )
 
 # Stable finding codes.
@@ -659,7 +663,10 @@ def _zip_member_chunks(info: zipfile.ZipInfo, raw: BinaryIO) -> Iterator[bytes]:
     """
 
     raw.seek(info.header_offset)
-    head = _LOCAL_HEADER.unpack(raw.read(_LOCAL_HEADER.size))
+    header = raw.read(_LOCAL_HEADER.size)
+    if len(header) != _LOCAL_HEADER.size:
+        raise ValueError("truncated local header")
+    head = _LOCAL_HEADER.unpack(header)
     raw.seek(info.header_offset + _LOCAL_HEADER.size + head[9] + head[10])
     remaining = info.compress_size
     produced = 0
@@ -1140,7 +1147,7 @@ def verify_bundle(path: str | os.PathLike[str]) -> VerificationReport:
             try:
                 # (the precheck always leaves its copy; a stand-in precheck that does not is parsed in place)
                 archive = zipfile.ZipFile(_PinnedTail(raw, pinned[0][0], pinned[0][1]) if pinned else raw)
-            except (zipfile.BadZipFile, OSError, EOFError, ValueError, NotImplementedError):
+            except _READ_ERRORS:
                 report.add(CONTAINER_UNREADABLE, "<bundle>", "not a readable zip archive")
                 return report
             with archive:
@@ -1150,7 +1157,7 @@ def verify_bundle(path: str | os.PathLike[str]) -> VerificationReport:
                     _verify_open(entries, source, report)
             if _identity(os.fstat(raw.fileno())) != opened_as:
                 report.add(ARCHIVE_FRAMING, "<bundle>", "file changed during verification")
-    except OSError:
+    except _READ_ERRORS:
         report.add(CONTAINER_UNREADABLE, "<bundle>")
     return report
 
