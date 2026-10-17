@@ -21,6 +21,7 @@ from pydantic import (
     Field,
     StringConstraints,
 )
+from pydantic.fields import FieldInfo
 
 
 MAX_SAFE_INTEGER = 9_007_199_254_740_991
@@ -59,27 +60,82 @@ class VersionedContract(ContractModel):
     schema_version: Literal["candidate-v1"]
 
 
-def _validation_alias_owners(model_type: type[BaseModel]) -> dict[str, set[str]]:
-    if model_type.model_config.get("validate_by_alias") is False:
-        return {}
+def _class_namespace_entry(model_type: type, name: str) -> object:
+    """``name`` from the first class on ``model_type``'s native MRO whose own namespace defines it.
+
+    The namespaces are read directly, so no metaclass ``__getattribute__`` or descriptor runs.
+    """
+
+    for klass in _TYPE_MRO.__get__(model_type):
+        namespace = _CLASS_NAMESPACE.__get__(klass)
+        if name in namespace:
+            return namespace[name]
+    return None
+
+
+def _text(value: object) -> object:
+    """A ``str`` subclass as its exact text (no hook of it runs); anything else unchanged."""
+
+    return str.__str__(value) if type(value) is not str and _is_subclass(type(value), str) else value
+
+
+def _model_metadata(model_type: type[BaseModel]) -> tuple[dict[object, object], object, bool]:
+    """The model's declared fields and configuration, read without caller hooks.
+
+    pydantic keeps both as plain dicts in every model class's own namespace.  Anything else
+    (a replaced or exotic store) is read through the class as before, and reported as impure:
+    reading it may run caller code, so the subtree must not be reused.
+    """
+
+    fields = _class_namespace_entry(model_type, "__pydantic_fields__")
+    config = _class_namespace_entry(model_type, "model_config")
+    if type(fields) is dict and (config is None or type(config) is dict):
+        return fields, config, True
+    return dict(model_type.model_fields), model_type.model_config, False
+
+
+def _validation_alias_owners(
+    fields: dict[object, object], config: object
+) -> tuple[dict[str, set[str]], bool]:
+    """Each validation alias (or alias-path root) as exact text, with the fields it belongs to.
+
+    A ``str``-subclass alias is read as its text, so hashing it runs no hook.  The second value
+    is False when reading an alias may have run caller code (a subclass of a pydantic alias or
+    field type), which makes the subtree ineligible for reuse.
+    """
+
+    pure = type(config) is dict or config is None
+    if type(config) is dict:
+        validate_by_alias = dict.get(config, "validate_by_alias")
+    else:
+        validate_by_alias = None if config is None else config.get("validate_by_alias")  # type: ignore[attr-defined]
+    if validate_by_alias is False:
+        return {}, pure
 
     owners: dict[str, set[str]] = {}
-    for field_name, field in model_type.model_fields.items():
-        validation_alias = field.validation_alias
-        choices = (
-            validation_alias.choices
-            if isinstance(validation_alias, AliasChoices)
-            else (validation_alias,)
-        )
+    for field_name, field in dict.items(fields):
+        if type(field) is not FieldInfo:
+            pure = False
+        validation_alias = field.validation_alias  # type: ignore[attr-defined]
+        if _is_subclass(type(validation_alias), AliasChoices):
+            pure = pure and type(validation_alias) is AliasChoices
+            choices = tuple(validation_alias.choices)
+        else:
+            choices = (validation_alias,)
+        name = _text(field_name)
         for choice in choices:
-            if isinstance(choice, str):
-                owners.setdefault(choice, set()).add(field_name)
-            elif isinstance(choice, AliasPath):
-                owners.setdefault(choice.path[0], set()).add(field_name)
-    return owners
+            if _is_subclass(type(choice), str):
+                owners.setdefault(_text(choice), set()).add(name)  # type: ignore[arg-type]
+            elif _is_subclass(type(choice), AliasPath):
+                pure = pure and type(choice) is AliasPath
+                root = choice.path[0]
+                if _is_subclass(type(root), str):
+                    owners.setdefault(_text(root), set()).add(name)  # type: ignore[arg-type]
+    return owners, pure
 
 
 _TYPE_MRO = vars(type)["__mro__"]
+_CLASS_NAMESPACE = vars(type)["__dict__"]
 _MAPPING_BASES = (Mapping, dict, MappingProxyType)
 # Key types whose hashing and equality run no caller code.  A ``str`` subclass is read as its
 # text instead; any other key type can run a hook while a dict is rebuilt, so a subtree that
@@ -465,8 +521,13 @@ def _snapshot_captured_graph(
             model_type = captured.model_type
             stored_entries = captured.stored_entries
             stored_names = {key for key, _ in stored_entries}
-            declared_names = set(model_type.model_fields)
-            alias_owners = _validation_alias_owners(model_type)
+            # Declared fields, configuration and aliases are read without running caller code; where
+            # that is not possible the subtree (and every ancestor) is not reused.
+            declared_fields, config, metadata_pure = _model_metadata(model_type)
+            declared_names = {_text(name) for name in dict.keys(declared_fields)}
+            alias_owners, aliases_pure = _validation_alias_owners(declared_fields, config)
+            if not (metadata_pure and aliases_pure):
+                inventory.impure_reads += 1
             alias_roots = set(alias_owners)
             unknown_stored_names = stored_names - declared_names
             missing_owner_roots = {

@@ -3722,3 +3722,95 @@ def test_a_height_found_late_inside_late_extras_reaches_the_outer_model_and_its_
     siblings = [hidden, outer] if hidden_first else [outer, hidden]
     with pytest.raises(ValueError, match="budget"):
         snapshot_contract_graph(siblings)
+
+
+# ── model metadata is read without caller hooks, so a reused subtree ran no caller code ──
+
+
+def _counter_view(counter):
+    class CounterView(list):
+        def __iter__(self):
+            return iter([counter[0]])
+
+    return CounterView()
+
+
+def test_a_metaclass_hook_on_model_metadata_never_runs_and_cannot_skew_later_views() -> None:
+    from pydantic._internal._model_construction import ModelMetaclass
+
+    counter = [0]
+
+    class Meta(ModelMetaclass):
+        def __getattribute__(cls, name):
+            if name in ("model_fields", "model_config", "__pydantic_fields__"):
+                counter[0] += 1
+            return super().__getattribute__(name)
+
+    class Hooked(BaseModel, metaclass=Meta):
+        a: int = 1
+
+    model = Hooked()
+    view = _counter_view(counter)
+    counter[0] = 0
+    snapshot = snapshot_contract_graph([model, view, model, view])
+    assert counter[0] == 0                     # the fields and configuration are read natively
+    assert snapshot[1] == snapshot[3] == [0]   # so both observations of the view agree
+    assert snapshot[0] == snapshot[2] == {"a": 1}
+
+
+@pytest.mark.parametrize("shape", ["alias", "path-root", "choices"])
+def test_a_str_subclass_validation_alias_runs_no_hook_and_cannot_skew_later_views(shape) -> None:
+    from pydantic import AliasChoices, AliasPath, Field
+
+    counter = [0]
+
+    class CountingAlias(str):
+        def __hash__(self):
+            counter[0] += 1
+            return str.__hash__(self)
+
+        def __eq__(self, other):
+            counter[0] += 1
+            return str.__eq__(self, other)
+
+    alias = {
+        "alias": CountingAlias("alias_a"),
+        "path-root": AliasPath(CountingAlias("root_a"), 0),
+        "choices": AliasChoices(CountingAlias("a1"), AliasPath(CountingAlias("a2"), "x")),
+    }[shape]
+
+    class Aliased(BaseModel):
+        a: int = Field(1, validation_alias=alias)
+
+    model = Aliased()
+    view = _counter_view(counter)
+    counter[0] = 0
+    snapshot = snapshot_contract_graph([model, view, model, view])
+    assert counter[0] == 0                     # an alias is read as its text, never hashed through its hooks
+    assert snapshot[1] == snapshot[3] == [0]
+
+
+def test_an_alias_whose_read_runs_code_makes_the_model_rebuilt_per_edge() -> None:
+    from pydantic import AliasPath, Field
+
+    counter = [0]
+
+    class CountingPath(AliasPath):
+        @property
+        def path(self):
+            counter[0] += 1
+            return ["root_a", 0]
+
+        @path.setter
+        def path(self, value):
+            pass
+
+    class Aliased(BaseModel):
+        a: int = Field(1, validation_alias=CountingPath("root_a", 0))
+
+    model = Aliased()
+    view = _counter_view(counter)
+    counter[0] = 0
+    snapshot = snapshot_contract_graph([model, view, model, view])
+    assert snapshot[0] is not snapshot[2]  # never reused: reading its alias ran caller code
+    assert snapshot[1] != snapshot[3]       # so each later observation sees its own hook run
