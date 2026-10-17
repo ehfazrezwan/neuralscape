@@ -1927,3 +1927,53 @@ def test_generation_uuid_format_requires_the_canonical_form(value):
         assert validate_generation_result(request, generation_result(output={"id": canonical})).compliant
     with pytest.raises(ValueError, match="does not match declared schema"):
         validate_generation_result(request, generation_result(output={"id": value}))
+
+
+def _generation_with_output(output, **properties):
+    request = generation_request(schema=output_schema(properties=properties, required=list(properties)))
+    result = generation_result(output={"placeholder": "x"})
+    result.proposals[0].__dict__["output"] = output  # unchecked storage, as a caller can supply it
+    return request, result
+
+
+def test_a_mapping_pair_cannot_repair_its_value_while_unpacking_checks_its_length():
+    """Unpacking ``key, value = pair`` asks the pair for a third item before the value is captured."""
+
+    exposed = ["a", "b", "c"]  # violates maxItems
+
+    class Pair(tuple):
+        def __iter__(self):
+            yield "answer"
+            yield exposed
+            exposed[:] = ["a"]  # the exhaustion check would run this before capture
+
+    class Output(dict):
+        def items(self):
+            return iter([Pair()])
+
+    request, result = _generation_with_output(
+        Output(answer=None), answer={"type": "array", "maxItems": 1, "items": {"type": "string"}}
+    )
+    with pytest.raises(ValueError, match="does not match declared schema"):
+        validate_generation_result(request, result)
+
+
+@pytest.mark.parametrize(
+    "pair, message",
+    [
+        (("answer",), "not enough values to unpack"),
+        (("answer", ["a"], "extra"), "too many values to unpack"),
+    ],
+)
+def test_a_malformed_mapping_pair_is_refused_as_unpacking_would(pair, message):
+    class Pair(tuple):
+        def __iter__(self):
+            return iter(tuple.__iter__(self))
+
+    class Output(dict):
+        def items(self):
+            return iter([Pair(pair)])
+
+    request, result = _generation_with_output(Output(answer=None), answer={"type": "array"})
+    with pytest.raises(ValueError, match=message):
+        validate_generation_result(request, result)

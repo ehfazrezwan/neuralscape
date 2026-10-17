@@ -278,6 +278,50 @@ def _normalize_field_items(
     )
 
 
+def _open_pair(entry: Any) -> tuple[Any, Any, Iterator[Any] | None]:
+    """Read a key/value pair's first two items: ``(key, value, rest)``.
+
+    Unpacking (``key, value = pair``) asks a pair's iterator for a third item, to check there is
+    none, *before* the caller can capture the value, and a pair's public iterator can run code at
+    that point.  This reads exactly two items; the caller captures the value and then calls
+    ``_close_pair(rest)``.  An exact tuple is read natively (no hook runs, ``rest`` is ``None``).
+    The errors and messages are the ones unpacking raises.
+    """
+
+    if type(entry) is tuple:
+        size = tuple.__len__(entry)
+        if size < 2:
+            raise ValueError(f"not enough values to unpack (expected 2, got {size})")
+        if size > 2:
+            raise ValueError("too many values to unpack (expected 2)")
+        return tuple.__getitem__(entry, 0), tuple.__getitem__(entry, 1), None
+    try:
+        iterator = iter(entry)
+    except TypeError:
+        raise TypeError(f"cannot unpack non-iterable {type(entry).__name__} object") from None
+    try:
+        key = next(iterator)
+    except StopIteration:
+        raise ValueError("not enough values to unpack (expected 2, got 0)") from None
+    try:
+        value = next(iterator)
+    except StopIteration:
+        raise ValueError("not enough values to unpack (expected 2, got 1)") from None
+    return key, value, iterator
+
+
+def _close_pair(rest: Iterator[Any] | None) -> None:
+    """The exhaustion check unpacking would have made, after the value was captured."""
+
+    if rest is None:
+        return
+    try:
+        next(rest)
+    except StopIteration:
+        return
+    raise ValueError("too many values to unpack (expected 2)")
+
+
 def _charged_entries(read: Callable[[], Any], budget: DiscoveryBudget) -> Iterator[Any]:
     """Observe a public view: one charge for the observation itself (an empty view is
     not free), taken before the view is read, then one charge per entry observed."""
@@ -449,7 +493,10 @@ def _snapshot_native_value(
             if exact:
                 own_cost = 1 + len(frozen.entries)
             result = {}
-            for key, item in frozen.entries if exact else _charged_entries(value.items, budget):
+            for entry in frozen.entries if exact else _charged_entries(value.items, budget):
+                # A public view's pair is read two items at a time: its value is captured before
+                # the pair is asked for a third item, so it cannot repair what it just exposed.
+                key, item, rest = _open_pair(entry)
                 # A str subclass is the same key to a dict lookup, so it must be the same field
                 # name to the JSON guard: an exact-str-only test would withhold the name.  Its
                 # text is read without running its hooks and stored as a plain str; two keys
@@ -459,6 +506,7 @@ def _snapshot_native_value(
                     if key in result:
                         raise ValueError(f"contract mapping has colliding keys at {location}")
                 result[key] = child(item, f"{location}[key]", key if type(key) is str else None)
+                _close_pair(rest)
         elif is_subclass(value_type, (list, tuple)):
             is_list = is_subclass(value_type, list)
             frozen = frozen_containers.get(identity)
