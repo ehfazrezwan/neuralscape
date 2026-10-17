@@ -4513,5 +4513,8 @@ def test_fields_set_names_disjoint_from_stored_fields_are_charged_when_synthesiz
 
 
 def test_fields_set_names_that_name_stored_fields_are_not_charged_twice() -> None:
+    """70,000 stored fields all named by the fields-set make 70,000 output fields: charged once that
+    fits the 131,072-edge budget, charged twice (140,000) it would not."""
+
     with pytest.raises(ValidationError):  # refused for its unknown fields, not by the budget
-        _evaluate_with_statement_resource(_model_with_disjoint_fields_set(60_000, 60_000, overlap=True))
+        _evaluate_with_statement_resource(_model_with_disjoint_fields_set(70_000, 70_000, overlap=True))
