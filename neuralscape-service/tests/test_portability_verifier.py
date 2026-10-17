@@ -1575,3 +1575,91 @@ def test_an_archive_named_with_a_trailing_slash_is_still_not_a_readable_archive(
     path = _bundle_zip(tmp_path, {"a.txt": b"x"}, name="plain.zip")
     assert verify_bundle(path).ok
     assert pv.CONTAINER_UNREADABLE in _codes(verify_bundle(str(path) + "/"))  # ENOTDIR semantics preserved
+
+
+# --- streamed members' local CRC; an in-place rewrite after the precheck -------------------------
+
+
+class _StreamSink(io.RawIOBase):
+    def __init__(self) -> None:
+        self.data = bytearray()
+
+    def writable(self) -> bool:
+        return True
+
+    def write(self, chunk) -> int:
+        self.data += chunk
+        return len(chunk)
+
+
+def _streamed_bundle(tmp_path, *, local_crc=None) -> Path:
+    """A bundle whose members are streamed (bit 3, a trailing data descriptor); ``local_crc`` rewrites every
+    local header's CRC field (None keeps the writer's zero placeholder)."""
+
+    stream = _StreamSink()
+    with zipfile.ZipFile(stream, "w", zipfile.ZIP_STORED) as archive:
+        archive.writestr("manifest.json", json.dumps(_manifest(PAYLOAD)))
+        for name, data in PAYLOAD.items():
+            archive.writestr(name, data)
+    raw = bytearray(stream.data)
+    assert raw[6] & 0x08  # the writer streamed them
+    if local_crc is not None:
+        offset = 0
+        while (offset := raw.find(b"PK\x03\x04", offset)) != -1 and offset < raw.find(b"PK\x01\x02"):
+            struct.pack_into("<I", raw, offset + 14, local_crc(raw, offset))
+            offset += 4
+    path = tmp_path / "streamed.zip"
+    path.write_bytes(bytes(raw))
+    return path
+
+
+def _central_crc_of_local(raw: bytearray, local_offset: int) -> int:
+    """The central directory's CRC for the member whose local header is at ``local_offset``."""
+
+    cursor = raw.find(b"PK\x01\x02")
+    while cursor != -1:
+        if struct.unpack_from("<I", raw, cursor + 42)[0] == local_offset:
+            return struct.unpack_from("<I", raw, cursor + 16)[0]
+        cursor = raw.find(b"PK\x01\x02", cursor + 4)
+    raise AssertionError("no central record")
+
+
+def test_a_streamed_member_with_a_zero_or_the_real_local_crc_verifies(tmp_path) -> None:
+    assert verify_bundle(_streamed_bundle(tmp_path)).ok  # the writer's placeholder
+    assert verify_bundle(_streamed_bundle(tmp_path, local_crc=_central_crc_of_local)).ok  # the real value
+
+
+def test_a_streamed_member_with_another_nonzero_local_crc_is_refused(tmp_path) -> None:
+    report = verify_bundle(_streamed_bundle(tmp_path, local_crc=lambda raw, offset: 0xDEADBEEF))
+    assert pv.ARCHIVE_FRAMING in _codes(report), report.findings
+
+
+def test_rewriting_the_file_in_place_after_the_precheck_cannot_change_what_is_parsed(tmp_path, monkeypatch) -> None:
+    path = _write_zip(tmp_path / "b.zip", PAYLOAD)  # a valid bundle of three entries
+    replacement = _many_entry_archive(tmp_path / "other.zip", 6).read_bytes()
+    monkeypatch.setattr(pv, "MAX_BUNDLE_ENTRIES", 3)
+    real_precheck, real_zipfile = pv._precheck_central_directory, pv.zipfile.ZipFile
+    parsed: list[int] = []
+
+    def precheck_then_rewrite(source, report):
+        accepted = real_precheck(source, report)
+        with open(path, "r+b") as writer:  # another writer rewrites the same file, same inode, in place
+            writer.seek(0)
+            writer.write(replacement)
+            writer.truncate()
+        return accepted
+
+    def counting_zipfile(*args, **kwargs):
+        archive = real_zipfile(*args, **kwargs)
+        parsed.append(len(archive.infolist()))
+        return archive
+
+    monkeypatch.setattr(pv, "_precheck_central_directory", precheck_then_rewrite)
+    monkeypatch.setattr(pv.zipfile, "ZipFile", counting_zipfile)
+    report = verify_bundle(path)
+    assert parsed == [3]  # the parser got the checked directory, never the six-entry rewrite
+    assert not report.ok  # and the change itself is refused
+
+
+def test_an_untouched_archive_is_unchanged_by_the_pinned_parse(tmp_path) -> None:
+    assert verify_bundle(_write_zip(tmp_path / "b.zip", PAYLOAD)).ok

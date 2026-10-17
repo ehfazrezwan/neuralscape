@@ -35,6 +35,7 @@ Usage: ``python -m portability_verifier PATH`` prints a JSON report and exits
 
 from __future__ import annotations
 
+import contextvars
 import errno
 import hashlib
 import json
@@ -338,6 +339,9 @@ def _local_record_end(raw: BinaryIO, info: zipfile.ZipInfo, start_dir: int) -> i
         csize == _U32_MAX or usize == _U32_MAX
     ):
         raise _Framing("local sizes conflict with the central directory")
+    elif crc not in (0, info.CRC):
+        # A streamed member's local CRC is a placeholder (zero) or the real one, never anything else.
+        raise _Framing("local CRC disagrees with the central directory")
 
     data_end = info.header_offset + _LOCAL_HEADER.size + name_length + extra_length + info.compress_size
     if data_end > start_dir:
@@ -841,6 +845,14 @@ _ZIP64_LOCATOR = struct.Struct("<4sIQI")
 _CENTRAL_RECORD_SIZE = 46
 
 
+# Where the precheck leaves the end records and central directory it read, for the parser (set by the verifier
+# for the duration of one archive; a context slot rather than a parameter, so callers and tests that wrap
+# the precheck keep its two-argument shape).
+_PINNED_TAIL: "contextvars.ContextVar[list[tuple[int, bytes]] | None]" = contextvars.ContextVar(
+    "portability_pinned_tail", default=None
+)
+
+
 def _precheck_central_directory(target: str | os.PathLike[str] | BinaryIO, report: VerificationReport) -> bool:
     """Bound and locate the central directory before the archive is parsed, or refuse the archive.
 
@@ -934,12 +946,18 @@ def _precheck_central_directory(target: str | os.PathLike[str] | BinaryIO, repor
         # from the stored offset as prepended data; a bundle is never a self-extracting archive.
         if cd_offset + cd_size != directory_end:
             return refuse(ARCHIVE_FRAMING, "data before the first record")
+        # The directory and every end record after it are read once, here, and the parser is later given
+        # these bytes (see ``_PinnedTail``): a writer that rewrites the file in place after this check can
+        # change the member data, which is hashed as it is read, but not what is parsed or counted.
+        if size - cd_offset > cd_size + _MAX_END_RECORD_BYTES:
+            return refuse(ARCHIVE_FRAMING, "oversized end records")
         raw.seek(cd_offset)
-        directory = raw.read(cd_size)
+        tail_bytes = raw.read(size - cd_offset)
+        directory = tail_bytes[:cd_size]
     except OSError:
         report.add(CONTAINER_UNREADABLE, "<bundle>")
         return False
-    if len(directory) != cd_size:
+    if len(directory) != cd_size or len(tail_bytes) != size - cd_offset:
         return refuse(ARCHIVE_FRAMING, "short central directory")
     records = 0
     cursor = 0
@@ -953,7 +971,59 @@ def _precheck_central_directory(target: str | os.PathLike[str] | BinaryIO, repor
         cursor += _CENTRAL_RECORD_SIZE + name_length + extra_length + comment_length
     if cursor != cd_size or records != entries:
         return refuse(ARCHIVE_FRAMING, "central directory does not match its declared size and count")
+    pin = _PINNED_TAIL.get()
+    if pin is not None:
+        pin.append((cd_offset, tail_bytes))
     return True
+
+
+_MAX_END_RECORD_BYTES = 1 << 20  # the zip64 end record, its locator and the end record, with their extensions
+
+
+class _PinnedTail:
+    """A read-only view of an open archive whose bytes from ``start`` on are a copy taken by the precheck.
+
+    The archive parser reads the end records and the central directory from the tail of the file; handing
+    it this view means it parses exactly the bytes that were bounded and checked, however the file is
+    rewritten afterwards.  Reads before ``start`` go to the file.
+    """
+
+    def __init__(self, raw: BinaryIO, start: int, tail: bytes) -> None:
+        self._raw, self._start, self._tail = raw, start, tail
+        self._size = start + len(tail)
+        self._position = 0
+
+    def seekable(self) -> bool:
+        return True
+
+    def tell(self) -> int:
+        return self._position
+
+    def seek(self, offset: int, whence: int = os.SEEK_SET) -> int:
+        base = {os.SEEK_SET: 0, os.SEEK_CUR: self._position, os.SEEK_END: self._size}[whence]
+        self._position = max(0, base + offset)
+        return self._position
+
+    def read(self, count: int = -1) -> bytes:
+        if count is None or count < 0:
+            count = max(0, self._size - self._position)
+        end = min(self._position + count, self._size)
+        out = b""
+        if self._position < self._start and end > self._position:
+            stop = min(end, self._start)
+            self._raw.seek(self._position)
+            out = self._raw.read(stop - self._position)
+            if len(out) != stop - self._position:
+                self._position += len(out)
+                return out
+        low = max(self._position + len(out), self._start)
+        if end > low:
+            out += self._tail[low - self._start : end - self._start]
+        self._position += len(out)
+        return out
+
+    def close(self) -> None:  # the file belongs to the caller
+        pass
 
 
 def _root_name(target: str | bytes) -> str:
@@ -974,8 +1044,21 @@ def _root_name(target: str | bytes) -> str:
             return text
 
 
+def _identity(info: os.stat_result) -> tuple[int, int, int]:
+    return (info.st_ino, info.st_size, info.st_mtime_ns)
+
+
 def verify_bundle(path: str | os.PathLike[str]) -> VerificationReport:
-    """Verify a bundle directory or zip file; never extracts or mutates it."""
+    """Verify a bundle directory or zip file; never extracts or mutates it.
+
+    Threat model for a file that another writer can modify while it is verified: the pathname is bound
+    once (one open handle, no re-resolution); the archive's end records and central directory are read
+    once, bounded and checked, and that copy is what the parser parses; member bytes are hashed as they
+    are read, and the file's inode, size and modification time are compared before and after, so an
+    in-place rewrite during verification is refused (``archive_framing``).  A writer that restores the
+    same modification time cannot be ruled out by a verifier that reads a file in place: a bundle from an
+    untrusted writer should be copied somewhere that writer cannot reach before it is verified.
+    """
 
     report = VerificationReport()
     target = os.fspath(path)
@@ -1030,10 +1113,18 @@ def verify_bundle(path: str | os.PathLike[str]) -> VerificationReport:
         return report
     try:
         with raw:
-            if not _precheck_central_directory(raw, report):
+            opened_as = _identity(os.fstat(raw.fileno()))
+            pinned: list[tuple[int, bytes]] = []
+            token = _PINNED_TAIL.set(pinned)
+            try:
+                accepted = _precheck_central_directory(raw, report)
+            finally:
+                _PINNED_TAIL.reset(token)
+            if not accepted:
                 return report
             try:
-                archive = zipfile.ZipFile(raw)
+                # (the precheck always leaves its copy; a stand-in precheck that does not is parsed in place)
+                archive = zipfile.ZipFile(_PinnedTail(raw, pinned[0][0], pinned[0][1]) if pinned else raw)
             except (zipfile.BadZipFile, OSError, EOFError, ValueError, NotImplementedError):
                 report.add(CONTAINER_UNREADABLE, "<bundle>", "not a readable zip archive")
                 return report
@@ -1042,6 +1133,8 @@ def verify_bundle(path: str | os.PathLike[str]) -> VerificationReport:
                 entries = _inventory_zip(source, report)
                 if not any(item.code in _FATAL_CODES for item in report.findings):
                     _verify_open(entries, source, report)
+            if _identity(os.fstat(raw.fileno())) != opened_as:
+                report.add(ARCHIVE_FRAMING, "<bundle>", "file changed during verification")
     except OSError:
         report.add(CONTAINER_UNREADABLE, "<bundle>")
     return report

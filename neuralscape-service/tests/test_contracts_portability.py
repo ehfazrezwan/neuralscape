@@ -4221,3 +4221,53 @@ def test_the_ancestor_check_does_work_linear_in_the_components_not_the_depth_squ
     # and the answer is right: a file below a file is reported, a sibling is not
     assert names_below_a_file(["a", "a/b", "a2"], ["a", "a/b", "a2"]) == ["a/b"]
     assert names_below_a_file(["A/b"], ["a"], str.lower) == ["A/b"]
+
+
+# --- a key that is no text cannot overwrite a text key's value ------------------------------------
+
+
+class _AliasKey:
+    """Not a string, but hashes and compares equal to ``"path"``."""
+
+    def __hash__(self) -> int:
+        return hash("path")
+
+    def __eq__(self, other: object) -> bool:
+        return other == "path" or other is self
+
+
+class _TwoKeyItems(Mapping):
+    """A custom mapping whose items() yields an unsafe value under "path", then an alias key with a safe one."""
+
+    def __init__(self, base: dict) -> None:
+        self.base = base
+
+    def __getitem__(self, key):
+        raise KeyError(key)
+
+    def __iter__(self):
+        return iter(())
+
+    def __len__(self) -> int:
+        return 0
+
+    def items(self):
+        rest = {key: value for key, value in self.base.items() if key != "path"}
+        yield ("path", "../escape.txt")
+        yield (_AliasKey(), "safe.txt")  # would replace the unsafe value and keep the first key
+        yield from rest.items()
+
+
+def test_an_alias_key_cannot_replace_an_unsafe_value_before_the_schema_sees_it() -> None:
+    document = valid_manifest()
+    document["files"] = [_TwoKeyItems(document["files"][0]), *document["files"][1:]]
+    with pytest.raises(ValidationError):
+        validate_portable_manifest(document)
+
+
+def test_non_text_keys_are_refused_and_text_keys_still_work() -> None:
+    document = valid_manifest()
+    document["scope"] = {**document["scope"], 7: "x"}
+    with pytest.raises(ValidationError):
+        validate_portable_manifest(document)
+    assert validate_portable_manifest(valid_manifest())

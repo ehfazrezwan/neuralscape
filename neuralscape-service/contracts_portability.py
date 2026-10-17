@@ -614,7 +614,12 @@ def _reconstruct_retained_state(
             key = rebuild(key)
             if type(key) is not str and _inherits(key, str):
                 key = str.__str__(key)
-            if type(key) is str and key in result:
+            if type(key) is not str:
+                # An object that is no text could hash and compare equal to a key already present and
+                # replace its value while the first key is kept: the schema would never see the value
+                # that was overwritten.  Mapping keys of a contract are text.
+                raise ValueError("a mapping key must be text")
+            if key in result:
                 raise ValueError("two keys of one mapping share a text")
             result[key] = rebuild(item)
         return result
