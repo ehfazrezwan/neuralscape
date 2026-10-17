@@ -634,7 +634,7 @@ def _reject_retained_unknown_fields(
     discover(root)
     walk(root, ())
     if errors:
-        raise ValidationError.from_exception_data("PortableManifest", errors)
+        raise _OwnErrors(errors)
     return model_inventory, native_container_inventory, public_view_inventory
 
 
@@ -1067,22 +1067,74 @@ _OMITTED_INPUT = "<omitted: caller input is never rendered>"
 _MAX_REFUSAL_TEXT = 1_000
 
 
+class _OwnErrors(Exception):
+    """The refusals this module's own traversal found (plain detail dicts), as opposed to a ``ValidationError``
+    raised by a caller's public iterator, which is never read."""
+
+    def __init__(self, details: list[dict[str, Any]]) -> None:
+        super().__init__("contract input refused")
+        self.details = details
+
+
+_MAX_REFUSAL_ITEMS = 100
+_MAX_REFUSAL_LOCATION = 32
+
+
+def _fixed_refusal() -> ValidationError:
+    return _refusal(ValueError(_UNREADABLE_INPUT))[0]
+
+
+def _bounded_scalar(value: Any) -> Any:
+    """A context or location value that renders without caller code: an exact ``bool``, ``int``, ``float`` or
+    ``str`` (cut at the cap); anything else becomes the fixed text."""
+
+    if is_exact_type(value, bool, int, float):
+        return value
+    if is_exact_type(value, str):
+        return value if len(value) <= _MAX_REFUSAL_TEXT else value[:_MAX_REFUSAL_TEXT] + "..."
+    return _UNREADABLE_INPUT
+
+
+def _from_own_details(details: list[dict[str, Any]]) -> ValidationError:
+    """The refusal for the traversal's own findings: locations and plain inputs only, items and locations capped."""
+
+    bounded = []
+    for item in details[:_MAX_REFUSAL_ITEMS]:
+        location = tuple(_bounded_scalar(part) for part in tuple(item["loc"])[:_MAX_REFUSAL_LOCATION])
+        bounded.append({"type": item["type"], "loc": location, "input": _renderable_input(item.get("input"))})
+    return ValidationError.from_exception_data("PortableManifest", bounded)
+
+
 def _value_free(error: ValidationError) -> ValidationError:
     """The same refusal with no caller input in it, so rendering it reads nothing of the caller.
 
     Pydantic keeps the rejected object as each error's input, and rendering the error
     (``str``, ``repr``, ``json``, logging) then runs that object's ``repr``: for a
     model carrying a custom extra view, an unbounded read.  Locations, error types and
-    context are kept; an input is kept only when it is a short plain scalar.
+    bounded context are kept; an input is kept only when it is a short plain scalar.
+
+    The error itself can come from a caller's public iterator.  Only a genuine ``ValidationError`` (exact
+    type) is read: a subclass could answer ``errors()`` and ``title`` with caller code, so it is replaced by
+    a fixed refusal.  Items and locations are capped, a context value must be a plain scalar, and a context
+    ``error`` is replaced by a bounded stand-in (see ``_bounded_cause``), never rendered.
     """
 
+    if type(error) is not ValidationError:
+        return _fixed_refusal()
     details = []
-    for item in error.errors(include_url=False):
-        detail = {"type": item["type"], "loc": item["loc"], "input": _renderable_input(item.get("input"))}
+    for item in error.errors(include_url=False)[:_MAX_REFUSAL_ITEMS]:
+        location = tuple(_bounded_scalar(part) for part in tuple(item["loc"])[:_MAX_REFUSAL_LOCATION])
+        detail = {"type": item["type"], "loc": location, "input": _renderable_input(item.get("input"))}
         if "ctx" in item:
-            detail["ctx"] = item["ctx"]
+            context = {}
+            for key, value in item["ctx"].items():
+                if _inherits(value, BaseException):
+                    context[key] = _bounded_cause(value)
+                else:
+                    context[key] = _bounded_scalar(value)
+            detail["ctx"] = context
         details.append(detail)
-    return ValidationError.from_exception_data(error.title, details)
+    return ValidationError.from_exception_data("PortableManifest", details)
 
 
 _MAX_RENDERED_INPUT = 256
@@ -1152,16 +1204,20 @@ def validate_portable_manifest(
         try:
             model_inventory = _reject_retained_unknown_fields(document)
             candidate = _reconstruct_retained_state(document, model_inventory)
-        except ValidationError as exc:
-            failure = _value_free(exc)
-        except (TypeError, ValueError, RecursionError) as exc:
+        except _OwnErrors as exc:
+            failure = _from_own_details(exc.details)
+        except ValidationError:  # raised by a caller's iterator: never read
+            failure = _fixed_refusal()
+        except Exception as exc:  # any error of the caller's iterator: a fixed or bounded refusal, never raised on
             failure, cause = _refusal(exc)
     else:
         try:
             candidate = _plain_text_keys(document)
-        except ValidationError as exc:
-            failure = _value_free(exc)
-        except (TypeError, ValueError, RecursionError) as exc:
+        except _OwnErrors as exc:
+            failure = _from_own_details(exc.details)
+        except ValidationError:  # raised by a caller's iterator: never read
+            failure = _fixed_refusal()
+        except Exception as exc:  # any error of the caller's iterator: a fixed or bounded refusal, never raised on
             failure, cause = _refusal(exc)
     if failure is None:
         try:

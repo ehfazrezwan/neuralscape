@@ -4922,3 +4922,96 @@ def test_our_own_refusals_keep_their_exact_message() -> None:
     with pytest.raises(ValidationError) as raised:
         validate_portable_manifest(manifest)
     assert str(raised.value.__cause__) == budget_message
+
+
+# ---- a refusal built from an error the caller's iterator raised reads nothing of that error
+
+class _Renders:
+    count = 0
+
+    def __repr__(self) -> str:
+        type(self).count += 1
+        return "SECRET-RENDERING " + "x" * 1_000_000
+
+    __str__ = __repr__
+
+
+def _validation_error(items) -> ValidationError:
+    return ValidationError.from_exception_data("Hostile", items)
+
+
+def _refused_by(error: BaseException) -> ValidationError:
+    manifest = _manifest_with_a_raising_view(error)
+    with pytest.raises(ValidationError) as raised:
+        validate_portable_manifest(manifest)
+    return raised.value
+
+
+def test_a_validation_error_from_a_callers_iterator_is_not_rendered() -> None:
+    import traceback
+
+    hostile = _validation_error(
+        [{"type": "value_error", "loc": ("a",), "input": _Renders(), "ctx": {"error": _HostileError("h")}}]
+    )
+    _Renders.count = _HostileError.renders = 0  # building the hostile error is the test's own
+    refusal = _refused_by(hostile)
+    assert _Renders.count == 0 and _HostileError.renders == 0  # not at construction
+    text = str(refusal) + "".join(traceback.format_exception(refusal))
+    assert _Renders.count == 0 and _HostileError.renders == 0
+    assert "SECRET" not in text and len(text) < 20_000
+
+
+def test_a_validation_error_subclass_is_never_asked_for_its_contents() -> None:
+    calls: list[str] = []
+
+    class Spoofing(ValidationError):
+        def errors(self, *args, **kwargs):
+            calls.append("errors")
+            return [{"type": "value_error", "loc": ("a",), "input": 1}] * 1_000
+
+        @property
+        def title(self):
+            calls.append("title")
+            return "T"
+
+    hostile = Spoofing.from_exception_data("Hostile", [{"type": "value_error", "loc": (), "input": 1, "ctx": {"error": ValueError("x")}}])
+    refusal = _refused_by(hostile)
+    assert calls == []  # neither errors() nor title ran
+    assert len(refusal.errors()) == 1  # a fixed, single refusal
+
+
+def test_a_huge_validation_error_gives_a_bounded_refusal() -> None:
+    items = [{"type": "value_error", "loc": tuple(range(5_000)), "input": 1, "ctx": {"error": ValueError("e" * 50_000)}}] * 400
+    refusal = _refused_by(_validation_error(items))
+    details = refusal.errors()
+    assert 0 < len(details) <= 100 and all(len(detail["loc"]) <= 32 for detail in details)
+    assert len(str(refusal)) < 200_000
+
+
+def test_the_modules_own_refusals_keep_their_locations_and_types() -> None:
+    document = valid_manifest()
+    document["files"][0]["path"] = "../escape"  # refused by the schema
+    with pytest.raises(ValidationError) as schema_refusal:
+        validate_portable_manifest(document)
+    assert any(detail["loc"][:3] == ("files", 0, "path") for detail in schema_refusal.value.errors())
+    manifest = validate_portable_manifest(valid_manifest()).model_copy(deep=True)
+    _PYDANTIC_FIELDS_SET_SLOT.__get__(manifest, type(manifest)).add("phantom_only")  # found by the traversal
+    with pytest.raises(ValidationError) as traversal_refusal:
+        validate_portable_manifest(manifest)
+    (detail,) = traversal_refusal.value.errors()
+    assert detail["type"] == "extra_forbidden" and detail["loc"] == ("phantom_only",)
+
+
+def test_any_other_exception_from_a_callers_iterator_is_a_fixed_refusal() -> None:
+    import traceback
+
+    _Renders.count = 0
+
+    class Odd(KeyError):
+        def __str__(self) -> str:
+            _Renders.count += 1
+            return "SECRET-RENDERING " + "x" * 1_000_000
+
+    refusal = _refused_by(Odd("k"))
+    assert _Renders.count == 0 and type(refusal.__cause__) is ValueError
+    assert "SECRET" not in "".join(traceback.format_exception(refusal)) and _Renders.count == 0

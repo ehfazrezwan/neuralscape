@@ -2553,3 +2553,11 @@ def test_parent_directories_that_differ_only_in_case_collide_in_a_directory_bund
 def test_shared_and_distinct_parents_are_not_collisions(tmp_path, records) -> None:
     files = {"a/one.txt": b"x", "a/two.txt": b"x", "a/b/three.txt": b"x", "c/four.txt": b"x"}
     assert verify_bundle(_zip_of(tmp_path, files, directory_records=records)).ok
+
+
+def test_an_aliased_parent_with_a_directory_record_is_reported_once(tmp_path) -> None:
+    path = _zip_of(tmp_path, {"A/one.txt": b"x", "a/two.txt": b"x"}, directory_records=True)
+    report = verify_bundle(path)
+    collisions = [item for item in report.findings if item.code == pv.CASE_COLLISION]
+    assert collisions and not any(item.detail == "parent directories differ only in case" for item in collisions)
+    assert len({item.path for item in collisions}) == len(collisions)

@@ -728,7 +728,7 @@ def _collision_checks(entries: list[_Entry], report: VerificationReport) -> None
     _parent_collisions(seen_exact, report)
 
 
-def _parent_collisions(names: Iterable[str], report: VerificationReport) -> None:
+def _parent_collisions(names: "dict[str, int]", report: VerificationReport) -> None:
     """Parent directories that differ only in case or normalization, whether or not the container has records
     for them: ``A/one.txt`` and ``a/two.txt`` are as much a collision as the same inventory with ``A/`` and
     ``a/`` listed, so an optional directory record can never change the verdict.  The names are walked once
@@ -750,7 +750,7 @@ def _parent_collisions(names: Iterable[str], report: VerificationReport) -> None
                 known = node[key] = (part, {})
             elif known[0] != part:
                 parent = "/".join(parts[: depth + 1])
-                if parent not in reported:
+                if parent not in reported and parent not in names:  # an entry of that name was compared as a whole name
                     reported.add(parent)
                     report.add(CASE_COLLISION, _safe_label(parent), "parent directories differ only in case")
                 # judged once; the walk continues under the first spelling so deeper levels are still compared
