@@ -1,0 +1,11 @@
+{
+ "oracles": {
+  "persona-card-freshness.json": "8054f5419a812cff9609864946a72fdc29a1a78001dcedec0cd9065158a82adf",
+  "persona-citation-resolution.json": "1589603777948e969bf741402cd1b70ee49afcd10cea20554965eaf10a48f65d",
+  "persona-lifecycle-state.json": "13a7d507db5b6bbfd2362b93e7afffb715a06ee2e75e7f0446b9f323e445fb11",
+  "persona-project-preference.json": "f53483074e0cc030dacbcc6c71f7a0bbce922a3166f99920a8a9081f78a46553",
+  "persona-retained-source-hold.json": "6fb3db02b31ef5a7b427bd44ff299a417b25c6618968e20d0d6806b6f4fef441"
+ },
+ "rule": "a changed oracle needs a changed manifest entry accepted by its reviewer; fix authors do not edit either",
+ "schema_version": "oracle-manifest-v1"
+}
