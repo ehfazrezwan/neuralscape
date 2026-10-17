@@ -1448,9 +1448,18 @@ def check_compatibility(old: dict, new: dict) -> list[str]:
         old, new = _native_json(old), _native_json(new)  # read once: nothing the caller passed answers later
     except _NOT_JSON:
         return [_unverified("$", "a schema that is not plain JSON")]
-    old_version = _declared_version(old)
-    new_version = _declared_version(new)
-    if old_version is not None and new_version is not None and _is_version_bump(old_version, new_version):
+    return _check_native(old, new)
+
+
+def _explicit_bump(old: object, new: object) -> bool:
+    old_version, new_version = _declared_version(old), _declared_version(new)
+    return old_version is not None and new_version is not None and _is_version_bump(old_version, new_version)
+
+
+def _check_native(old: object, new: object) -> list[str]:
+    """:func:`check_compatibility` on two schemas already copied into exact natives."""
+
+    if _explicit_bump(old, new):
         return []
     problems: list[str] = []
     run = _Run()
@@ -1489,7 +1498,14 @@ def compare_schemas(old: dict[str, dict], new: dict[str, dict]) -> dict[str, lis
             if name not in new:
                 report[name] = ["contract removed"]
                 continue
-            problems = check_compatibility(old_schema, new[name])
+            call = _CALL.get()
+            if call is not None and (call.steps > _MAX_CALL_COMPARISONS or call.values > _MAX_CALL_VALUES):
+                # The call's budget is spent: the remaining contracts are not compared (nor copied again),
+                # only an explicit version bump is still read from the schemas copied above.
+                if not _explicit_bump(old_schema, new[name]):
+                    report[name] = [_BUDGET_MESSAGE]
+                continue
+            problems = _check_native(old_schema, new[name])  # the sets were copied once, above
             if problems:
                 report[name] = problems
     finally:

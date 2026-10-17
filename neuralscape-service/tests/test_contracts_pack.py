@@ -2296,3 +2296,37 @@ def test_a_digest_of_a_value_beyond_plain_json_is_a_clear_error() -> None:
     with pytest.raises(ValueError, match="plain JSON"):
         pack.schema_digest({"const": deep})
     assert pack.schema_digest({"type": "string"}) == pack.schema_digest({"type": "string"})
+
+
+# ---- once a call's budget is spent, the remaining contracts are reported without copying or comparing
+
+
+def test_compare_schemas_copies_once_and_stops_at_the_call_budget(monkeypatch) -> None:
+    copies = {"count": 0}
+    real = pack._native_json
+
+    def counting(value):
+        copies["count"] += 1
+        return real(value)
+
+    monkeypatch.setattr(pack, "_native_json", counting)
+    monkeypatch.setattr(pack, "_MAX_CALL_COMPARISONS", 5)
+    wide = {"type": "object", "properties": {f"p{i}": {"type": "string"} for i in range(100)}}
+    old = {f"c{i}": wide for i in range(6)}
+    report = pack.compare_schemas(old, copy.deepcopy(old))
+    assert copies["count"] == 2, copies  # the two sets, once: never again per contract
+    assert report.get("c5") == [pack._BUDGET_MESSAGE], report  # the rest are reported, not compared
+
+
+def test_an_explicit_version_bump_is_still_accepted_after_the_call_budget_is_spent(monkeypatch) -> None:
+    monkeypatch.setattr(pack, "_MAX_CALL_COMPARISONS", 5)
+    wide = {"type": "object", "properties": {f"p{i}": {"type": "string"} for i in range(100)}}
+    old = {"a": wide, "z": _versioned("v1")}
+    new = {"a": copy.deepcopy(wide), "z": {**_versioned("v2"), "required": ["schema_version"]}}
+    report = pack.compare_schemas(old, new)
+    assert report.get("a") == [pack._BUDGET_MESSAGE] and "z" not in report, report
+
+
+def test_check_compatibility_alone_is_unchanged_by_the_split() -> None:
+    assert _pair({"maxLength": 5}, {"maxLength": 3}) == ["$: maxLength lowered"]
+    assert _pair(_versioned("v1"), {**_versioned("v2"), "required": ["schema_version"]}) == []
