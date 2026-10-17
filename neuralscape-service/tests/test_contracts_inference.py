@@ -2119,3 +2119,17 @@ def test_a_long_scalar_output_used_once_is_charged_once_and_admitted_to_validati
         validate_generation_result(request, result)
     assert DISCOVERY_BUDGET_MESSAGE not in str(refused.value)
 
+
+class _TextSubclass(str):
+    pass
+
+
+def test_repeated_string_subclass_leaves_are_charged_like_strings():
+    """A str subclass is kept through reconstruction; it must cost what a plain string of its length costs."""
+
+    from contracts_limits import DISCOVERY_BUDGET_MESSAGE
+
+    leaf = _TextSubclass("x" * 200_000)
+    request, result = _generation_with_output({"v": [leaf] * 1_000}, v={"type": "array"})
+    with pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):
+        validate_generation_result(request, result)

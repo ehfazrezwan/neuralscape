@@ -636,8 +636,10 @@ def _expanded_size(native: Any, budget: DiscoveryBudget, memo: dict[Any, Any]) -
         total = len(children)
         texts = tuple(dict.keys(value)) + children if kind is dict else children
         for child in texts:
-            if type(child) is str:
-                total += _string_units(child)  # every path scans a long string (or key) again
+            if is_subclass(type(child), str):
+                # every path scans a long string (or key) again; a str subclass kept through the
+                # snapshot is text of the same length (its length is read without its hooks)
+                total += _string_units(child)
             else:
                 total += known(child) or 0
             if total > limit:
