@@ -434,14 +434,15 @@ def _charge_values(count: int, local: list[int]) -> bool:
     return local[0] <= _MAX_EQUALITY_STEPS
 
 
-def _charge_walk() -> None:
-    """Spend one walked value of the running comparison's (and call's) budget: an expansion or one of its
-    helper walks has a local limit per call, but repeated calls must still add up.  Free outside a run."""
+def _charge_walk(count: int = 1) -> None:
+    """Spend ``count`` walked values of the running comparison's (and call's) budget: an expansion, one of its
+    helper walks, or a scan of a list that many schemas may share has no budget of its own, but repeated
+    scans must still add up.  Free outside a run."""
 
     run = _RUN.get()
     if run is not None:
-        run.values += 1
-        run.call.values += 1
+        run.values += count
+        run.call.values += count
         if run.values > _MAX_EQUALITY_STEPS or run.call.values > _MAX_CALL_VALUES:
             raise _BudgetExhausted
 
@@ -795,7 +796,10 @@ def _allowed_values(schema: dict) -> list | None:
     if has_const:
         return [schema["const"]]
     if has_enum:
-        return list(schema["enum"]) if isinstance(schema["enum"], list) else []
+        if not isinstance(schema["enum"], list):
+            return []
+        _charge_walk(len(schema["enum"]))  # an enum may be shared by many schemas: its copy is charged
+        return list(schema["enum"])
     return None
 
 
@@ -882,6 +886,7 @@ def _malformed_keys(schema: dict) -> tuple[str, ...]:
         known = run.shapes.get(id(schema))
         if known is not None and known[0] is schema:
             return known[1]
+    _charge_walk(sum(1 + len(schema[key]) for key in _VALUE_SHAPES if key in schema and type(schema[key]) in (list, dict)))
     found = tuple(key for key, shape in _VALUE_SHAPES.items() if key in schema and not shape(schema[key]))
     if run is not None:
         run.shapes[id(schema)] = (schema, found)  # the node is kept, so its id is its own for the run
@@ -1053,6 +1058,7 @@ def _compare(
                 out.append(_unverified(path, f"{key} has a value outside JSON Schema"))
         old = {key: value for key, value in old.items() if key not in malformed}
         new = {key: value for key, value in new.items() if key not in malformed}
+    _charge_walk(len(old) + len(new))  # the node's keys are scanned on every visit, memoized pair or not
     for key in sorted((set(old) | set(new)) - _MODELED - _ANNOTATIONS):
         # Compared with its keyword, so the equality knows what the value is: in a map of names to schemas
         # (``patternProperties``, ``dependentSchemas``) a name such as ``const`` is a name, and the schema
@@ -1320,6 +1326,7 @@ def _compare_keywords(
                 for pattern in proven
             ):
                 out.append(_unverified(f"{path}.{name}", "a listed property narrows what patternProperties accepted"))
+    _charge_walk(len(new.get("required", [])) + len(old.get("required", [])))  # a required list may be shared widely
     for name in sorted(set(new.get("required", [])) - set(old.get("required", []))):
         out.append(f"{path}.{name}: now required")
     new_additional = new.get("additionalProperties", True)

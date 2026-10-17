@@ -2475,3 +2475,45 @@ def test_a_value_that_cannot_be_rendered_under_a_lowered_limit_is_still_reported
 def test_an_integer_at_the_text_limit_is_named_by_its_size() -> None:
     findings = _pair({"enum": [10**4299, 0]}, {"enum": [0]})
     assert findings == ["$: enum values removed [<integer of about 4300 digits>]"], findings
+
+
+# ---- scans of a shared list (required names, enum values, a node's keys) spend the value budget
+
+
+def _distinct_objects_sharing(names: list, count: int) -> dict:
+    return {"type": "object", "properties": {
+        f"o{i}": {"type": "object", "required": names, "properties": {n: {} for n in names[:1]}, "description": f"{i}"}
+        for i in range(count)}}
+
+
+@pytest.mark.parametrize("entry", ["check_compatibility", "compare_schemas"])
+def test_a_required_list_shared_by_many_objects_spends_the_value_budget(monkeypatch, entry) -> None:
+    monkeypatch.setattr(pack, "_MAX_EQUALITY_STEPS", 50)
+    monkeypatch.setattr(pack, "_MAX_CALL_VALUES", 50)
+    monkeypatch.setattr(pack, "_MAX_COMPARISONS", 50)
+    monkeypatch.setattr(pack, "_MAX_CALL_COMPARISONS", 50)
+    schema = _distinct_objects_sharing([f"n{i}" for i in range(100)], 20)  # Copilot's shape
+    if entry == "check_compatibility":
+        findings = _pair(schema, copy.deepcopy(schema))
+    else:
+        findings = pack.compare_schemas({"C": schema}, {"C": copy.deepcopy(schema)}).get("C")
+    assert findings == [pack._BUDGET_MESSAGE], findings
+
+
+def test_a_shared_enum_and_wide_nodes_spend_the_value_budget(monkeypatch) -> None:
+    monkeypatch.setattr(pack, "_MAX_EQUALITY_STEPS", 5_000)
+    members = [f"v{i}" for i in range(1000)]
+    old = {"type": "object", "properties": {f"p{i}": {"description": f"{i}"} for i in range(20)}}
+    new = {"type": "object", "properties": {f"p{i}": {"enum": members, "description": f"{i}"} for i in range(20)}}
+    assert pack._BUDGET_MESSAGE in _pair(old, new)  # each added restriction copied the 1,000-member enum for free
+    wide = {f"x-{k}": k for k in range(500)}
+    schema = {"type": "object", "properties": {f"p{i}": {**wide, "description": f"{i}"} for i in range(20)}}
+    assert _pair(schema, copy.deepcopy(schema)) == [pack._BUDGET_MESSAGE]  # 20 x 500 unmodelled keys scanned
+
+
+def test_shared_lists_within_budget_still_compare() -> None:
+    schema = _distinct_objects_sharing([f"n{i}" for i in range(10)], 5)
+    assert _pair(schema, copy.deepcopy(schema)) == []
+    narrowed = copy.deepcopy(schema)
+    narrowed["properties"]["o2"]["required"] = narrowed["properties"]["o2"]["required"] + ["extra"]
+    assert "$.o2.extra: now required" in _pair(schema, narrowed)
