@@ -1,6 +1,7 @@
 """Behavioral and adversarial tests for portable manifest validation."""
 
 import gc
+import itertools
 import json
 import sys
 import weakref
@@ -3258,9 +3259,9 @@ def test_budget_accounting_runs_no_container_protocol(monkeypatch) -> None:
             calls.append("bool")
             return True
 
-    monkeypatch.setattr(contracts_portability, "PORTABILITY", _tier(2, 4, 8))
     noisy = Noisy([[] for _ in range(10)])
-    manifest = _manifest_with_files(noisy)
+    manifest = _manifest_with_files(noisy)  # built under the real tier: a mapping input is budgeted too
+    monkeypatch.setattr(contracts_portability, "PORTABILITY", _tier(2, 4, 8))
     calls.clear()
     with pytest.raises(ValidationError) as raised:
         validate_portable_manifest(manifest)
@@ -4048,3 +4049,123 @@ def test_an_honest_shallower_revisit_still_validates() -> None:
     public = _files_with_first(manifest, _file_dict(first, first.checksum))
     honest = _RepairsOnIteration(first.checksum, lambda: None, public)
     assert validate_portable_manifest(_manifest_with_files(honest)).files[0].path == first.path
+
+
+# --- a mapping input is discovered whole, and its subclasses are observed, like a model graph ---
+
+
+def _sibling_repair_document(producer_first: bool) -> tuple[dict, BaseModel]:
+    """A mapping whose producer model's fields-set iterator repairs the scope model's invalid tenant."""
+
+    manifest = validate_portable_manifest(valid_manifest())
+    scope = manifest.scope.model_copy(deep=True)
+    _PYDANTIC_DICT_DESCRIPTOR.__get__(scope, BaseModel)["tenant_id"] = ""  # invalid on entry
+    producer = manifest.producer.model_copy(deep=True)
+    _PYDANTIC_FIELDS_SET_SLOT.__set__(
+        producer,
+        RepairingFieldsSetIterable(tuple(type(producer).model_fields), scope, "tenant_id", "tenant-1"),
+    )
+    document = {key: value for key, value in valid_manifest().items() if key not in ("scope", "producer")}
+    ordered = (("producer", producer), ("scope", scope)) if producer_first else (("scope", scope), ("producer", producer))
+    for key, value in ordered:
+        document[key] = value
+    return document, scope
+
+
+@pytest.mark.parametrize("producer_first", [True, False], ids=["producer-first", "scope-first"])
+def test_a_sibling_models_callback_cannot_repair_another_model_before_it_is_snapshotted(producer_first) -> None:
+    document, scope = _sibling_repair_document(producer_first)
+    with pytest.raises(ValidationError) as raised:
+        validate_portable_manifest(document)
+    assert any(error["loc"][:2] == ("scope", "tenant_id") for error in raised.value.errors())
+    assert _PYDANTIC_DICT_DESCRIPTOR.__get__(scope, BaseModel)["tenant_id"] == "tenant-1"  # the callback did run
+
+
+def test_the_same_sibling_repair_is_refused_inside_a_manifest_model_too() -> None:
+    document, scope = _sibling_repair_document(True)
+    manifest = validate_portable_manifest(valid_manifest()).model_copy(deep=True)
+    native = _PYDANTIC_DICT_DESCRIPTOR.__get__(manifest, BaseModel)
+    dict.__setitem__(native, "producer", document["producer"])
+    dict.__setitem__(native, "scope", scope)
+    with pytest.raises(ValidationError):
+        validate_portable_manifest(manifest)
+
+
+class _DivergentList(list):
+    """Valid native backing, but the public iterator yields something else."""
+
+    def __init__(self, native, public) -> None:
+        list.__init__(self, native)
+        self.public = public
+        self.iterations = 0
+
+    def __iter__(self):
+        self.iterations += 1
+        return iter(self.public)
+
+
+def _unsafe_file(manifest: PortableManifest) -> ManifestFile:
+    return manifest.files[0].model_copy(update={"path": "../escape.txt"})
+
+
+@pytest.mark.parametrize("form", ["model", "mapping"])
+def test_a_list_subclass_is_validated_by_its_public_view_in_both_input_forms(form) -> None:
+    manifest = validate_portable_manifest(valid_manifest())
+    divergent = _DivergentList(list(manifest.files), [_unsafe_file(manifest), *manifest.files[1:]])
+    if form == "model":
+        subject: object = _manifest_with_files(divergent)
+    else:
+        subject = valid_manifest()
+        subject["files"] = divergent  # type: ignore[index]
+    with pytest.raises(ValidationError):
+        validate_portable_manifest(subject)  # type: ignore[arg-type]
+    assert divergent.iterations == 1  # observed once, never re-read
+
+
+def test_an_honest_list_subclass_validates_in_both_input_forms() -> None:
+    manifest = validate_portable_manifest(valid_manifest())
+    honest = _DivergentList(list(manifest.files), list(manifest.files))
+    document = valid_manifest()
+    document["files"] = honest
+    assert validate_portable_manifest(document).files[0].path == manifest.files[0].path
+    assert validate_portable_manifest(_manifest_with_files(_DivergentList(list(manifest.files), list(manifest.files)))).files[0].path == manifest.files[0].path
+
+
+class _DivergentDict(dict):
+    """Valid native entries, but the public items() view differs."""
+
+    def __init__(self, native, public) -> None:
+        dict.__init__(self, native)
+        self.public = public
+
+    def items(self):
+        return self.public.items()
+
+
+def test_a_dict_subclass_in_a_mapping_input_is_validated_by_its_public_view() -> None:
+    scope = valid_manifest()["scope"]
+    document = valid_manifest()
+    document["scope"] = _DivergentDict(scope, {**scope, "tenant_id": ""})
+    with pytest.raises(ValidationError):
+        validate_portable_manifest(document)
+
+
+def test_an_endless_public_view_inside_a_mapping_input_is_observed_and_cut_off_by_the_budget() -> None:
+    produced = [0]
+
+    class Endless(list):
+        def __iter__(self):
+            def forever():
+                while True:
+                    produced[0] += 1
+                    yield produced[0]
+
+            return forever()
+
+    document = valid_manifest()
+    document["files"] = Endless()
+    with pytest.raises(ValidationError):
+        validate_portable_manifest(document)
+    # the public view is observed (charged as it is read) and stopped by the discovery budget; the native,
+    # empty backing used to be copied without ever asking the view
+    assert 0 < produced[0] <= PORTABILITY_MAX_EDGES + 1

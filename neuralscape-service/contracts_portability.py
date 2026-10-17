@@ -605,6 +605,20 @@ def _reconstruct_retained_state(
         completed[identity] = (value, result)
         return result
 
+    def entries(items: Any) -> dict[Any, Any]:
+        """A rebuilt mapping: a ``str``-subclass key is its plain text (its hash and equality never run), and
+        two keys with one text are refused rather than one silently shadowing the other."""
+
+        result: dict[Any, Any] = {}
+        for key, item in items:
+            key = rebuild(key)
+            if type(key) is not str and _inherits(key, str):
+                key = str.__str__(key)
+            if type(key) is str and key in result:
+                raise ValueError("two keys of one mapping share a text")
+            result[key] = rebuild(item)
+        return result
+
     def build(value: Any) -> Any:
         if _inherits(value, BaseModel):
             stored_entries, extra_entries = _validated_model_storage(
@@ -618,9 +632,9 @@ def _reconstruct_retained_state(
             items = _validated_native_container_items(
                 value, native_container_inventory
             )
-            return {rebuild(key): rebuild(item) for key, item in items}
+            return entries(items)
         if _is_mapping(value):
-            return {rebuild(key): rebuild(item) for key, item in observed(value)}
+            return entries(observed(value))
         if is_exact_type(value, list, tuple, set, frozenset):
             items = _validated_native_container_items(
                 value, native_container_inventory
@@ -894,69 +908,22 @@ class PortableManifest(VersionedContract):
 
 
 def _plain_text_keys(document: Any) -> Any:
-    """A copy of a mapping input whose str-subclass keys are their plain text.
+    """A copy of a mapping input, read by the same two phases and rules as a model graph.
 
-    A key that is a ``str`` subclass can carry its own hash and equality, so two keys
-    with one text could both survive in a mapping and the validator would silently
-    take one of them while another reader takes the other.  Each such key is read as
-    its text without running its hooks, and two keys with one text are refused.
-    Native dicts, lists and tuples (subclasses included) are walked once per object,
-    so a shared subtree costs one copy however many paths reach it; nesting is
-    bounded by the portability tier's depth.  A model instance is rebuilt through the
-    budgeted traversal first.  Anything else is left to the schema.
+    The whole graph (every nested dict, list, tuple and model, however shared) is discovered, with its
+    native storage frozen and every public view of a container subclass or custom mapping observed once
+    and charged, under one budget, before anything is rebuilt: a callback met while one part is read
+    cannot repair another part that has not been snapshotted yet.  The copy is then rebuilt from those
+    snapshots only.  A key that is a ``str`` subclass is read as its text without running its hooks, and
+    two keys with one text are refused (see ``_reconstruct_retained_state``).  Anything that is not a
+    container is left to the schema.
     """
 
-    copies: dict[int, Any] = {}
-    originals: list[Any] = []  # keeps every walked object alive, so ids stay unique
-    call_state: list[_CallState] = []  # created on the first model instance, then shared
-
-    def walk(value: Any, depth: int) -> Any:
-        if _inherits(value, BaseModel):
-            # A model instance inside a mapping goes through the same budgeted traversal
-            # and reconstruction as a top-level model, so its retained state (including
-            # a custom extra view) is read within the discovery budget, never by the schema.
-            # Every instance of this call shares one budget and one memo.
-            identity = id(value)
-            if identity in copies:
-                return copies[identity]
-            originals.append(value)
-            if not call_state:
-                call_state.append(_CallState())
-            state = call_state[0]
-            rebuilt = _reconstruct_retained_state(
-                value, _reject_retained_unknown_fields(value, state), state
-            )
-            copies[identity] = walk(rebuilt, depth)
-            return copies[identity]
-        if not _inherits(value, dict, list, tuple):
-            return value
-        if depth > PORTABILITY.max_depth:
-            raise ValueError("manifest nesting exceeds the portability depth limit")
-        identity = id(value)
-        if identity in copies:
-            return copies[identity]
-        originals.append(value)
-        if _inherits(value, dict):
-            result: dict[Any, Any] = {}
-            copies[identity] = result
-            for key, item in dict.items(value):
-                if type(key) is not str and _inherits(key, str):
-                    key = str.__str__(key)
-                if type(key) is str and key in result:
-                    raise ValueError("two keys of one mapping share a text")
-                result[key] = walk(item, depth + 1)
-            return result
-        items = list.__iter__(value) if _inherits(value, list) else tuple.__iter__(value)
-        if _inherits(value, list):
-            built: list[Any] = []
-            copies[identity] = built
-            built.extend(walk(item, depth + 1) for item in items)
-            return built
-        copied = tuple(walk(item, depth + 1) for item in items)
-        copies[identity] = copied
-        return copied
-
-    return walk(document, 0)
+    if not _inherits(document, dict):
+        return document  # not a mapping: the schema refuses it
+    state = _CallState()
+    inventory = _reject_retained_unknown_fields(document, state)  # type: ignore[arg-type]
+    return _reconstruct_retained_state(document, inventory, state)  # type: ignore[arg-type]
 
 
 _OMITTED_INPUT = "<omitted: caller input is never rendered>"
