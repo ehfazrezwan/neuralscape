@@ -1036,6 +1036,9 @@ def validate_capability_requirements(
         memo=memo,
     )
     states_by_operation = _operation_state_lookup(manifest)
+    # One set for every requirement: a tuple scan per requirement would be work per occurrence that
+    # grows with both the requirements and the declared versions.
+    declared_versions = frozenset(manifest.contract_schema_versions)
 
     violations: list[CapabilityViolation] = []
     for requirement in requirements:
@@ -1045,7 +1048,7 @@ def validate_capability_requirements(
                 CapabilityViolation(operation=requirement.operation, fact="supported")
             )
             continue
-        if requirement.contract_schema_version not in manifest.contract_schema_versions:
+        if requirement.contract_schema_version not in declared_versions:
             violations.append(
                 CapabilityViolation(
                     operation=requirement.operation,

@@ -1982,3 +1982,15 @@ def test_an_empty_requirements_view_observation_is_charged(monkeypatch):
     budgets = _recording_budgets(monkeypatch, max_edges=10_000)
     validate_capability_requirements(manifest(state()), _RepeatingRequirements(requirement(), times=0))
     assert budgets and budgets[0].edges >= 1
+
+
+def test_many_requirements_against_many_declared_versions_take_linear_time():
+    """5,000 occurrences of one requirement against 40,000 declared versions: one lookup each."""
+
+    import time
+
+    versions = tuple(f"version-{index}" for index in range(39_999)) + (VERSION,)
+    declared = manifest(state(), versions=versions)
+    started = time.monotonic()
+    assert validate_capability_requirements(declared, (requirement(),) * 5_000) == ()
+    assert time.monotonic() - started < 1.5
