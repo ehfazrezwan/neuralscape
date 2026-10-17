@@ -56,6 +56,18 @@ _TYPE_MRO = vars(type)["__mro__"]
 _TYPE_NAME = vars(type)["__name__"]  # a class's name, read without any metaclass hook
 
 
+_MAX_TYPE_NAME = 200  # a class name is caller-controlled: a diagnostic quotes at most this much of it
+
+
+def _type_name(value: object) -> str:
+    """The name of ``value``'s class as exact, bounded text: a class may be named by a ``str`` subclass,
+    whose ``__format__``/``__str__`` would otherwise run when the name is interpolated, and by a name of
+    any length."""
+
+    name = str.__str__(_TYPE_NAME.__get__(type(value)))
+    return name if len(name) <= _MAX_TYPE_NAME else name[:_MAX_TYPE_NAME] + "..."
+
+
 def _inherits(cls: type, base: type) -> bool:
     """Whether ``base`` is on ``cls``'s own method resolution order, by identity.
 
@@ -429,7 +441,7 @@ def _open_pair(raw_entry: object) -> tuple[object, object, Iterator[object] | No
     except TypeError:
         if _defines_iter(type(raw_entry)):
             raise  # unpacking reports the iteration protocol's own error unchanged
-        raise TypeError(f"cannot unpack non-iterable {_TYPE_NAME.__get__(type(raw_entry))} object") from None
+        raise TypeError(f"cannot unpack non-iterable {_type_name(raw_entry)} object") from None
     try:
         key = next(iterator)
     except StopIteration:
@@ -667,8 +679,13 @@ def _retained_mapping_entries(
     mapping_inventories: dict[int, _MappingInventory],
     model_inventories: dict[int, _ModelInventory],
     budget: DiscoveryBudget | None = None,
+    paid: dict[int, int] | None = None,
 ) -> tuple[_MappingEntry | _CapturedFailure, ...]:
-    """Return one authenticated public inventory, capturing it if newly seen."""
+    """Return one authenticated public inventory, capturing it if newly seen.
+
+    ``paid`` is completion's map of what discovery already charged: a mapping first captured here
+    records its native descendants in it, so completion does not charge their entries a second time.
+    """
 
     budget = _new_budget(budget)
 
@@ -680,7 +697,7 @@ def _retained_mapping_entries(
             owners,
             mapping_inventories,
             model_inventories,
-            {},
+            {} if paid is None else paid,
             mapping_inventories,
             None,
             budget,
@@ -699,6 +716,7 @@ def _retained_mapping_items(
     mapping_inventories: dict[int, _MappingInventory],
     model_inventories: dict[int, _ModelInventory],
     budget: DiscoveryBudget | None = None,
+    paid: dict[int, int] | None = None,
 ) -> tuple[tuple[object, object], ...]:
     """Rebuild model-owned items while retaining per-entry error priority."""
 
@@ -708,6 +726,7 @@ def _retained_mapping_items(
         mapping_inventories,
         model_inventories,
         budget,
+        paid,
     ):
         retained = cast(_MappingEntry, _raise_captured_failure(entry))
         items.append((retained.key, retained.value))
@@ -743,7 +762,7 @@ class _OpaqueKey:
         self._key = key
 
     def __repr__(self) -> str:
-        return f"<{_TYPE_NAME.__get__(type(self._key))} key>"
+        return f"<{_type_name(self._key)} key>"
 _COPIED = "copied"  # ids of containers completion has copied at least once
 
 
@@ -917,6 +936,7 @@ def _complete_contract_input(
                     mapping_inventories,
                     inventories,
                     budget,
+                    memo.setdefault(_PAID, {}),
                 )
             )
             stored_items = _normalize_model_items(native_stored_items)
@@ -939,6 +959,7 @@ def _complete_contract_input(
                         mapping_inventories,
                         inventories,
                         budget,
+                        memo.setdefault(_PAID, {}),
                     )
                 )
                 extra_items = _normalize_model_items(native_extra_items)
@@ -1027,6 +1048,7 @@ def _complete_contract_input(
                     mapping_inventories,
                     inventories,
                     budget,
+                    memo.setdefault(_PAID, {}),
                 )
             completed: dict[object, object] = {}
             free = _first_paid_copy(memo, value, paid)

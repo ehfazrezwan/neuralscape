@@ -21,6 +21,7 @@ from contracts_policy import (
     PolicyStatement,
     PrincipalContext,
 )
+import contracts_policy_reference as reference_module
 from contracts_policy_reference import (
     _CapturedFailure,
     _capture_model_inventory,
@@ -4740,3 +4741,86 @@ def test_a_public_iterator_only_statement_with_an_honest_extra_mapping_is_still_
     assert _decide(_policy_with_public_only_statements(honest_public)) == "allow"  # valid grants survive lazy discovery
     other, _ = _statement_with_proxy_resource_and_extra("other", None)
     assert _decide(_policy_with_public_only_statements(other)) == "deny"
+
+
+# --- previously missed: prepaid counts of a lazily captured mapping, hooked type names, the evaluator guard ---
+
+
+def _flow_with_paid_memo(root: object):
+    """The evaluator's own order: entry freeze, pending mapping captures, completion with discovery's paid map."""
+
+    inventories: dict = {}
+    owners: dict = {}
+    mapping_inventories: dict = {}
+    native_dicts: dict = {}
+    visited: dict = {}
+    reach: dict = {}
+    budget = DiscoveryBudget()
+    _freeze_reachable_model_inventories(root, inventories, visited, owners, native_dicts, budget, 0, True, reach)
+    _freeze_mapping_inventories(owners, mapping_inventories, inventories, visited, native_dicts, None, budget, reach)
+    mapping_inventories.update(native_dicts)
+    completed = _complete_contract_input(
+        root, set(), inventories, mapping_inventories, budget, 0, {reference_module._PAID: visited}
+    )
+    return completed, budget
+
+
+class _ExposingTuple(tuple):
+    """Empty native backing; the public iterator exposes objects only completion sees."""
+
+    def __new__(cls, public):
+        instance = super().__new__(cls, ())
+        instance.public = public
+        return instance
+
+    def __iter__(self):
+        return iter(self.public)
+
+
+def test_a_mapping_first_exposed_during_completion_keeps_its_prepaid_counts() -> None:
+    """The lazily captured mapping's native tuple is charged once: 70,000 entries fit, 140,000 would not."""
+
+    inner = tuple(range(70_000))
+    completed, budget = _flow_with_paid_memo((_ExposingTuple([_Items(lambda: iter([("k", inner)]))]),))
+    assert completed[0][0] == {"k": inner}
+    assert budget.edges < 75_000
+
+
+def test_an_invalid_key_diagnostic_never_formats_a_hooked_type_name() -> None:
+    calls: list[str] = []
+
+    class HookedName(str):
+        def __format__(self, spec):
+            calls.append("format")
+            return "hooked"
+
+        def __str__(self):
+            calls.append("str")
+            return "hooked"
+
+    class Key:
+        pass
+
+    Key.__name__ = HookedName("Key")
+    assert repr(reference_module._OpaqueKey(Key())) == "<Key key>"
+    assert calls == []
+
+
+def test_the_evaluator_denies_a_statement_with_an_unjudged_term(monkeypatch) -> None:
+    resource_value = reference("memory-1")
+    grant = statement("s", "allow", "read", resource_value)
+    assert evaluate(principal(), "read", resource_value, policy(grant)).outcome == "allow"
+    # the same statement, once one of its fields is no longer judged, must not authorize
+    monkeypatch.setattr(reference_module, "_JUDGED_STATEMENT_FIELDS", reference_module._JUDGED_STATEMENT_FIELDS - {"id"})
+    decision = evaluate(principal(), "read", resource_value, policy(grant))
+    assert (decision.outcome, decision.reason_code) == ("deny", "unsupported_policy_semantics")
+
+
+def test_an_invalid_key_diagnostic_bounds_a_long_type_name() -> None:
+    class Key:
+        pass
+
+    Key.__name__ = "K" * 100_000
+    text = repr(reference_module._OpaqueKey(Key()))
+    assert len(text) < 300  # the name is quoted only up to a bound
+    assert text.startswith("<KKK") and text.endswith(" key>")
