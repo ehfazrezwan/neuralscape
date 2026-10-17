@@ -412,6 +412,8 @@ def _json_equal(left: object, right: object) -> bool:
     work = [(left, right)]
     compared: set[tuple[int, int]] = set()
     local = [0]
+    if _json_kind(left) not in ("object", "array") and not _charge_values(1, local):
+        return False  # a scalar comparison is charged too (an enum scanned member by member)
     while work:
         first, second = work.pop()
         kind = _json_kind(first)
@@ -459,6 +461,8 @@ class _Keys:
     def key(self, value: object, depth: int = 0) -> object:
         kind = _json_kind(value)
         if kind in ("boolean", "number", "string", "null"):
+            if not _charge_values(1, self.local):  # every scalar keyed is charged (a large shared enum)
+                return None
             return (kind, value)
         if kind not in ("array", "object"):
             return (kind, id(value))

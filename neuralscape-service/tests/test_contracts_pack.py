@@ -2330,3 +2330,34 @@ def test_an_explicit_version_bump_is_still_accepted_after_the_call_budget_is_spe
 def test_check_compatibility_alone_is_unchanged_by_the_split() -> None:
     assert _pair({"maxLength": 5}, {"maxLength": 3}) == ["$: maxLength lowered"]
     assert _pair(_versioned("v1"), {**_versioned("v2"), "required": ["schema_version"]}) == []
+
+
+# ---- scalar comparisons spend the work budget too (enum scans shared by many properties)
+
+
+def _shared_enum_properties(count: int, members: list, *, with_const: bool) -> dict:
+    def prop(i: int) -> dict:
+        node = {"enum": members, "description": f"p{i}"}  # distinct schemas sharing one enum list
+        if with_const:
+            node["const"] = members[-1]
+        return node
+
+    return {"type": "object", "properties": {f"p{i}": prop(i) for i in range(count)}}
+
+
+@pytest.mark.parametrize("with_const", [True, False], ids=["const-and-enum", "enum-only"])
+def test_repeated_scalar_enum_scans_spend_the_budget(monkeypatch, with_const) -> None:
+    monkeypatch.setattr(pack, "_MAX_EQUALITY_STEPS", 50_000)
+    members = [f"value-{i}" for i in range(1000)]
+    old = _shared_enum_properties(200, members, with_const=with_const)
+    findings = _pair(old, copy.deepcopy(old))  # ~400,000 scalar comparisons
+    assert findings == [pack._BUDGET_MESSAGE], findings[:2]
+
+
+def test_a_small_enum_is_still_compared_within_budget() -> None:
+    members = [f"value-{i}" for i in range(10)]
+    old = _shared_enum_properties(5, members, with_const=True)
+    assert _pair(old, copy.deepcopy(old)) == []
+    narrowed = copy.deepcopy(old)
+    narrowed["properties"]["p0"]["enum"] = members[:-1]  # the const value is no longer allowed: nothing is
+    assert any("p0" in f for f in _pair(old, narrowed)), _pair(old, narrowed)
