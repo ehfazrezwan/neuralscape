@@ -535,12 +535,13 @@ def _freshness_degradations_for(
     return result
 
 
-def _reference_key(reference: ReferenceHandle) -> tuple[str, str, str, str]:
+def _reference_key(reference: ReferenceHandle) -> tuple[str, str, str, str, bool]:
     return (
         reference.kind,
         str(reference.id),
         str(reference.tenant_id),
         str(reference.resolver),
+        reference.cross_tenant,
     )
 
 

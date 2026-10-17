@@ -1422,3 +1422,21 @@ def test_budget_shortfall_is_explicit_and_requires_matching_safe_code() -> None:
                 omissions=["deadline_limit"],
             ),
         )
+
+
+@pytest.mark.parametrize("side", ["input_reference", "output_reference"])
+@pytest.mark.parametrize("bundle_marker", [False, True])
+def test_receipt_correspondence_includes_the_cross_tenant_marker_of_expansion_endpoints(
+    side: str, bundle_marker: bool
+) -> None:
+    item = _item()
+    item["expansion_handle"] = {**_reference("artifact", "expansion-1"), "cross_tenant": bundle_marker}
+    bundle = _validate(ContextBundle, _bundle(selected_items=[item]))
+    lineage = {"input_reference": item["expansion_handle"], "output_reference": item["reference"]}
+    assert receipt_matches_bundle(
+        _validate(ContextAssemblyReceipt, _receipt(expansion_lineage=[lineage])), bundle
+    )  # control: the same endpoints, marker included
+
+    flipped = {**lineage, side: {**lineage[side], "cross_tenant": not lineage[side].get("cross_tenant", False)}}
+    mismatched = _validate(ContextAssemblyReceipt, _receipt(expansion_lineage=[flipped]))
+    assert not receipt_matches_bundle(mismatched, bundle)  # an endpoint differing only in the marker does not match
