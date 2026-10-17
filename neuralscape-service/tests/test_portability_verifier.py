@@ -1845,7 +1845,9 @@ def _forced_zip64_bundle(path: Path) -> bytes:
     with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as archive:
         archive.writestr("manifest.json", json.dumps(_manifest(PAYLOAD)))
         for name, data in PAYLOAD.items():
-            with archive.open(zipfile.ZipInfo(name), "w", force_zip64=True) as member:
+            info = zipfile.ZipInfo(name)
+            info.compress_type = zipfile.ZIP_DEFLATED  # an explicit ZipInfo does not inherit the archive's method
+            with archive.open(info, "w", force_zip64=True) as member:
                 member.write(data)
     return path.read_bytes()
 
@@ -1915,7 +1917,9 @@ def _streamed_zip64_bundle(path: Path) -> bytes:
     with zipfile.ZipFile(sink, "w", zipfile.ZIP_DEFLATED) as archive:
         archive.writestr("manifest.json", json.dumps(_manifest(PAYLOAD)))
         for name, data in PAYLOAD.items():
-            with archive.open(zipfile.ZipInfo(name), "w", force_zip64=True) as member:
+            info = zipfile.ZipInfo(name)
+            info.compress_type = zipfile.ZIP_DEFLATED  # an explicit ZipInfo does not inherit the archive's method
+            with archive.open(info, "w", force_zip64=True) as member:
                 member.write(data)
     path.write_bytes(bytes(sink.data))
     return bytes(sink.data)
@@ -2344,7 +2348,9 @@ def _streamed_bundle_with_empty_member(path: Path, *, zip64: bool, method: int) 
     with zipfile.ZipFile(sink, "w", method) as archive:
         archive.writestr("manifest.json", json.dumps(_manifest(files)))
         for name, data in files.items():
-            with archive.open(zipfile.ZipInfo(name), "w", force_zip64=zip64) as member:
+            info = zipfile.ZipInfo(name)
+            info.compress_type = method  # an explicit ZipInfo does not inherit the archive's method
+            with archive.open(info, "w", force_zip64=zip64) as member:
                 member.write(data)
     path.write_bytes(bytes(sink.data))
 
@@ -2356,6 +2362,11 @@ def test_a_streamed_bundle_with_an_empty_member_verifies(tmp_path, zip64, method
 
     path = tmp_path / "b.zip"
     _streamed_bundle_with_empty_member(path, zip64=zip64, method=method)
+    with zipfile.ZipFile(path) as archive:
+        assert {info.compress_type for info in archive.infolist() if info.filename != "manifest.json"} == {method}
+        empty = archive.getinfo("sources/empty.txt")
+        assert empty.file_size == 0 and (empty.compress_size == 0) is (method == zipfile.ZIP_STORED)  # 2 bytes deflated
+        assert empty.flag_bits & 0x8  # streamed: a data descriptor follows
     assert verify_bundle(path).ok
 
 
@@ -2487,3 +2498,12 @@ def test_internal_file_attributes_other_than_the_text_flag_are_refused(tmp_path,
     assert report.ok is ok
     if not ok:
         assert pv.UNSAFE_MODE in _codes(report)
+
+
+def test_the_zip64_helpers_write_the_compression_they_claim(tmp_path) -> None:
+    forced, streamed = tmp_path / "f.zip", tmp_path / "s.zip"
+    _forced_zip64_bundle(forced)
+    _streamed_zip64_bundle(streamed)
+    for path in (forced, streamed):
+        with zipfile.ZipFile(path) as archive:
+            assert {info.compress_type for info in archive.infolist()} == {zipfile.ZIP_DEFLATED}
