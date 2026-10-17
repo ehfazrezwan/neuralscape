@@ -1999,3 +1999,53 @@ def test_a_possible_but_unproven_match_alone_is_reported() -> None:
     old = {"type": "object", "additionalProperties": False, "patternProperties": {"^[a-z]$": {"type": "string"}}}
     new = {**copy.deepcopy(old), "properties": {"a": {"type": "string"}}}  # the property accepts what the pattern did
     assert any("patternProperties" in f for f in _pair(old, new))  # but the match is not proven: unverified
+
+
+# ---- boolean schemas beside unevaluated keywords: compared, never raised on
+
+
+@pytest.mark.parametrize("keyword", ["unevaluatedItems", "unevaluatedProperties"])
+@pytest.mark.parametrize("boolean", [True, False])
+def test_a_boolean_schema_against_one_with_an_unevaluated_keyword_is_compared(keyword, boolean) -> None:
+    schema = {keyword: False}
+    for old, new in ((boolean, schema), (schema, boolean)):  # at the root
+        assert isinstance(_pair(old, new), list)
+    for old, new in (({"items": boolean}, {"items": schema}), ({"items": schema}, {"items": boolean})):  # nested
+        assert isinstance(_pair(old, new), list)
+    assert _pair({"items": True}, {"items": {keyword: False}}) != []  # true -> a restriction is reported
+
+
+# ---- an embedded resource carrying $ref resolves it against itself, not the outer definitions
+
+
+def _embedded_with_ref(inner_name: dict) -> dict:
+    return {
+        "$defs": {"Name": {"type": "string"}},
+        "type": "object",
+        "properties": {"inner": {"$id": "https://example.com/inner", "$defs": {"Name": inner_name}, "$ref": "#/$defs/Name"}},
+    }
+
+
+def test_an_embedded_resource_carrying_a_ref_is_not_resolved_against_the_outer_definitions() -> None:
+    findings = _pair(_embedded_with_ref({"type": "string"}), _embedded_with_ref({"type": "integer"}))  # {"inner": "text"} now invalid
+    assert any("embedded resource" in f for f in findings), findings
+
+
+def test_a_definition_that_is_an_embedded_resource_stops_a_reference_chain() -> None:
+    def schema(inner_name: dict) -> dict:
+        return {
+            "$defs": {"Name": {"type": "string"},
+                      "Res": {"$id": "https://example.com/res", "$defs": {"Name": inner_name}, "$ref": "#/$defs/Name"}},
+            "type": "object", "properties": {"x": {"$ref": "#/$defs/Res"}},
+        }
+
+    findings = _pair(schema({"type": "string"}), schema({"type": "integer"}))
+    assert any("embedded resource" in f for f in findings), findings
+
+
+def test_an_unchanged_embedded_resource_carrying_a_ref_compares_clean() -> None:
+    old = _embedded_with_ref({"type": "string"})
+    widened = copy.deepcopy(old)
+    widened["properties"]["other"] = {}
+    assert _pair(old, copy.deepcopy(old)) == []
+    assert _pair(old, widened) == []

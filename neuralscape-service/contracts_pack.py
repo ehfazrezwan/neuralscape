@@ -681,6 +681,8 @@ def _resolve(schema: object, defs: dict) -> tuple[object, list[dict]]:
             beside.append(extra)  # whatever the reference form: ``#`` and recursive ones included
         if not _plain_definition_reference(ref):
             break  # an escaped or deeper pointer is not followed here: it is reported as not modelled
+        if seen and "$id" in schema:
+            break  # a definition that is an embedded resource: its own reference resolves inside it
         schema = defs.get(ref.removeprefix("#/$defs/"), schema)
         seen += 1
     return schema, beside
@@ -833,6 +835,28 @@ def _unevaluated_node_same(old: object, new: object, old_defs: dict, new_defs: d
     return same
 
 
+def _embedded_resource(old: object, new: object, path: str, out: list[str]) -> bool:
+    """Whether either node is an embedded resource (an ``$id`` below the document root); if so, judge it here.
+
+    An embedded resource resolves its references (its own ``$ref`` included) against itself, which is not
+    modelled: only one left exactly as it was, and referring to nothing outside it, is shown compatible.
+    """
+
+    if not (isinstance(old, dict) and isinstance(new, dict) and ("$id" in old or "$id" in new)):
+        return False
+    run = _RUN.get()
+    roots = (run.roots[::-1] if run.reversed else run.roots) if run is not None and run.roots else (None, None)
+    if old is roots[0] and new is roots[1]:
+        return False  # the root resource: its references are the document's own
+    try:
+        unchanged = _json_equal(old, new) and _self_contained(old, [_INLINE_BUDGET]) is old
+    except _TooLarge:
+        unchanged = False
+    if not unchanged:
+        out.append(_unverified(path, "an embedded resource ($id) changed"))
+    return True
+
+
 def _compare(
     old: object,
     new: object,
@@ -847,7 +871,8 @@ def _compare(
         out.append(f"{path}: schema nesting exceeds the comparison depth limit; compatibility not verified")
         return
     if (
-        (_UNEVALUATED & _keys(old) or _UNEVALUATED & _keys(new))
+        isinstance(old, dict) and isinstance(new, dict)  # a boolean on either side is a change of shape, reported below
+        and (_UNEVALUATED & _keys(old) or _UNEVALUATED & _keys(new))
         and all(_same_value(old.get(k, _ABSENT), new.get(k, _ABSENT)) for k in _UNEVALUATED)  # else reported below
         and not _unevaluated_node_same(old, new, old_defs, new_defs)
     ):
@@ -855,6 +880,8 @@ def _compare(
         # every schema they reference) evaluates, which is not tracked: any change around it is not verified.
         out.append(_unverified(path, "a schema with unevaluatedProperties or unevaluatedItems changed"))
     base = len(active)  # references already being compared above this node
+    if _embedded_resource(old, new, path, out):
+        return  # before any reference is followed: its own $ref resolves inside it
     if isinstance(old, dict) and isinstance(new, dict) and "$ref" in old and "$ref" in new:
         # Constraints beside this reference are compared before any shortcut: a recursive reference
         # already being compared is assumed compatible, but only for its target, never for siblings.
@@ -895,19 +922,8 @@ def _compare(
         new, root_new_beside = _resolve(new_root, new_defs)
         if (root_old_beside or root_new_beside) and not _same(root_old_beside, root_new_beside, old_defs, new_defs):
             out.append(_unverified(path, "constraints beside a $ref changed"))
-    if isinstance(old, dict) and isinstance(new, dict) and ("$id" in old or "$id" in new):
-        run = _RUN.get()
-        roots = (run.roots[::-1] if run.reversed else run.roots) if run is not None and run.roots else (None, None)
-        if old is not roots[0] or new is not roots[1]:
-            # An embedded resource resolves its references against itself, which is not modelled: only one
-            # left exactly as it was (and referring to nothing outside it) is shown compatible.
-            try:
-                unchanged = _json_equal(old, new) and _self_contained(old, [_INLINE_BUDGET]) is old
-            except _TooLarge:
-                unchanged = False
-            if not unchanged:
-                out.append(_unverified(path, "an embedded resource ($id) changed"))
-            return
+    if _embedded_resource(old, new, path, out):
+        return  # a reference led to one
     if not isinstance(old, dict) or not isinstance(new, dict):
         if not _json_equal(old, new):
             out.append(f"{path}: schema changed shape")
