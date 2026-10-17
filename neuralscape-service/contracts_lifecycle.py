@@ -55,21 +55,35 @@ def _key_text(key: object) -> object:
 
 def _require_distinct_key_text(
     entries: tuple[tuple[object, object], ...],
+    captured_by_identity: dict[Any, Any],
+    budget: DiscoveryBudget,
 ) -> tuple[tuple[object, object], ...]:
     """The entries keyed by each key's exact text, refusing keys that spell one name.
 
     The text is copied once here, at capture, so later uses (materialization, conflict checks) neither
     copy nor hash the caller's key again, and a container keyed by text is as pure as one keyed by exact
-    strings.  A key that is neither text nor an exact native scalar is refused before it is hashed: hashing
-    a caller's object would run its code (an exact native key reaches validation, which refuses it).
+    strings.  One copy per key object (kept with its owner, so its id() is not recycled): containers
+    sharing a key share its text, whose hash is then computed once.  A key that is neither text nor an
+    exact native scalar is refused before it is hashed: hashing a caller's object would run its code (an
+    exact native key reaches validation, which refuses it).  An int's hash is not cached and costs its
+    size in every container holding it, so a large int key is charged by size before it is hashed.
     """
 
     seen: set[object] = set()
     keyed: list[tuple[object, object]] = []
     for key, item in entries:
-        if _derives_from(type(key), (str,)):
-            text: object = str.__str__(key)
+        if type(key) is str:
+            text: object = key
+        elif _derives_from(type(key), (str,)):
+            memo = captured_by_identity.get((_KEY_TEXT, id(key)))
+            if memo is not None and memo[0] is key:
+                text = memo[1]
+            else:
+                text = str.__str__(key)
+                captured_by_identity[(_KEY_TEXT, id(key))] = (key, text)
         elif _is_exact_native_kind(type(key)):
+            if type(key) is int:
+                budget.charge_edge(int.bit_length(key) >> 12)  # one edge per 4,096 bits hashed
             text = key  # its hash is native; validation refuses a non-text key with its own message
         else:
             raise ValueError("contract mapping keys must be text")
@@ -390,6 +404,7 @@ def _claims_another_class(kind: type, budget: DiscoveryBudget) -> bool:
 _HANDED_ENUMS = "handed-enums"  # memo key: enum members handed out while the current root materializes
 _DETACHED = "detached"  # memo key prefix: one scalar subclass leaf's exact copy, made once per call
 _LEAF_CLASS = "leaf-class"  # memo key prefix: one leaf class's verdict, decided once per call
+_KEY_TEXT = "key-text"  # memo key prefix: one str-subclass mapping key's exact text, copied once per call
 
 
 def _leaf_class_verdict(
@@ -529,7 +544,7 @@ def _capture_native_contract_graph(
                                 budget,
                             ),
                         )
-                        for key, item in _require_distinct_key_text(stored_entries)
+                        for key, item in _require_distinct_key_text(stored_entries, captured_by_identity, budget)
                     ),
                     extra_entries=tuple(
                         (
@@ -541,7 +556,7 @@ def _capture_native_contract_graph(
                                 budget,
                             ),
                         )
-                        for key, item in _require_distinct_key_text(extra_entries)
+                        for key, item in _require_distinct_key_text(extra_entries, captured_by_identity, budget)
                     ),
                     malformed_extra=malformed_extra,
                 )
@@ -561,7 +576,7 @@ def _capture_native_contract_graph(
                                 budget,
                             ),
                         )
-                        for key, item in _require_distinct_key_text(entries)
+                        for key, item in _require_distinct_key_text(entries, captured_by_identity, budget)
                     ),
                 )
             elif graph_kind is list:

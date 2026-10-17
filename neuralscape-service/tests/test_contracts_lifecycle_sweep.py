@@ -1797,3 +1797,72 @@ def test_a_mapping_key_object_is_refused_before_its_hash_runs():
     with pytest.raises(ValueError, match="keys must be text"):
         contracts_lifecycle.validate_stage_receipts(command, (applied,))
     assert calls == []
+
+
+def test_one_text_subclass_key_shared_by_many_containers_is_copied_once():
+    """Distinct containers keyed by one shared subclass key cost one copy of its text, not one per container."""
+
+    import tracemalloc
+
+    from tests.test_contracts_lifecycle import intent_with_requirements, requirement
+
+    class Text(str):
+        pass
+
+    key = Text("k" * 2**20)
+    command = intent_with_requirements(requirement(ProcessingStage.CANONICAL))
+    applied = receipt(ProcessingStage.CANONICAL, StageStatus.APPLIED)
+    EXTRA.__set__(applied, {"note": [{key: index} for index in range(64)]})
+    tracemalloc.start()
+    try:
+        with pytest.raises(ValueError):
+            contracts_lifecycle.validate_stage_receipts(command, (applied,))
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert peak < 8 * 2**20, peak  # one 1 MiB text, not 64 (64 MiB)
+
+
+def test_a_shared_text_subclass_key_still_collides_with_its_own_spelling():
+    from tests.test_contracts_lifecycle import intent_with_requirements, requirement
+
+    class Text(str):
+        def __hash__(self):  # keeps the dict from merging it with its spelling; capture never calls it
+            return 7
+
+    key = Text("note")
+    command = intent_with_requirements(requirement(ProcessingStage.CANONICAL))
+    applied = receipt(ProcessingStage.CANONICAL, StageStatus.APPLIED)
+    EXTRA.__set__(applied, {"first": {key: 1}, "second": {key: 1, "note": 2}})
+    with pytest.raises(ValueError, match="colliding keys"):
+        contracts_lifecycle.validate_stage_receipts(command, (applied,))
+
+
+def test_a_large_int_key_is_charged_by_size_in_every_container_holding_it():
+    """An int's hash is not cached and costs its size: 4,000 containers keyed by one megabit int are charged
+    for hashing it each time (and exceed the envelope) instead of paying a constant per container."""
+
+    from tests.test_contracts_lifecycle import intent_with_requirements, requirement
+
+    command = intent_with_requirements(requirement(ProcessingStage.CANONICAL))
+    applied = receipt(ProcessingStage.CANONICAL, StageStatus.APPLIED)
+    key = 1 << 2**20
+    EXTRA.__set__(applied, {"note": [{key: index} for index in range(4_000)]})
+    with pytest.raises(ValueError, match=BUDGET):
+        contracts_lifecycle.validate_stage_receipts(command, (applied,))
+
+
+@pytest.mark.parametrize("key", [1 << 4_000, 1, True, None, 1.5, b"k"], ids=["4000-bit-int", "int", "bool", "none", "float", "bytes"])
+def test_a_native_key_that_is_not_text_still_reaches_validation(key):
+    """A native non-text key costs no more than its container (the int is below one charged unit), and is
+    refused by validation with its own message, not by the budget."""
+
+    from pydantic import ValidationError
+
+    from tests.test_contracts_lifecycle import intent_with_requirements, requirement
+
+    command = intent_with_requirements(requirement(ProcessingStage.CANONICAL))
+    applied = receipt(ProcessingStage.CANONICAL, StageStatus.APPLIED)
+    EXTRA.__set__(applied, {"note": [{key: index} for index in range(4_000)]})
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        contracts_lifecycle.validate_stage_receipts(command, (applied,))
