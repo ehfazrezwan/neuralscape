@@ -713,7 +713,14 @@ def _reject_unknown_schema_semantics(
     schema: bool | Mapping[str, Any],
     validator_class: Any,
     location: str = "$",
+    seen: list[int] | None = None,
 ) -> None:
+    # Checking a schema against the dialect's meta-schema applies dozens of keywords to every subschema,
+    # and jsonschema runs that check on its own (unmetered) validator, so the subschemas are counted here.
+    seen = [0] if seen is None else seen
+    seen[0] += 1
+    if seen[0] > MAX_OUTPUT_SCHEMA_SUBSCHEMAS:
+        raise ValueError(SCHEMA_EXECUTION_MESSAGE)
     if is_subclass(type(schema), bool):
         return
     declared_dialect = schema.get("$schema")
@@ -753,12 +760,14 @@ def _reject_unknown_schema_semantics(
                         nested,
                         validator_class,
                         f"{location}/{keyword}/{name}",
+                        seen,
                     )
         elif keyword in _SCHEMA_SINGLE_KEYWORDS and is_subclass(type(value), (bool, Mapping)):
             _reject_unknown_schema_semantics(
                 value,
                 validator_class,
                 f"{location}/{keyword}",
+                seen,
             )
         elif keyword in _SCHEMA_ARRAY_KEYWORDS and is_subclass(type(value), list):
             for index, nested in enumerate(value):
@@ -767,6 +776,7 @@ def _reject_unknown_schema_semantics(
                         nested,
                         validator_class,
                         f"{location}/{keyword}/{index}",
+                        seen,
                     )
 
 
@@ -796,6 +806,8 @@ SCHEMA_EXECUTION_MESSAGE = "output schema execution exceeds its budget"
 MAX_SCHEMA_EXECUTION_UNITS = 8 * STANDARD_MAX_EDGES
 # One keyword application weighs as much as this many entries: about 130,000 applications per call.
 _KEYWORD_UNITS = 8
+# The most subschemas an output schema may have (checking it against the meta-schema costs per subschema).
+MAX_OUTPUT_SCHEMA_SUBSCHEMAS = 2_048
 
 
 class _SchemaExecutionMeter:
@@ -868,6 +880,31 @@ def _metered_validator_class(validator_class: Any, meter: _SchemaExecutionMeter)
     return extend(validator_class, keywords)
 
 
+def _executable_schema(schema: Any, root: bool = True) -> Any:
+    """A copy of the schema without nested ``$schema`` keys, for execution.
+
+    jsonschema runs a subschema that declares ``$schema`` on the validator registered for that dialect,
+    not on the metered one, so a nested declaration would escape the execution budget.  Nested
+    declarations must equal the root dialect (checked earlier), so removing them changes nothing.  Only
+    schema positions are rewritten; data positions (enum, const, default, examples) are kept as they are.
+    """
+
+    if not is_subclass(type(schema), dict):
+        return schema
+    copied: dict[str, Any] = {}
+    for keyword, value in schema.items():
+        if keyword == "$schema" and not root:
+            continue
+        if keyword in _SCHEMA_CONTAINER_KEYWORDS and is_subclass(type(value), dict):
+            value = {name: _executable_schema(nested, False) for name, nested in value.items()}
+        elif keyword in _SCHEMA_SINGLE_KEYWORDS:
+            value = _executable_schema(value, False)
+        elif keyword in _SCHEMA_ARRAY_KEYWORDS and is_subclass(type(value), list):
+            value = [_executable_schema(nested, False) for nested in value]
+        copied[keyword] = value
+    return copied
+
+
 def _build_output_validator(
     schema: Mapping[str, JsonValue], meter: _SchemaExecutionMeter | None = None
 ) -> Any:
@@ -878,11 +915,12 @@ def _build_output_validator(
     _validate_json_value(dict(schema))
     _reject_unknown_schema_semantics(schema, validator_class)
     try:
-        validator_class.check_schema(schema)
+        validator_class.check_schema(schema)  # bounded by the subschema limit checked above
     except Exception as exc:
-        raise ValueError(f"invalid output schema: {exc}") from exc
+        message = getattr(exc, "message", type(exc).__name__)
+        raise ValueError(f"invalid output schema: {message}") from exc  # never the whole schema
     metered_class = _metered_validator_class(validator_class, meter or _SchemaExecutionMeter())
-    return metered_class(schema, format_checker=format_checker)
+    return metered_class(_executable_schema(schema), format_checker=format_checker)
 
 
 class GenerationRequest(VersionedContract):

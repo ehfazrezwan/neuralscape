@@ -2201,3 +2201,38 @@ def test_a_large_enum_applied_to_many_items_is_refused_in_bounded_time():
     with pytest.raises(ValueError, match="schema execution"):
         validate_generation_result(request, result)
     assert time.monotonic() - started < 2
+
+
+def test_checking_a_very_large_schema_against_the_meta_schema_is_bounded():
+    """The meta-schema applies dozens of keywords to every schema node: a schema near the input allowance
+    took tens of seconds to check, before any output was looked at."""
+
+    import time
+
+    started = time.monotonic()
+    with pytest.raises((ValidationError, ValueError), match="schema execution"):
+        generation_request(
+            schema=output_schema(properties={"v": {"allOf": [{"type": "number"}] * 20_000}}, required=["v"])
+        )
+    assert time.monotonic() - started < 3
+
+
+def test_a_nested_dialect_declaration_does_not_escape_the_execution_budget():
+    """A subschema declaring $schema ran on jsonschema's own validator, outside the meter."""
+
+    import time
+
+    nested = {"$schema": contracts_inference.JSON_SCHEMA_DIALECT, "type": "number"}
+    request, result = _generation_with_output(
+        {"v": list(range(3_000))}, v={"type": "array", "items": {"allOf": [nested] * 300}}
+    )
+    started = time.monotonic()
+    with pytest.raises(ValueError, match="schema execution"):
+        validate_generation_result(request, result)
+    assert time.monotonic() - started < 3
+
+
+def test_data_that_looks_like_a_dialect_declaration_is_kept():
+    value = {"$schema": "not-a-dialect", "x": 1}
+    request, result = _generation_with_output({"v": value}, v={"enum": [value]})
+    assert validate_generation_result(request, result).compliant
