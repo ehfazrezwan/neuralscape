@@ -821,9 +821,26 @@ def _compare(
         out.append(_unverified(path, "a reference that is not a plain #/$defs one"))
         return
     for key in sorted((set(old) | set(new)) - _MODELED - _ANNOTATIONS):
-        if not _same(old.get(key, _ABSENT), new.get(key, _ABSENT), old_defs, new_defs):
+        # Compared with its keyword, so the equality knows what the value is: in a map of names to schemas
+        # (``patternProperties``, ``dependentSchemas``) a name such as ``const`` is a name, and the schema
+        # it maps to is expanded like any other.
+        before, after = old.get(key, _ABSENT), new.get(key, _ABSENT)
+        if key in _SCHEMA_MAPS or key in _LITERAL_KEYWORDS:
+            before = {key: before} if before is not _ABSENT else before
+            after = {key: after} if after is not _ABSENT else after
+        if not _same(before, after, old_defs, new_defs):
             out.append(_unverified(path, f"{key} changed"))
     _compare_checked(old, new, old_defs, new_defs, path, out, depth, active, base)
+
+
+def _charge_comparison() -> None:
+    """Spend one step of the running comparison's budget (``_MAX_COMPARISONS``)."""
+
+    run = _RUN.get()
+    if run is not None:
+        run.steps += 1
+        if run.steps > _MAX_COMPARISONS:
+            raise _BudgetExhausted
 
 
 def _compare_checked(
@@ -963,6 +980,9 @@ def _compare_keywords(
             for index, branch in enumerate(old_alternatives):
                 matched = False
                 for candidate in new_alternatives:
+                    # Every trial is charged before the comparison, whose result may be remembered: n old and
+                    # n new alternatives cost n * n trials even when each pair was already compared.
+                    _charge_comparison()
                     trial: list[str] = []
                     _compare(branch, candidate, old_defs, new_defs, f"{path}|{index}", trial, depth + 1, active)
                     if not trial:

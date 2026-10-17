@@ -1818,3 +1818,55 @@ def test_a_pattern_is_never_executed(monkeypatch) -> None:
 )
 def test_which_names_a_pattern_may_match(pattern, name, may) -> None:
     assert pack._pattern_may_match(pattern, name) is may
+
+
+# ---- a schema map compared by equality keeps its keyword: its names are never taken for keywords
+
+
+def _mapped(keyword: str, name_type: str) -> dict:
+    return {"$defs": {"Name": {"type": name_type}}, "type": "object", keyword: {"const": {"$ref": "#/$defs/Name"}}}
+
+
+@pytest.mark.parametrize("keyword", ["patternProperties", "dependentSchemas"])
+def test_a_changed_definition_behind_a_schema_map_entry_named_like_a_keyword_is_reported(keyword) -> None:
+    findings = _pair(_mapped(keyword, "string"), _mapped(keyword, "integer"))  # {"constant": "text"} is now rejected
+    assert any(f"{keyword} changed" in f for f in findings), findings
+
+
+@pytest.mark.parametrize("keyword", ["patternProperties", "dependentSchemas"])
+def test_an_unchanged_schema_map_entry_named_like_a_keyword_compares_clean(keyword) -> None:
+    widened = _mapped(keyword, "string")
+    widened["properties"] = {"other": {}}
+    assert _pair(_mapped(keyword, "string"), _mapped(keyword, "string")) == []
+    assert _pair(_mapped(keyword, "string"), widened) == []
+
+
+# ---- every candidate trial of a union is charged, cached or not
+
+
+def test_cached_candidate_trials_still_spend_the_budget(monkeypatch) -> None:
+    monkeypatch.setattr(pack, "_MAX_COMPARISONS", 50)
+    old_branch, new_branch = {"const": "a"}, {"const": "b"}
+    findings = _pair({"anyOf": [old_branch] * 20}, {"anyOf": [new_branch] * 20})  # 400 trials, all but one cached
+    assert pack._BUDGET_MESSAGE in findings, findings
+
+
+def test_a_wide_union_of_shared_alternatives_is_bounded(monkeypatch) -> None:
+    calls = {"count": 0}
+    real = pack._compare
+
+    def counting(*args, **kwargs):
+        calls["count"] += 1
+        if calls["count"] > 2 * pack._MAX_COMPARISONS:
+            pytest.fail("candidate trials are not charged: the union costs n**2")
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(pack, "_compare", counting)
+    old_branch, new_branch = {"const": "a"}, {"const": "b"}
+    findings = _pair({"anyOf": [old_branch] * 2000}, {"anyOf": [new_branch] * 2000})  # 4,000,000 trials uncharged
+    assert pack._BUDGET_MESSAGE in findings, findings[:2]
+
+
+def test_a_union_whose_alternatives_still_match_is_unchanged_by_the_charge() -> None:
+    branch = {"type": "string"}
+    assert _pair({"anyOf": [branch] * 20}, {"anyOf": [dict(branch) for _ in range(20)]}) == []
