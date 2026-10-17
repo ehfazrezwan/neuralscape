@@ -4612,10 +4612,11 @@ def test_a_statement_with_an_unjudged_term_is_reported_and_one_at_its_default_is
     from contracts_policy import PolicyStatement
     from contracts_policy_reference import _unjudged_terms
 
-    Conditioned = create_model(
-        "Conditioned", __base__=PolicyStatement, condition=(Optional[dict], None)
+    # a term no evaluator judges (named so it cannot collide with a real contract field)
+    Qualified = create_model(
+        "Qualified", __base__=PolicyStatement, unjudged_future_term=(Optional[dict], None)
     )
     base = statement("s", "allow", "read", reference("memory-1")).model_dump()
-    assert _unjudged_terms(Conditioned(**base, condition={"kind": "row_owner_is_principal"})) == ("condition",)
-    assert _unjudged_terms(Conditioned(**base)) == ()
+    assert _unjudged_terms(Qualified(**base, unjudged_future_term={"kind": "x"})) == ("unjudged_future_term",)
+    assert _unjudged_terms(Qualified(**base)) == ()
     assert _unjudged_terms(PolicyStatement(**base)) == ()
