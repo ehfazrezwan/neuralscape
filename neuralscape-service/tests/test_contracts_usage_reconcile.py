@@ -4160,3 +4160,41 @@ def test_a_public_view_is_not_read_past_a_bounded_number_of_entries(kind: str) -
     with pytest.raises(ValueError):
         usage_reconcile_contracts._native_snapshot({"k": value})
     assert produced["n"] < limit, "the view was read to its end"
+
+
+# ---- public views share one envelope: views that each fit the limit but together exceed it are refused
+
+def test_dict_views_that_each_fit_but_together_exceed_the_envelope_are_refused() -> None:
+    from contracts_limits import STANDARD
+
+    each = STANDARD.max_edges // 2 + 1  # 65,537: under the limit alone, over it with a sibling
+    produced = {"n": 0}
+
+    class EmptyBackedView(dict):
+        def items(self):
+            for index in range(each):
+                produced["n"] += 1
+                yield (f"k{index}", index)
+
+    with pytest.raises(ValueError, match=run_discovery_message()):
+        usage_reconcile_contracts._native_snapshot({"first": EmptyBackedView(), "second": EmptyBackedView()})
+    assert produced["n"] < 2 * each, "both views were read to their ends"
+
+
+def test_one_view_inside_the_envelope_is_still_read_in_full() -> None:
+    produced = {"n": 0}
+
+    class EmptyBackedView(dict):
+        def items(self):
+            for index in range(1000):
+                produced["n"] += 1
+                yield (f"k{index}", index)
+
+    usage_reconcile_contracts._native_snapshot({"only": EmptyBackedView()})
+    assert produced["n"] == 1000
+
+
+def run_discovery_message() -> str:
+    from contracts_limits import DISCOVERY_BUDGET_MESSAGE
+
+    return DISCOVERY_BUDGET_MESSAGE

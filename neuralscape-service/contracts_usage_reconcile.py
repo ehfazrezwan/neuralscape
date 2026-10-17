@@ -91,6 +91,9 @@ class _ValidatedPublicMappingEntries:
 
 
 _BUDGET_KEY = ("discovery-budget",)
+# The envelope of the snapshot that is validating a public mapping view right now (per thread).  It is
+# passed this way because the validator's signature is part of what the existing tests replace.
+_view_state = threading.local()
 
 
 def _session_budget(memo: dict) -> DiscoveryBudget:
@@ -128,8 +131,11 @@ def _validate_public_mapping_entries(
             break
         except Exception as exc:
             return _FailedNativeDictTraversal(exc)
-        if len(retained_entries) >= STANDARD.max_edges:
-            raise ValueError(DISCOVERY_BUDGET_MESSAGE)  # a view is read only as far as the envelope allows
+        shared = getattr(_view_state, "budget", None)
+        if shared is not None:
+            shared.charge_edge()  # every pair read is charged to the snapshot's one envelope
+        elif len(retained_entries) >= STANDARD.max_edges:
+            raise ValueError(DISCOVERY_BUDGET_MESSAGE)  # no envelope given: this one view is still bounded
         try:
             key, public_value = pair
         except Exception as exc:
@@ -693,7 +699,12 @@ def _snapshot_uncached(
                     public_items = value.items()
                 except Exception as exc:
                     return _FailedNativeDictTraversal(exc)
-                validated_entries = _validate_public_mapping_entries(public_items)
+                outer_budget = getattr(_view_state, "budget", None)
+                _view_state.budget = budget
+                try:
+                    validated_entries = _validate_public_mapping_entries(public_items)
+                finally:
+                    _view_state.budget = outer_budget
                 if isinstance(validated_entries, _FailedNativeDictTraversal):
                     return validated_entries
                 # Keep the iterator, retained keys, and all entry components
