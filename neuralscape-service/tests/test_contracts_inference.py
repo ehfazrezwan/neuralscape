@@ -2617,3 +2617,30 @@ def test_const_comparison_work_is_per_distinct_value_not_per_application(monkeyp
     )
     assert validate_generation_result(request, result).compliant
     assert walks[0] < 300_000, walks[0]
+
+
+def test_the_enum_check_visits_a_shared_container_once_not_once_per_path(monkeypatch):
+    """20 tuple layers each holding the previous twice are 2**20 paths to one leaf; the check keeps what it saw."""
+
+    import contracts_common
+
+    checked = [0]
+    original = contracts_common.is_canonical_enum_member
+
+    def counting(value):
+        checked[0] += 1
+        return original(value)
+
+    monkeypatch.setattr(contracts_common, "is_canonical_enum_member", counting)
+    from contracts_inference import DecisionOutcome
+
+    layer: object = DecisionOutcome.SELECTED
+    for _ in range(20):
+        layer = (layer, layer)
+    contracts_common.require_canonical_enum_members(layer)
+    assert checked[0] < 100, checked[0]  # per path it was 1,048,576
+    bad: object = _spoof(DecisionOutcome.SELECTED)
+    for _ in range(20):
+        bad = (bad, bad)
+    with pytest.raises(ValueError, match="declared member"):
+        contracts_common.require_canonical_enum_members(bad)

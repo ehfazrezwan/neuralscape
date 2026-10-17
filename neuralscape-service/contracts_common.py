@@ -64,23 +64,35 @@ def require_canonical_enum_members(value: object, *, _depth: int = 0) -> None:
     """Raise ``ValueError`` if ``value`` is, or natively contains, an enum instance that is no member.
 
     Looks through exact tuples, lists, sets, frozensets and dicts (what validation produces); nested
-    models validate themselves.
+    models validate themselves.  A container reached by several paths is checked once (the check keeps
+    what it has seen, alive, for the call), so a graph that shares its layers costs its objects, not its
+    paths.
     """
 
+    seen: dict[int, object] = {}
+    _scan_enum_members(value, _depth, seen)
+
+
+def _scan_enum_members(value: object, depth: int, seen: dict[int, object]) -> None:
     if any(base is enum.Enum for base in _TYPE_MRO.__get__(type(value))):
         if not is_canonical_enum_member(value):
             raise ValueError("an enum value must be a declared member of its enum")
         return
-    if _depth > 32:
-        raise ValueError("contract value nesting exceeds the enum check depth")
     kind = type(value)
+    if not (kind is dict or kind is tuple or kind is list or kind is set or kind is frozenset):  # identity
+        return
+    if depth > 32:
+        raise ValueError("contract value nesting exceeds the enum check depth")
+    if id(value) in seen:
+        return
+    seen[id(value)] = value  # kept alive: its id stays its own
     if kind is dict:
         for key, item in dict.items(value):  # type: ignore[arg-type]
-            require_canonical_enum_members(key, _depth=_depth + 1)
-            require_canonical_enum_members(item, _depth=_depth + 1)
-    elif kind is tuple or kind is list or kind is set or kind is frozenset:  # identity, never ==
+            _scan_enum_members(key, depth + 1, seen)
+            _scan_enum_members(item, depth + 1, seen)
+    else:
         for item in value:  # type: ignore[attr-defined]
-            require_canonical_enum_members(item, _depth=_depth + 1)
+            _scan_enum_members(item, depth + 1, seen)
 
 
 def _annotation_holds_enum(annotation: object, _depth: int = 0) -> bool:
