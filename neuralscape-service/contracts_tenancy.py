@@ -1,0 +1,624 @@
+"""Candidate tenant lifecycle contracts with topology-neutral validation.
+
+These value types describe control-plane intent and observations.  They do not
+allocate resources, grant authority, or select a shared-plane or cell topology.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Callable, Iterable, Iterator, Mapping
+from types import MappingProxyType
+from typing import Literal, TypeVar
+
+from pydantic import BaseModel, TypeAdapter, model_validator
+
+from contracts_common import OpaqueId, SafeCounter, VersionedContract
+from contracts_limits import DISCOVERY_BUDGET_MESSAGE, STANDARD, DiscoveryBudget
+
+
+TenantOperationKind = Literal[
+    "provision", "suspend", "resume", "export", "restore", "upgrade", "delete"
+]
+"""Lifecycle operations whose policy and execution live outside this module."""
+
+TenantDesiredState = Literal["active", "suspended", "deleted", "unchanged"]
+"""The lifecycle result requested by an operation."""
+
+TenantObservedState = Literal[
+    "pending", "running", "succeeded", "failed", "cancelled", "unknown"
+]
+"""Observed progress, kept distinct from the requested lifecycle result."""
+
+
+_DESIRED_STATE_BY_OPERATION: dict[TenantOperationKind, TenantDesiredState] = {
+    "provision": "active",
+    "suspend": "suspended",
+    "resume": "active",
+    "export": "unchanged",
+    "restore": "active",
+    "upgrade": "active",
+    "delete": "deleted",
+}
+
+T = TypeVar("T")
+
+_OPAQUE_ID_ADAPTER = TypeAdapter(OpaqueId)
+_SAFE_COUNTER_ADAPTER = TypeAdapter(SafeCounter)
+_PYDANTIC_DICT_DESCRIPTOR = BaseModel.__dict__["__dict__"]
+_PYDANTIC_EXTRA_DESCRIPTOR = BaseModel.__dict__["__pydantic_extra__"]
+
+
+_TYPE_MRO = type.__dict__["__mro__"]
+
+
+def _inherits(candidate: type, base: type) -> bool:
+    """Whether ``base`` is in the class's own MRO, ignoring ABC registration and metaclass hooks."""
+
+    return any(entry is base for entry in _TYPE_MRO.__get__(candidate))
+
+
+def _is_real_mapping(value: object) -> bool:
+    """A mapping subclass, or the one read-only view that only registers; never a registered-only class."""
+
+    candidate = type(value)
+    return (
+        candidate is MappingProxyType
+        or _inherits(candidate, dict)
+        or _inherits(candidate, Mapping)
+    )
+
+
+def unpack_pairs(
+    entries: Iterable[object], on_pair: Callable[[object], None] | None = None
+) -> tuple[tuple[object, object], ...]:
+    """Unpack each caller-owned ``(key, value)`` pair exactly once into a plain tuple.
+
+    A pair object is arbitrary caller code: it may answer differently each time it is
+    unpacked.  Every consumer (name checks, overlap checks, field construction) must use
+    the returned tuples and never the caller's pair objects again.
+
+    ``on_pair`` is called with each value right after its pair is unpacked and before the
+    iterator is advanced, so a caller can capture a value the moment the view exposes it
+    (advancing a caller-owned iterator is arbitrary code that may repair an exposed child).
+    """
+
+    unpacked: list[tuple[object, object]] = []
+    for entry in entries:
+        key, value = entry  # type: ignore[misc]
+        if on_pair is not None:
+            on_pair(value)
+        unpacked.append((key, value))
+    return tuple(unpacked)
+
+
+def _plain_key(key: object) -> object:
+    """A text-subclass key as plain text, read without running its own hooks; other keys unchanged."""
+
+    if type(key) is str or not _inherits(type(key), str):
+        return key
+    return str.__str__(key)  # type: ignore[arg-type]
+
+
+def _refuse_duplicate_texts(*entry_groups: tuple[tuple[object, object], ...]) -> None:
+    """Refuse two stored field names that read as one text (ambiguous input).
+
+    The text is read with the built-in accessor, so a text subclass's own hooks do not run here.
+    Each group is checked on its own.  (Native extras are refused outright by the caller, so a text
+    shared between model storage and extras never reaches an accepting path.)
+    """
+
+    for entries in entry_groups:
+        for name, _value in entries:
+            if not _inherits(type(name), str):
+                raise ValueError("contract input field names must be text")
+        texts = [_plain_key(name) for name, _value in entries]
+        if len(set(texts)) != len(texts):
+            raise ValueError("contract input field names must be unique text")
+
+
+def _model_extra_storage(value: BaseModel) -> object:
+    """Read Pydantic-owned extra storage without model instance dispatch."""
+
+    try:
+        return _PYDANTIC_EXTRA_DESCRIPTOR.__get__(value, type(value))
+    except AttributeError:
+        return None
+
+
+class ResourceManifestReference(VersionedContract):
+    """Tenant-bound reference to a resource manifest for one placement generation.
+
+    A reference is neither proof that the manifest exists nor permission to read
+    it.  The explicit tenant identity prevents a reference from being silently
+    re-used in another tenant's placement.
+    """
+
+    tenant_id: OpaqueId
+    manifest_id: OpaqueId
+    manifest_revision: SafeCounter
+    placement_generation: SafeCounter
+
+
+def _validate_manifest_references(
+    *,
+    tenant_id: str,
+    generation: int,
+    references: tuple[ResourceManifestReference, ...],
+) -> None:
+    seen: set[tuple[str, int]] = set()
+    for reference in references:
+        if reference.tenant_id != tenant_id:
+            raise ValueError("resource manifest tenant_id must match owning tenant_id")
+        if reference.placement_generation != generation:
+            raise ValueError(
+                "resource manifest placement_generation must match owning generation"
+            )
+        key = (reference.manifest_id, reference.manifest_revision)
+        if key in seen:
+            raise ValueError("resource manifest references must be unique")
+        seen.add(key)
+
+
+class TenantPlacement(VersionedContract):
+    """A topology-neutral placement generation and its resource manifests."""
+
+    tenant_id: OpaqueId
+    generation: SafeCounter
+    resource_manifests: tuple[ResourceManifestReference, ...]
+
+    @model_validator(mode="after")
+    def validate_manifest_identity(self) -> TenantPlacement:
+        _validate_manifest_references(
+            tenant_id=self.tenant_id,
+            generation=self.generation,
+            references=self.resource_manifests,
+        )
+        return self
+
+
+class TenantOperationState(VersionedContract):
+    """Desired and observed state for one idempotently identified operation."""
+
+    tenant_id: OpaqueId
+    operation_id: OpaqueId
+    operation: TenantOperationKind
+    desired_state: TenantDesiredState
+    observed_state: TenantObservedState
+    placement_generation: SafeCounter
+    resource_manifests: tuple[ResourceManifestReference, ...] = ()
+
+    @model_validator(mode="after")
+    def validate_operation_identity(self) -> TenantOperationState:
+        expected = _DESIRED_STATE_BY_OPERATION[self.operation]
+        if self.desired_state != expected:
+            raise ValueError(f"{self.operation} requires desired_state={expected}")
+        _validate_manifest_references(
+            tenant_id=self.tenant_id,
+            generation=self.placement_generation,
+            references=self.resource_manifests,
+        )
+        return self
+
+
+_ALLOWED_OBSERVED_TRANSITIONS: dict[
+    TenantObservedState, frozenset[TenantObservedState]
+] = {
+    "unknown": frozenset({"pending", "running", "succeeded", "failed", "cancelled"}),
+    "pending": frozenset({"running", "failed", "cancelled"}),
+    "running": frozenset({"succeeded", "failed", "cancelled"}),
+    "succeeded": frozenset(),
+    "failed": frozenset(),
+    "cancelled": frozenset(),
+}
+
+
+def _closed_graph_snapshot_session() -> tuple[
+    Callable[..., None],
+    Callable[..., object],
+]:
+    """Return native capture and public rebuild phases sharing one inventory.
+
+    Authority follows each supported container's public view.  Stored models
+    and exact built-in containers are fenced when the call begins and replayed
+    from that capture.  The public view of a container subclass is observed
+    once per occurrence in the graph, not once per call, so a view that
+    changes between two occurrences is rejected.  A view is read in full when
+    it is first observed, and the native backing of every child it exposes is
+    captured before the first of them is rebuilt, so a callback run while an
+    earlier child is rebuilt cannot change a later sibling.  Entry-time capture
+    of children that no view has yet exposed is not promised.  Hidden native
+    backing is never substituted for a public view.
+
+    Two discovery envelopes cover a call, each shared by every root.  Native
+    capture of the entry state (a previous and a current value together) charges
+    the first: unique nodes, captured edges (before copying them) and depth,
+    iteratively and without callbacks.  Everything observed afterwards while
+    rebuilding (public-view entries, and nodes a public view exposes for the
+    first time) charges the second.  Keeping them apart means one root
+    exhausting the capture envelope cannot replace the diagnostics of another
+    root that was captured successfully: the previous value's own validation
+    error is still reported before a current value's budget error.  The call's
+    total bound is the sum of the two envelopes.  Exceeding either raises the
+    stable budget error before any public view of the failing graph is read in
+    that phase.
+
+    Rebuilding copies a subtree built only from native storage once per object
+    identity, so shared descendants cost work proportional to the distinct
+    objects, not to the number of paths.  A subtree that observed a public view
+    is never reused: every occurrence observes the view again and is charged.
+    """
+
+    capture_budget = DiscoveryBudget(STANDARD)
+    view_budget = DiscoveryBudget(STANDARD)
+    budget = capture_budget  # envelope charged by the phase currently running
+    frozen_models: dict[int, tuple[object, bool, object]] = {}
+    frozen_containers: dict[int, object] = {}
+    native_children: dict[int, tuple[object, ...]] = {}
+
+    def is_graph_node(item: object) -> bool:
+        item_type = type(item)
+        return (
+            _inherits(item_type, BaseModel)
+            or _inherits(item_type, dict)
+            or _inherits(item_type, list)
+            or _inherits(item_type, tuple)
+        )
+
+    def freeze_native_graph(item: object, depth: int = 0) -> None:
+        """Discover model state and exact-container edges without callbacks."""
+
+        stack: list[tuple[object, int]] = [(item, depth)]
+        while stack:
+            node, node_depth = stack.pop()
+            if not is_graph_node(node):
+                continue
+            identity = id(node)
+            expand = budget.visit(node, node_depth)
+            if not expand:
+                continue
+            if identity in native_children:
+                # A shallower authoritative path re-expands the children so
+                # their depth is accounted from the minimum depth; the edges
+                # are charged again and nothing is captured twice.
+                children = native_children[identity]
+                budget.charge_edge(len(children))
+            else:
+                children = capture_native_node(node, identity)
+                native_children[identity] = children
+            for child in reversed(children):
+                stack.append((child, node_depth + 1))
+
+    def capture_native_node(node: object, identity: int) -> tuple[object, ...]:
+        node_type = type(node)
+        if _inherits(node_type, BaseModel):
+            stored = _PYDANTIC_DICT_DESCRIPTOR.__get__(node, BaseModel)
+            extras = _model_extra_storage(node)
+            extras_are_native = extras is not None and _inherits(
+                type(extras), dict
+            )
+            edge_count = dict.__len__(stored)
+            if extras_are_native:
+                edge_count += dict.__len__(extras)
+            budget.charge_edge(edge_count)
+            stored_entries = tuple(dict.items(stored))
+            frozen_extras: object = (
+                tuple(dict.items(extras)) if extras_are_native else extras
+            )
+            # Names are checked where the captured model is used (rebuild_node), not here: discovery
+            # also visits models that a container's public view hides, and those are never used.
+            frozen_models[identity] = (
+                stored_entries,
+                extras_are_native,
+                frozen_extras,
+            )
+            return tuple(value for _name, value in stored_entries)
+
+        if _inherits(node_type, dict):
+            budget.charge_edge(dict.__len__(node))
+            entries = tuple(dict.items(node))
+            if node_type is dict:
+                frozen_containers[identity] = entries
+            return tuple(value for _key, value in entries)
+
+        if _inherits(node_type, list):
+            budget.charge_edge(list.__len__(node))
+            items = tuple(list.__iter__(node))
+        else:
+            budget.charge_edge(tuple.__len__(node))
+            items = tuple(tuple.__iter__(node))
+        if node_type is list or node_type is tuple:
+            frozen_containers[identity] = items
+        return items
+
+    def observed(read: Callable[[], Iterable[T]]) -> Iterator[T]:
+        """Observe a public view: one charge for the observation itself (so an empty
+        view is not free), charged before the view is read, then one per entry."""
+
+        budget.charge_edge()
+        for entry in read():
+            budget.charge_edge()
+            yield entry
+
+    active: set[int] = set()
+    memo: dict[int, tuple[object, object, int]] = {}
+    phase_depth = 0
+
+    def capture_exposed(children: Iterable[object], depth: int) -> None:
+        """Freeze the native backing of every child a public view exposed, before any is rebuilt.
+
+        The view was read once; a callback that runs while an earlier child is rebuilt can then no
+        longer change a later sibling's captured state.  The children stay referenced by the caller's
+        tuple for the whole rebuild.
+        """
+
+        for exposed in children:
+            if is_graph_node(exposed) and id(exposed) not in native_children:
+                freeze_native_graph(exposed, depth)
+
+    def collect_exposed(read: Callable[[], Iterable[object]], depth: int) -> tuple[object, ...]:
+        """Read a public sequence view once, capturing each child as it is yielded.
+
+        Advancing the iterator is caller code that may repair a child it already exposed, so a child's
+        native backing is frozen before the next one is requested; reconstruction still waits until
+        every sibling is captured.
+        """
+
+        collected: list[object] = []
+        for entry in observed(read):
+            capture_exposed((entry,), depth)
+            collected.append(entry)
+        return tuple(collected)
+
+    def rebuild(item: object, depth: int = 0) -> object:
+        """Public rebuild phase: observations are charged to the view envelope."""
+
+        nonlocal budget, phase_depth
+        if phase_depth == 0:
+            budget = view_budget
+        phase_depth += 1
+        try:
+            return rebuild_node(item, depth)[0]
+        finally:
+            phase_depth -= 1
+            if phase_depth == 0:
+                budget = capture_budget
+
+    def rebuild_node(item: object, depth: int) -> tuple[object, bool, int]:
+        """Return ``(copy, reusable, height)``.
+
+        Reusable subtrees saw only native storage.  ``height`` is the deepest
+        descendant relative to this node, so the depth limit holds on every
+        occurrence, including a reused subtree reached through a deeper path
+        and a chain that public views form out of already captured nodes.
+        """
+
+        if not is_graph_node(item):
+            return item, True, 0
+        if depth > budget.tier.max_depth:
+            raise ValueError(DISCOVERY_BUDGET_MESSAGE)
+        item_type = type(item)
+
+        identity = id(item)
+        cached = memo.get(identity)
+        if cached is not None and cached[0] is item:
+            if depth + cached[2] > budget.tier.max_depth:
+                raise ValueError(DISCOVERY_BUDGET_MESSAGE)
+            return cached[1], True, cached[2]
+        if identity not in native_children:
+            freeze_native_graph(item, depth)
+        if identity in active:
+            raise ValueError("contract input graph must be acyclic")
+        active.add(identity)
+        reusable = True
+        height = 0
+        own_cost = 0  # copying an exact node that cannot be reused is work the capture phase did not charge
+
+        def child(value: object) -> object:
+            nonlocal reusable, height
+            copied, child_reusable, child_height = rebuild_node(value, depth + 1)
+            reusable = reusable and child_reusable
+            height = max(height, child_height + 1)
+            return copied
+
+        try:
+            if _inherits(item_type, BaseModel):
+                stored_entries, extras_are_native, frozen_extras = frozen_models[
+                    identity
+                ]
+                declared = item_type.model_fields
+                if extras_are_native:
+                    extra_entries = frozen_extras
+                    observed_extra_length = len(extra_entries)
+                    iterated_extra_names = tuple(
+                        name for name, _field_value in extra_entries
+                    )
+                elif frozen_extras is None:
+                    observed_extra_length = 0
+                    iterated_extra_names = ()
+                    extra_entries = ()
+                elif not _is_real_mapping(frozen_extras):
+                    raise ValueError("contract extra storage must be a mapping")
+                else:
+                    reusable = False
+                    observed_extra_length = len(frozen_extras)
+                    iterated_extra_names = tuple(
+                        name for name in observed(lambda: frozen_extras)
+                    )
+                    extra_entries = tuple(
+                        entry for entry in observed(frozen_extras.items)
+                    )
+                _refuse_duplicate_texts(
+                    stored_entries, extra_entries if extras_are_native else ()  # type: ignore[arg-type]
+                )
+                stored_names = {name for name, _field_value in stored_entries}
+                undeclared = stored_names - declared.keys()
+                if (
+                    undeclared
+                    or observed_extra_length
+                    or iterated_extra_names
+                    or extra_entries
+                ):
+                    raise ValueError("contract input contains undeclared fields")
+                own_cost = 1 + len(stored_entries)
+                result: object = {
+                    name: child(field_value) for name, field_value in stored_entries
+                }
+            elif _inherits(item_type, dict):
+                exact = item_type is dict
+                reusable = exact
+                entries = (
+                    frozen_containers[identity]
+                    if exact
+                    # Each observed pair is unpacked exactly once into a plain tuple that capture and
+                    # reconstruction both reuse; the caller's pair object is never read again.
+                    # Each exposed value is captured as its pair is unpacked, before the view advances.
+                    else unpack_pairs(
+                        observed(item.items), lambda value: capture_exposed((value,), depth + 1)
+                    )
+                )
+                if exact:
+                    own_cost = 1 + len(entries)
+                result = {}
+                for key, field_value in entries:
+                    # A text-subclass key is reduced to its text (its own hash and equality never run
+                    # again) and two keys with one text are refused as ambiguous.
+                    plain = _plain_key(key)
+                    if plain in result:
+                        raise ValueError("contract input field names must be unique text")
+                    result[plain] = child(field_value)
+            else:
+                is_list = _inherits(item_type, list)
+                exact = item_type is (list if is_list else tuple)
+                reusable = exact
+                items = (
+                    frozen_containers[identity]
+                    if exact
+                    else collect_exposed(lambda: item, depth + 1)
+                )
+                if exact:
+                    own_cost = 1 + len(items)
+                copied_items = [child(entry) for entry in items]
+                result = copied_items if is_list else tuple(copied_items)
+            if reusable:
+                memo[identity] = (item, result, height)
+            elif own_cost:
+                budget.charge_edge(own_cost)  # every non-reused ancestor copy is charged
+            return result, reusable, height
+        finally:
+            active.remove(identity)
+
+    return freeze_native_graph, rebuild
+
+
+def _snapshot_closed_graph(value: object) -> object:
+    """Copy a model/native graph without dropping stored undeclared fields."""
+
+    freeze_native_graph, rebuild = _closed_graph_snapshot_session()
+    freeze_native_graph(value)
+    return rebuild(value)
+
+
+def _validated_operation_snapshot(
+    operation: TenantOperationState,
+    *,
+    rebuild: Callable[[object], object] | None = None,
+) -> TenantOperationState:
+    if not _inherits(type(operation), TenantOperationState):
+        raise TypeError("operation must be a TenantOperationState")
+    snapshot = (
+        _snapshot_closed_graph(operation)
+        if rebuild is None
+        else rebuild(operation)
+    )
+    return TenantOperationState.model_validate(snapshot)
+
+
+def _validated_placement_snapshot(placement: TenantPlacement) -> TenantPlacement:
+    if not _inherits(type(placement), TenantPlacement):
+        raise TypeError("placement must be a TenantPlacement")
+    return TenantPlacement.model_validate(_snapshot_closed_graph(placement))
+
+
+def validate_operation_transition(
+    previous: TenantOperationState, current: TenantOperationState
+) -> TenantOperationState:
+    """Reject identity changes, generation rollback, and invalid progress changes."""
+
+    if not _inherits(type(previous), TenantOperationState):
+        raise TypeError("operation must be a TenantOperationState")
+
+    freeze_native_graph, rebuild = _closed_graph_snapshot_session()
+    previous_capture_error: Exception | None = None
+    try:
+        freeze_native_graph(previous)
+    except Exception as error:
+        previous_capture_error = error
+
+    current_capture_error: Exception | None = None
+    if _inherits(type(current), TenantOperationState):
+        try:
+            freeze_native_graph(current)
+        except Exception as error:
+            current_capture_error = error
+
+    if previous_capture_error is not None:
+        raise previous_capture_error
+    previous = _validated_operation_snapshot(previous, rebuild=rebuild)
+    if current_capture_error is not None:
+        raise current_capture_error
+    current = _validated_operation_snapshot(current, rebuild=rebuild)
+
+    immutable_fields = ("tenant_id", "operation_id", "operation", "desired_state")
+    for field_name in immutable_fields:
+        if getattr(previous, field_name) != getattr(current, field_name):
+            raise ValueError(f"operation transition changed immutable {field_name}")
+
+    if current.placement_generation < previous.placement_generation:
+        raise ValueError("operation transition cannot decrease placement_generation")
+
+    if current.observed_state == previous.observed_state:
+        if current.observed_state in {"succeeded", "failed", "cancelled"}:
+            if current != previous:
+                raise ValueError("terminal operation republication must be identical")
+        return current
+    allowed = _ALLOWED_OBSERVED_TRANSITIONS[previous.observed_state]
+    if current.observed_state not in allowed:
+        raise ValueError(
+            "invalid observed_state transition: "
+            f"{previous.observed_state} -> {current.observed_state}"
+        )
+    return current
+
+
+def validate_placement_publication(
+    placement: TenantPlacement,
+    *,
+    expected_tenant_id: OpaqueId,
+    current_generation: SafeCounter,
+) -> TenantPlacement:
+    """Accept only a publication for the exact tenant and current generation."""
+
+    placement = _validated_placement_snapshot(placement)
+    validated_tenant_id = _OPAQUE_ID_ADAPTER.validate_python(
+        expected_tenant_id, strict=True
+    )
+    validated_generation = _SAFE_COUNTER_ADAPTER.validate_python(
+        current_generation, strict=True
+    )
+    if placement.tenant_id != validated_tenant_id:
+        raise ValueError("placement publication tenant_id does not match")
+    if placement.generation != validated_generation:
+        raise ValueError("placement publication generation is stale or unexpected")
+    return placement
+
+
+__all__ = [
+    "ResourceManifestReference",
+    "TenantDesiredState",
+    "TenantObservedState",
+    "TenantOperationKind",
+    "TenantOperationState",
+    "TenantPlacement",
+    "validate_operation_transition",
+    "validate_placement_publication",
+]
