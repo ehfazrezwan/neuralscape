@@ -16,6 +16,7 @@ from contracts_policy import (
     PolicyEvaluationInput,
     PolicyOutcome,
     PolicyReasonCode,
+    PolicyStatement,
     PrincipalContext,
 )
 from contracts_limits import STANDARD, DiscoveryBudget, is_exact_type
@@ -1162,6 +1163,22 @@ def _decision(
     )
 
 
+# The statement fields ``evaluate_policy`` judges.  A field added to ``PolicyStatement`` must be
+# judged here (and listed) before a statement that sets it can authorize anything.
+_JUDGED_STATEMENT_FIELDS = frozenset({"id", "effect", "subject_id", "credential_id", "action", "resource"})
+
+
+def _unjudged_terms(statement: PolicyStatement) -> tuple[str, ...]:
+    """The fields of ``statement`` outside ``_JUDGED_STATEMENT_FIELDS`` that differ from their default."""
+
+    return tuple(
+        name
+        for name, field in type(statement).model_fields.items()
+        if name not in _JUDGED_STATEMENT_FIELDS
+        and getattr(statement, name, None) != (None if field.is_required() else field.default)
+    )
+
+
 def evaluate_policy(
     *,
     principal: PrincipalContext,
@@ -1262,6 +1279,11 @@ def evaluate_policy(
         delegated_action not in SUPPORTED_POLICY_ACTIONS
         for delegated_action in principal.delegation.allowed_actions
     ):
+        return deny("unsupported_policy_semantics")
+    # A statement field this evaluator does not judge (a condition, for example) narrows or
+    # qualifies the grant; ignoring it would turn a conditioned allow into an unconditional one.
+    # Any statement that sets such a field makes the whole snapshot unsupported.
+    if any(_unjudged_terms(statement) for statement in policy.statements):
         return deny("unsupported_policy_semantics")
 
     if not (

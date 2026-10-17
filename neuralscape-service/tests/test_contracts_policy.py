@@ -4592,3 +4592,30 @@ def test_a_reach_tuple_that_reuses_a_scanned_id_is_still_scanned(monkeypatch) ->
     monkeypatch.setattr(reference_module, "id", colliding_id, raising=False)
     completed = _entry_flow(root)
     assert completed[2][0] == {"v": "b-first"}  # captured at exposure, not after the change
+
+
+def test_every_statement_field_is_judged_by_the_evaluator() -> None:
+    """A field added to ``PolicyStatement`` (a condition, a scope) qualifies the grant; until the
+    evaluator judges it and lists it, a statement setting it must not authorize anything."""
+
+    from contracts_policy import PolicyStatement
+    from contracts_policy_reference import _JUDGED_STATEMENT_FIELDS
+
+    assert set(PolicyStatement.model_fields) == set(_JUDGED_STATEMENT_FIELDS)
+
+
+def test_a_statement_with_an_unjudged_term_is_reported_and_one_at_its_default_is_not() -> None:
+    from typing import Optional
+
+    from pydantic import create_model
+
+    from contracts_policy import PolicyStatement
+    from contracts_policy_reference import _unjudged_terms
+
+    Conditioned = create_model(
+        "Conditioned", __base__=PolicyStatement, condition=(Optional[dict], None)
+    )
+    base = statement("s", "allow", "read", reference("memory-1")).model_dump()
+    assert _unjudged_terms(Conditioned(**base, condition={"kind": "row_owner_is_principal"})) == ("condition",)
+    assert _unjudged_terms(Conditioned(**base)) == ()
+    assert _unjudged_terms(PolicyStatement(**base)) == ()
