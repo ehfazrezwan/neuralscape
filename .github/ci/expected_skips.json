@@ -7,10 +7,6 @@
     "host": {
       "skips": [
         {
-          "test": "::tests.test_integrated_reference_story",
-          "reason_contains": "absent module(s): contracts_portability"
-        },
-        {
           "test": "tests.test_baseline_reproductions::test_compose_backup_tooling_covers_every_persistent_volume",
           "reason_contains": "the compose profile ships no backup tooling that"
         },
@@ -62,10 +58,6 @@
     },
     "container": {
       "skips": [
-        {
-          "test": "::tests.test_integrated_reference_story",
-          "reason_contains": "absent module(s): contracts_portability"
-        },
         {
           "test": "tests.test_baseline_reproductions::test_compose_backup_tooling_covers_every_persistent_volume",
           "reason_contains": "the compose profile ships no backup tooling that"
