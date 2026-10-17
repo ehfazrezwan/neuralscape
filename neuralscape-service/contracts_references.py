@@ -37,7 +37,11 @@ ReferenceKind = Literal[
 
 
 class ReferenceHandle(ContractModel):
-    """An opaque, tenant-scoped target plus the capability used to resolve it."""
+    """An opaque, tenant-scoped target plus the capability used to resolve it.
+
+    ``cross_tenant`` marks a handle that deliberately names a record of another tenant; it is
+    additive and defaults to ``False`` so existing wire data is unchanged.
+    """
 
     model_config = ConfigDict(frozen=True, revalidate_instances="always")
 
@@ -45,6 +49,11 @@ class ReferenceHandle(ContractModel):
     id: OpaqueId
     tenant_id: OpaqueId
     resolver: OpaqueId
+    # Explicit marker for lineage that names another tenant's record (owner direction
+    # ``lineage = authorized_cross``).  It is data, never authority: resolving such a handle needs a
+    # current authorization check every time.  Contracts that hold handles decide where a marked
+    # handle is allowed (source lineage) and where it never is (write targets and outputs).
+    cross_tenant: bool = False
 
 
 class SourceVersion(ContractModel):
