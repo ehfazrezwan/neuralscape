@@ -487,20 +487,47 @@ def _capture_native_graph(value: object, inventory: _GraphInventory, depth: int 
     return height
 
 
-def _private_copy(value: object) -> object:
+def _private_copy(value: object, limit: int) -> object:
     """A structural copy of a snapshot (exact dicts, lists and tuples rebuilt; every other value shared as it is).
 
-    Only the containers are copied, so no value's own copy hook runs; the snapshot's depth is already bounded.
+    The snapshot stores an identical subtree once and shares it, so the copy does the same: each distinct container
+    is copied once (a memo by identity, holding the original so its identity cannot be reused) and shared in the
+    copy as it is in the snapshot, which makes the work linear in the snapshot's distinct nodes.  The strict
+    validation that follows walks a shared subtree once per path, so the expanded size (nodes counted per path,
+    computed from the same memo) is held to ``limit``, the tier's edge limit: a snapshot that would cost more to
+    validate is refused with the stable budget error before it is copied further or validated.  No value's own
+    copy hook runs, and the snapshot's depth is already bounded.
     """
 
-    kind = type(value)
-    if kind is dict:
-        return {key: _private_copy(item) for key, item in dict.items(value)}
-    if kind is list:
-        return [_private_copy(item) for item in list.__iter__(value)]
-    if kind is tuple:
-        return tuple(_private_copy(item) for item in tuple.__iter__(value))
-    return value
+    memo: dict[int, tuple[object, object, int]] = {}
+
+    def copy(node: object) -> tuple[object, int]:
+        kind = type(node)
+        if kind is not dict and kind is not list and kind is not tuple:
+            return node, 1
+        known = memo.get(id(node))
+        if known is not None and known[0] is node:
+            return known[1], known[2]
+        size = 1
+        if kind is dict:
+            built: dict[object, object] = {}
+            for key, item in dict.items(node):
+                built[key], item_size = copy(item)
+                size += item_size
+            result: object = built
+        else:
+            parts = []
+            for item in (list.__iter__(node) if kind is list else tuple.__iter__(node)):  # type: ignore[arg-type]
+                part, item_size = copy(item)
+                parts.append(part)
+                size += item_size
+            result = parts if kind is list else tuple(parts)
+        if size > limit:
+            raise ValueError(DISCOVERY_BUDGET_MESSAGE)
+        memo[id(node)] = (node, result, size)
+        return result, size
+
+    return copy(value)[0]
 
 
 def _pin_collected(inventory: _GraphInventory) -> None:
@@ -637,7 +664,7 @@ def _exposed_items(
                     inventory.entry_guard(snapshot)  # the receiving boundary's type check, before pydantic sees it
                 # A private copy: the validators of the declared class may edit what they are given, and the
                 # retained snapshot is the evidence the caller will judge.
-                item_model.model_validate(_private_copy(snapshot), strict=True)
+                item_model.model_validate(_private_copy(snapshot, budget.tier.max_edges), strict=True)
                 inventory.validated[id(snapshot)] = snapshot
             except Exception:  # noqa: BLE001 - the input is refused; a prefix is never returned as if it were the view
                 raise ValueError("a contract entry exposed by a public view is not valid") from None

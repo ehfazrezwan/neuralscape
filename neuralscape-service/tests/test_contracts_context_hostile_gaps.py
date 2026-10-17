@@ -1553,3 +1553,92 @@ def test_a_shared_item_does_not_scale_the_work_with_its_occurrences() -> None:
     started = time.monotonic()
     snapshot_contract_graph(Holder.model_construct(items=_GeneratedItems(lambda: iter([item] * 4_000))), contract=Holder)
     assert time.monotonic() - started < 10  # 80 million element validations if every occurrence were judged again
+
+
+# ---- a shared (diamond) subtree inside a yielded entry costs linear work, not one visit per path
+
+
+def _diamond(depth: int) -> object:
+    node: object = {"leaf": 1}
+    for _ in range(depth):
+        node = [node, node]  # each level references the one child twice: 2^depth paths, depth + 1 distinct nodes
+    return node
+
+
+def _receipt_whose_entry_carries_a_diamond(depth: int):
+    from contracts_context import ContextAssemblyReceipt
+    from tests.test_contracts_context import _receipt
+
+    base = _validate(ContextAssemblyReceipt, _receipt())
+    entry = {"record_id": "source-a", "content_revision": 4, "policy_epoch": 2, "extra": _diamond(depth)}
+    object.__setattr__(base, "source_versions", _GeneratedItems(lambda: iter([entry])))
+    return base
+
+
+@pytest.mark.parametrize("depth", [22, 40, 60])
+def test_a_diamond_in_a_yielded_entry_is_refused_in_linear_work(depth) -> None:
+    import time
+
+    from contracts_context import ContextAssemblyReceipt
+    from contracts_freshness import snapshot_pinned
+
+    receipt = _receipt_whose_entry_carries_a_diamond(depth)
+    started = time.monotonic()
+    with pytest.raises(ValueError):
+        snapshot_pinned(receipt, ContextAssemblyReceipt)
+    assert time.monotonic() - started < 2  # the unmemoized copy took 15 s at 22 levels and did not finish at 40
+
+
+def test_the_helpers_refuse_the_same_diamond_quickly_too() -> None:
+    import time
+
+    from contracts_context import receipt_matches_bundle
+
+    bundle = _validate(ContextBundle, _bundle())
+    started = time.monotonic()
+    assert receipt_matches_bundle(_receipt_whose_entry_carries_a_diamond(40), bundle) is False
+    assert time.monotonic() - started < 2
+
+
+def test_the_private_copy_keeps_sharing_and_copies_each_distinct_node_once() -> None:
+    from contracts_common import _private_copy
+
+    shared = {"a": [1, 2]}
+    original = {"x": shared, "y": [shared, shared], "z": (shared,)}
+    copy = _private_copy(original, 786_432)
+    assert copy == original and copy is not original
+    assert copy["x"] is copy["y"][0] is copy["y"][1] is copy["z"][0]  # shared once, in the copy as in the snapshot
+    assert copy["x"] is not shared and copy["x"]["a"] is not shared["a"]  # nothing is shared with the retained snapshot
+    copy["x"]["a"].append(3)
+    assert shared["a"] == [1, 2]
+
+
+def test_a_snapshot_whose_expanded_size_exceeds_the_budget_is_refused_before_validation() -> None:
+    from contracts_common import _private_copy
+
+    with pytest.raises(ValueError, match="budget"):
+        _private_copy(_diamond(40), 786_432)
+    assert _private_copy(_diamond(10), 786_432) is not None  # 2^10 expanded nodes: fine
+
+
+def test_a_nested_edit_by_a_validator_cannot_reach_the_retained_snapshot() -> None:
+    from pydantic import model_validator
+
+    from contracts_common import ContractModel, snapshot_contract_graph
+
+    class Item(ContractModel):
+        inner: tuple[list[int], ...]
+
+        @model_validator(mode="before")
+        @classmethod
+        def rewrite(cls, data):
+            data["inner"][0].append(99)  # edits a nested container in place
+            data["inner"] = tuple(data["inner"]) + ([5],)  # and replaces the tuple
+            return data
+
+    class Holder(ContractModel):
+        items: tuple[Item, ...]
+
+    entry = {"inner": ([1],)}
+    snapshot = snapshot_contract_graph(Holder.model_construct(items=_GeneratedItems(lambda: iter([entry]))), contract=Holder)
+    assert snapshot["items"][0] == {"inner": ([1],)}
