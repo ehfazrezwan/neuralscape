@@ -2049,3 +2049,44 @@ def test_an_unchanged_embedded_resource_carrying_a_ref_compares_clean() -> None:
     widened["properties"]["other"] = {}
     assert _pair(old, copy.deepcopy(old)) == []
     assert _pair(old, widened) == []
+
+
+# ---- the legacy dependencies keyword maps names to schemas like dependentSchemas
+
+
+def _legacy_dependencies(n_type: str) -> dict:
+    return {
+        "$defs": {"Name": {"type": "object", "properties": {"n": {"type": n_type}}}},
+        "type": "object",
+        "dependencies": {"const": {"$ref": "#/$defs/Name"}},
+    }
+
+
+def test_a_changed_definition_behind_a_legacy_dependency_named_like_a_keyword_is_reported() -> None:
+    findings = _pair(_legacy_dependencies("string"), _legacy_dependencies("integer"))  # {"const": true, "n": "text"} now invalid
+    assert any("dependencies changed" in f for f in findings), findings
+
+
+def test_an_unchanged_legacy_dependency_compares_clean() -> None:
+    assert _pair(_legacy_dependencies("string"), _legacy_dependencies("string")) == []
+    old = {"type": "object", "dependencies": {"a": ["b"]}}
+    assert _pair(old, copy.deepcopy(old)) == []
+    assert any("dependencies changed" in f for f in _pair(old, {"type": "object", "dependencies": {"a": ["b", "c"]}}))
+
+
+# ---- every pattern checked against a newly listed name spends the budget
+
+
+def test_checking_new_names_against_many_patterns_spends_the_budget(monkeypatch) -> None:
+    monkeypatch.setattr(pack, "_MAX_COMPARISONS", 50)
+    patterns = {f"^x{i}$": {"type": "string"} for i in range(20)}  # none matches the new names
+    old = {"type": "object", "additionalProperties": False, "patternProperties": patterns}
+    new = {**copy.deepcopy(old), "properties": {f"p{i}": {"type": "integer"} for i in range(20)}}
+    assert pack._BUDGET_MESSAGE in _pair(old, new), _pair(old, new)  # 400 pattern/name checks
+
+
+def test_a_few_patterns_and_new_names_stay_within_the_budget() -> None:
+    patterns = {f"^x{i}$": {"type": "string"} for i in range(5)}
+    old = {"type": "object", "additionalProperties": False, "patternProperties": patterns}
+    new = {**copy.deepcopy(old), "properties": {f"p{i}": {"type": "integer"} for i in range(5)}}
+    assert _pair(old, new) == []  # the names were rejected before and are allowed now

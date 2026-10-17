@@ -219,7 +219,7 @@ class _TooLarge(Exception):
 # Keywords whose value is data, not a schema: a ``{"$ref": ...}`` inside one is a literal object.
 _LITERAL_KEYWORDS = frozenset({"const", "enum", "examples", "default"})
 # Keywords whose value maps names to schemas: inside one, a key such as "const" is a name, not a keyword.
-_SCHEMA_MAPS = frozenset({"properties", "patternProperties", "$defs", "definitions", "dependentSchemas"})
+_SCHEMA_MAPS = frozenset({"properties", "patternProperties", "$defs", "definitions", "dependentSchemas", "dependencies"})
 
 
 def _def_name(ref: object, defs: dict) -> str | None:
@@ -1063,6 +1063,7 @@ def _matching_patterns(patterns: object, name: str) -> tuple[list, list]:
     possible: list = []
     if isinstance(patterns, dict):
         for pattern, schema in patterns.items():
+            _charge_comparison()  # names x patterns is a cross product: every check spends the budget
             decision = _pattern_matches(pattern, name)
             if decision is True:
                 proven.append(schema)
