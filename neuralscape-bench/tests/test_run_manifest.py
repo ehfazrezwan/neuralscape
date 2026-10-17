@@ -5252,3 +5252,30 @@ def test_error_locations_still_name_nested_fields_and_indexes():
     with pytest.raises(ValueError) as refused:
         run_manifest_module._require_native_snapshot({"resources": [{"name": [1, object()]}]})
     assert str(refused.value) == "unsupported value type at $['resources'][0]['name'][1]"
+
+
+# ---- the undeclared-field message lists a bounded number of names
+
+
+def test_many_undeclared_keys_give_a_bounded_error_naming_the_first_few_and_a_count():
+    manifest = completed_manifest()
+    storage = BASE_MODEL_DICT_DESCRIPTOR.__get__(manifest, BaseModel)
+    for index in range(20_000):
+        dict.__setitem__(storage, f"undeclared_{index:05d}_" + "y" * 200, 1)
+    with pytest.raises(ValueError) as refused:
+        serialize_run_manifest(manifest)
+    message = str(refused.value)
+    assert len(message) < 1_000
+    assert message.startswith("undeclared stored fields at $: 'undeclared_00000_")
+    assert message.endswith("… and 19995 more")
+    assert message.count("'undeclared_") == 5
+
+
+def test_a_few_undeclared_keys_are_all_listed():
+    manifest = completed_manifest()
+    storage = BASE_MODEL_DICT_DESCRIPTOR.__get__(manifest, BaseModel)
+    for name in ("zeta", "alpha", "mid"):
+        dict.__setitem__(storage, name, 1)
+    with pytest.raises(ValueError) as refused:
+        serialize_run_manifest(manifest)
+    assert str(refused.value) == "undeclared stored fields at $: 'alpha', 'mid', 'zeta'"

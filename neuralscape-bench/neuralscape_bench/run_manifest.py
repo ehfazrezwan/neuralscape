@@ -8,6 +8,7 @@ not be synthesized as a zero.
 
 from __future__ import annotations
 
+import heapq
 import json
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
@@ -1291,6 +1292,7 @@ def _is_supported_leaf(value: Any) -> bool:
 
 
 _KEY_LABEL_CHARS = 64
+_UNDECLARED_NAMES_LISTED = 5
 _KEY_LABEL_INT_BITS = 128
 
 
@@ -1456,7 +1458,11 @@ def _snapshot_native(
                 undeclared.update(iterated_extra_names)
                 undeclared.update(key for key, _ in extra_entries)
             if undeclared:
-                names = ", ".join(sorted(_key_label(name) for name in undeclared))
+                # Name the first few (sorted by label) and count the rest, so the error stays small.
+                labels = heapq.nsmallest(_UNDECLARED_NAMES_LISTED, map(_key_label, undeclared))
+                names = ", ".join(labels)
+                if len(undeclared) > len(labels):
+                    names += f", … and {len(undeclared) - len(labels)} more"
                 raise ValueError(f"undeclared stored fields at {path}: {names}")
             return {
                 name: _snapshot_native(
