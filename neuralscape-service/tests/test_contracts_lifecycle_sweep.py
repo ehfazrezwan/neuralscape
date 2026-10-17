@@ -1940,3 +1940,71 @@ def test_an_honest_enum_member_in_a_copy_reused_after_caller_code_is_still_accep
     memo[contracts_lifecycle._GENERATION] = contracts_lifecycle._generation(memo) + 1  # as a public view does
     second = contracts_lifecycle._revalidated_captured_model(Intent, captured)
     assert second == first and second.stage_requirements[1].upstream_stages == (ProcessingStage.CANONICAL,)
+
+
+def test_an_enum_member_nested_in_a_reused_pure_copy_is_judged_again():
+    """The copy's members include those of the pure containers inside it.  No lifecycle contract accepts a
+    nested scalar container, so this drives the root step directly: a nested copy built in one generation,
+    reused in the next after the member's class was armed, is refused before validation reads it."""
+
+    import enum
+
+    from contracts_lifecycle import Intent
+    from tests.test_contracts_lifecycle import intent_with_requirements, reference, requirement
+
+    class SourceId(str, enum.Enum):
+        MEMORY = "memory-1"
+
+    delegate = reference("r1")
+    reads: list[str] = []
+
+    def impersonate(self, name):
+        if name == "__class__":
+            return type(delegate)
+        if name.startswith("_") and name not in ("__dict__", "__pydantic_fields_set__", "__pydantic_extra__"):
+            return object.__getattribute__(self, name)
+        reads.append(name)
+        return getattr(delegate, name)
+
+    command = intent_with_requirements(requirement(ProcessingStage.CANONICAL))
+    set_native(command.stage_requirements[0], "precondition_source_ids", ((SourceId.MEMORY,),))
+    captured = contracts_lifecycle._capture_contract_graph(command)
+    memo = captured[1]
+    with pytest.raises(ValueError):  # a nested tuple is no source id; the copies are built all the same
+        contracts_lifecycle._revalidated_captured_model(Intent, captured)
+    type.__setattr__(SourceId, "__getattribute__", impersonate)
+    try:
+        memo[contracts_lifecycle._GENERATION] = contracts_lifecycle._generation(memo) + 1  # as a public view does
+        with pytest.raises(ValueError, match="native scalar, an enum member"):
+            contracts_lifecycle._revalidated_captured_model(Intent, captured)
+    finally:
+        type.__delattr__(SourceId, "__getattribute__")
+    assert reads == []
+
+
+@pytest.mark.parametrize("entry", ["record", "claim"])
+def test_an_enum_member_in_a_reused_copy_is_judged_again_when_a_later_view_of_its_root_arms_it(entry):
+    """The copy is reused in the generation it was made in (nothing to judge yet), and a view the receipt
+    materializes afterwards arms the member's class: the members a reuse hands out are recorded for the root
+    and judged again before validation, as freshly materialized ones are."""
+
+    command, receipts, reads, kind = _reused_enum_case(True)
+    applied = tuple.__getitem__(receipts, 0)
+    arm = type(receipts).__iter__
+
+    class Arming(tuple):
+        def __iter__(self):
+            arm(receipts)
+            return iter(())
+
+    set_native(applied, "upstream_applications", Arming(()))  # materialized after output_refs
+    try:
+        with pytest.raises((ValueError, TypeError)):
+            if entry == "record":
+                contracts_lifecycle.validate_stage_receipts(command, (applied,))
+            else:
+                validate_required_stage_claim(claimed_status=IntentStatus.APPLIED, intent=command, receipts=(applied,))
+    finally:
+        if "__getattribute__" in vars(kind):
+            type.__delattr__(kind, "__getattribute__")
+    assert reads == []
