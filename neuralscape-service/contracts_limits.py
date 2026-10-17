@@ -96,6 +96,27 @@ def is_exact_type(obj, *types):
     return False
 
 
+_TYPE_MRO = type.__dict__["__mro__"]
+
+
+def inherits_native(candidate, base) -> bool:
+    """Whether ``base`` is in the class's own MRO (identity, no hooks).
+
+    ``issubclass`` consults the metaclass (ABC registration, ``__subclasshook__``) and ``isinstance``
+    additionally honours the instance's own ``__class__``; neither is evidence of what an object really
+    is.  This reads the type's MRO through ``type``'s own descriptor.
+    """
+
+    return any(entry is base for entry in _TYPE_MRO.__get__(candidate))
+
+
+def is_native_instance(obj, *bases) -> bool:
+    """``isinstance`` by the object's real type only: its ``__class__`` property is never consulted."""
+
+    actual = type(obj)
+    return any(inherits_native(actual, base) for base in bases)
+
+
 def _exceeded():
     return ValueError(DISCOVERY_BUDGET_MESSAGE)
 
@@ -204,5 +225,7 @@ __all__ = [
     "STANDARD_MAX_DEPTH",
     "STANDARD_MAX_EDGES",
     "STANDARD_MAX_NODES",
+    "inherits_native",
     "is_exact_type",
+    "is_native_instance",
 ]
