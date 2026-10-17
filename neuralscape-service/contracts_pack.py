@@ -224,11 +224,11 @@ _SCHEMA_MAPS = frozenset({"properties", "patternProperties", "$defs", "definitio
 def _def_name(ref: object, defs: dict) -> str | None:
     """The definition a ``#/$defs/<name>`` reference names, when ``defs`` has it (else ``None``)."""
 
-    if isinstance(ref, str) and ref.startswith("#/$defs/"):
-        name = ref.removeprefix("#/$defs/")
+    if _plain_definition_reference(ref):
+        name = ref.removeprefix("#/$defs/")  # type: ignore[union-attr]
         if name in defs:
             return name
-    return None
+    return None  # an escaped or deeper pointer is resolved as a pointer (its tokens decoded), never as a name
 
 
 # Keywords that refer to another schema by something other than ``$ref`` (resolved at validation time).
@@ -363,19 +363,51 @@ def _json_kind(value: object) -> str:
     return "other:" + type(value).__name__
 
 
+# Values walked by equality and canonical keys in one comparison (each pair of containers, or container,
+# counted once with its members): past it the comparison is not verified, never taken for equal.
+_MAX_EQUALITY_STEPS = 5_000_000
+
+
+def _charge_values(count: int, local: list[int]) -> bool:
+    """Charge ``count`` walked values to the running comparison (or to ``local`` outside one).
+
+    Inside a comparison an exhausted budget ends it as unverified; outside, ``False`` tells the caller to stop.
+    """
+
+    run = _RUN.get()
+    if run is not None:
+        run.values += count
+        if run.values > _MAX_EQUALITY_STEPS:
+            raise _BudgetExhausted
+        return True
+    local[0] += count
+    return local[0] <= _MAX_EQUALITY_STEPS
+
+
 def _json_equal(left: object, right: object) -> bool:
     """JSON value equality: ``true`` is not ``1`` and ``false`` is not ``0``, ``1`` equals ``1.0``.
 
     Python's ``==`` (and ``in``) treats ``True`` as ``1``, so ``enum: [true, 1]`` to ``enum: [1]`` looked
-    unchanged.  Iterative, so a deeply nested value cannot exhaust the interpreter stack.
+    unchanged.  Iterative, so a deeply nested value cannot exhaust the interpreter stack; a pair of containers
+    is compared once however many paths reach it (both values stay alive for the call, so their ids are
+    their own), and the work is charged.
     """
 
     work = [(left, right)]
+    compared: set[tuple[int, int]] = set()
+    local = [0]
     while work:
         first, second = work.pop()
         kind = _json_kind(first)
         if kind != _json_kind(second):
             return False
+        if kind in ("object", "array"):
+            pair = (id(first), id(second))
+            if pair in compared:
+                continue
+            compared.add(pair)
+            if not _charge_values(1 + len(first), local):  # type: ignore[arg-type]
+                return False  # too large to tell outside a comparison: not shown equal
         if kind == "object":
             if set(first) != set(second):  # type: ignore[arg-type]
                 return False
@@ -392,35 +424,58 @@ def _json_equal(left: object, right: object) -> bool:
 _KEY_DEPTH = 48
 
 
-def _json_key(value: object, depth: int = 0) -> object:
-    """A hashable canonical key such that equal JSON values (true is not 1, 1 is 1.0) have equal keys.
+class _Keys:
+    """Hashable canonical keys such that equal JSON values (true is not 1, 1 is 1.0) have equal keys.
 
-    ``None`` when the value is nested deeper than ``_KEY_DEPTH`` (the caller compares those pairwise with the
-    iterative :func:`_json_equal`, so a deep value costs time but never the interpreter stack).
+    A container's key is a small number given to its kind and its members' keys (hash-consed), so a key is
+    built once per distinct container and hashed in its own size, however many paths share it.  ``None``
+    when the value is nested deeper than ``_KEY_DEPTH`` (the caller then compares pairwise with the iterative
+    :func:`_json_equal`).  The work is charged like equality's.
     """
 
-    kind = _json_kind(value)
-    if kind in ("boolean", "number", "string", "null"):
-        return (kind, value)
-    if depth >= _KEY_DEPTH:
+    def __init__(self) -> None:
+        self.table: dict[tuple, int] = {}
+        self.built: dict[int, object] = {}
+        self.too_deep_at: dict[int, int] = {}  # the shallowest depth a container was found too deep at
+        self.keep: list[object] = []  # every container whose id is remembered stays alive meanwhile
+        self.local = [0]
+
+    def key(self, value: object, depth: int = 0) -> object:
+        kind = _json_kind(value)
+        if kind in ("boolean", "number", "string", "null"):
+            return (kind, value)
+        if kind not in ("array", "object"):
+            return (kind, id(value))
+        ident = id(value)
+        if ident in self.built:
+            return self.built[ident]
+        if depth >= _KEY_DEPTH or depth >= self.too_deep_at.get(ident, _KEY_DEPTH):
+            return None
+        if not _charge_values(1 + len(value), self.local):  # type: ignore[arg-type]
+            return None
+        if kind == "array":
+            members: list = []
+            for item in value:  # type: ignore[attr-defined]
+                part = self.key(item, depth + 1)
+                if part is None:
+                    return self._too_deep(value, depth)
+                members.append(part)
+        else:
+            members = []
+            for name in sorted(value, key=str):  # type: ignore[call-overload]
+                part = self.key(value[name], depth + 1)  # type: ignore[index]
+                if part is None:
+                    return self._too_deep(value, depth)
+                members.append((str(name), part))
+        built = ("#", self.table.setdefault((kind, tuple(members)), len(self.table)))
+        self.built[ident] = built
+        self.keep.append(value)
+        return built
+
+    def _too_deep(self, value: object, depth: int) -> None:
+        self.too_deep_at[id(value)] = min(depth, self.too_deep_at.get(id(value), _KEY_DEPTH))
+        self.keep.append(value)
         return None
-    if kind == "array":
-        parts = []
-        for item in value:  # type: ignore[attr-defined]
-            part = _json_key(item, depth + 1)
-            if part is None:
-                return None
-            parts.append(part)
-        return ("array", tuple(parts))
-    if kind == "object":
-        members = []
-        for name in sorted(value, key=str):  # type: ignore[call-overload]
-            part = _json_key(value[name], depth + 1)  # type: ignore[index]
-            if part is None:
-                return None
-            members.append((str(name), part))
-        return ("object", tuple(members))
-    return (kind, id(value))
 
 
 def _removed_values(old_values: list, new_values: list) -> list:
@@ -430,17 +485,18 @@ def _removed_values(old_values: list, new_values: list) -> list:
     a value too deeply nested to key is compared pairwise with the iterative :func:`_json_equal`.
     """
 
+    canonical = _Keys()
     keys: set[object] = set()
     deep: list = []
     for value in new_values:
-        key = _json_key(value)
+        key = canonical.key(value)
         if key is None:
             deep.append(value)
         else:
             keys.add(key)
     removed = []
     for value in old_values:
-        key = _json_key(value)
+        key = canonical.key(value)
         if key is None:
             if not any(_json_equal(value, other) for other in new_values):
                 removed.append(value)
@@ -470,6 +526,7 @@ class _Run:
 
     def __init__(self) -> None:
         self.steps = 0
+        self.values = 0  # walked by equality and canonical keys (``_MAX_EQUALITY_STEPS``)
         # The lowest position, in the stack of references being compared, of a recursive reference assumed
         # compatible since the current frame began.  A pair that came out clean only because of an assumption
         # about a reference *above* it has proved nothing about itself, so it is not remembered as clean; an
@@ -619,8 +676,8 @@ def _resolve(schema: object, defs: dict) -> tuple[object, list[dict]]:
         extra = _beside(schema)
         if extra:
             beside.append(extra)  # whatever the reference form: ``#`` and recursive ones included
-        if not (isinstance(ref, str) and ref.startswith("#/$defs/")):
-            break
+        if not _plain_definition_reference(ref):
+            break  # an escaped or deeper pointer is not followed here: it is reported as not modelled
         schema = defs.get(ref.removeprefix("#/$defs/"), schema)
         seen += 1
     return schema, beside
@@ -826,6 +883,50 @@ def _cap(findings: list[str]) -> list[str]:
     return findings
 
 
+_REGEX_SPECIAL = frozenset(".^$*+?{}[]\\|()")
+
+
+def _pattern_may_match(pattern: object, name: str) -> bool:
+    """Whether an ECMA-262 ``patternProperties`` pattern may match ``name``, decided without running it.
+
+    A pattern from a document could backtrack for ever (``(a+)+b``), so none is executed: only an anchored
+    literal prefix (``^x-``) or a fully literal anchored pattern (``^a$``) rules a name out, and anything
+    else (alternation, classes, escapes, an unanchored pattern) may match.
+    """
+
+    if not isinstance(pattern, str) or not pattern.startswith("^") or "|" in pattern:
+        return True
+    body = pattern[1:]
+    literal: list[str] = []
+    for index, char in enumerate(body):
+        if char in _REGEX_SPECIAL:
+            if char == "$" and index == len(body) - 1:
+                return name == "".join(literal)  # without the multiline flag, ``$`` is the end of the input
+            if char in "*?{" and literal:
+                literal.pop()  # the literal before an optional quantifier may be absent
+            break
+        literal.append(char)
+    return name.startswith("".join(literal))
+
+
+def _matching_patterns(patterns: object, name: str) -> list:
+    """The ``patternProperties`` schemas whose pattern may match ``name`` (see :func:`_pattern_may_match`)."""
+
+    if not isinstance(patterns, dict):
+        return []
+    return [schema for pattern, schema in patterns.items() if _pattern_may_match(pattern, name)]
+
+
+def _trial(
+    old: object, new: object, old_defs: dict, new_defs: dict, path: str, depth: int, active: tuple
+) -> list[str]:
+    """The findings of comparing ``old`` with ``new``, without adding them to the report."""
+
+    trial: list[str] = []
+    _compare(old, new, old_defs, new_defs, path, trial, depth, active)
+    return trial
+
+
 def _compare_keywords(
     old: dict,
     new: dict,
@@ -933,6 +1034,14 @@ def _compare_keywords(
             # schema (anything when that was true or absent); the new schema may now restrict it.
             if isinstance(old_additional, dict):
                 _compare(old_additional, subschema, old_defs, new_defs, f"{path}.{name}", out, depth + 1, active)
+            # ... unless an old pattern matched its name: then that pattern's schema governed it, whatever
+            # additionalProperties said.  The new property must accept all that one matching pattern accepted.
+            patterns = _matching_patterns(old.get("patternProperties"), name)
+            if patterns and not any(
+                not _trial(pattern, subschema, old_defs, new_defs, f"{path}.{name}", depth + 1, active)
+                for pattern in patterns
+            ):
+                out.append(_unverified(f"{path}.{name}", "a listed property narrows what patternProperties accepted"))
     for name in sorted(set(new.get("required", [])) - set(old.get("required", []))):
         out.append(f"{path}.{name}: now required")
     new_additional = new.get("additionalProperties", True)

@@ -1669,3 +1669,152 @@ def test_a_class_hooking_its_hierarchy_never_answers_for_a_value() -> None:
     findings = _pair({"type": "object"}, {"type": "object", "properties": {"a": Plain()}})
     assert len(findings) == 1 and "not plain JSON" in findings[0], findings
     assert calls == {"mro": 0, "name": 0}, calls  # the real hierarchy is read, and no hook runs
+
+
+# ---- equality and canonical keys over shared nodes: work in distinct nodes, never in paths
+
+
+def _bounded_value_walk(monkeypatch, limit: int = 200_000) -> dict:
+    """Count JSON values classified while comparing, failing at once past ``limit`` (a walk over paths of a
+    shared structure would classify billions)."""
+
+    calls = {"count": 0}
+    real = pack._json_kind
+
+    def counting(value):
+        calls["count"] += 1
+        if calls["count"] > limit:
+            pytest.fail(f"more than {limit} values classified: the walk follows paths, not nodes")
+        return real(value)
+
+    monkeypatch.setattr(pack, "_json_kind", counting)
+    return calls
+
+
+def _shared_any_of(leaf: dict, levels: int = 60) -> dict:
+    node = leaf
+    for _ in range(levels):
+        node = {"anyOf": [node, node]}
+    return node
+
+
+def test_equality_under_not_over_a_shared_structure_is_bounded(monkeypatch) -> None:
+    _bounded_value_walk(monkeypatch)
+    node = _shared_any_of({"type": "string"})
+    assert _pair({"not": node}, {"not": node}) == []
+    changed = _shared_any_of({"type": "string", "maxLength": 1})
+    assert any("not changed" in f for f in _pair({"not": node}, {"not": changed}))
+
+
+def _shared_array(levels: int = 30, leaf: object = 0) -> object:
+    value = leaf
+    for _ in range(levels):
+        value = [value, value]
+    return value
+
+
+def _shared_object(levels: int = 30, leaf: object = 0) -> object:
+    value = leaf
+    for _ in range(levels):
+        value = {"a": value, "b": value}
+    return value
+
+
+@pytest.mark.parametrize("build", [_shared_array, _shared_object], ids=["array", "object"])
+def test_canonical_keys_of_shared_enum_values_are_bounded(monkeypatch, build) -> None:
+    _bounded_value_walk(monkeypatch)
+    assert _pair({"enum": [build(), "x"]}, {"enum": [build(), "x"]}) == []
+    findings = _pair({"enum": [build(), "x"]}, {"enum": [build(leaf=1), "x"]})
+    assert findings and "enum values removed" in findings[0], findings
+
+
+def test_exhausting_the_equality_budget_is_reported_not_taken_for_equal(monkeypatch) -> None:
+    monkeypatch.setattr(pack, "_MAX_EQUALITY_STEPS", 50)
+    value = [list(range(20)) for _ in range(20)]  # 420 distinct values, nothing shared
+    findings = _pair({"not": {"const": value}}, {"not": {"const": [list(row) for row in value]}})
+    assert findings == [pack._BUDGET_MESSAGE], findings
+
+
+# ---- an escaped JSON Pointer token names the decoded definition, never a decoy spelled like the escape
+
+
+def _escaped(real: dict, *, under_not: bool = False, token: str = "A~1B", real_name: str = "A/B") -> dict:
+    reference = {"$ref": f"#/$defs/{token}"}
+    return {
+        "$defs": {real_name: real, token: {"type": "string"}},  # the decoy is unchanged
+        "type": "object",
+        "properties": {"x": {"not": reference} if under_not else reference},
+    }
+
+
+@pytest.mark.parametrize("token, real_name", [("A~1B", "A/B"), ("A~0B", "A~B")])
+def test_a_narrowed_definition_behind_an_escaped_pointer_is_reported(token, real_name) -> None:
+    old = _escaped({"type": "string"}, token=token, real_name=real_name)
+    new = _escaped({"type": "string", "maxLength": 1}, token=token, real_name=real_name)
+    assert any(f.startswith("$.x") for f in _pair(old, new)), _pair(old, new)
+
+
+@pytest.mark.parametrize("token, real_name", [("A~1B", "A/B"), ("A~0B", "A~B")])
+def test_a_widened_definition_behind_an_escaped_pointer_under_not_is_reported(token, real_name) -> None:
+    old = _escaped({"type": "string", "maxLength": 1}, under_not=True, token=token, real_name=real_name)
+    new = _escaped({"type": "string"}, under_not=True, token=token, real_name=real_name)
+    assert any(f.startswith("$.x") for f in _pair(old, new)), _pair(old, new)
+
+
+def test_an_escaped_pointer_with_unchanged_targets_compares_clean_under_not() -> None:
+    schema = _escaped({"type": "string", "maxLength": 1}, under_not=True)
+    widened_elsewhere = copy.deepcopy(schema)
+    widened_elsewhere["properties"]["y"] = {}
+    assert _pair(schema, widened_elsewhere) == []
+
+
+# ---- a newly listed property may already have been governed by patternProperties
+
+
+def _patterned(**properties: dict) -> dict:
+    schema = {"type": "object", "patternProperties": {"^a$": {"type": "string"}}, "additionalProperties": False}
+    if properties:
+        schema["properties"] = properties
+    return schema
+
+
+def test_a_listed_property_narrowing_what_a_pattern_accepted_is_reported() -> None:
+    findings = _pair(_patterned(), _patterned(a={"type": "integer"}))  # {"a": "text"} is now rejected
+    assert any(f.startswith("$.a") for f in findings), findings
+
+
+def test_a_listed_property_accepting_all_a_pattern_accepted_compares_clean() -> None:
+    assert _pair(_patterned(), _patterned(a={"type": ["string", "integer"]})) == []
+
+
+def test_a_listed_property_no_pattern_matches_is_judged_as_before() -> None:
+    assert _pair(_patterned(), _patterned(b={"type": "integer"})) == []  # b was rejected, now allowed
+
+
+def test_a_pattern_that_cannot_be_ruled_out_is_assumed_to_match() -> None:
+    old = {"type": "object", "patternProperties": {"(?<n>a)": {"type": "string"}}, "additionalProperties": False}
+    new = {**copy.deepcopy(old), "properties": {"a": {"type": "integer"}}}
+    assert any(f.startswith("$.a") for f in _pair(old, new))
+
+
+def test_a_pattern_is_never_executed(monkeypatch) -> None:
+    def refuse(*args, **kwargs):
+        raise AssertionError("a pattern from the document was executed")
+
+    monkeypatch.setattr(pack.re, "search", refuse)
+    monkeypatch.setattr(pack.re, "match", refuse)
+    old = {"type": "object", "patternProperties": {"^(a+)+b$": {"type": "string"}}, "additionalProperties": False}
+    new = {**copy.deepcopy(old), "properties": {"a" * 40: {"type": "integer"}}}
+    assert any("patternProperties" in f for f in _pair(old, new))
+
+
+@pytest.mark.parametrize(
+    "pattern, name, may",
+    [
+        ("^a$", "a", True), ("^a$", "ab", False), ("^x-", "x-y", True), ("^x-", "y", False),
+        ("^ab?c", "ac", True), ("^ab*", "a", True), ("^a{0}b", "b", True), ("^ba{2}", "c", False), ("^a|b", "b", True),
+        ("a$", "zzz", True), ("^[a-z]+$", "Q", True), ("^\\d", "x", True), ("^a+$", "aaa", True),
+    ],
+)
+def test_which_names_a_pattern_may_match(pattern, name, may) -> None:
+    assert pack._pattern_may_match(pattern, name) is may
