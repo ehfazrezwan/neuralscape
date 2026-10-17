@@ -13,7 +13,7 @@ from pydantic import Field, TypeAdapter, model_validator
 
 from contracts_common import (
     ContractModel,
-    require_canonical_enum_members,
+    is_canonical_enum_member,
     OpaqueId,
     SafeCounter,
     VersionedContract,
@@ -424,8 +424,9 @@ def upstream_degradation_for(
 ) -> SafeDegradationCode | None:
     """Map non-current upstream knowledge to a content-free receipt code."""
 
-    require_canonical_enum_members(status)  # a look-alike would fall through every identity test below
-    status = _UPSTREAM_STATUS_ADAPTER.validate_python(status, strict=True)
+    status = _UPSTREAM_STATUS_ADAPTER.validate_python(status, strict=True)  # the scalar first: an enum instance
+    if not is_canonical_enum_member(status):  # a look-alike would fall through every identity test below
+        raise ValueError("upstream status must be a declared member of UpstreamVerificationStatus")
     if status is UpstreamVerificationStatus.STALE:
         return SafeDegradationCode.UPSTREAM_VERIFICATION_STALE
     if status in {
