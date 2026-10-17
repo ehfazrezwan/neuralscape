@@ -570,6 +570,19 @@ def _unwrapped(annotation: object) -> object:
 
 
 @functools.lru_cache(maxsize=256)  # bounded: classes a caller creates dynamically cannot accumulate
+def _field_names(model_type: type[BaseModel]) -> dict[str, str]:
+    """Each name a dictionary may use for a field of ``model_type`` (the field's name and its string aliases) -> the field."""
+
+    names: dict[str, str] = {}
+    for name, info in model_type.model_fields.items():
+        names[name] = name
+        for alias in (info.alias, info.validation_alias):
+            if type(alias) is str:
+                names[alias] = name
+    return names
+
+
+@functools.lru_cache(maxsize=256)  # bounded: classes a caller creates dynamically cannot accumulate
 def _declared_models(model_type: type[BaseModel]) -> dict[str, type]:
     """The fields of ``model_type`` declared as exactly one model class, mapped to that class.
 
@@ -839,10 +852,24 @@ def _snapshot_captured_graph(
             if value_id not in inventory.pure_dictionaries:
                 inventory.impure_reads += 1  # rebuilding it hashes keys that can run code
             rebuilt: dict[object, object] = {}
+            # A dictionary that is to be validated as a model carries the same declared contract as that model's own
+            # stored values do: its fields' entry models and declared child models are found by field name (or alias).
+            declared = contract if contract is not None else inventory.contracts.get(value_id)
+            if declared is not None and isinstance(declared, type) and _is_subclass(declared, BaseModel):
+                item_models = _item_models(declared)
+                declared_children = _declared_models(declared)
+                lookup = _field_names(declared)
+            else:
+                item_models = declared_children = lookup = {}
             for key, item in inventory.dictionaries[value_id]:
                 if again:
                     budget.charge_edge()
-                rebuilt[key] = _snapshot_captured_graph(item, active_containers, inventory, below)
+                field_name = lookup.get(key) if lookup and type(key) is str else None
+                rebuilt[key] = _snapshot_captured_graph(
+                    item, active_containers, inventory, below,
+                    item_models.get(field_name) if field_name else None,
+                    declared_children.get(field_name) if field_name else None,
+                )
                 height = _taller(height, item, completed)
             result = rebuilt
     finally:

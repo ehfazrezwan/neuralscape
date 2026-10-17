@@ -1642,3 +1642,184 @@ def test_a_nested_edit_by_a_validator_cannot_reach_the_retained_snapshot() -> No
     entry = {"inner": ([1],)}
     snapshot = snapshot_contract_graph(Holder.model_construct(items=_GeneratedItems(lambda: iter([entry]))), contract=Holder)
     assert snapshot["items"][0] == {"inner": ([1],)}
+
+
+# ---- the declared contract reaches a dictionary-shaped input exactly as it reaches a model-shaped one
+
+
+def _forms_contracts():
+    from contracts_common import ContractModel
+    from contracts_references import SourceVersion
+
+    class Item(ContractModel):
+        label: str
+        versions: tuple[SourceVersion, ...]
+
+    class Holder(ContractModel):
+        items: tuple[Item, ...]
+
+    return SourceVersion, Item, Holder
+
+
+def _holder_in(form, Holder, Item, items_view):
+    """The same holder as a model (stored values) or as a plain dict (the dictionary form)."""
+
+    if form == "model":
+        return Holder.model_construct(items=items_view)
+    return {"items": items_view}
+
+
+def _outcome(form, build_items, contract_holder):
+    from contracts_common import snapshot_contract_graph
+
+    _, Item, Holder = contract_holder
+    reads = {"outer": 0}
+    holder = _holder_in(form, Holder, Item, _GeneratedItems(lambda: (reads.__setitem__("outer", reads["outer"] + 1), iter(build_items()))[1]))
+    try:
+        snapshot = snapshot_contract_graph(holder, contract=Holder)
+        return ("snapshot", snapshot, reads["outer"])
+    except ValueError as error:
+        return ("refused", str(error), reads["outer"])
+
+
+@pytest.mark.parametrize("form", ["model", "dict"])
+def test_an_invalid_nested_entry_is_refused_at_once_in_both_forms(form) -> None:
+    contracts = _forms_contracts()
+    seen = {"nested_reads": 0}
+
+    class Endless(tuple):
+        def __iter__(self):
+            seen["nested_reads"] += 1
+            yield {"record_id": "s", "content_revision": -1, "policy_epoch": 1}  # invalid as yielded
+            for _ in range(10_000):
+                seen["nested_reads"] += 1
+                yield {"record_id": "s", "content_revision": 1, "policy_epoch": 1}
+
+    def items():
+        return [{"label": "a", "versions": Endless()}]
+
+    kind, detail, _ = _outcome(form, items, contracts)
+    assert kind == "refused" and "not valid" in detail
+    assert seen["nested_reads"] <= 2  # the read stopped at the invalid first entry, it did not drain 10,000 more
+
+
+def test_dictionary_and_model_forms_give_the_same_snapshot_for_a_valid_input() -> None:
+    contracts = _forms_contracts()
+    items = lambda: [{"label": "a", "versions": ({"record_id": "s", "content_revision": 1, "policy_epoch": 1},)}] * 2
+    model = _outcome("model", items, contracts)
+    plain = _outcome("dict", items, contracts)
+    assert model[0] == plain[0] == "snapshot" and model[1] == plain[1]
+
+
+@pytest.mark.parametrize("form", ["model", "dict"])
+def test_the_same_item_yielded_twice_keeps_each_occurrences_nested_view(form) -> None:
+    """The item's public view reports revision 4 the first time it is read and 5 the second: two entries, not one."""
+
+    contracts = _forms_contracts()
+
+    class Occurrence:
+        reads = 0
+
+    class Reports(tuple):
+        def __iter__(self):
+            Occurrence.reads += 1
+            return iter([{"record_id": "s", "content_revision": 3 + Occurrence.reads, "policy_epoch": 1}])
+
+    item = {"label": "a", "versions": Reports()}
+    Occurrence.reads = 0
+    kind, snapshot, _ = _outcome(form, lambda: [item, item], contracts)
+    assert kind == "snapshot"
+    revisions = [entry["versions"][0]["content_revision"] for entry in snapshot["items"]]
+    assert revisions == [4, 5]  # the conflict between the two positions is visible to the receiving validation
+
+
+def _dict_shaped_item_twice_with_flipping_versions(revisions, item_form):
+    """``selected_items`` is a public view yielding the same item twice; the item's nested views report ``revisions`` in turn."""
+
+    from contracts_references import SourceVersion
+
+    request, bundle = _matching_pair()
+    item = bundle.selected_items[0]
+    stored = dict(_STORED(item, BaseModel))
+
+    class Occurrence:
+        number = 0
+
+    class ByOccurrence(tuple):
+        def __iter__(self):
+            revision = revisions[min(Occurrence.number, len(revisions) - 1)]
+            return iter([{"record_id": "source-a", "content_revision": revision, "policy_epoch": 2}])
+
+    def flipping(value):
+        return ByOccurrence(value)
+
+    stored["source_versions"] = flipping(stored["source_versions"])
+    freshness = dict(_STORED(stored["freshness"], BaseModel))
+    projection = dict(_STORED(freshness["projection"], BaseModel))
+    projection["applied_sources"] = flipping(projection["applied_sources"])
+    freshness["projection"] = projection
+    stored["freshness"] = freshness
+    if item_form == "dict":
+        entry = {**stored, "freshness": {**freshness, "projection": projection}}
+    else:
+        entry = type(item).model_construct(**{**stored, "freshness": type(item.freshness).model_construct(**{**freshness, "projection": type(item.freshness.projection).model_construct(**projection)})})
+
+    class Twice(tuple):
+        def __new__(cls):
+            return super().__new__(cls, ())
+
+        def __iter__(self):
+            Occurrence.number = 0
+            yield entry
+            Occurrence.number = 1
+            yield entry
+
+    dict.__setitem__(_STORED(bundle, BaseModel), "selected_items", Twice())
+    return bundle_matches_reported_evidence(request, bundle)
+
+
+@pytest.mark.parametrize("item_form", ["model", "dict"])
+def test_a_repeated_item_in_either_shape_cannot_hide_a_conflict_between_its_positions(item_form) -> None:
+    assert _dict_shaped_item_twice_with_flipping_versions([4, 4], item_form) is True
+    assert _dict_shaped_item_twice_with_flipping_versions([4, 5], item_form) is False
+    assert _dict_shaped_item_twice_with_flipping_versions([5, 4], item_form) is False
+
+
+def test_a_dictionary_using_a_field_alias_gets_the_fields_declared_entry_model() -> None:
+    from pydantic import AliasChoices, Field
+
+    from contracts_common import ContractModel, snapshot_contract_graph
+    from contracts_references import SourceVersion
+
+    class Aliased(ContractModel):
+        versions: tuple[SourceVersion, ...] = Field(validation_alias="v")
+
+    reads = {"n": 0}
+
+    class Endless(tuple):
+        def __iter__(self):
+            reads["n"] += 1
+            yield {"record_id": "s", "content_revision": -1, "policy_epoch": 1}
+            for _ in range(10_000):
+                reads["n"] += 1
+                yield {"record_id": "s", "content_revision": 1, "policy_epoch": 1}
+
+    with pytest.raises(ValueError, match="not valid"):
+        snapshot_contract_graph({"v": Endless()}, contract=Aliased)
+    assert reads["n"] <= 2
+
+
+def test_str_subclass_and_unknown_keys_get_no_declared_contract() -> None:
+    from contracts_common import snapshot_contract_graph
+
+    _, Item, Holder = _forms_contracts()
+
+    class LoudKey(str):
+        hooks = 0
+
+        def __hash__(self):
+            LoudKey.hooks += 1
+            return str.__hash__(self)
+
+    snapshot = snapshot_contract_graph({LoudKey("items"): (), "other": 1}, contract=Holder)
+    assert snapshot == {"items": (), "other": 1}
