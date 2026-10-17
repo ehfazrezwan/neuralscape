@@ -142,19 +142,20 @@ def _declared_metadata(
 ) -> tuple[set[object], dict[str, set[str]], bool]:
     """``(declared names, alias owners, pure)`` of ``model_type`` for this call.
 
-    Read without hooks from the class's own namespaces, charged as scanned, and kept for the rest of the
-    call when that reading ran no caller code (the class stays alive with it), so N instances of one class
-    cost one scan, not N.  Impure metadata (read through the class, or through storage or keys that can run
+    Read without hooks from the class's own namespaces, charged as scanned, and kept while no caller code has
+    run since (the class stays alive with it), so N instances of one class cost one scan, not N, unless a
+    callback between them could have changed the class.  Impure metadata (read through the class, or through storage or keys that can run
     code) is not kept: it is read, and charged, again for every instance, so each occurrence observes it.
     A declared name that is not text is never hashed and makes the metadata impure.
     """
 
     cached = inventory.metadata.get(id(model_type))
-    if cached is not None and cached[0] is model_type:
+    if cached is not None and cached[0] is model_type and cached[4] == inventory.impure_reads:
         return cached[1], cached[2], cached[3]
     budget = inventory.budget
     declared_fields, config, metadata_pure = _model_metadata(model_type, budget)
     declared_names: set[object] = set()
+    budget.charge_edge(dict.__len__(declared_fields))  # every declared field scanned is charged
     for name in dict.keys(declared_fields):
         if _is_subclass(type(name), str):
             declared_names.add(_text(name))
@@ -163,7 +164,9 @@ def _declared_metadata(
     alias_owners, aliases_pure = _validation_alias_owners(declared_fields, config, budget)
     pure = metadata_pure and aliases_pure
     if pure:  # only metadata whose reading ran no caller code is kept; impure metadata is read on every edge
-        inventory.metadata[id(model_type)] = (model_type, declared_names, alias_owners, pure)
+        # Kept only until caller code next runs (``impure_reads`` moves): a hook-free read does not make the
+        # class immutable, and a callback may change its configuration before the next instance.
+        inventory.metadata[id(model_type)] = (model_type, declared_names, alias_owners, pure, inventory.impure_reads)
     return declared_names, alias_owners, pure
 
 
@@ -189,6 +192,7 @@ def _validation_alias_owners(
         return {}, pure
 
     owners: dict[str, set[str]] = {}
+    budget.charge_edge(dict.__len__(fields))  # this walk scans every declared field again: charged again
     for field_name, field in dict.items(fields):
         if not _is_subclass(type(field_name), str):
             pure = False  # a non-text name can hash or compare through caller code: never hashed, never reused
@@ -345,7 +349,7 @@ class _GraphInventory:
     # object and alias its captured contents.
     retained: list[object] = field(default_factory=list)
     # Hook-free model metadata per class for this call: ``id -> (class, declared names, alias owners, pure)``.
-    metadata: dict[int, tuple[type, set[object], dict[str, set[str]], bool]] = field(default_factory=dict)
+    metadata: dict[int, tuple[type, set[object], dict[str, set[str]], bool, int]] = field(default_factory=dict)
     # Completed reconstructions of pure subtrees, keyed by identity:
     # ``(object, copy, height)``.  A descendant shared by many paths is rebuilt once
     # and shared; ``height`` keeps the depth limit enforced on every path.

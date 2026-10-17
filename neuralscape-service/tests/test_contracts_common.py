@@ -3973,3 +3973,68 @@ def test_a_non_text_key_among_the_declared_fields_runs_no_hook_and_cannot_skew_l
     model = Declared()
     dict.__setitem__(vars(Declared)["__pydantic_fields__"], HookedKey(), vars(Declared)["__pydantic_fields__"]["a"])
     _assert_consistent(counter, model)
+
+
+# ── cached class metadata is not reused across caller code, and the declared-field scans are charged ──
+
+
+def test_metadata_changed_by_caller_code_between_two_instances_is_read_again() -> None:
+    from collections.abc import Mapping
+
+    from pydantic import ConfigDict, Field
+
+    class Aliased(BaseModel):
+        model_config = ConfigDict(validate_by_alias=False, validate_by_name=True, extra="allow")
+        a: int = Field(1, validation_alias="alias_a")
+
+    config = vars(Aliased)["model_config"]
+
+    class Flipping(Mapping):  # a carrier's extra storage: its view runs while the graph is rebuilt
+        def __getitem__(self, key):
+            raise KeyError(key)
+
+        def __iter__(self):
+            return iter(())
+
+        def __len__(self):
+            return 0
+
+        def items(self):
+            dict.__setitem__(config, "validate_by_alias", True)  # the alias is active from now on
+            return iter(())
+
+    first = Aliased()
+    carrier = Aliased()
+    vars(BaseModel)["__pydantic_extra__"].__set__(carrier, Flipping())
+    second = Aliased()
+    vars(BaseModel)["__dict__"].__get__(second, BaseModel)["alias_a"] = 2  # an active alias root, stored
+
+    with pytest.raises(ValueError, match="conflicting declared and extra fields"):
+        snapshot_contract_graph([first, carrier, second])
+    dict.__setitem__(config, "validate_by_alias", True)
+    with pytest.raises(ValueError, match="conflicting declared and extra fields"):
+        snapshot_contract_graph(second)  # the same instance alone is refused
+
+
+def test_declared_field_scans_are_charged_to_the_shared_budget() -> None:
+    from pydantic import create_model
+
+    Many = create_model("Many", **{f"f{index}": (int, 0) for index in range(2_000)})
+
+    class NonText:
+        def __hash__(self):
+            return 11
+
+        def __eq__(self, other):
+            return self is other
+
+    fields = vars(Many)["__pydantic_fields__"]
+    dict.__setitem__(fields, NonText(), fields["f0"])  # impure metadata: read again for every occurrence
+
+    def sparse():
+        instance = Many()
+        vars(BaseModel)["__dict__"].__get__(instance, BaseModel).clear()  # almost no captured storage
+        return instance
+
+    with pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):
+        snapshot_contract_graph([sparse() for _ in range(200)])
