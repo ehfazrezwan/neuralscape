@@ -599,15 +599,12 @@ def _expanded_size(native: Any, budget: DiscoveryBudget, memo: dict[Any, Any]) -
     while pending:
         value, expanded = pending.pop()
         kind = type(value)
-        if kind is dict:
-            children = tuple(dict.values(value))
-        elif kind is list or kind is tuple:
-            children = tuple(value)
-        else:
+        if kind is not dict and kind is not list and kind is not tuple:
             continue
+        if not expanded and known(value) is not None:
+            continue  # sized already: never copy its children again (N references to one wide list)
+        children = tuple(dict.values(value)) if kind is dict else tuple(value)
         if not expanded:
-            if known(value) is not None:
-                continue
             pending.append((value, True))
             pending.extend((child, False) for child in children if known(child) is None)
             continue

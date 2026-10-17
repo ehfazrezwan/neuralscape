@@ -2013,3 +2013,16 @@ def test_a_non_text_key_in_native_storage_is_refused_without_running_its_hooks()
     with pytest.raises(ValueError, match="keys must be text"):
         validate_generation_result(request, result)
     assert _ImpostorKey.hooks == []
+
+
+def test_many_references_to_one_wide_list_are_sized_once():
+    """40,000 references to one 40,000-element list: the size memo is consulted before the list is copied."""
+
+    import time
+
+    wide = list(range(40_000))
+    request, result = _generation_with_output({"v": [wide] * 40_000}, v={"type": "array"})
+    started = time.monotonic()
+    with pytest.raises(ValueError):
+        validate_generation_result(request, result)
+    assert time.monotonic() - started < 1.5
