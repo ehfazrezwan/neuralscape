@@ -56,11 +56,16 @@ _TYPE_MRO = vars(type)["__mro__"]
 _TYPE_NAME = vars(type)["__name__"]  # a class's name, read without any metaclass hook
 
 
-def _type_name(value: object) -> str:
-    """The name of ``value``'s class as exact text: a class may be named by a ``str`` subclass, whose
-    ``__format__``/``__str__`` would otherwise run when the name is interpolated."""
+_MAX_TYPE_NAME = 200  # a class name is caller-controlled: a diagnostic quotes at most this much of it
 
-    return str.__str__(_TYPE_NAME.__get__(type(value)))
+
+def _type_name(value: object) -> str:
+    """The name of ``value``'s class as exact, bounded text: a class may be named by a ``str`` subclass,
+    whose ``__format__``/``__str__`` would otherwise run when the name is interpolated, and by a name of
+    any length."""
+
+    name = str.__str__(_TYPE_NAME.__get__(type(value)))
+    return name if len(name) <= _MAX_TYPE_NAME else name[:_MAX_TYPE_NAME] + "..."
 
 
 def _inherits(cls: type, base: type) -> bool:
