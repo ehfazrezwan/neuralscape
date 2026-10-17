@@ -417,20 +417,11 @@ def pin_native_snapshot(snapshot: object) -> object:
     are exact ``dict``, ``list`` and ``tuple`` (``require_native_snapshot`` has checked that).
     """
 
-    order: list[object] = []
-    seen: set[int] = set()
-    stack = [snapshot]
-    while stack:
-        node = stack.pop()
-        kind = type(node)
-        if kind not in _NATIVE_CONTAINERS or id(node) in seen:
-            continue
-        seen.add(id(node))
-        order.append(node)
-        stack.extend(dict.values(node) if kind is dict else node)  # type: ignore[arg-type]
     rebuilt: dict[int, object] = {}
-
     pinned: dict[int, tuple[object, object]] = {}  # one datetime object, however often it appears, is read once
+
+    def is_container(kind: type) -> bool:
+        return kind is dict or kind is list or kind is tuple  # identity: no class's __eq__ is consulted
 
     def leaf(value: object) -> object:
         kind = type(value)
@@ -439,11 +430,25 @@ def pin_native_snapshot(snapshot: object) -> object:
             if known is None:
                 known = pinned[id(value)] = (value, pin_datetime(value))  # the original stays alive: no id reuse
             return known[1]
-        return rebuilt.get(id(value), value) if kind in _NATIVE_CONTAINERS else value
+        return rebuilt.get(id(value), value) if is_container(kind) else value
 
-    for node in reversed(order):  # children before their parents
+    # A true post-order: a container is rebuilt only after every container beneath it, whichever parent
+    # reaches it first, so each reference to a shared container gets the one rebuilt copy.
+    stack: list[tuple[object, bool]] = [(snapshot, False)]
+    entered: set[int] = set()
+    while stack:
+        node, children_done = stack.pop()
         kind = type(node)
-        if kind is dict:
+        if not is_container(kind) or id(node) in rebuilt:
+            continue
+        if not children_done:
+            if id(node) in entered:
+                continue  # already being expanded (a shared node, or a cycle: never expanded twice)
+            entered.add(id(node))
+            stack.append((node, True))
+            children = dict.values(node) if kind is dict else node  # type: ignore[arg-type]
+            stack.extend((child, False) for child in children if is_container(type(child)))
+        elif kind is dict:
             rebuilt[id(node)] = {key: leaf(item) for key, item in dict.items(node)}
         elif kind is list:
             rebuilt[id(node)] = [leaf(item) for item in node]  # type: ignore[attr-defined]

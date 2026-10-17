@@ -423,3 +423,30 @@ def test_ordering_two_datetimes_refuses_a_zone_that_stops_answering() -> None:
     zone = _StopsAnswering(0)
     with pytest.raises(ValueError):
         _instant_after(datetime(*_NOON, tzinfo=zone), datetime(*_EVENING, tzinfo=UTC))
+
+
+# ---- shared containers
+def test_a_datetime_in_a_container_shared_by_two_parents_is_pinned_on_every_path() -> None:
+    zone = FlappingZone(timedelta(0), timedelta(hours=9))
+    shared = [datetime(*_NOON, tzinfo=zone)]
+    zone.arm()
+    pinned = pin_native_snapshot({"a": {"k": shared}, "b": {"k": shared}})
+    assert pinned["a"]["k"] is pinned["b"]["k"]  # the sharing is kept
+    assert type(pinned["a"]["k"][0].tzinfo) is timezone and zone.reads == 1
+
+
+def test_a_shared_container_reached_before_its_other_parent_is_pinned_on_both_paths() -> None:
+    zone = FlappingZone(timedelta(0), timedelta(hours=9))
+    shared = {"when": datetime(*_NOON, tzinfo=zone)}
+    zone.arm()
+    pinned = pin_native_snapshot({"a": [shared], "b": shared})
+    for found in (pinned["a"][0]["when"], pinned["b"]["when"]):
+        assert type(found) is datetime and type(found.tzinfo) is timezone
+    assert pinned["a"][0] is pinned["b"] and zone.reads == 1
+
+
+def test_pinning_a_snapshot_that_contains_itself_terminates() -> None:
+    loop: list[object] = [datetime(*_NOON, tzinfo=UTC)]
+    loop.append(loop)
+    pinned = pin_native_snapshot({"loop": loop})
+    assert type(pinned["loop"][0]) is datetime
