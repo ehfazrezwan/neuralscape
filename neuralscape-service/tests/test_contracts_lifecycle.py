@@ -2049,11 +2049,12 @@ def test_aggregate_boundary_freezes_later_nested_model_before_earlier_hook(
     ]
     assert attacked_diagnostics == ordinary_diagnostics
     assert ordinary_source.content_revision == -1
-    assert attacked_source.content_revision == 1
+    # the tuple's view runs after capture and repairs; a stored name's hooks never run at all
+    assert attacked_source.content_revision == (1 if trigger_kind == "tuple" else -1)
     assert NestedRepairingTuple.iteration_calls == (1 if trigger_kind == "tuple" else 0)
     if hostile_name is not None:
-        assert hostile_name.hash_calls == 2
-        assert hostile_name.equality_calls == 1
+        assert hostile_name.hash_calls == 0
+        assert hostile_name.equality_calls == 0
 
 
 @pytest.mark.parametrize("trigger_kind", ["tuple", "stored-name"])
@@ -2106,11 +2107,11 @@ def test_aggregate_boundary_preserves_invalid_root_before_earlier_hook(
         for error in attacked_error.value.errors()
     ]
     assert attacked_diagnostics == ordinary_diagnostics
-    assert attacked.request_digest == "sha256:repaired"
+    assert attacked.request_digest == ("sha256:repaired" if trigger_kind == "tuple" else "")
     assert NestedRepairingTuple.iteration_calls == (1 if trigger_kind == "tuple" else 0)
     if hostile_name is not None:
-        assert hostile_name.hash_calls == 2
-        assert hostile_name.equality_calls == 1
+        assert hostile_name.hash_calls == 0
+        assert hostile_name.equality_calls == 0
 
 
 @pytest.mark.parametrize("trigger_kind", ["tuple", "stored-name"])
@@ -2133,8 +2134,8 @@ def test_aggregate_boundary_accepts_benign_supported_subclasses(
 
     assert NestedRepairingTuple.iteration_calls == (1 if trigger_kind == "tuple" else 0)
     if benign_name is not None:
-        assert benign_name.hash_calls == 2
-        assert benign_name.equality_calls == 1
+        assert benign_name.hash_calls == 0
+        assert benign_name.equality_calls == 0
 
 
 @pytest.mark.parametrize(
@@ -2241,9 +2242,9 @@ def test_source_boundary_scalar_invalidity_remains_frozen_before_name_hook() -> 
         for error in attacked_error.value.errors()
     ]
     assert attacked_diagnostics == ordinary_diagnostics
-    assert attacked.content_revision == 1
-    assert hostile_name.hash_calls == 2
-    assert hostile_name.equality_calls == 1
+    assert attacked.content_revision == -1  # the stored name's hooks never run
+    assert hostile_name.hash_calls == 0
+    assert hostile_name.equality_calls == 0
 
 
 def test_source_boundary_captures_observed_before_expected_name_hook() -> None:
@@ -2270,9 +2271,9 @@ def test_source_boundary_captures_observed_before_expected_name_hook() -> None:
     assert attacked_error.value.errors(include_url=False) == (
         ordinary_error.value.errors(include_url=False)
     )
-    assert attacked_observed.content_revision == 3
-    assert hostile_name.hash_calls == 2
-    assert hostile_name.equality_calls == 1
+    assert attacked_observed.content_revision == -1  # the stored name's hooks never run
+    assert hostile_name.hash_calls == 0
+    assert hostile_name.equality_calls == 0
 
 
 def test_source_boundary_preserves_expected_error_before_observed_type() -> None:
@@ -2606,7 +2607,8 @@ def test_aggregate_boundary_rejects_declared_overlap_hidden_in_native_backing(
     field_name: str,
 ) -> None:
     command, receipts, target = receiving_graph_with_extra_target(target_name)
-    hidden = HiddenBackingDict({field_name: object()})
+    # a native value, so the overlap itself is what is refused (a non-native one is refused as such first)
+    hidden = HiddenBackingDict({field_name: "hidden"})
     object.__setattr__(target, "__pydantic_extra__", hidden)
 
     with pytest.raises(ValueError, match="conflicting stored contract field"):

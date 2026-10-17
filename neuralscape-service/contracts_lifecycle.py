@@ -8,7 +8,7 @@ projection.  Callers must establish those runtime properties separately.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from enum import Enum
 from collections.abc import Iterator
 from typing import Annotated, Any, Literal, TypeVar
@@ -48,21 +48,76 @@ _BASE_MODEL_EXTRA_DESCRIPTOR = vars(BaseModel)["__pydantic_extra__"]
 def _key_text(key: object) -> object:
     """A key's own text for comparison; a str subclass is read without running its hooks."""
 
-    return str.__str__(key) if issubclass(type(key), str) else key
+    if type(key) is str:
+        return key
+    return str.__str__(key) if _derives_from(type(key), (str,)) else key
 
 
 def _require_distinct_key_text(
     entries: tuple[tuple[object, object], ...],
+    captured_by_identity: dict[Any, Any],
+    budget: DiscoveryBudget,
 ) -> tuple[tuple[object, object], ...]:
-    """Refuse keys that spell one name, however their own hash and equality disagree."""
+    """The entries keyed by each key's exact text, refusing keys that spell one name.
+
+    The text is copied once here, at capture, so later uses (materialization, conflict checks) neither
+    copy nor hash the caller's key again, and a container keyed by text is as pure as one keyed by exact
+    strings.  One copy per key object (kept with its owner, so its id() is not recycled): containers
+    sharing a key share its text, whose hash is then computed once.  A key that is neither text nor an
+    exact native scalar is refused before it is hashed: hashing a caller's object would run its code (an
+    exact native key reaches validation, which refuses it).  An int's hash is not cached and costs its
+    size in every container holding it, so a large int key is charged by size before it is hashed.
+    """
 
     seen: set[object] = set()
-    for key, _ in entries:
-        text = _key_text(key)
+    keyed: list[tuple[object, object]] = []
+    for key, item in entries:
+        memo = None if type(key) is str else captured_by_identity.get((_KEY_TEXT, id(key)))
+        if type(key) is str:
+            text: object = key
+        elif memo is not None and memo[0] is key:
+            text = memo[1]  # this key's text, copied when it was first met: no walk of its class again
+        elif _is_text_key_class(type(key), captured_by_identity, budget):
+            text = _subclass_key_text(key, captured_by_identity)
+        elif _is_exact_native_kind(type(key)):
+            if type(key) is int:
+                budget.charge_edge(int.bit_length(key) >> 12)  # one edge per 4,096 bits hashed
+            text = key  # its hash is native; validation refuses a non-text key with its own message
+        else:
+            raise ValueError("contract mapping keys must be text")
         if text in seen:
             raise ValueError("contract mapping has colliding keys")
         seen.add(text)
-    return entries
+        keyed.append((text, item))
+    return tuple(keyed)
+
+
+def _subclass_key_text(key: object, captured_by_identity: dict[Any, Any]) -> str:
+    """A ``str``-subclass key's exact text, copied once per key object per call (kept with the key, so its
+    ``id()`` is not recycled): every container and every class scan holding the key shares the one copy."""
+
+    memo = captured_by_identity.get((_KEY_TEXT, id(key)))
+    if memo is not None and memo[0] is key:
+        return memo[1]
+    text = str.__str__(key)
+    captured_by_identity[(_KEY_TEXT, id(key))] = (key, text)
+    return text
+
+
+def _is_text_key_class(kind: type, captured_by_identity: dict[Any, Any], budget: DiscoveryBudget) -> bool:
+    """Whether a key class derives from ``str``, decided once per class per call and charged by its MRO.
+
+    Deriving from ``str`` cannot change during the call (CPython refuses a ``__bases__`` change across native
+    layouts), so the verdict is kept with the class (its ``id()`` is not recycled) for every later key."""
+
+    known = captured_by_identity.get((_KEY_CLASS, id(kind)))
+    if known is not None and known[0] is kind:
+        return known[1]
+    mro = _TYPE_MRO.__get__(kind)
+    budget.charge_edge(tuple.__len__(mro))
+    verdict = any(base is str for base in mro)
+    captured_by_identity[(_KEY_CLASS, id(kind))] = (kind, verdict)
+    return verdict
 
 
 class _CapturedGraph:
@@ -194,6 +249,286 @@ def _utc_instant_before(earlier: datetime, later: datetime) -> bool:
     return datetime.__sub__(later, _UTC_EPOCH) < datetime.__sub__(earlier, _UTC_EPOCH)
 
 
+_TYPE_MRO = type.__dict__["__mro__"]  # the real MRO, never a metaclass's answer
+_TYPE_NAMESPACE = type.__dict__["__dict__"]  # a class's own namespace, read without metaclass dispatch
+_NATIVE_LEAF_TYPES = (str, int, float, bytes, type(None), date, timedelta)
+
+
+def _derives_from(kind: type, bases: tuple[type, ...]) -> bool:
+    """Whether ``kind``'s real MRO holds one of ``bases``, by identity.
+
+    ``issubclass`` dispatches to the base's metaclass (``__subclasscheck__``), which an ABC answers from
+    registrations and caches keyed by the caller's class; the MRO read through ``type`` runs no hook.
+    """
+
+    return any(base is wanted for base in _TYPE_MRO.__get__(kind) for wanted in bases)
+
+
+_EXACT_NATIVE_KINDS = (str, int, float, bytes, bool, type(None), date, datetime, timedelta)
+
+
+def _detached_int_class(captured_by_identity: dict[Any, Any]) -> type:
+    """This call's marker class for a detached int subclass: methods all native, made once per call, so an
+    instance that escapes in an error never lends a later call a class the caller could have changed."""
+
+    marker = captured_by_identity.get(_DETACHED_INT)
+    if marker is None:
+        marker = type("DetachedInt", (int,), {"__slots__": (), "__module__": __name__})
+        captured_by_identity[_DETACHED_INT] = marker
+    return marker
+
+
+def _is_exact_native_kind(kind: type) -> bool:
+    """Whether ``kind`` is itself one of the native scalar types, by identity (never ``==``, which a
+    metaclass can answer)."""
+
+    return any(kind is native for native in _EXACT_NATIVE_KINDS)
+
+
+_NATIVE_BASES = (str, bytes, int, float, datetime, date, timedelta, type(None))  # most derived first
+
+
+def _namespace_value(namespace: Any, name: str, budget: DiscoveryBudget) -> object:
+    """The entry named ``name`` in a class namespace, found by scanning keys as exact text (charged).
+
+    A namespace can keep a ``str``-subclass key whose hash collides with ``name``: looking the name up
+    would call that key's ``__eq__``.  ``None`` when absent."""
+
+    budget.charge_edge(len(namespace))
+    for key, item in namespace.items():
+        # Only an exact-str key: the type machinery writes these names as exact strings, so a subclass key
+        # spelling the name (planted through a metaclass's __prepare__) is never the real entry.
+        if type(key) is str and key == name:
+            return item
+    return None
+
+
+_FIELDS = "fields"  # memo key prefix: one model class's declared field names, read natively once per call
+
+
+def _declared_field_names(model_type: type, captured_by_identity: dict[Any, Any], budget: DiscoveryBudget) -> frozenset:
+    """The declared field names of ``model_type``, read from the real MRO's namespaces, never through its
+    metaclass (``model_fields`` is an attribute read a caller's model metaclass would answer)."""
+
+    generation = _generation(captured_by_identity)
+    memo = captured_by_identity.get((_FIELDS, id(model_type)))
+    if memo is not None and memo[0] is model_type and memo[2] == generation:
+        return memo[1]
+    names: frozenset = frozenset()
+    for base in _TYPE_MRO.__get__(model_type):
+        fields = _namespace_value(_TYPE_NAMESPACE.__get__(base), "__pydantic_fields__", budget)
+        if type(fields) is dict:
+            budget.charge_edge(dict.__len__(fields))  # one edge per declared name read
+            # A subclass key's text comes from the per-key cache, so classes sharing one table share its copies.
+            names = frozenset(
+                key if type(key) is str else _subclass_key_text(key, captured_by_identity)
+                for key in dict.keys(fields)
+                if type(key) is str or _is_text_key_class(type(key), captured_by_identity, budget)
+            )
+            break
+    captured_by_identity[(_FIELDS, id(model_type))] = (model_type, names, generation)
+    return names
+
+
+_GRAPH_KIND = "graph-kind"  # memo key prefix: whether a class is a model, dict, list, tuple or a leaf
+
+
+def _graph_kind(kind: type, captured_by_identity: dict[Any, Any], budget: DiscoveryBudget) -> type | None:
+    """``BaseModel``, ``dict``, ``list`` or ``tuple`` when ``kind`` derives from it (in that order), else
+    ``None``; decided from the real MRO once per class and call, charged one edge per class in it before the
+    walk.  The answer cannot change within a call: CPython refuses a ``__bases__`` assignment that moves a
+    class between these instance layouts, so the memo needs no generation (a view stepping item by item would
+    otherwise re-walk the MRO per item).  Exact containers and exact native scalars need no walk."""
+
+    if kind is dict or kind is list or kind is tuple:
+        return kind
+    if _is_exact_native_kind(kind):
+        return None
+    memo = captured_by_identity.get((_GRAPH_KIND, id(kind)))
+    if memo is not None and memo[0] is kind:
+        return memo[1]
+    mro = _TYPE_MRO.__get__(kind)
+    budget.charge_edge(tuple.__len__(mro))
+    found = next((wanted for wanted in (BaseModel, dict, list, tuple) if any(base is wanted for base in mro)), None)
+    captured_by_identity[(_GRAPH_KIND, id(kind))] = (kind, found)
+    return found
+
+
+def _exact_native(value: object, base: type) -> object:
+    """An exact copy of a native scalar of a subclass, read through its native ``base``, so nothing of the
+    subclass (its methods, or a hook installed on it later) travels on from capture."""
+
+    if base is str:
+        return str.__str__(value)
+    if base is bytes:
+        return bytes.__bytes__(value)
+    if base is int:
+        return int.__int__(value)
+    if base is float:
+        return float.__float__(value)
+    if base is datetime:
+        fields = [descriptor.__get__(value) for descriptor in _DATE_FIELDS + _TIME_FIELDS]
+        return datetime(*fields, tzinfo=datetime.__dict__["tzinfo"].__get__(value),
+                        fold=datetime.__dict__["fold"].__get__(value))
+    if base is date:
+        return date(*(descriptor.__get__(value) for descriptor in _DATE_FIELDS))
+    if base is timedelta:
+        return timedelta(days=timedelta.__dict__["days"].__get__(value),
+                         seconds=timedelta.__dict__["seconds"].__get__(value),
+                         microseconds=timedelta.__dict__["microseconds"].__get__(value))
+    return value
+
+
+_MEMBERS = "members"  # memo key prefix: one enum class's member identities, indexed once per call
+_GENERATION = "generation"  # memo key: advanced whenever a public view has run caller code
+
+
+def _generation(captured_by_identity: dict[Any, Any]) -> int:
+    return captured_by_identity.get(_GENERATION, 0)
+
+
+def _is_declared_member(
+    value: object,
+    captured_by_identity: dict[Any, Any],
+    budget: DiscoveryBudget,
+) -> bool:
+    """Whether an enum instance is one of its class's declared members, read without any hook.
+
+    ``type(value).__members__`` is an attribute lookup on the enum's class, so a caller's enum metaclass
+    (its ``__getattribute__``, or a ``__members__`` it overrides) would run during capture and could change
+    a later value before that value is captured.  The member map is read from the class's own namespace
+    instead, and iterated with the base ``dict`` method.  It is indexed by identity once per class and
+    call, each member charged one edge before the index is built, so repeated leaves of a large enum do
+    not rescan it.  The index keeps the class and its members alive, so no indexed ``id()`` is recycled,
+    and holds only until caller code runs (a public view can change the class).
+    """
+
+    kind = type(value)
+    generation = _generation(captured_by_identity)
+    memo = captured_by_identity.get((_MEMBERS, id(kind)))
+    if memo is None or memo[0] is not kind or memo[3] != generation:
+        members = _namespace_value(_TYPE_NAMESPACE.__get__(kind), "_member_map_", budget)
+        if type(members) is dict:
+            budget.charge_edge(dict.__len__(members))
+            declared = tuple(dict.values(members))
+        else:
+            declared = ()
+        memo = (kind, declared, frozenset(id(member) for member in declared), generation)
+        captured_by_identity[(_MEMBERS, id(kind))] = memo
+    return id(value) in memo[2]
+
+
+_IMPERSONATION_HOOKS = ("__class__", "__getattribute__")
+_LONGEST_HOOK = max(map(len, _IMPERSONATION_HOOKS))  # a longer key cannot spell a hook name
+_TYPE_FLAGS = type.__dict__["__flags__"]
+_HEAP_TYPE = 1 << 9  # Py_TPFLAGS_HEAPTYPE: a class created by a class statement (or ``type(...)``)
+
+
+def _claims_another_class(kind: type, captured_by_identity: dict[Any, Any], budget: DiscoveryBudget) -> bool:
+    """Whether a class written in Python in ``kind``'s MRO defines ``__class__`` or ``__getattribute__``.
+
+    Those are the two ways an object answers ``isinstance`` with a class it is not, or redirects the
+    attribute reads validation makes (``__dict__``, the field set): a ``str`` subclass claiming a model
+    class would otherwise reach a model-typed position as a "scalar" and hand validation storage that
+    capture never traversed or charged.  Only heap types are inspected (the built-in types, whose own
+    slots define these names, are fixed); flags and namespaces are read natively, so no hook runs.
+    A namespace can keep a ``str``-subclass key whose hash collides with a hook name, so the names are not
+    looked up (that would call the stored key's ``__eq__``): every key is copied to exact text and
+    compared, and the scan is charged one edge per key; a subclass key's class is judged once per call (charged).
+    """
+
+    for base in _TYPE_MRO.__get__(kind):
+        if not _TYPE_FLAGS.__get__(base) & _HEAP_TYPE:
+            continue
+        namespace = _TYPE_NAMESPACE.__get__(base)
+        budget.charge_edge(len(namespace))
+        for key in namespace:
+            # Ruled out by its native length first: a subclass key's text is copied only when it could spell a
+            # hook name, so one long key inherited by many classes is never copied once per class.
+            if (
+                (type(key) is str or _is_text_key_class(type(key), captured_by_identity, budget))
+                and str.__len__(key) <= _LONGEST_HOOK
+                and str.__str__(key) in _IMPERSONATION_HOOKS
+            ):
+                return True
+    return False
+
+
+_HANDED_ENUMS = "handed-enums"  # memo key: enum members and detached ints handed out while a root materializes
+_DETACHED = "detached"  # memo key prefix: one scalar subclass leaf's exact copy, made once per call
+_DETACHED_INT = "detached-int"  # memo key: this call's marker class for a detached int subclass
+_LEAF_CLASS = "leaf-class"  # memo key prefix: one leaf class's verdict, decided once per call
+_DICT_READ_COST = "dict-read-cost"  # memo key prefix: edges one native __dict__ read of a class costs
+_DERIVES = "derives"  # memo key prefix: whether one class derives from one contract base, decided once per call
+_KEY_CLASS = "key-class"  # memo key prefix: whether one key class derives from str, decided once per call
+_KEY_TEXT = "key-text"  # memo key prefix: one str-subclass mapping key's exact text, copied once per call
+
+
+def _leaf_class_verdict(
+    kind: type,
+    captured_by_identity: dict[Any, Any],
+    budget: DiscoveryBudget,
+) -> object:
+    """Classify a leaf's class once per call: ``"enum"``, ``"refused"``, or its native scalar base type.
+
+    Every check walks the class's MRO, which a caller can make arbitrarily deep; the walk is charged one
+    edge per class in it and its verdict kept (with the class, so its ``id()`` is not recycled), so
+    repeated leaves of one class do not walk it again.  A verdict holds only until caller code runs:
+    a public view can give an admitted class a ``__class__`` claim before its next instance is captured.
+    """
+
+    generation = _generation(captured_by_identity)
+    memo = captured_by_identity.get((_LEAF_CLASS, id(kind)))
+    if memo is not None and memo[0] is kind and memo[2] == generation:
+        return memo[1]
+    mro = _TYPE_MRO.__get__(kind)
+    budget.charge_edge(tuple.__len__(mro))
+    if _claims_another_class(kind, captured_by_identity, budget):
+        verdict = "refused"
+    elif any(base is Enum for base in mro):
+        verdict = "enum"
+    else:
+        verdict = next((native for native in _NATIVE_BASES if any(base is native for base in mro)), "refused")
+    captured_by_identity[(_LEAF_CLASS, id(kind))] = (kind, verdict, generation)
+    return verdict
+
+
+def _native_leaf(
+    value: object,
+    captured_by_identity: dict[Any, Any],
+    budget: DiscoveryBudget,
+) -> object:
+    """Admit a leaf only when its real type is a native scalar, or an enum member by identity.
+
+    Validation reads any other object through its own attribute protocol: a proxy claiming a contract
+    class (``__class__``) would run caller code inside the validator, outside the discovery budget.
+    An enum instance built with ``str.__new__(Enum, value)`` is no member: every ``is`` test would
+    misjudge it.  Both are refused here, before validation sees them; no hook runs to decide.
+    """
+
+    verdict = _leaf_class_verdict(type(value), captured_by_identity, budget)
+    if verdict == "enum":
+        if not _is_declared_member(value, captured_by_identity, budget):
+            raise ValueError("an enum value must be a declared member of its enum")
+        return value
+    if verdict != "refused":
+        if _is_exact_native_kind(type(value)):
+            return value
+        # Detached: a hook installed on the subclass later never travels.  One copy per source object (kept
+        # with its owner, so its id() is not recycled), so repeated references cost a reference, not a copy.
+        memo = captured_by_identity.get((_DETACHED, id(value)))
+        if memo is not None and memo[0] is value:
+            return memo[1]
+        detached = _exact_native(value, verdict)
+        if verdict is int:
+            # A validator may read the type itself (a field that must be the native integer): the copy keeps
+            # "not an exact int" through a hook-free class of this call's own, never the caller's.
+            detached = _detached_int_class(captured_by_identity)(detached)
+        captured_by_identity[(_DETACHED, id(value))] = (value, detached)
+        return detached
+    raise ValueError("a contract value must be a native scalar, an enum member, a model or a container")
+
+
 def _cached_identity_capture(
     value: object,
     captured_by_identity: dict[Any, Any],
@@ -226,7 +561,8 @@ def _capture_native_contract_graph(
         budget = DiscoveryBudget()
     budget.charge_edge()
 
-    if issubclass(value_type, (BaseModel, dict, list, tuple)):
+    graph_kind = _graph_kind(value_type, captured_by_identity, budget)
+    if graph_kind is not None:
         identity = id(value)
         if identity in active_containers:
             return _CapturedBackReference(identity=identity, source=value)
@@ -236,7 +572,8 @@ def _capture_native_contract_graph(
         budget.visit(value, len(active_containers))
         active_containers.add(identity)
         try:
-            if issubclass(value_type, BaseModel):
+            if graph_kind is BaseModel:
+                budget.charge_edge(_dict_read_cost(value_type, captured_by_identity))
                 stored = _BASE_MODEL_DICT_DESCRIPTOR.__get__(value, BaseModel)
                 _reserve_entries(budget, dict.__len__(stored))
                 stored_entries = tuple(dict.items(stored))
@@ -249,7 +586,7 @@ def _capture_native_contract_graph(
                     malformed_extra = False
                 else:
                     extra_type = type(extra)
-                    malformed_extra = not issubclass(extra_type, dict)
+                    malformed_extra = not _derives_once(extra_type, dict, captured_by_identity, budget)
                     if not malformed_extra:
                         _reserve_entries(budget, len(stored_entries) + dict.__len__(extra))
                     extra_entries = (
@@ -269,7 +606,7 @@ def _capture_native_contract_graph(
                                 budget,
                             ),
                         )
-                        for key, item in _require_distinct_key_text(stored_entries)
+                        for key, item in _require_distinct_key_text(stored_entries, captured_by_identity, budget)
                     ),
                     extra_entries=tuple(
                         (
@@ -281,11 +618,11 @@ def _capture_native_contract_graph(
                                 budget,
                             ),
                         )
-                        for key, item in _require_distinct_key_text(extra_entries)
+                        for key, item in _require_distinct_key_text(extra_entries, captured_by_identity, budget)
                     ),
                     malformed_extra=malformed_extra,
                 )
-            elif issubclass(value_type, dict):
+            elif graph_kind is dict:
                 _reserve_entries(budget, dict.__len__(value))
                 entries = tuple(dict.items(value))
                 captured = _CapturedDict(
@@ -301,10 +638,10 @@ def _capture_native_contract_graph(
                                 budget,
                             ),
                         )
-                        for key, item in _require_distinct_key_text(entries)
+                        for key, item in _require_distinct_key_text(entries, captured_by_identity, budget)
                     ),
                 )
-            elif issubclass(value_type, list):
+            elif graph_kind is list:
                 _reserve_entries(budget, list.__len__(value))
                 native_items = tuple(list.__iter__(value))
                 captured = _CapturedList(
@@ -340,7 +677,7 @@ def _capture_native_contract_graph(
             return captured
         finally:
             active_containers.remove(identity)
-    return _CapturedLeaf(value)
+    return _CapturedLeaf(_native_leaf(value, captured_by_identity, budget))
 
 
 def _observed_public_view(
@@ -352,7 +689,7 @@ def _observed_public_view(
 
     def public_item(item: object) -> _CapturedGraph:
         item_type = type(item)
-        if issubclass(item_type, (BaseModel, dict, list, tuple)):
+        if _graph_kind(item_type, captured_by_identity, budget) is not None:
             frozen = _cached_identity_capture(item, captured_by_identity)
             if frozen is not None:
                 # A cache hit is still one public item read: charged, so a view that keeps
@@ -365,7 +702,7 @@ def _observed_public_view(
                 budget=budget,
             )
         budget.charge_edge()
-        return _CapturedLeaf(item)
+        return _CapturedLeaf(_native_leaf(item, captured_by_identity, budget))
 
     memo = captured_by_identity.get(("view", id(source)))
     if memo is not None and memo[0] is source:
@@ -373,14 +710,19 @@ def _observed_public_view(
         return
     seen: list[_CapturedGraph] = []
     for item in source:  # type: ignore[attr-defined]
+        captured_by_identity[_GENERATION] = _generation(captured_by_identity) + 1  # caller code ran
         frozen = public_item(item)
         seen.append(frozen)
         yield frozen
+    captured_by_identity[_GENERATION] = _generation(captured_by_identity) + 1
     captured_by_identity[("view", id(source))] = (source, tuple(seen))
 
 
 _MATERIALIZED = "materialized"  # memo key prefix: the finished copy of a pure native container
 _REUSED = "reused"  # memo key: set once a copy nesting containers was shared between paths
+_COPY_MEMBERS = "copy-members"  # memo key: every enum member inside this call's pure copies, by identity
+_COPY_MEMBERS_JUDGED = "copy-members-judged"  # memo key: the generation the whole registry was last judged in
+_ROOT_REUSED_MEMBERS = "root-reused-members"  # memo key: the current root reused a copy holding members
 
 
 def _remember_pure_copy(
@@ -395,13 +737,21 @@ def _remember_pure_copy(
     pure containers themselves, so rebuilding it on another path runs no caller code and gives
     the same copy.  The subtree's height is kept so a later path is still depth-checked, and its
     expanded size (every entry on every path through it) so a later path is charged for the work
-    strict validation does there.
+    strict validation does there.  Whether the subtree holds enum members is kept too; the members
+    themselves go once into the call's registry (by identity, never hashed), not into every ancestor's
+    entry, so a later path reusing the copy after caller code ran can judge them again.
     """
 
     height = 0
     size = len(children)
+    has_members = False
     for child in children:
         if isinstance(child, _CapturedLeaf):
+            if not _is_exact_native_kind(type(child.value)):
+                # An enum member or a detached int (materialization admits no other leaf), just judged.
+                registry = captured_by_identity.setdefault(_COPY_MEMBERS, {})
+                registry[id(child.value)] = child.value
+                has_members = True
             continue
         if not isinstance(child, (_CapturedDict, _CapturedList, _CapturedTuple)):
             return
@@ -410,7 +760,51 @@ def _remember_pure_copy(
             return
         height = max(height, entry[2] + 1)
         size += entry[3]
-    captured_by_identity[(_MATERIALIZED, value.identity)] = (value.source, result, height, size)
+        has_members = has_members or entry[4]
+    captured_by_identity[(_MATERIALIZED, value.identity)] = (value.source, result, height, size, has_members)
+
+
+def _judge_copy_members(captured_by_identity: dict[Any, Any], budget: DiscoveryBudget) -> None:
+    """Judge every enum member kept in this call's pure copies again, once per generation (charged).
+
+    The registry can hold members of copies the current path does not reuse: one changed member class is
+    caller code tampering with this call, so refusing for it fails closed."""
+
+    generation = _generation(captured_by_identity)
+    if captured_by_identity.get(_COPY_MEMBERS_JUDGED) == generation:
+        return
+    registry = captured_by_identity.get(_COPY_MEMBERS, {})
+    budget.charge_edge(len(registry))
+    for leaf in tuple(registry.values()):
+        _judge_handed_leaf(leaf, captured_by_identity, budget)
+    captured_by_identity[_COPY_MEMBERS_JUDGED] = generation
+
+
+def _judge_handed_leaf(leaf: object, captured_by_identity: dict[Any, Any], budget: DiscoveryBudget) -> None:
+    """Refuse a leaf handed to validation as itself unless its class is still what admitted it.
+
+    An enum member must still belong to an enum class and be a declared member.  A detached int is an instance
+    of this call's marker class, a heap class that caller code can reach and change like any other, so the
+    marker must still be a plain int class (no claim to another class)."""
+
+    kind = type(leaf)
+    if kind is captured_by_identity.get(_DETACHED_INT):
+        if _leaf_class_verdict(kind, captured_by_identity, budget) is not int:
+            raise ValueError("a contract value must be a native scalar, an enum member, a model or a container")
+        return
+    if _leaf_class_verdict(type(leaf), captured_by_identity, budget) != "enum" or not _is_declared_member(
+        leaf, captured_by_identity, budget
+    ):
+        raise ValueError("a contract value must be a native scalar, an enum member, a model or a container")
+
+
+def _charge_int_key_hashes(entries: tuple[tuple[object, object], ...], budget: DiscoveryBudget) -> None:
+    """Charge the int keys a rebuild is about to hash, at capture's rate: an int's hash is not cached and costs its
+    size, and a container that is not reused as a pure copy is rebuilt (its keys hashed again) on every path."""
+
+    for key, _ in entries:
+        if type(key) is int:
+            budget.charge_edge(int.bit_length(key) >> 12)
 
 
 def _materialize_captured_graph(
@@ -434,7 +828,17 @@ def _materialize_captured_graph(
             resolved, captured_by_identity, active_containers, budget
         )
     if isinstance(value, _CapturedLeaf):
-        return value.value
+        leaf = value.value
+        kind = type(leaf)
+        if not _is_exact_native_kind(kind):
+            # Only an enum member (its identity is the value) or a detached int (this call's marker class) is
+            # kept as itself.  Caller code may have run since it was captured and changed its class, so the
+            # class (and an enum member's membership) is judged again, and again after the root if needed.
+            _judge_handed_leaf(leaf, captured_by_identity, budget)
+            handed = captured_by_identity.get(_HANDED_ENUMS)
+            if handed is not None:
+                handed.append(leaf)
+        return leaf
     identity = value.identity
     if identity in active_containers:
         raise ValueError("cyclic contract graph is not valid input")
@@ -452,15 +856,25 @@ def _materialize_captured_graph(
         # models share everywhere; its rendering does not grow, so it must not suppress a diagnostic.
         if reused[2] or reused[1]:
             captured_by_identity[_REUSED] = True
+        if reused[4]:
+            # Its members were judged when the copy was made; caller code that ran since may have changed
+            # their classes, so they are judged again (once per generation), and again after this root if a
+            # view materialized later in it moves the generation.
+            _judge_copy_members(captured_by_identity, budget)
+            if _HANDED_ENUMS in captured_by_identity:
+                captured_by_identity[_ROOT_REUSED_MEMBERS] = True
         return reused[1]
     budget.visit(value.source, len(active_containers))
     active_containers.add(identity)
     try:
         if isinstance(value, _CapturedModel):
-            stored_names = {key for key, _ in value.stored_entries}
-            declared_fields = value.model_type.model_fields
+            _charge_int_key_hashes(value.stored_entries, budget)
+            _charge_int_key_hashes(value.extra_entries, budget)
+            declared_fields = _declared_field_names(value.model_type, captured_by_identity, budget)
+            # Keys reach validation as their own text: a str subclass's hash and equality would
+            # otherwise decide which field a value fills (the text was checked distinct at capture).
             fields = {
-                key: _materialize_captured_graph(
+                _key_text(key): _materialize_captured_graph(
                     item,
                     captured_by_identity,
                     active_containers,
@@ -474,16 +888,12 @@ def _materialize_captured_graph(
                 )
             stored_texts = {_key_text(key) for key, _ in value.stored_entries}
             for key, item in value.extra_entries:
-                if (
-                    key in stored_names
-                    or key in declared_fields
-                    or _key_text(key) in stored_texts
-                    or _key_text(key) in declared_fields
-                ):
+                # Compared as exact text only: a stored key's own hash or equality never runs.
+                if _key_text(key) in stored_texts or _key_text(key) in declared_fields:
                     raise ValueError(
                         "conflicting stored contract field is not valid input"
                     )
-                fields[key] = _materialize_captured_graph(
+                fields[_key_text(key)] = _materialize_captured_graph(
                     item,
                     captured_by_identity,
                     active_containers,
@@ -491,8 +901,9 @@ def _materialize_captured_graph(
                 )
             return fields
         if isinstance(value, _CapturedDict):
+            _charge_int_key_hashes(value.entries, budget)
             built = {
-                key: _materialize_captured_graph(
+                _key_text(key): _materialize_captured_graph(
                     item,
                     captured_by_identity,
                     active_containers,
@@ -583,11 +994,49 @@ def _article(name: str) -> str:
     return "an" if name[:1] in "AEIOU" else "a"
 
 
+def _is_instance_by_type(value: object, model_type: type) -> bool:
+    """``isinstance`` by the object's real type: a ``__class__`` claim is never consulted."""
+
+    return _derives_from(type(value), (model_type,))
+
+
+def _dict_read_cost(kind: type, captured_by_identity: dict[Any, Any]) -> int:
+    """Edges to charge for reading one instance's native ``__dict__``: the descriptor finds the base that owns the
+    slot by walking the class chain in C (about 34 ns a class), so a deep model class makes every instance's read
+    cost its depth.  One edge per 64 classes (contract classes are far shallower and pay nothing); the MRO length
+    is read once per class per call."""
+
+    known = captured_by_identity.get((_DICT_READ_COST, id(kind)))
+    if known is not None and known[0] is kind:
+        return known[1]
+    cost = tuple.__len__(_TYPE_MRO.__get__(kind)) >> 6
+    captured_by_identity[(_DICT_READ_COST, id(kind))] = (kind, cost)
+    return cost
+
+
+def _derives_once(
+    kind: type, wanted: type, captured_by_identity: dict[Any, Any], budget: DiscoveryBudget | None
+) -> bool:
+    """``_derives_from`` for a check repeated per item (every receipt, every model with extras): decided once per
+    class per call, charged one edge per class in its MRO before the walk, and kept with the class (its ``id()``
+    is not recycled).  A class's bases cannot change across native layouts, so no generation is needed."""
+
+    known = captured_by_identity.get((_DERIVES, id(kind), id(wanted)))
+    if known is not None and known[0] is kind and known[2] is wanted:
+        return known[1]
+    mro = _TYPE_MRO.__get__(kind)
+    if budget is not None:
+        budget.charge_edge(tuple.__len__(mro))
+    verdict = any(base is wanted for base in mro)
+    captured_by_identity[(_DERIVES, id(kind), id(wanted))] = (kind, verdict, wanted)
+    return verdict
+
+
 def _captured_model(
     model_type: type[_ModelT],
     value: object,
 ) -> _CapturedGraphSnapshot:
-    if not isinstance(value, model_type):
+    if not _is_instance_by_type(value, model_type):
         raise TypeError(f"value must be {_article(model_type.__name__)} {model_type.__name__}")
     return _capture_contract_graph(value)
 
@@ -605,7 +1054,23 @@ def _revalidated_captured_model(
     Ordinary inputs keep the full diagnostic.
     """
 
-    native = _materialize_contract_graph(captured, budget)
+    memo = captured[1]
+    started = _generation(memo)
+    memo[_HANDED_ENUMS] = handed = []
+    memo[_ROOT_REUSED_MEMBERS] = False
+    try:
+        native = _materialize_contract_graph(captured, budget)
+    finally:
+        memo.pop(_HANDED_ENUMS, None)
+        reused_members = memo.pop(_ROOT_REUSED_MEMBERS, False)
+    if _generation(memo) != started:
+        # A view materialized after an enum leaf may have changed its class once that leaf was judged:
+        # judge every member handed out for this root again, before validation reads any of them.
+        check_budget = DiscoveryBudget() if budget is None else budget
+        for leaf in handed:
+            _judge_handed_leaf(leaf, memo, check_budget)
+        if reused_members:
+            _judge_copy_members(memo, check_budget)
     try:
         return model_type.model_validate(native, strict=True)
     except ValidationError as error:
@@ -631,7 +1096,7 @@ def _revalidated_inventory_model(
 ) -> _ModelT:
     """Validate a public-view item, reusing entry-time state when available."""
 
-    if not isinstance(value, model_type):
+    if not _derives_once(type(value), model_type, captured_by_identity, budget):
         raise TypeError(f"value must be {_article(model_type.__name__)} {model_type.__name__}")
     captured = _cached_identity_capture(value, captured_by_identity)
     if captured is None:
@@ -1019,7 +1484,7 @@ def source_versions_match(
 ) -> bool:
     """Require exact equality after deep validation of both version witnesses."""
 
-    if not isinstance(expected, SourceVersion):
+    if not _is_instance_by_type(expected, SourceVersion):
         raise TypeError("value must be a SourceVersion")
     budget = DiscoveryBudget()  # one envelope for both witnesses
     shared: dict[Any, Any] = {}  # and one observation of any view they share
@@ -1030,7 +1495,7 @@ def source_versions_match(
         captured_expected = None
         expected_capture_error = exc
 
-    if isinstance(observed, SourceVersion):
+    if _is_instance_by_type(observed, SourceVersion):
         try:
             captured_observed = _capture_contract_graph(observed, None, budget, shared)
             observed_capture_error: Exception | None = None
@@ -1068,10 +1533,10 @@ def _revalidated_claim_inputs(
     stores is always one the claim can read.  Public views are observed once per call.
     """
 
-    if not isinstance(receipts, tuple):
+    if not _is_instance_by_type(receipts, tuple):
         raise TypeError("receipts must be a tuple")
 
-    if not isinstance(intent, Intent):
+    if not _is_instance_by_type(intent, Intent):
         raise TypeError("value must be an Intent")
     budget = DiscoveryBudget(LIFECYCLE_TIER)  # one envelope for the intent and every receipt
     receipt_inventory: dict[Any, Any] = {}  # and one observation of any view they share
@@ -1093,7 +1558,7 @@ def _revalidated_claim_inputs(
             budget.charge_edge()
         except ValueError:
             break
-        if not issubclass(type(receipt), StageReceipt):
+        if not _derives_once(type(receipt), StageReceipt, receipt_inventory, budget):
             continue
         identity = id(receipt)
         if identity in receipt_inventory or identity in receipt_capture_errors:
@@ -1115,7 +1580,7 @@ def _revalidated_claim_inputs(
 
     def revalidate_receipt(receipt: object) -> StageReceipt:
         capture_error = receipt_capture_errors.get(id(receipt))
-        if capture_error is not None and isinstance(receipt, StageReceipt):
+        if capture_error is not None and _derives_once(type(receipt), StageReceipt, receipt_inventory, budget):
             raise capture_error
         return _revalidated_inventory_model(
             StageReceipt,
@@ -1237,8 +1702,10 @@ def validate_required_stage_claim(
     retry exhaustion, or select a runtime retry policy.
     """
 
-    if not isinstance(claimed_status, IntentStatus):
-        raise TypeError("claimed_status must be an IntentStatus")
+    if not is_exact_type(claimed_status, IntentStatus) or not any(
+        claimed_status is member for member in IntentStatus
+    ):
+        raise TypeError("claimed_status must be an IntentStatus member")
     intent, receipts = _revalidated_claim_inputs(intent, receipts)
 
     requirements = {item.stage: item for item in intent.stage_requirements}
@@ -1447,6 +1914,19 @@ def _settled_aggregate(
     return IntentStatus.PARTIAL
 
 
+def _same_source_version(expected: SourceVersion, observed: SourceVersion) -> bool:
+    """Equality of two source versions the claim has already strictly revalidated (exact values).
+
+    The public ``source_versions_match`` re-captures and re-validates under a fresh budget, which here
+    would only repeat work outside the call's envelope."""
+
+    return (
+        expected.record_id == observed.record_id
+        and expected.content_revision == observed.content_revision
+        and expected.policy_epoch == observed.policy_epoch
+    )
+
+
 def _source_sets_match(
     expected: tuple[SourceVersion, ...],
     observed: tuple[SourceVersion, ...],
@@ -1456,7 +1936,7 @@ def _source_sets_match(
     observed_by_id = {item.record_id: item for item in observed}
     return len(observed_by_id) == len(observed) and all(
         source.record_id in observed_by_id
-        and source_versions_match(source, observed_by_id[source.record_id])
+        and _same_source_version(source, observed_by_id[source.record_id])
         for source in expected
     )
 
@@ -1479,9 +1959,11 @@ def _reference_sets_match(
 def _require_unique_reference_handles(
     references: tuple[ReferenceHandle, ...], field: str
 ) -> None:
+    # Two handles naming one record are duplicates whatever their cross_tenant marker: a list may not hold one
+    # record twice, marked and unmarked.
     seen: set[tuple[str, str, str, str]] = set()
     for reference in references:
-        key = _reference_identity_key(reference)
+        key = _reference_identity_key(reference)[:4]
         if key in seen:
             raise ValueError(f"{field} must not contain duplicate handles")
         seen.add(key)
@@ -1489,12 +1971,15 @@ def _require_unique_reference_handles(
 
 def _reference_identity_key(
     reference: ReferenceHandle,
-) -> tuple[str, str, str, str]:
+) -> tuple[str, str, str, str, bool]:
+    """Every field of a handle, the cross_tenant marker included: a marked handle is not the unmarked one."""
+
     return (
         reference.kind,
         reference.id,
         reference.tenant_id,
         reference.resolver,
+        reference.cross_tenant,
     )
 
 

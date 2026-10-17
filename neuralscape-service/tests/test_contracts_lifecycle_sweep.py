@@ -24,6 +24,7 @@ from contracts_lifecycle import (
     Intent,
     IntentStatus,
     ProcessingStage,
+    StageError,
     StageReceipt,
     StageStatus,
     source_versions_match,
@@ -115,6 +116,233 @@ def test_a_spoofed_source_version_is_refused_on_either_side():
         source_versions_match(Spoof(invalid, SourceVersion), source("m"))
     with pytest.raises((TypeError, ValueError)):
         source_versions_match(source("m"), Spoof(invalid, SourceVersion))
+
+
+def test_a_spoof_of_a_valid_contract_is_refused_at_every_entry():
+    """``isinstance`` honours ``__class__``: a proxy of a valid model must not stand in for one."""
+
+    from tests.test_contracts_lifecycle import intent_with_requirements, requirement
+
+    command = intent_with_requirements(requirement(ProcessingStage.CANONICAL))
+    applied = receipt(ProcessingStage.CANONICAL, StageStatus.APPLIED)
+    validate_required_stage_claim(claimed_status=IntentStatus.APPLIED, intent=command, receipts=(applied,))
+    for entry in (
+        lambda: contracts_lifecycle.validate_stage_receipts(Spoof(command, Intent), (applied,)),
+        lambda: contracts_lifecycle.validate_stage_receipts(command, (Spoof(applied, StageReceipt),)),
+        lambda: validate_required_stage_claim(
+            claimed_status=IntentStatus.APPLIED, intent=Spoof(command, Intent), receipts=(applied,)
+        ),
+        lambda: validate_required_stage_claim(
+            claimed_status=IntentStatus.APPLIED, intent=command, receipts=(Spoof(applied, StageReceipt),)
+        ),
+        lambda: contracts_lifecycle.validate_stage_receipts(command, Spoof((applied,), tuple)),
+        lambda: source_versions_match(Spoof(source("m"), SourceVersion), source("m")),
+        lambda: source_versions_match(source("m"), Spoof(source("m"), SourceVersion)),
+    ):
+        with pytest.raises(TypeError):
+            entry()
+
+
+def test_a_spoofed_receipt_cannot_carry_a_graph_past_the_claim_budget():
+    import time
+
+    from tests.test_contracts_lifecycle import intent_with_requirements, reference, requirement
+
+    command = intent_with_requirements(requirement(ProcessingStage.CANONICAL))
+    large = receipt(ProcessingStage.CANONICAL, StageStatus.APPLIED)
+    set_native(large, "output_refs", tuple(reference(f"o{i}") for i in range(70_000)))
+    with pytest.raises(ValueError, match=BUDGET):  # beyond the tier, read natively
+        validate_required_stage_claim(claimed_status=IntentStatus.APPLIED, intent=command, receipts=(large,))
+    started = time.monotonic()
+    with pytest.raises((TypeError, ValueError)):  # the proxy's own view is never read outside the budget
+        validate_required_stage_claim(
+            claimed_status=IntentStatus.APPLIED, intent=command, receipts=(Spoof(large, StageReceipt),)
+        )
+    assert time.monotonic() - started < 30
+
+
+class CountingSpoof:
+    """A proxy that claims ``cls`` and counts every attribute read made through it."""
+
+    def __init__(self, target, cls):
+        object.__setattr__(self, "_target", target)
+        object.__setattr__(self, "_cls", cls)
+        object.__setattr__(self, "reads", 0)
+
+    def __getattribute__(self, name):
+        if name in ("_target", "_cls", "reads"):
+            return object.__getattribute__(self, name)
+        object.__setattr__(self, "reads", object.__getattribute__(self, "reads") + 1)
+        if name == "__class__":
+            return object.__getattribute__(self, "_cls")
+        return getattr(object.__getattribute__(self, "_target"), name)
+
+
+@pytest.mark.parametrize("position", ["output_ref", "source_precondition", "stage_requirement", "upstream_witness"])
+def test_a_proxy_at_a_nested_position_is_refused_before_validation_reads_it(position):
+    """A nested proxy is not a native value: capture refuses it, so no caller hook runs inside validation."""
+
+    from contracts_lifecycle import StageEvidenceRequirement, UpstreamApplication
+    from contracts_references import ReferenceHandle
+    from tests.test_contracts_lifecycle import intent_with_requirements, reference, requirement
+
+    command = intent_with_requirements(requirement(ProcessingStage.CANONICAL))
+    applied = receipt(ProcessingStage.CANONICAL, StageStatus.APPLIED)
+    if position == "output_ref":
+        proxy = CountingSpoof(reference("o1"), ReferenceHandle)
+        set_native(applied, "output_refs", (proxy,))
+    elif position == "source_precondition":
+        proxy = CountingSpoof(command.source_preconditions[0], SourceVersion)
+        set_native(command, "source_preconditions", (proxy,) + command.source_preconditions[1:])
+    elif position == "stage_requirement":
+        proxy = CountingSpoof(command.stage_requirements[0], StageEvidenceRequirement)
+        set_native(command, "stage_requirements", (proxy,))
+    else:
+        witness = UpstreamApplication(intent_id=applied.intent_id, stage=ProcessingStage.CANONICAL, attempt=1, effect_id="e")
+        proxy = CountingSpoof(witness, UpstreamApplication)
+        set_native(applied, "upstream_applications", (proxy,))
+    with pytest.raises(ValueError, match="native"):
+        contracts_lifecycle.validate_stage_receipts(command, (applied,))
+    with pytest.raises(ValueError, match="native"):
+        validate_required_stage_claim(claimed_status=IntentStatus.APPLIED, intent=command, receipts=(applied,))
+    assert object.__getattribute__(proxy, "reads") == 0
+
+
+def test_a_proxy_yielded_by_a_public_view_is_refused_before_validation_reads_it():
+    """A tuple subclass's public view is read item by item: a yielded proxy is refused like a nested one."""
+
+    from contracts_references import ReferenceHandle
+    from tests.test_contracts_lifecycle import intent_with_requirements, reference, requirement
+
+    class View(tuple):
+        def __iter__(self):
+            yield proxy
+
+    command = intent_with_requirements(requirement(ProcessingStage.CANONICAL))
+    applied = receipt(ProcessingStage.CANONICAL, StageStatus.APPLIED)
+    proxy = CountingSpoof(reference("o1"), ReferenceHandle)
+    set_native(applied, "output_refs", View((reference("o1"),)))  # native backing is a real handle
+    with pytest.raises(ValueError, match="native"):
+        contracts_lifecycle.validate_stage_receipts(command, (applied,))
+    with pytest.raises(ValueError, match="native"):
+        validate_required_stage_claim(claimed_status=IntentStatus.APPLIED, intent=command, receipts=(applied,))
+    assert object.__getattribute__(proxy, "reads") == 0
+
+
+def test_the_receipts_and_model_entry_checks_decide_by_the_real_type():
+    """Pins the two entry checks no other test tells apart from ``isinstance``."""
+
+    from tests.test_contracts_lifecycle import intent_with_requirements, requirement
+
+    command = intent_with_requirements(requirement(ProcessingStage.CANONICAL))
+    applied = receipt(ProcessingStage.CANONICAL, StageStatus.APPLIED)
+    with pytest.raises(TypeError, match="receipts must be a tuple"):
+        contracts_lifecycle.validate_stage_receipts(command, Spoof((applied,), tuple))
+    with pytest.raises(TypeError, match="value must be an Intent"):
+        contracts_lifecycle._revalidated_model(Intent, Spoof(command, Intent))
+
+
+def test_a_noncanonical_enum_instance_is_refused_at_every_position():
+    """``str.__new__(Enum, value)`` is an instance of the enum but no member: identity tests would misjudge it."""
+
+    from tests.test_contracts_lifecycle import intent_with_requirements, requirement
+
+    command = intent_with_requirements(requirement(ProcessingStage.CANONICAL))
+    for field, odd in (
+        ("status", str.__new__(StageStatus, "applied")),
+        ("stage", str.__new__(ProcessingStage, "canonical")),
+    ):
+        applied = receipt(ProcessingStage.CANONICAL, StageStatus.APPLIED)
+        set_native(applied, field, odd)
+        with pytest.raises(ValueError, match="declared member"):
+            contracts_lifecycle.validate_stage_receipts(command, (applied,))
+        with pytest.raises(ValueError, match="declared member"):
+            validate_required_stage_claim(claimed_status=IntentStatus.PARTIAL, intent=command, receipts=(applied,))
+    odd_requirement = intent_with_requirements(requirement(ProcessingStage.CANONICAL))
+    set_native(odd_requirement.stage_requirements[0], "stage", str.__new__(ProcessingStage, "canonical"))
+    with pytest.raises(ValueError, match="declared member"):
+        validate_required_stage_claim(claimed_status=IntentStatus.ACCEPTED, intent=odd_requirement, receipts=())
+    applied = receipt(ProcessingStage.CANONICAL, StageStatus.APPLIED)
+    with pytest.raises(TypeError, match="claimed_status"):
+        validate_required_stage_claim(
+            claimed_status=str.__new__(IntentStatus, "applied"), intent=command, receipts=(applied,)
+        )
+    validate_required_stage_claim(claimed_status=IntentStatus.APPLIED, intent=command, receipts=(applied,))
+
+
+def test_native_scalars_and_their_subclasses_still_reach_validation():
+    """Only non-native leaves are refused: an int subclass or datetime subclass is still judged by validation."""
+
+    from tests.test_contracts_lifecycle import intent_with_requirements, requirement
+
+    command = intent_with_requirements(requirement(ProcessingStage.CANONICAL))
+    applied = receipt(ProcessingStage.CANONICAL, StageStatus.APPLIED)
+    set_native(applied, "attempt", type("Count", (int,), {})(1))
+    kept_intent, kept = contracts_lifecycle.validate_stage_receipts(command, (applied,))
+    assert kept[0].attempt == 1
+    late = receipt(ProcessingStage.CANONICAL, StageStatus.APPLIED)
+    set_native(late, "finished_at", Late(2000, 1, 1, tzinfo=timezone.utc))
+    with pytest.raises(ValueError, match="finished_at cannot precede started_at"):
+        contracts_lifecycle.validate_stage_receipts(command, (late,))
+
+
+class Alias(str):
+    """A key whose text names one field while its hash and equality name another."""
+
+    def __new__(cls, text, claimed):
+        made = str.__new__(cls, text)
+        made.claimed = claimed
+        return made
+
+    def __hash__(self):
+        return hash(self.claimed)
+
+    def __eq__(self, other):
+        return str.__eq__(self.claimed, other) if isinstance(other, str) else NotImplemented
+
+    def __ne__(self, other):
+        equal = self.__eq__(other)
+        return equal if equal is NotImplemented else not equal
+
+
+def alias_storage(stored, first, second):
+    """Keep each value under its own text, with the two keys' hash and equality swapped."""
+
+    first_value, second_value = stored[first], stored[second]
+    del stored[first]
+    del stored[second]
+    stored[Alias(first, second)] = first_value
+    stored[Alias(second, first)] = second_value
+
+
+def test_model_storage_keys_are_read_by_their_text_not_their_hash():
+    from tests.test_contracts_lifecycle import intent_with_requirements, requirement
+
+    command = intent_with_requirements(requirement(ProcessingStage.CANONICAL)).model_copy(
+        update={"actor_id": "tenant-evil"}
+    )
+    alias_storage(NATIVE_DICT.__get__(command, BaseModel), "tenant_id", "actor_id")
+    applied = receipt(ProcessingStage.CANONICAL, StageStatus.APPLIED)
+    effect = applied.effect_id
+    alias_storage(NATIVE_DICT.__get__(applied, BaseModel), "intent_id", "effect_id")
+    kept_intent, kept = contracts_lifecycle.validate_stage_receipts(command, (applied,))
+    assert (kept_intent.tenant_id, kept_intent.actor_id) == ("tenant-1", "tenant-evil")  # as the text says
+    assert kept[0].intent_id == kept_intent.id and kept[0].effect_id == effect
+    assert type(next(iter(NATIVE_DICT.__get__(kept_intent, BaseModel)))) is str
+
+
+def test_raw_mapping_keys_are_read_by_their_text_not_their_hash():
+    from tests.test_contracts_lifecycle import intent_with_requirements, requirement
+
+    command = intent_with_requirements(requirement(ProcessingStage.CANONICAL))
+    handle = {"kind": "artifact", "id": "tenant-1", "tenant_id": "other-tenant", "resolver": "resolve_artifact"}
+    alias_storage(handle, "id", "tenant_id")  # by text the handle names another tenant
+    applied = receipt(ProcessingStage.CANONICAL, StageStatus.APPLIED)
+    set_native(applied, "output_refs", (handle,))
+    with pytest.raises(ValueError, match="output_refs must match intent tenant_id"):
+        contracts_lifecycle.validate_stage_receipts(command, (applied,))
+    with pytest.raises(ValueError, match="output_refs must match intent tenant_id"):
+        validate_required_stage_claim(claimed_status=IntentStatus.APPLIED, intent=command, receipts=(applied,))
 
 
 # ---- str subclasses
@@ -703,3 +931,1668 @@ def test_the_ordered_pair_across_a_repeated_hour_is_accepted_natively_and_on_the
     wire = {**values, "stage": "canonical", "status": "skipped",
             "started_at": started.isoformat(), "finished_at": finished.isoformat()}
     StageReceipt.model_validate_json(json.dumps(wire))
+
+
+def test_enum_membership_is_read_without_metaclass_hooks_so_a_later_value_stays_frozen():
+    """A genuine member of a caller's enum whose metaclass hooks attribute reads must not let capture run them:
+    the hook would repair a later source's content revision before that source is frozen."""
+
+    import enum
+
+    from tests.test_contracts_lifecycle import intent_with_requirements, requirement
+
+    command = intent_with_requirements(requirement(ProcessingStage.CANONICAL))
+    later = command.source_preconditions[0]
+    armed = [False]
+    hooked: list[str] = []
+
+    class HookedMeta(type(enum.Enum)):
+        def __getattribute__(cls, name):
+            if armed[0] and name in ("__members__", "_member_map_", "_value2member_map_", "__iter__"):
+                hooked.append(name)
+                set_native(later, "content_revision", 1)
+            return super().__getattribute__(name)
+
+    class Digest(str, enum.Enum, metaclass=HookedMeta):  # creating the class reads its maps: not armed yet
+        ABC = "sha256:abc"
+
+    member = Digest.ABC
+    set_native(command, "request_digest", member)  # an early field, captured before the source
+    set_native(later, "content_revision", -1)  # invalid, and it must stay so
+    armed[0] = True
+    applied = receipt(ProcessingStage.CANONICAL, StageStatus.APPLIED)
+    with pytest.raises(ValueError):
+        contracts_lifecycle.validate_stage_receipts(command, (applied,))
+    with pytest.raises(ValueError):
+        validate_required_stage_claim(claimed_status=IntentStatus.APPLIED, intent=command, receipts=(applied,))
+    assert hooked == []
+
+
+def test_a_metaclass_that_claims_a_forged_instance_as_a_member_cannot_make_it_one():
+    """The member map is read from the class's own namespace, not from an overridable ``__members__``."""
+
+    import enum
+
+    from tests.test_contracts_lifecycle import intent_with_requirements, requirement
+
+    forged: list[object] = []
+
+    class ClaimingMeta(type(enum.Enum)):
+        @property
+        def __members__(cls):
+            return {"ABC": forged[0]} if forged else super().__members__
+
+    class Digest(str, enum.Enum, metaclass=ClaimingMeta):
+        ABC = "sha256:abc"
+
+    forged.append(str.__new__(Digest, "sha256:abc"))  # an instance of the enum, but not its member
+    command = intent_with_requirements(requirement(ProcessingStage.CANONICAL))
+    set_native(command, "request_digest", forged[0])
+    applied = receipt(ProcessingStage.CANONICAL, StageStatus.APPLIED)
+    with pytest.raises(ValueError, match="declared member"):
+        contracts_lifecycle.validate_stage_receipts(command, (applied,))
+    with pytest.raises(ValueError, match="declared member"):
+        validate_required_stage_claim(claimed_status=IntentStatus.APPLIED, intent=command, receipts=(applied,))
+
+
+def _scalar_proxy(kind: str, target: object, reads: list[str]):
+    """A ``str`` subclass that claims ``type(target)`` and delegates its storage to ``target``."""
+
+    claimed = type(target)
+    if kind == "class-property":
+
+        class Proxy(str):
+            @property
+            def __class__(self):
+                return claimed
+
+            def __getattr__(self, name):
+                reads.append(name)
+                return getattr(target, name)
+
+    elif kind == "getattribute":
+
+        class Proxy(str):
+            def __getattribute__(self, name):
+                if name == "__class__":
+                    return claimed
+                reads.append(name)
+                return getattr(target, name)
+
+    elif kind == "enum-member":
+        import enum
+
+        class Proxy(str, enum.Enum):  # a genuine member of the caller's own enum
+            REQUIREMENT = "requirement"
+
+            def __getattribute__(self, name):
+                if name == "__class__":
+                    return claimed
+                if name in ("__dict__", "__pydantic_fields_set__", "__pydantic_extra__"):
+                    reads.append(name)
+                    return getattr(target, name)
+                return super().__getattribute__(name)
+
+        return Proxy.REQUIREMENT
+    else:
+
+        class Proxy(str):
+            @property
+            def __class__(self):
+                return claimed
+
+            def __getattribute__(self, name):
+                if name == "__class__":
+                    return claimed
+                reads.append(name)
+                return getattr(target, name)
+
+    return Proxy("requirement")
+
+
+@pytest.mark.parametrize("kind", ["class-property", "getattribute", "both", "enum-member"])
+def test_a_scalar_subclass_claiming_a_model_is_refused_before_its_delegated_graph_is_read(kind):
+    """A ``str`` subclass passes as a scalar leaf; claiming a model class, it would hand validation a delegated
+    graph that capture never charged.  It is refused at capture, and nothing is read through it."""
+
+    from tests.test_contracts_lifecycle import intent_with_requirements, requirement
+
+    command = intent_with_requirements(requirement(ProcessingStage.CANONICAL))
+    delegate = command.stage_requirements[0]
+    source = command.source_preconditions[0]
+    set_native(delegate, "committed_sources", (source,) * 140_000)  # past the claim's discovery budget
+    reads: list[str] = []
+    set_native(command, "stage_requirements", (_scalar_proxy(kind, delegate, reads),))
+    applied = receipt(ProcessingStage.CANONICAL, StageStatus.APPLIED)
+    with pytest.raises(ValueError, match="native"):
+        contracts_lifecycle.validate_stage_receipts(command, (applied,))
+    with pytest.raises(ValueError, match="native"):
+        validate_required_stage_claim(claimed_status=IntentStatus.APPLIED, intent=command, receipts=(applied,))
+    assert reads == []
+
+
+def test_plain_scalar_subclasses_are_still_admitted_in_scalar_fields():
+    from tests.test_contracts_lifecycle import intent_with_requirements, requirement
+
+    class Digest(str):
+        pass
+
+    command = intent_with_requirements(requirement(ProcessingStage.CANONICAL))
+    set_native(command, "request_digest", Digest("sha256:abc"))
+    applied = receipt(ProcessingStage.CANONICAL, StageStatus.APPLIED)
+    kept_intent, _kept = contracts_lifecycle.validate_stage_receipts(command, (applied,))
+    assert kept_intent.request_digest == "sha256:abc"
+
+
+def _large_enum(size: int):
+    import enum
+
+    return enum.Enum("Large", {f"M{index}": f"m{index}" for index in range(size)}, type=str)
+
+
+def _lifecycle_lines(call) -> int:
+    """Lines executed inside ``contracts_lifecycle`` while ``call`` runs: the module's own work, by count."""
+
+    import sys
+
+    module_file = contracts_lifecycle.__file__
+    count = [0]
+
+    def tracer(frame, event, arg):
+        if frame.f_code.co_filename != module_file:
+            return None
+
+        def local(frame, event, arg):
+            if event == "line":
+                count[0] += 1
+            return local
+
+        return local(frame, event, arg)
+
+    sys.settrace(tracer)
+    try:
+        call()
+    finally:
+        sys.settrace(None)
+    return count[0]
+
+
+def test_repeating_a_member_of_a_large_enum_does_not_rescan_its_members():
+    """Membership is decided from an identity index built once per class and call: 400 repeats of the last
+    member of a 500-member enum cost about the same as 400 repeats of a member of a 2-member enum."""
+
+    from tests.test_contracts_lifecycle import intent_with_requirements, requirement
+
+    def run(member) -> int:
+        command = intent_with_requirements(requirement(ProcessingStage.CANONICAL))
+        set_native(command, "request_digest", (member,) * 400)  # captured (and charged) before validation refuses it
+        applied = receipt(ProcessingStage.CANONICAL, StageStatus.APPLIED)
+
+        def call():
+            with pytest.raises(ValueError):
+                contracts_lifecycle.validate_stage_receipts(command, (applied,))
+
+        return _lifecycle_lines(call)
+
+    small = run(_large_enum(2).M1)
+    large = run(_large_enum(500).M499)
+    assert large - small < 10_000, (small, large)  # a rescan per leaf is about 200,000 lines
+
+
+def _namespace_charge(kind: type) -> int:
+    """Edges charged for scanning the namespaces of the Python-defined classes in ``kind``'s MRO, once."""
+
+    return sum(len(vars(base)) for base in type.__dict__["__mro__"].__get__(kind) if base.__flags__ & (1 << 9))
+
+
+def test_the_member_index_is_charged_to_the_discovery_budget_once_per_class():
+    from contracts_limits import DiscoveryBudget
+
+    large = _large_enum(500)
+    budget = DiscoveryBudget(contracts_lifecycle.LIFECYCLE_TIER)
+    contracts_lifecycle._capture_native_contract_graph((large.M499,) * 400, budget=budget)
+    mro_length = len(type.__dict__["__mro__"].__get__(large))
+    # the tuple, its items, two class walks (graph kind, leaf verdict), one namespace scan, the member map's
+    # lookup, one member index
+    assert budget.edges == 1 + 400 + 2 * mro_length + _namespace_charge(large) + len(vars(large)) + 500
+
+
+def test_an_enum_with_more_members_than_the_budget_allows_is_refused():
+    from contracts_limits import DiscoveryBudget
+
+    budget = DiscoveryBudget(contracts_lifecycle.LIFECYCLE_TIER)
+    budget.charge_edge(budget.tier.max_edges - 10)
+    with pytest.raises(ValueError, match=BUDGET):
+        contracts_lifecycle._capture_native_contract_graph(_large_enum(20).M0, budget=budget)
+
+
+def test_a_forged_instance_of_a_large_enum_is_still_refused_after_its_index_is_built():
+    large = _large_enum(500)
+    forged = str.__new__(large, "m499")
+    shared: dict = {}
+    contracts_lifecycle._capture_native_contract_graph(large.M499, captured_by_identity=shared)
+    with pytest.raises(ValueError, match="declared member"):
+        contracts_lifecycle._capture_native_contract_graph(forged, captured_by_identity=shared)
+
+
+def _deep_str_class(depth: int) -> type:
+    kind = str
+    for _ in range(depth):
+        kind = type("Deeper", (kind,), {})
+    return kind
+
+
+def test_repeating_a_leaf_of_a_deeply_derived_class_does_not_rewalk_its_mro():
+    """A leaf's class is classified once per call (its MRO walked and charged once), not once per leaf."""
+
+    from tests.test_contracts_lifecycle import intent_with_requirements, requirement
+
+    def run(kind) -> int:
+        command = intent_with_requirements(requirement(ProcessingStage.CANONICAL))
+        set_native(command, "request_digest", (kind("sha256:abc"),) * 400)
+        applied = receipt(ProcessingStage.CANONICAL, StageStatus.APPLIED)
+
+        def call():
+            with pytest.raises(ValueError):
+                contracts_lifecycle.validate_stage_receipts(command, (applied,))
+
+        return _lifecycle_lines(call)
+
+    shallow = run(_deep_str_class(1))
+    deep = run(_deep_str_class(300))
+    assert deep - shallow < 10_000, (shallow, deep)
+
+
+def test_a_leaf_class_mro_is_charged_to_the_discovery_budget_once_per_class():
+    from contracts_limits import DiscoveryBudget
+
+    kind = _deep_str_class(300)
+    mro_length = len(type.__dict__["__mro__"].__get__(kind))
+    budget = DiscoveryBudget(contracts_lifecycle.LIFECYCLE_TIER)
+    contracts_lifecycle._capture_native_contract_graph((kind("a"),) * 400, budget=budget)
+    # the tuple, its items, two class walks (graph kind, leaf verdict), one namespace scan
+    assert budget.edges == 1 + 400 + 2 * mro_length + _namespace_charge(kind)
+
+
+def test_a_leaf_class_changed_by_a_view_is_classified_again_for_items_captured_after_it():
+    """A class verdict kept in the call's memo must not outlive caller code: a receipts view that gives an
+    admitted ``str`` subclass a ``__class__`` claim, then yields a receipt its backing never held, does not get
+    that receipt's instance past capture on a stale verdict."""
+
+    from tests.test_contracts_lifecycle import intent_with_requirements, requirement
+
+    command = intent_with_requirements(requirement(ProcessingStage.CANONICAL))
+    error = StageError(code="projection_failed", retryable=False, safe_message="Projection failed")
+    reads: list[str] = []
+
+    class Plain(str):
+        pass
+
+    def impersonate(self, name):
+        if name == "__class__":
+            return StageError
+        if name in ("__dict__", "__pydantic_fields_set__", "__pydantic_extra__"):
+            reads.append(name)
+            return getattr(error, name)
+        return str.__getattribute__(self, name)
+
+    def receipts():
+        first = receipt(ProcessingStage.CANONICAL, StageStatus.APPLIED)
+        set_native(first, "effect_id", Plain(first.effect_id))  # admitted at inventory, its class verdict kept
+        unseen = receipt(ProcessingStage.CANONICAL, StageStatus.FAILED)
+        set_native(unseen, "error", Plain("error"))
+
+        class Receipts(tuple):
+            def __iter__(self):
+                yield first
+                Plain.__getattribute__ = impersonate  # caller code between items
+                yield unseen  # only in the public view: captured after the class changed
+
+        return Receipts((first,))
+
+    try:
+        with pytest.raises(ValueError, match="native"):
+            contracts_lifecycle.validate_stage_receipts(command, receipts())
+        del Plain.__getattribute__
+        with pytest.raises(ValueError, match="native"):
+            validate_required_stage_claim(claimed_status=IntentStatus.FAILED, intent=command, receipts=receipts())
+    finally:
+        if "__getattribute__" in vars(Plain):
+            del Plain.__getattribute__
+    assert reads == []
+
+
+def test_an_enum_member_map_changed_by_a_view_is_indexed_again_for_items_captured_after_it():
+    """The member index holds only until caller code runs: a member a receipts view removes from its class's
+    map is no longer a declared member for a receipt captured after the view stepped."""
+
+    import enum
+
+    from tests.test_contracts_lifecycle import intent_with_requirements, requirement
+
+    command = intent_with_requirements(requirement(ProcessingStage.CANONICAL))
+    first = receipt(ProcessingStage.CANONICAL, StageStatus.APPLIED)
+    Ids = enum.Enum("Ids", {"INTENT": first.intent_id, "OTHER": "other"}, type=str)
+    members = vars(Ids)["_member_map_"]
+    set_native(first, "intent_id", Ids.INTENT)  # indexed at inventory
+
+    def receipts():
+        unseen = receipt(ProcessingStage.CANONICAL, StageStatus.APPLIED)
+        set_native(unseen, "intent_id", Ids.INTENT)
+
+        class Receipts(tuple):
+            def __iter__(self):
+                yield first
+                del members["INTENT"]  # caller code between items
+                yield unseen  # only in the public view: captured after the map changed
+
+        return Receipts((first,))
+
+    try:
+        with pytest.raises(ValueError, match="declared member"):
+            contracts_lifecycle.validate_stage_receipts(command, receipts())
+        members["INTENT"] = Ids.INTENT
+        with pytest.raises(ValueError, match="declared member"):
+            validate_required_stage_claim(claimed_status=IntentStatus.APPLIED, intent=command, receipts=receipts())
+    finally:
+        members["INTENT"] = Ids.INTENT
+
+
+def test_a_namespace_key_colliding_with_a_hook_name_never_runs_its_comparison():
+    """A class namespace may hold a str-subclass key whose hash equals ``__class__``'s: looking the name up in
+    the namespace would call that key's ``__eq__``.  The scan compares exact text instead, so no callback runs."""
+
+    from tests.test_contracts_lifecycle import intent_with_requirements, requirement
+
+    command = intent_with_requirements(requirement(ProcessingStage.CANONICAL))
+    later = command.source_preconditions[0]
+    calls: list[str] = []
+
+    class Colliding(str):
+        def __hash__(self):
+            return str.__hash__("__class__")
+
+        def __eq__(self, other):
+            calls.append("eq")
+            set_native(later, "content_revision", 1)  # would hide the invalid later source
+            return False
+
+    class Prepared(type):
+        @classmethod
+        def __prepare__(mcls, name, bases, **kwargs):
+            return {Colliding("decoy"): None}
+
+    class Leaf(str, metaclass=Prepared):
+        pass
+
+    assert any(type(key) is Colliding for key in vars(Leaf))  # the key survived class creation
+    set_native(command, "request_digest", Leaf("sha256:abc"))
+    set_native(later, "content_revision", -1)
+    applied = receipt(ProcessingStage.CANONICAL, StageStatus.APPLIED)
+    with pytest.raises(ValueError):
+        contracts_lifecycle.validate_stage_receipts(command, (applied,))
+    with pytest.raises(ValueError):
+        validate_required_stage_claim(claimed_status=IntentStatus.APPLIED, intent=command, receipts=(applied,))
+    assert calls == []
+    assert later.content_revision == -1
+
+
+def test_a_scalar_leaf_whose_class_is_changed_by_a_later_view_is_not_handed_to_validation_as_a_model():
+    """Capture checks a leaf's class, but a public view materialized before the leaf can give that class a
+    delegating ``__getattribute__``.  Leaves are detached to exact natives, so validation never reads it."""
+
+    from contracts_lifecycle import StageEvidenceRequirement
+    from tests.test_contracts_lifecycle import intent_with_requirements, requirement, source
+
+    command = intent_with_requirements(requirement(ProcessingStage.CANONICAL))
+    real = command.stage_requirements[0]
+    set_native(real, "committed_sources", tuple(source(f"s{i}") for i in range(70_000)))  # never charged
+    reads: list[str] = []
+
+    class Plain(str):
+        pass
+
+    leaf = Plain("requirement")
+
+    def impersonate(self, name):
+        if name == "__class__":
+            return StageEvidenceRequirement
+        reads.append(name)
+        return getattr(real, name)
+
+    class Arming(tuple):
+        def __iter__(self):
+            type.__setattr__(Plain, "__getattribute__", impersonate)  # after capture checked Plain
+            return iter(())
+
+    set_native(command, "target_refs", Arming(()))  # materialized before stage_requirements
+    set_native(command, "stage_requirements", (leaf,))
+    applied = receipt(ProcessingStage.CANONICAL, StageStatus.APPLIED)
+    try:
+        for entry in (
+            lambda: contracts_lifecycle.validate_stage_receipts(command, (applied,)),
+            lambda: validate_required_stage_claim(claimed_status=IntentStatus.APPLIED, intent=command, receipts=(applied,)),
+        ):
+            with pytest.raises((ValueError, TypeError)):
+                entry()
+    finally:
+        type.__delattr__(Plain, "__getattribute__") if "__getattribute__" in vars(Plain) else None
+    assert reads == []
+
+
+def test_an_enum_member_whose_class_is_changed_by_a_later_view_is_refused_before_validation():
+    import enum
+
+    from contracts_lifecycle import StageEvidenceRequirement
+    from tests.test_contracts_lifecycle import intent_with_requirements, requirement
+
+    command = intent_with_requirements(requirement(ProcessingStage.CANONICAL))
+    real = command.stage_requirements[0]
+    reads: list[str] = []
+
+    class Kind(str, enum.Enum):
+        A = "a"
+
+    def impersonate(self, name):
+        if name == "__class__":
+            return StageEvidenceRequirement
+        if name.startswith("_") and name not in ("__dict__", "__pydantic_fields_set__", "__pydantic_extra__"):
+            return object.__getattribute__(self, name)
+        reads.append(name)
+        return getattr(real, name)
+
+    class Arming(tuple):
+        def __iter__(self):
+            type.__setattr__(Kind, "__getattribute__", impersonate)
+            return iter(())
+
+    set_native(command, "target_refs", Arming(()))
+    set_native(command, "stage_requirements", (Kind.A,))
+    applied = receipt(ProcessingStage.CANONICAL, StageStatus.APPLIED)
+    try:
+        for entry in (
+            lambda: contracts_lifecycle.validate_stage_receipts(command, (applied,)),
+            lambda: validate_required_stage_claim(claimed_status=IntentStatus.APPLIED, intent=command, receipts=(applied,)),
+        ):
+            with pytest.raises((ValueError, TypeError)):
+                entry()
+    finally:
+        if "__getattribute__" in vars(Kind):
+            type.__delattr__(Kind, "__getattribute__")
+    assert reads == []
+
+
+def test_entry_checks_ignore_a_virtual_subclass_registration():
+    """Entry checks walk the real MRO: an ABC registration never makes a foreign class a contract model."""
+
+    class Foreign:
+        pass
+
+    Intent.register(Foreign)
+    try:
+        with pytest.raises(TypeError):
+            contracts_lifecycle.validate_stage_receipts(Foreign(), ())
+        with pytest.raises(TypeError):
+            validate_required_stage_claim(claimed_status=IntentStatus.ACCEPTED, intent=Foreign(), receipts=())
+    finally:
+        Intent._abc_registry_clear() if hasattr(Intent, "_abc_registry_clear") else None
+
+
+def test_scalar_leaves_of_subclasses_are_captured_as_exact_natives():
+    """A captured scalar carries nothing of its subclass on to validation: exact text, number or timestamp.  An
+    int subclass becomes the call's own hook-free marker, so a validator that reads the type still sees "not an
+    exact int"."""
+
+    from datetime import timedelta
+
+    class S(str):
+        pass
+
+    class I(int):
+        pass
+
+    class D(datetime):
+        pass
+
+    class T(timedelta):
+        pass
+
+    for value, exact in ((S("x"), str), (D(2026, 1, 1, tzinfo=timezone.utc), datetime), (T(seconds=5), timedelta)):
+        captured = contracts_lifecycle._capture_native_contract_graph(value)
+        assert type(captured.value) is exact and captured.value == value
+    memo: dict = {}
+    captured = contracts_lifecycle._capture_native_contract_graph(I(7), captured_by_identity=memo)
+    marker = type(captured.value)
+    assert marker is memo[contracts_lifecycle._DETACHED_INT] and marker.__bases__ == (int,) and marker is not I
+    assert set(vars(marker)) <= {"__slots__", "__module__", "__doc__"} and int.__int__(captured.value) == 7
+    assert type(contracts_lifecycle._capture_native_contract_graph(I(7)).value) is not marker  # one class per call
+
+
+def test_an_enum_namespace_key_colliding_with_the_member_map_never_runs_its_comparison():
+    """Looking ``_member_map_`` up by name in a namespace that keeps a colliding ``str``-subclass key would
+    call that key's ``__eq__``; the map is found by scanning keys as exact text instead."""
+
+    import enum
+
+    from tests.test_contracts_lifecycle import intent_with_requirements, requirement
+
+    command = intent_with_requirements(requirement(ProcessingStage.CANONICAL))
+    later = command.source_preconditions[0]
+    calls: list[str] = []
+    armed = [False]  # creating the enum stores _member_map_ itself, which compares with the planted key
+
+    class Colliding(str):
+        def __hash__(self):
+            return str.__hash__("_member_map_")
+
+        def __eq__(self, other):
+            if armed[0]:
+                calls.append("eq")
+                set_native(later, "content_revision", 1)
+            return False
+
+    class Planting(type(enum.Enum)):
+        @classmethod
+        def __prepare__(mcls, name, bases, **kwargs):
+            namespace = super().__prepare__(name, bases, **kwargs)
+            dict.__setitem__(namespace, Colliding("decoy"), None)
+            return namespace
+
+    class Digest(str, enum.Enum, metaclass=Planting):
+        ABC = "sha256:abc"
+
+    assert any(type(key) is Colliding for key in vars(Digest))
+    set_native(command, "request_digest", Digest.ABC)
+    set_native(later, "content_revision", -1)
+    applied = receipt(ProcessingStage.CANONICAL, StageStatus.APPLIED)
+    armed[0] = True
+    with pytest.raises(ValueError):
+        contracts_lifecycle.validate_stage_receipts(command, (applied,))
+    with pytest.raises(ValueError):
+        validate_required_stage_claim(claimed_status=IntentStatus.APPLIED, intent=command, receipts=(applied,))
+    assert calls == []
+    assert later.content_revision == -1
+
+
+class _VersionLookalike(str):
+    """Spells something else, but hashes and compares like the schema version."""
+
+    calls = 0
+
+    def __hash__(self):
+        type(self).calls += 1
+        return str.__hash__("candidate-v1")
+
+    def __eq__(self, other):
+        type(self).calls += 1
+        return True
+
+    def __ne__(self, other):
+        return False
+
+
+@pytest.mark.parametrize("position", ["receipt", "intent"])
+def test_a_text_subclass_cannot_pass_a_literal_it_does_not_spell(position):
+    from tests.test_contracts_lifecycle import intent_with_requirements, requirement
+
+    command = intent_with_requirements(requirement(ProcessingStage.CANONICAL))
+    applied = receipt(ProcessingStage.CANONICAL, StageStatus.APPLIED)
+    set_native(applied if position == "receipt" else command, "schema_version", _VersionLookalike("attacker"))
+    _VersionLookalike.calls = 0
+
+    with pytest.raises(ValueError, match="schema_version"):  # used to be accepted as "candidate-v1"
+        contracts_lifecycle.validate_stage_receipts(command, (applied,))
+    with pytest.raises(ValueError, match="schema_version"):  # and the claim reads it the same way
+        validate_required_stage_claim(claimed_status=IntentStatus.APPLIED, intent=command, receipts=(applied,))
+    assert _VersionLookalike.calls == 0  # its hash and equality never ran
+
+
+def test_a_text_subclass_that_spells_its_value_reaches_validation_as_plain_text():
+    from tests.test_contracts_lifecycle import intent_with_requirements, requirement
+
+    class Text(str):
+        pass
+
+    command = intent_with_requirements(requirement(ProcessingStage.CANONICAL))
+    applied = receipt(ProcessingStage.CANONICAL, StageStatus.APPLIED)
+    set_native(applied, "schema_version", Text("candidate-v1"))
+    set_native(applied, "effect_id", Text("effect-canonical"))
+
+    _, (kept,) = contracts_lifecycle.validate_stage_receipts(command, (applied,))
+
+    assert kept == contracts_lifecycle.validate_stage_receipts(command, (receipt(ProcessingStage.CANONICAL, StageStatus.APPLIED),))[1][0]
+    assert type(kept.schema_version) is str and type(kept.effect_id) is str
+
+
+def _arming_enum_case(position):
+    """An enum member, and a tuple-subclass view materialized after it that gives the enum class a
+    delegating ``__getattribute__`` once capture and the materialization-time re-check have passed."""
+
+    import enum
+
+    from contracts_lifecycle import StageError
+    from tests.test_contracts_lifecycle import intent_with_requirements, requirement
+
+    command = intent_with_requirements(requirement(ProcessingStage.CANONICAL))
+    applied = receipt(ProcessingStage.CANONICAL, StageStatus.FAILED, sources=())
+    delegate = StageError(code="c", retryable=False, safe_message="m") if position == "error" else command.stage_requirements[0]
+    reads: list[str] = []
+
+    class Kind(str, enum.Enum):
+        A = "a"
+
+    def impersonate(self, name):
+        if name == "__class__":
+            return type(delegate)
+        if name.startswith("_") and name not in ("__dict__", "__pydantic_fields_set__", "__pydantic_extra__"):
+            return object.__getattribute__(self, name)
+        reads.append(name)
+        return getattr(delegate, name)
+
+    class Arming(tuple):
+        def __iter__(self):
+            type.__setattr__(Kind, "__getattribute__", impersonate)
+            return iter(())
+
+    if position == "error":
+        set_native(applied, "error", Kind.A)
+        set_native(applied, "upstream_applications", Arming(()))  # materialized after error
+    else:
+        set_native(command, "stage_requirements", (Kind.A,))
+        set_native(command, "correlation_id", Arming(()))  # materialized after stage_requirements
+    return command, applied, reads, Kind
+
+
+@pytest.mark.parametrize("position", ["error", "stage_requirement"])
+def test_an_enum_member_armed_by_a_view_materialized_after_it_is_refused_before_validation_reads_it(position):
+    for entry in ("record", "claim"):
+        command, applied, reads, kind = _arming_enum_case(position)
+        try:
+            with pytest.raises((ValueError, TypeError)):
+                if entry == "record":
+                    contracts_lifecycle.validate_stage_receipts(command, (applied,))
+                else:
+                    validate_required_stage_claim(claimed_status=IntentStatus.FAILED, intent=command, receipts=(applied,))
+        finally:
+            if "__getattribute__" in vars(kind):
+                type.__delattr__(kind, "__getattribute__")
+        assert reads == [], (entry, reads)
+
+
+def test_a_planted_twin_of_the_member_map_never_chooses_the_members():
+    """A str-subclass key spelling ``_member_map_`` (planted ahead of the real one) is not the type machinery's
+    entry: only an exact-``str`` key is read, so a forged instance listed only in the twin map stays refused."""
+
+    import enum
+
+    from tests.test_contracts_lifecycle import intent_with_requirements, requirement
+
+    forged_holder: list[object] = []
+
+    class Twin(str):
+        def __hash__(self):
+            return str.__hash__("_member_map_")
+
+        def __eq__(self, other):
+            return False
+
+    class TwinMap(dict):
+        pass
+
+    twin_map: dict = {}
+
+    class Planting(type(enum.Enum)):
+        @classmethod
+        def __prepare__(mcls, name, bases, **kwargs):
+            namespace = super().__prepare__(name, bases, **kwargs)
+            dict.__setitem__(namespace, Twin("_member_map_"), twin_map)
+            return namespace
+
+    class Digest(str, enum.Enum, metaclass=Planting):
+        ABC = "sha256:abc"
+
+    forged = str.__new__(Digest, "sha256:abc")
+    twin_map["ABC"] = forged
+    keys = list(vars(Digest))
+    assert any(type(key) is Twin for key in keys) and "_member_map_" in [str.__str__(k) for k in keys if type(k) is str]
+    command = intent_with_requirements(requirement(ProcessingStage.CANONICAL))
+    set_native(command, "request_digest", forged)
+    applied = receipt(ProcessingStage.CANONICAL, StageStatus.APPLIED)
+    with pytest.raises(ValueError, match="declared member"):
+        contracts_lifecycle.validate_stage_receipts(command, (applied,))
+    with pytest.raises(ValueError, match="declared member"):
+        validate_required_stage_claim(claimed_status=IntentStatus.APPLIED, intent=command, receipts=(applied,))
+
+
+def test_declared_field_names_are_never_read_through_the_model_metaclass():
+    """The extras conflict check needs a model class's declared names; they are read from the class
+    namespaces, so a caller's model metaclass answering ``model_fields`` is never consulted."""
+
+    from tests.test_contracts_lifecycle import intent_with_requirements, requirement, source
+
+    reads: list[str] = []
+
+    class Counting(type(SourceVersion)):
+        def __getattribute__(cls, name):
+            if name in ("model_fields", "__pydantic_fields__"):
+                reads.append(name)
+            return super().__getattribute__(name)
+
+    class Counted(SourceVersion, metaclass=Counting):
+        pass
+
+    command = intent_with_requirements(requirement(ProcessingStage.CANONICAL))
+    applied = receipt(ProcessingStage.CANONICAL, StageStatus.APPLIED)
+    item = Counted.model_construct(**vars(source("c1")))
+    EXTRA.__set__(item, {"extra_note": 1})  # forces the declared-name check
+    set_native(applied, "applied_sources", (item,))
+    reads.clear()
+    with pytest.raises(ValueError):
+        contracts_lifecycle.validate_stage_receipts(command, (applied,))
+    assert reads == []
+
+
+def test_a_repeated_text_subclass_leaf_is_detached_once_not_per_occurrence():
+    """Capture copies a subclass leaf to exact text; the copy is kept per source object, so 400 references to
+    one large leaf cost one copy, as 400 references to an exact string cost none."""
+
+    import tracemalloc
+
+    from tests.test_contracts_lifecycle import intent_with_requirements, requirement
+
+    class Text(str):
+        pass
+
+    command = intent_with_requirements(requirement(ProcessingStage.CANONICAL))
+    applied = receipt(ProcessingStage.CANONICAL, StageStatus.APPLIED)
+    set_native(applied, "effect_id", (Text("x" * (256 * 1024)),) * 400)
+    tracemalloc.start()
+    try:
+        with pytest.raises(ValueError):
+            contracts_lifecycle.validate_stage_receipts(command, (applied,))
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert peak < 8 * 2**20, peak  # one copy of 256 KiB (and bookkeeping), not 400 (100 MiB)
+
+
+def test_a_shared_container_with_a_text_subclass_key_is_not_copied_per_path():
+    """A key's exact text is kept once at capture, so a container shared by many paths is rebuilt once."""
+
+    import tracemalloc
+
+    from tests.test_contracts_lifecycle import intent_with_requirements, requirement
+
+    class Text(str):
+        pass
+
+    command = intent_with_requirements(requirement(ProcessingStage.CANONICAL))
+    applied = receipt(ProcessingStage.CANONICAL, StageStatus.APPLIED)
+    shared = {Text("k" * (256 * 1024)): 1}
+    EXTRA.__set__(applied, {f"note{i}": shared for i in range(200)})
+    tracemalloc.start()
+    try:
+        with pytest.raises(ValueError):
+            contracts_lifecycle.validate_stage_receipts(command, (applied,))
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert peak < 8 * 2**20, peak  # one 256 KiB key text, not one per path (50 MiB and more)
+
+
+def test_declared_field_tables_are_charged_to_the_discovery_budget():
+    """Reading a model class's declared names costs one edge per name: 200 classes sharing a 20,000-entry
+    table exceed the envelope instead of being read for free."""
+
+    from tests.test_contracts_lifecycle import intent_with_requirements, requirement, source
+
+    table = {f"field{i}": None for i in range(20_000)}
+    table.update(SourceVersion.__pydantic_fields__)
+    classes = [type(f"Wide{i}", (SourceVersion,), {}) for i in range(200)]
+    for kind in classes:
+        type.__setattr__(kind, "__pydantic_fields__", table)
+    command = intent_with_requirements(requirement(ProcessingStage.CANONICAL))
+    applied = receipt(ProcessingStage.CANONICAL, StageStatus.APPLIED)
+    sources = []
+    for index, kind in enumerate(classes):
+        item = SourceVersion.model_construct(**vars(source(f"w{index}")))
+        object.__setattr__(item, "__class__", kind)
+        EXTRA.__set__(item, {"extra_note": 1})  # forces the declared-name check
+        sources.append(item)
+    set_native(applied, "applied_sources", tuple(sources))
+    with pytest.raises(ValueError, match=BUDGET):
+        contracts_lifecycle.validate_stage_receipts(command, (applied,))
+
+
+def test_the_claim_compares_its_revalidated_sources_without_new_budgets(monkeypatch):
+    """Source sets are compared on the claim's own strict copies: no further envelope (and no second
+    capture and validation per source pair) is created outside the call's budget."""
+
+    import contracts_limits
+    from tests.test_contracts_lifecycle import intent_with_requirements, requirement, source
+
+    created: list[object] = []
+    real = contracts_lifecycle.DiscoveryBudget
+
+    class Counting(real):
+        def __init__(self, *args, **kwargs):
+            created.append(self)
+            super().__init__(*args, **kwargs)
+
+    command = intent_with_requirements(requirement(ProcessingStage.CANONICAL))
+    applied = receipt(ProcessingStage.CANONICAL, StageStatus.APPLIED)
+    monkeypatch.setattr(contracts_lifecycle, "DiscoveryBudget", Counting)
+    validate_required_stage_claim(claimed_status=IntentStatus.APPLIED, intent=command, receipts=(applied,) * 20)
+    assert len(created) == 1  # the call's own envelope only
+
+
+def test_a_mapping_key_object_is_refused_before_its_hash_runs():
+    from tests.test_contracts_lifecycle import intent_with_requirements, requirement
+
+    calls: list[str] = []
+
+    class Key:
+        def __hash__(self):
+            calls.append("hash")
+            return 1
+
+        def __eq__(self, other):
+            calls.append("eq")
+            return False
+
+    command = intent_with_requirements(requirement(ProcessingStage.CANONICAL))
+    applied = receipt(ProcessingStage.CANONICAL, StageStatus.APPLIED)
+    EXTRA.__set__(applied, {"note": {Key(): 1}})
+    calls.clear()  # building the dict above hashed the key once
+    with pytest.raises(ValueError, match="keys must be text"):
+        contracts_lifecycle.validate_stage_receipts(command, (applied,))
+    assert calls == []
+
+
+def test_one_text_subclass_key_shared_by_many_containers_is_copied_once():
+    """Distinct containers keyed by one shared subclass key cost one copy of its text, not one per container."""
+
+    import tracemalloc
+
+    from tests.test_contracts_lifecycle import intent_with_requirements, requirement
+
+    class Text(str):
+        pass
+
+    key = Text("k" * 2**20)
+    command = intent_with_requirements(requirement(ProcessingStage.CANONICAL))
+    applied = receipt(ProcessingStage.CANONICAL, StageStatus.APPLIED)
+    EXTRA.__set__(applied, {"note": [{key: index} for index in range(64)]})
+    tracemalloc.start()
+    try:
+        with pytest.raises(ValueError):
+            contracts_lifecycle.validate_stage_receipts(command, (applied,))
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert peak < 8 * 2**20, peak  # one 1 MiB text, not 64 (64 MiB)
+
+
+def test_a_shared_text_subclass_key_still_collides_with_its_own_spelling():
+    from tests.test_contracts_lifecycle import intent_with_requirements, requirement
+
+    class Text(str):
+        def __hash__(self):  # keeps the dict from merging it with its spelling; capture never calls it
+            return 7
+
+    key = Text("note")
+    command = intent_with_requirements(requirement(ProcessingStage.CANONICAL))
+    applied = receipt(ProcessingStage.CANONICAL, StageStatus.APPLIED)
+    EXTRA.__set__(applied, {"first": {key: 1}, "second": {key: 1, "note": 2}})
+    with pytest.raises(ValueError, match="colliding keys"):
+        contracts_lifecycle.validate_stage_receipts(command, (applied,))
+
+
+def test_a_large_int_key_is_charged_by_size_in_every_container_holding_it():
+    """An int's hash is not cached and costs its size: 4,000 containers keyed by one megabit int are charged
+    for hashing it each time (and exceed the envelope) instead of paying a constant per container."""
+
+    from tests.test_contracts_lifecycle import intent_with_requirements, requirement
+
+    command = intent_with_requirements(requirement(ProcessingStage.CANONICAL))
+    applied = receipt(ProcessingStage.CANONICAL, StageStatus.APPLIED)
+    key = 1 << 2**20
+    EXTRA.__set__(applied, {"note": [{key: index} for index in range(4_000)]})
+    with pytest.raises(ValueError, match=BUDGET):
+        contracts_lifecycle.validate_stage_receipts(command, (applied,))
+
+
+@pytest.mark.parametrize("key", [1 << 4_000, 1, True, None, 1.5, b"k"], ids=["4000-bit-int", "int", "bool", "none", "float", "bytes"])
+def test_a_native_key_that_is_not_text_still_reaches_validation(key):
+    """A native non-text key costs no more than its container (the int is below one charged unit), and is
+    refused by validation with its own message, not by the budget."""
+
+    from pydantic import ValidationError
+
+    from tests.test_contracts_lifecycle import intent_with_requirements, requirement
+
+    command = intent_with_requirements(requirement(ProcessingStage.CANONICAL))
+    applied = receipt(ProcessingStage.CANONICAL, StageStatus.APPLIED)
+    EXTRA.__set__(applied, {"note": [{key: index} for index in range(4_000)]})
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        contracts_lifecycle.validate_stage_receipts(command, (applied,))
+
+
+def _reused_enum_case(shared_tuple: bool):
+    """A caller str-enum member in a tuple the intent holds; the receipt holds the same tuple object (or a
+    fresh one), and the receipts view arms the enum's class before the receipt is materialized."""
+
+    import enum
+
+    from tests.test_contracts_lifecycle import intent_with_requirements, reference, requirement
+
+    class SourceId(str, enum.Enum):
+        MEMORY = "memory-1"
+
+    delegate = reference("r1")
+    reads: list[str] = []
+
+    def impersonate(self, name):
+        if name == "__class__":
+            return type(delegate)
+        if name.startswith("_") and name not in ("__dict__", "__pydantic_fields_set__", "__pydantic_extra__"):
+            return object.__getattribute__(self, name)
+        reads.append(name)
+        return getattr(delegate, name)
+
+    held = (SourceId.MEMORY,)
+    command = intent_with_requirements(requirement(ProcessingStage.CANONICAL))
+    set_native(command.stage_requirements[0], "precondition_source_ids", held)
+    applied = receipt(ProcessingStage.CANONICAL, StageStatus.APPLIED)
+    set_native(applied, "output_refs", held if shared_tuple else (SourceId.MEMORY,))
+
+    class Arming(tuple):
+        def __iter__(self):
+            type.__setattr__(SourceId, "__getattribute__", impersonate)
+            return tuple.__iter__(self)
+
+    return command, Arming((applied,)), reads, SourceId
+
+
+@pytest.mark.parametrize("shared_tuple", [True, False], ids=["reused-copy", "fresh-tuple"])
+@pytest.mark.parametrize("entry", ["record", "claim"])
+def test_an_enum_member_in_a_reused_pure_copy_is_judged_again_after_caller_code(shared_tuple, entry):
+    """A pure copy built for the intent is reused for the receipt; the enum members inside it are judged again
+    when caller code ran since the copy was made, as a freshly materialized member is."""
+
+    command, receipts, reads, kind = _reused_enum_case(shared_tuple)
+    try:
+        with pytest.raises((ValueError, TypeError)):
+            if entry == "record":
+                contracts_lifecycle.validate_stage_receipts(command, receipts)
+            else:
+                validate_required_stage_claim(claimed_status=IntentStatus.APPLIED, intent=command, receipts=receipts)
+    finally:
+        if "__getattribute__" in vars(kind):
+            type.__delattr__(kind, "__getattribute__")
+    assert reads == []
+
+
+def test_an_honest_enum_member_in_a_copy_reused_after_caller_code_is_still_accepted():
+    """The same root materialized again after the generation moved reuses its pure copies; their honest
+    members pass the new judgement and the model validates as before."""
+
+    from contracts_lifecycle import Intent
+    from tests.test_contracts_lifecycle import intent_with_requirements, requirement
+
+    command = intent_with_requirements(
+        requirement(ProcessingStage.CANONICAL),
+        requirement(ProcessingStage.EXTRACT, upstream_stages=(ProcessingStage.CANONICAL,)),
+    )
+    captured = contracts_lifecycle._capture_contract_graph(command)
+    memo = captured[1]
+    first = contracts_lifecycle._revalidated_captured_model(Intent, captured)
+    memo[contracts_lifecycle._GENERATION] = contracts_lifecycle._generation(memo) + 1  # as a public view does
+    second = contracts_lifecycle._revalidated_captured_model(Intent, captured)
+    assert second == first and second.stage_requirements[1].upstream_stages == (ProcessingStage.CANONICAL,)
+
+
+def test_an_enum_member_nested_in_a_reused_pure_copy_is_judged_again():
+    """The copy's members include those of the pure containers inside it.  No lifecycle contract accepts a
+    nested scalar container, so this drives the root step directly: a nested copy built in one generation,
+    reused in the next after the member's class was armed, is refused before validation reads it."""
+
+    import enum
+
+    from contracts_lifecycle import Intent
+    from tests.test_contracts_lifecycle import intent_with_requirements, reference, requirement
+
+    class SourceId(str, enum.Enum):
+        MEMORY = "memory-1"
+
+    delegate = reference("r1")
+    reads: list[str] = []
+
+    def impersonate(self, name):
+        if name == "__class__":
+            return type(delegate)
+        if name.startswith("_") and name not in ("__dict__", "__pydantic_fields_set__", "__pydantic_extra__"):
+            return object.__getattribute__(self, name)
+        reads.append(name)
+        return getattr(delegate, name)
+
+    command = intent_with_requirements(requirement(ProcessingStage.CANONICAL))
+    set_native(command.stage_requirements[0], "precondition_source_ids", ((SourceId.MEMORY,),))
+    captured = contracts_lifecycle._capture_contract_graph(command)
+    memo = captured[1]
+    with pytest.raises(ValueError):  # a nested tuple is no source id; the copies are built all the same
+        contracts_lifecycle._revalidated_captured_model(Intent, captured)
+    type.__setattr__(SourceId, "__getattribute__", impersonate)
+    try:
+        memo[contracts_lifecycle._GENERATION] = contracts_lifecycle._generation(memo) + 1  # as a public view does
+        with pytest.raises(ValueError, match="native scalar, an enum member"):
+            contracts_lifecycle._revalidated_captured_model(Intent, captured)
+    finally:
+        type.__delattr__(SourceId, "__getattribute__")
+    assert reads == []
+
+
+@pytest.mark.parametrize("entry", ["record", "claim"])
+def test_an_enum_member_in_a_reused_copy_is_judged_again_when_a_later_view_of_its_root_arms_it(entry):
+    """The copy is reused in the generation it was made in (nothing to judge yet), and a view the receipt
+    materializes afterwards arms the member's class: the members a reuse hands out are recorded for the root
+    and judged again before validation, as freshly materialized ones are."""
+
+    command, receipts, reads, kind = _reused_enum_case(True)
+    applied = tuple.__getitem__(receipts, 0)
+    arm = type(receipts).__iter__
+
+    class Arming(tuple):
+        def __iter__(self):
+            arm(receipts)
+            return iter(())
+
+    set_native(applied, "upstream_applications", Arming(()))  # materialized after output_refs
+    try:
+        with pytest.raises((ValueError, TypeError)):
+            if entry == "record":
+                contracts_lifecycle.validate_stage_receipts(command, (applied,))
+            else:
+                validate_required_stage_claim(claimed_status=IntentStatus.APPLIED, intent=command, receipts=(applied,))
+    finally:
+        if "__getattribute__" in vars(kind):
+            type.__delattr__(kind, "__getattribute__")
+    assert reads == []
+
+
+@pytest.mark.parametrize("entry", ["record", "claim"])
+def test_an_int_subclass_minimum_is_still_refused_by_its_exactness_check(entry):
+    """Detaching a subclass leaf must not erase what a validator reads from its type: the requirement's minimum
+    must be the native integer 0 or 1, so an int subclass holding 1 is refused as it was before capture."""
+
+    from tests.test_contracts_lifecycle import intent_with_requirements, requirement
+
+    command = intent_with_requirements(requirement(ProcessingStage.CANONICAL))
+    set_native(command.stage_requirements[0], "minimum_output_refs", type("Minimum", (int,), {})(1))
+    applied = receipt(ProcessingStage.CANONICAL, StageStatus.APPLIED)
+    with pytest.raises(ValueError, match="native integer 0 or 1"):
+        if entry == "record":
+            contracts_lifecycle.validate_stage_receipts(command, (applied,))
+        else:
+            validate_required_stage_claim(claimed_status=IntentStatus.APPLIED, intent=command, receipts=(applied,))
+
+
+def test_a_detached_int_subclass_runs_none_of_its_methods_and_leaves_validation_as_an_exact_int():
+    from tests.test_contracts_lifecycle import intent_with_requirements, requirement
+
+    calls: list[str] = []
+
+    class Count(int):
+        def __index__(self):
+            calls.append("index")
+            return 1
+
+        def __int__(self):
+            calls.append("int")
+            return 1
+
+        def __eq__(self, other):
+            calls.append("eq")
+            return int.__eq__(self, other)
+
+        __hash__ = int.__hash__
+
+    command = intent_with_requirements(requirement(ProcessingStage.CANONICAL))
+    applied = receipt(ProcessingStage.CANONICAL, StageStatus.APPLIED)
+    set_native(applied, "attempt", Count(2))
+    calls.clear()
+    _, kept = contracts_lifecycle.validate_stage_receipts(command, (applied,))
+    assert type(kept[0].attempt) is int and kept[0].attempt == 2
+    assert calls == []
+
+
+def _nested_member_tuples(members: int, depth: int):
+    import enum
+
+    from tests.test_contracts_lifecycle import intent_with_requirements, requirement
+
+    Wide = enum.Enum("Wide", {f"M{index}": f"m{index}" for index in range(members)}, type=str)
+    nested: object = tuple(Wide)
+    for _ in range(depth):
+        nested = (nested,)
+    command = intent_with_requirements(requirement(ProcessingStage.CANONICAL))
+    set_native(command.stage_requirements[0], "precondition_source_ids", nested)
+    return command
+
+
+def test_nested_pure_copies_do_not_each_keep_their_descendants_members():
+    """Every pure ancestor of a tuple of distinct enum members used to copy those members into its own table:
+    work and retention grew with depth times members, uncharged.  The members are kept once per call."""
+
+    import tracemalloc
+
+    from contracts_lifecycle import Intent
+
+    peaks = []
+    for depth in (8, 32):
+        command = _nested_member_tuples(20_000, depth)
+        captured = contracts_lifecycle._capture_contract_graph(command)
+        tracemalloc.start()
+        try:
+            with pytest.raises(ValueError):
+                contracts_lifecycle._revalidated_captured_model(Intent, captured)
+            _, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        peaks.append(peak)
+    assert peaks[1] < peaks[0] * 1.5, peaks  # four times the depth: not four times the members kept
+
+
+def test_reusing_copies_judges_the_member_registry_once_per_generation(monkeypatch):
+    """A copy reused many times in one generation costs one judgement of the members, not one per reuse."""
+
+    from contracts_lifecycle import Intent
+
+    judged: list[object] = []
+    real = contracts_lifecycle._judge_handed_leaf
+
+    def counting(leaf, memo, budget):
+        judged.append(leaf)
+        return real(leaf, memo, budget)
+
+    command = _nested_member_tuples(50, 0)
+    shared = command.stage_requirements[0].precondition_source_ids
+    set_native(command.stage_requirements[0], "precondition_source_ids", (shared,) * 40)  # 1 build, 39 reuses
+    captured = contracts_lifecycle._capture_contract_graph(command)
+    memo = captured[1]
+    memo[contracts_lifecycle._GENERATION] = 1  # the copy is built in generation 1 ...
+    monkeypatch.setattr(contracts_lifecycle, "_judge_handed_leaf", counting)
+    with pytest.raises(ValueError):
+        contracts_lifecycle._revalidated_captured_model(Intent, captured)
+    built_and_reused = len(judged)
+    # each member at build, the registry once more at the first reuse, and the intent's own stage member; judging
+    # it again on every reuse would be about 50 + 39 * 50
+    assert built_and_reused <= 2 * 50 + 1, built_and_reused
+
+
+def _arm_detached_int_markers(delegate, reads):
+    """What caller code in a view can do: find this module's detached-int marker classes and make them claim and
+    delegate to a model.  Returns a restore function."""
+
+    import gc
+
+    armed = []
+
+    def impersonate(self, name):
+        if name == "__class__":
+            return type(delegate)
+        if name.startswith("_") and name not in ("__dict__", "__pydantic_fields_set__", "__pydantic_extra__"):
+            return object.__getattribute__(self, name)
+        reads.append(name)
+        return getattr(delegate, name)
+
+    def arm():
+        for kind in gc.get_objects():
+            if (
+                issubclass(type(kind), type)  # type(): other tests leave objects whose __class__ raises
+                and kind.__name__ == "DetachedInt"
+                and kind.__module__ == contracts_lifecycle.__name__
+                and "__getattribute__" not in vars(kind)
+            ):
+                type.__setattr__(kind, "__getattribute__", impersonate)
+                armed.append(kind)
+
+    def restore():
+        for kind in armed:
+            if "__getattribute__" in vars(kind):
+                type.__delattr__(kind, "__getattribute__")
+
+    return arm, restore
+
+
+@pytest.mark.parametrize("entry", ["record", "claim"])
+def test_a_detached_int_marker_armed_by_a_later_view_is_refused_before_validation_reads_it(entry):
+    """The marker class is this call's own, but a heap class all the same: caller code in a view materialized after
+    the leaf can reach it and make it claim a model.  Its leaves are judged again, like enum members."""
+
+    from contracts_lifecycle import StageError
+    from tests.test_contracts_lifecycle import intent_with_requirements, requirement
+
+    reads: list[str] = []
+    arm, restore = _arm_detached_int_markers(StageError(code="c", retryable=False, safe_message="m"), reads)
+
+    class Arming(tuple):
+        def __iter__(self):
+            arm()
+            return iter(())
+
+    command = intent_with_requirements(requirement(ProcessingStage.CANONICAL))
+    failed = receipt(ProcessingStage.CANONICAL, StageStatus.FAILED, sources=())
+    set_native(failed, "error", type("Count", (int,), {})(5))
+    set_native(failed, "upstream_applications", Arming(()))  # materialized after error, valid when empty
+    try:
+        with pytest.raises((ValueError, TypeError)):
+            if entry == "record":
+                contracts_lifecycle.validate_stage_receipts(command, (failed,))
+            else:
+                validate_required_stage_claim(claimed_status=IntentStatus.FAILED, intent=command, receipts=(failed,))
+    finally:
+        restore()
+    assert reads == []
+
+
+def test_a_detached_int_marker_armed_by_a_later_view_of_the_intent_is_never_read_through():
+    from tests.test_contracts_lifecycle import intent_with_requirements, requirement
+
+    command = intent_with_requirements(requirement(ProcessingStage.CANONICAL))
+    reads: list[str] = []
+    arm, restore = _arm_detached_int_markers(command.stage_requirements[0], reads)
+
+    class Arming(tuple):
+        def __iter__(self):
+            arm()
+            return iter(())
+
+    set_native(command, "stage_requirements", (type("Count", (int,), {})(5),))
+    set_native(command, "correlation_id", Arming(()))  # materialized after stage_requirements
+    applied = receipt(ProcessingStage.CANONICAL, StageStatus.APPLIED)
+    try:
+        with pytest.raises((ValueError, TypeError)):
+            contracts_lifecycle.validate_stage_receipts(command, (applied,))
+    finally:
+        restore()
+    assert reads == []
+
+
+def test_a_detached_int_in_a_reused_pure_copy_is_judged_again_after_its_marker_is_armed():
+    """A pure copy holding a detached int is reused in a later generation after the marker class was armed: the
+    copy's leaves are judged again (the registry holds detached ints as well as enum members), so validation never
+    reads through it.  Driven at the root step: no lifecycle position both validates and holds a tuple of ints."""
+
+    from contracts_lifecycle import Intent
+    from tests.test_contracts_lifecycle import intent_with_requirements, requirement
+
+    command = intent_with_requirements(requirement(ProcessingStage.CANONICAL))
+    reads: list[str] = []
+    arm, restore = _arm_detached_int_markers(command.stage_requirements[0], reads)
+    set_native(command.stage_requirements[0], "precondition_source_ids", (type("Count", (int,), {})(5),))
+    captured = contracts_lifecycle._capture_contract_graph(command)
+    memo = captured[1]
+    with pytest.raises(ValueError):  # an int is no source id; the copy is built all the same
+        contracts_lifecycle._revalidated_captured_model(Intent, captured)
+    arm()
+    try:
+        memo[contracts_lifecycle._GENERATION] = contracts_lifecycle._generation(memo) + 1  # as a public view does
+        with pytest.raises(ValueError, match="native scalar, an enum member"):
+            contracts_lifecycle._revalidated_captured_model(Intent, captured)
+    finally:
+        restore()
+    assert reads == []
+
+
+def _deep_text_class(depth: int) -> type:
+    kind: type = str
+    for index in range(depth):
+        kind = type(f"Text{index}", (kind,), {})
+    return kind
+
+
+def test_a_shared_text_subclass_key_walks_its_class_once_not_per_container(monkeypatch):
+    """The key-text cache is consulted before any inheritance walk, and a key class is judged once per call: one
+    deeply derived key in 2,000 containers (or 2,000 keys of that class) walks the class's MRO once."""
+
+    from tests.test_contracts_lifecycle import intent_with_requirements, requirement
+
+    deep = _deep_text_class(200)
+    walks: list[type] = []
+    real = contracts_lifecycle._TYPE_MRO
+
+    class Counting:  # every read of a class's real MRO in the module goes through this descriptor
+        def __get__(self, kind, owner=None):
+            if kind is deep:
+                walks.append(kind)
+            return real.__get__(kind)
+
+    monkeypatch.setattr(contracts_lifecycle, "_TYPE_MRO", Counting())
+    for keys in ([deep("k")] * 2_000, [deep(f"k{index}") for index in range(2_000)]):
+        command = intent_with_requirements(requirement(ProcessingStage.CANONICAL))
+        applied = receipt(ProcessingStage.CANONICAL, StageStatus.APPLIED)
+        EXTRA.__set__(applied, {"note": [{key: index} for index, key in enumerate(keys)]})
+        walks.clear()
+        with pytest.raises(ValueError):
+            contracts_lifecycle.validate_stage_receipts(command, (applied,))
+        assert len(walks) <= 1, len(walks)
+
+
+def test_the_one_walk_of_a_key_class_is_charged_by_its_depth():
+    from contracts_limits import DiscoveryBudget
+
+    def charged(depth: int) -> int:
+        budget = DiscoveryBudget(contracts_lifecycle.LIFECYCLE_TIER)
+        contracts_lifecycle._capture_native_contract_graph({_deep_text_class(depth)("k"): 1}, budget=budget)
+        return budget.edges
+
+    assert charged(400) - charged(10) >= 390  # the MRO is charged one edge per class walked
+
+
+def test_a_large_int_key_is_charged_on_every_path_that_rebuilds_its_container():
+    """Capture charges a large int key once per container, but materialization rebuilds an int-keyed container on
+    every path that reaches it and hashes the key again each time: those hashes are charged too."""
+
+    from tests.test_contracts_lifecycle import intent_with_requirements, requirement
+
+    shared = {1 << 2**20: 0}  # one container, captured (and charged) once
+    command = intent_with_requirements(requirement(ProcessingStage.CANONICAL))
+    applied = receipt(ProcessingStage.CANONICAL, StageStatus.APPLIED)
+    EXTRA.__set__(applied, {"note": [shared] * 4_000})  # 4,000 paths, each rebuilding it
+    with pytest.raises(ValueError, match=BUDGET):
+        contracts_lifecycle.validate_stage_receipts(command, (applied,))
+
+
+def test_a_small_int_key_on_many_paths_still_reaches_validation():
+    from pydantic import ValidationError
+
+    from tests.test_contracts_lifecycle import intent_with_requirements, requirement
+
+    command = intent_with_requirements(requirement(ProcessingStage.CANONICAL))
+    applied = receipt(ProcessingStage.CANONICAL, StageStatus.APPLIED)
+    EXTRA.__set__(applied, {"note": [{1 << 4_000: 0}] * 4_000})
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        contracts_lifecycle.validate_stage_receipts(command, (applied,))
+
+
+def test_output_reference_sets_compare_the_cross_tenant_marker():
+    """Two handles that differ only in ``cross_tenant`` are not the same reference: a set comparison tells them
+    apart, while one receipt still may not list both (they name one record)."""
+
+    from tests.test_contracts_lifecycle import reference
+
+    plain = reference("out-1")
+    marked = plain.model_copy(update={"cross_tenant": True})
+    assert contracts_lifecycle._reference_sets_match((plain,), (plain,))
+    assert not contracts_lifecycle._reference_sets_match((plain,), (marked,))
+    with pytest.raises(ValueError, match="duplicate handles"):
+        contracts_lifecycle._require_unique_reference_handles((plain, marked), "output_refs")
+
+
+def test_a_large_int_key_in_a_shared_models_extras_is_charged_on_every_path():
+    """A model is rebuilt on every path that reaches it (models are never reused as pure copies), so an int key in
+    its stored or extra entries is hashed, and charged, on each one."""
+
+    from tests.test_contracts_lifecycle import intent_with_requirements, requirement, source
+
+    shared = SourceVersion.model_construct(**vars(source("shared")))
+    EXTRA.__set__(shared, {1 << 2**20: 1})
+    command = intent_with_requirements(requirement(ProcessingStage.CANONICAL))
+    applied = receipt(ProcessingStage.CANONICAL, StageStatus.APPLIED)
+    set_native(applied, "applied_sources", (shared,) * 4_000)
+    with pytest.raises(ValueError, match=BUDGET):
+        contracts_lifecycle.validate_stage_receipts(command, (applied,))
+
+
+def _count_mro_reads(monkeypatch, kinds):
+    reads: list[type] = []
+    real = contracts_lifecycle._TYPE_MRO
+
+    class Counting:  # every read of a class's real MRO in the module goes through this descriptor
+        def __get__(self, kind, owner=None):
+            if kind in kinds:
+                reads.append(kind)
+            return real.__get__(kind)
+
+    monkeypatch.setattr(contracts_lifecycle, "_TYPE_MRO", Counting())
+    return reads
+
+
+@pytest.mark.parametrize("entry", ["record", "claim"])
+def test_a_deep_receipt_class_is_walked_once_per_call_not_per_receipt(monkeypatch, entry):
+    """Classifying each receipt by its real class walks that class's MRO; receipts of one class share one charged
+    walk per call instead of one or two uncharged walks per receipt."""
+
+    from tests.test_contracts_lifecycle import intent_with_requirements, requirement
+
+    kind: type = StageReceipt
+    for index in range(30):
+        kind = type(f"Receipt{index}", (kind,), {})
+    command = intent_with_requirements(requirement(ProcessingStage.CANONICAL))
+    receipts = []
+    for attempt in range(1, 201):
+        item = receipt(ProcessingStage.CANONICAL, StageStatus.FAILED, sources=(), attempt=attempt)
+        object.__setattr__(item, "__class__", kind)
+        receipts.append(item)
+    reads = _count_mro_reads(monkeypatch, {kind})
+    if entry == "record":
+        contracts_lifecycle.validate_stage_receipts(command, tuple(receipts))
+    else:
+        validate_required_stage_claim(claimed_status=IntentStatus.FAILED, intent=command, receipts=tuple(receipts))
+    assert len(reads) <= 4, len(reads)  # a few per class (classification, graph kind), never per receipt
+
+
+def test_a_deep_extras_class_is_walked_once_per_call_not_per_model(monkeypatch):
+    from tests.test_contracts_lifecycle import intent_with_requirements, requirement, source
+
+    kind: type = dict
+    for index in range(30):
+        kind = type(f"Extras{index}", (kind,), {})
+    command = intent_with_requirements(requirement(ProcessingStage.CANONICAL))
+    applied = receipt(ProcessingStage.CANONICAL, StageStatus.APPLIED)
+    sources = []
+    for index in range(200):
+        item = SourceVersion.model_construct(**vars(source(f"s{index}")))
+        EXTRA.__set__(item, kind())
+        sources.append(item)
+    set_native(applied, "applied_sources", tuple(sources))
+    reads = _count_mro_reads(monkeypatch, {kind})
+    contracts_lifecycle.validate_stage_receipts(command, (applied,))  # empty extras of a dict subclass are valid
+    assert len(reads) <= 2, len(reads)
+
+
+def test_the_one_walk_of_a_receipt_class_is_charged_by_its_depth():
+    from contracts_limits import DiscoveryBudget
+
+    from tests.test_contracts_lifecycle import intent_with_requirements, requirement
+
+    def charged(depth: int) -> int:
+        kind: type = StageReceipt
+        for index in range(depth):
+            kind = type(f"Charged{index}", (kind,), {})
+        command = intent_with_requirements(requirement(ProcessingStage.CANONICAL))
+        item = receipt(ProcessingStage.CANONICAL, StageStatus.FAILED, sources=())
+        object.__setattr__(item, "__class__", kind)
+        budgets: list[DiscoveryBudget] = []
+
+        class Recording(DiscoveryBudget):
+            __slots__ = ()
+
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                budgets.append(self)
+
+        real = contracts_lifecycle.DiscoveryBudget
+        contracts_lifecycle.DiscoveryBudget = Recording
+        try:
+            contracts_lifecycle.validate_stage_receipts(command, (item,))
+        finally:
+            contracts_lifecycle.DiscoveryBudget = real
+        return max(budget.edges for budget in budgets)
+
+    assert charged(120) - charged(10) >= 110  # the class walk is charged one edge per class in its MRO
+
+
+def test_every_instance_of_a_deep_model_class_is_charged_for_its_native_storage_read():
+    """Reading a model's native ``__dict__`` walks its class chain in C, once per instance: receipts of a 256-deep
+    class are charged for it per receipt, while shallow contract classes pay nothing extra."""
+
+    from contracts_limits import DiscoveryBudget
+
+    from tests.test_contracts_lifecycle import intent_with_requirements, requirement
+
+    deep: type = StageReceipt
+    for index in range(256):
+        deep = type(f"Stored{index}", (deep,), {})
+
+    def charged(kind: type, count: int) -> int:
+        command = intent_with_requirements(requirement(ProcessingStage.CANONICAL))
+        items = []
+        for attempt in range(1, count + 1):
+            item = receipt(ProcessingStage.CANONICAL, StageStatus.FAILED, sources=(), attempt=attempt)
+            object.__setattr__(item, "__class__", kind)
+            items.append(item)
+        budgets: list[DiscoveryBudget] = []
+
+        class Recording(DiscoveryBudget):
+            __slots__ = ()
+
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                budgets.append(self)
+
+        real = contracts_lifecycle.DiscoveryBudget
+        contracts_lifecycle.DiscoveryBudget = Recording
+        try:
+            contracts_lifecycle.validate_stage_receipts(command, tuple(items))
+        finally:
+            contracts_lifecycle.DiscoveryBudget = real
+        return max(budget.edges for budget in budgets)
+
+    per_receipt = (charged(deep, 101) - charged(deep, 1)) - (charged(StageReceipt, 101) - charged(StageReceipt, 1))
+    assert per_receipt >= 100 * (256 >> 6), per_receipt  # about one edge per 64 classes, for each receipt
+
+
+def test_each_new_container_class_walk_is_charged_by_its_depth():
+    """Classifying a container's class (model, dict, list or tuple) walks its real MRO once per class per call:
+    N distinct subclasses of one deep dict class are charged for N walks of that depth, not one edge each."""
+
+    from contracts_limits import DiscoveryBudget
+
+    def charged(depth: int, count: int = 200) -> int:
+        base: type = dict
+        for index in range(depth):
+            base = type(f"Mapping{index}", (base,), {})
+        value = [type(f"Leafy{index}", (base,), {})() for index in range(count)]
+        budget = DiscoveryBudget(contracts_lifecycle.LIFECYCLE_TIER)
+        contracts_lifecycle._capture_native_contract_graph(value, budget=budget)
+        return budget.edges
+
+    assert charged(300) - charged(1) >= 200 * 299  # each of the 200 walks is charged its 300 extra classes
+
+
+def test_field_table_keys_of_one_deep_text_class_walk_it_once_and_are_charged(monkeypatch):
+    """The declared-field scan copies each key's text; keys sharing a deeply derived ``str`` class walk that class
+    once per call (charged), not once per key."""
+
+    from tests.test_contracts_lifecycle import intent_with_requirements, requirement, source
+
+    deep = _deep_text_class(200)
+    table = {deep(f"field{index}"): None for index in range(500)}
+    table.update(SourceVersion.__pydantic_fields__)
+    kind = type("WideKeys", (SourceVersion,), {})
+    type.__setattr__(kind, "__pydantic_fields__", table)
+    item = SourceVersion.model_construct(**vars(source("w")))
+    object.__setattr__(item, "__class__", kind)
+    EXTRA.__set__(item, {"extra_note": 1})  # forces the declared-name check
+    command = intent_with_requirements(requirement(ProcessingStage.CANONICAL))
+    applied = receipt(ProcessingStage.CANONICAL, StageStatus.APPLIED)
+    set_native(applied, "applied_sources", (item,))
+    reads = _count_mro_reads(monkeypatch, {deep})
+    with pytest.raises(ValueError):
+        contracts_lifecycle.validate_stage_receipts(command, (applied,))
+    assert len(reads) <= 1, len(reads)
+
+
+def test_namespace_keys_of_one_deep_text_class_walk_it_once_and_are_charged(monkeypatch):
+    """The impersonation scan reads every key of a leaf class's namespace; keys sharing a deeply derived ``str``
+    class walk that class once per call (charged), not once per key."""
+
+    from contracts_limits import DiscoveryBudget
+
+    deep = _deep_text_class(200)
+    namespace = {deep(f"name{index}"): index for index in range(500)}
+    leafy = type("Leafy", (str,), namespace)
+    reads = _count_mro_reads(monkeypatch, {deep})
+    budget = DiscoveryBudget(contracts_lifecycle.LIFECYCLE_TIER)
+    contracts_lifecycle._capture_native_contract_graph((leafy("x"),), budget=budget)
+    assert len(reads) <= 1, len(reads)
+    monkeypatch.undo()
+    shallow = type("Leafy", (str,), {str(key): value for key, value in namespace.items()})
+    flat = DiscoveryBudget(contracts_lifecycle.LIFECYCLE_TIER)
+    contracts_lifecycle._capture_native_contract_graph((shallow("x"),), budget=flat)
+    assert budget.edges - flat.edges >= 200  # the deep key class's one walk is charged
+
+
+def test_model_classes_sharing_a_field_table_share_one_copy_of_each_subclass_key():
+    """Each class's declared-name set is kept per class, but a ``str``-subclass key's text is copied once per call
+    and shared: 200 classes sharing one table with a 256 KiB subclass key keep one copy, not 200."""
+
+    import tracemalloc
+
+    from tests.test_contracts_lifecycle import intent_with_requirements, requirement, source
+
+    class Text(str):
+        pass
+
+    table = {Text("k" * (256 * 1024)): None}
+    table.update(SourceVersion.__pydantic_fields__)
+    sources = []
+    for index in range(200):
+        kind = type(f"SharedTable{index}", (SourceVersion,), {})
+        type.__setattr__(kind, "__pydantic_fields__", table)
+        item = SourceVersion.model_construct(**vars(source(f"t{index}")))
+        object.__setattr__(item, "__class__", kind)
+        EXTRA.__set__(item, {"extra_note": 1})  # forces the declared-name check
+        sources.append(item)
+    command = intent_with_requirements(requirement(ProcessingStage.CANONICAL))
+    applied = receipt(ProcessingStage.CANONICAL, StageStatus.APPLIED)
+    set_native(applied, "applied_sources", tuple(sources))
+    tracemalloc.start()
+    try:
+        with pytest.raises(ValueError):
+            contracts_lifecycle.validate_stage_receipts(command, (applied,))
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert peak < 8 * 2**20, peak  # one 256 KiB text, not one per class (50 MiB)
+
+
+def test_a_long_namespace_key_is_never_copied_to_be_compared_with_the_hook_names():
+    """The impersonation scan compares namespace keys with short hook names: a ``str``-subclass key longer than any
+    of them cannot spell one, so it is ruled out by its native length, never copied (once per inheriting class)."""
+
+    import tracemalloc
+
+    class Text(str):
+        pass
+
+    base = type("Holder", (str,), {Text("k" * (16 * 2**20)): 1})
+    leaves = tuple(type(f"Holder{index}", (base,), {})("x") for index in range(40))
+    tracemalloc.start()
+    try:
+        contracts_lifecycle._capture_native_contract_graph(leaves)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert peak < 4 * 2**20, peak  # no 16 MiB copy of the key, for any of the 40 classes
+
+
+def test_a_short_subclass_key_spelling_a_hook_name_still_claims():
+    class Text(str):
+        pass
+
+    kind = type("Claiming", (str,), {Text("__getattribute__"): lambda self, name: object.__getattribute__(self, name)})
+    with pytest.raises(ValueError):
+        contracts_lifecycle._capture_native_contract_graph((kind("x"),))
