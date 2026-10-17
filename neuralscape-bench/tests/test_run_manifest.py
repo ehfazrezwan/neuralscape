@@ -6073,3 +6073,193 @@ def test_a_stateful_key_that_claims_to_be_text_is_refused_by_type_not_by_its_cla
     dict.__setitem__(storage, "observed_value", True)
     with pytest.raises(ValueError, match="unsupported key type"):
         _finish_with_resource(reading)
+
+
+# ---- caller-overridable inventories are read once: a stateful field list cannot drop a captured value
+
+class _ShrinkingFields(dict):
+    """The model's field inventory; every iteration after the first leaves ``limit_value`` out."""
+
+    def __init__(self, fields):
+        super().__init__(fields)
+        self.iterations = 0
+
+    def __iter__(self):
+        self.iterations += 1
+        names = list(dict.__iter__(self))
+        return iter(names if self.iterations == 1 else [name for name in names if name != "limit_value"])
+
+    def __contains__(self, name):
+        self.iterations += 1
+        return dict.__contains__(self, name) and (self.iterations == 1 or name != "limit_value")
+
+
+def _resource_with_a_stateful_field_inventory():
+    base_meta = type(ResourceReading)
+
+    class StatefulMeta(base_meta):
+        @property
+        def model_fields(cls):   # type: ignore[override]
+            return cls._inventory
+
+    class StatefulReading(ResourceReading, metaclass=StatefulMeta):
+        pass
+
+    StatefulReading._inventory = _ShrinkingFields(ResourceReading.model_fields)
+    values = measured_memory().model_dump()
+    values.update(limit_kind=LimitKind.UNBOUNDED, limit_value=True, observed_kind=ObservationKind.MEASURED)
+    values["observation_kind"] = ObservationKind.MEASURED
+    values.pop("observed_kind", None)
+    return StatefulReading.model_construct(**values), StatefulReading._inventory
+
+
+def _error_locations(error) -> set[str]:
+    return {".".join(str(part) for part in item["loc"]) for item in error.errors()}
+
+
+def test_a_field_inventory_that_changes_between_reads_cannot_drop_a_captured_value_through_serialization() -> None:
+    resource, inventory = _resource_with_a_stateful_field_inventory()
+    manifest = completed_manifest()
+    object.__setattr__(manifest, "resources", (resource,))
+    with pytest.raises(ValidationError) as caught:   # limit_value=True is invalid; a dropped value would let the default None through
+        serialize_run_manifest(manifest)
+    assert any(location.endswith("limit_value") for location in _error_locations(caught.value)), caught.value
+    assert inventory.iterations >= 1
+
+
+def test_a_field_inventory_that_changes_between_reads_cannot_drop_a_captured_value_through_finish() -> None:
+    """The planned envelope is unbounded too, so a dropped ``limit_value`` would be the only difference: it would be accepted."""
+
+    resource, _inventory = _resource_with_a_stateful_field_inventory()
+    unbounded = ResourceReading(
+        schema_version=VERSION, scope="api-container", resource="memory", unit="bytes",
+        limit_kind=LimitKind.UNBOUNDED, limit_value=None, observation_kind=ObservationKind.PENDING,
+    )
+    planned = planned_manifest().model_copy(update={"resources": (unbounded,)})
+    with pytest.raises(ValidationError) as caught:
+        finish_run(
+            planned,
+            state=RunState.COMPLETED,
+            started_at=datetime(2026, 9, 28, 8, 0, tzinfo=timezone.utc),
+            finished_at=datetime(2026, 9, 28, 8, 1, tzinfo=timezone.utc),
+            resources=(resource,),
+            measurements=(timing(),),
+        )
+    assert any(location.endswith("limit_value") for location in _error_locations(caught.value)), caught.value
+
+
+def test_the_snapshot_keeps_every_captured_stored_entry_whatever_the_field_inventory_says() -> None:
+    resource, inventory = _resource_with_a_stateful_field_inventory()
+    snapshot = _snapshot_native(resource)    # the snapshot does not validate: it must simply keep what was captured
+    assert snapshot["limit_value"] is True and set(snapshot) == set(dict.keys(BASE_MODEL_DICT_DESCRIPTOR.__get__(resource, pydantic.BaseModel))), snapshot
+
+
+def test_an_honest_resource_snapshot_still_lists_its_fields_in_declaration_order() -> None:
+    snapshot = _snapshot_native(measured_memory())
+    assert list(snapshot) == [name for name in ResourceReading.model_fields if name in snapshot]
+
+
+# ---- an input document is copied to exact text or bytes once, and every parser reads that copy
+
+def _duplicate_key_document() -> bytes:
+    text = serialize_run_manifest(completed_manifest()).decode()
+    return text.replace('"run_id":"run-001"', '"run_id":"run-001","run_id":"run-001"', 1).encode()
+
+
+def test_a_bytes_subclass_with_its_own_decode_cannot_show_one_parser_a_cleaner_document() -> None:
+    clean = serialize_run_manifest(completed_manifest()).decode()
+    dirty = _duplicate_key_document()
+    assert dirty != clean.encode()
+
+    class CleanDecode(bytes):
+        def decode(self, *args, **kwargs):
+            return clean
+
+    with pytest.raises(ValueError, match="duplicate JSON key"):
+        validate_run_manifest_json(CleanDecode(dirty))
+
+
+def test_a_bytes_subclass_with_its_own_bytes_method_is_copied_from_its_buffer() -> None:
+    clean = serialize_run_manifest(completed_manifest())
+    dirty = _duplicate_key_document()
+
+    class CleanBytes(bytes):
+        def __bytes__(self):
+            return clean
+
+    with pytest.raises(ValueError, match="duplicate JSON key"):
+        validate_run_manifest_json(CleanBytes(dirty))
+
+
+def test_a_text_subclass_with_hooks_is_copied_and_runs_none_of_them() -> None:
+    log: list[str] = []
+    document = serialize_run_manifest(completed_manifest()).decode()
+
+    class Hooked(str):
+        def startswith(self, *args, **kwargs):
+            log.append("startswith")
+            return False
+
+        def __len__(self):
+            log.append("__len__")
+            return 1
+
+        def __str__(self):
+            log.append("__str__")
+            return "{}"
+
+    manifest = validate_run_manifest_json(Hooked(document))
+    assert manifest.run_id == completed_manifest().run_id and log == [], log
+
+
+def test_a_bytes_subclass_is_read_as_its_own_bytes() -> None:
+    class Plain(bytes):
+        pass
+
+    document = serialize_run_manifest(completed_manifest())
+    assert validate_run_manifest_json(Plain(document)) == validate_run_manifest_json(document)
+
+
+def test_other_input_types_are_refused() -> None:
+    for bad in (None, 3, [], bytearray(b"{}")):
+        with pytest.raises(TypeError, match="text or bytes"):
+            validate_run_manifest_json(bad)   # type: ignore[arg-type]
+
+
+def test_a_bytes_subclass_with_its_own_buffer_view_is_copied_from_its_real_bytes() -> None:
+    # A Python-level __buffer__ is consulted from Python 3.12 only; on earlier versions the hook is simply never asked.
+    log: list[str] = []
+    clean = serialize_run_manifest(completed_manifest())
+    dirty = _duplicate_key_document()
+
+    class CleanBuffer(bytes):
+        def __buffer__(self, flags):
+            log.append("__buffer__")
+            return memoryview(clean)
+
+    with pytest.raises(ValueError, match="duplicate JSON key"):
+        validate_run_manifest_json(CleanBuffer(dirty))
+    assert log == [], log
+
+
+def test_a_bytes_subclass_overriding_item_access_is_copied_from_its_real_bytes() -> None:
+    log: list[str] = []
+    clean = serialize_run_manifest(completed_manifest())
+    dirty = _duplicate_key_document()
+
+    class Slippery(bytes):
+        def __getitem__(self, index):
+            log.append("__getitem__")
+            return clean[index]
+
+        def __iter__(self):
+            log.append("__iter__")
+            return iter(clean)
+
+        def __len__(self):
+            log.append("__len__")
+            return len(clean)
+
+    with pytest.raises(ValueError, match="duplicate JSON key"):
+        validate_run_manifest_json(Slippery(dirty))
+    assert log == [], log
