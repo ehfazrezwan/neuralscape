@@ -4620,3 +4620,33 @@ def test_a_statement_with_an_unjudged_term_is_reported_and_one_at_its_default_is
     assert _unjudged_terms(Qualified(**base, unjudged_future_term={"kind": "x"})) == ("unjudged_future_term",)
     assert _unjudged_terms(Qualified(**base)) == ()
     assert _unjudged_terms(PolicyStatement(**base)) == ()
+
+
+def test_a_reach_tuple_is_scanned_and_charged_once_per_capture() -> None:
+    """A list of 1,000 mapping proxies, reachable from the root and exposed by each of 60 pairs: its
+    reach tuple is scanned (and charged) once per capture.  Each pair still walks the list it exposes
+    (about 2,100 edges per pair, 126,065 in all), so a rescan of the reach tuple for every pair (1,000
+    more each) would exceed the standard edge budget; this pins both the skip and the single charge."""
+
+    proxies = [MappingProxyType({"k": index}) for index in range(1_000)]
+
+    def pairs():
+        for index in range(60):
+            yield (f"k{index}", proxies)
+
+    budget_edges = []
+    original = DiscoveryBudget.charge_edge
+
+    def counting(self, count=1):
+        budget_edges.append(count)
+        return original(self, count)
+
+    import contracts_limits
+
+    contracts_limits.DiscoveryBudget.charge_edge = counting
+    try:
+        _entry_flow((proxies, _Items(pairs)))
+    finally:
+        contracts_limits.DiscoveryBudget.charge_edge = original
+    total = sum(budget_edges)
+    assert total <= 127_000, total  # inside the 131,072-edge budget only if the reach tuple is charged once
