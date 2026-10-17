@@ -212,6 +212,30 @@ def _is_declared_member(value: object) -> bool:
     return type(members) is dict and any(member is value for member in dict.values(members))
 
 
+_IMPERSONATION_HOOKS = ("__class__", "__getattribute__")
+_TYPE_FLAGS = type.__dict__["__flags__"]
+_HEAP_TYPE = 1 << 9  # Py_TPFLAGS_HEAPTYPE: a class created by a class statement (or ``type(...)``)
+
+
+def _claims_another_class(kind: type) -> bool:
+    """Whether a class written in Python in ``kind``'s MRO defines ``__class__`` or ``__getattribute__``.
+
+    Those are the two ways an object answers ``isinstance`` with a class it is not, or redirects the
+    attribute reads validation makes (``__dict__``, the field set): a ``str`` subclass claiming a model
+    class would otherwise reach a model-typed position as a "scalar" and hand validation storage that
+    capture never traversed or charged.  Only heap types are inspected (the built-in types, whose own
+    slots define these names, are fixed); flags and namespaces are read natively, so no hook runs.
+    """
+
+    for base in _TYPE_MRO.__get__(kind):
+        if not _TYPE_FLAGS.__get__(base) & _HEAP_TYPE:
+            continue
+        namespace = _TYPE_NAMESPACE.__get__(base)
+        if any(hook in namespace for hook in _IMPERSONATION_HOOKS):
+            return True
+    return False
+
+
 def _native_leaf(value: object) -> object:
     """Admit a leaf only when its real type is a native scalar, or an enum member by identity.
 
@@ -222,6 +246,8 @@ def _native_leaf(value: object) -> object:
     """
 
     mro = _TYPE_MRO.__get__(type(value))
+    if _claims_another_class(type(value)):
+        raise ValueError("a contract value must be a native scalar, an enum member, a model or a container")
     if any(base is Enum for base in mro):
         if not _is_declared_member(value):
             raise ValueError("an enum value must be a declared member of its enum")

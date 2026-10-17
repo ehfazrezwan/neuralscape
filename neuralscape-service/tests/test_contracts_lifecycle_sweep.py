@@ -992,3 +992,92 @@ def test_a_metaclass_that_claims_a_forged_instance_as_a_member_cannot_make_it_on
         contracts_lifecycle.validate_stage_receipts(command, (applied,))
     with pytest.raises(ValueError, match="declared member"):
         validate_required_stage_claim(claimed_status=IntentStatus.APPLIED, intent=command, receipts=(applied,))
+
+
+def _scalar_proxy(kind: str, target: object, reads: list[str]):
+    """A ``str`` subclass that claims ``type(target)`` and delegates its storage to ``target``."""
+
+    claimed = type(target)
+    if kind == "class-property":
+
+        class Proxy(str):
+            @property
+            def __class__(self):
+                return claimed
+
+            def __getattr__(self, name):
+                reads.append(name)
+                return getattr(target, name)
+
+    elif kind == "getattribute":
+
+        class Proxy(str):
+            def __getattribute__(self, name):
+                if name == "__class__":
+                    return claimed
+                reads.append(name)
+                return getattr(target, name)
+
+    elif kind == "enum-member":
+        import enum
+
+        class Proxy(str, enum.Enum):  # a genuine member of the caller's own enum
+            REQUIREMENT = "requirement"
+
+            def __getattribute__(self, name):
+                if name == "__class__":
+                    return claimed
+                if name in ("__dict__", "__pydantic_fields_set__", "__pydantic_extra__"):
+                    reads.append(name)
+                    return getattr(target, name)
+                return super().__getattribute__(name)
+
+        return Proxy.REQUIREMENT
+    else:
+
+        class Proxy(str):
+            @property
+            def __class__(self):
+                return claimed
+
+            def __getattribute__(self, name):
+                if name == "__class__":
+                    return claimed
+                reads.append(name)
+                return getattr(target, name)
+
+    return Proxy("requirement")
+
+
+@pytest.mark.parametrize("kind", ["class-property", "getattribute", "both", "enum-member"])
+def test_a_scalar_subclass_claiming_a_model_is_refused_before_its_delegated_graph_is_read(kind):
+    """A ``str`` subclass passes as a scalar leaf; claiming a model class, it would hand validation a delegated
+    graph that capture never charged.  It is refused at capture, and nothing is read through it."""
+
+    from tests.test_contracts_lifecycle import intent_with_requirements, requirement
+
+    command = intent_with_requirements(requirement(ProcessingStage.CANONICAL))
+    delegate = command.stage_requirements[0]
+    source = command.source_preconditions[0]
+    set_native(delegate, "committed_sources", (source,) * 140_000)  # past the claim's discovery budget
+    reads: list[str] = []
+    set_native(command, "stage_requirements", (_scalar_proxy(kind, delegate, reads),))
+    applied = receipt(ProcessingStage.CANONICAL, StageStatus.APPLIED)
+    with pytest.raises(ValueError, match="native"):
+        contracts_lifecycle.validate_stage_receipts(command, (applied,))
+    with pytest.raises(ValueError, match="native"):
+        validate_required_stage_claim(claimed_status=IntentStatus.APPLIED, intent=command, receipts=(applied,))
+    assert reads == []
+
+
+def test_plain_scalar_subclasses_are_still_admitted_in_scalar_fields():
+    from tests.test_contracts_lifecycle import intent_with_requirements, requirement
+
+    class Digest(str):
+        pass
+
+    command = intent_with_requirements(requirement(ProcessingStage.CANONICAL))
+    set_native(command, "request_digest", Digest("sha256:abc"))
+    applied = receipt(ProcessingStage.CANONICAL, StageStatus.APPLIED)
+    kept_intent, _kept = contracts_lifecycle.validate_stage_receipts(command, (applied,))
+    assert kept_intent.request_digest == "sha256:abc"
