@@ -2416,6 +2416,7 @@ def test_frozen_native_dict_projection_unhashable_key_is_located(
         frozen_dicts,
         frozen_tuples,
         visited,
+        budget,
     ) -> None:
         original_freeze(
             value,
@@ -2423,6 +2424,7 @@ def test_frozen_native_dict_projection_unhashable_key_is_located(
             frozen_dicts,
             frozen_tuples,
             visited,
+            budget,
         )
         if value is target:
             injected_targets.append(value)
@@ -4198,3 +4200,74 @@ def run_discovery_message() -> str:
     from contracts_limits import DISCOVERY_BUDGET_MESSAGE
 
     return DISCOVERY_BUDGET_MESSAGE
+
+
+# ---- native capture shares the call's envelope: storage is charged before it is copied
+
+def _counting_freeze(monkeypatch) -> dict:
+    calls = {"n": 0}
+    real = usage_reconcile_contracts._freeze_model_storage
+
+    def counted(*args, **kwargs):
+        calls["n"] += 1
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(usage_reconcile_contracts, "_freeze_model_storage", counted)
+    return calls
+
+
+def test_a_recipients_tuple_over_the_edge_limit_is_refused_before_it_is_walked(monkeypatch) -> None:
+    from contracts_limits import STANDARD
+
+    recipients = tuple(f"r{index}" for index in range(STANDARD.max_edges + 1))
+    event = _event(attribution=_attribution(recipients=recipients))
+    calls = _counting_freeze(monkeypatch)
+    with pytest.raises(ValueError, match=run_discovery_message()):
+        usage_reconcile_contracts._native_snapshot(event)
+    assert calls["n"] < 100, "the over-limit tuple was walked before it was refused"
+    with pytest.raises(UsageReconciliationError):
+        reconcile_usage_events([event])
+
+
+def test_many_small_containers_that_together_exceed_the_envelope_are_refused(monkeypatch) -> None:
+    from contracts_limits import STANDARD
+
+    # each tuple is tiny; together they are more nodes and edges than one call may capture
+    shape = {"k": tuple((index,) for index in range(STANDARD.max_edges // 2 + 1))}
+    calls = _counting_freeze(monkeypatch)
+    with pytest.raises(ValueError, match=run_discovery_message()):
+        usage_reconcile_contracts._native_snapshot(shape)
+    assert calls["n"] <= 2 * STANDARD.max_nodes + 2  # a tuple and its scalar per entry, cut at the node limit
+
+
+def test_honest_large_inputs_inside_the_envelope_are_still_captured_once() -> None:
+    recipients = tuple(f"r{index}" for index in range(100_000))
+    event = _event(attribution=_attribution(recipients=recipients))
+    assert usage_reconcile_contracts._native_snapshot(event)["attribution"]["recipients"] == recipients
+    assert len(reconcile_usage_events([event]).streams) == 1
+    # an exact list is charged when it is captured, not a second time when it is rebuilt
+    assert len(usage_reconcile_contracts._native_snapshot({"k": list(range(120_000))})["k"]) == 120_000
+
+
+def test_a_list_grown_by_a_callback_after_its_capture_is_rebuilt_from_the_capture() -> None:
+    from contracts_limits import STANDARD
+
+    victim = [1, 2, 3]
+
+    class Grower(Mapping):
+        def __getitem__(self, key):
+            raise KeyError(key)
+
+        def __iter__(self):
+            return iter(())
+
+        def __len__(self):
+            return 0
+
+        def items(self):
+            victim.extend(range(STANDARD.max_edges + 10))  # runs while the graph is rebuilt
+            return iter(())
+
+    snapshot = usage_reconcile_contracts._native_snapshot({"a": Grower(), "b": victim})
+    assert snapshot["b"] == [1, 2, 3]  # what was captured (and charged), not the grown list
+    assert len(victim) > STANDARD.max_edges

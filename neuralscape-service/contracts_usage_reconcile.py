@@ -105,6 +105,33 @@ def _session_budget(memo: dict) -> DiscoveryBudget:
     return budget
 
 
+def _precheck(budget: DiscoveryBudget, count: int) -> None:
+    """Refuse to copy native storage that cannot fit the remaining edge allowance (before copying it)."""
+
+    if count > budget.tier.max_edges - budget.edges:
+        budget.charge_edge(count)  # raises the stable budget error
+
+
+def _sequence_items(
+    value: object,
+    exact: type,
+    captured: dict[int, tuple[object, tuple[object, ...]]],
+    budget: DiscoveryBudget,
+) -> Iterable[object]:
+    """The items a list or set is rebuilt from.
+
+    An instance of exactly ``exact`` is rebuilt from what its capture copied (and charged), not read
+    again: a callback that ran since then cannot grow it past the envelope.  A subclass keeps its
+    public view, which is a further read and is charged as it is read.
+    """
+
+    if type(value) is exact:
+        held = captured.get(id(value))
+        if held is not None and held[0] is value:
+            return held[1]
+    return _charged(value, budget)
+
+
 def _charged(entries: Iterable[object], budget: DiscoveryBudget) -> Iterator[object]:
     """Yield each entry of a public view after charging it, so an endless or huge view is cut off."""
 
@@ -435,15 +462,20 @@ def _freeze_model_storage(
     frozen_dicts: dict[int, _FrozenDictStorage],
     frozen_tuples: dict[int, _FrozenTupleStorage],
     visited: set[int],
+    budget: DiscoveryBudget,
 ) -> None:
-    """Capture reachable native model stores without public traversal hooks."""
+    """Capture reachable native model stores without public traversal hooks.
+
+    Every capture is charged to the call's one envelope: each object once as a node, and each
+    container's native entries as edges, checked against what is left before they are copied.
+    """
 
     depth = getattr(_freeze_state, "depth", 0)
     if depth > STANDARD.max_depth:
         raise ValueError(DISCOVERY_BUDGET_MESSAGE)  # nesting beyond the envelope is refused, not recursed into
     _freeze_state.depth = depth + 1
     try:
-        _freeze_model_storage_body(value, frozen_models, frozen_dicts, frozen_tuples, visited)
+        _freeze_model_storage_body(value, frozen_models, frozen_dicts, frozen_tuples, visited, budget)
     finally:
         _freeze_state.depth = depth
 
@@ -454,6 +486,7 @@ def _freeze_model_storage_body(
     frozen_dicts: dict[int, _FrozenDictStorage],
     frozen_tuples: dict[int, _FrozenTupleStorage],
     visited: set[int],
+    budget: DiscoveryBudget,
 ) -> None:
 
     value_type = type(value)
@@ -467,22 +500,26 @@ def _freeze_model_storage_body(
     if identity in visited:
         return
     visited.add(identity)
+    if not budget.charge_node(value):
+        return  # already captured in this call (a later freeze starts with a fresh ``visited``)
 
     if inherits_native(value_type, BaseModel):
         frozen_model = frozen_models.get(identity)
         if frozen_model is not None and frozen_model[0] is value:
             return
         stored = _MODEL_DICT_DESCRIPTOR.__get__(value, BaseModel)
+        _precheck(budget, dict.__len__(stored))
         stored_items = tuple(dict.items(stored))
+        budget.charge_edge(len(stored_items))
         try:
             extras = _MODEL_EXTRAS_DESCRIPTOR.__get__(value, BaseModel)
         except AttributeError:
             extras = None
-        native_extra_items = (
-            tuple(dict.items(extras))
-            if extras is not None and inherits_native(type(extras), dict)
-            else None
-        )
+        native_extra_items = None
+        if extras is not None and inherits_native(type(extras), dict):
+            _precheck(budget, dict.__len__(extras))
+            native_extra_items = tuple(dict.items(extras))
+            budget.charge_edge(len(native_extra_items))
         group_texts: list[set[object]] = []
         for group in (stored_items, native_extra_items or ()):
             if any(not _inherits_str(type(name)) for name, _item in group):
@@ -508,6 +545,7 @@ def _freeze_model_storage_body(
                 frozen_dicts,
                 frozen_tuples,
                 visited,
+                budget,
             )
         if native_extra_items is not None:
             for _name, field_value in native_extra_items:
@@ -517,6 +555,7 @@ def _freeze_model_storage_body(
                     frozen_dicts,
                     frozen_tuples,
                     visited,
+                    budget,
                 )
         return
 
@@ -524,22 +563,36 @@ def _freeze_model_storage_body(
         frozen_dict = frozen_dicts.get(identity)
         if frozen_dict is not None and frozen_dict[0] is value:
             return
+        _precheck(budget, dict.__len__(value))
         native_items = tuple(dict.items(value))
+        budget.charge_edge(len(native_items))
         frozen_dicts[identity] = (value, native_items)
         items = (item for _key, item in native_items)
     elif inherits_native(value_type, list):
-        items = list.__iter__(value)
+        _precheck(budget, list.__len__(value))
+        items = tuple(list.__iter__(value))
+        budget.charge_edge(len(items))
+        # rebuilt from this capture (owner retained): a callback that grows the list later is not read
+        frozen_tuples[identity] = (value, items)
     elif inherits_native(value_type, tuple):
         frozen_tuple = frozen_tuples.get(identity)
         if frozen_tuple is not None and frozen_tuple[0] is value:
             return
+        _precheck(budget, tuple.__len__(value))
         native_items = tuple(tuple.__iter__(value))
+        budget.charge_edge(len(native_items))
         frozen_tuples[identity] = (value, native_items)
         items = iter(native_items)
     elif inherits_native(value_type, set):
-        items = set.__iter__(value)
+        _precheck(budget, set.__len__(value))
+        items = tuple(set.__iter__(value))
+        budget.charge_edge(len(items))
+        frozen_tuples[identity] = (value, items)
     else:
-        items = frozenset.__iter__(value)
+        _precheck(budget, frozenset.__len__(value))
+        items = tuple(frozenset.__iter__(value))
+        budget.charge_edge(len(items))
+        frozen_tuples[identity] = (value, items)
     for item in items:
         _freeze_model_storage(
             item,
@@ -547,6 +600,7 @@ def _freeze_model_storage_body(
             frozen_dicts,
             frozen_tuples,
             visited,
+            budget,
         )
 
 
@@ -602,6 +656,7 @@ def _snapshot_uncached(
     unchecked model copies so the destination contract can reject them.
     """
 
+    budget = _session_budget(_memo)  # the one envelope of this call, shared by capture and rebuild
     if (
         _frozen_models is None
         or _frozen_dicts is None
@@ -619,6 +674,7 @@ def _snapshot_uncached(
             _frozen_dicts,
             _frozen_tuples,
             set(),
+            budget,
         )
     if active is None:
         active = set()
@@ -629,7 +685,6 @@ def _snapshot_uncached(
     if identity in active:
         raise ValueError("cyclic input graph")
     active.add(identity)
-    budget = _session_budget(_memo)
     try:
         if len(active) > STANDARD.max_depth:
             raise ValueError(DISCOVERY_BUDGET_MESSAGE)
@@ -642,6 +697,7 @@ def _snapshot_uncached(
                     _frozen_dicts,
                     _frozen_tuples,
                     set(),
+                    budget,
                 )
                 frozen = _frozen_models[identity]
             _model, stored_items, extras, native_extra_items = frozen
@@ -780,7 +836,7 @@ def _snapshot_uncached(
                     _frozen_tuples=_frozen_tuples,
                     _memo=_memo,
                 )
-                for item in _charged(value, budget)
+                for item in _sequence_items(value, list, _frozen_tuples, budget)
             ]
         if is_native_instance(value, tuple):
             frozen_tuple = _frozen_tuples.get(identity)
@@ -791,6 +847,7 @@ def _snapshot_uncached(
                     _frozen_dicts,
                     _frozen_tuples,
                     set(),
+                    budget,
                 )
                 frozen_tuple = _frozen_tuples[identity]
             return tuple(
@@ -813,7 +870,9 @@ def _snapshot_uncached(
                 _frozen_tuples=_frozen_tuples,
                 _memo=_memo,
             )
-            for item in _charged(value, budget)
+            for item in _sequence_items(
+                value, set if is_native_instance(value, set) else frozenset, _frozen_tuples, budget
+            )
         ]
         try:
             return set(members) if is_native_instance(value, set) else frozenset(members)
