@@ -6460,3 +6460,64 @@ def test_an_inventory_name_that_lies_about_its_length_is_measured_by_the_base_me
     with pytest.raises(ValueError) as caught:
         serialize_run_manifest(_manifest_of_instances(cls, 5))
     assert str(caught.value) == run_manifest_module.SNAPSHOT_BUDGET_MESSAGE and log == [], log
+
+
+# ---- a self-iterating inventory is iterated exactly once
+
+class _SelfIteratingInventory:
+    """``__iter__`` returns the object itself and refuses a second call: the inventory can be iterated once only."""
+
+    def __init__(self, names):
+        self.names = list(names)
+        self.iter_calls = 0
+        self.position = 0
+
+    def __iter__(self):
+        self.iter_calls += 1
+        if self.iter_calls > 1:
+            raise RuntimeError("this inventory cannot be iterated twice")
+        return self
+
+    def __next__(self):
+        if self.position >= len(self.names):
+            raise StopIteration
+        self.position += 1
+        return self.names[self.position - 1]
+
+
+def _resource_with_a_self_iterating_inventory():
+    base_meta = type(ResourceReading)
+
+    class OnceMeta(base_meta):
+        @property
+        def model_fields(cls):   # type: ignore[override]
+            return cls._inventory
+
+    class OnceReading(ResourceReading, metaclass=OnceMeta):
+        pass
+
+    OnceReading._inventory = _SelfIteratingInventory(ResourceReading.model_fields)
+    return OnceReading.model_construct(**measured_memory().model_dump()), OnceReading._inventory
+
+
+def test_a_self_iterating_inventory_is_iterated_exactly_once() -> None:
+    resource, inventory = _resource_with_a_self_iterating_inventory()
+    snapshot = _snapshot_native(resource)
+    assert inventory.iter_calls == 1
+    assert set(snapshot) == set(measured_memory().model_dump())
+
+
+def test_a_self_iterating_inventory_works_through_serialization() -> None:
+    resource, inventory = _resource_with_a_self_iterating_inventory()
+    manifest = completed_manifest()
+    object.__setattr__(manifest, "resources", (resource,))
+    assert serialize_run_manifest(manifest)
+    assert inventory.iter_calls == 1
+
+
+def test_a_self_iterating_inventory_over_the_bound_is_still_refused_after_one_iteration() -> None:
+    resource, inventory = _resource_with_a_self_iterating_inventory()
+    inventory.names = [f"extra-{index}" for index in range(200)]
+    with pytest.raises(ValueError) as caught:
+        _snapshot_native(resource)
+    assert str(caught.value) == run_manifest_module.SNAPSHOT_BUDGET_MESSAGE and inventory.iter_calls == 1

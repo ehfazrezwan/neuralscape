@@ -1273,7 +1273,7 @@ def _read_field_inventory(model_type: type, frozen_graph: _FrozenGraph) -> froze
     known = frozen_graph.field_inventories.get(id(model_type))
     if known is not None and known[0] is model_type:
         return known[1]
-    produced = list(itertools.islice(iter(model_type.model_fields), _MAX_FIELD_INVENTORY + 1))  # type: ignore[attr-defined]
+    produced = list(itertools.islice(model_type.model_fields, _MAX_FIELD_INVENTORY + 1))  # type: ignore[attr-defined]  # islice takes the one iter() itself
     if len(produced) > _MAX_FIELD_INVENTORY:
         raise ValueError(SNAPSHOT_BUDGET_MESSAGE)
     for name in produced:
