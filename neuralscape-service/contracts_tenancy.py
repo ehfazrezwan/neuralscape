@@ -7,6 +7,7 @@ allocate resources, grant authority, or select a shared-plane or cell topology.
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Iterator, Mapping
+from types import MappingProxyType
 from typing import Literal, TypeVar
 
 from pydantic import BaseModel, TypeAdapter, model_validator
@@ -45,6 +46,74 @@ _OPAQUE_ID_ADAPTER = TypeAdapter(OpaqueId)
 _SAFE_COUNTER_ADAPTER = TypeAdapter(SafeCounter)
 _PYDANTIC_DICT_DESCRIPTOR = BaseModel.__dict__["__dict__"]
 _PYDANTIC_EXTRA_DESCRIPTOR = BaseModel.__dict__["__pydantic_extra__"]
+
+
+_TYPE_MRO = type.__dict__["__mro__"]
+
+
+def _inherits(candidate: type, base: type) -> bool:
+    """Whether ``base`` is in the class's own MRO, ignoring ABC registration and metaclass hooks."""
+
+    return any(entry is base for entry in _TYPE_MRO.__get__(candidate))
+
+
+def _is_real_mapping(value: object) -> bool:
+    """A mapping subclass, or the one read-only view that only registers; never a registered-only class."""
+
+    candidate = type(value)
+    return (
+        candidate is MappingProxyType
+        or _inherits(candidate, dict)
+        or _inherits(candidate, Mapping)
+    )
+
+
+def unpack_pairs(
+    entries: Iterable[object], on_pair: Callable[[object], None] | None = None
+) -> tuple[tuple[object, object], ...]:
+    """Unpack each caller-owned ``(key, value)`` pair exactly once into a plain tuple.
+
+    A pair object is arbitrary caller code: it may answer differently each time it is
+    unpacked.  Every consumer (name checks, overlap checks, field construction) must use
+    the returned tuples and never the caller's pair objects again.
+
+    ``on_pair`` is called with each value right after its pair is unpacked and before the
+    iterator is advanced, so a caller can capture a value the moment the view exposes it
+    (advancing a caller-owned iterator is arbitrary code that may repair an exposed child).
+    """
+
+    unpacked: list[tuple[object, object]] = []
+    for entry in entries:
+        key, value = entry  # type: ignore[misc]
+        if on_pair is not None:
+            on_pair(value)
+        unpacked.append((key, value))
+    return tuple(unpacked)
+
+
+def _plain_key(key: object) -> object:
+    """A text-subclass key as plain text, read without running its own hooks; other keys unchanged."""
+
+    if type(key) is str or not _inherits(type(key), str):
+        return key
+    return str.__str__(key)  # type: ignore[arg-type]
+
+
+def _refuse_duplicate_texts(*entry_groups: tuple[tuple[object, object], ...]) -> None:
+    """Refuse two stored field names that read as one text (ambiguous input).
+
+    The text is read with the built-in accessor, so a text subclass's own hooks do not run here.
+    Each group is checked on its own.  (Native extras are refused outright by the caller, so a text
+    shared between model storage and extras never reaches an accepting path.)
+    """
+
+    for entries in entry_groups:
+        for name, _value in entries:
+            if not _inherits(type(name), str):
+                raise ValueError("contract input field names must be text")
+        texts = [_plain_key(name) for name, _value in entries]
+        if len(set(texts)) != len(texts):
+            raise ValueError("contract input field names must be unique text")
 
 
 def _model_extra_storage(value: BaseModel) -> object:
@@ -153,10 +222,11 @@ def _closed_graph_snapshot_session() -> tuple[
     and exact built-in containers are fenced when the call begins and replayed
     from that capture.  The public view of a container subclass is observed
     once per occurrence in the graph, not once per call, so a view that
-    changes between two occurrences is rejected.  Children exposed only by a
-    public iterator are captured when that iterator first exposes them, so an
-    earlier callback in the same call may still change them first; entry-time
-    capture of never-yet-exposed children is not promised.  Hidden native
+    changes between two occurrences is rejected.  A view is read in full when
+    it is first observed, and the native backing of every child it exposes is
+    captured before the first of them is rebuilt, so a callback run while an
+    earlier child is rebuilt cannot change a later sibling.  Entry-time capture
+    of children that no view has yet exposed is not promised.  Hidden native
     backing is never substituted for a public view.
 
     Two discovery envelopes cover a call, each shared by every root.  Native
@@ -188,10 +258,10 @@ def _closed_graph_snapshot_session() -> tuple[
     def is_graph_node(item: object) -> bool:
         item_type = type(item)
         return (
-            issubclass(item_type, BaseModel)
-            or issubclass(item_type, dict)
-            or issubclass(item_type, list)
-            or issubclass(item_type, tuple)
+            _inherits(item_type, BaseModel)
+            or _inherits(item_type, dict)
+            or _inherits(item_type, list)
+            or _inherits(item_type, tuple)
         )
 
     def freeze_native_graph(item: object, depth: int = 0) -> None:
@@ -220,10 +290,10 @@ def _closed_graph_snapshot_session() -> tuple[
 
     def capture_native_node(node: object, identity: int) -> tuple[object, ...]:
         node_type = type(node)
-        if issubclass(node_type, BaseModel):
+        if _inherits(node_type, BaseModel):
             stored = _PYDANTIC_DICT_DESCRIPTOR.__get__(node, BaseModel)
             extras = _model_extra_storage(node)
-            extras_are_native = extras is not None and issubclass(
+            extras_are_native = extras is not None and _inherits(
                 type(extras), dict
             )
             edge_count = dict.__len__(stored)
@@ -234,6 +304,8 @@ def _closed_graph_snapshot_session() -> tuple[
             frozen_extras: object = (
                 tuple(dict.items(extras)) if extras_are_native else extras
             )
+            # Names are checked where the captured model is used (rebuild_node), not here: discovery
+            # also visits models that a container's public view hides, and those are never used.
             frozen_models[identity] = (
                 stored_entries,
                 extras_are_native,
@@ -241,14 +313,14 @@ def _closed_graph_snapshot_session() -> tuple[
             )
             return tuple(value for _name, value in stored_entries)
 
-        if issubclass(node_type, dict):
+        if _inherits(node_type, dict):
             budget.charge_edge(dict.__len__(node))
             entries = tuple(dict.items(node))
             if node_type is dict:
                 frozen_containers[identity] = entries
             return tuple(value for _key, value in entries)
 
-        if issubclass(node_type, list):
+        if _inherits(node_type, list):
             budget.charge_edge(list.__len__(node))
             items = tuple(list.__iter__(node))
         else:
@@ -270,6 +342,32 @@ def _closed_graph_snapshot_session() -> tuple[
     active: set[int] = set()
     memo: dict[int, tuple[object, object, int]] = {}
     phase_depth = 0
+
+    def capture_exposed(children: Iterable[object], depth: int) -> None:
+        """Freeze the native backing of every child a public view exposed, before any is rebuilt.
+
+        The view was read once; a callback that runs while an earlier child is rebuilt can then no
+        longer change a later sibling's captured state.  The children stay referenced by the caller's
+        tuple for the whole rebuild.
+        """
+
+        for exposed in children:
+            if is_graph_node(exposed) and id(exposed) not in native_children:
+                freeze_native_graph(exposed, depth)
+
+    def collect_exposed(read: Callable[[], Iterable[object]], depth: int) -> tuple[object, ...]:
+        """Read a public sequence view once, capturing each child as it is yielded.
+
+        Advancing the iterator is caller code that may repair a child it already exposed, so a child's
+        native backing is frozen before the next one is requested; reconstruction still waits until
+        every sibling is captured.
+        """
+
+        collected: list[object] = []
+        for entry in observed(read):
+            capture_exposed((entry,), depth)
+            collected.append(entry)
+        return tuple(collected)
 
     def rebuild(item: object, depth: int = 0) -> object:
         """Public rebuild phase: observations are charged to the view envelope."""
@@ -323,7 +421,7 @@ def _closed_graph_snapshot_session() -> tuple[
             return copied
 
         try:
-            if isinstance(item, BaseModel):
+            if _inherits(item_type, BaseModel):
                 stored_entries, extras_are_native, frozen_extras = frozen_models[
                     identity
                 ]
@@ -338,7 +436,7 @@ def _closed_graph_snapshot_session() -> tuple[
                     observed_extra_length = 0
                     iterated_extra_names = ()
                     extra_entries = ()
-                elif not isinstance(frozen_extras, Mapping):
+                elif not _is_real_mapping(frozen_extras):
                     raise ValueError("contract extra storage must be a mapping")
                 else:
                     reusable = False
@@ -349,6 +447,9 @@ def _closed_graph_snapshot_session() -> tuple[
                     extra_entries = tuple(
                         entry for entry in observed(frozen_extras.items)
                     )
+                _refuse_duplicate_texts(
+                    stored_entries, extra_entries if extras_are_native else ()  # type: ignore[arg-type]
+                )
                 stored_names = {name for name, _field_value in stored_entries}
                 undeclared = stored_names - declared.keys()
                 if (
@@ -362,20 +463,38 @@ def _closed_graph_snapshot_session() -> tuple[
                 result: object = {
                     name: child(field_value) for name, field_value in stored_entries
                 }
-            elif isinstance(item, dict):
+            elif _inherits(item_type, dict):
                 exact = item_type is dict
                 reusable = exact
                 entries = (
-                    frozen_containers[identity] if exact else observed(item.items)
+                    frozen_containers[identity]
+                    if exact
+                    # Each observed pair is unpacked exactly once into a plain tuple that capture and
+                    # reconstruction both reuse; the caller's pair object is never read again.
+                    # Each exposed value is captured as its pair is unpacked, before the view advances.
+                    else unpack_pairs(
+                        observed(item.items), lambda value: capture_exposed((value,), depth + 1)
+                    )
                 )
                 if exact:
                     own_cost = 1 + len(entries)
-                result = {key: child(field_value) for key, field_value in entries}
+                result = {}
+                for key, field_value in entries:
+                    # A text-subclass key is reduced to its text (its own hash and equality never run
+                    # again) and two keys with one text are refused as ambiguous.
+                    plain = _plain_key(key)
+                    if plain in result:
+                        raise ValueError("contract input field names must be unique text")
+                    result[plain] = child(field_value)
             else:
-                is_list = isinstance(item, list)
+                is_list = _inherits(item_type, list)
                 exact = item_type is (list if is_list else tuple)
                 reusable = exact
-                items = frozen_containers[identity] if exact else observed(lambda: item)
+                items = (
+                    frozen_containers[identity]
+                    if exact
+                    else collect_exposed(lambda: item, depth + 1)
+                )
                 if exact:
                     own_cost = 1 + len(items)
                 copied_items = [child(entry) for entry in items]
@@ -404,7 +523,7 @@ def _validated_operation_snapshot(
     *,
     rebuild: Callable[[object], object] | None = None,
 ) -> TenantOperationState:
-    if not isinstance(operation, TenantOperationState):
+    if not _inherits(type(operation), TenantOperationState):
         raise TypeError("operation must be a TenantOperationState")
     snapshot = (
         _snapshot_closed_graph(operation)
@@ -415,7 +534,7 @@ def _validated_operation_snapshot(
 
 
 def _validated_placement_snapshot(placement: TenantPlacement) -> TenantPlacement:
-    if not isinstance(placement, TenantPlacement):
+    if not _inherits(type(placement), TenantPlacement):
         raise TypeError("placement must be a TenantPlacement")
     return TenantPlacement.model_validate(_snapshot_closed_graph(placement))
 
@@ -425,7 +544,7 @@ def validate_operation_transition(
 ) -> TenantOperationState:
     """Reject identity changes, generation rollback, and invalid progress changes."""
 
-    if not isinstance(previous, TenantOperationState):
+    if not _inherits(type(previous), TenantOperationState):
         raise TypeError("operation must be a TenantOperationState")
 
     freeze_native_graph, rebuild = _closed_graph_snapshot_session()
@@ -436,7 +555,7 @@ def validate_operation_transition(
         previous_capture_error = error
 
     current_capture_error: Exception | None = None
-    if issubclass(type(current), TenantOperationState):
+    if _inherits(type(current), TenantOperationState):
         try:
             freeze_native_graph(current)
         except Exception as error:

@@ -378,11 +378,12 @@ def test_parser_captures_all_stored_pairs_before_name_hashing(
     ]
     assert ordinary_errors == hooked_errors
     assert any(error_type == "string_too_short" for _, error_type in hooked_errors)
-    assert name.hash_calls == 1
+    # stored names are read as plain text, so the hostile name's hash never runs and nothing is repaired
+    assert name.hash_calls == 0
     assert dict.__getitem__(
         _BASE_MODEL_DICT_DESCRIPTOR.__get__(hooked, BaseModel),
         invalid_field,
-    ) == repaired_value
+    ) != repaired_value
 
 
 @pytest.mark.parametrize(
