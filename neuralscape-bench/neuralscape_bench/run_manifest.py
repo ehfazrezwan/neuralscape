@@ -10,8 +10,7 @@ from __future__ import annotations
 
 import heapq
 import json
-from collections.abc import Iterator, Mapping
-from contextlib import contextmanager
+from collections.abc import Mapping
 from contextvars import ContextVar
 from types import MappingProxyType
 from datetime import datetime, timedelta, timezone
@@ -23,7 +22,6 @@ from pydantic import (
     ConfigDict,
     Field,
     StringConstraints,
-    ValidationInfo,
     field_validator,
     model_validator,
 )
@@ -344,93 +342,26 @@ _TIMESTAMP_PINS: ContextVar[dict[int, tuple[datetime, datetime]] | None] = Conte
 )
 
 
-# The started_at readings held for the manifests whose fields are being validated, when no per-call pins are
-# open (a TypeAdapter, or a model that nests RunManifest, does not run RunManifest's own __init__ or
-# model_validate).  Validations can nest (reading ``finished_at`` from an attribute source can validate
-# another manifest), so each reading belongs to ONE validation, found by the identity of its ``info.data``
-# (the dict both timestamp fields of that validation share; it is held with the entry, so its id cannot be
-# reused while the entry exists): a nested validation puts, takes and empties only its own entry and never
-# touches the outer one.  The finished_at wrap step of a validation takes its entry before the value is
-# checked and again afterwards, so a rejected validation leaves nothing behind; an empty table is ``None``.
-# The table is replaced, never mutated, so contexts that share it (tasks started from a copied context)
-# cannot disturb each other, and it is capped (a source whose attribute read fails never reaches the finished_at step, so its entry stays until pushed out).
-_PENDING_STARTED_AT: ContextVar[dict[int, tuple[object, datetime, datetime]] | None] = ContextVar(
-    "_PENDING_STARTED_AT", default=None
+# One validation of a manifest from Python objects owns one table (the object -> its fixed-offset copy), opened by
+# ``_open_validation_scope`` when the validation starts and restored in a ``finally`` when it ends, however it
+# ends.  The scope is a ContextVar token, so nested validations (reading ``finished_at`` from an attribute source
+# can validate another manifest, or fail while doing so) each get their own table and put the outer one back;
+# nothing is evicted or capped, and nothing outlives the validation.  The same datetime object supplied as both
+# timestamps is therefore read once, on every route (constructor, ``model_validate``, TypeAdapter, an enclosing
+# model, ``from_attributes``).  JSON input has no scope: each value is a new object, so there is nothing to pair.
+_TIMESTAMP_PINS: ContextVar[dict[int, tuple[datetime, datetime]] | None] = ContextVar(
+    "_TIMESTAMP_PINS", default=None
 )
-_PENDING_LIMIT = 16
 
 
-def _pending_put(data: object, original: datetime, fixed: datetime) -> None:
-    table = dict(_PENDING_STARTED_AT.get() or {})
-    table.pop(id(data), None)
-    while len(table) >= _PENDING_LIMIT:
-        table.pop(next(iter(table)))  # the oldest: only an aborted validation can have left one that long
-    table[id(data)] = (data, original, fixed)
-    _PENDING_STARTED_AT.set(table)
-
-
-def _pending_take(data: object) -> tuple[object, datetime, datetime] | None:
-    """This validation's entry, removed (no other validation's entry is read or changed)."""
-
-    table = _PENDING_STARTED_AT.get()
-    if not table:
-        return None
-    entry = table.get(id(data))
-    if entry is None or entry[0] is not data:
-        return None
-    rest = {key: value for key, value in table.items() if key != id(data)}
-    _PENDING_STARTED_AT.set(rest or None)
-    return entry
-
-
-@contextmanager
-def _pinned_timestamp_offsets() -> Iterator[None]:
-    """Open the per-call offset pins for one manifest validation (nested calls get their own).
-
-    A model-level validator cannot do this: it would hand JSON input to the strict field checks as
-    Python objects.  The two entry points that take Python objects open the scope instead.
-    """
+def _open_validation_scope(value: Any, handler: Any) -> Any:
+    """Run one Python-input validation of a manifest inside its own table of offset readings."""
 
     token = _TIMESTAMP_PINS.set({})
     try:
-        yield
-    finally:
-        _TIMESTAMP_PINS.reset(token)
-
-
-def _take_started_reading(value: Any, handler: Any, info: ValidationInfo) -> Any:
-    """Check ``finished_at`` after taking, and in every case emptying, this validation's started_at reading.
-
-    The entry is taken before the value is checked and again afterwards, so it is gone whether the value is
-    valid or not: a rejected validation leaves nothing behind.  The same object supplied as both
-    timestamps is handed on as the reading already taken.  Only this validation's entry is touched, so a
-    validation nested in the reading of this one cannot erase it.  (A function validator on the whole
-    field would make JSON input reach the strict checks as Python objects; see ``_PairedFinish``.)
-    """
-
-    held = _pending_take(info.data)
-    try:
-        if held is not None and _TIMESTAMP_PINS.get() is None and held[1] is value:
-            value = held[2]
         return handler(value)
     finally:
-        _pending_take(info.data)
-
-
-class _PairedFinish:
-    """Annotation for ``finished_at``: the pairing step applies to Python input only.
-
-    JSON input keeps the field's own schema (each value is a new object, so there is nothing to pair)
-    and so stays on the strict JSON path.
-    """
-
-    @classmethod
-    def __get_pydantic_core_schema__(cls, source: Any, handler: Any) -> Any:
-        inner = handler(source)
-        return core_schema.json_or_python_schema(
-            json_schema=inner,
-            python_schema=core_schema.with_info_wrap_validator_function(_take_started_reading, inner),
-        )
+        _TIMESTAMP_PINS.reset(token)
 
 
 class RunManifest(_ManifestContract):
@@ -443,30 +374,28 @@ class RunManifest(_ManifestContract):
     cache_condition: CacheCondition
     concurrency: tuple[ConcurrencySetting, ...]
     resources: tuple[ResourceReading, ...]
-    # Validated even when omitted, so the started_at/finished_at pairing slot is always cleared.
-    started_at: datetime | None = Field(default=None, validate_default=True)
-    finished_at: Annotated[datetime | None, _PairedFinish] = Field(default=None, validate_default=True)
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
     measurements: tuple[TimingMeasurement, ...] = ()
 
-    def __init__(self, /, **data: Any) -> None:
-        with _pinned_timestamp_offsets():
-            super().__init__(**data)
-
-    # An ``__init__`` that is not marked as pass-through makes pydantic route JSON input through it
-    # as Python objects, which would defeat the strict JSON checks.
-    __init__.__pydantic_base_init__ = True  # type: ignore[attr-defined]
-
     @classmethod
-    def model_validate(cls, obj: Any, *args: Any, **kwargs: Any) -> Self:
-        with _pinned_timestamp_offsets():
-            return super().model_validate(obj, *args, **kwargs)
+    def __get_pydantic_core_schema__(cls, source: Any, handler: Any) -> Any:
+        """Wrap the model's validation in its own offset scope for Python input only.
+
+        A function validator around the whole model would hand JSON input to the strict field checks as Python
+        objects, so JSON keeps the model schema as it is.
+        """
+
+        schema = handler(source)
+        return core_schema.json_or_python_schema(
+            json_schema=schema,
+            python_schema=core_schema.no_info_wrap_validator_function(_open_validation_scope, schema),
+        )
 
     @field_validator("started_at", "finished_at")
     @classmethod
-    def require_aware_timestamp(cls, value: datetime | None, info: ValidationInfo) -> datetime | None:
+    def require_aware_timestamp(cls, value: datetime | None) -> datetime | None:
         pins = _TIMESTAMP_PINS.get()
-        if pins is None and info.field_name == "started_at":
-            _pending_take(info.data)  # an entry left under this very dict by nothing else: start clean
         if value is None:
             return None
         # Read the caller's tzinfo once and keep an exact fixed-offset copy, so nothing later (the
@@ -480,11 +409,7 @@ class RunManifest(_ManifestContract):
                 raise ValueError("run timestamps must include an explicit UTC offset")
             fixed = _exact_datetime(value, timezone(_exact_offset(offset)))
             if pins is not None:
-                pins[id(value)] = (value, fixed)
-            elif info.field_name == "started_at" and info.mode == "python":
-                # Only Python input is paired (the emptying step is installed for it alone); a JSON value is a
-                # new object each time, so nothing is held for it.
-                _pending_put(info.data, value, fixed)
+                pins[id(value)] = (value, fixed)  # the original stays referenced: its id cannot be reused
             return fixed
         except ValueError:
             raise

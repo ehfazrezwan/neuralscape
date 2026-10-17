@@ -5457,9 +5457,11 @@ def test_json_validation_is_unaffected_by_the_pairing_step():
 
 
 def _pending_slot():
-    from neuralscape_bench.run_manifest import _PENDING_STARTED_AT
+    """What a finished validation leaves behind: nothing (the scope table is restored to ``None``)."""
 
-    return _PENDING_STARTED_AT.get()
+    from neuralscape_bench.run_manifest import _TIMESTAMP_PINS
+
+    return _TIMESTAMP_PINS.get()
 
 
 @pytest.mark.parametrize("entry", ["model_validate_json", "type_adapter_validate_json"])
@@ -5601,28 +5603,45 @@ def test_threads_that_nest_validations_never_cross_readings():
 
 
 def test_nothing_is_pending_after_nested_validations_in_any_order():
-    from neuralscape_bench.run_manifest import _PENDING_STARTED_AT
-
     zone = _FlipZone(timedelta(0), timedelta(hours=-5))
     pydantic.TypeAdapter(RunManifest).validate_python(
         _source_whose_finish_builds_another_manifest(zone, nest=lambda: _another_manifest_through("type_adapter")), from_attributes=True
     )
-    assert not _PENDING_STARTED_AT.get()
+    assert _pending_slot() is None
 
 
-def test_validations_aborted_while_reading_finished_at_cannot_grow_the_table_or_pair_with_the_next():
-    from neuralscape_bench.run_manifest import _PENDING_LIMIT, _PENDING_STARTED_AT
-
+def test_validations_aborted_while_reading_finished_at_leave_nothing_and_pair_nothing_with_the_next():
     def explode():
         raise RuntimeError("the attribute source failed")
 
-    for _ in range(_PENDING_LIMIT + 40):
+    for _ in range(100):
         source = _source_whose_finish_builds_another_manifest(_FlipZone(timedelta(0), timedelta(0)), nest=explode)
         with pytest.raises(ValidationError):  # pydantic reports a failing attribute as a validation error
             pydantic.TypeAdapter(RunManifest).validate_python(source, from_attributes=True)
-    assert len(_PENDING_STARTED_AT.get() or {}) <= _PENDING_LIMIT
+        assert _pending_slot() is None  # the scope is restored in a finally, however the validation ended
     zone = _FlipZone(timedelta(hours=-5), timedelta(0))  # the next validation reads and pairs on its own
     manifest = pydantic.TypeAdapter(RunManifest).validate_python(
         _source_whose_finish_builds_another_manifest(zone, nest=lambda: None), from_attributes=True
     )
     assert manifest.started_at == manifest.finished_at and zone.reads == 1
+
+
+@pytest.mark.parametrize("aborted", [1, 15, 16, 17, 40, 100])
+def test_many_aborted_nested_validations_cannot_evict_the_outer_validations_reading(aborted):
+    """The outer ``finished_at`` read runs ``aborted`` nested validations that each fail while reading an attribute."""
+
+    def explode():
+        raise RuntimeError("the attribute source failed")
+
+    def nest():
+        for _ in range(aborted):
+            inner = _source_whose_finish_builds_another_manifest(_FlipZone(timedelta(0), timedelta(0)), nest=explode)
+            with pytest.raises(ValidationError):
+                pydantic.TypeAdapter(RunManifest).validate_python(inner, from_attributes=True)
+
+    zone = _FlipZone(timedelta(hours=-5), timedelta(0))
+    manifest = pydantic.TypeAdapter(RunManifest).validate_python(
+        _source_whose_finish_builds_another_manifest(zone, nest=nest), from_attributes=True
+    )
+    assert manifest.started_at == manifest.finished_at  # one object, one reading, however many nested failures
+    assert manifest.started_at.utcoffset() == timedelta(hours=-5) and zone.reads == 1
