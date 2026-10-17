@@ -1212,6 +1212,7 @@ class NativeEngine:
             Compressed snapshot bytes (gzipped JSON).
         """
         import gzip
+        import io
         import json
 
         # Extract repo name from code_space
@@ -1281,7 +1282,16 @@ class NativeEngine:
 
         # Serialize and compress
         envelope_json = json.dumps(envelope, sort_keys=True)
-        compressed = gzip.compress(envelope_json.encode("utf-8"))
+        buffer = io.BytesIO()
+        with gzip.GzipFile(
+            filename="",
+            mode="wb",
+            compresslevel=9,
+            fileobj=buffer,
+            mtime=0,
+        ) as archive:
+            archive.write(envelope_json.encode("utf-8"))
+        compressed = buffer.getvalue()
         logger.info(
             "Exported snapshot: %d nodes, %d edges, %d bytes (code_space=%s)",
             len(nodes), len(edges), len(compressed), self.code_space,

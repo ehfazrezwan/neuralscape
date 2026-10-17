@@ -1,0 +1,22 @@
+{
+ "correction": "oracle-v1 expected the baseline to show a known failure from facts that the probe had actually read from the harness's own tree (a probe isolation defect found in review). With the probes isolated the baseline tree lacks the module, so the baseline expectation is blocked (capability absent).",
+ "expected": {
+  "baseline": {
+   "facts": {
+    "capability": "absent"
+   },
+   "verdict": "blocked"
+  },
+  "candidate": {
+   "facts": {
+    "foreign_marker_field": "present",
+    "handle_without_tenant": "refused"
+   },
+   "verdict": "candidate_pass"
+  }
+ },
+ "oracle_version": "oracle-v2",
+ "owner": "independent reviewer (not the author of the probes); not yet accepted",
+ "persona": "persona-cam",
+ "scenario_id": "persona-citation-resolution"
+}
