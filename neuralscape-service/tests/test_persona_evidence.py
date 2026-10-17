@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 from pathlib import Path
 
@@ -232,3 +233,204 @@ def test_the_report_of_clean_evidence_exits_zero_without_a_warning(tmp_path) -> 
     report = tmp_path / "report.md"
     assert pe.main(["report", "--evidence", str(out), "--out", str(report)]) == 0
     assert "integrity" not in report.read_text().lower()
+
+
+def test_a_missing_evidence_file_is_refused_not_reported_as_an_empty_success(tmp_path, capsys) -> None:
+    report = tmp_path / "report.md"
+    missing = tmp_path / "nowhere" / "evidence.jsonl"
+    code = pe.main(["report", "--evidence", str(missing), "--out", str(report)])
+    assert code != 0 and not report.exists()
+    assert "evidence" in capsys.readouterr().err
+    assert not missing.parent.exists()   # reading must not create the directory it was told to read
+
+
+def test_a_directory_is_not_accepted_as_the_evidence_file(tmp_path) -> None:
+    report = tmp_path / "report.md"
+    assert pe.main(["report", "--evidence", str(tmp_path), "--out", str(report)]) != 0 and not report.exists()
+
+
+def test_the_report_flags_invalid_utf8_in_a_record_and_exits_nonzero(tmp_path) -> None:
+    out = tmp_path / "evidence.jsonl"
+    pe.run(tmp_path, "baseline", "tree-a", ORACLES, out, "run-1")
+    lines = out.read_bytes().split(b"\n")
+    assert b"tree-a" in lines[0]
+    lines[0] = lines[0].replace(b"tree-a", b"tree-\xff")
+    out.write_bytes(b"\n".join(lines))
+    report = tmp_path / "report.md"
+    code = pe.main(["report", "--evidence", str(out), "--out", str(report)])
+    assert code != 0 and "invalid line" in report.read_text().lower()
+
+
+# ---- the probe harness: startup failures and what counts as a refusal
+
+def _faulty_references(tmp_path: Path, body: str) -> Path:
+    tree = tmp_path / "tree"
+    tree.mkdir()
+    (tree / "contracts_references.py").write_text(body)
+    return tree
+
+
+_REAL_SHAPE = '''
+from pydantic import BaseModel, field_validator
+
+
+class ReferenceHandle(BaseModel):
+    kind: str
+    id: str
+    tenant_id: str{tenant_default}
+    resolver: str
+    cross_tenant: bool = False
+{extra}
+'''
+
+
+def _citation(observed: dict) -> dict:
+    return observed["persona-citation-resolution"]
+
+
+@pytest.mark.parametrize("kind", ["missing", "file"])
+def test_a_service_dir_that_cannot_start_the_probe_is_recorded_per_scenario(tmp_path, kind) -> None:
+    target = tmp_path / "nowhere"
+    if kind == "file":
+        target.write_text("not a directory")
+    observed = pe.observe(target)
+    assert set(observed) == set(persona_probes.SCENARIOS)
+    assert all("error" in item for item in observed.values()), observed
+    out = tmp_path / "evidence.jsonl"
+    records = pe.run(target, "candidate", "no-such-tree", ORACLES, out, "run-s")
+    assert {item.verdict for item in records} == {"invalid_attempt"} and len(records) == len(persona_probes.SCENARIOS)
+    assert len(ev.EvidenceWriter(out).read().records) == len(persona_probes.SCENARIOS)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores directory permissions")
+def test_an_inaccessible_service_dir_is_recorded_per_scenario(tmp_path) -> None:
+    target = tmp_path / "locked"
+    target.mkdir()
+    target.chmod(0)
+    try:
+        observed = pe.observe(target)
+    finally:
+        target.chmod(0o700)
+    assert all("error" in item for item in observed.values()), observed
+
+
+def test_a_handle_that_always_raises_is_not_a_tenant_refusal(tmp_path) -> None:
+    tree = _faulty_references(tmp_path, '''
+class ReferenceHandle:
+    model_fields = {"cross_tenant": None}
+
+    def __init__(self, **kwargs):
+        raise RuntimeError("always")
+''')
+    result = _citation(pe.observe(tree))
+    assert "facts" not in result and "error" in result, result
+    records = pe.run(tree, "candidate", "always-raises", ORACLES, tmp_path / "e.jsonl", "run-c")
+    assert {item.scenario_id: item.verdict for item in records}["persona-citation-resolution"] == "invalid_attempt"
+
+
+def test_a_handle_that_rejects_a_tenant_scoped_control_is_an_invalid_attempt(tmp_path) -> None:
+    tree = _faulty_references(tmp_path, _REAL_SHAPE.format(
+        tenant_default="", extra='''
+    @field_validator("kind")
+    @classmethod
+    def _never(cls, value):
+        raise ValueError("nothing is accepted")
+'''))
+    assert "error" in _citation(pe.observe(tree))
+
+
+def test_only_a_missing_tenant_validation_error_is_a_refusal(tmp_path) -> None:
+    unrelated = _faulty_references(tmp_path, _REAL_SHAPE.format(
+        tenant_default=" = 'default-tenant'", extra='''
+    @field_validator("id")
+    @classmethod
+    def _no_probe_id(cls, value):
+        if value == "memory-1":
+            raise ValueError("this id is reserved")
+        return value
+'''))
+    assert "error" in _citation(pe.observe(unrelated))   # a refusal for another reason is not the tenant refusal
+
+
+def test_a_handle_that_accepts_a_missing_tenant_is_reported_as_accepted(tmp_path) -> None:
+    tree = _faulty_references(tmp_path, _REAL_SHAPE.format(tenant_default=" = 'default-tenant'", extra=""))
+    assert _citation(pe.observe(tree))["facts"]["handle_without_tenant"] == "accepted"
+
+
+def test_a_handle_that_requires_a_tenant_is_reported_as_refused(tmp_path) -> None:
+    tree = _faulty_references(tmp_path, _REAL_SHAPE.format(tenant_default="", extra=""))
+    facts = _citation(pe.observe(tree))["facts"]
+    assert facts == {"foreign_marker_field": "present", "handle_without_tenant": "refused"}
+
+
+def test_this_trees_citation_probe_still_gets_the_candidate_facts() -> None:
+    facts = _citation(pe.observe(SERVICE_DIR))["facts"]
+    assert facts == {"foreign_marker_field": "present", "handle_without_tenant": "refused"}
+
+
+# ---- the child interpreter's isolation flag exists on Python 3.11 and later only; failures keep their class name
+
+@pytest.mark.parametrize(
+    "version, flags",
+    [((3, 10, 14), []), ((3, 11, 0), ["-P"]), ((3, 12, 3), ["-P"]), ((3, 13, 1), ["-P"])],
+)
+def test_the_path_isolation_flag_is_passed_only_where_the_interpreter_has_it(version, flags) -> None:
+    assert pe._isolation_flags(version) == flags
+
+
+def test_the_probe_command_on_python_3_10_has_no_unknown_flag(monkeypatch) -> None:
+    seen: list[list[str]] = []
+
+    def fake_run(command, **kwargs):
+        seen.append(list(command))
+        raise OSError("not started")
+
+    monkeypatch.setattr(pe.subprocess, "run", fake_run)
+    monkeypatch.setattr(pe.sys, "version_info", (3, 10, 14, "final", 0))   # simulate the older interpreter
+    pe.observe(Path("."))
+    assert seen and "-P" not in seen[0]
+    monkeypatch.setattr(pe.sys, "version_info", (3, 11, 4, "final", 0))
+    seen.clear()
+    pe.observe(Path("."))
+    assert seen and "-P" in seen[0]
+
+
+def test_the_probes_report_every_scenario_in_a_fresh_interpreter_on_this_python() -> None:
+    """On a real 3.10 this fails if ``-P`` is passed (the child exits before running a probe)."""
+
+    observed = pe.observe(SERVICE_DIR)
+    assert set(observed) == set(persona_probes.SCENARIOS)
+    assert not any("error" in item for item in observed.values()), observed
+
+
+@pytest.mark.parametrize(
+    "error, name",
+    [
+        (OSError("boom"), "OSError"),
+        (FileNotFoundError("gone"), "FileNotFoundError"),
+        (ValueError("bad"), "ValueError"),
+        (IndexError("empty"), "IndexError"),
+        (pe.subprocess.TimeoutExpired("probe", 300), "TimeoutExpired"),
+        (pe.subprocess.CalledProcessError(3, "probe"), "CalledProcessError"),
+    ],
+    ids=lambda value: type(value).__name__ if isinstance(value, BaseException) else str(value),
+)
+def test_a_probe_process_failure_is_recorded_with_its_exception_class(monkeypatch, tmp_path, error, name) -> None:
+    def failing(command, **kwargs):
+        raise error
+
+    monkeypatch.setattr(pe.subprocess, "run", failing)
+    observed = pe.observe(tmp_path)
+    assert {item["error"] for item in observed.values()} == {name}
+    records = pe.run(tmp_path, "baseline", "tree-x", ORACLES, tmp_path / "e.jsonl", "run-f")
+    assert {item.verdict for item in records} == {"invalid_attempt"}
+    assert {item.note for item in records} == {f"probe failed: {name}"}, {item.note for item in records}
+
+
+def test_a_failure_note_never_carries_the_exception_message_or_a_path(monkeypatch, tmp_path) -> None:
+    def failing(command, **kwargs):
+        raise OSError(f"cannot start in {tmp_path}/secret-dir")
+
+    monkeypatch.setattr(pe.subprocess, "run", failing)
+    records = pe.run(tmp_path, "baseline", "tree-x", ORACLES, tmp_path / "e.jsonl", "run-g")
+    assert all("secret-dir" not in item.note and str(tmp_path) not in item.note for item in records)

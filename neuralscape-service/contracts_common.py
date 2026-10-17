@@ -7,7 +7,12 @@ is the wire representation.  Neither representation grants identity or
 authority merely because a value validates.
 """
 
-from collections.abc import Iterable, Mapping
+import enum
+import functools
+import types
+import typing
+from collections.abc import Callable, Iterable, Mapping
+from datetime import datetime
 from types import MappingProxyType
 from dataclasses import dataclass, field
 from typing import Annotated, Literal
@@ -20,6 +25,7 @@ from pydantic import (
     ConfigDict,
     Field,
     StringConstraints,
+    model_validator,
 )
 from pydantic.fields import FieldInfo
 
@@ -44,6 +50,65 @@ SafeCounter = Annotated[
 """A non-negative integer exactly representable by JavaScript number values."""
 
 
+def is_canonical_enum_member(value: object) -> bool:
+    """Whether an enum instance is one of its class's declared members, decided by identity.
+
+    ``str.__new__(MyEnum, "value")`` builds an object that passes ``isinstance(value, MyEnum)`` (and
+    pydantic's strict enum check) but is no member: every ``value is MyEnum.MEMBER`` test then fails,
+    so a decision written as a chain of identity tests silently falls through to its default branch.
+    """
+
+    for member in type(value).__members__.values():  # type: ignore[attr-defined]
+        if member is value:
+            return True
+    return False
+
+
+def require_canonical_enum_members(value: object, *, _depth: int = 0) -> None:
+    """Raise ``ValueError`` if ``value`` is, or natively contains, an enum instance that is no member.
+
+    Looks through exact tuples, lists, sets, frozensets and dicts (what validation produces); nested
+    models validate themselves.  A container reached by several paths is checked once (the check keeps
+    what it has seen, alive, for the call), so a graph that shares its layers costs its objects, not its
+    paths.
+    """
+
+    seen: dict[int, object] = {}
+    _scan_enum_members(value, _depth, seen)
+
+
+def _scan_enum_members(value: object, depth: int, seen: dict[int, object]) -> None:
+    if any(base is enum.Enum for base in _TYPE_MRO.__get__(type(value))):
+        if not is_canonical_enum_member(value):
+            raise ValueError("an enum value must be a declared member of its enum")
+        return
+    kind = type(value)
+    if not (kind is dict or kind is tuple or kind is list or kind is set or kind is frozenset):  # identity
+        return
+    if depth > 32:
+        raise ValueError("contract value nesting exceeds the enum check depth")
+    if id(value) in seen:
+        return
+    seen[id(value)] = value  # kept alive: its id stays its own
+    if kind is dict:
+        for key, item in dict.items(value):  # type: ignore[arg-type]
+            _scan_enum_members(key, depth + 1, seen)
+            _scan_enum_members(item, depth + 1, seen)
+    else:
+        for item in value:  # type: ignore[attr-defined]
+            _scan_enum_members(item, depth + 1, seen)
+
+
+def _annotation_holds_enum(annotation: object, _depth: int = 0) -> bool:
+    if _depth > 8:
+        return True  # unknown shape: check it
+    # A parametrized builtin (``list[int]``) is an instance of ``type`` on Python 3.10 but has no class MRO of its
+    # own to read: anything with an origin is walked through its arguments, and only a plain class is read.
+    if typing.get_origin(annotation) is None and isinstance(annotation, type):
+        return any(base is enum.Enum for base in _TYPE_MRO.__get__(annotation))
+    return any(_annotation_holds_enum(arg, _depth + 1) for arg in typing.get_args(annotation))
+
+
 class ContractModel(BaseModel):
     """Base for strict contracts with a closed set of fields."""
 
@@ -52,6 +117,25 @@ class ContractModel(BaseModel):
         strict=True,
         revalidate_instances="always",
     )
+
+    _enum_field_names: typing.ClassVar[tuple[str, ...]] = ()
+
+    @classmethod
+    def __pydantic_init_subclass__(cls, **kwargs: typing.Any) -> None:
+        super().__pydantic_init_subclass__(**kwargs)
+        cls._enum_field_names = tuple(
+            name for name, info in cls.model_fields.items() if _annotation_holds_enum(info.annotation)
+        )
+
+    @model_validator(mode="after")
+    def _enum_members_are_canonical(self) -> "ContractModel":
+        # Every enum-typed field must hold a declared member (see ``is_canonical_enum_member``): a
+        # look-alike passes the type check and then falls through every identity comparison.
+        stored = self.__dict__
+        for name in type(self)._enum_field_names:
+            if name in stored:
+                require_canonical_enum_members(stored[name])
+        return self
 
 
 class VersionedContract(ContractModel):
@@ -274,6 +358,7 @@ _MAPPING_BASES = (Mapping, dict, MappingProxyType)
 # Key types whose hashing and equality run no caller code.  A ``str`` subclass is read as its
 # text instead; any other key type can run a hook while a dict is rebuilt, so a subtree that
 # holds one is never reused (see ``_snapshot_captured_graph``).
+_KEY_HASH_BITS_PER_EDGE = 14  # an integer is charged one edge per 16 Kibit (2 KiB) it holds
 _PLAIN_KEY_TYPES = (str, int, float, bool, type(None), bytes)
 
 
@@ -301,8 +386,37 @@ def _is_subclass(cls: type, types: type | tuple[type, ...]) -> bool:
     return False
 
 
+def _charge_key_hash(key: object, budget: DiscoveryBudget) -> None:
+    """Charge the hash a dictionary pays for ``key`` when it is rebuilt, in proportion to what hashing reads.
+
+    An ``int`` (exact or a subclass) is charged one edge per 2 KiB it holds; a ``tuple`` (exact or a subclass) one
+    edge per entry, counted along every path through it, with each integer in it charged the same way, because
+    neither type remembers its hash and a shared inner tuple is hashed once per path.  Only native readers are
+    used (``int.bit_length``, ``tuple.__iter__``), so no hook of the key runs, and every step is charged, so
+    the walk stops at the budget however the tuple is shared.  Other keys (``str`` and ``bytes`` remember their
+    hash) cost nothing extra.
+    """
+
+    kind = type(key)
+    if _is_subclass(kind, int):
+        budget.charge_edge(int.bit_length(key) >> _KEY_HASH_BITS_PER_EDGE)  # type: ignore[call-overload]
+        return
+    if not _is_subclass(kind, tuple):
+        return
+    pending = [key]
+    while pending:
+        for part in tuple.__iter__(pending.pop()):  # type: ignore[call-overload]
+            budget.charge_edge()
+            part_type = type(part)
+            if _is_subclass(part_type, int):
+                budget.charge_edge(int.bit_length(part) >> _KEY_HASH_BITS_PER_EDGE)  # type: ignore[call-overload]
+            elif _is_subclass(part_type, tuple):
+                pending.append(part)
+
+
 def _plain_keys(
     entries: tuple[tuple[object, object], ...],
+    inventory: "_GraphInventory",
 ) -> tuple[tuple[tuple[object, object], ...], bool, bool]:
     """Read ``str``-subclass keys as their text, without running their hooks.
 
@@ -312,6 +426,11 @@ def _plain_keys(
     which runs its code).  ``colliding`` is set when two keys share one text; the entries keep
     both, and the caller refuses them where its established diagnostics expect it (a plain dict
     when it is rebuilt, model names after their fields, extras through the duplicate-key check).
+
+    The work here follows the size of what is read, so it is charged that way: one key object shared by many
+    dictionaries is read as text once per call (``inventory.key_texts``, holding the key), not copied once per
+    dictionary, and an integer key is charged for the hash that rebuilding every dictionary that holds it will
+    cost (an integer is not hashed once and remembered), in proportion to its size.
     """
 
     plain: list[tuple[object, object]] = []
@@ -321,9 +440,16 @@ def _plain_keys(
     for key, item in entries:
         if not is_exact_type(key, *_PLAIN_KEY_TYPES):
             if _is_subclass(type(key), str):
-                key = str.__str__(key)  # type: ignore[arg-type]
+                known = inventory.key_texts.get(id(key))
+                if known is not None and known[0] is key:
+                    key = known[1]
+                else:
+                    text = str.__str__(key)  # type: ignore[arg-type]
+                    inventory.key_texts[id(key)] = (key, text)  # holds the key: its id cannot be reused
+                    key = text
             else:
                 pure = False
+        _charge_key_hash(key, inventory.budget)
         if type(key) is str:
             if key in texts:
                 colliding = True
@@ -398,6 +524,31 @@ class _GraphInventory:
     retained: list[object] = field(default_factory=list)
     # The call's one metadata snapshot per model class, taken at capture: ``id -> (class, declared names, alias owners)``.
     metadata: dict[int, tuple[type, set[object] | None, dict[str, set[str]] | None]] = field(default_factory=dict)
+    # An optional function applied to every ``datetime`` leaf the moment its entry is captured (before any public
+    # iterator is advanced), and the results by identity: ``(the caller's datetime, its pinned copy)``.  The
+    # original stays referenced, so its id cannot be reused by another object during the call.
+    pin_leaf: "Callable[[object], object] | None" = None
+    pinned: dict[int, tuple[object, object]] = field(default_factory=dict)
+    # While the initial native capture runs, a datetime is only recorded here (pinning asks its zone, which is
+    # caller code, and every native backing must be frozen before any caller code runs); the recorded ones are
+    # pinned once that capture is complete, and any later one (captured as a public view yields it) at once.
+    collecting: bool = True
+    collected: list[object] = field(default_factory=list)
+    # An optional check applied to each snapshotted entry of a public view before it is validated eagerly (the
+    # receiving boundary's supported-type and enum check): a refusal ends the read like an invalid entry.
+    entry_guard: "Callable[[object], object] | None" = None
+    # The contract each root is validated against by the receiving boundary, by object identity (see ``contract``).
+    contracts: dict[int, type] = field(default_factory=dict)
+    # Snapshots already validated early, by identity and by the model they were judged against (both held, so
+    # neither identity can be reused): a pure subtree is reconstructed once and shared, so the same item yielded
+    # many times for one model is judged once, while a different model judges it afresh.
+    validated: dict[tuple[int, int], tuple[object, type]] = field(default_factory=dict)
+    # The expanded size of every snapshot node measured so far, by identity: ``(node, nodes counted per path)``
+    # (held, so its id cannot be reused), and the running total charged by the eager validation of this call.
+    expanded_sizes: dict[int, tuple[object, int]] = field(default_factory=dict)
+    expanded_work: int = 0
+    # ``str``-subclass keys already read as text, by identity: ``(the key, its text)``.  The key stays referenced.
+    key_texts: dict[int, tuple[object, str]] = field(default_factory=dict)
     # Completed reconstructions of pure subtrees, keyed by identity:
     # ``(object, copy, height)``.  A descendant shared by many paths is rebuilt once
     # and shared; ``height`` keeps the depth limit enforced on every path.
@@ -459,6 +610,11 @@ def _capture_native_graph(value: object, inventory: _GraphInventory, depth: int 
 
     value_type = type(value)
     if not _is_subclass(value_type, (BaseModel, tuple, list, dict)):
+        if inventory.pin_leaf is not None and _is_subclass(value_type, datetime) and id(value) not in inventory.pinned:
+            if inventory.collecting:
+                inventory.collected.append(value)  # pinned when the native capture is complete
+            else:
+                inventory.pinned[id(value)] = (value, inventory.pin_leaf(value))  # pinned now, read once
         return -1
     budget = inventory.budget
     if depth > budget.tier.max_depth:
@@ -484,7 +640,7 @@ def _capture_native_graph(value: object, inventory: _GraphInventory, depth: int 
         _snapshot_class_metadata(value_type, inventory)
         stored = _BASE_MODEL_DICT_DESCRIPTOR.__get__(value, BaseModel)
         _precheck(budget, dict.__len__(stored))
-        stored_entries, pure_stored, stored_colliding = _plain_keys(tuple(dict.items(stored)))
+        stored_entries, pure_stored, stored_colliding = _plain_keys(tuple(dict.items(stored)), inventory)
         budget.charge_edge(len(stored_entries))
         try:
             extra = _BASE_MODEL_EXTRA_DESCRIPTOR.__get__(value, BaseModel)
@@ -514,7 +670,7 @@ def _capture_native_graph(value: object, inventory: _GraphInventory, depth: int 
         extra_type = type(extra)
         if _is_subclass(extra_type, dict):
             _precheck(budget, dict.__len__(extra))
-            extra_entries, pure_extra, _ = _plain_keys(tuple(dict.items(extra)))
+            extra_entries, pure_extra, _ = _plain_keys(tuple(dict.items(extra)), inventory)
             budget.charge_edge(len(extra_entries))
             model_inventory.extra_entries = extra_entries
             model_inventory.pure_names = model_inventory.pure_names and pure_extra
@@ -561,7 +717,7 @@ def _capture_native_graph(value: object, inventory: _GraphInventory, depth: int 
         return height
 
     _precheck(budget, dict.__len__(value))
-    entries, pure, colliding = _plain_keys(tuple(dict.items(value)))
+    entries, pure, colliding = _plain_keys(tuple(dict.items(value)), inventory)
     budget.charge_edge(len(entries))
     inventory.dictionaries[value_id] = entries
     if pure:
@@ -578,27 +734,248 @@ def _capture_native_graph(value: object, inventory: _GraphInventory, depth: int 
     return height
 
 
-def _exposed_items(value: object, inventory: _GraphInventory, depth: int) -> tuple[object, ...]:
+def _private_copy(value: object, limit: int) -> object:
+    """A structural copy of a snapshot (exact dicts, lists and tuples rebuilt; every other value shared as it is).
+
+    The snapshot stores an identical subtree once and shares it, so the copy does the same: each distinct container
+    is copied once (a memo by identity, holding the original so its identity cannot be reused) and shared in the
+    copy as it is in the snapshot, which makes the work linear in the snapshot's distinct nodes.  The strict
+    validation that follows walks a shared subtree once per path, so the expanded size (nodes counted per path,
+    computed from the same memo) is held to ``limit``, the tier's edge limit: a snapshot that would cost more to
+    validate is refused with the stable budget error before it is copied further or validated.  No value's own
+    copy hook runs, and the snapshot's depth is already bounded.
+    """
+
+    memo: dict[int, tuple[object, object, int]] = {}
+
+    def copy(node: object) -> tuple[object, int]:
+        kind = type(node)
+        if kind is not dict and kind is not list and kind is not tuple:
+            return node, 1
+        known = memo.get(id(node))
+        if known is not None and known[0] is node:
+            return known[1], known[2]
+        size = 1
+        if kind is dict:
+            built: dict[object, object] = {}
+            for key, item in dict.items(node):
+                built[key], item_size = copy(item)
+                size += item_size
+            result: object = built
+        else:
+            parts = []
+            for item in (list.__iter__(node) if kind is list else tuple.__iter__(node)):  # type: ignore[arg-type]
+                part, item_size = copy(item)
+                parts.append(part)
+                size += item_size
+            result = parts if kind is list else tuple(parts)
+        if size > limit + 1:  # ``size`` counts nodes: ``limit`` edges is ``limit + 1`` nodes
+            raise ValueError(DISCOVERY_BUDGET_MESSAGE)
+        memo[id(node)] = (node, result, size)
+        return result, size
+
+    return copy(value)[0]
+
+
+def _charge_expanded_work(snapshot: object, inventory: "_GraphInventory") -> None:
+    """Add the expanded size of one entry about to be validated to the call's running total; refuse past the limit.
+
+    Eager validation walks a shared subtree once per path, and every distinct entry is validated separately, so
+    the work is the sum of the entries' expanded sizes, not the largest.  Sizes are measured once per node
+    (memoized by identity), so measuring costs the distinct nodes only.  The limit is the same as for one entry:
+    the tier's edge limit, in nodes (``limit`` edges is ``limit + 1`` nodes).
+    """
+
+    sizes = inventory.expanded_sizes
+    limit = inventory.budget.tier.max_edges
+
+    def size_of(node: object) -> int:
+        kind = type(node)
+        if kind is not dict and kind is not list and kind is not tuple:
+            return 1
+        known = sizes.get(id(node))
+        if known is not None and known[0] is node:
+            return known[1]
+        total = 1
+        children = (
+            dict.values(node) if kind is dict else (list.__iter__(node) if kind is list else tuple.__iter__(node))  # type: ignore[arg-type]
+        )
+        for child in children:
+            total += size_of(child)
+            if total > limit + 1:
+                raise ValueError(DISCOVERY_BUDGET_MESSAGE)
+        sizes[id(node)] = (node, total)
+        return total
+
+    inventory.expanded_work += size_of(snapshot)
+    if inventory.expanded_work > limit + 1:
+        raise ValueError(DISCOVERY_BUDGET_MESSAGE)
+
+
+def bounded_private_copy(value: object) -> object:
+    """``_private_copy`` held to the standard tier's edge limit: the gate every final validation passes first.
+
+    The strict validation that follows walks a shared subtree once per path, so the expanded size of the whole
+    graph is charged here, before any ``model_validate`` sees it; an oversized graph is refused with the stable
+    budget error.
+    """
+
+    return _private_copy(value, STANDARD.max_edges)
+
+
+def _pin_collected(inventory: _GraphInventory) -> None:
+    """Pin, once each, the datetimes recorded while a capture was running (their zones are asked now)."""
+
+    pending = list(inventory.collected)
+    inventory.collected.clear()
+    for leaf in pending:
+        if id(leaf) not in inventory.pinned:
+            inventory.pinned[id(leaf)] = (leaf, inventory.pin_leaf(leaf))  # type: ignore[misc]
+
+
+def _capture_entry(value: object, inventory: _GraphInventory, depth: int) -> int:
+    """Capture an entry met after the initial capture: freeze all of its native backing, then pin its datetimes.
+
+    Asking a zone is caller code, so no datetime in the entry is pinned until every part of the entry has been
+    frozen: a zone callback cannot repair a later sibling of what it sits in before that is captured.
+    """
+
+    if inventory.pin_leaf is None or inventory.collecting:
+        return _capture_native_graph(value, inventory, depth)
+    inventory.collecting = True
+    try:
+        height = _capture_native_graph(value, inventory, depth)
+    finally:
+        inventory.collecting = False
+    _pin_collected(inventory)
+    return height
+
+
+def _is_union(origin: object) -> bool:
+    """Both spellings of a union: ``typing.Union[X, None]`` / ``Optional[X]`` and ``X | None``."""
+
+    return origin is typing.Union or origin is types.UnionType
+
+
+def _unwrapped(annotation: object) -> object:
+    for _ in range(4):  # Annotated[...] and Optional[...] wrappers
+        args = typing.get_args(annotation)
+        origin = typing.get_origin(annotation)
+        if origin is Annotated or (_is_union(origin) and len(args) == 2 and type(None) in args):
+            annotation = args[0] if origin is Annotated else next(a for a in args if a is not type(None))
+            continue
+        break
+    return annotation
+
+
+@functools.lru_cache(maxsize=256)  # bounded: classes a caller creates dynamically cannot accumulate
+def _field_names(model_type: type[BaseModel]) -> dict[str, str]:
+    """Each name a dictionary may use for a field of ``model_type`` (the field's name and its string aliases) -> the field."""
+
+    names: dict[str, str] = {}
+    for name, info in model_type.model_fields.items():
+        names[name] = name
+        for alias in (info.alias, info.validation_alias):
+            if type(alias) is str:
+                names[alias] = name
+    return names
+
+
+@functools.lru_cache(maxsize=256)  # bounded: classes a caller creates dynamically cannot accumulate
+def _declared_models(model_type: type[BaseModel]) -> dict[str, type]:
+    """The fields of ``model_type`` declared as exactly one model class, mapped to that class.
+
+    A value held there is judged by the declared class, not by its own (possibly narrower) class, because the
+    contract the receiving helper validates against is the declared one.
+    """
+
+    found: dict[str, type] = {}
+    for name, info in model_type.model_fields.items():
+        element = _unwrapped(info.annotation)
+        if isinstance(element, type) and issubclass(element, BaseModel):
+            found[name] = element
+    return found
+
+
+@functools.lru_cache(maxsize=256)  # bounded: classes a caller creates dynamically cannot accumulate
+def _item_models(model_type: type[BaseModel]) -> dict[str, type]:
+    """The fields of ``model_type`` that hold a homogeneous sequence of one model class, mapped to that class.
+
+    Only ``tuple[T, ...]`` and ``list[T]`` count.  A fixed tuple (``tuple[A, B]``, ``tuple[A]``) has a type
+    and a length per position, so no single class describes its entries: it is left to the model's own
+    validation, which sees the whole view.
+    """
+
+    found: dict[str, type] = {}
+    for name, info in model_type.model_fields.items():
+        annotation = _unwrapped(info.annotation)
+        origin = typing.get_origin(annotation)
+        args = typing.get_args(annotation)
+        homogeneous = (origin is tuple and len(args) == 2 and args[1] is Ellipsis) or (
+            origin is list and len(args) == 1
+        )
+        if homogeneous:
+            element = args[0]
+            if isinstance(element, type) and issubclass(element, BaseModel):
+                found[name] = element
+    return found
+
+
+def _exposed_items(
+    value: object,
+    inventory: _GraphInventory,
+    depth: int,
+    active_containers: set[int] | None = None,
+    item_model: "type[BaseModel] | None" = None,
+    checked: "list[tuple[object, object]] | None" = None,
+) -> tuple[object, ...]:
     """Read a sequence subclass's public view and freeze every sibling.
 
     The native backing of all exposed items is captured before the first one is
     reconstructed, so a callback run while reconstructing an earlier item cannot
-    change a later sibling's captured state.  The observation and each item it yields
-    are charged as they are read, so an endless view is cut off by the budget.
+    change a later sibling's captured state.  Each item is captured the moment the
+    iterator yields it, before the iterator is advanced: a generator resumed to
+    produce the next item cannot repair what it just exposed.  The observation and each
+    item it yields are charged as they are read, so an endless view is cut off by the budget.
+
+    When the view is a field of a model whose items are a known model (``item_model``), each yielded entry
+    is also snapshotted, passed through the receiving boundary's ``entry_guard`` and strictly validated right then, before the iterator is advanced; the first invalid
+    entry refuses the whole input (a prefix of the view is never returned in its place) and the tail is
+    never produced.  The snapshots are kept in ``checked`` for the caller to reuse, so no entry is
+    reconstructed twice.
     """
 
     budget = inventory.budget
     inventory.impure_reads += 1
     budget.charge_edge()
-    collected: list[object] = []
-    for item in iter(value):  # type: ignore[call-overload]
+    iterator = iter(value)  # type: ignore[call-overload]
+    items: list[object] = []
+    inventory.retained.append(items)  # kept alive from the first item, whatever the iterator does next
+    while True:
+        try:
+            item = next(iterator)
+        except StopIteration:
+            break
         budget.charge_edge()
-        collected.append(item)
-    items = tuple(collected)
-    inventory.retained.append(items)
-    for item in items:
-        _capture_native_graph(item, inventory, depth + 1)
-    return items
+        _capture_entry(item, inventory, depth + 1)
+        items.append(item)
+        if item_model is not None and active_containers is not None and checked is not None:
+            snapshot = _snapshot_captured_graph(item, active_containers, inventory, depth + 1, None, item_model)
+            checked.append((item, snapshot))  # by position: the same object yielded twice is two entries
+            done = inventory.validated.get((id(snapshot), id(item_model)))
+            if done is not None and done[0] is snapshot and done[1] is item_model:
+                continue  # the same shared snapshot, already guarded and validated (immutable, unreachable by callers)
+            _charge_expanded_work(snapshot, inventory)  # before any copy or validation: the call's total is bounded
+            try:
+                if inventory.entry_guard is not None:
+                    inventory.entry_guard(snapshot)  # the receiving boundary's type check, before pydantic sees it
+                # A private copy: the validators of the declared class may edit what they are given, and the
+                # retained snapshot is the evidence the caller will judge.
+                item_model.model_validate(_private_copy(snapshot, budget.tier.max_edges), strict=True)
+                inventory.validated[(id(snapshot), id(item_model))] = (snapshot, item_model)
+            except Exception:  # noqa: BLE001 - the input is refused; a prefix is never returned as if it were the view
+                raise ValueError("a contract entry exposed by a public view is not valid") from None
+    return tuple(items)
 
 
 def _snapshot_captured_graph(
@@ -606,6 +983,8 @@ def _snapshot_captured_graph(
     active_containers: set[int],
     inventory: _GraphInventory,
     depth: int = 0,
+    item_model: "type[BaseModel] | None" = None,
+    contract: "type[BaseModel] | None" = None,
 ) -> object:
     """Reconstruct one graph after its reachable native backing is frozen.
 
@@ -625,14 +1004,15 @@ def _snapshot_captured_graph(
 
     value_type = type(value)
     if not _is_subclass(value_type, (BaseModel, tuple, list, dict)):
-        return value
+        known = inventory.pinned.get(id(value))
+        return known[1] if known is not None and known[0] is value else value
 
     budget = inventory.budget
     if depth > budget.tier.max_depth:
         budget.charge_edge(budget.tier.max_edges + 1)  # the stable budget error
     value_id = id(value)
     if value_id not in inventory.visited:
-        _capture_native_graph(value, inventory, depth)
+        _capture_entry(value, inventory, depth)
     completed = inventory.completed
     cached = completed.get(value_id)
     if cached is not None and cached[0] is value:
@@ -690,7 +1070,8 @@ def _snapshot_captured_graph(
                         captured.extra,  # type: ignore[arg-type]
                         type(captured.extra),
                         budget,
-                    )
+                    ),
+                    inventory,
                 )
                 captured.extra_entries = extra_entries
                 # Later rebuilds reuse the saved entries but still hash these keys: remember that a key of
@@ -702,14 +1083,29 @@ def _snapshot_captured_graph(
                 # occurrence may be far deeper than the path that found them).
                 for _, item in extra_entries:
                     _adopt(inventory, value_id, item)
-                    late_height = _capture_native_graph(item, inventory, below) + 1
+                    late_height = _capture_entry(item, inventory, below) + 1
                     _grow_height(inventory, value_id, late_height)
 
             fields: dict[object, object] = {}
+            # Early validation of a view's entries uses the contract the receiving helper validates against (the
+            # declared one, from the root down), never a narrower class the caller's own object happens to have.
+            declared = contract if contract is not None else inventory.contracts.get(value_id)
+            if declared is not None and _is_subclass(model_type, declared):
+                item_models = _item_models(declared)
+                declared_children = _declared_models(declared)
+            else:
+                # No trusted contract names this model: nothing is validated early, because the only class
+                # to do it with would be the caller's own, whose validators are caller code.
+                item_models = declared_children = {}
             for key, item in stored_entries:
                 if again:
                     budget.charge_edge()
-                fields[key] = _snapshot_captured_graph(item, active_containers, inventory, below)
+                if not captured.pure_names:
+                    _charge_key_hash(key, budget)  # an impure model is rebuilt, and its keys hashed, on every path
+                fields[key] = _snapshot_captured_graph(
+                    item, active_containers, inventory, below,
+                    item_models.get(key) if item_models else None, declared_children.get(key),
+                )
                 height = _taller(height, item, completed)
             if captured.colliding_names:
                 raise ValueError("contract input contains colliding keys")
@@ -727,18 +1123,29 @@ def _snapshot_captured_graph(
             for key, item in extra_entries:
                 if again:
                     budget.charge_edge()
+                if not captured.pure_names:
+                    _charge_key_hash(key, budget)
                 fields[key] = _snapshot_captured_graph(item, active_containers, inventory, below)
                 height = _taller(height, item, completed)
             result: object = fields
         elif _is_subclass(value_type, (tuple, list)):
             is_tuple = _is_subclass(value_type, tuple)
             exact = value_type is tuple if is_tuple else value_type is list
-            items = inventory.sequences[value_id] if exact else _exposed_items(value, inventory, depth)
+            checked: list[tuple[object, object]] = []
+            items = (
+                inventory.sequences[value_id]
+                if exact
+                else _exposed_items(value, inventory, depth, active_containers, item_model, checked)
+            )
             copies: list[object] = []
-            for item in items:
+            for position, item in enumerate(items):
                 if exact and again:
                     budget.charge_edge()
-                copies.append(_snapshot_captured_graph(item, active_containers, inventory, below))
+                done = checked[position] if position < len(checked) else None
+                if done is not None and done[0] is item:
+                    copies.append(done[1])  # snapshotted and validated when it was yielded
+                else:
+                    copies.append(_snapshot_captured_graph(item, active_containers, inventory, below, None, item_model))
                 height = _taller(height, item, completed)
             result = tuple(copies) if is_tuple else copies
         else:
@@ -747,10 +1154,27 @@ def _snapshot_captured_graph(
             if value_id not in inventory.pure_dictionaries:
                 inventory.impure_reads += 1  # rebuilding it hashes keys that can run code
             rebuilt: dict[object, object] = {}
+            # A dictionary that is to be validated as a model carries the same declared contract as that model's own
+            # stored values do: its fields' entry models and declared child models are found by field name (or alias).
+            declared = contract if contract is not None else inventory.contracts.get(value_id)
+            if declared is not None and isinstance(declared, type) and _is_subclass(declared, BaseModel):
+                item_models = _item_models(declared)
+                declared_children = _declared_models(declared)
+                lookup = _field_names(declared)
+            else:
+                item_models = declared_children = lookup = {}
+            impure = value_id not in inventory.pure_dictionaries
             for key, item in inventory.dictionaries[value_id]:
                 if again:
                     budget.charge_edge()
-                rebuilt[key] = _snapshot_captured_graph(item, active_containers, inventory, below)
+                if impure:
+                    _charge_key_hash(key, budget)  # an impure dictionary is rebuilt, and its keys hashed, on every path
+                field_name = lookup.get(key) if lookup and type(key) is str else None
+                rebuilt[key] = _snapshot_captured_graph(
+                    item, active_containers, inventory, below,
+                    item_models.get(field_name) if field_name else None,
+                    declared_children.get(field_name) if field_name else None,
+                )
                 height = _taller(height, item, completed)
             result = rebuilt
     finally:
@@ -775,7 +1199,12 @@ def _taller(height: int, item: object, completed: dict[int, tuple[object, object
 
 
 def snapshot_contract_graph(
-    value: object, active_containers: set[int] | None = None
+    value: object,
+    active_containers: set[int] | None = None,
+    *,
+    pin_leaf: "Callable[[object], object] | None" = None,
+    entry_guard: "Callable[[object], object] | None" = None,
+    contract: "type[BaseModel] | tuple[type[BaseModel] | None, ...] | None" = None,
 ) -> object:
     """Reconstruct stored contract graphs while rejecting structural defects.
 
@@ -793,13 +1222,29 @@ def snapshot_contract_graph(
     read, the native backing of every item it exposes is frozen before the
     first item is reconstructed, and all captured objects stay referenced until
     reconstruction finishes.
+
+    ``pin_leaf``, when given, is applied once to every ``datetime`` leaf as its entry is captured (so before a
+    public view that yielded it is advanced), and the snapshot holds the result instead of the caller's object.
+    ``entry_guard`` is the receiving boundary's check of one snapshotted entry (supported types, allowed enums),
+    run before an eager validation so that a value the boundary would refuse is never shown to pydantic.
+    ``contract`` is the model class the root will be validated against (a tuple gives one per element of a tuple
+    root): entries of a public view are validated early against the contract declared there, from the root down,
+    never against a narrower class the caller's own object has.
     """
 
     if active_containers is None:
         active_containers = set()
-    inventory = _GraphInventory()  # one discovery budget for the whole call
+    inventory = _GraphInventory(pin_leaf=pin_leaf, entry_guard=entry_guard)  # one discovery budget for the whole call
+    if contract is not None:
+        if type(contract) is tuple:  # one declared contract per element of an exact tuple root
+            if type(value) is tuple and len(value) == len(contract):
+                inventory.contracts.update({id(v): c for v, c in zip(value, contract) if c is not None})
+        else:
+            inventory.contracts[id(value)] = contract  # type: ignore[assignment]
     try:
         _capture_native_graph(value, inventory)
+        inventory.collecting = False
+        _pin_collected(inventory)  # all native backing is frozen: now the zones may be asked, once each
         return _snapshot_captured_graph(value, active_containers, inventory)
     except RecursionError:
         # One frame per level keeps every admitted depth far inside the interpreter's limit;
@@ -813,5 +1258,6 @@ __all__ = [
     "OpaqueId",
     "SafeCounter",
     "VersionedContract",
+    "bounded_private_copy",
     "snapshot_contract_graph",
 ]

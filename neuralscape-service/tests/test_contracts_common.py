@@ -2577,8 +2577,17 @@ def test_public_first_unrepaired_public_only_child_is_exposed_and_rejected(
 ) -> None:
     value, child, public_view = _public_only_envelope(container_kind, placement)
 
+    if placement == "direct":
+        # The exposed entry is invalid as it is yielded: the whole input is refused (a prefix is never returned
+        # in its place), after exactly one read of the view.
+        with pytest.raises(ValueError, match="not valid"):
+            snapshot_contract_graph(value, contract=type(value))
+        assert public_view.iteration_calls == 1
+        assert child.count == -1
+        return
+    # A view held inside an outer sequence has no single declared entry model: it is exposed and the receiving
+    # model rejects it.
     snapshot = snapshot_contract_graph(value)
-
     assert list(_exposed_children(snapshot, placement)) == [{"count": -1}]
     assert public_view.iteration_calls == 1
     assert child.count == -1
@@ -2604,16 +2613,20 @@ def test_public_first_public_only_child_repaired_by_earlier_stored_name_hook(
     stored_name.armed = True
     stored_name.hash_calls = stored_name.equality_calls = 0
 
-    snapshot = snapshot_contract_graph(value)
-
     # A stored name is read as its text, so no hook runs before the public view is first
-    # observed: the child is exposed as it is (invalid) and the receiving model rejects it.
+    # observed: the child is exposed as it is (invalid) and is refused (directly) or rejected by the model.
+    if placement == "direct":
+        with pytest.raises(ValueError, match="not valid"):
+            snapshot_contract_graph(value, contract=type(value))
+    else:
+        snapshot = snapshot_contract_graph(value)
+        assert list(_exposed_children(snapshot, placement)) == [{"count": -1}]
+        with pytest.raises(ValidationError):
+            type(value).model_validate(snapshot, strict=True)
+
     assert stored_name.hash_calls == stored_name.equality_calls == 0
     assert child.count == -1
-    assert list(_exposed_children(snapshot, placement)) == [{"count": -1}]
     assert public_view.iteration_calls == 1
-    with pytest.raises(ValidationError):
-        type(value).model_validate(snapshot, strict=True)
 
 
 @pytest.mark.parametrize("placement", ["direct", "nested"])
@@ -2672,17 +2685,15 @@ def test_public_first_native_stored_child_stays_fenced_against_the_same_callback
 def test_public_first_public_view_is_read_once_per_edge_not_per_snapshot(
     container_kind: str,
 ) -> None:
-    value, _, public_view = _public_only_envelope(container_kind, "direct")
-    native = _BASE_MODEL_DICT_DESCRIPTOR.__get__(value, BaseModel)
-    outer: object = (public_view,) if container_kind == "tuple" else [public_view]
-    dict.__setitem__(native, "groups", outer)
+    _, _, public_view = _public_only_envelope(container_kind, "direct")
 
-    snapshot = snapshot_contract_graph(value)
+    # Not a model field, so there is no early check: two edges reach the one view.
+    snapshot = snapshot_contract_graph({"one": public_view, "two": [public_view]})
 
-    # One read for each edge that reaches the view (the direct field and the
-    # nested one); a single edge reads it exactly once (see the tests above).
+    # One read for each edge that reaches the view (the direct one and the nested one); a single
+    # edge reads it exactly once (see the tests above).
     assert public_view.iteration_calls == 2
-    assert list(snapshot["children"]) == list(snapshot["groups"][0]) == [{"count": -1}]
+    assert list(snapshot["one"]) == list(snapshot["two"][0]) == [{"count": -1}]
 
 
 # ---------------------------------------------------------------------------
@@ -4366,3 +4377,76 @@ def test_a_missing_metadata_slot_on_a_hidden_model_does_not_abort_capture(shape)
 def test_a_missing_metadata_slot_on_a_projected_model_is_the_metadata_refusal(shape) -> None:
     with pytest.raises(ValueError, match="metadata"):
         snapshot_contract_graph({"items": [_model_missing_slot(shape)]})
+
+
+# ---- the enum-annotation helper runs on every supported Python (on 3.10 ``list[int]`` is an instance of ``type``)
+
+def test_the_enum_annotation_helper_handles_generic_aliases_and_unions() -> None:
+    import enum
+    import typing
+
+    from contracts_common import _annotation_holds_enum
+
+    class Color(enum.Enum):
+        RED = "red"
+
+    class Plain:
+        pass
+
+    holds = [
+        Color,
+        list[Color],
+        tuple[Color, ...],
+        tuple[str, Color],
+        dict[str, Color],
+        dict[Color, int],
+        Color | None,
+        typing.Optional[Color],
+        typing.Union[int, Color],
+        typing.Annotated[Color, "note"],
+        list[dict[str, tuple[Color, ...]]],
+        typing.Annotated[list[Color], "note"],
+    ]
+    does_not = [
+        Plain,
+        str,
+        int,
+        list,
+        list[int],
+        tuple[str, ...],
+        dict[str, int],
+        int | None,
+        typing.Optional[str],
+        typing.Annotated[str, "note"],
+        typing.Any,
+        typing.Literal["a"],
+        None,
+        list[Plain],
+    ]
+    for annotation in holds:
+        assert _annotation_holds_enum(annotation) is True, annotation
+    for annotation in does_not:
+        assert _annotation_holds_enum(annotation) is False, annotation
+
+
+def test_a_model_with_generic_enum_annotations_defines_and_records_its_enum_fields() -> None:
+    import enum
+    import typing
+
+    from contracts_common import ContractModel
+
+    class Color(enum.Enum):
+        RED = "red"
+
+    class Holder(ContractModel):
+        one: Color
+        many: list[Color]
+        fixed: tuple[Color, ...]
+        mapping: dict[str, Color]
+        maybe: Color | None = None
+        optional: typing.Optional[Color] = None
+        annotated: typing.Annotated[Color, "note"] = Color.RED
+        text: str = ""
+        numbers: list[int] = []
+
+    assert set(Holder._enum_field_names) == {"one", "many", "fixed", "mapping", "maybe", "optional", "annotated"}
