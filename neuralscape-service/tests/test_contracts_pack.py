@@ -922,3 +922,63 @@ def test_every_path_to_a_narrowed_shared_definition_is_still_reported() -> None:
     findings = _pair(_diamond(2, {"type": "string", "maxLength": 9}), _diamond(2, {"type": "string", "maxLength": 3}))
     paths = {f.split(":")[0] for f in findings if "maxLength lowered" in f}
     assert {"$.a.a", "$.a.b", "$.b.a", "$.b.b"} <= paths, paths
+
+
+# ------------------------------------------------------- bounded time, memory and findings on hostile shapes
+
+
+import resource as _resource  # noqa: E402
+
+
+def test_a_narrowed_shared_definition_is_reported_through_every_path_in_bounded_time_and_findings() -> None:
+    old = _diamond(18, {"type": "string", "maxLength": 9})
+    new = _diamond(18, {"type": "string", "maxLength": 3})
+    findings, seconds = _timed(old, new)
+    assert any("maxLength lowered" in f for f in findings), findings[:3]
+    assert seconds < 2.0, seconds  # 262,144 findings and about 13 s before the pair memory
+    assert len(findings) <= pack._MAX_FINDINGS
+    assert not any("budget" in f for f in findings), "the shared-pair memory, not the budget, keeps this small"
+
+
+def test_a_very_deep_narrowed_diamond_neither_hangs_nor_grows_memory() -> None:
+    before = _resource.getrusage(_resource.RUSAGE_SELF).ru_maxrss
+    findings, seconds = _timed(_diamond(40, {"type": "string", "maxLength": 9}), _diamond(40, {"type": "string", "maxLength": 3}))
+    growth_mib = (_resource.getrusage(_resource.RUSAGE_SELF).ru_maxrss - before) / 1024
+    assert findings and seconds < 2.0 and growth_mib < 100, (len(findings), seconds, growth_mib)
+
+
+def test_the_findings_list_is_capped_with_one_marker() -> None:
+    props = {f"p{index}": {"type": "string", "maxLength": 9} for index in range(3000)}
+    narrowed = {name: {"type": "string", "maxLength": 3} for name in props}
+    findings = _pair({"type": "object", "properties": props}, {"type": "object", "properties": narrowed})
+    assert len(findings) == pack._MAX_FINDINGS
+    assert "finding limit reached" in findings[-1] and findings.count(findings[-1]) == 1
+
+
+def test_an_exhausted_comparison_budget_is_an_unverified_finding_not_a_hang(monkeypatch) -> None:
+    monkeypatch.setattr(pack, "_MAX_COMPARISONS", 50)
+    props = {f"p{index}": {"type": "string"} for index in range(500)}
+    findings = _pair({"type": "object", "properties": props}, {"type": "object", "properties": dict(props)})
+    assert any("comparison budget exhausted" in f for f in findings), findings
+    monkeypatch.undo()
+    assert _pair({"type": "object", "properties": props}, {"type": "object", "properties": dict(props)}) == []
+
+
+def test_a_budget_hit_inside_a_union_trial_is_never_read_as_a_match(monkeypatch) -> None:
+    monkeypatch.setattr(pack, "_MAX_COMPARISONS", 30)
+    branch = {"type": "object", "properties": {f"p{index}": {"type": "string"} for index in range(200)}}
+    findings = _pair({"anyOf": [branch]}, {"anyOf": [branch]})
+    assert findings, "an exhausted budget must be reported, never silently accepted"
+
+
+def test_a_dirty_shared_pair_inside_a_union_trial_still_fails_the_match() -> None:
+    leaf_old = {"type": "string", "maxLength": 9}
+    leaf_new = {"type": "string", "maxLength": 3}
+    defs_old = {"L": leaf_old, "P": {"type": "object", "properties": {"x": {"$ref": "#/$defs/L"}}}}
+    defs_new = {"L": leaf_new, "P": {"type": "object", "properties": {"x": {"$ref": "#/$defs/L"}}}}
+    old = {"$defs": defs_old, "properties": {"a": {"$ref": "#/$defs/P"}, "b": {"anyOf": [{"$ref": "#/$defs/P"}, {"type": "null"}]}}}
+    new = {"$defs": defs_new, "properties": {"a": {"$ref": "#/$defs/P"}, "b": {"anyOf": [{"$ref": "#/$defs/P"}, {"type": "null"}]}}}
+    findings = _pair(old, new)
+    # the first path (property a) records P as narrowed; the union trial under b must not read it as clean
+    assert any(f.startswith("$.a") and "maxLength lowered" in f for f in findings)
+    assert any(f.startswith("$.b") and ("no longer accepted" in f or "maxLength lowered" in f) for f in findings), findings

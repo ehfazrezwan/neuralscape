@@ -333,10 +333,27 @@ def _removed_values(old_values: list, new_values: list) -> list:
     return removed
 
 
+# Bounds on one comparison, so a schema generated from models can never hang CI or exhaust memory:
+# keyword comparisons performed, findings listed, and findings remembered per shared node pair.
+_MAX_COMPARISONS = 200_000
+_MAX_FINDINGS = 1000
+_MAX_PAIR_FINDINGS = 20
+_LIMIT_MESSAGE = "$: unverified change: finding limit reached; further findings omitted (needs a version bump or a reviewer waiver)"
+_BUDGET_MESSAGE = "$: unverified change: comparison budget exhausted; compatibility not verified (needs a version bump or a reviewer waiver)"
+
+
+class _BudgetExhausted(Exception):
+    pass
+
+
 class _Run:
-    """State shared by one ``check_compatibility`` call: definition-set equality and node pairs already shown compatible."""
+    """State shared by one ``check_compatibility`` call: definition-set equality and node pairs already compared."""
 
     def __init__(self) -> None:
+        self.steps = 0
+        # A pair that produced findings remembers them relative to its own path, so another path to the same
+        # shared definition reports them again (bounded) without walking it again.
+        self.dirty: dict[tuple[int, int, int, int], tuple[tuple[object, ...], list[str]]] = {}
         self.defs_equal: dict[tuple[int, int], bool] = {}
         # (old node, new node, old defs, new defs) identities -> the nodes themselves (strong references,
         # so a released temporary's id can never be reused by another object and alias a recorded pair)
@@ -502,12 +519,36 @@ def _compare_checked(
 
     run = _RUN.get()
     key = (id(old), id(new), id(old_defs), id(new_defs))
-    if run is not None and key in run.clean:
-        return
+    if run is not None:
+        if key in run.clean:
+            return
+        remembered = run.dirty.get(key)
+        if remembered is not None:
+            out.extend(f"{path}{suffix}" for suffix in remembered[1])
+            return
+        run.steps += 1
+        if run.steps > _MAX_COMPARISONS:
+            raise _BudgetExhausted
     before = len(out)
     _compare_keywords(old, new, old_defs, new_defs, path, out, depth, active)
-    if run is not None and len(out) == before:
-        run.clean[key] = (old, new, old_defs, new_defs)
+    if run is not None:
+        if len(out) == before:
+            run.clean[key] = (old, new, old_defs, new_defs)
+        else:
+            suffixes = [f[len(path):] for f in out[before:before + _MAX_PAIR_FINDINGS] if f.startswith(path)]
+            run.dirty[key] = ((old, new, old_defs, new_defs), suffixes)
+
+
+def _cap(findings: list[str]) -> list[str]:
+    """The final findings list, bounded: past the limit one marker replaces the rest.
+
+    Applied once at the end, never inside the walk: a pair is judged compatible by whether it added a finding,
+    and a list truncated mid-walk would make a pair that did add findings look clean.
+    """
+
+    if len(findings) > _MAX_FINDINGS:
+        return [*findings[: _MAX_FINDINGS - 1], _LIMIT_MESSAGE]
+    return findings
 
 
 def _compare_keywords(
@@ -682,9 +723,11 @@ def check_compatibility(old: dict, new: dict) -> list[str]:
     token = _RUN.set(_Run())
     try:
         _compare(old, new, old.get("$defs", {}), new.get("$defs", {}), "$", problems)
+    except _BudgetExhausted:
+        problems.append(_BUDGET_MESSAGE)
     finally:
         _RUN.reset(token)
-    return list(dict.fromkeys(problems))
+    return _cap(list(dict.fromkeys(problems)))
 
 
 def compare_schemas(old: dict[str, dict], new: dict[str, dict]) -> dict[str, list[str]]:
