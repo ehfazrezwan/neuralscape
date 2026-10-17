@@ -95,25 +95,28 @@ def _class_namespace_entry(model_type: type, name: str, budget: DiscoveryBudget)
         namespace = _CLASS_NAMESPACE.__get__(klass)
         budget.charge_edge(MappingProxyType.__len__(namespace))  # every entry scanned is charged
         value, found, klass_pure = _exact_entry(MappingProxyType.items(namespace), name)
-        pure = pure and klass_pure
+        if not klass_pure:
+            raise ValueError(_METADATA_REFUSAL)  # a key that is not exact text could answer a lookup itself
         if found:
             return value, pure
     return None, pure
 
 
-def _native_sequence(value: object, budget: DiscoveryBudget) -> tuple[tuple[object, ...], bool]:
-    """``(items, pure)`` of a list or tuple read through its native storage (no iteration, length or
-    indexing hook runs).  Its native length is charged before anything is copied, so an oversized one is
-    refused without the copy.  A subclass is still read natively but reported impure; anything else is
-    unreadable."""
+def _native_sequence(value: object, budget: DiscoveryBudget) -> tuple[object, ...]:
+    """The items of an alias's storage, which must be an exact list or tuple.
 
-    if _is_subclass(type(value), list):
+    Its native length is charged before anything is copied, so an oversized one is refused without the
+    copy.  Anything else (a subclass, a ``UserList``, any other object) cannot be read the way pydantic read
+    it, so it is refused rather than read as empty or through its own protocol.
+    """
+
+    if type(value) is list:
         budget.charge_edge(list.__len__(value))  # type: ignore[arg-type]
-        return tuple(list.__iter__(value)), type(value) is list  # type: ignore[arg-type]
-    if _is_subclass(type(value), tuple):
+        return tuple(list.__iter__(value))  # type: ignore[arg-type]
+    if type(value) is tuple:
         budget.charge_edge(tuple.__len__(value))  # type: ignore[arg-type]
-        return (value if type(value) is tuple else tuple(tuple.__iter__(value))), type(value) is tuple  # type: ignore[return-value,arg-type]
-    return (), False
+        return value  # type: ignore[return-value]
+    raise ValueError(_METADATA_REFUSAL)
 
 
 def _text(value: object) -> object:
@@ -162,9 +165,12 @@ def _declared_metadata(
     declared_fields, config, _pure = _model_metadata(model_type, budget)
     declared_names: set[object] = set()
     for name, _field in declared_fields:  # the charged copy, never the live table
-        if _is_subclass(type(name), str):
-            declared_names.add(_text(name))
-    alias_owners, _aliases_pure = _validation_alias_owners(declared_fields, config, budget)
+        if not _is_subclass(type(name), str):
+            raise ValueError(_METADATA_REFUSAL)  # a declared name that is not text (never hashed)
+        declared_names.add(_text(name))
+    alias_owners, aliases_pure = _validation_alias_owners(declared_fields, config, budget)
+    if not (_pure and aliases_pure):
+        raise ValueError(_METADATA_REFUSAL)  # every read above is exact and native, or refused: never cache otherwise
     inventory.metadata[id(model_type)] = (model_type, declared_names, alias_owners)
     return declared_names, alias_owners
 
@@ -185,7 +191,8 @@ def _validation_alias_owners(
     if type(config) is dict:
         budget.charge_edge(dict.__len__(config))
         validate_by_alias, _found, config_pure = _exact_entry(dict.items(config), "validate_by_alias")
-        pure = config_pure
+        if not config_pure:
+            raise ValueError(_METADATA_REFUSAL)  # a configuration key that is not exact text
     elif config is not None:
         raise ValueError(_METADATA_REFUSAL)
     if validate_by_alias is False:
@@ -195,16 +202,14 @@ def _validation_alias_owners(
     budget.charge_edge(len(fields))  # this walk scans every declared field again: charged again
     for field_name, field in fields:  # the copy: nothing read here can change what is walked
         if not _is_subclass(type(field_name), str):
-            pure = False  # a non-text name can hash or compare through caller code: never hashed
-            continue
+            raise ValueError(_METADATA_REFUSAL)  # a declared name that is not text (never hashed)
         # Only pydantic's own field and alias types are read, through their own slots: a subclass could
         # run code from a property while the metadata is read, before the input's storage is all captured.
         if type(field) is not FieldInfo:
             raise ValueError(_METADATA_REFUSAL)
         validation_alias = object.__getattribute__(field, "validation_alias")
         if type(validation_alias) is AliasChoices:
-            choices, choices_pure = _native_sequence(object.__getattribute__(validation_alias, "choices"), budget)
-            pure = pure and choices_pure
+            choices = _native_sequence(object.__getattribute__(validation_alias, "choices"), budget)
         elif _is_subclass(type(validation_alias), (AliasChoices, AliasPath)) and type(validation_alias) is not AliasPath:
             raise ValueError(_METADATA_REFUSAL)
         else:
@@ -214,8 +219,7 @@ def _validation_alias_owners(
             if _is_subclass(type(choice), str):
                 owners.setdefault(_text(choice), set()).add(name)  # type: ignore[arg-type]
             elif type(choice) is AliasPath:
-                path, path_pure = _native_sequence(object.__getattribute__(choice, "path"), budget)
-                pure = pure and path_pure
+                path = _native_sequence(object.__getattribute__(choice, "path"), budget)
                 root = path[0] if path else None
                 if _is_subclass(type(root), str):
                     owners.setdefault(_text(root), set()).add(name)  # type: ignore[arg-type]

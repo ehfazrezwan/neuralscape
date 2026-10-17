@@ -3832,17 +3832,16 @@ def _hooked_text(counter, text):
 
 
 def _assert_consistent(counter, model) -> None:
+    """Metadata that could only be read through hook-capable storage or keys is refused, and no hook runs."""
+
     view = _counter_view(counter)
     counter[0] = 0
-    snapshot = snapshot_contract_graph([model, view, model, view])
-    ran = counter[0]
-    if ran == 0:
-        assert snapshot[1] == snapshot[3]      # no hook ran: both observations agree
-    else:
-        assert snapshot[1] != snapshot[3]      # a hook ran: the model is rebuilt per edge, not reused
+    with pytest.raises(ValueError, match="metadata"):
+        snapshot_contract_graph([model, view, model, view])
+    assert counter[0] == 0
 
 
-def test_a_str_subclass_key_in_the_model_configuration_cannot_skew_later_views() -> None:
+def test_a_str_subclass_key_in_the_model_configuration_is_refused_without_running_it() -> None:
     counter = [0]
 
     class Configured(BaseModel):
@@ -3854,7 +3853,7 @@ def test_a_str_subclass_key_in_the_model_configuration_cannot_skew_later_views()
 
 
 @pytest.mark.parametrize("shape", ["choices", "path"])
-def test_alias_storage_that_is_a_list_subclass_cannot_skew_later_views(shape) -> None:
+def test_alias_storage_that_is_a_list_subclass_is_refused_without_running_it(shape) -> None:
     from pydantic import AliasChoices, AliasPath, Field
 
     counter = [0]
@@ -3885,7 +3884,7 @@ def test_alias_storage_that_is_a_list_subclass_cannot_skew_later_views(shape) ->
     _assert_consistent(counter, Aliased())
 
 
-def test_a_hooked_key_in_a_model_class_namespace_cannot_skew_later_views() -> None:
+def test_a_hooked_key_in_a_model_class_namespace_is_refused_without_running_it() -> None:
     counter = [0]
 
     class Colliding(str):  # hashes like "model_config", so looking that name up compares against it
@@ -3954,7 +3953,7 @@ def test_an_oversized_alias_list_is_refused_before_it_is_copied() -> None:
     assert peak < 4_000_000, peak  # the 16 MB copy of the list was never made
 
 
-def test_a_non_text_key_among_the_declared_fields_runs_no_hook_and_cannot_skew_later_views() -> None:
+def test_a_non_text_key_among_the_declared_fields_is_refused_without_running_it() -> None:
     counter = [0]
 
     class HookedKey:
@@ -4056,16 +4055,6 @@ def test_declared_fields_are_scanned_and_charged_once_per_class_per_call(monkeyp
 
     Many = create_model("Many", **{f"f{index}": (int, 0) for index in range(2_000)})
 
-    class NonText:
-        def __hash__(self):
-            return 11
-
-        def __eq__(self, other):
-            return self is other
-
-    fields = vars(Many)["__pydantic_fields__"]
-    dict.__setitem__(fields, NonText(), fields["f0"])  # a non-text declared key: never hashed
-
     def sparse():
         instance = Many()
         vars(BaseModel)["__dict__"].__get__(instance, BaseModel).clear()  # almost no captured storage
@@ -4102,13 +4091,21 @@ def _impure_wide_model(field_count: int) -> type[BaseModel]:
     return Wide
 
 
-def test_impure_model_metadata_is_read_once_per_call_and_charged() -> None:
-    Wide = _impure_wide_model(2_000)
+def test_wide_model_metadata_is_read_once_per_call_and_charged() -> None:
+    def wide(field_count):
+        Wide = type("Wide", (BaseModel,), {"__annotations__": {"a": int}, "a": 1})
+        fields = vars(Wide)["__pydantic_fields__"]
+        for index in range(field_count):
+            dict.__setitem__(fields, f"f{index}", fields["a"])
+        return Wide
+
+    Wide = wide(2_000)
     # 200 instances of a class with a 2,001-entry declared table: the table is read (and charged) once
     assert len(snapshot_contract_graph([Wide() for _ in range(200)])) == 200
-    huge = _impure_wide_model(200_000)
     with pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):
-        snapshot_contract_graph([huge()])  # one read of a table past the edge allowance is still refused
+        snapshot_contract_graph([wide(200_000)()])  # one read of a table past the edge allowance is refused
+    with pytest.raises(ValueError, match="metadata"):
+        snapshot_contract_graph([_impure_wide_model(10)()])  # a non-text declared key is refused
 
 
 def test_a_declared_field_table_shared_by_many_classes_costs_its_size_per_class() -> None:
@@ -4275,3 +4272,28 @@ def test_hook_capable_metadata_types_are_refused(shape) -> None:
         type.__setattr__(Model, "model_config", MappingProxyType(dict(vars(Model)["model_config"])))
     with pytest.raises(ValueError, match="metadata"):
         snapshot_contract_graph(Model())
+
+
+# ── alias storage that is not a native list or tuple is refused, never read as empty ──
+
+
+@pytest.mark.parametrize("shape", ["choices", "path"])
+def test_alias_storage_that_cannot_be_read_natively_is_refused_not_dropped(shape) -> None:
+    from collections import UserList
+
+    from pydantic import AliasChoices, AliasPath, ConfigDict, Field
+
+    alias = AliasChoices("alias_a") if shape == "choices" else AliasPath("alias_a", 0)
+
+    class Aliased(BaseModel):
+        model_config = ConfigDict(validate_by_alias=True, validate_by_name=True, extra="allow")
+        a: int = Field(1, validation_alias=alias)
+
+    if shape == "choices":
+        object.__setattr__(alias, "choices", UserList(["alias_a"]))
+    else:
+        object.__setattr__(alias, "path", UserList(["alias_a", 0]))
+    both = Aliased()
+    vars(BaseModel)["__dict__"].__get__(both, BaseModel)["alias_a"] = 2  # the field and its alias root, stored
+    with pytest.raises(ValueError, match="metadata"):
+        snapshot_contract_graph(both)  # used to drop the alias silently and accept the conflicting storage
