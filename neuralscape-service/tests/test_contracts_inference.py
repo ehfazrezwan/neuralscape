@@ -2065,3 +2065,32 @@ def test_many_references_to_one_wide_list_are_sized_once():
     with pytest.raises(ValueError):
         validate_generation_result(request, result)
     assert time.monotonic() - started < 1.5
+
+
+def test_a_shared_source_text_costs_little_per_occurrence():
+    """One 2 MB source text shared by 100 source entries: each occurrence is revalidated."""
+
+    import time
+
+    request = decision_request()
+    request.__dict__["sources"] = (source_evidence(text="a" * 2_000_000),) * 100
+    result = DecisionResult(schema_version=VERSION, request_id="request-1", head_result=selected(), attempts=(usage(),))
+    started = time.monotonic()
+    with pytest.raises(ValueError):  # two versions of one record: refused after revalidation
+        validate_decision_result(request, result)
+    assert time.monotonic() - started < 2
+
+
+def test_a_long_string_repeated_in_a_json_value_is_charged_for_every_occurrence():
+    """1,000 references to one 1 MB string: few entries, but every occurrence is scanned."""
+
+    from contracts_limits import DISCOVERY_BUDGET_MESSAGE
+
+    request, result = _generation_with_output({"v": ["x" * 1_000_000] * 1_000}, v={"type": "array"})
+    with pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):
+        validate_generation_result(request, result)
+
+
+def test_one_long_distinct_string_is_still_accepted():
+    request, result = _generation_with_output({"v": "x" * 5_000_000}, v={"type": "string"})
+    assert validate_generation_result(request, result).compliant

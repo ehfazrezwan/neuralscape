@@ -107,8 +107,12 @@ class SourceEvidence(ContractModel):
 
     @model_validator(mode="after")
     def validate_utf8(self) -> "SourceEvidence":
-        if any(0xD800 <= ord(character) <= 0xDFFF for character in self.text):
-            raise ValueError("source evidence must be valid UTF-8 text")
+        # The strict UTF-8 codec refuses exactly the surrogate code points, in C: this runs for every
+        # occurrence of the evidence a request holds, so a per-character Python loop would not do.
+        try:
+            str.encode(self.text, "utf-8")
+        except UnicodeEncodeError:
+            raise ValueError("source evidence must be valid UTF-8 text") from None
         return self
 
     def utf8_boundaries(self) -> frozenset[int]:

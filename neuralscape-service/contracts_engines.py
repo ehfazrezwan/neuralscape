@@ -539,6 +539,10 @@ def _snapshot_native_value(
                 # a mapping that is not a dict is not copied, but nothing hidden may sit inside a JSON value
                 for nested in _charged_entries(value.values, budget):
                     child(nested, f"{location}[value]")
+            elif not guard and is_subclass(value_type, str):
+                # A long string is scanned once per occurrence by revalidation and the contract's checks;
+                # each occurrence charges its length (inside a JSON value, sizing counts it per path).
+                _add_expansion(_string_units(value), budget, memo)
             return value, 0, True
         if own_cost and not guard:
             # Strict revalidation walks typed collections path by path, like a JSON value: an exact
@@ -589,8 +593,18 @@ def _add_expansion(amount: int, budget: DiscoveryBudget, memo: dict[Any, Any]) -
     memo[_EXPANDED_TOTAL] = total
 
 
+#: A string costs one allowance unit per this many characters: a short string is free, and a long one
+#: repeated by reference is charged for the scans every occurrence receives.
+_STRING_UNIT_CHARS = 1024
+
+
+def _string_units(text: str) -> int:
+    return str.__len__(text) // _STRING_UNIT_CHARS
+
+
 def _expanded_size(native: Any, budget: DiscoveryBudget, memo: dict[Any, Any]) -> int:
-    """The number of entries a path-by-path walk of ``native`` visits, sized once per container.
+    """The work a path-by-path walk of ``native`` does, sized once per container: its entries, plus
+    one unit per ``_STRING_UNIT_CHARS`` characters of every string or key it scans.
 
     Children first, by identity (``entries + the expanded size of its children``), so the work is
     proportional to the distinct graph; sizing stops as soon as one container exceeds the edge
@@ -617,8 +631,12 @@ def _expanded_size(native: Any, budget: DiscoveryBudget, memo: dict[Any, Any]) -
             pending.extend((child, False) for child in children if known(child) is None)
             continue
         total = len(children)
-        for child in children:
-            total += known(child) or 0
+        texts = tuple(dict.keys(value)) + children if kind is dict else children
+        for child in texts:
+            if type(child) is str:
+                total += _string_units(child)  # every path scans a long string (or key) again
+            else:
+                total += known(child) or 0
             if total > limit:
                 budget.charge_edge(limit - budget.edges + 1)  # raises and leaves the budget exhausted
         memo[(_EXPANDED_SIZE, id(value))] = (value, total)
