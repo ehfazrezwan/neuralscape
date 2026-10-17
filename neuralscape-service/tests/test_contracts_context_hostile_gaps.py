@@ -357,3 +357,29 @@ def test_the_documented_limit_holds_at_its_real_size_for_one_native_and_a_full_i
 
     with pytest.raises(ValueError, match="budget"):
         projection_status_for(Lazy(), [entries[0]])
+
+
+# ---- sequence class gate
+
+
+def test_a_sequence_class_with_a_metaclass_eq_runs_no_code_before_the_arguments_are_captured() -> None:
+    from tests.test_contracts_freshness import _invalid, _sv
+
+    for hold in (tuple, list):
+        bad = _invalid()
+        calls: list[str] = []
+
+        class Meta(type):
+            def __eq__(cls, other):
+                calls.append("eq")
+                object.__setattr__(bad, "content_revision", 1)  # repairs the invalid model the other argument holds
+                return NotImplemented
+
+            __hash__ = type.__hash__
+
+        class Public(list, metaclass=Meta):
+            pass
+
+        with pytest.raises(Exception):
+            projection_status_for(Public([_sv("rec-1", 1)]), hold([bad]))
+        assert calls == []  # the class was judged by identity: its hook never ran

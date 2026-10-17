@@ -489,7 +489,7 @@ def _version_maps(*sequences: Sequence[SourceVersion]) -> tuple[dict[str, tuple[
     native_entries = sum(
         tuple.__len__(sequence) if type(sequence) is tuple else list.__len__(sequence)  # type: ignore[arg-type]
         for sequence in sequences
-        if type(sequence) in (tuple, list)
+        if type(sequence) is tuple or type(sequence) is list
     )
     if native_entries > _MAX_SEQUENCE_ENTRIES:
         raise ValueError(_SEQUENCE_BUDGET_MESSAGE)
