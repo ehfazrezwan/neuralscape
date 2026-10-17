@@ -9,6 +9,7 @@ not be synthesized as a zero.
 from __future__ import annotations
 
 import heapq
+import itertools
 import json
 from collections.abc import Mapping
 from contextvars import ContextVar
@@ -1250,6 +1251,18 @@ _LEAF_TYPES = (type(None), bool, int, float, str, datetime)
 MAX_SNAPSHOT_VISITS = 65_536
 MAX_SNAPSHOT_DEPTH = 64
 SNAPSHOT_BUDGET_MESSAGE = "manifest input exceeds the native snapshot budget"
+# The most names one read of a model's field inventory may produce, repeated names included: the project's own
+# models have about a dozen fields, and the inventory belongs to the caller's class, so it is read through a bound.
+_MAX_FIELD_INVENTORY = 64
+
+
+def _read_field_inventory(model_type: type) -> frozenset[Any]:
+    """The names of ``model_type.model_fields`` as exact text, read once and never past ``_MAX_FIELD_INVENTORY`` entries."""
+
+    produced = list(itertools.islice(iter(model_type.model_fields), _MAX_FIELD_INVENTORY + 1))  # type: ignore[attr-defined]
+    if len(produced) > _MAX_FIELD_INVENTORY:
+        raise ValueError(SNAPSHOT_BUDGET_MESSAGE)
+    return frozenset(_exact_key(name) for name in produced)
 
 
 def _charge_capture(frozen_graph: _FrozenGraph) -> None:
@@ -1453,7 +1466,7 @@ def _snapshot_native(
         if _is_instance(value, BaseModel):
             # The field inventory comes from the caller's class and may answer differently each time it is iterated:
             # it is read once into exact names, and the model is rebuilt from the captured entries, not from it.
-            fields = frozenset(_exact_key(name) for name in type(value).model_fields)
+            fields = _read_field_inventory(type(value))
             frozen = _frozen_graph.models.get(identity)
             if frozen is None or frozen[0] is not value:
                 _freeze_model_storage(value, _frozen_graph, set())

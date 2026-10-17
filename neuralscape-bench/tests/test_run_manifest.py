@@ -6263,3 +6263,117 @@ def test_a_bytes_subclass_overriding_item_access_is_copied_from_its_real_bytes()
     with pytest.raises(ValueError, match="duplicate JSON key"):
         validate_run_manifest_json(Slippery(dirty))
     assert log == [], log
+
+
+# ---- the single read of a caller-overridable field inventory is bounded
+
+import signal as _signal
+
+
+class _Alarm(Exception):
+    pass
+
+
+def _within(seconds, call):
+    def on_alarm(signum, frame):
+        raise _Alarm()
+
+    previous = _signal.signal(_signal.SIGALRM, on_alarm)
+    _signal.setitimer(_signal.ITIMER_REAL, seconds)
+    try:
+        return call()
+    finally:
+        _signal.setitimer(_signal.ITIMER_REAL, 0)
+        _signal.signal(_signal.SIGALRM, previous)
+
+
+class _InventoryFrom(dict):
+    """A field inventory whose iteration yields whatever ``factory`` makes (after the real names, when asked)."""
+
+    def __init__(self, fields, factory):
+        super().__init__(fields)
+        self.factory = factory
+        self.reads = 0
+
+    def __iter__(self):
+        self.reads += 1
+        return iter(self.factory(list(dict.__iter__(self))))
+
+
+def _resource_with_inventory(factory):
+    base_meta = type(ResourceReading)
+
+    class InventoryMeta(base_meta):
+        @property
+        def model_fields(cls):   # type: ignore[override]
+            return cls._inventory
+
+    class InventoryReading(ResourceReading, metaclass=InventoryMeta):
+        pass
+
+    InventoryReading._inventory = _InventoryFrom(ResourceReading.model_fields, factory)
+    return InventoryReading.model_construct(**measured_memory().model_dump()), InventoryReading._inventory
+
+
+def _endless(real):
+    def names():
+        yield from real
+        index = 0
+        while True:
+            yield f"extra-{index}"
+            index += 1
+    return names()
+
+
+def _huge_distinct(real):
+    return iter([*real, *(f"extra-{index}" for index in range(200_000))])
+
+
+def _huge_repeated(real):
+    return iter(["observed_value"] * 200_000)
+
+
+@pytest.mark.parametrize("factory", [_endless, _huge_distinct, _huge_repeated], ids=["nonterminating", "huge-distinct", "huge-repeated"])
+def test_an_oversized_or_endless_field_inventory_is_refused_by_the_snapshot_budget(factory) -> None:
+    resource, inventory = _resource_with_inventory(factory)
+    with pytest.raises(ValueError) as caught:
+        _within(10, lambda: _snapshot_native(resource))
+    assert str(caught.value) == run_manifest_module.SNAPSHOT_BUDGET_MESSAGE
+    assert inventory.reads == 1
+
+
+def test_an_oversized_inventory_is_refused_through_serialization_too() -> None:
+    resource, _inventory = _resource_with_inventory(_huge_distinct)
+    manifest = completed_manifest()
+    object.__setattr__(manifest, "resources", (resource,))
+    with pytest.raises(ValueError) as caught:
+        _within(10, lambda: serialize_run_manifest(manifest))
+    assert str(caught.value) == run_manifest_module.SNAPSHOT_BUDGET_MESSAGE
+
+
+def test_an_inventory_at_the_limit_is_read_once_and_one_more_is_refused() -> None:
+    limit = run_manifest_module._MAX_FIELD_INVENTORY
+    real = list(ResourceReading.model_fields)
+
+    def exactly(count):
+        def make(names):
+            return iter([*names, *(f"pad-{index}" for index in range(count - len(names)))])
+        return make
+
+    at_limit, inventory = _resource_with_inventory(exactly(limit))
+    try:
+        _snapshot_native(at_limit)   # padding names are not stored fields: refused as undeclared, but not by the budget
+    except ValueError as error:
+        assert str(error) != run_manifest_module.SNAPSHOT_BUDGET_MESSAGE
+    assert inventory.reads == 1
+    over, _inventory = _resource_with_inventory(exactly(limit + 1))
+    with pytest.raises(ValueError) as caught:
+        _snapshot_native(over)
+    assert str(caught.value) == run_manifest_module.SNAPSHOT_BUDGET_MESSAGE
+    assert limit > len(real)
+
+
+def test_an_honest_resource_reads_its_inventory_once_and_is_unchanged() -> None:
+    resource, inventory = _resource_with_inventory(lambda names: iter(names))
+    snapshot = _snapshot_native(resource)
+    assert inventory.reads == 1 and set(snapshot) == set(measured_memory().model_dump())
