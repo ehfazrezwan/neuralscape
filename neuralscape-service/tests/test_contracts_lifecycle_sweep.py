@@ -930,3 +930,65 @@ def test_the_ordered_pair_across_a_repeated_hour_is_accepted_natively_and_on_the
     wire = {**values, "stage": "canonical", "status": "skipped",
             "started_at": started.isoformat(), "finished_at": finished.isoformat()}
     StageReceipt.model_validate_json(json.dumps(wire))
+
+
+def test_enum_membership_is_read_without_metaclass_hooks_so_a_later_value_stays_frozen():
+    """A genuine member of a caller's enum whose metaclass hooks attribute reads must not let capture run them:
+    the hook would repair a later source's content revision before that source is frozen."""
+
+    import enum
+
+    from tests.test_contracts_lifecycle import intent_with_requirements, requirement
+
+    command = intent_with_requirements(requirement(ProcessingStage.CANONICAL))
+    later = command.source_preconditions[0]
+    armed = [False]
+    hooked: list[str] = []
+
+    class HookedMeta(type(enum.Enum)):
+        def __getattribute__(cls, name):
+            if armed[0] and name in ("__members__", "_member_map_", "_value2member_map_", "__iter__"):
+                hooked.append(name)
+                set_native(later, "content_revision", 1)
+            return super().__getattribute__(name)
+
+    class Digest(str, enum.Enum, metaclass=HookedMeta):  # creating the class reads its maps: not armed yet
+        ABC = "sha256:abc"
+
+    member = Digest.ABC
+    set_native(command, "request_digest", member)  # an early field, captured before the source
+    set_native(later, "content_revision", -1)  # invalid, and it must stay so
+    armed[0] = True
+    applied = receipt(ProcessingStage.CANONICAL, StageStatus.APPLIED)
+    with pytest.raises(ValueError):
+        contracts_lifecycle.validate_stage_receipts(command, (applied,))
+    with pytest.raises(ValueError):
+        validate_required_stage_claim(claimed_status=IntentStatus.APPLIED, intent=command, receipts=(applied,))
+    assert hooked == []
+
+
+def test_a_metaclass_that_claims_a_forged_instance_as_a_member_cannot_make_it_one():
+    """The member map is read from the class's own namespace, not from an overridable ``__members__``."""
+
+    import enum
+
+    from tests.test_contracts_lifecycle import intent_with_requirements, requirement
+
+    forged: list[object] = []
+
+    class ClaimingMeta(type(enum.Enum)):
+        @property
+        def __members__(cls):
+            return {"ABC": forged[0]} if forged else super().__members__
+
+    class Digest(str, enum.Enum, metaclass=ClaimingMeta):
+        ABC = "sha256:abc"
+
+    forged.append(str.__new__(Digest, "sha256:abc"))  # an instance of the enum, but not its member
+    command = intent_with_requirements(requirement(ProcessingStage.CANONICAL))
+    set_native(command, "request_digest", forged[0])
+    applied = receipt(ProcessingStage.CANONICAL, StageStatus.APPLIED)
+    with pytest.raises(ValueError, match="declared member"):
+        contracts_lifecycle.validate_stage_receipts(command, (applied,))
+    with pytest.raises(ValueError, match="declared member"):
+        validate_required_stage_claim(claimed_status=IntentStatus.APPLIED, intent=command, receipts=(applied,))

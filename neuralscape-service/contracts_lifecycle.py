@@ -195,7 +195,21 @@ def _utc_instant_before(earlier: datetime, later: datetime) -> bool:
 
 
 _TYPE_MRO = type.__dict__["__mro__"]  # the real MRO, never a metaclass's answer
+_TYPE_NAMESPACE = type.__dict__["__dict__"]  # a class's own namespace, read without metaclass dispatch
 _NATIVE_LEAF_TYPES = (str, int, float, bytes, type(None), date, timedelta)
+
+
+def _is_declared_member(value: object) -> bool:
+    """Whether an enum instance is one of its class's declared members, read without any hook.
+
+    ``type(value).__members__`` is an attribute lookup on the enum's class, so a caller's enum metaclass
+    (its ``__getattribute__``, or a ``__members__`` it overrides) would run during capture and could change
+    a later value before that value is captured.  The member map is read from the class's own namespace
+    instead, and iterated with the base ``dict`` method.
+    """
+
+    members = _TYPE_NAMESPACE.__get__(type(value)).get("_member_map_")
+    return type(members) is dict and any(member is value for member in dict.values(members))
 
 
 def _native_leaf(value: object) -> object:
@@ -209,7 +223,7 @@ def _native_leaf(value: object) -> object:
 
     mro = _TYPE_MRO.__get__(type(value))
     if any(base is Enum for base in mro):
-        if not any(member is value for member in type(value).__members__.values()):
+        if not _is_declared_member(value):
             raise ValueError("an enum value must be a declared member of its enum")
         return value
     if any(base is native for base in mro for native in _NATIVE_LEAF_TYPES):
