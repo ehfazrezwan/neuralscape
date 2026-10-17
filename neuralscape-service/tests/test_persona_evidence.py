@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -434,3 +435,64 @@ def test_a_failure_note_never_carries_the_exception_message_or_a_path(monkeypatc
     monkeypatch.setattr(pe.subprocess, "run", failing)
     records = pe.run(tmp_path, "baseline", "tree-x", ORACLES, tmp_path / "e.jsonl", "run-g")
     assert all("secret-dir" not in item.note and str(tmp_path) not in item.note for item in records)
+
+
+# ---- one read of an oracle, and an empty evidence file
+
+def _oracle_copy(tmp_path):
+    copy = tmp_path / "oracles"
+    shutil.copytree(ORACLES, copy)
+    return copy
+
+
+def test_an_oracle_is_read_once_so_the_digest_and_the_parsed_document_share_bytes(tmp_path, monkeypatch) -> None:
+    copy = _oracle_copy(tmp_path)
+    target = copy / "persona-lifecycle-state.json"
+    original = target.read_bytes()
+    changed = json.loads(original)
+    changed["expected"]["candidate"]["verdict"] = "known_failure"
+    opened = []
+    real_open = Path.open
+
+    def racing_open(self, *args, **kwargs):
+        if self == target:
+            opened.append(1)
+            if len(opened) > 1:   # a second reader would see the file after it changed
+                target.write_text(json.dumps(changed))
+        return real_open(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", racing_open)
+    document, digest = pe.load_oracles(copy)["persona-lifecycle-state"]
+    assert len(opened) == 1
+    assert document == json.loads(original) and digest == hashlib.sha256(original).hexdigest()
+
+
+def test_a_blank_or_zero_byte_evidence_file_is_an_integrity_failure_with_an_explanation(tmp_path) -> None:
+    for content in (b"", b"\n", b"  \n\n \t\n"):
+        out = tmp_path / "evidence.jsonl"
+        out.write_bytes(content)
+        report = tmp_path / "report.md"
+        report.unlink(missing_ok=True)
+        code = pe.main(["report", "--evidence", str(out), "--out", str(report)])
+        text = report.read_text()
+        assert code != 0, content
+        assert "no records" in text.lower() and "integrity" in text.lower(), text
+
+
+def test_an_evidence_file_with_only_invalid_lines_names_both_problems(tmp_path) -> None:
+    out = tmp_path / "evidence.jsonl"
+    out.write_bytes(b"{not json}\n")
+    report = tmp_path / "report.md"
+    assert pe.main(["report", "--evidence", str(out), "--out", str(report)]) != 0
+    text = report.read_text().lower()
+    assert "invalid line" in text and "no records" in text
+
+
+def test_a_report_of_history_damage_in_the_file_exits_nonzero(tmp_path) -> None:
+    out = tmp_path / "evidence.jsonl"
+    pe.run(tmp_path, "baseline", "tree-a", ORACLES, out, "run-1")
+    first = out.read_bytes().split(b"\n")[0]
+    out.write_bytes(out.read_bytes() + first + b"\n")   # a repeated record id
+    report = tmp_path / "report.md"
+    assert pe.main(["report", "--evidence", str(out), "--out", str(report)]) != 0
+    assert "invalid line" in report.read_text().lower()

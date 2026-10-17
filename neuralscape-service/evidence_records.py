@@ -101,6 +101,24 @@ class ReadResult:
     partial_tail: bool               # the file ends without a newline (an interrupted append)
 
 
+def _history_allows(record: EvidenceRecord, accepted: Mapping[str, EvidenceRecord]) -> bool:
+    """The history rules ``write()`` enforces, applied to a record read after the ``accepted`` ones.
+
+    An id may appear once (a repeat is refused even when identical: the writer never appends one), and a
+    supersession must name an earlier accepted record of the same scenario, role and subject.  A record
+    that fails is not accepted, so it can neither hide a record nor be superseded in turn.
+    """
+
+    if record.record_id in accepted:
+        return False
+    if record.supersedes is None:
+        return True
+    target = accepted.get(record.supersedes)
+    return target is not None and (target.scenario_id, target.role, target.subject_ref) == (
+        record.scenario_id, record.role, record.subject_ref,
+    )
+
+
 class EvidenceWriter:
     """Append-only JSON Lines evidence file."""
 
@@ -119,6 +137,7 @@ class EvidenceWriter:
         raw = self._path.read_bytes()
         partial_tail = bool(raw) and not raw.endswith(b"\n")
         records: list[EvidenceRecord] = []
+        accepted: dict[str, EvidenceRecord] = {}
         invalid: list[int] = []
         for number, chunk in enumerate(raw.split(b"\n"), start=1):
             if not chunk.strip():
@@ -128,9 +147,15 @@ class EvidenceWriter:
                 line = chunk.decode("utf-8")
                 if not line.strip():
                     continue
-                records.append(EvidenceRecord.model_validate_json(line))
+                record = EvidenceRecord.model_validate_json(line)
             except (ValidationError, ValueError):   # UnicodeDecodeError is a ValueError
                 invalid.append(number)
+                continue
+            if not _history_allows(record, accepted):
+                invalid.append(number)
+                continue
+            accepted[record.record_id] = record
+            records.append(record)
         return ReadResult(tuple(records), tuple(invalid), partial_tail)
 
     def write(self, record: EvidenceRecord) -> bool:
@@ -309,6 +334,7 @@ def matrix_artifacts(
         f"{len(result.records)} records over {len(rows)} scenarios; changes: "
         + ", ".join(f"{name} {count}" for name, count in sorted(counts.items()))
         + f"; {Path(evidence_path).stat().st_size} bytes when hashed (the hash goes stale if records are appended later)"
+        + ("; NO VALID RECORDS" if not result.records else "")
         + (f"; {len(result.invalid_lines)} invalid line(s)" if result.invalid_lines else "")
         + ("; partial tail" if result.partial_tail else "")
     )
