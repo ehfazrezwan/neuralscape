@@ -175,3 +175,22 @@ def test_a_shared_subtree_too_deep_on_one_path_is_still_refused_by_depth() -> No
     assert DISCOVERY_BUDGET_MESSAGE not in str(shallow.value)  # ... refused only as invalid refs
     with pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):
         claim_with(_diamond(8))  # ... but a subtree of height 8 under them is too deep on that path
+
+
+def test_a_malformed_first_receipt_does_not_copy_an_uncharged_tail() -> None:
+    """The inventory stops at the first capture error, so the tail is never charged; reading the exact
+    root must not copy it either (the error is raised at the first receipt)."""
+
+    import gc
+    import tracemalloc
+
+    receipts = (_unreadable_receipt(),) + (None,) * 5_000_000
+    gc.collect()
+    tracemalloc.start()
+    try:
+        with pytest.raises(ValueError, match="colliding keys"):
+            _claim(receipts)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert peak < 8 * 1024 * 1024, peak  # a copy of the tail alone is 40 MB

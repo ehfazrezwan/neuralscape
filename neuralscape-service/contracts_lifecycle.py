@@ -1114,7 +1114,9 @@ def _revalidated_claim_inputs(
         )
 
     if is_exact_type(receipts, tuple):
-        public_receipts: tuple[object, ...] = tuple(tuple.__iter__(receipts))
+        # An exact tuple is immutable and runs no caller code: read it in place, so a tail the
+        # inventory never charged (it stops at the first capture error) is never copied.
+        public_receipts: tuple[object, ...] = receipts
     else:
         # A tuple subclass's public view is read through the same first-observation cache as
         # every nested view: if the intent already observed this object (one tuple shared
