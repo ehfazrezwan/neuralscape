@@ -2321,7 +2321,7 @@ def test_the_schema_execution_refusal_is_the_documented_message_on_both_paths():
     )
     with pytest.raises(ValueError) as meter:
         validate_generation_result(request, result)
-    assert str(meter.value).endswith(documented) or documented in str(meter.value)
+    assert type(meter.value) is ValueError and str(meter.value) == documented  # the whole message, exactly
     # the subschema cap
     with pytest.raises((ValidationError, ValueError)) as cap:
         generation_request(
@@ -2330,4 +2330,62 @@ def test_the_schema_execution_refusal_is_the_documented_message_on_both_paths():
                 required=["v"],
             )
         )
-    assert documented in str(cap.value)
+    assert isinstance(cap.value, ValueError) and documented in str(cap.value)  # inside pydantic's ValidationError
+
+
+# ---- the enum mechanism is pinned: lists and instances are hashed once per call, every node is charged
+
+def _count_identity_nodes(monkeypatch):
+    calls = [0]
+    original = contracts_inference._json_identity
+
+    def counting(value, meter):
+        calls[0] += 1
+        return original(value, meter)
+
+    monkeypatch.setattr(contracts_inference, "_json_identity", counting)
+    return calls
+
+
+def test_each_enum_list_and_instance_is_hashed_once_per_call_whatever_the_applications(monkeypatch):
+    """40 nested entries of about 500 nodes applied to 200 items: hashing the list per application would be
+    4,000,000 nodes (refused by the meter); once per call it is about 20,000, plus the items."""
+
+    calls = _count_identity_nodes(monkeypatch)
+    allowed = [[0] * 499 + [j] for j in range(40)]
+    values = [[0] * 499 + [39] for _ in range(200)]
+    request, result = _generation_with_output({"v": values}, v={"type": "array", "items": {"enum": allowed}})
+    assert validate_generation_result(request, result).compliant
+    assert calls[0] < 150_000, calls[0]
+
+
+def test_repeated_enum_applications_over_one_instance_hash_it_once(monkeypatch):
+    """200 single-entry enums under anyOf, all applied to the same 50,005-node value (five arrays of 10,000: a
+    small top-level size, so only the nodes can make it expensive)."""
+
+    calls = _count_identity_nodes(monkeypatch)
+    request, result = _generation_with_output(
+        {"v": [list(range(10_000)) for _ in range(5)]},
+        v={"anyOf": [{"enum": [[k]]} for k in range(200)]},
+    )
+    with pytest.raises(ValueError, match="does not match declared schema"):  # nothing matches; not the meter
+        validate_generation_result(request, result)
+    assert calls[0] < 200_000, calls[0]  # per application it was 200 x 50,005 = 10 million
+
+
+def test_many_small_enums_over_one_large_instance_are_not_refused_by_the_meter():
+    request, result = _generation_with_output(
+        {"v": [list(range(20_000)) for _ in range(5)]},
+        v={"allOf": [{"not": {"enum": [[k]]}} for k in range(150)]},
+    )
+    assert validate_generation_result(request, result).compliant  # the parent answered this; the meter must too
+
+
+def test_every_hashed_node_is_charged_to_the_meter():
+    meter = contracts_inference._SchemaExecutionMeter(limit=100)
+    contracts_inference._json_identity([[1, 2], [3], {"a": True}], meter)  # 1 + 2 + 2 + 1 + 1 + 1 + ... nodes
+    nodes = 100 - meter.left
+    assert nodes == 8  # outer list, two lists and a dict, then 2 + 1 + 1 leaves
+    with pytest.raises(ValueError) as refused:
+        contracts_inference._json_identity([[1, 2], [3], {"a": True}], contracts_inference._SchemaExecutionMeter(limit=nodes - 1))
+    assert str(refused.value) == contracts_inference.SCHEMA_EXECUTION_MESSAGE

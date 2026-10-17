@@ -12,10 +12,13 @@ output schema or result that fits every input budget can still be refused when
 applying the one to the other costs more than the meter allows (a strict schema
 over very many small objects, or one with more than
 ``MAX_OUTPUT_SCHEMA_SUBSCHEMAS`` subschemas).  The refusal is a ``ValueError``
-whose message is exactly ``SCHEMA_EXECUTION_MESSAGE`` ("output schema execution
-exceeds its budget"), raised before any output is accepted, never a partial
-validation; shrink the output or simplify the schema.  The constants are
-implementation limits of this candidate, not a service-level commitment.
+carrying exactly ``SCHEMA_EXECUTION_MESSAGE`` ("output schema execution exceeds
+its budget"): it is the whole message when ``validate_generation_result`` refuses
+an output, and it is inside pydantic's ``ValidationError`` (a ``ValueError``) when
+the subschema cap refuses a ``GenerationRequest`` at construction.  It is raised
+before any output is accepted, never a partial validation; shrink the output or
+simplify the schema.  The constants are implementation limits of this candidate,
+not a service-level commitment.
 """
 
 from __future__ import annotations
@@ -894,12 +897,19 @@ def _metered_validator_class(validator_class: Any, meter: _SchemaExecutionMeter)
     # (one unit per node, cached by the list object), the instance is hashed per application, and
     # membership is a set lookup.
     enum_sets: dict[int, tuple[object, frozenset[object]]] = {}
+    instance_identities: dict[int, tuple[object, object]] = {}
 
     def enum(validator: Any, enums: Any, instance: Any, schema: Any) -> Any:
         known = enum_sets.get(id(enums))
         if known is None or known[0] is not enums:  # the list is kept alive, so its id is its own
             known = enum_sets[id(enums)] = (enums, frozenset(_json_identity(entry, meter) for entry in enums))
-        if _json_identity(instance, meter) not in known[1]:
+        # An instance is hashed once per call, however many enums are applied to it (jsonschema compares
+        # cheaply when the type or length differs, so many small enums over one large instance must not
+        # pay for the whole instance each time); the object is kept alive so its id is its own.
+        hashed = instance_identities.get(id(instance))
+        if hashed is None or hashed[0] is not instance:
+            hashed = instance_identities[id(instance)] = (instance, _json_identity(instance, meter))
+        if hashed[1] not in known[1]:
             yield SchemaError(f"{instance!r} is not one of {enums!r}")
 
     keywords = {name: metered(keyword) for name, keyword in validator_class.VALIDATORS.items()}
