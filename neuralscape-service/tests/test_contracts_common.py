@@ -694,14 +694,14 @@ def test_snapshot_contract_graph_freezes_later_model_before_stored_name_hook(
     stored_value = dict.pop(native, "tuple_trigger")
     dict.__setitem__(native, stored_name, stored_value)
     stored_name.armed = True
+    stored_name.hash_calls = stored_name.equality_calls = 0  # storing it above hashed it once
 
     snapshot = snapshot_contract_graph(value)
 
-    if hook == "hash":
-        assert stored_name.hash_calls > 0
-    else:
-        assert stored_name.equality_calls > 0
-    assert child.count == 1
+    # A stored name is read as its text: its hash and equality hooks never run, so the
+    # repair never happens and the frozen invalid child is what validation sees.
+    assert stored_name.hash_calls == stored_name.equality_calls == 0
+    assert child.count == -1
     assert snapshot["child"]["count"] == -1
     with pytest.raises(ValidationError) as repaired_error:
         NestedInventoryEnvelope.model_validate(snapshot, strict=True)
@@ -722,10 +722,11 @@ def test_snapshot_contract_graph_freezes_invalid_root_before_name_hook(
     stored_value = dict.pop(native, "count")
     dict.__setitem__(native, stored_name, stored_value)
     stored_name.armed = True
+    stored_name.hash_calls = stored_name.equality_calls = 0
 
     snapshot = snapshot_contract_graph(value)
 
-    assert value.count == 1
+    assert stored_name.hash_calls == stored_name.equality_calls == 0  # read as text, no hook
     assert snapshot["count"] == -1
     with pytest.raises(ValidationError) as raised:
         ExampleContract.model_validate(snapshot, strict=True)
@@ -2598,19 +2599,18 @@ def test_public_first_public_only_child_repaired_by_earlier_stored_name_hook(
     stored_value = dict.pop(native, "trigger")
     dict.__setitem__(native, stored_name, stored_value)
     stored_name.armed = True
+    stored_name.hash_calls = stored_name.equality_calls = 0
 
     snapshot = snapshot_contract_graph(value)
 
-    if hook == "hash":
-        assert stored_name.hash_calls > 0
-    else:
-        assert stored_name.equality_calls > 0
-    assert child.count == 1
-    # The never-exposed child is first observed after the callback, so it is
-    # exposed in repaired form and the receiving model accepts it.
-    assert list(_exposed_children(snapshot, placement)) == [{"count": 1}]
+    # A stored name is read as its text, so no hook runs before the public view is first
+    # observed: the child is exposed as it is (invalid) and the receiving model rejects it.
+    assert stored_name.hash_calls == stored_name.equality_calls == 0
+    assert child.count == -1
+    assert list(_exposed_children(snapshot, placement)) == [{"count": -1}]
     assert public_view.iteration_calls == 1
-    assert type(value).model_validate(snapshot, strict=True) is not None
+    with pytest.raises(ValidationError):
+        type(value).model_validate(snapshot, strict=True)
 
 
 @pytest.mark.parametrize("placement", ["direct", "nested"])
@@ -2773,3 +2773,949 @@ def test_exposed_siblings_are_captured_before_the_first_is_reconstructed(
     # reconstructed, so the snapshot keeps the exposed (invalid) value.
     assert (sibling["count"] if sibling_kind == "dict" else sibling.count) == 1  # type: ignore[index,union-attr]
     assert second == expected
+
+
+def _shared_ladder(depth: int) -> list:
+    level: list = []
+    for _ in range(depth):
+        level = [level, level]
+    return level
+
+
+def _unique_lists(value: object) -> int:
+    seen: set[int] = set()
+    stack = [value]
+    while stack:
+        item = stack.pop()
+        if type(item) is list and id(item) not in seen:
+            seen.add(id(item))
+            stack.extend(item)
+    return len(seen)
+
+
+def test_snapshot_contract_graph_reuses_completed_shared_subtrees() -> None:
+    snapshot = snapshot_contract_graph(_shared_ladder(15))
+
+    # One rebuilt list per distinct source list, not one per path (32,767).
+    assert _unique_lists(snapshot) == 16
+
+
+def test_snapshot_contract_graph_completes_deep_shared_ladder() -> None:
+    snapshot = snapshot_contract_graph(_shared_ladder(60))
+
+    assert _unique_lists(snapshot) == 61
+
+
+def test_snapshot_contract_graph_shared_reuse_is_a_detached_copy() -> None:
+    source = _shared_ladder(3)
+    snapshot = snapshot_contract_graph(source)
+    source[0].append("late")
+
+    assert snapshot[0] is snapshot[1]
+    assert snapshot[0] is not source[0]
+    assert snapshot[0][0][0] == []
+
+
+def test_snapshot_contract_graph_still_rejects_cycles_with_memo() -> None:
+    shared: list = []
+    cyclic: list = [shared, shared]
+    shared.append(cyclic)
+
+    with pytest.raises(Exception):
+        snapshot_contract_graph(cyclic)
+
+
+def test_snapshot_contract_graph_reads_public_view_once_per_edge() -> None:
+    class CountingList(list):
+        reads = 0
+
+        def __iter__(self):
+            type(self).reads += 1
+            return super().__iter__()
+
+    view = CountingList([1])
+    snapshot = snapshot_contract_graph([[view], [view], {"k": [view]}])
+
+    assert CountingList.reads == 3
+    assert snapshot[0] == snapshot[1] == [[1]]
+
+
+def test_snapshot_contract_graph_public_view_ancestors_are_not_reused() -> None:
+    class CountingList(list):
+        reads = 0
+
+        def __iter__(self):
+            type(self).reads += 1
+            return super().__iter__()
+
+    view = CountingList([1])
+    parent = [view]
+    snapshot_contract_graph([parent, parent, parent])
+
+    assert CountingList.reads == 3
+
+
+# ── one accounting: the shared discovery budget bounds capture and reconstruction ──
+
+import time as _time  # noqa: E402
+
+from contracts_limits import DISCOVERY_BUDGET_MESSAGE, STANDARD_MAX_DEPTH, STANDARD_MAX_EDGES  # noqa: E402
+from contracts_references import SourceVersion  # noqa: E402
+
+
+def _source_version() -> SourceVersion:
+    return SourceVersion(record_id="rec-1", content_revision=1, policy_epoch=1)
+
+
+def _pairs(depth: int, leaf: object = None) -> object:
+    node: object = ({"x": 1},) if leaf is None else leaf
+    for _ in range(depth):
+        node = (node, node)
+    return node
+
+
+def test_shared_native_pairs_are_rebuilt_once_per_object(monkeypatch) -> None:
+    """``node = (node, node)`` twelve times is 13 containers and 8,191 paths."""
+
+    import contracts_common
+
+    calls = 0
+    original = contracts_common._snapshot_captured_graph
+
+    def counting(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(contracts_common, "_snapshot_captured_graph", counting)
+    snapshot = snapshot_contract_graph(_pairs(12))
+    assert calls <= 40  # two edges per distinct container (the per-path copy made 16,383 calls)
+    assert snapshot[0] is snapshot[1]
+
+
+def test_fifteen_lists_of_two_references_are_not_expanded() -> None:
+    node: object = []
+    for _ in range(15):
+        node = [node, node]
+    started = _time.monotonic()
+    snapshot = snapshot_contract_graph(node)
+    assert _time.monotonic() - started < 1.0 and snapshot[0] is snapshot[1]
+
+
+def test_a_forty_level_native_diamond_completes_quickly() -> None:
+    started = _time.monotonic()
+    snapshot_contract_graph(_pairs(40))
+    assert _time.monotonic() - started < 2.0
+
+
+def test_deep_nesting_is_the_stable_budget_error_not_a_recursion_error() -> None:
+    for depth in (STANDARD_MAX_DEPTH + 10, 5_000):
+        node: object = ()
+        for _ in range(depth):
+            node = (node,)
+        with pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):
+            snapshot_contract_graph(node)
+
+
+def test_the_depth_limit_holds_on_every_path_to_a_reused_subtree() -> None:
+    deep: object = ()
+    for _ in range(STANDARD_MAX_DEPTH - 2):
+        deep = (deep,)
+    snapshot_contract_graph((deep,))  # fits at depth 1
+    with pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):
+        snapshot_contract_graph((deep, (((deep,),),)))  # the same subtree, three levels lower
+
+
+def test_an_endless_public_sequence_is_cut_off_by_the_budget() -> None:
+    produced = [0]
+
+    class Endless(tuple):
+        def __iter__(self):
+            # Self-limiting so a tree without the budget fails instead of exhausting memory.
+            while produced[0] < 4 * STANDARD_MAX_EDGES:
+                produced[0] += 1
+                yield produced[0]
+            raise AssertionError("the discovery budget did not stop the view")
+
+    with pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):
+        snapshot_contract_graph(Endless())
+    assert produced[0] <= 140_000  # the edge limit is 131,072
+
+
+def test_a_diamond_of_public_views_is_charged_per_path() -> None:
+    class View(tuple):
+        def __iter__(self):
+            return iter(tuple.__iter__(self))
+
+    node: object = View((1,))
+    for _ in range(30):
+        node = View((node, node))
+    started = _time.monotonic()
+    with pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):
+        snapshot_contract_graph(node)
+    assert _time.monotonic() - started < 5.0
+
+
+# ── purity is not "no public view was read": key hooks are callbacks too ──
+
+
+def test_a_str_subclass_key_runs_no_hook_and_cannot_skew_later_views() -> None:
+    counter = [0]
+
+    class CountingKey(str):
+        def __hash__(self):
+            counter[0] += 1
+            return str.__hash__(self)
+
+        def __eq__(self, other):
+            counter[0] += 1
+            return str.__eq__(self, other)
+
+    class CounterView(list):
+        def __iter__(self):
+            return iter([counter[0]])
+
+    shared = {CountingKey("k"): 1}
+    view = CounterView()
+    counter[0] = 0  # building the dict above hashed the key once; only the snapshot is under test
+    snapshot = snapshot_contract_graph([shared, view, shared, view])
+    assert counter[0] == 0                      # the key is read as its text, never hashed through its hooks
+    assert snapshot[1] == snapshot[3] == [0]    # both observations of the view agree with that
+    assert [type(k) for k in snapshot[0]] == [str]
+
+
+def test_two_keys_with_one_text_are_refused() -> None:
+    class Twin(str):
+        def __hash__(self):
+            return hash("x" + str.__str__(self))
+
+        def __eq__(self, other):
+            return False
+
+    value = {"k": 1}
+    dict.__setitem__(value, Twin("k"), 2)
+    with pytest.raises(ValueError, match="colliding"):
+        snapshot_contract_graph(value)
+
+
+def test_a_subtree_with_a_non_text_hashable_key_is_never_reused() -> None:
+    counter = [0]
+
+    class Key:
+        def __hash__(self):
+            counter[0] += 1
+            return 7
+
+        def __eq__(self, other):
+            return self is other
+
+    class CounterView(list):
+        def __iter__(self):
+            return iter([counter[0]])
+
+    shared = {Key(): 1}
+    view = CounterView()
+    snapshot = snapshot_contract_graph([shared, view, shared, view])
+    assert snapshot[0] is not snapshot[2]  # rebuilt per edge, like a public view
+    assert snapshot[1] != snapshot[3]       # so each later observation sees its own hook run
+
+
+def test_str_subclass_model_field_names_are_read_as_text() -> None:
+    counter = [0]
+
+    class CountingName(str):
+        def __hash__(self):
+            counter[0] += 1
+            return str.__hash__(self)
+
+    value = _source_version()
+    stored = vars(BaseModel)["__dict__"].__get__(value, BaseModel)
+    renamed = {CountingName(name): item for name, item in dict.items(stored)}
+    stored.clear()
+    counter[0] = 0
+    stored.update(renamed)
+    counter[0] = 0
+    snapshot = snapshot_contract_graph(value)
+    assert counter[0] == 0
+    assert all(type(name) is str for name in snapshot)
+
+
+# ── type checks by native MRO, no metaclass hook (from the snapshot hardening) ──
+
+
+def _hooked(events: list[str]):
+    class Meta(type):
+        def __hash__(cls):
+            events.append("hash")
+            return id(cls)
+
+        def __eq__(cls, other):
+            events.append("eq")
+            return False
+
+        def __ne__(cls, other):
+            events.append("ne")
+            return True
+
+        def __subclasscheck__(cls, subclass):
+            events.append("subclasscheck")
+            return False
+
+        def __instancecheck__(cls, instance):
+            events.append("instancecheck")
+            return False
+
+    return Meta
+
+
+@pytest.mark.parametrize("base", [tuple, list, dict])
+def test_the_shared_snapshot_runs_no_metaclass_hook_on_a_hostile_container_class(base) -> None:
+    events: list[str] = []
+    hostile = _hooked(events)("Hostile", (base,), {})
+    value = hostile()
+    events.clear()
+    try:
+        snapshot_contract_graph(value)
+    except Exception:  # an unsupported subclass may be refused; running its hooks is not allowed
+        pass
+    assert events == []
+
+
+def test_a_class_only_registered_as_a_mapping_is_not_trusted_as_model_extras() -> None:
+    from collections.abc import Mapping as _Mapping
+
+    touched: list[str] = []
+
+    class RegisteredOnly:
+        def items(self):
+            touched.append("items")
+            return [("smuggled", 1)]
+
+        def __iter__(self):
+            touched.append("iter")
+            return iter(())
+
+        def __len__(self):
+            return 0
+
+    _Mapping.register(RegisteredOnly)
+    value = _source_version()
+    object.__setattr__(value, "__pydantic_extra__", RegisteredOnly())
+    with pytest.raises(ValueError):
+        snapshot_contract_graph(value)
+    assert touched == []
+
+
+def test_ordinary_graphs_are_far_inside_the_budget() -> None:
+    snapshot = snapshot_contract_graph([_source_version() for _ in range(500)])
+    assert len(snapshot) == 500
+
+# ── discovery budget: design-neutral limits (depth, nodes, edges, views, hygiene) ──
+
+from contracts_limits import STANDARD  # noqa: E402
+
+
+def _nested_tuple(depth: int) -> tuple:
+    value: tuple = ()
+    for _ in range(depth):
+        value = (value,)
+    return value
+
+
+def test_snapshot_contract_graph_rejects_unbounded_depth_without_recursion_error() -> None:
+    with pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):
+        snapshot_contract_graph(_nested_tuple(5000))
+
+
+def test_snapshot_contract_graph_accepts_the_depth_limit_and_rejects_one_more() -> None:
+    limit = STANDARD.max_depth
+
+    snapshot = snapshot_contract_graph(_nested_tuple(limit))
+    assert snapshot == _nested_tuple(limit)
+    with pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):
+        snapshot_contract_graph(_nested_tuple(limit + 1))
+
+
+@pytest.mark.parametrize("shallow_first", [True, False])
+def test_snapshot_contract_graph_depth_does_not_depend_on_visit_order(
+    shallow_first: bool,
+) -> None:
+    tall = _nested_tuple(STANDARD.max_depth - 10)
+    deep_path = tall
+    for _ in range(20):
+        deep_path = (deep_path,)
+    # `tall` is reached at depth 1 and again at depth 21 through a chain.
+    value = (tall, deep_path) if shallow_first else (deep_path, tall)
+
+    with pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):
+        snapshot_contract_graph(value)
+
+
+def test_snapshot_contract_graph_depth_holds_for_an_impure_subtree_reached_deeper() -> None:
+    # The subtree reads a public view, so it is rebuilt (not reused) on every path; it fits
+    # where it is first captured but not where the second path reaches it.
+    class View(list):
+        pass
+
+    tall: list = [View([1])]
+    for _ in range(STANDARD.max_depth - 10):
+        tall = [tall]
+    deep_path: object = tall
+    for _ in range(20):
+        deep_path = [deep_path]
+
+    snapshot_contract_graph([tall])
+    with pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):
+        snapshot_contract_graph([tall, deep_path])
+
+
+def test_snapshot_contract_graph_rejects_too_many_nodes() -> None:
+    with pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):
+        snapshot_contract_graph([[] for _ in range(STANDARD.max_nodes)])
+    assert len(snapshot_contract_graph([[] for _ in range(STANDARD.max_nodes - 1)])) == (
+        STANDARD.max_nodes - 1
+    )
+
+
+@pytest.mark.parametrize(
+    "build",
+    [list, tuple, lambda items: dict.fromkeys(items)],
+    ids=["list", "tuple", "dict"],
+)
+def test_snapshot_contract_graph_rejects_too_many_edges(
+    build: Callable[[range], object],
+) -> None:
+    with pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):
+        snapshot_contract_graph(build(range(STANDARD.max_edges + 1)))
+
+
+@pytest.mark.parametrize(
+    "build",
+    [list, tuple, lambda items: dict.fromkeys(items)],
+    ids=["list", "tuple", "dict"],
+)
+def test_snapshot_contract_graph_charges_each_native_entry_once(
+    build: Callable[[range], object],
+) -> None:
+    # One entry is one edge: capturing it and rebuilding it once is one traversal, so a
+    # container just inside the edge limit is accepted.
+    accepted = snapshot_contract_graph(build(range(STANDARD.max_edges - 1)))
+    assert len(accepted) == STANDARD.max_edges - 1  # type: ignore[arg-type]
+    shared: list = []
+    assert len(snapshot_contract_graph([shared] * (STANDARD.max_edges - 2))) == (
+        STANDARD.max_edges - 2
+    )
+
+
+def test_snapshot_contract_graph_rejects_too_many_model_edges() -> None:
+    class Open(ContractModel):
+        model_config = ConfigDict(extra="allow")
+
+    model = Open.model_validate({f"k{index}": index for index in range(STANDARD.max_edges + 1)})
+
+    with pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):
+        snapshot_contract_graph(model)
+
+
+class _EmptyView(list):
+    pass
+
+
+def test_snapshot_contract_graph_charges_ancestor_copies_that_cannot_be_reused() -> None:
+    # 4,096 paths each observe the view once (8,192 charges), but every copy of
+    # the wide ancestors on those paths must be rebuilt too and is charged.
+    level: list = [_EmptyView()]
+    for _ in range(12):
+        level = [level, level, *range(30)]
+
+    with pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):
+        snapshot_contract_graph(level)
+
+    narrow: list = [_EmptyView()]
+    for _ in range(12):
+        narrow = [narrow, narrow]
+    snapshot_contract_graph(narrow)
+
+
+def test_snapshot_contract_graph_bounds_depth_of_a_chain_formed_by_views() -> None:
+    # Every view is captured at depth 1, but each one's public iteration exposes
+    # the next, so the reconstruction path is far deeper than any native path.
+    class Link(list):
+        successor: object = None
+
+        def __iter__(self):
+            if self.successor is None:
+                return iter(())
+            return iter((self.successor,))
+
+    links = [Link() for _ in range(STANDARD.max_depth + 20)]
+    for current, successor in zip(links, links[1:]):
+        current.successor = successor
+
+    with pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):
+        snapshot_contract_graph(links)
+
+
+def test_snapshot_contract_graph_charges_aliased_edges() -> None:
+    shared: list = []
+    with pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):
+        snapshot_contract_graph([shared] * (STANDARD.max_edges + 1))
+
+
+def test_snapshot_contract_graph_budgets_a_shared_ladder_over_a_public_view() -> None:
+    class View(list):
+        pass
+
+    level: list = [View([1])]
+    for _ in range(40):
+        level = [level, level]
+
+    # Each path observes the view again, so the work is charged and stops.
+    with pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):
+        snapshot_contract_graph(level)
+
+
+_ENDLESS_GUARD = 4 * STANDARD.max_edges
+
+
+def test_snapshot_contract_graph_stops_an_endless_public_view() -> None:
+    class Endless(list):
+        def __iter__(self):
+            # Self-limiting so a tree without the budget fails instead of exhausting memory.
+            for _ in range(_ENDLESS_GUARD):
+                yield 0
+            raise AssertionError("the discovery budget did not stop the view")
+
+    with pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):
+        snapshot_contract_graph([Endless()])
+
+
+def test_snapshot_contract_graph_stops_an_endless_mapping_view() -> None:
+    class EndlessItems(Mapping):
+        def __getitem__(self, key):
+            raise KeyError(key)
+
+        def __iter__(self):
+            return iter(())
+
+        def __len__(self):
+            return 0
+
+        def items(self):
+            for index in range(_ENDLESS_GUARD):
+                yield index, 0
+            raise AssertionError("the discovery budget did not stop the view")
+
+    class Open(ContractModel):
+        pass
+
+    model = Open()
+    object.__setattr__(model, "__pydantic_extra__", EndlessItems())
+
+    with pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):
+        snapshot_contract_graph(model)
+
+
+def test_snapshot_contract_graph_native_accounting_runs_no_caller_code() -> None:
+    calls: list[str] = []
+
+    class Hostile(list):
+        def __len__(self):
+            calls.append("len")
+            return 0
+
+        def __bool__(self):
+            calls.append("bool")
+            return True
+
+        def __hash__(self):
+            calls.append("hash")
+            return 0
+
+        def __eq__(self, other):
+            calls.append("eq")
+            return True
+
+        def __getattribute__(self, name):
+            if name == "__class__":
+                calls.append("class")
+            return super().__getattribute__(name)
+
+    snapshot = snapshot_contract_graph([Hostile([1, 2]), [Hostile([3])]])
+
+    assert snapshot == [[1, 2], [[3]]]
+    assert calls == []
+
+
+def test_snapshot_contract_graph_budget_error_is_value_free() -> None:
+    marker = "very-secret-marker"
+    value: object = (marker,)
+    for _ in range(STANDARD.max_depth + 1):
+        value = (value,)
+
+    with pytest.raises(ValueError) as caught:
+        snapshot_contract_graph(value)
+
+    assert str(caught.value) == DISCOVERY_BUDGET_MESSAGE
+    assert marker not in repr(caught.value)
+
+
+
+# ── an admitted depth never overflows the stack, whatever the caller's own depth ──
+
+
+def _with_caller_frames(headroom: int, call):
+    """Run ``call`` with only ``headroom`` frames left below the interpreter's limit."""
+
+    import sys as _sys
+
+    def descend(remaining: int):
+        if remaining <= 0:
+            return call()
+        return descend(remaining - 1)
+
+    frame, used = _sys._getframe(), 0
+    while frame is not None:
+        frame, used = frame.f_back, used + 1
+    return descend(_sys.getrecursionlimit() - used - headroom)
+
+
+@pytest.mark.parametrize("kind", ["tuple", "list", "dict", "model-and-dict"])
+def test_the_deepest_admitted_input_snapshots_with_a_deep_caller_stack(kind) -> None:
+    depth = STANDARD_MAX_DEPTH - 1
+    node: object = None
+    for level in range(depth):
+        if kind == "tuple":
+            node = (node,)
+        elif kind == "list":
+            node = [node]
+        elif kind == "dict" or level % 2:
+            node = {"k": node}
+        else:
+            node = ExampleContractEnvelope.model_construct(item=node)
+    # 300 frames of headroom: a reconstruction that costs three frames per level needs ~770
+    snapshot = _with_caller_frames(300, lambda: snapshot_contract_graph(node))
+    assert snapshot is not None
+
+
+def test_a_recursion_error_is_never_what_a_caller_receives() -> None:
+    node: object = None
+    for _ in range(STANDARD_MAX_DEPTH - 1):
+        node = [node]
+    # far too little headroom for any reconstruction: the stable budget error, never RecursionError
+    with pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):
+        _with_caller_frames(40, lambda: snapshot_contract_graph(node))
+
+
+# ── model field names are read as text without hooks, and duplicates are refused ──
+
+
+class _CountingName(str):
+    """Same text as a plain name but a different hash, so both can live in one dict."""
+
+    calls: list = []
+
+    def __hash__(self):
+        _CountingName.calls.append("hash")
+        return hash("other:" + str.__str__(self))
+
+    def __eq__(self, other):
+        _CountingName.calls.append("eq")
+        return self is other
+
+
+def test_a_colliding_stored_name_runs_no_hook_and_is_refused() -> None:
+    value = ExampleContract(count=1)
+    stored = vars(BaseModel)["__dict__"].__get__(value, BaseModel)
+    dict.__setitem__(stored, _CountingName("count"), 5)  # a second "count" with a different hash path
+    _CountingName.calls.clear()
+    with pytest.raises(ValueError, match="colliding"):
+        snapshot_contract_graph(value)
+    assert _CountingName.calls == []
+
+
+@pytest.mark.parametrize("order", ["plain-first", "subclass-first"])
+def test_a_colliding_extra_name_runs_no_hook_and_is_refused(order) -> None:
+    value = ExampleContract(count=1)
+    pairs = [("note", 1), (_CountingName("note"), 2)]
+    extra: dict = {}
+    for key, item in pairs if order == "plain-first" else reversed(pairs):
+        dict.__setitem__(extra, key, item)
+    _BASE_MODEL_EXTRA_DESCRIPTOR.__set__(value, extra)
+    _CountingName.calls.clear()
+    with pytest.raises(ValueError, match="duplicate keys"):
+        snapshot_contract_graph(value)
+    assert _CountingName.calls == []
+
+
+def test_snapshot_capture_stack_is_bounded_by_the_tier_depth_not_the_recursion_limit() -> None:
+    # The stable error must come from the depth limit, not from running into the
+    # interpreter's recursion limit, so a caller that raised that limit is still bounded.
+    import sys
+
+    import contracts_common
+
+    deepest = 0
+    current = 0
+    capture_code = contracts_common._capture_native_graph.__code__
+
+    def profile(frame, event, arg):
+        nonlocal deepest, current
+        if frame.f_code is capture_code:
+            if event == "call":
+                current += 1
+                deepest = max(deepest, current)
+            elif event == "return":
+                current -= 1
+
+    value: object = ()
+    for _ in range(3_000):
+        value = (value,)
+    limit = sys.getrecursionlimit()
+    sys.setrecursionlimit(5_000)
+    sys.setprofile(profile)
+    try:
+        with pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):
+            snapshot_contract_graph(value)
+    finally:
+        sys.setprofile(None)
+        sys.setrecursionlimit(limit)
+    assert deepest <= STANDARD.max_depth + 2
+
+
+_EXTRA = BaseModel.__dict__["__pydantic_extra__"]
+
+
+# ── purity: reconstruction that runs key code is never reused, on every path that reads keys ──
+
+
+class _CountingKey:
+    """A key of a non-plain type: building a dict with it runs this hash."""
+
+    hashes = 0
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+
+    def __hash__(self) -> int:
+        _CountingKey.hashes += 1
+        return hash(self.name)
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, _CountingKey) and other.name == self.name
+
+
+class _PublicExtras(Mapping):
+    """Non-dict extra storage whose public items carry the counting key."""
+
+    def __init__(self, key: object) -> None:
+        self.key = key
+
+    def __getitem__(self, key):
+        raise KeyError(key)
+
+    def __iter__(self):
+        return iter(())
+
+    def __len__(self) -> int:
+        return 0
+
+    def items(self):
+        return [(self.key, 1)]
+
+
+def _hashes_for_references(build, count: int) -> int:
+    _CountingKey.hashes = 0
+    value = build()
+    try:
+        snapshot_contract_graph([value] * count)
+    except ValueError:
+        pass  # a model with surplus names is refused at the end; the walk still ran
+    return _CountingKey.hashes
+
+
+def _model_with_public_extras():
+    value = SourceVersion(record_id="r1", content_revision=1, policy_epoch=1)
+    _EXTRA.__set__(value, _PublicExtras(_CountingKey("surplus")))
+    return value
+
+
+def _model_with_native_extras():
+    value = SourceVersion(record_id="r1", content_revision=1, policy_epoch=1)
+    _EXTRA.__set__(value, {_CountingKey("surplus"): 1})
+    return value
+
+
+def _model_with_a_stored_key():
+    value = SourceVersion(record_id="r1", content_revision=1, policy_epoch=1)
+    dict.__setitem__(_BASE_MODEL_DICT_DESCRIPTOR.__get__(value, BaseModel), _CountingKey("surplus"), 1)
+    return value
+
+
+def _plain_dict_with_the_key():
+    return {_CountingKey("k"): 1}
+
+
+@pytest.mark.parametrize(
+    "build",
+    [_model_with_public_extras, _model_with_native_extras, _model_with_a_stored_key, _plain_dict_with_the_key],
+    ids=["non-dict-extras", "dict-extras", "stored-name", "plain-dict-value"],
+)
+def test_key_code_runs_for_every_reference_not_just_the_first_two(build) -> None:
+    one, two, three = (_hashes_for_references(build, count) for count in (1, 2, 3))
+    assert one > 0  # the key's code is reached at all
+    # capture may hash once; every further reference rebuilds, and so hashes, again
+    assert two - one > 0
+    assert three - two == two - one, (one, two, three)  # a later reference never skips the callbacks
+
+
+# ── the native depth limit does not depend on which sibling reaches a shared subtree first ──
+
+
+class _EmptyView(list):
+    """A list whose public view yields nothing while its native backing holds the child."""
+
+    def __iter__(self):
+        return iter(())
+
+
+def _deep_subtree(levels: int) -> list:
+    node: list = []
+    for _ in range(levels):
+        node = [node]
+    return node
+
+
+def _hidden_path(subtree: object, wrappers: int) -> object:
+    node = subtree
+    for _ in range(wrappers):
+        node = _EmptyView([node])
+    return node
+
+
+@pytest.mark.parametrize("hidden_first", [False, True], ids=["direct-first", "hidden-first"])
+def test_a_subtree_reached_deep_through_empty_public_views_is_refused_in_either_sibling_order(hidden_first) -> None:
+    subtree = _deep_subtree(250)  # 251 levels on its own: inside the 256 limit
+    snapshot_contract_graph([subtree])  # alone it is accepted
+    hidden = _hidden_path(subtree, 10)  # the same subtree 11 levels down: 261 native levels
+    siblings = [hidden, subtree] if hidden_first else [subtree, hidden]
+    with pytest.raises(ValueError, match="budget"):
+        snapshot_contract_graph(siblings)
+
+
+def test_a_shared_subtree_that_stays_inside_the_limit_on_every_path_is_still_accepted() -> None:
+    subtree = _deep_subtree(200)
+    hidden = _hidden_path(subtree, 10)  # 211 levels at the deepest
+    for siblings in ([subtree, hidden], [hidden, subtree], [subtree, subtree, hidden]):
+        assert snapshot_contract_graph(siblings) is not None
+
+
+@pytest.mark.parametrize("wrap", [list, tuple], ids=["list", "tuple"])
+def test_a_revisit_in_a_deep_position_through_model_and_dict_edges_is_refused_in_either_order(wrap) -> None:
+    subtree = _deep_subtree(250)
+    deep: object = {"k": subtree}
+    for _ in range(10):
+        deep = {"k": wrap([deep])}
+    for siblings in ([subtree, deep], [deep, subtree]):
+        with pytest.raises(ValueError, match="budget"):
+            snapshot_contract_graph(wrap(siblings))
+
+
+# ── extras found late (through a public mapping) respect every depth the model was reached at ──
+
+
+def _model_with_deep_extras(levels: int, *, native: bool):
+    value = SourceVersion(record_id="r1", content_revision=1, policy_epoch=1)
+    extras = {"deep": _deep_subtree(levels)}
+    _EXTRA.__set__(value, extras if native else MappingProxyType(extras))
+    return value
+
+
+@pytest.mark.parametrize("native", [False, True], ids=["public-mapping-extras", "dict-extras"])
+@pytest.mark.parametrize("hidden_first", [False, True], ids=["direct-first", "hidden-first"])
+def test_extras_are_checked_at_the_deepest_depth_the_model_was_reached(native, hidden_first) -> None:
+    model = _model_with_deep_extras(250, native=native)  # 252 levels below the model: fine on its own
+    snapshot_contract_graph([model])
+    hidden = _hidden_path(model, 10)  # the same model 11 levels down through empty public views
+    siblings = [hidden, model] if hidden_first else [model, hidden]
+    with pytest.raises(ValueError, match="budget"):
+        snapshot_contract_graph(siblings)
+
+
+@pytest.mark.parametrize("native", [False, True], ids=["public-mapping-extras", "dict-extras"])
+def test_extras_found_late_on_a_shallow_path_still_pass_when_every_path_fits(native) -> None:
+    model = _model_with_deep_extras(200, native=native)
+    hidden = _hidden_path(model, 10)
+    for siblings in ([model, hidden], [hidden, model]):
+        assert snapshot_contract_graph(siblings) is not None
+
+
+@pytest.mark.parametrize("native", [False, True], ids=["public-mapping-extras", "dict-extras"])
+@pytest.mark.parametrize("deep_first", [False, True], ids=["shallow-first", "deep-first"])
+def test_a_late_height_reaches_ancestors_that_a_deeper_path_visits(native, deep_first) -> None:
+    model = _model_with_deep_extras(200, native=native)
+    head = _hidden_path(model, 5)  # an ancestor of the model through native edges
+    deeper: object = head
+    for _ in range(60):  # a second, deeper path to the same ancestor
+        deeper = [deeper]
+    siblings = [model, head, deeper]
+    if deep_first:
+        siblings = [deeper, model, head]
+    with pytest.raises(ValueError, match="budget"):
+        snapshot_contract_graph(siblings)
+
+
+def test_the_ancestor_of_a_late_height_is_accepted_when_the_deeper_path_fits() -> None:
+    model = _model_with_deep_extras(100, native=False)
+    head = _hidden_path(model, 5)
+    deeper: object = head
+    for _ in range(40):
+        deeper = [deeper]
+    for siblings in ([model, head, deeper], [deeper, model, head]):
+        assert snapshot_contract_graph(siblings) is not None
+
+
+class _ViewOf(list):
+    """A list whose public view yields one item that its native backing does not hold."""
+
+    def __init__(self, shown: object) -> None:
+        super().__init__()
+        self._shown = shown
+
+    def __iter__(self):
+        return iter((self._shown,))
+
+
+@pytest.mark.parametrize("model_first", [False, True], ids=["view-first", "model-first"])
+def test_a_late_height_is_checked_at_the_depth_an_ancestor_reached_through_a_public_view(model_first) -> None:
+    model = _model_with_deep_extras(150, native=False)
+    ancestor = _hidden_path(model, 5)  # holds the model natively, five levels down
+    shown: object = _ViewOf(ancestor)  # reached only through this view, one hundred levels deep
+    for _ in range(100):
+        shown = [shown]
+    siblings = [model, shown] if model_first else [shown, model]
+    with pytest.raises(ValueError, match="budget"):
+        snapshot_contract_graph(siblings)
+
+
+def test_the_deepest_visit_counts_even_when_a_shallower_one_comes_later() -> None:
+    model = _model_with_deep_extras(150, native=False)
+    ancestor = _hidden_path(model, 5)
+    deep: object = _ViewOf(ancestor)
+    for _ in range(100):
+        deep = [deep]
+    first, last = _ViewOf(ancestor), _ViewOf(ancestor)  # the same ancestor, near the top before and after
+    with pytest.raises(ValueError, match="budget"):
+        snapshot_contract_graph([first, deep, last, model])  # the extras are found after every visit
+
+
+@pytest.mark.parametrize("hidden_first", [False, True], ids=["direct-first", "hidden-first"])
+def test_a_height_found_late_inside_late_extras_reaches_the_outer_model_and_its_ancestors(hidden_first) -> None:
+    inner = _model_with_deep_extras(250, native=False)  # 252 levels once its extras are read
+    outer = SourceVersion(record_id="r2", content_revision=1, policy_epoch=1)
+    _EXTRA.__set__(outer, MappingProxyType({"inner": inner}))  # found late too: one more level
+    snapshot_contract_graph([outer])  # 254 levels on its own: inside the limit
+    hidden = _hidden_path(outer, 10)
+    siblings = [hidden, outer] if hidden_first else [outer, hidden]
+    with pytest.raises(ValueError, match="budget"):
+        snapshot_contract_graph(siblings)

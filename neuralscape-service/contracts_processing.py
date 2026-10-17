@@ -11,9 +11,10 @@ from __future__ import annotations
 from collections.abc import Collection
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, TypeAdapter, model_validator
+from pydantic import ConfigDict, TypeAdapter, model_validator
 
 from contracts_common import OpaqueId, SafeCounter, VersionedContract
+from contracts_native import CollectionBudgetExceeded, bounded_entries, is_subclass, native_model_input, plain_str
 
 
 ProcessingMode = Literal["operator_trusted", "operator_blind", "strict_local"]
@@ -32,38 +33,6 @@ _NON_ENDPOINT_LOCATIONS = frozenset(
 _EXECUTION_LOCATION_ADAPTER = TypeAdapter(ExecutionLocation)
 _OPAQUE_ID_ADAPTER = TypeAdapter(OpaqueId)
 _SAFE_COUNTER_ADAPTER = TypeAdapter(SafeCounter)
-_BASE_MODEL_DICT_DESCRIPTOR = vars(BaseModel)["__dict__"]
-_BASE_MODEL_EXTRA_DESCRIPTOR = vars(BaseModel)["__pydantic_extra__"]
-
-
-def _with_native_dict_extra_backing(value: object) -> object:
-    """Project a model with native dict extra storage for closed revalidation."""
-    value_type = type(value)
-    if not issubclass(value_type, BaseModel):
-        return value
-    extras = _BASE_MODEL_EXTRA_DESCRIPTOR.__get__(value, BaseModel)
-    if extras is None:
-        captured = ()
-    elif issubclass(type(extras), dict):
-        # A dict subclass may lie through len/iteration/keys/items/truthiness.
-        # Snapshot its concrete backing exactly once with the built-in operation.
-        captured = tuple(dict.items(extras))
-    else:
-        # Not a dict: none of its views can be trusted and none is read.  Fence it the
-        # same way as any other native storage by projecting a marker the closed model
-        # rejects, instead of handing the original model (and its masked descriptors)
-        # back to revalidation.
-        captured = (("unreadable_extra_storage", True),)
-
-    # Detach every pair before projected-dict hashing can run a hostile stored
-    # name callback that repairs a later value in the live model backing.
-    stored = tuple(
-        dict.items(_BASE_MODEL_DICT_DESCRIPTOR.__get__(value, BaseModel))
-    )
-    projected = dict(stored)
-    if captured:
-        projected["native_extra_backing"] = dict(captured)
-    return projected
 
 
 class ProcessingPolicy(VersionedContract):
@@ -151,7 +120,7 @@ def validate_plaintext_dispatch(
 
     try:
         policy = ProcessingPolicy.model_validate(
-            _with_native_dict_extra_backing(policy)
+            native_model_input(policy, (ProcessingPolicy,))
         )
     except (TypeError, ValueError) as exc:
         raise PlaintextDispatchRejected("processing policy is invalid") from exc
@@ -169,7 +138,7 @@ def validate_plaintext_dispatch(
         raise PlaintextDispatchRejected("fallback marker must be a boolean")
     try:
         checked_location = _EXECUTION_LOCATION_ADAPTER.validate_python(
-            execution_location, strict=True
+            plain_str(execution_location), strict=True
         )
     except ValueError as exc:
         raise PlaintextDispatchRejected("execution location is invalid") from exc
@@ -195,13 +164,15 @@ def validate_plaintext_dispatch(
         raise PlaintextDispatchRejected("non-endpoint execution requires a recipient")
 
     try:
-        if isinstance(currently_authorized_recipient_ids, (str, bytes)):
+        if is_subclass(type(currently_authorized_recipient_ids), (str, bytes)):
             raise TypeError("recipient authority must be a collection of identifiers")
-        checked_recipient = _OPAQUE_ID_ADAPTER.validate_python(recipient_id, strict=True)
+        checked_recipient = _OPAQUE_ID_ADAPTER.validate_python(plain_str(recipient_id), strict=True)
         current_recipients = {
-            _OPAQUE_ID_ADAPTER.validate_python(value, strict=True)
-            for value in currently_authorized_recipient_ids
+            _OPAQUE_ID_ADAPTER.validate_python(plain_str(value), strict=True)
+            for value in bounded_entries(currently_authorized_recipient_ids)
         }
+    except CollectionBudgetExceeded as exc:
+        raise PlaintextDispatchRejected("current recipient authority exceeds the budget") from exc
     except (TypeError, ValueError) as exc:
         raise PlaintextDispatchRejected("current recipient authority is invalid") from exc
 

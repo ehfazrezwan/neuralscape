@@ -608,11 +608,12 @@ def test_dispatch_captures_all_stored_pairs_before_name_hashing() -> None:
     assert ordinary_errors == hooked_errors == [
         (("policy_epoch",), "greater_than_equal")
     ]
-    assert name.hash_calls == 1
+    # stored names are read as plain text, so the hostile name's hash never runs and nothing is repaired
+    assert name.hash_calls == 0
     assert dict.__getitem__(
         _BASE_MODEL_DICT_DESCRIPTOR.__get__(hooked, BaseModel),
         "policy_epoch",
-    ) == 7
+    ) != 7
 
 
 @pytest.mark.parametrize(

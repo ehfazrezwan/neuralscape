@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 from collections.abc import Mapping
 from datetime import datetime, timedelta, timezone
 from types import MappingProxyType
@@ -1044,7 +1045,7 @@ def test_readiness_boundaries_keep_spoofing_non_dict_on_mapping_path(
     else:
         validate()
 
-    assert extras.class_calls == 1
+    assert extras.class_calls == 0  # the claimed class is never consulted: the real type decides
     assert extras.length_calls == 1
     assert extras.iteration_calls == 1
     assert extras.items_calls == 1
@@ -1922,3 +1923,285 @@ def test_mixed_zones_and_the_spring_gap_use_absolute_time() -> None:
     assert capability_is_ready(observation, evaluated_at=evaluated, max_probe_age_seconds=3599) is False
     utc_evaluated = datetime(2026, 3, 8, 7, 30, tzinfo=timezone.utc)
     assert capability_is_ready(observation, evaluated_at=utc_evaluated, max_probe_age_seconds=3600) is True
+
+
+# ---- a zone that answers differently on each read (a caller-owned tzinfo is arbitrary code)
+
+from datetime import tzinfo  # noqa: E402
+
+
+class FlappingZone(tzinfo):
+    """Reports ``script[0]`` on the first read after ``arm()``, then ``script[1]`` on every later read."""
+
+    def __init__(self, first: timedelta, later: timedelta) -> None:
+        self.first, self.later = first, later
+        self.reads: int | None = None
+
+    def arm(self) -> None:
+        self.reads = 0
+
+    def utcoffset(self, dt):
+        if self.reads is None:
+            return self.first
+        self.reads += 1
+        return self.first if self.reads == 1 else self.later
+
+    def dst(self, dt):
+        return timedelta(0)
+
+    def tzname(self, dt):
+        return "flap"
+
+
+def _flapping_observation(zone: FlappingZone, *, observed: datetime) -> CapabilityReadiness:
+    item = _fold_observation(observed.replace(tzinfo=zone))  # built while the zone is steady
+    zone.arm()
+    return item
+
+
+def test_an_observed_at_zone_that_changes_its_offset_between_reads_cannot_freshen_a_stale_probe() -> None:
+    # First read: UTC, so the probe is 2026-01-01 12:00Z.  Every later read: UTC-12, which would move it to
+    # 2026-01-02 00:00Z and make a probe 12 hours old look brand new at that evaluation time.
+    zone = FlappingZone(timedelta(0), timedelta(hours=-12))
+    observation = _flapping_observation(zone, observed=datetime(2026, 1, 1, 12, 0))
+    evaluated = datetime(2026, 1, 2, 0, 0, tzinfo=timezone.utc)
+    assert capability_is_ready(observation, evaluated_at=evaluated, max_probe_age_seconds=3600) is False
+    assert zone.reads == 1  # the caller's zone was asked once
+
+
+def test_an_evaluated_at_zone_that_changes_its_offset_between_reads_cannot_age_a_fresh_probe() -> None:
+    zone = FlappingZone(timedelta(0), timedelta(hours=-12))
+    observation = _fold_observation(datetime(2026, 1, 1, 11, 30, tzinfo=timezone.utc))
+    evaluated = datetime(2026, 1, 1, 12, 0, tzinfo=zone)
+    zone.arm()
+    assert capability_is_ready(observation, evaluated_at=evaluated, max_probe_age_seconds=3600) is True
+    assert zone.reads == 1
+
+
+def test_a_publication_pins_each_observation_time_once() -> None:
+    zone = FlappingZone(timedelta(0), timedelta(hours=-12))
+    item = _fold_observation(datetime(2026, 1, 1, 12, 0, tzinfo=zone))
+    publication = TenantReadinessPublication(
+        schema_version="candidate-v1", tenant_id="tenant-a", placement_generation=1, capabilities=(item,)
+    )
+    zone.arm()
+    checked = validate_readiness_publication(
+        publication, expected_tenant_id="tenant-a", current_placement_generation=1
+    )
+    assert zone.reads == 1
+    kept = checked.capabilities[0].observed_at
+    assert kept == datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)  # the first read decided the instant
+    # and the value handed back no longer depends on the caller's zone
+    assert capability_is_ready(
+        checked.capabilities[0], evaluated_at=datetime(2026, 1, 1, 12, 30, tzinfo=timezone.utc), max_probe_age_seconds=3600
+    ) is True
+    assert zone.reads == 1
+
+
+def test_pinning_keeps_ordinary_zones_equal_and_naive_values_refused() -> None:
+    ordinary = _fold_observation(datetime(2026, 7, 1, 9, 0, tzinfo=_NEW_YORK))
+    pub = TenantReadinessPublication(schema_version="candidate-v1", tenant_id="t", placement_generation=1, capabilities=(ordinary,))
+    checked = validate_readiness_publication(pub, expected_tenant_id="t", current_placement_generation=1)
+    assert checked == pub and checked.capabilities[0].observed_at.utcoffset() == timedelta(hours=-4)
+    # an ambiguous (fold) time keeps its instant and offset; only the zone object is replaced by the fixed offset
+    observation = _fold_observation(datetime(2026, 11, 1, 1, 30, tzinfo=_NEW_YORK, fold=1))
+    folded = TenantReadinessPublication(schema_version="candidate-v1", tenant_id="t", placement_generation=1, capabilities=(observation,))
+    kept = validate_readiness_publication(folded, expected_tenant_id="t", current_placement_generation=1).capabilities[0].observed_at
+    assert kept.utcoffset() == timedelta(hours=-5) and kept.astimezone(timezone.utc) == datetime(2026, 11, 1, 6, 30, tzinfo=timezone.utc)
+    with pytest.raises(ValueError):
+        capability_is_ready(observation, evaluated_at=datetime(2026, 11, 2), max_probe_age_seconds=1)  # naive
+
+
+# ---- shared subtrees are pinned once; a zone with no offset on its first read is refused
+
+class CountingZone(tzinfo):
+    """UTC, counting every offset read."""
+
+    def __init__(self) -> None:
+        self.reads = 0
+
+    def utcoffset(self, dt):
+        self.reads += 1
+        return timedelta(0)
+
+    def dst(self, dt):
+        return timedelta(0)
+
+    def tzname(self, dt):
+        return "count"
+
+
+def _shared_node(depth: int, leaf: object) -> object:
+    node = leaf
+    for _ in range(depth):
+        node = [node, node]  # 2**depth paths, depth + 1 distinct lists
+    return node
+
+
+@pytest.mark.parametrize("depth", [12, 30])
+def test_a_shared_nested_graph_is_pinned_once_per_object(depth: int) -> None:
+    zone = CountingZone()
+    item = _fold_observation(datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc))
+    dict.__setitem__(vars(item), "detail_code", _shared_node(depth, datetime(2026, 1, 1, 12, 0, tzinfo=zone)))
+    started = time.perf_counter()
+    with pytest.raises(ValidationError):  # a nested list is not an id; the pinning must not blow up first
+        capability_is_ready(item, evaluated_at=datetime(2026, 1, 1, 12, 30, tzinfo=timezone.utc), max_probe_age_seconds=3600)
+    assert zone.reads == 1  # not 2**depth
+    assert time.perf_counter() - started < 2.0
+
+
+def test_pinning_keeps_the_sharing_of_the_snapshot() -> None:
+    import contracts_readiness as readiness
+
+    shared = [datetime(2026, 1, 1, tzinfo=timezone.utc)]
+    pinned = readiness._pin_datetimes({"a": shared, "b": (shared, shared), "c": [shared, "x"]})
+    assert pinned["a"] is pinned["b"][0] is pinned["b"][1] is pinned["c"][0]
+    untouched = {"k": ["plain", ("tuple", 1)]}
+    assert readiness._pin_datetimes(untouched) is untouched  # nothing to pin: nothing copied
+
+
+class NoOffsetFirstZone(tzinfo):
+    """No offset on the first read after ``arm()``, UTC on every later read."""
+
+    def __init__(self) -> None:
+        self.reads: int | None = None
+
+    def arm(self) -> None:
+        self.reads = 0
+
+    def utcoffset(self, dt):
+        if self.reads is None:
+            return timedelta(0)
+        self.reads += 1
+        return None if self.reads == 1 else timedelta(0)
+
+    def dst(self, dt):
+        return timedelta(0)
+
+    def tzname(self, dt):
+        return "none-first"
+
+
+def test_an_observed_at_with_no_offset_on_its_first_read_is_refused_and_read_once() -> None:
+    zone = NoOffsetFirstZone()
+    item = _fold_observation(datetime(2026, 1, 1, 12, 0, tzinfo=zone))
+    zone.arm()
+    with pytest.raises(ValidationError):
+        capability_is_ready(item, evaluated_at=datetime(2026, 1, 1, 12, 30, tzinfo=timezone.utc), max_probe_age_seconds=3600)
+    assert zone.reads == 1
+
+
+def test_an_evaluated_at_with_no_offset_on_its_first_read_is_refused_and_read_once() -> None:
+    zone = NoOffsetFirstZone()
+    item = _fold_observation(datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc))
+    evaluated = datetime(2026, 1, 1, 12, 30, tzinfo=zone)
+    zone.arm()
+    with pytest.raises(ValidationError):
+        capability_is_ready(item, evaluated_at=evaluated, max_probe_age_seconds=3600)
+    assert zone.reads == 1
+
+
+def test_a_publication_with_a_first_read_of_none_is_refused() -> None:
+    zone = NoOffsetFirstZone()
+    item = _fold_observation(datetime(2026, 1, 1, 12, 0, tzinfo=zone))
+    publication = TenantReadinessPublication(schema_version="candidate-v1", tenant_id="t", placement_generation=1, capabilities=(item,))
+    zone.arm()
+    with pytest.raises(ValidationError):
+        validate_readiness_publication(publication, expected_tenant_id="t", current_placement_generation=1)
+    assert zone.reads == 1
+
+
+# ---- type gates classify by the object's real type, never by its own ``__class__``
+
+class _ClaimsObservation:
+    """Not a ``CapabilityReadiness``: its ``__class__`` says it is, and its ``__dict__`` holds a flapping zone."""
+
+    def __init__(self, observed_at: datetime) -> None:
+        self.__dict__.update(
+            schema_version="candidate-v1", capability="exact_reads", status="healthy",
+            observed_at=observed_at, detail_code=None,
+        )
+        self.__pydantic_fields_set__ = set(self.__dict__)
+
+    @property
+    def __class__(self):  # type: ignore[override]
+        return CapabilityReadiness
+
+
+def test_an_object_claiming_the_observation_class_cannot_skip_the_timestamp_pinning() -> None:
+    zone = FlappingZone(timedelta(0), timedelta(hours=-12))
+    spoof = _ClaimsObservation(datetime(2026, 1, 1, 12, 0, tzinfo=zone))
+    zone.arm()
+    with pytest.raises(TypeError, match="observation must be a CapabilityReadiness"):
+        capability_is_ready(spoof, evaluated_at=datetime(2026, 1, 2, 0, 0, tzinfo=timezone.utc), max_probe_age_seconds=60)  # type: ignore[arg-type]
+    assert zone.reads in (0, None)  # the caller's zone was never consulted
+
+
+def test_the_genuine_observation_with_the_same_zone_is_not_ready() -> None:
+    zone = FlappingZone(timedelta(0), timedelta(hours=-12))
+    observation = _fold_observation(datetime(2026, 1, 1, 12, 0, tzinfo=zone))
+    zone.arm()
+    assert capability_is_ready(observation, evaluated_at=datetime(2026, 1, 2, 0, 0, tzinfo=timezone.utc), max_probe_age_seconds=60) is False
+    assert zone.reads == 1
+
+
+def test_an_object_claiming_the_publication_class_is_refused_by_the_gate() -> None:
+    class Spoof:
+        @property
+        def __class__(self):  # type: ignore[override]
+            return TenantReadinessPublication
+    with pytest.raises(TypeError, match="publication must be a TenantReadinessPublication"):
+        validate_readiness_publication(Spoof(), expected_tenant_id="t", current_placement_generation=1)  # type: ignore[arg-type]
+
+
+# ---- a hostile zone is a value error, never the caller's exception or a TypeError
+
+class _HostileZone(tzinfo):
+    def __init__(self, mode: str) -> None:
+        self.mode, self.armed, self.reads = mode, False, 0
+
+    def utcoffset(self, dt):
+        if not self.armed:
+            return timedelta(0)
+        self.reads += 1
+        if self.mode == "raises":
+            raise RuntimeError("zone trap")
+        return "not an offset"
+
+    def dst(self, dt):
+        return timedelta(0)
+
+    def tzname(self, dt):
+        return "hostile"
+
+
+@pytest.mark.parametrize("mode", ["raises", "non-offset"])
+def test_a_hostile_zone_on_observed_at_is_a_value_error(mode: str) -> None:
+    zone = _HostileZone(mode)
+    item = _fold_observation(datetime(2026, 1, 1, 12, 0, tzinfo=zone))
+    zone.armed = True
+    with pytest.raises(ValidationError):
+        capability_is_ready(item, evaluated_at=datetime(2026, 1, 1, 12, 30, tzinfo=timezone.utc), max_probe_age_seconds=3600)
+    assert zone.reads == 1
+
+
+@pytest.mark.parametrize("mode", ["raises", "non-offset"])
+def test_a_hostile_zone_on_evaluated_at_is_a_value_error(mode: str) -> None:
+    zone = _HostileZone(mode)
+    item = _fold_observation(datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc))
+    evaluated = datetime(2026, 1, 1, 12, 30, tzinfo=zone)
+    zone.armed = True
+    with pytest.raises(ValidationError):
+        capability_is_ready(item, evaluated_at=evaluated, max_probe_age_seconds=3600)
+    assert zone.reads == 1
+
+
+@pytest.mark.parametrize("mode", ["raises", "non-offset"])
+def test_a_hostile_zone_inside_a_publication_is_a_value_error(mode: str) -> None:
+    zone = _HostileZone(mode)
+    item = _fold_observation(datetime(2026, 1, 1, 12, 0, tzinfo=zone))
+    publication = TenantReadinessPublication(schema_version="candidate-v1", tenant_id="t", placement_generation=1, capabilities=(item,))
+    zone.armed = True
+    with pytest.raises(ValidationError):
+        validate_readiness_publication(publication, expected_tenant_id="t", current_placement_generation=1)
+    assert zone.reads == 1
