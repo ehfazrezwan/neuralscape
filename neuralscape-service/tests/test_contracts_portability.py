@@ -3915,3 +3915,44 @@ def test_a_nested_model_instance_with_a_smuggled_extra_is_refused_in_a_mapping_i
     document["scope"] = scope
     with pytest.raises(ValidationError):
         validate_portable_manifest(document)
+
+
+def test_nested_model_instances_in_a_mapping_input_share_one_discovery_budget() -> None:
+    """K instances that share one large retained field cost one budget, not K.
+
+    Each instance's retained ``path`` is the same 300,000-element list (the wrong type, so the
+    schema refuses it at the end).  Rebuilding every nested instance under its own budget and memo
+    copied that list once per instance: 200 instances took minutes and gigabytes.
+    """
+
+    import time
+
+    shared = list(range(300_000))
+    manifest = validate_portable_manifest(valid_manifest())
+    files = []
+    for _ in range(200):
+        nested = manifest.files[0].model_copy(deep=True)
+        nested.__dict__["path"] = shared
+        files.append(nested)
+    document = valid_manifest()
+    document["files"] = files
+    started = time.monotonic()
+    with pytest.raises(ValidationError) as raised:
+        validate_portable_manifest(document)
+    assert time.monotonic() - started < 5
+    assert {error["loc"][:2] for error in raised.value.errors()} >= {("files", 0)}
+
+
+def test_the_shared_budget_still_refuses_a_call_whose_nested_instances_exceed_it() -> None:
+    """The budget is the call's: many nested instances that each fit alone are refused together."""
+
+    manifest = validate_portable_manifest(valid_manifest())
+    files = []
+    for _ in range(40):
+        nested = manifest.files[0].model_copy(deep=True)
+        nested.__dict__["path"] = list(range(30_000))  # distinct lists: 1.2M entries in all
+        files.append(nested)
+    document = valid_manifest()
+    document["files"] = files
+    with pytest.raises(ValidationError, match="discovery budget"):
+        validate_portable_manifest(document)

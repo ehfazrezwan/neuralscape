@@ -52,6 +52,32 @@ _RetainedStateInventory = tuple[
     _NativeContainerInventory,
     _PublicViewInventory,
 ]
+
+
+class _CallState:
+    """The discovery state of one validation call, shared by every model root it rebuilds.
+
+    A mapping input can hold many model instances.  Rebuilding each under its own budget and
+    memo let K instances do K budgets of work (and copy shared substructure once per instance);
+    with one state per call they share one discovery envelope, one set of inventories and one
+    reconstruction memo, exactly like the roots of a single top-level model.
+    """
+
+    __slots__ = (
+        "budget", "visited", "discovered", "discovery_inventory", "model_inventory",
+        "native_container_inventory", "public_view_inventory", "completed",
+    )
+
+    def __init__(self) -> None:
+        self.budget = DiscoveryBudget(PORTABILITY)
+        self.visited: set[int] = set()
+        self.discovered: set[int] = set()
+        self.discovery_inventory: _ModelDiscoveryInventory = {}
+        self.model_inventory: _ModelStorageInventory = {}
+        self.native_container_inventory: _NativeContainerInventory = {}
+        self.public_view_inventory: _PublicViewInventory = {}
+        # Completed reconstructions, keyed by identity with the owner retained.
+        self.completed: dict[int, tuple[Any, Any]] = {}
 _MISSING_FIELDS_SET = object()
 
 
@@ -269,6 +295,7 @@ def _validated_model_extra_storage(
 
 def _reject_retained_unknown_fields(
     root: BaseModel,
+    state: _CallState | None = None,
 ) -> _RetainedStateInventory:
     """Reject undeclared state retained by unchecked Pydantic copies.
 
@@ -285,19 +312,20 @@ def _reject_retained_unknown_fields(
     """
 
     errors: list[dict[str, Any]] = []
-    visited: set[int] = set()
-    discovered: set[int] = set()
-    discovery_inventory: _ModelDiscoveryInventory = {}
-    model_inventory: _ModelStorageInventory = {}
-    native_container_inventory: _NativeContainerInventory = {}
-    # Public views (container subclasses and custom mappings) are observed once,
-    # here, and replayed by reconstruction; they are never iterated a second time.
-    public_view_inventory: _PublicViewInventory = {}
-
     # One native-discovery envelope for this validation call, shared by every
-    # root it visits.  Accounting reads only native lengths and object
-    # identities, so it never runs a caller-defined protocol.
-    budget = DiscoveryBudget(PORTABILITY)
+    # root it visits (every model instance of a mapping input passes the same
+    # ``state``).  Accounting reads only native lengths and object identities,
+    # so it never runs a caller-defined protocol.  Public views (container
+    # subclasses and custom mappings) are observed once, here, and replayed by
+    # reconstruction; they are never iterated a second time.
+    state = state if state is not None else _CallState()
+    budget = state.budget
+    visited = state.visited
+    discovered = state.discovered
+    discovery_inventory = state.discovery_inventory
+    model_inventory = state.model_inventory
+    native_container_inventory = state.native_container_inventory
+    public_view_inventory = state.public_view_inventory
 
     def discover(value: Any, depth: int = 0) -> None:
         pending = [(value, depth)]
@@ -502,6 +530,7 @@ def _reject_retained_unknown_fields(
 def _reconstruct_retained_state(
     root: BaseModel,
     retained_state_inventory: _RetainedStateInventory,
+    state: _CallState | None = None,
 ) -> dict[str, Any]:
     """Copy a model graph without invoking lossy Pydantic serialization.
 
@@ -517,8 +546,9 @@ def _reconstruct_retained_state(
     )
     active: set[int] = set()
     # Completed reconstructions, keyed by identity with the owner retained so the
-    # key cannot be reused: shared substructure is rebuilt once, not once per path.
-    completed: dict[int, tuple[Any, Any]] = {}
+    # key cannot be reused: shared substructure is rebuilt once, not once per path
+    # (nor once per root, when the call's ``state`` is shared).
+    completed: dict[int, tuple[Any, Any]] = state.completed if state is not None else {}
 
     def observed(value: Any) -> tuple[Any, ...]:
         try:
@@ -854,17 +884,24 @@ def _plain_text_keys(document: Any) -> Any:
 
     copies: dict[int, Any] = {}
     originals: list[Any] = []  # keeps every walked object alive, so ids stay unique
+    call_state: list[_CallState] = []  # created on the first model instance, then shared
 
     def walk(value: Any, depth: int) -> Any:
         if _inherits(value, BaseModel):
             # A model instance inside a mapping goes through the same budgeted traversal
             # and reconstruction as a top-level model, so its retained state (including
             # a custom extra view) is read within the discovery budget, never by the schema.
+            # Every instance of this call shares one budget and one memo.
             identity = id(value)
             if identity in copies:
                 return copies[identity]
             originals.append(value)
-            rebuilt = _reconstruct_retained_state(value, _reject_retained_unknown_fields(value))
+            if not call_state:
+                call_state.append(_CallState())
+            state = call_state[0]
+            rebuilt = _reconstruct_retained_state(
+                value, _reject_retained_unknown_fields(value, state), state
+            )
             copies[identity] = walk(rebuilt, depth)
             return copies[identity]
         if not _inherits(value, dict, list, tuple):
