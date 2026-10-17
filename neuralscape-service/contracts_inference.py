@@ -24,6 +24,7 @@ not a service-level commitment.
 from __future__ import annotations
 
 import math
+import struct
 import re
 from collections.abc import Callable, Mapping
 from datetime import date
@@ -844,21 +845,63 @@ def _container_size(value: object) -> int:
     return len(value) if is_subclass(type(value), (list, dict)) else 0  # type: ignore[arg-type]
 
 
-def _json_identity(value: object, meter: _SchemaExecutionMeter) -> object:
-    """A hashable form of a JSON value with JSON Schema equality: a boolean is not a number, 1 equals
-    1.0, arrays compare in order and objects by their key set, at any depth.  One unit per node."""
+class _Identity:
+    """A node of a JSON value with JSON Schema equality, hashed once when it is built.
+
+    ``key`` is a tag with the node's content; its hash is cached, so a set lookup or a comparison costs
+    the node, not the subtree, and tuples are never re-hashed.  Numbers are keyed by their canonical
+    bytes (below), whose hash is Python's randomized byte hash: an attacker cannot choose integers that
+    collide in ``hash(int)`` (every multiple of ``sys.hash_info.modulus`` hashes to 0) to turn a set into
+    a list.  Equality compares the cached hashes first, then the content.
+    """
+
+    __slots__ = ("hash", "key")
+
+    def __init__(self, key: tuple[object, ...]) -> None:
+        self.key = key
+        self.hash = hash(key)
+
+    def __hash__(self) -> int:
+        return self.hash
+
+    def __eq__(self, other: object) -> bool:
+        return type(other) is _Identity and self.hash == other.hash and self.key == other.key  # type: ignore[attr-defined]
+
+
+def _number_key(value: int | float) -> tuple[object, ...]:
+    """The canonical key of a JSON number: equal numbers (1 and 1.0, 0 and -0.0) share it, distinct numbers
+    (2**53 + 1 and 2.0**53, big integers, nearby floats) never do, and its hash is a bytes hash."""
+
+    if type(value) is float:
+        if value != value:
+            return ("nan",)
+        if value.is_integer():
+            value = int(value)
+        else:
+            return ("f", struct.pack(">d", value))
+    size = (int.bit_length(value) + 8) // 8  # one bit for the sign
+    return ("n", int.to_bytes(value, size, "big", signed=True))
+
+
+def _json_identity(value: object, meter: _SchemaExecutionMeter) -> _Identity:
+    """The identity of a JSON value with JSON Schema equality: a boolean is not a number, 1 equals 1.0,
+    arrays compare in order and objects by their key set, at any depth.  One unit per node."""
 
     meter.charge(1)
     kind = type(value)
     if kind is bool:
-        return ("bool", value)
+        return _Identity(("bool", value))
     if is_subclass(kind, str):
-        return ("str", str.__str__(value))  # type: ignore[arg-type]
+        return _Identity(("str", str.__str__(value)))  # type: ignore[arg-type]
     if is_subclass(kind, list):
-        return ("array", tuple(_json_identity(item, meter) for item in value))  # type: ignore[union-attr]
+        return _Identity(("array", tuple(_json_identity(item, meter) for item in value)))  # type: ignore[union-attr]
     if is_subclass(kind, dict):
-        return ("object", frozenset((key, _json_identity(item, meter)) for key, item in value.items()))  # type: ignore[union-attr]
-    return ("value", value)  # a number (1 == 1.0 and hash alike) or null
+        return _Identity(
+            ("object", frozenset((str.__str__(key), _json_identity(item, meter)) for key, item in value.items()))  # type: ignore[union-attr]
+        )
+    if kind is int or kind is float:
+        return _Identity(_number_key(value))  # type: ignore[arg-type]
+    return _Identity(("value", value))  # null, or anything else a schema may carry
 
 
 def _metered_validator_class(validator_class: Any, meter: _SchemaExecutionMeter) -> Any:
@@ -897,24 +940,46 @@ def _metered_validator_class(validator_class: Any, meter: _SchemaExecutionMeter)
     # (one unit per node, cached by the list object), the instance is hashed per application, and
     # membership is a set lookup.
     enum_sets: dict[int, tuple[object, frozenset[object]]] = {}
-    instance_identities: dict[int, tuple[object, object]] = {}
+    instance_identities: dict[int, tuple[object, _Identity]] = {}
+    const_identities: dict[int, tuple[object, _Identity, int]] = {}
+
+    def identity_of(instance: Any) -> _Identity:
+        # An instance is hashed once per call, however many enums or consts are applied to it (jsonschema
+        # compares cheaply when the type or length differs, so many small keywords over one large instance
+        # must not pay for the whole instance each time); the object is kept alive so its id is its own.
+        hashed = instance_identities.get(id(instance))
+        if hashed is None or hashed[0] is not instance:
+            hashed = instance_identities[id(instance)] = (instance, _json_identity(instance, meter))
+        return hashed[1]
 
     def enum(validator: Any, enums: Any, instance: Any, schema: Any) -> Any:
         known = enum_sets.get(id(enums))
         if known is None or known[0] is not enums:  # the list is kept alive, so its id is its own
             known = enum_sets[id(enums)] = (enums, frozenset(_json_identity(entry, meter) for entry in enums))
-        # An instance is hashed once per call, however many enums are applied to it (jsonschema compares
-        # cheaply when the type or length differs, so many small enums over one large instance must not
-        # pay for the whole instance each time); the object is kept alive so its id is its own.
-        hashed = instance_identities.get(id(instance))
-        if hashed is None or hashed[0] is not instance:
-            hashed = instance_identities[id(instance)] = (instance, _json_identity(instance, meter))
-        if hashed[1] not in known[1]:
+        if identity_of(instance) not in known[1]:
             yield SchemaError(f"{instance!r} is not one of {enums!r}")
+
+    def const(validator: Any, expected: Any, instance: Any, schema: Any) -> Any:
+        # jsonschema's const equality recurses through the whole value, which the generic charge (top-level
+        # sizes) never saw: the value is hashed once per call, and a pair whose hashes are equal is compared
+        # node by node, so that comparison is charged its node count.
+        known = const_identities.get(id(expected))
+        if known is None or known[0] is not expected:
+            before = meter.left
+            identity = _json_identity(expected, meter)
+            known = const_identities[id(expected)] = (expected, identity, before - meter.left)
+        hashed = identity_of(instance)
+        if hashed.hash != known[1].hash:
+            yield SchemaError(f"{expected!r} was expected")
+            return
+        meter.charge(known[2])
+        if hashed != known[1]:
+            yield SchemaError(f"{expected!r} was expected")
 
     keywords = {name: metered(keyword) for name, keyword in validator_class.VALIDATORS.items()}
     keywords["uniqueItems"] = metered(unique_items)
     keywords["enum"] = metered(enum)
+    keywords["const"] = metered(const)
     return extend(validator_class, keywords)
 
 

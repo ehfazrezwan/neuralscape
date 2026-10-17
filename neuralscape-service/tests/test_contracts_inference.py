@@ -2389,3 +2389,108 @@ def test_every_hashed_node_is_charged_to_the_meter():
     with pytest.raises(ValueError) as refused:
         contracts_inference._json_identity([[1, 2], [3], {"a": True}], contracts_inference._SchemaExecutionMeter(limit=nodes - 1))
     assert str(refused.value) == contracts_inference.SCHEMA_EXECUTION_MESSAGE
+
+
+# ---- identities keep JSON Schema equality but not Python's predictable numeric hash; const is metered
+
+import sys as _sys
+
+
+def _identity_hashes(values):
+    meter = contracts_inference._SchemaExecutionMeter()
+    return [hash(contracts_inference._json_identity(value, meter)) for value in values]
+
+
+def test_integers_that_collide_in_pythons_numeric_hash_do_not_collide_as_identities():
+    """hash(i * modulus) is 0 for every i: an attacker-chosen set of distinct integers would put every item of a
+    uniqueItems or cached enum set in one bucket (quadratic, uncharged).  Counted as collisions, not timed."""
+
+    modulus = _sys.hash_info.modulus
+    values = [i * modulus for i in range(2_000)]
+    assert len(set(hash(value) for value in values)) == 1  # the premise: Python's own hash collides
+    assert len(set(_identity_hashes(values))) == len(values)
+    floats = [float(i * modulus) for i in range(1, 500)]
+    assert len(set(_identity_hashes(floats))) == len(floats)
+
+
+@pytest.mark.parametrize(
+    "left, right, equal",
+    [
+        (1, 1.0, True), (0, -0.0, True), (True, 1, False), (False, 0, False), (10**400, 10**400, True),
+        (10**400, 1e308, False), (2**53 + 1, 2.0**53, False), (2**53, 2.0**53, True), (0.1, 0.1, True),
+        (0.1, 0.10000000000000002, False), (-1, 1, False), ("1", 1, False), (None, None, True), (None, 0, False),
+        ([1, [2.0]], [1.0, [2]], True), ([True], [1], False), ({"a": [1]}, {"a": [1.0]}, True),
+        ({"a": 1, "b": 2}, {"b": 2, "a": 1}, True), ([1, 2], [2, 1], False), ({"a": 1}, {"a": 1, "b": 2}, False),
+    ],
+)
+def test_identities_keep_json_schema_equality(left, right, equal):
+    meter = contracts_inference._SchemaExecutionMeter()
+    one = contracts_inference._json_identity(left, meter)
+    two = contracts_inference._json_identity(right, meter)
+    assert (one == two) is equal
+    if equal:
+        assert hash(one) == hash(two)
+    # and through the three keywords that use them
+    for keyword_schema, outcome in (
+        ({"enum": [left]}, equal),
+        ({"const": left}, equal),
+    ):
+        request, result = _generation_with_output({"v": right}, v=keyword_schema)
+        if outcome:
+            assert validate_generation_result(request, result).compliant
+        else:
+            with pytest.raises(ValueError, match="does not match declared schema"):
+                validate_generation_result(request, result)
+    request, result = _generation_with_output({"v": [left, right]}, v={"type": "array", "uniqueItems": True})
+    if equal:
+        with pytest.raises(ValueError, match="does not match declared schema"):
+            validate_generation_result(request, result)
+    else:
+        assert validate_generation_result(request, result).compliant
+
+
+def test_a_const_with_nested_content_applied_many_times_is_charged_for_the_comparisons():
+    """100 allOf const entries (200 numbers each) over 100 items that equal it: 2,000,000 node comparisons, which
+    the generic top-level charge never saw (a size-1 object per application)."""
+
+    const = {"k": list(range(200))}
+    request, result = _generation_with_output(
+        {"v": [{"k": list(range(200))} for _ in range(100)]},
+        v={"type": "array", "items": {"allOf": [{"const": const}] * 100}},
+    )
+    with pytest.raises(ValueError) as refused:
+        validate_generation_result(request, result)
+    assert str(refused.value) == contracts_inference.SCHEMA_EXECUTION_MESSAGE
+
+
+def test_const_hashes_its_value_once_per_call_and_each_instance_once(monkeypatch):
+    """Five const entries applied to four items: every distinct object (the const, each item copy the call
+    validates) is hashed exactly once, not once per application."""
+
+    import collections
+
+    hashed = collections.Counter()
+    original = contracts_inference._json_identity
+
+    def counting(value, meter):
+        if isinstance(value, dict) and "k" in value:
+            hashed[id(value)] += 1
+        return original(value, meter)
+
+    monkeypatch.setattr(contracts_inference, "_json_identity", counting)
+    const = {"k": list(range(50))}
+    request, result = _generation_with_output(
+        {"v": [{"k": list(range(50))} for _ in range(4)]},
+        v={"type": "array", "items": {"allOf": [{"const": const}] * 5}},
+    )
+    assert validate_generation_result(request, result).compliant
+    assert hashed and set(hashed.values()) == {1}, hashed  # per application it would be 5 for each item
+    assert id(const) not in hashed or hashed[id(const)] == 1
+
+
+def test_a_modest_nested_const_still_validates_and_a_mismatch_is_still_reported():
+    request, result = _generation_with_output({"v": {"k": [1, 2.0]}}, v={"const": {"k": [1.0, 2]}})
+    assert validate_generation_result(request, result).compliant
+    request, result = _generation_with_output({"v": {"k": [1, 3]}}, v={"const": {"k": [1.0, 2]}})
+    with pytest.raises(ValueError, match="does not match declared schema"):
+        validate_generation_result(request, result)
