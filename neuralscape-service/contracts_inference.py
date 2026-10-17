@@ -941,7 +941,18 @@ def _metered_validator_class(validator_class: Any, meter: _SchemaExecutionMeter)
     # membership is a set lookup.
     enum_sets: dict[int, tuple[object, frozenset[object]]] = {}
     instance_identities: dict[int, tuple[object, _Identity]] = {}
-    const_identities: dict[int, tuple[object, _Identity, int]] = {}
+    const_identities: dict[int, tuple[object, _Identity]] = {}
+    pool: dict[_Identity, _Identity] = {}
+
+    def canonical(identity: _Identity) -> _Identity:
+        # Equal JSON values share one identity object per call, so "is it the same value" is an identity test
+        # however many separately built copies of it the schema and the output hold (a schema's repeated const
+        # is a distinct copy per use).  Interning compares an identity with at most the one already pooled, a
+        # walk bounded by the nodes just hashed and charged.
+        try:
+            return pool.setdefault(identity, identity)
+        except RecursionError:
+            raise ValueError(SCHEMA_EXECUTION_MESSAGE) from None
 
     def identity_of(instance: Any) -> _Identity:
         # An instance is hashed once per call, however many enums or consts are applied to it (jsonschema
@@ -949,31 +960,33 @@ def _metered_validator_class(validator_class: Any, meter: _SchemaExecutionMeter)
         # must not pay for the whole instance each time); the object is kept alive so its id is its own.
         hashed = instance_identities.get(id(instance))
         if hashed is None or hashed[0] is not instance:
-            hashed = instance_identities[id(instance)] = (instance, _json_identity(instance, meter))
+            hashed = instance_identities[id(instance)] = (instance, canonical(_json_identity(instance, meter)))
         return hashed[1]
 
+    # jsonschema's enum compares the instance with every entry, and its equality recurses through nested
+    # arrays and objects, so entries and items that keep their size one level down cost entries x items x
+    # depth while the top-level sizes charged above stay small.  Each enum list is hashed once per call
+    # (one unit per node, cached by the list object), the instance is hashed per distinct object, and
+    # membership is a set lookup on canonical identities.
     def enum(validator: Any, enums: Any, instance: Any, schema: Any) -> Any:
         known = enum_sets.get(id(enums))
         if known is None or known[0] is not enums:  # the list is kept alive, so its id is its own
-            known = enum_sets[id(enums)] = (enums, frozenset(_json_identity(entry, meter) for entry in enums))
+            known = enum_sets[id(enums)] = (
+                enums,
+                frozenset(canonical(_json_identity(entry, meter)) for entry in enums),
+            )
         if identity_of(instance) not in known[1]:
             yield SchemaError(f"{instance!r} is not one of {enums!r}")
 
     def const(validator: Any, expected: Any, instance: Any, schema: Any) -> Any:
         # jsonschema's const equality recurses through the whole value, which the generic charge (top-level
-        # sizes) never saw: the value is hashed once per call, and a pair whose hashes are equal is compared
-        # node by node, so that comparison is charged its node count.
+        # sizes) never saw.  The value and each instance are hashed once (every node charged) and made
+        # canonical, so a pair is equal exactly when the two canonical identities are one object: an
+        # application costs a lookup, however many copies of the const the schema repeats.
         known = const_identities.get(id(expected))
         if known is None or known[0] is not expected:
-            before = meter.left
-            identity = _json_identity(expected, meter)
-            known = const_identities[id(expected)] = (expected, identity, before - meter.left)
-        hashed = identity_of(instance)
-        if hashed.hash != known[1].hash:
-            yield SchemaError(f"{expected!r} was expected")
-            return
-        meter.charge(known[2])
-        if hashed != known[1]:
+            known = const_identities[id(expected)] = (expected, canonical(_json_identity(expected, meter)))
+        if identity_of(instance) is not known[1]:
             yield SchemaError(f"{expected!r} was expected")
 
     keywords = {name: metered(keyword) for name, keyword in validator_class.VALIDATORS.items()}

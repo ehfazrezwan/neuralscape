@@ -2449,18 +2449,24 @@ def test_identities_keep_json_schema_equality(left, right, equal):
         assert validate_generation_result(request, result).compliant
 
 
-def test_a_const_with_nested_content_applied_many_times_is_charged_for_the_comparisons():
-    """100 allOf const entries (200 numbers each) over 100 items that equal it: 2,000,000 node comparisons, which
-    the generic top-level charge never saw (a size-1 object per application)."""
+def test_a_const_repeated_as_separate_copies_is_answered_by_lookup_not_comparison(monkeypatch):
+    """100 allOf const entries (separate copies of 200 numbers) over 100 items that equal it: the parent compared
+    2,000,000 node pairs; here every node is hashed once (about 40,000) and each application is a lookup."""
 
-    const = {"k": list(range(200))}
+    nodes = [0]
+    original = contracts_inference._json_identity
+
+    def counting(value, meter):
+        nodes[0] += 1
+        return original(value, meter)
+
+    monkeypatch.setattr(contracts_inference, "_json_identity", counting)
     request, result = _generation_with_output(
         {"v": [{"k": list(range(200))} for _ in range(100)]},
-        v={"type": "array", "items": {"allOf": [{"const": const}] * 100}},
+        v={"type": "array", "items": {"allOf": [{"const": {"k": list(range(200))}} for _ in range(100)]}},
     )
-    with pytest.raises(ValueError) as refused:
-        validate_generation_result(request, result)
-    assert str(refused.value) == contracts_inference.SCHEMA_EXECUTION_MESSAGE
+    assert validate_generation_result(request, result).compliant
+    assert nodes[0] <= 2 * 100 * 202 + 100, nodes[0]  # each distinct object once, not once per application
 
 
 def test_const_hashes_its_value_once_per_call_and_each_instance_once(monkeypatch):
@@ -2552,3 +2558,62 @@ def test_a_noncanonical_selected_outcome_cannot_skip_the_selection_rules() -> No
         GenerationResult.model_validate({**result, "outcome": _spoof(GenerationOutcome.PROPOSED)}, strict=True)
     # controls: real members still follow the rules
     assert DecisionHeadResult.model_validate({**head, "outcome": DecisionOutcome.EMPTY}, strict=True).outcome is DecisionOutcome.EMPTY
+
+
+# ---- const: one comparison per (instance, const) pair; a mismatch stays cheap
+
+def test_one_matching_pair_is_compared_once_per_call():
+    """The same const object applied 100 times to each of 300 equal items is 300 comparisons (about 60,000
+    units), not 30,000; it used to be charged per application and refused."""
+
+    const = {"k": list(range(200))}
+    request, result = _generation_with_output(
+        {"v": [{"k": list(range(200))} for _ in range(300)]},
+        v={"type": "array", "items": {"allOf": [{"const": const}] * 100}},
+    )
+    assert validate_generation_result(request, result).compliant
+
+
+def test_a_deeply_nested_equal_const_never_leaks_a_recursion_error():
+    depth = 200
+    value: object = 1
+    for _ in range(depth):
+        value = [value]
+    request, result = _generation_with_output({"v": value}, v={"const": value})
+    try:
+        assert validate_generation_result(request, result).compliant
+    except ValueError as refused:  # a refusal is fine; a RecursionError is not
+        assert not isinstance(refused, RecursionError)
+
+
+def test_many_mismatching_consts_over_large_items_stay_cheap():
+    """100 negated consts that differ from 300 items of 201 nodes: the cached hashes reject each pair at once.
+    Without that short-circuit every pair would be compared and charged (6 million units, refused)."""
+
+    request, result = _generation_with_output(
+        {"v": [{"k": list(range(200))} for _ in range(300)]},
+        v={"type": "array", "items": {"allOf": [{"not": {"const": {"k": [index]}}} for index in range(100)]}},
+    )
+    assert validate_generation_result(request, result).compliant
+
+
+def test_const_comparison_work_is_per_distinct_value_not_per_application(monkeypatch):
+    """100 applications of a const to each of 300 equal items: equality walks are counted per node (a Python-level
+    ``__eq__`` per node).  Per application it was 100 x 300 x 201 = 6 million; interned, each distinct object is
+    compared with its pooled twin once (about 60,000)."""
+
+    walks = [0]
+    original = contracts_inference._Identity.__eq__
+
+    def counting(self, other):
+        walks[0] += 1
+        return original(self, other)
+
+    monkeypatch.setattr(contracts_inference._Identity, "__eq__", counting)
+    const = {"k": list(range(200))}
+    request, result = _generation_with_output(
+        {"v": [{"k": list(range(200))} for _ in range(300)]},
+        v={"type": "array", "items": {"allOf": [{"const": const}] * 100}},
+    )
+    assert validate_generation_result(request, result).compliant
+    assert walks[0] < 300_000, walks[0]
