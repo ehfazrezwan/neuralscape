@@ -366,6 +366,13 @@ class _Run:
         # (old node, new node, old defs, new defs) identities -> the nodes themselves (strong references,
         # so a released temporary's id can never be reused by another object and alias a recorded pair)
         self.clean: dict[tuple[int, int, int, int], tuple[object, ...]] = {}
+        # The two documents being compared and whether the comparison is running reversed (new against old):
+        # a ``{"$ref": "#"}`` points at the root of the document it is written in.
+        self.roots: tuple[object, object] | None = None
+        self.reversed = False
+        self.roots_equal: bool | None = None
+        self.any_root: bool | None = None
+        self.reaches_root: dict[tuple[int, int], bool] = {}
 
 
 _RUN: contextvars.ContextVar[_Run | None] = contextvars.ContextVar("contracts_pack_run", default=None)
@@ -384,7 +391,71 @@ def _defs_equal(old_defs: dict, new_defs: dict) -> bool:
     return cached
 
 
+def _mentions_root(value: object, defs: dict, seen: set[str] | None = None, budget: list[int] | None = None) -> bool:
+    """Whether ``value`` contains a ``{"$ref": "#"}``, directly or through the definitions it references."""
+
+    seen = set() if seen is None else seen
+    budget = [_INLINE_BUDGET] if budget is None else budget
+    budget[0] -= 1
+    if budget[0] < 0:
+        return True  # too large to tell: assume it does
+    if isinstance(value, list):
+        return any(_mentions_root(item, defs, seen, budget) for item in value)
+    if not isinstance(value, dict):
+        return False
+    ref = value.get("$ref")
+    if ref == "#":
+        return True
+    if isinstance(ref, str) and ref.startswith("#/$defs/"):
+        name = ref.removeprefix("#/$defs/")
+        if name not in seen and name in defs:
+            seen.add(name)
+            if _mentions_root(defs[name], defs, seen, budget):
+                return True
+    return any(_mentions_root(item, defs, seen, budget) for key, item in value.items() if key != "$ref")
+
+
+def _scan_root_references(run: _Run) -> bool:
+    """Whether either document being compared contains a ``{"$ref": "#"}`` at all (walked once per run)."""
+
+    found = False
+    budget = _INLINE_BUDGET * 50
+    stack = list(run.roots or ())
+    while stack and not found:
+        node = stack.pop()
+        budget -= 1
+        if budget < 0:
+            found = True  # too large to tell: assume it does
+        elif isinstance(node, dict):
+            found = node.get("$ref") == "#"
+            stack.extend(node.values())
+        elif isinstance(node, list):
+            stack.extend(node)
+    run.any_root = found
+    return found
+
+
+def _roots_equal() -> bool:
+    run = _RUN.get()
+    if run is None or run.roots is None:
+        return False
+    if run.roots_equal is None:
+        run.roots_equal = _json_equal(*run.roots)
+    return run.roots_equal
+
+
 def _same(old: object, new: object, old_defs: dict, new_defs: dict) -> bool:
+    # A ``#`` inside either side points at that side's own root, which the values do not carry: the same
+    # text means the same schema only if the roots are the same too.
+    run = _RUN.get()
+    # (inline, not a helper call: this runs at the deepest point of a recursive comparison)
+    if run is None or run.roots is None or (run.any_root if run.any_root is not None else _scan_root_references(run)):
+        try:
+            rooted = _mentions_root(old, old_defs) or _mentions_root(new, new_defs)
+        except RecursionError:
+            rooted = True  # too deep to tell: assume it does
+        if rooted and not _roots_equal():
+            return False
     if _json_equal(old, new) and _defs_equal(old_defs, new_defs):
         return True  # the same text under the same definitions
     try:
@@ -465,7 +536,14 @@ def _alternatives_equivalent(
         forward: list[str] = []
         backward: list[str] = []
         _compare(before, after, old_defs, new_defs, f"{path}|{index}", forward, depth + 1, active)
-        _compare(after, before, new_defs, old_defs, f"{path}|{index}", backward, depth + 1, active)
+        run = _RUN.get()
+        if run is not None:
+            run.reversed = not run.reversed  # the roots swap with the definition sets
+        try:
+            _compare(after, before, new_defs, old_defs, f"{path}|{index}", backward, depth + 1, active)
+        finally:
+            if run is not None:
+                run.reversed = not run.reversed
         if forward or backward:
             return False
     return True
@@ -493,26 +571,45 @@ def _compare(
         # An assumption belongs to one direction and one pair of definition sets: the reverse comparison
         # of the same references (new against old, definitions swapped) is a different question.
         pair = (str(old["$ref"]), str(new["$ref"]), id(old_defs), id(new_defs))
-        if pair in active:
+        if old["$ref"] == "#" and new["$ref"] == "#":
+            pair = None  # a root reference is followed to the roots below, where it is assumed or compared
+        elif pair in active:
             run = _RUN.get()
             if run is not None:  # assumed compatible: remember how far up the stack that assumption reaches
                 run.lowest_assumed = min(run.lowest_assumed, active.index(pair))
             return
-        active = (*active, pair)
+        if pair is not None:
+            active = (*active, pair)
     old, old_beside = _resolve(old, old_defs)
     new, new_beside = _resolve(new, new_defs)
     if (old_beside or new_beside) and not _same(old_beside, new_beside, old_defs, new_defs):
         # Resolving a reference replaces the schema, so constraints written beside it (``maxLength``
         # next to ``$ref``) would be dropped; a change in them is not verified.
         out.append(_unverified(path, "constraints beside a $ref changed"))
+    if isinstance(old, dict) and isinstance(new, dict) and old.get("$ref") == "#" and new.get("$ref") == "#":
+        # A root reference points at the root of the document it is written in, and the two documents differ:
+        # compare those roots (a root already being compared is assumed, as any recursive reference is).
+        run = _RUN.get()
+        if run is None or run.roots is None:
+            out.append(_unverified(path, "a root reference that cannot be resolved"))
+            return
+        root_pair = ("#", "#", id(old_defs), id(new_defs))
+        if root_pair in active:
+            run.lowest_assumed = min(run.lowest_assumed, active.index(root_pair))
+            return
+        active = (*active, root_pair)
+        old_root, new_root = run.roots[::-1] if run.reversed else run.roots
+        old, root_old_beside = _resolve(old_root, old_defs)
+        new, root_new_beside = _resolve(new_root, new_defs)
+        if (root_old_beside or root_new_beside) and not _same(root_old_beside, root_new_beside, old_defs, new_defs):
+            out.append(_unverified(path, "constraints beside a $ref changed"))
     if not isinstance(old, dict) or not isinstance(new, dict):
         if not _json_equal(old, new):
             out.append(f"{path}: schema changed shape")
         return
     if "$ref" in old or "$ref" in new:
         # Not a plain #/$defs reference (or a reference chain that does not end): not modelled.
-        if not (old.get("$ref") == new.get("$ref") == "#"):
-            out.append(_unverified(path, "a reference that is not a plain #/$defs one"))
+        out.append(_unverified(path, "a reference that is not a plain #/$defs one"))
         return
     for key in sorted((set(old) | set(new)) - _MODELED - _ANNOTATIONS):
         if not _same(old.get(key, _ABSENT), new.get(key, _ABSENT), old_defs, new_defs):
@@ -754,7 +851,9 @@ def check_compatibility(old: dict, new: dict) -> list[str]:
     if old_version is not None and new_version is not None and _is_version_bump(old_version, new_version):
         return []
     problems: list[str] = []
-    token = _RUN.set(_Run())
+    run = _Run()
+    run.roots = (old, new)
+    token = _RUN.set(run)
     try:
         _compare(
             old, new,

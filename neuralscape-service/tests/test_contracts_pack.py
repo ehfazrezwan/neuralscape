@@ -1129,3 +1129,43 @@ def test_an_assumption_made_going_forward_is_not_taken_for_the_reverse_compariso
 
     old, new = _direction_pair()
     assert _pair(old, new) != []
+
+
+# ---- recursive references: the root a "#" points to
+def test_a_root_reference_compares_the_roots_it_points_to_in_a_oneof() -> None:
+    old = {
+        "type": "object",
+        "required": ["a"],
+        "properties": {"x": {"oneOf": [{"$ref": "#"}, {"type": "object", "required": ["b"]}]}},
+    }
+    new = copy.deepcopy(old)
+    del new["required"]  # {"a":1,"x":{"b":1}} was valid; now x matches both branches
+    assert _pair(old, new) != []
+
+
+def test_a_root_reference_under_not_is_not_taken_for_unchanged() -> None:
+    old = {"type": "object", "properties": {"child": {"not": {"$ref": "#"}}}, "additionalProperties": False}
+    new = copy.deepcopy(old)
+    new["properties"]["flag"] = {"type": "boolean"}  # {"child":{"flag":true}} was valid; now it is the root
+    assert _pair(old, new) != []
+
+
+def test_a_recursive_root_still_compares_clean_when_the_change_is_a_widening() -> None:
+    old = {"type": "object", "properties": {"c": {"$ref": "#"}, "n": {"type": "string"}}}
+    widened = copy.deepcopy(old)
+    widened["properties"]["n"] = {"type": ["string", "null"]}
+    assert _pair(old, copy.deepcopy(old)) == []
+    assert _pair(old, widened) == []  # a widening below a root reference is still compatible
+    assert _pair(widened, old) != []  # and the narrowing is found, once, through the root reference as well
+
+
+def test_a_root_reference_reached_through_a_definition_is_compared_too() -> None:
+    old = {
+        "type": "object",
+        "required": ["a"],
+        "properties": {"x": {"oneOf": [{"$ref": "#/$defs/R"}, {"type": "object", "required": ["b"]}]}},
+        "$defs": {"R": {"$ref": "#"}},
+    }
+    new = copy.deepcopy(old)
+    del new["required"]
+    assert _pair(old, new) != []
