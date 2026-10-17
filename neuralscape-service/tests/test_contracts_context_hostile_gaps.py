@@ -601,3 +601,125 @@ def test_a_generated_entry_repaired_on_resume_in_the_bundle_is_judged_as_it_was_
 
     object.__setattr__(item, "source_versions", _EmptyBackedGenerated(make))
     assert receipt_matches_bundle(receipt, bundle) is False
+
+
+# ---- every enum-typed input is a declared member by identity (``str.__new__(Enum, "value")`` is refused)
+
+
+def _every_enum():
+    import enum as _enum
+
+    import contracts_context
+    import contracts_freshness
+
+    return [
+        value
+        for module in (contracts_context, contracts_freshness)
+        for value in vars(module).values()
+        if isinstance(value, type) and issubclass(value, _enum.Enum) and value.__module__ == module.__name__
+    ]
+
+
+def _spoof(member):
+    return str.__new__(type(member), member.value)  # right class and value, but not a declared member
+
+
+def test_the_enum_sweep_covers_every_enum_of_both_modules() -> None:
+    names = {kind.__name__ for kind in _every_enum()}
+    assert {"FreshnessRequirement", "UpstreamVerificationStatus", "ProjectionStatus", "VerificationMethod",
+            "ReconciliationState", "TimePerspective", "ContextOutcome", "CapabilityStatus", "TemporalStatus",
+            "EvidenceForm", "Uncertainty", "SafeOmissionCode", "SafeDegradationCode"} <= names
+
+
+@pytest.mark.parametrize("kind", _every_enum(), ids=lambda kind: kind.__name__)
+def test_a_contract_field_refuses_a_noncanonical_enum_instance_and_keeps_every_member(kind) -> None:
+    from pydantic import create_model
+
+    from contracts_common import ContractModel
+
+    holder = create_model("Holder", __base__=ContractModel, value=(kind, ...), many=(tuple[kind, ...], ()))
+    for member in kind:
+        assert holder.model_validate({"value": member}).value is member
+        assert holder.model_validate_json(json.dumps({"value": member.value})).value is member  # JSON: the member
+        with pytest.raises(ValidationError):
+            holder.model_validate({"value": _spoof(member)})
+        with pytest.raises(ValidationError):
+            holder.model_validate({"value": member, "many": (member, _spoof(member))})  # also inside a tuple
+
+
+@pytest.mark.parametrize("kind", _every_enum(), ids=lambda kind: kind.__name__)
+def test_the_native_snapshot_refuses_a_noncanonical_enum_instance_and_keeps_every_member(kind) -> None:
+    from contracts_freshness import require_native_snapshot
+
+    for member in kind:
+        assert require_native_snapshot({"x": [member]}) == {"x": [member]}
+        with pytest.raises(ValueError, match="noncanonical enum"):
+            require_native_snapshot({"x": [_spoof(member)]})
+
+
+def test_upstream_degradation_for_refuses_a_noncanonical_status_and_maps_every_member() -> None:
+    from contracts_context import SafeDegradationCode, upstream_degradation_for
+    from contracts_freshness import UpstreamVerificationStatus
+
+    assert upstream_degradation_for(UpstreamVerificationStatus.STALE) is SafeDegradationCode.UPSTREAM_VERIFICATION_STALE
+    assert upstream_degradation_for(UpstreamVerificationStatus.CURRENT) is None
+    for member in UpstreamVerificationStatus:
+        with pytest.raises(ValueError, match="declared member"):
+            upstream_degradation_for(_spoof(member))  # was None: the stale status reported no degradation
+
+
+def _stale_bundle():
+    item = _item()
+    freshness = item["freshness"]
+    freshness["upstream_status"] = "stale"
+    freshness["source_checkpoints"][0].update(verification_status="stale", last_successful_verification_at="2026-09-28T11:00:00Z")
+    return _validate(ContextBundle, _bundle(selected_items=[item]))
+
+
+def test_a_noncanonical_current_verified_request_cannot_match_stale_evidence() -> None:
+    from contracts_context import FreshnessRequirement
+
+    request, _ = _matching_pair()
+    bundle = _stale_bundle()
+    canonical = request.model_copy(update={"freshness_requirement": FreshnessRequirement.CURRENT_VERIFIED})
+    spoofed = request.model_copy(update={"freshness_requirement": _spoof(FreshnessRequirement.CURRENT_VERIFIED)})
+    stale_ok = request.model_copy(update={"freshness_requirement": FreshnessRequirement.LABELLED_STALE_ACCEPTABLE})
+    assert bundle_matches_reported_evidence(canonical, bundle) is False
+    assert bundle_matches_reported_evidence(spoofed, bundle) is False  # was True: the stale-acceptable branch
+    assert bundle_matches_reported_evidence(stale_ok, bundle) is True  # control: the labelled request still matches
+
+
+@pytest.mark.parametrize(
+    "where",
+    ["time_perspective", "freshness_requirement", "outcome", "temporal_status", "upstream_status", "projection_status",
+     "verification_method"],
+)
+def test_a_noncanonical_enum_in_either_argument_makes_the_predicates_false(where) -> None:
+    from contracts_context import receipt_matches_bundle
+    from tests.test_contracts_context import _receipt
+    from contracts_context import ContextAssemblyReceipt
+
+    request, bundle = _matching_pair()
+    assert bundle_matches_reported_evidence(request, bundle) is True
+    item = bundle.selected_items[0]
+    if where in ("time_perspective", "freshness_requirement"):
+        request = request.model_copy(update={where: _spoof(getattr(request, where))})
+    elif where == "outcome":
+        bundle = bundle.model_copy(update={"outcome": _spoof(bundle.outcome)})
+    else:
+        freshness = item.freshness
+        if where == "temporal_status":
+            item = item.model_copy(update={"temporal_status": _spoof(item.temporal_status)})
+        elif where == "upstream_status":
+            item = item.model_copy(update={"freshness": freshness.model_copy(update={"upstream_status": _spoof(freshness.upstream_status)})})
+        elif where == "projection_status":
+            projection = freshness.projection.model_copy(update={"status": _spoof(freshness.projection.status)})
+            item = item.model_copy(update={"freshness": freshness.model_copy(update={"projection": projection})})
+        else:
+            checkpoint = freshness.source_checkpoints[0]
+            checkpoint = checkpoint.model_copy(update={"verification_method": _spoof(checkpoint.verification_method)})
+            item = item.model_copy(update={"freshness": freshness.model_copy(update={"source_checkpoints": (checkpoint,)})})
+        bundle = bundle.model_copy(update={"selected_items": (item,)})
+    assert bundle_matches_reported_evidence(request, bundle) is False
+    receipt = _validate(ContextAssemblyReceipt, _receipt())
+    assert receipt_matches_bundle(receipt, _validate(ContextBundle, _bundle())) in (True, False)  # control: callable

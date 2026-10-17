@@ -13,7 +13,13 @@ from typing import Annotated, Sequence
 
 from pydantic import AfterValidator, AwareDatetime, Field, model_validator
 
-from contracts_common import ContractModel, OpaqueId, VersionedContract, snapshot_contract_graph
+from contracts_common import (
+    ContractModel,
+    OpaqueId,
+    VersionedContract,
+    is_canonical_enum_member,
+    snapshot_contract_graph,
+)
 from contracts_references import ReferenceHandle, SourceVersion
 
 
@@ -405,6 +411,11 @@ def require_native_snapshot(snapshot: object) -> object:
         ):
             trail.append((parent, label))
             raise ValueError(f"unsupported value type at {_trail_path(trail, len(trail) - 1)}")
+        elif any(kind is allowed for allowed in _ALLOWED_ENUMS) and not is_canonical_enum_member(value):
+            # ``str.__new__(Enum, "value")`` has the right class but is no member: every identity test on
+            # it fails and a decision falls through to its default branch.  Members only, by identity.
+            trail.append((parent, label))
+            raise ValueError(f"noncanonical enum value at {_trail_path(trail, len(trail) - 1)}")
     return snapshot
 
 
