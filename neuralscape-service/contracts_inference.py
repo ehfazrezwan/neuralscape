@@ -938,16 +938,20 @@ def _bounded_view(value: object) -> object:
 
     def walk(item: object) -> tuple[object, int]:
         kind = type(item)
-        if is_subclass(kind, str):
-            text = str.__str__(item)  # type: ignore[arg-type]
-            return (str.__new__(_LongText, text) if len(text) > _LONG_TEXT else text), 1
-        if kind is int and int.bit_length(item) > _LARGE_INT_BITS:  # type: ignore[arg-type]
-            return int.__new__(_LargeInt, item), 1  # type: ignore[call-overload]
-        if not is_subclass(kind, (list, dict)):
+        scalar = is_subclass(kind, str) or (kind is int and int.bit_length(item) > _LARGE_INT_BITS)  # type: ignore[arg-type]
+        if not scalar and not is_subclass(kind, (list, dict)):
             return item, 1
-        known = memo.get(id(item))
+        known = memo.get(id(item))  # a value repeated by reference is copied once, whatever its size
         if known is not None and known[0] is item:
             return known[1], known[2]
+        if scalar:
+            if kind is int:
+                copied_scalar: object = int.__new__(_LargeInt, item)  # type: ignore[call-overload]
+            else:
+                text = str.__str__(item)  # type: ignore[arg-type]
+                copied_scalar = str.__new__(_LongText, text) if len(text) > _LONG_TEXT else text
+            memo[id(item)] = (item, copied_scalar, 1)
+            return copied_scalar, 1
         nodes = 1
         if is_subclass(kind, list):
             elements = []
@@ -1011,6 +1015,30 @@ def _number_key(value: int | float) -> tuple[object, ...]:
     return ("n", int.to_bytes(value, size, "big", signed=True))
 
 
+def _text_of(value: object, meter: "_SchemaExecutionMeter") -> str:
+    """A string's exact text for an identity, charged by its length first (the copy and the hash scan it).
+    Our own long-text class is used as it is, so it is neither copied nor, once hashed, hashed again."""
+
+    meter.charge(_string_units(value))
+    return value if type(value) is str or type(value) is _LongText else str.__str__(value)  # type: ignore[arg-type,return-value]
+
+
+# Operand bit length of a float in the exact fallback: its fraction has at most this many bits.
+_FLOAT_BITS = 1_100
+_LIMB_BITS = 30
+_LIMB_PRODUCTS_PER_UNIT = 4_096
+
+
+def _division_units(dividend: object, divisor: object) -> int:
+    """Units for the arbitrary-precision division behind multipleOf: schoolbook cost, limbs times limbs."""
+
+    def limbs(value: object) -> int:
+        bits = int.bit_length(value) if is_subclass(type(value), int) and type(value) is not bool else _FLOAT_BITS  # type: ignore[arg-type]
+        return bits // _LIMB_BITS + 1
+
+    return limbs(dividend) * limbs(divisor) // _LIMB_PRODUCTS_PER_UNIT
+
+
 def _json_identity(value: object, meter: _SchemaExecutionMeter) -> _Identity:
     """The identity of a JSON value with JSON Schema equality: a boolean is not a number, 1 equals 1.0,
     arrays compare in order and objects by their key set, at any depth.  One unit per node."""
@@ -1020,12 +1048,12 @@ def _json_identity(value: object, meter: _SchemaExecutionMeter) -> _Identity:
     if kind is bool:
         return _Identity(("bool", value))
     if is_subclass(kind, str):
-        return _Identity(("str", str.__str__(value)))  # type: ignore[arg-type]
+        return _Identity(("str", _text_of(value, meter)))
     if is_subclass(kind, list):
         return _Identity(("array", tuple(_json_identity(item, meter) for item in value)))  # type: ignore[union-attr]
     if is_subclass(kind, dict):
         return _Identity(
-            ("object", frozenset((str.__str__(key), _json_identity(item, meter)) for key, item in value.items()))  # type: ignore[union-attr]
+            ("object", frozenset((_text_of(key, meter), _json_identity(item, meter)) for key, item in value.items()))  # type: ignore[union-attr]
         )
     if kind is int or kind is float or kind is _LargeInt:
         if kind is int or kind is _LargeInt:  # the key is the integer's whole byte string: charged by length before it is built
@@ -1068,7 +1096,7 @@ def _metered_validator_class(validator_class: Any, meter: _SchemaExecutionMeter)
         if unique and validator.is_type(instance, "array"):
             seen: set[object] = set()
             for item in instance:
-                identity = _json_identity(item, meter)
+                identity = identity_of(item)  # hashed and charged once per object, however many applications
                 if identity in seen:
                     yield SchemaError("array has non-unique elements")
                     return
@@ -1134,6 +1162,7 @@ def _metered_validator_class(validator_class: Any, meter: _SchemaExecutionMeter)
     def multiple_of(validator: Any, divisor: Any, instance: Any, schema: Any) -> Any:
         # jsonschema converts an integer divisor to a float for a float instance, which raises OverflowError
         # for a divisor past the float range; the exact answer is the rational quotient being whole.
+        meter.charge(_division_units(instance, divisor))
         try:
             yield from jsonschema_multiple_of(validator, divisor, instance, schema)
         except OverflowError:
@@ -1150,29 +1179,35 @@ def _metered_validator_class(validator_class: Any, meter: _SchemaExecutionMeter)
     return extend(validator_class, keywords)
 
 
-def _executable_schema(schema: Any, root: bool = True) -> Any:
+def _executable_schema(schema: Any, root: bool = True, shared: "dict[int, tuple[object, object]] | None" = None) -> Any:
     """A copy of the schema without nested ``$schema`` keys, for execution.
 
     jsonschema runs a subschema that declares ``$schema`` on the validator registered for that dialect,
     not on the metered one, so a nested declaration would escape the execution budget.  Nested
     declarations must equal the root dialect (checked earlier), so removing them changes nothing.  Only
     schema positions are rewritten; data positions (enum, const, default, examples) are kept as they are.
+    A large integer is wrapped once per object (``shared``), however many occurrences of it the schema has.
     """
 
     if not is_subclass(type(schema), dict):
         return schema
+    if shared is None:
+        shared = {}
     copied: dict[str, Any] = {}
     for keyword, value in schema.items():
         if keyword == "$schema" and not root:
             continue
         if keyword in _SCHEMA_CONTAINER_KEYWORDS and is_subclass(type(value), dict):
-            value = {name: _executable_schema(nested, False) for name, nested in value.items()}
+            value = {name: _executable_schema(nested, False, shared) for name, nested in value.items()}
         elif keyword in _SCHEMA_SINGLE_KEYWORDS:
-            value = _executable_schema(value, False)
+            value = _executable_schema(value, False, shared)
         elif keyword in _SCHEMA_ARRAY_KEYWORDS and is_subclass(type(value), list):
-            value = [_executable_schema(nested, False) for nested in value]
+            value = [_executable_schema(nested, False, shared) for nested in value]
         elif type(value) is int and int.bit_length(value) > _LARGE_INT_BITS:
-            value = int.__new__(_LargeInt, value)  # a bound or divisor that a discarded branch would quote
+            known = shared.get(id(value))  # a bound or divisor that a discarded branch would quote
+            if known is None or known[0] is not value:
+                known = shared[id(value)] = (value, int.__new__(_LargeInt, value))
+            value = known[1]
         copied[keyword] = value
     return copied
 

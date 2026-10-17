@@ -2927,3 +2927,80 @@ def test_a_float_instance_against_a_divisor_past_the_float_range_is_judged_exact
         else:
             with pytest.raises(ValueError, match="does not match declared schema"):
                 validate_generation_result(request, result)
+
+
+# ---- everything that copies, hashes or does arithmetic on a long string or a big integer is charged by size
+
+def _units_spent(schema, instance):
+    meter = contracts_inference._SchemaExecutionMeter()
+    validator = contracts_inference._build_output_validator({**_SCHEMA, **schema}, meter)
+    errors = list(validator.iter_errors(contracts_inference._bounded_view(instance)))
+    return contracts_inference.MAX_SCHEMA_EXECUTION_UNITS - meter.left, errors
+
+
+def test_a_long_string_is_charged_by_its_length_and_hashed_once_per_object(monkeypatch):
+    built = [0]
+    original = contracts_inference._Identity.__init__
+
+    def counting(self, key):
+        built[0] += 1
+        original(self, key)
+
+    monkeypatch.setattr(contracts_inference._Identity, "__init__", counting)
+    text = "x" * (1 << 20)
+    spent, errors = _units_spent({"allOf": [{"uniqueItems": True} for _ in range(512)]}, [text])
+    assert errors == []
+    assert spent >= (1 << 20) // 64  # charged by length
+    assert built[0] < 10, built[0]  # not rebuilt (copied and hashed) for each of the 512 applications
+
+
+def test_distinct_long_strings_and_keys_are_each_charged_by_length():
+    spent, _ = _units_spent({"uniqueItems": True}, [f"{i}" + "y" * 262_144 for i in range(8)])
+    assert spent >= 8 * 262_144 // 64
+    spent, _ = _units_spent({"uniqueItems": True}, [{"k" * 262_144: 1}])
+    assert spent >= 262_144 // 64
+
+
+def test_multiple_of_is_charged_by_the_size_of_its_operands():
+    big, divisor = (1 << 262_144) - 1, (1 << 131_072) + 1
+    spent, errors = _units_spent({"multipleOf": divisor}, big)
+    assert errors == [] and spent >= 3_000  # a valid multiple; the division is real work (it used to cost 8)
+    small, _ = _units_spent({"multipleOf": 3}, 12)
+    assert small < 50
+    divisor_schema = {"not": {"multipleOf": (1 << 1_000_000) + 1}}  # each passes, so both run
+    request, result = _generation_with_output({"v": 1 << 2_000_000}, v={"allOf": [divisor_schema, divisor_schema]})
+    with pytest.raises(ValueError, match="exceeds its budget"):
+        validate_generation_result(request, result)  # refused before any arithmetic
+
+
+def test_multiple_of_with_a_float_is_charged_by_its_exact_fraction_too():
+    spent, _ = _units_spent({"multipleOf": 0.1}, 1 << 262_144)
+    assert spent >= 50  # one fraction of up to ~1,100 bits against 8,739 limbs; it used to cost 8
+
+
+def test_a_large_bound_shared_by_many_branches_is_copied_once():
+    import tracemalloc
+
+    bound = 1 << (8 * 65_536)  # 64 KiB
+    schema = {**_SCHEMA, "allOf": [{"minimum": bound} for _ in range(256)]}
+    tracemalloc.start()
+    try:
+        contracts_inference._executable_schema(schema)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert peak < 1 << 20, peak  # it was one 64 KiB copy per occurrence: 16 MiB
+
+
+def test_a_long_string_or_integer_repeated_by_reference_is_copied_once_into_the_view():
+    import tracemalloc
+
+    text, number = "z" * (1 << 20), 1 << (8 * 65_536)
+    tracemalloc.start()
+    try:
+        view = contracts_inference._bounded_view([text] * 300 + [number] * 300)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert peak < 4 << 20, peak  # it was a copy per reference: 300 MiB
+    assert view[0] is view[1] and view[300] is view[301]  # type: ignore[index]
