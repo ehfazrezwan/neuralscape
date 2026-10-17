@@ -64,23 +64,33 @@ def load_oracles(directory: Path) -> dict[str, tuple[dict, str]]:  # noqa: C901
     return found
 
 
+def _isolation_flags(version: tuple[int, ...] | None = None) -> list[str]:
+    """The child interpreter's path-isolation flag: ``-P`` exists from Python 3.11, so it is passed only there.
+
+    Without it (Python 3.10) the script's own directory is on the path, and the probe process removes the
+    harness's directory from the path itself before it imports anything from the target.
+    """
+
+    return ["-P"] if tuple(sys.version_info[:3] if version is None else version) >= (3, 11) else []
+
+
 def observe(service_dir: Path) -> dict[str, dict]:
     """Run the probes in a fresh interpreter that sees only the target tree.
 
-    ``-P`` keeps the script's directory off the path; the probe process also removes the harness's own
-    directory (and an editable-install entry for it) and refuses to report facts if any module came from
-    the harness's tree.  A failing probe process is reported per scenario, so no run is lost.
+    ``-P`` (Python 3.11 and later) keeps the script's directory off the path; the probe process also removes the
+    harness's own directory (and an editable-install entry for it) and refuses to report facts if any module came
+    from the harness's tree.  A failing probe process is reported per scenario, so no run is lost.
     """
 
     service_dir = Path(service_dir).resolve()  # once: the probe process runs inside this directory
     try:
         done = subprocess.run(
-            [sys.executable, "-P", str(PROBES), "--service-dir", str(service_dir), "--harness-dir", str(PROBES.parent)],
+            [sys.executable, *_isolation_flags(), str(PROBES), "--service-dir", str(service_dir), "--harness-dir", str(PROBES.parent)],
             capture_output=True, text=True, check=True, cwd=str(service_dir), timeout=300,
         )
         return json.loads(done.stdout.strip().splitlines()[-1])
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError, ValueError, IndexError) as error:   # OSError: the process could not start (missing, non-directory or inaccessible service dir)
-        reason = f"probe process failed: {type(error).__name__}"
+        reason = type(error).__name__   # the class only: no message, no path; judge() reads it as a class name
         return {scenario: {"error": reason} for scenario in _scenario_ids()}
 
 

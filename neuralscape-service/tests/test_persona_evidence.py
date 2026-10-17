@@ -366,3 +366,71 @@ def test_a_handle_that_requires_a_tenant_is_reported_as_refused(tmp_path) -> Non
 def test_this_trees_citation_probe_still_gets_the_candidate_facts() -> None:
     facts = _citation(pe.observe(SERVICE_DIR))["facts"]
     assert facts == {"foreign_marker_field": "present", "handle_without_tenant": "refused"}
+
+
+# ---- the child interpreter's isolation flag exists on Python 3.11 and later only; failures keep their class name
+
+@pytest.mark.parametrize(
+    "version, flags",
+    [((3, 10, 14), []), ((3, 11, 0), ["-P"]), ((3, 12, 3), ["-P"]), ((3, 13, 1), ["-P"])],
+)
+def test_the_path_isolation_flag_is_passed_only_where_the_interpreter_has_it(version, flags) -> None:
+    assert pe._isolation_flags(version) == flags
+
+
+def test_the_probe_command_on_python_3_10_has_no_unknown_flag(monkeypatch) -> None:
+    seen: list[list[str]] = []
+
+    def fake_run(command, **kwargs):
+        seen.append(list(command))
+        raise OSError("not started")
+
+    monkeypatch.setattr(pe.subprocess, "run", fake_run)
+    monkeypatch.setattr(pe.sys, "version_info", (3, 10, 14, "final", 0))   # simulate the older interpreter
+    pe.observe(Path("."))
+    assert seen and "-P" not in seen[0]
+    monkeypatch.setattr(pe.sys, "version_info", (3, 11, 4, "final", 0))
+    seen.clear()
+    pe.observe(Path("."))
+    assert seen and "-P" in seen[0]
+
+
+def test_the_probes_report_every_scenario_in_a_fresh_interpreter_on_this_python() -> None:
+    """On a real 3.10 this fails if ``-P`` is passed (the child exits before running a probe)."""
+
+    observed = pe.observe(SERVICE_DIR)
+    assert set(observed) == set(persona_probes.SCENARIOS)
+    assert not any("error" in item for item in observed.values()), observed
+
+
+@pytest.mark.parametrize(
+    "error, name",
+    [
+        (OSError("boom"), "OSError"),
+        (FileNotFoundError("gone"), "FileNotFoundError"),
+        (ValueError("bad"), "ValueError"),
+        (IndexError("empty"), "IndexError"),
+        (pe.subprocess.TimeoutExpired("probe", 300), "TimeoutExpired"),
+        (pe.subprocess.CalledProcessError(3, "probe"), "CalledProcessError"),
+    ],
+    ids=lambda value: type(value).__name__ if isinstance(value, BaseException) else str(value),
+)
+def test_a_probe_process_failure_is_recorded_with_its_exception_class(monkeypatch, tmp_path, error, name) -> None:
+    def failing(command, **kwargs):
+        raise error
+
+    monkeypatch.setattr(pe.subprocess, "run", failing)
+    observed = pe.observe(tmp_path)
+    assert {item["error"] for item in observed.values()} == {name}
+    records = pe.run(tmp_path, "baseline", "tree-x", ORACLES, tmp_path / "e.jsonl", "run-f")
+    assert {item.verdict for item in records} == {"invalid_attempt"}
+    assert {item.note for item in records} == {f"probe failed: {name}"}, {item.note for item in records}
+
+
+def test_a_failure_note_never_carries_the_exception_message_or_a_path(monkeypatch, tmp_path) -> None:
+    def failing(command, **kwargs):
+        raise OSError(f"cannot start in {tmp_path}/secret-dir")
+
+    monkeypatch.setattr(pe.subprocess, "run", failing)
+    records = pe.run(tmp_path, "baseline", "tree-x", ORACLES, tmp_path / "e.jsonl", "run-g")
+    assert all("secret-dir" not in item.note and str(tmp_path) not in item.note for item in records)
