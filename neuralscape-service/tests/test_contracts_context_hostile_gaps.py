@@ -1077,3 +1077,81 @@ def test_pin_datetime_keeps_returning_the_callers_own_object_for_an_unusable_zon
     value = datetime(2026, 1, 1, tzinfo=NoOffset())
     assert pin_datetime(value) is value  # documented: the caller must check the result (see the docstring)
     assert "never cache" in (pin_datetime.__doc__ or "")
+
+
+# ---- early entry validation: only homogeneous sequences, and a bounded per-class cache
+
+def _holder_models():
+    from contracts_common import ContractModel
+
+    class Left(ContractModel):
+        x: int
+
+    class Right(ContractModel):
+        y: str
+
+    class Fixed(ContractModel):
+        pair: tuple[Left, Right]
+
+    class Open(ContractModel):
+        many: tuple[Left, ...]
+
+    class Listed(ContractModel):
+        many: list[Left]
+
+    return Left, Right, Fixed, Open, Listed
+
+
+def _view(entries, read):
+    def make():
+        for entry in entries:
+            read[0] += 1
+            yield entry
+
+    return _EmptyBackedGenerated(make)
+
+
+def test_a_fixed_heterogeneous_tuple_is_read_whole_not_cut_at_its_second_entry() -> None:
+    from contracts_common import snapshot_contract_graph
+
+    _, _, Fixed, _, _ = _holder_models()
+    read = [0]
+    # a Left, a Right, then a third entry the contract does not allow: the whole view must reach validation
+    holder = Fixed.model_construct(pair=_view([{"x": 1}, {"y": "b"}, {"x": 2}], read))
+    snapshot = snapshot_contract_graph(holder)
+    assert len(snapshot["pair"]) == 3 and read[0] == 3  # was 2: the Right entry failed the Left check and ended the read
+    with pytest.raises(ValidationError):
+        type(holder).model_validate(snapshot, strict=True)
+
+
+def test_a_valid_fixed_tuple_still_validates_and_homogeneous_views_still_stop_early() -> None:
+    from contracts_common import snapshot_contract_graph
+
+    Left, Right, Fixed, Open, Listed = _holder_models()
+    read = [0]
+    good = Fixed.model_construct(pair=_view([{"x": 1}, {"y": "b"}], read))
+    assert type(good).model_validate(snapshot_contract_graph(good), strict=True).pair[1].y == "b"
+    for model, field in ((Open, "many"), (Listed, "many")):
+        read = [0]
+        bad = model.model_construct(**{field: _view([{"x": -1.5}] + [{"x": 1}] * 1_000, read)})
+        snapshot = snapshot_contract_graph(bad)
+        assert read[0] == 1 and len(snapshot[field]) == 1  # the invalid first entry ends the read
+        with pytest.raises(ValidationError):
+            model.model_validate(snapshot, strict=True)
+
+
+def test_the_item_model_cache_does_not_grow_with_caller_created_classes() -> None:
+    import gc
+    import weakref
+
+    from contracts_common import ContractModel, _item_models
+    from pydantic import create_model
+
+    references = []
+    for index in range(400):
+        model = create_model(f"Dynamic{index}", __base__=ContractModel, items=(tuple[int, ...], ()))
+        _item_models(model)
+        references.append(weakref.ref(model))
+        del model
+    gc.collect()
+    assert sum(1 for reference in references if reference() is not None) <= 256

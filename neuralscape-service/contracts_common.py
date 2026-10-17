@@ -8,6 +8,7 @@ authority merely because a value validates.
 """
 
 import enum
+import functools
 import typing
 from collections.abc import Callable, Mapping
 from datetime import datetime
@@ -478,15 +479,15 @@ def _capture_native_graph(value: object, inventory: _GraphInventory, depth: int 
     return height
 
 
-_ITEM_MODELS: dict[type, dict[str, type]] = {}
-
-
+@functools.lru_cache(maxsize=256)  # bounded: classes a caller creates dynamically cannot accumulate
 def _item_models(model_type: type[BaseModel]) -> dict[str, type]:
-    """The fields of ``model_type`` that hold a tuple or list of one model class, mapped to that class."""
+    """The fields of ``model_type`` that hold a homogeneous sequence of one model class, mapped to that class.
 
-    known = _ITEM_MODELS.get(model_type)
-    if known is not None:
-        return known
+    Only ``tuple[T, ...]`` and ``list[T]`` count.  A fixed tuple (``tuple[A, B]``, ``tuple[A]``) has a type
+    and a length per position, so no single class describes its entries: it is left to the model's own
+    validation, which sees the whole view.
+    """
+
     found: dict[str, type] = {}
     for name, info in model_type.model_fields.items():
         annotation = info.annotation
@@ -499,11 +500,13 @@ def _item_models(model_type: type[BaseModel]) -> dict[str, type]:
             break
         origin = typing.get_origin(annotation)
         args = typing.get_args(annotation)
-        if (origin is tuple or origin is list) and args:
+        homogeneous = (origin is tuple and len(args) == 2 and args[1] is Ellipsis) or (
+            origin is list and len(args) == 1
+        )
+        if homogeneous:
             element = args[0]
             if isinstance(element, type) and issubclass(element, BaseModel):
                 found[name] = element
-    _ITEM_MODELS[model_type] = found
     return found
 
 
