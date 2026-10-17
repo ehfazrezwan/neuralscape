@@ -64,23 +64,35 @@ def require_canonical_enum_members(value: object, *, _depth: int = 0) -> None:
     """Raise ``ValueError`` if ``value`` is, or natively contains, an enum instance that is no member.
 
     Looks through exact tuples, lists, sets, frozensets and dicts (what validation produces); nested
-    models validate themselves.
+    models validate themselves.  A container reached by several paths is checked once (the check keeps
+    what it has seen, alive, for the call), so a graph that shares its layers costs its objects, not its
+    paths.
     """
 
+    seen: dict[int, object] = {}
+    _scan_enum_members(value, _depth, seen)
+
+
+def _scan_enum_members(value: object, depth: int, seen: dict[int, object]) -> None:
     if any(base is enum.Enum for base in _TYPE_MRO.__get__(type(value))):
         if not is_canonical_enum_member(value):
             raise ValueError("an enum value must be a declared member of its enum")
         return
-    if _depth > 32:
-        raise ValueError("contract value nesting exceeds the enum check depth")
     kind = type(value)
+    if not (kind is dict or kind is tuple or kind is list or kind is set or kind is frozenset):  # identity
+        return
+    if depth > 32:
+        raise ValueError("contract value nesting exceeds the enum check depth")
+    if id(value) in seen:
+        return
+    seen[id(value)] = value  # kept alive: its id stays its own
     if kind is dict:
         for key, item in dict.items(value):  # type: ignore[arg-type]
-            require_canonical_enum_members(key, _depth=_depth + 1)
-            require_canonical_enum_members(item, _depth=_depth + 1)
-    elif kind is tuple or kind is list or kind is set or kind is frozenset:  # identity, never ==
+            _scan_enum_members(key, depth + 1, seen)
+            _scan_enum_members(item, depth + 1, seen)
+    else:
         for item in value:  # type: ignore[attr-defined]
-            require_canonical_enum_members(item, _depth=_depth + 1)
+            _scan_enum_members(item, depth + 1, seen)
 
 
 def _annotation_holds_enum(annotation: object, _depth: int = 0) -> bool:
@@ -450,7 +462,43 @@ def _capture_native_graph(value: object, inventory: _GraphInventory, depth: int 
     return height
 
 
-def _exposed_items(value: object, inventory: _GraphInventory, depth: int) -> tuple[object, ...]:
+_ITEM_MODELS: dict[type, dict[str, type]] = {}
+
+
+def _item_models(model_type: type[BaseModel]) -> dict[str, type]:
+    """The fields of ``model_type`` that hold a tuple or list of one model class, mapped to that class."""
+
+    known = _ITEM_MODELS.get(model_type)
+    if known is not None:
+        return known
+    found: dict[str, type] = {}
+    for name, info in model_type.model_fields.items():
+        annotation = info.annotation
+        for _ in range(4):  # Annotated[...] and Optional[...] wrappers
+            args = typing.get_args(annotation)
+            origin = typing.get_origin(annotation)
+            if origin is Annotated or (origin is typing.Union and len(args) == 2 and type(None) in args):
+                annotation = args[0] if origin is Annotated else next(a for a in args if a is not type(None))
+                continue
+            break
+        origin = typing.get_origin(annotation)
+        args = typing.get_args(annotation)
+        if (origin is tuple or origin is list) and args:
+            element = args[0]
+            if isinstance(element, type) and issubclass(element, BaseModel):
+                found[name] = element
+    _ITEM_MODELS[model_type] = found
+    return found
+
+
+def _exposed_items(
+    value: object,
+    inventory: _GraphInventory,
+    depth: int,
+    active_containers: set[int] | None = None,
+    item_model: "type[BaseModel] | None" = None,
+    checked: "dict[int, tuple[object, object]] | None" = None,
+) -> tuple[object, ...]:
     """Read a sequence subclass's public view and freeze every sibling.
 
     The native backing of all exposed items is captured before the first one is
@@ -459,6 +507,12 @@ def _exposed_items(value: object, inventory: _GraphInventory, depth: int) -> tup
     iterator yields it, before the iterator is advanced: a generator resumed to
     produce the next item cannot repair what it just exposed.  The observation and each
     item it yields are charged as they are read, so an endless view is cut off by the budget.
+
+    When the view is a field of a model whose items are a known model (``item_model``), each yielded entry
+    is also snapshotted and strictly validated right then, before the iterator is advanced; the first invalid
+    entry ends the read (it stays in the result, so the caller's own validation refuses it) and the tail is
+    never produced.  The snapshots are kept in ``checked`` for the caller to reuse, so no entry is
+    reconstructed twice.
     """
 
     budget = inventory.budget
@@ -475,6 +529,13 @@ def _exposed_items(value: object, inventory: _GraphInventory, depth: int) -> tup
         budget.charge_edge()
         _capture_native_graph(item, inventory, depth + 1)
         items.append(item)
+        if item_model is not None and active_containers is not None and checked is not None:
+            snapshot = _snapshot_captured_graph(item, active_containers, inventory, depth + 1)
+            checked[id(item)] = (item, snapshot)
+            try:
+                item_model.model_validate(snapshot, strict=True)
+            except Exception:  # noqa: BLE001 - any refusal ends the read; the caller's validation reports it
+                break
     return tuple(items)
 
 
@@ -483,6 +544,7 @@ def _snapshot_captured_graph(
     active_containers: set[int],
     inventory: _GraphInventory,
     depth: int = 0,
+    item_model: "type[BaseModel] | None" = None,
 ) -> object:
     """Reconstruct one graph after its reachable native backing is frozen.
 
@@ -580,10 +642,13 @@ def _snapshot_captured_graph(
                     _grow_height(inventory, value_id, late_height)
 
             fields: dict[object, object] = {}
+            item_models = _item_models(model_type)
             for key, item in stored_entries:
                 if again:
                     budget.charge_edge()
-                fields[key] = _snapshot_captured_graph(item, active_containers, inventory, below)
+                fields[key] = _snapshot_captured_graph(
+                    item, active_containers, inventory, below, item_models.get(key) if item_models else None
+                )
                 height = _taller(height, item, completed)
             if captured.colliding_names:
                 raise ValueError("contract input contains colliding keys")
@@ -607,12 +672,21 @@ def _snapshot_captured_graph(
         elif _is_subclass(value_type, (tuple, list)):
             is_tuple = _is_subclass(value_type, tuple)
             exact = value_type is tuple if is_tuple else value_type is list
-            items = inventory.sequences[value_id] if exact else _exposed_items(value, inventory, depth)
+            checked: dict[int, tuple[object, object]] = {}
+            items = (
+                inventory.sequences[value_id]
+                if exact
+                else _exposed_items(value, inventory, depth, active_containers, item_model, checked)
+            )
             copies: list[object] = []
             for item in items:
                 if exact and again:
                     budget.charge_edge()
-                copies.append(_snapshot_captured_graph(item, active_containers, inventory, below))
+                done = checked.get(id(item))
+                if done is not None and done[0] is item:
+                    copies.append(done[1])  # snapshotted and validated when it was yielded
+                else:
+                    copies.append(_snapshot_captured_graph(item, active_containers, inventory, below))
                 height = _taller(height, item, completed)
             result = tuple(copies) if is_tuple else copies
         else:

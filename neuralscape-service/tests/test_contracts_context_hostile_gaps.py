@@ -689,25 +689,55 @@ def test_a_noncanonical_current_verified_request_cannot_match_stale_evidence() -
     assert bundle_matches_reported_evidence(stale_ok, bundle) is True  # control: the labelled request still matches
 
 
-@pytest.mark.parametrize(
-    "where",
-    ["time_perspective", "freshness_requirement", "outcome", "temporal_status", "upstream_status", "projection_status",
-     "verification_method"],
-)
-def test_a_noncanonical_enum_in_either_argument_makes_the_predicates_false(where) -> None:
-    from contracts_context import receipt_matches_bundle
-    from tests.test_contracts_context import _receipt
-    from contracts_context import ContextAssemblyReceipt
+def _spoofed_pair(where: str):
+    """A matching current (request, bundle) pair with one field replaced by a look-alike enum instance."""
 
     request, bundle = _matching_pair()
-    assert bundle_matches_reported_evidence(request, bundle) is True
     item = bundle.selected_items[0]
     if where in ("time_perspective", "freshness_requirement"):
-        request = request.model_copy(update={where: _spoof(getattr(request, where))})
-    elif where == "outcome":
-        bundle = bundle.model_copy(update={"outcome": _spoof(bundle.outcome)})
+        return request.model_copy(update={where: _spoof(getattr(request, where))}), bundle
+    if where == "outcome":
+        return request, bundle.model_copy(update={"outcome": _spoof(bundle.outcome)})
+    freshness = item.freshness
+    if where == "temporal_status":
+        item = item.model_copy(update={"temporal_status": _spoof(item.temporal_status)})
+    elif where == "upstream_status":
+        item = item.model_copy(update={"freshness": freshness.model_copy(update={"upstream_status": _spoof(freshness.upstream_status)})})
+    elif where == "projection_status":
+        projection = freshness.projection.model_copy(update={"status": _spoof(freshness.projection.status)})
+        item = item.model_copy(update={"freshness": freshness.model_copy(update={"projection": projection})})
     else:
-        freshness = item.freshness
+        checkpoint = freshness.source_checkpoints[0]
+        checkpoint = checkpoint.model_copy(update={"verification_method": _spoof(checkpoint.verification_method)})
+        item = item.model_copy(update={"freshness": freshness.model_copy(update={"source_checkpoints": (checkpoint,)})})
+    return request, bundle.model_copy(update={"selected_items": (item,)})
+
+
+_REQUEST_FIELDS = ["time_perspective", "freshness_requirement"]
+_BUNDLE_FIELDS = ["outcome", "temporal_status", "upstream_status", "projection_status", "verification_method"]
+
+
+@pytest.mark.parametrize("where", _REQUEST_FIELDS + _BUNDLE_FIELDS)
+def test_a_noncanonical_enum_makes_the_evidence_predicate_false_where_the_unmodified_pair_matches(where) -> None:
+    request, bundle = _matching_pair()
+    assert bundle_matches_reported_evidence(request, bundle) is True  # the control: this very pair matches
+    spoofed_request, spoofed_bundle = _spoofed_pair(where)
+    assert bundle_matches_reported_evidence(spoofed_request, spoofed_bundle) is False
+
+
+@pytest.mark.parametrize("where", _BUNDLE_FIELDS)
+def test_a_noncanonical_enum_in_the_bundle_makes_the_receipt_predicate_false_where_the_unmodified_bundle_matches(where) -> None:
+    from contracts_context import ContextAssemblyReceipt, receipt_matches_bundle
+    from tests.test_contracts_context import _receipt
+
+    receipt = _validate(ContextAssemblyReceipt, _receipt())
+    bundle = _validate(ContextBundle, _bundle())
+    assert receipt_matches_bundle(receipt, bundle) is True  # the control: this very receipt and bundle match
+    item = bundle.selected_items[0]
+    freshness = item.freshness
+    if where == "outcome":
+        bad = bundle.model_copy(update={"outcome": _spoof(bundle.outcome)})
+    else:
         if where == "temporal_status":
             item = item.model_copy(update={"temporal_status": _spoof(item.temporal_status)})
         elif where == "upstream_status":
@@ -719,7 +749,53 @@ def test_a_noncanonical_enum_in_either_argument_makes_the_predicates_false(where
             checkpoint = freshness.source_checkpoints[0]
             checkpoint = checkpoint.model_copy(update={"verification_method": _spoof(checkpoint.verification_method)})
             item = item.model_copy(update={"freshness": freshness.model_copy(update={"source_checkpoints": (checkpoint,)})})
-        bundle = bundle.model_copy(update={"selected_items": (item,)})
-    assert bundle_matches_reported_evidence(request, bundle) is False
-    receipt = _validate(ContextAssemblyReceipt, _receipt())
-    assert receipt_matches_bundle(receipt, _validate(ContextBundle, _bundle())) in (True, False)  # control: callable
+        bad = bundle.model_copy(update={"selected_items": (item,)})
+    assert receipt_matches_bundle(receipt, bad) is False
+
+
+def test_the_enum_check_visits_a_shared_container_once_not_once_per_path(monkeypatch) -> None:
+    """16 tuple layers each holding the previous twice are 2**16 paths to one leaf; the check keeps what it has seen."""
+
+    import contracts_common
+
+    checked = [0]
+    original = contracts_common.is_canonical_enum_member
+
+    def counting(value):
+        checked[0] += 1
+        return original(value)
+
+    monkeypatch.setattr(contracts_common, "is_canonical_enum_member", counting)
+    from contracts_context import TimePerspective
+
+    layer: object = TimePerspective.CURRENT
+    for _ in range(20):
+        layer = (layer, layer)
+    contracts_common.require_canonical_enum_members(layer)
+    assert checked[0] < 100, checked[0]  # per path it was 2**20 = 1,048,576
+    bad: object = _spoof(TimePerspective.CURRENT)
+    for _ in range(20):
+        bad = (bad, bad)
+    with pytest.raises(ValueError, match="declared member"):
+        contracts_common.require_canonical_enum_members(bad)
+
+
+def test_an_invalid_yielded_entry_stops_the_view_before_its_tail_is_read() -> None:
+    """The first source version is invalid and 50,000 valid ones follow: the invalid entry is validated as it is
+    captured, before the iterator is advanced, so the tail is never read."""
+
+    from contracts_context import ContextAssemblyReceipt, receipt_matches_bundle
+    from tests.test_contracts_context import _receipt
+
+    read = [0]
+
+    def make():
+        read[0] += 1
+        yield {"record_id": "source-a", "content_revision": -1, "policy_epoch": 2}  # invalid
+        for index in range(50_000):
+            read[0] += 1
+            yield {"record_id": f"tail-{index}", "content_revision": 1, "policy_epoch": 1}
+
+    receipt, bundle = _receipt_and_bundle_with_source_versions(make)
+    assert receipt_matches_bundle(receipt, bundle) is False
+    assert read[0] <= 2, read[0]  # the generator was started; the tail was never produced
