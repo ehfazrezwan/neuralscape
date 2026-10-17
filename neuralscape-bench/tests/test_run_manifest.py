@@ -2269,17 +2269,18 @@ def test_receivers_freeze_models_before_stored_name_hash_callbacks(
             dict.__setitem__(native, stored_name, run_id)
             stored_name.arm(repair)
 
+        before_receiving = repaired_value()
         with pytest.raises(ValidationError) as exc_info:
             receive_planned_manifest(boundary, manifest)
 
         assert exc_info.value.errors()[0]["loc"] == expected_location
         if armed:
             assert stored_name is not None
-            assert stored_name.hash_calls == 1
-            expected_repaired = (
-                None if invalid_target == "nested" else RunState.PLANNED
-            )
-            assert repaired_value() == expected_repaired
+            # The stored name is copied to its exact text at capture, so its hash callback is never run by the
+            # snapshot (it ran once here before): nothing can repair the captured state, and the invalid state
+            # that was captured is what is judged.
+            assert stored_name.hash_calls == 0
+            assert repaired_value() == before_receiving   # the repair callback never ran
 
 
 @pytest.mark.parametrize("boundary", ["serialize", "finish"])
@@ -3470,8 +3471,8 @@ def test_finish_preserves_new_exact_dict_shallow_and_valid_controls():
     )
     assert result.state is RunState.COMPLETED
     assert valid.items_calls == 1
-    assert collector_key.hash_calls == 1
-    assert key_callbacks == ["called"]
+    assert collector_key.hash_calls == 0   # a text key is copied to its exact text at capture: its hook never runs
+    assert key_callbacks == []
 
 
 def test_finish_preserves_lazy_exact_dict_priority_and_shared_capture():
@@ -5756,3 +5757,102 @@ def test_a_key_is_hashed_once_when_it_is_stored() -> None:
     _finish_with_resource(_PairsMapping(pairs))   # accepted: the keys are the model's own field names
     assert len(calls) == len(pairs)   # one hash per stored key: the repeat check adds none of its own
 
+
+# ---- a text key whose hash changes after capture cannot collapse two captured entries
+
+class _ShiftyKey(str):
+    """Equal to its base text, but it hashes differently until ``settle()``; then it hashes like the plain text."""
+
+    settled = False
+
+    def __hash__(self):
+        return str.__hash__(self) if self.settled else str.__hash__(self) ^ 0x5A5A5A
+
+    def settle(self):
+        self.settled = True
+
+
+def _with_shifty_duplicate(container, field="observed_value"):
+    """Store ``field: True`` and an equal-text shifty key holding 1 in ``container`` while their hashes differ, then settle."""
+
+    shifty = _ShiftyKey(field)
+    dict.__setitem__(container, field, True)
+    dict.__setitem__(container, shifty, 1)
+    assert dict.__len__(container) >= 2
+    shifty.settle()
+    return shifty
+
+
+def test_model_storage_with_a_key_that_changes_hash_is_refused_as_a_repeat() -> None:
+    reading = measured_memory()
+    _with_shifty_duplicate(BASE_MODEL_DICT_DESCRIPTOR.__get__(reading, pydantic.BaseModel))
+    with pytest.raises(ValueError, match="duplicate key"):
+        _finish_with_resource(reading)
+
+
+def test_an_exact_dict_with_a_key_that_changes_hash_is_refused_as_a_repeat() -> None:
+    fields = dict(measured_memory().model_dump())
+    _with_shifty_duplicate(fields)
+    with pytest.raises(ValueError, match="duplicate key"):
+        _finish_with_resource(fields)
+
+
+def test_a_public_mapping_with_equal_text_keys_of_different_hashes_is_refused_as_a_repeat() -> None:
+    base = measured_memory().model_dump()
+    others = [(key, value) for key, value in base.items() if key != "observed_value"]
+    pairs = others + [("observed_value", True), (_ShiftyKey("observed_value"), 1)]
+    with pytest.raises(ValueError):   # refused (by the model's own validation: the exact key wins, the other is extra)
+        _finish_with_resource(_PairsMapping(pairs))
+
+
+def test_a_single_text_subclass_key_is_read_as_its_exact_text_and_accepted() -> None:
+    fields = {(_ShiftyKey(key) if key == "observed_value" else key): value for key, value in measured_memory().model_dump().items()}
+    manifest = _finish_with_resource(fields)
+    assert manifest.resources[0].observed_value == measured_memory().observed_value
+
+
+def test_the_snapshot_runs_no_hook_of_a_text_subclass_key() -> None:
+    log: list[str] = []
+
+    class Counting(str):
+        def __hash__(self):
+            log.append("hash")
+            return str.__hash__(self)
+
+        def __eq__(self, other):
+            log.append("eq")
+            return str.__eq__(self, other)
+
+    fields = {(Counting(key) if key == "observed_value" else key): value for key, value in measured_memory().model_dump().items()}
+    log.clear()   # building the caller's own dict is not the snapshot's doing
+    _finish_with_resource(fields)
+    assert log == [], log
+
+
+
+def test_a_text_key_is_copied_with_the_base_method_not_the_keys_own_str() -> None:
+    log: list[str] = []
+
+    class Hostile(str):
+        def __str__(self):
+            log.append("__str__")
+            return "something-else"
+
+    fields = {(Hostile(key) if key == "observed_value" else key): value for key, value in measured_memory().model_dump().items()}
+    manifest = _finish_with_resource(fields)
+    assert manifest.resources[0].observed_value == measured_memory().observed_value and log == []
+
+
+def test_an_object_that_only_claims_to_be_text_is_not_copied_as_text() -> None:
+    class Claims:
+        @property
+        def __class__(self):   # type: ignore[override]
+            return str
+
+        def __hash__(self):
+            return 1
+
+    fields = dict(measured_memory().model_dump())
+    fields[Claims()] = 1
+    with pytest.raises(ValueError):   # an unsupported key is refused as an undeclared field, never a TypeError from a bad copy
+        _finish_with_resource(fields)
