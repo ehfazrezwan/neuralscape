@@ -4569,3 +4569,37 @@ def test_ordinary_fields_set_names_still_validate_as_text() -> None:
     fields.discard("manifest_id")
     fields.add(Plain("manifest_id"))
     assert validate_portable_manifest(manifest).manifest_id == "manifest-7"
+
+
+# ---- the declared fields of a model class are charged to the discovery budget for every instance scanned
+
+def test_sparse_instances_of_a_class_with_many_fields_are_charged_for_the_field_names() -> None:
+    from pydantic import create_model
+
+    wide = create_model("Wide", __base__=ManifestFile, **{f"extra_{i}": (int | None, None) for i in range(8_000)})
+    manifest = validate_portable_manifest(valid_manifest()).model_copy(deep=True)
+    files = manifest.files
+    for _ in range(100):  # unchecked instances: nothing stored, so only the field enumeration costs anything
+        sparse = object.__new__(wide)
+        _PYDANTIC_DICT_DESCRIPTOR.__set__(sparse, {})
+        _PYDANTIC_FIELDS_SET_SLOT.__set__(sparse, set())
+        _PYDANTIC_EXTRA_SLOT.__set__(sparse, None)
+        list.append(files, sparse)
+    with pytest.raises(ValidationError) as raised:
+        validate_portable_manifest(manifest)
+    assert str(raised.value.__cause__) == DISCOVERY_BUDGET_MESSAGE  # 100 x 8,000 names is over the edge budget
+
+
+def test_a_few_instances_of_a_wide_class_stay_within_the_budget() -> None:
+    from pydantic import create_model
+
+    wide = create_model("Wide", __base__=ManifestFile, **{f"extra_{i}": (int | None, None) for i in range(8_000)})
+    manifest = validate_portable_manifest(valid_manifest()).model_copy(deep=True)
+    sparse = object.__new__(wide)
+    _PYDANTIC_DICT_DESCRIPTOR.__set__(sparse, {})
+    _PYDANTIC_FIELDS_SET_SLOT.__set__(sparse, set())
+    _PYDANTIC_EXTRA_SLOT.__set__(sparse, None)
+    list.append(manifest.files, sparse)
+    with pytest.raises(ValidationError) as raised:
+        validate_portable_manifest(manifest)
+    assert str(raised.value.__cause__) != DISCOVERY_BUDGET_MESSAGE  # refused for its content, not its budget

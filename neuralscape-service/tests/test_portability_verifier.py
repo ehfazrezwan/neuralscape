@@ -2212,3 +2212,41 @@ def test_the_flags_refused_here_are_the_ones_the_standard_reader_refuses(tmp_pat
         _with_flag_in_both_headers(path, bit)
         with zipfile.ZipFile(path) as archive, pytest.raises(NotImplementedError):
             archive.open(archive.infolist()[0]).read()
+
+
+# --- a member that starts on another disk is refused even when the end records say one disk -------------------
+
+
+def _set_central_field(path: Path, offset: int, fmt: str, value: int) -> None:
+    data = bytearray(path.read_bytes())
+    position = data.find(b"PK\x01\x02")
+    while position != -1:
+        struct.pack_into(fmt, data, position + offset, value)
+        position = data.find(b"PK\x01\x02", position + 4)
+    path.write_bytes(bytes(data))
+
+
+@pytest.mark.parametrize("disk", [1, 2, 0xFFFF])
+def test_a_member_whose_start_disk_is_not_zero_is_refused(tmp_path, disk) -> None:
+    path = _write_zip(tmp_path / "b.zip", PAYLOAD)
+    _set_central_field(path, 34, "<H", disk)  # only the member's start-disk field; the end records stay at zero
+    with zipfile.ZipFile(path) as archive:
+        assert {info.volume for info in archive.infolist()} == {disk}
+    report = verify_bundle(path)
+    assert not report.ok
+    assert [(item.code, item.detail) for item in report.findings] == [(pv.ARCHIVE_FRAMING, "member starts on another disk")]
+
+
+def test_one_member_on_another_disk_is_enough(tmp_path) -> None:
+    path = _write_zip(tmp_path / "b.zip", PAYLOAD)
+    data = bytearray(path.read_bytes())
+    struct.pack_into("<H", data, data.rindex(b"PK\x01\x02") + 34, 1)  # the last record only
+    path.write_bytes(bytes(data))
+    assert not verify_bundle(path).ok
+
+
+@pytest.mark.parametrize(("offset", "fmt", "value"), [(36, "<H", 1), (36, "<H", 0xFFFF), (4, "<H", 0x0A63)])
+def test_member_fields_that_no_reader_acts_on_still_verify(tmp_path, offset, fmt, value) -> None:
+    path = _write_zip(tmp_path / "b.zip", PAYLOAD)
+    _set_central_field(path, offset, fmt, value)  # internal attributes; version made by
+    assert verify_bundle(path).ok

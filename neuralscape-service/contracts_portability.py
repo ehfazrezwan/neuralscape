@@ -244,6 +244,7 @@ def _is_mapping(value: object) -> bool:
 
 def _native_declared_field_names(
     model_type: type[BaseModel],
+    budget: DiscoveryBudget | None = None,
 ) -> tuple[str, ...] | None:
     """Return ordered declared field names from raw class storage, or ``None``.
 
@@ -262,6 +263,10 @@ def _native_declared_field_names(
         fields = raw["__pydantic_fields__"]
         if not issubclass(type(fields), dict):
             return None
+        # Every use of the names (this copy, the type scan, and the per-instance scans of the caller) costs
+        # the class's field count for each instance it is made for, so that count is charged first.
+        if budget is not None:  # every call made for an instance of a graph passes the graph's budget
+            budget.charge_edge(dict.__len__(fields))
         names = tuple(dict.keys(fields))
         if any(type(name) is not str for name in names):
             return None
@@ -272,10 +277,11 @@ def _native_declared_field_names(
 def _model_discovery_values(
     model_type: type[BaseModel],
     stored_entries: _ModelStorageEntries,
+    budget: DiscoveryBudget | None = None,
 ) -> tuple[Any, ...]:
     """Select stored values needing callback-free graph discovery."""
 
-    declared = _native_declared_field_names(model_type)
+    declared = _native_declared_field_names(model_type, budget)
     if declared is None:
         return tuple(item for _, item in reversed(stored_entries))
     declared_names = frozenset(declared)
@@ -428,7 +434,7 @@ def _reject_retained_unknown_fields(
                 # remain conservative candidates for later hash authority.
                 pending.extend(
                     (item, child_depth)
-                    for item in _model_discovery_values(value_type, stored_entries)
+                    for item in _model_discovery_values(value_type, stored_entries, budget)
                 )
                 continue
 
@@ -487,7 +493,7 @@ def _reject_retained_unknown_fields(
             discover(value, len(location))
 
         if _inherits(value, BaseModel):
-            declared = _native_declared_field_names(type(value))
+            declared = _native_declared_field_names(type(value), budget)
             if declared is None:
                 raise ValueError("contract model field storage is unavailable")
             stored_entries, fields_set_storage, extra_snapshot = (

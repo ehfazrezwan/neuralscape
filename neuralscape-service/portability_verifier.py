@@ -341,6 +341,10 @@ def _local_record_end(raw: BinaryIO, info: zipfile.ZipInfo, start_dir: int) -> i
     )
     if signature != _LOCAL_SIGNATURE:
         raise _Framing("bad local header signature")
+    if info.volume != 0:
+        # The end records say one disk; a member whose own start-disk field says otherwise is expected
+        # elsewhere by every reader that honours the field.
+        raise _Framing("member starts on another disk")
     name = raw.read(name_length)
     extra = raw.read(extra_length)
     if len(name) != name_length or len(extra) != extra_length:
