@@ -1379,3 +1379,181 @@ def test_a_property_or_literal_named_like_the_cycle_marker_still_compares_clean(
     new = copy.deepcopy(old)
     new["$defs"]["Unused"] = {"type": "string"}  # the definitions differ, so the comparison expands references
     assert _pair(old, new) == []
+
+
+# ---- equality across a reference compares what it points at, in its own document
+
+
+def _pointer_schema(n_siblings: dict, x: dict, **extra_properties: dict) -> dict:
+    return {
+        "type": "object",
+        "properties": {"n": {"type": "string", **n_siblings}, "x": x, **extra_properties},
+    }
+
+
+def test_an_unchanged_local_pointer_to_a_changed_target_is_reported() -> None:
+    old = _pointer_schema({"maxLength": 1}, {"not": {"$ref": "#/properties/n"}})
+    new = _pointer_schema({}, {"not": {"$ref": "#/properties/n"}})  # {"n": "a", "x": "long"} is now rejected
+    assert any(f.startswith("$.x:") for f in _pair(old, new)), _pair(old, new)
+
+
+def test_a_local_pointer_whose_target_is_unchanged_compares_clean() -> None:
+    old = _pointer_schema({"maxLength": 1}, {"not": {"$ref": "#/properties/n"}})
+    new = _pointer_schema({"maxLength": 1}, {"not": {"$ref": "#/properties/n"}}, y={})
+    assert _pair(old, new) == []  # an optional property added elsewhere; the pointer's target is the same
+
+
+def test_a_reference_written_as_data_is_still_compared_as_data() -> None:
+    old = _pointer_schema({"maxLength": 1}, {"not": {"const": {"$ref": "#/properties/n"}}})
+    new = _pointer_schema({}, {"not": {"const": {"$ref": "#/properties/n"}}})
+    assert _pair(old, new) == []  # the literal object is unchanged, whatever n says
+
+
+def test_a_local_pointer_that_resolves_nowhere_is_not_shown_equal() -> None:
+    old = _pointer_schema({"maxLength": 1}, {"not": {"$ref": "#/properties/missing"}})
+    new = _pointer_schema({}, {"not": {"$ref": "#/properties/missing"}})
+    assert any(f.startswith("$.x:") for f in _pair(old, new))
+
+
+def test_an_unchanged_anchor_reference_to_a_changed_target_is_reported() -> None:
+    old = _pointer_schema({"maxLength": 1, "$anchor": "short"}, {"not": {"$ref": "#short"}})
+    new = _pointer_schema({"$anchor": "short"}, {"not": {"$ref": "#short"}})
+    assert any(f.startswith("$.x:") for f in _pair(old, new))
+
+
+def test_a_pointer_that_reaches_itself_is_cut_and_bounded() -> None:
+    old = _pointer_schema({"maxLength": 1}, {"not": {"properties": {"again": {"$ref": "#/properties/x"}}}})
+    new = _pointer_schema({}, {"not": {"properties": {"again": {"$ref": "#/properties/x"}}}})
+    assert _pair(old, new) == []  # the pointer's target (x itself) is unchanged; n is not under it
+    changed = copy.deepcopy(new)
+    changed["properties"]["x"]["not"]["minProperties"] = 1
+    assert any(f.startswith("$.x:") for f in _pair(old, changed))
+
+
+# ---- an embedded resource ($id) resolves its own references
+
+
+def _embedded(inner_name: dict, *, under_not: bool = False, **extra_properties: dict) -> dict:
+    inner = {
+        "$id": "https://example.com/inner",
+        "$defs": {"Name": inner_name},
+        "type": "object",
+        "properties": {"x": {"$ref": "#/$defs/Name"}},
+    }
+    return {
+        "$defs": {"Name": {"type": "string"}},
+        "type": "object",
+        "properties": {"inner": {"not": inner} if under_not else inner, **extra_properties},
+    }
+
+
+def test_a_changed_definition_inside_an_embedded_resource_is_reported() -> None:
+    old = _embedded({"type": "string"})
+    new = _embedded({"type": "integer"})  # {"inner": {"x": "text"}} is now rejected
+    assert any(f.startswith("$.inner") for f in _pair(old, new)), _pair(old, new)
+
+
+def test_a_changed_embedded_resource_under_an_equality_keyword_is_reported() -> None:
+    assert _pair(_embedded({"type": "integer"}, under_not=True), _embedded({"type": "string"}, under_not=True)) != []
+
+
+def test_an_unchanged_embedded_resource_compares_clean() -> None:
+    assert _pair(_embedded({"type": "string"}), _embedded({"type": "string"}, y={})) == []
+    assert _pair(_embedded({"type": "string"}, under_not=True), _embedded({"type": "string"}, under_not=True)) == []
+
+
+# ---- absence is not a JSON value
+
+
+def test_an_added_keyword_whose_value_looks_like_the_absence_marker_is_reported() -> None:
+    findings = _pair({"type": "string"}, {"type": "string", "not": {"$absent": True}})  # now rejects every string
+    assert findings and all("not changed" in f for f in findings), findings
+
+
+def test_an_unchanged_unmodelled_keyword_still_compares_clean() -> None:
+    schema = {"type": "string", "not": {"$absent": True}}
+    assert _pair(schema, copy.deepcopy(schema)) == []
+    assert _pair({"type": "string", "not": {"const": "a"}}, {"type": "string", "not": {"const": "a"}, "title": "t"}) == []
+
+
+# ---- the documents are read once, as plain JSON: nothing the caller passed answers for them later
+
+
+class _LyingRef(str):
+    """Reads as a reference to an unchanged definition through its methods; is "#/properties/n" as text."""
+
+    def startswith(self, prefix, *args):  # type: ignore[override]
+        return True
+
+    def removeprefix(self, prefix):  # type: ignore[override]
+        return "Name"
+
+
+def test_a_string_subclass_cannot_answer_for_a_reference() -> None:
+    def schema(n: dict) -> dict:
+        document = _pointer_schema(n, {"not": {"$ref": _LyingRef("#/properties/n")}})
+        return {**document, "$defs": {"Name": {"type": "string"}}}
+
+    assert any(f.startswith("$.x:") for f in _pair(schema({"maxLength": 1}), schema({})))
+
+
+def test_a_mapping_subclass_cannot_hide_a_keyword() -> None:
+    class Hiding(dict):
+        def get(self, key, default=None):
+            return default if key == "maxLength" else super().get(key, default)
+
+        def __contains__(self, key):
+            return key != "maxLength" and super().__contains__(key)
+
+    old = {"type": "object", "properties": {"n": {"type": "string"}}}
+    new = {"type": "object", "properties": {"n": Hiding({"type": "string", "maxLength": 1})}}
+    assert _pair(old, new) == ["$.n: maxLength lowered"]
+
+
+def test_a_sequence_subclass_is_read_natively() -> None:
+    class Short(list):
+        def __iter__(self):
+            return iter(["a"])
+
+    assert _pair({"type": "object"}, {"type": "object", "required": Short(["a", "b"])}) == [
+        "$.a: now required", "$.b: now required",
+    ]
+    assert _pair({"type": "object", "required": ("a",)}, {"type": "object", "required": ["a"]}) == []  # a tuple is an array
+
+
+def test_values_that_are_not_json_are_refused_closed() -> None:
+    class Impostor:
+        __class__ = dict  # type: ignore[assignment]
+
+        def get(self, key, default=None):
+            return default
+
+    cyclic: dict = {"type": "object", "properties": {}}
+    cyclic["properties"]["self"] = cyclic
+    base = {"type": "object", "properties": {"n": {"type": "string"}}}
+    for new in (
+        {"type": "object", "properties": {"n": Impostor()}},
+        cyclic,
+        {"type": "object", "properties": {1: {}}},
+    ):
+        findings = _pair(base, new)
+        assert len(findings) == 1 and "not plain JSON" in findings[0], findings
+
+
+def test_a_shared_node_is_read_once_and_stays_bounded(monkeypatch) -> None:
+    calls = _bounded_comparisons(monkeypatch)
+    node: dict = {"type": "string"}
+    for _ in range(60):
+        node = {"anyOf": [node, node]}  # 2**60 paths through 61 distinct nodes
+    assert _pair({"properties": {"a": node}}, {"properties": {"a": node}}) == []
+    assert calls["count"] < 1000, calls
+
+
+def test_compare_schemas_reads_the_sets_natively() -> None:
+    class Hiding(dict):
+        def items(self):
+            return [item for item in super().items() if item[0] != "B"]
+
+    schema = {"type": "object"}
+    assert pack.compare_schemas(Hiding({"A": schema, "B": schema}), {"A": schema}) == {"B": ["contract removed"]}
+    assert pack.compare_schemas({"A": schema}, {"A": schema}) == {}

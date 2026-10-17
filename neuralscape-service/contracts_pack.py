@@ -26,7 +26,9 @@ anything else (``oneOf`` alternatives that are not equivalent, constraints writt
 beside any ``$ref`` (a ``#/$defs`` one, ``#`` or a recursive one) unless identical on both
 sides, ``not``, ``if``/``then``/``else``, ``allOf``, ``patternProperties``,
 ``dependent*``, ``unevaluated*``, ``format``, ``discriminator``, a reference that is
-not a plain ``#/$defs`` one, and so on) is reported as an *unverified change*, with the
+not a plain ``#/$defs`` one, an embedded resource (an inner ``$id``, whose references
+resolve against itself) that is not left exactly as it was, and so on) is reported as an
+*unverified change*, with the
 same standing as a narrowing (``enum`` and ``const`` values are compared as JSON values, so
 ``true`` is not ``1``): it needs an explicit contract version bump or a reviewer
 waiver, because the checker cannot show that no previously valid document is rejected.
@@ -219,10 +221,71 @@ _LITERAL_KEYWORDS = frozenset({"const", "enum", "examples", "default"})
 _SCHEMA_MAPS = frozenset({"properties", "patternProperties", "$defs", "definitions", "dependentSchemas"})
 
 
+def _def_name(ref: object, defs: dict) -> str | None:
+    """The definition a ``#/$defs/<name>`` reference names, when ``defs`` has it (else ``None``)."""
+
+    if isinstance(ref, str) and ref.startswith("#/$defs/"):
+        name = ref.removeprefix("#/$defs/")
+        if name in defs:
+            return name
+    return None
+
+
+# Keywords that refer to another schema by something other than ``$ref`` (resolved at validation time).
+_DYNAMIC_REFERENCES = frozenset({"$dynamicRef", "$recursiveRef"})
+
+
+def _pointer_target(root: object, ref: str) -> object:
+    """The node a local JSON pointer (``#`` or ``#/a/b``) names in ``root``; anything else cannot be resolved."""
+
+    if root is None or not ref.startswith("#") or (ref != "#" and not ref.startswith("#/")) or "%" in ref:
+        raise _TooLarge  # an anchor, another document or an encoded pointer: not resolved, so not shown equal
+    node = root
+    for token in ref[2:].split("/") if ref != "#" else ():
+        token = token.replace("~1", "/").replace("~0", "~")
+        if isinstance(node, dict) and token in node:
+            node = node[token]
+        elif isinstance(node, list) and token.isdigit() and (token == "0" or not token.startswith("0")) and int(token) < len(node):
+            node = node[int(token)]
+        else:
+            raise _TooLarge  # it resolves nowhere
+    return node
+
+
+def _self_contained(value: object, budget: list[int]) -> object:
+    """An embedded resource (``$id``) as written: its fragment references resolve inside it, so equal text is
+    the same schema; a reference out of it (by URI) or a dynamic one is not resolved here."""
+
+    stack = [value]
+    while stack:
+        node = stack.pop()
+        budget[0] -= 1
+        if budget[0] < 0:
+            raise _TooLarge
+        if isinstance(node, dict):
+            ref = node.get("$ref")
+            if (ref is not None and not (isinstance(ref, str) and ref.startswith("#"))) or _DYNAMIC_REFERENCES & node.keys():
+                raise _TooLarge
+            stack.extend(node.values())
+        elif isinstance(node, list):
+            stack.extend(node)
+    return value
+
+
 def _inline(
-    value: object, defs: dict, stack: tuple[str, ...] = (), budget: list[int] | None = None, named: bool = False
+    value: object,
+    defs: dict,
+    stack: tuple[str, ...] = (),
+    budget: list[int] | None = None,
+    named: bool = False,
+    root: object = None,
 ) -> object:
-    """``value`` with every ``#/$defs`` reference expanded (a cycle becomes a marker), so equality sees through refs.
+    """``value`` with every reference expanded (a cycle becomes a marker), so equality sees through refs.
+
+    A ``#/$defs`` reference expands to its definition; any other local pointer (``#``, ``#/properties/n``)
+    to the node it names in ``root``, the document it is written in.  An anchor, a reference to another
+    document or a dynamic reference cannot be expanded, so the value is never shown equal.  An embedded
+    resource (an inner ``$id``) is kept as written: its own references resolve inside it.
 
     Literal keywords (``const``, ``enum``, ``examples``, ``default``) are copied as written: a reference
     object there is data, and expanding it would make two different literals look equal.  ``named`` is set
@@ -235,13 +298,17 @@ def _inline(
     if budget[0] < 0:
         raise _TooLarge
     if isinstance(value, list):
-        return [_inline(item, defs, stack, budget) for item in value]
+        return [_inline(item, defs, stack, budget, root=root) for item in value]
     if not isinstance(value, dict):
         return value
     if named:
-        return {key: _inline(item, defs, stack, budget) for key, item in value.items()}
+        return {key: _inline(item, defs, stack, budget, root=root) for key, item in value.items()}
     if "$cycle" in value:
         raise _TooLarge  # written in the schema, it could pass for a cut cycle: not shown equal
+    if _DYNAMIC_REFERENCES & value.keys():
+        raise _TooLarge  # resolved at validation time: not shown equal
+    if "$id" in value and value is not root:
+        return _self_contained(value, budget)
 
     def inline_members(members: dict) -> dict:
         out = {}
@@ -249,21 +316,25 @@ def _inline(
             if key in _LITERAL_KEYWORDS:
                 out[key] = item
             elif key in _SCHEMA_MAPS and isinstance(item, dict):
-                out[key] = _inline(item, defs, stack, budget, named=True)
+                out[key] = _inline(item, defs, stack, budget, named=True, root=root)
             else:
-                out[key] = _inline(item, defs, stack, budget)
+                out[key] = _inline(item, defs, stack, budget, root=root)
         return out
 
-    ref = value.get("$ref")
-    if isinstance(ref, str) and ref.startswith("#/$defs/"):
-        name = ref.removeprefix("#/$defs/")
-        if name in stack:
-            # The cycle is cut here, but what is written beside the reference still constrains.
-            return {"$cycle": name, **inline_members({key: item for key, item in value.items() if key != "$ref"})}
-        if name in defs:
-            rest = inline_members({key: item for key, item in value.items() if key != "$ref"})
-            return {"$ref": _inline(defs[name], defs, stack + (name,), budget), **rest}
-    return inline_members(value)
+    if "$ref" not in value:
+        return inline_members(value)
+    ref = value["$ref"]
+    name = _def_name(ref, defs)
+    if name is None:
+        if not isinstance(ref, str):
+            raise _TooLarge  # not a reference anyone can resolve: not shown equal
+        name = "\0" + ref  # a pointer, kept apart from definition names
+    # What is written beside the reference still constrains, at a cut cycle too.
+    rest = inline_members({key: item for key, item in value.items() if key != "$ref"})
+    if name in stack:
+        return {"$cycle": name, **rest}
+    target = defs[name] if not name.startswith("\0") else _pointer_target(root, ref)
+    return {"$ref": _inline(target, defs, stack + (name,), budget, root=root), **rest}
 
 
 _REPR = reprlib.Repr()
@@ -436,43 +507,61 @@ def _defs_equal(old_defs: dict, new_defs: dict) -> bool:
     return cached
 
 
-def _mentions_root(value: object, defs: dict, seen: set[str] | None = None, budget: list[int] | None = None) -> bool:
-    """Whether ``value`` contains a ``{"$ref": "#"}``, directly or through the definitions it references."""
+def _depends_on_document(value: object, defs: dict, seen: set | None = None, budget: list[int] | None = None) -> bool:
+    """Whether ``value`` contains a reference other than to a definition (``#``, another local pointer, an
+    anchor, another document, a dynamic one), directly or through the definitions it references: the
+    same text then means the same schema only in the same document."""
 
     seen = set() if seen is None else seen
     budget = [_INLINE_BUDGET] if budget is None else budget
     budget[0] -= 1
     if budget[0] < 0:
         return True  # too large to tell: assume it does
-    if isinstance(value, list):
-        return any(_mentions_root(item, defs, seen, budget) for item in value)
-    if not isinstance(value, dict):
+    if not isinstance(value, (list, dict)):
         return False
-    ref = value.get("$ref")
-    if ref == "#":
+    if id(value) in seen:
+        return False  # a node shared by several parents (alive for the whole call): it did not, or we stopped
+    seen.add(id(value))
+    if isinstance(value, list):
+        return any(_depends_on_document(item, defs, seen, budget) for item in value)
+    if _DYNAMIC_REFERENCES & value.keys():
         return True
-    if isinstance(ref, str) and ref.startswith("#/$defs/"):
-        name = ref.removeprefix("#/$defs/")
-        if name not in seen and name in defs:
+    if "$ref" in value:
+        name = _def_name(value["$ref"], defs)
+        if name is None:
+            return True
+        if name not in seen:
             seen.add(name)
-            if _mentions_root(defs[name], defs, seen, budget):
+            if _depends_on_document(defs[name], defs, seen, budget):
                 return True
-    return any(_mentions_root(item, defs, seen, budget) for key, item in value.items() if key != "$ref")
+    return any(_depends_on_document(item, defs, seen, budget) for key, item in value.items() if key != "$ref")
 
 
-def _scan_root_references(run: _Run) -> bool:
-    """Whether either document being compared contains a ``{"$ref": "#"}`` at all (walked once per run)."""
+def _plain_definition_reference(ref: object) -> bool:
+    return isinstance(ref, str) and ref.startswith("#/$defs/") and not {"/", "~", "%"} & set(ref[8:])
+
+
+def _scan_document_references(run: _Run) -> bool:
+    """Whether either document being compared contains a reference other than a plain ``#/$defs`` one at
+    all (walked once per run)."""
 
     found = False
     budget = _INLINE_BUDGET * 50
     stack = list(run.roots or ())
+    visited: set[int] = set()  # the documents stay alive for the run, so a node's id is its own
     while stack and not found:
         node = stack.pop()
+        if isinstance(node, (dict, list)):
+            if id(node) in visited:
+                continue
+            visited.add(id(node))
         budget -= 1
         if budget < 0:
             found = True  # too large to tell: assume it does
         elif isinstance(node, dict):
-            found = node.get("$ref") == "#"
+            found = ("$ref" in node and not _plain_definition_reference(node["$ref"])) or bool(
+                _DYNAMIC_REFERENCES & node.keys()
+            )
             stack.extend(node.values())
         elif isinstance(node, list):
             stack.extend(node)
@@ -490,23 +579,28 @@ def _roots_equal() -> bool:
 
 
 def _same(old: object, new: object, old_defs: dict, new_defs: dict) -> bool:
-    # A ``#`` inside either side points at that side's own root, which the values do not carry: the same
-    # text means the same schema only if the roots are the same too.
+    if old is _ABSENT or new is _ABSENT:
+        return old is new  # absence equals no JSON value
+    # A pointer inside either side (``#``, ``#/properties/n``) points into that side's own document, which
+    # the values do not carry: the same text means the same schema only if the documents are the same too.
     run = _RUN.get()
+    dependent = False
     # (inline, not a helper call: this runs at the deepest point of a recursive comparison)
-    if run is None or run.roots is None or (run.any_root if run.any_root is not None else _scan_root_references(run)):
+    if run is None or run.roots is None or (run.any_root if run.any_root is not None else _scan_document_references(run)):
         try:
-            rooted = _mentions_root(old, old_defs) or _mentions_root(new, new_defs)
+            dependent = _depends_on_document(old, old_defs) or _depends_on_document(new, new_defs)
         except RecursionError:
-            rooted = True  # too deep to tell: assume it does
-        if rooted and not _roots_equal():
-            return False
-    if _json_equal(old, new) and _defs_equal(old_defs, new_defs):
-        return True  # the same text under the same definitions
+            dependent = True  # too deep to tell: assume it does
+    if _json_equal(old, new) and (_roots_equal() if dependent else _defs_equal(old_defs, new_defs)):
+        return True  # the same text under the same definitions (in the same document, when it points into it)
+    old_root = new_root = None
+    if run is not None and run.roots is not None:
+        old_root, new_root = run.roots[::-1] if run.reversed else run.roots
     try:
-        return _json_equal(_inline(old, old_defs), _inline(new, new_defs))
+        # Otherwise compare what each side points at, each in its own document.
+        return _json_equal(_inline(old, old_defs, root=old_root), _inline(new, new_defs, root=new_root))
     except (_TooLarge, RecursionError):
-        return False  # too large or too deep to compare: not shown equal
+        return False  # too large, too deep or not resolvable: not shown equal
 
 
 def _beside(schema: dict) -> dict:
@@ -569,7 +663,7 @@ def _multiple_of_narrowed(old_step: object, new_step: object) -> bool:
         return True
 
 
-_ABSENT = {"$absent": True}
+_ABSENT = object()  # a keyword missing on one side: equal to no JSON value, compared by identity
 
 
 def _alternatives_equivalent(
@@ -648,6 +742,19 @@ def _compare(
         new, root_new_beside = _resolve(new_root, new_defs)
         if (root_old_beside or root_new_beside) and not _same(root_old_beside, root_new_beside, old_defs, new_defs):
             out.append(_unverified(path, "constraints beside a $ref changed"))
+    if isinstance(old, dict) and isinstance(new, dict) and ("$id" in old or "$id" in new):
+        run = _RUN.get()
+        roots = (run.roots[::-1] if run.reversed else run.roots) if run is not None and run.roots else (None, None)
+        if old is not roots[0] or new is not roots[1]:
+            # An embedded resource resolves its references against itself, which is not modelled: only one
+            # left exactly as it was (and referring to nothing outside it) is shown compatible.
+            try:
+                unchanged = _json_equal(old, new) and _self_contained(old, [_INLINE_BUDGET]) is old
+            except _TooLarge:
+                unchanged = False
+            if not unchanged:
+                out.append(_unverified(path, "an embedded resource ($id) changed"))
+            return
     if not isinstance(old, dict) or not isinstance(new, dict):
         if not _json_equal(old, new):
             out.append(f"{path}: schema changed shape")
@@ -854,6 +961,87 @@ def _compare_keywords(
         _compare(unconstrained, new_prefix[index], old_defs, new_defs, f"{path}[{index}]", out, depth + 1, active)
 
 
+_MAX_NATIVE_NODES = 1_000_000
+
+
+class _NotJson(Exception):
+    pass
+
+
+def _native_json(value: object) -> object:
+    """An exact-native copy of a JSON document, read once.
+
+    Types are decided by the value's own class hierarchy, never by ``isinstance`` (which a spoofed
+    ``__class__`` answers); strings and numbers are copied through their base type, and mappings and
+    sequences are read natively, so an override (``startswith``, ``get``, ``items``) can never answer for
+    the document.  A node shared by several parents is copied once (and stays shared); a cycle, a key that is
+    not a string, any other type or more than ``_MAX_NATIVE_NODES`` nodes is not JSON.
+    """
+
+    memo: dict[int, object] = {}
+    keep: list[object] = []  # every node whose id is in ``memo`` stays alive, so no id is reused meanwhile
+    open_ids: set[int] = set()
+    count = 0
+
+    def convert(item: object) -> tuple[object, tuple | None]:
+        nonlocal count
+        count += 1
+        if count > _MAX_NATIVE_NODES:
+            raise _NotJson("too many nodes")
+        if item is None or item is True or item is False:
+            return item, None
+        mro = type(item).__mro__
+        if str in mro:
+            return str.__str__(item), None
+        if float in mro:
+            return float.__float__(item), None
+        if int in mro:
+            return int.__int__(item), None
+        key = id(item)
+        if key in open_ids:
+            raise _NotJson("a cycle")
+        if key in memo:
+            return memo[key], None
+        if dict in mro:
+            children = []
+            for name, child in list(dict.items(item)):
+                if str not in type(name).__mro__:
+                    raise _NotJson("a key that is not a string")
+                children.append((str.__str__(name), child))
+            shell: object = {}
+        elif list in mro or tuple in mro:
+            sequence = list.__getitem__(item, slice(None)) if list in mro else tuple.__getitem__(item, slice(None))
+            children = [(None, child) for child in sequence]
+            shell = []
+        else:
+            raise _NotJson(f"a {type(item).__name__} value")
+        memo[key] = shell
+        keep.append(item)
+        open_ids.add(key)
+        return shell, (key, shell, iter(children))
+
+    root, pending = convert(value)
+    stack = [pending] if pending is not None else []
+    while stack:
+        key, shell, children = stack[-1]
+        step = next(children, None)
+        if step is None:
+            open_ids.discard(key)
+            stack.pop()
+            continue
+        native, sub = convert(step[1])
+        if type(shell) is dict:
+            shell[step[0]] = native
+        else:
+            shell.append(native)
+        if sub is not None:
+            stack.append(sub)
+    return root
+
+
+_NOT_JSON = (_NotJson, TypeError, ValueError, OverflowError, RecursionError)
+
+
 def _version_number(version: object) -> tuple[str, int] | None:
     match = re.fullmatch(r"(.*?)(\d+)", version) if isinstance(version, str) else None
     return (match.group(1), int(match.group(2))) if match else None
@@ -891,6 +1079,10 @@ def check_compatibility(old: dict, new: dict) -> list[str]:
     the module docstring is reported as an unverified change, never accepted silently.
     """
 
+    try:
+        old, new = _native_json(old), _native_json(new)  # read once: nothing the caller passed answers later
+    except _NOT_JSON:
+        return [_unverified("$", "a schema that is not plain JSON")]
     old_version = _declared_version(old)
     new_version = _declared_version(new)
     if old_version is not None and new_version is not None and _is_version_bump(old_version, new_version):
@@ -916,6 +1108,12 @@ def check_compatibility(old: dict, new: dict) -> list[str]:
 def compare_schemas(old: dict[str, dict], new: dict[str, dict]) -> dict[str, list[str]]:
     """Compare two exported schema sets; a removed contract is a breaking change."""
 
+    try:
+        old, new = _native_json(old), _native_json(new)
+    except _NOT_JSON:
+        return {"$": [_unverified("$", "schema sets that are not plain JSON")]}
+    if type(old) is not dict or type(new) is not dict:
+        return {"$": [_unverified("$", "schema sets that are not JSON objects")]}
     report: dict[str, list[str]] = {}
     for name, old_schema in old.items():
         if name not in new:
