@@ -166,7 +166,7 @@ _MAPPING_BASES = (Mapping, dict, MappingProxyType)
 # Key types whose hashing and equality run no caller code.  A ``str`` subclass is read as its
 # text instead; any other key type can run a hook while a dict is rebuilt, so a subtree that
 # holds one is never reused (see ``_snapshot_captured_graph``).
-_KEY_HASH_BITS_PER_EDGE = 14  # an integer key is charged one edge per 16 Kibit (2 KiB) it holds
+_KEY_HASH_BITS_PER_EDGE = 14  # an integer is charged one edge per 16 Kibit (2 KiB) it holds
 _PLAIN_KEY_TYPES = (str, int, float, bool, type(None), bytes)
 
 
@@ -192,6 +192,34 @@ def _is_subclass(cls: type, types: type | tuple[type, ...]) -> bool:
             if base is candidate:
                 return True
     return False
+
+
+def _charge_key_hash(key: object, budget: DiscoveryBudget) -> None:
+    """Charge the hash a dictionary pays for ``key`` when it is rebuilt, in proportion to what hashing reads.
+
+    An ``int`` (exact or a subclass) is charged one edge per 2 KiB it holds; a ``tuple`` (exact or a subclass) one
+    edge per entry, counted along every path through it, with each integer in it charged the same way, because
+    neither type remembers its hash and a shared inner tuple is hashed once per path.  Only native readers are
+    used (``int.bit_length``, ``tuple.__iter__``), so no hook of the key runs, and every step is charged, so
+    the walk stops at the budget however the tuple is shared.  Other keys (``str`` and ``bytes`` remember their
+    hash) cost nothing extra.
+    """
+
+    kind = type(key)
+    if _is_subclass(kind, int):
+        budget.charge_edge(int.bit_length(key) >> _KEY_HASH_BITS_PER_EDGE)  # type: ignore[call-overload]
+        return
+    if not _is_subclass(kind, tuple):
+        return
+    pending = [key]
+    while pending:
+        for part in tuple.__iter__(pending.pop()):  # type: ignore[call-overload]
+            budget.charge_edge()
+            part_type = type(part)
+            if _is_subclass(part_type, int):
+                budget.charge_edge(int.bit_length(part) >> _KEY_HASH_BITS_PER_EDGE)  # type: ignore[call-overload]
+            elif _is_subclass(part_type, tuple):
+                pending.append(part)
 
 
 def _plain_keys(
@@ -229,8 +257,7 @@ def _plain_keys(
                     key = text
             else:
                 pure = False
-        elif type(key) is int:
-            inventory.budget.charge_edge(key.bit_length() >> _KEY_HASH_BITS_PER_EDGE)
+        _charge_key_hash(key, inventory.budget)
         if type(key) is str:
             if key in texts:
                 colliding = True
@@ -892,9 +919,12 @@ def _snapshot_captured_graph(
                 lookup = _field_names(declared)
             else:
                 item_models = declared_children = lookup = {}
+            impure = value_id not in inventory.pure_dictionaries
             for key, item in inventory.dictionaries[value_id]:
                 if again:
                     budget.charge_edge()
+                if impure:
+                    _charge_key_hash(key, budget)  # an impure dictionary is rebuilt, and its keys hashed, on every path
                 field_name = lookup.get(key) if lookup and type(key) is str else None
                 rebuilt[key] = _snapshot_captured_graph(
                     item, active_containers, inventory, below,

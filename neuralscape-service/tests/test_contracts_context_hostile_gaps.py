@@ -2022,3 +2022,51 @@ def test_a_huge_integer_key_is_charged_for_the_hash_it_costs_in_every_dictionary
     with pytest.raises(ValueError, match=re.escape(DISCOVERY_BUDGET_MESSAGE)):
         snapshot_contract_graph([{huge: 1} for _ in range(4_000)])  # 4,000 hashes of a megabit: refused
     assert len(snapshot_contract_graph([{i: 1} for i in range(4_000)])) == 4_000  # small keys cost nothing extra
+
+
+class _IntKey(int):
+    pass
+
+
+def test_an_integer_subclass_key_is_charged_for_its_hash_like_an_exact_integer() -> None:
+    from contracts_common import snapshot_contract_graph
+    from contracts_limits import DISCOVERY_BUDGET_MESSAGE
+
+    huge = _IntKey(1 << (1 << 20))  # hashing it reads all of it, once per dictionary that rebuilds it
+    snapshot_contract_graph([{huge: 1} for _ in range(100)])
+    with pytest.raises(ValueError, match=re.escape(DISCOVERY_BUDGET_MESSAGE)):
+        snapshot_contract_graph([{huge: 1} for _ in range(4_000)])
+    snapshot_contract_graph([{_IntKey(i): 1} for i in range(4_000)])  # small subclass keys cost nothing extra
+
+
+def test_a_large_tuple_key_is_charged_for_its_hash_in_every_dictionary() -> None:
+    from contracts_common import snapshot_contract_graph
+    from contracts_limits import DISCOVERY_BUDGET_MESSAGE
+
+    key = tuple(range(50_000))  # a tuple's hash is not remembered: every dictionary hashes all 50,000 entries again
+    snapshot_contract_graph([{key: 1}])
+    with pytest.raises(ValueError, match=re.escape(DISCOVERY_BUDGET_MESSAGE)):
+        snapshot_contract_graph([{key: 1} for _ in range(8)])
+    snapshot_contract_graph([{(i, i + 1): 1} for i in range(4_000)])  # small tuple keys cost almost nothing extra
+
+
+def test_a_shared_nested_tuple_key_is_charged_per_path_not_hashed_exponentially() -> None:
+    from contracts_common import snapshot_contract_graph
+    from contracts_limits import DISCOVERY_BUDGET_MESSAGE
+
+    key: tuple = (1,)
+    for _ in range(20):
+        key = (key, key)  # two paths per level: 2**20 paths to hash from 21 objects
+    with pytest.raises(ValueError, match=re.escape(DISCOVERY_BUDGET_MESSAGE)):
+        snapshot_contract_graph({key: 1})
+
+
+def test_an_impure_dictionary_reached_by_many_paths_pays_for_its_key_each_time_it_is_rebuilt() -> None:
+    from contracts_common import snapshot_contract_graph
+    from contracts_limits import DISCOVERY_BUDGET_MESSAGE
+
+    huge = _IntKey(1 << (1 << 20))
+    shared = {huge: 1}  # impure (an int subclass key): rebuilt and hashed again on every path that reaches it
+    snapshot_contract_graph([shared] * 20)
+    with pytest.raises(ValueError, match=re.escape(DISCOVERY_BUDGET_MESSAGE)):
+        snapshot_contract_graph([shared] * 4_000)
