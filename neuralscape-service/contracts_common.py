@@ -166,6 +166,7 @@ _MAPPING_BASES = (Mapping, dict, MappingProxyType)
 # Key types whose hashing and equality run no caller code.  A ``str`` subclass is read as its
 # text instead; any other key type can run a hook while a dict is rebuilt, so a subtree that
 # holds one is never reused (see ``_snapshot_captured_graph``).
+_KEY_HASH_BITS_PER_EDGE = 14  # an integer key is charged one edge per 16 Kibit (2 KiB) it holds
 _PLAIN_KEY_TYPES = (str, int, float, bool, type(None), bytes)
 
 
@@ -195,6 +196,7 @@ def _is_subclass(cls: type, types: type | tuple[type, ...]) -> bool:
 
 def _plain_keys(
     entries: tuple[tuple[object, object], ...],
+    inventory: "_GraphInventory",
 ) -> tuple[tuple[tuple[object, object], ...], bool, bool]:
     """Read ``str``-subclass keys as their text, without running their hooks.
 
@@ -204,6 +206,11 @@ def _plain_keys(
     which runs its code).  ``colliding`` is set when two keys share one text; the entries keep
     both, and the caller refuses them where its established diagnostics expect it (a plain dict
     when it is rebuilt, model names after their fields, extras through the duplicate-key check).
+
+    The work here follows the size of what is read, so it is charged that way: one key object shared by many
+    dictionaries is read as text once per call (``inventory.key_texts``, holding the key), not copied once per
+    dictionary, and an integer key is charged for the hash that rebuilding every dictionary that holds it will
+    cost (an integer is not hashed once and remembered), in proportion to its size.
     """
 
     plain: list[tuple[object, object]] = []
@@ -213,9 +220,17 @@ def _plain_keys(
     for key, item in entries:
         if not is_exact_type(key, *_PLAIN_KEY_TYPES):
             if _is_subclass(type(key), str):
-                key = str.__str__(key)  # type: ignore[arg-type]
+                known = inventory.key_texts.get(id(key))
+                if known is not None and known[0] is key:
+                    key = known[1]
+                else:
+                    text = str.__str__(key)  # type: ignore[arg-type]
+                    inventory.key_texts[id(key)] = (key, text)  # holds the key: its id cannot be reused
+                    key = text
             else:
                 pure = False
+        elif type(key) is int:
+            inventory.budget.charge_edge(key.bit_length() >> _KEY_HASH_BITS_PER_EDGE)
         if type(key) is str:
             if key in texts:
                 colliding = True
@@ -307,6 +322,8 @@ class _GraphInventory:
     # neither identity can be reused): a pure subtree is reconstructed once and shared, so the same item yielded
     # many times for one model is judged once, while a different model judges it afresh.
     validated: dict[tuple[int, int], tuple[object, type]] = field(default_factory=dict)
+    # ``str``-subclass keys already read as text, by identity: ``(the key, its text)``.  The key stays referenced.
+    key_texts: dict[int, tuple[object, str]] = field(default_factory=dict)
     # Completed reconstructions of pure subtrees, keyed by identity:
     # ``(object, copy, height)``.  A descendant shared by many paths is rebuilt once
     # and shared; ``height`` keeps the depth limit enforced on every path.
@@ -395,7 +412,7 @@ def _capture_native_graph(value: object, inventory: _GraphInventory, depth: int 
     if _is_subclass(value_type, BaseModel):
         stored = _BASE_MODEL_DICT_DESCRIPTOR.__get__(value, BaseModel)
         _precheck(budget, dict.__len__(stored))
-        stored_entries, pure_stored, stored_colliding = _plain_keys(tuple(dict.items(stored)))
+        stored_entries, pure_stored, stored_colliding = _plain_keys(tuple(dict.items(stored)), inventory)
         budget.charge_edge(len(stored_entries))
         try:
             extra = _BASE_MODEL_EXTRA_DESCRIPTOR.__get__(value, BaseModel)
@@ -425,7 +442,7 @@ def _capture_native_graph(value: object, inventory: _GraphInventory, depth: int 
         extra_type = type(extra)
         if _is_subclass(extra_type, dict):
             _precheck(budget, dict.__len__(extra))
-            extra_entries, pure_extra, _ = _plain_keys(tuple(dict.items(extra)))
+            extra_entries, pure_extra, _ = _plain_keys(tuple(dict.items(extra)), inventory)
             budget.charge_edge(len(extra_entries))
             model_inventory.extra_entries = extra_entries
             model_inventory.pure_names = model_inventory.pure_names and pure_extra
@@ -472,7 +489,7 @@ def _capture_native_graph(value: object, inventory: _GraphInventory, depth: int 
         return height
 
     _precheck(budget, dict.__len__(value))
-    entries, pure, colliding = _plain_keys(tuple(dict.items(value)))
+    entries, pure, colliding = _plain_keys(tuple(dict.items(value)), inventory)
     budget.charge_edge(len(entries))
     inventory.dictionaries[value_id] = entries
     if pure:
@@ -786,7 +803,8 @@ def _snapshot_captured_graph(
                         captured.extra,  # type: ignore[arg-type]
                         type(captured.extra),
                         budget,
-                    )
+                    ),
+                    inventory,
                 )
                 captured.extra_entries = extra_entries
                 # Later rebuilds reuse the saved entries but still hash these keys: remember that a key of

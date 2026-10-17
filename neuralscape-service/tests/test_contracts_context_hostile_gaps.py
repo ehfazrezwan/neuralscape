@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import tracemalloc
 import typing
 from datetime import datetime, timedelta, timezone, tzinfo
@@ -1971,3 +1972,53 @@ def test_a_pipe_none_declared_child_and_sequence_keep_their_declared_contract() 
 
         assert _declared_models(Parent) == {"child": Child}, name
         assert _item_models(Seq) == {"seq": Child}, name
+
+
+# ---- work and memory are charged in proportion to the size of what they touch, not as a constant per edge
+
+
+class _TextKey(str):
+    pass
+
+
+def _peak_bytes(fn) -> int:
+    tracemalloc.start()
+    try:
+        fn()
+        return tracemalloc.get_traced_peak() if hasattr(tracemalloc, "get_traced_peak") else tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+
+
+def test_one_shared_text_subclass_key_is_read_once_however_many_dicts_hold_it() -> None:
+    from contracts_common import snapshot_contract_graph
+
+    big = _TextKey("y" * (1 << 20))  # one 1 MiB key, shared by every dictionary below
+
+    def run(count: int):
+        value = [{big: 1} for _ in range(count)]
+        return _peak_bytes(lambda: snapshot_contract_graph(value))
+
+    small, large = run(16), run(128)
+    assert large < 4 * (1 << 20)  # the text is copied once (about 1 MiB), not once per dictionary (128 MiB)
+    assert large < small * 2  # and what grows with the count is the structure, not a copy of the key
+
+
+def test_the_same_shared_text_subclass_key_is_still_read_as_its_text() -> None:
+    from contracts_common import snapshot_contract_graph
+
+    key = _TextKey("name")
+    rebuilt = snapshot_contract_graph([{key: 1}, {key: 2}])
+    assert rebuilt == [{"name": 1}, {"name": 2}]
+    assert all(type(next(iter(d))) is str for d in rebuilt)
+
+
+def test_a_huge_integer_key_is_charged_for_the_hash_it_costs_in_every_dictionary() -> None:
+    from contracts_common import snapshot_contract_graph
+    from contracts_limits import DISCOVERY_BUDGET_MESSAGE
+
+    huge = 1 << (1 << 20)  # a 1 Mibit integer: hashing it reads all of it, and it is hashed once per dictionary
+    assert len(snapshot_contract_graph([{huge: 1} for _ in range(100)])) == 100
+    with pytest.raises(ValueError, match=re.escape(DISCOVERY_BUDGET_MESSAGE)):
+        snapshot_contract_graph([{huge: 1} for _ in range(4_000)])  # 4,000 hashes of a megabit: refused
+    assert len(snapshot_contract_graph([{i: 1} for i in range(4_000)])) == 4_000  # small keys cost nothing extra
