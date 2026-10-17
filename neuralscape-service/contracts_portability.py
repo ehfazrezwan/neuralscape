@@ -65,7 +65,7 @@ class _CallState:
 
     __slots__ = (
         "budget", "visited", "discovered", "discovery_inventory", "model_inventory",
-        "native_container_inventory", "public_view_inventory", "completed",
+        "native_container_inventory", "public_view_inventory", "completed", "first_expansion",
     )
 
     def __init__(self) -> None:
@@ -78,6 +78,9 @@ class _CallState:
         self.public_view_inventory: _PublicViewInventory = {}
         # Completed reconstructions, keyed by identity with the owner retained.
         self.completed: dict[int, tuple[Any, Any]] = {}
+        # What a node held when discovery first expanded it (owner retained): a shallower path that reaches
+        # it again re-expands these saved edges, never the live storage, which a callback may have changed.
+        self.first_expansion: dict[int, tuple[Any, tuple[Any, ...]]] = {}
 _MISSING_FIELDS_SET = object()
 
 
@@ -326,6 +329,7 @@ def _reject_retained_unknown_fields(
     model_inventory = state.model_inventory
     native_container_inventory = state.native_container_inventory
     public_view_inventory = state.public_view_inventory
+    first_expansion = state.first_expansion
 
     def discover(value: Any, depth: int = 0) -> None:
         pending = [(value, depth)]
@@ -346,28 +350,38 @@ def _reject_retained_unknown_fields(
             discovered.add(identity)
             child_depth = current_depth + 1
 
+            first = first_expansion.get(identity)
+            if first is not None and first[0] is not current:
+                first = None
             if issubclass(value_type, BaseModel):
-                native_stored = _PYDANTIC_DICT_DESCRIPTOR.__get__(
-                    current, BaseModel
-                )
-                budget.charge_edge(dict.__len__(native_stored))
-                stored_entries = tuple(dict.items(native_stored))
-                try:
-                    fields_set_storage = _PYDANTIC_FIELDS_SET_SLOT.__get__(
-                        current, value_type
+                if first is not None:
+                    # A shallower revisit: the first snapshot stands (its edges are charged again, as a
+                    # re-expansion is), and nothing is read from the live model.
+                    stored_entries = first[1][0]
+                    budget.charge_edge(len(stored_entries))
+                else:
+                    native_stored = _PYDANTIC_DICT_DESCRIPTOR.__get__(
+                        current, BaseModel
                     )
-                except AttributeError:
-                    fields_set_storage = _MISSING_FIELDS_SET
-                if issubclass(type(fields_set_storage), set):
-                    budget.charge_edge(set.__len__(fields_set_storage))
-                    fields_set_storage = set.copy(fields_set_storage)
-                extra_snapshot = _snapshot_model_extra_storage(current, budget)
-                discovery_inventory[identity] = (
-                    current,
-                    stored_entries,
-                    fields_set_storage,
-                    extra_snapshot,
-                )
+                    budget.charge_edge(dict.__len__(native_stored))
+                    stored_entries = tuple(dict.items(native_stored))
+                    try:
+                        fields_set_storage = _PYDANTIC_FIELDS_SET_SLOT.__get__(
+                            current, value_type
+                        )
+                    except AttributeError:
+                        fields_set_storage = _MISSING_FIELDS_SET
+                    if issubclass(type(fields_set_storage), set):
+                        budget.charge_edge(set.__len__(fields_set_storage))
+                        fields_set_storage = set.copy(fields_set_storage)
+                    extra_snapshot = _snapshot_model_extra_storage(current, budget)
+                    discovery_inventory[identity] = (
+                        current,
+                        stored_entries,
+                        fields_set_storage,
+                        extra_snapshot,
+                    )
+                    first_expansion[identity] = (current, (stored_entries,))
                 # Exact strings can be classified from the class field mapping
                 # without invoking a user-defined name protocol.  Other names
                 # remain conservative candidates for later hash authority.
@@ -378,9 +392,14 @@ def _reject_retained_unknown_fields(
                 continue
 
             if issubclass(value_type, dict):
-                budget.charge_edge(2 * dict.__len__(current))
-                items = tuple(dict.items(current))
-                if value_type is dict:
+                if first is not None:
+                    items = first[1]
+                    budget.charge_edge(2 * len(items))
+                else:
+                    budget.charge_edge(2 * dict.__len__(current))
+                    items = tuple(dict.items(current))
+                    first_expansion[identity] = (current, items)
+                if value_type is dict and first is None:
                     native_container_inventory[identity] = (
                         current,
                         dict,
@@ -390,19 +409,24 @@ def _reject_retained_unknown_fields(
                     pending.append((item, child_depth))
                     pending.append((key, child_depth))
                 continue
-            if issubclass(value_type, list):
-                budget.charge_edge(list.__len__(current))
-                items = tuple(list.__iter__(current))
-            elif issubclass(value_type, tuple):
-                budget.charge_edge(tuple.__len__(current))
-                items = tuple(tuple.__iter__(current))
-            elif issubclass(value_type, set):
-                budget.charge_edge(set.__len__(current))
-                items = tuple(set.__iter__(current))
+            if first is not None:
+                items = first[1]
+                budget.charge_edge(len(items))
             else:
-                budget.charge_edge(frozenset.__len__(current))
-                items = tuple(frozenset.__iter__(current))
-            if is_exact_type(current, list, tuple, set, frozenset):
+                if issubclass(value_type, list):
+                    budget.charge_edge(list.__len__(current))
+                    items = tuple(list.__iter__(current))
+                elif issubclass(value_type, tuple):
+                    budget.charge_edge(tuple.__len__(current))
+                    items = tuple(tuple.__iter__(current))
+                elif issubclass(value_type, set):
+                    budget.charge_edge(set.__len__(current))
+                    items = tuple(set.__iter__(current))
+                else:
+                    budget.charge_edge(frozenset.__len__(current))
+                    items = tuple(frozenset.__iter__(current))
+                first_expansion[identity] = (current, items)
+            if first is None and is_exact_type(current, list, tuple, set, frozenset):
                 native_container_inventory[identity] = (
                     current,
                     value_type,

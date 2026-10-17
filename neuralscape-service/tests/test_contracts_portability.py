@@ -3976,3 +3976,75 @@ def test_a_refusal_by_the_schema_never_renders_a_caller_object() -> None:
     text = str(raised.value) + repr(raised.value) + raised.value.json()
     assert Loud.calls == 0 and "LOUD" not in text
     assert any(error["loc"][:1] == ("manifest_id",) for error in raised.value.errors())
+
+
+# --- the first snapshot of a model or exact container is kept when a shallower path revisits it ---
+
+
+def _files_with_first(manifest: PortableManifest, first: object) -> tuple[object, ...]:
+    """The manifest's own files, the first replaced by ``first`` (so nothing else about the manifest is wrong)."""
+
+    return (first, *manifest.files[1:])
+
+
+def _file_dict(file: ManifestFile, checksum: object) -> dict[str, object]:
+    return {"path": file.path, "size_bytes": file.size_bytes, "checksum": checksum, "entry_type": "file"}
+
+
+class _RepairsOnIteration(list):
+    """The native backing holds the invalid object four levels down; the public iterator runs ``repair`` and
+    yields files that reach the same object one level up (a shallower revisit)."""
+
+    def __init__(self, native_holder: object, repair, public_files: tuple[object, ...]) -> None:
+        list.__init__(self, [[[[native_holder]]]])
+        self.repair, self.public_files = repair, public_files
+        self.iteration_calls = 0
+
+    def __iter__(self):
+        self.iteration_calls += 1
+        self.repair()
+        return iter(self.public_files)
+
+
+def test_a_shallower_revisit_does_not_replace_the_first_snapshot_of_a_model() -> None:
+    manifest = validate_portable_manifest(valid_manifest())
+    first = manifest.files[0]
+    checksum = first.checksum.model_copy(update={"digest": "not-a-digest"})  # unchecked: invalid on entry
+    repaired = first.checksum.digest
+
+    def repair() -> None:
+        object.__setattr__(checksum, "digest", repaired)
+
+    control = _RepairsOnIteration(checksum, lambda: None, _files_with_first(manifest, _file_dict(first, checksum)))
+    with pytest.raises(ValidationError):
+        validate_portable_manifest(_manifest_with_files(control))  # control: nothing repairs it
+    public = _files_with_first(manifest, _file_dict(first, checksum))
+    broken = _RepairsOnIteration(checksum, repair, public)
+    with pytest.raises(ValidationError):
+        validate_portable_manifest(_manifest_with_files(broken))
+    assert checksum.digest == repaired  # the public iterator did run and repair the live model afterwards
+
+
+def test_a_shallower_revisit_does_not_replace_the_first_snapshot_of_an_exact_container() -> None:
+    manifest = validate_portable_manifest(valid_manifest())
+    first = manifest.files[0]
+    checksum = {"algorithm": first.checksum.algorithm, "digest": "not-a-digest"}  # exact dict, invalid
+
+    def repair() -> None:
+        checksum["digest"] = first.checksum.digest  # the live exact container is repaired
+
+    public = _files_with_first(manifest, _file_dict(first, checksum))  # reaches the exact dict shallower
+    control = _RepairsOnIteration(checksum, lambda: None, public)
+    with pytest.raises(ValidationError):
+        validate_portable_manifest(_manifest_with_files(control))
+    with pytest.raises(ValidationError):
+        validate_portable_manifest(_manifest_with_files(_RepairsOnIteration(checksum, repair, public)))
+    assert checksum["digest"] == first.checksum.digest
+
+
+def test_an_honest_shallower_revisit_still_validates() -> None:
+    manifest = validate_portable_manifest(valid_manifest())
+    first = manifest.files[0]
+    public = _files_with_first(manifest, _file_dict(first, first.checksum))
+    honest = _RepairsOnIteration(first.checksum, lambda: None, public)
+    assert validate_portable_manifest(_manifest_with_files(honest)).files[0].path == first.path
