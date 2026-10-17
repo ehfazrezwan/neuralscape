@@ -143,6 +143,30 @@ def _validated_native_container_items(
     return items
 
 
+def _exact_names(entries: Any, where: str) -> tuple[tuple[str, Any], ...]:
+    """Captured model-storage entries with every name as exact text; a non-text name or a repeat is refused.
+
+    A model's stored names are attribute names.  A ``str`` subclass is copied with the base method (none of
+    its hooks runs); anything else could compare and hash like a field name only after it was captured, so
+    two captured entries would collapse into one when the storage is rebuilt into a dictionary and the
+    schema would see only the value that won.  A repeat is detected on the copies, before any rebuild.
+    """
+
+    names: set[str] = set()
+    exact: list[tuple[str, Any]] = []
+    for name, item in entries:
+        if type(name) is not str:
+            if not _inherits(name, str):
+                raise ValueError(f"contract model {where} names must be text")
+            name = str.__str__(name)
+        size = len(names)
+        names.add(name)
+        if len(names) == size:
+            raise ValueError(f"contract model {where} names repeat a text")
+        exact.append((name, item))
+    return tuple(exact)
+
+
 def _snapshot_model_extra_storage(
     value: BaseModel, budget: DiscoveryBudget | None = None
 ) -> _ModelExtraSnapshot:
@@ -161,7 +185,7 @@ def _snapshot_model_extra_storage(
     if issubclass(type(extra), dict):
         if budget is not None:
             budget.charge_edge(dict.__len__(extra))
-        return True, tuple(dict.items(extra))
+        return True, _exact_names(tuple(dict.items(extra)), "extra field")
     return False, extra
 
 
@@ -273,7 +297,8 @@ def _validated_model_extra_storage(
         iterated_names = []
         for name in extra:
             budget.charge_edge()
-            iterated_names.append(name)
+            iterated_names.append((name, None))
+        iterated_names = [name for name, _ in _exact_names(iterated_names, "extra field")]
         entries = []
         for entry in extra.items():
             budget.charge_edge(2)
@@ -284,7 +309,7 @@ def _validated_model_extra_storage(
             except (TypeError, ValueError) as exc:
                 raise ValueError("contract model extra storage has a malformed entry") from exc
             entries.append((key, value))
-        captured = dict(entries)
+        captured = dict(_exact_names(entries, "extra field"))
         observed_names = set(iterated_names) | set(captured)
     declared_or_stored = declared_names | stored_names
     overlap = declared_or_stored.intersection(observed_names)
@@ -364,7 +389,7 @@ def _reject_retained_unknown_fields(
                         current, BaseModel
                     )
                     budget.charge_edge(dict.__len__(native_stored))
-                    stored_entries = tuple(dict.items(native_stored))
+                    stored_entries = _exact_names(tuple(dict.items(native_stored)), "stored field")
                     try:
                         fields_set_storage = _PYDANTIC_FIELDS_SET_SLOT.__get__(
                             current, value_type

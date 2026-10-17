@@ -2115,6 +2115,7 @@ def test_stored_name_callback_cannot_change_frozen_native_list_edge(
             item,
         )
     hook.armed = True
+    hash_calls_before_validation = hook.hash_calls  # the test's own insertion into the native storage
 
     if edge_case == "invalid-repaired":
         with pytest.raises(ValidationError) as raised:
@@ -2126,12 +2127,11 @@ def test_stored_name_callback_cannot_change_frozen_native_list_edge(
         assert len(revalidated.files) == 2
         assert revalidated.files[0].path == "canonical/records.jsonl"
 
-    if edge_case == "valid-removed":
-        assert len(files) == 1
-        assert list.__getitem__(files, 0).path == "crypto/envelope.bin"
-    else:
-        assert list.__getitem__(files, 0) is replacement
-    assert hook.hash_calls == 4
+    # Stored names are copied to exact text at capture, so the name's hash callback never runs (it ran four
+    # times before): the frozen edge is judged, and the list is never touched.
+    assert len(files) == 2
+    assert list.__getitem__(files, 0) is original
+    assert hook.hash_calls == hash_calls_before_validation
 
 
 @pytest.mark.parametrize("invalid_view", ["native", "public"])
@@ -3118,16 +3118,17 @@ def test_inconsistent_hash_stored_name_preserves_unknown_field_authority(
         ) == (0, 0, 0)
         return
 
+    # The name is read as its exact text at capture ("files", a declared field), never through its own hash:
+    # the retained value is judged as that field (and refused), and no hook of the name runs.
     errors = raised.value.errors()
     assert len(errors) == 1
-    assert errors[0]["type"] == "extra_forbidden"
+    assert errors[0]["type"] == "list_type"
     assert errors[0]["loc"] == ("files",)
-    assert errors[0]["input"] is retained_value
     assert (
         stored_name.hash_calls,
         stored_name.equality_calls,
         stored_name.class_calls,
-    ) == (3, 0, 0)
+    ) == (0, 0, 0)
 
 
 def test_unknown_fields_and_missing_schema_version_are_rejected() -> None:
@@ -4304,3 +4305,195 @@ def test_the_public_path_normalizer_returns_exact_text_for_a_str_subclass() -> N
 
     normalized = normalize_bundle_path(Plain("canonical/./a.txt"))
     assert normalized == "canonical/a.txt" and type(normalized) is str
+
+
+# ---- model storage names: read as exact text at capture; a non-text name or a repeated text is refused
+
+
+class _ShapeShiftingName:
+    """Not text; unequal to ``"path"`` (and hashed apart) while it is stored, then equal with the same hash."""
+
+    def __init__(self) -> None:
+        self.equal = False
+        self.calls = 0
+
+    def __hash__(self) -> int:
+        if self.equal:
+            self.calls += 1
+            return hash("path")
+        return hash("path") ^ 0x5BD1E995
+
+    def __eq__(self, other: object) -> bool:
+        if self.equal:
+            self.calls += 1
+            return other == "path" or other is self
+        return other is self
+
+
+class _ShiftyName(str):
+    """Equal to its text, hashed apart until ``settle()``; then it hashes like its text."""
+
+    def __init__(self, value: str) -> None:
+        self.settled = False
+        self.calls = 0
+
+    def __hash__(self) -> int:
+        if self.settled:
+            self.calls += 1
+            return str.__hash__(self)
+        return str.__hash__(self) ^ 0x5BD1E995
+
+    def __eq__(self, other: object) -> bool:
+        if self.settled:
+            self.calls += 1
+        return str.__eq__(self, other)
+
+
+def _file_with_stored_twin(twin, *, unsafe_under_twin: bool) -> ManifestFile:
+    """A ManifestFile whose native storage holds "path" and ``twin`` (stored while unequal), one value unsafe."""
+
+    file = validate_portable_manifest(valid_manifest()).files[0].model_copy()
+    native = _PYDANTIC_DICT_DESCRIPTOR.__get__(file, BaseModel)
+    exact_value, twin_value = ("safe.txt", "../escape.txt") if unsafe_under_twin else ("../escape.txt", "safe.txt")
+    dict.__setitem__(native, "path", exact_value)
+    dict.__setitem__(native, twin, twin_value)
+    assert dict.__len__(native) == len(ManifestFile.model_fields) + 1
+    return file
+
+
+def _settle(twin) -> None:
+    if isinstance(twin, _ShapeShiftingName):
+        twin.equal = True
+    else:
+        twin.settled = True
+
+
+def _inputs_holding(file: ManifestFile):
+    """The file inside a model graph and inside a mapping document (both routes reach model storage)."""
+
+    manifest = validate_portable_manifest(valid_manifest()).model_copy(deep=True)
+    files = list(manifest.files)
+    files[0] = file
+    dict.__setitem__(_PYDANTIC_DICT_DESCRIPTOR.__get__(manifest, BaseModel), "files", files)
+    document = valid_manifest()
+    document["files"] = [file, *document["files"][1:]]
+    return {"model": manifest, "mapping": document}
+
+
+@pytest.mark.parametrize("route", ["model", "mapping"])
+@pytest.mark.parametrize("unsafe_under_twin", [False, True], ids=["unsafe-under-path", "unsafe-under-twin"])
+@pytest.mark.parametrize("twin_kind", ["non-text", "str-subclass"])
+def test_a_stored_twin_of_a_field_name_cannot_hide_an_unsafe_value(route, unsafe_under_twin, twin_kind) -> None:
+    twin = _ShapeShiftingName() if twin_kind == "non-text" else _ShiftyName("path")
+    file = _file_with_stored_twin(twin, unsafe_under_twin=unsafe_under_twin)
+    target = _inputs_holding(file)[route]
+    _settle(twin)
+    with pytest.raises(ValidationError):
+        validate_portable_manifest(target)
+    assert twin.calls == 0  # the name is never hashed or compared: it is read once, natively, at capture
+
+
+def test_a_str_subclass_stored_name_is_read_as_its_text_without_hooks() -> None:
+    file = validate_portable_manifest(valid_manifest()).files[0].model_copy()
+    native = _PYDANTIC_DICT_DESCRIPTOR.__get__(file, BaseModel)
+    value = dict.__getitem__(native, "path")
+    dict.__delitem__(native, "path")
+    name = _ShiftyName("path")
+    dict.__setitem__(native, name, value)
+    _settle(name)  # it now hashes like its text: an ordinary-looking subclass name
+    for target in _inputs_holding(file).values():
+        name.calls = 0
+        assert validate_portable_manifest(target).files[0].path == value
+        assert name.calls == 0
+
+
+def test_a_non_text_stored_name_alone_is_refused() -> None:
+    file = validate_portable_manifest(valid_manifest()).files[0].model_copy()
+    dict.__setitem__(_PYDANTIC_DICT_DESCRIPTOR.__get__(file, BaseModel), 7, "x")
+    for target in _inputs_holding(file).values():
+        with pytest.raises(ValidationError):
+            validate_portable_manifest(target)
+
+
+@pytest.mark.parametrize("twin_kind", ["non-text", "str-subclass"])
+def test_extras_with_a_twin_name_are_refused_without_hooks(twin_kind) -> None:
+    file = validate_portable_manifest(valid_manifest()).files[0].model_copy()
+    twin = _ShapeShiftingName() if twin_kind == "non-text" else _ShiftyName("path")
+    _PYDANTIC_EXTRA_SLOT.__set__(file, {"note": "a", twin: "b"})
+    _settle(twin)
+    for target in _inputs_holding(file).values():
+        with pytest.raises(ValidationError):
+            validate_portable_manifest(target)
+    assert twin.calls == 0
+
+
+class _ExtrasView(Mapping):
+    """A custom extras mapping that yields its names and pairs without any key operation of its own."""
+
+    def __init__(self, pairs, names=None) -> None:
+        self.pairs = list(pairs)
+        self.names = [name for name, _ in self.pairs] if names is None else list(names)
+
+    def __getitem__(self, key):
+        raise KeyError(key)
+
+    def __iter__(self):
+        return iter(self.names)
+
+    def __len__(self) -> int:
+        return len(self.pairs)
+
+    def items(self):
+        return iter(self.pairs)
+
+
+@pytest.mark.parametrize("where", ["both", "items-only", "iteration-only"])
+@pytest.mark.parametrize("twin_kind", ["non-text", "str-subclass"])
+def test_custom_mapping_extras_with_a_twin_name_are_refused_without_hooks(twin_kind, where) -> None:
+    """The names a custom extras mapping iterates and the names its items() yields are each read as text."""
+
+    file = validate_portable_manifest(valid_manifest()).files[0].model_copy()
+    twin = _ShapeShiftingName() if twin_kind == "non-text" else _ShiftyName("note")
+    pairs = [("note", "a"), (twin, "b")] if where != "iteration-only" else [("note", "a")]
+    names = ["note", twin] if where != "items-only" else ["note"]
+    _PYDANTIC_EXTRA_SLOT.__set__(file, _ExtrasView(pairs, names))
+    _settle(twin)
+    for target in _inputs_holding(file).values():
+        with pytest.raises(ValidationError):
+            validate_portable_manifest(target)
+    assert twin.calls == 0
+
+
+def test_a_stored_name_is_copied_with_the_base_method_not_its_own_str() -> None:
+    calls: list[str] = []
+
+    class LyingName(str):
+        def __str__(self) -> str:
+            calls.append("__str__")
+            return "something-else"
+
+    file = validate_portable_manifest(valid_manifest()).files[0].model_copy()
+    native = _PYDANTIC_DICT_DESCRIPTOR.__get__(file, BaseModel)
+    value = dict.__getitem__(native, "path")
+    dict.__delitem__(native, "path")
+    dict.__setitem__(native, LyingName("path"), value)
+    for target in _inputs_holding(file).values():
+        assert validate_portable_manifest(target).files[0].path == value
+    assert calls == []
+
+
+def test_a_stored_name_that_only_claims_to_be_text_is_refused_as_no_text() -> None:
+    class Claims:
+        @property
+        def __class__(self):  # type: ignore[override]
+            return str
+
+        def __hash__(self) -> int:
+            return hash("note")
+
+    file = validate_portable_manifest(valid_manifest()).files[0].model_copy()
+    dict.__setitem__(_PYDANTIC_DICT_DESCRIPTOR.__get__(file, BaseModel), Claims(), "x")
+    for target in _inputs_holding(file).values():
+        with pytest.raises(ValidationError) as raised:
+            validate_portable_manifest(target)
+        assert "names must be text" in str(raised.value.__cause__)
