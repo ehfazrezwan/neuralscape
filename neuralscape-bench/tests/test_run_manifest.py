@@ -7,6 +7,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from abc import ABCMeta
 from collections.abc import Mapping
 from datetime import datetime, timedelta, timezone, tzinfo
@@ -6377,3 +6378,85 @@ def test_an_honest_resource_reads_its_inventory_once_and_is_unchanged() -> None:
     resource, inventory = _resource_with_inventory(lambda names: iter(names))
     snapshot = _snapshot_native(resource)
     assert inventory.reads == 1 and set(snapshot) == set(measured_memory().model_dump())
+
+
+# ---- an inventory is bounded in the size of its names and read once per class per call
+
+class _BigName(str):
+    """A text name of a given length (a str subclass, so copying it is linear in its length)."""
+
+
+def _resource_class_with_names(names):
+    base_meta = type(ResourceReading)
+
+    class NamesMeta(base_meta):
+        @property
+        def model_fields(cls):   # type: ignore[override]
+            cls._reads += 1
+            return {**ResourceReading.model_fields, **{name: ResourceReading.model_fields["scope"] for name in names}}
+
+    class NamedReading(ResourceReading, metaclass=NamesMeta):
+        pass
+
+    NamedReading._reads = 0
+    return NamedReading
+
+
+def _manifest_of_instances(cls, count):
+    values = measured_memory().model_dump()
+    resources = tuple(cls.model_construct(**{**values, "scope": f"scope-{index}"}) for index in range(count))
+    manifest = completed_manifest()
+    object.__setattr__(manifest, "resources", resources)
+    return manifest
+
+
+def test_oversized_inventory_names_are_refused_before_they_are_copied_or_hashed() -> None:
+    cls = _resource_class_with_names([_BigName("n" * (1 << 20)) + str(index) for index in range(55)])
+    manifest = _manifest_of_instances(cls, 100)
+    started = time.monotonic()
+    with pytest.raises(ValueError) as caught:
+        serialize_run_manifest(manifest)
+    elapsed = time.monotonic() - started
+    assert str(caught.value) == run_manifest_module.SNAPSHOT_BUDGET_MESSAGE
+    assert elapsed < 2, elapsed      # unfixed: about 5 s for 100 instances of 55 one-mebibyte names
+
+
+def test_a_name_that_is_not_text_is_refused_by_the_inventory_bound() -> None:
+    cls = _resource_class_with_names([(1 << 2_000_000) + index for index in range(8)])
+    with pytest.raises(ValueError) as caught:
+        serialize_run_manifest(_manifest_of_instances(cls, 20))
+    assert str(caught.value) == run_manifest_module.SNAPSHOT_BUDGET_MESSAGE
+
+
+def test_a_class_inventory_is_read_once_per_call_however_many_instances() -> None:
+    cls = _resource_class_with_names([f"pad-{index}" for index in range(10)])
+    manifest = _manifest_of_instances(cls, 200)
+    serialize_run_manifest(manifest)                 # the padding names are inventory entries only: nothing is stored under them
+    assert cls._reads == 1, cls._reads
+
+
+def test_each_call_reads_the_inventory_afresh() -> None:
+    cls = _resource_class_with_names([f"pad-{index}" for index in range(3)])
+    for call in range(3):
+        serialize_run_manifest(_manifest_of_instances(cls, 5))
+    assert cls._reads == 3, cls._reads
+
+
+def test_field_names_of_ordinary_length_are_still_accepted() -> None:
+    manifest = _manifest_of_instances(_resource_class_with_names([]), 50)
+    manifest_bytes = serialize_run_manifest(manifest)
+    assert b"scope-49" in manifest_bytes
+
+
+def test_an_inventory_name_that_lies_about_its_length_is_measured_by_the_base_method() -> None:
+    log: list[str] = []
+
+    class Liar(str):
+        def __len__(self):
+            log.append("__len__")
+            return 1
+
+    cls = _resource_class_with_names([Liar("x" * (1 << 20) + str(index)) for index in range(3)])
+    with pytest.raises(ValueError) as caught:
+        serialize_run_manifest(_manifest_of_instances(cls, 5))
+    assert str(caught.value) == run_manifest_module.SNAPSHOT_BUDGET_MESSAGE and log == [], log
