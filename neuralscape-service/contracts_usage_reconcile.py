@@ -520,18 +520,8 @@ def _freeze_model_storage_body(
             _precheck(budget, dict.__len__(extras))
             native_extra_items = tuple(dict.items(extras))
             budget.charge_edge(len(native_extra_items))
-        group_texts: list[set[object]] = []
-        for group in (stored_items, native_extra_items or ()):
-            if any(not _inherits_str(type(name)) for name, _item in group):
-                raise ValueError("contract input field names must be text")
-            texts = [_plain_name(name) for name, _item in group]
-            if len(set(texts)) != len(texts):
-                raise ValueError("contract input field names must be unique text")
-            group_texts.append(set(texts))
-        # The two native stores are one namespace: compare their names as plain text, never through a
-        # key's own hash and equality (a text subclass could otherwise sit in both under one text).
-        if group_texts[0] & group_texts[1]:
-            raise ValueError("contract extra storage overlaps stored fields")
+        # The names are checked when the model is projected (``_checked_native_names``), not here: a model
+        # captured from a list subclass's native backing is never projected when its public view hides it.
         frozen_models[identity] = (
             value,
             stored_items,
@@ -602,6 +592,26 @@ def _freeze_model_storage_body(
             visited,
             budget,
         )
+
+
+def _checked_native_names(
+    stored_items: tuple[tuple[object, object], ...],
+    native_extra_items: tuple[tuple[object, object], ...] | None,
+) -> None:
+    """Refuse a projected model whose native field names are not unique text in one namespace."""
+
+    group_texts: list[set[object]] = []
+    for group in (stored_items, native_extra_items or ()):
+        if any(not _inherits_str(type(name)) for name, _item in group):
+            raise ValueError("contract input field names must be text")
+        texts = [_plain_name(name) for name, _item in group]
+        if len(set(texts)) != len(texts):
+            raise ValueError("contract input field names must be unique text")
+        group_texts.append(set(texts))
+    # The two native stores are one namespace: compare their names as plain text, never through a
+    # key's own hash and equality (a text subclass could otherwise sit in both under one text).
+    if group_texts[0] & group_texts[1]:
+        raise ValueError("contract extra storage overlaps stored fields")
 
 
 def _native_snapshot(
@@ -701,6 +711,7 @@ def _snapshot_uncached(
                 )
                 frozen = _frozen_models[identity]
             _model, stored_items, extras, native_extra_items = frozen
+            _checked_native_names(stored_items, native_extra_items)
             extra_items: tuple[tuple[object, object], ...] = ()
             if extras is not None:
                 if native_extra_items is not None:

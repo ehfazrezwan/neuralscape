@@ -4271,3 +4271,50 @@ def test_a_list_grown_by_a_callback_after_its_capture_is_rebuilt_from_the_captur
     snapshot = usage_reconcile_contracts._native_snapshot({"a": Grower(), "b": victim})
     assert snapshot["b"] == [1, 2, 3]  # what was captured (and charged), not the grown list
     assert len(victim) > STANDARD.max_edges
+
+
+# ---- a list subclass is rebuilt from its public view: a malformed model hidden in its backing is unused
+
+def _stream_with_bad_name(bad_name: object):
+    stream = reconcile_usage_events([_event()]).streams[0].model_copy(deep=True)
+    stored = _MODEL_DICT_DESCRIPTOR.__get__(stream, BaseModel)
+    dict.__setitem__(stored, bad_name, "x")
+    return stream
+
+
+class _PublicStreams(list):
+    def __init__(self, native, public) -> None:
+        list.__init__(self, native)
+        self.public = public
+
+    def __iter__(self):
+        return iter(self.public)
+
+
+@pytest.mark.parametrize("bad_name", [7, "tenant_id"], ids=["non-text", "duplicate-text"])
+def test_a_malformed_model_hidden_in_a_list_subclass_backing_is_not_rejected(bad_name) -> None:
+    class Twin(str):  # one text, its own hash and equality: it sits beside the plain key
+        def __hash__(self):
+            return hash("twin:" + str.__str__(self))
+
+        def __eq__(self, other):
+            return self is other
+
+    valid = reconcile_usage_events([_event()]).streams[0]
+    hidden = _stream_with_bad_name(bad_name if bad_name == 7 else Twin(bad_name))
+    snapshot = usage_reconcile_contracts._native_snapshot(_PublicStreams([hidden], [valid]))
+    assert snapshot == [usage_reconcile_contracts._native_snapshot(valid)]
+
+
+@pytest.mark.parametrize("bad_name", [7, "tenant_id"], ids=["non-text", "duplicate-text"])
+def test_a_malformed_model_in_a_tuple_is_still_rejected(bad_name) -> None:
+    class Twin(str):  # one text, its own hash and equality: it sits beside the plain key
+        def __hash__(self):
+            return hash("twin:" + str.__str__(self))
+
+        def __eq__(self, other):
+            return self is other
+
+    hidden = _stream_with_bad_name(bad_name if bad_name == 7 else Twin(bad_name))
+    with pytest.raises(ValueError, match="field names"):
+        usage_reconcile_contracts._native_snapshot((hidden,))
