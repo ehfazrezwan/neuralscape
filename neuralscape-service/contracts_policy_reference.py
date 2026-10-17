@@ -879,9 +879,31 @@ def _complete_contract_input(
         try:
             inventory = _validated_model_inventory(value, inventories)
             if inventory is None:
+                # A model first exposed here (by a container's public view) is discovered like one the entry
+                # walk found: the public mappings it reaches (a proxy field, an extra-storage mapping) are
+                # captured now, before any callback of the model's own storage runs.
+                lazy_owners: dict[int, Mapping[object, object]] = {}
+                lazy_reach: dict[int, tuple[Mapping[object, object], ...]] = {}
+                lazy_paid = memo.setdefault(_PAID, {})
                 _freeze_reachable_model_inventories(
-                    value, inventories, memo.setdefault(_PAID, {}), None, mapping_inventories, budget, depth
+                    value, inventories, lazy_paid, lazy_owners, mapping_inventories, budget, depth, True, lazy_reach
                 )
+                lazy_pending = {
+                    identity: found
+                    for identity, found in lazy_owners.items()
+                    if _validated_mapping_inventory(found, mapping_inventories) is None
+                }
+                if lazy_pending:
+                    _freeze_mapping_inventories(
+                        lazy_pending,
+                        mapping_inventories,
+                        inventories,
+                        lazy_paid,
+                        mapping_inventories,
+                        None,
+                        budget,
+                        lazy_reach,
+                    )
                 inventory = _validated_model_inventory(value, inventories)
                 if inventory is None:
                     raise ValueError("contract input model inventory is missing")

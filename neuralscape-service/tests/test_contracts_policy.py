@@ -4679,3 +4679,64 @@ def test_a_reach_tuple_is_scanned_and_charged_once_per_capture() -> None:
         contracts_limits.DiscoveryBudget.charge_edge = original
     total = sum(budget_edges)
     assert total <= 127_000, total  # inside the 131,072-edge budget only if the reach tuple is charged once
+
+
+# ── a statement exposed only by a tuple's public iterator keeps the mappings it exposes ──
+
+
+def _statement_with_proxy_resource_and_extra(resource_id: str, flip_to: str | None):
+    """An allow statement whose resource is a mapping proxy and whose (empty) extra storage is a Mapping whose
+    ``items()`` rewrites the proxy's backing dict when it is read."""
+
+    backing = {"kind": "memory", "id": resource_id, "tenant_id": "tenant-a", "resolver": "memory_by_id"}
+
+    class _MutatingExtra(Mapping[str, object]):
+        def __getitem__(self, key: str) -> object:
+            raise KeyError(key)
+
+        def __iter__(self) -> Iterator[str]:
+            return iter(())
+
+        def __len__(self) -> int:
+            return 0
+
+        def items(self):  # type: ignore[override]
+            if flip_to is not None:
+                backing["id"] = flip_to
+            return iter(())
+
+    value = statement("allow-it", "allow", "read", reference(resource_id))
+    object.__setattr__(value, "resource", MappingProxyType(backing))
+    _BASE_MODEL_EXTRA_DESCRIPTOR.__set__(value, _MutatingExtra())
+    return value, backing
+
+
+def _policy_with_native_statements(*statements) -> AccessPolicy:
+    """The statements sit in the policy's own tuple: built first, then tampered, so entry discovery sees them."""
+
+    policy_value = policy(statement("seed", "allow", "read", reference("other")))
+    object.__setattr__(policy_value, "statements", tuple(statements))
+    return policy_value
+
+
+def _decide(policy_value) -> str:
+    return evaluate(principal(), "read", reference("memory-1"), policy_value).outcome
+
+
+def test_a_public_iterator_only_statement_cannot_have_its_resource_rewritten_by_its_extra_mapping() -> None:
+    entry_visible, _ = _statement_with_proxy_resource_and_extra("other", "memory-1")
+    public_only, backing = _statement_with_proxy_resource_and_extra("other", "memory-1")
+
+    expected = _decide(_policy_with_native_statements(entry_visible))
+    assert expected == "deny"  # the entry-visible statement keeps its original resource: no match
+    assert _decide(_policy_with_public_only_statements(public_only)) == expected  # was "allow": the id flipped first
+    assert backing["id"] == "memory-1"  # the callback did run; the captured resource was already frozen
+
+
+def test_a_public_iterator_only_statement_with_an_honest_extra_mapping_is_still_granted() -> None:
+    honest_entry, _ = _statement_with_proxy_resource_and_extra("memory-1", None)
+    honest_public, _ = _statement_with_proxy_resource_and_extra("memory-1", None)
+    assert _decide(_policy_with_native_statements(honest_entry)) == "allow"
+    assert _decide(_policy_with_public_only_statements(honest_public)) == "allow"  # valid grants survive lazy discovery
+    other, _ = _statement_with_proxy_resource_and_extra("other", None)
+    assert _decide(_policy_with_public_only_statements(other)) == "deny"
