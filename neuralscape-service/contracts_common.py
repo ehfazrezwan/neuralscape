@@ -484,6 +484,22 @@ def _capture_native_graph(value: object, inventory: _GraphInventory, depth: int 
     return height
 
 
+def _private_copy(value: object) -> object:
+    """A structural copy of a snapshot (exact dicts, lists and tuples rebuilt; every other value shared as it is).
+
+    Only the containers are copied, so no value's own copy hook runs; the snapshot's depth is already bounded.
+    """
+
+    kind = type(value)
+    if kind is dict:
+        return {key: _private_copy(item) for key, item in dict.items(value)}
+    if kind is list:
+        return [_private_copy(item) for item in list.__iter__(value)]
+    if kind is tuple:
+        return tuple(_private_copy(item) for item in tuple.__iter__(value))
+    return value
+
+
 def _pin_collected(inventory: _GraphInventory) -> None:
     """Pin, once each, the datetimes recorded while a capture was running (their zones are asked now)."""
 
@@ -614,7 +630,9 @@ def _exposed_items(
             try:
                 if inventory.entry_guard is not None:
                     inventory.entry_guard(snapshot)  # the receiving boundary's type check, before pydantic sees it
-                item_model.model_validate(snapshot, strict=True)
+                # A private copy: the validators of the declared class may edit what they are given, and the
+                # retained snapshot is the evidence the caller will judge.
+                item_model.model_validate(_private_copy(snapshot), strict=True)
             except Exception:  # noqa: BLE001 - the input is refused; a prefix is never returned as if it were the view
                 raise ValueError("a contract entry exposed by a public view is not valid") from None
     return tuple(items)
@@ -728,9 +746,13 @@ def _snapshot_captured_graph(
             # Early validation of a view's entries uses the contract the receiving helper validates against (the
             # declared one, from the root down), never a narrower class the caller's own object happens to have.
             declared = contract if contract is not None else inventory.contracts.get(value_id)
-            effective = declared if declared is not None and _is_subclass(model_type, declared) else model_type
-            item_models = _item_models(effective)
-            declared_children = _declared_models(effective)
+            if declared is not None and _is_subclass(model_type, declared):
+                item_models = _item_models(declared)
+                declared_children = _declared_models(declared)
+            else:
+                # No trusted contract names this model: nothing is validated early, because the only class
+                # to do it with would be the caller's own, whose validators are caller code.
+                item_models = declared_children = {}
             for key, item in stored_entries:
                 if again:
                     budget.charge_edge()

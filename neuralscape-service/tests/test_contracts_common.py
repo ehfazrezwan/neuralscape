@@ -2578,7 +2578,7 @@ def test_public_first_unrepaired_public_only_child_is_exposed_and_rejected(
         # The exposed entry is invalid as it is yielded: the whole input is refused (a prefix is never returned
         # in its place), after exactly one read of the view.
         with pytest.raises(ValueError, match="not valid"):
-            snapshot_contract_graph(value)
+            snapshot_contract_graph(value, contract=type(value))
         assert public_view.iteration_calls == 1
         assert child.count == -1
         return
@@ -2614,7 +2614,7 @@ def test_public_first_public_only_child_repaired_by_earlier_stored_name_hook(
     # observed: the child is exposed as it is (invalid) and is refused (directly) or rejected by the model.
     if placement == "direct":
         with pytest.raises(ValueError, match="not valid"):
-            snapshot_contract_graph(value)
+            snapshot_contract_graph(value, contract=type(value))
     else:
         snapshot = snapshot_contract_graph(value)
         assert list(_exposed_children(snapshot, placement)) == [{"count": -1}]

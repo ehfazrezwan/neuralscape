@@ -1135,7 +1135,7 @@ def test_a_valid_fixed_tuple_still_validates_and_homogeneous_views_stop_early_an
         read = [0]
         bad = model.model_construct(**{field: _view([{"x": -1.5}] + [{"x": 1}] * 1_000, read)})
         with pytest.raises(ValueError, match="not valid"):  # the invalid first entry refuses the whole input
-            snapshot_contract_graph(bad)
+            snapshot_contract_graph(bad, contract=model)
         assert read[0] == 1  # and ends the read: the other 1,000 entries are never produced
 
 
@@ -1360,3 +1360,131 @@ def test_the_declared_contract_is_used_all_the_way_down_not_a_narrower_nested_cl
     dict.__setitem__(_STORED(item.freshness, BaseModel), "projection", StrictProjection.model_construct(**values))
     # the base contract accepts revision 4; the narrower nested class does not, and it is not the helper's contract
     assert bundle_matches_reported_evidence(request, bundle) is True
+
+
+# ---- eager validation never runs a caller's class on the retained snapshot, and every snapshot call site passes the guard
+
+
+def _receipt_whose_version_class_rewrites_what_it_validates():
+    """A ``ContextAssemblyReceipt`` subclass redeclaring ``source_versions`` with a ``SourceVersion`` subclass whose
+    ``model_validate`` repairs the snapshot it is handed (and counts the calls)."""
+
+    from typing import Annotated
+
+    from contracts_context import ContextAssemblyReceipt
+    from contracts_references import SourceVersion
+    from tests.test_contracts_context import _receipt
+
+    calls = {"n": 0}
+
+    class Repairing(SourceVersion):
+        @classmethod
+        def model_validate(cls, obj, *args, **kwargs):
+            calls["n"] += 1
+            if isinstance(obj, dict) and obj.get("content_revision") == -1:
+                obj["content_revision"] = 4  # the bundle's revision: repairs the retained snapshot in place
+            return super().model_validate(obj, *args, **kwargs)
+
+    class RepairingReceipt(ContextAssemblyReceipt):
+        source_versions: tuple[Repairing, ...]
+
+    base = _validate(ContextAssemblyReceipt, _receipt())
+    values = dict(_STORED(base, BaseModel))
+    values["source_versions"] = _GeneratedItems(lambda: iter([{"record_id": "source-a", "content_revision": -1, "policy_epoch": 2}]))
+    return RepairingReceipt.model_construct(**values), calls
+
+
+def test_a_callers_subclass_cannot_repair_the_snapshot_through_its_own_eager_validator() -> None:
+    from contracts_context import ContextAssemblyReceipt, receipt_matches_bundle
+
+    receipt, calls = _receipt_whose_version_class_rewrites_what_it_validates()
+    bundle = _validate(ContextBundle, _bundle())
+    assert receipt_matches_bundle(receipt, bundle) is False  # revision -1 was captured; nothing repaired it
+    assert calls["n"] == 0  # the caller's class never ran
+    from contracts_common import snapshot_contract_graph
+
+    with pytest.raises(ValueError, match="not valid"):  # refused by the trusted contract, as yielded (-1)
+        snapshot_contract_graph(receipt, contract=ContextAssemblyReceipt)
+    assert calls["n"] == 0
+
+
+def test_without_a_declared_contract_no_class_of_the_caller_runs_during_the_snapshot() -> None:
+    from contracts_common import snapshot_contract_graph
+
+    receipt, calls = _receipt_whose_version_class_rewrites_what_it_validates()
+    snapshot = snapshot_contract_graph(receipt)  # no trusted contract: no early validation at all
+    assert [entry["content_revision"] for entry in snapshot["source_versions"]] == [-1]
+    assert calls["n"] == 0
+
+
+def test_the_trusted_contracts_own_validator_works_on_a_private_copy() -> None:
+    from typing import Annotated
+
+    from pydantic import model_validator
+
+    from contracts_common import ContractModel, snapshot_contract_graph
+    from contracts_references import SourceVersion
+
+    class Mutating(SourceVersion):
+        @model_validator(mode="before")
+        @classmethod
+        def rewrite(cls, data):
+            if isinstance(data, dict):
+                data["content_revision"] = 4  # a validator that edits its input in place
+            return data
+
+    class Holder(ContractModel):
+        versions: tuple[Mutating, ...]
+
+    holder = Holder.model_construct(versions=_GeneratedItems(lambda: iter([{"record_id": "s", "content_revision": 1, "policy_epoch": 1}])))
+    snapshot = snapshot_contract_graph(holder, contract=Holder)
+    assert [entry["content_revision"] for entry in snapshot["versions"]] == [1]  # the retained snapshot is untouched
+
+
+def _unchecked_source_version_with_a_proxy_in_a_nested_view(reads):
+    from contracts_common import ContractModel
+    from contracts_references import SourceVersion
+
+    class Proxy:
+        def __getattribute__(self, name):
+            if name == "__class__":
+                reads["class"] += 1
+                return SourceVersion
+            raise AttributeError(name)
+
+    class Nested(ContractModel):
+        many: tuple[SourceVersion, ...]
+
+    nested = Nested.model_construct(many=_GeneratedItems(lambda: iter([Proxy()])))
+    version = SourceVersion.model_construct(record_id="r1", content_revision=1, policy_epoch=1)
+    dict.__setitem__(_STORED(version, BaseModel), "nested", nested)
+    return version
+
+
+@pytest.mark.parametrize("path", ["exact_sequence", "lazy_sequence"])
+def test_a_proxy_in_a_nested_view_is_refused_before_pydantic_reads_its_class_on_both_dependency_paths(path) -> None:
+    from contracts_freshness import projection_status_for
+
+    reads = {"class": 0}
+    version = _unchecked_source_version_with_a_proxy_in_a_nested_view(reads)
+    sequence = (version,) if path == "exact_sequence" else _GeneratedItems(lambda: iter([version]))
+    with pytest.raises(ValueError):
+        projection_status_for(sequence, ())
+    assert reads["class"] == 0
+
+
+def test_every_snapshot_call_site_in_the_service_passes_the_entry_guard() -> None:
+    """A call to ``snapshot_contract_graph`` outside tests must give the receiving boundary's guard."""
+
+    import ast
+    from pathlib import Path
+
+    service = Path(__file__).resolve().parents[1]
+    offenders = []
+    for path in sorted(service.glob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and getattr(node.func, "id", getattr(node.func, "attr", None)) == "snapshot_contract_graph":
+                if not any(keyword.arg == "entry_guard" for keyword in node.keywords):
+                    offenders.append(f"{path.name}:{node.lineno}")
+    assert offenders == []

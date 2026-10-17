@@ -598,7 +598,7 @@ def _version_maps(*sequences: Sequence[SourceVersion]) -> tuple[dict[str, tuple[
     exact_groups = [group for group in native if group is not None]
     exact_snapshots = iter(())
     if exact_groups:
-        captured = require_native_snapshot(snapshot_contract_graph(tuple(exact_groups)))
+        captured = require_native_snapshot(snapshot_contract_graph(tuple(exact_groups), entry_guard=require_native_snapshot))
         exact_snapshots = iter(captured)  # type: ignore[call-overload]
         for group, snapshots in zip(exact_groups, captured):  # type: ignore[call-overload]
             for entry, snapshot in zip(group, snapshots):
@@ -632,7 +632,7 @@ def _version_maps(*sequences: Sequence[SourceVersion]) -> tuple[dict[str, tuple[
                 if seen is not None and seen[0] is entry:
                     admit(result, seen[1])
                     continue
-                snapshot = require_native_snapshot(snapshot_contract_graph(entry))
+                snapshot = require_native_snapshot(snapshot_contract_graph(entry, entry_guard=require_native_snapshot))
                 first_capture[id(entry)] = (entry, snapshot)
                 # Validate now: an invalid entry ends the call before the iterator is asked for the next
                 # one, so the work done on invalid input is bounded by the first bad entry (each entry
