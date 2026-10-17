@@ -8,7 +8,7 @@
       "skips": [
         {
           "test": "::tests.test_integrated_reference_story",
-          "reason_contains": "absent module(s): contracts_freshness, contracts_portability"
+          "reason_contains": "absent module(s): contracts_portability"
         },
         {
           "test": "tests.test_baseline_reproductions::test_compose_backup_tooling_covers_every_persistent_volume",
@@ -64,7 +64,7 @@
       "skips": [
         {
           "test": "::tests.test_integrated_reference_story",
-          "reason_contains": "absent module(s): contracts_freshness, contracts_portability"
+          "reason_contains": "absent module(s): contracts_portability"
         },
         {
           "test": "tests.test_baseline_reproductions::test_compose_backup_tooling_covers_every_persistent_volume",
