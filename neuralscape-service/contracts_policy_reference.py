@@ -56,6 +56,13 @@ _TYPE_MRO = vars(type)["__mro__"]
 _TYPE_NAME = vars(type)["__name__"]  # a class's name, read without any metaclass hook
 
 
+def _type_name(value: object) -> str:
+    """The name of ``value``'s class as exact text: a class may be named by a ``str`` subclass, whose
+    ``__format__``/``__str__`` would otherwise run when the name is interpolated."""
+
+    return str.__str__(_TYPE_NAME.__get__(type(value)))
+
+
 def _inherits(cls: type, base: type) -> bool:
     """Whether ``base`` is on ``cls``'s own method resolution order, by identity.
 
@@ -429,7 +436,7 @@ def _open_pair(raw_entry: object) -> tuple[object, object, Iterator[object] | No
     except TypeError:
         if _defines_iter(type(raw_entry)):
             raise  # unpacking reports the iteration protocol's own error unchanged
-        raise TypeError(f"cannot unpack non-iterable {_TYPE_NAME.__get__(type(raw_entry))} object") from None
+        raise TypeError(f"cannot unpack non-iterable {_type_name(raw_entry)} object") from None
     try:
         key = next(iterator)
     except StopIteration:
@@ -750,7 +757,7 @@ class _OpaqueKey:
         self._key = key
 
     def __repr__(self) -> str:
-        return f"<{_TYPE_NAME.__get__(type(self._key))} key>"
+        return f"<{_type_name(self._key)} key>"
 _COPIED = "copied"  # ids of containers completion has copied at least once
 
 

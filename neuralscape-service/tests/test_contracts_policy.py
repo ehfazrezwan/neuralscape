@@ -4785,3 +4785,23 @@ def test_a_mapping_first_exposed_during_completion_keeps_its_prepaid_counts() ->
     assert completed[0][0] == {"k": inner}
     assert budget.edges < 75_000
 
+
+def test_an_invalid_key_diagnostic_never_formats_a_hooked_type_name() -> None:
+    calls: list[str] = []
+
+    class HookedName(str):
+        def __format__(self, spec):
+            calls.append("format")
+            return "hooked"
+
+        def __str__(self):
+            calls.append("str")
+            return "hooked"
+
+    class Key:
+        pass
+
+    Key.__name__ = HookedName("Key")
+    assert repr(reference_module._OpaqueKey(Key())) == "<Key key>"
+    assert calls == []
+
