@@ -7,6 +7,8 @@ is the wire representation.  Neither representation grants identity or
 authority merely because a value validates.
 """
 
+import enum
+import typing
 from collections.abc import Mapping
 from types import MappingProxyType
 from dataclasses import dataclass, field
@@ -20,6 +22,7 @@ from pydantic import (
     ConfigDict,
     Field,
     StringConstraints,
+    model_validator,
 )
 
 
@@ -43,6 +46,51 @@ SafeCounter = Annotated[
 """A non-negative integer exactly representable by JavaScript number values."""
 
 
+def is_canonical_enum_member(value: object) -> bool:
+    """Whether an enum instance is one of its class's declared members, decided by identity.
+
+    ``str.__new__(MyEnum, "value")`` builds an object that passes ``isinstance(value, MyEnum)`` (and
+    pydantic's strict enum check) but is no member: every ``value is MyEnum.MEMBER`` test then fails,
+    so a decision written as a chain of identity tests silently falls through to its default branch.
+    """
+
+    for member in type(value).__members__.values():  # type: ignore[attr-defined]
+        if member is value:
+            return True
+    return False
+
+
+def require_canonical_enum_members(value: object, *, _depth: int = 0) -> None:
+    """Raise ``ValueError`` if ``value`` is, or natively contains, an enum instance that is no member.
+
+    Looks through exact tuples, lists, sets, frozensets and dicts (what validation produces); nested
+    models validate themselves.
+    """
+
+    if any(base is enum.Enum for base in _TYPE_MRO.__get__(type(value))):
+        if not is_canonical_enum_member(value):
+            raise ValueError("an enum value must be a declared member of its enum")
+        return
+    if _depth > 32:
+        raise ValueError("contract value nesting exceeds the enum check depth")
+    kind = type(value)
+    if kind is dict:
+        for key, item in dict.items(value):  # type: ignore[arg-type]
+            require_canonical_enum_members(key, _depth=_depth + 1)
+            require_canonical_enum_members(item, _depth=_depth + 1)
+    elif kind is tuple or kind is list or kind is set or kind is frozenset:  # identity, never ==
+        for item in value:  # type: ignore[attr-defined]
+            require_canonical_enum_members(item, _depth=_depth + 1)
+
+
+def _annotation_holds_enum(annotation: object, _depth: int = 0) -> bool:
+    if _depth > 8:
+        return True  # unknown shape: check it
+    if isinstance(annotation, type):
+        return any(base is enum.Enum for base in _TYPE_MRO.__get__(annotation))
+    return any(_annotation_holds_enum(arg, _depth + 1) for arg in typing.get_args(annotation))
+
+
 class ContractModel(BaseModel):
     """Base for strict contracts with a closed set of fields."""
 
@@ -51,6 +99,25 @@ class ContractModel(BaseModel):
         strict=True,
         revalidate_instances="always",
     )
+
+    _enum_field_names: typing.ClassVar[tuple[str, ...]] = ()
+
+    @classmethod
+    def __pydantic_init_subclass__(cls, **kwargs: typing.Any) -> None:
+        super().__pydantic_init_subclass__(**kwargs)
+        cls._enum_field_names = tuple(
+            name for name, info in cls.model_fields.items() if _annotation_holds_enum(info.annotation)
+        )
+
+    @model_validator(mode="after")
+    def _enum_members_are_canonical(self) -> "ContractModel":
+        # Every enum-typed field must hold a declared member (see ``is_canonical_enum_member``): a
+        # look-alike passes the type check and then falls through every identity comparison.
+        stored = self.__dict__
+        for name in type(self)._enum_field_names:
+            if name in stored:
+                require_canonical_enum_members(stored[name])
+        return self
 
 
 class VersionedContract(ContractModel):

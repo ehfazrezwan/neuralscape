@@ -2494,3 +2494,61 @@ def test_a_modest_nested_const_still_validates_and_a_mismatch_is_still_reported(
     request, result = _generation_with_output({"v": {"k": [1, 3]}}, v={"const": {"k": [1.0, 2]}})
     with pytest.raises(ValueError, match="does not match declared schema"):
         validate_generation_result(request, result)
+
+
+# ---- every enum-typed value is a declared member by identity (``str.__new__(Enum, "value")`` is refused)
+
+def _every_enum():
+    import enum as _enum
+
+    import contracts_engines
+    import contracts_errors
+
+    return [
+        value
+        for module in (contracts_inference, contracts_engines, contracts_errors)
+        for value in vars(module).values()
+        if isinstance(value, type) and issubclass(value, _enum.Enum) and value.__module__ == module.__name__
+    ]
+
+
+def _spoof(member):
+    return str.__new__(type(member), member.value)  # right class and value, but not a declared member
+
+
+def test_the_enum_sweep_covers_every_enum_of_the_inference_engine_and_error_contracts() -> None:
+    assert {kind.__name__ for kind in _every_enum()} >= {
+        "FallbackGranularity", "ScoreKind", "DecisionOutcome", "GenerationOutcome", "ResourceViolation",
+        "EngineAdapterKind", "CapabilityHealth", "InternalErrorCode", "PublicErrorCode",
+    }
+
+
+@pytest.mark.parametrize("kind", _every_enum(), ids=lambda kind: kind.__name__)
+def test_a_contract_field_refuses_a_noncanonical_enum_instance_and_keeps_every_member(kind) -> None:
+    from pydantic import create_model
+
+    from contracts_common import ContractModel
+
+    holder = create_model("Holder", __base__=ContractModel, value=(kind, ...), many=(tuple[kind, ...], ()))
+    for member in kind:
+        assert holder.model_validate({"value": member}).value is member
+        with pytest.raises(ValidationError):
+            holder.model_validate({"value": _spoof(member)})
+        with pytest.raises(ValidationError):
+            holder.model_validate({"value": member, "many": (member, _spoof(member))})
+
+
+def test_a_noncanonical_selected_outcome_cannot_skip_the_selection_rules() -> None:
+    """Identity tests on ``outcome`` skipped every rule for a look-alike SELECTED (and PROPOSED) and accepted a
+    selected head with no candidate, and a proposed result with no proposal."""
+
+    from contracts_inference import DecisionHeadResult, DecisionOutcome, GenerationOutcome, GenerationResult
+
+    head = {"head_id": "h", "selected_candidate_ids": (), "distribution": None, "reason_code": None}
+    with pytest.raises(ValidationError):
+        DecisionHeadResult.model_validate({**head, "outcome": _spoof(DecisionOutcome.SELECTED)}, strict=True)
+    result = {"schema_version": "candidate-v1", "request_id": "r", "proposals": (), "reason_code": None, "attempts": ()}
+    with pytest.raises(ValidationError):
+        GenerationResult.model_validate({**result, "outcome": _spoof(GenerationOutcome.PROPOSED)}, strict=True)
+    # controls: real members still follow the rules
+    assert DecisionHeadResult.model_validate({**head, "outcome": DecisionOutcome.EMPTY}, strict=True).outcome is DecisionOutcome.EMPTY
