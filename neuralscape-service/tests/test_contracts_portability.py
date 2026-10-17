@@ -4271,3 +4271,36 @@ def test_non_text_keys_are_refused_and_text_keys_still_work() -> None:
     with pytest.raises(ValidationError):
         validate_portable_manifest(document)
     assert validate_portable_manifest(valid_manifest())
+
+
+class _PathThatLies(str):
+    """Its text is one path; its own string methods describe another."""
+
+    def __contains__(self, item: object) -> bool:
+        return False
+
+    def split(self, *args: object, **kwargs: object) -> list[str]:
+        return ["canonical", "a.txt"]
+
+    def startswith(self, *args: object, **kwargs: object) -> bool:
+        return False
+
+    def __str__(self) -> str:
+        return "canonical/a.txt"
+
+    def __fspath__(self) -> str:
+        return "canonical/a.txt"
+
+
+@pytest.mark.parametrize("text", ["../../etc/passwd", "canonical/a\x00.txt", "/etc/passwd", "canonical\\a.txt"])
+def test_the_public_path_normalizer_judges_a_str_subclass_by_its_own_text(text: str) -> None:
+    with pytest.raises(ValueError):
+        normalize_bundle_path(_PathThatLies(text))
+
+
+def test_the_public_path_normalizer_returns_exact_text_for_a_str_subclass() -> None:
+    class Plain(str):
+        pass
+
+    normalized = normalize_bundle_path(Plain("canonical/./a.txt"))
+    assert normalized == "canonical/a.txt" and type(normalized) is str

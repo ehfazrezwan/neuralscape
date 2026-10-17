@@ -671,6 +671,8 @@ def _normalized_bundle_path(value: str) -> str:
     file inventory.
     """
 
+    if issubclass(type(value), str):
+        value = str.__str__(value)  # the text itself: a subclass's own string methods never decide
     if not value or "\x00" in value:
         raise ValueError("bundle path must be nonempty and contain no NUL bytes")
     if "\\" in value:

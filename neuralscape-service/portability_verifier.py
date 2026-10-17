@@ -282,6 +282,12 @@ def _zip64_local_sizes(extra: bytes, want_usize: bool, want_csize: bool) -> tupl
         header_id, length = struct.unpack_from("<HH", extra, position)
         body = extra[position + 4 : position + 4 + length]
         if header_id == 0x0001:
+            # A block that runs past the extra field, or cannot hold the sizes the header defers to it, is
+            # not one every reader parses alike: a reader that honours its length finds no sizes there.
+            if len(body) != length:
+                raise _Framing("zip64 extra field runs past the extra field")
+            if length < 8 * (want_usize + want_csize):
+                raise _Framing("zip64 extra field too short for its sizes")
             offset = 0
             usize = csize = -1
             if want_usize:

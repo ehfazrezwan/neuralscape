@@ -1837,3 +1837,58 @@ def test_every_prefix_and_byte_flip_of_a_valid_archive_is_a_report_not_a_traceba
         target.write_bytes(bytes(mutated))
         monkeypatch.undo()
         verify_bundle(target)  # must not raise
+
+
+def _forced_zip64_bundle(path: Path) -> bytes:
+    """A valid bundle whose members carry their sizes in a local zip64 extra block (sizes 0xFFFFFFFF)."""
+
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("manifest.json", json.dumps(_manifest(PAYLOAD)))
+        for name, data in PAYLOAD.items():
+            with archive.open(zipfile.ZipInfo(name), "w", force_zip64=True) as member:
+                member.write(data)
+    return path.read_bytes()
+
+
+def _first_forced_zip64_extra(raw: bytes) -> int:
+    """Offset of the first member's local zip64 block (a header whose sizes are 0xFFFFFFFF)."""
+
+    position = 0
+    while True:
+        position = raw.index(b"PK\x03\x04", position)
+        name_length, _extra_length = struct.unpack_from("<HH", raw, position + 26)
+        if struct.unpack_from("<II", raw, position + 18) == (0xFFFFFFFF, 0xFFFFFFFF):
+            return position + 30 + name_length
+        position += 4
+
+
+def test_a_forced_zip64_bundle_still_verifies(tmp_path) -> None:
+    path = tmp_path / "b.zip"
+    _forced_zip64_bundle(path)
+    assert verify_bundle(path).ok
+
+
+@pytest.mark.parametrize("declared", [17, 0x00EF, 0xFFFF])
+def test_a_local_zip64_block_longer_than_its_extra_field_is_rejected(tmp_path, declared) -> None:
+    """Its sizes are read from bytes another reader does not accept as the block: it cannot find the sizes."""
+
+    path = tmp_path / "b.zip"
+    raw = bytearray(_forced_zip64_bundle(path))
+    block = _first_forced_zip64_extra(raw)
+    assert struct.unpack_from("<HH", raw, block) == (0x0001, 16)
+    struct.pack_into("<H", raw, block + 2, declared)
+    path.write_bytes(bytes(raw))
+    report = verify_bundle(path)
+    assert not report.ok and pv.ARCHIVE_FRAMING in _codes(report)
+
+
+def test_a_local_zip64_block_too_short_for_the_sizes_it_must_carry_is_rejected(tmp_path) -> None:
+    path = tmp_path / "b.zip"
+    raw = bytearray(_forced_zip64_bundle(path))
+    block = _first_forced_zip64_extra(raw)
+    struct.pack_into("<H", raw, block + 2, 8)  # room for one size; both are 0xFFFFFFFF in the header
+    struct.pack_into("<HH", raw, block + 12, 0x9999, 4)  # the rest of the area still tiles as an unknown block
+    path.write_bytes(bytes(raw))
+    report = verify_bundle(path)
+    assert not report.ok and pv.ARCHIVE_FRAMING in _codes(report)
+    assert any("too short" in item.detail for item in report.findings)  # refused for this reason, not by accident
