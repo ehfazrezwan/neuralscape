@@ -17,8 +17,20 @@ its budget"): it is the whole message when ``validate_generation_result`` refuse
 an output, and it is inside pydantic's ``ValidationError`` (a ``ValueError``) when
 the subschema cap refuses a ``GenerationRequest`` at construction.  It is raised
 before any output is accepted, never a partial validation; shrink the output or
-simplify the schema.  The constants are implementation limits of this candidate,
-not a service-level commitment.
+simplify the schema.
+
+One value-size bound is part of that contract: ``MAX_REGEX_CHARACTERS`` (8,192).
+The ``regex`` format check does not compile a string longer than that, because
+Python's regex compiler is superlinear in the pattern (alternatives with long
+shared prefixes take quadratic time).  Such a string is not judged a valid or an
+invalid regex: it is refused with the same ``SCHEMA_EXECUTION_MESSAGE``
+``ValueError``, and the refusal is of the whole output, wherever the ``format``
+keyword sits, including inside ``anyOf`` or ``not`` where another branch could
+have accepted the value.  Ordinary patterns are far below the bound.  Its
+length is also charged to the meter when the pattern is first checked.
+
+The constants, ``MAX_REGEX_CHARACTERS`` included, are implementation limits of
+this candidate, not a service-level commitment.
 """
 
 from __future__ import annotations

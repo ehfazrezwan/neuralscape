@@ -3105,3 +3105,33 @@ def test_many_bounds_sharing_a_large_integer_are_charged_for_every_comparison():
     instance = (1 << (8 << 20)) + 7  # matching high bits: every comparison scans the whole number
     spent, errors = _units_spent({"allOf": [{"minimum": bound}] * 200}, instance)
     assert errors == [] and spent >= 200 * (1 << 20) * 8 // 30 // 2_048  # it was 8 units per comparison
+
+
+# ---- the regex bound is part of the documented contract
+
+def test_the_module_documentation_states_the_regex_bound():
+    documentation = " ".join(contracts_inference.__doc__.split())
+    assert "MAX_REGEX_CHARACTERS" in documentation
+    assert f"{contracts_inference.MAX_REGEX_CHARACTERS:,}" in documentation  # the number stated is the constant's
+    assert "SCHEMA_EXECUTION_MESSAGE" in documentation
+    assert "inside ``anyOf`` or ``not``" in documentation  # what happens to an over-limit value in a branch
+    assert "not a service-level commitment" in documentation
+
+
+def test_an_over_limit_regex_value_refuses_the_whole_output_even_inside_a_branch():
+    """The documented behaviour: refused, not judged, wherever the format keyword sits."""
+
+    value = "a" * (contracts_inference.MAX_REGEX_CHARACTERS + 1)
+    for schema in (
+        {"anyOf": [{"format": "regex"}, {"type": "string"}]},  # the second branch would accept it
+        {"not": {"format": "regex"}},
+        {"format": "regex"},
+    ):
+        request, result = _generation_with_output({"v": value}, v=schema)
+        with pytest.raises(ValueError) as refused:
+            validate_generation_result(request, result)
+        assert str(refused.value) == contracts_inference.SCHEMA_EXECUTION_MESSAGE
+    request, result = _generation_with_output(
+        {"v": "a" * contracts_inference.MAX_REGEX_CHARACTERS}, v={"anyOf": [{"format": "regex"}, {"type": "string"}]}
+    )
+    assert validate_generation_result(request, result).compliant  # at the bound it is judged as before
