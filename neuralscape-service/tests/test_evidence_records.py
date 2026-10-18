@@ -493,3 +493,85 @@ def test_an_absent_sidecar_is_created_so_a_later_writer_meets_the_reader_on_it(t
     assert not path.with_name("e.jsonl.lock").exists()
     assert "1 records" in ev.matrix_artifacts(path)[0]["summary"]
     assert path.with_name("e.jsonl.lock").exists()
+
+
+def test_a_sidecar_created_by_a_writer_between_the_readers_opens_is_still_waited_on(tmp_path, monkeypatch) -> None:
+    import builtins
+    import fcntl
+    import os
+    import threading
+
+    _not_root()
+    path = tmp_path / "e.jsonl"
+    path.write_bytes(_lines(record("b1")))
+    sidecar = path.with_name("e.jsonl.lock")
+    held = []
+    real_open = builtins.open
+
+    def racing_open(file, mode="r", *args, **kwargs):
+        try:
+            return real_open(file, mode, *args, **kwargs)
+        except FileNotFoundError:
+            if os.fspath(file) == str(sidecar) and mode == "rb" and not held:
+                # the writer creates the sidecar (unwritable for this reader) and locks it right after the miss
+                handle = real_open(sidecar, "ab")
+                fcntl.flock(handle, fcntl.LOCK_EX)
+                os.chmod(sidecar, 0o444)
+                held.append(handle)
+            raise
+
+    monkeypatch.setattr(ev, "open", racing_open, raising=False)
+    done, out = threading.Event(), []
+
+    def summarise() -> None:
+        out.append(ev.matrix_artifacts(path)[0])
+        done.set()
+
+    thread = threading.Thread(target=summarise)
+    thread.start()
+    try:
+        assert not done.wait(0.5), "the reader bypassed a lock created between its two opens"
+        path.write_bytes(path.read_bytes() + _lines(record("b2", scenario="s2")))
+    finally:
+        for handle in held:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+            handle.close()
+    thread.join(10)
+    assert held and "2 records" in out[0]["summary"]
+
+
+def test_a_sidecar_still_absent_after_the_retry_in_a_read_only_directory_reads_unlocked(tmp_path) -> None:
+    import os
+    import stat
+
+    path = tmp_path / "ro" / "e.jsonl"
+    path.parent.mkdir()
+    path.write_bytes(_lines(record("b1")))
+    os.chmod(path.parent, stat.S_IRUSR | stat.S_IXUSR)
+    try:
+        if os.access(path.parent, os.W_OK):
+            pytest.skip("directory permissions are not enforced for this user")
+        assert "1 records" in ev.matrix_artifacts(path)[0]["summary"]
+    finally:
+        os.chmod(path.parent, stat.S_IRWXU)
+
+
+@pytest.mark.parametrize("code", [28, 24, 36, 40])   # ENOSPC, EMFILE, ENAMETOOLONG, ELOOP
+def test_an_unexpected_error_creating_the_sidecar_propagates(tmp_path, monkeypatch, code) -> None:
+    import builtins
+    import os
+
+    path = tmp_path / "e.jsonl"
+    path.write_bytes(_lines(record("b1")))
+    sidecar = str(path.with_name("e.jsonl.lock"))
+    real_open = builtins.open
+
+    def failing_open(file, mode="r", *args, **kwargs):
+        if os.fspath(file) == sidecar and mode == "ab":
+            raise OSError(code, os.strerror(code))
+        return real_open(file, mode, *args, **kwargs)
+
+    monkeypatch.setattr(ev, "open", failing_open, raising=False)
+    with pytest.raises(OSError) as raised:
+        ev.matrix_artifacts(path)
+    assert raised.value.errno == code

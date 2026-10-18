@@ -145,7 +145,8 @@ class EvidenceWriter:
         bytes.  An existing lock file is opened read-only, so a reader without write permission on it
         still waits for the writer; any other failure to open or lock it propagates.  Only an absent
         lock file that cannot be created (a read-only or foreign directory: an offline artifact that no
-        writer can be appending to) reads without the lock.  A missing evidence file raises
+        writer can be appending to) reads without the lock; a lock file that appears between the two
+        attempts is opened read-only and waited on.  A missing evidence file raises
         ``FileNotFoundError``.
         """
 
@@ -170,7 +171,10 @@ class EvidenceWriter:
         except OSError as error:
             if error.errno not in (errno.EACCES, errno.EPERM, errno.EROFS):
                 raise   # includes a missing directory: there is no evidence file to read either
-            return None
+        try:
+            return open(sidecar, "rb")   # a writer may have created it since the first look, unwritable for this reader
+        except FileNotFoundError:
+            return None   # still absent and not creatable here: an offline artifact
 
     @staticmethod
     def _parse(raw: bytes) -> ReadResult:
