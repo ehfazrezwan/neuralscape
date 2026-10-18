@@ -235,7 +235,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     try:
         snapshot = EvidenceWriter(evidence).snapshot_pinned()   # resolved and opened once: read, locked and identified together
-    except OSError as problem:
+    except (UnsafePath, OSError) as problem:
         print(f"error: cannot read the evidence file: {problem}", file=sys.stderr)
         return 2
     read = snapshot.result

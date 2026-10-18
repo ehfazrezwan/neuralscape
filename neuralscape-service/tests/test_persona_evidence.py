@@ -646,3 +646,14 @@ def test_a_report_guard_protects_the_file_that_was_read_even_if_the_evidence_ali
     monkeypatch.setattr(pe, "render_report", retargeting_render)
     code = pe.main(["report", "--evidence", str(alias), "--out", str(first)])
     assert code != 0 and first.read_bytes() == before
+
+
+def test_every_command_branch_turns_an_unsafe_path_into_exit_two_with_a_diagnostic(tmp_path, capsys) -> None:
+    lock_named = tmp_path / "history.lock"
+    lock_named.write_text("not evidence\n")
+    report = tmp_path / "report.md"
+    assert pe.main(["report", "--evidence", str(lock_named), "--out", str(report)]) == 2
+    assert "error" in capsys.readouterr().err and not report.exists()
+    assert pe.main(["run", "--service-dir", str(tmp_path), "--role", "baseline", "--subject-ref", "t",
+                    "--oracles", str(ORACLES), "--out", str(tmp_path / "x.lock")]) == 2
+    assert "error" in capsys.readouterr().err

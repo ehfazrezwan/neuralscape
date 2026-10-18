@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import os
+from pathlib import Path
 
 import pytest
 from pydantic import BaseModel, ValidationError
@@ -1384,3 +1386,60 @@ def test_a_file_that_appears_between_the_two_opens_is_appended_to_after_its_hist
     monkeypatch.setattr(os, "open", planting_open)
     assert writer.write(record("late", scenario="s4")) is True
     assert [item.record_id for item in writer.read().records] == ["early", "late"]
+
+
+# ---- an artifact is emitted only if its path still names the file that was read
+
+def _swap_parent(directory, replacement_files=None):
+    moved = directory.with_name(directory.name + "-moved")
+    directory.rename(moved)
+    if replacement_files is not None:
+        directory.mkdir()
+        for name, data in replacement_files.items():
+            (directory / name).write_bytes(data)
+
+
+@pytest.mark.parametrize("replacement", [None, {"e.jsonl": b""}])
+def test_an_evidence_artifact_is_refused_when_its_parent_directory_is_renamed_or_replaced_during_the_read(tmp_path, monkeypatch, replacement) -> None:
+    directory = tmp_path / "d"
+    ev.EvidenceWriter(directory / "e.jsonl").write(record("a0"))
+    real = ev.EvidenceWriter.snapshot_pinned
+
+    def swapping(self):
+        pinned = real(self)
+        _swap_parent(directory, replacement)   # after the bytes were read, before the artifact is built
+        return pinned
+
+    monkeypatch.setattr(ev.EvidenceWriter, "snapshot_pinned", swapping)
+    with pytest.raises(ev.PathChanged):
+        ev.matrix_artifacts(directory / "e.jsonl")
+
+
+@pytest.mark.parametrize("replacement", [None, {"r.md": b"other report\n"}])
+def test_a_report_artifact_is_refused_when_its_parent_directory_is_renamed_or_replaced_during_the_read(tmp_path, monkeypatch, replacement) -> None:
+    path, _ = _written(tmp_path, record("p1"))
+    reports = tmp_path / "reports"
+    reports.mkdir()
+    (reports / "r.md").write_text("report\n")
+    real = ev._pinned_read
+
+    def swapping(target):
+        pinned = real(target)
+        if Path(os.fspath(target)).name == "r.md":
+            _swap_parent(reports, replacement)
+        return pinned
+
+    monkeypatch.setattr(ev, "_pinned_read", swapping)
+    with pytest.raises(ev.PathChanged):
+        ev.matrix_artifacts(path, reports / "r.md")
+
+
+def test_a_path_changed_error_is_an_unsafe_path_so_every_handler_that_catches_one_catches_it() -> None:
+    assert issubclass(ev.PathChanged, ev.UnsafePath)
+
+
+def test_unchanged_paths_still_produce_artifacts(tmp_path) -> None:
+    path, _ = _written(tmp_path, record("p1"))
+    report = tmp_path / "r.md"
+    report.write_text("x\n")
+    assert len(ev.matrix_artifacts(path, report)) == 2

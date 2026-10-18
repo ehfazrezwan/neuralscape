@@ -294,6 +294,26 @@ def sidecar_path(path: str | os.PathLike[str]) -> Path:
     return resolved.with_name(resolved.name + ".lock")
 
 
+class PathChanged(UnsafePath):
+    """The path a result would be reported under no longer names the file that was read."""
+
+
+def _require_names(path: Path, identity: "FileIdentity") -> None:
+    """Refuse to pair a digest with ``path`` unless the path, walked afresh, still resolves to itself and names the file read.
+
+    A parent directory renamed or replaced during the read leaves the pinned descriptor on the original file
+    while the path is missing or names another one; that is an integrity error, never a mismatched artifact.
+    """
+
+    try:
+        status = os.stat(path)
+        resolved = os.path.realpath(path)
+    except OSError as problem:
+        raise PathChanged(f"the path of the file that was read no longer exists ({type(problem).__name__})") from None
+    if resolved != os.fspath(path) or _identity(status) != identity:
+        raise PathChanged("the path of the file that was read now names a different file")
+
+
 def _names(status: os.stat_result, other: object) -> bool:
     """``status`` is the file ``other`` names: a pinned identity, or (for a caller-supplied path) the file it names now."""
 
@@ -740,6 +760,7 @@ def _artifacts(
         + (f"; {len(result.invalid_lines)} invalid line(s)" if result.invalid_lines else "")
         + ("; partial tail" if result.partial_tail else "")
     )
+    _require_names(snapshot.path, snapshot.identity)   # before emitting: the digest below belongs to this path's file
     artifacts: list[dict[str, object]] = [{
         "kind": "unit", "path": str(snapshot.path), "sha256": snapshot.digest,
         "producer_lane": lane, "scope": "lane-local", "summary": summary,
@@ -747,6 +768,7 @@ def _artifacts(
     identities = [snapshot.identity] + ([snapshot.lock_identity] if snapshot.lock_identity is not None else [])
     if report_path is not None:
         pinned = _pinned_read(report_path)   # resolved, opened and read once: the path reported is the file hashed
+        _require_names(pinned.path, pinned.identity)
         artifacts.append({
             "kind": "unit", "path": str(pinned.path), "sha256": hashlib.sha256(pinned.data).hexdigest(),
             "producer_lane": lane, "scope": "lane-local", "summary": "baseline/candidate comparison report",
@@ -776,6 +798,6 @@ def write_matrix_input(
 
 __all__ = [
     "CHANGE_CLASSES", "CleanupReport", "EvidenceRecord", "EvidenceWriter", "FixtureManifest", "Observation",
-    "FileIdentity", "PinnedSnapshot", "ReadResult", "RecordConflict", "UnsafePath", "Verdict", "as_mapping", "classify", "cleanup", "compare",
+    "FileIdentity", "PathChanged", "PinnedSnapshot", "ReadResult", "RecordConflict", "UnsafePath", "Verdict", "as_mapping", "classify", "cleanup", "compare",
     "current_records", "facts", "matrix_artifacts", "render_report", "sha256_file", "write_matrix_input", "write_text_guarded",
 ]
