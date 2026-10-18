@@ -422,3 +422,74 @@ def test_a_summary_of_a_file_in_a_read_only_directory_still_works(tmp_path) -> N
 def test_a_missing_evidence_file_still_raises_for_the_matrix_summary(tmp_path) -> None:
     with pytest.raises(FileNotFoundError):
         ev.matrix_artifacts(tmp_path / "nowhere.jsonl")
+
+
+# ---- the reader's lock does not need write permission
+
+def _not_root() -> None:
+    import os
+
+    if os.geteuid() == 0:
+        pytest.skip("permission bits are not enforced for root")
+
+
+def test_a_reader_without_write_access_to_the_sidecar_still_waits_for_the_writer(tmp_path) -> None:
+    import fcntl
+    import os
+    import threading
+
+    _not_root()
+    path = tmp_path / "e.jsonl"
+    writer = ev.EvidenceWriter(path)
+    writer.write(record("b1"))
+    sidecar = path.with_name("e.jsonl.lock")
+    holder = open(sidecar, "ab")
+    fcntl.flock(holder, fcntl.LOCK_EX)
+    os.chmod(sidecar, 0o444)   # readable, not writable: the reader cannot open it for append
+    done, out = threading.Event(), []
+
+    def summarise() -> None:
+        out.append(ev.matrix_artifacts(path)[0])
+        done.set()
+
+    thread = threading.Thread(target=summarise)
+    thread.start()
+    try:
+        assert not done.wait(0.5), "a read-only consumer skipped the writer's lock"
+        path.write_bytes(path.read_bytes() + _lines(record("b2", scenario="s2")))
+    finally:
+        fcntl.flock(holder, fcntl.LOCK_UN)
+        holder.close()
+    thread.join(10)
+    assert "2 records" in out[0]["summary"]
+
+
+def test_an_unreadable_sidecar_is_an_error_not_a_silent_unlocked_read(tmp_path) -> None:
+    import os
+
+    _not_root()
+    path = tmp_path / "e.jsonl"
+    ev.EvidenceWriter(path).write(record("b1"))
+    sidecar = path.with_name("e.jsonl.lock")
+    os.chmod(sidecar, 0)
+    try:
+        with pytest.raises(PermissionError):
+            ev.matrix_artifacts(path)
+    finally:
+        os.chmod(sidecar, 0o644)
+
+
+def test_a_sidecar_that_is_a_directory_is_an_error_not_a_silent_unlocked_read(tmp_path) -> None:
+    path = tmp_path / "e.jsonl"
+    path.write_bytes(_lines(record("b1")))
+    path.with_name("e.jsonl.lock").mkdir()
+    with pytest.raises(OSError):
+        ev.matrix_artifacts(path)
+
+
+def test_an_absent_sidecar_is_created_so_a_later_writer_meets_the_reader_on_it(tmp_path) -> None:
+    path = tmp_path / "e.jsonl"
+    path.write_bytes(_lines(record("b1")))
+    assert not path.with_name("e.jsonl.lock").exists()
+    assert "1 records" in ev.matrix_artifacts(path)[0]["summary"]
+    assert path.with_name("e.jsonl.lock").exists()

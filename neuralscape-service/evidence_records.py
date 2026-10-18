@@ -13,6 +13,7 @@ percentage; the comparison classifies each scenario's change and leaves counting
 
 from __future__ import annotations
 
+import errno
 import fcntl
 import hashlib
 import json
@@ -141,14 +142,14 @@ class EvidenceWriter:
 
         The bytes are read once, under the writer's lock in shared mode, so an append in progress is
         either wholly absent or wholly present, and the records, size and digest all describe the same
-        bytes.  A directory that cannot hold the lock file has no writer, so the read proceeds without it.
-        A missing file raises ``FileNotFoundError``.
+        bytes.  An existing lock file is opened read-only, so a reader without write permission on it
+        still waits for the writer; any other failure to open or lock it propagates.  Only an absent
+        lock file that cannot be created (a read-only or foreign directory: an offline artifact that no
+        writer can be appending to) reads without the lock.  A missing evidence file raises
+        ``FileNotFoundError``.
         """
 
-        try:
-            lock = open(self._path.with_name(self._path.name + ".lock"), "ab")
-        except OSError:
-            lock = None
+        lock = self._open_shared_lock()
         try:
             if lock is not None:
                 fcntl.flock(lock, fcntl.LOCK_SH)
@@ -157,6 +158,19 @@ class EvidenceWriter:
             if lock is not None:
                 lock.close()   # closing releases the lock
         return self._parse(raw), len(raw), hashlib.sha256(raw).hexdigest()
+
+    def _open_shared_lock(self):
+        sidecar = self._path.with_name(self._path.name + ".lock")
+        try:
+            return open(sidecar, "rb")
+        except FileNotFoundError:
+            pass
+        try:
+            return open(sidecar, "ab")   # no writer has locked this file yet: create it so a later writer and this reader meet on it
+        except OSError as error:
+            if error.errno not in (errno.EACCES, errno.EPERM, errno.EROFS):
+                raise   # includes a missing directory: there is no evidence file to read either
+            return None
 
     @staticmethod
     def _parse(raw: bytes) -> ReadResult:
