@@ -51,10 +51,11 @@ def load_oracles(directory: Path) -> dict[str, tuple[dict, str]]:  # noqa: C901
     for path in sorted(directory.glob("*.json")):
         if path.name == MANIFEST:
             continue
-        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        data = path.read_bytes()   # once: the digest and the parsed document come from the same bytes
+        digest = hashlib.sha256(data).hexdigest()
         if listed.get(path.name) != digest:
             raise OracleError(f"oracle {path.name} does not match the manifest (reviewer must accept a change)")
-        document = json.loads(path.read_text())
+        document = json.loads(data.decode("utf-8"))
         if document["scenario_id"] in found:
             raise OracleError(f"two oracle files name the scenario {document['scenario_id']!r}")
         found[document["scenario_id"]] = (document, digest)
@@ -176,9 +177,12 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     read = EvidenceWriter(evidence).read()
     text = render_report(compare(read.records))
-    damaged = bool(read.invalid_lines or read.partial_tail)
+    empty = not read.records   # a truncated or never-populated file must not look like a clean, empty comparison
+    damaged = bool(read.invalid_lines or read.partial_tail or empty)
     if damaged:
         notes = ["", "## Evidence integrity", ""]
+        if empty:
+            notes.append("- the evidence file holds no records: it is empty, blank or has no valid record, so there is nothing to compare")
         if read.invalid_lines:
             notes.append(f"- {len(read.invalid_lines)} invalid line(s) at line number(s) {', '.join(map(str, read.invalid_lines[:20]))}")
         if read.partial_tail:

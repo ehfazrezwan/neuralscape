@@ -254,3 +254,85 @@ def test_a_fact_value_must_be_a_token_not_prose() -> None:
     with pytest.raises(ValidationError):
         ev.Observation(key="k", value="this sentence could carry personal data about someone")
     assert ev.Observation(key="k", value="refused").value == "refused"
+
+
+# ---- the reader applies the history checks the writer enforces
+
+def _lines(*records) -> bytes:
+    return b"".join(item.model_dump_json().encode() + b"\n" for item in records)
+
+
+def _read(tmp_path, *records):
+    path = tmp_path / "e.jsonl"
+    path.write_bytes(_lines(*records))
+    return ev.EvidenceWriter(path).read()
+
+
+def test_a_candidate_record_cannot_supersede_a_baseline_in_a_damaged_file(tmp_path) -> None:
+    baseline = record("b1", role="baseline", verdict="baseline_pass")
+    rival = record("b2", role="baseline", verdict="known_failure")
+    forged = record("c1", role="candidate", verdict="candidate_pass", supersedes="b1")
+    result = _read(tmp_path, baseline, rival, forged)
+    assert result.invalid_lines == (3,)
+    assert [item.record_id for item in result.records] == ["b1", "b2"]
+    # the competing baselines stay competing: the forged supersession did not remove one of them
+    assert ev.compare(result.records)[0]["change"] == "needs_investigation"
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"scenario": "s2"},                    # another scenario
+        {"subject_ref": "tree-2"},             # another subject
+        {"supersedes": "missing"},             # names no record at all
+    ],
+)
+def test_a_supersession_that_the_writer_would_refuse_is_an_invalid_line_on_read(tmp_path, overrides) -> None:
+    overrides = {"supersedes": "b1", **overrides}
+    result = _read(tmp_path, record("b1"), record("b2", **overrides))
+    assert result.invalid_lines == (2,) and [item.record_id for item in result.records] == ["b1"]
+
+
+def test_a_supersession_that_names_a_later_record_is_an_invalid_line(tmp_path) -> None:
+    early = record("b1", supersedes="b2")
+    result = _read(tmp_path, early, record("b2"))
+    assert result.invalid_lines == (1,) and [item.record_id for item in result.records] == ["b2"]
+
+
+def test_a_second_record_with_an_existing_id_is_an_invalid_line_even_when_identical(tmp_path) -> None:
+    first = record("b1")
+    for second in (first, record("b1", verdict="known_failure")):
+        result = _read(tmp_path, first, second)
+        assert result.invalid_lines == (2,) and result.records == (first,)
+
+
+def test_a_supersession_that_follows_the_writer_rules_is_read_and_applied(tmp_path) -> None:
+    older = record("b1", verdict="known_failure")
+    newer = record("b2", verdict="baseline_pass", supersedes="b1")
+    result = _read(tmp_path, older, newer)
+    assert result.invalid_lines == () and len(result.records) == 2
+    assert [item.record_id for item in ev.current_records(result.records)] == ["b2"]
+
+
+def test_a_record_rejected_by_history_does_not_become_a_supersession_target(tmp_path) -> None:
+    bad = record("b2", supersedes="missing")
+    later = record("b3", supersedes="b2")
+    result = _read(tmp_path, record("b1"), bad, later)
+    assert result.invalid_lines == (2, 3) and [item.record_id for item in result.records] == ["b1"]
+
+
+def test_writing_still_works_after_a_damaged_history_line(tmp_path) -> None:
+    path = tmp_path / "e.jsonl"
+    path.write_bytes(_lines(record("b1"), record("c1", role="candidate", verdict="candidate_pass", supersedes="b1")))
+    writer = ev.EvidenceWriter(path)
+    assert writer.write(record("b2", scenario="s2")) is True
+    assert [item.record_id for item in writer.read().records] == ["b1", "b2"]
+
+
+def test_the_matrix_summary_of_an_empty_evidence_file_says_it_holds_no_valid_records(tmp_path) -> None:
+    empty = tmp_path / "e.jsonl"
+    empty.write_bytes(b"")
+    assert "NO VALID RECORDS" in ev.matrix_artifacts(empty)[0]["summary"]
+    full = tmp_path / "f.jsonl"
+    full.write_bytes(_lines(record("b1")))
+    assert "NO VALID RECORDS" not in ev.matrix_artifacts(full)[0]["summary"]
