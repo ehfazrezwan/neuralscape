@@ -215,9 +215,10 @@ def capability_is_ready(
     # (``evaluated_at`` may be the very object the observation holds).
     pinned: dict[int, tuple[object, object]] = {}
     observation = _validated_observation_snapshot(observation, pinned)
-    validated_evaluation_time = _AWARE_DATETIME_ADAPTER.validate_python(
-        _pin_datetimes(evaluated_at, pinned), strict=True
-    )
+    # Only a datetime is pinned through the shared memo; anything else reaches validation unchanged (it is
+    # refused there), and is never walked as a container (a self-containing list would recurse).
+    evaluation_input = _pin_datetimes(evaluated_at, pinned) if _inherits(type(evaluated_at), datetime) else evaluated_at
+    validated_evaluation_time = _AWARE_DATETIME_ADAPTER.validate_python(evaluation_input, strict=True)
     validated_max_age = _SAFE_COUNTER_ADAPTER.validate_python(
         max_probe_age_seconds, strict=True
     )

@@ -2230,3 +2230,22 @@ def test_distinct_timestamp_objects_are_still_each_read_once() -> None:
     # each object is read once; the second object's first read is already a later read of the zone (UTC-12)
     assert capability_is_ready(observation, evaluated_at=evaluated, max_probe_age_seconds=3600) is False
     assert zone.reads == 2
+
+
+def _cyclic_list() -> list:
+    value: list = []
+    value.append(value)
+    return value
+
+
+def _cyclic_dict() -> dict:
+    value: dict = {}
+    value["self"] = value
+    return value
+
+
+@pytest.mark.parametrize("evaluated_at", [_cyclic_list(), _cyclic_dict(), [[[[[[]]]]]]], ids=["cyclic-list", "cyclic-dict", "nested-list"])
+def test_an_evaluation_time_that_is_not_a_datetime_reaches_validation_unchanged(evaluated_at) -> None:
+    observation = _fold_observation(datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc))
+    with pytest.raises(ValidationError):  # refused by the datetime validation, never walked as a container
+        capability_is_ready(observation, evaluated_at=evaluated_at, max_probe_age_seconds=3600)
