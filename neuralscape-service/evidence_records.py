@@ -217,6 +217,23 @@ def _detached(record: object) -> "EvidenceRecord":
     )
 
 
+_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+_CLOEXEC = getattr(os, "O_CLOEXEC", 0)
+_DIRECTORY_FLAGS = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | _CLOEXEC
+
+
+def _read_all(descriptor: int) -> bytes:
+    """Everything in the file behind ``descriptor``, read through that descriptor alone."""
+
+    chunks, offset = [], 0
+    while True:
+        chunk = os.pread(descriptor, 1 << 20, offset)
+        if not chunk:
+            return b"".join(chunks)
+        chunks.append(chunk)
+        offset += len(chunk)
+
+
 def sidecar_path(path: str | os.PathLike[str]) -> Path:
     """The writer's lock file, named after the resolved evidence path so every symbolic-link alias shares one lock."""
 
@@ -321,38 +338,54 @@ class EvidenceWriter:
 
         The bytes are read once, under the writer's lock in shared mode, so an append in progress is
         either wholly absent or wholly present, and the records, size and digest all describe the same
-        bytes.  An existing lock file is opened read-only, so a reader without write permission on it
-        still waits for the writer; any other failure to open or lock it propagates.  Only an absent
-        lock file that cannot be created (a read-only or foreign directory: an offline artifact that no
-        writer can be appending to) reads without the lock; a lock file that appears between the two
-        attempts is opened read-only and waited on.  A missing evidence file raises
+        bytes.  The path is resolved once and the directory is opened once; the lock file and the evidence
+        file are both opened relative to that directory, so a directory renamed or replaced afterwards
+        cannot move either.  An existing lock file is opened read-only, so a reader without write
+        permission on it still waits for the writer; any other failure to open or lock it propagates.  Only
+        an absent lock file that cannot be created (a read-only or foreign directory: an offline artifact
+        that no writer can be appending to) reads without the lock; a lock file that appears between the
+        two attempts is opened read-only and waited on.  A missing evidence file raises
         ``FileNotFoundError``.
         """
 
-        target = self._target()   # one stable file for the lock and the read, even if an alias is retargeted meanwhile
-        lock = self._open_shared_lock(target)
+        target = self._target()
+        directory = os.open(target.parent, _DIRECTORY_FLAGS)
         try:
-            if lock is not None:
-                fcntl.flock(lock, fcntl.LOCK_SH)
-            raw = target.read_bytes()
+            lock = self._open_shared_lock(target, directory)
+            try:
+                if lock is not None:
+                    fcntl.flock(lock, fcntl.LOCK_SH)
+                descriptor = os.open(target.name, os.O_RDONLY | _NOFOLLOW | _CLOEXEC, dir_fd=directory)
+                try:
+                    raw = _read_all(descriptor)
+                finally:
+                    os.close(descriptor)
+            finally:
+                if lock is not None:
+                    lock.close()   # closing releases the lock
         finally:
-            if lock is not None:
-                lock.close()   # closing releases the lock
+            os.close(directory)
         return self._parse(raw), len(raw), hashlib.sha256(raw).hexdigest()
 
-    def _open_shared_lock(self, target: Path):
-        sidecar = self._sidecar_of(target)
+    @staticmethod
+    def _in(directory: int):
+        """An ``open`` opener that resolves the name inside ``directory`` and never follows a final link."""
+
+        return lambda name, flags: os.open(name, flags | _NOFOLLOW, 0o666, dir_fd=directory)
+
+    def _open_shared_lock(self, target: Path, directory: int):
+        name = self._sidecar_of(target).name
         try:
-            return open(sidecar, "rb")
+            return open(name, "rb", opener=self._in(directory))
         except FileNotFoundError:
             pass
         try:
-            return open(sidecar, "ab")   # no writer has locked this file yet: create it so a later writer and this reader meet on it
+            return open(name, "ab", opener=self._in(directory))   # no writer has locked this file yet: create it so a later writer and this reader meet on it
         except OSError as error:
             if error.errno not in (errno.EACCES, errno.EPERM, errno.EROFS):
                 raise   # includes a missing directory: there is no evidence file to read either
         try:
-            return open(sidecar, "rb")   # a writer may have created it since the first look, unwritable for this reader
+            return open(name, "rb", opener=self._in(directory))   # a writer may have created it since the first look, unwritable for this reader
         except FileNotFoundError:
             return None   # still absent and not creatable here: an offline artifact
 
@@ -397,53 +430,69 @@ class EvidenceWriter:
         # caller's fields say.
         record = _detached(record)
         line = record.model_dump_json()
-        # Resolve the path once: an alias retargeted while this writer waits for the lock must not move the history
-        # read or the append to a file whose own lock this writer does not hold.
+        # Resolve the path once and open its directory once: the lock file, the history read and the append are all
+        # made through that directory descriptor and the one evidence descriptor, so neither an alias retargeted nor
+        # a directory renamed while this writer waits for the lock can move any step to a file it did not lock.
         evidence = self._target()
-        with self._lock, open(self._sidecar_of(evidence), "ab") as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX)
-            try:
-                self._require_plain_unaliased_file(evidence)
-                existing = {item.record_id: item for item in self._read_at(evidence).records}
-                previous = existing.get(record.record_id)
-                if previous is not None:
-                    if previous.model_dump_json() == line:
-                        return False
-                    raise RecordConflict(f"record {record.record_id!r} already exists with different content")
-                if record.supersedes is not None:
-                    target = existing.get(record.supersedes)
-                    if target is None:
-                        raise RecordConflict(f"superseded record {record.supersedes!r} does not exist")
-                    if (target.scenario_id, target.role, target.subject_ref) != (record.scenario_id, record.role, record.subject_ref):
-                        raise RecordConflict("a record may only supersede one of the same scenario, role and subject")
-                # Open the append descriptor, then judge the file it really names: a path swapped for a link since the
-                # earlier checks is caught here, before a byte is written.
-                try:
-                    descriptor = os.open(
-                        evidence, os.O_RDWR | os.O_APPEND | os.O_CREAT | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0), 0o666,
-                    )
-                except OSError as error:
-                    if error.errno == errno.ELOOP:   # the resolved file was swapped for a link since it was resolved
-                        raise UnsafePath("the evidence file was replaced by a link while the writer waited") from None
-                    raise
-                with os.fdopen(descriptor, "r+b") as handle:
-                    status = os.fstat(descriptor)
-                    self._require_appendable(status)
-                    if status.st_size and os.pread(descriptor, 1, status.st_size - 1) != b"\n":
-                        handle.write(b"\n")
-                    handle.write(line.encode("utf-8") + b"\n")
-                    handle.flush()
-                    os.fsync(descriptor)
-            finally:
-                fcntl.flock(lock, fcntl.LOCK_UN)
-        return True
-
-    def _require_plain_unaliased_file(self, target: Path) -> None:
+        directory = os.open(evidence.parent, _DIRECTORY_FLAGS)
         try:
-            status = os.stat(target)
+            with self._lock, open(self._sidecar_of(evidence).name, "ab", opener=self._in(directory)) as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX)
+                try:
+                    return self._append_locked(record, line, evidence.name, directory)
+                finally:
+                    fcntl.flock(lock, fcntl.LOCK_UN)
+        finally:
+            os.close(directory)
+
+    def _append_locked(self, record: EvidenceRecord, line: str, name: str, directory: int) -> bool:
+        flags = os.O_RDWR | os.O_APPEND | os.O_NONBLOCK | _NOFOLLOW | _CLOEXEC
+        try:
+            descriptor: int | None = os.open(name, flags, dir_fd=directory)
         except FileNotFoundError:
-            return
-        self._require_appendable(status)
+            descriptor = None   # nothing yet: the history is empty and the file is created only if the record is accepted
+        except OSError as error:
+            raise self._link_error(error)
+        try:
+            existing: dict[str, EvidenceRecord] = {}
+            if descriptor is not None:
+                self._require_appendable(os.fstat(descriptor))
+                existing = {item.record_id: item for item in self._parse(_read_all(descriptor)).records}   # the very file appended to
+            previous = existing.get(record.record_id)
+            if previous is not None:
+                if previous.model_dump_json() == line:
+                    return False
+                raise RecordConflict(f"record {record.record_id!r} already exists with different content")
+            if record.supersedes is not None:
+                target = existing.get(record.supersedes)
+                if target is None:
+                    raise RecordConflict(f"superseded record {record.supersedes!r} does not exist")
+                if (target.scenario_id, target.role, target.subject_ref) != (record.scenario_id, record.role, record.subject_ref):
+                    raise RecordConflict("a record may only supersede one of the same scenario, role and subject")
+            if descriptor is None:
+                try:
+                    descriptor = os.open(name, flags | os.O_CREAT, 0o666, dir_fd=directory)
+                except OSError as error:
+                    raise self._link_error(error)
+            status = os.fstat(descriptor)
+            self._require_appendable(status)   # judged on the descriptor that is written, before a byte is
+            data = line.encode("utf-8") + b"\n"
+            if status.st_size and os.pread(descriptor, 1, status.st_size - 1) != b"\n":
+                data = b"\n" + data
+            view = memoryview(data)
+            while view:
+                view = view[os.write(descriptor, view):]
+            os.fsync(descriptor)
+            return True
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+
+    @staticmethod
+    def _link_error(error: OSError) -> Exception:
+        if error.errno == errno.ELOOP:   # the file was replaced by a link since the path was resolved
+            return UnsafePath("the evidence file was replaced by a link while the writer waited")
+        return error
 
     def _require_appendable(self, status: os.stat_result) -> None:
         """Appending through a second hard link, to a non-plain file or to a protected file would change something else."""

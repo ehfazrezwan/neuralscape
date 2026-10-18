@@ -381,22 +381,22 @@ def test_the_matrix_summary_waits_for_a_writer_that_holds_the_lock(tmp_path) -> 
 
 def test_the_records_size_and_digest_of_a_summary_come_from_one_read(tmp_path, monkeypatch) -> None:
     import hashlib
-    from pathlib import Path
+    import os
 
     path = tmp_path / "e.jsonl"
     path.write_bytes(_lines(record("b1")))
     first = path.read_bytes()
     opened = []
-    real_open = Path.open
+    real_open = os.open
 
-    def racing_open(self, *args, **kwargs):
-        if self == path:
+    def racing_open(file, flags, *args, **kwargs):
+        if file == "e.jsonl":   # the evidence file, opened relative to its directory
             opened.append(1)
             if len(opened) > 1:   # a later reader would see an appended record
                 path.write_bytes(first + _lines(record("b2", scenario="s2")))
-        return real_open(self, *args, **kwargs)
+        return real_open(file, flags, *args, **kwargs)
 
-    monkeypatch.setattr(Path, "open", racing_open)
+    monkeypatch.setattr(os, "open", racing_open)
     artifact = ev.matrix_artifacts(path)[0]
     assert len(opened) == 1
     assert artifact["sha256"] == hashlib.sha256(first).hexdigest()
@@ -512,7 +512,7 @@ def test_a_sidecar_created_by_a_writer_between_the_readers_opens_is_still_waited
         try:
             return real_open(file, mode, *args, **kwargs)
         except FileNotFoundError:
-            if os.fspath(file) == str(sidecar) and mode == "rb" and not held:
+            if os.fspath(file) == sidecar.name and mode == "rb" and not held:
                 # the writer creates the sidecar (unwritable for this reader) and locks it right after the miss
                 handle = real_open(sidecar, "ab")
                 fcntl.flock(handle, fcntl.LOCK_EX)
@@ -567,7 +567,7 @@ def test_an_unexpected_error_creating_the_sidecar_propagates(tmp_path, monkeypat
     real_open = builtins.open
 
     def failing_open(file, mode="r", *args, **kwargs):
-        if os.fspath(file) == sidecar and mode == "ab":
+        if os.fspath(file) == os.path.basename(sidecar) and mode == "ab":
             raise OSError(code, os.strerror(code))
         return real_open(file, mode, *args, **kwargs)
 
@@ -1138,21 +1138,80 @@ def test_an_alias_retargeted_while_its_writer_waits_still_appends_to_the_file_it
 
 
 def test_a_resolved_file_swapped_for_a_link_before_the_append_is_refused(tmp_path, monkeypatch) -> None:
+    import os
+
     target = tmp_path / "e.jsonl"
     other = tmp_path / "other.jsonl"
     other.write_bytes(b"")
     writer = ev.EvidenceWriter(target)
-    real_require = writer._require_plain_unaliased_file
+    real_open = os.open
 
-    def swap_after_checks(resolved):
-        real_require(resolved)
-        if not resolved.exists():
-            resolved.symlink_to(other)   # created as a link after the early checks, before the append descriptor opens
+    def swapping_open(file, flags, *args, **kwargs):
+        if file == "e.jsonl" and flags & os.O_CREAT:
+            (tmp_path / "e.jsonl").symlink_to(other)   # created as a link after the history check, before the file is made
+        return real_open(file, flags, *args, **kwargs)
 
-    monkeypatch.setattr(writer, "_require_plain_unaliased_file", swap_after_checks)
+    monkeypatch.setattr(os, "open", swapping_open)
     with pytest.raises(ev.UnsafePath):
         writer.write(record("x"))
     assert other.read_bytes() == b""
+
+
+def test_a_directory_swapped_after_resolution_cannot_move_the_history_read_or_the_append(tmp_path, monkeypatch) -> None:
+    import fcntl
+    import os
+    import threading
+
+    d1, d2 = tmp_path / "d1", tmp_path / "d2"
+    moved = tmp_path / "d1-moved"
+    ev.EvidenceWriter(d1 / "A.jsonl").write(record("in-a", scenario="sa"))
+    ev.EvidenceWriter(d2 / "A.jsonl").write(record("in-b", scenario="sb"))
+    b_before = (d2 / "A.jsonl").read_bytes()
+    holder = open(ev.sidecar_path(d2 / "A.jsonl"), "ab")   # a stand-in writer holds the lock of the file in the other directory
+    fcntl.flock(holder, fcntl.LOCK_EX)
+    real_flock = fcntl.flock
+    swapped = threading.Event()
+
+    def swapping_flock(handle, operation):
+        result = real_flock(handle, operation)
+        if operation == fcntl.LOCK_EX and handle is not holder and not swapped.is_set():
+            swapped.set()   # the writer just took its lock: now the directory is renamed and replaced by a link
+            os.rename(d1, moved)
+            d1.symlink_to(d2)
+        return result
+
+    monkeypatch.setattr(fcntl, "flock", swapping_flock)
+    try:
+        assert ev.EvidenceWriter(d1 / "A.jsonl").write(record("new", scenario="sn")) is True
+    finally:
+        real_flock(holder, fcntl.LOCK_UN)
+        holder.close()
+    assert swapped.is_set()
+    assert (d2 / "A.jsonl").read_bytes() == b_before, "the append followed the swapped directory to a file it did not lock"
+    assert [item.record_id for item in ev.EvidenceWriter(moved / "A.jsonl").read().records] == ["in-a", "new"]
+
+
+def test_the_history_read_uses_the_file_that_is_appended_to(tmp_path, monkeypatch) -> None:
+    import os
+
+    first, second = tmp_path / "a.jsonl", tmp_path / "b.jsonl"
+    ev.EvidenceWriter(first).write(record("new", scenario="sa"))   # A already holds this id with other content
+    ev.EvidenceWriter(second).write(record("other", scenario="sb"))
+    alias = tmp_path / "alias.jsonl"
+    alias.symlink_to(first)
+    writer = ev.EvidenceWriter(alias)
+    real_target = writer._target
+
+    def retarget_after_resolution():
+        resolved = real_target()
+        alias.unlink()
+        alias.symlink_to(second)   # a later re-resolution (a history read through the path) would see B
+        return resolved
+
+    monkeypatch.setattr(writer, "_target", retarget_after_resolution)
+    with pytest.raises(ev.RecordConflict):
+        writer.write(record("new", scenario="sa", verdict="known_failure"))
+    assert [item.record_id for item in ev.EvidenceWriter(first).read().records] == ["new"]
 
 
 def test_a_tuple_subclass_of_observations_is_refused_not_passed_on(tmp_path) -> None:
