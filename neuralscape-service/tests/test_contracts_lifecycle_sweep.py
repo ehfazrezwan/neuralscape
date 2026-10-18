@@ -406,11 +406,13 @@ def test_a_native_diamond_is_refused_not_reconstructed_per_path(monkeypatch):
     assert work.materialized < 1_000, work.materialized  # the 41 objects, not the paths through them
 
 
-def test_a_diamond_of_public_views_is_refused():
+def test_a_diamond_of_public_views_is_refused(monkeypatch):
     """Each public view is observed once and its observation replayed on later paths, so the 41 views are
-    read a few times each, never once per path (2^40)."""
+    read a few times each, never once per path (2^40).  A replay does not call ``__iter__`` again, so the
+    rebuilt nodes are counted too: rebuilding the views along every path stops at the helper's cap."""
 
     from contracts_lifecycle import LIFECYCLE_TIER
+    from tests.test_contracts_lifecycle import LifecycleWork
 
     reads = [0]
 
@@ -425,9 +427,11 @@ def test_a_diamond_of_public_views_is_refused():
     for _ in range(40):
         shared = View([shared, shared])
     command = intent(ProcessingStage.CANONICAL).model_copy(update={"id": shared})
+    work = LifecycleWork(monkeypatch)
     with pytest.raises(ValueError, match=BUDGET):
         claim(command)
     assert reads[0] < 1_000, reads[0]
+    assert work.materialized <= LIFECYCLE_TIER.max_edges, work.materialized  # every rebuilt node is charged
 
 
 def test_a_view_that_never_ends_is_refused():

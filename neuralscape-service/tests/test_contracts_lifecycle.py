@@ -137,10 +137,15 @@ class LifecycleWork:
     included), ``validated`` counts strict ``model_validate`` calls per model class, and ``edges``
     is the largest charge any discovery envelope of the call reached.  A regression that does
     unbounded work fails these counts the same way on every machine.
+
+    Rebuilding stops itself at ``cap`` nodes (twice the lifecycle tier's edges by default) with an error
+    that is not the budget's, so a regression that stopped charging rebuilt nodes fails while it runs,
+    instead of rebuilding along exponentially many paths.
     """
 
-    def __init__(self, monkeypatch, *models: type[BaseModel]) -> None:
+    def __init__(self, monkeypatch, *models: type[BaseModel], cap: int | None = None) -> None:
         self.materialized = 0
+        self.cap = 2 * lifecycle_contracts.LIFECYCLE_TIER.max_edges if cap is None else cap
         self.validated: dict[str, int] = {}
         self.budgets: list = []
         work = self
@@ -148,6 +153,8 @@ class LifecycleWork:
 
         def counting_rebuild(*args, **kwargs):
             work.materialized += 1
+            if work.materialized > work.cap:
+                raise RuntimeError("the graph was rebuilt past the cap")  # not the budget's error
             return rebuild(*args, **kwargs)
 
         monkeypatch.setattr(lifecycle_contracts, "_materialize_captured_graph", counting_rebuild)
