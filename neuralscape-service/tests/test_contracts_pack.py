@@ -2694,7 +2694,7 @@ def test_an_unchanged_dynamic_reference_with_a_changed_target_is_reported(keywor
 
     old, new = schema("string"), schema("integer")  # "text" was valid, now rejected
     findings = _pair(old, new) if entry == "check_compatibility" else pack.compare_schemas({"C": old}, {"C": new}).get("C", [])
-    assert any(keyword in f for f in findings), findings
+    assert any(f.startswith(f"$: unverified change: {keyword} changed") for f in findings), findings  # compared in context
     unchanged = _pair(schema("string"), schema("string")) if entry == "check_compatibility" else pack.compare_schemas({"C": schema("string")}, {"C": schema("string")}).get("C", [])
     assert unchanged == []
 
@@ -2720,3 +2720,63 @@ def test_a_keyword_not_understood_fails_closed_when_its_siblings_change(keyword,
 )
 def test_an_understood_keyword_does_not_fail_closed_on_an_independent_sibling_change(keyword, value) -> None:
     assert _pair({"type": "string", "maxLength": 5, keyword: value}, {"type": "string", "maxLength": 10, keyword: value}) == []
+
+
+# ---- an unknown keyword beside a reference is guarded like one on the target
+
+
+@pytest.mark.parametrize("keyword, value", [("x-vendor", 1), ("nullable", True), ("additionalItems", False), ("foo", "bar")])
+@pytest.mark.parametrize("entry", ["check_compatibility", "compare_schemas"])
+def test_a_keyword_not_understood_beside_a_reference_fails_closed_when_the_target_changes(keyword, value, entry) -> None:
+    def schema(target: dict) -> dict:
+        return {"$defs": {"T": target}, "type": "object", "properties": {"p": {"$ref": "#/$defs/T", keyword: value}}}
+
+    old, new = schema({"type": "string", "maxLength": 3}), schema({"type": "string"})  # a widening of the target
+    findings = _pair(old, new) if entry == "check_compatibility" else pack.compare_schemas({"C": old}, {"C": new}).get("C", [])
+    assert any(f.startswith("$.p: unverified change: a schema with a keyword not modelled") for f in findings), findings
+    assert _pair(old, copy.deepcopy(old)) == []
+
+
+def test_an_annotation_only_change_beside_an_unknown_keyword_stays_clean() -> None:
+    old = {"type": "string", "x-vendor": 1, "description": "before"}
+    assert _pair(old, {**old, "description": "after", "title": "t"}) == []
+    beside = {"$defs": {"T": {"type": "string"}}, "properties": {"p": {"$ref": "#/$defs/T", "x-vendor": 1, "description": "a"}}}
+    changed = copy.deepcopy(beside)
+    changed["properties"]["p"]["description"] = "b"
+    assert _pair(beside, changed) == []
+
+
+# ---- the context guard beside a reference: before the recursion shortcut, and blind to annotations
+
+
+def _recursive_node_beside(node_extra: dict) -> dict:
+    node = {"type": "object", "properties": {"child": {"$ref": "#/$defs/Node", "x-vendor": 1}}, **node_extra}
+    return {"$defs": {"Node": node}, "$ref": "#/$defs/Node"}
+
+
+@pytest.mark.parametrize("entry", ["check_compatibility", "compare_schemas"])
+def test_an_unknown_keyword_beside_a_recursive_reference_is_guarded(entry) -> None:
+    old, new = _recursive_node_beside({"maxProperties": 1}), _recursive_node_beside({})  # Copilot's case
+    findings = _pair(old, new) if entry == "check_compatibility" else pack.compare_schemas({"C": old}, {"C": new}).get("C", [])
+    assert any("keyword not modelled" in f for f in findings), findings
+    assert _pair(old, copy.deepcopy(old)) == []
+
+
+@pytest.mark.parametrize("entry", ["check_compatibility", "compare_schemas"])
+def test_an_annotation_only_edit_of_a_referenced_target_stays_clean(entry) -> None:
+    def schema(description: str) -> dict:
+        return {"$defs": {"T": {"type": "string", "description": description, "examples": ["a"]}},
+                "type": "object", "properties": {"p": {"$ref": "#/$defs/T", "x-vendor": 1}}}
+
+    old, new = schema("before"), schema("after")  # documentation only
+    findings = _pair(old, new) if entry == "check_compatibility" else pack.compare_schemas({"C": old}, {"C": new}).get("C", [])
+    assert findings == [], findings
+
+
+def test_a_real_target_change_beside_an_unknown_keyword_is_still_reported_and_literals_still_count() -> None:
+    def schema(target: dict) -> dict:
+        return {"$defs": {"T": target}, "type": "object", "properties": {"p": {"$ref": "#/$defs/T", "x-vendor": 1}}}
+
+    assert _pair(schema({"type": "string", "maxLength": 3}), schema({"type": "string"})) != []
+    assert _pair(schema({"const": {"description": "a"}}), schema({"const": {"description": "b"}})) != []  # data, not an annotation
+    assert _pair(schema({"properties": {"title": {"type": "string"}}}), schema({"properties": {"title": {"type": "integer"}}})) != []  # a name
