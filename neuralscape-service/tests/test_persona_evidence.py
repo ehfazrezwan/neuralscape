@@ -452,16 +452,16 @@ def test_an_oracle_is_read_once_so_the_digest_and_the_parsed_document_share_byte
     changed = json.loads(original)
     changed["expected"]["candidate"]["verdict"] = "known_failure"
     opened = []
-    real_open = Path.open
+    real_open = os.open
 
-    def racing_open(self, *args, **kwargs):
-        if self == target:
+    def racing_open(file, flags, *args, **kwargs):
+        if file == target.name:   # the oracle, opened relative to its directory
             opened.append(1)
             if len(opened) > 1:   # a second reader would see the file after it changed
                 target.write_text(json.dumps(changed))
-        return real_open(self, *args, **kwargs)
+        return real_open(file, flags, *args, **kwargs)
 
-    monkeypatch.setattr(Path, "open", racing_open)
+    monkeypatch.setattr(os, "open", racing_open)
     document, digest = pe.load_oracles(copy)["persona-lifecycle-state"]
     assert len(opened) == 1
     assert document == json.loads(original) and digest == hashlib.sha256(original).hexdigest()
@@ -539,3 +539,121 @@ def test_only_the_requested_module_or_a_missing_ancestor_is_absent(fake_path, re
     else:
         with pytest.raises(ModuleNotFoundError):
             persona_probes._need(requested)
+
+
+# ---- the commands never replace the evidence history or an oracle
+
+def _aliased(tmp_path, target):
+    link, hard = tmp_path / "sym.out", tmp_path / "hard.out"
+    link.symlink_to(target)
+    os.link(target, hard)
+    return [target, link, hard]
+
+
+def test_report_out_naming_the_evidence_file_by_any_alias_is_refused_and_the_history_survives(tmp_path, capsys) -> None:
+    out = tmp_path / "evidence.jsonl"
+    pe.run(tmp_path, "baseline", "tree-a", ORACLES, out, "run-1")
+    before = out.read_bytes()
+    for alias in _aliased(tmp_path, out) + [out.with_name(out.name + ".lock")]:
+        assert pe.main(["report", "--evidence", str(out), "--out", str(alias)]) != 0
+        assert out.read_bytes() == before, alias
+    assert "cannot write the report" in capsys.readouterr().err
+
+
+def test_report_out_that_is_a_directory_or_unwritable_is_an_error_exit(tmp_path, capsys) -> None:
+    out = tmp_path / "evidence.jsonl"
+    pe.run(tmp_path, "baseline", "tree-a", ORACLES, out, "run-1")
+    assert pe.main(["report", "--evidence", str(out), "--out", str(tmp_path)]) != 0
+    assert "cannot write the report" in capsys.readouterr().err
+
+
+def test_run_out_naming_an_oracle_or_the_manifest_by_any_alias_is_refused_and_the_oracle_is_unchanged(tmp_path, capsys) -> None:
+    copy = _oracle_copy(tmp_path)
+    target = copy / "persona-lifecycle-state.json"
+    before = target.read_bytes()
+    for oracle in (target, copy / pe.MANIFEST):
+        for alias in _aliased(tmp_path, oracle):
+            code = pe.main(["run", "--service-dir", str(tmp_path), "--role", "baseline", "--subject-ref", "t",
+                            "--oracles", str(copy), "--out", str(alias)])
+            assert code == 2
+            alias.unlink() if alias.is_symlink() or alias.name == "hard.out" else None
+    assert target.read_bytes() == before
+    assert "same file" in capsys.readouterr().err
+
+
+def test_report_to_a_new_file_and_run_to_a_new_file_still_work(tmp_path) -> None:
+    out = tmp_path / "evidence.jsonl"
+    assert pe.main(["run", "--service-dir", str(tmp_path), "--role", "baseline", "--subject-ref", "t",
+                    "--oracles", str(ORACLES), "--out", str(out)]) == 0
+    report = tmp_path / "report.md"
+    assert pe.main(["report", "--evidence", str(out), "--out", str(report)]) == 0 and report.read_text().startswith("# Baseline")
+    assert pe.main(["report", "--evidence", str(out), "--out", str(report)]) == 0   # replacing a report is fine
+
+
+def test_an_output_swapped_for_a_link_to_an_oracle_during_observation_is_not_appended_to(tmp_path, monkeypatch) -> None:
+    copy = _oracle_copy(tmp_path)
+    oracle = copy / "persona-lifecycle-state.json"
+    manifest = copy / pe.MANIFEST
+    before = (oracle.read_bytes(), manifest.read_bytes())
+    out = tmp_path / "evidence.jsonl"
+    real_observe = pe.observe
+
+    def swapping_observe(service_dir):
+        observed = real_observe(service_dir)
+        out.symlink_to(oracle)   # replaced while the tree under test was running
+        return observed
+
+    monkeypatch.setattr(pe, "observe", swapping_observe)
+    with pytest.raises(pe.UnsafePath):
+        pe.run(tmp_path, "baseline", "tree-a", copy, out, "run-1")
+    assert (oracle.read_bytes(), manifest.read_bytes()) == before
+
+
+def test_main_reports_an_output_swapped_during_observation_as_an_error_exit(tmp_path, monkeypatch, capsys) -> None:
+    copy = _oracle_copy(tmp_path)
+    oracle = copy / "persona-card-freshness.json"
+    before = oracle.read_bytes()
+    out = tmp_path / "evidence.jsonl"
+    real_observe = pe.observe
+
+    def swapping_observe(service_dir):
+        observed = real_observe(service_dir)
+        out.symlink_to(oracle)
+        return observed
+
+    monkeypatch.setattr(pe, "observe", swapping_observe)
+    code = pe.main(["run", "--service-dir", str(tmp_path), "--role", "baseline", "--subject-ref", "t",
+                    "--oracles", str(copy), "--out", str(out)])
+    assert code == 2 and oracle.read_bytes() == before
+    assert "same file" in capsys.readouterr().err
+
+
+def test_a_report_guard_protects_the_file_that_was_read_even_if_the_evidence_alias_is_retargeted(tmp_path, monkeypatch) -> None:
+    first, second = tmp_path / "a.jsonl", tmp_path / "b.jsonl"
+    pe.run(tmp_path, "baseline", "tree-a", ORACLES, first, "run-1")
+    pe.run(tmp_path, "baseline", "tree-b", ORACLES, second, "run-2")
+    alias = tmp_path / "alias.jsonl"
+    alias.symlink_to(first)
+    before = first.read_bytes()
+    real_render = pe.render_report
+
+    def retargeting_render(rows):
+        text = real_render(rows)
+        alias.unlink()
+        alias.symlink_to(second)   # retargeted after the history was read
+        return text
+
+    monkeypatch.setattr(pe, "render_report", retargeting_render)
+    code = pe.main(["report", "--evidence", str(alias), "--out", str(first)])
+    assert code != 0 and first.read_bytes() == before
+
+
+def test_every_command_branch_turns_an_unsafe_path_into_exit_two_with_a_diagnostic(tmp_path, capsys) -> None:
+    lock_named = tmp_path / "history.lock"
+    lock_named.write_text("not evidence\n")
+    report = tmp_path / "report.md"
+    assert pe.main(["report", "--evidence", str(lock_named), "--out", str(report)]) == 2
+    assert "error" in capsys.readouterr().err and not report.exists()
+    assert pe.main(["run", "--service-dir", str(tmp_path), "--role", "baseline", "--subject-ref", "t",
+                    "--oracles", str(ORACLES), "--out", str(tmp_path / "x.lock")]) == 2
+    assert "error" in capsys.readouterr().err
