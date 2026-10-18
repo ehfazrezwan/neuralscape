@@ -9,6 +9,16 @@ The writer is append-only.  A partial or invalid attempt is recorded as such and
 a later record may *supersede* an earlier one by naming it, and the earlier record stays readable.
 Cleanup deletes only identifiers that a fixture manifest recorded.  Nothing here computes a pass
 percentage; the comparison classifies each scenario's change and leaves counting to the reader.
+
+Threat model.  Every path argument is resolved once, on entry, into pinned descriptors: the directory is
+opened once and the files are opened relative to it without following a final link, and each later step (the
+lock, the history read, the digest, the comparison against files that must not be replaced, the append and the
+path reported in an artifact) uses those descriptors and the ``(st_dev, st_ino)`` identities taken from them,
+never the path again.  New files are created exclusively, and a file that turns up afterwards is read and its
+history checked like any other.  Protected against: symbolic-link and hard-link aliases, an alias or a
+directory retargeted while a writer or reader waits, and concurrent appenders that use the provided lock file.
+Out of scope: an attacker with arbitrary write access to the evidence directory itself (who can delete or
+replace the files and the lock file outright), and writers that ignore the lock protocol.
 """
 
 from __future__ import annotations
@@ -23,7 +33,7 @@ import threading
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Annotated, Literal
+from typing import Annotated, Literal, NamedTuple
 
 from pydantic import BaseModel, StringConstraints, ValidationError, model_validator
 
@@ -222,6 +232,49 @@ _CLOEXEC = getattr(os, "O_CLOEXEC", 0)
 _DIRECTORY_FLAGS = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | _CLOEXEC
 
 
+class FileIdentity(NamedTuple):
+    """The ``(st_dev, st_ino)`` of an opened file: what a guard compares instead of a path."""
+
+    device: int
+    inode: int
+
+
+def _identity(status: os.stat_result) -> FileIdentity:
+    return FileIdentity(status.st_dev, status.st_ino)
+
+
+class PinnedSnapshot(NamedTuple):
+    """One consistent state of an evidence file, with the resolved path and identities it was read under."""
+
+    result: "ReadResult"
+    size: int
+    digest: str
+    path: Path
+    identity: FileIdentity
+    lock_identity: FileIdentity | None
+
+
+class _PinnedFile(NamedTuple):
+    path: Path
+    identity: FileIdentity
+    data: bytes
+
+
+def _pinned_read(path: str | os.PathLike[str]) -> _PinnedFile:
+    """Resolve ``path`` once, open its directory and the file without following a final link, read it once."""
+
+    target = Path(os.path.realpath(os.fspath(path)))
+    directory = os.open(target.parent, _DIRECTORY_FLAGS)
+    try:
+        descriptor = os.open(target.name, os.O_RDONLY | _NOFOLLOW | _CLOEXEC, dir_fd=directory)
+        try:
+            return _PinnedFile(target, _identity(os.fstat(descriptor)), _read_all(descriptor))
+        finally:
+            os.close(descriptor)
+    finally:
+        os.close(directory)
+
+
 def _read_all(descriptor: int) -> bytes:
     """Everything in the file behind ``descriptor``, read through that descriptor alone."""
 
@@ -241,8 +294,16 @@ def sidecar_path(path: str | os.PathLike[str]) -> Path:
     return resolved.with_name(resolved.name + ".lock")
 
 
-def _same_file(first: os.stat_result, second: os.stat_result) -> bool:
-    return (first.st_dev, first.st_ino) == (second.st_dev, second.st_ino)
+def _names(status: os.stat_result, other: object) -> bool:
+    """``status`` is the file ``other`` names: a pinned identity, or (for a caller-supplied path) the file it names now."""
+
+    if type(other) is FileIdentity:
+        return _identity(status) == other
+    try:
+        found = os.stat(os.fspath(other))   # type: ignore[arg-type]
+    except FileNotFoundError:
+        return False
+    return (status.st_dev, status.st_ino) == (found.st_dev, found.st_ino)
 
 
 def write_text_guarded(path: str | os.PathLike[str], text: str, protected: Iterable[str | os.PathLike[str]]) -> None:
@@ -254,18 +315,15 @@ def write_text_guarded(path: str | os.PathLike[str], text: str, protected: Itera
 
     path = os.fspath(path)   # a path-like object is asked for its path once
     text = _exact_required_text(text)
-    others = [os.fspath(other) for other in protected]   # the iterable is consumed once
+    others = [other if type(other) is FileIdentity else os.fspath(other) for other in protected]   # consumed once
     descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | getattr(os, "O_NONBLOCK", 0), 0o666)   # no truncation yet
     try:
         status = os.fstat(descriptor)
         if not stat.S_ISREG(status.st_mode):
             raise UnsafePath("the output is not a plain file")
         for other in others:
-            try:
-                if _same_file(status, os.stat(other)):
-                    raise UnsafePath("the output is the same file as an input or an evidence file it must not replace")
-            except FileNotFoundError:
-                continue
+            if _names(status, other):
+                raise UnsafePath("the output is the same file as an input or an evidence file it must not replace")
         os.ftruncate(descriptor, 0)
         with os.fdopen(descriptor, "w", encoding="utf-8", closefd=False) as handle:
             handle.write(text)
@@ -301,8 +359,8 @@ def _history_allows(record: EvidenceRecord, accepted: Mapping[str, EvidenceRecor
 class EvidenceWriter:
     """Append-only JSON Lines evidence file."""
 
-    def __init__(self, path: str | os.PathLike[str], protected: Iterable[str | os.PathLike[str]] = ()) -> None:
-        self._protected = tuple(Path(item) for item in protected)   # files an append must never reach, by inode
+    def __init__(self, path: str | os.PathLike[str], protected: Iterable[FileIdentity | str | os.PathLike[str]] = ()) -> None:
+        self._protected = tuple(item if type(item) is FileIdentity else Path(item) for item in protected)   # files an append must never reach, by inode
         self._path = Path(path)
         if self._path.name.endswith(".lock"):
             raise UnsafePath("an evidence file name must not end in .lock: that suffix names the writer's lock file")
@@ -326,14 +384,20 @@ class EvidenceWriter:
         return self._sidecar_of(self._target())
 
     def read(self) -> ReadResult:
-        return self._read_at(self._target())
+        """The records and damage of the file as it is now (not locked); a missing file reads as empty."""
 
-    def _read_at(self, target: Path) -> ReadResult:
-        if not target.exists():
+        try:
+            return self._parse(_pinned_read(self._path).data)
+        except FileNotFoundError:
             return ReadResult((), (), False)
-        return self._parse(target.read_bytes())
 
     def snapshot(self) -> tuple[ReadResult, int, str]:
+        """``snapshot_pinned`` without the path and identities."""
+
+        pinned = self.snapshot_pinned()
+        return pinned.result, pinned.size, pinned.digest
+
+    def snapshot_pinned(self) -> PinnedSnapshot:
         """The parsed records, the byte count and the SHA-256 of one consistent state of the file.
 
         The bytes are read once, under the writer's lock in shared mode, so an append in progress is
@@ -345,7 +409,8 @@ class EvidenceWriter:
         an absent lock file that cannot be created (a read-only or foreign directory: an offline artifact
         that no writer can be appending to) reads without the lock; a lock file that appears between the
         two attempts is opened read-only and waited on.  A missing evidence file raises
-        ``FileNotFoundError``.
+        ``FileNotFoundError``.  The resolved path and the identities of the files it was read from come back
+        with the bytes, so a caller reports and guards exactly what was read.
         """
 
         target = self._target()
@@ -358,14 +423,16 @@ class EvidenceWriter:
                 descriptor = os.open(target.name, os.O_RDONLY | _NOFOLLOW | _CLOEXEC, dir_fd=directory)
                 try:
                     raw = _read_all(descriptor)
+                    identity = _identity(os.fstat(descriptor))
                 finally:
                     os.close(descriptor)
+                lock_identity = None if lock is None else _identity(os.fstat(lock.fileno()))
             finally:
                 if lock is not None:
                     lock.close()   # closing releases the lock
         finally:
             os.close(directory)
-        return self._parse(raw), len(raw), hashlib.sha256(raw).hexdigest()
+        return PinnedSnapshot(self._parse(raw), len(raw), hashlib.sha256(raw).hexdigest(), target, identity, lock_identity)
 
     @staticmethod
     def _in(directory: int):
@@ -447,46 +514,50 @@ class EvidenceWriter:
 
     def _append_locked(self, record: EvidenceRecord, line: str, name: str, directory: int) -> bool:
         flags = os.O_RDWR | os.O_APPEND | os.O_NONBLOCK | _NOFOLLOW | _CLOEXEC
-        try:
-            descriptor: int | None = os.open(name, flags, dir_fd=directory)
-        except FileNotFoundError:
-            descriptor = None   # nothing yet: the history is empty and the file is created only if the record is accepted
-        except OSError as error:
-            raise self._link_error(error)
-        try:
-            existing: dict[str, EvidenceRecord] = {}
-            if descriptor is not None:
-                self._require_appendable(os.fstat(descriptor))
-                existing = {item.record_id: item for item in self._parse(_read_all(descriptor)).records}   # the very file appended to
-            previous = existing.get(record.record_id)
-            if previous is not None:
-                if previous.model_dump_json() == line:
-                    return False
-                raise RecordConflict(f"record {record.record_id!r} already exists with different content")
-            if record.supersedes is not None:
-                target = existing.get(record.supersedes)
-                if target is None:
-                    raise RecordConflict(f"superseded record {record.supersedes!r} does not exist")
-                if (target.scenario_id, target.role, target.subject_ref) != (record.scenario_id, record.role, record.subject_ref):
-                    raise RecordConflict("a record may only supersede one of the same scenario, role and subject")
-            if descriptor is None:
-                try:
-                    descriptor = os.open(name, flags | os.O_CREAT, 0o666, dir_fd=directory)
-                except OSError as error:
-                    raise self._link_error(error)
-            status = os.fstat(descriptor)
-            self._require_appendable(status)   # judged on the descriptor that is written, before a byte is
-            data = line.encode("utf-8") + b"\n"
-            if status.st_size and os.pread(descriptor, 1, status.st_size - 1) != b"\n":
-                data = b"\n" + data
-            view = memoryview(data)
-            while view:
-                view = view[os.write(descriptor, view):]
-            os.fsync(descriptor)
-            return True
-        finally:
-            if descriptor is not None:
-                os.close(descriptor)
+        for _attempt in range(4):
+            try:
+                descriptor: int | None = os.open(name, flags, dir_fd=directory)
+            except FileNotFoundError:
+                descriptor = None   # nothing yet: the history is empty and the file is created only if the record is accepted
+            except OSError as error:
+                raise self._link_error(error)
+            try:
+                existing: dict[str, EvidenceRecord] = {}
+                if descriptor is not None:
+                    self._require_appendable(os.fstat(descriptor))
+                    existing = {item.record_id: item for item in self._parse(_read_all(descriptor)).records}   # the very file appended to
+                previous = existing.get(record.record_id)
+                if previous is not None:
+                    if previous.model_dump_json() == line:
+                        return False
+                    raise RecordConflict(f"record {record.record_id!r} already exists with different content")
+                if record.supersedes is not None:
+                    target = existing.get(record.supersedes)
+                    if target is None:
+                        raise RecordConflict(f"superseded record {record.supersedes!r} does not exist")
+                    if (target.scenario_id, target.role, target.subject_ref) != (record.scenario_id, record.role, record.subject_ref):
+                        raise RecordConflict("a record may only supersede one of the same scenario, role and subject")
+                if descriptor is None:
+                    try:
+                        descriptor = os.open(name, flags | os.O_CREAT | os.O_EXCL, 0o666, dir_fd=directory)
+                    except FileExistsError:
+                        continue   # a file appeared after the first look: open it and run the history checks on it
+                    except OSError as error:
+                        raise self._link_error(error)
+                status = os.fstat(descriptor)
+                self._require_appendable(status)   # judged on the descriptor that is written, before a byte is
+                data = line.encode("utf-8") + b"\n"
+                if status.st_size and os.pread(descriptor, 1, status.st_size - 1) != b"\n":
+                    data = b"\n" + data
+                view = memoryview(data)
+                while view:
+                    view = view[os.write(descriptor, view):]
+                os.fsync(descriptor)
+                return True
+            finally:
+                if descriptor is not None:
+                    os.close(descriptor)
+        raise UnsafePath("the evidence file keeps appearing and disappearing; refusing to guess its history")
 
     @staticmethod
     def _link_error(error: OSError) -> Exception:
@@ -502,11 +573,8 @@ class EvidenceWriter:
         if status.st_nlink > 1:
             raise UnsafePath("the evidence file has more than one hard link: an append would also change the other names")
         for other in self._protected:
-            try:
-                if _same_file(status, os.stat(other)):
-                    raise UnsafePath("the evidence file is the same file as an oracle or the manifest")
-            except FileNotFoundError:
-                continue
+            if _names(status, other):
+                raise UnsafePath("the evidence file is the same file as an oracle or the manifest")
 
 
 def current_records(records: Iterable[EvidenceRecord]) -> list[EvidenceRecord]:
@@ -647,10 +715,19 @@ def matrix_artifacts(
     generator reads them from ``evidence-records.json`` written by ``write_matrix_input``.
     """
 
-    evidence = os.fspath(evidence_path)   # a path-like object is asked for its path once
-    report = None if report_path is None else os.fspath(report_path)
+    return _artifacts(evidence_path, report_path, producer_lane)[0]
+
+
+def _artifacts(
+    evidence_path: str | os.PathLike[str],
+    report_path: str | os.PathLike[str] | None,
+    producer_lane: str,
+) -> tuple[list[dict[str, object]], list[FileIdentity]]:
+    """The artifacts and the identities of every file they were read from (evidence, its lock file, the report)."""
+
     lane = _exact_required_text(producer_lane)
-    result, size, digest = EvidenceWriter(evidence).snapshot()
+    snapshot = EvidenceWriter(os.fspath(evidence_path)).snapshot_pinned()   # a path-like object is asked once
+    result = snapshot.result
     rows = compare(result.records)
     counts: dict[str, int] = {}
     for row in rows:
@@ -658,21 +735,24 @@ def matrix_artifacts(
     summary = (
         f"{len(result.records)} records over {len(rows)} scenarios; changes: "
         + ", ".join(f"{name} {count}" for name, count in sorted(counts.items()))
-        + f"; {size} bytes when hashed (the hash goes stale if records are appended later)"
+        + f"; {snapshot.size} bytes when hashed (the hash goes stale if records are appended later)"
         + ("; NO VALID RECORDS" if not result.records else "")
         + (f"; {len(result.invalid_lines)} invalid line(s)" if result.invalid_lines else "")
         + ("; partial tail" if result.partial_tail else "")
     )
-    artifacts = [{
-        "kind": "unit", "path": str(Path(evidence).resolve()), "sha256": digest,
+    artifacts: list[dict[str, object]] = [{
+        "kind": "unit", "path": str(snapshot.path), "sha256": snapshot.digest,
         "producer_lane": lane, "scope": "lane-local", "summary": summary,
     }]
-    if report is not None:
+    identities = [snapshot.identity] + ([snapshot.lock_identity] if snapshot.lock_identity is not None else [])
+    if report_path is not None:
+        pinned = _pinned_read(report_path)   # resolved, opened and read once: the path reported is the file hashed
         artifacts.append({
-            "kind": "unit", "path": str(Path(report).resolve()), "sha256": sha256_file(report),
+            "kind": "unit", "path": str(pinned.path), "sha256": hashlib.sha256(pinned.data).hexdigest(),
             "producer_lane": lane, "scope": "lane-local", "summary": "baseline/candidate comparison report",
         })
-    return artifacts
+        identities.append(pinned.identity)
+    return artifacts, identities
 
 
 def write_matrix_input(
@@ -682,21 +762,20 @@ def write_matrix_input(
     """Write ``{"rows": {row_id: [artifact, ...]}}`` for the matrix generator to attach."""
 
     rows: dict[str, list[dict[str, object]]] = {}
-    protected: list[Path] = []
+    protected: list[FileIdentity] = []
     for row_ids, evidence_path, report_path in list(entries):
         names = [_exact_required_text(row_id) for row_id in row_ids]
         evidence = os.fspath(evidence_path)   # each path-like object is asked once
         report = None if report_path is None else os.fspath(report_path)
+        artifacts, identities = _artifacts(evidence, report, "I")   # one pinned read per entry: shared by every row id
         for row_id in names:
-            rows.setdefault(row_id, []).extend(matrix_artifacts(evidence, report))
-        for named in (evidence, report):
-            if named is not None:
-                protected += [Path(named), sidecar_path(named)]
+            rows.setdefault(row_id, []).extend(dict(item) for item in artifacts)
+        protected += identities
     write_text_guarded(os.fspath(out_path), json.dumps({"schema_version": "evidence-records-v1", "rows": rows}, indent=1, sort_keys=True), protected)
 
 
 __all__ = [
     "CHANGE_CLASSES", "CleanupReport", "EvidenceRecord", "EvidenceWriter", "FixtureManifest", "Observation",
-    "ReadResult", "RecordConflict", "UnsafePath", "Verdict", "as_mapping", "classify", "cleanup", "compare",
+    "FileIdentity", "PinnedSnapshot", "ReadResult", "RecordConflict", "UnsafePath", "Verdict", "as_mapping", "classify", "cleanup", "compare",
     "current_records", "facts", "matrix_artifacts", "render_report", "sha256_file", "write_matrix_input", "write_text_guarded",
 ]

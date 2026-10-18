@@ -1241,3 +1241,146 @@ def test_a_tuple_subclass_of_texts_is_refused(tmp_path) -> None:
     object.__getattribute__(changed, "__dict__")["artifact_hashes"] = Tup((DIGEST,))
     with pytest.raises(TypeError):
         _written(tmp_path)[1].write(changed)
+
+
+# ---- paths are pinned once: the four retargeting shapes
+
+def _blocked_on(path):
+    """Hold the lock of ``path`` the way a writer does; returns the handle to release."""
+
+    import fcntl
+
+    holder = open(ev.sidecar_path(path), "ab")
+    fcntl.flock(holder, fcntl.LOCK_EX)
+    return holder
+
+
+def _release(holder) -> None:
+    import fcntl
+
+    fcntl.flock(holder, fcntl.LOCK_UN)
+    holder.close()
+
+
+def test_matrix_input_protects_the_file_it_read_even_if_the_input_alias_is_retargeted_during_the_snapshot(tmp_path) -> None:
+    import threading
+
+    first, second = tmp_path / "a.jsonl", tmp_path / "b.jsonl"
+    ev.EvidenceWriter(first).write(record("a0"))
+    ev.EvidenceWriter(second).write(record("b0", scenario="sb"))
+    alias = tmp_path / "alias.jsonl"
+    alias.symlink_to(first)
+    before = first.read_bytes()
+    holder = _blocked_on(first)
+    outcome: list = []
+
+    def build() -> None:
+        try:
+            ev.write_matrix_input(first, [(["row"], alias, None)])   # the output names the file the alias pointed at
+            outcome.append("written")
+        except ev.UnsafePath as refused:
+            outcome.append(refused)
+
+    thread = threading.Thread(target=build)
+    thread.start()
+    thread.join(0.5)
+    assert thread.is_alive()
+    alias.unlink()
+    alias.symlink_to(second)          # retargeted while the snapshot waits for the first file's lock
+    _release(holder)
+    thread.join(10)
+    assert isinstance(outcome[0], ev.UnsafePath), outcome
+    assert first.read_bytes() == before
+
+
+def test_an_artifact_names_the_file_whose_digest_and_summary_it_carries_when_the_alias_is_retargeted(tmp_path) -> None:
+    import hashlib
+    import threading
+
+    first, second = tmp_path / "a.jsonl", tmp_path / "b.jsonl"
+    ev.EvidenceWriter(first).write(record("a0"))
+    ev.EvidenceWriter(second).write(record("b0", scenario="sb"))
+    ev.EvidenceWriter(second).write(record("b1", scenario="sc"))
+    alias = tmp_path / "alias.jsonl"
+    alias.symlink_to(first)
+    holder = _blocked_on(first)
+    out: list = []
+    thread = threading.Thread(target=lambda: out.append(ev.matrix_artifacts(alias)[0]))
+    thread.start()
+    thread.join(0.5)
+    assert thread.is_alive()
+    alias.unlink()
+    alias.symlink_to(second)
+    _release(holder)
+    thread.join(10)
+    artifact = out[0]
+    assert artifact["path"] == str(first.resolve())
+    assert artifact["sha256"] == hashlib.sha256(first.read_bytes()).hexdigest() and "1 records" in artifact["summary"]
+
+
+def test_a_report_artifact_names_the_file_it_hashed_when_its_alias_is_retargeted_after_resolution(tmp_path, monkeypatch) -> None:
+    import hashlib
+    import os
+
+    path, _ = _written(tmp_path, record("p1"))
+    one, two = tmp_path / "r1.md", tmp_path / "r2.md"
+    one.write_text("report one\n")
+    two.write_text("report two\n")
+    alias = tmp_path / "report-alias.md"
+    alias.symlink_to(one)
+    real = os.path.realpath
+    seen: list[str] = []
+
+    def retargeting(candidate, *args, **kwargs):
+        resolved = real(candidate, *args, **kwargs)
+        if os.fspath(candidate) == str(alias) and not seen:
+            seen.append("x")
+            alias.unlink()
+            alias.symlink_to(two)   # retargeted right after the report path was resolved
+        return resolved
+
+    monkeypatch.setattr(os.path, "realpath", retargeting)
+    report = ev.matrix_artifacts(path, alias)[1]
+    assert report["path"] == str(one.resolve())
+    assert report["sha256"] == hashlib.sha256(one.read_bytes()).hexdigest()
+
+
+def test_a_file_that_appears_between_the_two_opens_has_its_history_checked(tmp_path, monkeypatch) -> None:
+    import os
+
+    path = tmp_path / "e.jsonl"
+    writer = ev.EvidenceWriter(path)
+    other = record("dup", scenario="s2", verdict="known_failure")
+    real_open = os.open
+    state = {"planted": False}
+
+    def planting_open(file, flags, *args, **kwargs):
+        if file == "e.jsonl" and flags & os.O_CREAT and not state["planted"]:
+            state["planted"] = True
+            path.write_bytes(_lines(other))   # a file with a conflicting id appears after the first open reported none
+        return real_open(file, flags, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", planting_open)
+    with pytest.raises(ev.RecordConflict):
+        writer.write(record("dup", scenario="s2", verdict="baseline_pass"))
+    assert path.read_bytes() == _lines(other)
+    assert writer.read().invalid_lines == ()
+
+
+def test_a_file_that_appears_between_the_two_opens_is_appended_to_after_its_history_passes(tmp_path, monkeypatch) -> None:
+    import os
+
+    path = tmp_path / "e.jsonl"
+    writer = ev.EvidenceWriter(path)
+    real_open = os.open
+    state = {"planted": False}
+
+    def planting_open(file, flags, *args, **kwargs):
+        if file == "e.jsonl" and flags & os.O_CREAT and not state["planted"]:
+            state["planted"] = True
+            path.write_bytes(_lines(record("early", scenario="s3")))
+        return real_open(file, flags, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", planting_open)
+    assert writer.write(record("late", scenario="s4")) is True
+    assert [item.record_id for item in writer.read().records] == ["early", "late"]

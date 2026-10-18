@@ -452,16 +452,16 @@ def test_an_oracle_is_read_once_so_the_digest_and_the_parsed_document_share_byte
     changed = json.loads(original)
     changed["expected"]["candidate"]["verdict"] = "known_failure"
     opened = []
-    real_open = Path.open
+    real_open = os.open
 
-    def racing_open(self, *args, **kwargs):
-        if self == target:
+    def racing_open(file, flags, *args, **kwargs):
+        if file == target.name:   # the oracle, opened relative to its directory
             opened.append(1)
             if len(opened) > 1:   # a second reader would see the file after it changed
                 target.write_text(json.dumps(changed))
-        return real_open(self, *args, **kwargs)
+        return real_open(file, flags, *args, **kwargs)
 
-    monkeypatch.setattr(Path, "open", racing_open)
+    monkeypatch.setattr(os, "open", racing_open)
     document, digest = pe.load_oracles(copy)["persona-lifecycle-state"]
     assert len(opened) == 1
     assert document == json.loads(original) and digest == hashlib.sha256(original).hexdigest()
@@ -626,3 +626,23 @@ def test_main_reports_an_output_swapped_during_observation_as_an_error_exit(tmp_
                     "--oracles", str(copy), "--out", str(out)])
     assert code == 2 and oracle.read_bytes() == before
     assert "same file" in capsys.readouterr().err
+
+
+def test_a_report_guard_protects_the_file_that_was_read_even_if_the_evidence_alias_is_retargeted(tmp_path, monkeypatch) -> None:
+    first, second = tmp_path / "a.jsonl", tmp_path / "b.jsonl"
+    pe.run(tmp_path, "baseline", "tree-a", ORACLES, first, "run-1")
+    pe.run(tmp_path, "baseline", "tree-b", ORACLES, second, "run-2")
+    alias = tmp_path / "alias.jsonl"
+    alias.symlink_to(first)
+    before = first.read_bytes()
+    real_render = pe.render_report
+
+    def retargeting_render(rows):
+        text = real_render(rows)
+        alias.unlink()
+        alias.symlink_to(second)   # retargeted after the history was read
+        return text
+
+    monkeypatch.setattr(pe, "render_report", retargeting_render)
+    code = pe.main(["report", "--evidence", str(alias), "--out", str(first)])
+    assert code != 0 and first.read_bytes() == before
