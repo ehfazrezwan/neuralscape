@@ -7,7 +7,6 @@ and a str subclass standing in for a response status.
 
 import ast
 import inspect
-import signal
 from datetime import datetime, timezone
 
 import pytest
@@ -70,21 +69,6 @@ class Late(datetime):
 
     def __gt__(self, other):
         return True
-
-
-class Alarm:
-    def __init__(self, seconds):
-        self.seconds = seconds
-
-    def __enter__(self):
-        def expired(*_):
-            raise TimeoutError("did not finish")
-
-        signal.signal(signal.SIGALRM, expired)
-        signal.alarm(self.seconds)
-
-    def __exit__(self, *_):
-        signal.alarm(0)
 
 
 def claim(command):
@@ -406,39 +390,66 @@ def test_the_lifecycle_modules_never_read_the_clock():
 
 
 # ---- reconstruction cost
-def test_a_native_diamond_is_refused_not_reconstructed_per_path():
+def test_a_native_diamond_is_refused_not_reconstructed_per_path(monkeypatch):
     """Built once per object (2^40 paths, 41 objects): each reuse is charged its expanded size, so the
     budget refuses it at once (arithmetic over 41 objects, not a walk of the paths)."""
+
+    from tests.test_contracts_lifecycle import LifecycleWork
 
     shared = ("x",)
     for _ in range(40):
         shared = (shared, shared)
     command = intent(ProcessingStage.CANONICAL).model_copy(update={"id": shared})
-    with Alarm(20), pytest.raises(ValueError, match=BUDGET):
+    work = LifecycleWork(monkeypatch)
+    with pytest.raises(ValueError, match=BUDGET):
         claim(command)
+    assert work.materialized < 1_000, work.materialized  # the 41 objects, not the paths through them
 
 
 def test_a_diamond_of_public_views_is_refused():
+    """Each public view is observed once and its observation replayed on later paths, so the 41 views are
+    read a few times each, never once per path (2^40)."""
+
+    from contracts_lifecycle import LIFECYCLE_TIER
+
+    reads = [0]
+
     class View(list):
-        pass
+        def __iter__(self):
+            reads[0] += 1
+            if reads[0] > 2 * LIFECYCLE_TIER.max_edges:
+                raise RuntimeError("the public views were read past the cap")  # not the budget's error
+            return list.__iter__(self)
 
     shared = View(["x"])
     for _ in range(40):
         shared = View([shared, shared])
     command = intent(ProcessingStage.CANONICAL).model_copy(update={"id": shared})
-    with Alarm(20), pytest.raises(ValueError, match=BUDGET):
+    with pytest.raises(ValueError, match=BUDGET):
         claim(command)
+    assert reads[0] < 1_000, reads[0]
 
 
 def test_a_view_that_never_ends_is_refused():
+    """Every item of a public view is charged, so an endless view ends at the edge budget; the view stops
+    itself at twice the budget with an error that is not the budget's, so a regression fails, not hangs."""
+
+    from contracts_lifecycle import LIFECYCLE_TIER
+
+    reads = [0]
+
     class Endless(tuple):
         def __iter__(self):
             while True:
+                reads[0] += 1
+                if reads[0] > 2 * LIFECYCLE_TIER.max_edges:
+                    raise RuntimeError("the endless view was read past the cap")
                 yield 1
 
     command = intent(ProcessingStage.CANONICAL).model_copy(update={"id": Endless((1,))})
-    with Alarm(20), pytest.raises(ValueError, match=BUDGET):
+    with pytest.raises(ValueError, match=BUDGET):
         claim(command)
+    assert reads[0] <= LIFECYCLE_TIER.max_edges, reads[0]  # each item read is charged at least one edge
 
 
 def test_deep_nesting_is_a_value_error_not_a_recursion_error():
