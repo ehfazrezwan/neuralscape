@@ -18,6 +18,7 @@ import fcntl
 import hashlib
 import json
 import os
+import stat
 import threading
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
@@ -95,6 +96,46 @@ class RecordConflict(Exception):
     """A record id already exists with different content, or a superseded id is unknown."""
 
 
+class UnsafePath(Exception):
+    """A write would reach evidence or reviewer-owned files through an alias, or a file that is not a plain file."""
+
+
+def sidecar_path(path: str | os.PathLike[str]) -> Path:
+    """The writer's lock file, named after the resolved evidence path so every symbolic-link alias shares one lock."""
+
+    resolved = Path(os.path.realpath(path))
+    return resolved.with_name(resolved.name + ".lock")
+
+
+def _same_file(first: os.stat_result, second: os.stat_result) -> bool:
+    return (first.st_dev, first.st_ino) == (second.st_dev, second.st_ino)
+
+
+def write_text_guarded(path: str | os.PathLike[str], text: str, protected: Iterable[str | os.PathLike[str]]) -> None:
+    """Replace ``path`` with ``text`` unless it is, by inode, one of the ``protected`` files.
+
+    A symbolic link or a hard link to a protected file is the same file, so the identity check runs on
+    the opened descriptor and nothing is truncated before it passes.  The target must be a plain file.
+    """
+
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | getattr(os, "O_NONBLOCK", 0), 0o666)   # no truncation yet
+    try:
+        status = os.fstat(descriptor)
+        if not stat.S_ISREG(status.st_mode):
+            raise UnsafePath("the output is not a plain file")
+        for other in protected:
+            try:
+                if _same_file(status, os.stat(other)):
+                    raise UnsafePath("the output is the same file as an input or an evidence file it must not replace")
+            except FileNotFoundError:
+                continue
+        os.ftruncate(descriptor, 0)
+        with os.fdopen(descriptor, "w", encoding="utf-8", closefd=False) as handle:
+            handle.write(text)
+    finally:
+        os.close(descriptor)
+
+
 @dataclass(frozen=True)
 class ReadResult:
     records: tuple[EvidenceRecord, ...]
@@ -125,12 +166,17 @@ class EvidenceWriter:
 
     def __init__(self, path: str | os.PathLike[str]) -> None:
         self._path = Path(path)
+        if self._path.name.endswith(".lock"):
+            raise UnsafePath("an evidence file name must not end in .lock: that suffix names the writer's lock file")
         self._lock = threading.Lock()
         self._path.parent.mkdir(parents=True, exist_ok=True)
 
     @property
     def path(self) -> Path:
         return self._path
+
+    def _sidecar(self) -> Path:
+        return sidecar_path(self._path)
 
     def read(self) -> ReadResult:
         if not self._path.exists():
@@ -161,7 +207,7 @@ class EvidenceWriter:
         return self._parse(raw), len(raw), hashlib.sha256(raw).hexdigest()
 
     def _open_shared_lock(self):
-        sidecar = self._path.with_name(self._path.name + ".lock")
+        sidecar = self._sidecar()
         try:
             return open(sidecar, "rb")
         except FileNotFoundError:
@@ -211,10 +257,18 @@ class EvidenceWriter:
         line and the new record is readable.  The file is never rewritten.
         """
 
+        if not isinstance(record, EvidenceRecord):
+            raise TypeError("only an EvidenceRecord can be written")
+        # A record can be mutated after construction (attribute assignment, model_copy(update=...)) without
+        # revalidation: serialize it with the base class's own serializer and validate that text exactly as the
+        # reader will, so every successful write is a line the reader accepts and no subclass hook can change it.
+        line = EvidenceRecord.model_dump_json(record)
+        record = EvidenceRecord.model_validate_json(line)
         line = record.model_dump_json()
-        with self._lock, open(self._path.with_name(self._path.name + ".lock"), "ab") as lock:
+        with self._lock, open(self._sidecar(), "ab") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
             try:
+                self._require_plain_unaliased_file()
                 existing = {item.record_id: item for item in self.read().records}
                 previous = existing.get(record.record_id)
                 if previous is not None:
@@ -236,6 +290,18 @@ class EvidenceWriter:
             finally:
                 fcntl.flock(lock, fcntl.LOCK_UN)
         return True
+
+    def _require_plain_unaliased_file(self) -> None:
+        """Appending through a second hard link or to a non-plain file would change another file's content."""
+
+        try:
+            status = os.stat(self._path)
+        except FileNotFoundError:
+            return
+        if not stat.S_ISREG(status.st_mode):
+            raise UnsafePath("the evidence path is not a plain file")
+        if status.st_nlink > 1:
+            raise UnsafePath("the evidence file has more than one hard link: an append would also change the other names")
 
     def _ends_with_newline(self) -> bool:
         with open(self._path, "rb") as handle:
@@ -338,6 +404,12 @@ def compare(records: Sequence[EvidenceRecord]) -> list[dict[str, str]]:
     return rows
 
 
+def _cell(value: object) -> str:
+    """A table cell: record text is data, never table or line structure."""
+
+    return " ".join(str(value).replace("\\", "\\\\").replace("|", "\\|").split())
+
+
 def render_report(rows: Sequence[Mapping[str, str]]) -> str:
     """A Markdown comparison; it counts changes by class and never reports a pass percentage."""
 
@@ -347,7 +419,10 @@ def render_report(rows: Sequence[Mapping[str, str]]) -> str:
         "| scenario | baseline | candidate | change |", "|---|---|---|---|",
     ]
     for row in rows:
-        lines.append(f"| {row['scenario_id']} | {row['baseline']} ({row['baseline_subject']}) | {row['candidate']} ({row['candidate_subject']}) | {row['change']} |")
+        lines.append(
+            f"| {_cell(row['scenario_id'])} | {_cell(row['baseline'])} ({_cell(row['baseline_subject'])}) "
+            f"| {_cell(row['candidate'])} ({_cell(row['candidate_subject'])}) | {_cell(row['change'])} |"
+        )
     counts = {name: sum(1 for row in rows if row["change"] == name) for name in CHANGE_CLASSES}
     lines += ["", "Changes by class: " + ", ".join(f"{name} {count}" for name, count in counts.items() if count), ""]
     return "\n".join(lines)
@@ -400,14 +475,18 @@ def write_matrix_input(
     """Write ``{"rows": {row_id: [artifact, ...]}}`` for the matrix generator to attach."""
 
     rows: dict[str, list[dict[str, object]]] = {}
+    protected: list[Path] = []
     for row_ids, evidence_path, report_path in entries:
         for row_id in row_ids:
             rows.setdefault(row_id, []).extend(matrix_artifacts(evidence_path, report_path))
-    Path(out_path).write_text(json.dumps({"schema_version": "evidence-records-v1", "rows": rows}, indent=1, sort_keys=True))
+        for named in (evidence_path, report_path):
+            if named is not None:
+                protected += [Path(named), sidecar_path(named)]
+    write_text_guarded(out_path, json.dumps({"schema_version": "evidence-records-v1", "rows": rows}, indent=1, sort_keys=True), protected)
 
 
 __all__ = [
     "CHANGE_CLASSES", "CleanupReport", "EvidenceRecord", "EvidenceWriter", "FixtureManifest", "Observation",
-    "ReadResult", "RecordConflict", "Verdict", "as_mapping", "classify", "cleanup", "compare",
-    "current_records", "facts", "matrix_artifacts", "render_report", "sha256_file", "write_matrix_input",
+    "ReadResult", "RecordConflict", "UnsafePath", "Verdict", "as_mapping", "classify", "cleanup", "compare",
+    "current_records", "facts", "matrix_artifacts", "render_report", "sha256_file", "write_matrix_input", "write_text_guarded",
 ]

@@ -539,3 +539,52 @@ def test_only_the_requested_module_or_a_missing_ancestor_is_absent(fake_path, re
     else:
         with pytest.raises(ModuleNotFoundError):
             persona_probes._need(requested)
+
+
+# ---- the commands never replace the evidence history or an oracle
+
+def _aliased(tmp_path, target):
+    link, hard = tmp_path / "sym.out", tmp_path / "hard.out"
+    link.symlink_to(target)
+    os.link(target, hard)
+    return [target, link, hard]
+
+
+def test_report_out_naming_the_evidence_file_by_any_alias_is_refused_and_the_history_survives(tmp_path, capsys) -> None:
+    out = tmp_path / "evidence.jsonl"
+    pe.run(tmp_path, "baseline", "tree-a", ORACLES, out, "run-1")
+    before = out.read_bytes()
+    for alias in _aliased(tmp_path, out) + [out.with_name(out.name + ".lock")]:
+        assert pe.main(["report", "--evidence", str(out), "--out", str(alias)]) != 0
+        assert out.read_bytes() == before, alias
+    assert "cannot write the report" in capsys.readouterr().err
+
+
+def test_report_out_that_is_a_directory_or_unwritable_is_an_error_exit(tmp_path, capsys) -> None:
+    out = tmp_path / "evidence.jsonl"
+    pe.run(tmp_path, "baseline", "tree-a", ORACLES, out, "run-1")
+    assert pe.main(["report", "--evidence", str(out), "--out", str(tmp_path)]) != 0
+    assert "cannot write the report" in capsys.readouterr().err
+
+
+def test_run_out_naming_an_oracle_or_the_manifest_by_any_alias_is_refused_and_the_oracle_is_unchanged(tmp_path, capsys) -> None:
+    copy = _oracle_copy(tmp_path)
+    target = copy / "persona-lifecycle-state.json"
+    before = target.read_bytes()
+    for oracle in (target, copy / pe.MANIFEST):
+        for alias in _aliased(tmp_path, oracle):
+            code = pe.main(["run", "--service-dir", str(tmp_path), "--role", "baseline", "--subject-ref", "t",
+                            "--oracles", str(copy), "--out", str(alias)])
+            assert code == 2
+            alias.unlink() if alias.is_symlink() or alias.name == "hard.out" else None
+    assert target.read_bytes() == before
+    assert "same file" in capsys.readouterr().err
+
+
+def test_report_to_a_new_file_and_run_to_a_new_file_still_work(tmp_path) -> None:
+    out = tmp_path / "evidence.jsonl"
+    assert pe.main(["run", "--service-dir", str(tmp_path), "--role", "baseline", "--subject-ref", "t",
+                    "--oracles", str(ORACLES), "--out", str(out)]) == 0
+    report = tmp_path / "report.md"
+    assert pe.main(["report", "--evidence", str(out), "--out", str(report)]) == 0 and report.read_text().startswith("# Baseline")
+    assert pe.main(["report", "--evidence", str(out), "--out", str(report)]) == 0   # replacing a report is fine

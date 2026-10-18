@@ -20,7 +20,9 @@ import subprocess
 import sys
 from pathlib import Path
 
-from evidence_records import EvidenceRecord, EvidenceWriter, compare, facts, render_report
+from evidence_records import (
+    EvidenceRecord, EvidenceWriter, UnsafePath, compare, facts, render_report, sidecar_path, write_text_guarded,
+)
 
 PROBES = Path(__file__).resolve().with_name("persona_probes.py")
 MANIFEST = "ORACLE-MANIFEST.json"
@@ -117,8 +119,22 @@ def judge(role: str, observation: dict, oracle: dict) -> tuple[str, dict[str, st
     return verdict, seen, note
 
 
+def _refuse_oracle_alias(out: Path, oracles_dir: Path) -> None:
+    """Appending evidence to a reviewer-owned oracle (directly, by symbolic link or by hard link) would alter it."""
+
+    try:
+        target = out.stat()
+    except FileNotFoundError:
+        return
+    for oracle in oracles_dir.glob("*.json"):
+        status = oracle.stat()
+        if (status.st_dev, status.st_ino) == (target.st_dev, target.st_ino):
+            raise UnsafePath("the evidence file is the same file as an oracle or the manifest")
+
+
 def run(service_dir: Path, role: str, subject_ref: str, oracles_dir: Path, out: Path, run_id: str) -> list[EvidenceRecord]:
     oracles = load_oracles(oracles_dir)
+    _refuse_oracle_alias(out, oracles_dir)
     observed = observe(service_dir)
     writer = EvidenceWriter(out)
     existing = {record.record_id: record for record in writer.read().records}
@@ -165,7 +181,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "run":
         try:
             records = run(Path(args.service_dir), args.role, args.subject_ref, Path(args.oracles), Path(args.out), args.run_id)
-        except RunIdentityConflict as conflict:
+        except (RunIdentityConflict, UnsafePath) as conflict:
             print(f"error: {conflict}", file=sys.stderr)
             return 2
         for record in records:
@@ -190,7 +206,11 @@ def main(argv: list[str] | None = None) -> int:
         notes.append("- this comparison is built from the valid records only and is incomplete")
         text = text.rstrip("\n") + "\n" + "\n".join(notes) + "\n"
         print("error: the evidence file is damaged; see the report's integrity section", file=sys.stderr)
-    Path(args.out).write_text(text)
+    try:
+        write_text_guarded(args.out, text, [evidence, sidecar_path(evidence)])
+    except (UnsafePath, OSError) as problem:   # nothing was written: the evidence file is never truncated
+        print(f"error: cannot write the report: {problem}", file=sys.stderr)
+        return 2
     return 2 if damaged else 0
 
 

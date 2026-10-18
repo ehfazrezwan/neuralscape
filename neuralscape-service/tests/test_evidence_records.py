@@ -575,3 +575,152 @@ def test_an_unexpected_error_creating_the_sidecar_propagates(tmp_path, monkeypat
     with pytest.raises(OSError) as raised:
         ev.matrix_artifacts(path)
     assert raised.value.errno == code
+
+
+# ---- writes never destroy history, never serialize an unvalidated record, never follow an alias
+
+def _written(tmp_path, *records):
+    path = tmp_path / "e.jsonl"
+    writer = ev.EvidenceWriter(path)
+    for item in records:
+        writer.write(item)
+    return path, writer
+
+
+def _mutations():
+    base = record("m1")
+    yield "assign", lambda: _assigned(base)
+    yield "model_copy", lambda: base.model_copy(update={"verdict": "candidate_pass"})
+    yield "nested", lambda: _nested(base)
+
+
+def _assigned(item):
+    changed = item.model_copy()
+    changed.verdict = "candidate_pass"      # a baseline cannot be a candidate_pass
+    return changed
+
+
+def _nested(item):
+    changed = item.model_copy(deep=True)
+    changed.observed[0].value = "not a token with spaces"
+    return changed
+
+
+@pytest.mark.parametrize("name", ["assign", "model_copy", "nested"])
+def test_a_record_mutated_after_construction_is_refused_and_nothing_is_appended(tmp_path, name) -> None:
+    path, writer = _written(tmp_path, record("keep"))
+    before = path.read_bytes()
+    mutated = dict(_mutations())[name]()
+    with pytest.raises((ValidationError, ValueError)):
+        writer.write(mutated)
+    assert path.read_bytes() == before and writer.read().invalid_lines == ()
+
+
+def test_an_unconstructed_or_foreign_object_is_not_written(tmp_path) -> None:
+    path, writer = _written(tmp_path, record("keep"))
+    before = path.read_bytes()
+    with pytest.raises(TypeError):
+        writer.write({"record_id": "x"})   # type: ignore[arg-type]
+    with pytest.raises((ValidationError, ValueError, AttributeError, TypeError)):
+        writer.write(ev.EvidenceRecord.model_construct(record_id="x"))
+    assert path.read_bytes() == before
+
+
+def test_a_subclass_cannot_choose_the_serialized_line(tmp_path) -> None:
+    class Sneaky(ev.EvidenceRecord):
+        def model_dump_json(self, **kwargs):   # type: ignore[override]
+            return '{"forged": true}'
+
+    plain = record("s1")
+    sneaky = Sneaky(**{name: getattr(plain, name) for name in type(plain).model_fields})
+    path, writer = _written(tmp_path)
+    assert writer.write(sneaky) is True
+    result = writer.read()
+    assert result.invalid_lines == () and [item.record_id for item in result.records] == ["s1"]
+
+
+def test_every_successful_write_is_a_line_the_reader_accepts(tmp_path) -> None:
+    path, writer = _written(tmp_path, record("a"), record("b", scenario="s2"))
+    assert writer.read().invalid_lines == () and len(writer.read().records) == 2
+
+
+def test_a_hard_linked_evidence_file_is_not_appended_to(tmp_path) -> None:
+    import os
+
+    path, writer = _written(tmp_path, record("keep"))
+    os.link(path, tmp_path / "other-name")
+    before = path.read_bytes()
+    with pytest.raises(ev.UnsafePath):
+        writer.write(record("more", scenario="s2"))
+    assert path.read_bytes() == before == (tmp_path / "other-name").read_bytes()
+
+
+def test_a_non_plain_evidence_path_is_refused_without_blocking(tmp_path) -> None:
+    import os
+
+    fifo = tmp_path / "pipe.jsonl"
+    os.mkfifo(fifo)
+    with pytest.raises(ev.UnsafePath):
+        ev.EvidenceWriter(fifo).write(record("x"))
+
+
+def test_symbolic_link_aliases_share_one_lock_file(tmp_path) -> None:
+    path, writer = _written(tmp_path, record("keep"))
+    link = tmp_path / "alias.jsonl"
+    link.symlink_to(path)
+    aliased = ev.EvidenceWriter(link)
+    assert aliased._sidecar() == writer._sidecar()
+    assert aliased.write(record("more", scenario="s2")) is True
+    assert not (tmp_path / "alias.jsonl.lock").exists()
+    assert [item.record_id for item in writer.read().records] == ["keep", "more"]
+
+
+def test_an_evidence_name_that_is_a_lock_file_name_is_refused(tmp_path) -> None:
+    with pytest.raises(ev.UnsafePath):
+        ev.EvidenceWriter(tmp_path / "e.jsonl.lock")
+
+
+def _aliases(tmp_path, target):
+    import os
+
+    link, hard = tmp_path / "sym", tmp_path / "hard"
+    link.symlink_to(target)
+    os.link(target, hard)
+    return [target, link, hard]
+
+
+def test_the_guarded_writer_never_replaces_a_protected_file_through_any_alias(tmp_path) -> None:
+    path, _writer = _written(tmp_path, record("keep"))
+    before = path.read_bytes()
+    for alias in _aliases(tmp_path, path):
+        with pytest.raises(ev.UnsafePath):
+            ev.write_text_guarded(alias, "# report\n", [path])
+        assert path.read_bytes() == before
+    ev.write_text_guarded(tmp_path / "report.md", "# report\n", [path])
+    assert (tmp_path / "report.md").read_text() == "# report\n"
+    ev.write_text_guarded(tmp_path / "report.md", "# again\n", [path])   # a plain replacement shortens, not appends
+    assert (tmp_path / "report.md").read_text() == "# again\n"
+
+
+def test_matrix_input_never_overwrites_an_evidence_or_report_file_or_its_lock(tmp_path) -> None:
+    path, writer = _written(tmp_path, record("keep"))
+    report = tmp_path / "report.md"
+    report.write_text("# r\n")
+    before = (path.read_bytes(), report.read_bytes(), writer._sidecar().read_bytes())
+    for out in (path, report, writer._sidecar(), tmp_path / "evidence-link"):
+        if out.name == "evidence-link":
+            out.symlink_to(path)
+        with pytest.raises(ev.UnsafePath):
+            ev.write_matrix_input(out, [(["row"], path, report)])
+    assert (path.read_bytes(), report.read_bytes(), writer._sidecar().read_bytes()) == before
+    ev.write_matrix_input(tmp_path / "matrix.json", [(["row"], path, report)])
+    assert "row" in json.loads((tmp_path / "matrix.json").read_text())["rows"]
+
+
+def test_record_text_cannot_forge_table_rows_in_the_report(tmp_path) -> None:
+    hostile = 'x |\n| forged | baseline_pass (t) | candidate_pass (t) | unchanged |'
+    rows = ev.compare([record("h1", scenario=hostile)])
+    text = ev.render_report(rows)
+    table = [line for line in text.splitlines() if line.startswith("|")]
+    assert len(table) == 3                                  # header, separator and exactly one row
+    assert not any(line.startswith("| forged") for line in table)
