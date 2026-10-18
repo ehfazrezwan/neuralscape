@@ -296,13 +296,25 @@ class EvidenceWriter:
     def path(self) -> Path:
         return self._path
 
+    def _target(self) -> Path:
+        """The file this writer's path names right now, resolved once: lock, history read and append all use it."""
+
+        return Path(os.path.realpath(self._path))
+
+    @staticmethod
+    def _sidecar_of(target: Path) -> Path:
+        return target.with_name(target.name + ".lock")
+
     def _sidecar(self) -> Path:
-        return sidecar_path(self._path)
+        return self._sidecar_of(self._target())
 
     def read(self) -> ReadResult:
-        if not self._path.exists():
+        return self._read_at(self._target())
+
+    def _read_at(self, target: Path) -> ReadResult:
+        if not target.exists():
             return ReadResult((), (), False)
-        return self._parse(self._path.read_bytes())
+        return self._parse(target.read_bytes())
 
     def snapshot(self) -> tuple[ReadResult, int, str]:
         """The parsed records, the byte count and the SHA-256 of one consistent state of the file.
@@ -317,18 +329,19 @@ class EvidenceWriter:
         ``FileNotFoundError``.
         """
 
-        lock = self._open_shared_lock()
+        target = self._target()   # one stable file for the lock and the read, even if an alias is retargeted meanwhile
+        lock = self._open_shared_lock(target)
         try:
             if lock is not None:
                 fcntl.flock(lock, fcntl.LOCK_SH)
-            raw = self._path.read_bytes()
+            raw = target.read_bytes()
         finally:
             if lock is not None:
                 lock.close()   # closing releases the lock
         return self._parse(raw), len(raw), hashlib.sha256(raw).hexdigest()
 
-    def _open_shared_lock(self):
-        sidecar = self._sidecar()
+    def _open_shared_lock(self, target: Path):
+        sidecar = self._sidecar_of(target)
         try:
             return open(sidecar, "rb")
         except FileNotFoundError:
@@ -384,11 +397,14 @@ class EvidenceWriter:
         # caller's fields say.
         record = _detached(record)
         line = record.model_dump_json()
-        with self._lock, open(self._sidecar(), "ab") as lock:
+        # Resolve the path once: an alias retargeted while this writer waits for the lock must not move the history
+        # read or the append to a file whose own lock this writer does not hold.
+        evidence = self._target()
+        with self._lock, open(self._sidecar_of(evidence), "ab") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
             try:
-                self._require_plain_unaliased_file()
-                existing = {item.record_id: item for item in self.read().records}
+                self._require_plain_unaliased_file(evidence)
+                existing = {item.record_id: item for item in self._read_at(evidence).records}
                 previous = existing.get(record.record_id)
                 if previous is not None:
                     if previous.model_dump_json() == line:
@@ -402,7 +418,14 @@ class EvidenceWriter:
                         raise RecordConflict("a record may only supersede one of the same scenario, role and subject")
                 # Open the append descriptor, then judge the file it really names: a path swapped for a link since the
                 # earlier checks is caught here, before a byte is written.
-                descriptor = os.open(self._path, os.O_RDWR | os.O_APPEND | os.O_CREAT | getattr(os, "O_NONBLOCK", 0), 0o666)
+                try:
+                    descriptor = os.open(
+                        evidence, os.O_RDWR | os.O_APPEND | os.O_CREAT | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0), 0o666,
+                    )
+                except OSError as error:
+                    if error.errno == errno.ELOOP:   # the resolved file was swapped for a link since it was resolved
+                        raise UnsafePath("the evidence file was replaced by a link while the writer waited") from None
+                    raise
                 with os.fdopen(descriptor, "r+b") as handle:
                     status = os.fstat(descriptor)
                     self._require_appendable(status)
@@ -415,9 +438,9 @@ class EvidenceWriter:
                 fcntl.flock(lock, fcntl.LOCK_UN)
         return True
 
-    def _require_plain_unaliased_file(self) -> None:
+    def _require_plain_unaliased_file(self, target: Path) -> None:
         try:
-            status = os.stat(self._path)
+            status = os.stat(target)
         except FileNotFoundError:
             return
         self._require_appendable(status)

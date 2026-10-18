@@ -1096,3 +1096,89 @@ def test_path_like_arguments_are_asked_for_their_path_once(tmp_path) -> None:
     calls.clear()
     ev.write_matrix_input(tmp_path / "m.json", [(["row"], Moving(), None)])
     assert len(calls) == 1
+
+
+# ---- one stable target for the lock, the history read and the append
+
+def test_an_alias_retargeted_while_its_writer_waits_still_appends_to_the_file_it_locked(tmp_path) -> None:
+    import fcntl
+    import threading
+
+    first, second = tmp_path / "a.jsonl", tmp_path / "b.jsonl"
+    alias = tmp_path / "alias.jsonl"
+    ev.EvidenceWriter(first).write(record("a0"))
+    ev.EvidenceWriter(second).write(record("b0", scenario="sb"))
+    alias.symlink_to(first)
+    b_before = second.read_bytes()
+    holder = open(ev.sidecar_path(first), "ab")   # another writer holds the lock of the file the alias names now
+    fcntl.flock(holder, fcntl.LOCK_EX)
+    errors: list[BaseException] = []
+    started = threading.Event()
+
+    def write_through_alias() -> None:
+        started.set()
+        try:
+            ev.EvidenceWriter(alias).write(record("via-alias", scenario="sx"))
+        except BaseException as error:   # noqa: BLE001
+            errors.append(error)
+
+    thread = threading.Thread(target=write_through_alias)
+    thread.start()
+    started.wait(5)
+    thread.join(0.5)
+    assert thread.is_alive(), "the writer did not wait for the lock"
+    alias.unlink()
+    alias.symlink_to(second)          # retargeted while the writer is blocked
+    fcntl.flock(holder, fcntl.LOCK_UN)
+    holder.close()
+    thread.join(10)
+    assert not errors, errors
+    assert second.read_bytes() == b_before, "the append followed the retargeted alias to a file it did not lock"
+    assert [item.record_id for item in ev.EvidenceWriter(first).read().records] == ["a0", "via-alias"]
+
+
+def test_a_resolved_file_swapped_for_a_link_before_the_append_is_refused(tmp_path, monkeypatch) -> None:
+    target = tmp_path / "e.jsonl"
+    other = tmp_path / "other.jsonl"
+    other.write_bytes(b"")
+    writer = ev.EvidenceWriter(target)
+    real_require = writer._require_plain_unaliased_file
+
+    def swap_after_checks(resolved):
+        real_require(resolved)
+        if not resolved.exists():
+            resolved.symlink_to(other)   # created as a link after the early checks, before the append descriptor opens
+
+    monkeypatch.setattr(writer, "_require_plain_unaliased_file", swap_after_checks)
+    with pytest.raises(ev.UnsafePath):
+        writer.write(record("x"))
+    assert other.read_bytes() == b""
+
+
+def test_a_tuple_subclass_of_observations_is_refused_not_passed_on(tmp_path) -> None:
+    class Masked(ev.Observation):
+        @property
+        def __dict__(self):   # type: ignore[override]
+            return {"key": "k", "value": "forged"}
+
+    class Tup(tuple):
+        pass
+
+    masked = _reclassed(ev.Observation(key="k", value="real"), Masked)
+    for field in ("observed", "expected"):
+        changed = record("t1")
+        object.__getattribute__(changed, "__dict__")[field] = Tup((masked,))
+        path, writer = _written(tmp_path)
+        with pytest.raises(TypeError):
+            writer.write(changed)
+        assert not path.exists() or path.read_bytes() == b""
+
+
+def test_a_tuple_subclass_of_texts_is_refused(tmp_path) -> None:
+    class Tup(tuple):
+        pass
+
+    changed = record("t2")
+    object.__getattribute__(changed, "__dict__")["artifact_hashes"] = Tup((DIGEST,))
+    with pytest.raises(TypeError):
+        _written(tmp_path)[1].write(changed)
