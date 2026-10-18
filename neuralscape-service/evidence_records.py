@@ -81,11 +81,21 @@ class EvidenceRecord(VersionedContract):
 
 
 def facts(mapping: Mapping[str, str]) -> tuple[Observation, ...]:
-    return tuple(Observation(key=key, value=value) for key, value in sorted(mapping.items()))
+    entries = []
+    for key, value in _native_items(mapping):
+        key = _exact_text(key)
+        if type(key) is not str:
+            raise ValueError("fact keys must be text")
+        entries.append((key, _exact_text(value)))
+    return tuple(Observation(key=key, value=value) for key, value in sorted(entries))
 
 
 def as_mapping(items: Iterable[Observation]) -> dict[str, str]:
-    return {item.key: item.value for item in items}
+    out = {}
+    for item in items:
+        fields = _native_fields(item, Observation)
+        out[_exact_required_text(fields["key"])] = _exact_required_text(fields["value"])
+    return out
 
 
 def sha256_file(path: str | os.PathLike[str]) -> str:
@@ -108,62 +118,103 @@ def _native_mro(value: object) -> tuple[type, ...]:
     return _TYPE_MRO.__get__(type(value))
 
 
+def _is_a(value: object, cls: type) -> bool:
+    """``value`` is an instance of ``cls`` by the class's real MRO, compared by identity (no metaclass ``__eq__``)."""
+
+    return any(base is cls for base in _native_mro(value))
+
+
+def _native_items(mapping: object) -> list[tuple[object, object]]:
+    """The entries of a mapping read once: a ``dict`` (or subclass) from its own storage, any other mapping by one ``dict()`` call."""
+
+    if _is_a(mapping, dict):
+        return list(dict.items(mapping))   # type: ignore[call-overload]
+    return list(dict(mapping).items())   # type: ignore[call-overload]
+
+
 def _native_fields(value: object, cls: type) -> dict[str, object]:
     """The declared fields of a model instance read from pydantic's own storage, running none of its code.
 
-    No property (``__dict__`` included), ``__getattr__``, ``__class__``, metaclass ``__mro__`` or serializer hook is consulted; an instance that
-    lacks a declared field (``model_construct`` with a subset) is refused.
+    No property (``__dict__`` included), ``__getattr__``, ``__class__``, metaclass ``__mro__``/``__eq__``, serializer
+    or dict-subclass hook is consulted: the storage must be a plain ``dict`` whose keys are all exact ``str``, so
+    neither subscription nor key comparison runs caller code.  An instance that lacks a declared field
+    (``model_construct`` with a subset) is refused.
     """
 
-    if cls not in _native_mro(value):
+    if not _is_a(value, cls):
         raise TypeError(f"expected a {cls.__name__}")
     stored = _MODEL_STORAGE.__get__(value, BaseModel)
+    if type(stored) is not dict:
+        raise TypeError(f"the {cls.__name__} keeps its fields in something other than a plain dict")
+    if any(type(key) is not str for key in dict.keys(stored)):
+        raise TypeError(f"the {cls.__name__} stores a field under a name that is not exact text")
     try:
-        return {name: stored[name] for name in cls.model_fields}
+        return {name: dict.__getitem__(stored, name) for name in cls.model_fields}
     except KeyError as missing:
         raise TypeError(f"the {cls.__name__} lacks the field {missing.args[0]!r}") from None
 
 
 def _exact_text(value: object) -> object:
-    """A ``str`` subclass instance copied to exact text; anything else is returned for validation to judge."""
+    """A ``str`` subclass instance copied to exact text; anything else is returned unchanged."""
 
-    return str.__str__(value) if str in _native_mro(value) else value
-
-
-def _exact_texts(value: object) -> object:
-    if type(value) is tuple:
-        return tuple(_exact_text(item) for item in value)
-    return value   # not the contract's tuple: left as it is so strict validation rejects it
+    return str.__str__(value) if _is_a(value, str) else value   # type: ignore[arg-type]
 
 
-def _exact_observations(value: object) -> object:
+def _exact_required_text(value: object) -> str:
+    copied = _exact_text(value)
+    if type(copied) is not str:
+        raise TypeError("expected text")
+    return copied
+
+
+def _exact_optional_text(value: object) -> str | None:
+    return None if value is None else _exact_required_text(value)
+
+
+def _exact_texts(value: object) -> tuple[str, ...]:
     if type(value) is not tuple:
-        return value
+        raise TypeError("expected a tuple")   # a list or other container is not the contract's tuple: refused, not rewritten
+    return tuple(_exact_required_text(item) for item in value)
+
+
+def _exact_observations(value: object) -> tuple["Observation", ...]:
+    """Observations rebuilt from native fields; an entry that is not an observation is refused, never passed on."""
+
+    if type(value) is not tuple:
+        raise TypeError("expected a tuple")
     rebuilt = []
     for item in value:
-        if Observation not in _native_mro(item):
-            return value   # validation rejects it
         fields = _native_fields(item, Observation)
-        rebuilt.append(Observation(key=_exact_text(fields["key"]), value=_exact_text(fields["value"])))
+        rebuilt.append(Observation(key=_exact_required_text(fields["key"]), value=_exact_required_text(fields["value"])))
     return tuple(rebuilt)
 
 
 def _detached(record: object) -> "EvidenceRecord":
-    """A new base-class record built and validated from the native field values of ``record``.
+    """A new base-class record built and validated only from rebuilt natives of ``record``.
 
     ``record`` may have been mutated after construction (assignment, ``model_copy(update=...)``) or be a
-    subclass with its own serializers; neither is trusted.  Strict validation sees the natives, so a value that
-    serialization would have normalized (a list for a tuple) is rejected rather than rewritten.
+    subclass with its own hooks; nothing of it is trusted or passed on: every field is read from storage,
+    text is copied to exact ``str``, containers must be the contract's exact tuples and entries are rebuilt, so
+    only objects made here reach validation and serialization.
     """
 
     fields = _native_fields(record, EvidenceRecord)
-    for name in ("schema_version", "record_id", "scenario_id", "run_id", "role", "subject_ref", "oracle_version",
-                 "oracle_sha256", "verdict", "supersedes", "note"):
-        fields[name] = _exact_text(fields[name])
-    fields["artifact_hashes"] = _exact_texts(fields["artifact_hashes"])
-    fields["observed"] = _exact_observations(fields["observed"])
-    fields["expected"] = _exact_observations(fields["expected"])
-    return EvidenceRecord(**fields)
+    return EvidenceRecord(
+        schema_version=_exact_required_text(fields["schema_version"]),   # type: ignore[arg-type]
+        record_id=_exact_required_text(fields["record_id"]),
+        scenario_id=_exact_required_text(fields["scenario_id"]),
+        run_id=_exact_required_text(fields["run_id"]),
+        role=_exact_required_text(fields["role"]),   # type: ignore[arg-type]
+        subject_ref=_exact_required_text(fields["subject_ref"]),
+        oracle_version=_exact_required_text(fields["oracle_version"]),
+        oracle_sha256=_exact_required_text(fields["oracle_sha256"]),
+        verdict=_exact_required_text(fields["verdict"]),   # type: ignore[arg-type]
+        observed=_exact_observations(fields["observed"]),
+        expected=_exact_observations(fields["expected"]),
+        artifact_hashes=_exact_texts(fields["artifact_hashes"]),
+        supersedes=_exact_optional_text(fields["supersedes"]),
+        note=_exact_required_text(fields["note"]),
+    )
 
 
 def sidecar_path(path: str | os.PathLike[str]) -> Path:
@@ -184,12 +235,15 @@ def write_text_guarded(path: str | os.PathLike[str], text: str, protected: Itera
     the opened descriptor and nothing is truncated before it passes.  The target must be a plain file.
     """
 
+    path = os.fspath(path)   # a path-like object is asked for its path once
+    text = _exact_required_text(text)
+    others = [os.fspath(other) for other in protected]   # the iterable is consumed once
     descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | getattr(os, "O_NONBLOCK", 0), 0o666)   # no truncation yet
     try:
         status = os.fstat(descriptor)
         if not stat.S_ISREG(status.st_mode):
             raise UnsafePath("the output is not a plain file")
-        for other in protected:
+        for other in others:
             try:
                 if _same_file(status, os.stat(other)):
                     raise UnsafePath("the output is the same file as an input or an evidence file it must not replace")
@@ -386,7 +440,10 @@ class EvidenceWriter:
 def current_records(records: Iterable[EvidenceRecord]) -> list[EvidenceRecord]:
     """The records that no later record supersedes (superseded verdicts stay in the file)."""
 
-    items = list(records)
+    return _unsuperseded([_detached(item) for item in records])   # decisions are made on detached copies, read once
+
+
+def _unsuperseded(items: Sequence[EvidenceRecord]) -> list[EvidenceRecord]:
     superseded = {item.supersedes for item in items if item.supersedes}
     return [item for item in items if item.record_id not in superseded]
 
@@ -413,8 +470,8 @@ def cleanup(
     present: Callable[[], Iterable[str]],
     delete: Callable[[str], None],
 ) -> CleanupReport:
-    recorded = set(manifest.created_ids)
-    live = list(dict.fromkeys(present()))
+    recorded = set(_exact_texts(_native_fields(manifest, FixtureManifest)["created_ids"]))
+    live = list(dict.fromkeys(_exact_required_text(identifier) for identifier in present()))
     deleted: list[str] = []
     for identifier in live:
         if identifier in recorded:
@@ -433,12 +490,13 @@ CHANGE_CLASSES = (
 
 
 def _current(records: Sequence[EvidenceRecord], scenario_id: str, role: str) -> list[EvidenceRecord]:
-    return [item for item in current_records(records) if item.scenario_id == scenario_id and item.role == role]
+    return [item for item in _unsuperseded(records) if item.scenario_id == scenario_id and item.role == role]   # records are already detached
 
 
 def classify(baseline: EvidenceRecord | None, candidate: EvidenceRecord | None) -> str:
     if baseline is None or candidate is None:
         return "missing_run"
+    baseline, candidate = _detached(baseline), _detached(candidate)
     if (baseline.oracle_version, baseline.oracle_sha256) != (candidate.oracle_version, candidate.oracle_sha256):
         return "needs_investigation"   # the two sides were judged by different oracles: not comparable
     odd = ("unexpected_failure", "invalid_attempt", "deferred", "not_applicable")
@@ -460,6 +518,7 @@ def compare(records: Sequence[EvidenceRecord]) -> list[dict[str, str]]:
     file holds competing verdicts nobody superseded, which is reported, never resolved by file order.
     """
 
+    records = [_detached(item) for item in records]   # read once; no caller hook runs again
     scenarios = sorted({item.scenario_id for item in records})
     rows = []
     for scenario in scenarios:
@@ -492,12 +551,11 @@ def render_report(rows: Sequence[Mapping[str, str]]) -> str:
         "Synthetic personas only. A `known_failure` is a documented baseline failure, not a qualified pass.", "",
         "| scenario | baseline | candidate | change |", "|---|---|---|---|",
     ]
-    for row in rows:
-        lines.append(
-            f"| {_cell(row['scenario_id'])} | {_cell(row['baseline'])} ({_cell(row['baseline_subject'])}) "
-            f"| {_cell(row['candidate'])} ({_cell(row['candidate_subject'])}) | {_cell(row['change'])} |"
-        )
-    counts = {name: sum(1 for row in rows if row["change"] == name) for name in CHANGE_CLASSES}
+    keys = ("scenario_id", "baseline", "baseline_subject", "candidate", "candidate_subject", "change")
+    captured = [[_cell(row[key]) for key in keys] for row in rows]   # each entry read once: a row's hooks cannot differ between uses
+    for scenario, baseline, baseline_subject, candidate, candidate_subject, change in captured:
+        lines.append(f"| {scenario} | {baseline} ({baseline_subject}) | {candidate} ({candidate_subject}) | {change} |")
+    counts = {name: sum(1 for cells in captured if cells[5] == name) for name in CHANGE_CLASSES}
     lines += ["", "Changes by class: " + ", ".join(f"{name} {count}" for name, count in counts.items() if count), ""]
     return "\n".join(lines)
 
@@ -517,7 +575,10 @@ def matrix_artifacts(
     generator reads them from ``evidence-records.json`` written by ``write_matrix_input``.
     """
 
-    result, size, digest = EvidenceWriter(evidence_path).snapshot()
+    evidence = os.fspath(evidence_path)   # a path-like object is asked for its path once
+    report = None if report_path is None else os.fspath(report_path)
+    lane = _exact_required_text(producer_lane)
+    result, size, digest = EvidenceWriter(evidence).snapshot()
     rows = compare(result.records)
     counts: dict[str, int] = {}
     for row in rows:
@@ -531,13 +592,13 @@ def matrix_artifacts(
         + ("; partial tail" if result.partial_tail else "")
     )
     artifacts = [{
-        "kind": "unit", "path": str(Path(evidence_path).resolve()), "sha256": digest,
-        "producer_lane": producer_lane, "scope": "lane-local", "summary": summary,
+        "kind": "unit", "path": str(Path(evidence).resolve()), "sha256": digest,
+        "producer_lane": lane, "scope": "lane-local", "summary": summary,
     }]
-    if report_path is not None:
+    if report is not None:
         artifacts.append({
-            "kind": "unit", "path": str(Path(report_path).resolve()), "sha256": sha256_file(report_path),
-            "producer_lane": producer_lane, "scope": "lane-local", "summary": "baseline/candidate comparison report",
+            "kind": "unit", "path": str(Path(report).resolve()), "sha256": sha256_file(report),
+            "producer_lane": lane, "scope": "lane-local", "summary": "baseline/candidate comparison report",
         })
     return artifacts
 
@@ -550,13 +611,16 @@ def write_matrix_input(
 
     rows: dict[str, list[dict[str, object]]] = {}
     protected: list[Path] = []
-    for row_ids, evidence_path, report_path in entries:
-        for row_id in row_ids:
-            rows.setdefault(row_id, []).extend(matrix_artifacts(evidence_path, report_path))
-        for named in (evidence_path, report_path):
+    for row_ids, evidence_path, report_path in list(entries):
+        names = [_exact_required_text(row_id) for row_id in row_ids]
+        evidence = os.fspath(evidence_path)   # each path-like object is asked once
+        report = None if report_path is None else os.fspath(report_path)
+        for row_id in names:
+            rows.setdefault(row_id, []).extend(matrix_artifacts(evidence, report))
+        for named in (evidence, report):
             if named is not None:
                 protected += [Path(named), sidecar_path(named)]
-    write_text_guarded(out_path, json.dumps({"schema_version": "evidence-records-v1", "rows": rows}, indent=1, sort_keys=True), protected)
+    write_text_guarded(os.fspath(out_path), json.dumps({"schema_version": "evidence-records-v1", "rows": rows}, indent=1, sort_keys=True), protected)
 
 
 __all__ = [

@@ -879,3 +879,220 @@ def test_a_metaclass_mro_hook_is_not_consulted_by_the_native_read(tmp_path) -> N
     path, writer = _written(tmp_path)
     assert writer.write(hooked) is True
     assert not calls
+
+
+# ---- detachment reads exact natives by identity, and only rebuilt objects flow onward
+
+def _eq_meta(base_meta, calls):
+    class Meta(base_meta):
+        armed = False
+
+        def __eq__(cls, other):   # noqa: N805
+            if Meta.armed:   # class creation itself compares classes; only the write is under test
+                calls.append(1)
+                raise RuntimeError("metaclass equality ran")
+            return cls is other
+
+        __hash__ = base_meta.__hash__
+
+    return Meta
+
+
+def test_a_metaclass_equality_hook_does_not_run_for_the_record_the_text_or_an_observation(tmp_path) -> None:
+    calls: list[int] = []
+    record_meta = _eq_meta(type(ev.EvidenceRecord), calls)
+    observation_meta = _eq_meta(type(ev.Observation), calls)
+    text_meta = _eq_meta(type, calls)
+
+    class Hooked(ev.EvidenceRecord, metaclass=record_meta):
+        pass
+
+    class HookedObservation(ev.Observation, metaclass=observation_meta):
+        pass
+
+    class HookedText(str, metaclass=text_meta):
+        pass
+
+    holder = _reclassed(record("h1"), Hooked)
+    object.__getattribute__(holder, "__dict__")["record_id"] = HookedText("h1")
+    holder.observed = (_reclassed(ev.Observation(key="k", value="v"), HookedObservation),)
+    object.__getattribute__(holder, "__dict__")["note"] = HookedText("fine")
+    for meta in (record_meta, observation_meta, text_meta):
+        meta.armed = True
+    calls.clear()
+    path, writer = _written(tmp_path)
+    try:
+        assert writer.write(holder) is True
+    finally:
+        for meta in (record_meta, observation_meta, text_meta):
+            meta.armed = False
+    assert not calls
+    [stored] = writer.read().records
+    assert (stored.record_id, stored.note, [(o.key, o.value) for o in stored.observed]) == ("h1", "fine", [("k", "v")])
+
+
+def _replace_storage(instance, storage):
+    BaseModel.__dict__["__dict__"].__set__(instance, storage)
+
+
+def test_a_dict_subclass_as_field_storage_is_refused_without_running_its_hooks(tmp_path) -> None:
+    calls: list[str] = []
+
+    class Hostile(dict):
+        def __getitem__(self, key):
+            calls.append(key)
+            return "forged-id" if key == "record_id" else super().__getitem__(key)
+
+    mutated = record("real")
+    _replace_storage(mutated, Hostile(BaseModel.__dict__["__dict__"].__get__(mutated, BaseModel)))
+    path, writer = _written(tmp_path)
+    with pytest.raises(TypeError):
+        writer.write(mutated)
+    assert not calls and not path.exists() or path.read_bytes() == b""
+
+
+def test_field_storage_with_a_text_subclass_key_is_refused_without_running_key_comparison(tmp_path) -> None:
+    calls: list[int] = []
+
+    class Key(str):
+        def __eq__(self, other):
+            calls.append(1)
+            return True
+
+        __hash__ = str.__hash__
+
+    mutated = record("real")
+    storage = dict(BaseModel.__dict__["__dict__"].__get__(mutated, BaseModel))
+    storage[Key("record_id")] = storage.pop("record_id")
+    _replace_storage(mutated, storage)
+    path, writer = _written(tmp_path)
+    with pytest.raises(TypeError):
+        writer.write(mutated)
+    assert not calls
+
+
+@pytest.mark.parametrize("field", ["observed", "expected"])
+def test_a_mixed_tuple_cannot_carry_the_original_observation_past_the_rebuild(tmp_path, field) -> None:
+    class Masked(ev.Observation):
+        @property
+        def __dict__(self):   # type: ignore[override]
+            return {"key": "k", "value": "forged"}
+
+    first = _reclassed(ev.Observation(key="k", value="real"), Masked)
+    changed = record("mixed")
+    object.__getattribute__(changed, "__dict__")[field] = (first, {"key": "j", "value": "ok"})
+    path, writer = _written(tmp_path)
+    with pytest.raises(TypeError):
+        writer.write(changed)
+    assert not path.exists() or path.read_bytes() == b""
+
+
+@pytest.mark.parametrize("entry", [None, 5, "text", {"key": "k", "value": "v"}])
+def test_an_observation_tuple_with_a_foreign_entry_is_refused(tmp_path, entry) -> None:
+    changed = record("foreign")
+    object.__getattribute__(changed, "__dict__")["observed"] = (entry,)
+    with pytest.raises(TypeError):
+        _written(tmp_path)[1].write(changed)
+
+
+@pytest.mark.parametrize("field", ["note", "record_id", "role", "verdict", "run_id", "oracle_sha256"])
+def test_a_non_text_scalar_field_is_refused_by_detachment(tmp_path, field) -> None:
+    changed = record("scalar")
+    object.__getattribute__(changed, "__dict__")[field] = 5
+    with pytest.raises(TypeError):
+        _written(tmp_path)[1].write(changed)
+
+
+# ---- the other public entry points detach what the caller hands them
+
+class _HookedRecord(ev.EvidenceRecord):
+    """A subclass whose attribute reads would lie if anything read them through the instance."""
+
+    def __getattribute__(self, name):
+        if name in {"scenario_id", "record_id", "role", "verdict", "supersedes"}:
+            raise AssertionError(f"an attribute hook ran for {name}")
+        return super().__getattribute__(name)
+
+
+def test_compare_classify_and_current_records_read_records_natively(tmp_path) -> None:
+    base = _reclassed(record("b", role="baseline", verdict="known_failure"), _HookedRecord)
+    cand = _reclassed(record("c", role="candidate", verdict="candidate_pass"), _HookedRecord)
+    assert ev.compare([base, cand])[0]["change"] == "fixed"
+    assert ev.classify(base, cand) == "fixed"
+    assert [item.record_id for item in ev.current_records([base, cand])] == ["b", "c"]
+
+
+def test_facts_copy_text_subclasses_and_read_a_dict_subclass_from_its_own_storage() -> None:
+    calls: list[str] = []
+
+    class Spy(dict):
+        def items(self):
+            calls.append("items")
+            return [("forged", "x")]
+
+    class Odd(str):
+        def __lt__(self, other):
+            calls.append("lt")
+            return True
+
+        def __str__(self):
+            return "evil"
+
+    result = ev.facts(Spy({Odd("b"): Odd("2"), "a": "1"}))
+    assert [(item.key, item.value) for item in result] == [("a", "1"), ("b", "2")] and not calls
+    assert type(result[1].key) is str
+    with pytest.raises(ValueError):
+        ev.facts({5: "x"})   # type: ignore[dict-item]
+
+
+def test_as_mapping_reads_observations_natively() -> None:
+    class Masked(ev.Observation):
+        @property
+        def __dict__(self):   # type: ignore[override]
+            return {"key": "k", "value": "forged"}
+
+    assert ev.as_mapping([_reclassed(ev.Observation(key="k", value="real"), Masked)]) == {"k": "real"}
+
+
+def test_cleanup_copies_present_identifiers_and_reads_the_manifest_natively() -> None:
+    class Odd(str):
+        def __eq__(self, other):
+            return True
+
+        __hash__ = str.__hash__
+
+    deleted: list[str] = []
+    manifest = ev.FixtureManifest(fixture_version="f1", created_ids=("a", "b"))
+    report = ev.cleanup(manifest, lambda: [Odd("a"), "z"], deleted.append)
+    assert report.deleted == ("a",) and report.already_gone == ("b",) and report.left_alone == ("z",)
+    assert deleted == ["a"] and all(type(item) is str for item in deleted)
+
+
+def test_render_report_reads_each_row_entry_once() -> None:
+    reads: list[str] = []
+
+    class Row(dict):
+        def __getitem__(self, key):
+            reads.append(key)
+            return super().__getitem__(key)
+
+    row = Row(scenario_id="s", baseline="baseline_pass", baseline_subject="t", candidate="candidate_pass",
+              candidate_subject="t", change="unchanged")
+    ev.render_report([row])
+    assert sorted(reads) == sorted(["scenario_id", "baseline", "baseline_subject", "candidate", "candidate_subject", "change"])
+
+
+def test_path_like_arguments_are_asked_for_their_path_once(tmp_path) -> None:
+    path, writer = _written(tmp_path, record("p1"))
+    calls = []
+
+    class Moving:
+        def __fspath__(self):
+            calls.append(1)
+            return str(path)
+
+    ev.matrix_artifacts(Moving())
+    assert len(calls) == 1
+    calls.clear()
+    ev.write_matrix_input(tmp_path / "m.json", [(["row"], Moving(), None)])
+    assert len(calls) == 1
