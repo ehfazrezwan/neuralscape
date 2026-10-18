@@ -7,7 +7,6 @@ and a str subclass standing in for a response status.
 
 import ast
 import inspect
-import signal
 from datetime import datetime, timezone
 
 import pytest
@@ -72,21 +71,6 @@ class Late(datetime):
         return True
 
 
-class Alarm:
-    def __init__(self, seconds):
-        self.seconds = seconds
-
-    def __enter__(self):
-        def expired(*_):
-            raise TimeoutError("did not finish")
-
-        signal.signal(signal.SIGALRM, expired)
-        signal.alarm(self.seconds)
-
-    def __exit__(self, *_):
-        signal.alarm(0)
-
-
 def claim(command):
     validate_required_stage_claim(claimed_status=IntentStatus.ACCEPTED, intent=command, receipts=())
 
@@ -144,21 +128,23 @@ def test_a_spoof_of_a_valid_contract_is_refused_at_every_entry():
 
 
 def test_a_spoofed_receipt_cannot_carry_a_graph_past_the_claim_budget():
-    import time
-
     from tests.test_contracts_lifecycle import intent_with_requirements, reference, requirement
+
+    class CountingSpoof(Spoof):
+        def __getattribute__(self, name):
+            object.__getattribute__(self, "_reads").append(name)
+            return Spoof.__getattribute__(self, name)
 
     command = intent_with_requirements(requirement(ProcessingStage.CANONICAL))
     large = receipt(ProcessingStage.CANONICAL, StageStatus.APPLIED)
     set_native(large, "output_refs", tuple(reference(f"o{i}") for i in range(70_000)))
     with pytest.raises(ValueError, match=BUDGET):  # beyond the tier, read natively
         validate_required_stage_claim(claimed_status=IntentStatus.APPLIED, intent=command, receipts=(large,))
-    started = time.monotonic()
+    spoof = CountingSpoof(large, StageReceipt)
+    object.__setattr__(spoof, "_reads", [])
     with pytest.raises((TypeError, ValueError)):  # the proxy's own view is never read outside the budget
-        validate_required_stage_claim(
-            claimed_status=IntentStatus.APPLIED, intent=command, receipts=(Spoof(large, StageReceipt),)
-        )
-    assert time.monotonic() - started < 30
+        validate_required_stage_claim(claimed_status=IntentStatus.APPLIED, intent=command, receipts=(spoof,))
+    assert object.__getattribute__(spoof, "_reads") == []  # nothing was read through the proxy at all
 
 
 class CountingSpoof:
@@ -404,39 +390,70 @@ def test_the_lifecycle_modules_never_read_the_clock():
 
 
 # ---- reconstruction cost
-def test_a_native_diamond_is_refused_not_reconstructed_per_path():
+def test_a_native_diamond_is_refused_not_reconstructed_per_path(monkeypatch):
     """Built once per object (2^40 paths, 41 objects): each reuse is charged its expanded size, so the
     budget refuses it at once (arithmetic over 41 objects, not a walk of the paths)."""
+
+    from tests.test_contracts_lifecycle import LifecycleWork
 
     shared = ("x",)
     for _ in range(40):
         shared = (shared, shared)
     command = intent(ProcessingStage.CANONICAL).model_copy(update={"id": shared})
-    with Alarm(20), pytest.raises(ValueError, match=BUDGET):
+    work = LifecycleWork(monkeypatch)
+    with pytest.raises(ValueError, match=BUDGET):
         claim(command)
+    assert work.materialized < 1_000, work.materialized  # the 41 objects, not the paths through them
 
 
-def test_a_diamond_of_public_views_is_refused():
+def test_a_diamond_of_public_views_is_refused(monkeypatch):
+    """Each public view is observed once and its observation replayed on later paths, so the 41 views are
+    read a few times each, never once per path (2^40).  A replay does not call ``__iter__`` again, so the
+    rebuilt nodes are counted too: rebuilding the views along every path stops at the helper's cap."""
+
+    from contracts_lifecycle import LIFECYCLE_TIER
+    from tests.test_contracts_lifecycle import LifecycleWork
+
+    reads = [0]
+
     class View(list):
-        pass
+        def __iter__(self):
+            reads[0] += 1
+            if reads[0] > 2 * LIFECYCLE_TIER.max_edges:
+                raise RuntimeError("the public views were read past the cap")  # not the budget's error
+            return list.__iter__(self)
 
     shared = View(["x"])
     for _ in range(40):
         shared = View([shared, shared])
     command = intent(ProcessingStage.CANONICAL).model_copy(update={"id": shared})
-    with Alarm(20), pytest.raises(ValueError, match=BUDGET):
+    work = LifecycleWork(monkeypatch)
+    with pytest.raises(ValueError, match=BUDGET):
         claim(command)
+    assert reads[0] < 1_000, reads[0]
+    assert work.materialized <= LIFECYCLE_TIER.max_edges, work.materialized  # every rebuilt node is charged
 
 
 def test_a_view_that_never_ends_is_refused():
+    """Every item of a public view is charged, so an endless view ends at the edge budget; the view stops
+    itself at twice the budget with an error that is not the budget's, so a regression fails, not hangs."""
+
+    from contracts_lifecycle import LIFECYCLE_TIER
+
+    reads = [0]
+
     class Endless(tuple):
         def __iter__(self):
             while True:
+                reads[0] += 1
+                if reads[0] > 2 * LIFECYCLE_TIER.max_edges:
+                    raise RuntimeError("the endless view was read past the cap")
                 yield 1
 
     command = intent(ProcessingStage.CANONICAL).model_copy(update={"id": Endless((1,))})
-    with Alarm(20), pytest.raises(ValueError, match=BUDGET):
+    with pytest.raises(ValueError, match=BUDGET):
         claim(command)
+    assert reads[0] <= LIFECYCLE_TIER.max_edges, reads[0]  # each item read is charged at least one edge
 
 
 def test_deep_nesting_is_a_value_error_not_a_recursion_error():
@@ -665,18 +682,28 @@ def many_outputs(count, *, status=StageStatus.APPLIED, attempt=1, stage=Processi
     return receipt(stage, status, outputs=outputs, attempt=attempt)
 
 
-def test_a_stage_with_ten_thousand_output_refs_validates_and_settles_in_bounded_time():
-    import time
-
-    from tests.test_contracts_lifecycle import intent_with_requirements, requirement
+def test_a_stage_with_ten_thousand_output_refs_validates_and_settles_in_bounded_time(monkeypatch):
+    from tests.test_contracts_lifecycle import LifecycleWork, intent_with_requirements, requirement
 
     command = intent_with_requirements(requirement(ProcessingStage.CANONICAL))
     applied = many_outputs(10_000)
-    started = time.monotonic()
+    keyed = []
+    identity_key = contracts_lifecycle._reference_identity_key
+
+    def counting_key(reference):
+        keyed.append(1)
+        assert len(keyed) <= 10 * 10_000, "handle identities are compared pairwise"  # stop a quadratic walk early
+        return identity_key(reference)
+
+    monkeypatch.setattr(contracts_lifecycle, "_reference_identity_key", counting_key)
+    work = LifecycleWork(monkeypatch)
     validate_required_stage_claim(claimed_status=IntentStatus.APPLIED, intent=command, receipts=(applied,))
     kept_intent, kept = contracts_lifecycle.validate_stage_receipts(command, (applied,))
     assert len(kept[0].output_refs) == 10_000 and kept_intent == command
-    assert time.monotonic() - started < 30
+    # Linear in the outputs: a pairwise comparison of the handles would be 10,000 x 10,000.
+    assert len(keyed) <= 10 * 10_000, len(keyed)
+    assert work.materialized <= 50 * 10_000, work.materialized
+    assert work.edges <= 50 * 10_000, work.edges
 
 
 def test_the_standard_tier_would_strand_a_large_stage_and_the_lifecycle_tier_does_not(monkeypatch):
@@ -752,15 +779,14 @@ def unchecked_outputs(count, form):
 
 
 @pytest.mark.parametrize("form", ["dict", "constructed"])
-def test_record_time_refuses_a_set_whose_normalized_copies_the_claim_could_not_read(form):
-    import time
+def test_record_time_refuses_a_set_whose_normalized_copies_the_claim_could_not_read(form, monkeypatch):
     import tracemalloc
 
-    from tests.test_contracts_lifecycle import intent_with_requirements, requirement
+    from tests.test_contracts_lifecycle import LifecycleWork, intent_with_requirements, requirement
 
     command = intent_with_requirements(requirement(ProcessingStage.CANONICAL))
     expanding = unchecked_outputs(70_000, form)  # fits as stored; one more field per handle once validated
-    started = time.monotonic()
+    work = LifecycleWork(monkeypatch, StageReceipt)
     tracemalloc.start()
     try:
         with pytest.raises(ValueError, match=BUDGET):
@@ -768,7 +794,8 @@ def test_record_time_refuses_a_set_whose_normalized_copies_the_claim_could_not_r
         _, peak = tracemalloc.get_traced_memory()
     finally:
         tracemalloc.stop()
-    assert time.monotonic() - started < 60
+    # One strict pass over the stored set (it fits); the copies' second read is refused before validating again.
+    assert work.validated.get("StageReceipt", 0) <= 1, work.validated
     assert peak < 512 * 2**20, peak
 
 

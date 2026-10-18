@@ -128,6 +128,58 @@ class InverseViewMapping(Mapping[str, object]):
 
 
 BASE_MODEL_DICT_DESCRIPTOR = vars(BaseModel)["__dict__"]
+
+
+class LifecycleWork:
+    """Deterministic work counts for the lifecycle validators, in place of wall-clock bounds.
+
+    ``materialized`` counts nodes rebuilt (every call of the module's graph rebuild, recursion
+    included), ``validated`` counts strict ``model_validate`` calls per model class, and ``edges``
+    is the largest charge any discovery envelope of the call reached.  A regression that does
+    unbounded work fails these counts the same way on every machine.
+
+    Rebuilding stops itself at ``cap`` nodes (twice the lifecycle tier's edges by default) with an error
+    that is not the budget's, so a regression that stopped charging rebuilt nodes fails while it runs,
+    instead of rebuilding along exponentially many paths.
+    """
+
+    def __init__(self, monkeypatch, *models: type[BaseModel], cap: int | None = None) -> None:
+        self.materialized = 0
+        self.cap = 2 * lifecycle_contracts.LIFECYCLE_TIER.max_edges if cap is None else cap
+        self.validated: dict[str, int] = {}
+        self.budgets: list = []
+        work = self
+        rebuild = lifecycle_contracts._materialize_captured_graph
+
+        def counting_rebuild(*args, **kwargs):
+            work.materialized += 1
+            if work.materialized > work.cap:
+                raise RuntimeError("the graph was rebuilt past the cap")  # not the budget's error
+            return rebuild(*args, **kwargs)
+
+        monkeypatch.setattr(lifecycle_contracts, "_materialize_captured_graph", counting_rebuild)
+        envelope = lifecycle_contracts.DiscoveryBudget
+
+        class Recording(envelope):
+            __slots__ = ()
+
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                work.budgets.append(self)
+
+        monkeypatch.setattr(lifecycle_contracts, "DiscoveryBudget", Recording)
+        for model in models:
+            original = model.model_validate.__func__
+
+            def counting_validate(cls, *args, _original=original, **kwargs):
+                work.validated[cls.__name__] = work.validated.get(cls.__name__, 0) + 1
+                return _original(cls, *args, **kwargs)
+
+            monkeypatch.setattr(model, "model_validate", classmethod(counting_validate))
+
+    @property
+    def edges(self) -> int:
+        return max((budget.edges for budget in self.budgets), default=0)
 BASE_MODEL_EXTRA_DESCRIPTOR = vars(BaseModel)["__pydantic_extra__"]
 
 

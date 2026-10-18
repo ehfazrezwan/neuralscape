@@ -131,29 +131,27 @@ def _diamond(depth: int, kind=tuple):
 
 
 @pytest.mark.parametrize("kind", [tuple, list, dict])
-def test_a_tiny_shared_graph_costs_work_per_object_not_per_path(kind) -> None:
+def test_a_tiny_shared_graph_costs_work_per_object_not_per_path(kind, monkeypatch) -> None:
     """20 objects, each holding the next twice (2^20 paths): materialization must reuse what it already
     built for an object instead of rebuilding (and charging) every path through it."""
-
-    import time
 
     from contracts_limits import DISCOVERY_BUDGET_MESSAGE
 
     from pydantic import BaseModel
 
-    from tests.test_contracts_lifecycle import BASE_MODEL_DICT_DESCRIPTOR
+    from tests.test_contracts_lifecycle import BASE_MODEL_DICT_DESCRIPTOR, LifecycleWork
 
     shared = receipt(CANONICAL, StageStatus.APPLIED)
     dict.__setitem__(BASE_MODEL_DICT_DESCRIPTOR.__get__(shared, BaseModel), "output_refs", (_diamond(20, kind),))
-    started = time.monotonic()
+    work = LifecycleWork(monkeypatch)
     with pytest.raises(ValueError) as refused:
         _claim((shared,))
     rendered = str(refused.value)  # an error naming the input must not expand it either
-    elapsed = time.monotonic() - started
     # Strict validation would walk all 2^20 paths, so the reused copy is charged per occurrence and the
-    # input is refused by the budget; the charge is arithmetic over the 20 objects, so it is immediate.
+    # input is refused by the budget; the charge is arithmetic over the 20 objects, so only those are
+    # rebuilt (rebuilding every path would visit hundreds of thousands of nodes before the budget stops it).
     assert DISCOVERY_BUDGET_MESSAGE in rendered
-    assert elapsed < 0.5, elapsed
+    assert work.materialized < 10_000, work.materialized
     assert len(rendered) < 10_000
 
 
@@ -254,28 +252,28 @@ def _requirements_sharing_one_raw_dict(n: int, ids: tuple[str, ...] | None = Non
     return command.model_copy(update={"stage_requirements": (shared,) * n})
 
 
-def test_many_references_to_one_raw_requirement_are_charged_for_every_occurrence() -> None:
+def test_many_references_to_one_raw_requirement_are_charged_for_every_occurrence(monkeypatch) -> None:
     """N requirement entries naming one raw dict of N source ids: one dict to the graph walk, N * N entries
-    for strict validation.  Refused by the budget before validation, in bounded time."""
-
-    import time
+    for strict validation.  Refused by the budget before validation, after rebuilding the dict once."""
 
     from contracts_limits import DISCOVERY_BUDGET_MESSAGE
+    from contracts_lifecycle import Intent
+    from tests.test_contracts_lifecycle import LifecycleWork
 
     command = _requirements_sharing_one_raw_dict(2_000)
-    started = time.monotonic()
+    work = LifecycleWork(monkeypatch, Intent)
     with pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):
         _claim_with(command, ())
-    assert time.monotonic() - started < 2
+    assert work.validated.get("Intent", 0) == 0, work.validated  # the N * N entries never reach validation
+    assert work.materialized < 10_000, work.materialized
 
 
-def test_receipts_sharing_one_raw_output_tuple_are_charged_for_every_occurrence() -> None:
-    import time
-
+def test_receipts_sharing_one_raw_output_tuple_are_charged_for_every_occurrence(monkeypatch) -> None:
     from pydantic import BaseModel
 
     from contracts_limits import DISCOVERY_BUDGET_MESSAGE
-    from tests.test_contracts_lifecycle import BASE_MODEL_DICT_DESCRIPTOR
+    from contracts_lifecycle import StageReceipt
+    from tests.test_contracts_lifecycle import BASE_MODEL_DICT_DESCRIPTOR, LifecycleWork
 
     handles = tuple({"kind": "memory", "id": f"m{i}", "tenant_id": "tenant-1", "resolver": "ns:memory"}
                     for i in range(1_500))
@@ -284,10 +282,15 @@ def test_receipts_sharing_one_raw_output_tuple_are_charged_for_every_occurrence(
         one = receipt(CANONICAL, StageStatus.APPLIED).model_copy(update={"attempt": attempt})
         dict.__setitem__(BASE_MODEL_DICT_DESCRIPTOR.__get__(one, BaseModel), "output_refs", handles)
         receipts.append(one)
-    started = time.monotonic()
+    work = LifecycleWork(monkeypatch, StageReceipt)
     with pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):
         _claim_with(intent(CANONICAL), tuple(receipts))
-    assert time.monotonic() - started < 3
+    # Every occurrence of the shared tuple is charged, so the handles strict validation reads stay within the
+    # envelope: the 1,500 x 1,500 handles of the whole set never reach it.
+    from contracts_lifecycle import LIFECYCLE_TIER
+
+    assert work.validated.get("StageReceipt", 0) * 1_500 <= LIFECYCLE_TIER.max_edges, work.validated
+    assert work.materialized < 50_000, work.materialized
 
 
 def test_a_raw_container_shared_a_few_times_still_validates() -> None:

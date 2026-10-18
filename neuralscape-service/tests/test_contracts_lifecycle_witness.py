@@ -515,17 +515,27 @@ def test_a_witness_still_has_to_name_an_applied_attempt_with_its_effect() -> Non
 
 # ----------------------------- every public item read is charged, including cache hits
 class RepeatingTuple(tuple):
-    """Native backing holds one receipt (so it is inventoried); the public view repeats it."""
+    """Native backing holds one receipt (so it is inventoried); the public view repeats it.
 
-    def __new__(cls, item, count):
+    The view counts the items it hands out and stops at ``cap`` with an error that is not the budget's, so
+    a validator that stopped charging view reads fails the test instead of reading forever."""
+
+    def __new__(cls, item, count, cap=None):
         instance = super().__new__(cls, (item,))
-        instance.item, instance.count = item, count
+        instance.item, instance.count, instance.cap, instance.reads = item, count, cap, 0
         return instance
 
     def __iter__(self):
         import itertools
 
-        return itertools.repeat(self.item) if self.count is None else itertools.repeat(self.item, self.count)
+        def items():
+            for _ in itertools.count() if self.count is None else range(self.count):
+                if self.cap is not None and self.reads >= self.cap:
+                    raise RuntimeError("the public view was read past the cap")
+                self.reads += 1
+                yield self.item
+
+        return items()
 
 
 @pytest.mark.parametrize("count", [None, 5_000_000], ids=["endless", "five-million"])
@@ -533,22 +543,21 @@ def test_a_root_view_repeating_an_inventoried_receipt_is_stopped_by_the_budget(c
     """Each cache hit is a public item read: it is charged, so a repeating root view ends at the edge
     budget instead of being collected without bound (an endless one would never finish)."""
 
-    import time
     import tracemalloc
 
+    from contracts_lifecycle import LIFECYCLE_TIER
     from contracts_limits import DISCOVERY_BUDGET_MESSAGE
 
-    repeated = RepeatingTuple(receipt(CANONICAL, StageStatus.APPLIED), count)
+    budget_edges = LIFECYCLE_TIER.max_edges
+    repeated = RepeatingTuple(receipt(CANONICAL, StageStatus.APPLIED), count, cap=2 * budget_edges)
     tracemalloc.start()
-    started = time.monotonic()
     try:
         with pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):
             claim(intent(CANONICAL), repeated)
-        elapsed = time.monotonic() - started
         _, peak = tracemalloc.get_traced_memory()
     finally:
         tracemalloc.stop()
-    assert elapsed < 10, elapsed
+    assert repeated.reads <= budget_edges, repeated.reads  # every read is charged at least one edge
     assert peak < 256 * 1024 * 1024, peak  # bounded by the budget, not by the stream
 
 
