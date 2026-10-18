@@ -6,11 +6,49 @@ code is verbatim — behavior unchanged.
 
 import logging
 import threading
+import time
 
 from google import genai
 from config import settings
 
 logger = logging.getLogger(__name__)
+
+# Each mem0 start creates at most a few Qdrant collections; every conflict
+# means one more of them now exists, so a handful of attempts always suffices.
+_COLD_START_ATTEMPTS = 5
+
+
+def _is_collection_exists_conflict(exc: BaseException) -> bool:
+    """Qdrant's 409: another process created the collection first."""
+    try:
+        from qdrant_client.http.exceptions import UnexpectedResponse
+    except ImportError:  # pragma: no cover — qdrant_client ships with mem0
+        return False
+    return isinstance(exc, UnexpectedResponse) and exc.status_code == 409
+
+
+def _memory_from_config(memory_cls, config):
+    """``Memory.from_config``, tolerating a concurrent first start.
+
+    mem0's Qdrant store lists the collections and creates its own when it is
+    missing. When the API and the workers start together against an empty
+    Qdrant, the processes that lose that race get ``409 already exists``. The
+    collection then exists, so building ``Memory`` again finds it and goes on.
+    Any other error is raised at once.
+    """
+    for attempt in range(1, _COLD_START_ATTEMPTS + 1):
+        try:
+            return memory_cls.from_config(config)
+        except Exception as exc:
+            if attempt == _COLD_START_ATTEMPTS or not _is_collection_exists_conflict(exc):
+                raise
+            logger.info(
+                "Qdrant collection was created concurrently by another process; "
+                "retrying memory initialisation (attempt %d/%d)",
+                attempt + 1,
+                _COLD_START_ATTEMPTS,
+            )
+            time.sleep(0.1 * attempt)
 
 class CoreMixin:
     """CoreMixin for MemoryService (mechanical split — see memory_service.py)."""
@@ -45,7 +83,7 @@ class CoreMixin:
                     from mem0 import Memory
 
                     config = settings.get_mem0_config()
-                    self._memory = Memory.from_config(config)
+                    self._memory = _memory_from_config(Memory, config)
 
                     # Re-attach the Graphiti adapter mem0 v2.0.2 stopped
                     # auto-creating. The MemoryGraph constructor in
