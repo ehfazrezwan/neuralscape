@@ -68,9 +68,10 @@ def _need(name: str):
     try:
         return importlib.import_module(name)
     except ModuleNotFoundError as error:
-        if error.name == name or (error.name or "").split(".")[0] == name.split(".")[0]:
+        missing = error.name or ""
+        if missing == name or name.startswith(missing + "."):   # the requested module or one of its ancestors
             raise CapabilityAbsent(name) from None
-        raise
+        raise   # a module the requested one needs (a sibling, a child or another package) is a broken dependency
 
 
 def lifecycle_state() -> dict[str, str]:

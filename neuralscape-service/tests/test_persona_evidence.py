@@ -496,3 +496,46 @@ def test_a_report_of_history_damage_in_the_file_exits_nonzero(tmp_path) -> None:
     report = tmp_path / "report.md"
     assert pe.main(["report", "--evidence", str(out), "--out", str(report)]) != 0
     assert "invalid line" in report.read_text().lower()
+
+
+# ---- a present package with a broken import is not an absent capability
+
+def _fake_tree(tmp_path, files):
+    for name, text in files.items():
+        target = tmp_path / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(text)
+    return tmp_path
+
+
+@pytest.fixture
+def fake_path(tmp_path, monkeypatch):
+    import sys
+
+    monkeypatch.syspath_prepend(str(tmp_path))
+    before = set(sys.modules)
+    yield tmp_path
+    for name in set(sys.modules) - before:
+        sys.modules.pop(name, None)
+
+
+@pytest.mark.parametrize(
+    ("requested", "files", "absent"),
+    [
+        ("pkg_a", {}, True),                                                             # the requested module itself
+        ("pkg_b.port", {}, True),                                                        # a missing ancestor
+        ("pkg_c.port", {"pkg_c/__init__.py": ""}, True),                                 # the requested child itself
+        ("pkg_d.port", {"pkg_d/__init__.py": "", "pkg_d/port.py": "import pkg_d.missing_child\n"}, False),   # a sibling it needs
+        ("pkg_e", {"pkg_e/__init__.py": "import pkg_e.gone\n"}, False),             # a child its own package needs
+        ("pkg_f", {"pkg_f/__init__.py": "import third_party_not_installed\n"}, False),   # an unrelated dependency
+        ("pkg_g.sqlite", {"pkg_g/__init__.py": "", "pkg_g/sqlite.py": "from pkg_g.port import x\n"}, False),   # the case reported
+    ],
+)
+def test_only_the_requested_module_or_a_missing_ancestor_is_absent(fake_path, requested, files, absent) -> None:
+    _fake_tree(fake_path, files)
+    if absent:
+        with pytest.raises(persona_probes.CapabilityAbsent):
+            persona_probes._need(requested)
+    else:
+        with pytest.raises(ModuleNotFoundError):
+            persona_probes._need(requested)
