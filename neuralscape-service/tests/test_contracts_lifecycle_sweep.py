@@ -144,21 +144,23 @@ def test_a_spoof_of_a_valid_contract_is_refused_at_every_entry():
 
 
 def test_a_spoofed_receipt_cannot_carry_a_graph_past_the_claim_budget():
-    import time
-
     from tests.test_contracts_lifecycle import intent_with_requirements, reference, requirement
+
+    class CountingSpoof(Spoof):
+        def __getattribute__(self, name):
+            object.__getattribute__(self, "_reads").append(name)
+            return Spoof.__getattribute__(self, name)
 
     command = intent_with_requirements(requirement(ProcessingStage.CANONICAL))
     large = receipt(ProcessingStage.CANONICAL, StageStatus.APPLIED)
     set_native(large, "output_refs", tuple(reference(f"o{i}") for i in range(70_000)))
     with pytest.raises(ValueError, match=BUDGET):  # beyond the tier, read natively
         validate_required_stage_claim(claimed_status=IntentStatus.APPLIED, intent=command, receipts=(large,))
-    started = time.monotonic()
+    spoof = CountingSpoof(large, StageReceipt)
+    object.__setattr__(spoof, "_reads", [])
     with pytest.raises((TypeError, ValueError)):  # the proxy's own view is never read outside the budget
-        validate_required_stage_claim(
-            claimed_status=IntentStatus.APPLIED, intent=command, receipts=(Spoof(large, StageReceipt),)
-        )
-    assert time.monotonic() - started < 30
+        validate_required_stage_claim(claimed_status=IntentStatus.APPLIED, intent=command, receipts=(spoof,))
+    assert object.__getattribute__(spoof, "_reads") == []  # nothing was read through the proxy at all
 
 
 class CountingSpoof:
@@ -665,18 +667,28 @@ def many_outputs(count, *, status=StageStatus.APPLIED, attempt=1, stage=Processi
     return receipt(stage, status, outputs=outputs, attempt=attempt)
 
 
-def test_a_stage_with_ten_thousand_output_refs_validates_and_settles_in_bounded_time():
-    import time
-
-    from tests.test_contracts_lifecycle import intent_with_requirements, requirement
+def test_a_stage_with_ten_thousand_output_refs_validates_and_settles_in_bounded_time(monkeypatch):
+    from tests.test_contracts_lifecycle import LifecycleWork, intent_with_requirements, requirement
 
     command = intent_with_requirements(requirement(ProcessingStage.CANONICAL))
     applied = many_outputs(10_000)
-    started = time.monotonic()
+    keyed = []
+    identity_key = contracts_lifecycle._reference_identity_key
+
+    def counting_key(reference):
+        keyed.append(1)
+        assert len(keyed) <= 10 * 10_000, "handle identities are compared pairwise"  # stop a quadratic walk early
+        return identity_key(reference)
+
+    monkeypatch.setattr(contracts_lifecycle, "_reference_identity_key", counting_key)
+    work = LifecycleWork(monkeypatch)
     validate_required_stage_claim(claimed_status=IntentStatus.APPLIED, intent=command, receipts=(applied,))
     kept_intent, kept = contracts_lifecycle.validate_stage_receipts(command, (applied,))
     assert len(kept[0].output_refs) == 10_000 and kept_intent == command
-    assert time.monotonic() - started < 30
+    # Linear in the outputs: a pairwise comparison of the handles would be 10,000 x 10,000.
+    assert len(keyed) <= 10 * 10_000, len(keyed)
+    assert work.materialized <= 50 * 10_000, work.materialized
+    assert work.edges <= 50 * 10_000, work.edges
 
 
 def test_the_standard_tier_would_strand_a_large_stage_and_the_lifecycle_tier_does_not(monkeypatch):
@@ -752,15 +764,14 @@ def unchecked_outputs(count, form):
 
 
 @pytest.mark.parametrize("form", ["dict", "constructed"])
-def test_record_time_refuses_a_set_whose_normalized_copies_the_claim_could_not_read(form):
-    import time
+def test_record_time_refuses_a_set_whose_normalized_copies_the_claim_could_not_read(form, monkeypatch):
     import tracemalloc
 
-    from tests.test_contracts_lifecycle import intent_with_requirements, requirement
+    from tests.test_contracts_lifecycle import LifecycleWork, intent_with_requirements, requirement
 
     command = intent_with_requirements(requirement(ProcessingStage.CANONICAL))
     expanding = unchecked_outputs(70_000, form)  # fits as stored; one more field per handle once validated
-    started = time.monotonic()
+    work = LifecycleWork(monkeypatch, StageReceipt)
     tracemalloc.start()
     try:
         with pytest.raises(ValueError, match=BUDGET):
@@ -768,7 +779,8 @@ def test_record_time_refuses_a_set_whose_normalized_copies_the_claim_could_not_r
         _, peak = tracemalloc.get_traced_memory()
     finally:
         tracemalloc.stop()
-    assert time.monotonic() - started < 60
+    # One strict pass over the stored set (it fits); the copies' second read is refused before validating again.
+    assert work.validated.get("StageReceipt", 0) <= 1, work.validated
     assert peak < 512 * 2**20, peak
 
 
