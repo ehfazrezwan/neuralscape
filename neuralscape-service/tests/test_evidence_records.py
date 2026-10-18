@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 
 import pytest
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 
 import evidence_records as ev
 
@@ -820,3 +820,62 @@ def test_a_writer_with_protected_files_still_appends_to_its_own_file(tmp_path) -
     path, _ = _written(tmp_path)
     writer = ev.EvidenceWriter(path, protected=[protected, tmp_path / "missing.json"])
     assert writer.write(record("p1")) is True and protected.read_text() == "{}\n"
+
+
+# ---- the native field read runs no hook of the supplied object or its class
+
+def _reclassed(instance, cls):
+    """The same stored fields under another class (layouts match), so the subclass hooks sit on a real record."""
+
+    object.__setattr__(instance, "__class__", cls)
+    return instance
+
+
+def test_a_subclass_dict_property_cannot_change_what_the_writer_persists(tmp_path) -> None:
+    class Masked(ev.EvidenceRecord):
+        @property
+        def __dict__(self):   # type: ignore[override]
+            return {**BaseModel.__dict__["__dict__"].__get__(self, BaseModel), "record_id": "forged-by-property", "verdict": "known_failure"}
+
+    masked = _reclassed(record("real-id", verdict="baseline_pass"), Masked)
+    assert masked.__dict__["record_id"] == "forged-by-property"   # the hook is live
+    path, writer = _written(tmp_path)
+    assert writer.write(masked) is True
+    [stored] = writer.read().records
+    assert (stored.record_id, stored.verdict) == ("real-id", "baseline_pass")
+
+
+def test_an_observation_subclass_dict_property_cannot_change_a_persisted_value(tmp_path) -> None:
+    class Masked(ev.Observation):
+        @property
+        def __dict__(self):   # type: ignore[override]
+            return {"key": "k", "value": "forged"}
+
+    masked = _reclassed(ev.Observation(key="k", value="real"), Masked)
+    assert masked.__dict__["value"] == "forged"
+    holder = record("o1")
+    holder.observed = (masked,)   # assigned after construction, so no constructor reads the hooked __dict__
+    path, writer = _written(tmp_path)
+    assert writer.write(holder) is True
+    assert [(item.key, item.value) for item in writer.read().records[0].observed] == [("k", "real")]
+
+
+def test_a_metaclass_mro_hook_is_not_consulted_by_the_native_read(tmp_path) -> None:
+    calls = []
+    live = []
+
+    class Meta(type(ev.EvidenceRecord)):
+        @property
+        def __mro__(cls):   # type: ignore[override]
+            if live:
+                calls.append(1)
+            return type.__dict__["__mro__"].__get__(cls)
+
+    class Hooked(ev.EvidenceRecord, metaclass=Meta):
+        pass
+
+    hooked = _reclassed(record("m1"), Hooked)
+    live.append(1)
+    path, writer = _written(tmp_path)
+    assert writer.write(hooked) is True
+    assert not calls

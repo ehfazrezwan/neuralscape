@@ -25,7 +25,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated, Literal
 
-from pydantic import StringConstraints, ValidationError, model_validator
+from pydantic import BaseModel, StringConstraints, ValidationError, model_validator
 
 from contracts_common import ContractModel, OpaqueId, VersionedContract
 
@@ -100,16 +100,24 @@ class UnsafePath(Exception):
     """A write would reach evidence or reviewer-owned files through an alias, or a file that is not a plain file."""
 
 
-def _native_fields(value: object, cls: type) -> dict[str, object]:
-    """The declared fields of a model instance read from its own storage, running none of its code.
+_MODEL_STORAGE = BaseModel.__dict__["__dict__"]   # pydantic's own slot for field values: a subclass's __dict__ property is not consulted
+_TYPE_MRO = type.__dict__["__mro__"]               # the class's real MRO: a metaclass's __mro__ hook is not consulted
 
-    No property, ``__getattr__``, ``__class__`` or serializer hook of a subclass is consulted; an instance that
+
+def _native_mro(value: object) -> tuple[type, ...]:
+    return _TYPE_MRO.__get__(type(value))
+
+
+def _native_fields(value: object, cls: type) -> dict[str, object]:
+    """The declared fields of a model instance read from pydantic's own storage, running none of its code.
+
+    No property (``__dict__`` included), ``__getattr__``, ``__class__``, metaclass ``__mro__`` or serializer hook is consulted; an instance that
     lacks a declared field (``model_construct`` with a subset) is refused.
     """
 
-    if cls not in type(value).__mro__:
+    if cls not in _native_mro(value):
         raise TypeError(f"expected a {cls.__name__}")
-    stored = object.__getattribute__(value, "__dict__")
+    stored = _MODEL_STORAGE.__get__(value, BaseModel)
     try:
         return {name: stored[name] for name in cls.model_fields}
     except KeyError as missing:
@@ -119,7 +127,7 @@ def _native_fields(value: object, cls: type) -> dict[str, object]:
 def _exact_text(value: object) -> object:
     """A ``str`` subclass instance copied to exact text; anything else is returned for validation to judge."""
 
-    return str.__str__(value) if str in type(value).__mro__ else value
+    return str.__str__(value) if str in _native_mro(value) else value
 
 
 def _exact_texts(value: object) -> object:
@@ -133,7 +141,7 @@ def _exact_observations(value: object) -> object:
         return value
     rebuilt = []
     for item in value:
-        if Observation not in type(item).__mro__:
+        if Observation not in _native_mro(item):
             return value   # validation rejects it
         fields = _native_fields(item, Observation)
         rebuilt.append(Observation(key=_exact_text(fields["key"]), value=_exact_text(fields["value"])))
