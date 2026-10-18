@@ -724,3 +724,99 @@ def test_record_text_cannot_forge_table_rows_in_the_report(tmp_path) -> None:
     table = [line for line in text.splitlines() if line.startswith("|")]
     assert len(table) == 3                                  # header, separator and exactly one row
     assert not any(line.startswith("| forged") for line in table)
+
+
+# ---- serialization never runs the instance's own serializer hooks
+
+def _hostile_subclasses():
+    from pydantic import field_serializer, model_serializer
+
+    class Wrapped(ev.EvidenceRecord):
+        @model_serializer(mode="wrap")
+        def _swap(self, handler):
+            data = handler(self)
+            data["record_id"] = "substituted"
+            data["verdict"] = "baseline_pass"
+            return data
+
+    class Noted(ev.EvidenceRecord):
+        @field_serializer("note")
+        def _note(self, value):
+            return "rewritten by a subclass serializer"
+
+    class Skewed(ev.Observation):
+        @field_serializer("value")
+        def _value(self, value):
+            return "skewed"
+
+    return Wrapped, Noted, Skewed
+
+
+def _clone(cls, source, **overrides):
+    values = {name: getattr(source, name) for name in ev.EvidenceRecord.model_fields}
+    values.update(overrides)
+    return cls(**values)
+
+
+@pytest.mark.parametrize("index", [0, 1])
+def test_a_subclass_serializer_cannot_substitute_fields_of_the_written_line(tmp_path, index) -> None:
+    cls = _hostile_subclasses()[index]
+    supplied = _clone(cls, record("orig", verdict="known_failure", note="original"))
+    path, writer = _written(tmp_path)
+    assert writer.write(supplied) is True
+    [stored] = writer.read().records
+    assert (stored.record_id, stored.verdict, stored.note) == ("orig", "known_failure", "original")
+
+
+def test_a_nested_observation_subclass_serializer_cannot_substitute_a_value(tmp_path) -> None:
+    skewed = _hostile_subclasses()[2](key="k", value="real")
+    path, writer = _written(tmp_path)
+    assert writer.write(record("n1", observed=(skewed,))) is True
+    assert [(item.key, item.value) for item in writer.read().records[0].observed] == [("k", "real")]
+
+
+@pytest.mark.parametrize("field", ["artifact_hashes", "observed", "expected"])
+def test_a_container_that_strict_validation_rejects_is_not_normalized_by_serialization(tmp_path, field) -> None:
+    path, writer = _written(tmp_path)
+    changed = record("c1")
+    value = [DIGEST] if field == "artifact_hashes" else [ev.Observation(key="k", value="v")]
+    setattr(changed, field, value)   # a list where the contract demands a tuple
+    with pytest.raises((ValidationError, ValueError, TypeError)):
+        writer.write(changed)
+    assert not path.exists() or path.read_bytes() == b""
+
+
+def test_text_subclasses_are_copied_to_exact_text_before_the_line_is_built(tmp_path) -> None:
+    class Odd(str):
+        def __str__(self):
+            return "evil"
+
+        def __eq__(self, other):
+            return True
+
+        __hash__ = str.__hash__
+
+    path, writer = _written(tmp_path)
+    assert writer.write(record(Odd("o1"), scenario=Odd("s9"))) is True
+    [stored] = writer.read().records
+    assert (stored.record_id, stored.scenario_id) == ("o1", "s9") and b"evil" not in path.read_bytes()
+
+
+def test_a_writer_refuses_to_append_through_a_link_to_a_protected_file_made_after_the_early_checks(tmp_path) -> None:
+    protected = tmp_path / "oracle.json"
+    protected.write_text('{"scenario_id": "x"}\n')
+    before = protected.read_bytes()
+    path = tmp_path / "e.jsonl"
+    writer = ev.EvidenceWriter(path, protected=[protected])
+    path.symlink_to(protected)   # created after construction: the append descriptor is what is compared
+    with pytest.raises(ev.UnsafePath):
+        writer.write(record("p1"))
+    assert protected.read_bytes() == before
+
+
+def test_a_writer_with_protected_files_still_appends_to_its_own_file(tmp_path) -> None:
+    protected = tmp_path / "oracle.json"
+    protected.write_text("{}\n")
+    path, _ = _written(tmp_path)
+    writer = ev.EvidenceWriter(path, protected=[protected, tmp_path / "missing.json"])
+    assert writer.write(record("p1")) is True and protected.read_text() == "{}\n"

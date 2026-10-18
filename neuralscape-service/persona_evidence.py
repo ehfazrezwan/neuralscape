@@ -136,7 +136,7 @@ def run(service_dir: Path, role: str, subject_ref: str, oracles_dir: Path, out: 
     oracles = load_oracles(oracles_dir)
     _refuse_oracle_alias(out, oracles_dir)
     observed = observe(service_dir)
-    writer = EvidenceWriter(out)
+    writer = EvidenceWriter(out, protected=oracles_dir.glob("*.json"))
     existing = {record.record_id: record for record in writer.read().records}
     for scenario_id, (oracle, digest) in oracles.items():
         stored = existing.get(f"{run_id}.{role}.{scenario_id}")

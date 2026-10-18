@@ -588,3 +588,41 @@ def test_report_to_a_new_file_and_run_to_a_new_file_still_work(tmp_path) -> None
     report = tmp_path / "report.md"
     assert pe.main(["report", "--evidence", str(out), "--out", str(report)]) == 0 and report.read_text().startswith("# Baseline")
     assert pe.main(["report", "--evidence", str(out), "--out", str(report)]) == 0   # replacing a report is fine
+
+
+def test_an_output_swapped_for_a_link_to_an_oracle_during_observation_is_not_appended_to(tmp_path, monkeypatch) -> None:
+    copy = _oracle_copy(tmp_path)
+    oracle = copy / "persona-lifecycle-state.json"
+    manifest = copy / pe.MANIFEST
+    before = (oracle.read_bytes(), manifest.read_bytes())
+    out = tmp_path / "evidence.jsonl"
+    real_observe = pe.observe
+
+    def swapping_observe(service_dir):
+        observed = real_observe(service_dir)
+        out.symlink_to(oracle)   # replaced while the tree under test was running
+        return observed
+
+    monkeypatch.setattr(pe, "observe", swapping_observe)
+    with pytest.raises(pe.UnsafePath):
+        pe.run(tmp_path, "baseline", "tree-a", copy, out, "run-1")
+    assert (oracle.read_bytes(), manifest.read_bytes()) == before
+
+
+def test_main_reports_an_output_swapped_during_observation_as_an_error_exit(tmp_path, monkeypatch, capsys) -> None:
+    copy = _oracle_copy(tmp_path)
+    oracle = copy / "persona-card-freshness.json"
+    before = oracle.read_bytes()
+    out = tmp_path / "evidence.jsonl"
+    real_observe = pe.observe
+
+    def swapping_observe(service_dir):
+        observed = real_observe(service_dir)
+        out.symlink_to(oracle)
+        return observed
+
+    monkeypatch.setattr(pe, "observe", swapping_observe)
+    code = pe.main(["run", "--service-dir", str(tmp_path), "--role", "baseline", "--subject-ref", "t",
+                    "--oracles", str(copy), "--out", str(out)])
+    assert code == 2 and oracle.read_bytes() == before
+    assert "same file" in capsys.readouterr().err

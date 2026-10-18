@@ -100,6 +100,64 @@ class UnsafePath(Exception):
     """A write would reach evidence or reviewer-owned files through an alias, or a file that is not a plain file."""
 
 
+def _native_fields(value: object, cls: type) -> dict[str, object]:
+    """The declared fields of a model instance read from its own storage, running none of its code.
+
+    No property, ``__getattr__``, ``__class__`` or serializer hook of a subclass is consulted; an instance that
+    lacks a declared field (``model_construct`` with a subset) is refused.
+    """
+
+    if cls not in type(value).__mro__:
+        raise TypeError(f"expected a {cls.__name__}")
+    stored = object.__getattribute__(value, "__dict__")
+    try:
+        return {name: stored[name] for name in cls.model_fields}
+    except KeyError as missing:
+        raise TypeError(f"the {cls.__name__} lacks the field {missing.args[0]!r}") from None
+
+
+def _exact_text(value: object) -> object:
+    """A ``str`` subclass instance copied to exact text; anything else is returned for validation to judge."""
+
+    return str.__str__(value) if str in type(value).__mro__ else value
+
+
+def _exact_texts(value: object) -> object:
+    if type(value) is tuple:
+        return tuple(_exact_text(item) for item in value)
+    return value   # not the contract's tuple: left as it is so strict validation rejects it
+
+
+def _exact_observations(value: object) -> object:
+    if type(value) is not tuple:
+        return value
+    rebuilt = []
+    for item in value:
+        if Observation not in type(item).__mro__:
+            return value   # validation rejects it
+        fields = _native_fields(item, Observation)
+        rebuilt.append(Observation(key=_exact_text(fields["key"]), value=_exact_text(fields["value"])))
+    return tuple(rebuilt)
+
+
+def _detached(record: object) -> "EvidenceRecord":
+    """A new base-class record built and validated from the native field values of ``record``.
+
+    ``record`` may have been mutated after construction (assignment, ``model_copy(update=...)``) or be a
+    subclass with its own serializers; neither is trusted.  Strict validation sees the natives, so a value that
+    serialization would have normalized (a list for a tuple) is rejected rather than rewritten.
+    """
+
+    fields = _native_fields(record, EvidenceRecord)
+    for name in ("schema_version", "record_id", "scenario_id", "run_id", "role", "subject_ref", "oracle_version",
+                 "oracle_sha256", "verdict", "supersedes", "note"):
+        fields[name] = _exact_text(fields[name])
+    fields["artifact_hashes"] = _exact_texts(fields["artifact_hashes"])
+    fields["observed"] = _exact_observations(fields["observed"])
+    fields["expected"] = _exact_observations(fields["expected"])
+    return EvidenceRecord(**fields)
+
+
 def sidecar_path(path: str | os.PathLike[str]) -> Path:
     """The writer's lock file, named after the resolved evidence path so every symbolic-link alias shares one lock."""
 
@@ -164,7 +222,8 @@ def _history_allows(record: EvidenceRecord, accepted: Mapping[str, EvidenceRecor
 class EvidenceWriter:
     """Append-only JSON Lines evidence file."""
 
-    def __init__(self, path: str | os.PathLike[str]) -> None:
+    def __init__(self, path: str | os.PathLike[str], protected: Iterable[str | os.PathLike[str]] = ()) -> None:
+        self._protected = tuple(Path(item) for item in protected)   # files an append must never reach, by inode
         self._path = Path(path)
         if self._path.name.endswith(".lock"):
             raise UnsafePath("an evidence file name must not end in .lock: that suffix names the writer's lock file")
@@ -257,13 +316,11 @@ class EvidenceWriter:
         line and the new record is readable.  The file is never rewritten.
         """
 
-        if not isinstance(record, EvidenceRecord):
-            raise TypeError("only an EvidenceRecord can be written")
-        # A record can be mutated after construction (attribute assignment, model_copy(update=...)) without
-        # revalidation: serialize it with the base class's own serializer and validate that text exactly as the
-        # reader will, so every successful write is a line the reader accepts and no subclass hook can change it.
-        line = EvidenceRecord.model_dump_json(record)
-        record = EvidenceRecord.model_validate_json(line)
+        # A record can be mutated after construction (attribute assignment, model_copy(update=...)) and a subclass
+        # can carry serializers: rebuild a base instance from the native field values and validate that, then
+        # serialize the rebuilt instance, so every successful write is a line the reader accepts and says what the
+        # caller's fields say.
+        record = _detached(record)
         line = record.model_dump_json()
         with self._lock, open(self._sidecar(), "ab") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
@@ -281,32 +338,41 @@ class EvidenceWriter:
                         raise RecordConflict(f"superseded record {record.supersedes!r} does not exist")
                     if (target.scenario_id, target.role, target.subject_ref) != (record.scenario_id, record.role, record.subject_ref):
                         raise RecordConflict("a record may only supersede one of the same scenario, role and subject")
-                with open(self._path, "ab") as handle:
-                    if self._path.stat().st_size and not self._ends_with_newline():
+                # Open the append descriptor, then judge the file it really names: a path swapped for a link since the
+                # earlier checks is caught here, before a byte is written.
+                descriptor = os.open(self._path, os.O_RDWR | os.O_APPEND | os.O_CREAT | getattr(os, "O_NONBLOCK", 0), 0o666)
+                with os.fdopen(descriptor, "r+b") as handle:
+                    status = os.fstat(descriptor)
+                    self._require_appendable(status)
+                    if status.st_size and os.pread(descriptor, 1, status.st_size - 1) != b"\n":
                         handle.write(b"\n")
                     handle.write(line.encode("utf-8") + b"\n")
                     handle.flush()
-                    os.fsync(handle.fileno())
+                    os.fsync(descriptor)
             finally:
                 fcntl.flock(lock, fcntl.LOCK_UN)
         return True
 
     def _require_plain_unaliased_file(self) -> None:
-        """Appending through a second hard link or to a non-plain file would change another file's content."""
-
         try:
             status = os.stat(self._path)
         except FileNotFoundError:
             return
+        self._require_appendable(status)
+
+    def _require_appendable(self, status: os.stat_result) -> None:
+        """Appending through a second hard link, to a non-plain file or to a protected file would change something else."""
+
         if not stat.S_ISREG(status.st_mode):
             raise UnsafePath("the evidence path is not a plain file")
         if status.st_nlink > 1:
             raise UnsafePath("the evidence file has more than one hard link: an append would also change the other names")
-
-    def _ends_with_newline(self) -> bool:
-        with open(self._path, "rb") as handle:
-            handle.seek(-1, os.SEEK_END)
-            return handle.read(1) == b"\n"
+        for other in self._protected:
+            try:
+                if _same_file(status, os.stat(other)):
+                    raise UnsafePath("the evidence file is the same file as an oracle or the manifest")
+            except FileNotFoundError:
+                continue
 
 
 def current_records(records: Iterable[EvidenceRecord]) -> list[EvidenceRecord]:
