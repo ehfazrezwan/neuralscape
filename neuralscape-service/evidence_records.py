@@ -134,7 +134,32 @@ class EvidenceWriter:
     def read(self) -> ReadResult:
         if not self._path.exists():
             return ReadResult((), (), False)
-        raw = self._path.read_bytes()
+        return self._parse(self._path.read_bytes())
+
+    def snapshot(self) -> tuple[ReadResult, int, str]:
+        """The parsed records, the byte count and the SHA-256 of one consistent state of the file.
+
+        The bytes are read once, under the writer's lock in shared mode, so an append in progress is
+        either wholly absent or wholly present, and the records, size and digest all describe the same
+        bytes.  A directory that cannot hold the lock file has no writer, so the read proceeds without it.
+        A missing file raises ``FileNotFoundError``.
+        """
+
+        try:
+            lock = open(self._path.with_name(self._path.name + ".lock"), "ab")
+        except OSError:
+            lock = None
+        try:
+            if lock is not None:
+                fcntl.flock(lock, fcntl.LOCK_SH)
+            raw = self._path.read_bytes()
+        finally:
+            if lock is not None:
+                lock.close()   # closing releases the lock
+        return self._parse(raw), len(raw), hashlib.sha256(raw).hexdigest()
+
+    @staticmethod
+    def _parse(raw: bytes) -> ReadResult:
         partial_tail = bool(raw) and not raw.endswith(b"\n")
         records: list[EvidenceRecord] = []
         accepted: dict[str, EvidenceRecord] = {}
@@ -325,7 +350,7 @@ def matrix_artifacts(
     generator reads them from ``evidence-records.json`` written by ``write_matrix_input``.
     """
 
-    result = EvidenceWriter(evidence_path).read()
+    result, size, digest = EvidenceWriter(evidence_path).snapshot()
     rows = compare(result.records)
     counts: dict[str, int] = {}
     for row in rows:
@@ -333,13 +358,13 @@ def matrix_artifacts(
     summary = (
         f"{len(result.records)} records over {len(rows)} scenarios; changes: "
         + ", ".join(f"{name} {count}" for name, count in sorted(counts.items()))
-        + f"; {Path(evidence_path).stat().st_size} bytes when hashed (the hash goes stale if records are appended later)"
+        + f"; {size} bytes when hashed (the hash goes stale if records are appended later)"
         + ("; NO VALID RECORDS" if not result.records else "")
         + (f"; {len(result.invalid_lines)} invalid line(s)" if result.invalid_lines else "")
         + ("; partial tail" if result.partial_tail else "")
     )
     artifacts = [{
-        "kind": "unit", "path": str(Path(evidence_path).resolve()), "sha256": sha256_file(evidence_path),
+        "kind": "unit", "path": str(Path(evidence_path).resolve()), "sha256": digest,
         "producer_lane": producer_lane, "scope": "lane-local", "summary": summary,
     }]
     if report_path is not None:

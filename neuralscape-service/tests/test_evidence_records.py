@@ -336,3 +336,89 @@ def test_the_matrix_summary_of_an_empty_evidence_file_says_it_holds_no_valid_rec
     full = tmp_path / "f.jsonl"
     full.write_bytes(_lines(record("b1")))
     assert "NO VALID RECORDS" not in ev.matrix_artifacts(full)[0]["summary"]
+
+
+# ---- the matrix summary describes one consistent file state
+
+def _held_exclusively(path):
+    """Hold the writer's lock the way ``write()`` does during an append."""
+
+    import fcntl
+
+    handle = open(path.with_name(path.name + ".lock"), "ab")
+    fcntl.flock(handle, fcntl.LOCK_EX)
+    return handle
+
+
+def test_the_matrix_summary_waits_for_a_writer_that_holds_the_lock(tmp_path) -> None:
+    import fcntl
+    import threading
+
+    path = tmp_path / "e.jsonl"
+    writer = ev.EvidenceWriter(path)
+    writer.write(record("b1"))
+    holder = _held_exclusively(path)
+    done = threading.Event()
+    out: list = []
+
+    def summarise() -> None:
+        out.append(ev.matrix_artifacts(path)[0])
+        done.set()
+
+    thread = threading.Thread(target=summarise)
+    thread.start()
+    assert not done.wait(0.5), "the summary did not wait for the writer's lock"
+    path.write_bytes(path.read_bytes() + _lines(record("b2", scenario="s2")))   # the append the lock protects
+    fcntl.flock(holder, fcntl.LOCK_UN)
+    holder.close()
+    thread.join(10)
+    artifact = out[0]
+    final = path.read_bytes()
+    import hashlib
+    assert artifact["sha256"] == hashlib.sha256(final).hexdigest()
+    assert f"{len(final)} bytes" in artifact["summary"] and "2 records" in artifact["summary"]
+
+
+def test_the_records_size_and_digest_of_a_summary_come_from_one_read(tmp_path, monkeypatch) -> None:
+    import hashlib
+    from pathlib import Path
+
+    path = tmp_path / "e.jsonl"
+    path.write_bytes(_lines(record("b1")))
+    first = path.read_bytes()
+    opened = []
+    real_open = Path.open
+
+    def racing_open(self, *args, **kwargs):
+        if self == path:
+            opened.append(1)
+            if len(opened) > 1:   # a later reader would see an appended record
+                path.write_bytes(first + _lines(record("b2", scenario="s2")))
+        return real_open(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", racing_open)
+    artifact = ev.matrix_artifacts(path)[0]
+    assert len(opened) == 1
+    assert artifact["sha256"] == hashlib.sha256(first).hexdigest()
+    assert f"{len(first)} bytes" in artifact["summary"] and "1 records" in artifact["summary"]
+
+
+def test_a_summary_of_a_file_in_a_read_only_directory_still_works(tmp_path) -> None:
+    import os
+    import stat
+
+    path = tmp_path / "ro" / "e.jsonl"
+    ev.EvidenceWriter(path).write(record("b1"))
+    path.with_name("e.jsonl.lock").unlink()
+    os.chmod(path.parent, stat.S_IRUSR | stat.S_IXUSR)
+    try:
+        if os.access(path.parent, os.W_OK):
+            pytest.skip("directory permissions are not enforced for this user")
+        assert "1 records" in ev.matrix_artifacts(path)[0]["summary"]
+    finally:
+        os.chmod(path.parent, stat.S_IRWXU)
+
+
+def test_a_missing_evidence_file_still_raises_for_the_matrix_summary(tmp_path) -> None:
+    with pytest.raises(FileNotFoundError):
+        ev.matrix_artifacts(tmp_path / "nowhere.jsonl")
