@@ -137,11 +137,12 @@ def _pin_datetimes(value: object, memo: dict[int, tuple[object, object]] | None 
 
 def _validated_observation_snapshot(
     observation: CapabilityReadiness,
+    memo: dict[int, tuple[object, object]] | None = None,
 ) -> CapabilityReadiness:
     if not is_native_instance(observation, CapabilityReadiness):
         raise TypeError("observation must be a CapabilityReadiness")
     return CapabilityReadiness.model_validate(
-        _pin_datetimes(_snapshot_closed_graph(observation))
+        _pin_datetimes(_snapshot_closed_graph(observation), memo)
     )
 
 
@@ -208,11 +209,14 @@ def capability_is_ready(
     Structural validation cannot prove that the represented probe occurred.
     """
 
-    observation = _validated_observation_snapshot(observation)
-    # The caller's timestamp is read once (offset and fields) before validation, and the pinned copy is
-    # what is validated and compared: a zone that answers differently per read cannot split the two.
+    # One pinning memo for the whole call: a timestamp object is read once (offset and fields) at its first
+    # occurrence, and that pinned copy is what is validated and compared wherever the object appears, so a
+    # zone that answers differently per read cannot give the observation and the evaluation two instants
+    # (``evaluated_at`` may be the very object the observation holds).
+    pinned: dict[int, tuple[object, object]] = {}
+    observation = _validated_observation_snapshot(observation, pinned)
     validated_evaluation_time = _AWARE_DATETIME_ADAPTER.validate_python(
-        _pin_datetime(evaluated_at), strict=True
+        _pin_datetimes(evaluated_at, pinned), strict=True
     )
     validated_max_age = _SAFE_COUNTER_ADAPTER.validate_python(
         max_probe_age_seconds, strict=True

@@ -2205,3 +2205,28 @@ def test_a_hostile_zone_inside_a_publication_is_a_value_error(mode: str) -> None
     with pytest.raises(ValidationError):
         validate_readiness_publication(publication, expected_tenant_id="t", current_placement_generation=1)
     assert zone.reads == 1
+
+
+# ---- one timestamp object has one interpretation throughout a call
+
+
+def test_an_evaluation_time_that_is_the_observation_time_object_is_read_once() -> None:
+    zone = FlappingZone(timedelta(0), timedelta(hours=-12))
+    moment = datetime(2026, 1, 1, 12, 0, tzinfo=zone)
+    observation = _fold_observation(moment)
+    assert observation.observed_at is moment  # the same caller object at both positions
+    zone.arm()
+    # Read once, the probe is exactly as old as the evaluation (age 0): ready.  A second read of the same
+    # object (UTC-12) would put the evaluation 12 hours after the probe and call it stale.
+    assert capability_is_ready(observation, evaluated_at=moment, max_probe_age_seconds=3600) is True
+    assert zone.reads == 1
+
+
+def test_distinct_timestamp_objects_are_still_each_read_once() -> None:
+    zone = FlappingZone(timedelta(0), timedelta(hours=-12))
+    observation = _fold_observation(datetime(2026, 1, 1, 12, 0, tzinfo=zone))
+    evaluated = datetime(2026, 1, 1, 12, 30, tzinfo=zone)  # another object on the same zone
+    zone.arm()
+    # each object is read once; the second object's first read is already a later read of the zone (UTC-12)
+    assert capability_is_ready(observation, evaluated_at=evaluated, max_probe_age_seconds=3600) is False
+    assert zone.reads == 2
