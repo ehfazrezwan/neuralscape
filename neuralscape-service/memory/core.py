@@ -13,10 +13,13 @@ from config import settings
 
 logger = logging.getLogger(__name__)
 
-# Each mem0 start creates at most a few Qdrant collections; every conflict
-# means one more of them now exists, and a collection still being created is
-# readable within tens of milliseconds, so a handful of attempts suffices.
-_COLD_START_ATTEMPTS = 5
+# One mem0 start touches two Qdrant collections (memories and migrations).
+# Each can cost two failed attempts, a 409 from our create and then a 500 from
+# reading it while another process finishes creating it, so the worst
+# expected start uses four. A collection being created was readable within
+# about 0.1 s in live boots, against 2.8 s of total backoff here. A fault that
+# persists still fails start-up after the last attempt.
+_COLD_START_ATTEMPTS = 8
 
 
 def _is_collection_exists_conflict(exc: BaseException) -> bool:

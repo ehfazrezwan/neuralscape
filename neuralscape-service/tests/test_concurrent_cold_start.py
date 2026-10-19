@@ -3,10 +3,12 @@
 The API and the three workers initialise mem0 at the same time against an
 empty Qdrant. mem0's Qdrant store lists the collections, sees its own missing
 and creates it; a process that loses the race gets ``409 Collection already
-exists``. That must count as a successful initialisation, not kill the worker.
+exists``. A process that lists while another is still creating the collection
+sees it listed, reads it, and gets ``500 0 of 0 read operations failed``. Both
+must count as a successful initialisation, not kill the worker.
 
-The race is reproduced against mem0's real ``Qdrant.create_col`` with a fake
-client: every process lists before any of them creates.
+The races are reproduced against mem0's real ``Qdrant.create_col`` with fake
+clients.
 """
 
 import threading
@@ -18,7 +20,7 @@ from qdrant_client.http.exceptions import UnexpectedResponse
 
 import mem0
 from config import settings
-from memory.core import CoreMixin
+from memory.core import _COLD_START_ATTEMPTS, CoreMixin
 from mem0.vector_stores.qdrant import Qdrant
 
 COLLECTIONS = ("neuralscape_memories", "mem0migrations")
@@ -305,7 +307,7 @@ def test_a_collection_that_never_becomes_readable_is_not_retried_forever(monkeyp
     with pytest.raises(UnexpectedResponse) as err:
         Service()._get_memory()
     assert err.value.status_code == 500
-    assert server.reads == 5
+    assert server.reads == _COLD_START_ATTEMPTS
 
 
 def test_other_qdrant_500s_on_read_still_fail_start(monkeypatch):
@@ -359,3 +361,71 @@ def test_legacy_lazy_memory_survives_a_collection_still_being_created(monkeypatc
     monkeypatch.setattr(mem0.Memory, "from_config", _fake_from_config(server))
     memory = legacy_main._get_memory()
     assert memory is not None and legacy_main._memory is memory
+
+
+class ScriptedQdrantServer(RacingQdrantServer):
+    """Every collection is listed as missing until its create was tried once.
+    ``script`` names, in order, the failure each start attempt meets:
+    ``("conflict", name)`` is a 409 on that collection's create, and
+    ``("unreadable", name)`` a 500 on the read that follows. A step is used up
+    when it fires; after the script, everything succeeds."""
+
+    def __init__(self, script):
+        super().__init__(1)
+        self.script = list(script)
+        self.tried = set()
+
+    def _next(self, kind, name):
+        if self.script and self.script[0] == (kind, name):
+            self.script.pop(0)
+            return True
+        return False
+
+    def get_collections(self):
+        return SimpleNamespace(collections=[SimpleNamespace(name=n) for n in self.tried])
+
+    def create_collection(self, collection_name, **_):
+        self.tried.add(collection_name)
+        if self._next("conflict", collection_name):
+            raise _conflict(collection_name)
+        self.creates += 1
+
+    def get_collection(self, name):
+        if self._next("unreadable", name):
+            raise _not_yet_readable()
+        return super().get_collection(name)
+
+
+def _start_with(monkeypatch, server):
+    monkeypatch.setattr(mem0.Memory, "from_config", _fake_from_config(server))
+    monkeypatch.setattr(type(settings), "get_mem0_config", lambda self: {})
+    monkeypatch.setattr("memory.core.time.sleep", lambda s: None, raising=False)
+    return Service()._get_memory()
+
+
+def test_the_migrations_collection_still_being_created_is_tolerated(monkeypatch):
+    server = ScriptedQdrantServer([("unreadable", "mem0migrations")])
+    server.tried = set(COLLECTIONS)
+    assert _start_with(monkeypatch, server) is not None
+    assert server.script == []
+
+
+def test_a_start_that_loses_every_race_on_both_collections_comes_up(monkeypatch):
+    worst = [
+        ("conflict", "neuralscape_memories"),
+        ("unreadable", "neuralscape_memories"),
+        ("conflict", "mem0migrations"),
+        ("unreadable", "mem0migrations"),
+    ]
+    server = ScriptedQdrantServer(worst)
+    assert _start_with(monkeypatch, server) is not None
+    assert server.script == []
+
+
+def test_failures_beyond_the_attempt_bound_still_fail_start(monkeypatch):
+    server = ScriptedQdrantServer([("unreadable", "neuralscape_memories")] * _COLD_START_ATTEMPTS)
+    server.tried = set(COLLECTIONS)
+    with pytest.raises(UnexpectedResponse) as err:
+        _start_with(monkeypatch, server)
+    assert err.value.status_code == 500
+    assert server.script == []
