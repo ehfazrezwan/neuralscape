@@ -5,7 +5,6 @@ Import and call configure_logging() once at startup (in main.py lifespan).
 """
 
 import logging
-import os
 import sys
 
 import structlog
@@ -17,8 +16,12 @@ def configure_logging() -> None:
     Uses JSON rendering for production (LOG_FORMAT=json or default)
     and console rendering for development (LOG_FORMAT=console).
     """
-    log_level = os.environ.get("LOG_LEVEL", "INFO").upper()
-    log_format = os.environ.get("LOG_FORMAT", "json")
+    # The process environment wins (read now, as before); otherwise the setting, which
+    # also covers a service .env (pydantic-settings does not populate os.environ).
+    from config import process_env_or, settings
+
+    log_level = process_env_or("LOG_LEVEL", settings.log_level).upper()
+    log_format = process_env_or("LOG_FORMAT", settings.log_format)
 
     shared_processors: list[structlog.types.Processor] = [
         structlog.contextvars.merge_contextvars,
@@ -74,8 +77,6 @@ def configure_logging() -> None:
     # (incl. the .env file), which does NOT populate os.environ. Checking
     # os.environ here would miss a .env-only deployment and keep the logs
     # silenced exactly when they're needed.
-    from config import settings
-
     oauth_enabled = bool(
         settings.neuralscape_public_url.strip()
         and settings.neuralscape_user_token_secret.strip()
