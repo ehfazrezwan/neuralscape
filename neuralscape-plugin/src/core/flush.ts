@@ -40,8 +40,17 @@ export function boundText(value: string, limit: number = MAX_FLUSH_TEXT): string
   return value.slice(0, keep) + omitted(value.length - keep);
 }
 
-/** HTTP statuses that mean the service refused THIS payload for good (retrying cannot help): bad request, too large, invalid. */
-const PERMANENT_REJECTIONS = new Set([400, 413, 422]);
+/**
+ * HTTP statuses that mean the service refused THIS payload for good (retrying cannot help): too large, invalid.
+ * A 400 is not here: it is as likely a proxy or a client/service mismatch as this turn's text.
+ */
+const PERMANENT_REJECTIONS = new Set([413, 422]);
+
+/**
+ * Two permanent refusals in a row look systemic (a schema skew refuses every turn), not like one bad turn:
+ * stop there and leave the cursor in place instead of dropping every turn for good.
+ */
+const MAX_CONSECUTIVE_REJECTIONS = 2;
 
 /**
  * Check if a conversation turn should be skipped (noise filtering).
@@ -85,6 +94,8 @@ export interface FlushResult {
  */
 export async function flushTurns(turns: ConversationTurn[]): Promise<FlushResult> {
   let flushed = 0;
+  let refusedRunStart: number | null = null;
+  let refusedRun = 0;
 
   for (let i = 0; i < turns.length; i++) {
     const turn = turns[i];
@@ -103,9 +114,17 @@ export async function flushTurns(turns: ConversationTurn[]): Promise<FlushResult
         user_id: turn.userId,
       });
       flushed++;
+      refusedRun = 0;
+      refusedRunStart = null;
     } catch (error) {
       if (error instanceof HttpStatusError && PERMANENT_REJECTIONS.has(error.status)) {
-        // The service will never accept this turn: skip it (like noise) so it cannot block every later turn.
+        refusedRunStart ??= i;
+        refusedRun++;
+        if (refusedRun >= MAX_CONSECUTIVE_REJECTIONS) {
+          logError(`The service refused ${refusedRun} conversation turns in a row (HTTP ${error.status}); leaving them for the next flush`);
+          return { attempted: turns.length, flushed, firstFailedIndex: refusedRunStart };
+        }
+        // The service will not accept this turn: skip it (like noise) so it cannot block every later turn.
         logError(`Skipping conversation turn ${i + 1}/${turns.length}: the service rejected it (HTTP ${error.status}) and will not accept it on retry`);
         continue;
       }

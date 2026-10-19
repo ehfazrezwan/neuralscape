@@ -23,7 +23,7 @@ let requests: Array<{ path: string; body: Record<string, any> }> = [];
 let failFlushFrom = -1;
 let flushCount = 0;
 /** Refuse the Nth flush request (0-based) with this HTTP status; null = never. */
-let rejectFlush: { at: number; status: number } | null = null;
+let rejectFlush: { at: number | "all"; status: number } | null = null;
 
 await new Promise<void>((resolve) => {
   server = createServer((req, res) => {
@@ -34,7 +34,7 @@ await new Promise<void>((resolve) => {
       requests.push({ path: req.url ?? "", body: parsed });
       if ((req.url ?? "").includes("/conversation-compiler/flush")) {
         const n = flushCount++;
-        if (rejectFlush !== null && n === rejectFlush.at) {
+        if (rejectFlush !== null && (rejectFlush.at === "all" || n === rejectFlush.at)) {
           res.writeHead(rejectFlush.status, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ error: "refused" }));
           return;
@@ -546,7 +546,7 @@ describe("flush payload bounds and permanent rejections", () => {
     expect(sent.assistant_response).toBe("a".repeat(LIMIT));
   });
 
-  it.each([400, 413, 422])("a turn the service refuses with HTTP %i is skipped and the later turns are still delivered", async (status) => {
+  it.each([413, 422])("a turn the service refuses with HTTP %i is skipped and the later turns are still delivered", async (status) => {
     rejectFlush = { at: 1, status };
     const { path, raw } = await transcript([...FLAT(1), ...FLAT(2), ...FLAT(3)]);
     const turns = await extractClaudeCodeTurns(raw);
@@ -562,7 +562,7 @@ describe("flush payload bounds and permanent rejections", () => {
     expect(await extractClaudeCodeTurns(raw)).toEqual([]);
   });
 
-  it.each([401, 403, 404, 408, 429, 500, 503])("HTTP %i is not a permanent rejection of the turn: delivery stops there and the cursor waits", async (status) => {
+  it.each([400, 401, 403, 404, 408, 429, 500, 503])("HTTP %i is not a permanent rejection of the turn: delivery stops there and the cursor waits", async (status) => {
     rejectFlush = { at: 1, status };
     const { path, raw } = await transcript([...FLAT(1), ...FLAT(2), ...FLAT(3)]);
     const result = await flushTurns(await extractClaudeCodeTurns(raw));
@@ -570,5 +570,38 @@ describe("flush payload bounds and permanent rejections", () => {
     expect(flushes().length).toBe(2); // turn 3 was not attempted
     await commitClaudeCodeFlush(raw, result);
     expect(await offsetOf(path)).toBe(2);
+  });
+
+  it.each([413, 422])("every turn refused with HTTP %i: delivery stops after the second and the cursor stays", async (status) => {
+    rejectFlush = { at: "all", status };
+    const { path, raw } = await transcript([...FLAT(1), ...FLAT(2), ...FLAT(3), ...FLAT(4)]);
+    const result = await flushTurns(await extractClaudeCodeTurns(raw));
+    expect(result.firstFailedIndex).toBe(0);
+    expect(flushes().length).toBe(2); // turns 3 and 4 were not attempted
+    await commitClaudeCodeFlush(raw, result);
+    expect(await offsetOf(path).catch(() => 0)).toBe(0); // no cursor was written
+    expect((await extractClaudeCodeTurns(raw)).length).toBe(4); // every turn is still pending
+  });
+
+  it("one refused turn between good ones is skipped, and a later refusal starts a new count", async () => {
+    rejectFlush = { at: 2, status: 422 };
+    const { path, raw } = await transcript([...FLAT(1), ...FLAT(2), ...FLAT(3), ...FLAT(4)]);
+    const result = await flushTurns(await extractClaudeCodeTurns(raw));
+    expect(result.firstFailedIndex).toBeNull();
+    expect(flushes().length).toBe(4);
+    await commitClaudeCodeFlush(raw, result);
+    expect(await offsetOf(path)).toBe(8);
+  });
+
+  it("two refusals in a row after delivered turns leave the cursor at the first refused turn", async () => {
+    rejectFlush = { at: "all", status: 413 };
+    const { path, raw } = await transcript([...FLAT(1), ...FLAT(2), ...FLAT(3)]);
+    const turns = await extractClaudeCodeTurns(raw);
+    rejectFlush = null;
+    await flushTurns(turns.slice(0, 1));
+    rejectFlush = { at: "all", status: 413 };
+    const result = await flushTurns(turns.slice(1));
+    expect(result.firstFailedIndex).toBe(0);
+    expect(flushes().length).toBe(3);
   });
 });
