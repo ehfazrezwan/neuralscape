@@ -5,12 +5,94 @@ code is verbatim — behavior unchanged.
 """
 
 import logging
+import re
 
 from datetime import datetime
+from typing import NamedTuple
+
 from config import settings
+from identity import collision_free_ids_enabled
 from schemas import MemoryVisibility, normalize_visibility
 
 logger = logging.getLogger(__name__)
+
+# Collision-free group ids (enforced auth profile).  Legacy names join components with
+# ``--``, which a legal id may itself contain, so user ``a--project--b`` and user ``a`` in
+# project ``b`` share one name.  A component is *plain* when it holds only Graphiti's group-id
+# characters (letters, digits, ``_`` and ``-``; no ``.``), no ``--``, and neither starts nor
+# ends with ``-``: then every ``--`` in a name is a delimiter and the name reads back to
+# exactly one tuple, so tuples of plain components keep their legacy name byte for byte.  Any
+# other tuple is named ``nsg1--`` + the hex of a length-prefixed encoding of the whole tuple,
+# whose first segment no legacy name has and whose characters Graphiti accepts.  Each
+# placement has exactly one name: an encoding of a plain tuple is not a valid name.
+_PLAIN_COMPONENT = re.compile(r"[A-Za-z0-9_]+(?:-[A-Za-z0-9_]+)*")
+ENCODED_GROUP_PREFIX = "nsg1--"
+_POOL_KINDS = ("private", "shared", "standard")
+
+
+class GroupKey(NamedTuple):
+    """The placement a group id names; ``owner`` is set for (only) private pools."""
+
+    pool: str
+    owner: str | None
+    project: str | None
+    workspace: str | None
+
+
+def _encode_group_key(key: GroupKey) -> str:
+    """``nsg1--`` + hex of one segment per field: ``~`` if absent, else ``<utf8-length>:<value>``."""
+    parts = []
+    for value in key:
+        parts.append("~" if value is None else f"{len(value.encode('utf-8'))}:{value}")
+    return ENCODED_GROUP_PREFIX + "".join(parts).encode("utf-8").hex()
+
+
+def decode_group_id(group_id: str) -> GroupKey | None:
+    """The exact placement of an encoded (``nsg1--``) group id, or ``None`` for any other name."""
+    if not isinstance(group_id, str) or not group_id.startswith(ENCODED_GROUP_PREFIX):
+        return None
+    try:
+        data = bytes.fromhex(group_id[len(ENCODED_GROUP_PREFIX):])
+    except ValueError:
+        return None
+    values: list[str | None] = []
+    position = 0
+    for _ in GroupKey._fields:
+        if data[position:position + 1] == b"~":
+            values.append(None)
+            position += 1
+            continue
+        colon = data.find(b":", position)
+        digits = data[position:colon] if colon != -1 else b""
+        if not digits.isdigit():
+            return None
+        end = colon + 1 + int(digits)
+        if end > len(data):
+            return None
+        try:
+            values.append(data[colon + 1:end].decode("utf-8"))
+        except UnicodeDecodeError:
+            return None
+        position = end
+    key = GroupKey(*values)
+    if (
+        position != len(data)
+        or key.pool not in _POOL_KINDS
+        or (key.pool == "private") != (key.owner is not None)
+        or _encode_group_key(key) != group_id  # canonical form only
+        or not _has_non_plain_component(key)  # a plain tuple's only name is its legacy one
+    ):
+        return None
+    return key
+
+
+def _has_non_plain_component(key: GroupKey) -> bool:
+    present = [value for value in (key.owner, key.project, key.workspace) if value is not None]
+    return not all(_PLAIN_COMPONENT.fullmatch(value) for value in present)
+
+
+def _needs_encoded_group_id(key: GroupKey) -> bool:
+    return collision_free_ids_enabled() and _has_non_plain_component(key)
 
 def _live_edges_filter():
     """Graphiti ``SearchFilters`` selecting only bi-temporally LIVE edges.
@@ -126,6 +208,10 @@ def _build_group_id(
     Workspace partition (WT6): absent or "memory" ⇒ NO suffix (byte-identical
     group_ids for existing rows, zero migration). Any other value appends
     `--ws--{workspace}`, isolating reference content from memory pools.
+
+    Under the enforced auth profile a tuple with a component that is not plain
+    (it contains ``--`` or starts or ends with ``-``) is named by
+    ``_encode_group_key`` instead, so distinct tuples never share a name.
     """
     # Tolerate enum / str / legacy "MemoryVisibility.X" / None — see
     # normalize_visibility docstring for why this matters. Unrecognized
@@ -136,6 +222,15 @@ def _build_group_id(
         vis = normalize_visibility(visibility) or MemoryVisibility.PRIVATE.value
     except (ValueError, TypeError):
         vis = MemoryVisibility.PRIVATE.value
+    pool = vis if vis in (MemoryVisibility.STANDARD.value, MemoryVisibility.SHARED.value) else "private"
+    key = GroupKey(
+        pool,
+        str(user_id) if pool == "private" else None,
+        str(project_id) if project_id else None,
+        str(workspace) if workspace and workspace != "memory" else None,
+    )
+    if _needs_encoded_group_id(key):
+        return _encode_group_key(key)
     if vis == MemoryVisibility.STANDARD.value:
         # Authoritative org-wide pool: dictator-written, everyone-readable.
         base = f"standard--project--{project_id}" if project_id else "standard"
@@ -170,16 +265,16 @@ def _get_group_ids(caller_user_id: str, project_id: str | None = None) -> list[s
     def _standard_groups() -> list[str]:
         if not settings.standards_enabled:
             return []
-        return ["standard"] + ([f"standard--project--{project_id}"] if project_id else [])
+        return ["standard"] + ([_build_group_id("standard", "", project_id)] if project_id else [])
 
     if not caller_user_id:
         # Anonymous / unauthenticated readers see the shared + standard pools.
-        anon = ["shared"] + ([f"shared--project--{project_id}"] if project_id else [])
+        anon = ["shared"] + ([_build_group_id("shared", "", project_id)] if project_id else [])
         return anon + _standard_groups()
-    group_ids = [f"user--{caller_user_id}", "shared"]
+    group_ids = [_build_group_id("private", caller_user_id), "shared"]
     if project_id:
-        group_ids.append(f"user--{caller_user_id}--project--{project_id}")
-        group_ids.append(f"shared--project--{project_id}")
+        group_ids.append(_build_group_id("private", caller_user_id, project_id))
+        group_ids.append(_build_group_id("shared", caller_user_id, project_id))
     return group_ids + _standard_groups()
 
 

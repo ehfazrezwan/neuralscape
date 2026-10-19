@@ -276,6 +276,60 @@ A search by user `alice` walks group_ids `["user--alice", "shared"]`
 (plus the project-scoped variants when the request supplies
 `project_id`).
 
+#### Collision-free names under the enforced auth profile
+
+The `--` delimiter may appear inside a legal id, so the legacy names are not
+one-to-one: user `alice--project--payroll` and user `alice` in project
+`payroll` both get `user--alice--project--payroll`. Likewise the email slug
+folds every run of disallowed characters to one `-`, so `a+b@example.com` and
+`a-b@example.com` both slug to `a-b-example.com`.
+
+With `NS_AUTH_PROFILE=enforced` (the default for new deployments):
+
+- **Group ids.** A tuple whose user, project and workspace are all *plain*
+  keeps its legacy name byte for byte. Plain means the value uses only
+  Graphiti's group-id characters (letters, digits, `_` and `-`, so no `.`),
+  contains no `--`, and does not start or end with `-`. Any other tuple is
+  named `nsg1--` followed by the hex of a length-prefixed encoding of the
+  whole tuple. Every placement has exactly one name: decoding refuses an
+  encoding of a plain tuple. Every read set (`_get_group_ids` and the
+  narrowed sets of the search graph leg), dreaming pool keys and cards,
+  project listing and the policy migration parser use the same names and
+  decode them exactly. An `nsg1--` name that does not decode is never treated
+  as a team pool.
+- **Fresh login ids.** An unlinked identity keeps its legacy slug whenever the
+  slug reads back to exactly one address. That means a local part of letters,
+  digits, `_` and `.` that starts with a letter or digit, a domain that ends
+  with a letter or digit, and at most 100 characters. Any other address gets
+  `_x` followed by the hex of the address, or `_h` followed by its SHA-256
+  digest when that would exceed 100 characters. A slug never starts with `_`.
+
+`legacy_compat` (the default for upgraded deployments) keeps every legacy
+name, including the collisions.
+
+**Migration when switching an existing deployment to `enforced`:**
+
+- **Unaffected:** plain tuples and unambiguous emails keep their ids, so most
+  data needs no change. Identities that are already linked (durable identity
+  store or `AUTH_IDENTITY_MAP`) also keep their ids, because the new derivation
+  applies only to fresh, unlinked logins.
+- **Group ids that change:** only for users, projects or workspaces whose
+  value contains `.` or `--`, or starts or ends with `-`. A dotted value
+  (for example the slug `first.last-example.com`) never had a usable legacy
+  graph name, because Graphiti refuses `.` in a group id, so it has no graph
+  data to move; its dreaming card pool key does change. Their old graph data stays
+  under the legacy name and is no longer read. Such a legacy name can belong
+  to more than one tuple, so it cannot be re-keyed automatically.
+  `policy_migration.parse_group_name` reports a legacy name as ambiguous when
+  the known user ids allow more than one reading.
+  `identity_binding.classify_legacy_identities` reports user ids that contain
+  `--project--` or `--ws--` with reason `namespace_delimiter`. Adjudicate each
+  affected id, then re-ingest or re-key its rows to the new name.
+- **Login ids that change:** only for fresh logins whose email is ambiguous
+  under the slug rule. If such a person used the deployment before under the
+  slug id, link that id explicitly (`AUTH_IDENTITY_MAP` or the link flow)
+  before their first login under `enforced`.
+
 ### Dual-pool search
 
 `MemoryService.search()` runs two queries and merges:

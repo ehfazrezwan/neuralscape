@@ -11,7 +11,9 @@ from evidence_registry import (
     LEAF_STATES,
     LEAVES,
     SCENARIO_KINDS,
+    ORACLE_REVISIONS,
     SCENARIOS,
+    SERVICE_PATH_SCENARIOS,
     get_leaf,
     leaf_state,
     scenarios_for,
@@ -206,3 +208,190 @@ def test_module_is_standard_library_only() -> None:
         if isinstance(node, ast.ImportFrom)
     } | {alias.name.split(".")[0] for node in ast.walk(tree) if isinstance(node, ast.Import) for alias in node.names}
     assert imported == {"dataclasses"}
+
+
+def test_oracle_revisions_name_registered_scenarios_and_say_why() -> None:
+    ids = {scenario.id for scenario in SCENARIOS}
+    assert ORACLE_REVISIONS
+    for scenario_id, revision in ORACLE_REVISIONS.items():
+        assert scenario_id in ids
+        assert {"version", "role", "reason"} <= set(revision)
+        assert revision["role"] in {"library-observation", "replaced", "conditional-expectation"}
+        assert all(isinstance(value, str) and value.strip() for value in revision.values())
+        if revision["role"] in {"library-observation", "replaced"}:
+            assert set(revision) == {"version", "role", "reason", "carried_by"}
+            assert revision["carried_by"] in {s.id for s in SERVICE_PATH_SCENARIOS}, "the requirement must be carried by a registered scenario"
+    # the revised scenario still names its original test: the oracle is annotated, never deleted or edited to pass
+    assert {s.id: s.kind for s in SCENARIOS}["graph-removal-shared-support"] == "expected-failure"
+
+
+_CONDITIONAL_KEYS = {
+    "version", "role", "reason", "evidence", "reviewed_by", "original", "original_reason", "predicate", "flips_to", "flips_when",
+}
+
+
+def _marker_problems(decorator: ast.Call, predicate: str) -> list[str]:
+    """What is wrong with a conditional expectation marker (empty when it hides nothing it should not)."""
+    problems = []
+    keywords = {k.arg: k.value for k in decorator.keywords}
+    if not (isinstance(keywords.get("strict"), ast.Constant) and keywords["strict"].value is True):
+        problems.append("not strict")
+    raises = keywords.get("raises")
+    if not (isinstance(raises, ast.Name) and raises.id == "AssertionError"):
+        problems.append("raises is not AssertionError")
+    if "run" in keywords:
+        problems.append("run is set (the test could be skipped from running)")
+    if set(keywords) - {"strict", "raises", "reason"}:
+        problems.append("unexpected keywords: " + ", ".join(sorted(set(keywords) - {"strict", "raises", "reason"})))
+    condition = decorator.args[0] if len(decorator.args) == 1 else None
+    expected = f"not {predicate}()"
+    if condition is None or ast.unparse(condition) != expected:
+        problems.append(f"condition is not `{expected}`")
+    return problems
+
+
+def _xfail_markers(tree: ast.Module) -> dict[str, ast.Call]:
+    found: dict[str, ast.Call] = {}
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef):
+            for decorator in node.decorator_list:
+                if isinstance(decorator, ast.Call) and getattr(decorator.func, "attr", "") == "xfail":
+                    found[node.name] = decorator
+    return found
+
+
+def test_conditional_expectations_keep_the_original_classification_and_the_original_reason() -> None:
+    tree = ast.parse(REPRODUCTIONS.read_text(encoding="utf-8"))
+    markers = _xfail_markers(tree)
+    by_id = {s.id: s for s in SCENARIOS}
+    conditional = {k: v for k, v in ORACLE_REVISIONS.items() if v["role"] == "conditional-expectation"}
+    assert set(conditional) == {
+        "group-id-tuple-collision", "email-slug-collision", "readiness-probes-backends", "backup-covers-compose-volumes",
+    }
+    for scenario_id, revision in conditional.items():
+        assert set(revision) == _CONDITIONAL_KEYS, scenario_id
+        assert revision["reviewed_by"].strip()  # a name, or "pending" until an independent review is recorded
+        assert revision["flips_to"] == "control"
+        scenario = by_id[scenario_id]
+        assert scenario.kind == "expected-failure", "the preserved classification stays"
+        marker = markers[scenario.test]
+        keywords = {k.arg: k.value for k in marker.keywords}
+        assert _marker_problems(marker, revision["predicate"]) == [], scenario_id
+        assert revision["predicate"] in {n.name for n in tree.body if isinstance(n, ast.FunctionDef)}, "the named predicate exists"
+        # the original wording is still in the marker (recoverable), possibly followed by a note
+        reason = ast.literal_eval(keywords["reason"])
+        assert revision["original_reason"] in reason, scenario_id
+
+
+def test_a_conditional_expectation_flips_only_for_a_scenario_named_as_fixed() -> None:
+    from evidence_registry import effective_kind
+
+    assert effective_kind("readiness-probes-backends") == "expected-failure"
+    assert effective_kind("readiness-probes-backends", frozenset({"backup-covers-compose-volumes"})) == "expected-failure"
+    assert effective_kind("readiness-probes-backends", frozenset({"readiness-probes-backends"})) == "control"
+    # an unrevised expected failure never flips, and a control stays a control
+    assert effective_kind("queued-visibility-publication", frozenset({"queued-visibility-publication"})) == "expected-failure"
+    assert effective_kind("readiness-controls", frozenset({"readiness-controls"})) == "control"
+    assert leaf_state("G2.04") == "known-failure"
+    assert leaf_state("G2.04", frozenset({"readiness-probes-backends"})) == "baseline-pass"
+
+
+def test_service_path_scenarios_carry_a_registered_baseline_scenario_and_pin_their_file() -> None:
+    import ast
+    import hashlib
+
+    baseline = {scenario.id: scenario for scenario in SCENARIOS}
+    ids = [scenario.id for scenario in SERVICE_PATH_SCENARIOS]
+    assert ids and len(ids) == len(set(ids)) and not set(ids) & set(baseline)
+    for scenario in SERVICE_PATH_SCENARIOS:
+        assert scenario.carries in baseline and baseline[scenario.carries].kind == "expected-failure"
+        assert scenario.leaves == baseline[scenario.carries].leaves
+        for leaf_id in scenario.leaves:
+            get_leaf(leaf_id)
+        assert scenario.summary and len(scenario.tests) >= 2 and len(set(scenario.tests)) == len(scenario.tests)
+        assert len(scenario.file_sha256) == 64
+        path = SERVICE_DIR / "tests" / scenario.file
+        if not path.exists():
+            continue  # a tree without the feature has no such file: the scenario does not exist there
+        raw = path.read_bytes()
+        assert hashlib.sha256(raw).hexdigest() == scenario.file_sha256, "the oracle file changed: the oracle owner must re-pin it"
+        defined = {node.name for node in ast.parse(raw.decode()).body if isinstance(node, ast.FunctionDef)}
+        assert set(scenario.tests) <= defined
+
+
+def test_every_oracle_revision_names_the_service_path_scenario_that_carries_it_and_that_scenario_names_the_revised_one() -> None:
+    carried = {scenario.id: scenario.carries for scenario in SERVICE_PATH_SCENARIOS}
+    for scenario_id, revision in ORACLE_REVISIONS.items():
+        if "carried_by" not in revision:
+            continue  # a conditional expectation is carried by its own test
+        assert carried[revision["carried_by"]] == scenario_id
+
+
+def test_a_service_path_summary_claims_tenant_isolation_only_when_a_registered_test_asserts_it() -> None:
+    for scenario in SERVICE_PATH_SCENARIOS:
+        claims = "tenants untouched" in scenario.summary and "not asserted" not in scenario.summary
+        assert not claims or any("tenant" in name for name in scenario.tests)
+
+
+def test_a_revised_oracle_carries_a_version_beyond_its_first_revision_once_its_carrier_is_registered() -> None:
+    carriers = {scenario.id for scenario in SERVICE_PATH_SCENARIOS}
+    for revision in ORACLE_REVISIONS.values():
+        if revision.get("carried_by") in carriers:
+            assert revision["version"] != "v2"
+
+
+def test_the_marker_pin_catches_markers_that_would_hide_an_oracle() -> None:
+    def marker(source: str) -> ast.Call:
+        return ast.parse(f"@pytest.mark.xfail({source})\ndef t(): pass").body[0].decorator_list[0]
+
+    good = "not _p(), strict=True, raises=AssertionError, reason='r'"
+    assert _marker_problems(marker(good), "_p") == []
+    for bad, why in (
+        ("not _p(), strict=True, raises=AssertionError, reason='r', run=False", "run is set"),
+        ("not _p(), strict=True, raises=Exception, reason='r'", "raises is not AssertionError"),
+        ("not _p(), strict=True, reason='r'", "raises is not AssertionError"),
+        ("not _p(), strict=False, raises=AssertionError, reason='r'", "not strict"),
+        ("not _q(), strict=True, raises=AssertionError, reason='r'", "condition is not"),
+        ("_p(), strict=True, raises=AssertionError, reason='r'", "condition is not"),
+        ("strict=True, raises=AssertionError, reason='r'", "condition is not"),
+        ("not _p(), strict=True, raises=AssertionError, reason='r', condition=True", "unexpected keywords"),
+    ):
+        assert any(why in problem for problem in _marker_problems(marker(bad), "_p")), bad
+
+
+def test_a_revised_real_service_oracle_changes_expectations_only_on_the_governed_profile() -> None:
+    from evidence_registry import REAL_SERVICE_ORACLE_REVISIONS, expected_fact
+
+    assert set(REAL_SERVICE_ORACLE_REVISIONS) == {"rs-job-keys"}
+    revision = REAL_SERVICE_ORACLE_REVISIONS["rs-job-keys"]
+    assert {"version", "role", "reason", "evidence", "reviewed_by", "original", "flips_when", "facts"} <= set(revision)
+    assert revision["reviewed_by"]  # a name, or "pending" until an independent review is recorded
+    facts = revision["facts"]
+    assert set(facts) == {"identical_without_key_same_task", "identical_with_key_same_task", "changed_payload_same_key_http"}
+    for name, by_profile in facts.items():
+        assert set(by_profile) == {"legacy", "governed"}, name
+    # the original control is preserved: the legacy half of the split is exactly what it asserted
+    assert revision["original"] == {"identical_inputs_same_task": True}
+    assert expected_fact("rs-job-keys", "identical_without_key_same_task", "legacy") is revision["original"]["identical_inputs_same_task"]
+    # the contract: no key is two intents under the governed profile, a key replays, a changed payload under a key is refused
+    assert expected_fact("rs-job-keys", "identical_without_key_same_task", "governed") is False
+    assert expected_fact("rs-job-keys", "identical_with_key_same_task", "legacy") is True
+    assert expected_fact("rs-job-keys", "identical_with_key_same_task", "governed") is True
+    assert (expected_fact("rs-job-keys", "changed_payload_same_key_http", "legacy"),
+            expected_fact("rs-job-keys", "changed_payload_same_key_http", "governed")) == (202, 409)
+    # the facts that differ between profiles are exactly the ones the fix changes
+    differing = {name for name, by_profile in facts.items() if by_profile["legacy"] != by_profile["governed"]}
+    assert differing == {"identical_without_key_same_task", "changed_payload_same_key_http"}
+    assert revision["open_decision"]  # the owner decision on keyless double submits stays visible
+    with pytest.raises(ValueError):
+        expected_fact("rs-job-keys", "identical_with_key_same_task", "other")
+    with pytest.raises(KeyError):
+        expected_fact("rs-job-keys", "unknown_fact", "legacy")
+
+
+def test_the_real_service_oracle_revision_names_no_report_identifier() -> None:
+    import json
+    from evidence_registry import REAL_SERVICE_ORACLE_REVISIONS
+
+    text = json.dumps(REAL_SERVICE_ORACLE_REVISIONS)
+    assert not re.search(r"\b[A-Z]-P[0-9]+\b", text)  # no report or packet style identifier

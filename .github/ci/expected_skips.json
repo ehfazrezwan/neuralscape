@@ -7,6 +7,86 @@
     "host": {
       "skips": [
         {
+          "test": "tests.test_authority_store_pg_integration::test_postgres_conformance[case_binding_is_atomic_verbatim_and_race_safe]",
+          "reason_contains": "AUTHORITY_TEST_PG_DSN not set (postgres authorit"
+        },
+        {
+          "test": "tests.test_authority_store_pg_integration::test_postgres_conformance[case_concurrent_publishes_get_distinct_consecutive_epochs]",
+          "reason_contains": "AUTHORITY_TEST_PG_DSN not set (postgres authorit"
+        },
+        {
+          "test": "tests.test_authority_store_pg_integration::test_postgres_conformance[case_control_characters_are_rejected_identically_on_both_backends]",
+          "reason_contains": "AUTHORITY_TEST_PG_DSN not set (postgres authorit"
+        },
+        {
+          "test": "tests.test_authority_store_pg_integration::test_postgres_conformance[case_credentials_retire_and_expire]",
+          "reason_contains": "AUTHORITY_TEST_PG_DSN not set (postgres authorit"
+        },
+        {
+          "test": "tests.test_authority_store_pg_integration::test_postgres_conformance[case_delegation_round_trips]",
+          "reason_contains": "AUTHORITY_TEST_PG_DSN not set (postgres authorit"
+        },
+        {
+          "test": "tests.test_authority_store_pg_integration::test_postgres_conformance[case_duplicate_credential_ids_are_validation_errors_not_outages]",
+          "reason_contains": "AUTHORITY_TEST_PG_DSN not set (postgres authorit"
+        },
+        {
+          "test": "tests.test_authority_store_pg_integration::test_postgres_conformance[case_fence_requires_the_admitted_credential_to_belong_to_the_admitted_subject]",
+          "reason_contains": "AUTHORITY_TEST_PG_DSN not set (postgres authorit"
+        },
+        {
+          "test": "tests.test_authority_store_pg_integration::test_postgres_conformance[case_hold_current_denies_after_retirement_and_offboarding]",
+          "reason_contains": "AUTHORITY_TEST_PG_DSN not set (postgres authorit"
+        },
+        {
+          "test": "tests.test_authority_store_pg_integration::test_postgres_conformance[case_hold_current_verifies_then_commits_body_atomically]",
+          "reason_contains": "AUTHORITY_TEST_PG_DSN not set (postgres authorit"
+        },
+        {
+          "test": "tests.test_authority_store_pg_integration::test_postgres_conformance[case_holding_blocks_a_concurrent_revocation_until_commit]",
+          "reason_contains": "AUTHORITY_TEST_PG_DSN not set (postgres authorit"
+        },
+        {
+          "test": "tests.test_authority_store_pg_integration::test_postgres_conformance[case_identifiers_that_compare_loosely_are_refused_before_they_decide_anything]",
+          "reason_contains": "AUTHORITY_TEST_PG_DSN not set (postgres authorit"
+        },
+        {
+          "test": "tests.test_authority_store_pg_integration::test_postgres_conformance[case_policy_publish_is_atomic_with_epoch_increment]",
+          "reason_contains": "AUTHORITY_TEST_PG_DSN not set (postgres authorit"
+        },
+        {
+          "test": "tests.test_authority_store_pg_integration::test_postgres_conformance[case_reads_are_not_serialized_behind_a_running_publication]",
+          "reason_contains": "AUTHORITY_TEST_PG_DSN not set (postgres authorit"
+        },
+        {
+          "test": "tests.test_authority_store_pg_integration::test_postgres_conformance[case_schema_is_versioned_idempotent_and_drift_checked]",
+          "reason_contains": "AUTHORITY_TEST_PG_DSN not set (postgres authorit"
+        },
+        {
+          "test": "tests.test_authority_store_pg_integration::test_postgres_conformance[case_storage_failure_is_an_unavailable_authority]",
+          "reason_contains": "AUTHORITY_TEST_PG_DSN not set (postgres authorit"
+        },
+        {
+          "test": "tests.test_authority_store_pg_integration::test_postgres_conformance[case_subjects_versions_and_tombstones]",
+          "reason_contains": "AUTHORITY_TEST_PG_DSN not set (postgres authorit"
+        },
+        {
+          "test": "tests.test_authority_store_pg_integration::test_postgres_conformance[case_tenants_lists_every_tenant_with_a_policy_or_a_subject]",
+          "reason_contains": "AUTHORITY_TEST_PG_DSN not set (postgres authorit"
+        },
+        {
+          "test": "tests.test_authority_store_pg_integration::test_postgres_conformance[case_update_subject_applies_a_new_expiry]",
+          "reason_contains": "AUTHORITY_TEST_PG_DSN not set (postgres authorit"
+        },
+        {
+          "test": "tests.test_authority_store_pg_integration::test_postgres_state_survives_reconnect",
+          "reason_contains": "AUTHORITY_TEST_PG_DSN not set (postgres authorit"
+        },
+        {
+          "test": "tests.test_authority_store_pg_integration::test_postgres_store_reconnects_after_a_lost_connection",
+          "reason_contains": "AUTHORITY_TEST_PG_DSN not set (postgres authorit"
+        },
+        {
           "test": "tests.test_baseline_reproductions::test_compose_backup_tooling_covers_every_persistent_volume",
           "reason_contains": "the compose profile ships no backup tooling that"
         },
@@ -20,7 +100,7 @@
         },
         {
           "test": "tests.test_baseline_reproductions::test_graph_removal_keeps_edges_supported_by_other_episodes",
-          "reason_contains": "removing an episode deletes every edge whose fir"
+          "reason_contains": "library observation (oracle v2): the vendored li"
         },
         {
           "test": "tests.test_baseline_reproductions::test_health_reports_an_unreachable_vector_store",
@@ -49,6 +129,86 @@
         {
           "test": "tests.test_contracts_pack::test_engine_port_contracts_are_registered_with_the_engines_owner",
           "reason_contains": "engine_ports is not part of this tree"
+        },
+        {
+          "test": "tests.test_credentials_pg_integration::test_postgres_credential_conformance[case_a_benign_duplicate_refresh_returns_the_same_successor]",
+          "reason_contains": "AUTHORITY_TEST_PG_DSN not set (postgres credenti"
+        },
+        {
+          "test": "tests.test_credentials_pg_integration::test_postgres_credential_conformance[case_a_late_duplicate_refresh_is_a_replay_and_revokes_the_family]",
+          "reason_contains": "AUTHORITY_TEST_PG_DSN not set (postgres credenti"
+        },
+        {
+          "test": "tests.test_credentials_pg_integration::test_postgres_credential_conformance[case_a_malformed_scope_is_a_scope_error]",
+          "reason_contains": "AUTHORITY_TEST_PG_DSN not set (postgres credenti"
+        },
+        {
+          "test": "tests.test_credentials_pg_integration::test_postgres_credential_conformance[case_concurrent_duplicates_within_the_grace_all_get_the_same_successor]",
+          "reason_contains": "AUTHORITY_TEST_PG_DSN not set (postgres credenti"
+        },
+        {
+          "test": "tests.test_credentials_pg_integration::test_postgres_credential_conformance[case_concurrent_redemption_yields_at_most_one_successor]",
+          "reason_contains": "AUTHORITY_TEST_PG_DSN not set (postgres credenti"
+        },
+        {
+          "test": "tests.test_credentials_pg_integration::test_postgres_credential_conformance[case_disabling_a_service_account_retires_everything]",
+          "reason_contains": "AUTHORITY_TEST_PG_DSN not set (postgres credenti"
+        },
+        {
+          "test": "tests.test_credentials_pg_integration::test_postgres_credential_conformance[case_expiry_and_offboarding_stop_a_credential]",
+          "reason_contains": "AUTHORITY_TEST_PG_DSN not set (postgres credenti"
+        },
+        {
+          "test": "tests.test_credentials_pg_integration::test_postgres_credential_conformance[case_identifiers_that_compare_loosely_are_refused]",
+          "reason_contains": "AUTHORITY_TEST_PG_DSN not set (postgres credenti"
+        },
+        {
+          "test": "tests.test_credentials_pg_integration::test_postgres_credential_conformance[case_minted_credentials_never_outlive_their_issuer]",
+          "reason_contains": "AUTHORITY_TEST_PG_DSN not set (postgres credenti"
+        },
+        {
+          "test": "tests.test_credentials_pg_integration::test_postgres_credential_conformance[case_offboarding_a_controller_disables_their_service_accounts]",
+          "reason_contains": "AUTHORITY_TEST_PG_DSN not set (postgres credenti"
+        },
+        {
+          "test": "tests.test_credentials_pg_integration::test_postgres_credential_conformance[case_only_the_owner_or_controller_may_revoke]",
+          "reason_contains": "AUTHORITY_TEST_PG_DSN not set (postgres credenti"
+        },
+        {
+          "test": "tests.test_credentials_pg_integration::test_postgres_credential_conformance[case_refresh_is_single_use_and_rotates_the_family]",
+          "reason_contains": "AUTHORITY_TEST_PG_DSN not set (postgres credenti"
+        },
+        {
+          "test": "tests.test_credentials_pg_integration::test_postgres_credential_conformance[case_refreshing_a_capped_family_never_extends_its_lifetime]",
+          "reason_contains": "AUTHORITY_TEST_PG_DSN not set (postgres credenti"
+        },
+        {
+          "test": "tests.test_credentials_pg_integration::test_postgres_credential_conformance[case_reusing_a_refresh_token_revokes_the_whole_family]",
+          "reason_contains": "AUTHORITY_TEST_PG_DSN not set (postgres credenti"
+        },
+        {
+          "test": "tests.test_credentials_pg_integration::test_postgres_credential_conformance[case_revocation_and_offboarding_fence_queued_work]",
+          "reason_contains": "AUTHORITY_TEST_PG_DSN not set (postgres credenti"
+        },
+        {
+          "test": "tests.test_credentials_pg_integration::test_postgres_credential_conformance[case_revoking_the_issuing_family_revokes_what_it_minted]",
+          "reason_contains": "AUTHORITY_TEST_PG_DSN not set (postgres credenti"
+        },
+        {
+          "test": "tests.test_credentials_pg_integration::test_postgres_credential_conformance[case_rotation_without_downtime_allows_two_active_credentials]",
+          "reason_contains": "AUTHORITY_TEST_PG_DSN not set (postgres credenti"
+        },
+        {
+          "test": "tests.test_credentials_pg_integration::test_postgres_credential_conformance[case_scope_is_a_subset_of_grants_and_can_only_narrow]",
+          "reason_contains": "AUTHORITY_TEST_PG_DSN not set (postgres credenti"
+        },
+        {
+          "test": "tests.test_credentials_pg_integration::test_postgres_credential_conformance[case_secrets_are_hashed_at_rest_and_tokens_verify_exactly]",
+          "reason_contains": "AUTHORITY_TEST_PG_DSN not set (postgres credenti"
+        },
+        {
+          "test": "tests.test_credentials_pg_integration::test_postgres_credential_conformance[case_service_accounts_have_a_human_controller_and_least_authority]",
+          "reason_contains": "AUTHORITY_TEST_PG_DSN not set (postgres credenti"
         },
         {
           "test": "tests.test_ledger_dispatch_pg_integration::test_dispatch_scenarios_on_postgres_as_runtime_role[a_failed_publish_returns_the_row_to_the_scan]",
@@ -329,12 +489,100 @@
         {
           "test": "tests.test_okf::test_ingest_real_ga4_sample_bundle_if_present",
           "reason_contains": "knowledge-catalog sample bundle not available"
+        },
+        {
+          "test": "tests.test_policy_migration_integration::test_real_inventory_classifies_quarantines_and_applies",
+          "reason_contains": "MIGRATION_TEST_* not set (policy migration real-"
+        },
+        {
+          "test": "tests.test_policy_migration_integration::test_sources_read_real_legacy_data_without_modifying_it",
+          "reason_contains": "MIGRATION_TEST_* not set (policy migration real-"
         }
       ]
     },
     "container": {
       "skips": [
         {
+          "test": "tests.test_authority_store_pg_integration::test_postgres_conformance[case_binding_is_atomic_verbatim_and_race_safe]",
+          "reason_contains": "AUTHORITY_TEST_PG_DSN not set (postgres authorit"
+        },
+        {
+          "test": "tests.test_authority_store_pg_integration::test_postgres_conformance[case_concurrent_publishes_get_distinct_consecutive_epochs]",
+          "reason_contains": "AUTHORITY_TEST_PG_DSN not set (postgres authorit"
+        },
+        {
+          "test": "tests.test_authority_store_pg_integration::test_postgres_conformance[case_control_characters_are_rejected_identically_on_both_backends]",
+          "reason_contains": "AUTHORITY_TEST_PG_DSN not set (postgres authorit"
+        },
+        {
+          "test": "tests.test_authority_store_pg_integration::test_postgres_conformance[case_credentials_retire_and_expire]",
+          "reason_contains": "AUTHORITY_TEST_PG_DSN not set (postgres authorit"
+        },
+        {
+          "test": "tests.test_authority_store_pg_integration::test_postgres_conformance[case_delegation_round_trips]",
+          "reason_contains": "AUTHORITY_TEST_PG_DSN not set (postgres authorit"
+        },
+        {
+          "test": "tests.test_authority_store_pg_integration::test_postgres_conformance[case_duplicate_credential_ids_are_validation_errors_not_outages]",
+          "reason_contains": "AUTHORITY_TEST_PG_DSN not set (postgres authorit"
+        },
+        {
+          "test": "tests.test_authority_store_pg_integration::test_postgres_conformance[case_fence_requires_the_admitted_credential_to_belong_to_the_admitted_subject]",
+          "reason_contains": "AUTHORITY_TEST_PG_DSN not set (postgres authorit"
+        },
+        {
+          "test": "tests.test_authority_store_pg_integration::test_postgres_conformance[case_hold_current_denies_after_retirement_and_offboarding]",
+          "reason_contains": "AUTHORITY_TEST_PG_DSN not set (postgres authorit"
+        },
+        {
+          "test": "tests.test_authority_store_pg_integration::test_postgres_conformance[case_hold_current_verifies_then_commits_body_atomically]",
+          "reason_contains": "AUTHORITY_TEST_PG_DSN not set (postgres authorit"
+        },
+        {
+          "test": "tests.test_authority_store_pg_integration::test_postgres_conformance[case_holding_blocks_a_concurrent_revocation_until_commit]",
+          "reason_contains": "AUTHORITY_TEST_PG_DSN not set (postgres authorit"
+        },
+        {
+          "test": "tests.test_authority_store_pg_integration::test_postgres_conformance[case_identifiers_that_compare_loosely_are_refused_before_they_decide_anything]",
+          "reason_contains": "AUTHORITY_TEST_PG_DSN not set (postgres authorit"
+        },
+        {
+          "test": "tests.test_authority_store_pg_integration::test_postgres_conformance[case_policy_publish_is_atomic_with_epoch_increment]",
+          "reason_contains": "AUTHORITY_TEST_PG_DSN not set (postgres authorit"
+        },
+        {
+          "test": "tests.test_authority_store_pg_integration::test_postgres_conformance[case_reads_are_not_serialized_behind_a_running_publication]",
+          "reason_contains": "AUTHORITY_TEST_PG_DSN not set (postgres authorit"
+        },
+        {
+          "test": "tests.test_authority_store_pg_integration::test_postgres_conformance[case_schema_is_versioned_idempotent_and_drift_checked]",
+          "reason_contains": "AUTHORITY_TEST_PG_DSN not set (postgres authorit"
+        },
+        {
+          "test": "tests.test_authority_store_pg_integration::test_postgres_conformance[case_storage_failure_is_an_unavailable_authority]",
+          "reason_contains": "AUTHORITY_TEST_PG_DSN not set (postgres authorit"
+        },
+        {
+          "test": "tests.test_authority_store_pg_integration::test_postgres_conformance[case_subjects_versions_and_tombstones]",
+          "reason_contains": "AUTHORITY_TEST_PG_DSN not set (postgres authorit"
+        },
+        {
+          "test": "tests.test_authority_store_pg_integration::test_postgres_conformance[case_tenants_lists_every_tenant_with_a_policy_or_a_subject]",
+          "reason_contains": "AUTHORITY_TEST_PG_DSN not set (postgres authorit"
+        },
+        {
+          "test": "tests.test_authority_store_pg_integration::test_postgres_conformance[case_update_subject_applies_a_new_expiry]",
+          "reason_contains": "AUTHORITY_TEST_PG_DSN not set (postgres authorit"
+        },
+        {
+          "test": "tests.test_authority_store_pg_integration::test_postgres_state_survives_reconnect",
+          "reason_contains": "AUTHORITY_TEST_PG_DSN not set (postgres authorit"
+        },
+        {
+          "test": "tests.test_authority_store_pg_integration::test_postgres_store_reconnects_after_a_lost_connection",
+          "reason_contains": "AUTHORITY_TEST_PG_DSN not set (postgres authorit"
+        },
+        {
           "test": "tests.test_baseline_reproductions::test_compose_backup_tooling_covers_every_persistent_volume",
           "reason_contains": "the compose profile ships no backup tooling that"
         },
@@ -348,7 +596,7 @@
         },
         {
           "test": "tests.test_baseline_reproductions::test_graph_removal_keeps_edges_supported_by_other_episodes",
-          "reason_contains": "removing an episode deletes every edge whose fir"
+          "reason_contains": "library observation (oracle v2): the vendored li"
         },
         {
           "test": "tests.test_baseline_reproductions::test_health_reports_an_unreachable_vector_store",
@@ -377,6 +625,86 @@
         {
           "test": "tests.test_contracts_pack::test_engine_port_contracts_are_registered_with_the_engines_owner",
           "reason_contains": "engine_ports is not part of this tree"
+        },
+        {
+          "test": "tests.test_credentials_pg_integration::test_postgres_credential_conformance[case_a_benign_duplicate_refresh_returns_the_same_successor]",
+          "reason_contains": "AUTHORITY_TEST_PG_DSN not set (postgres credenti"
+        },
+        {
+          "test": "tests.test_credentials_pg_integration::test_postgres_credential_conformance[case_a_late_duplicate_refresh_is_a_replay_and_revokes_the_family]",
+          "reason_contains": "AUTHORITY_TEST_PG_DSN not set (postgres credenti"
+        },
+        {
+          "test": "tests.test_credentials_pg_integration::test_postgres_credential_conformance[case_a_malformed_scope_is_a_scope_error]",
+          "reason_contains": "AUTHORITY_TEST_PG_DSN not set (postgres credenti"
+        },
+        {
+          "test": "tests.test_credentials_pg_integration::test_postgres_credential_conformance[case_concurrent_duplicates_within_the_grace_all_get_the_same_successor]",
+          "reason_contains": "AUTHORITY_TEST_PG_DSN not set (postgres credenti"
+        },
+        {
+          "test": "tests.test_credentials_pg_integration::test_postgres_credential_conformance[case_concurrent_redemption_yields_at_most_one_successor]",
+          "reason_contains": "AUTHORITY_TEST_PG_DSN not set (postgres credenti"
+        },
+        {
+          "test": "tests.test_credentials_pg_integration::test_postgres_credential_conformance[case_disabling_a_service_account_retires_everything]",
+          "reason_contains": "AUTHORITY_TEST_PG_DSN not set (postgres credenti"
+        },
+        {
+          "test": "tests.test_credentials_pg_integration::test_postgres_credential_conformance[case_expiry_and_offboarding_stop_a_credential]",
+          "reason_contains": "AUTHORITY_TEST_PG_DSN not set (postgres credenti"
+        },
+        {
+          "test": "tests.test_credentials_pg_integration::test_postgres_credential_conformance[case_identifiers_that_compare_loosely_are_refused]",
+          "reason_contains": "AUTHORITY_TEST_PG_DSN not set (postgres credenti"
+        },
+        {
+          "test": "tests.test_credentials_pg_integration::test_postgres_credential_conformance[case_minted_credentials_never_outlive_their_issuer]",
+          "reason_contains": "AUTHORITY_TEST_PG_DSN not set (postgres credenti"
+        },
+        {
+          "test": "tests.test_credentials_pg_integration::test_postgres_credential_conformance[case_offboarding_a_controller_disables_their_service_accounts]",
+          "reason_contains": "AUTHORITY_TEST_PG_DSN not set (postgres credenti"
+        },
+        {
+          "test": "tests.test_credentials_pg_integration::test_postgres_credential_conformance[case_only_the_owner_or_controller_may_revoke]",
+          "reason_contains": "AUTHORITY_TEST_PG_DSN not set (postgres credenti"
+        },
+        {
+          "test": "tests.test_credentials_pg_integration::test_postgres_credential_conformance[case_refresh_is_single_use_and_rotates_the_family]",
+          "reason_contains": "AUTHORITY_TEST_PG_DSN not set (postgres credenti"
+        },
+        {
+          "test": "tests.test_credentials_pg_integration::test_postgres_credential_conformance[case_refreshing_a_capped_family_never_extends_its_lifetime]",
+          "reason_contains": "AUTHORITY_TEST_PG_DSN not set (postgres credenti"
+        },
+        {
+          "test": "tests.test_credentials_pg_integration::test_postgres_credential_conformance[case_reusing_a_refresh_token_revokes_the_whole_family]",
+          "reason_contains": "AUTHORITY_TEST_PG_DSN not set (postgres credenti"
+        },
+        {
+          "test": "tests.test_credentials_pg_integration::test_postgres_credential_conformance[case_revocation_and_offboarding_fence_queued_work]",
+          "reason_contains": "AUTHORITY_TEST_PG_DSN not set (postgres credenti"
+        },
+        {
+          "test": "tests.test_credentials_pg_integration::test_postgres_credential_conformance[case_revoking_the_issuing_family_revokes_what_it_minted]",
+          "reason_contains": "AUTHORITY_TEST_PG_DSN not set (postgres credenti"
+        },
+        {
+          "test": "tests.test_credentials_pg_integration::test_postgres_credential_conformance[case_rotation_without_downtime_allows_two_active_credentials]",
+          "reason_contains": "AUTHORITY_TEST_PG_DSN not set (postgres credenti"
+        },
+        {
+          "test": "tests.test_credentials_pg_integration::test_postgres_credential_conformance[case_scope_is_a_subset_of_grants_and_can_only_narrow]",
+          "reason_contains": "AUTHORITY_TEST_PG_DSN not set (postgres credenti"
+        },
+        {
+          "test": "tests.test_credentials_pg_integration::test_postgres_credential_conformance[case_secrets_are_hashed_at_rest_and_tokens_verify_exactly]",
+          "reason_contains": "AUTHORITY_TEST_PG_DSN not set (postgres credenti"
+        },
+        {
+          "test": "tests.test_credentials_pg_integration::test_postgres_credential_conformance[case_service_accounts_have_a_human_controller_and_least_authority]",
+          "reason_contains": "AUTHORITY_TEST_PG_DSN not set (postgres credenti"
         },
         {
           "test": "tests.test_ledger_dispatch_pg_integration::test_dispatch_scenarios_on_postgres_as_runtime_role[a_failed_publish_returns_the_row_to_the_scan]",
@@ -657,6 +985,14 @@
         {
           "test": "tests.test_okf::test_ingest_real_ga4_sample_bundle_if_present",
           "reason_contains": "knowledge-catalog sample bundle not available"
+        },
+        {
+          "test": "tests.test_policy_migration_integration::test_real_inventory_classifies_quarantines_and_applies",
+          "reason_contains": "MIGRATION_TEST_* not set (policy migration real-"
+        },
+        {
+          "test": "tests.test_policy_migration_integration::test_sources_read_real_legacy_data_without_modifying_it",
+          "reason_contains": "MIGRATION_TEST_* not set (policy migration real-"
         }
       ]
     }

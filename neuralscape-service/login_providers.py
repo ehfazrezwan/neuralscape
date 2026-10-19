@@ -37,7 +37,7 @@ from jwt import PyJWKClient
 import identity_store
 from allowlist import is_email_allowed
 from config import settings
-from identity import slugify_email
+from identity import unlinked_user_id
 from tokens import sign_payload, verify_payload, verify_user_token
 
 logger = logging.getLogger(__name__)
@@ -180,7 +180,8 @@ async def resolve_login_identity(sub: str | None, email: str) -> tuple[str, bool
     """Map a verified identity to a ``user_id``. Returns ``(user_id, linked)``.
 
     Order: durable store → ``AUTH_IDENTITY_MAP`` seed (promoted into the store)
-    → email slug (a fresh, *unlinked* identity the caller can offer to link).
+    → email slug (a fresh, *unlinked* identity the caller can offer to link;
+    collision-free under the enforced auth profile, see ``identity``).
     """
     uid = await identity_store.resolve(sub, email)
     if uid:
@@ -189,7 +190,7 @@ async def resolve_login_identity(sub: str | None, email: str) -> tuple[str, bool
     if seed:
         await identity_store.link(seed, sub=sub, email=email)  # promote seed → durable
         return seed, True
-    return slugify_email(email), False
+    return unlinked_user_id(email), False
 
 
 async def _resolve_identity(

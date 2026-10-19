@@ -26,10 +26,11 @@ from fastapi import (
     UploadFile,
 )
 from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 import adapters  # noqa: F401 — registers knowledge-adapter taxonomies at import (deterministic MEMORY_CATEGORIES)
 from config import settings
+from policy_enforcement import enforce_request, install_or_refuse as _install_policy
 from extensions import ExtensionRegistry
 from extensions.events import EventType, EVENT_PAYLOAD_MODELS
 from logging_config import configure_logging
@@ -79,6 +80,7 @@ from schemas import (
     TimelineResponse,
     normalize_visibility,
 )
+from authority_store import AuthorityUnavailable
 from ledger.port import HoldActive, IdempotencyConflict
 from task_manager import TaskManager
 
@@ -178,8 +180,16 @@ async def lifespan(app: FastAPI):
     # Configure asyncio.to_thread executor when TO_THREAD_MAX_WORKERS>0
     _configure_to_thread_executor(asyncio.get_running_loop())
 
+    # Optional Gemini endpoint override; must precede the first client.
+    from provider_routing import apply_gemini_base_url
+
+    apply_gemini_base_url(settings.ns_gemini_base_url)
+
     # Initialize the service (this also initializes mem0 + Graphiti)
     _service._get_memory()
+    # Action policy: build the enforcer from settings (a no-op unless enabled).  In
+    # enforce mode a missing or unbuildable authority store refuses start-up.
+    _install_policy(_service, job_owner=_task_manager.job_owner)
     # Connect task manager to Redis
     await _task_manager.connect()
 
@@ -247,6 +257,8 @@ app = FastAPI(
     description="Production-grade memory layer with scoped memories, categories, REST and MCP interfaces",
     version="0.2.0",
     lifespan=lifespan,
+    # Explicit action policy (NS_POLICY_MODE; a no-op while it is "off").
+    dependencies=[Depends(enforce_request)],
 )
 
 
@@ -3002,6 +3014,18 @@ async def _idempotency_conflict_handler(request: Request, exc: IdempotencyConfli
     )
 
 
+@app.exception_handler(AuthorityUnavailable)
+async def _authority_unavailable_handler(request: Request, exc: AuthorityUnavailable):
+    """The authority store could not be read (an outage or a reconnect in progress): fail closed, retryable."""
+
+    from contracts_errors import InternalErrorCode, public_error_for
+
+    error = public_error_for(InternalErrorCode.UNAVAILABLE_DEPENDENCY)  # the same answer the policy layer gives
+    return JSONResponse(
+        status_code=503, headers={"Retry-After": "1"}, content={"detail": {"error": error.model_dump(mode="json")}}
+    )
+
+
 @v1_router.patch("/memories/{memory_id}")
 @v1_router.put("/memories/{memory_id}")  # transitional alias for the old update route
 async def v1_patch_memory(memory_id: str, req: PatchMemoryRequest, request: Request):
@@ -3509,6 +3533,169 @@ async def v1_audit_private_leakage(req: AuditPrivateLeakageRequest, request: Req
 
 
 # ── Scoped credentials and service accounts (off unless CREDENTIALS_ENABLED) ──
+
+
+class IssueCredentialRequest(BaseModel):
+    scope: list[str] = Field(min_length=1, max_length=16)
+    access_ttl_seconds: float | None = Field(default=None, gt=0)
+    refresh_ttl_seconds: float | None = Field(default=None, gt=0)
+    # Default: a refresh token for an ordinary caller, none when a scoped credential mints.
+    with_refresh: bool | None = None
+
+
+class RefreshCredentialRequest(BaseModel):
+    refresh_token: str = Field(min_length=1, max_length=512)
+
+
+class RevokeCredentialRequest(BaseModel):
+    credential_id: str = Field(min_length=1, max_length=128)
+
+
+class CreateServiceAccountRequest(BaseModel):
+    label: str = Field(min_length=1, max_length=128)
+
+
+def _credential_service():
+    import credentials
+
+    if not credentials.enabled():
+        raise HTTPException(status_code=404, detail="Not found")
+    service = credentials.get_service()
+    if service is None:
+        raise HTTPException(status_code=503, detail="Credential service unavailable")
+    return service
+
+
+def _credential_caller(request: Request, service):
+    """``(subject_id, verified_credential_or_None)`` for the authenticated caller."""
+
+    verified = getattr(request.state, "credential", None)
+    if verified is not None:
+        return verified.subject_id, verified
+    user_id = getattr(request.state, "user_id", None)
+    subject = service.subject_for_user_id(user_id) if user_id else None
+    if subject is None:
+        raise HTTPException(status_code=403, detail="A bound subject is required")
+    return subject, None
+
+
+def _issued_response(issued) -> dict:
+    return {
+        "access_token": issued.access_token,
+        "refresh_token": issued.refresh_token,
+        "credential_id": issued.credential_id,
+        "scope": list(issued.scope),
+        "access_expires_at": issued.access_expires_at,
+        "refresh_expires_at": issued.refresh_expires_at,
+        "token_type": "Bearer",
+    }
+
+
+def _ttls(req: IssueCredentialRequest, verified=None) -> dict:
+    ttls = {"with_refresh": req.with_refresh if req.with_refresh is not None else verified is None}
+    if req.access_ttl_seconds is not None:
+        ttls["access_ttl"] = req.access_ttl_seconds
+    if req.refresh_ttl_seconds is not None:
+        ttls["refresh_ttl"] = req.refresh_ttl_seconds
+    return ttls
+
+
+def _credential_errors(call):
+    import credentials
+
+    try:
+        return call()
+    except credentials.AuthorityUnavailable as error:
+        raise HTTPException(status_code=503, detail="Credential service unavailable") from error
+    except credentials.ScopeError as error:
+        raise HTTPException(status_code=400, detail="The requested scope is not permitted") from error
+    except credentials.CredentialLimit as error:
+        raise HTTPException(status_code=409, detail="Too many active credentials") from error
+    except (credentials.UnknownSubject, ValueError) as error:
+        raise HTTPException(status_code=404, detail="Not found") from error
+
+
+@v1_router.post("/credentials")
+async def v1_issue_credential(req: IssueCredentialRequest, request: Request):
+    """Issue a scoped credential (and refresh token) for the caller's own subject."""
+
+    service = _credential_service()
+    subject, verified = _credential_caller(request, service)
+    issued = await asyncio.to_thread(
+        _credential_errors,
+        lambda: service.issue(subject, req.scope, issuer=verified, **_ttls(req, verified)),
+    )
+    return _issued_response(issued)
+
+
+@v1_router.post("/credentials/refresh")
+async def v1_refresh_credential(req: RefreshCredentialRequest):
+    """Redeem a single-use refresh token.  Authenticated by the token itself."""
+
+    import credentials
+
+    service = _credential_service()
+    try:
+        issued = await asyncio.to_thread(service.refresh, req.refresh_token)
+    except credentials.AuthorityUnavailable as error:
+        raise HTTPException(status_code=503, detail="Credential service unavailable") from error
+    except (credentials.CredentialInvalid, credentials.RefreshReplay) as error:
+        # A replay and an unknown token look the same to the caller.
+        if isinstance(error, credentials.RefreshReplay):
+            logger.warning("refresh token replay: family revoked")
+        raise HTTPException(status_code=401, detail="Invalid refresh token") from error
+    return _issued_response(issued)
+
+
+@v1_router.post("/credentials/revoke")
+async def v1_revoke_credential(req: RevokeCredentialRequest, request: Request):
+    """Revoke a credential family the caller owns (or controls as a service account's owner)."""
+
+    service = _credential_service()
+    subject, _ = _credential_caller(request, service)
+    revoked = await asyncio.to_thread(
+        _credential_errors, lambda: service.revoke(req.credential_id, by_subject_id=subject)
+    )
+    return {"revoked": revoked}
+
+
+@v1_router.post("/service-accounts")
+async def v1_create_service_account(req: CreateServiceAccountRequest, request: Request):
+    """Create a service account controlled by the (human) caller.  It has no credential yet."""
+
+    service = _credential_service()
+    subject, _ = _credential_caller(request, service)
+    account_id = await asyncio.to_thread(
+        _credential_errors, lambda: service.create_service_account(subject, req.label)
+    )
+    return {"subject_id": account_id, "controller_subject_id": subject, "label": req.label}
+
+
+@v1_router.post("/service-accounts/{subject_id}/credentials")
+async def v1_service_account_credential(subject_id: str, req: IssueCredentialRequest, request: Request):
+    """Issue a new credential for a service account (rotation: two may be active)."""
+
+    service = _credential_service()
+    controller, verified = _credential_caller(request, service)
+    issued = await asyncio.to_thread(
+        _credential_errors,
+        lambda: service.rotate_service_account(
+            subject_id, controller, req.scope, issuer=verified, **_ttls(req, verified)
+        ),
+    )
+    return _issued_response(issued)
+
+
+@v1_router.post("/service-accounts/{subject_id}/disable")
+async def v1_disable_service_account(subject_id: str, request: Request):
+    """Disable a service account and retire all of its credentials."""
+
+    service = _credential_service()
+    controller, _ = _credential_caller(request, service)
+    changed = await asyncio.to_thread(
+        _credential_errors, lambda: service.disable_service_account(subject_id, controller)
+    )
+    return {"disabled": True, "changed": changed}
 
 
 # ── Opaque-envelope relay (E2EE_RELAY_ENABLED; 404 while off) ─────────────────
