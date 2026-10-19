@@ -6,10 +6,10 @@ Mounted at /v1/extensions/conversation-compiler/ by the extension registry.
 from datetime import datetime
 
 import structlog
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 
 from memory_service import MemoryService
-from task_manager import TaskManager
+from task_manager import TaskManager, record_task_owner
 
 from .compile import compile_all_pending, compile_date
 from .config import compiler_settings
@@ -49,8 +49,20 @@ def create_router(
     """
     router = APIRouter()
 
+    async def _record_owner(http_request: Request, task_id: str, body_user_id: str) -> None:
+        """Let the enqueuing user poll ``task_id`` on /v1/memories/status.
+
+        The owner is the body's ``user_id`` (the user the task runs as), but
+        only when the caller is that user: with a per-user token naming a
+        different user nobody is recorded, so the status read fails closed.
+        """
+        token_user_id = getattr(http_request.state, "user_id", None)
+        if token_user_id and token_user_id != body_user_id:
+            return
+        await record_task_owner(task_manager.pool, task_id, body_user_id)
+
     @router.post("/flush", status_code=202, response_model=dict)
-    async def flush(request: FlushRequest) -> dict:
+    async def flush(request: FlushRequest, http_request: Request) -> dict:
         """Submit a conversation turn for fact extraction.
 
         Enqueues the extraction to the ARQ worker for async processing.
@@ -71,6 +83,8 @@ def create_router(
                     request.user_id,
                 )
                 task_id = job.job_id if job else "duplicate"
+                if job:
+                    await _record_owner(http_request, task_id, request.user_id)
                 return {"status": "accepted", "task_id": task_id}
             except Exception:
                 logger.warning("ARQ enqueue failed, falling back to sync flush")
@@ -93,7 +107,7 @@ def create_router(
         }
 
     @router.post("/compile", status_code=202, response_model=dict)
-    async def compile(request: CompileRequest) -> dict:
+    async def compile(request: CompileRequest, http_request: Request) -> dict:
         """Trigger compilation for a specific date or all pending.
 
         Enqueues compilation to the ARQ worker for async processing.
@@ -106,6 +120,8 @@ def create_router(
                     request.user_id,
                 )
                 task_id = job.job_id if job else "duplicate"
+                if job:
+                    await _record_owner(http_request, task_id, request.user_id)
                 return {"status": "accepted", "task_id": task_id}
             except Exception:
                 logger.warning("ARQ enqueue failed, falling back to sync compile")

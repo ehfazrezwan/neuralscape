@@ -20,6 +20,7 @@ from fastapi import APIRouter
 
 from extensions.base import ExtensionManifest, NeuralscapeExtension
 from memory_service import MemoryService
+from task_manager import record_task_owner
 
 from .compile import compile_all_pending, compile_date
 from .config import compiler_settings
@@ -271,6 +272,9 @@ class ConversationCompilerExtension:
                     user_id,
                 )
                 task_id = job.job_id if job else "duplicate"
+                if job:
+                    # The session's user may poll it on /v1/memories/status.
+                    await record_task_owner(self._task_manager.pool, task_id, user_id)
                 logger.info("Auto-compile enqueued to ARQ", date=today, task_id=task_id)
                 return {"status": "accepted", "task_id": task_id, "date": today}
             except Exception:
