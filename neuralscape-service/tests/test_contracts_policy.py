@@ -458,6 +458,32 @@ def policy(
     )
 
 
+def delegated_policy(
+    *statements: PolicyStatement,
+    issuer: str,
+    issuer_membership_version: int = 1,
+) -> AccessPolicy:
+    """A ``policy`` in which the delegation issuer currently holds every right
+    the statements allow ``subject-a``: a delegate is allowed only while its
+    issuer is a current member with the same allow."""
+
+    mirrored = tuple(
+        item.model_copy(update={"id": f"{item.id}-issuer", "subject_id": issuer, "credential_id": None})
+        for item in statements
+        if item.effect == "allow" and item.subject_id == "subject-a"
+    )
+    return AccessPolicy(
+        schema_version=VERSION,
+        tenant_id="tenant-a",
+        policy_epoch=19,
+        membership_versions=(
+            MembershipVersion(subject_id="subject-a", version=7),
+            MembershipVersion(subject_id=issuer, version=issuer_membership_version),
+        ),
+        statements=statements + mirrored,
+    )
+
+
 def evaluate(
     principal_value: PrincipalContext,
     action: str,
@@ -589,10 +615,11 @@ def test_delegation_can_narrow_but_never_create_a_grant() -> None:
         allowed_resources=(allowed_resource,),
     )
     delegated = principal(subject_kind="delegated_agent", delegation=constraints)
-    policy_value = policy(
+    policy_value = delegated_policy(
         statement("read-allowed", "allow", "read", allowed_resource),
         statement("update-allowed", "allow", "update", allowed_resource),
         statement("read-other", "allow", "read", other_resource),
+        issuer="delegator-a",
     )
 
     assert evaluate(delegated, "read", allowed_resource, policy_value).outcome == "allow"
@@ -2809,7 +2836,9 @@ def test_public_first_delegation_ceiling_follows_the_public_view(field: str) -> 
         delegated_by_credential_id="credential-human",
         **granted,
     )
-    policy_value = policy(statement("grant", "allow", "read", resource_value))
+    policy_value = delegated_policy(
+        statement("grant", "allow", "read", resource_value), issuer="subject-human"
+    )
 
     # Native backing grants, public view is empty: the empty public view wins.
     narrowed = principal(subject_kind="delegated_agent", delegation=open_ceiling)
@@ -2978,7 +3007,9 @@ def test_iterator_children_are_frozen_before_the_iterator_advances() -> None:
 
 def test_the_same_generator_without_repair_is_rejected_and_a_valid_one_is_allowed() -> None:
     resource_value = reference("memory-1")
-    grant = policy(statement("allow-read", "allow", "read", resource_value))
+    grant = delegated_policy(
+        statement("allow-read", "allow", "read", resource_value), issuer="subject-human"
+    )
     broken = _tampered_handle()
     with pytest.raises(ValidationError):
         evaluate(_delegated_principal(_GeneratorMapping(lambda: _delegation_pairs(broken, repair=False))),
