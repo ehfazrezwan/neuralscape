@@ -8,7 +8,7 @@
  */
 
 import { spawn } from "node:child_process";
-import { mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, writeFile } from "node:fs/promises";
 import { createServer, type Server } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -91,6 +91,10 @@ const toolResultEntry = () => ({
 });
 const meta = (t: string) => ({ type: "user", ...common(), isMeta: true, message: { role: "user", content: t } });
 const sidechain = (t: string) => ({ type: "assistant", ...common(), isSidechain: true, message: { role: "assistant", content: [text(t)] } });
+const compactSummary = (t: string) => ({
+  type: "user", ...common(), isCompactSummary: true, isVisibleInTranscriptOnly: true, message: { role: "user", content: t },
+});
+const localCommand = (t: string) => ({ type: "user", ...common(), message: { role: "user", content: t } });
 const bookkeeping = [
   { type: "summary", summary: "synthetic summary entry", leafUuid: "uuid-0" },
   { type: "file-history-snapshot", messageId: "m1", snapshot: {} },
@@ -128,7 +132,11 @@ async function transcript(entries: unknown[], jsonl = true): Promise<{ path: str
 }
 
 const offsetOf = async (path: string) => parseInt(await readFile(path + ".neuralscape-offset", "utf-8"), 10);
-const markerOf = async (path: string) => readFile(path + ".neuralscape-offset.format", "utf-8").catch(() => null);
+/** The format tag stored in the offset file itself ("<offset> v2"), or null when the offset has none (or no offset exists). */
+const markerOf = async (path: string) => {
+  const raw = await readFile(path + ".neuralscape-offset", "utf-8").catch(() => null);
+  return raw !== null && /\bv2\b/.test(raw) ? "v2" : null;
+};
 
 // ── Reading real-shape entries ───────────────────────────────────
 
@@ -198,7 +206,7 @@ describe("real transcript shape: offsets", () => {
     expect(result.flushed).toBe(2);
     await commitClaudeCodeFlush(raw, result);
     expect(await offsetOf(path)).toBe(8); // eight user/assistant entries
-    expect(await markerOf(path)).toBe("2");
+    expect(await markerOf(path)).toBe("v2");
     expect(await extractClaudeCodeTurns(raw)).toEqual([]);
   });
 
@@ -245,7 +253,7 @@ describe("legacy offsets (advanced by the previous reader)", () => {
     const turns = await extractClaudeCodeTurns(raw);
     expect(turns.length).toBe(2); // the two lost turns come back
     await commitClaudeCodeFlush(raw, await flushTurns(turns));
-    expect(await markerOf(path)).toBe("2");
+    expect(await markerOf(path)).toBe("v2");
     expect(await extractClaudeCodeTurns(raw)).toEqual([]); // marker present: no further rewind
   });
 
@@ -335,5 +343,119 @@ describe("real transcript shape: built hooks deliver", () => {
     expect(checkpoint).toBeDefined();
     expect(JSON.stringify(checkpoint?.body.session_note)).toContain("retry");
     expect(JSON.stringify(checkpoint?.body)).not.toContain("TOOL-RESULT-SENTINEL");
+  });
+});
+
+
+// ── Compaction summaries and local-command wrappers are not what the user said ──
+
+const SUMMARY_TEXT = "COMPACT-SUMMARY-SENTINEL This session is being continued from a previous conversation that ran out of context.";
+
+describe("entries that are not the user's conversation", () => {
+  it("a compaction summary followed by assistant text is never delivered as a prompt", async () => {
+    const { raw } = await transcript([
+      compactSummary(SUMMARY_TEXT),
+      assistant(text("ANSWER-AFTER-COMPACT-SENTINEL continuing the task after the compaction has happened")),
+      user(PROMPT_TWO),
+      assistant(text(THIRD_TEXT)),
+    ]);
+    const turns = await extractClaudeCodeTurns(raw);
+    expect(turns.map((t) => t.userMessage)).toEqual([PROMPT_TWO]);
+    expect(JSON.stringify(turns)).not.toContain("COMPACT-SUMMARY-SENTINEL");
+    expect(JSON.stringify(turns)).not.toContain("ANSWER-AFTER-COMPACT-SENTINEL"); // unpaired continuation, dropped
+  });
+
+  it.each([["isCompactSummary"], ["isVisibleInTranscriptOnly"]])("%s alone is enough to exclude an entry", async (flag) => {
+    const entry = { type: "user", ...common(), [flag]: true, message: { role: "user", content: SUMMARY_TEXT } };
+    const { raw } = await transcript([entry, assistant(text(SECOND_TEXT)), user(PROMPT_ONE), assistant(text(THIRD_TEXT))]);
+    expect((await extractClaudeCodeTurns(raw)).map((t) => t.userMessage)).toEqual([PROMPT_ONE]);
+  });
+
+  it("a summary in the middle of a session neither ends the turn before it nor starts one", async () => {
+    const { raw } = await transcript([user(PROMPT_ONE), assistant(text(FIRST_TEXT)), compactSummary(SUMMARY_TEXT), assistant(text(SECOND_TEXT))]);
+    const turns = await extractClaudeCodeTurns(raw);
+    expect(turns.length).toBe(1);
+    expect(turns[0].assistantResponse).toBe(`${FIRST_TEXT}\n${SECOND_TEXT}`);
+    expect(JSON.stringify(turns)).not.toContain("COMPACT-SUMMARY-SENTINEL");
+  });
+
+  it("local slash-command wrappers are not prompts", async () => {
+    const wrappers = [
+      "<command-name>/compact</command-name>\n<command-message>compact</command-message>\n<command-args></command-args>",
+      "<local-command-stdout>LOCAL-COMMAND-SENTINEL synthetic output</local-command-stdout>",
+      "<local-command-caveat>Caveat: synthetic</local-command-caveat>",
+    ];
+    for (const wrapper of wrappers) {
+      const { raw } = await transcript([localCommand(wrapper), assistant(text(SECOND_TEXT)), user(PROMPT_ONE), assistant(text(THIRD_TEXT))]);
+      expect((await extractClaudeCodeTurns(raw)).map((t) => t.userMessage)).toEqual([PROMPT_ONE]);
+    }
+    const { raw } = await transcript([user("how do I use <command-name> in a sentence like this one?"), assistant(text(SECOND_TEXT))]);
+    expect((await extractClaudeCodeTurns(raw)).length).toBe(1); // only a wrapper at the start of the entry is dropped
+  });
+
+  it("the SessionEnd pair reader excludes them too", async () => {
+    const { raw } = await transcript([compactSummary(SUMMARY_TEXT), assistant(text(SECOND_TEXT)), user(PROMPT_ONE), assistant(text(THIRD_TEXT))]);
+    expect((await extractAllTurnPairs(raw)).map((p) => p.user)).toEqual([PROMPT_ONE]);
+  });
+
+  it("a legacy offset is not rewound because of a summary the old reader also could not see", async () => {
+    const { path, raw } = await transcript([compactSummary(SUMMARY_TEXT), assistant(text(SECOND_TEXT))]);
+    await writeFile(path + ".neuralscape-offset", "2", "utf-8");
+    expect(await extractClaudeCodeTurns(raw)).toEqual([]);
+  });
+
+  it("the Stop hook sends the real turn and never the summary", async () => {
+    const { path, dir } = await transcript([
+      compactSummary(SUMMARY_TEXT),
+      assistant(text("ANSWER-AFTER-COMPACT-SENTINEL continuing the task after the compaction has happened")),
+      user(PROMPT_TWO),
+      assistant(text(THIRD_TEXT)),
+    ]);
+    const r = await runHook("session-end.js", JSON.stringify({ session_id: SESSION, transcript_path: path, cwd: dir, hook_event_name: "Stop" }));
+    expect(r.code).toBe(0);
+    expect(flushes().map((q) => q.body.user_message)).toEqual([PROMPT_TWO]);
+    expect(JSON.stringify(requests)).not.toContain("COMPACT-SUMMARY-SENTINEL");
+  });
+});
+
+// ── The offset and its format tag are one write ──────────────────
+
+describe("offset file: one atomic write", () => {
+  it("stores the offset and the tag together and leaves no temporary or sidecar file", async () => {
+    const { path, dir, raw } = await transcript(realSession());
+    await commitClaudeCodeFlush(raw, await flushTurns(await extractClaudeCodeTurns(raw)));
+    expect((await readFile(path + ".neuralscape-offset", "utf-8")).trim()).toBe("8 v2");
+    expect((await readdir(dir)).sort()).toEqual(["transcript.jsonl", "transcript.jsonl.neuralscape-offset"]);
+  });
+
+  it("an older reader of the offset file still gets the number", async () => {
+    const { path, raw } = await transcript(realSession());
+    await commitClaudeCodeFlush(raw, await flushTurns(await extractClaudeCodeTurns(raw)));
+    expect(parseInt(await readFile(path + ".neuralscape-offset", "utf-8"), 10)).toBe(8);
+  });
+
+  it("a failed write keeps the previous offset, writes no half state and removes its temporary file", async () => {
+    const { path, dir, raw } = await transcript(realSession());
+    const turns = await extractClaudeCodeTurns(raw);
+    const result = await flushTurns(turns);
+    await mkdir(path + ".neuralscape-offset"); // a directory where the offset file belongs: the rename cannot succeed
+    await commitClaudeCodeFlush(raw, result);
+    expect((await readdir(dir)).sort()).toEqual(["transcript.jsonl", "transcript.jsonl.neuralscape-offset"]); // no .tmp left
+  });
+
+  it("a tagged offset is never rewound, an untagged one is", async () => {
+    const { path, raw } = await transcript(realSession());
+    await writeFile(path + ".neuralscape-offset", "8 v2", "utf-8");
+    expect(await extractClaudeCodeTurns(raw)).toEqual([]);
+    await writeFile(path + ".neuralscape-offset", "8", "utf-8");
+    expect((await extractClaudeCodeTurns(raw)).length).toBe(2);
+  });
+
+  it("a delivered flush is not replayed by the next one", async () => {
+    const { raw } = await transcript(realSession());
+    await commitClaudeCodeFlush(raw, await flushTurns(await extractClaudeCodeTurns(raw)));
+    const before = requests.length;
+    expect(await extractClaudeCodeTurns(raw)).toEqual([]);
+    expect(requests.length).toBe(before);
   });
 });

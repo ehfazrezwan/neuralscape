@@ -6,7 +6,7 @@
  * Fallback: if no transcript, uses prompt + last_assistant_message for the last turn.
  */
 
-import { readFile, writeFile } from "node:fs/promises";
+import { readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { getProjectId, getUserId, logError } from "../utils.js";
 import type { FlushResult } from "../core/flush.js";
 import type { ConversationTurn, SessionEndInput } from "../core/types.js";
@@ -14,13 +14,14 @@ import type { ConversationTurn, SessionEndInput } from "../core/types.js";
 const OFFSET_SUFFIX = ".neuralscape-offset";
 
 /**
- * Marker written next to the offset once a flush has been committed by a reader that understands the real
- * transcript shape (text under `message.content`). An offset WITHOUT the marker may have been advanced by an
- * older reader that saw every real turn as empty and skipped it, so it gets a bounded, data-driven rewind
- * (see `legacyRewindOffset`) the first time it is read.
+ * Format tag written in the SAME file as the offset (`"<offset> v2"`) once a flush has been committed by a reader
+ * that understands the real transcript shape (text under `message.content`). An offset WITHOUT the tag may have
+ * been advanced by an older reader that saw every real turn as empty and skipped it, so it gets a bounded,
+ * data-driven rewind (see `legacyRewindOffset`) the first time it is read. Offset and tag are written together
+ * (temporary file, then rename), so a failed or interrupted write can never leave a new offset without its tag.
+ * An older plugin reading the file still gets the number (`parseInt`).
  */
-const FORMAT_SUFFIX = ".neuralscape-offset.format";
-const FORMAT_VERSION = "2";
+const FORMAT_TAG = "v2";
 
 /** The most transcript entries a legacy offset is ever rewound across (older undelivered turns stay lost). */
 const MAX_LEGACY_REWIND_ENTRIES = 400;
@@ -54,38 +55,40 @@ interface TranscriptMessage {
   role?: string;
   isSidechain?: boolean;
   isMeta?: boolean;
+  isCompactSummary?: boolean;
+  isVisibleInTranscriptOnly?: boolean;
 }
 
 /**
- * Read the flush offset (last processed message index) for a transcript.
+ * Read the flush offset (last processed message index) for a transcript, and whether it carries the format tag.
  */
-async function readFlushOffset(transcriptPath: string): Promise<number> {
+async function readFlushOffset(transcriptPath: string): Promise<{ offset: number; tagged: boolean }> {
   try {
     const content = await readFile(transcriptPath + OFFSET_SUFFIX, "utf-8");
     const offset = parseInt(content.trim(), 10);
-    return Number.isNaN(offset) ? 0 : offset;
+    return { offset: Number.isNaN(offset) ? 0 : offset, tagged: /\bv2\b/.test(content) };
   } catch {
-    return 0;
-  }
-}
-
-async function hasFormatMarker(transcriptPath: string): Promise<boolean> {
-  try {
-    return (await readFile(transcriptPath + FORMAT_SUFFIX, "utf-8")).trim() === FORMAT_VERSION;
-  } catch {
-    return false;
+    return { offset: 0, tagged: false };
   }
 }
 
 /**
- * Write the flush offset after successful processing, then the format marker.
+ * Write the flush offset and its format tag in one atomic step: a temporary file in the same directory, renamed
+ * over the offset file. A failure leaves the previous offset untouched (and removes the temporary file).
  */
 async function writeFlushOffset(
   transcriptPath: string,
   offset: number
 ): Promise<void> {
-  await writeFile(transcriptPath + OFFSET_SUFFIX, String(offset), "utf-8");
-  await writeFile(transcriptPath + FORMAT_SUFFIX, FORMAT_VERSION, "utf-8");
+  const target = transcriptPath + OFFSET_SUFFIX;
+  const temporary = `${target}.${process.pid}.tmp`;
+  try {
+    await writeFile(temporary, `${offset} ${FORMAT_TAG}`, "utf-8");
+    await rename(temporary, target);
+  } catch (error) {
+    await unlink(temporary).catch(() => undefined);
+    throw error;
+  }
 }
 
 function roleOf(msg: TranscriptMessage): string | undefined {
@@ -105,13 +108,25 @@ function textOf(content: ContentBlocks | undefined): string {
 }
 
 /**
+ * User entries Claude Code writes for local slash commands and their output (`<command-name>`, `<command-message>`,
+ * `<command-args>`, `<local-command-stdout>`, `<local-command-stderr>`, `<local-command-caveat>`): not something the
+ * user said to the assistant.
+ */
+const LOCAL_COMMAND_WRAPPER = /^\s*<(?:command-name|command-message|command-args|local-command-[a-z]+)>/;
+
+/**
  * Extract the conversation text of a transcript entry. Real entries carry it under `message.content`; a top-level
- * `content` (simplified producers) is the fallback. Meta entries (injected context) and sidechain entries
- * (sub-agent conversations) are not part of the user's conversation and yield no text.
+ * `content` (simplified producers) is the fallback. Entries that are not the user's conversation yield no text:
+ * meta entries (injected context), sidechain entries (sub-agent conversations), compaction summaries
+ * (`isCompactSummary`, shown only in the transcript view: `isVisibleInTranscriptOnly`; the whole "continued from a
+ * previous conversation" summary, which must never be attributed to the user) and local-command wrappers.
  */
 function extractText(msg: TranscriptMessage): string {
   if (msg.isMeta === true || msg.isSidechain === true) return "";
-  return textOf(msg.message?.content ?? msg.content);
+  if (msg.isCompactSummary === true || msg.isVisibleInTranscriptOnly === true) return "";
+  const text = textOf(msg.message?.content ?? msg.content);
+  if ((roleOf(msg) ?? msg.message?.role) === "user" && LOCAL_COMMAND_WRAPPER.test(text)) return "";
+  return text;
 }
 
 /** What the previous reader saw: top-level `content` only. */
@@ -247,8 +262,9 @@ export async function extractClaudeCodeTurns(
   if (transcriptPath) {
     try {
       const content = await readFile(transcriptPath, "utf-8");
-      let offset = await readFlushOffset(transcriptPath);
-      if (offset > 0 && !(await hasFormatMarker(transcriptPath))) {
+      const stored = await readFlushOffset(transcriptPath);
+      let offset = stored.offset;
+      if (offset > 0 && !stored.tagged) {
         offset = legacyRewindOffset(content, offset);
       }
       const { turns, newOffset } = parseTranscript(content, offset);
@@ -341,7 +357,8 @@ export function extractClaudeCodeSessionEnd(
  * - nothing delivered (first turn failed) → leave the cursor untouched.
  *
  * If the hook crashes between extract and commit, the on-disk offset stays
- * at its prior value and the next session re-flushes (the backend dedups).
+ * at its prior value and the next session re-flushes. A re-sent turn is a new extraction call: the flush route
+ * does not de-duplicate turns (memory-level de-duplication happens when the turns are compiled).
  */
 export async function commitClaudeCodeFlush(
   raw: Record<string, unknown>,
