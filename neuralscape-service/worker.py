@@ -1344,13 +1344,17 @@ async def process_connector_sync(
     finally:
         await adapter.aclose()
 
-    await vault.update_sync_state(
+    # Atomic, field-scoped and bound to the instance read above: a connector
+    # deleted, re-created or re-owned meanwhile keeps its own state.
+    written = await vault.update_sync_state(
         connector_id,
         cursor=next_cursor,
         last_synced_at=datetime.now(timezone.utc).isoformat(),
         revisions=revisions,
         generation=record.get("generation"),
     )
+    if not written:
+        logger.info(f"Connector sync [{connector_id}]: connector replaced or removed during sync; state not saved")
     logger.info(f"Connector sync [{connector_id}]: {synced} ingested, {skipped} unchanged")
     return {"connector_id": connector_id, "synced": synced, "skipped": skipped}
 

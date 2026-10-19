@@ -539,25 +539,33 @@ class TaskManager:
         await self._track_task(requester_user_id or user_id, task_id)
         return task_id
 
-    def _candidate_queues(self) -> list[str]:
-        """Queues a poll-able job could live on (main + ingest), de-duplicated.
+    def _candidate_queues(self, *, include_graph: bool = False) -> list[str]:
+        """Queues a poll-able job could live on, de-duplicated.
 
         Ingest/connector-sync jobs run on a dedicated queue, so status polling
         must look there too or ``/v1/memories/status/{id}`` would report every
-        ingest job as not_found.
+        ingest job as not_found. With ``include_graph`` the graph queue is
+        searched as well, so a graph task handed to a caller (for example the
+        ``graph_task_id`` of a memory edit) reports queued while it waits
+        instead of not_found. Only per-task status reads ask for it;
+        ``get_queue_status`` accounting keeps its existing queue set.
         """
         queues = [settings.arq_queue_name, settings.ingest_queue_name]
+        if include_graph:
+            queues.append(settings.graph_queue_name)
         seen: set[str] = set()
         return [q for q in queues if not (q in seen or seen.add(q))]
 
-    async def _find_job(self, task_id: str) -> tuple[Job, JobStatus]:
+    async def _find_job(
+        self, task_id: str, *, include_graph: bool = False
+    ) -> tuple[Job, JobStatus]:
         """Return the (job, status) for ``task_id``, searching candidate queues.
 
         Returns the first queue where the job is known; falls back to a
         main-queue job with not_found status if it's on none of them.
         """
         fallback: Job | None = None
-        for queue_name in self._candidate_queues():
+        for queue_name in self._candidate_queues(include_graph=include_graph):
             job = Job(task_id, redis=self.pool, _queue_name=queue_name)
             status = await job.status()
             if status != JobStatus.not_found:
@@ -571,7 +579,12 @@ class TaskManager:
         return fallback, JobStatus.not_found
 
     async def get_status(
-        self, task_id: str, user_id: str | None = None, *, enforce_owner: bool = False
+        self,
+        task_id: str,
+        user_id: str | None = None,
+        *,
+        enforce_owner: bool = False,
+        include_graph: bool = False,
     ) -> dict:
         """Get task status from ARQ/Redis.
 
@@ -579,14 +592,16 @@ class TaskManager:
         ``user_id`` enqueued it, before the job is looked up, so a caller
         cannot tell another user's task from one that never existed. If the
         owner check itself fails, ``TaskStatusUnavailable`` propagates (no
-        job is looked up).
+        job is looked up). ``include_graph`` also searches the graph queue,
+        so a queued graph task reports its real status; the status routes
+        ask for it, while ``get_queue_status`` keeps its existing queue set.
 
         Returns:
             Dict with task_id, status, result, error keys.
         """
         if enforce_owner and not await self.is_task_owner(task_id, user_id):
             return {"task_id": task_id, "status": "not_found", "result": None, "error": None}
-        job, status = await self._find_job(task_id)
+        job, status = await self._find_job(task_id, include_graph=include_graph)
 
         api_status = _STATUS_MAP.get(status, "not_found")
 

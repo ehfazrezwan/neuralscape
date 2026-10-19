@@ -6,6 +6,7 @@ unknown id (404, no state, no result). With the shared key there is no caller
 identity on the request, so the status is returned as before.
 """
 
+import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -16,6 +17,7 @@ import main
 from config import settings
 from main import app
 from task_manager import TaskManager
+from tests.fake_vault_store import FakeVaultStore
 from tokens import issue_user_token
 
 SECRET = "task-owner-test-secret"
@@ -75,7 +77,7 @@ def tm(monkeypatch):
     manager.pool.enqueue_job = AsyncMock(side_effect=lambda *a, **k: MagicMock(job_id=k.get("_job_id") or "job-x"))
     known: dict[str, JobStatus] = {}
 
-    async def find_job(task_id):
+    async def find_job(task_id, **_):
         status = known.get(task_id, JobStatus.not_found)
         return FakeJob(PRIVATE_RESULT), status
 
@@ -132,7 +134,7 @@ class TestOwnerOnlyStatus:
         task_id = await _alice_task(tm)
         lookups = []
 
-        async def spy(tid):
+        async def spy(tid, **_):
             lookups.append(tid)
             return FakeJob(PRIVATE_RESULT), JobStatus.complete
 
@@ -236,16 +238,32 @@ class FakePipeline:
         self.ops.append(("expire", key, ttl))
         return self
 
+    # Read commands ARQ's Job.status() pipelines.
+    def exists(self, key):
+        self.ops.append(("exists", key, None))
+        return self
+
+    def zscore(self, key, member):
+        self.ops.append(("zscore", key, member))
+        return self
+
     async def execute(self):
         if self.redis.fail_exec:
             raise ConnectionError("redis down")
         self.redis.transactions.append((self.transaction, [(op, key) for op, key, _ in self.ops]))
+        out = []
         for op, key, arg in self.ops:
             if op == "sadd":
                 self.redis.sets.setdefault(key, set()).update(arg)
-            else:
+                out.append(True)
+            elif op == "expire":
                 self.redis.ttls[key] = arg
-        return [True] * len(self.ops)
+                out.append(True)
+            elif op == "exists":
+                out.append(int(key in self.redis.strings))
+            else:
+                out.append(self.redis.zsets.get(key, {}).get(arg))
+        return out
 
 
 class PipelineRedis(FakeRedis):
@@ -321,7 +339,7 @@ class TestOwnerCheckRedisError:
         task_id = await _alice_task(ptm)
         lookups = []
 
-        async def spy(tid):
+        async def spy(tid, **_):
             lookups.append(tid)
             return FakeJob(PRIVATE_RESULT), JobStatus.complete
 
@@ -477,7 +495,7 @@ class TestMixedUserBatch:
 
     @pytest.fixture()
     def batch_tm(self, ptm, monkeypatch):
-        async def find_job(task_id):
+        async def find_job(task_id, **_):
             return FakeJob(self.MIXED_RESULT), ptm.known.get(task_id, JobStatus.not_found)
 
         monkeypatch.setattr(ptm, "_find_job", find_job)
@@ -562,25 +580,8 @@ class TestMixedUserBatch:
 # ── Connector sync identity follows the connector instance and its owner ────
 
 
-class _VaultStore:
-    """In-memory async KV with the redis methods ConnectorVault uses."""
-
-    def __init__(self):
-        self.d: dict[str, str] = {}
-
-    async def set(self, k, v):
-        self.d[k] = v
-
-    async def get(self, k):
-        return self.d.get(k)
-
-    async def delete(self, k):
-        return 1 if self.d.pop(k, None) is not None else 0
-
-    async def keys(self, pattern):
-        import fnmatch
-
-        return [k for k in self.d if fnmatch.fnmatch(k, pattern)]
+# In-memory async KV with the redis commands ConnectorVault uses.
+_VaultStore = FakeVaultStore
 
 
 class TestConnectorSyncIdentity:
@@ -609,7 +610,7 @@ class TestConnectorSyncIdentity:
             seen[_job_id] = {"fn": fn, "args": args, **kw}
             return MagicMock(job_id=_job_id)
 
-        async def find_job(task_id):
+        async def find_job(task_id, **_):
             if task_id not in seen:
                 return FakeJob(None), JobStatus.not_found
             return FakeJob(results.get(task_id)), JobStatus.complete
@@ -630,7 +631,9 @@ class TestConnectorSyncIdentity:
     @pytest.mark.asyncio
     @pytest.mark.parametrize("change", ["delete_recreate", "reassign"])
     @pytest.mark.parametrize("old_job", ["cached", "expired"])
-    async def test_owner_change_gives_disjoint_jobs(self, vault, arq, per_user_auth, change, old_job):
+    async def test_owner_change_gives_disjoint_jobs(
+        self, vault, arq, per_user_auth, monkeypatch, change, old_job
+    ):
         client = TestClient(app)
         self._register(client, "alice")
         old = self._sync(client, "alice")
@@ -640,16 +643,23 @@ class TestConnectorSyncIdentity:
             del arq.seen[old]
         if change == "delete_recreate":
             assert client.delete(f"/v1/connectors/{self.CID}", headers=_bearer("alice")).status_code == 200
-        self._register(client, "bob")
-        new = self._sync(client, "bob")
-        arq.results[new] = {"owner": "bob"}
+            new_owner = "bob"
+            self._register(client, new_owner)
+        else:
+            # Only a caller without an identity (shared key) can re-own it;
+            # a per-user caller gets 404 (test_per_user_cannot_register_over_another_owner).
+            shared = _shared_key_auth(monkeypatch)
+            new_owner = settings.default_user_id
+            assert client.post("/v1/connectors", json=self.BODY, headers=shared).status_code == 201
+        new = self._sync(client, new_owner)
+        arq.results[new] = {"owner": new_owner}
 
         assert new != old
         if old_job == "cached":
             assert _poll(old, "alice").json()["result"] == {"owner": "alice"}
-        assert _poll(new, "bob").json()["result"] == {"owner": "bob"}
+        assert _poll(new, new_owner).json()["result"] == {"owner": new_owner}
         # Neither owner can read the other's sync.
-        assert _poll(old, "bob").status_code == 404
+        assert _poll(old, new_owner).status_code == 404
         assert _poll(new, "alice").status_code == 404
 
     @pytest.mark.asyncio
@@ -703,6 +713,93 @@ class TestConnectorSyncIdentity:
         again = await vault.get(self.CID)
         assert again["cursor"] == "c1"
         assert again["generation"] == first["generation"]
+
+
+    @pytest.mark.asyncio
+    async def test_per_user_cannot_register_over_another_owner(self, vault, per_user_auth):
+        client = TestClient(app)
+        self._register(client, "alice")
+        before = await vault.get(self.CID)
+        body = {**self.BODY, "credentials": {"token": "bob-token"}}
+        taken = client.post("/v1/connectors", json=body, headers=_bearer("bob"))
+        unknown = client.get("/v1/connectors/not-a-connector", headers=_bearer("bob"))
+        assert taken.status_code == 404
+        # Same answer as any foreign or unknown connector id.
+        assert taken.json()["detail"].replace(self.CID, "X") == unknown.json()["detail"].replace(
+            "not-a-connector", "X"
+        )
+        assert "alice" not in taken.text
+        assert await vault.get(self.CID) == before
+
+    @pytest.mark.asyncio
+    async def test_shared_key_owner_change_resets_sync_state(self, vault, monkeypatch):
+        shared = _shared_key_auth(monkeypatch)
+        client = TestClient(app)
+        self._register(client, "alice")
+        first = await vault.get(self.CID)
+        await vault.update_sync_state(
+            self.CID, cursor="alice-cursor", last_synced_at="2026-10-01T00:00:00Z",
+            revisions={"alice-doc": "r1"}, generation=first["generation"],
+        )
+        resp = client.post("/v1/connectors", json=self.BODY, headers=shared)
+        assert resp.status_code == 201
+        rec = await vault.get(self.CID)
+        assert rec["owner_user_id"] == settings.default_user_id != "alice"
+        assert rec["generation"] != first["generation"]
+        for view in (resp.json(), rec):
+            assert view["cursor"] is None
+            assert view["last_synced_at"] is None
+            assert view["last_revision_by_id"] == {}
+
+    @pytest.mark.asyncio
+    async def test_same_owner_reregister_route_keeps_identity_and_cursor(self, vault, per_user_auth):
+        client = TestClient(app)
+        self._register(client, "alice")
+        first = await vault.get(self.CID)
+        await vault.update_sync_state(self.CID, cursor="c1", generation=first["generation"])
+        body = {**self.BODY, "credentials": {"token": "rotated"}}
+        resp = client.post("/v1/connectors", json=body, headers=_bearer("alice"))
+        assert resp.status_code == 201
+        rec = await vault.get(self.CID)
+        assert rec["generation"] == first["generation"]
+        assert rec["cursor"] == "c1"
+        assert rec["credentials"] == {"token": "rotated"}
+
+    @pytest.mark.asyncio
+    async def test_sync_overlapping_a_takeover_does_not_restore_the_old_owner(self, vault, monkeypatch):
+        """Worker sync for alice's instance; bob replaces it between read and write."""
+        import worker
+
+        store = vault._store
+        await vault.put({**self.BODY, "owner_user_id": "alice"})
+        record = await vault.get(self.CID)
+
+        async def replace():
+            await vault.delete(self.CID)
+            await vault.put({**self.BODY, "owner_user_id": "bob", "credentials": {"token": "bob"}})
+
+        store.pause_after_get("ns:connector:" + self.CID)
+        pending = asyncio.create_task(vault.update_sync_state(
+            self.CID, cursor="alice-cursor", generation=record["generation"]
+        ))
+        await store.paused.wait()
+        await replace()
+        store.resume.set()
+        await pending
+        rec = await vault.get(self.CID)
+        assert rec["owner_user_id"] == "bob"
+        assert rec["cursor"] is None
+        # The cron now enqueues bob's instance, not alice's.
+        expected = worker.connector_sync_job_id(self.CID, "bob", rec["generation"])
+        seen = []
+
+        class Pool:
+            async def enqueue_job(self, fn, *args, _job_id=None, **kw):
+                seen.append(_job_id)
+
+        monkeypatch.setattr(settings, "connectors_enabled", True)
+        await worker.connector_sync_cron({"vault": vault, "redis": Pool()})
+        assert seen == [expected]
 
 
 # ── Graph tasks from an edit belong to the user who made the edit ───────────
@@ -809,3 +906,42 @@ class TestSharedEditGraphTask:
         assert not await ptm.is_task_owner(task_id, "mallory")
         ((fn, args),) = graph_jobs
         assert args[2] == "javi"
+
+
+    @pytest.fixture()
+    def graph_queue(self, ptm, monkeypatch):
+        """Real status lookup (ARQ Job.status) against the fake Redis queues."""
+        monkeypatch.setattr(ptm, "_find_job", TaskManager._find_job.__get__(ptm))
+        return ptm.pool.zsets
+
+    @pytest.mark.asyncio
+    async def test_queued_graph_task_reports_queued_to_the_editor(
+        self, ptm, edit_service, graph_jobs, graph_queue, per_user_auth
+    ):
+        import time
+
+        client = TestClient(app)
+        resp = client.patch("/v1/memories/m1", json={"project_id": "bon002"}, headers=_bearer("robb"))
+        task_id = resp.json()["graph_task_id"]
+        # Waiting on the graph queue: not complete, not in progress.
+        graph_queue.setdefault(settings.graph_queue_name, {})[task_id] = time.time() * 1000 - 1000
+        mine = _poll(task_id, "robb")
+        assert mine.status_code == 200
+        assert mine.json()["status"] == "queued"
+        assert _poll(task_id, "mallory").status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_queue_status_accounting_is_unchanged(self, ptm, graph_queue, monkeypatch):
+        import time
+
+        task_id = await ptm.enqueue_graph_enrichment(
+            memory_id="m1", content="c", user_id="javi", requester_user_id="robb",
+        )
+        graph_queue.setdefault(settings.graph_queue_name, {})[task_id] = time.time() * 1000 - 1000
+        ptm.pool.zrevrangebyscore = AsyncMock(return_value=[task_id])
+        ptm.pool.zcard = AsyncMock(return_value=0)
+        out = await ptm.get_queue_status("robb")
+        # Counted over the same queues as before graph tasks became pollable.
+        assert out["counts"]["queued"] == 0
+        assert out["counts"]["expired"] == 1
+        assert (await ptm.get_status(task_id, include_graph=True))["status"] == "queued"

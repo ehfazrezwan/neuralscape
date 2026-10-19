@@ -527,7 +527,11 @@ async def _caller_task_status(request: Request, task_id: str) -> dict:
     token_user_id = getattr(request.state, "user_id", None)
     try:
         result = await _task_manager.get_status(
-            task_id, user_id=token_user_id, enforce_owner=bool(token_user_id)
+            task_id,
+            user_id=token_user_id,
+            enforce_owner=bool(token_user_id),
+            # Graph tasks (e.g. an edit's graph_task_id) report queued too.
+            include_graph=True,
         )
     except TaskStatusUnavailable:
         # Same answer for every id (owned, foreign or unknown); retryable.
@@ -1862,12 +1866,25 @@ async def _require_owned_connector(vault, connector_id: str, caller: str) -> dic
 
 @v1_router.post("/connectors", status_code=201)
 async def v1_register_connector(req: ConnectorConfigRequest, request: Request):
-    """Register (or replace) a data-layer connector instance. Secrets are encrypted at rest."""
+    """Register (or replace) a data-layer connector instance. Secrets are encrypted at rest.
+
+    A per-user caller can only replace a connector it owns: an id owned by
+    someone else answers the same 404 as the other connector routes, so it
+    neither takes the connector over nor reveals that the id exists. Without
+    a caller identity (shared key / auth disabled) a replacement may change
+    the owner; the vault then starts a new instance with fresh sync state.
+    """
+    from connectors.vault import ConnectorOwnedElsewhere
+
     vault = _require_vault()
     resolved_user_id = _resolve_user_id(request, None)
     record = req.model_dump(mode="json", exclude_none=True)
     record["owner_user_id"] = resolved_user_id
-    redacted = await vault.put(record)
+    per_user_caller = bool(getattr(request.state, "user_id", None))
+    try:
+        redacted = await vault.put(record, allow_owner_change=not per_user_caller)
+    except ConnectorOwnedElsewhere:
+        raise HTTPException(status_code=404, detail=f"Connector '{req.connector_id}' not found")
     return JSONResponse(status_code=201, content=redacted)
 
 
@@ -1893,8 +1910,10 @@ async def v1_delete_connector(connector_id: str, request: Request):
     """Delete one of the caller's connectors (does not remove ingested memories)."""
     vault = _require_vault()
     caller = _resolve_user_id(request, None)
-    await _require_owned_connector(vault, connector_id, caller)
-    removed = await vault.delete(connector_id)
+    rec = await _require_owned_connector(vault, connector_id, caller)
+    # Only the instance the owner check saw: a connector re-created in between
+    # (a new generation) is not removed.
+    removed = await vault.delete(connector_id, generation=rec.get("generation"))
     return {"status": "ok", "deleted": removed}
 
 
