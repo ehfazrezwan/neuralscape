@@ -113,8 +113,10 @@ def _get_memory():
             if _memory is None:
                 from mem0 import Memory
 
+                from memory.core import _memory_from_config
+
                 config = settings.get_mem0_config()
-                _memory = Memory.from_config(config)
+                _memory = _memory_from_config(Memory, config)
 
                 if hasattr(_memory, "graph") and hasattr(_memory.graph, "graphiti"):
                     _graphiti = _memory.graph.graphiti
@@ -142,8 +144,12 @@ def _get_async_memory():
     if _async_memory is None:
         from mem0 import AsyncMemory
 
+        from memory.core import _memory_from_config
+
+        # AsyncMemory.from_config is synchronous and builds the same sync
+        # Qdrant store as Memory, so the same cold-start handling applies.
         config = settings.get_mem0_config()
-        _async_memory = AsyncMemory.from_config(config)
+        _async_memory = _memory_from_config(AsyncMemory, config)
     return _async_memory
 
 
