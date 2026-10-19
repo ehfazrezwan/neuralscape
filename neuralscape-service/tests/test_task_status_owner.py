@@ -704,6 +704,90 @@ class TestConnectorSyncIdentity:
         await vault.update_sync_state(self.CID, cursor="stale", generation=old_generation)
         assert (await vault.get(self.CID))["cursor"] is None
 
+    async def _make_legacy(self, vault, owner):
+        """A record stored before generations existed: no ``generation`` field at all."""
+        import json as _json
+
+        from connectors.vault import _KEY_PREFIX
+
+        await vault.put({**self.BODY, "owner_user_id": owner})
+        key = _KEY_PREFIX + self.CID
+        raw = _json.loads(await vault._store.get(key))
+        raw.pop("generation", None)
+        await vault._store.set(key, _json.dumps(raw))
+        assert "generation" not in await vault._get_raw(self.CID)
+
+    @staticmethod
+    def _adapter(monkeypatch, cursor):
+        from unittest.mock import AsyncMock
+
+        import connectors.registry as registry
+
+        adapter = type("Adapter", (), {})()
+        adapter.list_resources = AsyncMock(return_value=([], cursor))
+        adapter.aclose = AsyncMock()
+        built = []
+        monkeypatch.setattr(registry, "build_adapter", lambda record: built.append(record) or adapter)
+        return adapter, built
+
+    @pytest.mark.asyncio
+    async def test_pre_upgrade_job_does_not_sync_a_replacement_connector(self, vault, monkeypatch):
+        """A job queued before generations (no generation argument) for a generationless
+        record must not run against the connector that replaced it."""
+        import worker
+
+        await self._make_legacy(vault, "alice")
+        await vault.delete(self.CID)
+        await vault.put({**self.BODY, "owner_user_id": "bob"})
+        replacement = await vault.get(self.CID)
+        assert replacement["generation"]
+        _, built = self._adapter(monkeypatch, "pre-upgrade-cursor")
+        out = await worker.process_connector_sync({"vault": vault, "service": object()}, self.CID)
+        assert out["skipped"] is True
+        assert built == []
+        after = await vault.get(self.CID)
+        assert after["cursor"] is None and after["generation"] == replacement["generation"]
+        assert after["owner_user_id"] == "bob"
+
+    @pytest.mark.asyncio
+    async def test_pre_upgrade_job_still_syncs_its_unchanged_generationless_connector(self, vault, monkeypatch):
+        """Positive control: a still-generationless record keeps syncing under a pre-upgrade job."""
+        import worker
+
+        await self._make_legacy(vault, "alice")
+        _, built = self._adapter(monkeypatch, "legacy-cursor")
+        out = await worker.process_connector_sync({"vault": vault, "service": object()}, self.CID)
+        assert out.get("skipped") in (None, 0) and len(built) == 1
+        assert (await vault.get(self.CID))["cursor"] == "legacy-cursor"
+
+    @pytest.mark.asyncio
+    async def test_job_enqueued_today_for_a_legacy_record_runs(self, vault, monkeypatch, arq):
+        """The API/cron path passes the record's (absent) generation explicitly and still runs."""
+        import worker
+
+        await self._make_legacy(vault, "alice")
+        _, built = self._adapter(monkeypatch, "c-now")
+        out = await worker.process_connector_sync({"vault": vault, "service": object()}, self.CID, None)
+        assert len(built) == 1 and (await vault.get(self.CID))["cursor"] == "c-now"
+
+    @pytest.mark.asyncio
+    async def test_pre_upgrade_job_id_and_grant_are_not_shared_with_the_replacement(self, vault, arq, per_user_auth, ptm):
+        """The pre-upgrade job id (sync-<id>) and its owner grant stay separate from the replacement's job."""
+        from task_manager import record_task_owner
+
+        client = TestClient(app)
+        legacy_id = f"sync-{self.CID}"
+        await record_task_owner(arq.pool, legacy_id, "alice")
+        arq.seen[legacy_id] = {}
+        arq.results[legacy_id] = {"owner": "alice"}
+        self._register(client, "bob")
+        new = self._sync(client, "bob")
+        arq.results[new] = {"owner": "bob"}
+        assert new != legacy_id
+        assert _poll(legacy_id, "bob").status_code == 404
+        assert _poll(new, "alice").status_code == 404
+        assert _poll(new, "bob").status_code == 200
+
     @pytest.mark.asyncio
     async def test_reregister_keeps_cursor_and_generation(self, vault):
         await vault.put({**self.BODY, "owner_user_id": "alice"})

@@ -1281,10 +1281,12 @@ async def process_connector_sync(
     for sources without a revision marker. Sync state (cursor + per-resource
     revisions + timestamp) is persisted back to the vault.
 
-    ``generation`` is the connector instance the job was enqueued for. When
-    the stored connector is a different instance (deleted and re-registered,
-    or re-registered by another owner, since the job was queued) the job
-    skips: the new instance has its own job id and syncs under it.
+    ``generation`` is the connector instance the job was enqueued for (``None``
+    for a record from before generations, and for jobs queued before this
+    argument existed). When the stored connector is a different instance
+    (deleted and re-registered, or re-registered by another owner, since the job
+    was queued) the job skips: the new instance has its own job id and syncs
+    under it.
     """
     from datetime import timezone
 
@@ -1297,7 +1299,10 @@ async def process_connector_sync(
     record = await vault.get(connector_id)
     if not record:
         return {"skipped": True, "reason": "connector not found"}
-    if generation is not None and record.get("generation") != generation:
+    # Literal equality: a job queued before generations existed carries ``None`` and runs only
+    # while the stored record is still generationless; once the connector was replaced (and so
+    # given a generation) that job skips instead of syncing the replacement under its old grant.
+    if record.get("generation") != generation:
         return {"skipped": True, "reason": "connector replaced since this sync was enqueued"}
     if not record.get("enabled", True):
         return {"skipped": True, "reason": "connector disabled"}
