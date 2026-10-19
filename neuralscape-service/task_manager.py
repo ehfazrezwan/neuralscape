@@ -102,7 +102,9 @@ class TaskManager:
         )
         logger.info("TaskManager connected to Redis")
 
-    async def _track_task(self, user_id: str | None, task_id: str) -> None:
+    async def _track_task(
+        self, user_id: str | None, task_id: str, *, grant_read: bool = True
+    ) -> None:
         """Best-effort per-caller task bookkeeping (C4 queue visibility).
 
         Records the task id in the caller's recent-tasks sorted set (read by
@@ -110,10 +112,16 @@ class TaskManager:
         queue.empty webhook hook). Trivial by design: two keys with a TTL of
         twice the status window — no per-status bookkeeping, statuses are
         still read from ARQ itself. Never blocks or fails an enqueue.
+
+        With ``grant_read`` (the default) ``user_id`` may also read the task's
+        status and result through a per-user token. Queue bookkeeping and the
+        read grant are separate: a task whose result is not ``user_id``'s
+        alone (a mixed-user batch) is counted for them without the grant.
         """
         if not user_id or self.pool is None:
             return
-        await self._record_owner(user_id, task_id)
+        if grant_read:
+            await self._record_owner(user_id, task_id)
         try:
             now = time.time()
             ttl = max(int(settings.queue_status_window_s) * 2, 600)
@@ -128,8 +136,9 @@ class TaskManager:
     async def _record_owner(self, user_id: str, task_id: str) -> None:
         """Record ``user_id`` as allowed to read ``task_id`` (see ``record_task_owner``).
 
-        A set, because a batch may carry items for several users (only possible
-        with the shared key, where the status read is not owner-checked).
+        A set, because one deterministic job id can be enqueued by several
+        users who each submitted that same work (for example two editors
+        making the same change to a shared memory).
         """
         await record_task_owner(self.pool, task_id, user_id)
 
@@ -398,24 +407,34 @@ class TaskManager:
         await self._track_task(payload.get("user_id"), task_id)
         return task_id
 
-    async def enqueue_connector_sync(self, connector_id: str, user_id: str | None = None) -> str:
+    async def enqueue_connector_sync(
+        self,
+        connector_id: str,
+        user_id: str | None = None,
+        *,
+        generation: str | None = None,
+    ) -> str:
         """Enqueue a connector sync task. Returns job_id.
 
-        Job id is keyed on the connector instance so overlapping syncs of the
-        same connector coalesce rather than stacking. Must match the id scheme
-        used by ``connector_sync_cron`` in worker.py (``sync-<connector_id>``)
-        so a cron-triggered and an API-triggered sync of the same connector
-        coalesce instead of racing on the cursor/revision state.
+        ``user_id`` is the connector's owner (who asked for the sync and may
+        poll it) and ``generation`` the vault record's instance identity. The
+        job id is derived from the connector id, owner and generation
+        (``connector_sync_job_id``), the same scheme ``connector_sync_cron`` in
+        worker.py uses, so overlapping cron and API syncs of one connector
+        instance coalesce on a single job instead of racing on the cursor,
+        while a connector deleted and re-registered (or registered by another
+        owner) under the same id gets a new job id: its syncs never share a
+        cached job, result or read grant with the previous instance.
         """
-        job_id = f"sync-{connector_id}"
+        job_id = connector_sync_job_id(connector_id, user_id, generation)
         job = await self.pool.enqueue_job(
             "process_connector_sync",
             connector_id,
+            generation,
             _job_id=job_id,
             _queue_name=settings.ingest_queue_name,
         )
         task_id = job_id if job is None else job.job_id
-        # ``user_id`` is the connector owner who asked for the sync, so they can poll it.
         await self._track_task(user_id, task_id)
         return task_id
 
@@ -442,9 +461,13 @@ class TaskManager:
             _job_id=job_id,
         )
         task_id = job_id if job is None else job.job_id
-        # Mixed-user batches are legal — track for every distinct writer.
-        for uid in {i.get("user_id") for i in items if i.get("user_id")}:
-            await self._track_task(uid, task_id)
+        # Mixed-user batches are legal (shared key only) and count in every
+        # writer's queue status. The result holds every item, so only a
+        # single-user batch grants that user a per-user read of it; a
+        # mixed-user batch stays readable only by shared-key callers.
+        writers = sorted({i.get("user_id") for i in items if i.get("user_id")})
+        for uid in writers:
+            await self._track_task(uid, task_id, grant_read=len(writers) == 1)
         return task_id
 
     async def enqueue_retag(self, caller_user_id: str, filters: dict, ops: dict) -> str:
@@ -477,8 +500,16 @@ class TaskManager:
         project_id: str | None = None,
         visibility: str | None = None,
         source_ref: dict | None = None,
+        requester_user_id: str | None = None,
     ) -> str:
         """Enqueue a graph re-ingest for an edited memory (graph queue). Returns job_id.
+
+        ``user_id`` is the memory's storage owner, which selects the graph
+        partition the job writes to. ``requester_user_id`` is the
+        authenticated user who made the edit and receives the task id; the
+        task is tracked for, and readable by, that user (falls back to
+        ``user_id`` when not given). On a shared memory the two differ when a
+        teammate makes an allowed edit.
 
         Used by the memory-edit paths: after a content change or a
         project/visibility partition migration, the memory's content must be
@@ -505,7 +536,7 @@ class TaskManager:
             _queue_name=settings.graph_queue_name,
         )
         task_id = job_id if job is None else job.job_id
-        await self._track_task(user_id, task_id)
+        await self._track_task(requester_user_id or user_id, task_id)
         return task_id
 
     def _candidate_queues(self) -> list[str]:
@@ -668,6 +699,23 @@ class TaskManager:
         if self.pool:
             await self.pool.aclose()
             logger.info("TaskManager disconnected from Redis")
+
+
+def connector_sync_job_id(
+    connector_id: str, owner_user_id: str | None, generation: str | None
+) -> str:
+    """ARQ job id for a sync of one connector instance.
+
+    Shared by ``TaskManager.enqueue_connector_sync`` and the worker's
+    ``connector_sync_cron`` so both coalesce on the same job. The owner and
+    the vault record's ``generation`` are part of the id, so a connector
+    deleted and re-registered, or registered by another owner, under the
+    same ``connector_id`` never reuses the previous instance's job.
+    """
+    instance = hashlib.sha256(
+        "\x1f".join([owner_user_id or "", generation or ""]).encode()
+    ).hexdigest()[:16]
+    return f"sync-{connector_id}-{instance}"
 
 
 def _generate_job_id(content: str, user_id: str) -> str:

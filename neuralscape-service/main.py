@@ -1903,8 +1903,10 @@ async def v1_sync_connector(connector_id: str, request: Request):
     """Trigger an immediate sync for one of the caller's connectors."""
     vault = _require_vault()
     caller = _resolve_user_id(request, None)
-    await _require_owned_connector(vault, connector_id, caller)
-    task_id = await _task_manager.enqueue_connector_sync(connector_id, user_id=caller)
+    rec = await _require_owned_connector(vault, connector_id, caller)
+    task_id = await _task_manager.enqueue_connector_sync(
+        connector_id, user_id=caller, generation=rec.get("generation")
+    )
     return TaskAcceptedResponse(task_id=task_id, poll_url=f"/v1/memories/status/{task_id}")
 
 
@@ -2984,7 +2986,11 @@ async def v1_patch_memory(memory_id: str, req: PatchMemoryRequest, request: Requ
     graph_task_id = None
     if result.get("graph_job"):
         try:
-            graph_task_id = await _task_manager.enqueue_graph_enrichment(**result["graph_job"])
+            # The job writes to the storage owner's graph partition; the
+            # task id goes to (and is readable by) the caller who edited.
+            graph_task_id = await _task_manager.enqueue_graph_enrichment(
+                **result["graph_job"], requester_user_id=caller
+            )
             graph = graph.replace("_pending", "_queued")
         except Exception as e:
             # Never run Graphiti inline on a request thread — report honestly instead.

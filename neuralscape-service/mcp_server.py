@@ -2224,8 +2224,9 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
             graph_task_id = None
             if result.get("graph_job"):
                 try:
+                    # Storage owner's partition; the editor polls the task.
                     graph_task_id = await _task_manager.enqueue_graph_enrichment(
-                        **result["graph_job"]
+                        **result["graph_job"], requester_user_id=user_id
                     )
                     graph = graph.replace("_pending", "_queued")
                 except Exception as e:

@@ -176,16 +176,21 @@ class TestOwnerRecording:
         assert tm.pool.ttls[_task_owner_key(task_id)] >= 24 * 3600 + 3600
 
     @pytest.mark.asyncio
-    async def test_batch_records_every_writer(self, tm):
-        task_id = await tm.enqueue_raw_batch([
+    async def test_batch_grants_only_a_single_writer(self, tm):
+        single = await tm.enqueue_raw_batch([
+            {"content": "a", "user_id": "alice", "category": "decision"},
+            {"content": "b", "user_id": "alice", "category": "decision"},
+        ])
+        mixed = await tm.enqueue_raw_batch([
             {"content": "a", "user_id": "alice", "category": "decision"},
             {"content": "b", "user_id": "bob", "category": "decision"},
         ])
-        assert tm.pool.sets[_task_owner_key(task_id)] == {"alice", "bob"}
+        assert tm.pool.sets[_task_owner_key(single)] == {"alice"}
+        assert _task_owner_key(mixed) not in tm.pool.sets
 
     @pytest.mark.asyncio
     async def test_connector_sync_records_requesting_owner(self, tm):
-        task_id = await tm.enqueue_connector_sync("notion-1", user_id="alice")
+        task_id = await tm.enqueue_connector_sync("notion-1", user_id="alice", generation="g1")
         assert await tm.is_task_owner(task_id, "alice")
         assert not await tm.is_task_owner(task_id, "bob")
 
@@ -448,3 +453,359 @@ class TestDreamSweepTasks:
         task_id = json.loads(result[0].text)["job_id"]
         assert await ptm.is_task_owner(task_id, "alice")
         assert not await ptm.is_task_owner(task_id, "bob")
+
+
+# ── Read grants are separate from queue bookkeeping ──────────────────────────
+
+
+def _shared_key_auth(monkeypatch):
+    """Shared key and per-user tokens both accepted (a mixed deployment)."""
+    monkeypatch.setattr(settings, "neuralscape_user_token_secret", SECRET)
+    monkeypatch.setattr(settings, "neuralscape_api_key", SHARED_KEY)
+    return {"Authorization": f"Bearer {SHARED_KEY}"}
+
+
+class TestMixedUserBatch:
+    """A batch spanning several users grants no per-user read of its result."""
+
+    MIXED_RESULT = {
+        "memories": [
+            {"id": "m-a", "memory": "alice private text", "user_id": "alice"},
+            {"id": "m-b", "memory": "bob private text", "user_id": "bob"},
+        ]
+    }
+
+    @pytest.fixture()
+    def batch_tm(self, ptm, monkeypatch):
+        async def find_job(task_id):
+            return FakeJob(self.MIXED_RESULT), ptm.known.get(task_id, JobStatus.not_found)
+
+        monkeypatch.setattr(ptm, "_find_job", find_job)
+        return ptm
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("route", ROUTES)
+    async def test_shared_key_mixed_batch_is_not_readable_per_user(self, batch_tm, monkeypatch, route):
+        shared = _shared_key_auth(monkeypatch)
+        client = TestClient(app)
+        resp = client.post(
+            "/v1/memories/raw/batch",
+            json={"memories": [
+                {"content": "alice private text", "user_id": "alice", "category": "decision"},
+                {"content": "bob private text", "user_id": "bob", "category": "decision"},
+            ]},
+            headers=shared,
+        )
+        assert resp.status_code == 202
+        task_id = resp.json()["task_id"]
+        batch_tm.known[task_id] = JobStatus.complete
+        unknown = client.get(route.format("ns-does-not-exist"), headers=_bearer("alice"))
+        for user in ("alice", "bob", "carol"):
+            poll = client.get(route.format(task_id), headers=_bearer(user))
+            assert poll.status_code == 404
+            assert "private text" not in poll.text
+            assert poll.json()["detail"].replace(task_id, "X") == unknown.json()["detail"].replace(
+                "ns-does-not-exist", "X"
+            )
+        # The shared key, which may write and read as any user, still reads it.
+        assert client.get(route.format(task_id), headers=shared).json()["result"] == self.MIXED_RESULT
+
+    @pytest.mark.asyncio
+    async def test_mixed_batch_still_tracked_for_every_writer(self, batch_tm):
+        task_id = await batch_tm.enqueue_raw_batch([
+            {"content": "a", "user_id": "alice", "category": "decision"},
+            {"content": "b", "user_id": "bob", "category": "decision"},
+        ])
+        assert _task_owner_key(task_id) not in batch_tm.pool.sets
+        for user in ("alice", "bob"):
+            assert task_id in batch_tm.pool.zsets[f"ns:user-tasks:{user}"]
+
+    @pytest.mark.asyncio
+    async def test_mixed_batch_job_id_is_deterministic(self, batch_tm):
+        items = [
+            {"content": "a", "user_id": "alice", "category": "decision"},
+            {"content": "b", "user_id": "bob", "category": "decision"},
+        ]
+        assert await batch_tm.enqueue_raw_batch(items) == await batch_tm.enqueue_raw_batch(list(items))
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("route", ROUTES)
+    async def test_single_user_batch_pollable_by_its_user(self, batch_tm, per_user_auth, route):
+        client = TestClient(app)
+        resp = client.post(
+            "/v1/memories/raw/batch",
+            json={"memories": [
+                {"content": "one", "category": "decision"},
+                {"content": "two", "category": "decision"},
+            ]},
+            headers=_bearer("alice"),
+        )
+        assert resp.status_code == 202
+        task_id = resp.json()["task_id"]
+        batch_tm.known[task_id] = JobStatus.complete
+        assert client.get(route.format(task_id), headers=_bearer("alice")).status_code == 200
+        assert client.get(route.format(task_id), headers=_bearer("bob")).status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_shared_key_single_user_batch_granted_to_that_user(self, batch_tm, monkeypatch):
+        shared = _shared_key_auth(monkeypatch)
+        resp = TestClient(app).post(
+            "/v1/memories/raw/batch",
+            json={"memories": [{"content": "one", "user_id": "alice", "category": "decision"}]},
+            headers=shared,
+        )
+        task_id = resp.json()["task_id"]
+        assert await batch_tm.is_task_owner(task_id, "alice")
+        assert not await batch_tm.is_task_owner(task_id, "bob")
+
+
+# ── Connector sync identity follows the connector instance and its owner ────
+
+
+class _VaultStore:
+    """In-memory async KV with the redis methods ConnectorVault uses."""
+
+    def __init__(self):
+        self.d: dict[str, str] = {}
+
+    async def set(self, k, v):
+        self.d[k] = v
+
+    async def get(self, k):
+        return self.d.get(k)
+
+    async def delete(self, k):
+        return 1 if self.d.pop(k, None) is not None else 0
+
+    async def keys(self, pattern):
+        import fnmatch
+
+        return [k for k in self.d if fnmatch.fnmatch(k, pattern)]
+
+
+class TestConnectorSyncIdentity:
+    CID = "notion-shared-name"
+    BODY = {"connector_id": CID, "connector_type": "notion", "credentials": {"token": "t"}}
+
+    @pytest.fixture()
+    def vault(self, monkeypatch):
+        from cryptography.fernet import Fernet
+
+        from connectors.vault import ConnectorVault
+
+        v = ConnectorVault(_VaultStore(), Fernet(Fernet.generate_key()))
+        monkeypatch.setattr(main, "_vault", v)
+        return v
+
+    @pytest.fixture()
+    def arq(self, ptm, monkeypatch):
+        """ARQ enqueue semantics: an id with a queued or retained job returns None."""
+        seen: dict[str, dict] = {}
+        results: dict[str, dict] = {}
+
+        async def enqueue_job(fn, *args, _job_id=None, **kw):
+            if _job_id in seen:
+                return None
+            seen[_job_id] = {"fn": fn, "args": args, **kw}
+            return MagicMock(job_id=_job_id)
+
+        async def find_job(task_id):
+            if task_id not in seen:
+                return FakeJob(None), JobStatus.not_found
+            return FakeJob(results.get(task_id)), JobStatus.complete
+
+        ptm.pool.enqueue_job = enqueue_job
+        monkeypatch.setattr(ptm, "_find_job", find_job)
+        ptm.seen, ptm.results = seen, results
+        return ptm
+
+    def _register(self, client, user):
+        assert client.post("/v1/connectors", json=self.BODY, headers=_bearer(user)).status_code == 201
+
+    def _sync(self, client, user):
+        resp = client.post(f"/v1/connectors/{self.CID}/sync", headers=_bearer(user))
+        assert resp.status_code == 202
+        return resp.json()["task_id"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("change", ["delete_recreate", "reassign"])
+    @pytest.mark.parametrize("old_job", ["cached", "expired"])
+    async def test_owner_change_gives_disjoint_jobs(self, vault, arq, per_user_auth, change, old_job):
+        client = TestClient(app)
+        self._register(client, "alice")
+        old = self._sync(client, "alice")
+        arq.results[old] = {"owner": "alice"}
+        if old_job == "expired":
+            # The old result aged out of ARQ; the id is free again.
+            del arq.seen[old]
+        if change == "delete_recreate":
+            assert client.delete(f"/v1/connectors/{self.CID}", headers=_bearer("alice")).status_code == 200
+        self._register(client, "bob")
+        new = self._sync(client, "bob")
+        arq.results[new] = {"owner": "bob"}
+
+        assert new != old
+        if old_job == "cached":
+            assert _poll(old, "alice").json()["result"] == {"owner": "alice"}
+        assert _poll(new, "bob").json()["result"] == {"owner": "bob"}
+        # Neither owner can read the other's sync.
+        assert _poll(old, "bob").status_code == 404
+        assert _poll(new, "alice").status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_same_owner_recreate_gets_a_fresh_job(self, vault, arq, per_user_auth):
+        client = TestClient(app)
+        self._register(client, "alice")
+        old = self._sync(client, "alice")
+        assert client.delete(f"/v1/connectors/{self.CID}", headers=_bearer("alice")).status_code == 200
+        self._register(client, "alice")
+        assert self._sync(client, "alice") != old
+
+    @pytest.mark.asyncio
+    async def test_api_and_cron_coalesce_on_one_job(self, vault, arq, per_user_auth, monkeypatch):
+        import worker
+
+        client = TestClient(app)
+        self._register(client, "alice")
+        # Re-registering the same instance (same owner) keeps its identity.
+        self._register(client, "alice")
+        monkeypatch.setattr(settings, "connectors_enabled", True)
+        out = await worker.connector_sync_cron({"vault": vault, "redis": arq.pool})
+        assert out["enqueued"] == 1
+        (cron_id,) = arq.seen
+        api_id = self._sync(client, "alice")
+        assert api_id == cron_id
+        assert len(arq.seen) == 1
+        # The owner who asked can poll the coalesced job; nobody else can.
+        assert _poll(api_id, "alice").status_code == 200
+        assert _poll(api_id, "bob").status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_stale_job_does_not_sync_a_replaced_connector(self, vault, monkeypatch):
+        """A job enqueued for a previous instance skips, and never moves the new cursor."""
+        import worker
+
+        await vault.put({**self.BODY, "owner_user_id": "alice"})
+        old_generation = (await vault.get(self.CID))["generation"]
+        await vault.delete(self.CID)
+        await vault.put({**self.BODY, "owner_user_id": "bob"})
+        out = await worker.process_connector_sync({"vault": vault}, self.CID, old_generation)
+        assert out["skipped"] is True
+        await vault.update_sync_state(self.CID, cursor="stale", generation=old_generation)
+        assert (await vault.get(self.CID))["cursor"] is None
+
+    @pytest.mark.asyncio
+    async def test_reregister_keeps_cursor_and_generation(self, vault):
+        await vault.put({**self.BODY, "owner_user_id": "alice"})
+        first = await vault.get(self.CID)
+        await vault.update_sync_state(self.CID, cursor="c1", generation=first["generation"])
+        await vault.put({**self.BODY, "owner_user_id": "alice", "generation": "forged"})
+        again = await vault.get(self.CID)
+        assert again["cursor"] == "c1"
+        assert again["generation"] == first["generation"]
+
+
+# ── Graph tasks from an edit belong to the user who made the edit ───────────
+
+
+class TestSharedEditGraphTask:
+    """A non-owner's allowed edit of a shared memory: the editor polls its graph task."""
+
+    @pytest.fixture()
+    def edit_service(self, monkeypatch):
+        from types import SimpleNamespace
+
+        from memory_service import MemoryService
+
+        svc = MemoryService()
+        svc._memory = MagicMock(name="Memory")
+        svc._graphiti = None
+        svc._bridge = None
+        svc._memory.vector_store.get.return_value = SimpleNamespace(
+            id="m1",
+            payload={
+                "data": "Team decision text",
+                "hash": "h",
+                "created_at": "2026-01-01T00:00:00+00:00",
+                "user_id": "javi",
+                "metadata": {
+                    "scope": "project", "category": "decision", "project_id": "neuralscape",
+                    "owner_user_id": "javi", "visibility": "shared",
+                },
+            },
+        )
+        svc.get_memory = MagicMock(return_value=None)
+        svc._cascade_or_fallback_expire = MagicMock(return_value={"resolved": True})
+        monkeypatch.setattr(main, "_service", svc)
+        return svc
+
+    @pytest.fixture()
+    def graph_jobs(self, ptm):
+        calls = []
+
+        async def enqueue_job(fn, *args, _job_id=None, **kw):
+            calls.append((fn, args))
+            return MagicMock(job_id=_job_id)
+
+        ptm.pool.enqueue_job = enqueue_job
+        return calls
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("method", ["patch", "put"])
+    async def test_editor_polls_graph_task_others_cannot(self, ptm, edit_service, graph_jobs, per_user_auth, method):
+        client = TestClient(app)
+        resp = getattr(client, method)(
+            "/v1/memories/m1", json={"project_id": "bon002"}, headers=_bearer("robb")
+        )
+        assert resp.status_code == 200, resp.text
+        task_id = resp.json()["graph_task_id"]
+        assert task_id
+        # The graph job still targets the storage owner's partition.
+        ((fn, args),) = graph_jobs
+        assert fn == "process_graph_enrichment"
+        assert args[2] == "javi" and args[3] == "bon002" and args[4] == "shared"
+        ptm.known[task_id] = JobStatus.complete
+        assert _poll(task_id, "robb").status_code == 200
+        assert _poll(task_id, "mallory").status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_shared_key_edit_grants_the_body_user(self, ptm, edit_service, graph_jobs, monkeypatch):
+        shared = _shared_key_auth(monkeypatch)
+        client = TestClient(app)
+        resp = client.patch(
+            "/v1/memories/m1", json={"project_id": "bon002", "user_id": "robb"}, headers=shared
+        )
+        task_id = resp.json()["graph_task_id"]
+        ptm.known[task_id] = JobStatus.complete
+        assert client.get(f"/v1/memories/status/{task_id}", headers=shared).status_code == 200
+        assert _poll(task_id, "robb").status_code == 200
+        assert _poll(task_id, "mallory").status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_mcp_editor_owns_graph_task(self, ptm, graph_jobs, monkeypatch):
+        import json
+
+        import mcp_server
+        from auth import current_user_id
+
+        svc = MagicMock()
+        svc.patch_memory.return_value = {
+            "memory": None,
+            "graph": "migration_pending",
+            "graph_job": {
+                "memory_id": "m1", "content": "Team decision text", "user_id": "javi",
+                "project_id": "bon002", "visibility": "shared", "source_ref": None,
+            },
+        }
+        monkeypatch.setattr(mcp_server, "_service", svc)
+        monkeypatch.setattr(mcp_server, "_task_manager", ptm)
+        token = current_user_id.set("robb")
+        try:
+            result = await mcp_server.call_tool("edit_memory", {"memory_id": "m1", "project_id": "bon002"})
+        finally:
+            current_user_id.reset(token)
+        task_id = json.loads(result[0].text)["graph_task_id"]
+        assert await ptm.is_task_owner(task_id, "robb")
+        assert not await ptm.is_task_owner(task_id, "mallory")
+        ((fn, args),) = graph_jobs
+        assert args[2] == "javi"

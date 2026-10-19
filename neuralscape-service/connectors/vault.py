@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import logging
+import uuid
 from typing import Any
 
 from cryptography.fernet import Fernet
@@ -75,11 +76,27 @@ class ConnectorVault:
 
         Preserves an existing sync cursor / last_synced_at when the caller
         doesn't supply them (re-registering shouldn't reset sync progress).
+
+        ``generation`` identifies this connector instance and is assigned
+        here, never taken from the caller: re-registering an existing
+        connector with the same owner keeps it, while a new connector (also
+        one re-created after a delete) or an owner change gets a fresh one.
+        Sync job ids and status grants are bound to it, and a sync started
+        for an older generation does not run or write its cursor.
         """
         connector_id = record["connector_id"]
         existing = await self._get_raw(connector_id)
 
         stored = dict(record)
+        stored.pop("generation", None)
+        if (
+            existing
+            and existing.get("generation")
+            and existing.get("owner_user_id") == stored.get("owner_user_id")
+        ):
+            stored["generation"] = existing["generation"]
+        else:
+            stored["generation"] = uuid.uuid4().hex
         creds = stored.pop(_SECRET_FIELD, None) or {}
         stored["credentials_enc"] = self._encrypt(creds)
         # Carry sync state forward unless explicitly overridden.
@@ -136,10 +153,18 @@ class ConnectorVault:
         cursor: str | None = None,
         last_synced_at: str | None = None,
         revisions: dict | None = None,
+        generation: str | None = None,
     ) -> None:
-        """Persist sync progress (cursor, timestamp, per-resource revisions)."""
+        """Persist sync progress (cursor, timestamp, per-resource revisions).
+
+        With ``generation`` (the instance the sync read), nothing is written
+        when the stored connector is a different instance, so a sync that
+        overlapped a delete/re-register cannot move the new instance's cursor.
+        """
         raw = await self._get_raw(connector_id)
         if raw is None:
+            return
+        if generation is not None and raw.get("generation") != generation:
             return
         if cursor is not None:
             raw["cursor"] = cursor
