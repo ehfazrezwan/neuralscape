@@ -459,3 +459,104 @@ describe("offset file: one atomic write", () => {
     expect(requests.length).toBe(before);
   });
 });
+
+// ── A compaction in the middle of a turn, and a transcript that mixes both shapes ──
+
+const FLAT = (i: number) => [
+  { type: "user", content: `flattened prompt number ${i} with plenty of text to keep` },
+  { type: "assistant", content: `flattened answer number ${i} with plenty of text to keep` },
+];
+const preCompact = (path: string, dir: string) =>
+  runHook("pre-compact.js", JSON.stringify({ session_id: SESSION, transcript_path: path, cwd: dir, hook_event_name: "PreCompact", trigger: "auto" }));
+const stop = (path: string, dir: string) =>
+  runHook("session-end.js", JSON.stringify({ session_id: SESSION, transcript_path: path, cwd: dir, hook_event_name: "Stop" }));
+const append = (path: string, entries: unknown[]) =>
+  readFile(path, "utf-8").then((old) => writeFile(path, old + entries.map((e) => JSON.stringify(e)).join("\n") + "\n", "utf-8"));
+
+describe("PreCompact in the middle of a turn", () => {
+  const MID = (): unknown[] => [user(PROMPT_ONE), assistant(text(FIRST_TEXT), toolUse), toolResultEntry()];
+
+  it("PreCompact → continuation → Stop delivers the whole turn exactly once", async () => {
+    const { path, dir } = await transcript(MID());
+    await preCompact(path, dir);
+    expect(flushes().length).toBe(0); // the running turn is withheld
+    await expect(readFile(path + ".neuralscape-offset", "utf-8")).rejects.toThrow(); // and nothing is committed past its prompt
+    await append(path, [assistant(text(SECOND_TEXT))]);
+    await stop(path, dir);
+    expect(flushes().length).toBe(1);
+    expect(flushes()[0].body.user_message).toBe(PROMPT_ONE);
+    expect(flushes()[0].body.assistant_response).toBe(`${FIRST_TEXT}\n${SECOND_TEXT}`);
+    await stop(path, dir);
+    expect(flushes().length).toBe(1); // exactly once
+  });
+
+  it("delivers the finished turns before it and keeps the offset at the running turn's prompt", async () => {
+    const entries = [user(PROMPT_ONE), assistant(text(SECOND_TEXT)), user(PROMPT_TWO), assistant(text(FIRST_TEXT), toolUse), toolResultEntry()];
+    const { path, dir } = await transcript(entries);
+    await preCompact(path, dir);
+    expect(flushes().map((q) => q.body.user_message)).toEqual([PROMPT_ONE]);
+    expect(await offsetOf(path)).toBe(2);
+    await append(path, [assistant(text(THIRD_TEXT))]);
+    await stop(path, dir);
+    expect(flushes().map((q) => q.body.user_message)).toEqual([PROMPT_ONE, PROMPT_TWO]);
+    expect(flushes()[1].body.assistant_response).toBe(`${FIRST_TEXT}\n${THIRD_TEXT}`);
+  });
+
+  it("a turn that ends on an assistant entry calling a tool (result not written yet) is withheld too", async () => {
+    const { raw } = await transcript([user(PROMPT_ONE), assistant(text(FIRST_TEXT), toolUse)]);
+    expect(await extractClaudeCodeTurns({ ...raw, hook_event_name: "PreCompact" })).toEqual([]);
+    const flagged = await transcript([user(PROMPT_ONE), { ...assistant(text(FIRST_TEXT)), message: { role: "assistant", stop_reason: "tool_use", content: [text(FIRST_TEXT)] } }]);
+    expect(await extractClaudeCodeTurns({ ...flagged.raw, hook_event_name: "PreCompact" })).toEqual([]);
+  });
+
+  it("a finished turn is still delivered by PreCompact (the snapshot keeps its prompt) and not again by Stop", async () => {
+    const { path, dir } = await transcript([user(PROMPT_ONE), assistant(text(FIRST_TEXT), toolUse), toolResultEntry(), assistant(text(SECOND_TEXT))]);
+    await preCompact(path, dir);
+    expect(flushes().length).toBe(1);
+    expect(String(requests.find((q) => q.path.includes("/v1/memories/raw"))?.body.content)).toContain(PROMPT_ONE);
+    await stop(path, dir);
+    expect(flushes().length).toBe(1);
+  });
+
+  it("the Stop event always delivers what the transcript holds (the turn has ended)", async () => {
+    const { raw } = await transcript(MID());
+    expect((await extractClaudeCodeTurns({ ...raw, hook_event_name: "Stop" })).length).toBe(1);
+  });
+});
+
+describe("a legacy offset over a mixed-shape transcript", () => {
+  it("recovers the real-shape turn and never replays a flattened turn the previous reader delivered", async () => {
+    const entries = [...FLAT(1), user(PROMPT_ONE), assistant(text(SECOND_TEXT)), ...FLAT(2)];
+    const { path, raw } = await transcript(entries);
+    await writeFile(path + ".neuralscape-offset", String(entries.length), "utf-8"); // what the previous reader left
+    const turns = await extractClaudeCodeTurns(raw);
+    expect(turns.map((t) => t.userMessage)).toEqual([PROMPT_ONE]);
+    await commitClaudeCodeFlush(raw, await flushTurns(turns));
+    expect(await markerOf(path)).toBe("v2");
+    expect(await extractClaudeCodeTurns(raw)).toEqual([]);
+  });
+
+  it("a flattened turn between two lost real-shape turns is skipped, both lost turns return", async () => {
+    const entries = [user(PROMPT_ONE), assistant(text(SECOND_TEXT)), ...FLAT(1), user(PROMPT_TWO), assistant(text(THIRD_TEXT))];
+    const { path, raw } = await transcript(entries);
+    await writeFile(path + ".neuralscape-offset", String(entries.length), "utf-8");
+    expect((await extractClaudeCodeTurns(raw)).map((t) => t.userMessage)).toEqual([PROMPT_ONE, PROMPT_TWO]);
+  });
+
+  it("turns after the original cursor are delivered as usual, next to the recovered ones", async () => {
+    const before = [...FLAT(1), user(PROMPT_ONE), assistant(text(SECOND_TEXT))];
+    const { path, raw } = await transcript([...before, ...FLAT(2)]);
+    await writeFile(path + ".neuralscape-offset", String(before.length), "utf-8");
+    expect((await extractClaudeCodeTurns(raw)).map((t) => t.userMessage)).toEqual([PROMPT_ONE, "flattened prompt number 2 with plenty of text to keep"]);
+  });
+
+  it("the Stop hook sends the lost turn once and no flattened turn", async () => {
+    const entries = [...FLAT(1), user(PROMPT_ONE), assistant(text(SECOND_TEXT)), ...FLAT(2)];
+    const { path, dir } = await transcript(entries);
+    await writeFile(path + ".neuralscape-offset", String(entries.length), "utf-8");
+    await stop(path, dir);
+    expect(flushes().map((q) => q.body.user_message)).toEqual([PROMPT_ONE]);
+    await stop(path, dir);
+    expect(flushes().length).toBe(1);
+  });
+});

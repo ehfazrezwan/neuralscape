@@ -51,7 +51,7 @@ type ContentBlocks = string | Array<{ type?: string; text?: string }>;
 interface TranscriptMessage {
   type?: string; // "user" | "assistant" | "system" | "summary" | ...
   content?: ContentBlocks;
-  message?: { role?: string; content?: ContentBlocks };
+  message?: { role?: string; content?: ContentBlocks; stop_reason?: string | null };
   role?: string;
   isSidechain?: boolean;
   isMeta?: boolean;
@@ -164,24 +164,56 @@ function relevantMessages(content: string): TranscriptMessage[] {
   });
 }
 
+/** Entries that are not part of the user's conversation (see ``extractText``): skipped when judging how a transcript ends. */
+function isConversationEntry(msg: TranscriptMessage): boolean {
+  return !(msg.isMeta === true || msg.isSidechain === true || msg.isCompactSummary === true || msg.isVisibleInTranscriptOnly === true);
+}
+
+/**
+ * Whether the transcript currently ends in the middle of a turn: its last conversation entry is a tool result
+ * (the assistant has yet to continue) or an assistant entry that calls a tool (or says it stopped to use one).
+ * A PreCompact hook can fire in that state; the turn is then not finished, so it must not be delivered yet.
+ */
+function endsMidTurn(content: string): boolean {
+  const entries = relevantMessages(content).filter(isConversationEntry);
+  const last = entries[entries.length - 1];
+  if (last === undefined) return false;
+  const role = roleOf(last) ?? last.message?.role;
+  if (role === "user") return !extractText(last); // a tool result: the answer has not come yet
+  const blocks = last.message?.content ?? last.content;
+  const callsTool = Array.isArray(blocks) && blocks.some((block) => block && block.type === "tool_use");
+  return callsTool || last.message?.stop_reason === "tool_use";
+}
+
+interface ParsedTurn {
+  user: string;
+  assistant: string;
+  endOffset: number;
+  /** Index (in the user/assistant entry list) of the prompt that opens the turn. */
+  userIndex: number;
+}
+
 /**
  * Parse a transcript file into user/assistant turns.
  *
  * A turn is one real user prompt (an entry with text; a user entry that only carries tool results has none and
- * does not end a turn) and every assistant text entry up to the next real user prompt. Entries without text
+ * does not end a turn) and every assistant text entry up to the next real prompt. Entries without text
  * (thinking, tool calls, tool results) are skipped for pairing but still count as positions, so offsets stay
  * comparable with those written before. The returned `newOffset` never passes a user prompt that has no
- * assistant text yet: it stays unread and is picked up by the next flush.
+ * assistant text yet: it stays unread and is picked up by the next flush. With ``withholdTrailing`` the last
+ * turn is kept pending even when it already has assistant text (the turn is still running): its prompt stays
+ * unread, and the whole turn is delivered once, when it has finished.
  */
 function parseTranscript(
   content: string,
-  startOffset: number
+  startOffset: number,
+  options: { withholdTrailing?: boolean } = {}
 ): {
-  turns: Array<{ user: string; assistant: string; endOffset: number }>;
+  turns: ParsedTurn[];
   newOffset: number;
 } {
   const window = relevantMessages(content).slice(startOffset);
-  const turns: Array<{ user: string; assistant: string; endOffset: number }> = [];
+  const turns: ParsedTurn[] = [];
   let user: { text: string; index: number } | null = null;
   let assistantParts: string[] = [];
 
@@ -192,7 +224,7 @@ function parseTranscript(
     if (!text) return;
     if (role === "user") {
       if (user && assistantParts.length > 0) {
-        turns.push({ user: user.text, assistant: assistantParts.join("\n"), endOffset: absolute });
+        turns.push({ user: user.text, assistant: assistantParts.join("\n"), endOffset: absolute, userIndex: user.index });
       }
       user = { text, index: absolute };
       assistantParts = [];
@@ -205,13 +237,25 @@ function parseTranscript(
   let newOffset = windowEnd;
   if (user) {
     const pending: { text: string; index: number } = user;
-    if (assistantParts.length > 0) {
-      turns.push({ user: pending.text, assistant: assistantParts.join("\n"), endOffset: windowEnd });
+    if (assistantParts.length > 0 && !options.withholdTrailing) {
+      turns.push({ user: pending.text, assistant: assistantParts.join("\n"), endOffset: windowEnd, userIndex: pending.index });
     } else {
-      newOffset = pending.index; // an unanswered prompt is not consumed
+      newOffset = pending.index; // an unanswered (or still running) turn is not consumed
     }
   }
   return { turns, newOffset };
+}
+
+/**
+ * Whether the previous reader delivered this turn: it paired a prompt with the answer entry that follows it,
+ * both read through a top-level ``content``. A turn with any text it could not see was dropped as empty.
+ */
+function legacyDelivered(content: string, turn: ParsedTurn): boolean {
+  const entries = relevantMessages(content);
+  for (let i = turn.userIndex; i < Math.min(turn.endOffset, entries.length); i++) {
+    if (extractText(entries[i]) && !legacyText(entries[i])) return false;
+  }
+  return true;
 }
 
 /**
@@ -267,7 +311,16 @@ export async function extractClaudeCodeTurns(
       if (offset > 0 && !stored.tagged) {
         offset = legacyRewindOffset(content, offset);
       }
-      const { turns, newOffset } = parseTranscript(content, offset);
+      const rewound = offset < stored.offset;
+      const parsed = parseTranscript(content, offset, {
+        withholdTrailing: raw.hook_event_name === "PreCompact" && endsMidTurn(content),
+      });
+      // Recovery before the original cursor is only for turns the previous reader could NOT deliver; a turn it
+      // delivered (a flattened one in a mixed transcript) is never replayed. Turns after the cursor are unchanged.
+      const turns = rewound
+        ? parsed.turns.filter((t) => t.endOffset > stored.offset || !legacyDelivered(content, t))
+        : parsed.turns;
+      const newOffset = parsed.newOffset;
 
       if (turns.length > 0) {
         // Stage per-turn offsets; commitClaudeCodeFlush() persists a cursor
@@ -327,7 +380,7 @@ export async function extractAllTurnPairs(
   if (!transcriptPath) return [];
   try {
     const content = await readFile(transcriptPath, "utf-8");
-    return parseTranscript(content, 0).turns;
+    return parseTranscript(content, 0).turns.map(({ user, assistant }) => ({ user, assistant }));
   } catch (error) {
     logError("Failed to read transcript for session summary", error);
     return [];
