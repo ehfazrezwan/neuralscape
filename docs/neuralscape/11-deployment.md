@@ -105,6 +105,25 @@ All settings live in `neuralscape-service/config.py` as a Pydantic `BaseSettings
 
 `get_mem0_config()` (`config.py:79`) assembles the dict mem0 expects (LLM/embedder/vector_store/graph_store). `parse_redis_settings()` (`config.py:138`) turns `REDIS_URL` into ARQ's `RedisSettings` with sensible reconnect defaults. See [06-storage-backends](./06-storage-backends.md) for what each provider expects.
 
+### Third-party library telemetry (off by default)
+
+The vendored mem0 and Graphiti libraries each ship with anonymous usage telemetry enabled by default, which sends events to an external analytics host. Neuralscape turns both off unless the operator opts in:
+
+| Env var | Library | Shipped default | Opt in |
+|---------|---------|-----------------|--------|
+| `MEM0_TELEMETRY` | mem0 (read once, when mem0 is first imported) | `false` | `true` |
+| `GRAPHITI_TELEMETRY_ENABLED` | Graphiti (read on every event) | `false` | `true` |
+
+The default is applied in three layers, and each one respects an explicitly set value, including an empty one:
+
+- **Code:** `neuralscape-service/third_party_telemetry.py` fills each variable missing from the process environment: from the service `.env` (the file `config.Settings` reads, relative to the working directory) when that file sets it, otherwise `false`. Only these two names are taken from the file, and the process environment wins over it, as it does for `Settings`. Both keys are declared settings, so a service `.env` containing them is valid. `main`, `worker`, `mcp_server`, `memory_service` and the `memory` package import it before anything that can load mem0 or Graphiti, so scripts and library use get the same default. `tests/test_third_party_telemetry.py` enforces that import order.
+- **Image:** the runtime and test stages of the Dockerfile set both variables to `false`.
+- **Deployment templates:** `docker-compose.yml` and `docker-compose.prod.yml` pass `${MEM0_TELEMETRY:-false}` and `${GRAPHITI_TELEMETRY_ENABLED:-false}`, so setting either one in the Compose project's `.env` (the repository root) opts in. The Helm chart's `config` values set both to `"false"`.
+
+The vendored subtrees are not modified, so an upstream sync cannot silently turn telemetry back on.
+
+To opt in, set either variable to `true` in the process environment, in the Compose project's `.env` (for `docker compose`), or in `neuralscape-service/.env` (for a local `uv run` from that directory).
+
 ## Logging
 
 Configured in `neuralscape-service/logging_config.py` via structlog. Two knobs:

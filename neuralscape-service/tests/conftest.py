@@ -3,10 +3,13 @@
 import sys
 from pathlib import Path
 
-import pytest
-
 # Ensure the service root is importable (main.py, config.py)
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+# Before anything can import mem0/Graphiti: keep their telemetry off in tests.
+import third_party_telemetry  # noqa: E402,F401
+
+import pytest  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
