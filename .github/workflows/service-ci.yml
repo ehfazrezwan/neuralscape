@@ -6,12 +6,11 @@ name: service-ci
 # 2026-07-05 memory/ package incident (PR #136 → #138) is the origin story.
 #
 # Trigger shape: runs on EVERY PR so the jobs can be marked as required
-# checks; the `changes` job path-filters internally and non-service PRs get
-# "skipped" jobs, which GitHub treats as passing for required checks.
+# checks. The `changes` job retains its existing status context and diagnostic
+# output, but never skips the mandatory host, container, runtime, or guard jobs.
 
 on:
   pull_request:
-    branches: [dev, main]
   push:
     branches: [dev, main]
     paths:
@@ -26,6 +25,8 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Retained for status-context compatibility and change diagnostics. Its
+  # output is deliberately not used to condition any mandatory job.
   changes:
     runs-on: ubuntu-latest
     outputs:
@@ -51,8 +52,6 @@ jobs:
   # security tab with alerts for code we never install — one past sync left
   # 31 stale alerts to triage away. Fail fast at PR time instead.
   subtree-prune-guard:
-    needs: changes
-    if: needs.changes.outputs.service == 'true' || github.event_name == 'push'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -74,8 +73,6 @@ jobs:
           echo "subtrees clean"
 
   host-tests:
-    needs: changes
-    if: needs.changes.outputs.service == 'true' || github.event_name == 'push'
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -99,11 +96,77 @@ jobs:
         # (the image installs it) — a phantom FAILURE on every service PR.
         run: uv sync --frozen --extra code-graph
       - name: Run fast suite
-        run: uv run pytest tests/ --ignore=tests/test_async_pipeline.py -q
+        run: uv run pytest tests/ --ignore=tests/test_async_pipeline.py -q -rs --junitxml=../junit-host.xml
+      - name: Require the declared skip inventory (host)
+        run: >-
+          python3 -I tests/test_ci_skip_gate.py
+          --junit ../junit-host.xml
+          --manifest ../.github/ci/expected_skips.json
+          --profile host
+
+  python310-contracts:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Run contract floor suite on Python 3.10
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ "$(git rev-parse HEAD)" != "$GITHUB_SHA" ]; then
+            echo "::error::checkout does not match the candidate SHA"
+            exit 1
+          fi
+
+          required_contract_files=(
+            neuralscape-service/contracts_common.py
+            neuralscape-service/contracts_errors.py
+            neuralscape-service/contracts_references.py
+            neuralscape-service/contracts_engines.py
+            neuralscape-service/contracts_inference.py
+            neuralscape-service/tests/test_contracts_common.py
+            neuralscape-service/tests/test_contracts_engines.py
+            neuralscape-service/tests/test_contracts_inference.py
+          )
+          missing=0
+          for path in "${required_contract_files[@]}"; do
+            if [ ! -f "$path" ]; then
+              echo "::error file=$path::required Python 3.10 contract file is missing"
+              missing=1
+            fi
+          done
+          if [ "$missing" -ne 0 ]; then
+            exit 1
+          fi
+
+          docker run --rm \
+            --mount "type=bind,source=$GITHUB_WORKSPACE,target=/workspace,readonly" \
+            --workdir /workspace/neuralscape-service \
+            --env PYTHONDONTWRITEBYTECODE=1 \
+            python:3.10-slim \
+            sh -euxc '
+              python -c "import sys; assert sys.version_info[:2] == (3, 10), sys.version"
+              python -m pip install --disable-pip-version-check --no-cache-dir \
+                "pydantic-settings>=2.0.0" \
+                "idna>=3.11,<4" \
+                "jsonschema>=4.26.0,<5" \
+                "pytest>=8.0.0"
+              python -c "import contracts_common, contracts_references, contracts_engines, contracts_inference"
+              # These pure contract tests do not use the service suite
+              # auth/config fixtures. The full host and container jobs still
+              # load conftest.py and exercise the complete service environment.
+              python -m pytest --noconftest -p no:cacheprovider \
+                tests/test_contracts_common.py \
+                tests/test_contracts_engines.py \
+                tests/test_contracts_inference.py \
+                -q
+            '
 
   container-gate:
-    needs: changes
-    if: needs.changes.outputs.service == 'true' || github.event_name == 'push'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -121,7 +184,28 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
       - name: Run suite inside the packaged image
-        run: docker run --rm ns-gate:ci
+        # Same command as the image's default CMD plus a junit report, so the
+        # skip inventory below can be checked against the in-container run.
+        run: |
+          set +e
+          docker run --name ns-gate-run ns-gate:ci \
+            pytest tests/ --ignore=tests/test_async_pipeline.py -q -rs --junitxml=/tmp/junit-container.xml
+          status=$?
+          docker cp ns-gate-run:/tmp/junit-container.xml junit-container.xml
+          copy_status=$?
+          docker rm ns-gate-run
+          [ "$status" -eq 0 ] || exit "$status"
+          exit "$copy_status"
+      - name: Require the declared skip inventory (container)
+        run: >-
+          python3 -I neuralscape-service/tests/test_ci_skip_gate.py
+          --junit junit-container.xml
+          --manifest .github/ci/expected_skips.json
+          --profile container
+      - name: Verify test image contains snapshot integration test
+        run: >-
+          docker run --rm --entrypoint /bin/sh ns-gate:ci
+          -ec 'test -f /app/neuralscape-service/integration_tests/test_native_snapshot_neo4j.py'
       - name: Build runtime image
         uses: docker/build-push-action@v7
         with:
@@ -131,3 +215,153 @@ jobs:
           load: true
           tags: ns-gate-rt:ci
           cache-from: type=gha
+      - name: Verify runtime image contains snapshot integration test
+        run: >-
+          docker run --rm --entrypoint /bin/sh ns-gate-rt:ci
+          -ec 'test -f /app/neuralscape-service/integration_tests/test_native_snapshot_neo4j.py'
+
+  native-snapshot-neo4j:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    env:
+      SNAPSHOT_COMPOSE_FILE: docker-compose.snapshot-test.yml
+      SNAPSHOT_COMPOSE_PROJECT: snapshot-${{ github.run_id }}-${{ github.run_attempt }}
+      NEO4J_URI: neo4j://127.0.0.1:7687
+      NEO4J_USER: neo4j
+      NEO4J_DATABASE: neo4j
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Verify and record candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/snapshot-neo4j
+          candidate=$(git rev-parse HEAD)
+          printf 'candidate_sha=%s\n' "$candidate" | tee artifacts/snapshot-neo4j/candidate.txt
+          if [ "$candidate" != "$GITHUB_SHA" ]; then
+            echo "::error::checkout does not match the candidate SHA"
+            exit 1
+          fi
+      - name: Prepare disposable database credential
+        shell: bash
+        run: |
+          set -euo pipefail
+          credential=$(openssl rand -hex 32)
+          echo "::add-mask::$credential"
+          {
+            printf 'NEO4J_AUTH=neo4j/%s\n' "$credential"
+            printf 'NEO4J_PASSWORD=%s\n' "$credential"
+            printf 'NS_DB_PASSWORD=%s\n' "$credential"
+          } >> "$GITHUB_ENV"
+          unset credential
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+          cache-dependency-glob: "neuralscape-service/uv.lock"
+      - name: Install frozen service dependencies
+        working-directory: neuralscape-service
+        run: uv sync --frozen --extra code-graph
+      - name: Start disposable Neo4j
+        shell: bash
+        run: |
+          set -euo pipefail
+          : "${NEO4J_AUTH:?missing disposable database auth}"
+          : "${NEO4J_PASSWORD:?missing client database credential}"
+          : "${NS_DB_PASSWORD:?missing healthcheck database credential}"
+          docker compose \
+            --project-name "$SNAPSHOT_COMPOSE_PROJECT" \
+            --file "$SNAPSHOT_COMPOSE_FILE" \
+            up --detach --wait --wait-timeout 120 neo4j
+      - name: Record image and server evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          container_id=$(docker compose \
+            --project-name "$SNAPSHOT_COMPOSE_PROJECT" \
+            --file "$SNAPSHOT_COMPOSE_FILE" \
+            ps --quiet neo4j)
+          test -n "$container_id"
+          image_id=$(docker inspect --format '{{.Image}}' "$container_id")
+          {
+            printf 'candidate_sha=%s\n' "$(git rev-parse HEAD)"
+            docker image inspect \
+              --format 'image_id={{.Id}} repo_digests={{json .RepoDigests}}' \
+              "$image_id"
+            docker compose \
+              --project-name "$SNAPSHOT_COMPOSE_PROJECT" \
+              --file "$SNAPSHOT_COMPOSE_FILE" \
+              exec -T neo4j cypher-shell \
+                -d neo4j -u neo4j -p "$NEO4J_PASSWORD" \
+                "CALL dbms.components() YIELD name, versions, edition RETURN name, versions, edition"
+          } | tee artifacts/snapshot-neo4j/runtime-evidence.txt
+      - name: Run native snapshot database qualification
+        working-directory: neuralscape-service
+        run: >-
+          uv run --frozen pytest integration_tests/test_native_snapshot_neo4j.py -q
+          --junitxml=../artifacts/snapshot-neo4j/pytest.xml
+      - name: Collect bounded Neo4j diagnostics
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          mkdir -p artifacts/snapshot-neo4j
+          docker compose \
+            --project-name "$SNAPSHOT_COMPOSE_PROJECT" \
+            --file "$SNAPSHOT_COMPOSE_FILE" \
+            ps --all > artifacts/snapshot-neo4j/compose-ps.txt 2>&1 || true
+          docker compose \
+            --project-name "$SNAPSHOT_COMPOSE_PROJECT" \
+            --file "$SNAPSHOT_COMPOSE_FILE" \
+            logs --no-color --timestamps --tail 2000 neo4j \
+            > artifacts/snapshot-neo4j/neo4j.log 2>&1 || true
+      - name: Remove job-owned Neo4j project and volumes
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          docker compose \
+            --project-name "$SNAPSHOT_COMPOSE_PROJECT" \
+            --file "$SNAPSHOT_COMPOSE_FILE" \
+            down --volumes --remove-orphans --timeout 20
+      - name: Upload snapshot qualification evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-snapshot-neo4j-${{ github.run_id }}-${{ github.run_attempt }}
+          path: artifacts/snapshot-neo4j/
+          if-no-files-found: error
+          retention-days: 7
+
+  service-gate:
+    if: ${{ always() }}
+    needs: [changes, subtree-prune-guard, host-tests, python310-contracts, container-gate, native-snapshot-neo4j]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require every service qualification job
+        env:
+          CHANGES_RESULT: ${{ needs.changes.result }}
+          SUBTREE_RESULT: ${{ needs.subtree-prune-guard.result }}
+          HOST_RESULT: ${{ needs.host-tests.result }}
+          PYTHON310_RESULT: ${{ needs.python310-contracts.result }}
+          CONTAINER_RESULT: ${{ needs.container-gate.result }}
+          SNAPSHOT_NEO4J_RESULT: ${{ needs.native-snapshot-neo4j.result }}
+        run: |
+          set -eu
+
+          require_success() {
+            check_name=$1
+            result=$2
+            if [ "$result" != "success" ]; then
+              echo "::error::$check_name result '$result'; expected 'success'"
+              exit 1
+            fi
+          }
+
+          require_success changes "$CHANGES_RESULT"
+          require_success subtree-prune-guard "$SUBTREE_RESULT"
+          require_success host-tests "$HOST_RESULT"
+          require_success python310-contracts "$PYTHON310_RESULT"
+          require_success container-gate "$CONTAINER_RESULT"
+          require_success native-snapshot-neo4j "$SNAPSHOT_NEO4J_RESULT"
