@@ -14,19 +14,6 @@ import type { ConversationTurn, SessionEndInput } from "../core/types.js";
 const OFFSET_SUFFIX = ".neuralscape-offset";
 
 /**
- * Format tag written in the SAME file as the offset (`"<offset> v2"`) once a flush has been committed by a reader
- * that understands the real transcript shape (text under `message.content`). An offset WITHOUT the tag may have
- * been advanced by an older reader that saw every real turn as empty and skipped it, so it gets a bounded,
- * data-driven rewind (see `legacyRewindOffset`) the first time it is read. Offset and tag are written together
- * (temporary file, then rename), so a failed or interrupted write can never leave a new offset without its tag.
- * An older plugin reading the file still gets the number (`parseInt`).
- */
-const FORMAT_TAG = "v2";
-
-/** The most transcript entries a legacy offset is ever rewound across (older undelivered turns stay lost). */
-const MAX_LEGACY_REWIND_ENTRIES = 400;
-
-/**
  * Offsets staged by extractClaudeCodeTurns, committed only after the caller
  * reports delivery (audit 27 #34b): `turnEndOffsets[i]` is the transcript
  * cursor value just past turn i's messages, so a partial flush can advance
@@ -60,21 +47,23 @@ interface TranscriptMessage {
 }
 
 /**
- * Read the flush offset (last processed message index) for a transcript, and whether it carries the format tag.
+ * Read the flush offset (last processed message index) for a transcript.  An offset is used exactly as it
+ * was written: it is never moved backwards, so nothing that was already delivered can be delivered again.
  */
-async function readFlushOffset(transcriptPath: string): Promise<{ offset: number; tagged: boolean }> {
+async function readFlushOffset(transcriptPath: string): Promise<number> {
   try {
     const content = await readFile(transcriptPath + OFFSET_SUFFIX, "utf-8");
     const offset = parseInt(content.trim(), 10);
-    return { offset: Number.isNaN(offset) ? 0 : offset, tagged: /\bv2\b/.test(content) };
+    return Number.isNaN(offset) ? 0 : offset;
   } catch {
-    return { offset: 0, tagged: false };
+    return 0;
   }
 }
 
 /**
- * Write the flush offset and its format tag in one atomic step: a temporary file in the same directory, renamed
- * over the offset file. A failure leaves the previous offset untouched (and removes the temporary file).
+ * Write the flush offset in one atomic step: a temporary file in the same directory, renamed over the offset
+ * file, so an interrupted write can never leave a half-written cursor.  A failure keeps the previous offset
+ * (and removes the temporary file).
  */
 async function writeFlushOffset(
   transcriptPath: string,
@@ -83,7 +72,7 @@ async function writeFlushOffset(
   const target = transcriptPath + OFFSET_SUFFIX;
   const temporary = `${target}.${process.pid}.tmp`;
   try {
-    await writeFile(temporary, `${offset} ${FORMAT_TAG}`, "utf-8");
+    await writeFile(temporary, String(offset), "utf-8");
     await rename(temporary, target);
   } catch (error) {
     await unlink(temporary).catch(() => undefined);
@@ -127,11 +116,6 @@ function extractText(msg: TranscriptMessage): string {
   const text = textOf(msg.message?.content ?? msg.content);
   if ((roleOf(msg) ?? msg.message?.role) === "user" && LOCAL_COMMAND_WRAPPER.test(text)) return "";
   return text;
-}
-
-/** What the previous reader saw: top-level `content` only. */
-function legacyText(msg: TranscriptMessage): string {
-  return textOf(msg.content);
 }
 
 function parseMessages(content: string): TranscriptMessage[] {
@@ -189,8 +173,6 @@ interface ParsedTurn {
   user: string;
   assistant: string;
   endOffset: number;
-  /** Index (in the user/assistant entry list) of the prompt that opens the turn. */
-  userIndex: number;
 }
 
 /**
@@ -224,7 +206,7 @@ function parseTranscript(
     if (!text) return;
     if (role === "user") {
       if (user && assistantParts.length > 0) {
-        turns.push({ user: user.text, assistant: assistantParts.join("\n"), endOffset: absolute, userIndex: user.index });
+        turns.push({ user: user.text, assistant: assistantParts.join("\n"), endOffset: absolute });
       }
       user = { text, index: absolute };
       assistantParts = [];
@@ -238,52 +220,12 @@ function parseTranscript(
   if (user) {
     const pending: { text: string; index: number } = user;
     if (assistantParts.length > 0 && !options.withholdTrailing) {
-      turns.push({ user: pending.text, assistant: assistantParts.join("\n"), endOffset: windowEnd, userIndex: pending.index });
+      turns.push({ user: pending.text, assistant: assistantParts.join("\n"), endOffset: windowEnd });
     } else {
       newOffset = pending.index; // an unanswered (or still running) turn is not consumed
     }
   }
   return { turns, newOffset };
-}
-
-/**
- * Whether the previous reader delivered this turn: it paired a prompt with the answer entry that follows it,
- * both read through a top-level ``content``. A turn with any text it could not see was dropped as empty.
- */
-function legacyDelivered(content: string, turn: ParsedTurn): boolean {
-  const entries = relevantMessages(content);
-  for (let i = turn.userIndex; i < Math.min(turn.endOffset, entries.length); i++) {
-    if (extractText(entries[i]) && !legacyText(entries[i])) return false;
-  }
-  return true;
-}
-
-/**
- * Where to resume for an offset that has no format marker.
- *
- * An older reader looked only at top-level `content`, so for real transcripts it saw every turn as empty, dropped
- * it and still advanced the offset. Scan the entries before the offset (at most MAX_LEGACY_REWIND_ENTRIES back)
- * for text that the current reader finds and the old one did not; if there is any, resume at the start of the
- * earliest such turn. A transcript the old reader read correctly has no such entry, so its offset is kept.
- */
-export function legacyRewindOffset(content: string, offset: number): number {
-  if (offset <= 0) return offset;
-  const entries = relevantMessages(content);
-  const end = Math.min(offset, entries.length);
-  const floor = Math.max(0, end - MAX_LEGACY_REWIND_ENTRIES);
-  let earliest = -1;
-  for (let i = floor; i < end; i++) {
-    if (extractText(entries[i]) && !legacyText(entries[i])) {
-      earliest = i;
-      break;
-    }
-  }
-  if (earliest < 0) return offset;
-  for (let i = earliest; i >= floor; i--) {
-    const role = roleOf(entries[i]) ?? entries[i].message?.role;
-    if (role === "user" && extractText(entries[i])) return i;
-  }
-  return earliest;
 }
 
 /**
@@ -306,21 +248,11 @@ export async function extractClaudeCodeTurns(
   if (transcriptPath) {
     try {
       const content = await readFile(transcriptPath, "utf-8");
-      const stored = await readFlushOffset(transcriptPath);
-      let offset = stored.offset;
-      if (offset > 0 && !stored.tagged) {
-        offset = legacyRewindOffset(content, offset);
-      }
-      const rewound = offset < stored.offset;
-      const parsed = parseTranscript(content, offset, {
+      const offset = await readFlushOffset(transcriptPath);
+      // A PreCompact can fire in the middle of a turn: the running turn is then kept pending, not delivered.
+      const { turns, newOffset } = parseTranscript(content, offset, {
         withholdTrailing: raw.hook_event_name === "PreCompact" && endsMidTurn(content),
       });
-      // Recovery before the original cursor is only for turns the previous reader could NOT deliver; a turn it
-      // delivered (a flattened one in a mixed transcript) is never replayed. Turns after the cursor are unchanged.
-      const turns = rewound
-        ? parsed.turns.filter((t) => t.endOffset > stored.offset || !legacyDelivered(content, t))
-        : parsed.turns;
-      const newOffset = parsed.newOffset;
 
       if (turns.length > 0) {
         // Stage per-turn offsets; commitClaudeCodeFlush() persists a cursor

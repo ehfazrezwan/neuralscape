@@ -22,6 +22,8 @@ let server: Server;
 let requests: Array<{ path: string; body: Record<string, any> }> = [];
 let failFlushFrom = -1;
 let flushCount = 0;
+/** Refuse the Nth flush request (0-based) with this HTTP status; null = never. */
+let rejectFlush: { at: number; status: number } | null = null;
 
 await new Promise<void>((resolve) => {
   server = createServer((req, res) => {
@@ -32,6 +34,11 @@ await new Promise<void>((resolve) => {
       requests.push({ path: req.url ?? "", body: parsed });
       if ((req.url ?? "").includes("/conversation-compiler/flush")) {
         const n = flushCount++;
+        if (rejectFlush !== null && n === rejectFlush.at) {
+          res.writeHead(rejectFlush.status, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "refused" }));
+          return;
+        }
         if (failFlushFrom >= 0 && n >= failFlushFrom) {
           res.writeHead(500, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ error: "boom" }));
@@ -53,10 +60,10 @@ process.env.NEURALSCAPE_TEST = "1";
 // exists, would accept the turn and count it delivered).
 process.env.NEURALSCAPE_DURABLE_OUTBOX = "false";
 
-const { commitClaudeCodeFlush, extractAllTurnPairs, extractClaudeCodeTurns, legacyRewindOffset } = await import(
+const { commitClaudeCodeFlush, extractAllTurnPairs, extractClaudeCodeTurns } = await import(
   "../src/adapters/claude-code.js"
 );
-const { flushTurns } = await import("../src/core/flush.js");
+const { boundText, flushTurns } = await import("../src/core/flush.js");
 
 afterAll(async () => {
   await new Promise<void>((resolve) => server.close(() => resolve()));
@@ -66,6 +73,7 @@ beforeEach(() => {
   requests = [];
   failFlushFrom = -1;
   flushCount = 0;
+  rejectFlush = null;
 });
 
 // ── Real-shape fixtures (synthetic content) ──────────────────────
@@ -132,12 +140,6 @@ async function transcript(entries: unknown[], jsonl = true): Promise<{ path: str
 }
 
 const offsetOf = async (path: string) => parseInt(await readFile(path + ".neuralscape-offset", "utf-8"), 10);
-/** The format tag stored in the offset file itself ("<offset> v2"), or null when the offset has none (or no offset exists). */
-const markerOf = async (path: string) => {
-  const raw = await readFile(path + ".neuralscape-offset", "utf-8").catch(() => null);
-  return raw !== null && /\bv2\b/.test(raw) ? "v2" : null;
-};
-
 // ── Reading real-shape entries ───────────────────────────────────
 
 describe("real transcript shape: turns", () => {
@@ -199,24 +201,22 @@ describe("real transcript shape: turns", () => {
 // ── The offset only moves past delivered turns ───────────────────
 
 describe("real transcript shape: offsets", () => {
-  it("a full delivery commits the window and the format marker", async () => {
+  it("a full delivery commits the window", async () => {
     const { path, raw } = await transcript(realSession());
     const turns = await extractClaudeCodeTurns(raw);
     const result = await flushTurns(turns);
     expect(result.flushed).toBe(2);
     await commitClaudeCodeFlush(raw, result);
     expect(await offsetOf(path)).toBe(8); // eight user/assistant entries
-    expect(await markerOf(path)).toBe("v2");
     expect(await extractClaudeCodeTurns(raw)).toEqual([]);
   });
 
-  it("a failed delivery leaves the offset where it was (and writes no marker)", async () => {
+  it("a failed delivery leaves the offset where it was", async () => {
     failFlushFrom = 0;
     const { path, raw } = await transcript(realSession());
     const result = await flushTurns(await extractClaudeCodeTurns(raw));
     await commitClaudeCodeFlush(raw, result);
     await expect(readFile(path + ".neuralscape-offset", "utf-8")).rejects.toThrow();
-    expect(await markerOf(path)).toBeNull();
   });
 
   it("a partial failure advances only past the delivered turn", async () => {
@@ -246,46 +246,32 @@ describe("real transcript shape: offsets", () => {
 
 // ── Offsets advanced past undelivered turns by the old reader ────
 
-describe("legacy offsets (advanced by the previous reader)", () => {
-  it("rewinds a marker-less offset across turns the old reader could not see, delivers them, then stops rewinding", async () => {
+describe("an offset is used exactly as it was written", () => {
+  it("a cursor at the end of a transcript the previous reader skipped delivers nothing: lost turns stay lost, nothing is rewound", async () => {
     const { path, raw } = await transcript(realSession());
-    await writeFile(path + ".neuralscape-offset", "8", "utf-8"); // what the old reader left: everything 'processed'
-    const turns = await extractClaudeCodeTurns(raw);
-    expect(turns.length).toBe(2); // the two lost turns come back
-    await commitClaudeCodeFlush(raw, await flushTurns(turns));
-    expect(await markerOf(path)).toBe("v2");
-    expect(await extractClaudeCodeTurns(raw)).toEqual([]); // marker present: no further rewind
-  });
-
-  it("keeps the offset when the old reader could read the transcript (flattened shape)", async () => {
-    const { path, raw } = await transcript([
-      { type: "user", content: "flattened first prompt with plenty of text" },
-      { type: "assistant", content: "flattened first answer with plenty of text" },
-    ]);
-    await writeFile(path + ".neuralscape-offset", "2", "utf-8");
+    await writeFile(path + ".neuralscape-offset", "8", "utf-8");
     expect(await extractClaudeCodeTurns(raw)).toEqual([]);
   });
 
-  it("leaves the rewind in place when nothing is delivered, so the next flush tries again", async () => {
-    failFlushFrom = 0;
+  it("a cursor inside the transcript resumes there, never earlier", async () => {
     const { path, raw } = await transcript(realSession());
-    await writeFile(path + ".neuralscape-offset", "8", "utf-8");
-    await commitClaudeCodeFlush(raw, await flushTurns(await extractClaudeCodeTurns(raw)));
-    expect(await offsetOf(path)).toBe(8);
-    expect(await markerOf(path)).toBeNull();
-    failFlushFrom = -1;
-    expect((await extractClaudeCodeTurns(raw)).length).toBe(2);
+    await writeFile(path + ".neuralscape-offset", "5", "utf-8"); // just before the second prompt
+    expect((await extractClaudeCodeTurns(raw)).map((t) => t.userMessage)).toEqual([PROMPT_TWO]);
   });
 
-  it("bounds the rewind: only the most recent entries before the offset are recovered", () => {
-    const entries: unknown[] = [];
-    for (let i = 0; i < 300; i++) entries.push(user(`prompt ${i} with plenty of text`), assistant(text(`answer ${i} with plenty of text`)));
-    const content = entries.map((e) => JSON.stringify(e)).join("\n");
-    const rewound = legacyRewindOffset(content, 600);
-    expect(rewound).toBeGreaterThanOrEqual(200);   // never further back than 400 entries
-    expect(rewound).toBeLessThan(600);
-    expect(entries[rewound]).toMatchObject({ type: "user" }); // resumes at a prompt, not mid-turn
-    expect(legacyRewindOffset(content, 0)).toBe(0);
+  it("a flattened turn already delivered is never replayed, with or without real-shape entries around it", async () => {
+    const entries = [...FLAT(1), user(PROMPT_ONE), assistant(text(SECOND_TEXT)), ...FLAT(2)];
+    const { path, raw } = await transcript(entries);
+    await writeFile(path + ".neuralscape-offset", String(entries.length), "utf-8");
+    expect(await extractClaudeCodeTurns(raw)).toEqual([]);
+    await append(path, [{ type: "user", isMeta: true, content: "ignored entry appended after the cursor" }]);
+    expect(await extractClaudeCodeTurns(raw)).toEqual([]);
+  });
+
+  it("an offset file from an older plugin version (with or without extra text) is read as its number", async () => {
+    const { path, raw } = await transcript(realSession());
+    await writeFile(path + ".neuralscape-offset", "5 v2", "utf-8");
+    expect((await extractClaudeCodeTurns(raw)).map((t) => t.userMessage)).toEqual([PROMPT_TWO]);
   });
 });
 
@@ -398,12 +384,6 @@ describe("entries that are not the user's conversation", () => {
     expect((await extractAllTurnPairs(raw)).map((p) => p.user)).toEqual([PROMPT_ONE]);
   });
 
-  it("a legacy offset is not rewound because of a summary the old reader also could not see", async () => {
-    const { path, raw } = await transcript([compactSummary(SUMMARY_TEXT), assistant(text(SECOND_TEXT))]);
-    await writeFile(path + ".neuralscape-offset", "2", "utf-8");
-    expect(await extractClaudeCodeTurns(raw)).toEqual([]);
-  });
-
   it("the Stop hook sends the real turn and never the summary", async () => {
     const { path, dir } = await transcript([
       compactSummary(SUMMARY_TEXT),
@@ -421,10 +401,10 @@ describe("entries that are not the user's conversation", () => {
 // ── The offset and its format tag are one write ──────────────────
 
 describe("offset file: one atomic write", () => {
-  it("stores the offset and the tag together and leaves no temporary or sidecar file", async () => {
+  it("stores the offset alone and leaves no temporary or sidecar file", async () => {
     const { path, dir, raw } = await transcript(realSession());
     await commitClaudeCodeFlush(raw, await flushTurns(await extractClaudeCodeTurns(raw)));
-    expect((await readFile(path + ".neuralscape-offset", "utf-8")).trim()).toBe("8 v2");
+    expect((await readFile(path + ".neuralscape-offset", "utf-8")).trim()).toBe("8");
     expect((await readdir(dir)).sort()).toEqual(["transcript.jsonl", "transcript.jsonl.neuralscape-offset"]);
   });
 
@@ -441,14 +421,6 @@ describe("offset file: one atomic write", () => {
     await mkdir(path + ".neuralscape-offset"); // a directory where the offset file belongs: the rename cannot succeed
     await commitClaudeCodeFlush(raw, result);
     expect((await readdir(dir)).sort()).toEqual(["transcript.jsonl", "transcript.jsonl.neuralscape-offset"]); // no .tmp left
-  });
-
-  it("a tagged offset is never rewound, an untagged one is", async () => {
-    const { path, raw } = await transcript(realSession());
-    await writeFile(path + ".neuralscape-offset", "8 v2", "utf-8");
-    expect(await extractClaudeCodeTurns(raw)).toEqual([]);
-    await writeFile(path + ".neuralscape-offset", "8", "utf-8");
-    expect((await extractClaudeCodeTurns(raw)).length).toBe(2);
   });
 
   it("a delivered flush is not replayed by the next one", async () => {
@@ -524,39 +496,79 @@ describe("PreCompact in the middle of a turn", () => {
   });
 });
 
-describe("a legacy offset over a mixed-shape transcript", () => {
-  it("recovers the real-shape turn and never replays a flattened turn the previous reader delivered", async () => {
-    const entries = [...FLAT(1), user(PROMPT_ONE), assistant(text(SECOND_TEXT)), ...FLAT(2)];
-    const { path, raw } = await transcript(entries);
-    await writeFile(path + ".neuralscape-offset", String(entries.length), "utf-8"); // what the previous reader left
+// ── The payload is bounded to what the flush route accepts, and a refused turn cannot block the rest ──
+
+describe("flush payload bounds and permanent rejections", () => {
+  const LIMIT = 50000;
+
+  it("boundText leaves text at the limit untouched and marks text over it", () => {
+    const atLimit = "a".repeat(LIMIT);
+    expect(boundText(atLimit)).toBe(atLimit);
+    const over = "b".repeat(LIMIT + 1);
+    const bounded = boundText(over);
+    expect(bounded.length).toBeLessThanOrEqual(LIMIT);
+    expect(bounded).toContain("[truncated by the plugin:");
+    expect(bounded.startsWith("b".repeat(1000))).toBe(true);
+    const marker = /\[truncated by the plugin: (\d+) more characters\]/.exec(bounded);
+    expect(marker).not.toBeNull();
+    expect(bounded.indexOf("\n[truncated") + Number(marker![1])).toBe(over.length); // the marker counts exactly what was left out
+  });
+
+  it("never splits a surrogate pair at the cut and stays within the limit for any digit count", () => {
+    for (const filler of ["😀", "a😀", "ab😀"]) {
+      const text = filler.repeat(Math.ceil((LIMIT * 2) / filler.length));
+      const bounded = boundText(text);
+      expect(bounded.length).toBeLessThanOrEqual(LIMIT);
+      expect(bounded.slice(0, bounded.indexOf("\n[truncated"))).not.toMatch(/[\ud800-\udbff]$/);
+    }
+    expect(boundText("x".repeat(LIMIT * 20)).length).toBeLessThanOrEqual(LIMIT);
+  });
+
+  it("two assistant entries of 30,000 characters make one turn that the service accepts (bounded, marked)", async () => {
+    const big = (c: string) => c.repeat(30000);
+    const { raw } = await transcript([user(PROMPT_ONE), assistant(text(big("x"))), assistant(text(big("y")))]);
     const turns = await extractClaudeCodeTurns(raw);
-    expect(turns.map((t) => t.userMessage)).toEqual([PROMPT_ONE]);
-    await commitClaudeCodeFlush(raw, await flushTurns(turns));
-    expect(await markerOf(path)).toBe("v2");
+    expect(turns[0].assistantResponse.length).toBe(60001); // joined by a newline: over the limit before flushing
+    const result = await flushTurns(turns);
+    expect(result.firstFailedIndex).toBeNull();
+    const sent = flushes()[0].body;
+    expect(sent.assistant_response.length).toBeLessThanOrEqual(LIMIT);
+    expect(sent.assistant_response).toContain("[truncated by the plugin:");
+    expect(sent.user_message).toBe(PROMPT_ONE);
+  });
+
+  it("a user message over the limit is bounded too, and text at the limit goes unchanged", async () => {
+    const turns = [{ userMessage: "u".repeat(LIMIT + 10), assistantResponse: "a".repeat(LIMIT), sessionId: "s", channel: "claude-code", timestamp: "t", userId: "shape-test" }];
+    await flushTurns(turns);
+    const sent = flushes()[0].body;
+    expect(sent.user_message.length).toBeLessThanOrEqual(LIMIT);
+    expect(sent.user_message).toContain("[truncated by the plugin:");
+    expect(sent.assistant_response).toBe("a".repeat(LIMIT));
+  });
+
+  it.each([400, 413, 422])("a turn the service refuses with HTTP %i is skipped and the later turns are still delivered", async (status) => {
+    rejectFlush = { at: 1, status };
+    const { path, raw } = await transcript([...FLAT(1), ...FLAT(2), ...FLAT(3)]);
+    const turns = await extractClaudeCodeTurns(raw);
+    const result = await flushTurns(turns);
+    expect(result.firstFailedIndex).toBeNull();
+    expect(flushes().map((q) => q.body.user_message)).toEqual([
+      "flattened prompt number 1 with plenty of text to keep",
+      "flattened prompt number 2 with plenty of text to keep",
+      "flattened prompt number 3 with plenty of text to keep",
+    ]);
+    await commitClaudeCodeFlush(raw, result);
+    expect(await offsetOf(path)).toBe(6); // the cursor passed the refused turn
     expect(await extractClaudeCodeTurns(raw)).toEqual([]);
   });
 
-  it("a flattened turn between two lost real-shape turns is skipped, both lost turns return", async () => {
-    const entries = [user(PROMPT_ONE), assistant(text(SECOND_TEXT)), ...FLAT(1), user(PROMPT_TWO), assistant(text(THIRD_TEXT))];
-    const { path, raw } = await transcript(entries);
-    await writeFile(path + ".neuralscape-offset", String(entries.length), "utf-8");
-    expect((await extractClaudeCodeTurns(raw)).map((t) => t.userMessage)).toEqual([PROMPT_ONE, PROMPT_TWO]);
-  });
-
-  it("turns after the original cursor are delivered as usual, next to the recovered ones", async () => {
-    const before = [...FLAT(1), user(PROMPT_ONE), assistant(text(SECOND_TEXT))];
-    const { path, raw } = await transcript([...before, ...FLAT(2)]);
-    await writeFile(path + ".neuralscape-offset", String(before.length), "utf-8");
-    expect((await extractClaudeCodeTurns(raw)).map((t) => t.userMessage)).toEqual([PROMPT_ONE, "flattened prompt number 2 with plenty of text to keep"]);
-  });
-
-  it("the Stop hook sends the lost turn once and no flattened turn", async () => {
-    const entries = [...FLAT(1), user(PROMPT_ONE), assistant(text(SECOND_TEXT)), ...FLAT(2)];
-    const { path, dir } = await transcript(entries);
-    await writeFile(path + ".neuralscape-offset", String(entries.length), "utf-8");
-    await stop(path, dir);
-    expect(flushes().map((q) => q.body.user_message)).toEqual([PROMPT_ONE]);
-    await stop(path, dir);
-    expect(flushes().length).toBe(1);
+  it.each([401, 403, 404, 408, 429, 500, 503])("HTTP %i is not a permanent rejection of the turn: delivery stops there and the cursor waits", async (status) => {
+    rejectFlush = { at: 1, status };
+    const { path, raw } = await transcript([...FLAT(1), ...FLAT(2), ...FLAT(3)]);
+    const result = await flushTurns(await extractClaudeCodeTurns(raw));
+    expect(result.firstFailedIndex).toBe(1);
+    expect(flushes().length).toBe(2); // turn 3 was not attempted
+    await commitClaudeCodeFlush(raw, result);
+    expect(await offsetOf(path)).toBe(2);
   });
 });
