@@ -288,12 +288,12 @@ describe("an offset is used exactly as it was written", () => {
 // ── The three delivery paths, as the built hook bundles ──────────
 
 interface Run { code: number | null; stdout: string }
-function runHook(script: string, stdin: string): Promise<Run> {
+function runHook(script: string, stdin: string, env: Record<string, string> = {}): Promise<Run> {
   return mkdtemp(join(tmpdir(), "ns-shape-data-")).then(
     (dataDir) =>
       new Promise<Run>((resolve, reject) => {
         const child = spawn("node", [join(PLUGIN_ROOT, "scripts", script)], {
-          env: { PATH: process.env.PATH ?? "", NEURALSCAPE_USER_ID: "shape-test", NEURALSCAPE_URL: SERVER_URL, CLAUDE_PLUGIN_DATA: dataDir, NEURALSCAPE_DURABLE_OUTBOX: "false" },
+          env: { PATH: process.env.PATH ?? "", NEURALSCAPE_USER_ID: "shape-test", NEURALSCAPE_URL: SERVER_URL, CLAUDE_PLUGIN_DATA: dataDir, NEURALSCAPE_DURABLE_OUTBOX: "false", ...env },
           stdio: ["pipe", "pipe", "pipe"],
         });
         let stdout = "";
@@ -467,8 +467,8 @@ const FLAT = (i: number) => [
 ];
 const preCompact = (path: string, dir: string) =>
   runHook("pre-compact.js", JSON.stringify({ session_id: SESSION, transcript_path: path, cwd: dir, hook_event_name: "PreCompact", trigger: "auto" }));
-const stop = (path: string, dir: string) =>
-  runHook("session-end.js", JSON.stringify({ session_id: SESSION, transcript_path: path, cwd: dir, hook_event_name: "Stop" }));
+const stop = (path: string, dir: string, last?: string, env: Record<string, string> = {}) =>
+  runHook("session-end.js", JSON.stringify({ session_id: SESSION, transcript_path: path, cwd: dir, hook_event_name: "Stop", ...(last === undefined ? {} : { last_assistant_message: last }) }), env);
 const append = (path: string, entries: unknown[]) =>
   readFile(path, "utf-8").then((old) => writeFile(path, old + entries.map((e) => JSON.stringify(e)).join("\n") + "\n", "utf-8"));
 
@@ -529,6 +529,82 @@ describe("PreCompact delivers nothing; the Stop hook delivers everything once", 
     expect(await extractRecentUserPrompts({ ...raw, hook_event_name: "PreCompact" })).toEqual([PROMPT_ONE]);
     await commitClaudeCodeFlush(raw, { attempted: 1, flushed: 1, firstFailedIndex: null });
     await expect(readFile(path + ".neuralscape-offset", "utf-8")).rejects.toThrow();
+  });
+});
+
+describe("Stop with a transcript that lags the final answer", () => {
+  const FINAL = "FINAL-ANSWER The retry logic is in place and every test passes now.";
+  const NOWAIT = { NEURALSCAPE_TRANSCRIPT_LAG_WAIT_MS: "0" };
+  const MIDRUN = (progress: string): unknown[] => [user(PROMPT_ONE), assistant(text(progress), toolUse), toolResultEntry()];
+
+  it("the final answer lands after Stop read the transcript: the turn waits and is delivered once, complete", async () => {
+    const { path, dir } = await transcript(MIDRUN("I am reading the sync worker and the queue code first."));
+    await stop(path, dir, FINAL, NOWAIT);
+    expect(flushes().length).toBe(0); // the partial turn is not delivered
+    await expect(readFile(path + ".neuralscape-offset", "utf-8")).rejects.toThrow(); // and the cursor stays at its prompt
+    await append(path, [assistant(text(FINAL))]);
+    await stop(path, dir, FINAL, NOWAIT);
+    expect(flushes().length).toBe(1);
+    expect(flushes()[0].body.user_message).toBe(PROMPT_ONE);
+    expect(flushes()[0].body.assistant_response).toBe(`I am reading the sync worker and the queue code first.\n${FINAL}`);
+    expect(await offsetOf(path)).toBe(4);
+    await stop(path, dir, FINAL, NOWAIT);
+    expect(flushes().length).toBe(1); // exactly once
+  });
+
+  it("a transcript that catches up during the wait is delivered by the same Stop", async () => {
+    const { path, dir } = await transcript(MIDRUN("I am reading the sync worker and the queue code first."));
+    const running = stop(path, dir, FINAL, { NEURALSCAPE_TRANSCRIPT_LAG_WAIT_MS: "5000" });
+    await new Promise((r) => setTimeout(r, 700));
+    await append(path, [assistant(text(FINAL))]);
+    await running;
+    expect(flushes().length).toBe(1);
+    expect(String(flushes()[0].body.assistant_response)).toContain("FINAL-ANSWER");
+    expect(await offsetOf(path)).toBe(4);
+  });
+
+  it("a short progress text (dropped as noise if it were the whole turn) does not move the cursor past the unanswered final", async () => {
+    const { path, dir } = await transcript(MIDRUN("Checking."));
+    await stop(path, dir, FINAL, NOWAIT);
+    expect(flushes().length).toBe(0);
+    await expect(readFile(path + ".neuralscape-offset", "utf-8")).rejects.toThrow();
+    await append(path, [assistant(text(FINAL))]);
+    await stop(path, dir, FINAL, NOWAIT);
+    expect(flushes().length).toBe(1);
+    expect(flushes()[0].body.assistant_response).toContain("FINAL-ANSWER");
+  });
+
+  it("a genuinely short complete turn is dropped as noise and the cursor advances (its final answer is there)", async () => {
+    const { path, dir } = await transcript([user(PROMPT_ONE), assistant(text("Done."))]);
+    await stop(path, dir, "Done.", NOWAIT);
+    expect(flushes().length).toBe(0);
+    expect(await offsetOf(path)).toBe(2);
+  });
+
+  it("earlier finished turns are still delivered while only the lagging last turn waits", async () => {
+    const { path, dir } = await transcript([user(PROMPT_ONE), assistant(text(SECOND_TEXT)), ...MIDRUN("I am reading the sync worker and the queue code first.").slice(0)]);
+    await stop(path, dir, FINAL, NOWAIT);
+    expect(flushes().map((q) => q.body.user_message)).toEqual([PROMPT_ONE]);
+    expect(await offsetOf(path)).toBe(2);
+  });
+
+  it("matches whitespace-insensitively and when the final message is the tail of several assistant entries", async () => {
+    const { raw } = await transcript([user(PROMPT_ONE), assistant(text("First part of the answer, written earlier.")), assistant(text("Second part,\n  with   odd spacing.")) ]);
+    const stopped = { ...raw, hook_event_name: "Stop", last_assistant_message: "Second part, with odd spacing." };
+    process.env.NEURALSCAPE_TRANSCRIPT_LAG_WAIT_MS = "0";
+    expect((await extractClaudeCodeTurns(stopped)).length).toBe(1);
+    expect((await extractClaudeCodeTurns({ ...stopped, last_assistant_message: "First part of the answer, written earlier. Second part, with odd spacing." })).length).toBe(1);
+    expect(await extractClaudeCodeTurns({ ...stopped, last_assistant_message: "A different final answer that is not there yet." })).toEqual([]);
+    delete process.env.NEURALSCAPE_TRANSCRIPT_LAG_WAIT_MS;
+  });
+
+  it("events other than Stop, and a Stop without a final message, are not held back", async () => {
+    const { raw } = await transcript(MIDRUN("I am reading the sync worker and the queue code first."));
+    process.env.NEURALSCAPE_TRANSCRIPT_LAG_WAIT_MS = "0";
+    expect((await extractClaudeCodeTurns({ ...raw, hook_event_name: "Stop" })).length).toBe(1);
+    expect((await extractClaudeCodeTurns({ ...raw, hook_event_name: "Stop", last_assistant_message: "   " })).length).toBe(1);
+    expect((await extractClaudeCodeTurns({ ...raw, hook_event_name: "SessionEnd", last_assistant_message: FINAL })).length).toBe(1);
+    delete process.env.NEURALSCAPE_TRANSCRIPT_LAG_WAIT_MS;
   });
 });
 

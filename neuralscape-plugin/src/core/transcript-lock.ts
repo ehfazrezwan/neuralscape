@@ -9,6 +9,10 @@
  * The lock is a file next to the offset file, created with ``O_EXCL`` and holding the owner's pid, a token and
  * the time it was taken.  A lock whose owner process is gone, or that is older than ``staleMs``, is taken over.
  * The owner removes it in a ``finally``, and only while the file still carries its own token.
+ *
+ * An owner's pid is checked in this process's pid namespace: the hooks of one Claude Code instance share it.
+ * Hooks of different instances that run in different containers but share a transcript file cannot see each
+ * other's pids and would treat a live owner as gone.
  */
 
 import { link, open, readFile, rename, stat, unlink } from "node:fs/promises";

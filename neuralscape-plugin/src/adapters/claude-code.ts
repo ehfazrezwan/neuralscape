@@ -165,13 +165,20 @@ interface ParsedTurn {
  * (thinking, tool calls, tool results) are skipped for pairing but still count as positions, so offsets stay
  * comparable with those written before. The returned `newOffset` never passes a user prompt that has no
  * assistant text yet: it stays unread and is picked up by the next flush.
+ *
+ * With ``expectedFinal`` (the Stop event's ``last_assistant_message``) the last turn is delivered only when its
+ * assistant text ends with that message.  The transcript is written asynchronously and can lag the conversation:
+ * a turn whose final answer has not been written yet is ``lagging``, kept pending exactly like an unanswered
+ * prompt (its prompt stays unread), and delivered once, complete, by a later flush.
  */
 function parseTranscript(
   content: string,
-  startOffset: number
+  startOffset: number,
+  options: { expectedFinal?: string } = {}
 ): {
   turns: ParsedTurn[];
   newOffset: number;
+  lagging: boolean;
 } {
   const window = relevantMessages(content).slice(startOffset);
   const turns: ParsedTurn[] = [];
@@ -196,15 +203,45 @@ function parseTranscript(
 
   const windowEnd = startOffset + window.length;
   let newOffset = windowEnd;
+  let lagging = false;
   if (user) {
     const pending: { text: string; index: number } = user;
-    if (assistantParts.length > 0) {
+    lagging =
+      options.expectedFinal !== undefined &&
+      assistantParts.length > 0 &&
+      !endsWithText(assistantParts.join("\n"), options.expectedFinal);
+    if (assistantParts.length > 0 && !lagging) {
       turns.push({ user: pending.text, assistant: assistantParts.join("\n"), final: assistantParts[assistantParts.length - 1], endOffset: windowEnd });
     } else {
-      newOffset = pending.index; // an unanswered turn is not consumed
+      newOffset = pending.index; // an unanswered (or still lagging) turn is not consumed
     }
   }
-  return { turns, newOffset };
+  return { turns, newOffset, lagging };
+}
+
+const collapse = (text: string): string => text.replace(/\s+/g, " ").trim();
+
+/** Whether the turn's assistant text ends with the final message (whitespace-insensitive). */
+function endsWithText(turnText: string, finalMessage: string): boolean {
+  return collapse(turnText).endsWith(collapse(finalMessage));
+}
+
+/** How long a Stop hook waits for the transcript to catch up with ``last_assistant_message`` before it leaves the turn pending. */
+const DEFAULT_LAG_WAIT_MS = 3000;
+const LAG_POLL_MS = 100;
+
+function lagWaitMs(): number {
+  const configured = Number.parseInt(process.env.NEURALSCAPE_TRANSCRIPT_LAG_WAIT_MS ?? "", 10);
+  return Number.isNaN(configured) || configured < 0 ? DEFAULT_LAG_WAIT_MS : configured;
+}
+
+const pause = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+/** The Stop event's final answer, when the event carries one: what the transcript must have caught up with. */
+function expectedFinalOf(raw: Record<string, unknown>): string | undefined {
+  if (raw.hook_event_name !== "Stop") return undefined;
+  const message = raw.last_assistant_message;
+  return typeof message === "string" && collapse(message) !== "" ? message : undefined;
 }
 
 /**
@@ -226,9 +263,16 @@ export async function extractClaudeCodeTurns(
   // Primary: read transcript file
   if (transcriptPath) {
     try {
-      const content = await readFile(transcriptPath, "utf-8");
       const offset = await readFlushOffset(transcriptPath);
-      const { turns, newOffset } = parseTranscript(content, offset);
+      const expectedFinal = expectedFinalOf(raw);
+      let parsed = parseTranscript(await readFile(transcriptPath, "utf-8"), offset, { expectedFinal });
+      // The transcript is written asynchronously: give a lagging final answer a moment to land.
+      for (let waited = 0; parsed.lagging && waited < lagWaitMs(); waited += LAG_POLL_MS) {
+        await pause(LAG_POLL_MS);
+        parsed = parseTranscript(await readFile(transcriptPath, "utf-8"), offset, { expectedFinal });
+      }
+      const { turns, newOffset } = parsed;
+      if (parsed.lagging && turns.length === 0) return []; // nothing finished yet: the turn waits for the next flush
 
       if (turns.length > 0) {
         // Stage per-turn offsets; commitClaudeCodeFlush() persists a cursor
