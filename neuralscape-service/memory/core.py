@@ -14,7 +14,8 @@ from config import settings
 logger = logging.getLogger(__name__)
 
 # Each mem0 start creates at most a few Qdrant collections; every conflict
-# means one more of them now exists, so a handful of attempts always suffices.
+# means one more of them now exists, and a collection still being created is
+# readable within tens of milliseconds, so a handful of attempts suffices.
 _COLD_START_ATTEMPTS = 5
 
 
@@ -33,23 +34,48 @@ def _is_collection_exists_conflict(exc: BaseException) -> bool:
     return b"already exists" in (exc.content or b"")
 
 
+def _is_collection_not_yet_readable(exc: BaseException) -> bool:
+    """Qdrant's 500 ``0 of 0 read operations failed``: a collection another
+    process is still creating.
+
+    Qdrant lists a new collection before its shard can be read, and for a
+    moment after the create call returns. Reading it then fails with this
+    500. Only this exact body counts: any other 500, or ``N of N`` with
+    N > 0 (shards exist but failed), is a real failure.
+    """
+    try:
+        from qdrant_client.http.exceptions import UnexpectedResponse
+    except ImportError:  # pragma: no cover — qdrant_client ships with mem0
+        return False
+    if not isinstance(exc, UnexpectedResponse) or exc.status_code != 500:
+        return False
+    return b"0 of 0 read operations failed" in (exc.content or b"")
+
+
+def _is_concurrent_creation(exc: BaseException) -> bool:
+    return _is_collection_exists_conflict(exc) or _is_collection_not_yet_readable(exc)
+
+
 def _memory_from_config(memory_cls, config):
     """``Memory.from_config``, tolerating a concurrent first start.
 
     mem0's Qdrant store lists the collections and creates its own when it is
-    missing. When the API and the workers start together against an empty
-    Qdrant, the processes that lose that race get ``409 already exists``. The
-    collection then exists, so building ``Memory`` again finds it and goes on.
-    Any other error is raised at once.
+    missing, or reads it when it is listed. When the API and the workers start
+    together against an empty Qdrant, a process that loses the race either
+    gets ``409 already exists`` from its create, or sees the collection listed
+    while another process is still creating it and gets ``500 0 of 0 read
+    operations failed`` when reading it. Either way the collection is there or
+    about to be, so building ``Memory`` again a moment later goes on. Any other
+    error is raised at once.
     """
     for attempt in range(1, _COLD_START_ATTEMPTS + 1):
         try:
             return memory_cls.from_config(config)
         except Exception as exc:
-            if attempt == _COLD_START_ATTEMPTS or not _is_collection_exists_conflict(exc):
+            if attempt == _COLD_START_ATTEMPTS or not _is_concurrent_creation(exc):
                 raise
             logger.info(
-                "Qdrant collection was created concurrently by another process; "
+                "Qdrant collection is being created concurrently by another process; "
                 "retrying memory initialisation (attempt %d/%d)",
                 attempt + 1,
                 _COLD_START_ATTEMPTS,

@@ -253,3 +253,109 @@ def test_legacy_async_memory_survives_the_race(monkeypatch, legacy_main):
     memory = legacy_main._get_async_memory()
     assert memory is not None and legacy_main._async_memory is memory
     assert server.conflicts == 1
+
+
+# ── Follow-up: a collection listed while another process is still creating it ──
+
+
+def _not_yet_readable():
+    return UnexpectedResponse(
+        status_code=500,
+        reason_phrase="Internal Server Error",
+        content=b'{"status":{"error":"Service internal error: 0 of 0 read operations failed"},"time":0.0063}',
+        headers=httpx.Headers(),
+    )
+
+
+class StillCreatingQdrantServer(RacingQdrantServer):
+    """Another process has started creating every collection: they are already
+    listed, but the first ``unreadable_reads`` reads of them fail the way Qdrant
+    answers before the new collection's shard is up."""
+
+    def __init__(self, unreadable_reads):
+        super().__init__(1)
+        self.existing = set(COLLECTIONS)
+        self.unreadable_reads = unreadable_reads
+        self.reads = 0
+
+    def get_collection(self, name):
+        with self.lock:
+            self.reads += 1
+            if self.reads <= self.unreadable_reads:
+                raise _not_yet_readable()
+        return super().get_collection(name)
+
+
+@pytest.mark.parametrize("unreadable_reads", [1, 2])
+def test_a_process_that_reads_a_collection_still_being_created_starts(monkeypatch, unreadable_reads):
+    server = StillCreatingQdrantServer(unreadable_reads)
+    monkeypatch.setattr(mem0.Memory, "from_config", _fake_from_config(server))
+    monkeypatch.setattr(type(settings), "get_mem0_config", lambda self: {})
+    monkeypatch.setattr("memory.core.time.sleep", lambda s: None, raising=False)
+    assert Service()._get_memory() is not None
+    assert server.reads == unreadable_reads + len(COLLECTIONS)
+    assert server.creates == 0
+
+
+def test_a_collection_that_never_becomes_readable_is_not_retried_forever(monkeypatch):
+    server = StillCreatingQdrantServer(unreadable_reads=10**6)
+    monkeypatch.setattr(mem0.Memory, "from_config", _fake_from_config(server))
+    monkeypatch.setattr(type(settings), "get_mem0_config", lambda self: {})
+    monkeypatch.setattr("memory.core.time.sleep", lambda s: None, raising=False)
+    with pytest.raises(UnexpectedResponse) as err:
+        Service()._get_memory()
+    assert err.value.status_code == 500
+    assert server.reads == 5
+
+
+def test_other_qdrant_500s_on_read_still_fail_start(monkeypatch):
+    class BrokenRead(StillCreatingQdrantServer):
+        def get_collection(self, name):
+            self.reads += 1
+            raise UnexpectedResponse(
+                status_code=500,
+                reason_phrase="Internal Server Error",
+                content=b'{"status":{"error":"Service internal error: 1 of 1 read operations failed"}}',
+                headers=httpx.Headers(),
+            )
+
+    server = BrokenRead(0)
+    monkeypatch.setattr(mem0.Memory, "from_config", _fake_from_config(server))
+    monkeypatch.setattr(type(settings), "get_mem0_config", lambda self: {})
+    monkeypatch.setattr("memory.core.time.sleep", lambda s: None, raising=False)
+    with pytest.raises(UnexpectedResponse):
+        Service()._get_memory()
+    assert server.reads == 1
+
+
+@pytest.mark.parametrize(
+    "exc,expected",
+    [
+        (_not_yet_readable(), True),
+        (_conflict("mem0migrations"), True),
+        (
+            UnexpectedResponse(
+                status_code=500,
+                reason_phrase="x",
+                content=b'{"status":{"error":"Service internal error: 1 of 1 read operations failed"}}',
+                headers=httpx.Headers(),
+            ),
+            False,
+        ),
+        (UnexpectedResponse(status_code=503, reason_phrase="x", content=b"0 of 0 read operations failed", headers=httpx.Headers()), False),
+        (UnexpectedResponse(status_code=500, reason_phrase="x", content=b"", headers=httpx.Headers()), False),
+        (RuntimeError("0 of 0 read operations failed"), False),
+    ],
+)
+def test_only_the_two_concurrent_creation_answers_are_retried(exc, expected):
+    from memory.core import _is_concurrent_creation
+
+    assert _is_concurrent_creation(exc) is expected
+
+
+def test_legacy_lazy_memory_survives_a_collection_still_being_created(monkeypatch, legacy_main):
+    monkeypatch.setattr("memory.core.time.sleep", lambda s: None, raising=False)
+    server = StillCreatingQdrantServer(unreadable_reads=1)
+    monkeypatch.setattr(mem0.Memory, "from_config", _fake_from_config(server))
+    memory = legacy_main._get_memory()
+    assert memory is not None and legacy_main._memory is memory
