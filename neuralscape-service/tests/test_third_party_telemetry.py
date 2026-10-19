@@ -32,14 +32,21 @@ GUARD = "third_party_telemetry"
 VENDORED = ("mem0", "graphiti_core")
 
 
-def _run(code: str, env_overrides: dict[str, str], tmp_path: Path) -> dict:
+def _run(code: str, env_overrides: dict[str, str], tmp_path: Path, env_file: str | None = None) -> dict:
     env = {k: v for k, v in os.environ.items() if k not in VARS}
     env.update(env_overrides)
     # Keep any library cache/id files out of the real home directory.
     env["HOME"] = str(tmp_path)
+    # Run from an empty directory so a developer's own service .env cannot leak in; the
+    # service-local .env (read from the working directory, like Settings) is set per test.
+    work = tmp_path / "work"
+    work.mkdir()
+    if env_file is not None:
+        (work / ".env").write_text(env_file)
+    env["PYTHONPATH"] = str(SERVICE)
     proc = subprocess.run(
         [sys.executable, "-c", code],
-        cwd=SERVICE,
+        cwd=work,
         env=env,
         capture_output=True,
         text=True,
@@ -101,9 +108,9 @@ def test_apply_defaults_only_fills_missing_values():
     import third_party_telemetry
 
     environ = {"GRAPHITI_TELEMETRY_ENABLED": "yes"}
-    third_party_telemetry.apply_defaults(environ)
+    third_party_telemetry.apply_defaults(environ, env_file=None)
     assert environ == {"GRAPHITI_TELEMETRY_ENABLED": "yes", "MEM0_TELEMETRY": "false"}
-    third_party_telemetry.apply_defaults(environ)
+    third_party_telemetry.apply_defaults(environ, env_file=None)
     assert environ == {"GRAPHITI_TELEMETRY_ENABLED": "yes", "MEM0_TELEMETRY": "false"}
 
 
@@ -164,3 +171,81 @@ def test_every_vendored_importer_is_behind_the_guard():
         if any(n not in sys.stdlib_module_names and n != "__future__" for n in before):
             unguarded.append(rel)
     assert not unguarded, f"import mem0/graphiti without the telemetry guard: {unguarded}"
+
+
+# -- service-local .env -------------------------------------------------------------------
+# Settings reads ``.env`` from the working directory and forbids unknown keys; the libraries
+# read only the process environment. An opt-in written to that file must be accepted by
+# Settings and honoured by the guard, with the process environment still taking precedence.
+
+_REPORT_ENV_AND_GRAPHITI = (
+    "import json, os, memory_service; "
+    "from graphiti_core.telemetry import is_telemetry_enabled; "
+    "print(json.dumps({'env': {k: os.environ.get(k) for k in "
+    f"{VARS!r}}}, 'graphiti': is_telemetry_enabled()}}))"
+)
+
+
+def test_settings_accepts_both_keys_in_the_service_env_file(tmp_path):
+    seen = _run(
+        "import json, config; s = config.Settings(); "
+        "print(json.dumps([s.mem0_telemetry, s.graphiti_telemetry_enabled]))",
+        {},
+        tmp_path,
+        env_file="MEM0_TELEMETRY=true\nGRAPHITI_TELEMETRY_ENABLED=true\n",
+    )
+    assert seen == ["true", "true"]
+
+
+def test_guard_honours_an_opt_in_from_the_service_env_file(tmp_path):
+    seen = _run(_REPORT_ENV_AND_GRAPHITI, {}, tmp_path,
+                env_file="MEM0_TELEMETRY=true\nGRAPHITI_TELEMETRY_ENABLED=true\n")
+    assert seen == {"env": {"MEM0_TELEMETRY": "true", "GRAPHITI_TELEMETRY_ENABLED": "true"}, "graphiti": True}
+
+
+def test_process_environment_wins_over_the_service_env_file(tmp_path):
+    seen = _run(_REPORT_ENV_AND_GRAPHITI, {"GRAPHITI_TELEMETRY_ENABLED": "false"}, tmp_path,
+                env_file="GRAPHITI_TELEMETRY_ENABLED=true\n")
+    assert seen == {"env": {"MEM0_TELEMETRY": "false", "GRAPHITI_TELEMETRY_ENABLED": "false"}, "graphiti": False}
+
+
+def test_env_file_values_are_parsed_like_settings_and_explicit_empty_is_kept(tmp_path):
+    # Quotes, ``export`` and case-insensitive names, as pydantic-settings reads the same file.
+    seen = _run(f"import worker; {_REPORT_ENV}", {}, tmp_path,
+                env_file='export mem0_telemetry=""\nGRAPHITI_TELEMETRY_ENABLED="yes"\n')
+    assert seen == {"MEM0_TELEMETRY": "", "GRAPHITI_TELEMETRY_ENABLED": "yes"}
+
+
+def test_env_file_without_the_keys_keeps_the_default_and_loads_nothing_else(tmp_path):
+    code = (
+        "import json, os, third_party_telemetry; "
+        "print(json.dumps({k: os.environ.get(k) for k in "
+        f"{VARS + ('NS_PROBE_UNRELATED',)!r}}}))"
+    )
+    seen = _run(code, {}, tmp_path, env_file="NS_PROBE_UNRELATED=1\nGOOGLE_API_KEY=x\n")
+    assert seen == {"MEM0_TELEMETRY": "false", "GRAPHITI_TELEMETRY_ENABLED": "false", "NS_PROBE_UNRELATED": None}
+
+
+def test_guard_reads_the_same_file_settings_reads():
+    import config
+    import third_party_telemetry
+
+    assert third_party_telemetry.ENV_FILE == config.Settings.model_config["env_file"]
+
+
+def test_apply_defaults_takes_only_missing_names_from_the_file(tmp_path):
+    import third_party_telemetry
+
+    env_file = tmp_path / "service.env"
+    env_file.write_text("MEM0_TELEMETRY=true\nGRAPHITI_TELEMETRY_ENABLED=true\nOTHER=1\nBARE_KEY\n")
+    environ = {"GRAPHITI_TELEMETRY_ENABLED": "0"}
+    third_party_telemetry.apply_defaults(environ, env_file=str(env_file))
+    assert environ == {"GRAPHITI_TELEMETRY_ENABLED": "0", "MEM0_TELEMETRY": "true"}
+    missing = {}
+    third_party_telemetry.apply_defaults(missing, env_file=str(tmp_path / "absent.env"))
+    assert missing == {"MEM0_TELEMETRY": "false", "GRAPHITI_TELEMETRY_ENABLED": "false"}
+    bare = tmp_path / "bare.env"
+    bare.write_text("MEM0_TELEMETRY\n")  # a name without a value sets nothing
+    environ = {}
+    third_party_telemetry.apply_defaults(environ, env_file=str(bare))
+    assert environ["MEM0_TELEMETRY"] == "false"
