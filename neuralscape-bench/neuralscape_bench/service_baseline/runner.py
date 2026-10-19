@@ -182,10 +182,41 @@ ARMS: dict[str, dict[str, str]] = {
     "enforce": {"LEDGER_ENABLED": "true", "AUTHORITY_ENABLED": "true", "NS_POLICY_MODE": "enforce",
                 "NS_AUTH_PROFILE": "enforced", "HARNESS_WIRE_ENFORCER": "1"},
 }
+OVERRIDE_ENV = "NS_BENCH_COMPOSE_OVERRIDE"
+# The checked-in override that makes the stack's default network internal (no route out of the host).
+NO_EGRESS_OVERRIDE = BENCH_DIR / "scripts" / "service_baseline" / "compose.no-egress.yml"
+# Set by main() from --compose-override or the environment; None keeps the compose file exactly as shipped.
+COMPOSE_OVERRIDE: Path | None = None
+
+
+def resolve_override(argument: str | None, environ: dict[str, str] | None = None) -> Path | None:
+    """The compose override to apply: the argument wins over the environment variable; a missing file is an error."""
+
+    chosen = argument or (os.environ if environ is None else environ).get(OVERRIDE_ENV) or ""
+    if not chosen.strip():
+        return None
+    path = Path(chosen)
+    if not path.is_file():
+        raise ValueError(f"compose override {chosen!r} is not a file")
+    return path.resolve()
+
+
+def compose_argv(*args: str, override: Path | None = None) -> list[str]:
+    files = ["-f", str(COMPOSE_FILE)] + (["-f", str(override)] if override is not None else [])
+    return ["docker", "compose", "-p", PROJECT, *files, *args]
 
 
 def compose(*args: str, env: dict[str, str]) -> str:
-    return sh("docker", "compose", "-p", PROJECT, "-f", str(COMPOSE_FILE), *args, env=env)
+    return sh(*compose_argv(*args, override=COMPOSE_OVERRIDE), env=env)
+
+
+def assert_network_internal() -> bool:
+    """With an override the stack's network must really be internal: egress-free by construction, checked on Docker."""
+
+    verdict = sh("docker", "network", "inspect", f"{PROJECT}_default", "--format", "{{.Internal}}").strip()
+    if verdict != "true":
+        raise RuntimeError(f"the bench network {PROJECT}_default is not internal (Internal={verdict!r}): refusing to measure with egress")
+    return True
 
 
 def start_postgres(env: dict[str, str]) -> None:
@@ -257,8 +288,8 @@ def cold_start_seconds(env: dict[str, str], timeout_s: float = 420) -> float:
     compose("up", "-d", *started, env=env)
     while time.monotonic() - start < timeout_s:
         probe = subprocess.run(
-            ["docker", "compose", "-p", PROJECT, "-f", str(COMPOSE_FILE), "exec", "-T", "api", "python", "-c",
-             "import urllib.request;urllib.request.urlopen('http://localhost:8199/health/live',timeout=3)"],
+            compose_argv("exec", "-T", "api", "python", "-c",
+                         "import urllib.request;urllib.request.urlopen('http://localhost:8199/health/live',timeout=3)", override=COMPOSE_OVERRIDE),
             capture_output=True, env={**os.environ, **env})
         if probe.returncode == 0:
             return time.monotonic() - start
@@ -330,7 +361,11 @@ def main() -> None:
     parser.add_argument("--series", default="", help="series id for interleaved comparisons")
     parser.add_argument("--position", type=int, default=0, help="position of this run within its repetition")
     parser.add_argument("--rep", type=int, default=0, help="repetition number within the series")
+    parser.add_argument("--compose-override", default=None,
+                        help=f"extra compose file merged over the stack (e.g. {NO_EGRESS_OVERRIDE.name}); default: ${OVERRIDE_ENV}")
     args = parser.parse_args()
+    global COMPOSE_OVERRIDE
+    COMPOSE_OVERRIDE = resolve_override(args.compose_override)
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -347,6 +382,9 @@ def main() -> None:
             start_postgres(env)
         compose("run", "--rm", "--no-deps", "seed", env=env)
         record["cold_start_seconds"] = cold_start_seconds(env)
+        record["compose_override"] = str(COMPOSE_OVERRIDE) if COMPOSE_OVERRIDE else None
+        if COMPOSE_OVERRIDE is not None:
+            record["network_internal"] = assert_network_internal()
         sampler.start()
         compose("run", "--rm", "--no-deps", "driver", "--base-url", "http://api:8199",
                 "--out", "/out/driver.json", "--nonce", nonce, *args.driver_args.split(), env=env)

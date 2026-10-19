@@ -31,6 +31,9 @@ x-service-env: &service-env
   NS_AUTH_PROFILE: ${NS_AUTH_PROFILE:-legacy_compat}
   NEURALSCAPE_USER_TOKEN_SECRET: ${TOKEN_SECRET:-}
   HARNESS_WIRE_ENFORCER: ${HARNESS_WIRE_ENFORCER:-0}
+  # No telemetry leaves the stack: mem0 and Graphiti send usage events unless told not to.
+  MEM0_TELEMETRY: "False"
+  GRAPHITI_TELEMETRY_ENABLED: "false"
 
 x-service-mounts: &service-mounts
   - ${BENCH_DIR}:/bench:ro
@@ -73,6 +76,7 @@ services:
 
   qdrant:
     image: qdrant/qdrant:v1.15.0
+    environment: {QDRANT__TELEMETRY_DISABLED: "true"}
     deploy: {resources: {limits: {memory: 2G}}}
     healthcheck:
       test: ["CMD-SHELL", "bash -c ':> /dev/tcp/localhost/6333'"]

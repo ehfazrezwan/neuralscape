@@ -247,3 +247,84 @@ def test_run_selection_rule_and_summary(tmp_path):
     assert "6.0 [5.0-7.0] (n=2)" in clean and "99.0" not in clean
     assert "(n=3)" in report.summarize(runs, "all")
     assert report.is_clean({"host_before": {"other_running_containers": ["x"]}}) is False
+
+# ---- egress-free by construction: the override, the telemetry switches, the network check
+
+from pathlib import Path
+
+from neuralscape_bench.service_baseline import runner
+
+COMPOSE = Path(runner.COMPOSE_FILE)
+
+
+def test_compose_argv_without_an_override_is_exactly_the_shipped_file():
+    argv = runner.compose_argv("up", "-d", "api")
+    assert argv == ["docker", "compose", "-p", runner.PROJECT, "-f", str(COMPOSE), "up", "-d", "api"]
+
+
+def test_compose_argv_merges_the_override_after_the_shipped_file(tmp_path):
+    override = tmp_path / "o.yml"
+    argv = runner.compose_argv("down", override=override)
+    assert argv[:8] == ["docker", "compose", "-p", runner.PROJECT, "-f", str(COMPOSE), "-f", str(override)]
+    assert argv[-1] == "down"
+
+
+def test_the_override_argument_wins_over_the_environment(tmp_path):
+    first, second = tmp_path / "a.yml", tmp_path / "b.yml"
+    first.write_text("x: 1\n")
+    second.write_text("x: 2\n")
+    assert runner.resolve_override(str(first), {runner.OVERRIDE_ENV: str(second)}) == first.resolve()
+    assert runner.resolve_override(None, {runner.OVERRIDE_ENV: str(second)}) == second.resolve()
+    assert runner.resolve_override(None, {}) is None
+    assert runner.resolve_override("  ", {runner.OVERRIDE_ENV: ""}) is None
+
+
+def test_a_missing_override_file_is_an_error_not_a_silent_egress_run(tmp_path):
+    with pytest.raises(ValueError, match="not a file"):
+        runner.resolve_override(str(tmp_path / "missing.yml"), {})
+    with pytest.raises(ValueError, match="not a file"):
+        runner.resolve_override(None, {runner.OVERRIDE_ENV: str(tmp_path)})   # a directory
+
+
+def test_compose_runs_use_the_module_override(monkeypatch, tmp_path):
+    calls = []
+    monkeypatch.setattr(runner, "sh", lambda *args, **kwargs: calls.append(args) or "")
+    monkeypatch.setattr(runner, "COMPOSE_OVERRIDE", tmp_path / "o.yml")
+    runner.compose("ps", env={})
+    assert calls[0][calls[0].index("-f", 6) + 1] == str(tmp_path / "o.yml")
+    monkeypatch.setattr(runner, "COMPOSE_OVERRIDE", None)
+    calls.clear()
+    runner.compose("ps", env={})
+    assert calls[0].count("-f") == 1
+
+
+def test_the_checked_in_override_makes_the_default_network_internal():
+    text = runner.NO_EGRESS_OVERRIDE.read_text()
+    uncommented = "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("#"))
+    assert uncommented.split() == ["networks:", "default:", "internal:", "true"]
+
+
+@pytest.mark.parametrize("verdict, ok", [("true\n", True), ("false\n", False), ("\n", False)])
+def test_the_network_must_really_be_internal(monkeypatch, verdict, ok):
+    monkeypatch.setattr(runner, "sh", lambda *args, **kwargs: verdict)
+    if ok:
+        assert runner.assert_network_internal() is True
+    else:
+        with pytest.raises(RuntimeError, match="not internal"):
+            runner.assert_network_internal()
+
+
+def test_the_stack_switches_off_mem0_graphiti_and_qdrant_telemetry():
+    text = COMPOSE.read_text()
+    head = text.split("x-service-mounts:")[0]
+    assert 'MEM0_TELEMETRY: "False"' in head and 'GRAPHITI_TELEMETRY_ENABLED: "false"' in head
+    assert 'QDRANT__TELEMETRY_DISABLED: "true"' in text
+    # every NS application service takes the shared environment block
+    for service in ("api", "worker", "graph-worker", "ingest-worker"):
+        joined = "\n".join(text.split(f"\n  {service}:")[1].splitlines()[:8])
+        assert "*service-env" in joined, service
+
+
+def test_the_synthetic_provider_is_the_only_provider_in_the_stack():
+    text = COMPOSE.read_text()
+    assert "GOOGLE_API_KEY: fake-key" in text and "FAKE_GENAI_BASE_URL: http://fake-provider:8080" in text
