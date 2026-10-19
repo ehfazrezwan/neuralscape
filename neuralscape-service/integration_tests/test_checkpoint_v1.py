@@ -443,10 +443,14 @@ async def run_app_worker(world: World, monkeypatch) -> None:
 
     import worker as worker_module
     from arq.worker import create_worker
+    from config import parse_redis_settings
 
     monkeypatch.setattr(worker_module, "MemoryService", lambda: world.service)
     runner = create_worker(
         worker_module.LedgerWorkerSettings,
+        # The class reads the Redis URL when ``worker`` is first imported (possibly by another test
+        # module, before this world set it): build the worker from the URL in force now.
+        redis_settings=parse_redis_settings(),
         burst=True,
         poll_delay=0.1,
         handle_signals=False,
@@ -467,10 +471,14 @@ async def run_app_worker_until(world: World, monkeypatch, predicate, timeout: fl
 
     import worker as worker_module
     from arq.worker import create_worker
+    from config import parse_redis_settings
 
     monkeypatch.setattr(worker_module, "MemoryService", lambda: world.service)
     runner = create_worker(
         worker_module.LedgerWorkerSettings,
+        # The class reads the Redis URL when ``worker`` is first imported (possibly by another test
+        # module, before this world set it): build the worker from the URL in force now.
+        redis_settings=parse_redis_settings(),
         burst=False,
         poll_delay=0.1,
         handle_signals=False,
