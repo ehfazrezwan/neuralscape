@@ -1,7 +1,8 @@
 import json
+import math
 import os
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Literal
 from urllib.parse import urlparse
 
 from arq.connections import RedisSettings
@@ -106,6 +107,7 @@ class Settings(BaseSettings):
     # LLM retry (exponential backoff for transient 503/429 errors)
     llm_max_retries: int = 3
     llm_retry_base_delay: float = 1.0  # seconds
+
     llm_retry_max_delay: float = 30.0  # seconds
 
     # Dedup cron
@@ -145,6 +147,7 @@ class Settings(BaseSettings):
     # followed; delivery is a fire-and-forget 5s-capped daemon thread
     # (see webhooks.py).
     webhook_queue_empty_url: str = ""
+
 
     # ── Observability: SSE live stream (roadmap E1) ───────────────────
     # When enabled, memory events (memory_stored, dream actions applied,
@@ -548,12 +551,43 @@ class Settings(BaseSettings):
     sensitivity_gate_enabled: bool = True
     sensitivity_private_classes: str = "financial,equity_compensation,client_commercial,credentials_pii"
 
+    # ── Durable ledger (intent/outbox acceptance) ─────────────────────────
+    # Off by default: no code path consults the ledger unless enabled.
+    #   ledger_backend       → "sqlite" (self-hosted default: embedded, single
+    #     owning host, local filesystem, WAL, synchronous FULL, no new service)
+    #     or "postgres" (hosted tenant cells; optional for self-hosters). The
+    #     ledger stays disabled until explicitly enabled.
+    #   ledger_sqlite_path   → database file on a local filesystem.
+    #   ledger_postgres_dsn  → libpq connection string for the cell database.
+    ledger_enabled: bool = False
+    #   ledger_retention_postgres_dsn → a maintenance role that may delete aged tombstones (PostgreSQL only;
+    #     the runtime role cannot).  Needed only when ledger_retention_tombstone_days is set.
+    ledger_retention_postgres_dsn: str = ""
+    ledger_backend: str = "sqlite"
+    ledger_sqlite_path: str = ""
+    ledger_postgres_dsn: str = ""
+    #   ledger_postgres_migrate_on_open → True (default) opens as the schema owner and applies migrations.
+    #     False opens as a least-privilege runtime role: it must not be a superuser or BYPASSRLS and the
+    #     schema must already be migrated and granted (``python -m ledger.admin migrate`` then ``grant``).
+    ledger_postgres_migrate_on_open: bool = True
+    # ── Tenant admission control (cell edge; every limit unset = unlimited) ───
+    # Mechanism only: no default numbers, no advertised quota (that policy is
+    # not selected).  Used by ``tenant_admission`` (ASGI middleware or the edge
+    # proxy).  Rate refusals and concurrency/queue refusals are HTTP 429 with a
+    # Retry-After; a cell whose required capability is not ready answers 503.
+    tenant_admission_enabled: bool = False
+    tenant_admission_rate_per_second: float | None = None
+    tenant_admission_burst: int | None = None
+    tenant_admission_max_concurrency: int | None = None
+    tenant_admission_max_queue_depth: int | None = None
+
     # Service
     host: str = "0.0.0.0"
     port: int = 8199
     default_user_id: str = "default_user"
     default_project_id: str | None = None
     mcp_transport: str = "stdio"  # "stdio" or "http"
+
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
 
@@ -573,6 +607,32 @@ class Settings(BaseSettings):
         if parsed.scheme != "https" and not is_loopback:
             raise ValueError("NEURALSCAPE_PUBLIC_URL must use https:// (except loopback hosts)")
         return value.rstrip("/")
+
+    @field_validator("tenant_admission_rate_per_second")
+    @classmethod
+    def _validate_admission_rate(cls, value: float | None) -> float | None:
+        # Unset means unlimited; a set rate must be a finite positive number.
+        # NaN and infinity would otherwise reach the edge and crash it on start.
+        if value is not None and not (math.isfinite(value) and value > 0):
+            raise ValueError("TENANT_ADMISSION_RATE_PER_SECOND must be a finite positive number")
+        return value
+
+    @field_validator(
+        "tenant_admission_burst",
+        "tenant_admission_max_concurrency",
+    )
+    @classmethod
+    def _validate_admission_positive_int(cls, value: int | None) -> int | None:
+        if value is not None and value <= 0:
+            raise ValueError("admission burst and concurrency must be positive when set")
+        return value
+
+    @field_validator("tenant_admission_max_queue_depth")
+    @classmethod
+    def _validate_admission_queue(cls, value: int | None) -> int | None:
+        if value is not None and value < 0:
+            raise ValueError("TENANT_ADMISSION_MAX_QUEUE_DEPTH must not be negative")
+        return value
 
     @field_validator("oauth_access_ttl", "oauth_refresh_ttl")
     @classmethod

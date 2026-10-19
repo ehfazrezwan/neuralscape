@@ -5,6 +5,7 @@ categories, and a shared MemoryService business logic layer.
 """
 
 import asyncio
+import re
 import base64
 import hashlib
 import json
@@ -15,6 +16,7 @@ from datetime import datetime, timezone
 
 from fastapi import (
     APIRouter,
+    Depends,
     FastAPI,
     File,
     Form,
@@ -77,6 +79,7 @@ from schemas import (
     TimelineResponse,
     normalize_visibility,
 )
+from ledger.port import HoldActive, IdempotencyConflict
 from task_manager import TaskManager
 
 logger = logging.getLogger(__name__)
@@ -245,6 +248,7 @@ app = FastAPI(
     version="0.2.0",
     lifespan=lifespan,
 )
+
 
 # Register Bearer token auth middleware (no-op when NEURALSCAPE_API_KEY is unset)
 from auth import BearerAuthMiddleware
@@ -507,6 +511,7 @@ async def add_memory_async(req: LegacyAddMemoryRequest, request: Request):
         user_id=user_id,
         agent_id=req.agent_id,
         run_id=req.run_id,
+        **_ledger_kwargs(request),
     )
     return TaskAcceptedResponse(
         task_id=task_id,
@@ -928,12 +933,29 @@ async def v1_store_raw_memory(req: RawMemoryRequest, request: Request):
     if "expires_at" in raw_kwargs and hasattr(raw_kwargs["expires_at"], "isoformat"):
         raw_kwargs["expires_at"] = raw_kwargs["expires_at"].isoformat()
 
+    if settings.ledger_enabled:
+        # Durable path: an optional client idempotency key makes retries safe.
+        idempotency_key = _idempotency_key_from(request)
+        if idempotency_key is not None:
+            raw_kwargs["idempotency_key"] = idempotency_key
+
     try:
         task_id = await _task_manager.enqueue_raw(**raw_kwargs)
-    except (ConnectionError, OSError) as e:
+    except Exception as e:
+        if settings.ledger_enabled:
+            from ledger.port import IdempotencyConflict
+
+            if isinstance(e, IdempotencyConflict):
+                raise HTTPException(
+                    status_code=409,
+                    detail="Idempotency-Key was already used with a different request",
+                ) from e
+        if not isinstance(e, (ConnectionError, OSError)):
+            raise
         logger.warning(f"Redis unavailable, falling back to sync store: {e}")
         # Sync path expects datetime, not ISO string
         sync_kwargs = dict(raw_kwargs)
+        sync_kwargs.pop("idempotency_key", None)
         if "expires_at" in sync_kwargs and isinstance(sync_kwargs["expires_at"], str):
             try:
                 sync_kwargs["expires_at"] = datetime.fromisoformat(
@@ -1879,7 +1901,19 @@ async def v1_sync_connector(connector_id: str, request: Request):
     """Trigger an immediate sync for one of the caller's connectors."""
     vault = _require_vault()
     caller = _resolve_user_id(request, None)
-    await _require_owned_connector(vault, connector_id, caller)
+    record = await _require_owned_connector(vault, connector_id, caller)
+    if _durable():
+        from ledger.port import IdempotencyConflict
+
+        try:
+            task_id = await _task_manager.enqueue_connector_sync(
+                connector_id, record=record, idempotency_key=_idempotency_key_from(request)
+            )
+        except IdempotencyConflict as conflict:
+            raise HTTPException(
+                status_code=409, detail="Idempotency-Key was already used with a different request"
+            ) from conflict
+        return TaskAcceptedResponse(task_id=task_id, poll_url=f"/v1/memories/status/{task_id}")
     task_id = await _task_manager.enqueue_connector_sync(connector_id)
     return TaskAcceptedResponse(task_id=task_id, poll_url=f"/v1/memories/status/{task_id}")
 
@@ -1951,7 +1985,7 @@ async def v1_store_raw_batch(req: RawMemoryBatchRequest, request: Request):
             raise HTTPException(status_code=he.status_code, detail=f"Item {idx}: {he.detail}") from he
 
     try:
-        task_id = await _task_manager.enqueue_raw_batch(items=items_payload)
+        task_id = await _task_manager.enqueue_raw_batch(items=items_payload, **_ledger_kwargs(request))
     except (ConnectionError, OSError) as e:
         logger.warning(f"Redis unavailable, falling back to sync batch store: {e}")
         memories = await asyncio.to_thread(_service.store_raw_batch, items_payload)
@@ -2102,6 +2136,8 @@ async def v1_search_memories(req: SearchMemoryRequest, request: Request):
     except Exception as e:
         logger.exception("v1 search failed")
         raise HTTPException(status_code=500, detail="Memory search failed")
+
+
 
 
 @v1_router.post("/memories/batch-get", response_model=GetMemoriesResponse)
@@ -2273,7 +2309,7 @@ async def v1_checkpoint(req: CheckpointRequest, request: Request):
         )
 
     try:
-        task_id = await _task_manager.enqueue_raw_batch(items=prepared["to_enqueue"])
+        task_id = await _task_manager.enqueue_raw_batch(items=prepared["to_enqueue"], **_ledger_kwargs(request))
     except (ConnectionError, OSError) as e:
         logger.warning(f"Redis unavailable, falling back to sync checkpoint store: {e}")
         await asyncio.to_thread(_service.store_raw_batch, prepared["to_enqueue"])
@@ -2396,6 +2432,8 @@ async def v1_metrics(
     caller = _resolve_user_id(request, user_id)
     snapshot = await asyncio.to_thread(sm.metrics_snapshot, caller, None, task_id)
     return {"status": "ok", "savings_meter": snapshot}
+
+
 
 
 @v1_router.get("/queue/status", response_model=QueueStatusResponse)
@@ -2807,6 +2845,12 @@ async def v1_export_okf(
     )
 
 
+# ── Portable export (default off: PORTABILITY_EXPORT_ENABLED) ──────────────
+
+
+# ── Portable import (default off: PORTABILITY_IMPORT_ENABLED) ──────────────
+
+
 @v1_router.get("/memories", response_model=list[MemoryResponse])
 async def v1_list_memories(
     request: Request,
@@ -2925,6 +2969,39 @@ async def v1_get_reasoning_chain(
     return {"status": "ok", "chain": chain}
 
 
+def _idempotency_key_from(request: Request) -> str | None:
+    key = request.headers.get("Idempotency-Key")
+    if key is not None and (not key.strip() or len(key) > 200):
+        raise HTTPException(status_code=400, detail="Idempotency-Key must be 1-200 characters")
+    return key
+
+
+def _ledger_kwargs(request: Request) -> dict:
+    """``{"idempotency_key": ...}`` for the durable path when a client sent the header."""
+
+    if not settings.ledger_enabled:
+        return {}
+    key = _idempotency_key_from(request)
+    return {} if key is None else {"idempotency_key": key}
+
+
+def _durable() -> bool:
+    """Whether a new write is accepted by the ledger (the cutover phase decides when it is enabled)."""
+
+    return bool(
+        settings.ledger_enabled
+        and getattr(_task_manager, "producer", None) is not None
+        and _task_manager._durable_route()
+    )
+
+
+@app.exception_handler(IdempotencyConflict)
+async def _idempotency_conflict_handler(request: Request, exc: IdempotencyConflict):
+    return JSONResponse(
+        status_code=409, content={"detail": "Idempotency-Key was already used with a different request"}
+    )
+
+
 @v1_router.patch("/memories/{memory_id}")
 @v1_router.put("/memories/{memory_id}")  # transitional alias for the old update route
 async def v1_patch_memory(memory_id: str, req: PatchMemoryRequest, request: Request):
@@ -3000,7 +3077,7 @@ async def v1_retag_memories(req: RetagRequest, request: Request):
         return JSONResponse(status_code=200, content=result)
 
     try:
-        task_id = await _task_manager.enqueue_retag(caller, filters, ops)
+        task_id = await _task_manager.enqueue_retag(caller, filters, ops, **_ledger_kwargs(request))
     except (ConnectionError, OSError) as e:
         if "set_project_id" in ops:
             # A project change migrates graph partitions, which needs the graph
@@ -3431,6 +3508,27 @@ async def v1_audit_private_leakage(req: AuditPrivateLeakageRequest, request: Req
         raise HTTPException(status_code=500, detail="Failed to audit private leakage") from e
 
 
+# ── Scoped credentials and service accounts (off unless CREDENTIALS_ENABLED) ──
+
+
+# ── Opaque-envelope relay (E2EE_RELAY_ENABLED; 404 while off) ─────────────────
+# The relay stores ciphertext, signed membership entries, signed checkpoints,
+# wrapped epoch keys and sealed jobs.  It never holds a key or sees plaintext.
+# Handlers are thin: ``e2ee_relay.dispatch`` owns the flag, error mapping and
+# storage, and every operation is registered in the action policy registry.
+
+
+# ── Engine switch (privileged; default off: ENGINE_ROUTING_ENABLED) ──────────────
+#
+# Moves the routed vector engine between generations: status, start-dual-write,
+# catch-up, flip, rollback, abandon.  Dictator-only like the other admin routes;
+# 404 while the feature is off, 503 (with the reason) when it is on but this
+# process could not build the switch at startup.
+
+
+# ── Online cutover of legacy writers to the ledger (privileged; off unless LEDGER_CUTOVER_ENABLED) ──
+
+
 # Mount v1 router
 app.include_router(v1_router)
 
@@ -3442,6 +3540,9 @@ app.include_router(v1_router)
 from oauth import router as oauth_router
 
 app.include_router(oauth_router)
+
+# Optional server-rendered team console. Off unless CONSOLE_ENABLED is set; it
+# calls this app's own public API with the signed-in credential (no backdoor).
 
 
 class _McpTrailingSlash:

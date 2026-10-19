@@ -54,6 +54,8 @@ dependencies = [
     # intentionally excluded to keep the image lean.
     "markitdown[docx,pptx,xlsx,xls,pdf]>=0.0.1a3",
     "tiktoken>=0.13.0",
+    "pyhpke==0.6.5",
+    "psycopg[binary]==3.3.6",
 ]
 
 [tool.hatch.build.targets.wheel]

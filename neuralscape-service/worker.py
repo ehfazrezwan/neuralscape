@@ -81,6 +81,8 @@ async def process_session_summary(
     return await refresh_slot(user_id, session_id, slot, llm_call=_async_call_gemini)
 
 
+
+
 async def process_memory_store(
     ctx: dict,
     messages: list[dict],
@@ -1076,6 +1078,8 @@ async def synthesize_strategy_playbooks_cron(ctx: dict) -> dict:
     }
 
 
+
+
 def _generate_job_id(content: str, user_id: str) -> str:
     """Generate a deterministic job ID from content + user_id."""
     h = hashlib.sha256(f"{user_id}:{content}".encode()).hexdigest()[:16]
@@ -1207,6 +1211,9 @@ async def auto_compile_check(ctx: dict) -> dict | None:
 
     if not compiler_settings.auto_compile:
         return None
+    if ctx.get("ledger") is not None:
+        # This cron compiles for the *default user*; under the ledger no cron may act as one.
+        return {"skipped": True, "reason": "default-user cron is disabled while the ledger is on"}
 
     now = datetime.now()
     if now.hour < compiler_settings.compile_after_hour:
@@ -1373,6 +1380,8 @@ def _connector_sync_cron_hours() -> list[int]:
     return list(range(0, 24, interval))
 
 
+
+
 def _make_after_job_end(queue_name: str):
     """Build the per-queue ``after_job_end`` hook: queue.empty webhook (C4).
 
@@ -1437,6 +1446,7 @@ async def startup(ctx: dict) -> None:
     await registry.discover()
     await registry.startup_all()
     ctx["extension_registry"] = registry
+
 
     # Connector vault (only when connectors are enabled + a vault key is set).
     if settings.connectors_enabled:

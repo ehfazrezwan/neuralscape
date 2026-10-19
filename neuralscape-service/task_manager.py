@@ -3,6 +3,7 @@
 Centralizes task enqueuing and status tracking, replacing the in-memory _tasks dict.
 """
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -40,6 +41,13 @@ class TaskManager:
 
     def __init__(self):
         self.pool: ArqRedis | None = None
+        # Durable ordinary-write path; both stay None unless LEDGER_ENABLED.
+        self.ledger = None
+        self.producer = None
+        self.authority = None
+        # Online cutover phase machine; None unless LEDGER_CUTOVER_ENABLED (then every write follows its phase).
+        self.cutover = None
+        self._owner_client = None  # synchronous Redis client for job-owner lookups
 
     async def connect(self) -> None:
         """Initialize the ARQ Redis connection pool."""
@@ -48,6 +56,13 @@ class TaskManager:
             default_queue_name=settings.arq_queue_name,
         )
         logger.info("TaskManager connected to Redis")
+    def _durable_route(self) -> bool:
+        """Whether a new write is accepted by the ledger (the cutover phase decides when enabled)."""
+
+        if self.producer is None:
+            return False
+        return self.cutover is None or self.cutover.writes_use_ledger()
+
 
     async def _track_task(self, user_id: str | None, task_id: str) -> None:
         """Best-effort per-caller task bookkeeping (C4 queue visibility).
@@ -60,6 +75,8 @@ class TaskManager:
         """
         if not user_id or self.pool is None:
             return
+        if self.producer is not None and task_id.startswith("intent-"):
+            return  # durable intents are tracked by the ledger, not ARQ
         try:
             now = time.time()
             ttl = max(int(settings.queue_status_window_s) * 2, 600)
@@ -324,7 +341,9 @@ class TaskManager:
         await self._track_task(payload.get("user_id"), task_id)
         return task_id
 
-    async def enqueue_connector_sync(self, connector_id: str) -> str:
+    async def enqueue_connector_sync(
+        self, connector_id: str, *, record: dict | None = None, idempotency_key: str | None = None
+    ) -> str:
         """Enqueue a connector sync task. Returns job_id.
 
         Job id is keyed on the connector instance so overlapping syncs of the
@@ -344,7 +363,7 @@ class TaskManager:
             return job_id
         return job.job_id
 
-    async def enqueue_raw_batch(self, items: list[dict]) -> str:
+    async def enqueue_raw_batch(self, items: list[dict], *, idempotency_key: str | None = None) -> str:
         """Enqueue a batch of raw memory storage tasks (memory-model v2).
 
         Items are dispatched as a single ARQ job. Job ID is deterministic
@@ -372,7 +391,8 @@ class TaskManager:
             await self._track_task(uid, task_id)
         return task_id
 
-    async def enqueue_retag(self, caller_user_id: str, filters: dict, ops: dict) -> str:
+    async def enqueue_retag(self, caller_user_id: str, filters: dict, ops: dict,
+                            *, idempotency_key: str | None = None) -> str:
         """Enqueue a bulk retag task on the fast queue. Returns job_id.
 
         Canonical-JSON job id (sort_keys) so two *different* retags can never
@@ -583,6 +603,12 @@ class TaskManager:
         if self.pool:
             await self.pool.aclose()
             logger.info("TaskManager disconnected from Redis")
+        if self.producer is not None:
+            await asyncio.to_thread(self.producer.payloads.close)
+            await asyncio.to_thread(self.ledger.close)
+            if self.authority is not None:
+                await asyncio.to_thread(self.authority.close)
+            self.producer = self.ledger = self.authority = None
 
 
 def _generate_job_id(content: str, user_id: str) -> str:

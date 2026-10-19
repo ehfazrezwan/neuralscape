@@ -1474,6 +1474,7 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
     arguments = arguments or {}
     user_id = current_user_id.get() or arguments.get("user_id") or settings.default_user_id
 
+
     try:
         if name == "recall_memories":
             # Phase E: fusion — when the router says code leg is warranted, execute
