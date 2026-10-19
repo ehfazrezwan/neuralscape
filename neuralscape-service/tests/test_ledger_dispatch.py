@@ -510,17 +510,29 @@ class RenewalCounter:
     """Delegating ledger that counts successful lease renewals and lets a scenario wait for the next ones."""
 
     def __init__(self, inner: LedgerPort) -> None:
-        self._inner, self._renewed, self._changed = inner, 0, threading.Condition()
+        self._inner, self._renewed, self._refused, self._changed = inner, 0, 0, threading.Condition()
 
     def __getattr__(self, name: str):
         return getattr(self._inner, name)
 
     def extend_lease(self, claim, lease_seconds):
-        renewed = self._inner.extend_lease(claim, lease_seconds)
+        try:
+            renewed = self._inner.extend_lease(claim, lease_seconds)
+        except StaleLease:
+            with self._changed:
+                self._refused += 1
+                self._changed.notify_all()
+            raise
         with self._changed:
             self._renewed += 1
             self._changed.notify_all()
         return renewed
+
+    def refused(self) -> bool:
+        """Wait for a refused renewal (the lease had lapsed); ``False`` if none comes."""
+
+        with self._changed:
+            return self._changed.wait_for(lambda: self._refused > 0, timeout=WAIT)
 
     def renewals_after(self, count: int) -> bool:
         """Wait for ``count`` renewals beyond those already seen; ``False`` if they never come."""
@@ -561,6 +573,78 @@ def scenario_heartbeat_keeps_a_long_stage_leased(store) -> None:
     finish.set()
     thread.join(WAIT)
     assert out[0].status is IntentStatus.APPLIED and out[0].lost_lease is False and out[0].attempt == 1
+
+
+def scenario_a_lease_lost_mid_stage_is_reclaimed_and_settled_exactly_once(store) -> None:
+    """When renewals do not arrive before the lease lapses (a starved worker; here the stored expiry is moved
+    past the lease while the stage runs), the next renewal is refused: the run reports a lost lease, can record
+    nothing more (every write is fenced by the claim) and leaves the intent PROCESSING.  The obligation is not
+    stranded: its lease has expired, so another worker claims it and settles it, each effect exactly once (the
+    vector effect the first worker already put is found by ``inspect``, not applied again)."""
+
+    ledger, external = store.open(), store.external()
+    ledger.accept(intent("memory.write.raw"))
+    entered, finish = threading.Event(), threading.Event()
+
+    def long_stage(ctx: StageContext) -> None:
+        if ctx.stage is V:
+            entered.set()
+            finish.wait(WAIT)
+
+    renewals = RenewalCounter(store.open())
+    worker = StageWorker(renewals, all_handlers(external, **{V: Handler(external, hook=long_stage)}),
+                         owner="starved", lease_seconds=30, heartbeat_seconds=0.05)
+    out: list = []
+    thread = threading.Thread(target=lambda: out.append(worker.run_once()))
+    thread.start()
+    assert entered.wait(WAIT)
+    store.shift_leases(-60)  # the renewals did not come in time: the lease has lapsed
+    assert renewals.refused(), "the heartbeat never noticed the lapsed lease"
+    finish.set()
+    thread.join(WAIT)
+    lost = out[0]
+    assert lost.lost_lease is True and lost.status is IntentStatus.PROCESSING and lost.attempt == 1
+    assert ledger.get_intent("tenant-1", "intent-1").status is IntentStatus.PROCESSING  # unsettled, not stranded
+    rescued = StageWorker(store.open(), all_handlers(external), owner="rescuer", lease_seconds=30).run_once()
+    assert rescued is not None and rescued.status is IntentStatus.APPLIED and rescued.attempt == 2
+    assert rescued.outcomes[C] == "applied (earlier attempt)"
+    assert external.effects() == len(stage_set("memory.write.raw").stages)  # each effect exactly once
+    assert external.calls("vector_upsert") == 1  # the starved worker's put is recovered, not repeated
+    assert ledger.get_intent("tenant-1", "intent-1").status is IntentStatus.APPLIED
+
+
+def scenario_a_lease_that_lapses_during_settle_is_reclaimed_without_rerunning_stages(store) -> None:
+    """Settling holds the ledger for its whole transaction and runs after the heartbeat stops, so it must finish
+    within the lease.  If it does not (a slow settle on a loaded runner; here the stored expiry is moved past the
+    lease just before it), the fenced settle is refused: the run reports a lost lease and the intent stays
+    PROCESSING with every stage already applied.  Another worker claims the expired obligation and settles it
+    without running any stage again."""
+
+    ledger, external = store.open(), store.external()
+    ledger.accept(intent("memory.write.raw"))
+
+    class LapseBeforeSettle:
+        def __init__(self, inner):
+            self._inner = inner
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+        def settle(self, *args, **kwargs):
+            store.shift_leases(-60)  # the settle outlived the lease
+            return self._inner.settle(*args, **kwargs)
+
+    first = StageWorker(LapseBeforeSettle(store.open()), all_handlers(external), owner="slow-settle",
+                        lease_seconds=30, heartbeat_seconds=0.05).run_once()
+    assert first.lost_lease is True and first.status is IntentStatus.PROCESSING and first.attempt == 1
+    assert all(outcome == "applied" for outcome in first.outcomes.values())  # every stage ran and was recorded
+    assert ledger.get_intent("tenant-1", "intent-1").status is IntentStatus.PROCESSING  # unsettled, not stranded
+    calls_before = external.calls()
+    rescued = StageWorker(store.open(), all_handlers(external), owner="rescuer", lease_seconds=30).run_once()
+    assert rescued is not None and rescued.status is IntentStatus.APPLIED and rescued.attempt == 2
+    assert all(outcome == "applied (earlier attempt)" for outcome in rescued.outcomes.values())
+    assert external.calls() == calls_before  # no stage ran again
+    assert external.effects() == len(stage_set("memory.write.raw").stages)
 
 
 def scenario_skipped_by_handler_is_reported(store) -> None:
