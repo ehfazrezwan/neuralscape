@@ -49,6 +49,9 @@ const SERVER_URL = `http://127.0.0.1:${typeof address === "object" && address ? 
 process.env.NEURALSCAPE_URL = SERVER_URL;
 process.env.NEURALSCAPE_USER_ID = "shape-test";
 process.env.NEURALSCAPE_TEST = "1";
+// Direct delivery: the offset tests below need a failed POST to be a failed delivery (a durable outbox, where one
+// exists, would accept the turn and count it delivered).
+process.env.NEURALSCAPE_DURABLE_OUTBOX = "false";
 
 const { commitClaudeCodeFlush, extractAllTurnPairs, extractClaudeCodeTurns, legacyRewindOffset } = await import(
   "../src/adapters/claude-code.js"
@@ -286,7 +289,7 @@ function runHook(script: string, stdin: string): Promise<Run> {
     (dataDir) =>
       new Promise<Run>((resolve, reject) => {
         const child = spawn("node", [join(PLUGIN_ROOT, "scripts", script)], {
-          env: { PATH: process.env.PATH ?? "", NEURALSCAPE_USER_ID: "shape-test", NEURALSCAPE_URL: SERVER_URL, CLAUDE_PLUGIN_DATA: dataDir },
+          env: { PATH: process.env.PATH ?? "", NEURALSCAPE_USER_ID: "shape-test", NEURALSCAPE_URL: SERVER_URL, CLAUDE_PLUGIN_DATA: dataDir, NEURALSCAPE_DURABLE_OUTBOX: "false" },
           stdio: ["pipe", "pipe", "pipe"],
         });
         let stdout = "";
