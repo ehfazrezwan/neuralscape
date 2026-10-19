@@ -80,6 +80,11 @@ ENV PATH="/app/neuralscape-service/.venv/bin:$PATH"
 ENV NEO4J_URI=neo4j://neo4j:7687 \
     QDRANT_PATH=/data/qdrant
 
+# Vendored mem0/Graphiti send anonymous usage telemetry to an external host
+# unless disabled. Off by default; opt in by setting either variable at run time.
+ENV MEM0_TELEMETRY=false \
+    GRAPHITI_TELEMETRY_ENABLED=false
+
 WORKDIR /app/neuralscape-service
 
 # Run as non-root user
@@ -149,7 +154,9 @@ COPY neuralscape-service/scripts/ neuralscape-service/scripts/
 ENV PATH="/app/neuralscape-service/.venv/bin:$PATH"
 ENV NEO4J_URI=neo4j://neo4j:7687 \
     QDRANT_PATH=/data/qdrant \
-    PYTHONDONTWRITEBYTECODE=1
+    PYTHONDONTWRITEBYTECODE=1 \
+    MEM0_TELEMETRY=false \
+    GRAPHITI_TELEMETRY_ENABLED=false
 
 WORKDIR /app/neuralscape-service
 

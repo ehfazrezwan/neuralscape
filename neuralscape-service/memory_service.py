@@ -7,6 +7,8 @@ the implementation lives in ``memory/*.py``; this module preserves the full
 public + test import surface.
 """
 
+import third_party_telemetry  # noqa: F401 — must precede any mem0/Graphiti import (defaults their telemetry off)
+
 import logging
 import threading
 
