@@ -6,12 +6,24 @@
  * Fallback: if no transcript, uses prompt + last_assistant_message for the last turn.
  */
 
-import { readFile } from "node:fs/promises";
+import { readFile, writeFile } from "node:fs/promises";
 import { getProjectId, getUserId, logError } from "../utils.js";
 import type { FlushResult } from "../core/flush.js";
 import type { ConversationTurn, SessionEndInput } from "../core/types.js";
 
 const OFFSET_SUFFIX = ".neuralscape-offset";
+
+/**
+ * Marker written next to the offset once a flush has been committed by a reader that understands the real
+ * transcript shape (text under `message.content`). An offset WITHOUT the marker may have been advanced by an
+ * older reader that saw every real turn as empty and skipped it, so it gets a bounded, data-driven rewind
+ * (see `legacyRewindOffset`) the first time it is read.
+ */
+const FORMAT_SUFFIX = ".neuralscape-offset.format";
+const FORMAT_VERSION = "2";
+
+/** The most transcript entries a legacy offset is ever rewound across (older undelivered turns stay lost). */
+const MAX_LEGACY_REWIND_ENTRIES = 400;
 
 /**
  * Offsets staged by extractClaudeCodeTurns, committed only after the caller
@@ -28,10 +40,20 @@ interface StagedFlush {
 
 const pendingOffsets = new Map<string, StagedFlush>();
 
+type ContentBlocks = string | Array<{ type?: string; text?: string }>;
+
+/**
+ * One transcript entry. Claude Code writes `{type, message: {role, content}, isSidechain?, isMeta?, ...}` with
+ * `content` a string (user prompts) or a block list (assistant text, tool calls, user tool results); older and
+ * simplified producers put `content` at the top level, which is still read.
+ */
 interface TranscriptMessage {
-  type: string; // "user" | "assistant" | "tool_use" | "tool_result" | ...
-  content?: string | Array<{ type: string; text?: string }>;
+  type?: string; // "user" | "assistant" | "system" | "summary" | ...
+  content?: ContentBlocks;
+  message?: { role?: string; content?: ContentBlocks };
   role?: string;
+  isSidechain?: boolean;
+  isMeta?: boolean;
 }
 
 /**
@@ -47,25 +69,35 @@ async function readFlushOffset(transcriptPath: string): Promise<number> {
   }
 }
 
+async function hasFormatMarker(transcriptPath: string): Promise<boolean> {
+  try {
+    return (await readFile(transcriptPath + FORMAT_SUFFIX, "utf-8")).trim() === FORMAT_VERSION;
+  } catch {
+    return false;
+  }
+}
+
 /**
- * Write the flush offset after successful processing.
+ * Write the flush offset after successful processing, then the format marker.
  */
 async function writeFlushOffset(
   transcriptPath: string,
   offset: number
 ): Promise<void> {
-  const { writeFile } = await import("node:fs/promises");
   await writeFile(transcriptPath + OFFSET_SUFFIX, String(offset), "utf-8");
+  await writeFile(transcriptPath + FORMAT_SUFFIX, FORMAT_VERSION, "utf-8");
 }
 
-/**
- * Extract text content from a transcript message.
- */
-function extractText(msg: TranscriptMessage): string {
-  if (typeof msg.content === "string") return msg.content;
-  if (Array.isArray(msg.content)) {
-    return msg.content
-      .filter((block) => block.type === "text" && block.text)
+function roleOf(msg: TranscriptMessage): string | undefined {
+  return msg.type || msg.role;
+}
+
+/** Text of a `content` value: a string as is, otherwise the `text` blocks (tool calls, results, thinking are not text). */
+function textOf(content: ContentBlocks | undefined): string {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content
+      .filter((block) => block && block.type === "text" && block.text)
       .map((block) => block.text!)
       .join("\n");
   }
@@ -73,7 +105,58 @@ function extractText(msg: TranscriptMessage): string {
 }
 
 /**
- * Parse a transcript file into user/assistant turn pairs.
+ * Extract the conversation text of a transcript entry. Real entries carry it under `message.content`; a top-level
+ * `content` (simplified producers) is the fallback. Meta entries (injected context) and sidechain entries
+ * (sub-agent conversations) are not part of the user's conversation and yield no text.
+ */
+function extractText(msg: TranscriptMessage): string {
+  if (msg.isMeta === true || msg.isSidechain === true) return "";
+  return textOf(msg.message?.content ?? msg.content);
+}
+
+/** What the previous reader saw: top-level `content` only. */
+function legacyText(msg: TranscriptMessage): string {
+  return textOf(msg.content);
+}
+
+function parseMessages(content: string): TranscriptMessage[] {
+  try {
+    // Try JSON array first
+    const parsed = JSON.parse(content);
+    if (Array.isArray(parsed)) return parsed;
+  } catch {
+    // not one JSON document: JSONL below
+  }
+  // JSONL (one object per line; a single-line file parses as one object above and lands here too)
+  return content
+    .split("\n")
+    .filter((line) => line.trim())
+    .map((line) => {
+      try {
+        return JSON.parse(line);
+      } catch {
+        return null;
+      }
+    })
+    .filter(Boolean) as TranscriptMessage[];
+}
+
+/** The user/assistant entries, in order. An offset counts positions in this list. */
+function relevantMessages(content: string): TranscriptMessage[] {
+  return parseMessages(content).filter((m) => {
+    const role = roleOf(m) ?? m.message?.role;
+    return role === "user" || role === "assistant";
+  });
+}
+
+/**
+ * Parse a transcript file into user/assistant turns.
+ *
+ * A turn is one real user prompt (an entry with text; a user entry that only carries tool results has none and
+ * does not end a turn) and every assistant text entry up to the next real user prompt. Entries without text
+ * (thinking, tool calls, tool results) are skipped for pairing but still count as positions, so offsets stay
+ * comparable with those written before. The returned `newOffset` never passes a user prompt that has no
+ * assistant text yet: it stays unread and is picked up by the next flush.
  */
 function parseTranscript(
   content: string,
@@ -82,58 +165,66 @@ function parseTranscript(
   turns: Array<{ user: string; assistant: string; endOffset: number }>;
   newOffset: number;
 } {
-  let messages: TranscriptMessage[];
-  try {
-    // Try JSON array first
-    messages = JSON.parse(content);
-  } catch {
-    // Try JSONL (one object per line)
-    messages = content
-      .split("\n")
-      .filter((line) => line.trim())
-      .map((line) => {
-        try {
-          return JSON.parse(line);
-        } catch {
-          return null;
-        }
-      })
-      .filter(Boolean) as TranscriptMessage[];
-  }
-
-  // Filter to user and assistant messages only
-  const relevant = messages.filter(
-    (m) =>
-      m.type === "user" ||
-      m.type === "assistant" ||
-      m.role === "user" ||
-      m.role === "assistant"
-  );
-
-  // Skip already-processed messages
-  const newMessages = relevant.slice(startOffset);
-
-  // Pair consecutive user/assistant messages. Each turn records the cursor
-  // value just past its own messages so a partially-delivered flush can
-  // commit exactly the delivered prefix (audit 27 #34b).
+  const window = relevantMessages(content).slice(startOffset);
   const turns: Array<{ user: string; assistant: string; endOffset: number }> = [];
-  for (let i = 0; i < newMessages.length - 1; i++) {
-    const msg = newMessages[i];
-    const next = newMessages[i + 1];
-    const msgRole = msg.type || msg.role;
-    const nextRole = next.type || next.role;
+  let user: { text: string; index: number } | null = null;
+  let assistantParts: string[] = [];
 
-    if (msgRole === "user" && nextRole === "assistant") {
-      turns.push({
-        user: extractText(msg),
-        assistant: extractText(next),
-        endOffset: startOffset + i + 2,
-      });
-      i++; // skip the assistant message on next iteration
+  window.forEach((entry, position) => {
+    const absolute = startOffset + position;
+    const role = roleOf(entry) ?? entry.message?.role;
+    const text = extractText(entry);
+    if (!text) return;
+    if (role === "user") {
+      if (user && assistantParts.length > 0) {
+        turns.push({ user: user.text, assistant: assistantParts.join("\n"), endOffset: absolute });
+      }
+      user = { text, index: absolute };
+      assistantParts = [];
+    } else if (user) {
+      assistantParts.push(text);
+    }
+  });
+
+  const windowEnd = startOffset + window.length;
+  let newOffset = windowEnd;
+  if (user) {
+    const pending: { text: string; index: number } = user;
+    if (assistantParts.length > 0) {
+      turns.push({ user: pending.text, assistant: assistantParts.join("\n"), endOffset: windowEnd });
+    } else {
+      newOffset = pending.index; // an unanswered prompt is not consumed
     }
   }
+  return { turns, newOffset };
+}
 
-  return { turns, newOffset: startOffset + newMessages.length };
+/**
+ * Where to resume for an offset that has no format marker.
+ *
+ * An older reader looked only at top-level `content`, so for real transcripts it saw every turn as empty, dropped
+ * it and still advanced the offset. Scan the entries before the offset (at most MAX_LEGACY_REWIND_ENTRIES back)
+ * for text that the current reader finds and the old one did not; if there is any, resume at the start of the
+ * earliest such turn. A transcript the old reader read correctly has no such entry, so its offset is kept.
+ */
+export function legacyRewindOffset(content: string, offset: number): number {
+  if (offset <= 0) return offset;
+  const entries = relevantMessages(content);
+  const end = Math.min(offset, entries.length);
+  const floor = Math.max(0, end - MAX_LEGACY_REWIND_ENTRIES);
+  let earliest = -1;
+  for (let i = floor; i < end; i++) {
+    if (extractText(entries[i]) && !legacyText(entries[i])) {
+      earliest = i;
+      break;
+    }
+  }
+  if (earliest < 0) return offset;
+  for (let i = earliest; i >= floor; i--) {
+    const role = roleOf(entries[i]) ?? entries[i].message?.role;
+    if (role === "user" && extractText(entries[i])) return i;
+  }
+  return earliest;
 }
 
 /**
@@ -156,7 +247,10 @@ export async function extractClaudeCodeTurns(
   if (transcriptPath) {
     try {
       const content = await readFile(transcriptPath, "utf-8");
-      const offset = await readFlushOffset(transcriptPath);
+      let offset = await readFlushOffset(transcriptPath);
+      if (offset > 0 && !(await hasFormatMarker(transcriptPath))) {
+        offset = legacyRewindOffset(content, offset);
+      }
       const { turns, newOffset } = parseTranscript(content, offset);
 
       if (turns.length > 0) {
