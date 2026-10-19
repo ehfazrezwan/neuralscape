@@ -146,3 +146,110 @@ def test_a_conflict_that_never_clears_is_not_retried_forever(monkeypatch):
     with pytest.raises(UnexpectedResponse):
         Service()._get_memory()
     assert 1 < len(calls) <= 10
+
+
+# ── Follow-up: only "already exists" counts; legacy lazy clients too ────────
+
+
+def _unrelated_409():
+    return UnexpectedResponse(
+        status_code=409,
+        reason_phrase="Conflict",
+        content=b'{"status":{"error":"Wrong input: Collection `x` is being updated, try later"}}',
+        headers=httpx.Headers(),
+    )
+
+
+def test_a_409_that_is_not_already_exists_is_not_retried(monkeypatch):
+    calls = []
+
+    def from_config(config):
+        calls.append(1)
+        raise _unrelated_409()
+
+    monkeypatch.setattr(mem0.Memory, "from_config", from_config)
+    monkeypatch.setattr(type(settings), "get_mem0_config", lambda self: {})
+    monkeypatch.setattr("memory.core.time.sleep", lambda s: None, raising=False)
+    with pytest.raises(UnexpectedResponse):
+        Service()._get_memory()
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize(
+    "exc,expected",
+    [
+        (_conflict("neuralscape_memories"), True),
+        (_unrelated_409(), False),
+        (UnexpectedResponse(status_code=409, reason_phrase="Conflict", content=b"", headers=httpx.Headers()), False),
+        (UnexpectedResponse(status_code=500, reason_phrase="x", content=b"already exists", headers=httpx.Headers()), False),
+        (RuntimeError("Collection already exists"), False),
+    ],
+)
+def test_only_qdrant_already_exists_409_counts_as_concurrent_creation(exc, expected):
+    from memory.core import _is_collection_exists_conflict
+
+    assert _is_collection_exists_conflict(exc) is expected
+
+
+class LostRaceQdrantServer(RacingQdrantServer):
+    """This process always loses: its first listing is empty, but another
+    process creates every collection right after, so its create gets 409."""
+
+    def __init__(self):
+        super().__init__(1)
+        self.existing = set(COLLECTIONS)
+        self.listings = 0
+
+    def get_collections(self):
+        self.listings += 1
+        if self.listings == 1:
+            return SimpleNamespace(collections=[])
+        return SimpleNamespace(collections=[SimpleNamespace(name=n) for n in self.existing])
+
+
+@pytest.fixture()
+def legacy_main(monkeypatch):
+    import main
+
+    monkeypatch.setattr(main, "_memory", None)
+    monkeypatch.setattr(main, "_graphiti", None)
+    monkeypatch.setattr(main, "_bridge", None)
+    monkeypatch.setattr(main, "_async_memory", None)
+    monkeypatch.setattr(type(settings), "get_mem0_config", lambda self: {})
+    return main
+
+
+def test_legacy_lazy_memory_survives_the_race(monkeypatch, legacy_main):
+    monkeypatch.setattr("memory.core.time.sleep", lambda s: None, raising=False)
+    """main._get_memory (legacy routes) builds the client once; when that first
+    build races another process it must still come up."""
+    server = LostRaceQdrantServer()
+    monkeypatch.setattr(mem0.Memory, "from_config", _fake_from_config(server))
+    memory = legacy_main._get_memory()
+    assert memory is not None and legacy_main._memory is memory
+    assert server.conflicts == 1
+    assert server.creates == 0
+
+
+def test_legacy_lazy_memory_other_errors_fail_at_once(monkeypatch, legacy_main):
+    calls = []
+
+    def from_config(config):
+        calls.append(1)
+        raise _unrelated_409()
+
+    monkeypatch.setattr(mem0.Memory, "from_config", from_config)
+    with pytest.raises(UnexpectedResponse):
+        legacy_main._get_memory()
+    assert len(calls) == 1 and legacy_main._memory is None
+
+
+def test_legacy_async_memory_survives_the_race(monkeypatch, legacy_main):
+    monkeypatch.setattr("memory.core.time.sleep", lambda s: None, raising=False)
+    """AsyncMemory.from_config is synchronous (it builds the same sync Qdrant
+    store), so the same bounded handling applies to main._get_async_memory."""
+    server = LostRaceQdrantServer()
+    monkeypatch.setattr(mem0.AsyncMemory, "from_config", _fake_from_config(server))
+    memory = legacy_main._get_async_memory()
+    assert memory is not None and legacy_main._async_memory is memory
+    assert server.conflicts == 1

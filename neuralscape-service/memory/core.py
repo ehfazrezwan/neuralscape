@@ -19,12 +19,18 @@ _COLD_START_ATTEMPTS = 5
 
 
 def _is_collection_exists_conflict(exc: BaseException) -> bool:
-    """Qdrant's 409: another process created the collection first."""
+    """Qdrant's 409 ``Collection `x` already exists!``: another process created it first.
+
+    Only that conflict counts. A 409 with any other message (or none) is a
+    different failure and must not be retried as a concurrent creation.
+    """
     try:
         from qdrant_client.http.exceptions import UnexpectedResponse
     except ImportError:  # pragma: no cover — qdrant_client ships with mem0
         return False
-    return isinstance(exc, UnexpectedResponse) and exc.status_code == 409
+    if not isinstance(exc, UnexpectedResponse) or exc.status_code != 409:
+        return False
+    return b"already exists" in (exc.content or b"")
 
 
 def _memory_from_config(memory_cls, config):
