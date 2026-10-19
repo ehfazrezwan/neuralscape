@@ -569,7 +569,7 @@ def test_an_unexpected_error_creating_the_sidecar_propagates(tmp_path, monkeypat
     real_open = builtins.open
 
     def failing_open(file, mode="r", *args, **kwargs):
-        if os.fspath(file) == os.path.basename(sidecar) and mode == "ab":
+        if os.fspath(file) == os.path.basename(sidecar) and mode == "xb":
             raise OSError(code, os.strerror(code))
         return real_open(file, mode, *args, **kwargs)
 
@@ -1443,3 +1443,188 @@ def test_unchanged_paths_still_produce_artifacts(tmp_path) -> None:
     report = tmp_path / "r.md"
     report.write_text("x\n")
     assert len(ev.matrix_artifacts(path, report)) == 2
+
+
+# ---- concurrent first creation of the lock file
+#
+# Lock creation uses O_EXCL followed by a non-creating open of an existing sidecar. This avoids the macOS
+# nonexclusive O_CREAT race without confusing a removed APFS directory with a transient failure.
+
+
+def test_lock_opens_never_use_nonexclusive_creation(tmp_path, monkeypatch) -> None:
+    real_open = os.open
+    attempts = []
+
+    def checked_open(name, flags, mode=0o777, *, dir_fd=None):
+        if os.fspath(name).endswith(".lock"):
+            attempts.append(flags)
+            assert not flags & os.O_CREAT or flags & os.O_EXCL
+        return real_open(name, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(ev.os, "open", checked_open)
+    writer = ev.EvidenceWriter(tmp_path / "e.jsonl")
+    assert writer.write(record("first"))
+    assert writer.write(record("second"))
+    assert len(writer.snapshot_pinned().result.records) == 2
+    assert any(flags & os.O_EXCL for flags in attempts)
+    assert any(not flags & os.O_CREAT for flags in attempts)
+
+
+def _disappear_before_existing_lock_open(monkeypatch, path, failures):
+    real_open = os.open
+    state = {"left": failures, "disappeared": 0}
+    sidecar = path.with_name(path.name + ".lock")
+    sidecar.touch()
+
+    def racing_open(name, flags, mode=0o777, *, dir_fd=None):
+        if os.fspath(name).endswith(".lock") and not flags & os.O_CREAT and state["left"]:
+            state["left"] -= 1
+            state["disappeared"] += 1
+            sidecar.unlink()
+            try:
+                return real_open(name, flags, mode, dir_fd=dir_fd)
+            finally:
+                sidecar.touch()
+        return real_open(name, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(ev.os, "open", racing_open)
+    return state
+
+
+def test_sidecar_disappearing_between_create_and_open_is_retried(tmp_path, monkeypatch) -> None:
+    path = tmp_path / "e.jsonl"
+    state = _disappear_before_existing_lock_open(monkeypatch, path, failures=3)
+    assert ev.EvidenceWriter(path).write(record("first"))
+    assert state["disappeared"] == 3
+    monkeypatch.undo()
+    assert [item.record_id for item in ev.EvidenceWriter(path).read().records] == ["first"]
+
+
+def test_a_lock_that_keeps_disappearing_fails_after_a_bounded_number_of_attempts(tmp_path, monkeypatch) -> None:
+    path = tmp_path / "e.jsonl"
+    state = _disappear_before_existing_lock_open(monkeypatch, path, failures=10**6)
+    with pytest.raises(FileNotFoundError):
+        ev.EvidenceWriter(path).write(record("never"))
+    assert state["disappeared"] == ev._LOCK_CREATE_ATTEMPTS
+    assert not path.exists()
+
+
+def test_a_removed_directory_is_not_retried(tmp_path, monkeypatch) -> None:
+    import os
+
+    folder = tmp_path / "ledger"
+    path = folder / "e.jsonl"
+    writer = ev.EvidenceWriter(path)
+    real_open = os.open
+    creates = []
+
+    def remove_directory_first(name, flags, mode=0o777, *, dir_fd=None):
+        if os.fspath(name).endswith(".lock") and flags & os.O_CREAT:
+            creates.append(name)
+            if folder.exists():
+                folder.rmdir()   # the pinned directory disappears after it was opened
+        return real_open(name, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(ev.os, "open", remove_directory_first)
+    with pytest.raises(FileNotFoundError):
+        writer.write(record("gone"))
+    assert len(creates) == 1
+
+
+def test_the_lock_is_still_never_followed_through_a_link(tmp_path) -> None:
+    path = tmp_path / "e.jsonl"
+    outside = tmp_path / "outside.txt"
+    outside.write_text("keep")
+    path.with_name("e.jsonl.lock").symlink_to(outside)
+    with pytest.raises(OSError):
+        ev.EvidenceWriter(path).write(record("x"))
+    with pytest.raises(OSError):
+        ev.EvidenceWriter(path).snapshot_pinned()
+    assert outside.read_text() == "keep" and not path.exists()
+
+
+def test_a_pipe_under_the_lock_name_is_refused_without_blocking(tmp_path) -> None:
+    import os
+    import threading
+
+    path = tmp_path / "e.jsonl"
+    path.write_bytes(_lines(record("b1")))
+    os.mkfifo(path.with_name("e.jsonl.lock"))
+    outcome = {}
+
+    def attempt(label, call):
+        try:
+            call()
+            outcome[label] = "returned"
+        except OSError as error:
+            outcome[label] = type(error).__name__
+
+    threads = [threading.Thread(target=attempt, args=("write", lambda: ev.EvidenceWriter(path).write(record("x"))), daemon=True),
+               threading.Thread(target=attempt, args=("read", lambda: ev.EvidenceWriter(path).snapshot_pinned()), daemon=True)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(5)
+    assert set(outcome) == {"write", "read"}, f"a lock open blocked on a pipe: {outcome}"
+    assert outcome["read"] == "UnsafeLockPath" and outcome["write"] != "returned"
+    assert [item.record_id for item in ev.EvidenceWriter(path).read().records] == ["b1"]
+
+
+def _first_use_race(args) -> list[str]:
+    """One process concurrently appends the same twenty ids, reporting unexpected failures."""
+    path, verdict = args
+    errors = []
+    writer = ev.EvidenceWriter(path)
+    for index in range(20):
+        try:
+            writer.write(record(f"race-{index}", verdict=verdict))
+        except ev.RecordConflict:
+            pass
+        except Exception as error:  # noqa: BLE001 - reported to the parent
+            errors.append(f"{type(error).__name__}: {error}")
+    return errors
+
+
+@pytest.mark.parametrize("precreated", [False, True], ids=["new-ledger", "existing-lock"])
+def test_concurrent_first_use_loses_no_writer(tmp_path, precreated) -> None:
+    import multiprocessing
+
+    path = tmp_path / "e.jsonl"
+    if precreated:
+        path.with_name("e.jsonl.lock").touch()
+    context = multiprocessing.get_context("fork")
+    with context.Pool(6) as pool:
+        results = pool.map(_first_use_race, [(str(path), "baseline_pass" if n % 2 else "known_failure") for n in range(6)])
+    assert results == [[]] * 6
+    ids = [item.record_id for item in ev.EvidenceWriter(path).read().records]
+    assert len(ids) == len(set(ids)) == 20
+
+
+@pytest.mark.parametrize("replacement", ["directory", "symlink"])
+@pytest.mark.parametrize("precreated", [False, True])
+def test_directory_renamed_during_lock_open_remains_pinned(tmp_path, monkeypatch, replacement, precreated) -> None:
+    folder, moved, other = (tmp_path / name for name in ("ledger", "moved", "other"))
+    other.mkdir()
+    writer = ev.EvidenceWriter(folder / "e.jsonl")
+    if precreated:
+        (folder / "e.jsonl.lock").touch()
+    real_open = os.open
+    swapped = False
+
+    def rename_before_lock_create(name, flags, mode=0o777, *, dir_fd=None):
+        nonlocal swapped
+        if os.fspath(name).endswith(".lock") and bool(flags & os.O_CREAT) != precreated and not swapped:
+            swapped = True
+            folder.rename(moved)
+            if replacement == "directory":
+                folder.mkdir()
+            else:
+                folder.symlink_to(other, target_is_directory=True)
+        return real_open(name, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(ev.os, "open", rename_before_lock_create)
+    assert writer.write(record("pinned"))
+    assert swapped
+    assert not (folder / "e.jsonl").exists()
+    assert not (folder / "e.jsonl.lock").exists()
+    assert [item.record_id for item in ev.EvidenceWriter(moved / "e.jsonl").read().records] == ["pinned"]
