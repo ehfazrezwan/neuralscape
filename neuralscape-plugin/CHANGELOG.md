@@ -4,6 +4,13 @@ All notable changes to the `neuralscape` Claude plugin are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 the project adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.9.3] - 2026-10-19
+
+### Fixed
+- Conversation capture now reads the transcript format Claude Code actually writes. Entries carry their text under `message.content` (a string for prompts, a list of blocks for assistant output), but the adapter only looked at a top-level `content`, so every turn looked empty and was dropped as noise while the flush cursor still advanced. The Stop and PreCompact flushes and the transcript half of the SessionEnd note therefore delivered nothing. The adapter now reads `message.content` (falling back to a top-level `content`), treats a turn as one real prompt plus the assistant text up to the next real prompt, and ignores tool results, tool calls, thinking, injected meta entries and sub-agent (sidechain) entries.
+- The flush cursor no longer moves past a prompt that has not been answered yet; it stays unread and is delivered by the next flush.
+- A cursor left by an earlier version is rewound once, but only across turns that the earlier reader could not see and only over the most recent 400 transcript entries; turns older than that stay undelivered. The rewind is skipped for transcripts the earlier reader read correctly, and a marker next to the cursor stops it repeating after a successful flush.
+
 ## [2.9.2] - 2026-09-07
 
 ### Fixed
