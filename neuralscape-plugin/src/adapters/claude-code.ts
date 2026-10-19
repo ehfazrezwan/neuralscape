@@ -148,30 +148,12 @@ function relevantMessages(content: string): TranscriptMessage[] {
   });
 }
 
-/** Entries that are not part of the user's conversation (see ``extractText``): skipped when judging how a transcript ends. */
-function isConversationEntry(msg: TranscriptMessage): boolean {
-  return !(msg.isMeta === true || msg.isSidechain === true || msg.isCompactSummary === true || msg.isVisibleInTranscriptOnly === true);
-}
-
-/**
- * Whether the transcript currently ends in the middle of a turn: its last conversation entry is a tool result
- * (the assistant has yet to continue) or an assistant entry that calls a tool (or says it stopped to use one).
- * A PreCompact hook can fire in that state; the turn is then not finished, so it must not be delivered yet.
- */
-function endsMidTurn(content: string): boolean {
-  const entries = relevantMessages(content).filter(isConversationEntry);
-  const last = entries[entries.length - 1];
-  if (last === undefined) return false;
-  const role = roleOf(last) ?? last.message?.role;
-  if (role === "user") return !extractText(last); // a tool result: the answer has not come yet
-  const blocks = last.message?.content ?? last.content;
-  const callsTool = Array.isArray(blocks) && blocks.some((block) => block && block.type === "tool_use");
-  return callsTool || last.message?.stop_reason === "tool_use";
-}
-
 interface ParsedTurn {
   user: string;
+  /** Every assistant text entry of the turn, joined: what is delivered. */
   assistant: string;
+  /** The text of the turn's LAST assistant entry (the wrap-up), kept apart for the session note. */
+  final: string;
   endOffset: number;
 }
 
@@ -182,14 +164,11 @@ interface ParsedTurn {
  * does not end a turn) and every assistant text entry up to the next real prompt. Entries without text
  * (thinking, tool calls, tool results) are skipped for pairing but still count as positions, so offsets stay
  * comparable with those written before. The returned `newOffset` never passes a user prompt that has no
- * assistant text yet: it stays unread and is picked up by the next flush. With ``withholdTrailing`` the last
- * turn is kept pending even when it already has assistant text (the turn is still running): its prompt stays
- * unread, and the whole turn is delivered once, when it has finished.
+ * assistant text yet: it stays unread and is picked up by the next flush.
  */
 function parseTranscript(
   content: string,
-  startOffset: number,
-  options: { withholdTrailing?: boolean } = {}
+  startOffset: number
 ): {
   turns: ParsedTurn[];
   newOffset: number;
@@ -206,7 +185,7 @@ function parseTranscript(
     if (!text) return;
     if (role === "user") {
       if (user && assistantParts.length > 0) {
-        turns.push({ user: user.text, assistant: assistantParts.join("\n"), endOffset: absolute });
+        turns.push({ user: user.text, assistant: assistantParts.join("\n"), final: assistantParts[assistantParts.length - 1], endOffset: absolute });
       }
       user = { text, index: absolute };
       assistantParts = [];
@@ -219,10 +198,10 @@ function parseTranscript(
   let newOffset = windowEnd;
   if (user) {
     const pending: { text: string; index: number } = user;
-    if (assistantParts.length > 0 && !options.withholdTrailing) {
-      turns.push({ user: pending.text, assistant: assistantParts.join("\n"), endOffset: windowEnd });
+    if (assistantParts.length > 0) {
+      turns.push({ user: pending.text, assistant: assistantParts.join("\n"), final: assistantParts[assistantParts.length - 1], endOffset: windowEnd });
     } else {
-      newOffset = pending.index; // an unanswered (or still running) turn is not consumed
+      newOffset = pending.index; // an unanswered turn is not consumed
     }
   }
   return { turns, newOffset };
@@ -249,10 +228,7 @@ export async function extractClaudeCodeTurns(
     try {
       const content = await readFile(transcriptPath, "utf-8");
       const offset = await readFlushOffset(transcriptPath);
-      // A PreCompact can fire in the middle of a turn: the running turn is then kept pending, not delivered.
-      const { turns, newOffset } = parseTranscript(content, offset, {
-        withholdTrailing: raw.hook_event_name === "PreCompact" && endsMidTurn(content),
-      });
+      const { turns, newOffset } = parseTranscript(content, offset);
 
       if (turns.length > 0) {
         // Stage per-turn offsets; commitClaudeCodeFlush() persists a cursor
@@ -307,14 +283,36 @@ export async function extractClaudeCodeTurns(
  */
 export async function extractAllTurnPairs(
   raw: Record<string, unknown>
-): Promise<Array<{ user: string; assistant: string }>> {
+): Promise<Array<{ user: string; assistant: string; final: string }>> {
   const transcriptPath = raw.transcript_path as string | undefined;
   if (!transcriptPath) return [];
   try {
     const content = await readFile(transcriptPath, "utf-8");
-    return parseTranscript(content, 0).turns.map(({ user, assistant }) => ({ user, assistant }));
+    return parseTranscript(content, 0).turns.map(({ user, assistant, final }) => ({ user, assistant, final }));
   } catch (error) {
     logError("Failed to read transcript for session summary", error);
+    return [];
+  }
+}
+
+/**
+ * The text of the last ``limit`` real user prompts of the transcript, oldest first, whether or not they were
+ * delivered and including a prompt that has no answer yet.  The PreCompact snapshot uses it: it must show the
+ * task that is under way, and it does not depend on what the flush has delivered.  Returns [] when the
+ * transcript is missing or unreadable.
+ */
+export async function extractRecentUserPrompts(raw: Record<string, unknown>, limit = 10): Promise<string[]> {
+  const transcriptPath = raw.transcript_path as string | undefined;
+  if (!transcriptPath) return [];
+  try {
+    const content = await readFile(transcriptPath, "utf-8");
+    const prompts = relevantMessages(content)
+      .filter((entry) => (roleOf(entry) ?? entry.message?.role) === "user")
+      .map(extractText)
+      .filter((text) => text.length > 0);
+    return prompts.slice(-limit);
+  } catch (error) {
+    logError("Failed to read transcript for the compact snapshot", error);
     return [];
   }
 }

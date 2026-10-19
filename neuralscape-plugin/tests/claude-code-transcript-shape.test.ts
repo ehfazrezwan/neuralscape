@@ -22,6 +22,8 @@ let server: Server;
 let requests: Array<{ path: string; body: Record<string, any> }> = [];
 let failFlushFrom = -1;
 let flushCount = 0;
+/** Delay every flush answer, so that two hooks started together really overlap. */
+let flushDelayMs = 0;
 /** Refuse the Nth flush request (0-based) with this HTTP status; null = never. */
 let rejectFlush: { at: number | "all"; status: number } | null = null;
 
@@ -44,6 +46,13 @@ await new Promise<void>((resolve) => {
           res.end(JSON.stringify({ error: "boom" }));
           return;
         }
+        if (flushDelayMs > 0) {
+          setTimeout(() => {
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ status: "ok" }));
+          }, flushDelayMs);
+          return;
+        }
       }
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ status: "ok" }));
@@ -60,7 +69,7 @@ process.env.NEURALSCAPE_TEST = "1";
 // exists, would accept the turn and count it delivered).
 process.env.NEURALSCAPE_DURABLE_OUTBOX = "false";
 
-const { commitClaudeCodeFlush, extractAllTurnPairs, extractClaudeCodeTurns } = await import(
+const { commitClaudeCodeFlush, extractAllTurnPairs, extractClaudeCodeTurns, extractRecentUserPrompts } = await import(
   "../src/adapters/claude-code.js"
 );
 const { boundText, flushTurns } = await import("../src/core/flush.js");
@@ -74,6 +83,7 @@ beforeEach(() => {
   failFlushFrom = -1;
   flushCount = 0;
   rejectFlush = null;
+  flushDelayMs = 0;
 });
 
 // ── Real-shape fixtures (synthetic content) ──────────────────────
@@ -310,15 +320,32 @@ describe("real transcript shape: built hooks deliver", () => {
     expect(await offsetOf(path)).toBe(8);
   });
 
-  it("PreCompact (pre-compact.js) flushes both turns, commits the offset and snapshots the prompts", async () => {
+  it("PreCompact (pre-compact.js) delivers nothing, leaves the cursor and snapshots the prompts", async () => {
     const { path, dir } = await transcript(realSession());
     const r = await runHook("pre-compact.js", JSON.stringify({ session_id: SESSION, transcript_path: path, cwd: dir, hook_event_name: "PreCompact", trigger: "auto" }));
     expect(r.code).toBe(0);
-    expect(flushes().length).toBe(2);
-    expect(await offsetOf(path)).toBe(8);
+    expect(flushes().length).toBe(0);
+    await expect(readFile(path + ".neuralscape-offset", "utf-8")).rejects.toThrow(); // the cursor is the Stop hook's
     const snapshot = requests.find((q) => q.path.includes("/v1/memories/raw"));
+    expect(String(snapshot?.body.content)).toContain(PROMPT_ONE);
     expect(String(snapshot?.body.content)).toContain(PROMPT_TWO);
-    expect(String(snapshot?.body.content)).toContain("after 2 captured turn(s)");
+    expect(String(snapshot?.body.content)).not.toContain("captured turn");
+  });
+
+  it("SessionEnd note: `completed` comes from the turn's final assistant entry, not its progress commentary", async () => {
+    const progress = "PROGRESS-SENTINEL I am reading the sync worker and the queue code before changing anything, step by step. ".repeat(5);
+    const finalAnswer = "FINAL-SENTINEL The retry logic is in place and the tests pass.";
+    const { path, dir, raw } = await transcript([user(PROMPT_ONE), assistant(text(progress), toolUse), toolResultEntry(), assistant(text(finalAnswer))]);
+    const pairs = await extractAllTurnPairs(raw);
+    expect(pairs.length).toBe(1);
+    expect(pairs[0].assistant).toContain("PROGRESS-SENTINEL"); // the whole turn is still what is delivered
+    expect(pairs[0].assistant).toContain("FINAL-SENTINEL");
+    expect(pairs[0].final).toBe(finalAnswer);
+    const r = await runHook("session-summary.js", JSON.stringify({ session_id: SESSION, transcript_path: path, cwd: dir, hook_event_name: "SessionEnd" }));
+    expect(r.code).toBe(0);
+    const note = JSON.stringify(requests.find((q) => q.path.includes("/v1/checkpoint"))?.body);
+    expect(note).toContain("FINAL-SENTINEL");
+    expect(note).not.toContain("PROGRESS-SENTINEL I am reading");
   });
 
   it("SessionEnd (session-summary.js) builds its note from the real-shape turns", async () => {
@@ -445,14 +472,16 @@ const stop = (path: string, dir: string) =>
 const append = (path: string, entries: unknown[]) =>
   readFile(path, "utf-8").then((old) => writeFile(path, old + entries.map((e) => JSON.stringify(e)).join("\n") + "\n", "utf-8"));
 
-describe("PreCompact in the middle of a turn", () => {
+describe("PreCompact delivers nothing; the Stop hook delivers everything once", () => {
   const MID = (): unknown[] => [user(PROMPT_ONE), assistant(text(FIRST_TEXT), toolUse), toolResultEntry()];
+  const snapshotText = () => String(requests.find((q) => q.path.includes("/v1/memories/raw"))?.body.content);
 
-  it("PreCompact → continuation → Stop delivers the whole turn exactly once", async () => {
+  it("PreCompact in the middle of a turn: no flush, no cursor, and the snapshot names the running task", async () => {
     const { path, dir } = await transcript(MID());
     await preCompact(path, dir);
-    expect(flushes().length).toBe(0); // the running turn is withheld
-    await expect(readFile(path + ".neuralscape-offset", "utf-8")).rejects.toThrow(); // and nothing is committed past its prompt
+    expect(flushes().length).toBe(0);
+    await expect(readFile(path + ".neuralscape-offset", "utf-8")).rejects.toThrow();
+    expect(snapshotText()).toContain(PROMPT_ONE); // the prompt that has no final answer yet
     await append(path, [assistant(text(SECOND_TEXT))]);
     await stop(path, dir);
     expect(flushes().length).toBe(1);
@@ -462,43 +491,75 @@ describe("PreCompact in the middle of a turn", () => {
     expect(flushes().length).toBe(1); // exactly once
   });
 
-  it("delivers the finished turns before it and keeps the offset at the running turn's prompt", async () => {
-    const entries = [user(PROMPT_ONE), assistant(text(SECOND_TEXT)), user(PROMPT_TWO), assistant(text(FIRST_TEXT), toolUse), toolResultEntry()];
+  it("a finished turn followed by a local /compact command wrapper is snapshotted and delivered by Stop once", async () => {
+    const entries = [user(PROMPT_ONE), assistant(text(SECOND_TEXT)), localCommand("<command-name>/compact</command-name>\n<command-message>compact</command-message>")];
     const { path, dir } = await transcript(entries);
     await preCompact(path, dir);
+    expect(flushes().length).toBe(0);
+    expect(snapshotText()).toContain(PROMPT_ONE);
+    expect(snapshotText()).not.toContain("command-name");
+    await stop(path, dir);
     expect(flushes().map((q) => q.body.user_message)).toEqual([PROMPT_ONE]);
-    expect(await offsetOf(path)).toBe(2);
-    await append(path, [assistant(text(THIRD_TEXT))]);
+    await stop(path, dir);
+    expect(flushes().length).toBe(1);
+  });
+
+  it("PreCompact between two Stop hooks changes nothing about what is delivered", async () => {
+    const { path, dir } = await transcript([user(PROMPT_ONE), assistant(text(SECOND_TEXT))]);
+    await stop(path, dir);
+    await preCompact(path, dir);
+    await append(path, [compactSummary("synthetic summary of the conversation so far"), user(PROMPT_TWO), assistant(text(THIRD_TEXT))]);
+    await preCompact(path, dir);
     await stop(path, dir);
     expect(flushes().map((q) => q.body.user_message)).toEqual([PROMPT_ONE, PROMPT_TWO]);
-    expect(flushes()[1].body.assistant_response).toBe(`${FIRST_TEXT}\n${THIRD_TEXT}`);
+    expect(await offsetOf(path)).toBe(5);
   });
 
-  it("a turn that ends on an assistant entry calling a tool (result not written yet) is withheld too", async () => {
-    const { raw } = await transcript([user(PROMPT_ONE), assistant(text(FIRST_TEXT), toolUse)]);
-    expect(await extractClaudeCodeTurns({ ...raw, hook_event_name: "PreCompact" })).toEqual([]);
-    const flagged = await transcript([user(PROMPT_ONE), { ...assistant(text(FIRST_TEXT)), message: { role: "assistant", stop_reason: "tool_use", content: [text(FIRST_TEXT)] } }]);
-    expect(await extractClaudeCodeTurns({ ...flagged.raw, hook_event_name: "PreCompact" })).toEqual([]);
+  it("extractRecentUserPrompts: real prompts only, oldest first, unanswered prompt included, bounded", async () => {
+    const entries = [user("prompt 1"), assistant(text(SECOND_TEXT)), meta("META-SENTINEL"), toolResultEntry(), compactSummary("SUMMARY-SENTINEL"),
+      localCommand("<command-name>/x</command-name>"), user("prompt 2"), sidechain("SIDE-SENTINEL"), user("prompt 3 (no answer yet)")];
+    const { raw } = await transcript(entries);
+    expect(await extractRecentUserPrompts(raw)).toEqual(["prompt 1", "prompt 2", "prompt 3 (no answer yet)"]);
+    expect(await extractRecentUserPrompts(raw, 2)).toEqual(["prompt 2", "prompt 3 (no answer yet)"]);
+    expect(await extractRecentUserPrompts({})).toEqual([]);
   });
 
-  it("a finished turn is still delivered by PreCompact (the snapshot keeps its prompt) and not again by Stop", async () => {
-    const { path, dir } = await transcript([user(PROMPT_ONE), assistant(text(FIRST_TEXT), toolUse), toolResultEntry(), assistant(text(SECOND_TEXT))]);
-    await preCompact(path, dir);
-    expect(flushes().length).toBe(1);
-    expect(String(requests.find((q) => q.path.includes("/v1/memories/raw"))?.body.content)).toContain(PROMPT_ONE);
+  it("the flush no longer runs from PreCompact: the extractor stages nothing for it to commit", async () => {
+    const { raw, path } = await transcript([user(PROMPT_ONE), assistant(text(SECOND_TEXT))]);
+    expect(await extractRecentUserPrompts({ ...raw, hook_event_name: "PreCompact" })).toEqual([PROMPT_ONE]);
+    await commitClaudeCodeFlush(raw, { attempted: 1, flushed: 1, firstFailedIndex: null });
+    await expect(readFile(path + ".neuralscape-offset", "utf-8")).rejects.toThrow();
+  });
+});
+
+describe("overlapping Stop hooks", () => {
+  it("two hooks started together deliver each turn exactly once and leave the cursor at the end", async () => {
+    flushDelayMs = 250;
+    const { path, dir } = await transcript([...FLAT(1), ...FLAT(2), ...FLAT(3)]);
+    await Promise.all([stop(path, dir), stop(path, dir)]);
+    expect(flushes().map((q) => q.body.user_message)).toEqual([
+      "flattened prompt number 1 with plenty of text to keep",
+      "flattened prompt number 2 with plenty of text to keep",
+      "flattened prompt number 3 with plenty of text to keep",
+    ]);
+    expect(await offsetOf(path)).toBe(6);
+    await expect(readFile(path + ".neuralscape-lock", "utf-8")).rejects.toThrow(); // the lock is released
+    await stop(path, dir);
+    expect(flushes().length).toBe(3);
+  });
+
+  it("a hook that finds a dead owner's lock takes it over and delivers", async () => {
+    const { path, dir } = await transcript([...FLAT(1)]);
+    await writeFile(path + ".neuralscape-lock", JSON.stringify({ pid: 2 ** 22 + 12345, token: "dead", at: Date.now() }), "utf-8");
     await stop(path, dir);
     expect(flushes().length).toBe(1);
-  });
-
-  it("the Stop event always delivers what the transcript holds (the turn has ended)", async () => {
-    const { raw } = await transcript(MID());
-    expect((await extractClaudeCodeTurns({ ...raw, hook_event_name: "Stop" })).length).toBe(1);
+    expect(await offsetOf(path)).toBe(2);
   });
 });
 
 // ── The payload is bounded to what the flush route accepts, and a refused turn cannot block the rest ──
 
-describe("flush payload bounds and permanent rejections", () => {
+describe("flush payload bounds and failures", () => {
   const LIMIT = 50000;
 
   it("boundText leaves text at the limit untouched and marks text over it", () => {
@@ -546,23 +607,7 @@ describe("flush payload bounds and permanent rejections", () => {
     expect(sent.assistant_response).toBe("a".repeat(LIMIT));
   });
 
-  it.each([413, 422])("a turn the service refuses with HTTP %i is skipped and the later turns are still delivered", async (status) => {
-    rejectFlush = { at: 1, status };
-    const { path, raw } = await transcript([...FLAT(1), ...FLAT(2), ...FLAT(3)]);
-    const turns = await extractClaudeCodeTurns(raw);
-    const result = await flushTurns(turns);
-    expect(result.firstFailedIndex).toBeNull();
-    expect(flushes().map((q) => q.body.user_message)).toEqual([
-      "flattened prompt number 1 with plenty of text to keep",
-      "flattened prompt number 2 with plenty of text to keep",
-      "flattened prompt number 3 with plenty of text to keep",
-    ]);
-    await commitClaudeCodeFlush(raw, result);
-    expect(await offsetOf(path)).toBe(6); // the cursor passed the refused turn
-    expect(await extractClaudeCodeTurns(raw)).toEqual([]);
-  });
-
-  it.each([400, 401, 403, 404, 408, 429, 500, 503])("HTTP %i is not a permanent rejection of the turn: delivery stops there and the cursor waits", async (status) => {
+  it.each([400, 401, 403, 404, 408, 413, 422, 429, 500, 503])("HTTP %i is never a reason to skip a turn: delivery stops there and the cursor waits", async (status) => {
     rejectFlush = { at: 1, status };
     const { path, raw } = await transcript([...FLAT(1), ...FLAT(2), ...FLAT(3)]);
     const result = await flushTurns(await extractClaudeCodeTurns(raw));
@@ -570,38 +615,25 @@ describe("flush payload bounds and permanent rejections", () => {
     expect(flushes().length).toBe(2); // turn 3 was not attempted
     await commitClaudeCodeFlush(raw, result);
     expect(await offsetOf(path)).toBe(2);
-  });
-
-  it.each([413, 422])("every turn refused with HTTP %i: delivery stops after the second and the cursor stays", async (status) => {
-    rejectFlush = { at: "all", status };
-    const { path, raw } = await transcript([...FLAT(1), ...FLAT(2), ...FLAT(3), ...FLAT(4)]);
-    const result = await flushTurns(await extractClaudeCodeTurns(raw));
-    expect(result.firstFailedIndex).toBe(0);
-    expect(flushes().length).toBe(2); // turns 3 and 4 were not attempted
-    await commitClaudeCodeFlush(raw, result);
-    expect(await offsetOf(path).catch(() => 0)).toBe(0); // no cursor was written
-    expect((await extractClaudeCodeTurns(raw)).length).toBe(4); // every turn is still pending
-  });
-
-  it("one refused turn between good ones is skipped, and a later refusal starts a new count", async () => {
-    rejectFlush = { at: 2, status: 422 };
-    const { path, raw } = await transcript([...FLAT(1), ...FLAT(2), ...FLAT(3), ...FLAT(4)]);
-    const result = await flushTurns(await extractClaudeCodeTurns(raw));
-    expect(result.firstFailedIndex).toBeNull();
-    expect(flushes().length).toBe(4);
-    await commitClaudeCodeFlush(raw, result);
-    expect(await offsetOf(path)).toBe(8);
-  });
-
-  it("two refusals in a row after delivered turns leave the cursor at the first refused turn", async () => {
-    rejectFlush = { at: "all", status: 413 };
-    const { path, raw } = await transcript([...FLAT(1), ...FLAT(2), ...FLAT(3)]);
-    const turns = await extractClaudeCodeTurns(raw);
+    // the next flush retries the refused turn and delivers the rest, each once
     rejectFlush = null;
-    await flushTurns(turns.slice(0, 1));
-    rejectFlush = { at: "all", status: 413 };
-    const result = await flushTurns(turns.slice(1));
+    const next = await flushTurns(await extractClaudeCodeTurns(raw));
+    expect(next.firstFailedIndex).toBeNull();
+    await commitClaudeCodeFlush(raw, next);
+    expect(await offsetOf(path)).toBe(6);
+    expect(flushes().slice(2).map((q) => q.body.user_message)).toEqual([
+      "flattened prompt number 2 with plenty of text to keep",
+      "flattened prompt number 3 with plenty of text to keep",
+    ]);
+  });
+
+  it("a service that refuses every turn (a version skew) leaves the cursor where it was", async () => {
+    rejectFlush = { at: "all", status: 422 };
+    const { path, raw } = await transcript([...FLAT(1), ...FLAT(2), ...FLAT(3)]);
+    const result = await flushTurns(await extractClaudeCodeTurns(raw));
     expect(result.firstFailedIndex).toBe(0);
-    expect(flushes().length).toBe(3);
+    await commitClaudeCodeFlush(raw, result);
+    await expect(readFile(path + ".neuralscape-offset", "utf-8")).rejects.toThrow();
+    expect((await extractClaudeCodeTurns(raw)).length).toBe(3); // every turn is still pending
   });
 });

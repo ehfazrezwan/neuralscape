@@ -7,7 +7,6 @@
  */
 
 import {
-  HttpStatusError,
   isHeartbeat,
   isNoReply,
   isSystemMessage,
@@ -39,18 +38,6 @@ export function boundText(value: string, limit: number = MAX_FLUSH_TEXT): string
   if (unit >= 0xd800 && unit <= 0xdbff) keep -= 1; // the cut would split a surrogate pair
   return value.slice(0, keep) + omitted(value.length - keep);
 }
-
-/**
- * HTTP statuses that mean the service refused THIS payload for good (retrying cannot help): too large, invalid.
- * A 400 is not here: it is as likely a proxy or a client/service mismatch as this turn's text.
- */
-const PERMANENT_REJECTIONS = new Set([413, 422]);
-
-/**
- * Two permanent refusals in a row look systemic (a schema skew refuses every turn), not like one bad turn:
- * stop there and leave the cursor in place instead of dropping every turn for good.
- */
-const MAX_CONSECUTIVE_REJECTIONS = 2;
 
 /**
  * Check if a conversation turn should be skipped (noise filtering).
@@ -91,11 +78,14 @@ export interface FlushResult {
  * failure (if the service is down, later POSTs would fail too, and stopping
  * keeps the undelivered turns a contiguous re-flushable suffix). Never
  * throws — failures are logged and reported via the result.
+ *
+ * Every failure is treated as transient: delivery stops at that turn and the cursor stays before it, so the
+ * turn is retried by the next flush.  A turn is never skipped because the service refused it: the payload is
+ * bounded to the API limits (``boundText``) and turns with no text are filtered above, so a refusal does not
+ * come from this turn's content, and dropping turns on a refusal would lose every turn during a version skew.
  */
 export async function flushTurns(turns: ConversationTurn[]): Promise<FlushResult> {
   let flushed = 0;
-  let refusedRunStart: number | null = null;
-  let refusedRun = 0;
 
   for (let i = 0; i < turns.length; i++) {
     const turn = turns[i];
@@ -114,20 +104,7 @@ export async function flushTurns(turns: ConversationTurn[]): Promise<FlushResult
         user_id: turn.userId,
       });
       flushed++;
-      refusedRun = 0;
-      refusedRunStart = null;
     } catch (error) {
-      if (error instanceof HttpStatusError && PERMANENT_REJECTIONS.has(error.status)) {
-        refusedRunStart ??= i;
-        refusedRun++;
-        if (refusedRun >= MAX_CONSECUTIVE_REJECTIONS) {
-          logError(`The service refused ${refusedRun} conversation turns in a row (HTTP ${error.status}); leaving them for the next flush`);
-          return { attempted: turns.length, flushed, firstFailedIndex: refusedRunStart };
-        }
-        // The service will not accept this turn: skip it (like noise) so it cannot block every later turn.
-        logError(`Skipping conversation turn ${i + 1}/${turns.length}: the service rejected it (HTTP ${error.status}) and will not accept it on retry`);
-        continue;
-      }
       logError(`Failed to flush conversation turn ${i + 1}/${turns.length}; leaving the rest for the next flush`, error);
       return { attempted: turns.length, flushed, firstFailedIndex: i };
     }

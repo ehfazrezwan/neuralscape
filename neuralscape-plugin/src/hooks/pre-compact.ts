@@ -6,11 +6,11 @@
  * trigger: "manual"|"auto", custom_instructions}`). Compaction
  * lossy-summarizes in-context state, so before it happens this hook:
  *
- *   1. flushes any not-yet-delivered conversation turns through the SAME
- *      adapter path as the conversation-turn hook — including the
- *      offset-commit step, so the cursor advances only past delivered
- *      turns (audit 27 #34b) and nothing said pre-compact is lost to the
- *      turn-capture pipeline;
+ *   1. does NOT deliver conversation turns.  The Stop hook delivers them, and
+ *      compaction adds a flagged summary entry to the transcript next to the entries it summarizes,
+ *      so nothing is lost by leaving them for it; delivering here as well
+ *      would race the Stop hook over the cursor and could split a turn that
+ *      is still running;
  *   2. stores ONE small `task_context` "compact snapshot" memory (tagged
  *      `compact_snapshot`) via the EXISTING POST /v1/memories/raw
  *      endpoint. The compact-aware SessionStart re-injects it under
@@ -20,13 +20,12 @@
  * this hook must NEVER block or fail the compact.
  */
 
-import { commitClaudeCodeFlush } from "../adapters/claude-code.js";
+import { extractRecentUserPrompts } from "../adapters/claude-code.js";
 import { detectClient, getTurnExtractor } from "../adapters/detect.js";
 import {
   buildCompactSnapshotContent,
   buildCompactSnapshotPayload,
 } from "../core/compact.js";
-import { flushTurns } from "../core/flush.js";
 import {
   getProjectId,
   getUserId,
@@ -58,15 +57,14 @@ async function main(): Promise<void> {
     // Excluded projects (D4): nothing leaves an excluded project.
     if (isProjectExcluded(projectId)) return;
 
-    // 1. Flush undelivered turns — mirrors conversation-turn.ts exactly,
-    //    including the offset commit bounded by delivered turns (#34b).
+    // 1. The snapshot shows the prompts that were under way, read from the transcript independently of what
+    //    has been delivered (a prompt that is still being answered is included).  Other clients have no
+    //    transcript: their extractor's turns (no cursor involved) supply the prompts as before.
     const client = detectClient(raw);
-    const extractor = getTurnExtractor(client);
-    const turns = await extractor(raw);
-    const result = await flushTurns(turns);
-    if (client === "claude-code") {
-      await commitClaudeCodeFlush(raw, result);
-    }
+    const recentUserMessages =
+      client === "claude-code"
+        ? await extractRecentUserPrompts(raw)
+        : (await getTurnExtractor(client)(raw)).map((t) => t.userMessage);
 
     // 2. One compact-snapshot memory so the post-compact SessionStart can
     //    re-anchor the session. Small, redacted, bounded.
@@ -75,8 +73,7 @@ async function main(): Promise<void> {
       projectId,
       trigger: (raw.trigger as string) || "auto",
       when: new Date(),
-      capturedTurns: result.flushed,
-      recentUserMessages: turns.map((t) => t.userMessage),
+      recentUserMessages,
     });
 
     try {

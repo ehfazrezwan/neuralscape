@@ -16,6 +16,7 @@ import {
 } from "../adapters/detect.js";
 import { triggerCompile } from "../core/compile.js";
 import { flushTurns } from "../core/flush.js";
+import { withTranscriptLock } from "../core/transcript-lock.js";
 import {
   getBufferPath,
   getBufferStats,
@@ -53,9 +54,15 @@ async function main(): Promise<void> {
     // untouched so the next session re-flushes everything.
     if (client === "claude-code") {
       const turnExtractor = getTurnExtractor(client);
-      const turns = await turnExtractor(raw);
-      const result = await flushTurns(turns);
-      await commitClaudeCodeFlush(raw, result);
+      const deliver = async (): Promise<void> => {
+        const turns = await turnExtractor(raw);
+        const result = await flushTurns(turns);
+        await commitClaudeCodeFlush(raw, result);
+      };
+      // Read cursor, deliver and write cursor as one step per transcript: an overlapping hook waits for it.
+      const transcriptPath = raw.transcript_path as string | undefined;
+      if (transcriptPath) await withTranscriptLock(transcriptPath, deliver);
+      else await deliver();
     }
 
     // All clients: trigger compilation of conversation-compiler

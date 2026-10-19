@@ -383,22 +383,11 @@ export async function neuralscapeGet(
       signal: controller.signal,
     });
     if (!response.ok) {
-      throw new HttpStatusError(response.status, response.statusText);
+      throw new Error(`HTTP ${response.status}: ${response.statusText}`);
     }
     return await response.json();
   } finally {
     clearTimeout(timeout);
-  }
-}
-
-/** An HTTP answer that was not a success; ``status`` lets callers tell a rejected payload from an unavailable service. */
-export class HttpStatusError extends Error {
-  readonly status: number;
-
-  constructor(status: number, statusText: string) {
-    super(`HTTP ${status}: ${statusText}`);
-    this.name = "HttpStatusError";
-    this.status = status;
   }
 }
 
@@ -419,7 +408,7 @@ export async function neuralscapePost(
       signal: controller.signal,
     });
     if (!response.ok) {
-      throw new HttpStatusError(response.status, response.statusText);
+      throw new Error(`HTTP ${response.status}: ${response.statusText}`);
     }
     return await response.json();
   } finally {
