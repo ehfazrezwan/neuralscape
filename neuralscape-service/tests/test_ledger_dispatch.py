@@ -38,6 +38,11 @@ PRE = (SourceVersion(record_id="mem-1", content_revision=3, policy_epoch=7),)
 POST = (SourceVersion(record_id="mem-1", content_revision=4, policy_epoch=7),)
 
 
+# Generous guard for thread hand-offs: it only bounds how long a failing run takes, never how long a passing one
+# may.  Lease expiry is moved explicitly (``store.shift_leases``), so no scenario waits for wall-clock time to pass.
+WAIT = 120.0
+
+
 class Crash(BaseException):
     """Simulated process death: not an Exception, so nothing in the worker swallows it."""
 
@@ -133,6 +138,13 @@ class SqliteStore:
         return ledger
 
     open_admin = open
+
+    def shift_leases(self, seconds: float) -> None:
+        """Move every live lease's expiry by ``seconds`` (negative: as if that much time had passed)."""
+
+        raw = sqlite3.connect(self.path, isolation_level=None, timeout=30)
+        raw.execute("UPDATE outbox SET lease_until = lease_until + ? WHERE state='leased'", (seconds,))
+        raw.close()
 
     def external(self) -> External:
         return External(self.root / "external.db")
@@ -262,7 +274,7 @@ def scenario_kill_after_effect_before_receipt_reapplies_idempotently(store) -> N
         StageWorker(ledger, handlers, owner="a", lease_seconds=0.4).run_once()
     assert external.has(next(r.effect_id for r in ledger.get_intent("tenant-1", "intent-1").intent.stage_requirements if r.stage is V))
     assert ledger.claim("probe", 5) is None  # still leased to the dead worker
-    time.sleep(0.7)
+    store.shift_leases(-60)  # the dead worker's lease has expired
     result = StageWorker(store.open(), all_handlers(external), owner="b", lease_seconds=5).run_once()
     assert result.status is IntentStatus.APPLIED and result.attempt == 2
     assert result.outcomes[C] == "applied (earlier attempt)"
@@ -303,7 +315,7 @@ def scenario_kill_after_effect_recorded_recovers_without_reapply(store) -> None:
         StageWorker(crashing, all_handlers(external), owner="a", lease_seconds=0.4).run_once()
     vector_effect = next(r.effect_id for r in ledger.get_intent("tenant-1", "intent-1").intent.stage_requirements if r.stage is V)
     assert ledger.effect_recorded("tenant-1", vector_effect)
-    time.sleep(0.7)
+    store.shift_leases(-60)  # the dead worker's lease has expired
     result = StageWorker(store.open(), all_handlers(external), owner="b", lease_seconds=5).run_once()
     assert result.status is IntentStatus.APPLIED
     assert external.calls("vector_upsert") == 1  # inspect() recovered it: no second apply
@@ -329,7 +341,7 @@ def scenario_real_process_kill_during_stage_resumes_exactly_once(store) -> None:
     child.join()
     assert child.exitcode == 137
     assert ledger.get_intent("tenant-1", "intent-1").status is IntentStatus.PROCESSING
-    time.sleep(0.8)
+    store.shift_leases(-60)  # the killed process's lease has expired
     result = StageWorker(store.open(), all_handlers(external), owner="rescuer").run_once()
     assert result.status is IntentStatus.APPLIED and result.attempt == 2
     assert external.effects() == len(stage_set("memory.write.raw").stages)
@@ -344,19 +356,19 @@ def scenario_stale_claim_is_fenced(store) -> None:
     def slow(ctx: StageContext) -> None:
         if ctx.stage is V:
             entered.set()
-            release.wait(10)
+            release.wait(WAIT)
 
     slow_worker = StageWorker(store.open(), all_handlers(external, **{V: Handler(external, hook=slow)}),
                               owner="slow", lease_seconds=0.4)
     holder: list = []
     thread = threading.Thread(target=lambda: holder.append(slow_worker.run_once()))
     thread.start()
-    assert entered.wait(10)
-    time.sleep(0.7)  # slow's lease expires while its handler is stuck
+    assert entered.wait(WAIT)
+    store.shift_leases(-60)  # slow's lease expires while its handler is stuck
     fast = StageWorker(store.open(), all_handlers(external), owner="fast", lease_seconds=5).run_once()
     assert fast.status is IntentStatus.APPLIED and fast.attempt == 2
     release.set()
-    thread.join(10)
+    thread.join(WAIT)
     assert holder[0].lost_lease is True  # its receipts were refused by the fence
     stored = ledger.get_intent("tenant-1", "intent-1")
     assert stored.status is IntentStatus.APPLIED
@@ -382,7 +394,7 @@ def scenario_mixed_failed_and_pending_stays_processing_until_settle(store) -> No
     def hold_graph(ctx: StageContext) -> None:
         if ctx.stage is G:
             entered.set()
-            assert release.wait(10)
+            assert release.wait(WAIT)
 
     def fail_vector(ctx: StageContext) -> None:
         if ctx.stage is V:
@@ -392,7 +404,7 @@ def scenario_mixed_failed_and_pending_stays_processing_until_settle(store) -> No
     out: list = []
     thread = threading.Thread(target=lambda: out.append(StageWorker(store.open(), handlers, owner="w").run_once()))
     thread.start()
-    assert entered.wait(10)
+    assert entered.wait(WAIT)
     observer = store.open()
     stored = observer.get_intent("tenant-1", "intent-1")
     receipts = {r.stage: r.status for r in observer.receipts("tenant-1", "intent-1")}
@@ -400,7 +412,7 @@ def scenario_mixed_failed_and_pending_stays_processing_until_settle(store) -> No
     assert stored.status is IntentStatus.PROCESSING  # nonterminal until everything settles
     assert observer.derive_status("tenant-1", "intent-1") is IntentStatus.PROCESSING
     release.set()
-    thread.join(10)
+    thread.join(WAIT)
     result = out[0]
     assert result.status is IntentStatus.PARTIAL  # canonical applied; vector failed; graph/markdown skipped upstream or applied
     assert result.outcomes[V] == "failed (vector_down)"
@@ -486,7 +498,7 @@ def scenario_settled_failure_survives_a_crash_before_settle(store) -> None:
     handlers = all_handlers(external, **{V: Handler(external, hook=reject)})
     with pytest.raises(Crash):
         StageWorker(crashing, handlers, owner="a", lease_seconds=0.4).run_once()
-    time.sleep(0.7)
+    store.shift_leases(-60)  # the crashed worker's lease has expired
     calls_before = external.calls("vector_upsert")
     result = StageWorker(store.open(), handlers, owner="b").run_once()
     assert result.attempt == 2 and result.status is IntentStatus.PARTIAL
@@ -494,7 +506,38 @@ def scenario_settled_failure_survives_a_crash_before_settle(store) -> None:
     assert result.outcomes[V].endswith("earlier attempt)")
 
 
+class RenewalCounter:
+    """Delegating ledger that counts successful lease renewals and lets a scenario wait for the next ones."""
+
+    def __init__(self, inner: LedgerPort) -> None:
+        self._inner, self._renewed, self._changed = inner, 0, threading.Condition()
+
+    def __getattr__(self, name: str):
+        return getattr(self._inner, name)
+
+    def extend_lease(self, claim, lease_seconds):
+        renewed = self._inner.extend_lease(claim, lease_seconds)
+        with self._changed:
+            self._renewed += 1
+            self._changed.notify_all()
+        return renewed
+
+    def renewals_after(self, count: int) -> bool:
+        """Wait for ``count`` renewals beyond those already seen; ``False`` if they never come."""
+
+        with self._changed:
+            target = self._renewed + count
+            return self._changed.wait_for(lambda: self._renewed >= target, timeout=WAIT)
+
+
 def scenario_heartbeat_keeps_a_long_stage_leased(store) -> None:
+    """A stage that outlives its lease keeps it: each beat renews the lease from the ledger's clock.
+
+    The stored expiry is moved forward three times by two thirds of a lease (two whole lease lengths in
+    total), and after each move the scenario waits for the heartbeat to renew it (the second renewal after
+    the move started after it).  Without renewals the lease would have expired twice over, so a thief could
+    claim it; nothing depends on how fast the runner is."""
+
     ledger, external = store.open(), store.external()
     ledger.accept(intent("memory.write.raw"))
     entered, finish = threading.Event(), threading.Event()
@@ -502,18 +545,21 @@ def scenario_heartbeat_keeps_a_long_stage_leased(store) -> None:
     def long_stage(ctx: StageContext) -> None:
         if ctx.stage is V:
             entered.set()
-            finish.wait(10)
+            finish.wait(WAIT)
 
-    worker = StageWorker(store.open(), all_handlers(external, **{V: Handler(external, hook=long_stage)}),
-                         owner="w", lease_seconds=0.5, heartbeat_seconds=0.1)
+    renewals = RenewalCounter(store.open())
+    worker = StageWorker(renewals, all_handlers(external, **{V: Handler(external, hook=long_stage)}),
+                         owner="w", lease_seconds=30, heartbeat_seconds=0.05)
     out: list = []
     thread = threading.Thread(target=lambda: out.append(worker.run_once()))
     thread.start()
-    assert entered.wait(10)
-    time.sleep(1.4)  # nearly three lease lengths
-    assert store.open().claim("thief", 5) is None  # heartbeat kept the lease alive
+    assert entered.wait(WAIT)
+    for step in range(3):
+        store.shift_leases(-20)  # 10 s of the 30 s lease left: only a renewal keeps it alive
+        assert renewals.renewals_after(2), f"the heartbeat did not renew the lease (step {step + 1})"
+    assert store.open().claim("thief", 5) is None  # the heartbeat kept the lease alive
     finish.set()
-    thread.join(10)
+    thread.join(WAIT)
     assert out[0].status is IntentStatus.APPLIED and out[0].lost_lease is False and out[0].attempt == 1
 
 
