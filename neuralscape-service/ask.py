@@ -171,14 +171,16 @@ def _make_llm_call(tier: ReasoningTier):
     the caller needs an honest failure, not a silent empty answer.
     """
     from extensions.conversation_compiler.compile import _async_call_gemini
+    from usage_capture import operation_scope
 
     async def call(prompt: str) -> str:
         last_exc: Exception | None = None
         for attempt in range(2):  # one retry — the caller is waiting
             try:
-                return await asyncio.wait_for(
-                    _async_call_gemini(prompt), timeout=tier.llm_timeout_s
-                )
+                with operation_scope("llm_ask"):
+                    return await asyncio.wait_for(
+                        _async_call_gemini(prompt), timeout=tier.llm_timeout_s
+                    )
             except Exception as exc:  # timeout or transport
                 last_exc = exc
                 logger.warning(

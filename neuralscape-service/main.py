@@ -170,6 +170,16 @@ def _configure_to_thread_executor(loop) -> int | None:
     return None
 
 
+def _install_graph_reenrich_dispatch() -> None:
+    """Survivor re-enrichment after a shared episode is removed: ledger job, else graph-queue job."""
+    from memory.provenance import ledger_reenrich_dispatch, queue_reenrich_dispatch
+
+    if getattr(_task_manager, "producer", None) is not None:
+        _service.set_graph_reenrich_dispatch(ledger_reenrich_dispatch(_task_manager.producer))
+    elif getattr(_task_manager, "pool", None) is not None:
+        _service.set_graph_reenrich_dispatch(queue_reenrich_dispatch(_task_manager.pool, asyncio.get_running_loop()))
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("Starting Neuralscape Service...")
@@ -192,6 +202,7 @@ async def lifespan(app: FastAPI):
     _install_policy(_service, job_owner=_task_manager.job_owner)
     # Connect task manager to Redis
     await _task_manager.connect()
+    _install_graph_reenrich_dispatch()
     # The routed vector engine (off unless ENGINE_ROUTING_ENABLED): built over the ledger just opened.
     await _start_engine_switch()
 

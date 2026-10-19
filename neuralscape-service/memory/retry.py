@@ -22,6 +22,25 @@ def _is_transient(exc: Exception) -> bool:
     return any(p.lower() in msg.lower() for p in _TRANSIENT_PATTERNS)
 
 
+def _observed_call(fn, args, kwargs, operation, model_kwarg, fallback):
+    """Call ``fn``, reporting the attempt to the usage seam when it is enabled.
+
+    With no recorder installed this is a plain ``fn(*args, **kwargs)``.
+    """
+    from usage_capture import start_provider_attempt
+
+    observer = start_provider_attempt(fn, operation, kwargs.get(model_kwarg), fallback)
+    if observer is None:
+        return fn(*args, **kwargs)
+    try:
+        response = fn(*args, **kwargs)
+    except BaseException as exc:
+        observer.failed(exc)
+        raise
+    observer.succeeded(response)
+    return response
+
+
 def retry_transient(
     fn,
     *args,
@@ -51,7 +70,7 @@ def retry_transient(
     last_exc = None
     for attempt in range(max_retries + 1):
         try:
-            return fn(*args, **kwargs)
+            return _observed_call(fn, args, kwargs, operation, model_kwarg, False)
         except Exception as e:
             last_exc = e
             if not _is_transient(e):
@@ -75,7 +94,7 @@ def retry_transient(
             )
             kwargs[model_kwarg] = fallback_model
             try:
-                return fn(*args, **kwargs)
+                return _observed_call(fn, args, kwargs, operation, model_kwarg, True)
             except Exception as e:
                 logger.error(
                     f"Fallback model {fallback_model} also failed for {operation}: {e}"

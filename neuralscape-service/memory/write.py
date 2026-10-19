@@ -13,8 +13,10 @@ from config import settings
 from index_format import distill_title
 from prompts import build_extraction_messages, parse_extraction_response, parse_extraction_response_rich
 from savings_meter import stamp_tokens
+from usage_capture import record_generation_usage
 from schemas import EPISTEMIC_LEVEL_VOCAB, GLOBAL_CATEGORIES, MEMORY_CATEGORIES, MemoryResponse, MemoryScope, MemoryVisibility, PROJECT_CATEGORIES, default_scope_for_category, default_visibility_for_category, normalize_visibility, validate_occurred_at
 from memory.groups import _build_group_id
+from memory.provenance import REENRICH_PENDING_KEY, SUPERSEDED_EPISODES_KEY
 from memory.hashing import _infer_project_id, _parse_expires_at, content_hash
 from memory.junk import _clean_conversation_for_graph, _is_junk_fact
 from memory.ranking import _times_derived_from_metadata
@@ -263,17 +265,33 @@ class WriteMixin:
                 require_speaker=settings.extraction_require_speaker,
             )
             try:
-                response = retry_transient(
-                    client.models.generate_content,
-                    model=settings.gemini_llm_model,
-                    contents=extraction_messages[0]["content"],
-                    config=GenerateContentConfig(
-                        http_options=HttpOptions(timeout=60_000),  # milliseconds
-                    ),
-                    operation="LLM extraction",
-                    fallback_model=settings.gemini_llm_fallback_model,
-                )
-                parsed_facts_all.extend(parse_extraction_response_rich(response.text))
+                if settings.inference_facade_enabled is True:
+                    # Recipient-authorized, single-deadline, usage-recorded path.
+                    from inference_facade import service_complete_text
+
+                    response_text = service_complete_text(
+                        client=client,
+                        tenant_id=user_id,
+                        prompt=extraction_messages[0]["content"],
+                        operation="llm_extraction",
+                        settings=settings,
+                    )
+                else:
+                    response = retry_transient(
+                        client.models.generate_content,
+                        model=settings.gemini_llm_model,
+                        contents=extraction_messages[0]["content"],
+                        config=GenerateContentConfig(
+                            http_options=HttpOptions(timeout=60_000),  # milliseconds
+                        ),
+                        operation="LLM extraction",
+                        fallback_model=settings.gemini_llm_fallback_model,
+                    )
+                    record_generation_usage(
+                        response, operation="llm_extraction", model=settings.gemini_llm_model
+                    )
+                    response_text = response.text
+                parsed_facts_all.extend(parse_extraction_response_rich(response_text))
             except Exception as e:
                 # One window failing must not zero the whole session — keep
                 # the other windows' facts and report the failure honestly
@@ -587,21 +605,44 @@ class WriteMixin:
         try:
             from google.genai.types import GenerateContentConfig, HttpOptions
 
-            response = retry_transient(
-                client.models.generate_content,
-                model=settings.gemini_llm_model,
-                contents=extraction_messages[0]["content"],
-                config=GenerateContentConfig(
-                    http_options=HttpOptions(timeout=60_000),
-                ),
-                operation="LLM extraction (ingest)",
-                fallback_model=settings.gemini_llm_fallback_model,
-            )
-            if extractor is not None:
-                parsed_facts = extractor.parse(response.text)
+            if settings.inference_facade_enabled is True:
+                # Recipient-authorized, single-deadline, usage-recorded path.
+                from inference_facade import service_complete_text
+
+                response_text = service_complete_text(
+                    client=client,
+                    tenant_id=user_id,
+                    prompt=extraction_messages[0]["content"],
+                    operation="llm_extraction_ingest",
+                    settings=settings,
+                )
             else:
-                parsed_facts = parse_extraction_response(response.text)
+                response = retry_transient(
+                    client.models.generate_content,
+                    model=settings.gemini_llm_model,
+                    contents=extraction_messages[0]["content"],
+                    config=GenerateContentConfig(
+                        http_options=HttpOptions(timeout=60_000),
+                    ),
+                    operation="LLM extraction (ingest)",
+                    fallback_model=settings.gemini_llm_fallback_model,
+                )
+                record_generation_usage(
+                    response,
+                    operation="llm_extraction_ingest",
+                    model=settings.gemini_llm_model,
+                )
+                response_text = response.text
+            if extractor is not None:
+                parsed_facts = extractor.parse(response_text)
+            else:
+                parsed_facts = parse_extraction_response(response_text)
         except Exception as e:
+            if settings.inference_facade_enabled is True:
+                from inference_facade import RecipientDenied
+
+                if isinstance(e, RecipientDenied):
+                    raise  # an authorization denial is explicit, never an empty result
             logger.error(f"Ingest extraction failed: {e}")
             return []
         return [(cat, content) for cat, content in parsed_facts if not _is_junk_fact(content)]
@@ -1102,6 +1143,11 @@ class WriteMixin:
         # graph search can scope by allowed groups without re-leaking
         # cross-user facts or mixing memory/reference pools.
         group_id = _build_group_id(visibility, user_id, project_id, workspace)
+        # A correction re-enriches an existing memory: its previous episode is replaced below.
+        support_aware = bool(getattr(settings, "graph_support_aware_removal_enabled", False))
+        previous_episodes, reenrich_pending = (
+            self._previous_graph_episodes(memory_id) if support_aware else ([], False)
+        )
         graph_write_started_at = datetime.now(timezone.utc)
         try:
             graph_result = retry_transient(
@@ -1134,10 +1180,89 @@ class WriteMixin:
             episode_name = (graph_result or {}).get("episode_name")
             if episode_uuid or episode_name:
                 self._persist_graph_episode_ref(memory_id, episode_uuid, episode_name)
+            if (episode_uuid or episode_name) and self._row_deleted_during_enrichment(memory_id):
+                # The memory was deleted while it was being enriched: its delete found no episode
+                # yet, so the one just written would keep the deleted content in the graph.
+                # Remove it as the delete would have (once it is written, the delete's own
+                # content lookup finds it, so a delete landing after this check is covered).
+                self._cascade_expire_episode(
+                    group_id, episode_uuid=episode_uuid, episode_name=episode_name, content=content,
+                )
+                return True
+            if previous_episodes and episode_uuid:
+                # Support-aware: the new episode is already in place, so an edge the corrected
+                # text still asserts keeps the new support; only the superseded facts go.  An
+                # episode other memories share (one conversation, several facts) is removed too
+                # and they are re-enriched into fresh episodes; one that cannot be removed now
+                # is recorded on the row and retried by the next correction or the delete.
+                left = self._retire_episodes(
+                    (memory_id,), [u for u in previous_episodes if u != episode_uuid]
+                )
+                self._record_superseded_episodes(memory_id, previous_episodes, left)
+            if reenrich_pending and (episode_uuid or episode_name):
+                self._clear_reenrich_pending(memory_id)
             return True
         except Exception as e:
             logger.warning(f"Graph enrichment failed (non-critical): {e}")
             return False
+
+    def _row_deleted_during_enrichment(self, memory_id: str) -> bool:
+        """Whether the memory's row is gone after its graph write (a read error is not "gone")."""
+
+        try:
+            return self._memory.get(memory_id) is None
+        except Exception:
+            logger.debug("post-enrichment row check failed for %s", memory_id, exc_info=True)
+            return False
+
+    def _previous_graph_episodes(self, memory_id: str) -> tuple[list[str], bool]:
+        """The episodes recorded on the memory's row before a re-enrichment (its current episode
+        and any superseded one an earlier correction could not remove), and whether the row
+        awaits re-enrichment after its shared episode was removed."""
+
+        try:
+            row = self._memory.get(memory_id) or {}
+            metadata = row.get("metadata", {}) or {}
+            if isinstance(metadata.get("metadata"), dict):
+                metadata = metadata["metadata"]
+            superseded = metadata.get(SUPERSEDED_EPISODES_KEY)
+            values = [metadata.get("graph_episode_uuid"), *(superseded if isinstance(superseded, list) else [])]
+            episodes = list(dict.fromkeys(v for v in values if isinstance(v, str) and v))
+            return episodes, bool(metadata.get(REENRICH_PENDING_KEY))
+        except Exception:
+            logger.debug("previous graph episode lookup failed for %s", memory_id, exc_info=True)
+            return [], False
+
+    def _clear_reenrich_pending(self, memory_id: str) -> None:
+        try:
+            self._memory.vector_store.client.set_payload(
+                collection_name=settings.qdrant_collection,
+                payload={REENRICH_PENDING_KEY: None},
+                points=[memory_id],
+                key="metadata",
+            )
+        except Exception as e:
+            logger.warning(f"Clearing the re-enrichment marker failed for {memory_id} (non-fatal): {e}")
+
+    def _record_superseded_episodes(self, memory_id: str, previous: list[str], left: list[str]) -> None:
+        """Keep the superseded episodes not yet removed on the row (best-effort, like the episode ref)."""
+
+        if left:
+            logger.warning(
+                "Superseded graph episodes of memory=%s could not be removed (kept for retry): %s",
+                memory_id, left,
+            )
+        if not left and len(previous) <= 1:
+            return  # nothing was pending and nothing is
+        try:
+            self._memory.vector_store.client.set_payload(
+                collection_name=settings.qdrant_collection,
+                payload={SUPERSEDED_EPISODES_KEY: left},
+                points=[memory_id],
+                key="metadata",
+            )
+        except Exception as e:
+            logger.warning(f"Recording superseded graph episodes failed for {memory_id} (non-fatal): {e}")
 
     def _backfill_speaker_on_existing_memory(
         self,

@@ -1435,6 +1435,19 @@ def _make_after_job_end(queue_name: str):
 async def startup(ctx: dict) -> None:
     """Worker startup: initialize MemoryService + extension registry."""
     logger.info("ARQ worker starting up...")
+    # Durable usage capture (off unless USAGE_STORE_ENABLED).  The recorder must
+    # exist before the service builds its provider clients so they are wrapped.
+    if settings.usage_store_enabled:
+        import usage_capture
+        from usage_store import open_usage_store
+
+        usage_store = open_usage_store(settings)
+        ctx["usage_store"] = usage_store
+        usage_capture.set_usage_recorder(usage_capture.DurableUsageRecorder(usage_store))
+        logger.info("Durable usage store opened (backend=%s)", settings.usage_store_backend)
+    from provider_routing import apply_gemini_base_url
+
+    apply_gemini_base_url(settings.ns_gemini_base_url)  # must precede the first client
     service = MemoryService()
     service._get_memory()  # warm up connections
     ctx["service"] = service
@@ -1473,6 +1486,16 @@ async def shutdown(ctx: dict) -> None:
     service: MemoryService = ctx.get("service")
     if service:
         service.close()
+    for key in ("ledger_payloads", "ledger", "authority"):
+        handle = ctx.get(key)
+        if handle is not None:
+            handle.close()
+    usage_store = ctx.get("usage_store")
+    if usage_store is not None:
+        import usage_capture
+
+        usage_capture.set_usage_recorder(None)
+        usage_store.close()
     logger.info("ARQ worker stopped.")
 
 

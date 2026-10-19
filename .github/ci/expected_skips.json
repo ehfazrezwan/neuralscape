@@ -423,6 +423,10 @@
           "reason_contains": "ENGINE_TEST_PG_DSN and ENGINE_TEST_QDRANT_URL ar"
         },
         {
+          "test": "tests.test_graph_support_aware_cascade::test_the_reference_check_against_a_real_qdrant",
+          "reason_contains": "ENGINE_TEST_QDRANT_URL is not set (episode refer"
+        },
+        {
           "test": "tests.test_ledger_dispatch_pg_integration::test_dispatch_scenarios_on_postgres_as_runtime_role[a_failed_publish_returns_the_row_to_the_scan]",
           "reason_contains": "LEDGER_TEST_PG_DSN not set (postgres ledger inte"
         },
@@ -709,6 +713,66 @@
         {
           "test": "tests.test_policy_migration_integration::test_sources_read_real_legacy_data_without_modifying_it",
           "reason_contains": "MIGRATION_TEST_* not set (policy migration real-"
+        },
+        {
+          "test": "tests.test_usage_store_pg_integration::test_digest_tamper_detected",
+          "reason_contains": "USAGE_TEST_PG_DSN not set (postgres usage store "
+        },
+        {
+          "test": "tests.test_usage_store_pg_integration::test_newer_schema_refused_and_reopen_idempotent",
+          "reason_contains": "USAGE_TEST_PG_DSN not set (postgres usage store "
+        },
+        {
+          "test": "tests.test_usage_store_pg_integration::test_rows_content_free_and_schema_version",
+          "reason_contains": "USAGE_TEST_PG_DSN not set (postgres usage store "
+        },
+        {
+          "test": "tests.test_usage_store_pg_integration::test_shared_case_on_postgres[case_cancelled_late_counted_once]",
+          "reason_contains": "USAGE_TEST_PG_DSN not set (postgres usage store "
+        },
+        {
+          "test": "tests.test_usage_store_pg_integration::test_shared_case_on_postgres[case_concurrent_appends_count_once]",
+          "reason_contains": "USAGE_TEST_PG_DSN not set (postgres usage store "
+        },
+        {
+          "test": "tests.test_usage_store_pg_integration::test_shared_case_on_postgres[case_conflicting_event_id]",
+          "reason_contains": "USAGE_TEST_PG_DSN not set (postgres usage store "
+        },
+        {
+          "test": "tests.test_usage_store_pg_integration::test_shared_case_on_postgres[case_correction_counts_once]",
+          "reason_contains": "USAGE_TEST_PG_DSN not set (postgres usage store "
+        },
+        {
+          "test": "tests.test_usage_store_pg_integration::test_shared_case_on_postgres[case_idempotent_duplicate]",
+          "reason_contains": "USAGE_TEST_PG_DSN not set (postgres usage store "
+        },
+        {
+          "test": "tests.test_usage_store_pg_integration::test_shared_case_on_postgres[case_insertion_order_independent]",
+          "reason_contains": "USAGE_TEST_PG_DSN not set (postgres usage store "
+        },
+        {
+          "test": "tests.test_usage_store_pg_integration::test_shared_case_on_postgres[case_invalid_event_not_persisted]",
+          "reason_contains": "USAGE_TEST_PG_DSN not set (postgres usage store "
+        },
+        {
+          "test": "tests.test_usage_store_pg_integration::test_shared_case_on_postgres[case_ledger_attempt_correlation]",
+          "reason_contains": "USAGE_TEST_PG_DSN not set (postgres usage store "
+        },
+        {
+          "test": "tests.test_usage_store_pg_integration::test_shared_case_on_postgres[case_reconcile_empty_is_none]",
+          "reason_contains": "USAGE_TEST_PG_DSN not set (postgres usage store "
+        },
+        {
+          "test": "tests.test_usage_store_pg_integration::test_shared_case_on_postgres[case_task_filter]",
+          "reason_contains": "USAGE_TEST_PG_DSN not set (postgres usage store "
+        },
+        {
+          "test": "tests.test_usage_store_pg_integration::test_shared_case_on_postgres[case_tenant_isolation]",
+          "reason_contains": "USAGE_TEST_PG_DSN not set (postgres usage store "
+        },
+        {
+          "test": "tests.test_usage_store_pg_integration::test_shared_case_on_postgres[case_unknown_is_never_zero]",
+          "reason_contains": "USAGE_TEST_PG_DSN not set (postgres usage store "
         }
       ]
     },
@@ -1131,6 +1195,10 @@
           "reason_contains": "ENGINE_TEST_PG_DSN and ENGINE_TEST_QDRANT_URL ar"
         },
         {
+          "test": "tests.test_graph_support_aware_cascade::test_the_reference_check_against_a_real_qdrant",
+          "reason_contains": "ENGINE_TEST_QDRANT_URL is not set (episode refer"
+        },
+        {
           "test": "tests.test_ledger_dispatch_pg_integration::test_dispatch_scenarios_on_postgres_as_runtime_role[a_failed_publish_returns_the_row_to_the_scan]",
           "reason_contains": "LEDGER_TEST_PG_DSN not set (postgres ledger inte"
         },
@@ -1417,6 +1485,66 @@
         {
           "test": "tests.test_policy_migration_integration::test_sources_read_real_legacy_data_without_modifying_it",
           "reason_contains": "MIGRATION_TEST_* not set (policy migration real-"
+        },
+        {
+          "test": "tests.test_usage_store_pg_integration::test_digest_tamper_detected",
+          "reason_contains": "USAGE_TEST_PG_DSN not set (postgres usage store "
+        },
+        {
+          "test": "tests.test_usage_store_pg_integration::test_newer_schema_refused_and_reopen_idempotent",
+          "reason_contains": "USAGE_TEST_PG_DSN not set (postgres usage store "
+        },
+        {
+          "test": "tests.test_usage_store_pg_integration::test_rows_content_free_and_schema_version",
+          "reason_contains": "USAGE_TEST_PG_DSN not set (postgres usage store "
+        },
+        {
+          "test": "tests.test_usage_store_pg_integration::test_shared_case_on_postgres[case_cancelled_late_counted_once]",
+          "reason_contains": "USAGE_TEST_PG_DSN not set (postgres usage store "
+        },
+        {
+          "test": "tests.test_usage_store_pg_integration::test_shared_case_on_postgres[case_concurrent_appends_count_once]",
+          "reason_contains": "USAGE_TEST_PG_DSN not set (postgres usage store "
+        },
+        {
+          "test": "tests.test_usage_store_pg_integration::test_shared_case_on_postgres[case_conflicting_event_id]",
+          "reason_contains": "USAGE_TEST_PG_DSN not set (postgres usage store "
+        },
+        {
+          "test": "tests.test_usage_store_pg_integration::test_shared_case_on_postgres[case_correction_counts_once]",
+          "reason_contains": "USAGE_TEST_PG_DSN not set (postgres usage store "
+        },
+        {
+          "test": "tests.test_usage_store_pg_integration::test_shared_case_on_postgres[case_idempotent_duplicate]",
+          "reason_contains": "USAGE_TEST_PG_DSN not set (postgres usage store "
+        },
+        {
+          "test": "tests.test_usage_store_pg_integration::test_shared_case_on_postgres[case_insertion_order_independent]",
+          "reason_contains": "USAGE_TEST_PG_DSN not set (postgres usage store "
+        },
+        {
+          "test": "tests.test_usage_store_pg_integration::test_shared_case_on_postgres[case_invalid_event_not_persisted]",
+          "reason_contains": "USAGE_TEST_PG_DSN not set (postgres usage store "
+        },
+        {
+          "test": "tests.test_usage_store_pg_integration::test_shared_case_on_postgres[case_ledger_attempt_correlation]",
+          "reason_contains": "USAGE_TEST_PG_DSN not set (postgres usage store "
+        },
+        {
+          "test": "tests.test_usage_store_pg_integration::test_shared_case_on_postgres[case_reconcile_empty_is_none]",
+          "reason_contains": "USAGE_TEST_PG_DSN not set (postgres usage store "
+        },
+        {
+          "test": "tests.test_usage_store_pg_integration::test_shared_case_on_postgres[case_task_filter]",
+          "reason_contains": "USAGE_TEST_PG_DSN not set (postgres usage store "
+        },
+        {
+          "test": "tests.test_usage_store_pg_integration::test_shared_case_on_postgres[case_tenant_isolation]",
+          "reason_contains": "USAGE_TEST_PG_DSN not set (postgres usage store "
+        },
+        {
+          "test": "tests.test_usage_store_pg_integration::test_shared_case_on_postgres[case_unknown_is_never_zero]",
+          "reason_contains": "USAGE_TEST_PG_DSN not set (postgres usage store "
         }
       ]
     }

@@ -8,7 +8,7 @@ import logging
 
 from config import settings
 from schemas import MemoryResponse, MemoryVisibility
-from memory.groups import _edge_is_invalidated, _get_group_ids, _live_edges_filter
+from memory.groups import _build_group_id, _edge_is_invalidated, _get_group_ids, _live_edges_filter
 from memory.ranking import RRF_K, _dense_score_floor, _reinforcement_boost, _rrf_fuse, _salience_tiebreak, _unit_cosine
 
 logger = logging.getLogger(__name__)
@@ -364,6 +364,43 @@ class SearchMixin:
     # Search operations
     # ──────────────────────────────────────────────
 
+    def _engine_recall(
+        self, switch, query: str, user_id: str, project_id, limit: int, visibility, include_shared: bool
+    ):
+        """Vector recall from the serving engine, hydrated from the memory rows.
+
+        Returns ``None`` (the caller falls back to the legacy vector path) only
+        when the engine itself fails; rows the caller may not read are dropped
+        by ``get_memories_by_ids`` exactly as for any batch read.  Graph and
+        lexical legs are not routed in this mode.
+        """
+
+        try:
+            hits = switch.recall(
+                user_id, query, limit, project_id=project_id,
+                include_shared=include_shared, visibility=visibility,
+            )
+            if not hits:
+                return []
+            # The batch read accepts a bounded number of ids per call: hydrate in batches of it.
+            from memory.reads import GET_MEMORIES_MAX_IDS
+
+            ids = [h.record_id for h in hits]
+            by_id = {}
+            for start in range(0, len(ids), GET_MEMORIES_MAX_IDS):
+                fetched = self.get_memories_by_ids(ids[start:start + GET_MEMORIES_MAX_IDS], user_id)
+                by_id.update({r.id: r for r in fetched.get("results", [])})
+            results = []
+            for hit in hits:
+                row = by_id.get(hit.record_id)
+                if row is not None:
+                    row.score = hit.score
+                    results.append(row)
+            return results
+        except Exception as error:  # noqa: BLE001 - an engine fault must not take recall down
+            logger.warning("routed engine recall failed; using the legacy vector path: %s", error)
+            return None
+
     def search(
         self,
         query: str,
@@ -411,6 +448,19 @@ class SearchMixin:
         Returns:
             List of matching memory responses sorted by score.
         """
+        # Routed-engine recall (V3 switch): only when ENGINE_ROUTING_ENABLED and
+        # ENGINE_ROUTING_RECALL_ENABLED are both true; default off = unchanged.
+        if not vector_only:
+            from engine_adapters_switch import recall_switch
+
+            switch = recall_switch(settings)
+            if switch is not None:
+                routed = self._engine_recall(
+                    switch, query, user_id, project_id, limit, visibility, include_shared
+                )
+                if routed is not None:
+                    return routed
+
         m = self._get_memory()
         # Lazily ensure keyword/bool payload indexes for the hot-path filters
         # (audit 27 #14) — one attempt per service instance, never fatal.
@@ -1078,29 +1128,31 @@ class SearchMixin:
         unenriched row from the shared pool could slip into a
         private-only response.
         """
+        # Every name is built by ``_build_group_id``, exactly as writes build it, so a narrowed
+        # read set never names a pool another (user, project) tuple folds into.
         def _standard_groups() -> list[str]:
             if not settings.standards_enabled:
                 return []
-            return ["standard"] + ([f"standard--project--{project_id}"] if project_id else [])
+            return ["standard"] + ([_build_group_id("standard", "", project_id)] if project_id else [])
+
+        def _private_groups() -> list[str]:
+            return [_build_group_id("private", user_id)] + (
+                [_build_group_id("private", user_id, project_id)] if project_id else []
+            )
 
         if visibility == MemoryVisibility.PRIVATE.value:
-            group_ids = [f"user--{user_id}"]
-            if project_id:
-                group_ids.append(f"user--{user_id}--project--{project_id}")
+            group_ids = _private_groups()
         elif visibility == MemoryVisibility.STANDARD.value:
             group_ids = _standard_groups()
         elif visibility == MemoryVisibility.SHARED.value:
             group_ids = ["shared"]
             if project_id:
-                group_ids.append(f"shared--project--{project_id}")
+                group_ids.append(_build_group_id("shared", "", project_id))
         elif not include_shared:
             # No explicit visibility, but caller opted out of shared pool.
             # Standards remain in-scope — they are binding and independent of
             # the shared opt-out.
-            group_ids = [f"user--{user_id}"]
-            if project_id:
-                group_ids.append(f"user--{user_id}--project--{project_id}")
-            group_ids += _standard_groups()
+            group_ids = _private_groups() + _standard_groups()
         else:
             # Default: full read-set (caller's private + shared + standard).
             group_ids = _get_group_ids(user_id, project_id)

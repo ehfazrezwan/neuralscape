@@ -46,6 +46,14 @@ class CoreMixin:
 
                     config = settings.get_mem0_config()
                     self._memory = Memory.from_config(config)
+                    # Capture provider usage only when a recorder is installed.
+                    from usage_capture import get_usage_recorder
+
+                    capture_usage = get_usage_recorder() is not None
+                    if capture_usage:
+                        from usage_wrappers import install_mem0_wrappers
+
+                        install_mem0_wrappers(self._memory)
 
                     # Re-attach the Graphiti adapter mem0 v2.0.2 stopped
                     # auto-creating. The MemoryGraph constructor in
@@ -89,6 +97,10 @@ class CoreMixin:
                     if hasattr(self._memory, "graph") and hasattr(self._memory.graph, "graphiti"):
                         self._graphiti = self._memory.graph.graphiti
                         self._bridge = self._memory.graph._bridge
+                        if capture_usage:
+                            from usage_wrappers import install_graphiti_wrappers
+
+                            install_graphiti_wrappers(self._graphiti)
 
         return self._memory
 
@@ -159,7 +171,14 @@ class CoreMixin:
         if self._genai_model is None:
             with self._init_lock:
                 if self._genai_model is None:
-                    self._genai_model = genai.Client(api_key=settings.google_api_key)
+                    endpoint = getattr(settings, "ns_gemini_base_url", "")
+                    if isinstance(endpoint, str) and endpoint:
+                        from inference_facade import build_gemini_client
+
+                        self._genai_model = build_gemini_client(settings, genai)
+                    else:
+                        # Default (and any mocked setting): unchanged.
+                        self._genai_model = genai.Client(api_key=settings.google_api_key)
         return self._genai_model
 
     def close(self):
@@ -200,6 +219,10 @@ class CoreMixin:
         ("metadata.dream_tombstoned", "bool"),
         ("metadata.visibility", "keyword"),
         ("metadata.scope", "keyword"),
+        # The episode references the shared-episode sibling check filters on (one check per
+        # removed memory, so unindexed it would scan the collection once per deleted row).
+        ("metadata.graph_episode_uuid", "keyword"),
+        ("metadata.graph_episode_name", "keyword"),
     )
 
     def _ensure_filter_indexes(self) -> None:

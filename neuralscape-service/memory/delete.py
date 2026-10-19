@@ -289,11 +289,13 @@ class DeleteMixin:
         # (NS issue #176).
         unresolved_ids: list[str] = []
         if self._graphiti and self._bridge:
+            batch = tuple(mid for mid, _, _ in private_rows)
             for mid, payload, metadata in private_rows:
                 try:
                     cascade_result = self._cascade_or_fallback_expire(
                         {"memory": payload.get("data", ""), "metadata": metadata},
                         memory_id=mid,
+                        removing=batch,
                     )
                     if not cascade_result.get("resolved"):
                         logger.warning(
@@ -424,7 +426,7 @@ class DeleteMixin:
         for mem in private_memories + shared_memories:
             mid = mem.get("id", "")
             try:
-                cascade_result = self._cascade_or_fallback_expire(mem, memory_id=mid)
+                cascade_result = self._cascade_or_fallback_expire(mem, memory_id=mid, whole_user=True)
                 if not cascade_result.get("resolved"):
                     logger.warning(
                         "Nuke-all delete for user=%s memory=%s could not "
