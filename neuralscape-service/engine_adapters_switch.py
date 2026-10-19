@@ -33,6 +33,8 @@ import logging
 import threading
 from typing import Any, Callable, Iterable, Optional
 
+import third_party_telemetry  # noqa: F401 — must precede any mem0/Graphiti import (defaults their telemetry off)
+
 from contracts_errors import InternalErrorCode
 from engine_ports import EngineRecord, OperationContext, PortFailure, SearchHit, TenantFilter
 from engine_routing import (

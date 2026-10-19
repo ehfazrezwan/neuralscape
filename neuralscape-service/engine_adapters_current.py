@@ -31,6 +31,8 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Optional
 
+import third_party_telemetry  # noqa: F401 — must precede any mem0/Graphiti import (defaults their telemetry off)
+
 from contracts_engines import (
     CapabilityHealth,
     CapabilityManifest,
