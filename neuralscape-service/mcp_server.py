@@ -2613,6 +2613,11 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
                 force,
                 _queue_name=settings.graph_queue_name,
             )
+            if job:
+                # The caller may also poll it on /v1/memories/status.
+                from task_manager import record_task_owner
+
+                await record_task_owner(arq_pool, job.job_id, user_id)
             return [TextContent(type="text", text=json.dumps({
                 "status": "enqueued",
                 "job_id": job.job_id if job else None,

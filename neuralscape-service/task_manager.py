@@ -25,6 +25,59 @@ def _task_user_key(task_id: str) -> str:
     """Reverse map task id → user id (queue.empty webhook attribution)."""
     return f"ns:task-user:{task_id}"
 
+
+def _task_owner_key(task_id: str) -> str:
+    """Set of user ids allowed to read a task's status and result."""
+    return f"ns:task-owner:{task_id}"
+
+
+# ARQ drops a job that has not started within a day of being enqueued
+# (``expires_extra_ms``) and keeps a finished job's result for an hour
+# (``keep_result``). The owner record must outlive both, or an owner polling a
+# slow job would be told it does not exist.
+_OWNER_TTL_FLOOR_S = 2 * 24 * 3600
+
+
+def _task_owner_ttl() -> int:
+    return max(int(settings.queue_status_window_s) * 2, _OWNER_TTL_FLOOR_S)
+
+
+class TaskStatusUnavailable(Exception):
+    """The owner check could not be completed (Redis error).
+
+    The status routes answer this with a 503 for every task id alike. A 404
+    would tell the real owner that their task does not exist, so a client
+    could give up or resubmit the write; a 503 is retryable and, since it is
+    raised before anything about the task is read, says nothing about whether
+    the task exists or whose it is.
+    """
+
+
+async def record_task_owner(pool, task_id: str | None, *user_ids: str | None) -> bool:
+    """Record ``user_ids`` as allowed to read ``task_id``'s status.
+
+    For every enqueue that hands a task id to a caller who may poll it on
+    ``/v1/memories/status`` (TaskManager enqueues, and extension or MCP
+    routes that enqueue on the ARQ pool directly). The set member and its
+    TTL are written in one MULTI/EXEC so an owner key can never be left
+    without an expiry. Best-effort: a failure leaves the task unreadable
+    through a per-user token (the read fails closed) and never fails the
+    enqueue. Returns whether the record was written.
+    """
+    owners = sorted({u for u in user_ids if u})
+    if pool is None or not task_id or not owners:
+        return False
+    key = _task_owner_key(task_id)
+    try:
+        async with pool.pipeline(transaction=True) as pipe:
+            pipe.sadd(key, *owners)
+            pipe.expire(key, _task_owner_ttl())
+            await pipe.execute()
+        return True
+    except Exception as e:  # noqa: BLE001 — must never break writes
+        logger.warning(f"Task owner record failed for {task_id}: {e}")
+        return False
+
 # Map ARQ JobStatus to our API status strings
 _STATUS_MAP = {
     JobStatus.deferred: "queued",
@@ -60,6 +113,7 @@ class TaskManager:
         """
         if not user_id or self.pool is None:
             return
+        await self._record_owner(user_id, task_id)
         try:
             now = time.time()
             ttl = max(int(settings.queue_status_window_s) * 2, 600)
@@ -70,6 +124,26 @@ class TaskManager:
             await self.pool.set(_task_user_key(task_id), user_id, ex=ttl)
         except Exception as e:  # noqa: BLE001 — bookkeeping must never break writes
             logger.debug(f"Task tracking failed (non-fatal): {e}")
+
+    async def _record_owner(self, user_id: str, task_id: str) -> None:
+        """Record ``user_id`` as allowed to read ``task_id`` (see ``record_task_owner``).
+
+        A set, because a batch may carry items for several users (only possible
+        with the shared key, where the status read is not owner-checked).
+        """
+        await record_task_owner(self.pool, task_id, user_id)
+
+    async def is_task_owner(self, task_id: str, user_id: str | None) -> bool:
+        """Whether ``user_id`` enqueued ``task_id`` (False when unknown).
+
+        Raises ``TaskStatusUnavailable`` when Redis cannot answer.
+        """
+        if not user_id or self.pool is None:
+            return False
+        try:
+            return bool(await self.pool.sismember(_task_owner_key(task_id), user_id))
+        except Exception as e:  # noqa: BLE001 — any Redis failure: deny, retryably
+            raise TaskStatusUnavailable(str(e)) from e
 
     async def enqueue_store(
         self,
@@ -299,9 +373,9 @@ class TaskManager:
             _job_id=job_id,
             _queue_name=settings.ingest_queue_name,
         )
-        if job is None:
-            return job_id
-        return job.job_id
+        task_id = job_id if job is None else job.job_id
+        await self._track_task(payload.get("user_id"), task_id)
+        return task_id
 
     async def enqueue_code_index(self, payload: dict) -> str:
         """Phase G: enqueue a through-NS code-index task on the ingest queue.
@@ -324,7 +398,7 @@ class TaskManager:
         await self._track_task(payload.get("user_id"), task_id)
         return task_id
 
-    async def enqueue_connector_sync(self, connector_id: str) -> str:
+    async def enqueue_connector_sync(self, connector_id: str, user_id: str | None = None) -> str:
         """Enqueue a connector sync task. Returns job_id.
 
         Job id is keyed on the connector instance so overlapping syncs of the
@@ -340,9 +414,10 @@ class TaskManager:
             _job_id=job_id,
             _queue_name=settings.ingest_queue_name,
         )
-        if job is None:
-            return job_id
-        return job.job_id
+        task_id = job_id if job is None else job.job_id
+        # ``user_id`` is the connector owner who asked for the sync, so they can poll it.
+        await self._track_task(user_id, task_id)
+        return task_id
 
     async def enqueue_raw_batch(self, items: list[dict]) -> str:
         """Enqueue a batch of raw memory storage tasks (memory-model v2).
@@ -464,12 +539,22 @@ class TaskManager:
             fallback = Job(task_id, redis=self.pool, _queue_name=settings.arq_queue_name)
         return fallback, JobStatus.not_found
 
-    async def get_status(self, task_id: str) -> dict:
+    async def get_status(
+        self, task_id: str, user_id: str | None = None, *, enforce_owner: bool = False
+    ) -> dict:
         """Get task status from ARQ/Redis.
+
+        With ``enforce_owner`` the task is reported ``not_found`` unless
+        ``user_id`` enqueued it, before the job is looked up, so a caller
+        cannot tell another user's task from one that never existed. If the
+        owner check itself fails, ``TaskStatusUnavailable`` propagates (no
+        job is looked up).
 
         Returns:
             Dict with task_id, status, result, error keys.
         """
+        if enforce_owner and not await self.is_task_owner(task_id, user_id):
+            return {"task_id": task_id, "status": "not_found", "result": None, "error": None}
         job, status = await self._find_job(task_id)
 
         api_status = _STATUS_MAP.get(status, "not_found")

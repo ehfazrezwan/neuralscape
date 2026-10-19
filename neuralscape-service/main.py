@@ -77,7 +77,7 @@ from schemas import (
     TimelineResponse,
     normalize_visibility,
 )
-from task_manager import TaskManager
+from task_manager import TaskManager, TaskStatusUnavailable
 
 logger = logging.getLogger(__name__)
 
@@ -514,13 +514,37 @@ async def add_memory_async(req: LegacyAddMemoryRequest, request: Request):
     )
 
 
-@app.get("/memories/status/{task_id}")
-async def get_task_status(task_id: str):
-    """Check the status of an async memory addition task."""
-    result = await _task_manager.get_status(task_id)
+async def _caller_task_status(request: Request, task_id: str) -> dict:
+    """Status of ``task_id`` as the caller may see it; 404 when unknown or not theirs.
+
+    With a per-user token only the user who enqueued the task can read it, and
+    anyone else gets the same 404 as for an id that never existed. With the
+    shared key (or with auth disabled) every caller holds the same credential
+    and may write as any user, so there is no caller to check and the status
+    is returned as before. If the owner check cannot reach Redis the answer
+    is a 503 for every id alike, never the task's state.
+    """
+    token_user_id = getattr(request.state, "user_id", None)
+    try:
+        result = await _task_manager.get_status(
+            task_id, user_id=token_user_id, enforce_owner=bool(token_user_id)
+        )
+    except TaskStatusUnavailable:
+        # Same answer for every id (owned, foreign or unknown); retryable.
+        raise HTTPException(
+            status_code=503,
+            detail="Task status is temporarily unavailable; retry shortly.",
+            headers={"Retry-After": "1"},
+        )
     if result["status"] == "not_found":
         raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
     return result
+
+
+@app.get("/memories/status/{task_id}")
+async def get_task_status(task_id: str, request: Request):
+    """Check the status of an async memory addition task."""
+    return await _caller_task_status(request, task_id)
 
 
 # Legacy graph endpoints
@@ -1880,7 +1904,7 @@ async def v1_sync_connector(connector_id: str, request: Request):
     vault = _require_vault()
     caller = _resolve_user_id(request, None)
     await _require_owned_connector(vault, connector_id, caller)
-    task_id = await _task_manager.enqueue_connector_sync(connector_id)
+    task_id = await _task_manager.enqueue_connector_sync(connector_id, user_id=caller)
     return TaskAcceptedResponse(task_id=task_id, poll_url=f"/v1/memories/status/{task_id}")
 
 
@@ -1967,12 +1991,9 @@ async def v1_store_raw_batch(req: RawMemoryBatchRequest, request: Request):
 
 
 @v1_router.get("/memories/status/{task_id}", response_model=TaskStatusResponse)
-async def v1_get_task_status(task_id: str):
-    """Poll async task status."""
-    result = await _task_manager.get_status(task_id)
-    if result["status"] == "not_found":
-        raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
-    return result
+async def v1_get_task_status(task_id: str, request: Request):
+    """Poll async task status (only the user who enqueued it, with a per-user token)."""
+    return await _caller_task_status(request, task_id)
 
 
 # ── Recall ────────────────────────────────────
