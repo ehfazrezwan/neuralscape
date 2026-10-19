@@ -114,6 +114,28 @@ class Settings(BaseSettings):
     # destination.
     ns_gemini_base_url: str = ""
 
+    # ── pgvector direct-store adapter (default OFF; not wired into the service) ──
+    engine_pgvector_enabled: bool = False
+    engine_pgvector_dsn: str = ""
+    engine_pgvector_schema: str = "ns_engine"
+    engine_pgvector_dimensions: int = 0
+
+    # ── Engine routing (V3 switch; default OFF) ───────────────────────────
+    # When enabled, the vector stage of ledger writes/edits/deletes also projects
+    # the memory into a routed engine (generation 1 = a Qdrant projection
+    # collection), an operator can run dual-write/catch-up/flip/rollback through
+    # the dictator-only /v1/admin/engine-switch/* routes, and, if
+    # ENGINE_ROUTING_RECALL_ENABLED, /v1/search serves its vector recall from the
+    # routed engine.  The router keeps its state in one process: enable only
+    # where the API and the ledger worker share a process.
+    engine_routing_enabled: bool = False
+    engine_routing_recall_enabled: bool = False
+    engine_routing_qdrant_collection: str = "neuralscape_engine_projection"
+    engine_routing_dimensions: int = 0
+    # Seconds the previous generation is kept for rollback after a flip.  When it elapses the
+    # first routed write releases and destroys it (erased text must not outlive the window).
+    # 0 keeps it until an explicit release.
+    engine_routing_rollback_window_seconds: float = 0.0
     llm_retry_max_delay: float = 30.0  # seconds
 
     # Dedup cron
