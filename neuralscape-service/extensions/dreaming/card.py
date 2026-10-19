@@ -114,12 +114,14 @@ def resolve_card_pool(
     *, user_id: str | None = None, project_id: str | None = None, pool: str | None = None
 ) -> str | None:
     """Pool key for a card read: explicit pool > project pool > user pool."""
+    from memory.groups import _build_group_id
+
     if pool:
         return pool
     if project_id:
-        return f"shared--project--{project_id}"
+        return _build_group_id("shared", "", project_id)
     if user_id:
-        return f"user--{user_id}"
+        return _build_group_id("private", user_id)
     return None
 
 
@@ -136,6 +138,17 @@ def card_read_allowed(pool: str, caller_user_id: str | None, *, is_dictator: boo
     precedence every other read path uses). ``None`` denies: this guard
     never treats a missing identity as trust.
     """
+    from memory.groups import ENCODED_GROUP_PREFIX, decode_group_id
+
+    if pool.startswith(ENCODED_GROUP_PREFIX):
+        # An encoded (collision-free) name is read back exactly; whatever does not
+        # decode is refused rather than treated as a team pool.
+        key = decode_group_id(pool)
+        if key is None:
+            return is_dictator
+        if key.pool != "private" or is_dictator:
+            return True
+        return bool(caller_user_id) and key.owner == caller_user_id
     if not pool.startswith("user--"):
         return True
     if is_dictator:

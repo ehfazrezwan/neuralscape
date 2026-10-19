@@ -32,6 +32,15 @@ from .schemas import (
 logger = structlog.get_logger(__name__)
 
 
+def _ledger_on(task_manager) -> bool:
+    """True only when the durable ledger is enabled *and* this task manager has a producer."""
+
+    from config import settings
+
+    return bool(settings.ledger_enabled and task_manager is not None
+                and getattr(task_manager, "producer", None) is not None)
+
+
 def create_router(
     service: MemoryService,
     writer: ObsidianWriter,
@@ -57,6 +66,15 @@ def create_router(
         Returns 202 Accepted with a task reference.
         """
         timestamp = request.timestamp or datetime.now().isoformat()
+
+        if task_manager and _ledger_on(task_manager):
+            # Ledger on: accepted durably (idempotent receipt, recovered after a crash).
+            task_id = await task_manager.enqueue_conversation_flush(
+                user_message=request.user_message, assistant_response=request.assistant_response,
+                session_id=request.session_id, channel=request.channel, timestamp=timestamp,
+                project_id=request.project_id, user_id=request.user_id,
+            )
+            return {"status": "accepted", "task_id": task_id}
 
         if task_manager and task_manager.pool:
             try:
@@ -98,6 +116,10 @@ def create_router(
 
         Enqueues compilation to the ARQ worker for async processing.
         """
+        if task_manager and _ledger_on(task_manager):
+            task_id = await task_manager.enqueue_conversation_compile(request.date, request.user_id)
+            return {"status": "accepted", "task_id": task_id}
+
         if task_manager and task_manager.pool:
             try:
                 job = await task_manager.pool.enqueue_job(

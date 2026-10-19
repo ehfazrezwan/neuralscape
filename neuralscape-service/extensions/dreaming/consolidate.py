@@ -80,16 +80,19 @@ class ActionResult:
 
 
 def pool_key(*, visibility: str, owner_user_id: str | None, project_id: str | None, workspace: str | None = None) -> str:
-    """Derive the pool key for a memory row (mirrors graph group_id + WT6 workspace suffix)."""
-    if visibility == "shared":
-        base = f"shared--project--{project_id}" if project_id else "shared"
-    else:
-        uid = owner_user_id or "unknown"
-        base = f"user--{uid}--project--{project_id}" if project_id else f"user--{uid}"
-    # Workspace suffix (WT6): absent or "memory" ⇒ no suffix (backward compatible)
-    if workspace and workspace != "memory":
-        return f"{base}--ws--{workspace}"
-    return base
+    """Derive the pool key for a memory row: the graph group_id (incl. the WT6 workspace suffix).
+
+    Built by ``_build_group_id`` itself, so the key follows the collision-free naming
+    whenever the graph does.  Anything that is not shared counts as private.
+    """
+    from memory.groups import _build_group_id
+
+    return _build_group_id(
+        "shared" if visibility == "shared" else "private",
+        owner_user_id or "unknown",
+        project_id,
+        workspace,
+    )
 
 
 # Audit 27 #29: the enumeration scroll pulls ONLY the fields the cheap

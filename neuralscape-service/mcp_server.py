@@ -2194,9 +2194,46 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
 
         elif name == "delete_memories":
             memory_id = arguments.get("memory_id")
+            if memory_id and settings.ledger_enabled and getattr(_task_manager, "producer", None) is not None:
+                from ledger.port import HoldActive
+
+                row = await asyncio.to_thread(_service.get_memory, memory_id, user_id)
+                if row is None:
+                    return [TextContent(type="text", text=json.dumps({"error": f"Memory {memory_id} not found"}))]
+                memory_row = {
+                    "owner_user_id": getattr(row, "owner_user_id", None),
+                    "visibility": getattr(row, "visibility", None) or "private",
+                    "project_id": getattr(row, "project_id", None),
+                    "workspace": getattr(row, "workspace", None),
+                }
+                try:
+                    task_id = await _task_manager.enqueue_delete_durable(
+                        user_id=user_id, memory_id=memory_id, memory_row=memory_row
+                    )
+                except HoldActive as held:
+                    return [TextContent(type="text", text=json.dumps({"error": {
+                        "code": "hold_active", "message": "An active retention hold blocks this delete.",
+                        "hold_ids": list(held.hold_ids)}}))]
+                return [TextContent(type="text", text=json.dumps({"status": "accepted", "task_id": task_id}))]
             if memory_id:
                 # Pass caller identity so standard-tier deletes are gated to dictators.
                 result = await asyncio.to_thread(_service.delete_memory, memory_id, user_id)
+            elif settings.ledger_enabled and getattr(_task_manager, "producer", None) is not None:
+                from ledger.port import HoldActive
+
+                try:
+                    task_id = await _task_manager.enqueue_job_durable(
+                        "memory.delete.bulk", user_id=user_id, project_id=arguments.get("project_id"),
+                        payload={"user_id": user_id, "scope": arguments.get("scope"),
+                                 "category": arguments.get("category"), "project_id": arguments.get("project_id"),
+                                 "filter_null_category": arguments.get("filter_null_category", False),
+                                 "include_shared": arguments.get("include_shared", False)},
+                    )
+                except HoldActive:
+                    return [TextContent(type="text", text=json.dumps({"error": {
+                        "code": "hold_active",
+                        "message": "The tenant has an active retention hold; delete by memory id instead."}}))]
+                return [TextContent(type="text", text=json.dumps({"status": "accepted", "task_id": task_id}))]
             else:
                 result = await asyncio.to_thread(
                     _service.delete_memories,
@@ -2612,6 +2649,15 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
                 }))]
             # Reuse the process-lifetime pool (audit 27 #35) — no per-call
             # connect/teardown on this path.
+            if settings.ledger_enabled and getattr(_task_manager, "producer", None) is not None:
+                ids = await _task_manager.enqueue_system_jobs_durable(
+                    "dream.sweep",
+                    {"pool": arguments.get("pool"), "dry_run": bool(arguments.get("dry_run", False)), "force": force},
+                )
+                return [TextContent(type="text", text=json.dumps({
+                    "status": "enqueued", "job_id": ids[0] if ids else None, "job_ids": ids,
+                    "poll": "/v1/extensions/dreaming/status",
+                }))]
             arq_pool = await _get_arq_pool()
             job = await arq_pool.enqueue_job(
                 "run_dream_sweep",
@@ -2783,6 +2829,11 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
 
             if name == "rescope_private_derivatives":
                 dry_run = arguments.get("dry_run", True)
+                if not dry_run and settings.ledger_enabled and getattr(_task_manager, "producer", None) is not None:
+                    task_id = await _task_manager.enqueue_job_durable(
+                        "derivatives.retract", user_id=user_id, payload={"user_id": target, "dry_run": False},
+                    )
+                    return [TextContent(type="text", text=json.dumps({"status": "accepted", "task_id": task_id}))]
                 result = await asyncio.to_thread(
                     _service.rescope_private_derivatives, target, dry_run=dry_run
                 )

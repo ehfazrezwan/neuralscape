@@ -16,6 +16,7 @@ from google import genai
 
 from config import settings as core_settings
 from memory_service import MemoryService
+from usage_capture import current_operation, record_generation_usage
 
 from .config import compiler_settings
 from .obsidian_writer import ObsidianWriter, _slugify
@@ -99,6 +100,9 @@ def _call_gemini(prompt: str) -> str:
     model = compiler_settings.get_llm_model(core_settings.gemini_llm_model)
     client = genai.Client(api_key=core_settings.google_api_key)
     response = client.models.generate_content(model=model, contents=prompt)
+    record_generation_usage(
+        response, operation=current_operation("llm_compile"), model=model
+    )
     return response.text or ""
 
 

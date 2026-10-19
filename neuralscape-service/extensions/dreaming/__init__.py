@@ -99,9 +99,22 @@ class DreamingExtension:
                     status_code=409,
                     detail="DREAMING_ENABLED=false — set the env var (or force=true) to run",
                 )
+            from config import settings as core_settings
+
+            if core_settings.ledger_enabled:
+                import main as main_module
+
+                manager = main_module._task_manager
+                if getattr(manager, "producer", None) is not None:
+                    ids = await manager.enqueue_system_jobs_durable(
+                        "dream.sweep", {"pool": req.pool, "dry_run": req.dry_run, "force": req.force}
+                    )
+                    return {"job_id": ids[0] if ids else None, "job_ids": ids, "status": "enqueued",
+                            "poll": "/v1/extensions/dreaming/status"}
+
             from arq import create_pool
 
-            from config import parse_redis_settings, settings as core_settings
+            from config import parse_redis_settings
 
             arq_pool = await create_pool(parse_redis_settings())
             try:

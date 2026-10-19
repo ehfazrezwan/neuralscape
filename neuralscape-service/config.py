@@ -624,6 +624,21 @@ class Settings(BaseSettings):
     #   ledger_sqlite_path   → database file on a local filesystem.
     #   ledger_postgres_dsn  → libpq connection string for the cell database.
     ledger_enabled: bool = False
+    #   ledger_cutover_enabled → writes follow the online cutover phase (legacy until started) and the
+    #     privileged cutover admin routes are mounted; off keeps the ledger on whenever ledger_enabled is.
+    ledger_cutover_enabled: bool = False
+    #   ledger_retention_* → retention enforcement (off unless ledger_retention_enabled).  The windows are
+    #     engineering defaults, counted from an intent's terminal time.  Tombstones and the audit record
+    #     are never pruned until configured; tombstone retention is refused unless a backup expiry is set
+    #     and it is at least that expiry plus the restore window.
+    ledger_retention_enabled: bool = False
+    ledger_retention_idempotency_days: float = 7.0
+    ledger_retention_content_days: float = 30.0
+    ledger_retention_stale_processing_hours: float = 24.0
+    ledger_retention_tombstone_days: float | None = None
+    ledger_retention_audit_days: float | None = None
+    ledger_retention_backup_expiry_days: float | None = None
+    ledger_retention_restore_window_days: float = 30.0
     #   ledger_retention_postgres_dsn → a maintenance role that may delete aged tombstones (PostgreSQL only;
     #     the runtime role cannot).  Needed only when ledger_retention_tombstone_days is set.
     ledger_retention_postgres_dsn: str = ""
@@ -634,6 +649,12 @@ class Settings(BaseSettings):
     #     False opens as a least-privilege runtime role: it must not be a superuser or BYPASSRLS and the
     #     schema must already be migrated and granted (``python -m ledger.admin migrate`` then ``grant``).
     ledger_postgres_migrate_on_open: bool = True
+    #   ledger_cron_subjects → JSON object {tenant_id: worker/service-account subject id}.
+    #     With the authority store on, cron-started jobs (dream sweep, playbooks, dedup,
+    #     expiry) are accepted once per listed tenant under that explicit
+    #     subject; a tenant with no entry gets no cron job (never a default user).
+    ledger_cron_subjects: str = ""
+
     # ── Tenant admission control (cell edge; every limit unset = unlimited) ───
     # Mechanism only: no default numbers, no advertised quota (that policy is
     # not selected).  Used by ``tenant_admission`` (ASGI middleware or the edge

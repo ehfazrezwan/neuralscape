@@ -4,9 +4,11 @@ Run with: arq worker.WorkerSettings
 """
 
 import asyncio
+import dataclasses
 import hashlib
 import logging
-from datetime import datetime
+import os
+from datetime import datetime, timezone
 
 from arq.cron import cron
 
@@ -54,6 +56,10 @@ async def _note_session_messages(
         )
         for slot in due:
             bucket = count // ss.slot_interval(slot)
+            if ctx.get("ledger") is not None:
+                # Ledger on: the refresh is a durable intent (same deterministic key as the ARQ job id).
+                await _accept_session_summary(ctx, user_id, session_id, slot, bucket)
+                continue
             await ctx["redis"].enqueue_job(
                 "process_session_summary",
                 user_id,
@@ -66,6 +72,47 @@ async def _note_session_messages(
         logger.warning("session summary trigger failed (non-fatal)", exc_info=True)
 
 
+def _cutover_fenced(fn):
+    """Legacy write jobs honor the ledger cutover fence.
+
+    A job enqueued after the fence is not executed and returns an explicit ``fenced`` result (no
+    silent loss, no double write beside the ledger); one enqueued before it completes.  Without a
+    controller in the worker context (cutover not enabled) the job runs as before.  The ledger's own
+    legacy-body stages call ``fn.__wrapped__`` and so are never fenced.
+    """
+
+    import functools
+
+    @functools.wraps(fn)
+    async def guarded(ctx: dict, *args, **kwargs):
+        from ledger.cutover import FENCED_RESULT, legacy_admission
+
+        enqueued = ctx.get("enqueue_time")
+        admitted, reason = legacy_admission(ctx.get("cutover"), None if enqueued is None else enqueued.timestamp())
+        if not admitted:
+            logger.warning("legacy job %s fenced by the ledger cutover (%s)", fn.__name__, reason)
+            return dict(FENCED_RESULT)
+        return await fn(ctx, *args, **kwargs)
+
+    return guarded
+
+
+async def _accept_session_summary(ctx: dict, user_id: str, session_id: str, slot: str, bucket: int) -> None:
+    import session_summarizer as ss
+    from write_producer import WAKE_FUNCTION, ledger_queue_name
+
+    key = f"sess-{ss._safe(user_id)}-{ss._safe(session_id)}-{slot}-{bucket}"
+    result = await asyncio.to_thread(
+        _producer_from_ctx(ctx).accept_job,
+        operation="summary.session", user_id=user_id, idempotency_key=key,
+        payload={"user_id": user_id, "session_id": session_id, "slot": slot},
+    )
+    await ctx["redis"].enqueue_job(
+        WAKE_FUNCTION, _queue_name=ledger_queue_name(), _job_id=f"ledger-wake:{result.intent_id}"
+    )
+
+
+@_cutover_fenced
 async def process_session_summary(
     ctx: dict, user_id: str, session_id: str, slot: str
 ) -> dict:
@@ -83,6 +130,7 @@ async def process_session_summary(
 
 
 
+@_cutover_fenced
 async def process_memory_store(
     ctx: dict,
     messages: list[dict],
@@ -154,6 +202,7 @@ async def process_memory_store(
     return result
 
 
+@_cutover_fenced
 async def process_memory_raw(
     ctx: dict,
     content: str,
@@ -320,6 +369,7 @@ async def process_memory_raw(
     return {"memories": [m.model_dump(exclude_none=True) for m in memories]}
 
 
+@_cutover_fenced
 async def process_memory_raw_batch(ctx: dict, items: list[dict]) -> dict:
     """Background task: store a batch of pre-categorized facts (memory-model v2).
 
@@ -420,6 +470,7 @@ async def _enqueue_graph_jobs(ctx: dict, jobs: list[dict], adapter: str | None) 
     return enqueued
 
 
+@_cutover_fenced
 async def process_memory_retag(
     ctx: dict,
     caller_user_id: str,
@@ -452,6 +503,7 @@ async def process_memory_retag(
     return result
 
 
+@_cutover_fenced
 async def process_ingest_document(ctx: dict, doc: dict) -> dict:
     """Background task: ingest a document into passages + distilled facts.
 
@@ -570,6 +622,7 @@ async def _ingest_exemplars(
     return summaries
 
 
+@_cutover_fenced
 async def process_ingest_file(ctx: dict, payload: dict) -> dict:
     """Background task: parse an uploaded file's bytes → text → passages + facts.
 
@@ -718,6 +771,7 @@ async def process_ingest_file(ctx: dict, payload: dict) -> dict:
     return {"filename": filename, "doc_type": doc_type, **result}
 
 
+@_cutover_fenced
 async def process_ingest_okf_bundle(ctx: dict, payload: dict) -> dict:
     """Background task: walk + ingest an uploaded OKF bundle zip.
 
@@ -794,6 +848,7 @@ async def process_ingest_okf_bundle(ctx: dict, payload: dict) -> dict:
     return {"filename": filename, **result}
 
 
+@_cutover_fenced
 async def process_code_index(ctx: dict, payload: dict) -> dict:
     """Phase G: index a repo INTO a code knowledge system through NS.
 
@@ -1002,8 +1057,16 @@ async def process_graph_enrichment(
     return {"memory_id": memory_id, "enriched": enriched}
 
 
-async def expire_old_memories_cron(ctx: dict) -> dict:
-    """Cron job: purge memories whose expires_at is in the past (memory-model v2)."""
+async def process_graph_reenrich(ctx: dict, memory_id: str) -> dict:
+    """Background task: re-enrich one memory into a fresh episode after the conversation episode
+    it shared with a deleted or corrected memory was removed.  Raises (so ARQ retries) when the
+    enrichment does not complete; a memory deleted meanwhile is skipped."""
+    service: MemoryService = ctx["service"]
+    return await asyncio.to_thread(service.reenrich_memory_graph, memory_id)
+
+
+async def run_expire_sweep(ctx: dict) -> dict:
+    """Purge memories whose expires_at is in the past (memory-model v2)."""
     service: MemoryService = ctx["service"]
     result = await asyncio.to_thread(service.expire_old_memories)
     if result.get("deleted_count"):
@@ -1050,13 +1113,15 @@ async def dream_sweep_cron(ctx: dict) -> dict:
 
     if not dreaming_settings.enabled:
         return {"skipped": True, "reason": "DREAMING_ENABLED=false"}
+    if ctx.get("ledger") is not None:
+        return await _accept_cron(ctx, "dream.sweep", {"pool": None, "dry_run": False, "force": False})
     service: MemoryService = ctx["service"]
     run = await dream_all(service=service, settings=dreaming_settings)
     return run.to_dict()["totals"] | {"run_id": run.run_id}
 
 
-async def synthesize_strategy_playbooks_cron(ctx: dict) -> dict:
-    """Cron job: merge trading rule memories into canonical strategy playbooks.
+async def run_playbook_synthesis(ctx: dict) -> dict:
+    """Merge trading rule memories into canonical strategy playbooks.
 
     Gated by ``STRATEGY_SYNTHESIZER_ENABLED``; the synthesizer returns an empty
     result when disabled, so this wrapper just forwards. Runs on the graph
@@ -1078,6 +1143,63 @@ async def synthesize_strategy_playbooks_cron(ctx: dict) -> dict:
     }
 
 
+def _producer_from_ctx(ctx: dict):
+    from write_producer import DurableWriteProducer, PrincipalResolver, ServicePrincipalResolver
+
+    authority = ctx.get("authority")
+    return DurableWriteProducer(
+        ctx["ledger"], ctx["ledger_payloads"],
+        principals=None if authority is None else PrincipalResolver(authority),
+        service_principals=None if authority is None else ServicePrincipalResolver.from_setting(
+            authority, settings.ledger_cron_subjects
+        ),
+    )
+
+
+async def _accept_cron(ctx: dict, operation: str, payload: dict | None = None) -> dict:
+    """Ledger path of a cron: one intent per configured service principal, then a wake-up.
+
+    The key is one per hour per operation, so a repeated fire replays the receipt.  With the
+    authority store on and no configured subject for a tenant, nothing is accepted for it.
+    """
+
+    from write_producer import WAKE_FUNCTION, ledger_queue_name
+
+    bucket = datetime.now(timezone.utc).strftime("%Y%m%d%H")
+    results = await asyncio.to_thread(
+        _producer_from_ctx(ctx).accept_system_jobs,
+        operation=operation, payload=payload, idempotency_key=f"cron:{operation}:{bucket}",
+    )
+    for result in results:
+        await ctx["redis"].enqueue_job(
+            WAKE_FUNCTION, _queue_name=ledger_queue_name(), _job_id=f"ledger-wake:{result.intent_id}"
+        )
+    return {"accepted": [r.intent_id for r in results], "ledger": True}
+
+
+async def expire_old_memories_cron(ctx: dict) -> dict:
+    """Cron job: purge memories whose expires_at is in the past (memory-model v2)."""
+    if ctx.get("ledger") is not None:
+        return await _accept_cron(ctx, "memory.expire")
+    return await run_expire_sweep(ctx)
+
+
+async def synthesize_strategy_playbooks_cron(ctx: dict) -> dict:
+    """Cron job: merge trading rule memories into canonical strategy playbooks."""
+    from extensions.strategy_synthesizer.config import strategy_synthesizer_settings
+
+    if ctx.get("ledger") is not None:
+        if not strategy_synthesizer_settings.enabled:
+            return {"skipped": True, "reason": "STRATEGY_SYNTHESIZER_ENABLED=false"}
+        return await _accept_cron(ctx, "playbook.synthesize")
+    return await run_playbook_synthesis(ctx)
+
+
+async def dedup_all_memories(ctx: dict) -> dict:
+    """Cron job: deduplicate Qdrant memories for every user (see ``run_dedup_sweep``)."""
+    if ctx.get("ledger") is not None:
+        return await _accept_cron(ctx, "memory.dedup")
+    return await run_dedup_sweep(ctx)
 
 
 def _generate_job_id(content: str, user_id: str) -> str:
@@ -1143,6 +1265,7 @@ def _strategy_synthesizer_cron_hours() -> list[int]:
     return list(range(0, 24, interval))
 
 
+@_cutover_fenced
 async def process_conversation_flush(
     ctx: dict,
     user_message: str,
@@ -1182,6 +1305,7 @@ async def process_conversation_flush(
     return result.model_dump()
 
 
+@_cutover_fenced
 async def process_conversation_compile(
     ctx: dict,
     date: str | None,
@@ -1231,8 +1355,8 @@ async def auto_compile_check(ctx: dict) -> dict | None:
     return None
 
 
-async def dedup_all_memories(ctx: dict) -> dict:
-    """Cron job: deduplicate Qdrant memories for every user.
+async def run_dedup_sweep(ctx: dict) -> dict:
+    """Deduplicate Qdrant memories for every user.
 
     When dreaming is enabled the lossy semantic phase is skipped — the
     dream sweep's MERGE action supersedes it (folds unique details into
@@ -1277,6 +1401,7 @@ async def dedup_all_memories(ctx: dict) -> dict:
     return summary
 
 
+@_cutover_fenced
 async def process_connector_sync(ctx: dict, connector_id: str) -> dict:
     """Background task: pull a connector's resources and ingest changed ones.
 
@@ -1351,6 +1476,39 @@ async def process_connector_sync(ctx: dict, connector_id: str) -> dict:
     return {"connector_id": connector_id, "synced": synced, "skipped": skipped}
 
 
+async def _accept_connector_sync_durably(ctx: dict, rec: dict) -> bool:
+    from write_producer import (
+        WAKE_FUNCTION,
+        DurableWriteProducer,
+        PrincipalResolver,
+        ledger_queue_name,
+    )
+
+    authority = ctx.get("authority")
+    producer = DurableWriteProducer(
+        ctx["ledger"], ctx["ledger_payloads"],
+        principals=None if authority is None else PrincipalResolver(authority),
+    )
+    owner = rec.get("owner_user_id")
+    if not owner:  # never sync under a default identity from the cron
+        logger.warning("connector %s has no owner; durable sync skipped", rec.get("connector_id"))
+        return False
+    bucket = datetime.now(timezone.utc).strftime("%Y%m%d%H")
+    result = await asyncio.to_thread(
+        producer.accept_connector_sync,
+        user_id=owner,
+        connector_id=rec["connector_id"],
+        record=rec,
+        idempotency_key=f"cron:{rec['connector_id']}:{bucket}",
+    )
+    await ctx["redis"].enqueue_job(
+        WAKE_FUNCTION,
+        _queue_name=ledger_queue_name(),
+        _job_id=f"ledger-wake:{result.intent_id}",
+    )
+    return True
+
+
 async def connector_sync_cron(ctx: dict) -> dict:
     """Cron job: enqueue a sync for every enabled connector."""
     if not settings.connectors_enabled:
@@ -1362,6 +1520,12 @@ async def connector_sync_cron(ctx: dict) -> dict:
     enqueued = 0
     for rec in await vault.list():
         if not rec.get("enabled", True):
+            continue
+        if ctx.get("ledger") is not None:
+            # Durable path: one ledger intent per connector per hour (replays return
+            # the original receipt), then a wake-up for the ledger worker.
+            if await _accept_connector_sync_durably(ctx, rec):
+                enqueued += 1
             continue
         await redis.enqueue_job(
             "process_connector_sync",
@@ -1380,6 +1544,117 @@ def _connector_sync_cron_hours() -> list[int]:
     return list(range(0, 24, interval))
 
 
+async def _drain_ledger(ctx: dict, owner: str) -> int:
+    """Pull and process committed write obligations until none is available."""
+    from write_producer import LedgerWriteWorker, MemorySourceResolver
+
+    fence = None
+    authority = ctx.get("authority")
+    if authority is not None:
+        # Governed path: every stage is re-checked against current authority and
+        # the current source row before a provider call and at publication.
+        from publication_fence import PublicationFence
+
+        fence = PublicationFence(
+            authority,
+            MemorySourceResolver(
+                ctx["service"], ctx["ledger"], ctx["ledger_payloads"], authority
+            ),
+        )
+    worker = LedgerWriteWorker(
+        ctx["ledger"],
+        ctx["ledger_payloads"],
+        ctx["service"],
+        owner=owner,
+        lease_seconds=float(settings.arq_job_timeout),
+        fence=fence,
+        vault=ctx.get("vault"),
+        job_ctx=ctx,
+    )
+    return await worker.drain()
+
+
+async def process_ledger_work(ctx: dict) -> dict:
+    """Wake-up job for the durable write path (LEDGER_ENABLED only).
+
+    The queue message carries no authority and no payload: the worker claims
+    whatever obligation the ledger hands it, under a ledger lease with a
+    fencing token, and records stage receipts as it goes.
+    """
+    if ctx.get("ledger") is None:
+        logger.warning("ledger wake-up received but the ledger is not enabled here")
+        return {"processed": 0, "ledger": "disabled"}
+    owner = f"worker-{os.getpid()}-{ctx.get('job_id', 'job')}"
+    return {"processed": await _drain_ledger(ctx, owner)}
+
+
+async def ledger_retention_cron(ctx: dict) -> dict:
+    """Retention sweep per tenant (LEDGER_RETENTION_ENABLED).
+
+    With the authority store on, a tenant is swept only through its configured service principal
+    (a tenant without one, or whose principal cannot form, is skipped and reported); without it the
+    single default tenant is swept.  A failed tenant is reported and retried next run; a configuration
+    that would risk resurrecting erased data is refused (raised) before anything is pruned.
+    """
+
+    from ledger.retention import RetentionPolicy, RetentionSweeper
+    from write_producer import DEFAULT_TENANT, ServicePrincipalResolver, UnboundPrincipal
+
+    policy = RetentionPolicy.from_settings(settings)  # a configuration that risks resurrection refuses here
+    ledger, authority = ctx["ledger"], ctx.get("authority")
+    tenants: list[tuple[str, str]]
+    skipped: list[str] = []
+    if authority is None:
+        tenants = [(DEFAULT_TENANT, "default")]
+    else:
+        resolver = ServicePrincipalResolver.from_setting(authority, settings.ledger_cron_subjects)
+        tenants = []
+        for tenant in resolver.tenants():
+            try:
+                tenants.append((tenant, resolver.resolve(tenant).subject_id))
+            except UnboundPrincipal:
+                skipped.append(tenant)
+    sweeper = RetentionSweeper(ledger, policy, payloads=ctx.get("ledger_payloads"))
+    maintenance = fence_sweeper = None  # tombstone pruning runs under its own role on PostgreSQL
+    on_postgres = settings.ledger_backend == "postgres"
+    if policy.tombstone_seconds is not None and on_postgres:
+        sweeper = RetentionSweeper(ledger, dataclasses.replace(policy, tombstone_seconds=None, audit_seconds=None),
+                                   payloads=ctx.get("ledger_payloads"))
+        if settings.ledger_retention_postgres_dsn:
+            from ledger.postgres import PostgresLedger
+
+            maintenance = await asyncio.to_thread(PostgresLedger, settings.ledger_retention_postgres_dsn, migrate=False)
+            fence_sweeper = RetentionSweeper(maintenance, policy, fences_only=True)
+    reports: dict[str, dict] = {}
+    for tenant, actor in tenants:
+        try:
+            report = (await asyncio.to_thread(sweeper.sweep, tenant)).as_dict()
+            if policy.tombstone_seconds is not None and on_postgres:
+                if maintenance is None:
+                    report["notes"].append("tombstone pruning needs LEDGER_RETENTION_POSTGRES_DSN: not pruned")
+                else:
+                    report["tombstones_pruned"] = (
+                        await asyncio.to_thread(fence_sweeper.sweep, tenant)
+                    ).tombstones_pruned
+            reports[tenant] = report
+            logger.info("ledger retention swept tenant %s as %s", tenant, actor)
+        except Exception:  # noqa: BLE001
+            logger.exception("ledger retention failed for tenant %s", tenant)
+            reports[tenant] = {"error": "sweep_failed"}
+    if maintenance is not None:
+        maintenance.close()
+    return {"tenants": reports, "skipped": skipped}
+
+
+async def ledger_poll_cron(ctx: dict) -> dict:
+    """Recovery poll: claim pending obligations and steal expired leases.
+
+    Covers a lost wake-up (queue flush, crash between commit and enqueue) and a
+    worker that died holding a lease, independent of the ``queued`` flag.
+    """
+    if ctx.get("ledger") is None:
+        return {"processed": 0, "ledger": "disabled"}
+    return {"processed": await _drain_ledger(ctx, f"poll-{os.getpid()}")}
 
 
 def _make_after_job_end(queue_name: str):
@@ -1460,6 +1735,26 @@ async def startup(ctx: dict) -> None:
     await registry.startup_all()
     ctx["extension_registry"] = registry
 
+    # Durable ledger for the ordinary write path (off unless LEDGER_ENABLED).
+    if not settings.ledger_enabled:
+        from ledger import warn_if_ledger_bypassed
+
+        warn_if_ledger_bypassed(settings, logger)
+    if settings.ledger_enabled:
+        from ledger import open_ledger
+        from write_producer import open_payload_store
+
+        ctx["ledger"] = open_ledger(settings)
+        ctx["ledger_payloads"] = open_payload_store(settings)
+        from authority_store_sql import build_authority_store
+
+        ctx["authority"] = build_authority_store(settings)  # None unless AUTHORITY_ENABLED
+        if settings.ledger_cutover_enabled:
+            from ledger.cutover import CutoverController
+
+            ctx["cutover"] = CutoverController(ctx["ledger_payloads"])
+        logger.info("Durable ledger opened (backend=%s)", settings.ledger_backend)
+    _install_graph_reenrich_dispatch(ctx, service)
 
     # Connector vault (only when connectors are enabled + a vault key is set).
     if settings.connectors_enabled:
@@ -1475,6 +1770,16 @@ async def startup(ctx: dict) -> None:
             )
 
     logger.info("ARQ worker ready.")
+
+
+def _install_graph_reenrich_dispatch(ctx: dict, service: MemoryService) -> None:
+    """Survivor re-enrichment goes through the ledger when it is enabled, else the graph queue."""
+    from memory.provenance import ledger_reenrich_dispatch, queue_reenrich_dispatch
+
+    if ctx.get("ledger") is not None:
+        service.set_graph_reenrich_dispatch(ledger_reenrich_dispatch(_producer_from_ctx(ctx)))
+    elif ctx.get("redis") is not None:
+        service.set_graph_reenrich_dispatch(queue_reenrich_dispatch(ctx["redis"], asyncio.get_running_loop()))
 
 
 async def shutdown(ctx: dict) -> None:
@@ -1561,6 +1866,7 @@ class GraphWorkerSettings:
     """
     functions = [
         process_graph_enrichment,
+        process_graph_reenrich,
         run_dream_sweep,
         # Session summary refreshes (audit 27 #24): Gemini-bound, no latency
         # SLO — enqueued by _note_session_messages onto the graph queue.
@@ -1637,3 +1943,47 @@ class IngestWorkerSettings:
     max_jobs = 3
     job_timeout = 900  # a large PDF parse + fact extraction can run minutes
     max_tries = settings.arq_max_retries
+
+
+class LedgerWorkerSettings:
+    """Durable-write worker (LEDGER_ENABLED): claims ledger obligations.
+
+    Run with ``arq worker.LedgerWorkerSettings`` against the same ledger as the
+    API.  Own queue so a minutes-long graph stage never occupies the fast write
+    workers' slots.  The poll cron recovers lost wake-ups and expired leases.
+    """
+    functions = [
+        process_ledger_work,
+    ]
+    cron_jobs = [
+        cron(
+            ledger_poll_cron,
+            minute=set(range(0, 60)),
+            timeout=settings.arq_job_timeout * 4,
+            unique=True,
+            max_tries=1,
+            run_at_startup=True,
+        ),
+        *(
+            [
+                cron(
+                    ledger_retention_cron,
+                    hour={3},
+                    minute={17},
+                    timeout=settings.arq_job_timeout,
+                    unique=True,
+                    max_tries=1,
+                    run_at_startup=False,
+                )
+            ]
+            if settings.ledger_retention_enabled
+            else []
+        ),
+    ]
+    on_startup = startup
+    on_shutdown = shutdown
+    redis_settings = parse_redis_settings()
+    queue_name = f"{settings.arq_queue_name}:ledger"
+    max_jobs = 4
+    job_timeout = settings.arq_job_timeout * 4  # a graph stage can run minutes
+    max_tries = 1  # retries are ledger attempts, not ARQ redeliveries

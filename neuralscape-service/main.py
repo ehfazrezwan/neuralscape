@@ -82,6 +82,7 @@ from schemas import (
 )
 from authority_store import AuthorityUnavailable
 from ledger.port import HoldActive, IdempotencyConflict
+from write_producer import UnboundPrincipal
 from task_manager import TaskManager
 
 logger = logging.getLogger(__name__)
@@ -445,6 +446,14 @@ async def add_memory(req: LegacyAddMemoryRequest, request: Request):
     """Add a memory through mem0 (vector + graph). Legacy endpoint."""
     m = _get_memory()
     user_id = _resolve_user_id(request, req.user_id)
+    if _durable():
+        # Ledger on: the legacy synchronous add is accepted durably and applied by a worker.
+        task_id = await _task_manager.enqueue_job_durable(
+            "memory.add.legacy", user_id=user_id, **_ledger_kwargs(request),
+            payload={"messages": req.messages, "user_id": user_id, "agent_id": req.agent_id,
+                     "run_id": req.run_id, "metadata": req.metadata},
+        )
+        return _accepted(task_id, "/memories/status")
     try:
         result = await asyncio.to_thread(
             m.add,
@@ -515,6 +524,13 @@ async def delete_memories(
     """Delete all memories for a user. Legacy endpoint."""
     m = _get_memory()
     user_id = _resolve_user_id(request, user_id)
+    if _durable():
+        # Refused with 409 while the tenant has any hold (a delete-all cannot be checked per record).
+        task_id = await _task_manager.enqueue_job_durable(
+            "memory.delete_all.legacy", user_id=user_id, **_ledger_kwargs(request),
+            payload={"user_id": user_id, "agent_id": agent_id, "run_id": run_id},
+        )
+        return _accepted(task_id, "/memories/status")
     try:
         await asyncio.to_thread(
             m.delete_all,
@@ -546,9 +562,9 @@ async def add_memory_async(req: LegacyAddMemoryRequest, request: Request):
 
 
 @app.get("/memories/status/{task_id}")
-async def get_task_status(task_id: str):
+async def get_task_status(task_id: str, request: Request):
     """Check the status of an async memory addition task."""
-    result = await _task_manager.get_status(task_id)
+    result = await _task_manager.get_status(task_id, user_id=_resolve_user_id(request, None))
     if result["status"] == "not_found":
         raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
     return result
@@ -1132,9 +1148,25 @@ async def v1_ingest_text(req: IngestTextRequest, request: Request):
     }
     doc = {k: v for k, v in doc.items() if v is not None}
 
+    ingest_kwargs: dict = {}
+    if settings.ledger_enabled:
+        # Durable path: an optional client idempotency key makes retries safe.
+        ingest_key = _idempotency_key_from(request)
+        if ingest_key is not None:
+            ingest_kwargs["idempotency_key"] = ingest_key
     try:
-        task_id = await _task_manager.enqueue_ingest_document(doc)
-    except (ConnectionError, OSError) as e:
+        task_id = await _task_manager.enqueue_ingest_document(doc, **ingest_kwargs)
+    except Exception as e:
+        if settings.ledger_enabled:
+            from ledger.port import IdempotencyConflict
+
+            if isinstance(e, IdempotencyConflict):
+                raise HTTPException(
+                    status_code=409,
+                    detail="Idempotency-Key was already used with a different request",
+                ) from e
+        if not isinstance(e, (ConnectionError, OSError)):
+            raise
         logger.warning(f"Redis unavailable, falling back to sync ingest: {e}")
         from ingest.pipeline import IngestDoc, ingest_document
 
@@ -2027,12 +2059,31 @@ async def v1_store_raw_batch(req: RawMemoryBatchRequest, request: Request):
 
 
 @v1_router.get("/memories/status/{task_id}", response_model=TaskStatusResponse)
-async def v1_get_task_status(task_id: str):
+async def v1_get_task_status(task_id: str, request: Request):
     """Poll async task status."""
-    result = await _task_manager.get_status(task_id)
+    result = await _task_manager.get_status(task_id, user_id=_resolve_user_id(request, None))
     if result["status"] == "not_found":
         raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
     return result
+
+
+@v1_router.get("/memories/status/{task_id}/outputs")
+async def v1_get_task_outputs(
+    task_id: str,
+    request: Request,
+    offset: int = Query(default=0, ge=0),
+    limit: int = Query(default=256, ge=1, le=1000),
+):
+    """Page through every output of a durable task (a large ingest lists more than its receipt shows)."""
+    try:
+        page = await _task_manager.task_outputs(
+            task_id, user_id=_resolve_user_id(request, None), offset=offset, limit=limit
+        )
+    except LookupError as error:
+        raise HTTPException(status_code=410, detail="the outputs of this task are no longer available") from error
+    if page is None:
+        raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
+    return page
 
 
 # ── Recall ────────────────────────────────────
@@ -2995,6 +3046,9 @@ async def v1_get_reasoning_chain(
     return {"status": "ok", "chain": chain}
 
 
+_IF_MATCH_REVISION = re.compile(r'^\s*(?:W/)?"?(\d+)"?\s*$')
+
+
 def _idempotency_key_from(request: Request) -> str | None:
     key = request.headers.get("Idempotency-Key")
     if key is not None and (not key.strip() or len(key) > 200):
@@ -3021,6 +3075,13 @@ def _durable() -> bool:
     )
 
 
+def _accepted(task_id: str, poll_prefix: str = "/v1/memories/status") -> JSONResponse:
+    return JSONResponse(
+        status_code=202,
+        content={"status": "accepted", "task_id": task_id, "poll_url": f"{poll_prefix}/{task_id}"},
+    )
+
+
 @app.exception_handler(IdempotencyConflict)
 async def _idempotency_conflict_handler(request: Request, exc: IdempotencyConflict):
     return JSONResponse(
@@ -3037,6 +3098,93 @@ async def _authority_unavailable_handler(request: Request, exc: AuthorityUnavail
     error = public_error_for(InternalErrorCode.UNAVAILABLE_DEPENDENCY)  # the same answer the policy layer gives
     return JSONResponse(
         status_code=503, headers={"Retry-After": "1"}, content={"detail": {"error": error.model_dump(mode="json")}}
+    )
+
+
+@app.exception_handler(HoldActive)
+async def _hold_active_handler(request: Request, exc: HoldActive):
+    ids = list(exc.hold_ids)
+    message = (
+        "An active retention hold blocks this delete."
+        if ids else "The tenant has an active retention hold; delete by memory id instead."
+    )
+    return JSONResponse(
+        status_code=409,
+        content={"detail": {"error": {"code": "hold_active", "message": message, "retryable": False, "hold_ids": ids}}},
+    )
+
+
+@app.exception_handler(UnboundPrincipal)
+async def _unbound_principal_handler(request: Request, exc: UnboundPrincipal):
+    """A caller that does not resolve to an active, bound principal when its work is accepted.
+
+    The policy layer normally refuses such a caller first; this keeps any route that reaches the
+    write producer from answering 500 (the same refusal the governed edit route gives).
+    """
+
+    return JSONResponse(
+        status_code=403,
+        content={"detail": {"error": {"code": "permission_denied", "message": "Not permitted.", "retryable": False}}},
+    )
+
+
+async def _governed_edit(memory_id: str, caller: str, changes: dict, request: Request):
+    """Ledger-backed correction at an expected revision (``If-Match``).
+
+    A stale revision is a 409 with the current revision and writes nothing.
+    The correction is accepted durably and applied by the ledger worker, which
+    replaces the prior revision in the vector store and re-ingests the graph.
+    """
+    from ledger.port import IdempotencyConflict
+    from write_producer import StaleRevision, UnboundPrincipal, UnknownRevision
+
+    header = request.headers.get("If-Match")
+    if header is None:
+        raise HTTPException(
+            status_code=428,
+            detail={"error": {"code": "precondition_required", "message": "If-Match with the expected revision is required", "retryable": False}},
+        )
+    match = _IF_MATCH_REVISION.match(header)
+    if match is None:
+        raise HTTPException(status_code=400, detail="If-Match must be a revision number")
+    expected = int(match.group(1))
+    key = _idempotency_key_from(request)
+    row = await asyncio.to_thread(_service.get_memory, memory_id, caller)
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"Memory {memory_id} not found")
+    memory_row = {
+        "content": row.memory,
+        "owner_user_id": getattr(row, "owner_user_id", None),
+        "visibility": getattr(row, "visibility", None) or "private",
+        "project_id": getattr(row, "project_id", None),
+        "workspace": getattr(row, "workspace", None),
+    }
+    try:
+        task_id, revision = await _task_manager.enqueue_edit(
+            memory_id=memory_id,
+            user_id=caller,
+            changes=changes,
+            expected_revision=expected,
+            memory_row=memory_row,
+            idempotency_key=key,
+        )
+    except StaleRevision as stale:
+        raise HTTPException(
+            status_code=409,
+            detail={"error": {"code": "stale_revision", "message": "The memory changed since that revision; re-read it and retry.", "retryable": False, "current_revision": stale.current}},
+        ) from stale
+    except UnknownRevision as unknown:
+        raise HTTPException(
+            status_code=409,
+            detail={"error": {"code": "unknown_revision", "message": "No revision is registered for this memory; name revision 1.", "retryable": False}},
+        ) from unknown
+    except UnboundPrincipal as unbound:
+        raise HTTPException(status_code=403, detail={"error": {"code": "permission_denied", "message": "Not permitted.", "retryable": False}}) from unbound
+    except IdempotencyConflict as conflict:
+        raise HTTPException(status_code=409, detail="Idempotency-Key was already used with a different request") from conflict
+    return JSONResponse(
+        status_code=202,
+        content={"status": "accepted", "task_id": task_id, "poll_url": f"/v1/memories/status/{task_id}", "revision": revision},
     )
 
 
@@ -3060,6 +3208,8 @@ async def v1_patch_memory(memory_id: str, req: PatchMemoryRequest, request: Requ
     changes = {k: getattr(req, k) for k in req.model_fields_set if k != "user_id"}
     if not changes:
         raise HTTPException(status_code=400, detail="No fields to update — provide at least one field")
+    if _durable():
+        return await _governed_edit(memory_id, caller, changes, request)
     try:
         result = await asyncio.to_thread(_service.patch_memory, memory_id, caller, changes)
     except LookupError as e:
@@ -3135,6 +3285,41 @@ async def v1_retag_memories(req: RetagRequest, request: Request):
     )
 
 
+async def _durable_delete(memory_id: str, caller: str, request: Request):
+    """Ledger path for an ordinary delete: accept (409 under a hold), 202 + receipt."""
+
+    from ledger.port import HoldActive, IdempotencyConflict
+    from write_producer import UnboundPrincipal
+
+    key = _idempotency_key_from(request)
+    row = await asyncio.to_thread(_service.get_memory, memory_id, caller)
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"Memory {memory_id} not found")
+    memory_row = {
+        "owner_user_id": getattr(row, "owner_user_id", None),
+        "visibility": getattr(row, "visibility", None) or "private",
+        "project_id": getattr(row, "project_id", None),
+        "workspace": getattr(row, "workspace", None),
+    }
+    try:
+        task_id = await _task_manager.enqueue_delete_durable(
+            user_id=caller, memory_id=memory_id, memory_row=memory_row, idempotency_key=key
+        )
+    except HoldActive as held:
+        raise HTTPException(
+            status_code=409,
+            detail={"error": {"code": "hold_active", "message": "An active retention hold blocks this delete.", "retryable": False, "hold_ids": list(held.hold_ids)}},
+        ) from held
+    except UnboundPrincipal as unbound:
+        raise HTTPException(status_code=403, detail={"error": {"code": "permission_denied", "message": "Not permitted.", "retryable": False}}) from unbound
+    except IdempotencyConflict as conflict:
+        raise HTTPException(status_code=409, detail="Idempotency-Key was already used with a different request") from conflict
+    return JSONResponse(
+        status_code=202,
+        content={"status": "accepted", "task_id": task_id, "poll_url": f"/v1/memories/status/{task_id}"},
+    )
+
+
 @v1_router.delete("/memories/{memory_id}")
 async def v1_delete_memory(memory_id: str, request: Request):
     """Delete a single memory by ID.
@@ -3143,6 +3328,8 @@ async def v1_delete_memory(memory_id: str, request: Request):
     memories can be restricted to dictators.
     """
     caller = _resolve_user_id(request, None)
+    if _durable():
+        return await _durable_delete(memory_id, caller, request)
     try:
         return await asyncio.to_thread(_service.delete_memory, memory_id, caller)
     except PermissionError as pe:
@@ -3156,6 +3343,14 @@ async def v1_delete_memory(memory_id: str, request: Request):
 async def v1_bulk_delete_memories(req: BulkDeleteRequest, request: Request):
     """Bulk delete memories with filters."""
     user_id = _resolve_user_id(request, req.user_id)
+    if _durable():
+        task_id = await _task_manager.enqueue_job_durable(
+            "memory.delete.bulk", user_id=user_id, project_id=req.project_id, **_ledger_kwargs(request),
+            payload={"user_id": user_id, "scope": req.scope, "category": req.category,
+                     "project_id": req.project_id, "filter_null_category": req.filter_null_category,
+                     "include_shared": req.include_shared},
+        )
+        return _accepted(task_id)
     try:
         return await asyncio.to_thread(
             _service.delete_memories,
@@ -3508,6 +3703,13 @@ async def v1_rescope_private_derivatives(req: RescopePrivateDerivativesRequest, 
     """
     caller = _require_dictator_admin(request)
     target = req.user_id or caller
+    if _durable() and not req.dry_run:
+        # Only the mutating run is a writer; a dry run stays a synchronous read.
+        task_id = await _task_manager.enqueue_job_durable(
+            "derivatives.retract", user_id=caller, **_ledger_kwargs(request),
+            payload={"user_id": target, "dry_run": False},
+        )
+        return _accepted(task_id)
     try:
         result = await asyncio.to_thread(
             _service.rescope_private_derivatives, target, dry_run=req.dry_run
@@ -3825,6 +4027,100 @@ async def v1_engine_switch_abandon(request: Request):
 
 
 # ── Online cutover of legacy writers to the ledger (privileged; off unless LEDGER_CUTOVER_ENABLED) ──
+
+
+def _known_tenants(authority) -> tuple[str, ...]:
+    """The tenants a stray reference could hide in, for the backfill's reconciliation."""
+
+    lister = getattr(authority, "tenants", None)
+    return tuple(lister()) if callable(lister) else ()
+
+
+def _cutover_controller():
+    """The cutover controller with its backfill attached, or a 404 when cutover is not enabled."""
+
+    controller = getattr(_task_manager, "cutover", None)
+    if not settings.ledger_cutover_enabled or controller is None:
+        raise HTTPException(status_code=404, detail="ledger cutover is not enabled")
+    if controller._backfill is None:
+        from ledger.backfill import Backfill, QdrantScanner, authority_owner_resolver, single_tenant_resolver
+        from write_producer import DEFAULT_TENANT
+
+        authority = _task_manager.authority
+        resolver = (
+            authority_owner_resolver(authority, authority) if authority is not None
+            else single_tenant_resolver(DEFAULT_TENANT)
+        )
+        try:
+            client = _service._get_memory().vector_store.client
+        except Exception as error:  # the memory service is not initialized
+            raise HTTPException(status_code=503, detail="the memory service is not available for the backfill") from error
+        scanner = QdrantScanner(client, settings.qdrant_collection)
+        controller._backfill = Backfill(
+            _task_manager.ledger, scanner, resolver, _task_manager.producer.payloads,
+            extra_tenants=_known_tenants(authority),
+        )
+        controller._inflight = controller._inflight or _task_manager._legacy_inflight_sync
+    return controller
+
+
+async def _cutover_call(request: Request, action):
+    from ledger.cutover import CutoverError
+
+    _require_dictator_admin(request)
+    controller = _cutover_controller()
+    try:
+        return await asyncio.to_thread(action, controller)
+    except CutoverError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+
+
+@v1_router.get("/admin/ledger-cutover")
+async def v1_ledger_cutover_status(request: Request):
+    """Current phase, fence time and legacy in-flight count, plus the backfill progress."""
+
+    def status(controller):
+        out = controller.status()
+        out["backfill"] = controller._backfill.report().as_dict() if controller._backfill else None
+        return out
+
+    return await _cutover_call(request, status)
+
+
+@v1_router.post("/admin/ledger-cutover/start")
+async def v1_ledger_cutover_start(request: Request):
+    """``legacy`` -> ``dual_accept``: new writes are accepted by the ledger."""
+
+    return await _cutover_call(request, lambda c: c.start().as_dict())
+
+
+@v1_router.post("/admin/ledger-cutover/backfill")
+async def v1_ledger_cutover_backfill(request: Request, max_pages: int | None = Query(default=None, ge=1)):
+    """Continue the read-only backfill pass (resumable); ``max_pages`` bounds one call."""
+
+    return await _cutover_call(request, lambda c: c.backfill_step(max_pages).as_dict())
+
+
+@v1_router.post("/admin/ledger-cutover/advance")
+async def v1_ledger_cutover_advance(request: Request):
+    """``dual_accept`` -> ``ledger_only`` once the legacy queue is drained and reconciliation is clean."""
+
+    return await _cutover_call(request, lambda c: c.advance().as_dict())
+
+
+@v1_router.post("/admin/ledger-cutover/complete")
+async def v1_ledger_cutover_complete(request: Request):
+    """``ledger_only`` -> ``complete`` after a final clean reconciliation; rollback is refused afterwards."""
+
+    return await _cutover_call(request, lambda c: c.complete().as_dict())
+
+
+@v1_router.post("/admin/ledger-cutover/rollback")
+async def v1_ledger_cutover_rollback(request: Request):
+    """Return new writes to the legacy path (refused after ``complete``)."""
+
+    return await _cutover_call(request, lambda c: c.rollback().as_dict())
+
 
 
 # Mount v1 router
