@@ -624,9 +624,9 @@ describe("overlapping Stop hooks", () => {
     expect(flushes().length).toBe(3);
   });
 
-  it("a hook that finds a dead owner's lock takes it over and delivers", async () => {
+  it("a hook that finds the lock of a dead owner, older than the bound, takes it over and delivers", async () => {
     const { path, dir } = await transcript([...FLAT(1)]);
-    await writeFile(path + ".neuralscape-lock", JSON.stringify({ pid: 2 ** 22 + 12345, token: "dead", at: Date.now() }), "utf-8");
+    await writeFile(path + ".neuralscape-lock", JSON.stringify({ pid: 2 ** 22 + 12345, token: "dead", at: Date.now() - 120_000 }), "utf-8");
     await stop(path, dir);
     expect(flushes().length).toBe(1);
     expect(await offsetOf(path)).toBe(2);
@@ -711,5 +711,51 @@ describe("flush payload bounds and failures", () => {
     await commitClaudeCodeFlush(raw, result);
     await expect(readFile(path + ".neuralscape-offset", "utf-8")).rejects.toThrow();
     expect((await extractClaudeCodeTurns(raw)).length).toBe(3); // every turn is still pending
+  });
+});
+
+describe("the cursor only moves forward, and only under the lock", () => {
+  it("a commit that would write a lower or equal cursor is ignored", async () => {
+    const { path, raw } = await transcript([...FLAT(1), ...FLAT(2), ...FLAT(3)]);
+    await writeFile(path + ".neuralscape-offset", "6", "utf-8");
+    await extractClaudeCodeTurns({ ...raw }); // nothing new after 6
+    const { path: other, raw: otherRaw } = await transcript([...FLAT(1), ...FLAT(2)]);
+    const turns = await extractClaudeCodeTurns(otherRaw);
+    await writeFile(other + ".neuralscape-offset", "4", "utf-8"); // another hook already passed both turns
+    await commitClaudeCodeFlush(otherRaw, { attempted: turns.length, flushed: 1, firstFailedIndex: 1 }); // would write 2
+    expect(await offsetOf(other)).toBe(4);
+  });
+
+  it("a hook that lost its lock does not write the cursor", async () => {
+    const { path, raw } = await transcript([...FLAT(1), ...FLAT(2)]);
+    const turns = await extractClaudeCodeTurns(raw);
+    await commitClaudeCodeFlush(raw, { attempted: turns.length, flushed: 2, firstFailedIndex: null }, async () => false);
+    await expect(readFile(path + ".neuralscape-offset", "utf-8")).rejects.toThrow();
+  });
+});
+
+describe("Stop with a prompt that has no assistant text yet", () => {
+  const FINAL = "FINAL-ANSWER The retry logic is in place and every test passes now.";
+  it("an answer that lands within the wait window is delivered once, by that Stop", async () => {
+    const { path, dir } = await transcript([user(PROMPT_ONE), assistant(thinking, toolUse), toolResultEntry()]);
+    const running = stop(path, dir, FINAL, { NEURALSCAPE_TRANSCRIPT_LAG_WAIT_MS: "5000" });
+    await new Promise((r) => setTimeout(r, 700));
+    await append(path, [assistant(text(FINAL))]);
+    await running;
+    expect(flushes().length).toBe(1);
+    expect(flushes()[0].body.assistant_response).toBe(FINAL);
+    expect(await offsetOf(path)).toBe(4);
+    await stop(path, dir, FINAL, { NEURALSCAPE_TRANSCRIPT_LAG_WAIT_MS: "0" });
+    expect(flushes().length).toBe(1);
+  });
+
+  it("without the answer after the window, the prompt stays pending and a later Stop delivers it once", async () => {
+    const { path, dir } = await transcript([user(PROMPT_ONE), assistant(thinking, toolUse), toolResultEntry()]);
+    await stop(path, dir, FINAL, { NEURALSCAPE_TRANSCRIPT_LAG_WAIT_MS: "0" });
+    expect(flushes().length).toBe(0);
+    await expect(readFile(path + ".neuralscape-offset", "utf-8")).rejects.toThrow();
+    await append(path, [assistant(text(FINAL))]);
+    await stop(path, dir, FINAL, { NEURALSCAPE_TRANSCRIPT_LAG_WAIT_MS: "0" });
+    expect(flushes().length).toBe(1);
   });
 });

@@ -206,10 +206,10 @@ function parseTranscript(
   let lagging = false;
   if (user) {
     const pending: { text: string; index: number } = user;
+    // A prompt with no assistant text yet (thinking and tool entries only) lags too: the answer may be on its way.
     lagging =
       options.expectedFinal !== undefined &&
-      assistantParts.length > 0 &&
-      !endsWithText(assistantParts.join("\n"), options.expectedFinal);
+      !(assistantParts.length > 0 && endsWithText(assistantParts.join("\n"), options.expectedFinal));
     if (assistantParts.length > 0 && !lagging) {
       turns.push({ user: pending.text, assistant: assistantParts.join("\n"), final: assistantParts[assistantParts.length - 1], endOffset: windowEnd });
     } else {
@@ -389,7 +389,8 @@ export function extractClaudeCodeSessionEnd(
  */
 export async function commitClaudeCodeFlush(
   raw: Record<string, unknown>,
-  result: FlushResult
+  result: FlushResult,
+  stillHeld?: () => Promise<boolean>
 ): Promise<void> {
   const transcriptPath = raw.transcript_path as string | undefined;
   if (!transcriptPath) return;
@@ -408,6 +409,14 @@ export async function commitClaudeCodeFlush(
     if (committed === undefined) return;
     newOffset = committed;
   }
+
+  // The cursor only moves forward, and only while the delivery lock is still this hook's: a hook whose lock was
+  // lost must not write a cursor that another hook may already have passed.
+  if (stillHeld !== undefined && !(await stillHeld())) {
+    logError("The transcript lock was lost; leaving the cursor to the hook that holds it");
+    return;
+  }
+  if (newOffset <= (await readFlushOffset(transcriptPath))) return;
 
   try {
     await writeFlushOffset(transcriptPath, newOffset);
