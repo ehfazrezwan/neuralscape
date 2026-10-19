@@ -1869,10 +1869,13 @@ async def v1_register_connector(req: ConnectorConfigRequest, request: Request):
     """Register (or replace) a data-layer connector instance. Secrets are encrypted at rest.
 
     A per-user caller can only replace a connector it owns: an id owned by
-    someone else answers the same 404 as the other connector routes, so it
-    neither takes the connector over nor reveals that the id exists. Without
-    a caller identity (shared key / auth disabled) a replacement may change
-    the owner; the vault then starts a new instance with fresh sync state.
+    someone else answers the same 404 as the other connector routes, so the
+    connector cannot be taken over. Connector ids share one namespace across
+    users, so this route does show whether an id is taken (201 for an unused
+    id, 404 for one owned by someone else); it does not reveal the owner or
+    the connector's config. Without a caller identity (shared key / auth
+    disabled) a replacement may change the owner; the vault then starts a new
+    instance with fresh sync state.
     """
     from connectors.vault import ConnectorOwnedElsewhere
 
