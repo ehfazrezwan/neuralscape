@@ -1357,9 +1357,16 @@ async def process_connector_sync(
         last_synced_at=datetime.now(timezone.utc).isoformat(),
         revisions=revisions,
         generation=record.get("generation"),
+        # Only on top of the progress this sync started from: an overlapping sync of the
+        # same connector that already saved newer progress is never rolled back.
+        expected_cursor=cursor,
+        expected_revisions=dict(record.get("last_revision_by_id") or {}),
     )
     if not written:
-        logger.info(f"Connector sync [{connector_id}]: connector replaced or removed during sync; state not saved")
+        logger.info(
+            f"Connector sync [{connector_id}]: connector replaced or removed, or newer progress saved "
+            "by an overlapping sync; state not saved"
+        )
     logger.info(f"Connector sync [{connector_id}]: {synced} ingested, {skipped} unchanged")
     return {"connector_id": connector_id, "synced": synced, "skipped": skipped}
 

@@ -224,6 +224,8 @@ class ConnectorVault:
         last_synced_at: str | None = None,
         revisions: dict | None = None,
         generation: Any = _UNSET,
+        expected_cursor: Any = _UNSET,
+        expected_revisions: Any = _UNSET,
     ) -> bool:
         """Persist sync progress (cursor, timestamp, per-resource revisions).
 
@@ -235,7 +237,12 @@ class ConnectorVault:
         be ``None`` for a record from before generations), nothing is
         written when the stored connector is a different instance, so a sync
         that overlapped a delete/re-create or owner change cannot move the
-        new instance's cursor. Returns whether the state was written.
+        new instance's cursor. With ``expected_cursor`` / ``expected_revisions``
+        (the progress the sync started from), nothing is written when another
+        sync of the same instance saved newer progress meanwhile, so two
+        overlapping syncs (for example a job queued under an earlier job id and
+        one under the current id) cannot move the cursor backwards. Returns
+        whether the state was written.
         """
         key = _KEY_PREFIX + connector_id
         for _ in range(_CAS_ATTEMPTS):
@@ -244,6 +251,10 @@ class ConnectorVault:
                 return False
             raw = json.loads(blob)
             if generation is not _UNSET and raw.get("generation") != generation:
+                return False
+            if expected_cursor is not _UNSET and raw.get("cursor") != expected_cursor:
+                return False
+            if expected_revisions is not _UNSET and (raw.get("last_revision_by_id") or {}) != (expected_revisions or {}):
                 return False
             if cursor is not None:
                 raw["cursor"] = cursor

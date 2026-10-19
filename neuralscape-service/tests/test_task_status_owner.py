@@ -789,6 +789,92 @@ class TestConnectorSyncIdentity:
         assert _poll(new, "bob").status_code == 200
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("legacy_record", [True, False], ids=["generationless", "with-generation"])
+    async def test_a_slower_concurrent_sync_never_overwrites_newer_progress(self, vault, monkeypatch, legacy_record):
+        """Two syncs of one unchanged connector (e.g. a job queued under the old
+        sync-<id> id and one under the owner/generation id) can overlap. The one
+        that finishes last must not replace the progress the other already saved."""
+        import asyncio
+
+        import connectors.registry as registry
+        import worker
+
+        if legacy_record:
+            await self._make_legacy(vault, "alice")
+        else:
+            await vault.put({**self.BODY, "owner_user_id": "alice"})
+        gen = (await vault.get(self.CID)).get("generation")
+        await vault.update_sync_state(self.CID, cursor="initial", revisions={"doc": "r0"}, generation=gen)
+        started, release, calls = asyncio.Event(), asyncio.Event(), []
+
+        class Adapter:
+            def __init__(self):
+                self.slow = not calls
+                calls.append(self.slow)
+
+            async def list_resources(self, cursor):
+                assert cursor == "initial"
+                if self.slow:
+                    started.set()
+                    await release.wait()
+                    return [], "older-progress"
+                return [], "newer-progress"
+
+            async def aclose(self):
+                pass
+
+        monkeypatch.setattr(registry, "build_adapter", lambda record: Adapter())
+        ctx = {"vault": vault, "service": object()}
+        # Generationless record: the slower job uses the pre-upgrade form (no generation argument).
+        slow_args = (self.CID,) if legacy_record else (self.CID, gen)
+        slow = asyncio.create_task(worker.process_connector_sync(ctx, *slow_args))
+        await asyncio.wait_for(started.wait(), 5)
+        await worker.process_connector_sync(ctx, self.CID, gen)  # current form
+        assert (await vault.get(self.CID))["cursor"] == "newer-progress"
+        release.set()
+        await slow
+        assert (await vault.get(self.CID))["cursor"] == "newer-progress"
+
+    @pytest.mark.asyncio
+    async def test_sequential_syncs_still_advance_progress(self, vault, monkeypatch):
+        """Positive control: progress written by one sync is the starting point of the next."""
+        import connectors.registry as registry
+        import worker
+
+        await self._make_legacy(vault, "alice")
+        cursors = iter(["c1", "c2"])
+
+        class Adapter:
+            async def list_resources(self, cursor):
+                return [], next(cursors)
+
+            async def aclose(self):
+                pass
+
+        monkeypatch.setattr(registry, "build_adapter", lambda record: Adapter())
+        ctx = {"vault": vault, "service": object()}
+        await worker.process_connector_sync(ctx, self.CID)
+        assert (await vault.get(self.CID))["cursor"] == "c1"
+        await worker.process_connector_sync(ctx, self.CID, None)
+        assert (await vault.get(self.CID))["cursor"] == "c2"
+
+    @pytest.mark.asyncio
+    async def test_progress_write_requires_the_progress_it_started_from(self, vault):
+        await vault.put({**self.BODY, "owner_user_id": "alice"})
+        gen = (await vault.get(self.CID))["generation"]
+        assert await vault.update_sync_state(self.CID, cursor="a", revisions={"x": "1"}, generation=gen)
+        assert not await vault.update_sync_state(
+            self.CID, cursor="stale", generation=gen, expected_cursor="old", expected_revisions={"x": "1"}
+        )
+        assert not await vault.update_sync_state(
+            self.CID, cursor="stale", generation=gen, expected_cursor="a", expected_revisions={}
+        )
+        assert await vault.update_sync_state(
+            self.CID, cursor="b", generation=gen, expected_cursor="a", expected_revisions={"x": "1"}
+        )
+        assert (await vault.get(self.CID))["cursor"] == "b"
+
+    @pytest.mark.asyncio
     async def test_reregister_keeps_cursor_and_generation(self, vault):
         await vault.put({**self.BODY, "owner_user_id": "alice"})
         first = await vault.get(self.CID)
