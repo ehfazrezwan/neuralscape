@@ -252,7 +252,7 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# Register Bearer token auth middleware (no-op when NEURALSCAPE_API_KEY is unset)
+# Register Bearer token auth middleware (fail-closed; see auth.py and AUTH.md)
 from auth import BearerAuthMiddleware
 
 app.add_middleware(BearerAuthMiddleware)

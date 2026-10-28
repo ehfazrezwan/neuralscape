@@ -51,6 +51,7 @@ os.environ["DREAMING_OBSIDIAN_VAULT_PATH"] = "/tmp/obs-e2e-vault"
 os.environ["AUTH_PROVIDER"] = "token"
 os.environ["NEURALSCAPE_API_KEY"] = ""
 os.environ["NEURALSCAPE_USER_TOKEN_SECRET"] = ""
+os.environ["NEURALSCAPE_AUTH_DISABLED"] = "true"  # explicit opt-out (auth is fail-closed)
 
 RUN = uuid.uuid4().hex[:8]
 USER_A = f"obs-e2e-alice-{RUN}"
@@ -82,6 +83,7 @@ def main() -> int:  # noqa: PLR0915 — linear E2E narrative
     # Local-run determinism: bypass auth middleware, force both features on.
     settings.neuralscape_api_key = ""
     settings.neuralscape_user_token_secret = ""
+    settings.neuralscape_auth_disabled = True
     settings.savings_meter_enabled = True
     settings.event_stream_enabled = True
 
