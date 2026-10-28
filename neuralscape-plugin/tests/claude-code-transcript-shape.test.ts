@@ -200,6 +200,46 @@ describe("real transcript shape: turns", () => {
     ]);
   });
 
+  it("a transcript laid out as current Claude Code writes it (one block per assistant entry, API request copies, queue and attachment entries) yields the real turns only", async () => {
+    // Layout taken from the key names and types of real local transcripts (no content): assistant entries carry one
+    // block each (thinking, text or tool_use); `api-request-blob` entries repeat request messages under
+    // `message.{role,content}`; `queue-operation` and `system` entries may carry a top-level `content`.
+    const blob = (role: string, content: unknown) => ({ type: "api-request-blob", hash: "h", sessionId: SESSION, message: { role, content } });
+    const { raw } = await transcript([
+      { type: "permission-mode", permissionMode: "default", sessionId: SESSION },
+      { type: "queue-operation", operation: "enqueue", content: "QUEUE-SENTINEL queued prompt copy", sessionId: SESSION, timestamp: "t" },
+      { type: "attachment", ...common(), attachment: { type: "synthetic" } },
+      meta("META-SENTINEL <system-reminder> injected context"),
+      user(PROMPT_ONE),
+      blob("user", PROMPT_ONE + " BLOB-SENTINEL"),
+      assistant(thinking),
+      assistant(text(FIRST_TEXT)),
+      assistant(toolUse),
+      toolResultEntry(),
+      blob("assistant", [text("BLOB-SENTINEL request copy of an assistant message")]),
+      assistant(text(SECOND_TEXT)),
+      { type: "system", ...common(), subtype: "stop_hook_summary", isMeta: false, content: "SYSTEM-ENTRY-SENTINEL" },
+      localCommand("<command-name>/synthetic</command-name>"),
+      localCommand("<local-command-stdout>LOCAL-SENTINEL</local-command-stdout>"),
+      { type: "user", ...common(), message: { role: "user", content: [text(PROMPT_TWO)] } }, // a prompt sent as text blocks
+      assistant(thinking),
+      assistant(text(THIRD_TEXT)),
+      { type: "last-prompt", lastPrompt: "LAST-PROMPT-SENTINEL", sessionId: SESSION },
+      { type: "ai-title", aiTitle: "TITLE-SENTINEL", sessionId: SESSION },
+    ]);
+    const turns = await extractClaudeCodeTurns(raw);
+    expect(turns.map((t) => [t.userMessage, t.assistantResponse])).toEqual([
+      [PROMPT_ONE, `${FIRST_TEXT}\n${SECOND_TEXT}`],
+      [PROMPT_TWO, THIRD_TEXT],
+    ]);
+    const joined = JSON.stringify(turns);
+    for (const sentinel of ["QUEUE", "META", "BLOB", "SYSTEM-ENTRY", "LOCAL", "LAST-PROMPT", "TITLE", "TOOL-RESULT", "synthetic reasoning"]) {
+      expect(joined).not.toContain(sentinel);
+    }
+    expect((await extractAllTurnPairs(raw)).map((p) => p.user)).toEqual([PROMPT_ONE, PROMPT_TWO]);
+    expect(await extractRecentUserPrompts(raw)).toEqual([PROMPT_ONE, PROMPT_TWO]);
+  });
+
   it("extractAllTurnPairs (the SessionEnd note's input) reads the real shape from the start", async () => {
     const { raw } = await transcript(realSession());
     const pairs = await extractAllTurnPairs(raw);

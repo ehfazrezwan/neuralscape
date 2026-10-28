@@ -113,11 +113,12 @@ async function runHook(stdin: string, env: Record<string, string> = {}): Promise
   });
 }
 
+// The real Claude Code shape: text under message.content (a string for the user, text blocks for the assistant).
 const MESSAGES = [
-  { type: "user", content: "first user prompt with plenty of substance here" },
-  { type: "assistant", content: "first assistant answer with plenty of substance here" },
-  { type: "user", content: "second user prompt about the compact loop work" },
-  { type: "assistant", content: "second assistant answer with plenty of substance here" },
+  { type: "user", message: { role: "user", content: "first user prompt with plenty of substance here" } },
+  { type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "first assistant answer with plenty of substance here" }] } },
+  { type: "user", message: { role: "user", content: "second user prompt about the compact loop work" } },
+  { type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "second assistant answer with plenty of substance here" }] } },
 ];
 
 async function makeTranscript(): Promise<{ path: string; dir: string }> {

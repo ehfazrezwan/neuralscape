@@ -6,7 +6,7 @@ import { mkdtemp, readdir, readFile, utimes, writeFile } from "node:fs/promises"
 import { dirname } from "node:path";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it } from "vitest";
 import { recoverAbandoned, withTranscriptLock } from "../src/core/transcript-lock.js";
 import { flushTurns } from "../src/core/flush.js";
 
@@ -17,6 +17,24 @@ const gone = (path: string) => expect(readFile(lockFile(path), "utf-8")).rejects
 const DEAD_PID = 2 ** 22 + 4242; // above the kernel's pid limit: no such process
 const record = (over: Record<string, unknown> = {}) => JSON.stringify({ pid: process.pid, token: "other", at: Date.now(), ...over });
 const leftovers = async (path: string) => (await readdir(dirname(path))).filter((n) => /\.(tmp|stale\.|recover)/.test(n));
+
+/**
+ * A live process that may be a lock's owner: it started before the records written for it (``at: Date.now() - 1100``
+ * with a 1000 ms stale bound).  A process that started AFTER a record was written cannot be its owner (a reused pid),
+ * and without ``/proc`` (macOS) that is how the lock tells the two apart, so "a live owner" must be an older process.
+ */
+let ownerProcess: ReturnType<typeof spawn> | undefined;
+let ownerSpawned = 0;
+async function olderLiveProcess(): Promise<number> {
+  if (!ownerProcess) {
+    ownerProcess = spawn("sleep", ["120"]);
+    ownerSpawned = Date.now();
+  }
+  const ready = ownerSpawned + 3500; // older than the whole seconds of ``ps`` elapsed time plus its margin
+  if (Date.now() < ready) await sleep(ready - Date.now());
+  return ownerProcess.pid!;
+}
+afterAll(() => { ownerProcess?.kill(); });
 
 describe("withTranscriptLock", () => {
   it("never runs two bodies for the same transcript at once, and runs them all", async () => {
@@ -90,16 +108,17 @@ describe("abandoned locks", () => {
     expect(await readFile(lockFile(path), "utf-8")).toBe(text);
   });
 
-  it("never recovers a live owner's lock, however old, and leaves it untouched", async () => {
+  it("never recovers a live owner's lock once it is older than the bound, and leaves it untouched", async () => {
     const path = await fresh();
-    const text = record({ token: "live", at: Date.now() - 3_600_000 });
+    // the owner started before its record (a recorded /proc start time, tested below, confirms it however old the record is)
+    const text = record({ pid: await olderLiveProcess(), token: "live", at: Date.now() - 1100 });
     await writeFile(lockFile(path), text);
     let ran = false;
     const result = await withTranscriptLock(path, async () => { ran = true; }, { waitMs: 300, staleMs: 1000 });
     expect(result.ran).toBe(false);
     expect(ran).toBe(false);
     expect(await readFile(lockFile(path), "utf-8")).toBe(text);
-  });
+  }, 10000);
 
   it("recovers a lock file that is not a record once it is older than the bound", async () => {
     const path = await fresh();
@@ -309,9 +328,10 @@ describe("where /proc cannot confirm a live pid: no age fallback", () => {
     return seen;
   };
 
-  it("a record without a start time whose pid is alive is never reclaimed, however old; the skip says why", async () => {
+  it("a record without a start time whose pid is alive and may be its owner is never reclaimed; the skip says why", async () => {
     const path = await fresh();
-    const text = record({ token: "no-start", at: Date.now() - 30 * 86_400_000 });
+    // its process started before the record was written, so it may be the owner
+    const text = record({ pid: await olderLiveProcess(), token: "no-start", at: Date.now() - 1100 });
     await writeFile(lockFile(path), text);
     let result: { ran: boolean } | undefined;
     const log = await captureStderr(async () => { result = await withTranscriptLock(path, async () => 1, { staleMs: 1000, waitMs: 300 }); });
@@ -319,6 +339,34 @@ describe("where /proc cannot confirm a live pid: no age fallback", () => {
     expect(await readFile(lockFile(path), "utf-8")).toBe(text);
     expect(log).toContain("may still be running");
     expect(log).toContain("not reclaimed");
+  }, 10000);
+
+  it("a record without a start time whose pid now belongs to a process started after it was written is recovered (macOS pid reuse)", async () => {
+    const path = await fresh();
+    const unrelated = spawn("sleep", ["30"]);
+    try {
+      await writeFile(lockFile(path), record({ pid: unrelated.pid, token: "reused-no-proc", at: Date.now() - 7 * 86_400_000 }));
+      expect((await withTranscriptLock(path, async () => 1, { staleMs: 1000, waitMs: 3000 })).ran).toBe(true);
+      await gone(path);
+    } finally {
+      unrelated.kill();
+    }
+  });
+
+  it("a recovery mutex without a start time whose recorder's pid was reused is cleared", async () => {
+    const path = await fresh();
+    const lock = lockFile(path);
+    const judged = { pid: DEAD_PID, token: "dead", at: 1 };
+    await writeFile(lock, record(judged));
+    const unrelated = spawn("sleep", ["30"]);
+    try {
+      await writeFile(lock + ".recover", record({ pid: unrelated.pid, token: "reused-recoverer", at: Date.now() - 60_000 }));
+      expect(await recoverAbandoned(lock, judged, { mutexStaleMs: 50 })).toBe("retry"); // clears the reused-pid mutex
+      expect(await recoverAbandoned(lock, judged, { mutexStaleMs: 50 })).toBe("removed");
+      expect(await leftovers(path)).toEqual([]);
+    } finally {
+      unrelated.kill();
+    }
   });
 });
 

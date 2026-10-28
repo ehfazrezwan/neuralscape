@@ -16,9 +16,11 @@
  *   (``/proc/sys/kernel/random/boot_id``), or when the pid's process start time (``/proc/<pid>/stat``) differs
  *   from the one recorded (the pid was reused).  A live owner is never recovered, however old, and there is no
  *   age fallback: a suspended or slow owner can resume and post while a successor posts, so a lock whose owner
- *   might be alive is never reclaimed.  Where ``/proc`` cannot confirm who a live pid is (macOS, or a record
- *   without a start time) the waiter waits its bound and skips its flush with a log line that says so; the turns
- *   wait for the next flush (a lock whose pid is truly gone is still recovered, since ``kill(pid, 0)`` says so).
+ *   might be alive is never reclaimed.  Where ``/proc`` cannot compare start times (macOS, or a record without a
+ *   start time) a live pid whose process ``ps`` shows started after the record was written is not the owner
+ *   (the pid was reused, or the record predates a reboot), so a stale lock cannot wedge capture behind an
+ *   unrelated process; a live pid that may be the owner is waited for, then the waiter skips its flush with a
+ *   log line that says so and the turns wait for the next flush.
  * - **Recovery:** recoverers are serialized by a short-lived recovery mutex that follows the same rule: its
  *   record carries the same identity, and it is cleared only when its recorder is dead and it is old, by moving
  *   it aside and checking the token, never by deleting it by age.  Under the mutex the lock is re-read and, only
@@ -37,6 +39,7 @@
  * run in different containers but share a transcript file cannot see each other's pids.
  */
 
+import { execFile } from "node:child_process";
 import { link, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { randomBytes } from "node:crypto";
 import { logError } from "../utils.js";
@@ -100,6 +103,24 @@ async function startTimeOf(pid: number): Promise<string | null> {
   }
 }
 
+const PS_MARGIN_MS = 2_000;
+
+/**
+ * Whether a live ``pid`` provably started after ``at`` (so it cannot have written a record at ``at``), from the
+ * elapsed time ``ps -o etime=`` reports ("[[dd-]hh:]mm:ss", the same on macOS and Linux).  This is how a reused
+ * pid, or a record from before a reboot, is told apart where there is no ``/proc`` (macOS).  Null when ``ps``
+ * cannot say; the elapsed time is whole seconds, so the comparison allows a margin before calling the pid reused.
+ */
+async function startedAfter(pid: number, at: number): Promise<boolean | null> {
+  const text = await new Promise<string | null>((resolve) =>
+    execFile("ps", ["-o", "etime=", "-p", String(pid)], { timeout: 2000 }, (error, stdout) => resolve(error ? null : stdout))
+  );
+  const m = text?.trim().match(/^(?:(\d+)-)?(?:(\d+):)?(\d+):(\d+)$/);
+  if (!m) return null;
+  const elapsed = ((Number(m[1] ?? 0) * 24 + Number(m[2] ?? 0)) * 60 + Number(m[3])) * 60 + Number(m[4]);
+  return Date.now() - (elapsed + 1) * 1000 - PS_MARGIN_MS > at;
+}
+
 /** This process's identity as recorded in the records it writes. */
 async function identity(): Promise<Pick<LockOwner, "boot" | "start">> {
   const [boot, start] = await Promise.all([bootId(), startTimeOf(process.pid)]);
@@ -109,8 +130,9 @@ async function identity(): Promise<Pick<LockOwner, "boot" | "start">> {
 /**
  * Whether the process that wrote ``record`` is gone and the record is older than ``staleMs``.  Another boot, a
  * dead pid, or a pid whose start time differs from the recorded one (reuse) is dead; a pid that is alive and
- * confirmed by its start time never is.  Where the identity cannot be confirmed (no recorded start time, or no
- * ``/proc``), a live pid is believed alive, however old the record: there is no age fallback.
+ * confirmed by its start time never is.  Where ``/proc`` cannot compare start times (macOS, or no recorded start
+ * time), a live pid that ``ps`` shows started after the record was written is dead (reused); any other live pid
+ * is believed alive, however old the record: there is no age fallback.
  */
 async function ownerGone(record: LockOwner, staleMs: number): Promise<boolean> {
   const age = Date.now() - record.at;
@@ -120,10 +142,12 @@ async function ownerGone(record: LockOwner, staleMs: number): Promise<boolean> {
   if (!alive(record.pid)) return true;
   const start = await startTimeOf(record.pid);
   if (record.start && start) return record.start !== start; // the pid belongs to another process now
-  return false; // alive, and /proc cannot tell whose: believed alive
+  // no /proc to compare (macOS, or a record without a start time): a pid that started after the record was
+  // written is not its owner (reused, or the record predates a reboot).  Otherwise it is believed alive.
+  return (await startedAfter(record.pid, record.at)) === true;
 }
 
-/** Whether a live pid holds ``record`` without anything to confirm it is the owner (no start time to compare). */
+/** Whether a live pid holds ``record`` without ``/proc`` to confirm it is the owner (no start time to compare). */
 async function unconfirmedLive(record: LockOwner): Promise<boolean> {
   return alive(record.pid) && !(record.start && (await startTimeOf(record.pid)));
 }
