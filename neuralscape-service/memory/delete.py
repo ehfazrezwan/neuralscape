@@ -15,6 +15,77 @@ from memory.ranking import _times_derived_from_metadata
 
 logger = logging.getLogger(__name__)
 
+
+def _dedup_meta(payload: dict) -> tuple[dict, bool]:
+    """Unwrapped metadata of a raw Qdrant payload + whether it was double-wrapped."""
+    meta = payload.get("metadata", {}) or {}
+    if isinstance(meta.get("metadata"), dict):
+        return meta["metadata"], True
+    return meta, False
+
+
+def _dedup_partition(payload: dict) -> tuple:
+    """Partition identity a semantic near-duplicate must share to be merged.
+
+    (user_id, scope, project_id, visibility, workspace). Mirrors the write
+    path's partitioning (``memory/write.py`` content-hash identity and
+    ``memory/groups.py::_build_group_id``): the same text in two projects,
+    at two visibility tiers, or in a reference workspace vs the memory
+    workspace is two distinct memories. Missing/"memory" workspace is the
+    default memory workspace; an empty project_id is no project. Visibility
+    and scope compare raw (an absent value is its own partition), matching
+    the exact phase's ``(hash, visibility)`` key — stricter means fewer
+    merges, never a cross-partition delete.
+    """
+    meta, _ = _dedup_meta(payload)
+    workspace = meta.get("workspace")
+    if not workspace or workspace == "memory":
+        workspace = None
+    return (
+        payload.get("user_id"),
+        meta.get("scope"),
+        meta.get("project_id") or None,
+        meta.get("visibility"),
+        workspace,
+    )
+
+
+def _dedup_partition_filters(user_id: str, payload: dict) -> dict:
+    """Qdrant filter (fork dict syntax) restricting a search to ``payload``'s partition.
+
+    The fork's ``Qdrant._create_filter`` only expresses equality on present
+    values — it has no is-empty/is-null operator — so a partition field that
+    is absent on the source row (no project, no visibility stamp, default
+    workspace) cannot be pushed down; those are enforced by the strict
+    ``_dedup_partition`` equality check on every hit.
+    """
+    meta, wrapped = _dedup_meta(payload)
+    prefix = "metadata.metadata." if wrapped else "metadata."
+    filters: dict = {"user_id": user_id}
+    for field in ("scope", "project_id", "visibility", "workspace"):
+        value = meta.get(field)
+        if field == "workspace" and value == "memory":
+            continue  # default workspace: absent OR "memory" — post-filtered
+        if isinstance(value, str) and value and value != "*":
+            filters[prefix + field] = value
+    return filters
+
+
+def _dense_vector(vector) -> list[float] | None:
+    """The unnamed dense vector of a retrieved point (``None`` if unusable).
+
+    Collections with the ``bm25`` sparse slot return ``{"": dense, "bm25": sparse}``;
+    pre-v3 collections return the dense list directly.
+    """
+    if isinstance(vector, dict):
+        vector = vector.get("")
+    if isinstance(vector, (list, tuple)) and vector and all(
+        isinstance(x, (int, float)) for x in vector
+    ):
+        return list(vector)
+    return None
+
+
 class DeleteMixin:
     """DeleteMixin for MemoryService (mechanical split — see memory_service.py)."""
 
@@ -492,6 +563,30 @@ class DeleteMixin:
 
         return all_points
 
+    def _fetch_dense_vectors(self, ids: list[str]) -> dict[str, list[float]]:
+        """Stored dense vectors for ``ids`` (one Qdrant retrieve; ``{}`` on failure).
+
+        Callers fall back to the embedder for any id missing from the result.
+        """
+        if not ids:
+            return {}
+        try:
+            points = self._memory.vector_store.client.retrieve(
+                collection_name=settings.qdrant_collection,
+                ids=ids,
+                with_payload=False,
+                with_vectors=True,
+            )
+        except Exception as e:
+            logger.warning(f"Dedup vector fetch failed for {len(ids)} ids (embedding fallback): {e}")
+            return {}
+        out: dict[str, list[float]] = {}
+        for pt in points or []:
+            vec = _dense_vector(getattr(pt, "vector", None))
+            if vec is not None:
+                out[str(pt.id)] = vec
+        return out
+
     def _delete_qdrant_memory_with_graph_cleanup(self, memory_id: str, payload: dict) -> None:
         """Delete a single memory from Qdrant and expire related graph edges.
 
@@ -593,73 +688,17 @@ class DeleteMixin:
             }
         remaining = [mem for mem in memories if mem["id"] not in deleted_ids]
 
-        for mem in remaining:
-            mid = mem["id"]
-            if mid in deleted_ids:
-                continue
-
-            text = mem["payload"].get("data", "")
-            if not text:
-                continue
-
-            try:
-                embedding = m.embedding_model.embed(text)
-                # mem0 v2.0.2 renamed the search kwarg ``limit`` → ``top_k``
-                # on its Qdrant wrapper (``mem0/mem0/vector_stores/qdrant.py``).
-                # Calling with ``limit`` raises ``Qdrant.search() got an
-                # unexpected keyword argument 'limit'`` and dedup silently
-                # fails for every memory in the user's pool.
-                hits = m.vector_store.search(
-                    query=text,
-                    vectors=embedding,
-                    top_k=5,
-                    filters={"user_id": user_id},
+        # Chunked so stored vectors are held for at most ``batch_size`` rows
+        # at a time (a full user pool of 768-d vectors would not fit).
+        for start in range(0, len(remaining), batch_size):
+            chunk = remaining[start:start + batch_size]
+            stored_vectors = self._fetch_dense_vectors(
+                [mem["id"] for mem in chunk if mem["id"] not in deleted_ids]
+            )
+            for mem in chunk:
+                semantic_removed += self._semantic_dedup_one(
+                    m, user_id, mem, stored_vectors.get(mem["id"]), threshold, deleted_ids,
                 )
-            except Exception as e:
-                logger.warning(f"Semantic search failed for {mid}: {e}")
-                continue
-
-            for hit in hits:
-                hit_id = str(hit["id"]) if isinstance(hit, dict) else str(hit.id)
-                hit_score = hit["score"] if isinstance(hit, dict) else hit.score
-                hit_payload = hit.get("payload", {}) if isinstance(hit, dict) else (hit.payload or {})
-
-                if hit_id == mid or hit_id in deleted_ids:
-                    continue
-                if hit_score < threshold:
-                    continue
-                # Never dedup across visibility tiers — a standard must not be
-                # merged into a shared/private near-duplicate (or vice-versa).
-                if _pvis(hit_payload) != _pvis(mem["payload"]):
-                    continue
-
-                # Delete the older one
-                mem_created = mem["payload"].get("created_at", "")
-                hit_created = hit_payload.get("created_at", "")
-                older_id, older_payload, newer_id = (
-                    (hit_id, hit_payload, mid)
-                    if hit_created <= mem_created
-                    else (mid, mem["payload"], hit_id)
-                )
-
-                if older_id in deleted_ids:
-                    continue
-                try:
-                    self._delete_qdrant_memory_with_graph_cleanup(older_id, older_payload)
-                    deleted_ids.add(older_id)
-                    semantic_removed += 1
-                    # Same reinforcement transfer as the exact phase: the
-                    # near-duplicate we just dropped was a repeated
-                    # observation — its counter moves to the survivor.
-                    self._bump_times_derived(
-                        newer_id, _times_derived_from_metadata(older_payload.get("metadata"))
-                    )
-                except Exception as e:
-                    logger.warning(f"Failed to delete semantic dup {older_id}: {e}")
-
-                # If we deleted ourselves, stop checking this memory
-                if older_id == mid:
-                    break
 
         return {
             "user_id": user_id,
@@ -667,3 +706,96 @@ class DeleteMixin:
             "semantic_duplicates_removed": semantic_removed,
             "total_checked": len(memories),
         }
+
+    def _semantic_dedup_one(
+        self,
+        m,
+        user_id: str,
+        mem: dict,
+        vector: list[float] | None,
+        threshold: float,
+        deleted_ids: set[str],
+    ) -> int:
+        """Phase 2 for one memory: merge near-duplicates in its own partition.
+
+        Searches with the row's STORED dense vector (the embedder is only
+        called when the row has none) and restricts candidates to the same
+        (user, scope, project_id, visibility, workspace) partition — pushed
+        down as a Qdrant filter where the fork's filter syntax can express
+        it, and enforced strictly on every hit. Returns the number deleted.
+        """
+        removed = 0
+        mid = mem["id"]
+        if mid in deleted_ids:
+            return 0
+
+        text = mem["payload"].get("data", "")
+        if not text:
+            return 0
+        partition = _dedup_partition(mem["payload"])
+
+        try:
+            if vector is None:
+                # Same task type the write path stores vectors with, so the
+                # query lives in the same space as the rows it is compared to.
+                vector = m.embedding_model.embed(text, memory_action="add")
+            # mem0 v2.0.2 renamed the search kwarg ``limit`` → ``top_k``
+            # on its Qdrant wrapper (``mem0/mem0/vector_stores/qdrant.py``).
+            # Calling with ``limit`` raises ``Qdrant.search() got an
+            # unexpected keyword argument 'limit'`` and dedup silently
+            # fails for every memory in the user's pool.
+            hits = m.vector_store.search(
+                query=text,
+                vectors=vector,
+                top_k=5,
+                filters=_dedup_partition_filters(user_id, mem["payload"]),
+            )
+        except Exception as e:
+            logger.warning(f"Semantic search failed for {mid}: {e}")
+            return 0
+
+        for hit in hits:
+            hit_id = str(hit["id"]) if isinstance(hit, dict) else str(hit.id)
+            hit_score = hit["score"] if isinstance(hit, dict) else hit.score
+            hit_payload = hit.get("payload", {}) if isinstance(hit, dict) else (hit.payload or {})
+
+            if hit_id == mid or hit_id in deleted_ids:
+                continue
+            if hit_score < threshold:
+                continue
+            # Never dedup across partitions — the same text in another
+            # project, scope, visibility tier (a standard is binding, a
+            # shared note is not) or workspace (a reference passage vs a
+            # memory) is a distinct memory, not a duplicate.
+            if _dedup_partition(hit_payload) != partition:
+                continue
+
+            # Delete the older one
+            mem_created = mem["payload"].get("created_at", "")
+            hit_created = hit_payload.get("created_at", "")
+            older_id, older_payload, newer_id = (
+                (hit_id, hit_payload, mid)
+                if hit_created <= mem_created
+                else (mid, mem["payload"], hit_id)
+            )
+
+            if older_id in deleted_ids:
+                continue
+            try:
+                self._delete_qdrant_memory_with_graph_cleanup(older_id, older_payload)
+                deleted_ids.add(older_id)
+                removed += 1
+                # Same reinforcement transfer as the exact phase: the
+                # near-duplicate we just dropped was a repeated
+                # observation — its counter moves to the survivor.
+                self._bump_times_derived(
+                    newer_id, _times_derived_from_metadata(older_payload.get("metadata"))
+                )
+            except Exception as e:
+                logger.warning(f"Failed to delete semantic dup {older_id}: {e}")
+
+            # If we deleted ourselves, stop checking this memory
+            if older_id == mid:
+                break
+
+        return removed

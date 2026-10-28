@@ -603,3 +603,241 @@ class TestSearchReinforcementBoost:
         assert scores["b"] == pytest.approx(
             0.78 * (1 + REINFORCEMENT_BOOST_K * math.log1p(9))
         )
+
+
+# ──────────────────────────────────────────────
+# Semantic phase partitioning + stored vectors (P0)
+# ──────────────────────────────────────────────
+
+
+def _text_vec(text: str) -> list[float]:
+    """Deterministic 16-d vector per text: same text ⇒ identical vector,
+    different text ⇒ near-orthogonal (signed bytes of an md5)."""
+    import hashlib
+
+    digest = hashlib.md5(text.encode()).digest()
+    return [float(b) - 127.5 for b in digest]
+
+
+def _cosine(a: list[float], b: list[float]) -> float:
+    dot = sum(x * y for x, y in zip(a, b))
+    return dot / (math.sqrt(sum(x * x for x in a)) * math.sqrt(sum(y * y for y in b)))
+
+
+def _dig(payload: dict, dotted: str):
+    cur = payload
+    for part in dotted.split("."):
+        if not isinstance(cur, dict):
+            return None
+        cur = cur.get(part)
+    return cur
+
+
+class _FakeQdrant:
+    """Stand-in for the fork's Qdrant wrapper + raw client over a tiny store.
+
+    ``search`` honours the fork's dict filter (equality / list-membership on
+    dotted payload paths) and ranks by real cosine over the STORED vectors,
+    so a test exercises the same filter the production call sends. Points
+    carry the unnamed dense vector the way a bm25-enabled collection
+    returns it: ``{"": dense, "bm25": ...}``.
+    """
+
+    def __init__(self, service, rows: list[tuple[str, dict, list[float] | None]]):
+        self.payloads = {pid: payload for pid, payload, _ in rows}
+        self.vectors = {pid: vec for pid, _, vec in rows if vec is not None}
+        self.search_calls: list[dict] = []
+        vs = service._memory.vector_store
+        vs.client.scroll.return_value = (
+            [_make_point(pid, payload) for pid, payload, _ in rows],
+            None,
+        )
+        vs.client.retrieve.side_effect = self.retrieve
+        vs.search.side_effect = self.search
+        vs.search.return_value = None
+        vs.delete.side_effect = self.delete
+        service._memory.embedding_model.embed.side_effect = (
+            lambda text, **kw: _text_vec(text)
+        )
+
+    def retrieve(self, collection_name=None, ids=None, with_vectors=False, **kwargs):
+        out = []
+        for pid in ids or []:
+            if pid not in self.payloads:
+                continue
+            pt = _make_point(pid, self.payloads[pid])
+            pt.vector = (
+                {"": self.vectors[pid], "bm25": MagicMock(name="sparse")}
+                if with_vectors and pid in self.vectors
+                else None
+            )
+            out.append(pt)
+        return out
+
+    def _matches(self, payload: dict, filters: dict) -> bool:
+        for key, value in (filters or {}).items():
+            assert not isinstance(value, dict), f"fake filter does not model {key}={value!r}"
+            actual = _dig(payload, key)
+            if isinstance(value, list):
+                if actual not in value:
+                    return False
+            elif actual != value:
+                return False
+        return True
+
+    def search(self, query=None, vectors=None, top_k=5, filters=None):
+        self.search_calls.append({"query": query, "vectors": vectors, "filters": filters})
+        hits = []
+        for pid, payload in self.payloads.items():
+            if pid not in self.vectors or not self._matches(payload, filters):
+                continue
+            hits.append(_make_hit(pid, _cosine(vectors, self.vectors[pid]), payload))
+        hits.sort(key=lambda h: h.score, reverse=True)
+        return hits[:top_k]
+
+    def delete(self, vector_id):
+        self.payloads.pop(vector_id, None)
+        self.vectors.pop(vector_id, None)
+
+
+def _row(pid, text, created_at, *, user="u1", **meta):
+    payload = {
+        "user_id": user,
+        "hash": f"h-{pid}",  # distinct hashes: exercise phase 2, not phase 1
+        "data": text,
+        "created_at": created_at,
+        "metadata": meta,
+    }
+    return (pid, payload, _text_vec(text))
+
+
+def _deleted(service) -> list[str]:
+    return [c.args[0] for c in service._memory.vector_store.delete.call_args_list]
+
+
+class TestSemanticDedupPartitions:
+    TEXT = "Deploys go through the staging gate before prod"
+
+    def test_same_text_in_two_projects_both_kept(self, service):
+        fake = _FakeQdrant(service, [
+            _row("p1", self.TEXT, "2025-01-01T00:00:00",
+                 scope="project", project_id="alpha", visibility="private"),
+            _row("p2", self.TEXT, "2025-06-01T00:00:00",
+                 scope="project", project_id="beta", visibility="private"),
+        ])
+
+        result = service.dedup_memories("u1")
+
+        assert result["semantic_duplicates_removed"] == 0
+        assert _deleted(service) == []
+        # The project partition is pushed down to Qdrant, not just post-filtered.
+        assert {c["filters"].get("metadata.project_id") for c in fake.search_calls} == {
+            "alpha", "beta",
+        }
+
+    def test_global_row_not_merged_into_project_row(self, service):
+        """A no-project (global) memory and a project memory of the same text
+        are distinct; the absent project_id can't be pushed down (no is-empty
+        operator in the fork's filter syntax) so the hit-side check holds it."""
+        _FakeQdrant(service, [
+            _row("p1", self.TEXT, "2025-01-01T00:00:00", scope="global", visibility="private"),
+            _row("p2", self.TEXT, "2025-06-01T00:00:00",
+                 scope="global", project_id="alpha", visibility="private"),
+        ])
+
+        result = service.dedup_memories("u1")
+
+        assert result["semantic_duplicates_removed"] == 0
+        assert _deleted(service) == []
+
+    def test_private_and_shared_copies_both_kept(self, service):
+        fake = _FakeQdrant(service, [
+            _row("p1", self.TEXT, "2025-01-01T00:00:00", scope="global", visibility="private"),
+            _row("p2", self.TEXT, "2025-06-01T00:00:00", scope="global", visibility="shared"),
+        ])
+
+        result = service.dedup_memories("u1")
+
+        assert result["semantic_duplicates_removed"] == 0
+        assert _deleted(service) == []
+        assert {c["filters"].get("metadata.visibility") for c in fake.search_calls} == {
+            "private", "shared",
+        }
+
+    def test_different_workspaces_both_kept(self, service):
+        """A reference-corpus passage and a memory with the same text."""
+        _FakeQdrant(service, [
+            _row("p1", self.TEXT, "2025-01-01T00:00:00", scope="global", visibility="private"),
+            _row("p2", self.TEXT, "2025-06-01T00:00:00",
+                 scope="global", visibility="private", workspace="handbook"),
+        ])
+
+        result = service.dedup_memories("u1")
+
+        assert result["semantic_duplicates_removed"] == 0
+        assert _deleted(service) == []
+
+    def test_missing_workspace_is_memory_workspace(self, service):
+        """Absent workspace and explicit "memory" are the same partition."""
+        _FakeQdrant(service, [
+            _row("p1", self.TEXT, "2025-01-01T00:00:00", scope="global", visibility="private"),
+            _row("p2", self.TEXT, "2025-06-01T00:00:00",
+                 scope="global", visibility="private", workspace="memory"),
+        ])
+
+        result = service.dedup_memories("u1")
+
+        assert result["semantic_duplicates_removed"] == 1
+        assert _deleted(service) == ["p1"]
+
+    def test_same_partition_older_deleted_newest_kept_counter_moves(self, service):
+        """In-partition near-duplicates still collapse (keep newest, transfer
+        times_derived); the same text in a sibling project is untouched."""
+        _FakeQdrant(service, [
+            _row("p1", self.TEXT, "2025-01-01T00:00:00",
+                 scope="project", project_id="alpha", visibility="private", times_derived=3),
+            _row("p2", self.TEXT, "2025-06-01T00:00:00",
+                 scope="project", project_id="alpha", visibility="private"),
+            _row("p3", self.TEXT, "2025-03-01T00:00:00",
+                 scope="project", project_id="beta", visibility="private"),
+        ])
+
+        result = service.dedup_memories("u1")
+
+        assert result["semantic_duplicates_removed"] == 1
+        assert _deleted(service) == ["p1"]
+        kwargs = service._memory.vector_store.client.set_payload.call_args.kwargs
+        assert kwargs["points"] == ["p2"]
+        assert kwargs["key"] == "metadata"
+        assert kwargs["payload"] == {"times_derived": 4}  # 1 + 3
+
+    def test_uses_stored_vectors_not_embedder(self, service):
+        """Phase 2 searches with each row's stored dense vector; re-embedding
+        every memory text on every pass is the bug."""
+        fake = _FakeQdrant(service, [
+            _row("p1", self.TEXT, "2025-01-01T00:00:00", scope="global", visibility="private"),
+            _row("p2", "Unrelated: the cafe opens at nine", "2025-06-01T00:00:00",
+                 scope="global", visibility="private"),
+        ])
+
+        service.dedup_memories("u1")
+
+        service._memory.embedding_model.embed.assert_not_called()
+        assert [c["vectors"] for c in fake.search_calls] == [
+            fake.vectors["p1"], fake.vectors["p2"],
+        ]
+
+    def test_embedder_fallback_only_for_rows_without_vector(self, service):
+        fake = _FakeQdrant(service, [
+            _row("p1", self.TEXT, "2025-01-01T00:00:00", scope="global", visibility="private"),
+            ("p2", {"user_id": "u1", "hash": "h-p2", "data": "No stored vector",
+                    "created_at": "2025-06-01T00:00:00",
+                    "metadata": {"scope": "global", "visibility": "private"}}, None),
+        ])
+
+        service.dedup_memories("u1")
+
+        service._memory.embedding_model.embed.assert_called_once_with(
+            "No stored vector", memory_action="add"
+        )
+        assert len(fake.search_calls) == 2
