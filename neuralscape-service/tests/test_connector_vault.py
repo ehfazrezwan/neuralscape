@@ -1,30 +1,17 @@
 """Tests for connectors.vault — encryption at rest + redaction + sync state."""
 
-import fnmatch
+import asyncio
 
 import pytest
 from cryptography.fernet import Fernet
 
 from connectors.vault import ConnectorVault, VaultError
+from tests.fake_vault_store import FakeVaultStore
 
 
-class FakeStore:
-    """In-memory async KV mimicking the redis methods the vault uses."""
-
-    def __init__(self):
-        self.d: dict[str, str] = {}
-
-    async def set(self, k, v):
-        self.d[k] = v
-
-    async def get(self, k):
-        return self.d.get(k)
-
-    async def delete(self, k):
-        return 1 if self.d.pop(k, None) is not None else 0
-
-    async def keys(self, pattern):
-        return [k for k in self.d if fnmatch.fnmatch(k, pattern)]
+# In-memory async KV with the redis commands the vault uses (incl. its
+# compare-and-set scripts).
+FakeStore = FakeVaultStore
 
 
 def _vault():
@@ -110,6 +97,176 @@ class TestSyncState:
         rec = await v.get("notion-personal")
         assert rec["cursor"] == "c5"
         assert rec["credentials"]["token"] == "rotated"
+
+
+KEY = "ns:connector:notion-personal"
+
+
+async def _interleave(store, call, between):
+    """Run ``call``; once it has read the record, run ``between``, then let it finish."""
+    store.pause_after_get(KEY)
+    pending = asyncio.create_task(call)
+    await store.paused.wait()
+    await between()
+    store.resume.set()
+    return await pending
+
+
+class TestSyncStateWriteIsAtomic:
+    """A sync-state write never reverts a write that landed after its read."""
+
+    @pytest.mark.asyncio
+    async def test_delete_and_recreate_by_another_owner_is_not_reverted(self):
+        store = FakeStore()
+        v = ConnectorVault(store, Fernet(Fernet.generate_key()))
+        first = await v.put(_record(owner_user_id="alice", credentials={"token": "alice-token"}))
+        replacement = {}
+
+        async def replace():
+            await v.delete("notion-personal")
+            replacement.update(await v.put(_record(owner_user_id="bob", credentials={"token": "bob-token"})))
+
+        await _interleave(
+            store,
+            v.update_sync_state(
+                "notion-personal", cursor="alice-cursor", revisions={"alice-doc": "r1"},
+                generation=first["generation"],
+            ),
+            replace,
+        )
+        rec = await v.get("notion-personal")
+        assert rec["owner_user_id"] == "bob"
+        assert rec["generation"] == replacement["generation"] != first["generation"]
+        assert rec["credentials"] == {"token": "bob-token"}
+        assert rec["cursor"] is None
+        assert rec["last_revision_by_id"] == {}
+
+    @pytest.mark.asyncio
+    async def test_delete_during_write_is_not_resurrected(self):
+        store = FakeStore()
+        v = ConnectorVault(store, Fernet(Fernet.generate_key()))
+        first = await v.put(_record(owner_user_id="alice"))
+
+        async def remove():
+            await v.delete("notion-personal")
+
+        await _interleave(
+            store,
+            v.update_sync_state("notion-personal", cursor="c1", generation=first["generation"]),
+            remove,
+        )
+        assert await v.get("notion-personal") is None
+
+    @pytest.mark.asyncio
+    async def test_same_owner_credential_and_config_change_is_kept(self):
+        store = FakeStore()
+        v = ConnectorVault(store, Fernet(Fernet.generate_key()))
+        first = await v.put(_record(owner_user_id="alice", name="n1", credentials={"token": "old"}))
+
+        async def rotate():
+            await v.put(_record(owner_user_id="alice", name="n2", credentials={"token": "rotated"}))
+
+        await _interleave(
+            store,
+            v.update_sync_state("notion-personal", cursor="c1", generation=first["generation"]),
+            rotate,
+        )
+        rec = await v.get("notion-personal")
+        assert rec["credentials"] == {"token": "rotated"}
+        assert rec["name"] == "n2"
+        # Same instance, so the sync's progress is still recorded on it.
+        assert rec["generation"] == first["generation"]
+        assert rec["cursor"] == "c1"
+
+    @pytest.mark.asyncio
+    async def test_only_sync_fields_change(self):
+        store = FakeStore()
+        v = ConnectorVault(store, Fernet(Fernet.generate_key()))
+        first = await v.put(_record(owner_user_id="alice"))
+        before = await v.get("notion-personal")
+        await v.update_sync_state(
+            "notion-personal", cursor="c2", last_synced_at="2026-10-19T00:00:00Z",
+            revisions={"p": "r"}, generation=first["generation"],
+        )
+        after = await v.get("notion-personal")
+        changed = {k for k in after if after[k] != before.get(k)}
+        assert changed == {"cursor", "last_synced_at", "last_revision_by_id"}
+
+    @pytest.mark.asyncio
+    async def test_legacy_record_without_generation_is_still_written(self):
+        import json
+
+        store = FakeStore()
+        v = ConnectorVault(store, Fernet(Fernet.generate_key()))
+        await v.put(_record(owner_user_id="alice"))
+        legacy = json.loads(store.d[KEY])
+        legacy.pop("generation")
+        store.d[KEY] = json.dumps(legacy)
+        await v.update_sync_state("notion-personal", cursor="c1", generation=None)
+        assert (await v.get("notion-personal"))["cursor"] == "c1"
+
+
+class TestOwnerChange:
+    @pytest.mark.asyncio
+    async def test_owner_change_starts_with_empty_sync_state(self):
+        v = _vault()
+        first = await v.put(_record(owner_user_id="alice"))
+        await v.update_sync_state(
+            "notion-personal", cursor="alice-cursor", last_synced_at="2026-10-01T00:00:00Z",
+            revisions={"alice-doc": "r1"}, generation=first["generation"],
+        )
+        shown = await v.put(_record(owner_user_id="bob"))
+        rec = await v.get("notion-personal")
+        for view in (shown, rec):
+            assert view["cursor"] is None
+            assert view["last_synced_at"] is None
+            assert view["last_revision_by_id"] == {}
+        assert rec["generation"] != first["generation"]
+
+    @pytest.mark.asyncio
+    async def test_owner_change_can_be_refused_atomically(self):
+        from connectors.vault import ConnectorOwnedElsewhere
+
+        store = FakeStore()
+        v = ConnectorVault(store, Fernet(Fernet.generate_key()))
+        await v.put(_record(owner_user_id="alice"))
+        before = store.d[KEY]
+        with pytest.raises(ConnectorOwnedElsewhere):
+            await v.put(_record(owner_user_id="bob", credentials={"token": "bob"}), allow_owner_change=False)
+        assert store.d[KEY] == before
+
+    @pytest.mark.asyncio
+    async def test_refusal_sees_an_owner_that_registered_after_the_read(self):
+        """bob's registration read 'absent'; alice created it meanwhile; bob must not overwrite."""
+        from connectors.vault import ConnectorOwnedElsewhere
+
+        store = FakeStore()
+        v = ConnectorVault(store, Fernet(Fernet.generate_key()))
+
+        async def alice_registers():
+            await v.put(_record(owner_user_id="alice", credentials={"token": "alice"}))
+
+        with pytest.raises(ConnectorOwnedElsewhere):
+            await _interleave(
+                store,
+                v.put(_record(owner_user_id="bob", credentials={"token": "bob"}), allow_owner_change=False),
+                alice_registers,
+            )
+        rec = await v.get("notion-personal")
+        assert rec["owner_user_id"] == "alice"
+        assert rec["credentials"] == {"token": "alice"}
+
+    @pytest.mark.asyncio
+    async def test_conditional_delete_spares_a_recreated_connector(self):
+        store = FakeStore()
+        v = ConnectorVault(store, Fernet(Fernet.generate_key()))
+        first = await v.put(_record(owner_user_id="alice"))
+        await v.delete("notion-personal")
+        second = await v.put(_record(owner_user_id="alice"))
+        assert await v.delete("notion-personal", generation=first["generation"]) is False
+        assert (await v.get("notion-personal"))["generation"] == second["generation"]
+        assert await v.delete("notion-personal", generation=second["generation"]) is True
+        assert await v.get("notion-personal") is None
 
 
 class TestVaultConstruction:
