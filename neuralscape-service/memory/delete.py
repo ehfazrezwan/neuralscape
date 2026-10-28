@@ -607,9 +607,15 @@ class DeleteMixin:
     def dedup_memories(self, user_id: str, *, semantic: bool = True) -> dict:
         """Remove duplicate memories for a user in two phases.
 
-        Phase 1 — Exact: group by payload hash, keep newest, delete rest.
+        Phase 1 — Exact: group by (payload hash, partition), keep newest,
+                  delete rest.
         Phase 2 — Semantic: for each remaining memory, search for near-duplicates
-                  above the cosine threshold, delete the older one.
+                  in the same partition above the cosine threshold, delete the
+                  older one.
+
+        Both phases share one partition rule (``_dedup_partition``): a row is
+        only ever deleted as a duplicate of a row with the same user, scope,
+        project_id, visibility and workspace.
 
         ``semantic=False`` skips phase 2. The dreaming sweep's MERGE action
         supersedes it when ``DREAMING_ENABLED=true``: where this phase
@@ -628,23 +634,18 @@ class DeleteMixin:
         memories = self._scroll_all_user_memories(user_id, batch_size=batch_size)
         deleted_ids: set[str] = set()
 
-        def _pvis(payload: dict) -> str | None:
-            """Visibility of a raw Qdrant payload (handles mem0 double-wrap)."""
-            meta = payload.get("metadata", {}) or {}
-            if isinstance(meta.get("metadata"), dict):
-                meta = meta["metadata"]
-            return meta.get("visibility")
-
         # ── Phase 1: Exact dedup by hash ──
-        # Key on (hash, visibility) so a `standard` memory is never collapsed
-        # into an identically-worded `shared`/`private` one (different tiers are
-        # semantically distinct — a standard is binding, a shared note is not).
+        # Key on (hash, partition) — the same partition rule phase 2 uses
+        # (user, scope, project_id, visibility, workspace). The hash is an md5
+        # of the text alone, so identical text in two projects, at two tiers
+        # (a standard is binding, a shared note is not) or in a reference
+        # workspace vs a memory must stay separate rows.
         exact_removed = 0
         hash_groups: dict[tuple, list[dict]] = {}
         for mem in memories:
             h = mem["payload"].get("hash")
             if h:
-                hash_groups.setdefault((h, _pvis(mem["payload"])), []).append(mem)
+                hash_groups.setdefault((h, _dedup_partition(mem["payload"])), []).append(mem)
 
         for h, group in hash_groups.items():
             if len(group) < 2:

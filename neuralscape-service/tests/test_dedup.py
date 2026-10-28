@@ -428,11 +428,14 @@ class TestTimesDerivedHelpers:
 class TestExactDedupReinforcement:
     def test_survivor_absorbs_dropped_counters(self, service):
         """3 exact copies → survivor's times_derived becomes the group sum."""
+        # All three copies carry the same scope stamp, as real same-partition
+        # copies do (phase 1 groups by (hash, partition); an unstamped row is
+        # its own partition, like the write path's content-hash lookup).
         memories = [
             _make_point("p1", {"user_id": "u1", "hash": "abc", "data": "fact",
-                               "created_at": "2025-01-01T00:00:00", "metadata": {}}),
+                               "created_at": "2025-01-01T00:00:00", "metadata": {"scope": "global"}}),
             _make_point("p2", {"user_id": "u1", "hash": "abc", "data": "fact",
-                               "created_at": "2025-03-01T00:00:00", "metadata": {}}),
+                               "created_at": "2025-03-01T00:00:00", "metadata": {"scope": "global"}}),
             _make_point("p3", {"user_id": "u1", "hash": "abc", "data": "fact",
                                "created_at": "2025-06-01T00:00:00", "metadata": {"scope": "global"}}),
         ]
@@ -841,3 +844,61 @@ class TestSemanticDedupPartitions:
             "No stored vector", memory_action="add"
         )
         assert len(fake.search_calls) == 2
+
+
+class TestExactDedupPartitions:
+    """Phase 1 keys on (hash, partition): the hash is an md5 of the text only,
+    so the same text in another project or workspace shares the real hash."""
+
+    TEXT = "Deploys go through the staging gate before prod"
+
+    def _same_hash_row(self, pid, created_at, **meta):
+        from memory.hashing import content_hash
+
+        pid, payload, vec = _row(pid, self.TEXT, created_at, **meta)
+        payload["hash"] = content_hash(self.TEXT)
+        return (pid, payload, vec)
+
+    @pytest.mark.parametrize("semantic", [False, True])
+    def test_same_hash_across_projects_and_workspaces_all_kept(self, service, semantic):
+        _FakeQdrant(service, [
+            self._same_hash_row("p1", "2025-01-01T00:00:00",
+                                scope="project", project_id="alpha", visibility="private"),
+            self._same_hash_row("p2", "2025-03-01T00:00:00",
+                                scope="project", project_id="beta", visibility="private"),
+            self._same_hash_row("p3", "2025-06-01T00:00:00",
+                                scope="project", project_id="alpha", visibility="private",
+                                workspace="handbook"),
+            self._same_hash_row("p4", "2025-07-01T00:00:00",
+                                scope="global", visibility="private"),
+        ])
+
+        result = service.dedup_memories("u1", semantic=semantic)
+
+        assert result["exact_duplicates_removed"] == 0
+        assert result["semantic_duplicates_removed"] == 0
+        assert _deleted(service) == []
+        service._memory.vector_store.client.set_payload.assert_not_called()
+
+    @pytest.mark.parametrize("semantic", [False, True])
+    def test_same_hash_same_partition_older_deleted_counter_moves(self, service, semantic):
+        _FakeQdrant(service, [
+            self._same_hash_row("p1", "2025-01-01T00:00:00",
+                                scope="project", project_id="alpha", visibility="private",
+                                times_derived=3),
+            # absent workspace and "memory" are one partition
+            self._same_hash_row("p2", "2025-06-01T00:00:00",
+                                scope="project", project_id="alpha", visibility="private",
+                                workspace="memory"),
+            self._same_hash_row("p3", "2025-03-01T00:00:00",
+                                scope="project", project_id="beta", visibility="private"),
+        ])
+
+        result = service.dedup_memories("u1", semantic=semantic)
+
+        assert result["exact_duplicates_removed"] == 1
+        assert result["semantic_duplicates_removed"] == 0
+        assert _deleted(service) == ["p1"]
+        kwargs = service._memory.vector_store.client.set_payload.call_args.kwargs
+        assert kwargs["points"] == ["p2"]
+        assert kwargs["payload"] == {"times_derived": 4}  # 1 + 3
