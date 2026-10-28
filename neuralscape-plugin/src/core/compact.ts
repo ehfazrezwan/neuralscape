@@ -38,8 +38,8 @@ export interface CompactSnapshotInputs {
   /** "manual" (/compact) or "auto" (context-window pressure). */
   trigger: string;
   when: Date;
-  /** Turns the pre-compact flush actually delivered to NS. */
-  capturedTurns: number;
+  /** Turns delivered to NS before the compact, when the caller knows it (the line is left out otherwise). */
+  capturedTurns?: number;
   /** The last few user messages before the compact (tail is kept). */
   recentUserMessages: string[];
 }
@@ -61,8 +61,8 @@ export function buildCompactSnapshotContent(inputs: CompactSnapshotInputs): stri
   const project = inputs.projectId || "(no project)";
   const lines: string[] = [
     `${COMPACT_SNAPSHOT_MARKER} session ${inputs.sessionId} in project ${project} ` +
-      `compacted (${inputs.trigger}) at ${inputs.when.toISOString()} ` +
-      `after ${inputs.capturedTurns} captured turn(s).`,
+      `compacted (${inputs.trigger}) at ${inputs.when.toISOString()}` +
+      (inputs.capturedTurns === undefined ? "." : ` after ${inputs.capturedTurns} captured turn(s).`),
   ];
 
   const tail = inputs.recentUserMessages

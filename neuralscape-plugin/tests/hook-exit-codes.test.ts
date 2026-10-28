@@ -92,10 +92,14 @@ describe("session-summary exit taxonomy", () => {
     await writeFile(
       transcript,
       [
-        JSON.stringify({ type: "user", content: "please fix the flaky test" }),
+        // the real Claude Code shape: text under message.content (a string, or text blocks)
+        JSON.stringify({ type: "user", message: { role: "user", content: "please fix the flaky test" } }),
         JSON.stringify({
           type: "assistant",
-          content: "Done — the fixture now pins the clock so the test is deterministic.",
+          message: {
+            role: "assistant",
+            content: [{ type: "text", text: "Done — the fixture now pins the clock so the test is deterministic." }],
+          },
         }),
       ].join("\n") + "\n",
       "utf-8",

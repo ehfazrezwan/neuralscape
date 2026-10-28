@@ -102,10 +102,15 @@ export function extractLearned(turns: Array<{ user: string; assistant: string }>
   return squash(hits.join(" "));
 }
 
-/** The final assistant message is usually the wrap-up — use its head. */
-export function extractCompleted(turns: Array<{ user: string; assistant: string }>): string | undefined {
+/**
+ * The final assistant message is usually the wrap-up — use its head.  A turn's `assistant` joins every assistant
+ * entry (progress commentary first); `final`, when given, is the turn's last assistant entry on its own.
+ */
+export function extractCompleted(
+  turns: Array<{ user: string; assistant: string; final?: string }>
+): string | undefined {
   for (let i = turns.length - 1; i >= 0; i--) {
-    const text = (turns[i].assistant ?? "").trim();
+    const text = (turns[i].final ?? turns[i].assistant ?? "").trim();
     if (!text || isSystemMessage(text)) continue;
     return squash(text, 350);
   }
@@ -145,7 +150,7 @@ export function extractNextSteps(turns: Array<{ user: string; assistant: string 
  * nothing worth carrying forward (no substantive turns and no observations).
  */
 export function buildSessionNote(
-  turns: Array<{ user: string; assistant: string }>,
+  turns: Array<{ user: string; assistant: string; final?: string }>,
   observations: ObservationRow[],
 ): SessionNoteFields | null {
   const note: SessionNoteFields = {};
