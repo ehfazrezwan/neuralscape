@@ -52,8 +52,13 @@ GOOGLE_API_KEY=ya29...        # https://aistudio.google.com/apikey
 NEO4J_PASSWORD=change-me      # any password; Neo4j will use it on first start
 ```
 
+Then pick one auth option. Auth is fail-closed: the API refuses to start until
+one is set (see [AUTH.md](../../AUTH.md#fail-closed-by-default)):
+- `NEURALSCAPE_USER_TOKEN_SECRET` — per-user tokens (recommended; see [Step 8](#step-8-multi-user--issue-per-user-tokens))
+- `NEURALSCAPE_API_KEY` — legacy shared key; all endpoints except `/health` require `Authorization: Bearer <key>`
+- `NEURALSCAPE_AUTH_DISABLED=true` — no auth at all; trusted local machine only
+
 Optional knobs (defaults are reasonable):
-- `NEURALSCAPE_API_KEY` — if set, all endpoints except `/health` require `Authorization: Bearer <key>`
 - `OBSIDIAN_VAULT_PATH` — host path mounted into the container at `/data/vault` (defaults to `./vault`)
 - `MCP_TRANSPORT` — `http` (default in compose) or `stdio`
 
@@ -182,7 +187,7 @@ When you're ready to add a second user (or you want auth turned on at all for a 
 
 Memory visibility now matters: see the [memory-model doc](./03-memory-model.md#multi-user-model-v22) for the per-category default visibility table (`preference` → private; `tech_stack` → shared; etc.). If you have legacy memories you'd like to make team-visible after the fact, run `scripts/bulk_promote_visibility.py` (dry-run by default) and `scripts/migrate_graph_groups.py` to rewrite the Graphiti group_ids.
 
-For a strictly single-user install you can skip this step entirely — `NEURALSCAPE_API_KEY` (legacy shared key, or no auth at all) keeps working.
+For a strictly single-user install you can skip this step entirely — `NEURALSCAPE_API_KEY` (legacy shared key) or `NEURALSCAPE_AUTH_DISABLED=true` (no auth at all, trusted local machine only) keeps working.
 
 ## Step 9 (optional) — Install the Claude Code / Cowork plugin
 

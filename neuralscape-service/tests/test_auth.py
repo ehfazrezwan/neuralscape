@@ -1,7 +1,8 @@
 """Tests for Bearer token authentication middleware.
 
 Tests cover:
-- Auth disabled when NEURALSCAPE_API_KEY is empty (local dev mode)
+- Auth disabled only via the explicit NEURALSCAPE_AUTH_DISABLED opt-out
+- Fail-closed: no secret and no opt-out refuses startup and rejects requests
 - Auth enabled when NEURALSCAPE_API_KEY is set
 - Health endpoint always accessible without auth
 - Protected endpoints return 401 without/invalid token
@@ -69,15 +70,14 @@ def mock_service():
 
 
 class TestAuthDisabled:
-    """When NEURALSCAPE_API_KEY is empty, all requests pass through."""
+    """With no secret AND the explicit opt-out, all requests pass through."""
 
     @pytest.fixture(autouse=True)
-    def disable_auth(self):
+    def disable_auth(self, monkeypatch):
         from config import settings
-        original = settings.neuralscape_api_key
-        settings.neuralscape_api_key = ""
-        yield
-        settings.neuralscape_api_key = original
+        monkeypatch.setattr(settings, "neuralscape_api_key", "")
+        monkeypatch.setattr(settings, "neuralscape_user_token_secret", "")
+        monkeypatch.setattr(settings, "neuralscape_auth_disabled", True)
 
     def test_health_no_auth(self):
         client = TestClient(app, raise_server_exceptions=False)
@@ -170,6 +170,106 @@ class TestAuthEnabled:
         # Should be 401 (auth) not 404 (route not found)
         # Note: MCP may not be mounted in test env, so we accept 401 or 404
         assert resp.status_code in (401, 404)
+
+
+class TestAuthFailClosed:
+    """P0: with default settings (no secret, no opt-out) the service must not
+    run unauthenticated. Startup refuses; the middleware never silently
+    bypasses; the explicit opt-out is the only way to run without auth."""
+
+    def _settings(self, **kw):
+        base = dict(google_api_key="k", neo4j_password="p")
+        base.update(kw)
+        return Settings(_env_file=None, **base)
+
+    def test_validate_required_refuses_without_secret_or_opt_out(self):
+        with pytest.raises(ValueError) as exc_info:
+            self._settings().validate_required()
+        msg = str(exc_info.value)
+        assert "Authentication is not configured" in msg
+        assert "NEURALSCAPE_USER_TOKEN_SECRET" in msg
+        assert "NEURALSCAPE_API_KEY" in msg
+        assert "NEURALSCAPE_AUTH_DISABLED=true" in msg
+
+    def test_defaults_are_fail_closed(self):
+        s = self._settings()
+        assert s.neuralscape_user_token_secret == ""
+        assert s.neuralscape_api_key == ""
+        assert s.neuralscape_auth_disabled is False
+
+    def test_app_startup_refuses_without_secret_or_opt_out(self, monkeypatch):
+        """The real lifespan (what uvicorn runs) must abort before serving."""
+        from config import settings
+        monkeypatch.setattr(settings, "google_api_key", "k")
+        monkeypatch.setattr(settings, "neo4j_password", "p")
+        monkeypatch.setattr(settings, "neuralscape_user_token_secret", "")
+        monkeypatch.setattr(settings, "neuralscape_api_key", "")
+        monkeypatch.setattr(settings, "neuralscape_auth_disabled", False)
+        with pytest.raises(ValueError, match="Authentication is not configured"):
+            with TestClient(app):
+                pass
+
+    @pytest.mark.parametrize(
+        "secrets",
+        [
+            {"neuralscape_user_token_secret": "s"},
+            {"neuralscape_api_key": "k"},
+        ],
+        ids=["user_token_secret", "legacy_api_key"],
+    )
+    def test_validate_required_accepts_either_secret(self, secrets):
+        self._settings(**secrets).validate_required()  # no raise
+
+    def test_opt_out_starts_and_warns(self, caplog):
+        s = self._settings(neuralscape_auth_disabled=True)
+        with caplog.at_level("WARNING", logger="config"):
+            s.validate_required()  # no raise
+        warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+        assert len(warnings) == 1
+        assert "AUTHENTICATION IS DISABLED" in warnings[0].getMessage()
+
+    def test_opt_out_ignored_when_secret_set(self, caplog, monkeypatch):
+        """A secret always wins: the opt-out cannot switch auth off."""
+        s = self._settings(neuralscape_api_key=TEST_API_KEY, neuralscape_auth_disabled=True)
+        with caplog.at_level("WARNING", logger="config"):
+            s.validate_required()
+        assert any("is ignored" in r.getMessage() for r in caplog.records)
+
+        from config import settings
+        monkeypatch.setattr(settings, "neuralscape_api_key", TEST_API_KEY)
+        monkeypatch.setattr(settings, "neuralscape_auth_disabled", True)
+        client = TestClient(app, raise_server_exceptions=False)
+        assert client.get("/v1/memories", params={"user_id": "t"}).status_code == 401
+
+    def test_middleware_rejects_when_unconfigured(self, monkeypatch):
+        """Even when the app is served without the lifespan (embedded, tests),
+        no secret + no opt-out must never fall through to the route."""
+        from config import settings
+        monkeypatch.setattr(settings, "neuralscape_user_token_secret", "")
+        monkeypatch.setattr(settings, "neuralscape_api_key", "")
+        monkeypatch.setattr(settings, "neuralscape_auth_disabled", False)
+        client = TestClient(app, raise_server_exceptions=False)
+        resp = client.get("/v1/memories", params={"user_id": "t"})
+        assert resp.status_code == 503
+        assert "NEURALSCAPE_AUTH_DISABLED" in resp.json()["detail"]
+        assert client.post("/v1/memories", json={"user_id": "t"}).status_code == 503
+        assert client.get("/health").status_code == 200
+        assert client.get("/health/live").status_code == 200
+
+    @pytest.mark.parametrize(
+        "secret_field", ["neuralscape_user_token_secret", "neuralscape_api_key"]
+    )
+    def test_secret_set_protects_routes_health_public(self, secret_field, monkeypatch):
+        from config import settings
+        monkeypatch.setattr(settings, "neuralscape_user_token_secret", "")
+        monkeypatch.setattr(settings, "neuralscape_api_key", "")
+        monkeypatch.setattr(settings, "neuralscape_auth_disabled", False)
+        monkeypatch.setattr(settings, secret_field, "a-test-secret")
+        client = TestClient(app, raise_server_exceptions=False)
+        assert client.get("/v1/memories", params={"user_id": "t"}).status_code == 401
+        assert client.get("/memories", params={"user_id": "t"}).status_code == 401
+        assert client.get("/health").status_code == 200
+        assert client.get("/health/live").status_code == 200
 
 
 class TestLegacyKeyWithDotFallsBack:

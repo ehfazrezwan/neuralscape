@@ -35,6 +35,7 @@ class TestConfigValidation:
             neo4j_password="test-pass",
             neo4j_uri="neo4j://localhost:7687",
             redis_url="redis://localhost:6379",
+            neuralscape_user_token_secret="test-secret",
         )
         # Should not raise
         s.validate_required()
