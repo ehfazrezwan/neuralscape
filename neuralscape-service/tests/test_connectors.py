@@ -13,25 +13,9 @@ class TestConnectorOwnership:
     """get/delete/sync must 404 for non-owners (C5-C8), not leak/act cross-user."""
 
     def _owned_vault(self):
-        import fnmatch
         from cryptography.fernet import Fernet
         from connectors.vault import ConnectorVault
-
-        class FakeStore:
-            def __init__(self):
-                self.d = {}
-
-            async def set(self, k, v):
-                self.d[k] = v
-
-            async def get(self, k):
-                return self.d.get(k)
-
-            async def delete(self, k):
-                return 1 if self.d.pop(k, None) is not None else 0
-
-            async def keys(self, pattern):
-                return [k for k in self.d if fnmatch.fnmatch(k, pattern)]
+        from tests.fake_vault_store import FakeVaultStore as FakeStore
 
         return ConnectorVault(FakeStore(), Fernet(Fernet.generate_key()))
 
