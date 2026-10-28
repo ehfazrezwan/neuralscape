@@ -4,9 +4,10 @@ All notable changes to the `neuralscape` Claude plugin are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 the project adheres to [Semantic Versioning](https://semver.org/).
 
-## [2.9.3] - 2026-10-19
+## [2.9.3] - 2026-10-28
 
 ### Fixed
+- PostToolUse now captures tool output. Claude Code sends it as `tool_response` (string or object), but the hook read `tool_output`, so every observation row had `output: ""`. Object responses are stored as JSON; `tool_output` is still accepted as a fallback. `<private>` spans are now redacted before truncation, so a span split by the size cap cannot leak its kept half.
 - Conversation capture now reads the transcript format Claude Code actually writes. Entries carry their text under `message.content` (a string for prompts, a list of blocks for assistant output), but the adapter only looked at a top-level `content`, so every turn looked empty and was dropped as noise while the flush cursor still advanced. The Stop and PreCompact flushes and the transcript half of the SessionEnd note therefore delivered nothing. The adapter now reads `message.content` (falling back to a top-level `content`), treats a turn as one real prompt plus the assistant text up to the next real prompt, and ignores tool results, tool calls, thinking, injected meta entries and sub-agent (sidechain) entries.
 - The flush cursor no longer moves past a prompt that has not been answered yet; it stays unread and is delivered by the next flush.
 - Turns that earlier versions failed to capture because of this bug are not recovered: a cursor written by an earlier version is used exactly as it is and never moved backwards, so nothing that was already delivered can be sent again.
