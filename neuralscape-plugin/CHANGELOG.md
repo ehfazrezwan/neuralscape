@@ -4,6 +4,11 @@ All notable changes to the `neuralscape` Claude plugin are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 the project adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.9.3] - 2026-10-28
+
+### Fixed
+- PostToolUse now captures tool output. Claude Code sends it as `tool_response` (string or object), but the hook read `tool_output`, so every observation row had `output: ""`. Object responses are stored as JSON; `tool_output` is still accepted as a fallback. `<private>` spans are now redacted before truncation, so a span split by the size cap cannot leak its kept half.
+
 ## [2.9.2] - 2026-09-07
 
 ### Fixed

@@ -90,7 +90,12 @@ export interface HookInput {
   hook_event_name?: string;
   tool_name?: string;
   tool_input?: Record<string, unknown>;
-  tool_output?: string;
+  /** PostToolUse: the tool's result as Claude Code sends it — a string for
+   *  some tools, an object (e.g. Bash `{stdout, stderr, ...}`) for most. */
+  tool_response?: unknown;
+  /** @deprecated Not sent by Claude Code; kept as a fallback for older or
+   *  non-Claude-Code callers. Use `tool_response`. */
+  tool_output?: unknown;
   prompt?: string;
   stop_hook_active?: boolean;
   last_assistant_message?: string;

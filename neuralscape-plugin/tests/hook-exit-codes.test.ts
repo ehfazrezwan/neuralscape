@@ -9,7 +9,7 @@
  */
 
 import { spawn } from "node:child_process";
-import { mkdtemp, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -130,10 +130,40 @@ describe("post-tool-use exit taxonomy", () => {
         cwd: dataDir,
         tool_name: "Bash",
         tool_input: { command: "make build" },
-        tool_output: "ok",
+        tool_response: { stdout: "ok", stderr: "", interrupted: false, isImage: false },
       }),
       { CLAUDE_PLUGIN_DATA: dataDir },
     );
     expect(r.code).toBe(0);
+  });
+
+  it("captures tool_response from a real-shaped Claude Code payload into the buffer", async () => {
+    // Field set mirrors what Claude Code actually sends to PostToolUse.
+    const dataDir = await mkdtemp(join(tmpdir(), "ns-ptu-e2e-"));
+    const r = await runHook(
+      "post-tool-use.js",
+      JSON.stringify({
+        session_id: "s-real",
+        transcript_path: join(dataDir, "s-real.jsonl"),
+        cwd: dataDir,
+        permission_mode: "default",
+        hook_event_name: "PostToolUse",
+        tool_name: "Bash",
+        tool_input: { command: "npm run build", description: "Build bundles" },
+        tool_response: { stdout: "built 8 bundles", stderr: "", interrupted: false, isImage: false },
+        tool_use_id: "toolu_test",
+        duration_ms: 12,
+      }),
+      { CLAUDE_PLUGIN_DATA: dataDir },
+    );
+    expect(r.code).toBe(0);
+    const lines = (await readFile(join(dataDir, "observations", "s-real.jsonl"), "utf-8"))
+      .trim()
+      .split("\n");
+    expect(lines).toHaveLength(1);
+    const row = JSON.parse(lines[0]);
+    expect(row.tool).toBe("Bash");
+    expect(row.output).not.toBe("");
+    expect(row.output).toContain("built 8 bundles");
   });
 });
