@@ -1,10 +1,8 @@
 """End-to-end proof of every hybrid flag against REAL Neo4j / Qdrant / Redis.
 
-Run with ``pytest -m integration tests/test_hybrid_integration.py`` where the
-stores and a Gemini key are configured through the environment
-(QDRANT_URL, NEO4J_URI/NEO4J_PASSWORD, REDIS_URL, GOOGLE_API_KEY). With any
-of them unreachable the module SKIPS with the reason; it never fails an
-environment that simply has no stores (e.g. the plain container test stage).
+Lives in integration_tests/ (auto-marked ``integration`` by its conftest). The
+``stores`` and ``llm_key`` fixtures fail on the gate (NS_INTEGRATION_REQUIRED=1)
+and skip elsewhere when infrastructure is missing.
 
 What is real: Qdrant rows, Neo4j nodes/edges/episodes, the Redis/ARQ queue and
 task status, Gemini embeddings and (on the fallback paths) Gemini extraction.
@@ -13,72 +11,34 @@ local fake (tests/fake_jev_server.py) answers over real HTTP with valid
 decisions. These tests prove the NeuralScape wiring (flag gates, validation,
 storage, fallback), NOT the real model's accuracy.
 
-Every test enables its own flags (settings monkeypatch) and cleans up the
-rows it created under a unique user id.
+Every test enables its own flags and cleans up under a unique user id.
 """
 from __future__ import annotations
 
 import asyncio
-import socket
 import uuid
-from urllib.parse import urlparse
 
 import pytest
 
 from config import parse_redis_settings, settings
 from tests.fake_jev_server import FakeJev, _distribution, default_policy, fake_jev  # noqa: F401
 
-pytestmark = pytest.mark.integration
-
-
-def _hostport(url: str, default_port: int) -> tuple[str, int]:
-    parsed = urlparse(url if '://' in url else f'//{url}')
-    return parsed.hostname or 'localhost', parsed.port or default_port
-
-
-def _unreachable_reason() -> str | None:
-    if not settings.google_api_key:
-        return 'GOOGLE_API_KEY not set (real embeddings/extraction are required)'
-    if not settings.qdrant_url:
-        return 'QDRANT_URL not set (local on-disk Qdrant is not the integration target)'
-    targets = {'qdrant': _hostport(settings.qdrant_url, 6333),
-               'neo4j': _hostport(settings.neo4j_uri, 7687),
-               'redis': _hostport(settings.redis_url, 6379)}
-    down = []
-    for name, (host, port) in targets.items():
-        try:
-            socket.create_connection((host, port), timeout=2).close()
-        except OSError:
-            down.append(f'{name}@{host}:{port}')
-    return f'unreachable stores: {", ".join(down)}' if down else None
-
-
-_SKIP = _unreachable_reason()
-# tests/conftest.py DESELECTS (rather than skips) this module in plain runs when
-# the stores are unreachable, so the CI unexpected-skip inventory stays exact.
-# An explicit `-m integration` run keeps the visible skip with this reason.
-_INTEGRATION_SKIP_REASON = _SKIP
-if _SKIP:
-    pytestmark = [pytest.mark.integration, pytest.mark.skip(reason=f'hybrid integration needs real stores: {_SKIP}')]
-
 
 @pytest.fixture(autouse=True)
-def _isolated_guard(monkeypatch):
-    """Fresh circuit breaker per test and deterministic extraction settings."""
+def _isolated_guard(stores, llm_key, flags):
+    """Require stores + key, fresh circuit breaker, deterministic settings, all flags off."""
     import hybrid_inference as hybrid
     hybrid._extraction_guard.cache_clear()
-    monkeypatch.setattr(settings, 'extraction_require_speaker', False)
-    monkeypatch.setattr(settings, 'jev_timeout_s', 5.0)
-    monkeypatch.setattr(settings, 'jev_extraction_deadline_s', 8.0)
-    for flag in ('jev_graph_enabled', 'jev_categories_enabled', 'jev_extraction_enabled', 'jev_rerank_enabled'):
-        monkeypatch.setattr(settings, flag, False)
+    flags(extraction_require_speaker=False, jev_timeout_s=5.0, jev_extraction_deadline_s=8.0,
+          jev_graph_enabled=False, jev_categories_enabled=False, jev_extraction_enabled=False,
+          jev_rerank_enabled=False)
     yield
     hybrid._extraction_guard.cache_clear()
 
 
 @pytest.fixture
-def uid():
-    return f'it-hybrid-{uuid.uuid4().hex[:10]}'
+def uid(unique_ns):
+    return unique_ns.user_id
 
 
 @pytest.fixture

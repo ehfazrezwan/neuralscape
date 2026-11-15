@@ -44,13 +44,3 @@ def test_server_errors_and_refused_connections_abstain(monkeypatch):
         assert down.requests
     monkeypatch.setattr(jev_client, 'JEV_ENDPOINT', 'http://127.0.0.1:1/v1/systemone')
     assert _decisions().scores('q', [{'memory': 'a'}], 'p') is None
-
-
-def test_integration_module_declares_a_reason_whenever_stores_are_unreachable():
-    """No stores => the module self-describes as unreachable; never a failure."""
-    import tests.test_hybrid_integration as module
-    marks = [m for m in module.pytestmark if m.name == 'skip']
-    if module._INTEGRATION_SKIP_REASON is None:
-        assert not marks
-    else:
-        assert marks and 'hybrid integration needs real stores' in marks[0].kwargs['reason']
