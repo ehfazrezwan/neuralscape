@@ -154,8 +154,40 @@ def test_my_feature_negative_control(ctx, a, b):
 Helpers: fixtures `ctx`, `anon`, `a`, `b`, `bad` (REST clients), `mcp_a`,
 `mcp_b` (MCP clients with `initialize`, `list_tools`, `call_tool`),
 `nsaccept.hooks.run_hook(name, payload, base_url=..., token=..., user_id=...,
-project_id=...)`, `@needs("node")` / `@needs("docling")`, and `a_fact` (a
-shared stored fact, see `scenarios/conftest.py`).
+project_id=...)`, `@needs("node")` / `@needs("docling")` / `@needs("compose")`,
+and the shared session writes in `scenarios/conftest.py`: `a_fact`,
+`shared_fact` (visibility=shared, in `shared_project(ctx)`), `graph_seed`
+(facts enqueued early so the slow graph worker overlaps the rest of the run) and
+`conv_seed` (the suite's one LLM extraction write, a 22-message conversation).
+
+More helpers in `nsaccept/`:
+
+- `helpers.py`: `write_raw` (raw write + poll, records instead of raising),
+  `Written.require()`, `list_rows`, `rows_with`, `mcp_json`, `graph_listing`,
+  `blob_has`, `memory_ids_in`.
+- `ctx.compose(*args)`: `docker compose -p <project> <args>`, only when run
+  with `--compose-project` (which also sets the `compose` capability, so
+  `@needs("compose")` scenarios run). Refuses the production project name and
+  any verb outside pause/unpause/stop/start/restart/ps/logs/top/exec/up (`up` only with `-d --no-build --no-recreate`, i.e. starting existing containers).
+  Expired-token scenarios mint inside the API container (`tokens.mint_via_compose_python`) when `NS_TOKEN_SECRET` is not set, so they also run on the gate.
+- `sse.SSEReader`: background reader for `GET /v1/stream`
+  (`wait_connected`, `wait_for`, `events`).
+- `upload.upload_files` / `upload.build_zip`: multipart upload to
+  `/v1/ingest/files`; `pdfgen.make_pdf`: dependency-free text PDF.
+- `probe.probe_route`: sends a harmless request and says whether the route is
+  mounted (not 405, not FastAPI's own "Not Found", not a 5xx).
+
+Scenario files (one per family; default profile unless noted):
+`test_auth_isolation` (tokens, identity, task ownership), `test_write_paths`,
+`test_read_paths`, `test_graph`, `test_edit_delete`, `test_ingest`
+(Docling cases only under the `docling` profile), `test_extensions` (registry,
+SSE, knowledge router, admin gates, session summaries), `test_fault_injection`
+(needs `--compose-project`; Qdrant outage guarantees and a 3-cycle cold start
+that deletes the collections and starts the API + workers together; always
+restores the stack, or fails with `ps` output). Run order is alphabetical except `test_edit_delete` and
+`test_fault_injection`, which run last (see `RUN_LAST` in `scenarios/conftest.py`).
+`scenarios/route_table.py` lists every REST route with a harmless probe; a
+drift scenario compares it with the stack's `/openapi.json`.
 
 Rules:
 
@@ -178,3 +210,25 @@ Rules:
 profile selection, results writer, `expect_check_fails`, MCP client against a
 local stub (JSON, SSE, session id), REST client polling, hook runner, and a lint
 over the real scenarios. `run.sh` never collects it; run `run.sh --selftest`.
+
+
+## Destructive scenarios
+
+`test_fault_injection::test_api_and_workers_started_together_on_empty_collections_stay_up`
+**wipes the Qdrant collections** (every memory on the stack) three times. It runs only
+when `NS_ALLOW_DESTRUCTIVE=1` is set and the compose project name starts with
+`nscampaign`; otherwise it skips with that reason. The gate sets
+`NS_ALLOW_DESTRUCTIVE=1` on its throwaway stack only; never set it elsewhere.
+
+
+## Compose project allowlist, and `uv`-only boxes
+
+Every compose project name the harness touches (`run.sh`, `guard.check`, `ctx.compose`,
+token minting) goes through `guard.check_compose_project`: stripped and lower-cased,
+`neuralscape` is always refused, and only disposable prefixes pass (default `nscampaign`
+and `nstest-`; override only with `NS_COMPOSE_ALLOWLIST=prefix1,prefix2`). Container
+listing is always `docker compose -p <project> ps`, never global `docker ps`.
+
+`run.sh` needs only `uv`: it runs `uv run --no-project --python 3.12 --with-requirements ...`
+(uv may download a managed CPython; downloads are allowed). Set `NS_UV=/path/to/uv` for a
+standalone binary that is not on `PATH`. Without uv it falls back to python3 >= 3.10 + venv.
