@@ -228,13 +228,32 @@ def _event_dt(mem) -> datetime | None:
     return dt.astimezone(timezone.utc)
 
 
+def _transfer_scores(results) -> dict:
+    """Rank-transfer a search pass's scores onto its returned ORDER.
+
+    ``search()`` returns rows in fused order but with native scores (BM25-only
+    rows carry the pool floor). Hand the pass's scores, sorted descending, out
+    by position so the order survives a later score sort. Unscored rows are
+    skipped (they stay unscored).
+    """
+    scored = [r for r in results or [] if getattr(r, "score", None) is not None]
+    ranked = sorted((r.score for r in scored), reverse=True)
+    return {r.id: ranked[i] for i, r in enumerate(scored) if getattr(r, "id", None)}
+
+
 def _evidence_rows(
     evidence: dict,
     keyword_ids: list[str],
     enumeration: bool,
     prioritize_ids: list[str] | None = None,
+    order_scores: dict | None = None,
 ) -> list:
     """Select and order evidence for the prompt (audit 27 #15).
+
+    ``order_scores`` (optional ``{id: score}``) overrides the displayed score
+    in the keep-set ranking: the rank-transferred score of the search pass
+    that produced the row (see ``_transfer_scores``), so BM25-only rows,
+    whose displayed score is the pool floor, keep their fused position.
 
     When over the row budget, the keep-set is chosen by priority —
     keyword-pass hits first, then highest search score, then newest —
@@ -276,8 +295,13 @@ def _evidence_rows(
         kw_set = set(keyword_ids) | prioritized
         # Three stable sorts, applied lowest-priority first:
         rows.sort(key=_created, reverse=True)  # newest first ("" sorts last)
-        rows.sort(key=lambda m: (getattr(m, "score", None) is None,
-                                 -(getattr(m, "score", None) or 0.0)))
+        def _rank_score(m):
+            if order_scores and m.id in order_scores:
+                return order_scores[m.id]
+            return getattr(m, "score", None)
+
+        rows.sort(key=lambda m: (_rank_score(m) is None,
+                                 -(_rank_score(m) or 0.0)))
         rows.sort(key=lambda m: m.id not in kw_set)  # keyword hits first
         rows = rows[:_EVIDENCE_MAX_ROWS]
 
@@ -421,6 +445,7 @@ def _build_prompt(
     keyword_ids: list[str],
     keyword_scan_capped: bool = False,
     prioritize_ids: list[str] | None = None,
+    order_scores: dict | None = None,
 ) -> str:
     """Assemble the answering prompt. Verbosity scales with the tier."""
     parts = [
@@ -459,7 +484,8 @@ def _build_prompt(
     parts.append(
         _render_evidence(
             _evidence_rows(
-                evidence, keyword_ids, enumeration, prioritize_ids=prioritize_ids
+                evidence, keyword_ids, enumeration, prioritize_ids=prioritize_ids,
+                order_scores=order_scores,
             )
         )
     )
@@ -556,7 +582,12 @@ async def ask_memory(
     content_index: dict[str, str] = {}  # normalized content -> evidence id
     keyword_ids: list[str] = []
 
+    order_scores: dict[str, float] = {}
+
     def _merge(results) -> None:
+        for rid, sc in _transfer_scores(results).items():
+            if sc > order_scores.get(rid, -1.0):
+                order_scores[rid] = sc
         for r in results or []:
             if not (getattr(r, "id", None) and getattr(r, "memory", None)):
                 continue
@@ -693,7 +724,8 @@ async def ask_memory(
     parsed: dict | None = None
     for _ in range(tier.extra_searches + 1):
         prompt = _build_prompt(question, evidence, tier, budget, enumeration,
-                               keyword_ids, keyword_scan_capped)
+                               keyword_ids, keyword_scan_capped,
+                               order_scores=order_scores)
         raw = await call(prompt)
         parsed = _parse_llm_json(raw)
         if (
@@ -710,7 +742,8 @@ async def ask_memory(
     # one final answer-only pass so the caller never gets a non-answer.
     if parsed is not None and parsed.get("action") == "search":
         prompt = _build_prompt(question, evidence, tier, 0, enumeration,
-                               keyword_ids, keyword_scan_capped)
+                               keyword_ids, keyword_scan_capped,
+                               order_scores=order_scores)
         raw = await call(prompt)
         parsed = _parse_llm_json(raw)
 
@@ -746,6 +779,7 @@ async def ask_memory(
                 keyword_ids,
                 keyword_scan_capped,
                 prioritize_ids=relevant_ids,
+                order_scores=order_scores,
             )
             raw2 = await call(prompt)
             parsed2 = _parse_llm_json(raw2)
