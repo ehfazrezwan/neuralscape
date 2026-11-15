@@ -252,7 +252,7 @@ The hook is a Node subprocess with no LLM access. The only way to reach the in-s
 
 1. **UserPromptSubmit threshold** — primary. Active sessions hit this every ~25 tool uses or 30 minutes.
 2. **SessionStart fallback** — when a prior session left a non-empty buffer (short sessions or sessions closed without a final prompt).
-3. **Stop-time stale marker** — Stop hook drops `<buffer>.stale` so the next SessionStart picks it up.
+3. **SessionEnd end marker** — the SessionEnd hook writes `<buffer>.jsonl.ended` once, when the session ends, so the next SessionStart (in any terminal) can offer the finished buffer for compilation; a buffer with no marker is offered only after 12 idle hours (`PENDING_IDLE_HOURS`), and a live buffer of another session is never offered. (Up to 2.9.3 the per-turn Stop hook wrote a `.stale` marker; those are now ignored and removed.)
 4. **Manual `/neuralscape:capture`** — user-invoked any time.
 
 ### Quality rubric

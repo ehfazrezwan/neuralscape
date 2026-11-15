@@ -29,6 +29,19 @@ def _slugify(text: str) -> str:
     return slug.strip("-")[:80]
 
 
+def _escape_owner(user_id: str) -> str:
+    """Escape ``%``, ``)`` and line breaks so a user id survives the ``_(user: ...)_`` suffix."""
+    return (
+        user_id.replace("%", "%25").replace(")", "%29").replace("\n", "%0A").replace("\r", "%0D")
+    )
+
+
+def _unescape_owner(text: str) -> str:
+    return (
+        text.replace("%29", ")").replace("%0A", "\n").replace("%0D", "\r").replace("%25", "%")
+    )
+
+
 def _ensure_dir(path: Path) -> None:
     """Create directory and parents if they don't exist."""
     path.mkdir(parents=True, exist_ok=True)
@@ -119,7 +132,13 @@ def _update_frontmatter_field(content: str, field: str, value: str) -> str:
 
 
 class ObsidianWriter:
-    """Handles all vault I/O for the conversation-compiler extension."""
+    """Handles all vault I/O for the conversation-compiler extension.
+
+    The vault is ONE shared tree for every user: nothing under it is
+    partitioned by user. That is by design (a single-operator vault; see the
+    extension README). Privacy is enforced one level up -- only memories with
+    shared visibility are ever handed to this writer -- not by the layout.
+    """
 
     def __init__(self, vault_path: Path | None = None) -> None:
         self.vault = vault_path or compiler_settings.vault_path
@@ -132,7 +151,10 @@ class ObsidianWriter:
 
         Args:
             date: ISO date string (YYYY-MM-DD).
-            entries: List of dicts with 'category', 'content', 'time', 'session_id' keys.
+            entries: List of dicts with 'category', 'content', 'time', 'session_id'
+                keys, and an optional 'user_id' (the memory's owner). The owner
+                lets the compiler run its post-compile dedup for every user
+                whose entries it compiled rather than for one configured user.
 
         Returns:
             Path to the daily log file (relative to vault).
@@ -160,6 +182,9 @@ class ObsidianWriter:
             content += f"- **[{time_str}]** `{category}` {fact}"
             if session:
                 content += f" _(session: {session})_"
+            owner = entry.get("user_id", "")
+            if owner:
+                content += f" _(user: {_escape_owner(owner)})_"
             content += "\n"
 
         if existing:
@@ -194,7 +219,8 @@ class ObsidianWriter:
         """Parse entries from a daily log file.
 
         Returns:
-            List of dicts with 'time', 'category', 'content', 'session_id'.
+            List of dicts with 'time', 'category', 'content', 'session_id' and
+            'user_id' ("" for entries written before owners were recorded).
         """
         path = self._raw_path(f"Daily/{date}.md")
         content = _read_file(path)
@@ -202,9 +228,12 @@ class ObsidianWriter:
             return []
 
         entries = []
-        # Match lines like: - **[HH:MM]** `category` content _(session: xxx)_
+        # Match lines like:
+        #   - **[HH:MM]** `category` content _(session: xxx)_ _(user: yyy)_
+        # (the session and user suffixes are both optional).
         pattern = re.compile(
-            r"^- \*\*\[([^\]]*)\]\*\* `(\w+)` (.+?)(?:\s*_\(session: ([^)]+)\)_)?$",
+            r"^- \*\*\[([^\]]*)\]\*\* `(\w+)` (.+?)"
+            r"(?:\s*_\(session: ([^)]+)\)_)?(?:\s*_\(user: ([^)]+)\)_)?$",
             re.MULTILINE,
         )
         for m in pattern.finditer(content):
@@ -214,6 +243,7 @@ class ObsidianWriter:
                     "category": m.group(2),
                     "content": m.group(3).strip(),
                     "session_id": m.group(4) or "",
+                    "user_id": _unescape_owner(m.group(5)) if m.group(5) else "",
                 }
             )
         return entries
@@ -617,6 +647,31 @@ class ObsidianWriter:
         resolve in Obsidian.
         """
         return self._raw_path(rel_path), f"{self._RAW_ROOT}/{rel_path}"
+
+    # Meta pages the writer maintains. They live under ``_raw/`` (every writer
+    # target does); the vault-root spellings are kept so a vault laid out before
+    # the ``_raw/`` move still reads correctly.
+    META_FILES = frozenset(
+        {
+            "_raw/index.md",
+            "_raw/log.md",
+            "_raw/category-index.md",
+            "index.md",
+            "log.md",
+            "category-index.md",
+        }
+    )
+
+    def _read_meta(self, name: str) -> str:
+        return self.read_file(f"{self._RAW_ROOT}/{name}") or self.read_file(name)
+
+    def read_index(self) -> str:
+        """Content of the vault index (``_raw/index.md``; legacy root ``index.md``)."""
+        return self._read_meta("index.md")
+
+    def read_log(self) -> str:
+        """Content of the chronological log (``_raw/log.md``; legacy root ``log.md``)."""
+        return self._read_meta("log.md")
 
     def list_all_files(self) -> list[str]:
         """List all markdown files in the vault (relative paths)."""

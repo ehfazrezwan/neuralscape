@@ -13,13 +13,11 @@ from pathlib import Path
 
 import pytest
 
-import hashlib
-
 import httpx
 
-from . import caps, guard, runctx
+from . import caps, guard, profile as profile_mod, runctx
 from .decor import DEFAULT_PROFILES
-from .fixtures import a, anon, b, bad, ctx, mcp_a, mcp_b  # noqa: F401  (registered as fixtures)
+from .fixtures import a, anon, b, bad, ctx, dictator, mcp_a, mcp_b, mcp_dictator, sink  # noqa: F401  (registered as fixtures)
 from .tokens import scrub
 
 ACCEPTANCE_DIR = Path(__file__).resolve().parents[1]
@@ -120,18 +118,11 @@ def pytest_collection_modifyitems(config, items):
 
 
 def _profile_info(profile: str) -> tuple[dict, str | None]:
-    path = ACCEPTANCE_DIR / "profiles" / f"{profile}.env"
-    if not path.is_file():
+    """(flags as recorded, sha256 of the file). Secrets appear only as ``<generate:...>`` placeholders."""
+    prof = profile_mod.load(ACCEPTANCE_DIR / "profiles" / f"{profile}.env")
+    if prof is None:
         return {}, None
-    raw = path.read_bytes()
-    flags: dict[str, str] = {}
-    for line in raw.decode("utf-8", "replace").splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, _, value = line.partition("=")
-        flags[key.strip()] = value.strip()
-    return flags, hashlib.sha256(raw).hexdigest()
+    return prof.flags, prof.sha256
 
 
 def _probe_stack_commit(base_url: str) -> str | None:
@@ -177,12 +168,22 @@ def pytest_collection_finish(session):
             returncode=2,
         )
     config._ns_stack_commit = stack
+    flags, _ = _profile_info(config.getoption("--ns-profile"))
+    dictator_ids = [u.strip() for u in flags.get("DICTATOR_USER_IDS", "").split(",") if u.strip()]
     try:
         config._ns_ctx = runctx.build(
-            base, config.getoption("--ns-profile"), config.getoption("--ns-compose-project")
+            base,
+            config.getoption("--ns-profile"),
+            config.getoption("--ns-compose-project"),
+            profile_flags=flags,
+            dictator_user=dictator_ids[0] if dictator_ids else None,
         )
     except runctx.ConfigError as exc:
         pytest.exit(f"harness misconfiguration: {scrub(str(exc))}", returncode=2)
+    if config._ns_ctx.compose_project:
+        os.environ["NS_HAVE_COMPOSE"] = "1"  # capability for @needs("compose")
+    if config._ns_ctx.token_dictator:
+        os.environ["NS_HAVE_DICTATOR"] = "1"  # capability for @needs("dictator")
 
 
 # ── @needs ──────────────────────────────────────────────────────

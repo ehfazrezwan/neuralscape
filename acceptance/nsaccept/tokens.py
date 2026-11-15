@@ -19,6 +19,7 @@ import time
 from typing import Callable
 
 
+
 class TokenError(RuntimeError):
     """Raised when a token cannot be obtained (harness misconfiguration)."""
 
@@ -64,6 +65,12 @@ def mint_via_compose(
     run: Callable[..., subprocess.CompletedProcess] = subprocess.run,
 ) -> str:
     """Mint a token the AUTH.md way: ``docker compose -p P exec`` the issuer script."""
+    from .guard import GuardError, check_compose_project
+
+    try:
+        project = check_compose_project(project)
+    except GuardError as exc:
+        raise TokenError(str(exc)) from exc
     cmd = [
         "docker", "compose", "-p", project, "exec", "-T", service,
         "python", "scripts/issue_user_token.py", "--user", user_id, "--days", str(days),
@@ -81,3 +88,37 @@ def mint_via_compose(
         if _TOKEN_RE.match(line):
             return line
     raise TokenError("token issuer printed no token-shaped line on stdout")
+
+
+def mint_via_compose_python(
+    project: str,
+    user_id: str,
+    ttl_seconds: int,
+    service: str = "neuralscape",
+    run: Callable[..., subprocess.CompletedProcess] = subprocess.run,
+) -> str:
+    """Mint a token with an arbitrary TTL (negative = already expired) INSIDE the API
+    container, so the signing secret never leaves it (read from its own environment
+    and never printed). The issuer CLI cannot make expired tokens; the module can.
+    """
+    from .guard import GuardError, check_compose_project
+
+    try:
+        project = check_compose_project(project)
+    except GuardError as exc:
+        raise TokenError(str(exc)) from exc
+    code = (
+        "import os,sys; from tokens import issue_user_token; "
+        "print(issue_user_token(sys.argv[1], os.environ['NEURALSCAPE_USER_TOKEN_SECRET'], int(sys.argv[2])))"
+    )
+    cmd = ["docker", "compose", "-p", project, "exec", "-T", service, "python", "-c", code, user_id, str(ttl_seconds)]
+    try:
+        proc = run(cmd, capture_output=True, text=True, timeout=120)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise TokenError(f"could not run docker compose to mint a token: {exc}") from exc
+    if proc.returncode != 0:
+        raise TokenError(f"in-container minting exited {proc.returncode}: {scrub((proc.stderr or '').strip())[:300]}")
+    for line in reversed((proc.stdout or "").splitlines()):
+        if _TOKEN_RE.match(line.strip()):
+            return line.strip()
+    raise TokenError("in-container minting printed no token-shaped line")
