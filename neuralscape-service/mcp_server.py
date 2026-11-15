@@ -30,6 +30,8 @@ from mcp.types import TextContent, Tool
 
 import adapters  # noqa: F401 — registers knowledge-adapter taxonomies at import (deterministic MEMORY_CATEGORIES for validation; tool enums stay core-13)
 from config import settings
+from memory.delete import MemoryListingFailed
+from memory.edit import RevisionConflict
 from memory_service import get_shared_service
 from schemas import CORE_MEMORY_CATEGORIES
 from task_manager import TaskManager
@@ -860,18 +862,16 @@ async def list_tools() -> list[Tool]:
         Tool(
             name="edit_memory",
             description=(
-                "Partially update an existing memory in place — the memory keeps its ID, "
-                "author, and creation time (no lossy delete+recreate). Only the fields you "
-                "pass are changed; pass null to clear a clearable field (project_id, tags, "
-                "expires_at, domain, observation_type, concepts, confidence). Scope is "
-                "re-derived from category + project_id automatically. Permission model: "
+                "Partially update an existing memory in place (keeps its ID, author and "
+                "creation time). Only the fields you pass are changed; pass null to clear a clearable field (project_id, tags, "
+                "expires_at, domain, observation_type, concepts, confidence). Permission model: "
                 "SHARED memories accept metadata edits (tags/category/project_id/v2 fields) "
-                "from any authenticated teammate — housekeeping is collaborative — but "
+                "from any authenticated teammate, but "
                 "content and visibility changes are owner-or-dictator only. PRIVATE "
                 "memories are owner-only; 'standard' tier is dictator-only. Content edits "
                 "are blocked on 'passage' memories (verbatim chunks of an ingested "
-                "artifact — re-ingest the corrected source instead). Graph impact is "
-                "handled automatically: content or project/visibility changes enqueue a "
+                "artifact — re-ingest the corrected source instead). Content or "
+                "project/visibility changes enqueue a "
                 "background knowledge-graph re-ingest (reported as graph_task_id)."
             ),
             inputSchema={
@@ -888,6 +888,7 @@ async def list_tools() -> list[Tool]:
                     "concepts": {"type": ["array", "null"], "items": {"type": "string"}, "description": "Memory-model v2 concept tags (max 5)"},
                     "confidence": {"type": ["number", "null"], "description": "Memory-model v2 confidence 0.0-1.0"},
                     "expires_at": {"type": ["string", "null"], "description": "ISO 8601 expiry; null clears"},
+                    "expected_revision": {"type": "string", "description": "Revision from a prior read; stale => refused, nothing written"},
                     "user_id": {"type": "string", "description": "Caller user ID (optional under token auth)"},
                 },
                 "required": ["memory_id"],
@@ -2193,15 +2194,20 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
                 # Pass caller identity so standard-tier deletes are gated to dictators.
                 result = await asyncio.to_thread(_service.delete_memory, memory_id, user_id)
             else:
-                result = await asyncio.to_thread(
-                    _service.delete_memories,
-                    user_id=user_id,
-                    scope=arguments.get("scope"),
-                    category=arguments.get("category"),
-                    project_id=arguments.get("project_id"),
-                    filter_null_category=arguments.get("filter_null_category", False),
-                    include_shared=arguments.get("include_shared", False),
-                )
+                try:
+                    result = await asyncio.to_thread(
+                        _service.delete_memories,
+                        user_id=user_id,
+                        scope=arguments.get("scope"),
+                        category=arguments.get("category"),
+                        project_id=arguments.get("project_id"),
+                        filter_null_category=arguments.get("filter_null_category", False),
+                        include_shared=arguments.get("include_shared", False),
+                    )
+                except MemoryListingFailed as e:
+                    # Listing failed => nothing was deleted; say so, never "ok".
+                    return [TextContent(type="text", text=json.dumps(
+                        {"error": str(e), "code": "listing_failed", "deleted": 0}))]
             # Sibling facts that shared a deleted fact's graph episode need a
             # fresh single-fact re-ingest; the delete itself has already
             # succeeded, so a queue failure is reported, never raised.
@@ -2229,10 +2235,21 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
             if not changes:
                 return [TextContent(type="text", text=json.dumps(
                     {"error": "No fields to update — provide at least one editable field"}))]
+            expected_revision = arguments.get("expected_revision")
+            patch_kwargs = {"expected_revision": expected_revision} if expected_revision is not None else {}
             try:
                 result = await asyncio.to_thread(
-                    _service.patch_memory, arguments["memory_id"], user_id, changes
+                    _service.patch_memory, arguments["memory_id"], user_id, changes, **patch_kwargs
                 )
+            except RevisionConflict as rc:
+                # Nothing was written; re-read the memory (it carries the new
+                # revision), re-apply the change and retry.
+                return [TextContent(type="text", text=json.dumps({
+                    "error": str(rc),
+                    "code": "revision_conflict",
+                    "expected_revision": rc.expected_revision,
+                    "current_revision": rc.current_revision,
+                }))]
             except (LookupError, PermissionError, ValueError) as e:
                 return [TextContent(type="text", text=json.dumps({"error": str(e)}))]
 

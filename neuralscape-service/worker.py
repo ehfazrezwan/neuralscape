@@ -974,6 +974,31 @@ async def process_graph_enrichment(
     # occurred_at as a top-level MemoryResponse field (mapped from the payload
     # metadata in _mem_to_response), so read it directly.
     occurred_at = getattr(mem, "occurred_at", None)
+
+    # The job carries the visibility/project/content the memory had WHEN IT WAS
+    # ENQUEUED. A narrowing edit (shared -> private), a project move or a content
+    # rewrite can land while the job sits in the queue; publishing the queued
+    # values would put the memory into a graph group its owner has since
+    # withdrawn it from. The row just re-read above is authoritative: derive the
+    # group (visibility + project + workspace) from it, and skip rather than
+    # enrich text the memory no longer holds (the edit that changed the content
+    # enqueues its own re-ingest of the new text).
+    current_content = getattr(mem, "memory", None)
+    if isinstance(current_content, str) and " ".join(current_content.split()) != " ".join(content.split()):
+        logger.info(
+            "Skipping graph enrichment for memory %s — its content changed while the job "
+            "was queued (the edit enqueues its own re-ingest).", memory_id,
+        )
+        return {"memory_id": memory_id, "enriched": False, "skipped": "content_changed"}
+    current_visibility = getattr(mem, "visibility", None) or "private"  # legacy null == private
+    current_project = getattr(mem, "project_id", project_id) or None
+    current_workspace = getattr(mem, "workspace", None) or None
+    if (current_visibility, current_project) != ((visibility or "private"), (project_id or None)):
+        logger.info(
+            "Graph enrichment for memory %s: row changed while queued "
+            "(visibility %r -> %r, project %r -> %r); using the current values.",
+            memory_id, visibility, current_visibility, project_id, current_project,
+        )
     graph_ontology = None
     if adapter:
         # Strict resolution (audit 27 #36): a queued job carrying an adapter
@@ -986,12 +1011,13 @@ async def process_graph_enrichment(
         service.enrich_graph,
         content=content,
         user_id=user_id,
-        project_id=project_id,
-        visibility=visibility or "private",
+        project_id=current_project,
+        visibility=current_visibility,
         memory_id=memory_id,
         source_ref=source_ref,
         graph_ontology=graph_ontology,
         occurred_at=occurred_at,
+        workspace=current_workspace,
     )
     if not enriched:
         logger.warning(

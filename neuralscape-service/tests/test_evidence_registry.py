@@ -175,7 +175,9 @@ def test_every_scenario_names_a_test_and_expected_failures_are_strict_xfails() -
 def test_every_known_failure_names_the_real_service_follow_up() -> None:
     failures = [s for s in SCENARIOS if s.kind == "expected-failure"]
 
-    assert len(failures) >= 7
+    # No floor on the count: every fix turns a known failure into a control (the
+    # floor made fixing the last defects fail this test). Each remaining one must
+    # still declare whether it needs a real-service repetition.
     assert any(not s.needs_real_service for s in SCENARIOS if s.kind == "control")
     for scenario in failures:
         assert isinstance(scenario.needs_real_service, bool)
@@ -194,7 +196,9 @@ def test_required_baseline_areas_each_have_an_expected_failure_and_a_control() -
     }
     by_id = {s.id: s for s in SCENARIOS}
     for area, (failure, control) in areas.items():
-        assert by_id[failure].kind == "expected-failure", area
+        # A fixed defect's scenario is re-registered as a control (its test now
+        # passes), so the "failure" slot may be either kind; it must exist.
+        assert by_id[failure].kind in ("expected-failure", "control"), area
         assert by_id[control].kind == "control", area
 
 

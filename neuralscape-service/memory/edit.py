@@ -5,6 +5,7 @@ code is verbatim — behavior unchanged.
 """
 
 import logging
+import uuid
 
 from datetime import datetime, timezone
 from config import settings
@@ -15,6 +16,76 @@ from memory.audit import _audit_log
 from memory.groups import _build_group_id, _check_edit_permission
 
 logger = logging.getLogger(__name__)
+
+
+class RevisionConflict(Exception):
+    """A PATCH carried an ``expected_revision`` that is no longer current.
+
+    Nothing was written. ``current_revision`` is the row's revision at the
+    time of the refusal, so a client can re-read, re-apply its change and retry.
+    """
+
+    def __init__(self, memory_id: str, expected: str, current: str):
+        self.memory_id = memory_id
+        self.expected_revision = expected
+        self.current_revision = current
+        super().__init__(
+            f"Memory {memory_id} was modified since revision {expected} "
+            f"(current revision is {current}); re-read it and retry"
+        )
+
+
+def revision_of(meta: dict | None) -> str:
+    """The row's revision token: a per-memory write counter kept in ``metadata.revision``.
+
+    Rows written before this existed carry no counter and read as ``"0"``. The
+    counter is bumped by every ``patch_memory`` and ``retag_memories`` write, so
+    two clients holding the same revision cannot both apply an edit to it.
+    """
+    try:
+        return str(max(int((meta or {}).get("revision") or 0), 0))
+    except (TypeError, ValueError):
+        return "0"
+
+
+def normalize_expected_revision(value) -> str | None:
+    """Canonical form of a client-supplied revision (``None`` stays ``None``).
+
+    Accepts the token as returned by reads, tolerating the quoting/``W/`` an
+    HTTP ``ETag`` style echo would add. Anything else is a ``ValueError``.
+    """
+    if value is None:
+        return None
+    token = str(value).strip()
+    if token.startswith("W/"):
+        token = token[2:]
+    token = token.strip('"')
+    if not token.isascii() or not token.isdigit():
+        raise ValueError("expected_revision must be a revision token as returned by a read of the memory")
+    return str(int(token))
+
+
+def _revision_filter(memory_id: str, revision: str, parent_key: str):
+    """Qdrant filter selecting exactly this point at exactly this revision."""
+    from qdrant_client.models import (
+        FieldCondition,
+        Filter,
+        HasIdCondition,
+        IsEmptyCondition,
+        MatchValue,
+        PayloadField,
+    )
+
+    key = f"{parent_key}.revision"
+    if int(revision) == 0:
+        at_revision = Filter(should=[
+            IsEmptyCondition(is_empty=PayloadField(key=key)),
+            FieldCondition(key=key, match=MatchValue(value=0)),
+        ])
+    else:
+        at_revision = Filter(must=[FieldCondition(key=key, match=MatchValue(value=int(revision)))])
+    return Filter(must=[HasIdCondition(has_id=[memory_id]), at_revision])
+
 
 class EditMixin:
     """EditMixin for MemoryService (mechanical split — see memory_service.py)."""
@@ -72,7 +143,45 @@ class EditMixin:
             new_meta[key] = value
         return new_meta
 
-    def patch_memory(self, memory_id: str, caller_user_id: str | None, changes: dict) -> dict:
+    def _confirm_revision_claim(
+        self, client, collection: str, memory_id: str, nonce: str | None, expected: str
+    ) -> None:
+        """Verify OUR filtered write is the one that landed; else raise ``RevisionConflict``.
+
+        A filtered ``set_payload`` is silent when the filter matches nothing, so
+        the winner is identified by the per-write nonce stamped in the payload.
+        """
+        points = client.retrieve(
+            collection_name=collection, ids=[memory_id], with_payload=True, with_vectors=False
+        )
+        if not points:
+            raise LookupError(f"Memory {memory_id} not found")
+        stored = (points[0].payload or {}).get("metadata") or {}
+        if isinstance(stored.get("metadata"), dict):
+            stored = stored["metadata"]
+        if stored.get("revision_nonce") != nonce:
+            raise RevisionConflict(memory_id, expected, revision_of(stored))
+
+    def _claim_revision(
+        self, client, collection: str, memory_id: str, current_revision: str,
+        nonce: str | None, new_revision: int, parent_key: str,
+    ) -> None:
+        """Atomically bump the revision (and stamp our nonce) iff it is still current."""
+        client.set_payload(
+            collection_name=collection,
+            payload={"revision": new_revision, "revision_nonce": nonce},
+            points=_revision_filter(memory_id, current_revision, parent_key),
+            key=parent_key,
+        )
+        self._confirm_revision_claim(client, collection, memory_id, nonce, current_revision)
+
+    def patch_memory(
+        self,
+        memory_id: str,
+        caller_user_id: str | None,
+        changes: dict,
+        expected_revision: str | None = None,
+    ) -> dict:
         """Partially update a memory across the vector store and knowledge graph.
 
         ``changes`` is presence-keyed (built from the request's
@@ -85,6 +194,20 @@ class EditMixin:
              "sibling_graph_jobs": list[dict],
              "sibling_graph_unrepaired_ids": list[str],
              "sibling_graph_repair_failed": bool}
+
+        ``expected_revision`` (optional) is an optimistic-concurrency
+        precondition: the revision token a read returned (``MemoryResponse.
+        revision``). When given and no longer current, nothing is written and
+        ``RevisionConflict`` is raised (REST 409). Absent keeps the historical
+        last-writer-wins behaviour. Every successful patch bumps the revision.
+        The compare-and-set is a Qdrant filtered ``set_payload`` (the server
+        applies it only if the point still carries the expected revision), so
+        two concurrent patches holding the same revision cannot both win. A
+        content edit then re-embeds and rewrites the row in a second step; the
+        window between the revision claim and that rewrite is the one place a
+        concurrent writer that does NOT send ``expected_revision`` can still
+        interleave (Qdrant offers no conditional upsert through mem0's
+        update path). Metadata-only patches are a single atomic step.
 
         The caller is responsible for enqueuing ``graph_job`` on the graph
         queue — Graphiti work is minutes-slow and must never run inline on a
@@ -118,6 +241,11 @@ class EditMixin:
         if isinstance(meta.get("metadata"), dict):
             meta = meta["metadata"]
         meta = dict(meta)
+        # Where the nested metadata dict sits in the raw payload (the filter key
+        # for the revision compare-and-set must match the stored shape).
+        raw_meta = payload.get("metadata") or {}
+        revision_parent = "metadata.metadata" if isinstance(raw_meta.get("metadata"), dict) else "metadata"
+        expected_revision = normalize_expected_revision(expected_revision)
 
         for key in ("content", "category", "visibility"):
             if key in changes and changes[key] is None:
@@ -132,6 +260,12 @@ class EditMixin:
             edits_content=edits_content,
             edits_visibility=edits_visibility,
         )
+
+        # Precondition (after the permission gate so a caller who may not edit
+        # never learns the row's revision from a refusal).
+        current_revision = revision_of(meta)
+        if expected_revision is not None and expected_revision != current_revision:
+            raise RevisionConflict(memory_id, expected_revision, current_revision)
 
         # Passages are verbatim chunks of an ingested artifact — rewriting one
         # would silently diverge from the source document. Metadata edits are fine.
@@ -176,12 +310,37 @@ class EditMixin:
             new_meta["token_estimate"] = stamp_tokens(changes["content"])
 
         now_iso = datetime.now(timezone.utc).isoformat()
+        # Every write bumps the revision (even without a precondition) so a
+        # concurrent holder of the old revision is refused.
+        new_meta["revision"] = int(current_revision) + 1
+        write_nonce = None
+        if expected_revision is not None:
+            write_nonce = uuid.uuid4().hex
+            new_meta["revision_nonce"] = write_nonce
+        client = m.vector_store.client
+        collection = settings.qdrant_collection
+        if expected_revision is not None and edits_content:
+            # Claim the revision atomically BEFORE the (slow) re-embed: only one
+            # of N concurrent patches holding this revision gets past here.
+            self._claim_revision(
+                client, collection, memory_id, current_revision, write_nonce,
+                int(current_revision) + 1, revision_parent,
+            )
         if edits_content:
             # Full mem0 update: re-embed + BM25 refresh + history. Passing the
             # merged nested metadata is load-bearing — mem0's _update_memory
             # rebuilds the ENTIRE payload from this kwarg, so omitting it (the
             # old update_memory bug) wipes category/scope/tags/visibility/owner.
             m.update(memory_id, changes["content"], metadata={"metadata": new_meta})
+        elif expected_revision is not None:
+            # Metadata-only with a precondition: ONE filtered set_payload, applied
+            # by Qdrant only if the point still carries the expected revision.
+            client.set_payload(
+                collection_name=collection,
+                payload={"metadata": new_meta, "updated_at": now_iso},
+                points=_revision_filter(memory_id, current_revision, revision_parent),
+            )
+            self._confirm_revision_claim(client, collection, memory_id, write_nonce, expected_revision)
         else:
             # Metadata-only: direct payload patch. set_payload merges at top
             # level, so data/hash/created_at/user_id are preserved and the
@@ -427,6 +586,9 @@ class EditMixin:
                 updated += 1
                 if dry_run:
                     continue
+                # A retag changes patchable fields: bump the revision so a
+                # concurrent PATCH holding the old one is refused.
+                new_meta["revision"] = int(revision_of(meta)) + 1
                 m.vector_store.update(
                     str(pt.id), payload={"metadata": new_meta, "updated_at": now_iso}
                 )

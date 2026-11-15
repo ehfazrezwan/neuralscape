@@ -5,6 +5,7 @@ code is verbatim — behavior unchanged.
 """
 
 from config import settings
+from memory.edit import revision_of
 from schemas import MemoryResponse, MemoryVisibility
 
 class ConvertMixin:
@@ -105,6 +106,8 @@ class ConvertMixin:
             source_ref=metadata.get("source_ref"),
             visibility=metadata.get("visibility"),
             owner_user_id=metadata.get("owner_user_id"),
+            revision=revision_of(metadata),
+            workspace=metadata.get("workspace"),
             sensitivity=metadata.get("sensitivity"),
             sensitivity_source=metadata.get("sensitivity_source"),
             title=metadata.get("title"),

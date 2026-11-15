@@ -17,6 +17,14 @@ from memory.ranking import _times_derived_from_metadata
 logger = logging.getLogger(__name__)
 
 
+class MemoryListingFailed(RuntimeError):
+    """A bulk delete could not list the caller's memories, so it deleted NOTHING.
+
+    Raised (instead of returning a message) so a caller can never mistake a
+    failed listing for a completed delete; the REST routes answer 503.
+    """
+
+
 def _is_valid_point_id(memory_id: str) -> bool:
     """True for a well-formed Qdrant point id (UUID string or unsigned int)."""
     try:
@@ -243,7 +251,10 @@ class DeleteMixin:
                 )
                 unresolved_ids: list[str] = []
                 if self._graphiti and self._bridge:
-                    unresolved_ids = self._expire_user_graph_writes(user_id)
+                    # strict: if the user's rows cannot be listed the graph
+                    # cleanup cannot run — refuse BEFORE delete_all rather than
+                    # delete the vectors and silently leave their graph facts live.
+                    unresolved_ids = self._expire_user_graph_writes(user_id, strict=True)
                 m.delete_all(user_id=user_id)
                 return {
                     "message": "All memories deleted (including shared)",
@@ -389,7 +400,9 @@ class DeleteMixin:
             all_memories = self._scroll_all_user_memories(user_id)
         except Exception as e:
             logger.warning(f"Failed to scroll memories for private-only delete: {e}")
-            return {"message": "No memories deleted (scroll failed)"}
+            raise MemoryListingFailed(
+                "Memories could not be listed; nothing was deleted. Retry."
+            ) from e
 
         # (memory_id, payload, metadata) for every non-shared row.
         private_rows: list[tuple[str, dict, dict]] = []
@@ -509,7 +522,7 @@ class DeleteMixin:
         except Exception as e:
             logger.warning(f"Graph edge expiration failed (non-critical): {e}")
 
-    def _expire_user_graph_writes(self, user_id: str) -> list[str]:
+    def _expire_user_graph_writes(self, user_id: str, *, strict: bool = False) -> list[str]:
         """Expire graph edges/episodes/summaries across every group_id this
         user authored.
 
@@ -525,10 +538,20 @@ class DeleteMixin:
         Returns the memory ids whose episode could not be resolved/verified
         (zero-effect detection, private or shared) — never silently
         dropped, so the caller can report them.
+
+        ``strict=True`` (the bulk-delete caller) raises ``MemoryListingFailed``
+        when the rows cannot be listed instead of returning ``[]`` — an empty
+        list reads as "nothing to clean up", which is wrong when the listing
+        itself failed.
         """
         try:
             user_memories = self._scroll_all_user_memories(user_id)
         except Exception as e:
+            if strict:
+                logger.warning(f"Failed to scroll memories for graph cleanup: {e}")
+                raise MemoryListingFailed(
+                    "Memories could not be listed; nothing was deleted. Retry."
+                ) from e
             logger.warning(f"Failed to scroll memories for graph cleanup (non-critical): {e}")
             return []
 

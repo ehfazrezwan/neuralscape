@@ -667,6 +667,9 @@ class TestCRUD:
 
     def test_delete_memories_all_include_shared_nukes_everything(self, service):
         """include_shared=True restores the old full-nuke path."""
+        # The graph cleanup lists the user's rows first; a listing that cannot
+        # run now refuses the whole delete (MemoryListingFailed), so give it one.
+        service._scroll_all_user_memories = MagicMock(return_value=[])
         result = service.delete_memories(user_id="ehfaz", include_shared=True)
         service._memory.delete_all.assert_called_once_with(user_id="ehfaz")
 
@@ -1481,6 +1484,7 @@ class TestBulkDeleteNullCategory:
         legacy delete_all sweep.
         """
         # Unfiltered + include_shared=True = legacy delete_all path
+        service._scroll_all_user_memories = MagicMock(return_value=[])
         service.delete_memories(user_id="ehfaz", include_shared=True)
         service._memory.delete_all.assert_called_once()
 
@@ -3348,6 +3352,7 @@ class TestBulkDeleteSharedProtection:
         assert "preserved 1 shared" in result["message"]
 
     def test_include_shared_true_uses_delete_all(self, service):
+        service._scroll_all_user_memories = MagicMock(return_value=[])
         service.delete_memories(user_id="alice", include_shared=True)
         service._memory.delete_all.assert_called_once_with(user_id="alice")
 

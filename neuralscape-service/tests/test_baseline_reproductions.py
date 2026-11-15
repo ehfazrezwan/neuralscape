@@ -34,14 +34,6 @@ def _run(coro):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason=(
-        "legacy group ids join user and project with a delimiter that legal ids "
-        "may contain, so different (user, project) tuples can share one namespace"
-    ),
-)
 def test_distinct_namespace_tuples_have_distinct_group_ids() -> None:
     from memory.groups import _build_group_id
 
@@ -88,7 +80,7 @@ def test_ordinary_emails_slug_deterministically() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Queued graph publication uses the visibility captured at enqueue time
+# Queued graph publication uses the memory's CURRENT visibility
 # ---------------------------------------------------------------------------
 
 
@@ -122,14 +114,6 @@ def _enrich(service: _GraphService, queued_visibility: str) -> dict:
     )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason=(
-        "the graph job publishes the visibility it was enqueued with and never re-reads the "
-        "memory's current visibility, so narrowing a memory while a job is queued is not honored"
-    ),
-)
 def test_queued_graph_job_publishes_current_visibility() -> None:
     service = _GraphService(current_visibility="private")  # narrowed after enqueue
 
@@ -253,11 +237,6 @@ def test_job_ids_are_stable_and_user_scoped() -> None:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason="the edit request has no revision or etag precondition, so a stale edit cannot be refused (schema-level; concurrent-edit reproduction needs real stores)",
-)
 def test_patch_request_carries_an_expected_revision() -> None:
     from schemas import PatchMemoryRequest
 

@@ -5,12 +5,106 @@ code is verbatim — behavior unchanged.
 """
 
 import logging
+import re
 
 from datetime import datetime
+from typing import NamedTuple
+
 from config import settings
 from schemas import MemoryVisibility, normalize_visibility
 
 logger = logging.getLogger(__name__)
+
+# ── Injective group ids ────────────────────────────────────────────────
+# Legacy group ids join their parts with ``--``, but a legal id may itself
+# contain ``--`` (the id alphabet is ``[A-Za-z0-9_.-]``), so user
+# ``alice--project--payroll`` and user ``alice`` in project ``payroll`` shared
+# one graph namespace (a cross-user read/write alias).
+#
+# A component is *plain* when it is non-empty, uses only the id alphabet, has no
+# ``--`` and neither starts nor ends with ``-``. In a tuple of plain components
+# every ``--`` in the name is a delimiter, so the name reads back to exactly one
+# tuple, and plain tuples keep their legacy name BYTE FOR BYTE (zero migration
+# for every id that does not hit the collision). Any tuple with a non-plain
+# component is named ``nsg1--`` + the hex of a length-prefixed encoding of the
+# whole tuple: the ``nsg1`` first segment is not a legacy pool name, the
+# characters are all Graphiti-valid, and the encoding is canonical, so distinct
+# tuples can never share a name. (Idea reused from the old graph-wave branch,
+# minus its auth-profile flag: injectivity must not be opt-in.)
+_PLAIN_COMPONENT = re.compile(r"[A-Za-z0-9_.]+(?:-[A-Za-z0-9_.]+)*")
+ENCODED_GROUP_PREFIX = "nsg1--"
+_POOL_KINDS = ("private", "shared", "standard")
+
+
+class GroupKey(NamedTuple):
+    """The placement a group id names; ``owner`` is set for (only) private pools."""
+
+    pool: str
+    owner: str | None
+    project: str | None
+    workspace: str | None
+
+
+def _is_plain_component(value: str | None) -> bool:
+    # ``""`` only reaches here as a private owner (anonymous legacy write); it
+    # keeps its historical name ``user--``.
+    return value is None or value == "" or _PLAIN_COMPONENT.fullmatch(value) is not None
+
+
+def _encode_group_key(key: GroupKey) -> str:
+    """``nsg1--`` + hex of one segment per field: ``~`` if absent else ``<utf8-length>:<value>``."""
+    parts = [
+        "~" if value is None else f"{len(value.encode('utf-8'))}:{value}"
+        for value in key
+    ]
+    return ENCODED_GROUP_PREFIX + "".join(parts).encode("utf-8").hex()
+
+
+def decode_group_id(group_id: str) -> GroupKey | None:
+    """Exact placement named by an encoded (``nsg1--``) group id, else ``None``.
+
+    Only canonical encodings of tuples that actually need one decode; a legacy
+    name (including every plain tuple's name) returns ``None``.
+    """
+    if not isinstance(group_id, str) or not group_id.startswith(ENCODED_GROUP_PREFIX):
+        return None
+    try:
+        data = bytes.fromhex(group_id[len(ENCODED_GROUP_PREFIX):])
+    except ValueError:
+        return None
+    values: list[str | None] = []
+    position = 0
+    for _ in GroupKey._fields:
+        if data[position:position + 1] == b"~":
+            values.append(None)
+            position += 1
+            continue
+        colon = data.find(b":", position)
+        digits = data[position:colon] if colon != -1 else b""
+        if not digits.isdigit():
+            return None
+        end = colon + 1 + int(digits)
+        if end > len(data):
+            return None
+        try:
+            values.append(data[colon + 1:end].decode("utf-8"))
+        except UnicodeDecodeError:
+            return None
+        position = end
+    key = GroupKey(*values)
+    if (
+        position != len(data)
+        or key.pool not in _POOL_KINDS
+        or (key.pool == "private") != (key.owner is not None)
+        or _encode_group_key(key) != group_id
+        or _key_is_plain(key)
+    ):
+        return None
+    return key
+
+
+def _key_is_plain(key: GroupKey) -> bool:
+    return all(_is_plain_component(v) for v in (key.owner, key.project, key.workspace))
 
 def _live_edges_filter():
     """Graphiti ``SearchFilters`` selecting only bi-temporally LIVE edges.
@@ -126,6 +220,11 @@ def _build_group_id(
     Workspace partition (WT6): absent or "memory" ⇒ NO suffix (byte-identical
     group_ids for existing rows, zero migration). Any other value appends
     `--ws--{workspace}`, isolating reference content from memory pools.
+
+    Injective: a tuple with a non-plain component (one containing ``--``,
+    starting/ending with ``-``, or outside the id alphabet) is named
+    ``nsg1--<hex>`` (see ``_encode_group_key``) so it can never alias another
+    tuple's namespace; every plain tuple keeps the legacy name shown above.
     """
     # Tolerate enum / str / legacy "MemoryVisibility.X" / None — see
     # normalize_visibility docstring for why this matters. Unrecognized
@@ -136,23 +235,24 @@ def _build_group_id(
         vis = normalize_visibility(visibility) or MemoryVisibility.PRIVATE.value
     except (ValueError, TypeError):
         vis = MemoryVisibility.PRIVATE.value
-    if vis == MemoryVisibility.STANDARD.value:
-        # Authoritative org-wide pool: dictator-written, everyone-readable.
-        base = f"standard--project--{project_id}" if project_id else "standard"
-        if workspace and workspace != "memory":
-            return f"{base}--ws--{workspace}"
-        return base
-    if vis == MemoryVisibility.SHARED.value:
-        base = f"shared--project--{project_id}" if project_id else "shared"
-        if workspace and workspace != "memory":
-            return f"{base}--ws--{workspace}"
-        return base
-    # private
-    base = f"user--{user_id}--project--{project_id}" if project_id else f"user--{user_id}"
+    pool = vis if vis in (MemoryVisibility.STANDARD.value, MemoryVisibility.SHARED.value) else "private"
+    key = GroupKey(
+        pool,
+        str(user_id) if pool == "private" else None,
+        str(project_id) if project_id else None,
+        str(workspace) if workspace and workspace != "memory" else None,
+    )
+    if not _key_is_plain(key):
+        return _encode_group_key(key)
     # Workspace suffix: absent or "memory" ⇒ no suffix (backward compatible)
-    if workspace and workspace != "memory":
-        return f"{base}--ws--{workspace}"
-    return base
+    if pool == MemoryVisibility.STANDARD.value:
+        # Authoritative org-wide pool: dictator-written, everyone-readable.
+        base = f"standard--project--{key.project}" if key.project else "standard"
+    elif pool == MemoryVisibility.SHARED.value:
+        base = f"shared--project--{key.project}" if key.project else "shared"
+    else:
+        base = f"user--{key.owner}--project--{key.project}" if key.project else f"user--{key.owner}"
+    return f"{base}--ws--{key.workspace}" if key.workspace else base
 
 
 def _get_group_ids(caller_user_id: str, project_id: str | None = None) -> list[str]:
@@ -170,16 +270,16 @@ def _get_group_ids(caller_user_id: str, project_id: str | None = None) -> list[s
     def _standard_groups() -> list[str]:
         if not settings.standards_enabled:
             return []
-        return ["standard"] + ([f"standard--project--{project_id}"] if project_id else [])
+        return ["standard"] + ([_build_group_id("standard", "", project_id)] if project_id else [])
 
     if not caller_user_id:
         # Anonymous / unauthenticated readers see the shared + standard pools.
-        anon = ["shared"] + ([f"shared--project--{project_id}"] if project_id else [])
+        anon = ["shared"] + ([_build_group_id("shared", "", project_id)] if project_id else [])
         return anon + _standard_groups()
-    group_ids = [f"user--{caller_user_id}", "shared"]
+    group_ids = [_build_group_id("private", caller_user_id), "shared"]
     if project_id:
-        group_ids.append(f"user--{caller_user_id}--project--{project_id}")
-        group_ids.append(f"shared--project--{project_id}")
+        group_ids.append(_build_group_id("private", caller_user_id, project_id))
+        group_ids.append(_build_group_id("shared", caller_user_id, project_id))
     return group_ids + _standard_groups()
 
 
