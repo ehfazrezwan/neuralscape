@@ -23,6 +23,7 @@ COPY neuralscape-service/ingest/ neuralscape-service/ingest/
 COPY neuralscape-service/connectors/ neuralscape-service/connectors/
 COPY neuralscape-service/okf/ neuralscape-service/okf/
 COPY neuralscape-service/integration_tests/ neuralscape-service/integration_tests/
+COPY neuralscape-service/ledger/ neuralscape-service/ledger/
 
 # Install all dependencies using uv from the neuralscape-service project
 # E2: include the code-graph extra (tree-sitter + graphifyy) in the builder
@@ -80,6 +81,7 @@ COPY --chown=appuser:appuser neuralscape-service/ingest/ neuralscape-service/ing
 COPY --chown=appuser:appuser neuralscape-service/connectors/ neuralscape-service/connectors/
 COPY --chown=appuser:appuser neuralscape-service/okf/ neuralscape-service/okf/
 COPY --chown=appuser:appuser neuralscape-service/integration_tests/ neuralscape-service/integration_tests/
+COPY --chown=appuser:appuser neuralscape-service/ledger/ neuralscape-service/ledger/
 # Operator-facing scripts (relocate_vault_to_raw, issue_user_token,
 # migrate_graph_groups, bulk_promote_visibility). Production operators
 # invoke these in-container; without this copy they had to docker-cp
@@ -152,6 +154,7 @@ COPY --chown=appuser:appuser neuralscape-service/knowledge/ neuralscape-service/
 COPY --chown=appuser:appuser neuralscape-service/ingest/ neuralscape-service/ingest/
 COPY --chown=appuser:appuser neuralscape-service/connectors/ neuralscape-service/connectors/
 COPY --chown=appuser:appuser neuralscape-service/okf/ neuralscape-service/okf/
+COPY --chown=appuser:appuser neuralscape-service/ledger/ neuralscape-service/ledger/
 
 # Resolve WITH dev deps so pytest, pytest-asyncio, etc. are available.
 # E2: include the code-graph extra so in-container tests can import tree-sitter
