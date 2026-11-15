@@ -5,6 +5,7 @@ and extracts structured facts, stores them in NeuralScape, and appends
 a human-readable summary to the daily log.
 """
 
+import asyncio
 import json
 import re
 from datetime import datetime
@@ -205,7 +206,10 @@ async def flush_conversation_turn(
         fact_project = fact.project_id or project_id
         scope = "project" if fact_project else "global"
         try:
-            service.store_raw(
+            # store_raw is sync (embedding + vector/graph writes); run it off
+            # the event loop so the sync-fallback path cannot stall the API.
+            await asyncio.to_thread(
+                service.store_raw,
                 content=fact.content,
                 user_id=user_id,
                 category=category,
