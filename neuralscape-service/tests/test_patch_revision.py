@@ -420,3 +420,22 @@ def test_a_lost_claim_aborts_the_rewrite_before_it_can_overwrite_another_writers
         world.patch_memory(M1, "ehfaz", {"content": "first writer's text"}, expected_revision="0")
     assert world.fake.points[M1]["data"] == "Old content"            # the rewrite never ran
     assert _tags(world) == ["second-writer"]                         # writer 2's edit survived
+
+
+def test_a_committed_conditional_patch_survives_many_successor_writes_before_its_confirmation(world):
+    """Ten successors land between our committed write and our confirming read: still success, and the
+    caller still gets what it needs to run graph cleanup (a committed partition change must not read as a conflict)."""
+    real_retrieve = world.fake.retrieve
+    state = {"done": False}
+
+    def retrieve_after_successors(collection_name, ids, with_payload=True, with_vectors=False):
+        if not state["done"] and world.fake.points[M1]["metadata"].get("revision") == 1:
+            state["done"] = True
+            for r in range(1, 11):
+                world.patch_memory(M1, "ehfaz", {"tags": [f"s{r}"]}, expected_revision=str(r))
+        return real_retrieve(collection_name, ids, with_payload, with_vectors)
+
+    world.fake.retrieve = retrieve_after_successors
+    out = world.patch_memory(M1, "ehfaz", {"visibility": "shared"}, expected_revision="0")   # partition change
+    assert out["graph"] != "unchanged" and out["graph_job"] is not None       # cleanup + re-ingest job still produced
+    assert world.fake.points[M1]["metadata"]["revision"] == 11

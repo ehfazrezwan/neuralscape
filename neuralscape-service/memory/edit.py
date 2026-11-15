@@ -74,6 +74,7 @@ def normalize_expected_revision(value) -> str | None:
 # A content edit marks the row "pending" while it re-embeds; the mark expires so a
 # crashed writer cannot wedge the row (conditional writers are refused meanwhile).
 _PENDING_LEASE_S = 600
+_NONCE_HISTORY = 64
 
 
 def _now_epoch() -> float:
@@ -389,7 +390,10 @@ class EditMixin:
             write_nonce = uuid.uuid4().hex
             nonces = dict(meta.get("revision_nonces") or {})
             nonces[str(int(current_revision) + 1)] = write_nonce
-            for old in sorted(nonces, key=int)[:-8]:   # keep the last 8 only
+            # Keep the last _NONCE_HISTORY revisions. Our entry only has to survive the
+            # (millisecond) gap to our own confirming read, so it would take that many
+            # successor commits inside that gap to evict it.
+            for old in sorted(nonces, key=int)[:-_NONCE_HISTORY]:
                 del nonces[old]
             new_meta["revision_nonces"] = nonces
         client = m.vector_store.client
