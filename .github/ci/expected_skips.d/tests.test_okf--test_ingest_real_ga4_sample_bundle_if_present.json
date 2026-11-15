@@ -1,0 +1,9 @@
+{
+  "test": "tests.test_okf::test_ingest_real_ga4_sample_bundle_if_present",
+  "reason_contains": "knowledge-catalog sample bundle not available",
+  "profiles": [
+    "container",
+    "host"
+  ],
+  "why": "missing fixture: the sample bundle is not available in CI"
+}

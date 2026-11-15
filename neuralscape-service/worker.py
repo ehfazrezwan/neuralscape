@@ -1213,6 +1213,9 @@ async def auto_compile_check(ctx: dict) -> dict | None:
 
     if not compiler_settings.auto_compile:
         return None
+    if ctx.get("ledger") is not None:
+        # This cron compiles for the *default user*; under the ledger no cron may act as one.
+        return {"skipped": True, "reason": "default-user cron is disabled while the ledger is on"}
 
     now = datetime.now()
     if now.hour < compiler_settings.compile_after_hour:
@@ -1256,6 +1259,11 @@ async def dedup_all_memories(ctx: dict) -> dict:
             # dedup_memories does sync Qdrant scroll pagination + embedding/LLM
             # calls that would otherwise freeze the loop for minutes at scale.
             result = await asyncio.to_thread(service.dedup_memories, uid, semantic=semantic)
+            # Sibling facts that shared a deleted duplicate's conversation
+            # episode need a single-fact graph re-ingest (graph queue).
+            sibling_jobs = result.pop("graph_jobs", [])
+            if sibling_jobs:
+                result["graph_jobs_enqueued"] = await _enqueue_graph_jobs(ctx, sibling_jobs, None)
             results.append(result)
             removed = result["exact_duplicates_removed"] + result["semantic_duplicates_removed"]
             if removed:

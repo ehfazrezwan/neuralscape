@@ -11,7 +11,6 @@ import base64
 import hashlib
 import json
 import logging
-import threading
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
@@ -39,6 +38,7 @@ from memory_service import get_shared_service
 configure_logging()
 from context_formatter import format_context_for_injection
 from index_format import index_row
+from ledger.port import IdempotencyConflict
 from schemas import (
     MEMORY_CATEGORIES,
     AskMemoryRequest,
@@ -96,48 +96,10 @@ _extension_registry = ExtensionRegistry()
 # Connector vault (initialized in lifespan when connectors are enabled)
 _vault = None
 
-# Legacy lazy-init globals (kept for backward compat with old endpoints + tests)
-_memory = None
-_graphiti = None
-_bridge = None
+# Lazy AsyncMemory handle (only touched by _get_async_memory / shutdown). The
+# legacy REST routes no longer hold their own mem0/Graphiti handles: they go
+# through the shared MemoryService (``_service``) like every /v1 route.
 _async_memory = None
-_legacy_init_lock = threading.Lock()
-
-
-def _get_memory():
-    """Lazy-initialize mem0 Memory with Graphiti backend (legacy).
-
-    Thread-safe: uses double-checked locking to prevent concurrent initialization.
-    """
-    global _memory, _graphiti, _bridge
-    if _memory is None:
-        with _legacy_init_lock:
-            if _memory is None:
-                from mem0 import Memory
-
-                from memory.core import _memory_from_config
-
-                config = settings.get_mem0_config()
-                _memory = _memory_from_config(Memory, config)
-
-                if hasattr(_memory, "graph") and hasattr(_memory.graph, "graphiti"):
-                    _graphiti = _memory.graph.graphiti
-                    _bridge = _memory.graph._bridge
-
-    return _memory
-
-
-def _get_graphiti():
-    """Get the underlying Graphiti instance (legacy)."""
-    _get_memory()
-    return _graphiti
-
-
-def _run_on_bridge(coro):
-    """Run an async coroutine on the Graphiti adapter's event loop (legacy)."""
-    if _bridge is None:
-        raise HTTPException(status_code=503, detail="Graphiti bridge not initialized")
-    return _bridge.run(coro)
 
 
 def _get_async_memory():
@@ -418,42 +380,63 @@ async def health():
     return response_data
 
 
+def _reject_unsupported_entity_scope(agent_id: str | None, run_id: str | None, what: str) -> None:
+    """The shared service has no agent_id/run_id scoping for ``what``.
+
+    Ignoring the filter would silently widen the operation to the caller's
+    whole account (for a delete: wiping more than asked), so refuse instead.
+    """
+    if agent_id or run_id:
+        raise HTTPException(
+            status_code=400,
+            detail=f"agent_id/run_id scoping is not supported for {what}; use the /v1 API.",
+        )
+
+
 @app.post("/memories")
 async def add_memory(req: LegacyAddMemoryRequest, request: Request):
-    """Add a memory through mem0 (vector + graph). Legacy endpoint."""
-    m = _get_memory()
+    """Add memories from messages through the service write path. Legacy endpoint.
+
+    Same extraction + gates + namespaced graph groups as ``POST /v1/memories``
+    (``metadata`` is accepted for compatibility and ignored, as on
+    ``/memories/async``). Synchronous: returns the stored memories.
+    """
     user_id = _resolve_user_id(request, req.user_id)
     try:
-        result = await asyncio.to_thread(
-            m.add,
+        memories = await asyncio.to_thread(
+            _service.extract_and_store,
             messages=req.messages,
             user_id=user_id,
             agent_id=req.agent_id,
             run_id=req.run_id,
-            metadata=req.metadata,
         )
-        return {"status": "ok", "result": result}
-    except Exception as e:
+        return {
+            "status": "ok",
+            "result": {"memories": [m.model_dump(exclude_none=True) for m in memories]},
+        }
+    except HTTPException:
+        raise
+    except Exception:
         logger.exception("add_memory failed")
         raise HTTPException(status_code=500, detail="Memory storage failed")
 
 
 @app.post("/search")
 async def search_memories(req: LegacySearchRequest, request: Request):
-    """Search memories through mem0. Legacy endpoint."""
-    m = _get_memory()
+    """Search memories through the shared service. Legacy endpoint."""
     user_id = _resolve_user_id(request, req.user_id)
+    _reject_unsupported_entity_scope(req.agent_id, req.run_id, "search")
     try:
         result = await asyncio.to_thread(
-            m.search,
+            _service.search,
             query=req.query,
             user_id=user_id,
-            agent_id=req.agent_id,
-            run_id=req.run_id,
             limit=req.limit,
         )
         return {"status": "ok", "results": result}
-    except Exception as e:
+    except HTTPException:
+        raise
+    except Exception:
         logger.exception("search_memories failed")
         raise HTTPException(status_code=500, detail="Memory search failed")
 
@@ -467,18 +450,19 @@ async def list_memories(
     limit: int = Query(default=100),
 ):
     """List all memories for a user. Legacy endpoint."""
-    m = _get_memory()
     user_id = _resolve_user_id(request, user_id)
     try:
         result = await asyncio.to_thread(
-            m.get_all,
+            _service.list_memories,
             user_id=user_id,
+            limit=limit,
             agent_id=agent_id,
             run_id=run_id,
-            limit=limit,
         )
         return {"status": "ok", "memories": result}
-    except Exception as e:
+    except HTTPException:
+        raise
+    except Exception:
         logger.exception("list_memories failed")
         raise HTTPException(status_code=500, detail="Failed to list memories")
 
@@ -490,18 +474,27 @@ async def delete_memories(
     agent_id: str = Query(default=None),
     run_id: str = Query(default=None),
 ):
-    """Delete all memories for a user. Legacy endpoint."""
-    m = _get_memory()
+    """Delete the caller's memories, graph facts included. Legacy endpoint.
+
+    Same path as ``DELETE /v1/memories`` with no filters: the caller's private
+    writes go from the vector store AND the graph (provenance cascade); shared
+    memories they authored are preserved (use the v1 route's include_shared to
+    remove those too).
+    """
     user_id = _resolve_user_id(request, user_id)
+    _reject_unsupported_entity_scope(agent_id, run_id, "delete")
     try:
-        await asyncio.to_thread(
-            m.delete_all,
-            user_id=user_id,
-            agent_id=agent_id,
-            run_id=run_id,
-        )
-        return {"status": "ok", "message": "All memories deleted"}
-    except Exception as e:
+        result = await asyncio.to_thread(_service.delete_memories, user_id=user_id)
+        if "scroll failed" in (result.get("message") or ""):
+            # The service reports a failed listing as a message, not an
+            # exception; never answer 200 "ok" when nothing was deleted.
+            raise HTTPException(status_code=503, detail="Memories could not be listed; nothing was deleted. Retry.")
+        # Graph cleanup that could not be verified is a partial success.
+        status = "partial" if result.get("graph_cascade_unresolved_ids") else "ok"
+        return {"status": status, **result}
+    except HTTPException:
+        raise
+    except Exception:
         logger.exception("delete_memories failed")
         raise HTTPException(status_code=500, detail="Failed to delete memories")
 
@@ -515,6 +508,7 @@ async def add_memory_async(req: LegacyAddMemoryRequest, request: Request):
         user_id=user_id,
         agent_id=req.agent_id,
         run_id=req.run_id,
+        **_ledger_kwargs(request),
     )
     return TaskAcceptedResponse(
         task_id=task_id,
@@ -567,57 +561,16 @@ async def list_graph_nodes_legacy(
     limit: int = Query(default=50),
     include_expired: bool = Query(default=False),
 ):
-    """List entity nodes from Graphiti. Legacy endpoint.
-
-    Excludes nodes with no live connecting edges by default (see
-    memory/graph_admin.py::get_graph_nodes) — pass ``include_expired=true``
-    for an operator/debug view.
-    """
-    # Authorization before availability: a non-dictator asking for expired
-    # artifacts gets 403 even when the legacy Graphiti handle is unavailable.
-    group_id = _resolve_user_id(request, user_id)
-    _authorize_include_expired(group_id, include_expired)
-    g = _get_graphiti()
-    if g is None:
-        raise HTTPException(status_code=503, detail="Graphiti not initialized")
-
-    from graphiti_core.nodes import EntityNode
-    from memory.groups import _live_node_uuids
-    try:
-        nodes = await asyncio.to_thread(
-            _run_on_bridge,
-            EntityNode.get_by_group_ids(g.driver, group_ids=[group_id], limit=limit),
-        )
-        if not include_expired and nodes:
-            uuids = [n.uuid for n in nodes]
-            live = await asyncio.to_thread(
-                _live_node_uuids, _run_on_bridge, g.driver, uuids, [group_id]
-            )
-            if live is None:
-                logger.warning(
-                    "Legacy list_graph_nodes: liveness query failed, failing "
-                    "CLOSED to no nodes for group_id=%r", group_id,
-                )
-                nodes = []
-            else:
-                nodes = [n for n in nodes if n.uuid in live]
-        return {
-            "status": "ok",
-            "nodes": [
-                {
-                    "uuid": n.uuid,
-                    "name": n.name,
-                    "summary": n.summary,
-                    "labels": n.labels,
-                    "group_id": n.group_id,
-                    "created_at": n.created_at.isoformat(),
-                }
-                for n in nodes
-            ],
-        }
-    except Exception as e:
-        logger.warning("list_graph_nodes failed: %s", e)
-        return {"status": "ok", "nodes": []}
+    """List entity nodes from Graphiti. Legacy endpoint (same service path as v1)."""
+    resolved = _resolve_user_id(request, user_id)
+    _authorize_include_expired(resolved, include_expired)
+    nodes = await asyncio.to_thread(
+        _service.get_graph_nodes,
+        user_id=resolved,
+        limit=limit,
+        include_expired=include_expired,
+    )
+    return {"status": "ok", "nodes": nodes}
 
 
 @app.get("/graph/edges")
@@ -627,53 +580,16 @@ async def list_graph_edges_legacy(
     limit: int = Query(default=50),
     include_expired: bool = Query(default=False),
 ):
-    """List entity edges (facts) from Graphiti. Legacy endpoint.
-
-    Excludes soft-expired/invalidated edges by default (see
-    memory/graph_admin.py::get_graph_edges) — pass ``include_expired=true``
-    for an operator/debug view.
-    """
-    # Authorization before availability: a non-dictator asking for expired
-    # artifacts gets 403 even when the legacy Graphiti handle is unavailable.
-    group_id = _resolve_user_id(request, user_id)
-    _authorize_include_expired(group_id, include_expired)
-    g = _get_graphiti()
-    if g is None:
-        raise HTTPException(status_code=503, detail="Graphiti not initialized")
-
-    from graphiti_core.edges import EntityEdge
-    from graphiti_core.errors import GroupsEdgesNotFoundError
-    from memory.groups import _edge_is_invalidated
-    try:
-        edges = await asyncio.to_thread(
-            _run_on_bridge,
-            EntityEdge.get_by_group_ids(g.driver, group_ids=[group_id], limit=limit),
-        )
-        if not include_expired:
-            edges = [e for e in edges if not _edge_is_invalidated(e)]
-        return {
-            "status": "ok",
-            "edges": [
-                {
-                    "uuid": e.uuid,
-                    "name": e.name,
-                    "fact": e.fact,
-                    "source_node_uuid": e.source_node_uuid,
-                    "target_node_uuid": e.target_node_uuid,
-                    "group_id": e.group_id,
-                    "created_at": e.created_at.isoformat(),
-                    "valid_at": e.valid_at.isoformat() if e.valid_at else None,
-                    "invalid_at": e.invalid_at.isoformat() if e.invalid_at else None,
-                    "expired_at": e.expired_at.isoformat() if e.expired_at else None,
-                }
-                for e in edges
-            ],
-        }
-    except GroupsEdgesNotFoundError:
-        return {"status": "ok", "edges": []}
-    except Exception as e:
-        logger.warning("list_graph_edges failed: %s", e)
-        return {"status": "ok", "edges": []}
+    """List entity edges (facts) from Graphiti. Legacy endpoint (same service path as v1)."""
+    resolved = _resolve_user_id(request, user_id)
+    _authorize_include_expired(resolved, include_expired)
+    edges = await asyncio.to_thread(
+        _service.get_graph_edges,
+        user_id=resolved,
+        limit=limit,
+        include_expired=include_expired,
+    )
+    return {"status": "ok", "edges": edges}
 
 
 @app.get("/graph/episodes")
@@ -682,40 +598,12 @@ async def list_graph_episodes_legacy(
     user_id: str = Query(default=None),
     limit: int = Query(default=20),
 ):
-    """List episodic nodes from Graphiti. Legacy endpoint."""
-    g = _get_graphiti()
-    if g is None:
-        raise HTTPException(status_code=503, detail="Graphiti not initialized")
-
-    group_id = _resolve_user_id(request, user_id)
-    now = datetime.now(timezone.utc)
-    try:
-        episodes = await asyncio.to_thread(
-            _run_on_bridge,
-            g.retrieve_episodes(
-                reference_time=now,
-                last_n=limit,
-                group_ids=[group_id],
-            ),
-        )
-        return {
-            "status": "ok",
-            "episodes": [
-                {
-                    "uuid": ep.uuid,
-                    "name": ep.name,
-                    "content": ep.content,
-                    "source_description": ep.source_description,
-                    "group_id": ep.group_id,
-                    "created_at": ep.created_at.isoformat(),
-                    "valid_at": ep.valid_at.isoformat() if ep.valid_at else None,
-                }
-                for ep in episodes
-            ],
-        }
-    except Exception as e:
-        logger.warning("list_graph_episodes failed: %s", e)
-        return {"status": "ok", "episodes": []}
+    """List episodic nodes from Graphiti. Legacy endpoint (same service path as v1)."""
+    resolved = _resolve_user_id(request, user_id)
+    episodes = await asyncio.to_thread(
+        _service.get_graph_episodes, user_id=resolved, limit=limit
+    )
+    return {"status": "ok", "episodes": episodes}
 
 
 @app.get("/graph/communities")
@@ -724,92 +612,39 @@ async def list_graph_communities_legacy(
     user_id: str = Query(default=None),
     limit: int = Query(default=20),
 ):
-    """List community nodes from Graphiti. Legacy endpoint."""
-    g = _get_graphiti()
-    if g is None:
-        raise HTTPException(status_code=503, detail="Graphiti not initialized")
-
-    from graphiti_core.nodes import CommunityNode
-
-    group_id = _resolve_user_id(request, user_id)
-    try:
-        communities = await asyncio.to_thread(
-            _run_on_bridge,
-            CommunityNode.get_by_group_ids(g.driver, group_ids=[group_id], limit=limit),
-        )
-        return {
-            "status": "ok",
-            "communities": [
-                {
-                    "uuid": c.uuid,
-                    "name": c.name,
-                    "summary": c.summary if hasattr(c, "summary") else "",
-                    "group_id": c.group_id,
-                    "created_at": c.created_at.isoformat(),
-                }
-                for c in communities
-            ],
-        }
-    except Exception as e:
-        logger.warning("list_graph_communities failed: %s", e)
-        return {"status": "ok", "communities": []}
+    """List community nodes from Graphiti. Legacy endpoint (same service path as v1)."""
+    resolved = _resolve_user_id(request, user_id)
+    communities = await asyncio.to_thread(
+        _service.get_graph_communities, user_id=resolved, limit=limit
+    )
+    return {"status": "ok", "communities": communities}
 
 
 @app.post("/graph/search")
 async def advanced_graph_search_legacy(req: LegacyGraphSearchRequest, request: Request):
     """Advanced Graphiti search with configurable SearchConfig. Legacy endpoint."""
-    g = _get_graphiti()
-    if g is None:
-        raise HTTPException(status_code=503, detail="Graphiti not initialized")
-
-    from graphiti_core.search.search_config import SearchConfig
-    from graphiti_core.search.search_config_recipes import EDGE_HYBRID_SEARCH_RRF
-
-    group_id = _resolve_user_id(request, req.user_id)
-
+    resolved = _resolve_user_id(request, req.user_id)
     if req.search_config:
+        # The service falls back to the default recipe on a bad config; the
+        # legacy contract is a 400, so validate here first.
+        from graphiti_core.search.search_config import SearchConfig
+
         try:
-            config = SearchConfig(**req.search_config)
+            SearchConfig(**req.search_config)
         except (TypeError, ValueError) as e:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Invalid search_config: {e}",
-            )
-    else:
-        config = EDGE_HYBRID_SEARCH_RRF
-
-    config.limit = req.limit
-
+            raise HTTPException(status_code=400, detail=f"Invalid search_config: {e}")
     try:
         results = await asyncio.to_thread(
-            _run_on_bridge,
-            g.search_(
-                query=req.query,
-                config=config,
-                group_ids=[group_id],
-            ),
+            _service.search_graph,
+            query=req.query,
+            user_id=resolved,
+            limit=req.limit,
+            search_config=req.search_config,
         )
-
-        return {
-            "status": "ok",
-            "edges": [
-                {"uuid": e.uuid, "name": e.name, "fact": e.fact}
-                for e in results.edges
-            ],
-            "nodes": [
-                {"uuid": n.uuid, "name": n.name, "summary": n.summary}
-                for n in results.nodes
-            ],
-            "episodes": [
-                {"uuid": ep.uuid, "name": ep.name, "content": ep.content}
-                for ep in results.episodes
-            ],
-            "communities": [
-                {"uuid": c.uuid, "name": c.name}
-                for c in results.communities
-            ],
-        }
-    except Exception as e:
+        return {"status": "ok", **results}
+    except HTTPException:
+        raise
+    except Exception:
         logger.exception("graph search failed")
         raise HTTPException(status_code=500, detail="Graph search failed")
 
@@ -948,12 +783,19 @@ async def v1_store_raw_memory(req: RawMemoryRequest, request: Request):
     if "expires_at" in raw_kwargs and hasattr(raw_kwargs["expires_at"], "isoformat"):
         raw_kwargs["expires_at"] = raw_kwargs["expires_at"].isoformat()
 
+    if _durable():
+        # Durable path: an optional client idempotency key makes retries safe.
+        idempotency_key = _idempotency_key_from(request)
+        if idempotency_key is not None:
+            raw_kwargs["idempotency_key"] = idempotency_key
+
     try:
         task_id = await _task_manager.enqueue_raw(**raw_kwargs)
     except (ConnectionError, OSError) as e:
         logger.warning(f"Redis unavailable, falling back to sync store: {e}")
         # Sync path expects datetime, not ISO string
         sync_kwargs = dict(raw_kwargs)
+        sync_kwargs.pop("idempotency_key", None)
         if "expires_at" in sync_kwargs and isinstance(sync_kwargs["expires_at"], str):
             try:
                 sync_kwargs["expires_at"] = datetime.fromisoformat(
@@ -1896,9 +1738,20 @@ async def v1_register_connector(req: ConnectorConfigRequest, request: Request):
     disabled) a replacement may change the owner; the vault then starts a new
     instance with fresh sync state.
     """
+    from connectors.stdio_policy import ConnectorConfigError, validate_mcp_config
     from connectors.vault import ConnectorOwnedElsewhere
 
     vault = _require_vault()
+    if req.connector_type == "mcp":
+        try:
+            validate_mcp_config(req.config, settings.connector_stdio_commands_set())
+        except ConnectorConfigError as e:
+            # Ids only: never the command, args or env (they are caller-chosen).
+            logger.warning(
+                "MCP connector registration refused: connector_id=%s owner=%s",
+                req.connector_id, _resolve_user_id(request, None),
+            )
+            raise HTTPException(status_code=422, detail=str(e))
     resolved_user_id = _resolve_user_id(request, None)
     record = req.model_dump(mode="json", exclude_none=True)
     record["owner_user_id"] = resolved_user_id
@@ -1945,6 +1798,20 @@ async def v1_sync_connector(connector_id: str, request: Request):
     vault = _require_vault()
     caller = _resolve_user_id(request, None)
     rec = await _require_owned_connector(vault, connector_id, caller)
+    if _durable():
+        try:
+            task_id = await _task_manager.enqueue_connector_sync(
+                connector_id,
+                caller,
+                generation=rec.get("generation"),
+                record=rec,
+                idempotency_key=_idempotency_key_from(request),
+            )
+        except IdempotencyConflict as conflict:
+            raise HTTPException(
+                status_code=409, detail="Idempotency-Key was already used with a different request"
+            ) from conflict
+        return TaskAcceptedResponse(task_id=task_id, poll_url=f"/v1/memories/status/{task_id}")
     task_id = await _task_manager.enqueue_connector_sync(
         connector_id, user_id=caller, generation=rec.get("generation")
     )
@@ -2018,7 +1885,7 @@ async def v1_store_raw_batch(req: RawMemoryBatchRequest, request: Request):
             raise HTTPException(status_code=he.status_code, detail=f"Item {idx}: {he.detail}") from he
 
     try:
-        task_id = await _task_manager.enqueue_raw_batch(items=items_payload)
+        task_id = await _task_manager.enqueue_raw_batch(items=items_payload, **_ledger_kwargs(request))
     except (ConnectionError, OSError) as e:
         logger.warning(f"Redis unavailable, falling back to sync batch store: {e}")
         memories = await asyncio.to_thread(_service.store_raw_batch, items_payload)
@@ -2341,7 +2208,7 @@ async def v1_checkpoint(req: CheckpointRequest, request: Request):
         )
 
     try:
-        task_id = await _task_manager.enqueue_raw_batch(items=prepared["to_enqueue"])
+        task_id = await _task_manager.enqueue_raw_batch(items=prepared["to_enqueue"], **_ledger_kwargs(request))
     except (ConnectionError, OSError) as e:
         logger.warning(f"Redis unavailable, falling back to sync checkpoint store: {e}")
         await asyncio.to_thread(_service.store_raw_batch, prepared["to_enqueue"])
@@ -2993,6 +2860,39 @@ async def v1_get_reasoning_chain(
     return {"status": "ok", "chain": chain}
 
 
+def _idempotency_key_from(request: Request) -> str | None:
+    key = request.headers.get("Idempotency-Key")
+    if key is not None and (not key.strip() or len(key) > 200):
+        raise HTTPException(status_code=400, detail="Idempotency-Key must be 1-200 characters")
+    return key
+
+
+def _ledger_kwargs(request: Request) -> dict:
+    """``{"idempotency_key": ...}`` for the durable path when a client sent the header."""
+
+    if not _durable():
+        return {}
+    key = _idempotency_key_from(request)
+    return {} if key is None else {"idempotency_key": key}
+
+
+def _durable() -> bool:
+    """Whether a new write is accepted by the ledger (the cutover phase decides when it is enabled)."""
+
+    return bool(
+        settings.ledger_enabled
+        and getattr(_task_manager, "producer", None) is not None
+        and _task_manager._durable_route()
+    )
+
+
+@app.exception_handler(IdempotencyConflict)
+async def _idempotency_conflict_handler(request: Request, exc: IdempotencyConflict):
+    return JSONResponse(
+        status_code=409, content={"detail": "Idempotency-Key was already used with a different request"}
+    )
+
+
 @v1_router.patch("/memories/{memory_id}")
 @v1_router.put("/memories/{memory_id}")  # transitional alias for the old update route
 async def v1_patch_memory(memory_id: str, req: PatchMemoryRequest, request: Request):
@@ -3043,12 +2943,22 @@ async def v1_patch_memory(memory_id: str, req: PatchMemoryRequest, request: Requ
             graph = "enqueue_failed"
 
     mem = result.get("memory")
-    return {
+    response = {
         "status": "ok",
         "memory": mem.model_dump(exclude_none=True) if mem is not None else None,
         "graph": graph,
         "graph_task_id": graph_task_id,
     }
+    sibling_jobs = result.get("sibling_graph_jobs") or []
+    if sibling_jobs or result.get("sibling_graph_unrepaired_ids"):
+        # A partition migration expired the moved fact's whole conversation
+        # episode; re-ingest the surviving sibling facts (additive keys).
+        queued = await _enqueue_graph_jobs_safe(sibling_jobs) if sibling_jobs else {}
+        response["sibling_graph_jobs_enqueued"] = queued.get("graph_jobs_enqueued", 0)
+        response["sibling_graph_jobs_not_enqueued_ids"] = queued.get("graph_jobs_not_enqueued_ids", [])
+        response["sibling_graph_unrepaired_ids"] = result.get("sibling_graph_unrepaired_ids", [])
+        response["sibling_graph_repair_failed"] = bool(result.get("sibling_graph_repair_failed"))
+    return response
 
 
 @v1_router.post("/memories/retag", status_code=202)
@@ -3072,7 +2982,7 @@ async def v1_retag_memories(req: RetagRequest, request: Request):
         return JSONResponse(status_code=200, content=result)
 
     try:
-        task_id = await _task_manager.enqueue_retag(caller, filters, ops)
+        task_id = await _task_manager.enqueue_retag(caller, filters, ops, **_ledger_kwargs(request))
     except (ConnectionError, OSError) as e:
         if "set_project_id" in ops:
             # A project change migrates graph partitions, which needs the graph
@@ -3083,7 +2993,11 @@ async def v1_retag_memories(req: RetagRequest, request: Request):
             ) from e
         logger.warning(f"Redis unavailable, running retag synchronously: {e}")
         result = await asyncio.to_thread(_service.retag_memories, caller, filters, ops, False)
-        result.pop("graph_jobs", None)
+        # No queue: the re-ingests (moved rows + sibling facts) cannot run
+        # now — report which memories still need one instead of dropping them.
+        result["graph_jobs_not_enqueued_ids"] = [
+            j.get("memory_id") for j in result.pop("graph_jobs", [])
+        ]
         return JSONResponse(status_code=200, content=result)
 
     return TaskAcceptedResponse(
@@ -3101,12 +3015,45 @@ async def v1_delete_memory(memory_id: str, request: Request):
     """
     caller = _resolve_user_id(request, None)
     try:
-        return await asyncio.to_thread(_service.delete_memory, memory_id, caller)
+        result = await asyncio.to_thread(_service.delete_memory, memory_id, caller)
     except PermissionError as pe:
         raise HTTPException(status_code=403, detail=str(pe)) from pe
+    except LookupError as le:
+        raise HTTPException(status_code=404, detail="Memory not found") from le
     except Exception:
         logger.exception("v1 delete_memory failed")
         raise HTTPException(status_code=500, detail="Failed to delete memory")
+    return await _enqueue_sibling_graph_jobs(result)
+
+
+async def _enqueue_graph_jobs_safe(jobs: list[dict]) -> dict:
+    """Enqueue sibling re-enrichment jobs; never raises (the delete/edit that
+    produced them has already succeeded). Returns enqueued count + the memory
+    ids whose re-ingest was NOT queued (e.g. Redis down)."""
+    try:
+        return await _task_manager.enqueue_graph_jobs(jobs)
+    except Exception as e:
+        logger.warning(f"Sibling graph re-enrichment could not be queued (non-critical): {e}")
+        return {
+            "graph_jobs_enqueued": 0,
+            "graph_jobs_not_enqueued_ids": [j.get("memory_id") for j in jobs],
+        }
+
+
+async def _enqueue_sibling_graph_jobs(result):
+    """Enqueue the sibling re-enrichment jobs a delete produced.
+
+    Deleting a fact that shared a conversation's graph episode expires the
+    whole episode; the surviving siblings come back as ``graph_jobs`` and are
+    re-ingested on the graph queue. The (potentially large) job payloads are
+    replaced by counts in the response.
+    """
+    if not isinstance(result, dict):
+        return result
+    jobs = result.pop("graph_jobs", None)
+    if jobs:
+        result.update(await _enqueue_graph_jobs_safe(jobs))
+    return result
 
 
 @v1_router.delete("/memories")
@@ -3114,7 +3061,7 @@ async def v1_bulk_delete_memories(req: BulkDeleteRequest, request: Request):
     """Bulk delete memories with filters."""
     user_id = _resolve_user_id(request, req.user_id)
     try:
-        return await asyncio.to_thread(
+        result = await asyncio.to_thread(
             _service.delete_memories,
             user_id=user_id,
             scope=req.scope,
@@ -3128,6 +3075,7 @@ async def v1_bulk_delete_memories(req: BulkDeleteRequest, request: Request):
     except Exception as e:
         logger.exception("v1 bulk_delete failed")
         raise HTTPException(status_code=500, detail="Failed to delete memories")
+    return await _enqueue_sibling_graph_jobs(result)
 
 
 @v1_router.get("/categories", response_model=CategoryListResponse)
