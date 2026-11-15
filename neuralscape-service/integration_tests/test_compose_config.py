@@ -79,6 +79,8 @@ def project(tmp_path_factory) -> Path:
     directory = tmp_path_factory.mktemp("compose-config")
     for name in (*COMPOSE_FILES, "Caddyfile"):
         shutil.copy(REPO_ROOT / name, directory / name)
+    (directory / "ops").mkdir()
+    shutil.copy(REPO_ROOT / "ops" / "docker-socket-proxy.haproxy.cfg", directory / "ops")
     (directory / ".env").write_text("GOOGLE_API_KEY=dummy\nNEURALSCAPE_AUTH_DISABLED=true\n", encoding="utf-8")
     return directory
 

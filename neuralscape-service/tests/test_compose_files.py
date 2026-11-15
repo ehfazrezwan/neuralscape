@@ -417,14 +417,6 @@ def test_resolver_timeout_uses_the_name_the_resolver_reads() -> None:
 # ── autoheal and the Docker socket ──────────────────────────────────
 
 _SOCKET = "/var/run/docker.sock"
-# docker-socket-proxy sections that must stay off (exec/images/volumes/... are how
-# a container with the socket becomes root on the host).
-_PROXY_FORBIDDEN = (
-    "AUTH", "BUILD", "COMMIT", "CONFIGS", "DISTRIBUTION", "EXEC", "GRPC", "IMAGES", "INFO", "NETWORKS", "NODES",
-    "PLUGINS", "SECRETS", "SERVICES", "SESSION", "SWARM", "SYSTEM", "TASKS", "VOLUMES",
-)
-
-
 def _mounts_socket(svc: dict) -> bool:
     return any(_SOCKET in str(v) for v in svc.get("volumes", []))
 
@@ -457,15 +449,25 @@ def test_autoheal_talks_to_the_proxy_over_an_internal_network() -> None:
     assert sorted(members) == ["autoheal", "docker-socket-proxy"]
 
 
-def test_socket_proxy_allows_only_container_list_and_restart() -> None:
+def test_socket_proxy_config_allows_only_container_list_and_restart() -> None:
     if not _have_repo():
         return
-    env = _services(BASE)["docker-socket-proxy"]["environment"]
-    assert env["CONTAINERS"] == "1" and env["ALLOW_RESTARTS"] == "1"
-    for section in _PROXY_FORBIDDEN:
-        assert str(env.get(section, "0")) in {"0", ""}, f"socket proxy must not enable {section}"
-    # `POST` gates every non-GET method in the proxy; restart needs it.
-    assert env["POST"] == "1"
+    proxy = _services(BASE)["docker-socket-proxy"]
+    mount = "./ops/docker-socket-proxy.haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg.template:ro"
+    assert mount in proxy["volumes"]
+    # No env switch may re-open API sections: the custom config ignores them, but a
+    # reader must not be misled into thinking CONTAINERS/POST/EXEC are in play.
+    assert set(proxy["environment"]) == {"DISABLE_IPV6"}
+    cfg = (REPO_ROOT / "ops" / "docker-socket-proxy.haproxy.cfg").read_text(encoding="utf-8")
+    rules = [line.strip() for line in cfg.splitlines() if line.strip().startswith("http-request")]
+    assert len(rules) == 3, rules
+    assert rules[0].startswith("http-request allow if METH_GET") and rules[0].endswith("/containers/json$ }")
+    assert rules[1].startswith("http-request allow if METH_POST") and rules[1].endswith("/restart$ }")
+    assert rules[2] == "http-request deny", "the last rule must deny everything not allowed above"
+    assert "env(" not in cfg.split("frontend dockerfrontend", 1)[1]
+    assert "${BIND_CONFIG}" in cfg and "bind" in cfg, "the image seds BIND_CONFIG into the bind line"
+    for forbidden in ("exec", "create", "/start", "images", "volumes", "events"):
+        assert not any(forbidden in rule for rule in rules[:2]), forbidden
 
 
 # ── Dockerfile ──────────────────────────────────────────────────────

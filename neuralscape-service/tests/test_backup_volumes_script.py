@@ -43,13 +43,17 @@ case "$cmd" in
   exec)                                      # exec -T redis redis-cli <ARGS>
     shift 3
     case "$1" in
-      LASTSAVE) cat "$STUB_DIR/lastsave" 2>/dev/null || echo 100 ;;
-      BGSAVE) echo 101 > "$STUB_DIR/lastsave"; echo "Background saving started" ;;
-      INFO) printf 'rdb_bgsave_in_progress:0\r\nrdb_last_bgsave_status:ok\r\n' ;;
+      LASTSAVE) echo 100 ;;                  # frozen: a LASTSAVE-based wait would hang
+      BGSAVE) echo 2 > "$STUB_DIR/bgsave_polls"; echo "Background saving started" ;;
+      INFO)                                  # in progress for the first poll(s), then done
+        n="$(cat "$STUB_DIR/bgsave_polls" 2>/dev/null || echo 0)"
+        if [ "$n" -gt 0 ]; then echo $((n - 1)) > "$STUB_DIR/bgsave_polls"; flag=1; else flag=0; fi
+        printf 'rdb_bgsave_in_progress:%s\r\nrdb_last_bgsave_status:%s\r\n' "$flag" "${STUB_BGSAVE_STATUS:-ok}" ;;
     esac ;;
   cp)                                        # cp redis:/data/dump.rdb <dest>
     printf 'RDB-BYTES' > "$2" ;;
   stop) ;;
+  start) ;;
   up) ;;
   run)
     args=("$@")
@@ -268,3 +272,85 @@ def test_a_failed_run_never_prunes_good_backups(tmp_path: Path) -> None:
     result, _ = _run(tmp_path, "--keep", "1", env={"STUB_FAIL_DUMP": "1"})
     assert result.returncode != 0
     assert _complete(dest) == ["ns-backup-20200101T000000Z"]
+
+
+# ── redis wait, lock, quiesce ───────────────────────────────────────
+
+
+def test_redis_wait_polls_info_persistence_not_lastsave(tmp_path: Path) -> None:
+    if not SCRIPT.is_file():
+        return
+    _, stub = _ok(tmp_path)
+    calls = _calls(stub)
+    assert not any("LASTSAVE" in c for c in calls), "LASTSAVE has 1 s resolution: poll INFO persistence"
+    assert sum("INFO persistence" in c for c in calls) >= 2, "must keep polling while the save is in progress"
+    assert _index(calls, "BGSAVE") < _index(calls, "INFO persistence") < _index(calls, "cp redis:/data/dump.rdb")
+
+
+def test_a_failed_bgsave_fails_the_backup(tmp_path: Path) -> None:
+    if not SCRIPT.is_file():
+        return
+    result, stub = _run(tmp_path, env={"STUB_BGSAVE_STATUS": "err"})
+    assert result.returncode != 0 and "BGSAVE" in result.stderr
+    assert _complete(tmp_path / "backups") == []
+    assert not any("stop neo4j" in c for c in _calls(stub))
+
+
+def test_a_running_backup_blocks_a_second_one(tmp_path: Path) -> None:
+    if not SCRIPT.is_file():
+        return
+    lock = tmp_path / "backups" / ".backup.lock"
+    lock.mkdir(parents=True)
+    (lock / "pid").write_text(str(os.getpid()))  # this test process is alive
+    result, stub = _run(tmp_path)
+    assert result.returncode != 0 and "another backup" in result.stderr
+    assert _calls(stub) == [], "a blocked run must not touch docker"
+    assert lock.exists(), "the other run's lock must be left alone"
+
+
+def test_a_stale_lock_is_taken_over_and_the_lock_is_always_released(tmp_path: Path) -> None:
+    if not SCRIPT.is_file():
+        return
+    dead = subprocess.Popen(["true"])
+    dead.wait()
+    lock = tmp_path / "backups" / ".backup.lock"
+    lock.mkdir(parents=True)
+    (lock / "pid").write_text(str(dead.pid))
+    result, _ = _ok(tmp_path)
+    assert "stale lock" in result.stderr
+    assert not lock.exists(), "lock must be released after a successful run"
+    failed, _ = _run(tmp_path, env={"STUB_FAIL_DUMP": "1"})
+    assert failed.returncode != 0
+    assert not lock.exists(), "lock must be released after a failed run"
+
+
+def test_quiesce_stops_the_app_around_the_run_and_restarts_it_even_on_failure(tmp_path: Path) -> None:
+    if not SCRIPT.is_file():
+        return
+    apps = "neuralscape neuralscape-worker neuralscape-graph-worker neuralscape-ingest-worker"
+    _, stub = _ok(tmp_path, "--quiesce")
+    calls = _calls(stub)
+    assert f"stop {apps}" in calls and f"start {apps}" in calls
+    assert _index(calls, f"stop {apps}") < _index(calls, "BGSAVE")
+    assert _index(calls, "stop neo4j") < _index(calls, f"start {apps}")
+    assert _index(calls, "up -d --no-deps --wait") < _index(calls, f"start {apps}")
+
+    other = tmp_path / "second"
+    other.mkdir()
+    failed, stub2 = _run(other, "--quiesce", env={"STUB_FAIL_DUMP": "1"})
+    assert failed.returncode != 0
+    assert f"start {apps}" in _calls(stub2), "apps must come back after a failed run"
+
+
+def test_without_quiesce_the_app_is_left_running(tmp_path: Path) -> None:
+    if not SCRIPT.is_file():
+        return
+    _, stub = _ok(tmp_path)
+    assert not any(c.startswith(("stop neuralscape", "start neuralscape")) for c in _calls(stub))
+
+
+def test_usage_states_what_consistency_means() -> None:
+    if not SCRIPT.is_file():
+        return
+    text = subprocess.run(["bash", str(SCRIPT), "--help"], capture_output=True, text=True, check=False).stdout
+    assert "--quiesce" in text and "NOT as of one instant" in text

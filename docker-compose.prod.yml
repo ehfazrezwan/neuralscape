@@ -9,6 +9,8 @@
 # Add `-f docker-compose.deploy.yml` (and NS_IMAGE=...) to run a prebuilt image.
 # Copy .env.production to .env first; DOMAIN, NEO4J_PASSWORD and REDIS_PASSWORD
 # are required and compose refuses to start without them.
+# REDIS_PASSWORD is placed inside REDIS_URL unencoded, so it must be URL-safe
+# (letters and digits, e.g. `openssl rand -hex 24`); characters such as @ : / # break the URL.
 services:
   neo4j:
     ports: !override []

@@ -575,28 +575,28 @@ services:
 
   # ── Docker socket proxy (for autoheal) ──────────────────────────
   # The only container that touches /var/run/docker.sock. autoheal needs exactly
-  # two calls: GET /containers/json (list unhealthy) and POST /containers/<id>/restart.
-  # Everything else is denied by the proxy: no exec, images, volumes, networks,
-  # build, swarm, secrets, system. Caveat: the proxy has no per-path POST switch,
-  # so POST=1 (needed for restart) also lets a caller POST /containers/create; the
-  # blast radius is therefore "autoheal or anything on autoheal-net", an internal
-  # network with no other member and no route out. Not published on any host port.
-  # Pinned to v0.5.0 by digest; bump deliberately.
+  # two calls, and ops/docker-socket-proxy.haproxy.cfg (mounted over the image's
+  # config) allows only those: GET /containers/json and POST /containers/<id>/restart.
+  # Everything else, including container create/start, exec, images, volumes and
+  # networks, hits the final deny. (The stock env switches could not do this: with
+  # CONTAINERS=1 + POST=1 every container POST, create and start included, is
+  # allowed, which would be root on the host for anything that can reach the proxy.)
+  # Residual risk: the socket is still mounted here, so a bug in HAProxy or in this
+  # config is a Docker-API escape; the proxy listens only on autoheal-net, an
+  # internal network whose only other member is autoheal, with no route out and no
+  # published port. The mount is :ro, which does not restrict API calls on a socket.
+  # Pinned to v0.5.0 by digest; bump deliberately and re-diff the config's
+  # global/defaults sections against the new upstream haproxy.cfg.
   docker-socket-proxy:
     image: tecnativa/docker-socket-proxy:v0.5.0@sha256:1f5038b54f06c3e18422902cf00ba21803d1c97805aae032e5e6673d532d3459
     restart: unless-stopped
     networks:
       - autoheal-net
     environment:
-      CONTAINERS: "1"        # GET /containers/* (list + inspect)
-      ALLOW_RESTARTS: "1"    # POST /containers/<id>/restart (and stop, kill)
-      POST: "1"              # required by the proxy for any non-GET method
       DISABLE_IPV6: "1"      # bind :2375 on IPv4 only (works on hosts without IPv6)
-      EVENTS: "0"
-      PING: "0"
-      VERSION: "0"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./ops/docker-socket-proxy.haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg.template:ro
     deploy:
       resources:
         limits:

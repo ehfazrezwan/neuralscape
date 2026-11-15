@@ -10,6 +10,10 @@
 #   -p, --project NAME    compose project name (default: compose's own default)
 #       --db NAME         Neo4j database to dump (default: $NEO4J_DATABASE or memory)
 #       --skip LIST       comma list of parts to skip: neo4j,qdrant,redis,files
+#       --quiesce         stop the API and all three workers for the whole run and
+#                         start them again on exit (also on failure). Without it
+#                         the parts are taken one after another, each consistent
+#                         on its own, but NOT as of one instant across stores.
 #   -h, --help            this text
 #
 # What each persistent volume gets (compose volume -> method):
@@ -29,6 +33,12 @@
 #                  missing from it (the originals are also kept in the vector store).
 # Not covered: the Obsidian vault bind mount (a host directory, OBSIDIAN_VAULT_PATH):
 # back it up with your normal host tooling.
+#
+# Consistency: each store is internally consistent (offline dump, Qdrant snapshot,
+# Redis BGSAVE, tar). They are taken minutes apart, so with the app running a write
+# can land in one store's copy and not another's. For a cross-store point in time use
+# --quiesce (the app is unavailable while it runs); without it, pick a quiet hour.
+# Only one run per DEST at a time (a lock directory in DEST refuses a second).
 #
 # Output: DEST/ns-backup-<UTC stamp>/{neo4j,qdrant,redis,files}/ + MANIFEST.txt +
 # SHA256SUMS. It is built in ns-backup-<stamp>.partial and renamed only when every
@@ -68,6 +78,7 @@ KEEP=7
 PROJECT=""
 DB="${NEO4J_DATABASE:-memory}"
 SKIP=""
+QUIESCE=0
 FILES=()
 
 usage() { sed -n '2,/^# Test a restore/p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
@@ -82,6 +93,7 @@ while [ $# -gt 0 ]; do
     -p|--project) PROJECT="${2:?--project needs a name}"; shift 2 ;;
     --db) DB="${2:?--db needs a name}"; shift 2 ;;
     --skip) SKIP="${2:?--skip needs a list}"; shift 2 ;;
+    --quiesce) QUIESCE=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) die "unknown option: $1 (see --help)" ;;
   esac
@@ -110,21 +122,48 @@ DEST="$(cd "$DEST" && pwd)"
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 FINAL="$DEST/ns-backup-$STAMP"
 WORK="$FINAL.partial"
-[ ! -e "$FINAL" ] && [ ! -e "$WORK" ] || die "$FINAL already exists; wait a second and retry"
-mkdir -p "$WORK"
 
+
+LOCK="$DEST/.backup.lock"
+LOCK_HELD=0
 NEO4J_DOWN=0
+APP_STOPPED=()
+APP_SERVICES=(neuralscape neuralscape-worker neuralscape-graph-worker neuralscape-ingest-worker)
 cleanup() {
   status=$?
   if [ "$NEO4J_DOWN" = 1 ]; then
     log "restarting neo4j"
     dc up -d --no-deps --wait --wait-timeout 300 neo4j >&2 || log "WARNING: neo4j did not come back; start it by hand: docker compose start neo4j"
   fi
+  if [ "${#APP_STOPPED[@]}" -gt 0 ]; then
+    log "starting ${APP_STOPPED[*]}"
+    dc start "${APP_STOPPED[@]}" >&2 || log "WARNING: app services did not all start; run: docker compose start ${APP_STOPPED[*]}"
+  fi
+  if [ "$LOCK_HELD" = 1 ]; then rm -rf -- "$LOCK"; fi
   if [ "$status" -ne 0 ]; then
-    log "FAILED (exit $status); partial output left in $WORK and NOT counted as a backup"
+    if [ -d "$WORK" ]; then log "FAILED (exit $status); partial output left in $WORK and NOT counted as a backup"; else log "FAILED (exit $status)"; fi
   fi
 }
 trap cleanup EXIT
+
+# One run at a time per DEST: two runs would both stop neo4j and race on the dump.
+acquire_lock() {
+  if mkdir "$LOCK" 2>/dev/null; then
+    echo $$ > "$LOCK/pid"; LOCK_HELD=1; return 0
+  fi
+  other="$(cat "$LOCK/pid" 2>/dev/null || true)"
+  if [ -n "$other" ] && kill -0 "$other" 2>/dev/null; then
+    die "another backup (pid $other) is running against $DEST; lock: $LOCK"
+  fi
+  log "removing stale lock (pid ${other:-unknown} is gone)"
+  rm -rf -- "$LOCK"
+  mkdir "$LOCK" 2>/dev/null || die "could not take the lock $LOCK"
+  echo $$ > "$LOCK/pid"; LOCK_HELD=1
+}
+acquire_lock
+
+[ ! -e "$FINAL" ] && [ ! -e "$WORK" ] || die "$FINAL already exists; wait a second and retry"
+mkdir -p "$WORK"
 
 # Containers that the parts below talk to must be running (neo4j may be stopped:
 # it is stopped for the dump anyway, but then the dump has nothing recent to read).
@@ -134,6 +173,14 @@ for svc in redis qdrant neo4j; do
   running "$svc" || die "service '$svc' is not running in this compose project (use --skip $svc to leave it out)"
 done
 
+if [ "$QUIESCE" = 1 ]; then
+  log "quiesce: stopping ${APP_SERVICES[*]}"
+  for svc in "${APP_SERVICES[@]}"; do
+    if running "$svc"; then APP_STOPPED+=("$svc"); fi
+  done
+  [ "${#APP_STOPPED[@]}" -eq 0 ] || dc stop "${APP_STOPPED[@]}" >&2
+fi
+
 PARTS=()
 
 # ── Redis: BGSAVE, wait, copy ───────────────────────────────────────
@@ -141,22 +188,31 @@ if ! skipped redis; then
   log "redis: BGSAVE"
   mkdir -p "$WORK/redis"
   rcli() { dc exec -T redis redis-cli "$@" | tr -d '\r'; }
-  before="$(rcli LASTSAVE)"
-  out="$(rcli BGSAVE || true)"
-  case "$out" in
-    *"Background saving started"*|*"already in progress"*|*"scheduled"*) ;;
-    *) die "redis BGSAVE refused: $out" ;;
-  esac
-  for _ in $(seq 1 120); do
+  # LASTSAVE has 1 s resolution (a save right after the previous one looks like no
+  # save), so watch INFO persistence instead: BGSAVE sets rdb_bgsave_in_progress:1
+  # before it replies, and 0 with status ok means that save is finished.
+  started=0
+  for _ in $(seq 1 60); do
+    out="$(rcli BGSAVE || true)"
+    case "$out" in
+      *"Background saving started"*) started=1; break ;;
+      *"already in progress"*|*"scheduled"*)
+        for _ in $(seq 1 120); do
+          rcli INFO persistence | grep -q '^rdb_bgsave_in_progress:1' || break
+          sleep 1
+        done ;;
+      *) die "redis BGSAVE refused: $out" ;;
+    esac
+  done
+  [ "$started" = 1 ] || die "redis BGSAVE could not be started"
+  done_ok=0
+  for _ in $(seq 1 600); do
     info="$(rcli INFO persistence)"
-    last="$(rcli LASTSAVE)"
-    if [ "$last" != "$before" ] && ! grep -q '^rdb_bgsave_in_progress:1' <<<"$info"; then
-      grep -q '^rdb_last_bgsave_status:ok' <<<"$info" || die "redis BGSAVE finished with an error"
-      break
-    fi
+    if ! grep -q '^rdb_bgsave_in_progress:1' <<<"$info"; then done_ok=1; break; fi
     sleep 1
   done
-  [ "$(rcli LASTSAVE)" != "$before" ] || die "redis BGSAVE did not finish within 120s"
+  [ "$done_ok" = 1 ] || die "redis BGSAVE did not finish within 600s"
+  grep -q '^rdb_last_bgsave_status:ok' <<<"$info" || die "redis BGSAVE finished with an error"
   dc cp redis:/data/dump.rdb "$WORK/redis/dump.rdb"
   [ -s "$WORK/redis/dump.rdb" ] || die "redis dump.rdb is empty"
   PARTS+=(redis)
