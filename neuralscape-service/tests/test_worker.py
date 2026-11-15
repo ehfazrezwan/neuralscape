@@ -252,13 +252,27 @@ class TestProcessMemoryRaw:
 
     @pytest.mark.asyncio
     async def test_skips_graph_enrichment_on_dedup(self, ctx):
-        """A content-hash dedup hit (created=False) must NOT re-enqueue enrichment."""
+        """A content-hash dedup hit (created=False) must NOT re-enqueue enrichment
+        (flag off: the stale-graph check is part of GRAPH_SUPERSESSION_ENABLED)."""
         ctx["service"].store_raw.return_value = (
             [MemoryResponse(id="existing", memory="x")],
             False,
         )
         await worker.process_memory_raw(ctx, content="x", user_id="ehfaz", category="preference")
         ctx["redis"].enqueue_job.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_flag_on_dedup_hit_queues_only_the_stale_check(self, ctx, monkeypatch):
+        monkeypatch.setattr(worker.settings, "graph_supersession_enabled", True)
+        ctx["service"].store_raw.return_value = (
+            [MemoryResponse(id="existing", memory="x")],
+            False,
+        )
+        await worker.process_memory_raw(ctx, content="x", user_id="ehfaz", category="preference")
+        ctx["redis"].enqueue_job.assert_awaited_once()
+        args = ctx["redis"].enqueue_job.await_args.args
+        assert args[0] == "process_graph_enrichment" and args[1] == "existing"
+        assert args[8] is True  # only_if_stale
 
     @pytest.mark.asyncio
     async def test_falls_back_to_inline_enrichment_on_enqueue_failure(self, ctx):
@@ -507,7 +521,8 @@ class TestProcessMemoryRawBatch:
             {"content": "B", "user_id": "ehfaz", "category": "personal_fact"},
         ]
         result = await worker.process_memory_raw_batch(ctx, items)
-        ctx["service"].store_raw_batch.assert_called_once_with(items)
+        ctx["service"].store_raw_batch.assert_called_once()
+        assert ctx["service"].store_raw_batch.call_args.args[0] == items
         assert len(result["memories"]) == 2
 
     @pytest.mark.asyncio

@@ -19,13 +19,16 @@ Both counts include CI, bot and dependency-bump commits; they say "how stale", n
 
 ### 2.1 graphiti: small, fully marked
 
-`git diff 9cb6dc1b:graphiti_core HEAD:graphiti/graphiti_core` (`9cb6dc1b` is the squash of upstream `feafc422`, the last Graphiti sync) touched **3 files (+81 / -6 lines) as of 2026-11-16**; `scripts/upstream-patches.txt` is the authoritative patched-file list and supersedes this count:
+`git diff 9cb6dc1b:graphiti_core HEAD:graphiti/graphiti_core` (`9cb6dc1b` is the squash of upstream `feafc422`, the last Graphiti sync) touched **8 files** (7 patched, 1 NS-owned) once the fork-marker change (PR #475) landed; `scripts/upstream-patches.txt` is the authoritative patched-file list (a test re-derives the graphiti set from this diff) and supersedes this table:
 
 | File | What the delta does | Marker |
 |---|---|---|
-| `graphiti_core/llm_client/gemini_client.py` | default models changed to `gemini-3.1-flash-lite`, transient-error detection that walks the cause/context chain, output-token ceiling for that model, original error text preserved on re-raise, fallback-model failover on 503/overload | `NEURALSCAPE PATCH` (4 sites) |
-| `graphiti_core/llm_client/config.py` | adds `fallback_model` to `LLMConfig` | carried by the patch set; see 2.3 |
-| `graphiti_core/driver/neo4j_driver.py` | `kwargs.setdefault('database_', ...)` so queries run on the configured database | carried by the patch set; see 2.3 |
+| `graphiti_core/llm_client/gemini_client.py` | default models changed to `gemini-3.1-flash-lite`, transient-error detection that walks the cause/context chain, output-token ceiling for that model, original error text preserved on re-raise, fallback-model failover on 503/overload that passes the fallback model per call (`_generate_response(model_override=...)`, never mutating `self.model`), and a bounded Gemini HTTP timeout on the client | `NEURALSCAPE PATCH` (6 sites) |
+| `graphiti_core/llm_client/config.py` | adds `fallback_model` to `LLMConfig` and the `GEMINI_HTTP_TIMEOUT_MS = 60_000` constant (milliseconds) | `NEURALSCAPE PATCH` |
+| `graphiti_core/embedder/gemini.py`, `graphiti_core/cross_encoder/gemini_reranker_client.py` | `genai.Client(..., http_options=HttpOptions(timeout=GEMINI_HTTP_TIMEOUT_MS))` so a stalled call cannot hang a worker slot | `NEURALSCAPE PATCH` |
+| `graphiti_core/utils/maintenance/edge_operations.py`, `node_operations.py` | optional bounded-decision fast path behind `HYBRID_GRAPH_ENABLED` (PR #471) | `NEURALSCAPE PATCH` |
+| `graphiti_core/llm_client/hybrid_decision_client.py` | NS-only hybrid decision client (not upstream; listed `owned` in the manifest) | n/a |
+| `graphiti_core/driver/neo4j_driver.py` | `kwargs.setdefault('database_', ...)` so queries run on the configured database (upstream put it in `params`) | `NEURALSCAPE PATCH` |
 
 The saga lifecycle, `reference_time` edge field, extraction/dedup prompt patches and `summarize_sagas.py` that the 2026-06-22 edition listed are **not in the tree**: the April sync took upstream's own implementations, and the diff above proves it. There is no saga or prompt conflict cluster to resolve on a sync. `graphiti/` is pruned to `graphiti_core` plus packaging (`d3978abe`, 2026-07-05).
 
@@ -42,13 +45,13 @@ The saga lifecycle, `reference_time` edge field, extraction/dedup prompt patches
 | `mem0/mem0/graphs/configs.py` | `graphiti_llm_small_model` and related config fields for the Graphiti graph store |
 | `mem0/mem0/memory/graphiti_memory.py` | the adapter itself (above) |
 | `mem0/mem0/embeddings/openai.py`, `mem0/mem0/configs/embeddings/base.py` | `embedding_batch_size`: chunk size and per-item fallback for OpenAI-compatible endpoints that accept one input per request |
-| `mem0/mem0/utils/factory.py` | adds `GraphStoreFactory` (no inline marker; the whole class is NS) |
+| `mem0/mem0/utils/factory.py` | adds `GraphStoreFactory`, marked `NEURALSCAPE PATCH` above the class |
 
 - **Fork environment knob:** `GRAPHITI_BRIDGE_TIMEOUT_S` (documented in `.env.example`) bounds one `_AsyncBridge.run` call; default 960 s, above the 900 s graph/ingest worker `job_timeout`. Before the patch the wait was unbounded.
 
 ### 2.3 The authoritative list
 
-`scripts/upstream-patches.txt` is the list of patched files, and `scripts/check-upstream-patches.sh` fails a sync when a listed file loses its `NEURALSCAPE PATCH` marker (both arrive with the marker-enforcement change, PR #475). The tables above are the state when this report was written; if they disagree with that file, the file wins and this report is stale.
+`scripts/upstream-patches.txt` is the list of patched files, and `scripts/check-upstream-patches.sh` fails a sync when a listed file loses its `NEURALSCAPE PATCH` marker (PR #475). The manifest has two entry kinds: `patched` (upstream file we modified; must keep a marker) and `owned` (NS-only restored graph layer; must exist). The graphiti base (`9cb6dc1b`) and the mem0 base (`cd27fc57`, the `c9e8482a` sync; the upstream object itself is not in this repo, so the mem0 list is pinned) are recorded in its header and must be bumped after a sync. If the tables above disagree with the file, the file wins and this report is stale.
 
 ## 3. Upstream churn that mattered when last measured (2026-06-22, mem0 2.0.7 / graphiti 0.29.2)
 
