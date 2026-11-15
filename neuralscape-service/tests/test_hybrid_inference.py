@@ -109,6 +109,8 @@ def test_invalid_noul_scores_abstain(score):
 @pytest.mark.parametrize('mapping', [{'unfamiliar': 'preference'}, None])
 def test_okf_category_path_uses_jev_or_original_fallback(monkeypatch, mapping):
     from ingest.okf_bundle import OkfConcept, resolve_categories
+    # Jev is consulted only with JEV_CATEGORIES_ENABLED (flag off: see test_hybrid_flags_off).
+    monkeypatch.setattr(settings, 'jev_categories_enabled', True)
     monkeypatch.setattr(hybrid, 'classify_types', lambda _, **kwargs: mapping)
     concept = OkfConcept('id', 'id.md', {}, '', '', type_value='unfamiliar')
     fallback = Mock(return_value='{"mapping": {"unfamiliar": "preference"}}')
@@ -234,3 +236,20 @@ async def test_edge_maintenance_uses_decisions_and_fallback():
     llm.decision_client.resolve.return_value = None
     await resolve_extracted_edge(llm, edge, [candidate], [], None)
     llm.generate_response.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('task,context', [
+    # Non-JSON-serialisable candidate attributes: context building happens
+    # OUTSIDE ask(), so before the fix this escaped into the graph write.
+    ('nodes', {'extracted_nodes': [{'id': 0, 'name': 'A'}],
+               'existing_nodes': [{'candidate_id': 0, 'name': 'B', 'seen': {1, 2}}]}),
+    ('edges', {'new_edge': 'f', 'existing_edges': [{'fact': 'no idx key'}],
+               'edge_invalidation_candidates': []}),
+    ('nodes', {}),
+])
+async def test_resolve_never_raises_into_the_graph_write(task, context):
+    events = []
+    result = await JevDecisions('test', client=Mock(), telemetry=events.append).resolve(task, context)
+    assert result is None
+    assert events and events[-1]['fallback_reason'] in {'TypeError', 'KeyError'}

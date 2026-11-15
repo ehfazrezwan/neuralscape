@@ -245,8 +245,9 @@ def resolve_categories(
         else:
             concept.category = _DEFAULT_CATEGORY
 
+    jev_on = settings.jev_categories_enabled
     llm_mapping: dict[str, str] = {}
-    if unknown_types:
+    if unknown_types and jev_on:
         from hybrid_inference import classify_types
 
         mapping = classify_types(unknown_types[:50], categories=target_categories)
@@ -265,11 +266,14 @@ def resolve_categories(
             )
             mapping = parse_json_object(raw or "").get("mapping")
             if isinstance(mapping, dict):
-                unresolved = {t.strip().casefold() for t in unknown_types[:50]}
+                # Flag off: byte-identical to the original mapping handling.
+                # Flag on: normalised keys, restricted to still-unresolved types.
+                norm = (lambda s: s.strip().casefold()) if jev_on else (lambda s: s.casefold())
+                unresolved = {norm(t) for t in unknown_types[:50]}
                 llm_mapping.update({
-                    str(k).strip().casefold(): str(v)
+                    norm(str(k)): str(v)
                     for k, v in mapping.items()
-                    if str(v) in target_categories and str(k).strip().casefold() in unresolved
+                    if str(v) in target_categories and (not jev_on or norm(str(k)) in unresolved)
                 })
         except Exception:
             logger.warning("OKF type-mapping LLM fallback failed (non-fatal)", exc_info=True)
@@ -277,7 +281,10 @@ def resolve_categories(
     for concept in concepts:
         if concept.category is None:
             concept.category = (
-                llm_mapping.get((concept.type_value or "").strip().casefold()) or _DEFAULT_CATEGORY
+                llm_mapping.get(
+                    (concept.type_value or "").strip().casefold()
+                    if jev_on else (concept.type_value or "").casefold()
+                ) or _DEFAULT_CATEGORY
             )
 
 

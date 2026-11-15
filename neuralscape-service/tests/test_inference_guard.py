@@ -3,6 +3,8 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import Mock
 
+import pytest
+
 from inference_guard import InferenceGuard
 
 
@@ -109,3 +111,87 @@ def test_warmup_is_disabled_by_default_and_local_only(monkeypatch):
     tokenizer.assert_called_once_with()
     client.assert_called_once_with()
     client.return_value.post.assert_not_called()
+
+
+def test_concurrent_callers_never_exceed_capacity_and_every_caller_gets_a_clean_outcome():
+    """Hammer one guard from many threads: bounded in-flight work, no exceptions."""
+    capacity = 3
+    guard = InferenceGuard(capacity=capacity, failures=10 ** 6)
+    lock, running, peak, outcomes = threading.Lock(), [0], [0], []
+
+    def op():
+        with lock:
+            running[0] += 1
+            peak[0] = max(peak[0], running[0])
+        threading.Event().wait(.01)
+        with lock:
+            running[0] -= 1
+        return 'ok', False
+
+    try:
+        with ThreadPoolExecutor(max_workers=24) as pool:
+            for result in pool.map(lambda _: guard.run(op, timeout=2, emit=lambda e: None), range(200)):
+                outcomes.append(result)
+    finally:
+        guard.close()
+    assert peak[0] <= capacity
+    assert set(outcomes) <= {'ok', None} and 'ok' in outcomes
+
+
+def test_stale_epoch_success_cannot_close_a_circuit_a_probe_is_testing():
+    """A slow call admitted before the circuit opened must not reset it later."""
+    now, slow_started, release = [0], threading.Event(), threading.Event()
+    guard = InferenceGuard(capacity=4, failures=2, cooldown=10, clock=lambda: now[0])
+    try:
+        def slow():
+            slow_started.set()
+            release.wait(2)
+            return 'late-ok', False
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            slow_call = pool.submit(guard.run, slow, timeout=3, emit=lambda e: None)
+            assert slow_started.wait(1)
+            for _ in range(2):
+                guard.run(lambda: (None, True), timeout=1, emit=lambda e: None)
+            emit, unused = Mock(), Mock()
+            assert guard.run(unused, timeout=1, emit=emit) is None  # circuit is open
+            release.set()
+            assert slow_call.result() == 'late-ok'
+            # The old success must not have closed the circuit.
+            assert guard.run(unused, timeout=1, emit=emit) is None
+            unused.assert_not_called()
+            assert emit.call_args.args[0]['fallback_reason'] == 'circuit_open'
+    finally:
+        release.set()
+        guard.close()
+
+
+def test_failed_probe_reopens_for_a_full_cooldown():
+    now = [0]
+    guard = InferenceGuard(failures=1, cooldown=10, clock=lambda: now[0])
+    try:
+        guard.run(lambda: (None, True), timeout=1, emit=lambda e: None)
+        now[0] = 11
+        guard.run(lambda: (None, True), timeout=1, emit=lambda e: None)  # failed probe
+        now[0] = 15  # inside the NEW cooldown (opened at 11)
+        unused = Mock()
+        assert guard.run(unused, timeout=1, emit=lambda e: None) is None
+        unused.assert_not_called()
+        now[0] = 22
+        assert guard.run(lambda: ('ok', False), timeout=1, emit=lambda e: None) == 'ok'
+    finally:
+        guard.close()
+
+
+def test_operation_exceptions_count_as_failures_and_release_the_probe():
+    now = [0]
+    guard = InferenceGuard(failures=1, cooldown=1, clock=lambda: now[0])
+    try:
+        with pytest.raises(RuntimeError):
+            guard.run(Mock(side_effect=RuntimeError('boom')), timeout=1, emit=lambda e: None)
+        now[0] = 2
+        with pytest.raises(RuntimeError):  # probe raises: probe slot must be released
+            guard.run(Mock(side_effect=RuntimeError('boom')), timeout=1, emit=lambda e: None)
+        now[0] = 4
+        assert guard.run(lambda: ('ok', False), timeout=1, emit=lambda e: None) == 'ok'
+    finally:
+        guard.close()

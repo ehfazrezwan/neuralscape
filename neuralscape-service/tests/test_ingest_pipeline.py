@@ -60,7 +60,9 @@ def _doc(content, **over):
 
 
 class TestIngestDocument:
-    def test_fact_evidence_survives_ingest_without_extra_graph_jobs(self):
+    def test_fact_evidence_survives_ingest_without_extra_graph_jobs(self, monkeypatch):
+        from config import settings
+        monkeypatch.setattr(settings, 'jev_extraction_enabled', True)  # evidence is collected only when on
         fact = ('tech_stack', 'Project Cedar uses Redis.')
         # Pipeline forwards opaque validated evidence to the shared writer;
         # writer/reader validation is independently covered by its own tests.

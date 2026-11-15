@@ -412,8 +412,9 @@ async def _resolve_with_llm(
         ),
     }
 
-    # NS: capability-specific fast path. Never parse a rendered prompt back
-    # into data or route extraction/summarization through a classifier.
+    # NEURALSCAPE PATCH: optional bounded decision fast path (JEV_GRAPH_ENABLED).
+    # Never parse a rendered prompt back into data or route extraction/
+    # summarization through a classifier. None falls through to the original call.
     decisions = getattr(llm_client, 'decision_client', None)
     llm_response = await decisions.resolve('nodes', context) if decisions is not None else None
     if llm_response is None:

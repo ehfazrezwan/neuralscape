@@ -19,6 +19,8 @@ import httpx
 
 logger = logging.getLogger(__name__)
 Telemetry = Callable[[dict[str, Any]], None]
+# Module-level so a test can point the adapter at a local fake endpoint.
+JEV_ENDPOINT = 'https://api.typesafe.ai/v1/systemone'
 
 
 @lru_cache(maxsize=1)
@@ -107,7 +109,7 @@ class JevDecisions:
                     raise ValueError('choice_limit')
             event['attempted'] = True
             response = (self.client or _http_client()).post(
-                'https://api.typesafe.ai/v1/systemone', json=body,
+                JEV_ENDPOINT, json=body,
                 headers={'Authorization': f'Bearer {self._api_key}'},
                 timeout=httpx.Timeout(self.timeout, pool=min(.5, self.timeout)),
             )
@@ -170,6 +172,12 @@ class JevDecisions:
                                           timeout=self.timeout + .5)
         except TimeoutError:
             self.emit({'provider': 'jev', 'task': task, 'fallback_reason': 'deadline'})
+            return None
+        except Exception as exc:
+            # Context building (outside ask()) can raise on unexpected candidate
+            # shapes or non-JSON attributes. A graph write must never fail
+            # because the optional fast path did: abstain to the original LLM.
+            self.emit({'provider': 'jev', 'task': task, 'fallback_reason': type(exc).__name__})
             return None
 
     def resolve_sync(self, task: str, context: dict) -> dict | None:

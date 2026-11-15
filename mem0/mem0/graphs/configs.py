@@ -21,7 +21,8 @@ class GraphitiConfig(BaseModel):
     graphiti_embedder_model: Optional[str] = Field(default=None, description="Embedder model name")
     graphiti_embedder_api_key: Optional[str] = Field(default=None, description="Embedder API key")
     graphiti_reranker_provider: Optional[str] = Field(default=None, description="Reranker provider (gemini, openai, bge)")
-    # NS hybrid capability settings; generation and embeddings are unchanged.
+    # NEURALSCAPE PATCH: hybrid capability settings (all off by default);
+    # generation and embeddings are unchanged.
     graphiti_jev_enabled: bool = False
     graphiti_jev_api_key: str = Field(default="", repr=False)
     graphiti_jev_model: str = "jev-1.13.0"
