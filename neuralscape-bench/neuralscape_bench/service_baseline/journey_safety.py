@@ -17,6 +17,82 @@ class JourneySafetyError(RuntimeError):
     """A journey must not start or must not proceed."""
 
 
+# Every compose project the harness starts, stops or removes volumes of must carry this prefix. The
+# production project name is refused outright (empty and any letter case included) and anything
+# without the prefix is refused too, so `down -v` can only ever reach a disposable benchmark project.
+DISPOSABLE_PREFIX = "ns-bench-"
+PRODUCTION_PROJECT = "neuralscape"
+_NAME_CHARS = frozenset("abcdefghijklmnopqrstuvwxyz0123456789_-")
+
+
+def require_disposable_project(name: object) -> str:
+    """Return the project name when it is a disposable benchmark project, else refuse."""
+
+    if not isinstance(name, str) or not name.strip():
+        raise JourneySafetyError("refusing to run docker: the compose project name is empty")
+    if name.strip().casefold() == PRODUCTION_PROJECT:
+        raise JourneySafetyError(f"refusing to run docker: {name!r} is the production compose project")
+    if not name.startswith(DISPOSABLE_PREFIX) or len(name) == len(DISPOSABLE_PREFIX) or not set(name) <= _NAME_CHARS:
+        raise JourneySafetyError(
+            f"refusing to run docker: project {name!r} is not a disposable benchmark project "
+            f"(lower-case name starting with {DISPOSABLE_PREFIX!r})")
+    return name
+
+
+def require_disposable_volume(name: object, project: str) -> str:
+    """The sentinel volume the journey creates and removes must also be a benchmark-named volume."""
+
+    require_disposable_project(project)
+    if not isinstance(name, str) or not name.startswith(DISPOSABLE_PREFIX) or name == project + "_":
+        raise JourneySafetyError(f"refusing to remove volume {name!r}: not a disposable benchmark volume")
+    return name
+
+
+def local_only_violations(compose_text: str) -> list[str]:
+    """Lines of a compose file that would publish a port beyond loopback or reach the host's Docker/network.
+
+    The harness stacks publish nothing. Anything that is published must bind a loopback address.
+    """
+
+    loopback = ("127.0.0.1:", "[::1]:", "localhost:")
+    found: list[str] = []
+    in_ports = False
+    ports_indent = 0
+    for raw in compose_text.splitlines():
+        line = raw.split("#", 1)[0].rstrip()
+        if not line.strip():
+            continue
+        indent = len(line) - len(line.lstrip())
+        text = line.strip()
+        if in_ports and indent <= ports_indent and not text.startswith("-"):
+            in_ports = False
+        if text.startswith("ports:"):
+            in_ports, ports_indent = True, indent
+            if text != "ports:" and text != "ports: []":
+                found.append(text)
+            continue
+        if in_ports and text.startswith("-"):
+            entry = text[1:].strip().strip("\"'")
+            if not entry.startswith(loopback):
+                found.append(f"ports entry {entry!r} does not bind a loopback address")
+        elif in_ports and text.startswith(("published:", "target:", "host_ip:", "mode:", "protocol:")):
+            if text.startswith("host_ip:") and text.split(":", 1)[1].strip().strip("\"'") not in ("127.0.0.1", "::1"):
+                found.append(text)
+            elif text.startswith("published:"):
+                found.append("long-form published port: bind it with host_ip 127.0.0.1 in a short-form entry")
+        if text.replace(" ", "").startswith(("network_mode:host", "network_mode:\"host\"", "privileged:true", "pid:host")):
+            found.append(text)
+        if "docker.sock" in text:
+            found.append(text)
+    return found
+
+
+def require_local_only(compose_text: str, name: str = "compose file") -> None:
+    violations = local_only_violations(compose_text)
+    if violations:
+        raise JourneySafetyError(f"refusing to start: {name} is not loopback-only: {'; '.join(violations)}")
+
+
 def _lines(run: Run, *args: str) -> list[str]:
     return [line for line in run(*args).stdout.split() if line]
 
@@ -24,6 +100,7 @@ def _lines(run: Run, *args: str) -> list[str]:
 def leftovers(run: Run, project: str, sentinel: str) -> list[str]:
     """Names of anything an earlier journey with the same project name left behind."""
 
+    require_disposable_volume(sentinel, project)
     found: list[str] = []
     found += [f"container:{n}" for n in _lines(
         run, "docker", "ps", "-a", "--filter", f"label=com.docker.compose.project={project}", "--format", "{{.Names}}")]
@@ -48,6 +125,7 @@ def uninstall_report(before: Iterable[str], mid: Iterable[str], after: Iterable[
                      sentinel: str, mounted: Iterable[str]) -> dict[str, Any]:
     """Describe what `down -v` removed against the volumes that existed beforehand."""
 
+    require_disposable_volume(sentinel, project)
     before, mid, after, mounted = set(before), set(mid), set(after), set(mounted)
     removed = mid - after
     own = {v for v in mid if v.startswith(project + "_")}

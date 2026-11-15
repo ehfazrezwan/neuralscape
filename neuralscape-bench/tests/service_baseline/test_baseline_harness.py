@@ -122,9 +122,9 @@ def test_percentiles_only_reported_when_the_sample_supports_them():
 
 
 def test_docker_stats_parsing_and_peaks():
-    line = json.dumps({"Name": "ns-g-bench-api-1", "MemUsage": "525.9MiB / 3GiB", "CPUPerc": "12.50%"})
+    line = json.dumps({"Name": "ns-bench-baseline-api-1", "MemUsage": "525.9MiB / 3GiB", "CPUPerc": "12.50%"})
     parsed = parse_stats_line(line)
-    assert parsed == {"name": "ns-g-bench-api-1", "mem_bytes": int(525.9 * 2**20), "cpu_percent": 12.5}
+    assert parsed == {"name": "ns-bench-baseline-api-1", "mem_bytes": int(525.9 * 2**20), "cpu_percent": 12.5}
     assert parse_stats_line("garbage") is None
     assert parse_size("1.5GiB") == int(1.5 * 2**30)
     samples = [parsed, {**parsed, "mem_bytes": 1, "cpu_percent": 99.0}]
@@ -255,6 +255,12 @@ from pathlib import Path
 from neuralscape_bench.service_baseline import runner
 
 COMPOSE = Path(runner.COMPOSE_FILE)
+# The installed wheel carries the stack files next to the package; a source checkout has them under scripts/.
+_WHEEL_STACK = Path(runner.__file__).resolve().parent / "stack"
+
+
+def stack_file(name: str) -> Path:
+    return (_WHEEL_STACK if _WHEEL_STACK.is_dir() else COMPOSE.parent) / name
 
 
 def test_compose_argv_without_an_override_is_exactly_the_shipped_file():
@@ -299,7 +305,7 @@ def test_compose_runs_use_the_module_override(monkeypatch, tmp_path):
 
 
 def test_the_checked_in_override_makes_the_default_network_internal():
-    text = runner.NO_EGRESS_OVERRIDE.read_text()
+    text = stack_file(runner.NO_EGRESS_OVERRIDE.name).read_text()
     uncommented = "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("#"))
     assert uncommented.split() == ["networks:", "default:", "internal:", "true"]
 
@@ -315,7 +321,7 @@ def test_the_network_must_really_be_internal(monkeypatch, verdict, ok):
 
 
 def test_the_stack_switches_off_mem0_graphiti_and_qdrant_telemetry():
-    text = COMPOSE.read_text()
+    text = stack_file(COMPOSE.name).read_text()
     head = text.split("x-service-mounts:")[0]
     assert 'MEM0_TELEMETRY: "False"' in head and 'GRAPHITI_TELEMETRY_ENABLED: "false"' in head
     assert 'QDRANT__TELEMETRY_DISABLED: "true"' in text
@@ -326,5 +332,33 @@ def test_the_stack_switches_off_mem0_graphiti_and_qdrant_telemetry():
 
 
 def test_the_synthetic_provider_is_the_only_provider_in_the_stack():
-    text = COMPOSE.read_text()
+    text = stack_file(COMPOSE.name).read_text()
     assert "GOOGLE_API_KEY: fake-key" in text and "FAKE_GENAI_BASE_URL: http://fake-provider:8080" in text
+
+
+# ---- the runner builds a RunManifest that the current run_manifest module accepts
+
+
+def test_build_manifest_is_accepted_by_the_current_run_manifest_module():
+    from datetime import datetime, timedelta, timezone
+
+    from neuralscape_bench.run_manifest import RunState
+
+    results = {"cells": [
+        {"workload": "list", "concurrency": 4, "attempted": 20, "measured_attempts": 16, "warmup_excluded": 4,
+         "latency": {"n": 16}},
+        {"workload": "raw", "concurrency": 8, "attempted": 16, "measured_attempts": 16, "warmup_excluded": 0,
+         "accept": {"n": 15}, "completion": {"n": 10}},
+        {"workload": "raw_nopoll", "concurrency": 1, "attempted": 5, "measured_attempts": 5, "warmup_excluded": 0,
+         "accept": {"n": 5}, "completion": {"n": 0}},
+    ]}
+    started = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    manifest = runner.build_manifest(
+        "run-1", "0" * 40, "sha256:" + "1" * 64, "sha256:" + "2" * 64, results,
+        {"api": {"peak_mem_bytes": 1234}}, started, started + timedelta(seconds=5),
+        "sha256:" + "3" * 64, "sha256:" + "4" * 64)
+    assert manifest.state is RunState.COMPLETED
+    names = {m.name for m in manifest.measurements}
+    assert {"list-latency-c4", "raw-accept-c8", "raw-complete-c8", "raw_nopoll-accept-c1"} <= names
+    assert "raw_nopoll-complete-c1" not in names
+    assert {r.scope for r in manifest.resources} == set(runner.SERVICES)

@@ -20,6 +20,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from neuralscape_bench.service_baseline.journey_safety import require_disposable_project, require_local_only
 from neuralscape_bench.service_baseline.redact import redact_value
 from neuralscape_bench.run_manifest import (
     BuildIdentity,
@@ -39,7 +40,7 @@ from neuralscape_bench.run_manifest import (
 )
 
 SCHEMA = "candidate-v1"
-PROJECT = "ns-g-bench"
+PROJECT = "ns-bench-baseline"
 BENCH_DIR = Path(__file__).resolve().parents[2]
 COMPOSE_FILE = BENCH_DIR / "scripts" / "service_baseline" / "compose.yml"
 SERVICES = ("api", "worker", "graph-worker", "ingest-worker", "ledger-worker", "fake-provider", "neo4j", "redis", "qdrant", "pg")
@@ -202,6 +203,7 @@ def resolve_override(argument: str | None, environ: dict[str, str] | None = None
 
 
 def compose_argv(*args: str, override: Path | None = None) -> list[str]:
+    require_disposable_project(PROJECT)  # never build a docker command for the production project
     files = ["-f", str(COMPOSE_FILE)] + (["-f", str(override)] if override is not None else [])
     return ["docker", "compose", "-p", PROJECT, *files, *args]
 
@@ -213,6 +215,7 @@ def compose(*args: str, env: dict[str, str]) -> str:
 def assert_network_internal() -> bool:
     """With an override the stack's network must really be internal: egress-free by construction, checked on Docker."""
 
+    require_disposable_project(PROJECT)
     verdict = sh("docker", "network", "inspect", f"{PROJECT}_default", "--format", "{{.Internal}}").strip()
     if verdict != "true":
         raise RuntimeError(f"the bench network {PROJECT}_default is not internal (Internal={verdict!r}): refusing to measure with egress")
@@ -366,6 +369,10 @@ def main() -> None:
     args = parser.parse_args()
     global COMPOSE_OVERRIDE
     COMPOSE_OVERRIDE = resolve_override(args.compose_override)
+    require_disposable_project(PROJECT)
+    for stack_file in (COMPOSE_FILE, COMPOSE_OVERRIDE):
+        if stack_file is not None:
+            require_local_only(stack_file.read_text(), stack_file.name)
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)

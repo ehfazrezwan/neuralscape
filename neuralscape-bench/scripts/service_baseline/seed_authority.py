@@ -15,10 +15,14 @@ from tokens import issue_user_token  # noqa: E402
 
 AUTHORITY = os.environ.get("AUTHORITY_ENABLED") == "true"
 if AUTHORITY:  # images without the authority store (older trees) only need the token and the state directory
-    from authority_store_sql import PostgresAuthorityStore, SqliteAuthorityStore  # noqa: E402
-    from contracts_policy import PolicyStatement  # noqa: E402
-    from identity_binding import bind_identity  # noqa: E402
-    from policy_enforcement import pool_handle  # noqa: E402
+    try:
+        from authority_store_sql import PostgresAuthorityStore, SqliteAuthorityStore  # noqa: E402
+        from contracts_policy import PolicyStatement  # noqa: E402
+        from identity_binding import bind_identity  # noqa: E402
+        from policy_enforcement import pool_handle  # noqa: E402
+    except ImportError as error:  # the image does not carry the authority modules: degrade, say so, keep going
+        print(f"authority store unavailable in this image ({error.name}); seeding the token only", file=sys.stderr)
+        AUTHORITY = False
 
 USER, TENANT, PROJECT = "bench-user", "bench-tenant", "bench-project"
 ACTIONS = ("read", "search", "list", "create", "update", "delete", "background_derive", "share")

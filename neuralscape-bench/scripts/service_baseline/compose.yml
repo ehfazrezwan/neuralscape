@@ -1,4 +1,4 @@
-# Isolated service baseline stack (project name is set by the runner: ns-g-bench).
+# Isolated service baseline stack (project name is set by the runner: ns-bench-baseline).
 # No host ports are published; the driver runs inside the same network.
 # Application services restart on failure, like the production compose file: the
 # first cold start races on shared vector-store collection creation.

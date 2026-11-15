@@ -20,11 +20,12 @@ HERE = Path(__file__).resolve().parent
 BENCH = HERE.parents[1]
 sys.path.insert(0, str(BENCH))
 from neuralscape_bench.service_baseline.journey_safety import (  # noqa: E402
-    JourneySafetyError, preflight, uninstall_is_safe, uninstall_report)
+    JourneySafetyError, preflight, require_disposable_project, require_disposable_volume, require_local_only,
+    uninstall_is_safe, uninstall_report)
 from neuralscape_bench.service_baseline.redact import redact_value  # noqa: E402
 
-PROJECT = "ns-journey"
-SENTINEL = "ns-journey-sentinel"
+PROJECT = "ns-bench-journey"
+SENTINEL = "ns-bench-journey-sentinel"
 FILES = ["-f", str(HERE / "compose.yml"), "-f", str(HERE / "journey.override.yml")]
 APP = ["api", "worker", "graph-worker", "ingest-worker"]
 PG_PASSWORD = "bench-owner-password"
@@ -52,6 +53,7 @@ class Journey:
                 **self.flags}
 
     def compose(self, *args, check=True):
+        require_disposable_project(PROJECT)
         return run("docker", "compose", "-p", PROJECT, *FILES, "--profile", "ledger", "--profile", "pg", *args,
                    env=self.env(), check=check)
 
@@ -157,15 +159,19 @@ class Journey:
 def begin(j):
     """Refuse to start over leftovers, then create the sentinel and note the existing volumes."""
     try:
+        require_disposable_volume(SENTINEL, PROJECT)
+        for name in (HERE / "compose.yml", HERE / "journey.override.yml"):
+            require_local_only(name.read_text(), name.name)
         preflight(run, PROJECT, SENTINEL)
     except JourneySafetyError as error:
         shutil.rmtree(j.scratch, ignore_errors=True)
         raise SystemExit(str(error))
-    run("docker", "volume", "create", SENTINEL)
+    run("docker", "volume", "create", require_disposable_volume(SENTINEL, PROJECT))
     return j.volumes()
 
 
 def project_mounts():
+    require_disposable_project(PROJECT)
     ids = run("docker", "ps", "-aq", "--filter", f"label=com.docker.compose.project={PROJECT}").stdout.split()
     if not ids:
         return set()
@@ -179,7 +185,7 @@ def uninstall(j, before):
     j.step("uninstall: compose down -v", lambda: j.compose("down", "-v", "--remove-orphans") and "ok")
     report = uninstall_report(before, mid, j.volumes(), PROJECT, SENTINEL, mounted)
     j.steps.append({"step": "uninstall check", "safe": uninstall_is_safe(report), **report})
-    run("docker", "volume", "rm", SENTINEL, check=False)
+    run("docker", "volume", "rm", require_disposable_volume(SENTINEL, PROJECT), check=False)
 
 
 def pending_scenario(old, new, out):
@@ -213,6 +219,9 @@ def pending_scenario(old, new, out):
 
 
 def main():
+    if len(sys.argv) != 5 or sys.argv[1] in ("-h", "--help"):
+        print(__doc__)  # usage only: nothing is started
+        raise SystemExit(0 if sys.argv[1:2] in (["-h"], ["--help"]) else 2)
     scenario, old, new, out = sys.argv[1:5]
     if scenario == "ledger-pending":
         return pending_scenario(old, new, out)
@@ -272,4 +281,5 @@ def main():
     shutil.rmtree(j.scratch, ignore_errors=True)
 
 
-main()
+if __name__ == "__main__":  # importing the module must never start a journey
+    main()

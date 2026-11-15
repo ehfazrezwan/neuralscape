@@ -55,31 +55,31 @@ class FakeDocker:
 
 
 def test_preflight_refuses_to_start_over_leftovers():
-    journey_safety.preflight(FakeDocker(volumes=["other_volume"]), "proj", "proj-sentinel")  # unrelated: fine
-    for docker in (FakeDocker(containers=["proj-api-1"]), FakeDocker(volumes=["proj_state"]),
-                   FakeDocker(volumes=["proj-sentinel"]), FakeDocker(networks=["proj_default"])):
+    journey_safety.preflight(FakeDocker(volumes=["other_volume"]), "ns-bench-proj", "ns-bench-proj-sentinel")  # unrelated: fine
+    for docker in (FakeDocker(containers=["ns-bench-proj-api-1"]), FakeDocker(volumes=["ns-bench-proj_state"]),
+                   FakeDocker(volumes=["ns-bench-proj-sentinel"]), FakeDocker(networks=["ns-bench-proj_default"])):
         with pytest.raises(journey_safety.JourneySafetyError, match="refusing to start"):
-            journey_safety.preflight(docker, "proj", "proj-sentinel")
+            journey_safety.preflight(docker, "ns-bench-proj", "ns-bench-proj-sentinel")
 
 
 def test_uninstall_report_flags_removal_of_anything_that_is_not_the_projects():
-    before = ["unrelated", "proj-sentinel"]
-    mid = before + ["proj_state", "proj_pg", "deadbeef"]  # deadbeef: anonymous volume of a project container
-    safe = journey_safety.uninstall_report(before, mid, before, "proj", "proj-sentinel", mounted=["proj_state", "deadbeef"])
+    before = ["unrelated", "ns-bench-proj-sentinel"]
+    mid = before + ["ns-bench-proj_state", "ns-bench-proj_pg", "deadbeef"]  # deadbeef: anonymous volume of a project container
+    safe = journey_safety.uninstall_report(before, mid, before, "ns-bench-proj", "ns-bench-proj-sentinel", mounted=["ns-bench-proj_state", "deadbeef"])
     assert journey_safety.uninstall_is_safe(safe) and safe["removed_volumes_not_project_named"] == ["deadbeef"]
     # an unrelated volume disappeared
-    bad = journey_safety.uninstall_report(before, mid, ["proj-sentinel"], "proj", "proj-sentinel", mounted=["proj_state"])
+    bad = journey_safety.uninstall_report(before, mid, ["ns-bench-proj-sentinel"], "ns-bench-proj", "ns-bench-proj-sentinel", mounted=["ns-bench-proj_state"])
     assert bad["unrelated_volumes_untouched"] is False and not journey_safety.uninstall_is_safe(bad)
     assert bad["unrelated_volumes_missing_after"] == ["deadbeef", "unrelated"] or "unrelated" in bad["unrelated_volumes_missing_after"]
-    # a volume that vanished before the removal (another lane's cleanup) is reported, not blamed on `down -v`
-    early = journey_safety.uninstall_report(before + ["other_lane"], before + ["proj_state"], before, "proj", "proj-sentinel", mounted=["proj_state"])
-    assert journey_safety.uninstall_is_safe(early) and early["vanished_since_start_not_ours"] == ["other_lane"]
+    # a volume that vanished before the removal (another project's cleanup) is reported, not blamed on `down -v`
+    early = journey_safety.uninstall_report(before + ["other_project"], before + ["ns-bench-proj_state"], before, "ns-bench-proj", "ns-bench-proj-sentinel", mounted=["ns-bench-proj_state"])
+    assert journey_safety.uninstall_is_safe(early) and early["vanished_since_start_not_ours"] == ["other_project"]
     # a non-project volume removed that no project container mounted
-    stray = journey_safety.uninstall_report(before, mid + ["stray"], before, "proj", "proj-sentinel", mounted=["proj_state"])
+    stray = journey_safety.uninstall_report(before, mid + ["stray"], before, "ns-bench-proj", "ns-bench-proj-sentinel", mounted=["ns-bench-proj_state"])
     assert stray["removed_volumes_not_project_named_and_not_mounted_by_project"] == ["deadbeef", "stray"]
     assert not journey_safety.uninstall_is_safe(stray)
     # the project's own volumes surviving down -v is also unsafe
-    left = journey_safety.uninstall_report(before, mid, before + ["proj_state"], "proj", "proj-sentinel", mounted=[])
+    left = journey_safety.uninstall_report(before, mid, before + ["ns-bench-proj_state"], "ns-bench-proj", "ns-bench-proj-sentinel", mounted=[])
     assert not journey_safety.uninstall_is_safe(left)
 
 
