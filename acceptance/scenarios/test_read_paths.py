@@ -160,17 +160,40 @@ def check_meter_belongs_to(client: NSClient, user_id: str) -> None:
 # ── hybrid recall ────────────────────────────────────────────────
 
 
+LEGS_TEXT = "Quokkaforge compiles artefacts nightly on the staging cluster."
+LEGS_QUERY = "which utility assembles our deliverables each evening inside the rehearsal environment"
+
+
+def _words(text: str) -> set[str]:
+    return set(re.findall(r"[a-z0-9]+", text.lower()))
+
+
+@pytest.fixture(scope="module")
+def legs(ctx, a) -> dict:
+    """One fact alone in its own project, and a query sharing NO word with it."""
+    marker = f"zq-{ctx.run_id}-legs"
+    project = f"{ctx.project_id}-legs"
+    w = write_raw(
+        a, f"{marker} {LEGS_TEXT}", "tech_stack", marker=marker, scope="project", project_id=project, visibility="private",
+    )
+    return {"w": w, "project": project, "marker": marker}
+
+
 @proves("read.hybrid-search-core", "read.dense-pool-legs", "fork.mem0.gemini-embedder")
-def test_paraphrased_query_recalls_the_fact_through_the_dense_leg(ctx, a, rd):
-    rd["dense"].require()
+def test_query_with_no_shared_word_recalls_the_fact_through_the_dense_leg(a, legs):
+    """The query and the stored text share no token at all (checked here), so the
+    lexical (BM25) leg cannot match: only the embedding leg can surface the fact."""
+    legs["w"].require()
+    shared = _words(LEGS_QUERY) & _words(f"{legs['marker']} {LEGS_TEXT}")
+    assert not shared, f"test data bug: query and fact share words {sorted(shared)}"
     eventually(
-        lambda: check_search_finds(a, rd["dense"].marker, PARAPHRASE, ctx.project_id),
-        timeout=90, what="paraphrase recall",
+        lambda: check_search_finds(a, legs["marker"], LEGS_QUERY, legs["project"]),
+        timeout=90, what="zero-overlap paraphrase recall",
     )
 
 
-@proves("read.hybrid-search-core", "vec.bm25-sparse")
-def test_bare_rare_token_recalls_the_fact_through_the_keyword_leg(ctx, a, rd):
+@proves("read.hybrid-search-core")
+def test_bare_rare_token_recalls_the_fact(ctx, a, rd):
     rd["dense"].require()
     eventually(
         lambda: check_search_finds(a, rd["dense"].marker, rd["rare"], ctx.project_id),
@@ -180,9 +203,9 @@ def test_bare_rare_token_recalls_the_fact_through_the_keyword_leg(ctx, a, rd):
 
 @proves("read.hybrid-search-core", "read.dense-pool-legs")
 @negative_control
-def test_recall_check_fails_for_user_b(ctx, b, rd):
-    rd["dense"].require()
-    expect_check_fails(check_search_finds, b, rd["dense"].marker, PARAPHRASE, ctx.project_id)
+def test_recall_check_fails_for_user_b(b, legs):
+    legs["w"].require()
+    expect_check_fails(check_search_finds, b, legs["marker"], LEGS_QUERY, legs["project"])
 
 
 # ── index-first recall, batch get ────────────────────────────────
@@ -468,7 +491,7 @@ def test_ask_minimal_answers_from_memory_and_rejects_bad_levels(ctx, a, rd):
     assert bad.status_code == 422, f"unknown reasoning_level -> {bad.status_code} (want 422)"
 
 
-@proves("read.ask-tiers", "read.keyword-scan")
+@proves("read.ask-tiers")
 def test_ask_medium_runs_the_keyword_scan_pass(a, rd):
     rd["ask"].require()
     body = check_ask_answers(a, ASK_Q, rd["ask"].memory_id, rd["ask_tool"], "medium")

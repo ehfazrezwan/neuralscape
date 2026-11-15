@@ -51,7 +51,37 @@ class Ctx:
         return run_compose(self.compose_project, *args, check=check, timeout=timeout, run=run)
 
 
-COMPOSE_VERBS = frozenset({"pause", "unpause", "stop", "start", "restart", "ps", "logs", "top", "exec"})
+_CONTAINER_ID = __import__("re").compile(r"^[0-9a-f]{12,64}$")
+
+
+def container_restart_count(container_id: str, run: Callable[..., subprocess.CompletedProcess] = subprocess.run) -> int:
+    """RestartCount of one container (``docker inspect``, read-only)."""
+    if not _CONTAINER_ID.match(container_id or ""):
+        raise ConfigError(f"not a container id: {container_id!r}")
+    proc = run(
+        ["docker", "inspect", "--format", "{{.RestartCount}}", container_id],
+        capture_output=True, text=True, timeout=30,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(f"docker inspect failed: {(proc.stderr or '').strip()[:200]}")
+    return int((proc.stdout or "0").strip() or 0)
+
+
+def parse_ps_json(text: str) -> list[dict]:
+    """``docker compose ps --format json``: a JSON array or one object per line."""
+    import json
+
+    text = (text or "").strip()
+    if not text:
+        return []
+    if text.startswith("["):
+        return json.loads(text)
+    return [json.loads(line) for line in text.splitlines() if line.strip()]
+
+
+COMPOSE_VERBS = frozenset({"pause", "unpause", "stop", "start", "restart", "ps", "logs", "top", "exec", "up"})
+# `up` may only start existing containers: detached, no build, no recreate.
+UP_REQUIRED_FLAGS = ("-d", "--no-build", "--no-recreate")
 
 
 def run_compose(
@@ -67,6 +97,8 @@ def run_compose(
         )
     if not args or args[0] not in COMPOSE_VERBS:
         raise ConfigError(f"compose verb {args[:1]!r} is not allowed (allowed: {sorted(COMPOSE_VERBS)})")
+    if args[0] == "up" and not all(flag in args for flag in UP_REQUIRED_FLAGS):
+        raise ConfigError(f"`up` is only allowed with {UP_REQUIRED_FLAGS} (start existing containers only)")
     cmd = ["docker", "compose", "-p", project.strip(), *args]
     proc = run(cmd, capture_output=True, text=True, timeout=timeout)
     if check and proc.returncode != 0:

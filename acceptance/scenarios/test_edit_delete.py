@@ -1,8 +1,9 @@
 """Edit and delete: PATCH, retag, single and bulk delete, graph cleanup, ownership.
 
-Runs near the end of the session (see ``RUN_LAST`` in conftest.py) because the
-conversation-cascade scenario deletes one of the session's shared conversation
-facts. Writes are LLM-free raw writes, once per module.
+Runs near the end of the session (see ``RUN_LAST`` in conftest.py). Writes are
+LLM-free raw writes, once per module. The conversation-episode cascade
+(``graph.episode-cascade``) is proven by ``test_delete_privacy.py``, which
+builds its three facts from explicit markers; this file has no scenario for it.
 
 Documented behaviour: a private memory can be edited or deleted only by its
 owner; deleting a memory removes it from vector search, listings and by-id
@@ -15,7 +16,6 @@ import uuid
 
 import pytest
 
-from conftest import ConvSeed
 from nsaccept import eventually, expect_check_fails, negative_control, proves
 from nsaccept.client import NSClient
 from nsaccept.helpers import (
@@ -90,8 +90,10 @@ def check_gone(client: NSClient, memory_id: str, marker: str, project_id: str) -
     r = client.get(f"/v1/memories/{memory_id}")
     assert r.status_code == 404, f"GET by id -> {r.status_code} (want 404)"
     assert not rows_with(list_rows(client, project_id=project_id), marker), "still listed"
-    hits = client.search(marker, project_id=project_id, limit=20)
-    assert not any(marker in h.get("memory", "") for h in hits), "still recalled by search"
+    # keyword leg: the bare rare token; dense leg: a natural-language query
+    for query in (marker, f"{marker} what was recorded about this"):
+        hits = client.search(query, project_id=project_id, limit=20)
+        assert not any(marker in h.get("memory", "") for h in hits), f"still recalled by search for {query!r}"
 
 
 def check_content_replaced(client: NSClient, memory_id: str, old: str, new: str, project_id: str) -> None:
@@ -323,43 +325,3 @@ def test_mcp_bulk_delete_by_project(a, mcp_a, ed):
 def test_bulk_gone_check_fails_for_a_project_that_was_not_deleted(ctx, a, ed):
     w = ed["foreign"].require()
     expect_check_fails(check_gone, a, w.memory_id, w.marker, ctx.project_id)
-
-
-# ── conversation-episode cascade (atlas: graph.episode-cascade) ──
-
-
-@proves("graph.episode-cascade", "delete.single")
-def test_deleting_one_extracted_fact_keeps_its_siblings_graph_evidence(ctx, a, conv_seed: ConvSeed):
-    """One conversation is ONE graph episode shared by all facts extracted from it.
-    Correct: deleting one fact leaves graph evidence for the others. Atlas bug:
-    the cascade expires the whole episode, so the siblings lose their graph
-    evidence while their vector rows remain. Red until write-02 lands."""
-    assert conv_seed.write.completed, f"conversation write ended as {conv_seed.write.status or conv_seed.write.error}"
-    rows = list_rows(a, project_id=conv_seed.project_id)
-    forge_rows, lagoon_rows = rows_with(rows, conv_seed.forge), rows_with(rows, conv_seed.lagoon)
-    if not forge_rows or not lagoon_rows or forge_rows[0]["id"] == lagoon_rows[0]["id"]:
-        pytest.skip("extraction did not yield two separate facts for the two invented names")
-    eventually(
-        lambda: check_episode_present(a, conv_seed.project_id, conv_seed.lagoon),
-        timeout=GRAPH_WAIT, interval=5, what="the conversation's shared episode exists before the delete",
-    )
-    assert a.delete(f"/v1/memories/{forge_rows[0]['id']}").status_code == 200, "deleting the first fact failed"
-    assert get_row(a, lagoon_rows[0]["id"])["id"] == lagoon_rows[0]["id"], "the sibling fact's vector row was lost"
-
-    def sibling_evidence_alive():
-        eps = graph_listing(a, "episodes", conv_seed.project_id)
-        edges = graph_listing(a, "edges", conv_seed.project_id)
-        alive = any(conv_seed.lagoon in (e.get("content") or "") for e in eps) or blob_has(edges, conv_seed.lagoon)
-        assert alive, "the sibling fact has no live graph episode or edge after its sibling was deleted"
-
-    eventually(sibling_evidence_alive, timeout=120, interval=5, what="sibling graph evidence")
-
-
-@proves("graph.episode-cascade")
-@negative_control
-def test_sibling_evidence_check_fails_for_an_unwritten_name(ctx, a):
-    def check():
-        eps = graph_listing(a, "episodes", ctx.project_id)
-        assert any(f"zq-{ctx.run_id}-never-written" in (e.get("content") or "") for e in eps), "no such episode"
-
-    expect_check_fails(check)

@@ -261,3 +261,50 @@ def test_rows_with_and_blob_has():
     rows = [{"memory": "has zq-1"}, {"memory": "no"}]
     assert rows_with(rows, "zq-1") == [rows[0]]
     assert blob_has({"a": ["Hello ZqAbc"]}, "zqabc") and not blob_has({"a": 1}, "zz")
+
+
+# ── compose `up`, ps parsing, restart count, in-container token minting ──
+
+
+def test_compose_up_only_starts_existing_containers():
+    calls = []
+    ctx = _ctx("nscampaign")
+    for bad in (["up", "-d", "svc"], ["up", "svc"], ["up", "-d", "--no-build", "svc"]):
+        with pytest.raises(runctx.ConfigError):
+            ctx.compose(*bad, run=_fake_run(calls))
+    ctx.compose("up", "-d", "--no-build", "--no-recreate", "svc", run=_fake_run(calls))
+    assert calls[-1][:4] == ["docker", "compose", "-p", "nscampaign"] and len(calls) == 1
+
+
+def test_parse_ps_json_accepts_array_and_json_lines():
+    assert runctx.parse_ps_json("") == []
+    assert runctx.parse_ps_json('[{"Service":"a"},{"Service":"b"}]') == [{"Service": "a"}, {"Service": "b"}]
+    assert runctx.parse_ps_json('{"Service":"a"}\n{"Service":"b"}\n') == [{"Service": "a"}, {"Service": "b"}]
+
+
+def test_restart_count_reads_docker_inspect_and_rejects_odd_ids():
+    def run(cmd, **kw):
+        assert cmd[:3] == ["docker", "inspect", "--format"]
+        return subprocess.CompletedProcess(cmd, 0, "2\n", "")
+
+    assert runctx.container_restart_count("abcdef123456", run=run) == 2
+    with pytest.raises(runctx.ConfigError):
+        runctx.container_restart_count("x; rm -rf /", run=run)
+
+
+def test_in_container_minting_never_passes_a_secret_and_refuses_production():
+    from nsaccept import tokens
+
+    seen = []
+
+    def run(cmd, **kw):
+        seen.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0, "aaaaaaaaaaaaaaaaaaaa.bbbbbbbbbbbbbbbbbbbb\n", "")
+
+    tok = tokens.mint_via_compose_python("nscampaign", "u1", -60, "api", run=run)
+    assert tok == "aaaaaaaaaaaaaaaaaaaa.bbbbbbbbbbbbbbbbbbbb"
+    cmd = seen[0]
+    assert cmd[:7] == ["docker", "compose", "-p", "nscampaign", "exec", "-T", "api"] and cmd[-2:] == ["u1", "-60"]
+    assert "NEURALSCAPE_USER_TOKEN_SECRET" in cmd[9] and "print(issue_user_token" in cmd[9]
+    with pytest.raises(tokens.TokenError):
+        tokens.mint_via_compose_python("neuralscape", "u1", -60, run=run)

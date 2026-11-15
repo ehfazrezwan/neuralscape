@@ -16,12 +16,16 @@ import pytest
 from nsaccept import eventually
 from nsaccept.helpers import Written, write_raw
 
-# Module run order. test_edit_delete deletes the session's shared conversation
-# facts (graph episode cascade), so every module that reads them runs first;
-# test_fault_injection pauses/stops Qdrant, so it runs after everything else and
-# cannot starve other modules' background (graph) work. All other modules keep
+# Module run order. Modules that delete or wipe data, or stop Qdrant, run after
+# every module that reads the session's shared facts; the Qdrant ones last so
+# they cannot starve other modules' background (graph) work. All other modules keep
 # pytest's default (alphabetical) order.
-RUN_LAST = {"test_edit_delete": 1, "test_fault_injection": 2}
+RUN_LAST = {
+    "test_context_and_single_get": 1,  # writes a shared fact into ctx.project_id (would list it for B)
+    "test_edit_delete": 2,
+    "test_delete_privacy": 3,  # bulk-deletes ctx.project_id
+    "test_fault_injection": 4,
+}
 
 
 def pytest_collection_modifyitems(config, items):

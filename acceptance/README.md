@@ -168,7 +168,8 @@ More helpers in `nsaccept/`:
 - `ctx.compose(*args)`: `docker compose -p <project> <args>`, only when run
   with `--compose-project` (which also sets the `compose` capability, so
   `@needs("compose")` scenarios run). Refuses the production project name and
-  any verb outside pause/unpause/stop/start/restart/ps/logs/top/exec.
+  any verb outside pause/unpause/stop/start/restart/ps/logs/top/exec/up (`up` only with `-d --no-build --no-recreate`, i.e. starting existing containers).
+  Expired-token scenarios mint inside the API container (`tokens.mint_via_compose_python`) when `NS_TOKEN_SECRET` is not set, so they also run on the gate.
 - `sse.SSEReader`: background reader for `GET /v1/stream`
   (`wait_connected`, `wait_for`, `events`).
 - `upload.upload_files` / `upload.build_zip`: multipart upload to
@@ -181,8 +182,9 @@ Scenario files (one per family; default profile unless noted):
 `test_read_paths`, `test_graph`, `test_edit_delete`, `test_ingest`
 (Docling cases only under the `docling` profile), `test_extensions` (registry,
 SSE, knowledge router, admin gates, session summaries), `test_fault_injection`
-(needs `--compose-project`; pauses/stops Qdrant mid-write and always restores
-it). Run order is alphabetical except `test_edit_delete` and
+(needs `--compose-project`; Qdrant outage guarantees and a 3-cycle cold start
+that deletes the collections and starts the API + workers together; always
+restores the stack, or fails with `ps` output). Run order is alphabetical except `test_edit_delete` and
 `test_fault_injection`, which run last (see `RUN_LAST` in `scenarios/conftest.py`).
 `scenarios/route_table.py` lists every REST route with a harmless probe; a
 drift scenario compares it with the stack's `/openapi.json`.
