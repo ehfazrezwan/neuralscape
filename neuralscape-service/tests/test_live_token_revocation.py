@@ -134,6 +134,16 @@ class TestLiveDenylist:
         assert _get(client, _token()).status_code == 401
 
 
+class TestColdStart:
+    def test_redis_up_and_digest_present_is_refused_on_the_very_first_request(self, redis, client):
+        tok = _token()
+        redis.sadd(REVOKED_SET_KEY, token_fingerprint(tok))
+        reset_revocation_snapshot()  # process just started: nothing cached
+        assert tokens._snapshot.loaded is False
+        assert _get(client, tok).status_code == 401
+        assert redis.reads == 1
+
+
 class TestSnapshotCache:
     def test_requests_within_the_interval_cost_no_redis_read(self, redis, client, monkeypatch):
         monkeypatch.setattr(settings, "revocation_refresh_interval_seconds", 60.0)

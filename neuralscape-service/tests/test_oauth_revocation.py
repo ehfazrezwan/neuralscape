@@ -263,3 +263,67 @@ class TestRevokingASessionTokenDirectly:
         r = _refresh(client, client_id, tok["refresh_token"])
         assert r.status_code == 400 and r.json()["error"] == "invalid_grant"
         assert fam in stack.families
+
+
+def _link_ticket(client_id, suggested="newbie"):
+    from login_providers import LoginNeedsLink, sign_link_ticket
+
+    ctx = AuthorizeContext(client_id, REDIRECT, "s", CHALLENGE, "S256", "")
+    return sign_link_ticket(
+        LoginNeedsLink(ctx=ctx, email="a@example.com", sub="sub-1", suggested_user_id=suggested), SECRET
+    )
+
+
+def _link(client, ticket, **form):
+    return client.post("/oauth/link", data={"ticket": ticket, **form}, follow_redirects=False)
+
+
+class TestLinkFlow:
+    @pytest.fixture(autouse=True)
+    def no_identity_store(self, monkeypatch):
+        monkeypatch.setattr(oauth.identity_store, "link", AsyncMock())
+        monkeypatch.setattr(settings, "auth_provider", "google")
+
+    def test_revoked_token_cannot_be_used_to_link(self, client, monkeypatch):
+        client_id = _register(client)
+        admin = issue_user_token(USER, SECRET, 3600)
+        _revoke_env(monkeypatch, token_fingerprint(admin))
+        r = _link(client, _link_ticket(client_id), action="link", token=admin)
+        assert r.status_code == 400  # re-rendered link page, no code issued
+        assert "location" not in r.headers
+
+    def test_live_revocation_is_seen_by_the_link_step(self, client, stack):
+        client_id = _register(client)
+        admin = issue_user_token(USER, SECRET, 3600)
+        stack.redis.members.add(token_fingerprint(admin))  # cold snapshot, digest only in Redis
+        r = _link(client, _link_ticket(client_id), action="link", token=admin)
+        assert r.status_code == 400
+
+    def test_linked_session_carries_src_and_dies_with_the_token(self, client, monkeypatch):
+        client_id = _register(client)
+        admin = issue_user_token(USER, SECRET, 3600)
+        code = _code_from(_link(client, _link_ticket(client_id), action="link", token=admin))
+        assert verify_payload(code, SECRET)["src"] == token_fingerprint(admin)
+        tok = _exchange(client, client_id, code).json()
+        _revoke_env(monkeypatch, token_fingerprint(admin))
+        assert verify_user_token(tok["access_token"], SECRET) is None
+        assert _refresh(client, client_id, tok["refresh_token"]).status_code == 400
+
+    def test_new_account_session_is_tied_to_the_identity(self, client, monkeypatch):
+        client_id = _register(client)
+        code = _code_from(_link(client, _link_ticket(client_id, "newbie"), action="new"))
+        assert verify_payload(code, SECRET)["src"] == identity_fingerprint("google", "newbie")
+        tok = _exchange(client, client_id, code).json()
+        _revoke_env(monkeypatch, identity_fingerprint("google", "newbie"))
+        assert _refresh(client, client_id, tok["refresh_token"]).status_code == 400
+
+
+class TestColdSnapshot:
+    def test_paste_on_a_cold_snapshot_honours_a_digest_already_in_redis(self, client, stack):
+        pasted = issue_user_token(USER, SECRET, 3600)
+        stack.redis.members.add(token_fingerprint(pasted))
+        tokens.reset_revocation_snapshot()  # first request after start
+        client_id = _register(client)
+        r = _paste(client, client_id, pasted)
+        assert r.status_code == 400  # consent page re-rendered with the error
+        assert "location" not in r.headers

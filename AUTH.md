@@ -195,6 +195,20 @@ own digest; revoking a refresh token also revokes its family (the same
 Sessions minted before this change carry no `src` and are covered only by their
 own digests. Unrevoking a refresh token does not resurrect its family.
 
+**Redis durability.** The live denylist exists only in Redis. If Redis loses
+its data (restart without persistence, a flush, a replaced volume), every live
+revocation is forgotten and those tokens work again (API processes drop them
+once their snapshot is refreshed from the now-empty set, or keep them until
+restart if Redis stays down). Run Redis with persistence (`appendonly yes`, or
+RDB snapshots) if you rely on live revocation, and put any digest that must
+never come back in `NEURALSCAPE_REVOKED_TOKENS`: the env list is the durable
+fallback and survives Redis loss. `revoke_token.py --list` shows what the set
+holds.
+
+**The legacy shared key is not covered.** Digest revocation applies to per-user
+tokens (and the OAuth sessions derived from them). A leaked
+`NEURALSCAPE_API_KEY` cannot be revoked by digest: rotate the key and restart.
+
 Limits, plainly:
 
 - It covers the exact token string only (a fresh token for the same user is a

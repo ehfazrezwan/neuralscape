@@ -788,7 +788,9 @@ async def oauth_link(
     sub = claims.get("sub") or None
     email = claims.get("email") or None
 
+    src = None
     if action == "link":
+        await refresh_revocations()
         payload = verify_user_token(token.strip(), _secret()) if token.strip() else None
         if payload is None:
             return _render_link_page(
@@ -797,13 +799,16 @@ async def oauth_link(
                 status_code=400,
             )
         user_id = payload["user_id"]
+        # The session descends from the pasted credential: revoking it ends it.
+        src = payload.get("src") or token_fingerprint(token.strip())
     else:
         user_id = claims.get("suggested_user_id") or ""
         if not user_id:
             return _login_error_page(LoginError("Could not determine an account id.", 400))
+        src = identity_fingerprint(settings.auth_provider, user_id)
 
     await identity_store.link(user_id, sub=sub, email=email)
-    return _issue_code_and_redirect(ctx, user_id)
+    return _issue_code_and_redirect(ctx, user_id, src=src)
 
 
 # ── token endpoint ───────────────────────────────────────────────────────
