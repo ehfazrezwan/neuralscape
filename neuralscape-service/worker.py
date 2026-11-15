@@ -1007,6 +1007,19 @@ def _git_head_sha(repo_path: str) -> str | None:
     return None
 
 
+def _row_episode_uuid(service, memory_id: str) -> str | None:
+    """The graph episode uuid stamped on the row's payload (None when unknown / row gone / not a real store)."""
+    try:
+        point = service._memory.vector_store.get(vector_id=memory_id)
+        meta = ((getattr(point, "payload", None) or {}).get("metadata")) or {}
+        if isinstance(meta.get("metadata"), dict):
+            meta = meta["metadata"]
+        uuid = meta.get("graph_episode_uuid")
+        return uuid if isinstance(uuid, str) and uuid else None
+    except Exception:  # noqa: BLE001 - best effort; the content match is the fallback
+        return None
+
+
 async def process_graph_enrichment(
     ctx: dict,
     memory_id: str,
@@ -1110,6 +1123,7 @@ async def process_graph_enrichment(
         from adapters import require_adapter
 
         graph_ontology = require_adapter(adapter).graph_ontology_kwargs()
+    episode_before = _row_episode_uuid(service, memory_id)
     enriched = await asyncio.to_thread(
         service.enrich_graph,
         content=content,
@@ -1122,6 +1136,7 @@ async def process_graph_enrichment(
         occurred_at=occurred_at,
         workspace=current_workspace,
     )
+    episode_after = _row_episode_uuid(service, memory_id) if enriched else None
     if enriched:
         # The first check above only covers the time the job sat in the queue.
         # Extraction itself takes minutes: re-read the row now and, if it was
@@ -1148,9 +1163,14 @@ async def process_graph_enrichment(
                 "Memory %s changed or was deleted while its graph enrichment ran; "
                 "expiring the episode just written to group %r.", memory_id, written_group,
             )
+            # Pin the episode THIS job wrote when it can be told apart (the row's
+            # episode ref changed across our enrich_graph call): the cascade then
+            # resolves by uuid first, so a newer re-ingested episode of the same
+            # memory is never the one expired. Otherwise exact-content match.
+            ours = episode_after if episode_after and episode_after != episode_before else None
             await asyncio.to_thread(
                 expire,
-                {"memory": content, "metadata": {}, "user_id": user_id},
+                {"memory": content, "metadata": {"graph_episode_uuid": ours} if ours else {}, "user_id": user_id},
                 group_id=written_group,
                 memory_id=memory_id,
             )

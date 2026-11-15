@@ -135,3 +135,53 @@ def test_unchanged_row_after_enrichment_expires_nothing():
     svc = DuringService(after, visibility="shared", project_id=None, memory="the text", workspace=None)
     assert _run(svc, visibility="shared")["enriched"] is True
     assert svc.expired == []
+
+
+# ── the expiry is pinned to the episode THIS job wrote ────────────────
+
+
+class EpisodeRows(DuringService):
+    """A service whose Qdrant row reports an episode ref that changes across our enrich call."""
+
+    def __init__(self, refs, after, **row):
+        super().__init__(after, **row)
+        self.refs = list(refs)
+        self._memory = SimpleNamespace(vector_store=SimpleNamespace(get=self._get))
+
+    def _get(self, vector_id):
+        ref = self.refs.pop(0) if len(self.refs) > 1 else self.refs[0]
+        return SimpleNamespace(payload={"metadata": {"graph_episode_uuid": ref}})
+
+
+def test_expiry_resolves_by_the_episode_uuid_this_job_wrote():
+    svc = EpisodeRows([None, "ep-ours"], None, visibility="private", project_id=None, memory="the text", workspace=None)
+    _run(svc, visibility="private")
+    (mem, group, mid), = svc.expired
+    assert mem["metadata"] == {"graph_episode_uuid": "ep-ours"}     # uuid first: a newer episode (same text/group) survives
+
+
+def test_expiry_falls_back_to_content_when_the_episode_cannot_be_told_apart():
+    svc = EpisodeRows(["ep-old", "ep-old"], None, visibility="private", project_id=None, memory="the text", workspace=None)
+    _run(svc, visibility="private")
+    assert svc.expired[0][0]["metadata"] == {}
+
+
+def test_the_cascade_prefers_the_uuid_over_a_newer_same_content_episode():
+    """Provenance: uuid lookup runs first, content only if the uuid misses."""
+    from memory_service import MemoryService
+
+    s = MemoryService()
+    s._get_graphiti = lambda: object()
+    s._bridge = object()
+    seen = []
+
+    def lookup(group, field, value):
+        seen.append(field)
+        return {"uuid": "ep-ours", "name": "n"} if field == "uuid" else {"uuid": "ep-newer", "name": "n2"}
+
+    s._lookup_episode = lookup
+    s._expire_episode_edges = lambda *a, **k: 0
+    s._clear_or_remove_episode_entities = lambda *a, **k: {"nodes_removed": 0, "summaries_cleared": 0}
+    s._delete_episode_node = lambda *a, **k: None
+    out = s._cascade_expire_episode("g", episode_uuid="ep-ours", content="the text")
+    assert out["episode_uuid"] == "ep-ours" and seen == ["uuid"]
