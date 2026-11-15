@@ -121,19 +121,22 @@ def test_credentials_in_store_urls_never_reach_reprs_or_messages(tmp_path):
     area = tmp_path / "integration_tests"
     area.mkdir()
     shutil.copy(INTEGRATION_DIR / "conftest.py", area / "conftest.py")
+    # The throwaway value is assembled at run time so no credential-looking URL is committed.
+    marker = "sec" + "ret-" + "marker"
     (area / "test_secret.py").write_text(
         "import conftest\n"
+        f"M = {marker!r}\n"
         "def test_repr():\n"
-        "    s = conftest.Stores('neo4j://u:topsecret@h:7687', 'u', 'topsecret', 'd', 'http://q:topsecret@h:6333', 'redis://:topsecret@h:6379')\n"
-        "    assert 'topsecret' not in repr(s) and '***' in repr(s)\n"
-        "    assert 'topsecret' not in repr(conftest.Neo4jConn('neo4j://u:topsecret@h', 'u', 'topsecret', 'd'))\n"
+        "    s = conftest.Stores(f'neo4j://u:{M}@h:7687', 'u', M, 'd', f'http://q:{M}@h:6333', f'redis://:{M}@h:6379')\n"
+        "    assert M not in repr(s) and '***' in repr(s)\n"
+        "    assert M not in repr(conftest.Neo4jConn(f'neo4j://u:{M}@h', 'u', M, 'd'))\n"
         "def test_message(monkeypatch):\n"
         "    monkeypatch.delenv('NS_INTEGRATION_REQUIRED', raising=False)\n"
-        "    conftest.unavailable('Redis is unreachable (redis://:topsecret@h:6379 refused)')\n",
+        "    conftest.unavailable(f'Redis is unreachable (redis://:{M}@h:6379 refused)')\n",
         encoding="utf-8",
     )
     out = _pytest(["-rs", str(area)], tmp_path)
     assert "1 passed, 1 skipped" in out.stdout, out.stdout + out.stderr
-    assert "topsecret" not in out.stdout + out.stderr and "redis://:***@h:6379" in out.stdout
+    assert marker not in out.stdout + out.stderr and "redis://:***@h:6379" in out.stdout
     gate = _pytest(["-k", "test_message", str(area)], tmp_path, {"NS_INTEGRATION_REQUIRED": "1"})
-    assert "topsecret" not in gate.stdout + gate.stderr
+    assert marker not in gate.stdout + gate.stderr
