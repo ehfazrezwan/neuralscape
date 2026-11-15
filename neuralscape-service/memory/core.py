@@ -85,6 +85,14 @@ def _memory_from_config(memory_cls, config):
             )
             time.sleep(0.1 * attempt)
 
+_BM25_MISSING_DETAIL = (
+    "collection predates the BM25 sparse slot; keyword leg disabled (search is dense-only). "
+    "No in-place migration exists: recreate the collection and re-ingest to enable hybrid search."
+)
+# One warning per process, not per search.
+_bm25_warned = False
+
+
 class CoreMixin:
     """CoreMixin for MemoryService (mechanical split — see memory_service.py)."""
 
@@ -269,10 +277,28 @@ class CoreMixin:
     # #14): every pool query carries a dream_tombstoned must_not, the shared/
     # standard pools filter on visibility, and dual-scope merges filter on
     # scope — all unindexed meant full payload scans on every search.
+    #
+    # Every payload key the service filters on (grep ``FieldCondition(key=``
+    # in memory/*.py) is listed here. The payload layout is mem0's: ``hash``
+    # and ``user_id`` are top-level; everything NS stamps lives under
+    # ``metadata.*``. ``user_id`` is indexed by mem0's own store, and
+    # ``created_at`` by ``_ensure_created_at_index`` (DATETIME), so neither is
+    # repeated here. Array fields (tags, concepts) take a keyword index too.
     _FILTER_INDEX_FIELDS = (
         ("metadata.dream_tombstoned", "bool"),
         ("metadata.visibility", "keyword"),
         ("metadata.scope", "keyword"),
+        ("hash", "keyword"),
+        ("metadata.project_id", "keyword"),
+        ("metadata.category", "keyword"),
+        ("metadata.domain", "keyword"),
+        ("metadata.observation_type", "keyword"),
+        ("metadata.concepts", "keyword"),
+        ("metadata.tags", "keyword"),
+        ("metadata.memory_kind", "keyword"),
+        ("metadata.owner_user_id", "keyword"),
+        ("metadata.speaker", "keyword"),
+        ("metadata.workspace", "keyword"),
     )
 
     def _ensure_filter_indexes(self) -> None:
@@ -285,6 +311,9 @@ class CoreMixin:
         """
         if getattr(self, "_filter_indexes_ok", False):
             return
+        # Surface a pre-v3 collection (no BM25 slot) once per process, on the
+        # first search/timeline — the first point where it starts to matter.
+        self._warn_bm25_missing_once()
         # Mark attempted FIRST — a flaky Qdrant must not re-pay this on
         # every subsequent search.
         self._filter_indexes_ok = True
@@ -310,3 +339,37 @@ class CoreMixin:
                     )
         except Exception as e:
             logger.debug(f"filter payload index ensure failed (non-fatal): {e}")
+
+    def vector_store_capabilities(self) -> dict:
+        """What the live vector store can do, for ``/health``.
+
+        ``bm25_sparse`` is read from mem0's Qdrant store (``_has_bm25_slot``):
+        ``False`` means the collection predates the v3 BM25 sparse slot, so
+        search silently runs dense-only. ``None`` means not initialised yet or
+        the store does not report it. Never initialises the store and never
+        raises, so a health probe can call it freely.
+        """
+        memory = self._memory
+        store = getattr(memory, "vector_store", None) if memory is not None else None
+        flag = getattr(store, "_has_bm25_slot", None) if store is not None else None
+        if not isinstance(flag, bool):
+            return {"bm25_sparse": None, "detail": "vector store not initialized or does not report BM25 support"}
+        if flag:
+            return {"bm25_sparse": True}
+        self._warn_bm25_missing_once()
+        return {"bm25_sparse": False, "detail": _BM25_MISSING_DETAIL}
+
+    def _warn_bm25_missing_once(self) -> None:
+        """One structured warning per process when the BM25 slot is missing."""
+        global _bm25_warned
+        if _bm25_warned:
+            return
+        store = getattr(self._memory, "vector_store", None) if self._memory is not None else None
+        if getattr(store, "_has_bm25_slot", None) is not False:
+            return
+        _bm25_warned = True
+        logger.warning(
+            "vector_store_bm25_slot_missing collection=%s: keyword leg disabled, search is dense-only. %s",
+            settings.qdrant_collection,
+            _BM25_MISSING_DETAIL,
+        )
