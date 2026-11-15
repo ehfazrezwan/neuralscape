@@ -30,6 +30,12 @@ class Ctx:
     project_id: str
     token_source: str
     compose_project: str | None = None
+    # Flags-on profiles: the profile's recorded flags (placeholders for secrets,
+    # never values) and, when it names DICTATOR_USER_IDS, a token for the first
+    # id so scenarios can act as the dictator (@needs("dictator")).
+    profile_flags: dict = field(default_factory=dict)
+    dictator_user: str | None = None
+    token_dictator: str | None = field(default=None, repr=False)
 
     def compose(
         self,
@@ -89,7 +95,13 @@ def new_run_id() -> str:
     return out + "".join(random.choice(alphabet) for _ in range(3))
 
 
-def build(base_url: str, profile: str, compose_project: str | None = None) -> Ctx:
+def build(
+    base_url: str,
+    profile: str,
+    compose_project: str | None = None,
+    profile_flags: dict | None = None,
+    dictator_user: str | None = None,
+) -> Ctx:
     run_id = new_run_id()
     project_id = f"acc-{run_id}-proj"
     compose_project = compose_project or os.environ.get("NS_COMPOSE_PROJECT") or None
@@ -122,6 +134,14 @@ def build(base_url: str, profile: str, compose_project: str | None = None) -> Ct
             "no token source: pass --compose-project (or NS_COMPOSE_PROJECT), "
             "or set NS_TOKEN_SECRET, or set NS_TOKEN_A/NS_TOKEN_B with NS_USER_A/NS_USER_B"
         )
+    token_dictator = None
+    if dictator_user:
+        # Only when a token can be minted for an arbitrary id (compose or local secret);
+        # a run given two pre-made tokens has no dictator and @needs("dictator") skips.
+        if compose_project:
+            token_dictator = _mint_dictator(compose_project, dictator_user)
+        elif secret:
+            token_dictator = tokens.mint_local(dictator_user, secret)
     return Ctx(
         base_url=base_url.rstrip("/"),
         profile=profile,
@@ -134,4 +154,14 @@ def build(base_url: str, profile: str, compose_project: str | None = None) -> Ct
         project_id=project_id,
         token_source=source,
         compose_project=compose_project,
+        profile_flags=dict(profile_flags or {}),
+        dictator_user=dictator_user if token_dictator else None,
+        token_dictator=token_dictator,
     )
+
+
+def _mint_dictator(compose_project: str, user: str) -> str:
+    try:
+        return tokens.mint_via_compose(compose_project, user, os.environ.get("NS_API_SERVICE", "neuralscape"))
+    except tokens.TokenError as exc:
+        raise ConfigError(str(exc)) from exc
