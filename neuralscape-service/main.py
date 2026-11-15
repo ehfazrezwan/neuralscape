@@ -2126,6 +2126,10 @@ async def v1_search_memories(req: SearchMemoryRequest, request: Request):
     When project_id is provided, searches both global and project memories.
     Memory-model v2 filters (domain, observation_type, concepts) are optional.
 
+    Code-graph fusion ([structure]/[semantics] sections) is applied only by the
+    MCP recall_memories tool, when the project has a knowledge config with a
+    code_space. This REST endpoint returns plain ranked memories by design.
+
     Multi-user: results combine the caller's personal memories with the
     shared pool. Pass `visibility="private"` to restrict to personal only,
     `visibility="shared"` to restrict to the team pool, or
