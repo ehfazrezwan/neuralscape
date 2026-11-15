@@ -206,7 +206,7 @@ def batched_anchor_lookup(
         Dict mapping canonical FQN -> list of memory dicts.
     """
     from memory_service import get_shared_service
-    from qdrant_client.models import FieldCondition, Filter, MatchAny
+    from qdrant_client.models import FieldCondition, Filter, MatchAny, MatchValue
 
     if not fqns:
         return {}
@@ -227,7 +227,46 @@ def batched_anchor_lookup(
                 match=MatchAny(any=anchor_keys),
             )
         ]
-        query_filter = Filter(must=must)
+        # Push the readability predicate into Qdrant so other users' private
+        # rows on the same anchor can't consume the scroll limit and cut the
+        # caller's own rows before the Python post-filter runs. Rows are
+        # readable when visibility is shared/standard, or when the caller owns
+        # them (metadata.owner_user_id, or top-level user_id on rows that only
+        # carry that). Anonymous callers get shared/standard only.
+        shared_cond = FieldCondition(
+            key="metadata.visibility", match=MatchAny(any=["shared", "standard"])
+        )
+        readable_any: list = [shared_cond]
+        if user_id:
+            readable_any.append(
+                Filter(
+                    must=[
+                        Filter(
+                            should=[
+                                FieldCondition(
+                                    key="metadata.owner_user_id",
+                                    match=MatchValue(value=user_id),
+                                ),
+                                FieldCondition(
+                                    key="user_id", match=MatchValue(value=user_id)
+                                ),
+                            ]
+                        )
+                    ],
+                    # shared/standard rows are already covered above
+                    must_not=[shared_cond],
+                )
+            )
+        must.append(Filter(should=readable_any))
+        query_filter = Filter(
+            must=must,
+            # Same exclusion memory/search.py applies: dreaming tombstones.
+            must_not=[
+                FieldCondition(
+                    key="metadata.dream_tombstoned", match=MatchValue(value=True)
+                )
+            ],
+        )
 
         # Phase G-final (GF2): use scroll (filter-only, NO query vector) rather
         # than query_points with a throwaway zero vector. The anchor join filters
