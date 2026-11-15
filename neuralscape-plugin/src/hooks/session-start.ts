@@ -21,11 +21,14 @@
 import {
   type ContextResponse,
   type LocalCompactSnapshot,
+  type FailureKind,
   type NeuralscapeMemory,
   MalformedHookInputError,
   getFailLoudThreshold,
   getProjectId,
+  getServiceUrl,
   getUserId,
+  getUserIdSource,
   hasUserId,
   isProjectExcluded,
   listPendingBuffers,
@@ -37,7 +40,7 @@ import {
   readConfig,
   readLocalCompactSnapshot,
   readPredecessorSessionIds,
-  recordTransportFailure,
+  recordFailure,
   resetTransportFailures,
 } from "../utils.js";
 
@@ -99,6 +102,69 @@ export function buildUnreachableNotice(count: number, threshold: number): string
     );
   }
   return "[neuralscape] memory service unreachable — continuing without memory context.";
+}
+
+/**
+ * The notice for a failed context fetch, by failure kind. Only `network` and
+ * `server` are "unreachable" (and counted: see recordFailure); the others mean
+ * the service answered and the plugin's setup is wrong, so they say what to fix.
+ * Never includes the token or the URL.
+ */
+export function buildFailureNotice(
+  kind: FailureKind,
+  count: number | null,
+  threshold: number,
+): string {
+  switch (kind) {
+    case "auth":
+      return (
+        "[neuralscape] the memory service rejected the API key (HTTP 401/403) — " +
+        "the token is missing, expired or revoked. Update API_KEY with " +
+        "`/plugin config neuralscape@neuralscape-plugins`. Continuing without memory context."
+      );
+    case "not_found":
+      return (
+        "[neuralscape] the memory service answered 404 for the context route — " +
+        "the service URL is probably wrong or points at an incompatible version. " +
+        "Check URL in `/plugin config neuralscape@neuralscape-plugins`. Continuing without memory context."
+      );
+    case "client":
+      return (
+        "[neuralscape] the memory service rejected the context request (HTTP 4xx) — " +
+        "check the plugin URL, user id and service version. Continuing without memory context."
+      );
+    default:
+      return buildUnreachableNotice(count ?? 1, threshold);
+  }
+}
+
+const LOCAL_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]", "::1"]);
+
+/** True when the service URL points at this machine (or does not parse). */
+export function isLocalServiceUrl(url: string): boolean {
+  try {
+    return LOCAL_HOSTS.has(new URL(url).hostname.toLowerCase());
+  } catch {
+    return true;
+  }
+}
+
+/**
+ * One line shown when this install identifies as the OS login name (USER_ID
+ * unset) against a non-local service: the fallback is deliberate (see utils.ts)
+ * but the user should know which id their memories are filed under. Empty
+ * otherwise. Does not name the service host.
+ */
+export function buildIdentityNotice(
+  userId: string,
+  source: "config" | "os" | "none",
+  serviceUrl: string,
+): string {
+  if (source !== "os" || !userId || isLocalServiceUrl(serviceUrl)) return "";
+  return (
+    `[neuralscape] USER_ID is not set, so memories are filed under your OS login name "${userId}" ` +
+    "on a remote memory service. Set USER_ID with `/plugin config neuralscape@neuralscape-plugins` to choose the id."
+  );
 }
 
 // ── Legacy full-content formatting (CONTEXT_MODE=full) ───────────
@@ -451,18 +517,20 @@ async function main(): Promise<void> {
     let context: ContextResponse;
     try {
       context = await contextPromise;
-    } catch {
-      // NS unreachable — never block session start: one-line notice, exit 0.
-      // The consecutive-failure counter upgrades the notice to fail-loud
-      // once the streak crosses FAIL_LOUD_THRESHOLD (D4).
-      const count = await recordTransportFailure();
+    } catch (error) {
+      // Never block session start: one-line notice, exit 0. Only a down/failing
+      // service (network, 5xx) counts toward the consecutive-failure counter,
+      // which upgrades the notice to fail-loud at FAIL_LOUD_THRESHOLD (D4);
+      // auth / 404 / other 4xx get a notice naming what to fix instead.
+      const { kind, count } = await recordFailure(error);
+      logError(`context fetch failed (${kind})`, error);
       // Local-only parts still apply: buffers left by finished sessions keep
       // piling up during an outage unless this session is told about them,
       // and the local copy of the compact snapshot needs no service.
       const localResume = await localResumeBlock(input);
       const pendingDuringOutage = await buildPendingNote(input.session_id);
       outputWithContext(
-        buildUnreachableNotice(count, getFailLoudThreshold()) +
+        buildFailureNotice(kind, count, getFailLoudThreshold()) +
           (localResume ? `\n\n${localResume}` : "") +
           pendingDuringOutage,
       );
@@ -510,7 +578,9 @@ async function main(): Promise<void> {
       });
     }
 
-    const combined = (contextBody || "") + pendingNote;
+    const identityNotice = buildIdentityNotice(userId, getUserIdSource(), getServiceUrl());
+    const combined =
+      (contextBody || "") + pendingNote + (identityNotice ? `\n\n${identityNotice}` : "");
     if (combined.trim()) {
       outputWithContext(combined);
     } else {

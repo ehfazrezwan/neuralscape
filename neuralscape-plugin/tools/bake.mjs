@@ -17,6 +17,8 @@
  *   node tools/bake.mjs --url https://memory.acme.internal/mcp/ \
  *     --marketplace-name acme-plugins --owner "Acme" --owner-email ops@acme.com
  *   node tools/bake.mjs --url https://… --dry-run
+ *   node tools/bake.mjs --check                      # report the baked URL
+ *   node tools/bake.mjs --check --expect https://…   # exit 1 if it differs
  *
  * Options:
  *   --url <url>              Required. Service base or full /mcp/ URL. Must be
@@ -26,6 +28,13 @@
  *   --owner <s>             Optional. Set marketplace.json owner.name.
  *   --owner-email <s>       Optional. Set marketplace.json owner.email.
  *   --dry-run               Print what would change; write nothing.
+ *   --check                 Report which connector URL is baked into .mcp.json
+ *                           (and the API base the hooks derive from it); write
+ *                           nothing. A fork should run this before publishing: the
+ *                           URL shipped in this repo is the upstream channel's.
+ *                           Exits 0 unless --expect is given and differs.
+ *   --expect <url>          With --check: exit 1 when the baked URL is not this one
+ *                           (same normalization as --url). For a fork's own CI.
  *   --help                  Show this help.
  */
 import { readFileSync, writeFileSync, existsSync } from "node:fs";
@@ -56,6 +65,12 @@ function parseArgs(argv) {
         break;
       case "--dry-run":
         opts.dryRun = true;
+        break;
+      case "--check":
+        opts.check = true;
+        break;
+      case "--expect":
+        opts.expect = takeValue();
         break;
       case "--url":
         opts.url = takeValue();
@@ -128,11 +143,55 @@ function writeJson(path, obj) {
   writeFileSync(path, JSON.stringify(obj, null, 2) + "\n");
 }
 
+// Report what is baked. Writes nothing; exits 0 unless --expect differs, so it is
+// safe as a report step in any CI (including the upstream repo's own).
+function runCheck(opts) {
+  const mcp = readJson(mcpPath);
+  const raw = mcp?.mcpServers?.neuralscape?.url;
+  console.log("\n🔎 Baked distribution channel\n");
+  if (typeof raw !== "string" || raw === "") {
+    console.log("   connector URL: (none)\n   The hooks fall back to http://localhost:8199.\n");
+    process.exit(opts.expect ? 1 : 0);
+  }
+  console.log(`   connector URL: ${raw}`);
+  if (raw.includes("${")) {
+    console.log("   This is an un-baked template; the hooks ignore it and use http://localhost:8199.\n");
+    process.exit(opts.expect ? 1 : 0);
+  }
+  let parsed;
+  try {
+    parsed = new URL(raw);
+  } catch {
+    console.log("   This is not a valid URL; the hooks ignore it and use http://localhost:8199.\n");
+    process.exit(opts.expect ? 1 : 0);
+  }
+  const base = parsed.pathname.replace(/\/mcp\/?$/, "").replace(/\/$/, "");
+  console.log(`   hooks API base: ${parsed.origin}${base}   (overridden by the URL userConfig / NEURALSCAPE_URL)`);
+  console.log(
+    "   Self-hosting? This is the URL every install of your fork talks to by default.\n" +
+      "   Point it at your own service with:  npm run bake -- --url https://your-host\n",
+  );
+  if (opts.expect) {
+    const want = normalizeMcpUrl(opts.expect);
+    if (normalizeMcpUrl(raw) !== want) {
+      console.error(`❌ Baked URL differs from --expect (${want}).\n`);
+      process.exit(1);
+    }
+    console.log("✅ Baked URL matches --expect.\n");
+  }
+  process.exit(0);
+}
+
 const opts = parseArgs(process.argv.slice(2));
 if (opts.help) {
   console.log(HELP);
   process.exit(0);
 }
+
+if (opts.check) {
+  runCheck(opts);
+}
+if (opts.expect) fail("--expect only works with --check");
 
 const url = normalizeMcpUrl(opts.url);
 const changes = [];
