@@ -716,22 +716,37 @@ describe("leftovers of crashed processes, and an exhausted recovery chain", () =
     return seen;
   };
 
-  it("recovery sweeps old .tmp, .stale.* and dead recoverers' mutexes of other records, and keeps young and live ones", async () => {
+  it("recovery sweeps old .tmp and .stale.* leftovers and keeps young ones", async () => {
     const path = await fresh();
     const lock = lockFile(path);
     const judged = { pid: DEAD_PID, token: "dead", at: 1 };
     await writeFile(lock, record(judged));
-    const old = { tmp: lock + ".deadbeef.tmp", stale: lock + ".stale.deadbeef", otherMutex: lock + ".recover.0123456789abcdef.0" };
-    for (const f of Object.values(old)) await writeFile(f, f === old.otherMutex ? record({ pid: DEAD_PID, token: "x", at: 1 }) : "x");
+    const old = [lock + ".deadbeef.tmp", lock + ".stale.deadbeef"];
+    for (const f of old) await writeFile(f, "x");
+    await sleep(120); // older than the 50 ms bound
     const young = lock + ".cafe.tmp";
-    const liveMutex = lock + ".recover.fedcba9876543210.0";
-    await sleep(120); // the three above are now older than the 50 ms bound
     await writeFile(young, "x");
-    await writeFile(liveMutex, record({ token: "live", at: Date.now() - 60_000, start: undefined }));
-    expect(await recoverAbandoned(lock, judged, { sweepAgeMs: 50, mutexStaleMs: 50 })).toBe("removed");
-    for (const f of Object.values(old)) expect(existsSync(f)).toBe(false);
+    expect(await recoverAbandoned(lock, judged, { sweepAgeMs: 50 })).toBe("removed");
+    for (const f of old) expect(existsSync(f)).toBe(false);
     expect(existsSync(young)).toBe(true);
-    expect(existsSync(liveMutex)).toBe(true); // its recorder (this process) is alive
+  });
+
+  it("a recovery of one record never deletes the dead generation below another record's live recoverer", async () => {
+    const path = await fresh();
+    const lock = lockFile(path);
+    const judged = { pid: DEAD_PID, token: "dead", at: 1 };
+    await writeFile(lock, record(judged));
+    const other = { pid: DEAD_PID, token: "other-record", at: 2 };
+    const gen0 = recoveryMutexPath(lock, other, 0);
+    const gen1 = recoveryMutexPath(lock, other, 1);
+    await writeFile(gen0, record({ pid: DEAD_PID, token: "dead-recoverer", at: 1 }));
+    await writeFile(gen1, record({ token: "live-recoverer", at: Date.now(), start: undefined })); // this process: alive and older than the record
+    await sleep(120);
+    expect(await recoverAbandoned(lock, judged, { sweepAgeMs: 50, mutexStaleMs: 50 })).toBe("removed");
+    expect(existsSync(gen0)).toBe(true); // a new recoverer of `other` still cannot take generation 0 under the live one
+    expect(existsSync(gen1)).toBe(true);
+    await writeFile(lock, record(other));
+    expect(await recoverAbandoned(lock, other, { mutexStaleMs: 50, sweepAgeMs: 50 })).toBe("retry"); // gen1 is live: no second recoverer
   });
 
   it("an exhausted chain of dead recoverers logs one clear line and recovers nothing", async () => {

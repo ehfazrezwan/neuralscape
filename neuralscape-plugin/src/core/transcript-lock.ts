@@ -49,9 +49,10 @@
  * hooks are short-lived, so the window closes by itself.  A transcript that does not exist yet is canonicalized
  * through its parent directory, so it gets the same lock file once it exists.
  *
- * Leftovers: a crash can leave a ``.tmp`` (a record being linked in), a ``.stale.*`` (a lock moved aside) or a
- * recovery mutex of a dead recoverer.  Every recovery sweeps those that are older than the stale bound (by change
- * time, which a rename updates) and, for mutexes, whose recorder is gone.
+ * Leftovers: a crash can leave a ``.tmp`` (a record being linked in) or a ``.stale.*`` (a lock moved aside); every
+ * recovery sweeps those older than the stale bound.  A crashed recoverer's mutex files are not swept (removing a
+ * dead generation below a live one would let a new recoverer take it); they are passed over, and cleaned by the
+ * next recoverer that settles that record.
  */
 
 import { execFile } from "node:child_process";
@@ -295,23 +296,23 @@ async function takeMutex(
   return null;
 }
 
-/** Remove leftovers of crashed processes next to the lock (see the module header).  Never touches a live file. */
-async function sweepLeftovers(path: string, ageMs: number, keepMutexPrefix: string): Promise<void> {
+/**
+ * Remove ``.tmp`` and ``.stale.*`` leftovers of crashed processes next to the lock (by change time, which a rename
+ * updates).  Recovery mutex files are NEVER swept here: a dead generation below a live one must stay, or a new
+ * recoverer could take the vacated generation while the live one still works; dead generations are removed only by
+ * the recoverer that settled their record.
+ */
+async function sweepLeftovers(path: string, ageMs: number): Promise<void> {
   const dir = dirname(path);
   const base = basename(path);
   const names = await readdir(dir).catch(() => [] as string[]);
   for (const name of names) {
     if (!name.startsWith(base + ".")) continue;
     const rest = name.slice(base.length + 1);
+    if (!(rest.endsWith(".tmp") || rest.startsWith("stale."))) continue;
     const full = join(dir, name);
-    const isMutex = rest.startsWith("recover.");
-    if (isMutex ? full.startsWith(keepMutexPrefix) : !(rest.endsWith(".tmp") || rest.startsWith("stale."))) continue;
     const info = await stat(full).catch(() => null);
     if (!info || !info.isFile() || Date.now() - info.ctimeMs <= ageMs) continue;
-    if (isMutex) {
-      const record = await readOwner(full);
-      if (typeof record !== "object" || !(await ownerGone(record, ageMs))) continue; // only a dead recoverer's
-    }
     await unlink(full).catch(() => undefined);
   }
 }
@@ -331,7 +332,7 @@ export async function recoverAbandoned(path: string, judged: LockOwner | "invali
   // garbage; until then they stay, so no later contender can take a lower generation while we work
   let settled = false;
   try {
-    await sweepLeftovers(path, hooks.sweepAgeMs ?? LOCK_STALE_MS, recoveryMutexPath(path, judged, 0).slice(0, -1));
+    await sweepLeftovers(path, hooks.sweepAgeMs ?? LOCK_STALE_MS);
     if (!sameRecord(await readOwner(path), judged)) {
       settled = true;
       return "retry"; // it changed hands: not ours to remove
