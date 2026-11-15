@@ -6,6 +6,14 @@ Persistent agentic memory for **Claude Code** and **Claude Cowork**, backed by y
 - **Where it stores:** in your own Neuralscape deployment. The plugin never sends data anywhere else.
 - **Cost:** zero additional. The plugin is a thin client over your service.
 
+> **Forking or self-hosting? Read this first.** The connector URL baked into
+> `.mcp.json` in this repository is the upstream channel's service. A fork or a
+> copy installed as is talks to *that* URL by default. Before you publish or
+> install your own copy, bake your URL: `npm run bake -- --url https://your-host`
+> (see **Distribution & self-hosting** below), and verify what is baked with
+> `npm run bake -- --check`. If `USER_ID` is unset the hooks identify as your OS
+> login name; against a non-local service SessionStart tells you so.
+
 ## 60-second install (Claude Code)
 
 ```text
@@ -82,6 +90,14 @@ npm run bake -- --url https://your-host --marketplace-name acme-plugins --owner 
 
 Then commit the result to your channel's repo (marketplace installs pull raw
 from git — there's no build step, so the baked value must be committed).
+
+**Verify what is baked** (writes nothing; shows the connector URL and the API
+base the hooks derive from it):
+
+```bash
+npm run bake -- --check
+npm run bake -- --check --expect https://your-host   # exit 1 if it differs (for your fork's CI)
+```
 
 **Enable OAuth on your service** (required; the connector is OAuth-only, no API
 key). It's a thin wrapper over the token you already issue — no user database,
@@ -292,7 +308,8 @@ code:
 
 | Failure | Behavior | Exit code |
 |---|---|---|
-| Neuralscape unreachable / transport error | Continue without memory. SessionStart injects a one-line `[neuralscape] memory service unreachable` notice; other hooks log to stderr; the read gate allows the read. The session is NEVER blocked. | `0` |
+| Neuralscape answers 401/403 (bad or expired API key) or 404 (wrong URL) | The service is reachable, so this is not "unreachable": SessionStart injects a notice saying the key was rejected (fix `API_KEY`) or the URL is wrong (fix `URL`), never printing the key. These do not count toward the fail-loud streak. | `0` |
+| Neuralscape unreachable / transport error / 5xx | Continue without memory. SessionStart injects a one-line `[neuralscape] memory service unreachable` notice; other hooks log to stderr; the read gate allows the read. The session is NEVER blocked. | `0` |
 | Neuralscape unreachable for `FAIL_LOUD_THRESHOLD` (default 3) **consecutive** events | Fail loud instead of staying quietly degraded: the next SessionStart notice names the streak — `unreachable for N consecutive events — check docker compose ps`. Any successful call resets the counter. | `0` |
 | Malformed hook stdin (not valid JSON — a client bug) | Fail loud so the bug is visible instead of silently swallowed. | `2` on hooks where exit 2 cannot block (`SessionStart`, `SessionEnd`, `PostToolUse`) |
 | Malformed stdin on `Stop` / `UserPromptSubmit` / `PreToolUse` | Exit 2 has *blocking* semantics on these events (it would force Claude to continue, erase the user's prompt, or deny the tool call), so the never-block principle wins: log to stderr, exit `0`. | `0` |
