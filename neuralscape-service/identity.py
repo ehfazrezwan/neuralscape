@@ -9,6 +9,13 @@ never contain ``@``. Two-step resolution:
    preserving memories already stored under that id.
 2. **Slug** — everyone else gets a deterministic slug of their email, so the
    same person always resolves to the same id across sessions.
+
+The slug is lossy (``a+b@x.com`` and ``a-b@x.com`` both give ``a-b-x.com``) and
+existing users' ids must never change, so ``slugify_email`` is left as is and a
+collision is resolved at first login instead: when the slug is already claimed
+by a different identity, the newcomer gets ``disambiguate_user_id(slug, email)``
+(slug + short hash of the normalised email). See
+``login_providers.provision_user_id``.
 """
 
 from __future__ import annotations
@@ -49,3 +56,16 @@ def derive_user_id(email: str, identity_map: dict[str, str]) -> str:
     if mapped:
         return mapped
     return slugify_email(norm)
+
+
+def disambiguate_user_id(slug: str, email: str, *, hex_len: int = 8) -> str:
+    """Return ``slug`` made unique to ``email``: ``<slug>-<sha256(email)[:n]>``.
+
+    Deterministic, pattern-valid and capped at 100 chars (the slug is trimmed
+    to make room for the suffix). Only used when the plain slug is already
+    claimed by someone else; never changes an existing user's id.
+    """
+    norm = (email or "").strip().lower()
+    suffix = hashlib.sha256(norm.encode("utf-8")).hexdigest()[:hex_len]
+    head = _EDGE.sub("", slug[: _MAX_LEN - len(suffix) - 1])
+    return f"{head}-{suffix}" if head else f"user-{suffix}"

@@ -15,7 +15,7 @@ import identity_store
 import login_providers as lp
 from allowlist import email_domain, is_email_allowed, normalize_email
 from config import Settings, settings
-from identity import derive_user_id, slugify_email
+from identity import derive_user_id, disambiguate_user_id, slugify_email
 from login_providers import (
     AuthorizeContext,
     GoogleProvider,
@@ -24,6 +24,7 @@ from login_providers import (
     LoginResult,
     SupabaseProvider,
     get_login_provider,
+    provision_user_id,
     resolve_login_identity,
     sign_link_ticket,
     sign_login_state,
@@ -714,3 +715,76 @@ class TestOAuthLinkEndpoint:
         import oauth
         resp = await oauth.oauth_link(None, ticket="garbage", action="new", token="")
         assert resp.status_code == 400
+
+
+class TestSlugCollisions:
+    """Distinct emails that slug identically must not share a user_id."""
+
+    @pytest.mark.asyncio
+    async def test_second_identity_with_claimed_slug_gets_suffixed_id(self, auth_settings, fake_store):
+        auth_settings.auth_identity_map = ""
+        await identity_store.link("a-b-example.com", sub="s1", email="a-b@example.com")
+        uid, linked = await resolve_login_identity("s2", "a+b@example.com")
+        assert linked is False
+        assert uid != "a-b-example.com"
+        assert uid == disambiguate_user_id("a-b-example.com", "a+b@example.com")
+        assert uid.startswith("a-b-example.com-") and len(uid) == len("a-b-example.com-") + 8
+
+    @pytest.mark.asyncio
+    async def test_unclaimed_slug_and_existing_users_unchanged(self, auth_settings, fake_store):
+        auth_settings.auth_identity_map = ""
+        # nobody holds the slug: plain slug, exactly as before
+        assert await resolve_login_identity("s1", "a+b@example.com") == ("a-b-example.com", False)
+        # an already-linked identity resolves to its stored id, untouched
+        await identity_store.link("a-b-example.com", sub="s1", email="a+b@example.com")
+        assert await resolve_login_identity("s1", "a+b@example.com") == ("a-b-example.com", True)
+        # the same identity retrying first login is not "another" claimant
+        assert await provision_user_id("a-b-example.com", "s1", "a+b@example.com") == "a-b-example.com"
+
+    @pytest.mark.asyncio
+    async def test_seed_for_another_email_counts_as_claim(self, auth_settings, fake_store):
+        auth_settings.auth_identity_map = "a-b@example.com:a-b-example.com"
+        uid, linked = await resolve_login_identity("s2", "a+b@example.com")
+        assert linked is False and uid != "a-b-example.com"
+
+    @pytest.mark.asyncio
+    async def test_structurally_different_slug_collision(self, auth_settings, fake_store):
+        auth_settings.auth_identity_map = ""
+        await identity_store.link("a-b-c.com", sub="s1", email="a-b@c.com")
+        uid, _ = await resolve_login_identity("s2", "a@b-c.com")
+        assert uid != "a-b-c.com"
+
+    @pytest.mark.asyncio
+    async def test_store_down_keeps_plain_slug(self, auth_settings, monkeypatch):
+        def boom():
+            raise ConnectionError("no redis")
+        monkeypatch.setattr(identity_store, "_client", boom)
+        auth_settings.auth_identity_map = ""
+        assert await resolve_login_identity("s", "a+b@example.com") == ("a-b-example.com", False)
+
+    def test_slugify_output_is_unchanged_and_suffix_is_valid(self):
+        import re
+        assert slugify_email("a+b@example.com") == slugify_email("a-b@example.com") == "a-b-example.com"
+        long_slug = "x" * 100
+        uid = disambiguate_user_id(long_slug, "who@example.com")
+        assert len(uid) <= 100 and re.fullmatch(r"[a-zA-Z0-9_.\-]+", uid)
+        assert disambiguate_user_id("a", "WHO@example.com") == disambiguate_user_id("a", "who@example.com")
+
+    @pytest.mark.asyncio
+    async def test_oauth_link_new_never_shares_a_claimed_slug(self, auth_settings, fake_store):
+        import oauth
+        await identity_store.link("a-b-example.com", sub="s1", email="a-b@example.com")
+        # ticket minted while the slug looked free (or by the legacy path)
+        needs = LoginNeedsLink(_make_ctx(), "a+b@example.com", "s2", "a-b-example.com")
+        resp = await oauth.oauth_link(None, ticket=sign_link_ticket(needs, _SECRET), action="new", token="")
+        assert resp.status_code == 303
+        got = await identity_store.resolve("s2", "a+b@example.com")
+        assert got == disambiguate_user_id("a-b-example.com", "a+b@example.com")
+        assert await identity_store.resolve("s1", "a-b@example.com") == "a-b-example.com"  # untouched
+
+    @pytest.mark.asyncio
+    async def test_oauth_link_new_unclaimed_keeps_suggested(self, auth_settings, fake_store):
+        import oauth
+        needs = LoginNeedsLink(_make_ctx(), "solo@example.com", "s9", "solo-example.com")
+        await oauth.oauth_link(None, ticket=sign_link_ticket(needs, _SECRET), action="new", token="")
+        assert await identity_store.resolve("s9", None) == "solo-example.com"

@@ -33,6 +33,29 @@ comment on table public.signup_email_domains is
 comment on table public.signup_email_addresses is
   'Allowlisted individual email addresses for Supabase signup. Lowercase.';
 
+-- ── lock the tables down ────────────────────────────────────────────────
+-- Supabase exposes the public schema over PostgREST to the `anon` and
+-- `authenticated` roles, so without this anyone holding the public anon key
+-- could read the allowlist or INSERT their own address into it. RLS on with no
+-- policy for those roles = deny; the explicit revoke removes the table
+-- privileges Supabase grants to them by default. The hook itself is SECURITY
+-- DEFINER (runs as the table owner, which bypasses RLS); the policy below also
+-- lets supabase_auth_admin read the tables directly. Idempotent.
+
+alter table public.signup_email_domains   enable row level security;
+alter table public.signup_email_addresses enable row level security;
+
+revoke all on public.signup_email_domains   from anon, authenticated, public;
+revoke all on public.signup_email_addresses from anon, authenticated, public;
+
+drop policy if exists signup_email_domains_auth_admin_read on public.signup_email_domains;
+create policy signup_email_domains_auth_admin_read on public.signup_email_domains
+  for select to supabase_auth_admin using (true);
+
+drop policy if exists signup_email_addresses_auth_admin_read on public.signup_email_addresses;
+create policy signup_email_addresses_auth_admin_read on public.signup_email_addresses
+  for select to supabase_auth_admin using (true);
+
 -- ── seed (REPLACE with your org's domain) ───────────────────────────────
 -- Auto-allow your whole Workspace domain.
 insert into public.signup_email_domains (domain, note)
@@ -45,6 +68,8 @@ on conflict (domain) do nothing;
 
 -- ── the hook function ───────────────────────────────────────────────────
 
+-- NOTE: locals are v_-prefixed; a bare `email`/`domain` is ambiguous with the
+-- column names inside the EXISTS subqueries and makes every call raise.
 create or replace function public.hook_restrict_signup(event jsonb)
 returns jsonb
 language plpgsql
@@ -52,19 +77,19 @@ security definer
 set search_path = public
 as $$
 declare
-  email  text;
-  domain text;
+  v_email  text;
+  v_domain text;
 begin
-  email := lower(event->'user'->>'email');
+  v_email := lower(event->'user'->>'email');
 
   -- Require a well-formed address: a non-empty local-part AND domain. The
   -- `@` must not be the first char (empty local-part like "@example.com") nor
   -- absent, and the domain part must be non-empty. (OAuth signups arrive with
   -- an email already verified by the upstream IdP, e.g. Google; the service
   -- additionally checks `email_verified` on the session JWT.)
-  if email is null or email = ''
-     or position('@' in email) <= 1
-     or split_part(email, '@', 2) = ''
+  if v_email is null or v_email = ''
+     or position('@' in v_email) <= 1
+     or split_part(v_email, '@', 2) = ''
   then
     return jsonb_build_object(
       'error', jsonb_build_object(
@@ -74,11 +99,11 @@ begin
     );
   end if;
 
-  domain := split_part(email, '@', 2);
+  v_domain := split_part(v_email, '@', 2);
 
   -- Exact-address allowlist wins, then domain allowlist.
-  if exists (select 1 from public.signup_email_addresses a where a.email = email)
-     or exists (select 1 from public.signup_email_domains d where d.domain = domain)
+  if exists (select 1 from public.signup_email_addresses a where a.email = v_email)
+     or exists (select 1 from public.signup_email_domains d where d.domain = v_domain)
   then
     return '{}'::jsonb;  -- allow
   end if;

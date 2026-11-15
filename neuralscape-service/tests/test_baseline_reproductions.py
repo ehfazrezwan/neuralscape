@@ -67,15 +67,44 @@ def test_ordinary_namespace_tuples_stay_distinct() -> None:
     assert _build_group_id("private", "alice") == "user--alice"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason="legacy email slugging collapses every disallowed run to one '-', so distinct emails can share a user id",
-)
-def test_distinct_emails_have_distinct_user_ids() -> None:
-    from identity import derive_user_id
+def test_distinct_emails_have_distinct_user_ids(monkeypatch) -> None:
+    """Fixed at first login (not in ``slugify_email``, whose output must not
+    change for existing users): the second person whose slug is already
+    claimed gets a hash-suffixed id, and both stay stable on re-login."""
+    import identity_store
+    from config import settings
+    from login_providers import resolve_login_identity
 
-    assert derive_user_id("a+b@example.com", {}) != derive_user_id("a-b@example.com", {})
+    hashes: dict[str, dict[str, str]] = {}
+
+    class _Redis:
+        async def hget(self, h, k):
+            return hashes.get(h, {}).get(k)
+
+        async def hset(self, h, k, v):
+            hashes.setdefault(h, {})[k] = v
+
+        async def hgetall(self, h):
+            return dict(hashes.get(h, {}))
+
+        async def aclose(self):
+            return None
+
+    monkeypatch.setattr(identity_store, "_client", lambda: _Redis())
+    monkeypatch.setattr(settings, "auth_identity_map", "")
+
+    async def first_login(sub, email):
+        uid, linked = await resolve_login_identity(sub, email)
+        assert not linked
+        await identity_store.link(uid, sub=sub, email=email)  # what /oauth/link action=new does
+        return uid
+
+    first = _run(first_login("s1", "a-b@example.com"))
+    second = _run(first_login("s2", "a+b@example.com"))
+
+    assert first == "a-b-example.com"  # existing ids never change
+    assert second != first
+    assert _run(resolve_login_identity("s2", "a+b@example.com")) == (second, True)
 
 
 def test_ordinary_emails_slug_deterministically() -> None:

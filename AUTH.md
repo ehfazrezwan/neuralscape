@@ -91,6 +91,14 @@ hidden and `POST /oauth/authorize` rejects token submits). It's always shown for
    to an existing id, **preserving memories already stored under that id**.
 2. **Slug** — everyone else gets a deterministic slug:
    `alice.smith@example.com` → `alice.smith-example.com`.
+   The slug is lossy (`a+b@x.com` and `a-b@x.com` both give `a-b-x.com`), so a
+   **first login whose slug is already linked to a different sub/email (or seeded
+   in `AUTH_IDENTITY_MAP` for another email) gets `<slug>-<8 hex of sha256(email)>`
+   instead** (`login_providers.provision_user_id`, checked when the link page is
+   shown and again when `/oauth/link` provisions it). Existing links and the
+   first claimant keep the plain slug, so no existing id changes. Limit: the
+   check sees only the identity store and the env seed, not memories, so a user
+   who has memories under a slug but was never linked is not protected.
 
 > **Migration:** if memories are already keyed by short ids (e.g. `alice`),
 > map those people in `AUTH_IDENTITY_MAP` before flipping a provider on, or
@@ -202,7 +210,10 @@ docker compose exec neuralscape python scripts/issue_user_token.py --user alice 
 2. **Allowlist hook:** run [`neuralscape-service/supabase/allowlist_hook.sql`](neuralscape-service/supabase/allowlist_hook.sql)
    in the SQL editor. It creates `signup_email_domains` / `signup_email_addresses`,
    seeds a placeholder `example.com` (replace it), and defines
-   `public.hook_restrict_signup` (default-deny). Then **Authentication → Hooks → Before User Created →
+   `public.hook_restrict_signup` (default-deny). Both tables have row-level
+   security on and no `anon`/`authenticated` access (PostgREST cannot read or
+   edit the allowlist); re-running the script on an older install applies this.
+   Then **Authentication → Hooks → Before User Created →
    Postgres → select `hook_restrict_signup` → Enable.**
    - Add/remove access later with plain SQL — no redeploy:
      ```sql

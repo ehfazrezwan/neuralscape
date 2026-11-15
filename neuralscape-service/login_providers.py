@@ -37,7 +37,7 @@ from jwt import PyJWKClient
 import identity_store
 from allowlist import is_email_allowed
 from config import settings
-from identity import slugify_email
+from identity import disambiguate_user_id, slugify_email
 from tokens import sign_payload, verify_payload, verify_user_token
 
 logger = logging.getLogger(__name__)
@@ -189,7 +189,28 @@ async def resolve_login_identity(sub: str | None, email: str) -> tuple[str, bool
     if seed:
         await identity_store.link(seed, sub=sub, email=email)  # promote seed → durable
         return seed, True
-    return slugify_email(email), False
+    return await provision_user_id(slugify_email(email), sub, email), False
+
+
+async def provision_user_id(suggested: str, sub: str | None, email: str | None) -> str:
+    """Return the id a *new* (unlinked) identity should get.
+
+    ``suggested`` is the plain email slug. The slug is lossy, so two different
+    emails can derive the same one; if it is already linked to a different
+    sub/email (or seeded for a different email in ``AUTH_IDENTITY_MAP``) the
+    newcomer gets a hash-suffixed id instead of silently sharing that user's
+    memories. Existing links never pass through here, so existing ids are
+    unchanged. Idempotent: an already-disambiguated id that is unclaimed is
+    returned as is. Called when the suggestion is made and again when
+    ``/oauth/link`` provisions it (the slug may have been claimed in between).
+    """
+    seeds = settings.identity_map_dict()
+    candidate = suggested
+    for hex_len in (8, 16, 64):
+        if not await identity_store.claimed_by_other(candidate, sub=sub, email=email, seed_map=seeds):
+            return candidate
+        candidate = disambiguate_user_id(suggested, email or "", hex_len=hex_len)
+    return candidate
 
 
 async def _resolve_identity(
@@ -539,6 +560,6 @@ def get_login_provider() -> LoginProvider:
 __all__ = [
     "AuthorizeContext", "LoginResult", "LoginError", "LoginNeedsLink",
     "LoginProvider", "get_login_provider", "sign_login_state", "verify_login_state",
-    "sign_link_ticket", "verify_link_ticket", "resolve_login_identity",
+    "sign_link_ticket", "verify_link_ticket", "resolve_login_identity", "provision_user_id",
     "verify_user_token",
 ]

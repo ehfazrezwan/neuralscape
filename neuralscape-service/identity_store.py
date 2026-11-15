@@ -119,3 +119,38 @@ async def all_links() -> dict[str, dict[str, str]]:
     except Exception as e:  # noqa: BLE001
         logger.warning("identity_store.all_links unavailable (%s)", e)
         return {"by_sub": {}, "by_email": {}}
+
+
+async def claimed_by_other(
+    user_id: str,
+    *,
+    sub: str | None = None,
+    email: str | None = None,
+    seed_map: dict[str, str] | None = None,
+) -> bool:
+    """True when ``user_id`` is already linked to an identity other than this
+    ``sub``/``email`` (another sub, another email, or an ``AUTH_IDENTITY_MAP``
+    seed for a different email). Used to stop two people sharing one slug.
+
+    Best-effort like the rest of the module: if Redis is unreachable the answer
+    is False (the caller keeps today's behaviour) and a WARNING is logged.
+    """
+    if not user_id:
+        return False
+    email_n = _norm_email(email)
+    for seed_email, seed_uid in (seed_map or {}).items():
+        if seed_uid == user_id and _norm_email(seed_email) != email_n:
+            return True
+    try:
+        client = _client()
+        try:
+            by_sub = await client.hgetall(SUB_HASH)
+            by_email = await client.hgetall(EMAIL_HASH)
+        finally:
+            await client.aclose()
+    except Exception as e:  # noqa: BLE001
+        logger.warning("identity_store.claimed_by_other unavailable (%s); assuming unclaimed", e)
+        return False
+    if any(uid == user_id and key != sub for key, uid in (by_sub or {}).items()):
+        return True
+    return any(uid == user_id and key != email_n for key, uid in (by_email or {}).items())
