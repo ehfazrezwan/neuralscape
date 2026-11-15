@@ -1,7 +1,9 @@
 """Real-Redis check that /flush binds identity to the per-user token (sec-02).
 
-Uses a private ARQ queue name so no live worker can pick the job up. Skipped
-when Redis is unreachable; the remote gate runs it with Redis up.
+Lives in ``integration_tests/`` (outside the host/container unit suites, like
+the other live-store qualifications) and is run explicitly with Redis up; an
+unreachable Redis is a test failure. Uses a private ARQ queue name so no live
+worker can pick the job up.
 """
 
 import asyncio
@@ -23,25 +25,7 @@ PREFIX = "/v1/extensions/conversation-compiler"
 FLUSH = {"user_message": "hi", "assistant_response": "hello", "session_id": "s-int"}
 
 
-def _redis_reachable() -> bool:
-    async def probe():
-        pool = await create_pool(parse_redis_settings())
-        try:
-            await pool.ping()
-        finally:
-            await pool.close()
-
-    try:
-        asyncio.run(asyncio.wait_for(probe(), 3))
-        return True
-    except Exception:
-        return False
-
-
-pytestmark = [
-    pytest.mark.integration,
-    pytest.mark.skipif(not _redis_reachable(), reason="Redis not reachable"),
-]
+pytestmark = pytest.mark.integration
 
 
 def _bearer(user_id):
