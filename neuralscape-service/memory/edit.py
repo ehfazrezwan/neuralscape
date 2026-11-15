@@ -71,6 +71,11 @@ def normalize_expected_revision(value) -> str | None:
     return str(int(token))
 
 
+# A content edit marks the row "pending" while it re-embeds; the mark expires so a
+# crashed writer cannot wedge the row (conditional writers are refused meanwhile).
+_PENDING_LEASE_S = 120
+
+
 def _revision_filter(memory_id: str, revision: str, parent_key: str):
     """Qdrant filter selecting exactly this point at exactly this revision."""
     from qdrant_client.models import (
@@ -81,6 +86,7 @@ def _revision_filter(memory_id: str, revision: str, parent_key: str):
         MatchValue,
         PayloadField,
     )
+    from qdrant_client.models import DatetimeRange
 
     key = f"{parent_key}.revision"
     if int(revision) == 0:
@@ -90,7 +96,14 @@ def _revision_filter(memory_id: str, revision: str, parent_key: str):
         ])
     else:
         at_revision = Filter(must=[FieldCondition(key=key, match=MatchValue(value=int(revision)))])
-    return Filter(must=[HasIdCondition(has_id=[memory_id]), at_revision])
+    lease_cutoff = datetime.fromtimestamp(
+        datetime.now(timezone.utc).timestamp() - _PENDING_LEASE_S, timezone.utc
+    ).isoformat()
+    not_pending = Filter(should=[
+        IsEmptyCondition(is_empty=PayloadField(key=f"{parent_key}.revision_pending")),
+        FieldCondition(key=f"{parent_key}.revision_pending_at", range=DatetimeRange(lt=lease_cutoff)),
+    ])
+    return Filter(must=[HasIdCondition(has_id=[memory_id]), at_revision, not_pending])
 
 
 class EditMixin:
@@ -150,12 +163,15 @@ class EditMixin:
         return new_meta
 
     def _confirm_revision_claim(
-        self, client, collection: str, memory_id: str, nonce: str | None, expected: str
+        self, client, collection: str, memory_id: str, nonce: str | None, expected: str, new_revision: int
     ) -> None:
         """Verify OUR filtered write is the one that landed; else raise ``RevisionConflict``.
 
         A filtered ``set_payload`` is silent when the filter matches nothing, so
-        the winner is identified by the per-write nonce stamped in the payload.
+        the winner is identified by the nonce recorded FOR THE REVISION WE
+        CREATED (``revision_nonces[<new_revision>]``). Keying by revision keeps
+        the answer correct when a successor write has already landed on top of
+        ours before this read: it carries the map forward, so our entry survives.
         """
         points = client.retrieve(
             collection_name=collection, ids=[memory_id], with_payload=True, with_vectors=False
@@ -165,21 +181,49 @@ class EditMixin:
         stored = (points[0].payload or {}).get("metadata") or {}
         if isinstance(stored.get("metadata"), dict):
             stored = stored["metadata"]
-        if stored.get("revision_nonce") != nonce:
+        if (stored.get("revision_nonces") or {}).get(str(new_revision)) != nonce:
             raise RevisionConflict(memory_id, expected, revision_of(stored))
 
     def _claim_revision(
         self, client, collection: str, memory_id: str, current_revision: str,
-        nonce: str | None, new_revision: int, parent_key: str,
+        nonce: str | None, new_revision: int, parent_key: str, nonces: dict,
     ) -> None:
-        """Atomically bump the revision (and stamp our nonce) iff it is still current."""
+        """Atomically bump the revision, record our nonce and mark the row pending, iff it is still current.
+
+        While ``revision_pending`` is set (until the rewrite replaces the payload,
+        or the lease runs out) every conditional writer is refused by the filter,
+        so none can commit on the claimed revision and then be overwritten by the
+        still-running rewrite.
+        """
         client.set_payload(
             collection_name=collection,
-            payload={"revision": new_revision, "revision_nonce": nonce},
+            payload={
+                "revision": new_revision,
+                "revision_nonces": nonces,
+                "revision_pending": nonce,
+                "revision_pending_at": datetime.now(timezone.utc).isoformat(),
+            },
             points=_revision_filter(memory_id, current_revision, parent_key),
             key=parent_key,
         )
-        self._confirm_revision_claim(client, collection, memory_id, nonce, current_revision)
+        self._confirm_revision_claim(client, collection, memory_id, nonce, current_revision, new_revision)
+
+    @staticmethod
+    def _clear_pending(client, collection: str, memory_id: str, nonce: str | None, parent_key: str) -> None:
+        """Best effort: drop OUR pending mark after a failed rewrite (the lease covers a crash)."""
+        try:
+            from qdrant_client.models import FieldCondition, Filter, HasIdCondition, MatchValue
+
+            client.delete_payload(
+                collection_name=collection,
+                keys=[f"{parent_key}.revision_pending", f"{parent_key}.revision_pending_at"],
+                points=Filter(must=[
+                    HasIdCondition(has_id=[memory_id]),
+                    FieldCondition(key=f"{parent_key}.revision_pending", match=MatchValue(value=nonce)),
+                ]),
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"Could not clear the pending revision mark for {memory_id}: {e}")
 
     def patch_memory(
         self,
@@ -322,9 +366,16 @@ class EditMixin:
         # concurrent holder of the old revision is refused.
         new_meta["revision"] = int(current_revision) + 1
         write_nonce = None
+        new_meta.pop("revision_pending", None)
+        new_meta.pop("revision_pending_at", None)
+        new_meta.pop("revision_nonce", None)   # superseded by the per-revision map below
         if expected_revision is not None:
             write_nonce = uuid.uuid4().hex
-            new_meta["revision_nonce"] = write_nonce
+            nonces = dict(meta.get("revision_nonces") or {})
+            nonces[str(int(current_revision) + 1)] = write_nonce
+            for old in sorted(nonces, key=int)[:-8]:   # keep the last 8 only
+                del nonces[old]
+            new_meta["revision_nonces"] = nonces
         client = m.vector_store.client
         collection = settings.qdrant_collection
         if expected_revision is not None and edits_content:
@@ -332,14 +383,20 @@ class EditMixin:
             # of N concurrent patches holding this revision gets past here.
             self._claim_revision(
                 client, collection, memory_id, current_revision, write_nonce,
-                int(current_revision) + 1, revision_parent,
+                int(current_revision) + 1, revision_parent, nonces,
             )
         if edits_content:
             # Full mem0 update: re-embed + BM25 refresh + history. Passing the
             # merged nested metadata is load-bearing — mem0's _update_memory
             # rebuilds the ENTIRE payload from this kwarg, so omitting it (the
             # old update_memory bug) wipes category/scope/tags/visibility/owner.
-            m.update(memory_id, changes["content"], metadata={"metadata": new_meta})
+            try:
+                # Rebuilds the payload from new_meta, which carries no pending mark.
+                m.update(memory_id, changes["content"], metadata={"metadata": new_meta})
+            except Exception:
+                if expected_revision is not None:
+                    self._clear_pending(client, collection, memory_id, write_nonce, revision_parent)
+                raise
         elif expected_revision is not None:
             # Metadata-only with a precondition: ONE filtered set_payload, applied
             # by Qdrant only if the point still carries the expected revision.
@@ -348,7 +405,9 @@ class EditMixin:
                 payload={"metadata": new_meta, "updated_at": now_iso},
                 points=_revision_filter(memory_id, current_revision, revision_parent),
             )
-            self._confirm_revision_claim(client, collection, memory_id, write_nonce, expected_revision)
+            self._confirm_revision_claim(
+                client, collection, memory_id, write_nonce, expected_revision, int(current_revision) + 1
+            )
         else:
             # Metadata-only: direct payload patch. set_payload merges at top
             # level, so data/hash/created_at/user_id are preserved and the

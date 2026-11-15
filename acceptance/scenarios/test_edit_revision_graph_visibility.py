@@ -138,6 +138,18 @@ def test_owner_reaches_the_narrowed_memory_in_their_own_graph(a, narrowed):
     )
 
 
+def _holds_for(check, *, window: float, interval: float) -> None:
+    """Assert ``check`` passes on EVERY poll across ``window`` seconds (unlike ``eventually``, which returns on the first pass)."""
+    import time
+
+    deadline = time.monotonic() + window
+    while True:
+        check()
+        if time.monotonic() >= deadline:
+            return
+        time.sleep(interval)
+
+
 def _assert_in(text: str, marker: str) -> None:
     assert marker in text, "not there yet"
 
@@ -146,9 +158,8 @@ def _assert_in(text: str, marker: str) -> None:
 def test_narrowed_memory_is_absent_from_the_shared_graph_pool(b, narrowed):
     # (ordered after the owner reached it: both jobs have had their chance to run)
     check_marker_not_visible_through_graph(b, narrowed)
-    # and stays absent: a late-running stale job must not publish it either
-    eventually(lambda: check_marker_not_visible_through_graph(b, narrowed), timeout=20, interval=5,
-               what="shared pool stays clean")
+    # and stays absent for the whole observation window: a late-running stale job must not publish it either
+    _holds_for(lambda: check_marker_not_visible_through_graph(b, narrowed), window=30, interval=5)
     assert b.get(f"/v1/memories/{narrowed['id']}").status_code == 404, "B can read the narrowed memory"
 
 

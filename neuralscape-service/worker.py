@@ -1168,12 +1168,30 @@ async def process_graph_enrichment(
             # resolves by uuid first, so a newer re-ingested episode of the same
             # memory is never the one expired. Otherwise exact-content match.
             ours = episode_after if episode_after and episode_after != episode_before else None
-            await asyncio.to_thread(
-                expire,
-                {"memory": content, "metadata": {"graph_episode_uuid": ours} if ours else {}, "user_id": user_id},
-                group_id=written_group,
-                memory_id=memory_id,
-            )
+            resolved = False
+            for attempt, pause in enumerate((0, 1.0, 3.0), start=1):
+                if pause:
+                    await asyncio.sleep(pause)
+                result = await asyncio.to_thread(
+                    expire,
+                    {"memory": content, "metadata": {"graph_episode_uuid": ours} if ours else {}, "user_id": user_id},
+                    group_id=written_group,
+                    memory_id=memory_id,
+                )
+                resolved = bool(isinstance(result, dict) and result.get("resolved"))
+                if resolved:
+                    break
+                logger.warning(
+                    "Cleanup of the stale episode for memory %s (group %r) unresolved on attempt %d",
+                    memory_id, written_group, attempt,
+                )
+            if not resolved:
+                # Never swallow it: a shared episode of a now-private/deleted memory must not stay readable
+                # unnoticed. Fail the job visibly with the identity needed to retry the cleanup.
+                raise RuntimeError(
+                    f"graph cleanup unresolved for memory {memory_id}: group_id={written_group!r} "
+                    f"episode_uuid={ours!r}; re-run the episode cascade for this group/episode"
+                )
             return {"memory_id": memory_id, "enriched": False, "skipped": "changed_during_enrichment"}
     if not enriched:
         logger.warning(

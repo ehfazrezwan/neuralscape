@@ -306,94 +306,122 @@ class DeleteMixin:
         cascade_rows: list[dict] = []
         failed_ids: list[str] = []
         seen: set[str] = set()
-        truncated = False
+
+        listing_failed = False
+        # Widest raw window a sweep may ask for; beyond it the result says ``truncated``.
+        cap = _BULK_PAGE * _BULK_MAX_ROUNDS
+
+        def _sweep(fetch, row_id, handle) -> bool:
+            """Page a sweep: returns True when it stopped early (truncated or a mid-sweep listing failure).
+
+            ``fetch(limit)`` returns the RAW rows (tombstones included); exhaustion is
+            judged from that raw size, never from a post-filter length. Rows already
+            handled (deleted, failed, or preserved shared/standard) stay in the next
+            listing, so when a round makes no progress the window is DOUBLED to reach
+            rows behind them, up to ``cap``.
+            """
+            nonlocal listing_failed
+            limit = _BULK_PAGE
+            for round_no in range(_BULK_MAX_ROUNDS):
+                try:
+                    batch = fetch(limit)
+                except Exception as e:
+                    if round_no == 0 and not seen:
+                        raise MemoryListingFailed(
+                            "Memories could not be listed; nothing was deleted. Retry."
+                        ) from e
+                    logger.warning(f"Bulk delete listing failed after partial progress: {e}")
+                    listing_failed = True
+                    return True
+                fresh = [x for x in batch if row_id(x) not in seen]
+                for row in fresh:
+                    seen.add(row_id(row))
+                    handle(row)
+                if len(batch) < limit:
+                    return False  # a short RAW page: everything that matched has been seen
+                if not fresh:
+                    if limit >= cap:
+                        return True
+                    limit = min(limit * 2, cap)
+            return True
 
         if filter_null_category:
-            for _round in range(_BULK_MAX_ROUNDS):
-                batch = self._list_null_category_memories(
-                    user_id=user_id, scope=scope, project_id=project_id, limit=_BULK_PAGE,
-                )
-                fresh = [x for x in batch if x["id"] not in seen]
-                if not fresh:
-                    truncated = len(batch) >= _BULK_PAGE  # a full page of rows already handled: more may sit behind them
-                    break
-                for mem_info in fresh:
-                    seen.add(mem_info["id"])
-                    meta = mem_info.get("metadata", {}) or {}
-                    if isinstance(meta.get("metadata"), dict):
-                        meta = meta["metadata"]
-                    if not include_shared and meta.get("visibility") == MemoryVisibility.SHARED.value:
-                        skipped_shared += 1
-                        continue
-                    if meta.get("visibility") == MemoryVisibility.STANDARD.value and not settings.is_dictator(user_id):
-                        skipped_standard += 1
-                        continue
-                    mid = mem_info["id"]
-                    try:
-                        m.vector_store.delete(mid)
-                        cascade_rows.append({
-                            "id": mid,
-                            "mem": {"memory": mem_info.get("data", ""), "metadata": meta},
-                            "group_id": None,
-                        })
-                        deleted_count += 1
-                    except Exception as e:
-                        failed_ids.append(mid)
-                        logger.warning(f"Failed to delete null-category memory {mid}: {e}")
-                if len(batch) < _BULK_PAGE:
-                    break  # a short page: everything that matched has been seen
-            else:
-                truncated = True
+            def _handle_null(mem_info):
+                nonlocal deleted_count, skipped_shared, skipped_standard
+                meta = mem_info.get("metadata", {}) or {}
+                if isinstance(meta.get("metadata"), dict):
+                    meta = meta["metadata"]
+                if not include_shared and meta.get("visibility") == MemoryVisibility.SHARED.value:
+                    skipped_shared += 1
+                    return
+                if meta.get("visibility") == MemoryVisibility.STANDARD.value and not settings.is_dictator(user_id):
+                    skipped_standard += 1
+                    return
+                mid = mem_info["id"]
+                try:
+                    m.vector_store.delete(mid)
+                    cascade_rows.append({
+                        "id": mid,
+                        "mem": {"memory": mem_info.get("data", ""), "metadata": meta},
+                        "group_id": None,
+                    })
+                    deleted_count += 1
+                except Exception as e:
+                    failed_ids.append(mid)
+                    logger.warning(f"Failed to delete null-category memory {mid}: {e}")
+
+            truncated = _sweep(
+                lambda lim: self._list_null_category_memories(
+                    user_id=user_id, scope=scope, project_id=project_id, limit=lim,
+                ),
+                lambda x: x["id"],
+                _handle_null,
+            )
+            # Cleanup runs for what WAS deleted even if the sweep stopped early.
             graph = self._bulk_graph_cleanup(cascade_rows, "null-category")
             return {
                 "message": _deleted_msg("null-category memories", deleted_count, skipped_shared, skipped_standard)
                 + (f" ({len(failed_ids)} failed)" if failed_ids else ""),
                 **graph,
                 **_bulk_partial_fields(failed_ids, truncated),
+                **({"listing_failed": True} if listing_failed else {}),
             }
 
         # For filtered deletes, we need to list then delete individually
-        for _round in range(_BULK_MAX_ROUNDS):
-            batch = self.list_memories(
-                user_id=user_id,
-                scope=scope,
-                category=category,
-                project_id=project_id,
-                limit=_BULK_PAGE,
-            )
-            fresh = [x for x in batch if x.id not in seen]
-            if not fresh:
-                truncated = len(batch) >= _BULK_PAGE
-                break
-            for mem in fresh:
-                seen.add(mem.id)
-                if not include_shared and getattr(mem, "visibility", None) == MemoryVisibility.SHARED.value:
-                    skipped_shared += 1
-                    continue
-                if getattr(mem, "visibility", None) == MemoryVisibility.STANDARD.value and not settings.is_dictator(user_id):
-                    skipped_standard += 1
-                    continue
-                try:
-                    # Get full memory for graph cleanup before deleting
-                    full_mem = m.get(mem.id)
-                    m.delete(mem.id)
-                    if full_mem:
-                        cascade_rows.append({"id": mem.id, "mem": full_mem, "group_id": None})
-                    deleted_count += 1
-                except Exception as e:
-                    failed_ids.append(mem.id)
-                    logger.warning(f"Failed to delete memory {mem.id}: {e}")
-            if len(batch) < _BULK_PAGE:
-                break
-        else:
-            truncated = True
+        def _handle_row(mem):
+            nonlocal deleted_count, skipped_shared, skipped_standard
+            if not include_shared and getattr(mem, "visibility", None) == MemoryVisibility.SHARED.value:
+                skipped_shared += 1
+                return
+            if getattr(mem, "visibility", None) == MemoryVisibility.STANDARD.value and not settings.is_dictator(user_id):
+                skipped_standard += 1
+                return
+            try:
+                # Get full memory for graph cleanup before deleting
+                full_mem = m.get(mem.id)
+                m.delete(mem.id)
+                if full_mem:
+                    cascade_rows.append({"id": mem.id, "mem": full_mem, "group_id": None})
+                deleted_count += 1
+            except Exception as e:
+                failed_ids.append(mem.id)
+                logger.warning(f"Failed to delete memory {mem.id}: {e}")
 
+        truncated = _sweep(
+            lambda lim: self.list_memories(
+                user_id=user_id, scope=scope, category=category, project_id=project_id,
+                limit=lim, include_tombstoned=True,  # raw size decides exhaustion; tombstoned rows match the filter too
+            ),
+            lambda x: x.id,
+            _handle_row,
+        )
         graph = self._bulk_graph_cleanup(cascade_rows, "filtered")
         return {
             "message": _deleted_msg("memories", deleted_count, skipped_shared, skipped_standard)
             + (f" ({len(failed_ids)} failed)" if failed_ids else ""),
             **graph,
             **_bulk_partial_fields(failed_ids, truncated),
+            **({"listing_failed": True} if listing_failed else {}),
         }
 
     def _bulk_graph_cleanup(

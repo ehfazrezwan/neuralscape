@@ -7,6 +7,8 @@ shared graph group its owner has since withdrawn it from.
 """
 
 import asyncio
+
+import pytest
 from types import SimpleNamespace
 
 from worker import process_graph_enrichment
@@ -105,8 +107,12 @@ class DuringService(Service):
         self.reads += 1
         return self.row if self.reads == 1 else self.after
 
+    resolved_results = None   # optional list of results to return per attempt
+
     def _cascade_or_fallback_expire(self, mem, *, group_id=None, memory_id=""):
         self.expired.append((mem, group_id, memory_id))
+        if self.resolved_results:
+            return self.resolved_results.pop(0)
         return {"resolved": True}
 
 
@@ -185,3 +191,30 @@ def test_the_cascade_prefers_the_uuid_over_a_newer_same_content_episode():
     s._delete_episode_node = lambda *a, **k: None
     out = s._cascade_expire_episode("g", episode_uuid="ep-ours", content="the text")
     assert out["episode_uuid"] == "ep-ours" and seen == ["uuid"]
+
+
+def _no_sleep(monkeypatch):
+    async def instant(_):
+        return None
+
+    monkeypatch.setattr("worker.asyncio.sleep", instant)
+
+
+def test_unresolved_cleanup_fails_the_job_visibly_with_the_identity_to_retry(monkeypatch):
+    """Finding 7: a shared episode of a now-private memory must not stay readable unnoticed."""
+    _no_sleep(monkeypatch)
+    after = _row_like(visibility="private", project_id=None, memory="the text", workspace=None)
+    svc = DuringService(after, visibility="shared", project_id=None, memory="the text", workspace=None)
+    svc.resolved_results = [{"resolved": False}] * 3
+    with pytest.raises(RuntimeError, match="graph cleanup unresolved for memory m1.*group_id='shared'"):
+        _run(svc, visibility="shared")
+    assert len(svc.expired) == 3                      # retried before giving up
+
+
+def test_cleanup_that_resolves_on_a_retry_is_a_normal_skip(monkeypatch):
+    _no_sleep(monkeypatch)
+    after = _row_like(visibility="private", project_id=None, memory="the text", workspace=None)
+    svc = DuringService(after, visibility="shared", project_id=None, memory="the text", workspace=None)
+    svc.resolved_results = [{"resolved": False}, {"resolved": True}]
+    out = _run(svc, visibility="shared")
+    assert out["skipped"] == "changed_during_enrichment" and len(svc.expired) == 2

@@ -46,6 +46,8 @@ def _match(cond, pid, payload) -> bool:
         return _dig(payload, cond.is_empty.key) in (None, [], "")
     assert isinstance(cond, FieldCondition), cond
     val = _dig(payload, cond.key)
+    if cond.range is not None:          # DatetimeRange(lt=...) on an ISO string
+        return val is not None and str(val) < str(cond.range.lt)
     assert isinstance(cond.match, MatchValue), cond.match
     return cond.match.value in val if isinstance(val, list) else val == cond.match.value
 
@@ -94,6 +96,16 @@ class FakeQdrant:
             target.update(payload)
             self.writes.append(f"set_payload:{pid}")
 
+    def delete_payload(self, collection_name, keys, points):
+        for pid in [p for p, v in self.points.items() if _eval(points, p, v)]:
+            for key in keys:
+                node = self.points[pid]
+                parts = key.split(".")
+                for part in parts[:-1]:
+                    node = node.get(part, {})
+                node.pop(parts[-1], None)
+            self.writes.append(f"delete_payload:{pid}")
+
     def scroll(self, collection_name, scroll_filter=None, limit=100, offset=None,
                with_payload=True, with_vectors=False):
         items = [(k, v) for k, v in self.points.items() if _eval(scroll_filter, k, v)]
@@ -108,7 +120,14 @@ class FakeQdrant:
         self.points[pid].update(payload or {})
         self.writes.append(f"vs_update:{pid}")
 
+    before_mem0_update = None             # hook: a writer that runs while the rewrite is in flight
+
     def mem0_update(self, pid, data, metadata=None):
+        if self.before_mem0_update:
+            hook, self.before_mem0_update = self.before_mem0_update, None
+            hook(self)
+        if getattr(self, "fail_mem0_update", False):
+            raise RuntimeError("embedder down")
         # mem0 rebuilds the whole payload from the metadata kwarg
         self.points[pid]["data"] = data
         self.points[pid]["metadata"] = (metadata or {}).get("metadata", {})
@@ -297,6 +316,61 @@ def test_revision_of_tolerates_missing_and_garbage():
 
 def test_the_internal_write_nonce_is_never_returned_in_a_response(world):
     out = world.patch_memory(M1, "ehfaz", {"tags": ["x"]}, expected_revision="0")
-    assert "revision_nonce" in world.fake.points[M1]["metadata"]     # stored (needed to identify the winner) ...
+    assert "revision_nonces" in world.fake.points[M1]["metadata"]    # stored (needed to identify the winner) ...
     dumped = str(out["memory"].model_dump()) + str(world.get_memory(M1).model_dump())
     assert "revision_nonce" not in dumped                              # ... but not part of any response model
+
+
+# ── review findings 5 and 6 ───────────────────────────────────────────
+
+
+def test_a_committed_conditional_patch_is_not_reported_as_a_conflict_when_a_successor_already_landed(world):
+    """Finding 5: our filtered write committed; a successor (holding the new revision) lands before the
+    confirming read. Success must be decided from OUR revision's nonce, not the latest write's."""
+    real_retrieve = world.fake.retrieve
+    state = {"done": False}
+
+    def retrieve_after_successor(collection_name, ids, with_payload=True, with_vectors=False):
+        if not state["done"] and world.fake.points[M1]["metadata"].get("revision") == 1:
+            state["done"] = True    # the successor lands between our write and our confirming read
+            world.patch_memory(M1, "ehfaz", {"tags": ["successor"]}, expected_revision="1")
+        return real_retrieve(collection_name, ids, with_payload, with_vectors)
+
+    world.fake.retrieve = retrieve_after_successor
+    out = world.patch_memory(M1, "ehfaz", {"tags": ["mine"]}, expected_revision="0")   # must NOT raise
+    assert out["memory"] is not None
+    assert world.fake.points[M1]["metadata"]["revision"] == 2 and _tags(world) == ["successor"]
+
+
+def test_a_second_conditional_writer_cannot_commit_inside_a_content_edits_rewrite_window(world):
+    """Finding 6: the rewrite is in flight; a writer holding the claimed revision must be refused, not
+    commit and then be overwritten by the rewrite (lost update)."""
+    refused = []
+
+    def during_rewrite(fake):
+        try:
+            world.patch_memory(M1, "ehfaz", {"tags": ["second"]}, expected_revision="1")
+        except RevisionConflict as e:
+            refused.append(e)
+
+    world.fake.before_mem0_update = during_rewrite
+    world.patch_memory(M1, "ehfaz", {"content": "first writer's text"}, expected_revision="0")
+    assert len(refused) == 1
+    assert world.fake.points[M1]["data"] == "first writer's text"
+    assert "revision_pending" not in world.fake.points[M1]["metadata"]       # the rewrite cleared the mark
+    world.patch_memory(M1, "ehfaz", {"tags": ["after"]}, expected_revision="1")   # and the row is usable again
+
+
+def test_a_failed_rewrite_releases_the_pending_mark(world):
+    world.fake.fail_mem0_update = True
+    with pytest.raises(RuntimeError):
+        world.patch_memory(M1, "ehfaz", {"content": "never lands"}, expected_revision="0")
+    assert "revision_pending" not in world.fake.points[M1]["metadata"]
+    world.patch_memory(M1, "ehfaz", {"tags": ["ok"]}, expected_revision="1")      # revision 1 was claimed; row not wedged
+
+
+def test_an_expired_pending_lease_does_not_wedge_the_row(world):
+    meta = world.fake.points[M1]["metadata"]
+    meta.update({"revision": 1, "revision_pending": "dead-writer", "revision_pending_at": "2000-01-01T00:00:00+00:00"})
+    world.patch_memory(M1, "ehfaz", {"tags": ["x"]}, expected_revision="1")
+    assert _tags(world) == ["x"]
