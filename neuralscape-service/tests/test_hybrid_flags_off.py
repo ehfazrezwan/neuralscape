@@ -1,6 +1,6 @@
 """Every hybrid flag OFF (the default) must behave exactly like dev.
 
-No Jev client is constructed, nothing touches the network, nothing runs at
+No decision client is constructed, nothing touches the network, nothing runs at
 startup, and the wire/storage shapes are unchanged.
 """
 import json
@@ -13,39 +13,39 @@ import pytest
 import hybrid_inference as hybrid
 from config import Settings, settings
 
-FLAGS = ('jev_graph_enabled', 'jev_categories_enabled', 'jev_extraction_enabled', 'jev_rerank_enabled')
+FLAGS = ('hybrid_graph_enabled', 'hybrid_categories_enabled', 'hybrid_extraction_enabled', 'hybrid_rerank_enabled')
 
 
 @pytest.fixture
-def no_jev(monkeypatch):
-    """Any attempt to build a Jev client or reach the network fails the test."""
+def no_hybrid(monkeypatch):
+    """Any attempt to build a decision client or reach the network fails the test."""
     for flag in FLAGS:
         monkeypatch.setattr(settings, flag, False)
-    boom = Mock(side_effect=AssertionError('Jev client constructed with flags off'))
+    boom = Mock(side_effect=AssertionError('the decision client constructed with flags off'))
     monkeypatch.setattr(hybrid, 'decisions', boom)
-    monkeypatch.setattr('graphiti_core.llm_client.jev_client.JevDecisions.__init__', boom)
+    monkeypatch.setattr('graphiti_core.llm_client.hybrid_decision_client.HybridDecisions.__init__', boom)
     monkeypatch.setattr(httpx.Client, 'send', Mock(side_effect=AssertionError('network call with flags off')))
     return boom
 
 
 def test_all_flags_default_off_and_key_alone_enables_nothing():
-    defaults = Settings(_env_file=None, typesafe_api_key='present-but-inert')
+    defaults = Settings(_env_file=None, hybrid_inference_api_key='present-but-inert')
     assert [getattr(defaults, f) for f in FLAGS] == [False] * 4
-    assert defaults.get_mem0_config()['graph_store']['config']['graphiti_jev_enabled'] is False
+    assert defaults.get_mem0_config()['graph_store']['config']['graphiti_hybrid_enabled'] is False
 
 
-def test_hybrid_entry_points_are_noops(no_jev):
+def test_hybrid_entry_points_are_noops(no_hybrid):
     rows = [object(), object()]
     assert hybrid.extract_source_facts([{'role': 'user', 'content': 'I prefer tea.'}]) is None
     assert hybrid.classify_types(['label']) is None
     assert hybrid.rerank('q', rows) is rows
-    no_jev.assert_not_called()
+    no_hybrid.assert_not_called()
 
 
-def test_startup_warmup_is_inert(no_jev, monkeypatch):
+def test_startup_warmup_is_inert(no_hybrid, monkeypatch):
     tokenizer, http = Mock(), Mock()
-    monkeypatch.setattr('jev_extraction._segmenter', tokenizer)
-    monkeypatch.setattr('graphiti_core.llm_client.jev_client._http_client', http)
+    monkeypatch.setattr('source_extraction._segmenter', tokenizer)
+    monkeypatch.setattr('graphiti_core.llm_client.hybrid_decision_client._http_client', http)
     hybrid.warmup_extraction()
     tokenizer.assert_not_called()
     http.assert_not_called()
@@ -66,11 +66,11 @@ async def test_graphiti_hooks_without_decision_client_use_original_llm_only():
     llm.generate_response.assert_awaited_once()
 
 
-def test_okf_resolution_with_flag_off_is_the_original_algorithm(no_jev):
-    """Original semantics: no Jev call, keys casefolded but NOT stripped."""
+def test_okf_resolution_with_flag_off_is_the_original_algorithm(no_hybrid):
+    """Original semantics: no decision-model call, keys casefolded but NOT stripped."""
     from ingest.okf_bundle import OkfConcept, resolve_categories
     concept = OkfConcept('c', 'c.md', {}, '', '', type_value=' Opaque ')
-    # Stripped key would match under the Jev-on normalisation; the original
+    # Stripped key would match under the flag-on normalisation; the original
     # algorithm only matched the exact (casefolded) type string.
     llm = Mock(return_value='{"mapping": {"opaque": "preference"}}')
     resolve_categories([concept], llm_call=llm)
@@ -78,12 +78,12 @@ def test_okf_resolution_with_flag_off_is_the_original_algorithm(no_jev):
     exact = OkfConcept('c', 'c.md', {}, '', '', type_value=' Opaque ')
     resolve_categories([exact], llm_call=Mock(return_value='{"mapping": {" opaque ": "preference"}}'))
     assert exact.category == 'preference'
-    no_jev.assert_not_called()
+    no_hybrid.assert_not_called()
 
 
 def test_ingest_pipeline_call_signature_is_unchanged_when_extraction_off(monkeypatch):
     from ingest.pipeline import IngestDoc, ingest_document
-    monkeypatch.setattr(settings, 'jev_extraction_enabled', False)
+    monkeypatch.setattr(settings, 'hybrid_extraction_enabled', False)
     seen = {}
 
     class Service:  # an extract_facts_only WITHOUT the new kwarg, as on dev
@@ -103,20 +103,20 @@ def test_ingest_pipeline_call_signature_is_unchanged_when_extraction_off(monkeyp
     assert seen == {'called': True}
 
 
-def test_extraction_off_never_reaches_jev_in_extract_facts_only(no_jev, monkeypatch):
+def test_extraction_off_never_reaches_hybrid_in_extract_facts_only(no_hybrid, monkeypatch):
     from memory.write import WriteMixin
     monkeypatch.setattr('extraction_settings.resolve_instructions', lambda *a: '')
     client = Mock()
     client.models.generate_content.return_value = SimpleNamespace(text='{"facts": []}')
     WriteMixin.extract_facts_only(SimpleNamespace(_get_genai_client=lambda: client), 'I prefer tea.')
     client.models.generate_content.assert_called_once()
-    no_jev.assert_not_called()
+    no_hybrid.assert_not_called()
 
 
-def test_search_rerank_hook_is_skipped_when_flag_off(no_jev):
+def test_search_rerank_hook_is_skipped_when_flag_off(no_hybrid):
     from schemas import MemoryResponse
     row = MemoryResponse(id='1', memory='x')
-    assert settings.jev_rerank_enabled is False
+    assert settings.hybrid_rerank_enabled is False
     assert hybrid.rerank('q', [row, row]) == [row, row]
 
 
@@ -128,3 +128,38 @@ def test_response_wire_shape_omits_evidence_unless_present():
     assert 'category_evidence' not in plain.model_dump(exclude_none=True)
     with_evidence = MemoryResponse(id='1', memory='x', category_evidence={'mode': 'soft'})
     assert with_evidence.model_dump()['category_evidence'] == {'mode': 'soft'}
+
+
+def test_defaults_carry_no_endpoint_or_model():
+    defaults = Settings(_env_file=None)
+    assert defaults.hybrid_inference_endpoint == '' and defaults.hybrid_inference_model == ''
+
+
+def test_flag_on_without_endpoint_or_key_warns_and_falls_back(monkeypatch, caplog):
+    monkeypatch.setattr(settings, 'hybrid_extraction_enabled', True)
+    monkeypatch.setattr(settings, 'hybrid_inference_endpoint', '')
+    monkeypatch.setattr(settings, 'hybrid_inference_api_key', 'k')
+    monkeypatch.setattr(httpx.Client, 'send', Mock(side_effect=AssertionError('network call without an endpoint')))
+    with caplog.at_level('WARNING'):
+        assert hybrid.warn_if_inactive() == ['HYBRID_INFERENCE_ENDPOINT']
+    assert 'hybrid_inference_inactive' in caplog.text
+    assert hybrid.extract_source_facts([{'role': 'user', 'content': 'I prefer tea.'}]) is None
+    assert hybrid.classify_types(['x']) is None  # categories flag still off
+    monkeypatch.setattr(settings, 'hybrid_rerank_enabled', True)
+    rows = [object(), object()]
+    assert hybrid.rerank('q', rows) is rows
+
+
+def test_warning_is_silent_when_nothing_is_enabled(no_hybrid, caplog):
+    with caplog.at_level('WARNING'):
+        assert hybrid.warn_if_inactive() == []
+    assert caplog.text == ''
+
+
+def test_client_without_endpoint_abstains_without_network():
+    from graphiti_core.llm_client.hybrid_decision_client import HybridDecisions
+    events = []
+    client = Mock()
+    assert HybridDecisions('k', telemetry=events.append, client=client).scores('q', ['p'], '') is None
+    client.post.assert_not_called()
+    assert events[0]['fallback_reason'] == 'missing_endpoint'

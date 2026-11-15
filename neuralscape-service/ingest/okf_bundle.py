@@ -219,15 +219,15 @@ def resolve_categories(
 
     Priority: an embedded category extension key (a Neuralscape-exported
     bundle round-trips losslessly) → the exact/alias mapping table → one
-    batched Jev choices (when enabled) → LLM for unresolved types → default.
+    batched decision-model choices (when enabled) → LLM for unresolved types → default.
     Explicit adapter taxonomies may be passed by callers; an ordinary bundle's
-    Jev choices use the core 13. Embedded/alias mappings remain authoritative.
+    Decision-model choices use the core 13. Embedded/alias mappings remain authoritative.
     """
     from config import settings
     from schemas import CORE_MEMORY_CATEGORIES, MEMORY_CATEGORIES
 
     target_categories = categories if categories is not None else (
-        CORE_MEMORY_CATEGORIES if settings.jev_categories_enabled else MEMORY_CATEGORIES)
+        CORE_MEMORY_CATEGORIES if settings.hybrid_categories_enabled else MEMORY_CATEGORIES)
 
     unknown_types: list[str] = []
     for concept in concepts:
@@ -245,9 +245,9 @@ def resolve_categories(
         else:
             concept.category = _DEFAULT_CATEGORY
 
-    jev_on = settings.jev_categories_enabled
+    hybrid_on = settings.hybrid_categories_enabled
     llm_mapping: dict[str, str] = {}
-    if unknown_types and jev_on:
+    if unknown_types and hybrid_on:
         from hybrid_inference import classify_types
 
         mapping = classify_types(unknown_types[:50], categories=target_categories)
@@ -268,12 +268,12 @@ def resolve_categories(
             if isinstance(mapping, dict):
                 # Flag off: byte-identical to the original mapping handling.
                 # Flag on: normalised keys, restricted to still-unresolved types.
-                norm = (lambda s: s.strip().casefold()) if jev_on else (lambda s: s.casefold())
+                norm = (lambda s: s.strip().casefold()) if hybrid_on else (lambda s: s.casefold())
                 unresolved = {norm(t) for t in unknown_types[:50]}
                 llm_mapping.update({
                     norm(str(k)): str(v)
                     for k, v in mapping.items()
-                    if str(v) in target_categories and (not jev_on or norm(str(k)) in unresolved)
+                    if str(v) in target_categories and (not hybrid_on or norm(str(k)) in unresolved)
                 })
         except Exception:
             logger.warning("OKF type-mapping LLM fallback failed (non-fatal)", exc_info=True)
@@ -283,7 +283,7 @@ def resolve_categories(
             concept.category = (
                 llm_mapping.get(
                     (concept.type_value or "").strip().casefold()
-                    if jev_on else (concept.type_value or "").casefold()
+                    if hybrid_on else (concept.type_value or "").casefold()
                 ) or _DEFAULT_CATEGORY
             )
 

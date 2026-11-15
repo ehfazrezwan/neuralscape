@@ -16,7 +16,7 @@ async def run(args):
     from google import genai
     from google.genai import types
     from extensions.dreaming.prompts import parse_json_object
-    from graphiti_core.llm_client.jev_client import JevDecisions, category_policy
+    from graphiti_core.llm_client.hybrid_decision_client import HybridDecisions, category_policy
     from ingest.okf_bundle import TYPE_MAPPING_PROMPT
     from schemas import CORE_MEMORY_CATEGORIES, MEMORY_CATEGORIES
 
@@ -43,10 +43,10 @@ async def run(args):
                 try:
                     taxonomy = MEMORY_CATEGORIES if arm == 'baseline' else CORE_MEMORY_CATEGORIES
                     if arm == 'hybrid':
-                        result = await asyncio.to_thread(JevDecisions.from_env(telemetry=events.append).classify,
+                        result = await asyncio.to_thread(HybridDecisions.from_env(telemetry=events.append).classify,
                                                          list(expected), taxonomy)
                     result = result or {}
-                    row['jev_accepted'] = len(result)
+                    row['hybrid_accepted'] = len(result)
                     unresolved = [k for k in expected if k not in result]
                     if unresolved:
                         fallback_prompt = TYPE_MAPPING_PROMPT.format(

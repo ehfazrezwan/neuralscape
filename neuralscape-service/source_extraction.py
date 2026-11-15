@@ -1,4 +1,4 @@
-"""Source-preserving extraction: select spans, never ask Jev to generate facts.
+"""Source-preserving extraction: select spans, never ask the decision model to generate facts.
 
 None means run the original extractor over the ENTIRE input. [] means a
 validated decision that there are no durable facts. Keep that distinction.
@@ -9,7 +9,7 @@ import re
 from dataclasses import dataclass
 from functools import lru_cache
 
-from graphiti_core.llm_client.jev_client import JevDecisions, category_policy
+from graphiti_core.llm_client.hybrid_decision_client import HybridDecisions, category_policy
 from schemas import CORE_MEMORY_CATEGORIES
 from category_evidence import category_mode, make_evidence
 
@@ -67,10 +67,10 @@ def candidates(messages: list[dict]) -> list[SourceSpan] | None:
     return spans if len(spans) <= MAX_CANDIDATES else None
 
 
-def select_facts(messages: list[dict], decision: JevDecisions, *, category_evidence: dict | None = None) -> list[tuple[str, str]] | None:
+def select_facts(messages: list[dict], decision: HybridDecisions, *, category_evidence: dict | None = None) -> list[tuple[str, str]] | None:
     spans = candidates(messages)
     if spans is None:
-        decision.emit({'provider': 'jev', 'task': 'source_extraction', 'fallback_reason': 'unsupported_source'})
+        decision.emit({'provider': 'hybrid', 'task': 'source_extraction', 'fallback_reason': 'unsupported_source'})
         return None
     if not spans:
         return []
@@ -118,7 +118,7 @@ def select_facts(messages: list[dict], decision: JevDecisions, *, category_evide
         answer = answers[f'category-{i}']
         mode = category_mode(answer, decision.threshold)
         # Scores/reasons only: no source text, tenant IDs or generated content.
-        decision.emit({'provider': 'jev', 'task': 'source_extraction', 'span_index': i,
+        decision.emit({'provider': 'hybrid', 'task': 'source_extraction', 'span_index': i,
                        'retain_score': retain, 'standalone_score': standalone,
                        'category_confidence': answer['confidence'], 'category_mode': mode})
         if retain <= 1 - decision.threshold:
@@ -127,7 +127,7 @@ def select_facts(messages: list[dict], decision: JevDecisions, *, category_evide
                   'standalone_uncertain' if standalone < decision.threshold else
                   'category_policy_uncertain' if mode is None else None)
         if reason:
-            decision.emit({'provider': 'jev', 'task': 'source_extraction', 'fallback_reason': reason})
+            decision.emit({'provider': 'hybrid', 'task': 'source_extraction', 'fallback_reason': reason})
             return None
         # Output is reconstructed ONLY from source offsets and bucket IDs.
         assert span.text == messages[span.message_index]['content'][span.start:span.end]
@@ -138,6 +138,6 @@ def select_facts(messages: list[dict], decision: JevDecisions, *, category_evide
     # Publish only after the entire window passed. No partial fallback metadata.
     if category_evidence is not None:
         category_evidence.update(evidence)
-    decision.emit({'provider': 'jev', 'task': 'source_extraction',
+    decision.emit({'provider': 'hybrid', 'task': 'source_extraction',
                    'accepted': True, 'candidate_count': len(spans), 'fact_count': len(facts)})
     return facts

@@ -1,7 +1,7 @@
 """Private, synthetic component A/B. Not an end-to-end or production benchmark.
 
 Run baseline BEFORE enabling substitutions. Outputs include every paid attempt,
-including fallback usage. Labels are handwritten, never distilled from Jev.
+including fallback usage. Labels are handwritten, never distilled from the decision model.
 """
 from __future__ import annotations
 
@@ -11,6 +11,8 @@ import hashlib
 import json
 import math
 import os
+
+from config import settings
 import platform
 import statistics
 import subprocess
@@ -141,8 +143,8 @@ async def execute(case, args, client):
         schema = module.NodeResolutions if case["task"] == "nodes" else module.EdgeDuplicate
         result = None
         if args.arm == "hybrid":
-            from graphiti_core.llm_client.jev_client import JevDecisions
-            decisions = JevDecisions.from_env(telemetry=events.append)
+            from graphiti_core.llm_client.hybrid_decision_client import HybridDecisions
+            decisions = HybridDecisions.from_env(telemetry=events.append)
             result = await decisions.resolve(case["task"], case["context"])
         if result is None:
             result = await fallback.generate_response(prompt(case["context"]), response_model=schema)
@@ -158,9 +160,14 @@ async def execute(case, args, client):
 def summary(rows):
     durations = sorted(r["elapsed_ms"] for r in rows)
     events = [e for r in rows for e in r["events"] if "input_tokens" in e and
-              (e.get('provider') != 'jev' or e.get('attempted'))]
+              (e.get('provider') != 'hybrid' or e.get('attempted'))]
     known = [e for e in events if e["input_tokens"] is not None and e.get("output_tokens") is not None]
-    rates = {"gemini-3.1-flash-lite": (0.25, 1.5), "jev-1.13.0": (0.042, 0)}
+    # Decision-model list price per million input tokens comes from the operator
+    # (HYBRID_INFERENCE_PRICE_IN_USD_PER_M); unknown price => cost is reported incomplete.
+    rates = {"gemini-3.1-flash-lite": (0.25, 1.5)}
+    price_in = os.environ.get("HYBRID_INFERENCE_PRICE_IN_USD_PER_M")
+    if price_in and settings.hybrid_inference_model:
+        rates[settings.hybrid_inference_model] = (float(price_in), 0)
     unknown = [e for e in events if e not in known or e["model"] not in rates]
     # A timed-out thread can still finish its HTTP request after this snapshot.
     # Never report its possible paid usage as a fully measured zero.

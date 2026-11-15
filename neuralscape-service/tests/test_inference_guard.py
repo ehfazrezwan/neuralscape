@@ -74,19 +74,19 @@ def test_half_open_admits_only_one_probe():
 def test_late_extraction_cannot_publish_evidence(monkeypatch):
     import hybrid_inference as hybrid
     from config import settings
-    from graphiti_core.llm_client.jev_client import JevDecisions
+    from graphiti_core.llm_client.hybrid_decision_client import HybridDecisions
     release = threading.Event()
     guard = InferenceGuard(capacity=1)
-    monkeypatch.setattr(settings, 'jev_extraction_enabled', True)
-    monkeypatch.setattr(settings, 'typesafe_api_key', 'test')
-    monkeypatch.setattr(settings, 'jev_extraction_deadline_s', .01)
+    monkeypatch.setattr(settings, 'hybrid_extraction_enabled', True)
+    monkeypatch.setattr(settings, 'hybrid_inference_api_key', 'test')
+    monkeypatch.setattr(settings, 'hybrid_extraction_deadline_s', .01)
     monkeypatch.setattr(hybrid, '_extraction_guard', lambda *a: guard)
-    monkeypatch.setattr(hybrid, 'decisions', lambda **kw: JevDecisions('test', **kw))
+    monkeypatch.setattr(hybrid, 'decisions', lambda **kw: HybridDecisions('test', endpoint='http://local.test/decide', model='test-model', **kw))
     def delayed(messages, decision, *, category_evidence):
         release.wait(2)
         category_evidence['late'] = 'must not publish'
         return [('preference', 'late')]
-    monkeypatch.setattr('jev_extraction.select_facts', delayed)
+    monkeypatch.setattr('source_extraction.select_facts', delayed)
     output = {}
     try:
         assert hybrid.extract_source_facts([], category_evidence=output) is None
@@ -101,12 +101,12 @@ def test_warmup_is_disabled_by_default_and_local_only(monkeypatch):
     import hybrid_inference as hybrid
     from config import settings
     tokenizer, client = Mock(), Mock()
-    monkeypatch.setattr('jev_extraction._segmenter', tokenizer)
-    monkeypatch.setattr('graphiti_core.llm_client.jev_client._http_client', client)
-    monkeypatch.setattr(settings, 'jev_extraction_enabled', False)
+    monkeypatch.setattr('source_extraction._segmenter', tokenizer)
+    monkeypatch.setattr('graphiti_core.llm_client.hybrid_decision_client._http_client', client)
+    monkeypatch.setattr(settings, 'hybrid_extraction_enabled', False)
     hybrid.warmup_extraction()
     tokenizer.assert_not_called()
-    monkeypatch.setattr(settings, 'jev_extraction_enabled', True)
+    monkeypatch.setattr(settings, 'hybrid_extraction_enabled', True)
     hybrid.warmup_extraction()
     tokenizer.assert_called_once_with()
     client.assert_called_once_with()

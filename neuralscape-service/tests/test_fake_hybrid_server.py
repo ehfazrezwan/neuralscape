@@ -1,19 +1,19 @@
-"""The local Jev stand-in must satisfy the real wire validators for every task.
+"""The local decision-model stand-in must satisfy the real wire validators for every task.
 
 If this fails, the integration tests that rely on the fake prove nothing. It
 runs over real loopback HTTP through the production adapter, with no stores.
 """
-from graphiti_core.llm_client import jev_client
-from graphiti_core.llm_client.jev_client import JevDecisions
-from jev_extraction import select_facts
-from tests.fake_jev_server import FakeJev, fake_jev  # noqa: F401
+from config import settings
+from graphiti_core.llm_client.hybrid_decision_client import HybridDecisions
+from source_extraction import select_facts
+from tests.fake_hybrid_server import FakeHybrid, fake_hybrid  # noqa: F401
 
 
 def _decisions():
-    return JevDecisions('fake-local-key', timeout=5.0)
+    return HybridDecisions('fake-local-key', endpoint=settings.hybrid_inference_endpoint, model='test-model', timeout=5.0)
 
 
-def test_extraction_round_trip_over_http(fake_jev):
+def test_extraction_round_trip_over_http(fake_hybrid):
     category_evidence = {}
     facts = select_facts([{'role': 'user', 'content': 'I prefer concise answers. Qdrant stores vectors as points.'}],
                          _decisions(), category_evidence=category_evidence)
@@ -22,7 +22,7 @@ def test_extraction_round_trip_over_http(fake_jev):
     assert set(category_evidence) == set(facts)
 
 
-def test_classification_scoring_and_graph_round_trips(fake_jev):
+def test_classification_scoring_and_graph_round_trips(fake_hybrid):
     decisions = _decisions()
     assert decisions.classify(['Quantum Gizmo', 'Opaque'], {'preference': 'Tastes', 'convention': 'Norms'}) == {
         'quantum gizmo': 'preference'}
@@ -38,9 +38,9 @@ def test_classification_scoring_and_graph_round_trips(fake_jev):
 
 
 def test_server_errors_and_refused_connections_abstain(monkeypatch):
-    with FakeJev(status=503) as down:
-        monkeypatch.setattr(jev_client, 'JEV_ENDPOINT', down.url)
+    with FakeHybrid(status=503) as down:
+        monkeypatch.setattr(settings, 'hybrid_inference_endpoint', down.url)
         assert _decisions().scores('q', [{'memory': 'a'}], 'p') is None
         assert down.requests
-    monkeypatch.setattr(jev_client, 'JEV_ENDPOINT', 'http://127.0.0.1:1/v1/systemone')
+    monkeypatch.setattr(settings, 'hybrid_inference_endpoint', 'http://127.0.0.1:1/decide')
     assert _decisions().scores('q', [{'memory': 'a'}], 'p') is None

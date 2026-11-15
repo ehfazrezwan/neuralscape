@@ -7,8 +7,8 @@ import httpx
 import pytest
 
 from category_evidence import category_mode, make_evidence, validated_evidence
-from graphiti_core.llm_client.jev_client import JevDecisions
-from jev_extraction import select_facts
+from graphiti_core.llm_client.hybrid_decision_client import HybridDecisions
+from source_extraction import select_facts
 from memory_service import MemoryService
 from schemas import CORE_MEMORY_CATEGORIES, MemoryResponse
 
@@ -37,21 +37,21 @@ def test_soft_acceptance_is_bounded_by_storage_policy(weights, mode):
 
 def test_wire_validation_preserves_soft_scores_only_when_requested():
     a = answer()
-    wire = {'model': 'jev-1.13.0', 'answers': {'c': a}}
+    wire = {'model': 'test-model', 'answers': {'c': a}}
     client = httpx.Client(transport=httpx.MockTransport(lambda _: httpx.Response(200, json=wire)))
-    d = JevDecisions('test', client=client)
+    d = HybridDecisions('test', endpoint='http://local.test/decide', model='test-model', client=client)
     questions = {'c': {'type': 'choice', 'criteria': dict.fromkeys(a['probabilities'])}}
     assert d.ask({}, questions, task='graph') is None
     assert d.ask({}, questions, task='extract', preserve_choice_probabilities=True) == {'c': a}
     wire['answers']['c']['probabilities']['architecture'] = float('nan')
     client = httpx.Client(transport=httpx.MockTransport(lambda _: httpx.Response(200, content=json.dumps(wire))))
-    assert JevDecisions('test', client=client).ask({}, questions, task='extract', preserve_choice_probabilities=True) is None
+    assert HybridDecisions('test', endpoint='http://local.test/decide', model='test-model', client=client).ask({}, questions, task='extract', preserve_choice_probabilities=True) is None
 
 
 @pytest.mark.parametrize('retain,standalone,expected_reason', [(.5,.99,'retain_uncertain'), (.99,.5,'standalone_uncertain'), (.99,.99,None)])
 def test_soft_categories_never_bypass_fact_safety(retain, standalone, expected_reason):
     text = 'Project Cedar uses Redis for caching, not durable storage.'
-    d = SimpleNamespace(threshold=.9, model='jev-1.13.0', emit=Mock(), ask=Mock(return_value={
+    d = SimpleNamespace(threshold=.9, model='test-model', emit=Mock(), ask=Mock(return_value={
         'retain-0': {'noul': retain}, 'standalone-0': {'noul': standalone}, 'category-0': answer()}))
     evidence = {}
     result = select_facts([{'role':'user', 'content':text}], d, category_evidence=evidence)
@@ -66,7 +66,7 @@ def test_soft_categories_never_bypass_fact_safety(retain, standalone, expected_r
 
 
 def test_uncertain_later_span_does_not_publish_partial_evidence():
-    d = SimpleNamespace(threshold=.9, model='jev-1.13.0', emit=Mock(), ask=Mock(return_value={
+    d = SimpleNamespace(threshold=.9, model='test-model', emit=Mock(), ask=Mock(return_value={
         'retain-0': {'noul': .99}, 'standalone-0': {'noul': .99}, 'category-0': answer(),
         'retain-1': {'noul': .5}, 'standalone-1': {'noul': .99}, 'category-1': answer()}))
     evidence = {}
@@ -85,7 +85,7 @@ def service():
 
 
 def evidence_for(text):
-    return make_evidence(text, answer(), 'jev-1.13.0', 'soft')
+    return make_evidence(text, answer(), 'test-model', 'soft')
 
 
 def test_raw_roundtrip_preserves_one_record_and_explicit_privacy(service):
@@ -164,12 +164,12 @@ def test_content_or_primary_change_invalidates_read_evidence():
 def test_rerank_receives_evidence_but_does_not_change_permissions(monkeypatch):
     import hybrid_inference as hybrid
     from config import settings
-    monkeypatch.setattr(settings, 'jev_rerank_enabled', True)
+    monkeypatch.setattr(settings, 'hybrid_rerank_enabled', True)
     client = Mock()
     client.scores.return_value = [.2, .8]
     monkeypatch.setattr(hybrid, 'decisions', lambda: client)
     rows = [MemoryResponse(id=str(i), memory='Cedar uses Redis.', category='tech_stack',
-                           visibility='private', category_evidence=evidence_for('Cedar uses Redis.')) for i in range(2)]
+                           visibility='shared', category_evidence=evidence_for('Cedar uses Redis.')) for i in range(2)]
     assert hybrid.rerank('caching architecture', rows) == rows[::-1]
     assert client.scores.call_args.args[1][0]['category_evidence']['probabilities']['architecture'] == .4
-    assert all(r.visibility == 'private' for r in rows)
+    assert all(r.visibility == 'shared' for r in rows)  # default visibility for tech_stack: eligible to send

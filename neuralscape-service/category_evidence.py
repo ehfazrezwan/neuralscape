@@ -69,7 +69,7 @@ def validated_evidence(content: str, category: str | None, value) -> dict | None
                 or value['primary_category'] != category
                 or value['content_sha256'] != hashlib.sha256(content.encode()).hexdigest()
                 or value['policy_version'] != POLICY_VERSION or value['mode'] not in ('certain', 'soft')
-                or not isinstance(value['model'], str) or not value['model']):
+                or not isinstance(value['model'], str)):
             return None
         return {k: value[k] for k in ('probabilities', 'confidence', 'primary_category', 'model',
                                      'mode', 'policy_version', 'content_sha256')}

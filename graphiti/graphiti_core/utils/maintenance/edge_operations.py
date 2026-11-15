@@ -583,7 +583,7 @@ async def resolve_extracted_edge(
             else '',
         )
 
-    # NEURALSCAPE PATCH: optional bounded decision fast path (JEV_GRAPH_ENABLED);
+    # NEURALSCAPE PATCH: optional bounded decision fast path (HYBRID_GRAPH_ENABLED);
     # None (flag off or abstain) falls through to the original LLM call.
     decisions = getattr(llm_client, 'decision_client', None)
     llm_response = await decisions.resolve('edges', context) if decisions is not None else None

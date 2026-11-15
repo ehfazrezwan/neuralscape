@@ -1,9 +1,9 @@
-"""A tiny local stand-in for the Jev HTTP endpoint.
+"""A tiny local stand-in for the hybrid decision endpoint.
 
-It speaks the wire contract JevDecisions validates (model echo, per-question
+It speaks the wire contract HybridDecisions validates (model echo, per-question
 answers, probability distributions) so the NeuralScape-side wiring can be
 exercised against real stores. It says NOTHING about the real model's
-accuracy: the real Jev API (third party, key-gated) is not exercised by tests.
+accuracy: the real third-party decision API (key-gated) is not exercised by tests.
 """
 from __future__ import annotations
 
@@ -59,7 +59,7 @@ def default_policy(body: dict) -> dict:
     return answers
 
 
-class FakeJev:
+class FakeHybrid:
     """Context-managed local server; records every request body it receives."""
 
     def __init__(self, policy: Callable[[dict], dict] = default_policy, *, status: int = 200,
@@ -94,7 +94,7 @@ class FakeJev:
 
     @property
     def url(self) -> str:
-        return f'http://127.0.0.1:{self._server.server_address[1]}/v1/systemone'
+        return f'http://127.0.0.1:{self._server.server_address[1]}/decide'
 
     def __enter__(self):
         self._thread.start()
@@ -106,12 +106,12 @@ class FakeJev:
 
 
 @pytest.fixture
-def fake_jev(monkeypatch):
-    """Point the Jev adapter at a local fake and give it a (fake) key."""
+def fake_hybrid(monkeypatch):
+    """Point the hybrid decision adapter at a local fake and give it a (fake) key."""
     from config import settings
-    from graphiti_core.llm_client import jev_client
 
-    with FakeJev() as server:
-        monkeypatch.setattr(jev_client, 'JEV_ENDPOINT', server.url)
-        monkeypatch.setattr(settings, 'typesafe_api_key', 'fake-local-key')
+    with FakeHybrid() as server:
+        monkeypatch.setattr(settings, 'hybrid_inference_endpoint', server.url)
+        monkeypatch.setattr(settings, 'hybrid_inference_api_key', 'fake-local-key')
+        monkeypatch.setattr(settings, 'hybrid_inference_model', 'test-model')
         yield server

@@ -8,7 +8,7 @@ import httpx
 import pytest
 
 from config import settings
-from graphiti_core.llm_client.jev_client import JevDecisions, validate_choice
+from graphiti_core.llm_client.hybrid_decision_client import HybridDecisions, validate_choice
 import hybrid_inference as hybrid
 
 
@@ -25,7 +25,7 @@ def response_handler(select, requests):
     def handler(request):
         body = json.loads(request.content)
         requests.append(body)
-        return httpx.Response(200, json={'model': 'jev-1.13.0',
+        return httpx.Response(200, json={'model': 'test-model',
             'answers': {k: choice(select(q), q['criteria']) for k, q in body['questions'].items()},
             'usage': {'input_tokens': 30, 'output_tokens': 5}})
     return handler
@@ -46,11 +46,11 @@ def test_nodes_preserve_candidate_ids_and_names():
     from scripts.benchmark_hybrid import cases
     requests, events = [], []
     client = client_for(response_handler(lambda _: '0', requests))
-    result = JevDecisions('test', client=client, telemetry=events.append).resolve_sync('nodes', cases()[0]['context'])
+    result = HybridDecisions('sekrit-key', endpoint='http://local.test/decide', model='test-model', client=client, telemetry=events.append).resolve_sync('nodes', cases()[0]['context'])
     assert result == {'entity_resolutions': [{'id': 0, 'name': 'New York City', 'duplicate_candidate_id': 0}]}
     assert requests[0]['questions']['0']['instructions']['extracted_entity']['name'] == 'NYC'
     assert events[0]['input_tokens'] == 30
-    assert 'NYC' not in json.dumps(events) and 'test' not in json.dumps(events)
+    assert 'NYC' not in json.dumps(events) and 'sekrit-key' not in json.dumps(events)
 
 
 @pytest.mark.parametrize('selected,expected', [('DISTINCT', {'duplicate_facts': [], 'contradicted_facts': []}),
@@ -58,13 +58,13 @@ def test_nodes_preserve_candidate_ids_and_names():
 def test_edges_never_invalidate_without_original_resolver(selected, expected):
     from scripts.benchmark_hybrid import cases
     client = client_for(response_handler(lambda _: selected, []))
-    assert JevDecisions('test', client=client).resolve_sync('edges', cases()[6]['context']) == expected
+    assert HybridDecisions('test', endpoint='http://local.test/decide', model='test-model', client=client).resolve_sync('edges', cases()[6]['context']) == expected
 
 
 def test_invalidation_only_duplicate_falls_back():
     context = {'new_edge': 'Fact', 'existing_edges': [], 'edge_invalidation_candidates': [{'idx': 7, 'fact': 'Fact'}]}
     client = client_for(response_handler(lambda _: 'DUPLICATE', []))
-    assert JevDecisions('test', client=client).resolve_sync('edges', context) is None
+    assert HybridDecisions('test', endpoint='http://local.test/decide', model='test-model', client=client).resolve_sync('edges', context) is None
 
 
 @pytest.mark.parametrize('status', [401, 402, 422, 429, 500, 529])
@@ -73,7 +73,7 @@ def test_provider_errors_abstain_and_do_not_retry_or_log_body(status):
     def handler(request):
         calls.append(request)
         return httpx.Response(status, text='sensitive-private-body')
-    result = JevDecisions('secret-test', client=client_for(handler), telemetry=events.append).scores('Q', ['P'], 'policy')
+    result = HybridDecisions('secret-test', endpoint='http://local.test/decide', model='test-model', client=client_for(handler), telemetry=events.append).scores('Q', ['P'], 'policy')
     assert result is None and len(calls) == 1
     assert events[0]['input_tokens'] is None
     assert 'sensitive' not in json.dumps(events) and 'secret-test' not in json.dumps(events)
@@ -81,36 +81,36 @@ def test_provider_errors_abstain_and_do_not_retry_or_log_body(status):
 
 def test_limits_do_not_silently_truncate_evidence():
     client = Mock()
-    assert JevDecisions('test', client=client).scores('Q', ['x' * 25000], '') is None
+    assert HybridDecisions('test', endpoint='http://local.test/decide', model='test-model', client=client).scores('Q', ['x' * 25000], '') is None
     client.post.assert_not_called()
 
 
 def test_missing_answers_falls_back_but_preserves_usage():
     events = []
-    client = client_for(lambda _: httpx.Response(200, json={'model': 'jev-1.13.0', 'answers': {},
+    client = client_for(lambda _: httpx.Response(200, json={'model': 'test-model', 'answers': {},
         'usage': {'input_tokens': 123, 'output_tokens': 4}}))
-    assert JevDecisions('test', client=client, telemetry=events.append).scores('Q', ['P'], '') is None
+    assert HybridDecisions('test', endpoint='http://local.test/decide', model='test-model', client=client, telemetry=events.append).scores('Q', ['P'], '') is None
     assert events[0]['input_tokens'] == 123
 
 
 def test_model_version_change_abstains():
-    client = client_for(lambda _: httpx.Response(200, json={'model': 'jev-future', 'answers': {}}))
-    assert JevDecisions('test', client=client).scores('Q', ['P'], '') is None
+    client = client_for(lambda _: httpx.Response(200, json={'model': 'model-future', 'answers': {}}))
+    assert HybridDecisions('test', endpoint='http://local.test/decide', model='test-model', client=client).scores('Q', ['P'], '') is None
 
 
 @pytest.mark.parametrize('score', [float('nan'), float('inf'), -1, 1.1, True, '0.9'])
 def test_invalid_noul_scores_abstain(score):
     # JSON encoders reject nonfinite values too; simulate their wire format.
-    client = client_for(lambda _: httpx.Response(200, content=json.dumps({'model': 'jev-1.13.0',
+    client = client_for(lambda _: httpx.Response(200, content=json.dumps({'model': 'test-model',
         'answers': {'0': {'type': 'noul', 'noul': score}}})))
-    assert JevDecisions('test', client=client).scores('Q', ['P'], '') is None
+    assert HybridDecisions('test', endpoint='http://local.test/decide', model='test-model', client=client).scores('Q', ['P'], '') is None
 
 
 @pytest.mark.parametrize('mapping', [{'unfamiliar': 'preference'}, None])
-def test_okf_category_path_uses_jev_or_original_fallback(monkeypatch, mapping):
+def test_okf_category_path_uses_hybrid_or_original_fallback(monkeypatch, mapping):
     from ingest.okf_bundle import OkfConcept, resolve_categories
-    # Jev is consulted only with JEV_CATEGORIES_ENABLED (flag off: see test_hybrid_flags_off).
-    monkeypatch.setattr(settings, 'jev_categories_enabled', True)
+    # the decision model is consulted only with HYBRID_CATEGORIES_ENABLED (flag off: see test_hybrid_flags_off).
+    monkeypatch.setattr(settings, 'hybrid_categories_enabled', True)
     monkeypatch.setattr(hybrid, 'classify_types', lambda _, **kwargs: mapping)
     concept = OkfConcept('id', 'id.md', {}, '', '', type_value='unfamiliar')
     fallback = Mock(return_value='{"mapping": {"unfamiliar": "preference"}}')
@@ -125,7 +125,7 @@ def test_async_deadline_abstains(monkeypatch):
         raise TimeoutError
     monkeypatch.setattr(asyncio, 'wait_for', timeout)
     events = []
-    assert asyncio.run(JevDecisions('test', telemetry=events.append).resolve('nodes', {})) is None
+    assert asyncio.run(HybridDecisions('test', endpoint='http://local.test/decide', model='test-model', telemetry=events.append).resolve('nodes', {})) is None
     assert events[0]['fallback_reason'] == 'deadline'
 
 
@@ -136,8 +136,8 @@ def test_classification_partial_abstention_and_dedup():
         requests.append(body)
         answers = {key: choice('preference', q['criteria'], .99 if key == '0' else .2)
                    for key, q in body['questions'].items()}
-        return httpx.Response(200, json={'model': 'jev-1.13.0', 'answers': answers})
-    result = JevDecisions('test', client=client_for(handler)).classify(
+        return httpx.Response(200, json={'model': 'test-model', 'answers': answers})
+    result = HybridDecisions('test', endpoint='http://local.test/decide', model='test-model', client=client_for(handler)).classify(
         ['Taste', ' taste ', 'Unknown'], {'preference': 'Personal tastes', 'convention': 'Team rules'})
     assert result == {'taste': 'preference'}
     assert len(requests) == 1 and len(requests[0]['questions']) == 2
@@ -145,7 +145,7 @@ def test_classification_partial_abstention_and_dedup():
 
 def test_classification_uses_bounded_batches_without_dropping_labels():
     requests = []
-    decision = JevDecisions('test', client=client_for(response_handler(lambda _: 'preference', requests)))
+    decision = HybridDecisions('test', endpoint='http://local.test/decide', model='test-model', client=client_for(response_handler(lambda _: 'preference', requests)))
     result = decision.classify([f'label-{i}' for i in range(129)], {'preference': 'Tastes'})
     assert len(result) == 129
     assert [len(r['questions']) for r in requests] == [64, 64, 1]
@@ -153,7 +153,7 @@ def test_classification_uses_bounded_batches_without_dropping_labels():
 
 def test_service_classification_uses_core_buckets_not_global_registry(monkeypatch):
     from schemas import CORE_MEMORY_CATEGORIES, MEMORY_CATEGORIES
-    monkeypatch.setattr(settings, 'jev_categories_enabled', True)
+    monkeypatch.setattr(settings, 'hybrid_categories_enabled', True)
     monkeypatch.setitem(MEMORY_CATEGORIES, 'irrelevant_adapter', 'Unrelated domain')
     decision = Mock()
     decision.classify.return_value = {}
@@ -167,7 +167,7 @@ def test_service_classification_uses_core_buckets_not_global_registry(monkeypatc
 
 def test_okf_fallback_only_receives_unresolved_and_cannot_overwrite_accepted(monkeypatch):
     from ingest.okf_bundle import OkfConcept, resolve_categories
-    monkeypatch.setattr(settings, 'jev_categories_enabled', True)
+    monkeypatch.setattr(settings, 'hybrid_categories_enabled', True)
     monkeypatch.setattr(hybrid, 'classify_types', lambda _, **kwargs: {'opaque-a': 'preference'})
     concepts = [OkfConcept(label, label + '.md', {}, '', '', type_value=label)
                 for label in ('opaque-a', 'opaque-b')]
@@ -178,9 +178,9 @@ def test_okf_fallback_only_receives_unresolved_and_cannot_overwrite_accepted(mon
     assert [c.category for c in concepts] == ['preference', 'interaction']
 
 
-def test_known_bucket_aliases_never_call_jev(monkeypatch):
+def test_known_bucket_aliases_never_call_hybrid(monkeypatch):
     from ingest.okf_bundle import OkfConcept, resolve_categories
-    monkeypatch.setattr(settings, 'jev_categories_enabled', True)
+    monkeypatch.setattr(settings, 'hybrid_categories_enabled', True)
     monkeypatch.setattr(hybrid, 'classify_types', lambda *a, **k: pytest.fail('Already mapped'))
     concept = OkfConcept('p', 'p.md', {}, '', '', type_value='Preference')
     resolve_categories([concept], llm_call=lambda _: pytest.fail('Already mapped'))
@@ -188,8 +188,8 @@ def test_known_bucket_aliases_never_call_jev(monkeypatch):
 
 
 def test_rerank_is_permutation_preserves_score_and_stable_ties(monkeypatch):
-    monkeypatch.setattr(settings, 'jev_rerank_enabled', True)
-    monkeypatch.setattr(settings, 'jev_rerank_limit', 3)
+    monkeypatch.setattr(settings, 'hybrid_rerank_enabled', True)
+    monkeypatch.setattr(settings, 'hybrid_rerank_limit', 3)
     mock = Mock()
     mock.scores.return_value = [.1, .9, .9]
     monkeypatch.setattr(hybrid, 'decisions', lambda: mock)
@@ -201,7 +201,7 @@ def test_rerank_is_permutation_preserves_score_and_stable_ties(monkeypatch):
 
 
 def test_disabled_flags_are_noops(monkeypatch):
-    for flag in ('jev_categories_enabled', 'jev_rerank_enabled'):
+    for flag in ('hybrid_categories_enabled', 'hybrid_rerank_enabled'):
         monkeypatch.setattr(settings, flag, False)
     monkeypatch.setattr(hybrid, 'decisions', lambda: pytest.fail('No model calls when disabled'))
     rows = [object(), object()]
@@ -210,11 +210,11 @@ def test_disabled_flags_are_noops(monkeypatch):
 
 
 def test_graph_config_plumbs_flags_without_changing_generation(monkeypatch):
-    monkeypatch.setattr(settings, 'jev_graph_enabled', True)
-    monkeypatch.setattr(settings, 'typesafe_api_key', 'test-only')
+    monkeypatch.setattr(settings, 'hybrid_graph_enabled', True)
+    monkeypatch.setattr(settings, 'hybrid_inference_api_key', 'test-only')
     config = settings.get_mem0_config()['graph_store']['config']
-    assert config['graphiti_jev_enabled'] is True
-    assert config['graphiti_jev_api_key'] == 'test-only'
+    assert config['graphiti_hybrid_enabled'] is True
+    assert config['graphiti_hybrid_api_key'] == 'test-only'
     assert config['graphiti_llm_provider'] == 'gemini'
 
 
@@ -250,6 +250,76 @@ async def test_edge_maintenance_uses_decisions_and_fallback():
 ])
 async def test_resolve_never_raises_into_the_graph_write(task, context):
     events = []
-    result = await JevDecisions('test', client=Mock(), telemetry=events.append).resolve(task, context)
+    result = await HybridDecisions('test', endpoint='http://local.test/decide', model='test-model', client=Mock(), telemetry=events.append).resolve(task, context)
     assert result is None
     assert events and events[-1]['fallback_reason'] in {'TypeError', 'KeyError'}
+
+
+# ── egress gate and temporal-contradiction routing (review round 2) ──────
+
+def _decisions(client, **kw):
+    return HybridDecisions('k', endpoint='http://local.test/decide', model='test-model', client=client, **kw)
+
+
+def test_all_distinct_with_invalidation_candidates_falls_back_to_original_resolver():
+    """A DISTINCT answer must not replace the original temporal-contradiction call."""
+    context = {'new_edge': 'Ada works at Beta',
+               'existing_edges': [{'idx': 0, 'fact': 'Ada likes tea'}],
+               'edge_invalidation_candidates': [{'idx': 1, 'fact': 'Ada works at Acme'}]}
+    requests = []
+    client = client_for(response_handler(lambda _: 'DISTINCT', requests))
+    assert _decisions(client).resolve_sync('edges', context) is None
+    assert requests == []  # decided before any egress: the original LLM owns this case
+
+
+def test_distinct_without_invalidation_candidates_keeps_the_fast_path():
+    context = {'new_edge': 'Ada works at Beta', 'existing_edges': [{'idx': 0, 'fact': 'Ada likes tea'}],
+               'edge_invalidation_candidates': []}
+    client = client_for(response_handler(lambda _: 'DISTINCT', []))
+    assert _decisions(client).resolve_sync('edges', context) == {'duplicate_facts': [], 'contradicted_facts': []}
+
+
+def _gate(text):
+    from memory.sensitivity import classify_sensitivity
+    return classify_sensitivity(text) is None
+
+
+@pytest.mark.parametrize('field,value', [
+    ('episode_content', 'My salary is $250,000 and my stock options vest in 2027.'),
+    ('previous_episodes', ['The API password: hunter2 is stored in the vault.']),
+])
+def test_graph_resolution_never_sends_gated_episode_text(field, value):
+    requests, events = [], []
+    context = {'extracted_nodes': [{'id': 0, 'name': 'Ada'}],
+               'existing_nodes': [{'candidate_id': 0, 'name': 'Ada L', 'summary': ''}],
+               'episode_content': 'Ada joined.', 'previous_episodes': [], field: value}
+    client = client_for(response_handler(lambda _: '0', requests))
+    decision = _decisions(client, telemetry=events.append, egress_check=_gate)
+    assert decision.resolve_sync('nodes', context) is None
+    assert requests == [] and events[-1]['fallback_reason'] == 'egress_blocked'
+    clean = dict(context, episode_content='Ada joined.', previous_episodes=[])
+    assert _decisions(client, egress_check=_gate).resolve_sync('nodes', clean) is not None
+    assert requests  # clean context is sent
+
+
+def test_rerank_never_sends_sensitive_or_non_default_visibility_rows(monkeypatch):
+    monkeypatch.setattr(settings, 'hybrid_rerank_enabled', True)
+    sent = []
+    mock = Mock()
+    mock.scores.side_effect = lambda q, cands, policy: sent.extend(c['memory'] for c in cands) or [.1, .9, .5][:len(cands)]
+    monkeypatch.setattr(hybrid, 'decisions', lambda: mock)
+    rows = [
+        SimpleNamespace(memory='plain a', category='tech_stack', visibility='shared', sensitivity=None),
+        SimpleNamespace(memory='plain b', category='tech_stack', visibility='shared', sensitivity=None),
+        SimpleNamespace(memory='flagged by gate', category='tech_stack', visibility='shared', sensitivity='financial'),
+        SimpleNamespace(memory='forced private', category='tech_stack', visibility='private', sensitivity=None),
+        SimpleNamespace(memory='My salary is $250,000 and my stock options vest.', category='tech_stack',
+                        visibility='shared', sensitivity=None),
+        SimpleNamespace(memory='plain c', category='tech_stack', visibility='shared', sensitivity=None),
+    ]
+    out = hybrid.rerank('q', rows)
+    assert sent == ['plain a', 'plain b', 'plain c']  # nothing gated left the process
+    # gated rows keep their slots; eligible rows are reordered among theirs
+    assert [r.memory for r in out][2:5] == ['flagged by gate', 'forced private', rows[4].memory]
+    assert [out[0].memory, out[1].memory, out[5].memory] == ['plain b', 'plain c', 'plain a']
+    assert sorted(map(id, out)) == sorted(map(id, rows))

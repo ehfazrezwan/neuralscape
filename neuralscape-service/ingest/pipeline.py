@@ -214,13 +214,13 @@ def ingest_document(service, doc: IngestDoc) -> dict:
     if doc.extract_facts:
         # E4: user/project ride along so operator extraction instructions
         # compose with the adapter's own prompt (adapter first, addendum after).
-        # Evidence is collected only when JEV_EXTRACTION_ENABLED; flag off, the
+        # Evidence is collected only when HYBRID_EXTRACTION_ENABLED; flag off, the
         # call signature is exactly the original.
         from config import settings as _settings
 
         category_evidence: dict = {}
         evidence_kwargs = (
-            {"category_evidence": category_evidence} if _settings.jev_extraction_enabled else {}
+            {"category_evidence": category_evidence} if _settings.hybrid_extraction_enabled else {}
         )
         facts = service.extract_facts_only(
             doc.content,

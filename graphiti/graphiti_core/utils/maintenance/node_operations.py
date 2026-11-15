@@ -412,7 +412,7 @@ async def _resolve_with_llm(
         ),
     }
 
-    # NEURALSCAPE PATCH: optional bounded decision fast path (JEV_GRAPH_ENABLED).
+    # NEURALSCAPE PATCH: optional bounded decision fast path (HYBRID_GRAPH_ENABLED).
     # Never parse a rendered prompt back into data or route extraction/
     # summarization through a classifier. None falls through to the original call.
     decisions = getattr(llm_client, 'decision_client', None)

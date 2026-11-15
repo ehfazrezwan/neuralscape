@@ -19,8 +19,6 @@ import httpx
 
 logger = logging.getLogger(__name__)
 Telemetry = Callable[[dict[str, Any]], None]
-# Module-level so a test can point the adapter at a local fake endpoint.
-JEV_ENDPOINT = 'https://api.typesafe.ai/v1/systemone'
 
 
 @lru_cache(maxsize=1)
@@ -63,20 +61,24 @@ def category_policy(categories: dict[str, str]) -> str:
     return policy
 
 
-class JevDecisions:
-    def __init__(self, api_key: str, *, model: str = 'jev-1.13.0', threshold: float = .9,
+class HybridDecisions:
+    def __init__(self, api_key: str, *, endpoint: str = '', model: str = '', threshold: float = .9,
                  timeout: float = 2.0, telemetry: Telemetry | None = None,
-                 client: httpx.Client | None = None):
+                 client: httpx.Client | None = None,
+                 egress_check: Callable[[str], bool] | None = None):
         if not .5 <= threshold <= 1 or not 0 < timeout <= 30:
             raise ValueError('invalid_decision_configuration')
-        self._api_key = api_key
+        self._api_key, self.endpoint = api_key, endpoint
         self.model, self.threshold, self.timeout = model, threshold, timeout
         self.telemetry, self.client = telemetry, client
+        # Optional gate: returns False for text that must never leave the process.
+        self.egress_check = egress_check
 
     @classmethod
     def from_env(cls, **kwargs):
-        return cls(os.environ.get('TYPESAFE_API_KEY', ''),
-                   model=os.environ.get('JEV_MODEL', 'jev-1.13.0'), **kwargs)
+        return cls(os.environ.get('HYBRID_INFERENCE_API_KEY', ''),
+                   endpoint=os.environ.get('HYBRID_INFERENCE_ENDPOINT', ''),
+                   model=os.environ.get('HYBRID_INFERENCE_MODEL', ''), **kwargs)
 
     def emit(self, event: dict) -> None:
         # No state, question text, memory IDs, credentials, or response bodies.
@@ -89,12 +91,14 @@ class JevDecisions:
 
     def ask(self, state: Any, questions: dict, *, task: str,
             partial_choices: bool = False, preserve_choice_probabilities: bool = False) -> dict | None:
-        event = {'provider': 'jev', 'model': self.model, 'task': task,
+        event = {'provider': 'hybrid', 'model': self.model, 'task': task,
                  'input_tokens': None, 'output_tokens': None}
         started = time.perf_counter()
         try:
             if not self._api_key:
                 raise ValueError('missing_key')
+            if not self.endpoint:
+                raise ValueError('missing_endpoint')
             body = {'model': self.model, 'state': state, 'questions': questions}
             # Conservative BYTE caps, not an inaccurate tokenizer estimate.
             # Do not truncate evidence or options silently to fit the model.
@@ -109,7 +113,7 @@ class JevDecisions:
                     raise ValueError('choice_limit')
             event['attempted'] = True
             response = (self.client or _http_client()).post(
-                JEV_ENDPOINT, json=body,
+                self.endpoint, json=body,
                 headers={'Authorization': f'Bearer {self._api_key}'},
                 timeout=httpx.Timeout(self.timeout, pool=min(.5, self.timeout)),
             )
@@ -155,7 +159,7 @@ class JevDecisions:
         except (httpx.HTTPError, ValueError, KeyError, TypeError, AttributeError) as exc:
             # Exception messages can contain private response/request data.
             event['fallback_reason'] = str(exc) if type(exc) is ValueError and str(exc) in {
-                'missing_key', 'question_limit', 'input_limit', 'choice_limit', 'model_version_changed',
+                'missing_key', 'missing_endpoint', 'question_limit', 'input_limit', 'choice_limit', 'model_version_changed',
                 'answer_set_mismatch', 'invalid_answer_type', 'invalid_choice', 'invalid_distribution',
                 'uncertain_choice', 'invalid_probability', 'unsupported_question',
                 'http_401', 'http_402', 'http_422', 'http_429', 'http_503', 'http_529',
@@ -171,16 +175,41 @@ class JevDecisions:
             return await asyncio.wait_for(asyncio.to_thread(self.resolve_sync, task, context),
                                           timeout=self.timeout + .5)
         except TimeoutError:
-            self.emit({'provider': 'jev', 'task': task, 'fallback_reason': 'deadline'})
+            self.emit({'provider': 'hybrid', 'task': task, 'fallback_reason': 'deadline'})
             return None
         except Exception as exc:
             # Context building (outside ask()) can raise on unexpected candidate
             # shapes or non-JSON attributes. A graph write must never fail
             # because the optional fast path did: abstain to the original LLM.
-            self.emit({'provider': 'jev', 'task': task, 'fallback_reason': type(exc).__name__})
+            self.emit({'provider': 'hybrid', 'task': task, 'fallback_reason': type(exc).__name__})
             return None
 
+    @staticmethod
+    def _strings(value):
+        if isinstance(value, str):
+            yield value
+        elif isinstance(value, dict):
+            for item in value.values():
+                yield from HybridDecisions._strings(item)
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                yield from HybridDecisions._strings(item)
+
+    def _egress_blocked(self, context: dict) -> bool:
+        """True when any text in the graph context fails the egress gate.
+
+        The whole resolution then abstains and the original resolver handles
+        it, so gated text (episode, previous episodes, candidate summaries/facts)
+        is never sent to the endpoint.
+        """
+        if self.egress_check is None:
+            return False
+        return not all(self.egress_check(text) for text in self._strings(context))
+
     def resolve_sync(self, task: str, context: dict) -> dict | None:
+        if task in ('nodes', 'edges') and self._egress_blocked(context):
+            self.emit({'provider': 'hybrid', 'task': task, 'fallback_reason': 'egress_blocked'})
+            return None
         if task == 'nodes':
             nodes, existing = context['extracted_nodes'], context['existing_nodes']
             if not nodes:
@@ -204,6 +233,12 @@ class JevDecisions:
             candidates = context['existing_edges'] + context['edge_invalidation_candidates']
             if not candidates:
                 return {'duplicate_facts': [], 'contradicted_facts': []}
+            if context['edge_invalidation_candidates']:
+                # Temporal contradiction/invalidation stays with the original
+                # resolver: a bounded DISTINCT answer cannot replace it.
+                self.emit({'provider': 'hybrid', 'task': 'edge_resolution',
+                           'fallback_reason': 'invalidation_requires_llm'})
+                return None
             questions = {str(c['idx']): {'type': 'choice', 'criteria': {
                 'DUPLICATE': 'Identical factual information; same subject, values, dates and qualifiers.',
                 'DISTINCT': 'Different compatible facts, subjects, versions or events; neither duplicate nor contradiction.',
@@ -215,7 +250,7 @@ class JevDecisions:
             if answers is None:
                 return None
             if any(a['choice'] in {'CONFLICT', 'UNCERTAIN'} for a in answers.values()):
-                self.emit({'provider': 'jev', 'task': 'edge_resolution', 'fallback_reason': 'conflict_requires_llm'})
+                self.emit({'provider': 'hybrid', 'task': 'edge_resolution', 'fallback_reason': 'conflict_requires_llm'})
                 return None
             # A duplicate in invalidation-only candidates is not eligible for
             # merging. Let the original temporal resolver adjudicate it.

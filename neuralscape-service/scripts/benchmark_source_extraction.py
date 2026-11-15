@@ -95,14 +95,16 @@ def run(args):
     import hybrid_inference
 
     # This benchmark was added and baseline run before the new flag existed.
-    if hasattr(settings, 'jev_extraction_enabled'):
-        settings.jev_extraction_enabled = args.arm == 'hybrid'
+    if hasattr(settings, 'hybrid_extraction_enabled'):
+        settings.hybrid_extraction_enabled = args.arm == 'hybrid'
     elif args.arm == 'hybrid':
-        raise SystemExit('Jev extraction implementation not installed')
+        raise SystemExit('the decision model extraction implementation not installed')
     settings.google_api_key = os.environ['GOOGLE_API_KEY']
-    settings.typesafe_api_key = os.environ.get('TYPESAFE_API_KEY', '')
+    settings.hybrid_inference_api_key = os.environ.get('HYBRID_INFERENCE_API_KEY', '')
+    settings.hybrid_inference_endpoint = os.environ.get('HYBRID_INFERENCE_ENDPOINT', '')
+    settings.hybrid_inference_model = os.environ.get('HYBRID_INFERENCE_MODEL', '')
     if args.simulate_outage:
-        settings.typesafe_api_key = ''
+        settings.hybrid_inference_api_key = ''
     rows, cases = [], (fixtures() + heldout_fixtures() if args.combined else
                       heldout_fixtures() if args.heldout else fixtures())
     client = genai.Client(api_key=settings.google_api_key)
@@ -111,11 +113,11 @@ def run(args):
     hybrid_inference.decisions = lambda **kw: factory(telemetry=sink.get().append)
     warmup_ms = None
     if args.warmup:
-        settings.jev_extraction_enabled = True
+        settings.hybrid_extraction_enabled = True
         start = time.perf_counter()
         hybrid_inference.warmup_extraction()
         warmup_ms = (time.perf_counter() - start) * 1000
-    settings.jev_extraction_enabled = args.arm == 'hybrid'
+    settings.hybrid_extraction_enabled = args.arm == 'hybrid'
 
     def evaluate(item):
         repeat, name, source, expected, arm = item
@@ -157,7 +159,7 @@ def run(args):
                 jobs.extend((repeat, name, source, expected, arm) for arm in arms)
         if args.concurrency == 1:
             for job in jobs:
-                settings.jev_extraction_enabled = job[-1] == 'hybrid'
+                settings.hybrid_extraction_enabled = job[-1] == 'hybrid'
                 report = save(evaluate(job))
         else:
             # Concurrent arms run in separate processes: never race global flags.

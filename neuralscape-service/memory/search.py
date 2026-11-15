@@ -763,7 +763,7 @@ class SearchMixin:
             combined = [r for r in combined if r.memory_kind == "passage"]
 
         # After tenant/visibility/kind filters, never on internal write probes.
-        if not vector_only and settings.jev_rerank_enabled:
+        if not vector_only and settings.hybrid_rerank_enabled:
             from hybrid_inference import rerank
 
             combined = rerank(query, combined)

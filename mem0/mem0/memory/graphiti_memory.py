@@ -149,6 +149,16 @@ class _AsyncBridge:
         return future.result()
 
 
+def _hybrid_egress_ok(text: str) -> bool:
+    """NEURALSCAPE PATCH: text matching a sensitivity class never goes to the
+    optional hybrid decision endpoint (the service's regex floor, no LLM)."""
+    try:
+        from memory.sensitivity import classify_sensitivity
+    except ImportError:  # library used outside the service: no gate available
+        return True
+    return classify_sensitivity(text) is None
+
+
 class MemoryGraph:
     """Graphiti-backed MemoryGraph adapter for mem0.
 
@@ -186,14 +196,16 @@ class MemoryGraph:
 
         # NEURALSCAPE PATCH: attach the optional decision client only when the
         # graph flag is on; flag off constructs nothing.
-        if getattr(graph_config, "graphiti_jev_enabled", False):
-            from graphiti_core.llm_client.jev_client import JevDecisions
+        if getattr(graph_config, "graphiti_hybrid_enabled", False):
+            from graphiti_core.llm_client.hybrid_decision_client import HybridDecisions
 
-            llm_client.decision_client = JevDecisions(
-                graph_config.graphiti_jev_api_key,
-                model=graph_config.graphiti_jev_model,
-                threshold=graph_config.graphiti_jev_threshold,
-                timeout=graph_config.graphiti_jev_timeout,
+            llm_client.decision_client = HybridDecisions(
+                graph_config.graphiti_hybrid_api_key,
+                endpoint=graph_config.graphiti_hybrid_endpoint,
+                model=graph_config.graphiti_hybrid_model,
+                threshold=graph_config.graphiti_hybrid_threshold,
+                timeout=graph_config.graphiti_hybrid_timeout,
+                egress_check=_hybrid_egress_ok,
             )
 
         cross_encoder = _create_cross_encoder(

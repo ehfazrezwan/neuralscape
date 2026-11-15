@@ -1,4 +1,4 @@
-"""Fixed-candidate policy reranking pilot: input order, Jev, Gemini, MiniLM.
+"""Fixed-candidate policy reranking pilot: input order, the decision model, Gemini, MiniLM.
 
 Handwritten labels; not a search-recall benchmark. Model download excluded from
 warm latency, initialization separately reported. Local compute is NOT free:
@@ -44,7 +44,7 @@ async def run(args):
     from google import genai
     from google.genai import types
     from pydantic import BaseModel
-    from graphiti_core.llm_client.jev_client import JevDecisions
+    from graphiti_core.llm_client.hybrid_decision_client import HybridDecisions
 
     load_dotenv(args.env_file)
     client = genai.Client(api_key=os.environ['GOOGLE_API_KEY'])
@@ -65,7 +65,7 @@ async def run(args):
         for repeat in range(args.repeats):
             for index, case in enumerate(fixtures()):
                 # Alternating ordering reduces systematic first/last arm bias.
-                arms = ['input_order', 'jev', 'gemini'] + (['minilm'] if local else [])
+                arms = ['input_order', 'hybrid', 'gemini'] + (['minilm'] if local else [])
                 if repeat % 2:
                     arms.reverse()
                 for arm in arms:
@@ -74,8 +74,8 @@ async def run(args):
                     row = {'id': f'{arm}-{index}-{repeat}', 'arm': arm, 'task': 'rerank', 'events': events}
                     order = list(range(len(case['passages'])))
                     try:
-                        if arm == 'jev':
-                            scores = await asyncio.to_thread(JevDecisions.from_env(telemetry=events.append).scores,
+                        if arm == 'hybrid':
+                            scores = await asyncio.to_thread(HybridDecisions.from_env(telemetry=events.append).scores,
                                 case['query'], case['passages'], case['policy'])
                             if scores is None:
                                 row['fallback'] = True

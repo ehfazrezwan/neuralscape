@@ -259,7 +259,7 @@ class WriteMixin:
         window_errors: list[str] = []
         last_exc: Exception | None = None
         for w_idx, window_messages in enumerate(windows):
-            if settings.jev_extraction_enabled and not operator_guidance and not use_rich_parser:
+            if settings.hybrid_extraction_enabled and not operator_guidance and not use_rich_parser:
                 from hybrid_inference import extract_source_facts
 
                 source_facts = extract_source_facts(window_messages, category_evidence=category_evidence)
@@ -600,7 +600,7 @@ class WriteMixin:
             )
         # Source-selection lanes cannot honor domain prompts or synthesize
         # multi-party context. Preserve those contracts by falling back.
-        if not operator_guidance and settings.jev_extraction_enabled:
+        if not operator_guidance and settings.hybrid_extraction_enabled:
             from ingest.extractors import DefaultExtractor
             from hybrid_inference import extract_source_facts
 

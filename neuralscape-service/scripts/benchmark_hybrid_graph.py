@@ -31,13 +31,15 @@ def run(args):
     settings.redis_url = 'redis://127.0.0.1:16379/0'
     settings.llm_gateway_enabled = False
     settings.llm_gateway_graphiti_enabled = False
-    settings.jev_graph_enabled = args.arm == 'hybrid'
-    settings.jev_rerank_enabled = False
-    settings.jev_extraction_enabled = args.extract and args.arm == 'hybrid'
-    settings.typesafe_api_key = os.environ.get('TYPESAFE_API_KEY', '')
+    settings.hybrid_graph_enabled = args.arm == 'hybrid'
+    settings.hybrid_rerank_enabled = False
+    settings.hybrid_extraction_enabled = args.extract and args.arm == 'hybrid'
+    settings.hybrid_inference_api_key = os.environ.get('HYBRID_INFERENCE_API_KEY', '')
+    settings.hybrid_inference_endpoint = os.environ.get('HYBRID_INFERENCE_ENDPOINT', '')
+    settings.hybrid_inference_model = os.environ.get('HYBRID_INFERENCE_MODEL', '')
     settings.google_api_key = os.environ['GOOGLE_API_KEY']
-    if args.simulate_jev_outage:
-        settings.typesafe_api_key = ''
+    if args.simulate_hybrid_outage:
+        settings.hybrid_inference_api_key = ''
     settings.reinforcement_boost_k = 0
     service = MemoryService()
     rows, checks, events = [], {}, []
@@ -55,7 +57,7 @@ def run(args):
         decisions = getattr(graph.llm_client, 'decision_client', None)
         if decisions:
             decisions.telemetry = events.append
-            if args.simulate_jev_outage:
+            if args.simulate_hybrid_outage:
                 decisions._api_key = ''
         facts = [
             ('Ada works at Acme as of January 1, 2025.', '2025-01-01T00:00:00+00:00'),
@@ -162,7 +164,7 @@ def run(args):
         probabilities = dict.fromkeys([*CORE_MEMORY_CATEGORIES, 'UNCERTAIN'], 0.0)
         probabilities.update(tech_stack=.6, architecture=.4)
         soft = make_evidence(text, {'choice':'tech_stack', 'confidence':.55,
-                                   'probabilities':probabilities}, 'jev-1.13.0', 'soft')
+                                   'probabilities':probabilities}, 'test-model', 'soft')
         soft_user = run_id + 'soft'
         result = service.store_raw(text, soft_user, 'tech_stack', scope='project', project_id='cedar',
                                    visibility='private', category_evidence=soft, add_to_graph=True)
@@ -198,6 +200,6 @@ if __name__ == '__main__':
     parser.add_argument('--arm', choices=['baseline', 'hybrid'], required=True)
     parser.add_argument('--env-file', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
-    parser.add_argument('--simulate-jev-outage', action='store_true')
+    parser.add_argument('--simulate-hybrid-outage', action='store_true')
     parser.add_argument('--extract', action='store_true', help='Extract facts before persisting to both stores')
     run(parser.parse_args())

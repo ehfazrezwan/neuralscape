@@ -6,13 +6,13 @@ import pytest
 
 from config import settings
 import hybrid_inference as hybrid
-from jev_extraction import candidates, select_facts
+from source_extraction import candidates, select_facts
 from memory.write import WriteMixin
 from schemas import CORE_MEMORY_CATEGORIES
 
 
 def decision(answers):
-    return SimpleNamespace(threshold=.9, model='jev-1.13.0', ask=Mock(return_value=answers), emit=Mock())
+    return SimpleNamespace(threshold=.9, model='test-model', ask=Mock(return_value=answers), emit=Mock())
 
 
 def heads(i=0, retain=.99, standalone=.99, category='preference'):
@@ -83,7 +83,7 @@ def test_provider_abstention_preserved():
 
 
 def test_kill_switch_avoids_factory(monkeypatch):
-    monkeypatch.setattr(settings, 'jev_extraction_enabled', False)
+    monkeypatch.setattr(settings, 'hybrid_extraction_enabled', False)
     factory = Mock(side_effect=AssertionError)
     monkeypatch.setattr(hybrid, 'decisions', factory)
     assert hybrid.extract_source_facts(messages('I prefer tea.')) is None
@@ -91,18 +91,18 @@ def test_kill_switch_avoids_factory(monkeypatch):
 
 
 def test_runtime_failure_falls_back_without_logging_content(monkeypatch):
-    monkeypatch.setattr(settings, 'jev_extraction_enabled', True)
-    monkeypatch.setattr(settings, 'typesafe_api_key', 'test')
+    monkeypatch.setattr(settings, 'hybrid_extraction_enabled', True)
+    monkeypatch.setattr(settings, 'hybrid_inference_api_key', 'test')
     d = decision({})
     monkeypatch.setattr(hybrid, 'decisions', lambda **kw: d)
-    monkeypatch.setattr('jev_extraction.select_facts', Mock(side_effect=RuntimeError('private-content')))
+    monkeypatch.setattr('source_extraction.select_facts', Mock(side_effect=RuntimeError('private-content')))
     assert hybrid.extract_source_facts(messages('private-content')) is None
     assert 'private-content' not in str(d.emit.call_args)
 
 
 @pytest.mark.parametrize('selected', [[], [('preference', 'I prefer concise answers.')], None])
 def test_ingest_accepted_empty_and_fallback(monkeypatch, selected):
-    monkeypatch.setattr(settings, 'jev_extraction_enabled', True)
+    monkeypatch.setattr(settings, 'hybrid_extraction_enabled', True)
     monkeypatch.setattr('extraction_settings.resolve_instructions', lambda *a: '')
     monkeypatch.setattr(hybrid, 'extract_source_facts', lambda *a, **kw: selected)
     client = Mock()
@@ -114,8 +114,8 @@ def test_ingest_accepted_empty_and_fallback(monkeypatch, selected):
 
 
 @pytest.mark.parametrize('custom', ['guidance', 'extractor'])
-def test_custom_contracts_bypass_jev(monkeypatch, custom):
-    monkeypatch.setattr(settings, 'jev_extraction_enabled', True)
+def test_custom_contracts_bypass_hybrid(monkeypatch, custom):
+    monkeypatch.setattr(settings, 'hybrid_extraction_enabled', True)
     monkeypatch.setattr('extraction_settings.resolve_instructions', lambda *a: 'custom' if custom == 'guidance' else '')
     fast = Mock(side_effect=AssertionError)
     monkeypatch.setattr(hybrid, 'extract_source_facts', fast)
@@ -133,7 +133,7 @@ def test_custom_contracts_bypass_jev(monkeypatch, custom):
 @pytest.mark.parametrize('rich,selected', [(False, []), (False, [('preference', 'I prefer tea.')]), (True, [])])
 def test_conversation_path_preserves_rich_contract_and_batch_store(monkeypatch, rich, selected):
     from memory_service import MemoryService
-    monkeypatch.setattr(settings, 'jev_extraction_enabled', True)
+    monkeypatch.setattr(settings, 'hybrid_extraction_enabled', True)
     monkeypatch.setattr(settings, 'extraction_require_speaker', rich)
     monkeypatch.setattr('extraction_settings.resolve_instructions', lambda *a: '')
     fast = Mock(return_value=selected)

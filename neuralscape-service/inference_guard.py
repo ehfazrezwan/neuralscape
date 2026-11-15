@@ -14,7 +14,7 @@ from contextvars import copy_context
 
 class InferenceGuard:
     def __init__(self, *, capacity=4, failures=3, cooldown=30.0, clock=time.monotonic):
-        self._executor = ThreadPoolExecutor(max_workers=capacity, thread_name_prefix='jev-extraction')
+        self._executor = ThreadPoolExecutor(max_workers=capacity, thread_name_prefix='hybrid-extraction')
         self._slots = threading.BoundedSemaphore(capacity)
         self._lock = threading.Lock()
         self._clock, self._limit, self._cooldown = clock, failures, cooldown

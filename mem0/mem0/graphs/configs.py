@@ -23,11 +23,12 @@ class GraphitiConfig(BaseModel):
     graphiti_reranker_provider: Optional[str] = Field(default=None, description="Reranker provider (gemini, openai, bge)")
     # NEURALSCAPE PATCH: hybrid capability settings (all off by default);
     # generation and embeddings are unchanged.
-    graphiti_jev_enabled: bool = False
-    graphiti_jev_api_key: str = Field(default="", repr=False)
-    graphiti_jev_model: str = "jev-1.13.0"
-    graphiti_jev_threshold: float = Field(default=0.9, ge=0.5, le=1)
-    graphiti_jev_timeout: float = Field(default=2.0, gt=0, le=30)
+    graphiti_hybrid_enabled: bool = False
+    graphiti_hybrid_api_key: str = Field(default="", repr=False)
+    graphiti_hybrid_endpoint: str = ""
+    graphiti_hybrid_model: str = ""
+    graphiti_hybrid_threshold: float = Field(default=0.9, ge=0.5, le=1)
+    graphiti_hybrid_timeout: float = Field(default=2.0, gt=0, le=30)
     store_raw_episode_content: bool = Field(default=True, description="Whether to store raw episode content")
     update_communities: bool = Field(default=False, description="Whether to update communities on add")
 
