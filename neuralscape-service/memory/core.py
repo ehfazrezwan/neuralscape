@@ -259,6 +259,11 @@ class CoreMixin:
         """Clean up resources."""
         if self._graphiti and self._bridge:
             self._bridge.run(self._graphiti.close())
+        shutdown = getattr(self._bridge, "shutdown", None)
+        if callable(shutdown):
+            # Stop the bridge loop AFTER the driver closed on it, so no task or
+            # driver outlives its loop.
+            shutdown()
 
     def _ensure_created_at_index(self) -> None:
         """Best-effort: ensure a DATETIME payload index on ``created_at``.
