@@ -880,7 +880,6 @@ class ReadsMixin:
         if g is None:
             return []
 
-        from identity import collision_free_ids_enabled
         from memory.groups import ENCODED_GROUP_PREFIX, _build_group_id, decode_group_id
 
         shared_prefix = "shared--project--"
@@ -889,9 +888,8 @@ class ReadsMixin:
             # This user's pools carry encoded names (collision-free ids); the legacy
             # prefix could only match names other users' tuples fold into.
             user_prefix = shared_prefix
-        # Encoded (collision-free) names share one prefix and are decoded below; with
-        # the encoding off the slot repeats the shared prefix and adds nothing.
-        encoded_prefix = ENCODED_GROUP_PREFIX if collision_free_ids_enabled() else shared_prefix
+        # Encoded (collision-free) names share one prefix and are decoded below.
+        encoded_prefix = ENCODED_GROUP_PREFIX
         # One MATCH per indexed label so the per-label group_id range index is
         # used; UNION dedupes across labels (and is itself DISTINCT).
         cypher = """

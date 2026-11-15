@@ -993,7 +993,14 @@ def evaluate_request(operation_id: str, context: RequestContext) -> PublicError 
         if decision.unavailable
         else InternalErrorCode.DENIED
     )
+    if decision.reason in _CREDENTIAL_REFUSED:
+        # The profile refuses this KIND of credential outright; nothing about any resource is disclosed,
+        # so it is an honest 403 rather than the existence-safe 404 used for every other denial.
+        return public_error_for(InternalErrorCode.DENIED, disclose_existence=True)
     return public_error_for(code)
+
+
+_CREDENTIAL_REFUSED = frozenset({"legacy_credential_refused", "unauthenticated_refused"})
 
 
 def operation_id_for_route(method: str, path: str) -> str | None:

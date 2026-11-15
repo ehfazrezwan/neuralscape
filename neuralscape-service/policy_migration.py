@@ -482,6 +482,17 @@ def build_statements(
         for action in ADMIN_ACTIONS_ON_TENANT:
             grant(subject_ids[user], (action,), privileged_handle(action, tenant_handle(tenant_id)),
                   origin=ADMIN_ORIGIN)
+    if legacy_key_subject:
+        # Under legacy_compat the shared key acts as ONE bound identity (NEURALSCAPE_API_KEY_USER_ID, else
+        # the default user).  When that user is an administrator the key keeps exactly that user's
+        # administrator operations (and nothing else: still no standards, membership or credentials).
+        from config import settings
+
+        all_admins = set(admin_user_ids(dictators) if admins is None else admins)
+        if settings.legacy_key_identity() in all_admins:
+            for action in ADMIN_ACTIONS_ON_TENANT:
+                grant(legacy_key_subject, (action,), privileged_handle(action, tenant_handle(tenant_id)),
+                      origin=ADMIN_ORIGIN)
 
     if legacy_key_subject:
         # The shared key acted as any user it asserted: it holds each unique

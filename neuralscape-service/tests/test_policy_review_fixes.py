@@ -27,6 +27,17 @@ KEY = "the-shared-key"
 SOLO = "solo-admin"
 
 
+def _credentials(monkeypatch, on: bool) -> None:
+    """Switch CREDENTIALS_ENABLED through Settings (and the environment, for code that predates the field)."""
+
+    if on:
+        monkeypatch.setenv("CREDENTIALS_ENABLED", "1")
+    else:
+        monkeypatch.delenv("CREDENTIALS_ENABLED", raising=False)
+    if "credentials_enabled" in type(settings).model_fields:
+        monkeypatch.setattr(settings, "credentials_enabled", on)
+
+
 @pytest.fixture
 def world(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "default_user_id", SOLO)
@@ -44,7 +55,7 @@ def world(tmp_path, monkeypatch):
         action="manage_credentials", resource=_handle("credential", solo, T))])
     monkeypatch.setattr(settings, "ns_policy_mode", "enforce")
     monkeypatch.setattr(settings, "ns_auth_profile", "legacy_compat")
-    monkeypatch.setattr(settings, "credentials_enabled", True)
+    _credentials(monkeypatch, True)
     monkeypatch.setattr(settings, "neuralscape_user_token_secret", SECRET)
     monkeypatch.setattr(settings, "neuralscape_api_key", KEY)
     monkeypatch.setattr(settings, "neuralscape_api_key_user_id", SOLO)
@@ -79,7 +90,7 @@ def test_the_shared_key_is_refused_under_the_enforced_profile(world, monkeypatch
     assert w.call(KEY, "GET", "/v1/memories").status_code == 200        # legacy_compat: as before
     monkeypatch.setattr(settings, "ns_auth_profile", "enforced")
     refused = w.call(KEY, "GET", "/v1/memories")
-    assert refused.status_code == 404 and refused.json()["detail"]["error"]["code"] == "not_found"
+    assert refused.status_code == 403 and refused.json()["detail"]["error"]["code"] == "permission_denied"
     assert w.call(w.tokens[SOLO], "GET", "/v1/memories").status_code == 200  # a token user is not affected
 
 
@@ -95,11 +106,22 @@ def test_the_shared_key_cannot_mint_or_manage_credentials(world) -> None:
     assert w.call(w.tokens[SOLO], "POST", "/v1/credentials", json={"scope": ["list"]}).status_code == 200
 
 
-def test_the_shared_key_is_still_the_asserted_user_not_an_administrator(world, monkeypatch) -> None:
+def test_the_shared_key_keeps_the_administrator_powers_of_the_user_it_is_bound_to(world, monkeypatch) -> None:
+    """Owner decision (#467): with DICTATOR_USER_IDS empty the default user is the administrator, and under
+    legacy_compat the shared key acting as that user keeps exactly those powers; under enforced it is refused."""
+
     w = world
-    monkeypatch.setattr("knowledge.router.set_project_config", MagicMock())
-    response = w.call(KEY, "PUT", "/v1/projects/p1/knowledge-config", json={"project_id": "p1"})
-    assert response.status_code in (403, 404)                           # never the administrator's grant
+    saved = MagicMock()
+    monkeypatch.setattr("knowledge.router.set_project_config", saved)
+    ok = w.call(KEY, "PUT", "/v1/projects/p1/knowledge-config", json={"project_id": "p1"})
+    assert ok.status_code == 200, ok.text and saved.call_count == 1
+    # a key bound to somebody who is not an administrator gets no administrator operation
+    monkeypatch.setattr(settings, "neuralscape_api_key_user_id", "bob")
+    assert w.call(KEY, "PUT", "/v1/projects/p1/knowledge-config", json={"project_id": "p1"}).status_code in (403, 404)
+    monkeypatch.setattr(settings, "neuralscape_api_key_user_id", SOLO)
+    monkeypatch.setattr(settings, "ns_auth_profile", "enforced")
+    refused = w.call(KEY, "PUT", "/v1/projects/p1/knowledge-config", json={"project_id": "p1"})
+    assert refused.status_code == 403 and saved.call_count == 1
 
 
 def test_a_single_user_install_keeps_its_administrator_under_enforce(world, monkeypatch) -> None:
@@ -137,7 +159,7 @@ def test_credential_routes_need_both_flags(world, monkeypatch) -> None:
     monkeypatch.setattr(settings, "ns_policy_mode", "off")
     assert w.call(w.tokens[SOLO], "POST", "/v1/credentials", json={"scope": ["list"]}).status_code == 404
     monkeypatch.setattr(settings, "ns_policy_mode", "enforce")
-    monkeypatch.setattr(settings, "credentials_enabled", False)
+    _credentials(monkeypatch, False)
     assert w.call(w.tokens[SOLO], "POST", "/v1/credentials", json={"scope": ["list"]}).status_code == 404
     # unauthenticated refresh is a 404 (not a 401) while the feature is off
     assert w.client.post("/v1/credentials/refresh", json={"refresh_token": "nsr_x.y"}).status_code == 404

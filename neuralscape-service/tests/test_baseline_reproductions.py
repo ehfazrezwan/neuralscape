@@ -34,14 +34,6 @@ def _run(coro):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason=(
-        "legacy group ids join user and project with a delimiter that legal ids "
-        "may contain, so different (user, project) tuples can share one namespace"
-    ),
-)
 def test_distinct_namespace_tuples_have_distinct_group_ids() -> None:
     from memory.groups import _build_group_id
 

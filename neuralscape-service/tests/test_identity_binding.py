@@ -118,10 +118,11 @@ def test_legacy_email_slug_collisions_exist() -> None:
     assert slugify_email("a+b@x.com") == slugify_email("a-b@x.com")
 
 
-def test_legacy_group_id_delimiter_collision_exists() -> None:
-    assert _build_group_id("private", "x--project--y") == _build_group_id(
-        "private", "x", project_id="y"
-    )
+def test_group_ids_no_longer_share_a_name_across_the_delimiter() -> None:
+    """The legacy join let user ``x--project--y`` and user ``x`` in project ``y`` share one graph namespace."""
+
+    assert _build_group_id("private", "x--project--y") != _build_group_id("private", "x", project_id="y")
+    assert _build_group_id("private", "x", project_id="y") == "user--x--project--y"  # plain: legacy name kept
 
 
 def test_codec_separates_the_legacy_group_id_collision() -> None:

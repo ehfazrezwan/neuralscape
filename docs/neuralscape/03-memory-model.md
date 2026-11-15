@@ -276,7 +276,7 @@ A search by user `alice` walks group_ids `["user--alice", "shared"]`
 (plus the project-scoped variants when the request supplies
 `project_id`).
 
-#### Collision-free names under the enforced auth profile
+#### Collision-free names
 
 The `--` delimiter may appear inside a legal id, so the legacy names are not
 one-to-one: user `alice--project--payroll` and user `alice` in project
@@ -284,12 +284,18 @@ one-to-one: user `alice--project--payroll` and user `alice` in project
 folds every run of disallowed characters to one `-`, so `a+b@example.com` and
 `a-b@example.com` both slug to `a-b-example.com`.
 
-With `NS_AUTH_PROFILE=enforced` (opt-in; the setting defaults to `legacy_compat`, which keeps every legacy name). **Switching an existing deployment to `enforced` re-keys graph group ids for any user, project or workspace value that contains `.` or `--` or starts or ends with `-`: their old graph data is no longer read. The service logs a warning at start-up under `enforced`; read the migration notes below before switching.**
+Two separate changes, with different switches:
+
+- **Group ids are injective for every deployment.** (The implementation is shared with PR #501 and
+  collapses into it.) Not tied to the auth profile.
+- **Fresh login ids** use the collision-free derivation only with `NS_AUTH_PROFILE=enforced` (opt-in; the
+  setting defaults to `legacy_compat`, which keeps the legacy slug). The service does not warn at start-up when
+  the profile is switched; read the migration notes below first.
 
 - **Group ids.** A tuple whose user, project and workspace are all *plain*
   keeps its legacy name byte for byte. Plain means the value uses only
-  Graphiti's group-id characters (letters, digits, `_` and `-`, so no `.`),
-  contains no `--`, and does not start or end with `-`. Any other tuple is
+  Graphiti's group-id characters (letters, digits, `_` and `-`, so no `.`)
+  and contains no `--` (a single `-` may start or end it). Any other tuple is
   named `nsg1--` followed by the hex of a length-prefixed encoding of the
   whole tuple. Every placement has exactly one name: decoding refuses an
   encoding of a plain tuple. Every read set (`_get_group_ids` and the
@@ -304,17 +310,16 @@ With `NS_AUTH_PROFILE=enforced` (opt-in; the setting defaults to `legacy_compat`
   `_x` followed by the hex of the address, or `_h` followed by its SHA-256
   digest when that would exceed 100 characters. A slug never starts with `_`.
 
-`legacy_compat` (the default for upgraded deployments) keeps every legacy
-name, including the collisions.
+`legacy_compat` (the default) keeps the legacy slug for fresh logins, including its collisions.
 
-**Migration when switching an existing deployment to `enforced`:**
+**Migration:**
 
 - **Unaffected:** plain tuples and unambiguous emails keep their ids, so most
   data needs no change. Identities that are already linked (durable identity
   store or `AUTH_IDENTITY_MAP`) also keep their ids, because the new derivation
   applies only to fresh, unlinked logins.
-- **Group ids that change:** only for users, projects or workspaces whose
-  value contains `.` or `--`, or starts or ends with `-`. A dotted value
+- **Group ids that change (any profile):** only for users, projects or workspaces whose
+  value contains `.` or `--`. A dotted value
   (for example the slug `first.last-example.com`) never had a usable legacy
   graph name, because Graphiti refuses `.` in a group id, so it has no graph
   data to move; its dreaming card pool key does change. Their old graph data stays

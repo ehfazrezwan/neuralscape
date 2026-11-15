@@ -11,21 +11,25 @@ from datetime import datetime
 from typing import NamedTuple
 
 from config import settings
-from identity import collision_free_ids_enabled
 from schemas import MemoryVisibility, normalize_visibility
 
 logger = logging.getLogger(__name__)
 
-# Collision-free group ids (enforced auth profile).  Legacy names join components with
+# TODO: this block collapses into the single ``nsg1--`` implementation owned by PR #501
+# (bug/graph-group-delimiter); the behaviour below is kept identical to it (encode ``.``, edge
+# dashes stay plain, not tied to the auth profile) so that merge is a deletion.
+#
+# Collision-free group ids.  Legacy names join components with
 # ``--``, which a legal id may itself contain, so user ``a--project--b`` and user ``a`` in
 # project ``b`` share one name.  A component is *plain* when it holds only Graphiti's group-id
-# characters (letters, digits, ``_`` and ``-``; no ``.``), no ``--``, and neither starts nor
-# ends with ``-``: then every ``--`` in a name is a delimiter and the name reads back to
+# characters (letters, digits, ``_`` and ``-``; no ``.``) and no ``--`` (a single ``-`` may start
+# or end it: the delimiter is then followed or preceded by one more ``-`` and the reading stays
+# unique): then every delimiter in a name is a real one and the name reads back to
 # exactly one tuple, so tuples of plain components keep their legacy name byte for byte.  Any
 # other tuple is named ``nsg1--`` + the hex of a length-prefixed encoding of the whole tuple,
 # whose first segment no legacy name has and whose characters Graphiti accepts.  Each
 # placement has exactly one name: an encoding of a plain tuple is not a valid name.
-_PLAIN_COMPONENT = re.compile(r"[A-Za-z0-9_]+(?:-[A-Za-z0-9_]+)*")
+_PLAIN_COMPONENT = re.compile(r"(?!.*--)[A-Za-z0-9_\-]+")
 ENCODED_GROUP_PREFIX = "nsg1--"
 _POOL_KINDS = ("private", "shared", "standard")
 
@@ -92,7 +96,7 @@ def _has_non_plain_component(key: GroupKey) -> bool:
 
 
 def _needs_encoded_group_id(key: GroupKey) -> bool:
-    return collision_free_ids_enabled() and _has_non_plain_component(key)
+    return _has_non_plain_component(key)
 
 def _live_edges_filter():
     """Graphiti ``SearchFilters`` selecting only bi-temporally LIVE edges.
@@ -209,8 +213,8 @@ def _build_group_id(
     group_ids for existing rows, zero migration). Any other value appends
     `--ws--{workspace}`, isolating reference content from memory pools.
 
-    Under the enforced auth profile a tuple with a component that is not plain
-    (it contains ``--`` or starts or ends with ``-``) is named by
+    A tuple with a component that is not plain (it contains ``--`` or a
+    character outside Graphiti's group-id alphabet, such as ``.``) is named by
     ``_encode_group_key`` instead, so distinct tuples never share a name.
     """
     # Tolerate enum / str / legacy "MemoryVisibility.X" / None — see
