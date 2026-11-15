@@ -249,3 +249,20 @@ def test_apply_defaults_takes_only_missing_names_from_the_file(tmp_path):
     environ = {}
     third_party_telemetry.apply_defaults(environ, env_file=str(bare))
     assert environ["MEM0_TELEMETRY"] == "false"
+
+
+def test_test_suite_keeps_telemetry_off_despite_a_local_opt_in(tmp_path):
+    """The suite's conftest forces both off, even when the developer opted in.
+
+    A service .env (or shell) with MEM0_TELEMETRY=true must not make the test
+    run build a real analytics client (review finding L-1 on #451).
+    """
+    code = (
+        "import json, os, runpy; "
+        f"runpy.run_path({str(SERVICE / 'tests' / 'conftest.py')!r}); "
+        "print(json.dumps([os.environ.get(k) for k in "
+        f"{VARS!r}]))"
+    )
+    seen = _run(code, {"MEM0_TELEMETRY": "true"}, tmp_path,
+                env_file="MEM0_TELEMETRY=true\nGRAPHITI_TELEMETRY_ENABLED=true\n")
+    assert seen == ["false", "false"]

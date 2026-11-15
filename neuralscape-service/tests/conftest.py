@@ -7,6 +7,14 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 # Before anything can import mem0/Graphiti: keep their telemetry off in tests.
+# Forced, not defaulted: a developer's own opt-in (shell or a service .env with
+# MEM0_TELEMETRY=true) must not make the suite build a real analytics client.
+# tests/test_third_party_telemetry.py runs its opt-in cases in subprocesses
+# with their own environment, so they are unaffected.
+import os  # noqa: E402
+
+os.environ["MEM0_TELEMETRY"] = "false"
+os.environ["GRAPHITI_TELEMETRY_ENABLED"] = "false"
 import third_party_telemetry  # noqa: E402,F401
 
 import pytest  # noqa: E402
@@ -27,8 +35,8 @@ def _disable_auth_for_tests():
     which makes every unauthenticated TestClient request return 401
     before reaching the route under test.
 
-    Tests that specifically exercise auth (test_auth.py, test_tokens.py,
-    test_auth_fail_closed.py) set their own credentials (which take
+    Tests that specifically exercise auth (test_auth.py, including
+    TestAuthFailClosed, and test_tokens.py) set their own credentials (which take
     precedence over the opt-out) or turn the opt-out back off.
     """
     from config import settings

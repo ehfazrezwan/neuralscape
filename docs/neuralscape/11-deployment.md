@@ -114,11 +114,15 @@ The vendored mem0 and Graphiti libraries each ship with anonymous usage telemetr
 | `MEM0_TELEMETRY` | mem0 (read once, when mem0 is first imported) | `false` | `true` |
 | `GRAPHITI_TELEMETRY_ENABLED` | Graphiti (read on every event) | `false` | `true` |
 
-The default is applied in three layers, and each one respects an explicitly set value, including an empty one:
+The default is applied in three layers. The code and image layers keep any explicitly set value, including an empty one; the Compose layer keeps an explicit non-empty value (Compose's `${VAR:-false}` treats an empty value as unset). Either way an empty value means off in both libraries:
 
 - **Code:** `neuralscape-service/third_party_telemetry.py` fills each variable missing from the process environment: from the service `.env` (the file `config.Settings` reads, relative to the working directory) when that file sets it, otherwise `false`. Only these two names are taken from the file, and the process environment wins over it, as it does for `Settings`. Both keys are declared settings, so a service `.env` containing them is valid. `main`, `worker`, `mcp_server`, `memory_service` and the `memory` package import it before anything that can load mem0 or Graphiti, so scripts and library use get the same default. `tests/test_third_party_telemetry.py` enforces that import order.
 - **Image:** the runtime and test stages of the Dockerfile set both variables to `false`.
 - **Deployment templates:** `docker-compose.yml` and `docker-compose.prod.yml` pass `${MEM0_TELEMETRY:-false}` and `${GRAPHITI_TELEMETRY_ENABLED:-false}`, so setting either one in the Compose project's `.env` (the repository root) opts in. The Helm chart's `config` values set both to `"false"`.
+
+Inside the shipped image both variables are already set in the process environment, so a `.env` file inside the container cannot opt in; use `docker run -e …` or the Compose project's `.env`. The service `.env` route applies to a local `uv run`.
+
+The guard covers the service processes. The benchmark harness `neuralscape-bench/trackb/mem0_tracka/run.py` imports mem0 directly; set `MEM0_TELEMETRY=false` in its environment when running it.
 
 The vendored subtrees are not modified, so an upstream sync cannot silently turn telemetry back on.
 
