@@ -334,6 +334,7 @@ class CoreMixin:
     # Qdrant; allow a re-check after this many seconds.
     _FILTER_INDEX_RETRY_S = 60.0
     _filter_indexes_ok = False
+    _created_at_index_ok = False
 
     def _ensure_filter_indexes(self) -> None:
         """Best-effort: ensure payload indexes on the filter fields.
