@@ -21,19 +21,24 @@
  *   (the pid was reused, or the record predates a reboot), so a stale lock cannot wedge capture behind an
  *   unrelated process; a live pid that may be the owner is waited for, then the waiter skips its flush with a
  *   log line that says so and the turns wait for the next flush.
- * - **Recovery:** recoverers are serialized by a short-lived recovery mutex that follows the same rule: its
- *   record carries the same identity, and it is cleared only when its recorder is dead and it is old, by moving
- *   it aside and checking the token, never by deleting it by age.  Under the mutex the lock is re-read and, only
- *   if it is still the exact abandoned record, renamed to a unique name and deleted.  If what was moved turns
- *   out not to be that record, it is NOT put back (putting it back is the race that lets a third hook acquire
- *   the vacant path): the recoverer abandons its own flush instead.
+ * - **Recovery:** recoverers of one abandoned record are serialized by a recovery mutex that is named after the
+ *   record being recovered and a generation number (``<lock>.recover.<hash of the record's token>.<n>``).  A mutex
+ *   file is never removed by anyone but its own recoverer: a recoverer that finds the generation taken by a dead
+ *   recoverer moves on to the next generation instead of clearing it, so a mutex can never be taken out from under
+ *   a live recoverer (the lost-mutex race of earlier versions).  The recoverer re-reads the lock under the mutex
+ *   and, only if it is still the exact abandoned record, checks once more that it still holds its mutex, then
+ *   renames the lock to a unique name and deletes it.  If what was moved turns out not to be that record, it is NOT
+ *   put back (putting it back is the race that lets a third hook acquire the vacant path): the recoverer abandons
+ *   its own flush instead.  Once the record is gone it can never come back (tokens are unique), so the dead
+ *   generations are deleted then, and a late contender that judged the same record finds the lock changed.
  * - **The owner verifies:** the body receives ``held()``, which is true only while the lock file still carries
  *   the owner's token.  The delivery code calls it before every POST and before it writes the cursor, and
  *   stops cleanly when the lock is gone.
  *
  * Residual window (it requires an owner or recoverer that is declared dead while it is alive, for example
  * because it runs in another pid namespace, and a lock older than ``staleMs``): a recoverer's rename can move a
- * successor's lock in the gap between its re-read and its rename.  The owner then notices at its next ``held()`` check, so at
+ * successor's lock in the gap between its re-read and its rename.  With owners and recoverers judged correctly the
+ * window does not exist: recoverers of one record exclude each other and nobody else removes the lock.  The owner then notices at its next ``held()`` check, so at
  * most the one POST already past that check can overlap another hook (one turn delivered twice), and the cursor
  * is only ever written forward (see ``commitClaudeCodeFlush``).  Hooks of different Claude Code instances that
  * run in different containers but share a transcript file cannot see each other's pids.
@@ -41,7 +46,7 @@
 
 import { execFile } from "node:child_process";
 import { link, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { logError } from "../utils.js";
 
 const LOCK_SUFFIX = ".neuralscape-lock";
@@ -50,8 +55,10 @@ const LOCK_SUFFIX = ".neuralscape-lock";
 export const LOCK_WAIT_MS = 20_000;
 export const LOCK_STALE_MS = 90_000;
 const POLL_MS = 50;
-/** A recovery mutex must be older than this, and its recorder dead, before it is cleared. */
+/** A recovery mutex generation is passed over (never deleted) only when it is older than this and its recorder dead. */
 const RECOVERY_MUTEX_STALE_MS = 10_000;
+/** How many dead recoverers one record's mutex chain tolerates before the waiter gives up for this flush. */
+const MAX_MUTEX_GENERATIONS = 16;
 export interface LockOptions {
   waitMs?: number;
   staleMs?: number;
@@ -77,7 +84,9 @@ function alive(pid: number): boolean {
     process.kill(pid, 0);
     return true;
   } catch (error) {
-    return (error as NodeJS.ErrnoException).code === "EPERM"; // exists, owned by someone else
+    // only ESRCH proves the process is gone.  EPERM means it exists (owned by someone else) and any other
+    // failure (an OS resource error, an unsupported probe) proves nothing, so the owner is believed alive
+    return (error as NodeJS.ErrnoException).code !== "ESRCH";
   }
 }
 
@@ -105,20 +114,39 @@ async function startTimeOf(pid: number): Promise<string | null> {
 
 const PS_MARGIN_MS = 2_000;
 
+/** Seams for the tests: how the elapsed time of a process is asked for (the default runs ``ps``). */
+export const probeHooks = {
+  etime: (pid: number): Promise<string | null> =>
+    new Promise((resolve) =>
+      execFile("ps", ["-o", "etime=", "-p", String(pid)], { timeout: 2000 }, (error, stdout) => resolve(error ? null : stdout))
+    ),
+};
+
+/** ``ps`` verdicts of this process, kept for the length of a wait: a record never changes, so ask once, not per poll. */
+const PS_VERDICT_TTL_MS = 60_000;
+const psVerdicts = new Map<string, { value: boolean | null; until: number }>();
+
 /**
  * Whether a live ``pid`` provably started after ``at`` (so it cannot have written a record at ``at``), from the
  * elapsed time ``ps -o etime=`` reports ("[[dd-]hh:]mm:ss", the same on macOS and Linux).  This is how a reused
  * pid, or a record from before a reboot, is told apart where there is no ``/proc`` (macOS).  Null when ``ps``
  * cannot say; the elapsed time is whole seconds, so the comparison allows a margin before calling the pid reused.
+ * The verdict is cached per (pid, record time) so a waiter polling every 50 ms spawns ``ps`` once, not per poll.
  */
 async function startedAfter(pid: number, at: number): Promise<boolean | null> {
-  const text = await new Promise<string | null>((resolve) =>
-    execFile("ps", ["-o", "etime=", "-p", String(pid)], { timeout: 2000 }, (error, stdout) => resolve(error ? null : stdout))
-  );
+  const key = `${pid}:${at}`;
+  const cached = psVerdicts.get(key);
+  if (cached && cached.until > Date.now()) return cached.value;
+  const text = await probeHooks.etime(pid);
   const m = text?.trim().match(/^(?:(\d+)-)?(?:(\d+):)?(\d+):(\d+)$/);
-  if (!m) return null;
-  const elapsed = ((Number(m[1] ?? 0) * 24 + Number(m[2] ?? 0)) * 60 + Number(m[3])) * 60 + Number(m[4]);
-  return Date.now() - (elapsed + 1) * 1000 - PS_MARGIN_MS > at;
+  let value: boolean | null = null;
+  if (m) {
+    const elapsed = ((Number(m[1] ?? 0) * 24 + Number(m[2] ?? 0)) * 60 + Number(m[3])) * 60 + Number(m[4]);
+    value = Date.now() - (elapsed + 1) * 1000 - PS_MARGIN_MS > at;
+  }
+  if (psVerdicts.size > 256) psVerdicts.clear();
+  psVerdicts.set(key, { value, until: Date.now() + PS_VERDICT_TTL_MS });
+  return value;
 }
 
 /** This process's identity as recorded in the records it writes. */
@@ -152,13 +180,19 @@ async function unconfirmedLive(record: LockOwner): Promise<boolean> {
   return alive(record.pid) && !(record.start && (await startTimeOf(record.pid)));
 }
 
-/** The lock's record; ``"invalid"`` is a file that is not a record (never written by this module). */
-async function readOwner(path: string): Promise<LockOwner | "invalid" | "gone"> {
+type Read = LockOwner | "invalid" | "gone" | "unreadable";
+
+/**
+ * The lock's record.  ``"invalid"`` is a file that is not a record (never written by this module); ``"gone"`` is a
+ * path that does not exist (ENOENT, and only that); ``"unreadable"`` is something there that cannot be read (EACCES,
+ * a directory, ...): it proves nothing about the owner, so it is never reclaimed and never treated as absent.
+ */
+async function readOwner(path: string): Promise<Read> {
   let text: string;
   try {
     text = await readFile(path, "utf-8");
-  } catch {
-    return "gone";
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "ENOENT" ? "gone" : "unreadable";
   }
   try {
     const parsed = JSON.parse(text) as Partial<LockOwner>;
@@ -190,74 +224,99 @@ async function linkInto(path: string, owner: LockOwner): Promise<boolean> {
   }
 }
 
-const sameRecord = (a: LockOwner | "invalid" | "gone", b: LockOwner | "invalid" | "gone"): boolean =>
-  typeof a === "object" && typeof b === "object" ? a.token === b.token : a === b;
+const sameRecord = (a: Read, b: Read): boolean => (typeof a === "object" && typeof b === "object" ? a.token === b.token : a === b);
+
+/** The recovery mutex of ``judged``, generation ``generation``.  Named after the record so recoveries of different records never share one. */
+export function recoveryMutexPath(path: string, judged: LockOwner | "invalid", generation = 0): string {
+  const key = judged === "invalid" ? "invalid" : createHash("sha256").update(judged.token).digest("hex").slice(0, 16);
+  return `${path}.recover.${key}.${generation}`;
+}
 
 export type Recovery = "removed" | "retry" | "aborted";
+
+interface RecoveryHooks {
+  /** Called under the mutex after the lock was re-read and before the check that the mutex is still held. */
+  afterVerify?: () => Promise<void>;
+  /** Called when a mutex generation was judged abandoned, before the next generation is tried. */
+  afterMutexJudged?: () => Promise<void>;
+  mutexStaleMs?: number;
+}
+
+/**
+ * Take the first free generation of ``judged``'s recovery mutex.  A generation held by a recoverer that is gone
+ * (and old) is passed over, never deleted: only a mutex's own recoverer removes it, so a live recoverer's mutex
+ * cannot be lost to a cleaner.  Null when a live recoverer holds one, or the chain is exhausted or unreadable.
+ */
+async function takeMutex(
+  path: string, judged: LockOwner | "invalid", me: LockOwner, staleMs: number, hooks: RecoveryHooks
+): Promise<number | null> {
+  for (let generation = 0, flaps = 0; generation < MAX_MUTEX_GENERATIONS; ) {
+    const mutexPath = recoveryMutexPath(path, judged, generation);
+    try {
+      if (await linkInto(mutexPath, me)) return generation;
+    } catch {
+      return null;
+    }
+    const holder = await readOwner(mutexPath);
+    if (holder === "gone") {
+      if (++flaps > MAX_MUTEX_GENERATIONS) return null; // released and retaken over and over: give up for now
+      continue;
+    }
+    if (holder === "unreadable") return null;
+    let gone: boolean;
+    if (holder === "invalid") {
+      const info = await stat(mutexPath).catch(() => null);
+      gone = info !== null && Date.now() - info.mtimeMs > Math.max(staleMs, 60_000);
+    } else {
+      gone = await ownerGone(holder, staleMs);
+    }
+    if (!gone) return null; // a live (if slow) recoverer has it
+    await hooks.afterMutexJudged?.();
+    generation++;
+  }
+  return null;
+}
 
 /**
  * Remove an abandoned lock, never a live one.  ``judged`` is the record the caller saw and found abandoned.
  * "retry": nothing was removed (the lock changed hands, or another recoverer is working); "aborted": the file
  * that was moved aside was not the judged record, so a live lock may have been disturbed and the caller must
- * give up its own flush.  Exported for the tests, which inject ``afterVerify`` to open the race window.
+ * give up its own flush.  Exported for the tests, which inject hooks to open the race windows.
  */
-export async function recoverAbandoned(
-  path: string,
-  judged: LockOwner | "invalid",
-  hooks: { afterVerify?: () => Promise<void>; mutexStaleMs?: number } = {}
-): Promise<Recovery> {
-  const mutexPath = path + ".recover";
-  const mutexStaleMs = hooks.mutexStaleMs ?? RECOVERY_MUTEX_STALE_MS;
+export async function recoverAbandoned(path: string, judged: LockOwner | "invalid", hooks: RecoveryHooks = {}): Promise<Recovery> {
   const me: LockOwner = { pid: process.pid, token: randomBytes(12).toString("hex"), at: Date.now(), ...(await identity()) };
-  let have: boolean;
+  const generation = await takeMutex(path, judged, me, hooks.mutexStaleMs ?? RECOVERY_MUTEX_STALE_MS, hooks);
+  if (generation === null) return "retry";
+  const mutexPath = recoveryMutexPath(path, judged, generation);
+  // once the judged record is gone it cannot return (tokens are unique), so the dead generations below ours are
+  // garbage; until then they stay, so no later contender can take a lower generation while we work
+  let settled = false;
   try {
-    have = await linkInto(mutexPath, me);
-  } catch {
-    return "retry";
-  }
-  if (!have) {
-    await clearAbandonedMutex(mutexPath, mutexStaleMs);
-    return "retry";
-  }
-  try {
-    if (!sameRecord(await readOwner(path), judged)) return "retry"; // it changed hands: not ours to remove
+    if (!sameRecord(await readOwner(path), judged)) {
+      settled = true;
+      return "retry"; // it changed hands: not ours to remove
+    }
     await hooks.afterVerify?.();
+    const mine = await readOwner(mutexPath);
+    if (typeof mine !== "object" || mine.token !== me.token) return "retry"; // the mutex was lost: it authorizes nothing
     const aside = `${path}.stale.${me.token}`;
     try {
       await rename(path, aside);
-    } catch {
+    } catch (error) {
+      settled = (error as NodeJS.ErrnoException).code === "ENOENT";
       return "retry";
     }
+    settled = true;
     const moved = await readOwner(aside);
     await unlink(aside).catch(() => undefined);
     return sameRecord(moved, judged) ? "removed" : "aborted"; // never put a moved lock back
   } finally {
     const mine = await readOwner(mutexPath);
     if (typeof mine === "object" && mine.token === me.token) await unlink(mutexPath).catch(() => undefined);
+    if (settled) {
+      for (let g = 0; g < generation; g++) await unlink(recoveryMutexPath(path, judged, g)).catch(() => undefined);
+    }
   }
-}
-
-/**
- * Clear a recovery mutex whose recorder is gone (and that is old), by the lock's own rule: move it aside and
- * delete it only if what was moved is the record that was judged.  A mutex held by a live (if slow) recoverer is
- * never cleared.  Something else that was moved by mistake is not put back.
- */
-async function clearAbandonedMutex(mutexPath: string, staleMs: number): Promise<void> {
-  const judged = await readOwner(mutexPath);
-  if (judged === "gone") return;
-  if (judged === "invalid") {
-    const info = await stat(mutexPath).catch(() => null);
-    if (info === null || Date.now() - info.mtimeMs <= Math.max(staleMs, 60_000)) return;
-  } else if (!(await ownerGone(judged, staleMs))) {
-    return;
-  }
-  const aside = `${mutexPath}.stale.${randomBytes(6).toString("hex")}`;
-  try {
-    await rename(mutexPath, aside);
-  } catch {
-    return;
-  }
-  await unlink(aside).catch(() => undefined);
 }
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -290,7 +349,20 @@ export async function withTranscriptLock<T>(
     if (created) break;
 
     const holder = await readOwner(path);
-    if (holder === "gone") continue; // released between the attempt and the read
+    if (holder === "unreadable") {
+      // something is there that cannot be read (permissions, a directory): that says nothing about its owner, so
+      // it is neither waited on (it will not go away) nor reclaimed
+      logError("The transcript lock exists but cannot be read; it is not reclaimed. Capture skipped; the turns wait for the next flush");
+      return { ran: false };
+    }
+    if (holder === "gone") {
+      // released between the attempt and the read
+      if (Date.now() >= deadline) {
+        logError("Another hook is delivering this transcript; leaving the turns for the next flush");
+        return { ran: false };
+      }
+      continue;
+    }
     let abandoned = false;
     if (holder === "invalid") {
       const info = await stat(path).catch(() => null);
@@ -299,7 +371,7 @@ export async function withTranscriptLock<T>(
       abandoned = await ownerGone(holder, staleMs); // a confirmed live owner's lock is never recovered
     }
     if (abandoned) {
-      const outcome = await recoverAbandoned(path, holder as LockOwner | "invalid");
+      const outcome = await recoverAbandoned(path, holder);
       if (outcome === "aborted") {
         logError("The transcript lock changed while it was being recovered; leaving the turns for the next flush");
         return { ran: false };

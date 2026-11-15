@@ -2,12 +2,12 @@
 
 import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
-import { mkdtemp, readdir, readFile, utimes, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readdir, readFile, unlink, utimes, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterAll, describe, expect, it } from "vitest";
-import { recoverAbandoned, withTranscriptLock } from "../src/core/transcript-lock.js";
+import { afterAll, describe, expect, it, vi } from "vitest";
+import { probeHooks, recoverAbandoned, recoveryMutexPath, withTranscriptLock } from "../src/core/transcript-lock.js";
 import { flushTurns } from "../src/core/flush.js";
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -246,15 +246,32 @@ describe("the recovery mutex follows the lock's rule", () => {
     expect(await slow).toBe("removed");
   });
 
-  it("a mutex whose recorder is gone, and that is old, is cleared (by moving it aside)", async () => {
+  it("a mutex whose recorder is gone, and that is old, is passed over (never deleted by a contender), so the same call recovers", async () => {
     const path = await fresh();
     const lock = lockFile(path);
     const judged = { pid: DEAD_PID, token: "dead", at: 1 };
     await writeFile(lock, record(judged));
-    await writeFile(lock + ".recover", record({ pid: DEAD_PID, token: "dead-recoverer", at: Date.now() - 60_000 }));
-    expect(await recoverAbandoned(lock, judged, { mutexStaleMs: 50 })).toBe("retry"); // clears it
-    expect(await recoverAbandoned(lock, judged, { mutexStaleMs: 50 })).toBe("removed"); // and the next one recovers
-    expect(await leftovers(path)).toEqual([]);
+    const deadMutex = record({ pid: DEAD_PID, token: "dead-recoverer", at: Date.now() - 60_000 });
+    await writeFile(recoveryMutexPath(lock, judged, 0), deadMutex);
+    expect(await recoverAbandoned(lock, judged, { mutexStaleMs: 50 })).toBe("removed");
+    expect(await leftovers(path)).toEqual([]); // the winner deleted the dead generation after the record was gone
+  });
+
+  it("a dead recoverer's mutex is left as it was while the record is still there (a contender that gives up deletes nothing)", async () => {
+    const path = await fresh();
+    const lock = lockFile(path);
+    const judged = { pid: DEAD_PID, token: "dead", at: 1 };
+    await writeFile(lock, record(judged));
+    const deadMutex = record({ pid: DEAD_PID, token: "dead-recoverer", at: Date.now() - 60_000 });
+    await writeFile(recoveryMutexPath(lock, judged, 0), deadMutex);
+    // a contender whose own mutex vanishes mid-way cannot proceed, and must not have touched the dead generation
+    const outcome = await recoverAbandoned(lock, judged, {
+      mutexStaleMs: 50,
+      afterVerify: async () => { await unlink(recoveryMutexPath(lock, judged, 1)); },
+    });
+    expect(outcome).toBe("retry");
+    expect(await readFile(recoveryMutexPath(lock, judged, 0), "utf-8")).toBe(deadMutex);
+    expect(JSON.parse(await readFile(lock, "utf-8")).token).toBe("dead");
   });
 });
 
@@ -293,18 +310,17 @@ procTests("process identity (pid reuse, reboots, no /proc)", () => {
     expect((await withTranscriptLock(path, async () => 1, { staleMs: 1000, waitMs: 3000 })).ran).toBe(true);
   });
 
-  it("a recovery mutex whose recorder's pid was reused (different start time) is cleared; one whose recorder is alive is not", async () => {
+  it("a recovery mutex whose recorder's pid was reused (different start time) is passed over; one whose recorder is alive is not", async () => {
     const path = await fresh();
     const lock = lockFile(path);
     const judged = { pid: DEAD_PID, token: "dead", at: 1 };
     await writeFile(lock, record(judged));
     const unrelated = spawn("sleep", ["30"]);
     try {
-      await writeFile(lock + ".recover", record({ pid: unrelated.pid, token: "reused-recoverer", at: Date.now() - 60_000, start: "1" }));
-      expect(await recoverAbandoned(lock, judged, { mutexStaleMs: 50 })).toBe("retry"); // clears the reused-pid mutex
-      expect(await recoverAbandoned(lock, judged, { mutexStaleMs: 50 })).toBe("removed");
+      await writeFile(recoveryMutexPath(lock, judged), record({ pid: unrelated.pid, token: "reused-recoverer", at: Date.now() - 60_000, start: "1" }));
+      expect(await recoverAbandoned(lock, judged, { mutexStaleMs: 50 })).toBe("removed"); // passes over the reused-pid mutex
       await writeFile(lock, record(judged));
-      await writeFile(lock + ".recover", record({ token: "live-recoverer", at: Date.now() - 60_000, start: await ownStart() }));
+      await writeFile(recoveryMutexPath(lock, judged), record({ token: "live-recoverer", at: Date.now() - 60_000, start: await ownStart() }));
       expect(await recoverAbandoned(lock, judged, { mutexStaleMs: 50 })).toBe("retry");
       expect(await recoverAbandoned(lock, judged, { mutexStaleMs: 50 })).toBe("retry"); // still held by a live recoverer
     } finally {
@@ -353,21 +369,211 @@ describe("where /proc cannot confirm a live pid: no age fallback", () => {
     }
   });
 
-  it("a recovery mutex without a start time whose recorder's pid was reused is cleared", async () => {
+  it("a pre-upgrade recovery mutex (no start time) whose recorder's pid was reused by a live process is passed over, not waited on forever", async () => {
     const path = await fresh();
     const lock = lockFile(path);
     const judged = { pid: DEAD_PID, token: "dead", at: 1 };
     await writeFile(lock, record(judged));
     const unrelated = spawn("sleep", ["30"]);
     try {
-      await writeFile(lock + ".recover", record({ pid: unrelated.pid, token: "reused-recoverer", at: Date.now() - 60_000 }));
-      expect(await recoverAbandoned(lock, judged, { mutexStaleMs: 50 })).toBe("retry"); // clears the reused-pid mutex
+      // the mutex was written 60 s ago by a process that is gone; its pid belongs to `sleep`, started just now
+      await writeFile(recoveryMutexPath(lock, judged), record({ pid: unrelated.pid, token: "reused-recoverer", at: Date.now() - 60_000 }));
       expect(await recoverAbandoned(lock, judged, { mutexStaleMs: 50 })).toBe("removed");
       expect(await leftovers(path)).toEqual([]);
     } finally {
       unrelated.kill();
     }
   });
+});
+
+describe("a lost recovery mutex authorizes nothing, and cleaners never delete a live recoverer's mutex", () => {
+  it("a recoverer whose mutex was taken from it does not rename the lock (it re-checks its mutex before it acts)", async () => {
+    const path = await fresh();
+    const lock = lockFile(path);
+    const judged = { pid: DEAD_PID, token: "dead", at: 1 };
+    await writeFile(lock, record(judged));
+    const text = await readFile(lock, "utf-8");
+    const outcome = await recoverAbandoned(lock, judged, {
+      afterVerify: async () => {
+        // what the old cleaner did: the live recoverer's mutex is moved away and another recoverer holds a new one
+        const mutex = recoveryMutexPath(lock, judged, 0);
+        await unlink(mutex);
+        await writeFile(mutex, record({ token: "second-recoverer" }));
+      },
+    });
+    expect(outcome).toBe("retry");
+    expect(await readFile(lock, "utf-8")).toBe(text); // the abandoned lock was not touched by the recoverer that lost its mutex
+    expect(JSON.parse(await readFile(recoveryMutexPath(lock, judged, 0), "utf-8")).token).toBe("second-recoverer"); // nor the new mutex
+  });
+
+  it("two cleaners judge the same dead mutex; one finishes and a live recoverer takes over: the late one deletes nothing of the live recoverer's", async () => {
+    const path = await fresh();
+    const lock = lockFile(path);
+    const first = { pid: DEAD_PID, token: "dead-1", at: 1 };
+    await writeFile(lock, record(first));
+    const deadMutex = record({ pid: DEAD_PID, token: "dead-recoverer", at: Date.now() - 60_000 });
+    await writeFile(recoveryMutexPath(lock, first, 0), deadMutex);
+
+    // B finds the dead mutex and stalls right after judging it abandoned (the old code renamed it aside next)
+    let bJudged!: () => void;
+    const bReached = new Promise<void>((r) => { bJudged = r; });
+    let releaseB!: () => void;
+    const bGate = new Promise<void>((r) => { releaseB = r; });
+    const b = recoverAbandoned(lock, first, { mutexStaleMs: 50, afterMutexJudged: async () => { bJudged(); await bGate; } });
+    await bReached;
+
+    // A passes over the same dead mutex and recovers the lock; then the lock is abandoned again and R starts recovering it
+    expect(await recoverAbandoned(lock, first, { mutexStaleMs: 50 })).toBe("removed");
+    const second = { pid: DEAD_PID, token: "dead-2", at: 2 };
+    await writeFile(lock, record(second));
+    let rInside!: () => void;
+    const rReached = new Promise<void>((r) => { rInside = r; });
+    let releaseR!: () => void;
+    const rGate = new Promise<void>((r) => { releaseR = r; });
+    const r = recoverAbandoned(lock, second, { afterVerify: async () => { rInside(); await rGate; } });
+    await rReached;
+    const rMutex = recoveryMutexPath(lock, second, 0);
+    const rMutexText = await readFile(rMutex, "utf-8");
+
+    releaseB(); // B resumes with its stale view
+    const bOutcome = await b;
+    expect(bOutcome).toBe("retry");
+    expect(await readFile(rMutex, "utf-8")).toBe(rMutexText); // R still holds its mutex
+    expect(JSON.parse(await readFile(lock, "utf-8")).token).toBe("dead-2"); // and B did not touch R's record
+
+    releaseR();
+    expect(await r).toBe("removed");
+    await gone(path);
+    expect(await leftovers(path)).toEqual([]);
+  });
+
+  it("eight recoverers of one record behind a dead recoverer's mutex: exactly one removes it and never two act at once", async () => {
+    const path = await fresh();
+    const lock = lockFile(path);
+    const judged = { pid: DEAD_PID, token: "dead", at: 1 };
+    await writeFile(lock, record(judged));
+    await writeFile(recoveryMutexPath(lock, judged, 0), record({ pid: DEAD_PID, token: "dead-recoverer", at: Date.now() - 60_000 }));
+    let inside = 0;
+    let overlapped = false;
+    const outcomes = await Promise.all(Array.from({ length: 8 }, () => recoverAbandoned(lock, judged, {
+      mutexStaleMs: 50,
+      afterVerify: async () => { inside++; if (inside > 1) overlapped = true; await sleep(20); inside--; },
+    })));
+    expect(overlapped).toBe(false);
+    expect(outcomes.filter((o) => o === "removed")).toHaveLength(1);
+    expect(outcomes.filter((o) => o === "aborted")).toHaveLength(0);
+    await gone(path);
+    expect(await leftovers(path)).toEqual([]);
+  });
+
+  it("a chain of dead recoverers is passed over generation by generation", async () => {
+    const path = await fresh();
+    const lock = lockFile(path);
+    const judged = { pid: DEAD_PID, token: "dead", at: 1 };
+    await writeFile(lock, record(judged));
+    for (let g = 0; g < 3; g++) await writeFile(recoveryMutexPath(lock, judged, g), record({ pid: DEAD_PID, token: `dead-recoverer-${g}`, at: 5 }));
+    expect(await recoverAbandoned(lock, judged, { mutexStaleMs: 50 })).toBe("removed");
+    expect(await leftovers(path)).toEqual([]);
+  });
+});
+
+describe("a lock that exists but cannot be read", () => {
+  const captureStderr = async (run: () => Promise<unknown>): Promise<string> => {
+    const original = process.stderr.write.bind(process.stderr);
+    let seen = "";
+    process.stderr.write = ((chunk: string | Uint8Array) => { seen += String(chunk); return true; }) as typeof process.stderr.write;
+    try { await run(); } finally { process.stderr.write = original; }
+    return seen;
+  };
+
+  it("a directory at the lock path: the call returns at once, well inside the wait bound, logs why, and removes nothing", async () => {
+    const path = await fresh();
+    await mkdir(lockFile(path));
+    await writeFile(join(lockFile(path), "inside"), "x");
+    const started = Date.now();
+    let result: { ran: boolean } | undefined;
+    let ran = false;
+    const log = await captureStderr(async () => { result = await withTranscriptLock(path, async () => { ran = true; }, { waitMs: 2000, staleMs: 1 }); });
+    expect(result?.ran).toBe(false);
+    expect(ran).toBe(false);
+    expect(Date.now() - started).toBeLessThan(1500);
+    expect(log).toContain("cannot be read");
+    expect(log).toContain("not reclaimed");
+    expect(existsSync(join(lockFile(path), "inside"))).toBe(true);
+    expect(await leftovers(path)).toEqual([]);
+  }, 5000);
+
+  it("a file without read permission: same, and the file is left alone", async () => {
+    const path = await fresh();
+    const text = record({ pid: DEAD_PID, token: "dead", at: 1 });
+    await writeFile(lockFile(path), text);
+    await chmod(lockFile(path), 0o000);
+    try {
+      const readable = await readFile(lockFile(path), "utf-8").then(() => true, () => false);
+      if (readable) return; // running as a user that ignores permissions (root): nothing to test
+      const started = Date.now();
+      const result = await withTranscriptLock(path, async () => 1, { waitMs: 2000, staleMs: 1 });
+      expect(result.ran).toBe(false);
+      expect(Date.now() - started).toBeLessThan(1500);
+      expect(existsSync(lockFile(path))).toBe(true);
+    } finally {
+      await chmod(lockFile(path), 0o600);
+    }
+    expect(await readFile(lockFile(path), "utf-8")).toBe(text);
+  }, 5000);
+});
+
+describe("which liveness-probe errors prove the owner is gone", () => {
+  const withKillStub = async (code: string, run: () => Promise<void>) => {
+    const original = process.kill.bind(process);
+    const spy = vi.spyOn(process, "kill").mockImplementation(((pid: number, signal?: string | number) => {
+      if (pid === DEAD_PID) throw Object.assign(new Error(code), { code });
+      return original(pid, signal as never);
+    }) as typeof process.kill);
+    try { await run(); } finally { spy.mockRestore(); }
+  };
+
+  for (const code of ["EINVAL", "EPERM", "EMFILE"]) {
+    it(`${code} from the probe is not proof of death: an old lock is not reclaimed`, async () => {
+      const path = await fresh();
+      const text = record({ pid: DEAD_PID, token: "maybe-alive", at: Date.now() - 60_000 });
+      await writeFile(lockFile(path), text);
+      await withKillStub(code, async () => {
+        const result = await withTranscriptLock(path, async () => 1, { waitMs: 300, staleMs: 1000 });
+        expect(result.ran).toBe(false);
+      });
+      expect(await readFile(lockFile(path), "utf-8")).toBe(text);
+    });
+  }
+
+  it("ESRCH is proof of death: the same old lock is reclaimed", async () => {
+    const path = await fresh();
+    await writeFile(lockFile(path), record({ pid: DEAD_PID, token: "dead", at: Date.now() - 60_000 }));
+    await withKillStub("ESRCH", async () => {
+      expect((await withTranscriptLock(path, async () => 1, { waitMs: 3000, staleMs: 1000 })).ran).toBe(true);
+    });
+  });
+});
+
+describe("waiting on a held lock does not spawn ps on every poll", () => {
+  it("one ps call for the whole wait (the verdict is cached per pid and record), and the lock is still not reclaimed", async () => {
+    const path = await fresh();
+    const text = record({ pid: await olderLiveProcess(), token: "slow-owner", at: Date.now() - 1100 });
+    await writeFile(lockFile(path), text);
+    const real = probeHooks.etime;
+    let calls = 0;
+    probeHooks.etime = (pid) => { calls++; return real(pid); };
+    try {
+      const started = Date.now();
+      const result = await withTranscriptLock(path, async () => 1, { waitMs: 800, staleMs: 1000 });
+      expect(result.ran).toBe(false);
+      expect(Date.now() - started).toBeGreaterThanOrEqual(700); // about sixteen polls happened
+    } finally {
+      probeHooks.etime = real;
+    }
+    expect(calls).toBe(1);
+    expect(await readFile(lockFile(path), "utf-8")).toBe(text);
+  }, 10000);
 });
 
 /** Bundle the lock module for a real child process (the tests cannot import TypeScript in a child). */
@@ -384,6 +590,17 @@ async function bundledLock(): Promise<string> {
       await new Promise((r) => setTimeout(r, Number(ms)));
       console.log("done " + (await h.held()));
     }, { waitMs: 1000 });
+  `);
+  await writeFile(join(dir, "overlap.mjs"), `
+    import { appendFile } from "node:fs/promises";
+    const { withTranscriptLock } = await import(${JSON.stringify(out)});
+    const [transcript, log] = process.argv.slice(2);
+    const result = await withTranscriptLock(transcript, async () => {
+      await appendFile(log, "in " + process.pid + "\\n");
+      await new Promise((r) => setTimeout(r, 40));
+      await appendFile(log, "out " + process.pid + "\\n");
+    }, { waitMs: 20000, staleMs: 1000 });
+    await appendFile(log, (result.ran ? "ran " : "skipped ") + process.pid + "\\n");
   `);
   return join(dir, "worker.mjs");
 }
@@ -414,4 +631,28 @@ describe("a suspended live owner", () => {
     await gone(path);
     expect((await withTranscriptLock(path, async () => 1)).ran).toBe(true);
   }, 20000);
+});
+
+describe("overlapping hook processes on one abandoned lock (real processes, the built lock module)", () => {
+  it("six processes race to recover a dead owner's lock behind a dead recoverer's mutex: every one delivers, never two at once", async () => {
+    const path = await fresh();
+    const worker = (await bundledLock()).replace("worker.mjs", "overlap.mjs");
+    const log = join(dirname(path), "events.log");
+    await writeFile(log, "");
+    const judged = { pid: DEAD_PID, token: "dead-owner", at: Date.now() - 60_000 };
+    await writeFile(lockFile(path), record(judged));
+    await writeFile(recoveryMutexPath(lockFile(path), judged, 0), record({ pid: DEAD_PID, token: "dead-recoverer", at: Date.now() - 60_000 }));
+    const children = Array.from({ length: 6 }, () => spawn("node", [worker, path, log], { stdio: ["ignore", "ignore", "inherit"] }));
+    await Promise.all(children.map((c) => new Promise<void>((resolve) => c.on("close", () => resolve()))));
+    const events = (await readFile(log, "utf-8")).split("\n").filter((l) => /^(in|out) /.test(l));
+    expect(events).toHaveLength(12);
+    for (let i = 0; i < events.length; i += 2) {
+      const [a, b] = [events[i].split(" "), events[i + 1].split(" ")];
+      expect(a[0]).toBe("in");
+      expect(b).toEqual(["out", a[1]]); // each process leaves before the next one enters
+    }
+    expect(new Set(events.map((l) => l.split(" ")[1])).size).toBe(6);
+    await gone(path);
+    expect(await leftovers(path)).toEqual([]);
+  }, 40000);
 });
