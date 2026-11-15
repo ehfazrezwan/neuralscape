@@ -5,10 +5,12 @@ from __future__ import annotations
 import os
 import random
 import string
+import subprocess
 import time
 from dataclasses import dataclass, field
+from typing import Callable
 
-from . import tokens
+from . import guard, tokens
 
 
 class ConfigError(RuntimeError):
@@ -27,6 +29,100 @@ class Ctx:
     bad_token: str = field(repr=False)
     project_id: str
     token_source: str
+    compose_project: str | None = None
+
+    def compose(
+        self,
+        *args: str,
+        check: bool = True,
+        timeout: float = 120.0,
+        run: Callable[..., subprocess.CompletedProcess] = subprocess.run,
+    ) -> subprocess.CompletedProcess:
+        """``docker compose -p <project> <args...>`` against the campaign stack.
+
+        Only usable when the run was given ``--compose-project`` (the same
+        project the stack runs under). Refuses the production project name,
+        and only lets container-lifecycle verbs through (pause/unpause/stop/
+        start/restart/ps/logs/top/exec): nothing here can tear a project
+        down or remove its volumes.
+        """
+        if not self.compose_project:
+            raise ConfigError("ctx.compose needs --compose-project (or NS_COMPOSE_PROJECT)")
+        return run_compose(self.compose_project, *args, check=check, timeout=timeout, run=run)
+
+
+_CONTAINER_ID = __import__("re").compile(r"^[0-9a-f]{12,64}$")
+
+
+def container_restart_count(container_id: str, run: Callable[..., subprocess.CompletedProcess] = subprocess.run) -> int:
+    """RestartCount of one container (``docker inspect``, read-only)."""
+    if not _CONTAINER_ID.match(container_id or ""):
+        raise ConfigError(f"not a container id: {container_id!r}")
+    proc = run(
+        ["docker", "inspect", "--format", "{{.RestartCount}}", container_id],
+        capture_output=True, text=True, timeout=30,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(f"docker inspect failed: {(proc.stderr or '').strip()[:200]}")
+    return int((proc.stdout or "0").strip() or 0)
+
+
+def parse_ps_json(text: str) -> list[dict]:
+    """``docker compose ps --format json``: a JSON array or one object per line."""
+    import json
+
+    text = (text or "").strip()
+    if not text:
+        return []
+    if text.startswith("["):
+        return json.loads(text)
+    return [json.loads(line) for line in text.splitlines() if line.strip()]
+
+
+COMPOSE_VERBS = frozenset({"pause", "unpause", "stop", "start", "restart", "ps", "logs", "top", "exec", "up"})
+# `up` may only start existing containers: detached, no build, no recreate.
+UP_REQUIRED_FLAGS = ("-d", "--no-build", "--no-recreate")
+UP_ALLOWED_FLAGS = UP_REQUIRED_FLAGS + ("--no-deps",)
+
+
+def qdrant_service() -> str:
+    return os.environ.get("NS_QDRANT_SERVICE", "qdrant")
+
+
+def app_services() -> list[str]:
+    return os.environ.get(
+        "NS_APP_SERVICES", "neuralscape,neuralscape-worker,neuralscape-graph-worker,neuralscape-ingest-worker"
+    ).split(",")
+
+
+def run_compose(
+    project: str,
+    *args: str,
+    check: bool = True,
+    timeout: float = 120.0,
+    run: Callable[..., subprocess.CompletedProcess] = subprocess.run,
+) -> subprocess.CompletedProcess:
+    project = guard.check_compose_project(project)
+    if not args or args[0] not in COMPOSE_VERBS:
+        raise ConfigError(f"compose verb {args[:1]!r} is not allowed (allowed: {sorted(COMPOSE_VERBS)})")
+    if args[0] == "up":
+        flags = {a for a in args[1:] if a.startswith("-")}
+        names = [a for a in args[1:] if not a.startswith("-")]
+        if not set(UP_REQUIRED_FLAGS) <= flags or not flags <= set(UP_ALLOWED_FLAGS):
+            raise ConfigError(f"`up` takes exactly {UP_REQUIRED_FLAGS} (+ optional --no-deps), got {sorted(flags)}")
+        if not names or not set(names) <= set(app_services()):
+            raise ConfigError(f"`up` may only name the API/worker services {app_services()}, got {names}")
+    if args[0] == "exec":
+        if len(args) < 6 or args[1:5] != ("-T", qdrant_service(), "sh", "-c") or len(args) != 6:
+            raise ConfigError(f"`exec` is only allowed as: exec -T {qdrant_service()} sh -c <script>")
+    cmd = ["docker", "compose", "-p", project, *args]
+    proc = run(cmd, capture_output=True, text=True, timeout=timeout)
+    if check and proc.returncode != 0:
+        raise RuntimeError(
+            f"`docker compose -p {project} {' '.join(args)}` exited {proc.returncode}: "
+            f"{(proc.stderr or '').strip()[:300]}"
+        )
+    return proc
 
 
 def new_run_id() -> str:
@@ -49,6 +145,7 @@ def build(base_url: str, profile: str, compose_project: str | None = None) -> Ct
     env_a, env_b = os.environ.get("NS_TOKEN_A", "").strip(), os.environ.get("NS_TOKEN_B", "").strip()
 
     if compose_project:
+        compose_project = guard.check_compose_project(compose_project)
         user_a, user_b = f"acc-{run_id}-a", f"acc-{run_id}-b"
         service = os.environ.get("NS_API_SERVICE", "neuralscape")
         try:
@@ -85,4 +182,5 @@ def build(base_url: str, profile: str, compose_project: str | None = None) -> Ct
         bad_token=tokens.wrong_secret_token(user_a),
         project_id=project_id,
         token_source=source,
+        compose_project=compose_project,
     )
