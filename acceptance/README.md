@@ -50,6 +50,44 @@ Other env: `NS_RUN_ID` (fix the run id), `NS_COMMIT` (commit recorded in the
 results; default `git rev-parse HEAD` of the repo holding `acceptance/`),
 `NS_REPO_ROOT`, `NS_HAVE_<CAP>=1` (declare a capability for `@needs`).
 
+## Gate command
+
+Run on the host where the throwaway stack runs, once per file in `profiles/`:
+
+```bash
+NS_COMMIT=<sha> acceptance/run.sh http://127.0.0.1:18199 --compose-project nscampaign --profile <name> --out <file>
+```
+
+`NS_COMMIT` is the commit the stack image was built from; it is recorded as
+`commit` in the results. If the stack ever exposes its own commit (a `commit`
+or `git_sha` field in `/health`, or `NS_STACK_COMMIT`), it is recorded as
+`stack_commit` and the run exits 2 when the two disagree (prefix match). Today
+`/health` exposes none, so `stack_commit` is `null` unless `NS_STACK_COMMIT`
+is set. Without `NS_COMMIT` the harness checkout's HEAD is recorded, which only
+describes the harness, not the stack.
+
+For a profile whose `profiles/<name>.env` starts with a `# services: a, b`
+header, the gate brings those extra compose services up next to the stack and
+exports `NS_HAVE_<SERVICE>=1` (e.g. `NS_HAVE_DOCLING=1`) so `@needs` scenarios
+run instead of skipping. The header is documentation for the gate; this harness
+only reads `KEY=value` lines (recorded as `profile_flags`, plus the file's
+`profile_sha256`, in the results).
+
+## Safety and cleanup
+
+- **Production guard.** The run writes real data, so it refuses (exit 2) the
+  compose project name `neuralscape` (no override), port `8199` (override only
+  with `NS_ALLOW_PROD_PORT=1`) and any non-loopback host (override only with
+  `NS_ALLOW_REMOTE=1`). Never point it at production.
+- **No cleanup.** `acc-<runid>-*` users, projects and memories are never
+  removed; run against throwaway volumes (the gate's `nscampaign` project).
+- **Compose token minting.** `docker compose -p <project> exec` without `-f`
+  finds the project's existing containers by their compose labels, so it must run
+  on the host where that project is running.
+- **One negative control needs no stack**
+  (`test_health_check_rejects_a_dead_backend`); against a dead URL it still
+  passes, which is expected.
+
 ## Profiles
 
 `--profile <name>` runs the scenarios whose `@profiles(...)` include it
@@ -79,6 +117,8 @@ git-ignored):
   ]
 }
 ```
+
+Also at the top level: `stack_commit` (or null), `profile_flags` (the `KEY=value` lines of the profile file) and `profile_sha256`.
 
 `result`: `pass`, `fail` (assertion), `skip` (`detail` = reason, e.g. "node not
 available"), `error` (anything else: connection refused, fixture failure,

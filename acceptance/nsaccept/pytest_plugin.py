@@ -13,7 +13,11 @@ from pathlib import Path
 
 import pytest
 
-from . import caps, runctx
+import hashlib
+
+import httpx
+
+from . import caps, guard, runctx
 from .decor import DEFAULT_PROFILES
 from .fixtures import a, anon, b, bad, ctx, mcp_a, mcp_b  # noqa: F401  (registered as fixtures)
 from .tokens import scrub
@@ -47,6 +51,7 @@ def pytest_configure(config):
     config._ns_state = {}
     config._ns_started = _dt.datetime.now(_dt.timezone.utc)
     config._ns_ctx = None
+    config._ns_stack_commit = None
 
 
 # ── helpers ─────────────────────────────────────────────────────
@@ -114,15 +119,64 @@ def pytest_collection_modifyitems(config, items):
     items[:] = keep
 
 
+def _profile_info(profile: str) -> tuple[dict, str | None]:
+    path = ACCEPTANCE_DIR / "profiles" / f"{profile}.env"
+    if not path.is_file():
+        return {}, None
+    raw = path.read_bytes()
+    flags: dict[str, str] = {}
+    for line in raw.decode("utf-8", "replace").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        flags[key.strip()] = value.strip()
+    return flags, hashlib.sha256(raw).hexdigest()
+
+
+def _probe_stack_commit(base_url: str) -> str | None:
+    """The stack's own commit if it exposes one in /health (no field exists today)."""
+    try:
+        body = httpx.get(base_url.rstrip("/") + "/health", timeout=10).json()
+    except Exception:
+        return None
+    if not isinstance(body, dict):
+        return None
+    for key in ("commit", "git_sha", "git_commit", "build_sha"):
+        val = body.get(key)
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+    return None
+
+
+def _same_commit(a: str, b: str) -> bool:
+    a, b = a.lower(), b.lower()
+    return a.startswith(b) or b.startswith(a)
+
+
 def pytest_collection_finish(session):
     config = session.config
     if config.getoption("--ns-list-out"):
         return
+    # Only scenarios that use the stack need a target, a guard check and tokens.
     if not any("ctx" in getattr(it, "fixturenames", ()) for it in session.items):
         return
     base = config.getoption("--ns-base-url")
     if not base:
         pytest.exit("harness misconfiguration: no base URL (pass it to run.sh)", returncode=2)
+    compose = config.getoption("--ns-compose-project") or os.environ.get("NS_COMPOSE_PROJECT")
+    try:
+        guard.check(base, compose)
+    except guard.GuardError as exc:
+        pytest.exit(f"harness misconfiguration: {exc}", returncode=2)
+    declared = os.environ.get("NS_COMMIT", "").strip()
+    stack = os.environ.get("NS_STACK_COMMIT", "").strip() or _probe_stack_commit(base)
+    if declared and stack and not _same_commit(declared, stack):
+        pytest.exit(
+            f"harness misconfiguration: NS_COMMIT={declared[:12]} but the stack reports {stack[:40]}",
+            returncode=2,
+        )
+    config._ns_stack_commit = stack
     try:
         config._ns_ctx = runctx.build(
             base, config.getoption("--ns-profile"), config.getoption("--ns-compose-project")
@@ -197,9 +251,13 @@ def pytest_sessionfinish(session, exitstatus):
     if config.getoption("--ns-list-out") or not config._ns_state:
         return
     commit = _commit()
+    flags, sha = _profile_info(config.getoption("--ns-profile"))
     doc = {
         "commit": commit,
+        "stack_commit": config._ns_stack_commit,
         "profile": config.getoption("--ns-profile"),
+        "profile_flags": flags,
+        "profile_sha256": sha,
         "base_url": config.getoption("--ns-base-url") or "",
         "started": _utc(config._ns_started),
         "finished": _utc(_dt.datetime.now(_dt.timezone.utc)),

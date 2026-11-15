@@ -45,13 +45,7 @@ def hook_a(ctx, a_fact: Fact):
 
 @needs("node")
 @proves("plugin.session-start-index")
-def test_session_start_emits_context(hook_a):
-    check_hook_output(hook_a())
-
-
-@needs("node")
-@proves("plugin.session-start-index")
-def test_session_start_index_lists_users_memory(hook_a, a_fact):
+def test_session_start_injects_stack_produced_index(hook_a, a_fact):
     assert a_fact.visible_to_a, "precondition: A's fact never became visible"
     eventually(
         lambda: check_context_has_marker(hook_a(), a_fact.marker),

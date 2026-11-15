@@ -28,6 +28,7 @@ while [ $# -gt 0 ]; do
 done
 
 if [ "$LIST" -eq 0 ] && [ "$SELFTEST" -eq 0 ]; then
+  [ "${COMPOSE:-${NS_COMPOSE_PROJECT:-}}" != "neuralscape" ] || die "refusing compose project 'neuralscape' (production)"
   [ -n "$BASE_URL" ] || { usage >&2; die "base URL required"; }
   [ -f "$HERE/profiles/$PROFILE.env" ] || die "unknown profile '$PROFILE' (no $HERE/profiles/$PROFILE.env)"
 fi

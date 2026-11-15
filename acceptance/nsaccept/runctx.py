@@ -6,7 +6,7 @@ import os
 import random
 import string
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from . import tokens
 
@@ -22,9 +22,9 @@ class Ctx:
     run_id: str
     user_a: str
     user_b: str
-    token_a: str
-    token_b: str
-    bad_token: str
+    token_a: str = field(repr=False)
+    token_b: str = field(repr=False)
+    bad_token: str = field(repr=False)
     project_id: str
     token_source: str
 
