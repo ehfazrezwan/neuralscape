@@ -142,7 +142,10 @@ export function buildObservationRow(input: HookInput): Record<string, unknown> {
     user_id: getUserId(),
     tool: input.tool_name,
     input: picked,
-    output: redactPrivate(truncateOutput(asString(input.tool_output))),
+    // Claude Code sends the result as `tool_response` (string or object);
+    // `tool_output` is a legacy fallback. Redact BEFORE truncating so a
+    // <private> span split by the elision cannot leak its kept half.
+    output: truncateOutput(redactPrivate(asString(input.tool_response ?? input.tool_output))),
   };
 }
 

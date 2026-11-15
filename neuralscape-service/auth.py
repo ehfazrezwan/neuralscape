@@ -14,16 +14,21 @@ Supports two token formats simultaneously:
    (routes must fall back to body ``user_id``), and a deprecation
    warning header is added to the response.
 
-When neither secret is configured, auth is disabled (local dev).
+Auth is fail-closed. When neither secret is configured, startup refuses
+(``Settings.validate_required``) and this middleware rejects every non-public
+request with 503, unless the operator explicitly set
+``NEURALSCAPE_AUTH_DISABLED=true`` (trusted local machine only), which is the
+one path that lets requests through unauthenticated.
 
-Public paths (`/health`) always bypass auth.
+Public paths (``/health``, ``/health/live``, ``/.well-known/*``, ``/oauth/*``)
+always bypass auth.
 """
 
 import hmac
 import logging
 from contextvars import ContextVar
 
-from fastapi import Request
+from fastapi import HTTPException, Request
 from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 
@@ -42,14 +47,12 @@ current_user_id: ContextVar[str | None] = ContextVar("current_user_id", default=
 # Paths that never require authentication
 # The refresh endpoint authenticates by the single-use refresh token in its body
 # (an expired access token cannot be required to obtain a new one); the handler
-# is a 404 unless CREDENTIALS_ENABLED.  The console pages sign users in themselves.
-PUBLIC_PATHS = {"/health", "/health/live", "/api/v1/health", "/console", "/v1/credentials/refresh"}
+# is a 404 unless CREDENTIALS_ENABLED.
+PUBLIC_PATHS = {"/health", "/health/live", "/v1/credentials/refresh"}
 # Path prefixes that never require auth: OAuth discovery metadata and the
 # Authorization Server endpoints themselves (the consent page, DCR, token
-# exchange). These are the public front door of the OAuth flow. ``/console/``
-# pages carry their own session login and call the API with the signed-in
-# credential; the routes exist only when CONSOLE_ENABLED is set.
-PUBLIC_PREFIXES = ("/.well-known/", "/oauth/", "/console/")
+# exchange). These are the public front door of the OAuth flow.
+PUBLIC_PREFIXES = ("/.well-known/", "/oauth/")
 
 
 def _public_base_url() -> str:
@@ -61,24 +64,85 @@ def _public_base_url() -> str:
 DEPRECATION_HEADER = "X-Neuralscape-Deprecation"
 DEPRECATION_MSG = "shared-api-key auth is deprecated; issue per-user tokens via scripts/issue_user_token.py"
 
+AUTH_NOT_CONFIGURED_MSG = (
+    "Authentication is not configured on this server: set NEURALSCAPE_USER_TOKEN_SECRET "
+    "or NEURALSCAPE_API_KEY (or NEURALSCAPE_AUTH_DISABLED=true on a trusted local machine)"
+)
+
+
+def resolve_request_user_id(request: Request, body_user_id: str | None) -> str:
+    """Resolve the authoritative user_id for a request.
+
+    - With a verified per-user token (``request.state.user_id`` set by the
+      middleware) the token user wins; a body ``user_id`` that disagrees is
+      rejected with 400 (token-vs-body identity confusion).
+    - Legacy shared-key callers have no ``request.state.user_id``; the body
+      ``user_id`` is trusted as before.
+    - With neither, fall back to ``settings.default_user_id``.
+
+    Lives here (not in main.py) so extension routers can use it without a
+    circular import.
+    """
+    token_user_id = getattr(request.state, "user_id", None)
+    if token_user_id:
+        if body_user_id and body_user_id != token_user_id:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Request body user_id ({body_user_id!r}) does not match the "
+                    f"user_id encoded in the auth token ({token_user_id!r})."
+                ),
+            )
+        return token_user_id
+    return body_user_id or settings.default_user_id
+
+
+def is_admin_user(user_id: str | None) -> bool:
+    """Admin gate for dreaming runs and project knowledge-config writes.
+
+    Owner decision 2026-11-15: with ``DICTATOR_USER_IDS`` empty the default
+    user (``settings.default_user_id``) is the admin, so single-user and
+    legacy-key installs keep working; with a non-empty list only the listed
+    users are admins. ``settings.is_dictator`` is deliberately unchanged
+    (standards-tier writes keep their meaning). Callers must pass the
+    token-resolved identity, never a body-supplied one.
+    """
+    if not user_id:
+        return False
+    listed = settings.dictator_user_ids_set()
+    if listed:
+        return user_id in listed
+    return user_id == settings.default_user_id
+
 
 class BearerAuthMiddleware(BaseHTTPMiddleware):
     """Bearer token middleware supporting per-user HMAC + legacy shared keys."""
 
     async def dispatch(self, request: Request, call_next):
-        # Auth disabled when neither secret is set (local dev convenience)
         token_secret = settings.neuralscape_user_token_secret
         legacy_key = settings.neuralscape_api_key
+        path = request.url.path
         # Scoped credentials (off unless CREDENTIALS_ENABLED and policy
         # enforcement is on) make authentication mandatory.
         import credentials
 
         scoped_enabled = credentials.accepts_scoped_credentials()
         if not token_secret and not legacy_key and not scoped_enabled:
-            return await call_next(request)
+            # The ONLY unauthenticated pass-through: an explicit operator
+            # opt-out (startup logs a WARNING for it). Never a silent default.
+            if settings.neuralscape_auth_disabled:
+                return await call_next(request)
+            # No credential configured and no opt-out: fail closed. Startup
+            # validation normally refuses this state; this guards any path
+            # that serves the app without running the lifespan.
+            if path in PUBLIC_PATHS or path.startswith(PUBLIC_PREFIXES):
+                return await call_next(request)
+            return JSONResponse(
+                status_code=503,
+                content={"detail": AUTH_NOT_CONFIGURED_MSG},
+            )
 
         # Health checks and the OAuth front door are always public
-        path = request.url.path
         if path in PUBLIC_PATHS or path.startswith(PUBLIC_PREFIXES):
             return await call_next(request)
 
@@ -140,11 +204,17 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
             return JSONResponse(status_code=503, content={"detail": "credential service unavailable"})
         if verified is None:
             return self._unauthorized(request, "Invalid or expired token")
-        # The opaque subject id is the identity downstream code sees as user_id.
-        request.state.user_id = verified.subject_id
+        # Downstream code (memory reads and writes, task ownership) sees the ``user_id`` the subject's
+        # rows are keyed by: the bound legacy id, or the subject id itself when there is none.  The
+        # policy layer still identifies the principal by ``request.state.credential``.
+        try:
+            memory_user = service.memory_user_id(verified.subject_id)
+        except credentials.AuthorityUnavailable:
+            return JSONResponse(status_code=503, content={"detail": "credential service unavailable"})
+        request.state.user_id = memory_user
         request.state.auth_mode = "scoped_credential"
         request.state.credential = verified
-        user_token = current_user_id.set(verified.subject_id)
+        user_token = current_user_id.set(memory_user)
         credential_token = credentials.current_credential.set(verified)
         try:
             return await call_next(request)

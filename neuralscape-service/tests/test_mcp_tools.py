@@ -464,7 +464,9 @@ class TestEditMemoryTool:
         data = json.loads(result[0].text)
         assert data["graph"] == "migration_queued"
         assert data["graph_task_id"] == "task-graph"
-        mock_task_manager.enqueue_graph_enrichment.assert_awaited_once_with(**job)
+        mock_task_manager.enqueue_graph_enrichment.assert_awaited_once_with(
+            **job, requester_user_id="e"
+        )
 
     @pytest.mark.asyncio
     async def test_edit_permission_error_surfaced(self, mock_mcp_service):
@@ -731,6 +733,11 @@ class TestRememberProvenanceValidation:
 
 
 class TestScheduleDreamTool:
+    @pytest.fixture(autouse=True)
+    def _caller_is_dictator(self, monkeypatch):
+        # schedule_dream is dictator-only; these tests exercise the sweep path.
+        monkeypatch.setattr(mcp_server.settings, "dictator_user_ids", mcp_server.settings.default_user_id)
+
     @pytest.mark.asyncio
     async def test_refuses_when_dreaming_disabled(self, monkeypatch):
         from extensions.dreaming.config import dreaming_settings

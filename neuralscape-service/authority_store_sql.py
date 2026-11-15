@@ -28,8 +28,10 @@ import contextlib
 import hashlib
 import hmac
 import json
+import logging
 import os
 import sqlite3
+import stat
 import threading
 import time
 from collections.abc import Callable, Iterator, Sequence
@@ -351,6 +353,27 @@ class SqlAuthorityStore:
                 c,
                 "SELECT subject_id FROM authority_bindings WHERE issuer=? AND provider_subject=?",
                 (issuer, provider_subject),
+            )
+            return row[0] if row else None
+
+    def binding_alias(self, subject_id: str, issuer: str) -> str | None:
+        """The provider subject bound to ``subject_id`` under ``issuer``, or ``None``.
+
+        The reverse of :meth:`get`.  When one subject holds several bindings under the issuer the
+        earliest one (then the lowest name) is returned, so the answer is stable.
+        """
+
+        try:
+            _ident("subject_id", subject_id)
+            _ident("issuer", issuer)
+        except ValueError:
+            return None
+        with self._guard(), self._read_lock, self._read_txn() as c:
+            row = self._one(
+                c,
+                "SELECT provider_subject FROM authority_bindings WHERE issuer=? AND subject_id=?"
+                " ORDER BY created_at, provider_subject LIMIT 1",
+                (issuer, subject_id),
             )
             return row[0] if row else None
 
@@ -1521,19 +1544,6 @@ class SqlAuthorityStore:
             return body(c)
 
 
-def _create_private(path: str) -> None:
-    """Create a new database file readable by its owner only (SQLite gives its WAL and shared-memory
-    files the database file's mode).  An existing file, or an in-memory database, is left as it is."""
-
-    if not path or path == ":memory:" or path.startswith("file:"):
-        return
-    try:
-        descriptor = os.open(path, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
-    except FileExistsError:
-        return
-    os.close(descriptor)
-
-
 def _ident(name: str, value: object) -> str:
     """An identifier accepted identically by every backend.
 
@@ -1556,6 +1566,44 @@ def _load_delegation(text: str | None) -> DelegationConstraints | None:
     return None if text is None else DelegationConstraints.model_validate_json(text)
 
 
+_logger = logging.getLogger(__name__)
+_SQLITE_SIDECARS = ("", "-wal", "-shm", "-journal")
+
+
+def _owner_only(path: str) -> None:
+    """Create the database file owner-only if it is missing, and tighten it and its sidecars if looser.
+
+    The authority database holds invite and credential secret hashes and the credential pepper.  SQLite
+    creates its WAL and shared-memory files with the database file's mode, so the main file is created
+    0600 before the first connection; files left looser by an earlier version are tightened here.  Each
+    name is opened without following a symbolic link or blocking on a pipe and must be a regular file
+    (``OSError`` otherwise), and the mode is changed through that descriptor, so a link planted at the
+    path is refused and its target never touched.  A regular file that cannot be tightened (owned by
+    another user, for example) is logged, not refused.
+    """
+
+    if path == ":memory:" or path.startswith("file:"):
+        return
+    for suffix in _SQLITE_SIDECARS:
+        name = path + suffix
+        flags = os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK | (os.O_CREAT if not suffix else 0)
+        try:
+            descriptor = os.open(name, flags, 0o600)  # 0600 & ~umask when the database is created now
+        except FileNotFoundError:
+            continue  # a sidecar created later takes the database file's mode
+        try:
+            info = os.fstat(descriptor)
+            if not stat.S_ISREG(info.st_mode):
+                raise OSError(f"the authority database file {name} is not a regular file")
+            if stat.S_IMODE(info.st_mode) & 0o077:
+                try:
+                    os.fchmod(descriptor, stat.S_IMODE(info.st_mode) & 0o700)
+                except OSError:
+                    _logger.warning("the authority database file %s could not be made owner-only", name)
+        finally:
+            os.close(descriptor)
+
+
 class SqliteAuthorityStore(SqlAuthorityStore):
     """Embedded profile: one owning host, local disk, WAL, ``synchronous=FULL``."""
 
@@ -1571,7 +1619,7 @@ class SqliteAuthorityStore(SqlAuthorityStore):
         busy_timeout_ms: int = 30_000,
     ) -> None:
         super().__init__(clock)
-        _create_private(path)
+        _owner_only(path)
         self._conn = sqlite3.connect(
             path, isolation_level=None, timeout=busy_timeout_ms / 1000, check_same_thread=False
         )
@@ -1586,6 +1634,7 @@ class SqliteAuthorityStore(SqlAuthorityStore):
         self._rconn = sqlite3.connect(
             path, isolation_level=None, timeout=busy_timeout_ms / 1000, check_same_thread=False
         )
+        _owner_only(path)  # sidecars left looser by an earlier version (new ones follow the main file)
         self._rconn.execute("PRAGMA query_only=ON")
         self._rconn.execute(f"PRAGMA busy_timeout={int(busy_timeout_ms)}")
 
@@ -1763,6 +1812,16 @@ _AUTHORITY_DML = {
     "authority_credentials": "SELECT, INSERT, UPDATE",
     "authority_policies": "SELECT, INSERT, UPDATE",
     "authority_statements": "SELECT, INSERT, DELETE",
+    # Scoped credentials, service accounts, the credential pepper, invites and the per-tenant onboarding
+    # policy.  Every row is updated or consumed in place (a secret is marked consumed or revoked, an
+    # invite is used or revoked, a service account is disabled, the onboarding policy is replaced by an
+    # upsert) and none is ever deleted; the pepper is written once and read.  Table locks are not
+    # needed (row locks via SELECT ... FOR UPDATE ride on the UPDATE privilege).
+    "authority_credential_secrets": "SELECT, INSERT, UPDATE",
+    "authority_service_accounts": "SELECT, INSERT, UPDATE",
+    "authority_pepper": "SELECT, INSERT",
+    "authority_invites": "SELECT, INSERT, UPDATE",
+    "authority_onboarding": "SELECT, INSERT, UPDATE",
     "authority_schema_version": "SELECT",
 }
 

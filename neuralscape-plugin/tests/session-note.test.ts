@@ -114,6 +114,20 @@ describe("extractLearned", () => {
   });
 });
 
+describe("extractCompleted from a turn with progress commentary", () => {
+  it("uses the turn's final assistant entry, not the commentary that precedes it", () => {
+    const progress = "Looking at the sync worker now, reading the retry settings and the queue code first. ".repeat(6);
+    const finalAnswer = "Done: the retry logic is in place and the tests pass.";
+    const out = extractCompleted([{ user: "add retries", assistant: `${progress}\n${finalAnswer}`, final: finalAnswer }])!;
+    expect(out).toContain("retry logic is in place");
+    expect(out).not.toContain("Looking at the sync worker");
+  });
+
+  it("falls back to the whole assistant text when no final entry is given", () => {
+    expect(extractCompleted([{ user: "u", assistant: "the whole text of the turn" }])).toContain("whole text");
+  });
+});
+
 describe("extractCompleted", () => {
   it("uses the head of the final assistant message", () => {
     const out = extractCompleted(TURNS)!;

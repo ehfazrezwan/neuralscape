@@ -1,4 +1,5 @@
 import json
+import logging
 import math
 import os
 from pathlib import Path
@@ -8,6 +9,8 @@ from urllib.parse import urlparse
 from arq.connections import RedisSettings
 from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode
+
+_logger = logging.getLogger(__name__)
 
 _LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1", "[::1]"}
 
@@ -108,6 +111,8 @@ class Settings(BaseSettings):
     llm_max_retries: int = 3
     llm_retry_base_delay: float = 1.0  # seconds
 
+    llm_retry_max_delay: float = 30.0  # seconds
+
     # Optional Gemini endpoint override (e.g. an egress proxy or regional
     # endpoint). Empty ⇒ the SDK default. When set, recipient ids in the
     # inference facade name the endpoint host so approvals match the real
@@ -136,7 +141,6 @@ class Settings(BaseSettings):
     # first routed write releases and destroys it (erased text must not outlive the window).
     # 0 keeps it until an explicit release.
     engine_routing_rollback_window_seconds: float = 0.0
-    llm_retry_max_delay: float = 30.0  # seconds
 
     # Dedup cron
     dedup_similarity_threshold: float = 0.95
@@ -175,7 +179,6 @@ class Settings(BaseSettings):
     # followed; delivery is a fire-and-forget 5s-capped daemon thread
     # (see webhooks.py).
     webhook_queue_empty_url: str = ""
-
 
     # ── Observability: SSE live stream (roadmap E1) ───────────────────
     # When enabled, memory events (memory_stored, dream actions applied,
@@ -479,6 +482,13 @@ class Settings(BaseSettings):
     # `request.state.user_id` so routes don't need to trust the request body.
     # Generate tokens via `python scripts/issue_user_token.py --user <name>`.
     neuralscape_user_token_secret: str = ""
+    # Explicit, loud opt-out of authentication. Auth is FAIL-CLOSED: when neither
+    # `neuralscape_user_token_secret` nor `neuralscape_api_key` is set, startup
+    # refuses (see `validate_required`) and the middleware rejects every
+    # non-public request. Set NEURALSCAPE_AUTH_DISABLED=true only on a trusted
+    # local machine to run with no auth at all; a WARNING is logged at startup.
+    # Ignored (auth stays on) whenever either secret above is set.
+    neuralscape_auth_disabled: bool = False
     # Public HTTPS base URL the service is reachable at from the internet
     # (e.g. the cloudflared tunnel hostname: "https://neuralscape.example.com").
     # Used as the OAuth issuer and to build the .well-known metadata URLs that
@@ -589,14 +599,16 @@ class Settings(BaseSettings):
     #   ledger_postgres_dsn  → libpq connection string for the cell database.
     ledger_enabled: bool = False
     #   ledger_retention_postgres_dsn → a maintenance role that may delete aged tombstones (PostgreSQL only;
-    #     the runtime role cannot).  Needed only when ledger_retention_tombstone_days is set.
+    #     the runtime role cannot).  Used only by the tombstone retention
+    #     job (PostgreSQL), which a later slice adds.
     ledger_retention_postgres_dsn: str = ""
     ledger_backend: str = "sqlite"
     ledger_sqlite_path: str = ""
     ledger_postgres_dsn: str = ""
     #   ledger_postgres_migrate_on_open → True (default) opens as the schema owner and applies migrations.
     #     False opens as a least-privilege runtime role: it must not be a superuser or BYPASSRLS and the
-    #     schema must already be migrated and granted (``python -m ledger.admin migrate`` then ``grant``).
+    #     schema must already be migrated and granted (``PostgresLedger(dsn)`` as the owner, then
+    #     ``ledger.postgres.grant_runtime_role``).
     ledger_postgres_migrate_on_open: bool = True
     # ── Tenant admission control (cell edge; every limit unset = unlimited) ───
     # Mechanism only: no default numbers, no advertised quota (that policy is
@@ -636,6 +648,13 @@ class Settings(BaseSettings):
     # capability under named principals; enforced refuses both.
     ns_auth_profile: Literal["legacy_compat", "enforced"] = "legacy_compat"
 
+    # Vendored mem0/Graphiti usage telemetry. Declared so these keys are valid in the
+    # service .env; nothing here reads them. third_party_telemetry.py applies them (or
+    # defaults both to off) before mem0/Graphiti are imported, since the libraries read
+    # only the process environment. None means "not set".
+    mem0_telemetry: str | None = None
+    graphiti_telemetry_enabled: str | None = None
+
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
 
     @field_validator("neuralscape_public_url")
@@ -654,6 +673,25 @@ class Settings(BaseSettings):
         if parsed.scheme != "https" and not is_loopback:
             raise ValueError("NEURALSCAPE_PUBLIC_URL must use https:// (except loopback hosts)")
         return value.rstrip("/")
+
+    @field_validator("ledger_backend")
+    @classmethod
+    def _validate_ledger_backend(cls, value: str) -> str:
+        backend = value.strip().lower()
+        if backend not in ("sqlite", "postgres"):
+            raise ValueError("LEDGER_BACKEND must be 'sqlite' or 'postgres'")
+        return backend
+
+    @model_validator(mode="after")
+    def _validate_ledger_target(self) -> "Settings":
+        # Fail at startup, not at the first write, when the ledger is on but has nowhere to live.
+        if not self.ledger_enabled:
+            return self
+        if self.ledger_backend == "sqlite" and not self.ledger_sqlite_path.strip():
+            raise ValueError("LEDGER_ENABLED with LEDGER_BACKEND=sqlite requires LEDGER_SQLITE_PATH")
+        if self.ledger_backend == "postgres" and not self.ledger_postgres_dsn.strip():
+            raise ValueError("LEDGER_ENABLED with LEDGER_BACKEND=postgres requires LEDGER_POSTGRES_DSN")
+        return self
 
     @field_validator("tenant_admission_rate_per_second")
     @classmethod
@@ -944,9 +982,33 @@ class Settings(BaseSettings):
                 errors.append(
                     "SUPABASE_URL and SUPABASE_ANON_KEY are required when AUTH_PROVIDER=supabase"
                 )
+        # Auth is fail-closed: with no credential configured, the API would be
+        # open to anyone who can reach it, so refuse to start unless the
+        # operator explicitly opted out.
+        auth_configured = bool(self.neuralscape_user_token_secret or self.neuralscape_api_key)
+        if not auth_configured and not self.neuralscape_auth_disabled:
+            errors.append(
+                "Authentication is not configured. Set one of: "
+                "NEURALSCAPE_USER_TOKEN_SECRET (per-user tokens, recommended), "
+                "NEURALSCAPE_API_KEY (legacy shared key), or "
+                "NEURALSCAPE_AUTH_DISABLED=true (no auth at all; trusted local machine only). "
+                "See AUTH.md"
+            )
         if errors:
             raise ValueError(
                 "Missing required configuration:\n  - " + "\n  - ".join(errors)
+            )
+        if not auth_configured:
+            _logger.warning(
+                "AUTHENTICATION IS DISABLED (NEURALSCAPE_AUTH_DISABLED=true): every "
+                "REST and MCP endpoint accepts unauthenticated requests. Use this only "
+                "on a trusted local machine; set NEURALSCAPE_USER_TOKEN_SECRET for any "
+                "shared or network-reachable deployment."
+            )
+        elif self.neuralscape_auth_disabled:
+            _logger.warning(
+                "NEURALSCAPE_AUTH_DISABLED=true is ignored because an auth secret is "
+                "configured; authentication stays enabled."
             )
 
     def _gateway_openai_base(self) -> str:

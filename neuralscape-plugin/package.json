@@ -1,6 +1,6 @@
 {
   "name": "neuralscape-plugin",
-  "version": "2.9.2",
+  "version": "2.9.3",
   "description": "Persistent agentic memory plugin for Claude Code and Claude Cowork",
   "private": true,
   "type": "module",
@@ -28,9 +28,9 @@
     "test:coverage": "vitest run --coverage"
   },
   "devDependencies": {
-    "@vitest/coverage-v8": "^4.1.11",
+    "@vitest/coverage-v8": "^5.1.0",
     "esbuild": "^0.28.2",
     "typescript": "^7.0.2",
-    "vitest": "^4.1.10"
+    "vitest": "^5.1.0"
   }
 }

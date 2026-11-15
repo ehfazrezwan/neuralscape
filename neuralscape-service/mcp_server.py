@@ -16,6 +16,8 @@ Supports both stdio transport (local Claude Code) and Streamable HTTP
 transport (remote agent access via /mcp/ endpoint on port 8199).
 """
 
+import third_party_telemetry  # noqa: F401 — must precede any mem0/Graphiti import (defaults their telemetry off)
+
 import asyncio
 import contextlib
 import json
@@ -1467,7 +1469,7 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
     #      arguments["user_id"] is ignored rather than trusted.
     #   2. An explicit user_id argument (stdio / local Claude Code, legacy).
     #   3. The configured default_user_id.
-    from auth import current_user_id
+    from auth import current_user_id, is_admin_user
 
     # Tools like list_memories / delete_memories declare no required fields, so a
     # client may omit `arguments` entirely (None). Normalize before any access.
@@ -2231,8 +2233,9 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
             graph_task_id = None
             if result.get("graph_job"):
                 try:
+                    # Storage owner's partition; the editor polls the task.
                     graph_task_id = await _task_manager.enqueue_graph_enrichment(
-                        **result["graph_job"]
+                        **result["graph_job"], requester_user_id=user_id
                     )
                     graph = graph.replace("_pending", "_queued")
                 except Exception as e:
@@ -2580,6 +2583,10 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
         elif name == "set_project_knowledge_config":
             from knowledge.router import ProjectKnowledgeConfig, set_project_config
 
+            if not is_admin_user(user_id):
+                return [TextContent(type="text", text=json.dumps(
+                    {"error": f"User {user_id!r} is not authorized to set project knowledge config."}))]
+
             project_id = arguments.get("project_id")
             if not project_id:
                 return [TextContent(type="text", text=json.dumps({"error": "project_id required"}))]
@@ -2605,6 +2612,11 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
             # worker's queue and let the caller poll the status endpoint.
             from extensions.dreaming.config import dreaming_settings
 
+            # Dictator-only, checked before the flag/force logic (mirrors REST /run).
+            if not is_admin_user(user_id):
+                return [TextContent(type="text", text=json.dumps(
+                    {"error": f"User {user_id!r} is not authorized to trigger dreaming sweeps."}))]
+
             force = bool(arguments.get("force", False))
             if not dreaming_settings.enabled and not force:
                 return [TextContent(type="text", text=json.dumps({
@@ -2620,6 +2632,11 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
                 force,
                 _queue_name=settings.graph_queue_name,
             )
+            if job:
+                # The caller may also poll it on /v1/memories/status.
+                from task_manager import record_task_owner
+
+                await record_task_owner(arq_pool, job.job_id, user_id)
             return [TextContent(type="text", text=json.dumps({
                 "status": "enqueued",
                 "job_id": job.job_id if job else None,
