@@ -31,10 +31,20 @@ capacity, and proposes no budgets.
   driver records its own CPU use per cell; a value near one core means it is the limit.
 
 ## Safety rules the harness enforces
-- **Disposable projects only.** Every compose command, `down -v` and sentinel-volume removal
-  goes through `journey_safety.require_disposable_project`: the project name must start with
-  `ns-bench-`. The production project name is refused in any letter case, and so is an empty
-  name. The check runs before any docker command is built, so a refusal makes no docker call.
+- **Disposable projects only.** The compose project name is a parameter (`--project`; default
+  `ns-bench-baseline` for the runner and `ns-bench-journey` for the journey). Every compose
+  command, `down -v` and sentinel-volume removal first goes through
+  `journey_safety.require_disposable_project`: the production project name is refused after
+  trimming and in any letter case, an empty name is refused, and the name must equal or start
+  with an allowed prefix. The default allowlist is `nscampaign`, `nstest-` and `ns-bench-`;
+  more prefixes can be added only with the repeatable `--allow-project-prefix` option, never
+  through the environment (a prefix that could match the production name is refused). The
+  check runs before any docker command is built, so a refusal makes no docker call. The
+  sentinel volume must be named after its own project.
+- **Scoped to the project.** Resource sampling (`docker stats`) and container listings cover
+  only the run's compose project, found by its compose label; stats is never run without ids.
+  The run-selection rule still notices other containers on the host, but only a count is
+  recorded: no name, stats or inspect output of a foreign container is kept.
 - **Loopback only.** The stack files publish no host ports. Before a run the runner (and the
   journey) scan the compose file and any override and refuse anything that publishes beyond
   `127.0.0.1`/`[::1]`, uses host networking, runs privileged or mounts the Docker socket.

@@ -17,12 +17,33 @@ class JourneySafetyError(RuntimeError):
     """A journey must not start or must not proceed."""
 
 
-# Every compose project the harness starts, stops or removes volumes of must carry this prefix. The
-# production project name is refused outright (empty and any letter case included) and anything
-# without the prefix is refused too, so `down -v` can only ever reach a disposable benchmark project.
-DISPOSABLE_PREFIX = "ns-bench-"
+# Every compose project the harness starts, stops or removes volumes of must match an allowlist of
+# disposable prefixes (`name == prefix` or `name.startswith(prefix)`). The production project name is
+# refused outright (trimmed, any letter case, empty included). More prefixes can be added only by an
+# explicit command-line option through `allow_prefix`, never from the environment.
+DEFAULT_ALLOWED_PREFIXES: tuple[str, ...] = ("nscampaign", "nstest-", "ns-bench-")
 PRODUCTION_PROJECT = "neuralscape"
 _NAME_CHARS = frozenset("abcdefghijklmnopqrstuvwxyz0123456789_-")
+_extra_prefixes: list[str] = []
+
+
+def allowed_prefixes() -> tuple[str, ...]:
+    return DEFAULT_ALLOWED_PREFIXES + tuple(_extra_prefixes)
+
+
+def allow_prefix(prefix: object) -> str:
+    """Add a disposable prefix (CLI option only). Anything that could reach production is refused."""
+
+    if (not isinstance(prefix, str) or len(prefix) < 3 or not set(prefix) <= _NAME_CHARS
+            or PRODUCTION_PROJECT.startswith(prefix) or prefix.startswith(PRODUCTION_PROJECT)):
+        raise JourneySafetyError(f"refusing to allow project prefix {prefix!r}")
+    if prefix not in _extra_prefixes:
+        _extra_prefixes.append(prefix)
+    return prefix
+
+
+def reset_extra_prefixes() -> None:
+    _extra_prefixes.clear()
 
 
 def require_disposable_project(name: object) -> str:
@@ -32,19 +53,20 @@ def require_disposable_project(name: object) -> str:
         raise JourneySafetyError("refusing to run docker: the compose project name is empty")
     if name.strip().casefold() == PRODUCTION_PROJECT:
         raise JourneySafetyError(f"refusing to run docker: {name!r} is the production compose project")
-    if not name.startswith(DISPOSABLE_PREFIX) or len(name) == len(DISPOSABLE_PREFIX) or not set(name) <= _NAME_CHARS:
+    prefixes = allowed_prefixes()
+    if not any(name == p or name.startswith(p) for p in prefixes) or not set(name) <= _NAME_CHARS:
         raise JourneySafetyError(
-            f"refusing to run docker: project {name!r} is not a disposable benchmark project "
-            f"(lower-case name starting with {DISPOSABLE_PREFIX!r})")
+            f"refusing to run docker: project {name!r} is not a disposable project "
+            f"(lower-case name matching one of {', '.join(prefixes)})")
     return name
 
 
 def require_disposable_volume(name: object, project: str) -> str:
-    """The sentinel volume the journey creates and removes must also be a benchmark-named volume."""
+    """The sentinel volume the journey creates and removes must be named after its own disposable project."""
 
     require_disposable_project(project)
-    if not isinstance(name, str) or not name.startswith(DISPOSABLE_PREFIX) or name == project + "_":
-        raise JourneySafetyError(f"refusing to remove volume {name!r}: not a disposable benchmark volume")
+    if not isinstance(name, str) or not name.startswith(project + "-") or name == project + "-":
+        raise JourneySafetyError(f"refusing to remove volume {name!r}: not a volume of the disposable project")
     return name
 
 

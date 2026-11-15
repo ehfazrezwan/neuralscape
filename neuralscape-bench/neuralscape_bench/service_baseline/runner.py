@@ -20,7 +20,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from neuralscape_bench.service_baseline.journey_safety import require_disposable_project, require_local_only
+from neuralscape_bench.service_baseline.journey_safety import (
+    allow_prefix, require_disposable_project, require_local_only)
 from neuralscape_bench.service_baseline.redact import redact_value
 from neuralscape_bench.run_manifest import (
     BuildIdentity,
@@ -40,7 +41,8 @@ from neuralscape_bench.run_manifest import (
 )
 
 SCHEMA = "candidate-v1"
-PROJECT = "ns-bench-baseline"
+DEFAULT_PROJECT = "ns-bench-baseline"
+PROJECT = DEFAULT_PROJECT  # set from --project by main()
 BENCH_DIR = Path(__file__).resolve().parents[2]
 COMPOSE_FILE = BENCH_DIR / "scripts" / "service_baseline" / "compose.yml"
 SERVICES = ("api", "worker", "graph-worker", "ingest-worker", "ledger-worker", "fake-provider", "neo4j", "redis", "qdrant", "pg")
@@ -76,6 +78,20 @@ def parse_stats_line(line: str) -> dict[str, Any] | None:
         return None
 
 
+def project_container_ids() -> list[str]:
+    """Ids of the running containers of this compose project only."""
+
+    require_disposable_project(PROJECT)
+    return sh("docker", "ps", "-q", "--filter", f"label=com.docker.compose.project={PROJECT}", check=False).split()
+
+
+def foreign_container_count(ours: list[str] | None = None) -> int:
+    """How many running containers are not in this project. Only the count leaves this function."""
+
+    mine = set(project_container_ids() if ours is None else ours)
+    return len(set(sh("docker", "ps", "-q", check=False).split()) - mine)
+
+
 class StatsSampler(threading.Thread):
     """Samples ``docker stats`` for the project's containers (one pass per call)."""
 
@@ -83,15 +99,15 @@ class StatsSampler(threading.Thread):
         super().__init__(daemon=True)
         self.stop = threading.Event()
         self.samples: list[dict[str, Any]] = []
-        self.other_containers: set[str] = set()
+        self.other_containers = 0  # the most foreign containers seen at once; their names are never kept
 
     def run(self) -> None:
         while not self.stop.is_set():
             taken = time.time()
-            everything = sh("docker", "ps", "--format", "{{.Names}}", check=False).split()
-            self.other_containers.update(n for n in everything if not n.startswith(f"{PROJECT}-"))
-            out = sh("docker", "stats", "--no-stream", "--format", "{{json .}}",
-                     *self._containers(), check=False)
+            ours = self._containers()
+            self.other_containers = max(self.other_containers, foreign_container_count(ours))
+            # Only the project's own containers are sampled; with none, `docker stats` would list the whole host.
+            out = sh("docker", "stats", "--no-stream", "--format", "{{json .}}", *ours, check=False) if ours else ""
             for line in out.splitlines():
                 parsed = parse_stats_line(line)
                 if parsed:
@@ -100,8 +116,7 @@ class StatsSampler(threading.Thread):
 
     @staticmethod
     def _containers() -> list[str]:
-        out = sh("docker", "ps", "--filter", f"label=com.docker.compose.project={PROJECT}", "--format", "{{.Names}}", check=False)
-        return out.split()
+        return project_container_ids()
 
 
 def peaks(samples: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
@@ -154,7 +169,7 @@ def host_facts() -> dict[str, Any]:
         "kernel": platform.release(),
         "loadavg": os.getloadavg(),
         "docker_version": sh("docker", "version", "--format", "{{.Server.Version}}", check=False).strip(),
-        "other_running_containers": sh("docker", "ps", "--format", "{{.Names}}", check=False).split(),
+        "other_running_containers": foreign_container_count(),
     }
 
 
@@ -364,12 +379,19 @@ def main() -> None:
     parser.add_argument("--series", default="", help="series id for interleaved comparisons")
     parser.add_argument("--position", type=int, default=0, help="position of this run within its repetition")
     parser.add_argument("--rep", type=int, default=0, help="repetition number within the series")
+    parser.add_argument("--project", default=DEFAULT_PROJECT,
+                        help="compose project name; must match an allowed disposable prefix (default: %(default)s)")
+    parser.add_argument("--allow-project-prefix", action="append", default=[], metavar="PREFIX",
+                        help="extra disposable project prefix, repeatable (the defaults are nscampaign, nstest-, ns-bench-)")
     parser.add_argument("--compose-override", default=None,
                         help=f"extra compose file merged over the stack (e.g. {NO_EGRESS_OVERRIDE.name}); default: ${OVERRIDE_ENV}")
     args = parser.parse_args()
-    global COMPOSE_OVERRIDE
-    COMPOSE_OVERRIDE = resolve_override(args.compose_override)
+    global COMPOSE_OVERRIDE, PROJECT
+    for prefix in args.allow_project_prefix:
+        allow_prefix(prefix)
+    PROJECT = args.project
     require_disposable_project(PROJECT)
+    COMPOSE_OVERRIDE = resolve_override(args.compose_override)
     for stack_file in (COMPOSE_FILE, COMPOSE_OVERRIDE):
         if stack_file is not None:
             require_local_only(stack_file.read_text(), stack_file.name)
@@ -409,7 +431,7 @@ def main() -> None:
     results = json.loads((out_dir / "driver.json").read_text())
     record["resource_peaks"] = peaks(sampler.samples)
     record["stats_samples"] = len(sampler.samples)
-    record["other_containers_during_run"] = sorted(sampler.other_containers)
+    record["other_containers_during_run"] = sampler.other_containers
     workload_sha = "sha256:" + hashlib.sha256(json.dumps(results["args"] | {"nonce": None}, sort_keys=True).encode()).hexdigest()
     corpus_sha = "sha256:" + hashlib.sha256(b"service-baseline-corpus-v1:unique-notes-by-nonce-and-index").hexdigest()
     (out_dir / "record.json").write_text(json.dumps(redact_value(record), indent=2, default=str))

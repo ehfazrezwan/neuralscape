@@ -25,6 +25,14 @@ def load_script(name: str, monkeypatch):
     return module
 
 
+@pytest.fixture(autouse=True)
+def _reset_prefixes():
+    reset = getattr(journey_safety, "reset_extra_prefixes", lambda: None)
+    reset()
+    yield
+    reset()
+
+
 @pytest.fixture
 def no_docker(monkeypatch):
     """Any subprocess start is recorded; none ever runs."""
@@ -40,14 +48,55 @@ def no_docker(monkeypatch):
     return calls
 
 
-PRODUCTION_SPELLINGS = ["neuralscape", "Neuralscape", "NEURALSCAPE", " neuralscape ", "neuralscape\n"]
-NOT_DISPOSABLE = ["", "   ", "prod", "ns-bench-", "ns-benchmark", "ns-bench-UP", "ns-bench-a b", "my-neuralscape"]
+PRODUCTION_SPELLINGS = ["neuralscape", "Neuralscape", "NeuralScape", "NEURALSCAPE", " neuralscape ", "neuralscape\n"]
+NOT_DISPOSABLE = ["", "   ", "prod", "ns-benchmark", "mystack-1", "ns-bench", "ns-bench-UP", "ns-bench-a b", "my-neuralscape"]
 
 
 @pytest.mark.parametrize("name", PRODUCTION_SPELLINGS + NOT_DISPOSABLE + [None, 7])
 def test_only_a_disposable_project_name_is_accepted(name):
     with pytest.raises(JourneySafetyError):
         journey_safety.require_disposable_project(name)
+
+
+@pytest.mark.parametrize("name", ["nscampaign", "nscampaign-x", "nstest-a", "ns-bench-x", "ns-bench-baseline"])
+def test_the_default_allowlist_accepts_disposable_prefixes(name):
+    assert journey_safety.require_disposable_project(name) == name
+
+
+def test_a_prefix_added_by_option_is_accepted_and_unsafe_prefixes_are_not():
+    with pytest.raises(JourneySafetyError):
+        journey_safety.require_disposable_project("mystack-1")
+    journey_safety.allow_prefix("mystack-")
+    assert journey_safety.require_disposable_project("mystack-1") == "mystack-1"
+    for bad in ("", "ne", "neuralscape", "neuralscape-x", "Mystack-", None):
+        with pytest.raises(JourneySafetyError):
+            journey_safety.allow_prefix(bad)
+    with pytest.raises(JourneySafetyError, match="production"):
+        journey_safety.require_disposable_project("NeuralScape")
+
+
+def test_the_runner_takes_the_project_as_a_parameter_with_the_allowlist(monkeypatch, no_docker, tmp_path):
+    base = ["runner", "--image", "x", "--tree", "0" * 40, "--lock-sha256", "0" * 64, "--label", "l", "--out-dir", str(tmp_path / "out")]
+    monkeypatch.setattr(runner, "PROJECT", runner.PROJECT)  # restored after the test
+    monkeypatch.setattr(sys, "argv", [*base, "--project", "mystack-1"])
+    with pytest.raises(JourneySafetyError, match="not a disposable"):
+        runner.main()
+    monkeypatch.setattr(sys, "argv", [*base, "--project", "NeuralScape", "--allow-project-prefix", "mystack-"])
+    with pytest.raises(JourneySafetyError, match="production"):
+        runner.main()
+
+    class Reached(Exception):
+        pass
+
+    def stop(image):
+        raise Reached
+
+    monkeypatch.setattr(runner, "image_facts", stop)
+    monkeypatch.setattr(runner, "COMPOSE_FILE", STACK / "compose.yml")
+    monkeypatch.setattr(sys, "argv", [*base, "--project", "mystack-1", "--allow-project-prefix", "mystack-"])
+    with pytest.raises(Reached):
+        runner.main()
+    assert runner.PROJECT == "mystack-1" and no_docker == []
 
 
 def test_the_harness_own_project_names_are_accepted():
@@ -68,9 +117,9 @@ def test_the_runner_builds_no_compose_command_for_the_production_project(monkeyp
 
 
 def test_the_runner_refuses_the_production_project_before_parsing_a_single_stack_file(monkeypatch, no_docker, tmp_path):
-    monkeypatch.setattr(runner, "PROJECT", "NeuralScape")
+    monkeypatch.setattr(runner, "PROJECT", runner.PROJECT)  # restored after the test
     monkeypatch.setattr(sys, "argv", ["runner", "--image", "x", "--tree", "0" * 40, "--lock-sha256", "0" * 64,
-                                      "--label", "l", "--out-dir", str(tmp_path / "out")])
+                                      "--label", "l", "--out-dir", str(tmp_path / "out"), "--project", "NeuralScape"])
     with pytest.raises(JourneySafetyError, match="production"):
         runner.main()
     assert no_docker == [] and not (tmp_path / "out").exists()
@@ -103,10 +152,61 @@ def test_the_sentinel_volume_must_be_a_benchmark_volume(sentinel):
     assert docker.calls == []
 
 
+def _scripted_sh(monkeypatch, project_ids, all_ids):
+    calls: list[tuple[str, ...]] = []
+
+    def fake(*args, **kwargs):
+        calls.append(args)
+        if args[:2] == ("docker", "ps") and any(a.startswith("label=com.docker.compose.project=") for a in args):
+            return "\n".join(project_ids)
+        if args[:2] == ("docker", "ps"):
+            return "\n".join(all_ids)
+        return ""
+
+    monkeypatch.setattr(runner, "sh", fake)
+    return calls
+
+
+def test_listing_and_stats_are_scoped_to_the_run_project(monkeypatch):
+    calls = _scripted_sh(monkeypatch, ["p1", "p2"], ["p1", "p2", "x1"])
+    sampler = runner.StatsSampler()
+    sampler.stop.set()
+    sampler.stop = type("OneShot", (), {"is_set": lambda self, n=[0]: n.append(1) or len(n) > 2, "set": lambda self: None})()
+    sampler.run()
+    listings = [c for c in calls if c[:2] == ("docker", "ps")]
+    assert any(f"label=com.docker.compose.project={runner.PROJECT}" in c for c in listings)
+    stats = [c for c in calls if c[:2] == ("docker", "stats")]
+    assert stats and all(c[-2:] == ("p1", "p2") for c in stats)  # ids of the project only
+    assert all("{{.Names}}" not in " ".join(c) for c in calls)  # no listing that returns container names
+
+
+def test_stats_is_never_run_unscoped_when_the_project_has_no_container(monkeypatch):
+    calls = _scripted_sh(monkeypatch, [], ["x1", "x2"])
+    sampler = runner.StatsSampler()
+    sampler.stop = type("OneShot", (), {"is_set": lambda self, n=[0]: n.append(1) or len(n) > 2, "set": lambda self: None})()
+    sampler.run()
+    assert not [c for c in calls if c[:2] == ("docker", "stats")]  # a bare `docker stats` samples the whole host
+
+
+def test_the_other_container_check_records_a_count_and_no_foreign_names(monkeypatch):
+    calls = _scripted_sh(monkeypatch, ["p1"], ["p1", "foreign-secret-id", "other-id"])
+    assert runner.foreign_container_count() == 2
+    sampler = runner.StatsSampler()
+    sampler.stop = type("OneShot", (), {"is_set": lambda self, n=[0]: n.append(1) or len(n) > 2, "set": lambda self: None})()
+    sampler.run()
+    assert sampler.other_containers == 2 and isinstance(sampler.other_containers, int)
+    assert all("{{.Names}}" not in " ".join(c) for c in calls)
+    assert "foreign" not in repr(sampler.__dict__)
+    from neuralscape_bench.service_baseline import report
+
+    assert report.is_clean({"host_before": {"other_running_containers": 0}, "host_after": {"other_running_containers": 0},
+                            "other_containers_during_run": 0})
+    assert not report.is_clean({"host_before": {"other_running_containers": 0}, "other_containers_during_run": 2})
+
+
 def test_the_journey_never_starts_docker_for_the_production_project(monkeypatch, no_docker):
     journey = load_script("journey", monkeypatch)
-    assert journey.PROJECT.startswith(journey_safety.DISPOSABLE_PREFIX)
-    assert journey.SENTINEL.startswith(journey_safety.DISPOSABLE_PREFIX)
+    journey_safety.require_disposable_volume(journey.SENTINEL, journey.PROJECT)
     monkeypatch.setattr(journey, "PROJECT", "neuralscape")
     walker = journey.Journey("old", "new", "/nonexistent/out.json")
     try:

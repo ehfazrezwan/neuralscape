@@ -20,10 +20,16 @@ from pathlib import Path
 from typing import Any
 
 
+def _count(value: Any) -> int:
+    """A recorded count of foreign containers (older records stored a list)."""
+
+    return len(value) if isinstance(value, (list, tuple, set)) else int(value or 0)
+
+
 def is_clean(record: dict[str, Any]) -> bool:
-    before = record.get("host_before", {}).get("other_running_containers") or []
-    after = record.get("host_after", {}).get("other_running_containers") or []
-    during = record.get("other_containers_during_run") or []
+    before = _count(record.get("host_before", {}).get("other_running_containers"))
+    after = _count(record.get("host_after", {}).get("other_running_containers"))
+    during = _count(record.get("other_containers_during_run"))
     return not before and not after and not during
 
 

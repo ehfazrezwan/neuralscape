@@ -20,12 +20,12 @@ HERE = Path(__file__).resolve().parent
 BENCH = HERE.parents[1]
 sys.path.insert(0, str(BENCH))
 from neuralscape_bench.service_baseline.journey_safety import (  # noqa: E402
-    JourneySafetyError, preflight, require_disposable_project, require_disposable_volume, require_local_only,
+    JourneySafetyError, allow_prefix, preflight, require_disposable_project, require_disposable_volume, require_local_only,
     uninstall_is_safe, uninstall_report)
 from neuralscape_bench.service_baseline.redact import redact_value  # noqa: E402
 
-PROJECT = "ns-bench-journey"
-SENTINEL = "ns-bench-journey-sentinel"
+PROJECT = "ns-bench-journey"  # a parameter: --project, validated against the allowed disposable prefixes
+SENTINEL = PROJECT + "-sentinel"
 FILES = ["-f", str(HERE / "compose.yml"), "-f", str(HERE / "journey.override.yml")]
 APP = ["api", "worker", "graph-worker", "ingest-worker"]
 PG_PASSWORD = "bench-owner-password"
@@ -219,10 +219,30 @@ def pending_scenario(old, new, out):
 
 
 def main():
-    if len(sys.argv) != 5 or sys.argv[1] in ("-h", "--help"):
-        print(__doc__)  # usage only: nothing is started
-        raise SystemExit(0 if sys.argv[1:2] in (["-h"], ["--help"]) else 2)
-    scenario, old, new, out = sys.argv[1:5]
+    global PROJECT, SENTINEL
+    args = sys.argv[1:]
+    if not args or args[0] in ("-h", "--help"):
+        print(__doc__ + "\nOptions: --project NAME (default ns-bench-journey), --allow-project-prefix PREFIX (repeatable).")
+        raise SystemExit(0 if args else 2)
+    positional = []
+    index = 0
+    project = PROJECT
+    while index < len(args):
+        if args[index] in ("--project", "--allow-project-prefix") and index + 1 < len(args):
+            if args[index] == "--project":
+                project = args[index + 1]
+            else:
+                allow_prefix(args[index + 1])
+            index += 2
+        else:
+            positional.append(args[index])
+            index += 1
+    if len(positional) != 4:
+        print(__doc__)
+        raise SystemExit(2)
+    PROJECT, SENTINEL = project, project + "-sentinel"
+    require_disposable_project(PROJECT)
+    scenario, old, new, out = positional
     if scenario == "ledger-pending":
         return pending_scenario(old, new, out)
     j = Journey(old, new, out)
