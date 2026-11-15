@@ -87,6 +87,14 @@ def test_ensure_local_mode_not_found_creates(engine):
     client.create_collection.assert_called_once()
 
 
+def test_ensure_plain_not_found_exception_creates(engine):
+    """A client that surfaces absence as a bare exception with Qdrant's wording."""
+    client = MagicMock()
+    client.get_collection.side_effect = Exception("Not found")
+    engine._ensure_code_index_collection(_mem(client), vector_size=8)
+    client.create_collection.assert_called_once()
+
+
 def test_ensure_create_409_already_exists_is_success(engine):
     """Another worker created it between our check and our create."""
     client = MagicMock()

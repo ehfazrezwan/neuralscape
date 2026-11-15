@@ -161,16 +161,15 @@ class _Edge:
 def _is_collection_not_found(exc: BaseException) -> bool:
     """True only for a real "collection does not exist" answer from Qdrant.
 
-    Server mode raises ``UnexpectedResponse`` with status 404; the embedded
-    local mode raises ``ValueError("Collection x not found")``. Anything else
-    (connection reset, 5xx, timeout) is a transient fault, not absence.
+    Server mode raises ``UnexpectedResponse`` with status 404 (body "Not found:
+    Collection `x` doesn't exist!"); the embedded local mode raises
+    ``ValueError("Collection x not found")``. Anything else (connection reset,
+    5xx, timeout) is a transient fault, not absence.
     """
-    status = getattr(exc, "status_code", None)
-    if status == 404:
+    if getattr(exc, "status_code", None) == 404:
         return True
-    if isinstance(exc, ValueError) and "not found" in str(exc).lower():
-        return True
-    return False
+    text = str(exc).lower()
+    return "not found" in text or "doesn't exist" in text or "does not exist" in text
 
 
 def _is_collection_exists_conflict(exc: BaseException) -> bool:
