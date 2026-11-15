@@ -332,7 +332,7 @@ async def process_memory_raw(
     )
     if memories and not created and not revived:
         # Plain dedup hit: not re-enriched, but check whether the graph has
-        # since gone stale for this row (default path, flag independent).
+        # since gone stale for this row (flagged: GRAPH_SUPERSESSION_ENABLED).
         await _enqueue_stale_graph_check(ctx, memories[0], content, user_id, project_id)
     if (created or revived) and memories:
         mem = memories[0]
