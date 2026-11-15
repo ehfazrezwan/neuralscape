@@ -107,6 +107,41 @@ def _validate_speaker(speaker: str | None) -> str | None:
 class WriteMixin:
     """WriteMixin for MemoryService (mechanical split — see memory_service.py)."""
 
+    def _maybe_supersede_contradicted(
+        self,
+        *,
+        group_id: str,
+        owner_user_id: str,
+        write_started_at: datetime,
+        episode_uuid: str | None,
+        new_memory_ids: set[str],
+        superseded_by: str | None = None,
+    ) -> None:
+        """Flag-gated post-graph-write hook: tombstone rows whose graph edges
+        this write's episode just invalidated (memory/supersession.py).
+
+        No-op (no Cypher, no payload write) unless
+        ``GRAPH_SUPERSESSION_ENABLED``. Best-effort — logs and swallows every
+        error so a failed probe can never fail the write, and never touches
+        ``new_memory_ids`` (the row(s) just written/re-derived).
+        """
+        if not settings.graph_supersession_enabled:
+            return
+        try:
+            from memory.supersession import supersede_contradicted_rows
+
+            supersede_contradicted_rows(
+                self,
+                group_id=group_id,
+                owner_user_id=owner_user_id,
+                write_started_at=write_started_at,
+                new_episode_uuid=episode_uuid,
+                new_memory_ids=new_memory_ids,
+                superseded_by=superseded_by,
+            )
+        except Exception as e:  # noqa: BLE001 — supersession is best-effort
+            logger.warning(f"Graph-contradiction supersession failed (non-critical): {e}")
+
     def _attach_memory_id_to_graph_nodes(
         self,
         *,
@@ -493,6 +528,16 @@ class WriteMixin:
                         # ref (see the docstring above the sibling loop).
                         if (episode_uuid or episode_name) and mid in newly_created_ids:
                             self._persist_graph_episode_ref(mid, episode_uuid, episode_name)
+                    # Contradiction supersession (flag-gated, best-effort): rows
+                    # in ``stored`` — new rows AND re-derived dedup survivors —
+                    # are what this conversation just asserted, so never touched.
+                    self._maybe_supersede_contradicted(
+                        group_id=group_id,
+                        owner_user_id=user_id,
+                        write_started_at=graph_write_started_at,
+                        episode_uuid=episode_uuid,
+                        new_memory_ids={getattr(mem, "id", "") or "" for mem in stored},
+                    )
         except Exception as e:
             logger.warning(f"Graph storage failed (non-critical): {e}")
 
@@ -1134,6 +1179,15 @@ class WriteMixin:
             episode_name = (graph_result or {}).get("episode_name")
             if episode_uuid or episode_name:
                 self._persist_graph_episode_ref(memory_id, episode_uuid, episode_name)
+            # Contradiction supersession (flag-gated, best-effort, never raises).
+            self._maybe_supersede_contradicted(
+                group_id=group_id,
+                owner_user_id=user_id,
+                write_started_at=graph_write_started_at,
+                episode_uuid=episode_uuid,
+                new_memory_ids={memory_id},
+                superseded_by=memory_id,
+            )
             return True
         except Exception as e:
             logger.warning(f"Graph enrichment failed (non-critical): {e}")
@@ -1308,12 +1362,20 @@ class WriteMixin:
             meta = (points[0].payload or {}).get("metadata") or {}
             if not meta.get("dream_tombstoned"):
                 return False
+            revive_patch: dict = {
+                "dream_tombstoned": False,
+                "dream_revived_at": datetime.now(timezone.utc).isoformat(),
+            }
+            if meta.get("superseded_reason") == "graph_contradiction":
+                # Graph-contradiction supersession (memory/supersession.py) is
+                # undone by re-derivation: drop its provenance so the revived
+                # row doesn't carry a stale "superseded by" pointer.
+                from memory.supersession import SUPERSESSION_KEYS
+
+                revive_patch.update({k: None for k in SUPERSESSION_KEYS})
             client.set_payload(
                 collection_name=collection,
-                payload={
-                    "dream_tombstoned": False,
-                    "dream_revived_at": datetime.now(timezone.utc).isoformat(),
-                },
+                payload=revive_patch,
                 points=[memory_id],
                 key="metadata",
             )
@@ -1473,6 +1535,23 @@ class WriteMixin:
                 continue
             if kind == "dup":
                 results.append(obj)
+                if settings.graph_supersession_enabled and getattr(obj, "revived", None):
+                    # Re-asserted fact revived a tombstoned row: it must reach
+                    # Graphiti's contradiction engine again (this batch path
+                    # enriches inline, like its new rows). Best-effort.
+                    try:
+                        self.enrich_graph(
+                            content=obj.memory,
+                            user_id=items[idx]["user_id"],
+                            project_id=getattr(obj, "project_id", None),
+                            visibility=getattr(obj, "visibility", None) or "private",
+                            memory_id=obj.id,
+                            source_ref=getattr(obj, "source_ref", None),
+                            occurred_at=getattr(obj, "occurred_at", None),
+                            workspace=getattr(obj, "workspace", None),
+                        )
+                    except Exception as e:  # noqa: BLE001
+                        logger.warning(f"Revived-row graph re-enrichment failed for {obj.id}: {e}")
                 continue
             if kind == "batchdup":
                 # Survivor was inserted earlier in this pass — count the

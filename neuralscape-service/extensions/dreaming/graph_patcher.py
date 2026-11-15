@@ -474,3 +474,82 @@ async def patch_dream_path_by_memory_ids(
             exc_info=True,
         )
         return 0
+
+
+async def find_contradicted_edges(
+    driver: Any,
+    *,
+    group_id: str,
+    write_started_at: datetime,
+    new_episode_uuid: str,
+) -> list[dict]:
+    """RELATES_TO edges a graph write just invalidated (supersession probe).
+
+    Graphiti's ``add_episode`` contradiction pass sets BOTH ``invalid_at``
+    (the new edge's ``valid_at``) and ``expired_at`` (now) on an older edge.
+    Requiring ``invalid_at`` excludes the episode-delete cascade, which only
+    sets ``expired_at``. ``expired_at >= write_started_at`` bounds the probe
+    to this write's window, and ``NOT new_episode_uuid IN episodes`` drops the
+    new episode's own edges (an out-of-order new edge is born expired).
+
+    Returns ``[{"uuid", "fact", "episodes": [...]}]``. Best-effort — logs and
+    returns ``[]`` on any driver error (never raises).
+    """
+    if not group_id or not new_episode_uuid:
+        return []
+    cypher = """
+    MATCH ()-[r:RELATES_TO]->()
+    WHERE r.group_id = $group_id
+      AND r.invalid_at IS NOT NULL
+      AND r.expired_at >= datetime($since)
+      AND NOT $new_episode_uuid IN coalesce(r.episodes, [])
+    RETURN r.uuid AS uuid, r.fact AS fact, coalesce(r.episodes, []) AS episodes
+    """
+    try:
+        async with driver.session() as session:
+            result = await session.run(
+                cypher,
+                group_id=group_id,
+                since=write_started_at.astimezone(timezone.utc).isoformat(),
+                new_episode_uuid=new_episode_uuid,
+            )
+            return list(await result.data())
+    except Exception:
+        logger.warning(
+            "find_contradicted_edges failed for group_id=%s (non-fatal)",
+            group_id,
+            exc_info=True,
+        )
+        return []
+
+
+async def count_live_edges_by_episode(
+    driver: Any,
+    *,
+    group_id: str,
+    episode_uuids: list[str],
+) -> dict[str, int]:
+    """Live (neither invalid nor expired) RELATES_TO edge count per episode.
+
+    An episode that appears in ``episode_uuids`` but has no live edge maps to
+    ``0``. Raises on driver errors — the caller decides how to degrade (the
+    supersession hook treats a failure as "leave rows alone").
+    """
+    counts = {ep: 0 for ep in episode_uuids}
+    if not group_id or not episode_uuids:
+        return counts
+    cypher = """
+    MATCH ()-[r:RELATES_TO]->()
+    WHERE r.group_id = $group_id
+      AND r.invalid_at IS NULL
+      AND r.expired_at IS NULL
+    UNWIND [ep IN coalesce(r.episodes, []) WHERE ep IN $episode_uuids] AS ep
+    RETURN ep AS episode_uuid, count(r) AS live
+    """
+    async with driver.session() as session:
+        result = await session.run(
+            cypher, group_id=group_id, episode_uuids=list(episode_uuids)
+        )
+        for row in await result.data():
+            counts[row["episode_uuid"]] = int(row["live"])
+    return counts

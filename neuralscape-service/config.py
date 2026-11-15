@@ -111,6 +111,20 @@ class Settings(BaseSettings):
     llm_retry_base_delay: float = 1.0  # seconds
     llm_retry_max_delay: float = 30.0  # seconds
 
+    # ── Graph-contradiction supersession (flag, default OFF) ──────────
+    # When Graphiti's add_episode invalidates an older RELATES_TO edge, mark
+    # the Qdrant row that edge came from with a reversible tombstone
+    # (metadata.dream_tombstoned + superseded_* keys) so recall stops serving
+    # the contradicted fact, and let a dedup-hit that revived a tombstoned row
+    # re-enter graph enrichment. Env: GRAPH_SUPERSESSION_ENABLED. Off ⇒ the
+    # write path is byte-identical to before (no Cypher probe, no payload
+    # change, no extra enqueue). Multi-row (conversation) episodes only
+    # supersede a row whose stored vector matches the invalidated edge's fact
+    # at >= min_similarity AND beats the runner-up by >= margin.
+    graph_supersession_enabled: bool = False
+    graph_supersession_min_similarity: float = 0.85
+    graph_supersession_margin: float = 0.05
+
     # Dedup cron
     dedup_similarity_threshold: float = 0.95
     dedup_batch_size: int = 100

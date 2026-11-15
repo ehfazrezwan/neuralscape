@@ -264,7 +264,15 @@ async def process_memory_raw(
 
     # Defer graph enrichment for newly-created rows onto the graph queue. Skip
     # for content-hash dedup hits (created=False) — they're already in the graph.
-    if created and memories:
+    # Exception (GRAPH_SUPERSESSION_ENABLED): a dedup hit that REVIVED a
+    # tombstoned row is a re-assertion of that fact, so it re-enters the graph
+    # (and Graphiti's contradiction engine) like a fresh write.
+    revived = bool(
+        settings.graph_supersession_enabled
+        and memories
+        and getattr(memories[0], "revived", None)
+    )
+    if (created or revived) and memories:
         mem = memories[0]
         try:
             await ctx["redis"].enqueue_job(
