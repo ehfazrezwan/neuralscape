@@ -45,6 +45,10 @@ config:
   # together with the user-token secret.
   NEURALSCAPE_PUBLIC_URL: "https://neuralscape.example.com"
   OBSIDIAN_VAULT_PATH: "/data/vault"
+  # Vendored mem0/Graphiti send anonymous usage telemetry to an external host
+  # unless disabled. Off by default; set "true" here to opt in.
+  MEM0_TELEMETRY: "false"
+  GRAPHITI_TELEMETRY_ENABLED: "false"
 
 # Keys read from the ESO-synced `neuralscape-secrets` Secret (deploy/k8s/).
 secretName: neuralscape-secrets
