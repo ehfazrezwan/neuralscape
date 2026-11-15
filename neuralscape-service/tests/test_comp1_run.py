@@ -843,7 +843,7 @@ def no_calls(monkeypatch):
     return comp1_realservice
 
 
-@pytest.mark.parametrize("project", ["neuralscape", "NeuralScape", " neuralscape ", "", "   ", None, "nscampaign", "prod-comp1-x"])
+@pytest.mark.parametrize("project", ["neuralscape", "NeuralScape", " neuralscape ", "", "   ", None, "stackx", "prod-comp1-x"])
 def test_the_guard_refuses_the_production_project_an_empty_name_and_a_missing_prefix(no_calls, project) -> None:
     with pytest.raises(no_calls.UnsafeTarget):
         no_calls.check_project(project)
@@ -917,3 +917,98 @@ def test_the_flag_exits_zero_when_nothing_unexpected_was_recorded(tmp_path: Path
     monkeypatch.setattr(comp1_run, "surface", lambda tree: {})
     assert _cli(tmp_path, tmp_path, tmp_path, "--fail-on-unexpected") == 0
     assert "unexpected_failure" not in (tmp_path / "out" / "evidence.jsonl").read_text()
+
+
+# ── disposable-project allowlist, explicit extra prefixes, and project-scoped docker commands ──
+
+
+@pytest.fixture
+def prefixes(monkeypatch):
+    import comp1_realservice
+
+    monkeypatch.setattr(comp1_realservice, "_EXTRA_PREFIXES", [])
+    return comp1_realservice
+
+
+@pytest.mark.parametrize("name", ["NeuralScape", "NEURALSCAPE", "  neuralscape\n", "neuralscape-x", "myproj", "my-comp1-x", "stackx", "stackx-x"])
+def test_names_outside_the_default_allowlist_and_the_production_name_are_refused(prefixes, name) -> None:
+    with pytest.raises(prefixes.UnsafeTarget):
+        prefixes.check_project(name)
+
+
+@pytest.mark.parametrize("name", ["nstest-1", "nstest-", "comp1-run", " comp1-run "])
+def test_the_default_allowlist_accepts_its_prefixes(prefixes, name) -> None:
+    assert prefixes.check_project(name) == name.strip()
+
+
+def test_a_prefix_added_by_option_is_accepted_and_matches_by_equality_or_prefix(prefixes) -> None:
+    prefixes.allow_prefixes(["stackx", "myproj-"])
+    for name in ("stackx", "stackx-x", "myproj-3"):
+        assert prefixes.check_project(name) == name
+    with pytest.raises(prefixes.UnsafeTarget):
+        prefixes.check_project("myproj")  # not equal and not prefixed
+    assert prefixes.check_project("other", extra=["other"]) == "other"
+
+
+@pytest.mark.parametrize("prefix", ["", "  ", "neuralscape", "NeuralScape-", "neuralscape-x"])
+def test_the_production_name_cannot_be_allowlisted(prefixes, prefix) -> None:
+    with pytest.raises(prefixes.UnsafeTarget):
+        prefixes.allow_prefixes([prefix])
+    with pytest.raises(prefixes.UnsafeTarget):
+        prefixes.check_project("neuralscape", extra=[prefix or "x"])
+
+
+def test_the_environment_cannot_add_a_prefix(prefixes, monkeypatch) -> None:
+    monkeypatch.setenv("COMP1_ALLOW_PROJECT_PREFIX", "myproj")
+    monkeypatch.setenv("ALLOW_PROJECT_PREFIX", "myproj")
+    with pytest.raises(prefixes.UnsafeTarget):
+        prefixes.check_project("myproj-1")
+
+
+def test_every_compose_command_is_scoped_to_the_project_and_unscoped_subcommands_are_refused(prefixes, monkeypatch) -> None:
+    seen = []
+
+    class Done:
+        stdout = "127.0.0.1:6333\n"
+
+    monkeypatch.setattr(prefixes.subprocess, "run", lambda cmd, **k: seen.append(cmd) or Done())
+    prefixes._compose(" comp1-x ", "f.yml", "stop", "qdrant")
+    prefixes._compose("comp1-x", "f.yml", "start", "qdrant")
+    prefixes._compose("comp1-x", "f.yml", "ps")
+    assert prefixes._port("comp1-x", "f.yml", "redis", 6379) == "127.0.0.1:6333"
+    assert len(seen) == 4
+    for cmd in seen:
+        assert cmd[:5] == ["docker", "compose", "-p", "comp1-x", "-f"], cmd  # trimmed name, always -p scoped
+    seen.clear()
+    for forbidden in (("stats",), ("inspect", "x"), ("exec", "x"), ()):
+        with pytest.raises(prefixes.UnsafeTarget):
+            prefixes._compose("comp1-x", "f.yml", *forbidden)
+    assert seen == []  # refused before docker was spawned
+
+
+def test_the_runner_accepts_an_extra_prefix_only_by_option_and_hands_it_to_the_probe(tmp_path: Path, monkeypatch, capsys) -> None:
+    calls = []
+
+    def fake(tree, project, compose_file, extra=None):
+        calls.append((project, extra))
+        return _canned("baseline" if "base" in project else "candidate")
+
+    monkeypatch.setattr(comp1_run, "realservice", fake)
+    monkeypatch.setattr(comp1_run.persona_evidence, "run", lambda *a, **k: [])
+    monkeypatch.setattr(comp1_run, "surface", lambda tree: {})
+    monkeypatch.setattr(comp1_run, "run_reproductions", lambda *a, **k: ({}, ""))
+    common = ["--compose-project-baseline", "myproj-base", "--compose-project-candidate", "myproj-cand", "--compose-file", "c.yml"]
+    inputs = _inputs(tmp_path)
+    assert _cli(tmp_path, tmp_path, tmp_path, *common, inputs=inputs) == 2  # not allowed without the option
+    assert "not a disposable one" in capsys.readouterr().err and calls == []
+    assert _cli(tmp_path, tmp_path, tmp_path, *common, "--allow-project-prefix", "myproj-", inputs=inputs) == 0
+    assert calls == [("myproj-base", ["--allow-project-prefix", "myproj-"]), ("myproj-cand", ["--allow-project-prefix", "myproj-"])]
+
+
+def test_the_real_service_main_takes_extra_prefixes_from_the_command_line(prefixes, tmp_path: Path, monkeypatch, capsys) -> None:
+    base = ["x", "--service-dir", str(tmp_path), "--compose-file", "f.yml", "--compose-project", "myproj-1"]
+    monkeypatch.setattr(prefixes, "_port", lambda *a: "10.1.2.3:1")  # stops after the project check, before any API
+    monkeypatch.setattr(prefixes.sys, "argv", base)
+    assert prefixes.main() == 2 and "not a disposable one" in capsys.readouterr().err
+    monkeypatch.setattr(prefixes.sys, "argv", [*base, "--allow-project-prefix", "myproj-"])
+    assert prefixes.main() == 2 and "loopback" in capsys.readouterr().err  # past the project check, refused on the address

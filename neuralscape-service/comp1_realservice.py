@@ -3,7 +3,8 @@
   python comp1_realservice.py --service-dir DIR --compose-project NAME --compose-file FILE
 
 Starts the target tree's API (its own interpreter, its own code, a free loopback port) against the
-disposable stores of one compose project, then observes:
+disposable stores of one compose project (a disposable name only: see ``check_project``; every docker
+call is scoped to it with ``-p`` and the harness never lists, inspects or reads stats of other containers), then observes:
 
 * ``readiness``: what ``/health`` reports with every store up, and again with the vector store
   container stopped (the store is really unreachable, not a fake);
@@ -29,19 +30,35 @@ import urllib.request
 from pathlib import Path
 
 
-DISPOSABLE_PREFIX = "comp1-"
+# Names of disposable stacks the harness may touch: ``name == prefix`` or ``name.startswith(prefix)``.
+# More prefixes come only from an explicit ``--allow-project-prefix`` option, never from the environment.
+DEFAULT_PROJECT_PREFIXES = ("nstest-", "comp1-")
 _LOOPBACK = {"127.0.0.1", "::1", "localhost"}
+_EXTRA_PREFIXES: list[str] = []
+_COMPOSE_SUBCOMMANDS = {"port", "stop", "start", "ps"}  # every one is scoped to the project by ``-p``
 
 
 class UnsafeTarget(Exception):
     """A compose project or address the harness must never touch."""
 
 
-def check_project(project: str | None) -> str:
+def allow_prefixes(prefixes: list[str] | tuple[str, ...]) -> None:
+    """Add disposable-project prefixes named on the command line (never the production project)."""
+
+    for prefix in prefixes:
+        text = prefix.strip()
+        if not text or text.lower().startswith("neuralscape"):
+            raise UnsafeTarget(f"not an acceptable disposable project prefix: {prefix!r}")
+        if text not in _EXTRA_PREFIXES:
+            _EXTRA_PREFIXES.append(text)
+
+
+def check_project(project: str | None, extra: list[str] | tuple[str, ...] = ()) -> str:
     """The project name when it is a disposable one; otherwise refuse before any docker call.
 
-    The production project is never a valid target, and only names with the harness's own
-    disposable prefix are accepted, so a typo cannot stop or write into a long-lived stack.
+    The production project is never valid (any case, after trimming).  Any other name must equal or
+    start with one of the allowed disposable prefixes, so a typo cannot stop or write into a stack
+    that is not a throwaway one.
     """
 
     name = (project or "").strip()
@@ -49,8 +66,9 @@ def check_project(project: str | None) -> str:
         raise UnsafeTarget("the compose project name is empty")
     if name.lower() == "neuralscape":
         raise UnsafeTarget("the compose project 'neuralscape' is the production project: refused")
-    if not name.startswith(DISPOSABLE_PREFIX):
-        raise UnsafeTarget(f"the compose project must start with {DISPOSABLE_PREFIX!r} (a disposable stack): {name!r}")
+    prefixes = (*DEFAULT_PROJECT_PREFIXES, *_EXTRA_PREFIXES, *extra)
+    if not any(name == prefix or name.startswith(prefix) for prefix in prefixes):
+        raise UnsafeTarget(f"the compose project {name!r} is not a disposable one (allowed prefixes: {', '.join(prefixes)})")
     return name
 
 
@@ -71,9 +89,11 @@ def _free_port() -> int:
 
 
 def _compose(project: str, file: str, *args: str) -> str:
-    check_project(project)
-    done = subprocess.run(
-        ["docker", "compose", "-p", project, "-f", file, *args],
+    name = check_project(project)
+    if not args or args[0] not in _COMPOSE_SUBCOMMANDS:
+        raise UnsafeTarget(f"the compose subcommand {args[:1]!r} is not one the harness uses")
+    done = subprocess.run(  # always scoped to the project with -p: no unscoped listing, stats or inspect
+        ["docker", "compose", "-p", name, "-f", file, *args],
         capture_output=True, text=True, check=True, timeout=180,
     )
     return done.stdout.strip()
@@ -219,6 +239,8 @@ def main() -> int:
     parser.add_argument("--service-dir", required=True)
     parser.add_argument("--compose-project", required=True)
     parser.add_argument("--compose-file", required=True)
+    parser.add_argument("--allow-project-prefix", action="append", default=[],
+                        help="an extra disposable compose-project prefix (repeatable; never read from the environment)")
     parser.add_argument("--extra-env", action="append", default=[], help="KEY=VALUE for the API")
     parser.add_argument("--tokens", default="", help="JSON file mapping user id to bearer token")
     parser.add_argument("--write-visibility", default="", help="send this visibility on every write")
@@ -229,6 +251,7 @@ def main() -> int:
         _TOKENS.update(json.loads(Path(args.tokens).read_text()))
     service_dir = Path(args.service_dir).resolve()
     try:
+        allow_prefixes(args.allow_project_prefix)
         project, file = check_project(args.compose_project), args.compose_file
     except UnsafeTarget as refusal:
         print(f"error: {refusal}", file=sys.stderr)
