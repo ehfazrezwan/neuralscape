@@ -157,6 +157,10 @@ class TestSharedKeyStatus:
     async def test_shared_key_reads_any_task(self, tm, monkeypatch, route):
         monkeypatch.setattr(settings, "neuralscape_user_token_secret", SECRET)
         monkeypatch.setattr(settings, "neuralscape_api_key", SHARED_KEY)
+        # These tests cover the shared key WITHOUT a bound identity, i.e. the
+        # NEURALSCAPE_LEGACY_KEY_TRUST_BODY_USER_ID opt-out. The default
+        # (bound identity) is covered in tests/test_legacy_key_identity.py.
+        monkeypatch.setattr(settings, "neuralscape_legacy_key_trust_body_user_id", True)
         task_id = await _alice_task(tm)
         resp = TestClient(app).get(route.format(task_id), headers={"Authorization": f"Bearer {SHARED_KEY}"})
         assert resp.status_code == 200
@@ -397,17 +401,23 @@ class TestConversationCompilerTasks:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("path,body", [("/flush", FLUSH), ("/compile", {})])
-    async def test_task_for_another_user_has_no_owner(self, compiler, per_user_auth, path, body):
-        """A token holder naming another user in the body owns nothing: fail closed."""
+    async def test_body_naming_another_user_is_refused(self, compiler, per_user_auth, path, body):
+        """A token holder naming another user in the body is refused (400) and
+        nothing is enqueued (previously it enqueued into the other user's
+        namespace and merely declined to record an owner)."""
+        compiler.pool.enqueue_job.reset_mock()
         resp = TestClient(app).post(self.PREFIX + path, json={**body, "user_id": "bob"}, headers=_bearer("alice"))
-        task_id = resp.json()["task_id"]
-        assert not await compiler.is_task_owner(task_id, "alice")
-        assert not await compiler.is_task_owner(task_id, "bob")
+        assert resp.status_code == 400
+        compiler.pool.enqueue_job.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_shared_key_records_body_user(self, compiler, monkeypatch):
         monkeypatch.setattr(settings, "neuralscape_user_token_secret", SECRET)
         monkeypatch.setattr(settings, "neuralscape_api_key", SHARED_KEY)
+        # These tests cover the shared key WITHOUT a bound identity, i.e. the
+        # NEURALSCAPE_LEGACY_KEY_TRUST_BODY_USER_ID opt-out. The default
+        # (bound identity) is covered in tests/test_legacy_key_identity.py.
+        monkeypatch.setattr(settings, "neuralscape_legacy_key_trust_body_user_id", True)
         resp = TestClient(app).post(
             self.PREFIX + "/flush",
             json={**self.FLUSH, "user_id": "alice"},
@@ -440,6 +450,8 @@ class TestDreamSweepTasks:
         from extensions.dreaming.config import dreaming_settings
 
         monkeypatch.setattr(dreaming_settings, "enabled", True)
+        # /run is dictator-only: alice is the admin in these tests.
+        monkeypatch.setattr(settings, "dictator_user_ids", "alice")
         monkeypatch.setattr(arq, "create_pool", AsyncMock(return_value=ptm.pool))
         mounted(DreamingExtension().get_routes(), "/v1/extensions/dreaming")
         return ptm
@@ -462,6 +474,7 @@ class TestDreamSweepTasks:
         from extensions.dreaming.config import dreaming_settings
 
         monkeypatch.setattr(dreaming_settings, "enabled", True)
+        monkeypatch.setattr(settings, "dictator_user_ids", "alice")
         monkeypatch.setattr(mcp_server, "_arq_pool", ptm.pool)
         token = current_user_id.set("alice")
         try:
@@ -480,6 +493,8 @@ def _shared_key_auth(monkeypatch):
     """Shared key and per-user tokens both accepted (a mixed deployment)."""
     monkeypatch.setattr(settings, "neuralscape_user_token_secret", SECRET)
     monkeypatch.setattr(settings, "neuralscape_api_key", SHARED_KEY)
+    # Opt-out: the shared key trusts the body user_id (no bound identity).
+    monkeypatch.setattr(settings, "neuralscape_legacy_key_trust_body_user_id", True)
     return {"Authorization": f"Bearer {SHARED_KEY}"}
 
 

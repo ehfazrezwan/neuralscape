@@ -22,24 +22,40 @@ from main import app
 TEST_API_KEY = "test-secret-key-12345"
 
 
+def settings_default_user() -> str:
+    """The identity the legacy shared key is bound to when no override is set."""
+    from config import settings
+    return settings.legacy_key_identity()
+
+
 @pytest.fixture(autouse=True)
 def mock_memory():
-    """Patch lazy-init globals so no real mem0/Graphiti is created."""
-    original_memory = main._memory
-    original_graphiti = main._graphiti
-    original_bridge = main._bridge
+    """Patch the shared MemoryService so no real mem0/Graphiti is created.
+
+    The legacy root routes run through ``main._service`` like every /v1 route,
+    so the stand-in returns the empty shapes those routes serialize.
+    """
+    original_service = main._service
     original_async_memory = main._async_memory
 
-    main._memory = MagicMock(name="Memory")
-    main._graphiti = MagicMock(name="Graphiti")
-    main._bridge = MagicMock(name="AsyncBridge")
+    svc = MagicMock(name="MemoryService")
+    svc.extract_and_store.return_value = []
+    svc.search.return_value = []
+    svc.list_memories.return_value = []
+    svc.delete_memories.return_value = {"message": "ok"}
+    svc.get_graph_nodes.return_value = []
+    svc.get_graph_edges.return_value = []
+    svc.get_graph_episodes.return_value = []
+    svc.get_graph_communities.return_value = []
+    svc.search_graph.return_value = {
+        "edges": [], "nodes": [], "episodes": [], "communities": [],
+    }
+    main._service = svc
     main._async_memory = None
 
-    yield
+    yield svc
 
-    main._memory = original_memory
-    main._graphiti = original_graphiti
-    main._bridge = original_bridge
+    main._service = original_service
     main._async_memory = original_async_memory
 
 
@@ -134,7 +150,7 @@ class TestAuthEnabled:
         client = TestClient(app, raise_server_exceptions=False)
         resp = client.get(
             "/v1/memories",
-            params={"user_id": "test"},
+            params={"user_id": settings_default_user()},
             headers={"Authorization": f"Bearer {TEST_API_KEY}"},
         )
         assert resp.status_code == 200
@@ -301,7 +317,7 @@ class TestLegacyKeyWithDotFallsBack:
         client = TestClient(app, raise_server_exceptions=False)
         resp = client.get(
             "/v1/memories",
-            params={"user_id": "test"},
+            params={"user_id": settings_default_user()},
             headers={"Authorization": "Bearer legacy-key.with.dots"},
         )
         assert resp.status_code == 200, (

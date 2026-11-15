@@ -1,6 +1,7 @@
 """Identity, fallback, schema, score, and resource inference invariants."""
 
 import math
+import sys
 
 import pytest
 from pydantic import BaseModel, ValidationError
@@ -1778,29 +1779,21 @@ def _array_schema():
 
 
 def test_a_proposal_output_that_reuses_a_subtree_exponentially_is_refused_quickly():
-    import time
-
     request = generation_request(schema=_array_schema())
     proposal = {
         "proposal_id": "proposal-1", "output": _aliased(22), "support_span_ids": ("support-1",),
         "machine_authored": True,
     }
     result = generation_result().model_copy(update={"proposals": (proposal,)})
-    started = time.monotonic()
-    with pytest.raises(ValueError, match="native discovery budget"):
+    with _PythonCalls(20_000), pytest.raises(ValueError, match="native discovery budget"):
         validate_generation_result(request, result)
-    assert time.monotonic() - started < 2.0  # 2**22 paths took about 14 s to walk before
 
 
 def test_a_declared_output_schema_that_reuses_a_subtree_exponentially_is_refused_quickly():
-    import time
-
     request = generation_request()
     schema = {**request.output_schema, "examples": [_aliased(22)]}
-    started = time.monotonic()
-    with pytest.raises(ValueError, match="native discovery budget"):
+    with _PythonCalls(20_000), pytest.raises(ValueError, match="native discovery budget"):
         validate_generation_result(request.model_copy(update={"output_schema": schema}), generation_result())
-    assert time.monotonic() - started < 2.0
 
 
 def test_modest_reuse_and_large_ordinary_json_are_still_accepted():
@@ -1823,8 +1816,6 @@ def _proposals(output, count, *, same_object=False):
 
 
 def test_many_proposals_sharing_one_admitted_expansion_are_refused_by_one_call_allowance():
-    import time
-
     from contracts_limits import DISCOVERY_BUDGET_MESSAGE
 
     request = generation_request(schema=_array_schema())
@@ -1832,10 +1823,8 @@ def test_many_proposals_sharing_one_admitted_expansion_are_refused_by_one_call_a
     validate_generation_result(request, generation_result().model_copy(update={"proposals": _proposals(shared, 1)}))
     for count, same in ((3, False), (60, False), (5_000, False), (100_000, True)):
         result = generation_result().model_copy(update={"proposals": _proposals(shared, count, same_object=same)})
-        started = time.monotonic()
-        with pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):
+        with _PythonCalls(20_000 + 40 * count), pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):
             validate_generation_result(request, result)
-        assert time.monotonic() - started < 10, (count, same)
 
 
 def test_large_flat_json_is_still_accepted_alone_and_the_allowance_spans_the_call():
@@ -1929,6 +1918,74 @@ def test_generation_uuid_format_requires_the_canonical_form(value):
         validate_generation_result(request, generation_result(output={"id": value}))
 
 
+
+class _WorkCapExceeded(BaseException):
+    """Raised inside the code under test the moment it makes more Python calls than the cap allows."""
+
+
+class _PythonCalls:
+    """Counts the Python function calls made inside the block and stops the run past ``cap``.
+
+    The bounded-work tests assert how much work is done (a count derived from the input), not how long it
+    takes on whatever machine runs the suite: a count is the same on a loaded two-CPU gate and a laptop, and
+    when the bound is broken the cap ends the run at once instead of letting it grind for minutes.
+    """
+
+    def __init__(self, cap: int) -> None:
+        self.cap = cap
+        self.calls = 0
+        self._previous = None
+
+    def __enter__(self) -> "_PythonCalls":
+        def count(frame, event, arg):
+            if event == "call":
+                self.calls += 1
+                if self.calls > self.cap:
+                    raise _WorkCapExceeded(f"more than {self.cap} Python calls: the work is not bounded")
+
+        self._previous = sys.getprofile()
+        sys.setprofile(count)
+        return self
+
+    def __exit__(self, *exc_info) -> bool:
+        sys.setprofile(self._previous)
+        return False
+
+
+
+class _MeterSpend:
+    """Records what each schema-execution meter was charged while the block runs (the code's own budget)."""
+
+    def __enter__(self) -> "_MeterSpend":
+        from unittest import mock
+
+        self.spent: dict[int, int] = {}
+        self.largest = 0
+        meter_class = contracts_inference._SchemaExecutionMeter
+        original = meter_class.charge
+        spy = self
+
+        def charge(meter, units):
+            spy.spent[id(meter)] = spy.spent.get(id(meter), 0) + units
+            spy.largest = max(spy.largest, units)
+            original(meter, units)
+
+        self._patch = mock.patch.object(meter_class, "charge", charge)
+        self._patch.start()
+        return self
+
+    def __exit__(self, *exc_info) -> bool:
+        self._patch.stop()
+        return False
+
+    def assert_refused_at_the_limit(self) -> None:
+        """One meter ran out, and was stopped at its first charge past the limit: no work beyond the budget."""
+
+        limit = contracts_inference.MAX_SCHEMA_EXECUTION_UNITS
+        total = max(self.spent.values(), default=0)
+        assert limit < total <= limit + self.largest, (total, limit, self.largest)
+
+
 def _generation_with_output(output, **properties):
     request = generation_request(schema=output_schema(properties=properties, required=list(properties)))
     result = generation_result(output={"placeholder": "x"})
@@ -2018,8 +2075,6 @@ def test_a_non_text_key_in_native_storage_is_refused_without_running_its_hooks()
 def test_a_shared_typed_collection_is_charged_for_every_occurrence_revalidation_walks():
     """3,000 heads sharing one tuple of 3,000 candidate ids: one tuple to discovery, 9M entries to revalidation."""
 
-    import time
-
     from contracts_limits import DISCOVERY_BUDGET_MESSAGE
 
     count = 3_000
@@ -2034,10 +2089,8 @@ def test_a_shared_typed_collection_is_charged_for_every_occurrence_revalidation_
         schema_version=VERSION, request_id="request-1", fallback_granularity=FallbackGranularity.WHOLE_BATCH,
         publishable=False, head_results=(abstained("head-0"),), attempts=(),
     )
-    started = time.monotonic()
-    with pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):
+    with _PythonCalls(1_500_000), pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):
         validate_decision_batch_result(request, result)
-    assert time.monotonic() - started < 2
 
 
 def test_a_shared_typed_collection_within_the_allowance_still_validates():
@@ -2057,28 +2110,23 @@ def test_a_shared_typed_collection_within_the_allowance_still_validates():
 def test_many_references_to_one_wide_list_are_sized_once():
     """40,000 references to one 40,000-element list: the size memo is consulted before the list is copied."""
 
-    import time
-
     wide = list(range(40_000))
     request, result = _generation_with_output({"v": [wide] * 40_000}, v={"type": "array"})
-    started = time.monotonic()
-    with pytest.raises(ValueError):
+    with _PythonCalls(5_000_000), pytest.raises(ValueError):
         validate_generation_result(request, result)
-    assert time.monotonic() - started < 1.5
 
 
 def test_a_shared_source_text_costs_little_per_occurrence():
-    """One 2 MB source text shared by 100 source entries: each occurrence is revalidated."""
+    """One 2 MB source text shared by 100 source entries: every occurrence is charged for the text it holds,
+    so the call is refused by the allowance (about 4,000 Python calls), before any occurrence is revalidated."""
 
-    import time
+    from contracts_limits import DISCOVERY_BUDGET_MESSAGE
 
     request = decision_request()
     request.__dict__["sources"] = (source_evidence(text="a" * 2_000_000),) * 100
     result = DecisionResult(schema_version=VERSION, request_id="request-1", head_result=selected(), attempts=(usage(),))
-    started = time.monotonic()
-    with pytest.raises(ValueError):  # two versions of one record: refused after revalidation
+    with _PythonCalls(20_000), pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):
         validate_decision_result(request, result)
-    assert time.monotonic() - started < 2
 
 
 def test_a_long_string_repeated_in_a_json_value_is_charged_for_every_occurrence():
@@ -2099,16 +2147,12 @@ def test_one_long_distinct_string_is_still_accepted():
 def test_a_long_scalar_output_shared_by_many_proposals_is_charged_for_every_occurrence():
     """1,000 proposals sharing one 1 MiB scalar output: no containers, but every occurrence is scanned."""
 
-    import time
-
     from contracts_limits import DISCOVERY_BUDGET_MESSAGE
 
     request, result = _generation_with_output("x" * (1 << 20), v={"type": "string"})
     result.__dict__["proposals"] = result.proposals * 1_000
-    started = time.monotonic()
-    with pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):
+    with _PythonCalls(40_000), pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):
         validate_generation_result(request, result)
-    assert time.monotonic() - started < 2
 
 
 def test_a_long_scalar_output_used_once_is_charged_once_and_admitted_to_validation():
@@ -2141,14 +2185,11 @@ def test_repeated_string_subclass_leaves_are_charged_like_strings():
 def test_unique_items_over_many_distinct_objects_is_checked_in_linear_time():
     """8,000 distinct objects under uniqueItems: jsonschema's object fallback compares every pair."""
 
-    import time
-
     request, result = _generation_with_output(
         {"v": [{"id": index} for index in range(8_000)]}, v={"type": "array", "uniqueItems": True}
     )
-    started = time.monotonic()
-    assert validate_generation_result(request, result).compliant
-    assert time.monotonic() - started < 2
+    with _PythonCalls(4_000_000):
+        assert validate_generation_result(request, result).compliant
 
 
 @pytest.mark.parametrize(
@@ -2177,59 +2218,46 @@ def test_unique_items_keeps_json_schema_equality(items, unique):
 def test_a_schema_whose_work_multiplies_with_the_output_is_refused_in_bounded_time():
     """300 subschemas applied to each of 3,000 items: both fit the input budgets, the product does not."""
 
-    import time
-
     request, result = _generation_with_output(
         {"v": list(range(3_000))},
         v={"type": "array", "items": {"allOf": [{"type": "number"}] * 300}},
     )
-    started = time.monotonic()
-    with pytest.raises(ValueError, match="schema execution"):
+    with _PythonCalls(12_000_000), _MeterSpend() as meter, pytest.raises(ValueError, match="schema execution"):
         validate_generation_result(request, result)
-    assert time.monotonic() - started < 3  # about 10 s when execution was unbounded
+    meter.assert_refused_at_the_limit()  # 900,000 keyword applications were asked for; the budget stopped it
 
 
 def test_a_large_enum_applied_to_many_items_is_refused_in_bounded_time():
-    import time
-
     allowed = [{"id": index} for index in range(3_000)]
     request, result = _generation_with_output(
         {"v": [{"id": index} for index in range(3_000)]},
         v={"type": "array", "items": {"enum": allowed}},
     )
-    started = time.monotonic()
-    with pytest.raises(ValueError, match="schema execution"):
+    with _PythonCalls(3_000_000), _MeterSpend() as meter, pytest.raises(ValueError, match="schema execution"):
         validate_generation_result(request, result)
-    assert time.monotonic() - started < 2
+    meter.assert_refused_at_the_limit()
 
 
 def test_checking_a_very_large_schema_against_the_meta_schema_is_bounded():
     """The meta-schema applies dozens of keywords to every schema node: a schema near the input allowance
     took tens of seconds to check, before any output was looked at."""
 
-    import time
-
-    started = time.monotonic()
-    with pytest.raises((ValidationError, ValueError), match="schema execution"):
+    with _PythonCalls(1_500_000), pytest.raises((ValidationError, ValueError), match="schema execution"):
         generation_request(
             schema=output_schema(properties={"v": {"allOf": [{"type": "number"}] * 20_000}}, required=["v"])
         )
-    assert time.monotonic() - started < 3
 
 
 def test_a_nested_dialect_declaration_does_not_escape_the_execution_budget():
     """A subschema declaring $schema ran on jsonschema's own validator, outside the meter."""
 
-    import time
-
     nested = {"$schema": contracts_inference.JSON_SCHEMA_DIALECT, "type": "number"}
     request, result = _generation_with_output(
         {"v": list(range(3_000))}, v={"type": "array", "items": {"allOf": [nested] * 300}}
     )
-    started = time.monotonic()
-    with pytest.raises(ValueError, match="schema execution"):
+    with _PythonCalls(12_000_000), _MeterSpend() as meter, pytest.raises(ValueError, match="schema execution"):
         validate_generation_result(request, result)
-    assert time.monotonic() - started < 3
+    meter.assert_refused_at_the_limit()
 
 
 def test_data_that_looks_like_a_dialect_declaration_is_kept():
@@ -2249,34 +2277,31 @@ def _enum_shape(entries: int, items: int, width: int):
     return _generation_with_output({"v": values}, v={"type": "array", "items": {"enum": allowed}})
 
 
-def _enum_and_input_only_seconds(entries: int, items: int, width: int):
-    """Seconds to validate the shape with the list as an enum, and with the same list as ``examples`` (the input
-    budgets and contract checks alone, which are not what is bounded here), and the enum run's outcome."""
-
-    import time
+def _enum_and_input_only_calls(entries: int, items: int, width: int):
+    """Python calls to validate the shape with the list as an enum, and with the same list as ``examples`` (the
+    input budgets and contract checks alone, which are not what is bounded here), and the enum run's outcome."""
 
     allowed = [[0] * width + [j] for j in range(entries)]
     values = [[0] * width + [entries - 1] for _ in range(items)]
     request, result = _generation_with_output({"v": values}, v={"type": "array", "items": {"examples": allowed}})
-    started = time.monotonic()
-    validate_generation_result(request, result)
-    baseline = time.monotonic() - started
-    request, result = _enum_shape(entries, items, width)
-    started = time.monotonic()
-    try:
+    with _PythonCalls(40_000_000) as input_only:
         validate_generation_result(request, result)
-        outcome = None
-    except ValueError as error:
-        outcome = str(error)
-    return time.monotonic() - started, baseline, outcome
+    request, result = _enum_shape(entries, items, width)
+    outcome = None
+    with _PythonCalls(40_000_000) as with_enum:
+        try:
+            validate_generation_result(request, result)
+        except ValueError as error:
+            outcome = str(error)
+    return with_enum.calls, input_only.calls, outcome
 
 
 def test_an_enum_whose_entries_hide_their_size_is_refused_in_bounded_time():
-    elapsed, baseline, outcome = _enum_and_input_only_seconds(entries=1_000, items=1_000, width=60)
+    calls, baseline, outcome = _enum_and_input_only_calls(entries=1_000, items=1_000, width=60)
     assert outcome is not None and "schema execution" in outcome
-    # The execution share (elapsed minus the input-only cost) was about 5-7 s before the nodes were charged;
-    # the refusal is the deterministic assertion, the bound is relative to the same machine's baseline.
-    assert elapsed - baseline < 2.5
+    # The execution share (the enum run's calls minus the input-only run's) was about 5-7 s before the nodes
+    # were charged; the refusal is one assertion, the other is the work done before it, counted.
+    assert calls - baseline < 4_000_000
 
 
 def test_a_modest_enum_over_nested_entries_still_validates():
@@ -3079,13 +3104,10 @@ def test_a_regex_longer_than_the_limit_is_refused_before_it_is_compiled(monkeypa
 
 
 def test_the_worst_regex_inside_the_limit_compiles_in_bounded_time():
-    import time
-
     half = (contracts_inference.MAX_REGEX_CHARACTERS - 7) // 2
     pattern = "(?:" + "a" * half + "b|" + "a" * half + "c)"
-    started = time.monotonic()
-    assert _errors({"format": "regex"}, pattern) == []
-    assert time.monotonic() - started < 0.5  # 8 KiB of shared prefixes: about 12 ms; the unbounded form took seconds
+    with _PythonCalls(300_000):
+        assert _errors({"format": "regex"}, pattern) == []
 
 
 def test_numeric_bound_charges_double_with_the_size_of_the_integers():
