@@ -2849,12 +2849,22 @@ async def v1_patch_memory(memory_id: str, req: PatchMemoryRequest, request: Requ
             graph = "enqueue_failed"
 
     mem = result.get("memory")
-    return {
+    response = {
         "status": "ok",
         "memory": mem.model_dump(exclude_none=True) if mem is not None else None,
         "graph": graph,
         "graph_task_id": graph_task_id,
     }
+    sibling_jobs = result.get("sibling_graph_jobs") or []
+    if sibling_jobs or result.get("sibling_graph_unrepaired_ids"):
+        # A partition migration expired the moved fact's whole conversation
+        # episode; re-ingest the surviving sibling facts (additive keys).
+        queued = await _enqueue_graph_jobs_safe(sibling_jobs) if sibling_jobs else {}
+        response["sibling_graph_jobs_enqueued"] = queued.get("graph_jobs_enqueued", 0)
+        response["sibling_graph_jobs_not_enqueued_ids"] = queued.get("graph_jobs_not_enqueued_ids", [])
+        response["sibling_graph_unrepaired_ids"] = result.get("sibling_graph_unrepaired_ids", [])
+        response["sibling_graph_repair_failed"] = bool(result.get("sibling_graph_repair_failed"))
+    return response
 
 
 @v1_router.post("/memories/retag", status_code=202)
@@ -2889,7 +2899,11 @@ async def v1_retag_memories(req: RetagRequest, request: Request):
             ) from e
         logger.warning(f"Redis unavailable, running retag synchronously: {e}")
         result = await asyncio.to_thread(_service.retag_memories, caller, filters, ops, False)
-        result.pop("graph_jobs", None)
+        # No queue: the re-ingests (moved rows + sibling facts) cannot run
+        # now — report which memories still need one instead of dropping them.
+        result["graph_jobs_not_enqueued_ids"] = [
+            j.get("memory_id") for j in result.pop("graph_jobs", [])
+        ]
         return JSONResponse(status_code=200, content=result)
 
     return TaskAcceptedResponse(
@@ -2907,12 +2921,45 @@ async def v1_delete_memory(memory_id: str, request: Request):
     """
     caller = _resolve_user_id(request, None)
     try:
-        return await asyncio.to_thread(_service.delete_memory, memory_id, caller)
+        result = await asyncio.to_thread(_service.delete_memory, memory_id, caller)
     except PermissionError as pe:
         raise HTTPException(status_code=403, detail=str(pe)) from pe
+    except LookupError as le:
+        raise HTTPException(status_code=404, detail="Memory not found") from le
     except Exception:
         logger.exception("v1 delete_memory failed")
         raise HTTPException(status_code=500, detail="Failed to delete memory")
+    return await _enqueue_sibling_graph_jobs(result)
+
+
+async def _enqueue_graph_jobs_safe(jobs: list[dict]) -> dict:
+    """Enqueue sibling re-enrichment jobs; never raises (the delete/edit that
+    produced them has already succeeded). Returns enqueued count + the memory
+    ids whose re-ingest was NOT queued (e.g. Redis down)."""
+    try:
+        return await _task_manager.enqueue_graph_jobs(jobs)
+    except Exception as e:
+        logger.warning(f"Sibling graph re-enrichment could not be queued (non-critical): {e}")
+        return {
+            "graph_jobs_enqueued": 0,
+            "graph_jobs_not_enqueued_ids": [j.get("memory_id") for j in jobs],
+        }
+
+
+async def _enqueue_sibling_graph_jobs(result):
+    """Enqueue the sibling re-enrichment jobs a delete produced.
+
+    Deleting a fact that shared a conversation's graph episode expires the
+    whole episode; the surviving siblings come back as ``graph_jobs`` and are
+    re-ingested on the graph queue. The (potentially large) job payloads are
+    replaced by counts in the response.
+    """
+    if not isinstance(result, dict):
+        return result
+    jobs = result.pop("graph_jobs", None)
+    if jobs:
+        result.update(await _enqueue_graph_jobs_safe(jobs))
+    return result
 
 
 @v1_router.delete("/memories")
@@ -2920,7 +2967,7 @@ async def v1_bulk_delete_memories(req: BulkDeleteRequest, request: Request):
     """Bulk delete memories with filters."""
     user_id = _resolve_user_id(request, req.user_id)
     try:
-        return await asyncio.to_thread(
+        result = await asyncio.to_thread(
             _service.delete_memories,
             user_id=user_id,
             scope=req.scope,
@@ -2934,6 +2981,7 @@ async def v1_bulk_delete_memories(req: BulkDeleteRequest, request: Request):
     except Exception as e:
         logger.exception("v1 bulk_delete failed")
         raise HTTPException(status_code=500, detail="Failed to delete memories")
+    return await _enqueue_sibling_graph_jobs(result)
 
 
 @v1_router.get("/categories", response_model=CategoryListResponse)
