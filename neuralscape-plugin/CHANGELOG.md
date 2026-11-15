@@ -4,6 +4,20 @@ All notable changes to the `neuralscape` Claude plugin are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 the project adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.9.7] - 2026-11-16
+
+### Fixed
+- The UserPromptSubmit compile instruction told Claude to call `remember` once per memory, contradicting the `compile-observations` skill (one `checkpoint` call for 3 or more memories, `remember` for 1-2). It now states the same rule and points at the skill for the rubric and the field list instead of repeating them.
+- The instruction was re-injected on every prompt until the buffer was truncated, so an ignored or still-running compile re-prompted every turn. It is now injected once per threshold crossing: a marker next to the buffer (`<buffer>.jsonl.compile-armed`) records the row count and time of the last injection, and it re-arms when the buffer grows by another `COMPILE_THRESHOLD`, when the last injection is `COMPILE_AGE_MIN` old, or after the buffer was truncated and refilled. Thresholds and defaults are unchanged.
+- `CONTEXT_MODE=full` skipped the resume-after-compaction block, the "Previously..." block and the identity cards. It now renders the same continuity blocks as the default index mode (standards, identity cards, "Resuming after compaction" on compact/resume/fork, "Previously..."), then the full text of the remaining memories within the existing 8000-character budget; the resume snapshot and the session note are not repeated in the list. The default stays `index`.
+- The adapter for the third-party agent framework dropped every real `message:sent` event: its documented payload carries the assistant text but no user message, and the shared noise filter skips turns with an empty user message. The adapter now remembers the user text from the `message:received` event (per session, consumed by the next `message:sent`) and pairs the two; `hooks/openclaw-hooks.json` subscribes to `message:received` as well. Turns were always global scope; the project now comes from a `workspaceDir` / `cwd` in the payload when there is one, or the `PROJECT_ID` override, and stays global otherwise. The manifest no longer uses the unconfirmed `${PLUGIN_ROOT}` variable (the README installs to `~/.openclaw/hooks/neuralscape/`, and the manifest uses that absolute path); what could not be verified against the framework's public docs is listed in the README.
+
+- Review fixes in the same release: the excluded-projects check of the framework adapter's hooks now uses the project the adapter files the turn under (it used the runner's cwd); the compile instruction re-arms after a truncate-and-refill that passes the old row count between two prompts (the marker records the first row's timestamp); `.compile-armed` markers are garbage-collected with the other per-session leftovers; the adapter's remembered inbound messages are written atomically, one file per message, with `<private>` spans redacted before they reach disk.
+
+### Added
+- README section "Server endpoints the plugin calls", and a test that fails when it differs from the `neuralscapeGet` / `neuralscapePost` call sites in `src/` or the REST paths the skills name.
+- Tests for the adapter (detection, turn extraction, session-end threshold, project resolution) and subprocess tests running the built `conversation-turn.js`, `session-end.js`, `user-prompt-submit.js` and `session-start.js` (with `CONTEXT_MODE=full`) against a fixture server.
+
 ## [2.9.6] - 2026-11-16
 
 ### Fixed
