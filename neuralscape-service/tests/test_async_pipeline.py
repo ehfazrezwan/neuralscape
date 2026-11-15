@@ -4,7 +4,8 @@ Prerequisites — these services must be running:
   - Redis on localhost:6379
   - Qdrant on localhost:6333
   - Neo4j on localhost:7687
-  - API server on localhost:8199  (uv run python main.py)
+  - API server on localhost:8199  (uv run python main.py), or NS_API_URL
+    (with NS_API_TOKEN as the Bearer token when the API enforces auth)
   - ARQ worker                    (uv run arq worker.WorkerSettings)
 
 Run:
@@ -16,31 +17,58 @@ Skip these automatically when the server isn't reachable by using the
 """
 
 import asyncio
+import os
 import time
 
 import httpx
 import pytest
 
-BASE_URL = "http://localhost:8199"
+BASE_URL = (os.environ.get("NS_API_URL") or "http://localhost:8199").rstrip("/")
+API_TOKEN = os.environ.get("NS_API_TOKEN", "")
+REQUIRED = os.environ.get("NS_INTEGRATION_REQUIRED", "").strip().lower() in {"1", "true", "yes", "on"}
 POLL_INTERVAL = 5  # seconds between status polls
 POLL_TIMEOUT = 300  # max seconds to wait for task completion (LLM + Neo4j writes are slow)
 
 
+def _auth(kwargs: dict) -> dict:
+    """Add the Bearer token (NS_API_TOKEN) when one is configured."""
+
+    if API_TOKEN:
+        headers = dict(kwargs.get("headers") or {})
+        headers.setdefault("Authorization", f"Bearer {API_TOKEN}")
+        kwargs = dict(kwargs, headers=headers)
+    return kwargs
+
+
+def _http_get(url, **kwargs):
+    return httpx.get(url, **_auth(kwargs))
+
+
+def _http_post(url, **kwargs):
+    return httpx.post(url, **_auth(kwargs))
+
+
 def server_is_reachable() -> bool:
     try:
-        r = httpx.get(f"{BASE_URL}/health", timeout=3)
+        r = _http_get(f"{BASE_URL}/health", timeout=3)
         return r.status_code == 200
     except Exception:
         return False
 
 
-pytestmark = [
-    pytest.mark.integration,
-    pytest.mark.skipif(
-        not server_is_reachable(),
-        reason="Neuralscape API server not reachable at localhost:8199",
-    ),
-]
+_REACHABLE = server_is_reachable()
+
+pytestmark = [pytest.mark.integration]
+if not _REACHABLE:
+    _REASON = f"Neuralscape API server not reachable at {BASE_URL}"
+    if REQUIRED:
+        # The VPS gate sets NS_INTEGRATION_REQUIRED=1: an unreachable API must
+        # fail, not skip.
+        @pytest.fixture(autouse=True)
+        def _api_required():
+            pytest.fail(f"NS_INTEGRATION_REQUIRED is set but {_REASON}", pytrace=False)
+    else:
+        pytestmark.append(pytest.mark.skip(reason=_REASON))
 
 
 def poll_until_done(task_id: str, base_path: str = "/v1/memories/status") -> dict:
@@ -48,7 +76,7 @@ def poll_until_done(task_id: str, base_path: str = "/v1/memories/status") -> dic
     url = f"{BASE_URL}{base_path}/{task_id}"
     deadline = time.time() + POLL_TIMEOUT
     while time.time() < deadline:
-        resp = httpx.get(url, timeout=10)
+        resp = _http_get(url, timeout=10)
         assert resp.status_code == 200
         data = resp.json()
         if data["status"] in ("completed", "failed"):
@@ -64,7 +92,7 @@ def poll_until_done(task_id: str, base_path: str = "/v1/memories/status") -> dic
 
 class TestHealth:
     def test_health_endpoint(self):
-        resp = httpx.get(f"{BASE_URL}/health", timeout=5)
+        resp = _http_get(f"{BASE_URL}/health", timeout=5)
         assert resp.status_code == 200
         assert resp.json()["status"] == "ok"
 
@@ -76,7 +104,7 @@ class TestHealth:
 
 class TestAsyncRawMemoryStore:
     def test_returns_202_with_task_id(self):
-        resp = httpx.post(
+        resp = _http_post(
             f"{BASE_URL}/v1/memories/raw",
             json={
                 "content": "Integration test: prefers 4-space indentation",
@@ -92,7 +120,7 @@ class TestAsyncRawMemoryStore:
         assert data["poll_url"].startswith("/v1/memories/status/")
 
     def test_task_completes_successfully(self):
-        resp = httpx.post(
+        resp = _http_post(
             f"{BASE_URL}/v1/memories/raw",
             json={
                 "content": "Integration test: uses vim keybindings",
@@ -115,7 +143,7 @@ class TestAsyncRawMemoryStore:
         assert mem["scope"] == "global"
 
     def test_rejects_invalid_category(self):
-        resp = httpx.post(
+        resp = _http_post(
             f"{BASE_URL}/v1/memories/raw",
             json={
                 "content": "test",
@@ -128,7 +156,7 @@ class TestAsyncRawMemoryStore:
         assert "Invalid category" in resp.json()["detail"]
 
     def test_rejects_project_scope_without_project_id(self):
-        resp = httpx.post(
+        resp = _http_post(
             f"{BASE_URL}/v1/memories/raw",
             json={
                 "content": "test",
@@ -149,7 +177,7 @@ class TestAsyncRawMemoryStore:
 
 class TestAsyncConversationExtraction:
     def test_returns_202_with_task_id(self):
-        resp = httpx.post(
+        resp = _http_post(
             f"{BASE_URL}/v1/memories",
             json={
                 "messages": [
@@ -166,7 +194,7 @@ class TestAsyncConversationExtraction:
         assert "task_id" in data
 
     def test_extracts_and_stores_facts(self):
-        resp = httpx.post(
+        resp = _http_post(
             f"{BASE_URL}/v1/memories",
             json={
                 "messages": [
@@ -194,7 +222,7 @@ class TestAsyncConversationExtraction:
 
 class TestTaskStatusPolling:
     def test_returns_404_for_unknown_task(self):
-        resp = httpx.get(
+        resp = _http_get(
             f"{BASE_URL}/v1/memories/status/nonexistent-task-id-12345",
             timeout=5,
         )
@@ -202,7 +230,7 @@ class TestTaskStatusPolling:
 
     def test_status_transitions(self):
         """Enqueue a task and verify status goes from queued/processing to completed."""
-        resp = httpx.post(
+        resp = _http_post(
             f"{BASE_URL}/v1/memories/raw",
             json={
                 "content": "Integration test: status transition check",
@@ -214,7 +242,7 @@ class TestTaskStatusPolling:
         task_id = resp.json()["task_id"]
 
         # Immediately check — should be queued or processing
-        status_resp = httpx.get(
+        status_resp = _http_get(
             f"{BASE_URL}/v1/memories/status/{task_id}", timeout=5
         )
         assert status_resp.status_code == 200
@@ -234,7 +262,7 @@ class TestTaskStatusPolling:
 class TestSyncSearch:
     def test_search_returns_results(self):
         """Search should still work synchronously and find stored memories."""
-        resp = httpx.post(
+        resp = _http_post(
             f"{BASE_URL}/v1/search",
             json={
                 "query": "indentation preference",
@@ -255,7 +283,7 @@ class TestSyncSearch:
 
 class TestLegacyAsyncEndpoint:
     def test_legacy_async_returns_accepted(self):
-        resp = httpx.post(
+        resp = _http_post(
             f"{BASE_URL}/memories/async",
             json={
                 "messages": [{"role": "user", "content": "Legacy test memory"}],
@@ -270,7 +298,7 @@ class TestLegacyAsyncEndpoint:
         assert "poll_url" in data
 
     def test_legacy_status_endpoint(self):
-        resp = httpx.post(
+        resp = _http_post(
             f"{BASE_URL}/memories/async",
             json={
                 "messages": [{"role": "user", "content": "Legacy status check"}],

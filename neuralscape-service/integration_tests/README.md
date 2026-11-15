@@ -24,6 +24,8 @@ Copy `test_flag_on_exemplar.py`. The fixtures (`conftest.py`):
 |---|---|
 | `stores` | `neo4j_uri/user/password/database`, `qdrant_url`, `redis_url` from env, each probed once |
 | `llm_key` | the `GOOGLE_API_KEY` value (ask for it only if the test spends LLM calls; never print it) |
+| `pg_dsn` | the PostgreSQL+pgvector DSN (`NS_TEST_PG_DSN`), probed |
+| `live_api` | `.url` and `.headers` (Bearer token) of the running API + workers |
 | `flags(**fields)` | turns Settings fields on for this one test, e.g. `flags(standards_enabled=True)` |
 | `unique_ns` | unique `user_id`, `project_id`, `qdrant_collection`, `group_prefix` (all carry `nsit`) and `unique_ns.on_cleanup(fn)` |
 
@@ -48,25 +50,41 @@ one test here that (1) calls `flags(...)`, (2) exercises the feature through the
 service code against the real stores, (3) asserts the observable result, and
 ideally (4) shows the flag-off contrast. State the test id in the PR body.
 
+## Environment contract
+
+A test may rely on exactly these variables and nothing else (the gate sets
+them; nothing else is guaranteed):
+
+| variable | meaning | fixture |
+|---|---|---|
+| `NS_INTEGRATION_REQUIRED` | `1` on the gate: missing infrastructure fails instead of skipping | all |
+| `NEO4J_URI`, `NEO4J_USER`, `NEO4J_PASSWORD`, `NEO4J_DATABASE` | Neo4j | `stores` |
+| `QDRANT_URL` | Qdrant | `stores` |
+| `REDIS_URL` | Redis | `stores` |
+| `GOOGLE_API_KEY` | real Gemini key | `llm_key` |
+| `NS_TEST_PG_DSN` | PostgreSQL with pgvector | `pg_dsn` |
+| `NS_API_URL`, `NS_API_TOKEN` | live API plus the three workers; the token is minted for a per-run user against the stack's user-token secret | `live_api` (`.url`, `.headers`) |
+
+The gate also sets `LEDGER_TEST_PG_DSN`, `ENGINE_TEST_PG_DSN`,
+`USAGE_TEST_PG_DSN` and `AUTHORITY_TEST_PG_DSN` to the same DSN as
+`NS_TEST_PG_DSN`, for the Phase 2 slices whose tests read those names.
+
+`tests/test_async_pipeline.py` reads `NS_API_URL` (default
+`http://localhost:8199`) and `NS_API_TOKEN` (sent as a Bearer token), and fails
+instead of skipping when the API is unreachable and `NS_INTEGRATION_REQUIRED=1`.
+
 ## The VPS gate command
 
-Inside the **test image** (its WORKDIR is `/app/neuralscape-service`), on the
-network of the stores, with the store variables and `GOOGLE_API_KEY` passed as
-environment (never echoed):
+One command covers both, run inside the **test image** (WORKDIR
+`/app/neuralscape-service`) on the stores' network, with the variables above
+passed as environment (never echoed):
 
 ```
-NS_INTEGRATION_REQUIRED=1 pytest integration_tests/ -m integration -v -p no:cacheprovider
+NS_INTEGRATION_REQUIRED=1 pytest integration_tests/ tests/test_async_pipeline.py -m integration -v -p no:cacheprovider
 ```
 
-Environment: `NEO4J_URI`, `NEO4J_USER`, `NEO4J_PASSWORD`, `NEO4J_DATABASE`,
-`QDRANT_URL`, `REDIS_URL`, `GOOGLE_API_KEY`.
-
-Separately, and only when a live API and worker are up (it needs the running
-stack, so it is not part of the command above):
-
-```
-pytest tests/test_async_pipeline.py -m integration -v
-```
+`tests/test_async_pipeline.py` lives under `tests/` but is named explicitly, so
+`excluded_suites` (which only keeps it out of `pytest tests/`) does not stop it.
 
 The native snapshot job in `service-ci.yml` still runs
 `integration_tests/test_native_snapshot_neo4j.py` by file name; the marker does

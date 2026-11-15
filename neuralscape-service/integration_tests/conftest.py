@@ -174,6 +174,62 @@ def llm_key() -> str:
     return key
 
 
+@pytest.fixture(scope="session")
+def pg_dsn() -> str:
+    """DSN of a PostgreSQL with pgvector (``NS_TEST_PG_DSN``), probed once.
+
+    The gate also sets LEDGER_TEST_PG_DSN, ENGINE_TEST_PG_DSN,
+    USAGE_TEST_PG_DSN and AUTHORITY_TEST_PG_DSN to the same value for the
+    Phase 2 slices that read those names.  Use ``unique_ns`` names (a schema
+    or table prefix) so tests never share rows.
+    """
+
+    dsn = _env("NS_TEST_PG_DSN")
+    if not dsn:
+        unavailable("NS_TEST_PG_DSN is not set")
+    parsed = urlparse(dsn)
+    error = _tcp_reachable(parsed.hostname or "localhost", parsed.port or 5432)
+    if error:
+        unavailable(f"PostgreSQL is unreachable ({error})")
+    return dsn
+
+
+@dataclass(frozen=True)
+class LiveApi:
+    """A running API (with all workers) and the credentials to call it."""
+
+    url: str
+    headers: dict = field(default_factory=dict)
+
+    def __repr__(self) -> str:  # never show the token
+        return f"LiveApi(url={self.url})"
+
+
+@pytest.fixture(scope="session")
+def live_api() -> LiveApi:
+    """The live API from ``NS_API_URL`` plus ``Authorization: Bearer $NS_API_TOKEN``.
+
+    The token is minted by the gate for a per-run user; use that user's id in
+    requests.  Probed with ``GET /health``.
+    """
+
+    url = _env("NS_API_URL")
+    if not url:
+        unavailable("NS_API_URL is not set")
+    url = url.rstrip("/")
+    try:
+        with urllib.request.urlopen(url + "/health", timeout=PROBE_TIMEOUT_S) as resp:  # noqa: S310
+            error = None if resp.status == 200 else f"HTTP {resp.status}"
+    except urllib.error.HTTPError as exc:
+        error = f"HTTP {exc.code}"
+    except (OSError, ValueError) as exc:
+        error = f"{type(exc).__name__}: {exc}"
+    if error:
+        unavailable(f"the API at {url} is unreachable ({error})")
+    token = _env("NS_API_TOKEN")
+    return LiveApi(url=url, headers={"Authorization": f"Bearer {token}"} if token else {})
+
+
 # --------------------------------------------------------------------------
 # turning a feature flag on for one test
 # --------------------------------------------------------------------------

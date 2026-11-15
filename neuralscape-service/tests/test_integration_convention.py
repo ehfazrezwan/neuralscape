@@ -70,7 +70,7 @@ def test_the_guard_detects_the_marker_forms_it_is_meant_to_catch():
 def test_integration_conftest_statically_keeps_the_convention():
     tree = ast.parse((INTEGRATION_DIR / "conftest.py").read_text(encoding="utf-8"))
     functions = {n.name for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)}
-    for required in ("pytest_collection_modifyitems", "stores", "llm_key", "flags", "unique_ns", "unavailable"):
+    for required in ("pytest_collection_modifyitems", "stores", "llm_key", "pg_dsn", "live_api", "flags", "unique_ns", "unavailable"):
         assert required in functions, f"integration_tests/conftest.py lost {required}()"
     text = (INTEGRATION_DIR / "conftest.py").read_text(encoding="utf-8")
     assert "NS_INTEGRATION_REQUIRED" in text
