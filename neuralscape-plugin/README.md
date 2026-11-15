@@ -97,12 +97,12 @@ dynamic client registration and PKCE are automatic.
 ## What gets installed
 
 ```
-.claude/plugins/cache/neuralscape-plugins/neuralscape/2.4.0/
+.claude/plugins/cache/neuralscape-plugins/neuralscape/<version>/
 ├── .claude-plugin/plugin.json    manifest with userConfig (hooks) prompts
 ├── .mcp.json                      bundled OAuth MCP connector at the baked <URL>/mcp/
-├── hooks/hooks.json               SessionStart, PreToolUse (Read), PostToolUse, UserPromptSubmit, Stop, SessionEnd
-├── skills/{recall,remember,save-session,project,search,ns-status,ns-config,sync,capture,compile-observations}/SKILL.md
-├── scripts/                       built hook bundles
+├── hooks/hooks.json               seven events: SessionStart, PreToolUse (Read), PostToolUse, UserPromptSubmit, PreCompact, Stop, SessionEnd
+├── skills/{recall,remember,save-session,project,search,ns-status,ns-config,sync,capture,compile-observations,ingest,process}/SKILL.md
+├── scripts/                       built hook bundles (eight: one per hook, plus conversation-turn for OpenClaw/generic clients)
 └── LICENSE / CHANGELOG.md
 ```
 
@@ -110,15 +110,15 @@ The plugin reaches your service via these calls:
 
 | Trigger | Endpoint | Purpose |
 |---|---|---|
-| SessionStart | `GET /v1/context/{project_id}` or `/v1/context/global` (+ `GET /v1/extensions/dreaming/card`, `GET /v1/code-graph/query` probe) | **Index mode (default):** inject a day-grouped, budget-bounded memory *index* (`#id \| time \| type \| title \| ~tokens`) with a savings header, the identity card(s) when the dreaming sweep has built them, a "Previously…" block from the last session note, and an escalation footer teaching `recall_memories(index_only=true)` → `get_memories(ids=[...])` → `timeline`. `CONTEXT_MODE=full` restores legacy full-content injection. Also flags any pending observation buffers from prior sessions. |
+| SessionStart | `GET /v1/context/{project_id}` or `/v1/context/global` (+ `GET /v1/extensions/dreaming/card`, `GET /v1/code-graph/query` probe) | **Index mode (default):** inject a day-grouped, budget-bounded memory *index* (`#id \| time \| type \| title \| ~tokens`) with a savings header, the identity card(s) when the dreaming sweep has built them, a "Previously…" block from the last session note, and an escalation footer teaching `recall_memories(index_only=true)` → `get_memories(ids=[...])` → `timeline`. `CONTEXT_MODE=full` restores legacy full-content injection. Also flags pending observation buffers from other sessions, but only finished ones: a buffer is offered for compilation when its session wrote a `.ended` marker (SessionEnd) that is not older than the buffer's last write, or when it has been idle for 12 hours (`PENDING_IDLE_HOURS`; covers crashed sessions). A live buffer of another terminal is never offered. Markers left by plugin versions up to 2.9.3 (`.stale`) are ignored and removed. |
 | PreToolUse (Read) | `GET /v1/memories?fields=index` (newest-first, project-scoped, once per session) | **File Read Gate (steering):** when the target file is larger than `READ_GATE_MIN_BYTES` and stored memories reference it (path-tail match, at least `dir/basename`), the hook injects `additionalContext` with a ranked per-file memory timeline (`#id \| when \| title \| ~tokens`) plus an escalation menu (`get_memories` → `timeline`) — **the Read always proceeds**. The index fetch happens at most once per session (cached), under a hard time budget; steering fires at most once per file per session. |
 | PostToolUse | (none — local file write) | Append `{tool, input, output, ts, project_id}` to per-session JSONL buffer. Filters read-only tools, harness plumbing (`SKIP_TOOLS`), and trivial Bash commands; truncates large outputs. |
 | UserPromptSubmit | (none — local check) | When the buffer crosses the threshold (default 25 obs or 30 min old), prepends an `additionalContext` instruction asking Claude to compile the buffer using the `compile-observations` skill before responding. |
 | compile-observations skill | `POST /v1/memories/raw` (via `mcp__plugin_neuralscape_neuralscape__remember`) | Claude reads the buffer, applies the quality rubric, and submits one wiki-quality memory per significant work unit. Backend embeds and stores — **no Gemini call**. |
 | Stop (per turn) | `POST /v1/extensions/conversation-compiler/flush` | Stream each user/assistant pair to Gemini extraction (legacy conversation-driven memory). |
 | Stop (after flush) | `POST /v1/extensions/conversation-compiler/compile` | Synthesize the day's facts into Sessions/Decisions/Research articles. |
-| Stop (after compile) | (none — local marker) | Drop a `.stale` marker next to any non-empty observation buffer so the next SessionStart compiles it even if no further user prompts were sent. |
-| SessionEnd | `POST /v1/checkpoint` | Distill the whole session (transcript + observation buffer, deterministic — no LLM) into a structured `{request, investigated, learned, completed, next_steps}` note and store it as ONE checkpoint `session_note`. The next SessionStart renders it as the "Previously…" block, next steps first. Fires once per session (clear/logout/exit), not per turn. |
+| PreCompact | `POST /v1/memories/raw` (+ local copy) | Store ONE small `task_context` "compact snapshot" memory (tagged `compact_snapshot` and `session:<id>`) and keep a copy next to the observation buffers as `<session>.compact-snapshot.json`. The following SessionStart (`compact` / `resume` / `fork`) renders only that session's own (or its predecessor session's) snapshots under "Resuming after compaction". Never blocks the compact. |
+| SessionEnd | `POST /v1/checkpoint` (+ local marker) | Write the `<buffer>.jsonl.ended` marker next to the session's observation buffer (once, before any network call), then distill the whole session (transcript + observation buffer, deterministic — no LLM) into a structured `{request, investigated, learned, completed, next_steps}` note and store it as ONE checkpoint `session_note`. The next SessionStart renders it as the "Previously…" block, next steps first. Fires once per session (clear/logout/exit), not per turn. |
 
 ### Where extraction happens
 
@@ -146,7 +146,7 @@ Claude Cowork loads plugin **skills** but runs no hooks. The MCP-driven skills a
 
 ## MCP tools (auto-wired)
 
-Installing the plugin enables eight MCP tools backed by your Neuralscape service:
+Installing the plugin connects your client to your Neuralscape service's MCP server, which exposes 26 core tools (plus 7 code-graph tools when the server has the optional `code-graph` extra installed; run `tools/list` for the live set). The most-used ones:
 
 | Tool | Purpose |
 |---|---|
