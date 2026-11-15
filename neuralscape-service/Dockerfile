@@ -1,8 +1,9 @@
 # ── Stage 1: Builder ─────────────────────────────────────────────
 FROM python:3.12-slim AS builder
 
-# Install uv
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+# Install uv. Pinned (version + digest), not :latest: a new uv release must not change
+# how `uv sync --frozen` resolves the build. Bump on purpose, in both stages below.
+COPY --from=ghcr.io/astral-sh/uv:0.13.6@sha256:af22a52f5eafef3d78e551599d405c02df61919d18028f0cea8eda93bc9986d0 /uv /uvx /bin/
 
 WORKDIR /app
 
@@ -48,6 +49,20 @@ RUN cd neuralscape-service && \
         .venv/bin/python -m spacy download en_core_web_sm; \
     fi
 
+# ── Stage 1b: Runtime source ────────────────────────────────────
+# Top-level service modules for the runtime image, minus the ones no runtime entry
+# point (main, worker, mcp_server, the extensions, scripts/) imports: the evidence and
+# persona modules are exercised by tests only. (The contracts_* modules used to be
+# here too; the ledger package now imports several, so they ship.) Pruned in a
+# scratch stage so they never enter the runtime image's layers (an `rm` in the
+# runtime stage would leave them in the COPY layer). The builder and test stages
+# keep every module. tests/test_dockerfile_runtime.py fails if a runtime entry
+# point starts importing a pruned module: then delete that pattern from this RUN.
+FROM python:3.12-slim AS runtime-src
+WORKDIR /src
+COPY neuralscape-service/*.py ./
+RUN rm -f evidence_*.py persona_*.py portability_verifier.py
+
 # ── Stage 2: Runtime ────────────────────────────────────────────
 FROM python:3.12-slim AS runtime
 
@@ -61,7 +76,7 @@ COPY graphiti/graphiti_core/ graphiti/graphiti_core/
 COPY graphiti/pyproject.toml graphiti/
 COPY mem0/mem0/ mem0/mem0/
 COPY mem0/pyproject.toml mem0/
-COPY neuralscape-service/*.py neuralscape-service/
+COPY --from=runtime-src /src/ neuralscape-service/
 COPY neuralscape-service/memory/ neuralscape-service/memory/
 COPY neuralscape-service/extensions/ neuralscape-service/extensions/
 COPY neuralscape-service/adapters/ neuralscape-service/adapters/
@@ -111,7 +126,7 @@ CMD ["sh", "-c", "w=\"${UVICORN_WORKERS:-1}\"; case \"$w\" in ''|*[!0-9]*) w=1;;
 # Build with `--target test` or `docker compose --profile test`.
 FROM python:3.12-slim AS test
 
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+COPY --from=ghcr.io/astral-sh/uv:0.13.6@sha256:af22a52f5eafef3d78e551599d405c02df61919d18028f0cea8eda93bc9986d0 /uv /uvx /bin/
 
 WORKDIR /app
 

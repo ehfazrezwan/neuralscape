@@ -4,13 +4,18 @@
  * On every user message, check the per-session observation buffer. If it has
  * accumulated beyond the threshold (or its oldest entry is older than the
  * configured age), inject `additionalContext` instructing Claude to compile
- * the buffer using the skill before responding to the user's prompt.
+ * the buffer using the skill before responding to the user's prompt. The
+ * instruction is injected once per threshold crossing (see shouldInjectNow),
+ * not on every prompt.
  *
  * The cost lands on the same Claude turn that was about to handle the prompt
  * anyway — no extra API round-trip, fully covered by the user's subscription.
  */
 
+import { readFile, unlink, writeFile } from "node:fs/promises";
+
 import {
+  COMPILE_ARMED_SUFFIX,
   type BufferStats,
   getBufferPath,
   getBufferStats,
@@ -52,20 +57,92 @@ The PostToolUse hook has captured **${stats.lineCount} tool observations** in th
 
 \`${stats.path}\`
 
-**Before responding to the user's prompt above**, please run the \`compile-observations\` skill on this buffer:
+**Before responding to the user's prompt above**, run the \`compile-observations\` skill on this buffer. The skill holds the quality rubric and the field list; follow it. In short:
 
-1. Read each JSONL row and group consecutive ops on the same target into work units.
-2. For each *significant* work unit (decision / discovery / gotcha / pattern / bugfix / convention / architecture / outcome — see the skill's quality rubric), submit one wiki-quality memory via the \`mcp__plugin_neuralscape_neuralscape__remember\` MCP tool with:
-   - \`category\`: one of the 13 NS categories
-   - \`domain\`: coding | research | meeting | writing | ops | personal | general
-   - \`observation_type\`: bugfix | feature | refactor | decision | discovery | gotcha | pattern | trade_off | research_note | meeting_outcome | task_plan | fact
-   - \`concepts\`: 1-3 from how-it-works | why-it-exists | what-changed | problem-solution | gotcha | pattern | trade-off | open-question | next-step | blocker
-   - \`source_type\`: "tool_extraction"
-   - \`confidence\`: your 0.0-1.0 self-assessment
+1. Read the JSONL rows, group them into work units, and keep only the significant ones (decision, discovery, gotcha, pattern, bugfix, convention, architecture, outcome).
+2. Submit the memories through the MCP tools, never curl: ONE \`mcp__plugin_neuralscape_neuralscape__checkpoint\` call carrying all of them when there are 3 or more, individual \`mcp__plugin_neuralscape_neuralscape__remember\` calls when there are 1-2.
 3. After the calls succeed, truncate the buffer by writing an empty string to the same path with the \`Write\` tool.
-4. Then continue with the user's request.
+4. Then continue with the user's request. This note is shown once per threshold crossing, not on every prompt.
 
-Throughput target: ${stats.lineCount} captured rows should yield ~3-10 dense memories, not ${stats.lineCount}. Skip routine file edits, reads, searches. Skip anything tied to *this* session that won't matter in 30 days. Never store API keys, tokens, or env vars.`;
+Throughput target: ${stats.lineCount} captured rows should yield ~3-10 dense memories, not ${stats.lineCount}. Skip routine file edits, reads, searches. Never store API keys, tokens, or env vars.`;
+}
+
+// ── Once-per-crossing cool-down ──────────────────────────────────
+
+/** What the hook remembers about the last time it injected the instruction for a buffer. */
+export interface CompileMarker {
+  /** Buffer line count when the instruction was injected. */
+  lineCount: number;
+  /** Injection time (ms since epoch). */
+  injectedAt: number;
+  /**
+   * Timestamp of the buffer's first row at injection. A different first row
+   * means the buffer was truncated and refilled since, whatever its size now.
+   */
+  firstTs?: string | null;
+}
+
+/** Path of the per-buffer cool-down marker (next to the buffer; the buffer's own name keeps it per-session). */
+export function getCompileMarkerPath(bufferPath: string): string {
+  return bufferPath + COMPILE_ARMED_SUFFIX;
+}
+
+/**
+ * Should the instruction be injected NOW, given that the buffer qualifies for
+ * compilation? The instruction used to ride along on every prompt until the
+ * buffer was truncated, so an ignored (or still running) compile re-prompted
+ * on every turn. Now it is injected once per crossing and re-armed when
+ *   - there is no marker (first crossing),
+ *   - the buffer was truncated and refilled: it is smaller than at the last
+ *     injection, or its first row is no longer the one seen then,
+ *   - the buffer grew by another `threshold` rows since the last injection, or
+ *   - the last injection is itself `ageMinutes` old.
+ */
+export function shouldInjectNow(
+  stats: BufferStats,
+  marker: CompileMarker | null,
+  threshold: number,
+  ageMinutes: number,
+  now: number = Date.now(),
+): boolean {
+  if (!marker) return true;
+  if (stats.lineCount < marker.lineCount) return true;
+  if (marker.firstTs !== undefined && (stats.oldestTs ?? null) !== marker.firstTs) return true;
+  if (stats.lineCount >= marker.lineCount + threshold) return true;
+  if (now - marker.injectedAt >= ageMinutes * 60_000) return true;
+  return false;
+}
+
+export async function readCompileMarker(bufferPath: string): Promise<CompileMarker | null> {
+  try {
+    const parsed = JSON.parse(await readFile(getCompileMarkerPath(bufferPath), "utf-8"));
+    if (Number.isFinite(parsed?.lineCount) && Number.isFinite(parsed?.injectedAt)) {
+      return {
+        lineCount: parsed.lineCount,
+        injectedAt: parsed.injectedAt,
+        ...(typeof parsed.firstTs === "string" || parsed.firstTs === null ? { firstTs: parsed.firstTs } : {}),
+      };
+    }
+  } catch {
+    // missing or unreadable: behave as if never injected
+  }
+  return null;
+}
+
+export async function writeCompileMarker(bufferPath: string, marker: CompileMarker): Promise<void> {
+  try {
+    await writeFile(getCompileMarkerPath(bufferPath), JSON.stringify(marker), { encoding: "utf-8", mode: 0o600 });
+  } catch (error) {
+    logError("writing compile marker failed (non-critical)", error);
+  }
+}
+
+export async function clearCompileMarker(bufferPath: string): Promise<void> {
+  try {
+    await unlink(getCompileMarkerPath(bufferPath));
+  } catch {
+    // none — fine
+  }
 }
 
 export function getThreshold(): number {
@@ -95,9 +172,22 @@ async function main(): Promise<void> {
 
     const decision = shouldCompile(stats, threshold, ageMin);
     if (!decision.compile) {
+      // Below the threshold again (the buffer was truncated): re-arm.
+      await clearCompileMarker(stats.path);
       outputContinue();
       return;
     }
+
+    const marker = await readCompileMarker(stats.path);
+    if (!shouldInjectNow(stats, marker, threshold, ageMin)) {
+      outputContinue();
+      return;
+    }
+    await writeCompileMarker(stats.path, {
+      lineCount: stats.lineCount,
+      injectedAt: Date.now(),
+      firstTs: stats.oldestTs,
+    });
 
     outputHookResult({
       continue: true,

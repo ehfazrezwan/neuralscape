@@ -76,9 +76,12 @@ def test_template_loads_as_the_service_env(template, tmp_path):
 
     values = {k.upper(): v for k, v in dotenv_values(template).items()}
     seen = _last_json(_run(_LOAD_ALL, tmp_path, template.read_text()))
-    assert seen["level"] == values["LOG_LEVEL"].upper()
-    assert seen["log_format"] == values["LOG_FORMAT"]
-    assert seen["vault"] == values["OBSIDIAN_VAULT_PATH"]
+    # A template may leave a key unset or commented out (then the default applies); only a key
+    # it actually sets must reach the service.
+    assert seen["level"] == values.get("LOG_LEVEL", "INFO").upper()
+    assert seen["log_format"] == values.get("LOG_FORMAT", "json")
+    if "OBSIDIAN_VAULT_PATH" in values:
+        assert seen["vault"] == values["OBSIDIAN_VAULT_PATH"]
 
 
 @pytest.mark.parametrize("template", TEMPLATES, ids=lambda p: p.name)
@@ -145,7 +148,7 @@ def test_every_template_key_is_a_setting_or_listed_as_compose_only(template):
 
     fields = {name.upper() for name in config.Settings.model_fields}
     unexplained = [k for k in _template_keys(template)
-                   if k not in fields and k not in config.COMPOSE_ONLY_KEYS and not _owned_by_an_extension(k)]
+                   if k not in fields and k not in config.COMPOSE_ONLY_KEYS and k not in config.VENDORED_ENV_KEYS and not _owned_by_an_extension(k)]
     assert not unexplained, f"{template.name}: not a setting and not listed as Compose-only: {unexplained}"
 
 
@@ -153,7 +156,7 @@ def test_compose_only_keys_are_really_not_settings():
     import config
 
     fields = {name.upper() for name in config.Settings.model_fields}
-    assert not config.COMPOSE_ONLY_KEYS & fields
+    assert not (config.COMPOSE_ONLY_KEYS | config.VENDORED_ENV_KEYS) & fields
     assert not [k for k in config.COMPOSE_ONLY_KEYS if _owned_by_an_extension(k)]
 
 

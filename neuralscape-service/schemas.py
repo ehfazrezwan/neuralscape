@@ -3,7 +3,7 @@
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, Field, field_validator, model_serializer, model_validator
 
 
 # ──────────────────────────────────────────────
@@ -137,14 +137,24 @@ CORE_MEMORY_CATEGORIES: dict[str, str] = {
 # fact parser consult (i.e. validation ACCEPTS adapter categories).
 MEMORY_CATEGORIES: dict[str, str] = dict(CORE_MEMORY_CATEGORIES)
 
-# Categories that default to global scope
-GLOBAL_CATEGORIES = {"preference", "personal_fact", "technical_skill", "domain_knowledge"}
+# Categories that always store global scope, even with an explicit project_id
+GLOBAL_CATEGORIES = {"preference", "personal_fact", "technical_skill"}
 
 # Categories that require project_id and default to project scope
 PROJECT_CATEGORIES = {"tech_stack", "convention", "architecture", "dependency"}
 
-# Categories that can be either scope
-FLEXIBLE_CATEGORIES = {"decision", "interaction", "workflow", "procedure", "task_context"}
+# Categories that can be either scope: follow the caller's project_id (global
+# when none). ``domain_knowledge`` is flexible so ingested/remembered knowledge
+# given a project_id stays in that project instead of leaking into every
+# project's context (#224).
+FLEXIBLE_CATEGORIES = {
+    "domain_knowledge",
+    "decision",
+    "interaction",
+    "workflow",
+    "procedure",
+    "task_context",
+}
 
 
 def default_scope_for_category(category: str) -> MemoryScope:
@@ -1154,6 +1164,19 @@ class MemoryResponse(BaseModel):
     id: str
     memory: str
     category: str | None = None
+    # Model scores for relevance only, bound to content/category by the service.
+    # These never authorize sharing or change strict category filter semantics.
+    category_evidence: dict | None = None
+
+    @model_serializer(mode="wrap")
+    def _omit_absent_category_evidence(self, handler):
+        # Flag off (the default), no row carries evidence: omit the key so the
+        # wire shape is byte-identical to before the field existed.
+        data = handler(self)
+        if isinstance(data, dict) and data.get("category_evidence") is None:
+            data.pop("category_evidence", None)
+        return data
+
     scope: str | None = None
     project_id: str | None = None
     tags: list[str] | None = None

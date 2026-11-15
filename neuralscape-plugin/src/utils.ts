@@ -61,8 +61,9 @@ const NEURALSCAPE_API_KEY = readConfig("API_KEY", "");
 // Removing it would orphan memories existing installs stored under that id.
 // Token-authenticated servers ignore client-claimed ids (identity comes from
 // the Bearer token), so this can't spoof identity on multi-user deployments.
+const CONFIGURED_USER_ID = readConfig("USER_ID", "");
 const NEURALSCAPE_USER_ID =
-  readConfig("USER_ID", "") ||
+  CONFIGURED_USER_ID ||
   process.env.USER?.trim() ||
   process.env.USERNAME?.trim() ||
   /* v8 ignore next — fallback when neither $USER nor $USERNAME set */
@@ -298,6 +299,13 @@ export function hasUserId(): boolean {
   return NEURALSCAPE_USER_ID.length > 0;
 }
 
+/** Where the effective user id came from: the user's own config, the OS
+ *  login-name fallback (see the comment above NEURALSCAPE_USER_ID), or nowhere. */
+export function getUserIdSource(): "config" | "os" | "none" {
+  if (CONFIGURED_USER_ID) return "config";
+  return NEURALSCAPE_USER_ID ? "os" : "none";
+}
+
 export function getServiceUrl(): string {
   return NEURALSCAPE_URL;
 }
@@ -367,6 +375,72 @@ export function getProjectId(cwd?: string): string | undefined {
 
 // ── HTTP Client ──────────────────────────────────────────────────
 
+/** The service answered, but not with 2xx. `message` keeps the legacy
+ *  `HTTP <status>: <text>` shape so log lines and old assertions still match. */
+export class NeuralscapeHttpError extends Error {
+  readonly status: number;
+  constructor(status: number, statusText = "") {
+    super(`HTTP ${status}: ${statusText}`);
+    this.name = "NeuralscapeHttpError";
+    this.status = status;
+  }
+}
+
+/** No usable answer: DNS/connection failure, reset, or the request timeout. */
+export class NeuralscapeNetworkError extends Error {
+  constructor(detail: string) {
+    super(`network error: ${detail}`);
+    this.name = "NeuralscapeNetworkError";
+  }
+}
+
+/** What a failed call means for the user. `auth`, `not_found` and `client`
+ *  mean the service IS reachable but the plugin's setup is wrong; `server`
+ *  and `network` mean the service is down or failing. */
+export type FailureKind = "auth" | "not_found" | "client" | "server" | "network";
+
+export function classifyFailure(error: unknown): FailureKind {
+  if (error instanceof NeuralscapeHttpError) {
+    if (error.status === 401 || error.status === 403) return "auth";
+    if (error.status === 404) return "not_found";
+    if (error.status >= 500) return "server";
+    return "client";
+  }
+  // NeuralscapeNetworkError, a bare fetch/abort error, or anything unexpected:
+  // treated as a transport failure, the pre-existing behavior.
+  return "network";
+}
+
+/** Failures that count toward the "unreachable" streak: the service is down
+ *  or failing. Config problems (auth/404/other 4xx) do not: the service answered. */
+export function isUnreachableKind(kind: FailureKind): boolean {
+  return kind === "network" || kind === "server";
+}
+
+/** Count a failed call toward the unreachable streak when (and only when) it
+ *  was a transport/server failure. Returns the kind, and the new count when
+ *  the streak advanced. Never throws. */
+export async function recordFailure(
+  error: unknown,
+): Promise<{ kind: FailureKind; count: number | null }> {
+  const kind = classifyFailure(error);
+  const count = isUnreachableKind(kind) ? await recordTransportFailure() : null;
+  return { kind, count };
+}
+
+function wrapTransportError(error: unknown): unknown {
+  if (error instanceof NeuralscapeHttpError || error instanceof NeuralscapeNetworkError) return error;
+  // fetch() rejects with TypeError on connection failure; abort() on timeout.
+  if (error instanceof Error && (error.name === "AbortError" || error.name === "TimeoutError")) {
+    return new NeuralscapeNetworkError(`timed out after ${REQUEST_TIMEOUT_MS}ms`);
+  }
+  if (error instanceof TypeError) {
+    return new NeuralscapeNetworkError("could not connect");
+  }
+  // e.g. a 2xx body that is not JSON: leave as is (classified as network, as before).
+  return error;
+}
+
 export async function neuralscapeGet(
   endpoint: string,
   params?: Record<string, string>
@@ -388,9 +462,11 @@ export async function neuralscapeGet(
       signal: controller.signal,
     });
     if (!response.ok) {
-      throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+      throw new NeuralscapeHttpError(response.status, response.statusText);
     }
     return await response.json();
+  } catch (error) {
+    throw wrapTransportError(error);
   } finally {
     clearTimeout(timeout);
   }
@@ -413,9 +489,11 @@ export async function neuralscapePost(
       signal: controller.signal,
     });
     if (!response.ok) {
-      throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+      throw new NeuralscapeHttpError(response.status, response.statusText);
     }
     return await response.json();
+  } catch (error) {
+    throw wrapTransportError(error);
   } finally {
     clearTimeout(timeout);
   }
@@ -524,6 +602,9 @@ export function getEndedMarkerPath(sessionId: string): string {
 /** Marker suffix written by plugin versions up to 2.9.3 (meaningless; cleaned up). */
 const LEGACY_STALE_SUFFIX = ".stale";
 const ENDED_SUFFIX = ".ended";
+
+/** Cool-down marker of the UserPromptSubmit compile instruction, next to the buffer. */
+export const COMPILE_ARMED_SUFFIX = ".compile-armed";
 
 /** Local copy of the last compact snapshot, next to the buffers. */
 const COMPACT_SNAPSHOT_FILE_SUFFIX = ".compact-snapshot.json";
@@ -635,6 +716,14 @@ export async function cleanupOrphanMarkers(entries: string[], now: number = Date
         let empty = !buffers.has(bufferName);
         if (!empty) empty = (await stat(pathJoin(dir, bufferName))).size === 0;
         if (empty) await unlink(pathJoin(dir, name));
+      } else if (name.endsWith(".jsonl" + COMPILE_ARMED_SUFFIX)) {
+        // Meaningful only while its buffer holds rows; also bounded by age
+        // like the other per-session leftovers.
+        const bufferName = name.slice(0, -COMPILE_ARMED_SUFFIX.length);
+        let remove = !buffers.has(bufferName);
+        if (!remove) remove = (await stat(pathJoin(dir, bufferName))).size === 0;
+        if (!remove) remove = now - (await stat(pathJoin(dir, name))).mtimeMs > COMPACT_SNAPSHOT_FILE_MAX_AGE_MS;
+        if (remove) await unlink(pathJoin(dir, name));
       } else if (name.endsWith(COMPACT_SNAPSHOT_FILE_SUFFIX) || name.endsWith(".lastturn")) {
         const age = now - (await stat(pathJoin(dir, name))).mtimeMs;
         if (age > COMPACT_SNAPSHOT_FILE_MAX_AGE_MS) await unlink(pathJoin(dir, name));

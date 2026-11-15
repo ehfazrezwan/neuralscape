@@ -8,7 +8,7 @@ from typing import Annotated, Literal
 from urllib.parse import urlparse
 
 from arq.connections import RedisSettings
-from pydantic import field_validator, model_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, PydanticBaseSettingsSource
 
 _logger = logging.getLogger(__name__)
@@ -17,7 +17,7 @@ _LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1", "[::1]"}
 
 # ── Keys a service .env may hold that Settings does not own ──────────────────
 # Settings reads ``.env`` from the working directory and rejects unknown keys, so a
-# typo fails loudly. Two kinds of keys in that file are legitimate without being
+# typo fails loudly. Three kinds of keys in that file are legitimate without being
 # Settings fields, and only these are tolerated (and only from the file):
 #
 # * Compose-only keys: read by ``docker compose`` for interpolation in
@@ -27,8 +27,13 @@ COMPOSE_ONLY_KEYS = frozenset({
     "CLOUDFLARE_TUNNEL_TOKEN",  # cloudflared sidecar
     "DOMAIN",  # reverse-proxy host name
     "REDIS_PASSWORD",  # interpolated into REDIS_URL and the redis service
-    "SMALL_MODEL_NAME",  # interpolated into GEMINI_LLM_MODEL
     "EMBEDDING_MODEL_NAME",  # interpolated into GEMINI_EMBEDDER_MODEL
+})
+# * Vendored-env keys: read straight from the process environment by vendored library
+#   code (mem0 adapter), not by Settings. Tolerated in the file so a template can
+#   document them, but a value there is NOT read by a local run: export it instead.
+VENDORED_ENV_KEYS = frozenset({
+    "GRAPHITI_BRIDGE_TIMEOUT_S",  # mem0 graphiti adapter: per-call bridge timeout
 })
 # * Keys owned by the extension settings classes that read the same ``.env``
 #   (extensions/*/config.py, which config.py cannot import; a test keeps these in
@@ -42,7 +47,7 @@ EXTENSION_ENV_KEYS = frozenset({  # conversation_compiler.config.CompilerSetting
 
 def _owned_elsewhere(key: str) -> bool:
     upper = key.upper()
-    return upper in COMPOSE_ONLY_KEYS or upper in EXTENSION_ENV_KEYS or upper.startswith(EXTENSION_ENV_PREFIXES)
+    return upper in COMPOSE_ONLY_KEYS or upper in VENDORED_ENV_KEYS or upper in EXTENSION_ENV_KEYS or upper.startswith(EXTENSION_ENV_PREFIXES)
 
 
 class _ServiceDotEnvSource(PydanticBaseSettingsSource):
@@ -89,6 +94,20 @@ class Settings(BaseSettings):
     log_format: str = "json"  # "json" or "console"
     neuralscape_extensions: str = ""  # comma-separated import paths (extensions discovery)
 
+    # Hybrid experiments are independently opt-in; each needs its flag plus an endpoint and key.
+    hybrid_inference_api_key: str = Field(default="", repr=False)
+    # No default endpoint or model: a flag alone, or a key alone, activates nothing.
+    hybrid_inference_endpoint: str = ""
+    hybrid_inference_model: str = ""
+    hybrid_threshold: float = Field(default=0.9, ge=0.5, le=1)
+    hybrid_timeout_s: float = Field(default=2.0, gt=0, le=30)
+    hybrid_graph_enabled: bool = False
+    hybrid_categories_enabled: bool = False
+    hybrid_extraction_enabled: bool = False
+    hybrid_extraction_deadline_s: float = Field(default=2.5, gt=0, le=30)
+    hybrid_rerank_enabled: bool = False
+    hybrid_rerank_limit: int = Field(default=32, ge=1, le=64)
+    hybrid_rerank_policy: str = "Prefer direct evidence answering the query; respect explicit versions and dates in the query. Do not confuse topical overlap with an answer."
     # ── LLM gateway (OpenAI-compatible) ───────────────────────────────
     # When enabled, the LLM + embedder (and the graphiti reranker) route
     # through an OpenAI-compatible gateway (e.g. an internal Vertex-via-ADC
@@ -167,6 +186,13 @@ class Settings(BaseSettings):
     ingest_queue_name: str = "neuralscape:ingest"
     arq_max_retries: int = 3
     arq_job_timeout: int = 300  # 5 min max per task
+    # Concurrent jobs per worker process (ARQ ``max_jobs``), one knob per
+    # worker class. The graph worker's default is low to cap concurrent Gemini
+    # extraction (AI-Studio throttling); the ingest worker's bounds parse /
+    # embed memory. Env: ARQ_MAX_JOBS / GRAPH_MAX_JOBS / INGEST_MAX_JOBS.
+    arq_max_jobs: int = Field(default=10, ge=1)
+    graph_max_jobs: int = Field(default=4, ge=1)
+    ingest_max_jobs: int = Field(default=3, ge=1)
     # Override the global ThreadPoolExecutor used by asyncio.to_thread (batch-get,
     # code-graph reads). 0 = use Python default (min(32, cpu+4)); >0 sets explicit
     # size. The stdlib default silently caps concurrent to_thread calls, which
@@ -179,9 +205,29 @@ class Settings(BaseSettings):
     llm_retry_base_delay: float = 1.0  # seconds
     llm_retry_max_delay: float = 30.0  # seconds
 
+    # ── Graph-contradiction supersession (flag, default OFF) ──────────
+    # When Graphiti's add_episode invalidates an older RELATES_TO edge, mark
+    # the Qdrant row that edge came from with a reversible tombstone
+    # (metadata.dream_tombstoned + superseded_* keys) so recall stops serving
+    # the contradicted fact, and let a dedup-hit that revived a tombstoned row
+    # re-enter graph enrichment. Env: GRAPH_SUPERSESSION_ENABLED. Off ⇒ the
+    # write path is byte-identical to before (no Cypher probe, no payload
+    # change, no extra enqueue). Multi-row (conversation) episodes only
+    # supersede a row whose stored vector matches the invalidated edge's fact
+    # at >= min_similarity AND beats the runner-up by >= margin.
+    graph_supersession_enabled: bool = False
+    graph_supersession_min_similarity: float = 0.85
+    graph_supersession_margin: float = 0.05
+
     # Dedup cron
     dedup_similarity_threshold: float = 0.95
     dedup_batch_size: int = 100
+    # Semantic dedup (phase 2 of the dedup cron and of post-compile dedup).
+    # False (default): the older near-duplicate is hard-deleted, with the graph
+    # cascade and sibling re-ingest jobs. True: it is tombstoned instead
+    # (reversible: recall hides it, the row stays, re-deriving it revives it)
+    # and nothing cascades. Env: DEDUP_SEMANTIC_TOMBSTONE_ENABLED.
+    dedup_semantic_tombstone_enabled: bool = False
     dedup_cron_hours: set = {0, 6, 12, 18}
 
     # ── Reinforcement-aware recall boost (times_derived) ──────────────
@@ -1230,6 +1276,12 @@ class Settings(BaseSettings):
                     "password": self.neo4j_password,
                     "database": self.neo4j_database,
                     **graphiti_models,
+                    "graphiti_hybrid_enabled": self.hybrid_graph_enabled,
+                    "graphiti_hybrid_api_key": self.hybrid_inference_api_key,
+                    "graphiti_hybrid_endpoint": self.hybrid_inference_endpoint,
+                    "graphiti_hybrid_model": self.hybrid_inference_model,
+                    "graphiti_hybrid_threshold": self.hybrid_threshold,
+                    "graphiti_hybrid_timeout": self.hybrid_timeout_s,
                     "store_raw_episode_content": self.store_raw_episode_content,
                     "update_communities": self.update_communities,
                 },
