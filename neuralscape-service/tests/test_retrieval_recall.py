@@ -183,6 +183,171 @@ class TestBM25LexicalLeg:
         assert fused[0]["dense"] is True
 
 
+class TestHybridFusionOrderSurvivesPoolMerge:
+    """Pre-fix: each pool fused dense + BM25 by RRF, but the callers kept
+    only the native score (cosine for dense rows, the pool's weakest cosine
+    for lexical-only rows), and ``search()`` re-sorted the cross-pool merge
+    by that score before cutting to ``limit``. So BM25-only hits sat at the
+    pool floor and were cut, leg-agreement promotions were undone by raw
+    cosine, and a lexical hit in an empty-dense pool (score None -> 0.0)
+    sank below every unrelated row.
+
+    The fix orders the merge by a per-pool rank-transferred key on the
+    cosine scale; displayed scores stay native.
+    """
+
+    QUERY = "Where does Margrethe Vestager work?"
+
+    @staticmethod
+    def _wire_pools(service, personal_dense, personal_lex, shared_dense):
+        """Route query_points by pool: the personal pool filters on the
+        top-level ``user_id``, the shared/standard pools on
+        ``metadata.visibility``."""
+        vs = service._memory.vector_store
+        vs._has_bm25_slot = True
+        vs._encode_bm25 = MagicMock(return_value="SPARSE-VEC")
+
+        def _qp(*args, **kwargs):
+            first = kwargs["query_filter"].must[0]
+            if first.key == "user_id":
+                bm25 = kwargs.get("using") == "bm25"
+                return _qresult(list(personal_lex if bm25 else personal_dense))
+            if first.match.value == "shared" and kwargs.get("using") != "bm25":
+                return _qresult(list(shared_dense))
+            return _qresult([])
+
+        vs.client.query_points.side_effect = _qp
+
+    @staticmethod
+    def _hits(spec):
+        return [_make_hit(i, sc, _payload(f"fact {i}")) for i, sc in spec]
+
+    def _search(self, service, limit):
+        return service.search(
+            query=self.QUERY, user_id="u1", include_shared=True, limit=limit
+        )
+
+    def test_bm25_only_hit_survives_cross_pool_limit_cut(self, service):
+        gold = _make_hit("gold", 7.42, _payload("Margrethe Vestager works at the Commission"))
+        self._wire_pools(
+            service,
+            personal_dense=self._hits([("p0", 0.90), ("p1", 0.86), ("p2", 0.82)]),
+            personal_lex=[gold],
+            shared_dense=self._hits([("s0", 0.88), ("s1", 0.80), ("s2", 0.78)]),
+        )
+
+        results = self._search(service, limit=3)
+
+        # Fused personal order is p0, gold, p1 (gold = lexical rank 0 ties
+        # p0's dense rank 0); gold inherits the pool's 2nd-best cosine.
+        assert [r.id for r in results] == ["p0", "s0", "gold"]
+        scores = {r.id: r.score for r in results}
+        # Displayed score stays NATIVE: the pool's dense floor, not the key.
+        assert scores["gold"] == pytest.approx(0.82)
+        assert scores["p0"] == pytest.approx(0.90)
+
+    def test_leg_agreement_promotion_survives_cross_pool_merge(self, service):
+        both = _make_hit("both", 0.85, _payload("agreed by both legs"))
+        self._wire_pools(
+            service,
+            personal_dense=[_make_hit("top", 0.90, _payload("top cosine only"))]
+            + [both],
+            personal_lex=[both],
+            shared_dense=self._hits([("s0", 0.50)]),
+        )
+
+        results = self._search(service, limit=3)
+
+        # RRF: both = dense rank 1 + lexical rank 0 beats dense rank 0.
+        assert [r.id for r in results][:2] == ["both", "top"]
+        scores = {r.id: r.score for r in results}
+        assert scores["both"] == pytest.approx(0.85)  # native cosine kept
+        assert scores["top"] == pytest.approx(0.90)
+
+    def test_empty_dense_pool_lexical_hit_not_sunk_to_last(self, service):
+        gold = _make_hit("gold", 7.42, _payload("Margrethe Vestager works at the Commission"))
+        self._wire_pools(
+            service,
+            personal_dense=[],
+            personal_lex=[gold],
+            shared_dense=self._hits([("s0", 0.90), ("s1", 0.80), ("s2", 0.70)]),
+        )
+
+        results = self._search(service, limit=4)
+
+        ids = [r.id for r in results]
+        assert "gold" in ids
+        assert ids[-1] != "gold", "lexical hit sank below every unrelated row"
+        assert ids == ["s0", "s1", "gold", "s2"]
+
+    def test_merit_merge_keeps_vector_fused_order_against_graph(self, service):
+        """A lexical-only vector row (native score = pool floor 0.50) must
+        not be evicted by a weaker-ranked graph edge (0.70) once the vector
+        leg hands its fused key (0.86) into the merit merge. Exercised on
+        the merge helper directly — search() reaches it with the keys from
+        the pool merge, and wiring a scored Graphiti edge through the
+        threaded graph pass adds nothing to what this asserts."""
+        vec = [
+            MemoryResponse(id="dense", memory="alpha dense row", score=0.90),
+            MemoryResponse(id="lex", memory="beta lexical row", score=0.50),
+        ]
+        graph = [
+            MemoryResponse(id="edge", memory="gamma graph edge", score=0.70, source="graph")
+        ]
+
+        legacy = service._deduplicate_responses(vec, graph, limit=None)
+        assert [r.id for r in legacy] == ["dense", "edge", "lex"]  # floor-score eviction
+
+        keyed = service._deduplicate_responses(
+            vec, graph, limit=None, vector_keys={"dense": 0.90, "lex": 0.86}
+        )
+        assert [r.id for r in keyed] == ["dense", "lex", "edge"]
+        assert {r.id: r.score for r in keyed}["lex"] == pytest.approx(0.50)
+
+    def test_salience_lifts_order_keys_consistently(self, service, monkeypatch):
+        """Salience on (k>0): the ordering keys get the same lift as the
+        displayed score, and the cross-pool sort follows the lifted keys."""
+        from extensions.dreaming import traces
+        from extensions.dreaming.config import dreaming_settings
+        from memory_service import _salience_tiebreak
+
+        monkeypatch.setattr(dreaming_settings, "salience_recall_k", 0.1)
+        monkeypatch.setattr(
+            traces, "get_strength_signals", lambda ids: {"b": 4.0}
+        )
+
+        # Unit: keys and scores lifted by the same factor; zero signal untouched.
+        a = MemoryResponse(id="a", memory="a", score=0.80)
+        b = MemoryResponse(id="b", memory="b", score=0.50)
+        keys = {"a": 0.80, "b": 0.78}
+        _salience_tiebreak([a, b], keys)
+        lift = b.score / 0.50
+        assert lift > 1.0
+        assert keys["b"] == pytest.approx(0.78 * lift)
+        assert keys["a"] == 0.80 and a.score == 0.80
+
+        # End to end: b's fused key (0.78) beats a's (0.75) only via salience.
+        pa = _make_hit("a", 0.75, _payload("alpha"))
+        pb = _make_hit("b", 0.70, _payload("beta"))
+        pb2 = _make_hit("pad", 0.78, _payload("gamma"))
+        self._wire_pools(service, [], [], [pb2, pa, pb])
+        results = self._search(service, limit=3)
+        ids = [r.id for r in results]
+        assert ids.index("b") < ids.index("a")  # 0.70 * lift(>1.0) vs 0.75
+
+    def test_merit_merge_equal_keys_keep_incoming_order_not_id_order(self, service):
+        """Equal ordering keys (floor/imputed rows) must keep the incoming
+        fused order; id order is opposite here."""
+        vec = [
+            MemoryResponse(id="z-first", memory="alpha row", score=0.50),
+            MemoryResponse(id="a-second", memory="beta row", score=0.50),
+        ]
+        out = service._deduplicate_responses(
+            vec, [], limit=None, vector_keys={"z-first": 0.7, "a-second": 0.7}
+        )
+        assert [r.id for r in out] == ["z-first", "a-second"]
+
+
 # ══════════════════════════════════════════════
 # Defect 2 — vector/graph weave (ranked hits keep priority)
 # ══════════════════════════════════════════════

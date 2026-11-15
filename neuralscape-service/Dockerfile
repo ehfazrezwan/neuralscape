@@ -23,6 +23,7 @@ COPY neuralscape-service/ingest/ neuralscape-service/ingest/
 COPY neuralscape-service/connectors/ neuralscape-service/connectors/
 COPY neuralscape-service/okf/ neuralscape-service/okf/
 COPY neuralscape-service/integration_tests/ neuralscape-service/integration_tests/
+COPY neuralscape-service/ledger/ neuralscape-service/ledger/
 
 # Install all dependencies using uv from the neuralscape-service project
 # E2: include the code-graph extra (tree-sitter + graphifyy) in the builder
@@ -69,6 +70,7 @@ COPY neuralscape-service/ingest/ neuralscape-service/ingest/
 COPY neuralscape-service/connectors/ neuralscape-service/connectors/
 COPY neuralscape-service/okf/ neuralscape-service/okf/
 COPY neuralscape-service/integration_tests/ neuralscape-service/integration_tests/
+COPY neuralscape-service/ledger/ neuralscape-service/ledger/
 # Operator-facing scripts (relocate_vault_to_raw, issue_user_token,
 # migrate_graph_groups, bulk_promote_visibility). Production operators
 # invoke these in-container; without this copy they had to docker-cp
@@ -81,6 +83,11 @@ ENV PATH="/app/neuralscape-service/.venv/bin:$PATH"
 # Default environment for container networking
 ENV NEO4J_URI=neo4j://neo4j:7687 \
     QDRANT_PATH=/data/qdrant
+
+# Vendored mem0/Graphiti send anonymous usage telemetry to an external host
+# unless disabled. Off by default; opt in by setting either variable at run time.
+ENV MEM0_TELEMETRY=false \
+    GRAPHITI_TELEMETRY_ENABLED=false
 
 WORKDIR /app/neuralscape-service
 
@@ -124,6 +131,7 @@ COPY neuralscape-service/knowledge/ neuralscape-service/knowledge/
 COPY neuralscape-service/ingest/ neuralscape-service/ingest/
 COPY neuralscape-service/connectors/ neuralscape-service/connectors/
 COPY neuralscape-service/okf/ neuralscape-service/okf/
+COPY neuralscape-service/ledger/ neuralscape-service/ledger/
 
 # Resolve WITH dev deps so pytest, pytest-asyncio, etc. are available.
 # E2: include the code-graph extra so in-container tests can import tree-sitter
@@ -152,7 +160,9 @@ COPY neuralscape-service/scripts/ neuralscape-service/scripts/
 ENV PATH="/app/neuralscape-service/.venv/bin:$PATH"
 ENV NEO4J_URI=neo4j://neo4j:7687 \
     QDRANT_PATH=/data/qdrant \
-    PYTHONDONTWRITEBYTECODE=1
+    PYTHONDONTWRITEBYTECODE=1 \
+    MEM0_TELEMETRY=false \
+    GRAPHITI_TELEMETRY_ENABLED=false
 
 WORKDIR /app/neuralscape-service
 

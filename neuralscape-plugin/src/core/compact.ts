@@ -17,6 +17,9 @@ import { redactPrivate } from "../utils.js";
 /** Tag every snapshot carries so SessionStart can pick them out. */
 export const COMPACT_SNAPSHOT_TAG = "compact_snapshot";
 
+/** Each snapshot also carries `session:<id>` so a compaction re-injects only its own session's snapshot. */
+export const COMPACT_SNAPSHOT_SESSION_TAG_PREFIX = "session:";
+
 /** Content prefix — also the fallback detector for tag-less legacy rows. */
 export const COMPACT_SNAPSHOT_MARKER = "Compact snapshot:";
 
@@ -82,7 +85,8 @@ export function buildCompactSnapshotContent(inputs: CompactSnapshotInputs): stri
 
 /**
  * Body for the existing POST /v1/memories/raw endpoint (RawMemoryRequest):
- * a pre-categorized `task_context` fact tagged `compact_snapshot`, scoped
+ * a pre-categorized `task_context` fact tagged `compact_snapshot` (plus
+ * `session:<id>` when the session is known), scoped
  * to the project when one resolves, with a finite expiry so snapshots stay
  * a rolling window instead of accumulating forever.
  */
@@ -91,13 +95,17 @@ export function buildCompactSnapshotPayload(
   userId: string,
   projectId: string | undefined,
   when: Date = new Date(),
+  sessionId?: string,
 ): Record<string, unknown> {
   const payload: Record<string, unknown> = {
     content,
     user_id: userId,
     category: "task_context",
     scope: projectId ? "project" : "global",
-    tags: [COMPACT_SNAPSHOT_TAG],
+    tags:
+      sessionId && sessionId !== "unknown"
+        ? [COMPACT_SNAPSHOT_TAG, `${COMPACT_SNAPSHOT_SESSION_TAG_PREFIX}${sessionId}`]
+        : [COMPACT_SNAPSHOT_TAG],
     source_type: "tool_extraction",
     expires_at: new Date(when.getTime() + SNAPSHOT_TTL_MS).toISOString(),
   };

@@ -597,8 +597,13 @@ class ReadsMixin:
         project_id: str | None = None,
         limit: int = 100,
         include_tombstoned: bool = False,
+        agent_id: str | None = None,
+        run_id: str | None = None,
     ) -> list[MemoryResponse]:
         """List memories with optional filters.
+
+        ``agent_id`` / ``run_id`` (legacy ``GET /memories``) narrow to rows
+        written under that agent / session; they only ever restrict.
 
         Audit 27 #14: rows the dreaming sweep consolidated away
         (``metadata.dream_tombstoned=true``) are excluded from listings by
@@ -619,6 +624,10 @@ class ReadsMixin:
             filters["metadata.category"] = category
         if project_id:
             filters["metadata.project_id"] = project_id
+        if agent_id:
+            filters["agent_id"] = agent_id
+        if run_id:
+            filters["run_id"] = run_id
 
         result = m.get_all(
             filters=filters,

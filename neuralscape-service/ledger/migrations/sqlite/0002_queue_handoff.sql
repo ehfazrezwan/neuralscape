@@ -1,0 +1,3 @@
+-- The queue hand-off (a pending row is marked queued by exactly one dispatcher)
+-- is a conditional UPDATE here, so SQLite needs no schema change.  The version
+-- exists so both backends share one schema version and snapshots move between them.
