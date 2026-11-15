@@ -112,7 +112,7 @@ def _row(qdrant, collection, pid, user, episode, vec=(1.0, 0.0, 0.0)):
                 vector=list(vec),
                 payload={
                     "data": "fact", "user_id": user, "created_at": "2026-01-01T00:00:00+00:00",
-                    "metadata": {"graph_episode_uuid": episode, "visibility": "private", "scope": "global"},
+                    "metadata": {"graph_episode_uuid": episode, "graph_episode_kind": "fact", "visibility": "private", "scope": "global"},
                 },
             )
         ],

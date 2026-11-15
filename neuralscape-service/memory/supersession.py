@@ -17,10 +17,11 @@ Flow (all best-effort, driven from ``memory/write.py`` behind
    ``metadata.graph_episode_uuid`` — same owner user only, never the rows just
    written.
 3. Decide per row:
-   - episode maps to ONE live row: supersede only if every RELATES_TO edge
+   - episode is a single-fact episode (``graph_episode_kind="fact"``, stamped
+     by ``enrich_graph``) with ONE live row: supersede only if every RELATES_TO edge
      citing that episode is now dead (a partially contradicted row still
      holds true facts);
-   - episode maps to SEVERAL rows (a conversation episode): supersede the row
+   - any other episode (conversation / unstamped, one or several rows): supersede the row
      whose stored dense vector best matches the embedded edge ``fact``, only
      if it clears ``graph_supersession_min_similarity`` and beats the
      runner-up by ``graph_supersession_margin``; otherwise leave all alone.
@@ -205,7 +206,16 @@ def supersede_contradicted_rows(
             ep_rows = rows.get(ep)
             if not ep_rows:
                 continue
-            if len(ep_rows) == 1:
+            # Single-fact episodes (stamped by enrich_graph with
+            # graph_episode_kind="fact") ARE their one row: no content gate
+            # needed, just "every edge of the episode is dead". Anything else
+            # (conversation episodes, pre-flag rows) may hold unrelated facts
+            # in a lone stamped row (dedup hits are not stamped), so the
+            # vector similarity gate applies even with a single row.
+            single_fact = len(ep_rows) == 1 and (
+                _row_meta(ep_rows[0][1]).get("graph_episode_kind") == "fact"
+            )
+            if single_fact:
                 if live_counts is None:
                     live_counts = _bridge(
                         count_live_edges_by_episode(
@@ -229,23 +239,36 @@ def supersede_contradicted_rows(
     client = service._memory.vector_store.client
     now = datetime.now(timezone.utc).isoformat()
     done: list[str] = []
+    failed: list[tuple[str, list[str]]] = []
     for pid, edge_uuids in chosen.items():
-        client.set_payload(
-            collection_name=settings.qdrant_collection,
-            payload={
-                "dream_tombstoned": True,
-                "superseded_by": superseded_by,
-                "superseded_by_episode": new_episode_uuid,
-                "superseded_reason": SUPERSEDED_REASON,
-                "superseded_at": now,
-                "superseded_edge_uuids": edge_uuids,
-            },
-            points=[pid],
-            key="metadata",
-        )
+        try:
+            client.set_payload(
+                collection_name=settings.qdrant_collection,
+                payload={
+                    "dream_tombstoned": True,
+                    "superseded_by": superseded_by,
+                    "superseded_by_episode": new_episode_uuid,
+                    "superseded_reason": SUPERSEDED_REASON,
+                    "superseded_at": now,
+                    "superseded_edge_uuids": edge_uuids,
+                },
+                points=[pid],
+                key="metadata",
+            )
+        except Exception:
+            failed.append((pid, edge_uuids))
+            logger.error(
+                "Supersession tombstone FAILED for memory %s (edges %s invalidated "
+                "by episode %s); graph and vector store are now inconsistent for "
+                "this row until it is re-derived or tombstoned by hand",
+                pid, edge_uuids, new_episode_uuid, exc_info=True,
+            )
+            continue
         done.append(pid)
         logger.info(
             "Superseded memory %s: graph edges %s invalidated by episode %s",
             pid, edge_uuids, new_episode_uuid,
         )
+    if failed:
+        logger.error("Supersession: %d/%d tombstones failed", len(failed), len(chosen))
     return done

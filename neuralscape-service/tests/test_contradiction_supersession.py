@@ -225,7 +225,7 @@ class TestSingleRowEpisode:
     def test_fully_invalidated_row_is_tombstoned_with_provenance(self, env):
         svc, qdrant, graph = env
         qdrant.add("old", user="u1", data="User lives in Berlin",
-                   metadata={"graph_episode_uuid": "ep-old"})
+                   metadata={"graph_episode_uuid": "ep-old", "graph_episode_kind": "fact"})
         qdrant.add("new", user="u1", data="User lives in Paris")
         graph.add_edge("E1", "User lives in Berlin", ["ep-old"])
         svc._memory.graph.add.side_effect = _graph_add(graph, episode_uuid="ep-new", invalidate=["E1"])
@@ -250,7 +250,7 @@ class TestSingleRowEpisode:
     def test_partially_invalidated_row_is_left_alone(self, env):
         svc, qdrant, graph = env
         qdrant.add("old", user="u1", data="Lives in Berlin and works at Acme",
-                   metadata={"graph_episode_uuid": "ep-old"})
+                   metadata={"graph_episode_uuid": "ep-old", "graph_episode_kind": "fact"})
         qdrant.add("new", user="u1", data="x")
         graph.add_edge("E1", "User lives in Berlin", ["ep-old"])
         graph.add_edge("E2", "User works at Acme", ["ep-old"])  # still live
@@ -264,7 +264,7 @@ class TestSingleRowEpisode:
     def test_delete_cascade_expiry_is_not_a_contradiction(self, env):
         """A cascade only sets expired_at (no invalid_at) — must not supersede."""
         svc, qdrant, graph = env
-        qdrant.add("old", user="u1", data="d", metadata={"graph_episode_uuid": "ep-old"})
+        qdrant.add("old", user="u1", data="d", metadata={"graph_episode_uuid": "ep-old", "graph_episode_kind": "fact"})
         qdrant.add("new", user="u1", data="x")
         graph.add_edge("E1", "f", ["ep-old"])
 
@@ -282,7 +282,7 @@ class TestSingleRowEpisode:
         invalidated. The row being (re)written must never be superseded."""
         svc, qdrant, graph = env
         qdrant.add("same", user="u1", data="User lives in Paris",
-                   metadata={"graph_episode_uuid": "ep-old"})
+                   metadata={"graph_episode_uuid": "ep-old", "graph_episode_kind": "fact"})
         graph.add_edge("E1", "User lives in Paris", ["ep-old"])
         svc._memory.graph.add.side_effect = _graph_add(graph, episode_uuid="ep-new", invalidate=["E1"])
 
@@ -293,8 +293,8 @@ class TestSingleRowEpisode:
 
     def test_cross_user_rows_are_never_touched(self, env):
         svc, qdrant, graph = env
-        qdrant.add("mine", user="u1", data="Berlin", metadata={"graph_episode_uuid": "ep-old"})
-        qdrant.add("theirs", user="u2", data="Berlin", metadata={"graph_episode_uuid": "ep-old"})
+        qdrant.add("mine", user="u1", data="Berlin", metadata={"graph_episode_uuid": "ep-old", "graph_episode_kind": "fact"})
+        qdrant.add("theirs", user="u2", data="Berlin", metadata={"graph_episode_uuid": "ep-old", "graph_episode_kind": "fact"})
         qdrant.add("new", user="u1", data="Paris")
         graph.add_edge("E1", "Berlin", ["ep-old"])
         svc._memory.graph.add.side_effect = _graph_add(graph, episode_uuid="ep-new", invalidate=["E1"])
@@ -308,7 +308,7 @@ class TestSingleRowEpisode:
     def test_only_edges_invalidated_inside_this_write_window_count(self, env):
         """An edge invalidated before the write started is old news."""
         svc, qdrant, graph = env
-        qdrant.add("old", user="u1", data="d", metadata={"graph_episode_uuid": "ep-old"})
+        qdrant.add("old", user="u1", data="d", metadata={"graph_episode_uuid": "ep-old", "graph_episode_kind": "fact"})
         qdrant.add("new", user="u1", data="x")
         graph.add_edge("E1", "f", ["ep-old"])
         graph.invalidate("E1")
@@ -399,6 +399,67 @@ class TestMultiRowEpisode:
             assert not qdrant.meta(pid).get("dream_tombstoned")
 
 
+class TestLoneStampedConversationRow:
+    """Conversation episodes stamp only NEW rows; dedup hits are unstamped, so
+    a lone stamped row may be unrelated to the contradicted edge."""
+
+    def _seed(self, qdrant, graph, row_vec):
+        qdrant.add("tea", user="u1", data="Likes tea",
+                   metadata={"graph_episode_uuid": "ep-conv"}, vector=row_vec)  # no kind
+        qdrant.add("new", user="u1", data="Lives in Paris")
+        graph.add_edge("E1", "User lives in Berlin", ["ep-conv"])  # only edge, now dead
+
+    def test_unrelated_lone_row_is_not_tombstoned(self, env):
+        svc, qdrant, graph = env
+        self._seed(qdrant, graph, [0.0, 1.0, 0.0])
+        svc._embed_map["User lives in Berlin"] = [1.0, 0.0, 0.0]
+        svc._memory.graph.add.side_effect = _graph_add(graph, episode_uuid="ep-new", invalidate=["E1"])
+
+        _enrich(svc)
+
+        assert not qdrant.meta("tea").get("dream_tombstoned")
+
+    def test_matching_lone_row_is_tombstoned(self, env):
+        svc, qdrant, graph = env
+        self._seed(qdrant, graph, [1.0, 0.0, 0.0])
+        svc._embed_map["User lives in Berlin"] = [1.0, 0.0, 0.0]
+        svc._memory.graph.add.side_effect = _graph_add(graph, episode_uuid="ep-new", invalidate=["E1"])
+
+        _enrich(svc)
+
+        assert qdrant.meta("tea")["dream_tombstoned"] is True
+
+
+class TestEpisodeKindStampAndPartialFailure:
+    def test_enrich_graph_stamps_single_fact_kind_only_with_flag(self, env, monkeypatch):
+        svc, qdrant, graph = env
+        qdrant.add("new", user="u1", data="x")
+        svc._memory.graph.add.side_effect = _graph_add(graph, episode_uuid="ep-new")
+        _enrich(svc)
+        assert qdrant.meta("new")["graph_episode_kind"] == "fact"
+
+    def test_one_failed_tombstone_does_not_stop_the_rest(self, env):
+        svc, qdrant, graph = env
+        for i in (1, 2):
+            qdrant.add(f"o{i}", user="u1", data="d",
+                       metadata={"graph_episode_uuid": f"ep-{i}", "graph_episode_kind": "fact"})
+            graph.add_edge(f"E{i}", "f", [f"ep-{i}"])
+        qdrant.add("new", user="u1", data="x")
+        svc._memory.graph.add.side_effect = _graph_add(
+            graph, episode_uuid="ep-new", invalidate=["E1", "E2"])
+        real = qdrant.set_payload
+
+        def _flaky(collection_name, payload, points, key=None):
+            if payload.get("dream_tombstoned") and points == ["o1"]:
+                raise RuntimeError("boom")
+            return real(collection_name, payload, points, key)
+
+        qdrant.set_payload = _flaky
+        assert _enrich(svc) is True
+        assert not qdrant.meta("o1").get("dream_tombstoned")
+        assert qdrant.meta("o2")["dream_tombstoned"] is True
+
+
 def _run_extract(svc):
     svc._genai_model.models.generate_content.return_value = MagicMock(
         text='{"facts": ["[personal_fact] Lives in Paris", "[preference] Likes tea"]}'
@@ -418,7 +479,7 @@ class TestSupersededRowsLeaveRecall:
     def test_personal_pool_and_shared_pool_exclude_superseded_row(self, env):
         svc, qdrant, graph = env
         qdrant.add("old", user="u1", data="User lives in Berlin",
-                   metadata={"graph_episode_uuid": "ep-old", "visibility": "shared"})
+                   metadata={"graph_episode_uuid": "ep-old", "graph_episode_kind": "fact", "visibility": "shared"})
         qdrant.add("new", user="u1", data="User lives in Paris", metadata={"visibility": "shared"})
         graph.add_edge("E1", "User lives in Berlin", ["ep-old"])
         m = svc._get_memory()
@@ -445,7 +506,7 @@ class TestSupersededRowsLeaveRecall:
 
     def test_list_memories_excludes_superseded_row(self, env):
         svc, qdrant, graph = env
-        qdrant.add("old", user="u1", data="Berlin", metadata={"graph_episode_uuid": "ep-old"})
+        qdrant.add("old", user="u1", data="Berlin", metadata={"graph_episode_uuid": "ep-old", "graph_episode_kind": "fact"})
         qdrant.add("new", user="u1", data="Paris")
         graph.add_edge("E1", "Berlin", ["ep-old"])
         svc._memory.graph.add.side_effect = _graph_add(graph, episode_uuid="ep-new", invalidate=["E1"])
@@ -550,7 +611,7 @@ class TestFlagOff:
 
     def test_no_cypher_probe_no_tombstone(self, env):
         svc, qdrant, graph = env
-        qdrant.add("old", user="u1", data="Berlin", metadata={"graph_episode_uuid": "ep-old"})
+        qdrant.add("old", user="u1", data="Berlin", metadata={"graph_episode_uuid": "ep-old", "graph_episode_kind": "fact"})
         qdrant.add("new", user="u1", data="Paris")
         graph.add_edge("E1", "Berlin", ["ep-old"])
         svc._memory.graph.add.side_effect = _graph_add(graph, episode_uuid="ep-new", invalidate=["E1"])
@@ -609,7 +670,7 @@ class TestFlagOff:
 class TestFailuresNeverFailTheWrite:
     def test_graph_probe_failure_is_swallowed(self, env):
         svc, qdrant, graph = env
-        qdrant.add("old", user="u1", data="Berlin", metadata={"graph_episode_uuid": "ep-old"})
+        qdrant.add("old", user="u1", data="Berlin", metadata={"graph_episode_uuid": "ep-old", "graph_episode_kind": "fact"})
         qdrant.add("new", user="u1", data="Paris")
         graph.add_edge("E1", "Berlin", ["ep-old"])
         svc._memory.graph.add.side_effect = _graph_add(graph, episode_uuid="ep-new", invalidate=["E1"])
@@ -625,7 +686,7 @@ class TestFailuresNeverFailTheWrite:
 
     def test_qdrant_failure_during_tombstone_is_swallowed(self, env):
         svc, qdrant, graph = env
-        qdrant.add("old", user="u1", data="Berlin", metadata={"graph_episode_uuid": "ep-old"})
+        qdrant.add("old", user="u1", data="Berlin", metadata={"graph_episode_uuid": "ep-old", "graph_episode_kind": "fact"})
         qdrant.add("new", user="u1", data="Paris")
         graph.add_edge("E1", "Berlin", ["ep-old"])
         svc._memory.graph.add.side_effect = _graph_add(graph, episode_uuid="ep-new", invalidate=["E1"])
@@ -642,7 +703,7 @@ class TestFailuresNeverFailTheWrite:
 
     def test_missing_episode_uuid_skips_supersession(self, env):
         svc, qdrant, graph = env
-        qdrant.add("old", user="u1", data="Berlin", metadata={"graph_episode_uuid": "ep-old"})
+        qdrant.add("old", user="u1", data="Berlin", metadata={"graph_episode_uuid": "ep-old", "graph_episode_kind": "fact"})
         graph.add_edge("E1", "Berlin", ["ep-old"])
         svc._memory.graph.add.side_effect = lambda **kw: (graph.invalidate("E1"), {})[1]
 

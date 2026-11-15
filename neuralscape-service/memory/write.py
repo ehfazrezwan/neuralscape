@@ -116,6 +116,7 @@ class WriteMixin:
         episode_uuid: str | None,
         new_memory_ids: set[str],
         superseded_by: str | None = None,
+        single_fact: bool = False,
     ) -> None:
         """Flag-gated post-graph-write hook: tombstone rows whose graph edges
         this write's episode just invalidated (memory/supersession.py).
@@ -127,6 +128,18 @@ class WriteMixin:
         """
         if not settings.graph_supersession_enabled:
             return
+        if single_fact and episode_uuid and superseded_by:
+            # Mark the episode as a single-fact one so the row-level content
+            # gate can be skipped for it (memory/supersession.py).
+            try:
+                self._memory.vector_store.client.set_payload(
+                    collection_name=settings.qdrant_collection,
+                    payload={"graph_episode_kind": "fact"},
+                    points=[superseded_by],
+                    key="metadata",
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"Stamping graph_episode_kind failed (non-fatal): {e}")
         try:
             from memory.supersession import supersede_contradicted_rows
 
@@ -1187,6 +1200,7 @@ class WriteMixin:
                 episode_uuid=episode_uuid,
                 new_memory_ids={memory_id},
                 superseded_by=memory_id,
+                single_fact=True,
             )
             return True
         except Exception as e:

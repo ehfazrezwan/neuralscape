@@ -273,6 +273,8 @@ class CoreMixin:
         ("metadata.dream_tombstoned", "bool"),
         ("metadata.visibility", "keyword"),
         ("metadata.scope", "keyword"),
+        # Graph-contradiction supersession maps edge episodes -> rows.
+        ("metadata.graph_episode_uuid", "keyword"),
     )
 
     def _ensure_filter_indexes(self) -> None:
