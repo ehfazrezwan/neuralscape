@@ -324,8 +324,10 @@ class CoreMixin:
         ("metadata.workspace", "keyword"),
         ("metadata.source_ref.external_id", "keyword"),
         ("metadata.code_liveness_stale", "bool"),
-        # Shared-episode sibling lookup (memory/provenance.py): one scroll per
-        # cascade filters on these; unindexed it scans the collection each time.
+        # Shared-episode sibling lookup (memory/provenance.py) and
+        # graph-contradiction supersession (memory/supersession.py, edge
+        # episode -> row): both scroll on these; unindexed they scan the
+        # collection each time.
         ("metadata.graph_episode_uuid", "keyword"),
         ("metadata.graph_episode_name", "keyword"),
     )
