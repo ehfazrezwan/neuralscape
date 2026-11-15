@@ -546,7 +546,8 @@ async def apply_actions(
                     if act.get("contains_secret") and not act.get("secret_claim_downgraded"):
                         # The one irreversible case: gate-cleared secrets must
                         # not persist, not even as tombstones.
-                        await asyncio.to_thread(service.delete_memory, mid)
+                        deleted = await asyncio.to_thread(service.delete_memory, mid)
+                        await _enqueue_delete_sibling_jobs(deleted)
                     else:
                         # Below-gate secret claims ride the reversible path
                         # (audit 27 #25): tombstone + record the claim for a
@@ -574,6 +575,16 @@ async def apply_actions(
             logger.exception("dream action failed: %s", act.get("type"))
             result.errors.append(f"{act.get('type')}:{act.get('memory_ids')}: {exc.__class__.__name__}")
     return result
+
+
+async def _enqueue_delete_sibling_jobs(deleted) -> None:
+    """Re-ingest the siblings of a hard-deleted fact whose shared graph episode
+    the delete expired (``delete_memory``'s ``graph_jobs``). Non-critical."""
+    jobs = deleted.pop("graph_jobs", None) if isinstance(deleted, dict) else None
+    if jobs:
+        from task_manager import enqueue_graph_jobs_standalone
+
+        await enqueue_graph_jobs_standalone(jobs)
 
 
 # ── Apply primitives (Qdrant + graph) ───────────────────────────────

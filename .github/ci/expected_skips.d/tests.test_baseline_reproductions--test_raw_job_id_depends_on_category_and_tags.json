@@ -1,0 +1,9 @@
+{
+  "test": "tests.test_baseline_reproductions::test_raw_job_id_depends_on_category_and_tags",
+  "reason_contains": "the raw-write job id covers visibility, scope, p",
+  "profiles": [
+    "container",
+    "host"
+  ],
+  "why": "pinned bug: strict-xfail reproduction in test_baseline_reproductions; git rm this file in the PR that fixes the bug"
+}
