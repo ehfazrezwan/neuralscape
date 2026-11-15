@@ -161,15 +161,16 @@ class _Edge:
 def _is_collection_not_found(exc: BaseException) -> bool:
     """True only for a real "collection does not exist" answer from Qdrant.
 
-    Server mode raises ``UnexpectedResponse`` with status 404 (body "Not found:
-    Collection `x` doesn't exist!"); the embedded local mode raises
-    ``ValueError("Collection x not found")``. Anything else (connection reset,
-    5xx, timeout) is a transient fault, not absence.
+    The server client raises ``UnexpectedResponse`` and ONLY HTTP 404 counts: a
+    401 or 5xx whose body happens to say "not found" is a fault, not absence.
+    The embedded local mode has no HTTP status and raises
+    ``ValueError("Collection x not found")``; the text check applies to that
+    case alone. Everything else (connection reset, timeout) is transient.
     """
-    if getattr(exc, "status_code", None) == 404:
-        return True
-    text = str(exc).lower()
-    return "not found" in text or "doesn't exist" in text or "does not exist" in text
+    status = getattr(exc, "status_code", None)
+    if status is not None:
+        return status == 404
+    return isinstance(exc, ValueError) and "not found" in str(exc).lower()
 
 
 def _is_collection_exists_conflict(exc: BaseException) -> bool:
@@ -1716,6 +1717,10 @@ class NativeEngine:
         result = self._run_cypher(cypher, code_space=self.code_space, path=rel_path, hash=file_hash)
         return result[0]["unchanged"] if result else False
 
+    # NOTE: ``adapters/code_graph/queries/*.scm`` are NOT loaded at runtime. Extraction
+    # is the tree walk in ``_parse_python`` / ``_parse_generic`` below; the .scm files
+    # are reference queries kept honest by tests/test_code_intel_engine_fixes.py
+    # (each must compile against its grammar and capture the fixture).
     def _parse_file(self, source_file: Path, repo_root: Path, language: str) -> tuple[list[_Symbol], list[_Edge]]:
         """Parse a source file with tree-sitter and extract symbols/edges.
 

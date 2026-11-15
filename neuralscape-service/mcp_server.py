@@ -2346,6 +2346,13 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
 
                 repo_name = _P(str(repo_source).rstrip("/")).name or "repo"
                 code_space = f"code--{user_id}--{repo_name}"
+            from knowledge.code_dispatch import code_space_access_error, repo_source_error
+
+            refused = code_space_access_error(code_space, user_id) or repo_source_error(
+                repo_source, settings
+            )
+            if refused:
+                return [TextContent(type="text", text=json.dumps({"error": refused}))]
             task_id = await _task_manager.enqueue_code_index({
                 "system": system,
                 "repo_source": repo_source,
@@ -2372,8 +2379,11 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
             if not graph_id or not system:
                 return [TextContent(type="text", text=json.dumps(
                     {"error": "graph_id and system are required"}))]
-            from knowledge.code_dispatch import teardown_code_space
+            from knowledge.code_dispatch import code_space_access_error, teardown_code_space
 
+            denied = code_space_access_error(graph_id, user_id)
+            if denied:
+                return [TextContent(type="text", text=json.dumps({"error": denied}))]
             result = await asyncio.to_thread(
                 teardown_code_space, system, graph_id, user_id, settings
             )
@@ -2417,6 +2427,11 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
                 if not code_space:
                     return [TextContent(type="text", text=json.dumps(
                         {"error": "knowledge_system requires graph_id (the code_space)"}))]
+                from knowledge.code_dispatch import code_space_access_error
+
+                denied = code_space_access_error(code_space, user_id)
+                if denied:
+                    return [TextContent(type="text", text=json.dumps({"error": denied}))]
                 from knowledge.base import RecallRequest
 
                 if explicit_system == "auto":

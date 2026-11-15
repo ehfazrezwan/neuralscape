@@ -52,6 +52,69 @@ def repo_path_for_code_space(code_space: str, settings) -> str | None:
     return str(Path(os.path.expanduser(repo_path)))
 
 
+def code_space_owner(code_space: str | None) -> str | None:
+    """Owner segment of a ``code--<owner>--<repo>`` ref (also ``lib:`` prefixed), else None."""
+    ref = (code_space or "")
+    if ref.startswith("lib:"):
+        ref = ref[len("lib:"):]
+    parts = ref.split("--")
+    if len(parts) < 3 or parts[0] != "code":
+        return None
+    return "--".join(parts[1:-1])
+
+
+def code_space_access_error(code_space: str | None, caller: str | None) -> str | None:
+    """None when ``caller`` may act on ``code_space``; otherwise the refusal reason.
+
+    A code_space is owned by its ``<owner>`` segment. The owner and admins
+    (``auth.is_admin_user``: the listed DICTATOR_USER_IDS, or the default user
+    when that list is empty) may index, read and delete it. Refs that are not
+    ``code--`` spaces (``repo:<name>``, artifact ids) are scoped elsewhere.
+    """
+    owner = code_space_owner(code_space)
+    if owner is None:
+        return None
+    if caller and caller == owner:
+        return None
+    from auth import is_admin_user
+
+    if is_admin_user(caller):
+        return None
+    return (
+        f"code_space {code_space!r} belongs to {owner!r}; "
+        "only its owner or an admin may index, read or delete it"
+    )
+
+
+def repo_source_error(repo_source: str | None, settings) -> str | None:
+    """None when ``repo_source`` is (inside) a directory mapped in CODE_REPOS.
+
+    Compares real paths, so ``..`` traversal and symlinks that point outside a
+    mapped directory are refused. Applies to every engine: indexing reads the
+    server disk, and only operator-configured directories are allowed.
+    """
+    from adapters.code_graph.engine import CODE_REPOS_REQUIREMENT
+
+    repos = getattr(settings, "code_repos", {}) or {}
+    if not repo_source:
+        return "repo_source is required. " + CODE_REPOS_REQUIREMENT
+    try:
+        target = os.path.realpath(os.path.expanduser(str(repo_source)))
+    except (OSError, ValueError):
+        return f"repo_source {repo_source!r} is not a valid path. " + CODE_REPOS_REQUIREMENT
+    for configured in repos.values():
+        root = os.path.realpath(os.path.expanduser(str(configured)))
+        try:
+            if os.path.commonpath([root, target]) == root:
+                return None
+        except ValueError:  # different drives / mixed absolute+relative
+            continue
+    return (
+        f"repo_source {repo_source!r} is not inside any directory in CODE_REPOS "
+        f"(configured: {', '.join(sorted(repos)) or 'none'}). " + CODE_REPOS_REQUIREMENT
+    )
+
+
 def code_repos_error(code_space: str, settings) -> str | None:
     """Explain why ``code_space`` has no server-side repo, or None when it has one.
 
@@ -98,6 +161,11 @@ def resolve_code_engine(
         not configured, bridge down) — callers degrade to the base answer.
     """
     from adapters.code_graph import query as cg_query
+
+    denied = code_space_access_error(code_space, user_id)
+    if denied:
+        logger.warning("resolve_code_engine refused: %s (caller=%s)", denied, user_id)
+        return None
 
     if system_name == "code-cbm":
         return _resolve_cbm_engine(code_space, settings, for_index=for_index)
@@ -157,6 +225,22 @@ _cbm_unbound_until: dict[str, float] = {}
 _CBM_NEG_TTL = 15.0
 
 
+def _bind_cbm_project(engine, code_space: str, settings) -> str | None:
+    """Bind ``engine`` to its CBM project slug via one bridge call (None if unbindable).
+
+    The single place that maps code_space -> CODE_REPOS path -> bridge
+    ``/index_status`` slug; the read path and teardown both use it.
+    """
+    repo_path = repo_path_for_code_space(code_space, settings)
+    if not repo_path:
+        return None
+    try:
+        return engine.resolve_project_from_source(repo_path)
+    except Exception:  # noqa: BLE001
+        logger.warning("could not resolve CBM slug for %s", code_space, exc_info=True)
+        return None
+
+
 def _resolve_cbm_engine(code_space: str, settings, *, for_index: bool):
     """Build/get a CBMEngine bound to ``code_space`` (project slug via the bridge).
 
@@ -191,8 +275,7 @@ def _resolve_cbm_engine(code_space: str, settings, *, for_index: bool):
     if exp is not None and time.monotonic() < exp:
         return None
 
-    repo_path = repo_path_for_code_space(code_space, settings)
-    slug = engine.resolve_project_from_source(repo_path) if repo_path else None
+    slug = _bind_cbm_project(engine, code_space, settings)
     if not slug:
         # Unbindable (bridge down / repo not indexed / not configured). Degrade:
         # return None so the caller answers from base / returns a clean error.
@@ -236,6 +319,15 @@ def teardown_code_space(
     Idempotent. Returns a structured result; ``deleted`` is False (with a
     reason) when the space is unbindable or the engine has no teardown.
     """
+    denied = code_space_access_error(code_space, user_id)
+    if denied:
+        return {
+            "deleted": False,
+            "system": system_name,
+            "code_space": code_space,
+            "reason": denied,
+            "forbidden": True,
+        }
     engine = resolve_code_engine(
         system_name, code_space, user_id, settings, for_index=True
     )
@@ -250,15 +342,7 @@ def teardown_code_space(
     # CBM's delete_project needs the project slug; the index ran in another
     # process, so bind it from the bridge if this instance hasn't resolved it.
     if system_name == "code-cbm" and not getattr(engine, "project", None):
-        repo_path = repo_path_for_code_space(code_space, settings)
-        if repo_path:
-            try:
-                engine.resolve_project_from_source(repo_path)
-            except Exception:  # noqa: BLE001
-                logger.warning(
-                    "teardown_code_space: could not resolve CBM slug for %s",
-                    code_space, exc_info=True,
-                )
+        _bind_cbm_project(engine, code_space, settings)
 
     teardown = getattr(engine, "teardown", None)
     if not callable(teardown):

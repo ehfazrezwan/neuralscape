@@ -41,6 +41,10 @@ from adapters.code_graph.semantic import CodeGraphError, load_code_graph
 logger = logging.getLogger(__name__)
 
 
+class CodeSpaceForbidden(CodeGraphError):
+    """The caller does not own the requested code_space (and is not an admin)."""
+
+
 class CodeGraphNotConfigured(CodeGraphError):
     """No graph.json to query: no graph_id given and no default path configured."""
 
@@ -105,6 +109,15 @@ def get_engine(graph_id: str | None, user_id: str, settings) -> CodeIntelEngine:
         CodeGraphNotConfigured: No graph_id and no default configured.
         CodeGraphError: graph_id doesn't resolve or repo path not found.
     """
+    # A code_space belongs to its <owner> segment: only the owner or an admin
+    # may read it (repo:<name> refs are scoped to the caller by construction).
+    if graph_id:
+        from knowledge.code_dispatch import code_space_access_error
+
+        denied = code_space_access_error(graph_id, user_id)
+        if denied:
+            raise CodeSpaceForbidden(denied)
+
     # Phase F: detect lib:<code_space> refs (GraphifyLibEngine in-process)
     if graph_id and graph_id.startswith("lib:"):
         code_space = graph_id.removeprefix("lib:")

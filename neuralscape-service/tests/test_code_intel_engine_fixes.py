@@ -87,12 +87,20 @@ def test_ensure_local_mode_not_found_creates(engine):
     client.create_collection.assert_called_once()
 
 
-def test_ensure_plain_not_found_exception_creates(engine):
-    """A client that surfaces absence as a bare exception with Qdrant's wording."""
+def test_ensure_500_whose_body_says_not_found_is_not_absence(engine):
+    client = MagicMock()
+    client.get_collection.side_effect = _qdrant_error(500, b"Not found: shard does not exist")
+    with pytest.raises(RuntimeError, match="(?s)not attempting to create"):
+        engine._ensure_code_index_collection(_mem(client), vector_size=8)
+    client.create_collection.assert_not_called()
+
+
+def test_ensure_bare_exception_with_not_found_text_is_not_absence(engine):
     client = MagicMock()
     client.get_collection.side_effect = Exception("Not found")
-    engine._ensure_code_index_collection(_mem(client), vector_size=8)
-    client.create_collection.assert_called_once()
+    with pytest.raises(RuntimeError):
+        engine._ensure_code_index_collection(_mem(client), vector_size=8)
+    client.create_collection.assert_not_called()
 
 
 def test_ensure_create_409_already_exists_is_success(engine):

@@ -85,7 +85,25 @@ def code_repos(flags, monkeypatch, repo_dir):
 
 
 @pytest.fixture
-def native_on(monkeypatch, code_repos):
+def registry_snapshot():
+    """Restore the knowledge registry exactly as it was, even if the test fails.
+
+    Registration runs at import time, so the flag-on tests reload ``knowledge``;
+    that replaces entries (a fresh ns-memory base, new code systems). The
+    finalizer puts back the original objects so nothing leaks into later tests.
+    """
+    from knowledge.registry import KNOWLEDGE_REGISTRY
+
+    saved = dict(KNOWLEDGE_REGISTRY)
+    try:
+        yield saved
+    finally:
+        KNOWLEDGE_REGISTRY.clear()
+        KNOWLEDGE_REGISTRY.update(saved)
+
+
+@pytest.fixture
+def native_on(monkeypatch, code_repos, registry_snapshot):
     """Re-run knowledge registration with CODE_NATIVE_ENABLED=true."""
     import knowledge
     from knowledge.registry import KNOWLEDGE_REGISTRY
@@ -94,7 +112,6 @@ def native_on(monkeypatch, code_repos):
     importlib.reload(knowledge)
     assert "code-native" in KNOWLEDGE_REGISTRY, "CODE_NATIVE_ENABLED=true did not register code-native"
     yield
-    KNOWLEDGE_REGISTRY.pop("code-native", None)
 
 
 def test_native_engine_end_to_end_through_registry_and_router(stores, llm_key, unique_ns, native_on, code_repos, repo_dir):
@@ -171,18 +188,29 @@ def test_native_engine_end_to_end_through_registry_and_router(stores, llm_key, u
     second = _recall(_bind("code-native", code_space, user_id, "neighbors"), query="render", label="render", operation="neighbors")
     assert first.content == second.content
 
-    # 3. The repo-not-on-server error names CODE_REPOS (by design: operator-side).
-    missing = asyncio.run(
+    # 3. Operator-side by design: a path outside CODE_REPOS is refused for the NATIVE
+    #    engine too (real resolver, real stores), and the error names CODE_REPOS.
+    for source in ("/nope", str(repo_dir / "..")):
+        missing = asyncio.run(
+            worker.process_code_index(
+                {"service": get_shared_service()},
+                {"system": "code-native", "repo_source": source, "code_space": f"code--{user_id}--nope", "user_id": user_id},
+            )
+        )
+        assert missing["ok"] is False
+        assert "CODE_REPOS" in missing["error"] and "server" in missing["error"]
+
+    # 4. Another user cannot index into this user's space.
+    foreign = asyncio.run(
         worker.process_code_index(
             {"service": get_shared_service()},
-            {"system": "code-graphify-lib", "repo_source": "/nope", "code_space": f"code--{user_id}--nope", "user_id": user_id},
+            {"system": "code-native", "repo_source": str(repo_dir), "code_space": code_space, "user_id": "someone-else"},
         )
     )
-    assert missing["ok"] is False
-    assert "CODE_REPOS" in missing["error"] and "server" in missing["error"]
+    assert foreign["ok"] is False and unique_ns.user_id in foreign["error"]
 
 
-def test_graphify_lib_binds_and_answers_for_code_repos_fixture(unique_ns, code_repos):
+def test_graphify_lib_binds_and_answers_for_code_repos_fixture(unique_ns, code_repos, registry_snapshot):
     """graphify-lib is on by default with the code-graph extra: no flag, no stores."""
     from knowledge.registry import get_system
 
@@ -210,7 +238,7 @@ def _cbm_bridge_url() -> str | None:
         return None
 
 
-def test_cbm_engine_indexes_and_answers_when_bridge_reachable(unique_ns, code_repos, repo_dir, monkeypatch):
+def test_cbm_engine_indexes_and_answers_when_bridge_reachable(unique_ns, code_repos, repo_dir, registry_snapshot, monkeypatch):
     """Needs the cbm-bridge container + CBM binary (not in the standard store stack).
 
     The bridge indexes by path, so the repo copy's directory must be visible to the
@@ -223,7 +251,6 @@ def test_cbm_engine_indexes_and_answers_when_bridge_reachable(unique_ns, code_re
             "(the gate's store stack does not run it)"
         )
     import knowledge
-    from knowledge.registry import KNOWLEDGE_REGISTRY
 
     monkeypatch.setenv("CBM_ENABLED", "true")
     importlib.reload(knowledge)
@@ -249,4 +276,4 @@ def test_cbm_engine_indexes_and_answers_when_bridge_reachable(unique_ns, code_re
         loc = _recall(_bind("code-cbm", code_space, user_id, "locate"), query="format_name", operation="locate", limit=5)
         assert loc.hits, loc.content
     finally:
-        KNOWLEDGE_REGISTRY.pop("code-cbm", None)
+        pass  # registry_snapshot restores the registry

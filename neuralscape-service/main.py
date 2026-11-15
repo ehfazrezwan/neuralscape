@@ -1234,11 +1234,22 @@ def _code_graph_or_501():
 
 
 def _map_code_graph_error(e: Exception) -> HTTPException:
-    from adapters.code_graph.query import CodeGraphNotConfigured
+    from adapters.code_graph.query import CodeGraphNotConfigured, CodeSpaceForbidden
 
+    if isinstance(e, CodeSpaceForbidden):
+        return HTTPException(status_code=403, detail=str(e))
     if isinstance(e, CodeGraphNotConfigured):
         return HTTPException(status_code=400, detail=str(e))
     return HTTPException(status_code=404, detail=str(e))
+
+
+def _require_code_space_access(code_space: str | None, caller: str) -> None:
+    """403 unless ``caller`` owns ``code_space`` or is an admin (no-op for non-code-space refs)."""
+    from knowledge.code_dispatch import code_space_access_error
+
+    denied = code_space_access_error(code_space, caller)
+    if denied:
+        raise HTTPException(status_code=403, detail=denied)
 
 
 async def _dispatch_code_system(
@@ -1284,6 +1295,7 @@ async def _dispatch_code_system(
             status_code=400,
             detail="knowledge_system requires graph_id (the code_space, e.g. code--owner--repo)",
         )
+    _require_code_space_access(code_space, caller)
 
     if knowledge_system == "auto":
         # AR2 auto-selection: resolve + bind the best healthy engine for this op,
@@ -1651,6 +1663,12 @@ async def v1_code_graph_index(req: CodeIndexRequest, request: Request):
 
         repo_name = _P(req.repo_source.rstrip("/")).name or "repo"
         code_space = f"code--{caller}--{repo_name}"
+    _require_code_space_access(code_space, caller)
+    from knowledge.code_dispatch import repo_source_error
+
+    refused = repo_source_error(req.repo_source, settings)
+    if refused:
+        raise HTTPException(status_code=400, detail=refused)
 
     payload = {
         "system": req.system,
@@ -1691,6 +1709,7 @@ async def v1_code_graph_delete(
     """
     _code_graph_or_501()
     caller = _resolve_user_id(request, user_id)
+    _require_code_space_access(graph_id, caller)
     from knowledge.code_dispatch import teardown_code_space
 
     result = await asyncio.to_thread(
