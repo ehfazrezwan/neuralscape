@@ -4,6 +4,8 @@ Provides both legacy endpoints (root) and new v1 endpoints with scoping,
 categories, and a shared MemoryService business logic layer.
 """
 
+import third_party_telemetry  # noqa: F401 — must precede any mem0/Graphiti import (defaults their telemetry off)
+
 import asyncio
 import base64
 import hashlib
@@ -253,7 +255,7 @@ app = FastAPI(
 )
 
 # Register Bearer token auth middleware (fail-closed; see auth.py and AUTH.md)
-from auth import BearerAuthMiddleware
+from auth import BearerAuthMiddleware, is_admin_user, resolve_request_user_id
 
 app.add_middleware(BearerAuthMiddleware)
 
@@ -822,27 +824,11 @@ v1_router = APIRouter(prefix="/v1", tags=["v1"])
 def _resolve_user_id(request: Request, body_user_id: str | None) -> str:
     """Resolve the authoritative user_id for a v1 request.
 
-    - When the auth middleware verified a per-user token, ``request.state.user_id``
-      is set; that wins. If the body also supplied ``user_id`` and they disagree,
-      reject with 400 to prevent token-vs-body identity confusion.
-    - Legacy shared-key callers don't have ``request.state.user_id``; we trust
-      the body's ``user_id`` as before.
-    - When neither path supplies an id, fall back to ``settings.default_user_id``.
-
-    Raises HTTPException(400) on token/body mismatch.
+    Thin delegate to ``auth.resolve_request_user_id`` (shared with extension
+    routers, which cannot import main). Token user wins; a disagreeing body
+    user_id is a 400; legacy shared-key callers use the body or the default.
     """
-    token_user_id = getattr(request.state, "user_id", None)
-    if token_user_id:
-        if body_user_id and body_user_id != token_user_id:
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    f"Request body user_id ({body_user_id!r}) does not match the "
-                    f"user_id encoded in the auth token ({token_user_id!r})."
-                ),
-            )
-        return token_user_id
-    return body_user_id or settings.default_user_id
+    return resolve_request_user_id(request, body_user_id)
 
 
 def _authorize_standard_write(user_id: str, visibility) -> None:
@@ -2119,6 +2105,10 @@ async def v1_search_memories(req: SearchMemoryRequest, request: Request):
     When project_id is provided, searches both global and project memories.
     Memory-model v2 filters (domain, observation_type, concepts) are optional.
 
+    Code-graph fusion ([structure]/[semantics] sections) is applied only by the
+    MCP recall_memories tool, when the project has a knowledge config with a
+    code_space. This REST endpoint returns plain ranked memories by design.
+
     Multi-user: results combine the caller's personal memories with the
     shared pool. Pass `visibility="private"` to restrict to personal only,
     `visibility="shared"` to restrict to the team pool, or
@@ -3290,20 +3280,29 @@ async def v1_list_extensions():
 
 
 @v1_router.post("/extensions/events")
-async def v1_emit_extension_event(req: EmitEventRequest):
+async def v1_emit_extension_event(req: EmitEventRequest, request: Request):
     """Post an event to all registered extensions.
 
     Broadcasts the event to extensions whose manifest.hooks includes
     the given event_type. Useful for external callers (e.g. OpenClaw hooks).
     For known event types, validates the payload against the expected schema.
     """
+    # Bind the payload identity to the token: extensions (conversation
+    # compiler) take payload["user_id"] as the namespace to write into.
+    # Legacy shared-key callers are unchanged (no token user to bind to).
+    payload = req.payload
+    token_user_id = getattr(request.state, "user_id", None)
+    if token_user_id:
+        payload = dict(payload or {})
+        payload["user_id"] = _resolve_user_id(request, payload.get("user_id"))
+
     # Validate payload for known event types
     try:
         event_enum = EventType(req.event_type)
         payload_model = EVENT_PAYLOAD_MODELS.get(event_enum)
         if payload_model is not None:
             try:
-                payload_model.model_validate(req.payload)
+                payload_model.model_validate(payload)
             except Exception as e:
                 raise HTTPException(
                     status_code=422,
@@ -3312,7 +3311,7 @@ async def v1_emit_extension_event(req: EmitEventRequest):
     except ValueError:
         pass  # Unknown/custom event type — allow pass-through
 
-    result = await _extension_registry.emit_event(req.event_type, req.payload)
+    result = await _extension_registry.emit_event(req.event_type, payload)
     return {
         "status": "ok",
         "event_type": req.event_type,
@@ -3365,8 +3364,20 @@ async def v1_get_project_knowledge_config(project_id: str):
 
 
 @v1_router.put("/projects/{project_id}/knowledge-config", response_model=ProjectKnowledgeConfigResponse)
-async def v1_set_project_knowledge_config(project_id: str, req: ProjectKnowledgeConfigRequest):
-    """Set/update a project's knowledge routing config (Phase D)."""
+async def v1_set_project_knowledge_config(
+    project_id: str, req: ProjectKnowledgeConfigRequest, request: Request
+):
+    """Set/update a project's knowledge routing config (Phase D).
+
+    Dictator-only (mirrors project-wide extraction instructions): the config
+    is shared by every user of the project.
+    """
+    user_id = _resolve_user_id(request, None)
+    if not is_admin_user(user_id):
+        raise HTTPException(
+            status_code=403,
+            detail=f"User {user_id!r} is not authorized to set project knowledge config.",
+        )
     from knowledge.router import ProjectKnowledgeConfig, set_project_config
 
     config = ProjectKnowledgeConfig(
