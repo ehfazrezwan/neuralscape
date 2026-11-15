@@ -220,11 +220,19 @@ The plugin's conversation capture also understands OpenClaw events. OpenClaw doe
 
 What the adapter does with the events:
 
-- `message:received` is remembered (the user's text), `message:sent` is the assistant's reply: the two are paired into one turn, because OpenClaw's documented `message:sent` context (`to`, `content`, `success`, `channelId`) carries no user message. A payload that does carry `userMessage` / `user_message` is used as is.
+- `message:received` is remembered (the user's text, with `<private>` spans redacted before it is written, one 0600 file per message, consumed by the next reply), `message:sent` is the assistant's reply: the two are paired into one turn, because OpenClaw's documented `message:sent` context (`to`, `content`, `success`, `channelId`) carries no user message. A payload that does carry `userMessage` / `user_message` is used as is.
 - Project: the documented `message:sent` / `message:received` contexts carry no working directory, so turns are **global scope** unless you set the `PROJECT_ID` setting (`NEURALSCAPE_PROJECT_ID`), or the payload carries a `workspaceDir` / `cwd`, which is resolved like Claude Code's `cwd`.
 - `session:end` triggers the day's compile unless the payload reports fewer than 2 messages.
+- Excluded projects (`EXCLUDED_PROJECTS`) are checked against the same project the adapter files the turn under (workspace directory or `PROJECT_ID` override), not the hook runner's directory.
 
-**Unverified against a live OpenClaw.** From OpenClaw's public docs ([hooks](https://docs.openclaw.ai/automation/hooks.md), [event types](https://docs.openclaw.ai/automation/hooks/event-types.md), [writing hooks](https://docs.openclaw.ai/automation/hooks/writing-hooks.md)): internal hooks are described there as a directory with `HOOK.md` plus a JavaScript/TypeScript handler running in the gateway process, not as a JSON command manifest; the docs name no environment variable for a hook's install directory (so the manifest uses the absolute `$HOME/.openclaw/hooks/neuralscape/...` path instead of an unconfirmed `${PLUGIN_ROOT}`); and they list no `session:end` internal event (`session_end` is a typed plugin hook). The payload shapes above follow the documented event contexts; the command-manifest format and the `session:end` payload have not been confirmed on a running OpenClaw. If your build wants a `HOOK.md` handler, write a thin handler that spawns the same `scripts/*.js` with the event JSON on stdin.
+**Unverified against a live OpenClaw.** Nothing here has been run on a real OpenClaw instance. Read from its public docs ([hooks](https://docs.openclaw.ai/automation/hooks.md), [event types](https://docs.openclaw.ai/automation/hooks/event-types.md), [writing hooks](https://docs.openclaw.ai/automation/hooks/writing-hooks.md)): internal hooks are described as a directory with `HOOK.md` plus a JavaScript/TypeScript handler running in the gateway process, not as a JSON command manifest; no environment variable for a hook's install directory is documented; and no `session:end` internal event is listed (`session_end` is a typed plugin hook). So, plainly:
+
+- **The command manifest itself** (`hooks/openclaw-hooks.json`) is this plugin's own format; whether OpenClaw reads it is unconfirmed.
+- **`$HOME` expansion** in the manifest's command strings is unconfirmed (the manifest avoids an unconfirmed `${PLUGIN_ROOT}` by using the absolute `$HOME/.openclaw/hooks/neuralscape/...` path, but the framework may or may not run commands through a shell). If it does not expand `$HOME`, write the absolute path.
+- **The `message:received` event name** and its `from` / `content` / `channelId` context are taken from the event-types page above; the pairing depends on that event firing before `message:sent`.
+- **The `session:end` payload** is unconfirmed.
+
+The payload shapes the adapter reads follow the documented event contexts and are covered by tests against fixture payloads, which prove the plugin side only. If your build wants a `HOOK.md` handler, write a thin handler that spawns the same `scripts/*.js` with the event JSON on stdin.
 
 ## Configuration
 

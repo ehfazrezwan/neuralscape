@@ -15,6 +15,7 @@
 import { readFile, unlink, writeFile } from "node:fs/promises";
 
 import {
+  COMPILE_ARMED_SUFFIX,
   type BufferStats,
   getBufferPath,
   getBufferStats,
@@ -74,11 +75,16 @@ export interface CompileMarker {
   lineCount: number;
   /** Injection time (ms since epoch). */
   injectedAt: number;
+  /**
+   * Timestamp of the buffer's first row at injection. A different first row
+   * means the buffer was truncated and refilled since, whatever its size now.
+   */
+  firstTs?: string | null;
 }
 
 /** Path of the per-buffer cool-down marker (next to the buffer; the buffer's own name keeps it per-session). */
 export function getCompileMarkerPath(bufferPath: string): string {
-  return bufferPath + ".compile-armed";
+  return bufferPath + COMPILE_ARMED_SUFFIX;
 }
 
 /**
@@ -87,7 +93,8 @@ export function getCompileMarkerPath(bufferPath: string): string {
  * buffer was truncated, so an ignored (or still running) compile re-prompted
  * on every turn. Now it is injected once per crossing and re-armed when
  *   - there is no marker (first crossing),
- *   - the buffer is smaller than at the last injection (it was truncated and refilled),
+ *   - the buffer was truncated and refilled: it is smaller than at the last
+ *     injection, or its first row is no longer the one seen then,
  *   - the buffer grew by another `threshold` rows since the last injection, or
  *   - the last injection is itself `ageMinutes` old.
  */
@@ -100,6 +107,7 @@ export function shouldInjectNow(
 ): boolean {
   if (!marker) return true;
   if (stats.lineCount < marker.lineCount) return true;
+  if (marker.firstTs !== undefined && (stats.oldestTs ?? null) !== marker.firstTs) return true;
   if (stats.lineCount >= marker.lineCount + threshold) return true;
   if (now - marker.injectedAt >= ageMinutes * 60_000) return true;
   return false;
@@ -109,7 +117,11 @@ export async function readCompileMarker(bufferPath: string): Promise<CompileMark
   try {
     const parsed = JSON.parse(await readFile(getCompileMarkerPath(bufferPath), "utf-8"));
     if (Number.isFinite(parsed?.lineCount) && Number.isFinite(parsed?.injectedAt)) {
-      return { lineCount: parsed.lineCount, injectedAt: parsed.injectedAt };
+      return {
+        lineCount: parsed.lineCount,
+        injectedAt: parsed.injectedAt,
+        ...(typeof parsed.firstTs === "string" || parsed.firstTs === null ? { firstTs: parsed.firstTs } : {}),
+      };
     }
   } catch {
     // missing or unreadable: behave as if never injected
@@ -171,7 +183,11 @@ async function main(): Promise<void> {
       outputContinue();
       return;
     }
-    await writeCompileMarker(stats.path, { lineCount: stats.lineCount, injectedAt: Date.now() });
+    await writeCompileMarker(stats.path, {
+      lineCount: stats.lineCount,
+      injectedAt: Date.now(),
+      firstTs: stats.oldestTs,
+    });
 
     outputHookResult({
       continue: true,

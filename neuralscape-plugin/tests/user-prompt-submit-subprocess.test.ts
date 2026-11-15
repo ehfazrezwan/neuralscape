@@ -62,6 +62,16 @@ describe("user-prompt-submit.js cool-down", () => {
     expect(additionalContext(await prompt(dataDir))).toContain("**10 tool observations**");
   });
 
+  it("re-arms after truncate-and-refill even when the refill passes the old count between prompts", async () => {
+    const { dataDir, buffer } = await setup(10);
+    expect(additionalContext(await prompt(dataDir))).toContain("**10 tool observations**");
+    expect(additionalContext(await prompt(dataDir))).toBe("");
+    // The compile ran and emptied the buffer, and 12 new rows arrived before the next prompt.
+    await new Promise((r) => setTimeout(r, 15));
+    await writeFile(buffer, Array.from({ length: 12 }, (_, i) => row(i)).join(""), "utf-8");
+    expect(additionalContext(await prompt(dataDir))).toContain("**12 tool observations**");
+  });
+
   it("re-arms when the last injection is older than the age window", async () => {
     const { dataDir, buffer } = await setup(10);
     expect(additionalContext(await prompt(dataDir))).toContain("Compile Observations");

@@ -121,6 +121,46 @@ describe("pairing message:received with message:sent", () => {
     const [turn] = await extractOpenClawTurns({ ...sent({ content: "a", userMessage: "inline" }), sessionKey: "agent:main:telegram" });
     expect(turn.userMessage).toBe("inline");
   });
+  it("redacts <private> spans before anything is written to disk, and writes 0600 files", async () => {
+    const { readdirSync, readFileSync, statSync } = await import("node:fs");
+    await extractOpenClawTurns(received("my key is <private>sk-LIVE-123</private> please remember the plan"));
+    const dir = join(dataDir, "observations");
+    const files = readdirSync(dir).filter((f) => f.startsWith("openclaw-"));
+    expect(files).toHaveLength(1);
+    const onDisk = readFileSync(join(dir, files[0]), "utf-8");
+    expect(onDisk).not.toContain("sk-LIVE-123");
+    expect(onDisk).toContain("[redacted");
+    expect(statSync(join(dir, files[0])).mode & 0o777).toBe(0o600);
+    const [turn] = await extractOpenClawTurns({ ...sent({ content: "ok then" }), sessionKey: "agent:main:telegram" });
+    expect(turn.userMessage).not.toContain("sk-LIVE-123");
+  });
+  it("two inbound messages before one reply are both kept, oldest first", async () => {
+    await extractOpenClawTurns(received("first part"));
+    await new Promise((r) => setTimeout(r, 5));
+    await extractOpenClawTurns(received("second part"));
+    const [turn] = await extractOpenClawTurns({ ...sent({ content: "reply" }), sessionKey: "agent:main:telegram" });
+    expect(turn.userMessage).toBe("first part\nsecond part");
+  });
+  it("never reads a half-written file: the temp file is ignored and the finished one is taken later", async () => {
+    const { mkdirSync, renameSync, writeFileSync: wf } = await import("node:fs");
+    const dir = join(dataDir, "observations");
+    mkdirSync(dir, { recursive: true });
+    // A writer in progress: content exists only under the temp name.
+    const final = join(dir, "openclaw-agent_main_telegram.inbound.000000000000001-1-aaaaaa.lastturn");
+    wf(final + ".tmp", "par");
+    const early = await extractOpenClawTurns({ ...sent({ content: "reply" }), sessionKey: "agent:main:telegram" });
+    expect(early[0].userMessage).toBe("");
+    // The writer finishes (rename is the commit point): the next reply gets it whole.
+    wf(final + ".tmp", "partial text, now complete");
+    renameSync(final + ".tmp", final);
+    const later = await extractOpenClawTurns({ ...sent({ content: "reply 2" }), sessionKey: "agent:main:telegram" });
+    expect(later[0].userMessage).toBe("partial text, now complete");
+  });
+  it("an empty inbound is not stored", async () => {
+    const { existsSync } = await import("node:fs");
+    await extractOpenClawTurns(received("   "));
+    expect(existsSync(join(dataDir, "observations"))).toBe(false);
+  });
   it("keys on the conversation or channel when there is no session key, and survives an unwritable data dir", async () => {
     await extractOpenClawTurns({ type: "message", action: "received", context: { content: "by conv", conversationId: "c-1" } });
     const [turn] = await extractOpenClawTurns({ type: "message", action: "sent", context: { content: "r", conversationId: "c-1" } });

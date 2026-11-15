@@ -8,17 +8,18 @@
  * outgoing text (`content`, `to`, `success`, `channelId`, …) and NO user
  * message; the user's text arrives in the earlier `message:received` event
  * (`content`, `from`, `channelId`, …). So `message:received` is remembered per
- * session (a small file next to the observation buffers, consumed by the next
+ * session (a small file per message next to the observation buffers, consumed by the next
  * `message:sent`) and paired into the turn. A payload that carries the user
  * message itself (`userMessage` / `user_message`) is used as is.
  * Source: https://docs.openclaw.ai/automation/hooks/event-types.md
  */
 
-import { mkdir, readFile, unlink, writeFile } from "node:fs/promises";
+import { randomBytes } from "node:crypto";
+import { mkdir, readdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { join as pathJoin } from "node:path";
 
 import type { ConversationTurn, SessionEndInput } from "../core/types.js";
-import { getObservationDir, getProjectId, getUserId, logError, readConfig } from "../utils.js";
+import { getObservationDir, getProjectId, getUserId, logError, readConfig, redactPrivate } from "../utils.js";
 
 interface OpenClawContext {
   to?: string;
@@ -53,28 +54,57 @@ export function resolveOpenClawProjectId(raw: Record<string, unknown>): string |
   return readConfig("PROJECT_ID", "").trim() || undefined;
 }
 
-/** File (next to the observation buffers) holding the last inbound user message of a session. */
-function inboundPath(raw: Record<string, unknown>, ctx: OpenClawContext): string {
+const INBOUND_SUFFIX = ".lastturn";
+
+/** Filename stem shared by every remembered inbound message of one session. */
+function inboundStem(raw: Record<string, unknown>, ctx: OpenClawContext): string {
   const key = (raw.sessionKey as string) || ctx.conversationId || ctx.channelId || "unknown";
   const safe = key.replace(/[^A-Za-z0-9._-]/g, "_") || "unknown";
-  return pathJoin(getObservationDir(), `openclaw-${safe}.inbound.lastturn`);
+  return `openclaw-${safe}.inbound.`;
 }
 
+/**
+ * Remember the user's text (private spans redacted BEFORE it touches disk).
+ * One file per inbound message, written under a temp name and renamed into
+ * place, so a concurrent reader never sees a half-written file and two
+ * inbound messages before a reply do not overwrite each other. Files end in
+ * `.lastturn`, so the SessionStart orphan sweep ages them out.
+ */
 async function rememberInbound(raw: Record<string, unknown>, ctx: OpenClawContext): Promise<void> {
+  const text = redactPrivate(ctx.content || "");
+  if (!text.trim()) return;
   try {
-    await mkdir(getObservationDir(), { recursive: true });
-    await writeFile(inboundPath(raw, ctx), ctx.content || "", { encoding: "utf-8", mode: 0o600 });
+    const dir = getObservationDir();
+    await mkdir(dir, { recursive: true });
+    const unique = `${String(Date.now()).padStart(15, "0")}-${process.pid}-${randomBytes(3).toString("hex")}`;
+    const final = pathJoin(dir, `${inboundStem(raw, ctx)}${unique}${INBOUND_SUFFIX}`);
+    const tmp = `${final}.tmp`;
+    await writeFile(tmp, text, { encoding: "utf-8", mode: 0o600 });
+    await rename(tmp, final);
   } catch (error) {
     logError("openclaw: could not remember the inbound message", error);
   }
 }
 
+/** Consume the session's remembered inbound messages (oldest first, joined). Temp files are never read. */
 async function takeInbound(raw: Record<string, unknown>, ctx: OpenClawContext): Promise<string> {
-  const path = inboundPath(raw, ctx);
+  const stem = inboundStem(raw, ctx);
   try {
-    const text = await readFile(path, "utf-8");
-    await unlink(path);
-    return text;
+    const dir = getObservationDir();
+    const names = (await readdir(dir)).filter((n) => n.startsWith(stem) && n.endsWith(INBOUND_SUFFIX)).sort();
+    const parts: string[] = [];
+    for (const name of names) {
+      const path = pathJoin(dir, name);
+      try {
+        const text = await readFile(path, "utf-8");
+        // Claim it by unlinking; if another hook already did, it is theirs.
+        await unlink(path);
+        if (text.trim()) parts.push(text);
+      } catch {
+        // gone (claimed by a concurrent hook) — skip
+      }
+    }
+    return parts.join("\n");
   } catch {
     return "";
   }

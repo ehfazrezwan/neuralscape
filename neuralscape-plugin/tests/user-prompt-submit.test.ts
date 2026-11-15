@@ -259,6 +259,14 @@ describe("shouldInjectNow (once per threshold crossing)", () => {
     expect(shouldInjectNow(st(26), marker, 25, 30, now)).toBe(true);
   });
 
+  it("re-arms when the buffer was truncated and refilled PAST the old count between two prompts", () => {
+    const marker = { lineCount: 25, injectedAt: now - 1 * MIN, firstTs: "2026-11-16T10:00:00.000Z" };
+    const refilled = { ...st(30), oldestTs: "2026-11-16T11:30:00.000Z" };
+    expect(shouldInjectNow(refilled, marker, 25, 30, now)).toBe(true);
+    // same first row: still the same fill, stays quiet
+    expect(shouldInjectNow({ ...st(30), oldestTs: marker.firstTs }, marker, 25, 30, now)).toBe(false);
+  });
+
   it("re-arms when the buffer was truncated and refilled below the old count", () => {
     const marker = { lineCount: 80, injectedAt: now - 1 * MIN };
     expect(shouldInjectNow(st(25), marker, 25, 30, now)).toBe(true);
@@ -277,6 +285,10 @@ describe("compile marker file", () => {
     expect(await readCompileMarker(buf)).toBeNull();
     await writeCompileMarker(buf, { lineCount: 7, injectedAt: 123 });
     expect(await readCompileMarker(buf)).toEqual({ lineCount: 7, injectedAt: 123 });
+    await writeCompileMarker(buf, { lineCount: 7, injectedAt: 123, firstTs: "t0" });
+    expect(await readCompileMarker(buf)).toEqual({ lineCount: 7, injectedAt: 123, firstTs: "t0" });
+    await writeCompileMarker(buf, { lineCount: 7, injectedAt: 123, firstTs: null });
+    expect(await readCompileMarker(buf)).toEqual({ lineCount: 7, injectedAt: 123, firstTs: null });
     await writeFile(getCompileMarkerPath(buf), "{}");
     expect(await readCompileMarker(buf)).toBeNull();
     await clearCompileMarker(buf);

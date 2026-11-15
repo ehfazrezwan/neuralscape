@@ -141,3 +141,58 @@ describe("session-end.js with OpenClaw session:end payloads", () => {
     await waitFor(() => posts(COMPILE).length === 1);
   });
 });
+
+
+describe("excluded projects apply to the project the adapter resolves", () => {
+  const wsNamed = (name: string) => {
+    const root = mkdtempSync(join(tmpdir(), "oc-excl-"));
+    const ws = join(root, name);
+    mkdirSync(join(ws, ".git"), { recursive: true });
+    return ws;
+  };
+  const excl = { CLAUDE_PLUGIN_OPTION_EXCLUDED_PROJECTS: "secret-*" };
+
+  it("captures nothing from an excluded workspace (message:sent), but still captures another", async () => {
+    const e = env(excl);
+    await runHook(
+      "conversation-turn.js",
+      messageSent({ content: "A reply long enough to be captured, secret one.", userMessage: "q", workspaceDir: wsNamed("secret-app") }),
+      e,
+    );
+    await runHook(
+      "conversation-turn.js",
+      messageSent({ content: "A reply long enough to be captured, open one.", userMessage: "q", workspaceDir: wsNamed("open-app") }),
+      e,
+    );
+    await waitFor(() => posts(FLUSH).length >= 1);
+    await new Promise((r) => setTimeout(r, 300));
+    expect(posts(FLUSH)).toHaveLength(1);
+    expect(posts(FLUSH)[0].body.project_id).toBe("open-app");
+  });
+
+  it("does not even remember the inbound message of an excluded workspace", async () => {
+    const e = env(excl);
+    const ws = wsNamed("secret-app");
+    await runHook(
+      "conversation-turn.js",
+      JSON.stringify({ type: "message", action: "received", sessionKey: "k1", context: { content: "private words", workspaceDir: ws } }),
+      e,
+    );
+    const { readdirSync, existsSync } = await import("node:fs");
+    const obs = join(e.CLAUDE_PLUGIN_DATA, "observations");
+    expect(existsSync(obs) ? readdirSync(obs).filter((f) => f.startsWith("openclaw-")) : []).toEqual([]);
+  });
+
+  it("the PROJECT_ID override that is excluded stops capture too, and session-end skips the compile", async () => {
+    const e = env({ ...excl, CLAUDE_PLUGIN_OPTION_PROJECT_ID: "secret-pinned" });
+    await runHook("conversation-turn.js", messageSent({ content: "A reply long enough to be captured, pinned.", userMessage: "q" }), e);
+    await runHook(
+      "session-end.js",
+      JSON.stringify({ type: "session", action: "end", sessionKey: "k", timestamp: "2026-11-16T22:30:00.000Z", context: { messageCount: 5, workspaceDir: wsNamed("secret-app") } }),
+      e,
+    );
+    await new Promise((r) => setTimeout(r, 400));
+    expect(posts(FLUSH)).toHaveLength(0);
+    expect(posts(COMPILE)).toHaveLength(0);
+  });
+});
