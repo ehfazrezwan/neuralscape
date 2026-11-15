@@ -1,5 +1,7 @@
 import asyncio
+import concurrent.futures
 import logging
+import os
 import threading
 from datetime import datetime, timezone
 
@@ -126,6 +128,25 @@ def _create_cross_encoder(provider: str | None, api_key: str | None, model: str 
         raise ValueError(f"Unsupported Graphiti reranker provider: {provider}")
 
 
+# NEURALSCAPE PATCH: upper bound on one bridge call. Graph writes legitimately
+# take minutes (LLM extraction), so this is a hang guard, not a latency target.
+# It must never undercut the longest worker job that runs graph work: the graph
+# and ingest workers use ``job_timeout = 900`` (neuralscape-service/worker.py),
+# so the default is 900 s plus a 60 s margin. Before this patch the wait was
+# unbounded. Override per process with GRAPHITI_BRIDGE_TIMEOUT_S, or per call
+# with ``_AsyncBridge.run(timeout=...)``.
+DEFAULT_BRIDGE_TIMEOUT_S = 960.0
+
+
+def _bridge_timeout_from_env() -> float:
+    raw = os.environ.get("GRAPHITI_BRIDGE_TIMEOUT_S", "").strip()
+    try:
+        value = float(raw) if raw else DEFAULT_BRIDGE_TIMEOUT_S
+    except ValueError:
+        return DEFAULT_BRIDGE_TIMEOUT_S
+    return value if value > 0 else DEFAULT_BRIDGE_TIMEOUT_S
+
+
 class _AsyncBridge:
     """Runs a dedicated event loop in a background thread.
 
@@ -143,10 +164,56 @@ class _AsyncBridge:
         asyncio.set_event_loop(self._loop)
         self._loop.run_forever()
 
-    def run(self, coro):
-        """Submit a coroutine to the background loop and wait for the result."""
+    def run(self, coro, timeout: float | None = None):
+        """Submit a coroutine to the background loop and wait for the result.
+
+        NEURALSCAPE PATCH: the wait is bounded. Upstream waited forever, so a
+        stalled Neo4j or LLM call parked the calling worker slot for good.
+        ``timeout`` (seconds) wins; otherwise ``GRAPHITI_BRIDGE_TIMEOUT_S``;
+        otherwise ``DEFAULT_BRIDGE_TIMEOUT_S``. On expiry the coroutine is
+        cancelled on the loop and ``TimeoutError`` is raised, which the
+        service's graph callers already log and treat as non-critical.
+        """
+        limit = timeout if timeout is not None and timeout > 0 else _bridge_timeout_from_env()
         future = asyncio.run_coroutine_threadsafe(coro, self._loop)
-        return future.result()
+        try:
+            return future.result(timeout=limit)
+        except concurrent.futures.TimeoutError:
+            if future.done():
+                # The coroutine itself raised TimeoutError (driver/LLM timeout,
+                # or it finished in the same instant): propagate it unchanged
+                # so its message and the service's transient retry still apply.
+                return future.result()
+            future.cancel()
+            # No "timed out"/"timeout" wording: the service's transient-error
+            # retry matches on those and would re-run a call that just hung.
+            raise TimeoutError(
+                f"Graphiti bridge call did not finish within {limit:g}s and was cancelled"
+            ) from None
+
+
+def _hybrid_egress_ok(text: str) -> bool:
+    """NEURALSCAPE PATCH: text matching a sensitivity class never goes to the
+    optional hybrid decision endpoint (the service's regex floor, no LLM)."""
+    try:
+        from memory.sensitivity import classify_sensitivity
+    except ImportError:  # library used outside the service: no gate available
+        return True
+    return classify_sensitivity(text) is None
+
+
+def _build_hybrid_decisions(graph_config):
+    """NEURALSCAPE PATCH: the optional decision client, always built WITH the egress gate."""
+    from graphiti_core.llm_client.hybrid_decision_client import HybridDecisions
+
+    return HybridDecisions(
+        graph_config.graphiti_hybrid_api_key,
+        endpoint=graph_config.graphiti_hybrid_endpoint,
+        model=graph_config.graphiti_hybrid_model,
+        threshold=graph_config.graphiti_hybrid_threshold,
+        timeout=graph_config.graphiti_hybrid_timeout,
+        egress_check=_hybrid_egress_ok,
+    )
 
 
 class MemoryGraph:
@@ -183,6 +250,11 @@ class MemoryGraph:
             model=graph_config.graphiti_embedder_model,
             api_key=graph_config.graphiti_embedder_api_key,
         )
+
+        # NEURALSCAPE PATCH: attach the optional decision client only when the
+        # graph flag is on; flag off constructs nothing.
+        if getattr(graph_config, "graphiti_hybrid_enabled", False):
+            llm_client.decision_client = _build_hybrid_decisions(graph_config)
 
         cross_encoder = _create_cross_encoder(
             provider=graph_config.graphiti_reranker_provider,

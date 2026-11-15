@@ -153,6 +153,8 @@ async def lifespan(app: FastAPI):
     # Action policy: build the enforcer from settings (a no-op unless enabled).  In
     # enforce mode a missing or unbuildable authority store refuses start-up.
     _install_policy(_service, job_owner=_task_manager.job_owner)
+    from hybrid_inference import warmup_extraction
+    await asyncio.to_thread(warmup_extraction)
     # Connect task manager to Redis
     await _task_manager.connect()
 
