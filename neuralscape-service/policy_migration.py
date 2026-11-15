@@ -222,10 +222,14 @@ def parse_group_name(name: str, known_user_ids: set[str]) -> GroupParse:
     ambiguous, none is an unknown owner.  Neither is ever guessed.
     """
 
-    from memory.groups import ENCODED_GROUP_PREFIX, decode_group_id
+    try:  # the injective encoding is owned by PR 501 (GRAPH_GROUP_ID_INJECTIVE_ENABLED)
+        from memory.groups import ENCODED_GROUP_PREFIX, decode_group_id
+    except ImportError:
+        ENCODED_GROUP_PREFIX, decode_group_id = "nsg1--", (lambda _name: None)
 
     if name.startswith(ENCODED_GROUP_PREFIX):
-        # A collision-free name decodes to exactly one placement, or to none.
+        # A collision-free name decodes to exactly one placement, or to none (and without the
+        # encoder on this tree it is never guessed: an unrecognized group is quarantined).
         key = decode_group_id(name)
         if key is None:
             return GroupParse(name, None, None, None, None, "unrecognized_group")
@@ -407,6 +411,10 @@ def build_statements(
     admins: Iterable[str] | None = None,
 ) -> tuple[PolicyStatement, ...]:
     """The explicit grants that reproduce today's effective sharing.
+
+    The shared key's administrator grant depends on who the key is bound to (``NEURALSCAPE_API_KEY_USER_ID``,
+    else the default user) and on who the administrators are (``DICTATOR_USER_IDS``) AT MIGRATION TIME:
+    re-run the migration after changing either.
 
     ``admins`` (default: ``admin_user_ids(dictators)``) receive the administrator operations, each on a
     privileged tenant handle that no content grant matches.

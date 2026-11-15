@@ -880,40 +880,28 @@ class ReadsMixin:
         if g is None:
             return []
 
-        from memory.groups import ENCODED_GROUP_PREFIX, _build_group_id, decode_group_id
-
-        shared_prefix = "shared--project--"
         user_prefix = f"user--{user_id}--project--"
-        if _build_group_id("private", user_id) != f"user--{user_id}":
-            # This user's pools carry encoded names (collision-free ids); the legacy
-            # prefix could only match names other users' tuples fold into.
-            user_prefix = shared_prefix
-        # Encoded (collision-free) names share one prefix and are decoded below.
-        encoded_prefix = ENCODED_GROUP_PREFIX
+        shared_prefix = "shared--project--"
         # One MATCH per indexed label so the per-label group_id range index is
         # used; UNION dedupes across labels (and is itself DISTINCT).
         cypher = """
         MATCH (n:Entity)
         WHERE n.group_id STARTS WITH $user_prefix OR n.group_id STARTS WITH $shared_prefix
-           OR n.group_id STARTS WITH $encoded_prefix
         RETURN DISTINCT n.group_id AS group_id
         UNION
         MATCH (n:Episodic)
         WHERE n.group_id STARTS WITH $user_prefix OR n.group_id STARTS WITH $shared_prefix
-           OR n.group_id STARTS WITH $encoded_prefix
         RETURN DISTINCT n.group_id AS group_id
         UNION
         MATCH (n:Community)
         WHERE n.group_id STARTS WITH $user_prefix OR n.group_id STARTS WITH $shared_prefix
-           OR n.group_id STARTS WITH $encoded_prefix
         RETURN DISTINCT n.group_id AS group_id
         """
 
         async def _run():
             async with g.driver.session() as session:
                 result = await session.run(
-                    cypher, user_prefix=user_prefix, shared_prefix=shared_prefix,
-                    encoded_prefix=encoded_prefix,
+                    cypher, user_prefix=user_prefix, shared_prefix=shared_prefix
                 )
                 return await result.data()
 
@@ -930,18 +918,6 @@ class ReadsMixin:
         projects: set[str] = set()
         for rec in records:
             gid = rec.get("group_id") or ""
-            encoded = decode_group_id(gid)
-            if encoded is not None:
-                # An encoded name is read back exactly: the caller's private
-                # projects and every shared project.
-                if encoded.project and (
-                    encoded.pool == "shared"
-                    or (encoded.pool == "private" and encoded.owner == user_id)
-                ):
-                    projects.add(encoded.project)
-                continue
-            if gid.startswith(ENCODED_GROUP_PREFIX):
-                continue
             # Both namespaces end with '--project--{pid}'; everything after the
             # separator is the project id. Global groups ('user--{uid}',
             # 'shared') have no separator and are skipped.

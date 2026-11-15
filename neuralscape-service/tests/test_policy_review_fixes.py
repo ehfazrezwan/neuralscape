@@ -114,7 +114,8 @@ def test_the_shared_key_keeps_the_administrator_powers_of_the_user_it_is_bound_t
     saved = MagicMock()
     monkeypatch.setattr("knowledge.router.set_project_config", saved)
     ok = w.call(KEY, "PUT", "/v1/projects/p1/knowledge-config", json={"project_id": "p1"})
-    assert ok.status_code == 200, ok.text and saved.call_count == 1
+    assert ok.status_code == 200, ok.text
+    assert saved.call_count == 1
     # a key bound to somebody who is not an administrator gets no administrator operation
     monkeypatch.setattr(settings, "neuralscape_api_key_user_id", "bob")
     assert w.call(KEY, "PUT", "/v1/projects/p1/knowledge-config", json={"project_id": "p1"}).status_code in (403, 404)
