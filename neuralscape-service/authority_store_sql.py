@@ -356,6 +356,27 @@ class SqlAuthorityStore:
             )
             return row[0] if row else None
 
+    def binding_alias(self, subject_id: str, issuer: str) -> str | None:
+        """The provider subject bound to ``subject_id`` under ``issuer``, or ``None``.
+
+        The reverse of :meth:`get`.  When one subject holds several bindings under the issuer the
+        earliest one (then the lowest name) is returned, so the answer is stable.
+        """
+
+        try:
+            _ident("subject_id", subject_id)
+            _ident("issuer", issuer)
+        except ValueError:
+            return None
+        with self._guard(), self._read_lock, self._read_txn() as c:
+            row = self._one(
+                c,
+                "SELECT provider_subject FROM authority_bindings WHERE issuer=? AND subject_id=?"
+                " ORDER BY created_at, provider_subject LIMIT 1",
+                (issuer, subject_id),
+            )
+            return row[0] if row else None
+
     def put_if_absent(self, issuer: str, provider_subject: str, subject_id: str) -> str:
         """Atomic first-contact insert; the loser receives the existing subject."""
 
@@ -1791,6 +1812,16 @@ _AUTHORITY_DML = {
     "authority_credentials": "SELECT, INSERT, UPDATE",
     "authority_policies": "SELECT, INSERT, UPDATE",
     "authority_statements": "SELECT, INSERT, DELETE",
+    # Scoped credentials, service accounts, the credential pepper, invites and the per-tenant onboarding
+    # policy.  Every row is updated or consumed in place (a secret is marked consumed or revoked, an
+    # invite is used or revoked, a service account is disabled, the onboarding policy is replaced by an
+    # upsert) and none is ever deleted; the pepper is written once and read.  Table locks are not
+    # needed (row locks via SELECT ... FOR UPDATE ride on the UPDATE privilege).
+    "authority_credential_secrets": "SELECT, INSERT, UPDATE",
+    "authority_service_accounts": "SELECT, INSERT, UPDATE",
+    "authority_pepper": "SELECT, INSERT",
+    "authority_invites": "SELECT, INSERT, UPDATE",
+    "authority_onboarding": "SELECT, INSERT, UPDATE",
     "authority_schema_version": "SELECT",
 }
 

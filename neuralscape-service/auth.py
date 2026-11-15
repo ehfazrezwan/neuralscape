@@ -159,11 +159,17 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
             return JSONResponse(status_code=503, content={"detail": "credential service unavailable"})
         if verified is None:
             return self._unauthorized(request, "Invalid or expired token")
-        # The opaque subject id is the identity downstream code sees as user_id.
-        request.state.user_id = verified.subject_id
+        # Downstream code (memory reads and writes, task ownership) sees the ``user_id`` the subject's
+        # rows are keyed by: the bound legacy id, or the subject id itself when there is none.  The
+        # policy layer still identifies the principal by ``request.state.credential``.
+        try:
+            memory_user = service.memory_user_id(verified.subject_id)
+        except credentials.AuthorityUnavailable:
+            return JSONResponse(status_code=503, content={"detail": "credential service unavailable"})
+        request.state.user_id = memory_user
         request.state.auth_mode = "scoped_credential"
         request.state.credential = verified
-        user_token = current_user_id.set(verified.subject_id)
+        user_token = current_user_id.set(memory_user)
         credential_token = credentials.current_credential.set(verified)
         try:
             return await call_next(request)

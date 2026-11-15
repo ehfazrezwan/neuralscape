@@ -76,6 +76,20 @@ def case_binding_is_atomic_verbatim_and_race_safe(backend):
     assert len(set(results)) == 1 and store.get("idp", "racer") == results[0]
 
 
+def case_binding_alias_is_the_reverse_of_a_binding(backend):
+    store = backend.open()
+    assert store.binding_alias("sub_1", "local") is None
+    store.put_if_absent("local", "alice", "sub_1")
+    store.put_if_absent("idp", "A-1", "sub_1")
+    assert store.binding_alias("sub_1", "local") == "alice"          # per issuer
+    assert store.binding_alias("sub_1", "idp") == "A-1"
+    assert store.binding_alias("sub_2", "local") is None            # another subject
+    assert store.binding_alias("sub_1", "LOCAL") is None            # verbatim
+    store.put_if_absent("local", "alice-2", "sub_1")                  # a second alias: the earliest wins
+    assert store.binding_alias("sub_1", "local") == "alice"
+    assert store.binding_alias("", "local") is None and store.binding_alias("sub_1", "") is None
+
+
 def case_subjects_versions_and_tombstones(backend):
     clock = Clock()
     store = backend.open(clock)
@@ -197,7 +211,10 @@ def case_hold_current_verifies_then_commits_body_atomically(backend):
         tenant_id="tenant-a", subject_id="sub_a", credential_id="cred-a",
         membership_version=1, policy_epoch=policy.policy_epoch,
     )
-    store.hold_current(**base, body=lambda c: store._x(c, "CREATE TABLE scratch(v TEXT)"))
+    if hasattr(backend, "prepare_scratch"):
+        backend.prepare_scratch()  # a least-privilege runtime role may not create tables
+    else:
+        store.hold_current(**base, body=lambda c: store._x(c, "CREATE TABLE scratch(v TEXT)"))
     assert store.hold_current(**base, body=lambda c: store._x(c, "INSERT INTO scratch VALUES('ok')") and "done") == "done"
     # A raising body rolls back its writes and propagates.
     with pytest.raises(RuntimeError):
@@ -732,3 +749,58 @@ def test_a_fifo_at_the_database_path_is_refused_without_blocking(tmp_path):
     thread.start()
     thread.join(5)
     assert not thread.is_alive() and isinstance(outcome.get("error"), OSError), outcome
+
+
+# ---- the least-privilege PostgreSQL runtime role is granted exactly what the store's SQL uses
+
+
+def _authority_tables() -> set[str]:
+    import re
+
+    import authority_store_sql as module
+
+    tables = set()
+    for migration in module.MIGRATIONS:
+        tables |= set(re.findall(r"CREATE TABLE (?:IF NOT EXISTS )?(\w+)", migration.sql))
+    tables.add("authority_schema_version")  # bootstrapped outside the numbered migrations
+    return tables
+
+
+def test_every_authority_table_has_a_declared_runtime_grant() -> None:
+    """A table the runtime role was never granted fails at the first request that touches it."""
+
+    import authority_store_sql as module
+
+    assert _authority_tables() == set(module._AUTHORITY_DML)
+
+
+def test_the_declared_runtime_grants_cover_every_statement_the_store_runs() -> None:
+    """INSERT/UPDATE/DELETE and SELECT in the store's source need the matching table privilege."""
+
+    import inspect
+    import re
+
+    import authority_store_sql as module
+
+    source = inspect.getsource(module)
+    needed: dict[str, set[str]] = {}
+    for pattern, privilege in (
+        (r"INSERT INTO (authority_\w+)", "INSERT"),
+        (r"UPDATE (authority_\w+) SET", "UPDATE"),
+        (r"DELETE FROM (authority_\w+)", "DELETE"),
+        (r"FROM (authority_\w+)", "SELECT"),
+    ):
+        for table in re.findall(pattern, source):
+            needed.setdefault(table, set()).add(privilege)
+    for match in re.finditer(r"INSERT INTO (authority_\w+)", source):
+        if "DO UPDATE SET" in source[match.end() : match.end() + 400].split("def ")[0]:
+            needed[match.group(1)].add("UPDATE")  # an upsert also updates
+    granted = {t: {p.strip() for p in v.split(",")} for t, v in module._AUTHORITY_DML.items()}
+    for table, privileges in needed.items():
+        if table == "authority_schema_version":
+            continue
+        assert privileges <= granted[table], (table, sorted(privileges - granted[table]))
+    for table, privileges in granted.items():  # and nothing beyond what is used (least privilege)
+        if table == "authority_schema_version":
+            continue
+        assert privileges <= needed[table], (table, sorted(privileges - needed[table]))
