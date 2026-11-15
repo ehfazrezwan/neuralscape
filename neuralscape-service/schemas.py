@@ -137,14 +137,24 @@ CORE_MEMORY_CATEGORIES: dict[str, str] = {
 # fact parser consult (i.e. validation ACCEPTS adapter categories).
 MEMORY_CATEGORIES: dict[str, str] = dict(CORE_MEMORY_CATEGORIES)
 
-# Categories that default to global scope
-GLOBAL_CATEGORIES = {"preference", "personal_fact", "technical_skill", "domain_knowledge"}
+# Categories that always store global scope, even with an explicit project_id
+GLOBAL_CATEGORIES = {"preference", "personal_fact", "technical_skill"}
 
 # Categories that require project_id and default to project scope
 PROJECT_CATEGORIES = {"tech_stack", "convention", "architecture", "dependency"}
 
-# Categories that can be either scope
-FLEXIBLE_CATEGORIES = {"decision", "interaction", "workflow", "procedure", "task_context"}
+# Categories that can be either scope: follow the caller's project_id (global
+# when none). ``domain_knowledge`` is flexible so ingested/remembered knowledge
+# given a project_id stays in that project instead of leaking into every
+# project's context (#224).
+FLEXIBLE_CATEGORIES = {
+    "domain_knowledge",
+    "decision",
+    "interaction",
+    "workflow",
+    "procedure",
+    "task_context",
+}
 
 
 def default_scope_for_category(category: str) -> MemoryScope:

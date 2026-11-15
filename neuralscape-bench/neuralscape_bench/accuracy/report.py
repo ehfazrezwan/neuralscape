@@ -83,6 +83,13 @@ def _git_commit() -> str | None:
 def build_suite_result(suite: str, judged_records: list[dict], *,
                        config: dict, suite_stats: dict, run_stats: dict) -> dict:
     """Aggregate one suite's judged records into a committable result dict."""
+    metrics = aggregate(judged_records, k=config.get("k", 10))
+    incompatible = get_suite(suite).retrieval_incompatible
+    if incompatible:
+        # Never emit a number for a metric the suite cannot support.
+        for key in [k for k in metrics if k.startswith("retrieval_recall_at_")]:
+            del metrics[key]
+        metrics["retrieval"] = {"status": "incompatible", "reason": incompatible}
     return {
         "suite": suite,
         "display": get_suite(suite).display,
@@ -91,7 +98,7 @@ def build_suite_result(suite: str, judged_records: list[dict], *,
         "config": config,
         "dataset": suite_stats,
         "run": run_stats,
-        "metrics": aggregate(judged_records, k=config.get("k", 10)),
+        "metrics": metrics,
         "published_comparison": PUBLISHED.get(suite, []),
         "caveats": [
             "Competitor figures are self-reported on their own configurations "
@@ -143,9 +150,14 @@ def render_battery_markdown(results_by_suite: dict[str, dict | None], *,
         m = res["metrics"]
         acc = _fmt_pct((m.get("overall") or {}).get("accuracy"))
         rk = "—"
-        for key, val in m.items():
-            if key.startswith("retrieval_recall_at_"):
-                rk = f"{_fmt_pct(val.get('recall'))} (R@{key.rsplit('_', 1)[-1]}, n={val.get('n')})"
+        incompatible = get_suite(suite).retrieval_incompatible
+        if incompatible:
+            # Also covers older result JSONs that still carry a stored 0.0.
+            rk = f"n/a (incompatible: {incompatible})"
+        else:
+            for key, val in m.items():
+                if key.startswith("retrieval_recall_at_"):
+                    rk = f"{_fmt_pct(val.get('recall'))} (R@{key.rsplit('_', 1)[-1]}, n={val.get('n')})"
         judged = (m.get("overall") or {}).get("judged", 0)
         lines.append(f"| {display} | {acc} | {rk} | {judged} | {pub} |")
 

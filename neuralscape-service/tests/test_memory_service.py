@@ -318,12 +318,12 @@ class TestContextStandards:
         from config import settings
 
         monkeypatch.setattr(settings, "standards_enabled", True)
-        service._memory.get_all.return_value = {"results": []}
-        # _get_standards scrolls for visibility=standard.
-        service._memory.vector_store.client.scroll.return_value = (
-            [_point("s1", "Always use the Opti template",
-                    {"visibility": "standard", "scope": "global"})],
-            None,
+        # Context rows come from the ordered scroll (order_by); _get_standards
+        # scrolls for visibility=standard (no order_by).
+        _mock_context_store(
+            service, [],
+            standards=[_point("s1", "Always use the Opti template",
+                              {"visibility": "standard", "scope": "global"})],
         )
         ctx = service.get_global_context(user_id="alice")
         assert len(ctx.standards) == 1
@@ -333,7 +333,7 @@ class TestContextStandards:
         from config import settings
 
         monkeypatch.setattr(settings, "standards_enabled", False)
-        service._memory.get_all.return_value = {"results": []}
+        _mock_context_store(service, [])
         ctx = service.get_global_context(user_id="alice")
         assert ctx.standards == []
 
@@ -357,42 +357,121 @@ class TestContextStandards:
         assert "metadata.tags" not in _all_field_keys(qf)
 
 
+def _ctx_point(mem_id, category, created_at, scope="global", **meta):
+    """A Qdrant point-like row for the ordered context scroll."""
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        id=mem_id,
+        score=None,
+        payload={
+            "data": f"fact {mem_id}",
+            "metadata": {"category": category, "scope": scope, **meta},
+            "created_at": created_at,
+        },
+    )
+
+
+def _mock_context_store(service, rows, total=None, standards=()):
+    """Mock the Qdrant client for session-start context reads.
+
+    ``rows`` are the store's rows, already newest-first (what Qdrant's
+    order_by returns). Three scroll shapes are served: the ordered scroll
+    (``order_by`` set, cut at ``limit``), the boundary tie-group scroll
+    (filter carries a created_at range) and the undated-rows scroll (filter
+    carries IsEmptyCondition). Any other scroll is the standards lookup.
+    ``total`` is the exact count (default ``len(rows)``).
+    """
+    from qdrant_client.models import FieldCondition, IsEmptyCondition
+
+    client = service._memory.vector_store.client
+
+    def _scroll(**kw):
+        if kw.get("order_by") is not None:
+            return [r for r in rows if r.payload.get("created_at")][: kw["limit"]], None
+        must = list(getattr(kw.get("scroll_filter"), "must", None) or [])
+        extra = must[1] if len(must) == 2 else None
+        if isinstance(extra, IsEmptyCondition):
+            return [r for r in rows if not r.payload.get("created_at")][: kw["limit"]], None
+        if isinstance(extra, FieldCondition) and extra.key == "created_at":
+            from datetime import datetime
+
+            def _dt(v):
+                return datetime.fromisoformat(str(v).replace("Z", "+00:00"))
+
+            b = extra.range.gte
+            return [r for r in rows if r.payload.get("created_at") and _dt(r.payload["created_at"]) == b], None
+        return list(standards), None
+
+    client.scroll.side_effect = _scroll
+    client.count.return_value = MagicMock(count=len(rows) if total is None else total)
+    return client
+
+
+def _flt_keys(flt):
+    """All FieldCondition keys reachable in a (nested) qdrant Filter."""
+    from qdrant_client.models import FieldCondition
+
+    out = []
+    for bucket in (flt.must, flt.should, flt.must_not):
+        for c in bucket or []:
+            out.extend([c.key] if isinstance(c, FieldCondition) else _flt_keys(c))
+    return out
+
+
 class TestGetContext:
     def test_global_context_organizes_by_category(self, service):
-        service._memory.get_all.return_value = {
-            "results": [
-                {"id": "m1", "memory": "Prefers tabs", "metadata": {"category": "preference", "scope": "global"}},
-                {"id": "m2", "memory": "Knows Python", "metadata": {"category": "technical_skill", "scope": "global"}},
-            ]
-        }
+        _mock_context_store(service, [
+            _ctx_point("m2", "technical_skill", "2026-07-02T00:00:00Z"),
+            _ctx_point("m1", "preference", "2026-07-01T00:00:00Z"),
+        ])
         ctx = service.get_global_context(user_id="ehfaz")
         assert ctx.user_id == "ehfaz"
         assert "preference" in ctx.categories
         assert "technical_skill" in ctx.categories
+        assert ctx.total == 2 and ctx.returned == 2 and ctx.has_more is False
+
+    def test_global_context_is_newest_first_server_side(self, service):
+        """The rows are fetched ordered by created_at DESC (not an arbitrary
+        200-row sample sorted afterwards), and total is the true count."""
+        from qdrant_client.models import Direction
+
+        client = _mock_context_store(service, [
+            _ctx_point(f"g{i}", "preference", f"2026-07-{30 - i:02d}T00:00:00Z")
+            for i in range(3)
+        ], total=450)
+        ctx = service.get_global_context(user_id="ehfaz")
+        kw = [c.kwargs for c in client.scroll.call_args_list if c.kwargs.get("order_by")][0]
+        assert kw["order_by"].key == "created_at"
+        assert kw["order_by"].direction == Direction.DESC
+        assert "user_id" in _flt_keys(kw["scroll_filter"])
+        assert ctx.total == 450 and ctx.returned == 3 and ctx.has_more is True
 
     def test_project_context_includes_both_scopes(self, service):
-        # Mock returns different results for each call
-        service._memory.get_all.side_effect = [
-            {"results": [{"id": "m1", "memory": "Prefers tabs", "metadata": {"category": "preference"}}]},
-            {"results": [{"id": "m2", "memory": "Uses FastAPI", "metadata": {"category": "tech_stack"}}]},
-        ]
+        client = _mock_context_store(service, [
+            _ctx_point("m2", "tech_stack", "2026-07-02T00:00:00Z", scope="project",
+                       project_id="my-project"),
+            _ctx_point("m1", "preference", "2026-07-01T00:00:00Z"),
+        ])
         ctx = service.get_project_context(user_id="ehfaz", project_id="my-project")
         assert ctx.project_id == "my-project"
-        assert service._memory.get_all.call_count == 2
+        assert {"tech_stack", "preference"} <= set(ctx.categories)
+        keys = _flt_keys(
+            [c.kwargs for c in client.scroll.call_args_list if c.kwargs.get("order_by")][0][
+                "scroll_filter"
+            ]
+        )
+        assert {"metadata.scope", "metadata.project_id", "metadata.visibility"} <= set(keys)
 
     def test_project_context_paginates(self, service):
-        # 2 global + 3 project = 5 total; page the second window of 2.
-        service._memory.get_all.side_effect = [
-            {"results": [
-                {"id": "g1", "memory": "a", "metadata": {"category": "preference"}},
-                {"id": "g2", "memory": "b", "metadata": {"category": "preference"}},
-            ]},
-            {"results": [
-                {"id": "p1", "memory": "c", "metadata": {"category": "tech_stack"}},
-                {"id": "p2", "memory": "d", "metadata": {"category": "tech_stack"}},
-                {"id": "p3", "memory": "e", "metadata": {"category": "tech_stack"}},
-            ]},
-        ]
+        # 2 global + 3 project = 5 total, newest-first: p3, p2, p1, g2, g1.
+        _mock_context_store(service, [
+            _ctx_point("p3", "tech_stack", "2026-07-05T00:00:00Z", scope="project"),
+            _ctx_point("p2", "tech_stack", "2026-07-04T00:00:00Z", scope="project"),
+            _ctx_point("p1", "tech_stack", "2026-07-03T00:00:00Z", scope="project"),
+            _ctx_point("g2", "preference", "2026-07-02T00:00:00Z"),
+            _ctx_point("g1", "preference", "2026-07-01T00:00:00Z"),
+        ])
         ctx = service.get_project_context(
             user_id="ehfaz", project_id="proj", limit=2, offset=1
         )
@@ -402,31 +481,126 @@ class TestGetContext:
         assert ctx.limit == 2
         assert ctx.has_more is True
         assert sum(len(v) for v in ctx.categories.values()) == 2
-        # Newest-first by (created_at, id) desc → p3, p2, p1, g2, g1; the
-        # offset=1/limit=2 window is exactly {p2, p1}.
+        # The offset=1/limit=2 window is exactly {p2, p1}.
         page_ids = {m.id for bucket in ctx.categories.values() for m in bucket}
         assert page_ids == {"p2", "p1"}
 
     def test_project_context_clamps_nonpositive_limit(self, service):
-        service._memory.get_all.side_effect = [
-            {"results": [{"id": "g1", "memory": "a", "metadata": {"category": "preference"}}]},
-            {"results": [{"id": "p1", "memory": "c", "metadata": {"category": "tech_stack"}}]},
-        ]
+        _mock_context_store(service, [
+            _ctx_point("p1", "tech_stack", "2026-07-02T00:00:00Z", scope="project"),
+            _ctx_point("g1", "preference", "2026-07-01T00:00:00Z"),
+        ])
         # limit<=0 must not yield an empty page with has_more=True (infinite loop).
         ctx = service.get_project_context(user_id="ehfaz", project_id="proj", limit=0)
         assert ctx.returned == 1
         assert ctx.limit == 1
 
     def test_project_context_no_limit_returns_all(self, service):
-        service._memory.get_all.side_effect = [
-            {"results": [{"id": "g1", "memory": "a", "metadata": {"category": "preference"}}]},
-            {"results": [{"id": "p1", "memory": "c", "metadata": {"category": "tech_stack"}}]},
-        ]
+        _mock_context_store(service, [
+            _ctx_point("p1", "tech_stack", "2026-07-02T00:00:00Z", scope="project"),
+            _ctx_point("g1", "preference", "2026-07-01T00:00:00Z"),
+        ])
         ctx = service.get_project_context(user_id="ehfaz", project_id="proj")
         assert ctx.total == 2
         assert ctx.returned == 2
         assert ctx.limit is None
         assert ctx.has_more is False
+
+    def test_project_context_true_newest_page_beyond_200_rows(self, service):
+        """>200 rows: the page is the true newest rows and total/has_more
+        describe the whole store (the old top_k=200 unordered get_all sampled
+        arbitrary rows and reported total<=400)."""
+        rows = [
+            _ctx_point(f"r{i:04d}", "tech_stack", f"2026-07-01T00:{(999 - i) // 60:02d}:{(999 - i) % 60:02d}Z",
+                       scope="project")
+            for i in range(1000)  # r0000 is the newest
+        ]
+        client = _mock_context_store(service, rows, total=1000)
+        ctx = service.get_project_context(user_id="u", project_id="proj", limit=5)
+        assert [m.id for m in ctx.categories["tech_stack"]] == [f"r{i:04d}" for i in range(5)]
+        assert ctx.total == 1000
+        assert ctx.has_more is True
+        # Only offset+limit rows were pulled, ordered server-side.
+        order_calls = [c.kwargs for c in client.scroll.call_args_list if c.kwargs.get("order_by")]
+        assert order_calls[0]["limit"] == 5
+        # Last page: has_more flips to False.
+        last = service.get_project_context(user_id="u", project_id="proj", limit=5, offset=995)
+        assert last.returned == 5 and last.has_more is False
+
+    def test_paging_is_deterministic_across_a_shared_timestamp(self, service):
+        """Batch writes share one created_at. Rows tied at a page edge must
+        be neither skipped nor repeated: consecutive pages cover every row
+        exactly once."""
+        same = "2026-07-01T00:00:00Z"
+        rows = (
+            [_ctx_point("n1", "tech_stack", "2026-07-02T00:00:00Z", scope="project")]
+            + [_ctx_point(f"t{i}", "tech_stack", same, scope="project") for i in range(7)]
+            + [_ctx_point("o1", "tech_stack", "2026-06-01T00:00:00Z", scope="project")]
+        )
+        _mock_context_store(service, rows)
+        seen: list[str] = []
+        for off in range(0, 9, 3):
+            ctx = service.get_project_context(
+                user_id="u", project_id="proj", limit=3, offset=off
+            )
+            seen += [m.id for b in ctx.categories.values() for m in b]
+        assert sorted(seen) == sorted(r.id for r in rows)
+        assert len(seen) == len(set(seen)) == 9
+
+    def test_rows_without_created_at_are_included_last(self, service):
+        rows = [
+            _ctx_point("d1", "tech_stack", "2026-07-02T00:00:00Z", scope="project"),
+            _ctx_point("u1", "tech_stack", None, scope="project"),
+            _ctx_point("u2", "tech_stack", None, scope="project"),
+        ]
+        _mock_context_store(service, rows)
+        ctx = service.get_project_context(user_id="u", project_id="proj")
+        ids = [m.id for b in ctx.categories.values() for m in b]
+        assert ids[0] == "d1" and set(ids) == {"d1", "u1", "u2"}
+        assert ctx.total == 3 and ctx.has_more is False
+
+    def test_project_context_includes_teammates_shared_excludes_private(self, service):
+        """The ordered query is the caller's own rows OR project-shared rows;
+        a teammate's private row matches neither branch."""
+        from qdrant_client.models import FieldCondition, Filter, MatchValue
+
+        client = _mock_context_store(service, [])
+        service.get_project_context(user_id="alice", project_id="proj", limit=10)
+        flt = [c.kwargs for c in client.scroll.call_args_list if c.kwargs.get("order_by")][0][
+            "scroll_filter"
+        ]
+        own, shared = flt.should
+        # own branch: pinned to the caller's user_id
+        assert FieldCondition(key="user_id", match=MatchValue(value="alice")) in own.must
+        # shared branch: visibility=shared AND this project (search's predicate)
+        assert FieldCondition(
+            key="metadata.visibility", match=MatchValue(value="shared")
+        ) in shared.must
+        assert FieldCondition(
+            key="metadata.project_id", match=MatchValue(value="proj")
+        ) in shared.must
+        # never matches on someone else's user_id alone; tombstones excluded
+        assert "metadata.dream_tombstoned" in _flt_keys(Filter(must_not=flt.must_not))
+        assert not [k for k in _flt_keys(shared) if k == "user_id"]
+        # the count query uses the identical filter
+        assert client.count.call_args.kwargs["count_filter"] == flt
+        assert client.count.call_args.kwargs["exact"] is True
+
+    def test_project_context_order_by_failure_falls_back_to_sorted_scroll(self, service):
+        client = service._memory.vector_store.client
+        newest = _ctx_point("n", "tech_stack", "2026-07-09T00:00:00Z", scope="project")
+        oldest = _ctx_point("o", "tech_stack", "2026-07-01T00:00:00Z", scope="project")
+
+        def _scroll(**kw):
+            if kw.get("order_by") is not None:
+                raise RuntimeError("no index")
+            return [oldest, newest], None
+
+        client.scroll.side_effect = _scroll
+        client.count.return_value = MagicMock(count=2)
+        ctx = service.get_project_context(user_id="u", project_id="proj", limit=1)
+        assert [m.id for m in ctx.categories["tech_stack"]] == ["n"]
+        assert ctx.total == 2 and ctx.has_more is True
 
 
 def _point(mem_id: str, data: str, metadata: dict):
@@ -549,15 +723,15 @@ class TestProcesses:
 class TestCRUD:
     def test_get_memory_found(self, service):
         service._memory.get.return_value = {
-            "id": "m1", "memory": "Prefers tabs", "metadata": {"category": "preference"}
+            "id": _MEM_ID, "memory": "Prefers tabs", "metadata": {"category": "preference"}
         }
-        result = service.get_memory("m1")
+        result = service.get_memory(_MEM_ID)
         assert result is not None
-        assert result.id == "m1"
+        assert result.id == _MEM_ID
 
     def test_get_memory_not_found(self, service):
         service._memory.get.return_value = None
-        result = service.get_memory("nonexistent")
+        result = service.get_memory("22222222-2222-4222-8222-222222222222")
         assert result is None
 
     def test_list_memories(self, service):
@@ -721,10 +895,13 @@ _SHARED_META = {
 # ──────────────────────────────────────────────
 
 
+_MEM_ID = "11111111-1111-4111-8111-111111111111"
+
+
 def _owned_mem(owner: str, visibility: str = "private", content: str = "secret content", **meta):
     """A mem0 ``get()``-style dict owned by ``owner`` with the given visibility."""
     metadata = {"category": "preference", "visibility": visibility, "owner_user_id": owner, **meta}
-    return {"id": "m1", "memory": content, "user_id": owner, "metadata": metadata}
+    return {"id": _MEM_ID, "memory": content, "user_id": owner, "metadata": metadata}
 
 
 class TestGetMemoryReadGate:
@@ -732,17 +909,17 @@ class TestGetMemoryReadGate:
 
     def test_owner_reads_own_private_memory(self, service):
         service._memory.get.return_value = _owned_mem("alice")
-        result = service.get_memory("m1", "alice")
+        result = service.get_memory(_MEM_ID, "alice")
         assert result is not None
         assert result.memory == "secret content"
 
     def test_different_user_cannot_read_private_memory(self, service):
         service._memory.get.return_value = _owned_mem("alice")
-        assert service.get_memory("m1", "bob") is None
+        assert service.get_memory(_MEM_ID, "bob") is None
 
     def test_different_user_can_read_shared_memory(self, service):
         service._memory.get.return_value = _owned_mem("alice", visibility="shared")
-        result = service.get_memory("m1", "bob")
+        result = service.get_memory(_MEM_ID, "bob")
         assert result is not None
         assert result.memory == "secret content"
 
@@ -753,18 +930,47 @@ class TestGetMemoryReadGate:
         saved = settings.standards_enabled
         try:
             settings.standards_enabled = False
-            assert service.get_memory("m1", "bob") is None
+            assert service.get_memory(_MEM_ID, "bob") is None
             settings.standards_enabled = True
-            assert service.get_memory("m1", "bob") is not None
+            assert service.get_memory(_MEM_ID, "bob") is not None
         finally:
             settings.standards_enabled = saved
+
+    @pytest.mark.parametrize(
+        "bad_id", ["not-a-uuid", "m1", "", "123-45", "../etc/passwd", "x" * 200, "1" * 30]
+    )
+    def test_malformed_id_is_not_found_not_an_error(self, service, bad_id):
+        """#437: a non-UUID id used to reach Qdrant retrieve and raise (HTTP
+        500). It must resolve to None (404), like a well-formed unknown id,
+        without ever touching the store."""
+        service._memory.get.side_effect = RuntimeError("qdrant would raise here")
+        assert service.get_memory(bad_id, "alice") is None
+        service._memory.get.assert_not_called()
+
+    def test_uppercase_uuid_and_numeric_id_reach_store_in_canonical_form(self, service):
+        """Qdrant ids are UUIDs or unsigned ints: an upper-case UUID is passed
+        canonical (lower-case); an all-digit id is passed as an int."""
+        service._memory.get.return_value = None
+        service.get_memory("AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA", "alice")
+        service._memory.get.assert_called_with("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+        service.get_memory("12345", "alice")
+        service._memory.get.assert_called_with(12345)
+
+    def test_wellformed_unknown_id_is_not_found(self, service):
+        service._memory.get.return_value = None
+        assert service.get_memory("33333333-3333-4333-8333-333333333333", "alice") is None
+        service._memory.get.assert_called_once()
 
     def test_no_caller_id_skips_gate_backward_compat(self, service):
         """``caller_user_id=None`` (the default) is the pre-existing internal
         call shape (e.g. patch_memory's post-write re-read) — must stay
         ungated."""
         service._memory.get.return_value = _owned_mem("alice")
-        assert service.get_memory("m1") is not None
+        assert service.get_memory(_MEM_ID) is not None
+
+
+_ROOT = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+_P1 = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
 
 
 class TestReasoningChainReadGate:
@@ -775,36 +981,36 @@ class TestReasoningChainReadGate:
         service._memory.get.side_effect = lambda mid: by_id.get(mid)
 
     def test_owner_reads_full_chain(self, service):
-        root = _owned_mem("alice", derived_from=["p1"])
+        root = _owned_mem("alice", derived_from=[_P1])
         premise = _owned_mem("alice", content="alice's private premise")
-        self._wire(service, {"root": root, "p1": premise})
-        chain = service.get_reasoning_chain("root", caller_user_id="alice")
-        assert chain["memory_id"] == "root"
-        assert chain["children"][0]["memory_id"] == "p1"
+        self._wire(service, {_ROOT: root, _P1: premise})
+        chain = service.get_reasoning_chain(_ROOT, caller_user_id="alice")
+        assert chain["memory_id"] == _ROOT
+        assert chain["children"][0]["memory_id"] == _P1
         assert chain["children"][0]["content"] == "alice's private premise"
 
     def test_other_users_private_premise_not_leaked(self, service):
-        root = _owned_mem("alice", visibility="shared", derived_from=["p1"])
+        root = _owned_mem("alice", visibility="shared", derived_from=[_P1])
         premise = _owned_mem("alice", content="alice's private premise")
-        self._wire(service, {"root": root, "p1": premise})
-        chain = service.get_reasoning_chain("root", caller_user_id="bob")
-        assert chain["memory_id"] == "root"
+        self._wire(service, {_ROOT: root, _P1: premise})
+        chain = service.get_reasoning_chain(_ROOT, caller_user_id="bob")
+        assert chain["memory_id"] == _ROOT
         # Unreadable premise is folded into "missing" — same shape as a
         # hard-deleted premise, and its content never appears anywhere.
-        assert chain["children"][0] == {"memory_id": "p1", "missing": True, "children": []}
+        assert chain["children"][0] == {"memory_id": _P1, "missing": True, "children": []}
         import json
         assert "alice's private premise" not in json.dumps(chain)
 
     def test_root_unreadable_returns_none(self, service):
         root = _owned_mem("alice")  # private, caller is a stranger
-        self._wire(service, {"root": root})
-        assert service.get_reasoning_chain("root", caller_user_id="bob") is None
+        self._wire(service, {_ROOT: root})
+        assert service.get_reasoning_chain(_ROOT, caller_user_id="bob") is None
 
     def test_no_caller_id_skips_gate_backward_compat(self, service):
-        root = _owned_mem("alice", derived_from=["p1"])
+        root = _owned_mem("alice", derived_from=[_P1])
         premise = _owned_mem("alice", content="alice's private premise")
-        self._wire(service, {"root": root, "p1": premise})
-        chain = service.get_reasoning_chain("root")
+        self._wire(service, {_ROOT: root, _P1: premise})
+        chain = service.get_reasoning_chain(_ROOT)
         assert chain["children"][0]["content"] == "alice's private premise"
 
 
@@ -1251,6 +1457,39 @@ class TestBatchStoreFacts:
 
         # preference is a GLOBAL_CATEGORIES member, should stay global
         assert results[0].scope == "global"
+
+    def test_domain_knowledge_with_project_id_is_project_scoped(self, service):
+        """#224: domain_knowledge follows the caller's project_id."""
+        service._memory.embedding_model.embed_batch.return_value = [[0.1] * 768]
+
+        results = service._batch_store_facts(
+            facts=[("domain_knowledge", "Kelly sizing caps risk")],
+            user_id="ehfaz", project_id="my-project",
+        )
+        assert results[0].scope == "project"
+        payload = service._memory.vector_store.insert.call_args[1]["payloads"][0]
+        assert payload["metadata"]["scope"] == "project"
+        assert payload["metadata"]["project_id"] == "my-project"
+
+    def test_domain_knowledge_without_project_id_stays_global(self, service):
+        service._memory.embedding_model.embed_batch.return_value = [[0.1] * 768]
+
+        results = service._batch_store_facts(
+            facts=[("domain_knowledge", "Kelly sizing caps risk")], user_id="ehfaz"
+        )
+        assert results[0].scope == "global"
+
+    def test_domain_knowledge_scope_helpers_agree(self):
+        """default_scope_for_category / edit's derive rule / ingest's rule all
+        treat domain_knowledge as flexible, so write and edit never disagree."""
+        from memory.edit import EditMixin
+        from schemas import FLEXIBLE_CATEGORIES, GLOBAL_CATEGORIES, default_scope_for_category
+
+        assert "domain_knowledge" in FLEXIBLE_CATEGORIES
+        assert "domain_knowledge" not in GLOBAL_CATEGORIES
+        assert default_scope_for_category("domain_knowledge").value == "global"
+        assert EditMixin._derive_scope("domain_knowledge", "p") == "project"
+        assert EditMixin._derive_scope("domain_knowledge", None) == "global"
 
     def test_payload_structure(self, service):
         service._memory.embedding_model.embed_batch.return_value = [[0.1] * 768]

@@ -1,0 +1,166 @@
+name: sidecars-ci
+
+# Coverage for things no other workflow runs:
+#   - resolver-svc and cbm-bridge: standalone images outside the service suite,
+#     each with a host-side pytest file the container gate never sees.
+#   - deploy/charts/neuralscape: nothing else renders the helm chart.
+#   - acceptance/selftest: the acceptance harness's own tests (a local stub
+#     server only; `run.sh --selftest` never contacts a stack).
+#
+# Trigger shape mirrors plugin-ci/service-ci: runs on EVERY PR so `sidecars-gate`
+# can be a required check. The `changes` job decides which jobs apply;
+# `sidecars-gate` always reports and fails only on failure/cancel.
+
+on:
+  pull_request:
+  push:
+    branches: [dev, main]
+    paths:
+      - "resolver-svc/**"
+      - "cbm-bridge/**"
+      - "deploy/**"
+      - "acceptance/**"
+      - ".github/workflows/sidecars-ci.yml"
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: sidecars-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      resolver: ${{ steps.filter.outputs.resolver }}
+      cbm: ${{ steps.filter.outputs.cbm }}
+      deploy: ${{ steps.filter.outputs.deploy }}
+      acceptance: ${{ steps.filter.outputs.acceptance }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dorny/paths-filter@v4
+        id: filter
+        with:
+          filters: |
+            resolver:
+              - "resolver-svc/**"
+              - ".github/workflows/sidecars-ci.yml"
+            cbm:
+              - "cbm-bridge/**"
+              - ".github/workflows/sidecars-ci.yml"
+            deploy:
+              - "deploy/**"
+              - ".github/workflows/sidecars-ci.yml"
+            acceptance:
+              - "acceptance/**"
+              - ".github/workflows/sidecars-ci.yml"
+
+  resolver-svc:
+    needs: changes
+    # push events have no PR diff; the trigger's own path filter already scoped them.
+    if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.resolver == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      # Versions match resolver-svc/Dockerfile; httpx backs fastapi's TestClient.
+      - name: Install test dependencies
+        run: pip install pytest==8.4.2 httpx==0.28.1 fastapi==0.115.5 pydantic==2.10.3 anyio==4.6.2
+      - name: Run resolver-svc tests
+        working-directory: resolver-svc
+        run: python -m pytest test_resolver.py -v -p no:cacheprovider
+
+  cbm-bridge:
+    needs: changes
+    if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.cbm == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      # Versions match cbm-bridge/Dockerfile.
+      - name: Install test dependencies
+        run: pip install pytest==8.4.2 fastapi==0.115.5 uvicorn==0.32.1 pydantic==2.10.3
+      - name: Run cbm-bridge tests
+        working-directory: cbm-bridge
+        run: python -m pytest test_trace_path_degrade.py -v -p no:cacheprovider
+
+  helm-chart:
+    needs: changes
+    if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.deploy == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: azure/setup-helm@v4
+      - name: Lint and render with default values
+        run: |
+          set -eu
+          helm lint deploy/charts/neuralscape
+          helm template ci deploy/charts/neuralscape > /dev/null
+      - name: Lint and render with every example values file
+        # The chart ships only values.yaml today; this picks up any
+        # values*.yaml / examples/*.yaml added later without a workflow edit.
+        run: |
+          set -eu
+          chart=deploy/charts/neuralscape
+          for f in "$chart"/values-*.yaml "$chart"/examples/*.yaml; do
+            [ -e "$f" ] || continue
+            echo "== $f"
+            helm lint "$chart" -f "$f"
+            helm template ci "$chart" -f "$f" > /dev/null
+          done
+
+  acceptance-selftest:
+    needs: changes
+    if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.acceptance == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      # run.sh builds its own venv from acceptance/requirements.txt, then runs
+      # pytest on acceptance/selftest only (never against a stack).
+      - name: Acceptance harness self-test
+        run: acceptance/run.sh --selftest
+
+  sidecars-gate:
+    if: ${{ always() }}
+    needs: [changes, resolver-svc, cbm-bridge, helm-chart, acceptance-selftest]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require every applicable job to have passed
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          set -eu
+          echo "$NEEDS" | python3 -c '
+          import json, sys
+          needs = json.load(sys.stdin)
+          bad = []
+          for name, n in needs.items():
+              r = n["result"]
+              print(f"{name}: {r}")
+              # skipped is correct only when the paths were untouched
+              ok = {"success"} if name == "changes" else {"success", "skipped"}
+              if r not in ok:
+                  bad.append(f"{name}={r}")
+          if bad:
+              print("::error::" + ", ".join(bad))
+              sys.exit(1)
+          '
