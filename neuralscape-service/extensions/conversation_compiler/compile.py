@@ -208,27 +208,45 @@ def _entries_to_text(entries: list[dict]) -> str:
 
 async def _dedup_compiled_users(
     service: MemoryService, entries: list[dict], fallback_user_id: str
-) -> bool:
+) -> tuple[bool, int, int]:
     """Run post-compile dedup for each user that owns a compiled entry.
 
     The semantic phase is skipped when dreaming is enabled, exactly like the
     dedup cron. ``dedup_memories`` is synchronous, so each call runs in a
     worker thread (issue #213: running it inline blocked the API event loop).
     One user's failure never stops the others. Returns True when every
-    attempted dedup succeeded.
+    attempted dedup succeeded, plus the sibling graph jobs enqueued / not
+    enqueued from the ``graph_jobs`` the dedup runs returned.
     """
     users = {e["user_id"] for e in entries if e.get("user_id")}
     if not users or any(not e.get("user_id") for e in entries):
         users.add(fallback_user_id)
     semantic = _semantic_dedup_enabled()
     ok = True
+    enqueued = failed = 0
     for uid in sorted(users):
         try:
-            await asyncio.to_thread(service.dedup_memories, uid, semantic=semantic)
+            result = await asyncio.to_thread(service.dedup_memories, uid, semantic=semantic)
+            jobs = (result or {}).get("graph_jobs") or []
+            if jobs:
+                e, f = await _enqueue_sibling_jobs(jobs)
+                enqueued += e
+                failed += f
         except Exception:
             ok = False
             logger.warning("Post-compile dedup failed (non-critical)", user_id=uid)
-    return ok
+    return ok, enqueued, failed
+
+
+async def _enqueue_sibling_jobs(jobs: list[dict]) -> tuple[int, int]:
+    """Enqueue the sibling graph re-ingests a dedup run produced.
+
+    Returns ``(enqueued, not_enqueued)``; never raises.
+    """
+    from task_manager import enqueue_graph_jobs_standalone
+
+    res = await enqueue_graph_jobs_standalone(jobs)
+    return res["graph_jobs_enqueued"], len(res["graph_jobs_not_enqueued_ids"])
 
 
 async def compile_date(
@@ -378,14 +396,18 @@ async def compile_date(
     # The vault is one shared tree, so one daily log can hold entries from
     # several users; each entry records its owner. Entries written before
     # owners were recorded fall back to the ``user_id`` the compile was
-    # requested for.
-    dedup_triggered = await _dedup_compiled_users(service, entries, user_id)
+    # requested for. Sibling graph jobs the dedup returns are enqueued.
+    dedup_triggered, sibling_enqueued, sibling_failed = await _dedup_compiled_users(
+        service, entries, user_id
+    )
 
     result = CompileResult(
         date=date,
         articles=articles,
         entries_compiled=entries_compiled,
         dedup_triggered=dedup_triggered,
+        dedup_graph_jobs_enqueued=sibling_enqueued,
+        dedup_graph_jobs_not_enqueued=sibling_failed,
     )
 
     logger.info(

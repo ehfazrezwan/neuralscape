@@ -3,6 +3,7 @@
 Centralizes task enqueuing and status tracking, replacing the in-memory _tasks dict.
 """
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -88,11 +89,44 @@ _STATUS_MAP = {
 }
 
 
+async def enqueue_graph_jobs_standalone(jobs: list[dict]) -> dict:
+    """Enqueue graph re-ingest jobs from code with no queue handle (the dream
+    sweep's prune, the post-compile dedup) through a short-lived TaskManager.
+
+    Never raises: returns ``graph_jobs_enqueued`` and
+    ``graph_jobs_not_enqueued_ids`` like :meth:`TaskManager.enqueue_graph_jobs`.
+    """
+    tm = TaskManager()
+    try:
+        await tm.connect()
+        return await tm.enqueue_graph_jobs(jobs)
+    except Exception as e:
+        logger.warning("Sibling graph re-enrichment could not be queued (non-critical): %s", e)
+        return {
+            "graph_jobs_enqueued": 0,
+            "graph_jobs_not_enqueued_ids": [j.get("memory_id") for j in jobs],
+        }
+    finally:
+        pool = getattr(tm, "pool", None)
+        if pool is not None:
+            try:
+                await pool.aclose()
+            except Exception:
+                pass
+
+
 class TaskManager:
     """Redis-backed task status tracking + ARQ job enqueuing."""
 
     def __init__(self):
         self.pool: ArqRedis | None = None
+        # Durable ordinary-write path; both stay None unless LEDGER_ENABLED.
+        self.ledger = None
+        self.producer = None
+        self.authority = None
+        # Online cutover phase machine; None unless LEDGER_CUTOVER_ENABLED (then every write follows its phase).
+        self.cutover = None
+        self._owner_client = None  # synchronous Redis client for job-owner lookups
 
     async def connect(self) -> None:
         """Initialize the ARQ Redis connection pool."""
@@ -101,6 +135,13 @@ class TaskManager:
             default_queue_name=settings.arq_queue_name,
         )
         logger.info("TaskManager connected to Redis")
+
+    def _durable_route(self) -> bool:
+        """Whether a new write is accepted by the ledger (the cutover phase decides when enabled)."""
+
+        if self.producer is None:
+            return False
+        return self.cutover is None or self.cutover.writes_use_ledger()
 
     async def _track_task(
         self, user_id: str | None, task_id: str, *, grant_read: bool = True
@@ -120,6 +161,8 @@ class TaskManager:
         """
         if not user_id or self.pool is None:
             return
+        if self.producer is not None and task_id.startswith("intent-"):
+            return  # durable intents are tracked by the ledger, not ARQ
         if grant_read:
             await self._record_owner(user_id, task_id)
         try:
@@ -162,6 +205,8 @@ class TaskManager:
         agent_id: str | None = None,
         run_id: str | None = None,
         occurred_at: str | None = None,
+        # Durable path only (LEDGER_ENABLED): accepted and unused until writes use the ledger.
+        idempotency_key: str | None = None,
     ) -> str:
         """Enqueue memory extraction task. Returns task_id (job_id).
 
@@ -231,6 +276,8 @@ class TaskManager:
         # Data-layer connectors
         memory_kind: str | None = None,
         source_ref: dict | None = None,
+        # Durable path only (LEDGER_ENABLED): accepted and unused until writes use the ledger.
+        idempotency_key: str | None = None,
     ) -> str:
         """Enqueue raw memory storage task. Returns task_id (job_id).
 
@@ -440,6 +487,8 @@ class TaskManager:
         user_id: str | None = None,
         *,
         generation: str | None = None,
+        record: dict | None = None,
+        idempotency_key: str | None = None,
     ) -> str:
         """Enqueue a connector sync task. Returns job_id.
 
@@ -465,7 +514,7 @@ class TaskManager:
         await self._track_task(user_id, task_id)
         return task_id
 
-    async def enqueue_raw_batch(self, items: list[dict]) -> str:
+    async def enqueue_raw_batch(self, items: list[dict], *, idempotency_key: str | None = None) -> str:
         """Enqueue a batch of raw memory storage tasks (memory-model v2).
 
         Items are dispatched as a single ARQ job. Job ID is deterministic
@@ -497,7 +546,8 @@ class TaskManager:
             await self._track_task(uid, task_id, grant_read=len(writers) == 1)
         return task_id
 
-    async def enqueue_retag(self, caller_user_id: str, filters: dict, ops: dict) -> str:
+    async def enqueue_retag(self, caller_user_id: str, filters: dict, ops: dict,
+                            *, idempotency_key: str | None = None) -> str:
         """Enqueue a bulk retag task on the fast queue. Returns job_id.
 
         Canonical-JSON job id (sort_keys) so two *different* retags can never
@@ -565,6 +615,33 @@ class TaskManager:
         task_id = job_id if job is None else job.job_id
         await self._track_task(requester_user_id or user_id, task_id)
         return task_id
+
+    async def enqueue_graph_jobs(self, jobs: list[dict]) -> dict:
+        """Enqueue a list of graph re-ingest jobs (the ``graph_job`` shape).
+
+        Used for the sibling re-enrichment a delete/edit produces. Never
+        raises: a delete must succeed even when the queue is unavailable, so
+        failures are returned instead — ``graph_jobs_enqueued`` and
+        ``graph_jobs_not_enqueued_ids`` (memory ids whose re-ingest did NOT
+        get queued, so the caller can report them). A connection-level
+        failure short-circuits the remainder (no point timing out N times).
+        """
+        enqueued = 0
+        not_enqueued: list[str] = []
+        for i, job in enumerate(jobs or []):
+            try:
+                await self.enqueue_graph_enrichment(**job)
+                enqueued += 1
+            except Exception as e:
+                logger.warning(
+                    "Graph re-enrichment enqueue failed for %s (non-critical): %s",
+                    job.get("memory_id"), e,
+                )
+                not_enqueued.append(job.get("memory_id"))
+                if isinstance(e, OSError) or "Connection" in type(e).__name__ or "Timeout" in type(e).__name__:
+                    not_enqueued.extend(j.get("memory_id") for j in jobs[i + 1:])
+                    break
+        return {"graph_jobs_enqueued": enqueued, "graph_jobs_not_enqueued_ids": not_enqueued}
 
     def _candidate_queues(self, *, include_graph: bool = False) -> list[str]:
         """Queues a poll-able job could live on, de-duplicated.
@@ -741,6 +818,12 @@ class TaskManager:
         if self.pool:
             await self.pool.aclose()
             logger.info("TaskManager disconnected from Redis")
+        if self.producer is not None:
+            await asyncio.to_thread(self.producer.payloads.close)
+            await asyncio.to_thread(self.ledger.close)
+            if self.authority is not None:
+                await asyncio.to_thread(self.authority.close)
+            self.producer = self.ledger = self.authority = None
 
 
 def connector_sync_job_id(
