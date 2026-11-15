@@ -294,9 +294,6 @@ def batched_anchor_lookup(
         for hit in hits:
             payload = getattr(hit, "payload", None) or {}
             metadata = payload.get("metadata", {}) or {}
-            # Unwrap double-nested metadata if present (same as graph_admin).
-            if isinstance(metadata.get("metadata"), dict):
-                metadata = metadata["metadata"]
             source_ref = metadata.get("source_ref", {}) or {}
             anchor_key = source_ref.get("external_id", "")
             visibility = metadata.get("visibility", "private")

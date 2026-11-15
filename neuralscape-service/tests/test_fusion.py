@@ -327,20 +327,16 @@ def test_batched_anchor_lookup_visibility_preserved():
 def test_batched_anchor_lookup_private_owner_from_write_path_shape():
     """Regression: the owner is metadata.owner_user_id / payload.user_id, never
     metadata.user_id. A caller's own private anchored memory is returned; another
-    user's private one is not; a double-nested metadata wrapper is unwrapped."""
+    user's private one is not."""
     with patch("memory_service.get_shared_service") as mock_service:
         mock_m = MagicMock()
         mock_service.return_value._get_memory.return_value = mock_m
-        nested = _stored_point("mem_nested", "Nested mine", "repo::Foo",
-                               owner="alice", visibility="private", category="gotcha")
-        nested.payload["metadata"] = {"metadata": nested.payload["metadata"]}
         points = [
             _stored_point("mem_mine", "Mine", "repo::Foo",
                           owner="alice", visibility="private", category="gotcha",
                           created_at="2026-03-03T00:00:00Z"),
             _stored_point("mem_theirs", "Theirs", "repo::Foo",
                           owner="bob", visibility="private", category="gotcha"),
-            nested,
         ]
         mock_m.vector_store.client.scroll.return_value = (points, None)
 
@@ -350,7 +346,7 @@ def test_batched_anchor_lookup_private_owner_from_write_path_shape():
         )
 
         got = {m["id"]: m for m in result["Foo"]}
-        assert set(got) == {"mem_mine", "mem_nested"}
+        assert set(got) == {"mem_mine"}
         assert got["mem_mine"]["created_at"] == "2026-03-03T00:00:00Z"
 
         # Anonymous caller never sees private memories.
