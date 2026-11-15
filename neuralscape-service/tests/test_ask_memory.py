@@ -313,6 +313,31 @@ class TestEvidenceBudget:
         assert ids[0] == "mem-000"
 
 
+class TestEvidenceKeepsFusedOrder:
+    def test_floor_scored_lexical_row_survives_budget_cut(self):
+        """A BM25-only row (displayed score = the pass's weakest cosine)
+        that search() ranked 2nd must survive the evidence cap."""
+        n = ask_mod._EVIDENCE_MAX_ROWS
+        # search() order: dense 0.95, LEXICAL (floor 0.10), then n weaker dense rows
+        dense = [_mem(f"d-{i:03d}", f"dense fact {i:03d}") for i in range(n)]
+        for i, m in enumerate(dense):
+            m.score = 0.90 - i * 0.001
+        lex = _mem("lex", "Margrethe Vestager chairs the committee")
+        lex.score = 0.10  # imputed pool floor
+        results = [dense[0], lex] + dense[1:]
+        evidence = {m.id: m for m in results}
+
+        # Legacy score sort drops it...
+        legacy = [m.id for m in ask_mod._evidence_rows(dict(evidence), [], False)]
+        assert "lex" not in legacy
+        # ...rank-transferred scores keep it.
+        kept = ask_mod._evidence_rows(
+            dict(evidence), [], False,
+            order_scores=ask_mod._transfer_scores(results),
+        )
+        assert "lex" in [m.id for m in kept]
+
+
 # ──────────────────────────────────────────────
 # Evidence clipping (audit 27 #16): passage rows get a 1500-char budget,
 # every row clips at a sentence boundary instead of mid-word
