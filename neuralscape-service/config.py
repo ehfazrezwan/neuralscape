@@ -625,6 +625,13 @@ class Settings(BaseSettings):
     # capability under named principals; enforced refuses both.
     ns_auth_profile: Literal["legacy_compat", "enforced"] = "legacy_compat"
 
+    # Vendored mem0/Graphiti usage telemetry. Declared so these keys are valid in the
+    # service .env; nothing here reads them. third_party_telemetry.py applies them (or
+    # defaults both to off) before mem0/Graphiti are imported, since the libraries read
+    # only the process environment. None means "not set".
+    mem0_telemetry: str | None = None
+    graphiti_telemetry_enabled: str | None = None
+
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
 
     @field_validator("neuralscape_public_url")

@@ -193,6 +193,9 @@ services:
     # Auth comes from .env: startup refuses until NEURALSCAPE_USER_TOKEN_SECRET, NEURALSCAPE_API_KEY or NEURALSCAPE_AUTH_DISABLED=true is set (AUTH.md).
     env_file: .env
     environment:
+      # Vendored mem0/Graphiti usage telemetry: off unless explicitly opted in.
+      MEM0_TELEMETRY: ${MEM0_TELEMETRY:-false}
+      GRAPHITI_TELEMETRY_ENABLED: ${GRAPHITI_TELEMETRY_ENABLED:-false}
       NEO4J_URI: neo4j://neo4j:7687
       NEO4J_PASSWORD: ${NEO4J_PASSWORD:-neuralscape}
       NEO4J_DATABASE: ${NEO4J_DATABASE:-memory}
@@ -271,6 +274,9 @@ services:
         condition: service_healthy
     env_file: .env
     environment:
+      # Vendored mem0/Graphiti usage telemetry: off unless explicitly opted in.
+      MEM0_TELEMETRY: ${MEM0_TELEMETRY:-false}
+      GRAPHITI_TELEMETRY_ENABLED: ${GRAPHITI_TELEMETRY_ENABLED:-false}
       NEO4J_URI: neo4j://neo4j:7687
       NEO4J_PASSWORD: ${NEO4J_PASSWORD:-neuralscape}
       NEO4J_DATABASE: ${NEO4J_DATABASE:-memory}
@@ -317,6 +323,9 @@ services:
         condition: service_healthy
     env_file: .env
     environment:
+      # Vendored mem0/Graphiti usage telemetry: off unless explicitly opted in.
+      MEM0_TELEMETRY: ${MEM0_TELEMETRY:-false}
+      GRAPHITI_TELEMETRY_ENABLED: ${GRAPHITI_TELEMETRY_ENABLED:-false}
       NEO4J_URI: neo4j://neo4j:7687
       NEO4J_PASSWORD: ${NEO4J_PASSWORD:-neuralscape}
       NEO4J_DATABASE: ${NEO4J_DATABASE:-memory}
@@ -373,6 +382,9 @@ services:
         condition: service_healthy
     env_file: .env
     environment:
+      # Vendored mem0/Graphiti usage telemetry: off unless explicitly opted in.
+      MEM0_TELEMETRY: ${MEM0_TELEMETRY:-false}
+      GRAPHITI_TELEMETRY_ENABLED: ${GRAPHITI_TELEMETRY_ENABLED:-false}
       NEO4J_URI: neo4j://neo4j:7687
       NEO4J_PASSWORD: ${NEO4J_PASSWORD:-neuralscape}
       NEO4J_DATABASE: ${NEO4J_DATABASE:-memory}
@@ -479,6 +491,9 @@ services:
         condition: service_healthy
     env_file: .env
     environment:
+      # Vendored mem0/Graphiti usage telemetry: off unless explicitly opted in.
+      MEM0_TELEMETRY: ${MEM0_TELEMETRY:-false}
+      GRAPHITI_TELEMETRY_ENABLED: ${GRAPHITI_TELEMETRY_ENABLED:-false}
       NEO4J_URI: neo4j://neo4j:7687
       NEO4J_PASSWORD: ${NEO4J_PASSWORD:-neuralscape}
       NEO4J_DATABASE: ${NEO4J_DATABASE:-memory}

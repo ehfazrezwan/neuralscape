@@ -4,6 +4,8 @@ Provides both legacy endpoints (root) and new v1 endpoints with scoping,
 categories, and a shared MemoryService business logic layer.
 """
 
+import third_party_telemetry  # noqa: F401 — must precede any mem0/Graphiti import (defaults their telemetry off)
+
 import asyncio
 import base64
 import hashlib
