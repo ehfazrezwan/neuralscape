@@ -2603,6 +2603,11 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
             # worker's queue and let the caller poll the status endpoint.
             from extensions.dreaming.config import dreaming_settings
 
+            # Dictator-only, checked before the flag/force logic (mirrors REST /run).
+            if not settings.is_dictator(user_id):
+                return [TextContent(type="text", text=json.dumps(
+                    {"error": f"User {user_id!r} is not authorized to trigger dreaming sweeps."}))]
+
             force = bool(arguments.get("force", False))
             if not dreaming_settings.enabled and not force:
                 return [TextContent(type="text", text=json.dumps({

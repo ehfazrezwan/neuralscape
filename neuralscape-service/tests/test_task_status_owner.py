@@ -466,6 +466,7 @@ class TestDreamSweepTasks:
         from extensions.dreaming.config import dreaming_settings
 
         monkeypatch.setattr(dreaming_settings, "enabled", True)
+        monkeypatch.setattr(settings, "dictator_user_ids", "alice")
         monkeypatch.setattr(mcp_server, "_arq_pool", ptm.pool)
         token = current_user_id.set("alice")
         try:

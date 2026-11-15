@@ -295,3 +295,43 @@ async def test_flush_store_raw_runs_off_the_event_loop(monkeypatch):
     t.cancel()
     assert result.memories_stored == 1
     assert ticks >= 8, f"event loop starved while store_raw ran (ticks={ticks})"
+
+
+# ── MCP schedule_dream dictator gate ────────────────────────────────────
+
+
+class TestScheduleDreamGate:
+    @pytest.fixture()
+    def arq(self, pool, monkeypatch):
+        import mcp_server
+        from extensions.dreaming.config import dreaming_settings
+
+        monkeypatch.setattr(dreaming_settings, "enabled", True)
+        monkeypatch.setattr(mcp_server, "_arq_pool", pool)
+        monkeypatch.setattr("task_manager.record_task_owner", AsyncMock())
+        return pool
+
+    async def _call(self, user, **args):
+        import mcp_server
+        from auth import current_user_id
+
+        tok = current_user_id.set(user)
+        try:
+            return await mcp_server.call_tool("schedule_dream", args)
+        finally:
+            current_user_id.reset(tok)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("force", [False, True])
+    async def test_non_dictator_refused_and_nothing_enqueued(self, arq, monkeypatch, force):
+        monkeypatch.setattr(settings, "dictator_user_ids", "")
+        out = await self._call("alice", force=force)
+        assert "not authorized" in json.loads(out[0].text)["error"]
+        arq.enqueue_job.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_dictator_enqueues(self, arq, monkeypatch):
+        monkeypatch.setattr(settings, "dictator_user_ids", "alice")
+        out = await self._call("alice")
+        assert json.loads(out[0].text)["status"] == "enqueued"
+        assert arq.enqueue_job.await_args.args[0] == "run_dream_sweep"

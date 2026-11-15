@@ -43,12 +43,12 @@ class ProjectKnowledgeConfig:
 ### REST Endpoints
 
 - `GET /v1/projects/{project_id}/knowledge-config` — get current config (returns default if not set)
-- `PUT /v1/projects/{project_id}/knowledge-config` — set/update config
+- `PUT /v1/projects/{project_id}/knowledge-config` — set/update config (dictator-only: 403 otherwise; `DICTATOR_USER_IDS` empty means nobody can write)
 
 ### MCP Tools
 
 - `get_project_knowledge_config(project_id)` — get current config
-- `set_project_knowledge_config(project_id, code_systems?, fuse_code_into_recall?, default_engine?)` — set/update config
+- `set_project_knowledge_config(project_id, code_systems?, fuse_code_into_recall?, default_engine?)` — set/update config (dictator-only, same gate as the PUT; returns a JSON `error` otherwise)
 
 ## Decision #3 Rationale (fusion ON by default)
 
