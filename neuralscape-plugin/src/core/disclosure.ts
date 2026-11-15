@@ -12,7 +12,11 @@
  */
 
 import type { NeuralscapeMemory } from "../utils.js";
-import { COMPACT_SNAPSHOT_MARKER, COMPACT_SNAPSHOT_TAG } from "./compact.js";
+import {
+  COMPACT_SNAPSHOT_MARKER,
+  COMPACT_SNAPSHOT_SESSION_TAG_PREFIX,
+  COMPACT_SNAPSHOT_TAG,
+} from "./compact.js";
 
 // ── Budget ───────────────────────────────────────────────────────
 
@@ -347,6 +351,22 @@ export function isCompactSnapshot(mem: NeuralscapeMemory): boolean {
   );
 }
 
+/** `--resume` / `--fork` start a new session id; a snapshot from the old one is still relevant for this long. */
+export const RESUME_FALLBACK_WINDOW_MS = 2 * 60 * 60 * 1000;
+
+/** Which session a snapshot belongs to: its `session:<id>` tag, else the id in the content line. */
+export function snapshotSessionId(mem: NeuralscapeMemory): string | null {
+  const tag = (mem.tags ?? []).find((t) => t.startsWith(COMPACT_SNAPSHOT_SESSION_TAG_PREFIX));
+  if (tag) return tag.slice(COMPACT_SNAPSHOT_SESSION_TAG_PREFIX.length) || null;
+  const m = /^\s*Compact snapshot: session (\S+) in project /.exec(mem.memory ?? "");
+  return m ? m[1] : null;
+}
+
+function createdMs(mem: NeuralscapeMemory): number {
+  const t = mem.created_at ? new Date(mem.created_at).getTime() : Number.NEGATIVE_INFINITY;
+  return Number.isNaN(t) ? Number.NEGATIVE_INFINITY : t;
+}
+
 /**
  * Render the newest compact snapshots — FULL content, they're small by
  * construction — under a "## Resuming after compaction" heading. Scans all
@@ -354,29 +374,47 @@ export function isCompactSnapshot(mem: NeuralscapeMemory): boolean {
  * safety, mirroring findLatestSessionNote). Returns the rendered block
  * ("" when no snapshots) plus the ids rendered, so the caller can keep
  * them out of the index table (no double render).
+ *
+ * The project's memories include snapshots of every session in it, so a
+ * compaction in one terminal must not re-inject another terminal's. With
+ * `sessionId` (the SessionStart payload's id):
+ *   - this session's own snapshots win (compaction keeps the session id);
+ *   - source "compact" shows ONLY those;
+ *   - on resume/fork (Claude Code issues a NEW session id, so nothing is
+ *     "own") the newest snapshot of the project is used, but only when it is
+ *     recent (RESUME_FALLBACK_WINDOW_MS), so a resume does not pull in a
+ *     long-dead or concurrent session's old state.
+ * Without `sessionId` every snapshot is a candidate, as before.
  */
 export function renderResumeAfterCompact(
   categories: Record<string, NeuralscapeMemory[]>,
-  opts: { now?: Date; limit?: number } = {},
+  opts: { now?: Date; limit?: number; sessionId?: string; source?: string } = {},
 ): { block: string; ids: string[] } {
   const now = opts.now ?? new Date();
   const limit = opts.limit ?? 3;
 
-  const snapshots: NeuralscapeMemory[] = [];
+  let snapshots: NeuralscapeMemory[] = [];
   for (const memories of Object.values(categories)) {
     for (const mem of memories ?? []) {
       if (isCompactSnapshot(mem)) snapshots.push(mem);
     }
   }
+
+  let keptLimit = limit;
+  if (opts.sessionId) {
+    const own = snapshots.filter((m) => snapshotSessionId(m) === opts.sessionId);
+    if (own.length > 0 || opts.source === "compact") {
+      snapshots = own;
+    } else {
+      snapshots = snapshots.filter((m) => now.getTime() - createdMs(m) <= RESUME_FALLBACK_WINDOW_MS);
+      keptLimit = 1;
+    }
+  }
   if (snapshots.length === 0) return { block: "", ids: [] };
 
-  snapshots.sort((a, b) => {
-    const ta = a.created_at ? new Date(a.created_at).getTime() : Number.NEGATIVE_INFINITY;
-    const tb = b.created_at ? new Date(b.created_at).getTime() : Number.NEGATIVE_INFINITY;
-    return (Number.isNaN(tb) ? Number.NEGATIVE_INFINITY : tb) - (Number.isNaN(ta) ? Number.NEGATIVE_INFINITY : ta);
-  });
+  snapshots.sort((a, b) => createdMs(b) - createdMs(a));
 
-  const kept = snapshots.slice(0, limit);
+  const kept = snapshots.slice(0, keptLimit);
   const lines: string[] = [
     "## Resuming after compaction",
     "",

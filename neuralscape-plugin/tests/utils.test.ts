@@ -7,7 +7,7 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync, statSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, utimesSync, writeFileSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -17,9 +17,13 @@ import {
   getBufferStats,
   getObservationDir,
   getProjectId,
-  getStaleMarkerPath,
+  getCompactSnapshotPath,
+  getEndedMarkerPath,
+  getPendingIdleHours,
   listPendingBuffers,
-  markBufferStale,
+  markBufferEnded,
+  readLocalCompactSnapshot,
+  writeLocalCompactSnapshot,
   pickRelevantInput,
   readBakedUrl,
   readConfig,
@@ -87,10 +91,10 @@ describe("getBufferPath", () => {
 });
 
 
-describe("getStaleMarkerPath", () => {
-  it("appends .stale to the buffer path", () => {
-    const path = getStaleMarkerPath("abc");
-    expect(path.endsWith(".jsonl.stale")).toBe(true);
+describe("getEndedMarkerPath", () => {
+  it("appends .ended to the buffer path", () => {
+    const path = getEndedMarkerPath("abc");
+    expect(path.endsWith(".jsonl.ended")).toBe(true);
   });
 });
 
@@ -136,7 +140,7 @@ describe("getBufferStats", () => {
     const stats = await getBufferStats(join(scratch, "missing.jsonl"));
     expect(stats.lineCount).toBe(0);
     expect(stats.oldestTs).toBeNull();
-    expect(stats.isStale).toBe(false);
+    expect(stats.isEnded).toBe(false);
   });
 
   it("counts non-empty lines", async () => {
@@ -161,12 +165,30 @@ describe("getBufferStats", () => {
     expect(stats.oldestTs).toBeNull();
   });
 
-  it("detects the .stale marker", async () => {
+  it("detects the .ended marker when the buffer was not written after it", async () => {
+    const path = join(scratch, "session.jsonl");
+    writeFileSync(path, '{"ts":"2026-01-01","tool":"A"}\n', "utf-8");
+    writeFileSync(path + ".ended", "2026-05-09", "utf-8");
+    utimesSync(path, new Date(1_000_000), new Date(1_000_000));
+    utimesSync(path + ".ended", new Date(2_000_000), new Date(2_000_000));
+    const stats = await getBufferStats(path);
+    expect(stats.isEnded).toBe(true);
+  });
+
+  it("does not call a buffer ended when it was written after the marker (resumed session)", async () => {
+    const path = join(scratch, "session.jsonl");
+    writeFileSync(path, '{"ts":"2026-01-01","tool":"A"}\n', "utf-8");
+    writeFileSync(path + ".ended", "2026-05-09", "utf-8");
+    utimesSync(path + ".ended", new Date(1_000_000), new Date(1_000_000));
+    utimesSync(path, new Date(2_000_000), new Date(2_000_000));
+    expect((await getBufferStats(path)).isEnded).toBe(false);
+  });
+
+  it("ignores a legacy .stale marker (it came from the per-turn Stop hook)", async () => {
     const path = join(scratch, "session.jsonl");
     writeFileSync(path, '{"ts":"2026-01-01","tool":"A"}\n', "utf-8");
     writeFileSync(path + ".stale", "2026-05-09", "utf-8");
-    const stats = await getBufferStats(path);
-    expect(stats.isStale).toBe(true);
+    expect((await getBufferStats(path)).isEnded).toBe(false);
   });
 
   it("oldestTs=null when first row's ts is not a string", async () => {
@@ -178,7 +200,28 @@ describe("getBufferStats", () => {
 });
 
 
+const ROW = '{"ts":"2026-01-01","tool":"A"}\n';
+const HOUR = 60 * 60 * 1000;
+
+/** Write a buffer whose last write was `ageMs` ago (relative to `now`), optionally with an end marker `markerAgeMs` ago. */
+function seedBuffer(name: string, now: number, ageMs: number, markerAgeMs?: number, content = ROW): string {
+  const dir = getObservationDir();
+  mkdirSync(dir, { recursive: true });
+  const path = join(dir, `${name}.jsonl`);
+  writeFileSync(path, content, "utf-8");
+  const t = new Date(now - ageMs);
+  utimesSync(path, t, t);
+  if (markerAgeMs !== undefined) {
+    writeFileSync(path + ".ended", "x", "utf-8");
+    const m = new Date(now - markerAgeMs);
+    utimesSync(path + ".ended", m, m);
+  }
+  return path;
+}
+
 describe("listPendingBuffers", () => {
+  const now = Date.now();
+
   it("returns [] when the observation dir doesn't exist yet", async () => {
     delete process.env.CLAUDE_PLUGIN_DATA;
     process.env.CLAUDE_PLUGIN_DATA = join(scratch, "nonexistent");
@@ -186,42 +229,131 @@ describe("listPendingBuffers", () => {
     expect(pending).toEqual([]);
   });
 
-  it("excludes the current session id", async () => {
-    const dir = getObservationDir();
-    mkdirSync(dir, { recursive: true });
-    writeFileSync(join(dir, "current.jsonl"), '{"ts":"2026-01-01","tool":"A"}\n', "utf-8");
-    writeFileSync(join(dir, "prior.jsonl"), '{"ts":"2026-01-01","tool":"A"}\n', "utf-8");
-    const pending = await listPendingBuffers("current");
+  it("excludes the current session id even when it has ended", async () => {
+    seedBuffer("current", now, 2 * HOUR, 1 * HOUR);
+    seedBuffer("prior", now, 2 * HOUR, 1 * HOUR);
+    const pending = await listPendingBuffers("current", now);
     expect(pending.map((b) => b.sessionId)).toEqual(["prior"]);
   });
 
   it("excludes empty buffers", async () => {
-    const dir = getObservationDir();
-    mkdirSync(dir, { recursive: true });
-    writeFileSync(join(dir, "empty.jsonl"), "", "utf-8");
-    writeFileSync(join(dir, "full.jsonl"), '{"ts":"2026-01-01","tool":"A"}\n', "utf-8");
-    const pending = await listPendingBuffers();
+    seedBuffer("empty", now, 2 * HOUR, 1 * HOUR, "");
+    seedBuffer("full", now, 2 * HOUR, 1 * HOUR);
+    const pending = await listPendingBuffers(undefined, now);
     expect(pending.map((b) => b.sessionId)).toEqual(["full"]);
   });
 
-  it("ignores non-jsonl files", async () => {
+  it("does NOT list a live buffer of another concurrent session (recent writes, no end marker)", async () => {
+    seedBuffer("other-terminal", now, 30 * 1000);
+    expect(await listPendingBuffers("mine", now)).toEqual([]);
+  });
+
+  it("does NOT treat a legacy per-turn .stale marker as an end of session", async () => {
+    const path = seedBuffer("other-terminal", now, 30 * 1000);
+    writeFileSync(path + ".stale", "2026-05-09", "utf-8");
+    expect(await listPendingBuffers("mine", now)).toEqual([]);
+  });
+
+  it("lists a buffer whose session ended (end marker newer than the last write)", async () => {
+    seedBuffer("ended", now, 5 * 60 * 1000, 60 * 1000);
+    const pending = await listPendingBuffers("mine", now);
+    expect(pending.map((b) => b.sessionId)).toEqual(["ended"]);
+    expect(pending[0].isEnded).toBe(true);
+  });
+
+  it("does NOT list a buffer that was written again after its end marker (session resumed)", async () => {
+    seedBuffer("resumed", now, 60 * 1000, 5 * 60 * 1000);
+    expect(await listPendingBuffers("mine", now)).toEqual([]);
+  });
+
+  it("lists an abandoned buffer with no marker once it has been idle for 12 hours (crashed session)", async () => {
+    seedBuffer("crashed", now, 13 * HOUR);
+    seedBuffer("just-quiet", now, 11 * HOUR);
+    const pending = await listPendingBuffers("mine", now);
+    expect(pending.map((b) => b.sessionId)).toEqual(["crashed"]);
+  });
+
+  it("takes the idle window from PENDING_IDLE_HOURS", async () => {
+    const prev = process.env.NEURALSCAPE_PENDING_IDLE_HOURS;
+    process.env.NEURALSCAPE_PENDING_IDLE_HOURS = "1";
+    try {
+      seedBuffer("quiet-2h", now, 2 * HOUR);
+      expect(getPendingIdleHours()).toBe(1);
+      expect((await listPendingBuffers("mine", now)).map((b) => b.sessionId)).toEqual(["quiet-2h"]);
+    } finally {
+      if (prev === undefined) delete process.env.NEURALSCAPE_PENDING_IDLE_HOURS;
+      else process.env.NEURALSCAPE_PENDING_IDLE_HOURS = prev;
+    }
+  });
+
+  it("defaults to 12 hours for a missing or invalid PENDING_IDLE_HOURS", () => {
+    expect(getPendingIdleHours()).toBe(12);
+    const prev = process.env.NEURALSCAPE_PENDING_IDLE_HOURS;
+    process.env.NEURALSCAPE_PENDING_IDLE_HOURS = "banana";
+    try {
+      expect(getPendingIdleHours()).toBe(12);
+    } finally {
+      if (prev === undefined) delete process.env.NEURALSCAPE_PENDING_IDLE_HOURS;
+      else process.env.NEURALSCAPE_PENDING_IDLE_HOURS = prev;
+    }
+  });
+
+  it("removes orphan markers: end markers of emptied or missing buffers, and legacy .stale markers", async () => {
+    // The compile skill empties a buffer with the Write tool: the marker is left behind.
+    const emptied = seedBuffer("emptied", now, 2 * HOUR, 1 * HOUR);
+    writeFileSync(emptied, "", "utf-8");
     const dir = getObservationDir();
-    mkdirSync(dir, { recursive: true });
-    writeFileSync(join(dir, "session.jsonl"), '{"ts":"2026-01-01","tool":"A"}\n', "utf-8");
-    writeFileSync(join(dir, "notes.txt"), "ignored", "utf-8");
-    writeFileSync(join(dir, "session.jsonl.stale"), "marker", "utf-8");
-    const pending = await listPendingBuffers();
+    writeFileSync(join(dir, "gone.jsonl.ended"), "x", "utf-8"); // buffer deleted
+    const legacy = seedBuffer("legacy", now, 2 * HOUR, 1 * HOUR);
+    writeFileSync(legacy + ".stale", "old", "utf-8");
+    const kept = seedBuffer("kept", now, 2 * HOUR, 1 * HOUR);
+
+    await listPendingBuffers("mine", now);
+
+    expect(existsSync(emptied + ".ended")).toBe(false);
+    expect(existsSync(join(dir, "gone.jsonl.ended"))).toBe(false);
+    expect(existsSync(legacy + ".stale")).toBe(false);
+    // A marker of a non-empty buffer is still needed.
+    expect(existsSync(kept + ".ended")).toBe(true);
+    expect(existsSync(legacy + ".ended")).toBe(true);
+  });
+
+  it("removes local compact snapshots older than two weeks and keeps recent ones", async () => {
+    await writeLocalCompactSnapshot({ sessionId: "old", content: "c", createdAt: "x" });
+    await writeLocalCompactSnapshot({ sessionId: "new", content: "c", createdAt: "x" });
+    const old = new Date(now - 15 * 24 * HOUR);
+    utimesSync(getCompactSnapshotPath("old"), old, old);
+    await listPendingBuffers("mine", now);
+    expect(existsSync(getCompactSnapshotPath("old"))).toBe(false);
+    expect(existsSync(getCompactSnapshotPath("new"))).toBe(true);
+  });
+
+  it("ignores non-jsonl files", async () => {
+    seedBuffer("session", now, 2 * HOUR, 1 * HOUR);
+    writeFileSync(join(getObservationDir(), "notes.txt"), "ignored", "utf-8");
+    const pending = await listPendingBuffers(undefined, now);
     expect(pending).toHaveLength(1);
     expect(pending[0].sessionId).toBe("session");
   });
+});
 
-  it("returns [] if currentSessionId omitted and only the active buffer exists", async () => {
-    const dir = getObservationDir();
-    mkdirSync(dir, { recursive: true });
-    writeFileSync(join(dir, "only.jsonl"), '{"ts":"x"}\n', "utf-8");
-    // Without currentSessionId filter, "only" should show up
-    const pending = await listPendingBuffers();
-    expect(pending.map((b) => b.sessionId)).toEqual(["only"]);
+
+describe("local compact snapshot", () => {
+  it("round-trips through the observation dir", async () => {
+    await writeLocalCompactSnapshot({ sessionId: "s/1", projectId: "p", content: "Compact snapshot: x", createdAt: "2026-11-16T00:00:00Z" });
+    expect(await readLocalCompactSnapshot("s/1")).toEqual({
+      sessionId: "s/1",
+      projectId: "p",
+      content: "Compact snapshot: x",
+      createdAt: "2026-11-16T00:00:00Z",
+    });
+  });
+
+  it("returns null when absent or corrupt", async () => {
+    expect(await readLocalCompactSnapshot("none")).toBeNull();
+    mkdirSync(getObservationDir(), { recursive: true });
+    writeFileSync(getCompactSnapshotPath("bad"), "{not json", "utf-8");
+    expect(await readLocalCompactSnapshot("bad")).toBeNull();
   });
 });
 
@@ -235,11 +367,13 @@ describe("truncateBuffer", () => {
     expect(statSync(path).isFile()).toBe(true);
   });
 
-  it("removes the .stale marker if present", async () => {
+  it("removes the end marker and a legacy .stale marker if present", async () => {
     const path = join(scratch, "buf.jsonl");
     writeFileSync(path, '{"a":1}\n', "utf-8");
+    writeFileSync(path + ".ended", "marker", "utf-8");
     writeFileSync(path + ".stale", "marker", "utf-8");
     await truncateBuffer(path);
+    expect(() => statSync(path + ".ended")).toThrow();
     expect(() => statSync(path + ".stale")).toThrow();
   });
 
@@ -258,10 +392,10 @@ describe("truncateBuffer", () => {
 });
 
 
-describe("markBufferStale", () => {
-  it("creates a .stale file alongside the buffer path", async () => {
-    await markBufferStale("session-x");
-    const markerPath = getStaleMarkerPath("session-x");
+describe("markBufferEnded", () => {
+  it("creates a .ended file alongside the buffer path", async () => {
+    await markBufferEnded("session-x");
+    const markerPath = getEndedMarkerPath("session-x");
     expect(statSync(markerPath).isFile()).toBe(true);
     const content = readFileSync(markerPath, "utf-8");
     // Content is an ISO timestamp
@@ -271,15 +405,15 @@ describe("markBufferStale", () => {
   it("creates the directory on first call", async () => {
     // Use a fresh subdirectory that does not yet exist
     process.env.CLAUDE_PLUGIN_DATA = join(scratch, "fresh");
-    await markBufferStale("s1");
-    expect(statSync(getStaleMarkerPath("s1")).isFile()).toBe(true);
+    await markBufferEnded("s1");
+    expect(statSync(getEndedMarkerPath("s1")).isFile()).toBe(true);
   });
 
   it("swallows write errors silently", async () => {
     const blocker = join(scratch, "blocker");
     writeFileSync(blocker, "x");
     process.env.CLAUDE_PLUGIN_DATA = blocker;
-    await expect(markBufferStale("x")).resolves.toBeUndefined();
+    await expect(markBufferEnded("x")).resolves.toBeUndefined();
   });
 });
 

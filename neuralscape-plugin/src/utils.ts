@@ -511,10 +511,22 @@ export function getBufferPath(sessionId: string): string {
   return pathJoin(getObservationDir(), `${safe}.jsonl`);
 }
 
-/** Path to the per-session "stale" marker dropped by the Stop hook. */
-export function getStaleMarkerPath(sessionId: string): string {
-  return getBufferPath(sessionId) + ".stale";
+/**
+ * Path to the per-session "session ended" marker, written once by the
+ * SessionEnd hook. (Versions up to 2.9.3 wrote `<buffer>.stale` from the Stop
+ * hook, which fires after every turn and so says nothing about the session
+ * having ended; those markers are ignored and removed.)
+ */
+export function getEndedMarkerPath(sessionId: string): string {
+  return getBufferPath(sessionId) + ".ended";
 }
+
+/** Marker suffix written by plugin versions up to 2.9.3 (meaningless; cleaned up). */
+const LEGACY_STALE_SUFFIX = ".stale";
+const ENDED_SUFFIX = ".ended";
+
+/** Local copy of the last compact snapshot, next to the buffers. */
+const COMPACT_SNAPSHOT_FILE_SUFFIX = ".compact-snapshot.json";
 
 /**
  * Append a single observation row (already-stringified-able JSON) to the
@@ -542,7 +554,13 @@ export interface BufferStats {
   sessionId: string;
   lineCount: number;
   oldestTs: string | null;
-  isStale: boolean; // true if a `.stale` marker exists alongside the buffer
+  /** Last write to the buffer (ms since epoch); 0 when the file is missing. */
+  mtimeMs: number;
+  /**
+   * True when the SessionEnd hook marked this session as ended and the buffer
+   * has not been written since (a session that resumed and kept working is not ended).
+   */
+  isEnded: boolean;
 }
 
 /**
@@ -567,21 +585,81 @@ export async function getBufferStats(path: string): Promise<BufferStats> {
   } catch {
     // file missing or unreadable: lineCount stays 0
   }
-  let isStale = false;
+  let mtimeMs = 0;
   try {
-    await stat(path + ".stale");
-    isStale = true;
+    mtimeMs = (await stat(path)).mtimeMs;
   } catch {
-    isStale = false;
+    mtimeMs = 0;
   }
-  return { path, sessionId, lineCount, oldestTs, isStale };
+  let isEnded = false;
+  try {
+    const marker = await stat(path + ENDED_SUFFIX);
+    isEnded = lineCount > 0 && marker.mtimeMs >= mtimeMs;
+  } catch {
+    isEnded = false;
+  }
+  return { path, sessionId, lineCount, oldestTs, mtimeMs, isEnded };
+}
+
+/** A buffer nobody has written to for this long belongs to a session that is gone (it crashed before SessionEnd). */
+export const DEFAULT_PENDING_IDLE_HOURS = 12;
+
+/** Hours of silence after which an un-ended buffer counts as abandoned (`PENDING_IDLE_HOURS`, default 12). */
+export function getPendingIdleHours(): number {
+  const parsed = parseFloat(readConfig("PENDING_IDLE_HOURS", ""));
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_PENDING_IDLE_HOURS;
+}
+
+/** Local compact snapshots are continuity artifacts like the stored ones: dropped after two weeks. */
+const COMPACT_SNAPSHOT_FILE_MAX_AGE_MS = 14 * 24 * 60 * 60 * 1000;
+
+/**
+ * Remove marker files that can no longer matter. The compile-observations
+ * skill empties a buffer with the Write tool, which cannot delete the
+ * markers next to it, so they would otherwise accumulate:
+ *   - `.ended` markers whose buffer is empty or missing;
+ *   - `.stale` markers written by plugin versions up to 2.9.3 (they came
+ *     from the per-turn Stop hook and carry no information);
+ *   - local compact snapshots older than two weeks.
+ * Never throws.
+ */
+export async function cleanupOrphanMarkers(entries: string[], now: number = Date.now()): Promise<void> {
+  const dir = getObservationDir();
+  const buffers = new Set(entries.filter((n) => n.endsWith(".jsonl")));
+  for (const name of entries) {
+    try {
+      if (name.endsWith(".jsonl" + LEGACY_STALE_SUFFIX)) {
+        await unlink(pathJoin(dir, name));
+      } else if (name.endsWith(".jsonl" + ENDED_SUFFIX)) {
+        const bufferName = name.slice(0, -ENDED_SUFFIX.length);
+        let empty = !buffers.has(bufferName);
+        if (!empty) empty = (await stat(pathJoin(dir, bufferName))).size === 0;
+        if (empty) await unlink(pathJoin(dir, name));
+      } else if (name.endsWith(COMPACT_SNAPSHOT_FILE_SUFFIX)) {
+        const age = now - (await stat(pathJoin(dir, name))).mtimeMs;
+        if (age > COMPACT_SNAPSHOT_FILE_MAX_AGE_MS) await unlink(pathJoin(dir, name));
+      }
+    } catch {
+      // raced with another hook or already gone — fine
+    }
+  }
 }
 
 /**
- * List every non-empty buffer file in the observation directory whose
- * session id is NOT the current one (i.e. left behind by prior sessions).
+ * List the non-empty buffers left behind by sessions that are OVER.
+ *
+ * A buffer belongs to a finished session when it is not the current one and
+ *   (a) the SessionEnd hook marked it ended and it has not been written since, or
+ *   (b) nobody has written to it for `PENDING_IDLE_HOURS` (default 12): the
+ *       session crashed or was killed and SessionEnd never fired.
+ * A buffer that is being written by another terminal's live session is neither,
+ * so it is never offered for compilation and truncation. Markers from empty
+ * or missing buffers are removed as a side effect.
  */
-export async function listPendingBuffers(currentSessionId?: string): Promise<BufferStats[]> {
+export async function listPendingBuffers(
+  currentSessionId?: string,
+  now: number = Date.now(),
+): Promise<BufferStats[]> {
   const dir = getObservationDir();
   let entries: string[] = [];
   try {
@@ -589,6 +667,8 @@ export async function listPendingBuffers(currentSessionId?: string): Promise<Buf
   } catch {
     return [];
   }
+  await cleanupOrphanMarkers(entries, now);
+  const idleMs = getPendingIdleHours() * 60 * 60 * 1000;
   const results: BufferStats[] = [];
   for (const name of entries) {
     if (!name.endsWith(".jsonl")) continue;
@@ -596,6 +676,8 @@ export async function listPendingBuffers(currentSessionId?: string): Promise<Buf
     const stats = await getBufferStats(path);
     if (stats.lineCount === 0) continue;
     if (currentSessionId && stats.sessionId === currentSessionId) continue;
+    const abandoned = now - stats.mtimeMs >= idleMs;
+    if (!stats.isEnded && !abandoned) continue;
     results.push(stats);
   }
   return results;
@@ -603,16 +685,19 @@ export async function listPendingBuffers(currentSessionId?: string): Promise<Buf
 
 /**
  * Truncate a buffer file to empty (preserves the file/inode for reuse).
- * Also removes any `.stale` marker. Used by the compile-observations skill
- * after successfully POSTing all extracted memories.
+ * Also removes the end marker. (The compile-observations skill itself empties
+ * buffers with the Write tool; the next `listPendingBuffers` call removes the
+ * marker it leaves behind.)
  */
 export async function truncateBuffer(path: string): Promise<void> {
   try {
     await writeFile(path, "", "utf-8");
-    try {
-      await unlink(path + ".stale");
-    } catch {
-      // no marker — fine
+    for (const suffix of [ENDED_SUFFIX, LEGACY_STALE_SUFFIX]) {
+      try {
+        await unlink(path + suffix);
+      } catch {
+        // no marker — fine
+      }
     }
   } catch (error) {
     logError(`truncateBuffer failed for ${path}`, error);
@@ -620,16 +705,63 @@ export async function truncateBuffer(path: string): Promise<void> {
 }
 
 /**
- * Write a small sentinel file next to the buffer indicating that the Stop
- * hook flushed without compilation. The next SessionStart picks these up.
+ * Write the "session ended" marker next to the buffer. Called once by the
+ * SessionEnd hook (never by Stop, which fires after every turn). The next
+ * SessionStart, in any terminal, treats the buffer as ready to compile
+ * as long as it is not written to again after the marker.
  */
-export async function markBufferStale(sessionId: string): Promise<void> {
+export async function markBufferEnded(sessionId: string): Promise<void> {
   try {
     const dir = getObservationDir();
     await mkdir(dir, { recursive: true });
-    await writeFile(getStaleMarkerPath(sessionId), new Date().toISOString(), "utf-8");
+    await writeFile(getEndedMarkerPath(sessionId), new Date().toISOString(), "utf-8");
   } catch (error) {
-    logError("markBufferStale failed", error);
+    logError("markBufferEnded failed", error);
+  }
+}
+
+// ── Local compact snapshot (survives a slow or unreachable service) ──
+
+export interface LocalCompactSnapshot {
+  sessionId: string;
+  projectId?: string;
+  content: string;
+  createdAt: string;
+}
+
+/** Path to the local copy of a session's latest compact snapshot. */
+export function getCompactSnapshotPath(sessionId: string): string {
+  const safe = sessionId.replace(/[^A-Za-z0-9._-]/g, "_") || "unknown";
+  return pathJoin(getObservationDir(), `${safe}${COMPACT_SNAPSHOT_FILE_SUFFIX}`);
+}
+
+/**
+ * Keep a copy of the compact snapshot on disk. POST /v1/memories/raw only
+ * enqueues the write (202), so the SessionStart that follows the compaction
+ * can run before the memory is searchable; this copy is read first.
+ */
+export async function writeLocalCompactSnapshot(snapshot: LocalCompactSnapshot): Promise<void> {
+  try {
+    await mkdir(getObservationDir(), { recursive: true });
+    await writeFile(getCompactSnapshotPath(snapshot.sessionId), JSON.stringify(snapshot), "utf-8");
+  } catch (error) {
+    logError("writeLocalCompactSnapshot failed (non-critical)", error);
+  }
+}
+
+/** Read a session's local compact snapshot; null when absent or unreadable. */
+export async function readLocalCompactSnapshot(sessionId: string): Promise<LocalCompactSnapshot | null> {
+  try {
+    const parsed = JSON.parse(await readFile(getCompactSnapshotPath(sessionId), "utf-8"));
+    if (typeof parsed?.content !== "string" || typeof parsed?.createdAt !== "string") return null;
+    return {
+      sessionId: String(parsed.sessionId ?? sessionId),
+      projectId: typeof parsed.projectId === "string" ? parsed.projectId : undefined,
+      content: parsed.content,
+      createdAt: parsed.createdAt,
+    };
+  } catch {
+    return null;
   }
 }
 

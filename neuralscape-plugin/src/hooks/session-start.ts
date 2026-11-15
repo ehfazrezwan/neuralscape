@@ -20,6 +20,7 @@
 
 import {
   type ContextResponse,
+  type LocalCompactSnapshot,
   type NeuralscapeMemory,
   MalformedHookInputError,
   getFailLoudThreshold,
@@ -34,6 +35,7 @@ import {
   outputWithContext,
   parseStdinStrict,
   readConfig,
+  readLocalCompactSnapshot,
   recordTransportFailure,
   resetTransportFailures,
 } from "../utils.js";
@@ -52,6 +54,7 @@ import {
   toIndexEntry,
 } from "../core/disclosure.js";
 
+import { COMPACT_SNAPSHOT_SESSION_TAG_PREFIX, COMPACT_SNAPSHOT_TAG } from "../core/compact.js";
 import { CATEGORY_LABELS, CATEGORY_ORDER } from "../types.js";
 
 // Target max chars for legacy full-content injection (~4 chars per token)
@@ -160,10 +163,12 @@ export interface IndexModeInputs {
   now?: Date;
   /**
    * SessionStart `source` from Claude Code: "startup" | "resume" | "clear"
-   * | "compact". On "compact"/"resume" the recent compact snapshots render
-   * full-content under "## Resuming after compaction".
+   * | "compact" | "fork". On "compact"/"resume"/"fork" the compact snapshots
+   * render full-content under "## Resuming after compaction".
    */
   source?: string;
+  /** The starting session's id: on compact/resume only its own snapshots render (see renderResumeAfterCompact). */
+  sessionId?: string;
 }
 
 /**
@@ -188,8 +193,12 @@ export function buildIndexContext(inputs: IndexModeInputs): string {
   // session with the pre-compact snapshots the PreCompact hook stored.
   // Rendered full-content here, excluded from the index table below.
   const resumeIds = new Set<string>();
-  if (inputs.source === "compact" || inputs.source === "resume") {
-    const resume = renderResumeAfterCompact(categories, { now });
+  if (isResumeSource(inputs.source)) {
+    const resume = renderResumeAfterCompact(categories, {
+      now,
+      sessionId: inputs.sessionId,
+      source: inputs.source,
+    });
     if (resume.block) {
       sections.push(resume.block);
       for (const id of resume.ids) resumeIds.add(id);
@@ -247,6 +256,89 @@ export function buildIndexContext(inputs: IndexModeInputs): string {
 
   if (sections.length === 0) return "";
   return `# Neuralscape Memory\n\n${sections.join("\n\n---\n\n")}`;
+}
+
+/** SessionStart sources that continue earlier work and so get the compact snapshots. */
+export function isResumeSource(source: string | undefined): boolean {
+  return source === "compact" || source === "resume" || source === "fork";
+}
+
+/**
+ * Turn the local copy of this session's compact snapshot into a memory the
+ * disclosure renderer understands.
+ */
+export function localSnapshotMemory(snap: LocalCompactSnapshot): NeuralscapeMemory {
+  return {
+    id: `local-compact-${snap.sessionId}`,
+    memory: snap.content,
+    category: "task_context",
+    project_id: snap.projectId,
+    tags: [COMPACT_SNAPSHOT_TAG, `${COMPACT_SNAPSHOT_SESSION_TAG_PREFIX}${snap.sessionId}`],
+    created_at: snap.createdAt,
+  };
+}
+
+/**
+ * Add this session's local compact snapshot to the fetched context unless the
+ * service already returned that very snapshot (same content). Only after a
+ * compaction: the session id is unchanged by compaction, so the id names the
+ * file; resume/fork get a new id and have no local copy.
+ */
+export async function withLocalCompactSnapshot(
+  context: ContextResponse,
+  input: { source?: string; session_id?: string },
+): Promise<ContextResponse> {
+  if (input.source !== "compact" || !input.session_id) return context;
+  const snap = await readLocalCompactSnapshot(input.session_id);
+  if (!snap) return context;
+  const categories = context.categories || {};
+  for (const memories of Object.values(categories)) {
+    if ((memories ?? []).some((m) => (m.memory ?? "").trim() === snap.content.trim())) return context;
+  }
+  return {
+    ...context,
+    categories: {
+      ...categories,
+      task_context: [...(categories.task_context ?? []), localSnapshotMemory(snap)],
+    },
+  };
+}
+
+/** The "Resuming after compaction" block from the local snapshot alone (service unreachable). */
+async function localResumeBlock(input: { source?: string; session_id?: string }): Promise<string> {
+  const context = await withLocalCompactSnapshot({ categories: {} } as ContextResponse, input);
+  return renderResumeAfterCompact(context.categories || {}, {
+    sessionId: input.session_id,
+    source: input.source,
+  }).block;
+}
+
+/**
+ * The "compile these buffers first" note for buffers left by sessions that
+ * are over (see listPendingBuffers). Empty string when there are none.
+ * Independent of the service: it only reads local files, so it is also
+ * appended to the unreachable notice.
+ */
+export async function buildPendingNote(currentSessionId?: string): Promise<string> {
+  try {
+    const pending = await listPendingBuffers(currentSessionId);
+    if (pending.length === 0) return "";
+    const totalRows = pending.reduce((s, b) => s + b.lineCount, 0);
+    const paths = pending.map((b) => `\`${b.path}\``).join(", ");
+    return (
+      `\n\n# Neuralscape — Pending Observations\n\n` +
+      `${pending.length} buffer file(s) from prior sessions hold ` +
+      `${totalRows} unprocessed tool observations: ${paths}.\n\n` +
+      `**Before responding to the user's first prompt**, run the ` +
+      `\`compile-observations\` skill on each of these paths to extract ` +
+      `significant memories using the v2 memory model. Skip noise ` +
+      `(routine reads/edits/searches). After memories submit successfully, ` +
+      `truncate each buffer file. Then continue with the user's request.`
+    );
+  } catch (error) {
+    logError("listPendingBuffers failed (non-critical)", error);
+    return "";
+  }
 }
 
 /* v8 ignore start — I/O paths below are exercised by the E2E dry-run script */
@@ -360,32 +452,27 @@ async function main(): Promise<void> {
       // The consecutive-failure counter upgrades the notice to fail-loud
       // once the streak crosses FAIL_LOUD_THRESHOLD (D4).
       const count = await recordTransportFailure();
-      outputWithContext(buildUnreachableNotice(count, getFailLoudThreshold()));
+      // Local-only parts still apply: buffers left by finished sessions keep
+      // piling up during an outage unless this session is told about them,
+      // and the local copy of the compact snapshot needs no service.
+      const localResume = await localResumeBlock(input);
+      const pendingDuringOutage = await buildPendingNote(input.session_id);
+      outputWithContext(
+        buildUnreachableNotice(count, getFailLoudThreshold()) +
+          (localResume ? `\n\n${localResume}` : "") +
+          pendingDuringOutage,
+      );
       return;
     }
     await resetTransportFailures();
 
     // Detect any unprocessed observation buffers left behind by prior sessions
     // and ask Claude to compile them before responding to the user.
-    let pendingNote = "";
-    try {
-      const pending = await listPendingBuffers(input.session_id);
-      if (pending.length > 0) {
-        const totalRows = pending.reduce((s, b) => s + b.lineCount, 0);
-        const paths = pending.map((b) => `\`${b.path}\``).join(", ");
-        pendingNote =
-          `\n\n# Neuralscape — Pending Observations\n\n` +
-          `${pending.length} buffer file(s) from prior sessions hold ` +
-          `${totalRows} unprocessed tool observations: ${paths}.\n\n` +
-          `**Before responding to the user's first prompt**, run the ` +
-          `\`compile-observations\` skill on each of these paths to extract ` +
-          `significant memories using the v2 memory model. Skip noise ` +
-          `(routine reads/edits/searches). After memories submit successfully, ` +
-          `truncate each buffer file. Then continue with the user's request.`;
-      }
-    } catch (error) {
-      logError("listPendingBuffers failed (non-critical)", error);
-    }
+    const pendingNote = await buildPendingNote(input.session_id);
+
+    // After a compaction the stored snapshot may not be searchable yet (the raw
+    // write is queued): merge the local copy the PreCompact hook left behind.
+    context = await withLocalCompactSnapshot(context, input);
 
     let contextBody: string;
     if (mode === "full") {
@@ -411,6 +498,7 @@ async function main(): Promise<void> {
         codeGraphAvailable,
         budgetTokens: getIndexBudgetTokens(),
         source: input.source,
+        sessionId: input.session_id,
       });
     }
 

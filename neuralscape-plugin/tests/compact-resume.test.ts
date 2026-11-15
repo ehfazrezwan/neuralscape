@@ -19,10 +19,10 @@ import { describe, expect, it } from "vitest";
 process.env.NEURALSCAPE_TEST = "1";
 
 const disclosure = await import("../src/core/disclosure.js");
-const { isCompactSnapshot, renderResumeAfterCompact } = disclosure;
+const { isCompactSnapshot, renderResumeAfterCompact, snapshotSessionId, RESUME_FALLBACK_WINDOW_MS } = disclosure;
 
 const sessionStart = await import("../src/hooks/session-start.js");
-const { buildIndexContext } = sessionStart;
+const { buildIndexContext, isResumeSource, withLocalCompactSnapshot } = sessionStart;
 
 import type { NeuralscapeMemory } from "../src/utils.js";
 
@@ -115,6 +115,92 @@ describe("renderResumeAfterCompact", () => {
     const { block, ids } = renderResumeAfterCompact({ decision: [ordinary()] }, { now: NOW });
     expect(block).toBe("");
     expect(ids.length).toBe(0);
+  });
+});
+
+// ── per-session selection ────────────────────────────────────────
+
+describe("snapshotSessionId", () => {
+  it("reads the session:<id> tag, else the id in the content line", () => {
+    expect(snapshotSessionId(snapshot({ tags: ["compact_snapshot", "session:abc-1"] }))).toBe("abc-1");
+    expect(snapshotSessionId(snapshot({ tags: ["compact_snapshot"], memory: "Compact snapshot: session xyz-2 in project p compacted" }))).toBe("xyz-2");
+    expect(snapshotSessionId(snapshot({ tags: [], memory: "Compact snapshot: no id here" }))).toBeNull();
+  });
+});
+
+describe("renderResumeAfterCompact with a session id", () => {
+  const mine = () =>
+    snapshot({ tags: ["compact_snapshot", "session:mine"], memory: "Compact snapshot: session mine in project p\n- my prompt", created_at: isoMinutesAgo(30) });
+  const other = () =>
+    snapshot({ tags: ["compact_snapshot", "session:other"], memory: "Compact snapshot: session other in project p\n- other terminal prompt", created_at: isoMinutesAgo(1) });
+
+  it("compact: renders only this session's snapshots, even when another session's is newer", () => {
+    const { block } = renderResumeAfterCompact({ task_context: [other(), mine()] }, { now: NOW, sessionId: "mine", source: "compact" });
+    expect(block).toContain("my prompt");
+    expect(block).not.toContain("other terminal prompt");
+  });
+
+  it("compact: renders nothing when this session has no snapshot (never another terminal's)", () => {
+    const { block, ids } = renderResumeAfterCompact({ task_context: [other()] }, { now: NOW, sessionId: "mine", source: "compact" });
+    expect(block).toBe("");
+    expect(ids).toEqual([]);
+  });
+
+  it("matches a tag-less legacy snapshot through the id in its content", () => {
+    const legacy = snapshot({ tags: [], memory: "Compact snapshot: session mine in project p\n- legacy prompt" });
+    const { block } = renderResumeAfterCompact({ task_context: [legacy, other()] }, { now: NOW, sessionId: "mine", source: "compact" });
+    expect(block).toContain("legacy prompt");
+    expect(block).not.toContain("other terminal prompt");
+  });
+
+  it("resume/fork with a new id and no own snapshot: only the newest snapshot inside the window", () => {
+    const recent = other();
+    const older = snapshot({ tags: ["compact_snapshot", "session:older"], memory: "Compact snapshot: session older in project p\n- older prompt", created_at: isoMinutesAgo(90) });
+    const { block, ids } = renderResumeAfterCompact({ task_context: [older, recent] }, { now: NOW, sessionId: "brand-new", source: "resume" });
+    expect(ids).toEqual([recent.id]);
+    expect(block).toContain("other terminal prompt");
+    expect(block).not.toContain("older prompt");
+  });
+
+  it("resume/fork: a snapshot older than the window is not pulled in", () => {
+    const stale = snapshot({ created_at: new Date(NOW.getTime() - RESUME_FALLBACK_WINDOW_MS - 60_000).toISOString() });
+    expect(renderResumeAfterCompact({ task_context: [stale] }, { now: NOW, sessionId: "brand-new", source: "fork" }).block).toBe("");
+  });
+
+  it("resume with an own snapshot uses it", () => {
+    const { block } = renderResumeAfterCompact({ task_context: [other(), mine()] }, { now: NOW, sessionId: "mine", source: "resume" });
+    expect(block).toContain("my prompt");
+    expect(block).not.toContain("other terminal prompt");
+  });
+});
+
+describe("session-start resume wiring", () => {
+  it("treats compact, resume and fork as resume sources", () => {
+    expect(isResumeSource("compact")).toBe(true);
+    expect(isResumeSource("resume")).toBe(true);
+    expect(isResumeSource("fork")).toBe(true);
+    expect(isResumeSource("startup")).toBe(false);
+    expect(isResumeSource("clear")).toBe(false);
+    expect(isResumeSource(undefined)).toBe(false);
+  });
+
+  it("buildIndexContext on fork renders the snapshot block", () => {
+    const out = buildIndexContext({
+      context: { status: "ok", user_id: "u1", categories: { task_context: [snapshot()] } },
+      cards: [],
+      codeGraphAvailable: false,
+      budgetTokens: 2000,
+      now: NOW,
+      source: "fork",
+      sessionId: "brand-new",
+    });
+    expect(out).toContain("## Resuming after compaction");
+  });
+
+  it("withLocalCompactSnapshot is a no-op unless the source is compact", async () => {
+    const ctx = { status: "ok", user_id: "u1", categories: {} };
+    expect(await withLocalCompactSnapshot(ctx, { source: "startup", session_id: "s" })).toBe(ctx);
+    expect(await withLocalCompactSnapshot(ctx, { source: "compact" })).toBe(ctx);
   });
 });
 
