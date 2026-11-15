@@ -286,6 +286,26 @@ can improve economical relevance ranking, but policy compliance must be tested
 separately. Hosted vendor marketing and this tiny pilot are different evidence
 classes.
 
+## Settings reference
+
+All settings are environment variables read by `config.py`; every flag defaults
+off and nothing activates without BOTH an endpoint and a key.
+
+| Setting | Default | What it does / what turning it on sends off-box |
+|---|---|---|
+| `HYBRID_INFERENCE_ENDPOINT` | empty | URL of the decision API. Empty = no feature can activate (warning at startup). |
+| `HYBRID_INFERENCE_API_KEY` | empty | Bearer key for the endpoint. Never logged. |
+| `HYBRID_INFERENCE_MODEL` | empty | Model id sent with each request and checked against the response. |
+| `HYBRID_GRAPH_ENABLED` | `false` | Graph node/edge resolution. Sends new/candidate entity names, summaries and facts plus the raw episode and previous episodes (content gated by the sensitivity floor). |
+| `HYBRID_CATEGORIES_ENABLED` | `false` | OKF type-to-category mapping. Sends only the unfamiliar type labels. |
+| `HYBRID_EXTRACTION_ENABLED` | `false` | Source-span extraction. Sends the user messages of each extraction window (plain conversations only; guidance, speaker and custom extractors bypass it). |
+| `HYBRID_RERANK_ENABLED` | `false` | Recall reranking. Sends memory text and metadata of eligible top rows (sensitivity-stamped, non-default-visibility and gated-text rows are never sent). |
+| `HYBRID_THRESHOLD` | `0.9` | Minimum probability/confidence for accepting a decision (0.5-1.0). Routing threshold, not calibrated correctness. |
+| `HYBRID_TIMEOUT_S` | `2.0` | Per-request HTTP timeout (0-30 s). Nothing extra is sent. |
+| `HYBRID_EXTRACTION_DEADLINE_S` | `2.5` | Wall-clock bound on waiting for the extraction decision before falling back to the original extractor. |
+| `HYBRID_RERANK_LIMIT` | `32` | How many top rows are scored (1-64); caps how much row text one search can send. |
+| `HYBRID_RERANK_POLICY` | built-in sentence | Ranking policy text sent with the rerank request. |
+
 ## Safety and rollout boundaries
 
 - The decision model is reached through the operator-configured

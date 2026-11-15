@@ -159,6 +159,20 @@ def _hybrid_egress_ok(text: str) -> bool:
     return classify_sensitivity(text) is None
 
 
+def _build_hybrid_decisions(graph_config):
+    """NEURALSCAPE PATCH: the optional decision client, always built WITH the egress gate."""
+    from graphiti_core.llm_client.hybrid_decision_client import HybridDecisions
+
+    return HybridDecisions(
+        graph_config.graphiti_hybrid_api_key,
+        endpoint=graph_config.graphiti_hybrid_endpoint,
+        model=graph_config.graphiti_hybrid_model,
+        threshold=graph_config.graphiti_hybrid_threshold,
+        timeout=graph_config.graphiti_hybrid_timeout,
+        egress_check=_hybrid_egress_ok,
+    )
+
+
 class MemoryGraph:
     """Graphiti-backed MemoryGraph adapter for mem0.
 
@@ -197,16 +211,7 @@ class MemoryGraph:
         # NEURALSCAPE PATCH: attach the optional decision client only when the
         # graph flag is on; flag off constructs nothing.
         if getattr(graph_config, "graphiti_hybrid_enabled", False):
-            from graphiti_core.llm_client.hybrid_decision_client import HybridDecisions
-
-            llm_client.decision_client = HybridDecisions(
-                graph_config.graphiti_hybrid_api_key,
-                endpoint=graph_config.graphiti_hybrid_endpoint,
-                model=graph_config.graphiti_hybrid_model,
-                threshold=graph_config.graphiti_hybrid_threshold,
-                timeout=graph_config.graphiti_hybrid_timeout,
-                egress_check=_hybrid_egress_ok,
-            )
+            llm_client.decision_client = _build_hybrid_decisions(graph_config)
 
         cross_encoder = _create_cross_encoder(
             provider=graph_config.graphiti_reranker_provider,

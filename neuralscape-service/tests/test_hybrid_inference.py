@@ -323,3 +323,30 @@ def test_rerank_never_sends_sensitive_or_non_default_visibility_rows(monkeypatch
     assert [r.memory for r in out][2:5] == ['flagged by gate', 'forced private', rows[4].memory]
     assert [out[0].memory, out[1].memory, out[5].memory] == ['plain b', 'plain c', 'plain a']
     assert sorted(map(id, out)) == sorted(map(id, rows))
+
+
+def test_egress_gate_is_wired_into_the_graph_decision_client(monkeypatch):
+    """The client the graph adapter builds must consult the sensitivity gate,
+    and a gated context must never reach the HTTP layer (transport spy)."""
+    from graphiti_core.llm_client import hybrid_decision_client
+    from mem0.graphs.configs import GraphitiConfig
+    from mem0.memory.graphiti_memory import _build_hybrid_decisions
+    import memory.sensitivity as sensitivity
+
+    spy = Mock()
+    monkeypatch.setattr(hybrid_decision_client, '_http_client', lambda: spy)
+    gate_calls = []
+    real = sensitivity.classify_sensitivity
+    monkeypatch.setattr(sensitivity, 'classify_sensitivity', lambda t: gate_calls.append(t) or real(t))
+    config = GraphitiConfig(url='bolt://x', username='u', password='p', graphiti_hybrid_enabled=True,
+                            graphiti_hybrid_api_key='k', graphiti_hybrid_endpoint='http://local.test/decide',
+                            graphiti_hybrid_model='test-model')
+    decision = _build_hybrid_decisions(config)
+    assert decision.egress_check is not None
+    gated = {'extracted_nodes': [{'id': 0, 'name': 'Ada'}],
+             'existing_nodes': [{'candidate_id': 0, 'name': 'Ada L', 'summary': ''}],
+             'episode_content': 'My salary is $250,000 and my stock options vest in 2027.',
+             'previous_episodes': []}
+    assert decision.resolve_sync('nodes', gated) is None
+    spy.post.assert_not_called()
+    assert any('salary' in t for t in gate_calls)
