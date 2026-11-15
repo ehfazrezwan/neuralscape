@@ -44,7 +44,7 @@
         },
         {
           "test": "tests.test_canonical_fqn_conformance::test_native_canonical_conformance_ge_98pct",
-          "reason_contains": "small-py corpus not present at"
+          "reason_contains": "small-py corpus not present"
         },
         {
           "test": "tests.test_contracts_pack::test_engine_port_contracts_are_registered_with_the_engines_owner",
@@ -372,7 +372,7 @@
         },
         {
           "test": "tests.test_canonical_fqn_conformance::test_native_canonical_conformance_ge_98pct",
-          "reason_contains": "small-py corpus not present at"
+          "reason_contains": "small-py corpus not present"
         },
         {
           "test": "tests.test_contracts_pack::test_engine_port_contracts_are_registered_with_the_engines_owner",
