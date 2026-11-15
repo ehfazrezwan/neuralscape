@@ -9,7 +9,17 @@ import logging
 from config import settings
 from schemas import MemoryResponse, MemoryVisibility
 from memory.groups import _edge_is_invalidated, _get_group_ids, _live_edges_filter
-from memory.ranking import RRF_K, _dense_score_floor, _reinforcement_boost, _rrf_fuse, _salience_tiebreak, _unit_cosine
+from memory.ranking import (
+    RRF_K,
+    _dense_score_floor,
+    _fused_order_keys,
+    _record_order_key,
+    _reinforcement_boost,
+    _resolve_order_keys,
+    _rrf_fuse,
+    _salience_tiebreak,
+    _unit_cosine,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -70,6 +80,7 @@ class SearchMixin:
         query_embedding: list[float] | None = None,
         visibility_value: str = MemoryVisibility.SHARED.value,
         workspaces: list[str] | None = None,
+        order_keys: dict | None = None,
     ) -> list[MemoryResponse]:
         """Search Qdrant for cross-writer memories of a given visibility.
 
@@ -159,7 +170,8 @@ class SearchMixin:
         dense_floor = _dense_score_floor(dense_hits)
 
         out: list[MemoryResponse] = []
-        for entry in fused:
+        pool_keys = _fused_order_keys(fused, dense_hits)
+        for entry, pool_key in zip(fused, pool_keys):
             hit = entry["hit"]
             payload = getattr(hit, "payload", None) or {}
             metadata = payload.get("metadata", {})
@@ -183,6 +195,13 @@ class SearchMixin:
                 "score": _reinforcement_boost(raw_score, metadata),
                 "created_at": payload.get("created_at"),
             }
+            # Fused-order key for the cross-pool sort (see _fused_order_keys);
+            # the displayed score above stays native.
+            _record_order_key(
+                order_keys,
+                mem_dict["id"],
+                _reinforcement_boost(pool_key, metadata),
+            )
             out.append(self._mem_to_response(mem_dict))
         return out
 
@@ -238,6 +257,7 @@ class SearchMixin:
         limit: int,
         query_embedding: list[float] | None = None,
         workspaces: list[str] | None = None,
+        order_keys: dict | None = None,
     ) -> list[MemoryResponse]:
         """Search the authoritative ``standard``-tier pool (dictator-written).
 
@@ -258,6 +278,7 @@ class SearchMixin:
             workspaces=workspaces,
             query_embedding=query_embedding,
             visibility_value=MemoryVisibility.STANDARD.value,
+            order_keys=order_keys,
         )
 
     def _search_personal_pool(
@@ -274,6 +295,7 @@ class SearchMixin:
         limit: int,
         query: str = "",
         workspaces: list[str] | None = None,
+        order_keys: dict | None = None,
     ) -> list[MemoryResponse]:
         """Search Qdrant for the caller's own memories using a precomputed vector.
 
@@ -335,7 +357,8 @@ class SearchMixin:
         effective_workspaces = workspaces if workspaces is not None else ["memory"]
 
         out: list[MemoryResponse] = []
-        for entry in fused:
+        pool_keys = _fused_order_keys(fused, dense_hits)
+        for entry, pool_key in zip(fused, pool_keys):
             hit = entry["hit"]
             payload = getattr(hit, "payload", None) or {}
             metadata = payload.get("metadata", {})
@@ -357,6 +380,13 @@ class SearchMixin:
                 "score": _reinforcement_boost(raw_score, metadata),
                 "created_at": payload.get("created_at"),
             }
+            # Fused-order key for the cross-pool sort (see _fused_order_keys);
+            # the displayed score above stays native.
+            _record_order_key(
+                order_keys,
+                mem_dict["id"],
+                _reinforcement_boost(pool_key, metadata),
+            )
             out.append(self._mem_to_response(mem_dict))
         return out
 
@@ -443,6 +473,10 @@ class SearchMixin:
                 logger.warning(f"Graph search submit failed (non-critical): {e}")
 
         vector_responses: list[MemoryResponse] = []
+        # Per-row fused-order keys recorded by the pool helpers (see
+        # ranking._fused_order_keys). The write-path near-dupe probe
+        # (vector_only) keeps its legacy score-sorted behaviour.
+        order_keys: dict | None = None if vector_only else {}
 
         # ── Personal pool: the caller's own memories (any visibility) ──
         # Skip when caller restricted to shared-only. Dedup + sort + limit
@@ -462,6 +496,7 @@ class SearchMixin:
                             domain=domain, observation_type=observation_type,
                             concepts=concepts, limit=limit, query=query,
                             workspaces=workspaces,
+                            order_keys=order_keys,
                         )
                     )
                     vector_responses.extend(
@@ -471,6 +506,7 @@ class SearchMixin:
                             domain=domain, observation_type=observation_type,
                             concepts=concepts, limit=limit, query=query,
                             workspaces=workspaces,
+                            order_keys=order_keys,
                         )
                     )
                 else:
@@ -481,6 +517,7 @@ class SearchMixin:
                             domain=domain, observation_type=observation_type,
                             concepts=concepts, limit=limit, query=query,
                             workspaces=workspaces,
+                            order_keys=order_keys,
                         )
                     )
             except Exception as e:
@@ -521,6 +558,7 @@ class SearchMixin:
                             concepts=concepts,
                             limit=limit,
                             workspaces=workspaces,
+                            order_keys=order_keys,
                             query_embedding=query_embedding,
                         )
                     )
@@ -536,6 +574,7 @@ class SearchMixin:
                             concepts=concepts,
                             limit=limit,
                             workspaces=workspaces,
+                            order_keys=order_keys,
                             query_embedding=query_embedding,
                         )
                     )
@@ -552,6 +591,7 @@ class SearchMixin:
                             concepts=concepts,
                             limit=limit,
                             workspaces=workspaces,
+                            order_keys=order_keys,
                             query_embedding=query_embedding,
                         )
                     )
@@ -587,6 +627,7 @@ class SearchMixin:
                         concepts=concepts,
                         limit=limit,
                         workspaces=workspaces,
+                        order_keys=order_keys,
                         query_embedding=query_embedding,
                     )
                 )
@@ -601,8 +642,24 @@ class SearchMixin:
                 seen_ids.add(r.id)
                 deduped.append(r)
         # A4 salience tie-breaker (opt-in; k=0 default returns untouched).
-        deduped = _salience_tiebreak(deduped)
-        deduped.sort(key=lambda r: r.score or 0.0, reverse=True)
+        deduped = _salience_tiebreak(deduped, order_keys)
+        if order_keys is None:
+            deduped.sort(key=lambda r: r.score or 0.0, reverse=True)
+            sort_keys: dict[str, float] | None = None
+        else:
+            # Order by the pools' RRF-fused order (rank-transferred onto the
+            # cosine scale), NOT by the displayed score: lexical-only and
+            # leg-agreement hits would otherwise be re-sorted below the
+            # weakest dense hit and cut by ``limit``. Displayed scores are
+            # left native. Rows from empty-dense pools get an imputed key
+            # and sort ahead of ties at that key.
+            sort_keys, imputed = _resolve_order_keys(order_keys)
+            deduped.sort(
+                key=lambda r: (
+                    -sort_keys.get(r.id, r.score or 0.0),
+                    0 if r.id in imputed else 1,
+                )
+            )
         vector_responses = deduped[:limit]
 
         # Join the knowledge-graph pass started above and merge edge facts.
@@ -750,7 +807,7 @@ class SearchMixin:
         # below may exclude rows, so we apply limit AFTER filtering to avoid
         # the cap being consumed by filtered-out rows (audit 27 hardening #8).
         combined = self._deduplicate_responses(
-            vector_responses, graph_responses, limit=None
+            vector_responses, graph_responses, limit=None, vector_keys=sort_keys
         )
 
         # memory_kind filter (data-layer connectors). Legacy memories have no
@@ -1485,6 +1542,7 @@ class SearchMixin:
         vector_responses: list[MemoryResponse],
         graph_responses: list[MemoryResponse],
         limit: int | None = None,
+        vector_keys: dict[str, float] | None = None,
     ) -> list[MemoryResponse]:
         """Fuse the vector and graph legs into one merit-ranked list.
 
@@ -1512,6 +1570,15 @@ class SearchMixin:
         ``1/(RRF_K + graph_rank + 1)``: leg agreement ranks up. Each row
         keeps its NATIVE score; the fused value only orders the list.
         Ties break deterministically: vector leg first, then id.
+
+        ``vector_keys`` (optional ``{id: key}``) carries the vector leg's
+        RRF-fused ordering keys from the pool merge: each vector row seeds
+        its merit value with its key instead of its native score, so a
+        lexical-only / leg-agreement hit keeps the position its fused rank
+        earned instead of being evicted by a weaker graph edge purely
+        because its displayed score is the pool floor. Keys live on the
+        cosine scale, so they compare directly with the graph edges' cosine
+        scores. Displayed scores stay native.
         """
         # Graph leg ranked by its cosine scores (strongest first, unscored
         # last, stable) — this rank drives both graph-vs-graph twin
@@ -1531,7 +1598,10 @@ class SearchMixin:
             norm_to_idx.setdefault(
                 self.normalize_memory_content(vr.memory), len(entries)
             )
-            entries.append({"row": vr, "leg": 0, "fused": float(vr.score or 0.0)})
+            seed = vr.score
+            if vector_keys is not None and vr.id in vector_keys:
+                seed = vector_keys[vr.id]
+            entries.append({"row": vr, "leg": 0, "fused": float(seed or 0.0)})
 
         for rank, gr in enumerate(graph_leg):
             normalized = self.normalize_memory_content(gr.memory)
