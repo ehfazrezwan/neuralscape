@@ -29,6 +29,7 @@ patched graphiti/graphiti_core/llm_client/gemini_client.py
 patched mem0/mem0/configs/embeddings/base.py
 patched mem0/mem0/embeddings/openai.py
 patched mem0/mem0/graphs/configs.py
+patched mem0/mem0/memory/main.py
 patched mem0/mem0/memory/graphiti_memory.py
 patched mem0/mem0/utils/factory.py
 

@@ -108,6 +108,13 @@ sync_mem0() {
         -m "chore: sync mem0 with upstream (filtered mirror: core only)"
     prune_subtree mem0 "${MEM0_KEEP[@]}"
     echo "    mem0 synced (check for merge conflicts in configs.py / factory.py / graphiti_memory.py)."
+    echo "    NEURALSCAPE PATCHES in mem0 to RE-APPLY if overwritten (see scripts/upstream-patches.txt):"
+    echo "      1. embeddings/openai.py + configs/embeddings/base.py: embedding_batch_size chunking and"
+    echo "         the single-input-rejection per-item fallback"
+    echo "      2. utils/factory.py: GraphStoreFactory (incl. the 'graphiti' provider registration)"
+    echo "      3. restored graph layer: graphs/ (configs.py carries graphiti_llm_small_model) and"
+    echo "         memory/{graph,memgraph,kuzu,apache_age}_memory.py; memory/graphiti_memory.py is NS-original"
+    echo "      4. memory/main.py: lock + cold-start tolerance for the lazy entity store"
 }
 
 case "$TARGET" in

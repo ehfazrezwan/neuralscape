@@ -4,6 +4,11 @@ A ``git subtree pull`` can silently revert NeuralScape's patches to graphiti and
 mem0. ``scripts/upstream-patches.txt`` lists the patched files; the check fails
 loudly when one of them lost its ``NEURALSCAPE PATCH`` marker.
 
+The git-derived coverage tests (``graphiti-base`` / ``mem0-base`` diffs) need
+the base commits, i.e. a full clone; on a shallow checkout (CI's default
+``fetch-depth: 1``) they return early, so there they verify nothing. The marker
+and manifest-consistency tests do run everywhere the repo-level files exist.
+
 The packaged test image carries only the service tree (no repo-level
 ``scripts/``), so these tests return early there, as the CI skip gate's
 manifest test does.
