@@ -14,9 +14,14 @@ Supports two token formats simultaneously:
    (routes must fall back to body ``user_id``), and a deprecation
    warning header is added to the response.
 
-When neither secret is configured, auth is disabled (local dev).
+Auth is fail-closed. When neither secret is configured, startup refuses
+(``Settings.validate_required``) and this middleware rejects every non-public
+request with 503, unless the operator explicitly set
+``NEURALSCAPE_AUTH_DISABLED=true`` (trusted local machine only), which is the
+one path that lets requests through unauthenticated.
 
-Public paths (`/health`) always bypass auth.
+Public paths (``/health``, ``/health/live``, ``/.well-known/*``, ``/oauth/*``)
+always bypass auth.
 """
 
 import hmac
@@ -40,7 +45,7 @@ logger = logging.getLogger(__name__)
 current_user_id: ContextVar[str | None] = ContextVar("current_user_id", default=None)
 
 # Paths that never require authentication
-PUBLIC_PATHS = {"/health", "/health/live", "/api/v1/health"}
+PUBLIC_PATHS = {"/health", "/health/live"}
 # Path prefixes that never require auth: OAuth discovery metadata and the
 # Authorization Server endpoints themselves (the consent page, DCR, token
 # exchange). These are the public front door of the OAuth flow.
@@ -56,19 +61,35 @@ def _public_base_url() -> str:
 DEPRECATION_HEADER = "X-Neuralscape-Deprecation"
 DEPRECATION_MSG = "shared-api-key auth is deprecated; issue per-user tokens via scripts/issue_user_token.py"
 
+AUTH_NOT_CONFIGURED_MSG = (
+    "Authentication is not configured on this server: set NEURALSCAPE_USER_TOKEN_SECRET "
+    "or NEURALSCAPE_API_KEY (or NEURALSCAPE_AUTH_DISABLED=true on a trusted local machine)"
+)
+
 
 class BearerAuthMiddleware(BaseHTTPMiddleware):
     """Bearer token middleware supporting per-user HMAC + legacy shared keys."""
 
     async def dispatch(self, request: Request, call_next):
-        # Auth disabled when neither secret is set (local dev convenience)
         token_secret = settings.neuralscape_user_token_secret
         legacy_key = settings.neuralscape_api_key
+        path = request.url.path
         if not token_secret and not legacy_key:
-            return await call_next(request)
+            # The ONLY unauthenticated pass-through: an explicit operator
+            # opt-out (startup logs a WARNING for it). Never a silent default.
+            if settings.neuralscape_auth_disabled:
+                return await call_next(request)
+            # No credential configured and no opt-out: fail closed. Startup
+            # validation normally refuses this state; this guards any path
+            # that serves the app without running the lifespan.
+            if path in PUBLIC_PATHS or path.startswith(PUBLIC_PREFIXES):
+                return await call_next(request)
+            return JSONResponse(
+                status_code=503,
+                content={"detail": AUTH_NOT_CONFIGURED_MSG},
+            )
 
         # Health checks and the OAuth front door are always public
-        path = request.url.path
         if path in PUBLIC_PATHS or path.startswith(PUBLIC_PREFIXES):
             return await call_next(request)
 

@@ -20,6 +20,26 @@ import type { ConversationTurn } from "./types.js";
 const MIN_RESPONSE_LENGTH = 20;
 
 /**
+ * The flush route accepts at most this many characters in each of ``user_message`` and ``assistant_response``
+ * (the service's request schema).  JavaScript counts UTF-16 code units, which is never fewer than the service's
+ * code points, so a text within this length is always accepted.
+ */
+export const MAX_FLUSH_TEXT = 50000;
+
+/**
+ * Bound ``value`` to ``limit`` characters.  Text beyond the limit is cut and replaced by a marker that says how
+ * much was left out, so the stored turn shows plainly that it is partial.  Never cuts a surrogate pair in two.
+ */
+export function boundText(value: string, limit: number = MAX_FLUSH_TEXT): string {
+  if (value.length <= limit) return value;
+  const omitted = (n: number) => `\n[truncated by the plugin: ${n} more characters]`;
+  let keep = limit - omitted(value.length).length;
+  const unit = value.charCodeAt(keep - 1);
+  if (unit >= 0xd800 && unit <= 0xdbff) keep -= 1; // the cut would split a surrogate pair
+  return value.slice(0, keep) + omitted(value.length - keep);
+}
+
+/**
  * Check if a conversation turn should be skipped (noise filtering).
  */
 export function shouldSkipTurn(turn: ConversationTurn): boolean {
@@ -57,9 +77,18 @@ export interface FlushResult {
  * Filters noise, then POSTs each turn sequentially, stopping at the first
  * failure (if the service is down, later POSTs would fail too, and stopping
  * keeps the undelivered turns a contiguous re-flushable suffix). Never
- * throws — failures are logged and reported via the result.
+ * throws — failures are logged and reported via the result.  ``options.proceed`` is asked before every POST
+ * (the delivery lock's ``held()``); a false answer stops the flush at that turn like a failure.
+ *
+ * Every failure is treated as transient: delivery stops at that turn and the cursor stays before it, so the
+ * turn is retried by the next flush.  A turn is never skipped because the service refused it: the payload is
+ * bounded to the API limits (``boundText``) and turns with no text are filtered above, so a refusal does not
+ * come from this turn's content, and dropping turns on a refusal would lose every turn during a version skew.
  */
-export async function flushTurns(turns: ConversationTurn[]): Promise<FlushResult> {
+export async function flushTurns(
+  turns: ConversationTurn[],
+  options: { proceed?: () => Promise<boolean> } = {}
+): Promise<FlushResult> {
   let flushed = 0;
 
   for (let i = 0; i < turns.length; i++) {
@@ -67,11 +96,17 @@ export async function flushTurns(turns: ConversationTurn[]): Promise<FlushResult
     // Noise counts as delivered: there is nothing to re-flush later.
     if (shouldSkipTurn(turn)) continue;
 
+    // The caller's lock may have been lost (an abandoned-lock recovery disturbed it): stop before this POST.
+    if (options.proceed !== undefined && !(await options.proceed())) {
+      logError(`The transcript lock was lost; stopping before conversation turn ${i + 1}/${turns.length}`);
+      return { attempted: turns.length, flushed, firstFailedIndex: i };
+    }
+
     try {
       // <private>…</private> spans never leave the machine (D4).
       await neuralscapePost("/v1/extensions/conversation-compiler/flush", {
-        user_message: redactPrivate(turn.userMessage),
-        assistant_response: redactPrivate(turn.assistantResponse),
+        user_message: boundText(redactPrivate(turn.userMessage)),
+        assistant_response: boundText(redactPrivate(turn.assistantResponse)),
         session_id: turn.sessionId,
         channel: turn.channel,
         timestamp: turn.timestamp,

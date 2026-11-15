@@ -1,0 +1,23 @@
+{
+ "expected": {
+  "baseline": {
+   "facts": {
+    "capability": "absent"
+   },
+   "verdict": "blocked"
+  },
+  "candidate": {
+   "facts": {
+    "accepted_to_processing": "true",
+    "applied_to_accepted": "false",
+    "cancelled_to_processing": "false",
+    "failed_to_applied": "false"
+   },
+   "verdict": "candidate_pass"
+  }
+ },
+ "oracle_version": "oracle-v1",
+ "owner": "independent reviewer (not the author of the probes); not yet accepted",
+ "persona": "persona-alex",
+ "scenario_id": "persona-lifecycle-state"
+}
