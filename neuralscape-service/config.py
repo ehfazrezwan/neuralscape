@@ -111,14 +111,7 @@ class Settings(BaseSettings):
     # LLM retry (exponential backoff for transient 503/429 errors)
     llm_max_retries: int = 3
     llm_retry_base_delay: float = 1.0  # seconds
-
     llm_retry_max_delay: float = 30.0  # seconds
-
-    # Optional Gemini endpoint override (e.g. an egress proxy or regional
-    # endpoint). Empty ⇒ the SDK default. When set, recipient ids in the
-    # inference facade name the endpoint host so approvals match the real
-    # destination.
-    ns_gemini_base_url: str = ""
 
     # Dedup cron
     dedup_similarity_threshold: float = 0.95

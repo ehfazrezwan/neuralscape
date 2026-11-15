@@ -148,11 +148,6 @@ async def lifespan(app: FastAPI):
     # Configure asyncio.to_thread executor when TO_THREAD_MAX_WORKERS>0
     _configure_to_thread_executor(asyncio.get_running_loop())
 
-    # Optional Gemini endpoint override; must precede the first client.
-    from provider_routing import apply_gemini_base_url
-
-    apply_gemini_base_url(settings.ns_gemini_base_url)
-
     # Initialize the service (this also initializes mem0 + Graphiti)
     _service._get_memory()
     # Action policy: build the enforcer from settings (a no-op unless enabled).  In
