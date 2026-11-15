@@ -177,3 +177,5 @@ and its repo segment must be a key in `CODE_REPOS`. There is no upload or clone 
 ends the task with `ok: false` and an error naming `CODE_REPOS`. A laptop client that
 wants code answers over a repo the server cannot see uploads a Graphify bundle
 (`graph.json`) through `POST /v1/ingest/files` instead.
+
+`CODE_REPOS` is global by design: any authenticated user may index any mapped repo into their own `code--<owner>--<repo>` space (the operator decides what is mapped). Owner and repo segments must not contain `--` or start/end with `-`; a space owned by someone else can only be indexed, read or deleted by an admin.

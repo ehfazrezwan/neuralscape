@@ -68,20 +68,45 @@ def code_space_owner(code_space: str | None) -> str | None:
     return parts[1]
 
 
+def _segment_error(label: str, value: str) -> str | None:
+    if not value:
+        return f"{label} must not be empty"
+    if "--" in value:
+        return f"{label} {value!r} must not contain '--'"
+    if value.startswith("-") or value.endswith("-"):
+        return f"{label} {value!r} must not start or end with '-'"
+    return None
+
+
+_SHAPE_HINT = (
+    "A code_space is code--<owner>--<repo>; the owner (user id) and the repo name must "
+    "not contain '--' or start/end with '-'. Pass an explicit code_space that avoids this."
+)
+
+
 def code_space_shape_error(code_space: str | None) -> str | None:
-    """None when ``code_space`` is exactly ``code--<owner>--<repo>`` (no extra ``--``)."""
-    parts = (code_space or "").split("--")
-    if len(parts) == 3 and parts[0] == "code" and parts[1] and parts[2]:
-        return None
-    return (
-        f"code_space {code_space!r} must be exactly code--<owner>--<repo>: neither the "
-        "owner (user id) nor the repo name may contain '--'. Pass an explicit code_space "
-        "with a name that avoids '--'."
-    )
+    """None when ``code_space`` is exactly ``code--<owner>--<repo>`` with unambiguous segments."""
+    ref = code_space or ""
+    if ref.startswith("lib:"):
+        ref = ref[len("lib:"):]
+    parts = ref.split("--")
+    if len(parts) == 3 and parts[0] == "code":
+        bad = _segment_error("owner", parts[1]) or _segment_error("repo", parts[2])
+        if bad is None:
+            return None
+        return f"code_space {code_space!r} is ambiguous: {bad}. {_SHAPE_HINT}"
+    return f"code_space {code_space!r} is not exactly code--<owner>--<repo>. {_SHAPE_HINT}"
 
 
 def build_code_space(owner: str, repo_name: str) -> str:
-    """Build ``code--<owner>--<repo>``; ValueError (clear message) if either has ``--``."""
+    """Build ``code--<owner>--<repo>``; ValueError (clear message) if a segment is ambiguous.
+
+    Each segment is checked on its own, so ``("a-", "repo")`` and ``("a", "-repo")``
+    (which would both render ``code--a---repo``) are refused.
+    """
+    bad = _segment_error("owner", owner) or _segment_error("repo", repo_name)
+    if bad:
+        raise ValueError(f"cannot build a code_space: {bad}. {_SHAPE_HINT}")
     space = f"code--{owner}--{repo_name}"
     err = code_space_shape_error(space)
     if err:
@@ -100,9 +125,19 @@ def code_space_access_error(code_space: str | None, caller: str | None) -> str |
     owner = code_space_owner(code_space)
     if owner is None:
         return None
+    from auth import is_admin_user
+
+    if code_space_shape_error(code_space):
+        # Legacy/ambiguous space: its owner cannot be told reliably, so fail
+        # closed. Only an admin may read or delete it (to clean it up).
+        if is_admin_user(caller):
+            return None
+        return (
+            f"code_space {code_space!r} is malformed (ambiguous owner); only an admin may "
+            "read or delete it. " + _SHAPE_HINT
+        )
     if caller and caller == owner:
         return None
-    from auth import is_admin_user
 
     if is_admin_user(caller):
         return None
@@ -125,10 +160,18 @@ def repo_source_error(repo_source: str | None, settings) -> str | None:
     if not repo_source:
         return "repo_source is required. " + CODE_REPOS_REQUIREMENT
     try:
-        target = os.path.realpath(os.path.expanduser(str(repo_source)))
+        expanded = os.path.expanduser(str(repo_source))
+        if not os.path.isabs(expanded):
+            return (
+                f"repo_source {repo_source!r} must be an absolute path on the server. "
+                + CODE_REPOS_REQUIREMENT
+            )
+        target = os.path.realpath(expanded)
     except (OSError, ValueError):
         return f"repo_source {repo_source!r} is not a valid path. " + CODE_REPOS_REQUIREMENT
     for configured in repos.values():
+        if not str(configured or "").strip():
+            continue  # a blank root would be the process cwd; never a valid root
         root = os.path.realpath(os.path.expanduser(str(configured)))
         try:
             if os.path.commonpath([root, target]) == root:

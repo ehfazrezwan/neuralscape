@@ -737,6 +737,20 @@ class Settings(BaseSettings):
             raise ValueError("OAuth token TTLs must be > 0 seconds")
         return value
 
+    @field_validator("code_repos", mode="after")
+    @classmethod
+    def _drop_blank_code_repos(cls, v: dict[str, str]) -> dict[str, str]:
+        """A blank CODE_REPOS directory would resolve to the process cwd; drop it with a warning."""
+        clean = {}
+        for name, path in (v or {}).items():
+            if not str(path or "").strip():
+                logging.getLogger(__name__).warning(
+                    "CODE_REPOS entry %r has an empty path; ignoring it", name
+                )
+                continue
+            clean[name] = path
+        return clean
+
     @field_validator("code_op_preference", mode="before")
     @classmethod
     def _parse_op_preference(cls, value):

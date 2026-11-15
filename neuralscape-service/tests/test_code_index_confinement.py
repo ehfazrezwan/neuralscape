@@ -437,3 +437,65 @@ async def test_worker_indexes_the_checked_realpath_not_the_input_string(worker_r
         out = await _index(r, alias)
     assert out["ok"] is True, out
     assert engine.index.call_args.args[0] == os.path.realpath(r.demo)
+
+
+# ── round 3: edge dashes, legacy malformed spaces, blank/relative roots ──
+
+
+@pytest.mark.parametrize("owner,repo", [("a-", "repo"), ("a", "-repo"), ("-a", "repo"), ("a", "repo-")])
+def test_builder_refuses_edge_dashes_that_render_ambiguously(owner, repo):
+    from knowledge.code_dispatch import build_code_space
+
+    with pytest.raises(ValueError, match="start or end with '-'"):
+        build_code_space(owner, repo)
+
+
+def test_ambiguous_string_from_either_split_is_refused_by_shape_check(no_admin_list):
+    from knowledge.code_dispatch import code_space_shape_error
+
+    # (a-, repo) and (a, -repo) both render this; the owner parse says "a".
+    assert code_space_shape_error("code--a---repo")
+    assert code_space_access_error("code--a---repo", "a")  # user a cannot ride on it
+    assert code_space_access_error("code--a---repo", "a-")
+    assert code_space_shape_error("code--a-b--repo-x") is None  # inner single dashes stay fine
+
+
+def test_legacy_malformed_space_is_admin_only_for_read_and_delete(no_admin_list):
+    legacy = "code--b--x--repo"  # user "b--x" built it under the old rule
+    assert code_space_access_error(legacy, "b")
+    assert code_space_access_error(legacy, "b--x")
+    assert code_space_access_error(legacy, config.settings.default_user_id) is None  # admin cleans up
+
+
+def test_rest_read_and_delete_of_legacy_space_refused_to_b_and_bx_allowed_to_admin(rest):
+    legacy = "code--b--x--repo"
+    with patch("adapters.code_graph.code_graph_available", return_value=True), patch(
+        "knowledge.code_dispatch.resolve_code_engine", return_value=None
+    ):
+        for user in ("b", "b--x"):
+            assert rest.call("GET", "/v1/code-graph/neighbors", user, params={"label": "x", "graph_id": legacy}).status_code == 403
+            assert rest.call("DELETE", "/v1/code-graph/graph", user, params={"graph_id": legacy, "system": "code-native"}).status_code == 403
+        admin = config.settings.default_user_id
+        assert rest.call("DELETE", "/v1/code-graph/graph", admin, params={"graph_id": legacy, "system": "code-native"}).status_code == 200
+
+
+def test_blank_code_repos_values_are_dropped_at_settings_load(caplog):
+    s = config.Settings(code_repos={"ok": "/srv/ok", "blank": "", "ws": "   "})
+    assert s.code_repos == {"ok": "/srv/ok"}
+
+
+def test_blank_root_never_matches_cwd(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "x").mkdir()
+    s = SimpleNamespace(code_repos={"blank": ""})
+    assert repo_source_error(str(tmp_path / "x"), s)  # empty root must not mean "cwd"
+
+
+def test_relative_repo_source_refused_even_if_it_resolves_inside_a_root(tmp_path, monkeypatch):
+    root = tmp_path / "repos"
+    (root / "demo").mkdir(parents=True)
+    monkeypatch.chdir(root)
+    s = SimpleNamespace(code_repos={"demo": str(root / "demo")})
+    err = repo_source_error("demo", s)
+    assert err and "absolute" in err
+    assert repo_source_error("./demo/../demo", s)
