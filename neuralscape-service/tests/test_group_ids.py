@@ -38,6 +38,49 @@ LEGACY_NAMES = [
 ]
 
 
+@pytest.fixture(autouse=True)
+def injective_on(monkeypatch):
+    """Most of this file proves the flag-ON mode; the flag-off tests switch it back explicitly."""
+    from config import settings
+
+    monkeypatch.setattr(settings, "graph_group_id_injective_enabled", True)
+
+
+def _legacy(visibility, user, project=None, workspace=None):
+    """Today's (pre-flag) naming, written out independently of the implementation."""
+    if visibility == "standard":
+        base = f"standard--project--{project}" if project else "standard"
+    elif visibility == "shared":
+        base = f"shared--project--{project}" if project else "shared"
+    else:
+        base = f"user--{user}--project--{project}" if project else f"user--{user}"
+    return f"{base}--ws--{workspace}" if workspace and workspace != "memory" else base
+
+
+@pytest.mark.parametrize("args", [
+    ("private", "alice"), ("private", "alice.smith-example.com"), ("private", "alice--project--payroll"),
+    ("shared", "u", "my.project"), ("private", "a", "x--ws--y"), ("private", "a", "p", "w.1"),
+    ("standard", "root", "p--q"), ("private", "a b/c", "p"), ("private", "alice-", "-p", "-w"),
+])
+def test_flag_off_names_are_exactly_todays_for_every_id(monkeypatch, args):
+    """The default: dotted and '--' ids included, byte-identical to dev."""
+    from config import settings
+
+    monkeypatch.setattr(settings, "graph_group_id_injective_enabled", False)
+    assert _build_group_id(*args) == _legacy(*args)
+    assert not _build_group_id(*args).startswith(ENCODED_GROUP_PREFIX)
+
+
+def test_flag_off_read_side_names_are_todays(monkeypatch):
+    from config import settings
+
+    monkeypatch.setattr(settings, "graph_group_id_injective_enabled", False)
+    monkeypatch.setattr(settings, "standards_enabled", False)
+    assert _get_group_ids("alice.smith", "p--q") == [
+        "user--alice.smith", "shared", "user--alice.smith--project--p--q", "shared--project--p--q",
+    ]
+
+
 @pytest.mark.parametrize("args,expected", LEGACY_NAMES)
 def test_ordinary_ids_keep_their_legacy_group_id_byte_for_byte(args, expected):
     assert _build_group_id(*args) == expected

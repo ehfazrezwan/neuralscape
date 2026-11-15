@@ -24,7 +24,7 @@ Usage:
     python scripts/migrate_graph_groups.py --audit-delimiter-ids            # read-only
 
 ``--audit-delimiter-ids`` (no Neo4j needed) lists the memories whose graph group
-id CHANGED when ``_build_group_id`` became injective. The old builder joined
+id WOULD CHANGE when ``GRAPH_GROUP_ID_INJECTIVE_ENABLED`` is turned on. The old builder joined
 user / project / workspace with ``--``, so ids that themselves contain ``--``
 (or a ``.`` / other character outside ``[A-Za-z0-9_-]``, which Graphiti rejects) aliased
 other tuples' namespaces; those tuples are now named ``nsg1--<hex>``. Every other
@@ -64,7 +64,7 @@ def changed_group_rows(points) -> list[dict]:
     ``points`` is any iterable of objects with ``.id`` and ``.payload`` (a Qdrant
     scroll result). Pure function: no I/O, so it is unit-testable with fakes.
     """
-    from memory.groups import _build_group_id  # noqa: E402
+    from memory.groups import GroupKey, _encode_group_key, _key_is_plain  # noqa: E402
 
     rows: list[dict] = []
     for pt in points:
@@ -77,7 +77,14 @@ def changed_group_rows(points) -> list[dict]:
         project = meta.get("project_id") or None
         workspace = meta.get("workspace") or None
         old = _legacy_group_id(visibility, owner, project, workspace)
-        new = _build_group_id(visibility, owner, project, workspace)
+        # What GRAPH_GROUP_ID_INJECTIVE_ENABLED=true would name it (computed
+        # directly, so the audit works while the flag is still off).
+        pool = visibility if visibility in ("standard", "shared") else "private"
+        key = GroupKey(
+            pool, owner if pool == "private" else None, project,
+            workspace if workspace and workspace != "memory" else None,
+        )
+        new = old if _key_is_plain(key) else _encode_group_key(key)
         if old != new:
             rows.append({"id": str(pt.id), "owner": owner, "project_id": project,
                          "workspace": workspace, "visibility": visibility,

@@ -34,8 +34,13 @@ def _run(coro):
 # ---------------------------------------------------------------------------
 
 
-def test_distinct_namespace_tuples_have_distinct_group_ids() -> None:
+def test_distinct_namespace_tuples_have_distinct_group_ids(monkeypatch) -> None:
+    # Injective group ids are flag-gated (default off); the fix is pinned in its
+    # flag-ON mode, which is the mode this reproduction asserts.
+    from config import settings
     from memory.groups import _build_group_id
+
+    monkeypatch.setattr(settings, "graph_group_id_injective_enabled", True)
 
     colliding_user = _build_group_id("private", "alice--project--payroll")
     plain_project = _build_group_id("private", "alice", project_id="payroll")

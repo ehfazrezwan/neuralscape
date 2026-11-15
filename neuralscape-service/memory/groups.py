@@ -224,7 +224,8 @@ def _build_group_id(
     group_ids for existing rows, zero migration). Any other value appends
     `--ws--{workspace}`, isolating reference content from memory pools.
 
-    Injective: a tuple with a non-plain component (one containing ``--``, a ``.`` or
+    Injective WHEN ``GRAPH_GROUP_ID_INJECTIVE_ENABLED`` is on (default off:
+    the names above for every id, byte for byte): a tuple with a non-plain component (one containing ``--``, a ``.`` or
     any character outside ``[A-Za-z0-9_-]``) is named
     ``nsg1--<hex>`` (see ``_encode_group_key``) so it can never alias another
     tuple's namespace; every plain tuple keeps the legacy name shown above.
@@ -245,7 +246,7 @@ def _build_group_id(
         str(project_id) if project_id else None,
         str(workspace) if workspace and workspace != "memory" else None,
     )
-    if not _key_is_plain(key):
+    if settings.graph_group_id_injective_enabled and not _key_is_plain(key):
         return _encode_group_key(key)
     # Workspace suffix: absent or "memory" ⇒ no suffix (backward compatible)
     if pool == MemoryVisibility.STANDARD.value:

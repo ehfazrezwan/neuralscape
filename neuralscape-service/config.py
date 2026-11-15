@@ -247,6 +247,17 @@ class Settings(BaseSettings):
     # bm25 episode snippets from Graphiti; additive+capped; flip off if the
     # read-latency floor is breached (mission constraint: ≤+20%).
     graph_episode_recall_enabled: bool = True
+    # Injective graph group ids (env GRAPH_GROUP_ID_INJECTIVE_ENABLED). Off (the
+    # default): group ids are exactly the legacy delimiter-joined names, byte for
+    # byte, for every id. On: a tuple with a component containing "--", "." or
+    # any character outside [A-Za-z0-9_-] is named "nsg1--<hex>" so distinct
+    # (user, project, workspace) tuples can never share a namespace. Enabling
+    # re-homes those ids' future graph writes: run
+    # scripts/migrate_graph_groups.py --audit-delimiter-ids first. The read-side
+    # call sites (memory/search.py narrowed branches, memory/reads.py
+    # list_projects, dreaming card/consolidate pool names) must adopt the
+    # builder before this is enabled.
+    graph_group_id_injective_enabled: bool = False
     # Bounded second-chance re-ask for false abstentions (T2.1): when the
     # normal answering loop produces an abstention AND at least one evidence
     # row shares ≥2 content keywords with the question, re-ask ONCE with
