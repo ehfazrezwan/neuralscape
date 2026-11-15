@@ -185,3 +185,4 @@ neuralscape-service/vendor/*.whl
 # One-off local report/visualization exports at repo root
 /ns-perf-report-*.html
 /naked-forex-graph.html
+/backups/
