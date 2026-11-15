@@ -486,3 +486,55 @@ class TestBoundSharedKeyOnExtensions:
         body = {"project_id": "p1", "code_systems": ["graphify"], "fuse_code_into_recall": True}
         resp = TestClient(app).put("/v1/projects/p1/knowledge-config", json=body, headers=bound_key)
         assert resp.status_code == 200
+
+    def test_compile_naming_other_user_is_400_and_nothing_enqueued(self, compiler, bound_key):
+        resp = TestClient(app).post(
+            PREFIX + "/compile", json={"date": "2026-10-18", "user_id": "bob"}, headers=bound_key
+        )
+        assert resp.status_code == 400
+        compiler.pool.enqueue_job.assert_not_called()
+        assert compiler.owners == []
+
+    def test_events_payload_user_other_than_bound_is_400_and_missing_is_bound(self, monkeypatch, bound_key):
+        registry = MagicMock()
+        registry.emit_event = AsyncMock(return_value=MagicMock(notified_count=1, responses={}))
+        monkeypatch.setattr(main, "_extension_registry", registry)
+        turn = {"messages": [{"role": "user", "content": "hi"}]}
+
+        def post(payload):
+            return TestClient(app).post(
+                "/v1/extensions/events",
+                json={"event_type": "conversation_turn", "payload": payload},
+                headers=bound_key,
+            )
+
+        assert post({**turn, "user_id": "bob"}).status_code == 400
+        registry.emit_event.assert_not_called()
+        assert post(turn).status_code == 200
+        assert registry.emit_event.await_args.args[1]["user_id"] == "alice"
+
+    def test_empty_admin_list_and_non_default_bound_user_is_403_on_both_gates(
+        self, pool, mounted, monkeypatch, bound_key
+    ):
+        import arq
+
+        import knowledge.router as kr
+        from extensions.dreaming import DreamingExtension
+        from extensions.dreaming.config import dreaming_settings
+
+        pool.close = AsyncMock()
+        monkeypatch.setattr(arq, "create_pool", AsyncMock(return_value=pool))
+        monkeypatch.setattr("extensions.dreaming.record_task_owner", AsyncMock())
+        monkeypatch.setattr(dreaming_settings, "enabled", False)
+        mounted(DreamingExtension().get_routes(), "/v1/extensions/dreaming")
+        set_config = MagicMock()
+        monkeypatch.setattr(kr, "set_project_config", set_config)
+        monkeypatch.setattr(settings, "dictator_user_ids", "")  # empty list
+        # bound_key: key bound to "alice", DEFAULT_USER_ID is "the-default-user"
+        run = TestClient(app).post("/v1/extensions/dreaming/run", json={"force": True}, headers=bound_key)
+        assert run.status_code == 403
+        pool.enqueue_job.assert_not_called()
+        body = {"project_id": "p1", "code_systems": ["graphify"], "fuse_code_into_recall": True}
+        put = TestClient(app).put("/v1/projects/p1/knowledge-config", json=body, headers=bound_key)
+        assert put.status_code == 403
+        set_config.assert_not_called()
