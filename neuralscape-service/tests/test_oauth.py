@@ -449,6 +449,17 @@ class TestToken:
         dead = self._refresh(client, second["refresh_token"], client_id)
         assert dead.status_code == 400 and dead.json()["error"] == "invalid_grant"
 
+    def test_retry_with_same_token_by_same_client_revokes_session_no_grace(self, client):
+        # A lost response makes the client retry the SAME token. By design
+        # there is no grace window: the retry is reuse, and the session dies.
+        client_id, tok = self._tokens(client)
+        first = self._refresh(client, tok["refresh_token"], client_id)
+        assert first.status_code == 200
+        retry = self._refresh(client, tok["refresh_token"], client_id)
+        assert retry.status_code == 400 and retry.json()["error"] == "invalid_grant"
+        successor = self._refresh(client, first.json()["refresh_token"], client_id)
+        assert successor.status_code == 400 and successor.json()["error"] == "invalid_grant"
+
     def test_other_family_unaffected_by_revocation(self, client):
         client_id, tok = self._tokens(client)
         _, other = self._tokens(client)  # an unrelated grant

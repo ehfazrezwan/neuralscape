@@ -892,6 +892,9 @@ async def token(
         except _ReplayGuardUnavailable:
             return _guard_unavailable()
         if not first_use:
+            # Strict by design, no grace window (OAuth 2.0 Security BCP reuse
+            # detection): a legitimate client retrying after a lost response
+            # lands here too and must reconnect.
             # A rotated token was replayed: someone holds a copy. Revoke the
             # whole family so the successor (possibly held by the thief) dies
             # too; the legitimate client reconnects.
