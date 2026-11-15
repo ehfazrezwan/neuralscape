@@ -94,6 +94,7 @@ _BM25_MISSING_DETAIL = (
 )
 # One warning per process, not per search.
 _bm25_warned = False
+_bm25_encoder_warned = False
 
 
 class CoreMixin:
@@ -173,6 +174,8 @@ class CoreMixin:
                     if hasattr(self._memory, "graph") and hasattr(self._memory.graph, "graphiti"):
                         self._graphiti = self._memory.graph.graphiti
                         self._bridge = self._memory.graph._bridge
+
+                    self._ensure_indexes_at_startup()
 
         return self._memory
 
@@ -282,8 +285,9 @@ class CoreMixin:
     # scope — all unindexed meant full payload scans on every search.
     #
     # Every payload key the service filters on (grep ``FieldCondition(key=``
-    # in memory/*.py) is listed here. The payload layout is mem0's: ``hash``
-    # and ``user_id`` are top-level; everything NS stamps lives under
+    # in memory/, okf/, knowledge/, extensions/, adapters/trading/) is listed
+    # here; tests/test_qdrant_indexes_bm25_health.py scans those dirs and fails
+    # on a gap. The payload layout is mem0's: ``hash`` and ``user_id`` are top-level; everything NS stamps lives under
     # ``metadata.*``. ``user_id`` is indexed by mem0's own store, and
     # ``created_at`` by ``_ensure_created_at_index`` (DATETIME), so neither is
     # repeated here. Array fields (tags, concepts) take a keyword index too.
@@ -302,28 +306,36 @@ class CoreMixin:
         ("metadata.owner_user_id", "keyword"),
         ("metadata.speaker", "keyword"),
         ("metadata.workspace", "keyword"),
+        ("metadata.source_ref.external_id", "keyword"),
+        ("metadata.code_liveness_stale", "bool"),
         # Shared-episode sibling lookup (memory/provenance.py): one scroll per
         # cascade filters on these; unindexed it scans the collection each time.
         ("metadata.graph_episode_uuid", "keyword"),
         ("metadata.graph_episode_name", "keyword"),
     )
 
-    def _ensure_filter_indexes(self) -> None:
-        """Best-effort: ensure payload indexes on the hot-path filter fields.
+    # After a failed attempt, do not retry on every search against a flaky
+    # Qdrant; allow a re-check after this many seconds.
+    _FILTER_INDEX_RETRY_S = 60.0
+    _filter_indexes_ok = False
 
-        Same pattern as ``_ensure_created_at_index``: idempotent server-side,
-        attempted once per service instance, ``wait=False`` so index builds
-        never block the first read, and any failure degrades to Qdrant's
-        unindexed filtering rather than raising.
+    def _ensure_filter_indexes(self) -> None:
+        """Best-effort: ensure payload indexes on the filter fields.
+
+        Idempotent server-side, ``wait=False`` so index builds never block a
+        read, and any failure degrades to Qdrant's unindexed filtering rather
+        than raising. The done flag is set only when every field succeeded;
+        after a failure the next call past ``_FILTER_INDEX_RETRY_S`` re-checks,
+        and the failed field names are logged at warning (once per instance).
         """
         if getattr(self, "_filter_indexes_ok", False):
             return
-        # Surface a pre-v3 collection (no BM25 slot) once per process, on the
-        # first search/timeline — the first point where it starts to matter.
+        if time.monotonic() < getattr(self, "_filter_index_retry_at", 0.0):
+            return
+        # Surface a pre-v3 collection (no BM25 slot) once per process.
         self._warn_bm25_missing_once()
-        # Mark attempted FIRST — a flaky Qdrant must not re-pay this on
-        # every subsequent search.
-        self._filter_indexes_ok = True
+        self._filter_index_retry_at = time.monotonic() + self._FILTER_INDEX_RETRY_S
+        failed: list[str] = []
         try:
             from qdrant_client.models import PayloadSchemaType
 
@@ -341,30 +353,80 @@ class CoreMixin:
                         wait=False,
                     )
                 except Exception as e:
-                    logger.debug(
-                        f"payload index ensure failed for {field_name} (non-fatal): {e}"
-                    )
+                    failed.append(field_name)
+                    logger.debug(f"payload index ensure failed for {field_name}: {e}")
         except Exception as e:
-            logger.debug(f"filter payload index ensure failed (non-fatal): {e}")
+            failed.append("*")
+            logger.debug(f"filter payload index ensure failed: {e}")
+        if not failed:
+            self._filter_indexes_ok = True
+        elif not getattr(self, "_filter_index_warned", False):
+            self._filter_index_warned = True
+            logger.warning(
+                "qdrant_payload_index_ensure_failed fields=%s: filters on these run unindexed "
+                "(will re-check in %ds)",
+                ",".join(failed),
+                int(self._FILTER_INDEX_RETRY_S),
+            )
+
+    def _ensure_indexes_at_startup(self) -> None:
+        """Ensure all payload indexes once memory is initialised, off the caller.
+
+        Runs on a daemon thread so neither the event loop nor a cold-start
+        request waits on Qdrant; never raises. Workers get the indexes before
+        their first dedup probe, not on their first search.
+        """
+
+        def _run():
+            try:
+                self._ensure_filter_indexes()
+                self._ensure_created_at_index()
+            except Exception as e:  # noqa: BLE001
+                logger.debug(f"startup payload index ensure failed (non-fatal): {e}")
+
+        thread = threading.Thread(target=_run, name="qdrant-index-ensure", daemon=True)
+        self._index_ensure_thread = thread
+        thread.start()
 
     def vector_store_capabilities(self) -> dict:
-        """What the live vector store can do, for ``/health``.
+        """What the live vector store can do, for ``/health`` (public fields only).
 
-        ``bm25_sparse`` is read from mem0's Qdrant store (``_has_bm25_slot``):
-        ``False`` means the collection predates the v3 BM25 sparse slot, so
-        search silently runs dense-only. ``None`` means not initialised yet or
-        the store does not report it. Never initialises the store and never
-        raises, so a health probe can call it freely.
+        ``bm25_sparse``: the collection has the BM25 sparse slot (``False`` =
+        predates v3, search is dense-only). ``bm25_encoder``: ``loaded`` /
+        ``unavailable`` (fastembed missing or failed to load: dense-only even
+        with the slot) / ``not_loaded`` (lazy, not used yet). ``None`` values
+        mean not initialised or not reported. Free-text detail goes to the
+        server log, not to this unauthenticated payload. Never initialises
+        the store and never raises.
         """
         memory = self._memory
         store = getattr(memory, "vector_store", None) if memory is not None else None
         flag = getattr(store, "_has_bm25_slot", None) if store is not None else None
         if not isinstance(flag, bool):
-            return {"bm25_sparse": None, "detail": "vector store not initialized or does not report BM25 support"}
-        if flag:
-            return {"bm25_sparse": True}
-        self._warn_bm25_missing_once()
-        return {"bm25_sparse": False, "detail": _BM25_MISSING_DETAIL}
+            return {"bm25_sparse": None, "bm25_encoder": None}
+        encoder = getattr(store, "_bm25_encoder", None)
+        if encoder is False:
+            state = "unavailable"
+        elif encoder is None:
+            state = "not_loaded"
+        else:
+            state = "loaded"
+        if not flag:
+            self._warn_bm25_missing_once()
+        elif state == "unavailable":
+            self._warn_bm25_encoder_once()
+        return {"bm25_sparse": flag, "bm25_encoder": state}
+
+    def _warn_bm25_encoder_once(self) -> None:
+        global _bm25_encoder_warned
+        if _bm25_encoder_warned:
+            return
+        _bm25_encoder_warned = True
+        logger.warning(
+            "vector_store_bm25_encoder_unavailable collection=%s: the BM25 encoder (fastembed) "
+            "failed to load, so the keyword leg is off and search is dense-only.",
+            settings.qdrant_collection,
+        )
 
     def _warn_bm25_missing_once(self) -> None:
         """One structured warning per process when the BM25 slot is missing."""

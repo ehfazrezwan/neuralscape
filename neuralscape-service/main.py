@@ -286,7 +286,7 @@ def _vector_store_capabilities() -> dict:
             return caps
     except Exception:
         logger.debug("vector_store_capabilities failed", exc_info=True)
-    return {"bm25_sparse": None, "detail": "unavailable"}
+    return {"bm25_sparse": None, "bm25_encoder": None}
 
 
 @app.get("/health")

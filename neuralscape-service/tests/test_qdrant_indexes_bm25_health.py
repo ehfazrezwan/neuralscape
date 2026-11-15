@@ -35,10 +35,12 @@ class FakeQdrantClient:
         self.indexes[field_name] = field_schema
 
 
-def _service(has_bm25=True, client=None):
+def _service(has_bm25=True, client=None, encoder=None):
     svc = MemoryService()
     svc._memory = SimpleNamespace(
-        vector_store=SimpleNamespace(client=client or FakeQdrantClient(), _has_bm25_slot=has_bm25)
+        vector_store=SimpleNamespace(
+            client=client or FakeQdrantClient(), _has_bm25_slot=has_bm25, _bm25_encoder=encoder
+        )
     )
     return svc
 
@@ -46,8 +48,10 @@ def _service(has_bm25=True, client=None):
 @pytest.fixture(autouse=True)
 def _reset_warned():
     core._bm25_warned = False
+    core._bm25_encoder_warned = False
     yield
     core._bm25_warned = False
+    core._bm25_encoder_warned = False
 
 
 # ---------------------------------------------------------------- indexes
@@ -66,6 +70,7 @@ def test_second_ensure_is_a_noop_and_never_raises():
     client = FakeQdrantClient()
     svc = _service(client=client)
     svc._ensure_filter_indexes()
+    assert svc._filter_indexes_ok is True
     first = client.calls
     svc._ensure_filter_indexes()
     assert client.calls == first
@@ -74,34 +79,158 @@ def test_second_ensure_is_a_noop_and_never_raises():
     assert set(client.indexes) >= {f for f, _ in core.CoreMixin._FILTER_INDEX_FIELDS}
 
 
+# Production code that filters the memories collection. scripts/ are one-off
+# operator tools; adapters/code_graph filters its OWN collection.
+GUARDED_DIRS = ("memory", "okf", "knowledge", "extensions", "adapters/trading")
+FILTER_CALLS = {"FieldCondition", "PayloadField", "IsEmptyCondition", "IsNullCondition"}
+# Non-literal keys that are allowed, with the reason; each resolves to keys
+# that ARE in _FILTER_INDEX_FIELDS (asserted below).
+NON_LITERAL_ALLOWED = {
+    "memory/provenance.py": (
+        "prefix + 'graph_episode_uuid'/'graph_episode_name' (prefix is '' or 'metadata.')",
+        {"graph_episode_uuid", "graph_episode_name"},
+    ),
+}
+
+
+def _filter_keys():
+    """(literal keys, non-literal sites) from every filter call, via the AST."""
+    import ast
+
+    root = MEMORY_DIR.parent
+    literal: set[str] = set()
+    dynamic: list[tuple[str, int]] = []
+    for d in GUARDED_DIRS:
+        for path in sorted((root / d).rglob("*.py")):
+            rel = path.relative_to(root).as_posix()
+            for node in ast.walk(ast.parse(path.read_text())):
+                if not isinstance(node, ast.Call):
+                    continue
+                func = node.func
+                name = getattr(func, "id", getattr(func, "attr", None))
+                if name not in FILTER_CALLS:
+                    continue
+                for kw in node.keywords:
+                    if kw.arg != "key":
+                        continue
+                    if isinstance(kw.value, ast.Constant) and isinstance(kw.value.value, str):
+                        literal.add(kw.value.value)
+                    else:
+                        dynamic.append((rel, node.lineno))
+    return literal, dynamic
+
+
 def test_every_filtered_metadata_key_is_indexed():
-    """Grep the service's own filters: nothing it filters on may be unindexed."""
-    keys: set[str] = set()
-    for path in MEMORY_DIR.glob("*.py"):
-        keys |= set(re.findall(r'(?:FieldCondition|PayloadField)\(\s*key="([\w.]+)"', path.read_text()))
-        keys |= set(re.findall(r'PayloadField\(key="([\w.]+)"', path.read_text()))
+    """Scan memory/, okf/, knowledge/, extensions/, adapters/trading: no unindexed filter key."""
+    literal, dynamic = _filter_keys()
+    assert "metadata.category" in literal and "metadata.source_ref.external_id" in literal  # scan sees extensions
     indexed = {f for f, _ in core.CoreMixin._FILTER_INDEX_FIELDS}
     # user_id: mem0's own store; created_at: _ensure_created_at_index;
-    # metadata: provenance JSON blob, not a filter key.
+    # metadata: provenance JSON blob patch, not a filter key.
     exempt = {"user_id", "created_at", "metadata"}
-    assert not (keys - indexed - exempt), sorted(keys - indexed - exempt)
+    assert not (literal - indexed - exempt), sorted(literal - indexed - exempt)
+
+    unexplained = [(f, ln) for f, ln in dynamic if f not in NON_LITERAL_ALLOWED]
+    assert not unexplained, f"non-literal FieldCondition key (allowlist with a reason): {unexplained}"
+    for _reason, suffixes in NON_LITERAL_ALLOWED.values():
+        for suffix in suffixes:
+            assert f"metadata.{suffix}" in indexed, suffix
+
+
+# ---------------------------------------------- startup + failure handling
+
+
+def test_service_init_alone_creates_indexes_without_a_search(monkeypatch):
+    """_get_memory() must ensure indexes: workers dedup-probe before any search."""
+    client = FakeQdrantClient()
+    fake_memory = SimpleNamespace(vector_store=SimpleNamespace(client=client, _has_bm25_slot=True, _bm25_encoder=None))
+    monkeypatch.setattr(core, "_memory_from_config", lambda cls, cfg: fake_memory)
+    monkeypatch.setattr(type(settings), "get_mem0_config", lambda self: {})
+    svc = MemoryService()
+    svc._get_memory()  # no search, no timeline
+    svc._index_ensure_thread.join(timeout=5)
+    for field in ("hash", "metadata.project_id", "metadata.category", "created_at"):
+        assert field in client.indexes, field
+
+
+def test_startup_ensure_never_raises_on_broken_qdrant(monkeypatch):
+    class Broken:
+        def create_payload_index(self, **_):
+            raise RuntimeError("qdrant down")
+
+    fake_memory = SimpleNamespace(vector_store=SimpleNamespace(client=Broken(), _has_bm25_slot=True, _bm25_encoder=None))
+    monkeypatch.setattr(core, "_memory_from_config", lambda cls, cfg: fake_memory)
+    monkeypatch.setattr(type(settings), "get_mem0_config", lambda self: {})
+    svc = MemoryService()
+    assert svc._get_memory() is fake_memory
+    svc._index_ensure_thread.join(timeout=5)
+
+
+class FlakyClient(FakeQdrantClient):
+    def __init__(self, fail_fields):
+        super().__init__()
+        self.fail_fields = set(fail_fields)
+
+    def create_payload_index(self, collection_name, field_name, field_schema, wait=True):
+        if field_name in self.fail_fields:
+            raise RuntimeError("transient")
+        super().create_payload_index(collection_name, field_name, field_schema, wait)
+
+
+def test_failed_field_warns_once_and_is_rechecked_later(caplog, monkeypatch):
+    client = FlakyClient({"hash"})
+    svc = _service(client=client)
+    with caplog.at_level(logging.WARNING, logger="memory.core"):
+        svc._ensure_filter_indexes()
+        assert svc._filter_indexes_ok is False
+        svc._ensure_filter_indexes()  # inside the cool-down: no retry, no second warning
+        msgs = [r.getMessage() for r in caplog.records if "qdrant_payload_index_ensure_failed" in r.getMessage()]
+        assert len(msgs) == 1 and "hash" in msgs[0] and "metadata.scope" not in msgs[0]
+        assert "hash" not in client.indexes
+
+        # Qdrant recovers; once the cool-down has passed the next call re-checks.
+        client.fail_fields.clear()
+        svc._filter_index_retry_at = 0.0
+        svc._ensure_filter_indexes()
+    assert "hash" in client.indexes
+    assert svc._filter_indexes_ok is True
+    assert len([r for r in caplog.records if "qdrant_payload_index_ensure_failed" in r.getMessage()]) == 1
 
 
 # ----------------------------------------------------------------- health
 
 
 def test_capabilities_true_when_store_has_slot():
-    assert _service(True).vector_store_capabilities() == {"bm25_sparse": True}
+    assert _service(True).vector_store_capabilities() == {"bm25_sparse": True, "bm25_encoder": "not_loaded"}
 
 
-def test_capabilities_false_with_detail_when_slot_missing():
-    caps = _service(False).vector_store_capabilities()
-    assert caps["bm25_sparse"] is False
-    assert "BM25" in caps["detail"] and "dense-only" in caps["detail"]
+def test_capabilities_false_when_slot_missing_detail_only_in_log(caplog):
+    with caplog.at_level(logging.WARNING, logger="memory.core"):
+        caps = _service(False).vector_store_capabilities()
+    assert caps == {"bm25_sparse": False, "bm25_encoder": "not_loaded"}  # no free text on the public payload
+    assert any("dense-only" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.parametrize(
+    "encoder,state", [(None, "not_loaded"), (False, "unavailable"), (object(), "loaded")]
+)
+def test_capabilities_report_encoder_state(encoder, state):
+    assert _service(True, encoder=encoder).vector_store_capabilities() == {
+        "bm25_sparse": True,
+        "bm25_encoder": state,
+    }
+
+
+def test_unavailable_encoder_warns_once(caplog):
+    svc = _service(True, encoder=False)
+    with caplog.at_level(logging.WARNING, logger="memory.core"):
+        for _ in range(3):
+            svc.vector_store_capabilities()
+    assert len([r for r in caplog.records if "bm25_encoder_unavailable" in r.getMessage()]) == 1
 
 
 def test_capabilities_unknown_before_init():
-    assert MemoryService().vector_store_capabilities()["bm25_sparse"] is None
+    assert MemoryService().vector_store_capabilities() == {"bm25_sparse": None, "bm25_encoder": None}
 
 
 def test_missing_slot_warns_once_per_process(caplog):
@@ -142,5 +271,6 @@ def test_health_endpoint_reports_bm25_without_failing(has_slot):
     body = resp.json()
     assert body["status"] == "ok"
     assert body["vector_store"]["bm25_sparse"] is has_slot
-    assert ("detail" in body["vector_store"]) is (not has_slot)
+    assert body["vector_store"] == {"bm25_sparse": has_slot, "bm25_encoder": "not_loaded"}
+    assert "detail" not in body["vector_store"]
     assert body["checks"]["vector_store"] == "ok"

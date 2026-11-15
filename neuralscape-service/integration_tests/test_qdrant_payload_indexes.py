@@ -20,6 +20,8 @@ EXPECTED = (
     "metadata.scope",
     "metadata.visibility",
     "metadata.dream_tombstoned",
+    "metadata.source_ref.external_id",
+    "created_at",
 )
 
 
@@ -29,7 +31,7 @@ def _service(client, collection, monkeypatch, has_bm25=True):
 
     monkeypatch.setattr(config.settings, "qdrant_collection", collection)
     svc = MemoryService()
-    svc._memory = SimpleNamespace(vector_store=SimpleNamespace(client=client, _has_bm25_slot=has_bm25))
+    svc._memory = SimpleNamespace(vector_store=SimpleNamespace(client=client, _has_bm25_slot=has_bm25, _bm25_encoder=None))
     return svc
 
 
@@ -64,5 +66,4 @@ def test_pre_v3_collection_reports_no_bm25_slot(stores, unique_ns, monkeypatch):
 
     svc = _service(client, collection, monkeypatch)
     svc._memory.vector_store = store
-    caps = svc.vector_store_capabilities()
-    assert caps["bm25_sparse"] is False and "dense-only" in caps["detail"]
+    assert svc.vector_store_capabilities() == {"bm25_sparse": False, "bm25_encoder": "not_loaded"}
