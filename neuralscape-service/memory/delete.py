@@ -17,6 +17,18 @@ from memory.ranking import _times_derived_from_metadata
 logger = logging.getLogger(__name__)
 
 
+# Bulk-delete listing page and the cap on listing rounds: a filtered sweep keeps
+# re-listing (deleted rows drop out of the next listing) until nothing new is
+# left; if rows remain unseen when the cap is hit the result says ``truncated``.
+_BULK_PAGE = 500
+_BULK_MAX_ROUNDS = 40
+
+
+def _bulk_partial_fields(failed_ids: list[str], truncated: bool) -> dict:
+    """Honest-status keys every bulk delete returns (``failed_ids`` empty / ``truncated`` False when clean)."""
+    return {"failed_ids": list(failed_ids), "failed": len(failed_ids), "truncated": bool(truncated)}
+
+
 class MemoryListingFailed(RuntimeError):
     """A bulk delete could not list the caller's memories, so it deleted NOTHING.
 
@@ -268,76 +280,102 @@ class DeleteMixin:
             )
             return self._delete_private_only(user_id)
 
-        if filter_null_category:
-            memories_to_delete = self._list_null_category_memories(
-                user_id=user_id, scope=scope, project_id=project_id,
-            )
-            deleted_count = 0
-            skipped_shared = 0
-            skipped_standard = 0
-            # Rows whose vector delete succeeded; the graph cascade runs once
-            # per distinct episode over all of them afterwards.
-            cascade_rows: list[dict] = []
-            for mem_info in memories_to_delete:
-                meta = mem_info.get("metadata", {}) or {}
-                if isinstance(meta.get("metadata"), dict):
-                    meta = meta["metadata"]
-                if not include_shared and meta.get("visibility") == MemoryVisibility.SHARED.value:
-                    skipped_shared += 1
-                    continue
-                if meta.get("visibility") == MemoryVisibility.STANDARD.value and not settings.is_dictator(user_id):
-                    skipped_standard += 1
-                    continue
-                mid = mem_info["id"]
-                try:
-                    m.vector_store.delete(mid)
-                    cascade_rows.append({
-                        "id": mid,
-                        "mem": {"memory": mem_info.get("data", ""), "metadata": meta},
-                        "group_id": None,
-                    })
-                    deleted_count += 1
-                except Exception as e:
-                    logger.warning(f"Failed to delete null-category memory {mid}: {e}")
-            graph = self._bulk_graph_cleanup(cascade_rows, "null-category")
-            return {
-                "message": _deleted_msg("null-category memories", deleted_count, skipped_shared, skipped_standard),
-                **graph,
-            }
-
-        # For filtered deletes, we need to list then delete individually
-        memories = self.list_memories(
-            user_id=user_id,
-            scope=scope,
-            category=category,
-            project_id=project_id,
-        )
-
         deleted_count = 0
         skipped_shared = 0
         skipped_standard = 0
-        cascade_rows = []
-        for mem in memories:
-            if not include_shared and getattr(mem, "visibility", None) == MemoryVisibility.SHARED.value:
-                skipped_shared += 1
-                continue
-            if getattr(mem, "visibility", None) == MemoryVisibility.STANDARD.value and not settings.is_dictator(user_id):
-                skipped_standard += 1
-                continue
-            try:
-                # Get full memory for graph cleanup before deleting
-                full_mem = m.get(mem.id)
-                m.delete(mem.id)
-                if full_mem:
-                    cascade_rows.append({"id": mem.id, "mem": full_mem, "group_id": None})
-                deleted_count += 1
-            except Exception as e:
-                logger.warning(f"Failed to delete memory {mem.id}: {e}")
+        # Rows whose vector delete succeeded; the graph cascade runs once
+        # per distinct episode over all of them afterwards.
+        cascade_rows: list[dict] = []
+        failed_ids: list[str] = []
+        seen: set[str] = set()
+        truncated = False
+
+        if filter_null_category:
+            for _round in range(_BULK_MAX_ROUNDS):
+                batch = self._list_null_category_memories(
+                    user_id=user_id, scope=scope, project_id=project_id, limit=_BULK_PAGE,
+                )
+                fresh = [x for x in batch if x["id"] not in seen]
+                if not fresh:
+                    truncated = len(batch) >= _BULK_PAGE  # a full page of rows already handled: more may sit behind them
+                    break
+                for mem_info in fresh:
+                    seen.add(mem_info["id"])
+                    meta = mem_info.get("metadata", {}) or {}
+                    if isinstance(meta.get("metadata"), dict):
+                        meta = meta["metadata"]
+                    if not include_shared and meta.get("visibility") == MemoryVisibility.SHARED.value:
+                        skipped_shared += 1
+                        continue
+                    if meta.get("visibility") == MemoryVisibility.STANDARD.value and not settings.is_dictator(user_id):
+                        skipped_standard += 1
+                        continue
+                    mid = mem_info["id"]
+                    try:
+                        m.vector_store.delete(mid)
+                        cascade_rows.append({
+                            "id": mid,
+                            "mem": {"memory": mem_info.get("data", ""), "metadata": meta},
+                            "group_id": None,
+                        })
+                        deleted_count += 1
+                    except Exception as e:
+                        failed_ids.append(mid)
+                        logger.warning(f"Failed to delete null-category memory {mid}: {e}")
+                if len(batch) < _BULK_PAGE:
+                    break  # a short page: everything that matched has been seen
+            else:
+                truncated = True
+            graph = self._bulk_graph_cleanup(cascade_rows, "null-category")
+            return {
+                "message": _deleted_msg("null-category memories", deleted_count, skipped_shared, skipped_standard)
+                + (f" ({len(failed_ids)} failed)" if failed_ids else ""),
+                **graph,
+                **_bulk_partial_fields(failed_ids, truncated),
+            }
+
+        # For filtered deletes, we need to list then delete individually
+        for _round in range(_BULK_MAX_ROUNDS):
+            batch = self.list_memories(
+                user_id=user_id,
+                scope=scope,
+                category=category,
+                project_id=project_id,
+                limit=_BULK_PAGE,
+            )
+            fresh = [x for x in batch if x.id not in seen]
+            if not fresh:
+                truncated = len(batch) >= _BULK_PAGE
+                break
+            for mem in fresh:
+                seen.add(mem.id)
+                if not include_shared and getattr(mem, "visibility", None) == MemoryVisibility.SHARED.value:
+                    skipped_shared += 1
+                    continue
+                if getattr(mem, "visibility", None) == MemoryVisibility.STANDARD.value and not settings.is_dictator(user_id):
+                    skipped_standard += 1
+                    continue
+                try:
+                    # Get full memory for graph cleanup before deleting
+                    full_mem = m.get(mem.id)
+                    m.delete(mem.id)
+                    if full_mem:
+                        cascade_rows.append({"id": mem.id, "mem": full_mem, "group_id": None})
+                    deleted_count += 1
+                except Exception as e:
+                    failed_ids.append(mem.id)
+                    logger.warning(f"Failed to delete memory {mem.id}: {e}")
+            if len(batch) < _BULK_PAGE:
+                break
+        else:
+            truncated = True
 
         graph = self._bulk_graph_cleanup(cascade_rows, "filtered")
         return {
-            "message": _deleted_msg("memories", deleted_count, skipped_shared, skipped_standard),
+            "message": _deleted_msg("memories", deleted_count, skipped_shared, skipped_standard)
+            + (f" ({len(failed_ids)} failed)" if failed_ids else ""),
             **graph,
+            **_bulk_partial_fields(failed_ids, truncated),
         }
 
     def _bulk_graph_cleanup(
@@ -407,6 +445,7 @@ class DeleteMixin:
         # (memory_id, payload, metadata) for every non-shared row.
         private_rows: list[tuple[str, dict, dict]] = []
         private_groups: set[str] = set()
+        row_groups: dict[str, str] = {}
         shared_preserved = 0
         standard_preserved = 0
         for mem in all_memories:
@@ -425,19 +464,11 @@ class DeleteMixin:
                 standard_preserved += 1
                 continue
             private_rows.append((mem["id"], payload, metadata))
-            private_groups.add(
-                _build_group_id(
-                    visibility, user_id, metadata.get("project_id"), metadata.get("workspace")
-                )
+            row_group = _build_group_id(
+                visibility, user_id, metadata.get("project_id"), metadata.get("workspace")
             )
-
-        # Cheap backstop: bulk-expire every edge in the private groups
-        # (ONE Cypher statement per call, not a per-edge write loop).
-        if self._graphiti and self._bridge and private_groups:
-            try:
-                self._expire_graph_edges_for_groups(sorted(private_groups))
-            except Exception as e:
-                logger.warning(f"Graph cleanup for private groups failed: {e}")
+            private_groups.add(row_group)
+            row_groups[mem["id"]] = row_group
 
         # Vectors FIRST (NS issue #176): the store must never be left
         # partially deleted by a slow/failed graph step — an interrupted or
@@ -446,13 +477,27 @@ class DeleteMixin:
         # best-effort and fully reportable.
         deleted = 0
         deleted_ids: set[str] = set()
+        failed_ids: list[str] = []
         for mid, payload, _ in private_rows:
             try:
                 self._memory.vector_store.delete(mid)
                 deleted += 1
                 deleted_ids.add(mid)
             except Exception as e:
+                failed_ids.append(mid)
                 logger.warning(f"Failed to delete private memory {mid}: {e}")
+
+        # Cheap backstop: bulk-expire every edge in a private group (ONE Cypher
+        # statement per call, not a per-edge write loop) — only AFTER the vector
+        # deletes and only for groups whose rows ALL went: a row that failed to
+        # delete is still live in Qdrant and must keep its graph facts.
+        failed_groups = {row_groups[f] for f in failed_ids}
+        clean_groups = sorted(private_groups - failed_groups)
+        if self._graphiti and self._bridge and clean_groups:
+            try:
+                self._expire_graph_edges_for_groups(clean_groups)
+            except Exception as e:
+                logger.warning(f"Graph cleanup for private groups failed: {e}")
 
         # Provenance-exact cascade (episodes + node summaries), ONCE per
         # distinct episode and bounded to the rows just scrolled — never an
@@ -476,7 +521,9 @@ class DeleteMixin:
             msg += f" (preserved {shared_preserved} shared)"
         if standard_preserved:
             msg += f" (preserved {standard_preserved} standard)"
-        return {"message": msg, **graph}
+        if failed_ids:
+            msg += f" ({len(failed_ids)} failed)"
+        return {"message": msg, **graph, **_bulk_partial_fields(failed_ids, False)}
 
     def _expire_graph_edges_for_memory(self, mem: dict) -> None:
         """Soft-delete graph edges related to a memory by setting expired_at."""

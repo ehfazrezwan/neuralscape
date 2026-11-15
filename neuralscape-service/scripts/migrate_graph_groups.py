@@ -26,7 +26,7 @@ Usage:
 ``--audit-delimiter-ids`` (no Neo4j needed) lists the memories whose graph group
 id CHANGED when ``_build_group_id`` became injective. The old builder joined
 user / project / workspace with ``--``, so ids that themselves contain ``--``
-(or use characters outside ``[A-Za-z0-9_.-]``) aliased
+(or a ``.`` / other character outside ``[A-Za-z0-9_-]``, which Graphiti rejects) aliased
 other tuples' namespaces; those tuples are now named ``nsg1--<hex>``. Every other
 memory keeps its group id byte for byte, so only the listed rows need attention:
 their graph facts under the old (ambiguous) group should be re-enriched into the
@@ -105,7 +105,7 @@ def main(argv: list[str] | None = None) -> int:
         "--audit-delimiter-ids",
         action="store_true",
         help="Read-only: list memories whose graph group id changed with the injective "
-             "group-id builder (ids containing '--' or characters outside [A-Za-z0-9_.-]).",
+             "group-id builder (ids containing '--', '.' or other characters outside [A-Za-z0-9_-]).",
     )
     parser.add_argument(
         "--owner",

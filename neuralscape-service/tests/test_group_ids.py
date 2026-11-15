@@ -33,7 +33,7 @@ LEGACY_NAMES = [
     (("private", "alice", "payroll", "reference"), "user--alice--project--payroll--ws--reference"),
     (("shared", "alice", "p", "docs"), "shared--project--p--ws--docs"),
     (("private", "alice", None, "memory"), "user--alice"),
-    (("private", "a.b-c_d", "p-1.x"), "user--a.b-c_d--project--p-1.x"),
+    (("private", "a-b_c-d", "p-1_x"), "user--a-b_c-d--project--p-1_x"),
     (("private", "ALICE9"), "user--ALICE9"),
 ]
 
@@ -41,6 +41,16 @@ LEGACY_NAMES = [
 @pytest.mark.parametrize("args,expected", LEGACY_NAMES)
 def test_ordinary_ids_keep_their_legacy_group_id_byte_for_byte(args, expected):
     assert _build_group_id(*args) == expected
+
+
+def test_a_dotted_id_gets_a_graphiti_valid_group_id():
+    """Graphiti's validate_group_id rejects '.', so a dotted email-slug user id could never be graph-written."""
+    import re
+
+    for args in [("private", "alice.smith-example.com"), ("shared", "u", "my.project"), ("private", "a", "p", "w.1")]:
+        gid = _build_group_id(*args)
+        assert re.fullmatch(r"[A-Za-z0-9_-]+", gid), gid
+        assert decode_group_id(gid) is not None
 
 
 def test_the_documented_collision_is_gone():

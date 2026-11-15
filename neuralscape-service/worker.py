@@ -1019,6 +1019,39 @@ async def process_graph_enrichment(
         occurred_at=occurred_at,
         workspace=current_workspace,
     )
+    if enriched:
+        # The first check above only covers the time the job sat in the queue.
+        # Extraction itself takes minutes: re-read the row now and, if it was
+        # deleted or moved (visibility/project/workspace) or rewritten while we
+        # were writing, expire the episode we just published — the edit/delete
+        # cascade ran BEFORE it existed, so nothing else would ever expire it.
+        expire = getattr(service, "_cascade_or_fallback_expire", None)
+        after = await asyncio.to_thread(service.get_memory, memory_id)
+        if after is None:
+            changed = True
+        else:
+            text_after = getattr(after, "memory", None)
+            changed = (
+                (getattr(after, "visibility", None) or "private") != current_visibility
+                or (getattr(after, "project_id", current_project) or None) != current_project
+                or (getattr(after, "workspace", None) or None) != current_workspace
+                or (isinstance(text_after, str) and " ".join(text_after.split()) != " ".join(content.split()))
+            )
+        if changed and callable(expire):
+            from memory.groups import _build_group_id
+
+            written_group = _build_group_id(current_visibility, user_id, current_project, current_workspace)
+            logger.warning(
+                "Memory %s changed or was deleted while its graph enrichment ran; "
+                "expiring the episode just written to group %r.", memory_id, written_group,
+            )
+            await asyncio.to_thread(
+                expire,
+                {"memory": content, "metadata": {}, "user_id": user_id},
+                group_id=written_group,
+                memory_id=memory_id,
+            )
+            return {"memory_id": memory_id, "enriched": False, "skipped": "changed_during_enrichment"}
     if not enriched:
         logger.warning(
             "Graph enrichment did not complete for memory %s — it remains "

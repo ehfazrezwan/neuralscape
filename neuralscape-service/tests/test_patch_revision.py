@@ -16,6 +16,9 @@ import pytest
 from memory.edit import RevisionConflict, normalize_expected_revision, revision_of
 from memory_service import MemoryService
 
+M1 = "00000000-0000-4000-8000-000000000001"   # point ids must be canonical UUIDs
+M2 = "00000000-0000-4000-8000-000000000002"
+
 
 def _dig(payload, dotted):
     cur = payload
@@ -138,11 +141,11 @@ def world():
         "unresolved_ids": [],
     })
     svc.fake = fake
-    fake.add("m1")
+    fake.add(M1)
     return svc
 
 
-def _tags(world, pid="m1"):
+def _tags(world, pid=M1):
     return world.fake.points[pid]["metadata"]["tags"]
 
 
@@ -150,52 +153,52 @@ def _tags(world, pid="m1"):
 
 
 def test_a_read_returns_the_revision_and_a_never_patched_row_is_zero(world):
-    assert world.get_memory("m1").revision == "0"
+    assert world.get_memory(M1).revision == "0"
 
 
 def test_the_patch_response_carries_the_new_revision(world):
-    result = world.patch_memory("m1", "ehfaz", {"tags": ["a"]})
+    result = world.patch_memory(M1, "ehfaz", {"tags": ["a"]})
     assert result["memory"].revision == "1"
-    assert world.get_memory("m1").revision == "1"
+    assert world.get_memory(M1).revision == "1"
 
 
 # ── stale precondition: refused, nothing written ──────────────────────
 
 
 def test_stale_revision_is_refused_and_nothing_is_written(world):
-    world.patch_memory("m1", "ehfaz", {"tags": ["winner"]})  # revision 0 -> 1
+    world.patch_memory(M1, "ehfaz", {"tags": ["winner"]})  # revision 0 -> 1
     writes_before = list(world.fake.writes)
 
     with pytest.raises(RevisionConflict) as err:
-        world.patch_memory("m1", "ehfaz", {"tags": ["stale"]}, expected_revision="0")
+        world.patch_memory(M1, "ehfaz", {"tags": ["stale"]}, expected_revision="0")
 
     assert err.value.current_revision == "1" and err.value.expected_revision == "0"
     assert _tags(world) == ["winner"]
     assert world.fake.writes == writes_before          # no write of any kind
-    assert world.get_memory("m1").revision == "1"      # and no revision bump
+    assert world.get_memory(M1).revision == "1"      # and no revision bump
 
 
 def test_stale_content_edit_is_refused_before_any_re_embed(world):
-    world.patch_memory("m1", "ehfaz", {"tags": ["winner"]})
+    world.patch_memory(M1, "ehfaz", {"tags": ["winner"]})
     with pytest.raises(RevisionConflict):
-        world.patch_memory("m1", "ehfaz", {"content": "stale text"}, expected_revision="0")
+        world.patch_memory(M1, "ehfaz", {"content": "stale text"}, expected_revision="0")
     world._memory.update.assert_not_called()
-    assert world.fake.points["m1"]["data"] == "Old content"
+    assert world.fake.points[M1]["data"] == "Old content"
 
 
 def test_two_clients_holding_the_same_revision_cannot_both_win(world):
-    first = world.patch_memory("m1", "ehfaz", {"tags": ["from-a"]}, expected_revision="0")
+    first = world.patch_memory(M1, "ehfaz", {"tags": ["from-a"]}, expected_revision="0")
     assert first["memory"].revision == "1"
     with pytest.raises(RevisionConflict):
-        world.patch_memory("m1", "ehfaz", {"tags": ["from-b"]}, expected_revision="0")
+        world.patch_memory(M1, "ehfaz", {"tags": ["from-b"]}, expected_revision="0")
     assert _tags(world) == ["from-a"]                  # the lost update did not happen
 
 
 def test_a_retag_bumps_the_revision_so_a_concurrent_patch_is_refused(world):
     world.retag_memories("ehfaz", {"category": "personal_fact"}, {"add_tags": ["bulk"]})
-    assert world.get_memory("m1").revision == "1"
+    assert world.get_memory(M1).revision == "1"
     with pytest.raises(RevisionConflict):
-        world.patch_memory("m1", "ehfaz", {"tags": ["x"]}, expected_revision="0")
+        world.patch_memory(M1, "ehfaz", {"tags": ["x"]}, expected_revision="0")
 
 
 # ── race: the other writer lands between our read and our write ───────
@@ -203,12 +206,12 @@ def test_a_retag_bumps_the_revision_so_a_concurrent_patch_is_refused(world):
 
 def test_race_on_a_metadata_patch_loses_atomically(world):
     def interloper(fake):  # lands after our pre-check, before our filtered write
-        fake.points["m1"]["metadata"]["tags"] = ["interloper"]
-        fake.points["m1"]["metadata"]["revision"] = 1
+        fake.points[M1]["metadata"]["tags"] = ["interloper"]
+        fake.points[M1]["metadata"]["revision"] = 1
 
     world.fake.before_filtered_write = interloper
     with pytest.raises(RevisionConflict) as err:
-        world.patch_memory("m1", "ehfaz", {"tags": ["mine"]}, expected_revision="0")
+        world.patch_memory(M1, "ehfaz", {"tags": ["mine"]}, expected_revision="0")
 
     assert err.value.current_revision == "1"
     assert _tags(world) == ["interloper"]               # the filtered write was a server-side no-op
@@ -216,40 +219,40 @@ def test_race_on_a_metadata_patch_loses_atomically(world):
 
 def test_race_on_a_content_edit_loses_before_the_re_embed(world):
     def interloper(fake):
-        fake.points["m1"]["metadata"]["revision"] = 1
+        fake.points[M1]["metadata"]["revision"] = 1
 
     world.fake.before_filtered_write = interloper
     with pytest.raises(RevisionConflict):
-        world.patch_memory("m1", "ehfaz", {"content": "mine"}, expected_revision="0")
+        world.patch_memory(M1, "ehfaz", {"content": "mine"}, expected_revision="0")
     world._memory.update.assert_not_called()
-    assert world.fake.points["m1"]["data"] == "Old content"
+    assert world.fake.points[M1]["data"] == "Old content"
 
 
 # ── correct revision applies ──────────────────────────────────────────
 
 
 def test_matching_revision_applies_a_metadata_patch_and_bumps(world):
-    result = world.patch_memory("m1", "ehfaz", {"tags": ["new"]}, expected_revision="0")
+    result = world.patch_memory(M1, "ehfaz", {"tags": ["new"]}, expected_revision="0")
     assert _tags(world) == ["new"]
-    meta = world.fake.points["m1"]["metadata"]
+    meta = world.fake.points[M1]["metadata"]
     assert meta["revision"] == 1 and meta["owner_user_id"] == "ehfaz"   # untouched keys survive
     assert result["memory"].revision == "1"
 
 
 def test_matching_revision_applies_a_content_edit(world):
-    result = world.patch_memory("m1", "ehfaz", {"content": "New text"}, expected_revision="0")
-    assert world.fake.points["m1"]["data"] == "New text"
-    assert world.fake.points["m1"]["metadata"]["revision"] == 1
+    result = world.patch_memory(M1, "ehfaz", {"content": "New text"}, expected_revision="0")
+    assert world.fake.points[M1]["data"] == "New text"
+    assert world.fake.points[M1]["metadata"]["revision"] == 1
     assert result["memory"].revision == "1"
     # and the next edit must present the new revision
     with pytest.raises(RevisionConflict):
-        world.patch_memory("m1", "ehfaz", {"tags": ["x"]}, expected_revision="0")
-    world.patch_memory("m1", "ehfaz", {"tags": ["x"]}, expected_revision="1")
+        world.patch_memory(M1, "ehfaz", {"tags": ["x"]}, expected_revision="0")
+    world.patch_memory(M1, "ehfaz", {"tags": ["x"]}, expected_revision="1")
 
 
 def test_a_legacy_row_without_a_counter_accepts_revision_zero(world):
-    assert "revision" not in world.fake.points["m1"]["metadata"]
-    world.patch_memory("m1", "ehfaz", {"tags": ["x"]}, expected_revision="0")
+    assert "revision" not in world.fake.points[M1]["metadata"]
+    world.patch_memory(M1, "ehfaz", {"tags": ["x"]}, expected_revision="0")
     assert _tags(world) == ["x"]
 
 
@@ -257,10 +260,10 @@ def test_a_legacy_row_without_a_counter_accepts_revision_zero(world):
 
 
 def test_absent_revision_is_last_writer_wins_as_before(world):
-    world.patch_memory("m1", "ehfaz", {"tags": ["one"]})
-    world.patch_memory("m1", "ehfaz", {"tags": ["two"]})     # no precondition: always applies
+    world.patch_memory(M1, "ehfaz", {"tags": ["one"]})
+    world.patch_memory(M1, "ehfaz", {"tags": ["two"]})     # no precondition: always applies
     assert _tags(world) == ["two"]
-    assert world.get_memory("m1").revision == "2"
+    assert world.get_memory(M1).revision == "2"
     world._memory.vector_store.update.assert_called()       # the historical write path
 
 
@@ -268,10 +271,10 @@ def test_absent_revision_is_last_writer_wins_as_before(world):
 
 
 def test_permission_is_checked_before_the_revision_is_revealed(world):
-    world.fake.add("m2", owner="alice")
-    world.patch_memory("m2", "alice", {"tags": ["x"]})
+    world.fake.add(M2, owner="alice")
+    world.patch_memory(M2, "alice", {"tags": ["x"]})
     with pytest.raises(PermissionError):
-        world.patch_memory("m2", "mallory", {"tags": ["y"]}, expected_revision="0")
+        world.patch_memory(M2, "mallory", {"tags": ["y"]}, expected_revision="0")
 
 
 @pytest.mark.parametrize("raw,canonical", [("3", "3"), ('"3"', "3"), ('W/"3"', "3"), (7, "7"), (None, None)])
@@ -290,3 +293,10 @@ def test_revision_of_tolerates_missing_and_garbage():
     assert revision_of({}) == "0"
     assert revision_of({"revision": "x"}) == "0"
     assert revision_of({"revision": 4}) == "4"
+
+
+def test_the_internal_write_nonce_is_never_returned_in_a_response(world):
+    out = world.patch_memory(M1, "ehfaz", {"tags": ["x"]}, expected_revision="0")
+    assert "revision_nonce" in world.fake.points[M1]["metadata"]     # stored (needed to identify the winner) ...
+    dumped = str(out["memory"].model_dump()) + str(world.get_memory(M1).model_dump())
+    assert "revision_nonce" not in dumped                              # ... but not part of any response model

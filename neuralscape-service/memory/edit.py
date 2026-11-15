@@ -40,7 +40,13 @@ def revision_of(meta: dict | None) -> str:
 
     Rows written before this existed carry no counter and read as ``"0"``. The
     counter is bumped by every ``patch_memory`` and ``retag_memories`` write, so
-    two clients holding the same revision cannot both apply an edit to it.
+    a client holding a stale revision is refused. Guarantee boundary: a revision
+    names ONE state only among *conditional* writers (those sending
+    ``expected_revision``, which use a filtered compare-and-set). An
+    unconditional PATCH and a retag bump the counter by read-then-write, so two
+    of those racing each other (or a conditional writer) can end up with the same
+    token for different states; that is the existing last-writer-wins behaviour
+    they opted into, made visible rather than prevented.
     """
     try:
         return str(max(int((meta or {}).get("revision") or 0), 0))

@@ -354,8 +354,10 @@ LEAVES: tuple[Leaf, ...] = tuple(
 # needs_real_service marks reproductions that are unit-level here and must be
 # repeated against real stores before they count as qualified evidence.
 SCENARIOS: tuple[Scenario, ...] = (
+    # The three retired scenarios below keep needs_real_service=True until the
+    # real-store integration tests (integration_tests/) have run on the gate.
     Scenario("group-id-tuple-collision", "control", ("A1.02", "A1.03"),
-             "test_distinct_namespace_tuples_have_distinct_group_ids", False,
+             "test_distinct_namespace_tuples_have_distinct_group_ids", True,
              "Distinct (user, project) tuples have distinct graph group ids (fixed: injective builder)."),
     Scenario("group-id-distinct-controls", "control", ("A1.02", "A1.03"),
              "test_ordinary_namespace_tuples_stay_distinct", False,
@@ -367,7 +369,7 @@ SCENARIOS: tuple[Scenario, ...] = (
              "test_ordinary_emails_slug_deterministically", False,
              "Ordinary emails slug deterministically and distinctly."),
     Scenario("queued-visibility-publication", "control", ("A7.01", "A7.04"),
-             "test_queued_graph_job_publishes_current_visibility", False,
+             "test_queued_graph_job_publishes_current_visibility", True,
              "A queued graph job publishes the memory's current visibility (fixed), not the one it was enqueued with."),
     Scenario("queued-job-deleted-memory-control", "control", ("A7.01", "A7.02"),
              "test_queued_graph_job_skips_a_deleted_memory", False,
@@ -385,7 +387,7 @@ SCENARIOS: tuple[Scenario, ...] = (
              "test_job_ids_are_stable_and_user_scoped", False,
              "Same inputs give one id and different users give different ids."),
     Scenario("stale-revision-edit", "control", ("A3.01", "A3.02"),
-             "test_patch_request_carries_an_expected_revision", False,
+             "test_patch_request_carries_an_expected_revision", True,
              "The edit request carries an expected-revision precondition (fixed); behaviour is covered in tests/test_patch_revision.py."),
     Scenario("patch-partial-control", "control", ("A3.01",),
              "test_patch_request_applies_only_sent_fields", False,

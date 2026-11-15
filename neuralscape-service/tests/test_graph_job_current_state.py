@@ -87,3 +87,51 @@ def test_unchanged_row_enriches_exactly_as_queued():
     assert out["enriched"] is True
     call = svc.enrich_calls[0]
     assert (call["visibility"], call["project_id"], call["user_id"]) == ("shared", "p", "alice")
+
+
+# ── a change that lands DURING extraction ─────────────────────────────
+
+
+class DuringService(Service):
+    """get_memory returns the queued state first, then ``after`` (what the row became mid-extraction)."""
+
+    def __init__(self, after, **row):
+        super().__init__(**row)
+        self.after = after
+        self.reads = 0
+        self.expired: list[tuple] = []
+
+    def get_memory(self, memory_id):
+        self.reads += 1
+        return self.row if self.reads == 1 else self.after
+
+    def _cascade_or_fallback_expire(self, mem, *, group_id=None, memory_id=""):
+        self.expired.append((mem, group_id, memory_id))
+        return {"resolved": True}
+
+
+def _row_like(**kw):
+    return SimpleNamespace(id="m1", occurred_at=None, **kw)
+
+
+def test_memory_deleted_during_enrichment_has_its_episode_expired():
+    svc = DuringService(None, visibility="private", project_id=None, memory="the text", workspace=None)
+    out = _run(svc, visibility="private")
+    assert out["skipped"] == "changed_during_enrichment" and out["enriched"] is False
+    (mem, group, mid), = svc.expired
+    assert group == "user--alice" and mid == "m1" and mem["memory"] == "the text"
+
+
+def test_memory_narrowed_during_enrichment_has_the_shared_episode_expired():
+    after = _row_like(visibility="private", project_id=None, memory="the text", workspace=None)
+    svc = DuringService(after, visibility="shared", project_id=None, memory="the text", workspace=None)
+    out = _run(svc, visibility="shared")
+    assert out["skipped"] == "changed_during_enrichment"
+    assert svc.expired[0][1] == "shared"          # the group the job wrote to, not the new one
+
+
+def test_unchanged_row_after_enrichment_expires_nothing():
+    after = _row_like(visibility="shared", project_id=None, memory="the text", workspace=None)
+    svc = DuringService(after, visibility="shared", project_id=None, memory="the text", workspace=None)
+    assert _run(svc, visibility="shared")["enriched"] is True
+    assert svc.expired == []

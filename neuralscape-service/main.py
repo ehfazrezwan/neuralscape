@@ -488,7 +488,10 @@ async def delete_memories(
     try:
         result = await asyncio.to_thread(_service.delete_memories, user_id=user_id)
         # Graph cleanup that could not be verified is a partial success.
-        status = "partial" if result.get("graph_cascade_unresolved_ids") else "ok"
+        incomplete = bool(result.get("graph_cascade_unresolved_ids") or result.get("failed_ids") or result.get("truncated"))
+        if result.get("failed_ids") or result.get("truncated"):
+            return JSONResponse(status_code=207, content={"status": "partial", **result})
+        status = "partial" if incomplete else "ok"
         return {"status": status, **result}
     except MemoryListingFailed as e:
         # The service refused because it could not list the rows: nothing was
@@ -3074,7 +3077,11 @@ async def v1_bulk_delete_memories(req: BulkDeleteRequest, request: Request):
     except Exception as e:
         logger.exception("v1 bulk_delete failed")
         raise HTTPException(status_code=500, detail="Failed to delete memories")
-    return await _enqueue_sibling_graph_jobs(result)
+    result = await _enqueue_sibling_graph_jobs(result)
+    if isinstance(result, dict) and (result.get("failed_ids") or result.get("truncated")):
+        # Not everything the caller asked to delete is gone: 207, never a clean 200.
+        return JSONResponse(status_code=207, content={"status": "partial", **result})
+    return result
 
 
 @v1_router.get("/categories", response_model=CategoryListResponse)
