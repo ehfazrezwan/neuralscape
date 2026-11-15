@@ -254,11 +254,17 @@ def batched_anchor_lookup(
 
         for hit in hits:
             payload = getattr(hit, "payload", None) or {}
-            metadata = payload.get("metadata", {})
-            source_ref = metadata.get("source_ref", {})
+            metadata = payload.get("metadata", {}) or {}
+            # Unwrap double-nested metadata if present (same as graph_admin).
+            if isinstance(metadata.get("metadata"), dict):
+                metadata = metadata["metadata"]
+            source_ref = metadata.get("source_ref", {}) or {}
             anchor_key = source_ref.get("external_id", "")
             visibility = metadata.get("visibility", "private")
-            owner = metadata.get("user_id")
+            # Write path (memory/write.py) stores the author at
+            # metadata["owner_user_id"] and top-level payload["user_id"];
+            # it never sets metadata["user_id"].
+            owner = metadata.get("owner_user_id") or payload.get("user_id")
 
             if anchor_key not in memories_by_anchor:
                 continue  # not one of our requested anchors
@@ -271,12 +277,15 @@ def batched_anchor_lookup(
                 readable = True
 
             if readable:
+                hit_id = getattr(hit, "id", None)
                 memory_dict = {
-                    "id": payload.get("id"),
+                    # The Qdrant point id is the memory id; the payload has no "id".
+                    "id": str(hit_id) if hit_id is not None else payload.get("id"),
                     "content": payload.get("data"),
                     "category": metadata.get("category"),
                     "visibility": visibility,
-                    "created_at": metadata.get("created_at"),
+                    # created_at is top-level in the stored payload.
+                    "created_at": payload.get("created_at") or metadata.get("created_at"),
                 }
                 memories_by_anchor[anchor_key].append(memory_dict)
 
