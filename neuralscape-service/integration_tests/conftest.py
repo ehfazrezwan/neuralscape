@@ -85,10 +85,16 @@ def integration_required() -> bool:
 _USERINFO = re.compile(r"(?P<scheme>[A-Za-z][A-Za-z0-9+.\-]*://)(?P<user>[^/:@\s]*):(?P<password>[^/@\s]*)@")
 
 
-def redact(text: str) -> str:
-    """Replace the password in any ``scheme://user:password@host`` in ``text`` with ``***``."""
+_QUERY_SECRET = re.compile(r"(?i)\b(password|passwd|token|secret|api[_-]?key|access[_-]?key)=[^&\s)]+")
+_BEARER = re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=\-]+")
 
-    return _USERINFO.sub(lambda m: f"{m['scheme']}{m['user']}:***@", text)
+
+def redact(text: str) -> str:
+    """Mask URL passwords, ``password=``/``token=``-style parameters and bearer tokens in ``text``."""
+
+    text = _USERINFO.sub(lambda m: f"{m['scheme']}{m['user']}:***@", text)
+    text = _QUERY_SECRET.sub(lambda m: f"{m.group(1)}=***", text)
+    return _BEARER.sub("Bearer ***", text)
 
 
 def unavailable(reason: str) -> None:
@@ -249,19 +255,38 @@ class LiveApi:
     """A running API (with all workers) and the credentials to call it."""
 
     url: str
-    headers: dict = field(default_factory=dict)
+    user_id: str
+    headers: dict = field(default_factory=dict, repr=False)
 
     def __repr__(self) -> str:  # never show the token
-        return f"LiveApi(url={redact(self.url)})"
+        return f"LiveApi(url={redact(self.url)}, user_id={self.user_id!r})"
 
 
 @pytest.fixture(scope="session")
-def live_api() -> LiveApi:
-    """The live API from ``NS_API_URL`` plus ``Authorization: Bearer $NS_API_TOKEN``.
+def api_user():
+    """The per-run API identity: ``.user_id`` and ``.headers`` (Bearer token).
 
-    The token is minted by the gate for a per-run user; use that user's id in
-    requests.  Probed with ``GET /health``.
+    ``NS_API_TOKEN`` (+ ``NS_API_USER``) overrides; otherwise a token is minted
+    from ``NEURALSCAPE_USER_TOKEN_SECRET`` for a unique user id.  Request
+    bodies must carry this user id (the API answers 400 on a mismatch).  With
+    neither configured, an API with auth disabled is assumed and the identity
+    is a unique user id with no credentials.
     """
+
+    from integration_tests.api_identity import ApiIdentity, resolve_identity
+
+    try:
+        identity = resolve_identity()
+    except ValueError as exc:
+        unavailable(str(exc))
+    if identity is None:
+        return ApiIdentity(user_id=f"nsit-api-{uuid.uuid4().hex[:12]}", token="")
+    return identity
+
+
+@pytest.fixture(scope="session")
+def live_api(api_user) -> LiveApi:
+    """The live API from ``NS_API_URL``, probed with ``GET /health``, plus the ``api_user`` identity."""
 
     url = _env("NS_API_URL")
     if not url:
@@ -276,8 +301,8 @@ def live_api() -> LiveApi:
         error = f"{type(exc).__name__}: {exc}"
     if error:
         unavailable(f"the API at {url} is unreachable ({error})")
-    token = _env("NS_API_TOKEN")
-    return LiveApi(url=url, headers={"Authorization": f"Bearer {token}"} if token else {})
+    headers = api_user.headers if api_user.token else {}
+    return LiveApi(url=url, user_id=api_user.user_id, headers=headers)
 
 
 # --------------------------------------------------------------------------

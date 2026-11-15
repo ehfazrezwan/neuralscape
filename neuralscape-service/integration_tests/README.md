@@ -26,7 +26,8 @@ Copy `test_flag_on_exemplar.py`. The fixtures (`conftest.py`):
 | `neo4j_conn` | Neo4j only (for tests that need no other store; the snapshot job uses it) |
 | `llm_key` | the `GOOGLE_API_KEY` value (ask for it only if the test spends LLM calls; never print it) |
 | `pg_dsn` | the PostgreSQL+pgvector DSN (`NS_TEST_PG_DSN`), probed |
-| `live_api` | `.url` and `.headers` (Bearer token) of the running API + workers |
+| `api_user` | `.user_id` and `.headers` (Bearer token) of the per-run API identity |
+| `live_api` | `.url`, `.user_id` and `.headers` of the running API + workers |
 | `flags(**fields)` | turns Settings fields on for this one test, e.g. `flags(standards_enabled=True)` |
 | `unique_ns` | unique `user_id`, `project_id`, `qdrant_collection`, `group_prefix` (all carry `nsit`) and `unique_ns.on_cleanup(fn)` |
 
@@ -43,7 +44,7 @@ changed by setattr; import or `importlib.reload` that module after calling
 Redis keys). Leftovers from a crashed run are findable by the `nsit` prefix.
 
 **Missing infrastructure.** With `NS_INTEGRATION_REQUIRED=1` (the VPS gate sets
-it) an unreachable store or missing key **fails** the test (a fixture error, exit status 1); without it the test
+it) an unreachable store or missing key **fails** the test; without it the test
 **skips** with the reason. Never silently pass.
 
 **Zero skips on the gate.** The gate sets `NS_INTEGRATION_REQUIRED=1`, so
@@ -60,27 +61,40 @@ ideally (4) shows the flag-off contrast. State the test id in the PR body.
 
 ## Environment contract
 
-A test may rely on exactly these variables and nothing else (the gate sets
-them; nothing else is guaranteed):
+A test may rely on exactly these variables and nothing else. The gate sets them.
 
-| variable | meaning | fixture |
+| Variable | Meaning | Fixture |
 |---|---|---|
 | `NS_INTEGRATION_REQUIRED` | `1` on the gate: missing infrastructure fails instead of skipping | all |
-| `NEO4J_URI`, `NEO4J_USER`, `NEO4J_PASSWORD`, `NEO4J_DATABASE` | Neo4j | `stores` |
+| `NEO4J_URI`, `NEO4J_USER`, `NEO4J_PASSWORD`, `NEO4J_DATABASE` | Neo4j | `stores`, `neo4j_conn` |
 | `QDRANT_URL` | Qdrant | `stores` |
 | `REDIS_URL` | Redis | `stores` |
-| `GOOGLE_API_KEY` | real Gemini key | `neo4j_conn` | Neo4j only (for tests that need no other store; the snapshot job uses it) |
-| `llm_key` |
+| `GOOGLE_API_KEY` | a real Gemini key | `llm_key` |
 | `NS_TEST_PG_DSN` | PostgreSQL with pgvector | `pg_dsn` |
-| `NS_API_URL`, `NS_API_TOKEN` | live API plus the three workers; the token is minted for a per-run user against the stack's user-token secret | `live_api` (`.url`, `.headers`) |
+| `NS_API_URL` | the live API (with the three workers) | `live_api` |
+| `NEURALSCAPE_USER_TOKEN_SECRET` | the stack's own user-token secret; a per-run token is minted from it | `api_user`, `live_api` |
+| `NS_API_TOKEN`, `NS_API_USER` | optional override of the minted identity | `api_user`, `live_api` |
 
 The gate also sets `LEDGER_TEST_PG_DSN`, `ENGINE_TEST_PG_DSN`,
 `USAGE_TEST_PG_DSN` and `AUTHORITY_TEST_PG_DSN` to the same DSN as
-`NS_TEST_PG_DSN`, for the Phase 2 slices whose tests read those names.
+`NS_TEST_PG_DSN`, for Phase 2 slices whose tests read those names. Phase 2
+slice 1 shipped its PostgreSQL and Redis tests under `tests/` with `skipif`
+guards (declared in the skip manifest); the expected home is
+`integration_tests/` using `pg_dsn` / `stores`, and they are being moved there.
 
-`tests/test_async_pipeline.py` reads `NS_API_URL` (default
-`http://localhost:8199`) and `NS_API_TOKEN` (sent as a Bearer token), and fails
-instead of skipping when the API is unreachable and `NS_INTEGRATION_REQUIRED=1`.
+**Fail versus skip.** Missing infrastructure fails the test (a fixture error,
+exit status 1) when `NS_INTEGRATION_REQUIRED=1` **or** `GITHUB_ACTIONS=true`
+(so the snapshot CI job can never go green by skipping); otherwise it skips
+with the reason.
+
+**Live API identity.** `api_user` / `live_api` mint a short-lived token with the
+service's own `tokens.issue_user_token` for a unique user id and send it as
+`Authorization: Bearer`. The identity comes from the token, so request bodies
+must carry `api_user.user_id` (the API answers 400 on a mismatch).
+`tests/test_async_pipeline.py` does the same through
+`integration_tests/api_identity.py` and reads `NS_API_URL` (default
+`http://localhost:8199`); it fails instead of skipping when the API is
+unreachable and `NS_INTEGRATION_REQUIRED=1`.
 
 ## The VPS gate command
 

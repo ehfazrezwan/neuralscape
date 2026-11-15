@@ -29,7 +29,7 @@ User-triggered alternative to the automatic UserPromptSubmit threshold. Useful w
 
 5. Confirm to the user how many memories were stored vs. how many observations were skipped as noise.
 
-6. If the buffer file is present but empty, tell the user "nothing to capture" and truncate it (and remove any `.stale` marker) so the buffer is reset — mirroring how `compile-observations` treats an empty/noisy buffer, so the manual and automatic flows stay consistent.
+6. If the buffer file is present but empty, tell the user "nothing to capture" and truncate it with the `Write` tool and content `""` so the buffer is reset (leave any `.ended` marker beside it alone: the next SessionStart removes the marker of an empty buffer) — mirroring how `compile-observations` treats an empty/noisy buffer, so the manual and automatic flows stay consistent.
 
 ## Privacy reminder
 

@@ -5,7 +5,7 @@ Prerequisites — these services must be running:
   - Qdrant on localhost:6333
   - Neo4j on localhost:7687
   - API server on localhost:8199  (uv run python main.py), or NS_API_URL
-    (with NS_API_TOKEN as the Bearer token when the API enforces auth)
+    (auth: NS_API_TOKEN, or a token minted from NEURALSCAPE_USER_TOKEN_SECRET)
   - ARQ worker                    (uv run arq worker.WorkerSettings)
 
 Run:
@@ -24,7 +24,14 @@ import httpx
 import pytest
 
 BASE_URL = (os.environ.get("NS_API_URL") or "http://localhost:8199").rstrip("/")
-API_TOKEN = os.environ.get("NS_API_TOKEN", "")
+# Identity from the token (NS_API_TOKEN, or minted from NEURALSCAPE_USER_TOKEN_SECRET); the
+# body user_id must equal it (the API answers 400 on a mismatch).  See
+# integration_tests/api_identity.py.  No auth configured -> an auth-disabled API.
+from integration_tests.api_identity import resolve_identity  # noqa: E402
+
+_IDENTITY = resolve_identity()
+API_TOKEN = _IDENTITY.token if _IDENTITY else ""
+USER_ID = _IDENTITY.user_id if _IDENTITY else "test-async-pipeline"
 REQUIRED = os.environ.get("NS_INTEGRATION_REQUIRED", "").strip().lower() in {"1", "true", "yes", "on"}
 POLL_INTERVAL = 5  # seconds between status polls
 POLL_TIMEOUT = 300  # max seconds to wait for task completion (LLM + Neo4j writes are slow)
@@ -108,7 +115,7 @@ class TestAsyncRawMemoryStore:
             f"{BASE_URL}/v1/memories/raw",
             json={
                 "content": "Integration test: prefers 4-space indentation",
-                "user_id": "test-async-pipeline",
+                "user_id": USER_ID,
                 "category": "preference",
             },
             timeout=10,
@@ -124,7 +131,7 @@ class TestAsyncRawMemoryStore:
             f"{BASE_URL}/v1/memories/raw",
             json={
                 "content": "Integration test: uses vim keybindings",
-                "user_id": "test-async-pipeline",
+                "user_id": USER_ID,
                 "category": "preference",
             },
             timeout=10,
@@ -147,7 +154,7 @@ class TestAsyncRawMemoryStore:
             f"{BASE_URL}/v1/memories/raw",
             json={
                 "content": "test",
-                "user_id": "test-async-pipeline",
+                "user_id": USER_ID,
                 "category": "invalid_category",
             },
             timeout=10,
@@ -160,7 +167,7 @@ class TestAsyncRawMemoryStore:
             f"{BASE_URL}/v1/memories/raw",
             json={
                 "content": "test",
-                "user_id": "test-async-pipeline",
+                "user_id": USER_ID,
                 "category": "tech_stack",
                 "scope": "project",
             },
@@ -184,7 +191,7 @@ class TestAsyncConversationExtraction:
                     {"role": "user", "content": "I prefer Python over JavaScript for backend work."},
                     {"role": "assistant", "content": "Noted, Python is your preferred backend language."},
                 ],
-                "user_id": "test-async-pipeline",
+                "user_id": USER_ID,
             },
             timeout=10,
         )
@@ -201,7 +208,7 @@ class TestAsyncConversationExtraction:
                     {"role": "user", "content": "I always use pytest for testing. My timezone is UTC+6."},
                     {"role": "assistant", "content": "Got it, pytest for tests and UTC+6 timezone."},
                 ],
-                "user_id": "test-async-pipeline",
+                "user_id": USER_ID,
             },
             timeout=10,
         )
@@ -234,7 +241,7 @@ class TestTaskStatusPolling:
             f"{BASE_URL}/v1/memories/raw",
             json={
                 "content": "Integration test: status transition check",
-                "user_id": "test-async-pipeline",
+                "user_id": USER_ID,
                 "category": "interaction",
             },
             timeout=10,
@@ -266,7 +273,7 @@ class TestSyncSearch:
             f"{BASE_URL}/v1/search",
             json={
                 "query": "indentation preference",
-                "user_id": "test-async-pipeline",
+                "user_id": USER_ID,
             },
             timeout=30,
         )
@@ -287,7 +294,7 @@ class TestLegacyAsyncEndpoint:
             f"{BASE_URL}/memories/async",
             json={
                 "messages": [{"role": "user", "content": "Legacy test memory"}],
-                "user_id": "test-async-pipeline",
+                "user_id": USER_ID,
             },
             timeout=10,
         )
@@ -302,7 +309,7 @@ class TestLegacyAsyncEndpoint:
             f"{BASE_URL}/memories/async",
             json={
                 "messages": [{"role": "user", "content": "Legacy status check"}],
-                "user_id": "test-async-pipeline",
+                "user_id": USER_ID,
             },
             timeout=10,
         )
