@@ -138,4 +138,18 @@ echo "==> Running adapter tests..."
 uv run pytest tests/ --ignore=tests/test_async_pipeline.py -v
 
 echo ""
+echo "==> Running fork smoke tests (real Qdrant/Neo4j; the mocked suite cannot catch fork breakage)..."
+# The unit suite above mocks every store, so a sync that changes mem0's Memory
+# internals, a Qdrant store signature or Graphiti's episode pipeline passes it.
+# integration_tests/test_fork_smoke.py exercises those paths for real. It needs
+# QDRANT_URL (+ NEO4J_*, REDIS_URL) and GOOGLE_API_KEY for the one LLM test; without
+# NS_INTEGRATION_REQUIRED=1 it skips when they are missing -- a skip is NOT a pass.
+if [ -n "${QDRANT_URL:-}" ]; then
+    NS_INTEGRATION_REQUIRED=1 uv run pytest integration_tests/test_fork_smoke.py -v -p no:cacheprovider
+else
+    echo "  SKIPPED: QDRANT_URL is not set. Before merging this sync, start the stores and run:"
+    echo "    cd neuralscape-service && NS_INTEGRATION_REQUIRED=1 uv run pytest integration_tests/test_fork_smoke.py -v"
+fi
+
+echo ""
 echo "Sync complete."

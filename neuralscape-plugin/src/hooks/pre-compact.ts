@@ -42,7 +42,7 @@ import {
   neuralscapePost,
   outputContinue,
   parseStdin,
-  recordTransportFailure,
+  recordFailure,
   resetTransportFailures,
   writeLocalCompactSnapshot,
 } from "../utils.js";
@@ -114,8 +114,8 @@ async function main(): Promise<void> {
     } catch (error) {
       // Transport failure → log + count toward the fail-loud threshold
       // surfaced at next SessionStart. The compact itself is unaffected.
-      await recordTransportFailure();
-      logError("compact snapshot store failed (service unreachable?)", error);
+      const { kind } = await recordFailure(error);
+      logError(`compact snapshot store failed (${kind})`, error);
     }
   } catch (error) {
     logError("pre-compact hook failed", error);
