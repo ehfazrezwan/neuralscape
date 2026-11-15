@@ -380,6 +380,19 @@ class TestTokenRevocation:
         monkeypatch.setattr(settings, "neuralscape_revoked_tokens", token_fingerprint(tok))
         assert oauth.verify_user_token(tok, SECRET) is None
 
+    def test_unreadable_revocation_list_fails_closed(self, monkeypatch):
+        tok = issue_user_token("alice", SECRET, 3600)
+
+        # A value the CSV parser cannot split: parsing raises.
+        monkeypatch.setattr(settings, "neuralscape_revoked_tokens", None)
+        assert verify_user_token(tok, SECRET) is None
+
+    def test_unreadable_revocation_list_is_401_at_the_middleware(self, service, monkeypatch):
+        tok = issue_user_token("alice", SECRET, 3600)
+        monkeypatch.setattr(settings, "neuralscape_revoked_tokens", None)
+        resp = _list(TestClient(app, raise_server_exceptions=False), None, self._headers(tok))
+        assert resp.status_code == 401
+
     def test_empty_list_changes_nothing(self):
         assert settings.revoked_token_digests() == set()
 

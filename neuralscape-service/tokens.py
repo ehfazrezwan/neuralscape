@@ -33,18 +33,19 @@ def token_fingerprint(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
-def _revoked_digests() -> set[str]:
-    """Digests listed in ``NEURALSCAPE_REVOKED_TOKENS`` (empty when unset).
+def _revoked_digests() -> set[str] | None:
+    """Digests listed in ``NEURALSCAPE_REVOKED_TOKENS`` (empty set when unset).
 
     Read from the live settings object so a test or operator override applies
-    immediately. If settings cannot be imported (a bare admin CLI without the
-    service deps) nothing is revoked, which is the pre-revocation behaviour.
+    immediately. Returns ``None`` when the list cannot be read or parsed:
+    callers must then FAIL CLOSED and reject the token, never accept it.
     """
     try:
         from config import settings
-    except Exception:  # pragma: no cover - settings unavailable in a bare CLI
-        return set()
-    return settings.revoked_token_digests()
+
+        return settings.revoked_token_digests()
+    except Exception:  # noqa: BLE001 - unreadable revocation list must not accept tokens
+        return None
 
 
 def sign_payload(claims: dict, secret: str) -> str:
@@ -178,6 +179,8 @@ def verify_user_token(token: str, secret: str) -> dict | None:
     if payload is None:
         return None
     revoked = _revoked_digests()
+    if revoked is None:  # revocation list unreadable: fail closed
+        return None
     if revoked and token_fingerprint(token) in revoked:
         return None
     user_id = payload.get("user_id")

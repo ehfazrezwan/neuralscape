@@ -140,9 +140,15 @@ NEURALSCAPE_REVOKED_TOKENS=<digest>[,<digest>...]
 ```
 
 A revoked token is rejected with 401 on REST and MCP, and cannot be pasted into
-the OAuth consent screen. The list holds digests only, never tokens. It covers
-the exact token string: a refresh token the user already holds is not
-affected, and rotating `NEURALSCAPE_USER_TOKEN_SECRET` invalidates every token.
+the OAuth consent screen. The list holds digests only, never tokens. If the list
+cannot be read, per-user tokens are rejected (fail closed). Limits, plainly:
+
+- Revoking needs an env edit and a restart.
+- It covers the exact token string only.
+- OAuth refresh tokens and sessions already minted from a leaked token are not
+  revoked (refresh rotation is a separate change).
+- Rotate `NEURALSCAPE_USER_TOKEN_SECRET` to invalidate every token.
+- Existing non-expiring tokens keep verifying unless revoked or the secret rotates.
 
 `scripts/issue_user_token.py --days N` requires `N >= 1`; a token with no
 expiry needs the explicit `--no-expiry` flag.
