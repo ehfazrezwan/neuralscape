@@ -402,9 +402,12 @@ SCENARIOS: tuple[Scenario, ...] = (
     Scenario("readiness-controls", "control", ("G2.03",),
              "test_health_reports_an_uninitialized_vector_store_as_degraded", False,
              "An uninitialized store and an unreachable queue are already reported."),
-    Scenario("backup-covers-compose-volumes", "expected-failure", ("G3.05", "G3.06"),
+    # Fixed by scripts/backup-volumes.sh: the former expected failure is now a
+    # passing control. needs_real_service stays True until the script has run
+    # against real stores (VPS gate / batch verification).
+    Scenario("backup-covers-compose-volumes", "control", ("G3.05", "G3.06"),
              "test_compose_backup_tooling_covers_every_persistent_volume", True,
-             "No compose backup tooling names the persistent volumes."),
+             "Compose backup tooling (scripts/backup-volumes.sh) names every persistent volume."),
     Scenario("backup-volume-controls", "control", ("G3.05",),
              "test_compose_declares_the_persistent_volumes", False,
              "The compose file declares the stores a backup must cover."),
