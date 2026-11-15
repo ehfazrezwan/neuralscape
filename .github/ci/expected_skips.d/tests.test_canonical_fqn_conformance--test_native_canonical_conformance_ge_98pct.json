@@ -1,0 +1,9 @@
+{
+  "test": "tests.test_canonical_fqn_conformance::test_native_canonical_conformance_ge_98pct",
+  "reason_contains": "small-py corpus not present",
+  "profiles": [
+    "container",
+    "host"
+  ],
+  "why": "missing corpus: the small-py conformance corpus is not shipped in this tree"
+}

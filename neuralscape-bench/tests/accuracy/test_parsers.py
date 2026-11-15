@@ -72,8 +72,16 @@ def test_dmr_parse_sessions_and_qa():
     assert conv.conv_id == "valid_9"
     assert len(conv.sessions) == 2  # 1 previous + final
     assert conv.sessions[0].date == "3 days before the final session"
-    # bare {"text"} turns alternate Speaker 1 / Speaker 2
-    assert conv.sessions[0].turns[0].content.startswith("Speaker 1:")
+    # Deterministic event time: fixed anchor minus time_back ("3 days ago"),
+    # final session at the anchor itself.
+    assert conv.sessions[0].occurred_at == "2025-12-29T12:00:00+00:00"
+    assert conv.sessions[1].occurred_at == "2026-01-01T12:00:00+00:00"
+    # bare {"text"} turns alternate Speaker 1 / Speaker 2. Identity travels
+    # on role/speaker ONLY — no "Speaker N:" text prefix (run-3 failure
+    # analysis: the literal prefix gave the extractor a second channel it
+    # distilled into unresolvable "Speaker 2 ..." memories).
+    assert not conv.sessions[0].turns[0].content.startswith("Speaker 1:")
+    assert conv.sessions[0].turns[0].speaker == "Speaker 1"
     assert conv.sessions[0].turns[1].role == "assistant"
     [qa] = data.qa_items
     assert qa.question == "What do I do for a living?"
@@ -136,6 +144,27 @@ def test_convomem_ids_namespaced_by_category():
                             file_stem="x" * 40)
     uid = bench_user_id("convomem", c.conversations[0].conv_id)
     assert len(uid) <= 100
+
+
+def test_convomem_load_same_stem_across_categories_has_distinct_join_keys(tmp_path):
+    """End to end through ``load``: the same file name under two category dirs
+    must yield distinct qa_ids, conv_ids, NS user ids, and answer/judge resume
+    keys ``(qa_id, qtype)``; the judge's ``qa_id`` lookup must keep all of them."""
+    import json
+
+    from neuralscape_bench.accuracy.schema import bench_user_id
+
+    for cat in ("user_evidence", "preference_evidence"):
+        (tmp_path / cat).mkdir()
+        (tmp_path / cat / "same_stem.json").write_text(json.dumps(fixtures.CONVOMEM_FILE))
+    data = convomem.load(tmp_path)
+    assert len(data.qa_items) == 2
+    assert len({qa.qa_id for qa in data.qa_items}) == 2
+    assert len({c.conv_id for c in data.conversations}) == 2
+    assert len({bench_user_id("convomem", c.conv_id) for c in data.conversations}) == 2
+    assert len({(qa.qa_id, qa.qtype) for qa in data.qa_items}) == 2
+    # judge.py builds ``{qa.qa_id: qa}``: a collision would silently drop one.
+    assert len({qa.qa_id: qa for qa in data.qa_items}) == len(data.qa_items)
 
 
 # ── MemBench ──
