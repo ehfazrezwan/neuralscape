@@ -114,6 +114,64 @@ def test_valid_non_ascii_text_is_still_read(tmp_path) -> None:
     assert [item.note for item in read.records] == ["caf\u00e9 \u2713"] and read.invalid_lines == ()
 
 
+def _append_raw(writer, *chunks: bytes) -> None:
+    with open(writer.path, "ab") as handle:
+        for chunk in chunks:
+            handle.write(chunk + b"\n")
+
+
+def test_a_duplicated_key_is_an_invalid_line_named_as_a_duplicate_not_a_silent_last_wins(tmp_path) -> None:
+    writer = ev.EvidenceWriter(tmp_path / "e.jsonl")
+    writer.write(record("r1"))
+    good = record("r2", verdict="unexpected_failure").model_dump_json()
+    top = record("r3").model_dump_json().replace('"verdict":"baseline_pass"', '"verdict":"baseline_pass","verdict":"unexpected_failure"').encode()
+    nested = record("r4").model_dump_json().replace('"key":"a"', '"key":"a","key":"b"').encode()
+    assert b'"verdict":"unexpected_failure"' in top and b'"key":"b"' in nested
+    _append_raw(writer, top, nested, good.encode())
+    read = writer.read()
+    assert [item.record_id for item in read.records] == ["r1", "r2"]
+    assert read.invalid_lines == (2, 3) and read.duplicate_key_lines == (2, 3)
+
+
+def test_a_line_without_a_duplicate_is_not_named_as_one(tmp_path) -> None:
+    writer = ev.EvidenceWriter(tmp_path / "e.jsonl")
+    writer.write(record("r1"))
+    _append_raw(writer, b"{not json}")
+    read = writer.read()
+    assert read.invalid_lines == (2,) and read.duplicate_key_lines == ()
+
+
+@pytest.mark.parametrize(
+    "blank",
+    ["\u00a0", "\x0b", "\x0c", "\u2028", "\u3000", "\u00a0\u00a0 "],
+    ids=["nbsp", "vertical-tab", "form-feed", "line-separator", "ideographic-space", "mixed"],
+)
+def test_a_line_of_non_json_whitespace_is_reported_not_skipped(tmp_path, blank) -> None:
+    writer = ev.EvidenceWriter(tmp_path / "e.jsonl")
+    writer.write(record("r1"))
+    _append_raw(writer, blank.encode(), record("r2").model_dump_json().encode())
+    read = writer.read()
+    assert [item.record_id for item in read.records] == ["r1", "r2"] and read.invalid_lines == (2,)
+
+
+def test_json_whitespace_only_lines_are_still_skipped(tmp_path) -> None:
+    writer = ev.EvidenceWriter(tmp_path / "e.jsonl")
+    writer.write(record("r1"))
+    with open(writer.path, "ab") as handle:
+        handle.write(b"\n   \n\t\n\r\n \t\r\n")
+    writer.write(record("r2"))
+    read = writer.read()
+    assert [item.record_id for item in read.records] == ["r1", "r2"] and read.invalid_lines == ()
+
+
+def test_a_deeply_nested_line_is_an_invalid_line_not_a_crash(tmp_path) -> None:
+    writer = ev.EvidenceWriter(tmp_path / "e.jsonl")
+    writer.write(record("r1"))
+    _append_raw(writer, b"[" * 200_000, b'{"a":' * 50_000 + b"1" + b"}" * 50_000)
+    read = writer.read()
+    assert [item.record_id for item in read.records] == ["r1"] and read.invalid_lines == (2, 3)
+
+
 # ---- cleanup deletes only recorded ids
 
 def test_cleanup_deletes_only_the_manifest_ids() -> None:

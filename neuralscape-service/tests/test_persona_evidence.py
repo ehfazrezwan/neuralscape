@@ -657,3 +657,117 @@ def test_every_command_branch_turns_an_unsafe_path_into_exit_two_with_a_diagnost
     assert pe.main(["run", "--service-dir", str(tmp_path), "--role", "baseline", "--subject-ref", "t",
                     "--oracles", str(ORACLES), "--out", str(tmp_path / "x.lock")]) == 2
     assert "error" in capsys.readouterr().err
+
+
+# ---- the report command reads the file once and reports what it cannot read
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores file permissions")
+def test_an_unreadable_evidence_file_is_a_one_line_refusal_not_a_traceback(tmp_path, capsys) -> None:
+    out = tmp_path / "evidence.jsonl"
+    pe.run(tmp_path, "baseline", "tree-a", ORACLES, out, "run-1")
+    out.chmod(0)
+    report = tmp_path / "report.md"
+    try:
+        code = pe.main(["report", "--evidence", str(out), "--out", str(report)])
+    finally:
+        out.chmod(0o600)
+    assert code == 2 and not report.exists()
+    assert len(capsys.readouterr().err.strip().splitlines()) == 1
+
+
+def test_a_file_that_disappears_after_the_existence_check_is_not_an_empty_successful_report(tmp_path, monkeypatch, capsys) -> None:
+    gone = tmp_path / "evidence.jsonl"
+    monkeypatch.setattr(Path, "is_file", lambda self: True)   # the check passes, then the read finds nothing
+    report = tmp_path / "report.md"
+    code = pe.main(["report", "--evidence", str(gone), "--out", str(report)])
+    assert code == 2 and not report.exists()
+    assert "evidence" in capsys.readouterr().err
+
+
+def test_the_report_names_a_duplicated_key_and_exits_nonzero(tmp_path) -> None:
+    out = tmp_path / "evidence.jsonl"
+    pe.run(tmp_path, "baseline", "tree-a", ORACLES, out, "run-1")
+    lines = out.read_bytes().split(b"\n")
+    assert b'"verdict":"' in lines[0]
+    lines[0] = lines[0].replace(b'"verdict":"', b'"verdict":"blocked","verdict":"', 1)
+    out.write_bytes(b"\n".join(lines))
+    report = tmp_path / "report.md"
+    code = pe.main(["report", "--evidence", str(out), "--out", str(report)])
+    text = report.read_text().lower()
+    assert code == 2 and "duplicate" in text and "invalid line" in text
+
+
+def test_the_report_flags_a_line_of_non_json_whitespace(tmp_path) -> None:
+    out = tmp_path / "evidence.jsonl"
+    pe.run(tmp_path, "baseline", "tree-a", ORACLES, out, "run-1")
+    with out.open("ab") as handle:
+        handle.write("\u00a0\n".encode())
+    report = tmp_path / "report.md"
+    assert pe.main(["report", "--evidence", str(out), "--out", str(report)]) == 2
+    assert "invalid line" in report.read_text().lower()
+
+
+# ---- the tenant refusal is recognised only from pydantic's own validation error
+
+def _missing_tenant_error():
+    import pydantic
+
+    class Handle(pydantic.BaseModel):
+        tenant_id: str
+
+    try:
+        Handle()
+    except pydantic.ValidationError as error:
+        return error
+    raise AssertionError("unreachable")
+
+
+def test_only_pydantics_own_missing_field_error_is_a_recognised_refusal() -> None:
+    import pydantic
+
+    real = _missing_tenant_error()
+    assert persona_probes._is_missing_field(real, "tenant_id") is True
+    assert persona_probes._is_missing_field(real, "other") is False
+
+    class Lookalike(Exception):
+        def errors(self):
+            return [{"type": "missing", "loc": ("tenant_id",)}]
+
+    assert persona_probes._is_missing_field(Lookalike(), "tenant_id") is False
+
+    class LyingItem(dict):
+        def get(self, key, default=None):
+            return {"type": "missing", "loc": ("tenant_id",)}.get(key, default)
+
+    class LyingErrors(Exception):
+        def errors(self):
+            return [LyingItem(type="int_parsing", loc=("id",))]
+
+    assert persona_probes._is_missing_field(LyingErrors(), "tenant_id") is False
+
+    class Other(pydantic.BaseModel):
+        id: int
+
+    try:
+        Other(id="x")
+    except pydantic.ValidationError as other:
+        assert persona_probes._is_missing_field(other, "tenant_id") is False
+
+
+def test_a_target_handle_that_raises_a_lookalike_refusal_is_an_invalid_attempt(tmp_path) -> None:
+    tree = tmp_path / "tree"
+    tree.mkdir()
+    (tree / "contracts_references.py").write_text(
+        "class Lookalike(Exception):\n"
+        "    def errors(self):\n"
+        "        return [{'type': 'missing', 'loc': ('tenant_id',)}]\n"
+        "\n"
+        "class ReferenceHandle:\n"
+        "    model_fields = {'cross_tenant': None}\n"
+        "    def __init__(self, **kwargs):\n"
+        "        if 'tenant_id' in kwargs:\n"
+        "            return\n"
+        "        raise Lookalike()\n"
+    )
+    result = pe.observe(tree)["persona-citation-resolution"]
+    assert "facts" not in result and "error" in result, result

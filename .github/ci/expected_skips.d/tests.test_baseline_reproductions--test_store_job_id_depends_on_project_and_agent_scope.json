@@ -1,0 +1,9 @@
+{
+  "test": "tests.test_baseline_reproductions::test_store_job_id_depends_on_project_and_agent_scope",
+  "reason_contains": "the extraction job id is built from message text",
+  "profiles": [
+    "container",
+    "host"
+  ],
+  "why": "pinned bug: strict-xfail reproduction in test_baseline_reproductions; git rm this file in the PR that fixes the bug"
+}

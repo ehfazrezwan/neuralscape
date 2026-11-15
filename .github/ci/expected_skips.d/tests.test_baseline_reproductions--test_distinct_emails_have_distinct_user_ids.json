@@ -1,0 +1,9 @@
+{
+  "test": "tests.test_baseline_reproductions::test_distinct_emails_have_distinct_user_ids",
+  "reason_contains": "legacy email slugging collapses every disallowed",
+  "profiles": [
+    "container",
+    "host"
+  ],
+  "why": "pinned bug: strict-xfail reproduction in test_baseline_reproductions; git rm this file in the PR that fixes the bug"
+}
