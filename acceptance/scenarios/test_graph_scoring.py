@@ -23,6 +23,15 @@ def check_graph_row_has_numeric_score(client, fact: Fact) -> None:
     scored = [r for r in graph_rows if isinstance(r.get("score"), (int, float))]
     assert scored, f"{len(graph_rows)} graph rows, none with a numeric score: {[r.get('score') for r in graph_rows]}"
     assert all(0.0 <= r["score"] <= 1.0 for r in scored), "graph score outside [0, 1]"
+    # The query IS the stored fact's text, and the edge is extracted from it, so
+    # the best graph row must be a close semantic match. A prefix comparison of
+    # unrelated halves (the failure mode if the MRL premise were false) scores
+    # near zero or at an arbitrary mid value; a real match is well above 0.5.
+    # The exact value is checked against directly computed real vectors in
+    # integration_tests/test_graph_embedding_mrl_gemini.py (a black-box scenario
+    # cannot embed text itself).
+    best = max(r["score"] for r in scored)
+    assert best >= 0.5, f"best graph score {best:.3f} is too low for a row derived from the query text"
 
 
 @proves(

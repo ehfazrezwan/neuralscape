@@ -181,14 +181,17 @@ def _fit_vector_to_collection(vec: list | None) -> list | None:
     collection (``VECTOR_EMBEDDING_DIMS``).
 
     Longer MRL vectors are truncated to the collection dimension and
-    re-normalised; longer non-MRL vectors cannot be searched with and yield
-    ``None`` (caller treats the row as having no stored embedding). Vectors
-    already at or below the collection dimension pass through unchanged.
+    re-normalised. Longer non-MRL vectors and vectors SHORTER than the
+    collection dimension cannot be searched with and yield ``None`` (caller
+    treats the row as having no stored embedding). A vector already at the
+    collection dimension passes through unchanged.
     """
     if not vec:
+        return None
+    if len(vec) == VECTOR_EMBEDDING_DIMS:
         return vec
-    if len(vec) <= VECTOR_EMBEDDING_DIMS:
-        return vec
+    if len(vec) < VECTOR_EMBEDDING_DIMS:
+        return None
     if not _graph_vectors_mrl_comparable():
         return None
     try:

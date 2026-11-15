@@ -783,6 +783,26 @@ class Settings(BaseSettings):
         return seen
 
     @model_validator(mode="after")
+    def _warn_ambient_embedding_dim(self) -> "Settings":
+        # The Graphiti embedder dimension used to come from the ambient
+        # EMBEDDING_DIM env (Graphiti's default 1024). GRAPHITI_EMBEDDING_DIM
+        # now wins; say so when an operator's old variable disagrees.
+        ambient = os.environ.get("EMBEDDING_DIM", "").strip()
+        if ambient and ambient != str(self.graphiti_embedding_dim):
+            logging.getLogger(__name__).warning(
+                "EMBEDDING_DIM=%s is set but GRAPHITI_EMBEDDING_DIM=%s is what "
+                "the Graphiti embedder now uses (new graph vectors are written "
+                "at %s). If your stored graph vectors are %s-d, set "
+                "GRAPHITI_EMBEDDING_DIM=%s; see docs/GRAPH_EMBEDDING_DIMENSION.md.",
+                ambient,
+                self.graphiti_embedding_dim,
+                self.graphiti_embedding_dim,
+                ambient,
+                ambient,
+            )
+        return self
+
+    @model_validator(mode="after")
     def _validate_extraction_windowing(self) -> "Settings":
         # Cross-field check (Copilot review, PR #124): overlap >= window
         # would make the split non-advancing. The splitter also clamps

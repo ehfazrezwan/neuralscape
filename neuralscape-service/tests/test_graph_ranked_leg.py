@@ -76,6 +76,12 @@ def service():
     return svc
 
 
+def _pad768(vec):
+    """Toy vector padded to the Qdrant collection's dimension: decoration only
+    queries Qdrant with vectors it can actually search with (768-d)."""
+    return list(vec) + [0.0] * (768 - len(vec))
+
+
 def _graph_result(edges):
     return {"edges": edges, "nodes": [], "episodes": [], "communities": []}
 
@@ -441,7 +447,7 @@ class TestAlwaysOnDecoration:
         """No v2 filter, no passage filter — pre-fix the twin lookup was
         skipped entirely and every one of these fields stayed None."""
         _wire_twins(service, 2)
-        edges = [_edge(f"g{i}", f"graph fact {i}", [1.0, 0.0, 0.0]) for i in range(2)]
+        edges = [_edge(f"g{i}", f"graph fact {i}", _pad768([1.0, 0.0, 0.0])) for i in range(2)]
         with patch.object(
             service, "_search_graph_for_visibility", return_value=_graph_result(edges)
         ):
@@ -459,7 +465,7 @@ class TestAlwaysOnDecoration:
     def test_decoration_queries_with_stored_vectors_not_new_embeds(self, service):
         """The batch Qdrant lookup must carry the STORED fact_embeddings —
         no embed API calls at all (better than #121's one batch call)."""
-        embs = [[1.0, 0.0, 0.1 * i] for i in range(3)]
+        embs = [_pad768([1.0, 0.0, 0.1 * i]) for i in range(3)]
         _wire_twins(service, 3)
         edges = [_edge(f"g{i}", f"graph fact {i}", embs[i]) for i in range(3)]
         with patch.object(
@@ -491,7 +497,7 @@ class TestAlwaysOnDecoration:
     def test_mixed_edges_decorate_only_stored_vector_rows(self, service):
         _wire_twins(service, 1)
         edges = [
-            _edge("g0", "embedded graph fact", [1.0, 0.0, 0.0]),
+            _edge("g0", "embedded graph fact", _pad768([1.0, 0.0, 0.0])),
             _edge("g1", "legacy graph fact"),
         ]
         with patch.object(
@@ -527,7 +533,7 @@ class TestAlwaysOnDecoration:
         from qdrant_client.models import FieldCondition, Filter
 
         _wire_twins(service, 1)
-        edges = [_edge("g0", "graph fact", [1.0, 0.0, 0.0])]
+        edges = [_edge("g0", "graph fact", _pad768([1.0, 0.0, 0.0]))]
         with patch.object(
             service, "_search_graph_for_visibility", return_value=_graph_result(edges)
         ):
@@ -552,7 +558,7 @@ class TestAlwaysOnDecoration:
     def test_low_similarity_twin_still_not_trusted(self, service):
         """The 0.7 enrichment threshold survives the stored-vector path."""
         _wire_twins(service, 1, score=0.4)
-        edges = [_edge("g0", "graph fact", [1.0, 0.0, 0.0])]
+        edges = [_edge("g0", "graph fact", _pad768([1.0, 0.0, 0.0]))]
         with patch.object(
             service, "_search_graph_for_visibility", return_value=_graph_result(edges)
         ):
@@ -566,7 +572,7 @@ class TestAlwaysOnDecoration:
         service._memory.vector_store.client.query_batch_points.side_effect = (
             RuntimeError("qdrant down")
         )
-        edges = [_edge("g0", "graph fact", [1.0, 0.0, 0.0])]
+        edges = [_edge("g0", "graph fact", _pad768([1.0, 0.0, 0.0]))]
         with patch.object(
             service, "_search_graph_for_visibility", return_value=_graph_result(edges)
         ):
@@ -597,7 +603,7 @@ class TestPerformanceBudget:
         service._memory.vector_store.client.query_points.return_value = _qresult(hits)
         _wire_twins(service, 8)
         edges = [
-            _edge(f"g{i}", f"graph fact {i}", [1.0, 0.0, 0.1 * i]) for i in range(8)
+            _edge(f"g{i}", f"graph fact {i}", _pad768([1.0, 0.0, 0.1 * i])) for i in range(8)
         ]
         with patch.object(
             service, "_search_graph_for_visibility", return_value=_graph_result(edges)

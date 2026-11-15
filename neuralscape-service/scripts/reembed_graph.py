@@ -262,6 +262,8 @@ def run_dry_run(store: Store, group_ids: list[str], all_groups: bool, out) -> di
             for r in store.run(query):
                 owner = r["owner"]
                 owners = owner if isinstance(owner, list) else [owner]
+                # relTypeProperties reports the type as ":`RELATES_TO`"
+                owners = [str(o).strip(":`") for o in owners]
                 prop = r["propertyName"]
                 if prop and "embedding" in prop.lower() and not any(
                     (o, prop) in known for o in owners
@@ -334,9 +336,11 @@ def _convert_all(
                     else:
                         rows.append({"uuid": r["uuid"], "emb": vec})
             else:
-                texts = [(r["text"] or "").replace("\n", " ") for r in page]
-                vecs = loop.run_until_complete(embedder.create_batch(texts))
-                for r, vec in zip(page, vecs):
+                usable = [r for r in page if (r["text"] or "").strip()]
+                skipped += len(page) - len(usable)  # empty name/fact: nothing to embed
+                texts = [r["text"].replace("\n", " ") for r in usable]
+                vecs = loop.run_until_complete(embedder.create_batch(texts)) if texts else []
+                for r, vec in zip(usable, vecs):
                     if not vec or len(vec) != target_dim:
                         skipped += 1
                     else:

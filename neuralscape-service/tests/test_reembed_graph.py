@@ -52,7 +52,12 @@ class _Session:
         db.queries.append(query)
         tag = re.match(r"// reembed:(\S+)", query).group(1)
         if tag in ("schema-nodes", "schema-rels"):
-            return [{"owner": ["Entity"], "propertyName": "summary_embedding"}] if tag == "schema-nodes" else []
+            if tag == "schema-nodes":
+                return [
+                    {"owner": ["Entity"], "propertyName": "name_embedding"},
+                    {"owner": ["Entity"], "propertyName": "summary_embedding"},
+                ]
+            return [{"owner": ":`RELATES_TO`", "propertyName": "fact_embedding"}]
         key = _table_for(query, db)
         rows = db.tables[key]
         if tag == "histogram":
@@ -141,6 +146,8 @@ class TestDryRun:
         assert "group g1: 768-d: 1, 1024-d: 5" in out
         assert "group g2: 1024-d: 1" in out
         assert "Entity.summary_embedding" in out  # unknown embedding property is reported
+        assert "RELATES_TO.fact_embedding" not in out.split("Other embedding-like")[1]
+        assert "Entity.name_embedding" not in out.split("Other embedding-like")[1]
 
     def test_scope_limits_groups(self, env):
         _, out = _run(_seed(), "--group-id", "g2", "--dry-run")
@@ -246,6 +253,21 @@ class TestReembed:
         assert [len(c) for c in emb.calls] == [2, 2, 1]
         assert emb.calls[0][0] == "name 0 x"  # newline flattened like Graphiti does
         assert all(len(r["emb"]) == 768 for r in db.tables[("Entity", "name_embedding")].values())
+
+    def test_empty_text_rows_are_skipped_and_counted_not_embedded(self, env):
+        db = FakeNeo4j()
+        db.add("Entity", "name_embedding", "a", "g1", _vec(1024), text="")
+        db.add("Entity", "name_embedding", "b", "g1", _vec(1024), text=None)
+        db.add("Entity", "name_embedding", "c", "g1", _vec(1024), text="   ")
+        db.add("Entity", "name_embedding", "d", "g1", _vec(1024), text="real name")
+        emb = self._Embedder(768)
+        _, out = _run(
+            db, "--all-groups", "--mode", "reembed", "--target-dim", "768",
+            "--confirm-backup", embedder_factory=lambda m, d: emb,
+        )
+        assert emb.calls == [["real name"]]
+        assert [w[1] for w in db.writes] == ["d"]
+        assert "Entity.name_embedding: converted=1 skipped=3" in out
 
     def test_reembed_skips_vectors_already_at_target(self, env):
         db = FakeNeo4j()

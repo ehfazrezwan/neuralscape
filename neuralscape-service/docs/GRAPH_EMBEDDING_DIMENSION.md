@@ -29,6 +29,18 @@ sent 1024-d edge vectors to the 768-d Qdrant collection.
 * `scripts/reembed_graph.py` moves an existing store to another dimension. It
   is opt-in and owner-run.
 
+## Before deploying this change
+
+The explicit setting replaces the ambient `EMBEDDING_DIM` that Graphiti used to
+read. An environment that already sets `EMBEDDING_DIM` would now write new graph
+vectors at 1024 unless told otherwise (the service logs a warning at startup
+when `EMBEDDING_DIM` is set and differs from `GRAPHITI_EMBEDDING_DIM`). So, on
+the target store, before the first deploy:
+
+1. Run the dry-run histogram (command below, read-only) and read the lengths.
+2. Stored vectors are 1024: nothing to do. Anything else: set
+   `GRAPHITI_EMBEDDING_DIM` to the stored length before deploying.
+
 ## How scoring works across dimensions
 
 `gemini-embedding-001` is trained with Matryoshka Representation Learning
@@ -54,9 +66,16 @@ common 768-value prefix; cosine normalises both. `memory/ranking.py`:
 Effect on ranking: graph edges now carry a real cosine score in unified
 recall, so they compete with vector hits on merit as the fusion was designed.
 
-Not verified live: that Google's service returns exactly the prefix relation
-for the live model and key. It is documented behaviour; an integration check
-against a throwaway store is planned.
+The prefix relation is checked against the real service by
+`integration_tests/test_graph_embedding_mrl_gemini.py` (768-d output versus the
+first 768 values of the 1024-d output, cosine >= 0.99). A vector shorter than
+the Qdrant collection dimension cannot be used as a query against it, so such
+edges are not decorated from their twin.
+
+Graphiti's BM25-only search branch builds a zero query vector of the ambient
+`EMBEDDING_DIM` length (`graphiti_core/search/search.py`). It is never compared
+against stored vectors, so it needs no change, but it does not follow
+`GRAPHITI_EMBEDDING_DIM`.
 
 ## Neo4j and vector indexes
 

@@ -77,6 +77,31 @@ class TestExplicitGraphDimension:
     def test_default_is_1024_so_stored_vectors_do_not_change(self):
         assert Settings(_env_file=None).graphiti_embedding_dim == 1024
 
+    @pytest.mark.parametrize("bad", ["0", "-5"])
+    def test_dimension_must_be_positive(self, monkeypatch, bad):
+        monkeypatch.setenv("GRAPHITI_EMBEDDING_DIM", bad)
+        with pytest.raises(Exception):
+            Settings(_env_file=None)
+
+    def test_warns_when_ambient_embedding_dim_disagrees(self, monkeypatch, caplog):
+        monkeypatch.setenv("EMBEDDING_DIM", "768")
+        monkeypatch.delenv("GRAPHITI_EMBEDDING_DIM", raising=False)
+        with caplog.at_level("WARNING", logger="config"):
+            Settings(_env_file=None)
+        msgs = [r.getMessage() for r in caplog.records if "EMBEDDING_DIM=768" in r.getMessage()]
+        assert msgs and "GRAPHITI_EMBEDDING_DIM=1024" in msgs[0]
+
+    @pytest.mark.parametrize("ambient", [None, "1024", ""])
+    def test_no_warning_when_ambient_absent_or_equal(self, monkeypatch, caplog, ambient):
+        monkeypatch.delenv("GRAPHITI_EMBEDDING_DIM", raising=False)
+        if ambient is None:
+            monkeypatch.delenv("EMBEDDING_DIM", raising=False)
+        else:
+            monkeypatch.setenv("EMBEDDING_DIM", ambient)
+        with caplog.at_level("WARNING", logger="config"):
+            Settings(_env_file=None)
+        assert not [r for r in caplog.records if "EMBEDDING_DIM=" in r.getMessage()]
+
     def test_env_override(self, monkeypatch):
         monkeypatch.setenv("GRAPHITI_EMBEDDING_DIM", "768")
         assert Settings(_env_file=None).graphiti_embedding_dim == 768
@@ -256,8 +281,16 @@ class TestTwinDecorationTruncation:
 
     def test_fit_helper_edge_cases(self):
         assert _fit_vector_to_collection(None) is None
-        assert _fit_vector_to_collection([]) == []
+        assert _fit_vector_to_collection([]) is None
         assert _fit_vector_to_collection([0.0] * 1024) is None  # zero-norm prefix
+
+    def test_vector_shorter_than_collection_cannot_query_it(self):
+        assert _fit_vector_to_collection([0.5] * 512) is None
+        assert _fit_vector_to_collection([0.5] * (VECTOR_EMBEDDING_DIMS - 1)) is None
+
+    def test_short_edge_vector_is_not_sent_to_qdrant(self, service):
+        qbp = TestTwinDecorationTruncation()._decorate(service, [0.5] * 512)
+        assert qbp.call_count == 0
 
 
 # ── MemoryGraph.search() / get_all() must not hide failures ────────────
