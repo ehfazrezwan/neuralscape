@@ -7,7 +7,7 @@ code is verbatim — behavior unchanged.
 import logging
 import math
 
-from config import settings
+from config import VECTOR_EMBEDDING_DIMS, settings
 
 logger = logging.getLogger(__name__)
 
@@ -102,6 +102,103 @@ def _unit_cosine(a: list, b: list) -> float | None:
         return max(0.0, min(1.0, dot / math.sqrt(norm_a * norm_b)))
     except (TypeError, ValueError):
         return None
+
+
+# ── Cross-store (Qdrant 768-d vs Graphiti 1024-d) comparison ───────────
+# Graphiti's stored vectors and the mem0/Qdrant vectors come from the same
+# Matryoshka (MRL) model, gemini-embedding-001, at different
+# ``output_dimensionality``. A lower-dimension MRL vector is the leading
+# prefix of the full vector -- Google's embeddings guide, section "Controlling
+# embedding size": gemini-embedding-001 "is trained using the Matryoshka
+# Representation Learning (MRL) technique" and its output "can be truncated";
+# non-3072 outputs of gemini-embedding-001 are not unit-norm
+# (https://ai.google.dev/gemini-api/docs/embeddings#control-embedding-size).
+# Two such vectors of different length are therefore compared on their common
+# prefix (cosine renormalises). Only models listed
+# here may be compared that way; anything else keeps the strict
+# length-match contract of ``_unit_cosine``.
+_MRL_EMBEDDING_MODELS = frozenset({"gemini-embedding-001"})
+
+
+def _canonical_embedding_model(name: str | None) -> str:
+    """``models/x``, ``google-vertex/x`` and ``x`` all name the same model."""
+    return (name or "").strip().lower().rsplit("/", 1)[-1]
+
+
+def _graph_vectors_mrl_comparable() -> bool:
+    """True when the graph embedder and the vector embedder are the SAME MRL
+    model, so prefix comparison across their dimensions is meaningful.
+
+    The graph side always uses ``gemini_embedder_model`` (both graphiti model
+    dicts in ``Settings``); the vector side uses the gateway embedder model
+    when the gateway is enabled, else ``gemini_embedder_model``.
+    """
+    graph_model = _canonical_embedding_model(settings.gemini_embedder_model)
+    vector_model = _canonical_embedding_model(
+        settings.llm_gateway_embedder_model
+        if settings.llm_gateway_enabled
+        else settings.gemini_embedder_model
+    )
+    return graph_model == vector_model and graph_model in _MRL_EMBEDDING_MODELS
+
+
+def _mrl_cosine(a: list, b: list) -> float | None:
+    """``_unit_cosine`` over the common prefix when the lengths differ.
+
+    Callers must have established that both vectors are leading-prefix
+    truncations of one MRL model (``_graph_vectors_mrl_comparable``);
+    this function does not check. Equal lengths behave exactly like
+    ``_unit_cosine``. The prefix is not unit-norm, but cosine normalises.
+    """
+    try:
+        if a and b and len(a) != len(b):
+            n = min(len(a), len(b))
+            return _unit_cosine(list(a[:n]), list(b[:n]))
+    except TypeError:
+        return None
+    return _unit_cosine(a, b)
+
+
+def _graph_edge_cosine(query_embedding: list, edge_embedding: list) -> float | None:
+    """Score a graph edge's stored ``fact_embedding`` against the query vector.
+
+    Same-length vectors: plain cosine. Different lengths: prefix cosine when
+    both stores use the same MRL model, otherwise ``None`` (unscorable, as
+    before).
+    """
+    if (
+        query_embedding
+        and edge_embedding
+        and len(query_embedding) != len(edge_embedding)
+        and not _graph_vectors_mrl_comparable()
+    ):
+        return None
+    return _mrl_cosine(query_embedding, edge_embedding)
+
+
+def _fit_vector_to_collection(vec: list | None) -> list | None:
+    """Make a stored graph edge vector usable as a query against the Qdrant
+    collection (``VECTOR_EMBEDDING_DIMS``).
+
+    Longer MRL vectors are truncated to the collection dimension and
+    re-normalised; longer non-MRL vectors cannot be searched with and yield
+    ``None`` (caller treats the row as having no stored embedding). Vectors
+    already at or below the collection dimension pass through unchanged.
+    """
+    if not vec:
+        return vec
+    if len(vec) <= VECTOR_EMBEDDING_DIMS:
+        return vec
+    if not _graph_vectors_mrl_comparable():
+        return None
+    try:
+        head = [float(x) for x in vec[:VECTOR_EMBEDDING_DIMS]]
+    except (TypeError, ValueError):
+        return None
+    norm = math.sqrt(sum(x * x for x in head))
+    if norm <= 0.0:
+        return None
+    return [x / norm for x in head]
 
 
 def _dense_score_floor(dense_hits: list) -> float | None:

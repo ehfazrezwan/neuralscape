@@ -20,6 +20,10 @@ class GraphitiConfig(BaseModel):
     graphiti_embedder_provider: str = Field(default="gemini", description="Embedder provider for Graphiti")
     graphiti_embedder_model: Optional[str] = Field(default=None, description="Embedder model name")
     graphiti_embedder_api_key: Optional[str] = Field(default=None, description="Embedder API key")
+    # NEURALSCAPE PATCH: explicit dimension for the vectors Graphiti stores on
+    # entity names / edge facts. None keeps Graphiti's ambient EMBEDDING_DIM env
+    # default (1024) for callers that do not set it.
+    graphiti_embedding_dim: Optional[int] = Field(default=None, description="Embedding dimension for Graphiti")
     graphiti_reranker_provider: Optional[str] = Field(default=None, description="Reranker provider (gemini, openai, bge)")
     store_raw_episode_content: bool = Field(default=True, description="Whether to store raw episode content")
     update_communities: bool = Field(default=False, description="Whether to update communities on add")
