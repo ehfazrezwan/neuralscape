@@ -248,6 +248,8 @@ def main(argv: list[str] | None = None) -> int:
             notes.append("- the evidence file holds no records: it is empty, blank or has no valid record, so there is nothing to compare")
         if read.invalid_lines:
             notes.append(f"- {len(read.invalid_lines)} invalid line(s) at line number(s) {', '.join(map(str, read.invalid_lines[:20]))}")
+        if read.duplicate_key_lines:
+            notes.append(f"- {len(read.duplicate_key_lines)} line(s) repeat a JSON key (duplicate key) at line number(s) {', '.join(map(str, read.duplicate_key_lines[:20]))}")
         if read.partial_tail:
             notes.append("- partial tail: the file ends without a newline (an interrupted append)")
         notes.append("- this comparison is built from the valid records only and is incomplete")
