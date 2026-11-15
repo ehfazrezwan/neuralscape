@@ -173,6 +173,10 @@ async def _enqueue_stale_graph_check(
     """
     from memory.hashing import content_hash
 
+    # Part of the flagged supersession feature: off => dedup hits enqueue
+    # nothing (pre-existing behaviour).
+    if not settings.graph_supersession_enabled:
+        return
     # Vector-only rows never reach the graph by design: nothing to check.
     if getattr(mem, "memory_kind", None) == "passage" or getattr(mem, "workspace", None) not in (None, "memory"):
         return

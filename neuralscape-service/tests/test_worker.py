@@ -252,8 +252,18 @@ class TestProcessMemoryRaw:
 
     @pytest.mark.asyncio
     async def test_skips_graph_enrichment_on_dedup(self, ctx):
-        """A content-hash dedup hit (created=False) must NOT re-enqueue a FULL
-        enrichment; it only queues the cheap only_if_stale graph check."""
+        """A content-hash dedup hit (created=False) must NOT re-enqueue enrichment
+        (flag off: the stale-graph check is part of GRAPH_SUPERSESSION_ENABLED)."""
+        ctx["service"].store_raw.return_value = (
+            [MemoryResponse(id="existing", memory="x")],
+            False,
+        )
+        await worker.process_memory_raw(ctx, content="x", user_id="ehfaz", category="preference")
+        ctx["redis"].enqueue_job.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_flag_on_dedup_hit_queues_only_the_stale_check(self, ctx, monkeypatch):
+        monkeypatch.setattr(worker.settings, "graph_supersession_enabled", True)
         ctx["service"].store_raw.return_value = (
             [MemoryResponse(id="existing", memory="x")],
             False,

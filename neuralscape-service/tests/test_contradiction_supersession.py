@@ -652,9 +652,8 @@ class TestFlagOff:
             category="personal_fact",
         )
 
-        # flag off: no FULL re-enrichment, only the cheap stale check
-        redis.enqueue_job.assert_awaited_once()
-        assert redis.enqueue_job.await_args.args[8] is True
+        # flag off: nothing is enqueued for a dedup hit (stale check is flagged)
+        redis.enqueue_job.assert_not_awaited()
 
     def test_batch_path_does_not_reenrich_revived_dup(self, env):
         svc, qdrant, _ = env
@@ -857,7 +856,8 @@ class TestStaleGraphCheckOnDedupHit:
         svc._memory.graph.add.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_repeated_dedup_hits_coalesce_on_one_job_id_and_lock(self):
+    async def test_repeated_dedup_hits_coalesce_on_one_job_id_and_lock(self, monkeypatch):
+        monkeypatch.setattr(settings, "graph_supersession_enabled", True)
         import worker
 
         seen: set[str] = set()
@@ -884,7 +884,8 @@ class TestStaleGraphCheckOnDedupHit:
                    for c in redis.enqueue_job.await_args_list)
 
     @pytest.mark.asyncio
-    async def test_passage_dedup_hit_enqueues_nothing(self):
+    async def test_passage_dedup_hit_enqueues_nothing(self, monkeypatch):
+        monkeypatch.setattr(settings, "graph_supersession_enabled", True)
         import worker
 
         redis = MagicMock()
@@ -896,7 +897,8 @@ class TestStaleGraphCheckOnDedupHit:
         redis.enqueue_job.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_early_idempotency_hit_also_queues_the_check(self):
+    async def test_early_idempotency_hit_also_queues_the_check(self, monkeypatch):
+        monkeypatch.setattr(settings, "graph_supersession_enabled", True)
         import worker
 
         existing = MemoryResponse(id="m1", memory="x", scope="global", visibility="private")
@@ -913,7 +915,8 @@ class TestStaleGraphCheckOnDedupHit:
         assert redis.enqueue_job.await_args.args[8] is True
 
     @pytest.mark.asyncio
-    async def test_batch_dedup_survivors_get_the_check(self):
+    async def test_batch_dedup_survivors_get_the_check(self, monkeypatch):
+        monkeypatch.setattr(settings, "graph_supersession_enabled", True)
         import worker
 
         survivor = MemoryResponse(id="old", memory="x", scope="global", visibility="private")
@@ -945,3 +948,22 @@ class TestStaleGraphCheckOnDedupHit:
             svc.store_raw_batch(
                 [{"content": "x", "user_id": "u1", "category": "personal_fact"}], dedup_ids=out)
         assert out == {"old"}
+
+
+class TestStaleCheckEnqueueIsFlagged:
+    @pytest.mark.asyncio
+    async def test_flag_off_dedup_hits_enqueue_nothing(self, env, monkeypatch):
+        import worker
+
+        monkeypatch.setattr(settings, "graph_supersession_enabled", False)
+        redis = MagicMock()
+        redis.set = AsyncMock(return_value=True)
+        redis.enqueue_job = AsyncMock()
+        mem = MemoryResponse(id="m1", memory="x", scope="global", visibility="private")
+        await worker._enqueue_stale_graph_check({"redis": redis}, mem, "x", "u1", None)
+        redis.enqueue_job.assert_not_awaited()
+        redis.set.assert_not_awaited()
+
+        monkeypatch.setattr(settings, "graph_supersession_enabled", True)
+        await worker._enqueue_stale_graph_check({"redis": redis}, mem, "x", "u1", None)
+        redis.enqueue_job.assert_awaited_once()
