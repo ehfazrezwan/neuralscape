@@ -36,8 +36,10 @@ def get_adapter_class(connector_type: str) -> type[ConnectorAdapter]:
 def build_adapter(record: dict) -> ConnectorAdapter:
     """Instantiate an adapter from a vault record (with decrypted credentials)."""
     cls = get_adapter_class(record["connector_type"])
-    return cls(
+    adapter = cls(
         connector_id=record["connector_id"],
         credentials=record.get("credentials", {}),
         config=record.get("config", {}),
     )
+    adapter.owner_user_id = record.get("owner_user_id")  # for log lines only
+    return adapter
