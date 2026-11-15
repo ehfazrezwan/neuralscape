@@ -192,8 +192,8 @@ Everything the plugin does against the service goes through the MCP tools above,
 | `GET /v1/memories` | PreToolUse (read gate) | File-memory lookup for the read gate |
 | `POST /v1/memories/raw` | PreCompact | Store the compact snapshot |
 | `POST /v1/checkpoint` | SessionEnd | Store the structured session note |
-| `POST /v1/extensions/conversation-compiler/flush` | Stop, PreCompact, framework adapter `message:sent` | Deliver a conversation turn |
-| `POST /v1/extensions/conversation-compiler/compile` | Stop, framework adapter `session:end` | Compile the day's turns |
+| `POST /v1/extensions/conversation-compiler/flush` | Stop, SessionEnd (a final turn the Stop hooks left pending), PreCompact, framework adapter `message:sent` | Deliver a conversation turn |
+| `POST /v1/extensions/conversation-compiler/compile` | Stop (at most once per compile interval), SessionEnd (what is left), framework adapter `session:end` | Compile the day's turns |
 
 ### From the skills (REST, via curl)
 
@@ -246,6 +246,7 @@ The plugin reads from `userConfig` prompts (modern) or env vars (legacy fallback
 |  | *Default when unset:* the hooks fall back to the **OS username** (`$USER` / `$USERNAME`) so zero-config local installs keep a stable identity. Set it explicitly on shared machines or if your OS username isn't the id you want memories filed under. Servers with token auth derive identity from the Bearer token and ignore client-claimed ids. | |
 | Compile threshold (obs) | `CLAUDE_PLUGIN_OPTION_COMPILE_THRESHOLD` (default `25`) | `NEURALSCAPE_COMPILE_THRESHOLD` |
 | Compile age (minutes) | `CLAUDE_PLUGIN_OPTION_COMPILE_AGE_MIN` (default `30`) | `NEURALSCAPE_COMPILE_AGE_MIN` |
+| Conversation compile interval (minutes) | `CLAUDE_PLUGIN_OPTION_COMPILE_INTERVAL_MIN` (default `15`; `0` = after every Stop that delivered a turn) | `NEURALSCAPE_COMPILE_INTERVAL_MIN` |
 | SessionStart context mode | `CLAUDE_PLUGIN_OPTION_CONTEXT_MODE` (`index` default \| `full` legacy) | `NEURALSCAPE_CONTEXT_MODE` |
 | Index budget (tokens) | `CLAUDE_PLUGIN_OPTION_INDEX_BUDGET_TOKENS` (default `1500`) | `NEURALSCAPE_INDEX_BUDGET_TOKENS` |
 | Code-graph deferral | `CLAUDE_PLUGIN_OPTION_CODE_GRAPH` (`auto` default \| `on` \| `off`) | `NEURALSCAPE_CODE_GRAPH` |

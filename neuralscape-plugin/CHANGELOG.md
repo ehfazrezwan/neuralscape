@@ -4,6 +4,19 @@ All notable changes to the `neuralscape` Claude plugin are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 the project adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.9.8] - 2026-11-16
+
+### Fixed
+- Privacy: the session note's `completed` took the final assistant entry of the last turn and redacted it on its own, so a `<private>` span opened in an earlier assistant entry and closed in the final one lost its opening tag and its tail was POSTed to `/v1/checkpoint`. Redaction is now decided over the whole turn's assistant text (the spans are found in the joined text and masked in place) before the final entry is cut out, and every turn is redacted over its whole text before any note field (request, learned, next steps) picks a sentence out of it.
+- Privacy: an unclosed `<private>` was redacted only to the end of its line or sentence, so a multi-line private span leaked its later lines. Text that leaves the machine or is written to disk is now redacted fail-closed (`redactPrivate(text, { failClosed: true })`: an unmatched opener redacts through the end of the text): observation rows (every input string, redacted before the 600-character elision, and the output, including JSON-stringified object responses), conversation turns sent to the flush route, the session note, the compact snapshot, and the framework adapter's remembered inbound message. The bounded default mode stays for text that does not leave the machine (the read gate's re-redaction of stored text before it is shown locally).
+- The Stop hook POSTed `/compile` after every assistant turn, and the service recompiles the whole date each time. The compile is now windowed per session: a Stop sends it only when it delivered at least one turn and the last successful compile for the session is at least `COMPILE_INTERVAL_MIN` (default 15) minutes old; the SessionEnd hook compiles whatever is still uncompiled. A failed compile leaves its date marked, so the next Stop retries even inside the window, and a date that is still marked when the day changes is compiled too. The state is a small file next to the observation buffers (`<session>.compile.lastturn`, aged out after two weeks). Other clients keep their single trigger at session end. If a session is killed before SessionEnd runs, up to one interval of its last turns waits for the next compile of that date.
+- The wait for a lagging transcript re-read and re-parsed the whole transcript on every poll (about 30 times in 3 seconds). It now parses the file once and then only the bytes appended since (a half-written last line and a split multi-byte character wait for the rest; a file that shrank, or a transcript stored as one JSON document, is read in full again).
+- A last turn whose transcript entry had not landed when its Stop ran stayed pending until a later Stop that might never come. The SessionEnd hook now delivers pending turns (under the same transcript lock) before it builds the session note, then compiles.
+- The Stop-hook documentation no longer says a pending turn is "delivered once": delivery is normally once, and the lock's residual race is documented in 2.9.5.
+
+### Notes
+- A user prompt that has no assistant text and is followed by another prompt (the user interrupted and asked again) is still skipped, on purpose: the conversation compiler needs an answer to compile from, the flush route drops turns without one as noise, and the next prompt carries the intent. A test pins it.
+
 ## [2.9.7] - 2026-11-16
 
 ### Fixed

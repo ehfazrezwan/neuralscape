@@ -29,7 +29,8 @@ export interface ObservationRow {
 const FIELD_MAX_CHARS = 400;
 
 function squash(text: string, maxChars = FIELD_MAX_CHARS): string {
-  const clean = redactPrivate(text).replace(/\s+/g, " ").trim();
+  // The note is POSTed: fail closed (an unmatched <private> redacts to the end of the text).
+  const clean = redactPrivate(text, { failClosed: true }).replace(/\s+/g, " ").trim();
   if (clean.length <= maxChars) return clean;
   return clean.slice(0, maxChars - 1).trimEnd() + "…";
 }
@@ -103,6 +104,28 @@ export function extractLearned(turns: Array<{ user: string; assistant: string }>
 }
 
 /**
+ * A turn's wrap-up (its last assistant entry) with `<private>` redaction decided over the WHOLE turn's assistant
+ * text. A span opened in an earlier entry and closed in the final one has no opening tag inside the final entry
+ * alone, so redacting the entry in isolation would leave the span's tail in the clear. The spans are found in the
+ * joined text (matched pairs, then an unmatched opener through the end: fail closed) and masked in place; only
+ * then is the final entry's part cut out. A wrap-up that is nothing but redaction is returned empty.
+ */
+export function redactedFinal(turn: { assistant: string; final?: string }): string {
+  const assistant = turn.assistant ?? "";
+  const final = turn.final;
+  if (final === undefined) return redactPrivate(assistant, { failClosed: true });
+  const earlier = assistant.endsWith(final) ? assistant.slice(0, assistant.length - final.length) : "";
+  let masked = (earlier + final).replace(/<private>[\s\S]*?<\/private>/gi, (m) => "\u0001".repeat(m.length));
+  const open = masked.search(/<private>/i);
+  if (open !== -1) masked = masked.slice(0, open) + "\u0002".repeat(masked.length - open);
+  const out = masked
+    .slice(earlier.length)
+    .replace(/\u0001+/g, "[redacted]")
+    .replace(/\u0002+/g, "[redacted:unclosed]");
+  return /^\s*\[redacted(?::unclosed)?\]\s*$/.test(out) ? "" : out;
+}
+
+/**
  * The final assistant message is usually the wrap-up — use its head.  A turn's `assistant` joins every assistant
  * entry (progress commentary first); `final`, when given, is the turn's last assistant entry on its own.
  */
@@ -110,7 +133,7 @@ export function extractCompleted(
   turns: Array<{ user: string; assistant: string; final?: string }>
 ): string | undefined {
   for (let i = turns.length - 1; i >= 0; i--) {
-    const text = (turns[i].final ?? turns[i].assistant ?? "").trim();
+    const text = redactedFinal(turns[i]).trim();
     if (!text || isSystemMessage(text)) continue;
     return squash(text, 350);
   }
@@ -154,11 +177,18 @@ export function buildSessionNote(
   observations: ObservationRow[],
 ): SessionNoteFields | null {
   const note: SessionNoteFields = {};
-  const request = extractRequest(turns);
+  // Redact every turn over its whole text before any extractor picks sentences or entries out of it: a private
+  // span can start in a sentence an extractor skips, so redacting what each one happens to select is not enough.
+  const clean = turns.map((t) => ({
+    user: redactPrivate(t.user ?? "", { failClosed: true }),
+    assistant: redactPrivate(t.assistant ?? "", { failClosed: true }),
+    final: redactedFinal(t),
+  }));
+  const request = extractRequest(clean);
   const investigated = extractInvestigated(observations);
-  const learned = extractLearned(turns);
-  const completed = extractCompleted(turns);
-  const nextSteps = extractNextSteps(turns);
+  const learned = extractLearned(clean);
+  const completed = extractCompleted(clean);
+  const nextSteps = extractNextSteps(clean);
   if (request) note.request = request;
   if (investigated) note.investigated = investigated;
   if (learned) note.learned = learned;

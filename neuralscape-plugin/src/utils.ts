@@ -270,22 +270,67 @@ export function isProjectExcluded(projectId: string | undefined): boolean {
  *
  * Matched OPEN…CLOSE pairs redact exactly their span. An UNMATCHED opener
  * (e.g. prose *about* the tag: "use <private> to mark secrets") is bounded
- * (audit 27 #34a): it redacts at most through the next sentence boundary or
- * end of line — never to end-of-string — and leaves a `[redacted:unclosed]`
- * warning marker so the truncation is visible instead of silently eating
- * the rest of the transcript.
+ * by default (audit 27 #34a): it redacts at most through the next sentence
+ * boundary or end of line — never to end-of-string — and leaves a
+ * `[redacted:unclosed]` warning marker so the truncation is visible instead
+ * of silently eating the rest of the transcript.
+ *
+ * `failClosed` is for text that LEAVES the machine or is written to disk:
+ * an unmatched opener redacts through the END OF THE TEXT. A private span
+ * can run over several lines or sentences (a tool result, a multi-paragraph
+ * answer), so bounding it to the line would publish the rest of the span;
+ * over-redacting prose that merely mentions the tag is the safe error.
  */
-export function redactPrivate(text: string): string {
+export function redactPrivate(text: string, options: { failClosed?: boolean } = {}): string {
   if (typeof text !== "string" || !/<private>/i.test(text)) return text;
-  return (
-    text
-      .replace(/<private>[\s\S]*?<\/private>/gi, "[redacted]")
-      // Remaining openers are unmatched: consume within the current line up
-      // to the earliest of (a) a sentence end ([.!?] before whitespace/EOL)
-      // or (b) the end of the line. `[^\n]*?` cannot cross a newline, so a
-      // stray opener can never swallow subsequent lines.
-      .replace(/<private>[^\n]*?(?:[.!?](?=\s|$)|(?=\n)|$)/gi, "[redacted:unclosed]")
-  );
+  const closed = text.replace(/<private>[\s\S]*?<\/private>/gi, "[redacted]");
+  if (options.failClosed) return closed.replace(/<private>[\s\S]*$/i, "[redacted:unclosed]");
+  // Remaining openers are unmatched: consume within the current line up
+  // to the earliest of (a) a sentence end ([.!?] before whitespace/EOL)
+  // or (b) the end of the line. `[^\n]*?` cannot cross a newline, so a
+  // stray opener can never swallow subsequent lines.
+  return closed.replace(/<private>[^\n]*?(?:[.!?](?=\s|$)|(?=\n)|$)/gi, "[redacted:unclosed]");
+}
+
+/**
+ * Per-session compile bookkeeping for the Stop hook, next to the buffers.
+ * The name ends in `.lastturn` so the SessionStart orphan sweep ages it out
+ * with the other per-session leftovers.
+ */
+export const COMPILE_STATE_SUFFIX = ".compile.lastturn";
+
+export interface CompileState {
+  /** Dates (YYYY-MM-DD) with turns delivered since their last successful compile. */
+  dirtyDates: string[];
+  /** When a compile last succeeded (ms since epoch); 0 when never. */
+  compiledAt: number;
+}
+
+export function getCompileStatePath(sessionId: string): string {
+  const safe = sessionId.replace(/[^A-Za-z0-9._-]/g, "_") || "unknown";
+  return pathJoin(getObservationDir(), `${safe}${COMPILE_STATE_SUFFIX}`);
+}
+
+export async function readCompileState(sessionId: string): Promise<CompileState> {
+  try {
+    const parsed = JSON.parse(await readFile(getCompileStatePath(sessionId), "utf-8"));
+    const dirtyDates = Array.isArray(parsed?.dirtyDates)
+      ? parsed.dirtyDates.filter((d: unknown): d is string => typeof d === "string").slice(-3)
+      : [];
+    const compiledAt = Number.isFinite(parsed?.compiledAt) ? parsed.compiledAt : 0;
+    return { dirtyDates, compiledAt };
+  } catch {
+    return { dirtyDates: [], compiledAt: 0 };
+  }
+}
+
+export async function writeCompileState(sessionId: string, state: CompileState): Promise<void> {
+  try {
+    await mkdir(getObservationDir(), { recursive: true });
+    await writeFile(getCompileStatePath(sessionId), JSON.stringify(state), { encoding: "utf-8", mode: 0o600 });
+  } catch (error) {
+    logError("writing compile state failed (non-critical)", error);
+  }
 }
 
 /* v8 ignore start — pre-existing utility, exercised by integration only */

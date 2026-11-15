@@ -24,6 +24,8 @@
 import { readFile } from "node:fs/promises";
 
 import { extractAllTurnPairs } from "../adapters/claude-code.js";
+import { compileForSession } from "../core/compile.js";
+import { deliverClaudeCodeTurns } from "../core/deliver.js";
 import {
   type ObservationRow,
   buildCheckpointPayload,
@@ -99,6 +101,19 @@ async function main(): Promise<void> {
 
     // Excluded projects (D4): no session note leaves an excluded project.
     if (isProjectExcluded(projectId)) return;
+
+    // Last chance for the turns the Stop hooks left pending (a final answer whose transcript entry had not been
+    // written yet when its Stop ran), then compile what is still uncompiled: the Stop compile is windowed.
+    try {
+      const delivered = raw.transcript_path ? await deliverClaudeCodeTurns(raw) : 0;
+      await compileForSession(
+        sessionId,
+        { date: new Date().toISOString().split("T")[0], userId: getUserId(), shouldCompile: true },
+        { delivered, final: true },
+      );
+    } catch (error) {
+      logError("session-end final flush failed (non-critical)", error);
+    }
 
     const turns = await extractAllTurnPairs(raw);
     const observations = await readObservationRows(sessionId);
