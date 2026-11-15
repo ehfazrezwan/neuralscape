@@ -114,6 +114,79 @@ def _dense_score_floor(dense_hits: list) -> float | None:
     return min(scores) if scores else None
 
 
+def _fused_order_keys(fused: list[dict], dense_hits: list) -> list[float | None]:
+    """Rank-transferred ordering keys for one pool's RRF-fused entries.
+
+    ``_rrf_fuse`` orders a pool by leg agreement, but the rows it returns
+    keep their NATIVE presentation score (real cosine for dense hits, the
+    pool's dense floor for lexical-only hits). Sorting the cross-pool merge
+    by that native score throws the fused order away: every lexical-only
+    hit sits at the pool floor and is cut, and a dense hit that RRF
+    promoted is re-ordered back by raw cosine.
+
+    Fix: transfer the fused ORDER onto the cosine SCALE. The pool's dense
+    cosines, sorted descending, are handed out by fused position — the
+    entry at position ``i`` gets the ``i``-th best cosine; positions past
+    the dense leg's length get the pool floor. The keys are monotone
+    non-increasing in fused order (so the pool's RRF order survives any
+    sort by key) and live on the cosine scale (so they stay comparable
+    across pools, unlike raw RRF values, which would degenerate into a
+    positional interleave). Keys only ORDER rows; displayed scores are
+    untouched.
+
+    Returns one entry per fused position; every entry is ``None`` when the
+    pool's dense leg was empty (no cosine scale to transfer onto) — the
+    caller resolves those against the other pools.
+    """
+    dense_scores = sorted(
+        (s for s in (getattr(h, "score", None) for h in dense_hits) if s is not None),
+        reverse=True,
+    )
+    if not dense_scores:
+        return [None] * len(fused)
+    floor = dense_scores[-1]
+    return [
+        dense_scores[i] if i < len(dense_scores) else floor
+        for i in range(len(fused))
+    ]
+
+
+def _record_order_key(
+    order_keys: dict | None, row_id: str, key: float | None
+) -> None:
+    """Record a pool row's ordering key; the best key wins across pools.
+
+    ``None`` (empty-dense pool) only registers the id so ``search()`` can
+    impute it later; it never overwrites a real key.
+    """
+    if order_keys is None or not row_id:
+        return
+    prior = order_keys.get(row_id)
+    if prior is None or (key is not None and key > prior):
+        order_keys[row_id] = key
+
+
+def _resolve_order_keys(
+    order_keys: dict[str, float | None],
+) -> tuple[dict[str, float], set[str]]:
+    """Impute keys for rows from empty-dense pools (key ``None``).
+
+    A lexical-only hit in a pool whose dense leg returned nothing has no
+    cosine to rank on. Same principle as ``_dense_score_floor`` (presence
+    via a keyword match is worth at least the weakest dense candidate,
+    never more): such rows get the LOWEST real key seen across all pools,
+    or 0.0 when no pool had a dense leg at all. They tie with that weakest
+    row; the returned ``imputed`` id set lets the caller sort them AHEAD of
+    that tie, so they are not silently sunk below everything, yet never
+    outrank a stronger dense hit. Returns ``(keys, imputed_ids)``.
+    """
+    real = [k for k in order_keys.values() if k is not None]
+    fallback = min(real) if real else 0.0
+    keys = {i: (k if k is not None else fallback) for i, k in order_keys.items()}
+    imputed = {i for i, k in order_keys.items() if k is None}
+    return keys, imputed
+
+
 def _mem_is_tombstoned(mem: dict) -> bool:
     """Whether a mem0 memory dict carries the dreaming consolidation
     tombstone (``metadata.dream_tombstoned``), handling mem0's potential
@@ -170,7 +243,7 @@ def _reinforcement_boost(score: float | None, metadata: dict | None) -> float | 
     return min(1.0, score * (1.0 + k * math.log1p(times_derived - 1)))
 
 
-def _salience_tiebreak(responses: list) -> list:
+def _salience_tiebreak(responses: list, order_keys: dict | None = None) -> list:
     """A4 guardrail 1: bounded logarithmic salience tie-breaker on recall.
 
     OFF by default (``DREAMING_SALIENCE_RECALL_K=0.0``) — and when off (or
@@ -187,6 +260,10 @@ def _salience_tiebreak(responses: list) -> list:
     reinforcement-by-dedup stored on the row; this is recall-frequency
     strength from the dreaming traces — the two signals never double-count
     one another.)
+
+    ``order_keys`` (optional ``{id: ordering key}`` from the hybrid pool
+    merge) receives the same multiplicative lift as the displayed score, so
+    the sort — which runs on the keys — stays consistent with the boost.
     """
     try:
         from extensions.dreaming.config import dreaming_settings
@@ -205,7 +282,10 @@ def _salience_tiebreak(responses: list) -> list:
         for r in responses:
             signal = signals.get(r.id or "", 0.0)
             if r.score is not None and signal > 0.0:
-                r.score = r.score * (1.0 + k * math.log1p(signal))
+                lift = 1.0 + k * math.log1p(signal)
+                r.score = r.score * lift
+                if order_keys is not None and order_keys.get(r.id) is not None:
+                    order_keys[r.id] = order_keys[r.id] * lift
     except Exception:
         logger.debug("salience tie-break skipped (non-fatal)", exc_info=True)
     return responses

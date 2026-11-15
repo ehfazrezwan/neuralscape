@@ -847,6 +847,9 @@ class TestPatchMemory:
         NS metadata field on any content edit."""
         meta = dict(_SHARED_META, owner_user_id="ehfaz")
         service._memory.vector_store.get.return_value = _edit_point(meta=meta)
+        # A content edit now cascades the OLD episode (its body holds the old
+        # text verbatim); stub it as resolved so this test stays about metadata.
+        service._cascade_or_fallback_expire = MagicMock(return_value={"resolved": True})
         result = service.patch_memory("m1", "ehfaz", {"content": "New content"})
 
         call = service._memory.update.call_args
@@ -858,6 +861,9 @@ class TestPatchMemory:
         assert nested["tags"] == ["old-tag"]
         assert result["graph"] == "reingest_pending"
         assert result["graph_job"]["content"] == "New content"
+        service._cascade_or_fallback_expire.assert_called_once()
+        # the cascade targets the OLD content, not the new text
+        assert service._cascade_or_fallback_expire.call_args.args[0]["memory"] != "New content"
         service._expire_graph_edges_for_memory.assert_not_called()
 
     def test_teammate_may_edit_shared_metadata(self, service):

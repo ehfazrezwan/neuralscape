@@ -6,6 +6,10 @@
  * For OpenClaw / generic: triggers compilation directly.
  *
  * Runs async (fire-and-forget) so it never blocks session teardown.
+ *
+ * Registered on Stop, which fires after EVERY assistant turn, not once at the
+ * end of the session. It therefore must not mark the observation buffer as
+ * finished: that marker is written by the SessionEnd hook (session-summary).
  */
 
 import { commitClaudeCodeFlush } from "../adapters/claude-code.js";
@@ -18,13 +22,10 @@ import { triggerCompile } from "../core/compile.js";
 import { flushTurns } from "../core/flush.js";
 import { type LockHandle, withTranscriptLock } from "../core/transcript-lock.js";
 import {
-  getBufferPath,
-  getBufferStats,
   getProjectId,
   hasUserId,
   isProjectExcluded,
   logError,
-  markBufferStale,
   outputContinue,
   parseStdin,
 } from "../utils.js";
@@ -69,19 +70,6 @@ async function main(): Promise<void> {
     const sessionExtractor = getSessionEndExtractor(client);
     const input = await sessionExtractor(raw);
     await triggerCompile(input);
-
-    // Mark this session's PostToolUse observation buffer as stale so the
-    // next SessionStart picks it up if compile-observations didn't already
-    // flush it via the UserPromptSubmit threshold during this session.
-    try {
-      const sessionId = (raw.session_id as string | undefined) || "unknown";
-      const stats = await getBufferStats(getBufferPath(sessionId));
-      if (stats.lineCount > 0) {
-        await markBufferStale(sessionId);
-      }
-    } catch (error) {
-      logError("stale-marker write failed (non-critical)", error);
-    }
   } catch (error) {
     logError("session-end hook failed", error);
   }
