@@ -42,6 +42,11 @@ if [ "$LIST" -eq 0 ] && [ "$SELFTEST" -eq 0 ]; then
   fi
   [ -n "$BASE_URL" ] || { usage >&2; die "base URL required"; }
   [ -f "$HERE/profiles/$PROFILE.env" ] || die "unknown profile '$PROFILE' (no $HERE/profiles/$PROFILE.env)"
+  # A profile that declares `# requires: compose` cannot be run without a compose project: its scenarios would
+  # skip silently, and a skipped scenario is never evidence.
+  if grep -qiE '^#[[:space:]]*requires:.*compose' "$HERE/profiles/$PROFILE.env" && [ -z "$proj" ]; then
+    die "profile '$PROFILE' requires --compose-project (or NS_COMPOSE_PROJECT): without it its scenarios would be skipped, not proven"
+  fi
 fi
 
 # ── environment ────────────────────────────────────────────────

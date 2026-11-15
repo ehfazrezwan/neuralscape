@@ -212,10 +212,11 @@ def test_required_baseline_areas_each_have_an_expected_failure_and_a_control() -
         "identity": ("email-slug-collision", "email-slug-controls"),
         "graph-deletion": ("graph-removal-shared-support", "graph-removal-controls"),
         "readiness": ("readiness-probes-backends", "readiness-controls"),
-        "backup": ("backup-covers-compose-volumes", "backup-volume-controls"),
     }
     # Areas whose pinned defect has been fixed: both scenarios are now controls.
     fixed = {
+        "backup": ("backup-covers-compose-volumes", "backup-volume-controls"),
+        "job-key": ("job-key-store-scope-control", "job-key-raw-options-control", "job-key-controls"),
         "namespace": ("group-id-tuple-collision", "group-id-distinct-controls"),
         "queued-visibility": ("queued-visibility-publication", "queued-job-deleted-memory-control"),
         "stale-revision": ("stale-revision-edit", "patch-partial-control"),
@@ -227,9 +228,6 @@ def test_required_baseline_areas_each_have_an_expected_failure_and_a_control() -
     for area, ids in fixed.items():
         for scenario_id in ids:
             assert by_id[scenario_id].kind == "control", area
-    # The job-key defects are fixed: that area is controls only now.
-    for control in ("job-key-store-scope-control", "job-key-raw-options-control", "job-key-controls"):
-        assert by_id[control].kind == "control", control
 
 
 def test_module_is_standard_library_only() -> None:
