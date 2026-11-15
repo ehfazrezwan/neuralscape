@@ -212,7 +212,6 @@ def test_required_baseline_areas_each_have_an_expected_failure_and_a_control() -
         "namespace": ("group-id-tuple-collision", "group-id-distinct-controls"),
         "identity": ("email-slug-collision", "email-slug-controls"),
         "queued-visibility": ("queued-visibility-publication", "queued-job-deleted-memory-control"),
-        "job-key": ("job-key-omits-store-scope", "job-key-controls"),
         "stale-revision": ("stale-revision-edit", "patch-partial-control"),
         "graph-deletion": ("graph-removal-shared-support", "graph-removal-controls"),
         "readiness": ("readiness-probes-backends", "readiness-controls"),
@@ -220,6 +219,7 @@ def test_required_baseline_areas_each_have_an_expected_failure_and_a_control() -
     # Areas whose pinned defect has been fixed: both scenarios are now controls.
     fixed = {
         "backup": ("backup-covers-compose-volumes", "backup-volume-controls"),
+        "job-key": ("job-key-store-scope-control", "job-key-raw-options-control", "job-key-controls"),
     }
     by_id = {s.id: s for s in SCENARIOS}
     for area, (failure, control) in areas.items():

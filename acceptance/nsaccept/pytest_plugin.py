@@ -183,6 +183,8 @@ def pytest_collection_finish(session):
         )
     except runctx.ConfigError as exc:
         pytest.exit(f"harness misconfiguration: {scrub(str(exc))}", returncode=2)
+    if config._ns_ctx.compose_project:
+        os.environ["NS_HAVE_COMPOSE"] = "1"  # capability for @needs("compose")
 
 
 # ── @needs ──────────────────────────────────────────────────────

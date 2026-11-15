@@ -47,6 +47,6 @@ def test_compose_project_takes_precedence(monkeypatch):
 
     monkeypatch.setattr(runctx.tokens, "mint_via_compose", fake)
     monkeypatch.setenv("NS_API_SERVICE", "api")
-    c = runctx.build("http://x", "default", compose_project="p1")
-    assert c.token_a == f"tok-{c.user_a}" and c.token_source == "compose:p1"
-    assert calls[0][0] == "p1" and calls[0][2] == "api"
+    c = runctx.build("http://x", "default", compose_project="nstest-p1")
+    assert c.token_a == f"tok-{c.user_a}" and c.token_source == "compose:nstest-p1"
+    assert calls[0][0] == "nstest-p1" and calls[0][2] == "api"

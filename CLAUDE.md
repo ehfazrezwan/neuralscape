@@ -113,6 +113,8 @@ Forbidden in tracked files:
   generic `LLM_GATEWAY_*` *feature flags* in `config.py` are fine — the
   gateway's identity/URL is not.)
 
+The plugin's third-party agent-framework adapter keeps that framework's public name (its files, tests, manifest and README section only): it is the public name of the framework it integrates, and it is the stated exception to the codename list (owner decision 2026-11-16).
+
 Keep `deploy/` (Terraform + Helm + k8s) **generic and parameterized** with
 placeholder defaults (`project_id`, `neuralscape.example.com`, empty
 `nodeSelector`, partial TF backend). Real values are supplied only at deploy time
