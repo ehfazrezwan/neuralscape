@@ -256,7 +256,6 @@ async def list_tools() -> list[Tool]:
                     "workspaces": {
                         "type": "array",
                         "items": {"type": "string"},
-                        "minItems": 1,
                         "maxItems": 10,
                         "description": (
                             "Workspaces to search, e.g. [\"ref-trading_strategy\"]. Default (omit): "

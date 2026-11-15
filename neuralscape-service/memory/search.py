@@ -91,6 +91,8 @@ def _workspace_filter(effective: list[str]):
     if "memory" in effective:
         should.append(IsEmptyCondition(is_empty=PayloadField(key=key)))
         should.append(FieldCondition(key=key, match=MatchValue(value="memory")))
+        # Legacy/odd rows with an empty-string workspace were memory rows.
+        should.append(FieldCondition(key=key, match=MatchValue(value="")))
     if refs:
         should.append(FieldCondition(key=key, match=MatchAny(any=refs)))
     return Filter(should=should)

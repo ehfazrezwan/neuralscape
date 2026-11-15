@@ -353,13 +353,16 @@ MAX_RECALL_WORKSPACES = 10
 
 def validate_workspace_names(v: list[str] | None) -> list[str] | None:
     """Validate a recall ``workspaces`` list: names match the write-side
-    ``workspace`` pattern, 1..MAX_RECALL_WORKSPACES entries, no duplicates."""
+    ``workspace`` pattern, at most MAX_RECALL_WORKSPACES entries, duplicates
+    collapsed. ``[]`` maps to ``None`` (the default)."""
     import re
 
     if v is None:
         return None
-    if not isinstance(v, list) or not 1 <= len(v) <= MAX_RECALL_WORKSPACES:
-        raise ValueError(f"workspaces must list 1 to {MAX_RECALL_WORKSPACES} workspace names")
+    if v == []:
+        return None  # empty list = default (memory workspace only)
+    if not isinstance(v, list) or len(v) > MAX_RECALL_WORKSPACES:
+        raise ValueError(f"workspaces must list at most {MAX_RECALL_WORKSPACES} workspace names")
     for name in v:
         if not isinstance(name, str) or len(name) > 100 or not re.fullmatch(_ID_PATTERN, name):
             raise ValueError(f"Invalid workspace name {name!r}: use letters, digits, '_', '.', '-' (max 100)")

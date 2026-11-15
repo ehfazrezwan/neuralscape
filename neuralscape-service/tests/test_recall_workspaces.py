@@ -185,7 +185,7 @@ async def test_mcp_recall_default_passes_none(mcp_service):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("bad", [["bad name"], ["ok", "x/../y"], [], ["a"] * 11, "ref-x", [5]])
+@pytest.mark.parametrize("bad", [["bad name"], ["ok", "x/../y"], ["a" + str(i) for i in range(11)], "ref-x", [5]])
 async def test_mcp_recall_rejects_invalid_workspaces(mcp_service, bad):
     out = await mcp_server.call_tool("recall_memories", {"query": "q", "user_id": "u1", "workspaces": bad})
     assert "error" in json.loads(out[0].text)
@@ -227,9 +227,54 @@ def test_rest_search_default_passes_none(rest_client):
     assert svc.search.call_args.kwargs["workspaces"] is None
 
 
-@pytest.mark.parametrize("bad", [["bad name"], ["x/y"], [], ["a"] * 11, ["a" * 101]])
+@pytest.mark.parametrize("bad", [["bad name"], ["x/y"], ["a" + str(i) for i in range(11)], ["a" * 101]])
 def test_rest_search_rejects_invalid_workspaces(rest_client, bad):
     client, svc = rest_client
     r = client.post("/v1/search", json={"query": "q", "user_id": "u1", "workspaces": bad})
     assert r.status_code == 422
     svc.search.assert_not_called()
+
+
+def test_rest_empty_workspaces_means_default(rest_client):
+    client, svc = rest_client
+    assert client.post("/v1/search", json={"query": "q", "user_id": "u1", "workspaces": []}).status_code == 200
+    assert svc.search.call_args.kwargs["workspaces"] is None
+
+
+@pytest.mark.asyncio
+async def test_mcp_empty_workspaces_means_default(mcp_service):
+    await mcp_server.call_tool("recall_memories", {"query": "q", "user_id": "u1", "workspaces": []})
+    assert mcp_service.search.call_args.kwargs["workspaces"] is None
+
+
+def test_empty_string_workspace_row_is_still_a_memory_row(service, pool):
+    pool.upsert(COLLECTION, [_point(300, "memory row empty-string ws", workspace="", cos=0.98)])
+    got = _texts(service.search("q", "u1", limit=20, include_shared=False, vector_only=True))
+    assert "memory row empty-string ws" in got
+    ref = _texts(service.search("q", "u1", limit=20, workspaces=["ref-x"], include_shared=False, vector_only=True))
+    assert "memory row empty-string ws" not in ref
+
+
+def _vis_point(pid, data, user, visibility, workspace="ref-x"):
+    p = _point(pid, data, user=user, workspace=workspace, cos=0.95)
+    p.payload["metadata"]["visibility"] = visibility
+    return p
+
+
+def test_workspace_does_not_cross_users(service, pool):
+    """User B asking for ref-x never sees A's private ref-x row (personal pool
+    is keyed on user_id, shared pool on visibility=shared); A's SHARED ref-x
+    row is visible to B as in any shared recall."""
+    pool.upsert(COLLECTION, [
+        _vis_point(400, "A private ref row", "userA", "private"),
+        _vis_point(401, "A shared ref row", "userA", "shared"),
+    ])
+    got = _texts(service.search("q", "userB", limit=20, workspaces=["ref-x"], vector_only=True))
+    assert "A private ref row" not in got
+    assert "A shared ref row" in got
+    only_private = _texts(service.search("q", "userB", limit=20, workspaces=["ref-x"],
+                                         include_shared=False, vector_only=True))
+    assert only_private == []  # B owns nothing; no shared pool requested
+    # the owner still reads her own private row
+    mine = _texts(service.search("q", "userA", limit=20, workspaces=["ref-x"], include_shared=False, vector_only=True))
+    assert "A private ref row" in mine

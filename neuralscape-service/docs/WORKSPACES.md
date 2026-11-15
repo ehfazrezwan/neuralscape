@@ -14,10 +14,11 @@ There are two kinds of workspace:
 ## Write side
 
 - Every row can carry `metadata.workspace`.
-- `POST /v1/memories/raw` and `POST /v1/ingest` accept an optional `workspace`
-  field (same name pattern), but the API routes do not forward it today: the
+- `POST /v1/memories/raw` and the document ingest route `POST /v1/ingest` accept an
+  optional `workspace` field (same name pattern), but the API routes do not forward it today: the
   value is validated and then ignored, so rows written through them carry no
-  workspace unless the ingest pipeline derives one (next bullet).
+  workspace unless the ingest pipeline derives one (next bullet). `POST /v1/ingest/text` and
+  `POST /v1/ingest/files` have no `workspace` field.
 - The ingest pipeline gives every document ingested with a non-default adapter
   (for example `trading_strategy`) a workspace named `ref-<adapter>`, or
   `ref-<adapter>--<title-slug>` when the document has a title. The slug is the
@@ -52,14 +53,14 @@ Dreaming (the consolidation sweep) keeps workspaces apart:
 
 Recall reads the memory workspace only, unless the caller names workspaces.
 
-- MCP `recall_memories`: optional `workspaces`, an array of 1 to 10 names.
+- MCP `recall_memories`: optional `workspaces`, an array of up to 10 names.
 - REST `POST /v1/search`: optional `workspaces`, same shape. A malformed list is
   rejected (422 on REST, an `error` result on MCP).
 - `MemoryService.search(workspaces=[...])`.
 
 Behaviour:
 
-- Absent (or empty): the memory workspace only, as before.
+- Absent or `[]`: the memory workspace only, as before.
 - `["ref-x"]`: only rows in `ref-x`.
 - `["memory", "ref-x"]`: both. Names match exactly: `ref-trading_strategy` does
   not match `ref-trading_strategy--my-book`.
