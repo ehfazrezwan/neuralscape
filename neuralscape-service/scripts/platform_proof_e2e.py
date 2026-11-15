@@ -51,6 +51,7 @@ os.environ["DREAMING_OBSIDIAN_VAULT_PATH"] = "/tmp/platform-e2e-vault"
 os.environ["AUTH_PROVIDER"] = "token"
 os.environ["NEURALSCAPE_API_KEY"] = ""
 os.environ["NEURALSCAPE_USER_TOKEN_SECRET"] = ""
+os.environ["NEURALSCAPE_AUTH_DISABLED"] = "true"  # explicit opt-out (auth is fail-closed)
 
 RUN = uuid.uuid4().hex[:8]
 USER = f"platform-e2e-user-{RUN}"
@@ -75,6 +76,7 @@ def main() -> int:  # noqa: PLR0915 — linear E2E narrative
 
     settings.neuralscape_api_key = ""
     settings.neuralscape_user_token_secret = ""
+    settings.neuralscape_auth_disabled = True
     settings.savings_meter_enabled = True
     settings.session_summary_enabled = True
     settings.extraction_instructions_enabled = True

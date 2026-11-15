@@ -4,6 +4,8 @@ Provides both legacy endpoints (root) and new v1 endpoints with scoping,
 categories, and a shared MemoryService business logic layer.
 """
 
+import third_party_telemetry  # noqa: F401 — must precede any mem0/Graphiti import (defaults their telemetry off)
+
 import asyncio
 import base64
 import hashlib
@@ -77,7 +79,7 @@ from schemas import (
     TimelineResponse,
     normalize_visibility,
 )
-from task_manager import TaskManager
+from task_manager import TaskManager, TaskStatusUnavailable
 
 logger = logging.getLogger(__name__)
 
@@ -113,8 +115,10 @@ def _get_memory():
             if _memory is None:
                 from mem0 import Memory
 
+                from memory.core import _memory_from_config
+
                 config = settings.get_mem0_config()
-                _memory = Memory.from_config(config)
+                _memory = _memory_from_config(Memory, config)
 
                 if hasattr(_memory, "graph") and hasattr(_memory.graph, "graphiti"):
                     _graphiti = _memory.graph.graphiti
@@ -142,8 +146,12 @@ def _get_async_memory():
     if _async_memory is None:
         from mem0 import AsyncMemory
 
+        from memory.core import _memory_from_config
+
+        # AsyncMemory.from_config is synchronous and builds the same sync
+        # Qdrant store as Memory, so the same cold-start handling applies.
         config = settings.get_mem0_config()
-        _async_memory = AsyncMemory.from_config(config)
+        _async_memory = _memory_from_config(AsyncMemory, config)
     return _async_memory
 
 
@@ -246,8 +254,8 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# Register Bearer token auth middleware (no-op when NEURALSCAPE_API_KEY is unset)
-from auth import BearerAuthMiddleware
+# Register Bearer token auth middleware (fail-closed; see auth.py and AUTH.md)
+from auth import BearerAuthMiddleware, is_admin_user, resolve_request_user_id
 
 app.add_middleware(BearerAuthMiddleware)
 
@@ -411,14 +419,15 @@ async def health():
 
 
 @app.post("/memories")
-async def add_memory(req: LegacyAddMemoryRequest):
+async def add_memory(req: LegacyAddMemoryRequest, request: Request):
     """Add a memory through mem0 (vector + graph). Legacy endpoint."""
     m = _get_memory()
+    user_id = _resolve_user_id(request, req.user_id)
     try:
         result = await asyncio.to_thread(
             m.add,
             messages=req.messages,
-            user_id=req.user_id or settings.default_user_id,
+            user_id=user_id,
             agent_id=req.agent_id,
             run_id=req.run_id,
             metadata=req.metadata,
@@ -430,14 +439,15 @@ async def add_memory(req: LegacyAddMemoryRequest):
 
 
 @app.post("/search")
-async def search_memories(req: LegacySearchRequest):
+async def search_memories(req: LegacySearchRequest, request: Request):
     """Search memories through mem0. Legacy endpoint."""
     m = _get_memory()
+    user_id = _resolve_user_id(request, req.user_id)
     try:
         result = await asyncio.to_thread(
             m.search,
             query=req.query,
-            user_id=req.user_id or settings.default_user_id,
+            user_id=user_id,
             agent_id=req.agent_id,
             run_id=req.run_id,
             limit=req.limit,
@@ -450,6 +460,7 @@ async def search_memories(req: LegacySearchRequest):
 
 @app.get("/memories")
 async def list_memories(
+    request: Request,
     user_id: str = Query(default=None),
     agent_id: str = Query(default=None),
     run_id: str = Query(default=None),
@@ -457,10 +468,11 @@ async def list_memories(
 ):
     """List all memories for a user. Legacy endpoint."""
     m = _get_memory()
+    user_id = _resolve_user_id(request, user_id)
     try:
         result = await asyncio.to_thread(
             m.get_all,
-            user_id=user_id or settings.default_user_id,
+            user_id=user_id,
             agent_id=agent_id,
             run_id=run_id,
             limit=limit,
@@ -473,16 +485,18 @@ async def list_memories(
 
 @app.delete("/memories")
 async def delete_memories(
+    request: Request,
     user_id: str = Query(default=None),
     agent_id: str = Query(default=None),
     run_id: str = Query(default=None),
 ):
     """Delete all memories for a user. Legacy endpoint."""
     m = _get_memory()
+    user_id = _resolve_user_id(request, user_id)
     try:
         await asyncio.to_thread(
             m.delete_all,
-            user_id=user_id or settings.default_user_id,
+            user_id=user_id,
             agent_id=agent_id,
             run_id=run_id,
         )
@@ -493,11 +507,12 @@ async def delete_memories(
 
 
 @app.post("/memories/async")
-async def add_memory_async(req: LegacyAddMemoryRequest):
+async def add_memory_async(req: LegacyAddMemoryRequest, request: Request):
     """Add a memory in the background (non-blocking). Returns a task_id to poll."""
+    user_id = _resolve_user_id(request, req.user_id)
     task_id = await _task_manager.enqueue_store(
         messages=req.messages,
-        user_id=req.user_id or settings.default_user_id,
+        user_id=user_id,
         agent_id=req.agent_id,
         run_id=req.run_id,
     )
@@ -507,34 +522,85 @@ async def add_memory_async(req: LegacyAddMemoryRequest):
     )
 
 
-@app.get("/memories/status/{task_id}")
-async def get_task_status(task_id: str):
-    """Check the status of an async memory addition task."""
-    result = await _task_manager.get_status(task_id)
+async def _caller_task_status(request: Request, task_id: str) -> dict:
+    """Status of ``task_id`` as the caller may see it; 404 when unknown or not theirs.
+
+    With a per-user token only the user who enqueued the task can read it, and
+    anyone else gets the same 404 as for an id that never existed. With the
+    shared key (or with auth disabled) every caller holds the same credential
+    and may write as any user, so there is no caller to check and the status
+    is returned as before. If the owner check cannot reach Redis the answer
+    is a 503 for every id alike, never the task's state.
+    """
+    token_user_id = getattr(request.state, "user_id", None)
+    try:
+        result = await _task_manager.get_status(
+            task_id,
+            user_id=token_user_id,
+            enforce_owner=bool(token_user_id),
+            # Graph tasks (e.g. an edit's graph_task_id) report queued too.
+            include_graph=True,
+        )
+    except TaskStatusUnavailable:
+        # Same answer for every id (owned, foreign or unknown); retryable.
+        raise HTTPException(
+            status_code=503,
+            detail="Task status is temporarily unavailable; retry shortly.",
+            headers={"Retry-After": "1"},
+        )
     if result["status"] == "not_found":
         raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
     return result
 
 
+@app.get("/memories/status/{task_id}")
+async def get_task_status(task_id: str, request: Request):
+    """Check the status of an async memory addition task."""
+    return await _caller_task_status(request, task_id)
+
+
 # Legacy graph endpoints
 @app.get("/graph/nodes")
 async def list_graph_nodes_legacy(
+    request: Request,
     user_id: str = Query(default=None),
     limit: int = Query(default=50),
+    include_expired: bool = Query(default=False),
 ):
-    """List entity nodes from Graphiti. Legacy endpoint."""
+    """List entity nodes from Graphiti. Legacy endpoint.
+
+    Excludes nodes with no live connecting edges by default (see
+    memory/graph_admin.py::get_graph_nodes) — pass ``include_expired=true``
+    for an operator/debug view.
+    """
+    # Authorization before availability: a non-dictator asking for expired
+    # artifacts gets 403 even when the legacy Graphiti handle is unavailable.
+    group_id = _resolve_user_id(request, user_id)
+    _authorize_include_expired(group_id, include_expired)
     g = _get_graphiti()
     if g is None:
         raise HTTPException(status_code=503, detail="Graphiti not initialized")
 
     from graphiti_core.nodes import EntityNode
-
-    group_id = user_id or settings.default_user_id
+    from memory.groups import _live_node_uuids
     try:
         nodes = await asyncio.to_thread(
             _run_on_bridge,
             EntityNode.get_by_group_ids(g.driver, group_ids=[group_id], limit=limit),
         )
+        if not include_expired and nodes:
+            uuids = [n.uuid for n in nodes]
+            live = await asyncio.to_thread(
+                _live_node_uuids, _run_on_bridge, g.driver, uuids, [group_id]
+            )
+            if live is None:
+                logger.warning(
+                    "Legacy list_graph_nodes: liveness query failed, failing "
+                    "CLOSED to no nodes for group_id=%r", group_id,
+                )
+                nodes = []
+            else:
+                nodes = [n for n in nodes if n.uuid in live]
         return {
             "status": "ok",
             "nodes": [
@@ -556,23 +622,35 @@ async def list_graph_nodes_legacy(
 
 @app.get("/graph/edges")
 async def list_graph_edges_legacy(
+    request: Request,
     user_id: str = Query(default=None),
     limit: int = Query(default=50),
+    include_expired: bool = Query(default=False),
 ):
-    """List entity edges (facts) from Graphiti. Legacy endpoint."""
+    """List entity edges (facts) from Graphiti. Legacy endpoint.
+
+    Excludes soft-expired/invalidated edges by default (see
+    memory/graph_admin.py::get_graph_edges) — pass ``include_expired=true``
+    for an operator/debug view.
+    """
+    # Authorization before availability: a non-dictator asking for expired
+    # artifacts gets 403 even when the legacy Graphiti handle is unavailable.
+    group_id = _resolve_user_id(request, user_id)
+    _authorize_include_expired(group_id, include_expired)
     g = _get_graphiti()
     if g is None:
         raise HTTPException(status_code=503, detail="Graphiti not initialized")
 
     from graphiti_core.edges import EntityEdge
     from graphiti_core.errors import GroupsEdgesNotFoundError
-
-    group_id = user_id or settings.default_user_id
+    from memory.groups import _edge_is_invalidated
     try:
         edges = await asyncio.to_thread(
             _run_on_bridge,
             EntityEdge.get_by_group_ids(g.driver, group_ids=[group_id], limit=limit),
         )
+        if not include_expired:
+            edges = [e for e in edges if not _edge_is_invalidated(e)]
         return {
             "status": "ok",
             "edges": [
@@ -600,6 +678,7 @@ async def list_graph_edges_legacy(
 
 @app.get("/graph/episodes")
 async def list_graph_episodes_legacy(
+    request: Request,
     user_id: str = Query(default=None),
     limit: int = Query(default=20),
 ):
@@ -608,7 +687,7 @@ async def list_graph_episodes_legacy(
     if g is None:
         raise HTTPException(status_code=503, detail="Graphiti not initialized")
 
-    group_id = user_id or settings.default_user_id
+    group_id = _resolve_user_id(request, user_id)
     now = datetime.now(timezone.utc)
     try:
         episodes = await asyncio.to_thread(
@@ -641,6 +720,7 @@ async def list_graph_episodes_legacy(
 
 @app.get("/graph/communities")
 async def list_graph_communities_legacy(
+    request: Request,
     user_id: str = Query(default=None),
     limit: int = Query(default=20),
 ):
@@ -651,7 +731,7 @@ async def list_graph_communities_legacy(
 
     from graphiti_core.nodes import CommunityNode
 
-    group_id = user_id or settings.default_user_id
+    group_id = _resolve_user_id(request, user_id)
     try:
         communities = await asyncio.to_thread(
             _run_on_bridge,
@@ -676,7 +756,7 @@ async def list_graph_communities_legacy(
 
 
 @app.post("/graph/search")
-async def advanced_graph_search_legacy(req: LegacyGraphSearchRequest):
+async def advanced_graph_search_legacy(req: LegacyGraphSearchRequest, request: Request):
     """Advanced Graphiti search with configurable SearchConfig. Legacy endpoint."""
     g = _get_graphiti()
     if g is None:
@@ -685,7 +765,7 @@ async def advanced_graph_search_legacy(req: LegacyGraphSearchRequest):
     from graphiti_core.search.search_config import SearchConfig
     from graphiti_core.search.search_config_recipes import EDGE_HYBRID_SEARCH_RRF
 
-    group_id = req.user_id or settings.default_user_id
+    group_id = _resolve_user_id(request, req.user_id)
 
     if req.search_config:
         try:
@@ -744,27 +824,11 @@ v1_router = APIRouter(prefix="/v1", tags=["v1"])
 def _resolve_user_id(request: Request, body_user_id: str | None) -> str:
     """Resolve the authoritative user_id for a v1 request.
 
-    - When the auth middleware verified a per-user token, ``request.state.user_id``
-      is set; that wins. If the body also supplied ``user_id`` and they disagree,
-      reject with 400 to prevent token-vs-body identity confusion.
-    - Legacy shared-key callers don't have ``request.state.user_id``; we trust
-      the body's ``user_id`` as before.
-    - When neither path supplies an id, fall back to ``settings.default_user_id``.
-
-    Raises HTTPException(400) on token/body mismatch.
+    Thin delegate to ``auth.resolve_request_user_id`` (shared with extension
+    routers, which cannot import main). Token user wins; a disagreeing body
+    user_id is a 400; legacy shared-key callers use the body or the default.
     """
-    token_user_id = getattr(request.state, "user_id", None)
-    if token_user_id:
-        if body_user_id and body_user_id != token_user_id:
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    f"Request body user_id ({body_user_id!r}) does not match the "
-                    f"user_id encoded in the auth token ({token_user_id!r})."
-                ),
-            )
-        return token_user_id
-    return body_user_id or settings.default_user_id
+    return resolve_request_user_id(request, body_user_id)
 
 
 def _authorize_standard_write(user_id: str, visibility) -> None:
@@ -783,6 +847,28 @@ def _authorize_standard_write(user_id: str, visibility) -> None:
         raise HTTPException(
             status_code=403,
             detail=f"User {user_id!r} is not authorized to write 'standard'-tier memories.",
+        )
+
+
+def _authorize_include_expired(user_id: str, include_expired: bool) -> None:
+    """Reject ``include_expired=true`` on the graph listing routes for
+    non-dictators.
+
+    Security fix: soft-expired nodes/edges can contain retracted PRIVATE
+    content (memory/provenance.py's cascade on a visibility flip/delete).
+    ``include_expired`` is an operator/debug escape hatch — before this gate
+    it was honored for ANY authenticated caller, re-exposing exactly what
+    the cascade removed. No-op when ``include_expired`` is falsy (the
+    default, unfiltered-listing behavior is unaffected). Raises 403 rather
+    than silently ignoring the flag, so a caller learns it's privileged
+    instead of getting a quietly-filtered response that looks like a bug.
+    """
+    if not include_expired:
+        return
+    if not settings.is_dictator(user_id):
+        raise HTTPException(
+            status_code=403,
+            detail=f"User {user_id!r} is not authorized to use include_expired=true.",
         )
 
 
@@ -916,6 +1002,7 @@ async def v1_ingest_document(req: IngestDocumentRequest, request: Request):
         "scope": req.scope,
         "project_id": req.project_id,
         "visibility": req.visibility.value if req.visibility else None,
+        "sensitivity_override": req.sensitivity_override,
         "tags": req.tags,
         "agent_id": req.agent_id,
         "run_id": req.run_id,
@@ -1006,6 +1093,7 @@ async def v1_ingest_text(req: IngestTextRequest, request: Request):
         "scope": req.scope,
         "project_id": req.project_id,
         "visibility": req.visibility.value if req.visibility else None,
+        "sensitivity_override": req.sensitivity_override,
         "tags": req.tags,
         "agent_id": req.agent_id,
         "run_id": req.run_id,
@@ -1045,6 +1133,10 @@ async def v1_ingest_files(
     project_id: str | None = Form(None),
     user_id: str | None = Form(None),
     visibility: str | None = Form(None),
+    sensitivity_override: bool = Form(
+        False,
+        description="Sensitivity gate escape hatch — see RawMemoryRequest.sensitivity_override.",
+    ),
     tags: str | None = Form(None, description="Comma-separated tags"),
     extract_facts: bool = Form(True),
     index_passages: bool = Form(True),
@@ -1100,6 +1192,7 @@ async def v1_ingest_files(
         "scope": scope,
         "project_id": project_id,
         "visibility": visibility,
+        "sensitivity_override": sensitivity_override,
         "tags": parsed_tags,
         "extract_facts": extract_facts,
         "index_passages": index_passages,
@@ -1765,12 +1858,28 @@ async def _require_owned_connector(vault, connector_id: str, caller: str) -> dic
 
 @v1_router.post("/connectors", status_code=201)
 async def v1_register_connector(req: ConnectorConfigRequest, request: Request):
-    """Register (or replace) a data-layer connector instance. Secrets are encrypted at rest."""
+    """Register (or replace) a data-layer connector instance. Secrets are encrypted at rest.
+
+    A per-user caller can only replace a connector it owns: an id owned by
+    someone else answers the same 404 as the other connector routes, so the
+    connector cannot be taken over. Connector ids share one namespace across
+    users, so this route does show whether an id is taken (201 for an unused
+    id, 404 for one owned by someone else); it does not reveal the owner or
+    the connector's config. Without a caller identity (shared key / auth
+    disabled) a replacement may change the owner; the vault then starts a new
+    instance with fresh sync state.
+    """
+    from connectors.vault import ConnectorOwnedElsewhere
+
     vault = _require_vault()
     resolved_user_id = _resolve_user_id(request, None)
     record = req.model_dump(mode="json", exclude_none=True)
     record["owner_user_id"] = resolved_user_id
-    redacted = await vault.put(record)
+    per_user_caller = bool(getattr(request.state, "user_id", None))
+    try:
+        redacted = await vault.put(record, allow_owner_change=not per_user_caller)
+    except ConnectorOwnedElsewhere:
+        raise HTTPException(status_code=404, detail=f"Connector '{req.connector_id}' not found")
     return JSONResponse(status_code=201, content=redacted)
 
 
@@ -1796,8 +1905,10 @@ async def v1_delete_connector(connector_id: str, request: Request):
     """Delete one of the caller's connectors (does not remove ingested memories)."""
     vault = _require_vault()
     caller = _resolve_user_id(request, None)
-    await _require_owned_connector(vault, connector_id, caller)
-    removed = await vault.delete(connector_id)
+    rec = await _require_owned_connector(vault, connector_id, caller)
+    # Only the instance the owner check saw: a connector re-created in between
+    # (a new generation) is not removed.
+    removed = await vault.delete(connector_id, generation=rec.get("generation"))
     return {"status": "ok", "deleted": removed}
 
 
@@ -1806,8 +1917,10 @@ async def v1_sync_connector(connector_id: str, request: Request):
     """Trigger an immediate sync for one of the caller's connectors."""
     vault = _require_vault()
     caller = _resolve_user_id(request, None)
-    await _require_owned_connector(vault, connector_id, caller)
-    task_id = await _task_manager.enqueue_connector_sync(connector_id)
+    rec = await _require_owned_connector(vault, connector_id, caller)
+    task_id = await _task_manager.enqueue_connector_sync(
+        connector_id, user_id=caller, generation=rec.get("generation")
+    )
     return TaskAcceptedResponse(task_id=task_id, poll_url=f"/v1/memories/status/{task_id}")
 
 
@@ -1894,12 +2007,9 @@ async def v1_store_raw_batch(req: RawMemoryBatchRequest, request: Request):
 
 
 @v1_router.get("/memories/status/{task_id}", response_model=TaskStatusResponse)
-async def v1_get_task_status(task_id: str):
-    """Poll async task status."""
-    result = await _task_manager.get_status(task_id)
-    if result["status"] == "not_found":
-        raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
-    return result
+async def v1_get_task_status(task_id: str, request: Request):
+    """Poll async task status (only the user who enqueued it, with a per-user token)."""
+    return await _caller_task_status(request, task_id)
 
 
 # ── Recall ────────────────────────────────────
@@ -2796,9 +2906,22 @@ async def v1_list_memories(
 
 
 @v1_router.get("/memories/{memory_id}", response_model=MemoryResponse)
-async def v1_get_memory(memory_id: str):
-    """Get a single memory by ID."""
-    result = await asyncio.to_thread(_service.get_memory, memory_id)
+async def v1_get_memory(
+    memory_id: str,
+    request: Request,
+    user_id: str | None = Query(default=None),
+):
+    """Get a single memory by ID.
+
+    Gated by the caller's effective identity (token > query > default, the
+    same precedence every read path uses): private memories are readable
+    only by their owner; shared/standard memories are readable by any
+    authenticated caller. A memory the caller may not read is reported as
+    404 — identical to not-found — so this can't be used as an existence
+    oracle for another user's private memories.
+    """
+    resolved_user_id = _resolve_user_id(request, user_id)
+    result = await asyncio.to_thread(_service.get_memory, memory_id, resolved_user_id)
     if result is None:
         raise HTTPException(status_code=404, detail=f"Memory {memory_id} not found")
     return result
@@ -2807,7 +2930,9 @@ async def v1_get_memory(memory_id: str):
 @v1_router.get("/memories/{memory_id}/reasoning_chain")
 async def v1_get_reasoning_chain(
     memory_id: str,
+    request: Request,
     max_depth: int = Query(default=3, ge=1, le=10),
+    user_id: str | None = Query(default=None),
 ):
     """Walk a memory's ``derived_from`` provenance into a reasoning tree.
 
@@ -2817,8 +2942,21 @@ async def v1_get_reasoning_chain(
     write that supplied ``derived_from``) was built from. Cycle-protected
     and capped (~50 nodes); leaves may carry ``missing`` / ``cycle`` /
     ``truncated`` markers. 404 when the root memory doesn't exist.
+
+    Gated by the caller's effective identity: the root memory AND every
+    premise node the walk would otherwise expand are checked against the
+    same read-visibility rule as ``get_memory``/``get_memories_by_ids``. A
+    premise the caller may not read is reported the same as a missing
+    premise (``{"missing": true}``, no content) rather than expanded — so a
+    reasoning chain can never leak another user's private premise content.
     """
-    chain = await asyncio.to_thread(_service.get_reasoning_chain, memory_id, max_depth)
+    resolved_user_id = _resolve_user_id(request, user_id)
+    chain = await asyncio.to_thread(
+        _service.get_reasoning_chain,
+        memory_id,
+        max_depth,
+        caller_user_id=resolved_user_id,
+    )
     if chain is None:
         raise HTTPException(status_code=404, detail=f"Memory {memory_id} not found")
     return {"status": "ok", "chain": chain}
@@ -2862,7 +3000,11 @@ async def v1_patch_memory(memory_id: str, req: PatchMemoryRequest, request: Requ
     graph_task_id = None
     if result.get("graph_job"):
         try:
-            graph_task_id = await _task_manager.enqueue_graph_enrichment(**result["graph_job"])
+            # The job writes to the storage owner's graph partition; the
+            # task id goes to (and is readable by) the caller who edited.
+            graph_task_id = await _task_manager.enqueue_graph_enrichment(
+                **result["graph_job"], requester_user_id=caller
+            )
             graph = graph.replace("_pending", "_queued")
         except Exception as e:
             # Never run Graphiti inline on a request thread — report honestly instead.
@@ -2972,14 +3114,21 @@ async def v1_graph_nodes(
     user_id: str | None = Query(default=None),
     project_id: str | None = Query(default=None),
     limit: int = Query(default=50),
+    include_expired: bool = Query(default=False),
 ):
-    """List entity nodes from Graphiti with project_id filter."""
+    """List entity nodes from Graphiti with project_id filter.
+
+    Excludes nodes with no live connecting edges by default — pass
+    ``include_expired=true`` for an operator/debug view.
+    """
     resolved_user_id = _resolve_user_id(request, user_id)
+    _authorize_include_expired(resolved_user_id, include_expired)
     nodes = await asyncio.to_thread(
         _service.get_graph_nodes,
         user_id=resolved_user_id,
         project_id=project_id,
         limit=limit,
+        include_expired=include_expired,
     )
     return {"status": "ok", "nodes": nodes}
 
@@ -2990,14 +3139,21 @@ async def v1_graph_edges(
     user_id: str | None = Query(default=None),
     project_id: str | None = Query(default=None),
     limit: int = Query(default=50),
+    include_expired: bool = Query(default=False),
 ):
-    """List entity edges (facts) from Graphiti with project_id filter."""
+    """List entity edges (facts) from Graphiti with project_id filter.
+
+    Excludes soft-expired/invalidated edges by default — pass
+    ``include_expired=true`` for an operator/debug view.
+    """
     resolved_user_id = _resolve_user_id(request, user_id)
+    _authorize_include_expired(resolved_user_id, include_expired)
     edges = await asyncio.to_thread(
         _service.get_graph_edges,
         user_id=resolved_user_id,
         project_id=project_id,
         limit=limit,
+        include_expired=include_expired,
     )
     return {"status": "ok", "edges": edges}
 
@@ -3114,20 +3270,29 @@ async def v1_list_extensions():
 
 
 @v1_router.post("/extensions/events")
-async def v1_emit_extension_event(req: EmitEventRequest):
+async def v1_emit_extension_event(req: EmitEventRequest, request: Request):
     """Post an event to all registered extensions.
 
     Broadcasts the event to extensions whose manifest.hooks includes
     the given event_type. Useful for external callers (e.g. OpenClaw hooks).
     For known event types, validates the payload against the expected schema.
     """
+    # Bind the payload identity to the token: extensions (conversation
+    # compiler) take payload["user_id"] as the namespace to write into.
+    # Legacy shared-key callers are unchanged (no token user to bind to).
+    payload = req.payload
+    token_user_id = getattr(request.state, "user_id", None)
+    if token_user_id:
+        payload = dict(payload or {})
+        payload["user_id"] = _resolve_user_id(request, payload.get("user_id"))
+
     # Validate payload for known event types
     try:
         event_enum = EventType(req.event_type)
         payload_model = EVENT_PAYLOAD_MODELS.get(event_enum)
         if payload_model is not None:
             try:
-                payload_model.model_validate(req.payload)
+                payload_model.model_validate(payload)
             except Exception as e:
                 raise HTTPException(
                     status_code=422,
@@ -3136,7 +3301,7 @@ async def v1_emit_extension_event(req: EmitEventRequest):
     except ValueError:
         pass  # Unknown/custom event type — allow pass-through
 
-    result = await _extension_registry.emit_event(req.event_type, req.payload)
+    result = await _extension_registry.emit_event(req.event_type, payload)
     return {
         "status": "ok",
         "event_type": req.event_type,
@@ -3189,8 +3354,20 @@ async def v1_get_project_knowledge_config(project_id: str):
 
 
 @v1_router.put("/projects/{project_id}/knowledge-config", response_model=ProjectKnowledgeConfigResponse)
-async def v1_set_project_knowledge_config(project_id: str, req: ProjectKnowledgeConfigRequest):
-    """Set/update a project's knowledge routing config (Phase D)."""
+async def v1_set_project_knowledge_config(
+    project_id: str, req: ProjectKnowledgeConfigRequest, request: Request
+):
+    """Set/update a project's knowledge routing config (Phase D).
+
+    Dictator-only (mirrors project-wide extraction instructions): the config
+    is shared by every user of the project.
+    """
+    user_id = _resolve_user_id(request, None)
+    if not is_admin_user(user_id):
+        raise HTTPException(
+            status_code=403,
+            detail=f"User {user_id!r} is not authorized to set project knowledge config.",
+        )
     from knowledge.router import ProjectKnowledgeConfig, set_project_config
 
     config = ProjectKnowledgeConfig(
@@ -3212,6 +3389,108 @@ async def v1_set_project_knowledge_config(project_id: str, req: ProjectKnowledge
 # extension itself — dreaming (its successor) exposes its admin surface at
 # /v1/extensions/dreaming/run and /v1/extensions/dreaming/status via the
 # extension-route mount. See docs/DREAMING_MODE_SPEC.md.
+
+
+# ══════════════════════════════════════════════
+# Admin — private-graph-leakage remediation
+# ══════════════════════════════════════════════
+#
+# Backward-looking cleanup for the shared→private visibility-flip leak
+# (memory/remediation.py): a memory written while shared, later flipped
+# private, could leave graph artifacts (edges/entity summaries/episode
+# content) live in the shared pool. These are the first /v1/admin/* routes.
+# Dictator-only (see ``_authorize_standard_write`` above for the identical
+# gate pattern this mirrors) — this touches raw Cypher across other users'
+# graph groups, not a self-service surface.
+
+
+class RescopePrivateDerivativesRequest(BaseModel):
+    """Request body for POST /v1/admin/rescope-private-derivatives."""
+
+    user_id: str | None = Field(
+        default=None,
+        description="Target user to remediate. Defaults to the caller. Only a dictator may target another user.",
+    )
+    dry_run: bool = Field(
+        default=True,
+        description="Resolve and count only — no writes. Must be explicitly set false to mutate anything.",
+    )
+
+
+class AuditPrivateLeakageRequest(BaseModel):
+    """Request body for POST /v1/admin/audit-private-leakage."""
+
+    user_id: str | None = Field(
+        default=None,
+        description="Target user to audit. Defaults to the caller. Only a dictator may target another user.",
+    )
+
+
+def _require_dictator_admin(request: Request) -> str:
+    """Resolve the caller's own identity (ignoring any body-supplied
+    target — that's a separate field these admin routes gate below) and
+    reject non-dictators outright. Same status code / error shape as
+    ``_authorize_standard_write``.
+    """
+    caller = _resolve_user_id(request, None)
+    if not settings.is_dictator(caller):
+        raise HTTPException(
+            status_code=403,
+            detail=f"User {caller!r} is not authorized to use this admin tool.",
+        )
+    return caller
+
+
+@v1_router.post("/admin/rescope-private-derivatives")
+async def v1_rescope_private_derivatives(req: RescopePrivateDerivativesRequest, request: Request):
+    """Cascade-expire shared-group graph derivatives of a user's private
+    memories (memory/remediation.py::rescope_private_derivatives).
+
+    ``dry_run`` defaults to true: resolves and counts what WOULD be
+    cascaded without writing anything. Pass ``dry_run: false`` explicitly
+    to mutate. Re-enrichment jobs the service produces (only when a
+    cascade actually removed something and the private side has no
+    episode of its own) are enqueued here on the graph queue — the same
+    pattern ``patch_memory``'s ``graph_job`` uses above.
+    """
+    caller = _require_dictator_admin(request)
+    target = req.user_id or caller
+    try:
+        result = await asyncio.to_thread(
+            _service.rescope_private_derivatives, target, dry_run=req.dry_run
+        )
+    except Exception as e:
+        logger.exception("rescope_private_derivatives failed")
+        raise HTTPException(status_code=500, detail="Failed to rescope private derivatives") from e
+
+    graph_jobs = result.pop("graph_jobs", [])
+    enqueued = 0
+    if graph_jobs:
+        for job in graph_jobs:
+            try:
+                await _task_manager.enqueue_graph_enrichment(**job)
+                enqueued += 1
+            except Exception as e:
+                logger.warning(
+                    f"Re-enrichment enqueue failed for {job.get('memory_id')} (non-critical): {e}"
+                )
+    result["graph_jobs_enqueued"] = enqueued
+    return result
+
+
+@v1_router.post("/admin/audit-private-leakage")
+async def v1_audit_private_leakage(req: AuditPrivateLeakageRequest, request: Request):
+    """Read-only proof of whether any of a user's private memories still
+    have a live derivative in a shared graph group
+    (memory/remediation.py::audit_private_leakage). Never writes.
+    """
+    caller = _require_dictator_admin(request)
+    target = req.user_id or caller
+    try:
+        return await asyncio.to_thread(_service.audit_private_leakage, target)
+    except Exception as e:
+        logger.exception("audit_private_leakage failed")
+        raise HTTPException(status_code=500, detail="Failed to audit private leakage") from e
 
 
 # Mount v1 router

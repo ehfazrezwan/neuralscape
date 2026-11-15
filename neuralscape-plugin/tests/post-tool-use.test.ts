@@ -236,7 +236,7 @@ describe("buildObservationRow", () => {
       cwd: "/home/u/project",
       tool_name: "Edit",
       tool_input: { file_path: "/x.ts", old_string: "a", new_string: "b" },
-      tool_output: "edit ok",
+      tool_response: "edit ok",
     });
     expect(row.ts).toBeTypeOf("string");
     expect(row.session_id).toBe("sess-1");
@@ -257,7 +257,7 @@ describe("buildObservationRow", () => {
     const row = buildObservationRow({
       tool_name: "Bash",
       tool_input: { command: "do stuff" },
-      tool_output: huge,
+      tool_response: huge,
     });
     expect((row.output as string).length).toBeLessThan(huge.length);
     expect(row.output as string).toContain("[truncated]");
@@ -282,11 +282,75 @@ describe("buildObservationRow", () => {
     const row = buildObservationRow({
       tool_name: "Bash",
       tool_input: { command: "x" },
-      // @ts-expect-error — runtime coercion of non-string tool_output
-      tool_output: { stdout: "hello", exit: 0 },
+      tool_response: { stdout: "hello", exit: 0 },
     });
     // asString → JSON.stringify produces canonical key order from object literal
     expect(row.output).toBe('{"stdout":"hello","exit":0}');
+  });
+
+  // Claude Code sends the tool result as `tool_response` (never
+  // `tool_output`): a string for some tools, an object for most.
+  it("captures a string tool_response", () => {
+    const row = buildObservationRow({
+      tool_name: "WebFetch",
+      tool_input: { url: "https://example.com" },
+      tool_response: "page summary text",
+    });
+    expect(row.output).toBe("page summary text");
+  });
+
+  it("captures an object tool_response as JSON (never [object Object])", () => {
+    const resp = { stdout: "built 3 files", stderr: "", interrupted: false, isImage: false };
+    const row = buildObservationRow({
+      tool_name: "Bash",
+      tool_input: { command: "make build" },
+      tool_response: resp,
+    });
+    expect(row.output).toBe(JSON.stringify(resp));
+    expect(row.output).not.toContain("[object Object]");
+  });
+
+  it("still accepts the legacy tool_output field", () => {
+    const row = buildObservationRow({
+      tool_name: "Bash",
+      tool_input: { command: "make build" },
+      tool_output: "legacy ok",
+    });
+    expect(row.output).toBe("legacy ok");
+  });
+
+  it("prefers tool_response over tool_output when both are present", () => {
+    const row = buildObservationRow({
+      tool_name: "Bash",
+      tool_input: { command: "make build" },
+      tool_response: "new",
+      tool_output: "old",
+    });
+    expect(row.output).toBe("new");
+  });
+
+  it("truncates a large object tool_response to the same size cap", () => {
+    const row = buildObservationRow({
+      tool_name: "Bash",
+      tool_input: { command: "make build" },
+      tool_response: { stdout: "Y".repeat(5000), stderr: "" },
+    });
+    const out = row.output as string;
+    expect(out).toContain("[truncated]");
+    expect(out.length).toBeLessThan(1100);
+  });
+
+  it("redacts a <private> span even when truncation would split it", () => {
+    // Opener lands in the elided middle, closer in the kept tail: redacting
+    // AFTER truncation would leak the tail half of the secret.
+    const text = "A".repeat(900) + "<private>" + "S".repeat(500) + "TAILSECRET</private> done";
+    const row = buildObservationRow({
+      tool_name: "Bash",
+      tool_input: { command: "x" },
+      tool_response: text,
+    });
+    expect(row.output as string).not.toContain("TAILSECRET");
+    expect(row.output as string).not.toContain("SSS");
   });
 
   it("ts is ISO 8601", () => {

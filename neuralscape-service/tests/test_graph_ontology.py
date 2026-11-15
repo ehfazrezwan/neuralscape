@@ -117,9 +117,15 @@ def test_enrich_graph_default_passes_no_ontology_kwargs():
 # ── MemoryGraph.add forwards to add_episode ────────────────────────
 
 
+class _FakeEpisode:
+    uuid = "ep-fake-uuid"
+    name = "ep-fake-name"
+
+
 class _FakeAddResult:
     edges: list = []
     nodes: list = []
+    episode = _FakeEpisode()
 
 
 class _FakeBridge:

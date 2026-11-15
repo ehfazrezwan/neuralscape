@@ -16,6 +16,8 @@ Supports both stdio transport (local Claude Code) and Streamable HTTP
 transport (remote agent access via /mcp/ endpoint on port 8199).
 """
 
+import third_party_telemetry  # noqa: F401 — must precede any mem0/Graphiti import (defaults their telemetry off)
+
 import asyncio
 import contextlib
 import json
@@ -467,6 +469,16 @@ async def list_tools() -> list[Tool]:
                         ),
                         "enum": ["private", "shared", "standard"],
                     },
+                    "sensitivity_override": {
+                        "type": "boolean",
+                        "description": (
+                            "Sensitivity gate escape hatch. When the content looks "
+                            "financial/equity/client-commercial/credentials, the server "
+                            "forces visibility='private' regardless of the 'visibility' "
+                            "field above — UNLESS this is true AND 'visibility' was also "
+                            "explicitly set. Default: false."
+                        ),
+                    },
                     "wait": {
                         "type": "boolean",
                         "description": "If true, wait for memory to be fully stored before returning. Default: false (fire-and-forget).",
@@ -563,6 +575,13 @@ async def list_tools() -> list[Tool]:
                     "project_id": {"type": "string", "description": "Project id (sets project scope)"},
                     "scope": {"type": "string", "enum": ["global", "project"]},
                     "visibility": {"type": "string", "enum": ["private", "shared", "standard"]},
+                    "sensitivity_override": {
+                        "type": "boolean",
+                        "description": (
+                            "Sensitivity gate escape hatch — see 'remember'. Applies to "
+                            "every fact this ingest produces. Default: false."
+                        ),
+                    },
                     "extract_facts": {"type": "boolean", "description": "Also run LLM extraction for distilled facts (default true)"},
                     "index_passages": {"type": "boolean", "description": "Chunk + store verbatim passages (default true)"},
                     "tags": {"type": "array", "items": {"type": "string"}},
@@ -600,6 +619,13 @@ async def list_tools() -> list[Tool]:
                     "project_id": {"type": "string", "description": "Project id (sets project scope)"},
                     "scope": {"type": "string", "enum": ["global", "project"]},
                     "visibility": {"type": "string", "enum": ["private", "shared", "standard"]},
+                    "sensitivity_override": {
+                        "type": "boolean",
+                        "description": (
+                            "Sensitivity gate escape hatch — see 'remember'. Applies to "
+                            "every fact this ingest produces. Default: false."
+                        ),
+                    },
                     "extract_facts": {"type": "boolean", "description": "Also run LLM extraction for distilled facts (default true)"},
                     "index_passages": {"type": "boolean", "description": "Chunk + store verbatim passages (default true)"},
                     "tags": {"type": "array", "items": {"type": "string"}},
@@ -1191,6 +1217,62 @@ async def list_tools() -> list[Tool]:
                 "required": ["project_id"],
             },
         ),
+        # ── Admin — private-graph-leakage remediation ────────────────────
+        # Backward-looking cleanup for the shared→private visibility-flip
+        # leak (memory/remediation.py). Dictator-only — see the
+        # settings.is_dictator gate in call_tool below.
+        Tool(
+            name="rescope_private_derivatives",
+            description=(
+                "ADMIN (dictator-only). Cascade-expire shared-group graph derivatives "
+                "of a user's private memories — cleans up already-leaked graph edges, "
+                "entity summaries, and episode content left behind when a memory was "
+                "flipped from shared to private before the going-forward fix existed. "
+                "dry_run defaults to true: resolves and counts what WOULD be cascaded "
+                "without writing anything. Pass dry_run=false explicitly to mutate. "
+                "Idempotent — a second dry_run=false call after a clean run returns zeros."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "user_id": {
+                        "type": "string",
+                        "description": (
+                            "Target user to remediate. Defaults to the caller. "
+                            "Only a dictator may target another user."
+                        ),
+                    },
+                    "dry_run": {
+                        "type": "boolean",
+                        "description": "Resolve and count only, no writes (default true).",
+                    },
+                },
+                "required": [],
+            },
+        ),
+        Tool(
+            name="audit_private_leakage",
+            description=(
+                "ADMIN (dictator-only), READ-ONLY. Proves whether any of a user's "
+                "private memories still have a live derivative in a shared graph "
+                "group — checks live RELATES_TO edges, non-empty Entity summaries, "
+                "and raw Episodic content, plus a heuristic text-match backstop. "
+                "Returns total==0 after a successful rescope_private_derivatives run."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "user_id": {
+                        "type": "string",
+                        "description": (
+                            "Target user to audit. Defaults to the caller. "
+                            "Only a dictator may target another user."
+                        ),
+                    },
+                },
+                "required": [],
+            },
+        ),
     ] + _code_graph_tools()
 
 
@@ -1387,7 +1469,7 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
     #      arguments["user_id"] is ignored rather than trusted.
     #   2. An explicit user_id argument (stdio / local Claude Code, legacy).
     #   3. The configured default_user_id.
-    from auth import current_user_id
+    from auth import current_user_id, is_admin_user
 
     # Tools like list_memories / delete_memories declare no required fields, so a
     # client may omit `arguments` entirely (None). Normalize before any access.
@@ -1814,6 +1896,7 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
                 "derived_from": arguments.get("derived_from"),
                 "epistemic_level": arguments.get("epistemic_level"),
                 "visibility": arguments.get("visibility"),
+                "sensitivity_override": arguments.get("sensitivity_override", False),
             }
 
             # Authoritative-tier write-gate: only dictators may write standards.
@@ -1923,6 +2006,7 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
                 "scope": scope,
                 "project_id": project_id,
                 "visibility": arguments.get("visibility"),
+                "sensitivity_override": arguments.get("sensitivity_override", False),
                 "tags": arguments.get("tags"),
                 "extract_facts": arguments.get("extract_facts", True),
                 "index_passages": arguments.get("index_passages", True),
@@ -2006,6 +2090,7 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
                 "scope": req.scope,
                 "project_id": project_id,
                 "visibility": req.visibility.value if req.visibility else None,
+                "sensitivity_override": req.sensitivity_override,
                 "tags": req.tags,
                 "extract_facts": req.extract_facts,
                 "index_passages": req.index_passages,
@@ -2141,8 +2226,9 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
             graph_task_id = None
             if result.get("graph_job"):
                 try:
+                    # Storage owner's partition; the editor polls the task.
                     graph_task_id = await _task_manager.enqueue_graph_enrichment(
-                        **result["graph_job"]
+                        **result["graph_job"], requester_user_id=user_id
                     )
                     graph = graph.replace("_pending", "_queued")
                 except Exception as e:
@@ -2163,7 +2249,11 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
                 max_depth = 3
             max_depth = min(max(max_depth, 1), 10)
             chain = await asyncio.to_thread(
-                _service.get_reasoning_chain, arguments["memory_id"], max_depth
+                _service.get_reasoning_chain,
+                arguments["memory_id"],
+                max_depth,
+                50,
+                user_id,
             )
             if chain is None:
                 return [TextContent(type="text", text=json.dumps(
@@ -2486,6 +2576,10 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
         elif name == "set_project_knowledge_config":
             from knowledge.router import ProjectKnowledgeConfig, set_project_config
 
+            if not is_admin_user(user_id):
+                return [TextContent(type="text", text=json.dumps(
+                    {"error": f"User {user_id!r} is not authorized to set project knowledge config."}))]
+
             project_id = arguments.get("project_id")
             if not project_id:
                 return [TextContent(type="text", text=json.dumps({"error": "project_id required"}))]
@@ -2511,6 +2605,11 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
             # worker's queue and let the caller poll the status endpoint.
             from extensions.dreaming.config import dreaming_settings
 
+            # Dictator-only, checked before the flag/force logic (mirrors REST /run).
+            if not is_admin_user(user_id):
+                return [TextContent(type="text", text=json.dumps(
+                    {"error": f"User {user_id!r} is not authorized to trigger dreaming sweeps."}))]
+
             force = bool(arguments.get("force", False))
             if not dreaming_settings.enabled and not force:
                 return [TextContent(type="text", text=json.dumps({
@@ -2526,6 +2625,11 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
                 force,
                 _queue_name=settings.graph_queue_name,
             )
+            if job:
+                # The caller may also poll it on /v1/memories/status.
+                from task_manager import record_task_owner
+
+                await record_task_owner(arq_pool, job.job_id, user_id)
             return [TextContent(type="text", text=json.dumps({
                 "status": "enqueued",
                 "job_id": job.job_id if job else None,
@@ -2666,6 +2770,48 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
             out = await _task_manager.get_queue_status(user_id)
             return [TextContent(type="text", text=json.dumps(
                 {"status": "ok", **out}, default=str))]
+
+        elif name in ("rescope_private_derivatives", "audit_private_leakage"):
+            # Admin — private-graph-leakage remediation (memory/remediation.py).
+            # Dictator-only for BOTH tools: the caller identity is resolved
+            # from the token/session ONLY (never trusted from `arguments`,
+            # unlike the generic `user_id` fallback above, and never
+            # defaulted to `settings.default_user_id` the way unauthenticated
+            # reads are — an unauthenticated stdio caller must not silently
+            # become whatever user a deployment configured as the default,
+            # which could itself be a dictator). A non-dictator (or
+            # unauthenticated caller) is denied outright — same gate shape
+            # as _standard_write_error.
+            caller = current_user_id.get()
+            if not caller:
+                return [TextContent(type="text", text=json.dumps(
+                    {"error": "authentication required"}))]
+            if not settings.is_dictator(caller):
+                return [TextContent(type="text", text=json.dumps(
+                    {"error": f"User {caller!r} is not authorized to use this admin tool."}))]
+            target = arguments.get("user_id") or caller
+
+            if name == "rescope_private_derivatives":
+                dry_run = arguments.get("dry_run", True)
+                result = await asyncio.to_thread(
+                    _service.rescope_private_derivatives, target, dry_run=dry_run
+                )
+                graph_jobs = result.pop("graph_jobs", [])
+                enqueued = 0
+                for job in graph_jobs:
+                    try:
+                        await _task_manager.enqueue_graph_enrichment(**job)
+                        enqueued += 1
+                    except Exception as e:
+                        logger.warning(
+                            f"Re-enrichment enqueue failed for {job.get('memory_id')} "
+                            f"(non-critical): {e}"
+                        )
+                result["graph_jobs_enqueued"] = enqueued
+                return [TextContent(type="text", text=json.dumps(result, default=str))]
+
+            result = await asyncio.to_thread(_service.audit_private_leakage, target)
+            return [TextContent(type="text", text=json.dumps(result, default=str))]
 
         else:
             return [TextContent(type="text", text=json.dumps({"error": f"Unknown tool: {name}"}))]

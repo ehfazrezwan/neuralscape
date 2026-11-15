@@ -1,0 +1,1099 @@
+"""Engine capability declarations that keep operational facts distinct.
+
+A manifest describes an implementation; it does not select a provider, grant
+access, or prove current usability. Qualification references make a claim
+reviewable but are not themselves proof that the referenced evidence is valid.
+"""
+
+from __future__ import annotations
+
+from enum import Enum
+from collections.abc import Mapping
+from types import MappingProxyType
+from typing import Any, Callable, Iterator, NamedTuple, TypeVar
+
+from pydantic import BaseModel, TypeAdapter, model_validator
+
+from contracts_common import ContractModel, OpaqueId, VersionedContract
+from contracts_limits import DISCOVERY_BUDGET_MESSAGE, DiscoveryBudget, is_exact_type
+from contracts_native import is_subclass
+from contracts_references import ReferenceHandle
+
+
+_ContractT = TypeVar("_ContractT", bound=BaseModel)
+_MAX_SNAPSHOT_DEPTH = 256
+_OPAQUE_ID_ADAPTER = TypeAdapter(OpaqueId)
+_MODEL_DICT_DESCRIPTOR = BaseModel.__dict__["__dict__"]
+_MODEL_FIELDS_SET_DESCRIPTOR = BaseModel.__dict__["__pydantic_fields_set__"]
+_MODEL_EXTRAS_DESCRIPTOR = BaseModel.__dict__["__pydantic_extra__"]
+_MISSING_MODEL_STORAGE = object()
+
+
+class _FrozenModelState(NamedTuple):
+    """Callback-free entry state for one natively reachable model."""
+
+    owner: BaseModel
+    storage_is_dict: bool
+    stored_items: tuple[tuple[Any, Any], ...]
+    fields_set_is_set: bool
+    fields_set_members: tuple[Any, ...]
+    extras_state: str
+    extra_items: tuple[tuple[Any, Any], ...]
+
+
+class _FrozenContainerState(NamedTuple):
+    """Callback-free entry edges for one exact native container."""
+
+    owner: Any
+    kind: str
+    entries: tuple[Any, ...]
+
+
+_TYPE_MRO = vars(type)["__mro__"]
+# Non-text keys whose hashing and comparison run no caller code and never equal a text key.
+_INERT_NON_TEXT_KEYS = (int, float, bool, type(None))
+
+
+def _is_real_mapping(value: Any) -> bool:
+    """Whether ``value`` really is a mapping, not merely registered as one.
+
+    ``isinstance`` against the ABC also honours ``register()``, so a class that registered
+    itself (and has none of the protocol) would be trusted and called.  A real mapping
+    inherits from ``Mapping`` (its own MRO, by identity) or is the one standard read-only
+    view that only registers, recognised by exact type.
+    """
+
+    kind = type(value)
+    return kind is MappingProxyType or any(base is Mapping for base in _TYPE_MRO.__get__(kind))
+
+
+def _model_storage(descriptor: Any, value: BaseModel) -> Any:
+    """Read a BaseModel-owned store without subclass attribute dispatch."""
+
+    try:
+        return descriptor.__get__(value, BaseModel)
+    except AttributeError:
+        return _MISSING_MODEL_STORAGE
+
+
+def _native_set_members(value: set[Any] | frozenset[Any]) -> tuple[Any, ...]:
+    """Capture concrete set members without subclass iteration hooks."""
+
+    if is_subclass(type(value), set):
+        return tuple(set.__iter__(value))
+    return tuple(frozenset.__iter__(value))
+
+
+def _native_len(value: Any) -> int:
+    """Length of a concrete native container without subclass hooks."""
+
+    value_type = type(value)
+    if is_subclass(value_type, dict):
+        return dict.__len__(value)
+    if is_subclass(value_type, list):
+        return list.__len__(value)
+    if is_subclass(value_type, tuple):
+        return tuple.__len__(value)
+    if is_subclass(value_type, set):
+        return set.__len__(value)
+    return frozenset.__len__(value)
+
+
+def _freeze_native_model_graph(
+    value: Any,
+    frozen_models: dict[int, _FrozenModelState],
+    frozen_containers: dict[int, _FrozenContainerState],
+    discovered: dict[int, Any],
+    budget: DiscoveryBudget,
+    depth: int = 0,
+) -> None:
+    """Freeze models reachable through native container edges without callbacks.
+
+    One ``budget`` is shared by every root of a validation call.  Nodes are
+    charged once by identity and every captured entry is charged as an edge
+    *before* it is copied, so an oversized graph is rejected with the stable
+    budget error before any public callback runs and without materializing it.
+    The depth frontier carries ``(object, depth, authoritative)``: model fields
+    and exact built-in containers are authoritative; native backing behind a
+    container subclass is hidden and clears the flag.  An authoritative node at
+    the snapshot depth limit is captured but its children are not enqueued, so
+    the ordered snapshot still reports the established nesting error.
+    """
+
+    pending: list[tuple[Any, int, bool]] = [(value, depth, True)]
+    while pending:
+        current, depth, authoritative = pending.pop()
+        current_type = type(current)
+        if not is_subclass(current_type, (BaseModel, dict, list, tuple)):
+            continue
+        identity = id(current)
+        if not budget.visit(current, depth, authoritative):
+            continue
+        discovered[identity] = current
+        enqueue = not (authoritative and depth >= _MAX_SNAPSHOT_DEPTH)
+        children: tuple[Any, ...] = ()
+        children_authoritative = authoritative
+
+        if is_subclass(current_type, BaseModel):
+            frozen = frozen_models.get(identity)
+            if frozen is None or frozen.owner is not current:
+                storage = _model_storage(_MODEL_DICT_DESCRIPTOR, current)
+                fields_set_value = _model_storage(
+                    _MODEL_FIELDS_SET_DESCRIPTOR,
+                    current,
+                )
+                extras_value = _model_storage(_MODEL_EXTRAS_DESCRIPTOR, current)
+                storage_is_dict = is_subclass(type(storage), dict)
+                fields_set_is_set = is_subclass(
+                    type(fields_set_value),
+                    (set, frozenset),
+                )
+                extras_are_dict = type(extras_value) is dict
+                budget.charge_edge(
+                    (_native_len(storage) if storage_is_dict else 0)
+                    + (_native_len(fields_set_value) if fields_set_is_set else 0)
+                    + (_native_len(extras_value) if extras_are_dict else 0)
+                )
+                stored_items = (
+                    tuple(dict.items(storage)) if storage_is_dict else ()
+                )
+                fields_set_members = (
+                    _native_set_members(fields_set_value)
+                    if fields_set_is_set
+                    else ()
+                )
+                if extras_value is _MISSING_MODEL_STORAGE:
+                    extras_state = "missing"
+                    extra_items: tuple[tuple[Any, Any], ...] = ()
+                elif extras_value is None:
+                    extras_state = "none"
+                    extra_items = ()
+                elif extras_are_dict:
+                    extras_state = "dict"
+                    extra_items = tuple(dict.items(extras_value))
+                else:
+                    extras_state = "malformed"
+                    extra_items = ()
+                frozen = _FrozenModelState(
+                    owner=current,
+                    storage_is_dict=storage_is_dict,
+                    stored_items=stored_items,
+                    fields_set_is_set=fields_set_is_set,
+                    fields_set_members=fields_set_members,
+                    extras_state=extras_state,
+                    extra_items=extra_items,
+                )
+                frozen_models[identity] = frozen
+            else:
+                # Re-expansion through a shallower authoritative path: the
+                # captured edges are charged again, nothing is re-read.
+                budget.charge_edge(
+                    len(frozen.stored_items)
+                    + len(frozen.fields_set_members)
+                    + len(frozen.extra_items)
+                )
+            children = tuple(item for _, item in frozen.stored_items)
+        else:
+            if is_subclass(current_type, dict):
+                kind, exact = "dict", current_type is dict
+                state = frozen_containers.get(identity)
+                if state is None or state.owner is not current:
+                    budget.charge_edge(_native_len(current))
+                    entries: tuple[Any, ...] = tuple(dict.items(current))
+                else:
+                    budget.charge_edge(len(state.entries))
+                    entries = state.entries
+                children = tuple(item for _, item in entries)
+            else:
+                if is_subclass(current_type, list):
+                    kind, exact = "list", current_type is list
+                    reader = list.__iter__
+                else:
+                    kind, exact = "tuple", current_type is tuple
+                    reader = tuple.__iter__
+                state = frozen_containers.get(identity)
+                if state is None or state.owner is not current:
+                    budget.charge_edge(_native_len(current))
+                    entries = tuple(reader(current))
+                else:
+                    budget.charge_edge(len(state.entries))
+                    entries = state.entries
+                children = entries
+            if exact:
+                frozen_containers[identity] = _FrozenContainerState(
+                    owner=current,
+                    kind=kind,
+                    entries=entries,
+                )
+            else:
+                # Native backing behind a subclass is hidden: it is accounted
+                # for but never authoritative.
+                children_authoritative = False
+
+        if enqueue:
+            pending.extend((child, depth + 1, children_authoritative) for child in children)
+
+
+def _normalize_field_names(
+    names: tuple[Any, ...],
+    *,
+    location: str,
+    storage_kind: str,
+) -> tuple[str, ...]:
+    """Normalize string-subclass names without invoking their hooks."""
+
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for candidate in names:
+        if not is_subclass(type(candidate), str):
+            raise ValueError(
+                f"malformed contract {storage_kind} at {location}: "
+                "field names must be strings"
+            )
+        name = str.__str__(candidate)
+        if name in seen:
+            raise ValueError(
+                f"malformed contract {storage_kind} at {location}: "
+                "field names collide after normalization"
+            )
+        seen.add(name)
+        normalized.append(name)
+    return tuple(normalized)
+
+
+def _normalize_field_items(
+    items: tuple[tuple[Any, Any], ...],
+    *,
+    location: str,
+    storage_kind: str,
+) -> tuple[tuple[str, Any], ...]:
+    """Attach normalized names to values captured from native storage."""
+
+    names = _normalize_field_names(
+        tuple(name for name, _ in items),
+        location=location,
+        storage_kind=storage_kind,
+    )
+    return tuple(
+        (name, item)
+        for name, (_, item) in zip(names, items)
+    )
+
+
+def _open_pair(entry: Any) -> tuple[Any, Any, Iterator[Any] | None]:
+    """Read a key/value pair's first two items: ``(key, value, rest)``.
+
+    Unpacking (``key, value = pair``) asks a pair's iterator for a third item, to check there is
+    none, *before* the caller can capture the value, and a pair's public iterator can run code at
+    that point.  This reads exactly two items; the caller captures the value and then calls
+    ``_close_pair(rest)``.  An exact tuple is read natively (no hook runs, ``rest`` is ``None``).
+    The errors and messages are the ones unpacking raises.
+    """
+
+    if type(entry) is tuple:
+        size = tuple.__len__(entry)
+        if size < 2:
+            raise ValueError(f"not enough values to unpack (expected 2, got {size})")
+        if size > 2:
+            raise ValueError("too many values to unpack (expected 2)")
+        return tuple.__getitem__(entry, 0), tuple.__getitem__(entry, 1), None
+    try:
+        iterator = iter(entry)
+    except TypeError:
+        raise TypeError(f"cannot unpack non-iterable {type(entry).__name__} object") from None
+    try:
+        key = next(iterator)
+    except StopIteration:
+        raise ValueError("not enough values to unpack (expected 2, got 0)") from None
+    try:
+        value = next(iterator)
+    except StopIteration:
+        raise ValueError("not enough values to unpack (expected 2, got 1)") from None
+    return key, value, iterator
+
+
+def _close_pair(rest: Iterator[Any] | None) -> None:
+    """The exhaustion check unpacking would have made, after the value was captured."""
+
+    if rest is None:
+        return
+    try:
+        next(rest)
+    except StopIteration:
+        return
+    raise ValueError("too many values to unpack (expected 2)")
+
+
+def _charged_entries(read: Callable[[], Any], budget: DiscoveryBudget) -> Iterator[Any]:
+    """Observe a public view: one charge for the observation itself (an empty view is
+    not free), taken before the view is read, then one charge per entry observed."""
+
+    budget.charge_edge()
+    for entry in read():
+        budget.charge_edge()
+        yield entry
+
+
+def _snapshot_native_value(
+    value: Any,
+    *,
+    active: set[int],
+    frozen_models: dict[int, _FrozenModelState],
+    frozen_containers: dict[int, _FrozenContainerState],
+    discovered: dict[int, Any],
+    budget: DiscoveryBudget,
+    memo: dict[Any, Any],
+    depth: int,
+    location: str,
+    guard: bool = False,
+    guard_memo: dict[int, tuple[Any, Any, int]] | None = None,
+    json_guard: Callable[[str, str], bool] | None = None,
+) -> tuple[Any, int, bool]:
+    """Copy a contract graph without discarding unchecked model state.
+
+    Returns ``(copy, height, memoizable)``.  A subtree built only from native
+    storage (models and exact built-in containers) is a pure function of the
+    entry state frozen for the call, so it is copied once per object identity
+    and shared by every path that reaches it; the work is bounded by the
+    distinct objects and edges rather than the number of paths.  ``height`` is
+    the deepest descendant relative to this value, so the nesting limit still
+    applies to every path.  A subtree that observed a public view (a container
+    subclass) is never memoized: each edge that reaches such a view observes
+    it again, and every entry observed is charged to the shared budget.
+    """
+
+    if depth > _MAX_SNAPSHOT_DEPTH:
+        raise ValueError(f"contract graph nesting exceeds the limit at {location}")
+    if depth > budget.tier.max_depth:
+        raise ValueError(DISCOVERY_BUDGET_MESSAGE)  # the tier applies to every occurrence, not only to discovery
+
+    value_type = type(value)
+    if guard and is_subclass(value_type, BaseModel):
+        # Inside a JSON-valued field a model object would be flattened into a plain mapping and
+        # lose its unchecked state, so it is rejected in the same replay that validates the value.
+        raise ValueError(f"JSON value contains a model object at {location}")
+    if guard and guard_memo is None:
+        guard_memo = {}
+    table = guard_memo if guard else memo  # a subtree cached outside a JSON field is never reused inside one
+    is_container = is_subclass(value_type, (BaseModel, dict, list, tuple))
+    identity = id(value)
+    if is_container:
+        cached = table.get(identity)
+        if cached is not None and cached[0] is value:
+            _, copied, height = cached
+            if depth + height > _MAX_SNAPSHOT_DEPTH:
+                raise ValueError(f"contract graph nesting exceeds the limit at {location}")
+            if depth + height > budget.tier.max_depth:
+                raise ValueError(DISCOVERY_BUDGET_MESSAGE)
+            if not guard:
+                # every occurrence of a reused subtree is walked again, its typed collections and
+                # JSON fields included
+                _add_expansion(memo.get((_EXPANDED_WITHIN, identity), 0), budget, memo)
+            return copied, height, True
+        # A child first exposed through a public view is captured now; it is
+        # charged to the same envelope as the entry discovery.
+        _freeze_native_model_graph(
+            value,
+            frozen_models,
+            frozen_containers,
+            discovered,
+            budget,
+            depth,
+        )
+        if identity in active:
+            raise ValueError(f"cyclic contract graph at {location}")
+        active.add(identity)
+
+    expanded_before = memo.get(_EXPANDED_TOTAL, 0)
+    height = 0
+    memoizable = True
+    own_cost = 0  # copying an exact node that cannot be reused is work the capture phase did not charge
+
+    def child(item: Any, child_location: str, name: str | None = None) -> Any:
+        nonlocal height, memoizable
+        child_guard = guard or (
+            name is not None and json_guard is not None and json_guard(location, name)
+        )
+        copied_item, item_height, item_memoizable = _snapshot_native_value(
+            item,
+            active=active,
+            frozen_models=frozen_models,
+            frozen_containers=frozen_containers,
+            discovered=discovered,
+            budget=budget,
+            memo=memo,
+            depth=depth + 1,
+            location=child_location,
+            guard=child_guard,
+            guard_memo=guard_memo,
+            json_guard=json_guard,
+        )
+        height = max(height, item_height + 1)
+        memoizable = memoizable and item_memoizable
+        if child_guard and not guard:
+            # The root of a JSON-valued field: anything may be nested and reused inside it, and
+            # validation, the JSON scans and the schema check walk it path by path.  (The fixed
+            # contract structure around it cannot expand: its depth is the schema's.)
+            _charge_expanded_size(copied_item, budget, memo)
+        return copied_item
+
+    try:
+        if is_subclass(value_type, BaseModel):
+            frozen = frozen_models[identity]
+            if not frozen.storage_is_dict or not frozen.fields_set_is_set:
+                raise ValueError(f"malformed contract model at {location}")
+            if frozen.extras_state == "malformed":
+                raise ValueError(f"malformed contract extras at {location}")
+            stored_items = _normalize_field_items(
+                frozen.stored_items,
+                location=location,
+                storage_kind="model",
+            )
+            fields_set_names = _normalize_field_names(
+                frozen.fields_set_members,
+                location=location,
+                storage_kind="model",
+            )
+            extra_items = _normalize_field_items(
+                frozen.extra_items,
+                location=location,
+                storage_kind="extras",
+            )
+            declared_names = tuple(type(value).model_fields)
+            declared = set(declared_names)
+            stored = {name for name, _ in stored_items}
+            fields_set = set(fields_set_names)
+            extras = {name for name, _ in extra_items}
+            duplicated = extras & (stored | declared)
+            if duplicated:
+                names = ", ".join(sorted(duplicated))
+                raise ValueError(
+                    f"malformed contract extras at {location}: "
+                    f"duplicate field(s): {names}"
+                )
+            undeclared = (stored | fields_set | extras) - declared
+            if undeclared:
+                names = ", ".join(sorted(undeclared))
+                raise ValueError(
+                    f"undeclared contract field(s) at {location}: {names}"
+                )
+            stored_by_name = dict(stored_items)
+            stored_values = tuple(
+                (name, stored_by_name[name])
+                for name in declared_names
+                if name in stored_by_name
+            )
+            own_cost = 1 + len(stored_values)
+            result: Any = {
+                name: child(item, f"{location}.{name}", name) for name, item in stored_values
+            }
+        elif is_subclass(value_type, dict):
+            frozen = frozen_containers.get(identity)
+            exact = (
+                frozen is not None and frozen.owner is value and frozen.kind == "dict"
+            )
+            memoizable = exact
+            if exact:
+                own_cost = 1 + len(frozen.entries)
+            result = {}
+            for entry in frozen.entries if exact else _charged_entries(value.items, budget):
+                # A public view's pair is read two items at a time: its value is captured before
+                # the pair is asked for a third item, so it cannot repair what it just exposed.
+                key, item, rest = _open_pair(entry)
+                # A str subclass is the same key to a dict lookup, so it must be the same field
+                # name to the JSON guard: an exact-str-only test would withhold the name.  Its
+                # text is read without running its hooks and stored as a plain str; two keys
+                # that collapse to one name are refused rather than one silently winning.
+                # Every contract mapping is keyed by text.  A key of any other caller-defined type is
+                # refused before it is inserted: inserting it would run its hash and equality hooks,
+                # and one that matches a text key would silently overwrite that key's value.  An exact
+                # built-in number, bool or None runs no code and never equals a text key, so it is left
+                # to strict validation, which reports it as before.
+                if is_subclass(type(key), str):
+                    key = str.__str__(key)
+                    if key in result:
+                        raise ValueError(f"contract mapping has colliding keys at {location}")
+                elif not is_exact_type(key, *_INERT_NON_TEXT_KEYS):
+                    raise ValueError(f"contract mapping keys must be text at {location}")
+                result[key] = child(item, f"{location}[key]", key if type(key) is str else None)
+                _close_pair(rest)
+        elif is_subclass(value_type, (list, tuple)):
+            is_list = is_subclass(value_type, list)
+            frozen = frozen_containers.get(identity)
+            exact = (
+                frozen is not None
+                and frozen.owner is value
+                and frozen.kind == ("list" if is_list else "tuple")
+            )
+            memoizable = exact
+            if exact:
+                own_cost = 1 + len(frozen.entries)
+            source_items = frozen.entries if exact else _charged_entries(lambda: value, budget)
+            items = [
+                child(item, f"{location}[{index}]")
+                for index, item in enumerate(source_items)
+            ]
+            result = items if is_list else tuple(items)
+        else:
+            if guard and _is_real_mapping(value):
+                # a mapping that is not a dict is not copied, but nothing hidden may sit inside a JSON value
+                for nested in _charged_entries(value.values, budget):
+                    child(nested, f"{location}[value]")
+            elif not guard and is_subclass(value_type, str):
+                # A long string is scanned once per occurrence by revalidation and the contract's checks;
+                # each occurrence charges its length (inside a JSON value, sizing counts it per path).
+                _add_expansion(_string_units(value), budget, memo)
+            return value, 0, True
+        if own_cost and not guard:
+            # Strict revalidation walks typed collections path by path, like a JSON value: an exact
+            # container shared by many parents is one node to discovery but is validated (and its
+            # contract checks run) once per occurrence.  Each copy charges its entries to the call's
+            # single expansion allowance, and a reused subtree charges them again below.
+            _add_expansion(own_cost, budget, memo)
+        if is_container and memoizable:
+            table[identity] = (value, result, height)
+            if not guard:
+                memo[(_EXPANDED_WITHIN, identity)] = memo.get(_EXPANDED_TOTAL, 0) - expanded_before
+        elif own_cost:
+            budget.charge_edge(own_cost)  # every non-reused ancestor copy is charged
+        return result, height, memoizable
+    finally:
+        if is_container:
+            active.remove(identity)
+
+
+#: Snapshot-memo keys for the call-level expansion allowance (not object identities, which are ints).  The
+#: allowance covers everything strict revalidation walks per path: typed collections and JSON values.
+_EXPANDED_TOTAL = "json-expanded-total"
+_EXPANDED_SIZE = "json-expanded-size"
+_EXPANDED_WITHIN = "json-expanded-within"
+
+
+def _charge_expanded_size(native: Any, budget: DiscoveryBudget, memo: dict[Any, Any]) -> None:
+    """Charge the expansion of one JSON-valued field to the call's single allowance.
+
+    The snapshot shares one copy of a reused subtree between every path that reaches it, so it
+    is cheap to build, but everything that follows (strict validation, the JSON scans, the
+    schema check) walks the *paths* of every JSON-valued field: a value that holds itself twice
+    at each of 40 levels is a few hundred bytes and 2**40 paths, and one admitted value reused by
+    many fields (or one proposal repeated) is walked once per field.  So the expanded sizes of all
+    JSON-valued fields of one call share a single allowance, the tier's edge limit, and a total
+    above it is the stable budget error.  ``memo`` is the call's snapshot memo, shared by every
+    root of the call; each distinct container is sized once per call, and a memoized subtree that
+    holds JSON fields is charged again for them every time it is reused.
+    """
+
+    _add_expansion(_expanded_size(native, budget, memo), budget, memo)
+
+
+def _add_expansion(amount: int, budget: DiscoveryBudget, memo: dict[Any, Any]) -> None:
+    total = memo.get(_EXPANDED_TOTAL, 0) + amount
+    if total > budget.tier.max_edges:
+        budget.charge_edge(budget.tier.max_edges - budget.edges + 1)  # raises and leaves the budget exhausted
+    memo[_EXPANDED_TOTAL] = total
+
+
+#: A string costs one allowance unit per this many characters: a short string is free, and a long one
+#: repeated by reference is charged for the scans every occurrence receives.
+_STRING_UNIT_CHARS = 1024
+
+
+def _string_units(text: str) -> int:
+    return str.__len__(text) // _STRING_UNIT_CHARS
+
+
+def _expanded_size(native: Any, budget: DiscoveryBudget, memo: dict[Any, Any]) -> int:
+    """The work a path-by-path walk of ``native`` does, sized once per container: its entries, plus
+    one unit per ``_STRING_UNIT_CHARS`` characters of every string or key it scans.
+
+    Children first, by identity (``entries + the expanded size of its children``), so the work is
+    proportional to the distinct graph; sizing stops as soon as one container exceeds the edge
+    limit.  Sizes are kept in the call's memo with the object they belong to.
+    """
+
+    limit = budget.tier.max_edges
+    if is_subclass(type(native), str):
+        # A scalar text value: no container to size, but every occurrence is scanned.
+        return _string_units(native)
+
+    def known(value: Any) -> int | None:
+        held = memo.get((_EXPANDED_SIZE, id(value)))
+        return held[1] if held is not None and held[0] is value else None
+
+    pending: list[tuple[Any, bool]] = [(native, False)]
+    while pending:
+        value, expanded = pending.pop()
+        kind = type(value)
+        if kind is not dict and kind is not list and kind is not tuple:
+            continue
+        if not expanded and known(value) is not None:
+            continue  # sized already: never copy its children again (N references to one wide list)
+        children = tuple(dict.values(value)) if kind is dict else tuple(value)
+        if not expanded:
+            pending.append((value, True))
+            pending.extend((child, False) for child in children if known(child) is None)
+            continue
+        total = len(children)
+        texts = tuple(dict.keys(value)) + children if kind is dict else children
+        for child in texts:
+            if is_subclass(type(child), str):
+                # every path scans a long string (or key) again; a str subclass kept through the
+                # snapshot is text of the same length (its length is read without its hooks)
+                total += _string_units(child)
+            else:
+                total += known(child) or 0
+            if total > limit:
+                budget.charge_edge(limit - budget.edges + 1)  # raises and leaves the budget exhausted
+        memo[(_EXPANDED_SIZE, id(value))] = (value, total)
+    return known(native) or 0
+
+
+def _validated_contract_snapshot(
+    value: Any,
+    expected_type: type[_ContractT],
+    *,
+    label: str,
+) -> _ContractT:
+    """Return a fresh, fully validated closed-contract snapshot."""
+
+    if not is_subclass(type(value), expected_type):
+        raise TypeError(f"{label} must be a {expected_type.__name__}")
+    frozen_models: dict[int, _FrozenModelState] = {}
+    frozen_containers: dict[int, _FrozenContainerState] = {}
+    discovered: dict[int, Any] = {}
+    budget = DiscoveryBudget()
+    memo: dict[Any, Any] = {}
+    _freeze_native_model_graph(
+        value,
+        frozen_models,
+        frozen_containers,
+        discovered,
+        budget,
+    )
+    return _validated_contract_snapshot_from_frozen(
+        value,
+        expected_type,
+        label=label,
+        frozen_models=frozen_models,
+        frozen_containers=frozen_containers,
+        discovered=discovered,
+        budget=budget,
+        memo=memo,
+    )
+
+
+def _validated_contract_snapshot_from_frozen(
+    value: Any,
+    expected_type: type[_ContractT],
+    *,
+    label: str,
+    frozen_models: dict[int, _FrozenModelState],
+    frozen_containers: dict[int, _FrozenContainerState],
+    discovered: dict[int, Any],
+    budget: DiscoveryBudget,
+    memo: dict[Any, Any],
+    guard_memo: dict[int, tuple[Any, Any, int]] | None = None,
+    json_guard: Callable[[str, str], bool] | None = None,
+) -> _ContractT:
+    """Validate using entry state already frozen for the enclosing boundary."""
+
+    if not is_subclass(type(value), expected_type):
+        raise TypeError(f"{label} must be a {expected_type.__name__}")
+    try:
+        native, _, _ = _snapshot_native_value(
+            value,
+            active=set(),
+            frozen_models=frozen_models,
+            frozen_containers=frozen_containers,
+            discovered=discovered,
+            budget=budget,
+            memo=memo,
+            depth=0,
+            location=label,
+            guard_memo=guard_memo,
+            json_guard=json_guard,
+        )
+    except RecursionError as exc:
+        raise ValueError(f"contract graph nesting is invalid at {label}") from exc
+    return expected_type.model_validate(native)
+
+
+def _validated_contract_tuple(
+    values: Any,
+    expected_type: type[_ContractT],
+    *,
+    label: str,
+) -> tuple[_ContractT, ...]:
+    """Validate a tuple argument without normalizing another container type."""
+
+    if not is_subclass(type(values), tuple):
+        raise TypeError(f"{label} must be a tuple")
+    frozen_models: dict[int, _FrozenModelState] = {}
+    frozen_containers: dict[int, _FrozenContainerState] = {}
+    discovered: dict[int, Any] = {}
+    budget = DiscoveryBudget()
+    memo: dict[Any, Any] = {}
+    _freeze_native_model_graph(
+        values,
+        frozen_models,
+        frozen_containers,
+        discovered,
+        budget,
+    )
+    return _validated_contract_tuple_from_frozen(
+        values,
+        expected_type,
+        label=label,
+        frozen_models=frozen_models,
+        frozen_containers=frozen_containers,
+        discovered=discovered,
+        budget=budget,
+        memo=memo,
+    )
+
+
+def _validated_contract_tuple_from_frozen(
+    values: Any,
+    expected_type: type[_ContractT],
+    *,
+    label: str,
+    frozen_models: dict[int, _FrozenModelState],
+    frozen_containers: dict[int, _FrozenContainerState],
+    discovered: dict[int, Any],
+    budget: DiscoveryBudget,
+    memo: dict[Any, Any],
+) -> tuple[_ContractT, ...]:
+    """Validate a tuple using entry state frozen for the enclosing boundary."""
+
+    if not is_subclass(type(values), tuple):
+        raise TypeError(f"{label} must be a tuple")
+    frozen = frozen_containers.get(id(values))
+    if frozen is not None and frozen.owner is values and frozen.kind == "tuple":
+        entries: Any = frozen.entries  # an exact tuple: replayed from the capture, already charged
+    else:
+        # A tuple subclass's public entries are observed here, so each one (and the observation
+        # itself, even when empty) is charged: a tiny native backing cannot yield entries for free.
+        entries = _charged_entries(lambda: values, budget)
+    return tuple(
+        _validated_contract_snapshot_from_frozen(
+            value,
+            expected_type,
+            label=f"{label}[{index}]",
+            frozen_models=frozen_models,
+            frozen_containers=frozen_containers,
+            discovered=discovered,
+            budget=budget,
+            memo=memo,
+        )
+        for index, value in enumerate(entries)
+    )
+
+
+def _validated_contract_snapshots(
+    *specs: tuple[Any, type[BaseModel], str],
+    json_guard: Callable[[str, str], bool] | None = None,
+) -> tuple[BaseModel, ...]:
+    """Validate several roots of one call from a single capture and one budget.
+
+    Order is the established precedence: every strict top-level type check, then
+    native capture and accounting of **every** root (so no root's public view can
+    run before another root's entry state is frozen, and one envelope bounds the
+    call), then the ordered reconstruction and diagnostics of each root in turn.
+    ``json_guard(parent_location, field_name)`` marks JSON-valued fields, inside
+    which a model object is rejected during that same reconstruction.
+    """
+
+    for value, expected_type, label in specs:
+        if not is_subclass(type(value), expected_type):
+            raise TypeError(f"{label} must be a {expected_type.__name__}")
+    frozen_models: dict[int, _FrozenModelState] = {}
+    frozen_containers: dict[int, _FrozenContainerState] = {}
+    discovered: dict[int, Any] = {}
+    budget = DiscoveryBudget()
+    memo: dict[Any, Any] = {}
+    guard_memo: dict[int, tuple[Any, Any, int]] = {}
+    for value, _expected_type, _label in specs:
+        _freeze_native_model_graph(value, frozen_models, frozen_containers, discovered, budget)
+    return tuple(
+        _validated_contract_snapshot_from_frozen(
+            value,
+            expected_type,
+            label=label,
+            frozen_models=frozen_models,
+            frozen_containers=frozen_containers,
+            discovered=discovered,
+            budget=budget,
+            memo=memo,
+            guard_memo=guard_memo,
+            json_guard=json_guard,
+        )
+        for value, expected_type, label in specs
+    )
+
+
+class EngineAdapterKind(str, Enum):
+    """The architectural seam implemented by an engine adapter."""
+
+    VECTOR_STORE = "vector_store"
+    GRAPH_STORE = "graph_store"
+    MEMORY_ENGINE = "memory_engine"
+    INFERENCE = "inference"
+
+
+class CapabilityHealth(str, Enum):
+    """Observed health of one configured operation."""
+
+    UNKNOWN = "unknown"
+    HEALTHY = "healthy"
+    DEGRADED = "degraded"
+    UNHEALTHY = "unhealthy"
+
+
+class QualificationClaim(ContractModel):
+    """Versioned references supporting a qualification claim for one operation.
+
+    Validation preserves the claim's identity. It does not resolve the
+    references or prove that the evidence qualifies the operation.
+    """
+
+    operation: OpaqueId
+    profile_reference: ReferenceHandle
+    profile_version: OpaqueId
+    evidence_reference: ReferenceHandle
+    evidence_version: OpaqueId
+
+
+class CapabilityOperationState(ContractModel):
+    """Independent deployment and qualification facts for one operation."""
+
+    operation: OpaqueId
+    supported: bool
+    configured: bool
+    health: CapabilityHealth
+    qualification: QualificationClaim | None
+
+    @model_validator(mode="after")
+    def validate_state(self) -> "CapabilityOperationState":
+        if self.configured and not self.supported:
+            raise ValueError("an unsupported operation cannot be configured")
+        if self.qualification is not None and not self.supported:
+            raise ValueError("an unsupported operation cannot be qualified")
+        if (
+            self.qualification is not None
+            and self.qualification.operation != self.operation
+        ):
+            raise ValueError("qualification operation must match the capability operation")
+        if self.health is not CapabilityHealth.UNKNOWN and not self.configured:
+            raise ValueError("an unconfigured operation must have unknown health")
+        return self
+
+    def has_declared_prerequisites(self) -> bool:
+        """Return whether structural dispatch prerequisites are declared.
+
+        This does not resolve the qualification evidence and therefore is not a
+        runtime authorization or proof of qualification.
+        """
+
+        state = _validated_contract_snapshot(
+            self,
+            CapabilityOperationState,
+            label="capability operation state",
+        )
+        return (
+            state.supported
+            and state.configured
+            and state.health is CapabilityHealth.HEALTHY
+            and state.qualification is not None
+        )
+
+
+class CapabilityManifest(VersionedContract):
+    """A versioned, operation-specific capability declaration."""
+
+    implementation_id: OpaqueId
+    implementation_version: OpaqueId
+    adapter_kind: EngineAdapterKind
+    contract_schema_versions: tuple[OpaqueId, ...]
+    operations: tuple[CapabilityOperationState, ...]
+
+    @model_validator(mode="after")
+    def validate_unique_values(self) -> "CapabilityManifest":
+        if not self.contract_schema_versions:
+            raise ValueError("at least one contract schema version is required")
+        if len(set(self.contract_schema_versions)) != len(self.contract_schema_versions):
+            raise ValueError("contract schema versions must be unique")
+        operation_names = [operation.operation for operation in self.operations]
+        if len(set(operation_names)) != len(operation_names):
+            raise ValueError("operation declarations must be unique")
+        return self
+
+    def operation_state(self, operation: str) -> CapabilityOperationState | None:
+        """Return the exact declared operation, without aliases or approximation."""
+
+        operation = _OPAQUE_ID_ADAPTER.validate_python(operation, strict=True)
+        manifest = _validated_contract_snapshot(
+            self,
+            CapabilityManifest,
+            label="capability manifest",
+        )
+        return next(
+            (state for state in manifest.operations if state.operation == operation),
+            None,
+        )
+
+
+class CapabilityRequirement(ContractModel):
+    """Exact contract and qualification profile required for an operation."""
+
+    operation: OpaqueId
+    contract_schema_version: OpaqueId
+    require_configured: bool
+    require_healthy: bool
+    qualification_profile_reference: ReferenceHandle | None
+    qualification_profile_version: OpaqueId | None
+
+    @model_validator(mode="after")
+    def validate_qualification_requirement(self) -> "CapabilityRequirement":
+        supplied = (
+            self.qualification_profile_reference is not None,
+            self.qualification_profile_version is not None,
+        )
+        if supplied[0] != supplied[1]:
+            raise ValueError("qualification profile reference and version are paired")
+        return self
+
+
+class CapabilityViolation(ContractModel):
+    """A stable explanation of one unmet capability requirement."""
+
+    operation: OpaqueId
+    fact: OpaqueId
+
+
+def _operation_state_lookup(
+    manifest: CapabilityManifest,
+) -> dict[str, CapabilityOperationState]:
+    """Build the exact operation index for one already-validated manifest."""
+
+    return {state.operation: state for state in manifest.operations}
+
+
+def validate_capability_requirements(
+    manifest: CapabilityManifest,
+    requirements: tuple[CapabilityRequirement, ...],
+) -> tuple[CapabilityViolation, ...]:
+    """Return structurally unmet facts without treating references as proof.
+
+    An empty result means the declarations agree. Runtime dispatch must still
+    resolve and evaluate the referenced qualification evidence.
+    """
+
+    if not is_subclass(type(manifest), CapabilityManifest):
+        raise TypeError("capability manifest must be a CapabilityManifest")
+
+    requirements_is_tuple = is_subclass(type(requirements), tuple)
+    frozen_models: dict[int, _FrozenModelState] = {}
+    frozen_containers: dict[int, _FrozenContainerState] = {}
+    discovered: dict[int, Any] = {}
+    budget = DiscoveryBudget()  # one envelope across manifest and requirements
+    memo: dict[Any, Any] = {}  # one copy per object across both roots
+    try:
+        _freeze_native_model_graph(
+            manifest,
+            frozen_models,
+            frozen_containers,
+            discovered,
+            budget,
+        )
+    except ValueError as exc:
+        # A strict top-level type error outranks the budget; ordinary manifest
+        # diagnostics keep their established priority over it.
+        if not requirements_is_tuple and str(exc) == DISCOVERY_BUDGET_MESSAGE:
+            raise TypeError("capability requirements must be a tuple") from None
+        raise
+    if requirements_is_tuple:
+        _freeze_native_model_graph(
+            requirements,
+            frozen_models,
+            frozen_containers,
+            discovered,
+            budget,
+        )
+
+    manifest = _validated_contract_snapshot_from_frozen(
+        manifest,
+        CapabilityManifest,
+        label="capability manifest",
+        frozen_models=frozen_models,
+        frozen_containers=frozen_containers,
+        discovered=discovered,
+        budget=budget,
+        memo=memo,
+    )
+    requirements = _validated_contract_tuple_from_frozen(
+        requirements,
+        CapabilityRequirement,
+        label="capability requirements",
+        frozen_models=frozen_models,
+        frozen_containers=frozen_containers,
+        discovered=discovered,
+        budget=budget,
+        memo=memo,
+    )
+    states_by_operation = _operation_state_lookup(manifest)
+    # One set for every requirement: a tuple scan per requirement would be work per occurrence that
+    # grows with both the requirements and the declared versions.
+    declared_versions = frozenset(manifest.contract_schema_versions)
+
+    violations: list[CapabilityViolation] = []
+    for requirement in requirements:
+        state = states_by_operation.get(requirement.operation)
+        if state is None or not state.supported:
+            violations.append(
+                CapabilityViolation(operation=requirement.operation, fact="supported")
+            )
+            continue
+        if requirement.contract_schema_version not in declared_versions:
+            violations.append(
+                CapabilityViolation(
+                    operation=requirement.operation,
+                    fact="contract_schema_version",
+                )
+            )
+        if requirement.require_configured and not state.configured:
+            violations.append(
+                CapabilityViolation(operation=requirement.operation, fact="configured")
+            )
+        if requirement.require_healthy and state.health is not CapabilityHealth.HEALTHY:
+            violations.append(
+                CapabilityViolation(operation=requirement.operation, fact="healthy")
+            )
+        if requirement.qualification_profile_reference is not None:
+            claim = state.qualification
+            if claim is None:
+                violations.append(
+                    CapabilityViolation(operation=requirement.operation, fact="qualified")
+                )
+            elif (
+                claim.profile_reference != requirement.qualification_profile_reference
+                or claim.profile_version != requirement.qualification_profile_version
+            ):
+                violations.append(
+                    CapabilityViolation(
+                        operation=requirement.operation,
+                        fact="qualification_profile",
+                    )
+                )
+    return tuple(violations)
+
+
+__all__ = [
+    "CapabilityHealth",
+    "CapabilityManifest",
+    "CapabilityOperationState",
+    "CapabilityRequirement",
+    "CapabilityViolation",
+    "EngineAdapterKind",
+    "QualificationClaim",
+    "validate_capability_requirements",
+]

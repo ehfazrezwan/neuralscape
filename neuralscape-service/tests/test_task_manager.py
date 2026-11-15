@@ -115,6 +115,27 @@ class TestEnqueueRawV2:
         assert ids["private"] != ids["standard"]
 
     @pytest.mark.asyncio
+    async def test_job_id_differs_by_sensitivity_override(self, tm):
+        """F1 regression: two enqueues that differ ONLY by
+        sensitivity_override must get distinct job ids. The gate
+        (memory/write.py) resolves a different STORED visibility depending
+        on this flag, so coalescing an override-on request onto an
+        override-off request's job id (or vice versa) would silently drop
+        one of the two writes before it ever reaches store_raw."""
+        tm.pool.enqueue_job.return_value = None
+        ids = {}
+        for override in (False, True):
+            await tm.enqueue_raw(
+                content="same sensitive text",
+                user_id="d",
+                category="decision",
+                visibility="shared",
+                sensitivity_override=override,
+            )
+            ids[override] = tm.pool.enqueue_job.call_args[1]["_job_id"]
+        assert ids[False] != ids[True]
+
+    @pytest.mark.asyncio
     async def test_ingest_file_job_id_differs_by_page_offset(self, tm):
         """Same file re-uploaded with a corrected page_offset must be a NEW job —
         page_offset changes exemplar provenance content, so coalescing onto the
@@ -135,15 +156,26 @@ class TestEnqueueRawV2:
 
     @pytest.mark.asyncio
     async def test_connector_sync_job_id_matches_cron_scheme(self, tm):
-        """enqueue_connector_sync uses the same sync-<id> job id as the cron (C2)."""
+        """enqueue_connector_sync uses the same job id scheme as the cron (C2),
+        keyed on the connector instance (id + owner + vault generation)."""
+        from task_manager import connector_sync_job_id
+
         tm.pool.enqueue_job.return_value = None
-        job_id = await tm.enqueue_connector_sync("notion-personal")
-        assert job_id == "sync-notion-personal"
-        assert tm.pool.enqueue_job.call_args.kwargs["_job_id"] == "sync-notion-personal"
+        job_id = await tm.enqueue_connector_sync("notion-personal", "alice", generation="g1")
+        expected = connector_sync_job_id("notion-personal", "alice", "g1")
+        assert job_id == expected
+        assert expected.startswith("sync-notion-personal-")
+        assert tm.pool.enqueue_job.call_args.kwargs["_job_id"] == expected
+        assert tm.pool.enqueue_job.call_args.args[1:] == ("notion-personal", "g1")
+        # A different owner or instance of the same connector id never shares it.
+        assert connector_sync_job_id("notion-personal", "bob", "g1") != expected
+        assert connector_sync_job_id("notion-personal", "alice", "g2") != expected
 
     @pytest.mark.asyncio
     async def test_no_v2_fields_packs_empty_extras(self, tm):
-        """Without v2 fields, extras dict is empty (None values dropped)."""
+        """Without v2 fields, extras dict carries only defaulted booleans
+        (None values are dropped; `sensitivity_override` defaults to False,
+        which survives the None-filter since False is not None)."""
         mock_job = MagicMock()
         mock_job.job_id = "job-xyz"
         tm.pool.enqueue_job.return_value = mock_job
@@ -154,7 +186,7 @@ class TestEnqueueRawV2:
             category="preference",
         )
         v2_extras = tm.pool.enqueue_job.call_args[0][9]
-        assert v2_extras == {}
+        assert v2_extras == {"sensitivity_override": False}
 
     @pytest.mark.asyncio
     async def test_duplicate_job_returns_existing_id(self, tm):

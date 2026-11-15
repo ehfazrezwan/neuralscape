@@ -4,9 +4,13 @@ Mechanically extracted from memory_service.py (mixins-with-facade split);
 code is verbatim — behavior unchanged.
 """
 
+import logging
+
 from datetime import datetime
 from config import settings
 from schemas import MemoryVisibility, normalize_visibility
+
+logger = logging.getLogger(__name__)
 
 def _live_edges_filter():
     """Graphiti ``SearchFilters`` selecting only bi-temporally LIVE edges.
@@ -42,6 +46,60 @@ def _edge_is_invalidated(edge) -> bool:
         if isinstance(value, datetime) or (isinstance(value, str) and value.strip()):
             return True
     return False
+
+
+def _live_node_uuids(run_on_bridge, driver, uuids: list[str], group_ids: list[str]) -> set[str] | None:
+    """Server-side liveness check for a candidate set of entity node uuids.
+
+    A node is LIVE (kept by a listing endpoint's default expiry filter) when
+    either (a) it has NO connecting ``RELATES_TO`` edges at all — "not yet
+    enriched", not "expired" — or (b) at least one of its connecting edges
+    is bi-temporally live (``expired_at IS NULL AND invalid_at IS NULL``).
+    Same liveness definition as ``_edge_is_invalidated``, evaluated in one
+    bounded Cypher statement instead of fetching every edge in the group
+    into Python: the prior approach (``EntityEdge.get_by_group_ids(...,
+    limit=5000)``) silently mis-classified nodes once a group held more
+    edges than the cap, and failed OPEN (returned nodes unfiltered) on any
+    lookup error — for listing endpoints that exist specifically to hide
+    soft-expired PRIVATE content, fail-open is a leak, not a convenience.
+
+    Returns the set of live node uuids (a subset of ``uuids``), or ``None``
+    on any query failure — callers MUST fail CLOSED (treat ``None`` as "no
+    nodes are provably live") rather than falling back to unfiltered.
+    """
+    if not uuids:
+        return set()
+
+    cypher = """
+    MATCH (n:Entity) WHERE n.uuid IN $uuids
+    OPTIONAL MATCH (n)-[e:RELATES_TO]-()
+    WHERE e.group_id IN $group_ids
+    WITH n.uuid AS uuid,
+         count(e) AS edge_count,
+         sum(CASE WHEN e.expired_at IS NULL AND e.invalid_at IS NULL THEN 1 ELSE 0 END) AS live_count
+    RETURN uuid, edge_count, live_count
+    """
+
+    async def _run():
+        async with driver.session() as session:
+            result = await session.run(cypher, uuids=uuids, group_ids=group_ids)
+            return await result.data()
+
+    coro = _run()
+    try:
+        records = run_on_bridge(coro) or []
+    except Exception:
+        coro.close()
+        logger.warning(
+            "Node liveness query failed for group_ids=%r (failing CLOSED)",
+            group_ids, exc_info=True,
+        )
+        return None
+    return {
+        rec["uuid"]
+        for rec in records
+        if not rec.get("edge_count") or rec.get("live_count")
+    }
 
 
 def _build_group_id(

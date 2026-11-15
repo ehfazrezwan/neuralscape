@@ -12,6 +12,19 @@ services:
     ports: !override []
   docling:
     profiles: ["ingest-heavy"]   # off by default on the VPS (4G container)
+  # Pin the four app services to the deployed image (falls back to ghcr :latest).
+  # Without this, a plain `docker compose up -d` on the box (any restart/recovery
+  # that omits docker-compose.deploy.yml) silently falls back to the base `build:`
+  # path and reuses a stale local build-tag - which is exactly how prod once
+  # reverted to a 2-month-old image. `build:` in the base file still serves local
+  # dev; here the image always wins.
   neuralscape:
+    image: ${NS_IMAGE:-ghcr.io/ehfazrezwan/neuralscape:latest}
     ports: !override
       - "127.0.0.1:8199:8199"
+  neuralscape-worker:
+    image: ${NS_IMAGE:-ghcr.io/ehfazrezwan/neuralscape:latest}
+  neuralscape-graph-worker:
+    image: ${NS_IMAGE:-ghcr.io/ehfazrezwan/neuralscape:latest}
+  neuralscape-ingest-worker:
+    image: ${NS_IMAGE:-ghcr.io/ehfazrezwan/neuralscape:latest}

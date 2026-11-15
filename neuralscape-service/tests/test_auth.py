@@ -1,7 +1,8 @@
 """Tests for Bearer token authentication middleware.
 
 Tests cover:
-- Auth disabled when NEURALSCAPE_API_KEY is empty (local dev mode)
+- Auth disabled only via the explicit NEURALSCAPE_AUTH_DISABLED opt-out
+- Fail-closed: no secret and no opt-out refuses startup and rejects requests
 - Auth enabled when NEURALSCAPE_API_KEY is set
 - Health endpoint always accessible without auth
 - Protected endpoints return 401 without/invalid token
@@ -69,15 +70,14 @@ def mock_service():
 
 
 class TestAuthDisabled:
-    """When NEURALSCAPE_API_KEY is empty, all requests pass through."""
+    """With no secret AND the explicit opt-out, all requests pass through."""
 
     @pytest.fixture(autouse=True)
-    def disable_auth(self):
+    def disable_auth(self, monkeypatch):
         from config import settings
-        original = settings.neuralscape_api_key
-        settings.neuralscape_api_key = ""
-        yield
-        settings.neuralscape_api_key = original
+        monkeypatch.setattr(settings, "neuralscape_api_key", "")
+        monkeypatch.setattr(settings, "neuralscape_user_token_secret", "")
+        monkeypatch.setattr(settings, "neuralscape_auth_disabled", True)
 
     def test_health_no_auth(self):
         client = TestClient(app, raise_server_exceptions=False)
@@ -172,6 +172,106 @@ class TestAuthEnabled:
         assert resp.status_code in (401, 404)
 
 
+class TestAuthFailClosed:
+    """P0: with default settings (no secret, no opt-out) the service must not
+    run unauthenticated. Startup refuses; the middleware never silently
+    bypasses; the explicit opt-out is the only way to run without auth."""
+
+    def _settings(self, **kw):
+        base = dict(google_api_key="k", neo4j_password="p")
+        base.update(kw)
+        return Settings(_env_file=None, **base)
+
+    def test_validate_required_refuses_without_secret_or_opt_out(self):
+        with pytest.raises(ValueError) as exc_info:
+            self._settings().validate_required()
+        msg = str(exc_info.value)
+        assert "Authentication is not configured" in msg
+        assert "NEURALSCAPE_USER_TOKEN_SECRET" in msg
+        assert "NEURALSCAPE_API_KEY" in msg
+        assert "NEURALSCAPE_AUTH_DISABLED=true" in msg
+
+    def test_defaults_are_fail_closed(self):
+        s = self._settings()
+        assert s.neuralscape_user_token_secret == ""
+        assert s.neuralscape_api_key == ""
+        assert s.neuralscape_auth_disabled is False
+
+    def test_app_startup_refuses_without_secret_or_opt_out(self, monkeypatch):
+        """The real lifespan (what uvicorn runs) must abort before serving."""
+        from config import settings
+        monkeypatch.setattr(settings, "google_api_key", "k")
+        monkeypatch.setattr(settings, "neo4j_password", "p")
+        monkeypatch.setattr(settings, "neuralscape_user_token_secret", "")
+        monkeypatch.setattr(settings, "neuralscape_api_key", "")
+        monkeypatch.setattr(settings, "neuralscape_auth_disabled", False)
+        with pytest.raises(ValueError, match="Authentication is not configured"):
+            with TestClient(app):
+                pass
+
+    @pytest.mark.parametrize(
+        "secrets",
+        [
+            {"neuralscape_user_token_secret": "s"},
+            {"neuralscape_api_key": "k"},
+        ],
+        ids=["user_token_secret", "legacy_api_key"],
+    )
+    def test_validate_required_accepts_either_secret(self, secrets):
+        self._settings(**secrets).validate_required()  # no raise
+
+    def test_opt_out_starts_and_warns(self, caplog):
+        s = self._settings(neuralscape_auth_disabled=True)
+        with caplog.at_level("WARNING", logger="config"):
+            s.validate_required()  # no raise
+        warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+        assert len(warnings) == 1
+        assert "AUTHENTICATION IS DISABLED" in warnings[0].getMessage()
+
+    def test_opt_out_ignored_when_secret_set(self, caplog, monkeypatch):
+        """A secret always wins: the opt-out cannot switch auth off."""
+        s = self._settings(neuralscape_api_key=TEST_API_KEY, neuralscape_auth_disabled=True)
+        with caplog.at_level("WARNING", logger="config"):
+            s.validate_required()
+        assert any("is ignored" in r.getMessage() for r in caplog.records)
+
+        from config import settings
+        monkeypatch.setattr(settings, "neuralscape_api_key", TEST_API_KEY)
+        monkeypatch.setattr(settings, "neuralscape_auth_disabled", True)
+        client = TestClient(app, raise_server_exceptions=False)
+        assert client.get("/v1/memories", params={"user_id": "t"}).status_code == 401
+
+    def test_middleware_rejects_when_unconfigured(self, monkeypatch):
+        """Even when the app is served without the lifespan (embedded, tests),
+        no secret + no opt-out must never fall through to the route."""
+        from config import settings
+        monkeypatch.setattr(settings, "neuralscape_user_token_secret", "")
+        monkeypatch.setattr(settings, "neuralscape_api_key", "")
+        monkeypatch.setattr(settings, "neuralscape_auth_disabled", False)
+        client = TestClient(app, raise_server_exceptions=False)
+        resp = client.get("/v1/memories", params={"user_id": "t"})
+        assert resp.status_code == 503
+        assert "NEURALSCAPE_AUTH_DISABLED" in resp.json()["detail"]
+        assert client.post("/v1/memories", json={"user_id": "t"}).status_code == 503
+        assert client.get("/health").status_code == 200
+        assert client.get("/health/live").status_code == 200
+
+    @pytest.mark.parametrize(
+        "secret_field", ["neuralscape_user_token_secret", "neuralscape_api_key"]
+    )
+    def test_secret_set_protects_routes_health_public(self, secret_field, monkeypatch):
+        from config import settings
+        monkeypatch.setattr(settings, "neuralscape_user_token_secret", "")
+        monkeypatch.setattr(settings, "neuralscape_api_key", "")
+        monkeypatch.setattr(settings, "neuralscape_auth_disabled", False)
+        monkeypatch.setattr(settings, secret_field, "a-test-secret")
+        client = TestClient(app, raise_server_exceptions=False)
+        assert client.get("/v1/memories", params={"user_id": "t"}).status_code == 401
+        assert client.get("/memories", params={"user_id": "t"}).status_code == 401
+        assert client.get("/health").status_code == 200
+        assert client.get("/health/live").status_code == 200
+
+
 class TestLegacyKeyWithDotFallsBack:
     """Regression: when both NEURALSCAPE_USER_TOKEN_SECRET and
     NEURALSCAPE_API_KEY are set, a legacy shared key that happens to
@@ -219,3 +319,177 @@ class TestLegacyKeyWithDotFallsBack:
             headers={"Authorization": "Bearer not.a.real.token.or.key"},
         )
         assert resp.status_code == 401
+
+
+# ══════════════════════════════════════════════
+# Legacy root endpoints — multi-user identity resolution
+# ══════════════════════════════════════════════
+#
+# Historically the legacy root routes (/memories, /search, /graph/*) trusted
+# whatever user_id the caller put in the request body/query string, even
+# when the caller had authenticated with a per-user token. That let any
+# token holder impersonate any other user simply by naming them. These
+# routes must now resolve identity via `_resolve_user_id` exactly like
+# /v1/* does: token wins, a body/token mismatch is rejected with 400, and
+# (via the shared BearerAuthMiddleware) an unauthenticated call is rejected
+# the same way /v1/* is. When NEURALSCAPE_USER_TOKEN_SECRET is unset, the
+# original trust-the-body/query behavior must be unchanged.
+
+
+def _legacy_route_cases():
+    """(name, http_method, path, kwarg_key, body_builder) for every legacy
+    root route that accepts a user_id from the body or query string.
+    ``body_builder(user_id_or_none)`` omits the user_id key entirely when
+    passed None, to exercise the "identity comes from the token alone" case.
+    """
+
+    def add_body(uid):
+        payload = {"messages": [{"role": "user", "content": "hi"}]}
+        if uid is not None:
+            payload["user_id"] = uid
+        return payload
+
+    def search_body(uid):
+        payload = {"query": "hello"}
+        if uid is not None:
+            payload["user_id"] = uid
+        return payload
+
+    def query_only(uid):
+        return {"user_id": uid} if uid is not None else {}
+
+    return [
+        ("post_memories", "post", "/memories", "json", add_body),
+        ("post_search", "post", "/search", "json", search_body),
+        ("get_memories", "get", "/memories", "params", query_only),
+        ("delete_memories", "delete", "/memories", "params", query_only),
+        ("post_memories_async", "post", "/memories/async", "json", add_body),
+        ("post_graph_search", "post", "/graph/search", "json", search_body),
+        ("get_graph_nodes", "get", "/graph/nodes", "params", query_only),
+        ("get_graph_edges", "get", "/graph/edges", "params", query_only),
+        ("get_graph_episodes", "get", "/graph/episodes", "params", query_only),
+        ("get_graph_communities", "get", "/graph/communities", "params", query_only),
+    ]
+
+
+LEGACY_ROUTE_CASES = _legacy_route_cases()
+LEGACY_ROUTE_IDS = [c[0] for c in LEGACY_ROUTE_CASES]
+
+
+class TestLegacyEndpointsMultiUserIdentity:
+    """Every legacy root route that accepts user_id must resolve identity
+    via `_resolve_user_id`, same as /v1/*, once a per-user token secret is
+    configured — and must leave legacy shared-key behavior unchanged when
+    it is not.
+    """
+
+    TEST_SECRET = "legacy-multiuser-secret"
+
+    @pytest.fixture(autouse=True)
+    def enable_token_secret(self):
+        from config import settings
+        orig_secret = settings.neuralscape_user_token_secret
+        orig_key = settings.neuralscape_api_key
+        settings.neuralscape_user_token_secret = self.TEST_SECRET
+        settings.neuralscape_api_key = ""
+        yield
+        settings.neuralscape_user_token_secret = orig_secret
+        settings.neuralscape_api_key = orig_key
+
+    @pytest.fixture(autouse=True)
+    def stub_enqueue_store(self):
+        """POST /memories/async awaits _task_manager.enqueue_store; the
+        shared mock_task_manager fixture doesn't configure it as async."""
+        original = main._task_manager.enqueue_store
+        main._task_manager.enqueue_store = AsyncMock(return_value="task-async-1")
+        yield
+        main._task_manager.enqueue_store = original
+
+    @staticmethod
+    def _token(user_id, secret):
+        from tokens import issue_user_token
+        return issue_user_token(user_id, secret, 3600)
+
+    @staticmethod
+    def _call(client, method, path, kwarg_key, payload, headers=None):
+        fn = getattr(client, method)
+        kwargs = {kwarg_key: payload}
+        if headers:
+            kwargs["headers"] = headers
+        return fn(path, **kwargs)
+
+    @pytest.mark.parametrize(
+        "name,method,path,kwarg_key,body_fn", LEGACY_ROUTE_CASES, ids=LEGACY_ROUTE_IDS
+    )
+    def test_no_token_rejected(self, name, method, path, kwarg_key, body_fn):
+        """Secret configured, no Authorization header -> rejected, same
+        shape the middleware already uses for /v1/*."""
+        client = TestClient(app, raise_server_exceptions=False)
+        resp = self._call(client, method, path, kwarg_key, body_fn("someone"))
+        assert resp.status_code == 401, f"{name}: expected 401, got {resp.status_code} {resp.text}"
+        assert "detail" in resp.json()
+
+    @pytest.mark.parametrize(
+        "name,method,path,kwarg_key,body_fn", LEGACY_ROUTE_CASES, ids=LEGACY_ROUTE_IDS
+    )
+    def test_valid_token_no_body_user_id_uses_token_identity(
+        self, name, method, path, kwarg_key, body_fn
+    ):
+        """Secret configured, valid token, no user_id in body/query ->
+        identity comes from the token and the request succeeds."""
+        client = TestClient(app, raise_server_exceptions=False)
+        token = self._token("alice-from-token", self.TEST_SECRET)
+        resp = self._call(
+            client, method, path, kwarg_key, body_fn(None),
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp.status_code in (200, 202), f"{name}: {resp.status_code} {resp.text}"
+
+    @pytest.mark.parametrize(
+        "name,method,path,kwarg_key,body_fn", LEGACY_ROUTE_CASES, ids=LEGACY_ROUTE_IDS
+    )
+    def test_valid_token_matching_body_user_id_allowed(
+        self, name, method, path, kwarg_key, body_fn
+    ):
+        """Secret configured, valid token, body/query user_id matches the
+        token's user_id -> allowed."""
+        client = TestClient(app, raise_server_exceptions=False)
+        token = self._token("alice-from-token", self.TEST_SECRET)
+        resp = self._call(
+            client, method, path, kwarg_key, body_fn("alice-from-token"),
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp.status_code in (200, 202), f"{name}: {resp.status_code} {resp.text}"
+
+    @pytest.mark.parametrize(
+        "name,method,path,kwarg_key,body_fn", LEGACY_ROUTE_CASES, ids=LEGACY_ROUTE_IDS
+    )
+    def test_valid_token_mismatched_body_user_id_rejected(
+        self, name, method, path, kwarg_key, body_fn
+    ):
+        """Secret configured, valid token, body/query user_id names a
+        DIFFERENT user -> 400, blocking impersonation."""
+        client = TestClient(app, raise_server_exceptions=False)
+        token = self._token("alice-from-token", self.TEST_SECRET)
+        resp = self._call(
+            client, method, path, kwarg_key, body_fn("bob-impersonator"),
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp.status_code == 400, f"{name}: {resp.status_code} {resp.text}"
+        assert "does not match" in resp.json()["detail"]
+
+    @pytest.mark.parametrize(
+        "name,method,path,kwarg_key,body_fn", LEGACY_ROUTE_CASES, ids=LEGACY_ROUTE_IDS
+    )
+    def test_secret_not_configured_legacy_body_user_id_trusted(
+        self, name, method, path, kwarg_key, body_fn, monkeypatch
+    ):
+        """No per-user token secret configured (shared-key / no-auth
+        deployments) -> legacy behavior preserved, body/query user_id is
+        trusted as-is, no Authorization header required."""
+        from config import settings
+        monkeypatch.setattr(settings, "neuralscape_user_token_secret", "")
+        monkeypatch.setattr(settings, "neuralscape_api_key", "")
+        client = TestClient(app, raise_server_exceptions=False)
+        resp = self._call(client, method, path, kwarg_key, body_fn("legacy-alice"))
+        assert resp.status_code in (200, 202), f"{name}: {resp.status_code} {resp.text}"

@@ -478,56 +478,6 @@ class StoreMemoryRequest(BaseModel):
         return validate_occurred_at(v)
 
 
-class IngestTextRequest(BaseModel):
-    """Ingest pasted/provided context: chunk → passages + distilled facts.
-
-    Similar to IngestDocumentRequest but for manually-provided text (not a
-    data-layer connector). A Markdown artifact is persisted on the storage
-    volume (organized by user/project/category) and every produced memory
-    references it via ``source_ref``.
-    """
-    content: str = Field(min_length=1, max_length=2_000_000, description="Context text to ingest")
-    title: str | None = Field(default=None, max_length=200, description="Optional human label for this context")
-    category: str = Field(default="domain_knowledge", description="Category for produced memories")
-    scope: str = Field(default="global", description="'global' or 'project'")
-    project_id: str | None = Field(default=None, max_length=100, pattern=_ID_PATTERN)
-    user_id: str | None = Field(default=None, max_length=100, pattern=_ID_PATTERN)
-    visibility: MemoryVisibility | None = Field(default=None)
-    extract_facts: bool = Field(default=True, description="Run LLM extraction for distilled facts")
-    index_passages: bool = Field(default=True, description="Chunk + store verbatim passages")
-    tags: list[str] | None = Field(default=None, max_length=20)
-    adapter: str = Field(
-        default="default",
-        max_length=100,
-        description="Knowledge adapter selecting taxonomy/chunker/extractor/graph-ontology",
-    )
-    workspace: str | None = Field(
-        default=None,
-        max_length=100,
-        pattern=r"^[a-zA-Z0-9_.\-]+$",
-        description="Workspace partition: absent or 'memory' = memory type; any other value = reference workspace",
-    )
-
-    @field_validator("category")
-    @classmethod
-    def _validate_category(cls, v: str) -> str:
-        if v not in MEMORY_CATEGORIES:
-            raise ValueError(f"Invalid category '{v}'. Must be one of: {list(MEMORY_CATEGORIES.keys())}")
-        return v
-
-    @field_validator("scope")
-    @classmethod
-    def _validate_scope(cls, v: str) -> str:
-        if v not in ("global", "project"):
-            raise ValueError("scope must be 'global' or 'project'")
-        return v
-
-    @field_validator("adapter")
-    @classmethod
-    def _validate_adapter(cls, v: str) -> str:
-        return validate_adapter_name(v)
-
-
 class RawMemoryRequest(BaseModel):
     """Store a single pre-categorized fact (no LLM extraction).
 
@@ -555,6 +505,16 @@ class RawMemoryRequest(BaseModel):
     visibility: MemoryVisibility | None = Field(
         default=None,
         description="Multi-user model: 'private' (owner only), 'shared' (team-wide), or 'standard' (dictator-only authoritative tier; requires STANDARDS_ENABLED). Defaults per-category.",
+    )
+    sensitivity_override: bool = Field(
+        default=False,
+        description=(
+            "Sensitivity gate escape hatch: when the content classifies as "
+            "financial/equity_compensation/client_commercial/credentials_pii, "
+            "the server forces visibility='private' regardless of the "
+            "'visibility' field above, UNLESS this is True *and* 'visibility' "
+            "was explicitly set — both are required to bypass the gate."
+        ),
     )
 
     # Memory-model v2 (all optional)
@@ -677,6 +637,13 @@ class IngestDocumentRequest(BaseModel):
     project_id: str | None = Field(default=None, max_length=100, pattern=_ID_PATTERN)
     user_id: str | None = Field(default=None, max_length=100, pattern=_ID_PATTERN)
     visibility: MemoryVisibility | None = Field(default=None)
+    sensitivity_override: bool = Field(
+        default=False,
+        description=(
+            "Sensitivity gate escape hatch — see RawMemoryRequest.sensitivity_override. "
+            "Applies to every fact this ingest produces."
+        ),
+    )
     extract_facts: bool = Field(default=True, description="Run LLM extraction to also store distilled facts")
     index_passages: bool = Field(default=True, description="Chunk + store verbatim passages")
     tags: list[str] | None = Field(default=None, max_length=20)
@@ -730,6 +697,13 @@ class IngestTextRequest(BaseModel):
     project_id: str | None = Field(default=None, max_length=100, pattern=_ID_PATTERN)
     user_id: str | None = Field(default=None, max_length=100, pattern=_ID_PATTERN)
     visibility: MemoryVisibility | None = Field(default=None)
+    sensitivity_override: bool = Field(
+        default=False,
+        description=(
+            "Sensitivity gate escape hatch — see RawMemoryRequest.sensitivity_override. "
+            "Applies to every fact this ingest produces."
+        ),
+    )
     extract_facts: bool = Field(default=True, description="Run LLM extraction to also store distilled facts")
     index_passages: bool = Field(default=True, description="Chunk + store verbatim passages")
     tags: list[str] | None = Field(default=None, max_length=20)
@@ -1221,6 +1195,27 @@ class MemoryResponse(BaseModel):
     # Multi-user model
     visibility: str | None = None
     owner_user_id: str | None = None
+
+    # Sensitivity gate provenance — stamped whenever the content matched a
+    # gated class (memory/sensitivity.py), whether the gate FORCED
+    # visibility=private or the caller BYPASSED it with sensitivity_override.
+    # `sensitivity` is one of financial | equity_compensation |
+    # client_commercial | credentials_pii; `sensitivity_source` says how the
+    # class was determined ("regex" | "llm") or that the gate was "bypassed".
+    sensitivity: str | None = Field(
+        default=None,
+        description="Sensitivity class the content matched at write time, if any "
+        "(financial | equity_compensation | client_commercial | credentials_pii). "
+        "Present whether the gate forced visibility=private or the caller bypassed it; "
+        "see sensitivity_source.",
+    )
+    sensitivity_source: str | None = Field(
+        default=None,
+        description="How the class was applied: 'regex' (deterministic gate forced "
+        "private), 'llm' (model-supplied hint forced private), or 'bypassed' (content "
+        "matched but the caller supplied an explicit visibility with sensitivity_override=True, "
+        "so visibility was NOT forced).",
+    )
 
     # Retrieval economics (C1): distilled at write time; null on legacy
     # memories (index renderers recompute the heuristic on the fly).

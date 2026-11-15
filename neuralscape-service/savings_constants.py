@@ -34,7 +34,17 @@ They are measured, checked-in constants, not runtime estimates:
 # Then +126 (11141) in the auto-routing PR (AR2/AR3): the recall_memories +
 # code-tool knowledge_system param docs now document the 'auto' value (per-op
 # auto-selection of the measured-best healthy engine). Intentional, per the rule.
-MCP_TOOL_SCHEMA_OVERHEAD_TOKENS = 11141
+# Then +142 in the sensitivity-gate hotfix: the remember/ingest_document/
+# ingest_text tools each gained a `sensitivity_override` input-schema property
+# documenting the write-time sensitivity gate's escape hatch. Intentional, per
+# the acceptance rule.
+# Then +323 in the same hotfix's remediation half: two new admin MCP tools,
+# rescope_private_derivatives and audit_private_leakage (memory/remediation.py).
+# Intentional, per the acceptance rule. The two halves landed on separate
+# branches, each measuring its own delta against the shared 11141 base; 11606 is
+# the re-measured total of the merged tool surface (33 tools), which happens to
+# equal 11141 + 142 + 323 exactly.
+MCP_TOOL_SCHEMA_OVERHEAD_TOKENS = 11606
 
 # Rendered savings line + detail fields on one response (measured: 67).
 SAVINGS_LINE_OVERHEAD_TOKENS = 70

@@ -708,6 +708,103 @@ _SHARED_META = {
 }
 
 
+# ──────────────────────────────────────────────
+# IDOR fix: get_memory(id, caller) / get_reasoning_chain(id, caller) read gate
+#
+# Regression coverage for the read-authorization fix: GET-by-id and the
+# reasoning-chain walker must apply the same pool-visibility rule as
+# search()/get_memories_by_ids() (own private, shared, standard-when-enabled)
+# instead of returning any memory to any caller.
+# ──────────────────────────────────────────────
+
+
+def _owned_mem(owner: str, visibility: str = "private", content: str = "secret content", **meta):
+    """A mem0 ``get()``-style dict owned by ``owner`` with the given visibility."""
+    metadata = {"category": "preference", "visibility": visibility, "owner_user_id": owner, **meta}
+    return {"id": "m1", "memory": content, "user_id": owner, "metadata": metadata}
+
+
+class TestGetMemoryReadGate:
+    """service.get_memory(memory_id, caller_user_id) — direct GET-by-id gate."""
+
+    def test_owner_reads_own_private_memory(self, service):
+        service._memory.get.return_value = _owned_mem("alice")
+        result = service.get_memory("m1", "alice")
+        assert result is not None
+        assert result.memory == "secret content"
+
+    def test_different_user_cannot_read_private_memory(self, service):
+        service._memory.get.return_value = _owned_mem("alice")
+        assert service.get_memory("m1", "bob") is None
+
+    def test_different_user_can_read_shared_memory(self, service):
+        service._memory.get.return_value = _owned_mem("alice", visibility="shared")
+        result = service.get_memory("m1", "bob")
+        assert result is not None
+        assert result.memory == "secret content"
+
+    def test_standard_tier_gated_by_settings_flag(self, service):
+        from config import settings
+
+        service._memory.get.return_value = _owned_mem("dictator", visibility="standard")
+        saved = settings.standards_enabled
+        try:
+            settings.standards_enabled = False
+            assert service.get_memory("m1", "bob") is None
+            settings.standards_enabled = True
+            assert service.get_memory("m1", "bob") is not None
+        finally:
+            settings.standards_enabled = saved
+
+    def test_no_caller_id_skips_gate_backward_compat(self, service):
+        """``caller_user_id=None`` (the default) is the pre-existing internal
+        call shape (e.g. patch_memory's post-write re-read) — must stay
+        ungated."""
+        service._memory.get.return_value = _owned_mem("alice")
+        assert service.get_memory("m1") is not None
+
+
+class TestReasoningChainReadGate:
+    """get_reasoning_chain(id, caller_user_id=...) gates the root AND every
+    premise node — an unreadable premise must never surface its content."""
+
+    def _wire(self, service, by_id: dict):
+        service._memory.get.side_effect = lambda mid: by_id.get(mid)
+
+    def test_owner_reads_full_chain(self, service):
+        root = _owned_mem("alice", derived_from=["p1"])
+        premise = _owned_mem("alice", content="alice's private premise")
+        self._wire(service, {"root": root, "p1": premise})
+        chain = service.get_reasoning_chain("root", caller_user_id="alice")
+        assert chain["memory_id"] == "root"
+        assert chain["children"][0]["memory_id"] == "p1"
+        assert chain["children"][0]["content"] == "alice's private premise"
+
+    def test_other_users_private_premise_not_leaked(self, service):
+        root = _owned_mem("alice", visibility="shared", derived_from=["p1"])
+        premise = _owned_mem("alice", content="alice's private premise")
+        self._wire(service, {"root": root, "p1": premise})
+        chain = service.get_reasoning_chain("root", caller_user_id="bob")
+        assert chain["memory_id"] == "root"
+        # Unreadable premise is folded into "missing" — same shape as a
+        # hard-deleted premise, and its content never appears anywhere.
+        assert chain["children"][0] == {"memory_id": "p1", "missing": True, "children": []}
+        import json
+        assert "alice's private premise" not in json.dumps(chain)
+
+    def test_root_unreadable_returns_none(self, service):
+        root = _owned_mem("alice")  # private, caller is a stranger
+        self._wire(service, {"root": root})
+        assert service.get_reasoning_chain("root", caller_user_id="bob") is None
+
+    def test_no_caller_id_skips_gate_backward_compat(self, service):
+        root = _owned_mem("alice", derived_from=["p1"])
+        premise = _owned_mem("alice", content="alice's private premise")
+        self._wire(service, {"root": root, "p1": premise})
+        chain = service.get_reasoning_chain("root")
+        assert chain["children"][0]["content"] == "alice's private premise"
+
+
 class TestPatchMemory:
     @pytest.fixture(autouse=True)
     def _stub_response(self, service):
@@ -802,11 +899,39 @@ class TestPatchMemory:
     def test_clearing_project_id_flips_flexible_scope_to_global(self, service):
         meta = dict(_SHARED_META, owner_user_id="ehfaz", visibility="private")
         service._memory.vector_store.get.return_value = _edit_point(meta=meta)
+        # Isolate this test's concern (scope/project_id derivation) from the
+        # graph-cascade-resolution concern (covered separately) by making the
+        # cascade resolve cleanly.
+        service._cascade_expire_episode = MagicMock(
+            return_value={"resolved": True, "episode_uuid": "ep-1",
+                          "edges_expired": 0, "nodes_removed": 0, "summaries_cleared": 0}
+        )
         result = service.patch_memory("m1", "ehfaz", {"project_id": None})
         new_meta = service._memory.vector_store.update.call_args.kwargs["payload"]["metadata"]
         assert new_meta["scope"] == "global" and new_meta["project_id"] is None
         # private user--ehfaz--project--neuralscape → user--ehfaz: partition moved
         assert result["graph"] == "migration_pending"
+
+    def test_clearing_project_id_reports_incomplete_when_cascade_unresolved(self, service):
+        """Honest-status regression guard: when the graph is configured but
+        the cascade can't resolve/verify the episode, the migration must NOT
+        report a clean 'migration_pending' — the pre-fix incident here was
+        exactly this silent-success shape.
+
+        Stub ``_cascade_expire_episode`` explicitly (rather than relying on
+        the fixture's mocked bridge failing internally) — the fixture's
+        mocked-bridge-raises-on-real-Cypher behavior is an implementation
+        detail of the bridge, not this test's actual concern (an unresolved
+        cascade), and coupling to it makes the test fragile to unrelated
+        bridge/liveness-query changes."""
+        meta = dict(_SHARED_META, owner_user_id="ehfaz", visibility="private")
+        service._memory.vector_store.get.return_value = _edit_point(meta=meta)
+        service._cascade_expire_episode = MagicMock(
+            return_value={"resolved": False, "episode_uuid": None,
+                          "edges_expired": 0, "nodes_removed": 0, "summaries_cleared": 0}
+        )
+        result = service.patch_memory("m1", "ehfaz", {"project_id": None})
+        assert result["graph"] == "migration_incomplete"
 
     def test_category_cannot_be_cleared(self, service):
         service._memory.vector_store.get.return_value = _edit_point(meta=dict(_SHARED_META))
@@ -821,13 +946,31 @@ class TestPatchMemory:
         service.patch_memory("m1", "ehfaz", {"tags": ["ok"]})  # metadata still fine
 
     def test_partition_migration_expires_and_returns_graph_job(self, service):
+        """The migration path routes through the REAL episode cascade
+        (memory/provenance.py), not the substring-match heuristic directly.
+        When the cascade resolves an episode, the legacy substring fallback
+        must not fire at all."""
         meta = dict(_SHARED_META, owner_user_id="ehfaz")
         service._memory.vector_store.get.return_value = _edit_point(meta=meta)
+        service._cascade_expire_episode = MagicMock(
+            return_value={
+                "resolved": True, "episode_uuid": "ep-1",
+                "edges_expired": 2, "nodes_removed": 0, "summaries_cleared": 1,
+            }
+        )
         result = service.patch_memory("m1", "ehfaz", {"project_id": "bon002"})
 
-        service._expire_graph_edges_for_memory.assert_called_once()
-        expired_mem = service._expire_graph_edges_for_memory.call_args.args[0]
-        assert expired_mem["metadata"]["project_id"] == "neuralscape"  # OLD partition
+        service._cascade_expire_episode.assert_called_once()
+        args, kwargs = service._cascade_expire_episode.call_args
+        assert args[0] == "shared--project--neuralscape"  # OLD partition group_id
+        assert kwargs["content"] == "Old content"
+        assert kwargs["episode_uuid"] is None  # no graph_episode_uuid on this legacy row
+        assert kwargs["episode_name"] is None
+
+        # Cascade resolved the episode — the lossy substring fallback must
+        # NOT also fire (it would be redundant and could over-match).
+        service._expire_graph_edges_for_memory.assert_not_called()
+
         job = result["graph_job"]
         assert job == {
             "memory_id": "m1",
@@ -838,6 +981,26 @@ class TestPatchMemory:
             "source_ref": None,
         }
         assert result["graph"] == "migration_pending"
+
+    def test_partition_migration_falls_back_when_cascade_unresolved(self, service):
+        """When the cascade can't resolve an episode (e.g. a pre-fix row
+        with no graph_episode_uuid/name and content that no longer matches
+        verbatim), the legacy substring heuristic still runs as a
+        last-resort fallback — old behavior is preserved, not silently
+        dropped."""
+        meta = dict(_SHARED_META, owner_user_id="ehfaz")
+        service._memory.vector_store.get.return_value = _edit_point(meta=meta)
+        service._cascade_expire_episode = MagicMock(
+            return_value={
+                "resolved": False, "episode_uuid": None,
+                "edges_expired": 0, "nodes_removed": 0, "summaries_cleared": 0,
+            }
+        )
+        service.patch_memory("m1", "ehfaz", {"project_id": "bon002"})
+
+        service._expire_graph_edges_for_memory.assert_called_once()
+        expired_mem = service._expire_graph_edges_for_memory.call_args.args[0]
+        assert expired_mem["metadata"]["project_id"] == "neuralscape"  # OLD partition
 
     def test_not_found_raises_lookup_error(self, service):
         service._memory.vector_store.get.return_value = None
@@ -1996,6 +2159,43 @@ class TestMemToResponseV2:
 
 
 # ──────────────────────────────────────────────
+# Sensitivity gate provenance: _mem_to_response surfaces
+# metadata.sensitivity / metadata.sensitivity_source (see memory/sensitivity.py
+# + memory/write.py for how the write-time gate stamps them).
+# ──────────────────────────────────────────────
+
+
+class TestMemToResponseSensitivity:
+    def test_surfaces_sensitivity_fields(self, service):
+        mem = {
+            "id": "sens-001",
+            "memory": "Approved a $50,000 client contract renewal",
+            "metadata": {
+                "metadata": {
+                    "category": "decision",
+                    "scope": "global",
+                    "visibility": "private",
+                    "sensitivity": "financial",
+                    "sensitivity_source": "regex",
+                }
+            },
+        }
+        resp = service._mem_to_response(mem)
+        assert resp.sensitivity == "financial"
+        assert resp.sensitivity_source == "regex"
+
+    def test_memory_without_sensitivity_yields_none(self, service):
+        mem = {
+            "id": "sens-002",
+            "memory": "Decided to use PostgreSQL for better JSONB support",
+            "metadata": {"metadata": {"category": "decision", "scope": "global", "visibility": "shared"}},
+        }
+        resp = service._mem_to_response(mem)
+        assert resp.sensitivity is None
+        assert resp.sensitivity_source is None
+
+
+# ──────────────────────────────────────────────
 # Memory model v2: schema validation
 # ──────────────────────────────────────────────
 
@@ -3097,7 +3297,10 @@ class TestExpireUserGraphWrites:
         groups = set(service._expire_graph_edges_for_groups.call_args[0][0])
         assert "user--alice" in groups
         assert "shared" not in groups
-        assert service._expire_graph_edges_for_memory.call_count == 1
+        # F4: the private row now ALSO gets the same per-row provenance
+        # cascade as the shared row (bulk group-edge expiry is a backstop,
+        # not a substitute) — one call per row, private + shared.
+        assert service._expire_graph_edges_for_memory.call_count == 2
 
     def test_scroll_failure_is_non_fatal(self, service):
         """If scrolling memories fails, expire returns quietly rather than

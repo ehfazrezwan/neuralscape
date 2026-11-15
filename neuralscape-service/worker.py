@@ -3,6 +3,8 @@
 Run with: arq worker.WorkerSettings
 """
 
+import third_party_telemetry  # noqa: F401 — must precede any mem0/Graphiti import (defaults their telemetry off)
+
 import asyncio
 import hashlib
 import logging
@@ -13,6 +15,7 @@ from arq.cron import cron
 import adapters  # noqa: F401 — registers knowledge-adapter taxonomies at import (deterministic MEMORY_CATEGORIES across all workers)
 from config import parse_redis_settings, settings
 from memory_service import MemoryService
+from task_manager import connector_sync_job_id
 
 logger = logging.getLogger(__name__)
 
@@ -173,15 +176,27 @@ async def process_memory_raw(
     service: MemoryService = ctx["service"]
     v2_extras = v2_extras or {}
 
-    # Resolve the requested effective visibility so the idempotency check below is
-    # visibility-aware. Without this, a dictator promoting existing private/shared
-    # text to a `standard` would match the old copy and be dropped before ever
-    # reaching store_raw (which is the tier-aware create path). Mirrors store_raw.
-    from schemas import default_visibility_for_category, normalize_visibility
-    _req_vis = v2_extras.get("visibility")
-    _eff_req_vis = (
-        normalize_visibility(_req_vis) if _req_vis
-        else default_visibility_for_category(category).value
+    # Resolve the visibility this write will ACTUALLY land at, so the
+    # idempotency check below is visibility-aware. Without this, a dictator
+    # promoting existing private/shared text to a `standard` would match the
+    # old copy and be dropped before ever reaching store_raw (which is the
+    # tier-aware create path).
+    #
+    # Must use the RESOLVED (post sensitivity-gate) visibility, not the
+    # caller-requested one (F7): store_raw applies the sensitivity gate
+    # internally and can force visibility=private for a `shared`-requested
+    # write. If this pre-check compared against the requested visibility
+    # instead, a gated write with no override could match a pre-existing
+    # SHARED row with the same content and get treated as a dedup hit —
+    # returning that shared row and skipping the write store_raw's gate
+    # would have forced private, silently leaving the content shared.
+    # resolve_gated_visibility (memory/sensitivity.py) is the single source
+    # of truth store_raw itself uses, so this check can never drift from
+    # what store_raw actually decides.
+    from memory.sensitivity import resolve_gated_visibility
+    _eff_req_vis, _, _, _ = resolve_gated_visibility(
+        content, category, v2_extras.get("visibility"),
+        v2_extras.get("sensitivity_override", False),
     )
 
     # Idempotency: skip only when identical content already exists AT THE SAME
@@ -242,6 +257,7 @@ async def process_memory_raw(
         derived_from=v2_extras.get("derived_from"),
         epistemic_level=v2_extras.get("epistemic_level"),
         visibility=v2_extras.get("visibility"),
+        sensitivity_override=v2_extras.get("sensitivity_override", False),
         memory_kind=v2_extras.get("memory_kind"),
         source_ref=v2_extras.get("source_ref"),
         add_to_graph=False,
@@ -456,6 +472,7 @@ async def process_ingest_document(ctx: dict, doc: dict) -> dict:
         scope=doc.get("scope", "global"),
         project_id=doc.get("project_id"),
         visibility=doc.get("visibility"),
+        sensitivity_override=doc.get("sensitivity_override", False),
         tags=doc.get("tags"),
         agent_id=doc.get("agent_id"),
         run_id=doc.get("run_id"),
@@ -656,6 +673,7 @@ async def process_ingest_file(ctx: dict, payload: dict) -> dict:
         scope=options.get("scope", "global"),
         project_id=options.get("project_id"),
         visibility=options.get("visibility"),
+        sensitivity_override=options.get("sensitivity_override", False),
         tags=options.get("tags"),
         agent_id=options.get("agent_id"),
         run_id=options.get("run_id"),
@@ -1255,13 +1273,22 @@ async def dedup_all_memories(ctx: dict) -> dict:
     return summary
 
 
-async def process_connector_sync(ctx: dict, connector_id: str) -> dict:
+async def process_connector_sync(
+    ctx: dict, connector_id: str, generation: str | None = None
+) -> dict:
     """Background task: pull a connector's resources and ingest changed ones.
 
     Incremental: resources whose source-side revision matches the last-seen
     revision are skipped; content-hash dedup in ``store_raw`` is the backstop
     for sources without a revision marker. Sync state (cursor + per-resource
     revisions + timestamp) is persisted back to the vault.
+
+    ``generation`` is the connector instance the job was enqueued for (``None``
+    for a record from before generations, and for jobs queued before this
+    argument existed). When the stored connector is a different instance
+    (deleted and re-registered, or re-registered by another owner, since the job
+    was queued) the job skips: the new instance has its own job id and syncs
+    under it.
     """
     from datetime import timezone
 
@@ -1274,6 +1301,11 @@ async def process_connector_sync(ctx: dict, connector_id: str) -> dict:
     record = await vault.get(connector_id)
     if not record:
         return {"skipped": True, "reason": "connector not found"}
+    # Literal equality: a job queued before generations existed carries ``None`` and runs only
+    # while the stored record is still generationless; once the connector was replaced (and so
+    # given a generation) that job skips instead of syncing the replacement under its old grant.
+    if record.get("generation") != generation:
+        return {"skipped": True, "reason": "connector replaced since this sync was enqueued"}
     if not record.get("enabled", True):
         return {"skipped": True, "reason": "connector disabled"}
 
@@ -1319,12 +1351,24 @@ async def process_connector_sync(ctx: dict, connector_id: str) -> dict:
     finally:
         await adapter.aclose()
 
-    await vault.update_sync_state(
+    # Atomic, field-scoped and bound to the instance read above: a connector
+    # deleted, re-created or re-owned meanwhile keeps its own state.
+    written = await vault.update_sync_state(
         connector_id,
         cursor=next_cursor,
         last_synced_at=datetime.now(timezone.utc).isoformat(),
         revisions=revisions,
+        generation=record.get("generation"),
+        # Only on top of the progress this sync started from: an overlapping sync of the
+        # same connector that already saved newer progress is never rolled back.
+        expected_cursor=cursor,
+        expected_revisions=dict(record.get("last_revision_by_id") or {}),
     )
+    if not written:
+        logger.info(
+            f"Connector sync [{connector_id}]: connector replaced or removed, or newer progress saved "
+            "by an overlapping sync; state not saved"
+        )
     logger.info(f"Connector sync [{connector_id}]: {synced} ingested, {skipped} unchanged")
     return {"connector_id": connector_id, "synced": synced, "skipped": skipped}
 
@@ -1341,10 +1385,15 @@ async def connector_sync_cron(ctx: dict) -> dict:
     for rec in await vault.list():
         if not rec.get("enabled", True):
             continue
+        # Same job id as an API-triggered sync of this connector instance
+        # (task_manager.connector_sync_job_id), so the two coalesce.
         await redis.enqueue_job(
             "process_connector_sync",
             rec["connector_id"],
-            _job_id=f"sync-{rec['connector_id']}",
+            rec.get("generation"),
+            _job_id=connector_sync_job_id(
+                rec["connector_id"], rec.get("owner_user_id"), rec.get("generation")
+            ),
             _queue_name=settings.ingest_queue_name,
         )
         enqueued += 1

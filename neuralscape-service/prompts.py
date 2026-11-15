@@ -5,9 +5,15 @@ import logging
 import re
 from typing import NamedTuple
 
+from memory.sensitivity import SENSITIVITY_CLASSES
 from schemas import MEMORY_CATEGORIES
 
 logger = logging.getLogger(__name__)
+
+# Trailing "(when: ...)" / "(sensitivity: ...)" suffix on a parsed fact
+# string. Order-independent — applied in a loop so either, both (in any
+# order), or neither may be present.
+_TRAILING_SUFFIX_RE = re.compile(r"\s*\((when|sensitivity):\s*([^)]+)\)\s*$")
 
 # NOTE: no frozen snapshot of MEMORY_CATEGORIES here — knowledge adapters extend
 # the taxonomy at import time (schemas.register_categories), so any dict
@@ -21,6 +27,12 @@ logger = logging.getLogger(__name__)
 
 # Base prompt (require_speaker=False): byte-identical to the original pre-T1.1 prompt.
 # This is the DEFAULT for all real deployments, preserving backward compatibility.
+# Deliberately NOT extended with the optional sensitivity tag (see the
+# WITH_SPEAKER variant below) — a locked test pins this constant byte-for-byte
+# to the pre-T1.1 prompt (tests/test_prompts_retro.py), so the LLM sensitivity
+# signal is only ever emitted on the require_speaker=True path. The default
+# production path's sensitivity coverage is the deterministic regex floor in
+# memory/sensitivity.py, applied at write time regardless of which prompt ran.
 CODING_ASSISTANT_EXTRACTION_PROMPT = """You are a memory extraction engine for an AI assistant. The user may be coding, doing research, running meetings, writing, or any other knowledge work — extract memories that fit the broad context, not just code.
 
 Analyze the conversation below and extract distinct, factual memories about the user, their preferences, projects, and environment.
@@ -112,6 +124,15 @@ Examples:
 
 Only include the time suffix when you can derive it from the conversation. Omit it when unclear.
 
+SENSITIVITY (optional):
+When a fact contains a specific dollar figure, equity/compensation detail, confidential client/commercial term, or a credential/PII value, append a sensitivity tag at the very end of the fact string (after any "(when: ...)" suffix):
+
+Format: [category] speaker: fact content (sensitivity: financial)
+
+Valid values: financial, equity_compensation, client_commercial, credentials_pii
+
+Only include the tag when it clearly applies. Omit it for everything else.
+
 Rules:
 1. Extract ONLY factual, reusable information. Skip greetings, acknowledgments, and transient dialogue.
 2. Each fact should be a standalone sentence that makes sense without the conversation context.
@@ -194,6 +215,14 @@ class ParsedFact(NamedTuple):
     content: str
     speaker: str | None
     occurred_at: str | None
+    # Optional sensitivity classification (financial | equity_compensation |
+    # client_commercial | credentials_pii), only present when the model
+    # tagged the fact with a trailing "(sensitivity: ...)" suffix. Trailing
+    # field with a default so this stays backward-compatible: old/short
+    # model outputs (or callers constructing ParsedFact positionally without
+    # it) parse exactly as before. See memory/sensitivity.py for the
+    # deterministic regex floor this is a supplementary signal to.
+    sensitivity: str | None = None
 
 
 def parse_category_from_fact(fact: str) -> tuple[str, str]:
@@ -295,15 +324,32 @@ def parse_extraction_response_rich(response_text: str) -> list[ParsedFact]:
         # Parse category
         category, remainder = parse_category_from_fact(fact_str)
 
-        # Parse optional trailing (when: ...) suffix
+        # Parse optional trailing suffixes: "(when: ...)" (event time) and
+        # "(sensitivity: ...)" (financial/equity_compensation/
+        # client_commercial/credentials_pii). Order-independent and each
+        # optional — a response with neither, either, or both parses
+        # correctly, so old/short model outputs that predate the
+        # sensitivity tag are fully backward-compatible.
         occurred_at = None
-        when_match = re.search(r"\s*\(when:\s*([^)]+)\)\s*$", remainder)
-        if when_match:
-            occurred_at_raw = when_match.group(1).strip()
-            # Validate: non-empty when value, otherwise drop the suffix entirely
-            if occurred_at_raw:
-                occurred_at = occurred_at_raw
-            remainder = remainder[: when_match.start()].strip()
+        sensitivity = None
+        while True:
+            suffix_match = _TRAILING_SUFFIX_RE.search(remainder)
+            if not suffix_match:
+                break
+            key = suffix_match.group(1).lower()
+            value = suffix_match.group(2).strip()
+            if key == "when":
+                if value and occurred_at is None:
+                    occurred_at = value
+            elif key == "sensitivity":
+                candidate = value.lower()
+                if candidate in SENSITIVITY_CLASSES and sensitivity is None:
+                    sensitivity = candidate
+                # An unrecognized value is silently dropped (not stamped as
+                # sensitivity) rather than failing the whole fact — the
+                # deterministic regex floor in memory/sensitivity.py is the
+                # backstop, this LLM signal is only ever supplementary.
+            remainder = remainder[: suffix_match.start()].strip()
 
         # Parse optional leading speaker: prefix
         # Guard against false positives (ratios, times, config syntax)
@@ -329,7 +375,11 @@ def parse_extraction_response_rich(response_text: str) -> list[ParsedFact]:
 
         parsed_facts.append(
             ParsedFact(
-                category=category, content=content, speaker=speaker, occurred_at=occurred_at
+                category=category,
+                content=content,
+                speaker=speaker,
+                occurred_at=occurred_at,
+                sensitivity=sensitivity,
             )
         )
 

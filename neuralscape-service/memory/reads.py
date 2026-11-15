@@ -211,6 +211,7 @@ class ReadsMixin:
         memory_id: str,
         max_depth: int = 3,
         node_cap: int = 50,
+        caller_user_id: str | None = None,
     ) -> dict | None:
         """Walk a memory's ``derived_from`` provenance into a reasoning tree.
 
@@ -224,17 +225,25 @@ class ReadsMixin:
         Each node is ``{memory_id, content (snippet), epistemic_level,
         children}``. A node where the walk stops is marked instead of
         expanded: ``missing`` (premise no longer resolvable — e.g.
-        hard-deleted), ``cycle`` (id already on the current path), or
-        ``truncated`` ("max_depth" | "node_cap" — unexpanded premises
-        remain, re-query with a higher max_depth or start deeper). The
-        node budget bounds the TOTAL emitted node count, so the response
-        size stays bounded even though internal ``derived_from`` lists are
-        uncapped (a wide MERGE fan-in). Tombstoned premises still resolve —
-        a merge survivor's provenance must outlive its losers' recall
-        visibility.
+        hard-deleted, OR unreadable by ``caller_user_id`` — deliberately
+        indistinguishable from not-found so this can't be used as an
+        existence oracle for another user's private premises), ``cycle``
+        (id already on the current path), or ``truncated`` ("max_depth" |
+        "node_cap" — unexpanded premises remain, re-query with a higher
+        max_depth or start deeper). The node budget bounds the TOTAL emitted
+        node count, so the response size stays bounded even though internal
+        ``derived_from`` lists are uncapped (a wide MERGE fan-in). Tombstoned
+        premises still resolve — a merge survivor's provenance must outlive
+        its losers' recall visibility.
 
-        Returns None when the root memory itself doesn't exist (callers map
-        that to 404).
+        Args:
+            caller_user_id: Optional caller id for read authorization,
+                threaded into every ``get_memory`` lookup (root AND every
+                premise). ``None`` skips the gate (backward-compatible
+                default — matches ``get_memory``'s own default).
+
+        Returns None when the root memory itself doesn't exist, or isn't
+        readable by ``caller_user_id`` (callers map that to 404).
         """
         max_depth = max(1, int(max_depth))
         budget = {"nodes": 0}
@@ -245,7 +254,7 @@ class ReadsMixin:
             if mid in path:
                 return {"memory_id": mid, "cycle": True, "children": []}
             try:
-                mem = self.get_memory(mid)
+                mem = self.get_memory(mid, caller_user_id)
             except Exception as e:
                 logger.debug(f"Reasoning-chain lookup failed for {mid}: {e}")
                 mem = None

@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 from pathlib import Path
 from typing import Annotated
@@ -7,6 +8,8 @@ from urllib.parse import urlparse
 from arq.connections import RedisSettings
 from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode
+
+_logger = logging.getLogger(__name__)
 
 _LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1", "[::1]"}
 
@@ -448,6 +451,13 @@ class Settings(BaseSettings):
     # `request.state.user_id` so routes don't need to trust the request body.
     # Generate tokens via `python scripts/issue_user_token.py --user <name>`.
     neuralscape_user_token_secret: str = ""
+    # Explicit, loud opt-out of authentication. Auth is FAIL-CLOSED: when neither
+    # `neuralscape_user_token_secret` nor `neuralscape_api_key` is set, startup
+    # refuses (see `validate_required`) and the middleware rejects every
+    # non-public request. Set NEURALSCAPE_AUTH_DISABLED=true only on a trusted
+    # local machine to run with no auth at all; a WARNING is logged at startup.
+    # Ignored (auth stays on) whenever either secret above is set.
+    neuralscape_auth_disabled: bool = False
     # Public HTTPS base URL the service is reachable at from the internet
     # (e.g. the cloudflared tunnel hostname: "https://neuralscape.example.com").
     # Used as the OAuth issuer and to build the .well-known metadata URLs that
@@ -528,12 +538,39 @@ class Settings(BaseSettings):
     processes_enabled: bool = False
     dictator_user_ids: str = ""   # e.g. "mark,alice"
 
+    # ── Sensitivity gate (write-time, deterministic, zero LLM cost) ──────
+    # Several categories (decision, interaction, architecture, tech_stack,
+    # procedure, workflow, convention, dependency) default to SHARED
+    # visibility (see schemas.DEFAULT_VISIBILITY_FOR_CATEGORY) because the
+    # deployment genuinely relies on shared team knowledge. But a caller can
+    # label a sensitive fact (a dollar figure, a credential, a client's
+    # commercial terms) with one of those categories and silently publish it
+    # to every seat. The gate classifies write content with a deterministic
+    # regex floor (see memory/sensitivity.py) — plus an optional LLM-supplied
+    # hint from the extraction prompt — and forces such writes to `private`
+    # unless the caller explicitly overrides (visibility set +
+    # sensitivity_override=True). This is per-class, not blanket privacy:
+    # only the classes listed in sensitivity_private_classes are forced.
+    #   sensitivity_gate_enabled    → feature flag; True keeps today's fix on.
+    #   sensitivity_private_classes → CSV of sensitivity classes that force
+    #     `private` when matched. Per-deployment: a team that wants
+    #     "financial" facts shared can drop it from the list.
+    sensitivity_gate_enabled: bool = True
+    sensitivity_private_classes: str = "financial,equity_compensation,client_commercial,credentials_pii"
+
     # Service
     host: str = "0.0.0.0"
     port: int = 8199
     default_user_id: str = "default_user"
     default_project_id: str | None = None
     mcp_transport: str = "stdio"  # "stdio" or "http"
+
+    # Vendored mem0/Graphiti usage telemetry. Declared so these keys are valid in the
+    # service .env; nothing here reads them. third_party_telemetry.py applies them (or
+    # defaults both to off) before mem0/Graphiti are imported, since the libraries read
+    # only the process environment. None means "not set".
+    mem0_telemetry: str | None = None
+    graphiti_telemetry_enabled: str | None = None
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
 
@@ -698,6 +735,28 @@ class Settings(BaseSettings):
     def _normalize_supabase_url(cls, value: str) -> str:
         return (value or "").rstrip("/")
 
+    @field_validator("sensitivity_private_classes")
+    @classmethod
+    def _validate_sensitivity_private_classes(cls, value: str) -> str:
+        """Normalize case and reject unknown class names at settings load.
+
+        A typo'd/renamed class here (e.g. "financials" or a class dropped
+        by a future memory/sensitivity.py refactor) would silently never
+        match ``sensitivity_private_classes_set()`` — the sensitivity gate
+        would look "on" but quietly stop forcing that class private. Fail
+        loudly at startup instead.
+        """
+        from memory.sensitivity import SENSITIVITY_CLASSES
+
+        normalized = [c.strip().lower() for c in (value or "").split(",") if c.strip()]
+        unknown = sorted(set(normalized) - set(SENSITIVITY_CLASSES))
+        if unknown:
+            raise ValueError(
+                f"SENSITIVITY_PRIVATE_CLASSES contains unknown class(es) {unknown} — "
+                f"must be a subset of: {sorted(SENSITIVITY_CLASSES)}"
+            )
+        return ",".join(normalized)
+
     # ── parsed views of the comma-separated auth settings ────────────────
     def allowed_domains_set(self) -> set[str]:
         """Lowercased allowed email domains, leading '@' stripped."""
@@ -737,6 +796,11 @@ class Settings(BaseSettings):
     def is_dictator(self, user_id: str | None) -> bool:
         """True iff `user_id` is an authorized dictator (may write standards)."""
         return bool(user_id) and user_id in self.dictator_user_ids_set()
+
+    # ── sensitivity gate helpers ──────────────────────────────────────────
+    def sensitivity_private_classes_set(self) -> set[str]:
+        """Parsed CSV of sensitivity classes that force `visibility=private`."""
+        return {c.strip() for c in self.sensitivity_private_classes.split(",") if c.strip()}
 
     def validate_required(self) -> None:
         """Validate that all required configuration fields are set.
@@ -790,9 +854,33 @@ class Settings(BaseSettings):
                 errors.append(
                     "SUPABASE_URL and SUPABASE_ANON_KEY are required when AUTH_PROVIDER=supabase"
                 )
+        # Auth is fail-closed: with no credential configured, the API would be
+        # open to anyone who can reach it, so refuse to start unless the
+        # operator explicitly opted out.
+        auth_configured = bool(self.neuralscape_user_token_secret or self.neuralscape_api_key)
+        if not auth_configured and not self.neuralscape_auth_disabled:
+            errors.append(
+                "Authentication is not configured. Set one of: "
+                "NEURALSCAPE_USER_TOKEN_SECRET (per-user tokens, recommended), "
+                "NEURALSCAPE_API_KEY (legacy shared key), or "
+                "NEURALSCAPE_AUTH_DISABLED=true (no auth at all; trusted local machine only). "
+                "See AUTH.md"
+            )
         if errors:
             raise ValueError(
                 "Missing required configuration:\n  - " + "\n  - ".join(errors)
+            )
+        if not auth_configured:
+            _logger.warning(
+                "AUTHENTICATION IS DISABLED (NEURALSCAPE_AUTH_DISABLED=true): every "
+                "REST and MCP endpoint accepts unauthenticated requests. Use this only "
+                "on a trusted local machine; set NEURALSCAPE_USER_TOKEN_SECRET for any "
+                "shared or network-reachable deployment."
+            )
+        elif self.neuralscape_auth_disabled:
+            _logger.warning(
+                "NEURALSCAPE_AUTH_DISABLED=true is ignored because an auth secret is "
+                "configured; authentication stays enabled."
             )
 
     def _gateway_openai_base(self) -> str:
