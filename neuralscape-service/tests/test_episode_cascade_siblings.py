@@ -462,6 +462,23 @@ class TestDeleteOneOfN:
         assert sorted(out["graph_sibling_unrepaired_ids"]) == sorted(conv.ids[1:])
         assert out["graph_jobs"] == []
 
+    def test_batch_clear_failure_retries_per_row_and_reports_only_failures(self, world):
+        w = world
+        conv = seed_conversation(w, n=4)
+        real = w.q.set_payload
+        bad = conv.ids[2]
+
+        def flaky(collection_name, payload, points, key=None):
+            if len(points) > 1 or bad in points:
+                raise RuntimeError("write failed")
+            return real(collection_name, payload, points, key)
+
+        w.q.set_payload = flaky
+        out = w.svc.delete_memory(conv.ids[0], OWNER)
+        assert out["graph_sibling_unrepaired_ids"] == [bad]
+        assert {j["memory_id"] for j in out["graph_jobs"]} == {conv.ids[1], conv.ids[3]}
+        assert w.q.meta(conv.ids[1])["graph_episode_uuid"] is None
+
     def test_workspace_partitioned_sibling_is_reported_not_misgrouped(self, world):
         w = world
         conv = seed_conversation(w, n=3)
@@ -1077,3 +1094,133 @@ class TestContentEditCascade:
         conv = seed_conversation(w, n=2)
         w.svc.patch_memory(conv.ids[0], OWNER, {"tags": ["t"]})
         assert conv.uuid in w.g.episodes
+
+
+# ──────────────────────────────────────────────
+# dreaming prune (hard delete of a gate-cleared secret)
+# ──────────────────────────────────────────────
+
+
+class TestDreamPruneSiblingJobs:
+    @pytest.mark.asyncio
+    async def test_prune_enqueues_the_delete_s_sibling_jobs(self, monkeypatch):
+        from extensions.dreaming import consolidate
+        from tests.test_dreaming_safety import _apply_service, _batch
+
+        service, _client = _apply_service({"a": {"data": "sk-live-abc", "metadata": {}}})
+        jobs = [_job(1), _job(2)]
+        service.delete_memory.return_value = {"message": "ok", "graph_jobs": list(jobs)}
+        seen = {}
+
+        async def fake_enqueue(j):
+            seen["jobs"] = j
+            return {"graph_jobs_enqueued": len(j), "graph_jobs_not_enqueued_ids": []}
+
+        monkeypatch.setattr("task_manager.enqueue_graph_jobs_standalone", fake_enqueue)
+        result = await consolidate.apply_actions(
+            service,
+            _batch([{"memory_id": "a", "content": "sk-live-abc"}]),
+            [{"type": "prune", "memory_ids": ["a"], "confidence": 0.95, "contains_secret": True}],
+            dry_run=False,
+        )
+        assert not result.errors
+        assert seen["jobs"] == jobs
+
+    @pytest.mark.asyncio
+    async def test_standalone_enqueue_reports_failure_never_raises(self, monkeypatch):
+        import task_manager
+
+        class _TM:
+            pool = None
+
+            async def connect(self):
+                raise ConnectionError("redis down")
+
+        monkeypatch.setattr(task_manager, "TaskManager", _TM)
+        res = await task_manager.enqueue_graph_jobs_standalone([_job(1), _job(2)])
+        assert res == {"graph_jobs_enqueued": 0, "graph_jobs_not_enqueued_ids": ["m1", "m2"]}
+
+
+# ──────────────────────────────────────────────
+# Permission matrix on the modules' real entry points (memory.delete / memory.edit)
+# ──────────────────────────────────────────────
+
+
+class TestDeleteEditPermissionMatrix:
+    @pytest.fixture(autouse=True)
+    def _dictator(self, monkeypatch):
+        monkeypatch.setattr(settings, "dictator_user_ids", "root", raising=False)
+
+    def _row(self, w, pid, vis, owner=OWNER):
+        w.q.add(pid, f"fact {pid}", user_id=owner, visibility=vis)
+
+    @pytest.mark.parametrize("vis,caller,allowed", [
+        ("private", OWNER, True), ("private", OTHER, False), ("private", "root", True),
+        ("shared", OWNER, True), ("shared", OTHER, False), ("shared", "root", True),
+        ("standard", OWNER, False), ("standard", OTHER, False), ("standard", "root", True),
+    ])
+    def test_single_delete(self, world, vis, caller, allowed):
+        from memory.delete import DeleteMixin  # noqa: F401  (module under test)
+
+        self._row(world, rid(1), vis)
+        if allowed:
+            world.svc.delete_memory(rid(1), caller)
+            assert rid(1) not in world.q.points
+        else:
+            with pytest.raises(PermissionError):
+                world.svc.delete_memory(rid(1), caller)
+            assert rid(1) in world.q.points
+
+    def test_private_only_wipe_preserves_shared_and_standard(self, world):
+        self._row(world, rid(1), "private")
+        self._row(world, rid(2), "shared")
+        self._row(world, rid(3), "standard")
+        out = world.svc.delete_memories(user_id=OWNER)
+        assert set(world.q.points) == {rid(2), rid(3)}
+        assert out["message"] == "Deleted 1 private memories (preserved 1 shared) (preserved 1 standard)"
+
+    def test_private_only_wipe_never_touches_another_user(self, world):
+        self._row(world, rid(1), "private")
+        self._row(world, rid(2), "private", owner=OTHER)
+        world.svc.delete_memories(user_id=OWNER)
+        assert set(world.q.points) == {rid(2)}
+
+    def test_filtered_delete_skips_shared_unless_asked_and_standard_unless_dictator(self, world):
+        for i, vis in enumerate(("private", "shared", "standard"), start=1):
+            self._row(world, rid(i), vis)
+        world.svc.list_memories = MagicMock(return_value=[
+            SimpleNamespace(id=rid(i), visibility=v)
+            for i, v in enumerate(("private", "shared", "standard"), start=1)
+        ])
+        out = world.svc.delete_memories(user_id=OWNER, category="personal_fact")
+        assert set(world.q.points) == {rid(2), rid(3)}
+        assert "preserved 1 shared, 1 standard" in out["message"]
+
+    @pytest.mark.parametrize("vis,caller,changes,allowed", [
+        ("private", OWNER, {"tags": ["x"]}, True),
+        ("private", OTHER, {"tags": ["x"]}, False),
+        ("shared", OTHER, {"tags": ["x"]}, True),                # housekeeping is team-editable
+        ("shared", OTHER, {"content": "rewritten"}, False),      # content is owner-only
+        ("shared", OWNER, {"content": "rewritten"}, True),
+        ("standard", OWNER, {"tags": ["x"]}, False),
+        ("standard", "root", {"tags": ["x"]}, True),
+        ("private", "root", {"content": "rewritten"}, True),
+    ])
+    def test_patch_permissions(self, world, vis, caller, changes, allowed):
+        from memory.edit import EditMixin  # noqa: F401  (module under test)
+
+        self._row(world, rid(1), vis)
+        if allowed:
+            world.svc.patch_memory(rid(1), caller, dict(changes))
+        else:
+            with pytest.raises(PermissionError):
+                world.svc.patch_memory(rid(1), caller, dict(changes))
+
+    def test_passage_content_edit_refused(self, world):
+        world.q.add(rid(1), "chunk", memory_kind="passage")
+        with pytest.raises(ValueError, match="passage"):
+            world.svc.patch_memory(rid(1), OWNER, {"content": "new"})
+
+    def test_missing_memory_is_lookup_error(self, world):
+        with pytest.raises(LookupError):
+            world.svc.patch_memory(rid(404), OWNER, {"tags": ["x"]})

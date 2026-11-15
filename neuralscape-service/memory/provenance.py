@@ -492,21 +492,35 @@ class ProvenanceMixin:
             out["lookup_failed"] = True
             return out
 
+        cleared_payload = {"graph_episode_uuid": None, "graph_episode_name": None}
+        failed: set[str] = set()
         for want_wrapped in (False, True):
             ids = [sid for sid, _, _, w in siblings if w == want_wrapped]
             if not ids:
                 continue
+            key = "metadata.metadata" if want_wrapped else "metadata"
             try:
                 client.set_payload(
-                    collection_name=collection,
-                    payload={"graph_episode_uuid": None, "graph_episode_name": None},
-                    points=ids,
-                    key="metadata.metadata" if want_wrapped else "metadata",
+                    collection_name=collection, payload=cleared_payload, points=ids, key=key,
                 )
+                continue
             except Exception as e:
-                logger.warning("Clearing stale episode refs failed for %d rows: %s", len(ids), e)
-                out["unrepaired_ids"].extend(ids)
-                siblings = [t for t in siblings if t[0] not in set(ids)]
+                logger.warning(
+                    "Batched clear of stale episode refs failed for %d rows (%s); retrying per row",
+                    len(ids), e,
+                )
+            # One bad point must not strand the rest: retry each on its own.
+            for sid in ids:
+                try:
+                    client.set_payload(
+                        collection_name=collection, payload=cleared_payload, points=[sid], key=key,
+                    )
+                except Exception as e:
+                    logger.warning("Clearing stale episode ref failed for %s: %s", sid, e)
+                    failed.add(sid)
+        if failed:
+            out["unrepaired_ids"].extend(sorted(failed))
+            siblings = [t for t in siblings if t[0] not in failed]
 
         for sid, payload, meta, _ in siblings:
             if sid in skip_job_ids or meta.get("dream_tombstoned"):

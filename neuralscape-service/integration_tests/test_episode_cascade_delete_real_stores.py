@@ -19,12 +19,16 @@ QDRANT_URL, GOOGLE_API_KEY (the LLM).
 
 from __future__ import annotations
 
+import third_party_telemetry  # noqa: F401  (telemetry guard; must precede mem0/graphiti imports)
+
 import asyncio
 import os
 import time
 import uuid
 
 import pytest
+
+pytestmark = pytest.mark.integration
 
 REQUIRED_ENV = ("NEO4J_URI", "NEO4J_USER", "NEO4J_PASSWORD", "QDRANT_URL", "GOOGLE_API_KEY")
 
@@ -121,10 +125,23 @@ def test_delete_one_fact_repairs_siblings_then_bulk_wipe(svc, user):
     (episode_uuid,) = ep_uuids
     assert any(e["uuid"] == episode_uuid for e in _episodes(svc, user))
 
-    # --- delete ONE fact -------------------------------------------------
-    victim = rows[0]
+    # --- delete ONE fact (chosen deterministically: the one carrying the seed token) --
+    seed = f"Quillfeather{tag}".lower()
+    victims = [r for r in rows if seed in r["payload"].get("data", "").lower()]
+    assert len(victims) == 1, (
+        f"expected exactly one extracted fact containing {seed!r}, got "
+        f"{[r['payload'].get('data') for r in rows]}"
+    )
+    victim = victims[0]
+    mentioned = [
+        r["uuid"] for r in _cypher(
+            svc,
+            "MATCH (e:Episodic {uuid: $u})-[:MENTIONS]->(n:Entity) RETURN n.uuid AS uuid",
+            u=episode_uuid,
+        )
+    ]
     victim_text = victim["payload"].get("data", "")
-    survivors = [r["id"] for r in rows[1:]]
+    survivors = [r["id"] for r in rows if r["id"] != victim["id"]]
     out = svc.delete_memory(victim["id"], user)
     assert out["graph_cascade"] == "resolved"
 
@@ -143,6 +160,14 @@ def test_delete_one_fact_repairs_siblings_then_bulk_wipe(svc, user):
         g=_group(user), ep=episode_uuid,
     )
     assert still_live == []
+    # entity nodes the episode mentioned: removed, or summary cleared (never left
+    # carrying text synthesised from the deleted conversation)
+    if mentioned:
+        left = _cypher(
+            svc, "MATCH (n:Entity) WHERE n.uuid IN $u RETURN n.uuid AS uuid, n.summary AS summary",
+            u=mentioned,
+        )
+        assert all(not (n["summary"] or "").strip() for n in left), left
     # nothing a reader can reach contains the deleted fact
     hits = svc.search_graph(victim_text, user_id=user, limit=10)
     blob = " ".join(

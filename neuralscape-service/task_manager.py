@@ -88,6 +88,32 @@ _STATUS_MAP = {
 }
 
 
+async def enqueue_graph_jobs_standalone(jobs: list[dict]) -> dict:
+    """Enqueue graph re-ingest jobs from code with no queue handle (the dream
+    sweep's prune, the post-compile dedup) through a short-lived TaskManager.
+
+    Never raises: returns ``graph_jobs_enqueued`` and
+    ``graph_jobs_not_enqueued_ids`` like :meth:`TaskManager.enqueue_graph_jobs`.
+    """
+    tm = TaskManager()
+    try:
+        await tm.connect()
+        return await tm.enqueue_graph_jobs(jobs)
+    except Exception as e:
+        logger.warning("Sibling graph re-enrichment could not be queued (non-critical): %s", e)
+        return {
+            "graph_jobs_enqueued": 0,
+            "graph_jobs_not_enqueued_ids": [j.get("memory_id") for j in jobs],
+        }
+    finally:
+        pool = getattr(tm, "pool", None)
+        if pool is not None:
+            try:
+                await pool.aclose()
+            except Exception:
+                pass
+
+
 class TaskManager:
     """Redis-backed task status tracking + ARQ job enqueuing."""
 

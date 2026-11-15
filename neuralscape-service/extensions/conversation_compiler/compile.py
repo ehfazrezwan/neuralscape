@@ -188,26 +188,12 @@ def _entries_to_text(entries: list[dict]) -> str:
 async def _enqueue_sibling_jobs(jobs: list[dict]) -> tuple[int, int]:
     """Enqueue the sibling graph re-ingests a dedup run produced.
 
-    The compile path has no queue handle of its own, so it opens a short-lived
-    TaskManager. Never raises: returns ``(enqueued, not_enqueued)``.
+    Returns ``(enqueued, not_enqueued)``; never raises.
     """
-    from task_manager import TaskManager
+    from task_manager import enqueue_graph_jobs_standalone
 
-    tm = TaskManager()
-    try:
-        await tm.connect()
-        res = await tm.enqueue_graph_jobs(jobs)
-        return res["graph_jobs_enqueued"], len(res["graph_jobs_not_enqueued_ids"])
-    except Exception as e:
-        logger.warning(f"Post-compile dedup sibling re-enrichment not queued: {e}")
-        return 0, len(jobs)
-    finally:
-        pool = getattr(tm, "pool", None)
-        if pool is not None:
-            try:
-                await pool.aclose()
-            except Exception:
-                pass
+    res = await enqueue_graph_jobs_standalone(jobs)
+    return res["graph_jobs_enqueued"], len(res["graph_jobs_not_enqueued_ids"])
 
 
 async def compile_date(
