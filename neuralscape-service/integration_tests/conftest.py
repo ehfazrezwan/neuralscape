@@ -22,6 +22,7 @@ without the service on ``sys.path``.
 from __future__ import annotations
 
 import os
+import re
 import socket
 import sys
 import urllib.error
@@ -70,11 +71,33 @@ def pytest_collection_modifyitems(config, items):
 
 
 def integration_required() -> bool:
+    """True on the VPS gate (NS_INTEGRATION_REQUIRED) and on GitHub Actions.
+
+    The Actions clause keeps the native-snapshot CI job strict (an unreachable
+    Neo4j there is a failure, never a skip) without editing the workflow.
+    """
+
+    if os.environ.get("GITHUB_ACTIONS", "").strip().lower() == "true":
+        return True
     return os.environ.get("NS_INTEGRATION_REQUIRED", "").strip().lower() in {"1", "true", "yes", "on"}
 
 
+_USERINFO = re.compile(r"(?P<scheme>[A-Za-z][A-Za-z0-9+.\-]*://)(?P<user>[^/:@\s]*):(?P<password>[^/@\s]*)@")
+
+
+def redact(text: str) -> str:
+    """Replace the password in any ``scheme://user:password@host`` in ``text`` with ``***``."""
+
+    return _USERINFO.sub(lambda m: f"{m['scheme']}{m['user']}:***@", text)
+
+
 def unavailable(reason: str) -> None:
-    """Fail (gate) or skip (anywhere else) because infrastructure is missing."""
+    """Fail (gate) or skip (anywhere else) because infrastructure is missing.
+
+    The reason is redacted: it may embed a store URL with credentials.
+    """
+
+    reason = redact(reason)
 
     if integration_required():
         pytest.fail(f"NS_INTEGRATION_REQUIRED is set but {reason}", pytrace=False)
@@ -123,7 +146,7 @@ class Stores:
     redis_url: str
 
     def __repr__(self) -> str:  # keep secrets out of assertion output
-        return f"Stores(neo4j={self.neo4j_uri}, qdrant={self.qdrant_url}, redis={self.redis_url})"
+        return f"Stores(neo4j={redact(self.neo4j_uri)}, qdrant={redact(self.qdrant_url)}, redis={redact(self.redis_url)})"
 
 
 def _env(name: str, default: str | None = None) -> str | None:
@@ -159,6 +182,33 @@ def stores() -> Stores:
         if error:
             unavailable(f"{name} is unreachable ({error})")
     return found
+
+
+@dataclass(frozen=True)
+class Neo4jConn:
+    uri: str
+    user: str
+    password: str
+    database: str
+
+    def __repr__(self) -> str:
+        return f"Neo4jConn(uri={redact(self.uri)}, user={self.user}, database={self.database})"
+
+
+@pytest.fixture(scope="session")
+def neo4j_conn() -> Neo4jConn:
+    """Only Neo4j (NEO4J_URI/USER/PASSWORD/DATABASE), probed.  For tests that need no other store."""
+
+    conn = Neo4jConn(
+        uri=_env("NEO4J_URI", "neo4j://127.0.0.1:7687"),
+        user=_env("NEO4J_USER", "neo4j"),
+        password=_env("NEO4J_PASSWORD", ""),
+        database=_env("NEO4J_DATABASE", "memory"),
+    )
+    error = _probe_neo4j(conn.uri)
+    if error:
+        unavailable(f"Neo4j is unreachable ({error})")
+    return conn
 
 
 @pytest.fixture(scope="session")
@@ -202,7 +252,7 @@ class LiveApi:
     headers: dict = field(default_factory=dict)
 
     def __repr__(self) -> str:  # never show the token
-        return f"LiveApi(url={self.url})"
+        return f"LiveApi(url={redact(self.url)})"
 
 
 @pytest.fixture(scope="session")
@@ -335,4 +385,5 @@ def unique_ns(request):
         except Exception as exc:  # noqa: BLE001
             errors.append(f"{type(exc).__name__}: {exc}")
     if errors:
-        print(f"unique_ns cleanup errors (non-fatal): {errors}")
+        # Leaked data would poison later runs: make the teardown an error.
+        pytest.fail(redact(f"unique_ns cleanup failed: {errors}"), pytrace=False)

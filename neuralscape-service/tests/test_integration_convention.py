@@ -70,14 +70,14 @@ def test_the_guard_detects_the_marker_forms_it_is_meant_to_catch():
 def test_integration_conftest_statically_keeps_the_convention():
     tree = ast.parse((INTEGRATION_DIR / "conftest.py").read_text(encoding="utf-8"))
     functions = {n.name for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)}
-    for required in ("pytest_collection_modifyitems", "stores", "llm_key", "pg_dsn", "live_api", "flags", "unique_ns", "unavailable"):
+    for required in ("pytest_collection_modifyitems", "stores", "neo4j_conn", "llm_key", "pg_dsn", "live_api", "flags", "unique_ns", "unavailable"):
         assert required in functions, f"integration_tests/conftest.py lost {required}()"
     text = (INTEGRATION_DIR / "conftest.py").read_text(encoding="utf-8")
     assert "NS_INTEGRATION_REQUIRED" in text
 
 
 def _pytest(args, cwd, env_extra=None):
-    env = {k: v for k, v in os.environ.items() if k != "NS_INTEGRATION_REQUIRED"}
+    env = {k: v for k, v in os.environ.items() if k not in {"NS_INTEGRATION_REQUIRED", "GITHUB_ACTIONS"}}
     env.update(env_extra or {})
     return subprocess.run(
         [sys.executable, "-m", "pytest", "-p", "no:cacheprovider", "-q", *args],
@@ -113,4 +113,27 @@ def test_missing_infrastructure_fails_on_the_gate_and_skips_elsewhere(tmp_path):
     relaxed = _pytest(["-rs", str(area)], tmp_path, env)
     assert relaxed.returncode == 0 and "1 skipped" in relaxed.stdout, relaxed.stdout + relaxed.stderr
     gate = _pytest([str(area)], tmp_path, dict(env, NS_INTEGRATION_REQUIRED="1"))
-    assert gate.returncode == 1 and "1 error" in gate.stdout  # a fixture failure is reported as an error and "NS_INTEGRATION_REQUIRED" in gate.stdout
+    assert gate.returncode == 1 and "1 error" in gate.stdout  # a fixture failure is reported as an error
+    assert "NS_INTEGRATION_REQUIRED is set but GOOGLE_API_KEY" in gate.stdout, gate.stdout
+
+
+def test_credentials_in_store_urls_never_reach_reprs_or_messages(tmp_path):
+    area = tmp_path / "integration_tests"
+    area.mkdir()
+    shutil.copy(INTEGRATION_DIR / "conftest.py", area / "conftest.py")
+    (area / "test_secret.py").write_text(
+        "import conftest\n"
+        "def test_repr():\n"
+        "    s = conftest.Stores('neo4j://u:topsecret@h:7687', 'u', 'topsecret', 'd', 'http://q:topsecret@h:6333', 'redis://:topsecret@h:6379')\n"
+        "    assert 'topsecret' not in repr(s) and '***' in repr(s)\n"
+        "    assert 'topsecret' not in repr(conftest.Neo4jConn('neo4j://u:topsecret@h', 'u', 'topsecret', 'd'))\n"
+        "def test_message(monkeypatch):\n"
+        "    monkeypatch.delenv('NS_INTEGRATION_REQUIRED', raising=False)\n"
+        "    conftest.unavailable('Redis is unreachable (redis://:topsecret@h:6379 refused)')\n",
+        encoding="utf-8",
+    )
+    out = _pytest(["-rs", str(area)], tmp_path)
+    assert "1 passed, 1 skipped" in out.stdout, out.stdout + out.stderr
+    assert "topsecret" not in out.stdout + out.stderr and "redis://:***@h:6379" in out.stdout
+    gate = _pytest(["-k", "test_message", str(area)], tmp_path, {"NS_INTEGRATION_REQUIRED": "1"})
+    assert "topsecret" not in gate.stdout + gate.stderr

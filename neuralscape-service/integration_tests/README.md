@@ -23,6 +23,7 @@ Copy `test_flag_on_exemplar.py`. The fixtures (`conftest.py`):
 | fixture | gives you |
 |---|---|
 | `stores` | `neo4j_uri/user/password/database`, `qdrant_url`, `redis_url` from env, each probed once |
+| `neo4j_conn` | Neo4j only (for tests that need no other store; the snapshot job uses it) |
 | `llm_key` | the `GOOGLE_API_KEY` value (ask for it only if the test spends LLM calls; never print it) |
 | `pg_dsn` | the PostgreSQL+pgvector DSN (`NS_TEST_PG_DSN`), probed |
 | `live_api` | `.url` and `.headers` (Bearer token) of the running API + workers |
@@ -45,6 +46,13 @@ Redis keys). Leftovers from a crashed run are findable by the `nsit` prefix.
 it) an unreachable store or missing key **fails** the test (a fixture error, exit status 1); without it the test
 **skips** with the reason. Never silently pass.
 
+**Zero skips on the gate.** The gate sets `NS_INTEGRATION_REQUIRED=1`, so
+missing infrastructure is an error, never a skip. Any SKIPPED integration test
+in a gate run must be justified in the PR body, and a test may skip only on a
+declared condition (for example an optional extra that is not installed), never
+for missing stores, keys or API. A cleanup that fails in `unique_ns` fails the
+test's teardown. Store URLs in messages and reprs have their passwords redacted.
+
 **The per-PR "flag-on proof".** A PR that adds or changes a flagged feature adds
 one test here that (1) calls `flags(...)`, (2) exercises the feature through the
 service code against the real stores, (3) asserts the observable result, and
@@ -61,7 +69,8 @@ them; nothing else is guaranteed):
 | `NEO4J_URI`, `NEO4J_USER`, `NEO4J_PASSWORD`, `NEO4J_DATABASE` | Neo4j | `stores` |
 | `QDRANT_URL` | Qdrant | `stores` |
 | `REDIS_URL` | Redis | `stores` |
-| `GOOGLE_API_KEY` | real Gemini key | `llm_key` |
+| `GOOGLE_API_KEY` | real Gemini key | `neo4j_conn` | Neo4j only (for tests that need no other store; the snapshot job uses it) |
+| `llm_key` |
 | `NS_TEST_PG_DSN` | PostgreSQL with pgvector | `pg_dsn` |
 | `NS_API_URL`, `NS_API_TOKEN` | live API plus the three workers; the token is minted for a per-run user against the stack's user-token secret | `live_api` (`.url`, `.headers`) |
 
@@ -88,7 +97,8 @@ NS_INTEGRATION_REQUIRED=1 pytest integration_tests/ tests/test_async_pipeline.py
 
 The native snapshot job in `service-ci.yml` still runs
 `integration_tests/test_native_snapshot_neo4j.py` by file name; the marker does
-not change it.
+not change it. On GitHub Actions (`GITHUB_ACTIONS=true`) the fail-instead-of-skip
+rule is on automatically, so that job can never go green by skipping.
 
 ## Skip manifest (`.github/ci/expected_skips.json`)
 
