@@ -3,7 +3,7 @@
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, Field, field_validator, model_serializer, model_validator
 
 
 # ──────────────────────────────────────────────
@@ -1196,6 +1196,19 @@ class MemoryResponse(BaseModel):
     id: str
     memory: str
     category: str | None = None
+    # Model scores for relevance only, bound to content/category by the service.
+    # These never authorize sharing or change strict category filter semantics.
+    category_evidence: dict | None = None
+
+    @model_serializer(mode="wrap")
+    def _omit_absent_category_evidence(self, handler):
+        # Flag off (the default), no row carries evidence: omit the key so the
+        # wire shape is byte-identical to before the field existed.
+        data = handler(self)
+        if isinstance(data, dict) and data.get("category_evidence") is None:
+            data.pop("category_evidence", None)
+        return data
+
     scope: str | None = None
     project_id: str | None = None
     tags: list[str] | None = None

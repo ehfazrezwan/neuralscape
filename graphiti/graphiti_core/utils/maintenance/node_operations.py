@@ -412,11 +412,17 @@ async def _resolve_with_llm(
         ),
     }
 
-    llm_response = await llm_client.generate_response(
-        prompt_library.dedupe_nodes.nodes(context),
-        response_model=NodeResolutions,
-        prompt_name='dedupe_nodes.nodes',
-    )
+    # NEURALSCAPE PATCH: optional bounded decision fast path (HYBRID_GRAPH_ENABLED).
+    # Never parse a rendered prompt back into data or route extraction/
+    # summarization through a classifier. None falls through to the original call.
+    decisions = getattr(llm_client, 'decision_client', None)
+    llm_response = await decisions.resolve('nodes', context) if decisions is not None else None
+    if llm_response is None:
+        llm_response = await llm_client.generate_response(
+            prompt_library.dedupe_nodes.nodes(context),
+            response_model=NodeResolutions,
+            prompt_name='dedupe_nodes.nodes',
+        )
 
     node_resolutions: list[NodeDuplicate] = NodeResolutions(**llm_response).entity_resolutions
 
