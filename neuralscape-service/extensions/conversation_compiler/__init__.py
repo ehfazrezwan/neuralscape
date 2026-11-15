@@ -231,6 +231,7 @@ class ConversationCompilerExtension:
                     "category": category,
                     "content": content,
                     "session_id": session_id,
+                    "user_id": payload.get("user_id", ""),
                 }
             ])
             return {"vault_path": cat_path}

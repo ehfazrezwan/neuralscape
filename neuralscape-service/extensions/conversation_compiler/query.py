@@ -50,7 +50,7 @@ async def query_knowledge_base(
     logger.info("Querying knowledge base", question=question[:80])
 
     # Step 1: Read index to find relevant pages
-    index_content = writer.read_file("index.md")
+    index_content = writer.read_index()
     all_files = writer.list_all_files()
 
     # Find pages that might be relevant based on keyword matching
@@ -62,7 +62,7 @@ async def query_knowledge_base(
 
     scored_files: list[tuple[str, int]] = []
     for rel_path in all_files:
-        if rel_path in ("index.md", "log.md"):
+        if rel_path in writer.META_FILES:
             continue
         # Score by keyword overlap with path + index description
         path_words = set(
@@ -92,7 +92,7 @@ async def query_knowledge_base(
     if not relevant_files:
         relevant_files = [
             f for f in all_files
-            if f not in ("index.md", "log.md")
+            if f not in writer.META_FILES
         ][:10]
 
     if not relevant_files:
@@ -130,9 +130,14 @@ async def query_knowledge_base(
         try:
             # Generate a topic from the question
             topic_words = re.findall(r"\w+", question)[:5]
-            topic = "-".join(w.lower() for w in topic_words)
+            topic = "-".join(w.lower() for w in topic_words) or "query"
             filed_back = writer.write_research(
                 topic, f"## Question\n\n{question}\n\n## Answer\n\n{answer}"
+            )
+            # Index the filed page so later queries and the index-drift lint
+            # find it (the compiler's own research pages are indexed the same way).
+            writer.update_index(
+                [{"path": filed_back, "title": topic.replace("-", " ").title(), "type": "research"}]
             )
             logger.info("Answer filed back to vault", path=filed_back)
         except Exception:

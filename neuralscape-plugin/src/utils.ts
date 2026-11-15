@@ -603,6 +603,9 @@ export function getEndedMarkerPath(sessionId: string): string {
 const LEGACY_STALE_SUFFIX = ".stale";
 const ENDED_SUFFIX = ".ended";
 
+/** Cool-down marker of the UserPromptSubmit compile instruction, next to the buffer. */
+export const COMPILE_ARMED_SUFFIX = ".compile-armed";
+
 /** Local copy of the last compact snapshot, next to the buffers. */
 const COMPACT_SNAPSHOT_FILE_SUFFIX = ".compact-snapshot.json";
 
@@ -713,6 +716,14 @@ export async function cleanupOrphanMarkers(entries: string[], now: number = Date
         let empty = !buffers.has(bufferName);
         if (!empty) empty = (await stat(pathJoin(dir, bufferName))).size === 0;
         if (empty) await unlink(pathJoin(dir, name));
+      } else if (name.endsWith(".jsonl" + COMPILE_ARMED_SUFFIX)) {
+        // Meaningful only while its buffer holds rows; also bounded by age
+        // like the other per-session leftovers.
+        const bufferName = name.slice(0, -COMPILE_ARMED_SUFFIX.length);
+        let remove = !buffers.has(bufferName);
+        if (!remove) remove = (await stat(pathJoin(dir, bufferName))).size === 0;
+        if (!remove) remove = now - (await stat(pathJoin(dir, name))).mtimeMs > COMPACT_SNAPSHOT_FILE_MAX_AGE_MS;
+        if (remove) await unlink(pathJoin(dir, name));
       } else if (name.endsWith(COMPACT_SNAPSHOT_FILE_SUFFIX) || name.endsWith(".lastturn")) {
         const age = now - (await stat(pathJoin(dir, name))).mtimeMs;
         if (age > COMPACT_SNAPSHOT_FILE_MAX_AGE_MS) await unlink(pathJoin(dir, name));
