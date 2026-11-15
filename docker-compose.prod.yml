@@ -26,7 +26,7 @@ services:
     # Password via env, not argv: it stays out of `ps` and `docker inspect` Cmd.
     # REDISCLI_AUTH makes redis-cli (the healthcheck and backup script) authenticate.
     environment:
-      REDISCLI_AUTH: ${REDIS_PASSWORD:?set REDIS_PASSWORD in .env}
+      REDISCLI_AUTH: ${REDIS_PASSWORD:?required}
     command: ["sh", "-c", "exec redis-server --requirepass \"$$REDISCLI_AUTH\""]
     healthcheck:
       test: ["CMD-SHELL", "redis-cli ping | grep -q PONG"]
@@ -38,19 +38,19 @@ services:
   neuralscape:
     ports: !override []
     environment:
-      REDIS_URL: redis://:${REDIS_PASSWORD:?set REDIS_PASSWORD in .env}@redis:6379
+      REDIS_URL: redis://:${REDIS_PASSWORD:?required}@redis:6379
   neuralscape-worker:
     environment:
-      REDIS_URL: redis://:${REDIS_PASSWORD:?set REDIS_PASSWORD in .env}@redis:6379
+      REDIS_URL: redis://:${REDIS_PASSWORD:?required}@redis:6379
   neuralscape-graph-worker:
     environment:
-      REDIS_URL: redis://:${REDIS_PASSWORD:?set REDIS_PASSWORD in .env}@redis:6379
+      REDIS_URL: redis://:${REDIS_PASSWORD:?required}@redis:6379
   neuralscape-ingest-worker:
     environment:
-      REDIS_URL: redis://:${REDIS_PASSWORD:?set REDIS_PASSWORD in .env}@redis:6379
+      REDIS_URL: redis://:${REDIS_PASSWORD:?required}@redis:6379
   neuralscape-test:
     environment:
-      REDIS_URL: redis://:${REDIS_PASSWORD:?set REDIS_PASSWORD in .env}@redis:6379
+      REDIS_URL: redis://:${REDIS_PASSWORD:?required}@redis:6379
 
   caddy:
     image: caddy:2.11.7-alpine@sha256:e70b164da81ef698b3ad19af799ea6086ce6d9e48ed4079eb9fe26f6fbf14ee5
@@ -58,7 +58,7 @@ services:
       - "80:80"
       - "443:443"
     environment:
-      DOMAIN: ${DOMAIN:?set DOMAIN in .env}
+      DOMAIN: ${DOMAIN:?required}
     depends_on:
       neuralscape:
         condition: service_healthy

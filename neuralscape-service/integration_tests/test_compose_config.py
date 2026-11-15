@@ -25,6 +25,7 @@ import json
 import os
 import shutil
 import subprocess
+import uuid
 from pathlib import Path
 
 import pytest
@@ -38,11 +39,12 @@ COMPOSE_FILES = (
     "docker-compose.deploy.yml",
     "docker-compose.prod.yml",
 )
+_RUN = uuid.uuid4().hex[:12]  # throwaway values, generated per run
 DUMMY = {
-    "NEO4J_PASSWORD": "dummy-neo4j",
-    "REDIS_PASSWORD": "dummy-redis",
+    "NEO4J_PASSWORD": f"neo-{_RUN}",
+    "REDIS_PASSWORD": f"red-{_RUN}",
     "DOMAIN": "ns.example.test",
-    "CLOUDFLARE_TUNNEL_TOKEN": "dummy-token",
+    "CLOUDFLARE_TUNNEL_TOKEN": f"tun-{_RUN}",
 }
 APP = {"neuralscape", "neuralscape-worker", "neuralscape-graph-worker", "neuralscape-ingest-worker"}
 
@@ -146,7 +148,7 @@ def test_cbm_and_resolver_profiles_are_wired_into_the_services_that_use_them(pro
 
 def test_tunnel_profile_renders_with_the_token_it_is_given(project: Path) -> None:
     services = _services(project, "base+vps", ("tunnel",))
-    assert services["cloudflared"]["environment"]["TUNNEL_TOKEN"] == "dummy-token"
+    assert services["cloudflared"]["environment"]["TUNNEL_TOKEN"] == DUMMY["CLOUDFLARE_TUNNEL_TOKEN"]
     assert "@sha256:" in services["cloudflared"]["image"]
 
 
@@ -194,8 +196,8 @@ def test_prod_requires_its_own_secrets(project: Path, missing: str) -> None:
 def test_prod_redis_clients_authenticate(project: Path) -> None:
     services = _services(project, "base+prod")
     for name in APP:
-        assert services[name]["environment"]["REDIS_URL"] == "redis://:dummy-redis@redis:6379"
-    assert services["redis"]["environment"]["REDISCLI_AUTH"] == "dummy-redis"
+        assert services[name]["environment"]["REDIS_URL"] == f"redis://:{DUMMY['REDIS_PASSWORD']}@redis:6379"
+    assert services["redis"]["environment"]["REDISCLI_AUTH"] == DUMMY["REDIS_PASSWORD"]
     assert "--requirepass" in " ".join(services["redis"]["command"])
 
 
