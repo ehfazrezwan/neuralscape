@@ -138,6 +138,27 @@ def test_convomem_ids_namespaced_by_category():
     assert len(uid) <= 100
 
 
+def test_convomem_load_same_stem_across_categories_has_distinct_join_keys(tmp_path):
+    """End to end through ``load``: the same file name under two category dirs
+    must yield distinct qa_ids, conv_ids, NS user ids, and answer/judge resume
+    keys ``(qa_id, qtype)``; the judge's ``qa_id`` lookup must keep all of them."""
+    import json
+
+    from neuralscape_bench.accuracy.schema import bench_user_id
+
+    for cat in ("user_evidence", "preference_evidence"):
+        (tmp_path / cat).mkdir()
+        (tmp_path / cat / "same_stem.json").write_text(json.dumps(fixtures.CONVOMEM_FILE))
+    data = convomem.load(tmp_path)
+    assert len(data.qa_items) == 2
+    assert len({qa.qa_id for qa in data.qa_items}) == 2
+    assert len({c.conv_id for c in data.conversations}) == 2
+    assert len({bench_user_id("convomem", c.conv_id) for c in data.conversations}) == 2
+    assert len({(qa.qa_id, qa.qtype) for qa in data.qa_items}) == 2
+    # judge.py builds ``{qa.qa_id: qa}``: a collision would silently drop one.
+    assert len({qa.qa_id: qa for qa in data.qa_items}) == len(data.qa_items)
+
+
 # ── MemBench ──
 
 
