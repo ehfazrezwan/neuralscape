@@ -47,7 +47,7 @@ def _match(cond, pid, payload) -> bool:
     assert isinstance(cond, FieldCondition), cond
     val = _dig(payload, cond.key)
     if cond.range is not None:          # DatetimeRange(lt=...) on an ISO string
-        return val is not None and str(val) < str(cond.range.lt)
+        return val is not None and float(val) < float(cond.range.lt)
     assert isinstance(cond.match, MatchValue), cond.match
     return cond.match.value in val if isinstance(val, list) else val == cond.match.value
 
@@ -342,38 +342,62 @@ def test_a_committed_conditional_patch_is_not_reported_as_a_conflict_when_a_succ
     assert world.fake.points[M1]["metadata"]["revision"] == 2 and _tags(world) == ["successor"]
 
 
+class _Crash(BaseException):
+    """A hard crash: skips ``except Exception`` cleanup, like a killed process."""
+
+
 def test_a_second_conditional_writer_cannot_commit_inside_a_content_edits_rewrite_window(world):
-    """Finding 6: the rewrite is in flight; a writer holding the claimed revision must be refused, not
-    commit and then be overwritten by the rewrite (lost update)."""
-    refused = []
+    """The rewrite is in flight; a writer must be refused, not commit and then be overwritten (lost update);
+    and a read during the window is a consistent OLD view (old revision + old content)."""
+    seen = {}
 
     def during_rewrite(fake):
+        seen["read"] = world.get_memory(M1)
         try:
-            world.patch_memory(M1, "ehfaz", {"tags": ["second"]}, expected_revision="1")
+            world.patch_memory(M1, "ehfaz", {"tags": ["second"]}, expected_revision="0")
         except RevisionConflict as e:
-            refused.append(e)
+            seen["refused"] = e
 
     world.fake.before_mem0_update = during_rewrite
     world.patch_memory(M1, "ehfaz", {"content": "first writer's text"}, expected_revision="0")
-    assert len(refused) == 1
+    assert "refused" in seen
+    assert (seen["read"].revision, seen["read"].memory) == ("0", "Old content")      # not N+1 with stale text
     assert world.fake.points[M1]["data"] == "first writer's text"
-    assert "revision_pending" not in world.fake.points[M1]["metadata"]       # the rewrite cleared the mark
-    world.patch_memory(M1, "ehfaz", {"tags": ["after"]}, expected_revision="1")   # and the row is usable again
+    meta = world.fake.points[M1]["metadata"]
+    assert "revision_pending" not in meta and meta["revision"] == 1                  # published with the content
+    world.patch_memory(M1, "ehfaz", {"tags": ["after"]}, expected_revision="1")      # and the row is usable again
 
 
 def test_a_failed_rewrite_releases_the_pending_mark(world):
+    during = {}
+
+    def hook(fake):
+        during["pending"] = fake.points[M1]["metadata"].get("revision_pending")
+
+    world.fake.before_mem0_update = hook
     world.fake.fail_mem0_update = True
     with pytest.raises(RuntimeError):
         world.patch_memory(M1, "ehfaz", {"content": "never lands"}, expected_revision="0")
-    assert "revision_pending" not in world.fake.points[M1]["metadata"]
-    world.patch_memory(M1, "ehfaz", {"tags": ["ok"]}, expected_revision="1")      # revision 1 was claimed; row not wedged
+    assert during["pending"]                                                        # the mark WAS set during the rewrite
+    assert world.fake.points[M1]["metadata"].get("revision_pending") is None      # and released on failure
+    world.patch_memory(M1, "ehfaz", {"tags": ["ok"]}, expected_revision="0")        # revision unchanged: not wedged
 
 
-def test_an_expired_pending_lease_does_not_wedge_the_row(world):
-    meta = world.fake.points[M1]["metadata"]
-    meta.update({"revision": 1, "revision_pending": "dead-writer", "revision_pending_at": "2000-01-01T00:00:00+00:00"})
-    world.patch_memory(M1, "ehfaz", {"tags": ["x"]}, expected_revision="1")
-    assert _tags(world) == ["x"]
+def test_a_crashed_writer_blocks_conditional_writers_only_until_the_lease_expires(world, monkeypatch):
+    import memory.edit as edit
+
+    def crash(fake):
+        raise _Crash()
+
+    world.fake.before_mem0_update = crash
+    with pytest.raises(_Crash):
+        world.patch_memory(M1, "ehfaz", {"content": "dies mid-rewrite"}, expected_revision="0")
+    with pytest.raises(RevisionConflict):                                           # pending mark is live: refused
+        world.patch_memory(M1, "ehfaz", {"tags": ["too-soon"]}, expected_revision="0")
+    real = edit._now_epoch()
+    monkeypatch.setattr(edit, "_now_epoch", lambda: real + edit._PENDING_LEASE_S + 5)
+    world.patch_memory(M1, "ehfaz", {"tags": ["after-lease"]}, expected_revision="0")   # lease expired: not wedged
+    assert _tags(world) == ["after-lease"]
 
 
 def test_a_lost_claim_aborts_the_rewrite_before_it_can_overwrite_another_writers_edit(world):
@@ -387,8 +411,8 @@ def test_a_lost_claim_aborts_the_rewrite_before_it_can_overwrite_another_writers
         if state["calls"] == 2 and state["armed"]:      # the fence read: claim confirm was call 1
             state["armed"] = False
             meta = world.fake.points[M1]["metadata"]
-            meta["revision_pending_at"] = "2000-01-01T00:00:00+00:00"        # lease expired
-            world.patch_memory(M1, "ehfaz", {"tags": ["second-writer"]}, expected_revision="1")   # commits
+            meta["revision_pending_at"] = 0.0                                  # lease expired
+            world.patch_memory(M1, "ehfaz", {"tags": ["second-writer"]}, expected_revision="0")   # commits
         return real_retrieve(collection_name, ids, with_payload, with_vectors)
 
     world.fake.retrieve = retrieve

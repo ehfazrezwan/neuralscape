@@ -76,6 +76,11 @@ def normalize_expected_revision(value) -> str | None:
 _PENDING_LEASE_S = 600
 
 
+def _now_epoch() -> float:
+    """Seconds since the epoch (one seam so tests can move the clock; the lease is a plain number, not a date string)."""
+    return datetime.now(timezone.utc).timestamp()
+
+
 def _revision_filter(memory_id: str, revision: str, parent_key: str):
     """Qdrant filter selecting exactly this point at exactly this revision."""
     from qdrant_client.models import (
@@ -86,7 +91,7 @@ def _revision_filter(memory_id: str, revision: str, parent_key: str):
         MatchValue,
         PayloadField,
     )
-    from qdrant_client.models import DatetimeRange
+    from qdrant_client.models import Range
 
     key = f"{parent_key}.revision"
     if int(revision) == 0:
@@ -96,12 +101,10 @@ def _revision_filter(memory_id: str, revision: str, parent_key: str):
         ])
     else:
         at_revision = Filter(must=[FieldCondition(key=key, match=MatchValue(value=int(revision)))])
-    lease_cutoff = datetime.fromtimestamp(
-        datetime.now(timezone.utc).timestamp() - _PENDING_LEASE_S, timezone.utc
-    ).isoformat()
+    lease_cutoff = _now_epoch() - _PENDING_LEASE_S   # numeric range on a numeric payload field
     not_pending = Filter(should=[
         IsEmptyCondition(is_empty=PayloadField(key=f"{parent_key}.revision_pending")),
-        FieldCondition(key=f"{parent_key}.revision_pending_at", range=DatetimeRange(lt=lease_cutoff)),
+        FieldCondition(key=f"{parent_key}.revision_pending_at", range=Range(lt=lease_cutoff)),
     ])
     return Filter(must=[HasIdCondition(has_id=[memory_id]), at_revision, not_pending])
 
@@ -188,25 +191,23 @@ class EditMixin:
         self, client, collection: str, memory_id: str, current_revision: str,
         nonce: str | None, new_revision: int, parent_key: str, nonces: dict,
     ) -> None:
-        """Atomically bump the revision, record our nonce and mark the row pending, iff it is still current.
+        """Atomically mark the row pending (our nonce + a numeric lease start), iff it is still at ``current_revision``.
 
-        While ``revision_pending`` is set (until the rewrite replaces the payload,
-        or the lease runs out) every conditional writer is refused by the filter,
-        so none can commit on the claimed revision and then be overwritten by the
-        still-running rewrite.
+        The revision is NOT bumped here: a read during the rewrite still sees the
+        OLD revision together with the OLD content (a consistent view), and the
+        new revision is published by the final rewrite together with the new
+        content. While ``revision_pending`` is set (until the rewrite replaces the
+        payload, or the lease runs out) every conditional writer is refused by the
+        filter, so none can commit and then be overwritten by the still-running
+        rewrite.
         """
         client.set_payload(
             collection_name=collection,
-            payload={
-                "revision": new_revision,
-                "revision_nonces": nonces,
-                "revision_pending": nonce,
-                "revision_pending_at": datetime.now(timezone.utc).isoformat(),
-            },
+            payload={"revision_pending": nonce, "revision_pending_at": _now_epoch()},
             points=_revision_filter(memory_id, current_revision, parent_key),
             key=parent_key,
         )
-        self._confirm_revision_claim(client, collection, memory_id, nonce, current_revision, new_revision)
+        self._assert_claim_held(client, collection, memory_id, nonce, current_revision, parent_key)
 
     @staticmethod
     def _assert_claim_held(client, collection, memory_id, nonce, expected, parent_key) -> None:
@@ -225,13 +226,17 @@ class EditMixin:
         try:
             from qdrant_client.models import FieldCondition, Filter, HasIdCondition, MatchValue
 
-            client.delete_payload(
+            # Null the mark with a nested set_payload (IsEmptyCondition treats null as empty).
+            # ``delete_payload`` with dotted keys is not relied on: the Qdrant client's own engine
+            # leaves nested keys in place.
+            client.set_payload(
                 collection_name=collection,
-                keys=[f"{parent_key}.revision_pending", f"{parent_key}.revision_pending_at"],
+                payload={"revision_pending": None, "revision_pending_at": None},
                 points=Filter(must=[
                     HasIdCondition(has_id=[memory_id]),
                     FieldCondition(key=f"{parent_key}.revision_pending", match=MatchValue(value=nonce)),
                 ]),
+                key=parent_key,
             )
         except Exception as e:  # noqa: BLE001
             logger.warning(f"Could not clear the pending revision mark for {memory_id}: {e}")

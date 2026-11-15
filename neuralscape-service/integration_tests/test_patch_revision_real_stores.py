@@ -46,7 +46,12 @@ class _Mem0Shim:
         # mem0's Qdrant wrapper: payload-only update is a plain set_payload.
         self.client.set_payload(self.collection, payload=payload, points=[vector_id])
 
+    before_update = None   # hook: runs while a content rewrite is in flight
+
     def update(self, memory_id, data, metadata=None):
+        if self.before_update:
+            hook, self.before_update = self.before_update, None
+            hook()
         # mem0 rebuilds the WHOLE payload from the metadata kwarg (re-embed omitted).
         old = self._vs_get(memory_id).payload
         payload = {**{k: old[k] for k in ("hash", "created_at", "user_id") if k in old},
@@ -233,3 +238,66 @@ def test_rest_route_answers_409_for_a_stale_revision_and_enqueues_nothing(world,
         loop.run_until_complete(pool.delete(queue))
         loop.run_until_complete(pool.close())
         loop.close()
+
+
+class _Crash(BaseException):
+    """A hard crash: skips ``except Exception`` cleanup, like a killed process."""
+
+
+def test_claim_blocks_a_second_writer_and_the_rewrite_publishes_revision_with_content(world):
+    """Real server: IsEmpty on a nested key + a numeric Range on the lease + nested Filter + nested set_payload."""
+    from memory.edit import RevisionConflict
+
+    pid = _seed(world)
+    seen = {}
+
+    def during():
+        seen["pending"] = _stored(world, pid)["metadata"].get("revision_pending")
+        seen["read"] = world.get_memory(pid)
+        try:
+            world.patch_memory(pid, world.owner, {"tags": ["second"]}, expected_revision="0")
+        except RevisionConflict as e:
+            seen["refused"] = e
+
+    world._memory.before_update = during
+    world.patch_memory(pid, world.owner, {"content": "new text"}, expected_revision="0")
+    assert seen["pending"] and "refused" in seen
+    assert (seen["read"].revision, seen["read"].memory) == ("0", "the original text")   # consistent old view
+    stored = _stored(world, pid)
+    assert stored["data"] == "new text" and stored["metadata"]["revision"] == 1
+    assert "revision_pending" not in stored["metadata"]
+    world.patch_memory(pid, world.owner, {"tags": ["after"]}, expected_revision="1")
+
+
+def test_a_failed_rewrite_releases_the_mark_on_the_real_server(world):
+    pid = _seed(world)
+
+    def boom():
+        raise RuntimeError("embedder down")
+
+    world._memory.before_update = boom
+    with pytest.raises(RuntimeError):
+        world.patch_memory(pid, world.owner, {"content": "x"}, expected_revision="0")
+    meta = _stored(world, pid)["metadata"]
+    assert meta.get("revision_pending") is None and meta.get("revision_pending_at") is None
+    world.patch_memory(pid, world.owner, {"tags": ["ok"]}, expected_revision="0")
+
+
+def test_a_crashed_writers_mark_expires_with_the_lease_on_the_real_server(world, monkeypatch):
+    import memory.edit as edit
+    from memory.edit import RevisionConflict
+
+    pid = _seed(world)
+
+    def crash():
+        raise _Crash()
+
+    world._memory.before_update = crash
+    with pytest.raises(_Crash):
+        world.patch_memory(pid, world.owner, {"content": "x"}, expected_revision="0")
+    with pytest.raises(RevisionConflict):
+        world.patch_memory(pid, world.owner, {"tags": ["soon"]}, expected_revision="0")
+    real = edit._now_epoch()
+    monkeypatch.setattr(edit, "_now_epoch", lambda: real + edit._PENDING_LEASE_S + 5)
+    world.patch_memory(pid, world.owner, {"tags": ["later"]}, expected_revision="0")
+    assert _stored(world, pid)["metadata"]["tags"] == ["later"]
