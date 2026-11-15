@@ -54,6 +54,10 @@ def _unreachable_reason() -> str | None:
 
 
 _SKIP = _unreachable_reason()
+# tests/conftest.py DESELECTS (rather than skips) this module in plain runs when
+# the stores are unreachable, so the CI unexpected-skip inventory stays exact.
+# An explicit `-m integration` run keeps the visible skip with this reason.
+_INTEGRATION_SKIP_REASON = _SKIP
 if _SKIP:
     pytestmark = [pytest.mark.integration, pytest.mark.skip(reason=f'hybrid integration needs real stores: {_SKIP}')]
 

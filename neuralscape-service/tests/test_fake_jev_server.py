@@ -3,9 +3,6 @@
 If this fails, the integration tests that rely on the fake prove nothing. It
 runs over real loopback HTTP through the production adapter, with no stores.
 """
-import pytest
-
-from config import settings
 from graphiti_core.llm_client import jev_client
 from graphiti_core.llm_client.jev_client import JevDecisions
 from jev_extraction import select_facts
@@ -49,11 +46,11 @@ def test_server_errors_and_refused_connections_abstain(monkeypatch):
     assert _decisions().scores('q', [{'memory': 'a'}], 'p') is None
 
 
-def test_integration_module_skips_cleanly_without_stores(pytestconfig):
-    """No stores configured => the integration module is skipped, never failed."""
+def test_integration_module_declares_a_reason_whenever_stores_are_unreachable():
+    """No stores => the module self-describes as unreachable; never a failure."""
     import tests.test_hybrid_integration as module
-    if module._SKIP is None:
-        pytest.skip('stores are reachable here; the module runs for real')
     marks = [m for m in module.pytestmark if m.name == 'skip']
-    assert marks and 'hybrid integration needs real stores' in marks[0].kwargs['reason']
-    assert settings is not None
+    if module._INTEGRATION_SKIP_REASON is None:
+        assert not marks
+    else:
+        assert marks and 'hybrid integration needs real stores' in marks[0].kwargs['reason']
