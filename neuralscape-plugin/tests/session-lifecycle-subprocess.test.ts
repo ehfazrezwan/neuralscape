@@ -371,16 +371,87 @@ describe("resume after compaction (PreCompact -> service -> SessionStart)", () =
     expect(raw?.body.tags).toEqual(["compact_snapshot", "session:sess-compacted"]);
   });
 
-  it("on resume (a NEW session id) uses the project's newest recent snapshot", async () => {
-    const { dataDir } = await newDataDir();
-    await runPreCompact(dataDir, "sess-old", PROMPTS);
-    stored = [storeFromRaw()];
-    requests = [];
+  async function resumedTranscript(previousId: string, newId: string): Promise<string> {
+    const dir = await mkdtemp(join(tmpdir(), "ns-lifecycle-resumed-"));
+    const path = join(dir, `${newId}.jsonl`);
+    const rows = [
+      { type: "user", sessionId: previousId, message: { role: "user", content: "earlier prompt" } },
+      { type: "user", sessionId: newId, message: { role: "user", content: "resumed prompt" } },
+    ];
+    await writeFile(path, rows.map((r) => JSON.stringify(r)).join("\n") + "\n", "utf-8");
+    return path;
+  }
 
-    const r = await runHook("session-start.js", startInput("sess-resumed-new-id", "resume"), dataDir);
-    const ctx = additionalContext(r);
-    expect(ctx).toContain("## Resuming after compaction");
-    expect(ctx).toContain(PROMPTS[2]);
+  for (const source of ["resume", "fork"]) {
+    it(`on ${source} (a NEW session id) renders the predecessor session's snapshot read from the transcript`, async () => {
+      const { dataDir } = await newDataDir();
+      await runPreCompact(dataDir, "sess-old", PROMPTS);
+      const mine = storeFromRaw();
+      requests = [];
+      await runPreCompact(dataDir, "sess-unrelated", ["unrelated terminal prompt about billing"]);
+      stored = [mine, storeFromRaw()];
+      requests = [];
+
+      const transcript = await resumedTranscript("sess-old", "sess-new-id");
+      const r = await runHook(
+        "session-start.js",
+        JSON.stringify({ session_id: "sess-new-id", transcript_path: transcript, cwd: PLUGIN_ROOT, hook_event_name: "SessionStart", source }),
+        dataDir,
+      );
+      const ctx = additionalContext(r);
+      expect(ctx).toContain("## Resuming after compaction");
+      expect(ctx).toContain(PROMPTS[2]);
+      expect(ctx).not.toContain("unrelated terminal prompt about billing");
+    });
+
+    it(`on ${source} with no predecessor id in the transcript renders no snapshot`, async () => {
+      const { dataDir } = await newDataDir();
+      await runPreCompact(dataDir, "sess-unrelated", ["unrelated terminal prompt about billing"]);
+      stored = [storeFromRaw()];
+      requests = [];
+      const r = await runHook(
+        "session-start.js",
+        JSON.stringify({ session_id: "sess-new-id", cwd: PLUGIN_ROOT, hook_event_name: "SessionStart", source }),
+        dataDir,
+      );
+      expect(additionalContext(r)).not.toContain("Resuming after compaction");
+      expect(additionalContext(r)).not.toContain("unrelated terminal prompt about billing");
+    });
+  }
+
+  it("writes the local snapshot before the network, so a hanging service cannot prevent it", async () => {
+    const { dataDir, obsDir } = await newDataDir();
+    const hang = createServer(() => {
+      /* never answers */
+    });
+    await new Promise<void>((resolve) => hang.listen(0, "127.0.0.1", () => resolve()));
+    const addr = hang.address();
+    const hangUrl = `http://127.0.0.1:${typeof addr === "object" && addr ? addr.port : 0}`;
+    const dir = await mkdtemp(join(tmpdir(), "ns-lifecycle-hang-"));
+    const transcript = join(dir, "t.jsonl");
+    await writeFile(transcript, transcriptLines(PROMPTS), "utf-8");
+    const child = spawn("node", [join(PLUGIN_ROOT, "scripts", "pre-compact.js")], {
+      env: {
+        PATH: process.env.PATH ?? "",
+        NEURALSCAPE_USER_ID: "lifecycle-test",
+        NEURALSCAPE_URL: hangUrl,
+        NEURALSCAPE_PROJECT_ID: PROJECT,
+        CLAUDE_PLUGIN_DATA: dataDir,
+      },
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    child.stdin.write(
+      JSON.stringify({ session_id: "sess-hang", transcript_path: transcript, cwd: PLUGIN_ROOT, hook_event_name: "PreCompact", trigger: "auto" }),
+    );
+    child.stdin.end();
+    const file = join(obsDir, "sess-hang.compact-snapshot.json");
+    const deadline = Date.now() + 4000;
+    while (!existsSync(file) && Date.now() < deadline) await new Promise((r) => setTimeout(r, 50));
+    const stillRunning = child.exitCode === null;
+    child.kill("SIGKILL");
+    await new Promise<void>((resolve) => hang.close(() => resolve()));
+    expect(existsSync(file)).toBe(true);
+    expect(stillRunning).toBe(true); // the POST is still hanging: the file did not wait for it
   });
 });
 
@@ -409,6 +480,24 @@ describe("pre-compact for a generic client", () => {
     const raws = requests.filter((q) => q.path.includes("/v1/memories/raw"));
     expect(raws.length).toBe(1);
     expect(String(raws[0].body.content)).toContain("generic client prompt before the compact");
+  });
+
+  it("does not deliver a turn twice when the conversation-turn hook already delivered it (no cursor)", async () => {
+    const { dataDir } = await newDataDir();
+    const payload = JSON.stringify({
+      session_id: "generic-dup",
+      user_message: "generic client prompt delivered twice?",
+      assistant_response: "generic client answer with plenty of substance here",
+      channel: "api",
+    });
+    expect((await runHook("conversation-turn.js", payload, dataDir)).code).toBe(0);
+    expect((await runHook("pre-compact.js", payload, dataDir)).code).toBe(0);
+    expect(requests.filter((q) => q.path.includes("/conversation-compiler/flush")).length).toBe(1);
+
+    // A different turn in the same session is still delivered.
+    const next = JSON.stringify({ ...JSON.parse(payload), user_message: "a different prompt entirely" });
+    await runHook("pre-compact.js", next, dataDir);
+    expect(requests.filter((q) => q.path.includes("/conversation-compiler/flush")).length).toBe(2);
   });
 
   it("Claude Code still delivers no turns from PreCompact", async () => {

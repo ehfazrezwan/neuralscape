@@ -71,12 +71,12 @@ async function main(): Promise<void> {
     //    supply the prompts, and are delivered here (once, no cursor involved) before the context is lost.
     const client = detectClient(raw);
     let recentUserMessages: string[];
+    let turnsToDeliver: Awaited<ReturnType<ReturnType<typeof getTurnExtractor>>> = [];
     if (client === "claude-code") {
       recentUserMessages = await extractRecentUserPrompts(raw);
     } else {
-      const turns = await getTurnExtractor(client)(raw);
-      recentUserMessages = turns.map((t) => t.userMessage);
-      await flushTurns(turns);
+      turnsToDeliver = await getTurnExtractor(client)(raw);
+      recentUserMessages = turnsToDeliver.map((t) => t.userMessage);
     }
 
     // 2. One compact-snapshot memory so the post-compact SessionStart can
@@ -90,6 +90,9 @@ async function main(): Promise<void> {
       when,
       recentUserMessages,
     });
+
+    // The local copy comes FIRST: it needs no network, so a hanging service
+    // (this hook has a 60 s timeout) cannot prevent it.
     if (sessionId !== "unknown") {
       await writeLocalCompactSnapshot({
         sessionId,
@@ -98,6 +101,9 @@ async function main(): Promise<void> {
         createdAt: when.toISOString(),
       });
     }
+
+    // Clients with no transcript: deliver the turn here (see the header).
+    if (turnsToDeliver.length > 0) await flushTurns(turnsToDeliver);
 
     try {
       await neuralscapePost(

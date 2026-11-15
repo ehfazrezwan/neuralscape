@@ -2,7 +2,7 @@
  * Shared utilities for Neuralscape Claude Code plugin hooks.
  */
 
-import { appendFile, mkdir, readdir, readFile, stat, unlink, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, open, readdir, readFile, stat, unlink, writeFile } from "node:fs/promises";
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join as pathJoin, parse as parsePath } from "node:path";
@@ -635,7 +635,7 @@ export async function cleanupOrphanMarkers(entries: string[], now: number = Date
         let empty = !buffers.has(bufferName);
         if (!empty) empty = (await stat(pathJoin(dir, bufferName))).size === 0;
         if (empty) await unlink(pathJoin(dir, name));
-      } else if (name.endsWith(COMPACT_SNAPSHOT_FILE_SUFFIX)) {
+      } else if (name.endsWith(COMPACT_SNAPSHOT_FILE_SUFFIX) || name.endsWith(".lastturn")) {
         const age = now - (await stat(pathJoin(dir, name))).mtimeMs;
         if (age > COMPACT_SNAPSHOT_FILE_MAX_AGE_MS) await unlink(pathJoin(dir, name));
       }
@@ -714,7 +714,7 @@ export async function markBufferEnded(sessionId: string): Promise<void> {
   try {
     const dir = getObservationDir();
     await mkdir(dir, { recursive: true });
-    await writeFile(getEndedMarkerPath(sessionId), new Date().toISOString(), "utf-8");
+    await writeFile(getEndedMarkerPath(sessionId), new Date().toISOString(), { encoding: "utf-8", mode: 0o600 });
   } catch (error) {
     logError("markBufferEnded failed", error);
   }
@@ -743,9 +743,46 @@ export function getCompactSnapshotPath(sessionId: string): string {
 export async function writeLocalCompactSnapshot(snapshot: LocalCompactSnapshot): Promise<void> {
   try {
     await mkdir(getObservationDir(), { recursive: true });
-    await writeFile(getCompactSnapshotPath(snapshot.sessionId), JSON.stringify(snapshot), "utf-8");
+    await writeFile(getCompactSnapshotPath(snapshot.sessionId), JSON.stringify(snapshot), { encoding: "utf-8", mode: 0o600 });
   } catch (error) {
     logError("writeLocalCompactSnapshot failed (non-critical)", error);
+  }
+}
+
+/**
+ * Session ids that came before this one, read from the head of a resumed or forked transcript.
+ * Claude Code starts a resumed/forked session under a NEW id, and the new transcript begins with
+ * the earlier session's entries, which carry their own `sessionId`. Returns the distinct ids that
+ * differ from `currentSessionId`, in order of appearance. Reads at most the first 8 MiB; only the
+ * `sessionId` key of each line is looked at. Empty when nothing is found or the file is unreadable.
+ */
+export async function readPredecessorSessionIds(
+  transcriptPath: string | undefined,
+  currentSessionId: string | undefined,
+): Promise<string[]> {
+  if (!transcriptPath) return [];
+  const MAX_BYTES = 8 * 1024 * 1024;
+  let handle;
+  try {
+    handle = await open(transcriptPath, "r");
+    const buf = Buffer.alloc(MAX_BYTES);
+    const { bytesRead } = await handle.read(buf, 0, MAX_BYTES, 0);
+    const text = buf.subarray(0, bytesRead).toString("utf-8");
+    const ids: string[] = [];
+    for (const line of text.split("\n")) {
+      if (!line.includes('"sessionId"')) continue;
+      try {
+        const id = JSON.parse(line)?.sessionId;
+        if (typeof id === "string" && id && id !== currentSessionId && !ids.includes(id)) ids.push(id);
+      } catch {
+        // a partial last line or a non-JSON line
+      }
+    }
+    return ids;
+  } catch {
+    return [];
+  } finally {
+    await handle?.close();
   }
 }
 

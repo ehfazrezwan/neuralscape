@@ -351,9 +351,6 @@ export function isCompactSnapshot(mem: NeuralscapeMemory): boolean {
   );
 }
 
-/** `--resume` / `--fork` start a new session id; a snapshot from the old one is still relevant for this long. */
-export const RESUME_FALLBACK_WINDOW_MS = 2 * 60 * 60 * 1000;
-
 /** Which session a snapshot belongs to: its `session:<id>` tag, else the id in the content line. */
 export function snapshotSessionId(mem: NeuralscapeMemory): string | null {
   const tag = (mem.tags ?? []).find((t) => t.startsWith(COMPACT_SNAPSHOT_SESSION_TAG_PREFIX));
@@ -380,15 +377,15 @@ function createdMs(mem: NeuralscapeMemory): number {
  * `sessionId` (the SessionStart payload's id):
  *   - this session's own snapshots win (compaction keeps the session id);
  *   - source "compact" shows ONLY those;
- *   - on resume/fork (Claude Code issues a NEW session id, so nothing is
- *     "own") the newest snapshot of the project is used, but only when it is
- *     recent (RESUME_FALLBACK_WINDOW_MS), so a resume does not pull in a
- *     long-dead or concurrent session's old state.
+ *   - on resume/fork Claude Code issues a NEW session id, and the new
+ *     transcript begins with the earlier session's entries, which carry the
+ *     earlier id(s): `predecessorIds` (read from the transcript head). Only
+ *     snapshots of those sessions render; with none known, nothing renders.
  * Without `sessionId` every snapshot is a candidate, as before.
  */
 export function renderResumeAfterCompact(
   categories: Record<string, NeuralscapeMemory[]>,
-  opts: { now?: Date; limit?: number; sessionId?: string; source?: string } = {},
+  opts: { now?: Date; limit?: number; sessionId?: string; source?: string; predecessorIds?: string[] } = {},
 ): { block: string; ids: string[] } {
   const now = opts.now ?? new Date();
   const limit = opts.limit ?? 3;
@@ -400,21 +397,23 @@ export function renderResumeAfterCompact(
     }
   }
 
-  let keptLimit = limit;
   if (opts.sessionId) {
     const own = snapshots.filter((m) => snapshotSessionId(m) === opts.sessionId);
     if (own.length > 0 || opts.source === "compact") {
       snapshots = own;
     } else {
-      snapshots = snapshots.filter((m) => now.getTime() - createdMs(m) <= RESUME_FALLBACK_WINDOW_MS);
-      keptLimit = 1;
+      const predecessors = new Set(opts.predecessorIds ?? []);
+      snapshots = snapshots.filter((m) => {
+        const id = snapshotSessionId(m);
+        return id !== null && predecessors.has(id);
+      });
     }
   }
   if (snapshots.length === 0) return { block: "", ids: [] };
 
   snapshots.sort((a, b) => createdMs(b) - createdMs(a));
 
-  const kept = snapshots.slice(0, keptLimit);
+  const kept = snapshots.slice(0, limit);
   const lines: string[] = [
     "## Resuming after compaction",
     "",

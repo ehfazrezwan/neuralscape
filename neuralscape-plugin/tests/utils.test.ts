@@ -23,6 +23,7 @@ import {
   listPendingBuffers,
   markBufferEnded,
   readLocalCompactSnapshot,
+  readPredecessorSessionIds,
   writeLocalCompactSnapshot,
   pickRelevantInput,
   readBakedUrl,
@@ -728,5 +729,34 @@ describe("readConfig URL precedence", () => {
 
   it("returns the fallback when neither is set", () => {
     expect(readConfig("URL", "fallback")).toBe("fallback");
+  });
+});
+
+
+describe("file modes", () => {
+  it("writes the end marker and the local compact snapshot readable by the owner only", async () => {
+    await markBufferEnded("modes");
+    await writeLocalCompactSnapshot({ sessionId: "modes", content: "c", createdAt: "x" });
+    expect(statSync(getEndedMarkerPath("modes")).mode & 0o777).toBe(0o600);
+    expect(statSync(getCompactSnapshotPath("modes")).mode & 0o777).toBe(0o600);
+  });
+});
+
+
+describe("readPredecessorSessionIds", () => {
+  const row = (id: string) => JSON.stringify({ type: "user", sessionId: id, message: { role: "user", content: "x" } });
+
+  it("returns the earlier session ids found at the head of a resumed transcript, in order", async () => {
+    const path = join(scratch, "t.jsonl");
+    writeFileSync(path, [row("old-1"), row("old-1"), row("old-2"), row("new"), row("new")].join("\n") + "\n", "utf-8");
+    expect(await readPredecessorSessionIds(path, "new")).toEqual(["old-1", "old-2"]);
+  });
+
+  it("returns [] for a fresh transcript, a missing file or no path", async () => {
+    const path = join(scratch, "fresh.jsonl");
+    writeFileSync(path, [row("new"), row("new")].join("\n") + "\n", "utf-8");
+    expect(await readPredecessorSessionIds(path, "new")).toEqual([]);
+    expect(await readPredecessorSessionIds(join(scratch, "nope.jsonl"), "new")).toEqual([]);
+    expect(await readPredecessorSessionIds(undefined, "new")).toEqual([]);
   });
 });

@@ -36,6 +36,7 @@ import {
   parseStdinStrict,
   readConfig,
   readLocalCompactSnapshot,
+  readPredecessorSessionIds,
   recordTransportFailure,
   resetTransportFailures,
 } from "../utils.js";
@@ -169,6 +170,8 @@ export interface IndexModeInputs {
   source?: string;
   /** The starting session's id: on compact/resume only its own snapshots render (see renderResumeAfterCompact). */
   sessionId?: string;
+  /** Resume/fork: the earlier session id(s) read from the transcript head (see readPredecessorSessionIds). */
+  predecessorIds?: string[];
 }
 
 /**
@@ -198,6 +201,7 @@ export function buildIndexContext(inputs: IndexModeInputs): string {
       now,
       sessionId: inputs.sessionId,
       source: inputs.source,
+      predecessorIds: inputs.predecessorIds,
     });
     if (resume.block) {
       sections.push(resume.block);
@@ -499,6 +503,10 @@ async function main(): Promise<void> {
         budgetTokens: getIndexBudgetTokens(),
         source: input.source,
         sessionId: input.session_id,
+        predecessorIds:
+          input.source === "resume" || input.source === "fork"
+            ? await readPredecessorSessionIds(input.transcript_path, input.session_id)
+            : undefined,
       });
     }
 
