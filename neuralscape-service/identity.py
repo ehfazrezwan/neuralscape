@@ -62,10 +62,16 @@ def disambiguate_user_id(slug: str, email: str, *, hex_len: int = 8) -> str:
     """Return ``slug`` made unique to ``email``: ``<slug>-<sha256(email)[:n]>``.
 
     Deterministic, pattern-valid and capped at 100 chars (the slug is trimmed
-    to make room for the suffix). Only used when the plain slug is already
-    claimed by someone else; never changes an existing user's id.
+    to make room for the suffix). Idempotent: a slug that already carries this
+    email's suffix (of any length) is re-suffixed, never double-suffixed.
+    Only used when the plain slug is already claimed by someone else.
     """
     norm = (email or "").strip().lower()
-    suffix = hashlib.sha256(norm.encode("utf-8")).hexdigest()[:hex_len]
+    digest = hashlib.sha256(norm.encode("utf-8")).hexdigest()
+    for n in (64, 16, 8):
+        if slug.endswith("-" + digest[:n]) and len(slug) > n + 1:
+            slug = slug[: -(n + 1)]
+            break
+    suffix = digest[:hex_len]
     head = _EDGE.sub("", slug[: _MAX_LEN - len(suffix) - 1])
     return f"{head}-{suffix}" if head else f"user-{suffix}"

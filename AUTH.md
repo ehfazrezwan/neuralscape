@@ -96,9 +96,17 @@ hidden and `POST /oauth/authorize` rejects token submits). It's always shown for
    in `AUTH_IDENTITY_MAP` for another email) gets `<slug>-<8 hex of sha256(email)>`
    instead** (`login_providers.provision_user_id`, checked when the link page is
    shown and again when `/oauth/link` provisions it). Existing links and the
-   first claimant keep the plain slug, so no existing id changes. Limit: the
-   check sees only the identity store and the env seed, not memories, so a user
-   who has memories under a slug but was never linked is not protected.
+   first claimant keep the plain slug, so no existing id changes. The claim is
+   reserved atomically in Redis (`ns:identity:owner`, HSETNX), so two simultaneous
+   first logins cannot both take one slug. **Fails closed:** if Redis is
+   unreachable, a login that is not already resolved by the `AUTH_IDENTITY_MAP`
+   seed gets a 503 "identity store unavailable, try again" page (already-linked
+   users also wait, since the link lives in the same Redis); nobody is guessed
+   onto a plain slug. The check sees links, reservations and the seed, not
+   memories, so **before enabling**, backfill users who have memories under a slug
+   but were never linked:
+   `uv run python scripts/identity.py backfill --from-env --file users.txt`
+   (lines `email:user_id`; dry-run by default, add `--apply`).
 
 > **Migration:** if memories are already keyed by short ids (e.g. `alice`),
 > map those people in `AUTH_IDENTITY_MAP` before flipping a provider on, or

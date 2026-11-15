@@ -564,6 +564,12 @@ class _FakeRedis:
     async def hdel(self, name, key):
         self.h.get(name, {}).pop(key, None)
 
+    async def hsetnx(self, name, key, val):
+        if key in self.h.setdefault(name, {}):
+            return 0
+        self.h[name][key] = val
+        return 1
+
     async def hgetall(self, name):
         return dict(self.h.get(name, {}))
 
@@ -755,12 +761,89 @@ class TestSlugCollisions:
         assert uid != "a-b-c.com"
 
     @pytest.mark.asyncio
-    async def test_store_down_keeps_plain_slug(self, auth_settings, monkeypatch):
+    async def test_store_down_fails_closed_for_unlinked_logins(self, auth_settings, monkeypatch):
         def boom():
             raise ConnectionError("no redis")
         monkeypatch.setattr(identity_store, "_client", boom)
         auth_settings.auth_identity_map = ""
-        assert await resolve_login_identity("s", "a+b@example.com") == ("a-b-example.com", False)
+        auth_settings.auth_allowed_domains = "example.com"
+        with pytest.raises(lp.IdentityStoreUnavailable):
+            await resolve_login_identity("s", "a+b@example.com")
+        res = await lp._resolve_identity(
+            _make_ctx(), "a+b@example.com", True, "s", trust_external_gate=False)
+        assert isinstance(res, LoginError) and res.status == 503
+
+    @pytest.mark.asyncio
+    async def test_store_down_seeded_user_still_resolves(self, auth_settings, monkeypatch):
+        def boom():
+            raise ConnectionError("no redis")
+        monkeypatch.setattr(identity_store, "_client", boom)
+        auth_settings.auth_identity_map = "a@example.com:alice"
+        assert await resolve_login_identity("s", "a@example.com") == ("alice", True)
+
+    @pytest.mark.asyncio
+    async def test_oauth_link_new_503_when_store_down(self, auth_settings, monkeypatch):
+        import oauth
+        needs = LoginNeedsLink(_make_ctx(), "n@example.com", "g1", "n-example.com")
+        ticket = sign_link_ticket(needs, _SECRET)
+
+        def boom():
+            raise ConnectionError("no redis")
+        monkeypatch.setattr(identity_store, "_client", boom)
+        resp = await oauth.oauth_link(None, ticket=ticket, action="new", token="")
+        assert resp.status_code == 503
+
+    @pytest.mark.asyncio
+    async def test_concurrent_first_logins_on_one_slug_get_one_plain_one_suffixed(
+        self, auth_settings, monkeypatch
+    ):
+        import asyncio
+        import oauth
+
+        class _YieldingRedis(_FakeRedis):
+            """Yields to the loop on every call so the two logins interleave."""
+
+            async def hget(self, *a):
+                await asyncio.sleep(0)
+                return await super().hget(*a)
+
+            async def hgetall(self, *a):
+                await asyncio.sleep(0)
+                return await super().hgetall(*a)
+
+            async def hset(self, *a):
+                await asyncio.sleep(0)
+                return await super().hset(*a)
+
+            async def hsetnx(self, *a):
+                await asyncio.sleep(0)
+                return await super().hsetnx(*a)
+
+        shared = _YieldingRedis()
+        monkeypatch.setattr(identity_store, "_client", lambda: shared)
+        auth_settings.auth_identity_map = ""
+        t1 = sign_link_ticket(LoginNeedsLink(_make_ctx(), "a-b@example.com", "s1", "a-b-example.com"), _SECRET)
+        t2 = sign_link_ticket(LoginNeedsLink(_make_ctx(), "a+b@example.com", "s2", "a-b-example.com"), _SECRET)
+        r1, r2 = await asyncio.gather(
+            oauth.oauth_link(None, ticket=t1, action="new", token=""),
+            oauth.oauth_link(None, ticket=t2, action="new", token=""),
+        )
+        assert r1.status_code == r2.status_code == 303
+        ids = {await identity_store.resolve("s1", None), await identity_store.resolve("s2", None)}
+        assert len(ids) == 2 and "a-b-example.com" in ids
+        assert any(i.startswith("a-b-example.com-") for i in ids)
+
+    @pytest.mark.asyncio
+    async def test_unlink_releases_the_reservation(self, auth_settings, fake_store):
+        await identity_store.link("x-example.com", sub="s1", email="x@example.com")
+        await identity_store.unlink(sub="s1", email="x@example.com")
+        assert await provision_user_id("x-example.com", "s2", "y@example.com", reserve=True) == "x-example.com"
+
+    def test_reprovisioning_a_suffixed_id_does_not_double_suffix(self):
+        once = disambiguate_user_id("a-b-example.com", "a+b@example.com")
+        assert disambiguate_user_id(once, "a+b@example.com") == once
+        longer = disambiguate_user_id(once, "a+b@example.com", hex_len=16)
+        assert longer == disambiguate_user_id("a-b-example.com", "a+b@example.com", hex_len=16)
 
     def test_slugify_output_is_unchanged_and_suffix_is_valid(self):
         import re
@@ -788,3 +871,25 @@ class TestSlugCollisions:
         needs = LoginNeedsLink(_make_ctx(), "solo@example.com", "s9", "solo-example.com")
         await oauth.oauth_link(None, ticket=sign_link_ticket(needs, _SECRET), action="new", token="")
         assert await identity_store.resolve("s9", None) == "solo-example.com"
+
+
+class TestBackfillScript:
+    def test_parse_pairs(self):
+        import importlib.util
+        from pathlib import Path
+        spec = importlib.util.spec_from_file_location(
+            "ns_identity_script", Path(__file__).resolve().parents[1] / "scripts" / "identity.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        text = "# operators\nAlice@Example.com:alice\nbob@example.com bob  # inline\n\ncarol@example.com,carol\n"
+        assert mod.parse_backfill_pairs(text) == [
+            ("alice@example.com", "alice"), ("bob@example.com", "bob"), ("carol@example.com", "carol")]
+        with pytest.raises(ValueError):
+            mod.parse_backfill_pairs("no-email-here")
+
+    @pytest.mark.asyncio
+    async def test_backfilled_user_blocks_a_colliding_newcomer(self, auth_settings, fake_store):
+        # an operator-known user with memories under the plain slug, never linked
+        await identity_store.link("a-b-example.com", email="a-b@example.com")  # what backfill --apply does
+        uid, _ = await resolve_login_identity("s2", "a+b@example.com")
+        assert uid != "a-b-example.com"

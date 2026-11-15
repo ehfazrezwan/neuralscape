@@ -87,6 +87,12 @@ def test_distinct_emails_have_distinct_user_ids(monkeypatch) -> None:
         async def hgetall(self, h):
             return dict(hashes.get(h, {}))
 
+        async def hsetnx(self, h, k, v):
+            if k in hashes.setdefault(h, {}):
+                return 0
+            hashes[h][k] = v
+            return 1
+
         async def aclose(self):
             return None
 

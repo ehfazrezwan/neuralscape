@@ -192,25 +192,40 @@ async def resolve_login_identity(sub: str | None, email: str) -> tuple[str, bool
     return await provision_user_id(slugify_email(email), sub, email), False
 
 
-async def provision_user_id(suggested: str, sub: str | None, email: str | None) -> str:
+async def provision_user_id(
+    suggested: str, sub: str | None, email: str | None, *, reserve: bool = False
+) -> str:
     """Return the id a *new* (unlinked) identity should get.
 
     ``suggested`` is the plain email slug. The slug is lossy, so two different
-    emails can derive the same one; if it is already linked to a different
-    sub/email (or seeded for a different email in ``AUTH_IDENTITY_MAP``) the
-    newcomer gets a hash-suffixed id instead of silently sharing that user's
-    memories. Existing links never pass through here, so existing ids are
-    unchanged. Idempotent: an already-disambiguated id that is unclaimed is
-    returned as is. Called when the suggestion is made and again when
-    ``/oauth/link`` provisions it (the slug may have been claimed in between).
+    emails can derive the same one; if it is already linked, reserved or seeded
+    (``AUTH_IDENTITY_MAP``) for a different identity the newcomer gets a
+    hash-suffixed id instead of silently sharing that user's memories. Existing
+    links never pass through here, so existing ids are unchanged.
+
+    ``reserve=False`` (the suggestion shown on the link page) only reads.
+    ``reserve=True`` (``/oauth/link`` provisioning) claims the id atomically
+    (``identity_store.reserve``), so two concurrent first logins cannot both
+    take one slug. Fails closed: raises ``IdentityStoreUnavailable`` when Redis
+    cannot answer, rather than guessing the slug is free.
     """
     seeds = settings.identity_map_dict()
     candidate = suggested
-    for hex_len in (8, 16, 64):
-        if not await identity_store.claimed_by_other(candidate, sub=sub, email=email, seed_map=seeds):
-            return candidate
-        candidate = disambiguate_user_id(suggested, email or "", hex_len=hex_len)
+    try:
+        for hex_len in (8, 16, 64):
+            if reserve:
+                if await identity_store.reserve(candidate, sub=sub, email=email, seed_map=seeds):
+                    return candidate
+            elif not await identity_store.claimed_by_other(candidate, sub=sub, email=email, seed_map=seeds):
+                return candidate
+            candidate = disambiguate_user_id(suggested, email or "", hex_len=hex_len)
+    except identity_store.StoreUnavailable as e:
+        raise IdentityStoreUnavailable(str(e)) from e
     return candidate
+
+
+class IdentityStoreUnavailable(RuntimeError):
+    """A first login cannot be provisioned safely because Redis is down."""
 
 
 async def _resolve_identity(
@@ -249,7 +264,10 @@ async def _resolve_identity(
         ):
             return LoginError("This account is not authorized.", 403)
 
-    user_id, linked = await resolve_login_identity(sub, email)
+    try:
+        user_id, linked = await resolve_login_identity(sub, email)
+    except IdentityStoreUnavailable:
+        return LoginError("Identity store unavailable. Please try signing in again shortly.", 503)
     if linked:
         return LoginResult(ctx=ctx, user_id=user_id)
     return LoginNeedsLink(ctx=ctx, email=email, sub=sub or "", suggested_user_id=user_id)
@@ -560,6 +578,6 @@ def get_login_provider() -> LoginProvider:
 __all__ = [
     "AuthorizeContext", "LoginResult", "LoginError", "LoginNeedsLink",
     "LoginProvider", "get_login_provider", "sign_login_state", "verify_login_state",
-    "sign_link_ticket", "verify_link_ticket", "resolve_login_identity", "provision_user_id",
+    "sign_link_ticket", "verify_link_ticket", "resolve_login_identity", "provision_user_id", "IdentityStoreUnavailable",
     "verify_user_token",
 ]

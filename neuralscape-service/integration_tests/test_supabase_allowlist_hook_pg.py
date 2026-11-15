@@ -126,6 +126,23 @@ def test_hook_default_denies_unlisted_and_malformed_emails(hook_db):
     assert _denied(_hook(hook_db, None))
 
 
+def test_hook_denies_addresses_with_more_than_one_at_sign(hook_db):
+    """``x@corp.example@evil.example`` must not be judged by its middle part."""
+
+    hook_db.execute("insert into public.signup_email_domains (domain) values ('corp.example')")
+    hook_db.execute("insert into public.signup_email_addresses (email) values ('a@b@corp.example')")
+    for email in ("x@corp.example@evil.example", "x@evil.example@corp.example", "a@b@corp.example", "@@", "a@@corp.example"):
+        assert _denied(_hook(hook_db, email)), email
+    assert _hook(hook_db, "x@corp.example") == {}
+
+
+def test_hook_function_pins_an_empty_search_path(hook_db):
+    config = hook_db.execute(
+        "select proconfig from pg_proc where proname = 'hook_restrict_signup'"
+    ).fetchone()[0]
+    assert config == ["search_path=\"\""]
+
+
 def test_hook_allows_a_listed_address_and_a_listed_domain(hook_db):
     hook_db.execute("insert into public.signup_email_addresses (email) values ('guest@elsewhere.example')")
     hook_db.execute("insert into public.signup_email_domains (domain) values ('corp.example')")

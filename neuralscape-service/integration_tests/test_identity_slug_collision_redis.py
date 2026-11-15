@@ -51,3 +51,28 @@ def test_second_identity_with_a_claimed_slug_gets_its_own_id(flags, stores, uniq
 async def _cleanup(identity_store, *pairs):
     for sub, email in pairs:
         await identity_store.unlink(sub=sub, email=email)
+
+
+def test_concurrent_first_logins_cannot_share_a_slug(flags, stores, unique_ns):
+    """Two simultaneous /oauth/link provisionings on one slug: one plain, one suffixed."""
+
+    import identity_store
+    from login_providers import provision_user_id
+
+    flags(redis_url=stores.redis_url, auth_identity_map="")
+    domain = f"{unique_ns.user_id}.example.com"
+    ids = [(f"{unique_ns.user_id}-c{i}", f"a{sep}b@{domain}") for i, sep in enumerate("-+")]
+    slug = f"a-b-{domain}"
+    unique_ns.on_cleanup(lambda: asyncio.run(_cleanup(identity_store, *ids)))
+
+    async def provision(sub, email):
+        uid = await provision_user_id(slug, sub, email, reserve=True)
+        await identity_store.link(uid, sub=sub, email=email)
+        return uid
+
+    async def both():
+        return await asyncio.gather(*(provision(sub, email) for sub, email in ids))
+
+    got = asyncio.run(both())
+    assert len(set(got)) == 2 and slug in got
+    assert any(g.startswith(slug + "-") for g in got)

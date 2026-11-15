@@ -74,7 +74,7 @@ create or replace function public.hook_restrict_signup(event jsonb)
 returns jsonb
 language plpgsql
 security definer
-set search_path = public
+set search_path = ''
 as $$
 declare
   v_email  text;
@@ -88,11 +88,12 @@ begin
   -- an email already verified by the upstream IdP, e.g. Google; the service
   -- additionally checks `email_verified` on the session JWT.)
   if v_email is null or v_email = ''
+     or length(v_email) - length(replace(v_email, '@', '')) <> 1   -- exactly one '@'
      or position('@' in v_email) <= 1
      or split_part(v_email, '@', 2) = ''
   then
-    return jsonb_build_object(
-      'error', jsonb_build_object(
+    return pg_catalog.jsonb_build_object(
+      'error', pg_catalog.jsonb_build_object(
         'message', 'A valid email address is required to sign in.',
         'http_code', 403
       )
@@ -108,8 +109,8 @@ begin
     return '{}'::jsonb;  -- allow
   end if;
 
-  return jsonb_build_object(
-    'error', jsonb_build_object(
+  return pg_catalog.jsonb_build_object(
+    'error', pg_catalog.jsonb_build_object(
       'message', 'This account is not authorized to access Neuralscape.',
       'http_code', 403
     )
