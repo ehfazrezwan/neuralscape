@@ -57,7 +57,48 @@ class Ctx:
         return run_compose(self.compose_project, *args, check=check, timeout=timeout, run=run)
 
 
-COMPOSE_VERBS = frozenset({"pause", "unpause", "stop", "start", "restart", "ps", "logs", "top", "exec"})
+_CONTAINER_ID = __import__("re").compile(r"^[0-9a-f]{12,64}$")
+
+
+def container_restart_count(container_id: str, run: Callable[..., subprocess.CompletedProcess] = subprocess.run) -> int:
+    """RestartCount of one container (``docker inspect``, read-only)."""
+    if not _CONTAINER_ID.match(container_id or ""):
+        raise ConfigError(f"not a container id: {container_id!r}")
+    proc = run(
+        ["docker", "inspect", "--format", "{{.RestartCount}}", container_id],
+        capture_output=True, text=True, timeout=30,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(f"docker inspect failed: {(proc.stderr or '').strip()[:200]}")
+    return int((proc.stdout or "0").strip() or 0)
+
+
+def parse_ps_json(text: str) -> list[dict]:
+    """``docker compose ps --format json``: a JSON array or one object per line."""
+    import json
+
+    text = (text or "").strip()
+    if not text:
+        return []
+    if text.startswith("["):
+        return json.loads(text)
+    return [json.loads(line) for line in text.splitlines() if line.strip()]
+
+
+COMPOSE_VERBS = frozenset({"pause", "unpause", "stop", "start", "restart", "ps", "logs", "top", "exec", "up"})
+# `up` may only start existing containers: detached, no build, no recreate.
+UP_REQUIRED_FLAGS = ("-d", "--no-build", "--no-recreate")
+UP_ALLOWED_FLAGS = UP_REQUIRED_FLAGS + ("--no-deps",)
+
+
+def qdrant_service() -> str:
+    return os.environ.get("NS_QDRANT_SERVICE", "qdrant")
+
+
+def app_services() -> list[str]:
+    return os.environ.get(
+        "NS_APP_SERVICES", "neuralscape,neuralscape-worker,neuralscape-graph-worker,neuralscape-ingest-worker"
+    ).split(",")
 
 
 def run_compose(
@@ -73,6 +114,16 @@ def run_compose(
         )
     if not args or args[0] not in COMPOSE_VERBS:
         raise ConfigError(f"compose verb {args[:1]!r} is not allowed (allowed: {sorted(COMPOSE_VERBS)})")
+    if args[0] == "up":
+        flags = {a for a in args[1:] if a.startswith("-")}
+        names = [a for a in args[1:] if not a.startswith("-")]
+        if not set(UP_REQUIRED_FLAGS) <= flags or not flags <= set(UP_ALLOWED_FLAGS):
+            raise ConfigError(f"`up` takes exactly {UP_REQUIRED_FLAGS} (+ optional --no-deps), got {sorted(flags)}")
+        if not names or not set(names) <= set(app_services()):
+            raise ConfigError(f"`up` may only name the API/worker services {app_services()}, got {names}")
+    if args[0] == "exec":
+        if len(args) < 6 or args[1:5] != ("-T", qdrant_service(), "sh", "-c") or len(args) != 6:
+            raise ConfigError(f"`exec` is only allowed as: exec -T {qdrant_service()} sh -c <script>")
     cmd = ["docker", "compose", "-p", project.strip(), *args]
     proc = run(cmd, capture_output=True, text=True, timeout=timeout)
     if check and proc.returncode != 0:

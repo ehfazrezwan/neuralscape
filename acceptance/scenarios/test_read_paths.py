@@ -160,17 +160,66 @@ def check_meter_belongs_to(client: NSClient, user_id: str) -> None:
 # ── hybrid recall ────────────────────────────────────────────────
 
 
-@proves("read.hybrid-search-core", "read.dense-pool-legs", "fork.mem0.gemini-embedder")
-def test_paraphrased_query_recalls_the_fact_through_the_dense_leg(ctx, a, rd):
-    rd["dense"].require()
-    eventually(
-        lambda: check_search_finds(a, rd["dense"].marker, PARAPHRASE, ctx.project_id),
-        timeout=90, what="paraphrase recall",
+LEGS_TEXT = "Quokkaforge compiles artefacts nightly on the staging cluster."
+LEGS_QUERY = "which utility assembles our deliverables each evening inside the rehearsal environment"
+
+
+def _words(text: str) -> set[str]:
+    return set(re.findall(r"[a-z0-9]+", text.lower()))
+
+
+@pytest.fixture(scope="module")
+def legs(ctx, a) -> dict:
+    """One fact alone in its own project, and a query sharing NO word with it."""
+    marker = f"zq-{ctx.run_id}-legs"
+    project = f"{ctx.project_id}-legs"
+    w = write_raw(
+        a, f"{marker} {LEGS_TEXT}", "tech_stack", marker=marker, scope="project", project_id=project, visibility="private",
     )
+    decoys = [
+        write_raw(
+            a, f"zq-{ctx.run_id}-decoy{i} {text}", "tech_stack", marker=f"zq-{ctx.run_id}-decoy{i}",
+            scope="project", project_id=project, visibility="private",
+        )
+        for i, text in enumerate((
+            "The orchard gate is painted green and squeaks in winter.",
+            "Grandmother's recipe needs two cups of oat flour and a pinch of salt.",
+            "The choir rehearses on Thursdays in the old chapel.",
+            "A heron nests near the third bridge every spring.",
+        ))
+    ]
+    return {"w": w, "project": project, "marker": marker, "decoys": decoys}
 
 
-@proves("read.hybrid-search-core", "vec.bm25-sparse")
-def test_bare_rare_token_recalls_the_fact_through_the_keyword_leg(ctx, a, rd):
+@proves("read.hybrid-search-core", "read.dense-pool-legs", "fork.mem0.gemini-embedder")
+def test_query_with_no_shared_word_recalls_the_fact_through_the_dense_leg(a, legs):
+    """The query and the stored text share no token at all (checked here), so the
+    lexical (BM25) leg cannot match: only the embedding leg can rank the fact first
+    among unrelated decoys in the same project."""
+    legs["w"].require()
+    for d in legs["decoys"]:
+        d.require()
+    shared = _words(LEGS_QUERY) & _words(f"{legs['marker']} {LEGS_TEXT}")
+    assert not shared, f"test data bug: query and fact share words {sorted(shared)}"
+    eventually(
+        lambda: check_search_finds(a, legs["marker"], LEGS_QUERY, legs["project"]),
+        timeout=90, what="the fact is searchable at all",
+    )
+    # Ranking is asserted once, outside the retry loop, with a margin.
+    results = a.search(LEGS_QUERY, project_id=legs["project"], limit=5)
+    assert results and legs["marker"] in results[0].get("memory", ""), (
+        f"target is not the top hit: {[r.get('memory', '')[:40] for r in results[:3]]}"
+    )
+    scores = [r.get("score") for r in results]
+    if all(isinstance(x, (int, float)) for x in scores) and len(scores) > 1:
+        assert scores[0] > max(scores[1:]), f"target's score has no margin over the decoys: {scores}"
+    else:  # no scores in the response: require the same rank-1 result twice in a row
+        again = a.search(LEGS_QUERY, project_id=legs["project"], limit=5)
+        assert again and again[0].get("id") == results[0].get("id"), "rank 1 is not stable across two searches"
+
+
+@proves("read.hybrid-search-core")
+def test_bare_rare_token_recalls_the_fact(ctx, a, rd):
     rd["dense"].require()
     eventually(
         lambda: check_search_finds(a, rd["dense"].marker, rd["rare"], ctx.project_id),
@@ -180,9 +229,9 @@ def test_bare_rare_token_recalls_the_fact_through_the_keyword_leg(ctx, a, rd):
 
 @proves("read.hybrid-search-core", "read.dense-pool-legs")
 @negative_control
-def test_recall_check_fails_for_user_b(ctx, b, rd):
-    rd["dense"].require()
-    expect_check_fails(check_search_finds, b, rd["dense"].marker, PARAPHRASE, ctx.project_id)
+def test_recall_check_fails_for_user_b(b, legs):
+    legs["w"].require()
+    expect_check_fails(check_search_finds, b, legs["marker"], LEGS_QUERY, legs["project"])
 
 
 # ── index-first recall, batch get ────────────────────────────────
@@ -468,7 +517,7 @@ def test_ask_minimal_answers_from_memory_and_rejects_bad_levels(ctx, a, rd):
     assert bad.status_code == 422, f"unknown reasoning_level -> {bad.status_code} (want 422)"
 
 
-@proves("read.ask-tiers", "read.keyword-scan")
+@proves("read.ask-tiers")
 def test_ask_medium_runs_the_keyword_scan_pass(a, rd):
     rd["ask"].require()
     body = check_ask_answers(a, ASK_Q, rd["ask"].memory_id, rd["ask_tool"], "medium")

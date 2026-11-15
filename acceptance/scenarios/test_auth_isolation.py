@@ -20,7 +20,7 @@ from nsaccept import eventually, expect_check_fails, needs, negative_control, pr
 from nsaccept.client import NSClient
 from nsaccept.helpers import Written, mcp_json, write_raw
 from nsaccept.mcp import MCPClient
-from nsaccept.tokens import mint_local, mint_via_compose
+from nsaccept.tokens import mint_local, mint_via_compose, mint_via_compose_python
 
 
 @pytest.fixture(scope="module")
@@ -167,21 +167,48 @@ def test_token_with_swapped_user_id_is_rejected(ctx, a):
     assert r.status_code == 401, f"token with swapped payload -> {r.status_code} (want 401): {r.text[:120]}"
 
 
+def _flip_signature_char(token: str) -> str:
+    payload, sig = token.split(".", 1)
+    return payload + "." + ("A" if sig[0] != "A" else "B") + sig[1:]
+
+
+@proves("auth.bearer-middleware")
+def test_token_with_a_flipped_signature_character_is_rejected(ctx, a):
+    forged = NSClient(ctx.base_url, _flip_signature_char(ctx.token_a), ctx.user_a)
+    try:
+        r = forged.get("/v1/memories", params={"limit": 1})
+    finally:
+        forged.close()
+    assert r.status_code == 401, f"token with a corrupted signature -> {r.status_code} (want 401)"
+    assert a.get("/v1/memories", params={"limit": 1}).status_code == 200, "control token was refused"
+
+
+def _tokens_with_ttls(ctx, user: str):
+    """(expired, fresh) tokens for ``user``: signed locally when NS_TOKEN_SECRET is known,
+    otherwise minted inside the API container (the secret never leaves it)."""
+    secret = os.environ.get("NS_TOKEN_SECRET", "").strip()
+    if secret:
+        return mint_local(user, secret, ttl_seconds=-3600), mint_local(user, secret, ttl_seconds=3600)
+    if ctx.compose_project:
+        svc = os.environ.get("NS_API_SERVICE", "neuralscape")
+        return (
+            mint_via_compose_python(ctx.compose_project, user, -60, svc),
+            mint_via_compose_python(ctx.compose_project, user, 3600, svc),
+        )
+    pytest.skip("neither NS_TOKEN_SECRET nor --compose-project: cannot mint an expired token for this stack")
+
+
 @proves("auth.bearer-middleware")
 def test_expired_token_is_rejected(ctx):
-    secret = os.environ.get("NS_TOKEN_SECRET", "").strip()
-    if not secret:
-        pytest.skip("NS_TOKEN_SECRET not set: cannot sign an expired token for this stack")
-    stale = mint_local(ctx.user_a, secret, ttl_seconds=-3600)
-    c = NSClient(ctx.base_url, stale, ctx.user_a)
-    fresh = NSClient(ctx.base_url, mint_local(ctx.user_a, secret, ttl_seconds=3600), ctx.user_a)
+    stale, fresh = _tokens_with_ttls(ctx, ctx.user_a)
+    c, ok = NSClient(ctx.base_url, stale, ctx.user_a), NSClient(ctx.base_url, fresh, ctx.user_a)
     try:
         r_stale = c.get("/v1/memories", params={"limit": 1})
-        r_fresh = fresh.get("/v1/memories", params={"limit": 1})
+        r_fresh = ok.get("/v1/memories", params={"limit": 1})
     finally:
         c.close()
-        fresh.close()
-    assert r_fresh.status_code == 200, f"control token signed with the same secret -> {r_fresh.status_code}"
+        ok.close()
+    assert r_fresh.status_code == 200, f"control token with the same signer -> {r_fresh.status_code}"
     assert r_stale.status_code == 401, f"expired token -> {r_stale.status_code} (want 401)"
 
 
