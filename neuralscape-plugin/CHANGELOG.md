@@ -4,6 +4,14 @@ All notable changes to the `neuralscape` Claude plugin are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 the project adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.9.6] - 2026-11-16
+
+### Fixed
+- A rejected token, a wrong URL and a dead service all produced the same "memory service unreachable — check `docker compose ps`" notice. The HTTP client now throws typed errors (`NeuralscapeHttpError` with the status, `NeuralscapeNetworkError` for connection failures and timeouts) and one classifier sorts a failure into auth (401/403), not found (404), other client error (4xx), server (5xx) or network. SessionStart words the notice per kind: a rejected key says so and points at `/plugin config neuralscape@neuralscape-plugins` (never printing the key); a 404 says the URL is probably wrong; another 4xx says the request was rejected; 5xx and network failures keep the unreachable wording. Only server and network failures count toward the fail-loud streak (the service answered the others, so "unreachable for N events" would be false); auth, 404 and other 4xx leave the streak untouched, and a success still resets it. PreToolUse, SessionEnd (session summary) and PreCompact use the same classification when deciding whether to count a failure. All hooks still exit 0 and never block.
+- An install with no `USER_ID` identifies as the OS login name (a deliberate fallback, unchanged), but the user was never told. When that fallback is in effect and the service URL is not localhost/127.0.0.1/::1, SessionStart now adds one line saying which id is used and how to set `USER_ID`. It does not name the service host.
+- The `ns-config` and `ns-status` skills resolved the URL from env vars only and treated "no env vars" as connector mode. They now follow the precedence the hooks use (userConfig, then env, then the baked `.mcp.json` URL, then localhost), show where each value came from, and keep the Cowork connector-mode branch for when the hooks do not run.
+- Forks were not warned that the connector URL committed in `.mcp.json` is the upstream channel's. The README now says so at the top, and `npm run bake -- --check` reports the baked URL and the API base the hooks derive from it (`--expect <url>` makes it exit 1 on a mismatch, for a fork's own CI). The committed URL itself is unchanged.
+
 ## [2.9.5] - 2026-11-16
 
 ### Fixed
