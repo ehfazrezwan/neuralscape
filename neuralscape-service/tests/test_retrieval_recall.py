@@ -304,6 +304,37 @@ class TestHybridFusionOrderSurvivesPoolMerge:
         assert [r.id for r in keyed] == ["dense", "lex", "edge"]
         assert {r.id: r.score for r in keyed}["lex"] == pytest.approx(0.50)
 
+    def test_salience_lifts_order_keys_consistently(self, service, monkeypatch):
+        """Salience on (k>0): the ordering keys get the same lift as the
+        displayed score, and the cross-pool sort follows the lifted keys."""
+        from extensions.dreaming import traces
+        from extensions.dreaming.config import dreaming_settings
+        from memory_service import _salience_tiebreak
+
+        monkeypatch.setattr(dreaming_settings, "salience_recall_k", 0.1)
+        monkeypatch.setattr(
+            traces, "get_strength_signals", lambda ids: {"b": 4.0}
+        )
+
+        # Unit: keys and scores lifted by the same factor; zero signal untouched.
+        a = MemoryResponse(id="a", memory="a", score=0.80)
+        b = MemoryResponse(id="b", memory="b", score=0.50)
+        keys = {"a": 0.80, "b": 0.78}
+        _salience_tiebreak([a, b], keys)
+        lift = b.score / 0.50
+        assert lift > 1.0
+        assert keys["b"] == pytest.approx(0.78 * lift)
+        assert keys["a"] == 0.80 and a.score == 0.80
+
+        # End to end: b's fused key (0.78) beats a's (0.75) only via salience.
+        pa = _make_hit("a", 0.75, _payload("alpha"))
+        pb = _make_hit("b", 0.70, _payload("beta"))
+        pb2 = _make_hit("pad", 0.78, _payload("gamma"))
+        self._wire_pools(service, [], [], [pb2, pa, pb])
+        results = self._search(service, limit=3)
+        ids = [r.id for r in results]
+        assert ids.index("b") < ids.index("a")  # 0.70 * lift(>1.0) vs 0.75
+
 
 # ══════════════════════════════════════════════
 # Defect 2 — vector/graph weave (ranked hits keep priority)
