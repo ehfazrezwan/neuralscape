@@ -768,12 +768,60 @@ class TestStaleGraphCheckOnDedupHit:
         assert result == {"memory_id": "m1", "enriched": False, "skipped": "graph_current"}
         svc._memory.graph.add.assert_not_called()
 
-    def test_row_without_episode_ref_is_enriched(self, env):
+    def test_no_ref_row_on_default_path_does_no_llm_work(self, env):
+        """Passages / connector / code-graph rows have no ref by design."""
         svc, qdrant, graph = env
+        qdrant.add("m1", user="u1", data="d")
+
+        assert self._run_job(svc)["skipped"] == "graph_current"
+        svc._memory.graph.add.assert_not_called()
+
+    def test_no_ref_plain_fact_is_enriched_only_with_the_flag(self, env, monkeypatch):
+        svc, qdrant, graph = env
+        monkeypatch.setattr(settings, "graph_supersession_enabled", True)
         qdrant.add("m1", user="u1", data="d")
 
         assert self._run_job(svc)["enriched"] is True
         svc._memory.graph.add.assert_called_once()
+
+    @pytest.mark.parametrize("meta", [{"memory_kind": "passage"}, {"source_ref": {"connector_id": "c"}}])
+    def test_no_ref_vector_only_rows_stay_skipped_even_with_the_flag(self, env, monkeypatch, meta):
+        svc, qdrant, graph = env
+        monkeypatch.setattr(settings, "graph_supersession_enabled", True)
+        qdrant.add("m1", user="u1", data="d", metadata=meta)
+
+        assert self._run_job(svc)["skipped"] == "graph_current"
+        svc._memory.graph.add.assert_not_called()
+
+    def test_passage_and_reference_rows_are_skipped_in_the_job(self, env):
+        import worker
+
+        svc, qdrant, graph = env
+        qdrant.add("m1", user="u1", data="d", metadata={"graph_episode_uuid": "ep"})
+        graph.add_edge("E1", "f", ["ep"])
+        graph.invalidate("E1")  # stale, but vector-only by design
+        for kind, ws in (("passage", None), ("fact", "ref-trading_strategy")):
+            svc.get_memory = MagicMock(return_value=MemoryResponse(
+                id="m1", memory="x", scope="global", memory_kind=kind, workspace=ws))
+            out = asyncio.run(worker.process_graph_enrichment(
+                {"service": svc}, memory_id="m1", content="x", user_id="u1", only_if_stale=True))
+            assert out["skipped"] == "vector_only"
+        svc._memory.graph.add.assert_not_called()
+
+    def test_stale_reenrichment_carries_the_rows_source_ref(self, env):
+        import worker
+
+        svc, qdrant, graph = env
+        qdrant.add("m1", user="u1", data="d", metadata={"graph_episode_uuid": "ep"})
+        graph.add_edge("E1", "f", ["ep"])
+        graph.invalidate("E1")
+        ref = {"connector_id": "c", "external_id": "x"}
+        svc.get_memory = MagicMock(return_value=MemoryResponse(
+            id="m1", memory="x", scope="global", visibility="private", source_ref=ref))
+        svc.enrich_graph = MagicMock(return_value=True)
+        asyncio.run(worker.process_graph_enrichment(
+            {"service": svc}, memory_id="m1", content="x", user_id="u1", only_if_stale=True))
+        assert svc.enrich_graph.call_args.kwargs["source_ref"] == ref
 
     def test_episode_with_no_edges_at_all_is_current(self, env):
         svc, qdrant, graph = env
@@ -809,21 +857,43 @@ class TestStaleGraphCheckOnDedupHit:
         svc._memory.graph.add.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_repeated_dedup_hits_coalesce_on_one_job_id(self):
+    async def test_repeated_dedup_hits_coalesce_on_one_job_id_and_lock(self):
         import worker
 
+        seen: set[str] = set()
+
+        async def _set(key, val, nx=False, ex=None):
+            assert nx and ex
+            if key in seen:
+                return None
+            seen.add(key)
+            return True
+
         redis = MagicMock()
+        redis.set = _set
         redis.enqueue_job = AsyncMock()
         mem = MemoryResponse(id="m1", memory="x", scope="global", visibility="private")
         for _ in range(3):
             await worker._enqueue_stale_graph_check({"redis": redis}, mem, "x", "u1", None)
         await worker._enqueue_stale_graph_check({"redis": redis}, mem, "different", "u1", None)
 
+        assert redis.enqueue_job.await_count == 2  # 3 identical hits -> 1 job; new hash -> 1 job
         ids = [c.kwargs["_job_id"] for c in redis.enqueue_job.await_args_list]
-        assert len(set(ids[:3])) == 1 and ids[3] != ids[0]
-        assert ids[0].startswith("graph-stale-check:m1:")
+        assert ids[0] != ids[1] and ids[0].startswith("graph-stale-check:m1:")
         assert all(c.kwargs["_queue_name"] == settings.graph_queue_name
                    for c in redis.enqueue_job.await_args_list)
+
+    @pytest.mark.asyncio
+    async def test_passage_dedup_hit_enqueues_nothing(self):
+        import worker
+
+        redis = MagicMock()
+        redis.set = AsyncMock(return_value=True)
+        redis.enqueue_job = AsyncMock()
+        for kw in ({"memory_kind": "passage"}, {"workspace": "ref-x"}):
+            mem = MemoryResponse(id="p1", memory="x", scope="global", **kw)
+            await worker._enqueue_stale_graph_check({"redis": redis}, mem, "x", "u1", None)
+        redis.enqueue_job.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_early_idempotency_hit_also_queues_the_check(self):

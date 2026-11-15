@@ -155,6 +155,9 @@ async def process_memory_store(
     return result
 
 
+_STALE_CHECK_COALESCE_TTL_S = 300
+
+
 async def _enqueue_stale_graph_check(
     ctx: dict, mem, content: str, user_id: str, project_id: str | None
 ) -> None:
@@ -170,6 +173,21 @@ async def _enqueue_stale_graph_check(
     """
     from memory.hashing import content_hash
 
+    # Vector-only rows never reach the graph by design: nothing to check.
+    if getattr(mem, "memory_kind", None) == "passage" or getattr(mem, "workspace", None) not in (None, "memory"):
+        return
+    redis = ctx["redis"]
+    # Coalescing: a short-lived NX marker per (memory, content hash) so a burst
+    # of repeated hits queues ONE check even after arq has dropped the finished
+    # job's result (the _job_id below only dedups while the result is retained).
+    # Fail-open: any Redis error just means we may queue a duplicate (the job
+    # itself is idempotent and cheap).
+    try:
+        marker = f"graph-stale-check-lock:{mem.id}:{content_hash(content)}"
+        if not await redis.set(marker, "1", nx=True, ex=_STALE_CHECK_COALESCE_TTL_S):
+            return
+    except Exception:  # noqa: BLE001
+        pass
     try:
         await ctx["redis"].enqueue_job(
             "process_graph_enrichment",
@@ -1038,6 +1056,13 @@ async def process_graph_enrichment(
     # metadata in _mem_to_response), so read it directly.
     occurred_at = getattr(mem, "occurred_at", None)
     if only_if_stale:
+        # Re-enrichment must reproduce the original write: carry the row's
+        # connector provenance. Reference-workspace / adapter rows (their
+        # ontology is not recoverable from the row) and passages are
+        # vector-only by design and never re-enriched here.
+        if getattr(mem, "memory_kind", None) == "passage" or getattr(mem, "workspace", None) not in (None, "memory"):
+            return {"memory_id": memory_id, "enriched": False, "skipped": "vector_only"}
+        source_ref = source_ref or getattr(mem, "source_ref", None)
         stale = await asyncio.to_thread(
             service.graph_row_is_stale,
             memory_id,

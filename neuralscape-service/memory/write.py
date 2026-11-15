@@ -117,11 +117,11 @@ class WriteMixin:
     ) -> bool:
         """Should a dedup-hit re-assertion of this row re-enter the graph?
 
-        True when the row has no ``graph_episode_uuid`` (never enriched, or
-        enrichment failed) or when its episode has edges but ALL are
-        invalid/expired (Graphiti has since contradicted the fact while the
+        True when its episode has edges but ALL are invalid/expired (Graphiti has since contradicted the fact while the
         row stayed live, so the graph disagrees with what the user just
-        re-asserted). One Qdrant retrieve + one Cypher probe, no LLM.
+        re-asserted), or — only with ``GRAPH_SUPERSESSION_ENABLED`` and for
+        plain graphed fact rows — when the row has no episode ref at all.
+        One Qdrant retrieve + one Cypher probe, no LLM.
 
         Fails SAFE: any probe error returns False (skip) so a flaky Neo4j
         can never trigger an LLM storm. An episode that produced no edges at
@@ -141,7 +141,17 @@ class WriteMixin:
             meta = (pts[0].payload or {}).get("metadata") or {}
             episode_uuid = meta.get("graph_episode_uuid")
             if not episode_uuid:
-                return True
+                # "No ref" is NOT evidence of staleness on the default path:
+                # passages, connector/ingest rows and code-graph rows are
+                # vector-only by design and would burn an LLM call on every
+                # dedup hit. Only with the supersession flag on, and only for
+                # plain graphed rows (a fact, no source_ref), treat it as
+                # "enrichment never landed".
+                return bool(
+                    settings.graph_supersession_enabled
+                    and meta.get("memory_kind") in (None, "fact")
+                    and not meta.get("source_ref")
+                )
             from extensions.dreaming.graph_patcher import episode_edge_counts
 
             group_id = _build_group_id(visibility, user_id, project_id, workspace)
