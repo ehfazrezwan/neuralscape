@@ -186,7 +186,6 @@ def test_required_baseline_areas_each_have_an_expected_failure_and_a_control() -
         "namespace": ("group-id-tuple-collision", "group-id-distinct-controls"),
         "identity": ("email-slug-collision", "email-slug-controls"),
         "queued-visibility": ("queued-visibility-publication", "queued-job-deleted-memory-control"),
-        "job-key": ("job-key-omits-store-scope", "job-key-controls"),
         "stale-revision": ("stale-revision-edit", "patch-partial-control"),
         "graph-deletion": ("graph-removal-shared-support", "graph-removal-controls"),
         "readiness": ("readiness-probes-backends", "readiness-controls"),
@@ -196,6 +195,9 @@ def test_required_baseline_areas_each_have_an_expected_failure_and_a_control() -
     for area, (failure, control) in areas.items():
         assert by_id[failure].kind == "expected-failure", area
         assert by_id[control].kind == "control", area
+    # The job-key defects are fixed: that area is controls only now.
+    for control in ("job-key-store-scope-control", "job-key-raw-options-control", "job-key-controls"):
+        assert by_id[control].kind == "control", control
 
 
 def test_module_is_standard_library_only() -> None:

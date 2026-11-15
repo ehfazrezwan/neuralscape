@@ -73,10 +73,9 @@ def check_orphan_pages(writer: ObsidianWriter) -> list[LintFinding]:
                 target_path = all_stems_to_path[target_stem]
                 inbound[target_path] = inbound.get(target_path, 0) + 1
 
-    # Skip index.md and log.md — they're root pages
-    skip = {"index.md", "log.md"}
+    # Skip the index, log and category index — they are root pages
     for rel_path, count in inbound.items():
-        if count == 0 and rel_path not in skip:
+        if count == 0 and rel_path not in writer.META_FILES:
             findings.append(
                 LintFinding(
                     check="orphan_pages",
@@ -261,7 +260,7 @@ def check_index_drift(writer: ObsidianWriter) -> list[LintFinding]:
     findings = []
     all_files = writer.list_all_files()
 
-    index_content = writer.read_file("index.md")
+    index_content = writer.read_index()
     if not index_content:
         if all_files:
             findings.append(
@@ -279,7 +278,7 @@ def check_index_drift(writer: ObsidianWriter) -> list[LintFinding]:
     indexed_stems = {Path(p).stem for p in indexed_paths}
 
     # Skip meta files
-    skip_stems = {"index", "log"}
+    skip_stems = {"index", "log", "category-index"}
 
     for rel_path in all_files:
         stem = Path(rel_path).stem

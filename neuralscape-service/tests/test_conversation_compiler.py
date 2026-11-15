@@ -16,10 +16,6 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from extensions.conversation_compiler.config import CompilerSettings
-from extensions.conversation_compiler.flush import (
-    _map_category,
-    _parse_extraction_response,
-)
 from extensions.conversation_compiler.obsidian_writer import (
     ObsidianWriter,
     _build_frontmatter,
@@ -209,60 +205,6 @@ class TestObsidianWriter:
         links = writer.find_wikilinks(content)
         assert "Page One" in links
         assert "another-page" in links
-
-
-# ──────────────────────────────────────────────
-# Flush engine tests
-# ──────────────────────────────────────────────
-
-
-class TestParseExtractionResponse:
-    def test_valid_json(self):
-        response = json.dumps({
-            "facts": [
-                {"type": "decision", "content": "Chose FastAPI", "project": "neuralscape", "tags": ["web"]},
-                {"type": "preference", "content": "Prefers dark mode", "project": None, "tags": []},
-            ]
-        })
-        facts = _parse_extraction_response(response)
-        assert len(facts) == 2
-        assert facts[0].category == "decision"
-        assert facts[0].content == "Chose FastAPI"
-        assert facts[0].project_id == "neuralscape"
-        assert facts[1].category == "preference"
-
-    def test_markdown_wrapped_json(self):
-        response = "```json\n" + json.dumps({"facts": [{"type": "fact", "content": "Test"}]}) + "\n```"
-        facts = _parse_extraction_response(response)
-        assert len(facts) == 1
-
-    def test_empty_facts(self):
-        response = json.dumps({"facts": []})
-        facts = _parse_extraction_response(response)
-        assert len(facts) == 0
-
-    def test_invalid_json(self):
-        facts = _parse_extraction_response("this is not json")
-        assert len(facts) == 0
-
-    def test_missing_content(self):
-        response = json.dumps({"facts": [{"type": "fact", "content": ""}]})
-        facts = _parse_extraction_response(response)
-        assert len(facts) == 0
-
-
-class TestMapCategory:
-    def test_decision(self):
-        assert _map_category("decision") == "decision"
-
-    def test_preference(self):
-        assert _map_category("preference") == "preference"
-
-    def test_unknown(self):
-        assert _map_category("unknown_type") == "personal_fact"
-
-    def test_pattern(self):
-        assert _map_category("pattern") == "convention"
 
 
 # ──────────────────────────────────────────────
@@ -509,7 +451,7 @@ class TestUserIdThreading:
         ):
             result = await compile_date("2026-04-07", mock_service, writer, user_id="alice")
 
-        mock_service.dedup_memories.assert_called_once_with("alice")
+        mock_service.dedup_memories.assert_called_once_with("alice", semantic=True)
         assert result.dedup_triggered is True
 
     @pytest.mark.asyncio
@@ -530,7 +472,11 @@ class TestUserIdThreading:
         ):
             result = await compile_date("2026-04-07", mock_service, writer)
 
-        mock_service.dedup_memories.assert_called_once_with("ehfaz")
+        from config import settings as _core_settings
+
+        mock_service.dedup_memories.assert_called_once_with(
+            _core_settings.default_user_id, semantic=True
+        )
 
 
 # ──────────────────────────────────────────────

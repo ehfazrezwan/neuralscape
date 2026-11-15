@@ -107,6 +107,21 @@ async def _async_call_gemini(prompt: str) -> str:
     return await asyncio.to_thread(_call_gemini, prompt)
 
 
+_RESEARCH_CATEGORIES = frozenset({"research", "domain_knowledge"})
+
+
+def _semantic_dedup_enabled() -> bool:
+    """Whether the lossy semantic dedup phase may run.
+
+    Same rule as the dedup cron (``worker.dedup_all_memories``): when
+    ``DREAMING_ENABLED`` is on, the dream sweep's MERGE action owns near-dup
+    merges, so only the lossless exact-hash phase runs.
+    """
+    from extensions.dreaming.config import dreaming_settings
+
+    return not dreaming_settings.enabled
+
+
 def _group_entries(entries: list[dict]) -> dict[str, list[dict]]:
     """Group daily log entries by type for synthesis.
 
@@ -129,9 +144,15 @@ def _group_entries(entries: list[dict]) -> dict[str, list[dict]]:
         # Check for project mentions
         project = _infer_project(content)
 
+        # Daily-log entries carry the memory's main-taxonomy category (the
+        # flush path stores them through the main extractor). ``decision`` is
+        # a core category; ``domain_knowledge`` is where research-style
+        # findings land (the old flush mapped its ``research`` and ``gotcha``
+        # types there), so it feeds the research article. ``research`` is kept
+        # for daily logs written before the flush path was unified.
         if category == "decision":
             groups["decisions"].append(entry)
-        elif category == "research":
+        elif category in _RESEARCH_CATEGORIES:
             groups["research"].append(entry)
         elif project:
             projects.setdefault(project, []).append(entry)
@@ -185,11 +206,36 @@ def _entries_to_text(entries: list[dict]) -> str:
     return "\n".join(lines)
 
 
+async def _dedup_compiled_users(
+    service: MemoryService, entries: list[dict], fallback_user_id: str
+) -> bool:
+    """Run post-compile dedup for each user that owns a compiled entry.
+
+    The semantic phase is skipped when dreaming is enabled, exactly like the
+    dedup cron. ``dedup_memories`` is synchronous, so each call runs in a
+    worker thread (issue #213: running it inline blocked the API event loop).
+    One user's failure never stops the others. Returns True when every
+    attempted dedup succeeded.
+    """
+    users = {e["user_id"] for e in entries if e.get("user_id")}
+    if not users or any(not e.get("user_id") for e in entries):
+        users.add(fallback_user_id)
+    semantic = _semantic_dedup_enabled()
+    ok = True
+    for uid in sorted(users):
+        try:
+            await asyncio.to_thread(service.dedup_memories, uid, semantic=semantic)
+        except Exception:
+            ok = False
+            logger.warning("Post-compile dedup failed (non-critical)", user_id=uid)
+    return ok
+
+
 async def compile_date(
     date: str,
     service: MemoryService,
     writer: ObsidianWriter,
-    user_id: str = "ehfaz",
+    user_id: str | None = None,
 ) -> CompileResult:
     """Compile all daily log entries for a given date into structured articles.
 
@@ -200,11 +246,14 @@ async def compile_date(
         date: ISO date string (YYYY-MM-DD).
         service: MemoryService instance for dedup.
         writer: ObsidianWriter for vault I/O.
-        user_id: User ID for post-compile dedup.
+        user_id: User the compile was requested for; post-compile dedup runs
+            for the owners recorded on the entries and falls back to this user
+            for entries without one. Defaults to ``DEFAULT_USER_ID``.
 
     Returns:
         CompileResult with details of what was compiled.
     """
+    user_id = user_id or core_settings.default_user_id
     logger.info("Starting compilation", date=date)
 
     # Check if already compiled
@@ -325,16 +374,12 @@ async def compile_date(
         f"Compiled {date}: {len(articles)} articles from {entries_compiled} entries"
     )
 
-    # 8. Trigger dedup
-    # DEFENSIVE FIX: wrap sync dedup in asyncio.to_thread to prevent blocking
-    # the event loop when compile_date is called inline (e.g., from session_end
-    # fallback or when ARQ worker runs process_conversation_compile).
-    dedup_triggered = False
-    try:
-        await asyncio.to_thread(service.dedup_memories, user_id)
-        dedup_triggered = True
-    except Exception:
-        logger.warning("Post-compile dedup failed (non-critical)")
+    # 8. Trigger dedup for every user whose entries were compiled.
+    # The vault is one shared tree, so one daily log can hold entries from
+    # several users; each entry records its owner. Entries written before
+    # owners were recorded fall back to the ``user_id`` the compile was
+    # requested for.
+    dedup_triggered = await _dedup_compiled_users(service, entries, user_id)
 
     result = CompileResult(
         date=date,
@@ -356,7 +401,7 @@ async def compile_date(
 async def compile_all_pending(
     service: MemoryService,
     writer: ObsidianWriter,
-    user_id: str = "ehfaz",
+    user_id: str | None = None,
 ) -> list[CompileResult]:
     """Compile all uncompiled daily logs.
 

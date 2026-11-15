@@ -6,7 +6,7 @@ from typing import Annotated
 from urllib.parse import urlparse
 
 from arq.connections import RedisSettings
-from pydantic import field_validator, model_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode
 
 _logger = logging.getLogger(__name__)
@@ -99,6 +99,13 @@ class Settings(BaseSettings):
     ingest_queue_name: str = "neuralscape:ingest"
     arq_max_retries: int = 3
     arq_job_timeout: int = 300  # 5 min max per task
+    # Concurrent jobs per worker process (ARQ ``max_jobs``), one knob per
+    # worker class. The graph worker's default is low to cap concurrent Gemini
+    # extraction (AI-Studio throttling); the ingest worker's bounds parse /
+    # embed memory. Env: ARQ_MAX_JOBS / GRAPH_MAX_JOBS / INGEST_MAX_JOBS.
+    arq_max_jobs: int = Field(default=10, ge=1)
+    graph_max_jobs: int = Field(default=4, ge=1)
+    ingest_max_jobs: int = Field(default=3, ge=1)
     # Override the global ThreadPoolExecutor used by asyncio.to_thread (batch-get,
     # code-graph reads). 0 = use Python default (min(32, cpu+4)); >0 sets explicit
     # size. The stdlib default silently caps concurrent to_thread calls, which

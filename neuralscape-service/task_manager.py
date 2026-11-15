@@ -167,18 +167,20 @@ class TaskManager:
 
         Uses a deterministic job ID based on content hash to prevent
         duplicate enqueues of the same conversation. ``occurred_at`` (event
-        time, for historical ingestion of old chat exports) is part of the
-        key when present — the same transcript imported with a different
-        event time is a distinct job, not a duplicate; the plain path's job
-        ids are unchanged.
+        time, for historical ingestion of old chat exports), ``project_id``,
+        ``agent_id`` and ``run_id`` are part of the key: the same text sent to
+        another project, agent or run (or imported with another event time)
+        is a distinct job, not a duplicate. A retry of the identical request
+        still derives the identical id.
         """
         # Generate deterministic job ID from message content
         content_str = "|".join(
             m.get("content", "") for m in messages
         )
-        key = f"store:{content_str}"
-        if occurred_at:
-            key = f"store:{occurred_at}:{content_str}"
+        key = (
+            f"store:{occurred_at or ''}:{_scope_key(project_id=project_id, agent_id=agent_id, run_id=run_id)}"
+            f":{content_str}"
+        )
         job_id = _generate_job_id(key, user_id)
 
         job = await self.pool.enqueue_job(
@@ -250,9 +252,34 @@ class TaskManager:
         must not coalesce onto one job id — that would let an override-on
         request silently absorb (and skip) an override-off request for the
         same content, or vice versa.
+
+        Everything else that changes what is stored is in the key too
+        (category, tags, agent, run, and the v2 / provenance fields), so two
+        writes of the same text that differ in any of them are distinct jobs.
+        Tags are compared as a set. A retry of the identical request derives
+        the identical id.
         """
+        options = _scope_key(
+            category=category,
+            tags=sorted(set(tags)) if tags else None,
+            agent_id=agent_id,
+            run_id=run_id,
+            domain=domain,
+            observation_type=observation_type,
+            concepts=sorted(set(concepts)) if concepts else None,
+            source_type=source_type,
+            related_memory_ids=sorted(set(related_memory_ids)) if related_memory_ids else None,
+            confidence=confidence,
+            expires_at=expires_at,
+            occurred_at=occurred_at,
+            derived_from=sorted(set(derived_from)) if derived_from else None,
+            epistemic_level=epistemic_level,
+            memory_kind=memory_kind,
+            source_ref=source_ref,
+        )
         job_id = _generate_job_id(
-            f"raw:{visibility}:{scope}:{project_id}:{sensitivity_override}:{content}", user_id
+            f"raw:{visibility}:{scope}:{project_id}:{sensitivity_override}:{options}:{content}",
+            user_id,
         )
 
         v2_extras = {
@@ -731,6 +758,20 @@ def connector_sync_job_id(
         "\x1f".join([owner_user_id or "", generation or ""]).encode()
     ).hexdigest()[:16]
     return f"sync-{connector_id}-{instance}"
+
+
+def _scope_key(**fields) -> str:
+    """Canonical, order-independent text for the optional fields of a job key.
+
+    Unset (None) fields are omitted so a request that leaves them out derives
+    the same text whichever way the caller spelled "not given".
+    """
+    return json.dumps(
+        {k: v for k, v in fields.items() if v is not None},
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
 
 
 def _generate_job_id(content: str, user_id: str) -> str:
