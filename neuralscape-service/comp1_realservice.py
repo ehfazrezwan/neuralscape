@@ -24,8 +24,44 @@ import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
+
+
+DISPOSABLE_PREFIX = "comp1-"
+_LOOPBACK = {"127.0.0.1", "::1", "localhost"}
+
+
+class UnsafeTarget(Exception):
+    """A compose project or address the harness must never touch."""
+
+
+def check_project(project: str | None) -> str:
+    """The project name when it is a disposable one; otherwise refuse before any docker call.
+
+    The production project is never a valid target, and only names with the harness's own
+    disposable prefix are accepted, so a typo cannot stop or write into a long-lived stack.
+    """
+
+    name = (project or "").strip()
+    if not name:
+        raise UnsafeTarget("the compose project name is empty")
+    if name.lower() == "neuralscape":
+        raise UnsafeTarget("the compose project 'neuralscape' is the production project: refused")
+    if not name.startswith(DISPOSABLE_PREFIX):
+        raise UnsafeTarget(f"the compose project must start with {DISPOSABLE_PREFIX!r} (a disposable stack): {name!r}")
+    return name
+
+
+def check_loopback(address: str) -> str:
+    """The address when its host is loopback; otherwise refuse before any connection."""
+
+    text = str(address)
+    host = urllib.parse.urlsplit(text if "://" in text else "//" + text).hostname
+    if host not in _LOOPBACK:
+        raise UnsafeTarget(f"the harness only connects to loopback addresses, not {host!r}")
+    return text
 
 
 def _free_port() -> int:
@@ -35,6 +71,7 @@ def _free_port() -> int:
 
 
 def _compose(project: str, file: str, *args: str) -> str:
+    check_project(project)
     done = subprocess.run(
         ["docker", "compose", "-p", project, "-f", file, *args],
         capture_output=True, text=True, check=True, timeout=180,
@@ -52,6 +89,7 @@ _TOKENS: dict[str, str] = {}  # user id -> bearer token (governed profile only)
 def _call(
     base: str, method: str, path: str, body: dict | None = None, headers: dict | None = None
 ) -> tuple[int, dict]:
+    check_loopback(base)
     data = None if body is None else json.dumps(body).encode()
     headers = {"content-type": "application/json", **(headers or {})}
     user = (body or {}).get("user_id") or ("comp1-reader" if "comp1-reader" in path else None)
@@ -70,6 +108,7 @@ def _call(
 
 def _start_api(service_dir: Path, env: dict[str, str]) -> tuple[subprocess.Popen, str]:
     port = _free_port()
+    check_loopback("127.0.0.1")
     python = service_dir / ".venv" / "bin" / "python"
     interpreter = str(python) if python.exists() else sys.executable  # a tree without its own environment
     process = subprocess.Popen(
@@ -189,7 +228,11 @@ def main() -> int:
     if args.tokens:
         _TOKENS.update(json.loads(Path(args.tokens).read_text()))
     service_dir = Path(args.service_dir).resolve()
-    project, file = args.compose_project, args.compose_file
+    try:
+        project, file = check_project(args.compose_project), args.compose_file
+    except UnsafeTarget as refusal:
+        print(f"error: {refusal}", file=sys.stderr)
+        return 2
     env = {k: v for k, v in os.environ.items() if not k.startswith(("NEURALSCAPE_", "NS_", "GOOGLE_"))}
     env.update({
         "NEO4J_URI": "bolt://" + _port(project, file, "neo4j", 7687),
@@ -200,6 +243,12 @@ def main() -> int:
         "QDRANT_COLLECTION": "comp1",
     })
     env.update(dict(item.split("=", 1) for item in args.extra_env))
+    try:
+        for name in ("NEO4J_URI", "REDIS_URL", "QDRANT_URL"):
+            check_loopback(env[name])
+    except UnsafeTarget as refusal:
+        print(f"error: {refusal}", file=sys.stderr)
+        return 2
     out: dict[str, dict] = {}
     process, base = _start_api(service_dir, env)
     try:

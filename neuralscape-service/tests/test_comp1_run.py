@@ -324,8 +324,8 @@ def test_a_damaged_evidence_file_is_reported_in_the_comparison(tmp_path: Path) -
     ("extra", "message"),
     [
         (["--candidate-env", "NOEQUALS"], "KEY=VALUE"),
-        (["--compose-project-candidate", "p"], "--compose-file is required"),
-        (["--compose-project-baseline", "p"], "--compose-file is required"),
+        (["--compose-project-candidate", "comp1-p"], "--compose-file is required"),
+        (["--compose-project-baseline", "comp1-p"], "--compose-file is required"),
     ],
 )
 def test_bad_arguments_are_refused_before_anything_runs(tmp_path: Path, capsys, extra, message) -> None:
@@ -419,15 +419,15 @@ def _realservice_run(tmp_path: Path, monkeypatch, candidate_observation: dict) -
 
     def fake(tree, project, compose_file, extra=None):
         calls.append((project, compose_file, extra))
-        return _canned("baseline") if project == "pb" else candidate_observation
+        return _canned("baseline") if project == "comp1-b" else candidate_observation
 
     monkeypatch.setattr(comp1_run, "realservice", fake)
     monkeypatch.setattr(comp1_run.persona_evidence, "run", lambda *a, **k: [])
     monkeypatch.setattr(comp1_run, "surface", lambda tree: {})
     monkeypatch.setattr(comp1_run, "run_reproductions", lambda *a, **k: ({}, ""))
-    assert _cli(tmp_path, tmp_path, tmp_path, "--compose-project-baseline", "pb", "--compose-project-candidate", "pc",
+    assert _cli(tmp_path, tmp_path, tmp_path, "--compose-project-baseline", "comp1-b", "--compose-project-candidate", "comp1-c",
                 "--compose-file", "compose.yml", "--candidate-realservice-args", "--write-visibility private") == 0
-    assert calls == [("pb", "compose.yml", []), ("pc", "compose.yml", ["--write-visibility", "private"])]
+    assert calls == [("comp1-b", "compose.yml", []), ("comp1-c", "compose.yml", ["--write-visibility", "private"])]
     assert json.loads((tmp_path / "out" / "realservice-baseline.json").read_text()) == _canned("baseline")
     return _records(tmp_path)
 
@@ -535,14 +535,14 @@ def test_job_key_observations_show_coalescing_and_its_absence(monkeypatch) -> No
     import comp1_realservice
 
     monkeypatch.setattr(comp1_realservice, "_call", _fake_api(coalesce_project=True))
-    coalescing = comp1_realservice.job_keys("http://x")
+    coalescing = comp1_realservice.job_keys("http://127.0.0.1:1")
     assert coalescing["store_other_project_other_task"] == "false"
     assert coalescing["store_other_agent_other_task"] == "false"
     assert coalescing["store_same_inputs_same_task"] == "true"
     assert coalescing["store_other_user_other_task"] == "true"
     assert coalescing["store_accepted"] == "true"
     monkeypatch.setattr(comp1_realservice, "_call", _fake_api(coalesce_project=False))
-    separate = comp1_realservice.job_keys("http://x")
+    separate = comp1_realservice.job_keys("http://127.0.0.1:1")
     assert separate["store_other_project_other_task"] == "true"
     assert separate["raw_other_category_other_task"] == "true"
     assert separate["raw_other_tags_other_task"] == "true"
@@ -552,7 +552,7 @@ def test_a_refused_write_is_reported_as_its_status_token(monkeypatch) -> None:
     import comp1_realservice
 
     monkeypatch.setattr(comp1_realservice, "_call", lambda *a, **k: (403, {}))
-    seen = comp1_realservice.job_keys("http://x")
+    seen = comp1_realservice.job_keys("http://127.0.0.1:1")
     assert seen["store_accepted"] == "http-403" and seen["raw_accepted"] == "http-403"
 
 
@@ -565,7 +565,7 @@ def test_idempotency_retry_observation(monkeypatch) -> None:
         return 202, {"task_id": "t1"}
 
     monkeypatch.setattr(comp1_realservice, "_call", call)
-    assert comp1_realservice.idempotency_retry("http://x") == {
+    assert comp1_realservice.idempotency_retry("http://127.0.0.1:1") == {
         "first_http": "202", "retry_same_task": "true", "retry_http": "202", "changed_payload_same_key_http": "409",
     }
 
@@ -580,7 +580,7 @@ def test_readiness_stops_and_restarts_the_vector_store_even_when_the_probe_fails
                    (503, {"status": "degraded", "checks": {"vector_store": "error"}})])
     monkeypatch.setattr(comp1_realservice, "_call", lambda base, method, path, *a, **k: (
         (200, {}) if "memories" in path else next(health)))
-    assert comp1_realservice.readiness("http://x", "p", "f.yml") == {
+    assert comp1_realservice.readiness("http://127.0.0.1:1", "p", "f.yml") == {
         "stores_up_status_ok": "true", "stores_up_vector_store_ok": "true",
         "stopped_status_ok": "false", "stopped_vector_store_ok": "false",
     }
@@ -594,7 +594,7 @@ def test_readiness_stops_and_restarts_the_vector_store_even_when_the_probe_fails
 
     monkeypatch.setattr(comp1_realservice, "_call", broken)
     with pytest.raises(OSError):
-        comp1_realservice.readiness("http://x", "p", "f.yml")
+        comp1_realservice.readiness("http://127.0.0.1:1", "p", "f.yml")
     assert steps == [("stop", "qdrant"), ("start", "qdrant")]
 
 
@@ -631,7 +631,7 @@ def test_the_real_service_main_prints_one_json_object_and_stops_the_api(tmp_path
     monkeypatch.setattr(comp1_realservice, "_FIXED_WRITE_FIELDS", {})
     monkeypatch.setattr(comp1_realservice, "_TOKENS", {})
     monkeypatch.setattr(comp1_realservice.sys, "argv", [
-        "x", "--service-dir", str(tmp_path), "--compose-project", "p", "--compose-file", "f.yml",
+        "x", "--service-dir", str(tmp_path), "--compose-project", "comp1-p", "--compose-file", "f.yml",
         "--extra-env", "A=b", "--tokens", str(tokens), "--write-visibility", "private"])
     assert comp1_realservice.main() == 0
     printed = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
@@ -674,12 +674,12 @@ def test_the_http_helper_sends_a_bearer_token_for_a_known_user_and_reads_error_b
 
     monkeypatch.setattr(comp1_realservice.urllib.request, "urlopen", fake_open)
     monkeypatch.setattr(comp1_realservice, "_TOKENS", {"alice": "tok"})
-    assert comp1_realservice._call("http://h", "POST", "/ok", {"user_id": "alice"}) == (200, {"ok": True})
+    assert comp1_realservice._call("http://127.0.0.1:2", "POST", "/ok", {"user_id": "alice"}) == (200, {"ok": True})
     assert sent[0].get_header("Authorization") == "Bearer tok"
-    assert comp1_realservice._call("http://h", "GET", "/ok", None)[0] == 200
+    assert comp1_realservice._call("http://127.0.0.1:2", "GET", "/ok", None)[0] == 200
     assert sent[1].get_header("Authorization") is None
-    assert comp1_realservice._call("http://h", "GET", "/bad") == (400, {})
-    assert comp1_realservice._call("http://h", "GET", "/refused") == (403, {"detail": "no"})
+    assert comp1_realservice._call("http://127.0.0.1:2", "GET", "/bad") == (400, {})
+    assert comp1_realservice._call("http://127.0.0.1:2", "GET", "/refused") == (403, {"detail": "no"})
 
 
 def test_a_free_loopback_port_is_returned() -> None:
@@ -756,13 +756,13 @@ def test_rejected_changed_scope_writes_are_not_scored_as_different_tasks(monkeyp
         return 202, {"task_id": "t-fixed"}
 
     monkeypatch.setattr(comp1_realservice, "_call", call)
-    seen = comp1_realservice.job_keys("http://x")
+    seen = comp1_realservice.job_keys("http://127.0.0.1:1")
     for fact in ("store_other_user_other_task", "store_other_project_other_task", "store_other_agent_other_task",
                  "raw_other_project_other_task", "raw_other_category_other_task", "raw_other_tags_other_task"):
         assert seen[fact] == "http-403", fact  # differs from the oracle's "true": judged unexpected_failure
     assert seen["store_same_inputs_same_task"] == "true" and seen["store_accepted"] == "true"
     monkeypatch.setattr(comp1_realservice, "_call", lambda *a, **k: (403, {}))
-    assert comp1_realservice.job_keys("http://x")["store_same_inputs_same_task"] == "http-403"
+    assert comp1_realservice.job_keys("http://127.0.0.1:1")["store_same_inputs_same_task"] == "http-403"
 
 
 def test_relative_command_line_paths_work_after_the_children_change_directory(tmp_path: Path, monkeypatch) -> None:
@@ -824,3 +824,96 @@ def test_the_live_probe_uses_the_trees_interpreter_or_falls_back(tmp_path: Path,
     (tmp_path / ".venv" / "bin" / "python").write_text("")
     comp1_realservice._start_api(tmp_path, {})
     assert launched[-1] == str(tmp_path / ".venv" / "bin" / "python")
+
+
+# ── the target guard: only disposable projects and loopback addresses, refused before any docker or HTTP call ──
+
+
+@pytest.fixture
+def no_calls(monkeypatch):
+    """Docker and HTTP stubbed to fail the test if reached."""
+    import comp1_realservice
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("a docker or HTTP call was made")
+
+    monkeypatch.setattr(comp1_realservice.subprocess, "run", forbidden)
+    monkeypatch.setattr(comp1_realservice.subprocess, "Popen", forbidden)
+    monkeypatch.setattr(comp1_realservice.urllib.request, "urlopen", forbidden)
+    return comp1_realservice
+
+
+@pytest.mark.parametrize("project", ["neuralscape", "NeuralScape", " neuralscape ", "", "   ", None, "nscampaign", "prod-comp1-x"])
+def test_the_guard_refuses_the_production_project_an_empty_name_and_a_missing_prefix(no_calls, project) -> None:
+    with pytest.raises(no_calls.UnsafeTarget):
+        no_calls.check_project(project)
+    with pytest.raises(no_calls.UnsafeTarget):
+        no_calls._compose(project or "", "f.yml", "stop", "qdrant")  # refused before docker is spawned
+
+
+@pytest.mark.parametrize("address", ["http://10.0.0.5:6333", "bolt://example.com:7687", "redis://0.0.0.0:6379", "192.168.1.2:80", "http://[2001:db8::1]:80"])
+def test_the_guard_refuses_a_non_loopback_host(no_calls, address) -> None:
+    with pytest.raises(no_calls.UnsafeTarget):
+        no_calls.check_loopback(address)
+    with pytest.raises(no_calls.UnsafeTarget):
+        no_calls._call(address if "://" in address else "http://" + address, "GET", "/health")  # refused before the request
+
+
+@pytest.mark.parametrize("address", ["http://127.0.0.1:6333", "redis://localhost:6379", "bolt://[::1]:7687", "127.0.0.1:8080"])
+def test_the_guard_accepts_loopback(no_calls, address) -> None:
+    assert no_calls.check_loopback(address) == address
+    assert no_calls.check_project("comp1-run-1") == "comp1-run-1"
+
+
+def test_a_valid_disposable_project_reaches_docker(monkeypatch) -> None:
+    import comp1_realservice
+
+    seen = []
+
+    class Done:
+        stdout = "ok\n"
+
+    monkeypatch.setattr(comp1_realservice.subprocess, "run", lambda cmd, **k: seen.append(cmd) or Done())
+    assert comp1_realservice._compose("comp1-x", "f.yml", "ps") == "ok"
+    assert seen[0][:4] == ["docker", "compose", "-p", "comp1-x"]
+
+
+def test_the_real_service_main_refuses_an_unsafe_project_and_a_remote_store(no_calls, tmp_path: Path, monkeypatch, capsys) -> None:
+    base = ["x", "--service-dir", str(tmp_path), "--compose-file", "f.yml"]
+    monkeypatch.setattr(no_calls.sys, "argv", [*base, "--compose-project", "neuralscape"])
+    assert no_calls.main() == 2 and "production project" in capsys.readouterr().err
+    # a disposable project whose compose ports resolve to a remote address: refused before the API starts
+    monkeypatch.setattr(no_calls, "_port", lambda project, file, service, inner: f"10.1.2.3:{inner}")
+    monkeypatch.setattr(no_calls.sys, "argv", [*base, "--compose-project", "comp1-ok"])
+    assert no_calls.main() == 2 and "loopback" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("flag", ["--compose-project-baseline", "--compose-project-candidate"])
+@pytest.mark.parametrize("name", ["neuralscape", "NEURALSCAPE", "other", ""])
+def test_the_runner_refuses_an_unsafe_project_before_running_anything(tmp_path: Path, capsys, monkeypatch, flag, name) -> None:
+    monkeypatch.setattr(comp1_run.subprocess, "run", lambda *a, **k: pytest.fail("a child was started"))
+    assert _cli(tmp_path, _tree(tmp_path, "b", False), _tree(tmp_path, "c", True), flag, name, "--compose-file", "f.yml") == 2
+    assert "error:" in capsys.readouterr().err
+    assert not (tmp_path / "out").exists()
+
+
+# ── --fail-on-unexpected ──
+
+
+def test_the_exit_status_is_zero_by_default_and_one_on_request_when_a_failure_is_unexpected(tmp_path: Path) -> None:
+    baseline, candidate = _tree(tmp_path, "b", fixed=False), _tree(tmp_path, "c", fixed=False, control="broken")
+    inputs = _inputs(tmp_path)
+    assert _cli(tmp_path, baseline, candidate, inputs=inputs) == 0  # default: unchanged
+    assert _cli(tmp_path, baseline, candidate, "--fail-on-unexpected", inputs=inputs) == 1
+
+
+def test_the_flag_exits_zero_when_nothing_unexpected_was_recorded(tmp_path: Path, monkeypatch) -> None:
+    def outcomes(tree, inputs, junit, env=None):
+        candidate = Path(junit).name.endswith("candidate.xml")
+        return {"test_defect": "xpassed" if candidate else "xfailed", "test_control": "passed", "test_static": "passed"}, ""
+
+    monkeypatch.setattr(comp1_run, "run_reproductions", outcomes)
+    monkeypatch.setattr(comp1_run.persona_evidence, "run", lambda *a, **k: [])
+    monkeypatch.setattr(comp1_run, "surface", lambda tree: {})
+    assert _cli(tmp_path, tmp_path, tmp_path, "--fail-on-unexpected") == 0
+    assert "unexpected_failure" not in (tmp_path / "out" / "evidence.jsonl").read_text()

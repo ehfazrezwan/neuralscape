@@ -20,7 +20,12 @@ Per tree it records, through the append-only ``EvidenceWriter``:
   but cannot be observed without a live provider;
 * a surface inventory (REST routes, MCP tools, default-off flags) written beside the evidence.
 
-It computes no pass percentage.  Partial and invalid attempts are kept as records.
+It computes no pass percentage.  The exit status is 0 whatever the verdicts (they are in the evidence file);
+``--fail-on-unexpected`` (off by default) makes it 1 when this run recorded an ``unexpected_failure``.  A usage
+problem, an oracle or identity refusal, or a compose project that is not disposable exits 2.
+
+Compose projects must start with the disposable prefix ``comp1-`` and never be the production project; every
+address the real-service probe connects to must be loopback.  Both are refused before any docker or HTTP call.  Partial and invalid attempts are kept as records.
 """
 
 from __future__ import annotations
@@ -36,6 +41,7 @@ import sys
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
+import comp1_realservice
 import persona_evidence
 from evidence_records import EvidenceRecord, EvidenceWriter, RecordConflict, UnsafePath, compare, facts, render_report
 
@@ -271,7 +277,7 @@ def surface(tree: Path) -> dict:
 # ------------------------------------------------------------------ runner
 
 
-def run(args: argparse.Namespace) -> None:
+def run(args: argparse.Namespace) -> list[EvidenceRecord]:
     inputs, out = Path(args.inputs).resolve(), Path(args.out).resolve()  # children run in other directories
     out.mkdir(parents=True, exist_ok=True)
     registry = load_registry(inputs)
@@ -339,6 +345,7 @@ def run(args: argparse.Namespace) -> None:
         notes.append("- this comparison is built from the valid records only and is incomplete")
         text = text.rstrip("\n") + "\n" + "\n".join(notes) + "\n"
     (out / "comparison.md").write_text(text)
+    return [record for record in read.records if record.run_id == args.run_id]
 
 
 def realservice(tree: Path, project: str, compose_file: str, extra: list[str] | None = None) -> dict:
@@ -366,6 +373,8 @@ def main(argv: list[str] | None = None) -> int:
     runner.add_argument("--compose-project-baseline")
     runner.add_argument("--compose-project-candidate")
     runner.add_argument("--compose-file")
+    runner.add_argument("--fail-on-unexpected", action="store_true",
+                        help="exit 1 when this run recorded an unexpected_failure (default: exit 0)")
     runner.add_argument("--profile", default="default", choices=["default", "governed"])
     runner.add_argument("--candidate-env", action="append", default=[], help="KEY=VALUE for the candidate")
     runner.add_argument("--candidate-realservice-args", default="", help="extra probe arguments for the candidate")
@@ -375,10 +384,12 @@ def main(argv: list[str] | None = None) -> int:
         print(f"error: {problem}", file=sys.stderr)
         return 2
     try:
-        run(args)
+        records = run(args)
     except (persona_evidence.RunIdentityConflict, persona_evidence.OracleError, RecordConflict, UnsafePath) as refusal:
         print(f"error: {type(refusal).__name__}: {refusal}", file=sys.stderr)
         return 2
+    if args.fail_on_unexpected and any(record.verdict == "unexpected_failure" for record in records):
+        return 1
     return 0
 
 
@@ -392,6 +403,12 @@ def _check(args: argparse.Namespace) -> str:
     for name in ("baseline", "candidate"):
         if not Path(getattr(args, name)).is_dir():
             return f"--{name} is not a directory: {getattr(args, name)}"
+    for project in (args.compose_project_baseline, args.compose_project_candidate):
+        if project is not None:
+            try:
+                comp1_realservice.check_project(project)
+            except comp1_realservice.UnsafeTarget as refusal:
+                return str(refusal)
     for item in args.candidate_env:
         if "=" not in item:
             return f"--candidate-env needs KEY=VALUE, got {item!r}"
