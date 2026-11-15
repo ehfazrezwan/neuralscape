@@ -191,6 +191,29 @@ def test_extract_fqns_hits_take_precedence_over_content():
     assert fqns == ["click.core.Command"]
 
 
+def _stored_point(point_id, data, anchor_key, *, owner, visibility, category, created_at="2026-01-01T00:00:00Z"):
+    """Qdrant point shaped exactly like memory/write.py stores it (see the
+    `payload = {...}` / `metadata = {...}` construction there): top-level
+    payload has data/created_at/user_id; metadata holds owner_user_id,
+    visibility, category, source_ref. The point id is the memory id (the payload
+    carries no "id") and metadata never contains "user_id".
+    """
+    return MagicMock(
+        id=point_id,
+        payload={
+            "data": data,
+            "created_at": created_at,
+            "user_id": owner,
+            "metadata": {
+                "owner_user_id": owner,
+                "visibility": visibility,
+                "category": category,
+                "source_ref": {"external_id": anchor_key},
+            },
+        },
+    )
+
+
 def test_batched_anchor_lookup_single_query():
     """CRITICAL: batched anchor join must be ONE Qdrant query, not N."""
     from memory_service import get_shared_service
@@ -207,28 +230,10 @@ def test_batched_anchor_lookup_single_query():
         # Mock query_points to return some results
         mock_result = MagicMock()
         mock_result.points = [
-            MagicMock(
-                payload={
-                    "id": "mem1",
-                    "data": "Test memory 1",
-                    "metadata": {
-                        "source_ref": {"external_id": "click::click.core.CommandCollection"},
-                        "category": "decision",
-                        "visibility": "shared",
-                    },
-                }
-            ),
-            MagicMock(
-                payload={
-                    "id": "mem2",
-                    "data": "Test memory 2",
-                    "metadata": {
-                        "source_ref": {"external_id": "click::click.core.BaseCommand"},
-                        "category": "gotcha",
-                        "visibility": "shared",
-                    },
-                }
-            ),
+            _stored_point("mem1", "Test memory 1", "click::click.core.CommandCollection",
+                          owner="alice", visibility="shared", category="decision"),
+            _stored_point("mem2", "Test memory 2", "click::click.core.BaseCommand",
+                          owner="alice", visibility="shared", category="gotcha"),
         ]
         # GF2: batched_anchor_lookup now uses scroll (filter-only) → (points, offset)
         mock_client.scroll.return_value = (mock_result.points, None)
@@ -280,54 +285,15 @@ def test_batched_anchor_lookup_visibility_preserved():
         # Mock results: shared, private (same user), private (different user), standard
         mock_result = MagicMock()
         mock_result.points = [
-            MagicMock(
-                payload={
-                    "id": "mem_shared",
-                    "data": "Shared memory",
-                    "metadata": {
-                        "source_ref": {"external_id": "repo::Foo"},
-                        "category": "decision",
-                        "visibility": "shared",
-                        "user_id": "other_user",
-                    },
-                }
-            ),
-            MagicMock(
-                payload={
-                    "id": "mem_private_same",
-                    "data": "Private same user",
-                    "metadata": {
-                        "source_ref": {"external_id": "repo::Foo"},
-                        "category": "preference",
-                        "visibility": "private",
-                        "user_id": "test_user",
-                    },
-                }
-            ),
-            MagicMock(
-                payload={
-                    "id": "mem_private_other",
-                    "data": "Private other user",
-                    "metadata": {
-                        "source_ref": {"external_id": "repo::Foo"},
-                        "category": "preference",
-                        "visibility": "private",
-                        "user_id": "other_user",
-                    },
-                }
-            ),
-            MagicMock(
-                payload={
-                    "id": "mem_standard",
-                    "data": "Standard memory",
-                    "metadata": {
-                        "source_ref": {"external_id": "repo::Foo"},
-                        "category": "convention",
-                        "visibility": "standard",
-                        "user_id": "dictator",
-                    },
-                }
-            ),
+            _stored_point("mem_shared", "Shared memory", "repo::Foo",
+                          owner="other_user", visibility="shared", category="decision"),
+            _stored_point("mem_private_same", "Private same user", "repo::Foo",
+                          owner="test_user", visibility="private", category="preference",
+                          created_at="2026-02-02T00:00:00Z"),
+            _stored_point("mem_private_other", "Private other user", "repo::Foo",
+                          owner="other_user", visibility="private", category="preference"),
+            _stored_point("mem_standard", "Standard memory", "repo::Foo",
+                          owner="dictator", visibility="standard", category="convention"),
         ]
         mock_client.scroll.return_value = (mock_result.points, None)
 
@@ -349,6 +315,45 @@ def test_batched_anchor_lookup_visibility_preserved():
         assert "mem_private_same" in memory_ids  # caller's own private
         assert "mem_standard" in memory_ids  # standard visible to all
         assert "mem_private_other" not in memory_ids  # CRITICAL: other user's private NOT visible
+
+        # Returned dict fields come from the real storage locations:
+        # point id and top-level payload created_at.
+        own = next(m for m in memories if m["id"] == "mem_private_same")
+        assert own["created_at"] == "2026-02-02T00:00:00Z"
+        assert own["content"] == "Private same user"
+        assert own["category"] == "preference"
+
+
+def test_batched_anchor_lookup_private_owner_from_write_path_shape():
+    """Regression: the owner is metadata.owner_user_id / payload.user_id, never
+    metadata.user_id. A caller's own private anchored memory is returned; another
+    user's private one is not."""
+    with patch("memory_service.get_shared_service") as mock_service:
+        mock_m = MagicMock()
+        mock_service.return_value._get_memory.return_value = mock_m
+        points = [
+            _stored_point("mem_mine", "Mine", "repo::Foo",
+                          owner="alice", visibility="private", category="gotcha",
+                          created_at="2026-03-03T00:00:00Z"),
+            _stored_point("mem_theirs", "Theirs", "repo::Foo",
+                          owner="bob", visibility="private", category="gotcha"),
+        ]
+        mock_m.vector_store.client.scroll.return_value = (points, None)
+
+        result = batched_anchor_lookup(
+            fqns=["Foo"], repo="repo", to_canonical_fn=lambda x: x,
+            user_id="alice", limit_per_anchor=10,
+        )
+
+        got = {m["id"]: m for m in result["Foo"]}
+        assert set(got) == {"mem_mine"}
+        assert got["mem_mine"]["created_at"] == "2026-03-03T00:00:00Z"
+
+        # Anonymous caller never sees private memories.
+        anon = batched_anchor_lookup(
+            fqns=["Foo"], repo="repo", to_canonical_fn=lambda x: x, user_id=None,
+        )
+        assert anon == {}
 
 
 def test_batched_anchor_lookup_empty_fqns():
@@ -411,3 +416,72 @@ def test_fusion_transport_uniformity():
     # Only the system_name attribution differs
     assert "(code-native)" in result_in_process
     assert "(code-cbm)" in result_http
+
+
+def _qdrant_match(cond, payload):
+    """Minimal evaluator for the qdrant Filter/FieldCondition subset used by
+    batched_anchor_lookup (must / should / must_not, MatchAny, MatchValue)."""
+    from qdrant_client.models import Filter
+
+    def get(key):
+        cur = payload
+        for part in key.split("."):
+            if not isinstance(cur, dict) or part not in cur:
+                return None
+            cur = cur[part]
+        return cur
+
+    if isinstance(cond, Filter):
+        ok = all(_qdrant_match(c, payload) for c in (cond.must or []))
+        if cond.should:
+            ok = ok and any(_qdrant_match(c, payload) for c in cond.should)
+        return ok and not any(_qdrant_match(c, payload) for c in (cond.must_not or []))
+    val = get(cond.key)
+    if hasattr(cond.match, "any"):
+        return val in cond.match.any
+    return val == cond.match.value
+
+
+def test_batched_anchor_lookup_pushes_readability_into_scroll_filter():
+    """Regression: many other-user private rows on the same anchor must not
+    consume the scroll limit and cut the caller's own rows. The filter sent to
+    Qdrant carries the readability predicate (and the tombstone exclusion)."""
+    with patch("memory_service.get_shared_service") as mock_service:
+        mock_m = MagicMock()
+        mock_service.return_value._get_memory.return_value = mock_m
+        others = [
+            _stored_point(f"other{i}", "x", "repo::Foo", owner="bob",
+                          visibility="private", category="gotcha")
+            for i in range(50)
+        ]
+        mine = _stored_point("mine", "Mine", "repo::Foo", owner="alice",
+                             visibility="private", category="gotcha")
+        legacy_mine = _stored_point("legacy", "Legacy", "repo::Foo", owner="alice",
+                                    visibility="private", category="gotcha")
+        del legacy_mine.payload["metadata"]["owner_user_id"]  # only top-level user_id
+        shared = _stored_point("shared", "Shared", "repo::Foo", owner="bob",
+                               visibility="shared", category="gotcha")
+        tomb = _stored_point("tomb", "Tomb", "repo::Foo", owner="alice",
+                             visibility="private", category="gotcha")
+        tomb.payload["metadata"]["dream_tombstoned"] = True
+        store = others + [mine, legacy_mine, shared, tomb]  # others come first
+
+        def scroll(**kw):
+            hits = [p for p in store if _qdrant_match(kw["scroll_filter"], p.payload)]
+            return (hits[: kw["limit"]], None)
+
+        mock_m.vector_store.client.scroll.side_effect = scroll
+
+        result = batched_anchor_lookup(
+            fqns=["Foo"], repo="repo", to_canonical_fn=lambda x: x,
+            user_id="alice", limit_per_anchor=2,
+        )
+        assert {m["id"] for m in result["Foo"]} <= {"mine", "legacy", "shared"}
+        assert len(result["Foo"]) == 2  # capped per anchor, from caller-readable rows
+        assert not any(m["id"].startswith("other") or m["id"] == "tomb" for m in result["Foo"])
+
+        anon = batched_anchor_lookup(
+            fqns=["Foo"], repo="repo", to_canonical_fn=lambda x: x,
+            user_id=None, limit_per_anchor=5,
+        )
+        assert [m["id"] for m in anon["Foo"]] == ["shared"]
