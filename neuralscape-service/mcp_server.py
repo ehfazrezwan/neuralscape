@@ -195,7 +195,10 @@ async def list_tools() -> list[Tool]:
                 "OUTPUT FORMAT (M5 hardening): Normal recall returns a JSON array of memory objects. "
                 "When code fusion is enabled (project with coding query), returns a stable JSON envelope: "
                 "{fused: true, sections: {structure: {...}, semantics: {...}, memories: [...]}, ...}. "
-                "This stable envelope ensures clients never receive a surprise type flip."
+                "This stable envelope ensures clients never receive a surprise type flip. "
+                "Reference material ingested with a non-default adapter (e.g. trading_strategy) is "
+                "stored in a 'ref-<adapter>[--<title>]' workspace and is returned only when you pass "
+                "workspaces=[\"ref-...\"]."
             ),
             inputSchema={
                 "type": "object",
@@ -248,6 +251,19 @@ async def list_tools() -> list[Tool]:
                             "glyph, age, tokens, score}) instead of full payloads — "
                             "~50-100 tokens per hit. Filter these, then call "
                             "get_memories(ids=[...]) for the few you need. Default: false."
+                        ),
+                    },
+                    "workspaces": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "minItems": 1,
+                        "maxItems": 10,
+                        "description": (
+                            "Workspaces to search, e.g. [\"ref-trading_strategy\"]. Default (omit): "
+                            "the memory workspace only. Content ingested with a non-default "
+                            "adapter is stored in 'ref-<adapter>[--<title-slug>]' and is NOT "
+                            "returned unless you name that workspace here (add \"memory\" to "
+                            "search both)."
                         ),
                     },
                     "knowledge_system": {
@@ -1478,6 +1494,12 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
 
     try:
         if name == "recall_memories":
+            try:
+                from schemas import validate_workspace_names
+
+                _workspaces = validate_workspace_names(arguments.get("workspaces"))
+            except ValueError as ve:
+                return [TextContent(type="text", text=json.dumps({"error": str(ve)}))]
             # Phase E: fusion — when the router says code leg is warranted, execute
             # it concurrently with base legs and compose sections.
             from knowledge.router import resolve_systems
@@ -1520,6 +1542,7 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
                     limit=arguments.get("limit", 10),
                     visibility=arguments.get("visibility"),
                     include_shared=arguments.get("include_shared", True),
+                    workspaces=_workspaces,
                 )
 
             # Phase E/F: resolve ALL healthy code system(s) the ROUTER decided

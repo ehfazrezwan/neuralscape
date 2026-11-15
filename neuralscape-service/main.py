@@ -1996,6 +1996,7 @@ async def v1_search_memories(req: SearchMemoryRequest, request: Request):
             memory_kind=req.memory_kind,
             visibility=req.visibility.value if req.visibility else None,
             include_shared=req.include_shared,
+            workspaces=req.workspaces,
         )
         if req.index_only:
             response = SearchIndexResponse(
