@@ -177,16 +177,54 @@ Installing the plugin enables eight MCP tools backed by your Neuralscape service
 
 These are reachable from any MCP client that picks up your plugin's `.mcp.json`. The transport is Streamable HTTP at `<URL>/mcp/`; the API key (if set) is sent as a Bearer token.
 
+## Server endpoints the plugin calls
+
+Everything the plugin does against the service goes through the MCP tools above, except these REST calls. A test (`tests/server-endpoints.test.ts`) fails when this list and the code disagree, so adding or dropping a call means updating this section.
+
+### From the hooks (src/)
+
+| Call | Hook | Purpose |
+|---|---|---|
+| `GET /v1/context/{project_id}` | SessionStart | Project context (own + team-shared memories), newest first, `limit=200` |
+| `GET /v1/context/global` | SessionStart | Global context when no project resolves |
+| `GET /v1/extensions/dreaming/card` | SessionStart | Identity cards (optional; 404 is fine) |
+| `GET /v1/code-graph/query` | SessionStart | Probe: is a code graph available |
+| `GET /v1/memories` | PreToolUse (read gate) | File-memory lookup for the read gate |
+| `POST /v1/memories/raw` | PreCompact | Store the compact snapshot |
+| `POST /v1/checkpoint` | SessionEnd | Store the structured session note |
+| `POST /v1/extensions/conversation-compiler/flush` | Stop, PreCompact, framework adapter `message:sent` | Deliver a conversation turn |
+| `POST /v1/extensions/conversation-compiler/compile` | Stop, framework adapter `session:end` | Compile the day's turns |
+
+### From the skills (REST, via curl)
+
+Only where no MCP equivalent exists (or as the documented fallback), Claude Code only. `ns-status` also probes `GET /health`.
+
+| Call | Skill |
+|---|---|
+| `POST /v1/ingest/files` | `ingest` (binary uploads) |
+| `GET /v1/ingest/artifacts/{file_id}` | `ingest` (retrieve the stored original) |
+| `POST /v1/search` | `search` (fallback when MCP is absent) |
+| `POST /v1/extensions/conversation-compiler/flush` | `sync` |
+| `POST /v1/extensions/conversation-compiler/compile` | `sync` |
+
+Server routes and MCP tools the plugin does not call are served for other clients (REST/MCP integrations); the plugin not calling them is not a defect.
+
 ## OpenClaw integration (manual)
 
-OpenClaw doesn't share Claude Code's marketplace. Install the OpenClaw hook manifest at `~/.openclaw/hooks/neuralscape/`:
+The plugin's conversation capture also understands OpenClaw events. OpenClaw doesn't share Claude Code's marketplace, so this is a manual install.
 
 1. Build the plugin from source (see **Development** below).
-2. Copy `hooks/openclaw-hooks.json` and the `scripts/` directory into `~/.openclaw/hooks/neuralscape/`.
-3. Set `NEURALSCAPE_URL`, `NEURALSCAPE_USER_ID`, and (optional) `NEURALSCAPE_API_KEY` in OpenClaw's hook env.
-4. Restart OpenClaw — `message:sent` and `session:end` will start firing.
+2. Copy `hooks/openclaw-hooks.json` and the `scripts/` directory into `~/.openclaw/hooks/neuralscape/` (so the scripts sit at `~/.openclaw/hooks/neuralscape/scripts/`).
+3. Set `NEURALSCAPE_URL`, `NEURALSCAPE_USER_ID`, and (optional) `NEURALSCAPE_API_KEY` in OpenClaw's hook env. To file turns under a project, also set `NEURALSCAPE_PROJECT_ID` (see below).
+4. Register the three commands from the manifest with OpenClaw (`message:received`, `message:sent`, `session:end`).
 
-> **Note:** the OpenClaw hook manifest still uses `${PLUGIN_ROOT}` rather than `${CLAUDE_PLUGIN_ROOT}` because OpenClaw's expansion convention hasn't been confirmed against the Claude Code spec. If your OpenClaw build complains, swap to whichever variable it does export — the rest of the script is platform-agnostic.
+What the adapter does with the events:
+
+- `message:received` is remembered (the user's text), `message:sent` is the assistant's reply: the two are paired into one turn, because OpenClaw's documented `message:sent` context (`to`, `content`, `success`, `channelId`) carries no user message. A payload that does carry `userMessage` / `user_message` is used as is.
+- Project: the documented `message:sent` / `message:received` contexts carry no working directory, so turns are **global scope** unless you set the `PROJECT_ID` setting (`NEURALSCAPE_PROJECT_ID`), or the payload carries a `workspaceDir` / `cwd`, which is resolved like Claude Code's `cwd`.
+- `session:end` triggers the day's compile unless the payload reports fewer than 2 messages.
+
+**Unverified against a live OpenClaw.** From OpenClaw's public docs ([hooks](https://docs.openclaw.ai/automation/hooks.md), [event types](https://docs.openclaw.ai/automation/hooks/event-types.md), [writing hooks](https://docs.openclaw.ai/automation/hooks/writing-hooks.md)): internal hooks are described there as a directory with `HOOK.md` plus a JavaScript/TypeScript handler running in the gateway process, not as a JSON command manifest; the docs name no environment variable for a hook's install directory (so the manifest uses the absolute `$HOME/.openclaw/hooks/neuralscape/...` path instead of an unconfirmed `${PLUGIN_ROOT}`); and they list no `session:end` internal event (`session_end` is a typed plugin hook). The payload shapes above follow the documented event contexts; the command-manifest format and the `session:end` payload have not been confirmed on a running OpenClaw. If your build wants a `HOOK.md` handler, write a thin handler that spawns the same `scripts/*.js` with the event JSON on stdin.
 
 ## Configuration
 

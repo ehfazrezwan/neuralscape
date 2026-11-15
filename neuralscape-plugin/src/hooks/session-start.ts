@@ -245,9 +245,19 @@ export interface IndexModeInputs {
  * Standards stay a binding block outside the budget; the session note that
  * feeds "Previously…" is excluded from the index table (no double render).
  */
-export function buildIndexContext(inputs: IndexModeInputs): string {
-  const { context, cards, codeGraphAvailable, budgetTokens } = inputs;
-  const now = inputs.now ?? new Date();
+/**
+ * The blocks both modes share, in order: binding standards, identity cards,
+ * the resume-after-compaction block (compact/resume/fork only) and the
+ * "Previously…" block. Also returns the ids rendered so the caller keeps them
+ * out of its memory listing (no double render).
+ */
+function buildContinuitySections(inputs: IndexModeInputs, now: Date): {
+  sections: string[];
+  cardBlock: string;
+  resumeIds: Set<string>;
+  previouslyId: string | null;
+} {
+  const { context, cards } = inputs;
   const categories = context.categories || {};
 
   const sections: string[] = [];
@@ -260,7 +270,7 @@ export function buildIndexContext(inputs: IndexModeInputs): string {
 
   // Compact-resilience: after a compaction (or --resume), re-anchor the
   // session with the pre-compact snapshots the PreCompact hook stored.
-  // Rendered full-content here, excluded from the index table below.
+  // Rendered full-content here, excluded from the listing below.
   const resumeIds = new Set<string>();
   if (isResumeSource(inputs.source)) {
     const resume = renderResumeAfterCompact(categories, {
@@ -291,6 +301,38 @@ export function buildIndexContext(inputs: IndexModeInputs): string {
       }
     }
   }
+  return { sections, cardBlock, resumeIds, previouslyId };
+}
+
+/**
+ * CONTEXT_MODE=full: the same continuity blocks as index mode (standards,
+ * identity cards, "Resuming after compaction", "Previously…"), then the full
+ * text of the remaining memories under the legacy MAX_CHARS budget. The
+ * resume snapshot and the session note are rendered once, above, and left
+ * out of the listing.
+ */
+export function buildFullContext(inputs: IndexModeInputs): string {
+  const now = inputs.now ?? new Date();
+  const { sections, resumeIds, previouslyId } = buildContinuitySections(inputs, now);
+
+  const remaining: Record<string, NeuralscapeMemory[]> = {};
+  for (const [cat, mems] of Object.entries(inputs.context.categories || {})) {
+    const kept = (mems ?? []).filter((m) => m.id !== previouslyId && !resumeIds.has(m.id));
+    if (kept.length > 0) remaining[cat] = kept;
+  }
+  const formatted = formatMemories(remaining);
+  if (formatted) sections.push(formatted);
+
+  if (sections.length === 0) return "";
+  return sections.join("\n\n---\n\n");
+}
+
+export function buildIndexContext(inputs: IndexModeInputs): string {
+  const { context, codeGraphAvailable, budgetTokens } = inputs;
+  const now = inputs.now ?? new Date();
+  const categories = context.categories || {};
+
+  const { sections, cardBlock, resumeIds, previouslyId } = buildContinuitySections(inputs, now);
 
   // D1: day-grouped index of everything else.
   const memories: NeuralscapeMemory[] = [];
@@ -548,14 +590,21 @@ async function main(): Promise<void> {
 
     let contextBody: string;
     if (mode === "full") {
-      // Legacy full-content injection, standards prepended unbudgeted.
-      const standardsBlock = formatStandards(context.standards);
-      const formatted = formatMemories(context.categories || {});
-      contextBody = standardsBlock
-        ? formatted
-          ? `${standardsBlock}\n\n---\n\n${formatted}`
-          : standardsBlock
-        : formatted;
+      // Legacy full-content injection plus the continuity blocks (resume,
+      // Previously, cards): see buildFullContext.
+      const settled = await Promise.all(cardPromises.map((p) => p.catch(() => null)));
+      contextBody = buildFullContext({
+        context,
+        cards: settled.filter((c): c is { label: string; lines: string[] } => c !== null),
+        codeGraphAvailable: false,
+        budgetTokens: getIndexBudgetTokens(),
+        source: input.source,
+        sessionId: input.session_id,
+        predecessorIds:
+          input.source === "resume" || input.source === "fork"
+            ? await readPredecessorSessionIds(input.transcript_path, input.session_id)
+            : undefined,
+      });
     } else {
       const settled = await Promise.all(
         cardPromises.map((p) => p.catch(() => null)),
