@@ -553,3 +553,31 @@ async def count_live_edges_by_episode(
         for row in await result.data():
             counts[row["episode_uuid"]] = int(row["live"])
     return counts
+
+
+async def episode_edge_counts(
+    driver: Any,
+    *,
+    group_id: str,
+    episode_uuid: str,
+) -> dict[str, int]:
+    """``{"total", "live"}`` RELATES_TO edge counts citing ``episode_uuid``.
+
+    ``live`` = neither ``invalid_at`` nor ``expired_at`` set. Used by the
+    stale-graph check on dedup hits: an episode whose edges ALL died
+    (``total > 0 and live == 0``) means Graphiti has since contradicted what
+    the row says. Raises on driver errors (the caller fails safe).
+    """
+    cypher = """
+    MATCH ()-[r:RELATES_TO]->()
+    WHERE r.group_id = $group_id
+      AND $episode_uuid IN coalesce(r.episodes, [])
+    RETURN count(r) AS total,
+           sum(CASE WHEN r.invalid_at IS NULL AND r.expired_at IS NULL
+                    THEN 1 ELSE 0 END) AS live
+    """
+    async with driver.session() as session:
+        result = await session.run(cypher, group_id=group_id, episode_uuid=episode_uuid)
+        rows = await result.data()
+    row = rows[0] if rows else {}
+    return {"total": int(row.get("total") or 0), "live": int(row.get("live") or 0)}

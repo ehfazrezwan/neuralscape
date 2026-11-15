@@ -145,7 +145,17 @@ class FakeGraph:
 
             async def run(self_inner, cypher, **params):
                 graph.calls.append(cypher)
-                if "invalid_at IS NOT NULL" in cypher:
+                if "count(r) AS total" in cypher:
+                    eps = [
+                        e for e in graph.edges.values()
+                        if e["group_id"] == params["group_id"]
+                        and params["episode_uuid"] in e["episodes"]
+                    ]
+                    live = sum(
+                        1 for e in eps if e["invalid_at"] is None and e["expired_at"] is None
+                    )
+                    rows = [{"total": len(eps), "live": live}]
+                elif "invalid_at IS NOT NULL" in cypher:
                     since = datetime.fromisoformat(params["since"])
                     rows = [
                         {"uuid": e["uuid"], "fact": e["fact"], "episodes": e["episodes"]}
@@ -642,7 +652,9 @@ class TestFlagOff:
             category="personal_fact",
         )
 
-        redis.enqueue_job.assert_not_awaited()
+        # flag off: no FULL re-enrichment, only the cheap stale check
+        redis.enqueue_job.assert_awaited_once()
+        assert redis.enqueue_job.await_args.args[8] is True
 
     def test_batch_path_does_not_reenrich_revived_dup(self, env):
         svc, qdrant, _ = env
@@ -710,3 +722,156 @@ class TestFailuresNeverFailTheWrite:
         assert _enrich(svc) is True
         assert graph.calls == []
         assert not qdrant.meta("old").get("dream_tombstoned")
+
+
+# ──────────────────────────────────────────────
+# Dedup-hit stale-graph check (default path, flag independent)
+# ──────────────────────────────────────────────
+
+
+class TestStaleGraphCheckOnDedupHit:
+    @pytest.fixture(autouse=True)
+    def _flag_off(self, env, monkeypatch):
+        # The check is a default-path bug fix: prove it with the flag OFF.
+        monkeypatch.setattr(settings, "graph_supersession_enabled", False)
+
+    def _run_job(self, svc, memory_id="m1"):
+        import worker
+
+        row = MemoryResponse(id=memory_id, memory="Alice lives in Paris", category="personal_fact",
+                             scope="global", visibility="private")
+        svc.get_memory = MagicMock(return_value=row)
+        svc._memory.graph.add.return_value = {"episode_uuid": "ep-n", "episode_name": "n"}
+        return asyncio.run(worker.process_graph_enrichment(
+            {"service": svc}, memory_id=memory_id, content="Alice lives in Paris",
+            user_id="u1", project_id=None, visibility="private", only_if_stale=True,
+        ))
+
+    def test_stale_row_with_all_edges_dead_is_reenriched(self, env):
+        svc, qdrant, graph = env
+        qdrant.add("m1", user="u1", data="d", metadata={"graph_episode_uuid": "ep-old"})
+        graph.add_edge("E1", "Alice lives in Paris", ["ep-old"])
+        graph.invalidate("E1")
+
+        result = self._run_job(svc)
+
+        assert result["enriched"] is True
+        svc._memory.graph.add.assert_called_once()
+
+    def test_current_row_is_skipped_without_any_llm_call(self, env):
+        svc, qdrant, graph = env
+        qdrant.add("m1", user="u1", data="d", metadata={"graph_episode_uuid": "ep-old"})
+        graph.add_edge("E1", "Alice lives in Paris", ["ep-old"])  # live
+
+        result = self._run_job(svc)
+
+        assert result == {"memory_id": "m1", "enriched": False, "skipped": "graph_current"}
+        svc._memory.graph.add.assert_not_called()
+
+    def test_row_without_episode_ref_is_enriched(self, env):
+        svc, qdrant, graph = env
+        qdrant.add("m1", user="u1", data="d")
+
+        assert self._run_job(svc)["enriched"] is True
+        svc._memory.graph.add.assert_called_once()
+
+    def test_episode_with_no_edges_at_all_is_current(self, env):
+        svc, qdrant, graph = env
+        qdrant.add("m1", user="u1", data="d", metadata={"graph_episode_uuid": "ep-old"})
+
+        assert self._run_job(svc)["skipped"] == "graph_current"
+        svc._memory.graph.add.assert_not_called()
+
+    def test_probe_failure_skips_instead_of_spending_an_llm_call(self, env):
+        svc, qdrant, graph = env
+        qdrant.add("m1", user="u1", data="d", metadata={"graph_episode_uuid": "ep-old"})
+
+        def _boom(coro, timeout=None):
+            coro.close()
+            raise RuntimeError("neo4j down")
+
+        svc._run_on_bridge = _boom
+
+        assert self._run_job(svc)["skipped"] == "graph_current"
+        svc._memory.graph.add.assert_not_called()
+
+    def test_plain_job_without_flag_is_unchanged(self, env):
+        """only_if_stale defaults False: a normal enrichment never probes."""
+        import worker
+
+        svc, qdrant, graph = env
+        qdrant.add("m1", user="u1", data="d", metadata={"graph_episode_uuid": "ep-old"})
+        graph.add_edge("E1", "f", ["ep-old"])
+        svc.get_memory = MagicMock(return_value=MemoryResponse(id="m1", memory="x", scope="global"))
+        svc._memory.graph.add.return_value = {}
+        asyncio.run(worker.process_graph_enrichment(
+            {"service": svc}, memory_id="m1", content="x", user_id="u1"))
+        svc._memory.graph.add.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_repeated_dedup_hits_coalesce_on_one_job_id(self):
+        import worker
+
+        redis = MagicMock()
+        redis.enqueue_job = AsyncMock()
+        mem = MemoryResponse(id="m1", memory="x", scope="global", visibility="private")
+        for _ in range(3):
+            await worker._enqueue_stale_graph_check({"redis": redis}, mem, "x", "u1", None)
+        await worker._enqueue_stale_graph_check({"redis": redis}, mem, "different", "u1", None)
+
+        ids = [c.kwargs["_job_id"] for c in redis.enqueue_job.await_args_list]
+        assert len(set(ids[:3])) == 1 and ids[3] != ids[0]
+        assert ids[0].startswith("graph-stale-check:m1:")
+        assert all(c.kwargs["_queue_name"] == settings.graph_queue_name
+                   for c in redis.enqueue_job.await_args_list)
+
+    @pytest.mark.asyncio
+    async def test_early_idempotency_hit_also_queues_the_check(self):
+        import worker
+
+        existing = MemoryResponse(id="m1", memory="x", scope="global", visibility="private")
+        service = MagicMock()
+        service.search.return_value = [existing]
+        redis = MagicMock()
+        redis.enqueue_job = AsyncMock()
+
+        result = await worker.process_memory_raw(
+            {"service": service, "redis": redis}, content="x", user_id="u1", category="personal_fact")
+
+        assert result["deduplicated"] is True
+        service.store_raw.assert_not_called()
+        assert redis.enqueue_job.await_args.args[8] is True
+
+    @pytest.mark.asyncio
+    async def test_batch_dedup_survivors_get_the_check(self):
+        import worker
+
+        survivor = MemoryResponse(id="old", memory="x", scope="global", visibility="private")
+        service = MagicMock()
+
+        def _batch(items, dedup_ids=None):
+            dedup_ids.add("old")
+            return [survivor]
+
+        service.store_raw_batch.side_effect = _batch
+        redis = MagicMock()
+        redis.enqueue_job = AsyncMock()
+
+        await worker.process_memory_raw_batch(
+            {"service": service, "redis": redis},
+            [{"content": "x", "user_id": "u1", "category": "personal_fact"}],
+        )
+
+        redis.enqueue_job.assert_awaited_once()
+        assert redis.enqueue_job.await_args.args[1] == "old"
+        assert redis.enqueue_job.await_args.args[8] is True
+
+    def test_batch_service_reports_dedup_survivors(self, env):
+        svc, qdrant, graph = env
+        existing = MemoryResponse(id="old", memory="x", category="personal_fact", scope="global")
+        svc._memory.embedding_model.embed_batch.return_value = []
+        out: set[str] = set()
+        with patch.object(svc, "_prepare_raw_store", return_value=(None, existing)):
+            svc.store_raw_batch(
+                [{"content": "x", "user_id": "u1", "category": "personal_fact"}], dedup_ids=out)
+        assert out == {"old"}

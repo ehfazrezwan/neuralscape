@@ -107,6 +107,57 @@ def _validate_speaker(speaker: str | None) -> str | None:
 class WriteMixin:
     """WriteMixin for MemoryService (mechanical split — see memory_service.py)."""
 
+    def graph_row_is_stale(
+        self,
+        memory_id: str,
+        user_id: str,
+        project_id: str | None,
+        visibility: str,
+        workspace: str | None = None,
+    ) -> bool:
+        """Should a dedup-hit re-assertion of this row re-enter the graph?
+
+        True when the row has no ``graph_episode_uuid`` (never enriched, or
+        enrichment failed) or when its episode has edges but ALL are
+        invalid/expired (Graphiti has since contradicted the fact while the
+        row stayed live, so the graph disagrees with what the user just
+        re-asserted). One Qdrant retrieve + one Cypher probe, no LLM.
+
+        Fails SAFE: any probe error returns False (skip) so a flaky Neo4j
+        can never trigger an LLM storm. An episode that produced no edges at
+        all (``total == 0``) is "current" — there is nothing to contradict.
+        """
+        if not (self._graphiti and self._bridge):
+            return False
+        try:
+            pts = self._memory.vector_store.client.retrieve(
+                collection_name=settings.qdrant_collection,
+                ids=[memory_id],
+                with_payload=True,
+                with_vectors=False,
+            )
+            if not pts:
+                return False
+            meta = (pts[0].payload or {}).get("metadata") or {}
+            episode_uuid = meta.get("graph_episode_uuid")
+            if not episode_uuid:
+                return True
+            from extensions.dreaming.graph_patcher import episode_edge_counts
+
+            group_id = _build_group_id(visibility, user_id, project_id, workspace)
+            coro = episode_edge_counts(
+                self._graphiti.driver, group_id=group_id, episode_uuid=episode_uuid
+            )
+            try:
+                counts = self._run_on_bridge(coro, timeout=10.0)
+            except Exception:
+                coro.close()
+                raise
+            return counts["total"] > 0 and counts["live"] == 0
+        except Exception as e:  # noqa: BLE001 — fail safe, never spend an LLM call on doubt
+            logger.warning(f"Graph staleness probe failed for {memory_id} (skipping): {e}")
+            return False
+
     def _maybe_supersede_contradicted(
         self,
         *,
@@ -1443,6 +1494,7 @@ class WriteMixin:
     def store_raw_batch(
         self,
         items: list[dict],
+        dedup_ids: set[str] | None = None,
     ) -> list[MemoryResponse]:
         """Store multiple pre-categorized facts (memory-model v2).
 
@@ -1464,6 +1516,10 @@ class WriteMixin:
         The single ``embed_batch`` failure mode is deliberately LOUD (fails
         the whole batch before any insert) — the content-hash dedup makes the
         ARQ retry safe, so partial-batch silent loss is the worse trade.
+
+        ``dedup_ids`` is an optional OUTPUT set: the ids of pre-existing rows
+        that content-hash dedup hit and that were NOT re-enriched inline, so
+        the caller can enqueue the cheap stale-graph check for them.
 
         Returns:
             List of MemoryResponse objects for successful items, input order.
@@ -1549,7 +1605,12 @@ class WriteMixin:
                 continue
             if kind == "dup":
                 results.append(obj)
-                if settings.graph_supersession_enabled and getattr(obj, "revived", None):
+                enriched_inline = bool(
+                    settings.graph_supersession_enabled and getattr(obj, "revived", None)
+                )
+                if dedup_ids is not None and not enriched_inline:
+                    dedup_ids.add(obj.id)
+                if enriched_inline:
                     # Re-asserted fact revived a tombstoned row: it must reach
                     # Graphiti's contradiction engine again (this batch path
                     # enriches inline, like its new rows). Best-effort.
