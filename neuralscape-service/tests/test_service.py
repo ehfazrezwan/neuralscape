@@ -466,6 +466,52 @@ class TestV1ManageMemories:
         assert resp.status_code == 200
 
 
+class TestV1GetMemoryMalformedId:
+    """#437: a malformed id must be a 404 (same as an unknown well-formed id),
+    not a 500 from the Qdrant retrieve. Uses the REAL MemoryService read path
+    with a store that raises on any malformed id, like Qdrant does."""
+
+    @pytest.fixture
+    def real_service(self):
+        from memory_service import MemoryService
+
+        svc = MemoryService()
+        svc._memory = MagicMock(name="Memory")
+
+        def _get(mid):
+            import uuid as _uuid
+
+            _uuid.UUID(mid)  # Qdrant: malformed point id -> error
+            return None
+
+        svc._memory.get.side_effect = _get
+        original = main._service
+        main._service = svc
+        yield svc
+        main._service = original
+
+    @pytest.mark.parametrize("bad_id", ["not-a-uuid", "12345", "m1", "x" * 64])
+    def test_malformed_id_is_404(self, client, real_service, bad_id):
+        resp = client.get(f"/v1/memories/{bad_id}")
+        assert resp.status_code == 404
+
+    def test_wellformed_unknown_id_is_404(self, client, real_service):
+        resp = client.get("/v1/memories/44444444-4444-4444-8444-444444444444")
+        assert resp.status_code == 404
+
+    def test_readable_id_is_200(self, client, real_service):
+        real_service._memory.get.side_effect = None
+        real_service._memory.get.return_value = {
+            "id": "55555555-5555-4555-8555-555555555555",
+            "memory": "Prefers tabs",
+            "user_id": "default",
+            "metadata": {"category": "preference", "visibility": "shared"},
+        }
+        resp = client.get("/v1/memories/55555555-5555-4555-8555-555555555555")
+        assert resp.status_code == 200
+        assert resp.json()["memory"] == "Prefers tabs"
+
+
 class TestV1MemoryByIdReadAuthorization:
     """IDOR fix: GET /v1/memories/{id} and its /reasoning_chain twin must pass
     the caller's resolved identity into the service so the read gate
