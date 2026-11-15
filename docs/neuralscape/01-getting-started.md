@@ -210,7 +210,7 @@ That's it — the post-install build runs automatically (`postinstall` script in
 
 **Cowork:** the marketplace install loads the skills, but **hooks don't fire in Cowork** and the token prompt is unreliable there — so the auto inject/capture loop above won't run. Use the **MCP OAuth connector + standing context** instead. Full runbook: [`../../COWORK.md`](../../COWORK.md).
 
-**MCP tools come for free.** The plugin's `.mcp.json` points at the deployed `/mcp/` endpoint, so installing the plugin auto-wires the seven Neuralscape MCP tools (`recall_memories`, `remember`, etc.) into Claude Code's tool list.
+**MCP tools come for free.** The plugin's `.mcp.json` points at the deployed `/mcp/` endpoint, so installing the plugin auto-wires the Neuralscape MCP tools (26 core, plus 7 code-graph tools when the optional extra is installed; `recall_memories`, `remember`, etc.) into Claude Code's tool list.
 
 **Slash commands:** four discoverable commands ship with the plugin — `/neuralscape:status`, `/neuralscape:search`, `/neuralscape:sync`, `/neuralscape:config`. Claude can also invoke them automatically when the user's question fits.
 

@@ -50,16 +50,16 @@ def _fake_run(stdout="", returncode=0, stderr=""):
 
 def test_mint_via_compose_command_and_parsing():
     run = _fake_run(stdout="warning: something\n" + VECTOR_TOKEN + "\n")
-    got = tokens.mint_via_compose("proj", "acc-test-a", "api", run=run)
+    got = tokens.mint_via_compose("nstest-proj", "acc-test-a", "api", run=run)
     assert got == VECTOR_TOKEN
-    assert run.cmd[:6] == ["docker", "compose", "-p", "proj", "exec", "-T"]
+    assert run.cmd[:6] == ["docker", "compose", "-p", "nstest-proj", "exec", "-T"]
     assert "api" in run.cmd and "scripts/issue_user_token.py" in run.cmd
 
 
 def test_mint_via_compose_failure_is_scrubbed():
     run = _fake_run(returncode=1, stderr=f"boom {VECTOR_TOKEN}")
     with pytest.raises(tokens.TokenError) as ei:
-        tokens.mint_via_compose("proj", "u", run=run)
+        tokens.mint_via_compose("nstest-proj", "u", run=run)
     assert VECTOR_TOKEN not in str(ei.value)
 
 

@@ -28,7 +28,8 @@ permissions:
 
 concurrency:
   group: sidecars-ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # Only PR runs are superseded; never cancel a push run on dev/main.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   changes:
@@ -105,6 +106,8 @@ jobs:
         with:
           persist-credentials: false
       - uses: azure/setup-helm@v4
+        with:
+          version: v3.22.1
       - name: Lint and render with default values
         run: |
           set -eu
