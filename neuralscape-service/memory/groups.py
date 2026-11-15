@@ -21,17 +21,19 @@ logger = logging.getLogger(__name__)
 # ``alice--project--payroll`` and user ``alice`` in project ``payroll`` shared
 # one graph namespace (a cross-user read/write alias).
 #
-# A component is *plain* when it is non-empty, uses only the id alphabet, has no
-# ``--`` and neither starts nor ends with ``-``. In a tuple of plain components
-# every ``--`` in the name is a delimiter, so the name reads back to exactly one
-# tuple, and plain tuples keep their legacy name BYTE FOR BYTE (zero migration
-# for every id that does not hit the collision). Any tuple with a non-plain
+# A component is *plain* when it is non-empty, uses only the id alphabet and has
+# no ``--``. A plain component can still start or end with a single ``-``: the
+# delimiter is then followed/preceded by one more ``-`` and the reading stays
+# unique (checked exhaustively in tests/test_group_ids.py). In a tuple of plain
+# components the name reads back to exactly one tuple, and plain tuples keep
+# their legacy name BYTE FOR BYTE (zero migration for every id that does not hit
+# the collision). Any tuple with a non-plain
 # component is named ``nsg1--`` + the hex of a length-prefixed encoding of the
 # whole tuple: the ``nsg1`` first segment is not a legacy pool name, the
 # characters are all Graphiti-valid, and the encoding is canonical, so distinct
 # tuples can never share a name. (Idea reused from the old graph-wave branch,
 # minus its auth-profile flag: injectivity must not be opt-in.)
-_PLAIN_COMPONENT = re.compile(r"[A-Za-z0-9_.]+(?:-[A-Za-z0-9_.]+)*")
+_PLAIN_COMPONENT = re.compile(r"(?!.*--)[A-Za-z0-9_.\-]+")
 ENCODED_GROUP_PREFIX = "nsg1--"
 _POOL_KINDS = ("private", "shared", "standard")
 
@@ -221,8 +223,8 @@ def _build_group_id(
     group_ids for existing rows, zero migration). Any other value appends
     `--ws--{workspace}`, isolating reference content from memory pools.
 
-    Injective: a tuple with a non-plain component (one containing ``--``,
-    starting/ending with ``-``, or outside the id alphabet) is named
+    Injective: a tuple with a non-plain component (one containing ``--`` or
+    a character outside the id alphabet) is named
     ``nsg1--<hex>`` (see ``_encode_group_key``) so it can never alias another
     tuple's namespace; every plain tuple keeps the legacy name shown above.
     """

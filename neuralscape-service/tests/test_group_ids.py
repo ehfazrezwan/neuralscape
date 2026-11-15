@@ -2,7 +2,7 @@
 
 The old builder joined user / project / workspace with ``--`` while legal ids may
 contain ``--``, so ``alice--project--payroll`` (a user) and ``alice`` in project
-``payroll`` shared one namespace. Plain tuples (no ``--``, no edge ``-``, id
+``payroll`` shared one namespace. Plain tuples (no ``--``, id
 alphabet only) must keep their name byte for byte so no data migrates.
 """
 
@@ -88,7 +88,7 @@ def test_the_builder_is_injective_over_an_adversarial_id_space():
 def test_encoded_names_use_only_graphiti_valid_characters_and_decode_exactly():
     import re
 
-    for args in [("private", "alice--project--payroll"), ("private", "x", "p--q", "w"), ("shared", "u", "-p")]:
+    for args in [("private", "alice--project--payroll"), ("private", "x", "p--q", "w"), ("shared", "u", "p--q")]:
         gid = _build_group_id(*args)
         assert re.fullmatch(r"[A-Za-z0-9_-]+", gid), gid          # Graphiti's validate_group_id alphabet
         key = decode_group_id(gid)

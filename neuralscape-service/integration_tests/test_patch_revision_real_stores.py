@@ -7,8 +7,8 @@ No LLM is involved: the mem0 surface is a thin shim over the real Qdrant
 collection, ``MemoryService.patch_memory`` / ``get_memory`` are the real code,
 and the request goes through the real ``PATCH /v1/memories/{id}`` route.
 
-Invoked explicitly (outside ``tests/``). A missing or unreachable store is a
-test FAILURE, never a skip. Required env: QDRANT_URL, REDIS_URL.
+Invoked explicitly (outside ``tests/``); see ``integration_tests/README.md``.
+Env: QDRANT_URL, REDIS_URL (via the ``stores`` fixture; unreachable fails on the gate).
 """
 
 from __future__ import annotations
@@ -16,7 +16,6 @@ from __future__ import annotations
 import third_party_telemetry  # noqa: F401  (telemetry guard; must precede any mem0/graphiti import)
 
 import asyncio
-import os
 import threading
 import uuid
 from types import SimpleNamespace
@@ -28,9 +27,6 @@ from fastapi.testclient import TestClient
 from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, PointStruct, VectorParams
 
-pytestmark = pytest.mark.integration
-
-REQUIRED_ENV = ("QDRANT_URL", "REDIS_URL")
 DIM = 4
 
 
@@ -67,33 +63,26 @@ class _Mem0Shim:
                 "metadata": p.get("metadata", {})}
 
 
-@pytest.fixture(scope="module")
-def qdrant():
-    missing = [k for k in REQUIRED_ENV if not os.environ.get(k)]
-    assert not missing, f"integration environment incomplete, missing: {missing}"
-    client = QdrantClient(url=os.environ["QDRANT_URL"])
-    collection = f"it_patch_revision_{uuid.uuid4().hex[:10]}"
-    client.create_collection(collection, vectors_config=VectorParams(size=DIM, distance=Distance.COSINE))
-    yield client, collection
-    client.delete_collection(collection)
-
-
 @pytest.fixture
-def world(qdrant, monkeypatch):
+def world(stores, unique_ns, monkeypatch):
     from config import settings
     from memory_service import MemoryService
 
-    client, collection = qdrant
+    client = QdrantClient(url=stores.qdrant_url)
+    collection = unique_ns.qdrant_collection
+    client.create_collection(collection, vectors_config=VectorParams(size=DIM, distance=Distance.COSINE))
+    unique_ns.on_cleanup(lambda: client.delete_collection(collection))
     monkeypatch.setattr(settings, "qdrant_collection", collection)
     svc = MemoryService()
     svc._memory = _Mem0Shim(client, collection)
     svc._graphiti = None
     svc._bridge = None
-    svc.client, svc.collection = client, collection
+    svc.client, svc.collection, svc.owner = client, collection, unique_ns.user_id
     return svc
 
 
-def _seed(world, *, owner="it-alice", visibility="shared", **meta) -> str:
+def _seed(world, *, owner=None, visibility="shared", **meta) -> str:
+    owner = owner or world.owner
     pid = str(uuid.uuid4())
     payload = {
         "data": "the original text", "hash": "h", "created_at": "2026-01-01T00:00:00+00:00",
@@ -113,11 +102,11 @@ def test_stale_revision_is_refused_by_the_real_server_and_nothing_is_written(wor
     from memory.edit import RevisionConflict
 
     pid = _seed(world)
-    world.patch_memory(pid, "it-alice", {"tags": ["first"]})            # 0 -> 1
+    world.patch_memory(pid, world.owner, {"tags": ["first"]})            # 0 -> 1
     before = _stored(world, pid)
 
     with pytest.raises(RevisionConflict) as err:
-        world.patch_memory(pid, "it-alice", {"tags": ["stale"]}, expected_revision="0")
+        world.patch_memory(pid, world.owner, {"tags": ["stale"]}, expected_revision="0")
 
     assert err.value.current_revision == "1"
     assert _stored(world, pid) == before                                 # byte-identical payload
@@ -126,10 +115,10 @@ def test_stale_revision_is_refused_by_the_real_server_and_nothing_is_written(wor
 def test_correct_revision_applies_and_is_echoed_on_the_next_read(world):
     pid = _seed(world)
     assert world.get_memory(pid).revision == "0"
-    out = world.patch_memory(pid, "it-alice", {"tags": ["applied"]}, expected_revision="0")
+    out = world.patch_memory(pid, world.owner, {"tags": ["applied"]}, expected_revision="0")
     assert out["memory"].revision == "1"
     assert _stored(world, pid)["metadata"]["tags"] == ["applied"]
-    world.patch_memory(pid, "it-alice", {"tags": ["again"]}, expected_revision="1")
+    world.patch_memory(pid, world.owner, {"tags": ["again"]}, expected_revision="1")
     assert world.get_memory(pid).revision == "2"
 
 
@@ -137,10 +126,10 @@ def test_content_edit_claims_the_revision_atomically_before_the_rewrite(world):
     from memory.edit import RevisionConflict
 
     pid = _seed(world)
-    world.patch_memory(pid, "it-alice", {"content": "second text"}, expected_revision="0")
+    world.patch_memory(pid, world.owner, {"content": "second text"}, expected_revision="0")
     assert _stored(world, pid)["data"] == "second text"
     with pytest.raises(RevisionConflict):
-        world.patch_memory(pid, "it-alice", {"content": "lost update"}, expected_revision="0")
+        world.patch_memory(pid, world.owner, {"content": "lost update"}, expected_revision="0")
     assert _stored(world, pid)["data"] == "second text"
 
 
@@ -156,7 +145,7 @@ def test_concurrent_patches_holding_one_revision_have_exactly_one_winner(world):
     def attempt(i: int) -> None:
         barrier.wait()
         try:
-            world.patch_memory(pid, "it-alice", {"tags": [f"writer-{i}"]}, expected_revision="0")
+            world.patch_memory(pid, world.owner, {"tags": [f"writer-{i}"]}, expected_revision="0")
             result = f"win:{i}"
         except RevisionConflict:
             result = "conflict"
@@ -218,11 +207,11 @@ def test_rest_route_answers_409_for_a_stale_revision_and_enqueues_nothing(world,
         client = TestClient(main.app, raise_server_exceptions=False)
 
         # a client reads the memory, gets its revision ...
-        got = client.get(f"/v1/memories/{pid}", params={"user_id": "it-alice"})
+        got = client.get(f"/v1/memories/{pid}", params={"user_id": world.owner})
         assert got.status_code == 200 and got.json()["revision"] == "0"
 
         # ... a second client narrows it first (this enqueues a graph re-ingest) ...
-        ok = client.patch(f"/v1/memories/{pid}", json={"user_id": "it-alice", "visibility": "private",
+        ok = client.patch(f"/v1/memories/{pid}", json={"user_id": world.owner, "visibility": "private",
                                                        "expected_revision": "0"})
         assert ok.status_code == 200, ok.text
         assert ok.json()["memory"]["revision"] == "1"
@@ -234,7 +223,7 @@ def test_rest_route_answers_409_for_a_stale_revision_and_enqueues_nothing(world,
 
         # ... and the first client's stale write is refused: 409, nothing written, nothing enqueued.
         before = _stored(world, pid)
-        stale = client.patch(f"/v1/memories/{pid}", json={"user_id": "it-alice", "visibility": "shared",
+        stale = client.patch(f"/v1/memories/{pid}", json={"user_id": world.owner, "visibility": "shared",
                                                           "expected_revision": "0"})
         assert stale.status_code == 409, stale.text
         assert stale.json()["detail"]["current_revision"] == "1"

@@ -6,9 +6,9 @@ the memory's episode into the owner's PRIVATE group and publish nothing into
 the shared pool. Previously the job used the visibility frozen at enqueue time
 and wrote the narrowed memory into the shared graph group.
 
-Invoked explicitly (outside ``tests/``). A missing or unreachable service is a
-test FAILURE, never a skip. Required env: NEO4J_URI, NEO4J_USER, NEO4J_PASSWORD,
-QDRANT_URL, GOOGLE_API_KEY (embeddings + Graphiti extraction).
+Invoked explicitly (outside ``tests/``); see ``integration_tests/README.md``.
+Env: the ``stores`` fixture's variables plus GOOGLE_API_KEY (``llm_key``: embeddings
+and Graphiti extraction). Unreachable infrastructure fails on the gate.
 """
 
 from __future__ import annotations
@@ -16,20 +16,12 @@ from __future__ import annotations
 import third_party_telemetry  # noqa: F401  (telemetry guard; must precede mem0/graphiti imports)
 
 import asyncio
-import os
 import uuid
 
 import pytest
 
-pytestmark = pytest.mark.integration
-
-REQUIRED_ENV = ("NEO4J_URI", "NEO4J_USER", "NEO4J_PASSWORD", "QDRANT_URL", "GOOGLE_API_KEY")
-
-
 @pytest.fixture(scope="module")
-def svc():
-    missing = [k for k in REQUIRED_ENV if not os.environ.get(k)]
-    assert not missing, f"integration environment incomplete, missing: {missing}"
+def svc(stores, llm_key):
     from memory_service import MemoryService
 
     service = MemoryService()
@@ -55,10 +47,10 @@ def _episodes_with(svc, group_id: str, token: str):
     )
 
 
-def test_job_queued_as_shared_but_narrowed_to_private_lands_in_the_private_group(svc):
+def test_job_queued_as_shared_but_narrowed_to_private_lands_in_the_private_group(svc, unique_ns):
     import worker
 
-    uid = f"it-narrow-{uuid.uuid4().hex[:10]}"
+    uid = unique_ns.user_id
     token = f"Quillfeather{uuid.uuid4().hex[:8]}"
     content = f"My dog is named {token} and lives in Reykjavik."
     try:
