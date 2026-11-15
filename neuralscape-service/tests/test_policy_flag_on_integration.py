@@ -112,7 +112,7 @@ class InlineTasks:
 
 
 class World:
-    def __init__(self, monkeypatch, store, mode: str = "enforce") -> None:
+    def __init__(self, monkeypatch, store, mode: str = "enforce", wire: bool = True) -> None:
         self.store = store
         self.service = CredentialService(store, refresh_grace=0)
         self.memory = InProcessMemory()
@@ -145,10 +145,11 @@ class World:
         monkeypatch.setattr(settings, "ns_auth_profile", "legacy_compat")
         monkeypatch.setattr(settings, "neuralscape_user_token_secret", SECRET)
         monkeypatch.setattr(settings, "neuralscape_api_key", "")
-        credentials.configure(self.service)
-        policy_enforcement.configure(
-            PolicyEnforcer(store, store, row_lookup=memory_row_lookup(self.memory.payload, store))
-        )
+        if wire:
+            credentials.configure(self.service)
+            policy_enforcement.configure(
+                PolicyEnforcer(store, store, row_lookup=memory_row_lookup(self.memory.payload, store))
+            )
         monkeypatch.setattr(main, "_service", self.memory)
         monkeypatch.setattr(main, "_task_manager", InlineTasks(self.memory))
         self.client = TestClient(main.app, raise_server_exceptions=False)
@@ -335,3 +336,54 @@ def test_with_the_default_mode_off_existing_behaviour_is_unchanged(monkeypatch, 
         assert w.call("GET", "/v1/memories").status_code == 401  # auth itself is untouched
     finally:
         w.close()
+
+
+@pytest.fixture(params=["sqlite", pytest.param("postgres", marks=pytest.mark.skipif(not DSN, reason=REASON))])
+def configured_store(request, tmp_path, monkeypatch):
+    """A seeded authority store, plus the ``AUTHORITY_*`` settings that point the service at it."""
+
+    monkeypatch.setattr(settings, "authority_enabled", True)
+    if request.param == "sqlite":
+        path = str(tmp_path / "configured.db")
+        seed = SqliteAuthorityStore(path)
+        monkeypatch.setattr(settings, "authority_backend", "sqlite")
+        monkeypatch.setattr(settings, "authority_sqlite_path", path)
+        yield seed
+        seed.close()
+        return
+    from tests.authority_pg_support import RuntimeRoleBackend
+
+    backend = RuntimeRoleBackend()
+    monkeypatch.setattr(settings, "authority_backend", "postgres")
+    monkeypatch.setattr(settings, "authority_postgres_dsn", backend.runtime_dsn)
+    monkeypatch.setattr(settings, "authority_postgres_migrate_on_open", False)  # the least-privilege role
+    yield backend.open()
+    backend.close()
+
+
+def test_the_service_builds_its_authority_store_from_settings_and_serves_scoped_credentials(
+    monkeypatch, configured_store
+) -> None:
+    """Start-up wiring: ``NS_POLICY_MODE=enforce`` + ``AUTHORITY_*`` + ``CREDENTIALS_ENABLED`` and nothing else."""
+
+    w = World(monkeypatch, configured_store, wire=False)
+    credentials.configure(None)
+    try:
+        enforcer = policy_enforcement.install_or_refuse(None)
+        assert enforcer is not None and credentials.get_service() is not None
+        w.write(w.hmac["alice"], "wired from settings")
+        token = w.scoped("alice", ["create", "list", "search"])
+        listed = w.call("GET", "/v1/memories", token)
+        assert listed.status_code == 200 and [r["memory"] for r in listed.json()] == ["wired from settings"]
+        assert w.call("POST", "/v1/search", token, json={"query": "wired"}).status_code == 200
+        assert denied(w.call("DELETE", "/v1/memories/mem-1", token))
+    finally:
+        w.close()
+
+
+def test_enforce_refuses_to_start_without_an_authority_store(monkeypatch) -> None:
+    monkeypatch.setattr(settings, "ns_policy_mode", "enforce")
+    monkeypatch.setattr(settings, "authority_enabled", False)
+    policy_enforcement.configure(None)
+    with pytest.raises(policy_enforcement.EnforcementUnavailable):
+        policy_enforcement.install_or_refuse(None)

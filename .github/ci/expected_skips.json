@@ -759,6 +759,10 @@
           "reason_contains": "AUTHORITY_TEST_PG_DSN not set (postgres authorit"
         },
         {
+          "test": "tests.test_policy_flag_on_integration::test_the_service_builds_its_authority_store_from_settings_and_serves_scoped_credentials[postgres]",
+          "reason_contains": "AUTHORITY_TEST_PG_DSN not set (postgres authorit"
+        },
+        {
           "test": "tests.test_policy_flag_on_integration::test_the_subject_cannot_widen_a_scope_beyond_its_grants[postgres]",
           "reason_contains": "AUTHORITY_TEST_PG_DSN not set (postgres authorit"
         },
@@ -1532,6 +1536,10 @@
         },
         {
           "test": "tests.test_policy_flag_on_integration::test_refresh_rotates_and_a_replay_revokes_the_family[postgres]",
+          "reason_contains": "AUTHORITY_TEST_PG_DSN not set (postgres authorit"
+        },
+        {
+          "test": "tests.test_policy_flag_on_integration::test_the_service_builds_its_authority_store_from_settings_and_serves_scoped_credentials[postgres]",
           "reason_contains": "AUTHORITY_TEST_PG_DSN not set (postgres authorit"
         },
         {
