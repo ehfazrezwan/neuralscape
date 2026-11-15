@@ -10,7 +10,8 @@
 # Provenance (how this list was built; tests re-derive it from git):
 #   graphiti-base: 9cb6dc1b   upstream tree (graphiti_core) at that commit; the
 #       'patched' graphiti entries are exactly
-#       `git diff --name-only 9cb6dc1b:graphiti_core HEAD:graphiti/graphiti_core`.
+#       `git diff --name-only --diff-filter=M 9cb6dc1b:graphiti_core HEAD:graphiti/graphiti_core`
+#       ('owned' = the same diff with --diff-filter=A).
 #   mem0-base: cd27fc57       the upstream c9e8482a sync commit. The upstream
 #       object itself is NOT in this repo (subtree squash), so a full upstream
 #       diff is impossible; the mem0 list is pinned: every mem0 file changed
@@ -24,6 +25,11 @@ patched graphiti/graphiti_core/driver/neo4j_driver.py
 patched graphiti/graphiti_core/embedder/gemini.py
 patched graphiti/graphiti_core/llm_client/config.py
 patched graphiti/graphiti_core/llm_client/gemini_client.py
+patched graphiti/graphiti_core/utils/maintenance/edge_operations.py
+patched graphiti/graphiti_core/utils/maintenance/node_operations.py
+
+# --- graphiti (owned: NS-only, not upstream) ---
+owned graphiti/graphiti_core/llm_client/hybrid_decision_client.py
 
 # --- mem0 (patched) ---
 patched mem0/mem0/configs/embeddings/base.py

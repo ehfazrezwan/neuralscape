@@ -87,20 +87,24 @@ def test_marked_and_graphiti_mentioning_mem0_files_are_in_the_manifest():
     assert set(_listed("patched")) <= found, "patched entry without a marker"
 
 
-def test_graphiti_patched_set_equals_diff_against_upstream_base():
-    """Derived from git, so an unmarked NS edit to graphiti is caught."""
+def test_graphiti_sets_equal_diff_against_upstream_base():
+    """Derived from git, so an unmarked NS edit or new NS file in graphiti is caught."""
     if not _present():
         return
     base = _base("graphiti-base")
-    diff = _git("diff", "--name-only", f"{base}:graphiti_core", "HEAD:graphiti/graphiti_core")
-    if diff is None:  # shallow clone / base object unavailable
-        return
-    expected = {f"graphiti/graphiti_core/{f}" for f in diff}
-    listed = {p for p in _listed("patched") if p.startswith("graphiti/")}
-    assert listed == expected, (
-        f"graphiti patched list drifted from the upstream diff: "
-        f"unlisted={sorted(expected - listed)} stale={sorted(listed - expected)}"
-    )
+    for flt, kind in (("M", "patched"), ("A", "owned")):
+        diff = _git(
+            "diff", "--name-only", f"--diff-filter={flt}",
+            f"{base}:graphiti_core", "HEAD:graphiti/graphiti_core",
+        )
+        if diff is None:  # shallow clone / base object unavailable
+            return
+        expected = {f"graphiti/graphiti_core/{f}" for f in diff}
+        listed = {p for p in _listed(kind) if p.startswith("graphiti/")}
+        assert listed == expected, (
+            f"graphiti {kind} list drifted from the upstream diff: "
+            f"unlisted={sorted(expected - listed)} stale={sorted(listed - expected)}"
+        )
 
 
 def test_mem0_files_changed_since_last_sync_are_in_the_manifest():
