@@ -740,3 +740,87 @@ def test_the_governed_bootstrap_grants_owner_actions_on_each_users_private_pools
         "private:subj-u1:global", "private:subj-u1:alpha", "private:subj-u1:beta"}
     assert {s.resource.tenant_id for s in statements} == {"t1"}
     assert calls["bound"] == [("local", "u1"), ("local", "u2")]
+
+
+# ── review findings: rejected writes, relative paths, empty replacement output, bad reports, interpreter fallback ──
+
+
+def test_rejected_changed_scope_writes_are_not_scored_as_different_tasks(monkeypatch) -> None:
+    import comp1_realservice
+
+    def call(base, method, path, body=None, headers=None):
+        body = body or {}
+        changed = body.get("project_id") == "beta" or body.get("category") == "tech_stack" or body.get("tags")
+        if changed or body.get("user_id") == "comp1-bob" or body.get("agent_id"):
+            return 403, {}
+        return 202, {"task_id": "t-fixed"}
+
+    monkeypatch.setattr(comp1_realservice, "_call", call)
+    seen = comp1_realservice.job_keys("http://x")
+    for fact in ("store_other_user_other_task", "store_other_project_other_task", "store_other_agent_other_task",
+                 "raw_other_project_other_task", "raw_other_category_other_task", "raw_other_tags_other_task"):
+        assert seen[fact] == "http-403", fact  # differs from the oracle's "true": judged unexpected_failure
+    assert seen["store_same_inputs_same_task"] == "true" and seen["store_accepted"] == "true"
+    monkeypatch.setattr(comp1_realservice, "_call", lambda *a, **k: (403, {}))
+    assert comp1_realservice.job_keys("http://x")["store_same_inputs_same_task"] == "http-403"
+
+
+def test_relative_command_line_paths_work_after_the_children_change_directory(tmp_path: Path, monkeypatch) -> None:
+    inputs = _inputs(tmp_path)
+    _tree(tmp_path, "base", fixed=False)
+    _tree(tmp_path, "cand", fixed=True)
+    monkeypatch.chdir(tmp_path)
+    assert comp1_run.main([
+        "run", "--baseline", "base", "--baseline-ref", "b", "--candidate", "cand", "--candidate-ref", "c",
+        "--inputs", "inputs", "--out", "results", "--run-id", "rel"]) == 0
+    records = _records_in(tmp_path / "results")
+    assert records[("baseline", "group-id-tuple-collision")]["verdict"] == "known_failure"
+    assert records[("candidate", "group-id-tuple-collision")]["verdict"] == "candidate_pass"
+    assert (tmp_path / "results" / "reproductions-candidate.xml").is_file()
+    assert not (tmp_path / "cand" / "results").exists() and inputs.is_dir()
+
+
+def _records_in(out: Path) -> dict:
+    lines = (out / "evidence.jsonl").read_text().splitlines()
+    return {(r["role"], r["scenario_id"]): r for r in map(json.loads, filter(None, lines))}
+
+
+def test_a_replacement_run_that_exits_zero_and_prints_nothing_is_a_failure(tmp_path: Path, monkeypatch) -> None:
+    class Done:
+        stdout, stderr, returncode = "", "", 0
+
+    monkeypatch.setattr(comp1_run.subprocess, "run", lambda *a, **k: Done())
+    outcome = comp1_run.run_replacements(tmp_path, ("t",))
+    assert outcome == "fail:no-output"
+    assert comp1_run.judge_replaced("why", ("t",), outcome)[0] == "unexpected_failure"
+
+
+def test_a_truncated_report_is_an_invalid_attempt_not_a_crash(tmp_path: Path, monkeypatch) -> None:
+    inputs = _inputs(tmp_path)
+    tree = _tree(tmp_path, "t", fixed=True)
+    junit = tmp_path / "j.xml"
+
+    def run(*args, **kwargs):
+        junit.write_text('<testsuites><testsuite><testcase name="a"')  # cut off mid-write
+
+    monkeypatch.setattr(comp1_run.subprocess, "run", run)
+    assert comp1_run.run_reproductions(tree, inputs, junit) == ({}, "pytest report unreadable")
+
+
+def test_the_live_probe_uses_the_trees_interpreter_or_falls_back(tmp_path: Path, monkeypatch) -> None:
+    import comp1_realservice
+
+    launched = []
+
+    class Proc:
+        def kill(self) -> None:
+            pass
+
+    monkeypatch.setattr(comp1_realservice.subprocess, "Popen", lambda cmd, **k: launched.append(cmd[0]) or Proc())
+    monkeypatch.setattr(comp1_realservice, "_call", lambda *a, **k: (200, {}))
+    comp1_realservice._start_api(tmp_path, {})
+    assert launched[-1] == comp1_realservice.sys.executable  # no .venv: the harness interpreter
+    (tmp_path / ".venv" / "bin").mkdir(parents=True)
+    (tmp_path / ".venv" / "bin" / "python").write_text("")
+    comp1_realservice._start_api(tmp_path, {})
+    assert launched[-1] == str(tmp_path / ".venv" / "bin" / "python")

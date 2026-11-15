@@ -140,7 +140,9 @@ def run_replacements(tree: Path, test_ids: tuple[str, ...]) -> str:
         )
     except subprocess.TimeoutExpired:
         return "fail:timeout"
-    tail = (done.stdout.strip().splitlines() or ["no output"])[-1]
+    if not done.stdout.strip():
+        return "fail:no-output"  # a replacement that reports nothing is a failure, whatever its exit status
+    tail = done.stdout.strip().splitlines()[-1]
     counts = "_".join(part.replace(" ", "-") for part in tail.split(" in ")[0].split(", "))
     return ("pass" if done.returncode == 0 else "fail") + ":" + counts[:60]
 
@@ -171,7 +173,10 @@ def run_reproductions(tree: Path, inputs: Path, junit: Path, env: dict[str, str]
             return {}, "pytest timed out"
         if not junit.exists():
             return {}, "pytest produced no report"
-        return _outcomes(junit), ""
+        try:
+            return _outcomes(junit), ""
+        except ET.ParseError:
+            return {}, "pytest report unreadable"
     finally:
         if placed:
             target.unlink()
@@ -267,14 +272,14 @@ def surface(tree: Path) -> dict:
 
 
 def run(args: argparse.Namespace) -> None:
-    inputs, out = Path(args.inputs), Path(args.out)
+    inputs, out = Path(args.inputs).resolve(), Path(args.out).resolve()  # children run in other directories
     out.mkdir(parents=True, exist_ok=True)
     registry = load_registry(inputs)
     writer = EvidenceWriter(out / "evidence.jsonl", protected=[inputs / "evidence_registry.py", inputs / REPRODUCTIONS])
     repro_sha = sha256(inputs / REPRODUCTIONS)
     registry_sha = sha256(inputs / "evidence_registry.py")
-    trees = (("baseline", Path(args.baseline), args.baseline_ref, args.compose_project_baseline),
-             ("candidate", Path(args.candidate), args.candidate_ref, args.compose_project_candidate))
+    trees = (("baseline", Path(args.baseline).resolve(), args.baseline_ref, args.compose_project_baseline),
+             ("candidate", Path(args.candidate).resolve(), args.candidate_ref, args.compose_project_candidate))
     rs_oracles = persona_evidence.load_oracles(REALSERVICE_ORACLES)
     candidate_env = dict(item.split("=", 1) for item in args.candidate_env)
     governed = args.profile == "governed"

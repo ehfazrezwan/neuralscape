@@ -71,8 +71,9 @@ def _call(
 def _start_api(service_dir: Path, env: dict[str, str]) -> tuple[subprocess.Popen, str]:
     port = _free_port()
     python = service_dir / ".venv" / "bin" / "python"
+    interpreter = str(python) if python.exists() else sys.executable  # a tree without its own environment
     process = subprocess.Popen(
-        [str(python), "-m", "uvicorn", "main:app", "--host", "127.0.0.1", "--port", str(port)],
+        [interpreter, "-m", "uvicorn", "main:app", "--host", "127.0.0.1", "--port", str(port)],
         cwd=str(service_dir), env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
     base = f"http://127.0.0.1:{port}"
@@ -128,17 +129,30 @@ def job_keys(base: str) -> dict[str, str]:
         status, body = _call(base, "POST", "/v1/memories/raw", payload)
         return body.get("task_id") or f"http-{status}"
 
+    def compare(left: str, right: str, equal: bool) -> str:
+        # a rejected write is not a task: it is reported as its status token, never as "same" or "different"
+        for item in (left, right):
+            if item.startswith("http-"):
+                return _token(item)
+        return str((left == right) == equal).lower()
+
+    def same(left: str, right: str) -> str:
+        return compare(left, right, True)
+
+    def other(left: str, right: str) -> str:
+        return compare(left, right, False)
+
     alpha = store(user_id="comp1-alice", project_id="alpha")
     raw_base = raw()
     return {
-        "store_same_inputs_same_task": str(store(user_id="comp1-alice", project_id="alpha") == alpha).lower(),
-        "store_other_user_other_task": str(store(user_id="comp1-bob", project_id="alpha") != alpha).lower(),
-        "store_other_project_other_task": str(store(user_id="comp1-alice", project_id="beta") != alpha).lower(),
-        "store_other_agent_other_task": str(store(user_id="comp1-alice", project_id="alpha", agent_id="agent-2") != alpha).lower(),
-        "raw_same_inputs_same_task": str(raw() == raw_base).lower(),
-        "raw_other_project_other_task": str(raw(project_id="beta") != raw_base).lower(),
-        "raw_other_category_other_task": str(raw(category="tech_stack") != raw_base).lower(),
-        "raw_other_tags_other_task": str(raw(tags=["release"]) != raw_base).lower(),
+        "store_same_inputs_same_task": same(store(user_id="comp1-alice", project_id="alpha"), alpha),
+        "store_other_user_other_task": other(store(user_id="comp1-bob", project_id="alpha"), alpha),
+        "store_other_project_other_task": other(store(user_id="comp1-alice", project_id="beta"), alpha),
+        "store_other_agent_other_task": other(store(user_id="comp1-alice", project_id="alpha", agent_id="agent-2"), alpha),
+        "raw_same_inputs_same_task": same(raw(), raw_base),
+        "raw_other_project_other_task": other(raw(project_id="beta"), raw_base),
+        "raw_other_category_other_task": other(raw(category="tech_stack"), raw_base),
+        "raw_other_tags_other_task": other(raw(tags=["release"]), raw_base),
         "store_accepted": "true" if not alpha.startswith("http-") else _token(alpha),
         "raw_accepted": "true" if not raw_base.startswith("http-") else _token(raw_base),
     }
