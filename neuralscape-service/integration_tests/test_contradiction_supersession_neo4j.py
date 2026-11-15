@@ -190,3 +190,47 @@ def test_real_filter_hides_superseded_row_from_recall(graph_env):
         limit=10, query="",
     )
     assert {h.id for h in hits} == {new}
+
+
+# ── Dedup-hit stale-graph check (default path) on real Neo4j ──
+
+
+def _stale_case(graph_env, edges, *, episode="ep-x"):
+    """Seed ``edges`` for ``episode`` + a Qdrant row stamped with it; return
+    (episode_edge_counts, graph_row_is_stale) from the real code paths."""
+    from extensions.dreaming.graph_patcher import episode_edge_counts
+
+    svc, qdrant, collection, group, cypher = graph_env
+    pid = str(uuid.uuid4())
+    _row(qdrant, collection, pid, "u1", episode)
+    for uid, invalid in edges:
+        _seed_edge(cypher, group, uid, "fact", [episode], invalid=invalid, expired=invalid)
+    svc._memory.vector_store.client = qdrant
+    counts = svc._run_on_bridge(
+        episode_edge_counts(svc._graphiti.driver, group_id=group, episode_uuid=episode)
+    )
+    # graph_row_is_stale derives group_id from (visibility, user, project):
+    # patch the builder so it targets the unique test group.
+    from unittest.mock import patch
+
+    with patch("memory.write._build_group_id", return_value=group):
+        stale = svc.graph_row_is_stale(pid, "u1", None, "private")
+    return counts, stale
+
+
+def test_stale_check_episode_with_live_edges_is_current(graph_env):
+    counts, stale = _stale_case(graph_env, [("s-live-1", False), ("s-dead-1", True)])
+    assert counts == {"total": 2, "live": 1}
+    assert stale is False
+
+
+def test_stale_check_episode_with_all_edges_invalidated_is_stale(graph_env):
+    counts, stale = _stale_case(graph_env, [("s-dead-1", True), ("s-dead-2", True)])
+    assert counts == {"total": 2, "live": 0}
+    assert stale is True
+
+
+def test_stale_check_episode_with_no_edges_is_current(graph_env):
+    counts, stale = _stale_case(graph_env, [])
+    assert counts == {"total": 0, "live": 0}
+    assert stale is False
