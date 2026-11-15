@@ -8,7 +8,9 @@ future server — with no bespoke code.
 config:
   - ``transport``: "http" (Streamable HTTP, default) or "stdio"
   - http: ``url`` (required), optional ``headers``
-  - stdio: ``command`` (required), optional ``args`` (list), ``env`` (dict)
+  - stdio: ``command`` (required), optional ``args`` (list). Disabled unless the
+    operator allowlists the exact command line in CONNECTOR_STDIO_COMMANDS; see
+    ``connectors.stdio_policy``. ``env`` is not permitted.
   - ``server_name``: label used in the retrieval handle (default = connector_id)
 credentials (optional): merged into HTTP headers as ``{"headers": {...}}`` or a
   bearer token ``{"token": "..."}`` (sent as ``Authorization: Bearer``).
@@ -47,6 +49,13 @@ class MCPConnectorAdapter(ConnectorAdapter):
     @asynccontextmanager
     async def _session(self):
         """Yield an initialized MCP client session for the configured transport."""
+        # Backstop for configs stored before the allowlist existed (the API
+        # validates at registration); runs before anything is spawned.
+        from config import settings
+        from connectors.stdio_policy import validate_mcp_config
+
+        validate_mcp_config(self.config, settings.connector_stdio_commands_set())
+
         if self.session_factory is not None:
             async with self.session_factory() as session:
                 yield session
@@ -61,7 +70,6 @@ class MCPConnectorAdapter(ConnectorAdapter):
             params = StdioServerParameters(
                 command=self.config["command"],
                 args=self.config.get("args", []),
-                env=self.config.get("env"),
             )
             async with stdio_client(params) as (read, write):
                 async with ClientSession(read, write) as session:

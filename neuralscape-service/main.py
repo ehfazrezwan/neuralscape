@@ -1883,9 +1883,15 @@ async def v1_register_connector(req: ConnectorConfigRequest, request: Request):
     disabled) a replacement may change the owner; the vault then starts a new
     instance with fresh sync state.
     """
+    from connectors.stdio_policy import ConnectorConfigError, validate_mcp_config
     from connectors.vault import ConnectorOwnedElsewhere
 
     vault = _require_vault()
+    if req.connector_type == "mcp":
+        try:
+            validate_mcp_config(req.config, settings.connector_stdio_commands_set())
+        except ConnectorConfigError as e:
+            raise HTTPException(status_code=422, detail=str(e))
     resolved_user_id = _resolve_user_id(request, None)
     record = req.model_dump(mode="json", exclude_none=True)
     record["owner_user_id"] = resolved_user_id
