@@ -115,3 +115,17 @@ def fake_hybrid(monkeypatch):
         monkeypatch.setattr(settings, 'hybrid_inference_api_key', 'fake-local-key')
         monkeypatch.setattr(settings, 'hybrid_inference_model', 'test-model')
         yield server
+
+
+if __name__ == '__main__':  # python -m tests.fake_hybrid_server [port]  (manual "see it work" runs)
+    import sys
+    import time
+
+    port = int(sys.argv[1]) if len(sys.argv) > 1 else 8765
+    server = FakeHybrid()
+    server._server.server_close()
+    server._server = ThreadingHTTPServer(('127.0.0.1', port), server._server.RequestHandlerClass)
+    with server:
+        print(f'fake hybrid decision endpoint: {server.url}', flush=True)
+        while True:
+            time.sleep(3600)
