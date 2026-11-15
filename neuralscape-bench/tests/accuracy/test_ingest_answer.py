@@ -163,3 +163,41 @@ async def test_answer_namespace_matches_ingest(tmp_path):
     assert fake.search_user_ids == ["bench-pr-t11-testsuite-c1"]
     assert fake.ask_user_ids == ["bench-pr-t11-testsuite-c1"]
     await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_ingest_sends_suite_occurred_at_over_parsed_date(tmp_path):
+    """A suite-supplied deterministic ``occurred_at`` (DMR) reaches the write
+    body; sessions without one fall back to the parsed dataset date."""
+    from neuralscape_bench.accuracy.suites import dmr
+    from tests.accuracy import fixtures
+
+    data = dmr.parse(fixtures.DMR_SAMPLE)
+    # A dated, parseable session without suite occurred_at keeps the T1.3 path.
+    conv = data.conversations[0]
+    extra = Session(session_id="s9", date="1:00 pm on 5 May, 2023",
+                    turns=(Turn(role="user", content="hello"),))
+    data.conversations[0] = Conversation(conv_id=conv.conv_id,
+                                         sessions=conv.sessions + (extra,))
+    fake = _FakeNS()
+    client = NeuralscapeClient(
+        "http://test", http=httpx.AsyncClient(
+            transport=httpx.MockTransport(fake.handler), base_url="http://test"))
+    await ingest_suite(client, data, manifest=IngestManifest(tmp_path / "m.json"),
+                       concurrency=1, poll_timeout_s=5, poll_interval_s=0.01,
+                       log=lambda *_: None)
+    by_run = {c["run_id"]: c.get("occurred_at") for c in fake.extract_calls}
+    assert by_run["s1"] == "2025-12-29T12:00:00+00:00"  # anchor - "3 days ago"
+    assert by_run["s2"] == "2026-01-01T12:00:00+00:00"  # final session = anchor
+    assert by_run["s9"] == "2023-05-05"                 # parsed-date fallback
+    await client.aclose()
+
+
+def test_dmr_turn_content_has_no_speaker_prefix():
+    from neuralscape_bench.accuracy.suites import dmr
+    from tests.accuracy import fixtures
+
+    data = dmr.parse(fixtures.DMR_SAMPLE)
+    for sess in data.conversations[0].sessions:
+        for t in sess.turns:
+            assert not t.content.startswith("Speaker ")

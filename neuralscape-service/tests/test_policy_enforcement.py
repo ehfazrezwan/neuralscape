@@ -331,10 +331,11 @@ def test_enforced_profile_refuses_shared_key_and_auth_off(world, monkeypatch) ->
     monkeypatch.setattr(settings, "ns_auth_profile", "enforced")
     monkeypatch.setattr(settings, "neuralscape_api_key", "shared-key")
     client = make_client(world)
-    assert as_user(client, None, "GET", "/v1/memories").status_code == 404
+    # a refused KIND of credential is an honest 403 (nothing about a resource is disclosed)
+    assert as_user(client, None, "GET", "/v1/memories").status_code == 403
     monkeypatch.setattr(settings, "neuralscape_api_key", "")
     monkeypatch.setattr(settings, "neuralscape_user_token_secret", "")
-    assert as_user(client, None, "GET", "/v1/memories").status_code == 404
+    assert as_user(client, None, "GET", "/v1/memories").status_code == 403
     assert as_user(client, "alice", "GET", "/v1/memories").status_code == 200
 
 

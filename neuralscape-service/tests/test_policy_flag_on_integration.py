@@ -1,8 +1,8 @@
 """The policy and scoped-credential feature switched ON, end to end on the real FastAPI app.
 
 ``NS_POLICY_MODE=enforce`` and ``CREDENTIALS_ENABLED=1`` with the authority store on a real
-backend: SQLite always, and PostgreSQL (as the least-privilege runtime role) when
-``AUTHORITY_TEST_PG_DSN`` is set (that skip is the declared one).  A scoped credential is issued over
+backend: SQLite here, and PostgreSQL (as the least-privilege runtime role) in
+``integration_tests/test_policy_flag_on_pg.py``, which runs these same tests against it.  A scoped credential is issued over
 HTTP and used to write, read, list, search and get memories; a forbidden action is refused; and the
 same traffic proves the user's own token and the default (``NS_POLICY_MODE=off``) are unchanged.
 
@@ -32,10 +32,7 @@ from contracts_policy import PolicyStatement
 from credentials import CredentialService
 from policy_enforcement import PolicyEnforcer, memory_row_lookup, _handle
 from schemas import MemoryResponse
-from tests.authority_pg_support import DSN, REASON
 from tokens import issue_user_token
-
-pytestmark = pytest.mark.integration
 
 T = "tenant-a"
 SECRET = "flag-on-integration-secret"
@@ -140,7 +137,7 @@ class World:
                     ),
                 ],
             )
-        monkeypatch.setenv("CREDENTIALS_ENABLED", "1")
+        monkeypatch.setattr(settings, "credentials_enabled", True)
         monkeypatch.setattr(settings, "ns_policy_mode", mode)
         monkeypatch.setattr(settings, "ns_auth_profile", "legacy_compat")
         monkeypatch.setattr(settings, "neuralscape_user_token_secret", SECRET)
@@ -177,18 +174,14 @@ class World:
         policy_enforcement.configure(None)
 
 
-@pytest.fixture(params=["sqlite", pytest.param("postgres", marks=pytest.mark.skipif(not DSN, reason=REASON))])
-def store(request, tmp_path):
-    if request.param == "sqlite":
-        sqlite_store = SqliteAuthorityStore(str(tmp_path / "authority.db"))
-        yield sqlite_store
-        sqlite_store.close()
-        return
-    from tests.authority_pg_support import RuntimeRoleBackend
+@pytest.fixture
+def store(tmp_path):
+    """The authority store under test.  ``integration_tests/test_policy_flag_on_pg.py`` runs every test
+    below again with this fixture replaced by a PostgreSQL runtime-role store."""
 
-    backend = RuntimeRoleBackend()  # the service connects as the least-privilege role
-    yield backend.open()
-    backend.close()
+    sqlite_store = SqliteAuthorityStore(str(tmp_path / "authority.db"))
+    yield sqlite_store
+    sqlite_store.close()
 
 
 @pytest.fixture
@@ -331,34 +324,24 @@ def test_with_the_default_mode_off_existing_behaviour_is_unchanged(monkeypatch, 
         assert w.call("POST", "/v1/search", w.hmac["alice"], json={"query": "plain"}).status_code == 200
         # scoped credentials authenticate only while enforcement is on: a scope nothing enforces would be a lie
         assert w.call("GET", "/v1/memories", "nsc_cred_x.y").status_code == 401
-        monkeypatch.delenv("CREDENTIALS_ENABLED")
+        monkeypatch.setattr(settings, "credentials_enabled", False)
         assert w.call("POST", "/v1/credentials", w.hmac["alice"], json={"scope": ["list"]}).status_code == 404
         assert w.call("GET", "/v1/memories").status_code == 401  # auth itself is untouched
     finally:
         w.close()
 
 
-@pytest.fixture(params=["sqlite", pytest.param("postgres", marks=pytest.mark.skipif(not DSN, reason=REASON))])
-def configured_store(request, tmp_path, monkeypatch):
+@pytest.fixture
+def configured_store(tmp_path, monkeypatch):
     """A seeded authority store, plus the ``AUTHORITY_*`` settings that point the service at it."""
 
     monkeypatch.setattr(settings, "authority_enabled", True)
-    if request.param == "sqlite":
-        path = str(tmp_path / "configured.db")
-        seed = SqliteAuthorityStore(path)
-        monkeypatch.setattr(settings, "authority_backend", "sqlite")
-        monkeypatch.setattr(settings, "authority_sqlite_path", path)
-        yield seed
-        seed.close()
-        return
-    from tests.authority_pg_support import RuntimeRoleBackend
-
-    backend = RuntimeRoleBackend()
-    monkeypatch.setattr(settings, "authority_backend", "postgres")
-    monkeypatch.setattr(settings, "authority_postgres_dsn", backend.runtime_dsn)
-    monkeypatch.setattr(settings, "authority_postgres_migrate_on_open", False)  # the least-privilege role
-    yield backend.open()
-    backend.close()
+    path = str(tmp_path / "configured.db")
+    seed = SqliteAuthorityStore(path)
+    monkeypatch.setattr(settings, "authority_backend", "sqlite")
+    monkeypatch.setattr(settings, "authority_sqlite_path", path)
+    yield seed
+    seed.close()
 
 
 def test_the_service_builds_its_authority_store_from_settings_and_serves_scoped_credentials(

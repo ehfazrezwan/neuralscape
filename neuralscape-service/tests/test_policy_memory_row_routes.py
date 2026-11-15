@@ -156,8 +156,15 @@ def test_unknown_unowned_and_quarantined_rows_are_denied_identically(world) -> N
             assert denied(delete(w, user, row)[0])
 
 
-def test_the_shared_key_acts_for_the_user_it_asserts(world) -> None:
+def test_the_shared_key_acts_for_the_user_it_asserts(world, monkeypatch) -> None:
+    """The legacy trust-the-body mode (NEURALSCAPE_LEGACY_KEY_TRUST_BODY_USER_ID): the key names its user.
+
+    By default the shared key is bound to one identity (dev), which resolves like any token user; the
+    asserting behaviour below exists only under the explicit opt-in.
+    """
+
     w = world
+    monkeypatch.setattr(settings, "neuralscape_legacy_key_trust_body_user_id", True)
     key = lambda body: w.call(None, "PATCH", "/v1/memories/m-shared-alice", json=body)  # noqa: E731
     assert key({"content": "x", "user_id": "alice"}).status_code == 200            # as the author
     assert denied(key({"content": "x", "user_id": "bob"}))                          # not as someone else
@@ -192,3 +199,12 @@ def test_the_row_is_read_fresh_for_every_request(world) -> None:
         assert denied(patch(w, "bob", "m-flip", {"tags": ["t"]})[0])
     finally:
         ROWS.pop("m-flip", None)
+
+
+def test_by_default_the_shared_key_is_one_bound_identity_and_cannot_assert_another(world, monkeypatch) -> None:
+    w = world
+    monkeypatch.setattr(settings, "neuralscape_legacy_key_trust_body_user_id", False)
+    monkeypatch.setattr(settings, "neuralscape_api_key_user_id", "alice")
+    response = w.call(None, "PATCH", "/v1/memories/m-shared-alice", json={"content": "x", "user_id": "bob"})
+    assert denied(response) and w.service.patch_memory.call_count == 0   # not bob: the key is alice here
+    assert w.call(None, "PATCH", "/v1/memories/m-shared-alice", json={"content": "x"}).status_code == 200  # as alice

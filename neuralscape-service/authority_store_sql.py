@@ -1021,7 +1021,7 @@ class SqlAuthorityStore:
             row = self._one(
                 c,
                 "SELECT subject_id, tenant_id, scope, family_id, secret_hash, kind, consumed_at,"
-                " revoked_at, expires_at, successor_id, parent_family_id, cap_expires_at"
+                " revoked_at, expires_at, successor_id, parent_family_id, cap_expires_at, issued_at"
                 " FROM authority_credential_secrets WHERE credential_id=?" + self._update_lock,
                 (refresh_id,),
             )
@@ -1064,6 +1064,18 @@ class SqlAuthorityStore:
                 )
                 if account is not None and account[0] != "active":
                     raise CredentialInvalid("service account is disabled")
+                # The successor lives as long as the family was issued to live (a short-lived credential
+                # stays short-lived across refreshes), not for the service's default lifetimes.
+                last_access = self._one(
+                    c,
+                    "SELECT issued_at, expires_at FROM authority_credential_secrets"
+                    " WHERE family_id=? AND kind='access' ORDER BY issued_at DESC LIMIT 1",
+                    (family_id,),
+                )
+                if last_access is not None and last_access[1] > last_access[0]:
+                    access = (access[0], access[1], now + (last_access[1] - last_access[0]))
+                if row[8] > row[12]:
+                    refresh = (refresh[0], refresh[1], now + (row[8] - row[12]))
                 self._x(
                     c,
                     "UPDATE authority_credential_secrets SET consumed_at=?, successor_id=? WHERE credential_id=?",
@@ -1579,7 +1591,7 @@ def _owner_only(path: str) -> None:
     name is opened without following a symbolic link or blocking on a pipe and must be a regular file
     (``OSError`` otherwise), and the mode is changed through that descriptor, so a link planted at the
     path is refused and its target never touched.  A regular file that cannot be tightened (owned by
-    another user, for example) is logged, not refused.
+    another user, for example) is refused too.
     """
 
     if path == ":memory:" or path.startswith("file:"):
@@ -1598,8 +1610,10 @@ def _owner_only(path: str) -> None:
             if stat.S_IMODE(info.st_mode) & 0o077:
                 try:
                     os.fchmod(descriptor, stat.S_IMODE(info.st_mode) & 0o700)
-                except OSError:
-                    _logger.warning("the authority database file %s could not be made owner-only", name)
+                except OSError as error:
+                    # owner-only is a security property: a database holding secret hashes that stays
+                    # readable by other users is refused, not logged and used.
+                    raise OSError(f"the authority database file {name} is readable by other users and could not be made owner-only") from error
         finally:
             os.close(descriptor)
 

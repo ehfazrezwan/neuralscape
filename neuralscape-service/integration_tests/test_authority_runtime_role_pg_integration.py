@@ -16,12 +16,9 @@ from __future__ import annotations
 
 import pytest
 
-from tests.authority_pg_support import DSN, REASON, RuntimeRoleBackend
+from tests.authority_pg_support import RuntimeRoleBackend, require_pg  # noqa: F401  (autouse)
 
-pytestmark = [
-    pytest.mark.integration,
-    pytest.mark.skipif(not DSN, reason=REASON),
-]
+pytestmark = pytest.mark.integration
 
 psycopg = pytest.importorskip("psycopg")
 

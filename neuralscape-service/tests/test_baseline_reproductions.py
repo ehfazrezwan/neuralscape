@@ -29,44 +29,17 @@ def _run(coro):
     return asyncio.run(coro)
 
 
-def _collision_free_ids() -> bool:
-    """The enforced auth profile names identities and namespaces collision-free (False where the fix is absent)."""
-    try:
-        from identity import collision_free_ids_enabled
-    except ImportError:  # a lineage without the enforced-profile identity fix: the legacy defect stands
-        return False
-    return collision_free_ids_enabled()
-
-
-def _readiness_probes_backends() -> bool:
-    """Whether ``/health`` probes the real backends (it takes a ``require`` query parameter) in this tree."""
-    import ast
-
-    tree = ast.parse((SERVICE_DIR / "main.py").read_text(encoding="utf-8"))
-    for node in ast.walk(tree):
-        if isinstance(node, ast.AsyncFunctionDef) and node.name == "health":
-            return "require" in {arg.arg for arg in node.args.args + node.args.kwonlyargs}
-    return False
-
-
-def _compose_backup_tooling_present() -> bool:
-    """Whether the compose backup tool is shipped in this tree."""
-    return (REPO_ROOT / "scripts" / "compose_backup.py").is_file()
-
-
 # ---------------------------------------------------------------------------
 # Namespace and identity collisions
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.xfail(
-    not _collision_free_ids(),
     strict=True,
     raises=AssertionError,
     reason=(
         "legacy group ids join user and project with a delimiter that legal ids "
-        "may contain, so different (user, project) tuples can share one namespace "
-        "(fixed under the enforced auth profile)"
+        "may contain, so different (user, project) tuples can share one namespace"
     ),
 )
 def test_distinct_namespace_tuples_have_distinct_group_ids() -> None:
@@ -95,13 +68,9 @@ def test_ordinary_namespace_tuples_stay_distinct() -> None:
 
 
 @pytest.mark.xfail(
-    not _collision_free_ids(),
     strict=True,
     raises=AssertionError,
-    reason=(
-        "legacy email slugging collapses every disallowed run to one '-', so distinct emails "
-        "can share a user id (fixed under the enforced auth profile)"
-    ),
+    reason="legacy email slugging collapses every disallowed run to one '-', so distinct emails can share a user id",
 )
 def test_distinct_emails_have_distinct_user_ids() -> None:
     from identity import derive_user_id
@@ -359,9 +328,8 @@ def _remove_episode(monkeypatch, episode_uuid: str, edges: list):
     strict=True,
     raises=AssertionError,
     reason=(
-        "library observation (oracle v2): the vendored library's episode removal deletes every edge whose first "
-        "supporting episode is the removed one, even when other episodes still support the edge; the service "
-        "removes episodes through the graph adapter, so this no longer stands for the product requirement"
+        "removing an episode deletes every edge whose first supporting episode is the removed one, "
+        "even when other episodes still support the edge (reproduced on a real graph by the engines lane)"
     ),
 )
 def test_graph_removal_keeps_edges_supported_by_other_episodes(monkeypatch) -> None:
@@ -421,7 +389,6 @@ def _health(monkeypatch, *, memory, pool_reachable: bool = True) -> dict:
 
 
 @pytest.mark.xfail(
-    not _readiness_probes_backends(),
     strict=True,
     raises=AssertionError,
     reason=(
@@ -477,7 +444,6 @@ def _compose_volumes() -> set[str]:
 
 
 @pytest.mark.xfail(
-    not _compose_backup_tooling_present(),
     strict=True,
     raises=AssertionError,
     reason=(

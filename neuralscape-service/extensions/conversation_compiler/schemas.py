@@ -53,6 +53,9 @@ class CompileResult(BaseModel):
     articles: list[CompiledArticle] = Field(default_factory=list)
     entries_compiled: int = 0
     dedup_triggered: bool = False
+    # Sibling re-ingests the post-compile dedup produced (see MemoryService.dedup_memories)
+    dedup_graph_jobs_enqueued: int = 0
+    dedup_graph_jobs_not_enqueued: int = 0
 
 
 # ──────────────────────────────────────────────

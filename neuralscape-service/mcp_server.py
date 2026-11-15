@@ -1479,7 +1479,7 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
     # Explicit action policy (NS_POLICY_MODE; a no-op while it is "off").
     from policy_enforcement import enforce_mcp_call
 
-    _policy_denial = enforce_mcp_call(name, arguments)
+    _policy_denial = await asyncio.to_thread(enforce_mcp_call, name, arguments)
     if _policy_denial is not None:
         return [TextContent(type="text", text=json.dumps(_policy_denial))]
 
@@ -2209,6 +2209,20 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
                     filter_null_category=arguments.get("filter_null_category", False),
                     include_shared=arguments.get("include_shared", False),
                 )
+            # Sibling facts that shared a deleted fact's graph episode need a
+            # fresh single-fact re-ingest; the delete itself has already
+            # succeeded, so a queue failure is reported, never raised.
+            if isinstance(result, dict):
+                jobs = result.pop("graph_jobs", None)
+                if jobs:
+                    try:
+                        result.update(await _task_manager.enqueue_graph_jobs(jobs))
+                    except Exception as e:
+                        logger.warning(f"Sibling graph re-enrichment could not be queued: {e}")
+                        result.update({
+                            "graph_jobs_enqueued": 0,
+                            "graph_jobs_not_enqueued_ids": [j.get("memory_id") for j in jobs],
+                        })
             return [TextContent(type="text", text=json.dumps(result, default=str))]
 
         elif name == "edit_memory":
@@ -2242,12 +2256,28 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
                     logger.warning(f"Graph enqueue failed for edited memory: {e}")
                     graph = "enqueue_failed"
             mem = result.get("memory")
-            return [TextContent(type="text", text=json.dumps({
+            response = {
                 "status": "ok",
                 "memory": mem.model_dump(exclude_none=True) if mem is not None else None,
                 "graph": graph,
                 "graph_task_id": graph_task_id,
-            }, default=str))]
+            }
+            sibling_jobs = result.get("sibling_graph_jobs") or []
+            if sibling_jobs or result.get("sibling_graph_unrepaired_ids"):
+                # The moved fact's whole conversation episode was expired;
+                # re-ingest the surviving siblings (additive keys).
+                queued: dict = {}
+                if sibling_jobs:
+                    try:
+                        queued = await _task_manager.enqueue_graph_jobs(sibling_jobs)
+                    except Exception as e:
+                        logger.warning(f"Sibling graph re-enrichment could not be queued: {e}")
+                        queued = {"graph_jobs_not_enqueued_ids": [j.get("memory_id") for j in sibling_jobs]}
+                response["sibling_graph_jobs_enqueued"] = queued.get("graph_jobs_enqueued", 0)
+                response["sibling_graph_jobs_not_enqueued_ids"] = queued.get("graph_jobs_not_enqueued_ids", [])
+                response["sibling_graph_unrepaired_ids"] = result.get("sibling_graph_unrepaired_ids", [])
+                response["sibling_graph_repair_failed"] = bool(result.get("sibling_graph_repair_failed"))
+            return [TextContent(type="text", text=json.dumps(response, default=str))]
 
         elif name == "get_reasoning_chain":
             try:

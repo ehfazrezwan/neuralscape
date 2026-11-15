@@ -15,7 +15,9 @@ Pure building blocks that need no durable ledger:
 
 ``InMemoryBindingStore`` is a REFERENCE implementation for tests.  A durable
 store with an atomic unique constraint arrives with the selected ledger.
-Nothing here changes runtime authentication.
+The authority store (``authority_store_sql``) is the durable ``BindingStore``; ``credentials`` and
+``policy_enforcement`` resolve identities through it when they are switched on, and nothing here changes
+authentication while they are off.
 """
 
 from __future__ import annotations

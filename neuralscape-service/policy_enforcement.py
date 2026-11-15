@@ -14,7 +14,8 @@ The operation's action and target-resolver spec come from ``policy_registry``;
 the tenant comes only from the verified subject record, never from a request
 field.  Row-dependent targets (a memory, episode or artifact id) need an
 injected ``row_lookup`` that maps the row to its pool; without one they are
-unresolved and deny in enforce mode.  Worker publication is enforced by the publication fence, not here.
+unresolved and deny in enforce mode.  Worker publication is meant to be enforced by the publication fence, not here; the fence is a library in this
+slice and is wired to the write path by a later slice (05/07).
 
 Boundaries: the dependency runs for every API route (including routers mounted
 later); targets are resolved from the same parsed request the handler receives
@@ -30,6 +31,7 @@ authorizes them.
 from __future__ import annotations
 
 import email.message
+import asyncio
 import logging
 import re
 from collections.abc import Callable, Mapping
@@ -120,6 +122,12 @@ class RequestContext(NamedTuple):
     subject_id: str | None = None
     credential_id: str | None = None
     credential_scope: tuple[str, ...] | None = None
+    # The legacy shared key authenticated this request.  Since the key is bound to one identity it also
+    # sets ``user_id``; that identity is only what the key ASSERTS (``legacy_user_id``), never a token
+    # user's, so the request is judged as the legacy principal (refused under the enforced profile,
+    # never an administrator or credential minter).
+    legacy_shared: bool = False
+    legacy_user_id: str | None = None
 
 
 class Decision(NamedTuple):
@@ -717,7 +725,7 @@ def _asserted_subject(context: RequestContext) -> str | None:
     for source in (context.body, context.arguments):
         if isinstance(source, Mapping) and type(source.get("user_id")) is str:
             return source["user_id"]
-    return None
+    return context.legacy_user_id if context.legacy_shared else None
 
 
 def _build_principal(subject_id: str, record: SubjectRecord) -> PrincipalContext:
@@ -906,8 +914,11 @@ def request_identity(request: Request) -> RequestContext:
     added here is seen by all of them at once.
     """
 
+    user_id = getattr(request.state, "user_id", None)
+    if getattr(request.state, "auth_mode", None) == "legacy_shared":
+        return RequestContext(user_id=None, legacy_shared=True, legacy_user_id=user_id)
     return RequestContext(
-        user_id=getattr(request.state, "user_id", None),
+        user_id=user_id,
         **_credential_fields(getattr(request.state, "credential", None)),
     )
 
@@ -982,7 +993,14 @@ def evaluate_request(operation_id: str, context: RequestContext) -> PublicError 
         if decision.unavailable
         else InternalErrorCode.DENIED
     )
+    if decision.reason in _CREDENTIAL_REFUSED:
+        # The profile refuses this KIND of credential outright; nothing about any resource is disclosed,
+        # so it is an honest 403 rather than the existence-safe 404 used for every other denial.
+        return public_error_for(InternalErrorCode.DENIED, disclose_existence=True)
     return public_error_for(code)
+
+
+_CREDENTIAL_REFUSED = frozenset({"legacy_credential_refused", "unauthenticated_refused"})
 
 
 def operation_id_for_route(method: str, path: str) -> str | None:
@@ -1064,7 +1082,8 @@ async def enforce_request(request: Request) -> None:
         body=body,
         body_unreadable=unreadable,
     )
-    error = evaluate_request(operation_id, context)
+    # The authority store is synchronous SQLite/psycopg I/O: off the event loop.
+    error = await asyncio.to_thread(evaluate_request, operation_id, context)
     if error is not None:
         raise HTTPException(status_code=_status_for(error), detail=_public_detail(error))
 
@@ -1074,14 +1093,19 @@ def enforce_mcp_call(name: str, arguments: Mapping[str, Any] | None) -> dict | N
 
     if current_mode() == "off":
         return None
-    from auth import current_user_id
+    from auth import current_legacy_shared, current_user_id
     from credentials import current_credential
 
-    context = RequestContext(
-        user_id=current_user_id.get(),
-        arguments=arguments or {},
-        **_credential_fields(current_credential.get()),
-    )
+    if current_legacy_shared.get():
+        context = RequestContext(
+            user_id=None, arguments=arguments or {}, legacy_shared=True, legacy_user_id=current_user_id.get()
+        )
+    else:
+        context = RequestContext(
+            user_id=current_user_id.get(),
+            arguments=arguments or {},
+            **_credential_fields(current_credential.get()),
+        )
     error = evaluate_request(f"mcp_tool:{name}", context)
     return None if error is None else _public_detail(error)
 

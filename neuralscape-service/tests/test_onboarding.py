@@ -607,13 +607,19 @@ def test_a_default_member_cannot_start_any_dreaming_sweep(tmp_path, preset, oper
 
 @pytest.mark.parametrize("operation_id", _DREAM_OPERATIONS)
 def test_an_administrator_granted_tenant_derivation_can_start_a_sweep(tmp_path, operation_id) -> None:
-    from policy_enforcement import tenant_handle
+    from policy_enforcement import privileged_handle, tenant_handle
 
     store, enforcer, admin, _dana = _dream_world(tmp_path, "hosted-v1")
     assert not _decide(enforcer, operation_id, "admin", {})  # nothing is implied for the administrator
+    # An ordinary tenant-level grant is not enough: the operation is administrator-only (privileged handle).
+    store.grant_statements(T, [PolicyStatement(
+        id="dream-plain", effect="allow", subject_id=admin, credential_id=None,
+        action="background_derive", resource=tenant_handle(T),
+    )])
+    assert not _decide(type(enforcer)(store, store), operation_id, "admin", {})
     store.grant_statements(T, [PolicyStatement(
         id="dream-admin", effect="allow", subject_id=admin, credential_id=None,
-        action="background_derive", resource=tenant_handle(T),
+        action="background_derive", resource=privileged_handle("background_derive", tenant_handle(T)),
     )])
     enforcer = type(enforcer)(store, store)
     for request in ({}, {"pool": "shared"}, {"pool": "user--erin", "force": True}):

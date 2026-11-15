@@ -5,9 +5,8 @@ In this slice the ledger is a library: no write is routed through it (the produc
 turning the flag on neither breaks the app nor changes a write's answer, and that the ledger the flag points at
 can be opened and migrated.
 
-* ``test_flag_on_*`` need no external service (the queue is faked) and run with the ordinary suite.
-* ``test_flag_on_write_through_real_redis`` needs ``LEDGER_TEST_REDIS_URL`` (a disposable Redis) and enqueues
-  through the real ARQ pool; it is skipped, with the declared reason, when that variable is unset.
+These need no external service (the queue is faked) and run with the ordinary suite.  The real-Redis write
+is ``integration_tests/test_ledger_flag_on_real_redis.py``.
 """
 
 from __future__ import annotations
@@ -26,9 +25,6 @@ from ledger import open_ledger
 from task_manager import TaskManager
 from tests.test_task_status_owner import PipelineRedis
 
-pytestmark = pytest.mark.integration
-
-REDIS_URL = os.environ.get("LEDGER_TEST_REDIS_URL")
 _RAW = {"content": "the ledger flag is on", "category": "preference", "user_id": "alice"}
 
 
@@ -119,24 +115,30 @@ def test_flag_on_batch_write_answer_on_the_legacy_path(flag_on, fake_queue):
     assert batch.json()["task_id"]
 
 
-@pytest.mark.skipif(not REDIS_URL, reason="LEDGER_TEST_REDIS_URL not set (ledger flag-on real Redis)")
-@pytest.mark.asyncio
-async def test_flag_on_write_through_real_redis(flag_on, monkeypatch):
-    monkeypatch.setattr(settings, "redis_url", REDIS_URL)
-    monkeypatch.setattr(settings, "arq_queue_name", "ledger-flag-on-test")
-    manager = TaskManager()
-    await manager.connect()
-    monkeypatch.setattr(main, "_task_manager", manager)
-    try:
-        import httpx
+class _FakeProducer:
+    """Stands in for a ledger producer so the task manager reports the durable route."""
 
-        transport = httpx.ASGITransport(app=main.app)
-        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-            resp = await client.post("/v1/memories/raw", json=_RAW, headers={"Idempotency-Key": "retry-3"})
-            assert resp.status_code == 202
-            task_id = resp.json()["task_id"]
-            status = await client.get(f"/v1/memories/status/{task_id}")
-            assert status.status_code == 200
-            assert status.json()["status"] in {"queued", "pending", "processing", "in_progress", "complete", "completed"}
-    finally:
-        await manager.close()
+
+@pytest.fixture()
+def durable(monkeypatch, flag_on, fake_queue):
+    fake_queue.producer = _FakeProducer()
+    monkeypatch.setattr(fake_queue, "_durable_route", lambda: True)
+    assert main._durable() is True
+    return fake_queue
+
+
+def test_durable_branch_accepts_an_idempotency_key_without_a_500(durable):
+    # The durable wiring hands the key to the task manager; the manager accepts it (unused until writes
+    # use the ledger) instead of raising TypeError.
+    client = TestClient(main.app)
+    headers = {"Idempotency-Key": "retry-4"}
+    assert client.post("/v1/memories/raw", json=_RAW, headers=headers).status_code == 202
+    assert client.post("/v1/memories/raw/batch", json={"memories": [_RAW]}, headers=headers).status_code == 202
+    legacy = client.post("/memories/async", json={"messages": [{"role": "user", "content": "hello"}], "user_id": "alice"},
+                         headers=headers)
+    assert legacy.status_code == 200 and legacy.json()["task_id"]
+
+
+def test_durable_branch_rejects_an_over_long_idempotency_key(durable):
+    resp = TestClient(main.app).post("/v1/memories/raw", json=_RAW, headers={"Idempotency-Key": "x" * 500})
+    assert resp.status_code == 400

@@ -47,6 +47,7 @@ import {
   parseStdin,
   readConfig,
   recordGatedFile,
+  recordFailure,
   recordTransportFailure,
   resetTransportFailures,
   saveReadGateIndexCache,
@@ -207,9 +208,11 @@ async function main(): Promise<void> {
       } catch (error) {
         // Transport failure → allow, exit 0 (never-block) + count toward the
         // fail-loud threshold surfaced at next SessionStart.
-        await recordTransportFailure();
+        // Only a down/failing service counts; a rejected token or wrong URL
+        // (401/403/404) does not (see recordFailure).
+        const { kind } = await recordFailure(error);
         await saveReadGateIndexCache(sessionId, projectId, false, []);
-        logError("read-gate memory fetch failed (service unreachable?) — allowing read", error);
+        logError(`read-gate memory fetch failed (${kind}) — allowing read`, error);
         outputContinue();
         return;
       }

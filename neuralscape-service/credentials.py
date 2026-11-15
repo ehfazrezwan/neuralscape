@@ -12,8 +12,8 @@ A scoped credential is bound to ``(subject, tenant, scope, expiry)``:
   credential.  Presenting an already-consumed refresh token is a replay and
   revokes the whole family;
 * revoking a credential or offboarding the subject retires it in the authority
-  store, which is also what fences queued work at publication
-  (``publication_fence``/``hold_current``);
+  store.  The publication fence (``publication_fence``/``hold_current``) is what will stop queued work at
+  publication, but it has no caller in this slice (wired by slices 05/07), so queued work is not yet stopped;
 * service accounts are owned by a recorded human controller, hold only their
   own statements, may have at most two active credential families (so a key
   can be rotated without downtime), and can be disabled.
@@ -28,7 +28,6 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
-import os
 import secrets
 import threading
 import time
@@ -86,10 +85,7 @@ class ScopeError(ValueError):
 
 
 def enabled() -> bool:
-    flag = getattr(settings, "credentials_enabled", None)
-    if flag is None:
-        flag = os.environ.get("CREDENTIALS_ENABLED", "").strip().lower() in {"1", "true", "yes"}
-    return bool(flag)
+    return bool(settings.credentials_enabled)
 
 
 def accepts_scoped_credentials() -> bool:
