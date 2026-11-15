@@ -90,8 +90,8 @@ def check_gone(client: NSClient, memory_id: str, marker: str, project_id: str, c
     r = client.get(f"/v1/memories/{memory_id}")
     assert r.status_code == 404, f"GET by id -> {r.status_code} (want 404)"
     assert not rows_with(list_rows(client, project_id=project_id), marker), "still listed"
-    # keyword leg: the bare rare token; dense leg: a natural-language query
-    natural = content.replace(marker, "").strip() or "what was recorded about this"  # marker-free: dense side
+    # bare rare token, and the stored text minus the marker (BM25 can match this one too)
+    natural = content.replace(marker, "").strip() or "what was recorded about this"
     for query in (marker, natural):
         hits = client.search(query, project_id=project_id, limit=20)
         assert not any(marker in h.get("memory", "") for h in hits), f"still recalled by search for {query!r}"

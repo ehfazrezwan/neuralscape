@@ -201,13 +201,21 @@ def test_query_with_no_shared_word_recalls_the_fact_through_the_dense_leg(a, leg
         d.require()
     shared = _words(LEGS_QUERY) & _words(f"{legs['marker']} {LEGS_TEXT}")
     assert not shared, f"test data bug: query and fact share words {sorted(shared)}"
-    def check_ranked_first():
-        results = a.search(LEGS_QUERY, project_id=legs["project"], limit=5)
-        assert results and legs["marker"] in results[0].get("memory", ""), (
-            f"target is not the top hit among {len(results)}: {[r.get('memory', '')[:40] for r in results[:3]]}"
-        )
-
-    eventually(check_ranked_first, timeout=90, what="zero-overlap paraphrase ranks the fact first among decoys")
+    eventually(
+        lambda: check_search_finds(a, legs["marker"], LEGS_QUERY, legs["project"]),
+        timeout=90, what="the fact is searchable at all",
+    )
+    # Ranking is asserted once, outside the retry loop, with a margin.
+    results = a.search(LEGS_QUERY, project_id=legs["project"], limit=5)
+    assert results and legs["marker"] in results[0].get("memory", ""), (
+        f"target is not the top hit: {[r.get('memory', '')[:40] for r in results[:3]]}"
+    )
+    scores = [r.get("score") for r in results]
+    if all(isinstance(x, (int, float)) for x in scores) and len(scores) > 1:
+        assert scores[0] > max(scores[1:]), f"target's score has no margin over the decoys: {scores}"
+    else:  # no scores in the response: require the same rank-1 result twice in a row
+        again = a.search(LEGS_QUERY, project_id=legs["project"], limit=5)
+        assert again and again[0].get("id") == results[0].get("id"), "rank 1 is not stable across two searches"
 
 
 @proves("read.hybrid-search-core")
