@@ -63,7 +63,7 @@ class FakeHybrid:
     """Context-managed local server; records every request body it receives."""
 
     def __init__(self, policy: Callable[[dict], dict] = default_policy, *, status: int = 200,
-                 model: str | None = None):
+                 model: str | None = None, port: int = 0):
         self.policy, self.status, self.model = policy, status, model
         self.requests: list[dict] = []
         outer = self
@@ -89,7 +89,7 @@ class FakeHybrid:
             def log_message(self, *args):  # silence stderr noise
                 pass
 
-        self._server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+        self._server = ThreadingHTTPServer(('127.0.0.1', port), Handler)
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
 
     @property
@@ -121,11 +121,8 @@ if __name__ == '__main__':  # python -m tests.fake_hybrid_server [port]  (manual
     import sys
     import time
 
-    port = int(sys.argv[1]) if len(sys.argv) > 1 else 8765
-    server = FakeHybrid()
-    server._server.server_close()
-    server._server = ThreadingHTTPServer(('127.0.0.1', port), server._server.RequestHandlerClass)
-    with server:
+    port = int(sys.argv[1]) if len(sys.argv) > 1 else 18765
+    with FakeHybrid(port=port) as server:
         print(f'fake hybrid decision endpoint: {server.url}', flush=True)
         while True:
             time.sleep(3600)
