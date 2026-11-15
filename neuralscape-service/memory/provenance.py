@@ -441,6 +441,7 @@ class ProvenanceMixin:
         try:
             from qdrant_client.models import FieldCondition, Filter, MatchAny, MatchValue
 
+            self._ensure_filter_indexes()
             client = self._memory.vector_store.client
             collection = settings.qdrant_collection
             should = []
@@ -508,8 +509,8 @@ class ProvenanceMixin:
                 siblings = [t for t in siblings if t[0] not in set(ids)]
 
         for sid, payload, meta, _ in siblings:
-            if sid in skip_job_ids:
-                continue
+            if sid in skip_job_ids or meta.get("dream_tombstoned"):
+                continue  # tombstoned rows are not live: ref cleared, no re-ingest
             content = payload.get("data") or ""
             workspace = meta.get("workspace")
             if not content or (workspace and workspace != "memory"):

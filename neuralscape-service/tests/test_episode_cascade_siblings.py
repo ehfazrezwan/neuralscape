@@ -470,6 +470,20 @@ class TestDeleteOneOfN:
         assert [j["memory_id"] for j in out["graph_jobs"]] == [conv.ids[1]]
         assert out["graph_sibling_unrepaired_ids"] == [conv.ids[2]]
 
+    def test_tombstoned_sibling_ref_cleared_but_not_reingested(self, world):
+        w = world
+        conv = seed_conversation(w, n=3)
+        w.q.meta(conv.ids[2])["dream_tombstoned"] = True
+        out = w.svc.delete_memory(conv.ids[0], OWNER)
+        assert [j["memory_id"] for j in out["graph_jobs"]] == [conv.ids[1]]
+        assert out["graph_sibling_unrepaired_ids"] == []
+        assert w.q.meta(conv.ids[2])["graph_episode_uuid"] is None
+
+    def test_episode_ref_fields_are_payload_indexed(self, world):
+        fields = dict(w_f for w_f in type(world.svc)._FILTER_INDEX_FIELDS)
+        assert fields["metadata.graph_episode_uuid"] == "keyword"
+        assert fields["metadata.graph_episode_name"] == "keyword"
+
     def test_graph_disabled_response_shape_unchanged(self, world):
         w = world
         w.svc._graphiti = None
