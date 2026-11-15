@@ -132,12 +132,15 @@ async def test_fusion_repo_from_code_space_not_project_id(registry_with_code, mo
     ]
 
     # The anchored memory in Qdrant, keyed on the CODE_SPACE repo.
-    mem_point = MagicMock(payload={
-        "id": "anchored-mem",
+    # Shaped like memory/write.py stores it: point id = memory id, author at
+    # top-level payload user_id + metadata.owner_user_id (no payload "id").
+    mem_point = MagicMock(id="anchored-mem", payload={
         "data": "Decision: run() dispatches via async — ADR-7",
+        "created_at": "2026-01-01T00:00:00Z",
+        "user_id": "bob",
         "metadata": {
             "source_ref": {"external_id": correct_key},
-            "category": "decision", "visibility": "shared", "user_id": "bob",
+            "category": "decision", "visibility": "shared", "owner_user_id": "bob",
         },
     })
     fake_service = MagicMock()
