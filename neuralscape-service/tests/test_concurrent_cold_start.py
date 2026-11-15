@@ -213,37 +213,9 @@ class LostRaceQdrantServer(RacingQdrantServer):
 def legacy_main(monkeypatch):
     import main
 
-    monkeypatch.setattr(main, "_memory", None)
-    monkeypatch.setattr(main, "_graphiti", None)
-    monkeypatch.setattr(main, "_bridge", None)
     monkeypatch.setattr(main, "_async_memory", None)
     monkeypatch.setattr(type(settings), "get_mem0_config", lambda self: {})
     return main
-
-
-def test_legacy_lazy_memory_survives_the_race(monkeypatch, legacy_main):
-    monkeypatch.setattr("memory.core.time.sleep", lambda s: None, raising=False)
-    """main._get_memory (legacy routes) builds the client once; when that first
-    build races another process it must still come up."""
-    server = LostRaceQdrantServer()
-    monkeypatch.setattr(mem0.Memory, "from_config", _fake_from_config(server))
-    memory = legacy_main._get_memory()
-    assert memory is not None and legacy_main._memory is memory
-    assert server.conflicts == 1
-    assert server.creates == 0
-
-
-def test_legacy_lazy_memory_other_errors_fail_at_once(monkeypatch, legacy_main):
-    calls = []
-
-    def from_config(config):
-        calls.append(1)
-        raise _unrelated_409()
-
-    monkeypatch.setattr(mem0.Memory, "from_config", from_config)
-    with pytest.raises(UnexpectedResponse):
-        legacy_main._get_memory()
-    assert len(calls) == 1 and legacy_main._memory is None
 
 
 def test_legacy_async_memory_survives_the_race(monkeypatch, legacy_main):
@@ -353,14 +325,6 @@ def test_only_the_two_concurrent_creation_answers_are_retried(exc, expected):
     from memory.core import _is_concurrent_creation
 
     assert _is_concurrent_creation(exc) is expected
-
-
-def test_legacy_lazy_memory_survives_a_collection_still_being_created(monkeypatch, legacy_main):
-    monkeypatch.setattr("memory.core.time.sleep", lambda s: None, raising=False)
-    server = StillCreatingQdrantServer(unreadable_reads=1)
-    monkeypatch.setattr(mem0.Memory, "from_config", _fake_from_config(server))
-    memory = legacy_main._get_memory()
-    assert memory is not None and legacy_main._memory is memory
 
 
 class ScriptedQdrantServer(RacingQdrantServer):
