@@ -1210,6 +1210,9 @@ async def auto_compile_check(ctx: dict) -> dict | None:
 
     if not compiler_settings.auto_compile:
         return None
+    if ctx.get("ledger") is not None:
+        # This cron compiles for the *default user*; under the ledger no cron may act as one.
+        return {"skipped": True, "reason": "default-user cron is disabled while the ledger is on"}
 
     now = datetime.now()
     if now.hour < compiler_settings.compile_after_hour:
