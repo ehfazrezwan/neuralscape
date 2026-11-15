@@ -8,6 +8,7 @@ from datetime import datetime
 import structlog
 from fastapi import APIRouter, HTTPException, Request
 
+from auth import resolve_request_user_id
 from memory_service import MemoryService
 from task_manager import TaskManager, record_task_owner
 
@@ -49,17 +50,9 @@ def create_router(
     """
     router = APIRouter()
 
-    async def _record_owner(http_request: Request, task_id: str, body_user_id: str) -> None:
-        """Let the enqueuing user poll ``task_id`` on /v1/memories/status.
-
-        The owner is the body's ``user_id`` (the user the task runs as), but
-        only when the caller is that user: with a per-user token naming a
-        different user nobody is recorded, so the status read fails closed.
-        """
-        token_user_id = getattr(http_request.state, "user_id", None)
-        if token_user_id and token_user_id != body_user_id:
-            return
-        await record_task_owner(task_manager.pool, task_id, body_user_id)
+    async def _record_owner(task_id: str, user_id: str) -> None:
+        """Let the resolved user poll ``task_id`` on /v1/memories/status."""
+        await record_task_owner(task_manager.pool, task_id, user_id)
 
     @router.post("/flush", status_code=202, response_model=dict)
     async def flush(request: FlushRequest, http_request: Request) -> dict:
@@ -68,6 +61,7 @@ def create_router(
         Enqueues the extraction to the ARQ worker for async processing.
         Returns 202 Accepted with a task reference.
         """
+        user_id = resolve_request_user_id(http_request, request.user_id)
         timestamp = request.timestamp or datetime.now().isoformat()
 
         if task_manager and task_manager.pool:
@@ -80,11 +74,11 @@ def create_router(
                     request.channel,
                     timestamp,
                     request.project_id,
-                    request.user_id,
+                    user_id,
                 )
                 task_id = job.job_id if job else "duplicate"
                 if job:
-                    await _record_owner(http_request, task_id, request.user_id)
+                    await _record_owner(task_id, user_id)
                 return {"status": "accepted", "task_id": task_id}
             except Exception:
                 logger.warning("ARQ enqueue failed, falling back to sync flush")
@@ -97,7 +91,7 @@ def create_router(
             channel=request.channel,
             timestamp=timestamp,
             project_id=request.project_id,
-            user_id=request.user_id,
+            user_id=user_id,
             service=service,
             writer=writer,
         )
@@ -112,26 +106,27 @@ def create_router(
 
         Enqueues compilation to the ARQ worker for async processing.
         """
+        user_id = resolve_request_user_id(http_request, request.user_id)
         if task_manager and task_manager.pool:
             try:
                 job = await task_manager.pool.enqueue_job(
                     "process_conversation_compile",
                     request.date,
-                    request.user_id,
+                    user_id,
                 )
                 task_id = job.job_id if job else "duplicate"
                 if job:
-                    await _record_owner(http_request, task_id, request.user_id)
+                    await _record_owner(task_id, user_id)
                 return {"status": "accepted", "task_id": task_id}
             except Exception:
                 logger.warning("ARQ enqueue failed, falling back to sync compile")
 
         # Fallback: run synchronously
         if request.date:
-            result = await compile_date(request.date, service, writer, user_id=request.user_id)
+            result = await compile_date(request.date, service, writer, user_id=user_id)
             return {"status": "completed", "result": result.model_dump()}
         else:
-            results = await compile_all_pending(service, writer, user_id=request.user_id)
+            results = await compile_all_pending(service, writer, user_id=user_id)
             return {
                 "status": "completed",
                 "results": [r.model_dump() for r in results],
