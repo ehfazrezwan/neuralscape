@@ -2211,6 +2211,8 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
             # Sibling facts that shared a deleted fact's graph episode need a
             # fresh single-fact re-ingest; the delete itself has already
             # succeeded, so a queue failure is reported, never raised.
+            if isinstance(result, dict) and (result.get("failed_ids") or result.get("truncated")):
+                result["status"] = "partial"  # same honesty as REST's 207
             if isinstance(result, dict):
                 jobs = result.pop("graph_jobs", None)
                 if jobs:

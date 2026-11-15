@@ -225,3 +225,28 @@ def test_audit_pages_through_the_whole_collection():
 
     rows = audit.audit_delimiter_ids(Client(), "c")
     assert [r["id"] for r in rows] == ["b"]
+
+
+def test_an_empty_private_owner_is_encoded_with_the_flag_on():
+    gid = _build_group_id("private", "")
+    assert gid.startswith(ENCODED_GROUP_PREFIX) and decode_group_id(gid).owner == ""
+
+
+def test_the_audit_names_match_the_builder_with_the_flag_on():
+    """The audit computes would-be names directly; it must agree with the real builder (flag on)."""
+    audit = _audit_module()
+    points = [_point("a", "alice"), _point("b", "alice--project--payroll"), _point("c", "a.b", "p"),
+              _point("d", "u", "x--ws--y", visibility="shared"), _point("e", "u", "p", workspace="w.1")]
+    for row in audit.changed_group_rows(points):
+        pt = next(p for p in points if str(p.id) == row["id"])
+        meta = pt.payload["metadata"]
+        assert row["new_group_id"] == _build_group_id(
+            meta["visibility"], meta["owner_user_id"], meta.get("project_id"), meta.get("workspace"))
+
+
+def test_enabling_the_flag_is_refused_until_the_read_side_adopts_the_builder():
+    from config import Settings
+
+    with pytest.raises(ValueError, match="cannot be enabled yet"):
+        Settings(graph_group_id_injective_enabled=True)
+    assert Settings(graph_group_id_injective_enabled=False).graph_group_id_injective_enabled is False

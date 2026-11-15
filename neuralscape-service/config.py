@@ -678,6 +678,20 @@ class Settings(BaseSettings):
         return backend
 
     @model_validator(mode="after")
+    def _refuse_injective_group_ids_until_read_side_adopted(self) -> "Settings":
+        # Fail closed: with this on, writes use nsg1-- names but the narrowed read
+        # branches (memory/search.py), list_projects (memory/reads.py) and the
+        # dreaming pool names still use legacy names, so reads would miss writes
+        # (and a '--' user id would query another user's legacy pool). Remove this
+        # guard in the PR that routes those call sites through the group-id builder.
+        if self.graph_group_id_injective_enabled:
+            raise ValueError(
+                "GRAPH_GROUP_ID_INJECTIVE_ENABLED cannot be enabled yet: the read-side call sites "
+                "have not adopted the injective group-id builder (tracked follow-up, lane read-10)"
+            )
+        return self
+
+    @model_validator(mode="after")
     def _validate_ledger_target(self) -> "Settings":
         # Fail at startup, not at the first write, when the ledger is on but has nowhere to live.
         if not self.ledger_enabled:

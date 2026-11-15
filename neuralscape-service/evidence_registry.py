@@ -358,7 +358,7 @@ SCENARIOS: tuple[Scenario, ...] = (
     # real-store integration tests (integration_tests/) have run on the gate.
     Scenario("group-id-tuple-collision", "control", ("A1.02", "A1.03"),
              "test_distinct_namespace_tuples_have_distinct_group_ids", True,
-             "Distinct (user, project) tuples have distinct graph group ids (fixed: injective builder)."),
+             "Distinct (user, project) tuples have distinct graph group ids WHEN GRAPH_GROUP_ID_INJECTIVE_ENABLED is on (the fix is flag-gated, default off; the defect remains by default)."),
     Scenario("group-id-distinct-controls", "control", ("A1.02", "A1.03"),
              "test_ordinary_namespace_tuples_stay_distinct", False,
              "Ordinary tuples remain distinct."),

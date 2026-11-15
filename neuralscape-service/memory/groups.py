@@ -49,9 +49,9 @@ class GroupKey(NamedTuple):
 
 
 def _is_plain_component(value: str | None) -> bool:
-    # ``""`` only reaches here as a private owner (anonymous legacy write); it
-    # keeps its historical name ``user--``.
-    return value is None or value == "" or _PLAIN_COMPONENT.fullmatch(value) is not None
+    # An empty component (e.g. an anonymous private owner) is NOT plain: with the
+    # flag on it is encoded, so no tuple can read back as "user--" ambiguously.
+    return value is None or _PLAIN_COMPONENT.fullmatch(value) is not None
 
 
 def _encode_group_key(key: GroupKey) -> str:
