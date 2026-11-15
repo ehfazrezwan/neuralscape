@@ -95,11 +95,10 @@ class DreamingExtension:
             autoheal restarts the container (observed live 2026-07-03).
             Poll GET /status for the DreamRun result.
             """
-            from auth import resolve_request_user_id
-            from config import settings as _core
+            from auth import is_admin_user, resolve_request_user_id
 
             caller = resolve_request_user_id(request, None)
-            if not _core.is_dictator(caller):
+            if not is_admin_user(caller):
                 raise HTTPException(
                     status_code=403,
                     detail=f"User {caller!r} is not authorized to trigger dreaming sweeps.",

@@ -1467,7 +1467,7 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
     #      arguments["user_id"] is ignored rather than trusted.
     #   2. An explicit user_id argument (stdio / local Claude Code, legacy).
     #   3. The configured default_user_id.
-    from auth import current_user_id
+    from auth import current_user_id, is_admin_user
 
     # Tools like list_memories / delete_memories declare no required fields, so a
     # client may omit `arguments` entirely (None). Normalize before any access.
@@ -2574,7 +2574,7 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
         elif name == "set_project_knowledge_config":
             from knowledge.router import ProjectKnowledgeConfig, set_project_config
 
-            if not settings.is_dictator(user_id):
+            if not is_admin_user(user_id):
                 return [TextContent(type="text", text=json.dumps(
                     {"error": f"User {user_id!r} is not authorized to set project knowledge config."}))]
 
@@ -2604,7 +2604,7 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
             from extensions.dreaming.config import dreaming_settings
 
             # Dictator-only, checked before the flag/force logic (mirrors REST /run).
-            if not settings.is_dictator(user_id):
+            if not is_admin_user(user_id):
                 return [TextContent(type="text", text=json.dumps(
                     {"error": f"User {user_id!r} is not authorized to trigger dreaming sweeps."}))]
 

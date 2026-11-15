@@ -94,6 +94,24 @@ def resolve_request_user_id(request: Request, body_user_id: str | None) -> str:
     return body_user_id or settings.default_user_id
 
 
+def is_admin_user(user_id: str | None) -> bool:
+    """Admin gate for dreaming runs and project knowledge-config writes.
+
+    Owner decision 2026-11-15: with ``DICTATOR_USER_IDS`` empty the default
+    user (``settings.default_user_id``) is the admin, so single-user and
+    legacy-key installs keep working; with a non-empty list only the listed
+    users are admins. ``settings.is_dictator`` is deliberately unchanged
+    (standards-tier writes keep their meaning). Callers must pass the
+    token-resolved identity, never a body-supplied one.
+    """
+    if not user_id:
+        return False
+    listed = settings.dictator_user_ids_set()
+    if listed:
+        return user_id in listed
+    return user_id == settings.default_user_id
+
+
 class BearerAuthMiddleware(BaseHTTPMiddleware):
     """Bearer token middleware supporting per-user HMAC + legacy shared keys."""
 

@@ -253,7 +253,7 @@ app = FastAPI(
 )
 
 # Register Bearer token auth middleware (fail-closed; see auth.py and AUTH.md)
-from auth import BearerAuthMiddleware, resolve_request_user_id
+from auth import BearerAuthMiddleware, is_admin_user, resolve_request_user_id
 
 app.add_middleware(BearerAuthMiddleware)
 
@@ -3361,7 +3361,7 @@ async def v1_set_project_knowledge_config(
     is shared by every user of the project.
     """
     user_id = _resolve_user_id(request, None)
-    if not settings.is_dictator(user_id):
+    if not is_admin_user(user_id):
         raise HTTPException(
             status_code=403,
             detail=f"User {user_id!r} is not authorized to set project knowledge config.",

@@ -43,7 +43,7 @@ class ProjectKnowledgeConfig:
 ### REST Endpoints
 
 - `GET /v1/projects/{project_id}/knowledge-config` — get current config (returns default if not set)
-- `PUT /v1/projects/{project_id}/knowledge-config` — set/update config (dictator-only: 403 otherwise; `DICTATOR_USER_IDS` empty means nobody can write)
+- `PUT /v1/projects/{project_id}/knowledge-config` — set/update config (admin-only: 403 otherwise. Admin = the listed `DICTATOR_USER_IDS`; when that list is empty, the default user)
 
 ### MCP Tools
 

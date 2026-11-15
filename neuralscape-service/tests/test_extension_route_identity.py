@@ -207,8 +207,9 @@ class TestDreamingRunGate:
         monkeypatch.setattr(settings, "dictator_user_ids", "alice")
         assert self._run(_bearer("alice")).status_code == 409
 
-    def test_shared_key_default_user_not_dictator_is_403(self, dreaming, shared_key_auth):
-        assert self._run(shared_key_auth, force=True).status_code == 403
+    def test_shared_key_default_user_is_admin_when_list_empty(self, dreaming, shared_key_auth):
+        # Owner decision 2026-11-15: empty DICTATOR_USER_IDS -> default user is admin.
+        assert self._run(shared_key_auth, force=True).status_code == 202
 
 
 # ── knowledge-config PUT (REST) and set_project_knowledge_config (MCP) ──
@@ -335,3 +336,75 @@ class TestScheduleDreamGate:
         out = await self._call("alice")
         assert json.loads(out[0].text)["status"] == "enqueued"
         assert arq.enqueue_job.await_args.args[0] == "run_dream_sweep"
+
+
+# ── admin rule: empty list -> default user; non-empty list -> listed only ─
+
+
+class TestAdminRuleAllGates:
+    """Owner decision 2026-11-15, enforced identically at all four gates."""
+
+    DEFAULT = "default_user"
+
+    @pytest.fixture()
+    def gates(self, pool, mounted, monkeypatch):
+        import arq
+
+        import knowledge.router as kr
+        import mcp_server
+        from auth import current_user_id
+        from extensions.dreaming import DreamingExtension
+        from extensions.dreaming.config import dreaming_settings
+
+        monkeypatch.setattr(settings, "default_user_id", self.DEFAULT)
+        pool.close = AsyncMock()
+        monkeypatch.setattr(arq, "create_pool", AsyncMock(return_value=pool))
+        monkeypatch.setattr("extensions.dreaming.record_task_owner", AsyncMock())
+        monkeypatch.setattr("task_manager.record_task_owner", AsyncMock())
+        monkeypatch.setattr(dreaming_settings, "enabled", True)
+        monkeypatch.setattr(mcp_server, "_arq_pool", pool)
+        monkeypatch.setattr(kr, "set_project_config", MagicMock())
+        mounted(DreamingExtension().get_routes(), "/v1/extensions/dreaming")
+
+        async def mcp(tool, args, user):
+            tok = current_user_id.set(user)
+            try:
+                out = await mcp_server.call_tool(tool, args)
+            finally:
+                current_user_id.reset(tok)
+            return "error" not in json.loads(out[0].text)
+
+        def run(user):
+            c = TestClient(app)
+            return c.post("/v1/extensions/dreaming/run", json={}, headers=_bearer(user)).status_code == 202
+
+        def put(user):
+            c = TestClient(app)
+            r = c.put("/v1/projects/p1/knowledge-config",
+                      json={"project_id": "p1"}, headers=_bearer(user))
+            return r.status_code == 200
+
+        return {
+            "rest_run": lambda u: asyncio.sleep(0, run(u)),
+            "rest_put": lambda u: asyncio.sleep(0, put(u)),
+            "mcp_dream": lambda u: mcp("schedule_dream", {}, u),
+            "mcp_set": lambda u: mcp("set_project_knowledge_config", {"project_id": "p1"}, u),
+        }
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("gate", ["rest_run", "rest_put", "mcp_dream", "mcp_set"])
+    async def test_empty_list_default_user_only(self, gates, per_user_auth, gate):
+        assert await gates[gate](self.DEFAULT) is True
+        assert await gates[gate]("alice") is False
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("gate", ["rest_run", "rest_put", "mcp_dream", "mcp_set"])
+    async def test_non_empty_list_listed_only(self, gates, per_user_auth, monkeypatch, gate):
+        monkeypatch.setattr(settings, "dictator_user_ids", "alice")
+        assert await gates[gate]("alice") is True
+        assert await gates[gate](self.DEFAULT) is False
+        assert await gates[gate]("bob") is False
+
+    def test_is_dictator_itself_unchanged(self, monkeypatch):
+        monkeypatch.setattr(settings, "dictator_user_ids", "")
+        assert settings.is_dictator(settings.default_user_id) is False
