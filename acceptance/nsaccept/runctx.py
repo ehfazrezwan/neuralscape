@@ -5,10 +5,12 @@ from __future__ import annotations
 import os
 import random
 import string
+import subprocess
 import time
 from dataclasses import dataclass, field
+from typing import Callable
 
-from . import tokens
+from . import guard, tokens
 
 
 class ConfigError(RuntimeError):
@@ -27,6 +29,52 @@ class Ctx:
     bad_token: str = field(repr=False)
     project_id: str
     token_source: str
+    compose_project: str | None = None
+
+    def compose(
+        self,
+        *args: str,
+        check: bool = True,
+        timeout: float = 120.0,
+        run: Callable[..., subprocess.CompletedProcess] = subprocess.run,
+    ) -> subprocess.CompletedProcess:
+        """``docker compose -p <project> <args...>`` against the campaign stack.
+
+        Only usable when the run was given ``--compose-project`` (the same
+        project the stack runs under). Refuses the production project name,
+        and only lets container-lifecycle verbs through (pause/unpause/stop/
+        start/restart/ps/logs/top/exec): nothing here can tear a project
+        down or remove its volumes.
+        """
+        if not self.compose_project:
+            raise ConfigError("ctx.compose needs --compose-project (or NS_COMPOSE_PROJECT)")
+        return run_compose(self.compose_project, *args, check=check, timeout=timeout, run=run)
+
+
+COMPOSE_VERBS = frozenset({"pause", "unpause", "stop", "start", "restart", "ps", "logs", "top", "exec"})
+
+
+def run_compose(
+    project: str,
+    *args: str,
+    check: bool = True,
+    timeout: float = 120.0,
+    run: Callable[..., subprocess.CompletedProcess] = subprocess.run,
+) -> subprocess.CompletedProcess:
+    if project.strip().lower() == guard.PROD_COMPOSE_PROJECT:
+        raise guard.GuardError(
+            f"refusing compose project '{guard.PROD_COMPOSE_PROJECT}' (the production project name)"
+        )
+    if not args or args[0] not in COMPOSE_VERBS:
+        raise ConfigError(f"compose verb {args[:1]!r} is not allowed (allowed: {sorted(COMPOSE_VERBS)})")
+    cmd = ["docker", "compose", "-p", project.strip(), *args]
+    proc = run(cmd, capture_output=True, text=True, timeout=timeout)
+    if check and proc.returncode != 0:
+        raise RuntimeError(
+            f"`docker compose -p {project} {' '.join(args)}` exited {proc.returncode}: "
+            f"{(proc.stderr or '').strip()[:300]}"
+        )
+    return proc
 
 
 def new_run_id() -> str:
@@ -85,4 +133,5 @@ def build(base_url: str, profile: str, compose_project: str | None = None) -> Ct
         bad_token=tokens.wrong_secret_token(user_a),
         project_id=project_id,
         token_source=source,
+        compose_project=compose_project,
     )
