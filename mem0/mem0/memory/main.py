@@ -4,6 +4,8 @@ import hashlib
 import json
 import logging
 import os
+import threading
+import time
 import uuid
 import warnings
 from copy import deepcopy
@@ -328,6 +330,80 @@ setup_config()
 logger = logging.getLogger(__name__)
 
 
+# NEURALSCAPE PATCH: lock + cold-start tolerance for the lazy entity store.
+# Upstream creates ``<collection>_entities`` on first access with no lock, so
+# concurrent first callers (threads of one process, or several processes
+# starting together) race on Qdrant's list-then-create and the loser gets a
+# 409 "already exists" (or a 500 "0 of 0 read operations failed" while the
+# winner finishes creating it). Same two conditions, and the same remedy,
+# as neuralscape-service/memory/core.py ``_memory_from_config``.
+_ENTITY_STORE_ATTEMPTS = 8
+
+
+def _is_concurrent_collection_creation(exc: BaseException) -> bool:
+    """True for Qdrant's 409 "already exists" or 500 "0 of 0 read operations failed".
+
+    Duck-typed on ``status_code``/``content`` (qdrant_client's
+    ``UnexpectedResponse``) so the check works for any vector store without
+    importing qdrant_client here. Anything else is a real failure.
+    """
+    status = getattr(exc, "status_code", None)
+    content = getattr(exc, "content", None) or b""
+    if isinstance(content, str):
+        content = content.encode()
+    if status == 409:
+        return b"already exists" in content
+    if status == 500:
+        return b"0 of 0 read operations failed" in content
+    return False
+
+
+def _get_or_create_entity_store(memory):
+    """Create ``memory._entity_store`` once (double-checked lock), tolerating a lost create race."""
+    if memory._entity_store is not None:
+        return memory._entity_store
+    # setdefault is atomic, so two first callers cannot end up with two locks.
+    # Created here (not in __init__) so instances built without __init__ work.
+    lock = memory.__dict__.setdefault("_entity_store_lock", threading.Lock())
+    with lock:
+        if memory._entity_store is not None:
+            return memory._entity_store
+        entity_config = _safe_deepcopy_config(memory.config.vector_store.config)
+        entity_collection = f"{memory.collection_name}_entities"
+        # Set collection name on the cloned config
+        if hasattr(entity_config, 'collection_name'):
+            entity_config.collection_name = entity_collection
+        elif isinstance(entity_config, dict):
+            entity_config['collection_name'] = entity_collection
+        # For Qdrant, share the existing client to avoid RocksDB lock contention
+        # when using embedded mode (path=...). QdrantConfig.client takes precedence
+        # over host/port/path.
+        if memory.config.vector_store.provider == "qdrant" and hasattr(memory.vector_store, "client"):
+            if hasattr(entity_config, "client"):
+                entity_config.client = memory.vector_store.client
+            elif isinstance(entity_config, dict):
+                entity_config["client"] = memory.vector_store.client
+        for attempt in range(1, _ENTITY_STORE_ATTEMPTS + 1):
+            try:
+                memory._entity_store = VectorStoreFactory.create(
+                    memory.config.vector_store.provider, entity_config
+                )
+                break
+            except Exception as exc:
+                # Another process created the collection first (or is still
+                # creating it): building the store again finds it and goes on.
+                if attempt == _ENTITY_STORE_ATTEMPTS or not _is_concurrent_collection_creation(exc):
+                    raise
+                logger.info(
+                    "Entity collection %s is being created concurrently; retrying (attempt %d/%d)",
+                    entity_collection,
+                    attempt + 1,
+                    _ENTITY_STORE_ATTEMPTS,
+                )
+                time.sleep(0.1 * attempt)
+    return memory._entity_store
+
+
 class Memory(MemoryBase):
     def __init__(self, config: MemoryConfig = MemoryConfig()):
         self.config = config
@@ -388,27 +464,12 @@ class Memory(MemoryBase):
 
     @property
     def entity_store(self):
-        """Lazily initialize entity store on first use."""
-        if self._entity_store is None:
-            entity_config = _safe_deepcopy_config(self.config.vector_store.config)
-            entity_collection = f"{self.collection_name}_entities"
-            # Set collection name on the cloned config
-            if hasattr(entity_config, 'collection_name'):
-                entity_config.collection_name = entity_collection
-            elif isinstance(entity_config, dict):
-                entity_config['collection_name'] = entity_collection
-            # For Qdrant, share the existing client to avoid RocksDB lock contention
-            # when using embedded mode (path=...). QdrantConfig.client takes precedence
-            # over host/port/path.
-            if self.config.vector_store.provider == "qdrant" and hasattr(self.vector_store, "client"):
-                if hasattr(entity_config, "client"):
-                    entity_config.client = self.vector_store.client
-                elif isinstance(entity_config, dict):
-                    entity_config["client"] = self.vector_store.client
-            self._entity_store = VectorStoreFactory.create(
-                self.config.vector_store.provider, entity_config
-            )
-        return self._entity_store
+        """Lazily initialize entity store on first use.
+
+        NEURALSCAPE PATCH: creation is serialised and tolerates a concurrent
+        first creation (see ``_get_or_create_entity_store``).
+        """
+        return _get_or_create_entity_store(self)
 
     def _upsert_entity(self, entity_text, entity_type, memory_id, filters):
         """Upsert an entity into the entity store, linking it to a memory."""
@@ -1832,26 +1893,12 @@ class AsyncMemory(MemoryBase):
 
     @property
     def entity_store(self):
-        """Lazily initialize entity store on first use."""
-        if self._entity_store is None:
-            entity_config = _safe_deepcopy_config(self.config.vector_store.config)
-            entity_collection = f"{self.collection_name}_entities"
-            if hasattr(entity_config, 'collection_name'):
-                entity_config.collection_name = entity_collection
-            elif isinstance(entity_config, dict):
-                entity_config['collection_name'] = entity_collection
-            # For Qdrant, share the existing client to avoid RocksDB lock contention
-            # when using embedded mode (path=...). QdrantConfig.client takes precedence
-            # over host/port/path.
-            if self.config.vector_store.provider == "qdrant" and hasattr(self.vector_store, "client"):
-                if hasattr(entity_config, "client"):
-                    entity_config.client = self.vector_store.client
-                elif isinstance(entity_config, dict):
-                    entity_config["client"] = self.vector_store.client
-            self._entity_store = VectorStoreFactory.create(
-                self.config.vector_store.provider, entity_config
-            )
-        return self._entity_store
+        """Lazily initialize entity store on first use.
+
+        NEURALSCAPE PATCH: creation is serialised and tolerates a concurrent
+        first creation (see ``_get_or_create_entity_store``).
+        """
+        return _get_or_create_entity_store(self)
 
     async def _upsert_entity_async(self, entity_text, entity_type, memory_id, filters):
         """Async variant of `_upsert_entity` — per-entity search-then-update-or-insert."""

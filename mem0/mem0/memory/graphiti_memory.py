@@ -1,5 +1,7 @@
 import asyncio
+import concurrent.futures
 import logging
+import os
 import threading
 from datetime import datetime, timezone
 
@@ -126,6 +128,22 @@ def _create_cross_encoder(provider: str | None, api_key: str | None, model: str 
         raise ValueError(f"Unsupported Graphiti reranker provider: {provider}")
 
 
+# NEURALSCAPE PATCH: upper bound on one bridge call. Graph writes legitimately
+# take minutes (LLM extraction), so this is a hang guard, not a latency target:
+# it matches the worker's ARQ job timeout (300 s). Override per process with
+# GRAPHITI_BRIDGE_TIMEOUT_S, or per call with ``_AsyncBridge.run(timeout=...)``.
+DEFAULT_BRIDGE_TIMEOUT_S = 300.0
+
+
+def _bridge_timeout_from_env() -> float:
+    raw = os.environ.get("GRAPHITI_BRIDGE_TIMEOUT_S", "").strip()
+    try:
+        value = float(raw) if raw else DEFAULT_BRIDGE_TIMEOUT_S
+    except ValueError:
+        return DEFAULT_BRIDGE_TIMEOUT_S
+    return value if value > 0 else DEFAULT_BRIDGE_TIMEOUT_S
+
+
 class _AsyncBridge:
     """Runs a dedicated event loop in a background thread.
 
@@ -143,10 +161,27 @@ class _AsyncBridge:
         asyncio.set_event_loop(self._loop)
         self._loop.run_forever()
 
-    def run(self, coro):
-        """Submit a coroutine to the background loop and wait for the result."""
+    def run(self, coro, timeout: float | None = None):
+        """Submit a coroutine to the background loop and wait for the result.
+
+        NEURALSCAPE PATCH: the wait is bounded. Upstream waited forever, so a
+        stalled Neo4j or LLM call parked the calling worker slot for good.
+        ``timeout`` (seconds) wins; otherwise ``GRAPHITI_BRIDGE_TIMEOUT_S``;
+        otherwise ``DEFAULT_BRIDGE_TIMEOUT_S``. On expiry the coroutine is
+        cancelled on the loop and ``TimeoutError`` is raised, which the
+        service's graph callers already log and treat as non-critical.
+        """
+        limit = timeout if timeout is not None and timeout > 0 else _bridge_timeout_from_env()
         future = asyncio.run_coroutine_threadsafe(coro, self._loop)
-        return future.result()
+        try:
+            return future.result(timeout=limit)
+        except concurrent.futures.TimeoutError:
+            future.cancel()
+            # No "timed out"/"timeout" wording: the service's transient-error
+            # retry matches on those and would re-run a call that just hung.
+            raise TimeoutError(
+                f"Graphiti bridge call did not finish within {limit:g}s and was cancelled"
+            ) from None
 
 
 class MemoryGraph:
