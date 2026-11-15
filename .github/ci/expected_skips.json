@@ -67,6 +67,14 @@
           "reason_contains": "LEDGER_TEST_PG_DSN not set (postgres ledger inte"
         },
         {
+          "test": "tests.test_ledger_dispatch_pg_integration::test_dispatch_scenarios_on_postgres_as_runtime_role[a_lease_lost_mid_stage_is_reclaimed_and_settled_exactly_once]",
+          "reason_contains": "LEDGER_TEST_PG_DSN not set (postgres ledger inte"
+        },
+        {
+          "test": "tests.test_ledger_dispatch_pg_integration::test_dispatch_scenarios_on_postgres_as_runtime_role[a_lease_that_lapses_during_settle_is_reclaimed_without_rerunning_stages]",
+          "reason_contains": "LEDGER_TEST_PG_DSN not set (postgres ledger inte"
+        },
+        {
           "test": "tests.test_ledger_dispatch_pg_integration::test_dispatch_scenarios_on_postgres_as_runtime_role[a_receipt_validated_but_not_recorded_is_not_kept_by_the_worker]",
           "reason_contains": "LEDGER_TEST_PG_DSN not set (postgres ledger inte"
         },
@@ -189,6 +197,10 @@
         {
           "test": "tests.test_ledger_dispatch_pg_integration::test_dispatch_scenarios_on_postgres_as_runtime_role[unexpected_error_is_failed_without_leaking_details]",
           "reason_contains": "LEDGER_TEST_PG_DSN not set (postgres ledger inte"
+        },
+        {
+          "test": "tests.test_ledger_flag_on_app::test_flag_on_write_through_real_redis",
+          "reason_contains": "LEDGER_TEST_REDIS_URL not set (ledger flag-on real Redis"
         },
         {
           "test": "tests.test_ledger_postgres_integration::test_conformance_as_non_superuser_runtime_role[ambiguous_effect_replay]",
@@ -395,6 +407,14 @@
           "reason_contains": "LEDGER_TEST_PG_DSN not set (postgres ledger inte"
         },
         {
+          "test": "tests.test_ledger_dispatch_pg_integration::test_dispatch_scenarios_on_postgres_as_runtime_role[a_lease_lost_mid_stage_is_reclaimed_and_settled_exactly_once]",
+          "reason_contains": "LEDGER_TEST_PG_DSN not set (postgres ledger inte"
+        },
+        {
+          "test": "tests.test_ledger_dispatch_pg_integration::test_dispatch_scenarios_on_postgres_as_runtime_role[a_lease_that_lapses_during_settle_is_reclaimed_without_rerunning_stages]",
+          "reason_contains": "LEDGER_TEST_PG_DSN not set (postgres ledger inte"
+        },
+        {
           "test": "tests.test_ledger_dispatch_pg_integration::test_dispatch_scenarios_on_postgres_as_runtime_role[a_receipt_validated_but_not_recorded_is_not_kept_by_the_worker]",
           "reason_contains": "LEDGER_TEST_PG_DSN not set (postgres ledger inte"
         },
@@ -517,6 +537,10 @@
         {
           "test": "tests.test_ledger_dispatch_pg_integration::test_dispatch_scenarios_on_postgres_as_runtime_role[unexpected_error_is_failed_without_leaking_details]",
           "reason_contains": "LEDGER_TEST_PG_DSN not set (postgres ledger inte"
+        },
+        {
+          "test": "tests.test_ledger_flag_on_app::test_flag_on_write_through_real_redis",
+          "reason_contains": "LEDGER_TEST_REDIS_URL not set (ledger flag-on real Redis"
         },
         {
           "test": "tests.test_ledger_postgres_integration::test_conformance_as_non_superuser_runtime_role[ambiguous_effect_replay]",

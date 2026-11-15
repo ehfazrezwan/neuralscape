@@ -5,6 +5,7 @@ from __future__ import annotations
 import multiprocessing
 import os
 import sqlite3
+import sys
 import threading
 import time
 from pathlib import Path
@@ -335,6 +336,10 @@ def _child_kill_during_stage(store, ready) -> None:
 
 
 def scenario_real_process_kill_during_stage_resumes_exactly_once(store) -> None:
+    if sys.platform == "darwin":
+        # A forked child that inherits an open SQLite connection segfaults on macOS (fork-unsafe system
+        # libraries); the scenario is real on Linux, where CI and the gate run it.
+        pytest.skip("os.fork after SQLite use is unsafe on macOS; runs on Linux")
     ledger, external = store.open(), store.external()
     ledger.accept(intent("memory.write.raw"))
     child = multiprocessing.get_context("fork").Process(target=_child_kill_during_stage, args=(store, None))
