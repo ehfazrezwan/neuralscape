@@ -434,6 +434,12 @@ def test_insights_only_cite_their_own_pool(dream_env, swept):
         scroll_filter=Filter(must=[FieldCondition(key="metadata.source_type", match=MatchValue(value="dream"))]),
     )
     mine, theirs = set(swept.ids.values()), set(swept.other_ids)
+    owners = {r.payload["metadata"].get("owner_user_id") for r in recs}
+    for want in (env.user, swept.other_user):
+        assert want in owners, (
+            f"no insight produced for {want} (insight owners: {sorted(o for o in owners if o)}); "
+            "the LLM produced no reflection, so citation isolation is unproven"
+        )
     for r in recs:
         md = r.payload["metadata"]
         env.seeded_ids.add(str(r.id))
@@ -454,3 +460,11 @@ def test_bridges_pass_runs_with_flag_on(dream_env, swept):
     assert run.pools and run.pools[0].status == "dreamt", run.pools
     assert "error" not in run.bridges, run.bridges
     assert set(run.bridges) >= {"pages_bridged", "pages_unchanged", "links"}, run.bridges
+    # Isolation after the bridges pass: it only reads the operator's vault,
+    # which never holds the other user's private pool, so nothing of theirs
+    # can be linked or rendered. (Proving a *bridged* page needs graph entities
+    # shared across hubs, which the graph LLM extracts nondeterministically:
+    # out of scope here.)
+    vault = _vault_text(env)
+    assert swept.other_tok not in vault and "Rust" not in vault
+    assert swept.other_pool.split("--", 1)[1] not in vault

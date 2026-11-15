@@ -7,6 +7,7 @@ real Gemini embedder is used (rows are stored through ``store_raw``).
 Run (from neuralscape-service/):
     uv run pytest integration_tests/test_dreaming_apply_flag_on.py -q
 Env: NEO4J_URI NEO4J_USER NEO4J_PASSWORD QDRANT_URL REDIS_URL GOOGLE_API_KEY
+(NS_INTEGRATION_REQUIRED=1 makes a missing store/key a failure.)
 """
 
 from __future__ import annotations

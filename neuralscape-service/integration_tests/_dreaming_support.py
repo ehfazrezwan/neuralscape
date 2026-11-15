@@ -1,9 +1,11 @@
 """Shared fixtures/helpers for the dreaming flag-on integration tests.
 
-Self-contained on purpose: it does not depend on the shared ``conftest.py``
-fixtures of the integration-test convention PR, so these tests run the same
-before and after that lands. Semantics match that convention: a missing
-store or key is a FAILURE, never a skip.
+Built on the convention's session fixtures (``stores``, ``llm_key``): a
+missing or unreachable store/key fails on the VPS gate and skips elsewhere.
+``flags`` and ``unique_ns`` are function-scoped; one sweep is minutes of LLM
+spend, so the sweep tests share a module-scoped environment and apply the
+same rules by hand (a ``nsit`` marker on every name; a failed teardown FAILS
+the module instead of warning, like ``unique_ns``).
 
 Everything is isolated: a throwaway Qdrant collection, a unique test user, a
 temp vault dir; teardown drops the collection, the user's Redis keys, the
@@ -19,22 +21,6 @@ import uuid
 from pathlib import Path
 
 import pytest
-
-REQUIRED_ENV = (
-    "NEO4J_URI", "NEO4J_USER", "NEO4J_PASSWORD", "QDRANT_URL", "REDIS_URL",
-    "GOOGLE_API_KEY",
-)
-
-
-def require_env() -> None:
-    missing = [k for k in REQUIRED_ENV if not os.environ.get(k)]
-    if missing:
-        pytest.fail(
-            "integration environment incomplete (a missing service/key is a "
-            f"failure, not a skip): {', '.join(missing)}",
-            pytrace=False,
-        )
-
 
 class DreamEnv:
     """Handle returned by the ``dream_env`` fixture."""
@@ -132,8 +118,7 @@ class DreamEnv:
 
 
 @pytest.fixture(scope="module")
-def dream_env(tmp_path_factory):
-    require_env()
+def dream_env(tmp_path_factory, stores, llm_key):
     import redis as redis_lib
 
     import config
@@ -155,7 +140,7 @@ def dream_env(tmp_path_factory):
     mp.setattr(dreaming_settings, "enabled", True)
     mp.setattr(dreaming_settings, "obsidian_vault_path", str(vault))
 
-    r = redis_lib.Redis.from_url(os.environ["REDIS_URL"])
+    r = redis_lib.Redis.from_url(stores.redis_url)
     try:
         r.ping()
     except Exception as exc:
@@ -169,11 +154,13 @@ def dream_env(tmp_path_factory):
     try:
         yield env
     finally:
-        _teardown(env, prior_last_run)
+        errors = _teardown(env, prior_last_run, stores)
         mp.undo()
+        if errors:
+            pytest.fail(f"dream_env cleanup failed (leaked data): {errors}", pytrace=False)
 
 
-def _teardown(env: DreamEnv, prior_last_run) -> None:
+def _teardown(env: DreamEnv, prior_last_run, stores) -> list[str]:
     errors: list[str] = []
     try:
         env.clear_pool_state()
@@ -199,10 +186,9 @@ def _teardown(env: DreamEnv, prior_last_run) -> None:
         from neo4j import GraphDatabase
 
         with GraphDatabase.driver(
-            os.environ["NEO4J_URI"],
-            auth=(os.environ["NEO4J_USER"], os.environ["NEO4J_PASSWORD"]),
+            stores.neo4j_uri, auth=(stores.neo4j_user, stores.neo4j_password),
         ) as drv:
-            db = os.environ.get("NEO4J_DATABASE") or None
+            db = stores.neo4j_database or None
             with drv.session(database=db) as s:
                 s.run(
                     "MATCH (n) WHERE n.group_id IS NOT NULL AND n.group_id CONTAINS $u "
@@ -210,8 +196,7 @@ def _teardown(env: DreamEnv, prior_last_run) -> None:
                 ).consume()
     except Exception as exc:
         errors.append(f"neo4j: {exc.__class__.__name__}")
-    if errors:
-        print(f"[dream_env teardown warnings] {errors}")
+    return errors
 
 
 def dumps_for_msg(obj) -> str:
