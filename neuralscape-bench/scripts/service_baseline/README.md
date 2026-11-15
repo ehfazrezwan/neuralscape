@@ -42,9 +42,11 @@ capacity, and proposes no budgets.
   (or `NS_BENCH_COMPOSE_OVERRIDE`) makes the stack network internal; the runner then checks
   on Docker that the network really is internal and records it. Telemetry of mem0, Graphiti
   and Qdrant is switched off in the stack either way.
-- **Older images.** The in-container scripts import the governed-service modules lazily and
-  fall back (token-only seeding, API without an enforcer) with a notice when an image does
-  not carry them.
+- **Older images.** The in-container scripts import the governed-service modules lazily. Arms
+  that never ask for the authority store or the enforcer seed the token only on images without
+  them. An arm that asks for them (authority seeding, `HARNESS_WIRE_ENFORCER=1`) refuses with a
+  message and a non-zero exit when the modules are missing, so an ungoverned run is never
+  recorded under a governed label.
 
 ## Command lines (usage only, nothing starts)
 - `python -m neuralscape_bench.service_baseline.runner --help`

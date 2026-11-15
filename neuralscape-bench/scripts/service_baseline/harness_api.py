@@ -20,8 +20,8 @@ if os.environ.get("HARNESS_WIRE_ENFORCER") == "1":
         import policy_enforcement
         from authority_store_sql import SqliteAuthorityStore
         from policy_enforcement import PolicyEnforcer
-    except ImportError as error:  # images without the governed modules start exactly as in production
-        print(f"policy enforcement unavailable in this image ({error.name}); starting without it", file=sys.stderr)
+    except ImportError as error:  # the enforcer arm was asked for: never run it unenforced under its label
+        sys.exit(f"refusing to start: the enforcer arm needs policy enforcement but this image lacks {error.name}")
     else:
         store = SqliteAuthorityStore(os.environ["AUTHORITY_SQLITE_PATH"])
         policy_enforcement.configure(PolicyEnforcer(store, store))

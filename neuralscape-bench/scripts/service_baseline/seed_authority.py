@@ -20,9 +20,8 @@ if AUTHORITY:  # images without the authority store (older trees) only need the 
         from contracts_policy import PolicyStatement  # noqa: E402
         from identity_binding import bind_identity  # noqa: E402
         from policy_enforcement import pool_handle  # noqa: E402
-    except ImportError as error:  # the image does not carry the authority modules: degrade, say so, keep going
-        print(f"authority store unavailable in this image ({error.name}); seeding the token only", file=sys.stderr)
-        AUTHORITY = False
+    except ImportError as error:  # a governed arm was asked for: never record an ungoverned run under its label
+        sys.exit(f"refusing to seed: the governed arm needs the authority store but this image lacks {error.name}")
 
 USER, TENANT, PROJECT = "bench-user", "bench-tenant", "bench-project"
 ACTIONS = ("read", "search", "list", "create", "update", "delete", "background_derive", "share")

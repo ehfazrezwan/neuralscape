@@ -192,15 +192,15 @@ def _absent(monkeypatch, *names):
         monkeypatch.setitem(sys.modules, name, None)  # an import of it raises ImportError
 
 
-def test_seed_authority_degrades_to_the_token_when_the_authority_modules_are_missing(monkeypatch, capsys):
+def test_seed_authority_refuses_a_governed_arm_when_the_authority_modules_are_missing(monkeypatch):
     monkeypatch.setenv("AUTHORITY_ENABLED", "true")
     fake_tokens = type(sys)("tokens")
     fake_tokens.issue_user_token = lambda user, secret, ttl: f"token-for-{user}"
     monkeypatch.setitem(sys.modules, "tokens", fake_tokens)
     _absent(monkeypatch, "authority_store_sql", "contracts_policy", "identity_binding", "policy_enforcement")
-    seed = load_script("seed_authority", monkeypatch)
-    assert seed.AUTHORITY is False
-    assert "authority store unavailable" in capsys.readouterr().err
+    with pytest.raises(SystemExit) as refused:
+        load_script("seed_authority", monkeypatch)
+    assert "refusing to seed" in str(refused.value.code) and "authority_store_sql" in str(refused.value.code)
 
 
 def test_seed_authority_without_the_flag_never_imports_the_authority_modules(monkeypatch):
@@ -212,13 +212,20 @@ def test_seed_authority_without_the_flag_never_imports_the_authority_modules(mon
     assert load_script("seed_authority", monkeypatch).AUTHORITY is False
 
 
-def test_the_api_launcher_starts_without_enforcement_when_the_modules_are_missing(monkeypatch, capsys):
+def test_the_api_launcher_refuses_the_enforcer_arm_when_the_modules_are_missing(monkeypatch):
     monkeypatch.setenv("HARNESS_WIRE_ENFORCER", "1")
     monkeypatch.setattr("os.chdir", lambda path: None)  # the service directory only exists in the image
     _absent(monkeypatch, "policy_enforcement", "authority_store_sql")
-    launcher = load_script("harness_api", monkeypatch)
-    assert callable(launcher.main)
-    assert "policy enforcement unavailable" in capsys.readouterr().err
+    with pytest.raises(SystemExit) as refused:
+        load_script("harness_api", monkeypatch)
+    assert "refusing to start" in str(refused.value.code)
+
+
+def test_the_api_launcher_without_the_enforcer_flag_starts_without_the_modules(monkeypatch):
+    monkeypatch.delenv("HARNESS_WIRE_ENFORCER", raising=False)
+    monkeypatch.setattr("os.chdir", lambda path: None)
+    _absent(monkeypatch, "policy_enforcement", "authority_store_sql")
+    assert callable(load_script("harness_api", monkeypatch).main)
 
 
 @pytest.mark.parametrize("argv", [["--help"], ["-h"]])
