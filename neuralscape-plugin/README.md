@@ -356,7 +356,7 @@ before session-note fields go into a checkpoint.
   attributes (`< private >`, `<PRIVATE reason="draft">`, `</ private >`) and the
   HTML-escaped form (`&lt;private&gt;` … `&lt;/private&gt;`). Other encodings
   (numeric entities such as `&#60;private&#62;`, URL-encoded or Unicode look-alike
-  characters) are **not** recognised: use the literal tag. A word that only starts
+  characters, full-width `＜private＞` or zero-width-joined look-alikes) are **not** recognised: use the literal ASCII tag. A tag whose closing `>` is missing (`<private` at the end of a text, `<private foo` with no `>`) counts as an opener when redacting fail-closed. A word that only starts
   with `private` (`<privateer>`, `<private-note>`) is not a tag.
 - **Across entries.** A span may open in the prompt and close in the answer, or
   open in one assistant message and close in a later one: the session note and the

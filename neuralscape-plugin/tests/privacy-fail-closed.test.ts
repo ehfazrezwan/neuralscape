@@ -218,3 +218,46 @@ describe("session note: nested spans and spans across user and assistant text", 
     expect(redactTurnPieces(["plain", "text"])).toEqual(["plain", "text"]);
   });
 });
+
+describe("linear time and unterminated tags", () => {
+  const MB = 1024 * 1024;
+  const timed = (fn: () => void): number => {
+    const t0 = performance.now();
+    fn();
+    return performance.now() - t0;
+  };
+
+  it.each([
+    ["&lt;private repeated", "&lt;private".repeat(Math.ceil(MB / 12))],
+    ["<private repeated", "<private".repeat(Math.ceil(MB / 8))],
+    ["&lt;private with spaces", "&lt;private ".repeat(Math.ceil(MB / 13))],
+    ["< / private noise", "< ".repeat(MB / 2)],
+    ["many matched pairs", "<private>x</private> ".repeat(Math.ceil(MB / 21))],
+    ["deep nesting", "<private>".repeat(Math.ceil(MB / 18)) + "</private>".repeat(Math.ceil(MB / 18))],
+  ])("1 MB of %s redacts in well under a second, in both modes", (_name, text) => {
+    expect(text.length).toBeGreaterThanOrEqual(MB / 2);
+    for (const failClosed of [false, true]) {
+      const ms = timed(() => redactPrivate(text, { failClosed }));
+      // The unbounded pattern took ~35 s per MB; a linear pass takes a few tens of milliseconds.
+      expect(ms, `${_name} failClosed=${failClosed} took ${ms.toFixed(0)} ms`).toBeLessThan(1000);
+    }
+  });
+
+  it("fail-closed: an opener with no terminator hides the rest", () => {
+    expect(redactPrivate("a <private", { failClosed: true })).toBe("a [redacted:unclosed]");
+    expect(redactPrivate("a <private foo SENTINEL and more", { failClosed: true })).toBe("a [redacted:unclosed]");
+    expect(redactPrivate("a &lt;private SENTINEL", { failClosed: true })).toBe("a [redacted:unclosed]");
+    expect(redactPrivate("x <private SENTINEL>y</private> z", { failClosed: true })).toBe("x [redacted] z");
+  });
+  it("default mode: an unterminated opener is plain text (prose mentioning the tag)", () => {
+    expect(redactPrivate("the <private tag is described here")).toBe("the <private tag is described here");
+  });
+  it("an attribute body longer than the cap is not mistaken for a tag in default mode, and fails closed otherwise", () => {
+    const long = `<private ${"x".repeat(300)}>SENTINEL</private>`;
+    expect(redactPrivate(long, { failClosed: true })).not.toMatch(/SENTINEL/);
+  });
+  it("full-width and zero-width look-alikes are not recognised (ASCII tags only)", () => {
+    const lookalike = "＜private＞SENTINEL＜/private＞ <pri‍vate>SENTINEL</pri‍vate>";
+    expect(redactPrivate(lookalike, { failClosed: true })).toBe(lookalike);
+  });
+});

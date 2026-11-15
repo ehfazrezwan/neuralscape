@@ -266,10 +266,19 @@ export function isProjectExcluded(projectId: string | undefined): boolean {
 
 /**
  * One `<private>` tag, tolerant of whitespace, attributes and case (`< private >`, `<PRIVATE reason="x">`,
- * `</ private>`), and of the HTML-escaped spelling (`&lt;private&gt;`). `private` must be a whole word, so
- * `<privateer>` and `<private-note>` are not tags. Group 1 is set for a closer.
+ * `</ private>`), and of the HTML-escaped spelling (`&lt;private&gt;`). ASCII only: full-width or zero-width-joined
+ * look-alikes are not recognised. `private` must be a whole word, so `<privateer>` and `<private-note>` are not
+ * tags. Group 1 is set for a closer.
  */
-const PRIVATE_TAG = /(?:<|&lt;)\s*(\/)?\s*private(?![\w-])[^<>]*?(?:>|&gt;)/gi;
+const PRIVATE_TAG = /(?:<|&lt;)\s{0,20}(\/)?\s{0,20}private(?![\w-])[^<>]{0,200}?(?:>|&gt;)/gi;
+
+/**
+ * Fail-closed matcher: the same, but a tag whose terminator is missing (`<private` at the end of the text,
+ * `<private foo` with no `>`) still counts, so a half-written opener cannot hide a span from the redactor.
+ * Both patterns are bounded (whitespace and attribute lengths are capped, no nested quantifiers), so the work
+ * is linear in the text even for a megabyte of repeated openers.
+ */
+const PRIVATE_TAG_LOOSE = /(?:<|&lt;)\s{0,20}(\/)?\s{0,20}private(?![\w-])(?:[^<>]{0,200}?(?:>|&gt;))?/gi;
 
 export interface PrivateSpan {
   start: number;
@@ -290,7 +299,7 @@ export function findPrivateSpans(text: string, failClosed = false): PrivateSpan[
   let depth = 0;
   let start = 0;
   let floor = 0; // end of the last span: a stray closer redacts back to here
-  for (const tag of text.matchAll(PRIVATE_TAG)) {
+  for (const tag of text.matchAll(failClosed ? PRIVATE_TAG_LOOSE : PRIVATE_TAG)) {
     const at = tag.index as number;
     const end = at + tag[0].length;
     if (tag[1] === undefined) {
