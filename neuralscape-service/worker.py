@@ -1404,6 +1404,9 @@ async def auto_compile_check(ctx: dict) -> dict | None:
     writer: ObsidianWriter = ctx.get("compiler_writer") or ObsidianWriter()
     ctx.setdefault("compiler_writer", writer)
 
+    # The vault is one shared tree and every daily-log entry records its owner, so
+    # post-compile dedup runs for each user whose entries were compiled;
+    # ``default_user_id`` only covers entries written before owners were recorded.
     results = await compile_all_pending(service, writer, user_id=settings.default_user_id)
     if results:
         writer.append_log(f"Auto-compiled {len(results)} date(s) via cron")
@@ -1737,7 +1740,7 @@ class WorkerSettings:
     redis_settings = parse_redis_settings()
     queue_name = settings.arq_queue_name
     after_job_end = _make_after_job_end(settings.arq_queue_name)
-    max_jobs = 10
+    max_jobs = settings.arq_max_jobs
     job_timeout = settings.arq_job_timeout
     max_tries = settings.arq_max_retries  # keep light-queue retry behavior unchanged
 
@@ -1790,7 +1793,7 @@ class GraphWorkerSettings:
     redis_settings = parse_redis_settings()
     queue_name = settings.graph_queue_name
     after_job_end = _make_after_job_end(settings.graph_queue_name)
-    max_jobs = 4
+    max_jobs = settings.graph_max_jobs
     job_timeout = 900  # graph.add + entity extraction can run several minutes
     max_tries = settings.arq_max_retries
 
@@ -1827,6 +1830,6 @@ class IngestWorkerSettings:
     redis_settings = parse_redis_settings()
     queue_name = settings.ingest_queue_name
     after_job_end = _make_after_job_end(settings.ingest_queue_name)
-    max_jobs = 3
+    max_jobs = settings.ingest_max_jobs
     job_timeout = 900  # a large PDF parse + fact extraction can run minutes
     max_tries = settings.arq_max_retries

@@ -146,7 +146,7 @@ def test_queued_graph_job_with_unchanged_visibility_enriches() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Job keys omit semantic options
+# Job keys cover semantic options (defects fixed; these are now controls)
 # ---------------------------------------------------------------------------
 
 
@@ -194,14 +194,6 @@ def _raw_id(**kwargs) -> str:
     return _run(manager.enqueue_raw(**arguments))
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason=(
-        "the extraction job id is built from message text and event time only, so the same text "
-        "sent to a different project, agent or run coalesces onto one job and the later write is dropped"
-    ),
-)
 def test_store_job_id_depends_on_project_and_agent_scope() -> None:
     base = _store_id(project_id="alpha")
 
@@ -210,20 +202,16 @@ def test_store_job_id_depends_on_project_and_agent_scope() -> None:
     assert _store_id(project_id="alpha", run_id="run-2") != base
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason=(
-        "the raw-write job id covers visibility, scope, project and the sensitivity override but "
-        "not category, tags or agent, so writes differing only in those options coalesce"
-    ),
-)
 def test_raw_job_id_depends_on_category_and_tags() -> None:
     base = _raw_id()
 
     assert _raw_id(category="preference") != base
     assert _raw_id(tags=["release"]) != base
     assert _raw_id(agent_id="agent-2") != base
+    assert _raw_id(run_id="run-2") != base
+    assert _raw_id(domain="ops") != base
+    # Tags are a set: order and repeats do not make a different write.
+    assert _raw_id(tags=["a", "b"]) == _raw_id(tags=["b", "a", "a"])
 
 
 def test_job_ids_are_stable_and_user_scoped() -> None:

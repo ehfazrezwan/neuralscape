@@ -210,7 +210,6 @@ def test_known_failure_rules_hold_as_the_list_shrinks_to_zero() -> None:
 def test_required_baseline_areas_each_have_an_expected_failure_and_a_control() -> None:
     areas = {
         "identity": ("email-slug-collision", "email-slug-controls"),
-        "job-key": ("job-key-omits-store-scope", "job-key-controls"),
         "graph-deletion": ("graph-removal-shared-support", "graph-removal-controls"),
         "readiness": ("readiness-probes-backends", "readiness-controls"),
         "backup": ("backup-covers-compose-volumes", "backup-volume-controls"),
@@ -228,6 +227,9 @@ def test_required_baseline_areas_each_have_an_expected_failure_and_a_control() -
     for area, ids in fixed.items():
         for scenario_id in ids:
             assert by_id[scenario_id].kind == "control", area
+    # The job-key defects are fixed: that area is controls only now.
+    for control in ("job-key-store-scope-control", "job-key-raw-options-control", "job-key-controls"):
+        assert by_id[control].kind == "control", control
 
 
 def test_module_is_standard_library_only() -> None:

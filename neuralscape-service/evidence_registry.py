@@ -377,12 +377,15 @@ SCENARIOS: tuple[Scenario, ...] = (
     Scenario("queued-job-same-visibility-control", "control", ("A7.01",),
              "test_queued_graph_job_with_unchanged_visibility_enriches", False,
              "An unchanged visibility is passed through."),
-    Scenario("job-key-omits-store-scope", "expected-failure", ("A6.02", "D2.07"),
-             "test_store_job_id_depends_on_project_and_agent_scope", True,
-             "The extraction job id ignores project, agent and run, so identical text coalesces across destinations."),
-    Scenario("job-key-omits-raw-options", "expected-failure", ("A6.02", "D2.07"),
-             "test_raw_job_id_depends_on_category_and_tags", True,
-             "The raw-write job id ignores category, tags and agent, so different options coalesce."),
+    # Fixed: the two job-key defects (identical text coalescing across
+    # project/agent/run, and across raw-write category/tags/agent) are now
+    # ordinary controls.
+    Scenario("job-key-store-scope-control", "control", ("A6.02", "D2.07"),
+             "test_store_job_id_depends_on_project_and_agent_scope", False,
+             "The extraction job id covers project, agent and run, so identical text sent to another destination is its own job."),
+    Scenario("job-key-raw-options-control", "control", ("A6.02", "D2.07"),
+             "test_raw_job_id_depends_on_category_and_tags", False,
+             "The raw-write job id covers category, tags and agent, so writes differing in those options are distinct jobs."),
     Scenario("job-key-controls", "control", ("A6.02", "D2.07"),
              "test_job_ids_are_stable_and_user_scoped", False,
              "Same inputs give one id and different users give different ids."),

@@ -115,6 +115,13 @@ class Settings(BaseSettings):
     ingest_queue_name: str = "neuralscape:ingest"
     arq_max_retries: int = 3
     arq_job_timeout: int = 300  # 5 min max per task
+    # Concurrent jobs per worker process (ARQ ``max_jobs``), one knob per
+    # worker class. The graph worker's default is low to cap concurrent Gemini
+    # extraction (AI-Studio throttling); the ingest worker's bounds parse /
+    # embed memory. Env: ARQ_MAX_JOBS / GRAPH_MAX_JOBS / INGEST_MAX_JOBS.
+    arq_max_jobs: int = Field(default=10, ge=1)
+    graph_max_jobs: int = Field(default=4, ge=1)
+    ingest_max_jobs: int = Field(default=3, ge=1)
     # Override the global ThreadPoolExecutor used by asyncio.to_thread (batch-get,
     # code-graph reads). 0 = use Python default (min(32, cpu+4)); >0 sets explicit
     # size. The stdlib default silently caps concurrent to_thread calls, which
@@ -144,6 +151,12 @@ class Settings(BaseSettings):
     # Dedup cron
     dedup_similarity_threshold: float = 0.95
     dedup_batch_size: int = 100
+    # Semantic dedup (phase 2 of the dedup cron and of post-compile dedup).
+    # False (default): the older near-duplicate is hard-deleted, with the graph
+    # cascade and sibling re-ingest jobs. True: it is tombstoned instead
+    # (reversible: recall hides it, the row stays, re-deriving it revives it)
+    # and nothing cascades. Env: DEDUP_SEMANTIC_TOMBSTONE_ENABLED.
+    dedup_semantic_tombstone_enabled: bool = False
     dedup_cron_hours: set = {0, 6, 12, 18}
 
     # ── Reinforcement-aware recall boost (times_derived) ──────────────
