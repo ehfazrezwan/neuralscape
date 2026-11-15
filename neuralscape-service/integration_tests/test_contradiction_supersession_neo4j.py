@@ -10,7 +10,11 @@ episodes``, live-edge counting) behave on a real graph, flag ON.
 The LLM-driven half (Graphiti's ``add_episode`` actually invalidating the
 edge) needs a Gemini key and is covered by the flag-on VPS integration run.
 
-Run: NEO4J_PASSWORD=... uv run pytest tests/test_contradiction_supersession_integration.py -v -m integration
+Lives outside ``tests/`` (like ``test_native_snapshot_neo4j.py``) so the
+default host/container suites never see it; invoke explicitly with a live
+Neo4j: ``NEO4J_URI=... NEO4J_USER=... NEO4J_PASSWORD=... [NEO4J_DATABASE=neo4j]
+uv run pytest integration_tests/test_contradiction_supersession_neo4j.py -v``.
+A missing or unreachable database is a test failure, not a skip.
 """
 
 import asyncio
@@ -23,27 +27,12 @@ import pytest
 
 from config import settings
 
-NEO4J_URI = os.environ.get("NEO4J_URI", settings.neo4j_uri)
-NEO4J_USER = os.environ.get("NEO4J_USER", settings.neo4j_user)
-NEO4J_PASSWORD = os.environ.get("NEO4J_PASSWORD", settings.neo4j_password)
-NEO4J_DB = os.environ.get("NEO4J_DATABASE", settings.neo4j_database)
+NEO4J_URI = os.environ["NEO4J_URI"]
+NEO4J_USER = os.environ["NEO4J_USER"]
+NEO4J_PASSWORD = os.environ["NEO4J_PASSWORD"]
+NEO4J_DB = os.environ.get("NEO4J_DATABASE", "neo4j")
 
-
-def _neo4j_reachable() -> bool:
-    try:
-        from neo4j import GraphDatabase
-
-        with GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD)) as d:
-            d.verify_connectivity()
-        return True
-    except Exception:
-        return False
-
-
-pytestmark = [
-    pytest.mark.integration,
-    pytest.mark.skipif(not _neo4j_reachable(), reason="Neo4j not reachable"),
-]
+pytestmark = pytest.mark.integration
 
 
 class _DbDriver:
