@@ -9,6 +9,7 @@ Needs QDRANT_URL (see conftest.py); skips cleanly without it.
 
 from types import SimpleNamespace
 
+import third_party_telemetry  # noqa: F401  (must precede any mem0 import)
 from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, VectorParams
 
