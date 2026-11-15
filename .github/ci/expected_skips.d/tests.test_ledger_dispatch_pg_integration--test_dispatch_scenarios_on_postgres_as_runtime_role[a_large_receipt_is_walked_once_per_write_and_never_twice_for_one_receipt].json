@@ -1,0 +1,9 @@
+{
+  "test": "tests.test_ledger_dispatch_pg_integration::test_dispatch_scenarios_on_postgres_as_runtime_role[a_large_receipt_is_walked_once_per_write_and_never_twice_for_one_receipt]",
+  "reason_contains": "LEDGER_TEST_PG_DSN not set (postgres ledger inte",
+  "profiles": [
+    "container",
+    "host"
+  ],
+  "why": "missing infrastructure: needs a PostgreSQL DSN (declared by Phase 2 slice 1); these tests belong under integration_tests/ with the pg_dsn fixture"
+}
