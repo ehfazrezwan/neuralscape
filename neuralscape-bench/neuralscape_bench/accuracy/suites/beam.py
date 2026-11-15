@@ -30,6 +30,12 @@ BASE = "https://raw.githubusercontent.com/vectorize-io/agent-memory-benchmark/ma
 TIERS = ("100k", "500k", "1m", "10m")
 DEFAULT_TIER = "100k"
 
+RETRIEVAL_INCOMPATIBLE = (
+    "BEAM gold_ids are user-level and its documents are whole multi-turn "
+    "dialogues, so lexical session attribution over distilled memories has "
+    "no session ground truth to match"
+)
+
 # "[March-15-2024 | Turn 0] User: text" — the date is omitted after Turn 0.
 _MARKER = re.compile(
     r"\[(?:(?P<date>[^\]|]+)\s*\|\s*)?Turn\s+(?P<turn>\d+)\]\s*(?P<role>\w+):",
@@ -154,5 +160,6 @@ SUITES = [
         source="github.com/vectorize-io/agent-memory-benchmark (data/beam/<tier>/)",
         license_note="See upstream repo license.",
         default_options={"tier": DEFAULT_TIER},
+        retrieval_incompatible=RETRIEVAL_INCOMPATIBLE,
     ),
 ]

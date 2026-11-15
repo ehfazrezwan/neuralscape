@@ -10,9 +10,14 @@ Supports two token formats simultaneously:
 
 2. **Legacy shared API key** (single-user / pre-multi-user installs):
    one segment, opaque string. Validated against ``NEURALSCAPE_API_KEY``.
-   When this path matches, ``request.state.user_id`` is **not** set
-   (routes must fall back to body ``user_id``), and a deprecation
-   warning header is added to the response.
+   When this path matches, the key acts as ONE identity:
+   ``NEURALSCAPE_API_KEY_USER_ID`` if set, else ``DEFAULT_USER_ID``. That user
+   is attached to ``request.state.user_id`` and ``current_user_id`` just like a
+   per-user token, so a body/query ``user_id`` naming anyone else gets HTTP 400
+   and MCP ignores ``arguments["user_id"]``. Setting
+   ``NEURALSCAPE_LEGACY_KEY_TRUST_BODY_USER_ID=true`` restores the old
+   behaviour (``request.state.user_id`` not set; routes trust the body). A
+   deprecation warning header is added to every legacy-key response.
 
 Auth is fail-closed. When neither secret is configured, startup refuses
 (``Settings.validate_required``) and this middleware rejects every non-public
@@ -28,7 +33,7 @@ import hmac
 import logging
 from contextvars import ContextVar
 
-from fastapi import Request
+from fastapi import HTTPException, Request
 from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 
@@ -41,7 +46,7 @@ logger = logging.getLogger(__name__)
 # is verified. Lets the MCP tool layer — which only receives a tool-arguments
 # dict, not the HTTP request — scope operations to the authenticated user
 # without the model having to pass `user_id`. Default None = unauthenticated
-# or legacy shared-key (fall back to the request body / arguments).
+# (or the legacy-key opt-out): fall back to the request body / arguments.
 current_user_id: ContextVar[str | None] = ContextVar("current_user_id", default=None)
 
 # Paths that never require authentication
@@ -65,6 +70,51 @@ AUTH_NOT_CONFIGURED_MSG = (
     "Authentication is not configured on this server: set NEURALSCAPE_USER_TOKEN_SECRET "
     "or NEURALSCAPE_API_KEY (or NEURALSCAPE_AUTH_DISABLED=true on a trusted local machine)"
 )
+
+
+def resolve_request_user_id(request: Request, body_user_id: str | None) -> str:
+    """Resolve the authoritative user_id for a request.
+
+    - With a verified per-user token (``request.state.user_id`` set by the
+      middleware) the token user wins; a body ``user_id`` that disagrees is
+      rejected with 400 (token-vs-body identity confusion).
+    - Legacy shared-key callers have no ``request.state.user_id``; the body
+      ``user_id`` is trusted as before.
+    - With neither, fall back to ``settings.default_user_id``.
+
+    Lives here (not in main.py) so extension routers can use it without a
+    circular import.
+    """
+    token_user_id = getattr(request.state, "user_id", None)
+    if token_user_id:
+        if body_user_id and body_user_id != token_user_id:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Request body user_id ({body_user_id!r}) does not match the "
+                    f"user_id encoded in the auth token ({token_user_id!r})."
+                ),
+            )
+        return token_user_id
+    return body_user_id or settings.default_user_id
+
+
+def is_admin_user(user_id: str | None) -> bool:
+    """Admin gate for dreaming runs and project knowledge-config writes.
+
+    Owner decision 2026-11-15: with ``DICTATOR_USER_IDS`` empty the default
+    user (``settings.default_user_id``) is the admin, so single-user and
+    legacy-key installs keep working; with a non-empty list only the listed
+    users are admins. ``settings.is_dictator`` is deliberately unchanged
+    (standards-tier writes keep their meaning). Callers must pass the
+    token-resolved identity, never a body-supplied one.
+    """
+    if not user_id:
+        return False
+    listed = settings.dictator_user_ids_set()
+    if listed:
+        return user_id in listed
+    return user_id == settings.default_user_id
 
 
 class BearerAuthMiddleware(BaseHTTPMiddleware):
@@ -118,12 +168,27 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
                     current_user_id.reset(ctx_token)
             # else: HMAC verify failed — fall through to legacy check.
 
-        # Fall back to the legacy shared API key. user_id is NOT set on
-        # request.state — routes must read it from the request body
-        # (trust-based, pre-multi-user behavior).
-        if legacy_key and hmac.compare_digest(token, legacy_key):
+        # Fall back to the legacy shared API key. By default the key acts as
+        # ONE identity (NEURALSCAPE_API_KEY_USER_ID, else DEFAULT_USER_ID): that
+        # user is bound to request.state and the MCP ContextVar exactly like a
+        # per-user token, so a body/query user_id naming anyone else is a 400.
+        # NEURALSCAPE_LEGACY_KEY_TRUST_BODY_USER_ID=true restores the old
+        # trust-the-body behaviour (no identity bound).
+        # Compare as bytes: compare_digest on str raises TypeError for non-ASCII.
+        if legacy_key and hmac.compare_digest(
+            token.encode("utf-8"), legacy_key.encode("utf-8")
+        ):
             request.state.auth_mode = "legacy_shared"
-            response = await call_next(request)
+            if settings.neuralscape_legacy_key_trust_body_user_id:
+                response = await call_next(request)
+            else:
+                bound_user_id = settings.legacy_key_identity()
+                request.state.user_id = bound_user_id
+                ctx_token = current_user_id.set(bound_user_id)
+                try:
+                    response = await call_next(request)
+                finally:
+                    current_user_id.reset(ctx_token)
             response.headers[DEPRECATION_HEADER] = DEPRECATION_MSG
             return response
 

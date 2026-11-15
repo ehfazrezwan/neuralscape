@@ -1,0 +1,9 @@
+{
+  "test": "tests.test_contracts_pack::test_engine_port_contracts_are_registered_with_the_engines_owner",
+  "reason_contains": "engine_ports is not part of this tree",
+  "profiles": [
+    "container",
+    "host"
+  ],
+  "why": "missing module: engine_ports is not part of this tree"
+}

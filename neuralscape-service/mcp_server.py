@@ -1469,7 +1469,7 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
     #      arguments["user_id"] is ignored rather than trusted.
     #   2. An explicit user_id argument (stdio / local Claude Code, legacy).
     #   3. The configured default_user_id.
-    from auth import current_user_id
+    from auth import current_user_id, is_admin_user
 
     # Tools like list_memories / delete_memories declare no required fields, so a
     # client may omit `arguments` entirely (None). Normalize before any access.
@@ -2202,6 +2202,20 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
                     filter_null_category=arguments.get("filter_null_category", False),
                     include_shared=arguments.get("include_shared", False),
                 )
+            # Sibling facts that shared a deleted fact's graph episode need a
+            # fresh single-fact re-ingest; the delete itself has already
+            # succeeded, so a queue failure is reported, never raised.
+            if isinstance(result, dict):
+                jobs = result.pop("graph_jobs", None)
+                if jobs:
+                    try:
+                        result.update(await _task_manager.enqueue_graph_jobs(jobs))
+                    except Exception as e:
+                        logger.warning(f"Sibling graph re-enrichment could not be queued: {e}")
+                        result.update({
+                            "graph_jobs_enqueued": 0,
+                            "graph_jobs_not_enqueued_ids": [j.get("memory_id") for j in jobs],
+                        })
             return [TextContent(type="text", text=json.dumps(result, default=str))]
 
         elif name == "edit_memory":
@@ -2235,12 +2249,28 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
                     logger.warning(f"Graph enqueue failed for edited memory: {e}")
                     graph = "enqueue_failed"
             mem = result.get("memory")
-            return [TextContent(type="text", text=json.dumps({
+            response = {
                 "status": "ok",
                 "memory": mem.model_dump(exclude_none=True) if mem is not None else None,
                 "graph": graph,
                 "graph_task_id": graph_task_id,
-            }, default=str))]
+            }
+            sibling_jobs = result.get("sibling_graph_jobs") or []
+            if sibling_jobs or result.get("sibling_graph_unrepaired_ids"):
+                # The moved fact's whole conversation episode was expired;
+                # re-ingest the surviving siblings (additive keys).
+                queued: dict = {}
+                if sibling_jobs:
+                    try:
+                        queued = await _task_manager.enqueue_graph_jobs(sibling_jobs)
+                    except Exception as e:
+                        logger.warning(f"Sibling graph re-enrichment could not be queued: {e}")
+                        queued = {"graph_jobs_not_enqueued_ids": [j.get("memory_id") for j in sibling_jobs]}
+                response["sibling_graph_jobs_enqueued"] = queued.get("graph_jobs_enqueued", 0)
+                response["sibling_graph_jobs_not_enqueued_ids"] = queued.get("graph_jobs_not_enqueued_ids", [])
+                response["sibling_graph_unrepaired_ids"] = result.get("sibling_graph_unrepaired_ids", [])
+                response["sibling_graph_repair_failed"] = bool(result.get("sibling_graph_repair_failed"))
+            return [TextContent(type="text", text=json.dumps(response, default=str))]
 
         elif name == "get_reasoning_chain":
             try:
@@ -2576,6 +2606,10 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
         elif name == "set_project_knowledge_config":
             from knowledge.router import ProjectKnowledgeConfig, set_project_config
 
+            if not is_admin_user(user_id):
+                return [TextContent(type="text", text=json.dumps(
+                    {"error": f"User {user_id!r} is not authorized to set project knowledge config."}))]
+
             project_id = arguments.get("project_id")
             if not project_id:
                 return [TextContent(type="text", text=json.dumps({"error": "project_id required"}))]
@@ -2600,6 +2634,11 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
             # (a sweep is minutes of LLM + store work) — enqueue onto the graph
             # worker's queue and let the caller poll the status endpoint.
             from extensions.dreaming.config import dreaming_settings
+
+            # Dictator-only, checked before the flag/force logic (mirrors REST /run).
+            if not is_admin_user(user_id):
+                return [TextContent(type="text", text=json.dumps(
+                    {"error": f"User {user_id!r} is not authorized to trigger dreaming sweeps."}))]
 
             force = bool(arguments.get("force", False))
             if not dreaming_settings.enabled and not force:
