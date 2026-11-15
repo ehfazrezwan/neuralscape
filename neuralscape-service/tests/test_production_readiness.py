@@ -428,23 +428,7 @@ class TestRESTRedisFallback:
     @pytest.fixture(autouse=True)
     def setup_mocks(self):
         """Patch globals for REST endpoint tests."""
-        mock_mem = MagicMock(name="Memory")
-        mock_graphiti = MagicMock(name="Graphiti")
-        mock_bridge = MagicMock(name="AsyncBridge")
-
-        original_memory = main._memory
-        original_graphiti = main._graphiti
-        original_bridge = main._bridge
-
-        main._memory = mock_mem
-        main._graphiti = mock_graphiti
-        main._bridge = mock_bridge
-
         yield
-
-        main._memory = original_memory
-        main._graphiti = original_graphiti
-        main._bridge = original_bridge
 
     @pytest.fixture
     def mock_service(self):
@@ -544,11 +528,11 @@ class TestJobIdempotency:
 class TestGlobalExceptionHandler:
     @pytest.fixture(autouse=True)
     def setup_mocks(self):
-        mock_mem = MagicMock(name="Memory")
-        original_memory = main._memory
-        main._memory = mock_mem
+        mock_svc = MagicMock(name="MemoryService")
+        original_service = main._service
+        main._service = mock_svc
         yield
-        main._memory = original_memory
+        main._service = original_service
 
     @pytest.fixture(autouse=True)
     def mock_task_manager(self):
@@ -569,7 +553,7 @@ class TestGlobalExceptionHandler:
 
     def test_500_does_not_leak_internal_details(self, client):
         """Error responses should not contain stack traces or internal paths."""
-        main._memory.add.side_effect = Exception(
+        main._service.extract_and_store.side_effect = Exception(
             "neo4j://admin:secret@localhost:7687 connection refused /app/internal/path.py"
         )
         resp = client.post("/memories", json={
@@ -583,7 +567,7 @@ class TestGlobalExceptionHandler:
         assert "/app/internal" not in json.dumps(body)
 
     def test_500_returns_generic_message(self, client):
-        main._memory.search.side_effect = RuntimeError("internal failure")
+        main._service.search.side_effect = RuntimeError("internal failure")
         resp = client.post("/search", json={
             "query": "test",
             "user_id": "u1",
@@ -602,10 +586,6 @@ class TestGlobalExceptionHandler:
 class TestInputValidation:
     @pytest.fixture(autouse=True)
     def setup_mocks(self):
-        mock_mem = MagicMock(name="Memory")
-        original_memory = main._memory
-        main._memory = mock_mem
-
         mock_tm = MagicMock(name="TaskManager")
         mock_tm.connect = AsyncMock()
         mock_tm.close = AsyncMock()
@@ -616,7 +596,6 @@ class TestInputValidation:
 
         yield
 
-        main._memory = original_memory
         main._task_manager = original_tm
 
     @pytest.fixture
@@ -693,11 +672,7 @@ class TestInputValidation:
 class TestHealthEndpointChecks:
     @pytest.fixture(autouse=True)
     def setup_mocks(self):
-        mock_mem = MagicMock(name="Memory")
-        original_memory = main._memory
-        main._memory = mock_mem
         yield
-        main._memory = original_memory
 
     @pytest.fixture
     def client(self):
