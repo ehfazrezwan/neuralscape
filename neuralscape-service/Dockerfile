@@ -22,6 +22,7 @@ COPY neuralscape-service/knowledge/ neuralscape-service/knowledge/
 COPY neuralscape-service/ingest/ neuralscape-service/ingest/
 COPY neuralscape-service/connectors/ neuralscape-service/connectors/
 COPY neuralscape-service/okf/ neuralscape-service/okf/
+COPY neuralscape-service/integration_tests/ neuralscape-service/integration_tests/
 
 # Install all dependencies using uv from the neuralscape-service project
 # E2: include the code-graph extra (tree-sitter + graphifyy) in the builder
@@ -67,6 +68,7 @@ COPY neuralscape-service/knowledge/ neuralscape-service/knowledge/
 COPY neuralscape-service/ingest/ neuralscape-service/ingest/
 COPY neuralscape-service/connectors/ neuralscape-service/connectors/
 COPY neuralscape-service/okf/ neuralscape-service/okf/
+COPY neuralscape-service/integration_tests/ neuralscape-service/integration_tests/
 # Operator-facing scripts (relocate_vault_to_raw, issue_user_token,
 # migrate_graph_groups, bulk_promote_visibility). Production operators
 # invoke these in-container; without this copy they had to docker-cp
@@ -144,6 +146,7 @@ RUN cd neuralscape-service && \
 # for faster iteration; the baked-in copy guarantees the image is
 # reproducibly testable on its own.
 COPY neuralscape-service/tests/ neuralscape-service/tests/
+COPY neuralscape-service/integration_tests/ neuralscape-service/integration_tests/
 COPY neuralscape-service/scripts/ neuralscape-service/scripts/
 
 ENV PATH="/app/neuralscape-service/.venv/bin:$PATH"

@@ -20,6 +20,7 @@ from pydantic import BaseModel, Field
 
 from extensions.base import ExtensionManifest
 from memory_service import MemoryService
+from task_manager import record_task_owner
 
 from .config import dreaming_settings
 from .sweep import get_last_run
@@ -86,7 +87,7 @@ class DreamingExtension:
         router = APIRouter(tags=["dreaming"])
 
         @router.post("/run", status_code=202)
-        async def run_dream(req: DreamRequest):
+        async def run_dream(req: DreamRequest, request: Request):
             """Enqueue one dreaming sweep onto the graph worker (202 + poll).
 
             Never sweeps in-process: a sweep is minutes of LLM + store
@@ -112,6 +113,12 @@ class DreamingExtension:
                     req.force,
                     _queue_name=core_settings.graph_queue_name,
                 )
+                if job:
+                    # A per-user token holder who started the sweep can also
+                    # poll it on /v1/memories/status (shared key: unchecked).
+                    await record_task_owner(
+                        arq_pool, job.job_id, getattr(request.state, "user_id", None)
+                    )
             finally:
                 await arq_pool.close()
             return {

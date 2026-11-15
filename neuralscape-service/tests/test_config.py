@@ -144,6 +144,7 @@ class TestProviderToggle:
             llm_gateway_api_key="k",
             google_api_key="g",
             neo4j_password="p",
+            neuralscape_user_token_secret="s",
         ).validate_required()
         with pytest.raises(ValueError, match="GOOGLE_API_KEY"):
             _settings(

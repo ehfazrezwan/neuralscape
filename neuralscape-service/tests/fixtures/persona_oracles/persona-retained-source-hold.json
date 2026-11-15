@@ -1,0 +1,21 @@
+{
+ "expected": {
+  "baseline": {
+   "facts": {
+    "capability": "absent"
+   },
+   "verdict": "blocked"
+  },
+  "candidate": {
+   "facts": {
+    "erase_after_release": "allowed",
+    "erase_while_held": "refused"
+   },
+   "verdict": "candidate_pass"
+  }
+ },
+ "oracle_version": "oracle-v1",
+ "owner": "independent reviewer (not the author of the probes); not yet accepted",
+ "persona": "persona-eli",
+ "scenario_id": "persona-retained-source-hold"
+}

@@ -25,8 +25,19 @@ from pydantic import BaseModel
 from neuralscape_bench.models import Target, compare_metrics
 from neuralscape_bench.runner import RESULTS_DIR, config_for_profile, run_benchmark, save_result
 
-BENCH_DIR = Path(__file__).resolve().parent.parent
-STATIC_DIR = BENCH_DIR / "static"
+PACKAGE_DIR = Path(__file__).resolve().parent
+BENCH_DIR = PACKAGE_DIR.parent
+
+
+def _resolve_static_dir(package_dir: Path) -> Path:
+    """Prefer wheel-packaged assets, falling back only for a source checkout."""
+    packaged = package_dir / "static"
+    if packaged.exists():
+        return packaged
+    return package_dir.parent / "static"
+
+
+STATIC_DIR = _resolve_static_dir(PACKAGE_DIR)
 
 app = FastAPI(title="Neuralscape Benchmark Dashboard")
 
