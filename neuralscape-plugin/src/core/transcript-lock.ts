@@ -45,8 +45,10 @@
  */
 
 import { execFile } from "node:child_process";
+import { realpathSync } from "node:fs";
 import { link, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { createHash, randomBytes } from "node:crypto";
+import { resolve } from "node:path";
 import { logError } from "../utils.js";
 
 const LOCK_SUFFIX = ".neuralscape-lock";
@@ -319,6 +321,18 @@ export async function recoverAbandoned(path: string, judged: LockOwner | "invali
   }
 }
 
+/**
+ * One transcript, one lock file: the same file reached through a relative path, ``..`` segments or a symlink gets the
+ * same lock (the operating system's canonical spelling).  A transcript that does not exist yet uses its absolute path.
+ */
+export function canonicalTranscriptPath(transcriptPath: string): string {
+  try {
+    return (realpathSync.native ?? realpathSync)(transcriptPath);
+  } catch {
+    return resolve(transcriptPath);
+  }
+}
+
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 /**
@@ -334,7 +348,7 @@ export async function withTranscriptLock<T>(
 ): Promise<{ ran: true; value: T } | { ran: false }> {
   const waitMs = options.waitMs ?? LOCK_WAIT_MS;
   const staleMs = options.staleMs ?? LOCK_STALE_MS;
-  const path = transcriptPath + LOCK_SUFFIX;
+  const path = canonicalTranscriptPath(transcriptPath) + LOCK_SUFFIX;
   const owner: LockOwner = { pid: process.pid, token: randomBytes(12).toString("hex"), at: Date.now(), ...(await identity()) };
   const deadline = Date.now() + waitMs;
 

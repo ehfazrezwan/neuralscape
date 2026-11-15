@@ -2,6 +2,7 @@
 
 import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
+import { symlink } from "node:fs/promises";
 import { chmod, mkdir, mkdtemp, readdir, readFile, unlink, utimes, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 import { tmpdir } from "node:os";
@@ -655,4 +656,47 @@ describe("overlapping hook processes on one abandoned lock (real processes, the 
     await gone(path);
     expect(await leftovers(path)).toEqual([]);
   }, 40000);
+});
+
+describe("one transcript, one lock (ported from the socket-lock attempt's key tests)", () => {
+  it("a symlink to the transcript, and a path with .. segments, exclude each other like the transcript's own path", async () => {
+    const path = await fresh();
+    await writeFile(path, "x");
+    const link = path + ".link";
+    await symlink(path, link);
+    const dotted = join(dirname(path), "sub", "..", "transcript.jsonl");
+    await mkdir(join(dirname(path), "sub"));
+    let inside = 0;
+    let overlapped = false;
+    const body = async () => { inside++; if (inside > 1) overlapped = true; await sleep(40); inside--; };
+    const results = await Promise.all([path, link, dotted, path].map((p) => withTranscriptLock(p, body, { waitMs: 5000 })));
+    expect(overlapped).toBe(false);
+    expect(results.every((r) => r.ran)).toBe(true);
+    await gone(path);
+  });
+
+  it("a transcript that does not exist yet still locks, and leaves no file behind", async () => {
+    const path = await fresh();
+    expect((await withTranscriptLock(path, async () => 1)).ran).toBe(true);
+    await gone(path);
+    expect(await leftovers(path)).toEqual([]);
+  });
+});
+
+describe("kill -9 of the holder (the case where the socket lock is faster)", () => {
+  it("a waiter skips while the dead holder's lock is younger than the bound, and takes over once it is older", async () => {
+    const path = await fresh();
+    const worker = await bundledLock();
+    const child = spawn("node", [worker, path, "30000"], { stdio: ["ignore", "pipe", "inherit"] });
+    let out = "";
+    child.stdout!.on("data", (d) => (out += d));
+    while (!out.includes("held")) await sleep(20);
+    child.kill("SIGKILL");
+    await new Promise<void>((r) => child.on("close", () => r()));
+    const young = await withTranscriptLock(path, async () => 1, { staleMs: 1500, waitMs: 300 });
+    expect(young.ran).toBe(false); // the file lock needs the record to age; a socket lock would have acquired at once
+    const old = await withTranscriptLock(path, async () => 1, { staleMs: 1500, waitMs: 4000 });
+    expect(old.ran).toBe(true);
+    await gone(path);
+  }, 20000);
 });

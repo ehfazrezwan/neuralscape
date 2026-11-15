@@ -11,6 +11,7 @@ the project adheres to [Semantic Versioning](https://semver.org/).
 - A lock path that exists but cannot be read (no read permission, or a directory) was treated as absent, so the hook retried without sleeping or checking its deadline and ran past the wait bound. Only a missing file counts as absent now; an unreadable lock is never reclaimed and the hook returns at once, skipping its flush with a log line (the turns wait for the next flush). Every retry path now checks the deadline.
 - The liveness probe treated any `process.kill(pid, 0)` error other than `EPERM` as proof that the owner was gone, so an unexpected error could make a live owner's lock reclaimable. Only `ESRCH` proves the owner is gone now; `EPERM` and every other error mean the owner is believed alive.
 - A hook waiting on a held lock spawned `ps` on every 50 ms poll to check whether the owner's pid had been reused. The verdict is now kept per pid and record for the length of the wait, so `ps` runs once.
+- The same transcript reached through a symlink, a relative path or `..` segments used a different lock file, so two such hooks did not exclude each other. The lock file now sits next to the transcript's canonical path.
 - Correction to the 2.9.3 entry: the per-transcript lock normally serializes overlapping hooks but does not promise exactly-once delivery; that sentence has been reworded. A recovery mutex written by a pre-2.9.3 hook (no start time) whose pid was reused by a live process was already passed over by the `ps` rule; there is a test for it now.
 
 ## [2.9.3] - 2026-10-28
