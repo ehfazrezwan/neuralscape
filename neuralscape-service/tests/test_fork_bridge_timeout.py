@@ -112,3 +112,25 @@ def test_timeout_message_does_not_trigger_the_service_transient_retry():
     finally:
         b._loop.call_soon_threadsafe(b._loop.stop)
     assert not _is_transient(err)
+
+
+def test_a_timeout_raised_inside_the_coroutine_propagates_unchanged(bridge):
+    """Only the outer wait expiring is a bridge timeout; an inner TimeoutError keeps its message."""
+    from memory.retry import _is_transient
+
+    async def inner():
+        raise TimeoutError("neo4j read timed out after 5s")
+
+    err = _run_guarded(bridge, inner(), timeout=5)["error"]
+    assert isinstance(err, TimeoutError)
+    assert str(err) == "neo4j read timed out after 5s"
+    assert _is_transient(err)  # the service still retries it as before
+
+
+def test_default_bound_is_not_shorter_than_the_longest_worker_job_timeout():
+    import re
+    from pathlib import Path
+
+    worker = (Path(__file__).resolve().parents[1] / "worker.py").read_text()
+    longest = max(int(n) for n in re.findall(r"job_timeout = (\d+)", worker))
+    assert DEFAULT_BRIDGE_TIMEOUT_S > longest

@@ -129,10 +129,13 @@ def _create_cross_encoder(provider: str | None, api_key: str | None, model: str 
 
 
 # NEURALSCAPE PATCH: upper bound on one bridge call. Graph writes legitimately
-# take minutes (LLM extraction), so this is a hang guard, not a latency target:
-# it matches the worker's ARQ job timeout (300 s). Override per process with
-# GRAPHITI_BRIDGE_TIMEOUT_S, or per call with ``_AsyncBridge.run(timeout=...)``.
-DEFAULT_BRIDGE_TIMEOUT_S = 300.0
+# take minutes (LLM extraction), so this is a hang guard, not a latency target.
+# It must never undercut the longest worker job that runs graph work: the graph
+# and ingest workers use ``job_timeout = 900`` (neuralscape-service/worker.py),
+# so the default is 900 s plus a 60 s margin. Before this patch the wait was
+# unbounded. Override per process with GRAPHITI_BRIDGE_TIMEOUT_S, or per call
+# with ``_AsyncBridge.run(timeout=...)``.
+DEFAULT_BRIDGE_TIMEOUT_S = 960.0
 
 
 def _bridge_timeout_from_env() -> float:
@@ -176,6 +179,11 @@ class _AsyncBridge:
         try:
             return future.result(timeout=limit)
         except concurrent.futures.TimeoutError:
+            if future.done():
+                # The coroutine itself raised TimeoutError (driver/LLM timeout,
+                # or it finished in the same instant): propagate it unchanged
+                # so its message and the service's transient retry still apply.
+                return future.result()
             future.cancel()
             # No "timed out"/"timeout" wording: the service's transient-error
             # retry matches on those and would re-run a call that just hung.

@@ -365,6 +365,10 @@ def _get_or_create_entity_store(memory):
     # setdefault is atomic, so two first callers cannot end up with two locks.
     # Created here (not in __init__) so instances built without __init__ work.
     lock = memory.__dict__.setdefault("_entity_store_lock", threading.Lock())
+    # The lock is held across the create call and its retries (network I/O).
+    # Acceptable: this runs only on the first touch of an instance, retries are
+    # bounded (_ENTITY_STORE_ATTEMPTS, ~2.8 s of sleeps), and other callers must
+    # wait for the store anyway; holding it is what makes the create happen once.
     with lock:
         if memory._entity_store is not None:
             return memory._entity_store
