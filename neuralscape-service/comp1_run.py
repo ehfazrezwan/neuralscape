@@ -26,7 +26,10 @@ problem, an oracle or identity refusal, or a compose project that is not disposa
 
 A compose project is the parameter ``--compose-project-*``.  It is refused when it is the production project (any
 case, after trimming) or does not equal or start with a disposable prefix: ``nstest-`` or ``comp1-`` built in, more
-only by repeating ``--allow-project-prefix`` (never by environment).  Every docker call is scoped to the project
+only by repeating ``--allow-project-prefix`` (never by environment; a prefix under 3 characters or one that could
+match ``neuralscape`` is refused).  The readiness probe stops and starts the vector store, so it runs only on a
+``comp1-`` project unless ``--allow-destructive-on-project`` is given (default off); otherwise it is recorded as an
+invalid attempt and no docker call is made.  Every docker call is scoped to the project
 with ``-p`` and the harness lists, inspects and reads stats of no other container.  Every
 address the real-service probe connects to must be loopback.  Both are refused before any docker or HTTP call.  Partial and invalid attempts are kept as records.
 """
@@ -326,6 +329,8 @@ def run(args: argparse.Namespace) -> list[EvidenceRecord]:
             extra = args.candidate_realservice_args.split() if role == "candidate" else []
             for prefix in args.allow_project_prefix:
                 extra += ["--allow-project-prefix", prefix]
+            if args.allow_destructive_on_project:
+                extra += ["--allow-destructive-on-project"]
             observed = realservice(tree, project, args.compose_file, extra)
             (out / f"realservice-{role}.json").write_text(json.dumps(observed, indent=1, sort_keys=True))
             for scenario_id, (oracle, digest) in sorted(rs_oracles.items()):
@@ -381,6 +386,9 @@ def main(argv: list[str] | None = None) -> int:
     runner.add_argument("--allow-project-prefix", action="append", default=[],
                         help="an extra disposable compose-project prefix (repeatable; the built-in ones are "
                              + ", ".join(comp1_realservice.DEFAULT_PROJECT_PREFIXES) + ")")
+    runner.add_argument("--allow-destructive-on-project", action="store_true",
+                        help="let the readiness probe stop and start the vector store of a project not named "
+                             + comp1_realservice.OWNED_PREFIX + "* (default: off; it is then recorded as an invalid attempt)")
     runner.add_argument("--fail-on-unexpected", action="store_true",
                         help="exit 1 when this run recorded an unexpected_failure (default: exit 0)")
     runner.add_argument("--profile", default="default", choices=["default", "governed"])
@@ -411,6 +419,11 @@ def _check(args: argparse.Namespace) -> str:
     for name in ("baseline", "candidate"):
         if not Path(getattr(args, name)).is_dir():
             return f"--{name} is not a directory: {getattr(args, name)}"
+    for prefix in args.allow_project_prefix:
+        try:
+            comp1_realservice.check_prefix(prefix)
+        except comp1_realservice.UnsafeTarget as refusal:
+            return str(refusal)
     for project in (args.compose_project_baseline, args.compose_project_candidate):
         if project is not None:
             try:

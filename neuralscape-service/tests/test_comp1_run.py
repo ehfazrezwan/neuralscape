@@ -580,7 +580,7 @@ def test_readiness_stops_and_restarts_the_vector_store_even_when_the_probe_fails
                    (503, {"status": "degraded", "checks": {"vector_store": "error"}})])
     monkeypatch.setattr(comp1_realservice, "_call", lambda base, method, path, *a, **k: (
         (200, {}) if "memories" in path else next(health)))
-    assert comp1_realservice.readiness("http://127.0.0.1:1", "p", "f.yml") == {
+    assert comp1_realservice.readiness("http://127.0.0.1:1", "comp1-p", "f.yml") == {
         "stores_up_status_ok": "true", "stores_up_vector_store_ok": "true",
         "stopped_status_ok": "false", "stopped_vector_store_ok": "false",
     }
@@ -594,7 +594,7 @@ def test_readiness_stops_and_restarts_the_vector_store_even_when_the_probe_fails
 
     monkeypatch.setattr(comp1_realservice, "_call", broken)
     with pytest.raises(OSError):
-        comp1_realservice.readiness("http://127.0.0.1:1", "p", "f.yml")
+        comp1_realservice.readiness("http://127.0.0.1:1", "comp1-p", "f.yml")
     assert steps == [("stop", "qdrant"), ("start", "qdrant")]
 
 
@@ -843,7 +843,7 @@ def no_calls(monkeypatch):
     return comp1_realservice
 
 
-@pytest.mark.parametrize("project", ["neuralscape", "NeuralScape", " neuralscape ", "", "   ", None, "stackx", "prod-comp1-x"])
+@pytest.mark.parametrize("project", ["neuralscape", "NeuralScape", " neuralscape ", "", "   ", None, "prod-comp1-x"])
 def test_the_guard_refuses_the_production_project_an_empty_name_and_a_missing_prefix(no_calls, project) -> None:
     with pytest.raises(no_calls.UnsafeTarget):
         no_calls.check_project(project)
@@ -930,20 +930,20 @@ def prefixes(monkeypatch):
     return comp1_realservice
 
 
-@pytest.mark.parametrize("name", ["NeuralScape", "NEURALSCAPE", "  neuralscape\n", "neuralscape-x", "myproj", "my-comp1-x", "stackx", "stackx-x"])
+@pytest.mark.parametrize("name", ["NeuralScape", "NEURALSCAPE", "  neuralscape\n", "neuralscape-x", "myproj", "my-comp1-x", "nstes", "xnstest-"])
 def test_names_outside_the_default_allowlist_and_the_production_name_are_refused(prefixes, name) -> None:
     with pytest.raises(prefixes.UnsafeTarget):
         prefixes.check_project(name)
 
 
-@pytest.mark.parametrize("name", ["nstest-1", "nstest-", "comp1-run", " comp1-run "])
+@pytest.mark.parametrize("name", ["nstest-1", "nstest-", "nstest-x", "comp1-run", " comp1-run "])
 def test_the_default_allowlist_accepts_its_prefixes(prefixes, name) -> None:
     assert prefixes.check_project(name) == name.strip()
 
 
 def test_a_prefix_added_by_option_is_accepted_and_matches_by_equality_or_prefix(prefixes) -> None:
-    prefixes.allow_prefixes(["stackx", "myproj-"])
-    for name in ("stackx", "stackx-x", "myproj-3"):
+    prefixes.allow_prefixes(["mytest", "myproj-"])
+    for name in ("mytest", "mytest-x", "myproj-3"):
         assert prefixes.check_project(name) == name
     with pytest.raises(prefixes.UnsafeTarget):
         prefixes.check_project("myproj")  # not equal and not prefixed
@@ -1012,3 +1012,108 @@ def test_the_real_service_main_takes_extra_prefixes_from_the_command_line(prefix
     assert prefixes.main() == 2 and "not a disposable one" in capsys.readouterr().err
     monkeypatch.setattr(prefixes.sys, "argv", [*base, "--allow-project-prefix", "myproj-"])
     assert prefixes.main() == 2 and "loopback" in capsys.readouterr().err  # past the project check, refused on the address
+
+
+# ── destructive steps need a harness-owned project; extra prefixes cannot match the production name ──
+
+
+@pytest.fixture
+def destructive(prefixes, monkeypatch):
+    monkeypatch.setattr(prefixes, "_DESTRUCTIVE_OK", False)
+    return prefixes
+
+
+def test_the_default_allowlist_is_the_ruled_one_and_the_docs_name_it() -> None:
+    import comp1_realservice
+
+    assert comp1_realservice.DEFAULT_PROJECT_PREFIXES == ("nstest-", "comp1-")
+    assert "nstest-" in (comp1_run.__doc__ or "")
+
+
+@pytest.mark.parametrize("project", ["nstest-x", "nstest-1", "nstest-"])
+def test_stopping_or_starting_a_project_the_harness_did_not_create_is_refused_before_docker(destructive, monkeypatch, project) -> None:
+    monkeypatch.setattr(destructive.subprocess, "run", lambda *a, **k: pytest.fail("docker was called"))
+    monkeypatch.setattr(destructive, "_call", lambda *a, **k: pytest.fail("an HTTP call was made"))
+    for command in (("stop", "qdrant"), ("start", "qdrant")):
+        with pytest.raises(destructive.UnsafeTarget, match="allow-destructive-on-project"):
+            destructive._compose(project, "f.yml", *command)
+    with pytest.raises(destructive.UnsafeTarget):
+        destructive.readiness("http://127.0.0.1:1", project, "f.yml")  # before the first request, too
+
+
+def test_a_harness_owned_project_may_be_stopped_and_started(destructive, monkeypatch) -> None:
+    seen = []
+
+    class Done:
+        stdout = ""
+
+    monkeypatch.setattr(destructive.subprocess, "run", lambda cmd, **k: seen.append(cmd) or Done())
+    destructive._compose("comp1-x", "f.yml", "stop", "qdrant")
+    assert seen[0][-2:] == ["stop", "qdrant"] and seen[0][3] == "comp1-x"
+
+
+def test_the_explicit_opt_in_allows_stop_and_start_on_another_disposable_project(destructive, monkeypatch) -> None:
+    seen = []
+
+    class Done:
+        stdout = ""
+
+    monkeypatch.setattr(destructive.subprocess, "run", lambda cmd, **k: seen.append(cmd) or Done())
+    destructive.allow_destructive(True)
+    destructive._compose("nstest-x", "f.yml", "stop", "qdrant")
+    assert seen and seen[0][3] == "nstest-x"
+    with pytest.raises(destructive.UnsafeTarget):  # the opt-in never widens the allowlist
+        destructive._compose("neuralscape", "f.yml", "stop", "qdrant")
+
+
+def test_the_option_is_off_by_default_and_reaches_the_probe_only_when_given(tmp_path: Path, monkeypatch) -> None:
+    calls = []
+
+    def fake(tree, project, compose_file, extra=None):
+        calls.append(list(extra or []))
+        return _canned("baseline" if "base" in project else "candidate")
+
+    monkeypatch.setattr(comp1_run, "realservice", fake)
+    monkeypatch.setattr(comp1_run.persona_evidence, "run", lambda *a, **k: [])
+    monkeypatch.setattr(comp1_run, "surface", lambda tree: {})
+    monkeypatch.setattr(comp1_run, "run_reproductions", lambda *a, **k: ({}, ""))
+    common = ["--compose-project-baseline", "nstest-base", "--compose-project-candidate", "nstest-cand", "--compose-file", "c.yml"]
+    inputs = _inputs(tmp_path)
+    assert _cli(tmp_path, tmp_path, tmp_path, *common, inputs=inputs) == 0
+    assert calls == [[], []]
+    assert _cli(tmp_path, tmp_path, tmp_path, *common, "--allow-destructive-on-project", run_id="r2", inputs=inputs) == 0
+    assert calls[2:] == [["--allow-destructive-on-project"], ["--allow-destructive-on-project"]]
+
+
+def test_the_readiness_probe_is_an_invalid_attempt_on_a_project_it_may_not_stop(destructive, tmp_path: Path, monkeypatch, capsys) -> None:
+    class Process:
+        def terminate(self) -> None:
+            pass
+
+        def wait(self, timeout=None) -> None:
+            pass
+
+    monkeypatch.setattr(destructive, "_start_api", lambda service_dir, env: (Process(), "http://127.0.0.1:1"))
+    monkeypatch.setattr(destructive, "_port", lambda project, file, service, inner: f"127.0.0.1:{inner}")
+    monkeypatch.setattr(destructive, "job_keys", lambda base: {"k": "v"})
+    monkeypatch.setattr(destructive, "idempotency_retry", lambda base: {"i": "v"})
+    monkeypatch.setattr(destructive.subprocess, "run", lambda *a, **k: pytest.fail("docker was called"))
+    monkeypatch.setattr(destructive.sys, "argv", ["x", "--service-dir", str(tmp_path), "--compose-project", "nstest-x", "--compose-file", "f.yml"])
+    assert destructive.main() == 0
+    printed = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert printed["job_keys"] == {"facts": {"k": "v"}}
+    assert "allow-destructive-on-project" in printed["readiness"]["error"]
+
+
+@pytest.mark.parametrize("prefix", ["", "  ", "ab", "n", "ne", "neu", "NeuralScape", "NEURAL", "neuralscape-x", "Neuralscape1"])
+def test_a_prefix_that_could_match_the_production_name_or_is_too_short_is_refused(prefixes, tmp_path: Path, capsys, prefix) -> None:
+    with pytest.raises(prefixes.UnsafeTarget):
+        prefixes.check_prefix(prefix)
+    assert _cli(tmp_path, _tree(tmp_path, "b", False), _tree(tmp_path, "c", True), "--allow-project-prefix", prefix) == 2
+    assert "not an acceptable disposable project prefix" in capsys.readouterr().err
+    assert not (tmp_path / "out").exists()
+
+
+def test_an_ordinary_prefix_passes_the_runner_check(prefixes, tmp_path: Path) -> None:
+    assert prefixes.check_prefix(" myproj- ") == "myproj-"
+    assert _cli(tmp_path, _tree(tmp_path, "b", False), _tree(tmp_path, "c", True), "--allow-project-prefix", "myproj-") == 0

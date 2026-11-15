@@ -33,6 +33,9 @@ from pathlib import Path
 # Names of disposable stacks the harness may touch: ``name == prefix`` or ``name.startswith(prefix)``.
 # More prefixes come only from an explicit ``--allow-project-prefix`` option, never from the environment.
 DEFAULT_PROJECT_PREFIXES = ("nstest-", "comp1-")
+OWNED_PREFIX = "comp1-"  # projects the harness itself creates: the only ones it may stop or start by default
+_DESTRUCTIVE_OK = False  # set only by --allow-destructive-on-project
+_DESTRUCTIVE_SUBCOMMANDS = {"stop", "start"}
 _LOOPBACK = {"127.0.0.1", "::1", "localhost"}
 _EXTRA_PREFIXES: list[str] = []
 _COMPOSE_SUBCOMMANDS = {"port", "stop", "start", "ps"}  # every one is scoped to the project by ``-p``
@@ -42,13 +45,42 @@ class UnsafeTarget(Exception):
     """A compose project or address the harness must never touch."""
 
 
+def check_prefix(prefix: str) -> str:
+    """An extra prefix when it cannot match the production project: at least 3 characters, and neither
+    starting with ``neuralscape`` nor a leading part of it (in any case)."""
+
+    text = prefix.strip()
+    lowered = text.lower()
+    if len(text) < 3 or lowered.startswith("neuralscape") or "neuralscape".startswith(lowered):
+        raise UnsafeTarget(f"not an acceptable disposable project prefix: {prefix!r}")
+    return text
+
+
+def allow_destructive(allowed: bool) -> None:
+    """The explicit opt-in (``--allow-destructive-on-project``) to stop or start services of a project
+    the harness did not create itself."""
+
+    global _DESTRUCTIVE_OK
+    _DESTRUCTIVE_OK = bool(allowed)
+
+
+def check_destructive(project: str | None) -> str:
+    """The project when the harness may stop or start its services: a disposable name that is the
+    harness's own (``comp1-``), or any disposable name after the explicit opt-in."""
+
+    name = check_project(project)
+    if not (name.startswith(OWNED_PREFIX) or _DESTRUCTIVE_OK):
+        raise UnsafeTarget(
+            f"stopping or starting services of {name!r} needs --allow-destructive-on-project "
+            f"(only {OWNED_PREFIX!r} projects are the harness's own)")
+    return name
+
+
 def allow_prefixes(prefixes: list[str] | tuple[str, ...]) -> None:
     """Add disposable-project prefixes named on the command line (never the production project)."""
 
     for prefix in prefixes:
-        text = prefix.strip()
-        if not text or text.lower().startswith("neuralscape"):
-            raise UnsafeTarget(f"not an acceptable disposable project prefix: {prefix!r}")
+        text = check_prefix(prefix)
         if text not in _EXTRA_PREFIXES:
             _EXTRA_PREFIXES.append(text)
 
@@ -66,7 +98,7 @@ def check_project(project: str | None, extra: list[str] | tuple[str, ...] = ()) 
         raise UnsafeTarget("the compose project name is empty")
     if name.lower() == "neuralscape":
         raise UnsafeTarget("the compose project 'neuralscape' is the production project: refused")
-    prefixes = (*DEFAULT_PROJECT_PREFIXES, *_EXTRA_PREFIXES, *extra)
+    prefixes = (*DEFAULT_PROJECT_PREFIXES, *_EXTRA_PREFIXES, *(check_prefix(item) for item in extra))
     if not any(name == prefix or name.startswith(prefix) for prefix in prefixes):
         raise UnsafeTarget(f"the compose project {name!r} is not a disposable one (allowed prefixes: {', '.join(prefixes)})")
     return name
@@ -92,6 +124,8 @@ def _compose(project: str, file: str, *args: str) -> str:
     name = check_project(project)
     if not args or args[0] not in _COMPOSE_SUBCOMMANDS:
         raise UnsafeTarget(f"the compose subcommand {args[:1]!r} is not one the harness uses")
+    if args[0] in _DESTRUCTIVE_SUBCOMMANDS:
+        check_destructive(name)
     done = subprocess.run(  # always scoped to the project with -p: no unscoped listing, stats or inspect
         ["docker", "compose", "-p", name, "-f", file, *args],
         capture_output=True, text=True, check=True, timeout=180,
@@ -153,6 +187,7 @@ def _token(value: object) -> str:
 
 
 def readiness(base: str, project: str, file: str) -> dict[str, str]:
+    check_destructive(project)  # this probe stops and starts the vector store: refuse before any call
     # Initialise the vector-store client the way an ordinary read does.
     _call(base, "GET", "/v1/memories?user_id=comp1-reader&limit=1")
     up_status, up = _call(base, "GET", "/health")
@@ -241,6 +276,8 @@ def main() -> int:
     parser.add_argument("--compose-file", required=True)
     parser.add_argument("--allow-project-prefix", action="append", default=[],
                         help="an extra disposable compose-project prefix (repeatable; never read from the environment)")
+    parser.add_argument("--allow-destructive-on-project", action="store_true",
+                        help="allow stopping and starting services of a project not named comp1-* (default: off)")
     parser.add_argument("--extra-env", action="append", default=[], help="KEY=VALUE for the API")
     parser.add_argument("--tokens", default="", help="JSON file mapping user id to bearer token")
     parser.add_argument("--write-visibility", default="", help="send this visibility on every write")
@@ -252,6 +289,7 @@ def main() -> int:
     service_dir = Path(args.service_dir).resolve()
     try:
         allow_prefixes(args.allow_project_prefix)
+        allow_destructive(args.allow_destructive_on_project)
         project, file = check_project(args.compose_project), args.compose_file
     except UnsafeTarget as refusal:
         print(f"error: {refusal}", file=sys.stderr)
