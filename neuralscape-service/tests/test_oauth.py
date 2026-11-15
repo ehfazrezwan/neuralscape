@@ -25,7 +25,10 @@ from fastapi.testclient import TestClient
 import main
 import oauth
 from main import app
-from tokens import issue_user_token, sign_payload, verify_user_token
+from tokens import issue_user_token, sign_payload, verify_payload, verify_user_token
+
+_REAL_CONSUME_CODE = oauth._consume_code_jti  # the autouse fixture patches the module attrs
+_REAL_CONSUME_REFRESH = oauth._consume_refresh_jti
 
 SECRET = "oauth-test-secret"
 PUBLIC_URL = "https://neuralscape.example.com"
@@ -80,7 +83,17 @@ def no_redis_replay():
         seen.add(jti)
         return True
 
-    with patch.object(oauth, "_consume_code_jti", side_effect=_consume):
+    seen_refresh = set()
+
+    async def _consume_refresh(jti, ttl):
+        if jti in seen_refresh:
+            return False
+        seen_refresh.add(jti)
+        return True
+
+    with patch.object(oauth, "_consume_code_jti", side_effect=_consume), patch.object(
+        oauth, "_consume_refresh_jti", side_effect=_consume_refresh
+    ):
         yield
 
 
@@ -371,7 +384,7 @@ class TestToken:
         assert second.status_code == 400
         assert "already used" in second.json()["error_description"]
 
-    def test_refresh_grant(self, client):
+    def _tokens(self, client):
         client_id, redirect_uri, verifier, code = self._full_flow_to_code(client)
         tok = client.post(
             "/oauth/token",
@@ -383,13 +396,272 @@ class TestToken:
                 "client_id": client_id,
             },
         ).json()
-        resp = client.post(
+        return client_id, tok
+
+    @staticmethod
+    def _refresh(client, refresh_token, client_id):
+        return client.post(
             "/oauth/token",
-            data={"grant_type": "refresh_token", "refresh_token": tok["refresh_token"]},
+            data={
+                "grant_type": "refresh_token",
+                "refresh_token": refresh_token,
+                "client_id": client_id,
+            },
         )
+
+    def test_refresh_grant(self, client):
+        client_id, tok = self._tokens(client)
+        resp = self._refresh(client, tok["refresh_token"], client_id)
         assert resp.status_code == 200
         new = resp.json()
         assert verify_user_token(new["access_token"], SECRET)["user_id"] == USER
+        # rotation: a different refresh token comes back, bound to the same client
+        assert new["refresh_token"] != tok["refresh_token"]
+        assert verify_payload(new["refresh_token"], SECRET)["client_id"] == client_id
+
+    def test_refresh_token_is_single_use(self, client):
+        client_id, tok = self._tokens(client)
+        assert self._refresh(client, tok["refresh_token"], client_id).status_code == 200
+        replay = self._refresh(client, tok["refresh_token"], client_id)
+        assert replay.status_code == 400
+        assert replay.json()["error"] == "invalid_grant"
+
+    def test_rotated_refresh_token_keeps_working(self, client):
+        client_id, tok = self._tokens(client)
+        second = self._refresh(client, tok["refresh_token"], client_id).json()
+        third = self._refresh(client, second["refresh_token"], client_id)
+        assert third.status_code == 200
+
+    def test_refresh_requires_matching_client_id_and_does_not_burn_token(self, client):
+        client_id, tok = self._tokens(client)
+        other_id, _ = _register(client, "https://other.example.com/cb")
+        wrong = self._refresh(client, tok["refresh_token"], other_id)
+        assert wrong.status_code == 400 and wrong.json()["error"] == "invalid_grant"
+        missing = self._refresh(client, tok["refresh_token"], "")
+        assert missing.status_code == 400 and missing.json()["error"] == "invalid_grant"
+        # the legitimate client can still redeem it
+        assert self._refresh(client, tok["refresh_token"], client_id).status_code == 200
+
+    def test_legacy_refresh_token_without_jti_or_client_is_rejected(self, client):
+        client_id, _ = self._tokens(client)
+        legacy = sign_payload(
+            {"typ": "refresh", "user_id": USER, "exp": int(time.time()) + 600}, SECRET
+        )
+        resp = self._refresh(client, legacy, client_id)
+        assert resp.status_code == 400 and resp.json()["error"] == "invalid_grant"
+
+    def test_refresh_fails_closed_when_guard_unavailable(self, client):
+        client_id, tok = self._tokens(client)
+
+        async def _down(jti, ttl):
+            raise oauth._ReplayGuardUnavailable()
+
+        with patch.object(oauth, "_consume_refresh_jti", side_effect=_down):
+            resp = self._refresh(client, tok["refresh_token"], client_id)
+        assert resp.status_code == 503
+        assert resp.json()["error"] == "temporarily_unavailable"
+        assert "access_token" not in resp.json()
+
+    def test_code_exchange_fails_closed_when_guard_unavailable(self, client):
+        client_id, redirect_uri, verifier, code = self._full_flow_to_code(client)
+
+        async def _down(jti):
+            raise oauth._ReplayGuardUnavailable()
+
+        data = {
+            "grant_type": "authorization_code",
+            "code": code,
+            "code_verifier": verifier,
+            "redirect_uri": redirect_uri,
+            "client_id": client_id,
+        }
+        with patch.object(oauth, "_consume_code_jti", side_effect=_down):
+            resp = client.post("/oauth/token", data=data)
+        assert resp.status_code == 503
+        assert resp.json()["error"] == "temporarily_unavailable"
+        assert "access_token" not in resp.json()
+        # nothing was consumed, so the code still works once Redis is back
+        assert client.post("/oauth/token", data=data).status_code == 200
+
+
+class TestSingleUseGuard:
+    """The real Redis helper must raise (not allow) when Redis is unreachable."""
+
+    def test_unreachable_redis_raises_guard_unavailable(self):
+        import asyncio
+
+        from config import settings
+
+        orig = settings.redis_url
+        settings.redis_url = "redis://127.0.0.1:1/0"  # nothing listens here
+        try:
+            with pytest.raises(oauth._ReplayGuardUnavailable):
+                asyncio.run(_REAL_CONSUME_CODE("j1"))
+            with pytest.raises(oauth._ReplayGuardUnavailable):
+                asyncio.run(_REAL_CONSUME_REFRESH("j2", 60))
+        finally:
+            settings.redis_url = orig
+
+    def test_first_claim_true_second_false_and_ttl_floor(self):
+        import asyncio
+
+        calls = []
+
+        class FakeRedis:
+            seen = set()
+
+            async def set(self, key, val, nx=None, ex=None):
+                calls.append((key, ex))
+                if key in self.seen:
+                    return None
+                self.seen.add(key)
+                return True
+
+            async def aclose(self):
+                pass
+
+        fake = FakeRedis()
+        with patch("redis.asyncio.from_url", return_value=fake):
+            assert asyncio.run(_REAL_CONSUME_REFRESH("abc", 0)) is True
+            assert asyncio.run(_REAL_CONSUME_REFRESH("abc", 0)) is False
+        assert calls[0] == ("oauth:refresh:abc", 1)
+
+
+# ── anti-framing headers + consent page layout / contrast ────────────────
+
+
+def _lum(hexcolor):
+    h = hexcolor.lstrip("#")
+    chans = []
+    for i in (0, 2, 4):
+        c = int(h[i : i + 2], 16) / 255
+        chans.append(c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4)
+    return 0.2126 * chans[0] + 0.7152 * chans[1] + 0.0722 * chans[2]
+
+
+def _contrast(a, b):
+    la, lb = sorted((_lum(a), _lum(b)), reverse=True)
+    return (la + 0.05) / (lb + 0.05)
+
+
+class TestHtmlHardening:
+    def _assert_hardened(self, resp):
+        assert resp.headers["x-frame-options"] == "DENY"
+        assert "frame-ancestors 'none'" in resp.headers["content-security-policy"]
+        assert resp.headers["referrer-policy"] == "no-referrer"
+        assert resp.headers["x-content-type-options"] == "nosniff"
+
+    def _authorize_params(self, client):
+        client_id, redirect_uri = _register(client)
+        _, challenge = _pkce()
+        return {
+            "response_type": "code",
+            "client_id": client_id,
+            "redirect_uri": redirect_uri,
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
+        }
+
+    def test_consent_page_not_frameable(self, client):
+        resp = client.get("/oauth/authorize", params=self._authorize_params(client))
+        assert resp.status_code == 200
+        self._assert_hardened(resp)
+
+    def test_consent_error_page_not_frameable(self, client):
+        params = self._authorize_params(client)
+        resp = _login_to_code(
+            client, params["client_id"], params["redirect_uri"], params["code_challenge"], "nope"
+        )
+        assert resp.status_code == 400
+        self._assert_hardened(resp)
+
+    def test_link_error_page_not_frameable(self, client):
+        resp = client.post("/oauth/link", data={"ticket": "garbage", "action": "new"})
+        assert resp.status_code == 400
+        self._assert_hardened(resp)
+
+    def test_link_page_not_frameable(self):
+        resp = oauth._render_link_page("t", "a@b.c", "abc")
+        self._assert_hardened(resp)
+
+    def test_supabase_callback_page_not_frameable(self, client):
+        from config import settings
+
+        orig = (settings.auth_provider, settings.supabase_url, settings.supabase_anon_key)
+        settings.auth_provider = "supabase"
+        settings.supabase_url = "https://x.supabase.example"
+        settings.supabase_anon_key = "anon-test"
+        try:
+            resp = client.get("/oauth/supabase/callback")
+        finally:
+            settings.auth_provider, settings.supabase_url, settings.supabase_anon_key = orig
+        assert resp.status_code == 200
+        self._assert_hardened(resp)
+
+    def test_supabase_consent_page_keeps_its_script(self, client):
+        # the hardening CSP must not disable the inline module the Supabase
+        # button needs: it only restricts framing/base/object.
+        from config import settings
+
+        orig = (settings.auth_provider, settings.supabase_url, settings.supabase_anon_key)
+        settings.auth_provider = "supabase"
+        settings.supabase_url = "https://x.supabase.example"
+        settings.supabase_anon_key = "anon-test"
+        try:
+            resp = client.get("/oauth/authorize", params=self._authorize_params(client))
+        finally:
+            settings.auth_provider, settings.supabase_url, settings.supabase_anon_key = orig
+        assert "ns-google-btn" in resp.text
+        csp = resp.headers["content-security-policy"]
+        assert "script-src" not in csp and "default-src" not in csp
+        self._assert_hardened(resp)
+
+
+class TestConsentLayout:
+    def _page(self, client):
+        client_id, redirect_uri = _register(client)
+        _, challenge = _pkce()
+        return client.get(
+            "/oauth/authorize",
+            params={
+                "response_type": "code",
+                "client_id": client_id,
+                "redirect_uri": redirect_uri,
+                "code_challenge": challenge,
+                "code_challenge_method": "S256",
+            },
+        ).text
+
+    def test_card_is_border_box_and_wraps_long_text(self, client):
+        page = self._page(client)
+        # universal rule: the .card (padding + border) must not add to its 92vw width
+        assert "*, *::before, *::after { box-sizing: border-box; }" in page
+        assert "overflow-wrap: anywhere" in page
+        assert "max-width: 100%" in page
+
+    def test_link_and_error_pages_reflow_too(self, client):
+        link = oauth._render_link_page("t", "a@b.c", "abc").body.decode()
+        assert "*, *::before, *::after { box-sizing: border-box; }" in link and "overflow-wrap:anywhere" in link
+        err = oauth._login_error_page(oauth.LoginError("x", 400)).body.decode()
+        assert "*,*::before,*::after{box-sizing:border-box;}" in err and "overflow-wrap:anywhere" in err
+
+    def test_primary_button_text_meets_wcag_aa(self, client):
+        import re
+
+        for page in (
+            self._page(client),
+            oauth._render_link_page("t", "a@b.c", "abc").body.decode(),
+        ):
+            m = re.search(r"(?:button|\.primary) *\{[^}]*?background: *(#[0-9a-fA-F]{6});[^}]*?color: *(#[0-9a-fA-F]{3,6})", page)
+            assert m, "primary action style not found"
+            fg = m.group(2) if len(m.group(2)) == 7 else "#ffffff"
+            assert _contrast(m.group(1), fg) >= 4.5
+        # the regression value: white on #5b7cfa is 3.68:1
+        assert _contrast("#5b7cfa", "#ffffff") < 4.5
+
+    def test_hint_text_meets_wcag_aa(self):
+        assert _contrast("#7b8198", "#151821") >= 4.5
+
 
     def test_unsupported_grant(self, client):
         resp = client.post("/oauth/token", data={"grant_type": "password"})
