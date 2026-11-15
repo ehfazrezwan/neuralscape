@@ -84,12 +84,27 @@ class TestExplicitGraphDimension:
             Settings(_env_file=None)
 
     def test_warns_when_ambient_embedding_dim_disagrees(self, monkeypatch, caplog):
+        import config
+
+        monkeypatch.setattr(config, "_AMBIENT_DIM_WARNED", set())
         monkeypatch.setenv("EMBEDDING_DIM", "768")
         monkeypatch.delenv("GRAPHITI_EMBEDDING_DIM", raising=False)
         with caplog.at_level("WARNING", logger="config"):
             Settings(_env_file=None)
         msgs = [r.getMessage() for r in caplog.records if "EMBEDDING_DIM=768" in r.getMessage()]
         assert msgs and "GRAPHITI_EMBEDDING_DIM=1024" in msgs[0]
+
+    def test_ambient_warning_is_logged_once_per_process(self, monkeypatch, caplog):
+        import config
+
+        monkeypatch.setattr(config, "_AMBIENT_DIM_WARNED", set())
+        monkeypatch.setenv("EMBEDDING_DIM", "768")
+        monkeypatch.delenv("GRAPHITI_EMBEDDING_DIM", raising=False)
+        with caplog.at_level("WARNING", logger="config"):
+            Settings(_env_file=None)
+            Settings(_env_file=None)
+            Settings(_env_file=None)
+        assert len([r for r in caplog.records if "EMBEDDING_DIM=768" in r.getMessage()]) == 1
 
     @pytest.mark.parametrize("ambient", [None, "1024", ""])
     def test_no_warning_when_ambient_absent_or_equal(self, monkeypatch, caplog, ambient):

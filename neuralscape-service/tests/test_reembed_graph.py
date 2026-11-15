@@ -146,8 +146,10 @@ class TestDryRun:
         assert "group g1: 768-d: 1, 1024-d: 5" in out
         assert "group g2: 1024-d: 1" in out
         assert "Entity.summary_embedding" in out  # unknown embedding property is reported
-        assert "RELATES_TO.fact_embedding" not in out.split("Other embedding-like")[1]
-        assert "Entity.name_embedding" not in out.split("Other embedding-like")[1]
+        tail = out.split("Other embedding-like")[1].splitlines()
+        # Neo4j reports the rel type as :`RELATES_TO`; no line of the "other
+        # properties" list may mention a handled property in any spelling.
+        assert not [l for l in tail if "fact_embedding" in l or "RELATES_TO" in l or "name_embedding" in l]
 
     def test_scope_limits_groups(self, env):
         _, out = _run(_seed(), "--group-id", "g2", "--dry-run")

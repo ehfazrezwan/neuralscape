@@ -123,8 +123,8 @@ def test_dry_run_reports_lengths_and_changes_nothing(store):
     assert f"group {store.target}:" in out and f"group {store.control}:" in out
     assert "1024-d: 3" in out
     # the schema scan must recognise the three handled properties (no "other" noise for them)
-    tail = out.split("Other embedding-like")[1] if "Other embedding-like" in out else ""
-    assert "RELATES_TO.fact_embedding" not in tail and "Entity.name_embedding" not in tail
+    tail = out.split("Other embedding-like")[1].splitlines() if "Other embedding-like" in out else []
+    assert not [l for l in tail if "fact_embedding" in l or "RELATES_TO" in l or "name_embedding" in l]
     after = {g: store.snapshot(g) for g in (store.target, store.control)}
     assert after == before  # untouched, bit for bit
 

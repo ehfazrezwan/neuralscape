@@ -21,6 +21,9 @@ _LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1", "[::1]"}
 # separately via ``Settings.graphiti_embedding_dim``.
 VECTOR_EMBEDDING_DIMS = 768
 
+# (ambient EMBEDDING_DIM, GRAPHITI_EMBEDDING_DIM) pairs already warned about.
+_AMBIENT_DIM_WARNED: set = set()
+
 
 class Settings(BaseSettings):
     # Gemini (direct Google AI Studio)
@@ -788,7 +791,9 @@ class Settings(BaseSettings):
         # EMBEDDING_DIM env (Graphiti's default 1024). GRAPHITI_EMBEDDING_DIM
         # now wins; say so when an operator's old variable disagrees.
         ambient = os.environ.get("EMBEDDING_DIM", "").strip()
-        if ambient and ambient != str(self.graphiti_embedding_dim):
+        key = (ambient, self.graphiti_embedding_dim)
+        if ambient and ambient != str(self.graphiti_embedding_dim) and key not in _AMBIENT_DIM_WARNED:
+            _AMBIENT_DIM_WARNED.add(key)  # once per process, not per Settings()
             logging.getLogger(__name__).warning(
                 "EMBEDDING_DIM=%s is set but GRAPHITI_EMBEDDING_DIM=%s is what "
                 "the Graphiti embedder now uses (new graph vectors are written "
