@@ -1,0 +1,9 @@
+{
+  "test": "tests.test_baseline_reproductions::test_patch_request_carries_an_expected_revision",
+  "reason_contains": "the edit request has no revision or etag precond",
+  "profiles": [
+    "container",
+    "host"
+  ],
+  "why": "pinned bug: strict-xfail reproduction in test_baseline_reproductions; git rm this file in the PR that fixes the bug"
+}

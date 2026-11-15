@@ -18,7 +18,8 @@ from psycopg.conninfo import make_conninfo  # noqa: E402
 
 from authority_store_sql import PostgresAuthorityStore, grant_authority_runtime_role  # noqa: E402
 
-DSN = os.environ.get("AUTHORITY_TEST_PG_DSN")
+# AUTHORITY_TEST_PG_DSN, else the gate's NS_TEST_PG_DSN: a server whose role may create schemas and roles.
+DSN = os.environ.get("AUTHORITY_TEST_PG_DSN") or os.environ.get("NS_TEST_PG_DSN")
 REQUIRED = os.environ.get("NS_INTEGRATION_REQUIRED") == "1"
 PASSWORD = "authority-test-pw"  # a throwaway role in a disposable database
 REASON = "AUTHORITY_TEST_PG_DSN not set (postgres authority runtime-role integration)"

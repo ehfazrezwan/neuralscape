@@ -34,8 +34,6 @@ from policy_enforcement import PolicyEnforcer, memory_row_lookup, _handle
 from schemas import MemoryResponse
 from tokens import issue_user_token
 
-pytestmark = pytest.mark.integration
-
 T = "tenant-a"
 SECRET = "flag-on-integration-secret"
 USERS = ("alice", "bob")

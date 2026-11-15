@@ -10,8 +10,6 @@ import pytest
 from tests.authority_pg_support import RuntimeRoleBackend, require_pg  # noqa: F401  (autouse)
 from tests.test_policy_flag_on_integration import *  # noqa: F401,F403  (the tests, and their fixtures)
 
-pytestmark = pytest.mark.integration
-
 
 @pytest.fixture
 def store():
