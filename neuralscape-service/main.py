@@ -482,7 +482,13 @@ async def delete_memories(
     _reject_unsupported_entity_scope(agent_id, run_id, "delete")
     try:
         result = await asyncio.to_thread(_service.delete_memories, user_id=user_id)
-        return {"status": "ok", **result}
+        if "scroll failed" in (result.get("message") or ""):
+            # The service reports a failed listing as a message, not an
+            # exception; never answer 200 "ok" when nothing was deleted.
+            raise HTTPException(status_code=503, detail="Memories could not be listed; nothing was deleted. Retry.")
+        # Graph cleanup that could not be verified is a partial success.
+        status = "partial" if result.get("graph_cascade_unresolved_ids") else "ok"
+        return {"status": status, **result}
     except HTTPException:
         raise
     except Exception:

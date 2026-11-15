@@ -219,7 +219,44 @@ def test_delete_all_surfaces_unresolved_graph_cleanup(client, mock_service):
         "message": "x", "graph_cascade_unresolved_ids": ["m9"],
     }
     resp = client.delete("/memories", params={"user_id": "u1"})
-    assert resp.json()["graph_cascade_unresolved_ids"] == ["m9"]
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["graph_cascade_unresolved_ids"] == ["m9"]
+    assert body["status"] == "partial"
+
+
+def test_delete_all_scroll_failure_is_5xx_not_ok(client, real_service):
+    def boom(user_id):
+        raise RuntimeError("qdrant down")
+
+    real_service._scroll_all_user_memories = boom
+    resp = client.delete("/memories", params={"user_id": "u1"})
+    assert resp.status_code == 503
+    assert "nothing was deleted" in resp.json()["detail"]
+
+
+def test_service_delete_all_cascades_each_private_row_and_keeps_shared(real_service):
+    """Service-level proof behind the route: every PRIVATE row goes through the
+    provenance cascade and the vector delete; shared rows are untouched."""
+    def row(mid, vis):
+        return {"id": mid, "payload": {"data": f"fact {mid}", "metadata": {"visibility": vis}}}
+
+    real_service._memory.vector_store = MagicMock()
+    real_service._scroll_all_user_memories = lambda uid: [
+        row("p1", "private"), row("p2", "private"), row("s1", "shared"),
+    ]
+    real_service._expire_graph_edges_for_groups = MagicMock()
+    real_service._cascade_or_fallback_expire = MagicMock(return_value={"resolved": True})
+
+    result = real_service.delete_memories(user_id="u1")
+
+    cascaded = [c.kwargs["memory_id"] for c in real_service._cascade_or_fallback_expire.call_args_list]
+    assert cascaded == ["p1", "p2"]
+    deleted = [c.args[0] for c in real_service._memory.vector_store.delete.call_args_list]
+    assert deleted == ["p1", "p2"]
+    assert real_service._expire_graph_edges_for_groups.call_args.args[0] == ["user--u1"]
+    assert result["graph_cascade_unresolved_ids"] == []
+    real_service._memory.delete_all.assert_not_called()
 
 
 def test_delete_with_agent_scope_is_refused_not_widened(client, mock_service):
