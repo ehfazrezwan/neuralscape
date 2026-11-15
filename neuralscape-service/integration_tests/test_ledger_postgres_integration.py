@@ -34,7 +34,6 @@ def _fail_when_required_store_is_missing():
         pytest.fail("NS_INTEGRATION_REQUIRED=1 but LEDGER_TEST_PG_DSN is not set")
 
 pytestmark = [
-    pytest.mark.integration,
     pytest.mark.skipif(not DSN and not REQUIRED, reason="LEDGER_TEST_PG_DSN not set (postgres ledger integration)"),
 ]
 
