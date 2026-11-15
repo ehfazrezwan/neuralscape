@@ -21,11 +21,14 @@
 import {
   type ContextResponse,
   type LocalCompactSnapshot,
+  type FailureKind,
   type NeuralscapeMemory,
   MalformedHookInputError,
   getFailLoudThreshold,
   getProjectId,
+  getServiceUrl,
   getUserId,
+  getUserIdSource,
   hasUserId,
   isProjectExcluded,
   listPendingBuffers,
@@ -37,7 +40,7 @@ import {
   readConfig,
   readLocalCompactSnapshot,
   readPredecessorSessionIds,
-  recordTransportFailure,
+  recordFailure,
   resetTransportFailures,
 } from "../utils.js";
 
@@ -99,6 +102,69 @@ export function buildUnreachableNotice(count: number, threshold: number): string
     );
   }
   return "[neuralscape] memory service unreachable — continuing without memory context.";
+}
+
+/**
+ * The notice for a failed context fetch, by failure kind. Only `network` and
+ * `server` are "unreachable" (and counted: see recordFailure); the others mean
+ * the service answered and the plugin's setup is wrong, so they say what to fix.
+ * Never includes the token or the URL.
+ */
+export function buildFailureNotice(
+  kind: FailureKind,
+  count: number | null,
+  threshold: number,
+): string {
+  switch (kind) {
+    case "auth":
+      return (
+        "[neuralscape] the memory service rejected the API key (HTTP 401/403) — " +
+        "the token is missing, expired or revoked. Update API_KEY with " +
+        "`/plugin config neuralscape@neuralscape-plugins`. Continuing without memory context."
+      );
+    case "not_found":
+      return (
+        "[neuralscape] the memory service answered 404 for the context route — " +
+        "the service URL is probably wrong or points at an incompatible version. " +
+        "Check URL in `/plugin config neuralscape@neuralscape-plugins`. Continuing without memory context."
+      );
+    case "client":
+      return (
+        "[neuralscape] the memory service rejected the context request (HTTP 4xx) — " +
+        "check the plugin URL, user id and service version. Continuing without memory context."
+      );
+    default:
+      return buildUnreachableNotice(count ?? 1, threshold);
+  }
+}
+
+const LOCAL_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]", "::1"]);
+
+/** True when the service URL points at this machine (or does not parse). */
+export function isLocalServiceUrl(url: string): boolean {
+  try {
+    return LOCAL_HOSTS.has(new URL(url).hostname.toLowerCase());
+  } catch {
+    return true;
+  }
+}
+
+/**
+ * One line shown when this install identifies as the OS login name (USER_ID
+ * unset) against a non-local service: the fallback is deliberate (see utils.ts)
+ * but the user should know which id their memories are filed under. Empty
+ * otherwise. Does not name the service host.
+ */
+export function buildIdentityNotice(
+  userId: string,
+  source: "config" | "os" | "none",
+  serviceUrl: string,
+): string {
+  if (source !== "os" || !userId || isLocalServiceUrl(serviceUrl)) return "";
+  return (
+    `[neuralscape] USER_ID is not set, so memories are filed under your OS login name "${userId}" ` +
+    "on a remote memory service. Set USER_ID with `/plugin config neuralscape@neuralscape-plugins` to choose the id."
+  );
 }
 
 // ── Legacy full-content formatting (CONTEXT_MODE=full) ───────────
@@ -179,9 +245,19 @@ export interface IndexModeInputs {
  * Standards stay a binding block outside the budget; the session note that
  * feeds "Previously…" is excluded from the index table (no double render).
  */
-export function buildIndexContext(inputs: IndexModeInputs): string {
-  const { context, cards, codeGraphAvailable, budgetTokens } = inputs;
-  const now = inputs.now ?? new Date();
+/**
+ * The blocks both modes share, in order: binding standards, identity cards,
+ * the resume-after-compaction block (compact/resume/fork only) and the
+ * "Previously…" block. Also returns the ids rendered so the caller keeps them
+ * out of its memory listing (no double render).
+ */
+function buildContinuitySections(inputs: IndexModeInputs, now: Date): {
+  sections: string[];
+  cardBlock: string;
+  resumeIds: Set<string>;
+  previouslyId: string | null;
+} {
+  const { context, cards } = inputs;
   const categories = context.categories || {};
 
   const sections: string[] = [];
@@ -194,7 +270,7 @@ export function buildIndexContext(inputs: IndexModeInputs): string {
 
   // Compact-resilience: after a compaction (or --resume), re-anchor the
   // session with the pre-compact snapshots the PreCompact hook stored.
-  // Rendered full-content here, excluded from the index table below.
+  // Rendered full-content here, excluded from the listing below.
   const resumeIds = new Set<string>();
   if (isResumeSource(inputs.source)) {
     const resume = renderResumeAfterCompact(categories, {
@@ -225,6 +301,38 @@ export function buildIndexContext(inputs: IndexModeInputs): string {
       }
     }
   }
+  return { sections, cardBlock, resumeIds, previouslyId };
+}
+
+/**
+ * CONTEXT_MODE=full: the same continuity blocks as index mode (standards,
+ * identity cards, "Resuming after compaction", "Previously…"), then the full
+ * text of the remaining memories under the legacy MAX_CHARS budget. The
+ * resume snapshot and the session note are rendered once, above, and left
+ * out of the listing.
+ */
+export function buildFullContext(inputs: IndexModeInputs): string {
+  const now = inputs.now ?? new Date();
+  const { sections, resumeIds, previouslyId } = buildContinuitySections(inputs, now);
+
+  const remaining: Record<string, NeuralscapeMemory[]> = {};
+  for (const [cat, mems] of Object.entries(inputs.context.categories || {})) {
+    const kept = (mems ?? []).filter((m) => m.id !== previouslyId && !resumeIds.has(m.id));
+    if (kept.length > 0) remaining[cat] = kept;
+  }
+  const formatted = formatMemories(remaining);
+  if (formatted) sections.push(formatted);
+
+  if (sections.length === 0) return "";
+  return sections.join("\n\n---\n\n");
+}
+
+export function buildIndexContext(inputs: IndexModeInputs): string {
+  const { context, codeGraphAvailable, budgetTokens } = inputs;
+  const now = inputs.now ?? new Date();
+  const categories = context.categories || {};
+
+  const { sections, cardBlock, resumeIds, previouslyId } = buildContinuitySections(inputs, now);
 
   // D1: day-grouped index of everything else.
   const memories: NeuralscapeMemory[] = [];
@@ -451,18 +559,20 @@ async function main(): Promise<void> {
     let context: ContextResponse;
     try {
       context = await contextPromise;
-    } catch {
-      // NS unreachable — never block session start: one-line notice, exit 0.
-      // The consecutive-failure counter upgrades the notice to fail-loud
-      // once the streak crosses FAIL_LOUD_THRESHOLD (D4).
-      const count = await recordTransportFailure();
+    } catch (error) {
+      // Never block session start: one-line notice, exit 0. Only a down/failing
+      // service (network, 5xx) counts toward the consecutive-failure counter,
+      // which upgrades the notice to fail-loud at FAIL_LOUD_THRESHOLD (D4);
+      // auth / 404 / other 4xx get a notice naming what to fix instead.
+      const { kind, count } = await recordFailure(error);
+      logError(`context fetch failed (${kind})`, error);
       // Local-only parts still apply: buffers left by finished sessions keep
       // piling up during an outage unless this session is told about them,
       // and the local copy of the compact snapshot needs no service.
       const localResume = await localResumeBlock(input);
       const pendingDuringOutage = await buildPendingNote(input.session_id);
       outputWithContext(
-        buildUnreachableNotice(count, getFailLoudThreshold()) +
+        buildFailureNotice(kind, count, getFailLoudThreshold()) +
           (localResume ? `\n\n${localResume}` : "") +
           pendingDuringOutage,
       );
@@ -480,14 +590,21 @@ async function main(): Promise<void> {
 
     let contextBody: string;
     if (mode === "full") {
-      // Legacy full-content injection, standards prepended unbudgeted.
-      const standardsBlock = formatStandards(context.standards);
-      const formatted = formatMemories(context.categories || {});
-      contextBody = standardsBlock
-        ? formatted
-          ? `${standardsBlock}\n\n---\n\n${formatted}`
-          : standardsBlock
-        : formatted;
+      // Legacy full-content injection plus the continuity blocks (resume,
+      // Previously, cards): see buildFullContext.
+      const settled = await Promise.all(cardPromises.map((p) => p.catch(() => null)));
+      contextBody = buildFullContext({
+        context,
+        cards: settled.filter((c): c is { label: string; lines: string[] } => c !== null),
+        codeGraphAvailable: false,
+        budgetTokens: getIndexBudgetTokens(),
+        source: input.source,
+        sessionId: input.session_id,
+        predecessorIds:
+          input.source === "resume" || input.source === "fork"
+            ? await readPredecessorSessionIds(input.transcript_path, input.session_id)
+            : undefined,
+      });
     } else {
       const settled = await Promise.all(
         cardPromises.map((p) => p.catch(() => null)),
@@ -510,7 +627,9 @@ async function main(): Promise<void> {
       });
     }
 
-    const combined = (contextBody || "") + pendingNote;
+    const identityNotice = buildIdentityNotice(userId, getUserIdSource(), getServiceUrl());
+    const combined =
+      (contextBody || "") + pendingNote + (identityNotice ? `\n\n${identityNotice}` : "");
     if (combined.trim()) {
       outputWithContext(combined);
     } else {

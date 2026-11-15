@@ -19,6 +19,10 @@ from enum import Enum
 DEFAULT_MAX_TOKENS = 16384
 DEFAULT_TEMPERATURE = 1
 
+# NEURALSCAPE PATCH (re-apply after upstream subtree syncs): HTTP timeout for
+# Gemini clients. google-genai HttpOptions.timeout is in MILLISECONDS.
+GEMINI_HTTP_TIMEOUT_MS = 60_000
+
 
 class ModelSize(Enum):
     small = 'small'

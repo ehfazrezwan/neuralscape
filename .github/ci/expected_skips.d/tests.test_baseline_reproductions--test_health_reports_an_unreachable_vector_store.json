@@ -1,0 +1,9 @@
+{
+  "test": "tests.test_baseline_reproductions::test_health_reports_an_unreachable_vector_store",
+  "reason_contains": "health marks the vector store 'ok' once its clie",
+  "profiles": [
+    "container",
+    "host"
+  ],
+  "why": "pinned bug: strict-xfail reproduction in test_baseline_reproductions; git rm this file in the PR that fixes the bug"
+}

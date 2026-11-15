@@ -42,7 +42,7 @@ import {
   neuralscapePost,
   outputContinue,
   parseStdinStrict,
-  recordTransportFailure,
+  recordFailure,
   resetTransportFailures,
 } from "../utils.js";
 
@@ -117,8 +117,8 @@ async function main(): Promise<void> {
     } catch (error) {
       // Transport failure → notice + exit 0 (never block session teardown).
       // Counted toward the fail-loud threshold surfaced at next SessionStart.
-      await recordTransportFailure();
-      logError("session summary checkpoint failed (service unreachable?)", error);
+      const { kind } = await recordFailure(error);
+      logError(`session summary checkpoint failed (${kind})`, error);
       return;
     }
   } catch (error) {
