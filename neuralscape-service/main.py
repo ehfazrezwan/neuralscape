@@ -31,7 +31,7 @@ import adapters  # noqa: F401 — registers knowledge-adapter taxonomies at impo
 from config import settings
 from extensions import ExtensionRegistry
 from extensions.events import EventType, EVENT_PAYLOAD_MODELS
-from logging_config import configure_logging
+from logging_config import RequestIdMiddleware, configure_logging
 from memory_service import get_shared_service
 
 # Configure structured logging before anything else
@@ -222,6 +222,9 @@ app = FastAPI(
 from auth import BearerAuthMiddleware, is_admin_user, resolve_request_user_id
 
 app.add_middleware(BearerAuthMiddleware)
+# Added last = outermost: binds request_id for every request and puts it on
+# every response, including the 401/503s BearerAuthMiddleware produces.
+app.add_middleware(RequestIdMiddleware)
 
 
 # ── Global exception handler ─────────────────────────────────────
@@ -280,6 +283,9 @@ async def health_live():
     return {"status": "alive"}
 
 
+_VECTOR_STORE_PROBE_TIMEOUT_S = 2.0
+
+
 @app.get("/health")
 async def health():
     """Health check that verifies backend connectivity.
@@ -302,12 +308,17 @@ async def health():
     except Exception:
         checks["redis"] = "unreachable"
 
-    # Check vector store (Qdrant via mem0) — lightweight: just verify mem0 is initialized
+    # Check vector store (Qdrant via mem0): a real, bounded round trip, off the event loop.
     try:
-        if _service._memory is not None:
-            checks["vector_store"] = "ok"
-        else:
+        memory = _service._memory
+        if memory is None:
             checks["vector_store"] = "not_initialized"
+        else:
+            await asyncio.wait_for(
+                asyncio.to_thread(memory.vector_store.client.get_collections),
+                timeout=_VECTOR_STORE_PROBE_TIMEOUT_S,
+            )
+            checks["vector_store"] = "ok"
     except Exception:
         checks["vector_store"] = "unreachable"
 

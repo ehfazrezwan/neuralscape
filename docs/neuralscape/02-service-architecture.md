@@ -123,7 +123,7 @@ async def generic_exception_handler(request: Request, exc: Exception):
 
 Per-endpoint, the pattern is `try ... except: logger.exception(...); raise HTTPException(500, "...")`. Validation failures surface as 400 from explicit checks (e.g. `/v1/memories/raw` rejects unknown categories at `main.py:656-662`).
 
-Logging is structlog, configured in `logging_config.py`: JSON in prod (`LOG_FORMAT=json`, the default) and console in dev. Processors include `merge_contextvars`.
+Logging is structlog, configured in `logging_config.py`: JSON in prod (`LOG_FORMAT=json`, the default) and console in dev. Processors include `merge_contextvars`. `LOG_LEVEL` / `LOG_FORMAT` are read through `config.settings` (so the service `.env` counts; the environment wins). `RequestIdMiddleware` binds `request_id` (a sane incoming `X-Request-ID`, else generated) for each request and echoes it on the response, including auth 401s; every ARQ job binds `job_id`, `job_try`, `queue` and `function` for its log lines (worker processes configure the same logging at startup).
 
 ## Gotchas
 

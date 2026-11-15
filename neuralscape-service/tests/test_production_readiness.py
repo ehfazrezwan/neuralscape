@@ -759,6 +759,42 @@ class TestHealthEndpointChecks:
             main._task_manager = original
             main._service = original_svc
 
+    def test_health_returns_503_when_vector_store_probe_fails_or_hangs(self, client, monkeypatch):
+        """An initialised client whose store errors or never answers is unreachable (bounded by the probe timeout)."""
+        import threading
+
+        mock_tm = MagicMock(name="TaskManager")
+        mock_tm.pool = MagicMock()
+        mock_tm.pool.ping = AsyncMock(return_value=True)
+        release = threading.Event()
+
+        def hang():
+            release.wait(5)
+            return []
+
+        monkeypatch.setattr(main, "_task_manager", mock_tm)
+        monkeypatch.setattr(main, "_VECTOR_STORE_PROBE_TIMEOUT_S", 0.1)
+        for probe in (MagicMock(side_effect=ConnectionError("refused")), hang):
+            mock_svc = MagicMock()
+            mock_svc._memory.vector_store.client.get_collections = probe
+            mock_svc._graphiti = MagicMock()
+            monkeypatch.setattr(main, "_service", mock_svc)
+            resp = client.get("/health")
+            assert resp.status_code == 503
+            assert resp.json()["checks"]["vector_store"] == "unreachable"
+        release.set()
+
+    def test_health_probes_the_vector_store_for_real(self, client, monkeypatch):
+        mock_tm = MagicMock(name="TaskManager")
+        mock_tm.pool = MagicMock()
+        mock_tm.pool.ping = AsyncMock(return_value=True)
+        mock_svc = MagicMock()
+        mock_svc._graphiti = MagicMock()
+        monkeypatch.setattr(main, "_task_manager", mock_tm)
+        monkeypatch.setattr(main, "_service", mock_svc)
+        assert client.get("/health").json()["checks"]["vector_store"] == "ok"
+        mock_svc._memory.vector_store.client.get_collections.assert_called_once()
+
 
 # ══════════════════════════════════════════════
 # Liveness endpoint: /health/live must never touch backends
