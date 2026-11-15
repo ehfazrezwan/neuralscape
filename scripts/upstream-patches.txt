@@ -1,14 +1,46 @@
-# Files in the vendored subtrees that carry NeuralScape patches. Each listed
-# file MUST still contain a "NEURALSCAPE PATCH" marker after an upstream sync;
-# scripts/check-upstream-patches.sh fails (non-zero) if one lost it, which
-# means the sync overwrote our patch and it must be re-applied.
-# Paths are relative to the repo root. Add a line when you add a patch.
-graphiti/graphiti_core/cross_encoder/gemini_reranker_client.py
-graphiti/graphiti_core/driver/neo4j_driver.py
-graphiti/graphiti_core/embedder/gemini.py
-graphiti/graphiti_core/llm_client/config.py
-graphiti/graphiti_core/llm_client/gemini_client.py
-mem0/mem0/configs/embeddings/base.py
-mem0/mem0/embeddings/openai.py
-mem0/mem0/graphs/configs.py
-mem0/mem0/memory/graphiti_memory.py
+# Upstream-patch manifest for the vendored subtrees (graphiti/, mem0/).
+# Checked by scripts/check-upstream-patches.sh (run by sync-upstream.sh).
+#
+# Format, one entry per line:
+#   patched <path>  - a file that exists upstream and that NeuralScape modified.
+#                     MUST still contain a "NEURALSCAPE PATCH" marker after a sync.
+#   owned <path>    - a NeuralScape-owned file with no upstream counterpart
+#                     (restored graph layer, Graphiti adapter). MUST still exist.
+#
+# Provenance (how this list was built; tests re-derive it from git):
+#   graphiti-base: 9cb6dc1b   upstream tree (graphiti_core) at that commit; the
+#       'patched' graphiti entries are exactly
+#       `git diff --name-only 9cb6dc1b:graphiti_core HEAD:graphiti/graphiti_core`.
+#   mem0-base: cd27fc57       the upstream c9e8482a sync commit. The upstream
+#       object itself is NOT in this repo (subtree squash), so a full upstream
+#       diff is impossible; the mem0 list is pinned: every mem0 file changed
+#       since cd27fc57, every mem0 file mentioning graphiti / GraphStoreFactory,
+#       plus the restored graph layer (per CLAUDE.md: upstream deleted it).
+# After a sync, bump the base ids above and refresh the list.
+
+# --- graphiti (patched) ---
+patched graphiti/graphiti_core/cross_encoder/gemini_reranker_client.py
+patched graphiti/graphiti_core/driver/neo4j_driver.py
+patched graphiti/graphiti_core/embedder/gemini.py
+patched graphiti/graphiti_core/llm_client/config.py
+patched graphiti/graphiti_core/llm_client/gemini_client.py
+
+# --- mem0 (patched) ---
+patched mem0/mem0/configs/embeddings/base.py
+patched mem0/mem0/embeddings/openai.py
+patched mem0/mem0/graphs/configs.py
+patched mem0/mem0/memory/graphiti_memory.py
+patched mem0/mem0/utils/factory.py
+
+# --- mem0 (owned: restored graph layer / Graphiti adapter) ---
+owned mem0/mem0/graphs/__init__.py
+owned mem0/mem0/graphs/neptune/__init__.py
+owned mem0/mem0/graphs/neptune/base.py
+owned mem0/mem0/graphs/neptune/neptunedb.py
+owned mem0/mem0/graphs/neptune/neptunegraph.py
+owned mem0/mem0/graphs/tools.py
+owned mem0/mem0/graphs/utils.py
+owned mem0/mem0/memory/apache_age_memory.py
+owned mem0/mem0/memory/graph_memory.py
+owned mem0/mem0/memory/kuzu_memory.py
+owned mem0/mem0/memory/memgraph_memory.py

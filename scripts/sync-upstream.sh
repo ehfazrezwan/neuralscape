@@ -91,6 +91,13 @@ sync_graphiti() {
     echo "      3. _is_transient_error(): walk the __cause__/__context__ chain"
     echo "      4. _generate_response except: 'raise Exception(str(e) or repr(e)) from e'"
     echo "         (NOT 'raise Exception from e' — blanks the msg, kills 503 fallback)"
+    echo "      5. genai.Client(..., http_options=HttpOptions(timeout=GEMINI_HTTP_TIMEOUT_MS)) in"
+    echo "         llm_client/gemini_client.py, embedder/gemini.py, cross_encoder/gemini_reranker_client.py"
+    echo "         (+ GEMINI_HTTP_TIMEOUT_MS = 60_000 in llm_client/config.py; milliseconds)"
+    echo "      6. _generate_response(model_override=...) and the 503 fallback passing"
+    echo "         model_override=self.fallback_model (NOT swapping self.model)"
+    echo "      7. driver/neo4j_driver.py: kwargs.setdefault('database_', ...) (not params)"
+    echo "    After a sync: bump graphiti-base / mem0-base in scripts/upstream-patches.txt."
 }
 
 sync_mem0() {

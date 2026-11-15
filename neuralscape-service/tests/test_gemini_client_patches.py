@@ -109,3 +109,48 @@ def test_fallback_does_not_mutate_shared_model_under_concurrency():
     assert model_seen_mid_fallback == [primary]
     assert model_while_a_in_flight == primary
     assert client.model == primary
+
+
+def test_timeout_error_triggers_fallback_model_end_to_end():
+    """timeout -> _is_transient_error -> fallback model, on a shared client."""
+    primary, fallback = "primary-model", "fallback-model"
+    seen: list[str] = []
+
+    async def generate_content(model, contents, config):
+        seen.append(model)
+        if model == primary:
+            raise Exception("Request timed out after 60000 ms")
+        return _response("rescued")
+
+    fake = SimpleNamespace(aio=SimpleNamespace(models=SimpleNamespace(generate_content=generate_content)))
+    client = gc.GeminiClient(
+        config=LLMConfig(api_key="k", model=primary, fallback_model=fallback), client=fake
+    )
+    out = asyncio.run(client.generate_response([Message(role="user", content="x")], prompt_name="t"))
+    assert out == {"content": "rescued"}
+    assert seen == [primary, primary, fallback]
+    assert client.model == primary
+
+
+def test_fallback_applies_to_small_model_calls():
+    from graphiti_core.llm_client.config import ModelSize
+
+    seen: list[str] = []
+
+    async def generate_content(model, contents, config):
+        seen.append(model)
+        if model == "small-primary":
+            raise Exception("503 UNAVAILABLE")
+        return _response("ok")
+
+    fake = SimpleNamespace(aio=SimpleNamespace(models=SimpleNamespace(generate_content=generate_content)))
+    client = gc.GeminiClient(
+        config=LLMConfig(
+            api_key="k", model="big", small_model="small-primary", fallback_model="fb"
+        ),
+        client=fake,
+    )
+    out = asyncio.run(
+        client.generate_response([Message(role="user", content="x")], model_size=ModelSize.small)
+    )
+    assert out == {"content": "ok"} and seen[-1] == "fb"
