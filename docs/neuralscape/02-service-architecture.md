@@ -105,7 +105,7 @@ The session manager is a `StreamableHTTPSessionManager` configured with `statele
 
 `/health` (`main.py:227`, public) returns:
 
-- 200 `{"status": "ok"}` when Redis, Qdrant (mem0 initialized), and Neo4j (Graphiti initialized) all check out.
+- 200 `{"status": "ok"}` when Redis, Qdrant (a real `get_collections` call, 2 s timeout), and Neo4j (Graphiti initialized) all check out.
 - 200 `{"status": "degraded"}` if any non-critical check is non-`ok`.
 - 503 `{"status": "unhealthy"}` if the vector store is `unreachable`.
 
