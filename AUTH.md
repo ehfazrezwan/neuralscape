@@ -131,22 +131,54 @@ the bound user is the default user.
 ## Token revocation
 
 A per-user token is valid until it expires (forever, for one issued with
-`--no-expiry`). To revoke a leaked token:
+`--no-expiry`). Revoking works on the token's SHA-256 digest; the token itself
+is never stored or printed. Two lists are enforced together (their union):
 
-```bash
-printf '%s' "$LEAKED_TOKEN" | python scripts/revoke_token.py   # prints a SHA-256 digest
-# add it to the server env, comma-separated, then restart:
-NEURALSCAPE_REVOKED_TOKENS=<digest>[,<digest>...]
-```
+1. **Live, no restart: the Redis set `ns:auth:revoked_tokens`.**
+
+   ```bash
+   printf '%s' "$LEAKED_TOKEN" | python scripts/revoke_token.py --redis      # revoke
+   printf '%s' "$LEAKED_TOKEN" | python scripts/revoke_token.py --unrevoke   # undo
+   python scripts/revoke_token.py --digest <sha256-hex> --unrevoke          # undo without the token
+   python scripts/revoke_token.py --list                                    # show revoked digests
+   ```
+
+   The script uses `REDIS_URL`. Every API process re-reads the set at most every
+   `REVOCATION_REFRESH_INTERVAL_SECONDS` (default 5; 0 = on every request), so a
+   revocation takes effect on all instances within that many seconds, and a
+   request costs no Redis round trip while the cached snapshot is fresh.
+2. **Static fallback: `NEURALSCAPE_REVOKED_TOKENS=<digest>[,<digest>...]`**
+   (digest printed by `python scripts/revoke_token.py`; needs a restart). It is
+   always honoured, whatever state Redis is in.
 
 A revoked token is rejected with 401 on REST and MCP, and cannot be pasted into
-the OAuth consent screen. The list holds digests only, never tokens. If the list
-cannot be read, per-user tokens are rejected (fail closed). Limits, plainly:
+the OAuth consent screen. If the env list cannot be parsed, per-user tokens are
+rejected (fail closed).
 
-- Revoking needs an env edit and a restart.
-- It covers the exact token string only.
-- OAuth refresh tokens and sessions already minted from a leaked token are not
-  revoked (refresh rotation is a separate change).
+**When Redis is unreachable** (exact semantics):
+
+- The env list is still enforced.
+- After at least one successful read, the in-process snapshot keeps being
+  enforced: everything revoked up to the outage stays revoked. A revocation
+  made during the outage is not seen until Redis is back (at most one interval
+  after it returns).
+- At cold start with Redis down there is no snapshot yet: only the env list is
+  enforced, and tokens are NOT refused on account of the outage (fail open for
+  the Redis list only, so a Redis restart does not lock every user out). This
+  is logged as a warning (`token revocation: Redis unreachable ... env list
+  only`). Operators who need a hard guarantee put the digest in the env list.
+- After a failed read the next attempt waits one interval, so an outage adds one
+  short connect timeout (`REVOCATION_REDIS_TIMEOUT_SECONDS`, default 1) per
+  interval, not per request. The warning is logged once per outage window.
+
+Staleness bound: a revocation is enforced at most
+`REVOCATION_REFRESH_INTERVAL_SECONDS` after it is written (plus the request
+that triggers the refresh), per API process.
+
+Limits, plainly:
+
+- It covers the exact token string only (a fresh token for the same user is a
+  different token).
 - Rotate `NEURALSCAPE_USER_TOKEN_SECRET` to invalidate every token.
 - Existing non-expiring tokens keep verifying unless revoked or the secret rotates.
 

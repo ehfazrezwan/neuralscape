@@ -38,7 +38,7 @@ from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from config import settings
-from tokens import issue_user_token, verify_user_token  # noqa: F401 (re-export)
+from tokens import issue_user_token, refresh_revocations, verify_user_token  # noqa: F401 (re-export)
 
 logger = logging.getLogger(__name__)
 
@@ -156,6 +156,9 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
         # legacy shared keys that happen to contain a `.` character
         # (the only signal we use to detect token shape).
         if token_secret and "." in token:
+            # Pick up revocations written to Redis since the last request
+            # (cached; at most one Redis read per REVOCATION_REFRESH_INTERVAL_SECONDS).
+            await refresh_revocations()
             payload = verify_user_token(token, token_secret)
             if payload is not None:
                 request.state.user_id = payload["user_id"]

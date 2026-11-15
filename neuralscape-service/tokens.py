@@ -10,7 +10,15 @@ import base64
 import hashlib
 import hmac
 import json
+import logging
 import time
+
+logger = logging.getLogger(__name__)
+
+# Redis set holding the SHA-256 digests of live-revoked tokens. Written by
+# ``scripts/revoke_token.py --redis``; read (as a cached snapshot) by the bearer
+# middleware. ``NEURALSCAPE_REVOKED_TOKENS`` stays an always-honoured fallback.
+REVOKED_SET_KEY = "ns:auth:revoked_tokens"
 
 
 def _b64url_encode(data: bytes) -> str:
@@ -33,19 +41,136 @@ def token_fingerprint(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
-def _revoked_digests() -> set[str] | None:
-    """Digests listed in ``NEURALSCAPE_REVOKED_TOKENS`` (empty set when unset).
+class _RevocationSnapshot:
+    """In-process, last-known copy of the Redis revocation set.
 
-    Read from the live settings object so a test or operator override applies
-    immediately. Returns ``None`` when the list cannot be read or parsed:
-    callers must then FAIL CLOSED and reject the token, never accept it.
+    ``digests`` only ever grows from a successful read to the next one: a failed
+    refresh keeps the previous snapshot, so a Redis outage keeps enforcing
+    everything revoked up to the outage. ``loaded`` is False until the first
+    successful read (cold start).
+    """
+
+    def __init__(self) -> None:
+        self.digests: frozenset[str] = frozenset()
+        self.loaded = False
+        self.next_attempt = 0.0  # time.monotonic() before which no refresh is tried
+        self.last_error_logged = 0.0
+        self.degraded = False
+        self.lock = None  # asyncio.Lock, created lazily inside the running loop
+        self.lock_loop = None
+
+
+_snapshot = _RevocationSnapshot()
+
+
+def reset_revocation_snapshot() -> None:
+    """Forget the cached Redis snapshot (tests; also forces a re-read)."""
+    global _snapshot
+    _snapshot = _RevocationSnapshot()
+
+
+def _refresh_interval() -> float:
+    try:
+        from config import settings
+
+        return max(0.0, float(settings.revocation_refresh_interval_seconds))
+    except Exception:  # noqa: BLE001
+        return 5.0
+
+
+def _new_redis_client():
+    """Async Redis client with short timeouts (patched in tests)."""
+    import redis.asyncio as aioredis
+    from config import settings
+
+    timeout = max(0.05, float(settings.revocation_redis_timeout_seconds))
+    return aioredis.from_url(
+        settings.redis_url, socket_timeout=timeout, socket_connect_timeout=timeout
+    )
+
+
+async def refresh_revocations(force: bool = False) -> bool:
+    """Refresh the Redis revocation snapshot when it is older than the interval.
+
+    Called by the bearer middleware before verifying a per-user token, so a
+    revocation written to Redis takes effect within
+    ``REVOCATION_REFRESH_INTERVAL_SECONDS`` (default 5) with no restart, and
+    most requests cost no Redis round trip. Never raises. On any Redis error
+    the previous snapshot is kept (the env list and everything revoked up to
+    the outage keep being enforced), a rate-limited warning is logged, and
+    the next attempt waits one interval so an outage does not add a connect
+    timeout to every request. Returns True when the snapshot is from a
+    successful read within this call.
+    """
+    import asyncio
+
+    snap = _snapshot
+    now = time.monotonic()
+    if not force and now < snap.next_attempt:
+        return False
+    loop = asyncio.get_running_loop()
+    if snap.lock is None or snap.lock_loop is not loop:
+        snap.lock = asyncio.Lock()
+        snap.lock_loop = loop
+    async with snap.lock:
+        now = time.monotonic()
+        if not force and now < snap.next_attempt:
+            return False  # another request refreshed while we waited
+        interval = _refresh_interval()
+        snap.next_attempt = now + interval
+        client = None
+        try:
+            client = _new_redis_client()
+            members = await client.smembers(REVOKED_SET_KEY)
+            digests = frozenset(
+                (m.decode("utf-8") if isinstance(m, (bytes, bytearray)) else str(m)).strip().lower()
+                for m in members
+            )
+        except Exception as exc:  # noqa: BLE001 - Redis down must not break auth
+            if now - snap.last_error_logged >= 30.0 or not snap.degraded:
+                snap.last_error_logged = now
+                logger.warning(
+                    "token revocation: Redis unreachable (%s); enforcing %s",
+                    type(exc).__name__,
+                    (
+                        f"the last snapshot ({len(snap.digests)} digests) plus the env list"
+                        if snap.loaded
+                        else "the env list only (no Redis snapshot yet)"
+                    ),
+                )
+            snap.degraded = True
+            return False
+        finally:
+            if client is not None:
+                try:
+                    await client.aclose()
+                except Exception:  # noqa: BLE001
+                    pass
+        if snap.degraded:
+            logger.info("token revocation: Redis reachable again; snapshot refreshed")
+        snap.degraded = False
+        snap.digests = digests
+        snap.loaded = True
+        return True
+
+
+def _revoked_digests() -> set[str] | None:
+    """Union of ``NEURALSCAPE_REVOKED_TOKENS`` and the Redis snapshot.
+
+    The env list is read from the live settings object so a test or operator
+    override applies immediately; the Redis part is the cached snapshot kept
+    fresh by ``refresh_revocations``. Returns ``None`` when the env list cannot
+    be read or parsed: callers must then FAIL CLOSED and reject the token,
+    never accept it. (An unreachable Redis is NOT a parse error: the snapshot
+    and env list keep being enforced.)
     """
     try:
         from config import settings
 
-        return settings.revoked_token_digests()
+        env_digests = settings.revoked_token_digests()
     except Exception:  # noqa: BLE001 - unreadable revocation list must not accept tokens
         return None
+    return env_digests | _snapshot.digests
 
 
 def sign_payload(claims: dict, secret: str) -> str:
@@ -171,7 +296,8 @@ def verify_user_token(token: str, secret: str) -> dict | None:
     Returns None for: malformed, tampered, expired, or wrong-secret tokens,
     tokens missing a non-empty ``user_id``, tokens whose ``typ`` is not an
     access type (i.e. OAuth codes/refresh tokens are rejected here), and
-    tokens whose SHA-256 digest is listed in ``NEURALSCAPE_REVOKED_TOKENS``.
+    tokens whose SHA-256 digest is listed in ``NEURALSCAPE_REVOKED_TOKENS`` or
+    in the live Redis denylist (see ``refresh_revocations``).
     Every caller (the bearer middleware, OAuth token-paste login) therefore
     honours revocation. Never raises (callers treat None as "auth failed").
     """

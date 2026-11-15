@@ -55,3 +55,22 @@ def _disable_auth_for_tests():
     settings.neuralscape_api_key = saved_api_key
     settings.default_user_id = saved_default_user_id
     settings.neuralscape_auth_disabled = saved_auth_disabled
+
+
+@pytest.fixture(autouse=True)
+def _isolate_revocation_snapshot(monkeypatch):
+    """Keep unit tests off any real Redis and clear the cached revocation snapshot.
+
+    The bearer middleware reads the live Redis denylist; here it sees an
+    unreachable Redis unless a test installs its own fake client through
+    ``tokens._new_redis_client``.
+    """
+    import tokens
+
+    def _no_redis():
+        raise ConnectionError("unit tests do not reach a real Redis")
+
+    monkeypatch.setattr(tokens, "_new_redis_client", _no_redis)
+    tokens.reset_revocation_snapshot()
+    yield
+    tokens.reset_revocation_snapshot()
