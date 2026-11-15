@@ -375,16 +375,32 @@ def _ctx_point(mem_id, category, created_at, scope="global", **meta):
 def _mock_context_store(service, rows, total=None, standards=()):
     """Mock the Qdrant client for session-start context reads.
 
-    ``rows`` are returned (in the order given — i.e. already newest-first, as
-    Qdrant's order_by would) for the ordered scroll, truncated to the requested
-    ``limit``; ``total`` is the exact count (default ``len(rows)``). Scrolls
-    without ``order_by`` are the standards lookup.
+    ``rows`` are the store's rows, already newest-first (what Qdrant's
+    order_by returns). Three scroll shapes are served: the ordered scroll
+    (``order_by`` set, cut at ``limit``), the boundary tie-group scroll
+    (filter carries a created_at range) and the undated-rows scroll (filter
+    carries IsEmptyCondition). Any other scroll is the standards lookup.
+    ``total`` is the exact count (default ``len(rows)``).
     """
+    from qdrant_client.models import FieldCondition, IsEmptyCondition
+
     client = service._memory.vector_store.client
 
     def _scroll(**kw):
         if kw.get("order_by") is not None:
-            return list(rows)[: kw["limit"]], None
+            return [r for r in rows if r.payload.get("created_at")][: kw["limit"]], None
+        must = list(getattr(kw.get("scroll_filter"), "must", None) or [])
+        extra = must[1] if len(must) == 2 else None
+        if isinstance(extra, IsEmptyCondition):
+            return [r for r in rows if not r.payload.get("created_at")][: kw["limit"]], None
+        if isinstance(extra, FieldCondition) and extra.key == "created_at":
+            from datetime import datetime
+
+            def _dt(v):
+                return datetime.fromisoformat(str(v).replace("Z", "+00:00"))
+
+            b = extra.range.gte
+            return [r for r in rows if r.payload.get("created_at") and _dt(r.payload["created_at"]) == b], None
         return list(standards), None
 
     client.scroll.side_effect = _scroll
@@ -510,6 +526,38 @@ class TestGetContext:
         # Last page: has_more flips to False.
         last = service.get_project_context(user_id="u", project_id="proj", limit=5, offset=995)
         assert last.returned == 5 and last.has_more is False
+
+    def test_paging_is_deterministic_across_a_shared_timestamp(self, service):
+        """Batch writes share one created_at. Rows tied at a page edge must
+        be neither skipped nor repeated: consecutive pages cover every row
+        exactly once."""
+        same = "2026-07-01T00:00:00Z"
+        rows = (
+            [_ctx_point("n1", "tech_stack", "2026-07-02T00:00:00Z", scope="project")]
+            + [_ctx_point(f"t{i}", "tech_stack", same, scope="project") for i in range(7)]
+            + [_ctx_point("o1", "tech_stack", "2026-06-01T00:00:00Z", scope="project")]
+        )
+        _mock_context_store(service, rows)
+        seen: list[str] = []
+        for off in range(0, 9, 3):
+            ctx = service.get_project_context(
+                user_id="u", project_id="proj", limit=3, offset=off
+            )
+            seen += [m.id for b in ctx.categories.values() for m in b]
+        assert sorted(seen) == sorted(r.id for r in rows)
+        assert len(seen) == len(set(seen)) == 9
+
+    def test_rows_without_created_at_are_included_last(self, service):
+        rows = [
+            _ctx_point("d1", "tech_stack", "2026-07-02T00:00:00Z", scope="project"),
+            _ctx_point("u1", "tech_stack", None, scope="project"),
+            _ctx_point("u2", "tech_stack", None, scope="project"),
+        ]
+        _mock_context_store(service, rows)
+        ctx = service.get_project_context(user_id="u", project_id="proj")
+        ids = [m.id for b in ctx.categories.values() for m in b]
+        assert ids[0] == "d1" and set(ids) == {"d1", "u1", "u2"}
+        assert ctx.total == 3 and ctx.has_more is False
 
     def test_project_context_includes_teammates_shared_excludes_private(self, service):
         """The ordered query is the caller's own rows OR project-shared rows;
@@ -886,7 +934,7 @@ class TestGetMemoryReadGate:
             settings.standards_enabled = saved
 
     @pytest.mark.parametrize(
-        "bad_id", ["not-a-uuid", "m1", "", "12345", "../etc/passwd", "x" * 200]
+        "bad_id", ["not-a-uuid", "m1", "", "123-45", "../etc/passwd", "x" * 200, "1" * 30]
     )
     def test_malformed_id_is_not_found_not_an_error(self, service, bad_id):
         """#437: a non-UUID id used to reach Qdrant retrieve and raise (HTTP
@@ -895,6 +943,15 @@ class TestGetMemoryReadGate:
         service._memory.get.side_effect = RuntimeError("qdrant would raise here")
         assert service.get_memory(bad_id, "alice") is None
         service._memory.get.assert_not_called()
+
+    def test_uppercase_uuid_and_numeric_id_reach_store_in_canonical_form(self, service):
+        """Qdrant ids are UUIDs or unsigned ints: an upper-case UUID is passed
+        canonical (lower-case); an all-digit id is passed as an int."""
+        service._memory.get.return_value = None
+        service.get_memory("AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA", "alice")
+        service._memory.get.assert_called_with("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+        service.get_memory("12345", "alice")
+        service._memory.get.assert_called_with(12345)
 
     def test_wellformed_unknown_id_is_not_found(self, service):
         service._memory.get.return_value = None

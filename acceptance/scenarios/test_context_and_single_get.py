@@ -37,7 +37,7 @@ def _store_and_wait(client, content, category, **kw) -> str:
 
 @proves("read.single-memory-get")
 def test_malformed_memory_id_is_404_not_500(a):
-    for bad in ("not-a-uuid", "12345", "x" * 64):
+    for bad in ("not-a-uuid", "123-45", "x" * 64):
         check_get_is_404(a, bad)
 
 

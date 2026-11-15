@@ -490,7 +490,7 @@ class TestV1GetMemoryMalformedId:
         yield svc
         main._service = original
 
-    @pytest.mark.parametrize("bad_id", ["not-a-uuid", "12345", "m1", "x" * 64])
+    @pytest.mark.parametrize("bad_id", ["not-a-uuid", "123-45", "m1", "x" * 64])
     def test_malformed_id_is_404(self, client, real_service, bad_id):
         resp = client.get(f"/v1/memories/{bad_id}")
         assert resp.status_code == 404

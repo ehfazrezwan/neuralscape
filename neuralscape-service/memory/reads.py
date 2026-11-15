@@ -252,20 +252,40 @@ class ReadsMixin:
         return Filter(should=[own, shared], must_not=[self._tombstone_condition()])
 
     def _ordered_context_rows(self, flt, need: int) -> list[MemoryResponse]:
-        """The ``need`` newest rows matching ``flt`` (capped at CONTEXT_FETCH_CAP).
+        """The newest rows matching ``flt``: at least ``need`` (capped at
+        CONTEXT_FETCH_CAP), newest-first by (created_at, id).
 
         Server-side ``order_by created_at DESC`` (needs the DATETIME payload
-        index, ensured lazily). If the server rejects order_by, falls back to
-        the bounded scroll-and-sort used by the timeline.
+        index, ensured lazily). Paging must be deterministic on
+        (created_at, id): batch writes share one timestamp, and Qdrant cuts by
+        created_at alone, so the whole tie group at the cut timestamp is
+        fetched too, otherwise rows at a page edge could be skipped or
+        repeated. Rows with no ``created_at`` are invisible to order_by; they
+        are fetched separately and sort after every dated row. If the server
+        rejects order_by, falls back to the timeline's bounded scroll+sort.
         """
-        from qdrant_client.models import Direction, OrderBy
+        from qdrant_client.models import (
+            DatetimeRange,
+            Direction,
+            FieldCondition,
+            Filter,
+            IsEmptyCondition,
+            OrderBy,
+            PayloadField,
+        )
 
         need = max(1, min(need, CONTEXT_FETCH_CAP))
         client = self._get_memory().vector_store.client
+        coll = settings.qdrant_collection
         self._ensure_created_at_index()
+
+        def _key(p):
+            return _created_at_key((getattr(p, "payload", None) or {}).get("created_at"))
+
+        points: list = []
         try:
             points, _ = client.scroll(
-                collection_name=settings.qdrant_collection,
+                collection_name=coll,
                 scroll_filter=flt,
                 limit=need,
                 order_by=OrderBy(key="created_at", direction=Direction.DESC),
@@ -273,20 +293,63 @@ class ReadsMixin:
                 with_vectors=False,
             )
             points = list(points or [])
+            if len(points) >= need:
+                # Truncated: complete the tie group at the boundary timestamp.
+                boundary = _key(points[-1])
+                tie, _ = client.scroll(
+                    collection_name=coll,
+                    scroll_filter=Filter(
+                        must=[
+                            flt,
+                            FieldCondition(
+                                key="created_at",
+                                range=DatetimeRange(gte=boundary, lte=boundary),
+                            ),
+                        ]
+                    ),
+                    limit=CONTEXT_FETCH_CAP,
+                    with_payload=True,
+                    with_vectors=False,
+                )
+                seen = {str(getattr(p, "id", "")) for p in points}
+                points += [p for p in (tie or []) if str(getattr(p, "id", "")) not in seen]
+            else:
+                # Every dated row is in hand: append undated rows (last).
+                undated, _ = client.scroll(
+                    collection_name=coll,
+                    scroll_filter=Filter(
+                        must=[
+                            flt,
+                            IsEmptyCondition(is_empty=PayloadField(key="created_at")),
+                        ]
+                    ),
+                    limit=need - len(points),
+                    with_payload=True,
+                    with_vectors=False,
+                )
+                points += list(undated or [])
         except Exception as e:
             logger.warning(
                 f"Context order_by scroll failed ({e}) — falling back to Python sort"
             )
-            points = self._scroll_all_sorted(client, flt, "before", need)
+            points = self._scroll_all_sorted(client, flt, "before", CONTEXT_FETCH_CAP)
+            if len(points) > need:
+                cut = _key(points[need - 1])
+                points = [p for p in points if _key(p) >= cut]
         rows = [self._point_to_response(p) for p in points]
         # Belt and braces: the filter already drops tombstones server-side.
-        return [
+        rows = [
             r
             for r, p in zip(rows, points)
             if not _mem_is_tombstoned(
                 {"metadata": (getattr(p, "payload", None) or {}).get("metadata") or {}}
             )
         ]
+        rows.sort(
+            key=lambda r: (_created_at_key(r.created_at), str(r.id or "")),
+            reverse=True,
+        )
+        return rows
 
     def _context_total(self, flt, fetched: int, need: int) -> int:
         """True number of rows matching ``flt`` (exact Qdrant count)."""
@@ -305,6 +368,23 @@ class ReadsMixin:
     # CRUD operations
     # ──────────────────────────────────────────────
 
+    @staticmethod
+    def _canonical_point_id(memory_id) -> "str | int | None":
+        """Qdrant point id in canonical form, or None if malformed.
+
+        Qdrant ids are UUIDs or unsigned integers. A UUID in any accepted
+        spelling (upper-case, braces, no dashes) becomes its canonical
+        lower-case string; an all-digit id becomes an int.
+        """
+        text = str(memory_id).strip()
+        if text.isascii() and text.isdigit():
+            n = int(text)
+            return n if n < 2**64 else None
+        try:
+            return str(uuid.UUID(text))
+        except (ValueError, AttributeError, TypeError):
+            return None
+
     def get_memory(self, memory_id: str, caller_user_id: str | None = None) -> MemoryResponse | None:
         """Get a single memory by ID.
 
@@ -320,12 +400,11 @@ class ReadsMixin:
         # Qdrant point ids are UUIDs: a malformed id would raise inside the
         # retrieve (HTTP 500 at the route, #437). Answer exactly like a
         # well-formed unknown id so ids are not probeable.
-        try:
-            uuid.UUID(str(memory_id))
-        except (ValueError, AttributeError, TypeError):
+        point_id = self._canonical_point_id(memory_id)
+        if point_id is None:
             return None
         m = self._get_memory()
-        result = m.get(memory_id)
+        result = m.get(point_id)
         if not result:
             return None
         # Apply read gate when caller_user_id is provided (C1, get_memories)
