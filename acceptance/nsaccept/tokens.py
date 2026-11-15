@@ -64,6 +64,12 @@ def mint_via_compose(
     run: Callable[..., subprocess.CompletedProcess] = subprocess.run,
 ) -> str:
     """Mint a token the AUTH.md way: ``docker compose -p P exec`` the issuer script."""
+    from .guard import GuardError, check_compose_project
+
+    try:
+        project = check_compose_project(project)
+    except GuardError as exc:
+        raise TokenError(str(exc)) from exc
     cmd = [
         "docker", "compose", "-p", project, "exec", "-T", service,
         "python", "scripts/issue_user_token.py", "--user", user_id, "--days", str(days),
@@ -94,11 +100,12 @@ def mint_via_compose_python(
     container, so the signing secret never leaves it (read from its own environment
     and never printed). The issuer CLI cannot make expired tokens; the module can.
     """
-    from .guard import PROD_COMPOSE_PROJECT
+    from .guard import GuardError, check_compose_project
 
-    project = project.strip()
-    if project.lower() == PROD_COMPOSE_PROJECT:
-        raise TokenError(f"refusing compose project '{PROD_COMPOSE_PROJECT}' (production)")
+    try:
+        project = check_compose_project(project)
+    except GuardError as exc:
+        raise TokenError(str(exc)) from exc
     code = (
         "import os,sys; from tokens import issue_user_token; "
         "print(issue_user_token(sys.argv[1], os.environ['NEURALSCAPE_USER_TOKEN_SECRET'], int(sys.argv[2])))"

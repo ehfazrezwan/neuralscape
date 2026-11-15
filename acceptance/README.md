@@ -219,3 +219,16 @@ over the real scenarios. `run.sh` never collects it; run `run.sh --selftest`.
 when `NS_ALLOW_DESTRUCTIVE=1` is set and the compose project name starts with
 `nscampaign`; otherwise it skips with that reason. The gate sets
 `NS_ALLOW_DESTRUCTIVE=1` on its throwaway stack only; never set it elsewhere.
+
+
+## Compose project allowlist, and `uv`-only boxes
+
+Every compose project name the harness touches (`run.sh`, `guard.check`, `ctx.compose`,
+token minting) goes through `guard.check_compose_project`: stripped and lower-cased,
+`neuralscape` is always refused, and only disposable prefixes pass (default `nscampaign`
+and `nstest-`; override only with `NS_COMPOSE_ALLOWLIST=prefix1,prefix2`). Container
+listing is always `docker compose -p <project> ps`, never global `docker ps`.
+
+`run.sh` needs only `uv`: it runs `uv run --no-project --python 3.12 --with-requirements ...`
+(uv may download a managed CPython; downloads are allowed). Set `NS_UV=/path/to/uv` for a
+standalone binary that is not on `PATH`. Without uv it falls back to python3 >= 3.10 + venv.

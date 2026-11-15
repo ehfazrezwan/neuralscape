@@ -102,10 +102,7 @@ def run_compose(
     timeout: float = 120.0,
     run: Callable[..., subprocess.CompletedProcess] = subprocess.run,
 ) -> subprocess.CompletedProcess:
-    if project.strip().lower() == guard.PROD_COMPOSE_PROJECT:
-        raise guard.GuardError(
-            f"refusing compose project '{guard.PROD_COMPOSE_PROJECT}' (the production project name)"
-        )
+    project = guard.check_compose_project(project)
     if not args or args[0] not in COMPOSE_VERBS:
         raise ConfigError(f"compose verb {args[:1]!r} is not allowed (allowed: {sorted(COMPOSE_VERBS)})")
     if args[0] == "up":
@@ -118,7 +115,7 @@ def run_compose(
     if args[0] == "exec":
         if len(args) < 6 or args[1:5] != ("-T", qdrant_service(), "sh", "-c") or len(args) != 6:
             raise ConfigError(f"`exec` is only allowed as: exec -T {qdrant_service()} sh -c <script>")
-    cmd = ["docker", "compose", "-p", project.strip(), *args]
+    cmd = ["docker", "compose", "-p", project, *args]
     proc = run(cmd, capture_output=True, text=True, timeout=timeout)
     if check and proc.returncode != 0:
         raise RuntimeError(
@@ -148,6 +145,7 @@ def build(base_url: str, profile: str, compose_project: str | None = None) -> Ct
     env_a, env_b = os.environ.get("NS_TOKEN_A", "").strip(), os.environ.get("NS_TOKEN_B", "").strip()
 
     if compose_project:
+        compose_project = guard.check_compose_project(compose_project)
         user_a, user_b = f"acc-{run_id}-a", f"acc-{run_id}-b"
         service = os.environ.get("NS_API_SERVICE", "neuralscape")
         try:
