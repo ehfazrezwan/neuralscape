@@ -111,6 +111,29 @@ def test_anchor_survives_reindex(mock_bridge, tmp_path):
         # The MERGE ensures the same anchor is reused
 
 
+def _stored_point(point_id, data, anchor_key, *, owner, visibility, category, created_at="2026-01-01T00:00:00Z"):
+    """Qdrant point shaped exactly like memory/write.py stores it.
+
+    write.py: top-level payload has data/created_at/user_id; metadata holds
+    owner_user_id, visibility, category, source_ref. The point id is the memory
+    id (the payload carries no "id"). metadata never contains "user_id".
+    """
+    return MagicMock(
+        id=point_id,
+        payload={
+            "data": data,
+            "created_at": created_at,
+            "user_id": owner,
+            "metadata": {
+                "owner_user_id": owner,
+                "visibility": visibility,
+                "category": category,
+                "source_ref": {"external_id": anchor_key},
+            },
+        },
+    )
+
+
 def test_get_anchor_memories_respects_read_scope(mock_bridge, mock_memory_service):
     """Private memories of other users are NOT returned; shared/standard are."""
     engine = NativeEngine(
@@ -126,39 +149,15 @@ def test_get_anchor_memories_respects_read_scope(mock_bridge, mock_memory_servic
     query_fqn = "myrepo.utils.parse"
     anchor_key = f"myrepo::{NativeEngine.to_canonical(query_fqn)}"
     mock_points = [
-        MagicMock(payload={
-            "id": "mem1",
-            "data": "Shared memory about this function",
-            "metadata": {
-                "source_ref": {"external_id": anchor_key},
-                "category": "decision",
-                "visibility": "shared",
-                "user_id": "bob",
-                "created_at": "2026-01-01T00:00:00Z",
-            }
-        }),
-        MagicMock(payload={
-            "id": "mem2",
-            "data": "Alice's private note",
-            "metadata": {
-                "source_ref": {"external_id": anchor_key},
-                "category": "gotcha",
-                "visibility": "private",
-                "user_id": "alice",
-                "created_at": "2026-01-02T00:00:00Z",
-            }
-        }),
-        MagicMock(payload={
-            "id": "mem3",
-            "data": "Bob's private note",
-            "metadata": {
-                "source_ref": {"external_id": anchor_key},
-                "category": "bugfix",
-                "visibility": "private",
-                "user_id": "bob",
-                "created_at": "2026-01-03T00:00:00Z",
-            }
-        }),
+        _stored_point("mem1", "Shared memory about this function", anchor_key,
+                      owner="bob", visibility="shared", category="decision",
+                      created_at="2026-01-01T00:00:00Z"),
+        _stored_point("mem2", "Alice's private note", anchor_key,
+                      owner="alice", visibility="private", category="gotcha",
+                      created_at="2026-01-02T00:00:00Z"),
+        _stored_point("mem3", "Bob's private note", anchor_key,
+                      owner="bob", visibility="private", category="bugfix",
+                      created_at="2026-01-03T00:00:00Z"),
     ]
 
     memory = mock_memory_service._get_memory()
@@ -173,6 +172,8 @@ def test_get_anchor_memories_respects_read_scope(mock_bridge, mock_memory_servic
     assert "mem1" in ids  # shared
     assert "mem2" in ids  # alice's private
     assert "mem3" not in ids  # bob's private (filtered out)
+    by_id = {m["id"]: m for m in memories}
+    assert by_id["mem2"]["created_at"] == "2026-01-02T00:00:00Z"
 
 
 def test_get_anchor_memories_cap(mock_bridge, mock_memory_service):
@@ -190,17 +191,9 @@ def test_get_anchor_memories_cap(mock_bridge, mock_memory_service):
     query_fqn = "myrepo.core.process"
     anchor_key = f"myrepo::{NativeEngine.to_canonical(query_fqn)}"
     mock_points = [
-        MagicMock(payload={
-            "id": f"mem{i}",
-            "data": f"Memory {i}",
-            "metadata": {
-                "source_ref": {"external_id": anchor_key},
-                "category": "decision",
-                "visibility": "shared",
-                "user_id": "alice",
-                "created_at": f"2026-01-0{i % 9 + 1}T00:00:00Z",
-            }
-        })
+        _stored_point(f"mem{i}", f"Memory {i}", anchor_key,
+                      owner="alice", visibility="shared", category="decision",
+                      created_at=f"2026-01-0{i % 9 + 1}T00:00:00Z")
         for i in range(10)
     ]
 
@@ -254,17 +247,9 @@ def test_locate_enriches_with_memories(mock_bridge, mock_memory_service):
     # "{repo}::{to_canonical(fqn)}" — compute it from the symbol's fqn, don't guess.
     anchor_key = f"myrepo::{NativeEngine.to_canonical(symbol_fqn)}"
     mock_mem_points = [
-        MagicMock(payload={
-            "id": "mem1",
-            "data": "This function had a bug in v1.2",
-            "metadata": {
-                "source_ref": {"external_id": anchor_key},
-                "category": "bugfix",
-                "visibility": "shared",
-                "user_id": "alice",
-                "created_at": "2026-01-01T00:00:00Z",
-            }
-        })
+        _stored_point("mem1", "This function had a bug in v1.2", anchor_key,
+                      owner="alice", visibility="shared", category="bugfix",
+                      created_at="2026-01-01T00:00:00Z")
     ]
     mock_mem_result = MagicMock()
     mock_mem_result.points = mock_mem_points
@@ -312,17 +297,9 @@ def test_query_enriches_with_memories(mock_bridge, mock_memory_service):
     # "{repo}::{to_canonical(fqn)}" — compute it from the seed fqn, don't guess.
     anchor_key = f"myrepo::{NativeEngine.to_canonical(seed_fqn)}"
     mock_mem_points = [
-        MagicMock(payload={
-            "id": "mem1",
-            "data": "Decision: use async for this",
-            "metadata": {
-                "source_ref": {"external_id": anchor_key},
-                "category": "decision",
-                "visibility": "shared",
-                "user_id": "alice",
-                "created_at": "2026-01-01T00:00:00Z",
-            }
-        })
+        _stored_point("mem1", "Decision: use async for this", anchor_key,
+                      owner="alice", visibility="shared", category="decision",
+                      created_at="2026-01-01T00:00:00Z")
     ]
     memory = mock_memory_service._get_memory()
     # GF2: batched anchor lookup uses scroll (filter-only) → (points, next_offset)
@@ -377,17 +354,12 @@ def test_anchor_round_trip_cross_engine_end_to_end(mock_bridge, mock_memory_serv
     # Cross-engine agreement is the whole point of the moat.
     assert cbm_canonical == NativeEngine.to_canonical(native_raw) == "click.core.Group"
 
-    mem_point = MagicMock(payload={
-        "id": "mem-decision",
-        "data": "Group dispatches subcommands — decided in ADR-3.",
-        "metadata": {
-            "source_ref": {"external_id": expected_key},  # Phase E: batched lookup requires this
-            "category": "decision",
-            "visibility": "shared",
-            "user_id": "bob",
-            "created_at": "2026-01-01T00:00:00Z",
-        },
-    })
+    mem_point = _stored_point(
+        "mem-decision", "Group dispatches subcommands — decided in ADR-3.",
+        expected_key,  # Phase E: batched lookup requires this
+        owner="bob", visibility="shared", category="decision",
+        created_at="2026-01-01T00:00:00Z",
+    )
 
     def scroll_side_effect(*args, **kwargs):
         """Return the memory ONLY when the filter carries the expected key.
