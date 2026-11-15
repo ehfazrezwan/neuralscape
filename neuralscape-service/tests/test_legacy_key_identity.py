@@ -36,11 +36,21 @@ AUTH = {"Authorization": f"Bearer {KEY}"}
 
 @pytest.fixture(autouse=True)
 def mock_backends():
-    """Same lazy-init stubs as tests/test_auth.py: no real mem0/Graphiti/Redis."""
-    saved = (main._memory, main._graphiti, main._bridge, main._async_memory, main._task_manager)
-    main._memory = MagicMock(name="Memory")
-    main._graphiti = MagicMock(name="Graphiti")
-    main._bridge = MagicMock(name="AsyncBridge")
+    """Same stubs as tests/test_auth.py: no real MemoryService/mem0/Graphiti/Redis.
+
+    The legacy root routes run through ``main._service`` like every /v1 route,
+    so there are no ``main._memory`` / ``_graphiti`` / ``_bridge`` module
+    globals to stub any more; the stand-in service returns the empty shapes
+    those routes serialize. Tests that assert on the service use the
+    ``service`` fixture, which swaps in its own stand-in on top of this one.
+    """
+    saved = (main._service, main._async_memory, main._task_manager)
+    svc = MagicMock(name="MemoryService")
+    svc.extract_and_store.return_value = []
+    svc.search.return_value = []
+    svc.list_memories.return_value = []
+    svc.delete_memories.return_value = {"message": "ok"}
+    main._service = svc
     main._async_memory = None
     tm = MagicMock(name="TaskManager")
     tm.connect = AsyncMock()
@@ -50,7 +60,7 @@ def mock_backends():
     tm.enqueue_store = AsyncMock(return_value="task-1")
     main._task_manager = tm
     yield tm
-    main._memory, main._graphiti, main._bridge, main._async_memory, main._task_manager = saved
+    main._service, main._async_memory, main._task_manager = saved
 
 
 @pytest.fixture
