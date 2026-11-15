@@ -6,7 +6,8 @@ it through the port; the canonical source or the legacy path covers it) or ``gap
 current stack outside the port, so lost when recall is routed).  Each measured verdict is asserted, so a
 behavior change fails here; the matrix is written as JSON when ``ENGINE_GAP_MATRIX_OUT`` names a file.
 
-Skipped unless ``ENGINE_TEST_PG_DSN`` and ``ENGINE_TEST_QDRANT_URL`` point at disposable services.
+Needs ``ENGINE_TEST_PG_DSN`` and ``ENGINE_TEST_QDRANT_URL`` (or the shared ``NS_TEST_PG_DSN`` and ``QDRANT_URL``)
+to point at disposable services; fails instead of skipping when ``NS_INTEGRATION_REQUIRED`` is set.
 """
 
 from __future__ import annotations
@@ -16,7 +17,8 @@ import os
 
 import pytest
 
-from tests.test_engine_adapters_pgvector_integration import (  # noqa: F401
+from engine_env import require_env
+from test_engine_adapters_pgvector_integration import (  # noqa: F401
     DIMS,
     PG_DSN,
     QDRANT_URL,
@@ -27,10 +29,12 @@ from tests.test_engine_adapters_pgvector_integration import (  # noqa: F401
     rec,
 )
 
-pytestmark = [
-    pytest.mark.integration,
-    pytest.mark.skipif(not (PG_DSN and QDRANT_URL), reason="ENGINE_TEST_PG_DSN and ENGINE_TEST_QDRANT_URL are not set"),
-]
+pytestmark = [pytest.mark.integration]
+
+
+@pytest.fixture(autouse=True, scope="module")
+def _stores_configured():
+    require_env(PostgreSQL=PG_DSN, Qdrant=QDRANT_URL)
 
 from contracts_engines import CapabilityHealth  # noqa: E402
 from engine_ports import PortFailure, TenantFilter  # noqa: E402

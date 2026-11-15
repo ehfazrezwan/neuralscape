@@ -1,26 +1,27 @@
 """pgvector adapter against a real PostgreSQL with the vector extension.
 
-Skipped unless ``ENGINE_TEST_PG_DSN`` points at a DISPOSABLE database whose
-role may create schemas (and, if needed, the ``vector`` extension).  Every test
+Needs ``ENGINE_TEST_PG_DSN`` (or ``NS_TEST_PG_DSN``) to point at a DISPOSABLE database whose
+role may create schemas (and, if needed, the ``vector`` extension); fails instead of skipping
+when ``NS_INTEGRATION_REQUIRED`` is set (see ``engine_env``).  Every test
 uses its own random schema and drops it afterwards.  The parity test also
-needs ``ENGINE_TEST_QDRANT_URL``.  Data is synthetic; embeddings are a
+needs ``ENGINE_TEST_QDRANT_URL`` (or ``QDRANT_URL``).  Data is synthetic; embeddings are a
 deterministic hash; no model is called.
 """
 
-import os
 import random
 import threading
 import uuid
 
 import pytest
 
-PG_DSN = os.environ.get("ENGINE_TEST_PG_DSN")
-QDRANT_URL = os.environ.get("ENGINE_TEST_QDRANT_URL")
+from engine_env import PG_DSN, QDRANT_URL, require_env
 
-pytestmark = [
-    pytest.mark.integration,
-    pytest.mark.skipif(not PG_DSN, reason="ENGINE_TEST_PG_DSN is not set"),
-]
+pytestmark = [pytest.mark.integration]
+
+
+@pytest.fixture(autouse=True, scope="module")
+def _stores_configured():
+    require_env(PostgreSQL=PG_DSN)
 
 from engine_adapters_current import QdrantVectorAdapter, hashed_bag_embedder  # noqa: E402
 from engine_adapters_pgvector import PgVectorAdapter, SchemaVersionError  # noqa: E402
@@ -291,8 +292,8 @@ def _state(adapter, tenants=("tenant-a", "tenant-b"), count=26):
     return state
 
 
-@pytest.mark.skipif(not QDRANT_URL, reason="ENGINE_TEST_QDRANT_URL is not set")
 def test_exact_state_parity_with_the_current_qdrant_adapter():
+    require_env(Qdrant=QDRANT_URL)
     qdrant, store = _qdrant_adapter()
     try:
         postgres = make()

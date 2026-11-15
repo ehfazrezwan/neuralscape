@@ -2,12 +2,12 @@
 flip (generation 2, pgvector) -> writes continue -> rollback (generation 3, Qdrant) -> roll forward again,
 with exact-state parity asserted at every step.
 
-Skipped unless ENGINE_TEST_QDRANT_URL and ENGINE_TEST_PG_DSN point at disposable services.  Data is
+Needs ENGINE_TEST_QDRANT_URL and ENGINE_TEST_PG_DSN (or QDRANT_URL and NS_TEST_PG_DSN) to point at disposable
+services; fails instead of skipping when NS_INTEGRATION_REQUIRED is set (see engine_env).  Data is
 synthetic; embeddings are a deterministic hash.  Retrieval ranking is not compared here (see the
 pgvector parity test); this test is about exact state: ids, revisions, text, labels, deletes and fences.
 """
 
-import os
 import json
 import random
 import threading
@@ -15,13 +15,14 @@ import uuid
 
 import pytest
 
-QDRANT_URL = os.environ.get("ENGINE_TEST_QDRANT_URL")
-PG_DSN = os.environ.get("ENGINE_TEST_PG_DSN")
+from engine_env import PG_DSN, QDRANT_URL, require_env
 
-pytestmark = [
-    pytest.mark.integration,
-    pytest.mark.skipif(not (QDRANT_URL and PG_DSN), reason="ENGINE_TEST_QDRANT_URL and ENGINE_TEST_PG_DSN are not set"),
-]
+pytestmark = [pytest.mark.integration]
+
+
+@pytest.fixture(autouse=True, scope="module")
+def _stores_configured():
+    require_env(PostgreSQL=PG_DSN, Qdrant=QDRANT_URL)
 
 from contracts_errors import InternalErrorCode  # noqa: E402
 from engine_adapters_current import QdrantVectorAdapter, hashed_bag_embedder  # noqa: E402

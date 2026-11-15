@@ -1,33 +1,30 @@
 """Conformance of the current stack against real Qdrant and Neo4j.
 
-Skipped unless both services are configured for disposable use:
+Needs both services configured for disposable use (see ``engine_env``; fails instead of
+skipping when ``NS_INTEGRATION_REQUIRED`` is set):
 
-  ENGINE_TEST_QDRANT_URL      e.g. http://127.0.0.1:6333
-  ENGINE_TEST_NEO4J_URI       e.g. neo4j://127.0.0.1:7687
-  ENGINE_TEST_NEO4J_PASSWORD  password for user ``neo4j`` (default ``neo4j``)
+  ENGINE_TEST_QDRANT_URL      (or QDRANT_URL)      e.g. http://127.0.0.1:6333
+  ENGINE_TEST_NEO4J_URI       (or NEO4J_URI)       e.g. neo4j://127.0.0.1:7687
+  ENGINE_TEST_NEO4J_PASSWORD  (or NEO4J_PASSWORD)  password for user ``neo4j`` (default ``neo4j``)
 
 The Neo4j instance is WIPED between checks; point it only at a throwaway
 database.  Data is synthetic and no model is called: embeddings are a
 deterministic hash and Graphiti's LLM/embedder/reranker are inert stubs.
 """
 
-import os
 import threading
 import uuid
 
 import pytest
 
-QDRANT_URL = os.environ.get("ENGINE_TEST_QDRANT_URL")
-NEO4J_URI = os.environ.get("ENGINE_TEST_NEO4J_URI")
-NEO4J_PASSWORD = os.environ.get("ENGINE_TEST_NEO4J_PASSWORD", "neo4j")
+from engine_env import NEO4J_PASSWORD, NEO4J_URI, QDRANT_URL, require_env
 
-pytestmark = [
-    pytest.mark.integration,
-    pytest.mark.skipif(
-        not (QDRANT_URL and NEO4J_URI),
-        reason="ENGINE_TEST_QDRANT_URL and ENGINE_TEST_NEO4J_URI are not set",
-    ),
-]
+pytestmark = [pytest.mark.integration]
+
+
+@pytest.fixture(autouse=True, scope="module")
+def _stores_configured():
+    require_env(Qdrant=QDRANT_URL, Neo4j=NEO4J_URI)
 
 from engine_adapters_current import (  # noqa: E402
     CurrentMemoryEngineAdapter,
