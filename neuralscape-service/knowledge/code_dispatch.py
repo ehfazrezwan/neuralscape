@@ -52,6 +52,29 @@ def repo_path_for_code_space(code_space: str, settings) -> str | None:
     return str(Path(os.path.expanduser(repo_path)))
 
 
+def code_repos_error(code_space: str, settings) -> str | None:
+    """Explain why ``code_space`` has no server-side repo, or None when it has one.
+
+    Code indexing is operator-side: only repositories on the server disk, mapped
+    in CODE_REPOS, can be indexed or bound. The text names CODE_REPOS.
+    """
+    from adapters.code_graph.engine import CODE_REPOS_REQUIREMENT
+
+    parts = (code_space or "").split("--")
+    if len(parts) < 3 or parts[0] != "code":
+        return (
+            f"code_space {code_space!r} is malformed (expected code--owner--repo). "
+            + CODE_REPOS_REQUIREMENT
+        )
+    if repo_path_for_code_space(code_space, settings):
+        return None
+    repos = getattr(settings, "code_repos", {}) or {}
+    return (
+        f"repo {parts[-1]!r} is not in CODE_REPOS "
+        f"(configured: {', '.join(sorted(repos)) or 'none'}). " + CODE_REPOS_REQUIREMENT
+    )
+
+
 def resolve_code_engine(
     system_name: str,
     code_space: str,

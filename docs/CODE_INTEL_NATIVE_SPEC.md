@@ -165,3 +165,15 @@ refactor. E1 has no such dependency and can go first.
 - 158 languages; LSP-grade resolution; watching filesystems (index is
   pull/CI-driven); exposing raw Cypher to normal users; mirroring the raw code
   graph into Graphiti (F1's hard rule stands).
+
+## Server-side repositories only (by design)
+
+Code indexing is operator-side. Every engine (native, graphify-lib, CBM) reads the
+repository from the NeuralScape server's own disk, resolved through `CODE_REPOS`
+(a JSON object of repo name to directory, for example
+`CODE_REPOS='{"demo": "/srv/repos/demo"}'`). The `code_space` is `code--<owner>--<repo>`
+and its repo segment must be a key in `CODE_REPOS`. There is no upload or clone path:
+`POST /v1/code-graph/index` / MCP `code_graph_index` with a repo that is not mapped
+ends the task with `ok: false` and an error naming `CODE_REPOS`. A laptop client that
+wants code answers over a repo the server cannot see uploads a Graphify bundle
+(`graph.json`) through `POST /v1/ingest/files` instead.

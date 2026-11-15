@@ -834,10 +834,13 @@ async def process_code_index(ctx: dict, payload: dict) -> dict:
 
     engine = resolve_code_engine(system, code_space, user_id, settings, for_index=True)
     if engine is None:
+        from knowledge.code_dispatch import code_repos_error
+
+        # Operator-side by design: name CODE_REPOS when the repo is not on the server.
+        reason = code_repos_error(code_space, settings) or "the engine's backend (e.g. the CBM bridge) is unreachable"
         return {
             "ok": False,
-            "error": f"could not resolve engine for system={system!r} code_space={code_space!r} "
-                     "(repo not in CODE_REPOS / bridge down)",
+            "error": f"could not resolve engine for system={system!r} code_space={code_space!r}: {reason}",
             "code_space": code_space,
             "system": system,
         }

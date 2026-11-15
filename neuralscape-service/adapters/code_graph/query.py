@@ -34,7 +34,7 @@ from pathlib import Path
 
 import networkx as nx
 
-from adapters.code_graph.engine import CodeIntelEngine
+from adapters.code_graph.engine import CODE_REPOS_REQUIREMENT, CodeIntelEngine
 from adapters.code_graph.graphify_engine import GraphifyJsonEngine
 from adapters.code_graph.semantic import CodeGraphError, load_code_graph
 
@@ -160,13 +160,13 @@ def _get_native_engine(repo_name: str, user_id: str, settings) -> CodeIntelEngin
     if not repos:
         raise CodeGraphError(
             "No code_repos configured. Set CODE_REPOS env var (JSON dict) "
-            "mapping repo names to filesystem paths."
+            "mapping repo names to filesystem paths. " + CODE_REPOS_REQUIREMENT
         )
     repo_path = repos.get(repo_name)
     if not repo_path:
         raise CodeGraphError(
             f"No repo configured with name {repo_name!r}. "
-            f"Available repos: {', '.join(repos.keys())}"
+            f"Available repos: {', '.join(repos.keys())}. " + CODE_REPOS_REQUIREMENT
         )
     repo_path = Path(os.path.expanduser(repo_path))
     if not repo_path.is_dir():
@@ -288,13 +288,13 @@ def _get_graphify_lib_engine(code_space: str, user_id: str, settings) -> CodeInt
         if not repos:
             raise CodeGraphError(
                 "No code_repos configured. Set CODE_REPOS env var (JSON dict) "
-                "mapping repo names to filesystem paths."
+                "mapping repo names to filesystem paths. " + CODE_REPOS_REQUIREMENT
             )
         repo_path = repos.get(repo_name)
         if not repo_path:
             raise CodeGraphError(
                 f"No repo configured with name {repo_name!r}. "
-                f"Available repos: {', '.join(repos.keys())}"
+                f"Available repos: {', '.join(repos.keys())}. " + CODE_REPOS_REQUIREMENT
             )
         repo_path = Path(os.path.expanduser(repo_path))
         if not repo_path.is_dir():

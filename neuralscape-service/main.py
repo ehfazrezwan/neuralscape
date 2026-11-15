@@ -1431,6 +1431,7 @@ async def _dispatch_code_system(
     """
     from knowledge.base import RecallRequest
     from knowledge.code_dispatch import (
+        code_repos_error,
         resolve_auto_bound_system,
         resolve_bound_code_system,
     )
@@ -1487,7 +1488,11 @@ async def _dispatch_code_system(
                 status_code=400,
                 detail=(
                     f"could not bind an engine for '{knowledge_system}' at code_space "
-                    f"'{code_space}' (repo not in CODE_REPOS / not indexed / bridge down)"
+                    f"'{code_space}': "
+                    + (
+                        code_repos_error(code_space, settings)
+                        or "not indexed yet, or the engine's backend (e.g. the CBM bridge) is down"
+                    )
                 ),
             )
 
@@ -1529,7 +1534,12 @@ async def v1_code_graph_query(
     knowledge_system: str | None = Query(None, description="Route to a code knowledge system (code-cbm | code-graphify-lib | code-native), or 'auto' for per-op auto-selection of the measured-best healthy engine; graph_id carries the code_space. Omit for the default native/graphify-json path."),
     user_id: str | None = Query(None),
 ):
-    """Search the code graph (BFS/DFS from scored seeds) — Graphify's query, NS's surface."""
+    """Search a code_space's graph (BFS/DFS from scored seeds).
+
+    Works on any indexed code_space (native, graphify-lib, CBM or an uploaded
+    graph.json bundle). Indexing needs the repo on the server disk, mapped in
+    CODE_REPOS; nothing uploads or clones a repo.
+    """
     cg = _code_graph_or_501()
     caller = _resolve_user_id(request, user_id)
     if knowledge_system:
@@ -1570,7 +1580,12 @@ async def v1_code_graph_neighbors(
     knowledge_system: str | None = Query(None, description="Route to a code knowledge system (code-cbm | code-graphify-lib | code-native) or 'auto' (per-op auto-selection); graph_id carries the code_space."),
     user_id: str | None = Query(None),
 ):
-    """Direct in/out neighbors of one code-graph node, with relation + confidence tags."""
+    """Direct in/out neighbors of one code-graph node, with relation + confidence tags.
+
+    Queries an already-indexed code_space; indexing needs the repo on the server
+    disk, mapped in CODE_REPOS. An ambiguous bare label resolves to the best match
+    and the response lists the other candidates.
+    """
     cg = _code_graph_or_501()
     caller = _resolve_user_id(request, user_id)
     if knowledge_system:
@@ -1610,7 +1625,11 @@ async def v1_code_graph_path(
     knowledge_system: str | None = Query(None, description="Route to a code knowledge system (code-cbm | code-graphify-lib | code-native) or 'auto' (per-op auto-selection); graph_id carries the code_space."),
     user_id: str | None = Query(None),
 ):
-    """Shortest connection path between two code-graph symbols (how does A reach B?)."""
+    """Shortest connection path between two code-graph symbols (how does A reach B?).
+
+    Queries an already-indexed code_space; indexing needs the repo on the server
+    disk, mapped in CODE_REPOS.
+    """
     cg = _code_graph_or_501()
     caller = _resolve_user_id(request, user_id)
     if knowledge_system:
@@ -1651,8 +1670,9 @@ async def v1_code_graph_locate(
     """Hybrid code retrieval: find symbols by description or name pattern (E3).
 
     Uses dense embeddings + BM25 + degree signal. Returns file:line locations with
-    signatures and docstrings. E3: requires NativeEngine (repo:<name> refs); raises
-    501 on GraphifyJsonEngine (.json artifacts).
+    signatures and docstrings. Needs an engine that supports locate (native or CBM);
+    501 / capability error on engines that do not (graphify-lib, uploaded graph.json).
+    The repo must have been indexed from the server disk (mapped in CODE_REPOS).
     """
     cg = _code_graph_or_501()
     caller = _resolve_user_id(request, user_id)
@@ -1714,8 +1734,10 @@ async def v1_code_graph_impact(
     """Compute blast radius from a given symbol (E7).
 
     BFS over CALLS/IMPORTS edges to find all symbols affected by changes to the
-    given symbol. Returns a text summary (file:line format). E7: requires
-    NativeEngine (repo:<name> refs); raises 501 on GraphifyJsonEngine (.json artifacts).
+    given symbol. Returns a text summary (file:line format). Needs an engine that
+    supports impact (native or graphify-lib); 501 / capability error on an uploaded
+    graph.json. The repo must have been indexed from the server disk (mapped in
+    CODE_REPOS).
     """
     from adapters.code_graph.engine import EngineCapabilityError
 
@@ -1772,6 +1794,11 @@ async def v1_code_graph_index(req: CodeIndexRequest, request: Request):
     routing config, and runs the external-engine liveness diff. Idempotent at the
     engine level (a re-index of the same code_space overwrites); each call gets a
     unique job id so a re-index always re-runs (not coalesced on a cached result).
+
+    Operator-side by design: ``repo_source`` must be a directory ON THE SERVER and
+    the repo must be mapped in the server's ``CODE_REPOS`` (JSON object of repo name
+    to directory). There is no upload or clone path; if the repo is not mapped the
+    task finishes with ``ok: false`` and an error naming CODE_REPOS.
     """
     _code_graph_or_501()
     caller = _resolve_user_id(request, req.user_id)

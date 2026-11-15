@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Any
 
 from adapters.code_graph.engine import (
+    CODE_REPOS_REQUIREMENT,
     ChangeReport,
     EngineCapabilityError,
     IndexReport,
@@ -154,6 +155,33 @@ class _Edge:
     target_fqn: str
     relation: str  # CALLS | IMPORTS | DEFINES | INHERITS | REFERENCES
     extraction: str  # extracted | inferred | ambiguous
+
+
+
+def _is_collection_not_found(exc: BaseException) -> bool:
+    """True only for a real "collection does not exist" answer from Qdrant.
+
+    Server mode raises ``UnexpectedResponse`` with status 404; the embedded
+    local mode raises ``ValueError("Collection x not found")``. Anything else
+    (connection reset, 5xx, timeout) is a transient fault, not absence.
+    """
+    status = getattr(exc, "status_code", None)
+    if status == 404:
+        return True
+    if isinstance(exc, ValueError) and "not found" in str(exc).lower():
+        return True
+    return False
+
+
+def _is_collection_exists_conflict(exc: BaseException) -> bool:
+    """True for Qdrant's 409 "already exists" (or the local-mode ValueError)."""
+    status = getattr(exc, "status_code", None)
+    if status == 409:
+        content = getattr(exc, "content", b"") or b""
+        if isinstance(content, str):
+            content = content.encode()
+        return b"already exists" in content
+    return isinstance(exc, ValueError) and "already exists" in str(exc).lower()
 
 
 class NativeEngine:
@@ -330,6 +358,7 @@ class NativeEngine:
 
         symbol = matches[0]
         fqn = symbol["fqn"]
+        ambiguity = self._ambiguity_note(label, matches)
         rel_filter = (relation_filter or "").lower()
 
         # Fetch in/out edges
@@ -352,6 +381,8 @@ class NativeEngine:
             lines.append(
                 f"  {direction} {edge['neighbor']} [{edge['relation']}] [{edge['extraction']}]"
             )
+        if ambiguity:
+            lines.append(ambiguity)
         return "\n".join(lines)
 
     def path(
@@ -395,7 +426,18 @@ class NativeEngine:
             extr = edge["extraction"]
             segments.append(f"--{rel} [{extr}]--> {next_node['fqn']}")
 
-        return f"Shortest path ({hops} hops):\n  " + " ".join(segments)
+        out = f"Shortest path ({hops} hops):\n  " + " ".join(segments)
+        notes = [
+            n
+            for n in (
+                self._ambiguity_note(source, src_matches),
+                self._ambiguity_note(target, tgt_matches),
+            )
+            if n
+        ]
+        if notes:
+            out += "\n" + "\n".join(notes)
+        return out
 
     # ── F2-future methods (E3+) ──────────────────────────────────────
 
@@ -777,6 +819,18 @@ class NativeEngine:
 
         try:
             info = client.get_collection(collection_name)
+        except Exception as exc:
+            if not _is_collection_not_found(exc):
+                # A transient or unrelated Qdrant failure is NOT "missing": falling
+                # through to create_collection would turn it into a misleading
+                # 409 (collection already exists) and fail the whole call.
+                raise RuntimeError(
+                    f"Could not check the {collection_name} Qdrant collection "
+                    f"({type(exc).__name__}: {exc}); not attempting to create it."
+                ) from exc
+            info = None  # genuinely missing -> create below
+
+        if info is not None:
             if not recreate_on_mismatch:
                 return  # exists — fast path, no dim computation
             existing = self._collection_vector_size(info)
@@ -789,8 +843,6 @@ class NativeEngine:
                 client.delete_collection(collection_name)
             else:
                 return  # exists and compatible
-        except Exception:
-            pass  # doesn't exist (or get failed) → create below
 
         try:
             client.create_collection(
@@ -802,6 +854,10 @@ class NativeEngine:
             )
             logger.info(f"Created code_index collection (size={_size()})")
         except Exception as e:
+            if _is_collection_exists_conflict(e):
+                # Another worker created it between our check and our create.
+                logger.info("code_index collection already exists (created concurrently)")
+                return
             logger.warning(f"Failed to create code_index collection: {e}")
             raise
 
@@ -881,6 +937,9 @@ class NativeEngine:
             detail_fqn = detail.get("fqn", "")
             lines.append(f"  {file}:{line} [{kind}] {detail_fqn}")
 
+        note = self._ambiguity_note(symbol, matches)
+        if note:
+            lines.append(note)
         return "\n".join(lines)
 
     def _get_symbol_details(self, fqn: str) -> dict | None:
@@ -1113,7 +1172,10 @@ class NativeEngine:
         start = time.time()
         repo_path = Path(source).resolve()
         if not repo_path.is_dir():
-            raise ValueError(f"source must be a directory: {source}")
+            raise ValueError(
+                f"source must be a directory on the server: {source}. "
+                + CODE_REPOS_REQUIREMENT
+            )
 
         # Collect source files across supported languages
         file_patterns = {
@@ -1738,7 +1800,8 @@ class NativeEngine:
             return rel_path.replace("/", ".").removesuffix(".ts").removesuffix(".tsx").removesuffix(".js").removesuffix(".jsx")
         elif language == "go":
             # Go uses directory-based packages
-            return str(Path(rel_path).parent).replace("/", ".")
+            parent = str(Path(rel_path).parent).replace("/", ".")
+            return "" if parent == "." else parent
         elif language == "rust":
             # Rust uses crate::module paths
             return rel_path.replace("/", "::").removesuffix(".rs")
@@ -1907,8 +1970,62 @@ class NativeEngine:
         def walk(node, parent_class=None):
             node_type = node.type
 
+            # Rust: ``impl Type { fn ... }`` / ``impl Trait for Type`` — the fns inside
+            # belong to the implemented type, so recurse with it as the parent.
+            if node_type == "impl_item":
+                type_node = node.child_by_field_name("type")
+                if type_node is not None:
+                    tname = type_node.text.decode("utf8", errors="ignore").split("<")[0].strip()
+                    owner = f"{module_path}.{tname}" if module_path else tname
+                    for child in node.children:
+                        walk(child, parent_class=owner)
+                    return
+
+            # TS/JS: ``const f = () => ...`` / ``const f = function () {}`` is a function.
+            if node_type == "variable_declarator":
+                value = node.child_by_field_name("value")
+                name_node = node.child_by_field_name("name")
+                if (
+                    value is not None
+                    and name_node is not None
+                    and name_node.type == "identifier"
+                    and value.type in ("arrow_function", "function_expression", "function")
+                ):
+                    name = name_node.text.decode("utf8", errors="ignore")
+                    fqn = (
+                        f"{parent_class}.{name}" if parent_class
+                        else (f"{module_path}.{name}" if module_path else name)
+                    )
+                    symbols.append(_Symbol(
+                        fqn=fqn,
+                        kind="method" if parent_class else "function",
+                        file=rel_path,
+                        line=node.start_point[0] + 1,
+                        end_line=node.end_point[0] + 1,
+                    ))
+
+            # Go: ``type X struct{}`` — the name lives on the ``type_spec`` child.
+            if node_type == "type_declaration":
+                for spec in node.children:
+                    if spec.type not in ("type_spec", "type_alias"):
+                        continue
+                    name_node = spec.child_by_field_name("name")
+                    if name_node is None:
+                        continue
+                    name = name_node.text.decode("utf8", errors="ignore")
+                    symbols.append(_Symbol(
+                        fqn=f"{module_path}.{name}" if module_path else name,
+                        kind="type",
+                        file=rel_path,
+                        line=spec.start_point[0] + 1,
+                        end_line=spec.end_point[0] + 1,
+                    ))
+
             # Functions/methods (language-specific patterns)
-            if node_type in ("function_declaration", "method_definition", "method_declaration"):
+            elif node_type in (
+                "function_declaration", "method_definition", "method_declaration",
+                "function_item",  # Rust
+            ):
                 name_node = node.child_by_field_name("name")
                 if name_node:
                     name = name_node.text.decode("utf8", errors="ignore")
@@ -1927,7 +2044,10 @@ class NativeEngine:
                     ))
 
             # Classes/structs/interfaces
-            elif node_type in ("class_declaration", "struct_item", "interface_declaration", "type_declaration"):
+            elif node_type in (
+                "class_declaration", "struct_item", "interface_declaration",
+                "enum_item", "trait_item",  # Rust
+            ):
                 name_node = node.child_by_field_name("name")
                 if name_node:
                     name = name_node.text.decode("utf8", errors="ignore")
@@ -1959,7 +2079,11 @@ class NativeEngine:
 
             # Calls (inferred)
             elif node_type in ("call_expression", "method_invocation"):
+                # Java's method_invocation has no ``function`` field: it carries
+                # ``object`` (optional receiver) and ``name``.
                 func_node = node.child_by_field_name("function")
+                if func_node is None and node_type == "method_invocation":
+                    func_node = node.child_by_field_name("name")
                 if func_node:
                     target = func_node.text.decode("utf8", errors="ignore")
                     if len(target) < 100:
@@ -2805,37 +2929,84 @@ class NativeEngine:
             for r in results
         ]
 
-    def _find_symbol(self, label: str) -> list[dict]:
-        """Find symbols by FQN substring match.
+    # Match tiers for _find_symbol (lower is better).
+    _TIER_EXACT_FQN = 0
+    _TIER_EXACT_SEGMENT = 1
+    _TIER_SUBSTRING = 2
 
-        NOTE (resolver-svc mission diagnosis): this unordered ``CONTAINS`` +
-        ``LIMIT 5`` returns an arbitrary ``matches[0]``, so an ambiguous bare label
-        like ``Argument`` can resolve to ``tests…test_argument_order`` (name merely
-        *contains* "argument") instead of the class ``…core.Argument`` — capping the
-        neighbors benchmark regardless of resolver quality. A ranked lookup
-        (exact-FQN → exact-final-segment → substring; then def kind; then degree)
-        plus caller-direction filtering for "who calls X" lifts the pyright graph's
-        neighbors from ~50% to ~70% F1 in offline measurement (see
-        ICE_V2_RESOLVER_RESULT.md). That fix touches the shared interactive query
-        path (all engines, latency-sensitive) so it is scoped as a follow-up, not
-        bundled into this resolver PR — the change here is intentionally left
-        minimal to avoid regressing the default jedi path."""
+    @classmethod
+    def _symbol_match_tier(cls, fqn: str, label: str) -> int:
+        """Rank how well ``label`` names ``fqn`` (case-insensitive).
+
+        0 = the whole fqn, 1 = the label equals the trailing dotted segment(s)
+        (``Argument`` -> ``pkg.core.Argument``), 2 = merely contained.
+        """
+        f, l = (fqn or "").lower(), (label or "").strip().lower()
+        if f == l:
+            return cls._TIER_EXACT_FQN
+        if f.endswith("." + l) or f.endswith("/" + l) or f.endswith("::" + l):
+            return cls._TIER_EXACT_SEGMENT
+        return cls._TIER_SUBSTRING
+
+    def _find_symbol(self, label: str) -> list[dict]:
+        """Resolve ``label`` to candidate symbols, best first (deterministic).
+
+        Order: exact fqn, then exact trailing segment, then substring; ties
+        broken by case-exact match, then graph degree (desc), then fqn (asc).
+        Each result carries ``tier``. ``matches[0]`` is therefore the same node on
+        every call, and an ambiguous bare label such as ``Argument`` prefers the
+        class ``core.Argument`` over a test whose name merely contains it. Callers
+        surface remaining ambiguity with ``_ambiguity_note``.
+        """
         cypher = """
         MATCH (s:CodeSymbol {code_space: $code_space})
         WHERE toLower(s.fqn) CONTAINS toLower($label)
-        RETURN s.fqn AS fqn, s.kind AS kind, s.file AS file, s.span AS span
-        LIMIT 5
+        WITH s, toLower(s.fqn) AS f, toLower($label) AS l
+        RETURN s.fqn AS fqn, s.kind AS kind, s.file AS file, s.span AS span,
+               coalesce(s.degree, 0) AS degree,
+               CASE WHEN f = l THEN 0
+                    WHEN f ENDS WITH ('.' + l) OR f ENDS WITH ('/' + l)
+                         OR f ENDS WITH ('::' + l) THEN 1
+                    ELSE 2 END AS tier
+        ORDER BY tier ASC, degree DESC, s.fqn ASC
+        LIMIT 50
         """
         results = self._run_cypher(cypher, code_space=self.code_space, label=label)
+        wanted = (label or "").strip()
+        ranked = []
+        for r in results:
+            fqn = r["fqn"]
+            tier = self._symbol_match_tier(fqn, wanted)
+            case_exact = 0 if (fqn == wanted or fqn.endswith(wanted)) else 1
+            degree = int(r.get("degree") or 0)
+            ranked.append((tier, case_exact, -degree, fqn, r, degree))
+        ranked.sort(key=lambda t: t[:4])
         return [
             {
                 "fqn": r["fqn"],
                 "kind": r["kind"],
                 "file": r["file"],
                 "line": int(r["span"].split(":")[0]) if r.get("span") else 0,
+                "tier": tier,
+                "degree": degree,
             }
-            for r in results
+            for tier, _c, _d, _f, r, degree in ranked[:5]
         ]
+
+    @staticmethod
+    def _ambiguity_note(label: str, matches: list[dict]) -> str:
+        """A one-line warning when several symbols tie for the best match tier."""
+        if len(matches) < 2:
+            return ""
+        top = matches[0].get("tier")
+        tied = [m for m in matches if m.get("tier") == top]
+        if len(tied) < 2:
+            return ""
+        others = ", ".join(m["fqn"] for m in tied[1:4])
+        return (
+            f"Note: '{label}' is ambiguous ({len(tied)} candidates); resolved to "
+            f"{tied[0]['fqn']}. Others: {others}. Use a fully-qualified name to disambiguate."
+        )
 
     def _get_edges(self, fqn: str, rel_filter: str = "") -> list[dict]:
         """Fetch in/out edges for a symbol."""
