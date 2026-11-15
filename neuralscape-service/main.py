@@ -147,6 +147,8 @@ async def lifespan(app: FastAPI):
 
     # Initialize the service (this also initializes mem0 + Graphiti)
     _service._get_memory()
+    from hybrid_inference import warmup_extraction
+    await asyncio.to_thread(warmup_extraction)
     # Connect task manager to Redis
     await _task_manager.connect()
 
@@ -1711,9 +1713,20 @@ async def v1_register_connector(req: ConnectorConfigRequest, request: Request):
     disabled) a replacement may change the owner; the vault then starts a new
     instance with fresh sync state.
     """
+    from connectors.stdio_policy import ConnectorConfigError, validate_mcp_config
     from connectors.vault import ConnectorOwnedElsewhere
 
     vault = _require_vault()
+    if req.connector_type == "mcp":
+        try:
+            validate_mcp_config(req.config, settings.connector_stdio_commands_set())
+        except ConnectorConfigError as e:
+            # Ids only: never the command, args or env (they are caller-chosen).
+            logger.warning(
+                "MCP connector registration refused: connector_id=%s owner=%s",
+                req.connector_id, _resolve_user_id(request, None),
+            )
+            raise HTTPException(status_code=422, detail=str(e))
     resolved_user_id = _resolve_user_id(request, None)
     record = req.model_dump(mode="json", exclude_none=True)
     record["owner_user_id"] = resolved_user_id

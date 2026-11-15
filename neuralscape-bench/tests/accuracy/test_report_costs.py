@@ -129,3 +129,46 @@ def test_fetch_file_backfills_manifest_for_preexisting_file(tmp_path):
     assert "data.json" in manifest
     assert manifest["data.json"]["sha256"]
     assert manifest["data.json"]["note"].startswith("pre-existing")
+
+
+# ── BEAM retrieval is incompatible, never a number ──
+
+
+def test_beam_retrieval_marked_incompatible_in_json_and_markdown():
+    # Even if records carry retrieval hits (e.g. an older run, or a lexical
+    # attribution that matched nothing), BEAM must not report an R@k number.
+    judged = [
+        {"qa_id": "q1", "qtype": "1-abstention", "correct": True, "retrieval_hit": False},
+        {"qa_id": "q2", "qtype": "2-temporal", "correct": False, "retrieval_hit": False},
+    ]
+    result = build_suite_result(
+        "beam", judged, config={"k": 10}, suite_stats={}, run_stats={},
+    )
+    m = result["metrics"]
+    assert not any(k.startswith("retrieval_recall_at_") for k in m)
+    assert m["retrieval"]["status"] == "incompatible"
+    assert m["retrieval"]["reason"]
+    assert m["overall"]["accuracy"] == 0.5  # the accuracy column stays real
+
+    md = render_battery_markdown({"beam": result})
+    row = next(line for line in md.splitlines() if line.startswith("| BEAM |"))
+    cells = [c.strip() for c in row.strip("|").split("|")]
+    assert cells[2].startswith("n/a (incompatible: ")  # retrieval column
+    assert "%" not in cells[2]
+
+    # A stale result JSON that still stores a 0.0 recall also renders as n/a.
+    stale = {**result, "metrics": {**m, "retrieval_recall_at_10":
+                                   {"n": 2, "hits": 0, "recall": 0.0}}}
+    stale["metrics"].pop("retrieval")
+    row = next(l for l in render_battery_markdown({"beam": stale}).splitlines()
+               if l.startswith("| BEAM |"))
+    rcell = [c.strip() for c in row.strip("|").split("|")][2]
+    assert rcell.startswith("n/a (incompatible: ") and "%" not in rcell
+
+
+def test_compatible_suite_retrieval_still_reported():
+    judged = [{"qa_id": "q1", "qtype": "t", "correct": True, "retrieval_hit": True}]
+    result = build_suite_result("locomo", judged, config={"k": 10},
+                                suite_stats={}, run_stats={})
+    assert "retrieval" not in result["metrics"]
+    assert result["metrics"]["retrieval_recall_at_10"]["recall"] == 1.0

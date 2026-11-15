@@ -319,6 +319,27 @@ describe("listPendingBuffers", () => {
     expect(existsSync(legacy + ".ended")).toBe(true);
   });
 
+  it("garbage-collects .compile-armed markers: of emptied or missing buffers, and older than two weeks", async () => {
+    const dir = getObservationDir();
+    const emptied = seedBuffer("armed-emptied", now, 2 * HOUR, 1 * HOUR);
+    writeFileSync(emptied, "", "utf-8");
+    writeFileSync(emptied + ".compile-armed", "{}", "utf-8");
+    writeFileSync(join(dir, "armed-gone.jsonl.compile-armed"), "{}", "utf-8");
+    const live = seedBuffer("armed-live", now, 2 * HOUR, 1 * HOUR);
+    writeFileSync(live + ".compile-armed", "{}", "utf-8");
+    const ancient = seedBuffer("armed-ancient", now, 2 * HOUR, 1 * HOUR);
+    writeFileSync(ancient + ".compile-armed", "{}", "utf-8");
+    const old = new Date(now - 15 * 24 * HOUR);
+    utimesSync(ancient + ".compile-armed", old, old);
+
+    await listPendingBuffers("mine", now);
+
+    expect(existsSync(emptied + ".compile-armed")).toBe(false);
+    expect(existsSync(join(dir, "armed-gone.jsonl.compile-armed"))).toBe(false);
+    expect(existsSync(ancient + ".compile-armed")).toBe(false);
+    expect(existsSync(live + ".compile-armed")).toBe(true);
+  });
+
   it("removes local compact snapshots older than two weeks and keeps recent ones", async () => {
     await writeLocalCompactSnapshot({ sessionId: "old", content: "c", createdAt: "x" });
     await writeLocalCompactSnapshot({ sessionId: "new", content: "c", createdAt: "x" });
