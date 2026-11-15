@@ -2,8 +2,33 @@
 
 **Provenance-based access control for a multi-seat agentic memory layer.**
 
-Status: design document (W6 of the access-control workstream). Phase 0 of the roadmap has landed on `hotfix/private-graph-cascade`; Phases 1–6 are proposed, not implemented.
+Status: design document (W6 of the access-control workstream). Phase 0 of the roadmap has landed on `dev` (PR #225, `hotfix/private-graph-cascade`, merged). Phase 1 is **partial** on `dev`: some identity hardening has shipped, and the audit sink and `admin_user_ids` / `owner_user_ids` configuration have not. Phases 2–6 are proposed and not started. See [Implementation status on dev](#implementation-status-on-dev).
 Audience: Neuralscape maintainers and deployment operators.
+
+## Implementation status on dev
+
+As of 2026-11-16, `dev` at `af63b9d1`. Evidence is by path; the design text below is unchanged.
+
+| Phase | Status | Evidence on dev |
+|---|---|---|
+| 0 — exact-provenance cascade, remediation, sensitivity gate | **Landed** (PR #225) | `neuralscape-service/memory/provenance.py`, `memory/remediation.py`, `memory/sensitivity.py`; cascade wired in `memory/edit.py` and `memory/delete.py`; `include_expired` on `memory/graph_admin.py` with the dictator-only 403 in `main.py::_authorize_include_expired`; `sensitivity_gate_enabled` / `sensitivity_private_classes` in `config.py`; `get_memory` / reasoning chain take a caller id in `memory/reads.py` |
+| 1 — identity hardening and audit foundation | **Partial** | Landed: legacy root routes resolve identity through `main.py::_resolve_user_id` (delegates to `auth.py::resolve_request_user_id`; token wins, mismatch is 400); extension routes use the same resolver (`tests/test_extension_route_identity.py`); task status is readable only by the enqueuing user (`tests/test_task_status_owner.py`); startup is fail-closed unless an auth secret or key is set or `NEURALSCAPE_AUTH_DISABLED` is explicit (`config.py`). Not landed: MCP tools still declare an optional `user_id` argument (`mcp_server.py`), ignored under token auth but not removed; no startup warning for multi-seat use without a token secret; no append-only audit sink or change-audit records (`memory/audit.py` only holds the standards-serving structlog logger); no `admin_user_ids` / `owner_user_ids` in `config.py` |
+| 1 policy contracts (PR #387) | **Landed as contracts only** | `neuralscape-service/contracts_policy.py`, `contracts_policy_reference.py`, `contracts_tenancy.py`; referenced only by other `contracts_*` modules and tests, not by `main.py`, `mcp_server.py` or any read or write path. Candidate evaluator vocabulary, not the L5 policy sets described here |
+| 2 — provenance projection (L2) | **Not started** | No `ns_*` access properties in `neuralscape-service/` or `graphiti/graphiti_core`; episode saves still whole-map replace; `memory/write.py::_attach_memory_id_to_graph_nodes` (legacy heuristic stamp) is still the only node stamp; no `memory/access.py` |
+| 3 — read-boundary predicate (L3) | **Not started** | No predicate module; `memory/groups.py::_get_group_ids` is still the read boundary; `graph_communities_enabled` does not exist and `memory/graph_admin.py::get_graph_communities` still serves communities |
+| 4 — lifecycle as re-projection | **Not started** | `memory/edit.py` / `memory/delete.py` still use the Phase 0 destroy-and-re-derive cascade |
+| 5 — RBAC and agent ABAC | **Not started** | Only `settings.is_dictator` (`config.py`) exists; no Admin/Owner roles, no agent policy sets, no kill switch |
+| 6 — full audit, retention, code-graph, workspaces | **Not started** | Workspace is still the `--ws--` suffix in `memory/groups.py` |
+
+A Phase 2 "policy/authority" slice exists from the paused program, but only in the handoff archives. It is not on `dev`; another campaign lane (p2-02) is importing it. Nothing in this table counts it.
+
+v1 claims in section 3 that are now stale or need a qualifier:
+
+- Section 3.1 "Identity binding": the resolver now lives in `neuralscape-service/auth.py::resolve_request_user_id`; `main.py::_resolve_user_id` delegates to it.
+- Section 3.1 "Partition": the workspace sentinel is still `"memory"` (or `None`) meaning no suffix, as in `memory/groups.py::_build_group_id`. Unchanged.
+- Section 3.3 (f) and (g) describe pre-hotfix behavior; both are closed on `dev` (see Phase 0 above). (a), (b), (d) as limits remain true.
+- Dictator versus Admin: only the dictator capability exists. `rescope_private_derivatives` and `audit_private_leakage` are dictator-gated (`main.py::_require_dictator_admin`, `mcp_server.py` `settings.is_dictator` checks).
+- Token defaults: per-user HMAC tokens remain the recommended mode; legacy shared key and explicit auth-disabled mode remain, with a startup warning only when auth is disabled (`config.py`).
 
 ## Contents
 
@@ -125,15 +150,15 @@ flowchart TB
 
 Seven fix commits (plus a measurement chore) close (c), (d), (f), (g) and harden (e). They do **not** change (a) or (b): partition is still the security boundary, and artifacts still carry no enforceable provenance-derived attributes.
 
-> **Where these live:** the modules marked *(new)* land with the private-graph cascade hotfix (PR #225, branch `hotfix/private-graph-cascade`); until that PR merges they are **not** present on `dev`. Paths below are as they appear on that branch.
+> **Where these live:** the modules marked *(new)* arrived with the private-graph cascade hotfix (PR #225, merged into `dev`). Paths below are the paths on `dev`.
 
 | Fix | Module | What it establishes |
 |---|---|---|
-| Exact-provenance cascade | `memory/provenance.py` *(new, PR #225)* | Resolve a memory's Graphiti **episode** by persisted uuid → verbatim content → deterministic name (all exact equality, never fuzzy), then expire everything it contributed: soft-expire every edge it created *or reaffirmed*, clear the `summary` of every entity it mentions, remove solely-mentioned entities, hard-delete the episode node. Idempotent, never raises, WARNING on failure. |
+| Exact-provenance cascade | `memory/provenance.py` *(new in PR #225)* | Resolve a memory's Graphiti **episode** by persisted uuid → verbatim content → deterministic name (all exact equality, never fuzzy), then expire everything it contributed: soft-expire every edge it created *or reaffirmed*, clear the `summary` of every entity it mentions, remove solely-mentioned entities, hard-delete the episode node. Idempotent, never raises, WARNING on failure. |
 | Durable memory→episode link | `provenance.py::_persist_graph_episode_ref` | Stamps `graph_episode_uuid` / `graph_episode_name` on the Qdrant row at enrich time via an additive nested-key merge, so lifecycle operations resolve the exact episode instead of guessing. |
 | Cascade wired into lifecycle | `memory/edit.py`, `memory/delete.py` | Tier migration and every delete path call `_cascade_or_fallback_expire`; the substring routine survives only as a loudly-logged last resort, and unresolved rows surface in the task result instead of being silently absorbed. |
-| Backward remediation + audit | `memory/remediation.py` *(new, PR #225)* | `rescope_private_derivatives(user_id, dry_run=True)` derives candidate shared-side groups from `_build_group_id`, resolves each private memory's episode there, and cascades. `audit_private_leakage(user_id)` is a read-only proof across three surfaces (live edges, non-empty entity summaries, raw episode content) plus a clearly-separated heuristic backstop. Dictator-gated, REST + MCP, `dry_run` defaults true. |
-| Write-time sensitivity gate | `memory/sensitivity.py` *(new, PR #225)*, `config.py`, `prompts.py` | A deterministic, zero-LLM-cost regex floor classifies content into `credentials_pii` / `equity_compensation` / `client_commercial` / `financial`, combined with an optional LLM hint parsed from the existing extraction prompt. A match in the configured class set forces `visibility=private` unless the caller both set `visibility` explicitly *and* passed `sensitivity_override=True`. Feature-flagged and per-class — never blanket privacy. |
+| Backward remediation + audit | `memory/remediation.py` *(new in PR #225)* | `rescope_private_derivatives(user_id, dry_run=True)` derives candidate shared-side groups from `_build_group_id`, resolves each private memory's episode there, and cascades. `audit_private_leakage(user_id)` is a read-only proof across three surfaces (live edges, non-empty entity summaries, raw episode content) plus a clearly-separated heuristic backstop. Dictator-gated, REST + MCP, `dry_run` defaults true. |
+| Write-time sensitivity gate | `memory/sensitivity.py` *(new in PR #225)*, `config.py`, `prompts.py` | A deterministic, zero-LLM-cost regex floor classifies content into `credentials_pii` / `equity_compensation` / `client_commercial` / `financial`, combined with an optional LLM hint parsed from the existing extraction prompt. A match in the configured class set forces `visibility=private` unless the caller both set `visibility` explicitly *and* passed `sensitivity_override=True`. Feature-flagged and per-class — never blanket privacy. |
 | Expired artifacts excluded from listings | `memory/graph_admin.py` | `get_graph_nodes` / `get_graph_edges` default-exclude expired/invalidated artifacts using the search path's liveness definition (uncapped, fail-closed node liveness), with an `include_expired=True` operator hatch that is **dictator-only** (403 otherwise) — soft-expire is only as safe as every read path that honors the live filter. |
 | Identity fixes | `main.py`, `memory/reads.py` | Legacy root endpoints resolve identity through `_resolve_user_id` (token wins, mismatch → 400). `get_memory` / `get_reasoning_chain` take a caller id; unreadable maps to 404 and an unreadable premise folds into `missing`, so a chain leaks neither content nor existence. |
 
