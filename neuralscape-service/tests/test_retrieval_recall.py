@@ -335,6 +335,18 @@ class TestHybridFusionOrderSurvivesPoolMerge:
         ids = [r.id for r in results]
         assert ids.index("b") < ids.index("a")  # 0.70 * lift(>1.0) vs 0.75
 
+    def test_merit_merge_equal_keys_keep_incoming_order_not_id_order(self, service):
+        """Equal ordering keys (floor/imputed rows) must keep the incoming
+        fused order; id order is opposite here."""
+        vec = [
+            MemoryResponse(id="z-first", memory="alpha row", score=0.50),
+            MemoryResponse(id="a-second", memory="beta row", score=0.50),
+        ]
+        out = service._deduplicate_responses(
+            vec, [], limit=None, vector_keys={"z-first": 0.7, "a-second": 0.7}
+        )
+        assert [r.id for r in out] == ["z-first", "a-second"]
+
 
 # ══════════════════════════════════════════════
 # Defect 2 — vector/graph weave (ranked hits keep priority)

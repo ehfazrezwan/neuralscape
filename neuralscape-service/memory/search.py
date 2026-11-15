@@ -439,7 +439,9 @@ class SearchMixin:
         salience).
 
         Returns:
-            List of matching memory responses sorted by score.
+            List of matching memory responses ordered by fused rank (RRF order
+            within each pool, rank-transferred onto the cosine scale across
+            pools); displayed scores stay native.
         """
         m = self._get_memory()
         # Lazily ensure keyword/bool payload indexes for the hot-path filters
@@ -1601,7 +1603,9 @@ class SearchMixin:
             seed = vr.score
             if vector_keys is not None and vr.id in vector_keys:
                 seed = vector_keys[vr.id]
-            entries.append({"row": vr, "leg": 0, "fused": float(seed or 0.0)})
+            entries.append(
+                {"row": vr, "leg": 0, "fused": float(seed or 0.0), "pos": len(entries)}
+            )
 
         for rank, gr in enumerate(graph_leg):
             normalized = self.normalize_memory_content(gr.memory)
@@ -1614,7 +1618,9 @@ class SearchMixin:
                 )
                 continue
             norm_to_idx.setdefault(normalized, len(entries))
-            entries.append({"row": gr, "leg": 1, "fused": float(gr.score or 0.0)})
+            entries.append(
+                {"row": gr, "leg": 1, "fused": float(gr.score or 0.0), "pos": 0}
+            )
 
         # Unscored (score=None) rows sort strictly below scored rows even at
         # a fused value of 0.0 — the id tie-break must never lift them.
@@ -1623,6 +1629,10 @@ class SearchMixin:
                 e["row"].score is None and e["fused"] == 0.0,
                 -e["fused"],
                 e["leg"],
+                # Incoming (already fused-ordered) position BEFORE id, so
+                # equal keys keep RRF order / the imputed-first rule (vector leg
+                # only; graph rows keep the documented id tie-break).
+                e["pos"],
                 str(e["row"].id or ""),
             )
         )
