@@ -171,7 +171,7 @@ def test_durable_branch_accepts_an_idempotency_key_without_a_500(durable):
     assert client.post("/v1/memories/raw/batch", json={"memories": [_RAW]}, headers=headers).status_code == 202
     legacy = client.post("/memories/async", json={"messages": [{"role": "user", "content": "hello"}], "user_id": "alice"},
                          headers=headers)
-    assert legacy.status_code == 202
+    assert legacy.status_code == 200 and legacy.json()["task_id"]
 
 
 def test_durable_branch_rejects_an_over_long_idempotency_key(durable):
