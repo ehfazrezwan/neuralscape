@@ -825,6 +825,11 @@ class SearchMixin:
         elif memory_kind == "passage":
             combined = [r for r in combined if r.memory_kind == "passage"]
 
+        # After tenant/visibility/kind filters, never on internal write probes.
+        if not vector_only and settings.hybrid_rerank_enabled:
+            from hybrid_inference import rerank
+
+            combined = rerank(query, combined)
         results = combined[:limit]
 
         # Dreaming: fire-and-forget recall trace (reinforcement signal for

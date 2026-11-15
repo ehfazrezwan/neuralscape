@@ -40,6 +40,20 @@ class Settings(BaseSettings):
     # Matryoshka prefix (see docs/GRAPH_EMBEDDING_DIMENSION.md).
     graphiti_embedding_dim: int = Field(default=1024, ge=1)
 
+    # Hybrid experiments are independently opt-in; each needs its flag plus an endpoint and key.
+    hybrid_inference_api_key: str = Field(default="", repr=False)
+    # No default endpoint or model: a flag alone, or a key alone, activates nothing.
+    hybrid_inference_endpoint: str = ""
+    hybrid_inference_model: str = ""
+    hybrid_threshold: float = Field(default=0.9, ge=0.5, le=1)
+    hybrid_timeout_s: float = Field(default=2.0, gt=0, le=30)
+    hybrid_graph_enabled: bool = False
+    hybrid_categories_enabled: bool = False
+    hybrid_extraction_enabled: bool = False
+    hybrid_extraction_deadline_s: float = Field(default=2.5, gt=0, le=30)
+    hybrid_rerank_enabled: bool = False
+    hybrid_rerank_limit: int = Field(default=32, ge=1, le=64)
+    hybrid_rerank_policy: str = "Prefer direct evidence answering the query; respect explicit versions and dates in the query. Do not confuse topical overlap with an answer."
     # ── LLM gateway (OpenAI-compatible) ───────────────────────────────
     # When enabled, the LLM + embedder (and the graphiti reranker) route
     # through an OpenAI-compatible gateway (e.g. an internal Vertex-via-ADC
@@ -1198,6 +1212,12 @@ class Settings(BaseSettings):
                     "password": self.neo4j_password,
                     "database": self.neo4j_database,
                     **graphiti_models,
+                    "graphiti_hybrid_enabled": self.hybrid_graph_enabled,
+                    "graphiti_hybrid_api_key": self.hybrid_inference_api_key,
+                    "graphiti_hybrid_endpoint": self.hybrid_inference_endpoint,
+                    "graphiti_hybrid_model": self.hybrid_inference_model,
+                    "graphiti_hybrid_threshold": self.hybrid_threshold,
+                    "graphiti_hybrid_timeout": self.hybrid_timeout_s,
                     "store_raw_episode_content": self.store_raw_episode_content,
                     "update_communities": self.update_communities,
                 },
