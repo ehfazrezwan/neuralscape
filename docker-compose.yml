@@ -1,11 +1,15 @@
+# Every published port is bound to 127.0.0.1: nothing here is reachable from
+# another machine unless you put a proxy/tunnel in front on purpose (see
+# docker-compose.prod.yml for Caddy, and the `tunnel` profile for cloudflared).
+# NEO4J_PASSWORD has no default: set a strong one in .env before `up`.
 services:
   neo4j:
     image: neo4j:5-community
     ports:
-      - "7474:7474"
-      - "7687:7687"
+      - "127.0.0.1:7474:7474"
+      - "127.0.0.1:7687:7687"
     environment:
-      NEO4J_AUTH: neo4j/${NEO4J_PASSWORD:-neuralscape}
+      NEO4J_AUTH: neo4j/${NEO4J_PASSWORD:?required}
       NEO4J_initial_dbms_default__database: ${NEO4J_DATABASE:-memory}
     volumes:
       - neo4j_data:/data
@@ -20,7 +24,7 @@ services:
         max-size: "10m"
         max-file: "3"
     healthcheck:
-      test: ["CMD", "cypher-shell", "-u", "neo4j", "-p", "${NEO4J_PASSWORD:-neuralscape}", "RETURN 1"]
+      test: ["CMD", "cypher-shell", "-u", "neo4j", "-p", "${NEO4J_PASSWORD:?required}", "RETURN 1"]
       interval: 10s
       timeout: 5s
       retries: 10
@@ -28,7 +32,7 @@ services:
   redis:
     image: redis:7.4-alpine  # pinned to the 7.4 minor series for license clarity (the :7 tag floats across the RSALv2/SSPLv1 boundary at 7.4), not for byte-reproducibility — see THIRD_PARTY_NOTICES.md; Valkey is the BSD fallback
     ports:
-      - "6379:6379"
+      - "127.0.0.1:6379:6379"
     volumes:
       - redis_data:/data
     restart: unless-stopped
@@ -50,8 +54,8 @@ services:
   qdrant:
     image: qdrant/qdrant:v1.15.0
     ports:
-      - "6333:6333"
-      - "6334:6334"
+      - "127.0.0.1:6333:6333"
+      - "127.0.0.1:6334:6334"
     volumes:
       - qdrant_data:/qdrant/storage
     restart: unless-stopped
@@ -72,13 +76,14 @@ services:
 
   # ── Docling document converter ──────────────────────────────────
   # Converts rich formats (PDF, MS Office docx/xlsx/pptx, HTML, …) to Markdown
-  # for the ingest worker. The preferred, AI-grade extractor; when it's down or
+  # for the ingest worker. Pinned to a release (+digest): :latest would change the
+  # parser under the ingest pipeline on any `docker compose pull`; bump on purpose. The preferred, AI-grade extractor; when it's down or
   # DOCLING_ENABLED=false the worker falls back to the in-process MarkItDown
   # parser, so ingestion degrades rather than failing. CPU/RAM-heavy (ML models).
   docling:
-    image: ghcr.io/docling-project/docling-serve:latest
+    image: ghcr.io/docling-project/docling-serve:v1.38.2@sha256:8a5fbc993da9dec17c53880e2445834591ad26800ef698ca64096bef29671808
     ports:
-      - "5001:5001"
+      - "127.0.0.1:5001:5001"
     restart: unless-stopped
     deploy:
       resources:
@@ -106,7 +111,7 @@ services:
       context: cbm-bridge
       dockerfile: Dockerfile
     ports:
-      - "8200:8200"
+      - "127.0.0.1:8200:8200"
     restart: unless-stopped
     environment:
       CBM_BIN: /usr/local/bin/cbm
@@ -133,7 +138,7 @@ services:
     labels:
       com.neuralscape.autoheal: "true"
     profiles:
-      - cbm  # Only starts when --profile cbm is specified
+      - cbm  # Only starts when --profile cbm is specified; also set CBM_ENABLED=true in .env
 
   # ── Precise Neighbors Resolver ──────────────────────────────────────
   # REST shim over pyright-langserver (pyright, MIT): resolves a repo's call
@@ -150,12 +155,13 @@ services:
       context: resolver-svc
       dockerfile: Dockerfile
     ports:
-      - "8201:8201"
+      - "127.0.0.1:8201:8201"
     restart: unless-stopped
     environment:
       PORT: 8201
       PYRIGHT_SETTLE_SECONDS: ${PYRIGHT_SETTLE_SECONDS:-2.0}
-      RESOLVER_TIMEOUT: ${RESOLVER_TIMEOUT:-600}
+      # Per-definition LSP deadline (resolver-svc/main.py reads RESOLVER_REQUEST_TIMEOUT, default 30).
+      RESOLVER_REQUEST_TIMEOUT: ${RESOLVER_REQUEST_TIMEOUT:-30}
     deploy:
       resources:
         limits:
@@ -174,7 +180,7 @@ services:
     labels:
       com.neuralscape.autoheal: "true"
     profiles:
-      - resolver  # Only starts when --profile resolver is specified
+      - resolver  # Only starts when --profile resolver is specified; also set CODE_NEIGHBORS_RESOLVER=lsp in .env
 
   neuralscape:
     build:
@@ -182,7 +188,7 @@ services:
       dockerfile: neuralscape-service/Dockerfile
       target: runtime
     ports:
-      - "8199:8199"
+      - "127.0.0.1:8199:8199"
     depends_on:
       neo4j:
         condition: service_healthy
@@ -197,13 +203,22 @@ services:
       MEM0_TELEMETRY: ${MEM0_TELEMETRY:-false}
       GRAPHITI_TELEMETRY_ENABLED: ${GRAPHITI_TELEMETRY_ENABLED:-false}
       NEO4J_URI: neo4j://neo4j:7687
-      NEO4J_PASSWORD: ${NEO4J_PASSWORD:-neuralscape}
+      NEO4J_PASSWORD: ${NEO4J_PASSWORD:?required}
       NEO4J_DATABASE: ${NEO4J_DATABASE:-memory}
       QDRANT_URL: http://qdrant:6333
       REDIS_URL: redis://redis:6379
       GEMINI_LLM_MODEL: ${GEMINI_LLM_MODEL:-gemini-3.1-flash-lite}
       GEMINI_EMBEDDER_MODEL: ${EMBEDDING_MODEL_NAME:-gemini-embedding-001}
       MCP_TRANSPORT: http
+      # Optional code-graph engines (compose profiles `cbm` / `resolver`; both off by
+      # default). Starting the profile alone does nothing: the API ALSO needs the
+      # matching switch below in .env, then restart the API + ingest worker.
+      #   --profile cbm       + CBM_ENABLED=true               (registers the code-cbm engine)
+      #   --profile resolver  + CODE_NEIGHBORS_RESOLVER=lsp    (precise call-graph neighbors)
+      CBM_ENABLED: ${CBM_ENABLED:-false}
+      CBM_BRIDGE_URL: ${CBM_BRIDGE_URL:-http://cbm-bridge:8200}
+      CODE_NEIGHBORS_RESOLVER: ${CODE_NEIGHBORS_RESOLVER:-jedi}
+      CODE_RESOLVER_URL: ${CODE_RESOLVER_URL:-http://resolver-svc:8201}
       OBSIDIAN_VAULT_PATH: /data/vault
       # Concurrency levers (default to today's behavior; raised for the hardened profile via env)
       UVICORN_WORKERS: ${UVICORN_WORKERS:-1}
@@ -278,7 +293,7 @@ services:
       MEM0_TELEMETRY: ${MEM0_TELEMETRY:-false}
       GRAPHITI_TELEMETRY_ENABLED: ${GRAPHITI_TELEMETRY_ENABLED:-false}
       NEO4J_URI: neo4j://neo4j:7687
-      NEO4J_PASSWORD: ${NEO4J_PASSWORD:-neuralscape}
+      NEO4J_PASSWORD: ${NEO4J_PASSWORD:?required}
       NEO4J_DATABASE: ${NEO4J_DATABASE:-memory}
       QDRANT_URL: http://qdrant:6333
       REDIS_URL: redis://redis:6379
@@ -327,7 +342,7 @@ services:
       MEM0_TELEMETRY: ${MEM0_TELEMETRY:-false}
       GRAPHITI_TELEMETRY_ENABLED: ${GRAPHITI_TELEMETRY_ENABLED:-false}
       NEO4J_URI: neo4j://neo4j:7687
-      NEO4J_PASSWORD: ${NEO4J_PASSWORD:-neuralscape}
+      NEO4J_PASSWORD: ${NEO4J_PASSWORD:?required}
       NEO4J_DATABASE: ${NEO4J_DATABASE:-memory}
       QDRANT_URL: http://qdrant:6333
       REDIS_URL: redis://redis:6379
@@ -386,7 +401,7 @@ services:
       MEM0_TELEMETRY: ${MEM0_TELEMETRY:-false}
       GRAPHITI_TELEMETRY_ENABLED: ${GRAPHITI_TELEMETRY_ENABLED:-false}
       NEO4J_URI: neo4j://neo4j:7687
-      NEO4J_PASSWORD: ${NEO4J_PASSWORD:-neuralscape}
+      NEO4J_PASSWORD: ${NEO4J_PASSWORD:?required}
       NEO4J_DATABASE: ${NEO4J_DATABASE:-memory}
       QDRANT_URL: http://qdrant:6333
       REDIS_URL: redis://redis:6379
@@ -397,6 +412,11 @@ services:
       INGEST_STORAGE_DIR: /data/ingest
       DOCLING_ENABLED: ${DOCLING_ENABLED:-true}
       DOCLING_URL: ${DOCLING_URL:-http://docling:5001}
+      # Code-index jobs (process_code_index) run on this worker: same switches as the API.
+      CBM_ENABLED: ${CBM_ENABLED:-false}
+      CBM_BRIDGE_URL: ${CBM_BRIDGE_URL:-http://cbm-bridge:8200}
+      CODE_NEIGHBORS_RESOLVER: ${CODE_NEIGHBORS_RESOLVER:-jedi}
+      CODE_RESOLVER_URL: ${CODE_RESOLVER_URL:-http://resolver-svc:8201}
       # Visual setup exemplars (trading adapter; dark by default). When enabled,
       # PDF chart images are extracted, vision-described, and stored here.
       EXEMPLAR_STORE_ENABLED: ${EXEMPLAR_STORE_ENABLED:-false}
@@ -441,7 +461,7 @@ services:
   # terminate at Cloudflare's edge. The Windows host never needs an
   # open port 80/443.
   cloudflared:
-    image: cloudflare/cloudflared:latest
+    image: cloudflare/cloudflared:2026.10.7@sha256:4955524aeaa379e154023d5a027c250f7b35041a2e7e950cf13f144bc9b9c5ba
     profiles: ["tunnel"]
     command: tunnel --no-autoupdate run
     environment:
@@ -495,7 +515,7 @@ services:
       MEM0_TELEMETRY: ${MEM0_TELEMETRY:-false}
       GRAPHITI_TELEMETRY_ENABLED: ${GRAPHITI_TELEMETRY_ENABLED:-false}
       NEO4J_URI: neo4j://neo4j:7687
-      NEO4J_PASSWORD: ${NEO4J_PASSWORD:-neuralscape}
+      NEO4J_PASSWORD: ${NEO4J_PASSWORD:?required}
       NEO4J_DATABASE: ${NEO4J_DATABASE:-memory}
       QDRANT_URL: http://qdrant:6333
       REDIS_URL: redis://redis:6379
@@ -520,15 +540,20 @@ services:
   # stay wedged/unresponsive until a manual restart. Scoped by a reverse-DNS
   # label (NOT "all") so it never touches unrelated containers on the host.
   autoheal:
-    # Pinned by digest: this container has the Docker socket (root-equivalent on
-    # the host), so a mutable :latest tag is a supply-chain risk. Digest is
-    # willfarrell/autoheal:latest as of 2026-06-29; bump deliberately.
+    # Pinned by digest: this container restarts other containers, so a mutable
+    # :latest tag is a supply-chain risk. Digest is willfarrell/autoheal:latest as
+    # of 2026-06-29; bump deliberately. It does NOT mount the Docker socket: it
+    # talks to `docker-socket-proxy` below over an internal network (DOCKER_SOCK
+    # accepts a tcp:// endpoint; see the image's docker-entrypoint).
     image: willfarrell/autoheal@sha256:3fd4d591075224304e95d92af8619adda1fe6e1469587e8b5230d946b0926f00
     restart: unless-stopped
-    # Only needs the Docker Unix socket; no webhook/notifications are
-    # configured, so deny it network access entirely.
-    network_mode: "none"
+    # Internal network only (no route out): the sole peer it can reach is the proxy.
+    networks:
+      - autoheal-net
+    depends_on:
+      - docker-socket-proxy
     environment:
+      DOCKER_SOCK: tcp://docker-socket-proxy:2375
       AUTOHEAL_CONTAINER_LABEL: com.neuralscape.autoheal  # only this stack's containers
       AUTOHEAL_INTERVAL: "15"                  # seconds between health polls
       AUTOHEAL_START_PERIOD: "90"              # sidecar's own boot delay before it polls
@@ -542,13 +567,50 @@ services:
       # slow-stopping container is logged "failed" and retried in a churn loop
       # (the bug that left the wedged API unrestarted). 60s gives ample headroom.
       CURL_TIMEOUT: "60"
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
     logging:
       driver: "json-file"
       options:
         max-size: "10m"
         max-file: "3"
+
+  # ── Docker socket proxy (for autoheal) ──────────────────────────
+  # The only container that touches /var/run/docker.sock. autoheal needs exactly
+  # two calls, and ops/docker-socket-proxy.haproxy.cfg (mounted over the image's
+  # config) allows only those: GET /containers/json and POST /containers/<id>/restart.
+  # Everything else, including container create/start, exec, images, volumes and
+  # networks, hits the final deny. (The stock env switches could not do this: with
+  # CONTAINERS=1 + POST=1 every container POST, create and start included, is
+  # allowed, which would be root on the host for anything that can reach the proxy.)
+  # Residual risk: the socket is still mounted here, so a bug in HAProxy or in this
+  # config is a Docker-API escape; the proxy listens only on autoheal-net, an
+  # internal network whose only other member is autoheal, with no route out and no
+  # published port. The mount is :ro, which does not restrict API calls on a socket.
+  # Pinned to v0.5.0 by digest; bump deliberately and re-diff the config's
+  # global/defaults sections against the new upstream haproxy.cfg.
+  docker-socket-proxy:
+    image: tecnativa/docker-socket-proxy:v0.5.0@sha256:1f5038b54f06c3e18422902cf00ba21803d1c97805aae032e5e6673d532d3459
+    restart: unless-stopped
+    networks:
+      - autoheal-net
+    environment:
+      DISABLE_IPV6: "1"      # bind :2375 on IPv4 only (works on hosts without IPv6)
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./ops/docker-socket-proxy.haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg.template:ro
+    deploy:
+      resources:
+        limits:
+          memory: 64M
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+networks:
+  # No external connectivity: autoheal <-> docker-socket-proxy only.
+  autoheal-net:
+    internal: true
 
 volumes:
   neo4j_data:

@@ -12,19 +12,43 @@ services:
     ports: !override []
   docling:
     profiles: ["ingest-heavy"]   # off by default on the VPS (4G container)
+    ports: !override []
+  cbm-bridge:
+    ports: !override []
+  resolver-svc:
+    ports: !override []
   # Pin the four app services to the deployed image (falls back to ghcr :latest).
   # Without this, a plain `docker compose up -d` on the box (any restart/recovery
   # that omits docker-compose.deploy.yml) silently falls back to the base `build:`
   # path and reuses a stale local build-tag - which is exactly how prod once
   # reverted to a 2-month-old image. `build:` in the base file still serves local
   # dev; here the image always wins.
+  #
+  # `pull_policy: never`: deploy.yml docker-loads the exact sha image and tags it
+  # :latest LOCALLY on purpose, so a plain `docker compose up -d` recovers onto
+  # it. The registry's :latest is a different, unreviewed image: with the default
+  # policy a manual `docker compose pull` (or `up --pull always`) would replace the
+  # deployed build with whatever ghcr currently serves as :latest. `never` makes
+  # every pull a no-op for these services. Only the deploy workflow introduces an
+  # image, by `docker load` + NS_IMAGE.
   neuralscape:
     image: ${NS_IMAGE:-ghcr.io/ehfazrezwan/neuralscape:latest}
+    pull_policy: never
     ports: !override
       - "127.0.0.1:8199:8199"
   neuralscape-worker:
     image: ${NS_IMAGE:-ghcr.io/ehfazrezwan/neuralscape:latest}
+    pull_policy: never
   neuralscape-graph-worker:
     image: ${NS_IMAGE:-ghcr.io/ehfazrezwan/neuralscape:latest}
+    pull_policy: never
+  # Docling is behind the `ingest-heavy` profile above, so by default there is NO
+  # converter on the box. The base file says DOCLING_ENABLED=true, which would make
+  # every rich-format ingest dial a host that does not exist, then fall back to
+  # MarkItDown. Say what is true instead: off unless the operator turns BOTH on
+  # (set DOCLING_ENABLED=true in .env AND start `--profile ingest-heavy`).
   neuralscape-ingest-worker:
     image: ${NS_IMAGE:-ghcr.io/ehfazrezwan/neuralscape:latest}
+    pull_policy: never
+    environment:
+      DOCLING_ENABLED: ${DOCLING_ENABLED:-false}

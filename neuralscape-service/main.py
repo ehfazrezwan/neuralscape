@@ -280,6 +280,17 @@ async def health_live():
     return {"status": "alive"}
 
 
+def _vector_store_capabilities() -> dict:
+    """Non-failing /health field: what the vector store can do (BM25 slot)."""
+    try:
+        caps = _service.vector_store_capabilities()
+        if isinstance(caps, dict):
+            return caps
+    except Exception:
+        logger.debug("vector_store_capabilities failed", exc_info=True)
+    return {"bm25_sparse": None, "bm25_encoder": None}
+
+
 @app.get("/health")
 async def health():
     """Health check that verifies backend connectivity.
@@ -375,6 +386,7 @@ async def health():
         "status": overall,
         "service": "neuralscape-memory",
         "checks": checks,
+        "vector_store": _vector_store_capabilities(),
     }
     if knowledge_systems:
         response_data["knowledge_systems"] = knowledge_systems

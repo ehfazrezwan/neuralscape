@@ -34,6 +34,14 @@ it. The ARQ workers likewise open no inbound port.
    connector UI is OAuth-only). **It does not change** when you switch login
    providers.
 
+   Refresh tokens are single-use and bound to the client that got them. Each
+   refresh returns a new token in the same family. If an already-used refresh
+   token is presented again, the whole family is revoked and the user reconnects.
+   There is no grace window, so a client that retries a refresh after a lost
+   response also has its session revoked (OAuth 2.0 Security BCP reuse
+   detection). The single-use and revocation markers live in Redis; if Redis is
+   down, `/oauth/token` answers 503 `temporarily_unavailable` and issues nothing.
+
 2. **The human-login step** — the one screen inside `/oauth/authorize` where a
    person proves who they are. This is the *only* thing `AUTH_PROVIDER` swaps.
 
@@ -146,7 +154,7 @@ cannot be read, per-user tokens are rejected (fail closed). Limits, plainly:
 - Revoking needs an env edit and a restart.
 - It covers the exact token string only.
 - OAuth refresh tokens and sessions already minted from a leaked token are not
-  revoked (refresh rotation is a separate change).
+  revoked (refresh tokens are single-use; see the OAuth layer above).
 - Rotate `NEURALSCAPE_USER_TOKEN_SECRET` to invalidate every token.
 - Existing non-expiring tokens keep verifying unless revoked or the secret rotates.
 

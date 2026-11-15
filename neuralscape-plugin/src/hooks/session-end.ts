@@ -16,13 +16,13 @@ import { commitClaudeCodeFlush } from "../adapters/claude-code.js";
 import {
   detectClient,
   getSessionEndExtractor,
+  resolveEventProjectId,
   getTurnExtractor,
 } from "../adapters/detect.js";
 import { triggerCompile } from "../core/compile.js";
 import { flushTurns } from "../core/flush.js";
 import { type LockHandle, withTranscriptLock } from "../core/transcript-lock.js";
 import {
-  getProjectId,
   hasUserId,
   isProjectExcluded,
   logError,
@@ -44,9 +44,9 @@ async function main(): Promise<void> {
     const raw = (await parseStdin()) as Record<string, unknown>;
 
     // Excluded projects (D4): no conversation capture leaves an excluded project.
-    if (isProjectExcluded(getProjectId(raw.cwd as string | undefined))) return;
-
     const client = detectClient(raw);
+    if (isProjectExcluded(resolveEventProjectId(raw, client))) return;
+
 
     // Claude Code: flush all turns from transcript before compiling.
     // The offset commit is bounded by the flush RESULT (audit 27 #34b):

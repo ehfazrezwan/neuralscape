@@ -12,9 +12,15 @@ config, not code"). The preference map is a plain dict, layered:
       → settings `code_op_preference`  (deployment override, env-driven)
         → DEFAULT_CODE_OP_PREFERENCE  (the measured winners below)
 
-The default map is **seeded from the MEASURED per-op winners** in
-`ICE_V2_ENGINE_COMPARISON.md` (through-NS, small-py, post-residuals) — accuracy is
-the PRIMARY key, latency the tiebreak — NOT invented:
+The default map is **seeded from the MEASURED per-op winners** of an
+unpublished internal benchmark run (ICE v2 engine comparison, 2026-07-10:
+through-NS, small-py corpus, post-residuals, warm graph; the report is not in
+this repository) — accuracy is the PRIMARY key, latency the tiebreak — NOT
+invented. The only published measurement, the older v1 report
+`docs/ice-benchmark/ICE_BENCH_REPORT-ice-final.md` (2026-07-08, direct-path
+`ns-ice`, native symbol_lookup 0.000), predates the through-NS routing and the
+scorer alignment, so it is not the source of these numbers. Re-measuring is
+parked; override per deployment with CODE_OP_PREFERENCE:
 
     query (symbol_lookup)  native 0.983 > cbm 0.517 > graphify 0.00 (traversal)
     neighbors              graphify 0.68 R @ 3.5 ms > cbm 0.40 R > native ~0
@@ -26,7 +32,7 @@ Op-classes are the internal names (`query|neighbors|path|locate|impact`) the
 router/`CodeKnowledgeSystem` operate on. Bench op names (`symbol_lookup`, …) are
 aliased for robustness.
 
-**NEVER branches on `transport`** (DECISIONS.md cross-cutting rule) — resolution
+**NEVER branches on `transport`** (a cross-cutting design rule of the code-intel work) — resolution
 is over registry entries (name, declared capabilities, health), transport-agnostic.
 """
 
