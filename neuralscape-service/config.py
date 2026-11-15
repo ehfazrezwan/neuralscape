@@ -2,6 +2,7 @@ import json
 import logging
 import math
 import os
+import re
 from pathlib import Path
 from typing import Annotated, Literal
 from urllib.parse import urlparse
@@ -283,6 +284,13 @@ class Settings(BaseSettings):
     connectors_enabled: bool = False
     vault_key: str = ""  # NEURALSCAPE_VAULT_KEY — required when connectors_enabled
     connector_sync_cron_hours: int = 6  # interval (hours) the sync cron fires
+    # Comma-separated exact command lines an MCP connector may spawn on the
+    # worker over the stdio transport (so an entry cannot itself contain a comma).
+    # Each entry is shell-quoted; it is normalised (shlex split + join) before
+    # comparison with the connector's command + args. Empty (default) disables
+    # stdio entirely. Allowlisting a general interpreter
+    # (python, node, npx, sh ...) is equivalent to allowing arbitrary code.
+    connector_stdio_commands: str = ""
 
     # ── Document/file ingestion ───────────────────────────────────────
     # Rich formats (PDF, MS Office docx/xlsx/pptx, HTML, …) are converted to
@@ -453,6 +461,18 @@ class Settings(BaseSettings):
     # all requests must present this exact token in `Authorization: Bearer ...` and
     # user_id is taken from the request body (trust-based, single-team or single-user).
     neuralscape_api_key: str = ""
+    # Identity the legacy shared key acts as (NEURALSCAPE_API_KEY_USER_ID). Empty
+    # means `default_user_id`. A caller presenting the shared key is bound to this
+    # one user: a body/query user_id naming anyone else gets HTTP 400, and MCP
+    # ignores `arguments["user_id"]` (same as for per-user tokens).
+    neuralscape_api_key_user_id: str = ""
+    # Opt-out (NEURALSCAPE_LEGACY_KEY_TRUST_BODY_USER_ID=true): restore the
+    # pre-binding behaviour where a shared-key caller may act as any body user_id.
+    neuralscape_legacy_key_trust_body_user_id: bool = False
+    # Revoked per-user tokens (NEURALSCAPE_REVOKED_TOKENS): CSV of SHA-256 hex
+    # digests of tokens to reject with 401. Get a digest with
+    # `python scripts/revoke_token.py <token>`. Empty = no revocation.
+    neuralscape_revoked_tokens: str = ""
     # Multi-user HMAC-signed tokens. When set, the server also accepts tokens of the
     # form `{base64url(payload)}.{hmac_sha256(secret, payload)}` where payload is
     # `{"user_id": "...", "exp": <unix-ts>}`. The verified user_id is attached to
@@ -882,10 +902,36 @@ class Settings(BaseSettings):
         """True iff `user_id` is an authorized dictator (may write standards)."""
         return bool(user_id) and user_id in self.dictator_user_ids_set()
 
+    def connector_stdio_commands_set(self) -> set[str]:
+        """Parsed CSV of exact stdio command lines connectors may spawn."""
+        import shlex
+
+        out: set[str] = set()
+        for entry in self.connector_stdio_commands.split(","):
+            try:
+                parts = shlex.split(entry)
+            except ValueError:
+                continue  # unbalanced quote: never matches rather than matching loosely
+            if parts:
+                out.add(shlex.join(parts))
+        return out
+
     # ── sensitivity gate helpers ──────────────────────────────────────────
     def sensitivity_private_classes_set(self) -> set[str]:
         """Parsed CSV of sensitivity classes that force `visibility=private`."""
         return {c.strip() for c in self.sensitivity_private_classes.split(",") if c.strip()}
+
+    def legacy_key_identity(self) -> str:
+        """User id the legacy shared key is bound to (empty setting -> default user)."""
+        return self.neuralscape_api_key_user_id.strip() or self.default_user_id
+
+    def revoked_token_digests(self) -> set[str]:
+        """Parsed ``NEURALSCAPE_REVOKED_TOKENS`` (lowercased SHA-256 hex digests)."""
+        return {
+            d.strip().lower()
+            for d in self.neuralscape_revoked_tokens.split(",")
+            if d.strip()
+        }
 
     def validate_required(self) -> None:
         """Validate that all required configuration fields are set.
@@ -939,6 +985,13 @@ class Settings(BaseSettings):
                 errors.append(
                     "SUPABASE_URL and SUPABASE_ANON_KEY are required when AUTH_PROVIDER=supabase"
                 )
+        if self.neuralscape_api_key_user_id.strip() and not re.match(
+            r"^[a-zA-Z0-9_.\-]{1,100}$", self.neuralscape_api_key_user_id.strip()
+        ):
+            errors.append(
+                "NEURALSCAPE_API_KEY_USER_ID must be 1-100 characters of letters, "
+                "digits, '_', '.' or '-'"
+            )
         # Auth is fail-closed: with no credential configured, the API would be
         # open to anyone who can reach it, so refuse to start unless the
         # operator explicitly opted out.
@@ -962,7 +1015,14 @@ class Settings(BaseSettings):
                 "on a trusted local machine; set NEURALSCAPE_USER_TOKEN_SECRET for any "
                 "shared or network-reachable deployment."
             )
-        elif self.neuralscape_auth_disabled:
+        if self.neuralscape_api_key and self.neuralscape_legacy_key_trust_body_user_id:
+            _logger.warning(
+                "NEURALSCAPE_LEGACY_KEY_TRUST_BODY_USER_ID=true: the legacy shared "
+                "NEURALSCAPE_API_KEY may act as ANY user named in a request body or "
+                "query. Prefer per-user tokens, or leave this off so the key is bound "
+                "to NEURALSCAPE_API_KEY_USER_ID (default: DEFAULT_USER_ID). See AUTH.md"
+            )
+        if auth_configured and self.neuralscape_auth_disabled:
             _logger.warning(
                 "NEURALSCAPE_AUTH_DISABLED=true is ignored because an auth secret is "
                 "configured; authentication stays enabled."
