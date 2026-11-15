@@ -30,6 +30,7 @@ import asyncio
 import threading
 import uuid
 
+import third_party_telemetry  # noqa: F401  (must precede any mem0/graphiti import; see tests/test_third_party_telemetry.py)
 import pytest
 
 DIMS = 768  # embedding_dims in Settings.get_mem0_config() for the Gemini embedder
