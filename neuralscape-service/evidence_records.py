@@ -365,6 +365,22 @@ class ReadResult:
     records: tuple[EvidenceRecord, ...]
     invalid_lines: tuple[int, ...]   # 1-based line numbers that did not validate
     partial_tail: bool               # the file ends without a newline (an interrupted append)
+    duplicate_key_lines: tuple[int, ...] = ()   # invalid lines that repeat a JSON key (also listed in invalid_lines)
+
+
+class _DuplicateKey(ValueError):
+    """A JSON object repeats a key: the writer never does this, so the line is corrupt or edited."""
+
+
+def _refuse_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    keys = [key for key, _value in pairs]
+    if len(set(keys)) != len(keys):
+        raise _DuplicateKey("duplicate key")
+    return dict(pairs)
+
+
+# JSON whitespace only: a line of anything else (a no-break space, a form feed, U+2028) is damage, not a blank line.
+_JSON_BLANK = b" \t\r"
 
 
 def _history_allows(record: EvidenceRecord, accepted: Mapping[str, EvidenceRecord]) -> bool:
@@ -530,16 +546,20 @@ class EvidenceWriter:
         records: list[EvidenceRecord] = []
         accepted: dict[str, EvidenceRecord] = {}
         invalid: list[int] = []
+        duplicates: list[int] = []
         for number, chunk in enumerate(raw.split(b"\n"), start=1):
-            if not chunk.strip():
+            if not chunk.strip(_JSON_BLANK):
                 continue
             try:
                 # strict, per line: a replacement character would let corrupted text pass as a valid field
                 line = chunk.decode("utf-8")
-                if not line.strip():
-                    continue
+                json.loads(line, object_pairs_hook=_refuse_duplicate_keys)   # last-wins would hide a changed value
                 record = EvidenceRecord.model_validate_json(line)
-            except (ValidationError, ValueError):   # UnicodeDecodeError is a ValueError
+            except _DuplicateKey:
+                invalid.append(number)
+                duplicates.append(number)
+                continue
+            except (ValidationError, ValueError, RecursionError):   # UnicodeDecodeError is a ValueError
                 invalid.append(number)
                 continue
             if not _history_allows(record, accepted):
@@ -547,7 +567,7 @@ class EvidenceWriter:
                 continue
             accepted[record.record_id] = record
             records.append(record)
-        return ReadResult(tuple(records), tuple(invalid), partial_tail)
+        return ReadResult(tuple(records), tuple(invalid), partial_tail, tuple(duplicates))
 
     def write(self, record: EvidenceRecord) -> bool:
         """Append ``record``; ``False`` when an identical record is already present.
