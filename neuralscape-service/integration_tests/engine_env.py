@@ -9,9 +9,8 @@ the gate (``NS_TEST_PG_DSN``, ``QDRANT_URL``, ``NEO4J_URI``, ``NEO4J_PASSWORD``)
   Neo4j                   ENGINE_TEST_NEO4J_URI    or NEO4J_URI
                           ENGINE_TEST_NEO4J_PASSWORD or NEO4J_PASSWORD (default ``neo4j``)
 
-A test that needs a store that is not configured FAILS when ``NS_INTEGRATION_REQUIRED`` is
-set (the gate) or on GitHub Actions, and SKIPS with the reason everywhere else.  It never
-passes silently.  The stores must be disposable: the Neo4j tests wipe the database.
+The fail-or-skip rule is the directory's own (``conftest.unavailable``): FAIL when
+``NS_INTEGRATION_REQUIRED`` is set (the gate) or on GitHub Actions, SKIP with the reason elsewhere.  The stores must be disposable: the Neo4j tests wipe the database.
 """
 
 from __future__ import annotations
@@ -20,7 +19,6 @@ import os
 import sys
 from pathlib import Path
 
-import pytest
 
 SERVICE_ROOT = Path(__file__).resolve().parent.parent
 if str(SERVICE_ROOT) not in sys.path:
@@ -46,10 +44,23 @@ NEO4J_URI = _first("ENGINE_TEST_NEO4J_URI", "NEO4J_URI")
 NEO4J_PASSWORD = _first("ENGINE_TEST_NEO4J_PASSWORD", "NEO4J_PASSWORD") or "neo4j"
 
 
+def _convention():
+    """The directory's own helpers (``conftest.unavailable``): one fail-or-skip rule for every integration test."""
+
+    import importlib.util
+
+    name = "_ns_integration_conftest"
+    if name in sys.modules:
+        return sys.modules[name]
+    spec = importlib.util.spec_from_file_location(name, Path(__file__).with_name("conftest.py"))
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module  # dataclasses in the module resolve their annotations through it
+    spec.loader.exec_module(module)
+    return module
+
+
 def integration_required() -> bool:
-    if os.environ.get("GITHUB_ACTIONS", "").strip().lower() == "true":
-        return True
-    return os.environ.get("NS_INTEGRATION_REQUIRED", "").strip().lower() in {"1", "true", "yes", "on"}
+    return _convention().integration_required()
 
 
 def require_env(**configured: object) -> None:
@@ -59,9 +70,5 @@ def require_env(**configured: object) -> None:
     """
 
     missing = [name for name, value in configured.items() if not value]
-    if not missing:
-        return
-    reason = f"{', '.join(missing)} not configured for the engine integration tests"
-    if integration_required():
-        pytest.fail(f"NS_INTEGRATION_REQUIRED is set but {reason}", pytrace=False)
-    pytest.skip(reason)
+    if missing:
+        _convention().unavailable(f"{', '.join(missing)} not configured for the engine integration tests")
