@@ -3609,11 +3609,12 @@ class TestBulkDeleteSharedProtection:
 
     def test_filtered_delete_skips_shared_by_default(self, service):
         """Even with a category filter, shared writes survive by default."""
-        from schemas import MemoryResponse
-        service.list_memories = MagicMock(return_value=[
-            MemoryResponse(id="t-priv", memory="x", visibility="private"),
-            MemoryResponse(id="t-share", memory="x", visibility="shared"),
-        ])
+        # The filtered sweep lists RAW mem0 dicts (so tombstones and page size stay visible).
+        service._ensure_filter_indexes = MagicMock()
+        service._memory.get_all.return_value = {"results": [
+            {"id": "t-priv", "memory": "x", "metadata": {"metadata": {"visibility": "private"}}},
+            {"id": "t-share", "memory": "x", "metadata": {"metadata": {"visibility": "shared"}}},
+        ]}
         service._memory.get.return_value = {"memory": "x", "metadata": {}}
         service._memory.delete = MagicMock()
         result = service.delete_memories(user_id="alice", category="tech_stack")
@@ -3622,11 +3623,12 @@ class TestBulkDeleteSharedProtection:
         assert "preserved 1 shared" in result["message"]
 
     def test_filtered_delete_with_include_shared_true_removes_shared(self, service):
-        from schemas import MemoryResponse
-        service.list_memories = MagicMock(return_value=[
-            MemoryResponse(id="t-priv", memory="x", visibility="private"),
-            MemoryResponse(id="t-share", memory="x", visibility="shared"),
-        ])
+        # The filtered sweep lists RAW mem0 dicts (so tombstones and page size stay visible).
+        service._ensure_filter_indexes = MagicMock()
+        service._memory.get_all.return_value = {"results": [
+            {"id": "t-priv", "memory": "x", "metadata": {"metadata": {"visibility": "private"}}},
+            {"id": "t-share", "memory": "x", "metadata": {"metadata": {"visibility": "shared"}}},
+        ]}
         service._memory.get.return_value = {"memory": "x", "metadata": {}}
         service._memory.delete = MagicMock()
         service.delete_memories(user_id="alice", category="tech_stack", include_shared=True)

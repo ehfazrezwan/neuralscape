@@ -374,3 +374,25 @@ def test_an_expired_pending_lease_does_not_wedge_the_row(world):
     meta.update({"revision": 1, "revision_pending": "dead-writer", "revision_pending_at": "2000-01-01T00:00:00+00:00"})
     world.patch_memory(M1, "ehfaz", {"tags": ["x"]}, expected_revision="1")
     assert _tags(world) == ["x"]
+
+
+def test_a_lost_claim_aborts_the_rewrite_before_it_can_overwrite_another_writers_edit(world):
+    """Finding (lease expiry): the lease ran out while writer 1 was still working, writer 2 committed; writer 1
+    must be refused at the fence instead of overwriting writer 2's edit."""
+    real_retrieve = world.fake.retrieve
+    state = {"calls": 0, "armed": True}
+
+    def retrieve(collection_name, ids, with_payload=True, with_vectors=False):
+        state["calls"] += 1
+        if state["calls"] == 2 and state["armed"]:      # the fence read: claim confirm was call 1
+            state["armed"] = False
+            meta = world.fake.points[M1]["metadata"]
+            meta["revision_pending_at"] = "2000-01-01T00:00:00+00:00"        # lease expired
+            world.patch_memory(M1, "ehfaz", {"tags": ["second-writer"]}, expected_revision="1")   # commits
+        return real_retrieve(collection_name, ids, with_payload, with_vectors)
+
+    world.fake.retrieve = retrieve
+    with pytest.raises(RevisionConflict):
+        world.patch_memory(M1, "ehfaz", {"content": "first writer's text"}, expected_revision="0")
+    assert world.fake.points[M1]["data"] == "Old content"            # the rewrite never ran
+    assert _tags(world) == ["second-writer"]                         # writer 2's edit survived

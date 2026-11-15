@@ -73,7 +73,7 @@ def normalize_expected_revision(value) -> str | None:
 
 # A content edit marks the row "pending" while it re-embeds; the mark expires so a
 # crashed writer cannot wedge the row (conditional writers are refused meanwhile).
-_PENDING_LEASE_S = 120
+_PENDING_LEASE_S = 600
 
 
 def _revision_filter(memory_id: str, revision: str, parent_key: str):
@@ -207,6 +207,17 @@ class EditMixin:
             key=parent_key,
         )
         self._confirm_revision_claim(client, collection, memory_id, nonce, current_revision, new_revision)
+
+    @staticmethod
+    def _assert_claim_held(client, collection, memory_id, nonce, expected, parent_key) -> None:
+        points = client.retrieve(collection_name=collection, ids=[memory_id], with_payload=True, with_vectors=False)
+        if not points:
+            raise LookupError(f"Memory {memory_id} not found")
+        stored = (points[0].payload or {}).get("metadata") or {}
+        if isinstance(stored.get("metadata"), dict):
+            stored = stored["metadata"]
+        if stored.get("revision_pending") != nonce:
+            raise RevisionConflict(memory_id, expected, revision_of(stored))
 
     @staticmethod
     def _clear_pending(client, collection: str, memory_id: str, nonce: str | None, parent_key: str) -> None:
@@ -391,6 +402,12 @@ class EditMixin:
             # rebuilds the ENTIRE payload from this kwarg, so omitting it (the
             # old update_memory bug) wipes category/scope/tags/visibility/owner.
             try:
+                # Fence: if the claim was lost (lease expired and another conditional
+                # writer committed) refuse BEFORE the unconditional rewrite could
+                # overwrite their edit. The remaining window is the embedder call
+                # inside m.update, bounded by its timeout and far below the lease.
+                if expected_revision is not None:
+                    self._assert_claim_held(client, collection, memory_id, write_nonce, expected_revision, revision_parent)
                 # Rebuilds the payload from new_meta, which carries no pending mark.
                 m.update(memory_id, changes["content"], metadata={"metadata": new_meta})
             except Exception:

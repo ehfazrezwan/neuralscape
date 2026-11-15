@@ -53,26 +53,47 @@ def test_private_only_graph_edges_are_expired_after_the_vector_deletes(svc):
     assert order == ["vector", "graph"]
 
 
-def test_filtered_delete_pages_through_all_matches_and_reports_failures(svc):
-    total = _BULK_PAGE * 2 + 5
-    live = [MemoryResponse(id=f"m{i}", memory="x", visibility="private") for i in range(total)]
+def _raw(mid, visibility="private", tombstoned=False):
+    meta = {"visibility": visibility}
+    if tombstoned:
+        meta["dream_tombstoned"] = True
+    return {"id": mid, "memory": "x", "metadata": {"metadata": meta}}
 
-    def list_memories(**kw):
-        return live[: kw["limit"]]
 
-    def delete(mid):
-        if mid == "m3":
-            raise RuntimeError("boom")
-        live[:] = [r for r in live if r.id != mid]
+def _wire_listing(svc, rows, fail_after=None):
+    """Filtered sweeps list RAW mem0 dicts through ``Memory.get_all``; deleting removes the row."""
+    calls = {"n": 0}
 
-    svc.list_memories = list_memories
+    def get_all(filters, top_k):
+        calls["n"] += 1
+        if fail_after is not None and calls["n"] > fail_after:
+            raise RuntimeError("qdrant went away")
+        return {"results": rows[:top_k]}
+
+    svc._ensure_filter_indexes = lambda: None
+    svc._memory.get_all.side_effect = get_all
     svc._memory.get.return_value = {"memory": "x", "metadata": {}}
-    svc._memory.delete.side_effect = delete
+    return calls
+
+
+def _deleting(rows, fail=()):
+    def delete(mid):
+        if mid in fail:
+            raise RuntimeError("boom")
+        rows[:] = [r for r in rows if r["id"] != mid]
+    return delete
+
+
+def test_filtered_delete_pages_through_all_matches_and_reports_failures(svc):
+    rows = [_raw(f"m{i}") for i in range(_BULK_PAGE * 2 + 5)]
+    total = len(rows)
+    _wire_listing(svc, rows)
+    svc._memory.delete.side_effect = _deleting(rows, fail={"m3"})
 
     out = svc.delete_memories(user_id="u", category="tech_stack")
 
     assert out["failed_ids"] == ["m3"] and out["truncated"] is False
-    assert [r.id for r in live] == ["m3"]            # everything else, past the first page, is gone
+    assert [r["id"] for r in rows] == ["m3"]
     assert f"Deleted {total - 1} memories" in out["message"]
 
 
@@ -80,68 +101,75 @@ def test_filtered_delete_says_truncated_when_the_window_cap_is_reached(svc, monk
     import memory.delete as d
 
     monkeypatch.setattr(d, "_BULK_MAX_ROUNDS", 2)      # cap = 2 pages
-    rows = [MemoryResponse(id=f"s{i}", memory="x", visibility="shared") for i in range(_BULK_PAGE * 3)]
-    svc.list_memories = lambda **kw: rows[: kw["limit"]]
+    rows = [_raw(f"s{i}", "shared") for i in range(_BULK_PAGE * 3)]
+    _wire_listing(svc, rows)
     out = svc.delete_memories(user_id="u", category="tech_stack")
     assert out["truncated"] is True and out["failed_ids"] == []
 
 
 def test_a_private_row_behind_many_preserved_shared_rows_is_still_reached(svc):
-    """Preserved shared rows stay in every listing; the window must widen past them."""
-    rows = [MemoryResponse(id=f"s{i}", memory="x", visibility="shared") for i in range(_BULK_PAGE + 100)]
-    rows.append(MemoryResponse(id="mine", memory="x", visibility="private"))
-    svc.list_memories = lambda **kw: rows[: kw["limit"]]
-    svc._memory.get.return_value = {"memory": "x", "metadata": {}}
-    svc._memory.delete.side_effect = lambda mid: rows.__setitem__(slice(None), [r for r in rows if r.id != mid])
+    rows = [_raw(f"s{i}", "shared") for i in range(_BULK_PAGE + 100)] + [_raw("mine")]
+    _wire_listing(svc, rows)
+    svc._memory.delete.side_effect = _deleting(rows)
     out = svc.delete_memories(user_id="u", category="tech_stack")
-    assert "mine" not in [r.id for r in rows] and out["truncated"] is False
+    assert "mine" not in [r["id"] for r in rows] and out["truncated"] is False
     assert "Deleted 1 memories" in out["message"] and "preserved" in out["message"]
 
 
-def test_null_category_private_row_behind_preserved_shared_rows_is_reached(svc):
-    rows = [{"id": f"s{i}", "data": "x", "metadata": {"visibility": "shared"}} for i in range(_BULK_PAGE + 50)]
-    rows.append({"id": "mine", "data": "x", "metadata": {"visibility": "private"}})
-    svc._list_null_category_memories = lambda user_id, scope=None, project_id=None, limit=500: rows[:limit]
-    svc._memory.vector_store.delete.side_effect = lambda mid: rows.__setitem__(slice(None), [r for r in rows if r["id"] != mid])
-    out = svc.delete_memories(user_id="u", filter_null_category=True)
-    assert "mine" not in [r["id"] for r in rows] and out["truncated"] is False
-
-
-def test_exhaustion_is_judged_from_the_raw_page_so_tombstones_cannot_end_the_sweep_early(svc):
-    seen_kwargs = []
-    svc.list_memories = lambda **kw: seen_kwargs.append(kw) or []
-    svc.delete_memories(user_id="u", category="tech_stack")
-    assert seen_kwargs[0]["include_tombstoned"] is True
+def test_a_tombstoned_row_survives_a_filtered_delete_while_exhaustion_is_still_raw(svc):
+    """Dream tombstones are reversible and a filtered sweep never touched them; raw page size still decides exhaustion."""
+    rows = [_raw(f"t{i}", tombstoned=True) for i in range(_BULK_PAGE)] + [_raw("live")]
+    _wire_listing(svc, rows)
+    svc._memory.delete.side_effect = _deleting(rows)
+    out = svc.delete_memories(user_id="u", category="tech_stack")
+    ids = [r["id"] for r in rows]
+    assert "live" not in ids and all(f"t{i}" in ids for i in range(_BULK_PAGE))    # tombstones kept, live row reached
+    assert out["truncated"] is False
 
 
 def test_listing_failure_before_any_deletion_raises(svc):
     from memory.delete import MemoryListingFailed
 
-    def boom(**kw):
-        raise RuntimeError("qdrant down")
-
-    svc.list_memories = boom
+    _wire_listing(svc, [], fail_after=0)
     with pytest.raises(MemoryListingFailed):
         svc.delete_memories(user_id="u", category="tech_stack")
 
 
-def test_listing_failure_after_progress_runs_cleanup_and_reports_incomplete(svc):
-    calls = {"n": 0}
-    live = [MemoryResponse(id=f"m{i}", memory="x", visibility="private") for i in range(_BULK_PAGE)]
+def test_listing_failure_after_only_preserved_rows_is_still_a_503_not_a_207(svc):
+    """A full page of preserved shared rows deleted nothing; a failing next listing must raise, not report partial."""
+    from memory.delete import MemoryListingFailed
 
-    def list_memories(**kw):
+    rows = [_raw(f"s{i}", "shared") for i in range(_BULK_PAGE)]
+    _wire_listing(svc, rows, fail_after=1)
+    with pytest.raises(MemoryListingFailed):
+        svc.delete_memories(user_id="u", category="tech_stack")
+
+
+def test_null_category_listing_failure_after_only_preserved_rows_raises(svc):
+    from memory.delete import MemoryListingFailed
+
+    rows = [{"id": f"s{i}", "data": "x", "metadata": {"visibility": "shared"}} for i in range(_BULK_PAGE)]
+    calls = {"n": 0}
+
+    def lister(user_id, scope=None, project_id=None, limit=500):
         calls["n"] += 1
         if calls["n"] > 1:
-            raise RuntimeError("qdrant went away")
-        return list(live)
+            raise RuntimeError("down")
+        return rows[:limit]
 
-    svc.list_memories = list_memories
-    svc._memory.get.return_value = {"memory": "x", "metadata": {}}
+    svc._list_null_category_memories = lister
+    with pytest.raises(MemoryListingFailed):
+        svc.delete_memories(user_id="u", filter_null_category=True)
+
+
+def test_listing_failure_after_progress_runs_cleanup_and_reports_incomplete(svc):
+    rows = [_raw(f"m{i}") for i in range(_BULK_PAGE)]
+    _wire_listing(svc, rows, fail_after=1)        # first listing ok, the next one fails
+    svc._memory.delete.side_effect = lambda mid: None   # deletes "succeed" but rows reappear: next listing fails first
     out = svc.delete_memories(user_id="u", category="tech_stack")
     assert out["listing_failed"] is True and out["truncated"] is True
     assert f"Deleted {_BULK_PAGE} memories" in out["message"]
-    rows = svc._bulk_graph_cleanup.call_args.args[0]
-    assert len(rows) == _BULK_PAGE                   # cleanup ran for what WAS deleted
+    assert len(svc._bulk_graph_cleanup.call_args.args[0]) == _BULK_PAGE      # cleanup ran for what WAS deleted
 
 
 def test_null_category_delete_pages_and_reports_failures(svc):

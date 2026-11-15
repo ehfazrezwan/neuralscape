@@ -12,7 +12,7 @@ from config import settings
 from schemas import MemoryVisibility
 from memory.groups import _build_group_id
 from memory.junk import _deleted_msg
-from memory.ranking import _times_derived_from_metadata
+from memory.ranking import _mem_is_tombstoned, _times_derived_from_metadata
 
 logger = logging.getLogger(__name__)
 
@@ -326,7 +326,7 @@ class DeleteMixin:
                 try:
                     batch = fetch(limit)
                 except Exception as e:
-                    if round_no == 0 and not seen:
+                    if deleted_count == 0 and not failed_ids:   # nothing deleted yet (preserved rows don't count)
                         raise MemoryListingFailed(
                             "Memories could not be listed; nothing was deleted. Retry."
                         ) from e
@@ -388,33 +388,45 @@ class DeleteMixin:
             }
 
         # For filtered deletes, we need to list then delete individually
+        def _fetch_raw(limit):
+            """The filtered listing as RAW mem0 dicts (tombstones included) so the page size is the raw size."""
+            self._ensure_filter_indexes()
+            filters: dict = {"user_id": user_id}
+            if scope:
+                filters["metadata.scope"] = scope
+            if category:
+                filters["metadata.category"] = category
+            if project_id:
+                filters["metadata.project_id"] = project_id
+            return self._extract_memory_list(m.get_all(filters=filters, top_k=limit))
+
         def _handle_row(mem):
             nonlocal deleted_count, skipped_shared, skipped_standard
-            if not include_shared and getattr(mem, "visibility", None) == MemoryVisibility.SHARED.value:
+            if _mem_is_tombstoned(mem):
+                return  # reversible dream tombstones are not touched by a filtered sweep (they never were)
+            meta = mem.get("metadata") or {}
+            if isinstance(meta.get("metadata"), dict):
+                meta = meta["metadata"]
+            visibility = meta.get("visibility")
+            if not include_shared and visibility == MemoryVisibility.SHARED.value:
                 skipped_shared += 1
                 return
-            if getattr(mem, "visibility", None) == MemoryVisibility.STANDARD.value and not settings.is_dictator(user_id):
+            if visibility == MemoryVisibility.STANDARD.value and not settings.is_dictator(user_id):
                 skipped_standard += 1
                 return
+            mid = mem.get("id")
             try:
                 # Get full memory for graph cleanup before deleting
-                full_mem = m.get(mem.id)
-                m.delete(mem.id)
+                full_mem = m.get(mid)
+                m.delete(mid)
                 if full_mem:
-                    cascade_rows.append({"id": mem.id, "mem": full_mem, "group_id": None})
+                    cascade_rows.append({"id": mid, "mem": full_mem, "group_id": None})
                 deleted_count += 1
             except Exception as e:
-                failed_ids.append(mem.id)
-                logger.warning(f"Failed to delete memory {mem.id}: {e}")
+                failed_ids.append(mid)
+                logger.warning(f"Failed to delete memory {mid}: {e}")
 
-        truncated = _sweep(
-            lambda lim: self.list_memories(
-                user_id=user_id, scope=scope, category=category, project_id=project_id,
-                limit=lim, include_tombstoned=True,  # raw size decides exhaustion; tombstoned rows match the filter too
-            ),
-            lambda x: x.id,
-            _handle_row,
-        )
+        truncated = _sweep(_fetch_raw, lambda x: x.get("id"), _handle_row)
         graph = self._bulk_graph_cleanup(cascade_rows, "filtered")
         return {
             "message": _deleted_msg("memories", deleted_count, skipped_shared, skipped_standard)
