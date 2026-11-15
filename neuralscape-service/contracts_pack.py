@@ -2151,7 +2151,7 @@ SCHEMA_DIGESTS: dict[str, str] = {
     "PolicyStatement": "0d60d9c33b5fdbac3927c9c90e3e6e3d2dd899bb7a52bcc22bd46d2e3e21d692",
     "PortableManifest": "0a77d59b8747e11736ee59cd5079fe4cb3073def1dad1d479e9f87699a099c7c",
     "PositionReference": "dd83ce1d7277e99ddc45aff2447c6439eac67c6defc8fea8a954a297e80ce06f",
-    "PrincipalContext": "d937e50fabf44b66cf3bf0d97cf6e73e46e10ae5016506fc50b21a3277267577",
+    "PrincipalContext": "a6996c742cbd4bee745555201b8db76ab2a3fb616fd40e6545e7b67e1675ca4c",
     "ProcessingPolicy": "9a304d12012cfdb36cf58ee6f5137c05fe1e58f6ce1d582d294ff75fcb465975",
     "ProducerReference": "6aabc3d2e1e769b39fc7e02f8ba636d46096b1f68f9b9bc9234b989b4a7bfe7b",
     "ProjectionFreshness": "3b2e025e69b5002803f844e367c1d24e99e3b893c950b0f2d0c9ae2d6618fc72",
