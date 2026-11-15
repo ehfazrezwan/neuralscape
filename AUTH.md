@@ -34,6 +34,14 @@ it. The ARQ workers likewise open no inbound port.
    connector UI is OAuth-only). **It does not change** when you switch login
    providers.
 
+   Refresh tokens are single-use and bound to the client that got them. Each
+   refresh returns a new token in the same family. If an already-used refresh
+   token is presented again, the whole family is revoked and the user reconnects.
+   There is no grace window, so a client that retries a refresh after a lost
+   response also has its session revoked (OAuth 2.0 Security BCP reuse
+   detection). The single-use and revocation markers live in Redis; if Redis is
+   down, `/oauth/token` answers 503 `temporarily_unavailable` and issues nothing.
+
 2. **The human-login step** — the one screen inside `/oauth/authorize` where a
    person proves who they are. This is the *only* thing `AUTH_PROVIDER` swaps.
 
@@ -175,10 +183,22 @@ Staleness bound: a revocation is enforced at most
 `REVOCATION_REFRESH_INTERVAL_SECONDS` after it is written (plus the request
 that triggers the refresh), per API process.
 
+**OAuth sessions.** Authorization codes, access tokens and refresh tokens carry a
+`src` claim: the digest of the credential the human logged in with (the pasted
+token) or, for Google/Supabase logins, of the identity (`identity_fingerprint`,
+printed by `revoke_token.py --identity <provider>:<user_id>`). `src` is carried
+across refresh rotation. Revoking that digest (live or env list) ends every
+session minted from it: access tokens are 401, refresh and code grants are
+`invalid_grant`. Revoking an OAuth access or refresh token directly works by its
+own digest; revoking a refresh token also revokes its family (the same
+`oauth:revoked_family:<fam>` key #495 uses on reuse), so its successors die too.
+Sessions minted before this change carry no `src` and are covered only by their
+own digests. Unrevoking a refresh token does not resurrect its family.
+
 Limits, plainly:
 
 - It covers the exact token string only (a fresh token for the same user is a
-  different token).
+  different token), plus every OAuth session derived from it (below).
 - Rotate `NEURALSCAPE_USER_TOKEN_SECRET` to invalidate every token.
 - Existing non-expiring tokens keep verifying unless revoked or the secret rotates.
 

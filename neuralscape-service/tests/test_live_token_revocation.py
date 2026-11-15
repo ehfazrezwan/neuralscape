@@ -273,6 +273,10 @@ class SyncFake:
         self._check()
         return {m.encode() for m in self.store.sets.get(key, set())}
 
+    def set(self, key, value, ex=None):
+        self._check()
+        self.store.sets.setdefault("__strings__", {})[key] = (value, ex)
+
 
 class TestRevokeScript:
     @pytest.fixture
@@ -341,6 +345,35 @@ class TestRevokeScript:
         assert mod.main(["--digest", "a" * 64, "--redis"]) == 1
         err = capsys.readouterr().err
         assert "Redis unavailable" in err
+
+    def test_identity_flag_revokes_a_federated_login(self, script):
+        from tokens import identity_fingerprint
+
+        mod, fake = script
+        assert mod.main(["--identity", "google:alice", "--redis"]) == 0
+        assert fake.sets[REVOKED_SET_KEY] == {identity_fingerprint("google", "alice")}
+        assert mod.main(["--identity", "nocolon", "--redis"]) == 2
+
+    def test_revoking_a_refresh_token_also_revokes_its_family(self, script, monkeypatch):
+        import time
+
+        from tokens import sign_payload
+
+        mod, fake = script
+        refresh = sign_payload(
+            {"typ": "refresh", "user_id": "a", "fam": "fam-1", "jti": "j", "exp": int(time.time()) + 100},
+            SECRET,
+        )
+        self._feed(monkeypatch, refresh)
+        assert mod.main(["--redis"]) == 0
+        value, ttl = fake.sets["__strings__"]["oauth:revoked_family:fam-1"]
+        assert value == "1" and 1 <= ttl <= 100
+
+    def test_revoking_an_access_token_sets_no_family_key(self, script, monkeypatch):
+        mod, fake = script
+        self._feed(monkeypatch, _token())
+        assert mod.main(["--redis"]) == 0
+        assert "__strings__" not in fake.sets
 
     def test_empty_stdin_still_fails(self, script, monkeypatch):
         mod, _ = script

@@ -65,6 +65,13 @@ def main(argv: list[str] | None = None) -> int:
         help="Act on this SHA-256 hex digest instead of reading a token.",
     )
     parser.add_argument(
+        "--identity",
+        default=None,
+        metavar="PROVIDER:USER_ID",
+        help="Act on a federated login identity (Google/Supabase) instead of a token: "
+        "ends every OAuth session minted from that login.",
+    )
+    parser.add_argument(
         "--redis",
         action="store_true",
         help="Add the digest to the live Redis denylist (no restart needed).",
@@ -97,7 +104,16 @@ def main(argv: list[str] | None = None) -> int:
             print(digest)
         return 0
 
-    if args.digest:
+    token = None
+    if args.identity:
+        provider, sep, user = args.identity.partition(":")
+        if not sep or not provider or not user:
+            print("error: --identity must be PROVIDER:USER_ID.", file=sys.stderr)
+            return 2
+        from tokens import identity_fingerprint  # noqa: E402
+
+        digest = identity_fingerprint(provider, user)
+    elif args.digest:
         digest = args.digest.strip().lower()
         if not _DIGEST_RE.match(digest):
             print("error: --digest must be 64 hex characters.", file=sys.stderr)
@@ -126,6 +142,8 @@ def main(argv: list[str] | None = None) -> int:
     except Exception as exc:  # noqa: BLE001
         print(f"error: Redis unavailable ({type(exc).__name__}).", file=sys.stderr)
         return 1
+    if args.redis and token:
+        _revoke_refresh_family(client, token)
     print(digest)
     print(
         ("unrevoked" if args.unrevoke else "revoked")
@@ -133,6 +151,30 @@ def main(argv: list[str] | None = None) -> int:
         file=sys.stderr,
     )
     return 0
+
+
+def _revoke_refresh_family(client, token: str) -> None:
+    """When ``token`` is an OAuth refresh token, revoke its whole family.
+
+    Uses the key the OAuth layer checks on every refresh grant
+    (``oauth:revoked_family:<fam>``), so successors of this token die too. The
+    payload is read unverified: it only picks a key to write.
+    """
+    import json
+    import time
+
+    from tokens import _b64url_decode  # noqa: E402
+
+    try:
+        claims = json.loads(_b64url_decode(token.split(".", 1)[0]))
+        fam = claims.get("fam")
+        if claims.get("typ") != "refresh" or not isinstance(fam, str) or not fam:
+            return
+        ttl = max(1, int(claims.get("exp", 0)) - int(time.time()))
+    except Exception:  # noqa: BLE001 - not a refresh token
+        return
+    client.set(f"oauth:revoked_family:{fam}", "1", ex=ttl)
+    print("refresh token: family revoked", file=sys.stderr)
 
 
 def _interval() -> str:

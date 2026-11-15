@@ -154,6 +154,15 @@ async def refresh_revocations(force: bool = False) -> bool:
         return True
 
 
+def identity_fingerprint(provider: str, user_id: str) -> str:
+    """Digest naming a federated login identity (Google/Supabase), for ``src``.
+
+    Revoking it (``revoke_token.py --identity provider:user_id``) ends every
+    OAuth session minted from that login.
+    """
+    return hashlib.sha256(f"identity:{provider}:{user_id}".encode("utf-8")).hexdigest()
+
+
 def _revoked_digests() -> set[str] | None:
     """Union of ``NEURALSCAPE_REVOKED_TOKENS`` and the Redis snapshot.
 
@@ -253,7 +262,11 @@ def verify_payload(token: str, secret: str) -> dict | None:
 
 
 def issue_user_token(
-    user_id: str, secret: str, ttl_seconds: int | None, typ: str | None = None
+    user_id: str,
+    secret: str,
+    ttl_seconds: int | None,
+    typ: str | None = None,
+    extra_claims: dict | None = None,
 ) -> str:
     """Sign a per-user HMAC token (the Bearer access token format).
 
@@ -282,6 +295,8 @@ def issue_user_token(
         claims["exp"] = int(time.time()) + int(ttl_seconds)
     if typ is not None:
         claims["typ"] = typ
+    if extra_claims:
+        claims.update({k: v for k, v in extra_claims.items() if k not in claims})
     return sign_payload(claims, secret)
 
 
@@ -313,5 +328,9 @@ def verify_user_token(token: str, secret: str) -> dict | None:
     if not isinstance(user_id, str) or not user_id:
         return None
     if payload.get("typ") not in _ACCESS_TYPS:
+        return None
+    # An OAuth access token dies with the credential/identity it was minted from.
+    src = payload.get("src")
+    if isinstance(src, str) and src and src.lower() in revoked:
         return None
     return payload

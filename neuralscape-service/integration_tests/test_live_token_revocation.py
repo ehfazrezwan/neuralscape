@@ -147,3 +147,55 @@ def test_redis_going_away_keeps_the_last_snapshot_then_catches_up(
     assert _script(stores, "--redis", token=second).returncode == 0
     assert _get(api, second).status_code == 401
     assert _get(api, first).status_code == 401
+
+
+def test_oauth_session_minted_from_a_pasted_token_dies_when_it_is_revoked(
+    api, stores, secret, digests, unique_ns, flags
+):
+    """Paste a token on the real consent flow (real Redis replay guard), then revoke it live."""
+    import base64
+    import hashlib
+
+    import main
+
+    flags(neuralscape_public_url="https://neuralscape.example.com")
+    client = TestClient(main.app, raise_server_exceptions=False)
+    pasted = issue_user_token(unique_ns.user_id, secret, 3600)
+    digests.append(token_fingerprint(pasted))
+    redirect = "https://claude.ai/api/mcp/auth_callback"
+    client_id = client.post("/oauth/register", json={"redirect_uris": [redirect]}).json()["client_id"]
+    verifier = base64.urlsafe_b64encode(secrets.token_bytes(40)).rstrip(b"=").decode()
+    challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
+
+    def grant(**data):
+        return client.post("/oauth/token", data={"client_id": client_id, **data})
+
+    resp = client.post(
+        "/oauth/authorize",
+        data={"client_id": client_id, "redirect_uri": redirect, "state": "s", "code_challenge": challenge,
+              "code_challenge_method": "S256", "token": pasted},
+        follow_redirects=False,
+    )
+    code = resp.headers["location"].split("code=")[1].split("&")[0]
+    tok = grant(grant_type="authorization_code", code=code, code_verifier=verifier, redirect_uri=redirect).json()
+    refresh = tok["refresh_token"]
+    assert verify_user_token_ok(tok["access_token"], secret)
+    rotated = grant(grant_type="refresh_token", refresh_token=refresh).json()  # works while unrevoked
+    assert "refresh_token" in rotated
+
+    assert _script(stores, "--redis", token=pasted).returncode == 0
+
+    refused = grant(grant_type="refresh_token", refresh_token=rotated["refresh_token"])
+    assert refused.status_code == 400 and refused.json()["error"] == "invalid_grant"
+    assert not verify_user_token_ok(rotated["access_token"], secret)
+    assert _get(api, rotated["access_token"]).status_code == 401  # the middleware agrees
+
+    assert _script(stores, "--unrevoke", token=pasted).returncode == 0
+    assert grant(grant_type="refresh_token", refresh_token=rotated["refresh_token"]).status_code == 200
+
+
+def verify_user_token_ok(token, secret):
+    import asyncio
+
+    asyncio.run(tokens.refresh_revocations(force=True))
+    return tokens.verify_user_token(token, secret) is not None
