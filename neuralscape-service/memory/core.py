@@ -177,6 +177,12 @@ class CoreMixin:
 
                     self._ensure_indexes_at_startup()
 
+        # A startup ensure that failed (Qdrant not ready yet) is retried from
+        # here, so a write-only worker (which never searches) still recovers.
+        # Cheap no-op unless an attempt failed and the cool-down has passed.
+        if not self._filter_indexes_ok or not getattr(self, "_created_at_index_ok", False):
+            self._retry_index_ensure()
+
         return self._memory
 
     def _get_graphiti(self):
@@ -258,12 +264,15 @@ class CoreMixin:
         """Best-effort: ensure a DATETIME payload index on ``created_at``.
 
         Qdrant's ``order_by`` scroll requires a range-capable payload index.
-        Creation is idempotent server-side; attempted once per process. On
-        failure the timeline falls back to a Python-side sort, so this never
-        raises.
+        Creation is idempotent server-side. On failure the flag stays unset and
+        the next call past the cool-down re-checks; meanwhile the timeline falls
+        back to a Python-side sort, so this never raises.
         """
         if getattr(self, "_created_at_index_ok", False):
             return
+        if time.monotonic() < getattr(self, "_created_at_retry_at", 0.0):
+            return
+        self._created_at_retry_at = time.monotonic() + self._FILTER_INDEX_RETRY_S
         try:
             from qdrant_client.models import PayloadSchemaType
 
@@ -274,9 +283,16 @@ class CoreMixin:
                 wait=True,
             )
         except Exception as e:
+            # Not marked done: re-checked after the cool-down. Warn once.
             logger.debug(f"created_at payload index ensure failed (non-fatal): {e}")
-        # Attempt once per process either way — the order_by scroll has its
-        # own fallback if the index genuinely isn't there.
+            if not getattr(self, "_created_at_warned", False):
+                self._created_at_warned = True
+                logger.warning(
+                    "qdrant_payload_index_ensure_failed fields=created_at: timeline falls back "
+                    "to a Python-side sort (will re-check in %ds)",
+                    int(self._FILTER_INDEX_RETRY_S),
+                )
+            return
         self._created_at_index_ok = True
 
     # Hot-path payload filters that deserve keyword/bool indexes (audit 27
@@ -368,6 +384,22 @@ class CoreMixin:
                 ",".join(failed),
                 int(self._FILTER_INDEX_RETRY_S),
             )
+
+    def _retry_index_ensure(self) -> None:
+        """Re-run the background ensure after a failed attempt, once per cool-down."""
+        now = time.monotonic()
+        pending = []  # retry-at times of the ensures that have not succeeded
+        if not self._filter_indexes_ok:
+            pending.append(getattr(self, "_filter_index_retry_at", 0.0))
+        if not getattr(self, "_created_at_index_ok", False):
+            pending.append(getattr(self, "_created_at_retry_at", 0.0))
+        # 0.0 = never attempted (init in progress): leave it to the startup hook.
+        if not pending or any(t == 0.0 for t in pending) or now < min(pending):
+            return
+        thread = getattr(self, "_index_ensure_thread", None)
+        if thread is not None and thread.is_alive():
+            return
+        self._ensure_indexes_at_startup()
 
     def _ensure_indexes_at_startup(self) -> None:
         """Ensure all payload indexes once memory is initialised, off the caller.

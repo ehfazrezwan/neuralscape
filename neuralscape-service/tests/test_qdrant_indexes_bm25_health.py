@@ -197,6 +197,43 @@ def test_failed_field_warns_once_and_is_rechecked_later(caplog, monkeypatch):
     assert len([r for r in caplog.records if "qdrant_payload_index_ensure_failed" in r.getMessage()]) == 1
 
 
+def test_created_at_failure_warns_once_and_is_rechecked(caplog):
+    client = FlakyClient({"created_at"})
+    svc = _service(client=client)
+    with caplog.at_level(logging.WARNING, logger="memory.core"):
+        svc._ensure_created_at_index()
+        assert not svc._created_at_index_ok
+        svc._ensure_created_at_index()  # cool-down: no retry, no second warning
+        client.fail_fields.clear()
+        svc._created_at_retry_at = 0.0
+        svc._ensure_created_at_index()
+    assert "created_at" in client.indexes and svc._created_at_index_ok is True
+    msgs = [r for r in caplog.records if "ensure_failed fields=created_at" in r.getMessage()]
+    assert len(msgs) == 1
+
+
+def test_write_only_worker_recovers_from_a_failed_startup_ensure(monkeypatch):
+    """No search ever runs: later _get_memory() calls (every write makes one) retry."""
+    client = FlakyClient({"hash", "created_at"})
+    fake_memory = SimpleNamespace(vector_store=SimpleNamespace(client=client, _has_bm25_slot=True, _bm25_encoder=None))
+    monkeypatch.setattr(core, "_memory_from_config", lambda cls, cfg: fake_memory)
+    monkeypatch.setattr(type(settings), "get_mem0_config", lambda self: {})
+    svc = MemoryService()
+    svc._get_memory()
+    svc._index_ensure_thread.join(timeout=5)
+    assert "hash" not in client.indexes and not svc._filter_indexes_ok
+
+    svc._get_memory()  # inside the cool-down: nothing happens
+    assert not svc._index_ensure_thread.is_alive() and "hash" not in client.indexes
+
+    client.fail_fields.clear()  # Qdrant is up now
+    svc._filter_index_retry_at = svc._created_at_retry_at = 1e-9  # cool-down elapsed
+    svc._get_memory()
+    svc._index_ensure_thread.join(timeout=5)
+    assert "hash" in client.indexes and "created_at" in client.indexes
+    assert svc._filter_indexes_ok and svc._created_at_index_ok
+
+
 # ----------------------------------------------------------------- health
 
 
