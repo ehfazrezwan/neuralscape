@@ -206,7 +206,7 @@ def batched_anchor_lookup(
         Dict mapping canonical FQN -> list of memory dicts.
     """
     from memory_service import get_shared_service
-    from qdrant_client.models import FieldCondition, Filter, MatchAny
+    from qdrant_client.models import FieldCondition, Filter, MatchAny, MatchValue
 
     if not fqns:
         return {}
@@ -227,7 +227,46 @@ def batched_anchor_lookup(
                 match=MatchAny(any=anchor_keys),
             )
         ]
-        query_filter = Filter(must=must)
+        # Push the readability predicate into Qdrant so other users' private
+        # rows on the same anchor can't consume the scroll limit and cut the
+        # caller's own rows before the Python post-filter runs. Rows are
+        # readable when visibility is shared/standard, or when the caller owns
+        # them (metadata.owner_user_id, or top-level user_id on rows that only
+        # carry that). Anonymous callers get shared/standard only.
+        shared_cond = FieldCondition(
+            key="metadata.visibility", match=MatchAny(any=["shared", "standard"])
+        )
+        readable_any: list = [shared_cond]
+        if user_id:
+            readable_any.append(
+                Filter(
+                    must=[
+                        Filter(
+                            should=[
+                                FieldCondition(
+                                    key="metadata.owner_user_id",
+                                    match=MatchValue(value=user_id),
+                                ),
+                                FieldCondition(
+                                    key="user_id", match=MatchValue(value=user_id)
+                                ),
+                            ]
+                        )
+                    ],
+                    # shared/standard rows are already covered above
+                    must_not=[shared_cond],
+                )
+            )
+        must.append(Filter(should=readable_any))
+        query_filter = Filter(
+            must=must,
+            # Same exclusion memory/search.py applies: dreaming tombstones.
+            must_not=[
+                FieldCondition(
+                    key="metadata.dream_tombstoned", match=MatchValue(value=True)
+                )
+            ],
+        )
 
         # Phase G-final (GF2): use scroll (filter-only, NO query vector) rather
         # than query_points with a throwaway zero vector. The anchor join filters
@@ -254,11 +293,14 @@ def batched_anchor_lookup(
 
         for hit in hits:
             payload = getattr(hit, "payload", None) or {}
-            metadata = payload.get("metadata", {})
-            source_ref = metadata.get("source_ref", {})
+            metadata = payload.get("metadata", {}) or {}
+            source_ref = metadata.get("source_ref", {}) or {}
             anchor_key = source_ref.get("external_id", "")
             visibility = metadata.get("visibility", "private")
-            owner = metadata.get("user_id")
+            # Write path (memory/write.py) stores the author at
+            # metadata["owner_user_id"] and top-level payload["user_id"];
+            # it never sets metadata["user_id"].
+            owner = metadata.get("owner_user_id") or payload.get("user_id")
 
             if anchor_key not in memories_by_anchor:
                 continue  # not one of our requested anchors
@@ -271,12 +313,15 @@ def batched_anchor_lookup(
                 readable = True
 
             if readable:
+                hit_id = getattr(hit, "id", None)
                 memory_dict = {
-                    "id": payload.get("id"),
+                    # The Qdrant point id is the memory id; the payload has no "id".
+                    "id": str(hit_id) if hit_id is not None else payload.get("id"),
                     "content": payload.get("data"),
                     "category": metadata.get("category"),
                     "visibility": visibility,
-                    "created_at": metadata.get("created_at"),
+                    # created_at is top-level in the stored payload.
+                    "created_at": payload.get("created_at") or metadata.get("created_at"),
                 }
                 memories_by_anchor[anchor_key].append(memory_dict)
 

@@ -185,6 +185,17 @@ def _entries_to_text(entries: list[dict]) -> str:
     return "\n".join(lines)
 
 
+async def _enqueue_sibling_jobs(jobs: list[dict]) -> tuple[int, int]:
+    """Enqueue the sibling graph re-ingests a dedup run produced.
+
+    Returns ``(enqueued, not_enqueued)``; never raises.
+    """
+    from task_manager import enqueue_graph_jobs_standalone
+
+    res = await enqueue_graph_jobs_standalone(jobs)
+    return res["graph_jobs_enqueued"], len(res["graph_jobs_not_enqueued_ids"])
+
+
 async def compile_date(
     date: str,
     service: MemoryService,
@@ -330,9 +341,13 @@ async def compile_date(
     # the event loop when compile_date is called inline (e.g., from session_end
     # fallback or when ARQ worker runs process_conversation_compile).
     dedup_triggered = False
+    sibling_enqueued = sibling_failed = 0
     try:
-        await asyncio.to_thread(service.dedup_memories, user_id)
+        dedup_result = await asyncio.to_thread(service.dedup_memories, user_id)
         dedup_triggered = True
+        sibling_jobs = (dedup_result or {}).get("graph_jobs") or []
+        if sibling_jobs:
+            sibling_enqueued, sibling_failed = await _enqueue_sibling_jobs(sibling_jobs)
     except Exception:
         logger.warning("Post-compile dedup failed (non-critical)")
 
@@ -341,6 +356,8 @@ async def compile_date(
         articles=articles,
         entries_compiled=entries_compiled,
         dedup_triggered=dedup_triggered,
+        dedup_graph_jobs_enqueued=sibling_enqueued,
+        dedup_graph_jobs_not_enqueued=sibling_failed,
     )
 
     logger.info(
