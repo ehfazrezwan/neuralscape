@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import uuid
 
+import third_party_telemetry  # noqa: F401  (must precede any mem0/graphiti import)
 import pytest
 
 from config import parse_redis_settings, settings

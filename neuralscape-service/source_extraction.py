@@ -9,6 +9,7 @@ import re
 from dataclasses import dataclass
 from functools import lru_cache
 
+import third_party_telemetry  # noqa: F401  (must precede any mem0/graphiti import)
 from graphiti_core.llm_client.hybrid_decision_client import HybridDecisions, category_policy
 from schemas import CORE_MEMORY_CATEGORIES
 from category_evidence import category_mode, make_evidence

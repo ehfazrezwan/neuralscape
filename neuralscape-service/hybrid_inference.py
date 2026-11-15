@@ -6,6 +6,7 @@ import threading
 import hashlib
 from functools import lru_cache
 
+import third_party_telemetry  # noqa: F401  (must precede any mem0/graphiti import)
 from config import settings
 from graphiti_core.llm_client.hybrid_decision_client import HybridDecisions
 

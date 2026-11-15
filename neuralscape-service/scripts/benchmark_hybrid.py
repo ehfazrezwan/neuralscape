@@ -12,6 +12,7 @@ import json
 import math
 import os
 
+import third_party_telemetry  # noqa: F401  (must precede any mem0/graphiti import)
 from config import settings
 import platform
 import statistics
