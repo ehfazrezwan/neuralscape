@@ -10,9 +10,14 @@ Supports two token formats simultaneously:
 
 2. **Legacy shared API key** (single-user / pre-multi-user installs):
    one segment, opaque string. Validated against ``NEURALSCAPE_API_KEY``.
-   When this path matches, ``request.state.user_id`` is **not** set
-   (routes must fall back to body ``user_id``), and a deprecation
-   warning header is added to the response.
+   When this path matches, the key acts as ONE identity:
+   ``NEURALSCAPE_API_KEY_USER_ID`` if set, else ``DEFAULT_USER_ID``. That user
+   is attached to ``request.state.user_id`` and ``current_user_id`` just like a
+   per-user token, so a body/query ``user_id`` naming anyone else gets HTTP 400
+   and MCP ignores ``arguments["user_id"]``. Setting
+   ``NEURALSCAPE_LEGACY_KEY_TRUST_BODY_USER_ID=true`` restores the old
+   behaviour (``request.state.user_id`` not set; routes trust the body). A
+   deprecation warning header is added to every legacy-key response.
 
 Auth is fail-closed. When neither secret is configured, startup refuses
 (``Settings.validate_required``) and this middleware rejects every non-public
@@ -41,7 +46,7 @@ logger = logging.getLogger(__name__)
 # is verified. Lets the MCP tool layer — which only receives a tool-arguments
 # dict, not the HTTP request — scope operations to the authenticated user
 # without the model having to pass `user_id`. Default None = unauthenticated
-# or legacy shared-key (fall back to the request body / arguments).
+# (or the legacy-key opt-out): fall back to the request body / arguments.
 current_user_id: ContextVar[str | None] = ContextVar("current_user_id", default=None)
 
 # Paths that never require authentication
@@ -118,12 +123,27 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
                     current_user_id.reset(ctx_token)
             # else: HMAC verify failed — fall through to legacy check.
 
-        # Fall back to the legacy shared API key. user_id is NOT set on
-        # request.state — routes must read it from the request body
-        # (trust-based, pre-multi-user behavior).
-        if legacy_key and hmac.compare_digest(token, legacy_key):
+        # Fall back to the legacy shared API key. By default the key acts as
+        # ONE identity (NEURALSCAPE_API_KEY_USER_ID, else DEFAULT_USER_ID): that
+        # user is bound to request.state and the MCP ContextVar exactly like a
+        # per-user token, so a body/query user_id naming anyone else is a 400.
+        # NEURALSCAPE_LEGACY_KEY_TRUST_BODY_USER_ID=true restores the old
+        # trust-the-body behaviour (no identity bound).
+        # Compare as bytes: compare_digest on str raises TypeError for non-ASCII.
+        if legacy_key and hmac.compare_digest(
+            token.encode("utf-8"), legacy_key.encode("utf-8")
+        ):
             request.state.auth_mode = "legacy_shared"
-            response = await call_next(request)
+            if settings.neuralscape_legacy_key_trust_body_user_id:
+                response = await call_next(request)
+            else:
+                bound_user_id = settings.legacy_key_identity()
+                request.state.user_id = bound_user_id
+                ctx_token = current_user_id.set(bound_user_id)
+                try:
+                    response = await call_next(request)
+                finally:
+                    current_user_id.reset(ctx_token)
             response.headers[DEPRECATION_HEADER] = DEPRECATION_MSG
             return response
 

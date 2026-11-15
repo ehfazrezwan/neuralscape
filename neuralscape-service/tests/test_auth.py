@@ -22,6 +22,12 @@ from main import app
 TEST_API_KEY = "test-secret-key-12345"
 
 
+def settings_default_user() -> str:
+    """The identity the legacy shared key is bound to when no override is set."""
+    from config import settings
+    return settings.legacy_key_identity()
+
+
 @pytest.fixture(autouse=True)
 def mock_memory():
     """Patch lazy-init globals so no real mem0/Graphiti is created."""
@@ -134,7 +140,7 @@ class TestAuthEnabled:
         client = TestClient(app, raise_server_exceptions=False)
         resp = client.get(
             "/v1/memories",
-            params={"user_id": "test"},
+            params={"user_id": settings_default_user()},
             headers={"Authorization": f"Bearer {TEST_API_KEY}"},
         )
         assert resp.status_code == 200
@@ -301,7 +307,7 @@ class TestLegacyKeyWithDotFallsBack:
         client = TestClient(app, raise_server_exceptions=False)
         resp = client.get(
             "/v1/memories",
-            params={"user_id": "test"},
+            params={"user_id": settings_default_user()},
             headers={"Authorization": "Bearer legacy-key.with.dots"},
         )
         assert resp.status_code == 200, (
