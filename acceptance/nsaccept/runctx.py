@@ -91,6 +91,21 @@ UP_REQUIRED_FLAGS = ("-d", "--no-build", "--no-recreate")
 UP_ALLOWED_FLAGS = UP_REQUIRED_FLAGS + ("--no-deps",)
 
 
+def read_only_exec(args: tuple) -> bool:
+    """The two read-only inspections the flags-on scenarios need, and nothing else:
+    ``exec -T <api> grep -rl -- <needle> /data/vault[/...]`` and
+    ``exec -T <redis> redis-cli GET ns:connector:<id>``."""
+    import re
+
+    a = tuple(args)
+    if len(a) == 8 and a[1:3] == ("-T", os.environ.get("NS_API_SERVICE", "neuralscape")) and a[3:6] == ("grep", "-rl", "--"):
+        needle, root = a[6], a[7]
+        return bool(needle) and not needle.startswith("-") and ".." not in root.split("/") and re.fullmatch(r"/data/vault(/[\w.-]+)*", root) is not None
+    if len(a) == 6 and a[1:3] == ("-T", os.environ.get("NS_REDIS_SERVICE", "redis")) and a[3:5] == ("redis-cli", "GET"):
+        return re.fullmatch(r"ns:connector:[\w.-]+", a[5]) is not None
+    return False
+
+
 def qdrant_service() -> str:
     return os.environ.get("NS_QDRANT_SERVICE", "qdrant")
 
@@ -108,10 +123,7 @@ def run_compose(
     timeout: float = 120.0,
     run: Callable[..., subprocess.CompletedProcess] = subprocess.run,
 ) -> subprocess.CompletedProcess:
-    if project.strip().lower() == guard.PROD_COMPOSE_PROJECT:
-        raise guard.GuardError(
-            f"refusing compose project '{guard.PROD_COMPOSE_PROJECT}' (the production project name)"
-        )
+    project = guard.check_compose_project(project)
     if not args or args[0] not in COMPOSE_VERBS:
         raise ConfigError(f"compose verb {args[:1]!r} is not allowed (allowed: {sorted(COMPOSE_VERBS)})")
     if args[0] == "up":
@@ -122,9 +134,13 @@ def run_compose(
         if not names or not set(names) <= set(app_services()):
             raise ConfigError(f"`up` may only name the API/worker services {app_services()}, got {names}")
     if args[0] == "exec":
-        if len(args) < 6 or args[1:5] != ("-T", qdrant_service(), "sh", "-c") or len(args) != 6:
-            raise ConfigError(f"`exec` is only allowed as: exec -T {qdrant_service()} sh -c <script>")
-    cmd = ["docker", "compose", "-p", project.strip(), *args]
+        qdrant_form = len(args) == 6 and args[1:5] == ("-T", qdrant_service(), "sh", "-c")
+        if not qdrant_form and not read_only_exec(args):
+            raise ConfigError(
+                f"`exec` is only allowed as: exec -T {qdrant_service()} sh -c <script>, "
+                "or one of the read-only inspections (vault grep, connector vault record)"
+            )
+    cmd = ["docker", "compose", "-p", project, *args]
     proc = run(cmd, capture_output=True, text=True, timeout=timeout)
     if check and proc.returncode != 0:
         raise RuntimeError(

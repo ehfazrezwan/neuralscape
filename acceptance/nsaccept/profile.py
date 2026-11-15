@@ -19,7 +19,7 @@ from pathlib import Path
 PLACEHOLDER_RE = re.compile(r"^<generate:(fernet|hex32)>$")
 SECRET_KEY_RE = re.compile(r"(KEY|SECRET|TOKEN|PASSWORD|PASSWD|CREDENTIAL)", re.IGNORECASE)
 REDACTED = "<redacted>"
-HEADER_RE = re.compile(r"^#\s*(services|sidecars|mounts)\s*:\s*(.*)$", re.IGNORECASE)
+HEADER_RE = re.compile(r"^#\s*(services|sidecars|mounts|requires)\s*:\s*(.*)$", re.IGNORECASE)
 
 
 def _unquote(value: str) -> str:

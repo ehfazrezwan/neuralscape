@@ -87,8 +87,14 @@ def test_cbm_check_fails_for_a_symbol_that_does_not_exist(ctx, a, cbm: Cbm):
 @proves("knowledge.cbm-engine", "knowledge.code-graph-delete")
 def test_deleting_the_cbm_project_empties_it(a, cbm: Cbm):
     c = _ready(cbm)
+    before = cg_get(a, "query", question=SYMBOL, graph_id=c.code_space, knowledge_system=SYSTEM)
+    check_mentions(before["result"], SYMBOL)  # a real hit exists before the delete
     r = a.delete("/v1/code-graph/graph", params={"graph_id": c.code_space, "system": SYSTEM})
     assert r.status_code == 200 and r.json().get("deleted") is True, f"DELETE -> {r.status_code}: {r.text[:200]}"
+    engine = r.json().get("engine_result") or {}
+    counts = [v for k, v in engine.items() if isinstance(v, int) and not isinstance(v, bool) and ("delet" in k or "node" in k or "count" in k)]
+    assert counts and max(counts) > 0, f"the delete reports nothing removed: {engine}"
     after = a.get("/v1/code-graph/query", params={"question": SYMBOL, "graph_id": c.code_space, "knowledge_system": SYSTEM})
-    # unbindable now (the project is gone): an honest error or an empty answer, never the symbol
-    assert SYMBOL not in after.text, f"the deleted CBM project still answers: {after.text[:200]}"
+    # the project is gone: the service answers 200 with no hit (never a 5xx, never the symbol)
+    assert after.status_code == 200, f"query after delete -> {after.status_code}: {after.text[:200]}"
+    assert SYMBOL not in after.json().get("result", ""), f"the deleted CBM project still answers: {after.text[:200]}"

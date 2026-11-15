@@ -144,6 +144,29 @@ and the connector's `list_url` use the container name `nsc-acc-sink`, which only
 **Time.** The flags-on run is dominated by the dreaming sweep (real LLM, queued behind graph enrichment of
 the seeds on the single graph worker) and the native index; budget about 15 minutes on 2 CPUs.
 
+### Reading a flags-on result honestly
+
+- **Skips are not evidence.** `flags-on` declares `# requires: compose`, and `run.sh` exits 2 without
+  `--compose-project` rather than skipping the compose-only scenarios. A skipped scenario never counts as proof.
+- **Compose projects.** Every entry point that touches Docker (`ctx.compose`, token minting, the sink) goes through
+  one function, `guard.check_compose_project`: case-insensitive after strip, refuses `neuralscape`, and refuses any name
+  outside the disposable prefixes `nscampaign` and `nstest-` (override only with `NS_COMPOSE_ALLOWLIST`).
+  Only two read-only `exec` forms exist besides the Qdrant one: vault `grep -rl` under `/data/vault` and
+  `redis-cli GET ns:connector:<id>`.
+- **LLM-dependent assertions** (an LLM decision, not wording, but a decision nonetheless): the contradicting fact is
+  invalidated (not merged), a reflection insight is stored, the identity card keeps the user's name token, speaker
+  attribution on two real extractions, the Docling figure detection. A red here is a real finding for the owning lane
+  or a model regression, not a harness bug; none was loosened to pass.
+- **Order dependence.** Within a module, tests share one fixture (the seeds, the sweeps, the index, the sync) and
+  read what it recorded, so they do not depend on each other's order; the exceptions are the last test of
+  `test_code_graph` / `test_code_graph_cbm` (they delete the code space) and `test_connectors`' delete test, which
+  use only objects they create. Do not run a single test of those modules with `-k` after a previous run on the same stack.
+- **Expected red until PR 495 (sec-03):** the consent-page framing headers and refresh-token rotation in `test_oauth`.
+- **Coverage of the old blind e2e scripts is partial** (see the PR body's disposition table): they stay in the repo
+  for the parts not ported.
+- **Hard-coded port.** The OAuth profiles carry `NEURALSCAPE_PUBLIC_URL=http://127.0.0.1:18199`; the scenarios assert
+  it equals the URL under test, so a gate on another port must edit that one line.
+
 ## Results JSON
 
 Written to `--out` (default `acceptance/results/<profile>-<commit12>.json`,

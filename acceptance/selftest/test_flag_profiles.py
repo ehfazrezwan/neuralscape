@@ -127,7 +127,7 @@ def test_ctx_repr_hides_the_dictator_token(monkeypatch, clean_env):
 
 
 class Recorder:
-    def __init__(self, logs="", network="nsx_default\n"):
+    def __init__(self, logs="", network="nstest-x_default\n"):
         self.calls, self.logs, self.network = [], logs, network
 
     def __call__(self, cmd, **kw):
@@ -150,7 +150,7 @@ def no_live_sidecars():
 READY = json.dumps({"ready": True, "port": 8080}) + "\n"
 
 
-def _sink(rec, project="nsx", **kw):
+def _sink(rec, project="nstest-x", **kw):
     return sidecar.Sink(project, {"/items": {"a": 1}}, run=rec, clock=time.monotonic, sleep=lambda s: None, **kw)
 
 
@@ -158,7 +158,7 @@ def test_start_runs_one_small_locked_down_container_on_the_discovered_network():
     rec = Recorder(logs=READY)
     s = _sink(rec).start()
     run = next(c for c in rec.calls if c[1] == "run")
-    for flag, value in (("--name", "nsc-acc-sink"), ("--network", "nsx_default"), ("--memory", "64m"), ("--cpus", "0.25"), ("--pids-limit", "32")):
+    for flag, value in (("--name", "nsc-acc-sink"), ("--network", "nstest-x_default"), ("--memory", "64m"), ("--cpus", "0.25"), ("--pids-limit", "32")):
         assert run[run.index(flag) + 1] == value, flag
     assert {"-d", "--rm", "--read-only"} <= set(run) and run[run.index("--cap-drop") + 1] == "ALL"
     assert not any(a.startswith("-v") or a == "--volume" or a == "-p" for a in run), "a sidecar must publish nothing and mount nothing"
@@ -211,7 +211,7 @@ def test_docker_is_only_ever_asked_for_its_four_verbs_and_only_about_its_own_nam
 
 
 def test_the_network_is_discovered_not_assumed():
-    assert _sink(Recorder(network="nsx_default\nother_net\n")).network() == "nsx_default"
+    assert _sink(Recorder(network="nstest-x_default\nother_net\n")).network() == "nstest-x_default"
     assert _sink(Recorder(network="only_one\n")).network() == "only_one"
     with pytest.raises(sidecar.SidecarError):
         _sink(Recorder(network="a\nb\n")).network()
@@ -299,3 +299,70 @@ def test_as_dictator():
     assert doc["profile_sha256"] and len(doc["profile_sha256"]) == 64
     s = doc["scenarios"][0]
     assert s["result"] == "skip" and "dictator not available" in s["detail"]
+
+
+# ── one compose-project gate, everywhere ─────────────────────────
+
+
+@pytest.mark.parametrize("name", ["neuralscape", " Neuralscape ", "NEURALSCAPE", "production", "myapp", "nscamp", ""])
+def test_check_compose_project_refuses_prod_and_non_disposable_names(name):
+    with pytest.raises(guard.GuardError):
+        guard.check_compose_project(name, env={})
+
+
+def test_check_compose_project_accepts_disposable_prefixes_and_normalises():
+    assert guard.check_compose_project(" NSCampaign ", env={}) == "nscampaign"
+    assert guard.check_compose_project("nstest-abc", env={}) == "nstest-abc"
+    assert guard.check_compose_project("bench-1", env={"NS_COMPOSE_ALLOWLIST": "bench-"}) == "bench-1"
+    with pytest.raises(guard.GuardError):
+        guard.check_compose_project("nscampaign", env={"NS_COMPOSE_ALLOWLIST": "bench-"})
+    with pytest.raises(guard.GuardError):  # the override cannot re-admit the production name
+        guard.check_compose_project("neuralscape", env={"NS_COMPOSE_ALLOWLIST": "neuralscape"})
+
+
+def test_every_docker_entry_point_uses_the_gate(monkeypatch):
+    calls = []
+    run = lambda cmd, **kw: calls.append(cmd) or subprocess.CompletedProcess(cmd, 0, "tok.en\n", "")
+    for bad in ("Neuralscape", "somethingelse"):
+        with pytest.raises(guard.GuardError):
+            runctx.run_compose(bad, "ps", run=run)
+        with pytest.raises(guard.GuardError):
+            tokens.mint_via_compose(bad, "u", run=run)
+        with pytest.raises(guard.GuardError):
+            tokens.mint_via_compose_python(bad, "u", 60, run=run)
+        with pytest.raises(guard.GuardError):
+            sidecar.Sink(bad)
+    assert calls == []
+    with pytest.raises(guard.GuardError):
+        guard.check("http://127.0.0.1:18199", " NeuralScape ", env={})
+
+
+def test_only_the_two_read_only_exec_forms_pass():
+    ok = [
+        ("exec", "-T", "neuralscape", "grep", "-rl", "--", "zq-x", "/data/vault"),
+        ("exec", "-T", "neuralscape", "grep", "-rl", "--", "zq-x", "/data/vault/Projects/p-1"),
+        ("exec", "-T", "redis", "redis-cli", "GET", "ns:connector:acc-1-rest"),
+    ]
+    bad = [
+        ("exec", "-T", "neuralscape", "grep", "-rl", "--", "zq-x", "/etc"),
+        ("exec", "-T", "neuralscape", "grep", "-rl", "--", "zq-x", "/data/vault/../../etc"),
+        ("exec", "-T", "neuralscape", "grep", "-rl", "--", "-e", "/data/vault"),
+        ("exec", "-T", "neuralscape", "cat", "/data/vault/x"),
+        ("exec", "-T", "redis", "redis-cli", "FLUSHALL"),
+        ("exec", "-T", "redis", "redis-cli", "GET", "arq:queue"),
+        ("exec", "-T", "neo4j", "grep", "-rl", "--", "x", "/data/vault"),
+    ]
+    assert all(runctx.read_only_exec(a) for a in ok)
+    assert not any(runctx.read_only_exec(a) for a in bad)
+    with pytest.raises(runctx.ConfigError):
+        runctx.run_compose("nscampaign", *bad[0], run=lambda *a, **k: None)
+
+
+def test_run_sh_refuses_a_compose_profile_without_a_compose_project():
+    sh = str(ACCEPTANCE / "run.sh")
+    env = {k: v for k, v in os.environ.items() if k != "NS_COMPOSE_PROJECT"}
+    r = subprocess.run([sh, "http://127.0.0.1:18200", "--profile", "flags-on"], capture_output=True, text=True, env=env)
+    assert r.returncode == 2 and "requires --compose-project" in r.stderr, r.stderr
+    r = subprocess.run([sh, "http://127.0.0.1:18200", "--profile", "flags-on", "--compose-project", " NeuralScape "], capture_output=True, text=True, env=env)
+    assert r.returncode == 2 and "production" in r.stderr, r.stderr
+    assert profile.load(ACCEPTANCE / "profiles" / "flags-on.env").headers["requires"] == ["compose"]

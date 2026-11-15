@@ -1,4 +1,6 @@
-"""The built-in OAuth 2.1 authorization server (what lets a claude.ai/Cowork-style client connect).
+"""Two scenarios here are EXPECTED RED UNTIL PR #495 (sec-03): the consent-page framing headers and refresh-token rotation.
+
+The built-in OAuth 2.1 authorization server (what lets a claude.ai/Cowork-style client connect).
 
 Profile ``flags-on`` turns it on with NEURALSCAPE_PUBLIC_URL (AUTH_PROVIDER stays ``token``) and
 folds scripts/oauth_login_test.py into an automatic flow: discovery, dynamic client registration,
@@ -44,6 +46,10 @@ def pkce() -> tuple[str, str]:
 def public_url(ctx) -> str:
     url = ctx.profile_flags.get("NEURALSCAPE_PUBLIC_URL", "")
     assert url, "the profile sets no NEURALSCAPE_PUBLIC_URL"
+    assert url.rstrip("/") == ctx.base_url, (
+        f"the profile's NEURALSCAPE_PUBLIC_URL ({url}) is not the URL this run targets ({ctx.base_url}): "
+        "run the stack on the profile's port, or edit that line for this run"
+    )
     return url.rstrip("/")
 
 
@@ -228,8 +234,8 @@ def test_the_consent_page_offers_the_token_login_and_validates_the_request(ctx, 
 @profiles("flags-on")
 @proves("auth.consent-page")
 def test_the_consent_page_cannot_be_framed(anon):
-    # Clickjacking: a login page that can be framed lets another site overlay it. Wanted:
-    # X-Frame-Options: DENY or CSP frame-ancestors 'none' (sec-03; red until it merges).
+    """EXPECTED RED UNTIL PR #495 (sec-03) merges. A login page that can be framed lets another site
+    overlay it; wanted: X-Frame-Options DENY or CSP frame-ancestors 'none'. Not weakened."""
     client_id = register(anon)
     _, challenge = pkce()
     r = anon.get("/oauth/authorize", params=authorize_url_params(client_id, challenge, "st-2"))
@@ -312,8 +318,9 @@ def test_a_refresh_token_yields_a_working_access_token_for_the_same_user(ctx, a,
 @profiles("flags-on")
 @proves("auth.oauth-server")
 def test_a_refresh_token_is_consumed_when_it_rotates(anon, login: Login):
-    # RFC 6749 sec 10.4 / OAuth 2.1: a refresh token is single-use and each refresh issues a new one
-    # (sec-03; red until it merges). The first refresh already happened in the login fixture.
+    """EXPECTED RED UNTIL PR #495 (sec-03) merges. RFC 6749 sec 10.4 / OAuth 2.1: a refresh token is
+    single-use and each refresh issues a new one. The first refresh already happened in the login
+    fixture. Not weakened."""
     lg = _ok(login)
     assert lg.refreshed.get("refresh_token") and lg.refreshed["refresh_token"] != lg.tokens["refresh_token"], "refresh did not rotate the refresh token"
     replay = anon.post("/oauth/token", data={"grant_type": "refresh_token", "refresh_token": lg.tokens["refresh_token"]})

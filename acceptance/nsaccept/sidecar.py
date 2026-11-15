@@ -111,10 +111,6 @@ def sink_fixtures(run_id: str) -> dict[str, Any]:
     return {CONNECTOR_ITEMS_PATH: {"items": items}}
 
 
-def _is_prod(project: str) -> bool:
-    return project.strip().lower() == guard.PROD_COMPOSE_PROJECT
-
-
 class Sink:
     """One ``nsc-acc-*`` sink container on a compose project's network."""
 
@@ -127,11 +123,7 @@ class Sink:
         clock: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], None] = time.sleep,
     ) -> None:
-        if _is_prod(project):
-            raise guard.GuardError(f"refusing compose project '{guard.PROD_COMPOSE_PROJECT}' (production)")
-        if not project.strip():
-            raise SidecarError("a sink needs the compose project it joins")
-        self.project = project.strip()
+        self.project = guard.check_compose_project(project)  # prod name / non-disposable project: refused
         self.name = check_name(name)
         self.fixtures = fixtures or {}
         self._run, self._clock, self._sleep = run, clock, sleep
