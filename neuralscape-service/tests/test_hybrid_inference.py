@@ -46,7 +46,7 @@ def test_nodes_preserve_candidate_ids_and_names():
     from scripts.benchmark_hybrid import cases
     requests, events = [], []
     client = client_for(response_handler(lambda _: '0', requests))
-    result = HybridDecisions('sekrit-key', endpoint='http://local.test/decide', model='test-model', client=client, telemetry=events.append).resolve_sync('nodes', cases()[0]['context'])
+    result = HybridDecisions('sekrit-key', endpoint='https://local.test/decide', model='test-model', client=client, telemetry=events.append).resolve_sync('nodes', cases()[0]['context'])
     assert result == {'entity_resolutions': [{'id': 0, 'name': 'New York City', 'duplicate_candidate_id': 0}]}
     assert requests[0]['questions']['0']['instructions']['extracted_entity']['name'] == 'NYC'
     assert events[0]['input_tokens'] == 30
@@ -58,13 +58,13 @@ def test_nodes_preserve_candidate_ids_and_names():
 def test_edges_never_invalidate_without_original_resolver(selected, expected):
     from scripts.benchmark_hybrid import cases
     client = client_for(response_handler(lambda _: selected, []))
-    assert HybridDecisions('test', endpoint='http://local.test/decide', model='test-model', client=client).resolve_sync('edges', cases()[6]['context']) == expected
+    assert HybridDecisions('test', endpoint='https://local.test/decide', model='test-model', client=client).resolve_sync('edges', cases()[6]['context']) == expected
 
 
 def test_invalidation_only_duplicate_falls_back():
     context = {'new_edge': 'Fact', 'existing_edges': [], 'edge_invalidation_candidates': [{'idx': 7, 'fact': 'Fact'}]}
     client = client_for(response_handler(lambda _: 'DUPLICATE', []))
-    assert HybridDecisions('test', endpoint='http://local.test/decide', model='test-model', client=client).resolve_sync('edges', context) is None
+    assert HybridDecisions('test', endpoint='https://local.test/decide', model='test-model', client=client).resolve_sync('edges', context) is None
 
 
 @pytest.mark.parametrize('status', [401, 402, 422, 429, 500, 529])
@@ -73,7 +73,7 @@ def test_provider_errors_abstain_and_do_not_retry_or_log_body(status):
     def handler(request):
         calls.append(request)
         return httpx.Response(status, text='sensitive-private-body')
-    result = HybridDecisions('secret-test', endpoint='http://local.test/decide', model='test-model', client=client_for(handler), telemetry=events.append).scores('Q', ['P'], 'policy')
+    result = HybridDecisions('secret-test', endpoint='https://local.test/decide', model='test-model', client=client_for(handler), telemetry=events.append).scores('Q', ['P'], 'policy')
     assert result is None and len(calls) == 1
     assert events[0]['input_tokens'] is None
     assert 'sensitive' not in json.dumps(events) and 'secret-test' not in json.dumps(events)
@@ -81,7 +81,7 @@ def test_provider_errors_abstain_and_do_not_retry_or_log_body(status):
 
 def test_limits_do_not_silently_truncate_evidence():
     client = Mock()
-    assert HybridDecisions('test', endpoint='http://local.test/decide', model='test-model', client=client).scores('Q', ['x' * 25000], '') is None
+    assert HybridDecisions('test', endpoint='https://local.test/decide', model='test-model', client=client).scores('Q', ['x' * 25000], '') is None
     client.post.assert_not_called()
 
 
@@ -89,13 +89,13 @@ def test_missing_answers_falls_back_but_preserves_usage():
     events = []
     client = client_for(lambda _: httpx.Response(200, json={'model': 'test-model', 'answers': {},
         'usage': {'input_tokens': 123, 'output_tokens': 4}}))
-    assert HybridDecisions('test', endpoint='http://local.test/decide', model='test-model', client=client, telemetry=events.append).scores('Q', ['P'], '') is None
+    assert HybridDecisions('test', endpoint='https://local.test/decide', model='test-model', client=client, telemetry=events.append).scores('Q', ['P'], '') is None
     assert events[0]['input_tokens'] == 123
 
 
 def test_model_version_change_abstains():
     client = client_for(lambda _: httpx.Response(200, json={'model': 'model-future', 'answers': {}}))
-    assert HybridDecisions('test', endpoint='http://local.test/decide', model='test-model', client=client).scores('Q', ['P'], '') is None
+    assert HybridDecisions('test', endpoint='https://local.test/decide', model='test-model', client=client).scores('Q', ['P'], '') is None
 
 
 @pytest.mark.parametrize('score', [float('nan'), float('inf'), -1, 1.1, True, '0.9'])
@@ -103,7 +103,7 @@ def test_invalid_noul_scores_abstain(score):
     # JSON encoders reject nonfinite values too; simulate their wire format.
     client = client_for(lambda _: httpx.Response(200, content=json.dumps({'model': 'test-model',
         'answers': {'0': {'type': 'noul', 'noul': score}}})))
-    assert HybridDecisions('test', endpoint='http://local.test/decide', model='test-model', client=client).scores('Q', ['P'], '') is None
+    assert HybridDecisions('test', endpoint='https://local.test/decide', model='test-model', client=client).scores('Q', ['P'], '') is None
 
 
 @pytest.mark.parametrize('mapping', [{'unfamiliar': 'preference'}, None])
@@ -125,7 +125,7 @@ def test_async_deadline_abstains(monkeypatch):
         raise TimeoutError
     monkeypatch.setattr(asyncio, 'wait_for', timeout)
     events = []
-    assert asyncio.run(HybridDecisions('test', endpoint='http://local.test/decide', model='test-model', telemetry=events.append).resolve('nodes', {})) is None
+    assert asyncio.run(HybridDecisions('test', endpoint='https://local.test/decide', model='test-model', telemetry=events.append).resolve('nodes', {})) is None
     assert events[0]['fallback_reason'] == 'deadline'
 
 
@@ -137,7 +137,7 @@ def test_classification_partial_abstention_and_dedup():
         answers = {key: choice('preference', q['criteria'], .99 if key == '0' else .2)
                    for key, q in body['questions'].items()}
         return httpx.Response(200, json={'model': 'test-model', 'answers': answers})
-    result = HybridDecisions('test', endpoint='http://local.test/decide', model='test-model', client=client_for(handler)).classify(
+    result = HybridDecisions('test', endpoint='https://local.test/decide', model='test-model', client=client_for(handler)).classify(
         ['Taste', ' taste ', 'Unknown'], {'preference': 'Personal tastes', 'convention': 'Team rules'})
     assert result == {'taste': 'preference'}
     assert len(requests) == 1 and len(requests[0]['questions']) == 2
@@ -145,7 +145,7 @@ def test_classification_partial_abstention_and_dedup():
 
 def test_classification_uses_bounded_batches_without_dropping_labels():
     requests = []
-    decision = HybridDecisions('test', endpoint='http://local.test/decide', model='test-model', client=client_for(response_handler(lambda _: 'preference', requests)))
+    decision = HybridDecisions('test', endpoint='https://local.test/decide', model='test-model', client=client_for(response_handler(lambda _: 'preference', requests)))
     result = decision.classify([f'label-{i}' for i in range(129)], {'preference': 'Tastes'})
     assert len(result) == 129
     assert [len(r['questions']) for r in requests] == [64, 64, 1]
@@ -250,7 +250,7 @@ async def test_edge_maintenance_uses_decisions_and_fallback():
 ])
 async def test_resolve_never_raises_into_the_graph_write(task, context):
     events = []
-    result = await HybridDecisions('test', endpoint='http://local.test/decide', model='test-model', client=Mock(), telemetry=events.append).resolve(task, context)
+    result = await HybridDecisions('test', endpoint='https://local.test/decide', model='test-model', client=Mock(), telemetry=events.append).resolve(task, context)
     assert result is None
     assert events and events[-1]['fallback_reason'] in {'TypeError', 'KeyError'}
 
@@ -258,7 +258,7 @@ async def test_resolve_never_raises_into_the_graph_write(task, context):
 # ── egress gate and temporal-contradiction routing (review round 2) ──────
 
 def _decisions(client, **kw):
-    return HybridDecisions('k', endpoint='http://local.test/decide', model='test-model', client=client, **kw)
+    return HybridDecisions('k', endpoint='https://local.test/decide', model='test-model', client=client, **kw)
 
 
 def test_all_distinct_with_invalidation_candidates_falls_back_to_original_resolver():
@@ -339,7 +339,7 @@ def test_egress_gate_is_wired_into_the_graph_decision_client(monkeypatch):
     real = sensitivity.classify_sensitivity
     monkeypatch.setattr(sensitivity, 'classify_sensitivity', lambda t: gate_calls.append(t) or real(t))
     config = GraphitiConfig(url='bolt://x', username='u', password='p', graphiti_hybrid_enabled=True,
-                            graphiti_hybrid_api_key='k', graphiti_hybrid_endpoint='http://local.test/decide',
+                            graphiti_hybrid_api_key='k', graphiti_hybrid_endpoint='https://local.test/decide',
                             graphiti_hybrid_model='test-model')
     decision = _build_hybrid_decisions(config)
     assert decision.egress_check is not None
@@ -350,3 +350,94 @@ def test_egress_gate_is_wired_into_the_graph_decision_client(monkeypatch):
     assert decision.resolve_sync('nodes', gated) is None
     spy.post.assert_not_called()
     assert any('salary' in t for t in gate_calls)
+
+
+# ── extraction egress gate, endpoint transport policy, MemoryGraph wiring (round 4) ──
+
+def _extraction_on(monkeypatch, endpoint='https://decide.example/v1'):
+    monkeypatch.setattr(settings, 'hybrid_extraction_enabled', True)
+    monkeypatch.setattr(settings, 'hybrid_inference_api_key', 'k')
+    monkeypatch.setattr(settings, 'hybrid_inference_endpoint', endpoint)
+    hybrid._extraction_guard.cache_clear()
+
+
+@pytest.mark.parametrize('messages', [
+    [{'role': 'user', 'content': 'My salary is $250,000 and my stock options vest in 2027.'}],
+    [{'role': 'user', 'content': 'I prefer tea.'}, {'role': 'user', 'content': 'The API password: hunter2 is in the vault.'}],
+])
+def test_extraction_never_sends_a_gated_window(monkeypatch, messages):
+    _extraction_on(monkeypatch)
+    select = Mock(side_effect=AssertionError('gated text reached the decision layer'))
+    monkeypatch.setattr('source_extraction.select_facts', select)
+    events = []
+    monkeypatch.setattr(hybrid, 'decisions', lambda **kw: HybridDecisions(
+        'k', endpoint=settings.hybrid_inference_endpoint, model='m', **{**kw, 'telemetry': events.append}))
+    assert hybrid.extract_source_facts(messages) is None
+    select.assert_not_called()
+    assert events[-1]['fallback_reason'] == 'egress_blocked'
+
+
+def test_extraction_sends_a_clean_window(monkeypatch):
+    _extraction_on(monkeypatch)
+    select = Mock(return_value=[('preference', 'I prefer tea.')])
+    monkeypatch.setattr('source_extraction.select_facts', select)
+    assert hybrid.extract_source_facts([{'role': 'user', 'content': 'I prefer tea.'}]) == [('preference', 'I prefer tea.')]
+
+
+@pytest.mark.parametrize('url,ok', [
+    ('https://decide.example/v1', True), ('http://127.0.0.1:18765/decide', True), ('http://localhost/x', True),
+    ('http://[::1]:9/x', True), ('http://decide.example/v1', False), ('ftp://127.0.0.1/x', False),
+    ('http://127.0.0.1.evil.example/x', False), ('', False), ('not a url', False),
+])
+def test_endpoint_policy_is_https_or_loopback(url, ok):
+    from graphiti_core.llm_client.hybrid_decision_client import endpoint_allowed
+    assert endpoint_allowed(url) is ok
+
+
+def test_non_https_remote_endpoint_is_inactive_warned_and_never_contacted(monkeypatch, caplog):
+    _extraction_on(monkeypatch, endpoint='http://decide.example/v1')
+    transport = Mock()
+    events = []
+    decision = HybridDecisions('k', endpoint='http://decide.example/v1', model='m', client=transport,
+                               telemetry=events.append)
+    assert decision.scores('q', [{'memory': 'a'}], 'p') is None
+    transport.post.assert_not_called()
+    assert events[0]['fallback_reason'] == 'insecure_endpoint'
+    with caplog.at_level('WARNING'):
+        assert any('HYBRID_INFERENCE_ENDPOINT' in m for m in hybrid.warn_if_inactive())
+    assert 'hybrid_inference_inactive' in caplog.text
+    select = Mock()
+    monkeypatch.setattr('source_extraction.select_facts', select)
+    assert hybrid.extract_source_facts([{'role': 'user', 'content': 'I prefer tea.'}]) is None
+    select.assert_not_called()
+
+
+def test_memory_graph_constructs_its_decision_client_with_the_egress_gate(monkeypatch):
+    """Construct the real MemoryGraph (stub driver/clients): the client it attaches is gated."""
+    from types import SimpleNamespace
+    from mem0.graphs.configs import GraphitiConfig
+    import mem0.memory.graphiti_memory as gm
+
+    llm = SimpleNamespace()
+    monkeypatch.setattr(gm, '_create_llm_client', lambda **kw: llm)
+    monkeypatch.setattr(gm, '_create_embedder', lambda **kw: object())
+    monkeypatch.setattr(gm, '_create_cross_encoder', lambda **kw: object())
+    monkeypatch.setattr(gm, 'Neo4jDriver', lambda **kw: object())
+    monkeypatch.setattr(gm, 'Graphiti', lambda **kw: SimpleNamespace(llm_client=kw['llm_client']))
+    spy = Mock()
+    from graphiti_core.llm_client import hybrid_decision_client
+    monkeypatch.setattr(hybrid_decision_client, '_http_client', lambda: spy)
+    config = GraphitiConfig(url='bolt://x', username='u', password='p', graphiti_hybrid_enabled=True,
+                            graphiti_hybrid_api_key='k', graphiti_hybrid_endpoint='https://decide.example/v1',
+                            graphiti_hybrid_model='m')
+    graph = gm.MemoryGraph(SimpleNamespace(graph_store=SimpleNamespace(config=config)))
+    try:
+        decision = graph.graphiti.llm_client.decision_client
+        assert decision is llm.decision_client and decision.egress_check is not None
+        gated = {'extracted_nodes': [{'id': 0, 'name': 'Ada'}],
+                 'existing_nodes': [{'candidate_id': 0, 'name': 'Ada L', 'summary': ''}],
+                 'episode_content': 'My salary is $250,000 and my stock options vest in 2027.', 'previous_episodes': []}
+        assert decision.resolve_sync('nodes', gated) is None
+        spy.post.assert_not_called()
+    finally:
+        graph._bridge.stop() if hasattr(graph._bridge, 'stop') else None

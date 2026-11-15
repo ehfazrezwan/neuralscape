@@ -68,7 +68,7 @@ entity/relationship extraction is not replaced by this sentence selector.
 
 Existing storage, sensitivity regex gates, authorization, source metadata and
 graph group boundaries remain in effect. Source offsets ground reconstruction
-but are not persisted as a new provenance field. The rejected native Needle
+but are not persisted as a new provenance field. The rejected native small-local-model
 prototype is not part of the runtime; the decision model abstention goes directly to the
 original extractor.
 
@@ -351,7 +351,7 @@ a minimal one-call substitution, but it
 does not introduce a provider framework, replace vendor generation APIs, fork
 the extraction pipeline, or build the deferred policy engine. Validation,
 whole-window fallback and late-result isolation account for useful complexity.
-The failed Needle experiment was removed from the runtime and dependency graph
+The failed small-local-model experiment was removed from the runtime and dependency graph
 after review rather than shipping an unisolated native path.
 
 Existing subtree ancestry, package layouts and `scripts/sync-upstream.sh` are

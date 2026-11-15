@@ -81,7 +81,7 @@ def test_late_extraction_cannot_publish_evidence(monkeypatch):
     monkeypatch.setattr(settings, 'hybrid_inference_api_key', 'test')
     monkeypatch.setattr(settings, 'hybrid_extraction_deadline_s', .01)
     monkeypatch.setattr(hybrid, '_extraction_guard', lambda *a: guard)
-    monkeypatch.setattr(hybrid, 'decisions', lambda **kw: HybridDecisions('test', endpoint='http://local.test/decide', model='test-model', **kw))
+    monkeypatch.setattr(hybrid, 'decisions', lambda **kw: HybridDecisions('test', endpoint='https://local.test/decide', model='test-model', **kw))
     def delayed(messages, decision, *, category_evidence):
         release.wait(2)
         category_evidence['late'] = 'must not publish'

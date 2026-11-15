@@ -141,7 +141,7 @@ def test_flag_on_without_endpoint_or_key_warns_and_falls_back(monkeypatch, caplo
     monkeypatch.setattr(settings, 'hybrid_inference_api_key', 'k')
     monkeypatch.setattr(httpx.Client, 'send', Mock(side_effect=AssertionError('network call without an endpoint')))
     with caplog.at_level('WARNING'):
-        assert hybrid.warn_if_inactive() == ['HYBRID_INFERENCE_ENDPOINT']
+        assert [m.split()[0] for m in hybrid.warn_if_inactive()] == ['HYBRID_INFERENCE_ENDPOINT']
     assert 'hybrid_inference_inactive' in caplog.text
     assert hybrid.extract_source_facts([{'role': 'user', 'content': 'I prefer tea.'}]) is None
     assert hybrid.classify_types(['x']) is None  # categories flag still off

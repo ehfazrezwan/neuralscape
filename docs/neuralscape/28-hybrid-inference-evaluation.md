@@ -12,7 +12,7 @@ original model for uncertainty, conflicts, extraction and synthesis. Consider
 The decision model policy reranking separately as a quality feature, not a saving over the
 current deterministic ranking. Bucket-aware category mapping improved after
 redesign and merits sandbox testing with partial fallback. Do not promote
-Needle: its initial pilot added work without saving calls.
+The small local model: its initial pilot added work without saving calls.
 
 The strongest finding is selective replacement, not replacing every LLM.
 Component savings were substantial; the graph write path saved only about 12%
@@ -205,9 +205,9 @@ independent external benchmark. Alias matching is deliberately bypassed in this
 direct classifier comparison; real imports should avoid these calls whenever
 an alias already resolves the type.
 
-### Negative result: Needle literal extraction
+### Negative result: small local extraction model
 
-Needle 3 (`cactus-needle==3.0.1`) accepted **0/12** literal extraction attempts.
+A small local extraction model accepted **0/12** literal extraction attempts.
 All used the original model. A raw high-confidence example extracted only
 “concise answers” and classified it as convention from “I prefer concise
 answers without emojis.” The exact-source guard rejected it; lowering that
@@ -219,13 +219,7 @@ source as a verbatim quote, but native inference lacked process-level
 crash/timeout isolation. The service lane and dependency were removed from this
 PR after review; this negative result remains research context only.
 
-The actual downloaded Needle archive was 35,335,380 bytes, SHA-256
-`c9d915eca282ed42d1a09b143b592adb4cc6744ffe2d294adf5cfc5548170c38`.
-Python's download client encountered a certificate-chain error on this host;
-the official artifacts were fetched with TLS verification intact and checked
-against published hashes. No TLS verification was disabled. See the
-[Needle repository](https://github.com/cactus-compute/needle) and
-[Needle 3 model](https://huggingface.co/Cactus-Compute/needle3).
+The model artifact was downloaded with TLS verification intact and checked against its published hash; no verification was disabled.
 
 ### Next extraction design: selection rather than generation
 
@@ -242,7 +236,7 @@ This redesign has now been implemented behind `HYBRID_EXTRACTION_ENABLED=false`;
 see [the extraction follow-up](29-source-extraction-evaluation.md) for the baseline,
 held-out comparison and actual extraction-to-graph/vector checks. It selects
 source sentences and preserves original generation for unsupported inputs. The
-failed Needle experiment did not establish that the decision model candidate selection would
+failed small-local-model experiment did not establish that the decision model candidate selection would
 fail. Adding the decision model after a Gemini call that already extracts and categorizes facts
 would not remove that call; this implementation instead runs selection first.
 
@@ -257,10 +251,10 @@ Captions cannot establish details visible only in diagrams or unspoken demos.
   and scores are a good fit; they do not imply free-form generation or a
   drop-in replacement for every model client. This pilot used a hosted
   endpoint, not an evaluated self-hosted deployment.
-- [Needle 3 video](https://www.youtube.com/watch?v=qbN559fQn7k): small local
+- Small-local-model video: small local
   function/slot models are plausible for literal structured inputs. Our
   extraction result did not validate a broader replacement claim.
-- [Reranking video](https://www.youtube.com/watch?v=UhGH8cNG0qs): policy-aware
+- Reranking video: policy-aware
   candidate scoring motivated the optional recall reranker. Its reported
   BM25/demo accuracy gain is not a NeuralScape result. The linked Colab notebook
   was inaccessible; its code was not inspected.
@@ -293,12 +287,12 @@ off and nothing activates without BOTH an endpoint and a key.
 
 | Setting | Default | What it does / what turning it on sends off-box |
 |---|---|---|
-| `HYBRID_INFERENCE_ENDPOINT` | empty | URL of the decision API. Empty = no feature can activate (warning at startup). |
+| `HYBRID_INFERENCE_ENDPOINT` | empty | URL of the decision API. Must be `https`, or a loopback host (local fakes/proxies); anything else is refused: feature inactive, startup warning. Empty = no feature can activate. |
 | `HYBRID_INFERENCE_API_KEY` | empty | Bearer key for the endpoint. Never logged. |
 | `HYBRID_INFERENCE_MODEL` | empty | Model id sent with each request and checked against the response. |
 | `HYBRID_GRAPH_ENABLED` | `false` | Graph node/edge resolution. Sends new/candidate entity names, summaries and facts plus the raw episode and previous episodes (content gated by the sensitivity floor). |
 | `HYBRID_CATEGORIES_ENABLED` | `false` | OKF type-to-category mapping. Sends only the unfamiliar type labels. |
-| `HYBRID_EXTRACTION_ENABLED` | `false` | Source-span extraction. Sends the user messages of each extraction window (plain conversations only; guidance, speaker and custom extractors bypass it). |
+| `HYBRID_EXTRACTION_ENABLED` | `false` | Source-span extraction. Sends the user messages of each extraction window unless the text matches a sensitivity class (plain conversations only; guidance, speaker and custom extractors bypass it). |
 | `HYBRID_RERANK_ENABLED` | `false` | Recall reranking. Sends memory text and metadata of eligible top rows (sensitivity-stamped, non-default-visibility and gated-text rows are never sent). |
 | `HYBRID_THRESHOLD` | `0.9` | Minimum probability/confidence for accepting a decision (0.5-1.0). Routing threshold, not calibrated correctness. |
 | `HYBRID_TIMEOUT_S` | `2.0` | Per-request HTTP timeout (0-30 s). Nothing extra is sent. |
@@ -336,7 +330,10 @@ off and nothing activates without BOTH an endpoint and a key.
   a sensitivity stamp, a visibility other than its category's default, or text
   matching a sensitivity class (such rows keep their original position); graph
   resolution abstains to the original resolver when any text in its context
-  matches a class. Graph episodes do not carry their visibility, so the graph
+  matches a class; extraction does not send a window (each message, or the
+  messages joined) that matches a class, so the original extractor handles it.
+  All three paths are gated by the same regex floor. Extraction windows carry no
+  visibility, so that gate is content-based only. Graph episodes do not carry their visibility, so the graph
   gate is content-based only. Anything the regex floor misses is sent.
 - Edge resolution: when invalidation candidates exist, the original resolver
   handles the case; the fast path only answers duplicate/distinct decisions
@@ -390,7 +387,7 @@ Wait until the stores are ready, then run baseline before hybrid:
 
 The rerank script downloads MiniLM on first `--local` run; use
 `--local-model-path /absolute/path/to/model` for pre-provisioned artifacts.
-Downloads are not included in warm latency. The rejected Needle prototype is
+Downloads are not included in warm latency. The rejected small-local-model prototype is
 not included in the service runtime or benchmark command surface.
 
 For a sandbox service trial, set `HYBRID_GRAPH_ENABLED=true` first; leave
@@ -413,7 +410,7 @@ host and the built test container. Existing deprecation/mock-coroutine warnings
 remain; this is not a warning-free suite. Fifty new hybrid contract tests cover
 provider errors, malformed choices/scores, timeout fallback, category scoping,
 partial acceptance, batch limits, graph decision wiring and safe reranking. The
-initial Needle contract tests were removed with the rejected runtime lane.
+initial small-local-model contract tests were removed with the rejected runtime lane.
 `git diff --check` passes.
 
 The container suite excludes the existing live-ARQ test module. The separate
@@ -422,7 +419,7 @@ Stop the sandbox without deleting its data with
 `docker compose -p ns-hybrid-eval -f neuralscape-bench/docker-compose.hybrid.yml stop`.
 
 Private report files from this evaluation: `baseline.json`, `hybrid-pilot.json`,
-`hybrid-needle-pilot.json`, `challenge-{baseline,hybrid}.json`,
+`hybrid-local-model-pilot.json`, `challenge-{baseline,hybrid}.json`,
 `graph-{baseline,baseline-warm,hybrid,fallback}.json`,
 `graph-expanded-{baseline,hybrid,fallback}.json`, `rerank.json`, `categories.json`,
 `categories-{scoped,shared,heldout,control-heldout}.json`.

@@ -35,9 +35,13 @@ def warn_if_inactive() -> list[str]:
     """
     enabled = [f for f in ('graph', 'categories', 'extraction', 'rerank')
                if getattr(settings, f'hybrid_{f}_enabled')]
-    missing = [name for name, value in (('HYBRID_INFERENCE_ENDPOINT', settings.hybrid_inference_endpoint),
-                                        ('HYBRID_INFERENCE_API_KEY', settings.hybrid_inference_api_key))
-               if enabled and not value]
+    from graphiti_core.llm_client.hybrid_decision_client import endpoint_allowed
+
+    endpoint = settings.hybrid_inference_endpoint
+    missing = [name for name, ok in (
+        ('HYBRID_INFERENCE_ENDPOINT (must be https, or a loopback host)', bool(endpoint) and endpoint_allowed(endpoint)),
+        ('HYBRID_INFERENCE_API_KEY', bool(settings.hybrid_inference_api_key)))
+        if enabled and not ok]
     if missing:
         logger.warning('hybrid_inference_inactive flags=%s missing=%s; falling back to the original path',
                        ','.join(enabled), ','.join(missing))
@@ -66,9 +70,21 @@ def extract_source_facts(messages: list[dict], *, telemetry=None,
 
     decision = decisions(telemetry=telemetry)
     try:
-        if not (settings.hybrid_inference_api_key and settings.hybrid_inference_endpoint):
+        from graphiti_core.llm_client.hybrid_decision_client import endpoint_allowed
+
+        if not (settings.hybrid_inference_api_key and settings.hybrid_inference_endpoint
+                and endpoint_allowed(settings.hybrid_inference_endpoint)):
             decision.emit({'provider': 'hybrid', 'task': 'source_extraction', 'fallback_reason': 'missing_key_or_endpoint'})
             return None
+        # Egress gate: a window whose text matches a sensitivity class is never
+        # sent; the original extractor handles it.
+        from memory.sensitivity import classify_sensitivity
+
+        texts = [m.get('content') for m in messages if isinstance(m.get('content'), str)]
+        if any(classify_sensitivity(t) for t in [*texts, '\n'.join(texts)]):
+            decision.emit({'provider': 'hybrid', 'task': 'source_extraction', 'fallback_reason': 'egress_blocked'})
+            return None
+
         def operation():
             evidence, events = {}, []
             original = decision.telemetry

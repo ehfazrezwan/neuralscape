@@ -61,6 +61,22 @@ def category_policy(categories: dict[str, str]) -> str:
     return policy
 
 
+def endpoint_allowed(url: str) -> bool:
+    """https anywhere, or any scheme on a loopback host (local fakes/proxies).
+
+    Prompts and keys must not cross a network in clear text.
+    """
+    from urllib.parse import urlparse
+
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return False
+    if parsed.scheme == 'https' and parsed.hostname:
+        return True
+    return parsed.scheme in ('http', 'https') and parsed.hostname in ('localhost', '127.0.0.1', '::1')
+
+
 class HybridDecisions:
     def __init__(self, api_key: str, *, endpoint: str = '', model: str = '', threshold: float = .9,
                  timeout: float = 2.0, telemetry: Telemetry | None = None,
@@ -99,6 +115,8 @@ class HybridDecisions:
                 raise ValueError('missing_key')
             if not self.endpoint:
                 raise ValueError('missing_endpoint')
+            if not endpoint_allowed(self.endpoint):
+                raise ValueError('insecure_endpoint')
             body = {'model': self.model, 'state': state, 'questions': questions}
             # Conservative BYTE caps, not an inaccurate tokenizer estimate.
             # Do not truncate evidence or options silently to fit the model.
@@ -159,7 +177,7 @@ class HybridDecisions:
         except (httpx.HTTPError, ValueError, KeyError, TypeError, AttributeError) as exc:
             # Exception messages can contain private response/request data.
             event['fallback_reason'] = str(exc) if type(exc) is ValueError and str(exc) in {
-                'missing_key', 'missing_endpoint', 'question_limit', 'input_limit', 'choice_limit', 'model_version_changed',
+                'missing_key', 'missing_endpoint', 'insecure_endpoint', 'question_limit', 'input_limit', 'choice_limit', 'model_version_changed',
                 'answer_set_mismatch', 'invalid_answer_type', 'invalid_choice', 'invalid_distribution',
                 'uncertain_choice', 'invalid_probability', 'unsupported_question',
                 'http_401', 'http_402', 'http_422', 'http_429', 'http_503', 'http_529',

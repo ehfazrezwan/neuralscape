@@ -55,23 +55,3 @@ def _disable_auth_for_tests():
     settings.neuralscape_api_key = saved_api_key
     settings.default_user_id = saved_default_user_id
     settings.neuralscape_auth_disabled = saved_auth_disabled
-
-
-def pytest_collection_modifyitems(config, items):
-    """Deselect store-backed integration modules that cannot run here.
-
-    A module that sets ``_INTEGRATION_SKIP_REASON`` (a string) declares it needs
-    live stores that are not reachable. In an ordinary run they are deselected,
-    not skipped, so the CI skip inventory (.github/ci/expected_skips.json)
-    stays exact. An explicit ``-m integration`` run keeps them as visible skips
-    carrying the reason.
-    """
-    if "integration" in (config.option.markexpr or ""):
-        return
-    kept, dropped = [], []
-    for item in items:
-        unreachable = getattr(item.module, "_INTEGRATION_SKIP_REASON", None)
-        (dropped if unreachable and item.get_closest_marker("integration") else kept).append(item)
-    if dropped:
-        config.hook.pytest_deselected(items=dropped)
-        items[:] = kept

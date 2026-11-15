@@ -39,13 +39,13 @@ def test_wire_validation_preserves_soft_scores_only_when_requested():
     a = answer()
     wire = {'model': 'test-model', 'answers': {'c': a}}
     client = httpx.Client(transport=httpx.MockTransport(lambda _: httpx.Response(200, json=wire)))
-    d = HybridDecisions('test', endpoint='http://local.test/decide', model='test-model', client=client)
+    d = HybridDecisions('test', endpoint='https://local.test/decide', model='test-model', client=client)
     questions = {'c': {'type': 'choice', 'criteria': dict.fromkeys(a['probabilities'])}}
     assert d.ask({}, questions, task='graph') is None
     assert d.ask({}, questions, task='extract', preserve_choice_probabilities=True) == {'c': a}
     wire['answers']['c']['probabilities']['architecture'] = float('nan')
     client = httpx.Client(transport=httpx.MockTransport(lambda _: httpx.Response(200, content=json.dumps(wire))))
-    assert HybridDecisions('test', endpoint='http://local.test/decide', model='test-model', client=client).ask({}, questions, task='extract', preserve_choice_probabilities=True) is None
+    assert HybridDecisions('test', endpoint='https://local.test/decide', model='test-model', client=client).ask({}, questions, task='extract', preserve_choice_probabilities=True) is None
 
 
 @pytest.mark.parametrize('retain,standalone,expected_reason', [(.5,.99,'retain_uncertain'), (.99,.5,'standalone_uncertain'), (.99,.99,None)])
