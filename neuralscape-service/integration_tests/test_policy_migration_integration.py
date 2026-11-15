@@ -2,7 +2,7 @@
 
 Needs MIGRATION_TEST_REDIS_URL, MIGRATION_TEST_QDRANT_URL and
 MIGRATION_TEST_NEO4J_URI (+ MIGRATION_TEST_NEO4J_PASSWORD); skipped otherwise
-(that skip is the declared one).  The sources are read-only: the test proves the
+(failed under NS_INTEGRATION_REQUIRED=1).  The sources are read-only: the test proves the
 stores are unchanged by the inventory.
 """
 
@@ -14,14 +14,19 @@ import uuid
 
 import pytest
 
-pytestmark = [
-    pytest.mark.integration,
-    pytest.mark.skipif(
-        not (os.environ.get("MIGRATION_TEST_REDIS_URL") and os.environ.get("MIGRATION_TEST_QDRANT_URL")
-             and os.environ.get("MIGRATION_TEST_NEO4J_URI")),
-        reason="MIGRATION_TEST_* not set (policy migration real-store integration)",
-    ),
-]
+_NEEDED = ("MIGRATION_TEST_REDIS_URL", "MIGRATION_TEST_QDRANT_URL", "MIGRATION_TEST_NEO4J_URI")
+
+
+@pytest.fixture(autouse=True, scope="module")
+def _require_stores():
+    """Missing stores fail under NS_INTEGRATION_REQUIRED=1 (the gate) and skip otherwise."""
+
+    missing = [name for name in _NEEDED if not os.environ.get(name)]
+    if missing:
+        if os.environ.get("NS_INTEGRATION_REQUIRED") == "1":
+            pytest.fail(f"NS_INTEGRATION_REQUIRED=1 but {missing} not set")
+        pytest.skip("MIGRATION_TEST_* not set (policy migration real-store integration)")
+
 
 redis = pytest.importorskip("redis")
 qdrant_client = pytest.importorskip("qdrant_client")
