@@ -23,12 +23,18 @@ stdin JSON → detect client → adapter extracts turns → core/flush → Neura
 | `neuralscape-plugin/src/core/flush.ts` | Shared filter + flush logic (ALL clients use this) |
 | `neuralscape-plugin/src/core/compile.ts` | Shared compile trigger (ALL clients use this) |
 | `neuralscape-plugin/src/adapters/detect.ts` | Client detection + extractor lookup |
-| `neuralscape-plugin/src/adapters/openclaw.ts` | Reference: OpenClaw adapter (1 turn per event) |
+| `neuralscape-plugin/src/adapters/openclaw.ts` | Reference: the existing OpenClaw adapter (1 turn per event) |
 | `neuralscape-plugin/src/adapters/claude-code.ts` | Reference: Claude Code adapter (N turns from transcript) |
 | `neuralscape-plugin/src/adapters/generic.ts` | Reference: simplest adapter (direct JSON) |
 | `neuralscape-plugin/src/hooks/conversation-turn.ts` | Entry point: detect → adapter → flush |
-| `neuralscape-plugin/src/hooks/session-end.ts` | Entry point: detect → adapter → flush + compile |
+| `neuralscape-plugin/src/hooks/session-end.ts` | Entry point bound to `Stop` (per assistant turn): detect → adapter → flush + compile; writes no marker |
+| `neuralscape-plugin/src/hooks/session-summary.ts` | Entry point bound to `SessionEnd` (once per session): writes the `.ended` buffer marker, stores one structured session note |
+| `neuralscape-plugin/src/hooks/{session-start,pre-tool-use,post-tool-use,user-prompt-submit,pre-compact}.ts` | Claude Code-only entry points: context injection, File Read Gate, observation capture, compile trigger, compact snapshot |
 | `neuralscape-plugin/src/utils.ts` | HTTP client, stdin parsing, identity helpers |
+
+### Hook events and bundles
+
+`hooks/hooks.json` registers seven Claude Code events (`SessionStart`, `PreToolUse`, `PostToolUse`, `UserPromptSubmit`, `PreCompact`, `Stop`, `SessionEnd`); `esbuild.config.js` builds eight bundles (those seven entry points' scripts plus `conversation-turn.js`, the per-turn hook used by OpenClaw and generic clients). A new client usually only needs the two conversation hooks (`conversation-turn`, `session-end`); the other events are Claude Code-specific. Claude Code payloads are recognised by `hook_event_name` / `transcript_path`, so every Claude Code event, not only `Stop`, resolves to the `claude-code` adapter. The `PreCompact` hook uses the adapter's turn extractors too (`extractRecentUserPrompts` for Claude Code).
 
 ### Shared interfaces (from `core/types.ts`)
 
@@ -248,7 +254,7 @@ Extracts one turn from an event payload. Demonstrates field mapping from a neste
 
 ### Batch/transcript: claude-code.ts
 
-Reads a transcript file, pairs user/assistant messages, tracks offset to avoid re-flushing. Demonstrates async extraction with file I/O.
+Reads a transcript file, pairs user/assistant messages, tracks offset to avoid re-flushing (the offset is committed afterwards by `commitClaudeCodeFlush`, under a per-transcript lock). Demonstrates async extraction with file I/O.
 
 **File**: `neuralscape-plugin/src/adapters/claude-code.ts`
 

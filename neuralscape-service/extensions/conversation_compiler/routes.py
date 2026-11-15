@@ -3,6 +3,7 @@
 Mounted at /v1/extensions/conversation-compiler/ by the extension registry.
 """
 
+import re
 from datetime import datetime
 
 import structlog
@@ -159,19 +160,19 @@ def create_router(
         daily_logs = writer.list_daily_logs()
 
         # Find last flush and compile times from the log
-        log_content = writer.read_file("log.md")
+        log_content = writer.read_log()
         last_flush = None
         last_compile = None
         if log_content:
             # Parse log entries for timestamps
             flush_matches = list(
-                __import__("re").finditer(
+                re.finditer(
                     r"\*\*(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\*\* — (?:Flush|flush)",
                     log_content,
                 )
             )
             compile_matches = list(
-                __import__("re").finditer(
+                re.finditer(
                     r"\*\*(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\*\* — Compiled",
                     log_content,
                 )
@@ -183,7 +184,11 @@ def create_router(
 
         # Count articles (exclude daily logs, index, log)
         article_count = len(
-            [f for f in all_files if not f.startswith("Daily/") and f not in ("index.md", "log.md")]
+            [
+                f
+                for f in all_files
+                if not f.startswith(("Daily/", "_raw/Daily/")) and f not in writer.META_FILES
+            ]
         )
 
         return StatusResponse(

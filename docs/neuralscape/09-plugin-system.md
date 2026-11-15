@@ -11,7 +11,7 @@ source: handwritten
 
 Neuralscape's plugin system is the bridge that lets multiple AI clients — Claude Code, **Claude Cowork**, OpenClaw, future agents like Cursor — write into the **same** memory layer without each client needing to understand Qdrant, Neo4j, or the [13-category taxonomy](./03-memory-model.md). The design is two-layered:
 
-1. **Client-side TypeScript plugin** (`neuralscape-plugin/`) — a single Node bundle exposing three hook entry points. It auto-detects the host client from the shape of the JSON payload arriving on stdin, runs a per-client *adapter* that normalizes the payload into a canonical `ConversationTurn`, and then makes ordinary HTTP calls to the Neuralscape service.
+1. **Client-side TypeScript plugin** (`neuralscape-plugin/`) — a set of Node hook bundles (eight scripts, bound to seven Claude Code hook events). It auto-detects the host client from the shape of the JSON payload arriving on stdin, runs a per-client *adapter* that normalizes the payload into a canonical `ConversationTurn`, and then makes ordinary HTTP calls to the Neuralscape service.
 2. **Server-side `conversation_compiler` extension** — a [FastAPI extension](./02-service-architecture.md) that owns `/flush` and `/compile`, runs Gemini extraction, dual-writes to the Obsidian vault, and synthesizes daily knowledge articles.
 
 The crucial property is that *everything past the adapter is client-agnostic*. Adapters are the only place where Claude Code transcript files, OpenClaw `message:sent` events, or any future client's wire format are touched. After normalization, a turn from Claude Code and a turn from OpenClaw look identical, follow the same [extraction pipeline](./07-async-pipeline.md), and end up in the same Qdrant collection, the same Neo4j graph, and the same vault folder.
@@ -43,32 +43,29 @@ neuralscape-plugin/
 ├── .claude-plugin/plugin.json        v2 manifest (full schema + userConfig)
 ├── .mcp.json                         remote HTTP MCP at <URL>/mcp/
 ├── hooks/
-│   ├── hooks.json                    Claude Code: SessionStart, Stop
+│   ├── hooks.json                    Claude Code: SessionStart, PreToolUse, PostToolUse, UserPromptSubmit, PreCompact, Stop, SessionEnd
 │   └── openclaw-hooks.json           OpenClaw: message:sent, session:end
-├── skills/
-│   ├── status/SKILL.md
-│   ├── search/SKILL.md
-│   ├── sync/SKILL.md
-│   └── config/SKILL.md
+├── skills/                           capture, compile-observations, ingest, ns-config, ns-status,
+│                                     process, project, recall, remember, save-session, search, sync
 ├── src/
 │   ├── adapters/{detect,claude-code,openclaw,generic}.ts
-│   ├── core/{types,compile,flush}.ts
-│   ├── hooks/{session-start,conversation-turn,session-end}.ts
+│   ├── core/{types,compile,flush,compact,disclosure,read-gate,session-note,transcript-lock}.ts
+│   ├── hooks/{session-start,pre-tool-use,post-tool-use,user-prompt-submit,pre-compact,session-end,session-summary,conversation-turn}.ts
 │   ├── types.ts                      13-category taxonomy mirror
 │   └── utils.ts                      HTTP client, identity, stdin parser
 ├── esbuild.config.js
-├── package.json                      v2.0.0; postinstall builds bundles
+├── package.json                      postinstall builds bundles
 ├── LICENSE                           MIT
 └── CHANGELOG.md
 ```
 
 The repository root also carries `.claude-plugin/marketplace.json` so the repo *is* the marketplace; users install with `/plugin marketplace add ehfazrezwan/neuralscape` followed by `/plugin install neuralscape@neuralscape-plugins` (Claude Code) or the equivalent Cowork UI flow.
 
-`npm run build` runs `esbuild.config.js`, which bundles the three hook source files in `src/hooks/` into three matching `scripts/*.js` outputs. Each is an ESM Node 18+ bundle with a `#!/usr/bin/env node` shebang and `minify: true`, so it can be invoked directly as a command. There are exactly three entry points because there are exactly three lifecycle moments: session start (sync, blocks the user briefly while context loads), per-turn capture (async, fast), and session end (async, may take a minute while compile runs).
+`npm run build` runs `esbuild.config.js`, which bundles the eight hook source files in `src/hooks/` into eight matching `scripts/*.js` outputs (the entry-point list in `esbuild.config.js`). Each is an ESM Node 18+ bundle with a `#!/usr/bin/env node` shebang and `minify: true`, so it can be invoked directly as a command. Seven of the eight are bound to Claude Code hook events in `hooks/hooks.json` (`SessionStart`, `PreToolUse`, `PostToolUse`, `UserPromptSubmit`, `PreCompact`, `Stop`, `SessionEnd`); `conversation-turn.js` is the per-turn hook for OpenClaw and generic clients and is not registered in `hooks.json`. The sync/async split is per event: `SessionStart` (blocks briefly while context loads) and `UserPromptSubmit` are synchronous; the capture and flush hooks (`PostToolUse`, `Stop`, `SessionEnd`) are async.
 
 Built scripts are gitignored and regenerated by the `postinstall` script in `package.json`, so a marketplace install does not require the user to run `npm run build` themselves.
 
-The Claude Code hook manifest at `neuralscape-plugin/hooks/hooks.json:1-30` is what Claude Code reads when it discovers the plugin:
+The Claude Code hook manifest at `neuralscape-plugin/hooks/hooks.json` is what Claude Code reads when it discovers the plugin (abridged here to two of its seven events; see the file for `PreToolUse`, `PostToolUse`, `UserPromptSubmit`, `PreCompact` and `SessionEnd`):
 
 ```json
 {
@@ -131,11 +128,11 @@ Bundled MCP lives in `neuralscape-plugin/.mcp.json`, a tiny config that points a
 
 The `${user_config.<KEY>}` form (declarative manifest substitution) is what HTTP MCP servers use, **not** `${CLAUDE_PLUGIN_OPTION_<KEY>}` (env-var reference). The two forms map to two different runtime contexts: env-var references resolve only when Claude Code spawns a subprocess, which an HTTP MCP server never is. Hook scripts and stdio MCP servers ARE spawned subprocesses and DO use the env-var form. Mixing these up surfaces as "Missing environment variables" in `/doctor` even when the userConfig values are correctly stored.
 
-When the plugin is enabled, the user's MCP-capable clients (Claude Code, Cowork) automatically pick up the seven Neuralscape tools — `recall_memories`, `remember`, `remember_conversation`, `get_project_context`, `search_knowledge_graph`, `list_memories`, `delete_memories` — without separate Claude Desktop config. See [08-mcp-server](./08-mcp-server.md) for the full tool surface.
+When the plugin is enabled, the user's MCP-capable clients (Claude Code, Cowork) automatically pick up the Neuralscape MCP tools (26 core, plus 7 code-graph tools when the server has the optional `code-graph` extra; for example `recall_memories`, `remember`, `remember_conversation`, `get_project_context`, `search_knowledge_graph`, `list_memories`, `delete_memories`) without separate Claude Desktop config. See [08-mcp-server](./08-mcp-server.md) for the full tool surface.
 
 ## Slash commands (skills)
 
-The `skills/` directory holds four pure-prompt skills that surface as discoverable commands:
+The `skills/` directory holds twelve prompt skills that surface as discoverable commands (the four below are the original set; the rest are `recall`, `remember`, `save-session`, `project`, `ingest`, `process`, `capture` and the internal `compile-observations`; the status and config commands are named `ns-status` and `ns-config` today):
 
 | Skill | Trigger | What it does |
 |---|---|---|
@@ -310,16 +307,19 @@ Released alongside memory model v2 on 2026-05-09. This is a *parallel* capture p
 
 ### New hook events
 
-The `hooks/hooks.json` manifest now declares **four** hook events (was two):
+The `hooks/hooks.json` manifest declares **seven** hook events (it started with two, then grew to four in v2.1; the table lists all seven as of this writing):
 
 | Event | Script | Purpose | Async |
 |---|---|---|---|
-| `SessionStart` | `scripts/session-start.js` | Pull stored memories + flag any pending observation buffers from prior sessions | No |
+| `SessionStart` | `scripts/session-start.js` | Pull stored memories + flag finished observation buffers from other sessions (see Buffer location below) | No |
+| `PreToolUse` | `scripts/pre-tool-use.js` | File Read Gate: inject a per-file memory timeline alongside a `Read` of a large file that has memories (the read always proceeds) | No |
 | `PostToolUse` | `scripts/post-tool-use.js` | Append one JSONL row per significant tool invocation to the per-session buffer | Yes |
 | `UserPromptSubmit` | `scripts/user-prompt-submit.js` | Threshold-based trigger that asks Claude to compile the buffer before responding | No |
-| `Stop` | `scripts/session-end.js` | Conversation-compiler flush + drop a `.stale` marker on any non-empty observation buffer | Yes |
+| `PreCompact` | `scripts/pre-compact.js` | Store one compact-snapshot memory and keep a local `<session>.compact-snapshot.json` copy for the post-compact SessionStart | Yes |
+| `Stop` | `scripts/session-end.js` | Conversation-compiler flush (per turn). Writes no marker | Yes |
+| `SessionEnd` | `scripts/session-summary.js` | Write the `<buffer>.jsonl.ended` marker, then store one structured session note via `POST /v1/checkpoint` — see the v2.8 section below | Yes |
 
-*(v2.8 adds a fifth event, `SessionEnd` → `scripts/session-summary.js` — see the v2.8 section below.)*
+Source of truth: `neuralscape-plugin/hooks/hooks.json` (events and scripts) and the `entryPoints` list in `neuralscape-plugin/esbuild.config.js` (bundles).
 
 ### PostToolUse hook (`src/hooks/post-tool-use.ts`)
 
@@ -344,12 +344,12 @@ with fallback to `~/.neuralscape/observations/{session_id}.jsonl` for older Clau
 |---|---|
 | `getObservationDir()` | Resolves the per-plugin data directory (with home-dir fallback) |
 | `getBufferPath(sessionId)` | Path to the per-session JSONL buffer |
-| `getStaleMarkerPath(sessionId)` | Path to the `.stale` sentinel dropped by Stop |
+| `getEndedMarkerPath(sessionId)` | Path to the `<buffer>.jsonl.ended` marker written by SessionEnd |
 | `appendObservation(row)` | Atomic single-row append; creates dir on first call |
-| `getBufferStats(path)` | Returns `{lineCount, oldestTs, isStale}` |
-| `listPendingBuffers(currentSessionId)` | All non-empty buffers from *other* sessions |
-| `truncateBuffer(path)` | Empty the file (preserves inode); also unlinks the `.stale` marker |
-| `markBufferStale(sessionId)` | Drop the `.stale` sentinel (Stop hook) |
+| `getBufferStats(path)` | Returns the buffer's stats, including `lineCount`, last-write time and `isEnded` (the end marker exists and is not older than the last write) |
+| `listPendingBuffers(currentSessionId)` | Non-empty buffers from *other* sessions that are finished: ended (marker not older than the last write) or idle for `PENDING_IDLE_HOURS` (default 12 h). A live buffer of another terminal is never offered; orphaned `.ended` markers and legacy `.stale` markers (written up to 2.9.3, now ignored) are removed |
+| `truncateBuffer(path)` | Empty the file (preserves inode); also unlinks the end marker |
+| `markBufferEnded(sessionId)` | Write the `.ended` marker (SessionEnd hook, once per session; Stop writes none) |
 | `truncateOutput(text, head, tail)` | Head + tail truncation with marker |
 | `pickRelevantInput(toolName, input)` | Per-tool input whitelisting |
 
@@ -463,6 +463,6 @@ When the service is unreachable, SessionStart injects a one-line `[neuralscape] 
 - [03-memory-model](./03-memory-model.md) — the 13-category taxonomy and v2 vocabularies
 - [02-service-architecture](./02-service-architecture.md) — how the conversation_compiler extension mounts into the FastAPI app
 - [07-async-pipeline](./07-async-pipeline.md) — what happens after `/flush` returns 202
-- [08-mcp-server](./08-mcp-server.md) — the seven MCP tools the plugin auto-wires via `.mcp.json`
+- [08-mcp-server](./08-mcp-server.md) — the MCP tools the plugin auto-wires via `.mcp.json` (26 core, plus 7 code-graph tools when the optional extra is installed)
 - [05-llm-extraction](./05-llm-extraction.md) — server-side Gemini prompts and the parallel client-side extraction path
 - [06-storage-backends](./06-storage-backends.md) — Qdrant and Neo4j, the shared sinks for all client adapters

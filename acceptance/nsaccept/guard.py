@@ -27,13 +27,37 @@ def _is_loopback(host: str) -> bool:
         return False
 
 
-def check(base_url: str, compose_project: str | None, env: dict | None = None) -> None:
+DEFAULT_COMPOSE_ALLOWLIST = ("nscampaign", "nstest-")
+
+
+def compose_allowlist(env: dict | None = None) -> list[str]:
     env = os.environ if env is None else env
-    if compose_project and compose_project.strip() == PROD_COMPOSE_PROJECT:
+    raw = env.get("NS_COMPOSE_ALLOWLIST", "")
+    items = [p.strip().lower() for p in raw.split(",") if p.strip()]
+    return items or list(DEFAULT_COMPOSE_ALLOWLIST)
+
+
+def check_compose_project(project: str, env: dict | None = None) -> str:
+    """THE rule for every compose project name the harness touches: refuse the
+    production name (case-insensitive, after strip) and anything outside the
+    disposable-prefix allowlist (default ``nscampaign``, ``nstest-``; only
+    ``NS_COMPOSE_ALLOWLIST`` overrides). Returns the normalised name."""
+    name = (project or "").strip()
+    if name.lower() == PROD_COMPOSE_PROJECT:
         raise GuardError(
             f"refusing compose project '{PROD_COMPOSE_PROJECT}' (the production project name); "
             "use a throwaway campaign project"
         )
+    allowed = compose_allowlist(env)
+    if not any(name.lower().startswith(p) for p in allowed):
+        raise GuardError(f"refusing compose project {name!r}: not a disposable project (allowed prefixes: {allowed})")
+    return name
+
+
+def check(base_url: str, compose_project: str | None, env: dict | None = None) -> None:
+    env = os.environ if env is None else env
+    if compose_project:
+        check_compose_project(compose_project, env)
     parsed = urlparse(base_url)
     host = (parsed.hostname or "").lower()
     if not host:
