@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
 import random
 import time
 from dataclasses import dataclass
@@ -156,6 +157,22 @@ class _Edge:
     relation: str  # CALLS | IMPORTS | DEFINES | INHERITS | REFERENCES
     extraction: str  # extracted | inferred | ambiguous
 
+
+
+def _confined_files(root: Path, files):
+    """Yield only files whose real path stays inside ``root``'s real path.
+
+    ``rglob`` follows file symlinks, so ``repo/link.py -> /elsewhere/s.py`` would
+    otherwise be read into the index. Operator-side indexing is confined to the
+    mapped repo directory.
+    """
+    real_root = os.path.realpath(root)
+    for f in files:
+        real = os.path.realpath(f)
+        if real == real_root or real.startswith(real_root + os.sep):
+            yield f
+        else:
+            logger.warning("skipping %s: resolves outside the repo root", f)
 
 
 def _is_collection_not_found(exc: BaseException) -> bool:
@@ -1190,7 +1207,7 @@ class NativeEngine:
         }
         source_files = []
         for pattern, lang in file_patterns.items():
-            for f in repo_path.rglob(pattern):
+            for f in _confined_files(repo_path, repo_path.rglob(pattern)):
                 source_files.append((f, lang))
 
         if not source_files:
@@ -3145,7 +3162,7 @@ class NativeEngine:
         }
         source_files = []
         for pattern, lang in file_patterns.items():
-            for f in self.repo_path.rglob(pattern):
+            for f in _confined_files(self.repo_path, self.repo_path.rglob(pattern)):
                 source_files.append((f, lang))
 
         fresh_symbols = []

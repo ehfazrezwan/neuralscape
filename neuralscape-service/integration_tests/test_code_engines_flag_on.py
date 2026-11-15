@@ -254,26 +254,23 @@ def test_cbm_engine_indexes_and_answers_when_bridge_reachable(unique_ns, code_re
 
     monkeypatch.setenv("CBM_ENABLED", "true")
     importlib.reload(knowledge)
-    try:
-        import worker
-        from memory_service import get_shared_service
+    import worker
+    from memory_service import get_shared_service
 
-        user_id = unique_ns.user_id
-        code_space = f"code--{user_id}--demo"
-        from knowledge.code_dispatch import teardown_code_space
+    user_id = unique_ns.user_id
+    code_space = f"code--{user_id}--demo"
+    from knowledge.code_dispatch import teardown_code_space
 
-        unique_ns.on_cleanup(lambda: teardown_code_space("code-cbm", code_space, user_id, code_repos))
-        result = asyncio.run(
-            worker.process_code_index(
-                {"service": get_shared_service()},
-                {"system": "code-cbm", "repo_source": str(repo_dir), "code_space": code_space, "user_id": user_id},
-            )
+    unique_ns.on_cleanup(lambda: teardown_code_space("code-cbm", code_space, user_id, code_repos))
+    result = asyncio.run(
+        worker.process_code_index(
+            {"service": get_shared_service()},
+            {"system": "code-cbm", "repo_source": str(repo_dir), "code_space": code_space, "user_id": user_id},
         )
-        assert result["ok"] is True, result
-        bound = _bind("code-cbm", code_space, user_id, "query")
-        q = _recall(bound, query="format_name", operation="query")
-        assert "format_name" in q.content, q.content
-        loc = _recall(_bind("code-cbm", code_space, user_id, "locate"), query="format_name", operation="locate", limit=5)
-        assert loc.hits, loc.content
-    finally:
-        pass  # registry_snapshot restores the registry
+    )
+    assert result["ok"] is True, result
+    bound = _bind("code-cbm", code_space, user_id, "query")
+    q = _recall(bound, query="format_name", operation="query")
+    assert "format_name" in q.content, q.content
+    loc = _recall(_bind("code-cbm", code_space, user_id, "locate"), query="format_name", operation="locate", limit=5)
+    assert loc.hits, loc.content

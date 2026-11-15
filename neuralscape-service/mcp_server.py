@@ -2345,11 +2345,22 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
                 from pathlib import Path as _P
 
                 repo_name = _P(str(repo_source).rstrip("/")).name or "repo"
-                code_space = f"code--{user_id}--{repo_name}"
-            from knowledge.code_dispatch import code_space_access_error, repo_source_error
+                from knowledge.code_dispatch import build_code_space
 
-            refused = code_space_access_error(code_space, user_id) or repo_source_error(
-                repo_source, settings
+                try:
+                    code_space = build_code_space(user_id, repo_name)
+                except ValueError as e:
+                    return [TextContent(type="text", text=json.dumps({"error": str(e)}))]
+            from knowledge.code_dispatch import (
+                code_space_access_error,
+                code_space_shape_error,
+                repo_source_error,
+            )
+
+            refused = (
+                code_space_shape_error(code_space)
+                or code_space_access_error(code_space, user_id)
+                or repo_source_error(repo_source, settings)
             )
             if refused:
                 return [TextContent(type="text", text=json.dumps({"error": refused}))]

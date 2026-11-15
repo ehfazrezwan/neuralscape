@@ -834,14 +834,23 @@ async def process_code_index(ctx: dict, payload: dict) -> dict:
 
     # Operator-side only: the source must sit inside a CODE_REPOS directory, for
     # every engine, and the caller must own the target code_space (or be admin).
-    from knowledge.code_dispatch import code_space_access_error, repo_source_error
+    from knowledge.code_dispatch import (
+        code_space_access_error,
+        code_space_shape_error,
+        repo_source_error,
+    )
 
-    denied = code_space_access_error(code_space, user_id)
+    denied = code_space_shape_error(code_space) or code_space_access_error(code_space, user_id)
     if denied:
         return {"ok": False, "error": denied, "code_space": code_space, "system": system}
     refused = repo_source_error(repo_source, settings)
     if refused:
         return {"ok": False, "error": refused, "code_space": code_space, "system": system}
+    # Index the path that was checked (resolved once), not the caller's string:
+    # closes the window where a symlink is swapped after the check.
+    import os as _os
+
+    repo_source = _os.path.realpath(_os.path.expanduser(str(repo_source)))
 
     engine = resolve_code_engine(system, code_space, user_id, settings, for_index=True)
     if engine is None:

@@ -53,14 +53,40 @@ def repo_path_for_code_space(code_space: str, settings) -> str | None:
 
 
 def code_space_owner(code_space: str | None) -> str | None:
-    """Owner segment of a ``code--<owner>--<repo>`` ref (also ``lib:`` prefixed), else None."""
+    """Owner segment of a ``code--<owner>--<repo>`` ref (also ``lib:`` prefixed), else None.
+
+    Unambiguous rule: the owner is ALWAYS ``parts[1]``. User ids and repo names
+    must not contain ``--`` (see ``code_space_shape_error``), so builder and
+    parser agree.
+    """
     ref = (code_space or "")
     if ref.startswith("lib:"):
         ref = ref[len("lib:"):]
     parts = ref.split("--")
     if len(parts) < 3 or parts[0] != "code":
         return None
-    return "--".join(parts[1:-1])
+    return parts[1]
+
+
+def code_space_shape_error(code_space: str | None) -> str | None:
+    """None when ``code_space`` is exactly ``code--<owner>--<repo>`` (no extra ``--``)."""
+    parts = (code_space or "").split("--")
+    if len(parts) == 3 and parts[0] == "code" and parts[1] and parts[2]:
+        return None
+    return (
+        f"code_space {code_space!r} must be exactly code--<owner>--<repo>: neither the "
+        "owner (user id) nor the repo name may contain '--'. Pass an explicit code_space "
+        "with a name that avoids '--'."
+    )
+
+
+def build_code_space(owner: str, repo_name: str) -> str:
+    """Build ``code--<owner>--<repo>``; ValueError (clear message) if either has ``--``."""
+    space = f"code--{owner}--{repo_name}"
+    err = code_space_shape_error(space)
+    if err:
+        raise ValueError(err)
+    return space
 
 
 def code_space_access_error(code_space: str | None, caller: str | None) -> str | None:
@@ -449,6 +475,10 @@ def resolve_bound_code_system(
     """
     from knowledge.code_system import CodeKnowledgeSystem
     from knowledge.registry import get_system
+
+    # Ownership first: the registry shortcut below must not skip it.
+    if code_space_access_error(code_space, user_id):
+        return None
 
     registered = get_system(system_name)
 

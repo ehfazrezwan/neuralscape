@@ -276,3 +276,164 @@ async def test_mcp_index_delete_and_read_enforce_owner_and_confinement(monkeypat
         assert "alice" in json.dumps(r)
         r = await _tool("locate", {"query": "x", "graph_id": "code--alice--demo", "knowledge_system": "code-native", "user_id": "mallory"})
         assert "alice" in r["error"]
+
+
+# ── round 2: unambiguous owner rule, registry shortcut, file symlinks, TOCTOU ──
+
+
+def test_owner_is_always_segment_one_and_builder_agrees(no_admin_list):
+    from knowledge.code_dispatch import build_code_space, code_space_owner
+
+    assert build_code_space("b", "repo") == "code--b--repo"
+    assert code_space_owner("code--b--repo") == "b"
+    # a repo named my--repo can no longer be misread as owner "b--my"
+    with pytest.raises(ValueError, match="'--'"):
+        build_code_space("b", "my--repo")
+    # a user called b--x can no longer shadow user b's namespace
+    with pytest.raises(ValueError, match="'--'"):
+        build_code_space("b--x", "repo")
+    assert code_space_owner("code--b--x--repo") == "b"  # parser rule: owner = parts[1]
+    assert code_space_access_error("code--b--x--repo", "b--x")  # user b--x does NOT own it
+
+
+def test_shape_error_rejects_extra_dashes_and_accepts_plain():
+    from knowledge.code_dispatch import code_space_shape_error
+
+    assert code_space_shape_error("code--b--repo") is None
+    for bad in ("code--b--my--repo", "code--b--x--repo", "code--b", "x--b--r", "code----r"):
+        assert code_space_shape_error(bad), bad
+
+
+def test_rest_default_space_for_dashed_repo_name_is_a_clear_400(rest):
+    dashed = rest.repos.root / "my--repo"
+    dashed.mkdir()
+    rest_settings = {"my--repo": str(dashed)}
+    with patch.dict(main.settings.code_repos, rest_settings), patch(
+        "adapters.code_graph.code_graph_available", return_value=True
+    ), patch.object(main._task_manager, "enqueue_code_index", AsyncMock(return_value="t")) as enqueue:
+        r = rest.call("POST", "/v1/code-graph/index", "b", json={"repo_source": str(dashed), "system": "code-native"})
+        assert r.status_code == 400 and "'--'" in r.json()["detail"], r.text
+        r2 = rest.call(
+            "POST", "/v1/code-graph/index", "b",
+            json={"repo_source": str(dashed), "system": "code-native", "code_space": "code--b--x--repo"},
+        )
+        assert r2.status_code == 400
+        # the same user can still index it under an explicit plain name
+        ok = rest.call(
+            "POST", "/v1/code-graph/index", "b",
+            json={"repo_source": str(dashed), "system": "code-native", "code_space": "code--b--myrepo"},
+        )
+        assert ok.status_code == 202, ok.text
+    assert enqueue.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_worker_refuses_malformed_code_space(worker_repos):
+    with patch("adapters.code_graph.code_graph_available", return_value=True):
+        out = await _index(worker_repos, worker_repos.demo, code_space="code--alice--x--demo")
+    assert out["ok"] is False and "'--'" in out["error"]
+
+
+def test_registry_shortcut_does_not_skip_ownership(no_admin_list):
+    from knowledge.base import HealthStatus, KnowledgeSystemInfo
+    from knowledge.code_dispatch import resolve_bound_code_system
+    from knowledge.registry import KNOWLEDGE_REGISTRY
+
+    fake = MagicMock()
+    fake.info = KnowledgeSystemInfo(
+        name="code-fake", kind="code", capabilities=frozenset({"query"}), transport="in-process"
+    )
+    fake._engine = SimpleNamespace(code_space="code--alice--demo")
+    fake.health.return_value = HealthStatus(status="ok")
+    saved = dict(KNOWLEDGE_REGISTRY)
+    KNOWLEDGE_REGISTRY["code-fake"] = fake
+    try:
+        assert resolve_bound_code_system("code-fake", "code--alice--demo", "mallory", SimpleNamespace()) is None
+        assert resolve_bound_code_system("code-fake", "code--alice--demo", "alice", SimpleNamespace()) is fake
+    finally:
+        KNOWLEDGE_REGISTRY.clear()
+        KNOWLEDGE_REGISTRY.update(saved)
+
+
+def test_confined_files_skip_file_symlinks_pointing_outside(repos):
+    from adapters.code_graph.native_engine import _confined_files
+
+    (repos.demo / "ok.py").write_text("a = 1\n")
+    os.symlink(repos.outside / "secret.py", repos.demo / "link.py")
+    os.symlink(repos.demo / "ok.py", repos.demo / "inside_link.py")  # stays inside: allowed
+    names = sorted(p.name for p in _confined_files(repos.demo, repos.demo.rglob("*.py")))
+    assert "link.py" not in names and "secret.py" not in names
+    assert "ok.py" in names and "inside_link.py" in names
+
+
+def test_native_index_does_not_read_symlinked_file_outside_root(repos):
+    """Through NativeEngine.index itself: the outside file is never parsed."""
+    from adapters.code_graph.native_engine import NativeEngine
+
+    (repos.demo / "ok.py").write_text("def ok():\n    return 1\n")
+    os.symlink(repos.outside / "secret.py", repos.demo / "link.py")
+    eng = NativeEngine(
+        repo_path=str(repos.demo), code_space="code--u--demo",
+        bridge=MagicMock(), settings=MagicMock(code_embedder="off"), driver=MagicMock(),
+    )
+    parsed = []
+
+    def fake_parse(path, root, lang):
+        parsed.append(path.name)
+        return [], []
+
+    with patch.object(eng, "_parse_file", side_effect=fake_parse), patch.object(
+        eng, "_run_cypher", return_value=[]
+    ), patch.object(eng, "_run_cypher_with_retry"), patch.object(eng, "_ensure_repo_node"), patch.object(
+        eng, "_store_file"
+    ), patch.object(eng, "_index_symbol_cards", return_value=None), patch.object(
+        eng, "_compute_communities", return_value=None
+    ):
+        try:
+            eng.index(str(repos.demo), incremental=False)
+        except Exception:  # noqa: BLE001 - later stages need a real store; the walk already ran
+            pass
+    assert "ok.py" in parsed and "link.py" not in parsed
+
+
+def test_graphify_lib_index_skips_symlink_outside_root(repos):
+    from adapters.code_graph.graphify_lib_engine import GraphifyLibEngine
+
+    (repos.demo / "ok.py").write_text("def ok():\n    return 1\n")
+    os.symlink(repos.outside / "secret.py", repos.demo / "link.py")
+    eng = GraphifyLibEngine(code_space="code--u--demo", source_root=str(repos.demo))
+    seen = {}
+
+    def fake_extract(files, **kw):
+        seen["files"] = [str(f) for f in files]
+        return {"nodes": [], "edges": []}
+
+    with patch("adapters.code_graph.graphify_lib_engine.extract", side_effect=fake_extract):
+        try:
+            eng.index(str(repos.demo))
+        except Exception:  # noqa: BLE001
+            pass
+    assert any(f.endswith("ok.py") for f in seen.get("files", []))
+    assert not any(f.endswith("link.py") for f in seen.get("files", []))
+
+
+@pytest.mark.asyncio
+async def test_worker_indexes_the_checked_realpath_not_the_input_string(worker_repos):
+    from adapters.code_graph.engine import IndexReport
+
+    r = worker_repos
+    alias = r.root / "alias"
+    os.symlink(r.demo, alias)  # a symlink that resolves inside CODE_REPOS
+    engine = MagicMock()
+    engine.index.return_value = IndexReport(
+        files_indexed=0, symbols_indexed=0, edges_indexed=0, incremental=False, duration_s=0.0
+    )
+    with patch("adapters.code_graph.code_graph_available", return_value=True), patch(
+        "adapters.code_graph.query._get_native_engine_by_code_space", return_value=engine
+    ), patch("worker._git_head_sha", return_value=None), patch("knowledge.index_store.record_index"), patch(
+        "extensions.dreaming.liveness.detect_inventory_diff_liveness",
+        return_value={"events": [], "flagged": 0, "summary": ""},
+    ):
+        out = await _index(r, alias)
+    assert out["ok"] is True, out
+    assert engine.index.call_args.args[0] == os.path.realpath(r.demo)

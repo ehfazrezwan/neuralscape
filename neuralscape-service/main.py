@@ -1662,9 +1662,18 @@ async def v1_code_graph_index(req: CodeIndexRequest, request: Request):
         from pathlib import Path as _P
 
         repo_name = _P(req.repo_source.rstrip("/")).name or "repo"
-        code_space = f"code--{caller}--{repo_name}"
+        from knowledge.code_dispatch import build_code_space
+
+        try:
+            code_space = build_code_space(caller, repo_name)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
+    from knowledge.code_dispatch import code_space_shape_error, repo_source_error
+
+    shape = code_space_shape_error(code_space)
+    if shape:
+        raise HTTPException(status_code=400, detail=shape)
     _require_code_space_access(code_space, caller)
-    from knowledge.code_dispatch import repo_source_error
 
     refused = repo_source_error(req.repo_source, settings)
     if refused:
