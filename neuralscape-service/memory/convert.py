@@ -80,10 +80,14 @@ class ConvertMixin:
         metadata = mem.get("metadata", {}) or {}
         if isinstance(metadata.get("metadata"), dict):
             metadata = metadata["metadata"]
+        from category_evidence import validated_evidence
+
         return MemoryResponse(
             id=mem.get("id", ""),
             memory=mem.get("memory", ""),
             category=metadata.get("category"),
+            category_evidence=validated_evidence(mem.get('memory', ''), metadata.get('category'),
+                                                 metadata.get('category_evidence')),
             scope=metadata.get("scope"),
             project_id=metadata.get("project_id"),
             tags=metadata.get("tags"),
