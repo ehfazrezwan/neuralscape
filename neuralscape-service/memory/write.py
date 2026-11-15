@@ -2007,7 +2007,13 @@ class WriteMixin:
                     "run_id": run_id,
                     "source": source,
                     **({'category_evidence': evidence} if evidence is not None else {}),
-                    **({"visibility": fact_forced_visibility} if fact_forced_visibility else {}),
+                    # Owner + tier are always stamped (conversation extractions
+                    # are private by default — the same assumption
+                    # extract_and_store's graph group makes). Previously only a
+                    # sensitivity-forced fact carried visibility, and no row
+                    # carried owner_user_id, so reads/deletes had to guess it.
+                    "owner_user_id": user_id,
+                    "visibility": fact_forced_visibility or MemoryVisibility.PRIVATE.value,
                     **({"sensitivity": fact_sensitivity} if fact_sensitivity else {}),
                     **({"sensitivity_source": fact_sensitivity_source} if fact_sensitivity_source else {}),
                     # Extraction stores directly-stated facts → epistemically
@@ -2095,7 +2101,8 @@ class WriteMixin:
                     title=distill_title(content),
                     token_estimate=stamp_tokens(content),
                     speaker=spk,
-                    visibility=forced_visibility,
+                    visibility=forced_visibility or MemoryVisibility.PRIVATE.value,
+                    owner_user_id=user_id,
                     sensitivity=fact_sensitivity,
                     sensitivity_source=fact_sensitivity_source,
                     category_evidence=payloads[idx]['metadata'].get('category_evidence'),
