@@ -43,6 +43,13 @@ SEED = {
     "secret": ("task_context", "The staging API key is sk-e2e-FAKE-abc123456789 for testing"),
     "live": ("task_context", "The payment module validates cards through validate_card() in billing.py"),
 }
+OTHER_SEED = [
+    ("preference", "User prefers Rust for systems work and keeps a {tok} cheat sheet"),
+    ("preference", "The user likes using Rust for low-level systems programming"),
+    ("workflow", "The user profiles every release build before shipping"),
+    ("workflow", "The user benchmarks the hot path after each refactor"),
+    ("workflow", "The user reviews flamegraphs before merging performance changes"),
+]
 PROJECT_SEED = [
     "The project backend is a FastAPI service using Python 3.12",
     "The project stores vectors in Qdrant and graph facts in Neo4j",
@@ -65,6 +72,12 @@ def swept(dream_env):
     ids = {name: env.store(text, cat) for name, (cat, text) in SEED.items()}
     pid = f"nsit-proj-{uuid.uuid4().hex[:6]}"
     proj_ids = [env.store_project(t, pid) for t in PROJECT_SEED]
+    # A second private user in the same collection: isolation fixtures.
+    other_user = env.user + "-other"
+    other_tok = "zq" + uuid.uuid4().hex[:10]
+    other_pool = f"user--{other_user}"
+    env.extra_pools.append(other_pool)
+    other_ids = [env.store(t.format(tok=other_tok), c, user=other_user) for c, t in OTHER_SEED]
     env.clear_pool_state()
 
     client = env.service._memory.vector_store.client
@@ -82,7 +95,8 @@ def swept(dream_env):
     real = asyncio.run(dream_all(service=env.service, settings=settings, dry_run=False, force=True))
     reports = {p.pool: p for p in real.pools}
     return SimpleNamespace(
-        ids=ids, proj_ids=proj_ids, pid=pid, project_pool=f"shared--project--{pid}",
+        ids=ids, proj_ids=proj_ids, other_user=other_user, other_tok=other_tok,
+        other_pool=other_pool, other_ids=other_ids, pid=pid, project_pool=f"shared--project--{pid}",
         settings=settings, dry=dry, real=real, reports=reports,
         before_noise=before_noise, after_dry=after_dry,
     )
@@ -380,3 +394,63 @@ def test_unchanged_staged_id_set_is_skipped_without_llm_work(dream_env, swept):
     rep = run.pools[0]
     assert rep.status == "skipped_unchanged", f"{rep.status}: {rep.reason}"
     assert rep.applied == 0 and rep.insights == 0
+
+
+# ── multi-user isolation (privacy) ──────────────────────────────────
+
+
+def _vault_text(env) -> str:
+    return "\n".join(
+        p.read_text(encoding="utf-8", errors="ignore") for p in env.vault.rglob("*") if p.is_file()
+    )
+
+
+def test_other_users_private_pool_swept_but_never_leaks(dream_env, swept):
+    env = dream_env
+    rep = swept.reports.get(swept.other_pool)
+    assert rep is not None and rep.status == "dreamt", f"other pool not swept: {rep}"
+    # never rendered into the operator's vault (pool isolation)
+    vault = _vault_text(env)
+    assert swept.other_tok not in vault, "other user's private content leaked into the operator vault"
+    assert "Rust" not in vault, "other user's private topic leaked into the operator vault"
+    # their card exists but is refused to this user, and unreadable via REST identity
+    assert load_card(env.redis, swept.other_pool), "other user's card was not produced"
+    view = build_card_view(swept.other_pool, env.user, is_dictator=False, redis=env.redis)
+    assert view["status"] == "forbidden"
+    # recall is user-scoped both ways
+    mine = env.service.search(query=f"Rust systems {swept.other_tok}", user_id=env.user, limit=20)
+    assert not [h for h in mine if swept.other_tok in h.memory or "rust" in h.memory.lower()]
+    theirs = env.service.search(query="Python FastAPI backend", user_id=swept.other_user, limit=20)
+    assert not [h for h in theirs if "fastapi" in h.memory.lower()]
+
+
+def test_insights_only_cite_their_own_pool(dream_env, swept):
+    from qdrant_client.models import FieldCondition, Filter, MatchValue
+
+    env = dream_env
+    client = env.service._memory.vector_store.client
+    recs, _ = client.scroll(
+        collection_name=env.collection, limit=100, with_payload=True, with_vectors=False,
+        scroll_filter=Filter(must=[FieldCondition(key="metadata.source_type", match=MatchValue(value="dream"))]),
+    )
+    mine, theirs = set(swept.ids.values()), set(swept.other_ids)
+    for r in recs:
+        md = r.payload["metadata"]
+        env.seeded_ids.add(str(r.id))
+        derived = set(md.get("derived_from") or [])
+        owner = md.get("owner_user_id")
+        if owner == env.user:
+            assert not (derived & theirs), f"insight of {owner} cites the other user's memories"
+        elif owner == swept.other_user:
+            assert not (derived & (mine | set(swept.proj_ids))), "other user's insight cites foreign memories"
+            assert md.get("visibility") == "private"
+
+
+def test_bridges_pass_runs_with_flag_on(dream_env, swept):
+    env = dream_env
+    s = env.sweep_settings(bridges_enabled=True)
+    run = asyncio.run(dream_all(service=env.service, settings=s, dry_run=False,
+                                only_pool=swept.project_pool, force=True))
+    assert run.pools and run.pools[0].status == "dreamt", run.pools
+    assert "error" not in run.bridges, run.bridges
+    assert set(run.bridges) >= {"pages_bridged", "pages_unchanged", "links"}, run.bridges

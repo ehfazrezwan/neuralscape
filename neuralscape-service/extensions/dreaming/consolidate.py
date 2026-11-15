@@ -609,6 +609,14 @@ def _rewrite_content(
     merge branch's summed ``times_derived`` arrives through ``extra_meta``.
     The metadata patch lands first so the undo stash exists before the
     visible text flips; ``data`` is written last.
+
+    Atomicity is per key, not one transaction: the steps are separate Qdrant
+    calls, so a failure part-way leaves a partly updated row (for example a
+    new undo stash with the old text). Every step only adds or replaces keys
+    this rewrite owns, so a retry (the sweep re-flags the row) converges and
+    nothing another writer set is ever overwritten. If no BM25 encoder is
+    available the row's sparse vector is deleted rather than left matching
+    the old text.
     """
     from config import settings as core_settings
 
@@ -660,14 +668,18 @@ def _rewrite_content(
 
     from qdrant_client.models import PointVectors
 
+    drop_stale_bm25 = False
     if getattr(vs, "_has_bm25_slot", False) is True:
         named: dict = {"": dense}
         sparse = vs._encode_bm25(new_content)
         if sparse is not None:
             named["bm25"] = sparse
         else:
+            # No encoder: the OLD text's sparse vector must not keep the row
+            # keyword-findable by words it no longer contains (privacy).
+            drop_stale_bm25 = True
             logger.warning(
-                "BM25 encoding unavailable for rewrite of %s; sparse vector left stale",
+                "BM25 encoding unavailable for rewrite of %s; dropping its sparse vector",
                 memory_id,
             )
         vector = named
@@ -681,6 +693,10 @@ def _rewrite_content(
         collection_name=collection,
         points=[PointVectors(id=memory_id, vector=vector)],
     )
+    if drop_stale_bm25:
+        client.delete_vectors(
+            collection_name=collection, points=[memory_id], vector=["bm25"],
+        )
     if "text_lemmatized" in payload:
         # The lemmatized shadow of the OLD text would otherwise feed the
         # next BM25 re-encode (the store prefers it over ``data``).

@@ -41,10 +41,12 @@ def _named_vectors(env, mid: str) -> dict:
 async def test_merge_keeps_bm25_vector_and_provenance(dream_env):
     env = dream_env
     tok = _tok()
-    keep = env.store("User prefers Python for backend services")
+    old_tok = _tok()
+    keep = env.store(f"User prefers Python for backend services {old_tok}")
     gone = env.store("The user likes Python for server-side work")
     merged = f"User prefers Python for backend services, especially with {tok} tooling"
     assert env.lexical_ids(tok) == [], "control: token must not match before the rewrite"
+    assert keep in env.lexical_ids(old_tok), "control: old token matches before the rewrite"
     before = _named_vectors(env, keep)
     assert before.get("bm25") is not None, "write path must store a bm25 sparse vector"
 
@@ -63,7 +65,7 @@ async def test_merge_keeps_bm25_vector_and_provenance(dream_env):
     meta = p["metadata"]
     assert p["data"] == merged
     assert p["hash"] == content_hash(merged)
-    assert meta["dream_prev_content"] == "User prefers Python for backend services"
+    assert meta["dream_prev_content"] == f"User prefers Python for backend services {old_tok}"
     assert gone in meta["derived_from"]
     assert meta["times_derived"] >= 2
     assert not meta.get("dream_tombstoned")
@@ -77,6 +79,7 @@ async def test_merge_keeps_bm25_vector_and_provenance(dream_env):
     assert after.get("bm25") is not None and after["bm25"].indices, "bm25 sparse vector dropped"
     # ... and a keyword-only (BM25) query finds it by the NEW text
     assert keep in env.lexical_ids(tok), "keyword-only query must find the rewritten row"
+    assert keep not in env.lexical_ids(old_tok), "words only in the OLD text must stop matching"
     # recall excludes the tombstoned loser, includes the survivor
     ids = {h.id for h in env.service.search(query="Python backend services", user_id=env.user, limit=10)}
     assert gone not in ids
@@ -86,8 +89,8 @@ async def test_merge_keeps_bm25_vector_and_provenance(dream_env):
 @pytest.mark.asyncio
 async def test_rewrite_and_reframe_keep_bm25_and_are_reversible(dream_env):
     env = dream_env
-    t1, t2 = _tok(), _tok()
-    rw = env.store("User works at OldCorp on the platform team", "personal_fact")
+    t1, t2, o1 = _tok(), _tok(), _tok()
+    rw = env.store(f"User works at OldCorp {o1} on the platform team", "personal_fact")
     rf = env.store("User plans to ship the beta in early July 2026", "task_context")
     old_rf = env.payload(rf)["data"]
 
@@ -102,7 +105,8 @@ async def test_rewrite_and_reframe_keep_bm25_and_are_reversible(dream_env):
     assert not result.errors, result.errors
 
     assert env.payload(rw)["data"].startswith("User works at NewCorp")
-    assert env.meta(rw)["dream_prev_content"] == "User works at OldCorp on the platform team"
+    assert env.meta(rw)["dream_prev_content"] == f"User works at OldCorp {o1} on the platform team"
+    assert rw not in env.lexical_ids(o1), "old-text keyword still matches the rewritten row"
     assert env.meta(rf)["dream_temporal_reframed"] is True
     assert env.meta(rf)["dream_prev_content"] == old_rf
     for mid, tok in ((rw, t1), (rf, t2)):

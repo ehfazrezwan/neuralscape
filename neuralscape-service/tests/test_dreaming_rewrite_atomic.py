@@ -77,6 +77,13 @@ class FakeQdrant:
             for k in keys:
                 self.payloads[pid].pop(k, None)
 
+    def delete_vectors(self, collection_name=None, points=None, vector=None):
+        self.calls.append("delete_vectors")
+        for pid in points:
+            if isinstance(self.vectors.get(pid), dict):
+                for name in vector:
+                    self.vectors[pid].pop(name, None)
+
     def update_vectors(self, collection_name=None, points=None):
         self.calls.append("update_vectors")
         for pv in points:
@@ -154,12 +161,15 @@ class TestBm25Preserved:
         vs._encode_bm25.assert_not_called()
         assert client.vectors["m1"] == [0.25] * 8
 
-    def test_encoder_unavailable_still_updates_dense(self):
+    def test_encoder_unavailable_updates_dense_and_drops_stale_sparse(self):
         service, client, _ = _service(
             {"m1": {"data": "old", "metadata": {}}}, bm25_slot=True, sparse=None
         )
+        client.vectors["m1"] = {"": [0.1] * 8, "bm25": SPARSE}  # the OLD text's sparse vector
         consolidate._rewrite_content(service, "m1", "new")
+        # dense updated; the stale sparse vector must not keep matching old words
         assert client.vectors["m1"] == {"": [0.25] * 8}
+        assert "delete_vectors" in client.calls
 
     def test_stale_text_lemmatized_shadow_is_dropped(self):
         service, client, _ = _service(
