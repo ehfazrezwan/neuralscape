@@ -18,7 +18,13 @@ from contracts_references import ReferenceHandle
 
 PolicyOutcome = Literal["allow", "deny"]
 PolicyEffect = Literal["allow", "deny"]
-SubjectKind = Literal["human", "delegated_agent", "worker"]
+# ``human`` and ``service_account`` act on their own authority: their own
+# membership and their own statements, never a delegation.  ``delegated_agent``
+# and ``worker`` act for an issuing subject and always carry a delegation, which
+# can only narrow that issuer's current rights (see ``DelegationConstraints``).
+SubjectKind = Literal["human", "delegated_agent", "worker", "service_account"]
+DELEGATED_SUBJECT_KINDS = frozenset({"delegated_agent", "worker"})
+INDEPENDENT_SUBJECT_KINDS = frozenset({"human", "service_account"})
 PolicyReasonCode = Literal[
     "explicit_grant",
     "not_authorized",
@@ -50,11 +56,22 @@ SUPPORTED_POLICY_ACTIONS = frozenset(
 
 
 class DelegationConstraints(ContractModel):
-    """Explicit ceilings applied after ordinary policy evaluation.
+    """The issuer of a delegated credential and an explicit ceiling on it.
+
+    A delegated principal (``delegated_agent`` or ``worker``) is allowed an
+    action on a resource only when all of these hold in the same policy
+    snapshot: the delegate is a current member with a matching allow and no
+    matching deny of its own; the action and resource are inside this ceiling;
+    and the issuer named here is a current member with a matching allow and no
+    matching deny for the same action and resource, judged for the issuing
+    credential.  A delegation therefore never widens the issuer's current
+    rights, and losing the issuer's membership or grant ends the delegate's
+    access at the next snapshot.
 
     An empty action or resource collection grants nothing.  Presence in these
-    collections is never itself a grant: a matching allow statement is still
-    required from the current policy snapshot.
+    collections is never itself a grant.  Only the issuer named here is
+    checked: an issuer that is itself delegated must be resolved to its own
+    issuer by the trusted boundary that constructs the context.
     """
 
     delegated_by_subject_id: OpaqueId
@@ -69,6 +86,11 @@ class PrincipalContext(VersionedContract):
     The subject and credential are intentionally separate identities.  The
     membership version is a per-subject authority witness, not a policy epoch.
     Callers must not treat serialized instances as authentication evidence.
+
+    ``human`` and ``service_account`` subjects act on their own membership and
+    statements and carry no delegation.  ``delegated_agent`` and ``worker``
+    subjects carry a delegation naming a different issuing subject and
+    credential; they are bounded by the issuer's current rights.
     """
 
     tenant_id: OpaqueId
@@ -81,11 +103,20 @@ class PrincipalContext(VersionedContract):
 
     @model_validator(mode="after")
     def validate_delegation(self) -> "PrincipalContext":
-        if self.subject_kind in {"delegated_agent", "worker"} and self.delegation is None:
+        if self.subject_kind in DELEGATED_SUBJECT_KINDS and self.delegation is None:
             raise ValueError("delegated_agent and worker contexts require delegation constraints")
         if self.subject_kind == "human" and self.delegation is not None:
             raise ValueError("human contexts cannot carry delegation constraints")
+        if self.subject_kind == "service_account" and self.delegation is not None:
+            # A service account is an independent subject with its own grants.
+            # An agent acting for someone else is a delegated_agent instead.
+            raise ValueError("service_account contexts cannot carry delegation constraints")
         if self.delegation is not None:
+            if (
+                self.delegation.delegated_by_subject_id == self.subject_id
+                or self.delegation.delegated_by_credential_id == self.credential_id
+            ):
+                raise ValueError("a delegation cannot be issued by the delegate itself")
             for resource in self.delegation.allowed_resources:
                 if resource.tenant_id != self.tenant_id:
                     raise ValueError("delegated resources must belong to the principal tenant")
@@ -200,7 +231,9 @@ class PolicyDecision(VersionedContract):
 
 __all__ = [
     "AccessPolicy",
+    "DELEGATED_SUBJECT_KINDS",
     "DelegationConstraints",
+    "INDEPENDENT_SUBJECT_KINDS",
     "MembershipVersion",
     "PolicyDecision",
     "PolicyEvaluationInput",

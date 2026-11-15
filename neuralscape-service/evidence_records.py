@@ -30,6 +30,7 @@ import json
 import os
 import stat
 import threading
+import time
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -118,6 +119,10 @@ class RecordConflict(Exception):
 
 class UnsafePath(Exception):
     """A write would reach evidence or reviewer-owned files through an alias, or a file that is not a plain file."""
+
+
+class UnsafeLockPath(UnsafePath, OSError):
+    """The lock file name is held by something that is not a plain file (a directory, a pipe, a device)."""
 
 
 _MODEL_STORAGE = BaseModel.__dict__["__dict__"]   # pydantic's own slot for field values: a subclass's __dict__ property is not consulted
@@ -230,6 +235,10 @@ def _detached(record: object) -> "EvidenceRecord":
 _NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 _CLOEXEC = getattr(os, "O_CLOEXEC", 0)
 _DIRECTORY_FLAGS = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | _CLOEXEC
+# Opening the lock file is retried this many times if it disappears between an exclusive create attempt and
+# opening the existing sidecar, with a short, capped backoff.
+_LOCK_CREATE_ATTEMPTS = 40
+_LOCK_CREATE_MAX_DELAY = 0.05
 
 
 class FileIdentity(NamedTuple):
@@ -456,23 +465,62 @@ class EvidenceWriter:
 
     @staticmethod
     def _in(directory: int):
-        """An ``open`` opener that resolves the name inside ``directory`` and never follows a final link."""
+        """An ``open`` opener for the lock file: the name is resolved inside ``directory``, a final link is never
+        followed, and opening never blocks (a pipe planted under the lock name is refused instead of waited on)."""
 
-        return lambda name, flags: os.open(name, flags | _NOFOLLOW, 0o666, dir_fd=directory)
+        return lambda name, flags: os.open(name, flags | _NOFOLLOW | os.O_NONBLOCK | _CLOEXEC, 0o666, dir_fd=directory)
+
+    @staticmethod
+    def _plain_lock(handle):
+        """``handle`` if it is a plain file; anything else under the lock name is refused (and closed)."""
+
+        if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+            handle.close()
+            raise UnsafeLockPath(errno.EINVAL, "the evidence lock file is not a plain file")
+        return handle
+
+    def _create_lock(self, name: str, directory: int):
+        """Open the lock sidecar, creating it if needed, inside the pinned ``directory``.
+
+        Create exclusively, or open the existing sidecar without O_CREAT.  In particular, do not combine
+        O_CREAT with a nonexclusive open: on macOS concurrent first use can make that operation report ENOENT
+        even in a live directory.  An exclusive create has an unambiguous outcome: this caller created the
+        sidecar, another caller already created it, or creation failed.  A missing directory fails immediately
+        without relying on st_nlink (which can remain nonzero after rmdir on APFS).
+
+        If the sidecar disappears between EEXIST and the existing-file open, retry within a fixed bound.  Both
+        opens always use the original directory descriptor and no-follow flags; neither a directory rename nor
+        a replacement path can redirect the lock.  Permission and non-regular-file errors still propagate.
+        """
+
+        delay = 0.001
+        for attempt in range(_LOCK_CREATE_ATTEMPTS):
+            try:
+                return self._plain_lock(open(name, "xb", opener=self._in(directory)))
+            except FileExistsError:
+                pass
+            try:
+                return self._plain_lock(open(name, "rb", opener=self._in(directory)))
+            except FileNotFoundError:
+                if attempt + 1 == _LOCK_CREATE_ATTEMPTS:
+                    raise
+            time.sleep(delay)
+            delay = min(delay * 2, _LOCK_CREATE_MAX_DELAY)
+        raise AssertionError("unreachable lock-open retry state")
 
     def _open_shared_lock(self, target: Path, directory: int):
         name = self._sidecar_of(target).name
         try:
-            return open(name, "rb", opener=self._in(directory))
+            return self._plain_lock(open(name, "rb", opener=self._in(directory)))
         except FileNotFoundError:
             pass
         try:
-            return open(name, "ab", opener=self._in(directory))   # no writer has locked this file yet: create it so a later writer and this reader meet on it
+            return self._create_lock(name, directory)   # no writer has locked this file yet: create it so a later writer and this reader meet on it
         except OSError as error:
             if error.errno not in (errno.EACCES, errno.EPERM, errno.EROFS):
                 raise   # includes a missing directory: there is no evidence file to read either
         try:
-            return open(name, "rb", opener=self._in(directory))   # a writer may have created it since the first look, unwritable for this reader
+            return self._plain_lock(open(name, "rb", opener=self._in(directory)))   # a writer may have created it since the first look, unwritable for this reader
         except FileNotFoundError:
             return None   # still absent and not creatable here: an offline artifact
 
@@ -523,7 +571,7 @@ class EvidenceWriter:
         evidence = self._target()
         directory = os.open(evidence.parent, _DIRECTORY_FLAGS)
         try:
-            with self._lock, open(self._sidecar_of(evidence).name, "ab", opener=self._in(directory)) as lock:
+            with self._lock, self._create_lock(self._sidecar_of(evidence).name, directory) as lock:
                 fcntl.flock(lock, fcntl.LOCK_EX)
                 try:
                     return self._append_locked(record, line, evidence.name, directory)

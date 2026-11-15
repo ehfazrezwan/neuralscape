@@ -5,7 +5,6 @@ categories, and a shared MemoryService business logic layer.
 """
 
 import asyncio
-import re
 import base64
 import hashlib
 import json
@@ -16,7 +15,6 @@ from datetime import datetime, timezone
 
 from fastapi import (
     APIRouter,
-    Depends,
     FastAPI,
     File,
     Form,
@@ -79,8 +77,8 @@ from schemas import (
     TimelineResponse,
     normalize_visibility,
 )
-from ledger.port import HoldActive, IdempotencyConflict
-from task_manager import TaskManager
+from ledger.port import IdempotencyConflict
+from task_manager import TaskManager, TaskStatusUnavailable
 
 logger = logging.getLogger(__name__)
 
@@ -116,8 +114,10 @@ def _get_memory():
             if _memory is None:
                 from mem0 import Memory
 
+                from memory.core import _memory_from_config
+
                 config = settings.get_mem0_config()
-                _memory = Memory.from_config(config)
+                _memory = _memory_from_config(Memory, config)
 
                 if hasattr(_memory, "graph") and hasattr(_memory.graph, "graphiti"):
                     _graphiti = _memory.graph.graphiti
@@ -145,8 +145,12 @@ def _get_async_memory():
     if _async_memory is None:
         from mem0 import AsyncMemory
 
+        from memory.core import _memory_from_config
+
+        # AsyncMemory.from_config is synchronous and builds the same sync
+        # Qdrant store as Memory, so the same cold-start handling applies.
         config = settings.get_mem0_config()
-        _async_memory = AsyncMemory.from_config(config)
+        _async_memory = _memory_from_config(AsyncMemory, config)
     return _async_memory
 
 
@@ -249,8 +253,7 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-
-# Register Bearer token auth middleware (no-op when NEURALSCAPE_API_KEY is unset)
+# Register Bearer token auth middleware (fail-closed; see auth.py and AUTH.md)
 from auth import BearerAuthMiddleware
 
 app.add_middleware(BearerAuthMiddleware)
@@ -519,13 +522,41 @@ async def add_memory_async(req: LegacyAddMemoryRequest, request: Request):
     )
 
 
-@app.get("/memories/status/{task_id}")
-async def get_task_status(task_id: str):
-    """Check the status of an async memory addition task."""
-    result = await _task_manager.get_status(task_id)
+async def _caller_task_status(request: Request, task_id: str) -> dict:
+    """Status of ``task_id`` as the caller may see it; 404 when unknown or not theirs.
+
+    With a per-user token only the user who enqueued the task can read it, and
+    anyone else gets the same 404 as for an id that never existed. With the
+    shared key (or with auth disabled) every caller holds the same credential
+    and may write as any user, so there is no caller to check and the status
+    is returned as before. If the owner check cannot reach Redis the answer
+    is a 503 for every id alike, never the task's state.
+    """
+    token_user_id = getattr(request.state, "user_id", None)
+    try:
+        result = await _task_manager.get_status(
+            task_id,
+            user_id=token_user_id,
+            enforce_owner=bool(token_user_id),
+            # Graph tasks (e.g. an edit's graph_task_id) report queued too.
+            include_graph=True,
+        )
+    except TaskStatusUnavailable:
+        # Same answer for every id (owned, foreign or unknown); retryable.
+        raise HTTPException(
+            status_code=503,
+            detail="Task status is temporarily unavailable; retry shortly.",
+            headers={"Retry-After": "1"},
+        )
     if result["status"] == "not_found":
         raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
     return result
+
+
+@app.get("/memories/status/{task_id}")
+async def get_task_status(task_id: str, request: Request):
+    """Check the status of an async memory addition task."""
+    return await _caller_task_status(request, task_id)
 
 
 # Legacy graph endpoints
@@ -933,7 +964,7 @@ async def v1_store_raw_memory(req: RawMemoryRequest, request: Request):
     if "expires_at" in raw_kwargs and hasattr(raw_kwargs["expires_at"], "isoformat"):
         raw_kwargs["expires_at"] = raw_kwargs["expires_at"].isoformat()
 
-    if settings.ledger_enabled:
+    if _durable():
         # Durable path: an optional client idempotency key makes retries safe.
         idempotency_key = _idempotency_key_from(request)
         if idempotency_key is not None:
@@ -941,17 +972,7 @@ async def v1_store_raw_memory(req: RawMemoryRequest, request: Request):
 
     try:
         task_id = await _task_manager.enqueue_raw(**raw_kwargs)
-    except Exception as e:
-        if settings.ledger_enabled:
-            from ledger.port import IdempotencyConflict
-
-            if isinstance(e, IdempotencyConflict):
-                raise HTTPException(
-                    status_code=409,
-                    detail="Idempotency-Key was already used with a different request",
-                ) from e
-        if not isinstance(e, (ConnectionError, OSError)):
-            raise
+    except (ConnectionError, OSError) as e:
         logger.warning(f"Redis unavailable, falling back to sync store: {e}")
         # Sync path expects datetime, not ISO string
         sync_kwargs = dict(raw_kwargs)
@@ -1860,12 +1881,28 @@ async def _require_owned_connector(vault, connector_id: str, caller: str) -> dic
 
 @v1_router.post("/connectors", status_code=201)
 async def v1_register_connector(req: ConnectorConfigRequest, request: Request):
-    """Register (or replace) a data-layer connector instance. Secrets are encrypted at rest."""
+    """Register (or replace) a data-layer connector instance. Secrets are encrypted at rest.
+
+    A per-user caller can only replace a connector it owns: an id owned by
+    someone else answers the same 404 as the other connector routes, so the
+    connector cannot be taken over. Connector ids share one namespace across
+    users, so this route does show whether an id is taken (201 for an unused
+    id, 404 for one owned by someone else); it does not reveal the owner or
+    the connector's config. Without a caller identity (shared key / auth
+    disabled) a replacement may change the owner; the vault then starts a new
+    instance with fresh sync state.
+    """
+    from connectors.vault import ConnectorOwnedElsewhere
+
     vault = _require_vault()
     resolved_user_id = _resolve_user_id(request, None)
     record = req.model_dump(mode="json", exclude_none=True)
     record["owner_user_id"] = resolved_user_id
-    redacted = await vault.put(record)
+    per_user_caller = bool(getattr(request.state, "user_id", None))
+    try:
+        redacted = await vault.put(record, allow_owner_change=not per_user_caller)
+    except ConnectorOwnedElsewhere:
+        raise HTTPException(status_code=404, detail=f"Connector '{req.connector_id}' not found")
     return JSONResponse(status_code=201, content=redacted)
 
 
@@ -1891,8 +1928,10 @@ async def v1_delete_connector(connector_id: str, request: Request):
     """Delete one of the caller's connectors (does not remove ingested memories)."""
     vault = _require_vault()
     caller = _resolve_user_id(request, None)
-    await _require_owned_connector(vault, connector_id, caller)
-    removed = await vault.delete(connector_id)
+    rec = await _require_owned_connector(vault, connector_id, caller)
+    # Only the instance the owner check saw: a connector re-created in between
+    # (a new generation) is not removed.
+    removed = await vault.delete(connector_id, generation=rec.get("generation"))
     return {"status": "ok", "deleted": removed}
 
 
@@ -1901,20 +1940,24 @@ async def v1_sync_connector(connector_id: str, request: Request):
     """Trigger an immediate sync for one of the caller's connectors."""
     vault = _require_vault()
     caller = _resolve_user_id(request, None)
-    record = await _require_owned_connector(vault, connector_id, caller)
+    rec = await _require_owned_connector(vault, connector_id, caller)
     if _durable():
-        from ledger.port import IdempotencyConflict
-
         try:
             task_id = await _task_manager.enqueue_connector_sync(
-                connector_id, record=record, idempotency_key=_idempotency_key_from(request)
+                connector_id,
+                caller,
+                generation=rec.get("generation"),
+                record=rec,
+                idempotency_key=_idempotency_key_from(request),
             )
         except IdempotencyConflict as conflict:
             raise HTTPException(
                 status_code=409, detail="Idempotency-Key was already used with a different request"
             ) from conflict
         return TaskAcceptedResponse(task_id=task_id, poll_url=f"/v1/memories/status/{task_id}")
-    task_id = await _task_manager.enqueue_connector_sync(connector_id)
+    task_id = await _task_manager.enqueue_connector_sync(
+        connector_id, user_id=caller, generation=rec.get("generation")
+    )
     return TaskAcceptedResponse(task_id=task_id, poll_url=f"/v1/memories/status/{task_id}")
 
 
@@ -2001,12 +2044,9 @@ async def v1_store_raw_batch(req: RawMemoryBatchRequest, request: Request):
 
 
 @v1_router.get("/memories/status/{task_id}", response_model=TaskStatusResponse)
-async def v1_get_task_status(task_id: str):
-    """Poll async task status."""
-    result = await _task_manager.get_status(task_id)
-    if result["status"] == "not_found":
-        raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
-    return result
+async def v1_get_task_status(task_id: str, request: Request):
+    """Poll async task status (only the user who enqueued it, with a per-user token)."""
+    return await _caller_task_status(request, task_id)
 
 
 # ── Recall ────────────────────────────────────
@@ -2136,7 +2176,6 @@ async def v1_search_memories(req: SearchMemoryRequest, request: Request):
     except Exception as e:
         logger.exception("v1 search failed")
         raise HTTPException(status_code=500, detail="Memory search failed")
-
 
 
 
@@ -2432,7 +2471,6 @@ async def v1_metrics(
     caller = _resolve_user_id(request, user_id)
     snapshot = await asyncio.to_thread(sm.metrics_snapshot, caller, None, task_id)
     return {"status": "ok", "savings_meter": snapshot}
-
 
 
 
@@ -2845,12 +2883,6 @@ async def v1_export_okf(
     )
 
 
-# ── Portable export (default off: PORTABILITY_EXPORT_ENABLED) ──────────────
-
-
-# ── Portable import (default off: PORTABILITY_IMPORT_ENABLED) ──────────────
-
-
 @v1_router.get("/memories", response_model=list[MemoryResponse])
 async def v1_list_memories(
     request: Request,
@@ -2979,7 +3011,7 @@ def _idempotency_key_from(request: Request) -> str | None:
 def _ledger_kwargs(request: Request) -> dict:
     """``{"idempotency_key": ...}`` for the durable path when a client sent the header."""
 
-    if not settings.ledger_enabled:
+    if not _durable():
         return {}
     key = _idempotency_key_from(request)
     return {} if key is None else {"idempotency_key": key}
@@ -3040,7 +3072,11 @@ async def v1_patch_memory(memory_id: str, req: PatchMemoryRequest, request: Requ
     graph_task_id = None
     if result.get("graph_job"):
         try:
-            graph_task_id = await _task_manager.enqueue_graph_enrichment(**result["graph_job"])
+            # The job writes to the storage owner's graph partition; the
+            # task id goes to (and is readable by) the caller who edited.
+            graph_task_id = await _task_manager.enqueue_graph_enrichment(
+                **result["graph_job"], requester_user_id=caller
+            )
             graph = graph.replace("_pending", "_queued")
         except Exception as e:
             # Never run Graphiti inline on a request thread — report honestly instead.
@@ -3508,27 +3544,6 @@ async def v1_audit_private_leakage(req: AuditPrivateLeakageRequest, request: Req
         raise HTTPException(status_code=500, detail="Failed to audit private leakage") from e
 
 
-# ── Scoped credentials and service accounts (off unless CREDENTIALS_ENABLED) ──
-
-
-# ── Opaque-envelope relay (E2EE_RELAY_ENABLED; 404 while off) ─────────────────
-# The relay stores ciphertext, signed membership entries, signed checkpoints,
-# wrapped epoch keys and sealed jobs.  It never holds a key or sees plaintext.
-# Handlers are thin: ``e2ee_relay.dispatch`` owns the flag, error mapping and
-# storage, and every operation is registered in the action policy registry.
-
-
-# ── Engine switch (privileged; default off: ENGINE_ROUTING_ENABLED) ──────────────
-#
-# Moves the routed vector engine between generations: status, start-dual-write,
-# catch-up, flip, rollback, abandon.  Dictator-only like the other admin routes;
-# 404 while the feature is off, 503 (with the reason) when it is on but this
-# process could not build the switch at startup.
-
-
-# ── Online cutover of legacy writers to the ledger (privileged; off unless LEDGER_CUTOVER_ENABLED) ──
-
-
 # Mount v1 router
 app.include_router(v1_router)
 
@@ -3540,9 +3555,6 @@ app.include_router(v1_router)
 from oauth import router as oauth_router
 
 app.include_router(oauth_router)
-
-# Optional server-rendered team console. Off unless CONSOLE_ENABLED is set; it
-# calls this app's own public API with the signed-in credential (no backdoor).
 
 
 class _McpTrailingSlash:

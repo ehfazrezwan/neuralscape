@@ -1474,7 +1474,6 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
     arguments = arguments or {}
     user_id = current_user_id.get() or arguments.get("user_id") or settings.default_user_id
 
-
     try:
         if name == "recall_memories":
             # Phase E: fusion — when the router says code leg is warranted, execute
@@ -2225,8 +2224,9 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
             graph_task_id = None
             if result.get("graph_job"):
                 try:
+                    # Storage owner's partition; the editor polls the task.
                     graph_task_id = await _task_manager.enqueue_graph_enrichment(
-                        **result["graph_job"]
+                        **result["graph_job"], requester_user_id=user_id
                     )
                     graph = graph.replace("_pending", "_queued")
                 except Exception as e:
@@ -2614,6 +2614,11 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
                 force,
                 _queue_name=settings.graph_queue_name,
             )
+            if job:
+                # The caller may also poll it on /v1/memories/status.
+                from task_manager import record_task_owner
+
+                await record_task_owner(arq_pool, job.job_id, user_id)
             return [TextContent(type="text", text=json.dumps({
                 "status": "enqueued",
                 "job_id": job.job_id if job else None,

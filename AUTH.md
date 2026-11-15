@@ -3,6 +3,28 @@
 How Neuralscape authenticates humans and machines, and how to switch the
 human-login mechanism per deployment with a single env var.
 
+## Fail-closed by default
+
+The service **refuses to start** unless one of these is set:
+
+| Setting | Use |
+|---|---|
+| `NEURALSCAPE_USER_TOKEN_SECRET` | Per-user HMAC tokens (recommended; also enables the OAuth connector with `NEURALSCAPE_PUBLIC_URL`) |
+| `NEURALSCAPE_API_KEY` | Legacy single shared key (deprecated, still honoured) |
+| `NEURALSCAPE_AUTH_DISABLED=true` | No authentication at all. Trusted local machine only |
+
+With neither secret set and no opt-out, startup fails with
+`Authentication is not configured. Set one of: ...`, and `BearerAuthMiddleware`
+answers every non-public request with 503 instead of passing it through. The
+opt-out logs one `AUTHENTICATION IS DISABLED` WARNING at startup and is ignored
+whenever either secret is set. Public paths are `/health`, `/health/live`,
+`/.well-known/*` and `/oauth/*`.
+
+The MCP **stdio** transport (`python mcp_server.py`, launched as a local
+subprocess by Claude Code) has no network listener and no bearer layer; it is
+reachable only by the process that spawned it, so this rule does not apply to
+it. The ARQ workers likewise open no inbound port.
+
 ## The model: two independent layers
 
 1. **The MCP OAuth layer** — Neuralscape is its own OAuth 2.1 Authorization
@@ -184,6 +206,8 @@ real deployment.
 
 ## Troubleshooting
 
+- **Refuses to start with `Authentication is not configured`** — set `NEURALSCAPE_USER_TOKEN_SECRET` (or the legacy `NEURALSCAPE_API_KEY`), or `NEURALSCAPE_AUTH_DISABLED=true` on a trusted local machine. See [Fail-closed by default](#fail-closed-by-default).
+- **Every request returns 503 `Authentication is not configured`** — the app is being served without its startup validation and no secret is set; same fix as above.
 - **Boots with a config error naming `GOOGLE_OAUTH_*` / `SUPABASE_*` / `AUTH_ALLOWED_DOMAINS`** — that provider's required env vars are missing; the validator lists every gap.
 - **"This account is not authorized"** — verified email isn't in the allowlist (env for `google`; the `signup_email_domains`/`addresses` tables for `supabase`).
 - **Google `redirect_uri_mismatch`** — the URI in Google Cloud must be exactly `https://<host>/oauth/google/callback`.

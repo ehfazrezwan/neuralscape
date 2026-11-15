@@ -1365,31 +1365,75 @@ def evaluate_policy(
         if resource not in principal.delegation.allowed_resources:
             return deny()
 
+    if not _holds_current_right(
+        policy,
+        subject_id=principal.subject_id,
+        credential_id=principal.credential_id,
+        action=action,
+        resource=resource,
+    ):
+        return deny()
+
+    # A delegated credential can never widen its issuer's current rights: the
+    # issuer must be a current member of this same snapshot and hold a matching
+    # allow, with no matching deny, for the issuing credential.  The snapshot
+    # does not carry the issuer's expected membership version, so presence is
+    # the membership witness; removing the issuer revokes every delegate.
+    if principal.delegation is not None:
+        issuer = principal.delegation.delegated_by_subject_id
+        if not any(
+            membership.subject_id == issuer for membership in policy.membership_versions
+        ):
+            return deny()
+        if not _holds_current_right(
+            policy,
+            subject_id=issuer,
+            credential_id=principal.delegation.delegated_by_credential_id,
+            action=action,
+            resource=resource,
+        ):
+            return deny()
+
+    return _decision(
+        principal=principal,
+        action=action,
+        resource=resource,
+        policy=policy,
+        outcome="allow",
+        reason_code="explicit_grant",
+    )
+
+
+def _holds_current_right(
+    policy: AccessPolicy,
+    *,
+    subject_id: str,
+    credential_id: str,
+    action: str,
+    resource: ReferenceHandle,
+) -> bool:
+    """Whether ``subject_id`` acting with ``credential_id`` has a matching allow
+    and no matching deny for ``action`` on ``resource`` in ``policy``.
+
+    A statement without a credential applies to every credential of its
+    subject; a credential-specific one applies only to that credential.
+    Denial precedence is independent of statement ordering.
+    """
+
     matching_statements = tuple(
         statement
         for statement in policy.statements
-        if statement.subject_id == principal.subject_id
+        if statement.subject_id == subject_id
         and statement.action == action
         and statement.resource == resource
         and (
             statement.credential_id is None
-            or statement.credential_id == principal.credential_id
+            or statement.credential_id == credential_id
         )
     )
-
-    # Denial precedence is independent of statement ordering.
     if any(statement.effect == "deny" for statement in matching_statements):
-        return deny()
-    if any(statement.effect == "allow" for statement in matching_statements):
-        return _decision(
-            principal=principal,
-            action=action,
-            resource=resource,
-            policy=policy,
-            outcome="allow",
-            reason_code="explicit_grant",
-        )
-    return deny()
+        return False
+    return any(statement.effect == "allow" for statement in matching_statements)
 
 
 def validate_policy_decision(decision: PolicyDecision) -> PolicyDecision:

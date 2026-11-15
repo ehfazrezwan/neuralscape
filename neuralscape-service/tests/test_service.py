@@ -597,7 +597,12 @@ class TestV1PatchMemory:
         data = resp.json()
         assert data["graph"] == "reingest_queued"
         assert data["graph_task_id"] == "test-task-id-graph"
-        mock_task_manager.enqueue_graph_enrichment.assert_awaited_once_with(**job)
+        # No token and no body user_id: the caller is the default user.
+        from config import settings as _settings
+
+        mock_task_manager.enqueue_graph_enrichment.assert_awaited_once_with(
+            **job, requester_user_id=_settings.default_user_id
+        )
 
     def test_patch_reports_enqueue_failure_honestly(self, client, mock_service, mock_task_manager):
         job = {"memory_id": "m1", "content": "new", "user_id": "e",

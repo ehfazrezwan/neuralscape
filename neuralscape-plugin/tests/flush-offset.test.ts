@@ -104,13 +104,14 @@ describe("flushTurns delivery accounting", () => {
 
 // ── offset commit semantics ──────────────────────────────────────
 
+// The real Claude Code shape: text under message.content (a string for the user, text blocks for the assistant).
 const MESSAGES = [
-  { type: "user", content: "turn zero user prompt with plenty of text" },
-  { type: "assistant", content: "turn zero assistant answer with plenty of text" },
-  { type: "user", content: "turn one user prompt with plenty of text" },
-  { type: "assistant", content: "turn one assistant answer with plenty of text" },
-  { type: "user", content: "turn two user prompt with plenty of text" },
-  { type: "assistant", content: "turn two assistant answer with plenty of text" },
+  { type: "user", message: { role: "user", content: "turn zero user prompt with plenty of text" } },
+  { type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "turn zero assistant answer with plenty of text" }] } },
+  { type: "user", message: { role: "user", content: "turn one user prompt with plenty of text" } },
+  { type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "turn one assistant answer with plenty of text" }] } },
+  { type: "user", message: { role: "user", content: "turn two user prompt with plenty of text" } },
+  { type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "turn two assistant answer with plenty of text" }] } },
 ];
 
 async function makeTranscript(): Promise<{ path: string; raw: Record<string, unknown> }> {
