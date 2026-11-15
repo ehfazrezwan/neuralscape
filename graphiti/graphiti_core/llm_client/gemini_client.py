@@ -24,7 +24,7 @@ from pydantic import BaseModel
 
 from ..prompts.models import Message
 from .client import LLMClient, get_extraction_language_instruction
-from .config import LLMConfig, ModelSize
+from .config import GEMINI_HTTP_TIMEOUT_MS, LLMConfig, ModelSize
 from .errors import RateLimitError
 
 if TYPE_CHECKING:
@@ -146,7 +146,14 @@ class GeminiClient(LLMClient):
         self.fallback_model = config.fallback_model
 
         if client is None:
-            self.client = genai.Client(api_key=config.api_key)
+            # NEURALSCAPE PATCH (re-apply after upstream subtree syncs): bound every
+            # Gemini HTTP call. Without it a stalled request hangs a graph worker
+            # slot forever. HttpOptions.timeout is in MILLISECONDS. Restores the
+            # patch lost in the April upstream sync.
+            self.client = genai.Client(
+                api_key=config.api_key,
+                http_options=types.HttpOptions(timeout=GEMINI_HTTP_TIMEOUT_MS),
+            )
         else:
             self.client = client
 
@@ -267,6 +274,7 @@ class GeminiClient(LLMClient):
         response_model: type[BaseModel] | None = None,
         max_tokens: int | None = None,
         model_size: ModelSize = ModelSize.medium,
+        model_override: str | None = None,
     ) -> tuple[dict[str, typing.Any], int, int]:
         """
         Generate a response from the Gemini language model.
@@ -276,6 +284,8 @@ class GeminiClient(LLMClient):
             response_model (type[BaseModel] | None): An optional Pydantic model to parse the response into.
             max_tokens (int | None): The maximum number of tokens to generate in the response. If None, uses precedence rules.
             model_size (ModelSize): The size of the model to use (small or medium).
+            model_override (str | None): NEURALSCAPE PATCH: explicit model for this call only
+                (used by the transient-error fallback); never mutates client state.
 
         Returns:
             tuple[dict[str, typing.Any], int, int]: The response dict, input tokens, and output tokens.
@@ -312,7 +322,8 @@ class GeminiClient(LLMClient):
                 )
 
             # Get the appropriate model for the requested size
-            model = self._get_model_for_size(model_size)
+            # NEURALSCAPE PATCH: model_override carries the fallback model per call.
+            model = model_override or self._get_model_for_size(model_size)
 
             # Resolve max_tokens using precedence rules (see _resolve_max_tokens for details)
             resolved_max_tokens = self._resolve_max_tokens(max_tokens, model)
@@ -502,15 +513,16 @@ class GeminiClient(LLMClient):
                         f'Primary model {primary} unavailable for {prompt_name or "unknown"}, '
                         f'falling back to {self.fallback_model}'
                     )
-                    # Temporarily swap models and make one more attempt
-                    original_model = self.model
-                    self.model = self.fallback_model
+                    # NEURALSCAPE PATCH: pass the fallback model explicitly for this
+                    # one call. Swapping self.model was not coroutine-safe (Graphiti
+                    # runs many generate_response calls concurrently on one client).
                     try:
                         response, input_tokens, output_tokens = await self._generate_response(
                             messages=messages,
                             response_model=response_model,
                             max_tokens=max_tokens,
                             model_size=model_size,
+                            model_override=self.fallback_model,
                         )
                         total_input_tokens += input_tokens
                         total_output_tokens += output_tokens
@@ -523,8 +535,6 @@ class GeminiClient(LLMClient):
                             f'Fallback model {self.fallback_model} also failed: {fallback_error}'
                         )
                         last_error = fallback_error
-                    finally:
-                        self.model = original_model
 
             logger.error('🦀 LLM generation failed and retries are exhausted.')
             logger.error(self._get_failed_generation_log(messages, last_output))
