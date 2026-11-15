@@ -99,6 +99,9 @@ All settings live in `neuralscape-service/config.py` as a Pydantic `BaseSettings
 | `dedup_batch_size` | `100` | `config.py:44` |
 | `dedup_cron_hours` | `{0, 6, 12, 18}` | `config.py:45` |
 | `neuralscape_api_key` | empty (startup refuses unless a secret or `NEURALSCAPE_AUTH_DISABLED=true` is set; see AUTH.md) | `config.py` |
+| `neuralscape_api_key_user_id` | empty (the shared key acts as `default_user_id`; see AUTH.md) | `config.py` |
+| `neuralscape_legacy_key_trust_body_user_id` | `false` (`true` lets the shared key act as any body `user_id`) | `config.py` |
+| `neuralscape_revoked_tokens` | empty (CSV of SHA-256 digests of revoked per-user tokens) | `config.py` |
 | `host` / `port` | `0.0.0.0` / `8199` | `config.py:51-52` |
 | `default_user_id` | `default_user` | `config.py:53` |
 | `mcp_transport` | `stdio` | `config.py:55` |
