@@ -72,8 +72,16 @@ def test_dmr_parse_sessions_and_qa():
     assert conv.conv_id == "valid_9"
     assert len(conv.sessions) == 2  # 1 previous + final
     assert conv.sessions[0].date == "3 days before the final session"
-    # bare {"text"} turns alternate Speaker 1 / Speaker 2
-    assert conv.sessions[0].turns[0].content.startswith("Speaker 1:")
+    # Deterministic event time: fixed anchor minus time_back ("3 days ago"),
+    # final session at the anchor itself.
+    assert conv.sessions[0].occurred_at == "2025-12-29T12:00:00+00:00"
+    assert conv.sessions[1].occurred_at == "2026-01-01T12:00:00+00:00"
+    # bare {"text"} turns alternate Speaker 1 / Speaker 2. Identity travels
+    # on role/speaker ONLY — no "Speaker N:" text prefix (run-3 failure
+    # analysis: the literal prefix gave the extractor a second channel it
+    # distilled into unresolvable "Speaker 2 ..." memories).
+    assert not conv.sessions[0].turns[0].content.startswith("Speaker 1:")
+    assert conv.sessions[0].turns[0].speaker == "Speaker 1"
     assert conv.sessions[0].turns[1].role == "assistant"
     [qa] = data.qa_items
     assert qa.question == "What do I do for a living?"
