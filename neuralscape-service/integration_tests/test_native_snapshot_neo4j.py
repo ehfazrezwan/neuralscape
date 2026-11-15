@@ -62,7 +62,7 @@ def live_database(neo4j_conn):
     # neo4j_conn (conftest) skips without a reachable Neo4j, or fails when
     # NS_INTEGRATION_REQUIRED=1; the dedicated CI job provides Neo4j, so
     # there it runs.
-    uri, user, password = neo4j_conn.uri, neo4j_conn.user, neo4j_conn.password
+    conn = neo4j_conn
 
     loop = asyncio.new_event_loop()
     started = threading.Event()
@@ -80,7 +80,7 @@ def live_database(neo4j_conn):
     thread.start()
     assert started.wait(timeout=5), "Neo4j event loop did not start"
 
-    driver = AsyncGraphDatabase.driver(uri, auth=(user, password))
+    driver = AsyncGraphDatabase.driver(conn.uri, auth=(conn.user, conn.password))
     try:
         _submit(loop, driver.verify_connectivity())
         yield SimpleNamespace(_loop=loop), driver
