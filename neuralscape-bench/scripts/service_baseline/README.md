@@ -36,7 +36,7 @@ capacity, and proposes no budgets.
   command, `down -v` and sentinel-volume removal first goes through
   `journey_safety.require_disposable_project`: the production project name is refused after
   trimming and in any letter case, an empty name is refused, and the name must equal or start
-  with an allowed prefix. The default allowlist is `nscampaign`, `nstest-` and `ns-bench-`;
+  with an allowed prefix. The default allowlist is `nstest-` and `ns-bench-`;
   more prefixes can be added only with the repeatable `--allow-project-prefix` option, never
   through the environment (a prefix that could match the production name is refused). The
   check runs before any docker command is built, so a refusal makes no docker call. The

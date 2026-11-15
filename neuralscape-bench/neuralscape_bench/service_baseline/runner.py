@@ -393,7 +393,7 @@ def main() -> None:
     parser.add_argument("--project", default=DEFAULT_PROJECT,
                         help="compose project name; must match an allowed disposable prefix (default: %(default)s)")
     parser.add_argument("--allow-project-prefix", action="append", default=[], metavar="PREFIX",
-                        help="extra disposable project prefix, repeatable (the defaults are nscampaign, nstest-, ns-bench-)")
+                        help="extra disposable project prefix, repeatable (the defaults are nstest-, ns-bench-)")
     parser.add_argument("--compose-override", default=None,
                         help=f"extra compose file merged over the stack (e.g. {NO_EGRESS_OVERRIDE.name}); default: ${OVERRIDE_ENV}")
     args = parser.parse_args()

@@ -22,7 +22,7 @@ class JourneySafetyError(RuntimeError):
 # disposable prefixes (`name == prefix` or `name.startswith(prefix)`). The production project name is
 # refused outright (trimmed, any letter case, empty included). More prefixes can be added only by an
 # explicit command-line option through `allow_prefix`, never from the environment.
-DEFAULT_ALLOWED_PREFIXES: tuple[str, ...] = ("nscampaign", "nstest-", "ns-bench-")
+DEFAULT_ALLOWED_PREFIXES: tuple[str, ...] = ("nstest-", "ns-bench-")
 PRODUCTION_PROJECT = "neuralscape"
 _NAME_CHARS = frozenset("abcdefghijklmnopqrstuvwxyz0123456789_-")
 _extra_prefixes: list[str] = []

@@ -58,7 +58,7 @@ def test_only_a_disposable_project_name_is_accepted(name):
         journey_safety.require_disposable_project(name)
 
 
-@pytest.mark.parametrize("name", ["nscampaign", "nscampaign-x", "nstest-a", "ns-bench-x", "ns-bench-baseline"])
+@pytest.mark.parametrize("name", ["nstest-", "nstest-x", "ns-bench-x", "ns-bench-baseline"])
 def test_the_default_allowlist_accepts_disposable_prefixes(name):
     assert journey_safety.require_disposable_project(name) == name
 
