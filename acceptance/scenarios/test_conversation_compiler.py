@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 
 import pytest
 
-from nsaccept import eventually, expect_check_fails, negative_control, proves
+from nsaccept import eventually, expect_check_fails, negative_control, proves, profiles
 
 PREFIX = "/v1/extensions/conversation-compiler"
 
@@ -121,17 +121,14 @@ def check_pair_collapsed_to_the_newer(client, marker, project_id):
     assert hits[0]["memory"].endswith("."), "the survivor should be the newer (second) write"
 
 
-@proves("ext.compiler-compile", "queue.dedup-cron")
-def test_compile_dedup_merges_a_near_duplicate_reversibly(ctx, a, flushed):
-    """Post-compile dedup hides the older of two near-identical facts from recall."""
-    assert flushed["task"].get("status") == "completed", "precondition: flush did not complete"
-    marker = f"zq-{ctx.run_id}-nightlyreport"
+def _compile_with_a_near_duplicate_pair(ctx, a, suffix):
+    """Store two near-identical facts (older, newer), compile, return (marker, older, newer)."""
+    marker = f"zq-{ctx.run_id}-{suffix}"
     older = f"{marker} The nightly report job runs at 02:00 UTC on weekdays"
     newer = f"{older}."
-    ids = []
     for text in (older, newer):
-        ids.append(a.store_raw(text, "convention", scope="project", project_id=ctx.project_id, visibility="private"))
-        assert a.poll_task(ids[-1], timeout=120)["status"] == "completed"
+        task = a.store_raw(text, "convention", scope="project", project_id=ctx.project_id, visibility="private")
+        assert a.poll_task(task, timeout=120)["status"] == "completed"
         time.sleep(1.1)  # distinct created_at, so "older" is well defined
     eventually(lambda: check_both_copies_recalled(a, marker, ctx.project_id), timeout=90, what="both copies recalled")
 
@@ -140,15 +137,29 @@ def test_compile_dedup_merges_a_near_duplicate_reversibly(ctx, a, flushed):
     task = a.poll_task(resp.json()["task_id"], timeout=300)
     assert task.get("status") == "completed", f"compile task ended as {task}"
     assert (task.get("result") or {}).get("dedup_triggered") is True
-
     eventually(lambda: check_pair_collapsed_to_the_newer(a, marker, ctx.project_id), timeout=60, what="older copy hidden")
-    # Reversible: the older row is not deleted, only hidden; the audit listing still has it.
+    return marker, older, newer
+
+
+@proves("ext.compiler-compile", "queue.dedup-cron")
+def test_compile_dedup_hides_the_older_near_duplicate(ctx, a, flushed):
+    """Post-compile dedup leaves only the newer of two near-identical facts recalled."""
+    assert flushed["task"].get("status") == "completed", "precondition: flush did not complete"
+    _compile_with_a_near_duplicate_pair(ctx, a, "nightlyreport")
+
+
+@proves("ext.compiler-compile", "queue.dedup-cron")
+@profiles("dedup-tombstone")
+def test_compile_dedup_tombstone_is_reversible(ctx, a, flushed):
+    """With the tombstone flag on, the older copy is hidden, not deleted: the audit listing keeps it."""
+    assert flushed["task"].get("status") == "completed", "precondition: flush did not complete"
+    marker, older, newer = _compile_with_a_near_duplicate_pair(ctx, a, "nightlytomb")
     plain = a.get("/v1/memories", params={"project_id": ctx.project_id, "limit": 200})
     audit = a.get("/v1/memories", params={"project_id": ctx.project_id, "limit": 200, "include_tombstoned": "true"})
     assert plain.status_code == 200 and audit.status_code == 200
-    plain_n = sum(older in m.get("memory", "") or newer in m.get("memory", "") for m in plain.json())
-    audit_hits = [m for m in audit.json() if marker in m.get("memory", "")]
-    assert len(audit_hits) == 2, f"the older copy was deleted, not tombstoned: {len(audit_hits)} rows"
+    plain_n = sum(marker in m.get("memory", "") for m in plain.json())
+    audit_n = sum(marker in m.get("memory", "") for m in audit.json())
+    assert audit_n == 2, f"the older copy was deleted, not tombstoned: {audit_n} rows"
     assert plain_n == 1, f"the plain listing should show one copy, got {plain_n}"
 
 

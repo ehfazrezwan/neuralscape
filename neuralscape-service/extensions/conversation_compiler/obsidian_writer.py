@@ -29,6 +29,19 @@ def _slugify(text: str) -> str:
     return slug.strip("-")[:80]
 
 
+def _escape_owner(user_id: str) -> str:
+    """Escape ``%``, ``)`` and line breaks so a user id survives the ``_(user: ...)_`` suffix."""
+    return (
+        user_id.replace("%", "%25").replace(")", "%29").replace("\n", "%0A").replace("\r", "%0D")
+    )
+
+
+def _unescape_owner(text: str) -> str:
+    return (
+        text.replace("%29", ")").replace("%0A", "\n").replace("%0D", "\r").replace("%25", "%")
+    )
+
+
 def _ensure_dir(path: Path) -> None:
     """Create directory and parents if they don't exist."""
     path.mkdir(parents=True, exist_ok=True)
@@ -171,7 +184,7 @@ class ObsidianWriter:
                 content += f" _(session: {session})_"
             owner = entry.get("user_id", "")
             if owner:
-                content += f" _(user: {owner})_"
+                content += f" _(user: {_escape_owner(owner)})_"
             content += "\n"
 
         if existing:
@@ -230,7 +243,7 @@ class ObsidianWriter:
                     "category": m.group(2),
                     "content": m.group(3).strip(),
                     "session_id": m.group(4) or "",
-                    "user_id": m.group(5) or "",
+                    "user_id": _unescape_owner(m.group(5)) if m.group(5) else "",
                 }
             )
         return entries

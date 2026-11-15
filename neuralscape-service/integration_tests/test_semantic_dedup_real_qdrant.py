@@ -14,51 +14,54 @@ must:
 5. leave the unrelated fact untouched, and never touch a copy in another
    project (partition rule).
 
-Invoked explicitly (outside ``tests/``). A missing or unreachable service is a
-test FAILURE, never a skip. Required env: NEO4J_URI, NEO4J_USER, NEO4J_PASSWORD
-(the service initialises its graph store), QDRANT_URL, GOOGLE_API_KEY (embeddings).
+Both behaviours of ``DEDUP_SEMANTIC_TOMBSTONE_ENABLED`` are covered: ON (tombstone,
+the first test) and OFF (hard delete, the last).
+
+Uses the integration fixtures (``stores``, ``llm_key``, ``flags``, ``unique_ns``): all
+rows live in a throwaway collection that is dropped afterwards, so nothing is
+cleaned user-wide in a shared collection. On the gate (``NS_INTEGRATION_REQUIRED=1``)
+missing stores or key fail the test. Needs Neo4j (the service initialises its graph
+store), Qdrant, and GOOGLE_API_KEY (embeddings).
 """
 
 from __future__ import annotations
 
 import third_party_telemetry  # noqa: F401  (telemetry guard; must precede mem0/graphiti imports)
 
-import os
 import time
 import uuid
 
 import pytest
 
-pytestmark = pytest.mark.integration
 
-REQUIRED_ENV = ("NEO4J_URI", "NEO4J_USER", "NEO4J_PASSWORD", "QDRANT_URL", "GOOGLE_API_KEY")
+@pytest.fixture
+def svc(flags, stores, llm_key, unique_ns):
+    """A MemoryService over a throwaway Qdrant collection (dropped at teardown).
 
+    Paraphrase similarity varies with the embedding model; the test is about
+    what happens to a pair that IS a near-duplicate, so the threshold is a
+    loose 0.85 for this test only.
+    """
+    from qdrant_client import QdrantClient
 
-@pytest.fixture(scope="module")
-def svc():
-    missing = [k for k in REQUIRED_ENV if not os.environ.get(k)]
-    assert not missing, f"integration environment incomplete, missing: {missing}"
+    flags(
+        qdrant_collection=unique_ns.qdrant_collection,
+        qdrant_url=stores.qdrant_url,
+        dedup_similarity_threshold=0.85,
+    )
+    unique_ns.on_cleanup(
+        lambda: QdrantClient(url=stores.qdrant_url).delete_collection(unique_ns.qdrant_collection)
+    )
     from memory_service import MemoryService
 
     service = MemoryService()
-    service._get_memory()  # real mem0; raises if a store is unreachable
-    yield service
+    service._get_memory()  # real mem0 over the throwaway collection; raises if unreachable
+    return service
 
 
 @pytest.fixture
-def user(svc):
-    uid = f"it-semdedup-{uuid.uuid4().hex[:12]}"
-    yield uid
-    svc.delete_memories(user_id=uid, include_shared=True)
-
-
-@pytest.fixture(autouse=True)
-def _threshold(monkeypatch):
-    # Paraphrase similarity varies with the embedding model; the test is about
-    # what happens to a pair that IS a near-duplicate, so pin a loose bar.
-    from config import settings
-
-    monkeypatch.setattr(settings, "dedup_similarity_threshold", 0.85)
+def user(unique_ns):
+    return unique_ns.user_id
 
 
 def _store(svc, uid, text, project="proj-a"):
@@ -82,7 +85,8 @@ def _recalled(svc, uid, query, project="proj-a"):
     return {m.id for m in svc.search(query, user_id=uid, project_id=project, limit=20)}
 
 
-def test_semantic_dedup_tombstones_reversibly_and_revives(svc, user):
+def test_semantic_dedup_tombstones_reversibly_and_revives(flags, svc, user):
+    flags(dedup_semantic_tombstone_enabled=True)  # opt-in behaviour: the flag-ON proof
     tag = uuid.uuid4().hex[:6]
     older = f"The deploy window for the zq{tag} billing service is Friday at 5pm."
     newer = f"The deploy window for the zq{tag} billing service is Friday 5pm."
@@ -131,3 +135,21 @@ def test_semantic_dedup_tombstones_reversibly_and_revives(svc, user):
     _store(svc, user, older)
     assert _meta(svc, user, old_id).get("dream_tombstoned") is False
     assert old_id in _recalled(svc, user, f"deploy window zq{tag} billing")
+
+
+def test_semantic_dedup_flag_off_hard_deletes_the_older_row(flags, svc, user):
+    """Contrast: with the flag off (the default) the older near-duplicate is deleted."""
+    flags(dedup_semantic_tombstone_enabled=False)
+    tag = uuid.uuid4().hex[:6]
+    older = f"The deploy window for the zq{tag} billing service is Friday at 5pm."
+    newer = f"The deploy window for the zq{tag} billing service is Friday 5pm."
+    old_id = _store(svc, user, older)
+    time.sleep(1.1)
+    new_id = _store(svc, user, newer)
+
+    result = svc.dedup_memories(user)
+
+    assert result["semantic_mode"] == "delete"
+    assert result["semantic_duplicates_removed"] >= 1, result
+    ids = {r["id"] for r in svc._scroll_all_user_memories(user)}
+    assert old_id not in ids and new_id in ids

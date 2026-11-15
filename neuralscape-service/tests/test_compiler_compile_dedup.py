@@ -127,3 +127,14 @@ def test_daily_log_round_trips_owner_and_reads_legacy_lines(writer, tmp_path):
         ("Legacy line", "s0", ""),
         ("Legacy line without session", "", ""),
     ]
+
+
+@pytest.mark.parametrize("owner", ["plain", "a)b", "name (team)", "100%25", "x%29y", "trail)", "weird)_ _(user: z"])
+def test_owner_ids_with_parentheses_or_percent_round_trip(writer, owner):
+    writer.append_daily_log(
+        "2026-05-16",
+        [{"time": "10:00", "category": "decision", "content": "Chose X", "session_id": "s", "user_id": owner}],
+    )
+    (entry,) = writer.get_daily_log_entries("2026-05-16")
+    assert entry["user_id"] == owner
+    assert entry["content"] == "Chose X" and entry["session_id"] == "s"

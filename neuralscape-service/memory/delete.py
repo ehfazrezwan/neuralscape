@@ -83,8 +83,12 @@ def _dedup_partition_filters(user_id: str, payload: dict) -> dict:
 
 def _is_tombstoned(payload: dict) -> bool:
     """Whether a raw Qdrant payload is a dream/dedup tombstone (hidden from recall)."""
-    meta, _ = _dedup_meta(payload)
-    return bool(meta.get("dream_tombstoned"))
+    # A double-wrapped row (``metadata.metadata``) can carry the flag at
+    # either level: recall filters read the outer one, dedup/dreaming patches
+    # may have written the inner one. Either hides the row.
+    outer = payload.get("metadata", {}) or {}
+    inner, _ = _dedup_meta(payload)
+    return bool(outer.get("dream_tombstoned") or inner.get("dream_tombstoned"))
 
 
 # Semantic-dedup neighbour search: ask for a small page first and widen it
@@ -746,7 +750,8 @@ class DeleteMixin:
                   delete rest.
         Phase 2 — Semantic: for each remaining memory, search for near-duplicates
                   in the same partition above the cosine threshold and
-                  tombstone the older one (reversible, see below).
+                  delete the older one (default) or, with
+                  ``DEDUP_SEMANTIC_TOMBSTONE_ENABLED``, tombstone it.
 
         Both phases share one partition rule (``_dedup_partition``): a row is
         only ever deleted as a duplicate of a row with the same user, scope,
@@ -758,7 +763,8 @@ class DeleteMixin:
         held), the dream merge folds those details into the survivor and
         tombstones reversibly. The lossless exact-hash phase always runs.
 
-        Phase 2 itself no longer hard-deletes: the older near-duplicate gets
+        With ``DEDUP_SEMANTIC_TOMBSTONE_ENABLED`` (off by default) phase 2
+        does not hard-delete: the older near-duplicate gets
         the same atomic tombstone dreaming uses (``dream_tombstoned``,
         ``superseded_by``, ``superseded_reason="semantic_dedup"``,
         ``superseded_at``), so recall hides it, its text stays on disk, and
@@ -875,9 +881,8 @@ class DeleteMixin:
         return {
             "user_id": user_id,
             "exact_duplicates_removed": exact_removed,
-            # Near-duplicates are merged by tombstone (reversible), not deleted.
             "semantic_duplicates_removed": semantic_removed,
-            "semantic_mode": "tombstone",
+            "semantic_mode": "tombstone" if settings.dedup_semantic_tombstone_enabled else "delete",
             "total_checked": total_checked,
             **self._dedup_graph_summary(collector, deleted_ids),
         }
@@ -956,7 +961,12 @@ class DeleteMixin:
             if older_id in deleted_ids:
                 continue
             try:
-                self._tombstone_semantic_duplicate(older_id, newer_id)
+                if settings.dedup_semantic_tombstone_enabled:
+                    self._tombstone_semantic_duplicate(older_id, newer_id, older_payload)
+                else:
+                    self._delete_qdrant_memory_with_graph_cleanup(
+                        older_id, older_payload, collector=collector
+                    )
                 deleted_ids.add(older_id)
                 removed += 1
                 # Same reinforcement transfer as the exact phase: the
@@ -1020,23 +1030,32 @@ class DeleteMixin:
             out.append(hit)
         return out
 
-    def _tombstone_semantic_duplicate(self, older_id: str, survivor_id: str) -> None:
+    def _tombstone_semantic_duplicate(
+        self, older_id: str, survivor_id: str, payload: dict | None = None
+    ) -> None:
         """Hide ``older_id`` as a near-duplicate of ``survivor_id`` without deleting it.
 
         Same atomic nested-key merge dreaming's ``_tombstone`` uses
         (``set_payload`` with ``key="metadata"``): only these keys are
         written server-side, so a concurrent ``times_derived`` bump is not
-        clobbered. Raises on failure so the caller does not count a merge
-        that did not happen.
+        clobbered. A double-wrapped row (``metadata.metadata``, see
+        ``_dedup_meta``) is patched at BOTH levels: the outer one is what the
+        recall filters read, the inner one is where its other fields live.
+        Raises on failure so the caller does not count a merge that did not
+        happen.
         """
-        self._memory.vector_store.client.set_payload(
-            collection_name=settings.qdrant_collection,
-            payload={
-                "dream_tombstoned": True,
-                "superseded_by": survivor_id,
-                "superseded_reason": "semantic_dedup",
-                "superseded_at": datetime.now(timezone.utc).isoformat(),
-            },
-            points=[older_id],
-            key="metadata",
-        )
+        _, wrapped = _dedup_meta(payload or {})
+        patch = {
+            "dream_tombstoned": True,
+            "superseded_by": survivor_id,
+            "superseded_reason": "semantic_dedup",
+            "superseded_at": datetime.now(timezone.utc).isoformat(),
+        }
+        client = self._memory.vector_store.client
+        for key in ("metadata", "metadata.metadata") if wrapped else ("metadata",):
+            client.set_payload(
+                collection_name=settings.qdrant_collection,
+                payload=patch,
+                points=[older_id],
+                key=key,
+            )

@@ -123,6 +123,12 @@ class Settings(BaseSettings):
     # Dedup cron
     dedup_similarity_threshold: float = 0.95
     dedup_batch_size: int = 100
+    # Semantic dedup (phase 2 of the dedup cron and of post-compile dedup).
+    # False (default): the older near-duplicate is hard-deleted, with the graph
+    # cascade and sibling re-ingest jobs. True: it is tombstoned instead
+    # (reversible: recall hides it, the row stays, re-deriving it revives it)
+    # and nothing cascades. Env: DEDUP_SEMANTIC_TOMBSTONE_ENABLED.
+    dedup_semantic_tombstone_enabled: bool = False
     dedup_cron_hours: set = {0, 6, 12, 18}
 
     # ── Reinforcement-aware recall boost (times_derived) ──────────────

@@ -235,12 +235,10 @@ class TestDedupSemantic:
         result = service.dedup_memories("u1")
 
         assert result["semantic_duplicates_removed"] == 1
-        # p1 is older: tombstoned (reversible), never hard-deleted
-        service._memory.vector_store.delete.assert_not_called()
-        tomb = _tombstone_calls(service)
-        assert [c["points"] for c in tomb] == [["p1"]]
-        assert tomb[0]["key"] == "metadata"
-        assert tomb[0]["payload"]["superseded_by"] == "p2"
+        assert result["semantic_mode"] == "delete"
+        # p1 is older, should be deleted (the default; tombstoning is opt-in)
+        service._memory.vector_store.delete.assert_called_once_with("p1")
+        assert _tombstone_calls(service) == []
 
     def test_keeps_both_below_threshold(self, service):
         memories = [
@@ -679,10 +677,9 @@ class _FakeQdrant:
         """Nested-key merge, as Qdrant does it: only the patch keys change."""
         for pid in points or []:
             target = self.payloads[pid]
-            if key:
-                target.setdefault(key, {}).update(payload)
-            else:
-                target.update(payload)
+            for part in (key.split(".") if key else []):
+                target = target.setdefault(part, {})
+            target.update(payload)
 
     def retrieve(self, collection_name=None, ids=None, with_vectors=False, **kwargs):
         out = []
@@ -825,8 +822,7 @@ class TestSemanticDedupPartitions:
         result = service.dedup_memories("u1")
 
         assert result["semantic_duplicates_removed"] == 1
-        assert _tombstoned(service) == ["p1"]
-        assert _deleted(service) == []
+        assert _deleted(service) == ["p1"]
 
     def test_same_partition_older_deleted_newest_kept_counter_moves(self, service):
         """In-partition near-duplicates still collapse (keep newest, transfer
@@ -843,8 +839,7 @@ class TestSemanticDedupPartitions:
         result = service.dedup_memories("u1")
 
         assert result["semantic_duplicates_removed"] == 1
-        assert _tombstoned(service) == ["p1"]
-        assert _deleted(service) == []
+        assert _deleted(service) == ["p1"]
         kwargs = service._memory.vector_store.client.set_payload.call_args.kwargs
         assert kwargs["points"] == ["p2"]
         assert kwargs["key"] == "metadata"
@@ -940,8 +935,21 @@ class TestExactDedupPartitions:
         assert kwargs["payload"] == {"times_derived": 4}  # 1 + 3
 
 
+@pytest.fixture
+def tombstone_on(monkeypatch):
+    from config import settings
+
+    monkeypatch.setattr(settings, "dedup_semantic_tombstone_enabled", True)
+
+
+def _merged(service) -> set[str]:
+    """Rows phase 2 retired, whichever way (hard delete or tombstone)."""
+    return set(_deleted(service)) | set(_tombstoned(service))
+
+
+@pytest.mark.usefixtures("tombstone_on")
 class TestSemanticDedupIsReversible:
-    """Phase 2 tombstones the older near-duplicate instead of deleting it."""
+    """With DEDUP_SEMANTIC_TOMBSTONE_ENABLED, phase 2 tombstones the older near-duplicate."""
 
     TEXT = "Deploys go through the staging gate before prod"
 
@@ -1033,6 +1041,52 @@ class TestSemanticDedupIsReversible:
         assert "dream_tombstoned" not in fake.payloads["old"].get("metadata", {})
 
 
+@pytest.mark.usefixtures("tombstone_on")
+class TestSemanticDedupWrappedMetadata:
+    """Rows whose metadata is double-wrapped (``metadata.metadata``)."""
+
+    TEXT = "Deploys go through the staging gate before prod"
+
+    def _wrapped_pair(self, service):
+        def wrapped(pid, created, **inner):
+            payload = {"user_id": "u1", "hash": f"h-{pid}", "data": self.TEXT, "created_at": created,
+                       "metadata": {"metadata": {"scope": "global", "visibility": "private", **inner}}}
+            return (pid, payload, _text_vec(self.TEXT))
+
+        return _FakeQdrant(service, [wrapped("old", "2025-01-01T00:00:00"), wrapped("new", "2025-06-01T00:00:00")])
+
+    def test_wrapped_older_row_is_patched_at_both_levels(self, service):
+        fake = self._wrapped_pair(service)
+        result = service.dedup_memories("u1")
+        assert result["semantic_duplicates_removed"] == 1
+        keys = sorted(c["key"] for c in _tombstone_calls(service))
+        assert keys == ["metadata", "metadata.metadata"]
+        outer = fake.payloads["old"]["metadata"]
+        assert outer["dream_tombstoned"] is True  # what the recall filter reads
+        assert outer["metadata"]["dream_tombstoned"] is True
+        assert outer["metadata"]["superseded_by"] == "new"
+
+    def test_tombstone_flag_on_either_level_hides_the_row(self):
+        from memory.delete import _is_tombstoned
+
+        assert _is_tombstoned({"metadata": {"dream_tombstoned": True}})
+        assert _is_tombstoned({"metadata": {"metadata": {"dream_tombstoned": True}}})
+        assert _is_tombstoned({"metadata": {"dream_tombstoned": True, "metadata": {"scope": "global"}}})
+        assert not _is_tombstoned({"metadata": {"metadata": {"dream_tombstoned": False}}})
+        assert not _is_tombstoned({})
+
+    def test_outer_flagged_wrapped_row_is_not_a_candidate(self, service):
+        fake = _FakeQdrant(service, [
+            ("dead", {"user_id": "u1", "hash": "h1", "data": self.TEXT, "created_at": "2025-06-01T00:00:00",
+                      "metadata": {"dream_tombstoned": True, "metadata": {"scope": "global"}}}, _text_vec(self.TEXT)),
+            ("live", {"user_id": "u1", "hash": "h2", "data": self.TEXT, "created_at": "2025-01-01T00:00:00",
+                      "metadata": {"metadata": {"scope": "global"}}}, _text_vec(self.TEXT)),
+        ])
+        result = service.dedup_memories("u1")
+        assert result["semantic_duplicates_removed"] == 0
+        assert _tombstoned(service) == []
+
+
 class TestSemanticDedupMissedDuplicates:
     TEXT = "Deploys go through the staging gate before prod"
 
@@ -1050,7 +1104,7 @@ class TestSemanticDedupMissedDuplicates:
 
         result = service.dedup_memories("u1")
 
-        assert set(_tombstoned(service)) == {"dup-old"}
+        assert _merged(service) == {"dup-old"}
         assert result["semantic_duplicates_removed"] == 1
         assert max(c["top_k"] for c in fake.search_calls) > 5
 
@@ -1088,3 +1142,39 @@ class TestDedupStreamsThePool:
         pages = service._iter_user_memory_pages("u1", batch_size=2)
         first = next(pages)
         assert len(first) == 2 and fake.scroll_calls == 1
+
+
+class TestSemanticDedupFlagOffIsTheHardDeleteWithCascade:
+    """The default: DEDUP_SEMANTIC_TOMBSTONE_ENABLED off keeps today's delete + #470 cascade."""
+
+    TEXT = "Deploys go through the staging gate before prod"
+
+    def test_default_is_off(self):
+        from config import Settings
+
+        assert Settings(_env_file=None).dedup_semantic_tombstone_enabled is False
+
+    def test_older_row_is_hard_deleted_with_graph_cleanup(self, service):
+        fake = _FakeQdrant(service, [
+            _row("old", self.TEXT, "2025-01-01T00:00:00", scope="global", visibility="private", times_derived=2),
+            _row("new", self.TEXT, "2025-06-01T00:00:00", scope="global", visibility="private"),
+        ])
+        with patch.object(service, "_delete_qdrant_memory_with_graph_cleanup",
+                          wraps=service._delete_qdrant_memory_with_graph_cleanup) as cleanup:
+            result = service.dedup_memories("u1")
+
+        assert result["semantic_mode"] == "delete"
+        assert _deleted(service) == ["old"] and "old" not in fake.payloads
+        assert _tombstone_calls(service) == []
+        assert cleanup.call_args.args[0] == "old" and cleanup.call_args.kwargs["collector"] is not None
+        assert fake.payloads["new"]["metadata"]["times_derived"] == 3  # reinforcement still moves
+
+    def test_flag_on_does_not_cascade_or_delete(self, service, tombstone_on):
+        _FakeQdrant(service, [
+            _row("old", self.TEXT, "2025-01-01T00:00:00", scope="global", visibility="private"),
+            _row("new", self.TEXT, "2025-06-01T00:00:00", scope="global", visibility="private"),
+        ])
+        with patch.object(service, "_delete_qdrant_memory_with_graph_cleanup") as cleanup:
+            result = service.dedup_memories("u1")
+        cleanup.assert_not_called()
+        assert result["semantic_mode"] == "tombstone" and _deleted(service) == []
