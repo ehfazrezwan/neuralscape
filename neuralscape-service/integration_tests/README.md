@@ -1,0 +1,112 @@
+# Integration tests
+
+Tests here run against **real** Neo4j, Qdrant and Redis (and Gemini where the
+feature uses it). They are written on a laptop but only *run* by the VPS gate
+(and CI jobs that name a file explicitly). A feature behind a flag is not done
+until a test here shows it working **with the flag on**.
+
+## Why not under `tests/`
+
+CI runs `pytest tests/ --ignore=tests/test_async_pipeline.py` with no stores,
+then `tests/test_ci_skip_gate.py` rejects every skip that is not declared. An
+integration test under `tests/` would either fail (no stores) or skip (gate
+failure). `integration_tests/` is never collected by `pytest tests/`, is copied
+into the test and runtime images, and `conftest.py` here marks everything in
+it `integration`. `tests/test_integration_convention.py` fails CI if
+`pytest.mark.integration` appears under `tests/` (except the excluded
+`test_async_pipeline.py`) or if the auto-marking is removed.
+
+## Writing one
+
+Copy `test_flag_on_exemplar.py`. The fixtures (`conftest.py`):
+
+| fixture | gives you |
+|---|---|
+| `stores` | `neo4j_uri/user/password/database`, `qdrant_url`, `redis_url` from env, each probed once |
+| `llm_key` | the `GOOGLE_API_KEY` value (ask for it only if the test spends LLM calls; never print it) |
+| `flags(**fields)` | turns Settings fields on for this one test, e.g. `flags(standards_enabled=True)` |
+| `unique_ns` | unique `user_id`, `project_id`, `qdrant_collection`, `group_prefix` (all carry `nsit`) and `unique_ns.on_cleanup(fn)` |
+
+**Turning a flag on.** `flags` does `monkeypatch.setenv(FIELD_NAME, ...)` (for any
+new `Settings()` or subprocess) and `monkeypatch.setattr(config.settings, field,
+value)` (the same singleton every `from config import settings` module holds, the
+mechanism the unit tests use). Unknown field names raise. Caveat: a flag copied
+at import time (module constant, default argument, decorator argument) is not
+changed by setattr; import or `importlib.reload` that module after calling
+`flags`, inside the test.
+
+**Isolation.** Write only under the `unique_ns` names and register deletion with
+`on_cleanup` (drop the Qdrant collection, `DETACH DELETE` the group, delete the
+Redis keys). Leftovers from a crashed run are findable by the `nsit` prefix.
+
+**Missing infrastructure.** With `NS_INTEGRATION_REQUIRED=1` (the VPS gate sets
+it) an unreachable store or missing key **fails** the test (a fixture error, exit status 1); without it the test
+**skips** with the reason. Never silently pass.
+
+**The per-PR "flag-on proof".** A PR that adds or changes a flagged feature adds
+one test here that (1) calls `flags(...)`, (2) exercises the feature through the
+service code against the real stores, (3) asserts the observable result, and
+ideally (4) shows the flag-off contrast. State the test id in the PR body.
+
+## The VPS gate command
+
+Inside the **test image** (its WORKDIR is `/app/neuralscape-service`), on the
+network of the stores, with the store variables and `GOOGLE_API_KEY` passed as
+environment (never echoed):
+
+```
+NS_INTEGRATION_REQUIRED=1 pytest integration_tests/ -m integration -v -p no:cacheprovider
+```
+
+Environment: `NEO4J_URI`, `NEO4J_USER`, `NEO4J_PASSWORD`, `NEO4J_DATABASE`,
+`QDRANT_URL`, `REDIS_URL`, `GOOGLE_API_KEY`.
+
+Separately, and only when a live API and worker are up (it needs the running
+stack, so it is not part of the command above):
+
+```
+pytest tests/test_async_pipeline.py -m integration -v
+```
+
+The native snapshot job in `service-ci.yml` still runs
+`integration_tests/test_native_snapshot_neo4j.py` by file name; the marker does
+not change it.
+
+## Skip manifest (`.github/ci/expected_skips.json`)
+
+The CI skip gate compares each run's skips with the declared inventory. The
+manifest file keeps `version`, `excluded_suites` and `entries_dir`; every
+declared skip is **one file** in `.github/ci/expected_skips.d/`, named after the
+test id with `::` replaced by `--`:
+
+```json
+{
+  "test": "tests.test_baseline_reproductions::test_x",
+  "reason_contains": "start of the skip reason",
+  "profiles": ["container", "host"],
+  "why": "pinned bug: ..."
+}
+```
+
+**When a lane fixes a pinned bug:** in the same PR that removes the strict
+`xfail`, `git rm` that bug's entry file. No other file changes, so parallel PRs
+never conflict; CI's skip gate proves it (a declared skip that no longer skips,
+or a fixed xfail that is still declared, fails the run).
+
+**Adding many skips at once** (a slice with a generated test matrix): run the
+suite with `--junitxml`, then
+
+```
+python3 -I neuralscape-service/tests/test_ci_skip_gate.py --junit junit.xml \
+  --profile container --write-entries .github/ci/expected_skips.d --why "<one line>"
+```
+
+Repeat per profile (profiles merge into existing files). The generated files are
+a draft: review every test id and reason before committing.
+
+## Black-box evidence
+
+"It works in action" evidence (REST/MCP/hooks against the running compose stack)
+lives in the separate top-level `acceptance/` suite, not here. Integration tests
+here call service code against real stores; acceptance scenarios go through the
+real surfaces.
