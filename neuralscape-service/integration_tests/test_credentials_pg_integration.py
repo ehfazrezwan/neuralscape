@@ -17,12 +17,9 @@ from psycopg.conninfo import make_conninfo  # noqa: E402
 from authority_store_sql import PostgresAuthorityStore  # noqa: E402
 from tests.test_credentials import CASES  # noqa: E402
 
-DSN = os.environ.get("AUTHORITY_TEST_PG_DSN")
+from tests.authority_pg_support import DSN, require_pg  # noqa: E402,F401  (autouse)
 
-pytestmark = [
-    pytest.mark.integration,
-    pytest.mark.skipif(not DSN, reason="AUTHORITY_TEST_PG_DSN not set (postgres credential integration)"),
-]
+pytestmark = pytest.mark.integration
 
 
 class PostgresBackend:
