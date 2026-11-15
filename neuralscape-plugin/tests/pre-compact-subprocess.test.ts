@@ -161,7 +161,7 @@ describe("pre-compact bundle end-to-end", () => {
 
     const snapshot = raws[0].body;
     expect(snapshot.category).toBe("task_context");
-    expect(snapshot.tags).toEqual(["compact_snapshot"]);
+    expect(snapshot.tags).toEqual(["compact_snapshot", "session:sess-precompact"]);
     expect(snapshot.user_id).toBe("pre-compact-test");
     expect(String(snapshot.content)).toContain("Compact snapshot: session sess-precompact");
     expect(String(snapshot.content)).toContain("(manual)");
