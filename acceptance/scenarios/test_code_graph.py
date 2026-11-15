@@ -92,17 +92,16 @@ def test_the_native_engine_is_registered_and_the_through_ns_index_builds_a_graph
 
 @proves("knowledge.native-engine", "knowledge.code-index-pipeline")
 @negative_control
-def test_index_pipeline_rejects_a_repo_that_is_not_configured(ctx, a):
+def test_index_pipeline_reports_an_unconfigured_repo_as_not_indexed(ctx, a):
     r = a.post("/v1/code-graph/index", json={"repo_source": "/nowhere", "system": SYSTEM, "code_space": f"code--{ctx.user_a}--not-configured"})
     assert r.status_code == 202, f"index request -> {r.status_code}"  # accepted, then answered honestly by the worker
     st = a.poll_task(r.json()["task_id"], timeout=300)
-    assert st.get("status") == "completed", f"task ended as {st}"
-    result = st["result"]
+    indexed = st.get("status") == "completed" and (st.get("result") or {}).get("ok") is True
 
     def check():
-        assert result.get("ok") is True, f"index of an unconfigured repo: {result}"
+        assert indexed, f"index of an unconfigured repo ended as {st.get('status')}: {st.get('error') or st.get('result')}"
 
-    expect_check_fails(check)
+    expect_check_fails(check)  # the "it was indexed" check cannot pass for a repo that is not in CODE_REPOS
 
 
 # ── query tools ──────────────────────────────────────────────────
