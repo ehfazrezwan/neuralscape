@@ -1,7 +1,6 @@
 """The runtime image must not ship modules it never imports, and must not lose one it does.
 
-The Dockerfile's ``runtime-src`` stage deletes the Phase 1/2 contract, evidence and
-persona modules from the copy that reaches the runtime image. That is only safe
+The Dockerfile's ``runtime-src`` stage deletes the evidence and persona modules from the copy that reaches the runtime image. That is only safe
 while no runtime entry point (the API, the workers, the MCP server, the
 extensions, the operator scripts) imports them. This test computes that import
 closure with the AST (lazy, function-level imports included) and fails the day

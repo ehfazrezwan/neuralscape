@@ -24,6 +24,7 @@ COPY neuralscape-service/ingest/ neuralscape-service/ingest/
 COPY neuralscape-service/connectors/ neuralscape-service/connectors/
 COPY neuralscape-service/okf/ neuralscape-service/okf/
 COPY neuralscape-service/integration_tests/ neuralscape-service/integration_tests/
+COPY neuralscape-service/ledger/ neuralscape-service/ledger/
 
 # Install all dependencies using uv from the neuralscape-service project
 # E2: include the code-graph extra (tree-sitter + graphifyy) in the builder
@@ -50,8 +51,9 @@ RUN cd neuralscape-service && \
 
 # ── Stage 1b: Runtime source ────────────────────────────────────
 # Top-level service modules for the runtime image, minus the ones no runtime entry
-# point (main, worker, mcp_server, the extensions, scripts/) imports: the Phase 1/2
-# contract, evidence and persona modules are exercised by tests only. Pruned in a
+# point (main, worker, mcp_server, the extensions, scripts/) imports: the evidence and
+# persona modules are exercised by tests only. (The contracts_* modules used to be
+# here too; the ledger package now imports several, so they ship.) Pruned in a
 # scratch stage so they never enter the runtime image's layers (an `rm` in the
 # runtime stage would leave them in the COPY layer). The builder and test stages
 # keep every module. tests/test_dockerfile_runtime.py fails if a runtime entry
@@ -59,7 +61,7 @@ RUN cd neuralscape-service && \
 FROM python:3.12-slim AS runtime-src
 WORKDIR /src
 COPY neuralscape-service/*.py ./
-RUN rm -f contracts_*.py evidence_*.py persona_*.py portability_verifier.py
+RUN rm -f evidence_*.py persona_*.py portability_verifier.py
 
 # ── Stage 2: Runtime ────────────────────────────────────────────
 FROM python:3.12-slim AS runtime
@@ -83,6 +85,7 @@ COPY neuralscape-service/ingest/ neuralscape-service/ingest/
 COPY neuralscape-service/connectors/ neuralscape-service/connectors/
 COPY neuralscape-service/okf/ neuralscape-service/okf/
 COPY neuralscape-service/integration_tests/ neuralscape-service/integration_tests/
+COPY neuralscape-service/ledger/ neuralscape-service/ledger/
 # Operator-facing scripts (relocate_vault_to_raw, issue_user_token,
 # migrate_graph_groups, bulk_promote_visibility). Production operators
 # invoke these in-container; without this copy they had to docker-cp
@@ -143,6 +146,7 @@ COPY neuralscape-service/knowledge/ neuralscape-service/knowledge/
 COPY neuralscape-service/ingest/ neuralscape-service/ingest/
 COPY neuralscape-service/connectors/ neuralscape-service/connectors/
 COPY neuralscape-service/okf/ neuralscape-service/okf/
+COPY neuralscape-service/ledger/ neuralscape-service/ledger/
 
 # Resolve WITH dev deps so pytest, pytest-asyncio, etc. are available.
 # E2: include the code-graph extra so in-container tests can import tree-sitter

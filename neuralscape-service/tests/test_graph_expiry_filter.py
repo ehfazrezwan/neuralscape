@@ -28,31 +28,6 @@ import main
 from main import app
 
 
-@pytest.fixture(autouse=True)
-def mock_memory():
-    """Patch main.py's legacy lazy-init globals so no real mem0/Graphiti is
-    created (mirrors test_service.py's fixture of the same name — each
-    test file that drives the app through TestClient needs its own copy,
-    fixtures aren't shared across files without a conftest.py entry)."""
-    mock_mem = MagicMock(name="Memory")
-    mock_graphiti = MagicMock(name="Graphiti")
-    mock_bridge = MagicMock(name="AsyncBridge")
-
-    original_memory = main._memory
-    original_graphiti = main._graphiti
-    original_bridge = main._bridge
-
-    main._memory = mock_mem
-    main._graphiti = mock_graphiti
-    main._bridge = mock_bridge
-
-    yield mock_mem
-
-    main._memory = original_memory
-    main._graphiti = original_graphiti
-    main._bridge = original_bridge
-
-
 @pytest.fixture
 def mock_service():
     """Patch the MemoryService instance for v1 endpoints."""
@@ -296,117 +271,65 @@ class TestV1GraphRoutesPassIncludeExpired:
 
 
 class TestLegacyGraphRoutesExpiryFilter:
-    """The legacy /graph/{nodes,edges} routes duplicate the fetch inline
-    (they predate the MemoryService split and use their own module-level
-    _graphiti/_bridge globals) — they must get the same default exclusion,
-    not just the v1 routes."""
+    """The legacy /graph/{nodes,edges} routes run through the SAME service
+    methods as /v1/graph/* (they used to duplicate the fetch inline against a
+    separate module-level handle), so they inherit the default exclusion of
+    soft-expired facts; the filtering itself is covered by the service-level
+    tests above. These pin the route pass-through and the include_expired gate.
+    """
 
-    def test_legacy_graph_edges_excludes_expired_by_default(self, client, monkeypatch):
-        import main
-
-        edges = [_edge("e-live", "a", "b"), _edge("e-expired", "a", "c", expired_at=_LATER)]
-
-        def _fake_run_on_bridge(coro):
-            coro.close()
-            return edges
-
-        monkeypatch.setattr(main, "_run_on_bridge", _fake_run_on_bridge)
+    def test_legacy_graph_edges_excludes_expired_by_default(self, client, mock_service):
+        mock_service.get_graph_edges.return_value = [{"uuid": "e-live"}]
         resp = client.get("/graph/edges", params={"user_id": "ehfaz"})
         assert resp.status_code == 200
-        assert {e["uuid"] for e in resp.json()["edges"]} == {"e-live"}
+        assert [e["uuid"] for e in resp.json()["edges"]] == ["e-live"]
+        assert mock_service.get_graph_edges.call_args.kwargs["include_expired"] is False
 
     def test_legacy_graph_edges_include_expired_true_rejected_for_non_dictator(
-        self, client, monkeypatch
+        self, client, mock_service, monkeypatch
     ):
         from config import settings
 
         monkeypatch.setattr(settings, "dictator_user_ids", "someone_else")
         resp = client.get("/graph/edges", params={"user_id": "ehfaz", "include_expired": "true"})
         assert resp.status_code == 403
+        mock_service.get_graph_edges.assert_not_called()
 
     def test_legacy_graph_edges_include_expired_returns_everything_for_dictator(
-        self, client, monkeypatch
+        self, client, mock_service, monkeypatch
     ):
-        import main
         from config import settings
 
-        edges = [_edge("e-live", "a", "b"), _edge("e-expired", "a", "c", expired_at=_LATER)]
-
-        def _fake_run_on_bridge(coro):
-            coro.close()
-            return edges
-
-        monkeypatch.setattr(main, "_run_on_bridge", _fake_run_on_bridge)
         monkeypatch.setattr(settings, "dictator_user_ids", "ehfaz")
+        mock_service.get_graph_edges.return_value = []
         resp = client.get("/graph/edges", params={"user_id": "ehfaz", "include_expired": "true"})
         assert resp.status_code == 200
-        assert {e["uuid"] for e in resp.json()["edges"]} == {"e-live", "e-expired"}
+        assert mock_service.get_graph_edges.call_args.kwargs["include_expired"] is True
 
-    def test_legacy_graph_nodes_excludes_node_with_only_expired_edges(self, client, monkeypatch):
-        import main
-
-        nodes = [_node("n1"), _node("n2")]
-        # Delegates to memory.groups._live_node_uuids (same helper as the
-        # v1/service path — F2's "legacy filter re-implemented" nitpick):
-        # second bridge call is the liveness query, not a raw edge fetch.
-        records = [_liveness("n1", 1, 0), _liveness("n2", 0, 0)]
-        calls = {"n": 0}
-
-        def _fake_run_on_bridge(coro):
-            coro.close()
-            calls["n"] += 1
-            return nodes if calls["n"] == 1 else records
-
-        monkeypatch.setattr(main, "_run_on_bridge", _fake_run_on_bridge)
+    def test_legacy_graph_nodes_excludes_expired_by_default(self, client, mock_service):
+        mock_service.get_graph_nodes.return_value = [{"uuid": "n2"}]
         resp = client.get("/graph/nodes", params={"user_id": "ehfaz"})
         assert resp.status_code == 200
-        assert {n["uuid"] for n in resp.json()["nodes"]} == {"n2"}
-
-    def test_legacy_graph_nodes_liveness_query_failure_fails_closed(self, client, monkeypatch):
-        """Same fail-CLOSED contract as the v1/service path (F2)."""
-        import main
-
-        nodes = [_node("n1")]
-        calls = {"n": 0}
-
-        def _fake_run_on_bridge(coro):
-            coro.close()
-            calls["n"] += 1
-            if calls["n"] == 1:
-                return nodes
-            raise RuntimeError("bridge down")
-
-        monkeypatch.setattr(main, "_run_on_bridge", _fake_run_on_bridge)
-        resp = client.get("/graph/nodes", params={"user_id": "ehfaz"})
-        assert resp.status_code == 200
-        assert resp.json()["nodes"] == []
+        assert [n["uuid"] for n in resp.json()["nodes"]] == ["n2"]
+        assert mock_service.get_graph_nodes.call_args.kwargs["include_expired"] is False
 
     def test_legacy_graph_nodes_include_expired_true_rejected_for_non_dictator(
-        self, client, monkeypatch
+        self, client, mock_service, monkeypatch
     ):
         from config import settings
 
         monkeypatch.setattr(settings, "dictator_user_ids", "someone_else")
         resp = client.get("/graph/nodes", params={"user_id": "ehfaz", "include_expired": "true"})
         assert resp.status_code == 403
+        mock_service.get_graph_nodes.assert_not_called()
 
-    def test_legacy_graph_nodes_include_expired_skips_edge_lookup_for_dictator(
-        self, client, monkeypatch
+    def test_legacy_graph_nodes_include_expired_passes_through_for_dictator(
+        self, client, mock_service, monkeypatch
     ):
-        import main
         from config import settings
 
-        nodes = [_node("n1"), _node("n2")]
-        calls = {"n": 0}
-
-        def _fake_run_on_bridge(coro):
-            coro.close()
-            calls["n"] += 1
-            return nodes
-
-        monkeypatch.setattr(main, "_run_on_bridge", _fake_run_on_bridge)
         monkeypatch.setattr(settings, "dictator_user_ids", "ehfaz")
+        mock_service.get_graph_nodes.return_value = []
         resp = client.get("/graph/nodes", params={"user_id": "ehfaz", "include_expired": "true"})
         assert resp.status_code == 200
-        assert {n["uuid"] for n in resp.json()["nodes"]} == {"n1", "n2"}
-        assert calls["n"] == 1  # no edge-liveness lookup when include_expired=True
+        assert mock_service.get_graph_nodes.call_args.kwargs["include_expired"] is True

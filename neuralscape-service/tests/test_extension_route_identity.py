@@ -44,6 +44,21 @@ def shared_key_auth(monkeypatch):
 
 
 @pytest.fixture()
+def legacy_key_opt_out(monkeypatch):
+    """The old shared-key behaviour (body user trusted): the sec-05 opt-out."""
+    monkeypatch.setattr(settings, "neuralscape_legacy_key_trust_body_user_id", True)
+
+
+@pytest.fixture()
+def bound_key(shared_key_auth, monkeypatch):
+    """Shared key bound to alice (sec-05 default)."""
+    monkeypatch.setattr(settings, "neuralscape_legacy_key_trust_body_user_id", False)
+    monkeypatch.setattr(settings, "neuralscape_api_key_user_id", "alice")
+    monkeypatch.setattr(settings, "default_user_id", "the-default-user")
+    return shared_key_auth
+
+
+@pytest.fixture()
 def mounted():
     before = len(app.router.routes)
     yield lambda router, prefix: app.include_router(router, prefix=prefix)
@@ -114,7 +129,7 @@ class TestCompilerIdentity:
         assert resp.status_code == 400
         flush.assert_not_called()
 
-    def test_shared_key_still_trusts_body_user(self, compiler, shared_key_auth):
+    def test_shared_key_still_trusts_body_user(self, compiler, shared_key_auth, legacy_key_opt_out):
         resp = TestClient(app).post(PREFIX + "/flush", json={**FLUSH, "user_id": "bob"}, headers=shared_key_auth)
         assert resp.status_code == 202
         assert compiler.pool.enqueue_job.await_args.args[-1] == "bob"
@@ -165,7 +180,7 @@ class TestEmitEventIdentity:
         assert resp.status_code == 200
         assert emit.await_args.args[1]["user_id"] == "alice"
 
-    def test_shared_key_payload_unchanged(self, emit, shared_key_auth):
+    def test_shared_key_payload_unchanged(self, emit, shared_key_auth, legacy_key_opt_out):
         resp = self._post({**self.TURN, "user_id": "bob"}, shared_key_auth)
         assert resp.status_code == 200
         assert emit.await_args.args[1]["user_id"] == "bob"
@@ -408,3 +423,118 @@ class TestAdminRuleAllGates:
     def test_is_dictator_itself_unchanged(self, monkeypatch):
         monkeypatch.setattr(settings, "dictator_user_ids", "")
         assert settings.is_dictator(settings.default_user_id) is False
+
+
+# ── bound shared key (sec-05) on the extension routes ───────────────────
+
+
+class TestBoundSharedKeyOnExtensions:
+    def test_flush_naming_other_user_is_400(self, compiler, bound_key):
+        resp = TestClient(app).post(PREFIX + "/flush", json={**FLUSH, "user_id": "bob"}, headers=bound_key)
+        assert resp.status_code == 400
+        compiler.pool.enqueue_job.assert_not_called()
+
+    def test_flush_naming_bound_user_acts_as_bound_identity(self, compiler, bound_key):
+        resp = TestClient(app).post(PREFIX + "/flush", json={**FLUSH, "user_id": "alice"}, headers=bound_key)
+        assert resp.status_code == 202
+        assert compiler.pool.enqueue_job.await_args.args[-1] == "alice"
+        assert compiler.owners == [("job-1", "alice")]
+
+    def test_dreaming_run_403_when_bound_user_not_admin(self, pool, mounted, monkeypatch, bound_key):
+        import arq
+
+        from extensions.dreaming import DreamingExtension
+        from extensions.dreaming.config import dreaming_settings
+
+        pool.close = AsyncMock()
+        monkeypatch.setattr(arq, "create_pool", AsyncMock(return_value=pool))
+        monkeypatch.setattr("extensions.dreaming.record_task_owner", AsyncMock())
+        monkeypatch.setattr(dreaming_settings, "enabled", False)
+        mounted(DreamingExtension().get_routes(), "/v1/extensions/dreaming")
+        monkeypatch.setattr(settings, "dictator_user_ids", "carol")
+        resp = TestClient(app).post(
+            "/v1/extensions/dreaming/run", json={"force": True}, headers=bound_key
+        )
+        assert resp.status_code == 403
+
+    def test_knowledge_config_put_403_when_bound_user_not_admin(self, monkeypatch, bound_key):
+        import knowledge.router as kr
+
+        set_config = MagicMock()
+        monkeypatch.setattr(kr, "set_project_config", set_config)
+        monkeypatch.setattr(settings, "dictator_user_ids", "carol")
+        body = {"project_id": "p1", "code_systems": ["graphify"], "fuse_code_into_recall": True}
+        resp = TestClient(app).put("/v1/projects/p1/knowledge-config", json=body, headers=bound_key)
+        assert resp.status_code == 403
+        set_config.assert_not_called()
+
+    def test_bound_to_default_user_with_empty_list_is_admin(self, monkeypatch, bound_key):
+        import knowledge.router as kr
+
+        monkeypatch.setattr(kr, "set_project_config", MagicMock())
+        monkeypatch.setattr(settings, "neuralscape_api_key_user_id", "")  # -> default user
+        monkeypatch.setattr(settings, "dictator_user_ids", "")
+        body = {"project_id": "p1", "code_systems": ["graphify"], "fuse_code_into_recall": True}
+        resp = TestClient(app).put("/v1/projects/p1/knowledge-config", json=body, headers=bound_key)
+        assert resp.status_code == 200
+
+    def test_bound_to_listed_dictator_is_admin(self, monkeypatch, bound_key):
+        import knowledge.router as kr
+
+        monkeypatch.setattr(kr, "set_project_config", MagicMock())
+        monkeypatch.setattr(settings, "dictator_user_ids", "alice")
+        body = {"project_id": "p1", "code_systems": ["graphify"], "fuse_code_into_recall": True}
+        resp = TestClient(app).put("/v1/projects/p1/knowledge-config", json=body, headers=bound_key)
+        assert resp.status_code == 200
+
+    def test_compile_naming_other_user_is_400_and_nothing_enqueued(self, compiler, bound_key):
+        resp = TestClient(app).post(
+            PREFIX + "/compile", json={"date": "2026-10-18", "user_id": "bob"}, headers=bound_key
+        )
+        assert resp.status_code == 400
+        compiler.pool.enqueue_job.assert_not_called()
+        assert compiler.owners == []
+
+    def test_events_payload_user_other_than_bound_is_400_and_missing_is_bound(self, monkeypatch, bound_key):
+        registry = MagicMock()
+        registry.emit_event = AsyncMock(return_value=MagicMock(notified_count=1, responses={}))
+        monkeypatch.setattr(main, "_extension_registry", registry)
+        turn = {"messages": [{"role": "user", "content": "hi"}]}
+
+        def post(payload):
+            return TestClient(app).post(
+                "/v1/extensions/events",
+                json={"event_type": "conversation_turn", "payload": payload},
+                headers=bound_key,
+            )
+
+        assert post({**turn, "user_id": "bob"}).status_code == 400
+        registry.emit_event.assert_not_called()
+        assert post(turn).status_code == 200
+        assert registry.emit_event.await_args.args[1]["user_id"] == "alice"
+
+    def test_empty_admin_list_and_non_default_bound_user_is_403_on_both_gates(
+        self, pool, mounted, monkeypatch, bound_key
+    ):
+        import arq
+
+        import knowledge.router as kr
+        from extensions.dreaming import DreamingExtension
+        from extensions.dreaming.config import dreaming_settings
+
+        pool.close = AsyncMock()
+        monkeypatch.setattr(arq, "create_pool", AsyncMock(return_value=pool))
+        monkeypatch.setattr("extensions.dreaming.record_task_owner", AsyncMock())
+        monkeypatch.setattr(dreaming_settings, "enabled", False)
+        mounted(DreamingExtension().get_routes(), "/v1/extensions/dreaming")
+        set_config = MagicMock()
+        monkeypatch.setattr(kr, "set_project_config", set_config)
+        monkeypatch.setattr(settings, "dictator_user_ids", "")  # empty list
+        # bound_key: key bound to "alice", DEFAULT_USER_ID is "the-default-user"
+        run = TestClient(app).post("/v1/extensions/dreaming/run", json={"force": True}, headers=bound_key)
+        assert run.status_code == 403
+        pool.enqueue_job.assert_not_called()
+        body = {"project_id": "p1", "code_systems": ["graphify"], "fuse_code_into_recall": True}
+        put = TestClient(app).put("/v1/projects/p1/knowledge-config", json=body, headers=bound_key)
+        assert put.status_code == 403
+        set_config.assert_not_called()
