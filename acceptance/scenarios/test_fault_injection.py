@@ -94,11 +94,10 @@ def health_snapshot(base_url: str) -> tuple[int, dict]:
 
 
 def check_health_notices_outage(base_url: str) -> None:
-    status, body = health_snapshot(base_url)
+    """Specifically the vector_store check must stop saying "ok"."""
+    _, body = health_snapshot(base_url)
     vector = (body.get("checks") or {}).get("vector_store")
-    assert status == 503 or body.get("status") != "ok" or vector != "ok", (
-        f"/health reports status {body.get('status')!r}, vector_store {vector!r} while Qdrant is down"
-    )
+    assert vector not in (None, "ok"), f"/health checks.vector_store is {vector!r} while Qdrant is down"
 
 
 def ps_rows(ctx, services: list[str]) -> list[dict]:
@@ -166,8 +165,9 @@ def test_stopped_qdrant_write_is_accepted_ends_cleanly_and_a_fresh_write_works(c
 @proves("ops.health-endpoints")
 @needs("compose")
 def test_health_does_not_claim_everything_is_fine_while_qdrant_is_down(ctx, restore_stack):
-    """Finding for the health-probe work if red: /health only checks that mem0 is
-    initialised, not that Qdrant answers."""
+    """Correct behaviour: the vector_store check reports the outage. EXPECTED RED on dev
+    until lane sec PR sec-08 (bug/health-probe-and-request-ids, "/health probes Qdrant")
+    lands: today /health only checks that mem0 is initialised and never contacts Qdrant."""
     ctx.compose("pause", QDRANT)
     try:
         time.sleep(5)
@@ -217,10 +217,15 @@ def check_stack_stable(rows: list[dict], restarts: dict[str, int], services: lis
 @proves("fork.mem0.qdrant-cold-start", "write.remember-raw")
 @needs("compose")
 def test_api_and_workers_started_together_on_empty_collections_stay_up(ctx, a, restore_stack):
-    """Stop the API and the three workers, delete both Qdrant collections, start all
+    """DESTRUCTIVE: wipes the vector store. Runs only with NS_ALLOW_DESTRUCTIVE=1 and a
+    compose project named nscampaign*.
+
+    Stop the API and the three workers, delete both Qdrant collections, start all
     four at once (they race to create the collections), then require: all running,
     zero exits and restarts after 90 s, and a write that works and is recalled.
     Three cycles."""
+    if os.environ.get("NS_ALLOW_DESTRUCTIVE") != "1" or not (ctx.compose_project or "").startswith("nscampaign"):
+        pytest.skip("destructive: needs NS_ALLOW_DESTRUCTIVE=1 and a compose project named nscampaign*")
     for cycle in range(1, COLD_CYCLES + 1):
         ctx.compose("stop", *APP_SERVICES)
         for name in COLLECTIONS:

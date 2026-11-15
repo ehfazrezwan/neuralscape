@@ -210,3 +210,12 @@ Rules:
 profile selection, results writer, `expect_check_fails`, MCP client against a
 local stub (JSON, SSE, session id), REST client polling, hook runner, and a lint
 over the real scenarios. `run.sh` never collects it; run `run.sh --selftest`.
+
+
+## Destructive scenarios
+
+`test_fault_injection::test_api_and_workers_started_together_on_empty_collections_stay_up`
+**wipes the Qdrant collections** (every memory on the stack) three times. It runs only
+when `NS_ALLOW_DESTRUCTIVE=1` is set and the compose project name starts with
+`nscampaign`; otherwise it skips with that reason. The gate sets
+`NS_ALLOW_DESTRUCTIVE=1` on its throwaway stack only; never set it elsewhere.

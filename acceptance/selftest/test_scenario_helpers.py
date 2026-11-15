@@ -272,7 +272,7 @@ def test_compose_up_only_starts_existing_containers():
     for bad in (["up", "-d", "svc"], ["up", "svc"], ["up", "-d", "--no-build", "svc"]):
         with pytest.raises(runctx.ConfigError):
             ctx.compose(*bad, run=_fake_run(calls))
-    ctx.compose("up", "-d", "--no-build", "--no-recreate", "svc", run=_fake_run(calls))
+    ctx.compose("up", "-d", "--no-build", "--no-recreate", "neuralscape", run=_fake_run(calls))
     assert calls[-1][:4] == ["docker", "compose", "-p", "nscampaign"] and len(calls) == 1
 
 
@@ -308,3 +308,19 @@ def test_in_container_minting_never_passes_a_secret_and_refuses_production():
     assert "NEURALSCAPE_USER_TOKEN_SECRET" in cmd[9] and "print(issue_user_token" in cmd[9]
     with pytest.raises(tokens.TokenError):
         tokens.mint_via_compose_python("neuralscape", "u1", -60, run=run)
+
+
+def test_compose_exec_and_up_are_restricted_to_what_the_scenarios_use():
+    ctx, calls = _ctx("nscampaign"), []
+    ok = _fake_run(calls)
+    ctx.compose("exec", "-T", "qdrant", "sh", "-c", "curl x", run=ok)
+    for bad in (("exec", "-T", "neuralscape", "sh", "-c", "x"), ("exec", "-T", "qdrant", "bash"),
+                ("exec", "-T", "qdrant", "sh", "-c", "x", "y")):
+        with pytest.raises(runctx.ConfigError):
+            ctx.compose(*bad, run=ok)
+    ctx.compose("up", "-d", "--no-build", "--no-recreate", "--no-deps", "neuralscape", "neuralscape-worker", run=ok)
+    for bad in (("up", "-d", "--no-build", "--no-recreate", "qdrant"),
+                ("up", "-d", "--no-build", "--no-recreate", "--force-recreate", "neuralscape"),
+                ("up", "-d", "--no-build", "--no-recreate")):
+        with pytest.raises(runctx.ConfigError):
+            ctx.compose(*bad, run=ok)

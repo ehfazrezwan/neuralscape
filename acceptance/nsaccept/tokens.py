@@ -94,8 +94,11 @@ def mint_via_compose_python(
     container, so the signing secret never leaves it (read from its own environment
     and never printed). The issuer CLI cannot make expired tokens; the module can.
     """
-    if project.strip().lower() == "neuralscape":
-        raise TokenError("refusing compose project 'neuralscape' (production)")
+    from .guard import PROD_COMPOSE_PROJECT
+
+    project = project.strip()
+    if project.lower() == PROD_COMPOSE_PROJECT:
+        raise TokenError(f"refusing compose project '{PROD_COMPOSE_PROJECT}' (production)")
     code = (
         "import os,sys; from tokens import issue_user_token; "
         "print(issue_user_token(sys.argv[1], os.environ['NEURALSCAPE_USER_TOKEN_SECRET'], int(sys.argv[2])))"

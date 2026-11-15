@@ -82,6 +82,17 @@ def parse_ps_json(text: str) -> list[dict]:
 COMPOSE_VERBS = frozenset({"pause", "unpause", "stop", "start", "restart", "ps", "logs", "top", "exec", "up"})
 # `up` may only start existing containers: detached, no build, no recreate.
 UP_REQUIRED_FLAGS = ("-d", "--no-build", "--no-recreate")
+UP_ALLOWED_FLAGS = UP_REQUIRED_FLAGS + ("--no-deps",)
+
+
+def qdrant_service() -> str:
+    return os.environ.get("NS_QDRANT_SERVICE", "qdrant")
+
+
+def app_services() -> list[str]:
+    return os.environ.get(
+        "NS_APP_SERVICES", "neuralscape,neuralscape-worker,neuralscape-graph-worker,neuralscape-ingest-worker"
+    ).split(",")
 
 
 def run_compose(
@@ -97,8 +108,16 @@ def run_compose(
         )
     if not args or args[0] not in COMPOSE_VERBS:
         raise ConfigError(f"compose verb {args[:1]!r} is not allowed (allowed: {sorted(COMPOSE_VERBS)})")
-    if args[0] == "up" and not all(flag in args for flag in UP_REQUIRED_FLAGS):
-        raise ConfigError(f"`up` is only allowed with {UP_REQUIRED_FLAGS} (start existing containers only)")
+    if args[0] == "up":
+        flags = {a for a in args[1:] if a.startswith("-")}
+        names = [a for a in args[1:] if not a.startswith("-")]
+        if not set(UP_REQUIRED_FLAGS) <= flags or not flags <= set(UP_ALLOWED_FLAGS):
+            raise ConfigError(f"`up` takes exactly {UP_REQUIRED_FLAGS} (+ optional --no-deps), got {sorted(flags)}")
+        if not names or not set(names) <= set(app_services()):
+            raise ConfigError(f"`up` may only name the API/worker services {app_services()}, got {names}")
+    if args[0] == "exec":
+        if len(args) < 6 or args[1:5] != ("-T", qdrant_service(), "sh", "-c") or len(args) != 6:
+            raise ConfigError(f"`exec` is only allowed as: exec -T {qdrant_service()} sh -c <script>")
     cmd = ["docker", "compose", "-p", project.strip(), *args]
     proc = run(cmd, capture_output=True, text=True, timeout=timeout)
     if check and proc.returncode != 0:

@@ -176,20 +176,38 @@ def legs(ctx, a) -> dict:
     w = write_raw(
         a, f"{marker} {LEGS_TEXT}", "tech_stack", marker=marker, scope="project", project_id=project, visibility="private",
     )
-    return {"w": w, "project": project, "marker": marker}
+    decoys = [
+        write_raw(
+            a, f"zq-{ctx.run_id}-decoy{i} {text}", "tech_stack", marker=f"zq-{ctx.run_id}-decoy{i}",
+            scope="project", project_id=project, visibility="private",
+        )
+        for i, text in enumerate((
+            "The orchard gate is painted green and squeaks in winter.",
+            "Grandmother's recipe needs two cups of oat flour and a pinch of salt.",
+            "The choir rehearses on Thursdays in the old chapel.",
+            "A heron nests near the third bridge every spring.",
+        ))
+    ]
+    return {"w": w, "project": project, "marker": marker, "decoys": decoys}
 
 
 @proves("read.hybrid-search-core", "read.dense-pool-legs", "fork.mem0.gemini-embedder")
 def test_query_with_no_shared_word_recalls_the_fact_through_the_dense_leg(a, legs):
     """The query and the stored text share no token at all (checked here), so the
-    lexical (BM25) leg cannot match: only the embedding leg can surface the fact."""
+    lexical (BM25) leg cannot match: only the embedding leg can rank the fact first
+    among unrelated decoys in the same project."""
     legs["w"].require()
+    for d in legs["decoys"]:
+        d.require()
     shared = _words(LEGS_QUERY) & _words(f"{legs['marker']} {LEGS_TEXT}")
     assert not shared, f"test data bug: query and fact share words {sorted(shared)}"
-    eventually(
-        lambda: check_search_finds(a, legs["marker"], LEGS_QUERY, legs["project"]),
-        timeout=90, what="zero-overlap paraphrase recall",
-    )
+    def check_ranked_first():
+        results = a.search(LEGS_QUERY, project_id=legs["project"], limit=5)
+        assert results and legs["marker"] in results[0].get("memory", ""), (
+            f"target is not the top hit among {len(results)}: {[r.get('memory', '')[:40] for r in results[:3]]}"
+        )
+
+    eventually(check_ranked_first, timeout=90, what="zero-overlap paraphrase ranks the fact first among decoys")
 
 
 @proves("read.hybrid-search-core")

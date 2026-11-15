@@ -85,13 +85,14 @@ def get_row(client: NSClient, memory_id: str) -> dict:
     return r.json()
 
 
-def check_gone(client: NSClient, memory_id: str, marker: str, project_id: str) -> None:
+def check_gone(client: NSClient, memory_id: str, marker: str, project_id: str, content: str = "") -> None:
     """The memory is unreadable by id, absent from the listing and from recall."""
     r = client.get(f"/v1/memories/{memory_id}")
     assert r.status_code == 404, f"GET by id -> {r.status_code} (want 404)"
     assert not rows_with(list_rows(client, project_id=project_id), marker), "still listed"
     # keyword leg: the bare rare token; dense leg: a natural-language query
-    for query in (marker, f"{marker} what was recorded about this"):
+    natural = content.replace(marker, "").strip() or "what was recorded about this"  # marker-free: dense side
+    for query in (marker, natural):
         hits = client.search(query, project_id=project_id, limit=20)
         assert not any(marker in h.get("memory", "") for h in hits), f"still recalled by search for {query!r}"
 
@@ -266,7 +267,7 @@ def test_deleting_one_memory_removes_it_everywhere_including_the_graph(ctx, a, e
     )
     r = a.delete(f"/v1/memories/{w.memory_id}")
     assert r.status_code == 200, f"DELETE -> {r.status_code}: {r.text[:160]}"
-    eventually(lambda: check_gone(a, w.memory_id, w.marker, ctx.project_id), timeout=60, what="memory gone from vector store")
+    eventually(lambda: check_gone(a, w.memory_id, w.marker, ctx.project_id, w.content), timeout=60, what="memory gone from vector store")
     eventually(
         lambda: check_episode_absent(a, ctx.project_id, w.marker), timeout=90, interval=3, what="graph episode removed",
     )
@@ -281,7 +282,7 @@ def test_mcp_delete_memories_by_id(ctx, a, mcp_a, ed):
     mcp_a.initialize()
     out = mcp_json(mcp_a, "delete_memories", {"memory_id": w.memory_id})
     assert "error" not in out, f"MCP delete: {out}"
-    eventually(lambda: check_gone(a, w.memory_id, w.marker, ctx.project_id), timeout=60, what="MCP-deleted memory gone")
+    eventually(lambda: check_gone(a, w.memory_id, w.marker, ctx.project_id, w.content), timeout=60, what="MCP-deleted memory gone")
 
 
 @proves("delete.single")
@@ -295,7 +296,7 @@ def test_deleting_an_unknown_or_malformed_id_is_never_a_server_error(a):
 @negative_control
 def test_gone_check_fails_for_a_live_memory(ctx, a, ed):
     w = ed["foreign"].require()
-    expect_check_fails(check_gone, a, w.memory_id, w.marker, ctx.project_id)
+    expect_check_fails(check_gone, a, w.memory_id, w.marker, ctx.project_id, w.content)
 
 
 # ── delete: bulk ─────────────────────────────────────────────────
@@ -307,7 +308,7 @@ def test_rest_bulk_delete_by_project_removes_exactly_that_project(ctx, a, ed):
     r = a.request("DELETE", "/v1/memories", json={"project_id": ed["bulk"]})
     assert r.status_code == 200, f"bulk DELETE -> {r.status_code}: {r.text[:160]}"
     for w in (b1, b2):
-        eventually(lambda w=w: check_gone(a, w.memory_id, w.marker, ed["bulk"]), timeout=60, what=f"{w.marker} gone")
+        eventually(lambda w=w: check_gone(a, w.memory_id, w.marker, ed["bulk"], w.content), timeout=60, what=f"{w.marker} gone")
     assert get_row(a, ed["foreign"].require().memory_id), "bulk delete of one project removed another project's memory"
 
 
@@ -317,11 +318,11 @@ def test_mcp_bulk_delete_by_project(a, mcp_a, ed):
     mcp_a.initialize()
     out = mcp_json(mcp_a, "delete_memories", {"project_id": ed["bulk2"]})
     assert "error" not in out, f"MCP bulk delete: {out}"
-    eventually(lambda: check_gone(a, w.memory_id, w.marker, ed["bulk2"]), timeout=60, what="MCP bulk-deleted memory gone")
+    eventually(lambda: check_gone(a, w.memory_id, w.marker, ed["bulk2"], w.content), timeout=60, what="MCP bulk-deleted memory gone")
 
 
 @proves("delete.bulk")
 @negative_control
 def test_bulk_gone_check_fails_for_a_project_that_was_not_deleted(ctx, a, ed):
     w = ed["foreign"].require()
-    expect_check_fails(check_gone, a, w.memory_id, w.marker, ctx.project_id)
+    expect_check_fails(check_gone, a, w.memory_id, w.marker, ctx.project_id, w.content)
