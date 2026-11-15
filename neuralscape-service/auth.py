@@ -28,7 +28,7 @@ import hmac
 import logging
 from contextvars import ContextVar
 
-from fastapi import Request
+from fastapi import HTTPException, Request
 from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 
@@ -65,6 +65,33 @@ AUTH_NOT_CONFIGURED_MSG = (
     "Authentication is not configured on this server: set NEURALSCAPE_USER_TOKEN_SECRET "
     "or NEURALSCAPE_API_KEY (or NEURALSCAPE_AUTH_DISABLED=true on a trusted local machine)"
 )
+
+
+def resolve_request_user_id(request: Request, body_user_id: str | None) -> str:
+    """Resolve the authoritative user_id for a request.
+
+    - With a verified per-user token (``request.state.user_id`` set by the
+      middleware) the token user wins; a body ``user_id`` that disagrees is
+      rejected with 400 (token-vs-body identity confusion).
+    - Legacy shared-key callers have no ``request.state.user_id``; the body
+      ``user_id`` is trusted as before.
+    - With neither, fall back to ``settings.default_user_id``.
+
+    Lives here (not in main.py) so extension routers can use it without a
+    circular import.
+    """
+    token_user_id = getattr(request.state, "user_id", None)
+    if token_user_id:
+        if body_user_id and body_user_id != token_user_id:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Request body user_id ({body_user_id!r}) does not match the "
+                    f"user_id encoded in the auth token ({token_user_id!r})."
+                ),
+            )
+        return token_user_id
+    return body_user_id or settings.default_user_id
 
 
 class BearerAuthMiddleware(BaseHTTPMiddleware):

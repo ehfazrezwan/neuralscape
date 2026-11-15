@@ -2574,6 +2574,10 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
         elif name == "set_project_knowledge_config":
             from knowledge.router import ProjectKnowledgeConfig, set_project_config
 
+            if not settings.is_dictator(user_id):
+                return [TextContent(type="text", text=json.dumps(
+                    {"error": f"User {user_id!r} is not authorized to set project knowledge config."}))]
+
             project_id = arguments.get("project_id")
             if not project_id:
                 return [TextContent(type="text", text=json.dumps({"error": "project_id required"}))]
