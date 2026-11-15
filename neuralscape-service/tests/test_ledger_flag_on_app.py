@@ -29,6 +29,14 @@ from tests.test_task_status_owner import PipelineRedis
 pytestmark = pytest.mark.integration
 
 REDIS_URL = os.environ.get("LEDGER_TEST_REDIS_URL")
+REQUIRED = os.environ.get("NS_INTEGRATION_REQUIRED") == "1"
+
+
+@pytest.fixture()
+def _fail_when_required_store_is_missing():
+    """With NS_INTEGRATION_REQUIRED=1 a missing store is a failure, not a skip."""
+    if REQUIRED and not REDIS_URL:
+        pytest.fail("NS_INTEGRATION_REQUIRED=1 but LEDGER_TEST_REDIS_URL is not set")
 _RAW = {"content": "the ledger flag is on", "category": "preference", "user_id": "alice"}
 
 
@@ -119,9 +127,9 @@ def test_flag_on_batch_write_answer_on_the_legacy_path(flag_on, fake_queue):
     assert batch.json()["task_id"]
 
 
-@pytest.mark.skipif(not REDIS_URL, reason="LEDGER_TEST_REDIS_URL not set (ledger flag-on real Redis)")
+@pytest.mark.skipif(not REDIS_URL and not REQUIRED, reason="LEDGER_TEST_REDIS_URL not set (ledger flag-on real Redis)")
 @pytest.mark.asyncio
-async def test_flag_on_write_through_real_redis(flag_on, monkeypatch):
+async def test_flag_on_write_through_real_redis(_fail_when_required_store_is_missing, flag_on, monkeypatch):
     monkeypatch.setattr(settings, "redis_url", REDIS_URL)
     monkeypatch.setattr(settings, "arq_queue_name", "ledger-flag-on-test")
     manager = TaskManager()
@@ -140,3 +148,32 @@ async def test_flag_on_write_through_real_redis(flag_on, monkeypatch):
             assert status.json()["status"] in {"queued", "pending", "processing", "in_progress", "complete", "completed"}
     finally:
         await manager.close()
+
+
+class _FakeProducer:
+    """Stands in for a ledger producer so the task manager reports the durable route."""
+
+
+@pytest.fixture()
+def durable(monkeypatch, flag_on, fake_queue):
+    fake_queue.producer = _FakeProducer()
+    monkeypatch.setattr(fake_queue, "_durable_route", lambda: True)
+    assert main._durable() is True
+    return fake_queue
+
+
+def test_durable_branch_accepts_an_idempotency_key_without_a_500(durable):
+    # The durable wiring hands the key to the task manager; the manager accepts it (unused until writes
+    # use the ledger) instead of raising TypeError.
+    client = TestClient(main.app)
+    headers = {"Idempotency-Key": "retry-4"}
+    assert client.post("/v1/memories/raw", json=_RAW, headers=headers).status_code == 202
+    assert client.post("/v1/memories/raw/batch", json={"memories": [_RAW]}, headers=headers).status_code == 202
+    legacy = client.post("/memories/async", json={"messages": [{"role": "user", "content": "hello"}], "user_id": "alice"},
+                         headers=headers)
+    assert legacy.status_code == 202
+
+
+def test_durable_branch_rejects_an_over_long_idempotency_key(durable):
+    resp = TestClient(main.app).post("/v1/memories/raw", json=_RAW, headers={"Idempotency-Key": "x" * 500})
+    assert resp.status_code == 400

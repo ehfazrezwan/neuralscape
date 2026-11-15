@@ -179,6 +179,8 @@ class TaskManager:
         agent_id: str | None = None,
         run_id: str | None = None,
         occurred_at: str | None = None,
+        # Durable path only (LEDGER_ENABLED): accepted and unused until writes use the ledger.
+        idempotency_key: str | None = None,
     ) -> str:
         """Enqueue memory extraction task. Returns task_id (job_id).
 
@@ -246,6 +248,8 @@ class TaskManager:
         # Data-layer connectors
         memory_kind: str | None = None,
         source_ref: dict | None = None,
+        # Durable path only (LEDGER_ENABLED): accepted and unused until writes use the ledger.
+        idempotency_key: str | None = None,
     ) -> str:
         """Enqueue raw memory storage task. Returns task_id (job_id).
 

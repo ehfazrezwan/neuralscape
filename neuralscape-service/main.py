@@ -37,6 +37,7 @@ from memory_service import get_shared_service
 configure_logging()
 from context_formatter import format_context_for_injection
 from index_format import index_row
+from ledger.port import IdempotencyConflict
 from schemas import (
     MEMORY_CATEGORIES,
     AskMemoryRequest,
@@ -77,7 +78,6 @@ from schemas import (
     TimelineResponse,
     normalize_visibility,
 )
-from ledger.port import IdempotencyConflict
 from task_manager import TaskManager, TaskStatusUnavailable
 
 logger = logging.getLogger(__name__)
@@ -2178,7 +2178,6 @@ async def v1_search_memories(req: SearchMemoryRequest, request: Request):
         raise HTTPException(status_code=500, detail="Memory search failed")
 
 
-
 @v1_router.post("/memories/batch-get", response_model=GetMemoriesResponse)
 async def v1_batch_get_memories(req: GetMemoriesRequest, request: Request):
     """Batch-fetch full memory payloads by id (C1, layer 3 of the contract).
@@ -2471,7 +2470,6 @@ async def v1_metrics(
     caller = _resolve_user_id(request, user_id)
     snapshot = await asyncio.to_thread(sm.metrics_snapshot, caller, None, task_id)
     return {"status": "ok", "savings_meter": snapshot}
-
 
 
 @v1_router.get("/queue/status", response_model=QueueStatusResponse)
