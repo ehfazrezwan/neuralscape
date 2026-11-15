@@ -680,10 +680,21 @@ class DeleteMixin:
                 out[str(pt.id)] = vec
         return out
 
-    def _delete_qdrant_memory_with_graph_cleanup(self, memory_id: str, payload: dict) -> None:
+    def _delete_qdrant_memory_with_graph_cleanup(
+        self, memory_id: str, payload: dict, *, collector: dict | None = None
+    ) -> None:
         """Delete a single memory from Qdrant and expire related graph edges.
 
         Graph cleanup is non-critical — failures are logged but don't propagate.
+
+        With a ``collector`` (``dedup_memories`` passes one) the cascade also
+        repairs sibling facts that shared the deleted row's conversation
+        episode: their stale refs are cleared and the single-fact re-ingest
+        jobs accumulate in ``collector["graph_jobs"]`` for the caller to
+        enqueue (``collector["unrepaired_ids"]`` lists the ones that could
+        not be repaired). Without a collector (the TTL-expiry sweep in
+        memory/write.py has no way to return jobs) the cascade is unchanged
+        and siblings are not touched.
         """
         self._memory.vector_store.delete(memory_id)
 
@@ -693,7 +704,18 @@ class DeleteMixin:
                     "memory": payload.get("data", ""),
                     "metadata": payload.get("metadata", {}),
                 }
-                self._cascade_or_fallback_expire(mem, memory_id=memory_id)
+                if collector is None:
+                    self._cascade_or_fallback_expire(mem, memory_id=memory_id)
+                    return
+                collector.setdefault("deleted", set()).add(memory_id)
+                batch = self._cascade_rows_once(
+                    [{"id": memory_id, "mem": mem, "group_id": None}],
+                    deleted_ids=collector["deleted"],
+                )
+                collector.setdefault("graph_jobs", []).extend(batch["graph_jobs"])
+                collector.setdefault("unrepaired_ids", []).extend(batch["sibling_unrepaired_ids"])
+                if batch.get("sibling_repair_failed"):
+                    collector["repair_failed"] = True
             except Exception as e:
                 logger.warning(f"Graph cleanup failed for {memory_id} (non-critical): {e}")
 
@@ -726,6 +748,7 @@ class DeleteMixin:
 
         memories = self._scroll_all_user_memories(user_id, batch_size=batch_size)
         deleted_ids: set[str] = set()
+        collector: dict = {}
 
         # ── Phase 1: Exact dedup by hash ──
         # Key on (hash, partition) — the same partition rule phase 2 uses
@@ -759,7 +782,7 @@ class DeleteMixin:
                 if mid in deleted_ids:
                     continue
                 try:
-                    self._delete_qdrant_memory_with_graph_cleanup(mid, dup["payload"])
+                    self._delete_qdrant_memory_with_graph_cleanup(mid, dup["payload"], collector=collector)
                     deleted_ids.add(mid)
                     exact_removed += 1
                     reinforcement += _times_derived_from_metadata(
@@ -779,6 +802,7 @@ class DeleteMixin:
                 "semantic_duplicates_removed": 0,
                 "semantic_skipped": "superseded by dreaming MERGE",
                 "total_checked": len(memories),
+                **self._dedup_graph_summary(collector, deleted_ids),
             }
         remaining = [mem for mem in memories if mem["id"] not in deleted_ids]
 
@@ -792,6 +816,7 @@ class DeleteMixin:
             for mem in chunk:
                 semantic_removed += self._semantic_dedup_one(
                     m, user_id, mem, stored_vectors.get(mem["id"]), threshold, deleted_ids,
+                    collector=collector,
                 )
 
         return {
@@ -799,6 +824,22 @@ class DeleteMixin:
             "exact_duplicates_removed": exact_removed,
             "semantic_duplicates_removed": semantic_removed,
             "total_checked": len(memories),
+            **self._dedup_graph_summary(collector, deleted_ids),
+        }
+
+    @staticmethod
+    def _dedup_graph_summary(collector: dict, deleted_ids: set[str]) -> dict:
+        """Sibling re-enrichment work a dedup run produced (caller enqueues
+        ``graph_jobs``). Jobs for rows a later dedup step also deleted are
+        dropped — there is nothing left to re-ingest for them."""
+        jobs = [j for j in collector.get("graph_jobs", []) if j["memory_id"] not in deleted_ids]
+        return {
+            "graph_jobs": jobs,
+            "graph_jobs_count": len(jobs),
+            "graph_sibling_unrepaired_ids": [
+                i for i in collector.get("unrepaired_ids", []) if i not in deleted_ids
+            ],
+            "graph_sibling_repair_failed": bool(collector.get("repair_failed")),
         }
 
     def _semantic_dedup_one(
@@ -809,6 +850,7 @@ class DeleteMixin:
         vector: list[float] | None,
         threshold: float,
         deleted_ids: set[str],
+        collector: dict | None = None,
     ) -> int:
         """Phase 2 for one memory: merge near-duplicates in its own partition.
 
@@ -876,7 +918,9 @@ class DeleteMixin:
             if older_id in deleted_ids:
                 continue
             try:
-                self._delete_qdrant_memory_with_graph_cleanup(older_id, older_payload)
+                self._delete_qdrant_memory_with_graph_cleanup(
+                    older_id, older_payload, collector=collector
+                )
                 deleted_ids.add(older_id)
                 removed += 1
                 # Same reinforcement transfer as the exact phase: the

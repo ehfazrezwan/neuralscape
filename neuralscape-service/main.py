@@ -3076,7 +3076,11 @@ async def v1_retag_memories(req: RetagRequest, request: Request):
             ) from e
         logger.warning(f"Redis unavailable, running retag synchronously: {e}")
         result = await asyncio.to_thread(_service.retag_memories, caller, filters, ops, False)
-        result.pop("graph_jobs", None)
+        # No queue: the re-ingests (moved rows + sibling facts) cannot run
+        # now — report which memories still need one instead of dropping them.
+        result["graph_jobs_not_enqueued_ids"] = [
+            j.get("memory_id") for j in result.pop("graph_jobs", [])
+        ]
         return JSONResponse(status_code=200, content=result)
 
     return TaskAcceptedResponse(

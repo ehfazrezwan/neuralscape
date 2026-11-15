@@ -65,7 +65,7 @@ def _match(cond, payload) -> bool:
     val = _dig(payload, cond.key)
     m = cond.match
     if isinstance(m, MatchValue):
-        return val == m.value
+        return m.value in val if isinstance(val, list) else val == m.value
     if isinstance(m, MatchAny):
         return val in m.any
     raise AssertionError(f"unsupported match {m!r}")
@@ -892,3 +892,174 @@ class TestMcpSurface:
             "delete_memories", {"user_id": OWNER, "memory_id": "not-a-uuid"}
         )
         assert "not found" in json.loads(out[0].text)["error"].lower()
+
+
+# ──────────────────────────────────────────────
+# retag partition migration (sibling repair)
+# ──────────────────────────────────────────────
+
+
+class TestRetagMigration:
+    def _retag(self, w, ids=None):
+        return w.svc.retag_memories(
+            OWNER, {"category": "personal_fact"}, {"set_project_id": "projx"}
+        )
+
+    def test_one_of_n_moved_siblings_in_same_run_all_moved_cascade_once(self, world):
+        w = world
+        conv = seed_conversation(w, n=4)
+        out = self._retag(w)
+        # every row of the conversation matched and moved: each gets its OWN
+        # job, no extra sibling jobs, and the episode was cascaded exactly once
+        assert out["updated"] == 4
+        assert sorted(j["memory_id"] for j in out["graph_jobs"]) == sorted(conv.ids)
+        assert out["sibling_graph_jobs_count"] == 0
+        assert len(w.g.kinds("lookup_uuid")) == 1
+        assert out["graph_migrations_unresolved_ids"] == []
+        assert conv.uuid not in w.g.episodes and w.g.live_edges(conv.group) == []
+
+    def test_partial_move_returns_sibling_jobs_for_the_unmoved(self, world):
+        w = world
+        conv = seed_conversation(w, n=4)
+        w.q.meta(conv.ids[0])["tags"] = ["move"]
+        w.q.meta(conv.ids[1])["tags"] = ["move"]
+        out = w.svc.retag_memories(OWNER, {"tags_contains": ["move"]}, {"set_project_id": "projx"})
+        moved = {j["memory_id"] for j in out["graph_jobs"]}
+        assert moved == set(conv.ids)            # 2 moved rows + 2 sibling re-ingests
+        assert out["sibling_graph_jobs_count"] == 2
+        sib = [j for j in out["graph_jobs"] if j["memory_id"] in conv.ids[2:]]
+        assert all(j["project_id"] is None for j in sib)  # siblings stay in their own group
+        assert all(w.q.meta(i)["graph_episode_uuid"] is None for i in conv.ids)
+        assert conv.uuid not in w.g.episodes
+
+    def test_non_migrating_retag_cascades_nothing(self, world):
+        w = world
+        conv = seed_conversation(w, n=3)
+        out = w.svc.retag_memories(OWNER, {"category": "personal_fact"}, {"add_tags": ["x"]})
+        assert out["graph_jobs"] == [] and conv.uuid in w.g.episodes
+
+    def test_dry_run_cascades_nothing(self, world):
+        w = world
+        conv = seed_conversation(w, n=3)
+        out = w.svc.retag_memories(
+            OWNER, {"category": "personal_fact"}, {"set_project_id": "projx"}, True
+        )
+        assert out["graph_jobs"] == [] and conv.uuid in w.g.episodes
+
+
+# ──────────────────────────────────────────────
+# dedup (cron + compile) sibling repair
+# ──────────────────────────────────────────────
+
+
+class TestDedupSiblingRepair:
+    def _seed_dup(self, w, conv):
+        # the conversation's first row is an exact duplicate of a NEWER standalone row
+        for pid in conv.ids:
+            w.q.points[pid]["hash"] = f"h-{pid}"
+            w.q.points[pid]["created_at"] = "2026-01-01"
+        w.q.points[conv.ids[0]]["hash"] = "H-dup"
+        w.q.add(rid(700), w.q.points[conv.ids[0]]["data"], hash="H-dup")
+        w.q.points[rid(700)]["hash"] = "H-dup"
+        w.q.points[rid(700)]["created_at"] = "2026-02-01"
+
+    def test_exact_dup_in_conversation_repairs_siblings(self, world):
+        w = world
+        conv = seed_conversation(w, n=4)
+        self._seed_dup(w, conv)
+        out = w.svc.dedup_memories(OWNER, semantic=False)
+        assert out["exact_duplicates_removed"] == 1
+        assert conv.ids[0] not in w.q.points
+        assert conv.uuid not in w.g.episodes and w.g.live_edges(conv.group) == []
+        assert {j["memory_id"] for j in out["graph_jobs"]} == set(conv.ids[1:])
+        assert out["graph_jobs_count"] == 3
+        for j in out["graph_jobs"]:
+            assert_job_shape(j)
+        assert all(w.q.meta(i)["graph_episode_uuid"] is None for i in conv.ids[1:])
+        # the standalone survivor is not part of the conversation
+        assert rid(700) in w.q.points
+
+    def test_expiry_sweep_collectorless_path_leaves_siblings_untouched(self, world):
+        w = world
+        conv = seed_conversation(w, n=3)
+        w.svc._delete_qdrant_memory_with_graph_cleanup(conv.ids[0], w.q.points[conv.ids[0]])
+        assert conv.uuid not in w.g.episodes  # privacy cascade still runs
+        assert w.q.meta(conv.ids[1])["graph_episode_uuid"] == conv.uuid  # status quo (see PR note)
+
+    @pytest.mark.asyncio
+    async def test_worker_cron_enqueues_sibling_jobs(self):
+        import worker
+
+        svc = MagicMock()
+        svc.get_all_user_ids.return_value = [OWNER]
+        svc.dedup_memories.return_value = {
+            "user_id": OWNER, "exact_duplicates_removed": 1, "semantic_duplicates_removed": 0,
+            "graph_jobs": [_job(1), _job(2)],
+        }
+        redis = MagicMock()
+        redis.enqueue_job = AsyncMock()
+        out = await worker.dedup_all_memories({"service": svc, "redis": redis})
+        assert redis.enqueue_job.await_count == 2
+        assert all(c.kwargs["_queue_name"] == settings.graph_queue_name
+                   for c in redis.enqueue_job.await_args_list)
+        assert out["per_user"][0]["graph_jobs_enqueued"] == 2
+        assert "graph_jobs" not in out["per_user"][0]
+
+    @pytest.mark.asyncio
+    async def test_compile_path_enqueues_and_reports_failures(self, monkeypatch):
+        from extensions.conversation_compiler import compile as cc
+
+        class _TM:
+            def __init__(self):
+                self.pool = None
+
+            async def connect(self):
+                raise ConnectionError("redis down")
+
+        monkeypatch.setattr("task_manager.TaskManager", _TM)
+        assert await cc._enqueue_sibling_jobs([_job(1), _job(2)]) == (0, 2)
+
+        class _TMok(_TM):
+            async def connect(self):
+                pass
+
+            async def enqueue_graph_jobs(self, jobs):
+                return {"graph_jobs_enqueued": len(jobs), "graph_jobs_not_enqueued_ids": []}
+
+        monkeypatch.setattr("task_manager.TaskManager", _TMok)
+        assert await cc._enqueue_sibling_jobs([_job(1), _job(2)]) == (2, 0)
+
+
+# ──────────────────────────────────────────────
+# content-only edit: old text must leave the graph
+# ──────────────────────────────────────────────
+
+
+class TestContentEditCascade:
+    def test_old_text_gone_from_recall_and_edges_new_text_reingested(self, world):
+        w = world
+        conv = seed_conversation(w, n=3)
+        assert episode_recall(w, "Biscuit")
+        out = w.svc.patch_memory(conv.ids[0], OWNER, {"content": "Alice's cat is called Mochi"})
+
+        assert out["graph"] == "reingest_pending"
+        # old text is gone from episode recall and from live edges
+        assert episode_recall(w, "Biscuit") == []
+        assert w.g.live_edges(conv.group) == [] and conv.uuid not in w.g.episodes
+        # new text is re-ingested (job), siblings get theirs
+        assert out["graph_job"]["content"] == "Alice's cat is called Mochi"
+        assert {j["memory_id"] for j in out["sibling_graph_jobs"]} == set(conv.ids[1:])
+
+    def test_unresolved_old_episode_is_reported_incomplete(self, world):
+        w = world
+        conv = seed_conversation(w, n=2)
+        del w.g.episodes[conv.uuid]
+        out = w.svc.patch_memory(conv.ids[0], OWNER, {"content": "something new"})
+        assert out["graph"] == "reingest_incomplete"
+        assert out["graph_job"] is not None  # still re-ingested
+
+    def test_metadata_only_edit_does_not_cascade(self, world):
+        w = world
+        conv = seed_conversation(w, n=2)
+        w.svc.patch_memory(conv.ids[0], OWNER, {"tags": ["t"]})
+        assert conv.uuid in w.g.episodes

@@ -80,8 +80,8 @@ class EditMixin:
         an absent key is untouched. Returns::
 
             {"memory": MemoryResponse, "graph_job": dict | None,
-             "graph": "unchanged" | "reingest_pending" | "migration_pending"
-                      | "migration_incomplete",
+             "graph": "unchanged" | "reingest_pending" | "reingest_incomplete"
+                      | "migration_pending" | "migration_incomplete",
              "sibling_graph_jobs": list[dict],
              "sibling_graph_unrepaired_ids": list[str],
              "sibling_graph_repair_failed": bool}
@@ -196,7 +196,8 @@ class EditMixin:
         sibling_jobs: list[dict] = []
         sibling_unrepaired: list[str] = []
         sibling_repair_failed = False
-        if new_group != old_group:
+        migrating = new_group != old_group
+        if migrating or edits_content:
             # Partition migration: expire the memory's episode/edges in the
             # OLD group (episode-precise cascade first, substring fallback
             # only if no episode resolves — memory/provenance.py), then the
@@ -210,6 +211,11 @@ class EditMixin:
             # distinguishably instead: "migration_incomplete" whenever the
             # graph is actually configured but the cascade could not
             # resolve (and therefore could not verify) the episode.
+            #
+            # A content-only edit takes the same cascade: the OLD text lives
+            # verbatim in the memory's episode, which episode recall serves
+            # (on by default), so it is expired exactly as for a migration
+            # (most-restrictive) before the new content is re-ingested.
             graph_available = bool(self._graphiti and self._bridge)
             cascade_result: dict = {"resolved": False}
             try:
@@ -232,18 +238,19 @@ class EditMixin:
                 sibling_repair_failed = batch["sibling_repair_failed"]
             except Exception as e:
                 logger.warning(f"Graph edge expiration failed for {memory_id} (non-critical): {e}")
-            if graph_available and not cascade_result.get("resolved"):
+            unverified = graph_available and not cascade_result.get("resolved")
+            if unverified:
                 logger.warning(
-                    "Partition migration for memory=%s could not resolve/verify "
+                    "%s for memory=%s could not resolve/verify "
                     "graph cleanup in old group=%r — old content may still be "
-                    "live in the shared graph pool until a follow-up cleanup runs",
+                    "live in the graph until a follow-up cleanup runs",
+                    "Partition migration" if migrating else "Content edit",
                     memory_id, old_group,
                 )
-                graph_status = "migration_incomplete"
+            if migrating:
+                graph_status = "migration_incomplete" if unverified else "migration_pending"
             else:
-                graph_status = "migration_pending"
-        elif edits_content:
-            graph_status = "reingest_pending"
+                graph_status = "reingest_incomplete" if unverified else "reingest_pending"
         if graph_status != "unchanged":
             graph_job = {
                 "memory_id": memory_id,
@@ -343,6 +350,7 @@ class EditMixin:
         # resolved must be COUNTED and its id REPORTED, never silently
         # absorbed by a per-row try/except that only logs.
         graph_migrations_unresolved_ids: list[str] = []
+        migrations: list[dict] = []
         offset = None
         while True:
             points, offset = client.scroll(
@@ -428,24 +436,15 @@ class EditMixin:
                 old_group = _build_group_id(visibility, owner, meta.get("project_id"), meta.get("workspace"))
                 new_group = _build_group_id(visibility, owner, new_meta.get("project_id"), new_meta.get("workspace"))
                 if new_group != old_group:
-                    graph_available = bool(self._graphiti and self._bridge)
-                    cascade_result: dict = {"resolved": False}
-                    try:
-                        cascade_result = self._cascade_or_fallback_expire(
-                            {"memory": payload.get("data", ""), "metadata": meta, "user_id": owner},
-                            group_id=old_group,
-                            memory_id=str(pt.id),
-                        )
-                    except Exception as e:
-                        logger.warning(f"Graph edge expiration failed for {pt.id} (non-critical): {e}")
-                    if graph_available and not cascade_result.get("resolved"):
-                        logger.warning(
-                            "Retag partition migration for memory=%s could not "
-                            "resolve/verify graph cleanup in old group=%r — old "
-                            "content may still be live in the shared graph pool",
-                            pt.id, old_group,
-                        )
-                        graph_migrations_unresolved_ids.append(str(pt.id))
+                    # Cascaded after the scroll, once per distinct episode
+                    # (rows of one conversation share an episode), with
+                    # sibling repair that skips every migrated row (each
+                    # gets its own re-ingest job below).
+                    migrations.append({
+                        "id": str(pt.id),
+                        "mem": {"memory": payload.get("data", ""), "metadata": meta, "user_id": owner},
+                        "group_id": old_group,
+                    })
                     graph_jobs.append({
                         "memory_id": str(pt.id),
                         "content": payload.get("data", ""),
@@ -456,6 +455,34 @@ class EditMixin:
                     })
             if offset is None:
                 break
+
+        sibling_unrepaired: list[str] = []
+        sibling_repair_failed = False
+        sibling_jobs_count = 0
+        if migrations:
+            graph_available = bool(self._graphiti and self._bridge)
+            batch = {"results": {}, "graph_jobs": [], "sibling_unrepaired_ids": []}
+            try:
+                batch = self._cascade_rows_once(
+                    migrations, skip_job_ids={r["id"] for r in migrations}
+                )
+            except Exception as e:
+                logger.warning(f"Retag graph cascade failed (non-critical): {e}")
+            for row in migrations:
+                res = batch["results"].get(row["id"]) or {"resolved": False}
+                if graph_available and not res.get("resolved"):
+                    logger.warning(
+                        "Retag partition migration for memory=%s could not "
+                        "resolve/verify graph cleanup in old group=%r — old "
+                        "content may still be live in the shared graph pool",
+                        row["id"], row["group_id"],
+                    )
+                    graph_migrations_unresolved_ids.append(row["id"])
+            # Sibling re-ingests ride the same list the callers already enqueue.
+            graph_jobs.extend(batch["graph_jobs"])
+            sibling_jobs_count = len(batch["graph_jobs"])
+            sibling_unrepaired = list(batch["sibling_unrepaired_ids"])
+            sibling_repair_failed = bool(batch.get("sibling_repair_failed"))
 
         _audit_log.info(
             "memories_retagged",
@@ -480,5 +507,10 @@ class EditMixin:
             # the substring fallback ran but its effect is unverifiable.
             # Never silently dropped; a caller/operator can act on these ids.
             "graph_migrations_unresolved_ids": graph_migrations_unresolved_ids,
+            # Of graph_jobs, how many re-ingest SIBLING facts of a cascaded
+            # conversation episode (the rest re-ingest the moved rows).
+            "sibling_graph_jobs_count": sibling_jobs_count,
+            "sibling_graph_unrepaired_ids": sibling_unrepaired,
+            "sibling_graph_repair_failed": sibling_repair_failed,
             "dry_run": dry_run,
         }

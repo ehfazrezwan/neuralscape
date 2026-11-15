@@ -185,6 +185,31 @@ def _entries_to_text(entries: list[dict]) -> str:
     return "\n".join(lines)
 
 
+async def _enqueue_sibling_jobs(jobs: list[dict]) -> tuple[int, int]:
+    """Enqueue the sibling graph re-ingests a dedup run produced.
+
+    The compile path has no queue handle of its own, so it opens a short-lived
+    TaskManager. Never raises: returns ``(enqueued, not_enqueued)``.
+    """
+    from task_manager import TaskManager
+
+    tm = TaskManager()
+    try:
+        await tm.connect()
+        res = await tm.enqueue_graph_jobs(jobs)
+        return res["graph_jobs_enqueued"], len(res["graph_jobs_not_enqueued_ids"])
+    except Exception as e:
+        logger.warning(f"Post-compile dedup sibling re-enrichment not queued: {e}")
+        return 0, len(jobs)
+    finally:
+        pool = getattr(tm, "pool", None)
+        if pool is not None:
+            try:
+                await pool.aclose()
+            except Exception:
+                pass
+
+
 async def compile_date(
     date: str,
     service: MemoryService,
@@ -330,9 +355,13 @@ async def compile_date(
     # the event loop when compile_date is called inline (e.g., from session_end
     # fallback or when ARQ worker runs process_conversation_compile).
     dedup_triggered = False
+    sibling_enqueued = sibling_failed = 0
     try:
-        await asyncio.to_thread(service.dedup_memories, user_id)
+        dedup_result = await asyncio.to_thread(service.dedup_memories, user_id)
         dedup_triggered = True
+        sibling_jobs = (dedup_result or {}).get("graph_jobs") or []
+        if sibling_jobs:
+            sibling_enqueued, sibling_failed = await _enqueue_sibling_jobs(sibling_jobs)
     except Exception:
         logger.warning("Post-compile dedup failed (non-critical)")
 
@@ -341,6 +370,8 @@ async def compile_date(
         articles=articles,
         entries_compiled=entries_compiled,
         dedup_triggered=dedup_triggered,
+        dedup_graph_jobs_enqueued=sibling_enqueued,
+        dedup_graph_jobs_not_enqueued=sibling_failed,
     )
 
     logger.info(
