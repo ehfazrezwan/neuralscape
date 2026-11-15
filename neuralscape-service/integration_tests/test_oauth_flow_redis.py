@@ -147,12 +147,83 @@ def test_full_oauth_flow_with_refresh_rotation(oauth_on):
     )
     assert reuse.status_code == 400 and reuse.json()["error"] == "invalid_grant"
 
-    # the rotated one still works exactly once
-    again = _token_post(
-        client, grant_type="refresh_token", refresh_token=new["refresh_token"], client_id=client_id
-    )
-    assert again.status_code == 200
+    # reuse revoked the family, so the successor is dead too
     dead = _token_post(
         client, grant_type="refresh_token", refresh_token=new["refresh_token"], client_id=client_id
     )
-    assert dead.status_code == 400
+    assert dead.status_code == 400 and dead.json()["error"] == "invalid_grant"
+
+
+def _login(client, secret):
+    """Register + authorize + exchange; returns (client_id, tokens)."""
+    client_id = client.post("/oauth/register", json={"redirect_uris": [REDIRECT]}).json()["client_id"]
+    verifier = _b64url(secrets.token_bytes(40))
+    challenge = _b64url(hashlib.sha256(verifier.encode("ascii")).digest())
+    resp = client.post(
+        "/oauth/authorize",
+        data={
+            "client_id": client_id,
+            "redirect_uri": REDIRECT,
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
+            "token": issue_user_token(USER, secret, 600),
+        },
+        follow_redirects=False,
+    )
+    code = parse_qs(urlparse(resp.headers["location"]).query)["code"][0]
+    tok = _token_post(
+        client,
+        grant_type="authorization_code",
+        code=code,
+        code_verifier=verifier,
+        redirect_uri=REDIRECT,
+        client_id=client_id,
+    )
+    assert tok.status_code == 200, tok.text
+    return client_id, tok.json()
+
+
+def test_concurrent_redemption_has_one_winner_and_reuse_revokes_family(oauth_on):
+    from concurrent.futures import ThreadPoolExecutor
+
+    client = TestClient(app, raise_server_exceptions=False)
+    client_id, tokens = _login(client, oauth_on)
+    _, unrelated = _login(client, oauth_on)
+
+    def redeem(_):
+        return _token_post(
+            TestClient(app, raise_server_exceptions=False),
+            grant_type="refresh_token",
+            refresh_token=tokens["refresh_token"],
+            client_id=client_id,
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(redeem, range(2)))
+    codes = sorted(r.status_code for r in results)
+    assert codes == [200, 400], [r.text for r in results]
+    winner = next(r for r in results if r.status_code == 200).json()
+
+    # Reuse (the loser, or any replay) revokes the family: even if the loser
+    # lost the race before the revoke landed, a further replay does it.
+    replay = _token_post(
+        client, grant_type="refresh_token", refresh_token=tokens["refresh_token"], client_id=client_id
+    )
+    assert replay.status_code == 400
+    dead = _token_post(
+        client, grant_type="refresh_token", refresh_token=winner["refresh_token"], client_id=client_id
+    )
+    assert dead.status_code == 400 and dead.json()["error"] == "invalid_grant"
+
+    # an unrelated grant (different family) is unaffected
+    ok = _token_post(
+        client, grant_type="refresh_token", refresh_token=unrelated["refresh_token"],
+        client_id=_client_of(unrelated, oauth_on),
+    )
+    assert ok.status_code == 200
+
+
+def _client_of(tokens, secret):
+    from tokens import verify_payload
+
+    return verify_payload(tokens["refresh_token"], secret)["client_id"]

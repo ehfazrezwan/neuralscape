@@ -27,8 +27,12 @@ import oauth
 from main import app
 from tokens import issue_user_token, sign_payload, verify_payload, verify_user_token
 
-_REAL_CONSUME_CODE = oauth._consume_code_jti  # the autouse fixture patches the module attrs
-_REAL_CONSUME_REFRESH = oauth._consume_refresh_jti
+# the autouse fixture patches these module attrs; keep the originals. getattr
+# with a default so a reverted oauth.py fails the tests, not collection.
+_ORIG = {
+    n: getattr(oauth, n, None)
+    for n in ("_consume_code_jti", "_consume_refresh_jti", "_family_revoked", "_revoke_family")
+}
 
 SECRET = "oauth-test-secret"
 PUBLIC_URL = "https://neuralscape.example.com"
@@ -91,8 +95,18 @@ def no_redis_replay():
         seen_refresh.add(jti)
         return True
 
-    with patch.object(oauth, "_consume_code_jti", side_effect=_consume), patch.object(
-        oauth, "_consume_refresh_jti", side_effect=_consume_refresh
+    revoked = set()
+
+    async def _family_revoked(fam):
+        return fam in revoked
+
+    async def _revoke_family(fam, ttl):
+        revoked.add(fam)
+
+    with patch.object(oauth, "_consume_code_jti", side_effect=_consume, create=True), patch.object(
+        oauth, "_consume_refresh_jti", side_effect=_consume_refresh, create=True
+    ), patch.object(oauth, "_family_revoked", side_effect=_family_revoked, create=True), patch.object(
+        oauth, "_revoke_family", side_effect=_revoke_family, create=True
     ):
         yield
 
@@ -426,6 +440,46 @@ class TestToken:
         assert replay.status_code == 400
         assert replay.json()["error"] == "invalid_grant"
 
+    def test_reuse_revokes_the_whole_family(self, client):
+        client_id, tok = self._tokens(client)
+        second = self._refresh(client, tok["refresh_token"], client_id).json()
+        # attacker replays the old, already-rotated token
+        assert self._refresh(client, tok["refresh_token"], client_id).status_code == 400
+        # the current successor is now dead too
+        dead = self._refresh(client, second["refresh_token"], client_id)
+        assert dead.status_code == 400 and dead.json()["error"] == "invalid_grant"
+
+    def test_other_family_unaffected_by_revocation(self, client):
+        client_id, tok = self._tokens(client)
+        _, other = self._tokens(client)  # an unrelated grant
+        self._refresh(client, tok["refresh_token"], client_id)
+        self._refresh(client, tok["refresh_token"], client_id)  # reuse -> revoke
+        other_client = verify_payload(other["refresh_token"], SECRET)["client_id"]
+        assert self._refresh(client, other["refresh_token"], other_client).status_code == 200
+
+    def test_family_survives_rotation(self, client):
+        client_id, tok = self._tokens(client)
+        second = self._refresh(client, tok["refresh_token"], client_id).json()
+        assert (
+            verify_payload(second["refresh_token"], SECRET)["fam"]
+            == verify_payload(tok["refresh_token"], SECRET)["fam"]
+        )
+
+    def test_revocation_check_fails_closed_when_redis_down(self, client):
+        client_id, tok = self._tokens(client)
+
+        async def _down(fam):
+            raise oauth._ReplayGuardUnavailable()
+
+        with patch.object(oauth, "_family_revoked", side_effect=_down):
+            resp = self._refresh(client, tok["refresh_token"], client_id)
+        assert resp.status_code == 503 and resp.json()["error"] == "temporarily_unavailable"
+
+    def test_non_ascii_client_id_is_invalid_grant_not_500(self, client):
+        client_id, tok = self._tokens(client)
+        resp = self._refresh(client, tok["refresh_token"], "clïent-id-é")
+        assert resp.status_code == 400 and resp.json()["error"] == "invalid_grant"
+
     def test_rotated_refresh_token_keeps_working(self, client):
         client_id, tok = self._tokens(client)
         second = self._refresh(client, tok["refresh_token"], client_id).json()
@@ -448,6 +502,14 @@ class TestToken:
             {"typ": "refresh", "user_id": USER, "exp": int(time.time()) + 600}, SECRET
         )
         resp = self._refresh(client, legacy, client_id)
+        assert resp.status_code == 400 and resp.json()["error"] == "invalid_grant"
+
+    def test_refresh_token_without_family_is_rejected(self, client):
+        client_id, _ = self._tokens(client)
+        nofam = sign_payload(
+            {"typ": "refresh", "user_id": USER, "client_id": client_id, "jti": "j",
+             "exp": int(time.time()) + 600}, SECRET)
+        resp = self._refresh(client, nofam, client_id)
         assert resp.status_code == 400 and resp.json()["error"] == "invalid_grant"
 
     def test_refresh_fails_closed_when_guard_unavailable(self, client):
@@ -496,9 +558,9 @@ class TestSingleUseGuard:
         settings.redis_url = "redis://127.0.0.1:1/0"  # nothing listens here
         try:
             with pytest.raises(oauth._ReplayGuardUnavailable):
-                asyncio.run(_REAL_CONSUME_CODE("j1"))
+                asyncio.run(_ORIG["_consume_code_jti"]("j1"))
             with pytest.raises(oauth._ReplayGuardUnavailable):
-                asyncio.run(_REAL_CONSUME_REFRESH("j2", 60))
+                asyncio.run(_ORIG["_consume_refresh_jti"]("j2", 60))
         finally:
             settings.redis_url = orig
 
@@ -522,9 +584,38 @@ class TestSingleUseGuard:
 
         fake = FakeRedis()
         with patch("redis.asyncio.from_url", return_value=fake):
-            assert asyncio.run(_REAL_CONSUME_REFRESH("abc", 0)) is True
-            assert asyncio.run(_REAL_CONSUME_REFRESH("abc", 0)) is False
+            assert asyncio.run(_ORIG["_consume_refresh_jti"]("abc", 0)) is True
+            assert asyncio.run(_ORIG["_consume_refresh_jti"]("abc", 0)) is False
         assert calls[0] == ("oauth:refresh:abc", 1)
+
+    def test_family_helpers_and_client_timeouts(self):
+        import asyncio
+
+        kwargs = {}
+
+        class FakeRedis:
+            store = {}
+
+            async def set(self, key, val, nx=None, ex=None):
+                self.store[key] = ex
+                return True
+
+            async def exists(self, key):
+                return 1 if key in self.store else 0
+
+            async def aclose(self):
+                pass
+
+        def fake_from_url(url, **kw):
+            kwargs.update(kw)
+            return FakeRedis()
+
+        with patch("redis.asyncio.from_url", side_effect=fake_from_url):
+            assert asyncio.run(_ORIG["_family_revoked"]("f1")) is False
+            asyncio.run(_ORIG["_revoke_family"]("f1", 100))
+            assert asyncio.run(_ORIG["_family_revoked"]("f1")) is True
+        assert FakeRedis.store["oauth:revoked_family:f1"] == 100
+        assert kwargs["socket_connect_timeout"] > 0 and kwargs["socket_timeout"] > 0
 
 
 # ── anti-framing headers + consent page layout / contrast ────────────────

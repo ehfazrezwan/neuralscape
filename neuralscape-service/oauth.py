@@ -33,7 +33,8 @@ refresh / client tokens can never be replayed as a Bearer credential.
 
 The only real state is a Redis key per consumed single-use credential: one per
 auth code (``oauth:code:<jti>``) and one per redeemed refresh token
-(``oauth:refresh:<jti>``, rotate-and-consume). Both guards fail CLOSED: when
+(``oauth:refresh:<jti>``, rotate-and-consume) plus
+``oauth:revoked_family:<fam>`` set when a rotated token is replayed. Both guards fail CLOSED: when
 Redis is unreachable the token endpoint answers 503 ``temporarily_unavailable``
 and issues nothing.
 """
@@ -138,23 +139,56 @@ class _ReplayGuardUnavailable(Exception):
     """Redis could not be reached, so single-use cannot be enforced."""
 
 
-async def _consume_once(key: str, ttl: int) -> bool:
-    """Atomically claim ``key`` (Redis ``SET NX EX``). True on the first claim,
-    False if it was already claimed. Raises ``_ReplayGuardUnavailable`` when
-    Redis cannot be reached: callers must then refuse (fail closed) rather than
+_REDIS_TIMEOUT = 2  # seconds; a hung Redis must fail closed promptly, not stall /oauth/token
+
+
+async def _redis_op(op):
+    """Run ``op(client)`` against Redis with short timeouts. Any failure raises
+    ``_ReplayGuardUnavailable``: callers must refuse (fail closed) rather than
     let a single-use credential be redeemed more than once."""
     try:
         import redis.asyncio as aioredis
 
-        client = aioredis.from_url(settings.redis_url)
+        client = aioredis.from_url(
+            settings.redis_url,
+            socket_connect_timeout=_REDIS_TIMEOUT,
+            socket_timeout=_REDIS_TIMEOUT,
+        )
         try:
-            ok = await client.set(key, "1", nx=True, ex=max(1, int(ttl)))
-            return bool(ok)
+            return await op(client)
         finally:
             await client.aclose()
     except Exception as e:  # noqa: BLE001 — any store failure means fail closed
         logger.warning("OAuth single-use guard unavailable (%s); refusing", e)
         raise _ReplayGuardUnavailable() from e
+
+
+async def _consume_once(key: str, ttl: int) -> bool:
+    """Atomically claim ``key`` (Redis ``SET NX EX``). True on the first claim,
+    False if it was already claimed."""
+
+    async def op(client):
+        return bool(await client.set(key, "1", nx=True, ex=max(1, int(ttl))))
+
+    return await _redis_op(op)
+
+
+async def _family_revoked(fam: str) -> bool:
+    """True if reuse of a token in this family was detected earlier."""
+
+    async def op(client):
+        return bool(await client.exists(f"oauth:revoked_family:{fam}"))
+
+    return await _redis_op(op)
+
+
+async def _revoke_family(fam: str, ttl: int) -> None:
+    """Revoke every refresh token in a family (TTL = the refresh lifetime)."""
+
+    async def op(client):
+        await client.set(f"oauth:revoked_family:{fam}", "1", ex=max(1, int(ttl)))
+
+    await _redis_op(op)
 
 
 async def _consume_code_jti(jti: str) -> bool:
@@ -742,7 +776,7 @@ async def oauth_link(
 # ── token endpoint ───────────────────────────────────────────────────────
 
 
-def _token_response(user_id: str, client_id: str) -> JSONResponse:
+def _token_response(user_id: str, client_id: str, family: str | None = None) -> JSONResponse:
     access = issue_user_token(
         user_id, _secret(), settings.oauth_access_ttl, typ="access"
     )
@@ -753,6 +787,9 @@ def _token_response(user_id: str, client_id: str) -> JSONResponse:
             "typ": "refresh",
             "user_id": user_id,
             "client_id": client_id,
+            # ``fam`` ties every rotation of one grant together so reuse of any
+            # old token can revoke the whole chain.
+            "fam": family or secrets.token_urlsafe(12),
             "jti": secrets.token_urlsafe(16),
             "exp": int(time.time()) + settings.oauth_refresh_ttl,
         },
@@ -833,27 +870,37 @@ async def token(
         user_id = claims.get("user_id")
         if not isinstance(user_id, str) or not user_id:
             return _token_error("invalid_grant", "refresh_token missing user")
-        # Refresh tokens minted before rotation shipped carry no jti/client_id.
-        # They cannot be made single-use or bound, so they are refused and the
-        # user reconnects once.
+        # Refresh tokens minted before rotation/families shipped carry no
+        # jti/client_id/fam. They cannot be made single-use or revoked, so they
+        # are refused and the user reconnects once.
         jti = claims.get("jti")
+        fam = claims.get("fam")
         bound_client = claims.get("client_id")
-        if not isinstance(jti, str) or not jti or not isinstance(bound_client, str) or not bound_client:
+        if not all(isinstance(v, str) and v for v in (jti, fam, bound_client)):
             return _token_error("invalid_grant", "refresh_token is invalid or expired")
         # Checked before consuming so a wrong client cannot burn the real
-        # client's token.
-        if not client_id or not secrets.compare_digest(bound_client, client_id):
+        # client's token. Compare bytes: compare_digest rejects non-ASCII str.
+        if not client_id or not secrets.compare_digest(
+            bound_client.encode("utf-8"), client_id.encode("utf-8")
+        ):
             return _token_error("invalid_grant", "client mismatch")
         remaining = int(claims.get("exp", 0)) - int(time.time())
         try:
+            if await _family_revoked(fam):
+                return _token_error("invalid_grant", "refresh_token is invalid or expired")
             first_use = await _consume_refresh_jti(jti, remaining)
         except _ReplayGuardUnavailable:
             return _guard_unavailable()
         if not first_use:
-            # Already redeemed: a replay of a rotated token. Rejected; the
-            # newer token in the chain is left alone (no family revocation).
-            logger.warning("OAuth refresh token reuse rejected (user=%s)", user_id)
+            # A rotated token was replayed: someone holds a copy. Revoke the
+            # whole family so the successor (possibly held by the thief) dies
+            # too; the legitimate client reconnects.
+            logger.warning("OAuth refresh token reuse: revoking family (user=%s)", user_id)
+            try:
+                await _revoke_family(fam, settings.oauth_refresh_ttl)
+            except _ReplayGuardUnavailable:
+                return _guard_unavailable()
             return _token_error("invalid_grant", "refresh_token already used")
-        return _token_response(user_id, client_id)
+        return _token_response(user_id, client_id, family=fam)
 
     return _token_error("unsupported_grant_type", f"grant_type '{grant_type}' not supported")
