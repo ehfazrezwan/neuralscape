@@ -539,6 +539,33 @@ class TaskManager:
         await self._track_task(requester_user_id or user_id, task_id)
         return task_id
 
+    async def enqueue_graph_jobs(self, jobs: list[dict]) -> dict:
+        """Enqueue a list of graph re-ingest jobs (the ``graph_job`` shape).
+
+        Used for the sibling re-enrichment a delete/edit produces. Never
+        raises: a delete must succeed even when the queue is unavailable, so
+        failures are returned instead — ``graph_jobs_enqueued`` and
+        ``graph_jobs_not_enqueued_ids`` (memory ids whose re-ingest did NOT
+        get queued, so the caller can report them). A connection-level
+        failure short-circuits the remainder (no point timing out N times).
+        """
+        enqueued = 0
+        not_enqueued: list[str] = []
+        for i, job in enumerate(jobs or []):
+            try:
+                await self.enqueue_graph_enrichment(**job)
+                enqueued += 1
+            except Exception as e:
+                logger.warning(
+                    "Graph re-enrichment enqueue failed for %s (non-critical): %s",
+                    job.get("memory_id"), e,
+                )
+                not_enqueued.append(job.get("memory_id"))
+                if isinstance(e, OSError) or "Connection" in type(e).__name__ or "Timeout" in type(e).__name__:
+                    not_enqueued.extend(j.get("memory_id") for j in jobs[i + 1:])
+                    break
+        return {"graph_jobs_enqueued": enqueued, "graph_jobs_not_enqueued_ids": not_enqueued}
+
     def _candidate_queues(self, *, include_graph: bool = False) -> list[str]:
         """Queues a poll-able job could live on, de-duplicated.
 

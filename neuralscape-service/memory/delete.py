@@ -5,6 +5,7 @@ code is verbatim — behavior unchanged.
 """
 
 import logging
+import uuid
 
 from datetime import datetime, timezone
 from config import settings
@@ -14,6 +15,15 @@ from memory.junk import _deleted_msg
 from memory.ranking import _times_derived_from_metadata
 
 logger = logging.getLogger(__name__)
+
+
+def _is_valid_point_id(memory_id: str) -> bool:
+    """True for a well-formed Qdrant point id (UUID string or unsigned int)."""
+    try:
+        uuid.UUID(str(memory_id))
+        return True
+    except (ValueError, AttributeError, TypeError):
+        return str(memory_id).isdigit()
 
 
 def _dedup_meta(payload: dict) -> tuple[dict, bool]:
@@ -102,8 +112,17 @@ class DeleteMixin:
         """
         m = self._get_memory()
 
-        # First, get the memory content to find related graph edges
-        mem = m.get(memory_id)
+        # First, get the memory content to find related graph edges. A
+        # malformed id cannot name a stored point (Qdrant ids are UUIDs or
+        # unsigned ints) and makes the store raise a 400-class error — that
+        # is "not found", not a server fault (the route maps LookupError to
+        # 404). A well-formed id whose lookup fails still propagates.
+        try:
+            mem = m.get(memory_id)
+        except Exception:
+            if not _is_valid_point_id(memory_id):
+                raise LookupError(f"Memory {memory_id} not found") from None
+            raise
 
         # Permission gate: enforce ownership/visibility rules when caller_user_id
         # is provided (backward-compatible: None skips the gate, existing tests).
@@ -149,9 +168,18 @@ class DeleteMixin:
         # is unchanged).
         if mem and self._graphiti and self._bridge:
             try:
-                cascade_result = self._cascade_or_fallback_expire(mem, memory_id=memory_id)
+                batch = self._cascade_rows_once(
+                    [{"id": memory_id, "mem": mem, "group_id": None}],
+                    deleted_ids={memory_id},
+                )
+                cascade_result = batch["results"].get(memory_id) or {}
                 if isinstance(result, dict):
                     result["graph_cascade"] = "resolved" if cascade_result.get("resolved") else "unresolved"
+                    # Sibling facts that shared this memory's graph episode lost
+                    # it (the episode body holds the deleted fact verbatim, so
+                    # it must go); the caller enqueues these single-fact
+                    # re-ingests so the survivors regain graph evidence.
+                    result.update(self._graph_repair_summary(batch))
                 if not cascade_result.get("resolved"):
                     logger.warning(
                         "delete_memory(%s): graph episode could not be "
@@ -165,6 +193,19 @@ class DeleteMixin:
                     result["graph_cascade"] = "error"
 
         return result
+
+    @staticmethod
+    def _graph_repair_summary(batch: dict) -> dict:
+        """Additive response keys describing the sibling re-enrichment work a
+        cascade produced (jobs for the caller to enqueue + what could not be
+        repaired). Always the same four keys so clients can rely on them."""
+        jobs = batch.get("graph_jobs") or []
+        return {
+            "graph_jobs": jobs,
+            "graph_jobs_count": len(jobs),
+            "graph_sibling_unrepaired_ids": list(batch.get("sibling_unrepaired_ids") or []),
+            "graph_sibling_repair_failed": bool(batch.get("sibling_repair_failed")),
+        }
 
     def delete_memories(
         self,
@@ -223,9 +264,9 @@ class DeleteMixin:
             deleted_count = 0
             skipped_shared = 0
             skipped_standard = 0
-            # Zero-effect detection: never silently absorb a row whose graph
-            # episode couldn't be resolved/verified — count and report it.
-            unresolved_ids: list[str] = []
+            # Rows whose vector delete succeeded; the graph cascade runs once
+            # per distinct episode over all of them afterwards.
+            cascade_rows: list[dict] = []
             for mem_info in memories_to_delete:
                 meta = mem_info.get("metadata", {}) or {}
                 if isinstance(meta.get("metadata"), dict):
@@ -239,23 +280,18 @@ class DeleteMixin:
                 mid = mem_info["id"]
                 try:
                     m.vector_store.delete(mid)
-                    if self._graphiti and self._bridge:
-                        cascade_result = self._cascade_or_fallback_expire(
-                            {"memory": mem_info.get("data", ""), "metadata": meta},
-                            memory_id=mid,
-                        )
-                        if not cascade_result.get("resolved"):
-                            logger.warning(
-                                "Bulk delete (null-category) for memory=%s could "
-                                "not resolve/verify graph cleanup", mid,
-                            )
-                            unresolved_ids.append(mid)
+                    cascade_rows.append({
+                        "id": mid,
+                        "mem": {"memory": mem_info.get("data", ""), "metadata": meta},
+                        "group_id": None,
+                    })
                     deleted_count += 1
                 except Exception as e:
                     logger.warning(f"Failed to delete null-category memory {mid}: {e}")
+            graph = self._bulk_graph_cleanup(cascade_rows, "null-category")
             return {
                 "message": _deleted_msg("null-category memories", deleted_count, skipped_shared, skipped_standard),
-                "graph_cascade_unresolved_ids": unresolved_ids,
+                **graph,
             }
 
         # For filtered deletes, we need to list then delete individually
@@ -269,7 +305,7 @@ class DeleteMixin:
         deleted_count = 0
         skipped_shared = 0
         skipped_standard = 0
-        unresolved_ids: list[str] = []
+        cascade_rows = []
         for mem in memories:
             if not include_shared and getattr(mem, "visibility", None) == MemoryVisibility.SHARED.value:
                 skipped_shared += 1
@@ -281,21 +317,55 @@ class DeleteMixin:
                 # Get full memory for graph cleanup before deleting
                 full_mem = m.get(mem.id)
                 m.delete(mem.id)
-                if full_mem and self._graphiti and self._bridge:
-                    cascade_result = self._cascade_or_fallback_expire(full_mem, memory_id=mem.id)
-                    if not cascade_result.get("resolved"):
-                        logger.warning(
-                            "Bulk delete for memory=%s could not resolve/verify "
-                            "graph cleanup", mem.id,
-                        )
-                        unresolved_ids.append(mem.id)
+                if full_mem:
+                    cascade_rows.append({"id": mem.id, "mem": full_mem, "group_id": None})
                 deleted_count += 1
             except Exception as e:
                 logger.warning(f"Failed to delete memory {mem.id}: {e}")
 
+        graph = self._bulk_graph_cleanup(cascade_rows, "filtered")
         return {
             "message": _deleted_msg("memories", deleted_count, skipped_shared, skipped_standard),
-            "graph_cascade_unresolved_ids": unresolved_ids,
+            **graph,
+        }
+
+    def _bulk_graph_cleanup(
+        self,
+        rows: list[dict],
+        label: str,
+        *,
+        deleted_ids=None,
+        repair_siblings: bool = True,
+    ) -> dict:
+        """Graph half of a bulk delete over rows whose vectors are gone.
+
+        One cascade per distinct episode (``_cascade_rows_once``); siblings
+        that survive the delete get their stale episode ref cleared and a
+        re-enrichment job. Returns the bulk response keys
+        (``graph_cascade_unresolved_ids`` + the sibling-repair summary). A
+        row with an unresolved episode is reported, never silently absorbed.
+        """
+        empty = {
+            "graph_cascade_unresolved_ids": [],
+            "graph_jobs": [],
+            "graph_jobs_count": 0,
+            "graph_sibling_unrepaired_ids": [],
+            "graph_sibling_repair_failed": False,
+        }
+        if not rows or not (self._graphiti and self._bridge):
+            return empty
+        done = {r["id"] for r in rows} if deleted_ids is None else set(deleted_ids)
+        batch = self._cascade_rows_once(rows, deleted_ids=done)
+        if not repair_siblings:
+            batch = dict(batch, graph_jobs=[], sibling_unrepaired_ids=[])
+        for mid in batch["unresolved_ids"]:
+            logger.warning(
+                "Bulk delete (%s) for memory=%s could not resolve/verify graph cleanup",
+                label, mid,
+            )
+        return {
+            "graph_cascade_unresolved_ids": list(batch["unresolved_ids"]),
+            **self._graph_repair_summary(batch),
         }
 
     def _delete_private_only(self, user_id: str) -> dict:
@@ -348,48 +418,52 @@ class DeleteMixin:
                 )
             )
 
-        # Cheap backstop: bulk-expire every edge in the private groups.
+        # Cheap backstop: bulk-expire every edge in the private groups
+        # (ONE Cypher statement per call, not a per-edge write loop).
         if self._graphiti and self._bridge and private_groups:
             try:
                 self._expire_graph_edges_for_groups(sorted(private_groups))
             except Exception as e:
                 logger.warning(f"Graph cleanup for private groups failed: {e}")
 
-        # Provenance-exact per-row cascade (episodes + node summaries) —
-        # bounded to the rows just scrolled, never an unbounded search
-        # (NS issue #176).
-        unresolved_ids: list[str] = []
-        if self._graphiti and self._bridge:
-            for mid, payload, metadata in private_rows:
-                try:
-                    cascade_result = self._cascade_or_fallback_expire(
-                        {"memory": payload.get("data", ""), "metadata": metadata},
-                        memory_id=mid,
-                    )
-                    if not cascade_result.get("resolved"):
-                        logger.warning(
-                            "Private-only bulk delete for memory=%s could not "
-                            "resolve/verify graph cleanup", mid,
-                        )
-                        unresolved_ids.append(mid)
-                except Exception as e:
-                    logger.warning(f"Per-private-memory graph cascade failed for {mid} (non-critical): {e}")
-                    unresolved_ids.append(mid)
-
+        # Vectors FIRST (NS issue #176): the store must never be left
+        # partially deleted by a slow/failed graph step — an interrupted or
+        # crashing graph cascade used to strand the remaining rows as
+        # half-deleted points. Once every vector is gone the graph work is
+        # best-effort and fully reportable.
         deleted = 0
+        deleted_ids: set[str] = set()
         for mid, payload, _ in private_rows:
             try:
                 self._memory.vector_store.delete(mid)
                 deleted += 1
+                deleted_ids.add(mid)
             except Exception as e:
                 logger.warning(f"Failed to delete private memory {mid}: {e}")
+
+        # Provenance-exact cascade (episodes + node summaries), ONCE per
+        # distinct episode and bounded to the rows just scrolled — never an
+        # unbounded search (NS issue #176). A row whose vector delete failed
+        # is still live: it is repaired as a sibling, not treated as deleted.
+        graph = self._bulk_graph_cleanup(
+            [
+                {
+                    "id": mid,
+                    "mem": {"memory": payload.get("data", ""), "metadata": metadata},
+                    "group_id": None,
+                }
+                for mid, payload, metadata in private_rows
+            ],
+            "private-only",
+            deleted_ids=deleted_ids,
+        )
 
         msg = f"Deleted {deleted} private memories"
         if shared_preserved:
             msg += f" (preserved {shared_preserved} shared)"
         if standard_preserved:
             msg += f" (preserved {standard_preserved} standard)"
-        return {"message": msg, "graph_cascade_unresolved_ids": unresolved_ids}
+        return {"message": msg, **graph}
 
     def _expire_graph_edges_for_memory(self, mem: dict) -> None:
         """Soft-delete graph edges related to a memory by setting expired_at."""
@@ -491,38 +565,57 @@ class DeleteMixin:
 
         if private_groups:
             self._expire_graph_edges_for_groups(sorted(private_groups))
-        unresolved_ids: list[str] = []
-        for mem in private_memories + shared_memories:
-            mid = mem.get("id", "")
-            try:
-                cascade_result = self._cascade_or_fallback_expire(mem, memory_id=mid)
-                if not cascade_result.get("resolved"):
-                    logger.warning(
-                        "Nuke-all delete for user=%s memory=%s could not "
-                        "resolve/verify graph cleanup", user_id, mid,
-                    )
-                    unresolved_ids.append(mid)
-            except Exception as e:
-                logger.warning(f"Per-memory edge expiration failed (non-critical): {e}")
-                unresolved_ids.append(mid)
-        return unresolved_ids
-
-    def _expire_graph_edges_for_groups(self, group_ids: list[str]) -> None:
-        """Expire all graph edges in the given groups (bulk soft-delete)."""
-        try:
-            from graphiti_core.edges import EntityEdge
-
-            edges = self._run_on_bridge(
-                EntityEdge.get_by_group_ids(
-                    self._graphiti.driver, group_ids=group_ids, limit=1000
-                )
+        # Every row of this user is being deleted (delete_all follows), so
+        # there are no surviving siblings to repair — only dedupe the cascade
+        # to once per distinct episode.
+        rows = [
+            {"id": mem.get("id", ""), "mem": mem, "group_id": None}
+            for mem in private_memories + shared_memories
+        ]
+        batch = self._cascade_rows_once(
+            rows, deleted_ids={r["id"] for r in rows}
+        )
+        for mid in batch["unresolved_ids"]:
+            logger.warning(
+                "Nuke-all delete for user=%s memory=%s could not "
+                "resolve/verify graph cleanup", user_id, mid,
             )
-            now = datetime.now(timezone.utc)
-            for edge in edges:
-                edge.expired_at = now
-                self._run_on_bridge(edge.save(self._graphiti.driver))
+        return list(batch["unresolved_ids"])
+
+    def _expire_graph_edges_for_groups(self, group_ids: list[str]) -> int:
+        """Expire every live edge in the given groups (bulk soft-delete).
+
+        ONE Cypher statement (one round trip) regardless of how many edges
+        the groups hold. The previous implementation fetched at most 1000
+        edges and issued one serial ``edge.save()`` write per edge — O(N)
+        blocking round trips inside the synchronous delete request for a
+        large user (NS issue #176), and it silently left every edge past the
+        1000th live. Returns the number of edges expired (0 on failure —
+        non-critical, logged).
+        """
+        if not group_ids:
+            return 0
+        cypher = """
+        MATCH ()-[r:RELATES_TO]->()
+        WHERE r.group_id IN $group_ids AND r.expired_at IS NULL
+        SET r.expired_at = datetime($now)
+        RETURN count(r) AS edges_expired
+        """
+        now_iso = datetime.now(timezone.utc).isoformat()
+
+        async def _run():
+            async with self._graphiti.driver.session() as session:
+                result = await session.run(cypher, group_ids=list(group_ids), now=now_iso)
+                return await result.data()
+
+        coro = _run()
+        try:
+            records = self._run_on_bridge(coro, timeout=60.0) or []
         except Exception as e:
+            coro.close()
             logger.warning(f"Bulk graph edge expiration failed (non-critical): {e}")
+            return 0
+        return int(records[0]["edges_expired"]) if records else 0
 
     # ──────────────────────────────────────────────
     # Dedup operations

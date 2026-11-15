@@ -81,7 +81,10 @@ class EditMixin:
 
             {"memory": MemoryResponse, "graph_job": dict | None,
              "graph": "unchanged" | "reingest_pending" | "migration_pending"
-                      | "migration_incomplete"}
+                      | "migration_incomplete",
+             "sibling_graph_jobs": list[dict],
+             "sibling_graph_unrepaired_ids": list[str],
+             "sibling_graph_repair_failed": bool}
 
         The caller is responsible for enqueuing ``graph_job`` on the graph
         queue — Graphiti work is minutes-slow and must never run inline on a
@@ -190,6 +193,9 @@ class EditMixin:
 
         graph_job = None
         graph_status = "unchanged"
+        sibling_jobs: list[dict] = []
+        sibling_unrepaired: list[str] = []
+        sibling_repair_failed = False
         if new_group != old_group:
             # Partition migration: expire the memory's episode/edges in the
             # OLD group (episode-precise cascade first, substring fallback
@@ -207,11 +213,23 @@ class EditMixin:
             graph_available = bool(self._graphiti and self._bridge)
             cascade_result: dict = {"resolved": False}
             try:
-                cascade_result = self._cascade_or_fallback_expire(
-                    {"memory": payload.get("data", ""), "metadata": meta, "user_id": owner},
-                    group_id=old_group,
-                    memory_id=memory_id,
+                # The moved row may share a conversation episode with sibling
+                # facts. The whole episode is expired (its body holds the moved
+                # fact verbatim) — the siblings are repaired: stale ref cleared
+                # and a single-fact re-ingest job returned for the caller to
+                # enqueue. The moved row is re-ingested via ``graph_job`` below.
+                batch = self._cascade_rows_once(
+                    [{
+                        "id": memory_id,
+                        "mem": {"memory": payload.get("data", ""), "metadata": meta, "user_id": owner},
+                        "group_id": old_group,
+                    }],
+                    skip_job_ids={memory_id},
                 )
+                cascade_result = batch["results"].get(memory_id) or cascade_result
+                sibling_jobs = batch["graph_jobs"]
+                sibling_unrepaired = batch["sibling_unrepaired_ids"]
+                sibling_repair_failed = batch["sibling_repair_failed"]
             except Exception as e:
                 logger.warning(f"Graph edge expiration failed for {memory_id} (non-critical): {e}")
             if graph_available and not cascade_result.get("resolved"):
@@ -243,7 +261,16 @@ class EditMixin:
             fields=sorted(changes.keys()),
             graph=graph_status,
         )
-        return {"memory": self.get_memory(memory_id), "graph_job": graph_job, "graph": graph_status}
+        return {
+            "memory": self.get_memory(memory_id),
+            "graph_job": graph_job,
+            "graph": graph_status,
+            # Additive: re-ingest jobs for sibling facts that shared the moved
+            # row's (now expired) conversation episode. Empty for single-fact rows.
+            "sibling_graph_jobs": sibling_jobs,
+            "sibling_graph_unrepaired_ids": sibling_unrepaired,
+            "sibling_graph_repair_failed": sibling_repair_failed,
+        }
 
     def retag_memories(
         self,
