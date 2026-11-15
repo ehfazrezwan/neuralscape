@@ -273,8 +273,12 @@ class CoreMixin:
         ("metadata.dream_tombstoned", "bool"),
         ("metadata.visibility", "keyword"),
         ("metadata.scope", "keyword"),
-        # Graph-contradiction supersession maps edge episodes -> rows.
+        # Shared-episode sibling lookup (memory/provenance.py) and
+        # graph-contradiction supersession (memory/supersession.py, edge
+        # episode -> row): both scroll on these; unindexed they scan the
+        # collection each time.
         ("metadata.graph_episode_uuid", "keyword"),
+        ("metadata.graph_episode_name", "keyword"),
     )
 
     def _ensure_filter_indexes(self) -> None:

@@ -14,27 +14,11 @@ from main import app
 
 
 @pytest.fixture(autouse=True)
-def mock_memory():
-    """Patch the lazy-init globals so no real mem0/Graphiti is created."""
-    mock_mem = MagicMock(name="Memory")
-    mock_graphiti = MagicMock(name="Graphiti")
-    mock_bridge = MagicMock(name="AsyncBridge")
-
-    original_memory = main._memory
-    original_graphiti = main._graphiti
-    original_bridge = main._bridge
+def isolate_lazy_async_memory():
+    """Keep the lazy AsyncMemory handle from being built by any test."""
     original_async_memory = main._async_memory
-
-    main._memory = mock_mem
-    main._graphiti = mock_graphiti
-    main._bridge = mock_bridge
     main._async_memory = None
-
-    yield mock_mem
-
-    main._memory = original_memory
-    main._graphiti = original_graphiti
-    main._bridge = original_bridge
+    yield
     main._async_memory = original_async_memory
 
 
@@ -96,8 +80,14 @@ class TestHealthEndpoint:
 
 
 class TestAddMemorySync:
-    def test_returns_result(self, client, mock_memory):
-        mock_memory.add.return_value = {"results": [{"memory": "test", "event": "ADD"}]}
+    """Legacy POST /memories goes through MemoryService (no mem0 Memory.add)."""
+
+    def test_returns_result(self, client, mock_service):
+        from schemas import MemoryResponse
+
+        mock_service.extract_and_store.return_value = [
+            MemoryResponse(id="m1", memory="works at Acme")
+        ]
         resp = client.post("/memories", json={
             "messages": [{"role": "user", "content": "I work at Acme"}],
             "user_id": "test_user",
@@ -105,28 +95,28 @@ class TestAddMemorySync:
         assert resp.status_code == 200
         data = resp.json()
         assert data["status"] == "ok"
-        assert "result" in data
+        assert data["result"]["memories"][0]["id"] == "m1"
 
-    def test_calls_memory_add(self, client, mock_memory):
-        mock_memory.add.return_value = {}
+    def test_calls_service_extract_and_store(self, client, mock_service):
+        mock_service.extract_and_store.return_value = []
         client.post("/memories", json={
             "messages": [{"role": "user", "content": "hello"}],
             "user_id": "u1",
         })
-        mock_memory.add.assert_called_once()
-        call_kwargs = mock_memory.add.call_args[1]
+        mock_service.extract_and_store.assert_called_once()
+        call_kwargs = mock_service.extract_and_store.call_args[1]
         assert call_kwargs["user_id"] == "u1"
 
-    def test_uses_default_user_id(self, client, mock_memory):
-        mock_memory.add.return_value = {}
+    def test_uses_default_user_id(self, client, mock_service):
+        mock_service.extract_and_store.return_value = []
         client.post("/memories", json={
             "messages": [{"role": "user", "content": "hello"}],
         })
-        call_kwargs = mock_memory.add.call_args[1]
+        call_kwargs = mock_service.extract_and_store.call_args[1]
         assert call_kwargs["user_id"] == "default_user"
 
-    def test_returns_500_on_exception(self, client, mock_memory):
-        mock_memory.add.side_effect = Exception("LLM error")
+    def test_returns_500_on_exception(self, client, mock_service):
+        mock_service.extract_and_store.side_effect = Exception("LLM error")
         resp = client.post("/memories", json={
             "messages": [{"role": "user", "content": "hello"}],
         })
@@ -139,8 +129,12 @@ class TestAddMemorySync:
 
 
 class TestSearchEndpoint:
-    def test_returns_results(self, client, mock_memory):
-        mock_memory.search.return_value = [{"memory": "works at Acme", "score": 0.9}]
+    def test_returns_results(self, client, mock_service):
+        from schemas import MemoryResponse
+
+        mock_service.search.return_value = [
+            MemoryResponse(id="m1", memory="works at Acme", score=0.9)
+        ]
         resp = client.post("/search", json={
             "query": "Where do I work?",
             "user_id": "u1",
@@ -148,7 +142,9 @@ class TestSearchEndpoint:
         assert resp.status_code == 200
         data = resp.json()
         assert data["status"] == "ok"
-        assert "results" in data
+        assert data["results"][0]["memory"] == "works at Acme"
+        kwargs = mock_service.search.call_args.kwargs
+        assert kwargs["user_id"] == "u1" and kwargs["limit"] == 10
 
 
 # ──────────────────────────────────────────────
@@ -157,8 +153,13 @@ class TestSearchEndpoint:
 
 
 class TestListMemoriesEndpoint:
-    def test_returns_memories(self, client, mock_memory):
-        mock_memory.get_all.return_value = [{"memory": "fact1"}, {"memory": "fact2"}]
+    def test_returns_memories(self, client, mock_service):
+        from schemas import MemoryResponse
+
+        mock_service.list_memories.return_value = [
+            MemoryResponse(id="m1", memory="fact1"),
+            MemoryResponse(id="m2", memory="fact2"),
+        ]
         resp = client.get("/memories", params={"user_id": "u1"})
         assert resp.status_code == 200
         data = resp.json()
@@ -173,13 +174,17 @@ class TestListMemoriesEndpoint:
 
 
 class TestDeleteMemoriesEndpoint:
-    def test_calls_delete_all(self, client, mock_memory):
+    def test_calls_service_delete(self, client, mock_service):
+        mock_service.delete_memories.return_value = {
+            "message": "All private memories deleted",
+            "graph_cascade_unresolved_ids": [],
+        }
         resp = client.delete("/memories", params={"user_id": "u1"})
         assert resp.status_code == 200
         data = resp.json()
         assert data["status"] == "ok"
         assert "deleted" in data["message"].lower()
-        mock_memory.delete_all.assert_called_once()
+        mock_service.delete_memories.assert_called_once_with(user_id="u1")
 
 
 # ──────────────────────────────────────────────

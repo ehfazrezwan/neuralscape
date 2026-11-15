@@ -404,16 +404,10 @@ class TestExtensionsEndpoint:
         """Patch main module globals to avoid real service initialization."""
         import main
 
-        original_memory = main._memory
-        original_graphiti = main._graphiti
-        original_bridge = main._bridge
         original_service = main._service
         original_tm = main._task_manager
         original_registry = main._extension_registry
 
-        main._memory = MagicMock()
-        main._graphiti = MagicMock()
-        main._bridge = MagicMock()
         main._service = MagicMock()
         mock_tm = MagicMock()
         mock_tm.connect = AsyncMock()
@@ -423,9 +417,6 @@ class TestExtensionsEndpoint:
 
         yield
 
-        main._memory = original_memory
-        main._graphiti = original_graphiti
-        main._bridge = original_bridge
         main._service = original_service
         main._task_manager = original_tm
         main._extension_registry = original_registry
