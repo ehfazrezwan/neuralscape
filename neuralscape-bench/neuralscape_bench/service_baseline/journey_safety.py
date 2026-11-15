@@ -7,6 +7,7 @@ a Docker daemon.
 
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Callable, Iterable
 from typing import Any
 
@@ -143,32 +144,56 @@ def preflight(run: Run, project: str, sentinel: str) -> None:
             f"`down -v`: {', '.join(sorted(existing))}")
 
 
+def summarize_foreign(names: Iterable[str]) -> dict[str, Any]:
+    """A count and a SHA-256 digest of a sorted set of names that are not the project's own.
+
+    A change in the set changes the digest, so it stays detectable without the record naming
+    anything that belongs to someone else.
+    """
+
+    ordered = sorted(set(names))
+    return {"count": len(ordered), "sha256": hashlib.sha256("\n".join(ordered).encode()).hexdigest()}
+
+
 def uninstall_report(before: Iterable[str], mid: Iterable[str], after: Iterable[str], project: str,
                      sentinel: str, mounted: Iterable[str]) -> dict[str, Any]:
-    """Describe what `down -v` removed against the volumes that existed beforehand."""
+    """Describe what `down -v` removed against the volumes that existed beforehand.
+
+    The project's own volumes (named after it or mounted by its containers) and the sentinel are
+    reported by name. Every other volume is reported only as a count and a digest.
+    """
 
     require_disposable_volume(sentinel, project)
     before, mid, after, mounted = set(before), set(mid), set(after), set(mounted)
     removed = mid - after
-    own = {v for v in mid if v.startswith(project + "_")}
+
+    def own_name(v: str) -> bool:
+        return v.startswith(project + "_")
+
+    def foreign(volumes: set[str]) -> set[str]:
+        return {v for v in volumes if not own_name(v) and v not in mounted and v != sentinel}
+
     # Volumes that are neither the project's nor mounted by its containers, measured over the
     # window of the removal itself (other work on a shared host can also add or drop volumes
     # earlier, which is reported separately and cannot be attributed to this run).
-    unrelated = mid - own - mounted
+    unrelated = mid - {v for v in mid if own_name(v)} - mounted
     return {
-        "project_volumes_before_down": sorted(own),
-        "project_volumes_after_down": sorted(v for v in after if v.startswith(project + "_")),
+        "project_volumes_before_down": sorted(v for v in mid if own_name(v)),
+        "project_volumes_after_down": sorted(v for v in after if own_name(v)),
         "unrelated_volumes_untouched": unrelated <= after,
-        "unrelated_volumes_missing_after": sorted(unrelated - after),
+        "unrelated_volumes_missing_after": summarize_foreign(unrelated - after),
         "sentinel_present": sentinel in after,
-        "removed_volumes_not_project_named": sorted(v for v in removed if not v.startswith(project + "_")),
-        "removed_volumes_not_project_named_and_not_mounted_by_project": sorted(
-            v for v in removed if not v.startswith(project + "_") and v not in mounted),
-        "vanished_since_start_not_ours": sorted(v for v in before - after if v not in mounted and not v.startswith(project + "_")),
+        "removed_volumes_not_project_named": sorted(v for v in removed if not own_name(v) and v in mounted),
+        "removed_volumes_not_project_named_and_not_mounted_by_project": summarize_foreign(
+            v for v in removed if not own_name(v) and v not in mounted),
+        "vanished_since_start_not_ours": summarize_foreign(foreign(before - after)),
+        "foreign_volumes_before": summarize_foreign(foreign(before)),
+        "foreign_volumes_at_removal": summarize_foreign(foreign(mid)),
+        "foreign_volumes_after": summarize_foreign(foreign(after)),
     }
 
 
 def uninstall_is_safe(report: dict[str, Any]) -> bool:
     return bool(report["unrelated_volumes_untouched"] and report["sentinel_present"]
                 and not report["project_volumes_after_down"]
-                and not report["removed_volumes_not_project_named_and_not_mounted_by_project"])
+                and not report["removed_volumes_not_project_named_and_not_mounted_by_project"]["count"])

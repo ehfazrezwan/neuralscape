@@ -45,6 +45,9 @@ capacity, and proposes no budgets.
   only the run's compose project, found by its compose label; stats is never run without ids.
   The run-selection rule still notices other containers on the host, but only a count is
   recorded: no name, stats or inspect output of a foreign container is kept.
+- **Foreign volumes.** The journey's uninstall check still lists every volume to detect changes, but the
+  record names only the project's own volumes. Volumes of anyone else appear as a count and a
+  SHA-256 digest of the sorted set (before, at removal, after), so a change is detectable.
 - **Loopback only.** The stack files publish no host ports. Before a run the runner (and the
   journey) scan the compose file and any override and refuse anything that publishes beyond
   `127.0.0.1`/`[::1]`, uses host networking, runs privileged or mounts the Docker socket.

@@ -340,3 +340,50 @@ def test_help_and_a_bad_command_line_start_nothing(monkeypatch, no_docker, argv,
         journey.main()
     assert bad.value.code == 2
     assert no_docker == []
+
+
+def test_the_journey_record_holds_no_foreign_volume_name_and_still_flags_a_change(monkeypatch, tmp_path):
+    import json
+    import shutil
+    from types import SimpleNamespace
+
+    journey = load_script("journey", monkeypatch)
+    project, sentinel = journey.PROJECT, journey.SENTINEL
+    foreign_names = ["acme-secret-db", "other-team-cache"]
+    listings = iter([
+        [*foreign_names, sentinel, project + "_state"],   # before / at removal (down -v is stubbed)
+        [foreign_names[0], sentinel],                     # after: the project's volume is gone and one foreign volume vanished
+    ])
+    current: list[list[str]] = [next(listings)]
+
+    def fake_run(*args, **kwargs):
+        if args[:3] == ("docker", "volume", "ls"):
+            return SimpleNamespace(stdout="\n".join(current[0]), stderr="", returncode=0)
+        if args[:2] == ("docker", "compose") and "down" in args:
+            current[0] = next(listings)
+        return SimpleNamespace(stdout="", stderr="", returncode=0)
+
+    monkeypatch.setattr(journey, "run", fake_run)
+    walker = journey.Journey("old", "new", str(tmp_path / "out.json"))
+    try:
+        before = walker.volumes()
+        journey.uninstall(walker, before)
+        record = json.dumps(walker.steps)
+    finally:
+        shutil.rmtree(walker.scratch, ignore_errors=True)
+    check = next(step for step in walker.steps if step["step"] == "uninstall check")
+    assert check["safe"] is False  # a foreign volume vanished during the removal window: flagged
+    assert check["unrelated_volumes_missing_after"]["count"] == 1
+    assert not any(name in record for name in foreign_names)
+    assert project + "_state" in record  # the project's own volume stays named
+    assert check["foreign_volumes_before"]["count"] == 2
+    assert check["foreign_volumes_before"]["sha256"] != check["foreign_volumes_after"]["sha256"]
+
+    # a changed foreign set changes the digest and is flagged
+    mid = [*foreign_names, sentinel]
+    changed = journey_safety.uninstall_report(mid, mid, [foreign_names[0], sentinel], project, sentinel, mounted=[])
+    same = journey_safety.uninstall_report(mid, mid, mid, project, sentinel, mounted=[])
+    assert changed["foreign_volumes_after"] != changed["foreign_volumes_before"]
+    assert same["foreign_volumes_after"] == same["foreign_volumes_before"]
+    assert changed["unrelated_volumes_untouched"] is False and not journey_safety.uninstall_is_safe(changed)
+    assert not any(name in json.dumps(changed) for name in foreign_names)
