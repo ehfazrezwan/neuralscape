@@ -92,6 +92,7 @@ def test_the_runner_takes_the_project_as_a_parameter_with_the_allowlist(monkeypa
         raise Reached
 
     monkeypatch.setattr(runner, "image_facts", stop)
+    monkeypatch.setattr(runner, "refuse_leftovers", lambda: None)  # covered by its own tests
     monkeypatch.setattr(runner, "COMPOSE_FILE", STACK / "compose.yml")
     monkeypatch.setattr(sys, "argv", [*base, "--project", "mystack-1", "--allow-project-prefix", "mystack-"])
     with pytest.raises(Reached):
@@ -387,3 +388,49 @@ def test_the_journey_record_holds_no_foreign_volume_name_and_still_flags_a_chang
     assert same["foreign_volumes_after"] == same["foreign_volumes_before"]
     assert changed["unrelated_volumes_untouched"] is False and not journey_safety.uninstall_is_safe(changed)
     assert not any(name in json.dumps(changed) for name in foreign_names)
+
+
+def _runner_argv(monkeypatch, tmp_path):
+    monkeypatch.setattr(runner, "PROJECT", runner.PROJECT)  # restored after the test
+    monkeypatch.setattr(runner, "COMPOSE_FILE", STACK / "compose.yml")
+    monkeypatch.setattr(sys, "argv", ["runner", "--image", "x", "--tree", "0" * 40, "--lock-sha256", "0" * 64,
+                                      "--label", "l", "--out-dir", str(tmp_path / "out")])
+
+
+@pytest.mark.parametrize("existing", [
+    ("docker", "ps", "-a"),            # containers of the project
+    ("docker", "volume", "ls"),        # volumes of the project
+    ("docker", "network", "ls"),       # its network
+])
+def test_the_runner_refuses_a_project_that_already_has_resources_and_never_runs_down_v(monkeypatch, tmp_path, existing):
+    _runner_argv(monkeypatch, tmp_path)
+    calls: list[tuple[str, ...]] = []
+
+    def fake_sh(*args, **kwargs):
+        calls.append(args)
+        if args[:3] == existing:
+            return {"ps": f"{runner.PROJECT}-api-1", "volume": f"{runner.PROJECT}_state", "network": f"{runner.PROJECT}_default"}[existing[1]]
+        return ""
+
+    monkeypatch.setattr(runner, "sh", fake_sh)
+    with pytest.raises(JourneySafetyError, match="earlier run"):
+        runner.main()
+    assert calls and all(c[:2] != ("docker", "compose") for c in calls)  # listings only: no up, no down -v
+    assert not (tmp_path / "out").exists()
+
+
+def test_the_runner_proceeds_when_the_project_has_no_resources(monkeypatch, tmp_path):
+    _runner_argv(monkeypatch, tmp_path)
+    calls: list[tuple[str, ...]] = []
+    monkeypatch.setattr(runner, "sh", lambda *args, **kwargs: calls.append(args) or "")
+
+    class Reached(Exception):
+        pass
+
+    def stop(image):
+        raise Reached
+
+    monkeypatch.setattr(runner, "image_facts", stop)
+    with pytest.raises(Reached):
+        runner.main()
+    assert [c for c in calls if c[:2] == ("docker", "ps")] and all(c[:2] != ("docker", "compose") for c in calls)

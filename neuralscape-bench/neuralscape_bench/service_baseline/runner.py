@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Any
 
 from neuralscape_bench.service_baseline.journey_safety import (
-    allow_prefix, require_disposable_project, require_local_only)
+    allow_prefix, preflight, require_disposable_project, require_local_only)
 from neuralscape_bench.service_baseline.redact import redact_value
 from neuralscape_bench.run_manifest import (
     BuildIdentity,
@@ -223,6 +223,17 @@ def compose_argv(*args: str, override: Path | None = None) -> list[str]:
     return ["docker", "compose", "-p", PROJECT, *files, *args]
 
 
+def refuse_leftovers() -> None:
+    """Refuse to start over a project that already has containers, volumes or networks.
+
+    The run ends with `down -v`, which would wipe a pre-existing stack of the same name.
+    """
+
+    from types import SimpleNamespace
+
+    preflight(lambda *args: SimpleNamespace(stdout=sh(*args)), PROJECT, f"{PROJECT}-sentinel")
+
+
 def compose(*args: str, env: dict[str, str]) -> str:
     return sh(*compose_argv(*args, override=COMPOSE_OVERRIDE), env=env)
 
@@ -396,6 +407,7 @@ def main() -> None:
         if stack_file is not None:
             require_local_only(stack_file.read_text(), stack_file.name)
 
+    refuse_leftovers()  # before anything is created: a run that did not start must never reach `down -v`
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     nonce = hashlib.sha256(f"{args.label}{time.time()}".encode()).hexdigest()[:10]

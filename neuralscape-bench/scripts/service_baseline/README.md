@@ -45,6 +45,9 @@ capacity, and proposes no budgets.
   only the run's compose project, found by its compose label; stats is never run without ids.
   The run-selection rule still notices other containers on the host, but only a count is
   recorded: no name, stats or inspect output of a foreign container is kept.
+- **No leftovers.** The runner, like the journey, refuses to start when the project already has
+  containers, volumes or a network it did not create, before anything is brought up, because the run
+  ends with `down -v`.
 - **Foreign volumes.** The journey's uninstall check still lists every volume to detect changes, but the
   record names only the project's own volumes. Volumes of anyone else appear as a count and a
   SHA-256 digest of the sorted set (before, at removal, after), so a change is detectable.
