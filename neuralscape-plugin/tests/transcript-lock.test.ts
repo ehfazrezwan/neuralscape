@@ -8,7 +8,7 @@ import { dirname } from "node:path";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, describe, expect, it, vi } from "vitest";
-import { probeHooks, recoverAbandoned, recoveryMutexPath, withTranscriptLock } from "../src/core/transcript-lock.js";
+import { canonicalTranscriptPath, probeHooks, recoverAbandoned, recoveryMutexPath, withTranscriptLock } from "../src/core/transcript-lock.js";
 import { flushTurns } from "../src/core/flush.js";
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -603,6 +603,12 @@ async function bundledLock(): Promise<string> {
     }, { waitMs: 20000, staleMs: 1000 });
     await appendFile(log, (result.ran ? "ran " : "skipped ") + process.pid + "\\n");
   `);
+  await writeFile(join(dir, "hold.mjs"), `
+    const { recoverAbandoned } = await import(${JSON.stringify(out)});
+    const [lock, judged] = process.argv.slice(2);
+    // a real recoverer: takes the mutex, re-reads the lock, then stalls (until it is killed)
+    await recoverAbandoned(lock, JSON.parse(judged), { afterVerify: async () => { console.log("holding"); setInterval(() => {}, 1000); await new Promise(() => {}); } });
+  `);
   return join(dir, "worker.mjs");
 }
 
@@ -699,4 +705,99 @@ describe("kill -9 of the holder (the case where the socket lock is faster)", () 
     expect(old.ran).toBe(true);
     await gone(path);
   }, 20000);
+});
+
+describe("leftovers of crashed processes, and an exhausted recovery chain", () => {
+  const captureStderr2 = async (run: () => Promise<unknown>): Promise<string> => {
+    const original = process.stderr.write.bind(process.stderr);
+    let seen = "";
+    process.stderr.write = ((chunk: string | Uint8Array) => { seen += String(chunk); return true; }) as typeof process.stderr.write;
+    try { await run(); } finally { process.stderr.write = original; }
+    return seen;
+  };
+
+  it("recovery sweeps old .tmp, .stale.* and dead recoverers' mutexes of other records, and keeps young and live ones", async () => {
+    const path = await fresh();
+    const lock = lockFile(path);
+    const judged = { pid: DEAD_PID, token: "dead", at: 1 };
+    await writeFile(lock, record(judged));
+    const old = { tmp: lock + ".deadbeef.tmp", stale: lock + ".stale.deadbeef", otherMutex: lock + ".recover.0123456789abcdef.0" };
+    for (const f of Object.values(old)) await writeFile(f, f === old.otherMutex ? record({ pid: DEAD_PID, token: "x", at: 1 }) : "x");
+    const young = lock + ".cafe.tmp";
+    const liveMutex = lock + ".recover.fedcba9876543210.0";
+    await sleep(120); // the three above are now older than the 50 ms bound
+    await writeFile(young, "x");
+    await writeFile(liveMutex, record({ token: "live", at: Date.now() - 60_000, start: undefined }));
+    expect(await recoverAbandoned(lock, judged, { sweepAgeMs: 50, mutexStaleMs: 50 })).toBe("removed");
+    for (const f of Object.values(old)) expect(existsSync(f)).toBe(false);
+    expect(existsSync(young)).toBe(true);
+    expect(existsSync(liveMutex)).toBe(true); // its recorder (this process) is alive
+  });
+
+  it("an exhausted chain of dead recoverers logs one clear line and recovers nothing", async () => {
+    const path = await fresh();
+    const lock = lockFile(path);
+    const judged = { pid: DEAD_PID, token: "dead", at: 1 };
+    await writeFile(lock, record(judged));
+    for (let g = 0; g < 16; g++) await writeFile(recoveryMutexPath(lock, judged, g), record({ pid: DEAD_PID, token: `d${g}`, at: 5 }));
+    let outcome: string | undefined;
+    const log = await captureStderr2(async () => { outcome = await recoverAbandoned(lock, judged, { mutexStaleMs: 50 }); });
+    expect(outcome).toBe("retry");
+    expect(log.match(/recovery chain is exhausted/g)).toHaveLength(1);
+    expect(JSON.parse(await readFile(lock, "utf-8")).token).toBe("dead");
+  });
+});
+
+describe("one canonical lock path per transcript", () => {
+  it("a transcript that does not exist yet, reached through a symlinked directory, gets the lock path it will have once it exists", async () => {
+    const real = await mkdtemp(join(tmpdir(), "ns-canon-"));
+    const linkDir = real + "-link";
+    await symlink(real, linkDir);
+    const viaLink = join(linkDir, "t.jsonl");
+    const before = canonicalTranscriptPath(viaLink);
+    await writeFile(join(real, "t.jsonl"), "x");
+    expect(canonicalTranscriptPath(viaLink)).toBe(before);
+    expect(canonicalTranscriptPath(join(real, "t.jsonl"))).toBe(before);
+  });
+});
+
+describe("a real recoverer holds the recovery mutex (live, then killed)", () => {
+  it("while it is alive nobody removes the lock or its mutex; once it is dead and old, eight processes recover without ever overlapping", async () => {
+    const path = await fresh();
+    const lock = lockFile(path);
+    const dir = dirname(await bundledLock());
+    const judged = { pid: DEAD_PID, token: "dead-owner", at: Date.now() - 60_000 };
+    const lockText = record(judged);
+    await writeFile(lock, lockText);
+    const holder = spawn("node", [join(dir, "hold.mjs"), lock, JSON.stringify(judged)], { stdio: ["ignore", "pipe", "inherit"] });
+    let out = "";
+    holder.stdout!.on("data", (d) => (out += d));
+    try {
+      while (!out.includes("holding")) await sleep(20);
+      const mutexes = () => readdir(dirname(path)).then((n) => n.filter((f) => f.includes(".recover.")));
+      const mutexBefore = await mutexes();
+      expect(mutexBefore).toHaveLength(1);
+      // four hooks try while the recoverer is alive: all wait, none runs, nothing is removed
+      const waiters = await Promise.all(Array.from({ length: 4 }, () => withTranscriptLock(path, async () => 1, { waitMs: 800, staleMs: 1000 })));
+      expect(waiters.every((r) => !r.ran)).toBe(true);
+      expect(await readFile(lock, "utf-8")).toBe(lockText);
+      expect(await mutexes()).toEqual(mutexBefore);
+      // the recoverer is killed mid-recovery; its mutex ages past the bound
+      holder.kill("SIGKILL");
+      await new Promise<void>((r) => holder.on("close", () => r()));
+      await sleep(10_500);
+      const worker = join(dir, "overlap.mjs");
+      const log = join(dirname(path), "events.log");
+      await writeFile(log, "");
+      const children = Array.from({ length: 8 }, () => spawn("node", [worker, path, log], { stdio: ["ignore", "ignore", "inherit"] }));
+      await Promise.all(children.map((c) => new Promise<void>((resolve) => c.on("close", () => resolve()))));
+      const events = (await readFile(log, "utf-8")).split("\n").filter((l) => /^(in|out) /.test(l));
+      expect(events).toHaveLength(16);
+      for (let i = 0; i < events.length; i += 2) expect(events[i + 1].split(" ")).toEqual(["out", events[i].split(" ")[1]]);
+      await gone(path);
+      expect(await leftovers(path)).toEqual([]);
+    } finally {
+      holder.kill("SIGKILL");
+    }
+  }, 60000);
 });

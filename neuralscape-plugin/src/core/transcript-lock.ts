@@ -42,13 +42,23 @@
  * most the one POST already past that check can overlap another hook (one turn delivered twice), and the cursor
  * is only ever written forward (see ``commitClaudeCodeFlush``).  Hooks of different Claude Code instances that
  * run in different containers but share a transcript file cannot see each other's pids.
+ *
+ * Upgrade window: the lock file sits next to the transcript's canonical path (symlinks and ``..`` resolved); versions
+ * before 2.9.5 put it next to the path as given.  While a hook of an older version is still running on a transcript
+ * that was reached through a non-canonical path, the two versions use two lock files and do not exclude each other;
+ * hooks are short-lived, so the window closes by itself.  A transcript that does not exist yet is canonicalized
+ * through its parent directory, so it gets the same lock file once it exists.
+ *
+ * Leftovers: a crash can leave a ``.tmp`` (a record being linked in), a ``.stale.*`` (a lock moved aside) or a
+ * recovery mutex of a dead recoverer.  Every recovery sweeps those that are older than the stale bound (by change
+ * time, which a rename updates) and, for mutexes, whose recorder is gone.
  */
 
 import { execFile } from "node:child_process";
 import { realpathSync } from "node:fs";
-import { link, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
+import { link, readdir, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { createHash, randomBytes } from "node:crypto";
-import { resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { logError } from "../utils.js";
 
 const LOCK_SUFFIX = ".neuralscape-lock";
@@ -214,8 +224,8 @@ async function readOwner(path: string): Promise<Read> {
 /** Create ``path`` holding ``owner`` atomically and exclusively: write a private file, then ``link`` it into place. */
 async function linkInto(path: string, owner: LockOwner): Promise<boolean> {
   const temporary = `${path}.${owner.token}.tmp`;
-  await writeFile(temporary, JSON.stringify(owner), { flag: "wx" });
   try {
+    await writeFile(temporary, JSON.stringify(owner), { flag: "wx" }); // a failed or partial write must not leave the file
     await link(temporary, path);
     return true;
   } catch (error) {
@@ -242,6 +252,8 @@ interface RecoveryHooks {
   /** Called when a mutex generation was judged abandoned, before the next generation is tried. */
   afterMutexJudged?: () => Promise<void>;
   mutexStaleMs?: number;
+  /** How old a leftover file must be (by change time) before the sweep removes it; the lock's ``staleMs``. */
+  sweepAgeMs?: number;
 }
 
 /**
@@ -276,7 +288,32 @@ async function takeMutex(
     await hooks.afterMutexJudged?.();
     generation++;
   }
+  logError(
+    `The transcript lock's recovery chain is exhausted (${MAX_MUTEX_GENERATIONS} dead recoverers or it keeps changing); ` +
+      "the abandoned lock is not recovered now. Capture skipped; the turns wait for the next flush"
+  );
   return null;
+}
+
+/** Remove leftovers of crashed processes next to the lock (see the module header).  Never touches a live file. */
+async function sweepLeftovers(path: string, ageMs: number, keepMutexPrefix: string): Promise<void> {
+  const dir = dirname(path);
+  const base = basename(path);
+  const names = await readdir(dir).catch(() => [] as string[]);
+  for (const name of names) {
+    if (!name.startsWith(base + ".")) continue;
+    const rest = name.slice(base.length + 1);
+    const full = join(dir, name);
+    const isMutex = rest.startsWith("recover.");
+    if (isMutex ? full.startsWith(keepMutexPrefix) : !(rest.endsWith(".tmp") || rest.startsWith("stale."))) continue;
+    const info = await stat(full).catch(() => null);
+    if (!info || !info.isFile() || Date.now() - info.ctimeMs <= ageMs) continue;
+    if (isMutex) {
+      const record = await readOwner(full);
+      if (typeof record !== "object" || !(await ownerGone(record, ageMs))) continue; // only a dead recoverer's
+    }
+    await unlink(full).catch(() => undefined);
+  }
 }
 
 /**
@@ -294,6 +331,7 @@ export async function recoverAbandoned(path: string, judged: LockOwner | "invali
   // garbage; until then they stay, so no later contender can take a lower generation while we work
   let settled = false;
   try {
+    await sweepLeftovers(path, hooks.sweepAgeMs ?? LOCK_STALE_MS, recoveryMutexPath(path, judged, 0).slice(0, -1));
     if (!sameRecord(await readOwner(path), judged)) {
       settled = true;
       return "retry"; // it changed hands: not ours to remove
@@ -309,8 +347,12 @@ export async function recoverAbandoned(path: string, judged: LockOwner | "invali
       return "retry";
     }
     settled = true;
-    const moved = await readOwner(aside);
-    await unlink(aside).catch(() => undefined);
+    let moved: Read;
+    try {
+      moved = await readOwner(aside);
+    } finally {
+      await unlink(aside).catch(() => undefined);
+    }
     return sameRecord(moved, judged) ? "removed" : "aborted"; // never put a moved lock back
   } finally {
     const mine = await readOwner(mutexPath);
@@ -326,10 +368,16 @@ export async function recoverAbandoned(path: string, judged: LockOwner | "invali
  * same lock (the operating system's canonical spelling).  A transcript that does not exist yet uses its absolute path.
  */
 export function canonicalTranscriptPath(transcriptPath: string): string {
+  const real = (p: string) => (realpathSync.native ?? realpathSync)(p);
   try {
-    return (realpathSync.native ?? realpathSync)(transcriptPath);
+    return real(transcriptPath);
   } catch {
-    return resolve(transcriptPath);
+    const absolute = resolve(transcriptPath);
+    try {
+      return join(real(dirname(absolute)), basename(absolute)); // not there yet: canonical parent + name
+    } catch {
+      return absolute;
+    }
   }
 }
 
@@ -385,7 +433,7 @@ export async function withTranscriptLock<T>(
       abandoned = await ownerGone(holder, staleMs); // a confirmed live owner's lock is never recovered
     }
     if (abandoned) {
-      const outcome = await recoverAbandoned(path, holder);
+      const outcome = await recoverAbandoned(path, holder, { sweepAgeMs: staleMs });
       if (outcome === "aborted") {
         logError("The transcript lock changed while it was being recovered; leaving the turns for the next flush");
         return { ran: false };
