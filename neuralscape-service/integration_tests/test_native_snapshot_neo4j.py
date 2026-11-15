@@ -1,7 +1,8 @@
 """Live Neo4j qualification for native snapshot imports.
 
 This module is intentionally outside ``tests/`` and is invoked explicitly by
-the dedicated CI job. A missing or unreachable database is a test failure.
+the dedicated CI job. A missing or unreachable database fails the test when NS_INTEGRATION_REQUIRED=1
+(and is skipped otherwise); see conftest.py.
 """
 
 from __future__ import annotations
@@ -11,7 +12,6 @@ import copy
 import gzip
 import hashlib
 import json
-import os
 import threading
 import uuid
 from types import SimpleNamespace
@@ -58,10 +58,11 @@ def _submit(loop: asyncio.AbstractEventLoop, awaitable):
 
 
 @pytest.fixture(scope="session")
-def live_database():
-    uri = os.environ["NEO4J_URI"]
-    user = os.environ["NEO4J_USER"]
-    password = os.environ["NEO4J_PASSWORD"]
+def live_database(neo4j_conn):
+    # neo4j_conn (conftest) skips without a reachable Neo4j, or fails when
+    # NS_INTEGRATION_REQUIRED=1; the dedicated CI job provides Neo4j, so
+    # there it runs.
+    conn = neo4j_conn
 
     loop = asyncio.new_event_loop()
     started = threading.Event()
@@ -79,7 +80,7 @@ def live_database():
     thread.start()
     assert started.wait(timeout=5), "Neo4j event loop did not start"
 
-    driver = AsyncGraphDatabase.driver(uri, auth=(user, password))
+    driver = AsyncGraphDatabase.driver(conn.uri, auth=(conn.user, conn.password))
     try:
         _submit(loop, driver.verify_connectivity())
         yield SimpleNamespace(_loop=loop), driver

@@ -172,15 +172,39 @@ def test_every_scenario_names_a_test_and_expected_failures_are_strict_xfails() -
     assert set(tests) - {name for name in tests if name.startswith("_")} == set(named)
 
 
-def test_every_known_failure_names_the_real_service_follow_up() -> None:
-    failures = [s for s in SCENARIOS if s.kind == "expected-failure"]
+def _known_failure_problems(scenarios) -> list[str]:
+    """Rules every remaining expected failure must meet.
 
-    # No floor on the count: every fix turns a known failure into a control (the
-    # floor made fixing the last defects fail this test). Each remaining one must
-    # still declare whether it needs a real-service repetition.
+    The list of expected failures shrinks to zero as the pinned defects are
+    fixed (a fixed defect's scenario becomes a ``control``), so there is no
+    minimum count: an empty list is valid. What must hold for each entry that
+    remains is that it says whether a real-service rerun is still owed and
+    what the defect is.
+    """
+
+    problems = []
+    for scenario in scenarios:
+        if scenario.kind != "expected-failure":
+            continue
+        if not isinstance(scenario.needs_real_service, bool):
+            problems.append(f"{scenario.id}: needs_real_service must be a bool")
+        if not scenario.summary.strip():
+            problems.append(f"{scenario.id}: summary must name the defect")
+        if not scenario.leaves:
+            problems.append(f"{scenario.id}: must name the feature leaves it affects")
+    return problems
+
+
+def test_every_known_failure_names_the_real_service_follow_up() -> None:
+    assert _known_failure_problems(SCENARIOS) == []
     assert any(not s.needs_real_service for s in SCENARIOS if s.kind == "control")
-    for scenario in failures:
-        assert isinstance(scenario.needs_real_service, bool)
+
+
+def test_known_failure_rules_hold_as_the_list_shrinks_to_zero() -> None:
+    controls_only = [s for s in SCENARIOS if s.kind == "control"]
+    assert _known_failure_problems(controls_only) == []
+    broken = registry.Scenario("x", "expected-failure", (), "t", "yes", " ")
+    assert len(_known_failure_problems([broken])) == 3
 
 
 def test_required_baseline_areas_each_have_an_expected_failure_and_a_control() -> None:
