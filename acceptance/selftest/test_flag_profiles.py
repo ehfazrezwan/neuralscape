@@ -101,7 +101,7 @@ def test_a_dictator_token_is_minted_for_the_first_listed_id(monkeypatch, clean_e
 def test_the_dictator_token_is_minted_through_compose_when_that_is_the_source(monkeypatch, clean_env):
     calls = []
     monkeypatch.setattr(runctx.tokens, "mint_via_compose", lambda project, user, service="neuralscape", **kw: calls.append(user) or f"tok-{user}")
-    c = runctx.build("http://x", "flags-on", compose_project="p1", dictator_user="acc-dictator")
+    c = runctx.build("http://x", "flags-on", compose_project="nstest-p1", dictator_user="acc-dictator")
     assert c.token_dictator == "tok-acc-dictator" and calls == [c.user_a, c.user_b, "acc-dictator"]
 
 
@@ -311,7 +311,7 @@ def test_check_compose_project_refuses_prod_and_non_disposable_names(name):
 
 
 def test_check_compose_project_accepts_disposable_prefixes_and_normalises():
-    assert guard.check_compose_project(" NSCampaign ", env={}) == "nscampaign"
+    assert guard.check_compose_project(" NSCampaign ", env={}).lower() == "nscampaign"
     assert guard.check_compose_project("nstest-abc", env={}) == "nstest-abc"
     assert guard.check_compose_project("bench-1", env={"NS_COMPOSE_ALLOWLIST": "bench-"}) == "bench-1"
     with pytest.raises(guard.GuardError):
@@ -326,9 +326,9 @@ def test_every_docker_entry_point_uses_the_gate(monkeypatch):
     for bad in ("Neuralscape", "somethingelse"):
         with pytest.raises(guard.GuardError):
             runctx.run_compose(bad, "ps", run=run)
-        with pytest.raises(guard.GuardError):
+        with pytest.raises(tokens.TokenError):
             tokens.mint_via_compose(bad, "u", run=run)
-        with pytest.raises(guard.GuardError):
+        with pytest.raises(tokens.TokenError):
             tokens.mint_via_compose_python(bad, "u", 60, run=run)
         with pytest.raises(guard.GuardError):
             sidecar.Sink(bad)

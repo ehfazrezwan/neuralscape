@@ -91,6 +91,13 @@ sync_graphiti() {
     echo "      3. _is_transient_error(): walk the __cause__/__context__ chain"
     echo "      4. _generate_response except: 'raise Exception(str(e) or repr(e)) from e'"
     echo "         (NOT 'raise Exception from e' — blanks the msg, kills 503 fallback)"
+    echo "      5. genai.Client(..., http_options=HttpOptions(timeout=GEMINI_HTTP_TIMEOUT_MS)) in"
+    echo "         llm_client/gemini_client.py, embedder/gemini.py, cross_encoder/gemini_reranker_client.py"
+    echo "         (+ GEMINI_HTTP_TIMEOUT_MS = 60_000 in llm_client/config.py; milliseconds)"
+    echo "      6. _generate_response(model_override=...) and the 503 fallback passing"
+    echo "         model_override=self.fallback_model (NOT swapping self.model)"
+    echo "      7. driver/neo4j_driver.py: kwargs.setdefault('database_', ...) (not params)"
+    echo "    After a sync: bump graphiti-base / mem0-base in scripts/upstream-patches.txt."
 }
 
 sync_mem0() {
@@ -101,6 +108,13 @@ sync_mem0() {
         -m "chore: sync mem0 with upstream (filtered mirror: core only)"
     prune_subtree mem0 "${MEM0_KEEP[@]}"
     echo "    mem0 synced (check for merge conflicts in configs.py / factory.py / graphiti_memory.py)."
+    echo "    NEURALSCAPE PATCHES in mem0 to RE-APPLY if overwritten (see scripts/upstream-patches.txt):"
+    echo "      1. embeddings/openai.py + configs/embeddings/base.py: embedding_batch_size chunking and"
+    echo "         the single-input-rejection per-item fallback"
+    echo "      2. utils/factory.py: GraphStoreFactory (incl. the 'graphiti' provider registration)"
+    echo "      3. restored graph layer: graphs/ (configs.py carries graphiti_llm_small_model) and"
+    echo "         memory/{graph,memgraph,kuzu,apache_age}_memory.py; memory/graphiti_memory.py is NS-original"
+    echo "      4. memory/main.py: lock + cold-start tolerance for the lazy entity store"
 }
 
 case "$TARGET" in
@@ -127,11 +141,13 @@ uv sync
 
 echo ""
 echo "==> Verifying carried NEURALSCAPE PATCH markers survived the sync..."
-# These markers tag local deviations from upstream that a subtree pull can
-# silently revert. Eyeball the list: anything you expect that's now missing was
-# overwritten and must be re-applied (see sync_graphiti notes above).
-grep -rn "NEURALSCAPE PATCH" "$REPO_ROOT/graphiti" "$REPO_ROOT/mem0" \
-    || echo "  WARNING: no NEURALSCAPE PATCH markers found — they may have been overwritten!"
+# scripts/upstream-patches.txt lists every patched file; each must still carry a
+# marker. A subtree pull can silently revert patches, so this fails the sync
+# (non-zero) if any listed file lost its marker - re-apply it, do not continue.
+"$REPO_ROOT/scripts/check-upstream-patches.sh" "$REPO_ROOT" || {
+    echo "ERROR: upstream sync dropped NEURALSCAPE PATCH markers (see above)." >&2
+    exit 1
+}
 
 echo ""
 echo "==> Running adapter tests..."

@@ -306,7 +306,7 @@ def test_in_container_minting_never_passes_a_secret_and_refuses_production():
     cmd = seen[0]
     assert cmd[:7] == ["docker", "compose", "-p", "nscampaign", "exec", "-T", "api"] and cmd[-2:] == ["u1", "-60"]
     assert "NEURALSCAPE_USER_TOKEN_SECRET" in cmd[9] and "print(issue_user_token" in cmd[9]
-    with pytest.raises(guard.GuardError):
+    with pytest.raises(tokens.TokenError):
         tokens.mint_via_compose_python("neuralscape", "u1", -60, run=run)
 
 

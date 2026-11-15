@@ -209,6 +209,8 @@ class VectorStoreFactory:
         return instance
 
 
+# NEURALSCAPE PATCH (re-apply after upstream subtree syncs): upstream v3 deleted the
+# self-hostable graph layer; NS restores this factory (incl. the 'graphiti' provider).
 class GraphStoreFactory:
     """
     Factory for creating MemoryGraph instances for different graph store providers.

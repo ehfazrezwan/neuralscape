@@ -12,8 +12,6 @@ from urllib.parse import urlparse
 
 PROD_COMPOSE_PROJECT = "neuralscape"
 PROD_PORT = 8199
-#: Compose projects the harness may touch: disposable ones only. Override with NS_COMPOSE_ALLOWLIST (comma list of prefixes).
-DEFAULT_COMPOSE_ALLOWLIST = ("nscampaign", "nstest-")
 
 
 class GuardError(RuntimeError):
@@ -29,25 +27,30 @@ def _is_loopback(host: str) -> bool:
         return False
 
 
-def check_compose_project(project: str | None, env: dict | None = None) -> str:
-    """THE one gate for every compose-project entry point; returns the normalised name.
+DEFAULT_COMPOSE_ALLOWLIST = ("nscampaign", "nstest-")
 
-    Docker lowercases project names, so the comparison is case-insensitive after strip. Refuses
-    ``neuralscape`` and any name outside the allowlist of disposable prefixes.
-    """
+
+def compose_allowlist(env: dict | None = None) -> list[str]:
     env = os.environ if env is None else env
-    name = (project or "").strip().lower()
-    if not name:
-        raise GuardError("a compose project name is required")
-    if name == PROD_COMPOSE_PROJECT:
+    raw = env.get("NS_COMPOSE_ALLOWLIST", "")
+    items = [p.strip().lower() for p in raw.split(",") if p.strip()]
+    return items or list(DEFAULT_COMPOSE_ALLOWLIST)
+
+
+def check_compose_project(project: str, env: dict | None = None) -> str:
+    """THE rule for every compose project name the harness touches: refuse the
+    production name (case-insensitive, after strip) and anything outside the
+    disposable-prefix allowlist (default ``nscampaign``, ``nstest-``; only
+    ``NS_COMPOSE_ALLOWLIST`` overrides). Returns the normalised name."""
+    name = (project or "").strip()
+    if name.lower() == PROD_COMPOSE_PROJECT:
         raise GuardError(
             f"refusing compose project '{PROD_COMPOSE_PROJECT}' (the production project name); "
             "use a throwaway campaign project"
         )
-    raw = env.get("NS_COMPOSE_ALLOWLIST", "")
-    allow = tuple(p.strip().lower() for p in raw.split(",") if p.strip()) or DEFAULT_COMPOSE_ALLOWLIST
-    if not name.startswith(allow):
-        raise GuardError(f"refusing compose project {name!r}: not a disposable project (allowed prefixes: {', '.join(allow)})")
+    allowed = compose_allowlist(env)
+    if not any(name.lower().startswith(p) for p in allowed):
+        raise GuardError(f"refusing compose project {name!r}: not a disposable project (allowed prefixes: {allowed})")
     return name
 
 

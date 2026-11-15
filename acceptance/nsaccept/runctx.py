@@ -176,6 +176,7 @@ def build(
     env_a, env_b = os.environ.get("NS_TOKEN_A", "").strip(), os.environ.get("NS_TOKEN_B", "").strip()
 
     if compose_project:
+        compose_project = guard.check_compose_project(compose_project)
         user_a, user_b = f"acc-{run_id}-a", f"acc-{run_id}-b"
         service = os.environ.get("NS_API_SERVICE", "neuralscape")
         try:
