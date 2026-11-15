@@ -137,7 +137,7 @@ class World:
                     ),
                 ],
             )
-        monkeypatch.setenv("CREDENTIALS_ENABLED", "1")
+        monkeypatch.setattr(settings, "credentials_enabled", True)
         monkeypatch.setattr(settings, "ns_policy_mode", mode)
         monkeypatch.setattr(settings, "ns_auth_profile", "legacy_compat")
         monkeypatch.setattr(settings, "neuralscape_user_token_secret", SECRET)
@@ -324,7 +324,7 @@ def test_with_the_default_mode_off_existing_behaviour_is_unchanged(monkeypatch, 
         assert w.call("POST", "/v1/search", w.hmac["alice"], json={"query": "plain"}).status_code == 200
         # scoped credentials authenticate only while enforcement is on: a scope nothing enforces would be a lie
         assert w.call("GET", "/v1/memories", "nsc_cred_x.y").status_code == 401
-        monkeypatch.delenv("CREDENTIALS_ENABLED")
+        monkeypatch.setattr(settings, "credentials_enabled", False)
         assert w.call("POST", "/v1/credentials", w.hmac["alice"], json={"scope": ["list"]}).status_code == 404
         assert w.call("GET", "/v1/memories").status_code == 401  # auth itself is untouched
     finally:

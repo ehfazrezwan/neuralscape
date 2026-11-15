@@ -206,5 +206,5 @@ def test_by_default_the_shared_key_is_one_bound_identity_and_cannot_assert_anoth
     monkeypatch.setattr(settings, "neuralscape_legacy_key_trust_body_user_id", False)
     monkeypatch.setattr(settings, "neuralscape_api_key_user_id", "alice")
     response = w.call(None, "PATCH", "/v1/memories/m-shared-alice", json={"content": "x", "user_id": "bob"})
-    assert response.status_code == 400 and w.service.patch_memory.call_count == 0   # auth refuses the mismatch
+    assert denied(response) and w.service.patch_memory.call_count == 0   # not bob: the key is alice here
     assert w.call(None, "PATCH", "/v1/memories/m-shared-alice", json={"content": "x"}).status_code == 200  # as alice

@@ -1,5 +1,7 @@
 """Membership: invite, join, list, remove, and the onboarding policy.
 
+Library only in this slice: no route or worker calls these operations yet (a later slice adds them).
+
 A new member needs more than content grants to use the product: tenant-level
 ``read`` (capabilities, console sign-in), and the relay
 actions when encrypted sync is on.  Those defaults are an explicit, versioned

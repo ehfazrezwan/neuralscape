@@ -284,7 +284,7 @@ one-to-one: user `alice--project--payroll` and user `alice` in project
 folds every run of disallowed characters to one `-`, so `a+b@example.com` and
 `a-b@example.com` both slug to `a-b-example.com`.
 
-With `NS_AUTH_PROFILE=enforced` (the default for new deployments):
+With `NS_AUTH_PROFILE=enforced` (opt-in; the setting defaults to `legacy_compat`, which keeps every legacy name). **Switching an existing deployment to `enforced` re-keys graph group ids for any user, project or workspace value that contains `.` or `--` or starts or ends with `-`: their old graph data is no longer read. The service logs a warning at start-up under `enforced`; read the migration notes below before switching.**
 
 - **Group ids.** A tuple whose user, project and workspace are all *plain*
   keeps its legacy name byte for byte. Plain means the value uses only

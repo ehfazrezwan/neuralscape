@@ -466,10 +466,11 @@ def test_sqlite_credential_conformance(case, sqlite_backend) -> None:
 
 
 def test_credentials_are_disabled_by_default(monkeypatch) -> None:
-    monkeypatch.delenv("CREDENTIALS_ENABLED", raising=False)
-    assert credentials.enabled() is False and credentials.accepts_scoped_credentials() is False
-    monkeypatch.setenv("CREDENTIALS_ENABLED", "true")
     from config import settings
+
+    assert settings.credentials_enabled is False  # the default
+    assert credentials.enabled() is False and credentials.accepts_scoped_credentials() is False
+    monkeypatch.setattr(settings, "credentials_enabled", True)
 
     assert credentials.enabled() is True
     monkeypatch.setattr(settings, "ns_policy_mode", "observe")

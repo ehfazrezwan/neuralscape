@@ -1479,7 +1479,7 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
     # Explicit action policy (NS_POLICY_MODE; a no-op while it is "off").
     from policy_enforcement import enforce_mcp_call
 
-    _policy_denial = enforce_mcp_call(name, arguments)
+    _policy_denial = await asyncio.to_thread(enforce_mcp_call, name, arguments)
     if _policy_denial is not None:
         return [TextContent(type="text", text=json.dumps(_policy_denial))]
 

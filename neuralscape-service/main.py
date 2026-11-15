@@ -3491,7 +3491,8 @@ class CreateServiceAccountRequest(BaseModel):
 def _credential_service():
     import credentials
 
-    if not credentials.enabled():
+    # Both flags: credentials issued while nothing enforces policy would carry a scope nobody checks.
+    if not credentials.accepts_scoped_credentials():
         raise HTTPException(status_code=404, detail="Not found")
     service = credentials.get_service()
     if service is None:
@@ -3505,6 +3506,9 @@ def _credential_caller(request: Request, service):
     verified = getattr(request.state, "credential", None)
     if verified is not None:
         return verified.subject_id, verified
+    if getattr(request.state, "auth_mode", None) == "legacy_shared":
+        # The shared key is not a member and never manages credentials, whoever it is bound to.
+        raise HTTPException(status_code=403, detail="The shared key cannot manage credentials")
     user_id = getattr(request.state, "user_id", None)
     subject = service.subject_for_user_id(user_id) if user_id else None
     if subject is None:

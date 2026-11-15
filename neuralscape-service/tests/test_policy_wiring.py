@@ -90,7 +90,7 @@ def wired(monkeypatch, tmp_path):
     monkeypatch.setattr(settings, "neuralscape_user_token_secret", SECRET)
     monkeypatch.setattr(settings, "neuralscape_api_key", "")
     monkeypatch.setattr(settings, "ingest_storage_dir", str(tmp_path / "ingest"))
-    monkeypatch.setenv("CREDENTIALS_ENABLED", "1")
+    monkeypatch.setattr(settings, "credentials_enabled", True)
     rows = {
         "m-shared": {"user_id": "alice", "memory": ORIG, "metadata": {"owner_user_id": "alice", "visibility": "shared"}},
         "m-private": {"user_id": "alice", "memory": ORIG, "metadata": {"owner_user_id": "alice", "visibility": "private"}},

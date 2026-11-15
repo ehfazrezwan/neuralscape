@@ -252,5 +252,8 @@ def test_legacy_dictator_grants_are_optional_and_tagged(store) -> None:
     assert tagged and all(s.action in ("update", "delete") for s in tagged)
     removed = apply_plan(store, inv, T, dictators=("carol",), standards_enabled=True, legacy_dictator_grants=False)
     assert removed.changed
-    assert not [s for s in store.current_policy(T).statements if s.origin]
+    assert not [s for s in store.current_policy(T).statements if s.origin and s.origin != pm.ADMIN_ORIGIN]
+    # the listed dictators are the administrators: tenant-level privileged update and background_derive
+    admin = [s for s in store.current_policy(T).statements if s.origin == pm.ADMIN_ORIGIN]
+    assert {s.action for s in admin} == {"update", "background_derive"} and len({s.subject_id for s in admin}) == 1
     assert with_grants.applied_epoch < removed.applied_epoch

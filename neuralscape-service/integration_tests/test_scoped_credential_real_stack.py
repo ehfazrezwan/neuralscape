@@ -109,7 +109,7 @@ class Stack:
                 )
             ],
         )
-        monkeypatch.setenv("CREDENTIALS_ENABLED", "1")
+        monkeypatch.setattr(settings, "credentials_enabled", True)
         monkeypatch.setattr(settings, "ns_policy_mode", "enforce")
         monkeypatch.setattr(settings, "ns_auth_profile", "legacy_compat")
         monkeypatch.setattr(settings, "neuralscape_user_token_secret", SECRET)

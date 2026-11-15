@@ -1,5 +1,7 @@
 """Legacy identity/namespace inventory, mapping report, and policy backfill.
 
+Library only in this slice: it is run by an operator, not by the service; no route or worker calls it.
+
 Read-only inventory of what the running service stores today (Redis identity
 aliases, owner ids and pools in the vector payloads, group ids in the graph),
 a classification with ``classify_legacy_identities`` (unique, ambiguous,
@@ -59,7 +61,7 @@ from identity_binding import (
     classify_legacy_identities,
     resolve_binding,
 )
-from policy_enforcement import RowInfo, pool_handle
+from policy_enforcement import RowInfo, pool_handle, privileged_handle, tenant_handle
 
 LOCAL_ISSUER = "local"
 LEGACY_SUBJECT_ISSUER = "legacy-subject"
@@ -368,6 +370,29 @@ def statement_id(subject: str, action: str, handle_id: str, tag: str = "") -> st
     return "mig-" + digest[:28]
 
 
+ADMIN_ORIGIN = "legacy_admin"
+#: What the administrator gate guards today (dreaming runs, project knowledge-config writes).
+ADMIN_ACTIONS_ON_TENANT = ("update", "background_derive")
+
+
+def admin_user_ids(dictators: Iterable[str] = (), default_user: str | None = None) -> frozenset[str]:
+    """Who is an administrator today (owner decision: with no listed dictators the default user is).
+
+    Mirrors ``auth.is_admin_user``: a non-empty ``DICTATOR_USER_IDS`` names exactly the administrators;
+    an empty one makes the default user the administrator, so single-user and legacy-key installs keep
+    working once enforcement is on.
+    """
+
+    listed = {d for d in dictators if d}
+    if listed:
+        return frozenset(listed)
+    if default_user is None:
+        from config import settings
+
+        default_user = settings.default_user_id
+    return frozenset({default_user}) if default_user else frozenset()
+
+
 def build_statements(
     report: MigrationReport,
     inventory: LegacyInventory,
@@ -379,8 +404,13 @@ def build_statements(
     legacy_key_subject: str | None = None,
     legacy_dictator_grants: bool = True,
     legacy_key_export: bool = False,
+    admins: Iterable[str] | None = None,
 ) -> tuple[PolicyStatement, ...]:
-    """The explicit grants that reproduce today's effective sharing."""
+    """The explicit grants that reproduce today's effective sharing.
+
+    ``admins`` (default: ``admin_user_ids(dictators)``) receive the administrator operations, each on a
+    privileged tenant handle that no content grant matches.
+    """
 
     unique = set(report.unique) & set(subject_ids)
     quarantined_owners = set(report.quarantined)
@@ -446,6 +476,12 @@ def build_statements(
             grant(subject, STANDARD_READ_ACTIONS, handle)
             if user in dictator_set:
                 grant(subject, DICTATOR_STANDARD_ACTIONS, handle)
+
+    admin_set = set(admin_user_ids(dictators) if admins is None else admins) & unique
+    for user in sorted(admin_set):
+        for action in ADMIN_ACTIONS_ON_TENANT:
+            grant(subject_ids[user], (action,), privileged_handle(action, tenant_handle(tenant_id)),
+                  origin=ADMIN_ORIGIN)
 
     if legacy_key_subject:
         # The shared key acted as any user it asserted: it holds each unique
@@ -526,7 +562,7 @@ def plan_against_store(
     """Dry run: classify, generate, diff against the current policy.  Writes nothing."""
 
     dictators = tuple(dictators)
-    report = build_report(inventory, extra_user_ids=dictators)
+    report = build_report(inventory, extra_user_ids=(*dictators, *admin_user_ids(dictators)))
     ids = _planned_subject_ids(store, report)
     legacy = None
     if include_legacy_key:
@@ -561,7 +597,7 @@ def apply_plan(
     """
 
     dictators = tuple(dictators)
-    report = build_report(inventory, extra_user_ids=dictators)
+    report = build_report(inventory, extra_user_ids=(*dictators, *admin_user_ids(dictators)))
     ids: dict[str, str] = {}
     created = 0
     for user in report.unique:
@@ -735,7 +771,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     inventory = _load_inventory(args)
     dictators = _dictators(args)
     if args.command == "inventory":
-        report = build_report(inventory, extra_user_ids=dictators)
+        report = build_report(inventory, extra_user_ids=(*dictators, *admin_user_ids(dictators)))
         print(json.dumps(report.to_json(redact=not args.show_ids), indent=2, sort_keys=True))
         return 0
     store = _store(args)

@@ -634,6 +634,9 @@ class Settings(BaseSettings):
     # Explicit action-policy enforcement (default off: no behavior change).
     #   off      → no-op; observe → decision log only; enforce → deny on policy.
     ns_policy_mode: Literal["off", "observe", "enforce"] = "off"
+    # Scoped credentials and service accounts (CREDENTIALS_ENABLED).  The routes and the credential format
+    # are live only when this is set AND ns_policy_mode is "enforce": a scope nothing enforces would be a lie.
+    credentials_enabled: bool = False
     # Authentication profile: legacy_compat keeps today's shared-key/auth-off
     # capability under named principals; enforced refuses both.
     ns_auth_profile: Literal["legacy_compat", "enforced"] = "legacy_compat"
