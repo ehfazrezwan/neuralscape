@@ -1,0 +1,17 @@
+# Isolated hybrid A/B backing stores. Never uses production volumes or ports.
+services:
+  neo4j:
+    image: neo4j:5-community
+    ports: ["127.0.0.1:17687:7687"]
+    environment:
+      NEO4J_AUTH: none
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+  qdrant:
+    image: qdrant/qdrant:v1.15.0
+    ports: ["127.0.0.1:16333:6333"]
+  redis:
+    image: redis:7.4-alpine
+    ports: ["127.0.0.1:16379:6379"]
