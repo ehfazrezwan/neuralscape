@@ -1208,7 +1208,7 @@ def _decision(
     )
 
 
-def _condition_state(statement, principal, evaluation) -> bool | None:
+def _condition_state(statement, subject_id, evaluation) -> bool | None:
     """Three-valued: ``True`` holds, ``False`` provably does not, ``None`` unknown.
 
     No condition always holds.  Unknown facts are unknown, never false.
@@ -1222,7 +1222,7 @@ def _condition_state(statement, principal, evaluation) -> bool | None:
         return None
     if condition.kind == "row_owner_is_principal":
         owner = context.row_owner_subject_id
-        return None if owner is None else owner == principal.subject_id
+        return None if owner is None else owner == subject_id
     if condition.kind == "fields_subset_of":
         edited = context.edited_fields
         if edited is None or len(edited) == 0:
@@ -1231,12 +1231,12 @@ def _condition_state(statement, principal, evaluation) -> bool | None:
     return None
 
 
-def _statement_applies(statement, principal, evaluation) -> bool:
+def _statement_applies(statement, subject_id, evaluation) -> bool:
     """An allow applies only when its condition provably holds; a deny applies
     unless its condition is provably false, so a condition that cannot be
     judged can never drop a deny."""
 
-    state = _condition_state(statement, principal, evaluation)
+    state = _condition_state(statement, subject_id, evaluation)
     if statement.effect == "deny":
         return state is not False
     return state is True
@@ -1416,6 +1416,7 @@ def evaluate_policy(
         credential_id=principal.credential_id,
         action=action,
         resource=resource,
+        evaluation=evaluation,
     ):
         return deny()
 
@@ -1436,6 +1437,7 @@ def evaluate_policy(
             credential_id=principal.delegation.delegated_by_credential_id,
             action=action,
             resource=resource,
+            evaluation=evaluation,
         ):
             return deny()
 
@@ -1456,6 +1458,7 @@ def _holds_current_right(
     credential_id: str,
     action: str,
     resource: ReferenceHandle,
+    evaluation: PolicyEvaluationInput,
 ) -> bool:
     """Whether ``subject_id`` acting with ``credential_id`` has a matching allow
     and no matching deny for ``action`` on ``resource`` in ``policy``.
@@ -1475,7 +1478,7 @@ def _holds_current_right(
             statement.credential_id is None
             or statement.credential_id == credential_id
         )
-        and _statement_applies(statement, principal, evaluation)
+        and _statement_applies(statement, subject_id, evaluation)
     )
     if any(statement.effect == "deny" for statement in matching_statements):
         return False
