@@ -134,3 +134,8 @@ def test_default_bound_is_not_shorter_than_the_longest_worker_job_timeout():
     worker = (Path(__file__).resolve().parents[1] / "worker.py").read_text()
     longest = max(int(n) for n in re.findall(r"job_timeout = (\d+)", worker))
     assert DEFAULT_BRIDGE_TIMEOUT_S > longest
+    # WorkerSettings uses ``job_timeout = settings.arq_job_timeout`` (env-overridable).
+    from config import settings
+
+    assert "job_timeout = settings.arq_job_timeout" in worker
+    assert DEFAULT_BRIDGE_TIMEOUT_S > settings.arq_job_timeout

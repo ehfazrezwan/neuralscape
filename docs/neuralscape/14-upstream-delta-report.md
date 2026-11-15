@@ -19,7 +19,7 @@ Both counts include CI, bot and dependency-bump commits; they say "how stale", n
 
 ### 2.1 graphiti: small, fully marked
 
-`git diff 9cb6dc1b:graphiti_core HEAD:graphiti/graphiti_core` (`9cb6dc1b` is the squash of upstream `feafc422`, the last Graphiti sync) touches exactly **3 files, +81 / -6 lines**:
+`git diff 9cb6dc1b:graphiti_core HEAD:graphiti/graphiti_core` (`9cb6dc1b` is the squash of upstream `feafc422`, the last Graphiti sync) touched **3 files (+81 / -6 lines) as of 2026-11-16**; `scripts/upstream-patches.txt` is the authoritative patched-file list and supersedes this count:
 
 | File | What the delta does | Marker |
 |---|---|---|
@@ -43,6 +43,8 @@ The saga lifecycle, `reference_time` edge field, extraction/dedup prompt patches
 | `mem0/mem0/memory/graphiti_memory.py` | the adapter itself (above) |
 | `mem0/mem0/embeddings/openai.py`, `mem0/mem0/configs/embeddings/base.py` | `embedding_batch_size`: chunk size and per-item fallback for OpenAI-compatible endpoints that accept one input per request |
 | `mem0/mem0/utils/factory.py` | adds `GraphStoreFactory` (no inline marker; the whole class is NS) |
+
+- **Fork environment knob:** `GRAPHITI_BRIDGE_TIMEOUT_S` (documented in `.env.example`) bounds one `_AsyncBridge.run` call; default 960 s, above the 900 s graph/ingest worker `job_timeout`. Before the patch the wait was unbounded.
 
 ### 2.3 The authoritative list
 

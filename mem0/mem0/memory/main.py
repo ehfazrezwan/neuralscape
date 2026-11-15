@@ -1902,6 +1902,9 @@ class AsyncMemory(MemoryBase):
         NEURALSCAPE PATCH: creation is serialised and tolerates a concurrent
         first creation (see ``_get_or_create_entity_store``).
         """
+        # Note: this is synchronous. On AsyncMemory the first touch blocks the
+        # event loop for the create call, and for up to ~2.8 s of retry sleeps
+        # when it loses a concurrent-create race. Later touches return at once.
         return _get_or_create_entity_store(self)
 
     async def _upsert_entity_async(self, entity_text, entity_type, memory_id, filters):
