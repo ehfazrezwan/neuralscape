@@ -141,6 +141,18 @@ class Settings(BaseSettings):
     graph_supersession_min_similarity: float = 0.85
     graph_supersession_margin: float = 0.05
 
+    # ── Graph-leg latency budget (flag, default OFF) ──────────────────
+    # search() overlaps the Graphiti leg with the vector pools and joins it
+    # before the weave. Off (default): the join waits up to 45 s (the inner
+    # bridge call is 30 s), so a wedged graph stalls a recall whose vector
+    # results are already in hand. On: the join waits at most
+    # GRAPH_LEG_BUDGET_S seconds measured from when the leg was SUBMITTED,
+    # then the recall returns the vector-only results and logs one warning.
+    # The late leg is left to finish on its own pool thread.
+    # Env: GRAPH_LEG_BUDGET_ENABLED, GRAPH_LEG_BUDGET_S.
+    graph_leg_budget_enabled: bool = False
+    graph_leg_budget_s: float = 4.0
+
     # Dedup cron
     dedup_similarity_threshold: float = 0.95
     dedup_batch_size: int = 100
@@ -690,6 +702,13 @@ class Settings(BaseSettings):
         if self.ledger_backend == "postgres" and not self.ledger_postgres_dsn.strip():
             raise ValueError("LEDGER_ENABLED with LEDGER_BACKEND=postgres requires LEDGER_POSTGRES_DSN")
         return self
+
+    @field_validator("graph_leg_budget_s")
+    @classmethod
+    def _validate_graph_leg_budget(cls, value: float) -> float:
+        if not (math.isfinite(value) and value > 0):
+            raise ValueError("GRAPH_LEG_BUDGET_S must be a finite number > 0")
+        return value
 
     @field_validator("tenant_admission_rate_per_second")
     @classmethod
