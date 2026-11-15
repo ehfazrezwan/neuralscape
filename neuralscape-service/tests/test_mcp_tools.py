@@ -464,7 +464,9 @@ class TestEditMemoryTool:
         data = json.loads(result[0].text)
         assert data["graph"] == "migration_queued"
         assert data["graph_task_id"] == "task-graph"
-        mock_task_manager.enqueue_graph_enrichment.assert_awaited_once_with(**job)
+        mock_task_manager.enqueue_graph_enrichment.assert_awaited_once_with(
+            **job, requester_user_id="e"
+        )
 
     @pytest.mark.asyncio
     async def test_edit_permission_error_surfaced(self, mock_mcp_service):

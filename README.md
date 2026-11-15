@@ -173,6 +173,13 @@ is pluggable per deployment via `AUTH_PROVIDER` (`token` | `google` | `supabase`
 Supabase (Google + a managed allowlist hook). Full runbook, setup steps, and
 troubleshooting: **[AUTH.md](./AUTH.md)**.
 
+Auth is **fail-closed**: the service refuses to start until you set
+`NEURALSCAPE_USER_TOKEN_SECRET` (recommended), the legacy
+`NEURALSCAPE_API_KEY`, or `NEURALSCAPE_AUTH_DISABLED=true` (no auth; trusted
+local machine only, logged as a WARNING at startup). A fresh clone with an
+untouched `.env` will therefore stop at startup with
+`Authentication is not configured`; pick one of the three in `.env`.
+
 ## MCP Server
 
 10 tools exposed via MCP for direct use by AI agents:

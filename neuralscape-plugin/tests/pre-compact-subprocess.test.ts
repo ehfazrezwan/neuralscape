@@ -113,11 +113,12 @@ async function runHook(stdin: string, env: Record<string, string> = {}): Promise
   });
 }
 
+// The real Claude Code shape: text under message.content (a string for the user, text blocks for the assistant).
 const MESSAGES = [
-  { type: "user", content: "first user prompt with plenty of substance here" },
-  { type: "assistant", content: "first assistant answer with plenty of substance here" },
-  { type: "user", content: "second user prompt about the compact loop work" },
-  { type: "assistant", content: "second assistant answer with plenty of substance here" },
+  { type: "user", message: { role: "user", content: "first user prompt with plenty of substance here" } },
+  { type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "first assistant answer with plenty of substance here" }] } },
+  { type: "user", message: { role: "user", content: "second user prompt about the compact loop work" } },
+  { type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "second assistant answer with plenty of substance here" }] } },
 ];
 
 async function makeTranscript(): Promise<{ path: string; dir: string }> {
@@ -148,14 +149,14 @@ function expectNeverBlocks(r: RunResult): void {
 // ── Behavior ─────────────────────────────────────────────────────
 
 describe("pre-compact bundle end-to-end", () => {
-  it("flushes turns, commits the offset, and stores one tagged snapshot", async () => {
+  it("delivers no turns, leaves the cursor to the Stop hook, and stores one tagged snapshot", async () => {
     const { path, dir } = await makeTranscript();
     const r = await runHook(stdinFor(path, dir, "manual"));
     expectNeverBlocks(r);
 
     const flushes = requests.filter((q) => q.path.includes("/conversation-compiler/flush"));
     const raws = requests.filter((q) => q.path.includes("/v1/memories/raw"));
-    expect(flushes.length).toBe(2);
+    expect(flushes.length).toBe(0);
     expect(raws.length).toBe(1);
 
     const snapshot = raws[0].body;
@@ -166,12 +167,11 @@ describe("pre-compact bundle end-to-end", () => {
     expect(String(snapshot.content)).toContain("(manual)");
     expect(String(snapshot.content)).toContain("second user prompt about the compact loop work");
 
-    // Offset committed past both delivered turns (audit 27 #34b path).
-    const offset = await readFile(path + ".neuralscape-offset", "utf-8");
-    expect(parseInt(offset, 10)).toBe(4);
+    // The cursor belongs to the Stop hook: PreCompact never writes it.
+    await expect(readFile(path + ".neuralscape-offset", "utf-8")).rejects.toThrow();
   });
 
-  it("still snapshots when the transcript has no new turns", async () => {
+  it("still snapshots when every turn was already delivered", async () => {
     const { path, dir } = await makeTranscript();
     await writeFile(path + ".neuralscape-offset", "4", "utf-8"); // all delivered
     const r = await runHook(stdinFor(path, dir));
@@ -181,7 +181,8 @@ describe("pre-compact bundle end-to-end", () => {
     const raws = requests.filter((q) => q.path.includes("/v1/memories/raw"));
     expect(flushes.length).toBe(0);
     expect(raws.length).toBe(1);
-    expect(String(raws[0].body.content)).toContain("after 0 captured turn(s)");
+    expect(String(raws[0].body.content)).toContain("second user prompt about the compact loop work");
+    expect(String(raws[0].body.content)).not.toContain("captured turn");
   });
 
   it("exits 0 with the service dead — the compact is never failed", async () => {

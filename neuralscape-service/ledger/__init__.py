@@ -24,8 +24,8 @@ def open_ledger(settings: Any) -> LedgerPort:
             raise ValueError("LEDGER_POSTGRES_DSN is required for the postgres ledger")
         from ledger.postgres import PostgresLedger
 
-        # The least-privilege runtime role connects without migrating; the owner runs the migrations
-        # beforehand (``python -m ledger.admin migrate``).
+        # The least-privilege runtime role connects without migrating; the schema owner migrates and
+        # grants beforehand (``PostgresLedger(dsn)`` then ``ledger.postgres.grant_runtime_role``).
         return PostgresLedger(
             settings.ledger_postgres_dsn, migrate=getattr(settings, "ledger_postgres_migrate_on_open", True)
         )

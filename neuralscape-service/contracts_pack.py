@@ -2128,7 +2128,7 @@ SCHEMA_DIGESTS: dict[str, str] = {
     "DecisionRequest": "267f963c4013d9bda89c27add04ab0a2d7b7820161b8928fdad97864719c0c8b",
     "DecisionResult": "29648061c77c26c2e981afdb16359c7284e630bda3717476310182025cd4ae8e",
     "DeclaredOmission": "8844bda0d5894a61283a242da6c1356972b4bc019d9c6c12e419c9a1aa0c92de",
-    "DelegationConstraints": "092bb0c72859f9068b6ff7388a62b5cb96444f7a5ead7b84cdf27de93267ad67",
+    "DelegationConstraints": "ee08aba3475eab02a4789a18a5336a241903e7334db4212866f7b4e672fc7b89",
     "EncryptionReference": "cc3a6afbf5d4494d1b415d8b6ed7c8d15e5fa27a8788dec1ae1ee19809f47b77",
     "ExpansionLineage": "c9432f97738fe9cdc2240a83202edd1068d01965ffd4fe8c0d6795d3dca6b727",
     "ExportScope": "ad62aa653584296184252dbade31a1ee5fba7095cecbdd6cb3390ea456e6f6a5",

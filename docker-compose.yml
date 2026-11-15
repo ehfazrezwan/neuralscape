@@ -190,6 +190,7 @@ services:
         condition: service_healthy
       qdrant:
         condition: service_healthy
+    # Auth comes from .env: startup refuses until NEURALSCAPE_USER_TOKEN_SECRET, NEURALSCAPE_API_KEY or NEURALSCAPE_AUTH_DISABLED=true is set (AUTH.md).
     env_file: .env
     environment:
       NEO4J_URI: neo4j://neo4j:7687
