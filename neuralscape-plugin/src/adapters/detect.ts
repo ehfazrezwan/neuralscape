@@ -5,7 +5,8 @@
 import type { SessionEndExtractor, TurnExtractor } from "../core/types.js";
 import { extractClaudeCodeTurns, extractClaudeCodeSessionEnd } from "./claude-code.js";
 import { extractGenericTurns, extractGenericSessionEnd } from "./generic.js";
-import { extractOpenClawTurns, extractOpenClawSessionEnd } from "./openclaw.js";
+import { extractOpenClawTurns, extractOpenClawSessionEnd, resolveOpenClawProjectId } from "./openclaw.js";
+import { getProjectId } from "../utils.js";
 
 export type ClientType = "openclaw" | "claude-code" | "generic";
 
@@ -46,4 +47,18 @@ export function getSessionEndExtractor(client: ClientType): SessionEndExtractor 
     case "generic":
       return extractGenericSessionEnd;
   }
+}
+
+/**
+ * The project a hook event belongs to, for the excluded-projects check. It
+ * must be the same id the adapter files the event under: the framework
+ * adapter resolves it from the payload (workspace directory or the
+ * PROJECT_ID override, else none), every other client from `cwd`.
+ */
+export function resolveEventProjectId(
+  raw: Record<string, unknown>,
+  client: ClientType = detectClient(raw),
+): string | undefined {
+  if (client === "openclaw") return resolveOpenClawProjectId(raw);
+  return getProjectId(raw.cwd as string | undefined);
 }
