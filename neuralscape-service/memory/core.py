@@ -288,7 +288,6 @@ class CoreMixin:
         ("metadata.dream_tombstoned", "bool"),
         ("metadata.visibility", "keyword"),
         ("metadata.scope", "keyword"),
-<<<<<<< HEAD
         ("hash", "keyword"),
         ("metadata.project_id", "keyword"),
         ("metadata.category", "keyword"),
@@ -300,12 +299,10 @@ class CoreMixin:
         ("metadata.owner_user_id", "keyword"),
         ("metadata.speaker", "keyword"),
         ("metadata.workspace", "keyword"),
-=======
         # Shared-episode sibling lookup (memory/provenance.py): one scroll per
         # cascade filters on these; unindexed it scans the collection each time.
         ("metadata.graph_episode_uuid", "keyword"),
         ("metadata.graph_episode_name", "keyword"),
->>>>>>> origin/dev
     )
 
     def _ensure_filter_indexes(self) -> None:
