@@ -343,9 +343,26 @@ as an env-var alias.
 Wrap anything in `<private>…</private>` and the plugin will never store or
 transmit it: the spans are replaced with `[redacted]` **before** observation
 rows hit disk, before conversation turns are flushed to the compiler, and
-before session-note fields go into a checkpoint. Redaction is case-insensitive
-and fail-closed — an unclosed `<private>` redacts to the end of the text. The
-compile-observations skill additionally skips any work unit containing
+before session-note fields go into a checkpoint.
+
+- **Fail-closed.** Text that leaves the machine or is written to disk is
+  redacted fail-closed: an unclosed `<private>` redacts to the end of the text
+  (so a multi-line private span cannot leak its later lines), and a closing tag
+  with no opener redacts back to the start of the text. The cost is that prose
+  which merely *mentions* the tag loses what follows it.
+- **Nesting.** Spans nest: the span ends at the closing tag that balances the
+  outermost opener, and everything between inner and outer closers stays inside.
+- **Spelling.** The tag is matched case-insensitively and tolerates whitespace and
+  attributes (`< private >`, `<PRIVATE reason="draft">`, `</ private >`) and the
+  HTML-escaped form (`&lt;private&gt;` … `&lt;/private&gt;`). Other encodings
+  (numeric entities such as `&#60;private&#62;`, URL-encoded or Unicode look-alike
+  characters) are **not** recognised: use the literal tag. A word that only starts
+  with `private` (`<privateer>`, `<private-note>`) is not a tag.
+- **Across entries.** A span may open in the prompt and close in the answer, or
+  open in one assistant message and close in a later one: the session note and the
+  flushed turn are redacted over the whole turn.
+
+The compile-observations skill additionally skips any work unit containing
 `<private>` content entirely.
 
 ## Hook failure taxonomy (never-block contract)

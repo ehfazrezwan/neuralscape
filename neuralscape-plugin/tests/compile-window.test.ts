@@ -130,6 +130,24 @@ describe("compileForSession", () => {
   });
 });
 
+describe("concurrent updates of the state file", () => {
+  it("two overlapping hooks of one session do not lose each other's dirty date (transcript lock)", async () => {
+    const transcript = join(process.env.CLAUDE_PLUGIN_DATA!, "t.jsonl");
+    writeFileSync(transcript, "");
+    const t0 = 6_000_000_000_000;
+    // Mark the window as just compiled so both calls only record their dirty date.
+    await writeCompileState("c", { dirtyDates: [], compiledAt: t0 });
+    await Promise.all([
+      compileForSession("c", input("2026-11-14"), { delivered: 1, final: false, now: t0 + MIN, lockPath: transcript }),
+      compileForSession("c", input("2026-11-15"), { delivered: 1, final: false, now: t0 + MIN, lockPath: transcript }),
+    ]);
+    expect((await readCompileState("c")).dirtyDates.sort()).toEqual(["2026-11-14", "2026-11-15"]);
+  });
+  it("without a lock path it still works (no transcript)", async () => {
+    expect(await compileForSession("d", input(), { delivered: 1, final: true })).toBe(true);
+  });
+});
+
 describe("triggerCompile", () => {
   it("reports success, failure, and a no-op for shouldCompile=false", async () => {
     expect(await triggerCompile(input())).toBe(true);

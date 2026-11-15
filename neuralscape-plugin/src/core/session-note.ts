@@ -10,7 +10,7 @@
  * deliberately does NOT duplicate.
  */
 
-import { isHeartbeat, isSystemMessage, redactPrivate } from "../utils.js";
+import { findPrivateSpans, isHeartbeat, isSystemMessage, redactPrivate } from "../utils.js";
 import type { SessionNoteFields } from "./disclosure.js";
 
 export type { SessionNoteFields };
@@ -104,25 +104,42 @@ export function extractLearned(turns: Array<{ user: string; assistant: string }>
 }
 
 /**
- * A turn's wrap-up (its last assistant entry) with `<private>` redaction decided over the WHOLE turn's assistant
- * text. A span opened in an earlier entry and closed in the final one has no opening tag inside the final entry
- * alone, so redacting the entry in isolation would leave the span's tail in the clear. The spans are found in the
- * joined text (matched pairs, then an unmatched opener through the end: fail closed) and masked in place; only
- * then is the final entry's part cut out. A wrap-up that is nothing but redaction is returned empty.
+ * Redact the pieces of ONE turn (its user text, the assistant entries before the wrap-up, the wrap-up) with the
+ * `<private>` spans decided over the whole turn: the pieces are joined, the spans found in the joined text
+ * (nesting, fail closed: an unclosed opener runs to the end, a closer with no opener redacts back to the start)
+ * and masked in place, and only then are the pieces cut out again. A span that opens in one piece and closes in
+ * a later one (the user prompt and the answer, an earlier assistant entry and the wrap-up) therefore has no tail
+ * left in the clear in any piece. A piece that is nothing but redaction comes back empty.
  */
+export function redactTurnPieces(pieces: string[]): string[] {
+  const joined = pieces.join("\n");
+  const spans = findPrivateSpans(joined, true);
+  if (spans.length === 0) return pieces;
+  let masked = joined;
+  for (const span of spans) {
+    const fill = span.unclosed ? "\u0002" : "\u0001";
+    masked = masked.slice(0, span.start) + fill.repeat(span.end - span.start) + masked.slice(span.end);
+  }
+  const out: string[] = [];
+  let at = 0;
+  for (const piece of pieces) {
+    const part = masked
+      .slice(at, at + piece.length)
+      .replace(/\u0001+/g, "[redacted]")
+      .replace(/\u0002+/g, "[redacted:unclosed]");
+    out.push(/^\s*\[redacted(?::unclosed)?\]\s*$/.test(part) ? "" : part);
+    at += piece.length + 1;
+  }
+  return out;
+}
+
+/** A turn's wrap-up (its last assistant entry) with redaction decided over the whole turn's text. */
 export function redactedFinal(turn: { assistant: string; final?: string }): string {
   const assistant = turn.assistant ?? "";
   const final = turn.final;
   if (final === undefined) return redactPrivate(assistant, { failClosed: true });
   const earlier = assistant.endsWith(final) ? assistant.slice(0, assistant.length - final.length) : "";
-  let masked = (earlier + final).replace(/<private>[\s\S]*?<\/private>/gi, (m) => "\u0001".repeat(m.length));
-  const open = masked.search(/<private>/i);
-  if (open !== -1) masked = masked.slice(0, open) + "\u0002".repeat(masked.length - open);
-  const out = masked
-    .slice(earlier.length)
-    .replace(/\u0001+/g, "[redacted]")
-    .replace(/\u0002+/g, "[redacted:unclosed]");
-  return /^\s*\[redacted(?::unclosed)?\]\s*$/.test(out) ? "" : out;
+  return redactTurnPieces([earlier, final])[1];
 }
 
 /**
@@ -177,13 +194,22 @@ export function buildSessionNote(
   observations: ObservationRow[],
 ): SessionNoteFields | null {
   const note: SessionNoteFields = {};
-  // Redact every turn over its whole text before any extractor picks sentences or entries out of it: a private
-  // span can start in a sentence an extractor skips, so redacting what each one happens to select is not enough.
-  const clean = turns.map((t) => ({
-    user: redactPrivate(t.user ?? "", { failClosed: true }),
-    assistant: redactPrivate(t.assistant ?? "", { failClosed: true }),
-    final: redactedFinal(t),
-  }));
+  // Redact every turn over its whole text (user and assistant together) before any extractor picks sentences or
+  // entries out of it: a private span can start in a sentence an extractor skips, or open in the prompt and
+  // close in the answer, so redacting what each one happens to select is not enough.
+  const clean = turns.map((t) => {
+    const assistant = t.assistant ?? "";
+    if (t.final === undefined) {
+      const [user, redAssistant] = redactTurnPieces([t.user ?? "", assistant]);
+      return { user, assistant: redAssistant, final: undefined };
+    }
+    if (assistant.endsWith(t.final)) {
+      const [user, earlier, final] = redactTurnPieces([t.user ?? "", assistant.slice(0, assistant.length - t.final.length), t.final]);
+      return { user, assistant: earlier + final, final };
+    }
+    const [user, redAssistant, final] = redactTurnPieces([t.user ?? "", assistant, t.final]);
+    return { user, assistant: redAssistant, final };
+  });
   const request = extractRequest(clean);
   const investigated = extractInvestigated(observations);
   const learned = extractLearned(clean);

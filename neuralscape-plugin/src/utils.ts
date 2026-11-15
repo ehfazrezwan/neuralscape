@@ -265,31 +265,97 @@ export function isProjectExcluded(projectId: string | undefined): boolean {
 // ── Privacy: <private> tag redaction (roadmap D4) ────────────────
 
 /**
+ * One `<private>` tag, tolerant of whitespace, attributes and case (`< private >`, `<PRIVATE reason="x">`,
+ * `</ private>`), and of the HTML-escaped spelling (`&lt;private&gt;`). `private` must be a whole word, so
+ * `<privateer>` and `<private-note>` are not tags. Group 1 is set for a closer.
+ */
+const PRIVATE_TAG = /(?:<|&lt;)\s*(\/)?\s*private(?![\w-])[^<>]*?(?:>|&gt;)/gi;
+
+export interface PrivateSpan {
+  start: number;
+  end: number;
+  /** An opener that is never closed (it runs to the end of the text). */
+  unclosed: boolean;
+}
+
+/**
+ * Find the private spans of a text. Spans NEST: an opener inside a span deepens it and the span ends at the
+ * closer that balances the outermost opener, so text between an inner and the outer closer stays inside.
+ * An opener that is never balanced ends at the end of the text (`unclosed`).
+ * With `failClosed`, a closer with no opener before it (the opener was in text that was cut away or sits in
+ * another entry) makes everything from the previous span's end through that closer a span.
+ */
+export function findPrivateSpans(text: string, failClosed = false): PrivateSpan[] {
+  const spans: PrivateSpan[] = [];
+  let depth = 0;
+  let start = 0;
+  let floor = 0; // end of the last span: a stray closer redacts back to here
+  for (const tag of text.matchAll(PRIVATE_TAG)) {
+    const at = tag.index as number;
+    const end = at + tag[0].length;
+    if (tag[1] === undefined) {
+      if (depth === 0) start = at;
+      depth++;
+    } else if (depth > 0) {
+      depth--;
+      if (depth === 0) {
+        spans.push({ start, end, unclosed: false });
+        floor = end;
+      }
+    } else if (failClosed) {
+      spans.push({ start: floor, end, unclosed: false });
+      floor = end;
+    }
+  }
+  if (depth > 0) spans.push({ start, end: text.length, unclosed: true });
+  return spans;
+}
+
+/**
  * Redact `<private>…</private>` spans from text the plugin is about to
- * store or transmit. Case-insensitive. Idempotent.
+ * store or transmit. Case-insensitive. Idempotent. Spans nest (see
+ * findPrivateSpans) and the tag is matched tolerantly (whitespace,
+ * attributes, `&lt;private&gt;`).
  *
- * Matched OPEN…CLOSE pairs redact exactly their span. An UNMATCHED opener
- * (e.g. prose *about* the tag: "use <private> to mark secrets") is bounded
- * by default (audit 27 #34a): it redacts at most through the next sentence
- * boundary or end of line — never to end-of-string — and leaves a
- * `[redacted:unclosed]` warning marker so the truncation is visible instead
- * of silently eating the rest of the transcript.
+ * An UNMATCHED opener (e.g. prose *about* the tag: "use <private> to mark
+ * secrets") is bounded by default (audit 27 #34a): it redacts at most through
+ * the next sentence boundary or end of line — never to end-of-string — and
+ * leaves a `[redacted:unclosed]` warning marker so the truncation is visible
+ * instead of silently eating the rest of the transcript.
  *
  * `failClosed` is for text that LEAVES the machine or is written to disk:
- * an unmatched opener redacts through the END OF THE TEXT. A private span
- * can run over several lines or sentences (a tool result, a multi-paragraph
- * answer), so bounding it to the line would publish the rest of the span;
+ * an unmatched opener redacts through the END OF THE TEXT, and a closer with
+ * no opener redacts back to the start of the text. A private span can run
+ * over several lines or sentences (a tool result, a multi-paragraph answer),
+ * so bounding it to the line would publish the rest of the span;
  * over-redacting prose that merely mentions the tag is the safe error.
  */
 export function redactPrivate(text: string, options: { failClosed?: boolean } = {}): string {
-  if (typeof text !== "string" || !/<private>/i.test(text)) return text;
-  const closed = text.replace(/<private>[\s\S]*?<\/private>/gi, "[redacted]");
-  if (options.failClosed) return closed.replace(/<private>[\s\S]*$/i, "[redacted:unclosed]");
-  // Remaining openers are unmatched: consume within the current line up
-  // to the earliest of (a) a sentence end ([.!?] before whitespace/EOL)
-  // or (b) the end of the line. `[^\n]*?` cannot cross a newline, so a
-  // stray opener can never swallow subsequent lines.
-  return closed.replace(/<private>[^\n]*?(?:[.!?](?=\s|$)|(?=\n)|$)/gi, "[redacted:unclosed]");
+  if (typeof text !== "string") return text;
+  const failClosed = options.failClosed === true;
+  const spans = findPrivateSpans(text, failClosed);
+  if (spans.length === 0) return text;
+  let out = "";
+  let pos = 0;
+  for (const span of spans) {
+    out += text.slice(pos, span.start);
+    pos = span.end;
+    if (!span.unclosed) {
+      out += "[redacted]";
+    } else if (failClosed) {
+      out += "[redacted:unclosed]";
+    } else {
+      // Bounded: through the earliest sentence end or the end of the line, then carry on with the rest.
+      const rest = text.slice(span.start);
+      const bound = /^[^\n]*?(?:[.!?](?=\s|$)|(?=\n)|$)/.exec(rest);
+      const cut = bound ? bound[0].length : rest.length;
+      out += "[redacted:unclosed]";
+      pos = span.start + cut;
+      out += redactPrivate(text.slice(pos), options);
+      return out;
+    }
+  }
+  return out + text.slice(pos);
 }
 
 /**

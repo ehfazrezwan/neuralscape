@@ -109,7 +109,7 @@ async function main(): Promise<void> {
       await compileForSession(
         sessionId,
         { date: new Date().toISOString().split("T")[0], userId: getUserId(), shouldCompile: true },
-        { delivered, final: true },
+        { delivered, final: true, lockPath: raw.transcript_path as string | undefined },
       );
     } catch (error) {
       logError("session-end final flush failed (non-critical)", error);

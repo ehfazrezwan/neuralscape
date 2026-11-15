@@ -82,6 +82,17 @@ describe("privacy of what Stop and SessionEnd POST", () => {
     expect(JSON.stringify(fx.requests.map((q) => q.body))).not.toMatch(/SENTINEL/);
   });
 
+  it("SessionEnd: a NESTED span split across entries, and a span opened in the prompt and closed in the answer, never reach any POST", async () => {
+    const { transcript, end } = await session();
+    await appendFile(transcript, user("my token is <private>SENTINEL-USER and more"));
+    await appendFile(transcript, assistant("Noted SENTINEL-ANSWER</private> and fine. Start <private>outer <private>inner SENTINEL-1"));
+    await appendFile(transcript, assistant("SENTINEL-2</private> SENTINEL-MID</private>\nAll done, shipped to staging."));
+    await end();
+    await waitFor(() => posts(CHECKPOINT).length === 1);
+    expect(JSON.stringify(fx.requests.map((q) => q.body))).not.toMatch(/SENTINEL/);
+    expect(JSON.stringify(posts(CHECKPOINT)[0].body)).toContain("All done, shipped to staging.");
+  });
+
   it("Stop: an unclosed opener in a turn hides the rest of that turn (multi-line) from the flush", async () => {
     const { transcript, stop } = await session();
     await appendFile(transcript, user("what is the key?"));

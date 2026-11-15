@@ -14,6 +14,7 @@ import {
   readConfig,
   writeCompileState,
 } from "../utils.js";
+import { withTranscriptLock } from "./transcript-lock.js";
 import type { SessionEndInput } from "./types.js";
 
 /** Stop compiles a session's delivered turns at most this often (SessionEnd always compiles what is left). */
@@ -60,6 +61,30 @@ export async function triggerCompile(input: SessionEndInput): Promise<boolean> {
  * Returns true when a compile request was sent.
  */
 export async function compileForSession(
+  sessionId: string,
+  input: SessionEndInput,
+  options: {
+    delivered: number;
+    final: boolean;
+    intervalMin?: number;
+    now?: number;
+    /**
+     * The session's transcript path. Two hooks of one session can overlap (a Stop still running when the next
+     * starts, SessionEnd right after a Stop), and the state is read, changed and written back: without a lock
+     * one of them would overwrite the other's change and could clear a date the other had just marked dirty.
+     * The same per-transcript lock the deliveries use serializes them; if it cannot be taken, the update is
+     * done unlocked rather than dropped (a lost "dirty" mark would leave delivered turns uncompiled).
+     */
+    lockPath?: string;
+  },
+): Promise<boolean> {
+  const run = () => compileForSessionLocked(sessionId, input, options);
+  if (!options.lockPath) return run();
+  const locked = await withTranscriptLock(options.lockPath, run);
+  return locked.ran ? locked.value : run();
+}
+
+async function compileForSessionLocked(
   sessionId: string,
   input: SessionEndInput,
   options: { delivered: number; final: boolean; intervalMin?: number; now?: number },

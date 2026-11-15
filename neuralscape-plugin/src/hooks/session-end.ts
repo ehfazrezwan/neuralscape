@@ -58,7 +58,7 @@ async function main(): Promise<void> {
     // sends whatever is still uncompiled when the session ends.
     if (client === "claude-code") {
       const delivered = await deliverClaudeCodeTurns(raw);
-      await compileForSession((raw.session_id as string) || "unknown", input, { delivered, final: false });
+      await compileForSession((raw.session_id as string) || "unknown", input, { delivered, final: false, lockPath: raw.transcript_path as string | undefined });
       return;
     }
 
