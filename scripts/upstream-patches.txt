@@ -1,0 +1,14 @@
+# Files in the vendored subtrees that carry NeuralScape patches. Each listed
+# file MUST still contain a "NEURALSCAPE PATCH" marker after an upstream sync;
+# scripts/check-upstream-patches.sh fails (non-zero) if one lost it, which
+# means the sync overwrote our patch and it must be re-applied.
+# Paths are relative to the repo root. Add a line when you add a patch.
+graphiti/graphiti_core/cross_encoder/gemini_reranker_client.py
+graphiti/graphiti_core/driver/neo4j_driver.py
+graphiti/graphiti_core/embedder/gemini.py
+graphiti/graphiti_core/llm_client/config.py
+graphiti/graphiti_core/llm_client/gemini_client.py
+mem0/mem0/configs/embeddings/base.py
+mem0/mem0/embeddings/openai.py
+mem0/mem0/graphs/configs.py
+mem0/mem0/memory/graphiti_memory.py

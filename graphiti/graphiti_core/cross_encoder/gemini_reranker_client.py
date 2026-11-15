@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING
 
 from ..helpers import semaphore_gather
 from ..llm_client import LLMConfig, RateLimitError
+from ..llm_client.config import GEMINI_HTTP_TIMEOUT_MS  # NEURALSCAPE PATCH
 from .client import CrossEncoderClient
 
 if TYPE_CHECKING:
@@ -66,7 +67,12 @@ class GeminiRerankerClient(CrossEncoderClient):
 
         self.config = config
         if client is None:
-            self.client = genai.Client(api_key=config.api_key)
+            # NEURALSCAPE PATCH (re-apply after upstream subtree syncs): bound the
+            # HTTP call (milliseconds) so a stalled Gemini request can't hang a worker.
+            self.client = genai.Client(
+                api_key=config.api_key,
+                http_options=types.HttpOptions(timeout=GEMINI_HTTP_TIMEOUT_MS),
+            )
         else:
             self.client = client
 

@@ -127,11 +127,13 @@ uv sync
 
 echo ""
 echo "==> Verifying carried NEURALSCAPE PATCH markers survived the sync..."
-# These markers tag local deviations from upstream that a subtree pull can
-# silently revert. Eyeball the list: anything you expect that's now missing was
-# overwritten and must be re-applied (see sync_graphiti notes above).
-grep -rn "NEURALSCAPE PATCH" "$REPO_ROOT/graphiti" "$REPO_ROOT/mem0" \
-    || echo "  WARNING: no NEURALSCAPE PATCH markers found — they may have been overwritten!"
+# scripts/upstream-patches.txt lists every patched file; each must still carry a
+# marker. A subtree pull can silently revert patches, so this fails the sync
+# (non-zero) if any listed file lost its marker - re-apply it, do not continue.
+"$REPO_ROOT/scripts/check-upstream-patches.sh" "$REPO_ROOT" || {
+    echo "ERROR: upstream sync dropped NEURALSCAPE PATCH markers (see above)." >&2
+    exit 1
+}
 
 echo ""
 echo "==> Running adapter tests..."
