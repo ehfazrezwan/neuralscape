@@ -1877,6 +1877,11 @@ async def v1_register_connector(req: ConnectorConfigRequest, request: Request):
         try:
             validate_mcp_config(req.config, settings.connector_stdio_commands_set())
         except ConnectorConfigError as e:
+            # Ids only: never the command, args or env (they are caller-chosen).
+            logger.warning(
+                "MCP connector registration refused: connector_id=%s owner=%s",
+                req.connector_id, _resolve_user_id(request, None),
+            )
             raise HTTPException(status_code=422, detail=str(e))
     resolved_user_id = _resolve_user_id(request, None)
     record = req.model_dump(mode="json", exclude_none=True)

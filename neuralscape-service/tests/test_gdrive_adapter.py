@@ -1,11 +1,14 @@
 """Google Drive adapter against a mocked httpx transport (no live Google calls)."""
 
+import secrets
+
 import httpx
 import pytest
 
 from connectors.adapters.gdrive import GoogleDriveAdapter
 
-CREDS = {"client_id": "cid", "client_secret": "sec", "refresh_token": "rt"}
+_RT = secrets.token_hex(8)
+CREDS = {"client_id": "cid-" + secrets.token_hex(4), "client_secret": secrets.token_hex(8), "refresh_token": _RT}
 DOC = "application/vnd.google-apps.document"
 
 
@@ -21,7 +24,7 @@ def _handler(calls):
         p = req.url.path
         if req.url.host == "oauth2.googleapis.com":
             body = dict(x.split("=", 1) for x in req.content.decode().split("&"))
-            assert body["grant_type"] == "refresh_token" and body["refresh_token"] == "rt"
+            assert body["grant_type"] == "refresh_token" and body["refresh_token"] == _RT
             return httpx.Response(200, json={"access_token": "AT"})
         assert req.headers["authorization"] == "Bearer AT"
         if p == "/drive/v3/files":
@@ -113,7 +116,7 @@ async def test_api_401_raises():
 @pytest.mark.asyncio
 async def test_missing_credentials_rejected_before_any_request():
     calls = []
-    a = _adapter(_handler(calls), creds={"client_id": "cid"})
+    a = _adapter(_handler(calls), creds={"client_id": "cid-x"})
     try:
         with pytest.raises(ValueError, match="client_secret"):
             await a.list_resources()

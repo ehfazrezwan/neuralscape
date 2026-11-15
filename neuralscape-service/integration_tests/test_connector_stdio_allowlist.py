@@ -24,6 +24,8 @@ from connectors.registry import build_adapter
 from connectors.stdio_policy import ConnectorConfigError
 from connectors.vault import ConnectorVault
 
+pytestmark = pytest.mark.integration
+
 FIXTURE = str(Path(__file__).with_name("mcp_stdio_fixture_server.py"))
 COMMAND = [sys.executable, FIXTURE]
 
@@ -144,3 +146,71 @@ def test_stdio_disabled_when_allowlist_empty(stack, monkeypatch):
     cfg = {"transport": "stdio", "command": COMMAND[0], "args": COMMAND[1:]}
     r = client.post("/v1/connectors", json=_body(cid, cfg))
     assert r.status_code == 422 and "not enabled" in r.json()["detail"]
+
+
+# ── worker sync path (process_connector_sync), real Redis vault + real subprocess ──
+
+
+def _worker_ctx(vault):
+    return {"vault": vault, "service": object()}
+
+
+@pytest.fixture
+def ingested(monkeypatch):
+    """Capture what the sync would ingest; the stores behind ingest are out of scope here."""
+    import ingest.pipeline as pipeline
+    import worker
+
+    docs: list = []
+
+    def fake_ingest(service, doc):
+        docs.append(doc)
+        return {"adapter": None, "graph_jobs": []}
+
+    async def no_graph(*a, **k):
+        return None
+
+    monkeypatch.setattr(pipeline, "ingest_document", fake_ingest)
+    monkeypatch.setattr(worker, "_enqueue_graph_jobs", no_graph)
+    return docs
+
+
+def test_worker_sync_ingests_allowlisted_stdio_resources(stack, ingested):
+    import worker
+
+    client, vault, created = stack
+    cid = _id()
+    created.append(cid)
+    cfg = {"transport": "stdio", "command": COMMAND[0], "args": COMMAND[1:]}
+    assert client.post("/v1/connectors", json=_body(cid, cfg)).status_code == 201
+    generation = asyncio.run(vault.get(cid))["generation"]
+
+    result = asyncio.run(worker.process_connector_sync(_worker_ctx(vault), cid, generation))
+
+    assert result["synced"] == 2, result
+    texts = sorted(d.content for d in ingested)
+    assert texts == ["alpha resource body: stdio connector works", "beta resource body"]
+    assert asyncio.run(vault.get(cid))["last_synced_at"]
+
+
+def test_worker_sync_refuses_legacy_stdio_and_spawns_nothing(stack, ingested, tmp_path):
+    import worker
+
+    client, vault, created = stack
+    marker = tmp_path / "ran"
+    cid = _id()
+    created.append(cid)
+    asyncio.run(vault.put({
+        "connector_id": cid, "connector_type": "mcp", "credentials": {},
+        "owner_user_id": settings.default_user_id,
+        "config": {"transport": "stdio", "command": sys.executable,
+                   "args": ["-c", f"open({str(marker)!r}, 'w')"]},
+    }))
+    generation = asyncio.run(vault.get(cid))["generation"]
+
+    with pytest.raises(ConnectorConfigError):
+        asyncio.run(worker.process_connector_sync(_worker_ctx(vault), cid, generation))
+
+    assert not marker.exists()
+    assert ingested == []
+    assert asyncio.run(vault.get(cid))["last_synced_at"] is None

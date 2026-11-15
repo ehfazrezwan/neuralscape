@@ -275,9 +275,11 @@ class Settings(BaseSettings):
     connectors_enabled: bool = False
     vault_key: str = ""  # NEURALSCAPE_VAULT_KEY — required when connectors_enabled
     connector_sync_cron_hours: int = 6  # interval (hours) the sync cron fires
-    # CSV of exact command lines (shlex-quoted, so entries cannot contain commas)
-    # an MCP connector may spawn on the worker over the stdio transport. Empty
-    # (default) disables stdio entirely. Allowlisting a general interpreter
+    # Comma-separated exact command lines an MCP connector may spawn on the
+    # worker over the stdio transport (so an entry cannot itself contain a comma).
+    # Each entry is shell-quoted; it is normalised (shlex split + join) before
+    # comparison with the connector's command + args. Empty (default) disables
+    # stdio entirely. Allowlisting a general interpreter
     # (python, node, npx, sh ...) is equivalent to allowing arbitrary code.
     connector_stdio_commands: str = ""
 
@@ -804,7 +806,17 @@ class Settings(BaseSettings):
 
     def connector_stdio_commands_set(self) -> set[str]:
         """Parsed CSV of exact stdio command lines connectors may spawn."""
-        return {c.strip() for c in self.connector_stdio_commands.split(",") if c.strip()}
+        import shlex
+
+        out: set[str] = set()
+        for entry in self.connector_stdio_commands.split(","):
+            try:
+                parts = shlex.split(entry)
+            except ValueError:
+                continue  # unbalanced quote: never matches rather than matching loosely
+            if parts:
+                out.add(shlex.join(parts))
+        return out
 
     # ── sensitivity gate helpers ──────────────────────────────────────────
     def sensitivity_private_classes_set(self) -> set[str]:

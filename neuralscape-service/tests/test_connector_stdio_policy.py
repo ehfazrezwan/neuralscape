@@ -48,6 +48,15 @@ class TestPolicy:
         stdio_setting(" /a/x , /b/y --z ,, ")
         assert settings.connector_stdio_commands_set() == {"/a/x", "/b/y --z"}
 
+    def test_entries_are_normalised(self, stdio_setting):
+        stdio_setting("  /opt/ok/server    --readonly , '/opt/my dir/srv' \"--a b\" ,'unbalanced")
+        assert settings.connector_stdio_commands_set() == {
+            "/opt/ok/server --readonly",
+            "'/opt/my dir/srv' '--a b'",
+        }
+        validate_mcp_config({"transport": "stdio", "command": "/opt/my dir/srv", "args": ["--a b"]},
+                            settings.connector_stdio_commands_set())
+
     def test_http_default_and_explicit_ok(self):
         validate_mcp_config(None, set())
         validate_mcp_config({"url": "https://x/mcp"}, set())
@@ -111,6 +120,17 @@ class TestRegisterRoute:
         r = client.post("/v1/connectors", json=_body({"transport": "stdio", "command": "/opt/ok/server", "args": ["--readonly"]}))
         assert r.status_code == 201
 
+    def test_refusal_logged_with_ids_only(self, client, caplog):
+        import logging
+
+        with caplog.at_level(logging.WARNING):
+            client.post("/v1/connectors", json=_body(
+                {"transport": "stdio", "command": "/bin/sh", "args": ["-c", "SECRETARG"], "env": {"K": "SECRETENV"}},
+                cid="logged-1"))
+        text = caplog.text
+        assert "connector_id=logged-1" in text and "owner=" in text
+        assert "/bin/sh" not in text and "SECRETARG" not in text and "SECRETENV" not in text
+
     def test_env_refused_on_route(self, client, stdio_setting):
         stdio_setting(ALLOWED)
         r = client.post("/v1/connectors", json=_body(
@@ -147,6 +167,20 @@ class TestAdapterBackstop:
         with pytest.raises(ConnectorConfigError):
             await adapter.list_resources()
         assert spawned == []
+
+    @pytest.mark.asyncio
+    async def test_session_refusal_logged_with_ids_only(self, caplog):
+        import logging
+
+        from connectors.registry import build_adapter
+
+        adapter = build_adapter({"connector_id": "legacy-2", "connector_type": "mcp", "owner_user_id": "alice",
+                                 "credentials": {},
+                                 "config": {"transport": "stdio", "command": "/bin/sh", "args": ["-c", "SECRETARG"]}})
+        with caplog.at_level(logging.WARNING), pytest.raises(ConnectorConfigError):
+            await adapter.list_resources()
+        assert "connector_id=legacy-2 owner=alice" in caplog.text
+        assert "/bin/sh" not in caplog.text and "SECRETARG" not in caplog.text
 
     @pytest.mark.asyncio
     async def test_allowlisted_session_reaches_spawn(self, monkeypatch, stdio_setting):

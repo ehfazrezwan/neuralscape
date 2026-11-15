@@ -54,7 +54,17 @@ class MCPConnectorAdapter(ConnectorAdapter):
         from config import settings
         from connectors.stdio_policy import validate_mcp_config
 
-        validate_mcp_config(self.config, settings.connector_stdio_commands_set())
+        from connectors.stdio_policy import ConnectorConfigError
+
+        try:
+            validate_mcp_config(self.config, settings.connector_stdio_commands_set())
+        except ConnectorConfigError:
+            # Ids only: never the command, args or env (they are caller-chosen).
+            logger.warning(
+                "MCP connector config refused at session time: connector_id=%s owner=%s",
+                self.connector_id, getattr(self, "owner_user_id", None),
+            )
+            raise
 
         if self.session_factory is not None:
             async with self.session_factory() as session:
