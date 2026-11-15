@@ -80,6 +80,8 @@ class NeuralscapeClient:
         if run_id:
             body["run_id"] = run_id
         if occurred_at:
+            # Event time for historical ingestion (service ≥ PR #130); older
+            # services ignore the extra field, so this is version-agnostic.
             body["occurred_at"] = occurred_at
         r = await self._http.post("/v1/memories", json=body)
         r.raise_for_status()

@@ -99,17 +99,35 @@ def project_preference() -> dict[str, str]:
     }
 
 
-def _is_missing_field(error: Exception, field: str) -> bool:
-    """True for a validation error whose only complaint is that ``field`` was not supplied."""
+def _is_missing_field(error: BaseException, field: str) -> bool:
+    """True only for pydantic's own validation error whose every complaint is that ``field`` was not supplied.
 
-    errors = getattr(error, "errors", None)
-    if not callable(errors):
+    Decided by exact type and the base class's own accessors, never by what the error says about itself: a
+    target's exception that merely offers an ``errors()`` method, or items whose ``get`` answers for another
+    error, is not a refusal.
+    """
+
+    try:
+        from pydantic_core import ValidationError as PydanticValidationError
+    except ImportError:
+        return False
+    if type(error) is not PydanticValidationError:
         return False
     try:
-        details = errors()
-        return bool(details) and all(item.get("type") == "missing" and tuple(item.get("loc", ())) == (field,) for item in details)
+        details = PydanticValidationError.errors(error)
     except Exception:  # noqa: BLE001 - an unreadable error is not a recognised refusal
         return False
+    if type(details) is not list or not details:
+        return False
+    for item in details:
+        if type(item) is not dict:
+            return False
+        kind, loc = dict.get(item, "type"), dict.get(item, "loc")
+        if type(kind) is not str or kind != "missing":
+            return False
+        if type(loc) is not tuple or len(loc) != 1 or type(loc[0]) is not str or loc[0] != field:
+            return False
+    return True
 
 
 def citation_resolution() -> dict[str, str]:

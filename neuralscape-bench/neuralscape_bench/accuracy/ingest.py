@@ -140,8 +140,11 @@ async def ingest_conversation(client: NeuralscapeClient, conv: Conversation, *,
         t0 = time.perf_counter()
         task_ids: list[str] = []
         ok = True
-        # T1.3: parse session date to ISO 8601 for event-time grounding
-        occurred_at = parse_session_date(session.date) if session.date else None
+        # Event-time grounding: a suite-supplied deterministic ``occurred_at``
+        # (DMR: fixed anchor minus time_back) wins; otherwise parse the
+        # dataset-native date string (T1.3).
+        occurred_at = session.occurred_at or (
+            parse_session_date(session.date) if session.date else None)
         for batch in _batches(messages):
             resp = await _with_backoff(
                 lambda b=batch, oa=occurred_at: client.extract_write(

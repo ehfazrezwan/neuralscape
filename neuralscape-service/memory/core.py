@@ -1,7 +1,9 @@
 """Core lazy-init plumbing for MemoryService: mem0/Graphiti/genai clients and Qdrant indexes.
 
-Mechanically extracted from memory_service.py (mixins-with-facade split);
-code is verbatim — behavior unchanged.
+``CoreMixin`` was mechanically extracted from memory_service.py (mixins-with-facade
+split) with its behavior unchanged. The Qdrant cold-start helpers above it
+(``_memory_from_config`` and the 409/500 detectors, PR #453) were written
+afterwards and are not part of that extraction.
 """
 
 import logging
@@ -17,8 +19,9 @@ logger = logging.getLogger(__name__)
 # Each can cost two failed attempts, a 409 from our create and then a 500 from
 # reading it while another process finishes creating it, so the worst
 # expected start uses four. A collection being created was readable within
-# about 0.1 s in live boots, against 2.8 s of total backoff here. A fault that
-# persists still fails start-up after the last attempt.
+# 0.1 to 0.16 s in live boots (0.155 s was the slowest observed), against 2.8 s
+# of total backoff here (sleeps of 0.1 * attempt after attempts 1 to 7). A fault
+# that persists still fails start-up after the last attempt.
 _COLD_START_ATTEMPTS = 8
 
 
