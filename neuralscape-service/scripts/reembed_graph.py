@@ -55,6 +55,8 @@ _SERVICE_DIR = _HERE.parent
 if str(_SERVICE_DIR) not in sys.path:
     sys.path.insert(0, str(_SERVICE_DIR))
 
+import third_party_telemetry  # noqa: E402,F401 — must precede any mem0/Graphiti import (defaults their telemetry off)
+
 # (kind, label/type, property, text property used when re-embedding)
 TARGETS: tuple[tuple[str, str, str, str], ...] = (
     ("node", "Entity", "name_embedding", "name"),
