@@ -29,6 +29,7 @@ import argparse
 import hashlib
 import importlib.util
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -36,7 +37,7 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 
 import persona_evidence
-from evidence_records import EvidenceRecord, EvidenceWriter, compare, facts, render_report
+from evidence_records import EvidenceRecord, EvidenceWriter, RecordConflict, UnsafePath, compare, facts, render_report
 
 HERE = Path(__file__).resolve().parent
 REPRODUCTIONS = "test_baseline_reproductions.py"
@@ -82,6 +83,19 @@ OBSERVED_LIVE = {"job-key-omits-store-scope": "rs-job-keys", "job-key-omits-raw-
                  "readiness-probes-backends": "rs-readiness"}
 
 
+def _python(tree: Path) -> str:
+    """The tree's own interpreter when it has one, else the harness's (a plain checkout or fixture tree)."""
+
+    own = tree / ".venv" / "bin" / "python"
+    return str(own) if own.exists() else sys.executable
+
+
+def _limited(command: list[str]) -> list[str]:
+    """Cap the child's address space where ``prlimit`` exists (Linux); elsewhere run it as given."""
+
+    return ["prlimit", "--as=8589934592", "--", *command] if shutil.which("prlimit") else command
+
+
 def sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
@@ -119,11 +133,13 @@ def run_replacements(tree: Path, test_ids: tuple[str, ...]) -> str:
     environment (passing it in makes their fixtures see a second, conflicting configuration).
     """
 
-    done = subprocess.run(
-        ["prlimit", "--as=8589934592", "--", str(tree / ".venv" / "bin" / "python"), "-m", "pytest",
-         *test_ids, "-q", "-p", "no:cacheprovider"],
-        cwd=str(tree), capture_output=True, text=True, timeout=900,
-    )
+    try:
+        done = subprocess.run(
+            _limited([_python(tree), "-m", "pytest", *test_ids, "-q", "-p", "no:cacheprovider"]),
+            cwd=str(tree), capture_output=True, text=True, timeout=900,
+        )
+    except subprocess.TimeoutExpired:
+        return "fail:timeout"
     tail = (done.stdout.strip().splitlines() or ["no output"])[-1]
     counts = "_".join(part.replace(" ", "-") for part in tail.split(" in ")[0].split(", "))
     return ("pass" if done.returncode == 0 else "fail") + ":" + counts[:60]
@@ -135,6 +151,8 @@ def run_reproductions(tree: Path, inputs: Path, junit: Path, env: dict[str, str]
     source = inputs / REPRODUCTIONS
     target = tree / "tests" / REPRODUCTIONS
     placed = False
+    if not (tree / "tests").is_dir():
+        return {}, "the tree has no tests directory: not run"
     if target.exists():
         if sha256(target) != sha256(source):
             return {}, "the tree carries a different copy of the reproductions (oracle edited): not run"
@@ -142,13 +160,15 @@ def run_reproductions(tree: Path, inputs: Path, junit: Path, env: dict[str, str]
         shutil.copyfile(source, target)  # untracked copy in a disposable checkout, removed below
         placed = True
     try:
-        import os
-
-        subprocess.run(
-            ["prlimit", "--as=8589934592", "--", str(tree / ".venv" / "bin" / "python"), "-m", "pytest",
-             f"tests/{REPRODUCTIONS}", "-q", "-p", "no:cacheprovider", f"--junitxml={junit}"],
-            cwd=str(tree), capture_output=True, text=True, timeout=900, env={**os.environ, **(env or {})},
-        )
+        junit.unlink(missing_ok=True)  # a report left by an earlier run must never be read as this run's
+        try:
+            subprocess.run(
+                _limited([_python(tree), "-m", "pytest", f"tests/{REPRODUCTIONS}", "-q", "-p", "no:cacheprovider",
+                          f"--junitxml={junit}"]),
+                cwd=str(tree), capture_output=True, text=True, timeout=900, env={**os.environ, **(env or {})},
+            )
+        except subprocess.TimeoutExpired:
+            return {}, "pytest timed out"
         if not junit.exists():
             return {}, "pytest produced no report"
         return _outcomes(junit), ""
@@ -229,12 +249,18 @@ print(json.dumps(out, sort_keys=True))
 
 
 def surface(tree: Path) -> dict:
-    done = subprocess.run(
-        ["prlimit", "--as=8589934592", "--", str(tree / ".venv" / "bin" / "python"), "-c", _SURFACE_PROBE],
-        cwd=str(tree), capture_output=True, text=True, timeout=300,
-    )
+    try:
+        done = subprocess.run(
+            _limited([_python(tree), "-c", _SURFACE_PROBE]),
+            cwd=str(tree), capture_output=True, text=True, timeout=300,
+        )
+    except subprocess.TimeoutExpired:
+        return {"errors": ["surface probe timed out"]}
     lines = [line for line in done.stdout.splitlines() if line.startswith("{")]
-    return json.loads(lines[-1]) if lines else {"errors": ["surface probe failed: " + done.stderr[-300:]]}
+    try:
+        return json.loads(lines[-1]) if lines else {"errors": ["surface probe failed: " + done.stderr[-300:]]}
+    except ValueError:
+        return {"errors": ["surface probe printed an unreadable result"]}
 
 
 # ------------------------------------------------------------------ runner
@@ -244,7 +270,7 @@ def run(args: argparse.Namespace) -> None:
     inputs, out = Path(args.inputs), Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     registry = load_registry(inputs)
-    writer = EvidenceWriter(out / "evidence.jsonl")
+    writer = EvidenceWriter(out / "evidence.jsonl", protected=[inputs / "evidence_registry.py", inputs / REPRODUCTIONS])
     repro_sha = sha256(inputs / REPRODUCTIONS)
     registry_sha = sha256(inputs / "evidence_registry.py")
     trees = (("baseline", Path(args.baseline), args.baseline_ref, args.compose_project_baseline),
@@ -297,19 +323,33 @@ def run(args: argparse.Namespace) -> None:
                 ))
         (out / f"surface-{role}.json").write_text(json.dumps(surface(tree), indent=1, sort_keys=True))
     read = writer.read()
-    (out / "comparison.md").write_text(render_report(compare(read.records)))
+    text = render_report(compare(read.records))
+    if read.invalid_lines or read.partial_tail:  # a damaged file must not read as a clean comparison
+        notes = ["", "## Evidence integrity", ""]
+        if read.invalid_lines:
+            notes.append(f"- {len(read.invalid_lines)} invalid line(s) at line number(s) "
+                         f"{', '.join(map(str, read.invalid_lines[:20]))}")
+        if read.partial_tail:
+            notes.append("- partial tail: the file ends without a newline (an interrupted append)")
+        notes.append("- this comparison is built from the valid records only and is incomplete")
+        text = text.rstrip("\n") + "\n" + "\n".join(notes) + "\n"
+    (out / "comparison.md").write_text(text)
 
 
 def realservice(tree: Path, project: str, compose_file: str, extra: list[str] | None = None) -> dict:
-    done = subprocess.run(
-        [sys.executable, str(HERE / "comp1_realservice.py"), "--service-dir", str(tree),
-         "--compose-project", project, "--compose-file", compose_file, *(extra or [])],
-        capture_output=True, text=True, timeout=900,
-    )
+    try:
+        done = subprocess.run(
+            [sys.executable, str(HERE / "comp1_realservice.py"), "--service-dir", str(tree),
+             "--compose-project", project, "--compose-file", compose_file, *(extra or [])],
+            capture_output=True, text=True, timeout=900,
+        )
+    except subprocess.TimeoutExpired:
+        return {"job_keys": {"error": "probe timed out"}, "readiness": {"error": "probe timed out"}}
     lines = [line for line in done.stdout.splitlines() if line.startswith("{")]
-    if not lines:
+    try:
+        return json.loads(lines[-1]) if lines else {"job_keys": {"error": "probe failed"}, "readiness": {"error": "probe failed"}}
+    except ValueError:
         return {"job_keys": {"error": "probe failed"}, "readiness": {"error": "probe failed"}}
-    return json.loads(lines[-1])
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -325,8 +365,34 @@ def main(argv: list[str] | None = None) -> int:
     runner.add_argument("--candidate-env", action="append", default=[], help="KEY=VALUE for the candidate")
     runner.add_argument("--candidate-realservice-args", default="", help="extra probe arguments for the candidate")
     args = parser.parse_args(argv)
-    run(args)
+    problem = _check(args)
+    if problem:
+        print(f"error: {problem}", file=sys.stderr)
+        return 2
+    try:
+        run(args)
+    except (persona_evidence.RunIdentityConflict, persona_evidence.OracleError, RecordConflict, UnsafePath) as refusal:
+        print(f"error: {type(refusal).__name__}: {refusal}", file=sys.stderr)
+        return 2
     return 0
+
+
+def _check(args: argparse.Namespace) -> str:
+    """The reason the arguments cannot be run, or an empty string."""
+
+    inputs = Path(args.inputs)
+    for name in ("evidence_registry.py", REPRODUCTIONS):
+        if not (inputs / name).is_file():
+            return f"the inputs directory has no {name}"
+    for name in ("baseline", "candidate"):
+        if not Path(getattr(args, name)).is_dir():
+            return f"--{name} is not a directory: {getattr(args, name)}"
+    for item in args.candidate_env:
+        if "=" not in item:
+            return f"--candidate-env needs KEY=VALUE, got {item!r}"
+    if (args.compose_project_baseline or args.compose_project_candidate) and not args.compose_file:
+        return "--compose-file is required with a compose project"
+    return ""
 
 
 if __name__ == "__main__":
