@@ -114,8 +114,8 @@ def test_invalidate_stamps_the_old_rows_edges_and_leaves_unrelated_edges_live(dr
 def test_invalidate_when_both_rows_are_enriched_holds_whoever_stamped_first(dream_env):
     """Production enriches the superseding row too, so Graphiti may already have invalidated the
     old edge (contradiction handling) before the dream runs. The assertions hold whichever side
-    stamped first: every old edge ends invalid, a pre-existing invalid_at is neither cleared nor
-    moved, unrelated edges stay live, and the action reports success."""
+    stamped first: every edge asserted only by the old row ends invalid and expired, a pre-existing
+    invalid_at / expired_at is neither cleared nor moved, unrelated edges stay live, and the action reports success."""
     env = dream_env
     old_text = "Odalys Fennimore works as the harbour pilot at the Kestrel Quay in Tromso."
     new_text = "Odalys Fennimore now works as the harbour pilot at the Plover Dock in Bergen."
@@ -126,7 +126,7 @@ def test_invalidate_when_both_rows_are_enriched_holds_whoever_stamped_first(drea
     for mid, text in ((old, old_text), (new, new_text), (other, other_text)):
         _enrich(env, mid, text)
 
-    old_before = {e["uuid"]: e["invalid_at"] for e in _edges_of(env, old)}
+    old_before = {e["uuid"]: (e["invalid_at"], e["expired_at"]) for e in _edges_of(env, old)}
     other_before = _edges_of(env, other)
     assert old_before, "precondition: graph extraction produced no edge for the old row's episode"
     assert other_before, "precondition: graph extraction produced no edge for the unrelated row's episode"
@@ -150,12 +150,15 @@ def test_invalidate_when_both_rows_are_enriched_holds_whoever_stamped_first(drea
             "RETURN r.uuid AS uuid", g=env.pool, m=old,
         )
     }
+    assert exclusive, "precondition: no edge was asserted only by the old row's episode"
     after_old = {e["uuid"]: e for e in _edges_of(env, old)}
     for uuid_ in exclusive:
-        assert after_old[uuid_]["invalid_at"] is not None, uuid_
-    for uuid_, before in old_before.items():
-        if before is not None:  # Graphiti stamped first: the dream must not clear or move it
-            assert after_old[uuid_]["invalid_at"] == before, (uuid_, before, after_old[uuid_])
+        assert after_old[uuid_]["invalid_at"] is not None and after_old[uuid_]["expired_at"] is not None, uuid_
+    for uuid_, (inv_before, exp_before) in old_before.items():
+        if inv_before is not None:  # Graphiti stamped first: the dream must not clear or move it
+            assert after_old[uuid_]["invalid_at"] == inv_before, (uuid_, inv_before, after_old[uuid_])
+        if exp_before is not None:
+            assert after_old[uuid_]["expired_at"] == exp_before, (uuid_, exp_before, after_old[uuid_])
     for e in _edges_of(env, other):
         assert e["invalid_at"] is None and e["expired_at"] is None, e
     marked = _cypher(
