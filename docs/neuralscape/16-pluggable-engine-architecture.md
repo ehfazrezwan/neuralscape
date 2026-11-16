@@ -1,6 +1,6 @@
 # Neuralscape Pluggable-Engine Architecture: Ports, Default Adapters, and Per-Use-Case Routing
 
-> **Status (as of 2026-11-16, dev 6a81341f):** design, not built. The `VectorPort`/`GraphPort` abstraction and per-use-case engine routing designed here were not built as described. What did land is a different mechanism: the `knowledge/` registry and router (`KnowledgeSystem`, `knowledge/router.py`) for code-intel engines, plus the config-driven providers described in [06-storage-backends](./06-storage-backends.md). Plan-named work that was never started.
+> **Status (as of 2026-11-16, dev 6a81341f):** design, not built. The `VectorPort`/`GraphPort` abstraction and per-use-case engine routing designed here were not built as described. What did land is a different mechanism: the `knowledge/` registry and router (`KnowledgeSystem`, `knowledge/router.py`) for code-intel engines, plus the existing configuration of the LLM and embedder choice described in [06-storage-backends](./06-storage-backends.md). The vector and graph providers (Qdrant and Neo4j) are still hardcoded. Plan-named work that was never started.
 
 *Design doc. Builds on doc 13 (coupling), doc 14 (version-drift), doc 15 (feature parity). Goal: turn Neuralscape from "is a mem0 instance that holds a graphiti instance" into an orchestration layer that drives **any** vector store and **any** temporal graph store — with mem0 and graphiti as the **default, first-class** adapters, not hard dependencies — and with the ability to **route different use-cases to different engines.***
 

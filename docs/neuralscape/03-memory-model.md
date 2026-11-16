@@ -15,7 +15,7 @@ The neuralscape memory model is structured along three orthogonal axes: **13 cat
 
 ## Categories
 
-The full taxonomy is defined in `neuralscape-service/schemas.py` (enum) and `neuralscape-service/schemas.py` (descriptions). Default scope is computed by `default_scope_for_category` (`schemas.py`).
+The full taxonomy is defined in `neuralscape-service/schemas.py` (the category enum and the category descriptions). Default scope is computed by `default_scope_for_category` (`schemas.py`).
 
 | # | Category | Type Group | Default Scope | Description |
 |---|----------|-----------|---------------|-------------|
@@ -70,8 +70,10 @@ Graphiti's `group_id` is built by `_build_group_id` (and read back as a set by `
 | private | set | `user--{user_id}--project--{project_id}` |
 | shared | none | `shared` |
 | shared | set | `shared--project--{project_id}` |
+| standard (authoritative tier, when enabled) | none | `standard` |
+| standard | set | `standard--project--{project_id}` |
 
-A non-default workspace appends `--ws--{workspace}` (the default `memory` workspace adds no suffix, so existing ids are unchanged). Components that would be ambiguous under the `--` delimiter are encoded injectively; see the comments at the top of `memory/groups.py` for the exact rule. The Qdrant side filters on the `metadata.*` payload fields (scope, project_id, visibility, user) rather than on a group_id string.
+A non-default workspace appends `--ws--{workspace}` (the default `memory` workspace adds no suffix, so existing ids are unchanged). These are the legacy names, and they are the ones in use: a user or project id that itself contains `--` can collide with another tuple. An injective naming exists behind `GRAPH_GROUP_ID_INJECTIVE_ENABLED` (default off): it writes `nsg1--<hex>` group ids for components that would otherwise be ambiguous (see the comments at the top of `memory/groups.py`). `Settings` currently refuses to start with that flag on, because the read-side call sites have not all adopted the group-id builder yet, so treat it as not available. The Qdrant side filters on the `metadata.*` payload fields (scope, project_id, visibility, user) rather than on a group_id string.
 
 > **Historical note.** Earlier versions used the bare tokens `global` and `project--{project_id}` for every user (commit `2edd9b5`). That layout let users share one graph namespace and was replaced by the per-user and `shared` namespaces above. Search with a `project_id` reads the caller's global and project groups, plus the shared groups when `include_shared` is set, and merges the results.
 
@@ -292,20 +294,15 @@ one-to-one: user `alice--project--payroll` and user `alice` in project
 folds every run of disallowed characters to one `-`, so `a+b@example.com` and
 `a-b@example.com` both slug to `a-b-example.com`.
 
-- **Group ids.** Injective (collision-free) graph group ids are owned by PR #501
-  (`GRAPH_GROUP_ID_INJECTIVE_ENABLED`, default off) and are not part of the authority slice. Until it is enabled
-  the legacy names still collide for ids containing `--`. Deployments using `NS_AUTH_PROFILE=enforced` should
-  enable it once #501 lands. The policy layer does not depend on it: it keys pools by the structured `ns1`
-  namespace, never by a group name.
+- **Group ids.** Injective (collision-free) graph group ids (`nsg1--<hex>`) are behind `GRAPH_GROUP_ID_INJECTIVE_ENABLED`, default off, and not part of the authority slice. Until they can be enabled the legacy names still collide for ids containing `--`. The policy layer does not depend on it: it keys pools by the structured `ns1` namespace, never by a group name.
 - **Fresh login ids.** The email slug is lossy; a collision between two different emails is resolved at first
   login (a hash-suffixed id for the newcomer, `login_providers.provision_user_id`), not by this slice. The
-  profile-gated `_x`/`_h` derivation that the authority slice carried is deferred
-  (`reports/p2-deferred-hunks/p2-02-identity-slug.patch`).
+  profile-gated `_x`/`_h` derivation that the authority slice carried is deferred.
 
 **Migration:**
 
 - **Unaffected:** plain tuples keep their group ids and every existing login keeps its id.
-- **Group ids that change (when #501's flag is on):** only for users, projects or workspaces whose
+- **Group ids that change (if the injective flag is ever enabled):** only for users, projects or workspaces whose
   value contains `.` or `--`. A dotted value
   (for example the slug `first.last-example.com`) never had a usable legacy
   graph name, because Graphiti refuses `.` in a group id, so it has no graph

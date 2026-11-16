@@ -207,11 +207,11 @@ if project_id and not scope:
 
 ### Graph search via the bridge
 
-`search_graph` (`memory/search.py`) wraps a Graphiti `g.search_()` call with `EDGE_HYBRID_SEARCH_RRF` (Reciprocal Rank Fusion across BM25, vector, and edge text). Group IDs are taken from `_get_group_ids(project_id)` so global edges are always included. Because Graphiti is async-only, the call goes through `_run_on_bridge` (`memory/core.py`) which schedules the coroutine on the bridge's dedicated event loop with a 30-second timeout and cancels on timeout.
+`search_graph` (`memory/search.py`) wraps a Graphiti `g.search_()` call with `EDGE_HYBRID_SEARCH_RRF` (Reciprocal Rank Fusion across BM25, vector, and edge text). Group IDs are taken from `_get_group_ids(caller_user_id, project_id)`, which returns the caller's private groups plus the shared (and, when enabled, standard) pools. Because Graphiti is async-only, the call goes through `_run_on_bridge` (`memory/core.py`) which schedules the coroutine on the bridge's dedicated event loop with a 30-second timeout and cancels on timeout.
 
 ### Result merge
 
-After both phases run, `_deduplicate_responses` (`memory/search.py`) lowercases and strips each vector response into a `seen_content` set, then drops any graph response whose content is an exact-or-substring match. The remaining unique results are interleaved (vector-1, graph-1, vector-2, graph-2, …) and truncated to `limit`. Graph search failures are caught and logged as non-critical (`memory/search.py`) so an unreachable Neo4j never breaks recall — vector-only results still flow back to the caller.
+After both phases run, `_deduplicate_responses` (`memory/search.py`) lowercases and strips each vector response into a `seen_content` set, then drops any graph response whose content is an exact-or-substring match. The remaining unique results are fused into one merit-ranked list: both legs carry cosine scores in the same space, so graph rows rank among the vector hits on score, with no fixed quota or cap, and the list is truncated to `limit`. (The original design interleaved the two legs one to one; that was replaced because it let unscored graph rows evict ranked vector hits.) Graph search failures are caught and logged as non-critical (`memory/search.py`) so an unreachable Neo4j never breaks recall — vector-only results still flow back to the caller.
 
 ## Scope and group_id
 
@@ -303,6 +303,9 @@ Return shape: `{user_id, exact_duplicates_removed, semantic_duplicates_removed, 
 The graph re-ingest on an edit (in `patch_memory`, `memory/edit.py`; formerly `update_memory`) is the only path that triggers a deliberate re-ingestion into Graphiti. The motivation is contradiction handling: when a user updates a stored fact (e.g., "prefers dark mode" → "prefers light mode"), the new content needs to flow through Graphiti's edge-extraction pipeline so it can detect the contradiction and expire the stale edge.
 
 ```python
+# HISTORICAL: the pre-split update_memory snippet, kept to show the idea.
+# Its _build_group_id(scope, project_id) call no longer exists; the current
+# signature is _build_group_id(visibility, user_id, project_id, workspace).
 if content and existing and self._graphiti and self._bridge:
     try:
         metadata = existing.get("metadata", {}) or {}
@@ -319,7 +322,7 @@ if content and existing and self._graphiti and self._bridge:
     except Exception as e:
         logger.warning(f"Graph re-ingestion failed for {memory_id} (non-critical): {e}")
 ```
-(abridged from the pre-split `update_memory`; the logic now lives in `memory/edit.py`)
+(historical, from the pre-split `update_memory`; the current logic lives in `patch_memory` in `memory/edit.py` and builds the group id with the current `_build_group_id`)
 
 The vector update is the source of truth and propagates errors. The graph re-ingest is best-effort: if it fails, the vector reflects the new content and the graph keeps the old edges until the next manual cleanup. Note that the existing memory record is fetched **before** the update (in `memory/edit.py`) so its `user_id` and metadata can be reused for the graph filters.
 
@@ -373,7 +376,7 @@ if project_id is not None:
     project_ids_to_scan = [project_id]
 else:
     # None = global group, then all known projects
-    project_ids_to_scan = [None] + ALL_KNOWN_PROJECTS
+    project_ids_to_scan = [None] + settings.known_projects
 ```
 (abridged from `delete_junk_episodes` in `memory/graph_admin.py`)
 

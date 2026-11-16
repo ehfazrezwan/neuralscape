@@ -1,6 +1,6 @@
 # ICE v2 Hardening Fixes — Fable Review MUST-FIX Items
 
-> **Status (as of 2026-11-16, dev 6a81341f):** historical. A record of the Fable-review fixes applied during the ICE v2 work. The M3 item (the `knowledge_system` parameter) has since been superseded: the parameter is wired for the code tools and is no longer marked EXPERIMENTAL. File and line citations below are as of that change and have drifted.
+> **Status (as of 2026-11-16, dev 6a81341f):** historical. A record of the independent-review fixes applied during the ICE v2 work. The M3 item (the `knowledge_system` parameter) has since been superseded: the parameter is wired for the code tools and is no longer marked EXPERIMENTAL. File and line citations below are as of that change and have drifted.
 
 This document details the fixes applied to address all 5 MUST-FIX items from the Fable review (ice-v2-fable-review.md §5), plus 2 cheap known-issues (KI#6, KI#12).
 

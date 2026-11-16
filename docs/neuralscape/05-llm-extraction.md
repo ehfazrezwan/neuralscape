@@ -29,7 +29,7 @@ Use ONLY these categories:
 
 After that introduction the prompt embeds all 13 categories inline as a bulleted list — `preference`, `personal_fact`, `technical_skill`, `domain_knowledge`, `tech_stack`, `convention`, `architecture`, `dependency`, `decision`, `interaction`, `workflow`, `procedure`, `task_context`. Each category gets a one-line gloss so the model can disambiguate (for example `[architecture]` is described as "Design decisions, module boundaries, API patterns" while `[convention]` is "Coding conventions, naming, file structure"). The category list is duplicated here from `schemas.MEMORY_CATEGORIES`; the enum is the source of truth for parser validation, but the prompt copy is what the model actually sees. See [03-memory-model](./03-memory-model.md) for how those categories map to scopes.
 
-The prompt then issues eight rules. Rules 1-6 are about quality (factual only, standalone sentences, specificity, dedup, pick the most specific category, mention project name when known). Rules 7-8 (lines 52-53) are the junk-filter rules and they are unusually emphatic:
+The prompt then issues eight rules. Rules 1-6 are about quality (factual only, standalone sentences, specificity, dedup, pick the most specific category, mention project name when known). Rules 7 and 8 are the junk-filter rules and they are unusually emphatic:
 
 ```text
 7. NEVER extract raw tool operations, shell commands run, files
@@ -47,14 +47,14 @@ The prompt closes by demanding a JSON envelope of the form `{"facts": ["[categor
 
 `parse_extraction_response()` (`prompts.py`) is the only consumer of the LLM's text output. It does three things in order:
 
-1. **Strip markdown code-block wrappers.** Gemini occasionally wraps its JSON in ```json … ``` even when not asked. Lines 104-107 strip a leading ```` ```json ```` (or just ```` ``` ````) and a trailing ```` ``` ```` before the JSON loader sees it.
-2. **Try `json.loads()`.** If the response is valid JSON the `facts` key is read directly (line 109-110).
-3. **Regex fallback.** If `json.loads()` raises `JSONDecodeError` (or the response was somehow not a string), the parser walks the response line-by-line and keeps every line that starts with a `[category]` bracket (lines 111-118). This is a pragmatic salvage path — Gemini sometimes returns a markdown bullet list or a half-broken JSON object, and the regex fallback recovers most of the content.
+1. **Strip markdown code-block wrappers.** Gemini occasionally wraps its JSON in ```json … ``` even when not asked. `parse_extraction_response` in `prompts.py` strips a leading ```` ```json ```` (or just ```` ``` ````) and a trailing ```` ``` ```` before the JSON loader sees it.
+2. **Try `json.loads()`.** If the response is valid JSON the `facts` key is read directly.
+3. **Regex fallback.** If `json.loads()` raises `JSONDecodeError` (or the response was somehow not a string), the parser walks the response line-by-line and keeps every line that starts with a `[category]` bracket. This is a pragmatic salvage path — Gemini sometimes returns a markdown bullet list or a half-broken JSON object, and the regex fallback recovers most of the content.
 
 Each surviving line is then handed to `parse_category_from_fact()` (`prompts.py`). That function applies the regex `^\[(\w+)\]\s*(.+)$` and validates the captured category against `MEMORY_CATEGORIES`. Three cases:
 
 - **Valid category** — return `(category_lower, content)`.
-- **Bracket present but unknown category** — log a warning at line 86 (`Unknown category '<x>' in fact, defaulting to personal_fact`) and emit `("personal_fact", content)`.
+- **Bracket present but unknown category** — log a warning in `parse_category_from_fact` (`Unknown category '<x>' in fact, defaulting to personal_fact`) and emit `("personal_fact", content)`.
 - **No bracket at all** — silently treat the whole string as a `personal_fact`.
 
 The default-to-`personal_fact` policy means the pipeline never throws on a malformed extraction; the worst-case outcome is a fact stored under a generic category rather than dropped.
@@ -147,15 +147,15 @@ The `Memory.from_config()` constructor consumes the dict built by `Settings.get_
 },
 ```
 
-`provider: "gemini"` resolves through mem0's factory (`mem0/utils/factory.py` for LLMs, `:145` for embedders) to `mem0.llms.gemini.GeminiLLM` and `mem0.embeddings.gemini.GoogleGenAIEmbedding`. The graph store block also receives Gemini wiring — `graphiti_llm_provider`, `graphiti_llm_model`, `graphiti_llm_fallback_model`, `graphiti_embedder_model`, and `graphiti_reranker_provider` — so Graphiti uses the same model family for entity extraction inside the knowledge graph. The CLAUDE.md note at the project root warns that after upstream syncs `mem0/configs.py` and `mem0/utils/factory.py` should be checked for provider-registration conflicts.
+`provider: "gemini"` resolves through mem0's factory (`mem0/utils/factory.py`, the LLM and embedder factories) to `mem0.llms.gemini.GeminiLLM` and `mem0.embeddings.gemini.GoogleGenAIEmbedding`. The graph store block also receives Gemini wiring — `graphiti_llm_provider`, `graphiti_llm_model`, `graphiti_llm_fallback_model`, `graphiti_embedder_model`, and `graphiti_reranker_provider` — so Graphiti uses the same model family for entity extraction inside the knowledge graph. The CLAUDE.md note at the project root warns that after upstream syncs `mem0/configs.py` and `mem0/utils/factory.py` should be checked for provider-registration conflicts.
 
 ## Retry strategy
 
 `retry_transient()` (`memory/retry.py`) is the unified retry helper for every Gemini call in the service — extraction, embedding, and graph add all use it. Its logic:
 
 1. **Transient detection by message substring.** `_is_transient()` (`memory/retry.py`) scans the exception's stringified message for any of `503`, `429`, `UNAVAILABLE`, `RESOURCE_EXHAUSTED`, `rate limit`, `overloaded`, `capacity`, `timed out`, `timeout`. Anything else is re-raised immediately so genuine bugs (auth failures, schema errors) propagate.
-2. **Exponential backoff with jitter.** On a transient error, sleep for `min(base * 2 ** attempt + uniform(0, 1), max_delay)` . Defaults from `config.py` (`llm_retry_*` settings) are 3 retries, 1.0 s base, 30 s cap. Each retry logs a warning with the attempt counter and the upcoming delay.
-3. **Fallback model.** If the primary model exhausts its retry budget on transient errors and a `fallback_model` was passed, the helper swaps `kwargs["model"]` to the fallback and tries one final time . Extraction passes `fallback_model=settings.gemini_llm_fallback_model` so a degraded `gemini-3-flash-preview` falls through to the stable `gemini-2.5-flash`.
+2. **Exponential backoff with jitter.** On a transient error, sleep for `min(base * 2 ** attempt + uniform(0, 1), max_delay)`. Defaults from `config.py` (`llm_retry_*` settings) are 3 retries, 1.0 s base, 30 s cap. Each retry logs a warning with the attempt counter and the upcoming delay.
+3. **Fallback model.** If the primary model exhausts its retry budget on transient errors and a `fallback_model` was passed, the helper swaps `kwargs["model"]` to the fallback and tries one final time. Extraction passes `fallback_model=settings.gemini_llm_fallback_model` so a degraded primary model (`gemini-3.1-flash-lite` by default) falls through to the stable `gemini-2.5-flash`.
 
 ## Failure modes
 
