@@ -130,18 +130,11 @@ FORBIDDEN_MEMORY_METHODS = {
     "_link_entities_for_memory", "_remove_memory_from_entity_store",
 }
 
-# NOT AN ENDORSEMENT. Exactly two calls, in exactly one file, are tolerated
-# pending an OWNER decision. The entity store (the Qdrant collection
-# ``<collection>_entities``) is read only by mem0's native search, which this
-# service never calls. These calls keep it written from the compare-and-set edit
-# path (PR #531), so they are orphan work (an embedding call per extracted entity
-# on every content edit) whose removal is the owner's call. The exception exists
-# only so this fence does not turn dev red; any other file calling them, or
-# edit.py calling any other forbidden method, still fails.
-PENDING_OWNER_DECISION = {
-    ("memory/edit.py", "_remove_memory_from_entity_store"),
-    ("memory/edit.py", "_link_entities_for_memory"),
-}
+# Calls tolerated pending an OWNER decision, as ``(path, method)``. Empty: the compare-and-set edit path
+# no longer writes the ``<collection>_entities`` store (it was orphan work, read only by mem0's native
+# search, which this service never calls), so nothing is excused. An entry added here must name its
+# owner decision; a stale entry fails the pipeline pin below.
+PENDING_OWNER_DECISION: set[tuple[str, str]] = set()
 
 
 def _service_sources() -> list[pathlib.Path]:
@@ -301,8 +294,8 @@ def test_the_pipeline_pin_would_catch_a_violation(tmp_path):
     assert hits == ["m.add", "self._get_memory().search"]
 
 
-def test_the_owner_decision_exception_is_scoped_to_edit_py():
-    """The same entity-store calls attributed to any other path are NOT excused."""
+def test_no_entity_store_call_is_excused_in_any_file():
+    """With no pending owner decision, the entity-store calls are flagged wherever they appear."""
 
     tree = ast.parse(
         "def f(self):\n    m = self._get_memory()\n"
@@ -312,12 +305,7 @@ def test_the_owner_decision_exception_is_scoped_to_edit_py():
     calls = _pipeline_calls(tree)
     assert [c[2] for c in calls] == ["_link_entities_for_memory", "_remove_memory_from_entity_store", "add"]
     flagged = [(p, a) for p in ("memory/edit.py", "memory/write.py") for _, _, a in calls if (p, a) not in PENDING_OWNER_DECISION]
-    assert flagged == [
-        ("memory/edit.py", "add"),
-        ("memory/write.py", "_link_entities_for_memory"),
-        ("memory/write.py", "_remove_memory_from_entity_store"),
-        ("memory/write.py", "add"),
-    ]
+    assert len(flagged) == 6
 
 
 # ---------------------------------------------------------------------------
