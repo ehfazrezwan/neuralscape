@@ -94,6 +94,10 @@ NON_LITERAL_ALLOWED = {
         "prefix + 'graph_episode_uuid'/'graph_episode_name' (prefix is '' or 'metadata.')",
         {"graph_episode_uuid", "graph_episode_name"},
     ),
+    "memory/edit.py": (
+        "parent_key + '.revision' in the edit compare-and-set filter (parent_key is 'metadata' or 'metadata.metadata')",
+        {"revision"},
+    ),
 }
 
 

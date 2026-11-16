@@ -9,7 +9,11 @@ helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version }}
 {{- end -}}
 
 {{- define "neuralscape.image" -}}
-{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}
+{{- $tag := .Values.image.tag | default .Chart.AppVersion | toString -}}
+{{- if or (eq $tag "") (eq $tag "latest") -}}
+{{- fail "image.tag must be a pinned image tag (not empty, not \"latest\"); set image.tag or a non-floating Chart appVersion" -}}
+{{- end -}}
+{{ .Values.image.repository }}:{{ $tag }}
 {{- end -}}
 
 {{/*

@@ -1,5 +1,7 @@
 # ICE Phase-I premise verification (executor, static analysis on merged tree)
 
+> **Status (as of 2026-11-16, dev 6a81341f):** historical. A static-analysis check of the Phase I premises before builders were spent on them (2026-07-08). Its `native_engine.py` line numbers have drifted: the engine has grown since, and the Louvain community detection it reports as stubbed was implemented afterwards (`NativeEngine.semantic_layer` reads stored `community_id`).
+
 Verified against ice/integrate-dev (dev 3c4e613 merged) before spending builders.
 
 ## I2 — Louvain communities: CONFIRMED STUBBED (fix needed)

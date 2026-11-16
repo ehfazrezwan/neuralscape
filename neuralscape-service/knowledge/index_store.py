@@ -28,8 +28,14 @@ logger = logging.getLogger(__name__)
 _KEY_PREFIX = "ns:code-index:"          # + code_space  → metadata hash (JSON)
 _CFG_PREFIX = "ns:code-projcfg:"        # + project_id  → project config (JSON)
 
-# Bounded so a wedged Redis can't stall the request path (router <1ms budget).
+# Write/general client timeout (index records, config saves, merge writes).
+# Writes must not be abandoned early: a stall under this bound still persists.
 _SOCKET_TIMEOUT = 1.0
+# Request-path config READS use a separate, shorter-timeout client so a wedged
+# Redis costs a recall at most this once per config_ttl() per process (router
+# <1ms budget). Payloads are tiny JSON blobs; a healthy Redis answers in well
+# under a millisecond.
+_READ_TIMEOUT = 0.25
 
 # In-memory L1 (also the sole store when Redis is unavailable). Entries carry a
 # monotonic write time; when Redis is up, a positive hit older than _L1_TTL is
@@ -38,6 +44,14 @@ _SOCKET_TIMEOUT = 1.0
 _mem_meta: dict[str, dict] = {}
 _mem_cfg: dict[str, dict] = {}
 _mem_cfg_at: dict[str, float] = {}
+# project_id -> monotonic time of the last authoritative "no config" answer.
+# Without it every recall for an unconfigured project (the common case) pays a
+# Redis GET. Valid for one config_ttl(); cleared by a local save.
+_mem_cfg_miss_at: dict[str, float] = {}
+# Process-wide: after a failed Redis config read (down, timeout, error), skip
+# Redis for config reads until this monotonic time, so a wedged Redis costs at
+# most ONE bounded read per config_ttl() per process, not one per project.
+_cfg_down_until = 0.0
 _L1_TTL = 30.0  # fallback when settings are unavailable
 
 
@@ -56,11 +70,34 @@ def config_ttl() -> float:
 
 _client = None
 _client_probe_at = 0.0
+_read_client = None
+_read_client_probe_at = 0.0
 _CLIENT_RETRY = 30.0
 
 
+def _connect(timeout: float):
+    """Build + ping a client with the given timeouts; None if unavailable."""
+    try:
+        import redis  # redis-py (dependency of arq)
+
+        from config import settings
+
+        client = redis.Redis.from_url(
+            settings.redis_url,
+            socket_timeout=timeout,
+            socket_connect_timeout=timeout,
+            decode_responses=True,
+        )
+        # Cheap liveness ping so a dead Redis falls back to memory immediately.
+        client.ping()
+        return client
+    except Exception:  # noqa: BLE001 — no Redis ⇒ in-memory only
+        logger.info("code index_store: Redis unavailable, using in-memory store")
+        return None
+
+
 def _redis():
-    """Lazy best-effort sync Redis client; None when unavailable.
+    """Lazy best-effort sync Redis client (write timeout); None when unavailable.
 
     Retries the connection at most every _CLIENT_RETRY seconds rather than
     latching a single failure forever (Fable should-fix b), so a Redis that was
@@ -75,23 +112,23 @@ def _redis():
     if now - _client_probe_at < _CLIENT_RETRY:
         return None
     _client_probe_at = now
-    try:
-        import redis  # redis-py (dependency of arq)
-
-        from config import settings
-
-        _client = redis.Redis.from_url(
-            settings.redis_url,
-            socket_timeout=_SOCKET_TIMEOUT,
-            socket_connect_timeout=_SOCKET_TIMEOUT,
-            decode_responses=True,
-        )
-        # Cheap liveness ping so a dead Redis falls back to memory immediately.
-        _client.ping()
-    except Exception:  # noqa: BLE001 — no Redis ⇒ in-memory only
-        logger.info("code index_store: Redis unavailable, using in-memory store")
-        _client = None
+    _client = _connect(_SOCKET_TIMEOUT)
     return _client
+
+
+def _redis_read():
+    """Short-timeout client for request-path config reads; None when unavailable."""
+    global _read_client, _read_client_probe_at
+    import time as _t
+
+    if _read_client is not None:
+        return _read_client
+    now = _t.monotonic()
+    if now - _read_client_probe_at < _CLIENT_RETRY:
+        return None
+    _read_client_probe_at = now
+    _read_client = _connect(_READ_TIMEOUT)
+    return _read_client
 
 
 # ── Index metadata ──────────────────────────────────────────────────
@@ -134,19 +171,31 @@ def get_index(code_space: str) -> dict | None:
 # ── Project routing config ──────────────────────────────────────────
 
 
+def cache_project_config(project_id: str, config: dict) -> None:
+    """Refresh the in-process L1 after a write that already reached Redis."""
+    import time as _t
+
+    _mem_cfg[project_id] = dict(config)
+    _mem_cfg_at[project_id] = _t.monotonic()
+
+
 def save_project_config(project_id: str, config: dict) -> None:
     """Persist a project's routing config (best-effort; never raises)."""
     import time as _t
 
     _mem_cfg[project_id] = dict(config)
     _mem_cfg_at[project_id] = _t.monotonic()
+    _mem_cfg_miss_at.pop(project_id, None)
     r = _redis()
     if r is None:
         return
     try:
         r.set(_CFG_PREFIX + project_id, json.dumps(config, default=str))
     except Exception:  # noqa: BLE001
-        logger.debug("save_project_config Redis write failed (non-fatal)", exc_info=True)
+        logger.warning(
+            "save_project_config Redis write failed; config is in-memory only until the next save",
+            exc_info=True,
+        )
 
 
 def load_project_config(project_id: str, max_age: float | None = None) -> dict | None:
@@ -176,23 +225,40 @@ def refresh_project_config(project_id: str) -> tuple[bool, dict | None]:
 
 
 def _load_project_config(project_id: str, max_age: float | None) -> tuple[bool, dict | None]:
+    """Worst case per call: one Redis read bounded by ``_READ_TIMEOUT``; after a
+    failure no further Redis read for ``config_ttl()`` seconds (process-wide)."""
+    global _cfg_down_until
     import time as _t
 
     ttl = config_ttl() if max_age is None else max_age
+    now = _t.monotonic()
     hit = _mem_cfg.get(project_id)
-    if hit is not None and (_t.monotonic() - _mem_cfg_at.get(project_id, 0.0)) < ttl:
+    if hit is not None and (now - _mem_cfg_at.get(project_id, 0.0)) < ttl:
         return False, hit
-    r = _redis()
+    if hit is None and max_age is None:
+        missed_at = _mem_cfg_miss_at.get(project_id)
+        if missed_at is not None and (now - missed_at) < ttl:
+            return False, None  # negative-cached: no Redis I/O
+    if now < _cfg_down_until:
+        return False, hit  # Redis failed recently: serve L1 without retrying
+
+    def _down() -> tuple[bool, dict | None]:
+        global _cfg_down_until
+        _cfg_down_until = _t.monotonic() + max(config_ttl(), 1.0)
+        return False, hit
+
+    r = _redis_read()
     if r is None:
-        return False, hit  # Redis down → serve the (possibly stale) L1 value, if any
+        return _down()  # Redis down → serve the (possibly stale) L1 value, if any
     try:
         raw = r.get(_CFG_PREFIX + project_id)
     except Exception:  # noqa: BLE001
-        return False, hit
+        return _down()
     if not raw:
         # Redis answered and the key is absent: authoritative, drop L1.
         _mem_cfg.pop(project_id, None)
         _mem_cfg_at.pop(project_id, None)
+        _mem_cfg_miss_at[project_id] = _t.monotonic()
         return True, None
     try:
         cfg = json.loads(raw)
@@ -200,14 +266,19 @@ def _load_project_config(project_id: str, max_age: float | None) -> tuple[bool, 
         return False, hit
     _mem_cfg[project_id] = cfg
     _mem_cfg_at[project_id] = _t.monotonic()
+    _mem_cfg_miss_at.pop(project_id, None)
     return True, cfg
 
 
 def _reset_for_tests() -> None:
     """Clear in-memory caches + force client re-resolution (test hook)."""
-    global _client, _client_probe_at
+    global _client, _client_probe_at, _read_client, _read_client_probe_at, _cfg_down_until
     _mem_meta.clear()
     _mem_cfg.clear()
     _mem_cfg_at.clear()
+    _mem_cfg_miss_at.clear()
+    _cfg_down_until = 0.0
     _client = None
     _client_probe_at = 0.0
+    _read_client = None
+    _read_client_probe_at = 0.0

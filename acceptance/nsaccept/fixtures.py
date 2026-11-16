@@ -92,3 +92,33 @@ def sink(ctx: Ctx):
         yield s
     finally:
         s.stop()
+
+
+def _legacy_ready(ctx: Ctx) -> None:
+    """The `legacy-key` profile's scenarios exist only for that stack: without the key it is a failure, not a skip."""
+    if not ctx.legacy_key or not ctx.legacy_user:
+        pytest.fail(
+            "PRECONDITION FAILED: this scenario needs the `legacy-key` profile's stack. The gate must start the stack "
+            "with that profile's lines (NEURALSCAPE_API_KEY=<generate:hex32>, NEURALSCAPE_API_KEY_USER_ID) and export the "
+            "generated key as NS_LEGACY_KEY (profile header `# harness-env: NS_LEGACY_KEY=NEURALSCAPE_API_KEY`); "
+            f"NS_LEGACY_KEY {'is set' if ctx.legacy_key else 'is missing'}, the bound user id is "
+            f"{'known' if ctx.legacy_user else 'missing from the profile flags'}.",
+            pytrace=False,
+        )
+
+
+@pytest.fixture(scope="session")
+def legacy(ctx: Ctx):
+    """REST client authenticating with the stack's legacy shared key (`legacy-key` profile only)."""
+    _legacy_ready(ctx)
+    c = NSClient(ctx.base_url, ctx.legacy_key, ctx.legacy_user)
+    yield c
+    c.close()
+
+
+@pytest.fixture(scope="session")
+def mcp_legacy(ctx: Ctx):
+    _legacy_ready(ctx)
+    c = MCPClient(ctx.base_url, ctx.legacy_key)
+    yield c
+    c.close()
