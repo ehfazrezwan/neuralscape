@@ -1,5 +1,9 @@
 """Publication fence: re-resolve current authority and source at publication.
 
+LIBRARY ONLY IN THIS SLICE: nothing in the worker or the write paths calls this module yet (slices 05 and
+07 wire it to the durable write path), so revoking a credential or offboarding a member does not yet stop
+work that is already queued.
+
 Admission only records *claims* about the world when a job was accepted (who
 asked, under which credential, membership version and policy epoch, and which
 source revision and namespace the work derived from).  At publication nothing

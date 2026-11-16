@@ -1,10 +1,65 @@
 """Edit path: patch_memory and bulk retag housekeeping.
 
 Mechanically extracted from memory_service.py (mixins-with-facade split);
-code is verbatim — behavior unchanged.
+the revision precondition was added on top.
+
+PROTOCOL (decided against the pinned versions, see below). Every ``patch_memory``
+takes a short per-memory Redis lock (SET NX PX + token, released by
+compare-and-delete) around read -> permission/precondition check -> re-embed ->
+the ONE write that carries content + metadata + ``revision+1`` together. There is
+no visible intermediate "claimed" state: readers see the old row until the single
+write lands, and the new row (new content, new revision) after it.
+
+INVARIANTS of a conditional edit (``expected_revision=N``); each has a direct
+controlled-interleaving test in ``tests/test_patch_revision.py`` and
+``tests/test_patch_revision_qdrant_local.py`` (Qdrant local mode), and a
+real-store test in ``integration_tests/test_patch_revision_real_stores.py``:
+
+* I1 - it commits at exactly revision N as ONE state change (content + metadata
+  + revision) or changes nothing, and says which (``RevisionConflict`` /
+  ``EditBusy``/``EditLockUnavailable`` before any write).
+* I2 - a committed edit is never reported as a conflict: there is no
+  post-write confirmation step to be fooled by successor writes.
+* I3 - while a writer holds the lock (through its re-embed) no other
+  ``patch_memory`` can read-modify-write that row; a writer whose lock was lost
+  (TTL expiry) FAILS before its write instead of writing: the embedding is
+  computed first, then two fences run (the lock token is still ours; the row is
+  still at the revision we read), then ONE mem0 ``_update_memory`` with the
+  precomputed embedding.
+
+LOCK EXPIRY / REDIS BEHAVIOUR: TTL ``_LOCK_TTL_MS`` = 120 s, wait budget
+``_LOCK_WAIT_S`` = 5 s (a writer that cannot get the lock in 5 s raises
+``EditBusy`` -> 409, nothing written). If the TTL lapses mid-edit and another
+writer commits, the original writer's second fence sees a different revision
+and raises ``RevisionConflict`` (nothing written). Redis unreachable: a
+conditional edit raises ``EditLockUnavailable`` (503, nothing written); an
+unconditional edit proceeds unlocked with a warning (the revision fence still
+applies).
+
+WHY NOT A CONDITIONAL UPSERT (option a): the pinned Qdrant server is
+``qdrant/qdrant:v1.15.0`` (docker-compose.yml, deploy/k8s/qdrant.yaml) and the
+pinned client is qdrant-client 1.16.2 (uv.lock). The client exposes
+``upsert(update_filter=...)`` but the v1.15.0 server's ``PointsList`` /
+``PointsBatch`` have no ``update_filter`` field (it first appears in v1.16.0), so
+a conditional upsert is unavailable on the deployed server.
+
+DOCUMENTED LIMITS: (1) mem0's upsert is unconditional (no ``update_filter`` on
+server v1.15), so a check-then-write gap remains between the second fence (a
+Qdrant get) and the upsert inside ``_update_memory`` (a few milliseconds, no
+embedder call in it). A writer must lose its lock AND a successor must commit
+inside that gap to be overwritten. (2) ``retag_memories`` takes the same lock per row it changes, re-checks the
+row's revision under it and bumps the revision in its single write (a busy or
+moved row is skipped and reported in ``skipped_busy_ids``). The writers that do
+NOT take the lock are the dedup counters (the dedup paths in
+``memory/write.py`` / ``memory/delete.py``) and the dreaming graph patcher
+(``extensions/dreaming/graph_patcher.py``); they never change the patchable
+fields a revision guards.
+(3) With Redis unreachable a conditional edit is refused (503); an unconditional
+one proceeds unlocked with a warning.
 """
 
 import logging
+import uuid
 
 from datetime import datetime, timezone
 from config import settings
@@ -15,6 +70,133 @@ from memory.audit import _audit_log
 from memory.groups import _build_group_id, _check_edit_permission
 
 logger = logging.getLogger(__name__)
+
+
+class RevisionConflict(Exception):
+    """A PATCH carried an ``expected_revision`` that is no longer current.
+
+    Nothing was written. ``current_revision`` is the row's revision at the
+    time of the refusal, so a client can re-read, re-apply its change and retry.
+    """
+
+    def __init__(self, memory_id: str, expected: str, current: str):
+        self.memory_id = memory_id
+        self.expected_revision = expected
+        self.current_revision = current
+        super().__init__(
+            f"Memory {memory_id} was modified since revision {expected} "
+            f"(current revision is {current}); re-read it and retry"
+        )
+
+
+def revision_of(meta: dict | None) -> str:
+    """The row's revision token: a per-memory write counter kept in ``metadata.revision``.
+
+    Rows written before this existed carry no counter and read as ``"0"``. The
+    counter is bumped by every ``patch_memory`` and ``retag_memories`` write, so
+    a client holding a stale revision is refused. Guarantee boundary: a revision
+    names ONE state among writers that take the per-memory edit lock
+    (``patch_memory``, conditional or not, and ``retag_memories``); see the
+    module docstring for the protocol, the lock's expiry behaviour and the
+    writers that do not take it (dedup counters, the dreaming graph patcher).
+    """
+    try:
+        return str(max(int((meta or {}).get("revision") or 0), 0))
+    except (TypeError, ValueError):
+        return "0"
+
+
+def normalize_expected_revision(value) -> str | None:
+    """Canonical form of a client-supplied revision (``None`` stays ``None``).
+
+    Accepts the token as returned by reads, tolerating the quoting/``W/`` an
+    HTTP ``ETag`` style echo would add. Anything else is a ``ValueError``.
+    """
+    if value is None:
+        return None
+    token = str(value).strip()
+    if token.startswith("W/"):
+        token = token[2:]
+    token = token.strip('"')
+    if not token.isascii() or not token.isdigit():
+        raise ValueError("expected_revision must be a revision token as returned by a read of the memory")
+    return str(int(token))
+
+
+_LOCK_TTL_MS = 120_000      # covers a slow embedder call; the fence guards a lost lock
+_LOCK_WAIT_S = 5.0          # how long a writer waits for the lock before reporting the row busy
+_LOCK_POLL_S = 0.05
+
+_RELEASE_LUA = "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) else return 0 end"
+
+
+class EditBusy(Exception):
+    """Another edit holds this memory's lock past the wait budget: nothing was written; retry."""
+
+    def __init__(self, memory_id: str):
+        self.memory_id = memory_id
+        super().__init__(f"Memory {memory_id} is being edited by another request; retry")
+
+
+class EditLockUnavailable(Exception):
+    """A conditional edit needs the Redis edit lock and Redis is unreachable: nothing was written."""
+
+
+def _redis_client():
+    """Sync Redis client for the per-memory edit lock (one seam so tests inject an in-memory fake)."""
+    import redis
+
+    return redis.Redis.from_url(settings.redis_url, socket_timeout=2, socket_connect_timeout=2)
+
+
+class _EditLock:
+    """``SET NX PX`` lock with a token, released by compare-and-delete; ``held()`` is the fence."""
+
+    def __init__(self, memory_id: str, *, required: bool):
+        self.key = f"ns:edit-lock:{memory_id}"
+        self.memory_id = memory_id
+        self.required = required
+        self.token = uuid.uuid4().hex
+        self.client = None
+
+    def __enter__(self):
+        import time
+
+        try:
+            self.client = _redis_client()
+            deadline = time.monotonic() + _LOCK_WAIT_S
+            while not self.client.set(self.key, self.token, nx=True, px=_LOCK_TTL_MS):
+                if time.monotonic() >= deadline:
+                    raise EditBusy(self.memory_id)
+                time.sleep(_LOCK_POLL_S)
+        except EditBusy:
+            raise
+        except Exception as e:  # noqa: BLE001 - Redis down
+            self.client = None
+            if self.required:
+                raise EditLockUnavailable(f"edit lock unavailable ({type(e).__name__}); nothing was written") from e
+            logger.warning("Edit lock unavailable for %s; proceeding unlocked: %s", self.memory_id, e)
+        return self
+
+    def held(self) -> bool:
+        """The fence: True when no lock is in use (best-effort mode) or the lock is still ours."""
+        if self.client is None:
+            return True
+        try:
+            got = self.client.get(self.key)
+        except Exception:  # noqa: BLE001
+            return not self.required
+        got = got.decode() if isinstance(got, bytes) else got
+        return got == self.token
+
+    def __exit__(self, *exc):
+        if self.client is not None:
+            try:
+                self.client.eval(_RELEASE_LUA, 1, self.key, self.token)
+            except Exception as e:  # noqa: BLE001 - the TTL will release it
+                logger.warning("Could not release the edit lock for %s: %s", self.memory_id, e)
+        return False
+
 
 class EditMixin:
     """EditMixin for MemoryService (mechanical split — see memory_service.py)."""
@@ -72,7 +254,30 @@ class EditMixin:
             new_meta[key] = value
         return new_meta
 
-    def patch_memory(self, memory_id: str, caller_user_id: str | None, changes: dict) -> dict:
+    def patch_memory(
+        self,
+        memory_id: str,
+        caller_user_id: str | None,
+        changes: dict,
+        expected_revision: str | None = None,
+    ) -> dict:
+        """Partially update a memory (see ``_patch_memory_locked`` for the full contract).
+
+        Serialised per memory id by a short Redis lock held across read -> re-embed
+        -> the single write (module docstring: protocol, invariants, limits).
+        """
+        expected = normalize_expected_revision(expected_revision)
+        with _EditLock(memory_id, required=expected is not None) as lock:
+            return self._patch_memory_locked(memory_id, caller_user_id, changes, expected, lock)
+
+    def _patch_memory_locked(
+        self,
+        memory_id: str,
+        caller_user_id: str | None,
+        changes: dict,
+        expected_revision: str | None,
+        lock: "_EditLock",
+    ) -> dict:
         """Partially update a memory across the vector store and knowledge graph.
 
         ``changes`` is presence-keyed (built from the request's
@@ -80,8 +285,20 @@ class EditMixin:
         an absent key is untouched. Returns::
 
             {"memory": MemoryResponse, "graph_job": dict | None,
-             "graph": "unchanged" | "reingest_pending" | "migration_pending"
-                      | "migration_incomplete"}
+             "graph": "unchanged" | "reingest_pending" | "reingest_incomplete"
+                      | "migration_pending" | "migration_incomplete",
+             "sibling_graph_jobs": list[dict],
+             "sibling_graph_unrepaired_ids": list[str],
+             "sibling_graph_repair_failed": bool}
+
+        ``expected_revision`` (optional) is an optimistic-concurrency
+        precondition: the revision token a read returned (``MemoryResponse.
+        revision``). When given and no longer current, nothing is written and
+        ``RevisionConflict`` is raised (REST 409). Absent keeps the historical
+        last-writer-wins behaviour. Every successful patch bumps the revision.
+        The check and the write run under the per-memory lock (see the module
+        docstring); the write is ONE operation carrying content, metadata and
+        revision+1.
 
         The caller is responsible for enqueuing ``graph_job`` on the graph
         queue — Graphiti work is minutes-slow and must never run inline on a
@@ -115,6 +332,7 @@ class EditMixin:
         if isinstance(meta.get("metadata"), dict):
             meta = meta["metadata"]
         meta = dict(meta)
+        expected_revision = normalize_expected_revision(expected_revision)
 
         for key in ("content", "category", "visibility"):
             if key in changes and changes[key] is None:
@@ -130,6 +348,12 @@ class EditMixin:
             edits_visibility=edits_visibility,
         )
 
+        # Precondition (after the permission gate so a caller who may not edit
+        # never learns the row's revision from a refusal).
+        current_revision = revision_of(meta)
+        if expected_revision is not None and expected_revision != current_revision:
+            raise RevisionConflict(memory_id, expected_revision, current_revision)
+
         # Passages are verbatim chunks of an ingested artifact — rewriting one
         # would silently diverge from the source document. Metadata edits are fine.
         if edits_content and meta.get("memory_kind") == "passage":
@@ -143,6 +367,8 @@ class EditMixin:
         old_group = _build_group_id(old_visibility, owner, meta.get("project_id"))
 
         new_meta = self._apply_meta_changes(meta, changes)
+        if edits_content or 'category' in changes:
+            new_meta.pop('category_evidence', None)
 
         if edits_visibility:
             new_visibility = normalize_visibility(changes["visibility"])
@@ -173,12 +399,43 @@ class EditMixin:
             new_meta["token_estimate"] = stamp_tokens(changes["content"])
 
         now_iso = datetime.now(timezone.utc).isoformat()
+        # Every write bumps the revision (even without a precondition) so a
+        # concurrent holder of the old revision is refused.
+        new_meta["revision"] = int(current_revision) + 1
+        new_meta.pop("revision_pending", None)       # leftovers of the earlier lease protocol
+        new_meta.pop("revision_pending_at", None)
+        new_meta.pop("revision_nonce", None)
+        new_meta.pop("revision_nonces", None)
+        client = m.vector_store.client  # noqa: F841 - kept for symmetry with retag
+        embedding = None
         if edits_content:
-            # Full mem0 update: re-embed + BM25 refresh + history. Passing the
-            # merged nested metadata is load-bearing — mem0's _update_memory
-            # rebuilds the ENTIRE payload from this kwarg, so omitting it (the
-            # old update_memory bug) wipes category/scope/tags/visibility/owner.
-            m.update(memory_id, changes["content"], metadata={"metadata": new_meta})
+            # The slow part (the embedder round trip) happens BEFORE the fence so the
+            # critical section below is only a Qdrant get + upsert (milliseconds).
+            embedding = m.embedding_model.embed(changes["content"], "update")
+        # Fences: the row must still be at the revision we read (a lock that expired during the
+        # re-embed may have let another writer commit) AND the lock must still be ours. Either
+        # failing means NOTHING is written.
+        latest = m.vector_store.get(vector_id=memory_id)
+        latest_payload = getattr(latest, "payload", None)
+        if latest is None:
+            raise LookupError(f"Memory {memory_id} not found")
+        if isinstance(latest_payload, dict):
+            latest_meta = latest_payload.get("metadata") or {}
+            if isinstance(latest_meta.get("metadata"), dict):
+                latest_meta = latest_meta["metadata"]
+            if revision_of(latest_meta) != current_revision:
+                raise RevisionConflict(memory_id, expected_revision or current_revision, revision_of(latest_meta))
+        if not lock.held():                      # lost lock, row unchanged: nothing written, report busy
+            raise EditBusy(memory_id)
+        if edits_content:
+            # Full mem0 update with the PRE-COMPUTED embedding: BM25 refresh + history.
+            # Passing the merged nested metadata is load-bearing — mem0's _update_memory
+            # rebuilds the ENTIRE payload from this kwarg, so omitting it (the old
+            # update_memory bug) wipes category/scope/tags/visibility/owner.
+            m._update_memory(
+                memory_id, changes["content"], {changes["content"]: embedding},
+                metadata={"metadata": new_meta},
+            )
         else:
             # Metadata-only: direct payload patch. set_payload merges at top
             # level, so data/hash/created_at/user_id are preserved and the
@@ -190,7 +447,11 @@ class EditMixin:
 
         graph_job = None
         graph_status = "unchanged"
-        if new_group != old_group:
+        sibling_jobs: list[dict] = []
+        sibling_unrepaired: list[str] = []
+        sibling_repair_failed = False
+        migrating = new_group != old_group
+        if migrating or edits_content:
             # Partition migration: expire the memory's episode/edges in the
             # OLD group (episode-precise cascade first, substring fallback
             # only if no episode resolves — memory/provenance.py), then the
@@ -204,28 +465,46 @@ class EditMixin:
             # distinguishably instead: "migration_incomplete" whenever the
             # graph is actually configured but the cascade could not
             # resolve (and therefore could not verify) the episode.
+            #
+            # A content-only edit takes the same cascade: the OLD text lives
+            # verbatim in the memory's episode, which episode recall serves
+            # (on by default), so it is expired exactly as for a migration
+            # (most-restrictive) before the new content is re-ingested.
             graph_available = bool(self._graphiti and self._bridge)
             cascade_result: dict = {"resolved": False}
             try:
-                cascade_result = self._cascade_or_fallback_expire(
-                    {"memory": payload.get("data", ""), "metadata": meta, "user_id": owner},
-                    group_id=old_group,
-                    memory_id=memory_id,
+                # The moved row may share a conversation episode with sibling
+                # facts. The whole episode is expired (its body holds the moved
+                # fact verbatim) — the siblings are repaired: stale ref cleared
+                # and a single-fact re-ingest job returned for the caller to
+                # enqueue. The moved row is re-ingested via ``graph_job`` below.
+                batch = self._cascade_rows_once(
+                    [{
+                        "id": memory_id,
+                        "mem": {"memory": payload.get("data", ""), "metadata": meta, "user_id": owner},
+                        "group_id": old_group,
+                    }],
+                    skip_job_ids={memory_id},
                 )
+                cascade_result = batch["results"].get(memory_id) or cascade_result
+                sibling_jobs = batch["graph_jobs"]
+                sibling_unrepaired = batch["sibling_unrepaired_ids"]
+                sibling_repair_failed = batch["sibling_repair_failed"]
             except Exception as e:
                 logger.warning(f"Graph edge expiration failed for {memory_id} (non-critical): {e}")
-            if graph_available and not cascade_result.get("resolved"):
+            unverified = graph_available and not cascade_result.get("resolved")
+            if unverified:
                 logger.warning(
-                    "Partition migration for memory=%s could not resolve/verify "
+                    "%s for memory=%s could not resolve/verify "
                     "graph cleanup in old group=%r — old content may still be "
-                    "live in the shared graph pool until a follow-up cleanup runs",
+                    "live in the graph until a follow-up cleanup runs",
+                    "Partition migration" if migrating else "Content edit",
                     memory_id, old_group,
                 )
-                graph_status = "migration_incomplete"
+            if migrating:
+                graph_status = "migration_incomplete" if unverified else "migration_pending"
             else:
-                graph_status = "migration_pending"
-        elif edits_content:
-            graph_status = "reingest_pending"
+                graph_status = "reingest_incomplete" if unverified else "reingest_pending"
         if graph_status != "unchanged":
             graph_job = {
                 "memory_id": memory_id,
@@ -243,7 +522,16 @@ class EditMixin:
             fields=sorted(changes.keys()),
             graph=graph_status,
         )
-        return {"memory": self.get_memory(memory_id), "graph_job": graph_job, "graph": graph_status}
+        return {
+            "memory": self.get_memory(memory_id),
+            "graph_job": graph_job,
+            "graph": graph_status,
+            # Additive: re-ingest jobs for sibling facts that shared the moved
+            # row's (now expired) conversation episode. Empty for single-fact rows.
+            "sibling_graph_jobs": sibling_jobs,
+            "sibling_graph_unrepaired_ids": sibling_unrepaired,
+            "sibling_graph_repair_failed": sibling_repair_failed,
+        }
 
     def retag_memories(
         self,
@@ -311,11 +599,13 @@ class EditMixin:
         now_iso = datetime.now(timezone.utc).isoformat()
 
         matched = updated = skipped_forbidden = skipped_invalid = 0
+        skipped_busy_ids: list[str] = []
         graph_jobs: list[dict] = []
         # Zero-effect detection (audit): a memory whose episode can't be
         # resolved must be COUNTED and its id REPORTED, never silently
         # absorbed by a per-row try/except that only logs.
         graph_migrations_unresolved_ids: list[str] = []
+        migrations: list[dict] = []
         offset = None
         while True:
             points, offset = client.scroll(
@@ -352,6 +642,7 @@ class EditMixin:
                         new_meta.pop("tags", None)
                 if ops.get("set_category"):
                     new_meta["category"] = ops["set_category"]
+                    new_meta.pop('category_evidence', None)
                 if "set_project_id" in ops:
                     if ops["set_project_id"] is None:
                         new_meta.pop("project_id", None)
@@ -392,33 +683,50 @@ class EditMixin:
                 updated += 1
                 if dry_run:
                     continue
-                m.vector_store.update(
-                    str(pt.id), payload={"metadata": new_meta, "updated_at": now_iso}
-                )
+                # A retag changes patchable fields: under the SAME per-memory lock a PATCH takes,
+                # re-check that the row is still at the revision the scroll saw, then write once with
+                # revision+1. A busy row, a lost lock or a row that moved on is skipped and reported
+                # (``skipped_busy_ids``) rather than overwritten from a stale scroll.
+                busy = False
+                try:
+                    with _EditLock(str(pt.id), required=False) as lock:
+                        fresh = m.vector_store.get(vector_id=str(pt.id))
+                        fresh_payload = getattr(fresh, "payload", None)
+                        if fresh is None:
+                            busy = True
+                        elif isinstance(fresh_payload, dict):
+                            fresh_meta = fresh_payload.get("metadata") or {}
+                            if isinstance(fresh_meta.get("metadata"), dict):
+                                fresh_meta = fresh_meta["metadata"]
+                            busy = revision_of(fresh_meta) != revision_of(meta)
+                        if not busy and not lock.held():
+                            busy = True
+                        if not busy:
+                            new_meta["revision"] = int(revision_of(meta)) + 1
+                            m.vector_store.update(
+                                str(pt.id), payload={"metadata": new_meta, "updated_at": now_iso}
+                            )
+                except EditBusy:
+                    busy = True
+                if busy:
+                    updated -= 1
+                    skipped_busy_ids.append(str(pt.id))
+                    continue
                 owner = meta.get("owner_user_id") or payload.get("user_id", "")
                 visibility = meta.get("visibility") or MemoryVisibility.PRIVATE.value
                 # WT6: include workspace in group_id derivation
                 old_group = _build_group_id(visibility, owner, meta.get("project_id"), meta.get("workspace"))
                 new_group = _build_group_id(visibility, owner, new_meta.get("project_id"), new_meta.get("workspace"))
                 if new_group != old_group:
-                    graph_available = bool(self._graphiti and self._bridge)
-                    cascade_result: dict = {"resolved": False}
-                    try:
-                        cascade_result = self._cascade_or_fallback_expire(
-                            {"memory": payload.get("data", ""), "metadata": meta, "user_id": owner},
-                            group_id=old_group,
-                            memory_id=str(pt.id),
-                        )
-                    except Exception as e:
-                        logger.warning(f"Graph edge expiration failed for {pt.id} (non-critical): {e}")
-                    if graph_available and not cascade_result.get("resolved"):
-                        logger.warning(
-                            "Retag partition migration for memory=%s could not "
-                            "resolve/verify graph cleanup in old group=%r — old "
-                            "content may still be live in the shared graph pool",
-                            pt.id, old_group,
-                        )
-                        graph_migrations_unresolved_ids.append(str(pt.id))
+                    # Cascaded after the scroll, once per distinct episode
+                    # (rows of one conversation share an episode), with
+                    # sibling repair that skips every migrated row (each
+                    # gets its own re-ingest job below).
+                    migrations.append({
+                        "id": str(pt.id),
+                        "mem": {"memory": payload.get("data", ""), "metadata": meta, "user_id": owner},
+                        "group_id": old_group,
+                    })
                     graph_jobs.append({
                         "memory_id": str(pt.id),
                         "content": payload.get("data", ""),
@@ -429,6 +737,34 @@ class EditMixin:
                     })
             if offset is None:
                 break
+
+        sibling_unrepaired: list[str] = []
+        sibling_repair_failed = False
+        sibling_jobs_count = 0
+        if migrations:
+            graph_available = bool(self._graphiti and self._bridge)
+            batch = {"results": {}, "graph_jobs": [], "sibling_unrepaired_ids": []}
+            try:
+                batch = self._cascade_rows_once(
+                    migrations, skip_job_ids={r["id"] for r in migrations}
+                )
+            except Exception as e:
+                logger.warning(f"Retag graph cascade failed (non-critical): {e}")
+            for row in migrations:
+                res = batch["results"].get(row["id"]) or {"resolved": False}
+                if graph_available and not res.get("resolved"):
+                    logger.warning(
+                        "Retag partition migration for memory=%s could not "
+                        "resolve/verify graph cleanup in old group=%r — old "
+                        "content may still be live in the shared graph pool",
+                        row["id"], row["group_id"],
+                    )
+                    graph_migrations_unresolved_ids.append(row["id"])
+            # Sibling re-ingests ride the same list the callers already enqueue.
+            graph_jobs.extend(batch["graph_jobs"])
+            sibling_jobs_count = len(batch["graph_jobs"])
+            sibling_unrepaired = list(batch["sibling_unrepaired_ids"])
+            sibling_repair_failed = bool(batch.get("sibling_repair_failed"))
 
         _audit_log.info(
             "memories_retagged",
@@ -448,10 +784,17 @@ class EditMixin:
             "updated": updated,
             "skipped_forbidden": skipped_forbidden,
             "skipped_invalid": skipped_invalid,
+            # Rows another edit held (lock busy / lost) or that changed since the scroll: not retagged.
+            "skipped_busy_ids": skipped_busy_ids,
             "graph_jobs": graph_jobs,
             # Rows whose old-group episode could not be resolved/verified —
             # the substring fallback ran but its effect is unverifiable.
             # Never silently dropped; a caller/operator can act on these ids.
             "graph_migrations_unresolved_ids": graph_migrations_unresolved_ids,
+            # Of graph_jobs, how many re-ingest SIBLING facts of a cascaded
+            # conversation episode (the rest re-ingest the moved rows).
+            "sibling_graph_jobs_count": sibling_jobs_count,
+            "sibling_graph_unrepaired_ids": sibling_unrepaired,
+            "sibling_graph_repair_failed": sibling_repair_failed,
             "dry_run": dry_run,
         }

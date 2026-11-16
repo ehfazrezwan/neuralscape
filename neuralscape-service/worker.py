@@ -3,6 +3,8 @@
 Run with: arq worker.WorkerSettings
 """
 
+import third_party_telemetry  # noqa: F401 — must precede any mem0/Graphiti import (defaults their telemetry off)
+
 import asyncio
 import dataclasses
 import hashlib
@@ -10,11 +12,14 @@ import logging
 import os
 from datetime import datetime, timezone
 
+import structlog
 from arq.cron import cron
+from arq.jobs import Job
 
 import adapters  # noqa: F401 — registers knowledge-adapter taxonomies at import (deterministic MEMORY_CATEGORIES across all workers)
 from config import parse_redis_settings, settings
 from memory_service import MemoryService
+from task_manager import connector_sync_job_id, enqueue_connector_sync_job
 
 logger = logging.getLogger(__name__)
 
@@ -128,8 +133,6 @@ async def process_session_summary(
     return await refresh_slot(user_id, session_id, slot, llm_call=_async_call_gemini)
 
 
-
-
 @_cutover_fenced
 async def process_memory_store(
     ctx: dict,
@@ -202,6 +205,62 @@ async def process_memory_store(
     return result
 
 
+_STALE_CHECK_COALESCE_TTL_S = 300
+
+
+async def _enqueue_stale_graph_check(
+    ctx: dict, mem, content: str, user_id: str, project_id: str | None
+) -> None:
+    """Dedup hit on an existing row: queue a cheap graph-staleness check.
+
+    A content-hash/semantic dedup hit used to return without ever touching the
+    graph, so a fact Graphiti had since invalidated (row live, edges dead)
+    stayed contradicted even though the user just re-asserted it. The check
+    runs on the GRAPH queue (never the fast path): one Cypher probe, and an
+    LLM enrichment only when the row has no episode ref or all its episode's
+    edges are dead. Deterministic job id per (memory_id, content hash) so a
+    burst of repeated hits coalesces onto one job. Best-effort.
+    """
+    from memory.hashing import content_hash
+
+    # Part of the flagged supersession feature: off => dedup hits enqueue
+    # nothing (pre-existing behaviour).
+    if not settings.graph_supersession_enabled:
+        return
+    # Vector-only rows never reach the graph by design: nothing to check.
+    if getattr(mem, "memory_kind", None) == "passage" or getattr(mem, "workspace", None) not in (None, "memory"):
+        return
+    redis = ctx["redis"]
+    # Coalescing: a short-lived NX marker per (memory, content hash) so a burst
+    # of repeated hits queues ONE check even after arq has dropped the finished
+    # job's result (the _job_id below only dedups while the result is retained).
+    # Fail-open: any Redis error just means we may queue a duplicate (the job
+    # itself is idempotent and cheap).
+    try:
+        marker = f"graph-stale-check-lock:{mem.id}:{content_hash(content)}"
+        if not await redis.set(marker, "1", nx=True, ex=_STALE_CHECK_COALESCE_TTL_S):
+            return
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        await ctx["redis"].enqueue_job(
+            "process_graph_enrichment",
+            mem.id,
+            content,
+            user_id,
+            project_id,
+            getattr(mem, "visibility", None),
+            None,
+            None,
+            True,
+            _queue_name=settings.graph_queue_name,
+            _job_id=f"graph-stale-check:{mem.id}:{content_hash(content)}",
+        )
+    except Exception as e:  # noqa: BLE001 — the check is best-effort
+        logger.warning(f"Stale-graph check enqueue failed for {getattr(mem, 'id', '?')}: {e}")
+
+
+
 @_cutover_fenced
 async def process_memory_raw(
     ctx: dict,
@@ -266,6 +325,7 @@ async def process_memory_raw(
                 and getattr(mem, "visibility", None) == _eff_req_vis
             ):
                 logger.info(f"Skipping duplicate memory for user {user_id}: {content[:50]}...")
+                await _enqueue_stale_graph_check(ctx, mem, content, user_id, project_id)
                 return {"memories": [mem.model_dump(exclude_none=True)], "deduplicated": True}
     except Exception as e:
         logger.warning(f"Idempotency check failed (proceeding with store): {e}")
@@ -314,7 +374,19 @@ async def process_memory_raw(
 
     # Defer graph enrichment for newly-created rows onto the graph queue. Skip
     # for content-hash dedup hits (created=False) — they're already in the graph.
-    if created and memories:
+    # Exception (GRAPH_SUPERSESSION_ENABLED): a dedup hit that REVIVED a
+    # tombstoned row is a re-assertion of that fact, so it re-enters the graph
+    # (and Graphiti's contradiction engine) like a fresh write.
+    revived = bool(
+        settings.graph_supersession_enabled
+        and memories
+        and getattr(memories[0], "revived", None)
+    )
+    if memories and not created and not revived:
+        # Plain dedup hit: not re-enriched, but check whether the graph has
+        # since gone stale for this row (flagged: GRAPH_SUPERSESSION_ENABLED).
+        await _enqueue_stale_graph_check(ctx, memories[0], content, user_id, project_id)
+    if (created or revived) and memories:
         mem = memories[0]
         try:
             await ctx["redis"].enqueue_job(
@@ -381,7 +453,19 @@ async def process_memory_raw_batch(ctx: dict, items: list[dict]) -> dict:
     """
     service: MemoryService = ctx["service"]
 
-    memories = await asyncio.to_thread(service.store_raw_batch, items)
+    dedup_ids: set[str] = set()
+    memories = await asyncio.to_thread(service.store_raw_batch, items, dedup_ids=dedup_ids)
+
+    # Dedup survivors weren't re-enriched: queue the cheap stale-graph check
+    # for each (same semantics as process_memory_raw's dedup hits).
+    if dedup_ids:
+        item_by_content = {i.get("content"): i for i in items if i.get("content")}
+        for mem in memories:
+            if mem.id in dedup_ids:
+                src = item_by_content.get(mem.memory) or {}
+                await _enqueue_stale_graph_check(
+                    ctx, mem, mem.memory, src.get("user_id", ""), src.get("project_id")
+                )
 
     # Emit memory_stored events for each successful store so extensions can
     # write to vault. We attribute each event to the originating item's
@@ -886,12 +970,35 @@ async def process_code_index(ctx: dict, payload: dict) -> dict:
     if not code_graph_available():
         return {"ok": False, "error": "code-graph extra not installed", "code_space": code_space}
 
+    # Operator-side only: the source must sit inside a CODE_REPOS directory, for
+    # every engine, and the caller must own the target code_space (or be admin).
+    from knowledge.code_dispatch import (
+        code_space_access_error,
+        code_space_shape_error,
+        repo_source_error,
+    )
+
+    denied = code_space_shape_error(code_space) or code_space_access_error(code_space, user_id)
+    if denied:
+        return {"ok": False, "error": denied, "code_space": code_space, "system": system}
+    refused = repo_source_error(repo_source, settings)
+    if refused:
+        return {"ok": False, "error": refused, "code_space": code_space, "system": system}
+    # Index the path that was checked (resolved once), not the caller's string:
+    # closes the window where a symlink is swapped after the check.
+    import os as _os
+
+    repo_source = _os.path.realpath(_os.path.expanduser(str(repo_source)))
+
     engine = resolve_code_engine(system, code_space, user_id, settings, for_index=True)
     if engine is None:
+        from knowledge.code_dispatch import code_repos_error
+
+        # Operator-side by design: name CODE_REPOS when the repo is not on the server.
+        reason = code_repos_error(code_space, settings) or "the engine's backend (e.g. the CBM bridge) is unreachable"
         return {
             "ok": False,
-            "error": f"could not resolve engine for system={system!r} code_space={code_space!r} "
-                     "(repo not in CODE_REPOS / bridge down)",
+            "error": f"could not resolve engine for system={system!r} code_space={code_space!r}: {reason}",
             "code_space": code_space,
             "system": system,
         }
@@ -981,6 +1088,19 @@ def _git_head_sha(repo_path: str) -> str | None:
     return None
 
 
+def _row_episode_uuid(service, memory_id: str) -> str | None:
+    """The graph episode uuid stamped on the row's payload (None when unknown / row gone / not a real store)."""
+    try:
+        point = service._memory.vector_store.get(vector_id=memory_id)
+        meta = ((getattr(point, "payload", None) or {}).get("metadata")) or {}
+        if isinstance(meta.get("metadata"), dict):
+            meta = meta["metadata"]
+        uuid = meta.get("graph_episode_uuid")
+        return uuid if isinstance(uuid, str) and uuid else None
+    except Exception:  # noqa: BLE001 - best effort; the content match is the fallback
+        return None
+
+
 async def process_graph_enrichment(
     ctx: dict,
     memory_id: str,
@@ -990,8 +1110,13 @@ async def process_graph_enrichment(
     visibility: str | None = None,
     source_ref: dict | None = None,
     adapter: str | None = None,
+    only_if_stale: bool = False,
 ) -> dict:
     """Background task: add a stored memory's content to the knowledge graph.
+
+    ``only_if_stale=True`` (dedup-hit re-assertions): enrich only when the row
+    has no graph episode ref or every edge of its episode is dead; otherwise
+    return ``skipped: graph_current`` with no LLM call.
 
     This is the slow half of a write (Graphiti entity extraction, ~minutes,
     Gemini-gated) split out of the synchronous vector store so it runs on the
@@ -1028,6 +1153,49 @@ async def process_graph_enrichment(
     # occurred_at as a top-level MemoryResponse field (mapped from the payload
     # metadata in _mem_to_response), so read it directly.
     occurred_at = getattr(mem, "occurred_at", None)
+
+    # The job carries the visibility/project/content the memory had WHEN IT WAS
+    # ENQUEUED. A narrowing edit (shared -> private), a project move or a content
+    # rewrite can land while the job sits in the queue; publishing the queued
+    # values would put the memory into a graph group its owner has since
+    # withdrawn it from. The row just re-read above is authoritative: derive the
+    # group (visibility + project + workspace) from it, and skip rather than
+    # enrich text the memory no longer holds (the edit that changed the content
+    # enqueues its own re-ingest of the new text).
+    current_content = getattr(mem, "memory", None)
+    if isinstance(current_content, str) and " ".join(current_content.split()) != " ".join(content.split()):
+        logger.info(
+            "Skipping graph enrichment for memory %s — its content changed while the job "
+            "was queued (the edit enqueues its own re-ingest).", memory_id,
+        )
+        return {"memory_id": memory_id, "enriched": False, "skipped": "content_changed"}
+    current_visibility = getattr(mem, "visibility", None) or "private"  # legacy null == private
+    current_project = getattr(mem, "project_id", project_id) or None
+    current_workspace = getattr(mem, "workspace", None) or None
+    if (current_visibility, current_project) != ((visibility or "private"), (project_id or None)):
+        logger.info(
+            "Graph enrichment for memory %s: row changed while queued "
+            "(visibility %r -> %r, project %r -> %r); using the current values.",
+            memory_id, visibility, current_visibility, project_id, current_project,
+        )
+    if only_if_stale:
+        # Re-enrichment must reproduce the original write: carry the row's
+        # connector provenance. Reference-workspace / adapter rows (their
+        # ontology is not recoverable from the row) and passages are
+        # vector-only by design and never re-enriched here.
+        if getattr(mem, "memory_kind", None) == "passage" or getattr(mem, "workspace", None) not in (None, "memory"):
+            return {"memory_id": memory_id, "enriched": False, "skipped": "vector_only"}
+        source_ref = source_ref or getattr(mem, "source_ref", None)
+        stale = await asyncio.to_thread(
+            service.graph_row_is_stale,
+            memory_id,
+            user_id,
+            current_project,
+            current_visibility,
+            getattr(mem, "workspace", None),
+        )
+        if not stale:
+            return {"memory_id": memory_id, "enriched": False, "skipped": "graph_current"}
     graph_ontology = None
     if adapter:
         # Strict resolution (audit 27 #36): a queued job carrying an adapter
@@ -1036,17 +1204,76 @@ async def process_graph_enrichment(
         from adapters import require_adapter
 
         graph_ontology = require_adapter(adapter).graph_ontology_kwargs()
+    episode_before = _row_episode_uuid(service, memory_id)
     enriched = await asyncio.to_thread(
         service.enrich_graph,
         content=content,
         user_id=user_id,
-        project_id=project_id,
-        visibility=visibility or "private",
+        project_id=current_project,
+        visibility=current_visibility,
         memory_id=memory_id,
         source_ref=source_ref,
         graph_ontology=graph_ontology,
         occurred_at=occurred_at,
+        workspace=current_workspace,
     )
+    episode_after = _row_episode_uuid(service, memory_id) if enriched else None
+    if enriched:
+        # The first check above only covers the time the job sat in the queue.
+        # Extraction itself takes minutes: re-read the row now and, if it was
+        # deleted or moved (visibility/project/workspace) or rewritten while we
+        # were writing, expire the episode we just published — the edit/delete
+        # cascade ran BEFORE it existed, so nothing else would ever expire it.
+        expire = getattr(service, "_cascade_or_fallback_expire", None)
+        after = await asyncio.to_thread(service.get_memory, memory_id)
+        if after is None:
+            changed = True
+        else:
+            text_after = getattr(after, "memory", None)
+            changed = (
+                (getattr(after, "visibility", None) or "private") != current_visibility
+                or (getattr(after, "project_id", current_project) or None) != current_project
+                or (getattr(after, "workspace", None) or None) != current_workspace
+                or (isinstance(text_after, str) and " ".join(text_after.split()) != " ".join(content.split()))
+            )
+        if changed and callable(expire):
+            from memory.groups import _build_group_id
+
+            written_group = _build_group_id(current_visibility, user_id, current_project, current_workspace)
+            logger.warning(
+                "Memory %s changed or was deleted while its graph enrichment ran; "
+                "expiring the episode just written to group %r.", memory_id, written_group,
+            )
+            # Pin the episode THIS job wrote when it can be told apart (the row's
+            # episode ref changed across our enrich_graph call): the cascade then
+            # resolves by uuid first, so a newer re-ingested episode of the same
+            # memory is never the one expired. Otherwise exact-content match.
+            ours = episode_after if episode_after and episode_after != episode_before else None
+            resolved = False
+            for attempt, pause in enumerate((0, 1.0, 3.0), start=1):
+                if pause:
+                    await asyncio.sleep(pause)
+                result = await asyncio.to_thread(
+                    expire,
+                    {"memory": content, "metadata": {"graph_episode_uuid": ours} if ours else {}, "user_id": user_id},
+                    group_id=written_group,
+                    memory_id=memory_id,
+                )
+                resolved = bool(isinstance(result, dict) and result.get("resolved"))
+                if resolved:
+                    break
+                logger.warning(
+                    "Cleanup of the stale episode for memory %s (group %r) unresolved on attempt %d",
+                    memory_id, written_group, attempt,
+                )
+            if not resolved:
+                # Never swallow it: a shared episode of a now-private/deleted memory must not stay readable
+                # unnoticed. Fail the job visibly with the identity needed to retry the cleanup.
+                raise RuntimeError(
+                    f"graph cleanup unresolved for memory {memory_id}: group_id={written_group!r} "
+                    f"episode_uuid={ours!r}; re-run the episode cascade for this group/episode"
+                )
+            return {"memory_id": memory_id, "enriched": False, "skipped": "changed_during_enrichment"}
     if not enriched:
         logger.warning(
             "Graph enrichment did not complete for memory %s — it remains "
@@ -1058,9 +1285,14 @@ async def process_graph_enrichment(
 
 
 async def process_graph_reenrich(ctx: dict, memory_id: str) -> dict:
-    """Background task: re-enrich one memory into a fresh episode after the conversation episode
-    it shared with a deleted or corrected memory was removed.  Raises (so ARQ retries) when the
-    enrichment does not complete; a memory deleted meanwhile is skipped."""
+    """Background task: re-enrich one memory into a fresh episode after its shared episode was removed.
+
+    Enqueued by the support-aware removal (``GRAPH_SUPPORT_AWARE_REMOVAL_ENABLED``) for every memory that
+    recorded the removed episode, when no ledger producer is installed.  The job carries only the memory id and
+    re-reads the owner, project and visibility from the row; a memory deleted meanwhile is skipped, and an
+    enrichment that does not complete raises so ARQ retries the job (the row keeps ``graph_reenrich_pending``
+    until it has run).
+    """
     service: MemoryService = ctx["service"]
     return await asyncio.to_thread(service.reenrich_memory_graph, memory_id)
 
@@ -1347,6 +1579,9 @@ async def auto_compile_check(ctx: dict) -> dict | None:
     writer: ObsidianWriter = ctx.get("compiler_writer") or ObsidianWriter()
     ctx.setdefault("compiler_writer", writer)
 
+    # The vault is one shared tree and every daily-log entry records its owner, so
+    # post-compile dedup runs for each user whose entries were compiled;
+    # ``default_user_id`` only covers entries written before owners were recorded.
     results = await compile_all_pending(service, writer, user_id=settings.default_user_id)
     if results:
         writer.append_log(f"Auto-compiled {len(results)} date(s) via cron")
@@ -1381,6 +1616,11 @@ async def run_dedup_sweep(ctx: dict) -> dict:
             # dedup_memories does sync Qdrant scroll pagination + embedding/LLM
             # calls that would otherwise freeze the loop for minutes at scale.
             result = await asyncio.to_thread(service.dedup_memories, uid, semantic=semantic)
+            # Sibling facts that shared a deleted duplicate's conversation
+            # episode need a single-fact graph re-ingest (graph queue).
+            sibling_jobs = result.pop("graph_jobs", [])
+            if sibling_jobs:
+                result["graph_jobs_enqueued"] = await _enqueue_graph_jobs(ctx, sibling_jobs, None)
             results.append(result)
             removed = result["exact_duplicates_removed"] + result["semantic_duplicates_removed"]
             if removed:
@@ -1402,13 +1642,22 @@ async def run_dedup_sweep(ctx: dict) -> dict:
 
 
 @_cutover_fenced
-async def process_connector_sync(ctx: dict, connector_id: str) -> dict:
+async def process_connector_sync(
+    ctx: dict, connector_id: str, generation: str | None = None
+) -> dict:
     """Background task: pull a connector's resources and ingest changed ones.
 
     Incremental: resources whose source-side revision matches the last-seen
     revision are skipped; content-hash dedup in ``store_raw`` is the backstop
     for sources without a revision marker. Sync state (cursor + per-resource
     revisions + timestamp) is persisted back to the vault.
+
+    ``generation`` is the connector instance the job was enqueued for (``None``
+    for a record from before generations, and for jobs queued before this
+    argument existed). When the stored connector is a different instance
+    (deleted and re-registered, or re-registered by another owner, since the job
+    was queued) the job skips: the new instance has its own job id and syncs
+    under it.
     """
     from datetime import timezone
 
@@ -1421,6 +1670,11 @@ async def process_connector_sync(ctx: dict, connector_id: str) -> dict:
     record = await vault.get(connector_id)
     if not record:
         return {"skipped": True, "reason": "connector not found"}
+    # Literal equality: a job queued before generations existed carries ``None`` and runs only
+    # while the stored record is still generationless; once the connector was replaced (and so
+    # given a generation) that job skips instead of syncing the replacement under its old grant.
+    if record.get("generation") != generation:
+        return {"skipped": True, "reason": "connector replaced since this sync was enqueued"}
     if not record.get("enabled", True):
         return {"skipped": True, "reason": "connector disabled"}
 
@@ -1466,12 +1720,24 @@ async def process_connector_sync(ctx: dict, connector_id: str) -> dict:
     finally:
         await adapter.aclose()
 
-    await vault.update_sync_state(
+    # Atomic, field-scoped and bound to the instance read above: a connector
+    # deleted, re-created or re-owned meanwhile keeps its own state.
+    written = await vault.update_sync_state(
         connector_id,
         cursor=next_cursor,
         last_synced_at=datetime.now(timezone.utc).isoformat(),
         revisions=revisions,
+        generation=record.get("generation"),
+        # Only on top of the progress this sync started from: an overlapping sync of the
+        # same connector that already saved newer progress is never rolled back.
+        expected_cursor=cursor,
+        expected_revisions=dict(record.get("last_revision_by_id") or {}),
     )
+    if not written:
+        logger.info(
+            f"Connector sync [{connector_id}]: connector replaced or removed, or newer progress saved "
+            "by an overlapping sync; state not saved"
+        )
     logger.info(f"Connector sync [{connector_id}]: {synced} ingested, {skipped} unchanged")
     return {"connector_id": connector_id, "synced": synced, "skipped": skipped}
 
@@ -1527,13 +1793,19 @@ async def connector_sync_cron(ctx: dict) -> dict:
             if await _accept_connector_sync_durably(ctx, rec):
                 enqueued += 1
             continue
-        await redis.enqueue_job(
-            "process_connector_sync",
+        # Same job id as an API-triggered sync of this connector instance
+        # (task_manager.connector_sync_job_id), so the two coalesce while one is
+        # in flight; a finished run's cached result is cleared (not skipped).
+        job = await enqueue_connector_sync_job(
+            redis,
             rec["connector_id"],
-            _job_id=f"sync-{rec['connector_id']}",
-            _queue_name=settings.ingest_queue_name,
+            rec.get("generation"),
+            connector_sync_job_id(
+                rec["connector_id"], rec.get("owner_user_id"), rec.get("generation")
+            ),
         )
-        enqueued += 1
+        if job is not None:
+            enqueued += 1
     logger.info(f"Connector sync cron: enqueued {enqueued} connector(s)")
     return {"enqueued": enqueued}
 
@@ -1657,6 +1929,57 @@ async def ledger_poll_cron(ctx: dict) -> dict:
     return {"processed": await _drain_ledger(ctx, f"poll-{os.getpid()}")}
 
 
+def _make_on_job_start(queue_name: str):
+    """Build the per-queue ``on_job_start`` hook: bind job context to the logs.
+
+    ARQ runs every job in its own asyncio task, so the contextvars bound here
+    reach every log line the job emits (structlog ``merge_contextvars``) and
+    never leak into another job. The function name is not in ARQ's job
+    context, so it is read from the queued job record; failing to read it
+    only leaves ``function`` off the log lines.
+    """
+    async def on_job_start(ctx: dict) -> None:
+        try:
+            bound = {"job_id": ctx.get("job_id"), "job_try": ctx.get("job_try"), "queue": queue_name}
+            structlog.contextvars.bind_contextvars(**{k: v for k, v in bound.items() if v is not None})
+            redis = ctx.get("redis")
+            if redis is not None and ctx.get("job_id"):
+                info = await Job(ctx["job_id"], redis, _queue_name=queue_name).info()
+                if info is not None and info.function:
+                    structlog.contextvars.bind_contextvars(function=info.function)
+        except Exception:  # noqa: BLE001 — observability must never fail a job
+            logger.debug("binding job log context failed (non-fatal)", exc_info=True)
+        await _bind_usage_attempt(ctx)
+
+    return on_job_start
+
+
+async def _bind_usage_attempt(ctx: dict) -> None:
+    """Attribute the provider calls this job makes to the person it serves (only when usage capture is on).
+
+    The person is read from the enqueue-time ``task -> user`` record; a job without one (a cron, a job
+    enqueued by another job) is recorded as unattributed rather than dropped.  The context lives as long as
+    the job's own asyncio task, and threads the job starts inherit it.  Never fails a job.
+    """
+    try:
+        import usage_capture
+
+        job_id = ctx.get("job_id")
+        if usage_capture.get_usage_recorder() is None or not job_id:
+            return
+        from task_manager import _task_user_key
+
+        tenant = None
+        redis = ctx.get("redis")
+        if redis is not None:
+            raw = await redis.get(_task_user_key(job_id))
+            if raw:
+                tenant = raw.decode() if isinstance(raw, bytes) else str(raw)
+        usage_capture.bind_job_attempt(tenant, job_id, ctx.get("job_try"))
+    except Exception:  # noqa: BLE001 — capture must never fail a job
+        logger.debug("binding the usage attempt failed (non-fatal)", exc_info=True)
+
+
 def _make_after_job_end(queue_name: str):
     """Build the per-queue ``after_job_end`` hook: queue.empty webhook (C4).
 
@@ -1671,6 +1994,18 @@ def _make_after_job_end(queue_name: str):
     error — observability must never fail a job.
     """
     async def after_job_end(ctx: dict) -> None:
+        try:
+            await _queue_empty_webhook(ctx)
+        finally:
+            structlog.contextvars.unbind_contextvars("job_id", "job_try", "queue", "function")
+            try:
+                import usage_capture
+
+                usage_capture.unbind_job_attempt()
+            except Exception:  # noqa: BLE001
+                pass
+
+    async def _queue_empty_webhook(ctx: dict) -> None:
         url = settings.webhook_queue_empty_url
         if not url:
             return
@@ -1709,22 +2044,25 @@ def _make_after_job_end(queue_name: str):
 
 async def startup(ctx: dict) -> None:
     """Worker startup: initialize MemoryService + extension registry."""
+    from logging_config import configure_logging
+
+    configure_logging(worker=True)
     logger.info("ARQ worker starting up...")
+    logger.info(third_party_telemetry.startup_log_line())
     # Durable usage capture (off unless USAGE_STORE_ENABLED).  The recorder must
     # exist before the service builds its provider clients so they are wrapped.
     if settings.usage_store_enabled:
-        import usage_capture
-        from usage_store import open_usage_store
+        from usage_store import install_usage_capture
 
-        usage_store = open_usage_store(settings)
-        ctx["usage_store"] = usage_store
-        usage_capture.set_usage_recorder(usage_capture.DurableUsageRecorder(usage_store))
+        ctx["usage_store"] = install_usage_capture(settings)
         logger.info("Durable usage store opened (backend=%s)", settings.usage_store_backend)
     from provider_routing import apply_gemini_base_url
 
     apply_gemini_base_url(settings.ns_gemini_base_url)  # must precede the first client
     service = MemoryService()
     service._get_memory()  # warm up connections
+    from hybrid_inference import warmup_extraction
+    await asyncio.to_thread(warmup_extraction)
     ctx["service"] = service
 
     # Initialize extension registry so worker can emit events
@@ -1797,10 +2135,9 @@ async def shutdown(ctx: dict) -> None:
             handle.close()
     usage_store = ctx.get("usage_store")
     if usage_store is not None:
-        import usage_capture
+        from usage_store import uninstall_usage_capture
 
-        usage_capture.set_usage_recorder(None)
-        usage_store.close()
+        uninstall_usage_capture(usage_store)
     logger.info("ARQ worker stopped.")
 
 
@@ -1848,8 +2185,9 @@ class WorkerSettings:
     on_shutdown = shutdown
     redis_settings = parse_redis_settings()
     queue_name = settings.arq_queue_name
+    on_job_start = _make_on_job_start(settings.arq_queue_name)
     after_job_end = _make_after_job_end(settings.arq_queue_name)
-    max_jobs = 10
+    max_jobs = settings.arq_max_jobs
     job_timeout = settings.arq_job_timeout
     max_tries = settings.arq_max_retries  # keep light-queue retry behavior unchanged
 
@@ -1902,8 +2240,9 @@ class GraphWorkerSettings:
     on_shutdown = shutdown
     redis_settings = parse_redis_settings()
     queue_name = settings.graph_queue_name
+    on_job_start = _make_on_job_start(settings.graph_queue_name)
     after_job_end = _make_after_job_end(settings.graph_queue_name)
-    max_jobs = 4
+    max_jobs = settings.graph_max_jobs
     job_timeout = 900  # graph.add + entity extraction can run several minutes
     max_tries = settings.arq_max_retries
 
@@ -1939,8 +2278,9 @@ class IngestWorkerSettings:
     on_shutdown = shutdown
     redis_settings = parse_redis_settings()
     queue_name = settings.ingest_queue_name
+    on_job_start = _make_on_job_start(settings.ingest_queue_name)
     after_job_end = _make_after_job_end(settings.ingest_queue_name)
-    max_jobs = 3
+    max_jobs = settings.ingest_max_jobs
     job_timeout = 900  # a large PDF parse + fact extraction can run minutes
     max_tries = settings.arq_max_retries
 

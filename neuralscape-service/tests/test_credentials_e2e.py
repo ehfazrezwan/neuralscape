@@ -43,7 +43,7 @@ class World:
             self.subjects[user] = sid
         self.extra: list[PolicyStatement] = []
         self.publish()
-        monkeypatch.setenv("CREDENTIALS_ENABLED", "1")
+        monkeypatch.setattr(settings, "credentials_enabled", True)
         monkeypatch.setattr(settings, "ns_policy_mode", "enforce")
         monkeypatch.setattr(settings, "ns_auth_profile", "legacy_compat")
         monkeypatch.setattr(settings, "neuralscape_user_token_secret", SECRET)
@@ -224,7 +224,7 @@ def test_the_feature_is_off_by_default_and_off_without_enforcement(w, monkeypatc
     assert w.call("POST", "/v1/search", token, json={"query": "q"}).status_code == 401   # scope would be unenforced
     assert w.call("POST", "/v1/search", w.hmac["alice"], json={"query": "q"}).status_code == 200
     monkeypatch.setattr(settings, "ns_policy_mode", "enforce")
-    monkeypatch.delenv("CREDENTIALS_ENABLED")
+    monkeypatch.setattr(settings, "credentials_enabled", False)
     assert w.call("POST", "/v1/credentials", w.hmac["alice"], json={"scope": ["search"]}).status_code == 404
     assert w.call("POST", "/v1/search", token, json={"query": "q"}).status_code == 401
     assert w.call("POST", "/v1/search", w.hmac["alice"], json={"query": "q"}).status_code == 200

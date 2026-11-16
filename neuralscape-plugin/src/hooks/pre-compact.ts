@@ -6,27 +6,33 @@
  * trigger: "manual"|"auto", custom_instructions}`). Compaction
  * lossy-summarizes in-context state, so before it happens this hook:
  *
- *   1. flushes any not-yet-delivered conversation turns through the SAME
- *      adapter path as the conversation-turn hook — including the
- *      offset-commit step, so the cursor advances only past delivered
- *      turns (audit 27 #34b) and nothing said pre-compact is lost to the
- *      turn-capture pipeline;
+ *   1. Claude Code: does NOT deliver conversation turns.  The Stop hook
+ *      delivers them, and compaction adds a flagged summary entry to the
+ *      transcript next to the entries it summarizes, so nothing is lost by
+ *      leaving them for it; delivering here as well would race the Stop hook
+ *      over the cursor and could split a turn that is still running.
+ *      Other clients (generic payload, no transcript and no cursor): the turn
+ *      arrives in the payload and no other hook is guaranteed to deliver it
+ *      before the compact, so it is flushed here;
  *   2. stores ONE small `task_context` "compact snapshot" memory (tagged
- *      `compact_snapshot`) via the EXISTING POST /v1/memories/raw
- *      endpoint. The compact-aware SessionStart re-injects it under
- *      "Resuming after compaction".
+ *      `compact_snapshot`, plus `session:<id>`) via the EXISTING
+ *      POST /v1/memories/raw endpoint, and keeps a copy next to the
+ *      observation buffers. That endpoint only enqueues the write (202), so
+ *      the SessionStart that follows the compaction may run before the
+ *      memory is searchable; the compact-aware SessionStart reads the local
+ *      copy first and re-injects it under "Resuming after compaction".
  *
  * Fire-and-forget: outputContinue() first, everything caught and logged —
  * this hook must NEVER block or fail the compact.
  */
 
-import { commitClaudeCodeFlush } from "../adapters/claude-code.js";
+import { extractRecentUserPrompts } from "../adapters/claude-code.js";
 import { detectClient, getTurnExtractor } from "../adapters/detect.js";
+import { flushTurns } from "../core/flush.js";
 import {
   buildCompactSnapshotContent,
   buildCompactSnapshotPayload,
 } from "../core/compact.js";
-import { flushTurns } from "../core/flush.js";
 import {
   getProjectId,
   getUserId,
@@ -36,8 +42,9 @@ import {
   neuralscapePost,
   outputContinue,
   parseStdin,
-  recordTransportFailure,
+  recordFailure,
   resetTransportFailures,
+  writeLocalCompactSnapshot,
 } from "../utils.js";
 
 async function main(): Promise<void> {
@@ -58,38 +65,57 @@ async function main(): Promise<void> {
     // Excluded projects (D4): nothing leaves an excluded project.
     if (isProjectExcluded(projectId)) return;
 
-    // 1. Flush undelivered turns — mirrors conversation-turn.ts exactly,
-    //    including the offset commit bounded by delivered turns (#34b).
+    // 1. Claude Code: the snapshot shows the prompts that were under way, read from the transcript independently
+    //    of what has been delivered (a prompt that is still being answered is included); the Stop hook owns
+    //    delivery and the cursor.  Other clients have no transcript and no cursor: their extractor's turns
+    //    supply the prompts, and are delivered here (once, no cursor involved) before the context is lost.
     const client = detectClient(raw);
-    const extractor = getTurnExtractor(client);
-    const turns = await extractor(raw);
-    const result = await flushTurns(turns);
+    let recentUserMessages: string[];
+    let turnsToDeliver: Awaited<ReturnType<ReturnType<typeof getTurnExtractor>>> = [];
     if (client === "claude-code") {
-      await commitClaudeCodeFlush(raw, result);
+      recentUserMessages = await extractRecentUserPrompts(raw);
+    } else {
+      turnsToDeliver = await getTurnExtractor(client)(raw);
+      recentUserMessages = turnsToDeliver.map((t) => t.userMessage);
     }
 
     // 2. One compact-snapshot memory so the post-compact SessionStart can
     //    re-anchor the session. Small, redacted, bounded.
+    const sessionId = (raw.session_id as string) || "unknown";
+    const when = new Date();
     const content = buildCompactSnapshotContent({
-      sessionId: (raw.session_id as string) || "unknown",
+      sessionId,
       projectId,
       trigger: (raw.trigger as string) || "auto",
-      when: new Date(),
-      capturedTurns: result.flushed,
-      recentUserMessages: turns.map((t) => t.userMessage),
+      when,
+      recentUserMessages,
     });
+
+    // The local copy comes FIRST: it needs no network, so a hanging service
+    // (this hook has a 60 s timeout) cannot prevent it.
+    if (sessionId !== "unknown") {
+      await writeLocalCompactSnapshot({
+        sessionId,
+        projectId,
+        content,
+        createdAt: when.toISOString(),
+      });
+    }
+
+    // Clients with no transcript: deliver the turn here (see the header).
+    if (turnsToDeliver.length > 0) await flushTurns(turnsToDeliver);
 
     try {
       await neuralscapePost(
         "/v1/memories/raw",
-        buildCompactSnapshotPayload(content, getUserId(), projectId),
+        buildCompactSnapshotPayload(content, getUserId(), projectId, when, sessionId),
       );
       await resetTransportFailures();
     } catch (error) {
       // Transport failure → log + count toward the fail-loud threshold
       // surfaced at next SessionStart. The compact itself is unaffected.
-      await recordTransportFailure();
-      logError("compact snapshot store failed (service unreachable?)", error);
+      const { kind } = await recordFailure(error);
+      logError(`compact snapshot store failed (${kind})`, error);
     }
   } catch (error) {
     logError("pre-compact hook failed", error);

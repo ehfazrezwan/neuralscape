@@ -11,21 +11,30 @@ from datetime import datetime
 from typing import NamedTuple
 
 from config import settings
-from identity import collision_free_ids_enabled
 from schemas import MemoryVisibility, normalize_visibility
 
 logger = logging.getLogger(__name__)
 
-# Collision-free group ids (enforced auth profile).  Legacy names join components with
-# ``--``, which a legal id may itself contain, so user ``a--project--b`` and user ``a`` in
-# project ``b`` share one name.  A component is *plain* when it holds only Graphiti's group-id
-# characters (letters, digits, ``_`` and ``-``; no ``.``), no ``--``, and neither starts nor
-# ends with ``-``: then every ``--`` in a name is a delimiter and the name reads back to
-# exactly one tuple, so tuples of plain components keep their legacy name byte for byte.  Any
-# other tuple is named ``nsg1--`` + the hex of a length-prefixed encoding of the whole tuple,
-# whose first segment no legacy name has and whose characters Graphiti accepts.  Each
-# placement has exactly one name: an encoding of a plain tuple is not a valid name.
-_PLAIN_COMPONENT = re.compile(r"[A-Za-z0-9_]+(?:-[A-Za-z0-9_]+)*")
+# ── Injective group ids ────────────────────────────────────────────────
+# Legacy group ids join their parts with ``--``, but a legal id may itself
+# contain ``--`` (the id alphabet is ``[A-Za-z0-9_.-]``), so user
+# ``alice--project--payroll`` and user ``alice`` in project ``payroll`` shared
+# one graph namespace (a cross-user read/write alias).
+#
+# A component is *plain* when it is non-empty, uses only Graphiti's group-id
+# alphabet ``[A-Za-z0-9_-]`` (so NOT ``.``: Graphiti's validate_group_id rejects it,
+# hence no data can exist under a dotted name) and has no ``--``. A plain component can still start or end with a single ``-``: the
+# delimiter is then followed/preceded by one more ``-`` and the reading stays
+# unique (checked exhaustively in tests/test_group_ids.py). In a tuple of plain
+# components the name reads back to exactly one tuple, and plain tuples keep
+# their legacy name BYTE FOR BYTE (zero migration for every id that does not hit
+# the collision). Any tuple with a non-plain
+# component is named ``nsg1--`` + the hex of a length-prefixed encoding of the
+# whole tuple: the ``nsg1`` first segment is not a legacy pool name, the
+# characters are all Graphiti-valid, and the encoding is canonical, so distinct
+# tuples can never share a name. (Idea reused from the old graph-wave branch,
+# minus its auth-profile flag: injectivity must not be opt-in.)
+_PLAIN_COMPONENT = re.compile(r"(?!.*--)[A-Za-z0-9_\-]+")
 ENCODED_GROUP_PREFIX = "nsg1--"
 _POOL_KINDS = ("private", "shared", "standard")
 
@@ -39,16 +48,27 @@ class GroupKey(NamedTuple):
     workspace: str | None
 
 
+def _is_plain_component(value: str | None) -> bool:
+    # An empty component (e.g. an anonymous private owner) is NOT plain: with the
+    # flag on it is encoded, so no tuple can read back as "user--" ambiguously.
+    return value is None or _PLAIN_COMPONENT.fullmatch(value) is not None
+
+
 def _encode_group_key(key: GroupKey) -> str:
-    """``nsg1--`` + hex of one segment per field: ``~`` if absent, else ``<utf8-length>:<value>``."""
-    parts = []
-    for value in key:
-        parts.append("~" if value is None else f"{len(value.encode('utf-8'))}:{value}")
+    """``nsg1--`` + hex of one segment per field: ``~`` if absent else ``<utf8-length>:<value>``."""
+    parts = [
+        "~" if value is None else f"{len(value.encode('utf-8'))}:{value}"
+        for value in key
+    ]
     return ENCODED_GROUP_PREFIX + "".join(parts).encode("utf-8").hex()
 
 
 def decode_group_id(group_id: str) -> GroupKey | None:
-    """The exact placement of an encoded (``nsg1--``) group id, or ``None`` for any other name."""
+    """Exact placement named by an encoded (``nsg1--``) group id, else ``None``.
+
+    Only canonical encodings of tuples that actually need one decode; a legacy
+    name (including every plain tuple's name) returns ``None``.
+    """
     if not isinstance(group_id, str) or not group_id.startswith(ENCODED_GROUP_PREFIX):
         return None
     try:
@@ -79,20 +99,15 @@ def decode_group_id(group_id: str) -> GroupKey | None:
         position != len(data)
         or key.pool not in _POOL_KINDS
         or (key.pool == "private") != (key.owner is not None)
-        or _encode_group_key(key) != group_id  # canonical form only
-        or not _has_non_plain_component(key)  # a plain tuple's only name is its legacy one
+        or _encode_group_key(key) != group_id
+        or _key_is_plain(key)
     ):
         return None
     return key
 
 
-def _has_non_plain_component(key: GroupKey) -> bool:
-    present = [value for value in (key.owner, key.project, key.workspace) if value is not None]
-    return not all(_PLAIN_COMPONENT.fullmatch(value) for value in present)
-
-
-def _needs_encoded_group_id(key: GroupKey) -> bool:
-    return collision_free_ids_enabled() and _has_non_plain_component(key)
+def _key_is_plain(key: GroupKey) -> bool:
+    return all(_is_plain_component(v) for v in (key.owner, key.project, key.workspace))
 
 def _live_edges_filter():
     """Graphiti ``SearchFilters`` selecting only bi-temporally LIVE edges.
@@ -209,9 +224,11 @@ def _build_group_id(
     group_ids for existing rows, zero migration). Any other value appends
     `--ws--{workspace}`, isolating reference content from memory pools.
 
-    Under the enforced auth profile a tuple with a component that is not plain
-    (it contains ``--`` or starts or ends with ``-``) is named by
-    ``_encode_group_key`` instead, so distinct tuples never share a name.
+    Injective WHEN ``GRAPH_GROUP_ID_INJECTIVE_ENABLED`` is on (default off:
+    the names above for every id, byte for byte): a tuple with a non-plain component (one containing ``--``, a ``.`` or
+    any character outside ``[A-Za-z0-9_-]``) is named
+    ``nsg1--<hex>`` (see ``_encode_group_key``) so it can never alias another
+    tuple's namespace; every plain tuple keeps the legacy name shown above.
     """
     # Tolerate enum / str / legacy "MemoryVisibility.X" / None — see
     # normalize_visibility docstring for why this matters. Unrecognized
@@ -229,25 +246,17 @@ def _build_group_id(
         str(project_id) if project_id else None,
         str(workspace) if workspace and workspace != "memory" else None,
     )
-    if _needs_encoded_group_id(key):
+    if settings.graph_group_id_injective_enabled and not _key_is_plain(key):
         return _encode_group_key(key)
-    if vis == MemoryVisibility.STANDARD.value:
-        # Authoritative org-wide pool: dictator-written, everyone-readable.
-        base = f"standard--project--{project_id}" if project_id else "standard"
-        if workspace and workspace != "memory":
-            return f"{base}--ws--{workspace}"
-        return base
-    if vis == MemoryVisibility.SHARED.value:
-        base = f"shared--project--{project_id}" if project_id else "shared"
-        if workspace and workspace != "memory":
-            return f"{base}--ws--{workspace}"
-        return base
-    # private
-    base = f"user--{user_id}--project--{project_id}" if project_id else f"user--{user_id}"
     # Workspace suffix: absent or "memory" ⇒ no suffix (backward compatible)
-    if workspace and workspace != "memory":
-        return f"{base}--ws--{workspace}"
-    return base
+    if pool == MemoryVisibility.STANDARD.value:
+        # Authoritative org-wide pool: dictator-written, everyone-readable.
+        base = f"standard--project--{key.project}" if key.project else "standard"
+    elif pool == MemoryVisibility.SHARED.value:
+        base = f"shared--project--{key.project}" if key.project else "shared"
+    else:
+        base = f"user--{key.owner}--project--{key.project}" if key.project else f"user--{key.owner}"
+    return f"{base}--ws--{key.workspace}" if key.workspace else base
 
 
 def _get_group_ids(caller_user_id: str, project_id: str | None = None) -> list[str]:

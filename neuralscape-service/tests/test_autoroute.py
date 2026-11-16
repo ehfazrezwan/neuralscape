@@ -303,3 +303,29 @@ def test_auto_bound_passes_project_id_keyword(monkeypatch):
         )
     assert name == "code-native"
     assert seen["project_id"] == "proj-42"  # forwarded, not dropped/crashed
+
+
+def test_preference_map_cites_no_missing_file():
+    """Every document the default preference map cites must exist in the repo.
+
+    Regression: the docstring cited ``ICE_V2_ENGINE_COMPARISON.md``, a report
+    that was never committed, so the default looked unsupported (and was
+    contradicted by the older v1 report). Any ``*.md`` file the module names
+    must be a tracked path; the unpublished run is described, not linked.
+    """
+    import re
+    from pathlib import Path
+
+    import knowledge.autoroute as autoroute
+
+    doc = autoroute.__doc__ or ""
+    repo_root = Path(autoroute.__file__).resolve().parents[2]
+    assert "unpublished" in doc, "the source of the default map must be stated"
+    cited = re.findall(r"[\w./-]+\.md", doc)
+    bare = [c for c in cited if not c.startswith("docs/")]
+    assert not bare, f"cite documents by repo path, found: {bare}"
+    if not (repo_root / "docs").is_dir():
+        # Packaged test image ships only neuralscape-service/; host CI checks paths.
+        return
+    missing = [c for c in cited if not (repo_root / c).is_file()]
+    assert not missing, f"cited docs missing from the repo: {missing}"

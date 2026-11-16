@@ -189,9 +189,9 @@ class ProvenanceMixin:
             return dict(zero)
 
         try:
-            resolved_uuid = None
+            found = None
             if episode_uuid:
-                resolved_uuid = self._lookup_episode_uuid(group_id, "uuid", episode_uuid)
+                found = self._lookup_episode(group_id, "uuid", episode_uuid)
             # Content before name: the single-fact write path (write.py
             # ::enrich_graph) does NOT name its episode deterministically —
             # MemoryGraph.add() mints `mem0_episode_{now.isoformat()}` when no
@@ -206,12 +206,12 @@ class ProvenanceMixin:
             # path, where it IS deterministic (sha256 of raw_text+group_id)
             # but the Qdrant row's `content` is the distilled fact, not the
             # raw transcript the episode actually stored.
-            if not resolved_uuid and content:
-                resolved_uuid = self._lookup_episode_uuid(group_id, "content", content)
-            if not resolved_uuid and episode_name:
-                resolved_uuid = self._lookup_episode_uuid(group_id, "name", episode_name)
+            if not found and content:
+                found = self._lookup_episode(group_id, "content", content)
+            if not found and episode_name:
+                found = self._lookup_episode(group_id, "name", episode_name)
 
-            if not resolved_uuid:
+            if not found:
                 logger.warning(
                     "Episode cascade: could not resolve an episode in "
                     "group_id=%r (uuid=%r, name=%r, content_len=%s)",
@@ -220,9 +220,11 @@ class ProvenanceMixin:
                 )
                 return dict(zero)
 
+            resolved_uuid = found["uuid"]
+            resolved_name = found.get("name")
             survivors: list = []
             if support_aware and exclude_ids is not None:
-                survivors = self._episode_survivors(resolved_uuid, episode_name, exclude_ids) or []
+                survivors = self._episode_survivors(resolved_uuid, resolved_name or episode_name, exclude_ids) or []
             if support_aware:
                 counts = self._support_aware_episode_removal(group_id, [resolved_uuid])
                 if counts is not None:
@@ -235,6 +237,7 @@ class ProvenanceMixin:
                     return {
                         "resolved": True,
                         "episode_uuid": resolved_uuid,
+                        "episode_name": resolved_name,
                         "mode": "support_aware",
                         "edges_expired": counts["edges_removed"],
                         "edges_kept": counts["edges_kept"],
@@ -259,6 +262,7 @@ class ProvenanceMixin:
             return {
                 "resolved": True,
                 "episode_uuid": resolved_uuid,
+                "episode_name": resolved_name,
                 "edges_expired": edges_expired,
                 "nodes_removed": node_counts["nodes_removed"],
                 "summaries_cleared": node_counts["summaries_cleared"],
@@ -583,14 +587,293 @@ class ProvenanceMixin:
             )
 
     # ──────────────────────────────────────────────
+    # One episode, N rows: cascade once, repair the siblings
+    # ──────────────────────────────────────────────
+    #
+    # A conversation write produces ONE Graphiti episode for N extracted
+    # facts and stamps the same ``graph_episode_uuid``/``graph_episode_name``
+    # on all N Qdrant rows. The episode body contains every fact verbatim and
+    # episode recall serves it, so when ANY of those rows is deleted (or
+    # migrated to another partition) the whole episode must go
+    # (most-restrictive-wins, unchanged). What must not happen is the other
+    # N-1 rows silently losing their graph evidence while their vectors live
+    # on with a dangling ref. ``_cascade_rows_once`` therefore (a) cascades
+    # each distinct episode ONCE per call and (b) repairs every live sibling:
+    # clears its stale ref and builds a single-fact re-ingest job into its own
+    # group — the same job shape ``patch_memory`` returns as ``graph_job``,
+    # consumed by ``task_manager.enqueue_graph_enrichment``.
+
+    @staticmethod
+    def _row_meta(mem: dict) -> dict:
+        meta = mem.get("metadata", {}) or {}
+        if isinstance(meta.get("metadata"), dict):
+            meta = meta["metadata"]
+        return meta
+
+    def _cascade_rows_once(
+        self,
+        rows: list[dict],
+        *,
+        deleted_ids=(),
+        skip_job_ids=(),
+    ) -> dict:
+        """Cascade a batch of rows' graph provenance, one cascade per episode.
+
+        ``rows``: ``[{"id": str, "mem": {"memory", "metadata", ...},
+        "group_id": str | None}]`` — ``mem``/``group_id`` are exactly what
+        :meth:`_cascade_or_fallback_expire` takes (``group_id`` only when the
+        caller needs to pin the OLD partition, e.g. a migration).
+
+        ``deleted_ids``: rows that no longer exist (or are being deleted in
+        this call). They are never repaired or re-enriched.
+        ``skip_job_ids``: live rows the caller re-enriches itself (the row a
+        partition migration moved): their stale ref is cleared but no sibling
+        job is built for them.
+
+        Rows sharing an episode ref with an already-cascaded row reuse that
+        cascade's result instead of re-resolving a node that is already gone
+        (which used to read as "unresolved" and fire the lossy substring
+        fallback). Unresolved rows are NOT merged — the substring fallback is
+        content-specific, so each runs its own.
+
+        Never raises. Returns::
+
+            {"results": {id: cascade_result}, "unresolved_ids": [...],
+             "graph_jobs": [job, ...],        # sibling re-enrichment jobs
+             "sibling_unrepaired_ids": [...], # siblings that could not be
+                                              # repaired (reported, not dropped)
+             "sibling_repair_failed": bool,   # the sibling lookup itself failed
+             "episodes_cascaded": int}
+        """
+        deleted = {str(i) for i in deleted_ids}
+        skip_jobs = {str(i) for i in skip_job_ids}
+        results: dict[str, dict] = {}
+        unresolved: list[str] = []
+        covered: dict[tuple, dict] = {}   # (group, ref) -> resolved cascade result
+        episodes: list[dict] = []         # distinct cascaded episodes, for repair
+
+        for row in rows:
+            mid = str(row.get("id") or "")
+            mem = row.get("mem") or {}
+            # Conversation-extracted rows carry no ``owner_user_id`` in their
+            # metadata (only the Qdrant payload's top-level ``user_id``), and
+            # the bulk paths hand us ``{"memory", "metadata"}`` without it. With
+            # no owner the group derives as ``user--`` and the episode is never
+            # found — so callers pass the row owner and it is injected here.
+            if row.get("user_id") and not mem.get("user_id"):
+                mem = dict(mem, user_id=row["user_id"])
+            pinned_group = row.get("group_id")
+            meta = self._row_meta(mem)
+            group = pinned_group or _build_group_id(
+                meta.get("visibility") or MemoryVisibility.PRIVATE.value,
+                meta.get("owner_user_id") or mem.get("user_id", ""),
+                meta.get("project_id"),
+                meta.get("workspace"),
+            )
+            row_uuid = meta.get("graph_episode_uuid")
+            row_name = meta.get("graph_episode_name")
+            hit = None
+            for ref in (row_uuid, row_name):
+                if ref and (group, ref) in covered:
+                    hit = covered[(group, ref)]
+                    break
+            if hit is not None:
+                results[mid] = dict(hit, memory_id=mid or None)
+                continue
+
+            try:
+                if pinned_group:
+                    res = self._cascade_or_fallback_expire(mem, group_id=pinned_group, memory_id=mid)
+                else:
+                    res = self._cascade_or_fallback_expire(mem, memory_id=mid)
+            except Exception as e:
+                logger.warning(f"Graph cascade failed for {mid} (non-critical): {e}")
+                res = {"resolved": False, "memory_id": mid or None}
+            results[mid] = res
+            if not res.get("resolved"):
+                unresolved.append(mid)
+                continue
+            refs = {r for r in (row_uuid, row_name, res.get("episode_uuid"), res.get("episode_name")) if r}
+            for ref in refs:
+                covered[(group, ref)] = res
+            episodes.append({
+                "owner": meta.get("owner_user_id") or mem.get("user_id", ""),
+                "uuids": {r for r in (row_uuid, res.get("episode_uuid")) if r},
+                "names": {r for r in (row_name, res.get("episode_name")) if r},
+            })
+
+        # Merge episodes per owner so the sibling scroll runs once per owner.
+        by_owner: dict[str, dict] = {}
+        for ep in episodes:
+            agg = by_owner.setdefault(ep["owner"], {"uuids": set(), "names": set()})
+            agg["uuids"] |= ep["uuids"]
+            agg["names"] |= ep["names"]
+        jobs: list[dict] = []
+        unrepaired: list[str] = []
+        repair_failed = False
+        for owner, agg in by_owner.items():
+            if not owner or not (agg["uuids"] or agg["names"]):
+                continue
+            repaired = self._repair_episode_siblings(
+                owner, agg["uuids"], agg["names"], deleted_ids=deleted, skip_job_ids=skip_jobs,
+            )
+            jobs.extend(repaired["graph_jobs"])
+            unrepaired.extend(repaired["unrepaired_ids"])
+            repair_failed = repair_failed or bool(repaired.get("lookup_failed"))
+        return {
+            "results": results,
+            "unresolved_ids": unresolved,
+            "graph_jobs": jobs,
+            "sibling_unrepaired_ids": unrepaired,
+            # True when the sibling lookup itself failed: siblings may exist
+            # with dangling refs and no re-enrichment job (reported, not hidden).
+            "sibling_repair_failed": repair_failed,
+            "episodes_cascaded": len(episodes),
+        }
+
+    def _repair_episode_siblings(
+        self,
+        owner: str,
+        uuids: set[str],
+        names: set[str],
+        *,
+        deleted_ids: set[str],
+        skip_job_ids: set[str],
+    ) -> dict:
+        """Clear the dangling episode ref on every live row of ``owner``
+        pointing at a just-cascaded episode and build its re-enrichment job.
+
+        Scoped by ``user_id`` (a cross-user row can never be touched) and
+        bounded to the rows that carry one of the cascaded refs. The ref is
+        cleared with an atomic nested-key ``set_payload(key="metadata")`` (no
+        read-modify-write of the whole payload). Any failure is returned in
+        ``unrepaired_ids`` — a sibling is never silently dropped. Never raises.
+        """
+        out: dict = {"graph_jobs": [], "unrepaired_ids": []}
+        try:
+            from qdrant_client.models import FieldCondition, Filter, MatchAny, MatchValue
+
+            self._ensure_filter_indexes()
+            client = self._memory.vector_store.client
+            collection = settings.qdrant_collection
+            should = []
+            for prefix in ("metadata.", "metadata.metadata."):
+                if uuids:
+                    should.append(FieldCondition(
+                        key=prefix + "graph_episode_uuid", match=MatchAny(any=sorted(uuids))))
+                if names:
+                    should.append(FieldCondition(
+                        key=prefix + "graph_episode_name", match=MatchAny(any=sorted(names))))
+            scroll_filter = Filter(
+                must=[FieldCondition(key="user_id", match=MatchValue(value=owner))],
+                should=should,
+            )
+            siblings: list[tuple[str, dict, dict, bool]] = []
+            offset = None
+            while True:
+                points, offset = client.scroll(
+                    collection_name=collection,
+                    scroll_filter=scroll_filter,
+                    limit=200,
+                    offset=offset,
+                    with_payload=True,
+                    with_vectors=False,
+                )
+                for pt in points:
+                    sid = str(pt.id)
+                    payload = pt.payload or {}
+                    if sid in deleted_ids or payload.get("user_id") != owner:
+                        continue
+                    raw = payload.get("metadata", {}) or {}
+                    wrapped = isinstance(raw.get("metadata"), dict)
+                    meta = raw["metadata"] if wrapped else raw
+                    # Re-check in Python: only rows that really point at a
+                    # cascaded episode (the filter is a candidate net).
+                    if meta.get("graph_episode_uuid") not in uuids and (
+                        meta.get("graph_episode_name") not in names
+                    ):
+                        continue
+                    siblings.append((sid, payload, meta, wrapped))
+                if offset is None:
+                    break
+        except Exception as e:
+            logger.warning(
+                "Sibling lookup for cascaded episode failed (owner=%r): %s", owner, e,
+                exc_info=True,
+            )
+            out["lookup_failed"] = True
+            return out
+
+        cleared_payload = {"graph_episode_uuid": None, "graph_episode_name": None}
+        failed: set[str] = set()
+        for want_wrapped in (False, True):
+            ids = [sid for sid, _, _, w in siblings if w == want_wrapped]
+            if not ids:
+                continue
+            key = "metadata.metadata" if want_wrapped else "metadata"
+            try:
+                client.set_payload(
+                    collection_name=collection, payload=cleared_payload, points=ids, key=key,
+                )
+                continue
+            except Exception as e:
+                logger.warning(
+                    "Batched clear of stale episode refs failed for %d rows (%s); retrying per row",
+                    len(ids), e,
+                )
+            # One bad point must not strand the rest: retry each on its own.
+            for sid in ids:
+                try:
+                    client.set_payload(
+                        collection_name=collection, payload=cleared_payload, points=[sid], key=key,
+                    )
+                except Exception as e:
+                    logger.warning("Clearing stale episode ref failed for %s: %s", sid, e)
+                    failed.add(sid)
+        if failed:
+            out["unrepaired_ids"].extend(sorted(failed))
+            siblings = [t for t in siblings if t[0] not in failed]
+
+        for sid, payload, meta, _ in siblings:
+            if sid in skip_job_ids or meta.get("dream_tombstoned"):
+                continue  # tombstoned rows are not live: ref cleared, no re-ingest
+            content = payload.get("data") or ""
+            workspace = meta.get("workspace")
+            if not content or (workspace and workspace != "memory"):
+                # The enrichment job shape carries no workspace, so a
+                # workspace-partitioned row would land in the wrong group;
+                # empty content has nothing to ingest. Report, don't drop.
+                out["unrepaired_ids"].append(sid)
+                continue
+            out["graph_jobs"].append({
+                "memory_id": sid,
+                "content": content,
+                "user_id": meta.get("owner_user_id") or owner,
+                "project_id": meta.get("project_id"),
+                "visibility": meta.get("visibility") or MemoryVisibility.PRIVATE.value,
+                "source_ref": meta.get("source_ref"),
+            })
+        return out
+
+    # ──────────────────────────────────────────────
     # Single-Cypher-statement helpers (each one _run_on_bridge round trip)
     # ──────────────────────────────────────────────
 
     def _lookup_episode_uuid(
         self, group_id: str, field: str, value: str, *, fail_closed: bool = False
     ) -> str | None:
-        """One cheap Cypher lookup: find an episode's uuid in ``group_id``
-        by ``field`` ('uuid' | 'name' | 'content') == ``value``.
+        """uuid-only view of :meth:`_lookup_episode` (kept for the audit /
+        remediation callers, which only need the uuid)."""
+        found = self._lookup_episode(group_id, field, value, fail_closed=fail_closed)
+        return found["uuid"] if found else None
+
+    def _lookup_episode(
+        self, group_id: str, field: str, value: str, *, fail_closed: bool = False
+    ) -> dict | None:
+        """One cheap Cypher lookup: find an episode (``{"uuid", "name"}``) in
+        ``group_id`` by ``field`` ('uuid' | 'name' | 'content') == ``value``.
+        The name rides along in the same round trip so the cascade can repair
+        sibling rows that reference the episode by name only.
 
         Default fail-OPEN like ``write.py::_graph_episode_exists``: any error
         (bridge down, Neo4j hiccup, mocked/half-initialized bridge in
@@ -605,12 +888,12 @@ class ProvenanceMixin:
         if field == "uuid":
             cypher = (
                 "MATCH (e:Episodic {group_id: $group_id, uuid: $value}) "
-                "RETURN e.uuid AS uuid LIMIT 1"
+                "RETURN e.uuid AS uuid, e.name AS name LIMIT 1"
             )
         elif field == "name":
             cypher = (
                 "MATCH (e:Episodic {group_id: $group_id, name: $value}) "
-                "RETURN e.uuid AS uuid LIMIT 1"
+                "RETURN e.uuid AS uuid, e.name AS name LIMIT 1"
             )
         elif field == "content":
             # Verbatim match — Graphiti stores episode content byte-for-byte.
@@ -618,7 +901,7 @@ class ProvenanceMixin:
             # pick the most recent one.
             cypher = (
                 "MATCH (e:Episodic {group_id: $group_id, content: $value}) "
-                "RETURN e.uuid AS uuid ORDER BY e.created_at DESC LIMIT 1"
+                "RETURN e.uuid AS uuid, e.name AS name ORDER BY e.created_at DESC LIMIT 1"
             )
         else:
             return None
@@ -642,7 +925,9 @@ class ProvenanceMixin:
                 "episode lookup by %s failed for group_id=%r (fail-open)", field, group_id, exc_info=True,
             )
             return None
-        return records[0]["uuid"] if records else None
+        if not records:
+            return None
+        return {"uuid": records[0]["uuid"], "name": records[0].get("name")}
 
     def _expire_episode_edges(self, group_id: str, episode_uuid: str, now_iso: str) -> int:
         """Soft-expire every edge this episode created OR reaffirmed.

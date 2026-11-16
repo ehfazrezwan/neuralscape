@@ -21,7 +21,9 @@ Everything is signed with the existing ``NEURALSCAPE_USER_TOKEN_SECRET`` via
 ``tokens.sign_payload`` and distinguished by a ``typ`` claim:
 
 * ``typ="client"``  → the Dynamic-Client-Registration ``client_id`` itself
-  (encodes the registered ``redirect_uris``; no server-side client store).
+  (encodes the registered ``redirect_uris`` plus a random ``jti`` so every
+  registration is a distinct client; no server-side client store. Client ids
+  issued before the ``jti`` existed still decode).
 * ``typ="code"``    → an authorization code (encodes user_id, client_id,
   redirect_uri, PKCE challenge; ~5 min TTL; single-use via Redis).
 * ``typ="access"``  → the Bearer access token. Identical in shape to an
@@ -31,8 +33,12 @@ Everything is signed with the existing ``NEURALSCAPE_USER_TOKEN_SECRET`` via
 ``verify_user_token`` only accepts ``typ`` in {absent, "access"}, so codes /
 refresh / client tokens can never be replayed as a Bearer credential.
 
-The single piece of real state is a short-TTL Redis key per consumed auth
-code (replay protection); it degrades to best-effort if Redis is down.
+The only real state is a Redis key per consumed single-use credential: one per
+auth code (``oauth:code:<jti>``) and one per redeemed refresh token
+(``oauth:refresh:<jti>``, rotate-and-consume) plus
+``oauth:revoked_family:<fam>`` set when a rotated token is replayed. Both guards fail CLOSED: when
+Redis is unreachable the token endpoint answers 503 ``temporarily_unavailable``
+and issues nothing.
 """
 
 from __future__ import annotations
@@ -41,6 +47,7 @@ import base64
 import hashlib
 import html
 import logging
+import re
 import secrets
 import time
 from urllib.parse import urlencode, urlparse
@@ -52,16 +59,33 @@ from config import settings
 import identity_store
 from login_providers import (
     AuthorizeContext,
+    login_binding_cookie_name,
+    login_binding_cookie_path,
     GoogleProvider,
+    IdentityStoreUnavailable,
+    LOGIN_BINDING_MAX_AGE,
     LoginError,
     LoginNeedsLink,
     SupabaseProvider,
     _supabase_finish_page,
     get_login_provider,
+    new_login_nonce,
+    provision_user_id,
+    sign_login_binding,
     sign_link_ticket,
     verify_link_ticket,
 )
-from tokens import issue_user_token, sign_payload, verify_payload, verify_user_token
+from tokens import (
+    identity_fingerprint,
+    issue_user_token,
+    refresh_revocations,
+    revocation_cold_unavailable,
+    sign_payload,
+    token_fingerprint,
+    verify_payload,
+    verify_user_token,
+)
+import tokens as _tokens
 
 logger = logging.getLogger(__name__)
 
@@ -75,6 +99,9 @@ _CLIENT_TTL: int | None = None  # client_id registrations don't expire
 _LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1"}
 
 
+_BAD_HOST_CHARS = re.compile(r"[\s\x00-\x1f\x7f<>\"'`\\{}|^]")
+
+
 def _is_valid_redirect_uri(uri: str) -> bool:
     """Accept only absolute https:// URIs (or http:// to a loopback host) with
     no fragment. These are signed into the client_id and later trusted by
@@ -82,8 +109,31 @@ def _is_valid_redirect_uri(uri: str) -> bool:
     registration time to avoid open-redirect / token-leak to plaintext hosts."""
     if not isinstance(uri, str) or not uri:
         return False
-    parsed = urlparse(uri)
+    try:
+        parsed = urlparse(uri)
+        # Malformed bracketed hosts make urlparse raise; an empty host or a
+        # non-numeric port is just as unusable. All are plain refusals (400).
+        if not parsed.hostname:
+            return False
+        parsed.port  # noqa: B018 - raises ValueError on an invalid port
+    except ValueError:
+        return False
     if not parsed.netloc or parsed.fragment:
+        return False
+    # userinfo (https://claude.ai@evil.example/cb) is a classic spoof of the
+    # displayed destination and has no legitimate use in a redirect URI.
+    if "@" in parsed.netloc:
+        return False
+    # Characters that can never appear in a host (markup, quotes, whitespace,
+    # control characters) and over-long hosts (DNS caps a name at 253): refused
+    # so the consent page can always show the destination intact.
+    if _BAD_HOST_CHARS.search(parsed.netloc) or len(parsed.hostname or "") > 253:
+        return False
+    # ASCII host, no percent-escapes: what we display must be exactly where the
+    # browser goes. Browsers apply UTS 46 (not Python's IDNA 2003) to non-ASCII
+    # hosts and percent-decode them, so those can differ from any text we show.
+    # A client that needs an IDN host registers its punycode (xn--) form.
+    if "%" in parsed.netloc or not parsed.netloc.isascii():
         return False
     host = (parsed.hostname or "").lower()
     if parsed.scheme == "https":
@@ -135,26 +185,125 @@ def _verify_pkce(code_verifier: str, code_challenge: str) -> bool:
     return secrets.compare_digest(_b64url(digest), code_challenge)
 
 
-async def _consume_code_jti(jti: str) -> bool:
-    """Mark an auth-code id used. Returns True if this is the first use.
+class _ReplayGuardUnavailable(Exception):
+    """Redis could not be reached, so single-use cannot be enforced."""
 
-    Backed by Redis ``SET NX EX`` for replay protection. If Redis is
-    unavailable we log and allow the exchange (best-effort) rather than
-    breaking login — the code is already single-client, PKCE-bound, and
-    short-lived, so the residual replay window is small.
-    """
+
+_REDIS_TIMEOUT = 2  # seconds; a hung Redis must fail closed promptly, not stall /oauth/token
+
+
+async def _redis_op(op):
+    """Run ``op(client)`` against Redis with short timeouts. Any failure raises
+    ``_ReplayGuardUnavailable``: callers must refuse (fail closed) rather than
+    let a single-use credential be redeemed more than once."""
     try:
         import redis.asyncio as aioredis
 
-        client = aioredis.from_url(settings.redis_url)
+        client = aioredis.from_url(
+            settings.redis_url,
+            socket_connect_timeout=_REDIS_TIMEOUT,
+            socket_timeout=_REDIS_TIMEOUT,
+        )
         try:
-            ok = await client.set(f"oauth:code:{jti}", "1", nx=True, ex=_CODE_TTL)
-            return bool(ok)
+            return await op(client)
         finally:
             await client.aclose()
-    except Exception as e:  # noqa: BLE001 — best-effort guard
-        logger.warning("OAuth code replay-guard unavailable (%s); allowing", e)
-        return True
+    except Exception as e:  # noqa: BLE001 — any store failure means fail closed
+        logger.warning("OAuth single-use guard unavailable (%s); refusing", e)
+        raise _ReplayGuardUnavailable() from e
+
+
+async def _consume_once(key: str, ttl: int) -> bool:
+    """Atomically claim ``key`` (Redis ``SET NX EX``). True on the first claim,
+    False if it was already claimed."""
+
+    async def op(client):
+        return bool(await client.set(key, "1", nx=True, ex=max(1, int(ttl))))
+
+    return await _redis_op(op)
+
+
+async def _family_revoked(fam: str) -> bool:
+    """True if reuse of a token in this family was detected earlier."""
+
+    async def op(client):
+        return bool(await client.exists(f"oauth:revoked_family:{fam}"))
+
+    return await _redis_op(op)
+
+
+async def _revoke_family(fam: str, ttl: int) -> None:
+    """Revoke every refresh token in a family (TTL = the refresh lifetime)."""
+
+    async def op(client):
+        await client.set(f"oauth:revoked_family:{fam}", "1", ex=max(1, int(ttl)))
+
+    await _redis_op(op)
+
+
+async def _consume_code_jti(jti: str) -> bool:
+    """Mark an auth-code id used. True if this is the first use."""
+    return await _consume_once(f"oauth:code:{jti}", _CODE_TTL)
+
+
+async def _consume_refresh_jti(jti: str, ttl: int) -> bool:
+    """Mark a refresh-token id redeemed. ``ttl`` is the token's remaining life,
+    so the marker outlives the token and a replay can never slip through."""
+    return await _consume_once(f"oauth:refresh:{jti}", ttl)
+
+
+# ── HTML responses: anti-framing + hardening headers ─────────────────────
+
+_HTML_SECURITY_HEADERS = {
+    "X-Frame-Options": "DENY",
+    # frame-ancestors is the modern equivalent of X-Frame-Options. The pages
+    # use inline CSS/JS and the Supabase page loads a CDN module, so no
+    # script/style policy is imposed here; only the directives that cannot
+    # break them.
+    "Content-Security-Policy": "frame-ancestors 'none'; base-uri 'none'; object-src 'none'",
+    "Referrer-Policy": "no-referrer",
+    "X-Content-Type-Options": "nosniff",
+    "Cache-Control": "no-store",
+}
+
+
+def _revocation_cold_refusal() -> JSONResponse | None:
+    """503 while the Redis revocation set has not loaded once (cold start).
+
+    A pasted/redeemed credential cannot be checked against live revocations
+    yet, so refuse (clients retry) rather than accept or reject it.
+    """
+    if not revocation_cold_unavailable():
+        return None
+    return JSONResponse(
+        status_code=503,
+        headers={"Retry-After": "1"},
+        content={
+            "error": "temporarily_unavailable",
+            "error_description": "token revocation state is unavailable; retry shortly",
+        },
+    )
+
+
+def _src_revoked(src) -> bool:
+    """True when a session's source credential/identity digest is revoked."""
+    if not isinstance(src, str) or not src:
+        return False
+    digests = _tokens._revoked_digests()
+    return digests is None or src.lower() in digests
+
+
+def _digest_revoked(token: str) -> bool:
+    digests = _tokens._revoked_digests()
+    return digests is None or token_fingerprint(token) in digests
+
+
+def _html_response(content: str, status_code: int = 200) -> HTMLResponse:
+    """Every HTML page served under /oauth/* goes through here so none can be
+    framed (clickjacking of the consent button) or leak the URL via Referer."""
+    return HTMLResponse(
+        content=content, status_code=status_code, headers=dict(_HTML_SECURITY_HEADERS)
+    )
 
 
 # ── discovery metadata ───────────────────────────────────────────────────
@@ -243,8 +392,17 @@ async def register(request: Request) -> JSONResponse:
         )
 
     issued_at = int(time.time())
+    # A random jti makes every registration a distinct client. Without it the
+    # signed client_id was a pure function of (redirect_uris, issue second), so
+    # two registrations with the same redirect URIs in the same second got the
+    # SAME client_id and could redeem each other's codes and refresh tokens.
     client_id = sign_payload(
-        {"typ": "client", "redirect_uris": redirect_uris, "iat": issued_at},
+        {
+            "typ": "client",
+            "redirect_uris": redirect_uris,
+            "iat": issued_at,
+            "jti": secrets.token_urlsafe(12),
+        },
         _secret(),
     )
     return JSONResponse(
@@ -279,26 +437,31 @@ _CONSENT_PAGE = """<!doctype html>
 <title>Connect Neuralscape</title>
 <style>
   :root {{ color-scheme: light dark; }}
+  *, *::before, *::after {{ box-sizing: border-box; }}
   body {{ font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
          margin: 0; min-height: 100vh; display: grid; place-items: center;
-         background: #0b0d12; color: #e7e9ee; }}
-  .card {{ width: min(440px, 92vw); background: #151821; border: 1px solid #262b38;
+         background: #0b0d12; color: #e7e9ee; overflow-wrap: anywhere; }}
+  .card {{ width: min(440px, 92vw); max-width: 100%; min-width: 0; background: #151821; border: 1px solid #262b38;
           border-radius: 16px; padding: 28px 28px 24px; box-shadow: 0 12px 40px rgba(0,0,0,.45); }}
   h1 {{ font-size: 19px; margin: 0 0 4px; }}
   p  {{ font-size: 14px; line-height: 1.5; color: #aab1c2; margin: 8px 0; }}
   .who {{ font-size: 13px; color: #8b93a7; margin-bottom: 18px; }}
+  .dest {{ font-size: 15px; color: #e7e9ee; background: #0d0f16; border: 1px solid #3b5bdb;
+          border-radius: 10px; padding: 10px 12px; margin: 10px 0 6px; }}
+  .dest b {{ font-size: 17px; overflow-wrap: anywhere; }}
   label {{ display:block; font-size: 13px; color:#cbd2e1; margin: 16px 0 6px; }}
   textarea {{ width: 100%; box-sizing: border-box; min-height: 84px; resize: vertical;
              font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px;
              background:#0d0f16; color:#e7e9ee; border:1px solid #2c3242; border-radius:10px;
              padding:10px; }}
   button {{ margin-top: 18px; width: 100%; padding: 12px; font-size: 15px; font-weight: 600;
-           border: 0; border-radius: 10px; background: #5b7cfa; color: #fff; cursor: pointer; }}
-  button:hover {{ background: #4f70ee; }}
+           border: 0; border-radius: 10px; background: #3b5bdb; color: #fff; cursor: pointer; }}
+  button:hover {{ background: #364fc7; }}
   .err {{ background: #2a1518; border: 1px solid #5b2a2f; color: #ffb4b4; font-size: 13px;
          border-radius: 10px; padding: 10px 12px; margin: 14px 0 0; }}
-  .hint {{ font-size: 12px; color: #7b8198; }}
-  code {{ background:#0d0f16; padding:1px 5px; border-radius:5px; font-size:12px; }}
+  .hint {{ font-size: 12px; color: #7b8198; overflow-wrap: anywhere; }}
+  code {{ background:#0d0f16; padding:1px 5px; border-radius:5px; font-size:12px;
+         overflow-wrap:anywhere; word-break:break-word; }}
   .provider-btn {{ display:flex; align-items:center; justify-content:center; gap:8px;
            width:100%; box-sizing:border-box; margin-top:8px; padding:11px; font-size:14px;
            font-weight:600; text-decoration:none; border-radius:10px; background:#fff;
@@ -313,7 +476,8 @@ _CONSENT_PAGE = """<!doctype html>
 <body>
   <div class="card">
     <h1>Connect Neuralscape memory</h1>
-    <p class="who">{client_label} is requesting access to your Neuralscape memories.</p>
+    <p class="dest">After you sign in, access is granted to <b>{redirect_host}</b></p>
+    <p class="who">The app calls itself &ldquo;{client_label}&rdquo; and is requesting access to your Neuralscape memories. Only continue if you recognise the address above.</p>
     {error_html}
     <!--PROVIDER_BLOCK-->
     <!--DIVIDER-->
@@ -355,6 +519,7 @@ def _render_consent(
     them when both are present."""
     error_html = f'<div class="err">{html.escape(error)}</div>' if error else ""
     page = _CONSENT_PAGE.format(
+        redirect_host=html.escape(_display_host(redirect_uri)),
         client_label=html.escape(client_label),
         error_html=error_html,
     )
@@ -378,7 +543,59 @@ def _render_consent(
         .replace("<!--DIVIDER-->", divider)
         .replace("<!--TOKEN_FORM-->", token_form)
     )
-    return HTMLResponse(content=page, status_code=status_code)
+    return _html_response(page, status_code)
+
+
+def _display_host(uri: str) -> str:
+    """The destination for the consent page, exactly as the browser will use it:
+    the lower-cased hostname (never userinfo; ASCII only, enforced at
+    registration, so IDN hosts appear in their xn-- form) plus a non-default port."""
+    parsed = urlparse(uri)
+    host = parsed.hostname or ""
+    if ":" in host:
+        host = f"[{host}]"
+    try:
+        port = parsed.port
+    except ValueError:
+        port = None
+    if port is not None and port != {"https": 443, "http": 80}.get(parsed.scheme):
+        host = f"{host}:{port}"
+    return host or "an unknown address"
+
+
+def _cookie_secure() -> bool:
+    """Secure cookie whenever the public URL is https (always, in production)."""
+    return _base_url().lower().startswith("https://")
+
+
+def _set_login_binding_cookie(response, nonce: str) -> None:
+    """Bind the login about to start to this browser.
+
+    HttpOnly (no script reads it), Secure on https, SameSite=Lax: the IdP
+    returns with a top-level GET (Google, and Supabase's redirect), and the
+    Supabase finisher then POSTs from our own origin, so Lax is sent on both;
+    Strict would drop it on the cross-site GET. Scoped to /oauth, expires with
+    the login state.
+    """
+    response.set_cookie(
+        login_binding_cookie_name(),
+        sign_login_binding(nonce, _secret()),
+        max_age=LOGIN_BINDING_MAX_AGE,
+        path=login_binding_cookie_path(),
+        secure=_cookie_secure(),
+        httponly=True,
+        samesite="lax",
+    )
+
+
+def _clear_login_binding_cookie(response) -> None:
+    response.delete_cookie(
+        login_binding_cookie_name(),
+        path=login_binding_cookie_path(),
+        secure=_cookie_secure(),
+        httponly=True,
+        samesite="lax",
+    )
 
 
 @router.get("/oauth/authorize", response_model=None)
@@ -405,7 +622,7 @@ async def authorize(request: Request) -> HTMLResponse | JSONResponse:
     client = _decode_client(client_id)
     if client is None:
         return JSONResponse(status_code=400, content={"error": "invalid_client"})
-    if redirect_uri not in client.get("redirect_uris", []):
+    if not _is_valid_redirect_uri(redirect_uri) or redirect_uri not in client.get("redirect_uris", []):
         # Never redirect to an unregistered URI — surface the error locally.
         return JSONResponse(
             status_code=400,
@@ -431,11 +648,15 @@ async def authorize(request: Request) -> HTMLResponse | JSONResponse:
         code_challenge_method=code_challenge_method,
         resource=resource,
     )
-    provider_block = get_login_provider().consent_block(ctx)
+    provider = get_login_provider()
+    # The login_state in the provider's button carries this nonce; the cookie
+    # set below proves the callback comes back to the browser that started it.
+    nonce = new_login_nonce()
+    provider_block = provider.consent_block(ctx, nonce=nonce)
     # The token-paste box always shows in token mode; under a federated provider
     # it shows unless the deployer turned it off.
     show_token_form = settings.auth_provider == "token" or settings.auth_allow_token_paste
-    return _render_consent(
+    response = _render_consent(
         client_id=client_id,
         redirect_uri=redirect_uri,
         state=state,
@@ -445,6 +666,9 @@ async def authorize(request: Request) -> HTMLResponse | JSONResponse:
         provider_block=provider_block,
         show_token_form=show_token_form,
     )
+    if provider.name != "token":
+        _set_login_binding_cookie(response, nonce)
+    return response
 
 
 @router.post("/oauth/authorize", response_model=None)
@@ -475,13 +699,16 @@ async def authorize_submit(
     client = _decode_client(client_id)
     if client is None:
         return JSONResponse(status_code=400, content={"error": "invalid_client"})
-    if redirect_uri not in client.get("redirect_uris", []):
+    if not _is_valid_redirect_uri(redirect_uri) or redirect_uri not in client.get("redirect_uris", []):
         return JSONResponse(
             status_code=400,
             content={"error": "invalid_request", "error_description": "redirect_uri mismatch"},
         )
 
     # "Login": the pasted credential is an admin-issued per-user token.
+    await refresh_revocations()
+    if (cold := _revocation_cold_refusal()) is not None:
+        return cold
     payload = verify_user_token(token.strip(), _secret()) if token.strip() else None
     if payload is None:
         return _render_consent(
@@ -503,10 +730,15 @@ async def authorize_submit(
         code_challenge_method=code_challenge_method,
         resource=resource,
     )
-    return _issue_code_and_redirect(ctx, payload["user_id"])
+    # ``src`` ties every session minted here to the pasted credential: revoking
+    # it ends them all. (Pasting an OAuth access token keeps its original src.)
+    src = payload.get("src") or token_fingerprint(token.strip())
+    return _issue_code_and_redirect(ctx, payload["user_id"], src=src)
 
 
-def _issue_code_and_redirect(ctx: AuthorizeContext, user_id: str) -> RedirectResponse:
+def _issue_code_and_redirect(
+    ctx: AuthorizeContext, user_id: str, src: str | None = None
+) -> RedirectResponse:
     """Mint a PKCE-bound authorization code for ``user_id`` and 303 back to the
     MCP client's redirect_uri. Shared by every login provider — the only thing
     that varies upstream is how ``user_id`` was authenticated."""
@@ -518,6 +750,7 @@ def _issue_code_and_redirect(ctx: AuthorizeContext, user_id: str) -> RedirectRes
             "redirect_uri": ctx.redirect_uri,
             "code_challenge": ctx.code_challenge,
             "jti": secrets.token_urlsafe(12),
+            **({"src": src} if src else {}),
             "exp": int(time.time()) + _CODE_TTL,
         },
         _secret(),
@@ -543,15 +776,16 @@ def _login_error_page(err: LoginError) -> HTMLResponse:
         "<meta name='viewport' content='width=device-width, initial-scale=1'>"
         "<title>Sign-in failed</title><style>"
         ":root{color-scheme:light dark;}"
-        "body{font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,sans-serif;"
+        "*,*::before,*::after{box-sizing:border-box;}"
+        "body{overflow-wrap:anywhere;font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,sans-serif;"
         "margin:0;min-height:100vh;display:grid;place-items:center;background:#0b0d12;color:#e7e9ee;}"
-        ".card{width:min(440px,92vw);background:#151821;border:1px solid #262b38;border-radius:16px;"
+        ".card{width:min(440px,92vw);max-width:100%;min-width:0;background:#151821;border:1px solid #262b38;border-radius:16px;"
         "padding:28px;box-shadow:0 12px 40px rgba(0,0,0,.45);}"
         "h1{font-size:19px;margin:0 0 8px;}p{font-size:14px;color:#aab1c2;}"
         "</style></head><body><div class='card'><h1>Sign-in failed</h1>"
         f"<p>{safe}</p></div></body></html>"
     )
-    return HTMLResponse(content=page, status_code=err.status)
+    return _html_response(page, err.status)
 
 
 # ── self-service link (claim an existing account) ─────────────────────────
@@ -560,9 +794,11 @@ _LINK_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Link your Neuralscape account</title><style>
   :root {{ color-scheme: light dark; }}
+  *, *::before, *::after {{ box-sizing: border-box; }}
   body {{ font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
-         margin:0; min-height:100vh; display:grid; place-items:center; background:#0b0d12; color:#e7e9ee; }}
-  .card {{ width:min(460px,92vw); background:#151821; border:1px solid #262b38; border-radius:16px;
+         margin:0; min-height:100vh; display:grid; place-items:center; background:#0b0d12; color:#e7e9ee;
+         overflow-wrap:anywhere; }}
+  .card {{ width:min(460px,92vw); max-width:100%; min-width:0; background:#151821; border:1px solid #262b38; border-radius:16px;
           padding:28px; box-shadow:0 12px 40px rgba(0,0,0,.45); }}
   h1 {{ font-size:19px; margin:0 0 4px; }}
   p {{ font-size:14px; line-height:1.5; color:#aab1c2; margin:8px 0; }}
@@ -572,12 +808,13 @@ _LINK_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
              color:#e7e9ee; border:1px solid #2c3242; border-radius:10px; padding:10px; }}
   button {{ margin-top:12px; width:100%; padding:11px; font-size:14px; font-weight:600; border:0;
            border-radius:10px; cursor:pointer; }}
-  .primary {{ background:#5b7cfa; color:#fff; }} .primary:hover {{ background:#4f70ee; }}
+  .primary {{ background:#3b5bdb; color:#fff; }} .primary:hover {{ background:#364fc7; }}
   .secondary {{ background:#fff; color:#1f2330; border:1px solid #d6d9e0; }}
   .divider {{ display:flex; align-items:center; color:#7b8198; font-size:12px; margin:20px 0 6px; }}
   .divider::before, .divider::after {{ content:""; flex:1; border-top:1px solid #262b38; }}
   .divider span {{ padding:0 10px; }}
-  .hint {{ font-size:12px; color:#7b8198; }} code {{ background:#0d0f16; padding:1px 5px; border-radius:5px; }}
+  .hint {{ font-size:12px; color:#7b8198; }} code {{ background:#0d0f16; padding:1px 5px; border-radius:5px;
+         overflow-wrap:anywhere; word-break:break-word; }}
   .err {{ background:#2a1518; border:1px solid #5b2a2f; color:#ffb4b4; font-size:13px;
          border-radius:10px; padding:10px 12px; margin:14px 0 0; }}
 </style></head><body><div class="card">
@@ -608,7 +845,7 @@ def _render_link_page(ticket: str, email: str, suggested: str,
         email=html.escape(email), ticket=html.escape(ticket),
         suggested=html.escape(suggested), error_html=error_html,
     )
-    return HTMLResponse(content=page, status_code=status_code)
+    return _html_response(page, status_code)
 
 
 async def _finish_login(result) -> HTMLResponse | RedirectResponse:
@@ -619,7 +856,20 @@ async def _finish_login(result) -> HTMLResponse | RedirectResponse:
     if isinstance(result, LoginNeedsLink):
         ticket = sign_link_ticket(result, _secret())
         return _render_link_page(ticket, result.email, result.suggested_user_id)
-    return _issue_code_and_redirect(result.ctx, result.user_id)
+    return _issue_code_and_redirect(
+        result.ctx,
+        result.user_id,
+        src=identity_fingerprint(settings.auth_provider, result.user_id),
+    )
+
+
+async def _finish_bound_login(result) -> HTMLResponse | RedirectResponse:
+    """``_finish_login`` for the IdP callbacks: the login binding cookie is spent
+    once the callback has been handled, unless it was refused or must be retried."""
+    response = await _finish_login(result)
+    if not (isinstance(result, LoginError) and result.keep_cookie):
+        _clear_login_binding_cookie(response)
+    return response
 
 
 # ── federated login callbacks (google / supabase) ────────────────────────
@@ -633,7 +883,7 @@ async def google_callback(request: Request) -> RedirectResponse | HTMLResponse |
         return _not_configured()
     if settings.auth_provider != "google":
         return JSONResponse(status_code=404, content={"detail": "google login not enabled"})
-    return await _finish_login(await GoogleProvider().complete(request))
+    return await _finish_bound_login(await GoogleProvider().complete(request))
 
 
 @router.get("/oauth/supabase/callback", response_model=None)
@@ -644,7 +894,7 @@ async def supabase_callback_get(request: Request) -> HTMLResponse | JSONResponse
         return _not_configured()
     if settings.auth_provider != "supabase":
         return JSONResponse(status_code=404, content={"detail": "supabase login not enabled"})
-    return HTMLResponse(_supabase_finish_page())
+    return _html_response(_supabase_finish_page())
 
 
 @router.post("/oauth/supabase/callback", response_model=None)
@@ -654,7 +904,7 @@ async def supabase_callback_post(request: Request) -> RedirectResponse | HTMLRes
         return _not_configured()
     if settings.auth_provider != "supabase":
         return JSONResponse(status_code=404, content={"detail": "supabase login not enabled"})
-    return await _finish_login(await SupabaseProvider().complete(request))
+    return await _finish_bound_login(await SupabaseProvider().complete(request))
 
 
 @router.post("/oauth/link", response_model=None)
@@ -681,7 +931,11 @@ async def oauth_link(
     sub = claims.get("sub") or None
     email = claims.get("email") or None
 
+    src = None
     if action == "link":
+        await refresh_revocations()
+        if (cold := _revocation_cold_refusal()) is not None:
+            return cold
         payload = verify_user_token(token.strip(), _secret()) if token.strip() else None
         if payload is None:
             return _render_link_page(
@@ -690,26 +944,49 @@ async def oauth_link(
                 status_code=400,
             )
         user_id = payload["user_id"]
+        # The session descends from the pasted credential: revoking it ends it.
+        src = payload.get("src") or token_fingerprint(token.strip())
     else:
         user_id = claims.get("suggested_user_id") or ""
         if not user_id:
             return _login_error_page(LoginError("Could not determine an account id.", 400))
+        # The slug may have been claimed by someone else since the page was
+        # shown (or the legacy slug collides): never silently share an id.
+        try:
+            user_id = await provision_user_id(user_id, sub, email, reserve=True)
+        except IdentityStoreUnavailable:
+            return _login_error_page(
+                LoginError("Identity store unavailable. Please try signing in again shortly.", 503)
+            )
+        # Computed after provisioning: the id may differ from the suggested slug.
+        src = identity_fingerprint(settings.auth_provider, user_id)
 
     await identity_store.link(user_id, sub=sub, email=email)
-    return _issue_code_and_redirect(ctx, user_id)
+    return _issue_code_and_redirect(ctx, user_id, src=src)
 
 
 # ── token endpoint ───────────────────────────────────────────────────────
 
 
-def _token_response(user_id: str) -> JSONResponse:
+def _token_response(
+    user_id: str, client_id: str, family: str | None = None, src: str | None = None
+) -> JSONResponse:
+    src_claim = {"src": src} if src else {}
     access = issue_user_token(
-        user_id, _secret(), settings.oauth_access_ttl, typ="access"
+        user_id, _secret(), settings.oauth_access_ttl, typ="access", extra_claims=src_claim
     )
+    # The refresh token is single-use (rotate-and-consume via its jti) and
+    # bound to the client it was issued to (RFC 6749 §6).
     refresh = sign_payload(
         {
             "typ": "refresh",
             "user_id": user_id,
+            "client_id": client_id,
+            # ``fam`` ties every rotation of one grant together so reuse of any
+            # old token can revoke the whole chain.
+            "fam": family or secrets.token_urlsafe(12),
+            "jti": secrets.token_urlsafe(16),
+            **src_claim,
             "exp": int(time.time()) + settings.oauth_refresh_ttl,
         },
         _secret(),
@@ -732,6 +1009,14 @@ def _token_error(error: str, description: str = "", status_code: int = 400) -> J
     return JSONResponse(status_code=status_code, content=body)
 
 
+def _guard_unavailable() -> JSONResponse:
+    return _token_error(
+        "temporarily_unavailable",
+        "single-use check is unavailable; retry shortly",
+        status_code=503,
+    )
+
+
 @router.post("/oauth/token")
 async def token(
     request: Request,
@@ -745,6 +1030,10 @@ async def token(
     """Exchange an authorization code (with PKCE) or a refresh token for tokens."""
     if not oauth_enabled():
         return _not_configured()
+
+    await refresh_revocations()
+    if (cold := _revocation_cold_refusal()) is not None:
+        return cold
 
     if grant_type == "authorization_code":
         claims = verify_payload(code, _secret())
@@ -760,13 +1049,21 @@ async def token(
             return _token_error("invalid_grant", "redirect_uri mismatch")
         if not _verify_pkce(code_verifier, claims.get("code_challenge", "")):
             return _token_error("invalid_grant", "PKCE verification failed")
-        jti = claims.get("jti", "")
-        if jti and not await _consume_code_jti(jti):
-            return _token_error("invalid_grant", "authorization code already used")
+        jti = claims.get("jti")
+        if not isinstance(jti, str) or not jti:
+            return _token_error("invalid_grant", "code is invalid or expired")
         user_id = claims.get("user_id")
         if not isinstance(user_id, str) or not user_id:
             return _token_error("invalid_grant", "code missing user")
-        return _token_response(user_id)
+        if _src_revoked(claims.get("src")):
+            return _token_error("invalid_grant", "code is invalid or expired")
+        try:
+            first_use = await _consume_code_jti(jti)
+        except _ReplayGuardUnavailable:
+            return _guard_unavailable()
+        if not first_use:
+            return _token_error("invalid_grant", "authorization code already used")
+        return _token_response(user_id, client_id, src=claims.get("src"))
 
     if grant_type == "refresh_token":
         claims = verify_payload(refresh_token, _secret())
@@ -775,6 +1072,56 @@ async def token(
         user_id = claims.get("user_id")
         if not isinstance(user_id, str) or not user_id:
             return _token_error("invalid_grant", "refresh_token missing user")
-        return _token_response(user_id)
+        # Refresh tokens minted before rotation/families shipped carry no
+        # jti/client_id/fam. They cannot be made single-use or revoked, so they
+        # are refused and the user reconnects once.
+        jti = claims.get("jti")
+        fam = claims.get("fam")
+        bound_client = claims.get("client_id")
+        if not all(isinstance(v, str) and v for v in (jti, fam, bound_client)):
+            return _token_error("invalid_grant", "refresh_token is invalid or expired")
+        # The refresh token is bound to the client it was issued to. A public
+        # client MAY omit client_id on the refresh grant (RFC 6749 3.2.1 and 6;
+        # OAuth 2.1 4.3.1); the bound client then continues the session. When a
+        # client_id IS sent it must match exactly, checked before consuming so a
+        # wrong client cannot burn the real client's token. Compare bytes:
+        # compare_digest rejects non-ASCII str. (Requiring client_id would add
+        # no security for a public client: client_id is not a secret.)
+        if client_id and not secrets.compare_digest(
+            bound_client.encode("utf-8"), client_id.encode("utf-8")
+        ):
+            return _token_error("invalid_grant", "client mismatch")
+        remaining = int(claims.get("exp", 0)) - int(time.time())
+        # Revoked directly (its own digest) or via the credential/identity it
+        # descends from. Direct revocation also kills the whole family.
+        if _digest_revoked(refresh_token):
+            try:
+                await _revoke_family(fam, max(1, remaining))
+            except _ReplayGuardUnavailable:
+                return _guard_unavailable()
+            return _token_error("invalid_grant", "refresh_token is invalid or expired")
+        if _src_revoked(claims.get("src")):
+            return _token_error("invalid_grant", "refresh_token is invalid or expired")
+        try:
+            if await _family_revoked(fam):
+                return _token_error("invalid_grant", "refresh_token is invalid or expired")
+            first_use = await _consume_refresh_jti(jti, remaining)
+        except _ReplayGuardUnavailable:
+            return _guard_unavailable()
+        if not first_use:
+            # Strict by design, no grace window (OAuth 2.0 Security BCP reuse
+            # detection): a legitimate client retrying after a lost response
+            # lands here too and must reconnect.
+            # A rotated token was replayed: someone holds a copy. Revoke the
+            # whole family so the successor (possibly held by the thief) dies
+            # too; the legitimate client reconnects.
+            logger.warning("OAuth refresh token reuse: revoking family (user=%s)", user_id)
+            try:
+                await _revoke_family(fam, settings.oauth_refresh_ttl)
+            except _ReplayGuardUnavailable:
+                return _guard_unavailable()
+            return _token_error("invalid_grant", "refresh_token already used")
+        # Rotate within the client the token is bound to (client_id may be omitted).
+        return _token_response(user_id, bound_client, family=fam, src=claims.get("src"))
 
     return _token_error("unsupported_grant_type", f"grant_type '{grant_type}' not supported")

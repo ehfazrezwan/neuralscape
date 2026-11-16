@@ -5,6 +5,7 @@ code is verbatim — behavior unchanged.
 """
 
 from config import settings
+from memory.edit import revision_of
 from schemas import MemoryResponse, MemoryVisibility
 
 class ConvertMixin:
@@ -46,6 +47,7 @@ class ConvertMixin:
                 "id": str(getattr(point, "id", "")),
                 "memory": payload.get("data", ""),
                 "metadata": payload.get("metadata", {}) or {},
+                "user_id": payload.get("user_id"),
                 "created_at": payload.get("created_at"),
                 "updated_at": payload.get("updated_at"),
             }
@@ -80,10 +82,14 @@ class ConvertMixin:
         metadata = mem.get("metadata", {}) or {}
         if isinstance(metadata.get("metadata"), dict):
             metadata = metadata["metadata"]
+        from category_evidence import validated_evidence
+
         return MemoryResponse(
             id=mem.get("id", ""),
             memory=mem.get("memory", ""),
             category=metadata.get("category"),
+            category_evidence=validated_evidence(mem.get('memory', ''), metadata.get('category'),
+                                                 metadata.get('category_evidence')),
             scope=metadata.get("scope"),
             project_id=metadata.get("project_id"),
             tags=metadata.get("tags"),
@@ -104,7 +110,11 @@ class ConvertMixin:
             memory_kind=metadata.get("memory_kind"),
             source_ref=metadata.get("source_ref"),
             visibility=metadata.get("visibility"),
-            owner_user_id=metadata.get("owner_user_id"),
+            # Legacy rows (conversation extraction before owner stamping) carry
+            # the owner only as the payload's top-level user_id.
+            owner_user_id=metadata.get("owner_user_id") or mem.get("user_id") or None,
+            revision=revision_of(metadata),
+            workspace=metadata.get("workspace"),
             sensitivity=metadata.get("sensitivity"),
             sensitivity_source=metadata.get("sensitivity_source"),
             title=metadata.get("title"),

@@ -35,6 +35,7 @@ class TestConfigValidation:
             neo4j_password="test-pass",
             neo4j_uri="neo4j://localhost:7687",
             redis_url="redis://localhost:6379",
+            neuralscape_user_token_secret="test-secret",
         )
         # Should not raise
         s.validate_required()
@@ -427,23 +428,7 @@ class TestRESTRedisFallback:
     @pytest.fixture(autouse=True)
     def setup_mocks(self):
         """Patch globals for REST endpoint tests."""
-        mock_mem = MagicMock(name="Memory")
-        mock_graphiti = MagicMock(name="Graphiti")
-        mock_bridge = MagicMock(name="AsyncBridge")
-
-        original_memory = main._memory
-        original_graphiti = main._graphiti
-        original_bridge = main._bridge
-
-        main._memory = mock_mem
-        main._graphiti = mock_graphiti
-        main._bridge = mock_bridge
-
         yield
-
-        main._memory = original_memory
-        main._graphiti = original_graphiti
-        main._bridge = original_bridge
 
     @pytest.fixture
     def mock_service(self):
@@ -543,11 +528,11 @@ class TestJobIdempotency:
 class TestGlobalExceptionHandler:
     @pytest.fixture(autouse=True)
     def setup_mocks(self):
-        mock_mem = MagicMock(name="Memory")
-        original_memory = main._memory
-        main._memory = mock_mem
+        mock_svc = MagicMock(name="MemoryService")
+        original_service = main._service
+        main._service = mock_svc
         yield
-        main._memory = original_memory
+        main._service = original_service
 
     @pytest.fixture(autouse=True)
     def mock_task_manager(self):
@@ -568,7 +553,7 @@ class TestGlobalExceptionHandler:
 
     def test_500_does_not_leak_internal_details(self, client):
         """Error responses should not contain stack traces or internal paths."""
-        main._memory.add.side_effect = Exception(
+        main._service.extract_and_store.side_effect = Exception(
             "neo4j://admin:secret@localhost:7687 connection refused /app/internal/path.py"
         )
         resp = client.post("/memories", json={
@@ -582,7 +567,7 @@ class TestGlobalExceptionHandler:
         assert "/app/internal" not in json.dumps(body)
 
     def test_500_returns_generic_message(self, client):
-        main._memory.search.side_effect = RuntimeError("internal failure")
+        main._service.search.side_effect = RuntimeError("internal failure")
         resp = client.post("/search", json={
             "query": "test",
             "user_id": "u1",
@@ -601,10 +586,6 @@ class TestGlobalExceptionHandler:
 class TestInputValidation:
     @pytest.fixture(autouse=True)
     def setup_mocks(self):
-        mock_mem = MagicMock(name="Memory")
-        original_memory = main._memory
-        main._memory = mock_mem
-
         mock_tm = MagicMock(name="TaskManager")
         mock_tm.connect = AsyncMock()
         mock_tm.close = AsyncMock()
@@ -615,7 +596,6 @@ class TestInputValidation:
 
         yield
 
-        main._memory = original_memory
         main._task_manager = original_tm
 
     @pytest.fixture
@@ -692,11 +672,7 @@ class TestInputValidation:
 class TestHealthEndpointChecks:
     @pytest.fixture(autouse=True)
     def setup_mocks(self):
-        mock_mem = MagicMock(name="Memory")
-        original_memory = main._memory
-        main._memory = mock_mem
         yield
-        main._memory = original_memory
 
     @pytest.fixture
     def client(self):
@@ -782,6 +758,84 @@ class TestHealthEndpointChecks:
         finally:
             main._task_manager = original
             main._service = original_svc
+
+    def test_health_returns_503_when_vector_store_probe_fails_or_hangs(self, client, monkeypatch):
+        """An initialised client whose store errors or never answers is unreachable (bounded by the probe timeout)."""
+        import threading
+
+        mock_tm = MagicMock(name="TaskManager")
+        mock_tm.pool = MagicMock()
+        mock_tm.pool.ping = AsyncMock(return_value=True)
+        release = threading.Event()
+
+        def hang():
+            release.wait(5)
+            return []
+
+        monkeypatch.setattr(main, "_task_manager", mock_tm)
+        monkeypatch.setattr(main, "_VECTOR_STORE_PROBE_TIMEOUT_S", 0.1)
+        for probe in (MagicMock(side_effect=ConnectionError("refused")), hang):
+            mock_svc = MagicMock()
+            mock_svc._memory.vector_store.client.get_collections = probe
+            mock_svc._graphiti = MagicMock()
+            monkeypatch.setattr(main, "_service", mock_svc)
+            resp = client.get("/health")
+            assert resp.status_code == 503
+            assert resp.json()["checks"]["vector_store"] == "unreachable"
+        release.set()
+
+    def test_health_probe_is_single_flight_and_briefly_cached(self, monkeypatch):
+        """Concurrent and back-to-back readiness probes share one Qdrant round trip (one event loop, as in prod)."""
+        import asyncio
+        import threading
+
+        release = threading.Event()
+        calls = []
+
+        def slow():
+            calls.append(1)
+            release.wait(5)
+            return []
+
+        memory = MagicMock()
+        memory.vector_store.client.get_collections = slow
+        monkeypatch.setattr(main, "_VECTOR_STORE_PROBE_TIMEOUT_S", 0.2)
+
+        async def scenario():
+            # A hung store: several concurrent callers all time out; only one probe is in flight.
+            results = await asyncio.gather(*[main._probe_vector_store(memory) for _ in range(4)], return_exceptions=True)
+            assert all(isinstance(r, TimeoutError) for r in results)
+            assert len(calls) == 1
+            again = await asyncio.gather(main._probe_vector_store(memory), return_exceptions=True)
+            assert isinstance(again[0], TimeoutError) and len(calls) == 1
+
+            # The store answers: the completed probe is cached for the TTL.
+            release.set()
+            for _ in range(100):
+                if main._vector_probe["task"] is None:
+                    break
+                await asyncio.sleep(0.02)
+            await main._probe_vector_store(memory)
+            await main._probe_vector_store(memory)
+            assert len(calls) == 1
+
+            # Past the TTL a fresh probe is made.
+            monkeypatch.setattr(main, "_VECTOR_STORE_PROBE_TTL_S", 0.0)
+            await main._probe_vector_store(memory)
+            assert len(calls) == 2
+
+        asyncio.run(scenario())
+
+    def test_health_probes_the_vector_store_for_real(self, client, monkeypatch):
+        mock_tm = MagicMock(name="TaskManager")
+        mock_tm.pool = MagicMock()
+        mock_tm.pool.ping = AsyncMock(return_value=True)
+        mock_svc = MagicMock()
+        mock_svc._graphiti = MagicMock()
+        monkeypatch.setattr(main, "_task_manager", mock_tm)
+        monkeypatch.setattr(main, "_service", mock_svc)
+        assert client.get("/health").json()["checks"]["vector_store"] == "ok"
+        mock_svc._memory.vector_store.client.get_collections.assert_called_once()
 
 
 # ══════════════════════════════════════════════

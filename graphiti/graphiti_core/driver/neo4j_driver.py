@@ -166,6 +166,10 @@ class Neo4jDriver(GraphDriver):
         params = kwargs.pop('params', None)
         if params is None:
             params = {}
+        # NEURALSCAPE PATCH (re-apply after upstream subtree syncs): `database_` is
+        # a neo4j driver *keyword* argument, not a Cypher parameter. Upstream put it
+        # in `params`, which sent it as a query parameter and left the query on the
+        # default database; it must go in kwargs.
         kwargs.setdefault('database_', self._database)
 
         try:

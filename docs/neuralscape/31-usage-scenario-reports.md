@@ -57,6 +57,23 @@ Measured on one machine (synthetic ledgers, single process):
 The report size does not grow with the ledger; reconciliation is linear in the number of events and dominates the cost.
 These figures describe the instrumentation, not provider cost or any product saving.
 
+## Where events come from in the running service
+
+With `USAGE_STORE_ENABLED=true` the API and every worker queue open the store at start-up and install the durable
+recorder before the memory service builds its provider clients (`usage_store.install_usage_capture`). A provider call
+records an event only when it runs under an attempt context, which names the person (the tenant) it is billed to:
+
+* **ARQ jobs** (every queue): the worker's `on_job_start` hook binds the job to the user who enqueued it, read from the
+  enqueue-time task-owner record; a job with no owner record (a cron, a job another job enqueued) is recorded under the
+  tenant `unattributed`, not dropped. This covers extraction, graph enrichment and the other provider calls a job makes.
+* **Search and Ask** on the API and MCP side: `MemoryService.search`, `search_graph` and `ask.ask_memory` bind the caller.
+  Ask's answering model call is recorded as `llm_ask`; the embeddings of its searches are recorded as `mem0_embedding`.
+* A caller that already bound a context (a ledger stage, with its ledger attempt) keeps it.
+
+Calls made outside these entry points (a script, a one-off CLI) are not recorded. The SQLite backend is a file per
+process host; with the API and the workers in separate containers use the PostgreSQL backend so one ledger holds
+everything. No route reads the ledger in this slice.
+
 ## Limits
 
 * Mixes are declarations. Representative activity distributions and the allocation of shared infrastructure and

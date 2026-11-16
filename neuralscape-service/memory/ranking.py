@@ -7,7 +7,7 @@ code is verbatim — behavior unchanged.
 import logging
 import math
 
-from config import settings
+from config import VECTOR_EMBEDDING_DIMS, settings
 
 logger = logging.getLogger(__name__)
 
@@ -104,6 +104,106 @@ def _unit_cosine(a: list, b: list) -> float | None:
         return None
 
 
+# ── Cross-store (Qdrant 768-d vs Graphiti 1024-d) comparison ───────────
+# Graphiti's stored vectors and the mem0/Qdrant vectors come from the same
+# Matryoshka (MRL) model, gemini-embedding-001, at different
+# ``output_dimensionality``. A lower-dimension MRL vector is the leading
+# prefix of the full vector -- Google's embeddings guide, section "Controlling
+# embedding size": gemini-embedding-001 "is trained using the Matryoshka
+# Representation Learning (MRL) technique" and its output "can be truncated";
+# non-3072 outputs of gemini-embedding-001 are not unit-norm
+# (https://ai.google.dev/gemini-api/docs/embeddings#control-embedding-size).
+# Two such vectors of different length are therefore compared on their common
+# prefix (cosine renormalises). Only models listed
+# here may be compared that way; anything else keeps the strict
+# length-match contract of ``_unit_cosine``.
+_MRL_EMBEDDING_MODELS = frozenset({"gemini-embedding-001"})
+
+
+def _canonical_embedding_model(name: str | None) -> str:
+    """``models/x``, ``google-vertex/x`` and ``x`` all name the same model."""
+    return (name or "").strip().lower().rsplit("/", 1)[-1]
+
+
+def _graph_vectors_mrl_comparable() -> bool:
+    """True when the graph embedder and the vector embedder are the SAME MRL
+    model, so prefix comparison across their dimensions is meaningful.
+
+    The graph side always uses ``gemini_embedder_model`` (both graphiti model
+    dicts in ``Settings``); the vector side uses the gateway embedder model
+    when the gateway is enabled, else ``gemini_embedder_model``.
+    """
+    graph_model = _canonical_embedding_model(settings.gemini_embedder_model)
+    vector_model = _canonical_embedding_model(
+        settings.llm_gateway_embedder_model
+        if settings.llm_gateway_enabled
+        else settings.gemini_embedder_model
+    )
+    return graph_model == vector_model and graph_model in _MRL_EMBEDDING_MODELS
+
+
+def _mrl_cosine(a: list, b: list) -> float | None:
+    """``_unit_cosine`` over the common prefix when the lengths differ.
+
+    Callers must have established that both vectors are leading-prefix
+    truncations of one MRL model (``_graph_vectors_mrl_comparable``);
+    this function does not check. Equal lengths behave exactly like
+    ``_unit_cosine``. The prefix is not unit-norm, but cosine normalises.
+    """
+    try:
+        if a and b and len(a) != len(b):
+            n = min(len(a), len(b))
+            return _unit_cosine(list(a[:n]), list(b[:n]))
+    except TypeError:
+        return None
+    return _unit_cosine(a, b)
+
+
+def _graph_edge_cosine(query_embedding: list, edge_embedding: list) -> float | None:
+    """Score a graph edge's stored ``fact_embedding`` against the query vector.
+
+    Same-length vectors: plain cosine. Different lengths: prefix cosine when
+    both stores use the same MRL model, otherwise ``None`` (unscorable, as
+    before).
+    """
+    if (
+        query_embedding
+        and edge_embedding
+        and len(query_embedding) != len(edge_embedding)
+        and not _graph_vectors_mrl_comparable()
+    ):
+        return None
+    return _mrl_cosine(query_embedding, edge_embedding)
+
+
+def _fit_vector_to_collection(vec: list | None) -> list | None:
+    """Make a stored graph edge vector usable as a query against the Qdrant
+    collection (``VECTOR_EMBEDDING_DIMS``).
+
+    Longer MRL vectors are truncated to the collection dimension and
+    re-normalised. Longer non-MRL vectors and vectors SHORTER than the
+    collection dimension cannot be searched with and yield ``None`` (caller
+    treats the row as having no stored embedding). A vector already at the
+    collection dimension passes through unchanged.
+    """
+    if not vec:
+        return None
+    if len(vec) == VECTOR_EMBEDDING_DIMS:
+        return vec
+    if len(vec) < VECTOR_EMBEDDING_DIMS:
+        return None
+    if not _graph_vectors_mrl_comparable():
+        return None
+    try:
+        head = [float(x) for x in vec[:VECTOR_EMBEDDING_DIMS]]
+    except (TypeError, ValueError):
+        return None
+    norm = math.sqrt(sum(x * x for x in head))
+    if norm <= 0.0:
+        return None
+    return [x / norm for x in head]
+
+
 def _dense_score_floor(dense_hits: list) -> float | None:
     """Weakest cosine score in a pool's dense leg (imputed score for
     lexical-only hits: presence via a strong keyword match is worth at
@@ -112,6 +212,79 @@ def _dense_score_floor(dense_hits: list) -> float | None:
         s for s in (getattr(h, "score", None) for h in dense_hits) if s is not None
     ]
     return min(scores) if scores else None
+
+
+def _fused_order_keys(fused: list[dict], dense_hits: list) -> list[float | None]:
+    """Rank-transferred ordering keys for one pool's RRF-fused entries.
+
+    ``_rrf_fuse`` orders a pool by leg agreement, but the rows it returns
+    keep their NATIVE presentation score (real cosine for dense hits, the
+    pool's dense floor for lexical-only hits). Sorting the cross-pool merge
+    by that native score throws the fused order away: every lexical-only
+    hit sits at the pool floor and is cut, and a dense hit that RRF
+    promoted is re-ordered back by raw cosine.
+
+    Fix: transfer the fused ORDER onto the cosine SCALE. The pool's dense
+    cosines, sorted descending, are handed out by fused position — the
+    entry at position ``i`` gets the ``i``-th best cosine; positions past
+    the dense leg's length get the pool floor. The keys are monotone
+    non-increasing in fused order (so the pool's RRF order survives any
+    sort by key) and live on the cosine scale (so they stay comparable
+    across pools, unlike raw RRF values, which would degenerate into a
+    positional interleave). Keys only ORDER rows; displayed scores are
+    untouched.
+
+    Returns one entry per fused position; every entry is ``None`` when the
+    pool's dense leg was empty (no cosine scale to transfer onto) — the
+    caller resolves those against the other pools.
+    """
+    dense_scores = sorted(
+        (s for s in (getattr(h, "score", None) for h in dense_hits) if s is not None),
+        reverse=True,
+    )
+    if not dense_scores:
+        return [None] * len(fused)
+    floor = dense_scores[-1]
+    return [
+        dense_scores[i] if i < len(dense_scores) else floor
+        for i in range(len(fused))
+    ]
+
+
+def _record_order_key(
+    order_keys: dict | None, row_id: str, key: float | None
+) -> None:
+    """Record a pool row's ordering key; the best key wins across pools.
+
+    ``None`` (empty-dense pool) only registers the id so ``search()`` can
+    impute it later; it never overwrites a real key.
+    """
+    if order_keys is None or not row_id:
+        return
+    prior = order_keys.get(row_id)
+    if prior is None or (key is not None and key > prior):
+        order_keys[row_id] = key
+
+
+def _resolve_order_keys(
+    order_keys: dict[str, float | None],
+) -> tuple[dict[str, float], set[str]]:
+    """Impute keys for rows from empty-dense pools (key ``None``).
+
+    A lexical-only hit in a pool whose dense leg returned nothing has no
+    cosine to rank on. Same principle as ``_dense_score_floor`` (presence
+    via a keyword match is worth at least the weakest dense candidate,
+    never more): such rows get the LOWEST real key seen across all pools,
+    or 0.0 when no pool had a dense leg at all. They tie with that weakest
+    row; the returned ``imputed`` id set lets the caller sort them AHEAD of
+    that tie, so they are not silently sunk below everything, yet never
+    outrank a stronger dense hit. Returns ``(keys, imputed_ids)``.
+    """
+    real = [k for k in order_keys.values() if k is not None]
+    fallback = min(real) if real else 0.0
+    keys = {i: (k if k is not None else fallback) for i, k in order_keys.items()}
+    imputed = {i for i, k in order_keys.items() if k is None}
+    return keys, imputed
 
 
 def _mem_is_tombstoned(mem: dict) -> bool:
@@ -170,7 +343,7 @@ def _reinforcement_boost(score: float | None, metadata: dict | None) -> float | 
     return min(1.0, score * (1.0 + k * math.log1p(times_derived - 1)))
 
 
-def _salience_tiebreak(responses: list) -> list:
+def _salience_tiebreak(responses: list, order_keys: dict | None = None) -> list:
     """A4 guardrail 1: bounded logarithmic salience tie-breaker on recall.
 
     OFF by default (``DREAMING_SALIENCE_RECALL_K=0.0``) — and when off (or
@@ -187,6 +360,10 @@ def _salience_tiebreak(responses: list) -> list:
     reinforcement-by-dedup stored on the row; this is recall-frequency
     strength from the dreaming traces — the two signals never double-count
     one another.)
+
+    ``order_keys`` (optional ``{id: ordering key}`` from the hybrid pool
+    merge) receives the same multiplicative lift as the displayed score, so
+    the sort — which runs on the keys — stays consistent with the boost.
     """
     try:
         from extensions.dreaming.config import dreaming_settings
@@ -205,7 +382,10 @@ def _salience_tiebreak(responses: list) -> list:
         for r in responses:
             signal = signals.get(r.id or "", 0.0)
             if r.score is not None and signal > 0.0:
-                r.score = r.score * (1.0 + k * math.log1p(signal))
+                lift = 1.0 + k * math.log1p(signal)
+                r.score = r.score * lift
+                if order_keys is not None and order_keys.get(r.id) is not None:
+                    order_keys[r.id] = order_keys[r.id] * lift
     except Exception:
         logger.debug("salience tie-break skipped (non-fatal)", exc_info=True)
     return responses

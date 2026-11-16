@@ -119,6 +119,9 @@ def test_legacy_email_slug_collisions_exist() -> None:
 
 
 def test_legacy_group_id_delimiter_collision_exists() -> None:
+    """Until PR 501's GRAPH_GROUP_ID_INJECTIVE_ENABLED is on, the legacy join still collides; the
+    ``ns1`` namespace codec below is what policy uses to keep the tuples apart."""
+
     assert _build_group_id("private", "x--project--y") == _build_group_id(
         "private", "x", project_id="y"
     )

@@ -22,6 +22,8 @@ setting, so CLI/CI/e2e are unaffected.
 
 from __future__ import annotations
 
+import contextvars
+import hmac
 import html
 import logging
 import secrets
@@ -37,7 +39,7 @@ from jwt import PyJWKClient
 import identity_store
 from allowlist import is_email_allowed
 from config import settings
-from identity import unlinked_user_id
+from identity import disambiguate_user_id, slugify_email
 from tokens import sign_payload, verify_payload, verify_user_token
 
 logger = logging.getLogger(__name__)
@@ -78,24 +80,81 @@ class AuthorizeContext:
     resource: str
 
 
-def sign_login_state(ctx: AuthorizeContext, secret: str) -> str:
-    """Sign the authorize context into a short-lived ``login_state`` token."""
+# The cookie that binds a login_state to the browser that started the login.
+# Without it the signed state alone is bearer-like: anyone holding a state URL
+# (an attacker who started their own /oauth/authorize) could push a victim
+# through the IdP and receive an authorization code for the VICTIM's account.
+LOGIN_BINDING_COOKIE = "ns_login_bind"
+# The IdP callbacks and the link page all live under /oauth.
+LOGIN_BINDING_COOKIE_PATH = "/oauth"
+LOGIN_BINDING_MAX_AGE = _LOGIN_STATE_TTL
+# Over https the cookie carries the __Host- prefix (Secure, Path=/, no Domain):
+# browsers refuse to let a sibling subdomain, or plain http, plant or overwrite a
+# __Host- cookie, which closes cookie tossing of an attacker's own signed cookie.
+HOST_PREFIX = "__Host-"
+
+
+def _public_https() -> bool:
+    return settings.neuralscape_public_url.strip().lower().startswith("https://")
+
+
+def login_binding_cookie_name() -> str:
+    """``__Host-ns_login_bind`` on an https deployment, else ``ns_login_bind``."""
+    return (HOST_PREFIX + LOGIN_BINDING_COOKIE) if _public_https() else LOGIN_BINDING_COOKIE
+
+
+def login_binding_cookie_path() -> str:
+    """``/`` (required by __Host-) on https, ``/oauth`` for plain-http dev."""
+    return "/" if _public_https() else LOGIN_BINDING_COOKIE_PATH
+
+
+def _cookie_name_count(request, name: str) -> int:
+    """How many times ``name`` appears in the RAW Cookie header(s). A framework
+    cookie dict keeps only one value per name, hiding a planted duplicate."""
+    headers = getattr(request, "headers", None)
+    if headers is None:
+        return 1 if name in getattr(request, "cookies", {}) else 0
+    raw = headers.get("cookie", "") if hasattr(headers, "get") else ""
+    return sum(1 for part in raw.split(";") if part.strip().split("=", 1)[0].strip() == name)
+
+_BINDING_REFUSED = (
+    "This sign-in was not started in this browser, or it has expired. "
+    "Start again from the app that asked you to connect, in the same browser "
+    "(cookies must be enabled)."
+)
+
+
+def new_login_nonce() -> str:
+    """A fresh random nonce shared by the login_state and the binding cookie."""
+    return secrets.token_urlsafe(16)
+
+
+def sign_login_state(ctx: AuthorizeContext, secret: str, nonce: str | None = None) -> str:
+    """Sign the authorize context into a short-lived ``login_state`` token.
+
+    ``nonce`` is the value the binding cookie carries; callers that start a real
+    login pass the same nonce to ``sign_login_binding``. Omitted, a random one
+    is generated (nothing is then bound to it).
+    """
     claims = {
         "typ": "login_state",
-        "nonce": secrets.token_urlsafe(8),
+        "nonce": nonce or new_login_nonce(),
         "exp": int(time.time()) + _LOGIN_STATE_TTL,
         **asdict(ctx),
     }
     return sign_payload(claims, secret)
 
 
-def verify_login_state(token: str, secret: str) -> AuthorizeContext | None:
-    """Verify a ``login_state`` token and rebuild the authorize context."""
+def verify_login_state_nonce(token: str, secret: str) -> tuple[AuthorizeContext, str] | None:
+    """Verify a ``login_state`` token; return ``(context, nonce)`` or None."""
     claims = verify_payload(token, secret)
     if claims is None or claims.get("typ") != "login_state":
         return None
+    nonce = claims.get("nonce")
+    if not isinstance(nonce, str) or not nonce:
+        return None
     try:
-        return AuthorizeContext(
+        ctx = AuthorizeContext(
             client_id=claims["client_id"],
             redirect_uri=claims["redirect_uri"],
             state=claims.get("state", ""),
@@ -105,6 +164,107 @@ def verify_login_state(token: str, secret: str) -> AuthorizeContext | None:
         )
     except KeyError:
         return None
+    return ctx, nonce
+
+
+def verify_login_state(token: str, secret: str) -> AuthorizeContext | None:
+    """Verify a ``login_state`` token and rebuild the authorize context.
+
+    This checks the signature and expiry only. It does NOT prove the caller is
+    the browser that started the login: the callbacks use ``bind_login`` for that.
+    """
+    parsed = verify_login_state_nonce(token, secret)
+    return parsed[0] if parsed else None
+
+
+def sign_login_binding(nonce: str, secret: str) -> str:
+    """The value of the binding cookie: the nonce, signed, with the state's TTL."""
+    return sign_payload(
+        {"typ": "login_bind", "nonce": nonce, "exp": int(time.time()) + LOGIN_BINDING_MAX_AGE},
+        secret,
+    )
+
+
+def verify_login_binding(token: str, secret: str) -> str | None:
+    """The nonce inside a binding cookie, or None (missing, tampered, expired)."""
+    claims = verify_payload(token or "", secret)
+    if claims is None or claims.get("typ") != "login_bind":
+        return None
+    nonce = claims.get("nonce")
+    return nonce if isinstance(nonce, str) and nonce else None
+
+
+class LoginBindingUnavailable(RuntimeError):
+    """The single-use store is down, so a login cannot be consumed safely."""
+
+
+async def _consume_login_nonce(nonce: str) -> bool:
+    """Claim ``nonce`` once (Redis SET NX EX). False when it was already used.
+
+    Reuses oauth.py's fail-closed Redis helper (imported lazily: oauth imports
+    this module). Raises ``LoginBindingUnavailable`` when Redis cannot answer.
+    """
+    import oauth
+
+    try:
+        return await oauth._consume_once(f"oauth:login_nonce:{nonce}", _LOGIN_STATE_TTL)
+    except oauth._ReplayGuardUnavailable as e:
+        raise LoginBindingUnavailable(str(e)) from e
+
+
+async def bind_login(request: Request, state_token: str) -> "AuthorizeContext | LoginError":
+    """Verify a callback's ``state`` AND that this browser started the login.
+
+    Order: valid signed state -> binding cookie present, signed, unexpired ->
+    cookie nonce equals state nonce -> nonce not used before (consumed here, once).
+    Any failure returns a ``LoginError`` and the caller issues no code.
+    """
+    secret = settings.neuralscape_user_token_secret
+    parsed = verify_login_state_nonce(state_token, secret)
+    if parsed is None:
+        return LoginError("Login session expired or invalid. Try again.", 400)
+    ctx, state_nonce = parsed
+    name = login_binding_cookie_name()
+    # Exactly one cookie of this name, read under the name for this deployment's
+    # scheme only (a non-prefixed cookie on https is attacker-plantable: ignored).
+    cookie_nonce = (
+        verify_login_binding(request.cookies.get(name, ""), secret)
+        if _cookie_name_count(request, name) == 1
+        else None
+    )
+    if cookie_nonce is None or not hmac.compare_digest(
+        cookie_nonce.encode("utf-8"), state_nonce.encode("utf-8")
+    ):
+        # Keep the cookie: this may be a forged callback hitting the real user's
+        # browser, and their genuine login must still be able to finish.
+        return LoginError(_BINDING_REFUSED, 403, keep_cookie=True)
+    try:
+        first_use = await _consume_login_nonce(state_nonce)
+    except LoginBindingUnavailable:
+        return LoginError(
+            "Sign-in is temporarily unavailable. Please try again shortly.", 503, keep_cookie=True
+        )
+    if not first_use:
+        return LoginError(_BINDING_REFUSED, 403, keep_cookie=False)
+    _binding_ok.set(True)
+    return ctx
+
+
+_binding_ok: contextvars.ContextVar[bool] = contextvars.ContextVar("login_binding_ok", default=False)
+
+
+async def _complete_tracking_binding(coro_fn, request):
+    """Run a provider's ``_complete``; a LoginError raised AFTER the binding
+    succeeded belongs to this browser's own spent login, so its cookie may be
+    cleared. Failures before that (junk state, forged callback) keep it."""
+    token = _binding_ok.set(False)
+    try:
+        res = await coro_fn(request)
+        if isinstance(res, LoginError) and _binding_ok.get():
+            res.keep_cookie = False
+        return res
+    finally:
+        _binding_ok.reset(token)
 
 
 # ── login results ────────────────────────────────────────────────────────
@@ -124,6 +284,11 @@ class LoginError:
 
     message: str
     status: int = 400
+    # True (default) keeps the login binding cookie in the browser: a refused,
+    # junk or retryable callback must not destroy the user's genuine in-flight
+    # login. It is cleared only once the binding itself succeeded (see
+    # ``_after_binding``) or the nonce was already spent.
+    keep_cookie: bool = True
 
 
 @dataclass
@@ -180,8 +345,7 @@ async def resolve_login_identity(sub: str | None, email: str) -> tuple[str, bool
     """Map a verified identity to a ``user_id``. Returns ``(user_id, linked)``.
 
     Order: durable store → ``AUTH_IDENTITY_MAP`` seed (promoted into the store)
-    → email slug (a fresh, *unlinked* identity the caller can offer to link;
-    collision-free under the enforced auth profile, see ``identity``).
+    → email slug (a fresh, *unlinked* identity the caller can offer to link).
     """
     uid = await identity_store.resolve(sub, email)
     if uid:
@@ -190,7 +354,43 @@ async def resolve_login_identity(sub: str | None, email: str) -> tuple[str, bool
     if seed:
         await identity_store.link(seed, sub=sub, email=email)  # promote seed → durable
         return seed, True
-    return unlinked_user_id(email), False
+    return await provision_user_id(slugify_email(email), sub, email), False
+
+
+async def provision_user_id(
+    suggested: str, sub: str | None, email: str | None, *, reserve: bool = False
+) -> str:
+    """Return the id a *new* (unlinked) identity should get.
+
+    ``suggested`` is the plain email slug. The slug is lossy, so two different
+    emails can derive the same one; if it is already linked, reserved or seeded
+    (``AUTH_IDENTITY_MAP``) for a different identity the newcomer gets a
+    hash-suffixed id instead of silently sharing that user's memories. Existing
+    links never pass through here, so existing ids are unchanged.
+
+    ``reserve=False`` (the suggestion shown on the link page) only reads.
+    ``reserve=True`` (``/oauth/link`` provisioning) claims the id atomically
+    (``identity_store.reserve``), so two concurrent first logins cannot both
+    take one slug. Fails closed: raises ``IdentityStoreUnavailable`` when Redis
+    cannot answer, rather than guessing the slug is free.
+    """
+    seeds = settings.identity_map_dict()
+    candidate = suggested
+    try:
+        for hex_len in (8, 16, 64):
+            if reserve:
+                if await identity_store.reserve(candidate, sub=sub, email=email, seed_map=seeds):
+                    return candidate
+            elif not await identity_store.claimed_by_other(candidate, sub=sub, email=email, seed_map=seeds):
+                return candidate
+            candidate = disambiguate_user_id(suggested, email or "", hex_len=hex_len)
+    except identity_store.StoreUnavailable as e:
+        raise IdentityStoreUnavailable(str(e)) from e
+    return candidate
+
+
+class IdentityStoreUnavailable(RuntimeError):
+    """A first login cannot be provisioned safely because Redis is down."""
 
 
 async def _resolve_identity(
@@ -229,7 +429,10 @@ async def _resolve_identity(
         ):
             return LoginError("This account is not authorized.", 403)
 
-    user_id, linked = await resolve_login_identity(sub, email)
+    try:
+        user_id, linked = await resolve_login_identity(sub, email)
+    except IdentityStoreUnavailable:
+        return LoginError("Identity store unavailable. Please try signing in again shortly.", 503)
     if linked:
         return LoginResult(ctx=ctx, user_id=user_id)
     return LoginNeedsLink(ctx=ctx, email=email, sub=sub or "", suggested_user_id=user_id)
@@ -245,9 +448,10 @@ class LoginProvider:
 
     name = "base"
 
-    def consent_block(self, ctx: AuthorizeContext) -> str:
+    def consent_block(self, ctx: AuthorizeContext, nonce: str | None = None) -> str:
         """HTML snippet for this provider's login control. '' = no provider UI
-        (the token-paste form is the only login mechanism)."""
+        (the token-paste form is the only login mechanism). ``nonce`` is the value
+        the caller also puts in the login binding cookie."""
         return ""
 
 
@@ -260,7 +464,7 @@ class TokenProvider(LoginProvider):
 
     name = "token"
 
-    def consent_block(self, ctx: AuthorizeContext) -> str:
+    def consent_block(self, ctx: AuthorizeContext, nonce: str | None = None) -> str:
         return ""
 
 
@@ -273,8 +477,8 @@ class GoogleProvider(LoginProvider):
     def _redirect_uri(self) -> str:
         return f"{settings.neuralscape_public_url.rstrip('/')}/oauth/google/callback"
 
-    def _authorize_url(self, ctx: AuthorizeContext) -> str:
-        state = sign_login_state(ctx, settings.neuralscape_user_token_secret)
+    def _authorize_url(self, ctx: AuthorizeContext, nonce: str | None = None) -> str:
+        state = sign_login_state(ctx, settings.neuralscape_user_token_secret, nonce)
         params = {
             "response_type": "code",
             "client_id": settings.google_oauth_client_id,
@@ -286,19 +490,22 @@ class GoogleProvider(LoginProvider):
         }
         return f"{GOOGLE_AUTH_ENDPOINT}?{urlencode(params)}"
 
-    def consent_block(self, ctx: AuthorizeContext) -> str:
+    def consent_block(self, ctx: AuthorizeContext, nonce: str | None = None) -> str:
         if not settings.google_oauth_client_id or not settings.google_oauth_client_secret:
             return '<p class="err">Google login is not configured on this server.</p>'
-        url = html.escape(self._authorize_url(ctx))
+        url = html.escape(self._authorize_url(ctx, nonce))
         return f'<a class="provider-btn" href="{url}">Sign in with Google</a>'
 
     async def complete(self, request: Request) -> LoginResult | LoginError:
+        return await _complete_tracking_binding(self._complete, request)
+
+    async def _complete(self, request: Request) -> LoginResult | LoginError:
         q = request.query_params
         if q.get("error"):
             return LoginError(f"Google sign-in failed: {q.get('error')}", 400)
-        ctx = verify_login_state(q.get("state", ""), settings.neuralscape_user_token_secret)
-        if ctx is None:
-            return LoginError("Login session expired or invalid. Try again.", 400)
+        ctx = await bind_login(request, q.get("state", ""))
+        if isinstance(ctx, LoginError):
+            return ctx
         code = q.get("code", "")
         if not code:
             return LoginError("Missing authorization code from Google.", 400)
@@ -352,10 +559,10 @@ class SupabaseProvider(LoginProvider):
         base = settings.neuralscape_public_url.rstrip("/")
         return f"{base}/oauth/supabase/callback?state={state}"
 
-    def consent_block(self, ctx: AuthorizeContext) -> str:
+    def consent_block(self, ctx: AuthorizeContext, nonce: str | None = None) -> str:
         if not settings.supabase_url or not settings.supabase_anon_key:
             return '<p class="err">Supabase login is not configured on this server.</p>'
-        state = sign_login_state(ctx, settings.neuralscape_user_token_secret)
+        state = sign_login_state(ctx, settings.neuralscape_user_token_secret, nonce)
         cb = self._callback_uri(state)
         # The button triggers supabase-js signInWithOAuth (browser PKCE flow),
         # redirecting back to GET /oauth/supabase/callback to finish.
@@ -372,12 +579,15 @@ document.getElementById('ns-google-btn').addEventListener('click', async () => {
 </script>"""
 
     async def complete(self, request: Request) -> LoginResult | LoginError:
+        return await _complete_tracking_binding(self._complete, request)
+
+    async def _complete(self, request: Request) -> LoginResult | LoginError:
         form = await request.form()
         access_token = (form.get("access_token") or "").strip()
         state = (form.get("state") or "").strip()
-        ctx = verify_login_state(state, settings.neuralscape_user_token_secret)
-        if ctx is None:
-            return LoginError("Login session expired or invalid. Try again.", 400)
+        ctx = await bind_login(request, state)
+        if isinstance(ctx, LoginError):
+            return ctx
         if not access_token:
             return LoginError("No Supabase session was provided.", 400)
 
@@ -540,6 +750,8 @@ def get_login_provider() -> LoginProvider:
 __all__ = [
     "AuthorizeContext", "LoginResult", "LoginError", "LoginNeedsLink",
     "LoginProvider", "get_login_provider", "sign_login_state", "verify_login_state",
-    "sign_link_ticket", "verify_link_ticket", "resolve_login_identity",
+    "verify_login_state_nonce", "new_login_nonce", "sign_login_binding", "verify_login_binding",
+    "bind_login", "login_binding_cookie_name", "login_binding_cookie_path", "LOGIN_BINDING_COOKIE", "LOGIN_BINDING_COOKIE_PATH", "LOGIN_BINDING_MAX_AGE",
+    "sign_link_ticket", "verify_link_ticket", "resolve_login_identity", "provision_user_id", "IdentityStoreUnavailable",
     "verify_user_token",
 ]

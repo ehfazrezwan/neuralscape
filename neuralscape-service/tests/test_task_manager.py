@@ -9,6 +9,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from arq.jobs import JobStatus
+
 from task_manager import TaskManager, _generate_job_id
 
 
@@ -156,11 +158,23 @@ class TestEnqueueRawV2:
 
     @pytest.mark.asyncio
     async def test_connector_sync_job_id_matches_cron_scheme(self, tm):
-        """enqueue_connector_sync uses the same sync-<id> job id as the cron (C2)."""
+        """enqueue_connector_sync uses the same job id scheme as the cron (C2),
+        keyed on the connector instance (id + owner + vault generation)."""
+        from task_manager import connector_sync_job_id
+
         tm.pool.enqueue_job.return_value = None
-        job_id = await tm.enqueue_connector_sync("notion-personal")
-        assert job_id == "sync-notion-personal"
-        assert tm.pool.enqueue_job.call_args.kwargs["_job_id"] == "sync-notion-personal"
+        # The id is held by a run still in flight: the request coalesces onto it.
+        with patch("task_manager.Job") as arq_job:
+            arq_job.return_value.status = AsyncMock(return_value=JobStatus.in_progress)
+            job_id = await tm.enqueue_connector_sync("notion-personal", "alice", generation="g1")
+        expected = connector_sync_job_id("notion-personal", "alice", "g1")
+        assert job_id == expected
+        assert expected.startswith("sync-notion-personal-")
+        assert tm.pool.enqueue_job.call_args.kwargs["_job_id"] == expected
+        assert tm.pool.enqueue_job.call_args.args[1:] == ("notion-personal", "g1")
+        # A different owner or instance of the same connector id never shares it.
+        assert connector_sync_job_id("notion-personal", "bob", "g1") != expected
+        assert connector_sync_job_id("notion-personal", "alice", "g2") != expected
 
     @pytest.mark.asyncio
     async def test_no_v2_fields_packs_empty_extras(self, tm):

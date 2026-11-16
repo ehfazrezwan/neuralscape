@@ -317,11 +317,20 @@ def test_invalid_endpoint_settings_are_rejected():
 
     for bad in ("ftp://x/y", "https://user:pw@host/x", "not a url", "https://"):
         with pytest.raises(Exception, match="NS_GEMINI_BASE_URL"):
-            config.Settings(ns_gemini_base_url=bad, google_api_key="k", neo4j_password="p").validate_required()
-    config.Settings(ns_gemini_base_url="https://ok.example.test/x", google_api_key="k", neo4j_password="p").validate_required()
+            config.Settings(ns_gemini_base_url=bad, google_api_key="k", neo4j_password="p", neuralscape_auth_disabled=True).validate_required()
+    config.Settings(ns_gemini_base_url="https://ok.example.test/x", google_api_key="k", neo4j_password="p", neuralscape_auth_disabled=True).validate_required()
 
 
-def test_memory_service_client_honors_the_endpoint_and_defaults_unchanged(monkeypatch):
+@pytest.fixture()
+def _routing_reset():
+    import provider_routing
+
+    provider_routing.reset()
+    yield
+    provider_routing.reset()  # the override patches the SDK class for the whole process
+
+
+def test_memory_service_client_honors_the_endpoint_and_defaults_unchanged(monkeypatch, _routing_reset):
     import config
     from memory_service import MemoryService
     import memory.core as core

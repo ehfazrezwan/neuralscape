@@ -7,7 +7,14 @@ name: deploy
 # main SHA via workflow_dispatch).
 #
 # Required repo secrets: VPS_HOST (IP/hostname), VPS_SSH_KEY (dedicated ed25519
-# private key whose public half is in the `deploy` user's authorized_keys on the VPS).
+# private key whose public half is in the `deploy` user's authorized_keys on the VPS),
+# VPS_SSH_KNOWN_HOSTS (the VPS host key line(s), as printed by
+# `ssh-keyscan -t ed25519 <host>`; the workflow pins it and refuses any other key,
+# there is no trust-on-first-use fallback).
+#
+# GHCR only receives the immutable sha-<12> tag (no mutable :latest). The VPS tags
+# the loaded image :latest LOCALLY (inside the remote script) so a plain
+# `docker compose up -d` recovers onto the deployed build.
 # Deploys run as the non-root, no-sudo `deploy` user (docker group; owns /opt/neuralscape).
 
 on:
@@ -28,9 +35,21 @@ jobs:
     runs-on: ubuntu-latest
     environment: production
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
+
+      - name: Pin the VPS host key (fail early if the secret is missing)
+        env:
+          KNOWN_HOSTS: ${{ secrets.VPS_SSH_KNOWN_HOSTS }}
+        run: |
+          if [ -z "${KNOWN_HOSTS//[[:space:]]/}" ]; then
+            echo "::error::secret VPS_SSH_KNOWN_HOSTS is empty or unset; refusing to deploy without a pinned host key (no trust-on-first-use fallback)"
+            exit 1
+          fi
+          mkdir -p ~/.ssh
+          printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts_deploy
+          chmod 600 ~/.ssh/known_hosts_deploy
 
       - uses: docker/setup-buildx-action@v4
 
@@ -47,13 +66,11 @@ jobs:
           tags: ghcr.io/${{ github.repository_owner }}/neuralscape:${{ steps.meta.outputs.tag }}
           cache-from: type=gha
 
-      - name: Push to GHCR (artifact trail + rollback registry)
+      - name: Push to GHCR (artifact trail + rollback registry, immutable tag only)
         run: |
           echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
           IMG="ghcr.io/${{ github.repository_owner }}/neuralscape"
-          docker tag "$IMG:${{ steps.meta.outputs.tag }}" "$IMG:latest"
           docker push "$IMG:${{ steps.meta.outputs.tag }}"
-          docker push "$IMG:latest"
 
       - name: Ship image to VPS and roll the stack
         env:
@@ -65,7 +82,7 @@ jobs:
           mkdir -p ~/.ssh
           printf '%s\n' "${{ secrets.VPS_SSH_KEY }}" > ~/.ssh/deploy_key
           chmod 600 ~/.ssh/deploy_key
-          SSH="ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15 ${VPS_USER}@${VPS_HOST}"
+          SSH="ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$HOME/.ssh/known_hosts_deploy -o ConnectTimeout=15 ${VPS_USER}@${VPS_HOST}"
 
           IMG="ghcr.io/${{ github.repository_owner }}/neuralscape:${TAG}"
           LATEST="ghcr.io/${{ github.repository_owner }}/neuralscape:latest"

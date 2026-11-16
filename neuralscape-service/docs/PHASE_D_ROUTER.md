@@ -1,6 +1,6 @@
 # Phase D: Deterministic Knowledge System Router
 
-**Status:** Phase D complete (resolve only; fusion composition is Phase E)  
+**Status:** Phase D (the resolver) is built and current. The Phase E fusion composition and the Phase G persistence described below as "later" have since landed on dev; this page was updated to say so. Current behavior lives in `knowledge/router.py`, `knowledge/index_store.py` and `knowledge/fusion.py`.  
 **See also:** `ICE_V2_KNOWLEDGE_SYSTEMS_PLAN.md` §4, `ICE_V2_DECISIONS.md` #3
 
 ## What This Is
@@ -23,13 +23,13 @@ Budget: <1 ms (measured in `tests/test_router.py::test_router_overhead`). No LLM
 
 ## Phase D vs Phase E
 
-**Phase D (this phase):** Resolves the route and logs the decision. Generic recall output is **byte-identical to today** unless `knowledge_system` is explicitly given. This preserves the latency floor and keeps D/E separable.
+**Phase D** is the resolver: it picks the route and records the decision. It is still what decides whether a recall gets a code leg, via `RouteDecision.wants_code_fusion` and `RouteDecision.code_system_names`. When the decision is base-only (plain prose, no indexed code, `fuse_code_into_recall=False`), generic recall output is unchanged from the plain memory path.
 
-**Phase E (fusion):** Uses the route decision to compose section-based fusion responses (structure + semantics + memory). Generic recall will then include code legs when the router decided they're warranted.
+**Phase E (fusion) has landed.** When the router decides a code leg is warranted, `recall_memories` in `mcp_server.py` runs the code leg next to the base legs and `knowledge/fusion.py` composes sections (`[structure]`, `[semantics]`, `[memory]`) instead of interleaving scores. So generic recall on a code project is no longer byte-identical to the plain memory path when the coding-signal gate passes; it is byte-identical only when the gate does not pass. A project can also set `default_engine="auto"` (or a caller can pass `knowledge_system="auto"`) to let `knowledge/autoroute.py` pick the engine per operation.
 
 ## Project Config
 
-Per-project knowledge routing settings (stored in-memory in Phase D; Phase E will persist to Redis/Neo4j):
+Per-project knowledge routing settings. The config is **persisted, not in-memory only**: `set_project_config` in `knowledge/router.py` writes through `knowledge/index_store.py` (`save_project_config`), which stores it in Redis under a per-project key and keeps a process-local copy. `get_project_config` consults the in-process mirror (`_PROJECT_CONFIGS` in `router.py`) first and falls back to `index_store.load_project_config` on a miss, so a config set by the ingest worker at index time becomes visible to the API process on its first read. A mirror entry that came from the store is re-validated against Redis at most once per `knowledge_config_cache_ttl_s` (one bounded read), so a config rewritten by another process is seen within that bound; if Redis is unreachable the mirror keeps being served. Redis is best-effort: with Redis down (unit tests, outages) the store degrades to the in-memory copy. A miss returns `None`, which keeps recall on the base path. 
 
 ```python
 @dataclass
@@ -37,18 +37,20 @@ class ProjectKnowledgeConfig:
     project_id: str
     code_systems: list[str] = []          # ["code-cbm"] or ["code-graphify"] etc.
     fuse_code_into_recall: bool = True    # DEFAULT TRUE per decision #3
-    default_engine: str | None = None     # "code-cbm" or "code-graphify"
+    default_engine: str | None = None     # "code-cbm", "code-graphify" or "auto"
+    code_space: str | None = None         # code_space indexed for this project (set at index time)
+    op_preference: dict[str, list[str]] | None = None  # per-op engine preference override
 ```
 
 ### REST Endpoints
 
 - `GET /v1/projects/{project_id}/knowledge-config` — get current config (returns default if not set)
-- `PUT /v1/projects/{project_id}/knowledge-config` — set/update config
+- `PUT /v1/projects/{project_id}/knowledge-config` — set/update config (admin-only: 403 otherwise. Admin = the listed `DICTATOR_USER_IDS`; when that list is empty, the default user)
 
 ### MCP Tools
 
 - `get_project_knowledge_config(project_id)` — get current config
-- `set_project_knowledge_config(project_id, code_systems?, fuse_code_into_recall?, default_engine?)` — set/update config
+- `set_project_knowledge_config(project_id, code_systems?, fuse_code_into_recall?, default_engine?)` — set/update config (dictator-only, same gate as the PUT; returns a JSON `error` otherwise)
 
 ## Decision #3 Rationale (fusion ON by default)
 
@@ -70,12 +72,12 @@ See `tests/test_router.py` for exhaustive unit tests. Each test asserts: systems
 ### Layer 2 Examples
 
 - Code tool + project has `code_systems=["code-cbm"]` → `[code-cbm]` (layer 2)
-- Generic recall + project has code + `fuse_code_into_recall=True` + coding signal → `[ns-memory]` (Phase D; Phase E will add code leg) (layer 2)
+- Generic recall + project has code + `fuse_code_into_recall=True` + coding signal → `[ns-memory]` plus the project's code system(s) as the fusion leg (`wants_code_fusion=True`) (layer 2)
 - Generic recall + `fuse_code_into_recall=False` → `[ns-memory]` (layer 2)
 
 ### Layer 3 Examples
 
-- Generic recall + project has code + coding signal detected → `[ns-memory]` (Phase D; Phase E will add code leg) (layer 3)
+- Generic recall + project has code + coding signal detected → `[ns-memory]` plus the code leg (`wants_code_fusion=True`) (layer 3)
 - Generic recall + plain prose (no coding signal) → `[ns-memory]` (layer 3)
 - Generic recall + project has no code → `[ns-memory]` (layer 3, default)
 
@@ -95,4 +97,6 @@ Plain prose (no coding signal): "What were the design decisions?", "Tell me abou
 - `neuralscape-service/knowledge/router.py` — the router
 - `neuralscape-service/tests/test_router.py` — exhaustive unit tests
 - `neuralscape-service/main.py` — REST endpoints for project config
-- `neuralscape-service/mcp_server.py` — MCP tools wired to router (Phase D: logs decision, doesn't change output)
+- `neuralscape-service/knowledge/index_store.py` — Redis-backed persistence for project config and code-index metadata
+- `neuralscape-service/knowledge/fusion.py` — section composer used when the router asks for a code leg
+- `neuralscape-service/mcp_server.py` — MCP tools wired to the router; `recall_memories` acts on the decision (code leg + fusion)

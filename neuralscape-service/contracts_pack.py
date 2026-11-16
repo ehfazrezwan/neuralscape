@@ -96,9 +96,9 @@ MODULE_OWNERS: dict[str, tuple[str, tuple[str, ...], tuple[str, ...]]] = {
 # registry test, whatever it is called.
 NON_PRODUCT_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
     "evidence_records": (
-        "machine-readable evidence records, writer and baseline/candidate comparison for the persona probes; "
-        "harness output, not a service wire contract",
-        ("persona_evidence",),
+        "machine-readable evidence records, writer and baseline/candidate comparison for the persona probes and "
+        "the preservation run harness; harness output, not a service wire contract",
+        ("persona_evidence", "comp1_run"),
     ),
 }
 
@@ -2129,7 +2129,7 @@ SCHEMA_DIGESTS: dict[str, str] = {
     "DecisionRequest": "267f963c4013d9bda89c27add04ab0a2d7b7820161b8928fdad97864719c0c8b",
     "DecisionResult": "29648061c77c26c2e981afdb16359c7284e630bda3717476310182025cd4ae8e",
     "DeclaredOmission": "8844bda0d5894a61283a242da6c1356972b4bc019d9c6c12e419c9a1aa0c92de",
-    "DelegationConstraints": "092bb0c72859f9068b6ff7388a62b5cb96444f7a5ead7b84cdf27de93267ad67",
+    "DelegationConstraints": "ee08aba3475eab02a4789a18a5336a241903e7334db4212866f7b4e672fc7b89",
     "EncryptionReference": "cc3a6afbf5d4494d1b415d8b6ed7c8d15e5fa27a8788dec1ae1ee19809f47b77",
     "EngineRecord": "aa85a3dde5cf6a7529db179663b14e05569241718259d58ded17a179ddec2e7d",
     "ExpansionLineage": "c9432f97738fe9cdc2240a83202edd1068d01965ffd4fe8c0d6795d3dca6b727",
@@ -2156,7 +2156,7 @@ SCHEMA_DIGESTS: dict[str, str] = {
     "PolicyStatement": "0d60d9c33b5fdbac3927c9c90e3e6e3d2dd899bb7a52bcc22bd46d2e3e21d692",
     "PortableManifest": "0a77d59b8747e11736ee59cd5079fe4cb3073def1dad1d479e9f87699a099c7c",
     "PositionReference": "dd83ce1d7277e99ddc45aff2447c6439eac67c6defc8fea8a954a297e80ce06f",
-    "PrincipalContext": "d937e50fabf44b66cf3bf0d97cf6e73e46e10ae5016506fc50b21a3277267577",
+    "PrincipalContext": "a6996c742cbd4bee745555201b8db76ab2a3fb616fd40e6545e7b67e1675ca4c",
     "ProcessingPolicy": "9a304d12012cfdb36cf58ee6f5137c05fe1e58f6ce1d582d294ff75fcb465975",
     "ProducerReference": "6aabc3d2e1e769b39fc7e02f8ba636d46096b1f68f9b9bc9234b989b4a7bfe7b",
     "ProjectionFreshness": "3b2e025e69b5002803f844e367c1d24e99e3b893c950b0f2d0c9ae2d6618fc72",

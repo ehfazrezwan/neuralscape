@@ -22,6 +22,7 @@ from memory.junk import _clean_conversation_for_graph, _is_junk_fact
 from memory.ranking import _times_derived_from_metadata
 from memory.retry import retry_transient
 from memory.sensitivity import classify_sensitivity, resolve_gated_visibility
+from category_evidence import validated_evidence
 
 logger = logging.getLogger(__name__)
 _SPEAKER_UNSET = object()
@@ -108,6 +109,115 @@ def _validate_speaker(speaker: str | None) -> str | None:
 
 class WriteMixin:
     """WriteMixin for MemoryService (mechanical split — see memory_service.py)."""
+
+    def graph_row_is_stale(
+        self,
+        memory_id: str,
+        user_id: str,
+        project_id: str | None,
+        visibility: str,
+        workspace: str | None = None,
+    ) -> bool:
+        """Should a dedup-hit re-assertion of this row re-enter the graph?
+
+        True when its episode has edges but ALL are invalid/expired (Graphiti has since contradicted the fact while the
+        row stayed live, so the graph disagrees with what the user just
+        re-asserted), or — only with ``GRAPH_SUPERSESSION_ENABLED`` and for
+        plain graphed fact rows — when the row has no episode ref at all.
+        One Qdrant retrieve + one Cypher probe, no LLM.
+
+        Fails SAFE: any probe error returns False (skip) so a flaky Neo4j
+        can never trigger an LLM storm. An episode that produced no edges at
+        all (``total == 0``) is "current" — there is nothing to contradict.
+        """
+        if not (self._graphiti and self._bridge):
+            return False
+        try:
+            pts = self._memory.vector_store.client.retrieve(
+                collection_name=settings.qdrant_collection,
+                ids=[memory_id],
+                with_payload=True,
+                with_vectors=False,
+            )
+            if not pts:
+                return False
+            meta = (pts[0].payload or {}).get("metadata") or {}
+            episode_uuid = meta.get("graph_episode_uuid")
+            if not episode_uuid:
+                # "No ref" is NOT evidence of staleness on the default path:
+                # passages, connector/ingest rows and code-graph rows are
+                # vector-only by design and would burn an LLM call on every
+                # dedup hit. Only with the supersession flag on, and only for
+                # plain graphed rows (a fact, no source_ref), treat it as
+                # "enrichment never landed".
+                return bool(
+                    settings.graph_supersession_enabled
+                    and meta.get("memory_kind") in (None, "fact")
+                    and not meta.get("source_ref")
+                )
+            from extensions.dreaming.graph_patcher import episode_edge_counts
+
+            group_id = _build_group_id(visibility, user_id, project_id, workspace)
+            coro = episode_edge_counts(
+                self._graphiti.driver, group_id=group_id, episode_uuid=episode_uuid
+            )
+            try:
+                counts = self._run_on_bridge(coro, timeout=10.0)
+            except Exception:
+                coro.close()
+                raise
+            return counts["total"] > 0 and counts["live"] == 0
+        except Exception as e:  # noqa: BLE001 — fail safe, never spend an LLM call on doubt
+            logger.warning(f"Graph staleness probe failed for {memory_id} (skipping): {e}")
+            return False
+
+    def _maybe_supersede_contradicted(
+        self,
+        *,
+        group_id: str,
+        owner_user_id: str,
+        write_started_at: datetime,
+        episode_uuid: str | None,
+        new_memory_ids: set[str],
+        superseded_by: str | None = None,
+        single_fact: bool = False,
+    ) -> None:
+        """Flag-gated post-graph-write hook: tombstone rows whose graph edges
+        this write's episode just invalidated (memory/supersession.py).
+
+        No-op (no Cypher, no payload write) unless
+        ``GRAPH_SUPERSESSION_ENABLED``. Best-effort — logs and swallows every
+        error so a failed probe can never fail the write, and never touches
+        ``new_memory_ids`` (the row(s) just written/re-derived).
+        """
+        if not settings.graph_supersession_enabled:
+            return
+        if single_fact and episode_uuid and superseded_by:
+            # Mark the episode as a single-fact one so the row-level content
+            # gate can be skipped for it (memory/supersession.py).
+            try:
+                self._memory.vector_store.client.set_payload(
+                    collection_name=settings.qdrant_collection,
+                    payload={"graph_episode_kind": "fact"},
+                    points=[superseded_by],
+                    key="metadata",
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"Stamping graph_episode_kind failed (non-fatal): {e}")
+        try:
+            from memory.supersession import supersede_contradicted_rows
+
+            supersede_contradicted_rows(
+                self,
+                group_id=group_id,
+                owner_user_id=owner_user_id,
+                write_started_at=write_started_at,
+                new_episode_uuid=episode_uuid,
+                new_memory_ids=new_memory_ids,
+                superseded_by=superseded_by,
+            )
+        except Exception as e:  # noqa: BLE001 — supersession is best-effort
+            logger.warning(f"Graph-contradiction supersession failed (non-critical): {e}")
 
     def _attach_memory_id_to_graph_nodes(
         self,
@@ -256,9 +366,17 @@ class WriteMixin:
         # even on the legacy (use_rich_parser=False, production-default) path,
         # instead of being dropped by parse_extraction_response's fold.
         parsed_facts_all: list[ParsedFact] = []
+        category_evidence: dict = {}
         window_errors: list[str] = []
         last_exc: Exception | None = None
         for w_idx, window_messages in enumerate(windows):
+            if settings.hybrid_extraction_enabled and not operator_guidance and not use_rich_parser:
+                from hybrid_inference import extract_source_facts
+
+                source_facts = extract_source_facts(window_messages, category_evidence=category_evidence)
+                if source_facts is not None:
+                    parsed_facts_all.extend(ParsedFact(cat, text, None, None) for cat, text in source_facts)
+                    continue
             extraction_messages = build_extraction_messages(
                 window_messages,
                 operator_guidance=operator_guidance,
@@ -412,6 +530,7 @@ class WriteMixin:
                 occurred_ats=occurred_ats,
                 sensitivities=sensitivities,
                 created_ids=newly_created_ids,
+                **({'category_evidence': category_evidence} if category_evidence else {}),
             )
         except Exception as e:
             logger.error(
@@ -511,6 +630,16 @@ class WriteMixin:
                         # ref (see the docstring above the sibling loop).
                         if (episode_uuid or episode_name) and mid in newly_created_ids:
                             self._persist_graph_episode_ref(mid, episode_uuid, episode_name)
+                    # Contradiction supersession (flag-gated, best-effort): rows
+                    # in ``stored`` — new rows AND re-derived dedup survivors —
+                    # are what this conversation just asserted, so never touched.
+                    self._maybe_supersede_contradicted(
+                        group_id=group_id,
+                        owner_user_id=user_id,
+                        write_started_at=graph_write_started_at,
+                        episode_uuid=episode_uuid,
+                        new_memory_ids={getattr(mem, "id", "") or "" for mem in stored},
+                    )
         except Exception as e:
             logger.warning(f"Graph storage failed (non-critical): {e}")
 
@@ -564,6 +693,7 @@ class WriteMixin:
         extractor=None,
         user_id: str | None = None,
         project_id: str | None = None,
+        category_evidence: dict | None = None,
     ) -> list[tuple[str, str]]:
         """Run LLM fact extraction over a block of text and return (category, content) tuples.
 
@@ -584,6 +714,10 @@ class WriteMixin:
         when set, the composed custom extraction instructions are appended
         to the prompt as the OPERATOR GUIDANCE addendum — AFTER the adapter's
         own prompt, so instructions compose with (never replace) adapters.
+
+        ``category_evidence`` is an optional output map keyed by the returned
+        (category, content) tuple. Internal ingest callers persist this evidence
+        on the same memory record; the legacy tuple return contract is unchanged.
         """
         if not text or not text.strip():
             return []
@@ -601,6 +735,17 @@ class WriteMixin:
             extraction_messages[0]["content"] = append_operator_guidance(
                 extraction_messages[0]["content"], operator_guidance
             )
+        # Source-selection lanes cannot honor domain prompts or synthesize
+        # multi-party context. Preserve those contracts by falling back.
+        if not operator_guidance and settings.hybrid_extraction_enabled:
+            from ingest.extractors import DefaultExtractor
+            from hybrid_inference import extract_source_facts
+
+            if extractor is None or type(extractor) is DefaultExtractor:
+                literal = extract_source_facts([{'role': 'user', 'content': text}],
+                                               category_evidence=category_evidence)
+                if literal is not None:
+                    return [(cat, content) for cat, content in literal if not _is_junk_fact(content)]
         client = self._get_genai_client()
         try:
             from google.genai.types import GenerateContentConfig, HttpOptions
@@ -693,6 +838,7 @@ class WriteMixin:
         # per-ingest and forwarded to enrich_graph → add_episode. None ⇒
         # Graphiti's built-in generic extraction (every regular memory write).
         graph_ontology: dict | None = None,
+        category_evidence: dict | None = None,
     ) -> list[MemoryResponse] | tuple[list[MemoryResponse], bool]:
         """Store a single pre-categorized fact directly (no LLM extraction).
 
@@ -763,6 +909,7 @@ class WriteMixin:
             source_ref=source_ref,
             workspace=workspace,
             sensitivity_override=sensitivity_override,
+            category_evidence=category_evidence,
         )
         if existing is not None:
             # created=False → caller must NOT re-enqueue graph enrichment.
@@ -813,6 +960,7 @@ class WriteMixin:
         # logic). False by default — every existing caller that doesn't know
         # about the gate keeps getting the gate's protection.
         sensitivity_override: bool = False,
+        category_evidence: dict | None = None,
     ) -> tuple[dict | None, MemoryResponse | None]:
         """Validate + resolve + dedup one raw store; everything except the embed.
 
@@ -829,6 +977,8 @@ class WriteMixin:
         """
         if category not in MEMORY_CATEGORIES:
             raise ValueError(f"Invalid category: {category}. Must be one of: {list(MEMORY_CATEGORIES.keys())}")
+        if category_evidence is not None and validated_evidence(content, category, category_evidence) is None:
+            raise ValueError('Invalid or stale category evidence')
         if epistemic_level is not None and epistemic_level not in EPISTEMIC_LEVEL_VOCAB:
             raise ValueError(
                 f"Invalid epistemic_level: {epistemic_level}. "
@@ -912,7 +1062,7 @@ class WriteMixin:
         existing = self._find_by_content_hash(
             user_id=user_id, content_hash=chash, scope=scope,
             project_id=project_id, visibility=effective_visibility,
-            workspace=effective_workspace,
+            workspace=effective_workspace, category=category,
         )
         if existing is not None:
             logger.info(
@@ -961,6 +1111,8 @@ class WriteMixin:
         }
         if tags:
             metadata["tags"] = tags
+        if category_evidence is not None:
+            metadata['category_evidence'] = validated_evidence(content, category, category_evidence)
         # Memory-model v2 metadata (only stored when set)
         if domain is not None:
             metadata["domain"] = domain
@@ -1032,6 +1184,7 @@ class WriteMixin:
             title=title,
             token_estimate=token_estimate,
             workspace=effective_workspace,
+            category_evidence=metadata.get('category_evidence'),
         )
 
         prepared = {
@@ -1201,6 +1354,16 @@ class WriteMixin:
                 self._record_superseded_episodes(memory_id, previous_episodes, left)
             if reenrich_pending and (episode_uuid or episode_name):
                 self._clear_reenrich_pending(memory_id)
+            # Contradiction supersession (flag-gated, best-effort, never raises).
+            self._maybe_supersede_contradicted(
+                group_id=group_id,
+                owner_user_id=user_id,
+                write_started_at=graph_write_started_at,
+                episode_uuid=episode_uuid,
+                new_memory_ids={memory_id},
+                superseded_by=memory_id,
+                single_fact=True,
+            )
             return True
         except Exception as e:
             logger.warning(f"Graph enrichment failed (non-critical): {e}")
@@ -1294,8 +1457,9 @@ class WriteMixin:
         visibility: str | None = None,
         speaker: str | None | object = _SPEAKER_UNSET,
         workspace: str | None = None,
+        category: str | None = None,
     ) -> MemoryResponse | None:
-        """Look up a memory by (user_id, hash, scope, visibility, speaker, workspace) for dedup.
+        """Look up a memory by (user_id, hash, scope, visibility, speaker, workspace, category) for dedup.
 
         Returns the existing MemoryResponse on hit, or None if not found.
         Failures here are non-fatal — we'd rather risk a duplicate than
@@ -1314,6 +1478,16 @@ class WriteMixin:
         ``workspace`` (WT6) is also part of the key: the same sentence in a
         reference book vs. a user note are distinct memories. Absent/None =
         memory type (default); matches rows with workspace absent/None/"memory".
+
+        ``category`` is part of the key when given: the same text stored under
+        another category is a distinct memory (a "convention" and a
+        "preference" that read alike are different facts), so it must not be
+        absorbed into the old row. It is a lookup filter on ``metadata.category``
+        rather than part of the hash, so every existing row keeps its hash.
+        ``None`` (omitted) keeps the category-agnostic lookup. Only the explicit
+        (raw) write path passes it, where the caller chose the category; the
+        conversation-extraction path leaves it out because a model-assigned
+        category is a guess, not intent.
         """
         try:
             from qdrant_client.models import FieldCondition, Filter, IsEmptyCondition, MatchValue, PayloadField
@@ -1326,6 +1500,8 @@ class WriteMixin:
             ]
             if visibility is not None:
                 must.append(FieldCondition(key="metadata.visibility", match=MatchValue(value=visibility)))
+            if category is not None:
+                must.append(FieldCondition(key="metadata.category", match=MatchValue(value=category)))
             if scope == "project" and project_id:
                 must.append(FieldCondition(key="metadata.project_id", match=MatchValue(value=project_id)))
             if speaker is None:
@@ -1365,10 +1541,14 @@ class WriteMixin:
             pt = points[0]
             payload = pt.payload or {}
             metadata = payload.get("metadata", {}) or {}
+            evidence = validated_evidence(
+                payload.get("data", ""), metadata.get("category"), metadata.get("category_evidence")
+            )
             return MemoryResponse(
                 id=str(pt.id),
                 memory=payload.get("data", ""),
                 category=metadata.get("category"),
+                category_evidence=evidence,
                 scope=metadata.get("scope"),
                 project_id=metadata.get("project_id"),
                 tags=metadata.get("tags"),
@@ -1433,12 +1613,20 @@ class WriteMixin:
             meta = (points[0].payload or {}).get("metadata") or {}
             if not meta.get("dream_tombstoned"):
                 return False
+            revive_patch: dict = {
+                "dream_tombstoned": False,
+                "dream_revived_at": datetime.now(timezone.utc).isoformat(),
+            }
+            if meta.get("superseded_reason") == "graph_contradiction":
+                # Graph-contradiction supersession (memory/supersession.py) is
+                # undone by re-derivation: drop its provenance so the revived
+                # row doesn't carry a stale "superseded by" pointer.
+                from memory.supersession import SUPERSESSION_KEYS
+
+                revive_patch.update({k: None for k in SUPERSESSION_KEYS})
             client.set_payload(
                 collection_name=collection,
-                payload={
-                    "dream_tombstoned": False,
-                    "dream_revived_at": datetime.now(timezone.utc).isoformat(),
-                },
+                payload=revive_patch,
                 points=[memory_id],
                 key="metadata",
             )
@@ -1492,6 +1680,7 @@ class WriteMixin:
     def store_raw_batch(
         self,
         items: list[dict],
+        dedup_ids: set[str] | None = None,
     ) -> list[MemoryResponse]:
         """Store multiple pre-categorized facts (memory-model v2).
 
@@ -1513,6 +1702,10 @@ class WriteMixin:
         The single ``embed_batch`` failure mode is deliberately LOUD (fails
         the whole batch before any insert) — the content-hash dedup makes the
         ARQ retry safe, so partial-batch silent loss is the worse trade.
+
+        ``dedup_ids`` is an optional OUTPUT set: the ids of pre-existing rows
+        that content-hash dedup hit and that were NOT re-enriched inline, so
+        the caller can enqueue the cheap stale-graph check for them.
 
         Returns:
             List of MemoryResponse objects for successful items, input order.
@@ -1558,6 +1751,7 @@ class WriteMixin:
                     memory_kind=item.get("memory_kind"),
                     source_ref=item.get("source_ref"),
                     sensitivity_override=item.get("sensitivity_override", False),
+                    category_evidence=item.get('category_evidence'),
                 )
                 if existing is not None:
                     entries.append(("dup", existing))
@@ -1598,6 +1792,28 @@ class WriteMixin:
                 continue
             if kind == "dup":
                 results.append(obj)
+                enriched_inline = bool(
+                    settings.graph_supersession_enabled and getattr(obj, "revived", None)
+                )
+                if dedup_ids is not None and not enriched_inline:
+                    dedup_ids.add(obj.id)
+                if enriched_inline:
+                    # Re-asserted fact revived a tombstoned row: it must reach
+                    # Graphiti's contradiction engine again (this batch path
+                    # enriches inline, like its new rows). Best-effort.
+                    try:
+                        self.enrich_graph(
+                            content=obj.memory,
+                            user_id=items[idx]["user_id"],
+                            project_id=getattr(obj, "project_id", None),
+                            visibility=getattr(obj, "visibility", None) or "private",
+                            memory_id=obj.id,
+                            source_ref=getattr(obj, "source_ref", None),
+                            occurred_at=getattr(obj, "occurred_at", None),
+                            workspace=getattr(obj, "workspace", None),
+                        )
+                    except Exception as e:  # noqa: BLE001
+                        logger.warning(f"Revived-row graph re-enrichment failed for {obj.id}: {e}")
                 continue
             if kind == "batchdup":
                 # Survivor was inserted earlier in this pass — count the
@@ -1706,6 +1922,7 @@ class WriteMixin:
         workspace: str | None = None,
         sensitivities: list[str | None] | None = None,
         created_ids: set[str] | None = None,
+        category_evidence: dict | None = None,
     ) -> list[MemoryResponse]:
         """Store multiple categorized facts via a single batch embed + single Qdrant upsert.
 
@@ -1848,8 +2065,11 @@ class WriteMixin:
             seen_in_batch.add(batch_key)
 
             # Storage-level idempotency (audit 27 #21). visibility=None on
-            # purpose: conversation-path rows don't stamp metadata.visibility,
-            # so a visibility condition would never match them. workspace defaults
+            # purpose: the lookup is tier-agnostic, so it matches stamped rows
+            # and older rows that predate the stamp (rows written before
+            # owner/visibility stamping carry no metadata.visibility), and a
+            # private raw write dedups against a stamped extracted twin.
+            # workspace defaults
             # to None here (memory type) unless the caller overrode it.
             lookup_kwargs = dict(
                 user_id=user_id,
@@ -1912,6 +2132,7 @@ class WriteMixin:
                     )
 
             mid = str(uuid.uuid4())
+            evidence = validated_evidence(content, category, (category_evidence or {}).get((category, content)))
             payload = {
                 "data": content,
                 "hash": chash,
@@ -1926,7 +2147,14 @@ class WriteMixin:
                     "agent_id": agent_id,
                     "run_id": run_id,
                     "source": source,
-                    **({"visibility": fact_forced_visibility} if fact_forced_visibility else {}),
+                    **({'category_evidence': evidence} if evidence is not None else {}),
+                    # Owner + tier are always stamped (conversation extractions
+                    # are private by default — the same assumption
+                    # extract_and_store's graph group makes). Previously only a
+                    # sensitivity-forced fact carried visibility, and no row
+                    # carried owner_user_id, so reads/deletes had to guess it.
+                    "owner_user_id": user_id,
+                    "visibility": fact_forced_visibility or MemoryVisibility.PRIVATE.value,
                     **({"sensitivity": fact_sensitivity} if fact_sensitivity else {}),
                     **({"sensitivity_source": fact_sensitivity_source} if fact_sensitivity_source else {}),
                     # Extraction stores directly-stated facts → epistemically
@@ -2014,9 +2242,11 @@ class WriteMixin:
                     title=distill_title(content),
                     token_estimate=stamp_tokens(content),
                     speaker=spk,
-                    visibility=forced_visibility,
+                    visibility=forced_visibility or MemoryVisibility.PRIVATE.value,
+                    owner_user_id=user_id,
                     sensitivity=fact_sensitivity,
                     sensitivity_source=fact_sensitivity_source,
+                    category_evidence=payloads[idx]['metadata'].get('category_evidence'),
                 )
             )
 

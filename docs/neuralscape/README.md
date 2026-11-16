@@ -18,6 +18,8 @@ Comprehensive reference for the Neuralscape codebase. Read in order or jump to w
 | 11 | [Deployment](./11-deployment.md) | Docker compose stack, two-stage Dockerfile, env vars, structlog, helper scripts, gotchas |
 | 12 | [UI PRD](./12-ui-prd.md) | Product requirements for the human-facing web UI: features, audience, constraints, states, accessibility |
 | 21 | [Document & File Ingestion](./21-document-ingestion.md) | Ingest files/folders/zips + manual context; Docling/MarkItDown parsing; artifact storage; dedicated ingest worker |
+| 28 | [Hybrid Inference Evaluation](./28-hybrid-inference-evaluation.md) | Decision-model and small-local-model feasibility, graph/vector acceptance checks, measured cost/latency, limitations and opt-in testing |
+| 29 | [Source Extraction Evaluation](./29-source-extraction-evaluation.md) | Source-selection redesign, held-out extraction benchmarks, graph/vector validation and fallback tradeoffs |
 | 31 | [Usage Scenario Reports](./31-usage-scenario-reports.md) | Per-person scenario reports and the usage pilot |
 
 ## Quick links by audience

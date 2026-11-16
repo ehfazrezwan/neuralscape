@@ -35,7 +35,11 @@ _task_manager = TaskManager()                   # mcp_server.py:29
 | 8 | `edit_memory` | `memory_id` | `content`, `category`, `project_id`, `tags[]`, `visibility`, v2 fields (`domain`, `observation_type`, `concepts`, `confidence`, `expires_at`) | `.patch_memory()` | sync + graph job |
 | 9 | `retag_memories` | ≥1 filter, ≥1 op | filters: `scope`, `category`, `project_id`, `visibility`, `tags_contains[]`; ops: `add_tags[]`, `remove_tags[]`, `set_category`, `set_project_id`; `dry_run` | `.retag_memories()` / `enqueue_retag()` | async (dry_run sync) |
 
+(`schedule_dream` and `set_project_knowledge_config` are admin-only (the listed `DICTATOR_USER_IDS`, or the default user when the list is empty); other callers get a JSON `error`, and `force=true` does not bypass the check. The same holds for REST `POST /v1/extensions/dreaming/run` and `PUT /v1/projects/{id}/knowledge-config`.)
+
 (The table lists the founding tool set plus the edit tools; the live server has 22 tools — later additions `ingest_document`, `ingest_text`, `list_projects`, `list_processes`, `get_process`, `get_reasoning_chain`, `schedule_dream`, `get_card`, `get_memories`, and `timeline` are covered in [21-document-ingestion](./21-document-ingestion.md) and the processes docs, and the three code-graph delegation tools `query_code_graph`, `get_code_neighbors`, and `code_path` — registered when the optional `code-graph` extra is installed — in [22-knowledge-adapters](./22-knowledge-adapters.md).)
+
+Code indexing is operator-side: the code tools (`code_graph_index`, `locate`, `code_impact`, `query_code_graph`, `get_code_neighbors`, `code_path`) only answer for repositories that sit on the server's disk and are mapped in `CODE_REPOS`. Nothing uploads or clones a repo; see the "Server-side repositories only" section of [CODE_INTEL_NATIVE_SPEC](../CODE_INTEL_NATIVE_SPEC.md).
 
 All tool handlers return `list[TextContent]` containing a single `TextContent(type="text", text=json.dumps(...))`. Tool definitions are at `neuralscape-service/mcp_server.py:32-294`; dispatch lives in the `call_tool` handler at `neuralscape-service/mcp_server.py:297-434`.
 

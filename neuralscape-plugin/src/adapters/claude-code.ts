@@ -6,7 +6,7 @@
  * Fallback: if no transcript, uses prompt + last_assistant_message for the last turn.
  */
 
-import { readFile } from "node:fs/promises";
+import { open, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { getProjectId, getUserId, logError } from "../utils.js";
 import type { FlushResult } from "../core/flush.js";
 import type { ConversationTurn, SessionEndInput } from "../core/types.js";
@@ -28,14 +28,27 @@ interface StagedFlush {
 
 const pendingOffsets = new Map<string, StagedFlush>();
 
+type ContentBlocks = string | Array<{ type?: string; text?: string }>;
+
+/**
+ * One transcript entry. Claude Code writes `{type, message: {role, content}, isSidechain?, isMeta?, ...}` with
+ * `content` a string (user prompts) or a block list (assistant text, tool calls, user tool results); older and
+ * simplified producers put `content` at the top level, which is still read.
+ */
 interface TranscriptMessage {
-  type: string; // "user" | "assistant" | "tool_use" | "tool_result" | ...
-  content?: string | Array<{ type: string; text?: string }>;
+  type?: string; // "user" | "assistant" | "system" | "summary" | ...
+  content?: ContentBlocks;
+  message?: { role?: string; content?: ContentBlocks; stop_reason?: string | null };
   role?: string;
+  isSidechain?: boolean;
+  isMeta?: boolean;
+  isCompactSummary?: boolean;
+  isVisibleInTranscriptOnly?: boolean;
 }
 
 /**
- * Read the flush offset (last processed message index) for a transcript.
+ * Read the flush offset (last processed message index) for a transcript.  An offset is used exactly as it
+ * was written: it is never moved backwards, so nothing that was already delivered can be delivered again.
  */
 async function readFlushOffset(transcriptPath: string): Promise<number> {
   try {
@@ -48,24 +61,35 @@ async function readFlushOffset(transcriptPath: string): Promise<number> {
 }
 
 /**
- * Write the flush offset after successful processing.
+ * Write the flush offset in one atomic step: a temporary file in the same directory, renamed over the offset
+ * file, so an interrupted write can never leave a half-written cursor.  A failure keeps the previous offset
+ * (and removes the temporary file).
  */
 async function writeFlushOffset(
   transcriptPath: string,
   offset: number
 ): Promise<void> {
-  const { writeFile } = await import("node:fs/promises");
-  await writeFile(transcriptPath + OFFSET_SUFFIX, String(offset), "utf-8");
+  const target = transcriptPath + OFFSET_SUFFIX;
+  const temporary = `${target}.${process.pid}.tmp`;
+  try {
+    await writeFile(temporary, String(offset), "utf-8");
+    await rename(temporary, target);
+  } catch (error) {
+    await unlink(temporary).catch(() => undefined);
+    throw error;
+  }
 }
 
-/**
- * Extract text content from a transcript message.
- */
-function extractText(msg: TranscriptMessage): string {
-  if (typeof msg.content === "string") return msg.content;
-  if (Array.isArray(msg.content)) {
-    return msg.content
-      .filter((block) => block.type === "text" && block.text)
+function roleOf(msg: TranscriptMessage): string | undefined {
+  return msg.type || msg.role;
+}
+
+/** Text of a `content` value: a string as is, otherwise the `text` blocks (tool calls, results, thinking are not text). */
+function textOf(content: ContentBlocks | undefined): string {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content
+      .filter((block) => block && block.type === "text" && block.text)
       .map((block) => block.text!)
       .join("\n");
   }
@@ -73,67 +97,234 @@ function extractText(msg: TranscriptMessage): string {
 }
 
 /**
- * Parse a transcript file into user/assistant turn pairs.
+ * User entries Claude Code writes for local slash commands and their output (`<command-name>`, `<command-message>`,
+ * `<command-args>`, `<local-command-stdout>`, `<local-command-stderr>`, `<local-command-caveat>`): not something the
+ * user said to the assistant.
  */
-function parseTranscript(
-  content: string,
-  startOffset: number
-): {
-  turns: Array<{ user: string; assistant: string; endOffset: number }>;
-  newOffset: number;
-} {
-  let messages: TranscriptMessage[];
+const LOCAL_COMMAND_WRAPPER = /^\s*<(?:command-name|command-message|command-args|local-command-[a-z]+)>/;
+
+/**
+ * Extract the conversation text of a transcript entry. Real entries carry it under `message.content`; a top-level
+ * `content` (simplified producers) is the fallback. Entries that are not the user's conversation yield no text:
+ * meta entries (injected context), sidechain entries (sub-agent conversations), compaction summaries
+ * (`isCompactSummary`, shown only in the transcript view: `isVisibleInTranscriptOnly`; the whole "continued from a
+ * previous conversation" summary, which must never be attributed to the user) and local-command wrappers.
+ */
+function extractText(msg: TranscriptMessage): string {
+  if (msg.isMeta === true || msg.isSidechain === true) return "";
+  if (msg.isCompactSummary === true || msg.isVisibleInTranscriptOnly === true) return "";
+  const text = textOf(msg.message?.content ?? msg.content);
+  if ((roleOf(msg) ?? msg.message?.role) === "user" && LOCAL_COMMAND_WRAPPER.test(text)) return "";
+  return text;
+}
+
+/** Counters for tests: how much transcript text the adapter parsed (JSON lines) and how it read the file. */
+export const transcriptStats = { linesParsed: 0, fullReads: 0, tailReads: 0 };
+
+function parseLine(line: string): TranscriptMessage | null {
+  transcriptStats.linesParsed++;
+  try {
+    return JSON.parse(line);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Parse transcript text. `document` is true when the text is one JSON array (not JSONL); `consumed` is the
+ * number of leading characters that hold only complete lines, so an incremental reader can resume from there
+ * (a last line that does not parse yet is a half-written line, and is left for the next read).
+ */
+function parseTranscriptText(content: string): { messages: TranscriptMessage[]; document: boolean; consumed: number } {
   try {
     // Try JSON array first
-    messages = JSON.parse(content);
+    const parsed = JSON.parse(content);
+    if (Array.isArray(parsed)) {
+      transcriptStats.linesParsed += parsed.length;
+      return { messages: parsed, document: true, consumed: content.length };
+    }
   } catch {
-    // Try JSONL (one object per line)
-    messages = content
-      .split("\n")
-      .filter((line) => line.trim())
-      .map((line) => {
-        try {
-          return JSON.parse(line);
-        } catch {
-          return null;
-        }
-      })
-      .filter(Boolean) as TranscriptMessage[];
+    // not one JSON document: JSONL below
+  }
+  // JSONL (one object per line; a single-line file parses as one object above and lands here too)
+  const lastBreak = content.lastIndexOf("\n");
+  const complete = content.slice(0, lastBreak + 1);
+  const tail = content.slice(lastBreak + 1);
+  const messages = complete
+    .split("\n")
+    .filter((line) => line.trim())
+    .map(parseLine)
+    .filter(Boolean) as TranscriptMessage[];
+  let consumed = complete.length;
+  if (tail.trim()) {
+    const last = parseLine(tail);
+    if (last) {
+      messages.push(last);
+      consumed = content.length;
+    }
+  } else {
+    consumed = content.length;
+  }
+  return { messages, document: false, consumed };
+}
+
+function parseMessages(content: string): TranscriptMessage[] {
+  return parseTranscriptText(content).messages;
+}
+
+const isConversation = (m: TranscriptMessage): boolean => {
+  const role = roleOf(m) ?? m.message?.role;
+  return role === "user" || role === "assistant";
+};
+
+/** The user/assistant entries, in order. An offset counts positions in this list. */
+function relevantMessages(content: string): TranscriptMessage[] {
+  return parseMessages(content).filter(isConversation);
+}
+
+/**
+ * Reads a transcript that is still being written. The first read parses the whole file; each later read
+ * parses only the bytes appended since (the lag wait polls the file up to ~30 times, and a long
+ * session's transcript is many megabytes). A file that shrank, or is one JSON document instead of
+ * JSONL, is read in full again.
+ */
+class TranscriptReader {
+  private all: TranscriptMessage[] = [];
+  private bytes = 0;
+  private loaded = false;
+  private document = false;
+
+  constructor(private readonly path: string) {}
+
+  /** The conversation entries now in the file. */
+  async read(): Promise<TranscriptMessage[]> {
+    const size = (await stat(this.path)).size;
+    if (!this.loaded || this.document || size < this.bytes) return this.readAll();
+    if (size === this.bytes) return this.all.filter(isConversation);
+    const handle = await open(this.path, "r");
+    let appended: Buffer;
+    try {
+      appended = Buffer.alloc(size - this.bytes);
+      const { bytesRead } = await handle.read(appended, 0, appended.length, this.bytes);
+      appended = appended.subarray(0, bytesRead);
+    } finally {
+      await handle.close();
+    }
+    transcriptStats.tailReads++;
+    const text = appended.toString("utf-8");
+    const { messages, consumed } = parseTranscriptText(text);
+    this.all.push(...messages);
+    this.bytes += Buffer.byteLength(text.slice(0, consumed), "utf-8");
+    return this.all.filter(isConversation);
   }
 
-  // Filter to user and assistant messages only
-  const relevant = messages.filter(
-    (m) =>
-      m.type === "user" ||
-      m.type === "assistant" ||
-      m.role === "user" ||
-      m.role === "assistant"
-  );
+  private async readAll(): Promise<TranscriptMessage[]> {
+    transcriptStats.fullReads++;
+    const content = await readFile(this.path, "utf-8");
+    const { messages, document, consumed } = parseTranscriptText(content);
+    this.all = messages;
+    this.document = document;
+    this.bytes = Buffer.byteLength(content.slice(0, consumed), "utf-8");
+    this.loaded = true;
+    return this.all.filter(isConversation);
+  }
+}
 
-  // Skip already-processed messages
-  const newMessages = relevant.slice(startOffset);
+interface ParsedTurn {
+  user: string;
+  /** Every assistant text entry of the turn, joined: what is delivered. */
+  assistant: string;
+  /** The text of the turn's LAST assistant entry (the wrap-up), kept apart for the session note. */
+  final: string;
+  endOffset: number;
+}
 
-  // Pair consecutive user/assistant messages. Each turn records the cursor
-  // value just past its own messages so a partially-delivered flush can
-  // commit exactly the delivered prefix (audit 27 #34b).
-  const turns: Array<{ user: string; assistant: string; endOffset: number }> = [];
-  for (let i = 0; i < newMessages.length - 1; i++) {
-    const msg = newMessages[i];
-    const next = newMessages[i + 1];
-    const msgRole = msg.type || msg.role;
-    const nextRole = next.type || next.role;
+/**
+ * Parse a transcript file into user/assistant turns.
+ *
+ * A turn is one real user prompt (an entry with text; a user entry that only carries tool results has none and
+ * does not end a turn) and every assistant text entry up to the next real prompt. Entries without text
+ * (thinking, tool calls, tool results) are skipped for pairing but still count as positions, so offsets stay
+ * comparable with those written before. The returned `newOffset` never passes a user prompt that has no
+ * assistant text yet: it stays unread and is picked up by the next flush.
+ *
+ * With ``expectedFinal`` (the Stop event's ``last_assistant_message``) the last turn is delivered only when its
+ * assistant text ends with that message.  The transcript is written asynchronously and can lag the conversation:
+ * a turn whose final answer has not been written yet is ``lagging``, kept pending exactly like an unanswered
+ * prompt (its prompt stays unread), and delivered, complete, by a later flush (the next Stop, or the SessionEnd hook).
+ */
+function parseTranscript(
+  source: string | TranscriptMessage[],
+  startOffset: number,
+  options: { expectedFinal?: string } = {}
+): {
+  turns: ParsedTurn[];
+  newOffset: number;
+  lagging: boolean;
+} {
+  const conversation = typeof source === "string" ? relevantMessages(source) : source;
+  const window = conversation.slice(startOffset);
+  const turns: ParsedTurn[] = [];
+  let user: { text: string; index: number } | null = null;
+  let assistantParts: string[] = [];
 
-    if (msgRole === "user" && nextRole === "assistant") {
-      turns.push({
-        user: extractText(msg),
-        assistant: extractText(next),
-        endOffset: startOffset + i + 2,
-      });
-      i++; // skip the assistant message on next iteration
+  window.forEach((entry, position) => {
+    const absolute = startOffset + position;
+    const role = roleOf(entry) ?? entry.message?.role;
+    const text = extractText(entry);
+    if (!text) return;
+    if (role === "user") {
+      if (user && assistantParts.length > 0) {
+        turns.push({ user: user.text, assistant: assistantParts.join("\n"), final: assistantParts[assistantParts.length - 1], endOffset: absolute });
+      }
+      user = { text, index: absolute };
+      assistantParts = [];
+    } else if (user) {
+      assistantParts.push(text);
+    }
+  });
+
+  const windowEnd = startOffset + window.length;
+  let newOffset = windowEnd;
+  let lagging = false;
+  if (user) {
+    const pending: { text: string; index: number } = user;
+    // A prompt with no assistant text yet (thinking and tool entries only) lags too: the answer may be on its way.
+    lagging =
+      options.expectedFinal !== undefined &&
+      !(assistantParts.length > 0 && endsWithText(assistantParts.join("\n"), options.expectedFinal));
+    if (assistantParts.length > 0 && !lagging) {
+      turns.push({ user: pending.text, assistant: assistantParts.join("\n"), final: assistantParts[assistantParts.length - 1], endOffset: windowEnd });
+    } else {
+      newOffset = pending.index; // an unanswered (or still lagging) turn is not consumed
     }
   }
+  return { turns, newOffset, lagging };
+}
 
-  return { turns, newOffset: startOffset + newMessages.length };
+const collapse = (text: string): string => text.replace(/\s+/g, " ").trim();
+
+/** Whether the turn's assistant text ends with the final message (whitespace-insensitive). */
+function endsWithText(turnText: string, finalMessage: string): boolean {
+  return collapse(turnText).endsWith(collapse(finalMessage));
+}
+
+/** How long a Stop hook waits for the transcript to catch up with ``last_assistant_message`` before it leaves the turn pending. */
+const DEFAULT_LAG_WAIT_MS = 3000;
+const LAG_POLL_MS = 100;
+
+function lagWaitMs(): number {
+  const configured = Number.parseInt(process.env.NEURALSCAPE_TRANSCRIPT_LAG_WAIT_MS ?? "", 10);
+  return Number.isNaN(configured) || configured < 0 ? DEFAULT_LAG_WAIT_MS : configured;
+}
+
+const pause = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+/** The Stop event's final answer, when the event carries one: what the transcript must have caught up with. */
+function expectedFinalOf(raw: Record<string, unknown>): string | undefined {
+  if (raw.hook_event_name !== "Stop") return undefined;
+  const message = raw.last_assistant_message;
+  return typeof message === "string" && collapse(message) !== "" ? message : undefined;
 }
 
 /**
@@ -155,9 +346,18 @@ export async function extractClaudeCodeTurns(
   // Primary: read transcript file
   if (transcriptPath) {
     try {
-      const content = await readFile(transcriptPath, "utf-8");
       const offset = await readFlushOffset(transcriptPath);
-      const { turns, newOffset } = parseTranscript(content, offset);
+      const expectedFinal = expectedFinalOf(raw);
+      const reader = new TranscriptReader(transcriptPath);
+      let parsed = parseTranscript(await reader.read(), offset, { expectedFinal });
+      // The transcript is written asynchronously: give a lagging final answer a moment to land. Each poll reads
+      // only what was appended since the last one.
+      for (let waited = 0; parsed.lagging && waited < lagWaitMs(); waited += LAG_POLL_MS) {
+        await pause(LAG_POLL_MS);
+        parsed = parseTranscript(await reader.read(), offset, { expectedFinal });
+      }
+      const { turns, newOffset } = parsed;
+      if (parsed.lagging && turns.length === 0) return []; // nothing finished yet: the turn waits for the next flush
 
       if (turns.length > 0) {
         // Stage per-turn offsets; commitClaudeCodeFlush() persists a cursor
@@ -212,14 +412,36 @@ export async function extractClaudeCodeTurns(
  */
 export async function extractAllTurnPairs(
   raw: Record<string, unknown>
-): Promise<Array<{ user: string; assistant: string }>> {
+): Promise<Array<{ user: string; assistant: string; final: string }>> {
   const transcriptPath = raw.transcript_path as string | undefined;
   if (!transcriptPath) return [];
   try {
     const content = await readFile(transcriptPath, "utf-8");
-    return parseTranscript(content, 0).turns;
+    return parseTranscript(content, 0).turns.map(({ user, assistant, final }) => ({ user, assistant, final }));
   } catch (error) {
     logError("Failed to read transcript for session summary", error);
+    return [];
+  }
+}
+
+/**
+ * The text of the last ``limit`` real user prompts of the transcript, oldest first, whether or not they were
+ * delivered and including a prompt that has no answer yet.  The PreCompact snapshot uses it: it must show the
+ * task that is under way, and it does not depend on what the flush has delivered.  Returns [] when the
+ * transcript is missing or unreadable.
+ */
+export async function extractRecentUserPrompts(raw: Record<string, unknown>, limit = 10): Promise<string[]> {
+  const transcriptPath = raw.transcript_path as string | undefined;
+  if (!transcriptPath) return [];
+  try {
+    const content = await readFile(transcriptPath, "utf-8");
+    const prompts = relevantMessages(content)
+      .filter((entry) => (roleOf(entry) ?? entry.message?.role) === "user")
+      .map(extractText)
+      .filter((text) => text.length > 0);
+    return prompts.slice(-limit);
+  } catch (error) {
+    logError("Failed to read transcript for the compact snapshot", error);
     return [];
   }
 }
@@ -247,11 +469,13 @@ export function extractClaudeCodeSessionEnd(
  * - nothing delivered (first turn failed) → leave the cursor untouched.
  *
  * If the hook crashes between extract and commit, the on-disk offset stays
- * at its prior value and the next session re-flushes (the backend dedups).
+ * at its prior value and the next session re-flushes. A re-sent turn is a new extraction call: the flush route
+ * does not de-duplicate turns (memory-level de-duplication happens when the turns are compiled).
  */
 export async function commitClaudeCodeFlush(
   raw: Record<string, unknown>,
-  result: FlushResult
+  result: FlushResult,
+  stillHeld?: () => Promise<boolean>
 ): Promise<void> {
   const transcriptPath = raw.transcript_path as string | undefined;
   if (!transcriptPath) return;
@@ -270,6 +494,14 @@ export async function commitClaudeCodeFlush(
     if (committed === undefined) return;
     newOffset = committed;
   }
+
+  // The cursor only moves forward, and only while the delivery lock is still this hook's: a hook whose lock was
+  // lost must not write a cursor that another hook may already have passed.
+  if (stillHeld !== undefined && !(await stillHeld())) {
+    logError("The transcript lock was lost; leaving the cursor to the hook that holds it");
+    return;
+  }
+  if (newOffset <= (await readFlushOffset(transcriptPath))) return;
 
   try {
     await writeFlushOffset(transcriptPath, newOffset);

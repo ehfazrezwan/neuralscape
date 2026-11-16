@@ -83,6 +83,13 @@ def _git_commit() -> str | None:
 def build_suite_result(suite: str, judged_records: list[dict], *,
                        config: dict, suite_stats: dict, run_stats: dict) -> dict:
     """Aggregate one suite's judged records into a committable result dict."""
+    metrics = aggregate(judged_records, k=config.get("k", 10))
+    incompatible = get_suite(suite).retrieval_incompatible
+    if incompatible:
+        # Never emit a number for a metric the suite cannot support.
+        for key in [k for k in metrics if k.startswith("retrieval_recall_at_")]:
+            del metrics[key]
+        metrics["retrieval"] = {"status": "incompatible", "reason": incompatible}
     return {
         "suite": suite,
         "display": get_suite(suite).display,
@@ -91,7 +98,7 @@ def build_suite_result(suite: str, judged_records: list[dict], *,
         "config": config,
         "dataset": suite_stats,
         "run": run_stats,
-        "metrics": aggregate(judged_records, k=config.get("k", 10)),
+        "metrics": metrics,
         "published_comparison": PUBLISHED.get(suite, []),
         "caveats": [
             "Competitor figures are self-reported on their own configurations "
@@ -116,7 +123,8 @@ def _fmt_pct(x) -> str:
 
 
 def render_battery_markdown(results_by_suite: dict[str, dict | None], *,
-                            config_note: str = "") -> str:
+                            config_note: str = "",
+                            manifest_identities: dict[str, list[str]] | None = None) -> str:
     """Markdown battery summary. Suites with ``None`` render as *not yet run*."""
     lines = [
         "# Neuralscape memory-accuracy battery",
@@ -143,9 +151,14 @@ def render_battery_markdown(results_by_suite: dict[str, dict | None], *,
         m = res["metrics"]
         acc = _fmt_pct((m.get("overall") or {}).get("accuracy"))
         rk = "—"
-        for key, val in m.items():
-            if key.startswith("retrieval_recall_at_"):
-                rk = f"{_fmt_pct(val.get('recall'))} (R@{key.rsplit('_', 1)[-1]}, n={val.get('n')})"
+        incompatible = get_suite(suite).retrieval_incompatible
+        if incompatible:
+            # Also covers older result JSONs that still carry a stored 0.0.
+            rk = f"n/a (incompatible: {incompatible})"
+        else:
+            for key, val in m.items():
+                if key.startswith("retrieval_recall_at_"):
+                    rk = f"{_fmt_pct(val.get('recall'))} (R@{key.rsplit('_', 1)[-1]}, n={val.get('n')})"
         judged = (m.get("overall") or {}).get("judged", 0)
         lines.append(f"| {display} | {acc} | {rk} | {judged} | {pub} |")
 
@@ -168,13 +181,19 @@ def render_battery_markdown(results_by_suite: dict[str, dict | None], *,
         for t, m in (res["metrics"].get("by_type") or {}).items():
             lines.append(f"| {t} | {m['n']} | {m['judged']} | {_fmt_pct(m['accuracy'])} |")
         lines.append("")
+    if manifest_identities:
+        lines += ["## Run manifests", ""]
+        for suite, ident in manifest_identities.items():
+            lines += [f"### {suite}", ""] + [f"- {line}" for line in ident] + [""]
     return "\n".join(lines)
 
 
 def save_battery_markdown(results_by_suite: dict[str, dict | None], *,
                           config_note: str = "",
+                          manifest_identities: dict[str, list[str]] | None = None,
                           results_dir: Path = RESULTS_DIR) -> Path:
     results_dir.mkdir(exist_ok=True)
     path = results_dir / f"accuracy-battery-{_ts()}.md"
-    path.write_text(render_battery_markdown(results_by_suite, config_note=config_note))
+    path.write_text(render_battery_markdown(results_by_suite, config_note=config_note,
+                                            manifest_identities=manifest_identities))
     return path

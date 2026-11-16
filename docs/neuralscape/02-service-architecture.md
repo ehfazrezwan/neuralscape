@@ -35,7 +35,7 @@ Only one middleware is registered:
 app.add_middleware(BearerAuthMiddleware)
 ```
 
-`BearerAuthMiddleware` (`neuralscape-service/auth.py:23`) is a no-op when `NEURALSCAPE_API_KEY` is unset (local dev). When set, every request that is not in `PUBLIC_PATHS = {"/health", "/api/v1/health"}` must carry `Authorization: Bearer <token>`; the token is matched with `hmac.compare_digest` (`auth.py:42`). Failures return `{"detail": "..."}` with HTTP 401.
+`BearerAuthMiddleware` (`neuralscape-service/auth.py`) is fail-closed: with neither `NEURALSCAPE_USER_TOKEN_SECRET` nor `NEURALSCAPE_API_KEY` set, startup refuses and the middleware answers non-public requests with 503, unless `NEURALSCAPE_AUTH_DISABLED=true` explicitly opts out (see [AUTH.md](../../AUTH.md)). When a secret is set, every request that is not in `PUBLIC_PATHS = {"/health", "/health/live"}` or under `/.well-known/` / `/oauth/` must carry `Authorization: Bearer <token>`; the token is matched with `hmac.compare_digest` (`auth.py:42`). Failures return `{"detail": "..."}` with HTTP 401.
 
 There is **no CORS, OpenTelemetry, or rate-limiting middleware**. There is also no request-ID middleware, despite structlog being configured — see [Gotchas](#gotchas).
 
@@ -105,11 +105,9 @@ The session manager is a `StreamableHTTPSessionManager` configured with `statele
 
 `/health` (`main.py:227`, public) returns:
 
-- 200 `{"status": "ok"}` when Redis, Qdrant (mem0 initialized), and Neo4j (Graphiti initialized) all check out.
+- 200 `{"status": "ok"}` when Redis, Qdrant (a real `get_collections` call, 2 s timeout), and Neo4j (Graphiti initialized) all check out.
 - 200 `{"status": "degraded"}` if any non-critical check is non-`ok`.
 - 503 `{"status": "unhealthy"}` if the vector store is `unreachable`.
-
-`/api/v1/health` is listed as public in `auth.py:20` but **the route is never registered** — minor doc gap.
 
 ## Error handling & logging
 
@@ -125,16 +123,15 @@ async def generic_exception_handler(request: Request, exc: Exception):
 
 Per-endpoint, the pattern is `try ... except: logger.exception(...); raise HTTPException(500, "...")`. Validation failures surface as 400 from explicit checks (e.g. `/v1/memories/raw` rejects unknown categories at `main.py:656-662`).
 
-Logging is structlog, configured in `logging_config.py`: JSON in prod (`LOG_FORMAT=json`, the default) and console in dev. Processors include `merge_contextvars`.
+Logging is structlog, configured in `logging_config.py`: JSON in prod (`LOG_FORMAT=json`, the default) and console in dev. Processors include `merge_contextvars`. `LOG_LEVEL` / `LOG_FORMAT` are read through `config.settings` (so the service `.env` counts; the environment wins). `RequestIdMiddleware` binds `request_id` (a sane incoming `X-Request-ID`, else generated) for each request and echoes it on the response, including auth 401s; every ARQ job binds `job_id`, `job_try`, `queue` and `function` for its log lines (worker processes configure the same logging at startup).
 
 ## Gotchas
 
 1. **202-with-sync-fallback.** `POST /v1/memories` and `POST /v1/memories/raw` are documented as returning 202, but on `ConnectionError`/`OSError` from Redis they fall back to `extract_and_store` / `store_raw` synchronously and return **200 with the materialized memories** (`main.py:628-641`, `675-691`). Clients that branch on status code must handle both.
 2. **Lazy backend init still bites.** Despite the lifespan calling `_get_memory()` at startup, mem0's vector-store and Graphiti's first request can pay extra latency on cold starts, especially the LLM client warmup. See [storage-backends](./06-storage-backends.md).
-3. **`/api/v1/health` is allowlisted but undefined.** `auth.py:20` carves out the path, but no `@app.get("/api/v1/health")` exists.
-4. **No request-ID correlation.** structlog ships with `merge_contextvars`, but nothing populates a per-request correlation ID — trace stitching across worker hops is manual.
-5. **Module-scope MCP manager.** `_mcp_session_manager` must be created before `app = FastAPI(...)` so the lifespan can `async with` it; this is the only reason `mcp_server.create_mcp_http_app()` is split into a factory + manager.
-6. **No CORS/rate limiting.** Anything beyond the bearer-token gate (e.g. browser clients on a different origin, abuse protection) must be added by a reverse proxy. See [deployment](./11-deployment.md).
+3. **No request-ID correlation.** structlog ships with `merge_contextvars`, but nothing populates a per-request correlation ID — trace stitching across worker hops is manual.
+4. **Module-scope MCP manager.** `_mcp_session_manager` must be created before `app = FastAPI(...)` so the lifespan can `async with` it; this is the only reason `mcp_server.create_mcp_http_app()` is split into a factory + manager.
+5. **No CORS/rate limiting.** Anything beyond the bearer-token gate (e.g. browser clients on a different origin, abuse protection) must be added by a reverse proxy. See [deployment](./11-deployment.md).
 
 ## Related
 

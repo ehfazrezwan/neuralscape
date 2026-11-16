@@ -20,7 +20,7 @@ def service(monkeypatch):
     svc._memory = MagicMock(name="Memory")
     svc._graphiti = MagicMock(name="Graphiti")
     svc._bridge = MagicMock(name="AsyncBridge")
-    monkeypatch.setattr(svc, "_lookup_episode_uuid", lambda group, field, value, **kw: "ep-1")
+    monkeypatch.setattr(svc, "_lookup_episode", lambda group, field, value, **kw: {"uuid": "ep-1", "name": "ep-name"})
     svc._legacy = []
     monkeypatch.setattr(svc, "_expire_episode_edges", lambda *a: svc._legacy.append("edges") or 2)
     monkeypatch.setattr(svc, "_clear_or_remove_episode_entities",
@@ -268,50 +268,53 @@ def test_a_correction_records_what_it_could_not_remove_and_clears_it_once_remove
     assert patches == [{"graph_episode_superseded": ["ep-1"]}, {"graph_episode_superseded": []}]
 
 
-QDRANT_URL = __import__("os").environ.get("ENGINE_TEST_QDRANT_URL")
-
-
-@pytest.mark.integration
-@pytest.mark.skipif(not QDRANT_URL, reason="ENGINE_TEST_QDRANT_URL is not set (episode reference check)")
-def test_the_reference_check_against_a_real_qdrant(service, monkeypatch):
-    import uuid
-
-    from qdrant_client import QdrantClient
-    from qdrant_client.models import Distance, PointStruct, VectorParams
-
-    client = QdrantClient(url=QDRANT_URL)
-    collection = f"episode_refs_{uuid.uuid4().hex[:8]}"
-    client.create_collection(collection, vectors_config=VectorParams(size=2, distance=Distance.COSINE))
-    try:
-        monkeypatch.setattr(settings, "qdrant_collection", collection)
-        service._memory.vector_store.client = client
-        service._filter_indexes_ok = False
-        ids = [str(uuid.uuid4()) for _ in range(70)]  # more than one page of references
-        named = str(uuid.uuid4())
-        client.upsert(collection, points=[
-            PointStruct(id=i, vector=[1.0, 0.0], payload={"data": i, "metadata": {"graph_episode_uuid": "ep-1"}})
-            for i in ids
-        ] + [PointStruct(id=named, vector=[1.0, 0.0], payload={"metadata": {"graph_episode_name": "ep-name"}})])
-        check = service._episode_survivors
-        assert [m for m, _ in check("ep-1", None, tuple(ids[:-1]))] == [ids[-1]]  # outside the batch
-        assert check("ep-1", None, tuple(ids)) == []
-        assert [m for m, _ in check("ep-1", "ep-name", tuple(ids))] == [named]  # a name-only row references it
-        assert check("ep-unknown", None, ()) == []
-        assert check("ep-1", None, tuple(ids[:-1]))[0][1]["data"] == ids[-1]  # payload carried for re-enrichment
-        import time
-
-        wanted = {"metadata.graph_episode_uuid", "metadata.graph_episode_name"}
-        deadline = time.monotonic() + 10  # the index is requested without waiting for the build
-        while not wanted <= set(client.get_collection(collection).payload_schema) and time.monotonic() < deadline:
-            time.sleep(0.1)
-        assert wanted <= set(client.get_collection(collection).payload_schema)  # indexed
-    finally:
-        client.delete_collection(collection)
-
-
 def test_a_failed_post_enrichment_row_check_is_not_taken_for_a_delete(service):
     service._memory.get.side_effect = RuntimeError("qdrant down")
     assert service._row_deleted_during_enrichment("m1") is False
     service._memory.get.side_effect = None
     service._memory.get.return_value = None
     assert service._row_deleted_during_enrichment("m1") is True
+
+
+# ── A delete that lands while the memory is being enriched (default path, not flag-gated) ──
+
+
+def _enrich(service, monkeypatch, *, row_present: bool):
+    from memory.groups import _build_group_id
+
+    service._memory.graph.add.return_value = {"episode_uuid": "ep-new", "episode_name": "ep-new-name"}
+    service._memory.get.return_value = {"id": "m1", "memory": "c"} if row_present else None
+    monkeypatch.setattr(service, "_attach_memory_id_to_graph_nodes", lambda **kw: None)
+    removed = []
+    monkeypatch.setattr(service, "_cascade_expire_episode", lambda group, **kw: removed.append((group, kw)) or {})
+    ok = service.enrich_graph(content="c", user_id="u", project_id=None, visibility="private", memory_id="m1")
+    return ok, removed, _build_group_id("private", "u", None, None)
+
+
+def test_a_memory_deleted_while_it_was_enriched_loses_the_episode_just_written(service, monkeypatch):
+    """Its delete ran first and found no episode yet; without this the deleted content stays in the graph."""
+    ok, removed, group = _enrich(service, monkeypatch, row_present=False)
+    assert ok is True
+    assert removed == [(group, {"episode_uuid": "ep-new", "episode_name": "ep-new-name", "content": "c"})]
+
+
+def test_a_memory_that_still_exists_keeps_its_new_episode(service, monkeypatch):
+    ok, removed, _ = _enrich(service, monkeypatch, row_present=True)
+    assert ok is True and removed == []
+
+
+def test_the_graph_queue_runs_the_re_enrichment_job_the_queue_dispatch_enqueues():
+    """Before: the dispatch enqueued ``process_graph_reenrich`` but no worker registered it, so a survivor stayed
+    marked ``graph_reenrich_pending`` for good (the queue is the path whenever no ledger producer is installed)."""
+    import asyncio
+
+    import worker
+
+    assert worker.process_graph_reenrich in worker.GraphWorkerSettings.functions
+    service = MagicMock(name="MemoryService")
+    service.reenrich_memory_graph.return_value = {"memory_ids": ["m2"]}
+    assert asyncio.run(worker.process_graph_reenrich({"service": service}, "m2")) == {"memory_ids": ["m2"]}
+    service.reenrich_memory_graph.assert_called_once_with("m2")
+    service.reenrich_memory_graph.side_effect = RuntimeError("graph re-enrichment of m2 did not complete")
+    with pytest.raises(RuntimeError):  # raised, so ARQ retries it
+        asyncio.run(worker.process_graph_reenrich({"service": service}, "m2"))

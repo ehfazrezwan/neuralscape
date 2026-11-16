@@ -354,39 +354,44 @@ LEAVES: tuple[Leaf, ...] = tuple(
 # needs_real_service marks reproductions that are unit-level here and must be
 # repeated against real stores before they count as qualified evidence.
 SCENARIOS: tuple[Scenario, ...] = (
-    Scenario("group-id-tuple-collision", "expected-failure", ("A1.02", "A1.03"),
+    # The three retired scenarios below keep needs_real_service=True until the
+    # real-store integration tests (integration_tests/) have run on the gate.
+    Scenario("group-id-tuple-collision", "control", ("A1.02", "A1.03"),
              "test_distinct_namespace_tuples_have_distinct_group_ids", True,
-             "Distinct (user, project) tuples can produce one graph group id."),
+             "Distinct (user, project) tuples have distinct graph group ids WHEN GRAPH_GROUP_ID_INJECTIVE_ENABLED is on (the fix is flag-gated, default off; the defect remains by default)."),
     Scenario("group-id-distinct-controls", "control", ("A1.02", "A1.03"),
              "test_ordinary_namespace_tuples_stay_distinct", False,
              "Ordinary tuples remain distinct."),
-    Scenario("email-slug-collision", "expected-failure", ("G1.04",),
+    Scenario("email-slug-collision", "control", ("G1.04",),
              "test_distinct_emails_have_distinct_user_ids", False,
-             "Distinct emails can slug to the same user id."),
+             "A second email whose slug is already claimed gets a hash-suffixed user id at first login."),
     Scenario("email-slug-controls", "control", ("G1.04",),
              "test_ordinary_emails_slug_deterministically", False,
              "Ordinary emails slug deterministically and distinctly."),
-    Scenario("queued-visibility-publication", "expected-failure", ("A7.01", "A7.04"),
+    Scenario("queued-visibility-publication", "control", ("A7.01", "A7.04"),
              "test_queued_graph_job_publishes_current_visibility", True,
-             "A queued graph job publishes the visibility it was enqueued with, not the memory's current one."),
+             "A queued graph job publishes the memory's current visibility (fixed), not the one it was enqueued with."),
     Scenario("queued-job-deleted-memory-control", "control", ("A7.01", "A7.02"),
              "test_queued_graph_job_skips_a_deleted_memory", False,
              "A job for a memory deleted while queued is skipped."),
     Scenario("queued-job-same-visibility-control", "control", ("A7.01",),
              "test_queued_graph_job_with_unchanged_visibility_enriches", False,
              "An unchanged visibility is passed through."),
-    Scenario("job-key-omits-store-scope", "expected-failure", ("A6.02", "D2.07"),
-             "test_store_job_id_depends_on_project_and_agent_scope", True,
-             "The extraction job id ignores project, agent and run, so identical text coalesces across destinations."),
-    Scenario("job-key-omits-raw-options", "expected-failure", ("A6.02", "D2.07"),
-             "test_raw_job_id_depends_on_category_and_tags", True,
-             "The raw-write job id ignores category, tags and agent, so different options coalesce."),
+    # Fixed: the two job-key defects (identical text coalescing across
+    # project/agent/run, and across raw-write category/tags/agent) are now
+    # ordinary controls.
+    Scenario("job-key-store-scope-control", "control", ("A6.02", "D2.07"),
+             "test_store_job_id_depends_on_project_and_agent_scope", False,
+             "The extraction job id covers project, agent and run, so identical text sent to another destination is its own job."),
+    Scenario("job-key-raw-options-control", "control", ("A6.02", "D2.07"),
+             "test_raw_job_id_depends_on_category_and_tags", False,
+             "The raw-write job id covers category, tags and agent, so writes differing in those options are distinct jobs."),
     Scenario("job-key-controls", "control", ("A6.02", "D2.07"),
              "test_job_ids_are_stable_and_user_scoped", False,
              "Same inputs give one id and different users give different ids."),
-    Scenario("stale-revision-edit", "expected-failure", ("A3.01", "A3.02"),
+    Scenario("stale-revision-edit", "control", ("A3.01", "A3.02"),
              "test_patch_request_carries_an_expected_revision", True,
-             "The edit request has no revision precondition, so a stale edit cannot be refused."),
+             "The edit request carries an expected-revision precondition (fixed); behaviour is covered in tests/test_patch_revision.py."),
     Scenario("patch-partial-control", "control", ("A3.01",),
              "test_patch_request_applies_only_sent_fields", False,
              "Only supplied fields count as changes."),
@@ -396,15 +401,18 @@ SCENARIOS: tuple[Scenario, ...] = (
     Scenario("graph-removal-controls", "control", ("A7.02", "A7.03"),
              "test_graph_removal_deletes_unsupported_edges_only_from_removed_episode", False,
              "An edge supported only by the removed episode is deleted; an unrelated edge is kept."),
-    Scenario("readiness-probes-backends", "expected-failure", ("G2.03", "G2.04"),
+    Scenario("readiness-probes-backends", "control", ("G2.03", "G2.04"),
              "test_health_reports_an_unreachable_vector_store", True,
-             "Health treats an initialized client as a reachable vector store."),
+             "Health probes the vector store for real, so an unreachable one is reported unhealthy (503)."),
     Scenario("readiness-controls", "control", ("G2.03",),
              "test_health_reports_an_uninitialized_vector_store_as_degraded", False,
              "An uninitialized store and an unreachable queue are already reported."),
-    Scenario("backup-covers-compose-volumes", "expected-failure", ("G3.05", "G3.06"),
+    # Fixed by scripts/backup-volumes.sh: the former expected failure is now a
+    # passing control. needs_real_service stays True until the script has run
+    # against real stores (VPS gate / batch verification).
+    Scenario("backup-covers-compose-volumes", "control", ("G3.05", "G3.06"),
              "test_compose_backup_tooling_covers_every_persistent_volume", True,
-             "No compose backup tooling names the persistent volumes."),
+             "Compose backup tooling (scripts/backup-volumes.sh) names every persistent volume."),
     Scenario("backup-volume-controls", "control", ("G3.05",),
              "test_compose_declares_the_persistent_volumes", False,
              "The compose file declares the stores a backup must cover."),
@@ -414,15 +422,16 @@ SCENARIOS: tuple[Scenario, ...] = (
 class ServicePathScenario:
     """A scenario that exercises a requirement through the service (route, worker) rather than a library call.
 
-    ``file`` is a test module owned by the lane that built the feature; the oracle owner registers it, pins its
-    content hash and names the tests that are the oracle.  A tree without the feature does not have the file,
-    and there the scenario simply fails to exist (the library observation keeps its expected failure).
+    ``file`` is an integration test module (a path under the service directory) owned by the lane that built the
+    feature; the oracle owner registers it, pins its content hash and names the tests that are the oracle.  A
+    tree without the feature does not have the file, and there the scenario simply fails to exist (the library
+    observation keeps its expected failure).
     """
 
     id: str
     carries: str                 # the baseline scenario whose product requirement this one carries
     leaves: tuple[str, ...]
-    file: str                    # under tests/
+    file: str                    # relative to the service directory
     file_sha256: str
     tests: tuple[str, ...]       # the oracle tests; two sides of one flag, so the scenario flips with the feature
     needs_real_service: bool
@@ -432,18 +441,18 @@ class ServicePathScenario:
 SERVICE_PATH_SCENARIOS: tuple[ServicePathScenario, ...] = (
     ServicePathScenario(
         "graph-removal-service-path", "graph-removal-shared-support", ("A7.02", "A7.03"),
-        "test_graph_support_aware_removal_integration.py",
-        "b802ae31926a140bf5ab61fb3a6ce05dc38c978187ef015941044a42e2e12349",
+        "integration_tests/test_graph_support_aware_removal_integration.py",
+        "875c8a216de6b156be1095c30ce03d2a2be41662d6d6266cd4a4236fc5c37e1a",
         (
             "test_api_delete_keeps_a_fact_another_memory_still_supports",
-            "test_the_governed_ledger_delete_stage_keeps_a_fact_another_memory_still_supports",
+            "test_a_correction_replaces_the_superseded_episode_and_keeps_still_asserted_facts",
             "test_with_the_flag_off_the_legacy_cascade_still_expires_the_shared_fact",
         ),
         True,
-        "On a real graph, deleting one memory through the delete route and through the ledger worker's delete "
-        "stage keeps an edge another memory still supports (detaching the deleted episode), removes edges and "
-        "orphan entities only it supported; with the feature flag off the legacy cascade is the pinned "
-        "difference.  Tenant isolation is not asserted by these tests.",
+        "On a real graph and a real row store, deleting one memory through the delete route and correcting one "
+        "keep an edge another memory still supports (detaching the removed episode) and remove edges and orphan "
+        "entities only it supported; with the feature flag off the legacy cascade is the pinned difference.  "
+        "Tenant isolation is not asserted by these tests.",
     ),
 )
 
@@ -465,163 +474,6 @@ ORACLE_REVISIONS: dict[str, dict[str, str]] = {
     },
 }
 
-# Conditional expectations.  These baseline scenarios stay classified as expected failures here (the
-# original classification is preserved); each one flips to a control only on a tree that carries the
-# fix, and the test file marks it with a strict expected failure that applies only while the fix is
-# absent.  The assertions are the preserved originals.  A fixing change never edits an expectation:
-# the oracle owner records the condition, the reason and the evidence here.
-_FLIP_REVIEW = "pending"
-
-ORACLE_REVISIONS.update({
-    "group-id-tuple-collision": {
-        "version": "v2",
-        "role": "conditional-expectation",
-        "reason": (
-            "The defect is fixed under the enforced auth profile: group ids with plain components keep their "
-            "name and any other tuple gets an exactly decodable encoded name. The assertion is unchanged; the "
-            "strict expected failure now applies only while that profile is not in force."
-        ),
-        "evidence": (
-            "the unchanged test passes under the enforced profile and still fails (strictly) under the legacy "
-            "profile; the identity collision tests pin both names and the migration parser"
-        ),
-        "reviewed_by": _FLIP_REVIEW,
-        "original": "expected-failure, strict, unconditional",
-        "original_reason": (
-            "legacy group ids join user and project with a delimiter that legal ids "
-            "may contain, so different (user, project) tuples can share one namespace"
-        ),
-        "flips_to": "control",
-        "predicate": "_collision_free_ids",
-        "flips_when": "identity.collision_free_ids_enabled() is true",
-    },
-    "email-slug-collision": {
-        "version": "v2",
-        "role": "conditional-expectation",
-        "reason": (
-            "The defect is fixed under the enforced auth profile: a fresh login keeps its slug only when the "
-            "slug reads back to one address, and otherwise gets an id no slug can produce. The assertion is "
-            "unchanged; the strict expected failure applies only while that profile is not in force."
-        ),
-        "evidence": (
-            "the unchanged test passes under the enforced profile and still fails (strictly) under the legacy "
-            "profile"
-        ),
-        "reviewed_by": _FLIP_REVIEW,
-        "original": "expected-failure, strict, unconditional",
-        "original_reason": (
-            "legacy email slugging collapses every disallowed run to one '-', so distinct emails can share a user id"
-        ),
-        "flips_to": "control",
-        "predicate": "_collision_free_ids",
-        "flips_when": "identity.collision_free_ids_enabled() is true",
-    },
-    "readiness-probes-backends": {
-        "version": "v2",
-        "role": "conditional-expectation",
-        "reason": (
-            "Readiness now probes the real backends (the health route takes a require parameter and answers "
-            "503 for an unreachable vector store). The assertion is unchanged; the strict expected failure "
-            "applies only on a tree whose health route does not probe the backends."
-        ),
-        "evidence": (
-            "the unchanged test passes on a tree with backend-probing readiness, whose probes were also run "
-            "against real Redis, Qdrant and Neo4j containers, and fails (strictly) on a tree without it"
-        ),
-        "reviewed_by": _FLIP_REVIEW,
-        "original": "expected-failure, strict, unconditional",
-        "original_reason": (
-            "health marks the vector store 'ok' once its client object exists and never probes the store, "
-            "so an unreachable store is reported healthy"
-        ),
-        "flips_to": "control",
-        "predicate": "_readiness_probes_backends",
-        "flips_when": "the health route in main.py has a require parameter",
-    },
-    "backup-covers-compose-volumes": {
-        "version": "v2",
-        "role": "conditional-expectation",
-        "reason": (
-            "The compose profile now ships a backup tool that names its five persistent volumes. The "
-            "assertion is unchanged; the strict expected failure applies only on a tree without that tool."
-        ),
-        "evidence": (
-            "the unchanged test passes on a tree that ships scripts/compose_backup.py, whose backup and "
-            "restore were run against a fake Docker with real archives, and fails (strictly) without it"
-        ),
-        "reviewed_by": _FLIP_REVIEW,
-        "original": "expected-failure, strict, unconditional",
-        "original_reason": (
-            "the compose profile ships no backup tooling that names its persistent volumes; the only "
-            "backup definition is an opt-in cluster add-on, and the deployment guide still lists backups as to-do"
-        ),
-        "flips_to": "control",
-        "predicate": "_compose_backup_tooling_present",
-        "flips_when": "scripts/compose_backup.py exists",
-    },
-})
-
-
-# Real-service oracles owned by the comparison harness are identified by their own scenario ids, not by a
-# baseline test in this repository.  A revision of one is recorded here with the same discipline as the
-# conditional expectations above: the original expectation is kept, the reason and evidence are recorded,
-# and an expectation changes only on the profile where the fix is present (``governed``); the legacy
-# expectation of every fact is the preserved original.
-REAL_SERVICE_ORACLE_REVISIONS: dict[str, dict[str, object]] = {
-    "rs-job-keys": {
-        "version": "v2",
-        "role": "split-control",
-        "reason": (
-            "The original control asserted that two identical submits are one task, which is the legacy "
-            "implicit coalescing. The governed write path replaces implicit coalescing with explicit "
-            "idempotency keys: without a key two identical submits are two intents; with the same key the "
-            "retry replays the first task; the same key with a changed payload is refused. The control is "
-            "split by contract so that each half is judged on the profile it describes."
-        ),
-        "evidence": (
-            "real-service runs of the unchanged scenario: on the baseline the key is ignored (identical "
-            "submits share a task, a changed payload under the same key is accepted); on a tree with the "
-            "governed write path identical keyless submits are two tasks, a retry with the same key reuses "
-            "the task and a changed payload under the same key is refused with HTTP 409"
-        ),
-        "reviewed_by": _FLIP_REVIEW,
-        "original": {"identical_inputs_same_task": True},
-        "original_note": "the five 'different input gives a different task' facts keep their preserved expectation",
-        "flips_when": "the governed write path is in force (ledger dispatch with the enforced policy profile)",
-        "facts": {
-            "identical_without_key_same_task": {"legacy": True, "governed": False},
-            "identical_with_key_same_task": {"legacy": True, "governed": True},
-            "changed_payload_same_key_http": {"legacy": 202, "governed": 409},
-        },
-        "open_decision": (
-            "whether a keyless double submit may create two intents is an owner decision; if the answer is no, "
-            "the governed expectation of identical_without_key_same_task becomes True and nothing else changes"
-        ),
-    },
-}
-
-
-def expected_fact(oracle_id: str, fact: str, profile: str) -> object:
-    """The expectation of one fact of a revised real-service oracle on ``legacy`` or ``governed``."""
-
-    if profile not in ("legacy", "governed"):
-        raise ValueError("profile must be 'legacy' or 'governed'")
-    return REAL_SERVICE_ORACLE_REVISIONS[oracle_id]["facts"][fact][profile]  # type: ignore[index]
-
-
-def effective_kind(scenario_id: str, fixed: frozenset[str] = frozenset()) -> str:
-    """The kind of a scenario on a tree where the scenarios in ``fixed`` carry their fix.
-
-    The registry keeps the preserved classification; a conditional expectation flips only for a scenario
-    named in ``fixed``, and only to the kind its revision records.
-    """
-
-    kind = {s.id: s.kind for s in SCENARIOS}[scenario_id]
-    revision = ORACLE_REVISIONS.get(scenario_id)
-    if revision and revision["role"] == "conditional-expectation" and scenario_id in fixed:
-        return revision["flips_to"]
-    return kind
-
 
 _LEAVES_BY_ID = {leaf.id: leaf for leaf in LEAVES}
 
@@ -634,7 +486,7 @@ def scenarios_for(leaf_id: str) -> tuple[Scenario, ...]:
     return tuple(s for s in SCENARIOS if leaf_id in s.leaves)
 
 
-def leaf_state(leaf_id: str, fixed: frozenset[str] = frozenset()) -> str:
+def leaf_state(leaf_id: str) -> str:
     """Return the evidence state of a leaf from its registered scenarios.
 
     A leaf with no scenario is ``not-covered``.  An expected-failure scenario
@@ -647,7 +499,7 @@ def leaf_state(leaf_id: str, fixed: frozenset[str] = frozenset()) -> str:
     related = scenarios_for(leaf_id)
     if not related:
         return "not-covered"
-    if any(effective_kind(s.id, fixed) == "expected-failure" for s in related):
+    if any(s.kind == "expected-failure" for s in related):
         return "known-failure"
     return "baseline-pass"
 
@@ -659,9 +511,7 @@ __all__ = [
     "SCENARIOS",
     "SCENARIO_KINDS",
     "SERVICE_PATH_SCENARIOS",
-    "REAL_SERVICE_ORACLE_REVISIONS",
-    "effective_kind",
-    "expected_fact",
+    "ORACLE_REVISIONS",
     "ServicePathScenario",
     "Scenario",
     "get_leaf",

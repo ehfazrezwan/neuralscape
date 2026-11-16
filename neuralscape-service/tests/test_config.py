@@ -144,6 +144,7 @@ class TestProviderToggle:
             llm_gateway_api_key="k",
             google_api_key="g",
             neo4j_password="p",
+            neuralscape_user_token_secret="s",
         ).validate_required()
         with pytest.raises(ValueError, match="GOOGLE_API_KEY"):
             _settings(
@@ -319,3 +320,14 @@ class TestNeighborsResolver:
     def test_invalid_rejected(self):
         with pytest.raises(Exception):
             _settings(code_neighbors_resolver="bogus")
+
+
+class TestConnectorStdioCommands:
+    def test_default_disabled(self):
+        cfg = _settings()
+        assert cfg.connector_stdio_commands == ""
+        assert cfg.connector_stdio_commands_set() == set()
+
+    def test_csv_parsed(self):
+        cfg = _settings(connector_stdio_commands=" /a/x , /b/y --z ,")
+        assert cfg.connector_stdio_commands_set() == {"/a/x", "/b/y --z"}

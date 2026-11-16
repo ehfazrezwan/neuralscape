@@ -16,6 +16,8 @@ Supports both stdio transport (local Claude Code) and Streamable HTTP
 transport (remote agent access via /mcp/ endpoint on port 8199).
 """
 
+import third_party_telemetry  # noqa: F401 — must precede any mem0/Graphiti import (defaults their telemetry off)
+
 import asyncio
 import contextlib
 import json
@@ -28,6 +30,8 @@ from mcp.types import TextContent, Tool
 
 import adapters  # noqa: F401 — registers knowledge-adapter taxonomies at import (deterministic MEMORY_CATEGORIES for validation; tool enums stay core-13)
 from config import settings
+from memory.delete import MemoryListingFailed
+from memory.edit import EditBusy, EditLockUnavailable, RevisionConflict
 from memory_service import get_shared_service
 from schemas import CORE_MEMORY_CATEGORIES
 from task_manager import TaskManager
@@ -193,7 +197,10 @@ async def list_tools() -> list[Tool]:
                 "OUTPUT FORMAT (M5 hardening): Normal recall returns a JSON array of memory objects. "
                 "When code fusion is enabled (project with coding query), returns a stable JSON envelope: "
                 "{fused: true, sections: {structure: {...}, semantics: {...}, memories: [...]}, ...}. "
-                "This stable envelope ensures clients never receive a surprise type flip."
+                "This stable envelope ensures clients never receive a surprise type flip. "
+                "Reference material ingested with a non-default adapter (e.g. trading_strategy) is "
+                "stored in a 'ref-<adapter>[--<title>]' workspace and is returned only when you pass "
+                "workspaces=[\"ref-...\"]."
             ),
             inputSchema={
                 "type": "object",
@@ -246,6 +253,18 @@ async def list_tools() -> list[Tool]:
                             "glyph, age, tokens, score}) instead of full payloads — "
                             "~50-100 tokens per hit. Filter these, then call "
                             "get_memories(ids=[...]) for the few you need. Default: false."
+                        ),
+                    },
+                    "workspaces": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "maxItems": 10,
+                        "description": (
+                            "Workspaces to search, e.g. [\"ref-trading_strategy\"]. Default (omit): "
+                            "the memory workspace only. Content ingested with a non-default "
+                            "adapter is stored in 'ref-<adapter>[--<title-slug>]' and is NOT "
+                            "returned unless you name that workspace here (add \"memory\" to "
+                            "search both)."
                         ),
                     },
                     "knowledge_system": {
@@ -671,10 +690,10 @@ async def list_tools() -> list[Tool]:
         Tool(
             name="search_knowledge_graph",
             description=(
-                "Search the knowledge graph for entities, relationships, and facts. "
-                "Use this for structured queries about relationships between concepts, "
-                "people, technologies, or decisions. Returns graph edges (facts), "
-                "entity nodes, episodes, and communities."
+                "Search the knowledge graph for entities, relationships and facts "
+                "about people, technologies or decisions. Returns edges, nodes, "
+                "episodes, communities. degraded:true (graph_unavailable) means an "
+                "outage, not no facts."
             ),
             inputSchema={
                 "type": "object",
@@ -858,18 +877,16 @@ async def list_tools() -> list[Tool]:
         Tool(
             name="edit_memory",
             description=(
-                "Partially update an existing memory in place — the memory keeps its ID, "
-                "author, and creation time (no lossy delete+recreate). Only the fields you "
-                "pass are changed; pass null to clear a clearable field (project_id, tags, "
-                "expires_at, domain, observation_type, concepts, confidence). Scope is "
-                "re-derived from category + project_id automatically. Permission model: "
+                "Partially update an existing memory in place (keeps its ID, author and "
+                "creation time). Only the fields you pass are changed; pass null to clear a clearable field (project_id, tags, "
+                "expires_at, domain, observation_type, concepts, confidence). Permission model: "
                 "SHARED memories accept metadata edits (tags/category/project_id/v2 fields) "
-                "from any authenticated teammate — housekeeping is collaborative — but "
+                "from any authenticated teammate, but "
                 "content and visibility changes are owner-or-dictator only. PRIVATE "
                 "memories are owner-only; 'standard' tier is dictator-only. Content edits "
                 "are blocked on 'passage' memories (verbatim chunks of an ingested "
-                "artifact — re-ingest the corrected source instead). Graph impact is "
-                "handled automatically: content or project/visibility changes enqueue a "
+                "artifact — re-ingest the corrected source instead). Content or "
+                "project/visibility changes enqueue a "
                 "background knowledge-graph re-ingest (reported as graph_task_id)."
             ),
             inputSchema={
@@ -886,6 +903,7 @@ async def list_tools() -> list[Tool]:
                     "concepts": {"type": ["array", "null"], "items": {"type": "string"}, "description": "Memory-model v2 concept tags (max 5)"},
                     "confidence": {"type": ["number", "null"], "description": "Memory-model v2 confidence 0.0-1.0"},
                     "expires_at": {"type": ["string", "null"], "description": "ISO 8601 expiry; null clears"},
+                    "expected_revision": {"type": "string", "description": "Revision from a prior read; stale => refused, nothing written"},
                     "user_id": {"type": "string", "description": "Caller user ID (optional under token auth)"},
                 },
                 "required": ["memory_id"],
@@ -1315,8 +1333,8 @@ def _code_graph_tools() -> list[Tool]:
         Tool(
             name="query_code_graph",
             description=(
-                "Search a project's code knowledge graph (built by Graphify, served "
-                "by Neuralscape) with BFS/DFS traversal from the best-matching nodes. "
+                "Search a project's code knowledge graph with BFS/DFS traversal from "
+                "the best-matching nodes. Only server-indexed repos (CODE_REPOS) answer. "
                 "Use this — not recalled memories — for CODE STRUCTURE questions "
                 "(what calls X, what's in module Y): the graph reflects the code as "
                 "analyzed, while structural memories would rot. Memories whose "
@@ -1341,7 +1359,7 @@ def _code_graph_tools() -> list[Tool]:
                 "List the direct incoming/outgoing neighbors of one code-graph node "
                 "(function/class/file/module) with each edge's relation and "
                 "confidence tag (EXTRACTED/INFERRED/AMBIGUOUS). The precise tool for "
-                "'what directly touches X?'."
+                "'what directly touches X?'. Needs a repo indexed server-side (CODE_REPOS)."
             ),
             inputSchema={
                 "type": "object",
@@ -1359,7 +1377,8 @@ def _code_graph_tools() -> list[Tool]:
                 "Shortest connection path between two code-graph symbols — how does "
                 "A reach B? Each hop shows the relation and its confidence tag. "
                 "Useful for tracing an unexpected coupling flagged in a 'boundary' "
-                "memory back through the actual code structure."
+                "memory back through the actual code structure. Needs a repo indexed "
+                "server-side (CODE_REPOS)."
             ),
             inputSchema={
                 "type": "object",
@@ -1376,12 +1395,11 @@ def _code_graph_tools() -> list[Tool]:
             name="locate",
             description=(
                 "Hybrid code retrieval: find symbols (functions, classes, methods) by "
-                "natural-language description or name pattern. Uses dense embeddings + "
-                "BM25 lexical search + graph degree signal for ranking. Returns file:line "
-                "locations with signatures and docstrings. Use this to find relevant code "
-                "before diving into structure queries (query_code_graph, get_code_neighbors, "
-                "code_path). E3: requires NativeEngine (repo:<name> refs); raises "
-                "EngineCapabilityError on GraphifyJsonEngine (.json artifacts)."
+                "natural-language description or name pattern (BM25 + optional dense + "
+                "graph degree). Returns file:line with signatures and docstrings. Use "
+                "before structure queries (query_code_graph, get_code_neighbors, "
+                "code_path). Engines: code-native, code-cbm; repo indexed server-side "
+                "(CODE_REPOS)."
             ),
             inputSchema={
                 "type": "object",
@@ -1396,12 +1414,10 @@ def _code_graph_tools() -> list[Tool]:
         Tool(
             name="code_impact",
             description=(
-                "Compute blast radius from a given symbol: BFS over CALLS/IMPORTS edges "
-                "to find all symbols affected by changes to the given symbol. Returns a "
-                "text summary (file:line format) of affected symbols. Use this to understand "
-                "the impact of modifying or deleting a symbol. E7: requires NativeEngine "
-                "(repo:<name> refs); raises EngineCapabilityError on GraphifyJsonEngine "
-                "(.json artifacts)."
+                "Blast radius of a symbol: BFS over CALLS/IMPORTS edges to the symbols "
+                "affected by changing it, as file:line text. Use before modifying or "
+                "deleting a symbol. Engines: code-native, "
+                "code-graphify-lib; repo indexed server-side (CODE_REPOS)."
             ),
             inputSchema={
                 "type": "object",
@@ -1417,16 +1433,18 @@ def _code_graph_tools() -> list[Tool]:
             name="code_graph_index",
             description=(
                 "Phase G: index a repository INTO a code knowledge system through "
-                "Neuralscape (async). Enqueues on the ingest queue and returns a "
+                "Neuralscape (async). Operator-side only: the repo must already be on the "
+                "server's disk and mapped in CODE_REPOS (no upload or clone); otherwise the "
+                "task fails with an error naming CODE_REPOS. "
+                "Enqueues on the ingest queue and returns a "
                 "task_id to poll via the memory status endpoint. Once complete, the "
                 "corpus is queryable via the code tools with knowledge_system set. "
-                "Records repo_sha/indexed_at/engine_version per code_space, sets the "
-                "project's routing config, and runs the external-engine liveness diff."
+                "Records index metadata and sets the project's routing config."
             ),
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "repo_source": {"type": "string", "description": "Absolute path (or ref) of the repo to index"},
+                    "repo_source": {"type": "string", "description": "Server-side absolute path (in CODE_REPOS)"},
                     "system": {"type": "string", "description": "Target code system: code-cbm | code-graphify-lib | code-native"},
                     "project_id": {"type": "string", "description": "Project scope; sets routing config so later recalls route to this engine"},
                     "code_space": {"type": "string", "description": "Explicit code_space (code--owner--repo); default derived from user_id + repo basename"},
@@ -1467,7 +1485,7 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
     #      arguments["user_id"] is ignored rather than trusted.
     #   2. An explicit user_id argument (stdio / local Claude Code, legacy).
     #   3. The configured default_user_id.
-    from auth import current_user_id
+    from auth import current_user_id, is_admin_user
 
     # Tools like list_memories / delete_memories declare no required fields, so a
     # client may omit `arguments` entirely (None). Normalize before any access.
@@ -1477,12 +1495,18 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
     # Explicit action policy (NS_POLICY_MODE; a no-op while it is "off").
     from policy_enforcement import enforce_mcp_call
 
-    _policy_denial = enforce_mcp_call(name, arguments)
+    _policy_denial = await asyncio.to_thread(enforce_mcp_call, name, arguments)
     if _policy_denial is not None:
         return [TextContent(type="text", text=json.dumps(_policy_denial))]
 
     try:
         if name == "recall_memories":
+            try:
+                from schemas import validate_workspace_names
+
+                _workspaces = validate_workspace_names(arguments.get("workspaces"))
+            except ValueError as ve:
+                return [TextContent(type="text", text=json.dumps({"error": str(ve)}))]
             # Phase E: fusion — when the router says code leg is warranted, execute
             # it concurrently with base legs and compose sections.
             from knowledge.router import resolve_systems
@@ -1525,6 +1549,7 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
                     limit=arguments.get("limit", 10),
                     visibility=arguments.get("visibility"),
                     include_shared=arguments.get("include_shared", True),
+                    workspaces=_workspaces,
                 )
 
             # Phase E/F: resolve ALL healthy code system(s) the ROUTER decided
@@ -2217,7 +2242,11 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
                 return [TextContent(type="text", text=json.dumps({"status": "accepted", "task_id": task_id}))]
             if memory_id:
                 # Pass caller identity so standard-tier deletes are gated to dictators.
-                result = await asyncio.to_thread(_service.delete_memory, memory_id, user_id)
+                try:
+                    result = await asyncio.to_thread(_service.delete_memory, memory_id, user_id)
+                except LookupError as e:
+                    # Same not-found answer REST gives as a 404.
+                    return [TextContent(type="text", text=json.dumps({"error": str(e)}))]
             elif settings.ledger_enabled and getattr(_task_manager, "producer", None) is not None:
                 from ledger.port import HoldActive
 
@@ -2235,15 +2264,36 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
                         "message": "The tenant has an active retention hold; delete by memory id instead."}}))]
                 return [TextContent(type="text", text=json.dumps({"status": "accepted", "task_id": task_id}))]
             else:
-                result = await asyncio.to_thread(
-                    _service.delete_memories,
-                    user_id=user_id,
-                    scope=arguments.get("scope"),
-                    category=arguments.get("category"),
-                    project_id=arguments.get("project_id"),
-                    filter_null_category=arguments.get("filter_null_category", False),
-                    include_shared=arguments.get("include_shared", False),
-                )
+                try:
+                    result = await asyncio.to_thread(
+                        _service.delete_memories,
+                        user_id=user_id,
+                        scope=arguments.get("scope"),
+                        category=arguments.get("category"),
+                        project_id=arguments.get("project_id"),
+                        filter_null_category=arguments.get("filter_null_category", False),
+                        include_shared=arguments.get("include_shared", False),
+                    )
+                except MemoryListingFailed as e:
+                    # Listing failed => nothing was deleted; say so, never "ok".
+                    return [TextContent(type="text", text=json.dumps(
+                        {"error": str(e), "code": "listing_failed", "deleted": 0}))]
+            # Sibling facts that shared a deleted fact's graph episode need a
+            # fresh single-fact re-ingest; the delete itself has already
+            # succeeded, so a queue failure is reported, never raised.
+            if isinstance(result, dict) and (result.get("failed_ids") or result.get("truncated")):
+                result["status"] = "partial"  # same honesty as REST's 207
+            if isinstance(result, dict):
+                jobs = result.pop("graph_jobs", None)
+                if jobs:
+                    try:
+                        result.update(await _task_manager.enqueue_graph_jobs(jobs))
+                    except Exception as e:
+                        logger.warning(f"Sibling graph re-enrichment could not be queued: {e}")
+                        result.update({
+                            "graph_jobs_enqueued": 0,
+                            "graph_jobs_not_enqueued_ids": [j.get("memory_id") for j in jobs],
+                        })
             return [TextContent(type="text", text=json.dumps(result, default=str))]
 
         elif name == "edit_memory":
@@ -2257,10 +2307,25 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
             if not changes:
                 return [TextContent(type="text", text=json.dumps(
                     {"error": "No fields to update — provide at least one editable field"}))]
+            expected_revision = arguments.get("expected_revision")
+            patch_kwargs = {"expected_revision": expected_revision} if expected_revision is not None else {}
             try:
                 result = await asyncio.to_thread(
-                    _service.patch_memory, arguments["memory_id"], user_id, changes
+                    _service.patch_memory, arguments["memory_id"], user_id, changes, **patch_kwargs
                 )
+            except RevisionConflict as rc:
+                # Nothing was written; re-read the memory (it carries the new
+                # revision), re-apply the change and retry.
+                return [TextContent(type="text", text=json.dumps({
+                    "error": str(rc),
+                    "code": "revision_conflict",
+                    "expected_revision": rc.expected_revision,
+                    "current_revision": rc.current_revision,
+                }))]
+            except EditBusy as eb:
+                return [TextContent(type="text", text=json.dumps({"error": str(eb), "code": "edit_busy"}))]
+            except EditLockUnavailable as eu:
+                return [TextContent(type="text", text=json.dumps({"error": str(eu), "code": "edit_lock_unavailable"}))]
             except (LookupError, PermissionError, ValueError) as e:
                 return [TextContent(type="text", text=json.dumps({"error": str(e)}))]
 
@@ -2268,20 +2333,37 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
             graph_task_id = None
             if result.get("graph_job"):
                 try:
+                    # Storage owner's partition; the editor polls the task.
                     graph_task_id = await _task_manager.enqueue_graph_enrichment(
-                        **result["graph_job"]
+                        **result["graph_job"], requester_user_id=user_id
                     )
                     graph = graph.replace("_pending", "_queued")
                 except Exception as e:
                     logger.warning(f"Graph enqueue failed for edited memory: {e}")
                     graph = "enqueue_failed"
             mem = result.get("memory")
-            return [TextContent(type="text", text=json.dumps({
+            response = {
                 "status": "ok",
                 "memory": mem.model_dump(exclude_none=True) if mem is not None else None,
                 "graph": graph,
                 "graph_task_id": graph_task_id,
-            }, default=str))]
+            }
+            sibling_jobs = result.get("sibling_graph_jobs") or []
+            if sibling_jobs or result.get("sibling_graph_unrepaired_ids"):
+                # The moved fact's whole conversation episode was expired;
+                # re-ingest the surviving siblings (additive keys).
+                queued: dict = {}
+                if sibling_jobs:
+                    try:
+                        queued = await _task_manager.enqueue_graph_jobs(sibling_jobs)
+                    except Exception as e:
+                        logger.warning(f"Sibling graph re-enrichment could not be queued: {e}")
+                        queued = {"graph_jobs_not_enqueued_ids": [j.get("memory_id") for j in sibling_jobs]}
+                response["sibling_graph_jobs_enqueued"] = queued.get("graph_jobs_enqueued", 0)
+                response["sibling_graph_jobs_not_enqueued_ids"] = queued.get("graph_jobs_not_enqueued_ids", [])
+                response["sibling_graph_unrepaired_ids"] = result.get("sibling_graph_unrepaired_ids", [])
+                response["sibling_graph_repair_failed"] = bool(result.get("sibling_graph_repair_failed"))
+            return [TextContent(type="text", text=json.dumps(response, default=str))]
 
         elif name == "get_reasoning_chain":
             try:
@@ -2356,7 +2438,25 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
                 from pathlib import Path as _P
 
                 repo_name = _P(str(repo_source).rstrip("/")).name or "repo"
-                code_space = f"code--{user_id}--{repo_name}"
+                from knowledge.code_dispatch import build_code_space
+
+                try:
+                    code_space = build_code_space(user_id, repo_name)
+                except ValueError as e:
+                    return [TextContent(type="text", text=json.dumps({"error": str(e)}))]
+            from knowledge.code_dispatch import (
+                code_space_access_error,
+                code_space_shape_error,
+                repo_source_error,
+            )
+
+            refused = (
+                code_space_shape_error(code_space)
+                or code_space_access_error(code_space, user_id)
+                or repo_source_error(repo_source, settings)
+            )
+            if refused:
+                return [TextContent(type="text", text=json.dumps({"error": refused}))]
             task_id = await _task_manager.enqueue_code_index({
                 "system": system,
                 "repo_source": repo_source,
@@ -2383,8 +2483,11 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
             if not graph_id or not system:
                 return [TextContent(type="text", text=json.dumps(
                     {"error": "graph_id and system are required"}))]
-            from knowledge.code_dispatch import teardown_code_space
+            from knowledge.code_dispatch import code_space_access_error, teardown_code_space
 
+            denied = code_space_access_error(graph_id, user_id)
+            if denied:
+                return [TextContent(type="text", text=json.dumps({"error": denied}))]
             result = await asyncio.to_thread(
                 teardown_code_space, system, graph_id, user_id, settings
             )
@@ -2428,6 +2531,11 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
                 if not code_space:
                     return [TextContent(type="text", text=json.dumps(
                         {"error": "knowledge_system requires graph_id (the code_space)"}))]
+                from knowledge.code_dispatch import code_space_access_error
+
+                denied = code_space_access_error(code_space, user_id)
+                if denied:
+                    return [TextContent(type="text", text=json.dumps({"error": denied}))]
                 from knowledge.base import RecallRequest
 
                 if explicit_system == "auto":
@@ -2617,6 +2725,10 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
         elif name == "set_project_knowledge_config":
             from knowledge.router import ProjectKnowledgeConfig, set_project_config
 
+            if not is_admin_user(user_id):
+                return [TextContent(type="text", text=json.dumps(
+                    {"error": f"User {user_id!r} is not authorized to set project knowledge config."}))]
+
             project_id = arguments.get("project_id")
             if not project_id:
                 return [TextContent(type="text", text=json.dumps({"error": "project_id required"}))]
@@ -2642,6 +2754,11 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
             # worker's queue and let the caller poll the status endpoint.
             from extensions.dreaming.config import dreaming_settings
 
+            # Dictator-only, checked before the flag/force logic (mirrors REST /run).
+            if not is_admin_user(user_id):
+                return [TextContent(type="text", text=json.dumps(
+                    {"error": f"User {user_id!r} is not authorized to trigger dreaming sweeps."}))]
+
             force = bool(arguments.get("force", False))
             if not dreaming_settings.enabled and not force:
                 return [TextContent(type="text", text=json.dumps({
@@ -2666,6 +2783,11 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
                 force,
                 _queue_name=settings.graph_queue_name,
             )
+            if job:
+                # The caller may also poll it on /v1/memories/status.
+                from task_manager import record_task_owner
+
+                await record_task_owner(arq_pool, job.job_id, user_id)
             return [TextContent(type="text", text=json.dumps({
                 "status": "enqueued",
                 "job_id": job.job_id if job else None,

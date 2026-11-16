@@ -10,7 +10,7 @@ source: handwritten
 This page walks you from a clean machine to a running neuralscape stack with a memory written, retrieved, and (optionally) wired into Claude Code via the plugin or MCP. Allow ~10 minutes if Docker images are warm; ~25 minutes on first pull.
 
 By the end you'll have:
-- The full stack running (Neo4j, Redis, Qdrant, neuralscape API, ARQ worker)
+- The full stack running (Neo4j, Redis, Qdrant, Docling, the neuralscape API, and the fast, graph and ingest ARQ workers)
 - One memory stored asynchronously and retrieved via hybrid search
 - (Optional) The Claude Code plugin installed so context auto-injects on `SessionStart`
 - (Optional) The MCP server reachable from any MCP-aware client
@@ -52,8 +52,13 @@ GOOGLE_API_KEY=ya29...        # https://aistudio.google.com/apikey
 NEO4J_PASSWORD=change-me      # any password; Neo4j will use it on first start
 ```
 
+Then pick one auth option. Auth is fail-closed: the API refuses to start until
+one is set (see [AUTH.md](../../AUTH.md#fail-closed-by-default)):
+- `NEURALSCAPE_USER_TOKEN_SECRET` — per-user tokens (recommended; see [Step 8](#step-8-multi-user--issue-per-user-tokens))
+- `NEURALSCAPE_API_KEY` — legacy shared key; all endpoints except `/health` require `Authorization: Bearer <key>`
+- `NEURALSCAPE_AUTH_DISABLED=true` — no auth at all; trusted local machine only
+
 Optional knobs (defaults are reasonable):
-- `NEURALSCAPE_API_KEY` — if set, all endpoints except `/health` require `Authorization: Bearer <key>`
 - `OBSIDIAN_VAULT_PATH` — host path mounted into the container at `/data/vault` (defaults to `./vault`)
 - `MCP_TRANSPORT` — `http` (default in compose) or `stdio`
 
@@ -71,7 +76,7 @@ mkdir -p vault
 
 ## Step 4 — Start the stack
 
-The full route brings up all five services with health-gated startup:
+The full route brings up the whole default stack (data stores, Docling, the API and three workers) with health-gated startup. Optional sidecars (`cbm`, `resolver`) and the `tunnel` and `test` services only start when you pass their compose profile:
 
 ```bash
 docker compose up --build -d
@@ -83,18 +88,20 @@ Wait ~30s for healthchecks. Check status:
 docker compose ps
 ```
 
-All five services (`neo4j`, `redis`, `qdrant`, `neuralscape`, `neuralscape-worker`) should show `(healthy)`.
+The services with health checks (`neo4j`, `redis`, `qdrant`, `docling`, `neuralscape`, and the three workers `neuralscape-worker`, `neuralscape-graph-worker`, `neuralscape-ingest-worker`) should show `(healthy)`. See [11-deployment](./11-deployment.md) for the full service table.
 
 ### Alternative — backing services only
 
-If you'd rather run the API and worker locally for fast reload:
+If you'd rather run the API and workers locally for fast reload:
 
 ```bash
-docker compose up neo4j redis qdrant -d
+docker compose up neo4j redis qdrant -d   # add docling for file ingest
 cd neuralscape-service
 uv sync
 uv run python main.py                # terminal 1: API
-uv run arq worker.WorkerSettings     # terminal 2: ARQ worker
+uv run arq worker.WorkerSettings          # terminal 2: fast worker (vector writes/reads)
+uv run arq worker.GraphWorkerSettings     # terminal 3: graph worker (Graphiti enrichment, dedup)
+uv run arq worker.IngestWorkerSettings    # terminal 4: ingest worker (only needed for document/file ingest)
 ```
 
 ## Step 5 — Verify health
@@ -182,7 +189,7 @@ When you're ready to add a second user (or you want auth turned on at all for a 
 
 Memory visibility now matters: see the [memory-model doc](./03-memory-model.md#multi-user-model-v22) for the per-category default visibility table (`preference` → private; `tech_stack` → shared; etc.). If you have legacy memories you'd like to make team-visible after the fact, run `scripts/bulk_promote_visibility.py` (dry-run by default) and `scripts/migrate_graph_groups.py` to rewrite the Graphiti group_ids.
 
-For a strictly single-user install you can skip this step entirely — `NEURALSCAPE_API_KEY` (legacy shared key, or no auth at all) keeps working.
+For a strictly single-user install you can skip this step entirely — `NEURALSCAPE_API_KEY` (legacy shared key) or `NEURALSCAPE_AUTH_DISABLED=true` (no auth at all, trusted local machine only) keeps working.
 
 ## Step 9 (optional) — Install the Claude Code / Cowork plugin
 
@@ -205,7 +212,7 @@ That's it — the post-install build runs automatically (`postinstall` script in
 
 **Cowork:** the marketplace install loads the skills, but **hooks don't fire in Cowork** and the token prompt is unreliable there — so the auto inject/capture loop above won't run. Use the **MCP OAuth connector + standing context** instead. Full runbook: [`../../COWORK.md`](../../COWORK.md).
 
-**MCP tools come for free.** The plugin's `.mcp.json` points at the deployed `/mcp/` endpoint, so installing the plugin auto-wires the seven Neuralscape MCP tools (`recall_memories`, `remember`, etc.) into Claude Code's tool list.
+**MCP tools come for free.** The plugin's `.mcp.json` points at the deployed `/mcp/` endpoint, so installing the plugin auto-wires the Neuralscape MCP tools (26 core, plus 7 code-graph tools when the optional extra is installed; `recall_memories`, `remember`, etc.) into Claude Code's tool list.
 
 **Slash commands:** four discoverable commands ship with the plugin — `/neuralscape:status`, `/neuralscape:search`, `/neuralscape:sync`, `/neuralscape:config`. Claude can also invoke them automatically when the user's question fits.
 
@@ -238,7 +245,7 @@ The 7 tools exposed (`recall_memories`, `remember`, `remember_conversation`, `ge
 
 - **Health 503 on `/health`** → Qdrant unreachable. With local on-disk Qdrant (no `QDRANT_URL`), check `~/.neuralscape/qdrant` is writable; otherwise verify the `qdrant` container is up.
 - **202 returns 200 instead** → Redis-down sync fallback fired. Check `docker compose logs redis`.
-- **Project graph search returns nothing for old data** → `group_id` format migration needed (was `project:{id}`, now `project--{id}`). Run `cypher-shell -u neo4j -p $NEO4J_PASSWORD < neuralscape-service/scripts/migrate-group-ids.cypher`.
+- **Project graph search returns nothing for old data** → a very old `group_id` format (`project:{id}`) may need migrating. Read `scripts/migrate-group-ids.cypher` (repo root) and the current format in [03-memory-model](./03-memory-model.md) before running it with `cypher-shell`.
 - **429 from Gemini** → free-tier quota; the service auto-retries with exponential backoff and falls back to `gemini-2.5-flash`. Tune `LLM_RETRY_MAX_DELAY` if needed. See [05-llm-extraction](./05-llm-extraction.md).
 - **Empty extractions** → conversation may have been all junk-filtered (tool logs, file edits). The extraction prompt skips those by design.
 

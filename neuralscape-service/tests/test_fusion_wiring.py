@@ -111,7 +111,7 @@ async def test_fusion_repo_from_code_space_not_project_id(registry_with_code, mo
     """
     project_id = "proj-alpha"
     repo = "myrepo"                       # deliberately different from project_id
-    code_space = f"code--owner--{repo}"
+    code_space = f"code--bob--{repo}"
     symbol_fqn = "myrepo.core.run"
     canonical = NativeEngine.to_canonical(symbol_fqn)   # "myrepo.core.run"
     correct_key = f"{repo}::{canonical}"                 # "myrepo::myrepo.core.run"
@@ -132,12 +132,15 @@ async def test_fusion_repo_from_code_space_not_project_id(registry_with_code, mo
     ]
 
     # The anchored memory in Qdrant, keyed on the CODE_SPACE repo.
-    mem_point = MagicMock(payload={
-        "id": "anchored-mem",
+    # Shaped like memory/write.py stores it: point id = memory id, author at
+    # top-level payload user_id + metadata.owner_user_id (no payload "id").
+    mem_point = MagicMock(id="anchored-mem", payload={
         "data": "Decision: run() dispatches via async — ADR-7",
+        "created_at": "2026-01-01T00:00:00Z",
+        "user_id": "bob",
         "metadata": {
             "source_ref": {"external_id": correct_key},
-            "category": "decision", "visibility": "shared", "user_id": "bob",
+            "category": "decision", "visibility": "shared", "owner_user_id": "bob",
         },
     })
     fake_service = MagicMock()
@@ -195,7 +198,7 @@ async def test_recall_auto_leg_routes_per_op_and_attributes(registry_with_code, 
     """
     project_id = "proj-beta"
     repo = "widgets"
-    code_space = f"code--owner--{repo}"
+    code_space = f"code--bob--{repo}"
     symbol_fqn = "widgets.core.build"
     canonical = NativeEngine.to_canonical(symbol_fqn)
 
@@ -254,7 +257,7 @@ async def test_fusion_code_leg_runs_concurrently_with_base(registry_with_code, m
     concurrent ≈ 0.2s. Assert well under the serial sum.
     """
     project_id = "proj-conc"
-    code_space = "code--owner--proj-conc"
+    code_space = "code--bob--proj-conc"
     KNOWLEDGE_REGISTRY["code-fake"] = _FakeCodeSystem(
         "code-fake", code_space,
         hits=[{"fqn": "proj-conc.mod.fn", "kind": "function", "file": "m.py", "line": 1}],
@@ -304,7 +307,7 @@ async def test_fusion_two_code_systems_deduped_in_real_path(registry_with_code, 
     """
     project_id = "proj-dual"
     repo = "proj-dual"
-    code_space = f"code--owner--{repo}"
+    code_space = f"code--bob--{repo}"
     shared_fqn = "proj-dual.core.run"     # both systems return this (overlap)
     cbm_only_fqn = "proj-dual.core.helper"
 
@@ -362,7 +365,7 @@ async def test_plain_prose_recall_unchanged_no_fusion(registry_with_code, mock_m
     """
     project_id = "proj-plain"
     KNOWLEDGE_REGISTRY["code-fake"] = _FakeCodeSystem(
-        "code-fake", "code--owner--proj-plain", hits=[{"fqn": "x.y", "kind": "function", "file": "x.py", "line": 1}],
+        "code-fake", "code--bob--proj-plain", hits=[{"fqn": "x.y", "kind": "function", "file": "x.py", "line": 1}],
     )
     set_project_config(ProjectKnowledgeConfig(
         project_id=project_id, code_systems=["code-fake"],

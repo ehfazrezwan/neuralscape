@@ -25,7 +25,14 @@ from fastapi.testclient import TestClient
 import main
 import oauth
 from main import app
-from tokens import issue_user_token, sign_payload, verify_user_token
+from tokens import issue_user_token, sign_payload, verify_payload, verify_user_token
+
+# the autouse fixture patches these module attrs; keep the originals. getattr
+# with a default so a reverted oauth.py fails the tests, not collection.
+_ORIG = {
+    n: getattr(oauth, n, None)
+    for n in ("_consume_code_jti", "_consume_refresh_jti", "_family_revoked", "_revoke_family")
+}
 
 SECRET = "oauth-test-secret"
 PUBLIC_URL = "https://neuralscape.example.com"
@@ -45,10 +52,6 @@ def _pkce():
 @pytest.fixture(autouse=True)
 def mock_backends():
     """Avoid real mem0/Graphiti/Redis like the other suites do."""
-    orig_mem, orig_g, orig_b = main._memory, main._graphiti, main._bridge
-    main._memory = MagicMock()
-    main._graphiti = MagicMock()
-    main._bridge = MagicMock()
     main._async_memory = None
     tm = MagicMock()
     tm.connect = AsyncMock()
@@ -56,7 +59,6 @@ def mock_backends():
     orig_tm = main._task_manager
     main._task_manager = tm
     yield
-    main._memory, main._graphiti, main._bridge = orig_mem, orig_g, orig_b
     main._task_manager = orig_tm
 
 
@@ -85,7 +87,27 @@ def no_redis_replay():
         seen.add(jti)
         return True
 
-    with patch.object(oauth, "_consume_code_jti", side_effect=_consume):
+    seen_refresh = set()
+
+    async def _consume_refresh(jti, ttl):
+        if jti in seen_refresh:
+            return False
+        seen_refresh.add(jti)
+        return True
+
+    revoked = set()
+
+    async def _family_revoked(fam):
+        return fam in revoked
+
+    async def _revoke_family(fam, ttl):
+        revoked.add(fam)
+
+    with patch.object(oauth, "_consume_code_jti", side_effect=_consume, create=True), patch.object(
+        oauth, "_consume_refresh_jti", side_effect=_consume_refresh, create=True
+    ), patch.object(oauth, "_family_revoked", side_effect=_family_revoked, create=True), patch.object(
+        oauth, "_revoke_family", side_effect=_revoke_family, create=True
+    ):
         yield
 
 
@@ -393,7 +415,7 @@ class TestToken:
         assert second.status_code == 400
         assert "already used" in second.json()["error_description"]
 
-    def test_refresh_grant(self, client):
+    def _tokens(self, client):
         client_id, redirect_uri, verifier, code = self._full_flow_to_code(client)
         tok = client.post(
             "/oauth/token",
@@ -405,13 +427,369 @@ class TestToken:
                 "client_id": client_id,
             },
         ).json()
-        resp = client.post(
+        return client_id, tok
+
+    @staticmethod
+    def _refresh(client, refresh_token, client_id):
+        return client.post(
             "/oauth/token",
-            data={"grant_type": "refresh_token", "refresh_token": tok["refresh_token"]},
+            data={
+                "grant_type": "refresh_token",
+                "refresh_token": refresh_token,
+                "client_id": client_id,
+            },
         )
+
+    def test_refresh_grant(self, client):
+        client_id, tok = self._tokens(client)
+        resp = self._refresh(client, tok["refresh_token"], client_id)
         assert resp.status_code == 200
         new = resp.json()
         assert verify_user_token(new["access_token"], SECRET)["user_id"] == USER
+        # rotation: a different refresh token comes back, bound to the same client
+        assert new["refresh_token"] != tok["refresh_token"]
+        assert verify_payload(new["refresh_token"], SECRET)["client_id"] == client_id
+
+    def test_refresh_token_is_single_use(self, client):
+        client_id, tok = self._tokens(client)
+        assert self._refresh(client, tok["refresh_token"], client_id).status_code == 200
+        replay = self._refresh(client, tok["refresh_token"], client_id)
+        assert replay.status_code == 400
+        assert replay.json()["error"] == "invalid_grant"
+
+    def test_reuse_revokes_the_whole_family(self, client):
+        client_id, tok = self._tokens(client)
+        second = self._refresh(client, tok["refresh_token"], client_id).json()
+        # attacker replays the old, already-rotated token
+        assert self._refresh(client, tok["refresh_token"], client_id).status_code == 400
+        # the current successor is now dead too
+        dead = self._refresh(client, second["refresh_token"], client_id)
+        assert dead.status_code == 400 and dead.json()["error"] == "invalid_grant"
+
+    def test_retry_with_same_token_by_same_client_revokes_session_no_grace(self, client):
+        # A lost response makes the client retry the SAME token. By design
+        # there is no grace window: the retry is reuse, and the session dies.
+        client_id, tok = self._tokens(client)
+        first = self._refresh(client, tok["refresh_token"], client_id)
+        assert first.status_code == 200
+        retry = self._refresh(client, tok["refresh_token"], client_id)
+        assert retry.status_code == 400 and retry.json()["error"] == "invalid_grant"
+        successor = self._refresh(client, first.json()["refresh_token"], client_id)
+        assert successor.status_code == 400 and successor.json()["error"] == "invalid_grant"
+
+    def test_other_family_unaffected_by_revocation(self, client):
+        client_id, tok = self._tokens(client)
+        _, other = self._tokens(client)  # an unrelated grant
+        self._refresh(client, tok["refresh_token"], client_id)
+        self._refresh(client, tok["refresh_token"], client_id)  # reuse -> revoke
+        other_client = verify_payload(other["refresh_token"], SECRET)["client_id"]
+        assert self._refresh(client, other["refresh_token"], other_client).status_code == 200
+
+    def test_family_survives_rotation(self, client):
+        client_id, tok = self._tokens(client)
+        second = self._refresh(client, tok["refresh_token"], client_id).json()
+        assert (
+            verify_payload(second["refresh_token"], SECRET)["fam"]
+            == verify_payload(tok["refresh_token"], SECRET)["fam"]
+        )
+
+    def test_revocation_check_fails_closed_when_redis_down(self, client):
+        client_id, tok = self._tokens(client)
+
+        async def _down(fam):
+            raise oauth._ReplayGuardUnavailable()
+
+        with patch.object(oauth, "_family_revoked", side_effect=_down):
+            resp = self._refresh(client, tok["refresh_token"], client_id)
+        assert resp.status_code == 503 and resp.json()["error"] == "temporarily_unavailable"
+
+    def test_non_ascii_client_id_is_invalid_grant_not_500(self, client):
+        client_id, tok = self._tokens(client)
+        resp = self._refresh(client, tok["refresh_token"], "clïent-id-é")
+        assert resp.status_code == 400 and resp.json()["error"] == "invalid_grant"
+
+    def test_rotated_refresh_token_keeps_working(self, client):
+        client_id, tok = self._tokens(client)
+        second = self._refresh(client, tok["refresh_token"], client_id).json()
+        third = self._refresh(client, second["refresh_token"], client_id)
+        assert third.status_code == 200
+
+    def test_refresh_requires_matching_client_id_and_does_not_burn_token(self, client):
+        client_id, tok = self._tokens(client)
+        other_id, _ = _register(client, "https://other.example.com/cb")
+        wrong = self._refresh(client, tok["refresh_token"], other_id)
+        assert wrong.status_code == 400 and wrong.json()["error"] == "invalid_grant"
+        # the legitimate client can still redeem it
+        assert self._refresh(client, tok["refresh_token"], client_id).status_code == 200
+
+    def test_refresh_without_client_id_continues_the_bound_client(self, client):
+        """A public client may omit client_id on refresh (RFC 6749 3.2.1, 6)."""
+        client_id, tok = self._tokens(client)
+        resp = self._refresh(client, tok["refresh_token"], "")
+        assert resp.status_code == 200, resp.text
+        new = resp.json()
+        assert verify_payload(new["refresh_token"], SECRET)["client_id"] == client_id
+        # still single-use: the consumed token cannot be replayed without client_id
+        replay = self._refresh(client, tok["refresh_token"], "")
+        assert replay.status_code == 400 and replay.json()["error"] == "invalid_grant"
+
+    def test_legacy_refresh_token_without_jti_or_client_is_rejected(self, client):
+        client_id, _ = self._tokens(client)
+        legacy = sign_payload(
+            {"typ": "refresh", "user_id": USER, "exp": int(time.time()) + 600}, SECRET
+        )
+        resp = self._refresh(client, legacy, client_id)
+        assert resp.status_code == 400 and resp.json()["error"] == "invalid_grant"
+
+    def test_refresh_token_without_family_is_rejected(self, client):
+        client_id, _ = self._tokens(client)
+        nofam = sign_payload(
+            {"typ": "refresh", "user_id": USER, "client_id": client_id, "jti": "j",
+             "exp": int(time.time()) + 600}, SECRET)
+        resp = self._refresh(client, nofam, client_id)
+        assert resp.status_code == 400 and resp.json()["error"] == "invalid_grant"
+
+    def test_refresh_fails_closed_when_guard_unavailable(self, client):
+        client_id, tok = self._tokens(client)
+
+        async def _down(jti, ttl):
+            raise oauth._ReplayGuardUnavailable()
+
+        with patch.object(oauth, "_consume_refresh_jti", side_effect=_down):
+            resp = self._refresh(client, tok["refresh_token"], client_id)
+        assert resp.status_code == 503
+        assert resp.json()["error"] == "temporarily_unavailable"
+        assert "access_token" not in resp.json()
+
+    def test_code_exchange_fails_closed_when_guard_unavailable(self, client):
+        client_id, redirect_uri, verifier, code = self._full_flow_to_code(client)
+
+        async def _down(jti):
+            raise oauth._ReplayGuardUnavailable()
+
+        data = {
+            "grant_type": "authorization_code",
+            "code": code,
+            "code_verifier": verifier,
+            "redirect_uri": redirect_uri,
+            "client_id": client_id,
+        }
+        with patch.object(oauth, "_consume_code_jti", side_effect=_down):
+            resp = client.post("/oauth/token", data=data)
+        assert resp.status_code == 503
+        assert resp.json()["error"] == "temporarily_unavailable"
+        assert "access_token" not in resp.json()
+        # nothing was consumed, so the code still works once Redis is back
+        assert client.post("/oauth/token", data=data).status_code == 200
+
+
+class TestSingleUseGuard:
+    """The real Redis helper must raise (not allow) when Redis is unreachable."""
+
+    def test_unreachable_redis_raises_guard_unavailable(self):
+        import asyncio
+
+        from config import settings
+
+        orig = settings.redis_url
+        settings.redis_url = "redis://127.0.0.1:1/0"  # nothing listens here
+        try:
+            with pytest.raises(oauth._ReplayGuardUnavailable):
+                asyncio.run(_ORIG["_consume_code_jti"]("j1"))
+            with pytest.raises(oauth._ReplayGuardUnavailable):
+                asyncio.run(_ORIG["_consume_refresh_jti"]("j2", 60))
+        finally:
+            settings.redis_url = orig
+
+    def test_first_claim_true_second_false_and_ttl_floor(self):
+        import asyncio
+
+        calls = []
+
+        class FakeRedis:
+            seen = set()
+
+            async def set(self, key, val, nx=None, ex=None):
+                calls.append((key, ex))
+                if key in self.seen:
+                    return None
+                self.seen.add(key)
+                return True
+
+            async def aclose(self):
+                pass
+
+        fake = FakeRedis()
+        with patch("redis.asyncio.from_url", return_value=fake):
+            assert asyncio.run(_ORIG["_consume_refresh_jti"]("abc", 0)) is True
+            assert asyncio.run(_ORIG["_consume_refresh_jti"]("abc", 0)) is False
+        assert calls[0] == ("oauth:refresh:abc", 1)
+
+    def test_family_helpers_and_client_timeouts(self):
+        import asyncio
+
+        kwargs = {}
+
+        class FakeRedis:
+            store = {}
+
+            async def set(self, key, val, nx=None, ex=None):
+                self.store[key] = ex
+                return True
+
+            async def exists(self, key):
+                return 1 if key in self.store else 0
+
+            async def aclose(self):
+                pass
+
+        def fake_from_url(url, **kw):
+            kwargs.update(kw)
+            return FakeRedis()
+
+        with patch("redis.asyncio.from_url", side_effect=fake_from_url):
+            assert asyncio.run(_ORIG["_family_revoked"]("f1")) is False
+            asyncio.run(_ORIG["_revoke_family"]("f1", 100))
+            assert asyncio.run(_ORIG["_family_revoked"]("f1")) is True
+        assert FakeRedis.store["oauth:revoked_family:f1"] == 100
+        assert kwargs["socket_connect_timeout"] > 0 and kwargs["socket_timeout"] > 0
+
+
+# ── anti-framing headers + consent page layout / contrast ────────────────
+
+
+def _lum(hexcolor):
+    h = hexcolor.lstrip("#")
+    chans = []
+    for i in (0, 2, 4):
+        c = int(h[i : i + 2], 16) / 255
+        chans.append(c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4)
+    return 0.2126 * chans[0] + 0.7152 * chans[1] + 0.0722 * chans[2]
+
+
+def _contrast(a, b):
+    la, lb = sorted((_lum(a), _lum(b)), reverse=True)
+    return (la + 0.05) / (lb + 0.05)
+
+
+class TestHtmlHardening:
+    def _assert_hardened(self, resp):
+        assert resp.headers["x-frame-options"] == "DENY"
+        assert "frame-ancestors 'none'" in resp.headers["content-security-policy"]
+        assert resp.headers["referrer-policy"] == "no-referrer"
+        assert resp.headers["x-content-type-options"] == "nosniff"
+
+    def _authorize_params(self, client):
+        client_id, redirect_uri = _register(client)
+        _, challenge = _pkce()
+        return {
+            "response_type": "code",
+            "client_id": client_id,
+            "redirect_uri": redirect_uri,
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
+        }
+
+    def test_consent_page_not_frameable(self, client):
+        resp = client.get("/oauth/authorize", params=self._authorize_params(client))
+        assert resp.status_code == 200
+        self._assert_hardened(resp)
+
+    def test_consent_error_page_not_frameable(self, client):
+        params = self._authorize_params(client)
+        resp = _login_to_code(
+            client, params["client_id"], params["redirect_uri"], params["code_challenge"], "nope"
+        )
+        assert resp.status_code == 400
+        self._assert_hardened(resp)
+
+    def test_link_error_page_not_frameable(self, client):
+        resp = client.post("/oauth/link", data={"ticket": "garbage", "action": "new"})
+        assert resp.status_code == 400
+        self._assert_hardened(resp)
+
+    def test_link_page_not_frameable(self):
+        resp = oauth._render_link_page("t", "a@b.c", "abc")
+        self._assert_hardened(resp)
+
+    def test_supabase_callback_page_not_frameable(self, client):
+        from config import settings
+
+        orig = (settings.auth_provider, settings.supabase_url, settings.supabase_anon_key)
+        settings.auth_provider = "supabase"
+        settings.supabase_url = "https://x.supabase.example"
+        settings.supabase_anon_key = "anon-test"
+        try:
+            resp = client.get("/oauth/supabase/callback")
+        finally:
+            settings.auth_provider, settings.supabase_url, settings.supabase_anon_key = orig
+        assert resp.status_code == 200
+        self._assert_hardened(resp)
+
+    def test_supabase_consent_page_keeps_its_script(self, client):
+        # the hardening CSP must not disable the inline module the Supabase
+        # button needs: it only restricts framing/base/object.
+        from config import settings
+
+        orig = (settings.auth_provider, settings.supabase_url, settings.supabase_anon_key)
+        settings.auth_provider = "supabase"
+        settings.supabase_url = "https://x.supabase.example"
+        settings.supabase_anon_key = "anon-test"
+        try:
+            resp = client.get("/oauth/authorize", params=self._authorize_params(client))
+        finally:
+            settings.auth_provider, settings.supabase_url, settings.supabase_anon_key = orig
+        assert "ns-google-btn" in resp.text
+        csp = resp.headers["content-security-policy"]
+        assert "script-src" not in csp and "default-src" not in csp
+        self._assert_hardened(resp)
+
+
+class TestConsentLayout:
+    def _page(self, client):
+        client_id, redirect_uri = _register(client)
+        _, challenge = _pkce()
+        return client.get(
+            "/oauth/authorize",
+            params={
+                "response_type": "code",
+                "client_id": client_id,
+                "redirect_uri": redirect_uri,
+                "code_challenge": challenge,
+                "code_challenge_method": "S256",
+            },
+        ).text
+
+    def test_card_is_border_box_and_wraps_long_text(self, client):
+        page = self._page(client)
+        # universal rule: the .card (padding + border) must not add to its 92vw width
+        assert "*, *::before, *::after { box-sizing: border-box; }" in page
+        assert "overflow-wrap: anywhere" in page
+        assert "max-width: 100%" in page
+
+    def test_link_and_error_pages_reflow_too(self, client):
+        link = oauth._render_link_page("t", "a@b.c", "abc").body.decode()
+        assert "*, *::before, *::after { box-sizing: border-box; }" in link and "overflow-wrap:anywhere" in link
+        err = oauth._login_error_page(oauth.LoginError("x", 400)).body.decode()
+        assert "*,*::before,*::after{box-sizing:border-box;}" in err and "overflow-wrap:anywhere" in err
+
+    def test_primary_button_text_meets_wcag_aa(self, client):
+        import re
+
+        for page in (
+            self._page(client),
+            oauth._render_link_page("t", "a@b.c", "abc").body.decode(),
+        ):
+            m = re.search(r"(?:button|\.primary) *\{[^}]*?background: *(#[0-9a-fA-F]{6});[^}]*?color: *(#[0-9a-fA-F]{3,6})", page)
+            assert m, "primary action style not found"
+            fg = m.group(2) if len(m.group(2)) == 7 else "#ffffff"
+            assert _contrast(m.group(1), fg) >= 4.5
+        # the regression value: white on #5b7cfa is 3.68:1
+        assert _contrast("#5b7cfa", "#ffffff") < 4.5
+
+    def test_hint_text_meets_wcag_aa(self):
+        assert _contrast("#7b8198", "#151821") >= 4.5
+
 
     def test_unsupported_grant(self, client):
         resp = client.post("/oauth/token", data={"grant_type": "password"})
@@ -598,3 +976,63 @@ class TestMcpIdentity:
             mcp_server._service = orig
         # The authenticated identity wins; the spoofed argument is ignored.
         assert svc.list_memories.call_args.kwargs["user_id"] == "alice"
+
+
+class TestClientIdentityIsUnique:
+    """RFC 7591 §3.2.1: each registration gets its own client_id, and a code or
+    refresh token issued to one client is refused for another, even when both
+    registered the same redirect URI in the same second (acceptance scenario
+    test_the_code_is_bound_to_its_client_redirect_and_verifier)."""
+
+    def test_two_registrations_in_the_same_second_get_distinct_client_ids(self, client):
+        with patch.object(oauth.time, "time", return_value=1_900_000_000):
+            first, _ = _register(client)
+            second, _ = _register(client)
+        assert first != second
+
+    def test_a_code_for_one_client_is_refused_for_another_registered_in_the_same_second(
+        self, client
+    ):
+        verifier, challenge = _pkce()
+        with patch.object(oauth.time, "time", return_value=int(time.time())):
+            client_a, redirect = _register(client)
+            client_b, _ = _register(client)
+        login = issue_user_token(USER, SECRET, 3600)
+        loc = _login_to_code(client, client_a, redirect, challenge, login).headers["location"]
+        code = loc.split("code=")[1].split("&")[0]
+        resp = client.post(
+            "/oauth/token",
+            data={
+                "grant_type": "authorization_code",
+                "code": code,
+                "code_verifier": verifier,
+                "redirect_uri": redirect,
+                "client_id": client_b,
+            },
+        )
+        assert resp.status_code == 400
+        assert resp.json() == {"error": "invalid_grant", "error_description": "client mismatch"}
+
+    def test_client_ids_issued_before_the_jti_still_work(self, client):
+        """Back-compat: a client_id without a jti (pre-change registration) still
+        authorizes and redeems codes."""
+        redirect = "https://claude.ai/api/mcp/auth_callback"
+        legacy_client = sign_payload(
+            {"typ": "client", "redirect_uris": [redirect], "iat": int(time.time())}, SECRET
+        )
+        verifier, challenge = _pkce()
+        login = issue_user_token(USER, SECRET, 3600)
+        loc = _login_to_code(client, legacy_client, redirect, challenge, login).headers["location"]
+        code = loc.split("code=")[1].split("&")[0]
+        resp = client.post(
+            "/oauth/token",
+            data={
+                "grant_type": "authorization_code",
+                "code": code,
+                "code_verifier": verifier,
+                "redirect_uri": redirect,
+                "client_id": legacy_client,
+            },
+        )
+        assert resp.status_code == 200, resp.text
+

@@ -1,0 +1,114 @@
+#!/usr/bin/env bash
+# Black-box acceptance run against a live NeuralScape stack.
+#
+#   acceptance/run.sh <base-url> [--profile NAME] [--out FILE] [--list]
+#                     [-k EXPR] [--compose-project P] [--selftest]
+#
+# Exit codes: 0 all pass/skip, 1 any fail/error, 2 harness misconfiguration.
+set -uo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+usage() { sed -n '2,8p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+die() { echo "run.sh: $*" >&2; exit 2; }
+
+BASE_URL="" PROFILE="default" OUT="" LIST=0 KEXPR="" COMPOSE="" SELFTEST=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --profile) [ $# -ge 2 ] || die "--profile needs a value"; PROFILE="$2"; shift 2 ;;
+    --out) [ $# -ge 2 ] || die "--out needs a value"; OUT="$2"; shift 2 ;;
+    --list) LIST=1; shift ;;
+    -k) [ $# -ge 2 ] || die "-k needs a value"; KEXPR="$2"; shift 2 ;;
+    --compose-project) [ $# -ge 2 ] || die "--compose-project needs a value"; COMPOSE="$2"; shift 2 ;;
+    --selftest) SELFTEST=1; shift ;;
+    -h|--help) usage; exit 0 ;;
+    -*) die "unknown option: $1" ;;
+    *) [ -z "$BASE_URL" ] || die "unexpected argument: $1"; BASE_URL="$1"; shift ;;
+  esac
+done
+
+if [ "$LIST" -eq 0 ] && [ "$SELFTEST" -eq 0 ]; then
+  # Same rule as nsaccept/guard.py: never the production project, only disposable prefixes.
+  proj="$(printf '%s' "${COMPOSE:-${NS_COMPOSE_PROJECT:-}}" | tr '[:upper:]' '[:lower:]' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+  if [ -n "$proj" ]; then
+    [ "$proj" != "neuralscape" ] || die "refusing compose project 'neuralscape' (production)"
+    ok=0
+    IFS=',' read -ra prefixes <<<"${NS_COMPOSE_ALLOWLIST:-nstest-}"
+    for pre in "${prefixes[@]}"; do
+      pre="$(printf '%s' "$pre" | tr '[:upper:]' '[:lower:]' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+      [ -n "$pre" ] && case "$proj" in "$pre"*) ok=1 ;; esac
+    done
+    [ "$ok" -eq 1 ] || die "refusing compose project '$proj': not a disposable project (allowed prefixes: ${NS_COMPOSE_ALLOWLIST:-nstest-})"
+  fi
+  [ -n "$BASE_URL" ] || { usage >&2; die "base URL required"; }
+  [ -f "$HERE/profiles/$PROFILE.env" ] || die "unknown profile '$PROFILE' (no $HERE/profiles/$PROFILE.env)"
+  # A profile that declares `# requires: compose` cannot be run without a compose project: its scenarios would
+  # skip silently, and a skipped scenario is never evidence.
+  if grep -qiE '^#[[:space:]]*requires:.*compose' "$HERE/profiles/$PROFILE.env" && [ -z "$proj" ]; then
+    die "profile '$PROFILE' requires --compose-project (or NS_COMPOSE_PROJECT): without it its scenarios would be skipped, not proven"
+  fi
+fi
+
+# ── environment ────────────────────────────────────────────────
+PY=()
+# uv is the preferred (and, on a bare gate box, the only) Python tooling: it may
+# download a managed CPython, which is allowed. $NS_UV points at a standalone binary.
+UV="${NS_UV:-uv}"
+if "$UV" --version >/dev/null 2>&1; then
+  PY=("$UV" run --no-project --quiet --python 3.12 --with-requirements "$HERE/requirements.txt" python)
+else
+  PYBIN=""
+  for cand in python3 python; do
+    if command -v "$cand" >/dev/null 2>&1 && "$cand" -c 'import sys; sys.exit(0 if sys.version_info >= (3,10) else 1)' 2>/dev/null; then
+      PYBIN="$cand"; break
+    fi
+  done
+  [ -n "$PYBIN" ] || die "need either 'uv' or python3 >= 3.10 on PATH"
+  if command -v sha256sum >/dev/null 2>&1; then KEY="$(sha256sum "$HERE/requirements.txt" | cut -c1-16)"
+  else KEY="$(shasum -a 256 "$HERE/requirements.txt" | cut -c1-16)"; fi
+  VENV="${XDG_CACHE_HOME:-$HOME/.cache}/ns-acceptance-venv/$KEY"
+  if [ ! -x "$VENV/bin/python" ]; then
+    mkdir -p "$(dirname "$VENV")"
+    "$PYBIN" -m venv "$VENV" >&2 || die "could not create venv at $VENV"
+    "$VENV/bin/python" -m pip install --quiet -r "$HERE/requirements.txt" >&2 \
+      || { rm -rf "$VENV"; die "pip install failed"; }
+  fi
+  PY=("$VENV/bin/python")
+fi
+
+if [ -n "${NS_ENV_SELECT_ONLY:-}" ]; then printf '%s\n' "${PY[@]}"; exit 0; fi  # self-test hook
+
+export PYTHONPATH="$HERE${PYTHONPATH:+:$PYTHONPATH}"
+export PYTHONDONTWRITEBYTECODE=1
+
+if [ "$SELFTEST" -eq 1 ]; then
+  exec "${PY[@]}" -m pytest -c "$HERE/pytest.ini" --rootdir "$HERE" "$HERE/selftest" -q -p no:cacheprovider
+fi
+
+ARGS=(-m pytest -c "$HERE/pytest.ini" --rootdir "$HERE" "$HERE/scenarios"
+      -p nsaccept.pytest_plugin -p no:cacheprovider -q
+      --ns-profile "$PROFILE")
+[ -n "$BASE_URL" ] && ARGS+=(--ns-base-url "$BASE_URL")
+[ -n "$COMPOSE" ] && ARGS+=(--ns-compose-project "$COMPOSE")
+[ -n "$OUT" ] && ARGS+=(--ns-out "$OUT")
+[ -n "$KEXPR" ] && ARGS+=(-k "$KEXPR")
+
+if [ "$LIST" -eq 1 ]; then
+  TMP="$(mktemp "${TMPDIR:-/tmp}/ns-accept-list.XXXXXX")"
+  trap 'rm -f "$TMP"' EXIT
+  "${PY[@]}" "${ARGS[@]}" --ns-list-out "$TMP" >&2
+  rc=$?
+  # exit 5 = "no tests collected" which is what a list run always ends with
+  { [ "$rc" -eq 0 ] || [ "$rc" -eq 5 ]; } || exit 2
+  cat "$TMP"
+  exit 0
+fi
+
+"${PY[@]}" "${ARGS[@]}"
+rc=$?
+case "$rc" in
+  0) exit 0 ;;
+  5) echo "run.sh: no scenarios selected (profile '$PROFILE', -k '$KEXPR')" >&2; exit 2 ;;
+  1) exit 1 ;;
+  *) exit 2 ;;
+esac

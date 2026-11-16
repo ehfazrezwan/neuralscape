@@ -5,7 +5,10 @@ nodes/edges under a target code_space. Reads the compressed SQLite database,
 extracts symbols and relationships, and writes them into Neo4j using the same
 label-space schema as NativeEngine.
 
-CBM schema (synthesized from typical code-graph databases):
+CBM schema (ASSUMED, synthesized from typical code-graph databases; NOT verified
+against a real CBM store, whose tables are nodes/edges/projects/file_hashes/
+node_vectors/token_vectors/project_summaries but whose column names are not
+recorded in this repo. A database whose columns differ is rejected up front):
   - nodes table: id, fqn, kind, file, line, end_line, docstring
   - edges table: source_id, target_id, relation, extraction
 
@@ -40,6 +43,13 @@ MAX_SQLITE_SIZE = 100 * 1024 * 1024  # 100 MB SQLite after decompression
 ALLOWED_RELATIONS = frozenset(
     {"CALLS", "IMPORTS", "DEFINES", "INHERITS", "REFERENCES"}
 )
+
+
+# Columns the importer reads (an ASSUMED schema; not verified against real CBM).
+_ASSUMED_COLUMNS = {
+    "nodes": ("id", "fqn", "kind", "file", "line", "end_line", "docstring"),
+    "edges": ("source_id", "target_id", "relation", "extraction"),
+}
 
 
 class CBMImportError(Exception):
@@ -113,6 +123,19 @@ def _validate_sqlite(db_path: Path):
             raise CBMImportError(
                 f"SQLite database missing expected tables. Found: {tables}"
             )
+        # The columns below are what this importer ASSUMES (see module docstring).
+        # A real CBM store has the same table names but may name its columns
+        # differently; fail with a clear message instead of an opaque
+        # "no such column" mid-import.
+        for table, expected in _ASSUMED_COLUMNS.items():
+            found = {row[1] for row in cursor.execute(f"PRAGMA table_info({table})")}
+            missing = sorted(set(expected) - found)
+            if missing:
+                raise CBMImportError(
+                    f"SQLite table {table!r} lacks the columns this importer assumes "
+                    f"({', '.join(missing)}); found {sorted(found)}. The importer's "
+                    "schema is assumed, not verified against a real CBM store."
+                )
     except sqlite3.DatabaseError as e:
         raise CBMImportError(f"Not a valid SQLite database: {e}") from e
     finally:

@@ -14,12 +14,12 @@ from mem0.embeddings.base import EmbeddingBase
 
 logger = logging.getLogger(__name__)
 
-# NS fork: some OpenAI-compatible backends (e.g. a Vertex gemini-embedding-001
+# NEURALSCAPE PATCH: some OpenAI-compatible backends (e.g. a Vertex gemini-embedding-001
 # gateway endpoint) accept only ONE input per embeddings request and reject
 # batched input with a message like "accepts only one input per request".
 _SINGLE_INPUT_REJECTION_RE = re.compile(r"\b(?:only\s+)?(?:one|single|1)\s+input\b", re.IGNORECASE)
 
-# NS fork (audit 27 #20): with a single-input-only backend a multi-text batch
+# NEURALSCAPE PATCH (audit 27 #20): with a single-input-only backend a multi-text batch
 # used to be N strictly-serial HTTP round trips (a 40-fact conversation ≈
 # 4-16s inside one worker slot). Per-item calls now fan out onto a small
 # shared thread pool. Module-level + lazily created so importing mem0 never
@@ -140,7 +140,7 @@ class OpenAIEmbedding(EmbeddingBase):
         """Embed multiple texts, chunking into batched OpenAI API calls.
 
         Chunk size defaults to 100 (API limit) and can be lowered via
-        ``config.embedding_batch_size`` — NS fork: OpenAI-compatible backends
+        ``config.embedding_batch_size`` — NEURALSCAPE PATCH: OpenAI-compatible backends
         that accept only one input per request (e.g. a Vertex
         gemini-embedding-001 gateway endpoint) need ``embedding_batch_size=1``.
         As a safety net, a batched call rejected with a single-input error is
@@ -159,7 +159,7 @@ class OpenAIEmbedding(EmbeddingBase):
         max_batch = max(1, min(configured or self.DEFAULT_MAX_BATCH, self.DEFAULT_MAX_BATCH))
         texts = [text.replace("\n", " ") for text in texts]
         if max_batch == 1 and len(texts) > 1:
-            # NS fork (audit 27 #20): single-input-only backend + multi-text
+            # NEURALSCAPE PATCH (audit 27 #20): single-input-only backend + multi-text
             # batch → bounded parallel fan-out instead of N serial round trips.
             return self._embed_singles_parallel(texts)
         all_embeddings = []

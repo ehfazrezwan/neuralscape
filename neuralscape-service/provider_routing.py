@@ -15,6 +15,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 _APPLIED: list[str] = []
+_ORIGINAL_INIT: list = []
 
 
 def apply_gemini_base_url(base_url: str) -> bool:
@@ -33,6 +34,7 @@ def apply_gemini_base_url(base_url: str) -> bool:
     from google.genai import types
 
     original = genai.Client.__init__
+    _ORIGINAL_INIT.append(original)
 
     def routed(self, *args, **kwargs):
         options = kwargs.get("http_options")
@@ -52,4 +54,28 @@ def apply_gemini_base_url(base_url: str) -> bool:
     return True
 
 
-__all__ = ["apply_gemini_base_url"]
+def apply_from_settings(settings) -> bool:
+    """Apply the configured override; a no-op (``False``) when the setting is unset or not a string.
+
+    Called from every place a process builds its first provider client (API start-up, the worker start-up
+    and the service's lazy client construction), so the API, every worker queue and a stdio MCP process are
+    routed alike.  Idempotent for the same URL.
+    """
+
+    value = getattr(settings, "ns_gemini_base_url", "")
+    return apply_gemini_base_url(value) if isinstance(value, str) else False
+
+
+def reset() -> None:
+    """Undo the override (tests only): restore the SDK's own constructor."""
+
+    if not _APPLIED:
+        return
+    from google import genai
+
+    genai.Client.__init__ = _ORIGINAL_INIT[0]  # type: ignore[method-assign]
+    _APPLIED.clear()
+    _ORIGINAL_INIT.clear()
+
+
+__all__ = ["apply_from_settings", "apply_gemini_base_url", "reset"]

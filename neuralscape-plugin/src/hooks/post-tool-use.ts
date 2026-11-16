@@ -130,10 +130,16 @@ export function shouldCapture(input: HookInput): boolean {
 /** Build the observation row that gets appended to the per-session buffer.
  *  `<private>…</private>` spans are redacted BEFORE anything hits disk (D4). */
 export function buildObservationRow(input: HookInput): Record<string, unknown> {
-  const picked = pickRelevantInput(input.tool_name!, input.tool_input);
-  for (const [k, v] of Object.entries(picked)) {
-    if (typeof v === "string") picked[k] = redactPrivate(v);
-  }
+  // Redact the whole input values BEFORE pickRelevantInput elides them: a <private> span cut by the elision would
+  // otherwise keep its first half. Fail closed: an unclosed opener redacts to the end of the value.
+  const rawInput = input.tool_input;
+  const redactedInput: Record<string, unknown> | undefined =
+    rawInput && typeof rawInput === "object"
+      ? Object.fromEntries(
+          Object.entries(rawInput).map(([k, v]) => [k, typeof v === "string" ? redactPrivate(v, { failClosed: true }) : v]),
+        )
+      : undefined;
+  const picked = pickRelevantInput(input.tool_name!, redactedInput);
   return {
     ts: new Date().toISOString(),
     session_id: input.session_id || "unknown",
@@ -142,7 +148,10 @@ export function buildObservationRow(input: HookInput): Record<string, unknown> {
     user_id: getUserId(),
     tool: input.tool_name,
     input: picked,
-    output: redactPrivate(truncateOutput(asString(input.tool_output))),
+    // Claude Code sends the result as `tool_response` (string or object);
+    // `tool_output` is a legacy fallback. Redact BEFORE truncating so a
+    // <private> span split by the elision cannot leak its kept half.
+    output: truncateOutput(redactPrivate(asString(input.tool_response ?? input.tool_output), { failClosed: true })),
   };
 }
 
