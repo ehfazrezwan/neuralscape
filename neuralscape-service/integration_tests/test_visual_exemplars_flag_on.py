@@ -154,11 +154,26 @@ def test_flags_on_the_figure_is_stored_described_indexed_and_downloadable(flags,
     assert summary["described"] is True and summary["setup_name"] == "Kangaroo Tail"
     assert env.vision.calls == 1
 
-    # the memory: setup category, tagged, body is the description, source_ref points at the stored image
+    # the text ingest still happened: passages in the book's reference workspace, traced to the upload
+    assert out["passages"] >= 1 and out["facts"] == 0
+    passages = [r for r in env.svc._scroll_all_user_memories(env.user)
+                if (r["payload"].get("metadata") or {}).get("category") == "domain_knowledge"]
+    assert len(passages) == out["passages"]
+    for r in passages:
+        m = r["payload"]["metadata"]
+        assert m["workspace"] == "ref-trading_strategy--kangaroo-book"
+        assert m["source_ref"]["connector_id"] == "file_upload" and m["source_ref"]["external_id"] == "kangaroo-book-sha"
+        assert m["source_ref"].get("chunk_index") is not None
+    assert not any("data:image" in r["payload"]["data"] for r in passages), "figure bytes leaked into the passages"
+
+    # the memory: setup category, tagged, body is the stubbed vision description verbatim
     (row,) = _exemplar_rows(env, env.user)
     meta = row["payload"]["metadata"]
     assert "visual_exemplar" in (meta.get("tags") or []) and "strategy:kangaroo" in meta["tags"]
-    assert "Kangaroo Tail" in row["payload"]["data"] and "Visual exemplar" in row["payload"]["data"]
+    body = row["payload"]["data"]
+    assert body.startswith("Visual exemplar \u2014 bullish Kangaroo Tail.")
+    assert "Long lower tail rejecting a support zone with room to the left." in body
+    assert "Chart: H4" in body and "Caption: Figure 3.1" in body
     image_id = image_hash(env.png)
     assert meta["source_ref"]["external_id"] == image_id
     stored = meta["source_ref"]["stored_path"]

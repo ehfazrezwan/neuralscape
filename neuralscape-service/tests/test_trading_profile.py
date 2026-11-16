@@ -36,9 +36,18 @@ def test_adapter_name_and_registry_entry():
 def test_twelve_trading_categories_with_descriptions():
     assert set(profile.TRADING_CATEGORIES) == EXPECTED_CATEGORIES
     assert len(profile.TRADING_CATEGORIES) == 12
+    keyword = {
+        "strategy": "strategy container", "setup": "tradable pattern", "entry_rule": "trigger",
+        "exit_rule": "trade management", "stop_rule": "Stop-loss", "take_profit_rule": "target",
+        "market_condition": "Regime", "sr_concept": "Support/resistance", "risk_rule": "sizing",
+        "psychology_rule": "Discipline", "checklist": "routine", "glossary": "Definitions",
+    }
+    assert set(keyword) == EXPECTED_CATEGORIES
     for name, desc in profile.TRADING_CATEGORIES.items():
         assert re.fullmatch(r"[a-z_]+", name)
-        assert desc.strip(), f"{name} has no description"
+        assert keyword[name].lower() in desc.lower(), f"{name}: description lost its meaning: {desc!r}"
+    assert profile.TRADING_CATEGORIES["setup"].startswith("A tradable pattern/catalyst")
+    assert profile.TRADING_CATEGORIES["glossary"].startswith("Definitions + aliases")
     assert profile.TRADING_ADAPTER.categories == profile.TRADING_CATEGORIES
     assert profile.TRADING_ADAPTER.categories is not profile.TRADING_CATEGORIES  # a copy, not an alias
 
