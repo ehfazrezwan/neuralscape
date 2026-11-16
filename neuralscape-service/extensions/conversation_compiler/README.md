@@ -39,7 +39,6 @@ All via environment variables:
 | `COMPILER_LLM_MODEL` | (NeuralScape default) | Gemini model for extraction/compilation |
 | `COMPILE_AFTER_HOUR` | `18` | Hour (24h) after which auto-compilation runs |
 | `AUTO_COMPILE` | `true` | Whether to auto-compile daily logs |
-| `NEURALSCAPE_URL` | `http://localhost:8199` | NeuralScape API URL |
 
 ## API Endpoints
 
