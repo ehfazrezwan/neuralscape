@@ -82,33 +82,46 @@ export function asString(v: unknown): string {
   }
 }
 
+/** Render one typed content block (MCP / Claude content-block shapes) by its content. */
+function renderBlock(block: Record<string, unknown>): string {
+  const type = block.type as string;
+  if (type === "text") return typeof block.text === "string" ? block.text : asString(block);
+  if (type === "image" || type === "audio") return `[${type}]`;
+  if (type === "resource") {
+    const r = block.resource as Record<string, unknown> | undefined;
+    if (r && typeof r === "object") {
+      const uri = typeof r.uri === "string" ? r.uri : "";
+      if (typeof r.text === "string") return uri ? `[resource ${uri}] ${r.text}` : r.text;
+      return uri ? `[resource ${uri}]` : "[resource]";
+    }
+  }
+  return asString(block);
+}
+
 /**
- * Render a tool result by shape. Text blocks (MCP results) become their joined text; non-text
- * blocks become a short `[<type>]` placeholder (never raw JSON, so image data cannot bloat the
- * buffer); empty values ({}, [], "", null) become empty output; a Bash-style result that was
- * interrupted keeps its stdout/stderr text plus an explicit `[interrupted]` marker; any other
- * value is JSON as before. Redaction runs on the rendered text, before truncation.
+ * Render a tool result by shape. Typed content blocks (MCP results) become their content: text
+ * as is, an embedded resource as its text labelled with its uri, image/audio as a `[type]`
+ * placeholder (binary is not useful and would bloat the buffer), any other block as its JSON;
+ * empty values ({}, [], "", null) become empty output; a Bash-style result (a boolean
+ * `interrupted` plus stdout/stderr) becomes its stdout/stderr text, with an explicit
+ * `[interrupted]` marker when it was interrupted; any other value is JSON. Redaction runs on
+ * the rendered text, before truncation.
  */
 export function renderToolResponse(v: unknown): string {
   if (v == null) return "";
   if (typeof v === "string") return v;
   if (Array.isArray(v)) {
     if (v.length > 0 && v.every((b) => b && typeof b === "object" && typeof (b as { type?: unknown }).type === "string")) {
-      return v
-        .map((b) => {
-          const block = b as { type: string; text?: unknown };
-          return block.type === "text" && typeof block.text === "string" ? block.text : `[${block.type}]`;
-        })
-        .join("\n");
+      return v.map((b) => renderBlock(b as Record<string, unknown>)).join("\n");
     }
     return v.length === 0 ? "" : asString(v);
   }
   if (typeof v === "object") {
     const o = v as Record<string, unknown>;
     if (Object.keys(o).length === 0) return "";
-    if (o.interrupted === true && ("stdout" in o || "stderr" in o)) {
+    if (typeof o.interrupted === "boolean" && ("stdout" in o || "stderr" in o)) {
       const parts = [o.stdout, o.stderr].filter((x): x is string => typeof x === "string" && x !== "");
-      return [...parts, "[interrupted]"].join("\n");
+      return (o.interrupted ? [...parts, "[interrupted]"] : parts).join("\n");
     }
   }
   return asString(v);

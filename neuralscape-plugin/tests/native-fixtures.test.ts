@@ -123,7 +123,7 @@ describe("local buffer persistence of captured events", () => {
     const lines = text.split("\n").filter(Boolean);
     expect(lines).toHaveLength(rows.length);
     lines.forEach((line, i) => expect(JSON.parse(line).output).toBe(rows[i].output));
-  }, 30_000);
+  }, 15_000) // ~2 s unthrottled; generous because throttled/shared runs are slow;
 
   it("a torn final line (an interrupted write) does not hide the complete rows before it", async () => {
     const { appendFile } = await import("node:fs/promises");
