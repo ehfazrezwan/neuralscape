@@ -179,7 +179,17 @@ class FakeGraph:
 
             async def run(self_inner, cypher, **params):
                 graph.calls.append(cypher)
-                if "count(r) AS total" in cypher:
+                if "collect(r.fact) AS facts" in cypher:
+                    by_ep: dict[str, list[str]] = {}
+                    for e in graph.edges.values():
+                        if e["group_id"] != params["group_id"]:
+                            continue
+                        if e["invalid_at"] is None and e["expired_at"] is None:
+                            for ep in e["episodes"]:
+                                if ep in params["episode_uuids"]:
+                                    by_ep.setdefault(ep, []).append(e["fact"])
+                    rows = [{"episode_uuid": k, "facts": v} for k, v in by_ep.items()]
+                elif "count(r) AS total" in cypher:
                     eps = [
                         e for e in graph.edges.values()
                         if e["group_id"] == params["group_id"]
@@ -298,6 +308,9 @@ class TestSingleRowEpisode:
         qdrant.add("new", user="u1", data="x")
         graph.add_edge("E1", "User lives in Berlin", ["ep-old"])
         graph.add_edge("E2", "User works at Acme", ["ep-old"])  # still live
+        # distinct, realistic: both edges ~0.88-0.90 to the row (inside the margin)
+        svc._embed_map["User lives in Berlin"] = [0.90, 0.436, 0.0]
+        svc._embed_map["User works at Acme"] = [0.88, 0.0, 0.475]
         svc._memory.graph.add.side_effect = _graph_add(graph, episode_uuid="ep-new", invalidate=["E1"])
 
         _enrich(svc)
@@ -341,6 +354,137 @@ class TestSingleRowEpisode:
 
         svc._memory.graph.add.side_effect = _add
         _enrich(svc)
+        assert not qdrant.meta("old").get("dream_tombstoned")
+
+    def test_one_fact_two_edges_dead_main_claim_supersedes_row(self, env):
+        """Real-store shape (gate): "Alice lives in Paris, France." yields TWO
+        edges from one episode; Graphiti invalidates the residence edge only.
+        The incidental "Paris is a city in France" edge stays live, and the
+        row must still be superseded because the dead edge is its main claim."""
+        svc, qdrant, graph = env
+        qdrant.add("old", user="u1", data="Alice lives in Paris, France.",
+                   metadata={"graph_episode_uuid": "ep-old", "graph_episode_kind": "fact"},
+                   vector=[1.0, 0.0, 0.0])
+        qdrant.add("new", user="u1", data="Alice moved to London and no longer lives in Paris.")
+        graph.add_edge("E1", "Alice resides in the city of Paris.", ["ep-old"])
+        graph.add_edge("E2", "Paris is a city situated in France.", ["ep-old"])  # stays live
+        svc._embed_map["Alice resides in the city of Paris."] = [0.95, 0.05, 0.0]
+        svc._embed_map["Paris is a city situated in France."] = [0.2, 0.0, 0.98]
+        svc._memory.graph.add.side_effect = _graph_add(graph, episode_uuid="ep-new", invalidate=["E1"])
+
+        _enrich(svc)
+
+        assert qdrant.meta("old")["dream_tombstoned"] is True
+        assert qdrant.meta("old")["superseded_edge_uuids"] == ["E1"]
+        decide = [t for t in svc._supersession_diag["new"]["trace"] if t["stage"] == "decide"]
+        assert decide and decide[0]["mode"] == "single_fact_partial" and decide[0]["supersede"] is True
+
+    def _partial_setup(self, env, dead_vec, live_vec, row_vec=(1.0, 0.0, 0.0)):
+        svc, qdrant, graph = env
+        qdrant.add("old", user="u1", data="Alice lives in Paris and works at Acme.",
+                   metadata={"graph_episode_uuid": "ep-old", "graph_episode_kind": "fact"},
+                   vector=list(row_vec))
+        qdrant.add("new", user="u1", data="x")
+        graph.add_edge("E1", "Alice works at Acme.", ["ep-old"])  # dead
+        graph.add_edge("E2", "Alice resides in Paris.", ["ep-old"])  # live
+        svc._embed_map["Alice works at Acme."] = list(dead_vec)
+        svc._embed_map["Alice resides in Paris."] = list(live_vec)
+        svc._memory.graph.add.side_effect = _graph_add(graph, episode_uuid="ep-new", invalidate=["E1"])
+        return svc, qdrant
+
+    def test_compound_row_with_realistic_close_cosines_is_left_alone(self, env):
+        """Both edges ~0.85-0.9 to the row, inside the margin: embedding noise."""
+        svc, qdrant = self._partial_setup(env, [0.88, 0.47, 0.0], [0.86, 0.0, 0.51])
+        _enrich(svc)
+        assert not qdrant.meta("old").get("dream_tombstoned")
+
+    def test_both_edges_near_085_with_modest_margin_is_left_alone(self, env):
+        # dead 0.86 vs live 0.84: at the floor but margin 0.02 < 0.05
+        svc, qdrant = self._partial_setup(env, [0.86, 0.51, 0.0], [0.84, 0.0, 0.54])
+        _enrich(svc)
+        assert not qdrant.meta("old").get("dream_tombstoned")
+
+    def test_dead_edge_clearly_above_floor_and_margin_supersedes(self, env):
+        # dead 0.92 vs live 0.80 (realistic): above floor 0.85, margin 0.12
+        svc, qdrant = self._partial_setup(env, [0.92, 0.392, 0.0], [0.8, 0.0, 0.6])
+        _enrich(svc)
+        assert qdrant.meta("old")["dream_tombstoned"] is True
+
+    def test_dead_edge_below_the_floor_is_not_enough_even_with_margin(self, env):
+        """Beats the live edge by far but only cos 0.5 to the row: not its claim."""
+        svc, qdrant = self._partial_setup(env, [0.5, 0.87, 0.0], [0.0, 0.0, 1.0])
+        _enrich(svc)
+        assert not qdrant.meta("old").get("dream_tombstoned")
+
+    def test_partial_floor_default_is_pinned_at_085(self):
+        from config import Settings
+
+        assert Settings.model_fields["graph_supersession_partial_min_similarity"].default == 0.85
+
+    def test_dead_edge_at_084_with_a_big_margin_is_left_alone(self, env):
+        svc, qdrant = self._partial_setup(env, [0.84, 0.5426, 0.0], [0.0, 0.0, 1.0])
+        _enrich(svc)
+        assert not qdrant.meta("old").get("dream_tombstoned")
+
+    def test_dead_edge_at_086_with_the_margin_supersedes(self, env):
+        svc, qdrant = self._partial_setup(env, [0.86, 0.5103, 0.0], [0.0, 0.0, 1.0])
+        _enrich(svc)
+        assert qdrant.meta("old")["dream_tombstoned"] is True
+
+    def test_embedder_failure_leaves_the_row(self, env):
+        svc, qdrant = self._partial_setup(env, [1.0, 0.0, 0.0], [0.0, 0.0, 1.0])
+        svc._memory.embedding_model.embed.side_effect = RuntimeError("embed down")
+        assert _enrich(svc) is True
+        assert not qdrant.meta("old").get("dream_tombstoned")
+
+    def test_vector_length_mismatch_leaves_the_row(self, env):
+        svc, qdrant = self._partial_setup(env, [1.0, 0.0], [0.0, 0.0, 1.0])
+        _enrich(svc)
+        assert not qdrant.meta("old").get("dream_tombstoned")
+        ev = [t for t in svc._supersession_diag["new"]["trace"] if t["stage"] == "decide"][0]
+        assert "mismatch" in ev["error"]
+
+    def test_missing_stored_vector_falls_back_to_embedding_the_row_text(self, env):
+        svc, qdrant = self._partial_setup(env, [0.95, 0.31, 0.0], [0.5, 0.0, 0.87])
+        svc._embed_map["Alice lives in Paris and works at Acme."] = [1.0, 0.0, 0.0]
+        svc._fetch_dense_vectors = MagicMock(return_value={})
+        _enrich(svc)
+        assert qdrant.meta("old")["dream_tombstoned"] is True
+
+    def test_embeddings_are_cached_per_call(self, env):
+        svc, qdrant = self._partial_setup(env, [0.95, 0.31, 0.0], [0.5, 0.0, 0.87])
+        svc._graphiti.driver.add_edge("E3", "Alice works at Acme.", ["ep-old"])  # same dead fact text
+        svc._memory.graph.add.side_effect = _graph_add(
+            svc._graphiti.driver, episode_uuid="ep-new", invalidate=["E1", "E3"])
+        _enrich(svc)
+        texts = [c.args[0] for c in svc._memory.embedding_model.embed.call_args_list]
+        # two dead edges x one row: each distinct fact embedded exactly once
+        assert sorted(texts) == ["Alice resides in Paris.", "Alice works at Acme."], texts
+
+    def test_diagnostics_are_per_call_not_a_shared_singleton(self, env):
+        svc, qdrant, graph = env
+        qdrant.add("new", user="u1", data="x")
+        svc._memory.graph.add.side_effect = _graph_add(graph, episode_uuid="ep-a")
+        _enrich(svc, memory_id="new")
+        qdrant.add("new2", user="u1", data="y")
+        svc._memory.graph.add.side_effect = _graph_add(graph, episode_uuid="ep-b")
+        _enrich(svc, memory_id="new2")
+        assert set(svc._supersession_diag) == {"new", "new2"}
+
+    def test_dead_edge_that_is_not_the_rows_main_claim_leaves_the_row(self, env):
+        svc, qdrant, graph = env
+        qdrant.add("old", user="u1", data="Alice lives in Paris, France.",
+                   metadata={"graph_episode_uuid": "ep-old", "graph_episode_kind": "fact"},
+                   vector=[1.0, 0.0, 0.0])
+        qdrant.add("new", user="u1", data="x")
+        graph.add_edge("E1", "Alice once visited Rome.", ["ep-old"])  # dead, unrelated to the row
+        graph.add_edge("E2", "Alice resides in the city of Paris.", ["ep-old"])  # live, main claim
+        svc._embed_map["Alice once visited Rome."] = [0.0, 0.0, 1.0]
+        svc._embed_map["Alice resides in the city of Paris."] = [0.97, 0.0, 0.1]
+        svc._memory.graph.add.side_effect = _graph_add(graph, episode_uuid="ep-new", invalidate=["E1"])
+
+        _enrich(svc)
+
         assert not qdrant.meta("old").get("dream_tombstoned")
 
     def test_delete_cascade_expiry_is_not_a_contradiction(self, env):

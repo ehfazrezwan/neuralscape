@@ -637,15 +637,6 @@ class TestV1PatchMemory:
         assert detail["error"] == "revision_conflict"
         assert (detail["expected_revision"], detail["current_revision"]) == ("3", "5")
 
-    def test_a_busy_row_maps_to_409_and_an_unavailable_lock_to_503(self, client, mock_service):
-        from memory.edit import EditBusy, EditLockUnavailable
-
-        mock_service.patch_memory.side_effect = EditBusy("m1")
-        resp = client.patch("/v1/memories/m1", json={"tags": ["x"]})
-        assert resp.status_code == 409 and resp.json()["detail"]["error"] == "edit_busy"
-        mock_service.patch_memory.side_effect = EditLockUnavailable("redis down; nothing was written")
-        assert client.patch("/v1/memories/m1", json={"tags": ["x"], "expected_revision": "0"}).status_code == 503
-
     def test_expected_revision_alone_is_still_an_empty_patch(self, client, mock_service):
         resp = client.patch("/v1/memories/m1", json={"expected_revision": "1"})
         assert resp.status_code == 400

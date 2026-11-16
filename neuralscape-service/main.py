@@ -38,7 +38,7 @@ from extensions import ExtensionRegistry
 from extensions.events import EventType, EVENT_PAYLOAD_MODELS
 from logging_config import REQUEST_ID_HEADER, RequestIdMiddleware, configure_logging, request_id_of
 from memory.delete import MemoryListingFailed
-from memory.edit import EditBusy, EditLockUnavailable, RevisionConflict
+from memory.edit import RevisionConflict
 from memory_service import get_shared_service
 
 # Configure structured logging before anything else
@@ -169,6 +169,8 @@ async def lifespan(app: FastAPI):
     await asyncio.to_thread(warmup_extraction)
     # Connect task manager to Redis
     await _task_manager.connect()
+    # The routed vector engine (off unless ENGINE_ROUTING_ENABLED): built over the ledger just opened.
+    await _start_engine_switch()
 
     # Discover and start extensions
     await _extension_registry.discover()
@@ -220,6 +222,7 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"Error during shutdown: {e}")
 
+    await _stop_engine_switch()
     await _task_manager.close()
     logger.info("Neuralscape Service stopped.")
 
@@ -1865,6 +1868,7 @@ async def v1_register_connector(req: ConnectorConfigRequest, request: Request):
     disabled) a replacement may change the owner; the vault then starts a new
     instance with fresh sync state.
     """
+    from connectors.destination import validate_connector_destinations
     from connectors.stdio_policy import ConnectorConfigError, validate_mcp_config
     from connectors.vault import ConnectorOwnedElsewhere
 
@@ -1879,6 +1883,15 @@ async def v1_register_connector(req: ConnectorConfigRequest, request: Request):
                 req.connector_id, _resolve_user_id(request, None),
             )
             raise HTTPException(status_code=422, detail=str(e))
+    try:
+        await validate_connector_destinations(req.connector_type, req.config, settings.connector_allowed_hosts_set())
+    except ConnectorConfigError as e:
+        # Ids and the refusal category only: the URL is caller-chosen and may carry credentials.
+        logger.warning(
+            "Connector destination refused at registration: connector_id=%s owner=%s reason=%s",
+            req.connector_id, _resolve_user_id(request, None), getattr(e, "reason", None),
+        )
+        raise HTTPException(status_code=422, detail=str(e))
     resolved_user_id = _resolve_user_id(request, None)
     record = req.model_dump(mode="json", exclude_none=True)
     record["owner_user_id"] = resolved_user_id
@@ -3074,10 +3087,6 @@ async def v1_patch_memory(memory_id: str, req: PatchMemoryRequest, request: Requ
                 "current_revision": rc.current_revision,
             },
         ) from rc
-    except EditBusy as eb:
-        raise HTTPException(status_code=409, detail={"error": "edit_busy", "message": str(eb)}) from eb
-    except EditLockUnavailable as eu:
-        raise HTTPException(status_code=503, detail=str(eu)) from eu
     except LookupError as e:
         raise HTTPException(status_code=404, detail=str(e)) from e
     except PermissionError as pe:
@@ -3471,7 +3480,7 @@ class ProjectKnowledgeConfigRequest(BaseModel):
 
     project_id: str
     code_systems: list[str] | None = None
-    fuse_code_into_recall: bool = True  # DEFAULT TRUE per decision #3
+    fuse_code_into_recall: bool | None = None  # unset keeps the stored value (default TRUE)
     default_engine: str | None = None
 
 
@@ -3482,6 +3491,8 @@ class ProjectKnowledgeConfigResponse(BaseModel):
     code_systems: list[str]
     fuse_code_into_recall: bool
     default_engine: str | None
+    code_space: str | None = None  # set by indexing; read-only here
+    op_preference: dict[str, list[str]] | None = None
 
 
 @v1_router.get("/projects/{project_id}/knowledge-config", response_model=ProjectKnowledgeConfigResponse)
@@ -3503,6 +3514,8 @@ async def v1_get_project_knowledge_config(project_id: str):
         code_systems=config.code_systems,
         fuse_code_into_recall=config.fuse_code_into_recall,
         default_engine=config.default_engine,
+        code_space=config.code_space,
+        op_preference=config.op_preference,
     )
 
 
@@ -3521,20 +3534,22 @@ async def v1_set_project_knowledge_config(
             status_code=403,
             detail=f"User {user_id!r} is not authorized to set project knowledge config.",
         )
-    from knowledge.router import ProjectKnowledgeConfig, set_project_config
+    from knowledge.router import KnowledgeConfigStoreError, merge_project_config
 
-    config = ProjectKnowledgeConfig(
-        project_id=project_id,
-        code_systems=req.code_systems or [],
-        fuse_code_into_recall=req.fuse_code_into_recall,
-        default_engine=req.default_engine,
-    )
-    set_project_config(config)
+    # Only the fields the caller sent change; code_space/op_preference survive.
+    # An explicit null default_engine clears it.
+    sent = req.model_dump(exclude_unset=True, exclude={"project_id"})
+    try:
+        config = merge_project_config(project_id, **sent)
+    except KnowledgeConfigStoreError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     return ProjectKnowledgeConfigResponse(
         project_id=config.project_id,
         code_systems=config.code_systems,
         fuse_code_into_recall=config.fuse_code_into_recall,
         default_engine=config.default_engine,
+        code_space=config.code_space,
+        op_preference=config.op_preference,
     )
 
 
@@ -3814,6 +3829,113 @@ async def v1_disable_service_account(subject_id: str, request: Request):
         _credential_errors, lambda: service.disable_service_account(subject_id, controller)
     )
     return {"disabled": True, "changed": changed}
+
+
+# ── Engine switch (privileged; default off: ENGINE_ROUTING_ENABLED) ──────────────
+#
+# Moves the routed vector engine between generations: status, start-dual-write,
+# catch-up, flip, rollback, abandon.  Dictator-only like the other admin routes;
+# 404 while the feature is off, 503 (with the reason) when it is on but this
+# process could not build the switch at startup.
+
+
+def _engine_tenant_for(user_id: str) -> str | None:
+    producer = getattr(_task_manager, "producer", None)
+    return None if producer is None else producer.tenant_for(user_id)
+
+
+def _engine_embed(text: str) -> list[float]:
+    return _service._get_memory().embedding_model.embed(text)
+
+
+async def _start_engine_switch() -> None:
+    """Build this process's engine switch at startup (only when ENGINE_ROUTING_ENABLED is set)."""
+
+    if settings.engine_routing_enabled is not True:
+        return
+    import engine_adapters_switch
+
+    # The service's own Qdrant client is shared (a local on-disk Qdrant admits one client per folder).
+    store = getattr(_service._get_memory(), "vector_store", None)
+    await asyncio.to_thread(
+        engine_adapters_switch.start,
+        settings,
+        ledger=getattr(_task_manager, "ledger", None),
+        service=_service,
+        tenant_for=_engine_tenant_for,
+        embed=_engine_embed,
+        qdrant_client=getattr(store, "client", None),
+    )
+
+
+async def _stop_engine_switch() -> None:
+    import sys
+
+    module = sys.modules.get("engine_adapters_switch")  # never imported: nothing was started
+    if module is not None:
+        await asyncio.to_thread(module.stop)
+
+
+def _engine_switch_or_error():
+    from engine_adapters_switch import get_switch, unavailable_reason
+
+    switch = get_switch()
+    if switch is None:
+        raise HTTPException(status_code=503, detail={"error": {
+            "code": "engine_switch_unavailable",
+            "message": "The engine switch is not available in this process",
+            "reason": unavailable_reason(),
+            "retryable": False,
+        }})
+    return switch
+
+
+async def _engine_switch_call(request: Request, operation: str):
+    # The flag is checked first: with routing off every caller (any identity) gets the same 404 and no
+    # engine module is imported.
+    if settings.engine_routing_enabled is not True:
+        raise HTTPException(status_code=404, detail="Not Found")
+    from engine_routing import RoutingError
+
+    _require_dictator_admin(request)
+    switch = _engine_switch_or_error()
+    try:
+        return await asyncio.to_thread(getattr(switch, operation))
+    except RoutingError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    except Exception as error:
+        logger.exception("engine switch %s failed", operation)
+        raise HTTPException(status_code=500, detail="Engine switch operation failed") from error
+
+
+@v1_router.get("/admin/engine-switch/status")
+async def v1_engine_switch_status(request: Request):
+    return await _engine_switch_call(request, "status")
+
+
+@v1_router.post("/admin/engine-switch/start-dual-write")
+async def v1_engine_switch_start(request: Request):
+    return await _engine_switch_call(request, "start_dual_write")
+
+
+@v1_router.post("/admin/engine-switch/catch-up")
+async def v1_engine_switch_catch_up(request: Request):
+    return await _engine_switch_call(request, "catch_up")
+
+
+@v1_router.post("/admin/engine-switch/flip")
+async def v1_engine_switch_flip(request: Request):
+    return await _engine_switch_call(request, "flip")
+
+
+@v1_router.post("/admin/engine-switch/rollback")
+async def v1_engine_switch_rollback(request: Request):
+    return await _engine_switch_call(request, "rollback")
+
+
+@v1_router.post("/admin/engine-switch/abandon")
+async def v1_engine_switch_abandon(request: Request):
+    return await _engine_switch_call(request, "abandon")
 
 
 # Mount v1 router

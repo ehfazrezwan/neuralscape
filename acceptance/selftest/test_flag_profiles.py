@@ -66,7 +66,7 @@ def test_the_flags_on_profile_turns_on_every_flag_the_scenarios_need():
     assert flags["DICTATOR_USER_IDS"] == "acc-dictator"
     assert flags["VAULT_KEY"] == "<generate:fernet>"
     assert flags["WEBHOOK_QUEUE_EMPTY_URL"] == f"http://{sidecar.SINK_NAME}:{sidecar.PORT}{sidecar.QUEUE_EMPTY_PATH}"
-    assert json.loads(flags["CODE_REPOS"]) == {"svc": "/app/neuralscape-service/knowledge"}
+    assert json.loads(flags["CODE_REPOS"]) == {"svc": "/app/neuralscape-service/knowledge", "svcdel": "/app/neuralscape-service/knowledge"}
     assert 0 < float(flags["DREAMING_SALIENCE_RECALL_K"]) <= 0.1
 
 
@@ -366,3 +366,59 @@ def test_run_sh_refuses_a_compose_profile_without_a_compose_project():
     r = subprocess.run([sh, "http://127.0.0.1:18200", "--profile", "flags-on", "--compose-project", " NeuralScape "], capture_output=True, text=True, env=env)
     assert r.returncode == 2 and "production" in r.stderr, r.stderr
     assert profile.load(ACCEPTANCE / "profiles" / "flags-on.env").headers["requires"] == ["compose"]
+
+
+# ── negative controls state their precondition ───────────────────
+
+
+def test_a_negative_control_whose_precondition_fails_reports_the_precondition_not_a_vacuous_pass():
+    from nsaccept import expect_check_fails, precondition
+
+    def check(indexed: bool):
+        assert indexed, "nothing is indexed"
+
+    with pytest.raises(AssertionError, match=r"PRECONDITION FAILED \(the index exists\)"):
+        # setup failed: the check fails with the RIGHT input too, so "fails with the wrong input" would be vacuous
+        precondition(check, False, what="the index exists")
+        expect_check_fails(check, False)
+    precondition(check, True, what="the index exists")  # a healthy setup passes through
+    expect_check_fails(check, False)
+
+
+def test_every_negative_control_in_the_flag_scenarios_states_a_precondition():
+    """AST scan: each function decorated with negative_control must CALL precondition(...) (a comment or a
+    string cannot satisfy it). The framing control is exempt: it compares against an ordinary page."""
+    import ast
+
+    flagged = ["test_dreaming", "test_standards", "test_connectors", "test_webhook", "test_code_graph", "test_code_graph_cbm",
+               "test_oauth", "test_speaker", "test_exemplars"]
+    exempt = {"test_frame_check_fails_for_a_page_without_the_headers"}
+
+    def deco_name(d):
+        d = d.func if isinstance(d, ast.Call) else d
+        return d.id if isinstance(d, ast.Name) else getattr(d, "attr", "")
+
+    def calls_precondition(fn):
+        """A precondition(...) call that comes BEFORE the first expect_check_fails(...) call (by position)."""
+        pre = [n.lineno for n in ast.walk(fn) if isinstance(n, ast.Call) and deco_name(n.func) == "precondition"]
+        neg = [n.lineno for n in ast.walk(fn) if isinstance(n, ast.Call) and deco_name(n.func) == "expect_check_fails"]
+        return bool(pre) and (not neg or min(pre) < min(neg))
+
+    missing, seen = [], 0
+    for mod in flagged:
+        tree = ast.parse((ACCEPTANCE / "scenarios" / f"{mod}.py").read_text())
+        for fn in [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)]:
+            if any(deco_name(d) == "negative_control" for d in fn.decorator_list):
+                seen += 1
+                if fn.name not in exempt and not calls_precondition(fn):
+                    missing.append(f"{mod}::{fn.name}")
+    assert seen > 20, f"scan found only {seen} negative controls"
+    assert missing == [], f"negative controls that never call precondition() before the wrong-input check: {missing}"
+
+
+def test_a_comment_or_string_does_not_satisfy_the_precondition_scan():
+    import ast
+
+    src = "@negative_control\ndef test_x():\n    # precondition(...)\n    s = 'precondition(x)'\n"
+    fn = ast.parse(src).body[0]
+    assert not any(isinstance(n, ast.Call) for n in ast.walk(fn))

@@ -1,7 +1,13 @@
 apiVersion: v2
 name: neuralscape
-description: Neuralscape application tier (FastAPI API + ARQ fast worker + graph worker)
+description: Neuralscape application tier (FastAPI API + ARQ fast, graph and ingest workers + Docling converter)
 type: application
 version: 0.1.0
-# appVersion tracks the container image tag deployed by default (overridable).
-appVersion: "latest"
+# appVersion is the image tag used when values `image.tag` is empty. It is an
+# unpublished placeholder: no image is pushed under this tag, and the default
+# image.repository is not where CI publishes either. It exists only so a bare
+# `helm lint` / `helm template` renders. A real install must set image.repository
+# and image.tag (or Terraform image_tag) to the image it pushed, e.g.
+# ghcr.io/<owner>/neuralscape and sha-<12>. It must stay non-floating (the chart
+# refuses "latest").
+appVersion: "0.1.0"

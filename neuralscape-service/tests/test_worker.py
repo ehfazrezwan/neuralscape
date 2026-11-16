@@ -619,3 +619,15 @@ class TestWorkerSettings:
         """The expire-old-memories cron must be registered."""
         cron_fns = [c.coroutine.__name__ for c in worker.WorkerSettings.cron_jobs]
         assert "expire_old_memories_cron" in cron_fns
+
+
+class TestVectorRepairCron:
+    def test_registered_on_the_graph_worker_only(self):
+        assert "repair_stale_vectors_cron" in {c.coroutine.__name__ for c in worker.GraphWorkerSettings.cron_jobs}
+        assert "repair_stale_vectors_cron" not in {c.coroutine.__name__ for c in worker.WorkerSettings.cron_jobs}
+
+    @pytest.mark.asyncio
+    async def test_calls_the_service_repair(self, ctx):
+        ctx["service"].repair_stale_vectors.return_value = {"scanned": 2, "repaired": 2, "failed": 0}
+        assert await worker.repair_stale_vectors_cron(ctx) == {"scanned": 2, "repaired": 2, "failed": 0}
+        ctx["service"].repair_stale_vectors.assert_called_once()

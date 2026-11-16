@@ -141,6 +141,37 @@ def _is_valid_redirect_uri(uri: str) -> bool:
     return parsed.scheme == "http" and host in _LOOPBACK_HOSTS
 
 
+_DEFAULT_PORTS = {"https": 443, "http": 80}
+
+
+def _redirect_host_allowed(uri: str) -> bool:
+    """True when ``uri``'s host passes ``OAUTH_REDIRECT_HOST_ALLOWLIST``.
+
+    Call only on a URI that passed ``_is_valid_redirect_uri``. An empty list
+    allows everything (today's behaviour). Loopback hosts always pass: native
+    clients (RFC 8252 section 7.3) listen on an ephemeral loopback port, so no
+    list could name it. An entry ``host`` matches the scheme's default port
+    only; ``host:port`` matches that exact port.
+    """
+    allowed = settings.oauth_redirect_host_allowlist_set()
+    if not allowed:
+        return True
+    parsed = urlparse(uri)
+    host = (parsed.hostname or "").lower()
+    if host in _LOOPBACK_HOSTS:
+        return True
+    default = _DEFAULT_PORTS.get(parsed.scheme)
+    port = parsed.port if parsed.port is not None else default
+    if port == default and host in allowed:
+        return True
+    return f"{host}:{port}" in allowed
+
+
+def _redirect_uri_usable(uri: str, registered: list) -> bool:
+    """Authorize-time check: valid, currently allowlisted, and registered."""
+    return _is_valid_redirect_uri(uri) and _redirect_host_allowed(uri) and uri in registered
+
+
 # ── helpers ──────────────────────────────────────────────────────────────
 
 
@@ -391,6 +422,17 @@ async def register(request: Request) -> JSONResponse:
             },
         )
 
+    if not all(_redirect_host_allowed(u) for u in redirect_uris):
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": "invalid_redirect_uri",
+                "error_description": (
+                    "redirect_uris host is not on this server's redirect host allowlist"
+                ),
+            },
+        )
+
     issued_at = int(time.time())
     # A random jti makes every registration a distinct client. Without it the
     # signed client_id was a pure function of (redirect_uris, issue second), so
@@ -622,7 +664,7 @@ async def authorize(request: Request) -> HTMLResponse | JSONResponse:
     client = _decode_client(client_id)
     if client is None:
         return JSONResponse(status_code=400, content={"error": "invalid_client"})
-    if not _is_valid_redirect_uri(redirect_uri) or redirect_uri not in client.get("redirect_uris", []):
+    if not _redirect_uri_usable(redirect_uri, client.get("redirect_uris", [])):
         # Never redirect to an unregistered URI — surface the error locally.
         return JSONResponse(
             status_code=400,
@@ -699,7 +741,7 @@ async def authorize_submit(
     client = _decode_client(client_id)
     if client is None:
         return JSONResponse(status_code=400, content={"error": "invalid_client"})
-    if not _is_valid_redirect_uri(redirect_uri) or redirect_uri not in client.get("redirect_uris", []):
+    if not _redirect_uri_usable(redirect_uri, client.get("redirect_uris", [])):
         return JSONResponse(
             status_code=400,
             content={"error": "invalid_request", "error_description": "redirect_uri mismatch"},
@@ -736,12 +778,22 @@ async def authorize_submit(
     return _issue_code_and_redirect(ctx, payload["user_id"], src=src)
 
 
+_REDIRECT_HOST_REFUSED = "This client's redirect host is not allowed on this server."
+
+
 def _issue_code_and_redirect(
     ctx: AuthorizeContext, user_id: str, src: str | None = None
-) -> RedirectResponse:
+) -> RedirectResponse | HTMLResponse:
     """Mint a PKCE-bound authorization code for ``user_id`` and 303 back to the
     MCP client's redirect_uri. Shared by every login provider — the only thing
-    that varies upstream is how ``user_id`` was authenticated."""
+    that varies upstream is how ``user_id`` was authenticated.
+
+    Every code issuance passes here, so this is where the redirect host
+    allowlist is re-checked for the federated callbacks and the link flow, whose
+    signed state or ticket may predate the list. A refusal renders an error page
+    and issues no code."""
+    if not _redirect_host_allowed(ctx.redirect_uri):
+        return _login_error_page(LoginError(_REDIRECT_HOST_REFUSED, 400))
     code = sign_payload(
         {
             "typ": "code",
@@ -928,6 +980,9 @@ async def oauth_link(
         return _login_error_page(LoginError("This link request expired. Please sign in again.", 400))
 
     ctx = claims["ctx"]
+    if not _redirect_host_allowed(ctx.redirect_uri):
+        # Refuse before anything is persisted for a login that cannot finish.
+        return _login_error_page(LoginError(_REDIRECT_HOST_REFUSED, 400))
     sub = claims.get("sub") or None
     email = claims.get("email") or None
 
@@ -1047,6 +1102,10 @@ async def token(
             return _token_error("invalid_grant", "client mismatch")
         if not redirect_uri or claims.get("redirect_uri") != redirect_uri:
             return _token_error("invalid_grant", "redirect_uri mismatch")
+        if not _redirect_host_allowed(redirect_uri):
+            # A code issued before the allowlist was set is not redeemable for a
+            # host that is no longer listed.
+            return _token_error("invalid_grant", "redirect_uri host is not allowed")
         if not _verify_pkce(code_verifier, claims.get("code_challenge", "")):
             return _token_error("invalid_grant", "PKCE verification failed")
         jti = claims.get("jti")

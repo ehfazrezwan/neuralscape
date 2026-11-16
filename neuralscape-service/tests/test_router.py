@@ -387,21 +387,109 @@ def test_default_base_only(mock_registry):
 # ── Router overhead test (<1 ms) ──
 
 
-def test_router_overhead(mock_registry):
-    """Router overhead must be <1 ms (budget from PLAN §4)."""
-    # Warm up (JIT, cache, etc.)
-    for _ in range(10):
-        resolve_systems(query="Who calls foo.bar()?", project_id="test")
+def test_router_overhead(mock_registry, monkeypatch):
+    """Router overhead must be <1 ms (budget from PLAN §4).
 
-    # Measure 100 calls
-    start = time.perf_counter()
-    for _ in range(100):
-        resolve_systems(query="Who calls foo.bar()?", project_id="test")
-    elapsed = time.perf_counter() - start
+    Measures routing in steady state: every project-config store read is stubbed
+    at the leaf (the read client, the write client and the connect), and the
+    router's real read-through runs against them. Two things keep the number
+    honest on a loaded runner:
+
+    * no store I/O inside the timed loop, asserted by COUNT (a hot path that
+      reached the store per call would fail the count even if the clock allowed
+      it); the store's own worst case is bounded in tests/test_router_redis_bound.py;
+    * the cyclic GC is paused for the timed loop (as ``timeit`` does). A gen-2
+      collection landing in a 100-call loop after ~10k earlier tests have grown
+      the heap costs hundreds of ms, i.e. a >5 ms "average" that is the
+      interpreter's, not the router's.
+    """
+    import gc
+
+    from knowledge import index_store, router
+
+    index_store._reset_for_tests()
+    saved = dict(router._PROJECT_CONFIGS), dict(router._PROJECT_CONFIG_AT)
+    router._PROJECT_CONFIGS.clear()
+    router._PROJECT_CONFIG_AT.clear()
+    # One TTL comfortably longer than this test: an expiry mid-loop is not what is measured.
+    monkeypatch.setattr(index_store, "config_ttl", lambda: 3600.0)
+
+    store_touches: list[str] = []
+
+    class _EmptyStore:
+        def get(self, key):
+            store_touches.append(key)
+            return None  # Redis answered: no config for this project
+
+    monkeypatch.setattr(index_store, "_redis_read", lambda: _EmptyStore())
+    monkeypatch.setattr(index_store, "_redis", lambda: store_touches.append("write-client") or None)
+    monkeypatch.setattr(
+        index_store, "_connect", lambda timeout: store_touches.append("connect") or None
+    )
+    try:
+        # Warm up: the first call may do its one bounded read, which seeds the
+        # negative cache for this project.
+        for _ in range(10):
+            resolve_systems(query="Who calls foo.bar()?", project_id="test")
+        touches_after_warmup = len(store_touches)
+        assert touches_after_warmup <= 1, store_touches
+
+        gc.collect()
+        gc.disable()
+        try:
+            start = time.perf_counter()
+            for _ in range(100):
+                resolve_systems(query="Who calls foo.bar()?", project_id="test")
+            elapsed = time.perf_counter() - start
+        finally:
+            gc.enable()
+
+        # Counted work: steady-state routing performs zero store I/O.
+        assert len(store_touches) == touches_after_warmup, (
+            f"router touched the store inside the timed loop: {store_touches[touches_after_warmup:]}"
+        )
+    finally:
+        index_store._reset_for_tests()
+        router._PROJECT_CONFIGS.clear()
+        router._PROJECT_CONFIGS.update(saved[0])
+        router._PROJECT_CONFIG_AT.clear()
+        router._PROJECT_CONFIG_AT.update(saved[1])
 
     avg_ms = (elapsed / 100) * 1000
     print(f"Router overhead: {avg_ms:.3f} ms/call (budget: <1 ms)")
     assert avg_ms < 1.0, f"Router too slow: {avg_ms:.3f} ms > 1 ms budget"
+
+
+def test_router_steady_state_makes_no_store_reads(mock_registry, monkeypatch):
+    """Counted work, no clock: after the first answer for a project, 500 routed
+    calls touch the store zero more times (one bounded read per TTL, not per call).
+    Fails if the hot path starts probing/connecting per call.
+    """
+    from knowledge import index_store, router
+
+    index_store._reset_for_tests()
+    saved = dict(router._PROJECT_CONFIGS), dict(router._PROJECT_CONFIG_AT)
+    router._PROJECT_CONFIGS.clear()
+    router._PROJECT_CONFIG_AT.clear()
+    monkeypatch.setattr(index_store, "config_ttl", lambda: 3600.0)
+    touches: list[str] = []
+
+    class _EmptyStore:
+        def get(self, key):
+            touches.append(key)
+            return None
+
+    monkeypatch.setattr(index_store, "_redis_read", lambda: _EmptyStore())
+    try:
+        for _ in range(500):
+            resolve_systems(query="Who calls foo.bar()?", project_id="test")
+        assert len(touches) == 1, touches
+    finally:
+        index_store._reset_for_tests()
+        router._PROJECT_CONFIGS.clear()
+        router._PROJECT_CONFIGS.update(saved[0])
+        router._PROJECT_CONFIG_AT.clear()
+        router._PROJECT_CONFIG_AT.update(saved[1])
 
 
 # ── Byte-identical output guarantee (Phase D critical) ──
