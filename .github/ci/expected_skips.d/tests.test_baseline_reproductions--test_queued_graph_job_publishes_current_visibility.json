@@ -1,9 +1,0 @@
-{
-  "test": "tests.test_baseline_reproductions::test_queued_graph_job_publishes_current_visibility",
-  "reason_contains": "the graph job publishes the visibility it was en",
-  "profiles": [
-    "container",
-    "host"
-  ],
-  "why": "pinned bug: strict-xfail reproduction in test_baseline_reproductions; git rm this file in the PR that fixes the bug"
-}

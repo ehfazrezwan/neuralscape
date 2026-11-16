@@ -1,15 +1,14 @@
 # System Capabilities Matrix
 
-This document declares which operations each ICEBench system supports and which are N/A (not applicable), with justifications.
+This document records which operations each standalone ICEBench system adapter implements, and what each adapter actually calls.
 
-**Both competitor tools were actually installed and smoke-run on the benchmark VM**, and the adapters were verified end-to-end against them (see the `test_live_*` tests in each system's `test_adapter.py`):
+> **Correction notice.** An earlier version of this file declared graphify `blast_radius` and incremental indexing, and CBM `nl_locate`, as N/A. `docs/ice-benchmark/ice-fable-review.md` section 3.3 found the graphify claims contradicted by the installed graphify CLI, and the adapter code has since changed. The tables below now follow the adapter code (`graphify_standalone/adapter.py`, `cbm_standalone/adapter.py`, `capabilities()` and `index_incremental()`). Whether each wired command **works as intended against the installed tool** has not been re-verified for this revision: nothing here was run, and no measurement is implied. Results produced before the adapters were changed (including the `ice-final` report) predate these capabilities and treat them as N/A; treat those N/A cells as unverified or contradicted by review, not as established tool limits.
 
-- **graphify** `0.9.10` — source `safishamsi/graphify` @ `20bfdf60`, installed via `uv` venv.
-- **cbm** (codebase-memory-mcp) binary `0.9.0` — source `DeusData/codebase-memory-mcp` @ `ee68144`, prebuilt portable Linux binary.
+The adapter modules' own top-of-file docstrings still describe the older, smaller capability sets; `capabilities()` in each file is the authority.
 
-Every command shown below is the **real, verified** CLI surface (not an assumed interface). Exact pins are in `/data/ice/tools/systems.lock.json`.
+Tool versions the adapters were written against (from their docstrings): graphify `0.9.10` and codebase-memory-mcp (cbm) `0.9.0`. Exact pins for any past run were kept outside this repository.
 
-**Rail safety:** every competitor subprocess — index AND query AND list AND delete — is routed through `icebench.rail.run_with_rail`, so the hard memory cap + wall-timeout + peak-RSS/CPU capture apply and any OOM/timeout/SIGABRT becomes a DNF row instead of a shared-VM outage.
+**Rail safety:** every competitor subprocess is routed through `icebench.rail.run_with_rail`, so the memory cap, wall-timeout and peak-RSS/CPU capture apply and an OOM, timeout or SIGABRT becomes a DNF row.
 
 ## Operation Classes
 
@@ -25,92 +24,73 @@ ICEBench defines 5 operation classes for code intelligence systems:
 
 ## Graphify Standalone (`graphify`)
 
-**Capabilities:** `symbol_lookup`, `neighbors_1hop`, `path_le4`
+**Implemented query ops (`capabilities()`):** `symbol_lookup`, `neighbors_1hop`, `path_le4`, `blast_radius`
 
-**N/A Operations:** `nl_locate`, `blast_radius`
+**Not implemented:** `nl_locate` (the adapter treats graphify's `query` as graph traversal, not natural-language-to-symbol resolution).
 
-### Supported Operations
+Index: `graphify extract <path> --code-only --no-cluster` writes `<path>/graphify-out/graph.json`.
 
-Index (verified): `graphify extract <path> --code-only --no-cluster` → `<path>/graphify-out/graph.json`.
-
-| Operation | Implementation (verified) | Justification |
+| Operation | What the adapter calls | Status |
 |-----------|---------------|---------------|
-| `symbol_lookup` | `graphify explain "<label-or-id>" --graph <graph.json>` | `explain` returns node details (source location, degree, connections). Accepts either the node label (`add()`) or id (`calc_add`). |
-| `neighbors_1hop` | `graphify explain "<label-or-id>" --graph <graph.json>` | Same as symbol_lookup; `explain` lists all direct connections (neighbors). |
-| `path_le4` | `graphify path "<from>" "<to>" --graph <graph.json>` | `path` finds the shortest path between two nodes. |
+| `symbol_lookup` | `graphify explain "<symbol>" --graph <graph.json>` | implemented |
+| `neighbors_1hop` | `graphify explain "<symbol>" --graph <graph.json>` | implemented (same command as symbol_lookup) |
+| `path_le4` | `graphify path "<from>" "<to>" --graph <graph.json>` | implemented |
+| `blast_radius` | `graphify affected "<symbol>" --graph <graph.json> --depth <max_hops>` | implemented; earlier N/A claim contradicted by review (ice-fable-review.md section 3.3) |
+| index_incremental | `graphify update <path> --no-cluster` | implemented; earlier N/A claim contradicted by review (ice-fable-review.md section 3.3) |
 
-### N/A Operations
-
-| Operation | Reason |
-|-----------|--------|
-| `nl_locate` | Graphify has no natural language query capability. Its `query` command is graph traversal (BFS/DFS), not NL→symbol resolution. Graphify is built on NetworkX + tree-sitter AST (deterministic, no LLM), so there's no semantic layer for NL queries. |
-| `blast_radius` | Graphify has no impact analysis tool. It has `affected` (reverse traversal to find nodes impacted by X) but that's a generic graph query, not a true blast radius with change propagation semantics. The brief specifies blast radius as impact analysis, which requires reasoning about call chains, data flow, and change propagation — graphify lacks this. |
+Caveat on `blast_radius`: `affected` is a reverse graph traversal. It is not data-flow analysis, and neither is the Neuralscape implementation it would be compared with (a breadth-first search over call and import edges). Compare them as like for like only with that stated.
 
 ---
 
 ## CBM Standalone (`cbm`)
 
-**Capabilities:** `symbol_lookup`, `neighbors_1hop`, `path_le4`
+**Implemented query ops (`capabilities()`):** `symbol_lookup`, `neighbors_1hop`, `path_le4`, `nl_locate`
 
-**N/A Operations:** `nl_locate`, `blast_radius`
+**Not implemented:** `blast_radius` (the adapter treats `detect_changes` as git-diff based, so it does not answer "what if I change this symbol").
 
-### Supported Operations
+Index: `cbm cli index_repository '{"repo_path": "<path>"}'`. Every query tool requires a `project` argument (the slug from `list_projects`); the adapter resolves it by matching a project's `root_path` to the corpus path rather than guessing.
 
-Index (verified): `cbm cli index_repository '{"repo_path": "<path>"}'`. Every query tool **requires a `project` argument** (the slug from `list_projects`); the adapter resolves it by matching a project's `root_path` to the corpus path (no slug guessing).
-
-| Operation | Implementation (verified) | Justification |
+| Operation | What the adapter calls | Status |
 |-----------|---------------|---------------|
-| `symbol_lookup` | `search_graph {project, name_pattern}` | Regex name matching; returns qualified names, labels, file locations, degrees. |
-| `neighbors_1hop` | `trace_path {project, function_name, direction:"both", depth:1}` | BFS over the call graph; depth=1 returns direct callers + callees. |
-| `path_le4` | `query_graph {project, query}` with `MATCH (a)-[*1..4]-(b) WHERE a.name='...' AND b.name='...' RETURN b.name LIMIT 1` | Variable-length path `[*1..4]`. **Verified quirk:** CBM's Cypher lexer rejects the `p=(...)` path-assignment form and `$params`, so the adapter uses a bare match and single-quote-escapes interpolated names. |
+| `symbol_lookup` | `search_graph {project, name_pattern}` | implemented |
+| `neighbors_1hop` | `trace_path {project, function_name, direction:"both", depth:1}` | implemented |
+| `path_le4` | `query_graph {project, query}` with `MATCH (a)-[*1..4]-(b) WHERE a.name='...' AND b.name='...' RETURN b.name LIMIT 1` | implemented; the adapter's notes say cbm's Cypher lexer rejected the `p=(...)` form and `$params`, so it uses a bare match and single-quote-escapes the names |
+| `nl_locate` | `search_code {project, pattern}` (semantic search over code chunks) | implemented; the adapter's own docstring still lists it as N/A |
+| index_incremental | none | N/A: cbm has a background watcher but no explicit incremental command in CLI mode; reported as DNF with `dnf_reason="incremental_na"` |
 
-### N/A Operations
-
-| Operation | Reason |
-|-----------|--------|
-| `nl_locate` | CBM has `semantic_query` (vector search via Nomic embeddings), but this is NOT natural language → symbol locate. `semantic_query` is vector similarity search over code chunks, returning snippets. The brief's `nl_locate` implies "find the symbol that implements X functionality" (e.g., "where is HTTP routing handled") — a higher-level semantic mapping. CBM's vector search doesn't resolve to specific symbols, and the MCP layer (the agent) would be doing the interpretation, which violates the no-added-intelligence rule. |
-| `blast_radius` | CBM has `detect_changes` (git diff → affected symbols + risk classification), but this is git-diff based, not a general blast radius tool. It only works on uncommitted changes, not arbitrary "what if I change this symbol" queries. A true blast radius would require transitive call-graph + data-flow impact analysis independent of git state, which CBM's `detect_changes` doesn't provide. |
+Caveat on `nl_locate`: `search_code` returns code chunks, so whether a result counts as resolving to the right symbol depends on how the scorer maps it. Read the scorer before drawing conclusions.
 
 ---
 
 ## Fairness & Honesty
 
-Both systems are evaluated **as-shipped**, with no emulation or workarounds:
+The adapters run each tool as shipped, with no emulation or added intelligence: every answer is the tool's own output, parsed as-is.
 
-- **Graphify** is a deterministic AST-based graph builder with CLI query commands. It excels at structural queries but has no semantic layer.
-- **CBM** is a tree-sitter + Hybrid LSP graph builder with MCP tools. It has vector search but not full NL→symbol resolution.
+- **Graphify** is a deterministic AST-based graph builder with CLI query commands and no semantic layer.
+- **CBM** is a tree-sitter graph builder with MCP/CLI tools, including vector search over code chunks.
 
-Operations marked N/A will raise `UnsupportedOp` in the adapters. The benchmark runner records these as N/A, never as failures or zeros, preserving fairness across systems with different capabilities.
+An operation an adapter does not implement raises `UnsupportedOp`, and the runner records it as N/A rather than as a failure or a zero. An N/A therefore means "the adapter does not call anything for this", which is only as sound as the adapter author's reading of the tool. That reading was wrong for graphify once (see the correction notice), so treat N/A cells with that in mind.
 
 ---
 
 ## Notes on Index Operations
 
-Both systems support:
+Both adapters implement:
 
-- **index_cold**: Full index from scratch (rail-run).
-- **index_second**: Second full index (stability probe; CBM's known SIGABRT-on-second-index becomes a DNF).
+- **index_cold**: full index from scratch (rail-run).
+- **index_second**: second full index (stability probe; cbm's known SIGABRT-on-second-index becomes a DNF).
 - **store_size_bytes**:
-  - graphify → total size of the `graphify-out/` dir for this corpus.
-  - CBM → this corpus's `size_bytes` from `list_projects` (matched by `root_path`), i.e. **scoped to the one corpus**, not a sum of every DB in the cache dir.
+  - graphify: total size of the `graphify-out/` dir for this corpus.
+  - cbm: this corpus's `size_bytes` from `list_projects` (matched by `root_path`), scoped to the one corpus, not a sum of every DB in the cache dir.
 - **export_snapshot / import_snapshot**:
-  - graphify → byte-copy of `graph.json` (its portable store).
-  - CBM → byte-copy of `<cache>/<slug>.db` (CBM's persistent SQLite store). CBM's documented `.codebase-memory/graph.db.zst` portable artifact is only emitted for **git** repos, so the adapter snapshots the real store file directly. `import_snapshot` requires the corpus to have been indexed (so a slug exists) — otherwise it returns N/A rather than guessing CBM's path→slug transform.
+  - graphify: byte-copy of `graph.json` (its portable store).
+  - cbm: byte-copy of `<cache>/<slug>.db` (its persistent SQLite store). The documented `.codebase-memory/graph.db.zst` artifact is only emitted for git repos, so the adapter snapshots the store file directly. `import_snapshot` requires the corpus to have been indexed (so a slug exists); otherwise it returns N/A rather than guessing the path-to-slug transform.
 
-Neither system has **index_incremental** in the traditional sense:
+**index_incremental:**
 
-- **Graphify**: No incremental mode → returns N/A (DNF with `dnf_reason="incremental_na"`)
-- **CBM**: Has an auto-sync background watcher but no explicit incremental index command in CLI mode → N/A
+- graphify: implemented via `graphify update` (see the table above).
+- cbm: N/A (`dnf_reason="incremental_na"`).
 
-This is honest reporting: the systems don't support it, so the benchmark doesn't fake it.
+## CBM `graph.db` fixture
 
-## Real CBM `graph.db` fixture (for I3)
-
-A **real** CBM `graph.db` was produced (not synthesized) at
-`/data/ice/corpora/cbm_fixture/graph.db` (+ `README.md` documenting provenance
-and schema) so I3's importer can be validated against actual CBM output. It is a
-plain SQLite DB with tables `nodes`, `edges`, `projects`, `file_hashes`,
-`node_vectors`, `token_vectors`, `project_summaries`, and an FTS5 `nodes_fts`
-virtual table. Note CBM's real store file is `<cache>/<slug>.db` — there is no
-file literally named `graph.db` in its cache; the fixture was renamed for I3's
-convenience.
+An earlier revision of this file described a real cbm `graph.db` fixture kept outside this repository. It is not part of the repo and is not needed to read the adapters. For reference, cbm's real store file is `<cache>/<slug>.db`; there is no file literally named `graph.db` in its cache.
