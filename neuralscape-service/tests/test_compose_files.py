@@ -222,7 +222,11 @@ def test_neo4j_password_has_no_default_anywhere() -> None:
         return
     for name in ALL_FILES:
         text = (REPO_ROOT / name).read_text(encoding="utf-8")
-        assert ":-neuralscape" not in text, f"{name} still falls back to the 'neuralscape' password"
+        # The per-project autoheal label key legitimately defaults the project NAME to
+        # "neuralscape"; every other `:-neuralscape` fallback is a password default.
+        assert ":-neuralscape" not in text.replace("${COMPOSE_PROJECT_NAME:-neuralscape}", ""), (
+            f"{name} still falls back to the 'neuralscape' password"
+        )
         for match in re.finditer(r"\$\{NEO4J_PASSWORD([^}]*)\}", text):
             assert match.group(1).startswith(":?"), (
                 f"{name}: {match.group(0)} must be a required variable (${{NEO4J_PASSWORD:?...}})"
@@ -507,19 +511,69 @@ def test_overlay_pinning_the_project_image_on_latest_never_pulls_it() -> None:
 
 # ── autoheal services need a real healthcheck ───────────────────────
 
-_AUTOHEAL_LABEL = "com.neuralscape.autoheal"
+_AUTOHEAL_LABEL = "com.neuralscape.autoheal"  # the key's prefix; the project name is appended
 _NOOP_RE = re.compile(r"sys\.exit\(\s*0\s*\)|^\s*(true|exit 0|:)\s*$")
 _WORKERS = ("neuralscape-worker", "neuralscape-graph-worker", "neuralscape-ingest-worker")
+_PROJECT_KEY = "${COMPOSE_PROJECT_NAME:-neuralscape}"
+# Every service that carries the label, and the raw (un-interpolated) value each must have.
+_LABELLED = {
+    "cbm-bridge": "true",
+    "resolver-svc": "true",
+    "neuralscape": "true",
+    **{worker: "${WORKER_AUTOHEAL:-true}" for worker in _WORKERS},
+}
+_STACKINGS = (
+    (BASE,),
+    (BASE, "docker-compose.vps.yml"),
+    (BASE, "docker-compose.deploy.yml"),
+    (BASE, "docker-compose.prod.yml"),
+)
+
+
+def _labels(svc: dict) -> dict:
+    """The service's labels as a dict, whichever form (map or ``key=value`` list) it is written in."""
+    labels = _plain(svc.get("labels")) or {}
+    if isinstance(labels, list):
+        return {key: value for key, _, value in (str(item).partition("=") for item in labels)}
+    return {str(key): str(value) for key, value in labels.items()}
+
+
+def _autoheal_labels(svc: dict) -> dict:
+    """Only the autoheal labels, key -> raw value, quotes stripped."""
+    return {
+        key: str(value).strip("\"'")
+        for key, value in _labels(svc).items()
+        if key == _AUTOHEAL_LABEL or key.startswith(_AUTOHEAL_LABEL + ".")
+    }
 
 
 def _has_autoheal(svc: dict) -> bool:
-    labels = svc.get("labels") or {}
-    if isinstance(labels, list):
-        labels = dict(str(i).partition("=")[::2] for i in labels)
-    value = str(labels.get(_AUTOHEAL_LABEL, "")).strip("\"'").lower()
-    # The label value is literal "true" or the interpolation `${WORKER_AUTOHEAL:-true}`
-    # (on by default; an operator sets WORKER_AUTOHEAL=false in .env to opt out).
-    return value in ("true", "${worker_autoheal:-true}")
+    # The key is per compose project (compose interpolates values, not mapping keys, so
+    # the labels are a list); the value is literal "true" or the interpolation
+    # `${WORKER_AUTOHEAL:-true}` (on by default; WORKER_AUTOHEAL=false in .env opts out).
+    return any(
+        key == f"{_AUTOHEAL_LABEL}.{_PROJECT_KEY}" and value in ("true", "${WORKER_AUTOHEAL:-true}")
+        for key, value in _autoheal_labels(svc).items()
+    )
+
+
+_VAR_RE = re.compile(r"\$\{(?P<name>[A-Za-z_][A-Za-z0-9_]*)(?::-(?P<default>[^}]*))?\}")
+
+
+def _subst(value, env: dict):
+    """Compose's ``${VAR}`` / ``${VAR:-default}`` interpolation over every string in ``value``."""
+    if isinstance(value, str):
+        return _VAR_RE.sub(lambda m: env.get(m["name"]) or m["default"] or "", value)
+    if isinstance(value, list):
+        return [_subst(item, env) for item in value]
+    if isinstance(value, dict):
+        return {_subst(k, env): _subst(v, env) for k, v in value.items()}
+    return _plain(value)
+
+
+def _autoheal_matches(sidecar_key: str, svc: dict) -> bool:
+    """What willfarrell/autoheal does: the filter ``label=<key>=true`` on ``GET /containers/json``."""
+    return _labels(svc).get(sidecar_key) == "true"
 
 
 def _check_cmd(svc: dict) -> str:
@@ -572,10 +626,84 @@ def test_helm_worker_liveness_probes_check_the_heartbeat() -> None:
 def test_worker_autoheal_opt_out_is_an_env_var_documented_in_the_templates() -> None:
     if not _have_repo():
         return
+    services = _services(BASE)
+    for worker in _WORKERS:
+        assert _autoheal_labels(services[worker]) == {
+            f"{_AUTOHEAL_LABEL}.{_PROJECT_KEY}": "${WORKER_AUTOHEAL:-true}"
+        }, worker
     text = (REPO_ROOT / BASE).read_text(encoding="utf-8")
-    assert text.count('com.neuralscape.autoheal: "${WORKER_AUTOHEAL:-true}"') == 3
+    assert text.count(f'"{_AUTOHEAL_LABEL}.{_PROJECT_KEY}=${{WORKER_AUTOHEAL:-true}}"') == 3
     for template in (".env.example", ".env.production"):
         assert re.search(r"^#?\s*WORKER_AUTOHEAL=", (REPO_ROOT / template).read_text(encoding="utf-8"), re.M)
+
+
+def _rendered_stack(combo: tuple[str, ...], project: str | None, **env: str) -> dict:
+    """The merged services with ``${VAR:-default}`` resolved the way ``docker compose -p <project>`` does.
+
+    Compose puts the resolved project name into the interpolation environment as
+    COMPOSE_PROJECT_NAME; ``project=None`` leaves it unset (a tool that does not set it).
+    """
+    values = dict(env)
+    if project is not None:
+        values["COMPOSE_PROJECT_NAME"] = project
+    return _subst(_services(*combo), values)
+
+
+def test_autoheal_label_key_is_scoped_to_the_compose_project() -> None:
+    """Two compose projects on one Docker host must not restart each other's containers.
+
+    The proxy lets the sidecar list every container on the host; the only scope is the
+    label key it filters on, so that key has to differ per project.
+    """
+    if not _have_repo():
+        return
+    for combo in _STACKINGS:
+        stacks = {name: _rendered_stack(combo, name) for name in ("proj-a", "proj-b")}
+        for mine, theirs in (("proj-a", "proj-b"), ("proj-b", "proj-a")):
+            key = stacks[mine]["autoheal"]["environment"]["AUTOHEAL_CONTAINER_LABEL"]
+            assert key == f"{_AUTOHEAL_LABEL}.{mine}", combo
+            assert key != _AUTOHEAL_LABEL and key.lower() != "all", combo
+            matched = {n for n, svc in stacks[mine].items() if _autoheal_matches(key, svc)}
+            assert matched == set(_LABELLED), f"{combo}: {mine}'s sidecar matches {sorted(matched)}"
+            foreign = [n for n, svc in stacks[theirs].items() if _autoheal_matches(key, svc)]
+            assert not foreign, f"{combo}: {mine}'s sidecar would restart {theirs}'s {foreign}"
+        # The sidecar's own key is also never carried by the sidecar or the proxy.
+        assert not _autoheal_labels(stacks["proj-a"]["autoheal"])
+        assert not _autoheal_labels(stacks["proj-a"]["docker-socket-proxy"])
+
+
+def test_autoheal_label_key_falls_back_to_neuralscape_when_the_project_name_is_unset() -> None:
+    if not _have_repo():
+        return
+    for combo in _STACKINGS:
+        services = _rendered_stack(combo, None)
+        key = services["autoheal"]["environment"]["AUTOHEAL_CONTAINER_LABEL"]
+        assert key == f"{_AUTOHEAL_LABEL}.neuralscape", combo
+        assert {n for n, svc in services.items() if _autoheal_matches(key, svc)} == set(_LABELLED), combo
+
+
+def test_worker_autoheal_false_renders_a_value_the_sidecar_filter_does_not_match() -> None:
+    if not _have_repo():
+        return
+    for combo in _STACKINGS:
+        services = _rendered_stack(combo, "proj-a", WORKER_AUTOHEAL="false")
+        key = services["autoheal"]["environment"]["AUTOHEAL_CONTAINER_LABEL"]
+        for worker in _WORKERS:
+            assert _labels(services[worker])[key] == "false", (combo, worker)
+            assert not _autoheal_matches(key, services[worker]), (combo, worker)
+        # Everything else is still healed.
+        assert {n for n, svc in services.items() if _autoheal_matches(key, svc)} == set(_LABELLED) - set(_WORKERS)
+
+
+def test_no_compose_file_still_carries_the_bare_autoheal_label_key() -> None:
+    if not _have_repo():
+        return
+    for name in ALL_FILES:
+        for service, svc in _load(name).get("services", {}).items():
+            for key in _autoheal_labels(svc):
+                assert key.startswith(f"{_AUTOHEAL_LABEL}."), f"{name}: {service} uses the shared key {key!r}"
+        env = _env_map(_load(name).get("services", {}).get("autoheal", {}).get("environment"))
+        assert env.get("AUTOHEAL_CONTAINER_LABEL", f"{_AUTOHEAL_LABEL}.x") != _AUTOHEAL_LABEL, name
 
 
 def test_worker_liveness_allows_five_minutes_of_missed_beats_before_unhealthy() -> None:

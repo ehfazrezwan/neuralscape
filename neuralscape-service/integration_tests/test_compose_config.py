@@ -208,3 +208,81 @@ def test_only_the_socket_proxy_has_the_docker_socket(project: Path) -> None:
         for name, service in _services(project, stack, tuple(PROFILES)).items():
             sources = [v.get("source") for v in service.get("volumes", [])]
             assert ("/var/run/docker.sock" in sources) == (name == "docker-socket-proxy"), (stack, name)
+
+
+# ── autoheal is scoped to its own compose project ───────────────────
+
+AUTOHEAL_PREFIX = "com.neuralscape.autoheal"
+AUTOHEAL_LABELLED = {
+    "cbm-bridge",
+    "resolver-svc",
+    "neuralscape",
+    "neuralscape-worker",
+    "neuralscape-graph-worker",
+    "neuralscape-ingest-worker",
+}
+
+
+def _rendered(project: Path, stack: str, project_name: str | None, env: dict | None = None) -> dict:
+    """``docker compose [-p name] ... config --format json`` with every profile on (all six labelled services)."""
+    cmd = ["docker", "compose"]
+    if project_name is not None:
+        cmd += ["--project-name", project_name]
+    for name in STACKS[stack]:
+        cmd += ["-f", name]
+    for profile in PROFILES:
+        cmd += ["--profile", profile]
+    cmd += ["config", "--format", "json"]
+    result = subprocess.run(cmd, cwd=project, capture_output=True, text=True, env=env or _env(), check=False)
+    assert result.returncode == 0, f"{stack} -p {project_name}: {result.stderr}"
+    return json.loads(result.stdout)
+
+
+def _matches(key: str, service: dict) -> bool:
+    """The filter willfarrell/autoheal sends to the Docker API: ``label=<key>=true``."""
+    return (service.get("labels") or {}).get(key) == "true"
+
+
+@pytest.mark.parametrize("stack", sorted(STACKS))
+def test_autoheal_sidecar_only_matches_its_own_compose_project(project: Path, stack: str) -> None:
+    """Two projects on one Docker host must not restart each other's containers.
+
+    The socket proxy lets the sidecar list every container on the host, so the label
+    key it filters on is the only scope: it has to embed the project name.
+    """
+    names = ("nstest-autoheal-a", "nstest-autoheal-b")
+    rendered = {name: _rendered(project, stack, name) for name in names}
+    for mine, theirs in (names, names[::-1]):
+        services = rendered[mine]["services"]
+        key = services["autoheal"]["environment"]["AUTOHEAL_CONTAINER_LABEL"]
+        assert key == f"{AUTOHEAL_PREFIX}.{mine}"
+        assert key not in {AUTOHEAL_PREFIX, "all"}
+        assert {n for n, svc in services.items() if _matches(key, svc)} == AUTOHEAL_LABELLED
+        foreign = [n for n, svc in rendered[theirs]["services"].items() if _matches(key, svc)]
+        assert not foreign, f"{mine}'s sidecar would restart {theirs}'s {foreign}"
+        # the bare, shared key must not be on any service any more
+        assert not [n for n, svc in services.items() if AUTOHEAL_PREFIX in (svc.get("labels") or {})]
+
+
+def test_autoheal_key_carries_the_directory_derived_project_name_without_dash_p(project: Path) -> None:
+    """No ``-p`` and no ``COMPOSE_PROJECT_NAME``: Compose names the project after the directory,
+    and the label key must carry that resolved name (not the ``neuralscape`` fallback)."""
+    expected = "".join(c for c in project.name.lower() if c in "abcdefghijklmnopqrstuvwxyz0123456789_-").lstrip("_-")
+    assert expected and expected != "neuralscape"
+    rendered = _rendered(project, "base", None)
+    assert rendered["name"] == expected
+    services = rendered["services"]
+    key = services["autoheal"]["environment"]["AUTOHEAL_CONTAINER_LABEL"]
+    assert key == f"{AUTOHEAL_PREFIX}.{expected}"
+    assert {n for n, svc in services.items() if _matches(key, svc)} == AUTOHEAL_LABELLED
+
+
+def test_worker_autoheal_false_opts_the_workers_out_of_the_sidecar_filter(project: Path) -> None:
+    rendered = _rendered(project, "base", "nstest-autoheal-a", _env(WORKER_AUTOHEAL="false"))
+    services = rendered["services"]
+    key = services["autoheal"]["environment"]["AUTOHEAL_CONTAINER_LABEL"]
+    for worker in ("neuralscape-worker", "neuralscape-graph-worker", "neuralscape-ingest-worker"):
+        assert services[worker]["labels"][key] == "false"
+        assert not _matches(key, services[worker])
+    # the API and the sidecar-served code-intel services are still healed
+    assert {n for n, svc in services.items() if _matches(key, svc)} == {"cbm-bridge", "resolver-svc", "neuralscape"}

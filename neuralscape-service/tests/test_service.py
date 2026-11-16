@@ -184,7 +184,7 @@ class TestDeleteMemoriesEndpoint:
         data = resp.json()
         assert data["status"] == "ok"
         assert "deleted" in data["message"].lower()
-        mock_service.delete_memories.assert_called_once_with(user_id="u1")
+        mock_service.delete_memories.assert_called_once_with(user_id="u1", include_shared=False)
 
 
 # ──────────────────────────────────────────────
