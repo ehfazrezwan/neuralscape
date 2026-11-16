@@ -44,9 +44,10 @@ What it does NOT do
 
 Usage
 -----
-Run inside the running ``neuralscape`` container:
+One-off repair; run once, on a deployment that ran the affected code, inside the
+running API container:
 
-    docker exec neuralscape-neuralscape-1 \\
+    docker exec <api-container> \\
         python scripts/backfill_vault_writes.py [--dry-run] \\
                                                 [--user USER_ID] \\
                                                 [--limit N_PER_USER]

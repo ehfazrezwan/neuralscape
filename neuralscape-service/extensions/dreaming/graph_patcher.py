@@ -48,6 +48,56 @@ _backoff_sleep = asyncio.sleep
 WRITE_WINDOW_SECONDS = 120
 
 
+# Node kinds Graphiti stores that carry ``group_id`` and that our stamps reach.
+# A label-less ``MATCH (n)`` cannot use Graphiti's label-scoped indexes and
+# scans every node in the database; these queries name the kinds explicitly.
+# (Saga nodes, which NS does not use, are not covered.)
+_NODE_KINDS = ("Entity", "Episodic", "Community")
+
+
+def _any_kind(where: str) -> str:
+    """Cypher ``CALL`` block yielding ``n`` for every node kind matching ``where``.
+
+    One label-scoped ``MATCH`` per kind (so each can use its label index),
+    UNION-ed. Replaces the label-less ``MATCH (n) WHERE ...`` scan without
+    dropping any kind the old query could reach.
+    """
+    branches = "\n        UNION\n".join(
+        f"        MATCH (n:{kind}) WHERE {where} RETURN n" for kind in _NODE_KINDS
+    )
+    return f"CALL {{\n{branches}\n    }}"
+
+
+# The episode's own node, every entity it mentions and the communities those
+# entities belong to (the old window stamped communities too): exactly the nodes
+# one write produced or touched, whatever else is writing to the group at once.
+# Rows are ordered by uuid before any write so two jobs sharing entities take
+# their node locks in the same order (no lock-order deadlock). ``@@S@@`` is
+# filled with ``s, `` when a MERGEd ``s`` must survive the WITH clauses.
+_EPISODE_NODES_BY_UUID = """
+    MATCH (ep:Episodic {group_id: $group_id}) WHERE ep.uuid = $episode_uuid
+    OPTIONAL MATCH (ep)-[:MENTIONS]->(e:Entity) WHERE e.group_id = $group_id
+    OPTIONAL MATCH (c:Community {group_id: $group_id})-[:HAS_MEMBER]->(e)
+    WITH @@S@@collect(DISTINCT ep) + collect(DISTINCT e) + collect(DISTINCT c) AS nodes
+    UNWIND nodes AS n
+    WITH @@S@@n ORDER BY n.uuid
+"""
+_EPISODE_NODES_BY_NAME = _EPISODE_NODES_BY_UUID.replace(
+    "ep.uuid = $episode_uuid", "ep.name = $episode_name"
+)
+
+
+def _episode_selector(
+    episode_uuid: str | None, episode_name: str | None, carry: str = ""
+) -> tuple[str, dict] | None:
+    """Cypher prefix + params selecting a write's own nodes, or None (no ref)."""
+    if episode_uuid:
+        return _EPISODE_NODES_BY_UUID.replace("@@S@@", carry), {"episode_uuid": episode_uuid}
+    if episode_name:
+        return _EPISODE_NODES_BY_NAME.replace("@@S@@", carry), {"episode_name": episode_name}
+    return None
+
+
 async def attach_memory_id(
     driver: Any,
     *,
@@ -57,48 +107,92 @@ async def attach_memory_id(
     owner_user_id: str | None,
     write_started_at: datetime,
     window_seconds: int | None = None,
+    episode_uuid: str | None = None,
+    episode_name: str | None = None,
 ) -> int:
-    """Mark recently-created Graphiti nodes with their originating memory.
+    """Mark the Graphiti nodes a write produced with their originating memory.
 
     Returns the number of nodes patched. Best-effort — never raises.
 
-    The match window is ``[write_started_at - window_seconds, now]``
-    intersected with the given ``group_id``. ``window_seconds`` defaults
-    to :data:`WRITE_WINDOW_SECONDS` (120s). Operators can override per
-    call (or globally via ``WIKI_SYNTHESIZER_ATTACH_WINDOW_SECONDS``) —
-    longer windows help on slow Gemini days where entity extraction
-    overruns the default 2-minute envelope.
+    When the write's episode is known (``episode_uuid`` or the deterministic
+    ``episode_name``) the nodes are selected by provenance: the ``Episodic``
+    node itself and every ``Entity`` it ``MENTIONS``. Concurrent graph jobs in
+    one group therefore never stamp each other's nodes. Only when no episode
+    reference is available does this fall back (with a warning) to the legacy
+    time window ``[write_started_at - window_seconds, now]`` over the group;
+    ``window_seconds`` defaults to :data:`WRITE_WINDOW_SECONDS` and is only
+    meaningful on that fallback.
 
-    Nodes that already carry a ``memory_id`` are left alone via
-    ``coalesce`` so we never overwrite an earlier attach.
+    Properties written on each node:
+
+    * ``memory_id`` — the *first* memory to claim the node (``coalesce``, never
+      overwritten). Kept for existing readers (wiki/dream/playbook patchers).
+    * ``memory_ids`` — additive list of EVERY memory id whose episode mentions
+      the node. One conversation episode backs N stored facts but ``memory_id``
+      holds only the first; ``memory_ids`` records them all. Idempotent
+      (a memory id is appended once).
+    * ``ns_visibility`` / ``ns_owner`` — coalesced, as before.
     """
     if not memory_id or not group_id:
         return 0
-    window = window_seconds if window_seconds is not None else WRITE_WINDOW_SECONDS
-    cypher = """
-    MATCH (n)
-    WHERE n.group_id = $group_id
-      AND n.created_at >= datetime($lower_bound)
+    # SET of a list property is read-modify-write: take the node's write lock
+    # first (a throwaway property) so two jobs appending to one shared entity
+    # serialise instead of losing an update, and drop it before commit.
+    set_clause = """
+    SET n.ns_attach_lock = true
+    WITH n
     SET n.memory_id = coalesce(n.memory_id, $memory_id),
+        n.memory_ids = CASE
+            WHEN $memory_id IN coalesce(n.memory_ids, []) THEN n.memory_ids
+            ELSE coalesce(n.memory_ids, []) + $memory_id
+        END,
         n.ns_visibility = coalesce(n.ns_visibility, $visibility),
         n.ns_owner = coalesce(n.ns_owner, $owner)
+    REMOVE n.ns_attach_lock
     RETURN count(n) AS patched
     """
-    lower_bound = (
-        write_started_at.astimezone(timezone.utc) - _delta_seconds(window)
-    ).isoformat()
+    params: dict[str, Any] = {
+        "group_id": group_id,
+        "memory_id": memory_id,
+        "visibility": visibility,
+        "owner": owner_user_id,
+    }
+    selector = _episode_selector(episode_uuid, episode_name)
+    if selector is not None:
+        prefix, extra = selector
+        cypher = prefix + set_clause
+        params.update(extra)
+    else:
+        logger.warning(
+            "attach_memory_id: no episode reference for memory_id=%s group_id=%s; "
+            "falling back to the creation-time window (may stamp concurrent writes' nodes)",
+            memory_id,
+            group_id,
+        )
+        window = window_seconds if window_seconds is not None else WRITE_WINDOW_SECONDS
+        params["lower_bound"] = (
+            write_started_at.astimezone(timezone.utc) - _delta_seconds(window)
+        ).isoformat()
+        cypher = (
+            _any_kind("n.group_id = $group_id AND n.created_at >= datetime($lower_bound)")
+            + set_clause
+        )
+    from neo4j.exceptions import TransientError
+
     try:
-        async with driver.session() as session:
-            result = await session.run(
-                cypher,
-                group_id=group_id,
-                lower_bound=lower_bound,
-                memory_id=memory_id,
-                visibility=visibility,
-                owner=owner_user_id,
-            )
-            record = await result.single()
-            return int(record["patched"]) if record else 0
+        # Two jobs can still cross locks on a shared node; Neo4j aborts one with
+        # a TransientError (deadlock). Retry after a jittered backoff so the
+        # stamp is not silently lost (same remedy as attach_source_ref).
+        for attempt in range(_SOURCE_ATTACH_RETRIES + 1):
+            try:
+                async with driver.session() as session:
+                    result = await session.run(cypher, **params)
+                    record = await result.single()
+                    return int(record["patched"]) if record else 0
+            except TransientError:
+                if attempt == _SOURCE_ATTACH_RETRIES:
+                    raise
+                await _backoff_sleep(0.2 * (2**attempt) + random.uniform(0, 0.2))
     except Exception:
         logger.warning(
             "attach_memory_id failed for memory_id=%s group_id=%s (non-fatal)",
@@ -117,17 +211,21 @@ async def attach_source_ref(
     source_ref: dict,
     write_started_at: datetime,
     window_seconds: int | None = None,
+    episode_uuid: str | None = None,
+    episode_name: str | None = None,
 ) -> int:
-    """Link freshly-created graph nodes to the data-layer source they came from.
+    """Link a write's graph nodes to the data-layer source they came from.
 
     For memories ingested from an external connector (Google Drive, Notion,
     an MCP server, …), this MERGEs a ``(:Source)`` node keyed by
     ``connector_id`` + a stable source key (external_id → parent_id →
-    connector_id) and connects every node written in this group/window to it
-    via ``(:Entity)-[:DERIVED_FROM]->(:Source)``. It also stamps connector
+    connector_id) and connects every node the write produced to it via
+    ``(:Entity)-[:DERIVED_FROM]->(:Source)``. It also stamps connector
     properties directly on those nodes so a graph search can answer "which
     connector produced this / what else came from the same source" without a
-    hop. Best-effort — never raises (mirrors :func:`attach_memory_id`).
+    hop. Node selection follows :func:`attach_memory_id` (the write's own
+    episode + mentioned entities; the time window only as a logged fallback
+    when no episode reference is known). Best-effort — never raises.
     """
     if not source_ref or not group_id:
         return 0
@@ -140,11 +238,7 @@ async def attach_source_ref(
         or source_ref.get("parent_id")
         or connector_id
     )
-    window = window_seconds if window_seconds is not None else WRITE_WINDOW_SECONDS
-    lower_bound = (
-        write_started_at.astimezone(timezone.utc) - _delta_seconds(window)
-    ).isoformat()
-    cypher = """
+    merge_source = """
     MERGE (s:Source {connector_id: $connector_id, source_key: $source_key})
     SET s.connector_type = $connector_type,
         s.url = coalesce($url, s.url),
@@ -152,33 +246,55 @@ async def attach_source_ref(
         s.external_id = coalesce($external_id, s.external_id),
         s.last_synced_at = $last_synced_at
     WITH s
-    MATCH (n)
-    WHERE n.group_id = $group_id
-      AND n.created_at >= datetime($lower_bound)
+    """
+    stamp = """
     SET n.ns_connector_id = coalesce(n.ns_connector_id, $connector_id),
         n.ns_connector_type = coalesce(n.ns_connector_type, $connector_type),
         n.ns_source_url = coalesce(n.ns_source_url, $url)
     MERGE (n)-[:DERIVED_FROM]->(s)
     RETURN count(n) AS patched
     """
+    params: dict[str, Any] = {
+        "connector_id": connector_id,
+        "source_key": source_key,
+        "connector_type": source_ref.get("connector_type"),
+        "url": source_ref.get("url"),
+        "title": source_ref.get("title"),
+        "external_id": source_ref.get("external_id"),
+        "last_synced_at": source_ref.get("last_synced_at"),
+        "group_id": group_id,
+    }
+    selector = _episode_selector(episode_uuid, episode_name)
+    if selector is not None:
+        prefix, extra = selector
+        # ``s`` must survive the WITH in the node selector.
+        cypher = merge_source + _episode_selector(
+            episode_uuid, episode_name, carry="s, "
+        )[0] + stamp
+        params.update(extra)
+    else:
+        logger.warning(
+            "attach_source_ref: no episode reference for memory_id=%s group_id=%s; "
+            "falling back to the creation-time window (may stamp concurrent writes' nodes)",
+            memory_id,
+            group_id,
+        )
+        window = window_seconds if window_seconds is not None else WRITE_WINDOW_SECONDS
+        params["lower_bound"] = (
+            write_started_at.astimezone(timezone.utc) - _delta_seconds(window)
+        ).isoformat()
+        cypher = (
+            merge_source
+            + _any_kind("n.group_id = $group_id AND n.created_at >= datetime($lower_bound)")
+            + stamp
+        )
     from neo4j.exceptions import TransientError
 
     try:
         for attempt in range(_SOURCE_ATTACH_RETRIES + 1):
             try:
                 async with driver.session() as session:
-                    result = await session.run(
-                        cypher,
-                        connector_id=connector_id,
-                        source_key=source_key,
-                        connector_type=source_ref.get("connector_type"),
-                        url=source_ref.get("url"),
-                        title=source_ref.get("title"),
-                        external_id=source_ref.get("external_id"),
-                        last_synced_at=source_ref.get("last_synced_at"),
-                        group_id=group_id,
-                        lower_bound=lower_bound,
-                    )
+                    result = await session.run(cypher, **params)
                     record = await result.single()
                     return int(record["patched"]) if record else 0
             except TransientError:
@@ -225,9 +341,7 @@ async def patch_wiki_path(
         return 0
     ts = (synthesized_at or datetime.now(timezone.utc)).isoformat()
     if group_id:
-        cypher = """
-        MATCH (n)
-        WHERE n.uuid IN $uuids AND n.group_id = $group_id
+        cypher = _any_kind("n.uuid IN $uuids AND n.group_id = $group_id") + """
         SET n.wiki_path = $wiki_path,
             n.wiki_synthesized_at = $synthesized_at
         RETURN count(n) AS patched
@@ -239,9 +353,7 @@ async def patch_wiki_path(
             "group_id": group_id,
         }
     else:
-        cypher = """
-        MATCH (n)
-        WHERE n.uuid IN $uuids
+        cypher = _any_kind("n.uuid IN $uuids") + """
         SET n.wiki_path = $wiki_path,
             n.wiki_synthesized_at = $synthesized_at
         RETURN count(n) AS patched
@@ -297,9 +409,7 @@ async def patch_wiki_path_by_memory_ids(
         return 0
     ts = (synthesized_at or datetime.now(timezone.utc)).isoformat()
     if group_id:
-        cypher = """
-        MATCH (n)
-        WHERE n.memory_id IN $mids AND n.group_id = $group_id
+        cypher = _any_kind("n.memory_id IN $mids AND n.group_id = $group_id") + """
         SET n.wiki_path = $wiki_path,
             n.wiki_synthesized_at = $synthesized_at
         RETURN count(n) AS patched
@@ -311,9 +421,7 @@ async def patch_wiki_path_by_memory_ids(
             "group_id": group_id,
         }
     else:
-        cypher = """
-        MATCH (n)
-        WHERE n.memory_id IN $mids
+        cypher = _any_kind("n.memory_id IN $mids") + """
         SET n.wiki_path = $wiki_path,
             n.wiki_synthesized_at = $synthesized_at
         RETURN count(n) AS patched
@@ -394,8 +502,7 @@ async def invalidate_memory_graph(
     like every helper in this module).
     """
     ts = (now or datetime.now(timezone.utc)).isoformat()
-    node_cypher = """
-    MATCH (n {group_id: $group_id, memory_id: $memory_id})
+    node_cypher = _any_kind("n.group_id = $group_id AND n.memory_id = $memory_id") + """
     SET n.dream_superseded_by = $superseded_by, n.dream_invalidated_at = $ts
     RETURN count(n) AS nodes
     """
@@ -450,9 +557,7 @@ async def patch_dream_path_by_memory_ids(
     if not ids:
         return 0
     ts = datetime.now(timezone.utc).isoformat()
-    cypher = """
-    MATCH (n {group_id: $group_id})
-    WHERE n.memory_id IN $memory_ids
+    cypher = _any_kind("n.group_id = $group_id AND n.memory_id IN $memory_ids") + """
     SET n.dream_path = $dream_path, n.dreamt_at = $ts
     RETURN count(n) AS patched
     """
@@ -533,38 +638,6 @@ async def find_contradicted_edges(
         return []
 
 
-async def count_live_edges_by_episode(
-    driver: Any,
-    *,
-    group_id: str,
-    episode_uuids: list[str],
-) -> dict[str, int]:
-    """Live (neither invalid nor expired) RELATES_TO edge count per episode.
-
-    An episode that appears in ``episode_uuids`` but has no live edge maps to
-    ``0``. Raises on driver errors — the caller decides how to degrade (the
-    supersession hook treats a failure as "leave rows alone").
-    """
-    counts = {ep: 0 for ep in episode_uuids}
-    if not group_id or not episode_uuids:
-        return counts
-    cypher = """
-    MATCH ()-[r:RELATES_TO]->()
-    WHERE r.group_id = $group_id
-      AND r.invalid_at IS NULL
-      AND r.expired_at IS NULL
-    UNWIND [ep IN coalesce(r.episodes, []) WHERE ep IN $episode_uuids] AS ep
-    RETURN ep AS episode_uuid, count(r) AS live
-    """
-    async with driver.session() as session:
-        result = await session.run(
-            cypher, group_id=group_id, episode_uuids=list(episode_uuids)
-        )
-        for row in await result.data():
-            counts[row["episode_uuid"]] = int(row["live"])
-    return counts
-
-
 async def episode_edge_counts(
     driver: Any,
     *,
@@ -591,3 +664,34 @@ async def episode_edge_counts(
         rows = await result.data()
     row = rows[0] if rows else {}
     return {"total": int(row.get("total") or 0), "live": int(row.get("live") or 0)}
+
+
+async def live_edge_facts_by_episode(
+    driver: Any,
+    *,
+    group_id: str,
+    episode_uuids: list[str],
+) -> dict[str, list[str]]:
+    """Facts of the LIVE (neither invalid nor expired) RELATES_TO edges per episode.
+
+    An episode with no live edge maps to ``[]``. Raises on driver errors; the
+    supersession hook swallows them (rows stay live).
+    """
+    facts: dict[str, list[str]] = {ep: [] for ep in episode_uuids}
+    if not group_id or not episode_uuids:
+        return facts
+    cypher = """
+    MATCH ()-[r:RELATES_TO]->()
+    WHERE r.group_id = $group_id
+      AND r.invalid_at IS NULL
+      AND r.expired_at IS NULL
+    UNWIND [ep IN coalesce(r.episodes, []) WHERE ep IN $episode_uuids] AS ep
+    RETURN ep AS episode_uuid, collect(r.fact) AS facts
+    """
+    async with driver.session() as session:
+        result = await session.run(
+            cypher, group_id=group_id, episode_uuids=list(episode_uuids)
+        )
+        for row in await result.data():
+            facts[row["episode_uuid"]] = [f or "" for f in (row.get("facts") or [])]
+    return facts

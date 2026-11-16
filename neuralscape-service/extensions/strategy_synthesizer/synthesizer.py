@@ -19,6 +19,7 @@ synthesis, the (expensive) LLM merge is skipped.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -90,7 +91,7 @@ async def synthesize_all(
         logger.info("strategy synthesizer disabled — skipping run")
         return result
 
-    groups = _group_by_strategy(_scroll_trading_memories(service))
+    groups = _group_by_strategy(await asyncio.to_thread(_scroll_trading_memories, service))
     if not groups:
         logger.info("strategy synthesis skipped: no trading memories found")
         return result

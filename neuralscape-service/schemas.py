@@ -1217,7 +1217,8 @@ class BulkDeleteRequest(BaseModel):
         description=(
             "When False (default), shared memories the caller authored are "
             "preserved even on bulk delete — they're team artifacts. Set True "
-            "to also remove the caller's shared writes (admin-style nuke)."
+            "to also delete the caller's OWN shared rows; never another user's "
+            "rows and never standard rows."
         ),
     )
 

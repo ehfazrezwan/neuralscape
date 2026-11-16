@@ -117,7 +117,9 @@ hidden and `POST /oauth/authorize` rejects token submits). It's always shown for
 A login is accepted only when the email is **verified** AND
 (`domain ∈ AUTH_ALLOWED_DOMAINS` OR `email ∈ AUTH_EMAIL_ALLOWLIST`).
 Both lists are comma-separated and case-insensitive; a leading `@` on a domain
-is tolerated. **An empty allowlist denies everyone (fail-closed).**
+is tolerated. The raw address is judged, never trimmed: it must contain exactly one
+`@` with a non-empty local part and domain and no whitespace, control or
+invisible characters, or it is denied. The Supabase hook applies the same rule. **An empty allowlist denies everyone (fail-closed).**
 
 - `google`: this env allowlist is the sole gate (must be configured).
 - `supabase`: the Supabase hook is the canonical gate; the env allowlist is
@@ -329,6 +331,89 @@ exchanges the PKCE `code` for a session (verifier in localStorage, same-origin),
 then POSTs the session JWT to `POST /oauth/supabase/callback`, which verifies it
 and continues the MCP flow. The start and finish pages **must be same-origin**
 (both under `NEURALSCAPE_PUBLIC_URL`) for the PKCE exchange to work.
+
+### Login binding (Google and Supabase)
+
+The signed `login_state` that carries the authorize request across the IdP
+redirect is bound to the browser that started the login, so a state URL built by
+someone else cannot be completed in a victim's browser (login CSRF).
+
+- `GET /oauth/authorize` sets the binding cookie: HttpOnly, `SameSite=Lax`,
+  10 minutes. Its signed value holds the same nonce as the `login_state`. When
+  `NEURALSCAPE_PUBLIC_URL` is https it is `__Host-ns_login_bind` (Secure,
+  `Path=/`, no Domain), so a sibling subdomain or a plain-http origin cannot
+  plant an attacker's cookie; the plain name is then ignored, and a request
+  carrying the cookie name more than once is refused. On plain http (loopback
+  dev) it is `ns_login_bind` with `Path=/oauth`.
+- The callback (`GET /oauth/google/callback`, `POST /oauth/supabase/callback`)
+  requires the cookie, a valid signature and expiry, and
+  `state.nonce == cookie.nonce`. The nonce is then claimed once in Redis
+  (`oauth:login_nonce:<nonce>`, SET NX EX 600). A missing, mismatched, tampered,
+  expired or replayed binding answers 4xx with a "Sign-in failed" page and issues
+  no code. If Redis is down the callback answers 503 and issues nothing (fail
+  closed); the cookie is kept so the user can retry.
+- `SameSite=Lax` is sufficient: Google returns by a top-level GET, and the
+  Supabase finisher POSTs from this origin. `Strict` would drop the cookie on the
+  cross-site GET.
+- Operator notes: the https cookie is `Secure`, so reaching the app over plain
+  http while `NEURALSCAPE_PUBLIC_URL` is https (a tunnel or port-forward) drops
+  it and every federated login is refused; use the https URL, or set the public
+  URL to the http address you really use. The `__Host-` cookie has `Path=/`, so a
+  reverse proxy that serves the app under a path prefix still works if it
+  forwards the `Cookie` header and `Set-Cookie` unmodified; a proxy that rewrites
+  cookie paths or strips `Set-Cookie`/`Cookie` breaks it.
+- Users must finish the login in the same browser that started it, with cookies
+  enabled. Starting a second login in another tab replaces the cookie, so only
+  the most recent tab can finish.
+
+### Redirect host allowlist (`OAUTH_REDIRECT_HOST_ALLOWLIST`)
+
+`POST /oauth/register` is open: anyone may register a client, so by default any
+https redirect URI is accepted, and so is a phishing client that would receive a
+victim's authorization code. The consent page shows the redirect host so the
+person logging in can see where access goes. To close the door, list the hosts
+you really connect from:
+
+```
+OAUTH_REDIRECT_HOST_ALLOWLIST=claude.ai
+```
+
+- **Empty (the default) changes nothing**: any https redirect URI, or http to a
+  loopback host, as before.
+- Comma-separated, case-insensitive entries: `host` or `host:port`. Entries are
+  exact hostnames (no wildcards, no suffix matching). A bare `host` matches the
+  scheme's default port only (`https://claude.ai` and `https://claude.ai:443`,
+  not `https://claude.ai:8443`); write `claude.ai:8443` to allow that port. A
+  `host:port` entry does not also open the default port.
+- **Loopback exemption.** Redirect hosts `127.0.0.1`, `localhost` and IPv6 `[::1]`
+  (written `http://[::1]:PORT/cb` in a URI) stay allowed, with any port and
+  either scheme, even when the list is set. Native clients (RFC 8252 section
+  7.3) listen on an ephemeral loopback port, so no list could name it, and such a
+  redirect only reaches the user's own machine. Loopback entries are never needed
+  in the list. Other IPv6 literals cannot be listed (entries with brackets or
+  colons other than a port are rejected at startup).
+- It sits on top of the existing rules and never widens them: http to a
+  non-loopback host, userinfo, fragments and non-ASCII or percent-encoded hosts
+  stay refused.
+- **Startup validation.** A malformed value stops the service at startup with a
+  clear error instead of being ignored (an ignored list would fail open): empty
+  entries (doubled or trailing comma, or a value of only separators), a scheme,
+  path, userinfo or wildcard, non-ASCII (use the punycode form), or a port that is
+  not 1-65535.
+- **Where it is enforced.** At `POST /oauth/register` (400
+  `invalid_redirect_uri`; every URI in the request must pass); at `GET` and
+  `POST /oauth/authorize` (400 `invalid_request`, `redirect_uri mismatch`); at
+  every code issuance (`_issue_code_and_redirect`: token paste, the Google and
+  Supabase callbacks, and `/oauth/link`, which refuses before persisting
+  anything), where a refusal renders a "Sign-in failed" page and issues no code;
+  and at `POST /oauth/token`, which refuses to redeem a code whose redirect host
+  is no longer listed (`invalid_grant`). So a client registered, a login started,
+  a link ticket minted or a code issued before the list was set stops working
+  once its host is not listed. Access and refresh tokens already issued are not
+  touched: end those with token revocation.
+- Recommendation for production: set it to the callback hosts you use (for
+  example the Claude connector's). Setting it is a deployment step; the default
+  stays empty.
 
 ---
 

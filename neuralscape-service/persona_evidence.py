@@ -31,7 +31,7 @@ import sys
 from pathlib import Path
 
 from evidence_records import (
-    EvidenceRecord, EvidenceWriter, FileIdentity, UnsafePath, compare, facts, render_report, write_text_guarded,
+    EvidenceRecord, EvidenceWriter, FileIdentity, RecordConflict, UnsafePath, compare, facts, render_report, write_text_guarded,
 )
 
 PROBES = Path(__file__).resolve().with_name("persona_probes.py")
@@ -223,8 +223,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "run":
         try:
             records = run(Path(args.service_dir), args.role, args.subject_ref, Path(args.oracles), Path(args.out), args.run_id)
-        except (RunIdentityConflict, UnsafePath) as conflict:
-            print(f"error: {conflict}", file=sys.stderr)
+        except (RunIdentityConflict, UnsafePath, OracleError, RecordConflict, OSError) as refusal:
+            # every refusal is exit 2 with one diagnostic line, never a traceback
+            print(f"error: {' '.join(str(refusal).split()) or type(refusal).__name__}", file=sys.stderr)
             return 2
         for record in records:
             print(f"{record.scenario_id}: {record.verdict}")
@@ -234,7 +235,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"error: evidence file not found: {evidence}", file=sys.stderr)
         return 2
     try:
-        snapshot = EvidenceWriter(evidence).snapshot_pinned()   # resolved and opened once: read, locked and identified together
+        snapshot = EvidenceWriter(evidence, create=False).snapshot_pinned()   # resolved and opened once: read, locked and identified together
     except (UnsafePath, OSError) as problem:
         print(f"error: cannot read the evidence file: {problem}", file=sys.stderr)
         return 2

@@ -17,7 +17,7 @@ from dataclasses import dataclass
 
 import pytest
 
-from nsaccept import eventually, expect_check_fails, needs, negative_control, profiles, proves
+from nsaccept import eventually, expect_check_fails, needs, negative_control, precondition, profiles, proves
 from nsaccept.client import NSClient
 from nsaccept.helpers import Written, mcp_json, write_raw
 from nsaccept.hooks import run_hook
@@ -137,6 +137,8 @@ def test_a_dictator_standard_is_injected_into_every_users_context(ctx, a, b, dic
 @proves("read.standards-always-inject", "ext.standards-tier", "model.standard-tier")
 @negative_control
 def test_injection_check_fails_for_a_marker_nobody_wrote(ctx, a, std: Std):
+    _written(std)
+    precondition(check_standard_injected, a, std.markers["crit"], std.project, what="the critical standard is injected for A")
     expect_check_fails(check_standard_injected, a, f"zq-{ctx.run_id}-never-written", std.project)
 
 
@@ -173,7 +175,8 @@ def test_only_the_dictator_may_write_the_standard_tier(ctx, a, b, dictator, mcp_
 
 @proves("auth.dictator-role", "model.standard-tier")
 @negative_control
-def test_write_refusal_check_fails_for_the_dictator(ctx, dictator):
+def test_write_refusal_check_fails_for_the_dictator(ctx, a, dictator):
+    precondition(check_standard_write_refused, a, ctx.run_id, what="a non-dictator's standard write is refused")
     # the dictator's identical request is accepted (202), so the 403 check must trip
     expect_check_fails(check_standard_write_refused, dictator, ctx.run_id)
 
@@ -208,11 +211,17 @@ def test_hook_block_check_fails_without_a_token(ctx, std: Std):
         base_url=ctx.base_url, token=ctx.bad_token, user_id=ctx.user_a, project_id=std.project,
     )
 
-    def check():
-        text = ((res.data or {}).get("hookSpecificOutput") or {}).get("additionalContext", "")
-        assert std.markers["crit"] in text, "the standards block is absent for an unauthenticated hook"
+    own = run_hook(
+        "session-start", {"hook_event_name": "SessionStart", "source": "startup", "session_id": f"acc-{ctx.run_id}-std1"},
+        base_url=ctx.base_url, token=ctx.token_a, user_id=ctx.user_a, project_id=std.project,
+    )
 
-    expect_check_fails(check)
+    def check(r):
+        text = ((r.data or {}).get("hookSpecificOutput") or {}).get("additionalContext", "")
+        assert std.markers["crit"] in text, "the standards block is absent from the hook output"
+
+    precondition(check, own, what="an authenticated hook shows the standards block")
+    expect_check_fails(check, res)
 
 
 # ── processes ────────────────────────────────────────────────────
@@ -247,7 +256,7 @@ def test_the_process_registry_lists_and_assembles_a_dictator_process(ctx, a, b, 
 @negative_control
 def test_process_bundle_check_fails_for_a_different_order_and_slug(std: Std):
     good = {"slug": std.slug, "title": std.markers["title"], "steps": [std.markers["stepa"], std.markers["stepb"]], "guidelines": [std.markers["guide"]]}
-    check_process_bundle(good, std.slug, [std.markers["stepa"], std.markers["stepb"]], std.markers["guide"], std.markers["title"])
+    precondition(check_process_bundle, good, std.slug, [std.markers["stepa"], std.markers["stepb"]], std.markers["guide"], std.markers["title"], what="the well-formed bundle passes")
     swapped = {**good, "steps": list(reversed(good["steps"]))}
     expect_check_fails(check_process_bundle, swapped, std.slug, [std.markers["stepa"], std.markers["stepb"]], std.markers["guide"], std.markers["title"])
     expect_check_fails(check_process_bundle, {**good, "slug": "other"}, std.slug, [std.markers["stepa"], std.markers["stepb"]], std.markers["guide"], std.markers["title"])
@@ -272,12 +281,18 @@ def test_the_leak_audit_and_dry_run_rescope_are_open_to_the_dictator_only(ctx, a
 
 @proves("hygiene.private-leak-remediation", "auth.dictator-role")
 @negative_control
-def test_admin_open_check_fails_for_a_non_dictator(ctx, a):
+def test_admin_open_check_fails_for_a_non_dictator(ctx, a, dictator):
+    precondition(check_admin_open, dictator, ctx.user_a, what="the dictator reaches the admin routes")
     expect_check_fails(check_admin_open, a, ctx.user_a)
 
 
 def check_config(body: dict, project: str, systems: list[str], fuse: bool, engine: str | None) -> None:
-    assert body == {"project_id": project, "code_systems": systems, "fuse_code_into_recall": fuse, "default_engine": engine}, f"config: {body}"
+    # code_space / op_preference are read-only here (the PUT body cannot set them; only indexing does), and
+    # this project is never indexed, so both stay None through every write and read.
+    assert body == {
+        "project_id": project, "code_systems": systems, "fuse_code_into_recall": fuse, "default_engine": engine,
+        "code_space": None, "op_preference": None,
+    }, f"config: {body}"
 
 
 @proves("knowledge.router", "auth.dictator-role")
@@ -304,7 +319,8 @@ def test_the_dictator_may_set_a_projects_knowledge_config_and_others_may_not(ctx
 @proves("knowledge.router")
 @negative_control
 def test_config_check_fails_for_the_default_config(ctx):
-    expect_check_fails(check_config, {"project_id": "p", "code_systems": [], "fuse_code_into_recall": True, "default_engine": None}, "p", ["code-native"], False, "code-native")
+    precondition(check_config, {"project_id": "p", "code_systems": ["code-native"], "fuse_code_into_recall": False, "default_engine": "code-native", "code_space": None, "op_preference": None}, "p", ["code-native"], False, "code-native", what="a matching config passes")
+    expect_check_fails(check_config, {"project_id": "p", "code_systems": [], "fuse_code_into_recall": True, "default_engine": None, "code_space": None, "op_preference": None}, "p", ["code-native"], False, "code-native")
 
 
 def check_instructions(client: NSClient, project: str, text: str | None) -> None:
@@ -334,4 +350,5 @@ def test_project_wide_extraction_instructions_are_a_dictator_only_write(ctx, a, 
 @proves("write.operator-extraction-instructions")
 @negative_control
 def test_instructions_check_fails_for_an_unset_project(ctx, a):
+    precondition(check_instructions, a, f"{ctx.project_id}-never-set", None, what="an unset project reads as no instructions")
     expect_check_fails(check_instructions, a, f"{ctx.project_id}-never-set", "anything")

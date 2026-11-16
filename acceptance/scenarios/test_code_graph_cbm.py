@@ -9,11 +9,13 @@ names are cache-path-prefixed, so the assertions look for the symbol's bare name
 from __future__ import annotations
 
 import json
+import os
+import re
 from dataclasses import dataclass, field
 
 import pytest
 
-from nsaccept import expect_check_fails, needs, negative_control, profiles, proves
+from nsaccept import expect_check_fails, needs, negative_control, precondition, profiles, proves
 
 from cg_helpers import SYMBOL, cg_get, check_mentions, mcp_text
 
@@ -80,6 +82,7 @@ def test_cbm_answers_query_neighbors_and_locate_over_rest_and_mcp(a, mcp_a, cbm:
 @negative_control
 def test_cbm_check_fails_for_a_symbol_that_does_not_exist(ctx, a, cbm: Cbm):
     c = _ready(cbm)
+    precondition(check_mentions, cg_get(a, "query", question=SYMBOL, graph_id=c.code_space, knowledge_system=SYSTEM)["result"], SYMBOL, what="querying the real symbol finds it")
     q = cg_get(a, "query", question=f"zq_{ctx.run_id}_no_such_symbol", graph_id=c.code_space, knowledge_system=SYSTEM)
     expect_check_fails(check_mentions, q["result"], SYMBOL)
 
@@ -88,13 +91,24 @@ def test_cbm_check_fails_for_a_symbol_that_does_not_exist(ctx, a, cbm: Cbm):
 def test_deleting_the_cbm_project_empties_it(a, cbm: Cbm):
     c = _ready(cbm)
     before = cg_get(a, "query", question=SYMBOL, graph_id=c.code_space, knowledge_system=SYSTEM)
-    check_mentions(before["result"], SYMBOL)  # a real hit exists before the delete
+    check_mentions(before["result"], SYMBOL, "router")  # a real hit names its file/module; an empty answer only echoes the question
     r = a.delete("/v1/code-graph/graph", params={"graph_id": c.code_space, "system": SYSTEM})
     assert r.status_code == 200 and r.json().get("deleted") is True, f"DELETE -> {r.status_code}: {r.text[:200]}"
+    # The cbm engine's teardown answers {deleted: True, project, status: "deleted"} (the bridge's own word): it
+    # reports no node count (the native engine's nodes_deleted is that engine's). What it promises is the project
+    # it deleted, which must be the one this scenario indexed; "nothing removed" is deleted=False. That the index
+    # is really empty is the query below.
     engine = r.json().get("engine_result") or {}
-    counts = [v for k, v in engine.items() if isinstance(v, int) and not isinstance(v, bool) and ("delet" in k or "node" in k or "count" in k)]
-    assert counts and max(counts) > 0, f"the delete reports nothing removed: {engine}"
+    assert engine.get("deleted") is True, f"the delete reports nothing removed: {engine}"
+    # The API does not expose the slug CBM bound at index time (the index result and the status routes omit
+    # it), so "the one this scenario indexed" is checked through what CBM derives it from: the repo path. The
+    # slug is that path flattened, so it must contain the indexed repo's directory name.
+    project = engine.get("project")
+    assert isinstance(project, str) and project, f"the delete names no project: {engine}"
+    repo_name = re.sub(r"[^a-z0-9]+", "-", os.path.basename(c.repo_source.rstrip("/")).lower()).strip("-")
+    assert repo_name in re.sub(r"[^a-z0-9]+", "-", project.lower()), f"the delete names project {project!r}, not the one indexed from {c.repo_source!r}: {engine}"
+    assert engine.get("status") == "deleted", f"the bridge's delete status is {engine.get('status')!r}, want 'deleted': {engine}"
     after = a.get("/v1/code-graph/query", params={"question": SYMBOL, "graph_id": c.code_space, "knowledge_system": SYSTEM})
     # the project is gone: the service answers 200 with no hit (never a 5xx, never the symbol)
     assert after.status_code == 200, f"query after delete -> {after.status_code}: {after.text[:200]}"
-    assert SYMBOL not in after.json().get("result", ""), f"the deleted CBM project still answers: {after.text[:200]}"
+    assert "router" not in after.json().get("result", ""), f"the deleted CBM project still answers: {after.text[:200]}"

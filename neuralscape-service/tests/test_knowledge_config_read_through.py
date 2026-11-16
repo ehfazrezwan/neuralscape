@@ -52,6 +52,7 @@ def env(monkeypatch):
     router._PROJECT_CONFIGS.clear()
     stamps.clear()
     monkeypatch.setattr(index_store, "_redis", lambda: redis)
+    monkeypatch.setattr(index_store, "_redis_read", lambda: redis)
     monkeypatch.setattr(index_store, "config_ttl", lambda: TTL, raising=False)
     monkeypatch.setattr(time, "monotonic", clock)
     yield redis, clock

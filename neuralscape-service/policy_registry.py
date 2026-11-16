@@ -197,6 +197,17 @@ REGISTRY: Mapping[str, Entry] = {
         privileged=False,
         note='system worker principal with explicit retention/derivation statements',
     ),
+    'arq_cron:IngestWorkerSettings.artifact_gc_cron': _e(
+        'delete',
+        'mapped',
+        'system_worker',
+        'system worker statements',
+        extra_actions=(),
+        exempt_reason=None,
+        required_payload=('worker_subject_id', 'policy_epoch'),
+        privileged=False,
+        note='system worker principal with explicit retention/derivation statements; flag ARTIFACT_GC_ENABLED (default off); deletes only artifacts with zero referencing rows past the grace period, dry-run by default',
+    ),
     'arq_cron:LedgerWorkerSettings.ledger_retention_cron': _e(
         'delete',
         'mapped',

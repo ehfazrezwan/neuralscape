@@ -8,7 +8,7 @@ from typing import Annotated, Literal
 from urllib.parse import urlparse
 
 from arq.connections import RedisSettings
-from pydantic import Field, field_validator, model_validator
+from pydantic import AliasChoices, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, PydanticBaseSettingsSource
 
 _logger = logging.getLogger(__name__)
@@ -28,6 +28,7 @@ COMPOSE_ONLY_KEYS = frozenset({
     "DOMAIN",  # reverse-proxy host name
     "REDIS_PASSWORD",  # interpolated into REDIS_URL and the redis service
     "EMBEDDING_MODEL_NAME",  # interpolated into GEMINI_EMBEDDER_MODEL
+    "WORKER_AUTOHEAL",  # label value on the worker services (opt out of autoheal restarts)
 })
 # * Vendored-env keys: read straight from the process environment by vendored library
 #   code (mem0 adapter), not by Settings. Tolerated in the file so a template can
@@ -41,13 +42,27 @@ VENDORED_ENV_KEYS = frozenset({
 #   unknown keys themselves), and the field names of the unprefixed class.
 EXTENSION_ENV_PREFIXES = ("DREAMING_", "STRATEGY_SYNTHESIZER_")
 EXTENSION_ENV_KEYS = frozenset({  # conversation_compiler.config.CompilerSettings (no prefix)
-    "OBSIDIAN_VAULT_PATH", "COMPILER_LLM_MODEL", "COMPILE_AFTER_HOUR", "AUTO_COMPILE", "NEURALSCAPE_URL",
+    "OBSIDIAN_VAULT_PATH", "COMPILER_LLM_MODEL", "COMPILE_AFTER_HOUR", "AUTO_COMPILE",
+})
+
+
+# * Retired keys: settings that nothing ever read and that were removed. An existing
+#   ``.env`` that still sets one keeps loading (the value is ignored, as it always was).
+RETIRED_ENV_KEYS = frozenset({
+    "DEFAULT_PROJECT_ID",  # Settings.default_project_id: no reader
+    "NEURALSCAPE_URL",  # CompilerSettings.neuralscape_url: no reader
 })
 
 
 def _owned_elsewhere(key: str) -> bool:
     upper = key.upper()
-    return upper in COMPOSE_ONLY_KEYS or upper in VENDORED_ENV_KEYS or upper in EXTENSION_ENV_KEYS or upper.startswith(EXTENSION_ENV_PREFIXES)
+    return (
+        upper in COMPOSE_ONLY_KEYS
+        or upper in VENDORED_ENV_KEYS
+        or upper in RETIRED_ENV_KEYS
+        or upper in EXTENSION_ENV_KEYS
+        or upper.startswith(EXTENSION_ENV_PREFIXES)
+    )
 
 
 class _ServiceDotEnvSource(PydanticBaseSettingsSource):
@@ -80,13 +95,38 @@ def process_env_or(name: str, configured: str) -> str:
     return configured if value is None else value
 
 
+_TRUE_WORDS = frozenset({"1", "true", "t", "yes", "y", "on"})
+_FALSE_WORDS = frozenset({"0", "false", "f", "no", "n", "off", ""})
+
+
+def parse_bool_flag(value, name: str = "flag") -> bool:
+    """The one truthiness rule for the boolean on/off switches that must never stop start-up.
+
+    ``1/true/t/yes/y/on`` is on; ``0/false/f/no/n/off`` and blank is off; anything else logs a
+    warning and is off (a mistyped switch leaves the feature off, as it always did)."""
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in _TRUE_WORDS:
+        return True
+    if text not in _FALSE_WORDS:
+        logging.getLogger(__name__).warning("%s=%r is not a boolean; treating it as off", name, value)
+    return False
+
+
 # Dimension of the mem0 / Qdrant vectors (embedder ``embedding_dims`` and the
 # collection's ``embedding_model_dims``). The Graphiti store is configured
 # separately via ``Settings.graphiti_embedding_dim``.
 VECTOR_EMBEDDING_DIMS = 768
 
+# Default per-request timeout (seconds) for Qdrant calls; the one place the value lives.
+DEFAULT_QDRANT_TIMEOUT_S = 30
+
 # (ambient EMBEDDING_DIM, GRAPHITI_EMBEDDING_DIM) pairs already warned about.
 _AMBIENT_DIM_WARNED: set = set()
+
+
+_DEFAULT_DEDUP_CRON_HOURS = (0, 6, 12, 18)
 
 
 class Settings(BaseSettings):
@@ -183,6 +223,9 @@ class Settings(BaseSettings):
     qdrant_on_disk: bool = True
     qdrant_path: str = "~/.neuralscape/qdrant"  # only used when qdrant_url is not set
     qdrant_collection: str = "neuralscape_memories"
+    # Per-request timeout (seconds) for every call the service makes to Qdrant. qdrant-client's
+    # own default is 5 s, which a loaded host can exceed on pool scrolls and large retrieves.
+    qdrant_timeout: int = Field(default=DEFAULT_QDRANT_TIMEOUT_S, ge=1)
 
     # Redis / ARQ
     redis_url: str = "redis://localhost:6379"
@@ -225,6 +268,31 @@ class Settings(BaseSettings):
     llm_retry_base_delay: float = 1.0  # seconds
     llm_retry_max_delay: float = 30.0  # seconds
 
+    # ── pgvector direct-store adapter (default OFF) ──
+    # Used as the shadow backend of the engine switch (build_default_switch) when ENGINE_ROUTING_ENABLED.
+    # Like the ENGINE_ROUTING_* settings below it has no effect until a later change wires the ledger producer.
+    engine_pgvector_enabled: bool = False
+    engine_pgvector_dsn: str = ""
+    engine_pgvector_schema: str = "ns_engine"
+    engine_pgvector_dimensions: int = 0
+
+    # ── Engine routing (V3 switch; default OFF) ───────────────────────────
+    # When enabled, the vector stage of ledger writes/edits/deletes also projects
+    # the memory into a routed engine (generation 1 = a Qdrant projection
+    # collection), an operator can run dual-write/catch-up/flip/rollback through
+    # the dictator-only /v1/admin/engine-switch/* routes, and, if
+    # ENGINE_ROUTING_RECALL_ENABLED, /v1/search serves its vector recall from the
+    # routed engine.  The router keeps its state in one process: enable only
+    # where the API and the ledger worker share a process.
+    engine_routing_enabled: bool = False
+    engine_routing_recall_enabled: bool = False
+    engine_routing_qdrant_collection: str = "neuralscape_engine_projection"
+    engine_routing_dimensions: int = 0
+    # Seconds the previous generation is kept for rollback after a flip.  When it elapses the
+    # first routed write releases and destroys it (erased text must not outlive the window).
+    # 0 keeps it until an explicit release.
+    engine_routing_rollback_window_seconds: float = 0.0
+
     # ── Graph-contradiction supersession (flag, default OFF) ──────────
     # When Graphiti's add_episode invalidates an older RELATES_TO edge, mark
     # the Qdrant row that edge came from with a reversible tombstone
@@ -238,6 +306,11 @@ class Settings(BaseSettings):
     graph_supersession_enabled: bool = False
     graph_supersession_min_similarity: float = 0.85
     graph_supersession_margin: float = 0.05
+    # Floor on cos(row, contradicted edge fact) when a single-fact row still has
+    # live edges: the dead edge must clearly BE the row's claim, not merely beat
+    # incidental edges. Same value as the multi-row floor; the e2e integration
+    # test prints the measured real-embedding cosines so it can be re-tuned.
+    graph_supersession_partial_min_similarity: float = 0.85
 
     # ── Graph-leg latency budget (flag, default OFF) ──────────────────
     # search() overlaps the Graphiti leg with the vector pools and joins it
@@ -257,13 +330,19 @@ class Settings(BaseSettings):
     # Dedup cron
     dedup_similarity_threshold: float = 0.95
     dedup_batch_size: int = 100
+    # OKF export (GET /v1/export/okf): most memories read per pool in one export.
+    # A pool above it is reported as truncated (headers + the bundle's log.md),
+    # never cut silently. Env: OKF_EXPORT_MAX_MEMORIES.
+    okf_export_max_memories: int = Field(default=50_000, ge=1)
     # Semantic dedup (phase 2 of the dedup cron and of post-compile dedup).
     # False (default): the older near-duplicate is hard-deleted, with the graph
     # cascade and sibling re-ingest jobs. True: it is tombstoned instead
     # (reversible: recall hides it, the row stays, re-deriving it revives it)
     # and nothing cascades. Env: DEDUP_SEMANTIC_TOMBSTONE_ENABLED.
     dedup_semantic_tombstone_enabled: bool = False
-    dedup_cron_hours: set = {0, 6, 12, 18}
+    # Hours (0-23, UTC) the dedup cron fires. Env DEDUP_CRON_HOURS takes a comma list
+    # ("0,6,12,18") or a JSON list ("[0, 6]"); blank means the default; "[]" disables the cron.
+    dedup_cron_hours: Annotated[set[int], NoDecode] = set(_DEFAULT_DEDUP_CRON_HOURS)
 
     # ── Reinforcement-aware recall boost (times_derived) ──────────────
     # Strength k of the deterministic recall re-rank
@@ -402,8 +481,7 @@ class Settings(BaseSettings):
     # re-homes those ids' future graph writes: run
     # scripts/migrate_graph_groups.py --audit-delimiter-ids first. The read-side
     # call sites (memory/search.py narrowed branches, memory/reads.py
-    # list_projects, dreaming card/consolidate pool names) must adopt the
-    # builder before this is enabled.
+    # list_projects, dreaming card/consolidate pool names) use the same builder.
     graph_group_id_injective_enabled: bool = False
     # Bounded second-chance re-ask for false abstentions (T2.1): when the
     # normal answering loop produces an abstention AND at least one evidence
@@ -433,7 +511,9 @@ class Settings(BaseSettings):
     # sync. `vault_key` is a Fernet key (generate with
     # `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"`).
     connectors_enabled: bool = False
-    vault_key: str = ""  # NEURALSCAPE_VAULT_KEY — required when connectors_enabled
+    # Env NEURALSCAPE_VAULT_KEY (documented name, wins) or VAULT_KEY (the field name,
+    # accepted for existing deployments). Required when connectors_enabled.
+    vault_key: str = Field(default="", validation_alias=AliasChoices("NEURALSCAPE_VAULT_KEY", "VAULT_KEY", "vault_key"))
     connector_sync_cron_hours: int = 6  # interval (hours) the sync cron fires
     # Comma-separated exact command lines an MCP connector may spawn on the
     # worker over the stdio transport (so an entry cannot itself contain a comma).
@@ -442,6 +522,10 @@ class Settings(BaseSettings):
     # stdio entirely. Allowlisting a general interpreter
     # (python, node, npx, sh ...) is equivalent to allowing arbitrary code.
     connector_stdio_commands: str = ""
+    # Comma-separated exact hostnames (optionally host:port) a connector may fetch
+    # even though they are internal (loopback / private / link-local) or plain http.
+    # Empty (default): connectors may only reach public hosts over https.
+    connector_allowed_hosts: str = ""
 
     # ── Document/file ingestion ───────────────────────────────────────
     # Rich formats (PDF, MS Office docx/xlsx/pptx, HTML, …) are converted to
@@ -466,6 +550,14 @@ class Settings(BaseSettings):
     # (Object storage — GCS/S3 — is a later swap behind this same interface.)
     ingest_storage_enabled: bool = True
     ingest_storage_dir: str = "~/.neuralscape/ingest"  # volume mount in prod
+    # Orphan-artifact sweep (ingest worker cron). Off by default: it deletes
+    # files. When on, it only ever removes an artifact that NO memory row
+    # references (by its owner) and that is older than the grace period; with
+    # ``artifact_gc_dry_run`` (default True) it only reports what it would
+    # remove. Env: ARTIFACT_GC_ENABLED / ARTIFACT_GC_DRY_RUN / ARTIFACT_GC_GRACE_DAYS.
+    artifact_gc_enabled: bool = False
+    artifact_gc_dry_run: bool = True
+    artifact_gc_grace_days: int = Field(default=7, ge=1)
 
     # ── Visual setup exemplars (VISUAL_EXEMPLARS_SPEC) ───────────────
     # The trading adapter can extract chart images from a book, store the bytes,
@@ -507,7 +599,14 @@ class Settings(BaseSettings):
     # graph.json (GraphifyJsonEngine) path is reachable — byte-for-byte the
     # pre-E2 behavior. Additive + optional (default {}), so nothing changes for
     # deployments that don't opt in.
-    code_repos: dict[str, str] = {}
+    # Env CODE_REPOS takes that JSON dict or "name=/abs/path,name2=/abs/path2"; blank is {}
+    # (NoDecode: parsed by the validator below so an empty env value cannot crash startup).
+    code_repos: Annotated[dict[str, str], NoDecode] = {}
+    # Code-engine switches, read at registration time through ``process_env_or`` (the
+    # process environment first, then the service .env, then these defaults).
+    cbm_enabled: bool = False  # register the code-cbm engine (needs the cbm-bridge service)
+    cbm_bridge_url: str = "http://cbm-bridge:8200"  # where the cbm-bridge service listens
+    code_native_enabled: bool = False  # register the frozen native code engine (opt-in)
     # ── Native code-intel locate: retrieval posture (C3, token-free default) ──
     # The A/B (reports/ICE_V2_NLLOCATE_EMBEDDINGS.md) proved native locate's 0.16
     # h@1 was a *configuration artifact*: the old default indexed no symbol-card
@@ -723,6 +822,13 @@ class Settings(BaseSettings):
     # Format: "alice@example.com:alice,ops@example.com:ops-bot"
     auth_identity_map: str = ""
 
+    # Optional allowlist of hosts an OAuth client may register as a redirect
+    # target (comma-separated, case-insensitive; "host" or "host:port"). Empty
+    # (the default) keeps today's rule: any https URI, or http to loopback.
+    # A bare host matches the scheme's default port only. Loopback hosts stay
+    # allowed for native clients even when this is set (RFC 8252 section 7.3).
+    oauth_redirect_host_allowlist: str = ""
+
     # ── Dictator role + authoritative "standard" memory tier ─────────────
     # Feature-flagged OFF by default so the public/generic build behaves
     # identically until a deployment opts in.
@@ -808,7 +914,6 @@ class Settings(BaseSettings):
     host: str = "0.0.0.0"
     port: int = 8199
     default_user_id: str = "default_user"
-    default_project_id: str | None = None
     mcp_transport: str = "stdio"  # "stdio" or "http"
 
     # Explicit action-policy enforcement (default off: no behavior change).
@@ -847,6 +952,40 @@ class Settings(BaseSettings):
             raise ValueError("NEURALSCAPE_PUBLIC_URL must use https:// (except loopback hosts)")
         return value.rstrip("/")
 
+    @field_validator("oauth_redirect_host_allowlist")
+    @classmethod
+    def _validate_oauth_redirect_host_allowlist(cls, value: str) -> str:
+        """Reject malformed entries at startup instead of ignoring them.
+
+        A bad entry silently dropped (or a value of only separators, which would
+        parse to an empty list = allow everything) would leave the operator
+        believing a restriction is in force when it is not.
+        """
+        import re
+
+        raw = (value or "").strip()
+        if not raw:
+            return ""
+        host_re = re.compile(r"^[a-z0-9]([a-z0-9.-]{0,251}[a-z0-9])?$")
+        out: list[str] = []
+        for part in raw.split(","):
+            entry = part.strip().lower()
+            if not entry:
+                raise ValueError(
+                    "OAUTH_REDIRECT_HOST_ALLOWLIST has an empty entry (stray or doubled comma); "
+                    "list hostnames as 'host' or 'host:port'"
+                )
+            host, sep, port = entry.partition(":")
+            bad_port = sep and not (port.isascii() and port.isdigit() and 0 < int(port) <= 65535)
+            if not entry.isascii() or not host_re.match(host) or bad_port:
+                raise ValueError(
+                    f"OAUTH_REDIRECT_HOST_ALLOWLIST entry {part.strip()!r} is not a valid "
+                    "'host' or 'host:port' (ASCII hostname, no scheme, path, userinfo or "
+                    "brackets; port 1-65535; use the punycode form for an IDN host)"
+                )
+            out.append(entry)
+        return ",".join(out)
+
     @field_validator("ledger_backend")
     @classmethod
     def _validate_ledger_backend(cls, value: str) -> str:
@@ -854,20 +993,6 @@ class Settings(BaseSettings):
         if backend not in ("sqlite", "postgres"):
             raise ValueError("LEDGER_BACKEND must be 'sqlite' or 'postgres'")
         return backend
-
-    @model_validator(mode="after")
-    def _refuse_injective_group_ids_until_read_side_adopted(self) -> "Settings":
-        # Fail closed: with this on, writes use nsg1-- names but the narrowed read
-        # branches (memory/search.py), list_projects (memory/reads.py) and the
-        # dreaming pool names still use legacy names, so reads would miss writes
-        # (and a '--' user id would query another user's legacy pool). Remove this
-        # guard in the PR that routes those call sites through the group-id builder.
-        if self.graph_group_id_injective_enabled:
-            raise ValueError(
-                "GRAPH_GROUP_ID_INJECTIVE_ENABLED cannot be enabled yet: the read-side call sites "
-                "have not adopted the injective group-id builder (tracked follow-up, lane read-10)"
-            )
-        return self
 
     @model_validator(mode="after")
     def _validate_ledger_target(self) -> "Settings":
@@ -886,6 +1011,19 @@ class Settings(BaseSettings):
         if not (math.isfinite(value) and value > 0):
             raise ValueError("GRAPH_LEG_BUDGET_S must be a finite number > 0")
         return value
+
+    @field_validator(
+        "tenant_admission_rate_per_second",
+        "tenant_admission_burst",
+        "tenant_admission_max_concurrency",
+        "tenant_admission_max_queue_depth",
+        mode="before",
+    )
+    @classmethod
+    def _blank_admission_limit_is_unset(cls, value):
+        # Optional limits: a blank env value (``TENANT_ADMISSION_BURST=``, as the env
+        # template ships it) means unset, like an absent one, not a parse error.
+        return None if isinstance(value, str) and not value.strip() else value
 
     @field_validator("tenant_admission_rate_per_second")
     @classmethod
@@ -926,6 +1064,61 @@ class Settings(BaseSettings):
         # Same sources and priority as the default; the .env source tolerates the
         # Compose-only and extension-owned keys declared at the top of this module.
         return init_settings, env_settings, _ServiceDotEnvSource(settings_cls, dotenv_settings), file_secret_settings
+
+    @field_validator("cbm_enabled", "code_native_enabled", mode="before")
+    @classmethod
+    def _tolerant_code_engine_flags(cls, value, info):
+        """An unparseable switch is off (with a warning), never a start-up failure."""
+        return parse_bool_flag(value, info.field_name.upper())
+
+    @field_validator("code_repos", mode="before")
+    @classmethod
+    def _parse_code_repos(cls, value):
+        """CODE_REPOS: JSON dict or ``name=/path,name2=/path2``; blank (or unset) is no repos."""
+        if value is None:
+            return {}
+        if isinstance(value, str):
+            text = value.strip()
+            if not text or text.lower() in ("null", "none"):
+                return {}
+            if text.startswith("{"):
+                return json.loads(text)
+            repos: dict[str, str] = {}
+            for part in text.split(","):
+                if not part.strip():
+                    continue
+                name, sep, path = part.partition("=")
+                if not sep or not name.strip():
+                    raise ValueError(
+                        f"CODE_REPOS entry {part.strip()!r} is not name=/path (or use a JSON object)"
+                    )
+                repos[name.strip()] = path.strip()
+            return repos
+        return value
+
+    @field_validator("dedup_cron_hours", mode="before")
+    @classmethod
+    def _parse_dedup_cron_hours(cls, value):
+        """DEDUP_CRON_HOURS: comma list or JSON list; blank (or unset) is the default hours."""
+        if value is None:
+            return set(_DEFAULT_DEDUP_CRON_HOURS)
+        if isinstance(value, str):
+            text = value.strip()
+            if not text:
+                return set(_DEFAULT_DEDUP_CRON_HOURS)
+            if text.startswith("["):
+                value = json.loads(text)
+            else:
+                value = [part.strip() for part in text.split(",") if part.strip()]
+        return value
+
+    @field_validator("dedup_cron_hours", mode="after")
+    @classmethod
+    def _dedup_cron_hours_in_range(cls, value: set[int]) -> set[int]:
+        bad = sorted(h for h in value if not 0 <= h <= 23)
+        if bad:
+            raise ValueError(f"DEDUP_CRON_HOURS hours must be 0-23; got {bad}")
+        return value
 
     @field_validator("code_repos", mode="after")
     @classmethod
@@ -1139,6 +1332,14 @@ class Settings(BaseSettings):
             if e.strip()
         }
 
+    def oauth_redirect_host_allowlist_set(self) -> set[str]:
+        """Lowercased ``host`` / ``host:port`` entries of the redirect-host allowlist."""
+        return {
+            e.strip().lower()
+            for e in self.oauth_redirect_host_allowlist.split(",")
+            if e.strip()
+        }
+
     def identity_map_dict(self) -> dict[str, str]:
         """Parse "email:user_id,email2:user_id2" into a lowercased-email map."""
         out: dict[str, str] = {}
@@ -1175,6 +1376,12 @@ class Settings(BaseSettings):
             if parts:
                 out.add(shlex.join(parts))
         return out
+
+    def connector_allowed_hosts_set(self) -> frozenset[str]:
+        """Parsed CSV of hosts connectors may reach despite the destination policy."""
+        from connectors.destination import parse_allowed_hosts
+
+        return parse_allowed_hosts(self.connector_allowed_hosts)
 
     # ── sensitivity gate helpers ──────────────────────────────────────────
     def sensitivity_private_classes_set(self) -> set[str]:
@@ -1344,6 +1551,7 @@ class Settings(BaseSettings):
         qdrant_config: dict = {
             "collection_name": self.qdrant_collection,
             "embedding_model_dims": VECTOR_EMBEDDING_DIMS,
+            "timeout": self.qdrant_timeout,
         }
         if self.qdrant_url:
             qdrant_config["url"] = self.qdrant_url
@@ -1441,6 +1649,21 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
+
+
+def settings_env_names() -> set[str]:
+    """Every environment-variable name ``Settings`` accepts: each field's name, plus the names
+    of a field's ``validation_alias`` choices (e.g. ``NEURALSCAPE_VAULT_KEY`` for ``vault_key``).
+    Upper-case (names are case-insensitive)."""
+    names: set[str] = set()
+    for name, field in Settings.model_fields.items():
+        names.add(name.upper())
+        alias = field.validation_alias
+        if isinstance(alias, AliasChoices):
+            names.update(c.upper() for c in alias.choices if isinstance(c, str))
+        elif isinstance(alias, str):
+            names.add(alias.upper())
+    return names
 
 
 def parse_redis_settings() -> RedisSettings:

@@ -167,9 +167,38 @@ def destructive_allowed(env: dict | None = None) -> bool:
     return (os.environ if env is None else env).get("NS_ALLOW_DESTRUCTIVE") == "1"
 
 
+def app_services() -> list[str]:
+    """The API and the three ARQ workers (the only services the stall forms may touch)."""
+    return os.environ.get(
+        "NS_APP_SERVICES", "neuralscape,neuralscape-worker,neuralscape-graph-worker,neuralscape-ingest-worker"
+    ).split(",")
+
+
+#: The one family of paths the worker heartbeat stall hook may be pointed at: a file name under
+#: ``/dev/shm`` (a per-container tmpfs, re-created empty whenever the container restarts, so a stall
+#: left behind cannot wedge the restarted worker). No further ``/`` is possible, so no ``..`` either.
+STALL_PATH_RE = re.compile(r"/dev/shm/ns-test-stall-[a-z0-9-]{1,32}")
+STALL_PATH = "/dev/shm/ns-test-stall-hb"
+
+
+def stall_exec(args: tuple) -> bool:
+    """``exec -T <api or worker> touch <STALL path>`` and ``exec -T <api or worker> rm -f <STALL path>``."""
+    a = tuple(args)
+    if a[:2] != ("exec", "-T") or len(a) < 3 or a[2] not in app_services():
+        return False
+    if len(a) == 5 and a[3] == "touch":
+        return STALL_PATH_RE.fullmatch(a[4]) is not None
+    if len(a) == 6 and a[3:5] == ("rm", "-f"):
+        return STALL_PATH_RE.fullmatch(a[5]) is not None
+    return False
+
+
 def destructive_exec(args: tuple, env: dict | None = None) -> bool:
-    """``exec -T <redis> redis-cli FLUSHALL``, and only with NS_ALLOW_DESTRUCTIVE=1."""
-    return tuple(args) == ("exec", "-T", redis_service(), "redis-cli", "FLUSHALL") and destructive_allowed(env)
+    """The destructive ``exec`` forms, each only with NS_ALLOW_DESTRUCTIVE=1: ``exec -T <redis> redis-cli FLUSHALL``
+    and the worker-heartbeat stall file forms (``stall_exec``)."""
+    if not destructive_allowed(env):
+        return False
+    return tuple(args) == ("exec", "-T", redis_service(), "redis-cli", "FLUSHALL") or stall_exec(args)
 
 
 def validate_restore_args(

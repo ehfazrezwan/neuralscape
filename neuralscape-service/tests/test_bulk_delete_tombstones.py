@@ -181,12 +181,19 @@ def test_private_only_default_erases_tombstones_and_keeps_shared_and_standard(sv
     assert svc._bulk_graph_cleanup.call_args.kwargs["deleted_ids"] == {"tomb", "live"}
 
 
-def test_include_shared_unfiltered_nukes_everything_including_tombstones(svc):
-    svc._expire_user_graph_writes = MagicMock(return_value=[])
+def test_include_shared_unfiltered_erases_own_private_shared_and_tombstones_keeps_standard(svc):
+    svc._scroll_all_user_memories = lambda uid: [
+        _private_row("tomb", tombstoned=True),
+        _private_row("tomb-shared", "shared", tombstoned=True),
+        _private_row("live-shared", "shared"),
+        _private_row("std", "standard"),
+    ]
     out = svc.delete_memories(user_id="u", include_shared=True)
-    svc._memory.delete_all.assert_called_once_with(user_id="u")
-    svc._expire_user_graph_writes.assert_called_once_with("u", strict=True)
-    assert "All memories deleted" in out["message"]
+    svc._memory.delete_all.assert_not_called()
+    deleted = [c.args[0] for c in svc._memory.vector_store.delete.call_args_list]
+    assert deleted == ["tomb", "tomb-shared", "live-shared"]
+    assert "including 2 shared" in out["message"] and "including 2 tombstoned" in out["message"]
+    assert "preserved 1 standard" in out["message"]
 
 
 # ── single delete by id ──

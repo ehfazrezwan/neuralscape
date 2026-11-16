@@ -23,7 +23,7 @@ from dataclasses import dataclass, field
 
 import pytest
 
-from nsaccept import eventually, expect_check_fails, needs, negative_control, profiles, proves
+from nsaccept import eventually, expect_check_fails, needs, negative_control, precondition, profiles, proves
 from nsaccept.client import NSClient
 from nsaccept.helpers import list_rows, mcp_json, write_raw
 from nsaccept.hooks import run_hook
@@ -209,6 +209,7 @@ def test_the_sweep_dreams_every_pool_and_reports_it(ctx, dictator, a, dream: Dre
 @negative_control
 def test_dreamt_check_fails_for_another_pool_and_a_failed_report(dream: Dream):
     _ready(dream)
+    precondition(check_dreamt, dream.results[dream.pool_a], dream.pool_a, what="the sweep of A's pool is dreamt")
     expect_check_fails(check_dreamt, dream.results[dream.pool_a], dream.pool_b)  # a report that is not about that pool
     failed = {"pools": [{"pool": dream.pool_a, "status": "sweep_failed", "reason": "x", "staged": 0}]}
     expect_check_fails(check_dreamt, failed, dream.pool_a)
@@ -235,15 +236,26 @@ def test_only_the_dictator_may_trigger_a_sweep(ctx, a, mcp_a, mcp_dictator, drea
 
 @proves("ext.dreaming-sweep")
 def test_schedule_dream_over_mcp_runs_a_dry_run_that_writes_nothing(ctx, b, mcp_dictator, dictator, dream: Dream):
+    """The fixture's forced sweep already stamped B's pool, and staging is incremental (only rows new or
+    changed since that stamp), so a fresh private row is written first. The MCP dry run must then stage it,
+    write nothing, and leave the pool unstamped: a second dry run stages the same row again."""
     _ready(dream)
+    marker = f"zq-{ctx.run_id}-dryrun"
+    write_raw(
+        b, f"{marker} B keeps a laminated tide table pinned inside the boat shed door.", "preference",
+        marker=marker, scope="global", visibility="private",
+    ).require()
     before = sorted(r["id"] for r in list_rows(b))
     mcp_dictator.initialize()
-    out = mcp_json(mcp_dictator, "schedule_dream", {"pool": dream.pool_b, "dry_run": True, "force": True})
-    assert out.get("status") == "enqueued" and out.get("job_id"), f"schedule_dream answered {out}"
-    result = _finish(dictator, out["job_id"])
-    assert result["dry_run"] is True, f"dry_run flag lost: {result.get('dry_run')}"
-    check_dreamt(result, dream.pool_b)
-    assert sorted(r["id"] for r in list_rows(b)) == before, "a dry-run sweep changed B's memories"
+    staged = []
+    for attempt in ("first", "second"):
+        out = mcp_json(mcp_dictator, "schedule_dream", {"pool": dream.pool_b, "dry_run": True, "force": True})
+        assert out.get("status") == "enqueued" and out.get("job_id"), f"{attempt} schedule_dream answered {out}"
+        result = _finish(dictator, out["job_id"])
+        assert result["dry_run"] is True, f"{attempt}: dry_run flag lost: {result.get('dry_run')}"
+        staged.append(check_dreamt(result, dream.pool_b)["staged"])  # >= 1: the fresh row is new since the last stamp
+        assert sorted(r["id"] for r in list_rows(b)) == before, f"the {attempt} dry-run sweep changed B's memories"
+    assert staged[1] >= 1, f"the second dry run staged {staged[1]}: the first dry run stamped the pool (staged {staged})"
 
 
 # ── deep consolidation: contradiction -> supersession ────────────
@@ -259,6 +271,7 @@ def test_the_older_of_two_contradicting_facts_is_superseded(a, dream: Dream):
 @negative_control
 def test_supersession_check_fails_when_the_roles_are_swapped_or_another_user_asks(b, a, dream: Dream):
     _ready(dream)
+    precondition(check_superseded, a, dream.ids["old"], dream.ids["new"], what="A's older fact is superseded")
     expect_check_fails(check_superseded, a, dream.ids["new"], dream.ids["old"])  # the newer one was not superseded
     expect_check_fails(check_superseded, b, dream.ids["old"], dream.ids["new"])  # B never held either row
 
@@ -287,8 +300,9 @@ def test_the_reflection_pass_stores_an_insight_derived_from_the_seeded_memories(
 
 @proves("ext.dreaming-rem-reflections")
 @negative_control
-def test_insight_check_fails_for_user_b(b, dream: Dream):
+def test_insight_check_fails_for_user_b(a, b, dream: Dream):
     _ready(dream)
+    precondition(check_insight_from, a, {dream.ids[k] for k in ("pat1", "pat2", "pat3")}, what="A holds an insight derived from the pattern")
     expect_check_fails(check_insight_from, b, {dream.ids["pat1"], dream.ids["pat2"], dream.ids["pat3"]})
 
 
@@ -327,6 +341,7 @@ def test_the_project_card_is_a_team_artifact_and_get_card_serves_both_over_mcp(a
 @negative_control
 def test_card_check_fails_for_a_pool_without_a_card_and_for_another_users_pool(ctx, a, b, dream: Dream):
     _ready(dream)
+    precondition(check_card, a, dream.pool_a, what="A reads its own card")
     expect_check_fails(check_card, a, f"user--{ctx.user_a}-nobody")
     expect_check_fails(check_card, b, dream.pool_a)
 
@@ -357,11 +372,17 @@ def test_hook_card_check_fails_for_user_b(ctx, dream: Dream):
         base_url=ctx.base_url, token=ctx.token_b, user_id=ctx.user_b, project_id=dream.project,
     )
 
-    def check():
-        text = ((res.data or {}).get("hookSpecificOutput") or {}).get("additionalContext", "")
-        assert dream.name_a.lower() in text.lower(), "A's identity is not in B's context"
+    own = run_hook(
+        "session-start", {"hook_event_name": "SessionStart", "source": "startup", "session_id": f"acc-{ctx.run_id}-card1"},
+        base_url=ctx.base_url, token=ctx.token_a, user_id=ctx.user_a, project_id=dream.project,
+    )
 
-    expect_check_fails(check)
+    def check(r):
+        text = ((r.data or {}).get("hookSpecificOutput") or {}).get("additionalContext", "")
+        assert dream.name_a.lower() in text.lower(), "A's identity is not in the context"
+
+    precondition(check, own, what="A's own session-start context carries A's identity")
+    expect_check_fails(check, res)
 
 
 # ── the vault on the shared volume ───────────────────────────────
@@ -393,10 +414,13 @@ def test_the_shared_pool_is_rendered_as_vault_pages_and_the_private_pool_is_not(
 def test_vault_check_fails_in_a_directory_that_holds_no_pages(ctx, dream: Dream):
     _ready(dream)
 
-    def check():
-        assert vault_grep(ctx, dream.ids["sh1"], "/data/vault/Projects/acc-no-such-project"), "no page lists the memory"
+    safe = re.sub(r"[^\w-]", "-", dream.project).strip("-")
 
-    expect_check_fails(check)
+    def check(directory):
+        assert vault_grep(ctx, dream.ids["sh1"], directory), "no page lists the memory"
+
+    precondition(check, f"/data/vault/Projects/{safe}", what="the project's own pages list the shared memory")
+    expect_check_fails(check, "/data/vault/Projects/acc-no-such-project")
 
 
 @needs("compose")
@@ -420,10 +444,11 @@ def test_a_shared_write_is_mirrored_into_the_vault_raw_log_and_a_private_one_is_
 def test_mirror_check_fails_for_the_private_marker(ctx, dream: Dream):
     _ready(dream)
 
-    def check():
-        assert vault_grep(ctx, dream.written["id1"].marker, "/data/vault/_raw"), "marker not mirrored"
+    def check(key):
+        assert vault_grep(ctx, dream.written[key].marker, "/data/vault/_raw"), "marker not mirrored"
 
-    expect_check_fails(check)
+    precondition(check, "sh1", what="a shared write is mirrored into the vault raw log")
+    expect_check_fails(check, "id1")
 
 
 # ── rewrites keep their lexical (BM25) leg ───────────────────────
@@ -463,4 +488,5 @@ def test_keyword_check_fails_for_user_b(ctx, a, b, dream: Dream):
     _ready(dream)
     marker_of = {w.memory_id: f"zq-{ctx.run_id}-{k}" for k, w in dream.written.items() if w.memory_id}
     rows = [r for r in list_rows(a) if r["id"] in marker_of]
+    precondition(check_keyword_finds, a, rows, marker_of, what="A's keyword search finds A's swept rows")
     expect_check_fails(check_keyword_finds, b, rows, marker_of)

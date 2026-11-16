@@ -13,7 +13,7 @@ Neuralscape is a production-grade agentic memory layer that fuses **mem0** (vect
 
 ## Architecture in prose
 
-**Write path.** A client (FastAPI client, MCP tool, or the conversation_compiler plugin) calls a write endpoint. The API constructs a deterministic SHA-256 job ID, enqueues the job onto the Redis-backed ARQ queue, and returns `202 {task_id, poll_url}` immediately. The ARQ worker (a separate process) dequeues the job, runs Gemini extraction against the conversation, batch-embeds the resulting facts, upserts them into Qdrant, and ingests the cleaned conversation as a Graphiti episode in Neo4j. For each stored fact it emits a `memory_stored` event so the conversation_compiler extension can write the fact into the Obsidian vault and rebuild the category index. Result lands in Redis at `arq:result:<job_id>` and the client polls the status endpoint until `completed`. See [async-pipeline](./07-async-pipeline.md) and [memory-service-core](./04-memory-service-core.md).
+**Write path.** A client (FastAPI client, MCP tool, or the conversation_compiler plugin) calls a write endpoint. The API constructs a deterministic SHA-256 job ID, enqueues the job onto the Redis-backed ARQ queue, and returns `202 {task_id, poll_url}` immediately. An ARQ worker (a separate process; there are fast, graph and ingest workers) dequeues the job, runs Gemini extraction against the conversation, batch-embeds the resulting facts, upserts them into Qdrant, and ingests the cleaned conversation as a Graphiti episode in Neo4j. For each stored fact it emits a `memory_stored` event so the conversation_compiler extension can write the fact into the Obsidian vault and rebuild the category index. Result lands in Redis at `arq:result:<job_id>` and the client polls the status endpoint until `completed`. See [async-pipeline](./07-async-pipeline.md) and [memory-service-core](./04-memory-service-core.md).
 
 **Read path.** Searches and context fetches run synchronously through `MemoryService` on the request thread. Vector recall hits Qdrant (with optional dual-scope merge for project queries that should also see global memories), graph recall hits Graphiti via an async bridge using `EDGE_HYBRID_SEARCH_RRF`, and the two result sets are deduplicated, interleaved, and truncated to the requested limit before returning `200`. Health, listing, and CRUD endpoints follow the same synchronous pattern. See [storage-backends](./06-storage-backends.md) and [service-architecture](./02-service-architecture.md).
 
@@ -29,7 +29,7 @@ Neuralscape is a production-grade agentic memory layer that fuses **mem0** (vect
 - [llm-extraction](./05-llm-extraction.md) — Gemini extraction prompt, JSON parser + regex fallback, embeddings, mem0 factory wiring, retry/backoff
 - [storage-backends](./06-storage-backends.md) — Qdrant payload + `metadata.` filter prefix, Neo4j + Graphiti, group_id format, subtree deps, sync-upstream
 - [testing](./10-testing.md) — 11 test files, fixtures, mocking strategy, integration tests, run commands
-- [deployment](./11-deployment.md) — Docker compose stack, two-stage Dockerfile, env vars, structlog, helper scripts, gotchas
+- [deployment](./11-deployment.md) — Docker compose stack, multi-stage Dockerfile, env vars, structlog, helper scripts, gotchas
 
 ## Quick links by audience
 
@@ -42,9 +42,9 @@ Neuralscape is a production-grade agentic memory layer that fuses **mem0** (vect
 
 ## Key concepts cheatsheet
 
-- **13 categories across 5 type groups.** Semantic (`preference`, `personal_fact`, `technical_skill`, `domain_knowledge`), Project (`tech_stack`, `convention`, `architecture`, `dependency`), Episodic (`decision`, `interaction`), Procedural (`workflow`, `procedure`), Working (`task_context`). Defined in `schemas.py:18-40`. Full table in [memory-model](./03-memory-model.md).
+- **13 categories across 5 type groups.** Semantic (`preference`, `personal_fact`, `technical_skill`, `domain_knowledge`), Project (`tech_stack`, `convention`, `architecture`, `dependency`), Episodic (`decision`, `interaction`), Procedural (`workflow`, `procedure`), Working (`task_context`). Defined in `schemas.py`. Full table in [memory-model](./03-memory-model.md).
 - **2 scopes.** `global` (user-wide) and `project` (project-scoped, requires `project_id`). Semantic categories default to `global`; Project categories default to `project`; flexible categories follow the caller.
-- **`group_id` format.** `"global"` or `"project--{project_id}"` — **double-hyphen**, locked in by commit `2edd9b5`. Project searches query both `["global", "project--{id}"]` and merge results.
+- **`group_id` format.** Per-user and shared, with a project suffix: `user--{user_id}`, `user--{user_id}--project--{project_id}`, `shared`, `shared--project--{project_id}` (a non-default workspace appends `--ws--{workspace}`); built in `memory/groups.py`. The double-hyphen delimiter dates from commit `2edd9b5`, which replaced the original `global` / `project--{id}` tokens. See [memory-model](./03-memory-model.md).
 - **Qdrant filter prefix.** Filter keys for nested fields must be `metadata.{key}` (e.g. `metadata.scope`, `metadata.category`, `metadata.project_id`) because they live under the payload's `metadata` object. Locked in by commit `6c94f20`. Forgetting the prefix silently returns zero results.
 - **Async write semantics.** `POST /v1/memories` and `POST /v1/memories/raw` return `202 {task_id, poll_url}`; clients poll `GET /v1/memories/status/{task_id}` until `status == "completed"` or `"failed"`. Redis-down fallback: the API runs the write synchronously and returns `200` with the materialized memories, so clients must branch on status code.
 - **Reads are sync.** `POST /v1/search`, `POST /v1/graph/search`, `GET /v1/context/*`, and all CRUD endpoints return `200` inline. No polling.
