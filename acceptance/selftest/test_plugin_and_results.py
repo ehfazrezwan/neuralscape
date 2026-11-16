@@ -47,6 +47,11 @@ def test_errors():
 def test_expected_red_still_fails():
     assert False, "known red"
 
+@proves("x.red2")
+@expected_red("#998")
+def test_expected_red_that_passes():
+    pass
+
 @proves("x.neg")
 @negative_control
 def test_negative_control():
@@ -82,8 +87,11 @@ def test_default_profile_selection_and_outcomes(scen):
     assert set(s) == {
         "test_scen::test_default_pass", "test_scen::test_both", "test_scen::test_needs_missing",
         "test_scen::test_fails", "test_scen::test_errors", "test_scen::test_negative_control",
-        "test_scen::test_expected_red_still_fails",
+        "test_scen::test_expected_red_still_fails", "test_scen::test_expected_red_that_passes",
     }
+    flagged = s["test_scen::test_expected_red_that_passes"]
+    assert flagged["result"] == "pass" and flagged["unexpected_pass"] is True and flagged["evidence"] is False
+    assert "PASSED" in r.stdout.str() and "test_expected_red_that_passes" in r.stdout.str()
     assert s["test_scen::test_default_pass"]["result"] == "pass"
     assert s["test_scen::test_default_pass"]["proves"] == ["x.one", "x.two"]
     assert s["test_scen::test_needs_missing"]["result"] == "skip"
@@ -96,6 +104,9 @@ def test_default_profile_selection_and_outcomes(scen):
     red = s["test_scen::test_expected_red_still_fails"]
     assert red["result"] == "fail" and red["expected_red"] == "#999", red  # reported as a failure, only labelled
     assert s["test_scen::test_default_pass"]["expected_red"] is None
+    assert red["evidence"] is False and red["unexpected_pass"] is False
+    assert s["test_scen::test_negative_control"]["evidence"] is False
+    assert s["test_scen::test_default_pass"]["evidence"] is True
     assert r.ret == 1
 
 
@@ -111,7 +122,7 @@ def test_top_level_schema_and_commit(scen):
     assert doc["commit"] == "abcdef0123456789abcdef"
     assert doc["base_url"] == "http://127.0.0.1:9"
     assert doc["started"].endswith("Z") and doc["finished"].endswith("Z")
-    assert set(doc["scenarios"][0]) == {"id", "proves", "result", "seconds", "detail", "negative_control", "expected_red"}
+    assert set(doc["scenarios"][0]) == {"id", "proves", "result", "seconds", "detail", "negative_control", "expected_red", "evidence", "unexpected_pass"}
 
 
 def test_needs_is_satisfied_by_env(scen, monkeypatch):
@@ -125,7 +136,7 @@ def test_list_writes_inventory_without_running(scen):
     listing = scen.path / "inv.json"
     scen.runpytest_subprocess("-p", "nsaccept.pytest_plugin", "--ns-list-out", str(listing), "-p", "no:cacheprovider")
     inv = {i["id"]: i for i in json.loads(listing.read_text())}
-    assert len(inv) == 8  # every scenario, regardless of profile
+    assert len(inv) == 9  # every scenario, regardless of profile
     assert inv["test_scen::test_only_flagx"]["profiles"] == ["flagx"]
     assert inv["test_scen::test_default_pass"]["profiles"] == ["default"]
     assert inv["test_scen::test_default_pass"]["proves"] == ["x.one", "x.two"]

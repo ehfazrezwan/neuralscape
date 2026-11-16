@@ -303,3 +303,5 @@ listing is always `docker compose -p <project> ps`, never global `docker ps`.
 `run.sh` needs only `uv`: it runs `uv run --no-project --python 3.12 --with-requirements ...`
 (uv may download a managed CPython; downloads are allowed). Set `NS_UV=/path/to/uv` for a
 standalone binary that is not on `PATH`. Without uv it falls back to python3 >= 3.10 + venv.
+
+**Evidence rule.** A results row is node evidence only when `evidence` is true: rows from `@negative_control` or `@expected_red` scenarios are never evidence (`evidence: false`). An expected-red scenario that passes is flagged `unexpected_pass: true` and named in the run summary, so the marker can be dropped.

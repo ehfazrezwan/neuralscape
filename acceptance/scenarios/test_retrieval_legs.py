@@ -32,7 +32,8 @@ GRAPH_WAIT = 240
 EPISODE_ROW_PREFIX = "[verbatim session excerpt]"
 
 TARGET_WORDS = ("Alpha", "Bravo", "Charlie")
-NEAR_MISSES_PER_TOKEN = 2
+NEAR_MISSES_PER_TOKEN = 3
+NEAR_MISS_LETTERS = "xzk"  # none of them is a token's last letter (a, o, e), so a near-miss is never the token
 RARE_LIMIT = 2  # smaller than a token's family (target + near-misses), so the dense leg alone cannot hold it
 TARGET_TEXTS = (
     "{tok} is written on the third tide gauge of the eastern breakwater.",
@@ -43,7 +44,7 @@ TARGET_TEXTS = (
 
 def near_misses(token: str) -> list[str]:
     """Spellings one character away from ``token`` that are different whole tokens (so BM25 cannot match them)."""
-    return [token[:-1] + c for c in "oq"[:NEAR_MISSES_PER_TOKEN]]
+    return [token[:-1] + c for c in NEAR_MISS_LETTERS[:NEAR_MISSES_PER_TOKEN] if c.lower() != token[-1].lower()]
 
 
 # ── helpers ──────────────────────────────────────────────────────
@@ -83,16 +84,13 @@ def vector_rows(results: list[dict]) -> list[dict]:
 
 
 def check_rare_token_recalled(client: NSClient, token: str, project: str, limit: int = RARE_LIMIT, query: str | None = None) -> None:
-    """The memory holding exactly ``token`` is among the top ``limit`` hits for the bare token, and no
-    near-miss spelling outranks it. The near-misses embed almost identically, so only the keyword leg
-    can tell the exact token from them."""
+    """The memory holding exactly ``token`` is among the top ``limit`` VECTOR rows for the bare token (graph rows
+    are left out of the ranking). The near-misses embed almost identically, so only the keyword leg can tell the
+    exact token from them: without it the target is in the top ``limit`` only by chance."""
     results = project_search(client, query or token, project, limit)
-    texts = [r.get("memory", "") for r in results]
-    hit = [i for i, t in enumerate(texts) if token in t]
-    assert hit, f"{token} not in the top {limit}: {[t[:36] for t in texts]}"
-    misses = near_misses(token)
-    above = [i for i, t in enumerate(texts) if any(m in t for m in misses) and i < hit[0]]
-    assert len(above) <= 1, f"{len(above)} near-miss rows outrank {token}: {[t[:36] for t in texts]}"  # one tie with dense #1 is allowed
+    rows = vector_rows(results)[:limit]
+    texts = [r.get("memory", "") for r in rows]
+    assert any(token in t for t in texts), f"{token} not in the top {limit} vector rows: {[t[:36] for t in texts]}"
 
 
 def check_all_rare_recalled(client: NSClient, tokens: list[str], project: str, spell=lambda t: t) -> None:
@@ -151,7 +149,7 @@ def check_ask_used_episodes(body: dict) -> None:
 
 @pytest.fixture(scope="module")
 def rare(ctx, a, graph_seed) -> dict:
-    """Three memories each found only by one rare token, each with two near-miss spellings written next to it."""
+    """Three memories each found only by one rare token, each with three near-miss spellings written next to it."""
     project = f"{ctx.project_id}-rare"
     tokens = [f"Zx{ctx.run_id.capitalize()}{w}" for w in TARGET_WORDS]
     out: dict = {"project": project, "tokens": tokens, "error": ""}
@@ -208,11 +206,12 @@ def reinforce(ctx, a) -> dict:
 
 @proves("read.rrf-pool-fusion", "read.bm25-sparse-leg", "vec.bm25-sparse")
 def test_a_bare_rare_token_recalls_its_exact_memory_among_near_miss_spellings(a, rare):
-    """Each rare token is stored next to two spellings one character away (other whole tokens, near-identical
+    """Each rare token is stored next to three spellings one character away (other whole tokens, near-identical
     embeddings), and the recall limit (2) is smaller than that family, so the dense leg cannot tell the exact
-    token from its near-misses. Each exact-token memory must still come back and not sit below more than one
-    near-miss: that takes the keyword leg and the pool's rank fusion (read-01). Chance of passing without the
-    keyword leg: about (2/9)^3, i.e. 1 in 90."""
+    token from its near-misses. Each exact-token memory must still be among the top two vector rows: that
+    takes the keyword leg and the pool's rank fusion (read-01). It cannot be asserted FIRST: a lexical-only hit
+    ties with the dense leg's first hit in the rank fusion. Chance of passing without the keyword leg: about
+    (2/12)^3, i.e. 1 in 200."""
     assert not rare["error"], rare["error"]
     for token in rare["tokens"]:
         eventually(
@@ -279,7 +278,7 @@ def test_episode_row_check_fails_for_user_b_and_an_unwritten_marker(ctx, b, a, g
     expect_check_fails(check_episode_row, a, graph_seed.first.content, ctx.project_id, f"zq-{ctx.run_id}-never")
 
 
-@proves("read.cross-leg-merit-merge")
+@proves("read.episode-bm25-leg")
 def test_unscored_rows_never_outrank_scored_ones_and_the_memory_itself_leads(ctx, a, graph_seed: GraphSeed):
     """Query with a stored fact's own text: the memory is the top hit, its graph edges are scored rows,
     its episode row has no score, and no unscored row sits above a scored one (a positional
@@ -293,7 +292,7 @@ def test_unscored_rows_never_outrank_scored_ones_and_the_memory_itself_leads(ctx
     eventually(check, timeout=GRAPH_WAIT, interval=10, what="merit-ordered recall with an episode row")
 
 
-@proves("read.cross-leg-merit-merge")
+@proves("read.episode-bm25-leg")
 @negative_control
 def test_merge_check_fails_for_an_interleaved_list(graph_seed: GraphSeed):
     mid = graph_seed.first.memory_id or "m"

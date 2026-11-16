@@ -113,7 +113,7 @@ def test_stack_shape_check_fails_for_an_exited_unhealthy_restarted_or_absent_ser
 
 @proves("queue.arq-workers")
 def test_a_job_completes_on_each_of_the_main_graph_and_ingest_queues(ctx, a, a_fact, graph_seed: GraphSeed):
-    """main: the raw write task completed (fast worker). ingest: a text ingest runs to completion on the
+    """A job completes on each of the three queues (not a proof of the worker split). main: the raw write task completed (fast worker). ingest: a text ingest runs to completion on the
     ingest worker. graph: the first seed write's episode was written by the graph worker."""
     assert a_fact.status.get("status") == "completed", f"fast-queue write ended as {a_fact.status}"
     marker = f"zq-{ctx.run_id}-qingest"
@@ -180,7 +180,7 @@ def test_each_response_echoes_or_generates_a_request_id(ctx, a, anon):
     check_request_id_echo(anon.get("/v1/queue/status", headers={"X-Request-ID": rid}).headers, rid)  # a 401 carries it too
 
 
-@proves("ops.structured-logging", "ops.compose-dev")
+@proves("ops.compose-dev")
 @negative_control
 def test_log_and_request_id_checks_fail_for_console_lines_and_missing_headers():
     console = "INFO  something happened\nINFO  something else\nplain text\n"
