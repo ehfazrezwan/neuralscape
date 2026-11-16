@@ -23,6 +23,21 @@ from memory.ranking import _mem_is_tombstoned, _times_derived_from_metadata
 logger = logging.getLogger(__name__)
 
 
+def semantic_dedup_phase_enabled() -> bool:
+    """Whether dedup's semantic phase (phase 2) may run for the dedup cron and post-compile dedup.
+
+    With dreaming on, the dream sweep's MERGE action owns near-duplicate merges,
+    so the LOSSY phase (hard delete) is skipped. With
+    ``DEDUP_SEMANTIC_TOMBSTONE_ENABLED`` phase 2 is not lossy (it only tombstones:
+    reversible, nothing deleted, nothing cascaded), so an operator who opted in
+    gets it whether or not dreaming is on. Tombstoned rows are never dream-merge
+    candidates, so the two do not fight over a pair.
+    """
+    from extensions.dreaming.config import dreaming_settings
+
+    return (not dreaming_settings.enabled) or bool(settings.dedup_semantic_tombstone_enabled)
+
+
 # Bulk-delete listing page and the cap on listing rounds: a filtered sweep keeps
 # re-listing (deleted rows drop out of the next listing) until nothing new is
 # left; if rows remain unseen when the cap is hit the result says ``truncated``.
@@ -1037,6 +1052,11 @@ class DeleteMixin:
         # ── Phase 2: Semantic dedup ──
         semantic_removed = 0
         if not semantic:
+            logger.info(
+                "dedup run user=%s scanned=%d exact_removed=%d semantic=skipped "
+                "(dreaming owns near-dup merges)",
+                user_id, total_checked, exact_removed,
+            )
             return {
                 "user_id": user_id,
                 "exact_duplicates_removed": exact_removed,
@@ -1062,6 +1082,12 @@ class DeleteMixin:
                     collector=collector,
                 )
 
+        logger.info(
+            "dedup run user=%s scanned=%d exact_removed=%d semantic_pairs_merged=%d "
+            "semantic_mode=%s threshold=%s",
+            user_id, total_checked, exact_removed, semantic_removed,
+            "tombstone" if settings.dedup_semantic_tombstone_enabled else "delete", threshold,
+        )
         return {
             "user_id": user_id,
             "exact_duplicates_removed": exact_removed,
