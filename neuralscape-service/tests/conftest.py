@@ -57,6 +57,39 @@ def _disable_auth_for_tests():
     settings.neuralscape_auth_disabled = saved_auth_disabled
 
 
+class FakeRedis:
+    """In-memory stand-in for the three Redis calls the per-memory edit lock makes (SET NX PX, GET, EVAL compare-and-delete)."""
+
+    def __init__(self):
+        self.store: dict[str, str] = {}
+
+    def set(self, key, value, nx=False, px=None):
+        if nx and key in self.store:
+            return None
+        self.store[key] = value
+        return True
+
+    def get(self, key):
+        return self.store.get(key)
+
+    def eval(self, script, numkeys, key, token):
+        if self.store.get(key) == token:
+            del self.store[key]
+            return 1
+        return 0
+
+
+@pytest.fixture(autouse=True)
+def edit_lock_redis(monkeypatch):
+    """Patch the edit-lock Redis seam so no test ever reaches a real Redis; tests can read/steal locks through ``fake``."""
+    import memory.edit as edit
+
+    fake = FakeRedis()
+    monkeypatch.setattr(edit, "_redis_client", lambda: fake)
+    monkeypatch.setattr(edit, "_LOCK_WAIT_S", 0.0)     # a busy row answers immediately in tests (no sleeping)
+    return fake
+
+
 @pytest.fixture(autouse=True)
 def _isolate_revocation_snapshot(monkeypatch):
     """Keep unit tests off any real Redis and clear the cached revocation snapshot.
