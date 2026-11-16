@@ -509,3 +509,122 @@ def test_list_projects_prefix_values_are_pinned(service, flag):
     assert got["params"] == {"user_prefix": "user--alice--x--project--", "shared_prefix": "shared--project--"}
     flag(True)
     assert _capture_query(service)["params"]["shared_prefix"] == "shared--project--"
+
+
+# ── review round 3: flag-on non-plain callers, exact prefixes, real STARTS WITH ──
+
+
+def test_non_plain_caller_cannot_read_the_plain_users_legacy_card(flag):
+    """'user--alice--project--x' is plain alice's card in project x; caller 'alice--project--x' is another user.
+
+    Only distinguishable with the flag ON (flag off, both users own that one name: inherent aliasing).
+    """
+    from extensions.dreaming.card import card_read_allowed
+
+    flag(True)
+    assert not card_read_allowed("user--alice--project--x", "alice--project--x")
+    assert card_read_allowed("user--alice--project--x", "alice")
+
+
+def test_flag_on_boundary_for_trailing_dash_owner(flag):
+    from extensions.dreaming.card import card_read_allowed
+
+    flag(True)
+    assert not card_read_allowed("user--alice---project--x", "alice")
+    assert not card_read_allowed("user--alice---ws--w", "alice")
+    assert card_read_allowed("user--alice---project--x", "alice-")
+    assert card_read_allowed("user--alice---ws--w", "alice-")
+
+
+@pytest.mark.parametrize("on", [False, True])
+@pytest.mark.parametrize("pool", ["user--alice--projectX", "user--alice--wsX", "user--alice--project-", "user--alice--ws"])
+def test_card_boundary_needs_the_full_delimiter(flag, on, pool):
+    from extensions.dreaming.card import card_read_allowed
+
+    flag(on)
+    assert not card_read_allowed(pool, "alice")
+
+
+@pytest.mark.parametrize("on", [True])
+@pytest.mark.parametrize("pool", ["user--alice--project--x", "user--alice--project--x--ws--w"])
+def test_card_rest_and_mcp_deny_non_plain_caller_on_plain_users_pool(flag, monkeypatch, on, pool):
+    import asyncio
+    import json
+
+    import extensions.dreaming.sweep as sweep
+    import mcp_server
+
+    flag(on)
+    caller = "alice--project--x"
+    redis = _CardRedis()
+    r = _rest_client(monkeypatch, redis).get(
+        "/v1/extensions/dreaming/card", params={"pool": pool, "user_id": caller})
+    assert r.status_code == 403
+    monkeypatch.setattr(sweep, "_get_redis", lambda: redis)
+    out = asyncio.run(mcp_server.call_tool("get_card", {"pool": pool, "user_id": caller}))
+    assert "not readable" in json.loads(out[0].text).get("error", "")
+    assert redis.reads == []
+
+
+PRIV_ALICE_X = "nsg1--373a70726976617465383a616c6963652d2d78"  # private + owner 'alice--x'
+SHARED_POOL = "nsg1--363a736861726564"  # shared, no owner
+
+
+def _list_with_real_starts_with(service, user, stored):
+    """list_projects against a fake driver that really applies the query's STARTS WITH terms."""
+    import asyncio
+
+    seen = {}
+
+    class _Session:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def run(self, cypher, **params):
+            seen["params"] = params
+            prefixes = [v for k, v in params.items() if f"${k}" in cypher]
+            res = MagicMock()
+
+            async def data():
+                return [{"group_id": g} for g in stored if any(g.startswith(p) for p in prefixes)]
+
+            res.data = data
+            return res
+
+    service._graphiti.driver.session = lambda: _Session()
+    service._run_on_bridge = lambda coro, timeout=None: asyncio.run(coro)
+    return service.list_projects(user), seen["params"]
+
+
+def test_flag_on_list_projects_exact_prefixes_and_real_prefix_matching(service, flag):
+    flag(True)
+    owner = "alice--x"
+    stored = [
+        _build_group_id("private", owner, "p.v2"),                    # mine, encoded
+        _build_group_id("private", owner, "q", "w.1"),                # mine, workspace
+        _build_group_id("private", "alice--xy", "longer-owner"),      # another owner whose id extends mine
+        _build_group_id("private", "bob--x", "bobs"),
+        _build_group_id("shared", "", "team.docs"),
+        _build_group_id("shared", "", "a--b", "ws"),
+        _build_group_id("standard", "", "std.proj"),                  # never listed
+        "shared--project--legacy",
+    ]
+    projects, params = _list_with_real_starts_with(service, owner, stored)
+    assert params["encoded_private_prefix"] == PRIV_ALICE_X
+    assert params["encoded_shared_prefix"] == SHARED_POOL
+    assert params["user_prefix"] == PRIV_ALICE_X
+    assert params["shared_prefix"] == "shared--project--"
+    assert projects == ["a--b", "legacy", "p.v2", "q", "team.docs"]
+
+
+def test_flag_on_plain_caller_list_projects_prefixes(service, flag):
+    flag(True)
+    stored = ["user--alice--project--mine", "user--alice--project--q--project--r",
+              _build_group_id("private", "alice", "my.proj"), _build_group_id("private", "alicex", "other.p")]
+    projects, params = _list_with_real_starts_with(service, "alice", stored)
+    assert params["user_prefix"] == "user--alice--project--"
+    assert params["encoded_private_prefix"] == "nsg1--373a70726976617465353a616c696365"
+    assert projects == ["mine", "my.proj"]

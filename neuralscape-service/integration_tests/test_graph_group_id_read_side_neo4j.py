@@ -112,3 +112,39 @@ def test_reads_find_the_encoded_write_and_a_colliding_plain_user_sees_nothing(sv
     assert tok_b.lower() not in _blob(opt_out)
     assert tok_b.lower() not in _blob(svc.search_graph(tok_b, user_id=plain, project_id="legacy", limit=10))
     assert project not in svc.list_projects(plain)
+
+
+def test_plain_users_legacy_group_is_not_read_by_the_colliding_dash_owner(svc, unique_ns, flags):
+    """Discriminates on the pre-change code: the PLAIN user writes into the legacy group
+    ``user--<plain>--project--legacy`` (plain ids stay legacy-named with the flag on).  The old
+    narrowed branch built that same name from the ``--`` owner (id ``<plain>--project--legacy``,
+    no project), so the owner read the plain user's fact.  With the builder the owner queries its
+    own encoded group, so it must not see it, while the plain user still does.
+    """
+    from memory.groups import _build_group_id
+
+    flags(graph_group_id_injective_enabled=True)
+    plain = unique_ns.user_id
+    owner = f"{plain}--project--legacy"
+    token = f"Quillfeather{uuid.uuid4().hex[:8]}"
+    legacy = _build_group_id("private", plain, "legacy")
+    assert legacy == f"user--{plain}--project--legacy"  # plain tuple keeps its legacy name
+
+    unique_ns.on_cleanup(lambda: (
+        svc.delete_memories(user_id=plain, include_shared=True),
+        _cypher(svc, "MATCH (n {group_id: $g}) DETACH DELETE n", g=legacy),
+    ))
+    _write(svc, plain, "legacy", f"My parrot is named {token} and lives in Lisbon.")
+    assert _cypher(svc, "MATCH (e:Episodic {group_id: $g}) WHERE e.content CONTAINS $t RETURN e.uuid AS u",
+                   g=legacy, t=token)
+
+    mine = svc._search_graph_for_visibility(
+        query=token, user_id=plain, project_id="legacy", limit=10, visibility="private",
+        include_shared=True, include_episodes=True)
+    assert token.lower() in _blob(mine)
+    for visibility, include_shared in (("private", True), (None, False)):
+        theirs = svc._search_graph_for_visibility(
+            query=token, user_id=owner, project_id=None, limit=10, visibility=visibility,
+            include_shared=include_shared, include_episodes=True)
+        assert token.lower() not in _blob(theirs), "the '--' owner read the plain user's legacy group"
+    assert token.lower() not in _blob(svc.search_graph(token, user_id=owner, limit=10))
