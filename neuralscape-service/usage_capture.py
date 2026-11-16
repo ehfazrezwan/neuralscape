@@ -670,7 +670,23 @@ class DurableUsageRecorder:
     #: Tells capture seams to write a pending event before each provider call.
     records_pending = True
 
-    def __init__(self, store: Any, *, retries: int = 2, retry_delay: float = 0.05, sleep: Any = None) -> None:
+    #: Most (tenant, task) gap counters held in memory while the store is down; more are only counted.
+    MAX_UNRECORDED_KEYS = 1_000
+
+    #: Longest the retries of one event may take (the call runs on the provider-call thread).
+    RECORD_BUDGET_S = 2.5
+
+    def __init__(
+        self,
+        store: Any,
+        *,
+        retries: int = 2,
+        retry_delay: float = 0.05,
+        sleep: Any = None,
+        max_unrecorded_keys: int | None = None,
+        record_budget_s: float | None = None,
+        monotonic: Any = None,
+    ) -> None:
         import threading
         import time
 
@@ -678,9 +694,14 @@ class DurableUsageRecorder:
         self._retries = max(0, int(retries))
         self._retry_delay = retry_delay
         self._sleep = sleep or time.sleep
+        self._monotonic = monotonic or time.monotonic
+        self._max_keys = self.MAX_UNRECORDED_KEYS if max_unrecorded_keys is None else int(max_unrecorded_keys)
+        self._budget_s = self.RECORD_BUDGET_S if record_budget_s is None else float(record_budget_s)
         self._lock = threading.Lock()
         self._unrecorded: dict[tuple[str, str], int] = {}
         self.failures = 0
+        #: Events that failed to store whose task could not even be remembered (the counter map was full).
+        self.gaps_overflowed = 0
 
     @property
     def unrecorded(self) -> dict[tuple[str, str], int]:
@@ -694,13 +715,15 @@ class DurableUsageRecorder:
 
         context = current_attempt_context()
         ledger_attempt = context.ledger_attempt if context else None
+        started = self._monotonic()
         for attempt in range(self._retries + 1):
             try:
                 self._store.append(event, ledger_attempt=ledger_attempt)
             except (UsageEventConflict, ValueError, TypeError):
                 break  # not transient: retrying cannot help
             except Exception:
-                if attempt < self._retries:
+                # The provider-call thread never waits longer than the budget on a sick store.
+                if attempt < self._retries and self._monotonic() - started < self._budget_s:
                     self._sleep(self._retry_delay * (attempt + 1))
                     continue
                 break
@@ -711,7 +734,12 @@ class DurableUsageRecorder:
         self.failures += 1
         key = (event.tenant_id, event.task_id)
         with self._lock:
-            self._unrecorded[key] = self._unrecorded.get(key, 0) + 1
+            if key in self._unrecorded or len(self._unrecorded) < self._max_keys:
+                self._unrecorded[key] = self._unrecorded.get(key, 0) + 1
+            else:
+                # The store has been down long enough to fill the map: keep the memory bounded and
+                # count the drop (an operator sees ``gaps_overflowed`` and the error logs).
+                self.gaps_overflowed += 1
         logger.error("durable usage write failed for %s", event.event_id, exc_info=True)
         return False
 
@@ -728,4 +756,7 @@ class DurableUsageRecorder:
                 logger.error("usage gap for task %s could not be stored", task_id, exc_info=True)
                 with self._lock:
                     key = (tenant_id, task_id)
-                    self._unrecorded[key] = self._unrecorded.get(key, 0) + count
+                    if key in self._unrecorded or len(self._unrecorded) < self._max_keys:
+                        self._unrecorded[key] = self._unrecorded.get(key, 0) + count
+                    else:
+                        self.gaps_overflowed += count

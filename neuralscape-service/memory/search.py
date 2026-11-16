@@ -4,8 +4,10 @@ Mechanically extracted from memory_service.py (mixins-with-facade split);
 code is verbatim — behavior unchanged.
 """
 
+import contextvars
 import logging
 import time
+import uuid
 
 from config import settings
 from schemas import MemoryResponse, MemoryVisibility
@@ -127,6 +129,27 @@ def _workspace_filter(effective: list[str]):
     if refs:
         should.append(FieldCondition(key="metadata.workspace", match=MatchAny(any=refs)))
     return Filter(should=should)
+
+
+
+def _plain_recall_request(
+    *, categories, scope, domain, observation_type, concepts, memory_kind, workspaces, visibility
+) -> bool:
+    """Whether a search carries nothing the routed engine cannot apply.
+
+    The engine filters by owner, shared pool and project only.  A request that narrows by category,
+    scope, domain, observation type, concepts, memory kind or workspaces, selects the standard tier
+    (or would include it: ``STANDARDS_ENABLED`` adds the standard pool to every unnarrowed search) is
+    served by the normal path, which applies all of them.
+    """
+
+    if categories or scope or domain or observation_type or concepts or memory_kind or workspaces:
+        return False
+    if visibility == MemoryVisibility.STANDARD.value:
+        return False
+    if settings.standards_enabled and visibility is None:
+        return False
+    return True
 
 
 class SearchMixin:
@@ -458,12 +481,15 @@ class SearchMixin:
     def _engine_recall(
         self, switch, query: str, user_id: str, project_id, limit: int, visibility, include_shared: bool
     ):
-        """Vector recall from the serving engine, hydrated from the memory rows.
+        """Vector recall from the serving engine, hydrated and re-checked against the memory rows.
 
-        Returns ``None`` (the caller falls back to the legacy vector path) only
-        when the engine itself fails; rows the caller may not read are dropped
-        by ``get_memories_by_ids`` exactly as for any batch read.  Graph and
-        lexical legs are not routed in this mode.
+        Only a *subset* of what the normal path may return is ever returned: every engine hit is
+        re-read from the memory store and kept only if the caller may read it, it is not a
+        consolidation tombstone, it lives in the default ``memory`` workspace (the reference-workspace
+        fence) and, when the request names a project, it belongs to that project.  The graph and
+        lexical legs and the rerank are not part of a routed search.
+
+        Returns ``None`` (the caller falls back to the normal path) when the engine itself fails.
         """
 
         try:
@@ -473,23 +499,46 @@ class SearchMixin:
             )
             if not hits:
                 return []
-            # The batch read accepts a bounded number of ids per call: hydrate in batches of it.
-            from memory.reads import GET_MEMORIES_MAX_IDS
-
-            ids = [h.record_id for h in hits]
+            m = self._get_memory()
+            ids = []
+            for hit in hits:
+                try:
+                    uuid.UUID(str(hit.record_id))
+                except (ValueError, AttributeError, TypeError):
+                    continue  # the row store would refuse a malformed id for the whole batch
+                ids.append(str(hit.record_id))
             by_id = {}
-            for start in range(0, len(ids), GET_MEMORIES_MAX_IDS):
-                fetched = self.get_memories_by_ids(ids[start:start + GET_MEMORIES_MAX_IDS], user_id)
-                by_id.update({r.id: r for r in fetched.get("results", [])})
+            # The row store is asked in bounded batches.
+            for start in range(0, len(ids), 50):
+                points = m.vector_store.client.retrieve(
+                    collection_name=settings.qdrant_collection,
+                    ids=ids[start:start + 50],
+                    with_payload=True,
+                    with_vectors=False,
+                ) or []
+                by_id.update({str(getattr(p, "id", "")): p for p in points})
             results = []
             for hit in hits:
-                row = by_id.get(hit.record_id)
-                if row is not None:
-                    row.score = hit.score
-                    results.append(row)
-            return results
+                point = by_id.get(str(hit.record_id))
+                if point is None:
+                    continue
+                payload = getattr(point, "payload", None) or {}
+                if not self._payload_readable_by(payload, user_id):
+                    continue
+                meta = payload.get("metadata") or {}
+                inner = meta.get("metadata") if isinstance(meta.get("metadata"), dict) else {}
+                if meta.get("dream_tombstoned") or inner.get("dream_tombstoned"):
+                    continue
+                if (meta.get("workspace") or inner.get("workspace") or "memory") != "memory":
+                    continue
+                if project_id and (meta.get("project_id") or inner.get("project_id")) != project_id:
+                    continue
+                row = self._point_to_response(point)
+                row.score = hit.score
+                results.append(row)
+            return results[:limit]
         except Exception as error:  # noqa: BLE001 - an engine fault must not take recall down
-            logger.warning("routed engine recall failed; using the legacy vector path: %s", error)
+            logger.warning("routed engine recall failed; using the normal search path: %s", error)
             return None
 
     @attributed("search")
@@ -542,9 +591,18 @@ class SearchMixin:
             within each pool, rank-transferred onto the cosine scale across
             pools); displayed scores stay native.
         """
-        # Routed-engine recall (V3 switch): only when ENGINE_ROUTING_ENABLED and
-        # ENGINE_ROUTING_RECALL_ENABLED are both true; default off = unchanged.
-        if not vector_only:
+        # Routed-engine recall: only when ENGINE_ROUTING_ENABLED and ENGINE_ROUTING_RECALL_ENABLED
+        # are both true, and only for a plain request (nothing the engine cannot apply).  The flags are
+        # read before anything engine-related is imported: with them off this is two attribute reads.
+        if (
+            not vector_only
+            and settings.engine_routing_enabled is True
+            and settings.engine_routing_recall_enabled is True
+            and _plain_recall_request(
+                categories=categories, scope=scope, domain=domain, observation_type=observation_type,
+                concepts=concepts, memory_kind=memory_kind, workspaces=workspaces, visibility=visibility,
+            )
+        ):
             from engine_adapters_switch import recall_switch
 
             switch = recall_switch(settings)
@@ -574,7 +632,10 @@ class SearchMixin:
         graph_submitted_at = time.monotonic()
         if not vector_only:
             try:
+                # A copy of the caller's context travels with the leg: the usage attempt (and the
+                # log context) it is bound to must be visible to Graphiti's own provider calls.
                 graph_future = _GRAPH_SEARCH_POOL.submit(
+                    contextvars.copy_context().run,
                     self._search_graph_for_visibility,
                     query=query,
                     user_id=user_id,

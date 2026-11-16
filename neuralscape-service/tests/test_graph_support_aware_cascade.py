@@ -292,13 +292,25 @@ def _enrich(service, monkeypatch, *, row_present: bool):
 
 
 def test_a_memory_deleted_while_it_was_enriched_loses_the_episode_just_written(service, monkeypatch):
-    """Its delete ran first and found no episode yet; without this the deleted content stays in the graph."""
+    """Its delete ran first and found no episode yet; without this the deleted content stays in the graph.
+
+    Behind ``GRAPH_DELETE_RACE_CLEANUP_ENABLED``; the episode is named by its uuid alone (a failed uuid lookup
+    must never fall back to a content match on another episode).
+    """
+    monkeypatch.setattr(settings, "graph_delete_race_cleanup_enabled", True)
     ok, removed, group = _enrich(service, monkeypatch, row_present=False)
     assert ok is True
-    assert removed == [(group, {"episode_uuid": "ep-new", "episode_name": "ep-new-name", "content": "c"})]
+    assert removed == [(group, {"episode_uuid": "ep-new"})]
+
+
+def test_with_the_flag_off_enrich_graph_leaves_a_deleted_memorys_episode_to_the_caller(service, monkeypatch):
+    monkeypatch.setattr(settings, "graph_delete_race_cleanup_enabled", False)
+    ok, removed, _ = _enrich(service, monkeypatch, row_present=False)
+    assert ok is True and removed == []
 
 
 def test_a_memory_that_still_exists_keeps_its_new_episode(service, monkeypatch):
+    monkeypatch.setattr(settings, "graph_delete_race_cleanup_enabled", True)
     ok, removed, _ = _enrich(service, monkeypatch, row_present=True)
     assert ok is True and removed == []
 

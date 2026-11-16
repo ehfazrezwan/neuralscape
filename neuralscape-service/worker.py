@@ -1151,6 +1151,12 @@ async def process_graph_enrichment(
 
         graph_ontology = require_adapter(adapter).graph_ontology_kwargs()
     episode_before = await asyncio.to_thread(_row_episode_uuid, service, memory_id)
+    enrich_kwargs: dict = {}
+    race_outcome: dict | None = None
+    if getattr(settings, "graph_delete_race_cleanup_enabled", False) is True:
+        # enrich_graph removes the episode itself when the row was deleted mid-write and says so here.
+        race_outcome = {}
+        enrich_kwargs["outcome"] = race_outcome
     enriched = await asyncio.to_thread(
         service.enrich_graph,
         content=content,
@@ -1162,7 +1168,14 @@ async def process_graph_enrichment(
         graph_ontology=graph_ontology,
         occurred_at=occurred_at,
         workspace=current_workspace,
+        **enrich_kwargs,
     )
+    if enriched and race_outcome and race_outcome.get("cleaned_up"):
+        logger.warning(
+            "Memory %s was deleted while its graph enrichment ran; the episode just written was "
+            "already removed by the enrichment.", memory_id,
+        )
+        return {"memory_id": memory_id, "enriched": False, "skipped": "changed_during_enrichment"}
     episode_after = await asyncio.to_thread(_row_episode_uuid, service, memory_id) if enriched else None
     if enriched:
         # The first check above only covers the time the job sat in the queue.
@@ -1669,6 +1682,7 @@ def _make_on_job_start(queue_name: str):
     only leaves ``function`` off the log lines.
     """
     async def on_job_start(ctx: dict) -> None:
+        info = None
         try:
             bound = {"job_id": ctx.get("job_id"), "job_try": ctx.get("job_try"), "queue": queue_name}
             structlog.contextvars.bind_contextvars(**{k: v for k, v in bound.items() if v is not None})
@@ -1679,12 +1693,25 @@ def _make_on_job_start(queue_name: str):
                     structlog.contextvars.bind_contextvars(function=info.function)
         except Exception:  # noqa: BLE001 — observability must never fail a job
             logger.debug("binding job log context failed (non-fatal)", exc_info=True)
-        await _bind_usage_attempt(ctx)
+        await _bind_usage_attempt(ctx, info)
 
     return on_job_start
 
 
-async def _bind_usage_attempt(ctx: dict) -> None:
+def _multi_writer_batch(info) -> bool:
+    """Whether the job is a raw batch holding items of more than one user."""
+    try:
+        if getattr(info, "function", None) != "process_memory_raw_batch":
+            return False
+        items = (getattr(info, "args", None) or (None,))[0]
+        if not isinstance(items, list):
+            return False
+        return len({i.get("user_id") for i in items if isinstance(i, dict) and i.get("user_id")}) > 1
+    except Exception:  # noqa: BLE001
+        return False
+
+
+async def _bind_usage_attempt(ctx: dict, info=None) -> None:
     """Attribute the provider calls this job makes to the person it serves (only when usage capture is on).
 
     The person is read from the enqueue-time ``task -> user`` record; a job without one (a cron, a job
@@ -1705,6 +1732,10 @@ async def _bind_usage_attempt(ctx: dict) -> None:
             raw = await redis.get(_task_user_key(job_id))
             if raw:
                 tenant = raw.decode() if isinstance(raw, bytes) else str(raw)
+        if tenant is not None and _multi_writer_batch(info):
+            # The enqueue-time record keeps only the last writer of a mixed-user batch: billing the whole
+            # batch to that one person would be wrong, so it is recorded as unattributed.
+            tenant = None
         usage_capture.bind_job_attempt(tenant, job_id, ctx.get("job_try"))
     except Exception:  # noqa: BLE001 — capture must never fail a job
         logger.debug("binding the usage attempt failed (non-fatal)", exc_info=True)

@@ -462,6 +462,11 @@ class Settings(BaseSettings):
     # most-restrictive cascade (an edge is expired even when another live
     # episode supports it).  The governed profile turns it on.
     graph_support_aware_removal_enabled: bool = False
+    # A memory deleted while its graph episode is being written has that episode removed again
+    # (its delete ran before the episode existed and found nothing to remove).  The graph worker
+    # recognises the cleanup as done and does not repeat it.  Off = the worker's own post-enrichment
+    # check alone handles a delete that lands mid-enrichment.
+    graph_delete_race_cleanup_enabled: bool = False
 
     # Injective graph group ids (env GRAPH_GROUP_ID_INJECTIVE_ENABLED). Off (the
     # default): group ids are exactly the legacy delimiter-joined names, byte for
@@ -1340,13 +1345,6 @@ class Settings(BaseSettings):
                 errors.append("LLM_GATEWAY_BASE_URL is required when LLM_GATEWAY_ENABLED is true")
             if not self.llm_gateway_api_key:
                 errors.append("LLM_GATEWAY_API_KEY is required when LLM_GATEWAY_ENABLED is true")
-        if self.engine_routing_enabled is True and self.engine_routing_dimensions <= 0:
-            errors.append("ENGINE_ROUTING_DIMENSIONS must be positive when ENGINE_ROUTING_ENABLED is true")
-        if self.engine_pgvector_enabled is True:
-            if not self.engine_pgvector_dsn:
-                errors.append("ENGINE_PGVECTOR_DSN is required when ENGINE_PGVECTOR_ENABLED is true")
-            if self.engine_pgvector_dimensions <= 0:
-                errors.append("ENGINE_PGVECTOR_DIMENSIONS must be positive when ENGINE_PGVECTOR_ENABLED is true")
         if self.ns_gemini_base_url:
             from urllib.parse import urlsplit
 

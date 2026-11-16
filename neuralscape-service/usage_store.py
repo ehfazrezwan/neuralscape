@@ -177,43 +177,55 @@ class _SqlUsageStore:
         # Through JSON, the same path reads take, so tuple fields (recipients) survive.
         event = UsageEvent.model_validate_json(event.model_dump_json())
         body, digest = _canonical(event)
+        return self._insert(event, body, digest, ledger_attempt)
+
+    def _run_write(self, work: Callable[[Any], Any]) -> Any:
+        """Run ``work(connection)`` in one transaction (the PostgreSQL store bounds it, see there)."""
         with self._lock, self._txn() as c:
-            cursor = c.execute(
-                self._sql(
-                    "INSERT INTO usage_events(tenant_id, event_id, task_id, session_id, intent_id,"
-                    " attempt_id, ledger, operation, predecessor_event_id, status, attempt_outcome,"
-                    " late_after_cancellation, ledger_attempt, digest, body, recorded_at)"
-                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
-                    " ON CONFLICT (tenant_id, event_id) DO NOTHING"
-                ),
-                (
-                    event.tenant_id,
-                    event.event_id,
-                    event.task_id,
-                    event.session_id,
-                    event.intent_id,
-                    event.attempt_id,
-                    event.ledger,
-                    event.operation,
-                    event.predecessor_event_id,
-                    event.status,
-                    event.attempt_outcome,
-                    int(event.late_after_cancellation),
-                    ledger_attempt,
-                    digest,
-                    body,
-                    float(self._clock()),
-                ),
-            )
-            if cursor.rowcount == 1:
-                return True
-            stored = c.execute(
-                self._sql("SELECT digest FROM usage_events WHERE tenant_id=? AND event_id=?"),
-                (event.tenant_id, event.event_id),
-            ).fetchone()
-            if stored is None or stored[0] != digest:
-                raise UsageEventConflict("a different usage event exists under this event id")
-            return False
+            return work(c)
+
+    def _insert(self, event: UsageEvent, body: str, digest: str, ledger_attempt: int | None) -> bool:
+        return self._run_write(lambda c: self._insert_in(c, event, body, digest, ledger_attempt))
+
+    def _insert_in(
+        self, c: Any, event: UsageEvent, body: str, digest: str, ledger_attempt: int | None
+    ) -> bool:
+        cursor = c.execute(
+            self._sql(
+                "INSERT INTO usage_events(tenant_id, event_id, task_id, session_id, intent_id,"
+                " attempt_id, ledger, operation, predecessor_event_id, status, attempt_outcome,"
+                " late_after_cancellation, ledger_attempt, digest, body, recorded_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                " ON CONFLICT (tenant_id, event_id) DO NOTHING"
+            ),
+            (
+                event.tenant_id,
+                event.event_id,
+                event.task_id,
+                event.session_id,
+                event.intent_id,
+                event.attempt_id,
+                event.ledger,
+                event.operation,
+                event.predecessor_event_id,
+                event.status,
+                event.attempt_outcome,
+                int(event.late_after_cancellation),
+                ledger_attempt,
+                digest,
+                body,
+                float(self._clock()),
+            ),
+        )
+        if cursor.rowcount == 1:
+            return True
+        stored = c.execute(
+            self._sql("SELECT digest FROM usage_events WHERE tenant_id=? AND event_id=?"),
+            (event.tenant_id, event.event_id),
+        ).fetchone()
+        if stored is None or stored[0] != digest:
+            raise UsageEventConflict("a different usage event exists under this event id")
+        return False
 
     # -- reads ---------------------------------------------------------
     def events(
@@ -251,8 +263,8 @@ class _SqlUsageStore:
         """Add ``count`` to the task's unrecorded-write counter (never lowers it)."""
         if type(count) is not int or count < 1:
             raise ValueError("count must be a positive integer")
-        with self._lock, self._txn() as c:
-            c.execute(
+        self._run_write(
+            lambda c: c.execute(
                 self._sql(
                     "INSERT INTO usage_gaps(tenant_id, task_id, unrecorded, updated_at)"
                     " VALUES (?, ?, ?, ?)"
@@ -262,6 +274,7 @@ class _SqlUsageStore:
                 ),
                 (tenant_id, task_id, count, float(self._clock())),
             )
+        )
 
     def gaps(self, tenant_id: str, task_id: str) -> int:
         """Usage writes known to be missing for the task (0 when none was lost)."""
@@ -353,6 +366,16 @@ class SqliteUsageStore(_SqlUsageStore):
 
 
 class PostgresUsageStore(_SqlUsageStore):
+    """PostgreSQL usage store.
+
+    One connection, reopened when it drops (a restart, a failover, a killed backend) and never held
+    across an unbounded wait: an append has a short budget (``append_budget_s``) covering the wait for
+    the connection lock, the statement and one reconnect-and-retry (the insert is idempotent), so a slow
+    or absent database costs the provider-call thread at most that budget.  Reads and the rollup use the
+    longer session timeouts.  After a failed reconnect the store fails fast for ``reconnect_cooldown_s``
+    instead of paying a connect timeout on every call.
+    """
+
     dialect = "postgres"
     _MIGRATION_LOCK = 7_302_011_017  # application-wide advisory lock key
 
@@ -364,31 +387,127 @@ class PostgresUsageStore(_SqlUsageStore):
         connect_timeout: int = 10,
         statement_timeout_ms: int = 30_000,
         lock_timeout_ms: int = 10_000,
+        append_budget_s: float = 2.0,
+        reconnect_cooldown_s: float = 5.0,
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         super().__init__(clock)
         import psycopg
 
-        self._conn = psycopg.connect(dsn, autocommit=True, connect_timeout=connect_timeout)
-        # A stuck statement or a held lock (the migration advisory lock included) must fail
-        # the call, not hang the writer or the rollup route for ever.
-        for name, value in (("statement_timeout", statement_timeout_ms), ("lock_timeout", lock_timeout_ms)):
-            self._conn.execute("SELECT set_config(%s, %s, false)", (name, f"{int(value)}ms"))
-        self._assert_durable_settings()
+        self._psycopg = psycopg
+        self._dsn = dsn
+        self._connect_timeout = connect_timeout
+        self._statement_timeout_ms = statement_timeout_ms
+        self._lock_timeout_ms = lock_timeout_ms
+        self._append_budget_s = float(append_budget_s)
+        self._reconnect_cooldown_s = float(reconnect_cooldown_s)
+        self._monotonic = monotonic
+        self._retry_after = 0.0
+        self.reconnects = 0
+        self._conn = self._open_connection(connect_timeout)
+        self._assert_durable_settings(self._conn)
         self._migrate()
 
-    def _assert_durable_settings(self) -> None:
+    def _open_connection(self, connect_timeout: float) -> Any:
+        conn = self._psycopg.connect(self._dsn, autocommit=True, connect_timeout=connect_timeout)
+        # A stuck statement or a held lock (the migration advisory lock included) must fail
+        # the call, not hang the writer or the rollup route for ever.
+        for name, value in (
+            ("statement_timeout", self._statement_timeout_ms),
+            ("lock_timeout", self._lock_timeout_ms),
+        ):
+            conn.execute("SELECT set_config(%s, %s, false)", (name, f"{int(value)}ms"))
+        return conn
+
+    @staticmethod
+    def _assert_durable_settings(conn: Any) -> None:
         for setting in ("fsync", "synchronous_commit", "full_page_writes"):
-            value = self._conn.execute(f"SHOW {setting}").fetchone()[0]
+            value = conn.execute(f"SHOW {setting}").fetchone()[0]
             if value != "on":
                 raise UsageStoreError(f"PostgreSQL {setting} must be on (is {value})")
+
+    def _connection_failure(self, error: BaseException) -> bool:
+        kinds = tuple(
+            kind
+            for kind in (
+                getattr(self._psycopg, "OperationalError", None),
+                getattr(self._psycopg, "InterfaceError", None),
+            )
+            if isinstance(kind, type)
+        )
+        return bool(kinds) and isinstance(error, kinds)
+
+    def _drop_connection(self) -> None:
+        conn, self._conn = self._conn, None
+        if conn is not None:
+            with contextlib.suppress(Exception):
+                conn.close()
+
+    def _ensure_connection(self) -> None:
+        conn = self._conn
+        if conn is not None and not getattr(conn, "closed", False) and not getattr(conn, "broken", False):
+            return
+        now = self._monotonic()
+        if now < self._retry_after:
+            raise UsageStoreError("usage store unavailable: reconnect is backing off")
+        self._drop_connection()
+        try:
+            conn = self._open_connection(min(self._connect_timeout, 2))
+            self._assert_durable_settings(conn)
+        except Exception:
+            self._retry_after = now + self._reconnect_cooldown_s
+            raise
+        self._conn = conn
+        self._retry_after = 0.0
+        self.reconnects += 1
 
     def _sql(self, sql: str) -> str:
         return sql.replace("?", "%s")
 
     @contextlib.contextmanager
     def _txn(self) -> Iterator[Any]:
-        with self._conn.transaction():
-            yield self._conn
+        self._ensure_connection()
+        try:
+            with self._conn.transaction():
+                yield self._conn
+        except Exception as error:
+            if self._connection_failure(error):
+                self._drop_connection()  # the next call reconnects
+            raise
+
+    def _run_write(self, work: Callable[[Any], Any]) -> Any:
+        """A write (an append, a gap count) within the append budget: the wait for the connection
+        lock, the statement and, after a dropped connection, one reconnect and one retry (every
+        write here is idempotent or additive-and-recorded, and a failed first try did not commit)."""
+
+        deadline = self._monotonic() + self._append_budget_s
+        last: BaseException | None = None
+        for attempt in range(2):  # the second try follows one reconnect
+            remaining = deadline - self._monotonic()
+            if remaining <= 0:
+                break
+            if not self._lock.acquire(timeout=remaining):
+                raise UsageStoreError("usage store busy: the append budget was spent waiting for the connection")
+            try:
+                budget_ms = max(100, int((deadline - self._monotonic()) * 1000))
+                try:
+                    with self._txn() as c:
+                        c.execute(
+                            "SELECT set_config('statement_timeout', %s, true),"
+                            " set_config('lock_timeout', %s, true)",
+                            (f"{budget_ms}ms", f"{budget_ms}ms"),
+                        )
+                        return work(c)
+                except Exception as error:
+                    if attempt == 0 and self._connection_failure(error):
+                        last = error
+                        continue
+                    raise
+            finally:
+                self._lock.release()
+        if last is not None:
+            raise last
+        raise UsageStoreError("usage store append budget spent")
 
     def _bootstrap(self, c: Any) -> None:
         c.execute("SELECT pg_advisory_xact_lock(%s)", (self._MIGRATION_LOCK,))

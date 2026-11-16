@@ -1265,6 +1265,7 @@ class WriteMixin:
         graph_ontology: dict | None = None,
         occurred_at: str | None = None,
         workspace: str | None = None,
+        outcome: dict | None = None,
     ) -> bool:
         """Add content to the knowledge graph + attach memory_id back-refs.
 
@@ -1289,6 +1290,11 @@ class WriteMixin:
         to report honest enrichment status instead of assuming success — a
         transient Gemini 503 leaves the memory vector-only, and that must be
         observable rather than reported as ``enriched=True``.
+
+        ``outcome`` (optional, passed by the graph worker only when
+        ``GRAPH_DELETE_RACE_CLEANUP_ENABLED`` is on) is an out-parameter: when the memory's row was
+        deleted while it was enriched and the episode just written has been removed here, it gets
+        ``outcome["cleaned_up"] = True`` so the caller knows the cleanup is already resolved.
         """
         if not (self._graphiti and self._bridge):
             return False
@@ -1333,14 +1339,25 @@ class WriteMixin:
             episode_name = (graph_result or {}).get("episode_name")
             if episode_uuid or episode_name:
                 self._persist_graph_episode_ref(memory_id, episode_uuid, episode_name)
-            if (episode_uuid or episode_name) and self._row_deleted_during_enrichment(memory_id):
+            if (
+                getattr(settings, "graph_delete_race_cleanup_enabled", False) is True
+                and (episode_uuid or episode_name)
+                and self._row_deleted_during_enrichment(memory_id)
+            ):
                 # The memory was deleted while it was being enriched: its delete found no episode
                 # yet, so the one just written would keep the deleted content in the graph.
                 # Remove it as the delete would have (once it is written, the delete's own
                 # content lookup finds it, so a delete landing after this check is covered).
-                self._cascade_expire_episode(
-                    group_id, episode_uuid=episode_uuid, episode_name=episode_name, content=content,
-                )
+                # The exact episode is known: name it by uuid alone, so a failed uuid lookup can
+                # never fall back to a content match on another (possibly another user's) episode.
+                if episode_uuid:
+                    removal = self._cascade_expire_episode(group_id, episode_uuid=episode_uuid)
+                else:
+                    removal = self._cascade_expire_episode(
+                        group_id, episode_name=episode_name, content=content,
+                    )
+                if isinstance(removal, dict) and removal.get("resolved") and outcome is not None:
+                    outcome["cleaned_up"] = True
                 return True
             if previous_episodes and episode_uuid:
                 # Support-aware: the new episode is already in place, so an edge the corrected

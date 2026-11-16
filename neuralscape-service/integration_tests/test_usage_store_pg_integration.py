@@ -83,3 +83,45 @@ def test_digest_tamper_detected(make_pg):
         c.execute("UPDATE usage_events SET body = replace(body, '\"final\"', '\"pending\"')")
     with pytest.raises(UsageStoreError):
         store.events(TENANT)
+
+
+def test_the_next_append_succeeds_after_the_backend_is_terminated(make_pg, pg_dsn):
+    """A PostgreSQL restart or failover kills the store's one connection: it must reconnect, not stay broken."""
+    store = make_pg()
+    assert store.append(event("e1")) is True
+    backend_pid = store._conn.info.backend_pid
+    with psycopg.connect(pg_dsn, autocommit=True) as other:
+        other.execute("SELECT pg_terminate_backend(%s)", (backend_pid,))
+    assert store.append(event("e2")) is True  # a fresh connection, one bounded retry
+    assert store.reconnects == 1
+    assert store._conn.info.backend_pid != backend_pid
+    assert {stored.event_id for stored in store.events(TENANT)} == {"e1", "e2"}
+
+
+def test_the_durable_recorder_keeps_recording_after_the_backend_is_terminated(make_pg, pg_dsn):
+    import usage_capture as uc
+
+    store = make_pg()
+    recorder = uc.DurableUsageRecorder(store, retries=0)  # no recorder-level retry: the store alone recovers
+    with uc.attempt_context(uc.AttemptContext(tenant_id=TENANT, task_id="task-1", attempt_id="a")):
+        assert recorder.record(event("e1")) is True
+        with psycopg.connect(pg_dsn, autocommit=True) as other:
+            other.execute("SELECT pg_terminate_backend(%s)", (store._conn.info.backend_pid,))
+        assert recorder.record(event("e2")) is True
+    assert recorder.failures == 0 and recorder.unrecorded == {}
+
+
+def test_an_unreachable_database_costs_an_append_only_its_budget(make_pg, pg_dsn):
+    import time
+
+    store = make_pg()
+    store.append(event("e1"))
+    with psycopg.connect(pg_dsn, autocommit=True) as other:
+        other.execute("SELECT pg_terminate_backend(%s)", (store._conn.info.backend_pid,))
+    store._dsn = "host=127.0.0.1 port=1 dbname=none connect_timeout=1"  # nothing listens there
+    started = time.monotonic()
+    with pytest.raises(Exception):
+        store.append(event("e2"))
+    with pytest.raises(UsageStoreError, match="backing off"):
+        store.append(event("e3"))  # fails at once during the cooldown
+    assert time.monotonic() - started < 6.0
