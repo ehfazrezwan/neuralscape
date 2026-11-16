@@ -428,9 +428,16 @@ def test_the_other_users_export_carries_nothing_of_the_narrowed_record(story):
 
 @proves("ingest.okf-export")
 @negative_control
-def test_export_check_fails_for_the_other_user(a, b, story):
-    check_export_carries(a, story.new)  # the same check passes for the owner first
-    expect_check_fails(check_export_carries, b, story.new)
+def test_export_check_fails_for_the_other_user(story):
+    """Judged on the two exports the fixture took at the export step: a live export now is a later state, after
+    the fixture deleted the record and restored it from the bundle, so it no longer says what the export step did."""
+    assert story.export_a and story.export_b, f"the exports were not taken: {story.export_error}"
+
+    def check_bundle_carries(data: bytes) -> None:
+        assert story.new in bundle_text(data), f"{story.new} is not in that export"
+
+    check_bundle_carries(story.export_a)  # the same check passes for the owner first
+    expect_check_fails(check_bundle_carries, story.export_b)
 
 
 # ── step 8: restore ──────────────────────────────────────────────
