@@ -68,7 +68,7 @@ other profile's scenarios on the same stack, so this profile needs its own resta
 1. Run the `default` profile first with a fixed `NS_RUN_ID`, so the acceptance users A and B and their pools
    exist. Never write data as `acc-<runid>-outsider` (it must stay unknown).
 2. In the API container, before the restart:
-   `python -m policy_migration apply --tenant acc --authority-sqlite /data/ingest/phase2-authority.db --qdrant-url http://qdrant:6333 --collection neuralscape_memories --no-legacy-dictator-grants`
+   `python -m policy_migration apply --tenant acc --authority-sqlite /data/ingest/phase2-authority.db --qdrant-url http://qdrant:6333 --collection <qdrant collection> --no-legacy-dictator-grants`
 3. Restart the API and every worker with the lines of `profiles/phase2.env`, then run
    `run.sh <url> --compose-project <gate project> --profile phase2` with the SAME `NS_RUN_ID`.
 

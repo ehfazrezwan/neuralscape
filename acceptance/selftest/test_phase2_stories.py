@@ -53,7 +53,7 @@ def test_a_secret_looking_name_with_a_non_boolean_value_is_still_redacted():
 def test_the_profile_declares_that_it_needs_a_compose_project_and_its_own_restart():
     text = (ACCEPTANCE / "profiles" / "phase2.env").read_text()
     assert re.search(r"^#\s*requires:.*compose", text, re.I | re.M)
-    assert "NOT part of the flags-on union" in text
+    assert "NOT part of that union" in text
 
 
 # ── @expected_red ────────────────────────────────────────────────
