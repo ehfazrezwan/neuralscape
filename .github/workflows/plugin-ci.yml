@@ -4,27 +4,63 @@ name: plugin-ci
 # and those bundles are committed artifacts (marketplace installs are plain git
 # clones — there is no install-time build). This workflow is the guard for the
 # 2.7.1 packaging bug class: it fails when the committed bundles are missing or
-# stale relative to src/.
+# stale relative to src/, when plugin versions drift between manifests, and when
+# coverage falls under the thresholds in vitest.config.ts.
+#
+# Trigger shape: runs on EVERY PR so `plugin-gate` can be a required check (a
+# path-filtered workflow never reports on PRs that do not touch the plugin, which
+# would block them forever). The `changes` job decides whether the heavy job
+# runs; `plugin-gate` always reports. Push builds stay path-filtered.
 
 on:
   pull_request:
-    paths:
-      - "neuralscape-plugin/**"
-      - ".github/workflows/plugin-ci.yml"
   push:
     branches: [dev, main]
     paths:
       - "neuralscape-plugin/**"
+      - ".claude-plugin/**"
       - ".github/workflows/plugin-ci.yml"
 
+# Least privilege: nothing here writes to the repo. paths-filter needs
+# pull-requests: read on pull_request events; checkout needs contents: read.
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: plugin-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      plugin: ${{ steps.filter.outputs.plugin }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dorny/paths-filter@v4
+        id: filter
+        with:
+          filters: |
+            plugin:
+              - "neuralscape-plugin/**"
+              - ".claude-plugin/**"
+              - ".github/workflows/plugin-ci.yml"
+
   build-and-test:
+    needs: changes
+    # push events have no PR diff; the trigger's own path filter already scoped them.
+    if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.plugin == 'true' }}
     runs-on: ubuntu-latest
     defaults:
       run:
         working-directory: neuralscape-plugin
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - uses: actions/setup-node@v7
         with:
@@ -44,14 +80,36 @@ jobs:
             echo "::error::neuralscape-plugin/scripts/ is stale — run 'npm run build' and commit the bundles."
             exit 1
           fi
-          # A deleted/never-committed bundle wouldn't show in git diff; make
-          # sure every bundle the hooks reference is actually tracked.
-          for f in session-start user-prompt-submit post-tool-use session-end conversation-turn; do
-            git ls-files --error-unmatch "scripts/$f.js" >/dev/null || {
-              echo "::error::scripts/$f.js is not committed — hooks would 404 on marketplace installs."
-              exit 1
-            }
-          done
 
-      - name: Run plugin tests
-        run: npm test
+      - name: Every bundle the hooks need is tracked
+        # Expected set is derived from esbuild.config.js entry points and every
+        # scripts/*.js referenced by hooks/*.json — no hand-kept list to rot.
+        run: node tools/check-bundles.mjs
+
+      - name: Plugin version is identical in every manifest
+        run: node tools/check-versions.mjs
+
+      - name: Run plugin tests with coverage thresholds
+        run: npm run test:coverage
+
+  plugin-gate:
+    if: ${{ always() }}
+    needs: [changes, build-and-test]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require the plugin qualification job when it applies
+        env:
+          CHANGES_RESULT: ${{ needs.changes.result }}
+          BUILD_RESULT: ${{ needs.build-and-test.result }}
+        run: |
+          set -eu
+          if [ "$CHANGES_RESULT" != "success" ]; then
+            echo "::error::changes result '$CHANGES_RESULT'; expected 'success'"
+            exit 1
+          fi
+          # 'skipped' is correct only when the plugin was untouched; failure and
+          # cancelled never pass.
+          case "$BUILD_RESULT" in
+            success|skipped) echo "build-and-test: $BUILD_RESULT" ;;
+            *) echo "::error::build-and-test result '$BUILD_RESULT'"; exit 1 ;;
+          esac

@@ -1,16 +1,92 @@
 """Core lazy-init plumbing for MemoryService: mem0/Graphiti/genai clients and Qdrant indexes.
 
-Mechanically extracted from memory_service.py (mixins-with-facade split);
-code is verbatim — behavior unchanged.
+``CoreMixin`` was mechanically extracted from memory_service.py (mixins-with-facade
+split) with its behavior unchanged. The Qdrant cold-start helpers above it
+(``_memory_from_config`` and the 409/500 detectors, PR #453) were written
+afterwards and are not part of that extraction.
 """
 
 import logging
 import threading
+import time
 
 from google import genai
 from config import settings
 
 logger = logging.getLogger(__name__)
+
+# One mem0 start touches two Qdrant collections (memories and migrations).
+# Each can cost two failed attempts, a 409 from our create and then a 500 from
+# reading it while another process finishes creating it, so the worst
+# expected start uses four. A collection being created was readable within
+# 0.1 to 0.16 s in live boots (0.155 s was the slowest observed), against 2.8 s
+# of total backoff here (sleeps of 0.1 * attempt after attempts 1 to 7). A fault
+# that persists still fails start-up after the last attempt.
+_COLD_START_ATTEMPTS = 8
+
+
+def _is_collection_exists_conflict(exc: BaseException) -> bool:
+    """Qdrant's 409 ``Collection `x` already exists!``: another process created it first.
+
+    Only that conflict counts. A 409 with any other message (or none) is a
+    different failure and must not be retried as a concurrent creation.
+    """
+    try:
+        from qdrant_client.http.exceptions import UnexpectedResponse
+    except ImportError:  # pragma: no cover — qdrant_client ships with mem0
+        return False
+    if not isinstance(exc, UnexpectedResponse) or exc.status_code != 409:
+        return False
+    return b"already exists" in (exc.content or b"")
+
+
+def _is_collection_not_yet_readable(exc: BaseException) -> bool:
+    """Qdrant's 500 ``0 of 0 read operations failed``: a collection another
+    process is still creating.
+
+    Qdrant lists a new collection before its shard can be read, and for a
+    moment after the create call returns. Reading it then fails with this
+    500. Only this exact body counts: any other 500, or ``N of N`` with
+    N > 0 (shards exist but failed), is a real failure.
+    """
+    try:
+        from qdrant_client.http.exceptions import UnexpectedResponse
+    except ImportError:  # pragma: no cover — qdrant_client ships with mem0
+        return False
+    if not isinstance(exc, UnexpectedResponse) or exc.status_code != 500:
+        return False
+    return b"0 of 0 read operations failed" in (exc.content or b"")
+
+
+def _is_concurrent_creation(exc: BaseException) -> bool:
+    return _is_collection_exists_conflict(exc) or _is_collection_not_yet_readable(exc)
+
+
+def _memory_from_config(memory_cls, config):
+    """``Memory.from_config``, tolerating a concurrent first start.
+
+    mem0's Qdrant store lists the collections and creates its own when it is
+    missing, or reads it when it is listed. When the API and the workers start
+    together against an empty Qdrant, a process that loses the race either
+    gets ``409 already exists`` from its create, or sees the collection listed
+    while another process is still creating it and gets ``500 0 of 0 read
+    operations failed`` when reading it. Either way the collection is there or
+    about to be, so building ``Memory`` again a moment later goes on. Any other
+    error is raised at once.
+    """
+    for attempt in range(1, _COLD_START_ATTEMPTS + 1):
+        try:
+            return memory_cls.from_config(config)
+        except Exception as exc:
+            if attempt == _COLD_START_ATTEMPTS or not _is_concurrent_creation(exc):
+                raise
+            logger.info(
+                "Qdrant collection is being created concurrently by another process; "
+                "retrying memory initialisation (attempt %d/%d)",
+                attempt + 1,
+                _COLD_START_ATTEMPTS,
+            )
+            time.sleep(0.1 * attempt)
 
 class CoreMixin:
     """CoreMixin for MemoryService (mechanical split — see memory_service.py)."""
@@ -45,7 +121,7 @@ class CoreMixin:
                     from mem0 import Memory
 
                     config = settings.get_mem0_config()
-                    self._memory = Memory.from_config(config)
+                    self._memory = _memory_from_config(Memory, config)
                     # Capture provider usage only when a recorder is installed.
                     from usage_capture import get_usage_recorder
 
@@ -219,8 +295,8 @@ class CoreMixin:
         ("metadata.dream_tombstoned", "bool"),
         ("metadata.visibility", "keyword"),
         ("metadata.scope", "keyword"),
-        # The episode references the shared-episode sibling check filters on (one check per
-        # removed memory, so unindexed it would scan the collection once per deleted row).
+        # Shared-episode sibling lookup (memory/provenance.py): one scroll per
+        # cascade filters on these; unindexed it scans the collection each time.
         ("metadata.graph_episode_uuid", "keyword"),
         ("metadata.graph_episode_name", "keyword"),
     )

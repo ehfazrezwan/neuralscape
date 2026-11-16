@@ -45,10 +45,6 @@ def _pkce():
 @pytest.fixture(autouse=True)
 def mock_backends():
     """Avoid real mem0/Graphiti/Redis like the other suites do."""
-    orig_mem, orig_g, orig_b = main._memory, main._graphiti, main._bridge
-    main._memory = MagicMock()
-    main._graphiti = MagicMock()
-    main._bridge = MagicMock()
     main._async_memory = None
     tm = MagicMock()
     tm.connect = AsyncMock()
@@ -56,7 +52,6 @@ def mock_backends():
     orig_tm = main._task_manager
     main._task_manager = tm
     yield
-    main._memory, main._graphiti, main._bridge = orig_mem, orig_g, orig_b
     main._task_manager = orig_tm
 
 

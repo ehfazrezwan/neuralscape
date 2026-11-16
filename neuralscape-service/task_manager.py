@@ -26,6 +26,59 @@ def _task_user_key(task_id: str) -> str:
     """Reverse map task id → user id (queue.empty webhook attribution)."""
     return f"ns:task-user:{task_id}"
 
+
+def _task_owner_key(task_id: str) -> str:
+    """Set of user ids allowed to read a task's status and result."""
+    return f"ns:task-owner:{task_id}"
+
+
+# ARQ drops a job that has not started within a day of being enqueued
+# (``expires_extra_ms``) and keeps a finished job's result for an hour
+# (``keep_result``). The owner record must outlive both, or an owner polling a
+# slow job would be told it does not exist.
+_OWNER_TTL_FLOOR_S = 2 * 24 * 3600
+
+
+def _task_owner_ttl() -> int:
+    return max(int(settings.queue_status_window_s) * 2, _OWNER_TTL_FLOOR_S)
+
+
+class TaskStatusUnavailable(Exception):
+    """The owner check could not be completed (Redis error).
+
+    The status routes answer this with a 503 for every task id alike. A 404
+    would tell the real owner that their task does not exist, so a client
+    could give up or resubmit the write; a 503 is retryable and, since it is
+    raised before anything about the task is read, says nothing about whether
+    the task exists or whose it is.
+    """
+
+
+async def record_task_owner(pool, task_id: str | None, *user_ids: str | None) -> bool:
+    """Record ``user_ids`` as allowed to read ``task_id``'s status.
+
+    For every enqueue that hands a task id to a caller who may poll it on
+    ``/v1/memories/status`` (TaskManager enqueues, and extension or MCP
+    routes that enqueue on the ARQ pool directly). The set member and its
+    TTL are written in one MULTI/EXEC so an owner key can never be left
+    without an expiry. Best-effort: a failure leaves the task unreadable
+    through a per-user token (the read fails closed) and never fails the
+    enqueue. Returns whether the record was written.
+    """
+    owners = sorted({u for u in user_ids if u})
+    if pool is None or not task_id or not owners:
+        return False
+    key = _task_owner_key(task_id)
+    try:
+        async with pool.pipeline(transaction=True) as pipe:
+            pipe.sadd(key, *owners)
+            pipe.expire(key, _task_owner_ttl())
+            await pipe.execute()
+        return True
+    except Exception as e:  # noqa: BLE001 — must never break writes
+        logger.warning(f"Task owner record failed for {task_id}: {e}")
+        return False
+
 # Map ARQ JobStatus to our API status strings
 _STATUS_MAP = {
     JobStatus.deferred: "queued",
@@ -34,6 +87,32 @@ _STATUS_MAP = {
     JobStatus.complete: "completed",
     JobStatus.not_found: "not_found",
 }
+
+
+async def enqueue_graph_jobs_standalone(jobs: list[dict]) -> dict:
+    """Enqueue graph re-ingest jobs from code with no queue handle (the dream
+    sweep's prune, the post-compile dedup) through a short-lived TaskManager.
+
+    Never raises: returns ``graph_jobs_enqueued`` and
+    ``graph_jobs_not_enqueued_ids`` like :meth:`TaskManager.enqueue_graph_jobs`.
+    """
+    tm = TaskManager()
+    try:
+        await tm.connect()
+        return await tm.enqueue_graph_jobs(jobs)
+    except Exception as e:
+        logger.warning("Sibling graph re-enrichment could not be queued (non-critical): %s", e)
+        return {
+            "graph_jobs_enqueued": 0,
+            "graph_jobs_not_enqueued_ids": [j.get("memory_id") for j in jobs],
+        }
+    finally:
+        pool = getattr(tm, "pool", None)
+        if pool is not None:
+            try:
+                await pool.aclose()
+            except Exception:
+                pass
 
 
 class TaskManager:
@@ -56,6 +135,7 @@ class TaskManager:
             default_queue_name=settings.arq_queue_name,
         )
         logger.info("TaskManager connected to Redis")
+
     def _durable_route(self) -> bool:
         """Whether a new write is accepted by the ledger (the cutover phase decides when enabled)."""
 
@@ -63,8 +143,9 @@ class TaskManager:
             return False
         return self.cutover is None or self.cutover.writes_use_ledger()
 
-
-    async def _track_task(self, user_id: str | None, task_id: str) -> None:
+    async def _track_task(
+        self, user_id: str | None, task_id: str, *, grant_read: bool = True
+    ) -> None:
         """Best-effort per-caller task bookkeeping (C4 queue visibility).
 
         Records the task id in the caller's recent-tasks sorted set (read by
@@ -72,11 +153,18 @@ class TaskManager:
         queue.empty webhook hook). Trivial by design: two keys with a TTL of
         twice the status window — no per-status bookkeeping, statuses are
         still read from ARQ itself. Never blocks or fails an enqueue.
+
+        With ``grant_read`` (the default) ``user_id`` may also read the task's
+        status and result through a per-user token. Queue bookkeeping and the
+        read grant are separate: a task whose result is not ``user_id``'s
+        alone (a mixed-user batch) is counted for them without the grant.
         """
         if not user_id or self.pool is None:
             return
         if self.producer is not None and task_id.startswith("intent-"):
             return  # durable intents are tracked by the ledger, not ARQ
+        if grant_read:
+            await self._record_owner(user_id, task_id)
         try:
             now = time.time()
             ttl = max(int(settings.queue_status_window_s) * 2, 600)
@@ -88,6 +176,27 @@ class TaskManager:
         except Exception as e:  # noqa: BLE001 — bookkeeping must never break writes
             logger.debug(f"Task tracking failed (non-fatal): {e}")
 
+    async def _record_owner(self, user_id: str, task_id: str) -> None:
+        """Record ``user_id`` as allowed to read ``task_id`` (see ``record_task_owner``).
+
+        A set, because one deterministic job id can be enqueued by several
+        users who each submitted that same work (for example two editors
+        making the same change to a shared memory).
+        """
+        await record_task_owner(self.pool, task_id, user_id)
+
+    async def is_task_owner(self, task_id: str, user_id: str | None) -> bool:
+        """Whether ``user_id`` enqueued ``task_id`` (False when unknown).
+
+        Raises ``TaskStatusUnavailable`` when Redis cannot answer.
+        """
+        if not user_id or self.pool is None:
+            return False
+        try:
+            return bool(await self.pool.sismember(_task_owner_key(task_id), user_id))
+        except Exception as e:  # noqa: BLE001 — any Redis failure: deny, retryably
+            raise TaskStatusUnavailable(str(e)) from e
+
     async def enqueue_store(
         self,
         messages: list[dict],
@@ -96,6 +205,8 @@ class TaskManager:
         agent_id: str | None = None,
         run_id: str | None = None,
         occurred_at: str | None = None,
+        # Durable path only (LEDGER_ENABLED): accepted and unused until writes use the ledger.
+        idempotency_key: str | None = None,
     ) -> str:
         """Enqueue memory extraction task. Returns task_id (job_id).
 
@@ -163,6 +274,8 @@ class TaskManager:
         # Data-layer connectors
         memory_kind: str | None = None,
         source_ref: dict | None = None,
+        # Durable path only (LEDGER_ENABLED): accepted and unused until writes use the ledger.
+        idempotency_key: str | None = None,
     ) -> str:
         """Enqueue raw memory storage task. Returns task_id (job_id).
 
@@ -316,9 +429,9 @@ class TaskManager:
             _job_id=job_id,
             _queue_name=settings.ingest_queue_name,
         )
-        if job is None:
-            return job_id
-        return job.job_id
+        task_id = job_id if job is None else job.job_id
+        await self._track_task(payload.get("user_id"), task_id)
+        return task_id
 
     async def enqueue_code_index(self, payload: dict) -> str:
         """Phase G: enqueue a through-NS code-index task on the ingest queue.
@@ -342,26 +455,37 @@ class TaskManager:
         return task_id
 
     async def enqueue_connector_sync(
-        self, connector_id: str, *, record: dict | None = None, idempotency_key: str | None = None
+        self,
+        connector_id: str,
+        user_id: str | None = None,
+        *,
+        generation: str | None = None,
+        record: dict | None = None,
+        idempotency_key: str | None = None,
     ) -> str:
         """Enqueue a connector sync task. Returns job_id.
 
-        Job id is keyed on the connector instance so overlapping syncs of the
-        same connector coalesce rather than stacking. Must match the id scheme
-        used by ``connector_sync_cron`` in worker.py (``sync-<connector_id>``)
-        so a cron-triggered and an API-triggered sync of the same connector
-        coalesce instead of racing on the cursor/revision state.
+        ``user_id`` is the connector's owner (who asked for the sync and may
+        poll it) and ``generation`` the vault record's instance identity. The
+        job id is derived from the connector id, owner and generation
+        (``connector_sync_job_id``), the same scheme ``connector_sync_cron`` in
+        worker.py uses, so overlapping cron and API syncs of one connector
+        instance coalesce on a single job instead of racing on the cursor,
+        while a connector deleted and re-registered (or registered by another
+        owner) under the same id gets a new job id: its syncs never share a
+        cached job, result or read grant with the previous instance.
         """
-        job_id = f"sync-{connector_id}"
+        job_id = connector_sync_job_id(connector_id, user_id, generation)
         job = await self.pool.enqueue_job(
             "process_connector_sync",
             connector_id,
+            generation,
             _job_id=job_id,
             _queue_name=settings.ingest_queue_name,
         )
-        if job is None:
-            return job_id
-        return job.job_id
+        task_id = job_id if job is None else job.job_id
+        await self._track_task(user_id, task_id)
+        return task_id
 
     async def enqueue_raw_batch(self, items: list[dict], *, idempotency_key: str | None = None) -> str:
         """Enqueue a batch of raw memory storage tasks (memory-model v2).
@@ -386,9 +510,13 @@ class TaskManager:
             _job_id=job_id,
         )
         task_id = job_id if job is None else job.job_id
-        # Mixed-user batches are legal — track for every distinct writer.
-        for uid in {i.get("user_id") for i in items if i.get("user_id")}:
-            await self._track_task(uid, task_id)
+        # Mixed-user batches are legal (shared key only) and count in every
+        # writer's queue status. The result holds every item, so only a
+        # single-user batch grants that user a per-user read of it; a
+        # mixed-user batch stays readable only by shared-key callers.
+        writers = sorted({i.get("user_id") for i in items if i.get("user_id")})
+        for uid in writers:
+            await self._track_task(uid, task_id, grant_read=len(writers) == 1)
         return task_id
 
     async def enqueue_retag(self, caller_user_id: str, filters: dict, ops: dict,
@@ -422,8 +550,16 @@ class TaskManager:
         project_id: str | None = None,
         visibility: str | None = None,
         source_ref: dict | None = None,
+        requester_user_id: str | None = None,
     ) -> str:
         """Enqueue a graph re-ingest for an edited memory (graph queue). Returns job_id.
+
+        ``user_id`` is the memory's storage owner, which selects the graph
+        partition the job writes to. ``requester_user_id`` is the
+        authenticated user who made the edit and receives the task id; the
+        task is tracked for, and readable by, that user (falls back to
+        ``user_id`` when not given). On a shared memory the two differ when a
+        teammate makes an allowed edit.
 
         Used by the memory-edit paths: after a content change or a
         project/visibility partition migration, the memory's content must be
@@ -450,28 +586,63 @@ class TaskManager:
             _queue_name=settings.graph_queue_name,
         )
         task_id = job_id if job is None else job.job_id
-        await self._track_task(user_id, task_id)
+        await self._track_task(requester_user_id or user_id, task_id)
         return task_id
 
-    def _candidate_queues(self) -> list[str]:
-        """Queues a poll-able job could live on (main + ingest), de-duplicated.
+    async def enqueue_graph_jobs(self, jobs: list[dict]) -> dict:
+        """Enqueue a list of graph re-ingest jobs (the ``graph_job`` shape).
+
+        Used for the sibling re-enrichment a delete/edit produces. Never
+        raises: a delete must succeed even when the queue is unavailable, so
+        failures are returned instead — ``graph_jobs_enqueued`` and
+        ``graph_jobs_not_enqueued_ids`` (memory ids whose re-ingest did NOT
+        get queued, so the caller can report them). A connection-level
+        failure short-circuits the remainder (no point timing out N times).
+        """
+        enqueued = 0
+        not_enqueued: list[str] = []
+        for i, job in enumerate(jobs or []):
+            try:
+                await self.enqueue_graph_enrichment(**job)
+                enqueued += 1
+            except Exception as e:
+                logger.warning(
+                    "Graph re-enrichment enqueue failed for %s (non-critical): %s",
+                    job.get("memory_id"), e,
+                )
+                not_enqueued.append(job.get("memory_id"))
+                if isinstance(e, OSError) or "Connection" in type(e).__name__ or "Timeout" in type(e).__name__:
+                    not_enqueued.extend(j.get("memory_id") for j in jobs[i + 1:])
+                    break
+        return {"graph_jobs_enqueued": enqueued, "graph_jobs_not_enqueued_ids": not_enqueued}
+
+    def _candidate_queues(self, *, include_graph: bool = False) -> list[str]:
+        """Queues a poll-able job could live on, de-duplicated.
 
         Ingest/connector-sync jobs run on a dedicated queue, so status polling
         must look there too or ``/v1/memories/status/{id}`` would report every
-        ingest job as not_found.
+        ingest job as not_found. With ``include_graph`` the graph queue is
+        searched as well, so a graph task handed to a caller (for example the
+        ``graph_task_id`` of a memory edit) reports queued while it waits
+        instead of not_found. Only per-task status reads ask for it;
+        ``get_queue_status`` accounting keeps its existing queue set.
         """
         queues = [settings.arq_queue_name, settings.ingest_queue_name]
+        if include_graph:
+            queues.append(settings.graph_queue_name)
         seen: set[str] = set()
         return [q for q in queues if not (q in seen or seen.add(q))]
 
-    async def _find_job(self, task_id: str) -> tuple[Job, JobStatus]:
+    async def _find_job(
+        self, task_id: str, *, include_graph: bool = False
+    ) -> tuple[Job, JobStatus]:
         """Return the (job, status) for ``task_id``, searching candidate queues.
 
         Returns the first queue where the job is known; falls back to a
         main-queue job with not_found status if it's on none of them.
         """
         fallback: Job | None = None
-        for queue_name in self._candidate_queues():
+        for queue_name in self._candidate_queues(include_graph=include_graph):
             job = Job(task_id, redis=self.pool, _queue_name=queue_name)
             status = await job.status()
             if status != JobStatus.not_found:
@@ -484,13 +655,30 @@ class TaskManager:
             fallback = Job(task_id, redis=self.pool, _queue_name=settings.arq_queue_name)
         return fallback, JobStatus.not_found
 
-    async def get_status(self, task_id: str) -> dict:
+    async def get_status(
+        self,
+        task_id: str,
+        user_id: str | None = None,
+        *,
+        enforce_owner: bool = False,
+        include_graph: bool = False,
+    ) -> dict:
         """Get task status from ARQ/Redis.
+
+        With ``enforce_owner`` the task is reported ``not_found`` unless
+        ``user_id`` enqueued it, before the job is looked up, so a caller
+        cannot tell another user's task from one that never existed. If the
+        owner check itself fails, ``TaskStatusUnavailable`` propagates (no
+        job is looked up). ``include_graph`` also searches the graph queue,
+        so a queued graph task reports its real status; the status routes
+        ask for it, while ``get_queue_status`` keeps its existing queue set.
 
         Returns:
             Dict with task_id, status, result, error keys.
         """
-        job, status = await self._find_job(task_id)
+        if enforce_owner and not await self.is_task_owner(task_id, user_id):
+            return {"task_id": task_id, "status": "not_found", "result": None, "error": None}
+        job, status = await self._find_job(task_id, include_graph=include_graph)
 
         api_status = _STATUS_MAP.get(status, "not_found")
 
@@ -638,6 +826,23 @@ class TaskManager:
             if self.authority is not None:
                 await asyncio.to_thread(self.authority.close)
             self.producer = self.ledger = self.authority = None
+
+
+def connector_sync_job_id(
+    connector_id: str, owner_user_id: str | None, generation: str | None
+) -> str:
+    """ARQ job id for a sync of one connector instance.
+
+    Shared by ``TaskManager.enqueue_connector_sync`` and the worker's
+    ``connector_sync_cron`` so both coalesce on the same job. The owner and
+    the vault record's ``generation`` are part of the id, so a connector
+    deleted and re-registered, or registered by another owner, under the
+    same ``connector_id`` never reuses the previous instance's job.
+    """
+    instance = hashlib.sha256(
+        "\x1f".join([owner_user_id or "", generation or ""]).encode()
+    ).hexdigest()[:16]
+    return f"sync-{connector_id}-{instance}"
 
 
 def _generate_job_id(content: str, user_id: str) -> str:

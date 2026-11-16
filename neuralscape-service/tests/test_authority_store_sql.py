@@ -76,6 +76,20 @@ def case_binding_is_atomic_verbatim_and_race_safe(backend):
     assert len(set(results)) == 1 and store.get("idp", "racer") == results[0]
 
 
+def case_binding_alias_is_the_reverse_of_a_binding(backend):
+    store = backend.open()
+    assert store.binding_alias("sub_1", "local") is None
+    store.put_if_absent("local", "alice", "sub_1")
+    store.put_if_absent("idp", "A-1", "sub_1")
+    assert store.binding_alias("sub_1", "local") == "alice"          # per issuer
+    assert store.binding_alias("sub_1", "idp") == "A-1"
+    assert store.binding_alias("sub_2", "local") is None            # another subject
+    assert store.binding_alias("sub_1", "LOCAL") is None            # verbatim
+    store.put_if_absent("local", "alice-2", "sub_1")                  # a second alias: the earliest wins
+    assert store.binding_alias("sub_1", "local") == "alice"
+    assert store.binding_alias("", "local") is None and store.binding_alias("sub_1", "") is None
+
+
 def case_subjects_versions_and_tombstones(backend):
     clock = Clock()
     store = backend.open(clock)
@@ -197,7 +211,10 @@ def case_hold_current_verifies_then_commits_body_atomically(backend):
         tenant_id="tenant-a", subject_id="sub_a", credential_id="cred-a",
         membership_version=1, policy_epoch=policy.policy_epoch,
     )
-    store.hold_current(**base, body=lambda c: store._x(c, "CREATE TABLE scratch(v TEXT)"))
+    if hasattr(backend, "prepare_scratch"):
+        backend.prepare_scratch()  # a least-privilege runtime role may not create tables
+    else:
+        store.hold_current(**base, body=lambda c: store._x(c, "CREATE TABLE scratch(v TEXT)"))
     assert store.hold_current(**base, body=lambda c: store._x(c, "INSERT INTO scratch VALUES('ok')") and "done") == "done"
     # A raising body rolls back its writes and propagates.
     with pytest.raises(RuntimeError):
@@ -630,29 +647,160 @@ def test_enforce_mode_end_to_end_on_the_real_app(sqlite_backend, monkeypatch) ->
         policy_enforcement.configure(None)
 
 
-def test_a_new_sqlite_authority_database_is_readable_by_its_owner_only(tmp_path) -> None:
-    """It holds invite hashes, credential secret hashes and the credential pepper."""
+# ---- the SQLite authority database holds secrets: owner-only file modes
 
+
+def _mode(path) -> int:
     import os
     import stat
 
-    old = os.umask(0o022)
+    return stat.S_IMODE(os.stat(path).st_mode)
+
+
+def test_a_new_authority_database_and_its_wal_files_are_owner_only(tmp_path):
+    import os
+
+    from authority_store_sql import SqliteAuthorityStore
+
+    previous = os.umask(0o022)  # the usual umask would make a plain create world-readable
     try:
-        store = SqliteAuthorityStore(str(tmp_path / "authority.db"))
-        store.add_subject("sub_a", "tenant-a", "human", "cred-a")  # writes the WAL too
-        modes = {p.name: stat.S_IMODE(p.stat().st_mode) for p in tmp_path.iterdir()}
-        store.close()
+        path = tmp_path / "authority.db"
+        store = SqliteAuthorityStore(str(path))
+        try:
+            for suffix in ("", "-wal", "-shm"):
+                target = f"{path}{suffix}"
+                assert os.path.exists(target), target
+                assert _mode(target) == 0o600, (suffix, oct(_mode(target)))
+        finally:
+            store.close()
     finally:
-        os.umask(old)
-    assert modes and all(mode & 0o077 == 0 for mode in modes.values()), {k: oct(v) for k, v in modes.items()}
+        os.umask(previous)
 
 
-def test_an_existing_database_keeps_its_own_mode(tmp_path) -> None:
+def test_an_existing_looser_authority_database_is_tightened_on_open(tmp_path):
     import os
-    import stat
+
+    from authority_store_sql import SqliteAuthorityStore
 
     path = tmp_path / "authority.db"
     SqliteAuthorityStore(str(path)).close()
-    os.chmod(path, 0o640)  # an operator's deliberate choice is not changed on reopen
+    for suffix in ("", "-wal", "-shm"):
+        if os.path.exists(f"{path}{suffix}"):
+            os.chmod(f"{path}{suffix}", 0o644)
+    store = SqliteAuthorityStore(str(path))
+    try:
+        for suffix in ("", "-wal", "-shm"):
+            if os.path.exists(f"{path}{suffix}"):
+                assert _mode(f"{path}{suffix}") == 0o600, suffix
+    finally:
+        store.close()
+
+
+def test_an_owner_only_database_is_left_as_it_is(tmp_path):
+    import os
+
+    from authority_store_sql import SqliteAuthorityStore
+
+    path = tmp_path / "authority.db"
+    path.touch(mode=0o600)
+    os.chmod(path, 0o400 | 0o200)
     SqliteAuthorityStore(str(path)).close()
-    assert stat.S_IMODE(path.stat().st_mode) == 0o640
+    assert _mode(path) == 0o600
+
+
+@pytest.mark.parametrize("suffix", ["", "-wal", "-shm"])
+def test_a_link_at_the_database_or_a_sidecar_path_is_refused_and_its_target_untouched(tmp_path, suffix):
+    import os
+
+    from authority_store_sql import SqliteAuthorityStore
+
+    target = tmp_path / "elsewhere"
+    target.write_bytes(b"not the authority database")
+    os.chmod(target, 0o644)
+    path = tmp_path / "authority.db"
+    if suffix:
+        SqliteAuthorityStore(str(path)).close()  # a real database; only the sidecar is a link
+        for name in ("-wal", "-shm"):
+            if os.path.exists(f"{path}{name}"):
+                os.remove(f"{path}{name}")
+    os.symlink(target, f"{path}{suffix}")
+    with pytest.raises(OSError):
+        SqliteAuthorityStore(str(path))
+    assert target.read_bytes() == b"not the authority database" and _mode(target) == 0o644
+
+
+def test_a_fifo_at_the_database_path_is_refused_without_blocking(tmp_path):
+    import os
+    import threading
+
+    from authority_store_sql import SqliteAuthorityStore
+
+    path = tmp_path / "authority.db"
+    os.mkfifo(path)
+    outcome = {}
+
+    def open_store():
+        try:
+            SqliteAuthorityStore(str(path))
+        except Exception as error:  # noqa: BLE001
+            outcome["error"] = error
+
+    thread = threading.Thread(target=open_store, daemon=True)
+    thread.start()
+    thread.join(5)
+    assert not thread.is_alive() and isinstance(outcome.get("error"), OSError), outcome
+
+
+# ---- the least-privilege PostgreSQL runtime role is granted exactly what the store's SQL uses
+
+
+def _authority_tables() -> set[str]:
+    import re
+
+    import authority_store_sql as module
+
+    tables = set()
+    for migration in module.MIGRATIONS:
+        tables |= set(re.findall(r"CREATE TABLE (?:IF NOT EXISTS )?(\w+)", migration.sql))
+    tables.add("authority_schema_version")  # bootstrapped outside the numbered migrations
+    return tables
+
+
+def test_every_authority_table_has_a_declared_runtime_grant() -> None:
+    """A table the runtime role was never granted fails at the first request that touches it."""
+
+    import authority_store_sql as module
+
+    assert _authority_tables() == set(module._AUTHORITY_DML)
+
+
+def test_the_declared_runtime_grants_cover_every_statement_the_store_runs() -> None:
+    """INSERT/UPDATE/DELETE and SELECT in the store's source need the matching table privilege."""
+
+    import inspect
+    import re
+
+    import authority_store_sql as module
+
+    source = inspect.getsource(module)
+    needed: dict[str, set[str]] = {}
+    for pattern, privilege in (
+        (r"INSERT INTO (authority_\w+)", "INSERT"),
+        (r"UPDATE (authority_\w+) SET", "UPDATE"),
+        (r"DELETE FROM (authority_\w+)", "DELETE"),
+        (r"FROM (authority_\w+)", "SELECT"),
+    ):
+        for table in re.findall(pattern, source):
+            needed.setdefault(table, set()).add(privilege)
+    for match in re.finditer(r"INSERT INTO (authority_\w+)", source):
+        if "DO UPDATE SET" in source[match.end() : match.end() + 400].split("def ")[0]:
+            needed[match.group(1)].add("UPDATE")  # an upsert also updates
+    granted = {t: {p.strip() for p in v.split(",")} for t, v in module._AUTHORITY_DML.items()}
+    for table, privileges in needed.items():
+        if table == "authority_schema_version":
+            continue
+        assert privileges <= granted[table], (table, sorted(privileges - granted[table]))
+    for table, privileges in granted.items():  # and nothing beyond what is used (least privilege)
+        if table == "authority_schema_version":
+            continue
+        assert privileges <= needed[table], (table, sorted(privileges - needed[table]))

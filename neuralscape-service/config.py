@@ -1,13 +1,17 @@
 import json
+import logging
 import math
 import os
+import re
 from pathlib import Path
 from typing import Annotated, Literal
 from urllib.parse import urlparse
 
 from arq.connections import RedisSettings
-from pydantic import field_validator, model_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode
+
+_logger = logging.getLogger(__name__)
 
 _LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1", "[::1]"}
 
@@ -19,6 +23,20 @@ class Settings(BaseSettings):
     gemini_llm_fallback_model: str = "gemini-2.5-flash"
     gemini_embedder_model: str = "gemini-embedding-001"
 
+    # Hybrid experiments are independently opt-in; each needs its flag plus an endpoint and key.
+    hybrid_inference_api_key: str = Field(default="", repr=False)
+    # No default endpoint or model: a flag alone, or a key alone, activates nothing.
+    hybrid_inference_endpoint: str = ""
+    hybrid_inference_model: str = ""
+    hybrid_threshold: float = Field(default=0.9, ge=0.5, le=1)
+    hybrid_timeout_s: float = Field(default=2.0, gt=0, le=30)
+    hybrid_graph_enabled: bool = False
+    hybrid_categories_enabled: bool = False
+    hybrid_extraction_enabled: bool = False
+    hybrid_extraction_deadline_s: float = Field(default=2.5, gt=0, le=30)
+    hybrid_rerank_enabled: bool = False
+    hybrid_rerank_limit: int = Field(default=32, ge=1, le=64)
+    hybrid_rerank_policy: str = "Prefer direct evidence answering the query; respect explicit versions and dates in the query. Do not confuse topical overlap with an answer."
     # ── LLM gateway (OpenAI-compatible) ───────────────────────────────
     # When enabled, the LLM + embedder (and the graphiti reranker) route
     # through an OpenAI-compatible gateway (e.g. an internal Vertex-via-ADC
@@ -107,6 +125,7 @@ class Settings(BaseSettings):
     # LLM retry (exponential backoff for transient 503/429 errors)
     llm_max_retries: int = 3
     llm_retry_base_delay: float = 1.0  # seconds
+    llm_retry_max_delay: float = 30.0  # seconds
 
     # ── Recipient-aware inference facade (default OFF) ───────────────
     # When enabled, the two extraction generate_content calls go through
@@ -154,7 +173,6 @@ class Settings(BaseSettings):
     # first routed write releases and destroys it (erased text must not outlive the window).
     # 0 keeps it until an explicit release.
     engine_routing_rollback_window_seconds: float = 0.0
-    llm_retry_max_delay: float = 30.0  # seconds
 
     # Dedup cron
     dedup_similarity_threshold: float = 0.95
@@ -193,7 +211,6 @@ class Settings(BaseSettings):
     # followed; delivery is a fire-and-forget 5s-capped daemon thread
     # (see webhooks.py).
     webhook_queue_empty_url: str = ""
-
 
     # ── Observability: SSE live stream (roadmap E1) ───────────────────
     # When enabled, memory events (memory_stored, dream actions applied,
@@ -339,6 +356,13 @@ class Settings(BaseSettings):
     connectors_enabled: bool = False
     vault_key: str = ""  # NEURALSCAPE_VAULT_KEY — required when connectors_enabled
     connector_sync_cron_hours: int = 6  # interval (hours) the sync cron fires
+    # Comma-separated exact command lines an MCP connector may spawn on the
+    # worker over the stdio transport (so an entry cannot itself contain a comma).
+    # Each entry is shell-quoted; it is normalised (shlex split + join) before
+    # comparison with the connector's command + args. Empty (default) disables
+    # stdio entirely. Allowlisting a general interpreter
+    # (python, node, npx, sh ...) is equivalent to allowing arbitrary code.
+    connector_stdio_commands: str = ""
 
     # ── Document/file ingestion ───────────────────────────────────────
     # Rich formats (PDF, MS Office docx/xlsx/pptx, HTML, …) are converted to
@@ -509,12 +533,31 @@ class Settings(BaseSettings):
     # all requests must present this exact token in `Authorization: Bearer ...` and
     # user_id is taken from the request body (trust-based, single-team or single-user).
     neuralscape_api_key: str = ""
+    # Identity the legacy shared key acts as (NEURALSCAPE_API_KEY_USER_ID). Empty
+    # means `default_user_id`. A caller presenting the shared key is bound to this
+    # one user: a body/query user_id naming anyone else gets HTTP 400, and MCP
+    # ignores `arguments["user_id"]` (same as for per-user tokens).
+    neuralscape_api_key_user_id: str = ""
+    # Opt-out (NEURALSCAPE_LEGACY_KEY_TRUST_BODY_USER_ID=true): restore the
+    # pre-binding behaviour where a shared-key caller may act as any body user_id.
+    neuralscape_legacy_key_trust_body_user_id: bool = False
+    # Revoked per-user tokens (NEURALSCAPE_REVOKED_TOKENS): CSV of SHA-256 hex
+    # digests of tokens to reject with 401. Get a digest with
+    # `python scripts/revoke_token.py <token>`. Empty = no revocation.
+    neuralscape_revoked_tokens: str = ""
     # Multi-user HMAC-signed tokens. When set, the server also accepts tokens of the
     # form `{base64url(payload)}.{hmac_sha256(secret, payload)}` where payload is
     # `{"user_id": "...", "exp": <unix-ts>}`. The verified user_id is attached to
     # `request.state.user_id` so routes don't need to trust the request body.
     # Generate tokens via `python scripts/issue_user_token.py --user <name>`.
     neuralscape_user_token_secret: str = ""
+    # Explicit, loud opt-out of authentication. Auth is FAIL-CLOSED: when neither
+    # `neuralscape_user_token_secret` nor `neuralscape_api_key` is set, startup
+    # refuses (see `validate_required`) and the middleware rejects every
+    # non-public request. Set NEURALSCAPE_AUTH_DISABLED=true only on a trusted
+    # local machine to run with no auth at all; a WARNING is logged at startup.
+    # Ignored (auth stays on) whenever either secret above is set.
+    neuralscape_auth_disabled: bool = False
     # Public HTTPS base URL the service is reachable at from the internet
     # (e.g. the cloudflared tunnel hostname: "https://neuralscape.example.com").
     # Used as the OAuth issuer and to build the .well-known metadata URLs that
@@ -625,14 +668,16 @@ class Settings(BaseSettings):
     #   ledger_postgres_dsn  → libpq connection string for the cell database.
     ledger_enabled: bool = False
     #   ledger_retention_postgres_dsn → a maintenance role that may delete aged tombstones (PostgreSQL only;
-    #     the runtime role cannot).  Needed only when ledger_retention_tombstone_days is set.
+    #     the runtime role cannot).  Used only by the tombstone retention
+    #     job (PostgreSQL), which a later slice adds.
     ledger_retention_postgres_dsn: str = ""
     ledger_backend: str = "sqlite"
     ledger_sqlite_path: str = ""
     ledger_postgres_dsn: str = ""
     #   ledger_postgres_migrate_on_open → True (default) opens as the schema owner and applies migrations.
     #     False opens as a least-privilege runtime role: it must not be a superuser or BYPASSRLS and the
-    #     schema must already be migrated and granted (``python -m ledger.admin migrate`` then ``grant``).
+    #     schema must already be migrated and granted (``PostgresLedger(dsn)`` as the owner, then
+    #     ``ledger.postgres.grant_runtime_role``).
     ledger_postgres_migrate_on_open: bool = True
     # ── Tenant admission control (cell edge; every limit unset = unlimited) ───
     # Mechanism only: no default numbers, no advertised quota (that policy is
@@ -679,9 +724,19 @@ class Settings(BaseSettings):
     # Explicit action-policy enforcement (default off: no behavior change).
     #   off      → no-op; observe → decision log only; enforce → deny on policy.
     ns_policy_mode: Literal["off", "observe", "enforce"] = "off"
+    # Scoped credentials and service accounts (CREDENTIALS_ENABLED).  The routes and the credential format
+    # are live only when this is set AND ns_policy_mode is "enforce": a scope nothing enforces would be a lie.
+    credentials_enabled: bool = False
     # Authentication profile: legacy_compat keeps today's shared-key/auth-off
     # capability under named principals; enforced refuses both.
     ns_auth_profile: Literal["legacy_compat", "enforced"] = "legacy_compat"
+
+    # Vendored mem0/Graphiti usage telemetry. Declared so these keys are valid in the
+    # service .env; nothing here reads them. third_party_telemetry.py applies them (or
+    # defaults both to off) before mem0/Graphiti are imported, since the libraries read
+    # only the process environment. None means "not set".
+    mem0_telemetry: str | None = None
+    graphiti_telemetry_enabled: str | None = None
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
 
@@ -701,6 +756,25 @@ class Settings(BaseSettings):
         if parsed.scheme != "https" and not is_loopback:
             raise ValueError("NEURALSCAPE_PUBLIC_URL must use https:// (except loopback hosts)")
         return value.rstrip("/")
+
+    @field_validator("ledger_backend")
+    @classmethod
+    def _validate_ledger_backend(cls, value: str) -> str:
+        backend = value.strip().lower()
+        if backend not in ("sqlite", "postgres"):
+            raise ValueError("LEDGER_BACKEND must be 'sqlite' or 'postgres'")
+        return backend
+
+    @model_validator(mode="after")
+    def _validate_ledger_target(self) -> "Settings":
+        # Fail at startup, not at the first write, when the ledger is on but has nowhere to live.
+        if not self.ledger_enabled:
+            return self
+        if self.ledger_backend == "sqlite" and not self.ledger_sqlite_path.strip():
+            raise ValueError("LEDGER_ENABLED with LEDGER_BACKEND=sqlite requires LEDGER_SQLITE_PATH")
+        if self.ledger_backend == "postgres" and not self.ledger_postgres_dsn.strip():
+            raise ValueError("LEDGER_ENABLED with LEDGER_BACKEND=postgres requires LEDGER_POSTGRES_DSN")
+        return self
 
     @field_validator("tenant_admission_rate_per_second")
     @classmethod
@@ -934,10 +1008,36 @@ class Settings(BaseSettings):
         """True iff `user_id` is an authorized dictator (may write standards)."""
         return bool(user_id) and user_id in self.dictator_user_ids_set()
 
+    def connector_stdio_commands_set(self) -> set[str]:
+        """Parsed CSV of exact stdio command lines connectors may spawn."""
+        import shlex
+
+        out: set[str] = set()
+        for entry in self.connector_stdio_commands.split(","):
+            try:
+                parts = shlex.split(entry)
+            except ValueError:
+                continue  # unbalanced quote: never matches rather than matching loosely
+            if parts:
+                out.add(shlex.join(parts))
+        return out
+
     # ── sensitivity gate helpers ──────────────────────────────────────────
     def sensitivity_private_classes_set(self) -> set[str]:
         """Parsed CSV of sensitivity classes that force `visibility=private`."""
         return {c.strip() for c in self.sensitivity_private_classes.split(",") if c.strip()}
+
+    def legacy_key_identity(self) -> str:
+        """User id the legacy shared key is bound to (empty setting -> default user)."""
+        return self.neuralscape_api_key_user_id.strip() or self.default_user_id
+
+    def revoked_token_digests(self) -> set[str]:
+        """Parsed ``NEURALSCAPE_REVOKED_TOKENS`` (lowercased SHA-256 hex digests)."""
+        return {
+            d.strip().lower()
+            for d in self.neuralscape_revoked_tokens.split(",")
+            if d.strip()
+        }
 
     def validate_required(self) -> None:
         """Validate that all required configuration fields are set.
@@ -1004,9 +1104,47 @@ class Settings(BaseSettings):
                 errors.append(
                     "SUPABASE_URL and SUPABASE_ANON_KEY are required when AUTH_PROVIDER=supabase"
                 )
+        if self.neuralscape_api_key_user_id.strip() and not re.match(
+            r"^[a-zA-Z0-9_.\-]{1,100}$", self.neuralscape_api_key_user_id.strip()
+        ):
+            errors.append(
+                "NEURALSCAPE_API_KEY_USER_ID must be 1-100 characters of letters, "
+                "digits, '_', '.' or '-'"
+            )
+        # Auth is fail-closed: with no credential configured, the API would be
+        # open to anyone who can reach it, so refuse to start unless the
+        # operator explicitly opted out.
+        auth_configured = bool(self.neuralscape_user_token_secret or self.neuralscape_api_key)
+        if not auth_configured and not self.neuralscape_auth_disabled:
+            errors.append(
+                "Authentication is not configured. Set one of: "
+                "NEURALSCAPE_USER_TOKEN_SECRET (per-user tokens, recommended), "
+                "NEURALSCAPE_API_KEY (legacy shared key), or "
+                "NEURALSCAPE_AUTH_DISABLED=true (no auth at all; trusted local machine only). "
+                "See AUTH.md"
+            )
         if errors:
             raise ValueError(
                 "Missing required configuration:\n  - " + "\n  - ".join(errors)
+            )
+        if not auth_configured:
+            _logger.warning(
+                "AUTHENTICATION IS DISABLED (NEURALSCAPE_AUTH_DISABLED=true): every "
+                "REST and MCP endpoint accepts unauthenticated requests. Use this only "
+                "on a trusted local machine; set NEURALSCAPE_USER_TOKEN_SECRET for any "
+                "shared or network-reachable deployment."
+            )
+        if self.neuralscape_api_key and self.neuralscape_legacy_key_trust_body_user_id:
+            _logger.warning(
+                "NEURALSCAPE_LEGACY_KEY_TRUST_BODY_USER_ID=true: the legacy shared "
+                "NEURALSCAPE_API_KEY may act as ANY user named in a request body or "
+                "query. Prefer per-user tokens, or leave this off so the key is bound "
+                "to NEURALSCAPE_API_KEY_USER_ID (default: DEFAULT_USER_ID). See AUTH.md"
+            )
+        if auth_configured and self.neuralscape_auth_disabled:
+            _logger.warning(
+                "NEURALSCAPE_AUTH_DISABLED=true is ignored because an auth secret is "
+                "configured; authentication stays enabled."
             )
 
     def _gateway_openai_base(self) -> str:
@@ -1145,6 +1283,12 @@ class Settings(BaseSettings):
                     "password": self.neo4j_password,
                     "database": self.neo4j_database,
                     **graphiti_models,
+                    "graphiti_hybrid_enabled": self.hybrid_graph_enabled,
+                    "graphiti_hybrid_api_key": self.hybrid_inference_api_key,
+                    "graphiti_hybrid_endpoint": self.hybrid_inference_endpoint,
+                    "graphiti_hybrid_model": self.hybrid_inference_model,
+                    "graphiti_hybrid_threshold": self.hybrid_threshold,
+                    "graphiti_hybrid_timeout": self.hybrid_timeout_s,
                     "store_raw_episode_content": self.store_raw_episode_content,
                     "update_communities": self.update_communities,
                 },

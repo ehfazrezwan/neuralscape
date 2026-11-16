@@ -3,6 +3,8 @@
 Run with: arq worker.WorkerSettings
 """
 
+import third_party_telemetry  # noqa: F401 — must precede any mem0/Graphiti import (defaults their telemetry off)
+
 import asyncio
 import hashlib
 import logging
@@ -13,6 +15,7 @@ from arq.cron import cron
 import adapters  # noqa: F401 — registers knowledge-adapter taxonomies at import (deterministic MEMORY_CATEGORIES across all workers)
 from config import parse_redis_settings, settings
 from memory_service import MemoryService
+from task_manager import connector_sync_job_id
 
 logger = logging.getLogger(__name__)
 
@@ -79,8 +82,6 @@ async def process_session_summary(
     from session_summarizer import refresh_slot
 
     return await refresh_slot(user_id, session_id, slot, llm_call=_async_call_gemini)
-
-
 
 
 async def process_memory_store(
@@ -1078,8 +1079,6 @@ async def synthesize_strategy_playbooks_cron(ctx: dict) -> dict:
     }
 
 
-
-
 def _generate_job_id(content: str, user_id: str) -> str:
     """Generate a deterministic job ID from content + user_id."""
     h = hashlib.sha256(f"{user_id}:{content}".encode()).hexdigest()[:16]
@@ -1257,6 +1256,11 @@ async def dedup_all_memories(ctx: dict) -> dict:
             # dedup_memories does sync Qdrant scroll pagination + embedding/LLM
             # calls that would otherwise freeze the loop for minutes at scale.
             result = await asyncio.to_thread(service.dedup_memories, uid, semantic=semantic)
+            # Sibling facts that shared a deleted duplicate's conversation
+            # episode need a single-fact graph re-ingest (graph queue).
+            sibling_jobs = result.pop("graph_jobs", [])
+            if sibling_jobs:
+                result["graph_jobs_enqueued"] = await _enqueue_graph_jobs(ctx, sibling_jobs, None)
             results.append(result)
             removed = result["exact_duplicates_removed"] + result["semantic_duplicates_removed"]
             if removed:
@@ -1277,13 +1281,22 @@ async def dedup_all_memories(ctx: dict) -> dict:
     return summary
 
 
-async def process_connector_sync(ctx: dict, connector_id: str) -> dict:
+async def process_connector_sync(
+    ctx: dict, connector_id: str, generation: str | None = None
+) -> dict:
     """Background task: pull a connector's resources and ingest changed ones.
 
     Incremental: resources whose source-side revision matches the last-seen
     revision are skipped; content-hash dedup in ``store_raw`` is the backstop
     for sources without a revision marker. Sync state (cursor + per-resource
     revisions + timestamp) is persisted back to the vault.
+
+    ``generation`` is the connector instance the job was enqueued for (``None``
+    for a record from before generations, and for jobs queued before this
+    argument existed). When the stored connector is a different instance
+    (deleted and re-registered, or re-registered by another owner, since the job
+    was queued) the job skips: the new instance has its own job id and syncs
+    under it.
     """
     from datetime import timezone
 
@@ -1296,6 +1309,11 @@ async def process_connector_sync(ctx: dict, connector_id: str) -> dict:
     record = await vault.get(connector_id)
     if not record:
         return {"skipped": True, "reason": "connector not found"}
+    # Literal equality: a job queued before generations existed carries ``None`` and runs only
+    # while the stored record is still generationless; once the connector was replaced (and so
+    # given a generation) that job skips instead of syncing the replacement under its old grant.
+    if record.get("generation") != generation:
+        return {"skipped": True, "reason": "connector replaced since this sync was enqueued"}
     if not record.get("enabled", True):
         return {"skipped": True, "reason": "connector disabled"}
 
@@ -1341,12 +1359,24 @@ async def process_connector_sync(ctx: dict, connector_id: str) -> dict:
     finally:
         await adapter.aclose()
 
-    await vault.update_sync_state(
+    # Atomic, field-scoped and bound to the instance read above: a connector
+    # deleted, re-created or re-owned meanwhile keeps its own state.
+    written = await vault.update_sync_state(
         connector_id,
         cursor=next_cursor,
         last_synced_at=datetime.now(timezone.utc).isoformat(),
         revisions=revisions,
+        generation=record.get("generation"),
+        # Only on top of the progress this sync started from: an overlapping sync of the
+        # same connector that already saved newer progress is never rolled back.
+        expected_cursor=cursor,
+        expected_revisions=dict(record.get("last_revision_by_id") or {}),
     )
+    if not written:
+        logger.info(
+            f"Connector sync [{connector_id}]: connector replaced or removed, or newer progress saved "
+            "by an overlapping sync; state not saved"
+        )
     logger.info(f"Connector sync [{connector_id}]: {synced} ingested, {skipped} unchanged")
     return {"connector_id": connector_id, "synced": synced, "skipped": skipped}
 
@@ -1363,10 +1393,15 @@ async def connector_sync_cron(ctx: dict) -> dict:
     for rec in await vault.list():
         if not rec.get("enabled", True):
             continue
+        # Same job id as an API-triggered sync of this connector instance
+        # (task_manager.connector_sync_job_id), so the two coalesce.
         await redis.enqueue_job(
             "process_connector_sync",
             rec["connector_id"],
-            _job_id=f"sync-{rec['connector_id']}",
+            rec.get("generation"),
+            _job_id=connector_sync_job_id(
+                rec["connector_id"], rec.get("owner_user_id"), rec.get("generation")
+            ),
             _queue_name=settings.ingest_queue_name,
         )
         enqueued += 1
@@ -1378,8 +1413,6 @@ def _connector_sync_cron_hours() -> list[int]:
     """Translate the connector sync interval (hours) into a set of hours-of-day."""
     interval = max(1, min(24, settings.connector_sync_cron_hours))
     return list(range(0, 24, interval))
-
-
 
 
 def _make_after_job_end(queue_name: str):
@@ -1450,6 +1483,8 @@ async def startup(ctx: dict) -> None:
     apply_gemini_base_url(settings.ns_gemini_base_url)  # must precede the first client
     service = MemoryService()
     service._get_memory()  # warm up connections
+    from hybrid_inference import warmup_extraction
+    await asyncio.to_thread(warmup_extraction)
     ctx["service"] = service
 
     # Initialize extension registry so worker can emit events
@@ -1459,7 +1494,6 @@ async def startup(ctx: dict) -> None:
     await registry.discover()
     await registry.startup_all()
     ctx["extension_registry"] = registry
-
 
     # Connector vault (only when connectors are enabled + a vault key is set).
     if settings.connectors_enabled:

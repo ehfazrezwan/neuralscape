@@ -21,6 +21,19 @@ logger = logging.getLogger(__name__)
 GET_MEMORIES_MAX_IDS = 50
 TIMELINE_MAX_DEPTH = 50
 
+# Session-start context bounds. Rows are fetched server-side newest-first
+# (Qdrant order_by created_at) so a page is the true newest rows, never an
+# arbitrary sample.
+# - CONTEXT_FETCH_CAP: most rows one request will pull from Qdrant
+#   (offset + limit). Paging deeper than this returns an empty page.
+# - CONTEXT_UNBOUNDED_PAGE: rows returned when the legacy ``limit=None``
+#   ("everything from offset") is used; ``has_more`` says whether more remain.
+# - CONTEXT_GLOBAL_LIMIT: newest global rows served by get_global_context
+#   (``total`` is the true count, ``has_more`` true when rows were left out).
+CONTEXT_FETCH_CAP = 5000
+CONTEXT_UNBOUNDED_PAGE = 500
+CONTEXT_GLOBAL_LIMIT = 200
+
 class ReadsMixin:
     """ReadsMixin for MemoryService (mechanical split — see memory_service.py)."""
 
@@ -37,16 +50,20 @@ class ReadsMixin:
     ) -> ContextResponse:
         """Get project + global context organized by category, with paging.
 
-        Retrieves user preferences (global) plus project-specific memories,
-        organized into category buckets for easy consumption by agents. The
-        combined set is sorted newest-first and paged by ``offset``/``limit``
-        so a large project doesn't return one oversized payload.
+        Retrieves the caller's global memories plus project-specific memories
+        AND the project's team-shared memories (``visibility=shared``, same
+        predicate as search's shared pool), organized into category buckets
+        for easy consumption by agents. The combined set is read server-side
+        newest-first and paged by ``offset``/``limit``; ``total`` is the true
+        number of matching rows, so a large project doesn't return one
+        oversized payload and ``has_more`` is accurate for the whole store.
 
         Args:
             user_id: User identifier
             project_id: Project identifier
             limit: Max memories across all categories for this page. ``None``
-                returns everything from ``offset`` on (legacy behavior).
+                returns everything from ``offset`` on (legacy behavior), bounded
+                to ``CONTEXT_UNBOUNDED_PAGE`` rows — check ``has_more``.
             offset: Number of (newest-first) memories to skip.
 
         Returns:
@@ -54,58 +71,38 @@ class ReadsMixin:
             metadata (``total``, ``returned``, ``offset``, ``limit``,
             ``has_more``).
         """
-        m = self._get_memory()
-
-        # Get global memories
-        # mem0 v2.0.2: ``user_id`` must live inside ``filters`` (top-level
-        # rejected) and ``limit`` was renamed to ``top_k``.
-        global_result = m.get_all(
-            filters={"user_id": user_id, "metadata.scope": "global"},
-            top_k=200,
-        )
-
-        # Get project memories
-        project_result = m.get_all(
-            filters={"user_id": user_id, "metadata.project_id": project_id},
-            top_k=200,
-        )
-
-        # Flatten to a deterministically ordered list (newest first) so paging
-        # is stable across calls. created_at may be absent → fall back to id.
-        # Exclude dream-tombstoned rows by default (same must_not as search).
-        flat: list[tuple[str, MemoryResponse]] = []
-        for result_set in [global_result, project_result]:
-            for mem in self._extract_memory_list(result_set):
-                # Exclude dream tombstones (same filter as search/list_memories)
-                if _mem_is_tombstoned(mem):
-                    continue
-                response = self._mem_to_response(mem)
-                # Bucket by the response's resolved category — `_mem_to_response`
-                # unwraps mem0's nested `{metadata: {metadata: {...}}}` shape, so
-                # reading raw `mem["metadata"]` here would mis-bucket as the
-                # default whenever the category lives one level deeper.
-                cat = getattr(response, "category", None) or "personal_fact"
-                flat.append((cat, response))
-
-        flat.sort(
-            key=lambda cr: (
-                str(getattr(cr[1], "created_at", "") or ""),
-                str(getattr(cr[1], "id", "") or ""),
-            ),
-            reverse=True,
-        )
-
-        total = len(flat)
+        self._ensure_filter_indexes()
         offset = max(0, offset)
         # Normalize a non-positive limit to 1: otherwise the page is empty while
         # has_more stays True, and a client advancing by `offset += returned`
         # never progresses (infinite pagination loop).
         if limit is not None and limit < 1:
             limit = 1
-        page = flat[offset:] if limit is None else flat[offset : offset + limit]
+        # ``limit=None`` keeps its legacy meaning ("everything from offset")
+        # but is bounded: at most CONTEXT_UNBOUNDED_PAGE rows. ``has_more``
+        # tells the caller there is more to page through.
+        window = CONTEXT_UNBOUNDED_PAGE if limit is None else limit
 
+        # One server-side filter, newest-first: the caller's own rows (global +
+        # this project) UNION the shared pool for this project (same
+        # visibility predicate as search's shared pool), tombstones excluded.
+        # Each row matches once, so there is nothing to dedup and the count
+        # below is the true size of the set being paged.
+        flt = self._project_context_filter(user_id, project_id)
+        rows = self._ordered_context_rows(flt, offset + window)
+        total = self._context_total(flt, len(rows), offset + window)
+
+        # created_at may be absent → fall back to id (stable tie-break).
+        rows.sort(
+            key=lambda r: (_created_at_key(r.created_at), str(r.id or "")),
+            reverse=True,
+        )
+        page = rows[offset : offset + window]
+        # The bucket label is the response's resolved category (``_mem_to_response``
+        # unwraps mem0's nested ``{metadata: {metadata: {...}}}`` shape).
         categories: dict[str, list[MemoryResponse]] = {}
-        for cat, response in page:
+        for response in page:
+            cat = getattr(response, "category", None) or "personal_fact"
             categories.setdefault(cat, []).append(response)
 
         standards = self._get_standards(project_id=project_id)
@@ -126,7 +123,7 @@ class ReadsMixin:
             returned=len(page),
             offset=offset,
             limit=limit,
-            has_more=(offset + len(page)) < total,
+            has_more=bool(page) and (offset + len(page)) < total,
         )
 
     def get_global_context(self, user_id: str) -> ContextResponse:
@@ -138,25 +135,24 @@ class ReadsMixin:
         Returns:
             ContextResponse with global memories organized by category.
         """
-        m = self._get_memory()
-
-        # mem0 v2.0.2 kwarg drift — see list_memories below.
-        result = m.get_all(
-            filters={"user_id": user_id, "metadata.scope": "global"},
-            top_k=200,
+        self._ensure_filter_indexes()
+        # Caller-only (own rows, scope=global), newest-first and server-side
+        # so the CONTEXT_GLOBAL_LIMIT rows served are the true newest ones.
+        # Team-shared rows are project-keyed (see get_project_context); the
+        # project-independent shared pool is intentionally not pushed here.
+        flt = self._global_context_filter(user_id)
+        rows = self._ordered_context_rows(flt, CONTEXT_GLOBAL_LIMIT)
+        total = self._context_total(flt, len(rows), CONTEXT_GLOBAL_LIMIT)
+        rows.sort(
+            key=lambda r: (_created_at_key(r.created_at), str(r.id or "")),
+            reverse=True,
         )
+        rows = rows[:CONTEXT_GLOBAL_LIMIT]
 
         categories: dict[str, list[MemoryResponse]] = {}
-        memories = self._extract_memory_list(result)
-        for mem in memories:
-            # Exclude dream tombstones (same filter as search/list_memories)
-            if _mem_is_tombstoned(mem):
-                continue
-            response = self._mem_to_response(mem)
+        for response in rows:
             cat = getattr(response, "category", None) or "personal_fact"
-            if cat not in categories:
-                categories[cat] = []
-            categories[cat].append(response)
+            categories.setdefault(cat, []).append(response)
 
         standards = self._get_standards(project_id=None)
         if standards:
@@ -164,24 +160,230 @@ class ReadsMixin:
                 "standards_served", user_id=user_id, project_id=None, count=len(standards)
             )
 
-        # Global context isn't paged — report the full set so the pagination
-        # metadata isn't misleading (total=0 with non-empty categories).
-        # Count reflects the post-tombstone-filter set (what's actually returned).
-        count = sum(len(mems) for mems in categories.values())
+        # Global context isn't paged: it is the newest CONTEXT_GLOBAL_LIMIT rows.
+        # ``total`` is the true size of the global set so the metadata does not
+        # claim completeness when rows were left out (``has_more``).
+        returned = len(rows)
         return ContextResponse(
             user_id=user_id,
             categories=categories,
             standards=standards,
-            total=count,
-            returned=count,
+            total=max(total, returned),
+            returned=returned,
             offset=0,
             limit=None,
-            has_more=False,
+            has_more=returned < total,
         )
+
+    # ── context fetch helpers ──
+
+    @staticmethod
+    def _tombstone_condition():
+        from qdrant_client.models import FieldCondition, MatchValue
+
+        return FieldCondition(
+            key="metadata.dream_tombstoned", match=MatchValue(value=True)
+        )
+
+    def _global_context_filter(self, user_id: str):
+        """Caller's own global-scope rows, tombstones excluded."""
+        from qdrant_client.models import FieldCondition, Filter, MatchValue
+
+        return Filter(
+            must=[
+                FieldCondition(key="user_id", match=MatchValue(value=user_id)),
+                FieldCondition(key="metadata.scope", match=MatchValue(value="global")),
+            ],
+            must_not=[self._tombstone_condition()],
+        )
+
+    def _project_context_filter(self, user_id: str, project_id: str):
+        """Rows a caller sees at session start for ``project_id``.
+
+        Union of (a) the caller's own rows that are global-scope or tagged to
+        this project and (b) other writers' ``visibility=shared`` rows for this
+        project. (b) is the same predicate ``_search_shared_pool`` uses
+        (visibility=shared + project_id, tombstones excluded, memory workspace
+        only), so this never exposes a row recall would not. A teammate's
+        private row matches neither branch.
+        """
+        from qdrant_client.models import (
+            FieldCondition,
+            Filter,
+            MatchExcept,
+            MatchValue,
+        )
+
+        own = Filter(
+            must=[
+                FieldCondition(key="user_id", match=MatchValue(value=user_id)),
+                Filter(
+                    should=[
+                        FieldCondition(
+                            key="metadata.scope", match=MatchValue(value="global")
+                        ),
+                        FieldCondition(
+                            key="metadata.project_id",
+                            match=MatchValue(value=project_id),
+                        ),
+                    ]
+                ),
+            ]
+        )
+        shared = Filter(
+            must=[
+                FieldCondition(
+                    key="metadata.visibility",
+                    match=MatchValue(value=MemoryVisibility.SHARED.value),
+                ),
+                FieldCondition(
+                    key="metadata.project_id", match=MatchValue(value=project_id)
+                ),
+            ],
+            # Search's shared pool serves the memory workspace only; reference
+            # workspaces stay fenced out here too.
+            must_not=[
+                FieldCondition(
+                    key="metadata.workspace",
+                    match=MatchExcept(**{"except": ["memory"]}),
+                )
+            ],
+        )
+        return Filter(should=[own, shared], must_not=[self._tombstone_condition()])
+
+    def _ordered_context_rows(self, flt, need: int) -> list[MemoryResponse]:
+        """The newest rows matching ``flt``: at least ``need`` (capped at
+        CONTEXT_FETCH_CAP), newest-first by (created_at, id).
+
+        Server-side ``order_by created_at DESC`` (needs the DATETIME payload
+        index, ensured lazily). Paging must be deterministic on
+        (created_at, id): batch writes share one timestamp, and Qdrant cuts by
+        created_at alone, so the whole tie group at the cut timestamp is
+        fetched too, otherwise rows at a page edge could be skipped or
+        repeated. Rows with no ``created_at`` are invisible to order_by; they
+        are fetched separately and sort after every dated row. If the server
+        rejects order_by, falls back to the timeline's bounded scroll+sort.
+        """
+        from qdrant_client.models import (
+            DatetimeRange,
+            Direction,
+            FieldCondition,
+            Filter,
+            IsEmptyCondition,
+            OrderBy,
+            PayloadField,
+        )
+
+        need = max(1, min(need, CONTEXT_FETCH_CAP))
+        client = self._get_memory().vector_store.client
+        coll = settings.qdrant_collection
+        self._ensure_created_at_index()
+
+        def _key(p):
+            return _created_at_key((getattr(p, "payload", None) or {}).get("created_at"))
+
+        points: list = []
+        try:
+            points, _ = client.scroll(
+                collection_name=coll,
+                scroll_filter=flt,
+                limit=need,
+                order_by=OrderBy(key="created_at", direction=Direction.DESC),
+                with_payload=True,
+                with_vectors=False,
+            )
+            points = list(points or [])
+            if len(points) >= need:
+                # Truncated: complete the tie group at the boundary timestamp.
+                boundary = _key(points[-1])
+                tie, _ = client.scroll(
+                    collection_name=coll,
+                    scroll_filter=Filter(
+                        must=[
+                            flt,
+                            FieldCondition(
+                                key="created_at",
+                                range=DatetimeRange(gte=boundary, lte=boundary),
+                            ),
+                        ]
+                    ),
+                    limit=CONTEXT_FETCH_CAP,
+                    with_payload=True,
+                    with_vectors=False,
+                )
+                seen = {str(getattr(p, "id", "")) for p in points}
+                points += [p for p in (tie or []) if str(getattr(p, "id", "")) not in seen]
+            else:
+                # Every dated row is in hand: append undated rows (last).
+                undated, _ = client.scroll(
+                    collection_name=coll,
+                    scroll_filter=Filter(
+                        must=[
+                            flt,
+                            IsEmptyCondition(is_empty=PayloadField(key="created_at")),
+                        ]
+                    ),
+                    limit=need - len(points),
+                    with_payload=True,
+                    with_vectors=False,
+                )
+                points += list(undated or [])
+        except Exception as e:
+            logger.warning(
+                f"Context order_by scroll failed ({e}) — falling back to Python sort"
+            )
+            points = self._scroll_all_sorted(client, flt, "before", CONTEXT_FETCH_CAP)
+            if len(points) > need:
+                cut = _key(points[need - 1])
+                points = [p for p in points if _key(p) >= cut]
+        rows = [self._point_to_response(p) for p in points]
+        # Belt and braces: the filter already drops tombstones server-side.
+        rows = [
+            r
+            for r, p in zip(rows, points)
+            if not _mem_is_tombstoned(
+                {"metadata": (getattr(p, "payload", None) or {}).get("metadata") or {}}
+            )
+        ]
+        rows.sort(
+            key=lambda r: (_created_at_key(r.created_at), str(r.id or "")),
+            reverse=True,
+        )
+        return rows
+
+    def _context_total(self, flt, fetched: int, need: int) -> int:
+        """True number of rows matching ``flt`` (exact Qdrant count)."""
+        try:
+            res = self._get_memory().vector_store.client.count(
+                collection_name=settings.qdrant_collection,
+                count_filter=flt,
+                exact=True,
+            )
+            return max(int(getattr(res, "count", fetched)), fetched)
+        except Exception as e:
+            logger.warning(f"Context count failed ({e}) — total is a lower bound")
+            return fetched
 
     # ──────────────────────────────────────────────
     # CRUD operations
     # ──────────────────────────────────────────────
+
+    @staticmethod
+    def _canonical_point_id(memory_id) -> "str | int | None":
+        """Qdrant point id in canonical form, or None if malformed.
+
+        Qdrant ids are UUIDs or unsigned integers. A UUID in any accepted
+        spelling (upper-case, braces, no dashes) becomes its canonical
+        lower-case string; an all-digit id becomes an int.
+        """
+        text = str(memory_id).strip()
+        if text.isascii() and text.isdigit():
+            n = int(text)
+            return n if n < 2**64 else None
+        try:
+            return str(uuid.UUID(text))
+        except (ValueError, AttributeError, TypeError):
+            return None
 
     def get_memory(self, memory_id: str, caller_user_id: str | None = None) -> MemoryResponse | None:
         """Get a single memory by ID.
@@ -195,8 +397,14 @@ class ReadsMixin:
         Returns:
             MemoryResponse if found and readable, None otherwise.
         """
+        # Qdrant point ids are UUIDs: a malformed id would raise inside the
+        # retrieve (HTTP 500 at the route, #437). Answer exactly like a
+        # well-formed unknown id so ids are not probeable.
+        point_id = self._canonical_point_id(memory_id)
+        if point_id is None:
+            return None
         m = self._get_memory()
-        result = m.get(memory_id)
+        result = m.get(point_id)
         if not result:
             return None
         # Apply read gate when caller_user_id is provided (C1, get_memories)
@@ -597,8 +805,13 @@ class ReadsMixin:
         project_id: str | None = None,
         limit: int = 100,
         include_tombstoned: bool = False,
+        agent_id: str | None = None,
+        run_id: str | None = None,
     ) -> list[MemoryResponse]:
         """List memories with optional filters.
+
+        ``agent_id`` / ``run_id`` (legacy ``GET /memories``) narrow to rows
+        written under that agent / session; they only ever restrict.
 
         Audit 27 #14: rows the dreaming sweep consolidated away
         (``metadata.dream_tombstoned=true``) are excluded from listings by
@@ -619,6 +832,10 @@ class ReadsMixin:
             filters["metadata.category"] = category
         if project_id:
             filters["metadata.project_id"] = project_id
+        if agent_id:
+            filters["agent_id"] = agent_id
+        if run_id:
+            filters["run_id"] = run_id
 
         result = m.get_all(
             filters=filters,
@@ -663,42 +880,28 @@ class ReadsMixin:
         if g is None:
             return []
 
-        from identity import collision_free_ids_enabled
-        from memory.groups import ENCODED_GROUP_PREFIX, _build_group_id, decode_group_id
-
-        shared_prefix = "shared--project--"
         user_prefix = f"user--{user_id}--project--"
-        if _build_group_id("private", user_id) != f"user--{user_id}":
-            # This user's pools carry encoded names (collision-free ids); the legacy
-            # prefix could only match names other users' tuples fold into.
-            user_prefix = shared_prefix
-        # Encoded (collision-free) names share one prefix and are decoded below; with
-        # the encoding off the slot repeats the shared prefix and adds nothing.
-        encoded_prefix = ENCODED_GROUP_PREFIX if collision_free_ids_enabled() else shared_prefix
+        shared_prefix = "shared--project--"
         # One MATCH per indexed label so the per-label group_id range index is
         # used; UNION dedupes across labels (and is itself DISTINCT).
         cypher = """
         MATCH (n:Entity)
         WHERE n.group_id STARTS WITH $user_prefix OR n.group_id STARTS WITH $shared_prefix
-           OR n.group_id STARTS WITH $encoded_prefix
         RETURN DISTINCT n.group_id AS group_id
         UNION
         MATCH (n:Episodic)
         WHERE n.group_id STARTS WITH $user_prefix OR n.group_id STARTS WITH $shared_prefix
-           OR n.group_id STARTS WITH $encoded_prefix
         RETURN DISTINCT n.group_id AS group_id
         UNION
         MATCH (n:Community)
         WHERE n.group_id STARTS WITH $user_prefix OR n.group_id STARTS WITH $shared_prefix
-           OR n.group_id STARTS WITH $encoded_prefix
         RETURN DISTINCT n.group_id AS group_id
         """
 
         async def _run():
             async with g.driver.session() as session:
                 result = await session.run(
-                    cypher, user_prefix=user_prefix, shared_prefix=shared_prefix,
-                    encoded_prefix=encoded_prefix,
+                    cypher, user_prefix=user_prefix, shared_prefix=shared_prefix
                 )
                 return await result.data()
 
@@ -715,18 +918,6 @@ class ReadsMixin:
         projects: set[str] = set()
         for rec in records:
             gid = rec.get("group_id") or ""
-            encoded = decode_group_id(gid)
-            if encoded is not None:
-                # An encoded name is read back exactly: the caller's private
-                # projects and every shared project.
-                if encoded.project and (
-                    encoded.pool == "shared"
-                    or (encoded.pool == "private" and encoded.owner == user_id)
-                ):
-                    projects.add(encoded.project)
-                continue
-            if gid.startswith(ENCODED_GROUP_PREFIX):
-                continue
             # Both namespaces end with '--project--{pid}'; everything after the
             # separator is the project id. Global groups ('user--{uid}',
             # 'shared') have no separator and are skipped.

@@ -3,6 +3,28 @@
 How Neuralscape authenticates humans and machines, and how to switch the
 human-login mechanism per deployment with a single env var.
 
+## Fail-closed by default
+
+The service **refuses to start** unless one of these is set:
+
+| Setting | Use |
+|---|---|
+| `NEURALSCAPE_USER_TOKEN_SECRET` | Per-user HMAC tokens (recommended; also enables the OAuth connector with `NEURALSCAPE_PUBLIC_URL`) |
+| `NEURALSCAPE_API_KEY` | Legacy single shared key (deprecated, still honoured; acts as one bound identity, see [Legacy shared key](#legacy-shared-key-one-identity)) |
+| `NEURALSCAPE_AUTH_DISABLED=true` | No authentication at all. Trusted local machine only |
+
+With neither secret set and no opt-out, startup fails with
+`Authentication is not configured. Set one of: ...`, and `BearerAuthMiddleware`
+answers every non-public request with 503 instead of passing it through. The
+opt-out logs one `AUTHENTICATION IS DISABLED` WARNING at startup and is ignored
+whenever either secret is set. Public paths are `/health`, `/health/live`,
+`/.well-known/*` and `/oauth/*`.
+
+The MCP **stdio** transport (`python mcp_server.py`, launched as a local
+subprocess by Claude Code) has no network listener and no bearer layer; it is
+reachable only by the process that spawned it, so this rule does not apply to
+it. The ARQ workers likewise open no inbound port.
+
 ## The model: two independent layers
 
 1. **The MCP OAuth layer** — Neuralscape is its own OAuth 2.1 Authorization
@@ -78,6 +100,58 @@ is tolerated. **An empty allowlist denies everyone (fail-closed).**
   applied as an *extra* gate only when configured.
 
 ---
+
+## Legacy shared key: one identity
+
+`NEURALSCAPE_API_KEY` is **deprecated** (no removal date is set). Every response
+to a caller using it carries an `X-Neuralscape-Deprecation` header. Prefer
+per-user tokens.
+
+The shared key acts as **one user**, not as anyone the caller names:
+
+| Setting | Meaning |
+|---|---|
+| `NEURALSCAPE_API_KEY_USER_ID` | The user the key acts as. Empty means `DEFAULT_USER_ID`. |
+| `NEURALSCAPE_LEGACY_KEY_TRUST_BODY_USER_ID` | `true` restores the old behaviour (key may act as any body/query `user_id`). Default `false`. A WARNING is logged at startup when on. |
+
+With the default, the middleware binds the key to that user exactly like a
+per-user token: a request whose body or query `user_id` names anyone else gets
+**HTTP 400**; a request with no `user_id` acts as the bound user; MCP ignores
+`arguments["user_id"]`; task status is readable only for tasks that user
+enqueued. The key holder is also an admin when `DICTATOR_USER_IDS` is empty and
+the bound user is the default user.
+
+> **Upgrade note.** Before upgrading, operators who use the shared key on
+> behalf of a specific user (for example a plugin whose configured user id is
+> `alice`) must set `NEURALSCAPE_API_KEY_USER_ID=alice`, otherwise the key is
+> bound to `DEFAULT_USER_ID` and calls naming `alice` fail with 400. If one key
+> serves several users, set `NEURALSCAPE_LEGACY_KEY_TRUST_BODY_USER_ID=true`
+> until each user has their own token (`scripts/issue_user_token.py`).
+
+## Token revocation
+
+A per-user token is valid until it expires (forever, for one issued with
+`--no-expiry`). To revoke a leaked token:
+
+```bash
+printf '%s' "$LEAKED_TOKEN" | python scripts/revoke_token.py   # prints a SHA-256 digest
+# add it to the server env, comma-separated, then restart:
+NEURALSCAPE_REVOKED_TOKENS=<digest>[,<digest>...]
+```
+
+A revoked token is rejected with 401 on REST and MCP, and cannot be pasted into
+the OAuth consent screen. The list holds digests only, never tokens. If the list
+cannot be read, per-user tokens are rejected (fail closed). Limits, plainly:
+
+- Revoking needs an env edit and a restart.
+- It covers the exact token string only.
+- OAuth refresh tokens and sessions already minted from a leaked token are not
+  revoked (refresh rotation is a separate change).
+- Rotate `NEURALSCAPE_USER_TOKEN_SECRET` to invalidate every token.
+- Existing non-expiring tokens keep verifying unless revoked or the secret rotates.
+
+`scripts/issue_user_token.py --days N` requires `N >= 1`; a token with no
+expiry needs the explicit `--no-expiry` flag.
 
 ## Setup: `AUTH_PROVIDER=token` (default)
 
@@ -184,6 +258,8 @@ real deployment.
 
 ## Troubleshooting
 
+- **Refuses to start with `Authentication is not configured`** — set `NEURALSCAPE_USER_TOKEN_SECRET` (or the legacy `NEURALSCAPE_API_KEY`), or `NEURALSCAPE_AUTH_DISABLED=true` on a trusted local machine. See [Fail-closed by default](#fail-closed-by-default).
+- **Every request returns 503 `Authentication is not configured`** — the app is being served without its startup validation and no secret is set; same fix as above.
 - **Boots with a config error naming `GOOGLE_OAUTH_*` / `SUPABASE_*` / `AUTH_ALLOWED_DOMAINS`** — that provider's required env vars are missing; the validator lists every gap.
 - **"This account is not authorized"** — verified email isn't in the allowlist (env for `google`; the `signup_email_domains`/`addresses` tables for `supabase`).
 - **Google `redirect_uri_mismatch`** — the URI in Google Cloud must be exactly `https://<host>/oauth/google/callback`.

@@ -77,6 +77,10 @@ WORKER_PAYLOAD_FIELDS = (
 # reviewed edit here and in the tests.
 PRIVILEGED_OPERATIONS = frozenset(
     {
+        "rest:PUT /v1/projects/{project_id}/knowledge-config",
+        "mcp_tool:set_project_knowledge_config",
+        "rest_extension:POST /v1/extensions/dreaming/run",
+        "mcp_tool:schedule_dream",
         "rest:POST /v1/admin/audit-private-leakage",
         "rest:GET /v1/admin/ledger-cutover",
         "rest:POST /v1/admin/ledger-cutover/start",
@@ -102,12 +106,8 @@ PRIVILEGED_OPERATIONS = frozenset(
 PENDING_ADMIN_DECISION = frozenset(
     {
         "rest:GET /v1/projects/{project_id}/knowledge-config",
-        "rest:PUT /v1/projects/{project_id}/knowledge-config",
         "rest:POST /v1/extensions/events",
-        "rest_extension:POST /v1/extensions/dreaming/run",
         "mcp_tool:get_project_knowledge_config",
-        "mcp_tool:set_project_knowledge_config",
-        "mcp_tool:schedule_dream",
     }
 )
 # In-handler gates whose presence means the operation is administrative.
@@ -754,8 +754,8 @@ REGISTRY: Mapping[str, Entry] = {
         extra_actions=(),
         exempt_reason=None,
         required_payload=(),
-        privileged=False,
-        note='tenant-level: the handler enqueues a system sweep (an omitted pool walks every pool, a named one any owner\'s), so derivation on a member\'s own pool never authorizes it; decision pending: global/project administration needs a settings-administration grant',
+        privileged=True,
+        note='tenant-level: the handler enqueues a system sweep (an omitted pool walks every pool, a named one any owner\'s), so derivation on a member\'s own pool never authorizes it; administrator-only (owner decision: with DICTATOR_USER_IDS empty the default user is the administrator), checked against a privileged tenant handle',
     ),
     'mcp_tool:search_knowledge_graph': _e(
         'search',
@@ -771,13 +771,13 @@ REGISTRY: Mapping[str, Entry] = {
     'mcp_tool:set_project_knowledge_config': _e(
         'update',
         'mapped',
-        'settings',
-        'arguments.project_id',
+        'tenant',
+        'credential.tenant',
         extra_actions=(),
         exempt_reason=None,
         required_payload=(),
-        privileged=False,
-        note='principal from credential only; arguments.user_id must not override; decision pending: global/project administration needs a settings-administration grant',
+        privileged=True,
+        note='principal from credential only; arguments.user_id must not override; administrator-only (owner decision: with DICTATOR_USER_IDS empty the default user is the administrator), checked against a privileged tenant handle',
     ),
     'mcp_tool:timeline': _e(
         'read',
@@ -2015,13 +2015,13 @@ REGISTRY: Mapping[str, Entry] = {
     'rest:PUT /v1/projects/{project_id}/knowledge-config': _e(
         'update',
         'mapped',
-        'settings',
-        'path.project_id',
+        'tenant',
+        'credential.tenant',
         extra_actions=(),
         exempt_reason=None,
         required_payload=(),
-        privileged=False,
-        note='unscoped today; decision pending: global/project administration needs a settings-administration grant',
+        privileged=True,
+        note='project settings are administered with one tenant-level grant (a per-project handle cannot be named in a statement for a project that does not exist yet); unscoped today; administrator-only (owner decision: with DICTATOR_USER_IDS empty the default user is the administrator), checked against a privileged tenant handle',
     ),
     'rest:PUT /v1/settings/extraction-instructions': _e(
         'update',
@@ -2119,8 +2119,8 @@ REGISTRY: Mapping[str, Entry] = {
         extra_actions=(),
         exempt_reason=None,
         required_payload=(),
-        privileged=False,
-        note='initiation only; unscoped today; tenant-level: the handler enqueues a system sweep (an omitted pool walks every pool, body.pool names any owner\'s), so derivation on a member\'s own pool never authorizes it; decision pending: global/project administration needs a settings-administration grant',
+        privileged=True,
+        note='initiation only; unscoped today; tenant-level: the handler enqueues a system sweep (an omitted pool walks every pool, body.pool names any owner\'s), so derivation on a member\'s own pool never authorizes it; administrator-only (owner decision: with DICTATOR_USER_IDS empty the default user is the administrator), checked against a privileged tenant handle',
     ),
     'rest_framework:GET /docs': _e(
         None,

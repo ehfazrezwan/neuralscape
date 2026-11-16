@@ -180,6 +180,13 @@ class TestRecallMemoriesTool:
         assert call_kwargs["categories"] == ["preference", "convention"]
 
 
+async def mock_call(category, project_id):
+    args = {"content": "Kelly sizing caps risk", "user_id": "ehfaz", "category": category}
+    if project_id:
+        args["project_id"] = project_id
+    return await mcp_server.call_tool("remember", args)
+
+
 class TestRememberTool:
     @pytest.mark.asyncio
     async def test_stores_fact(self, mock_mcp_service, mock_task_manager):
@@ -204,6 +211,32 @@ class TestRememberTool:
         call_kwargs = mock_task_manager.enqueue_raw.call_args[1]
         assert call_kwargs["scope"] == "project"
         assert call_kwargs["project_id"] == "my-project"
+
+    @pytest.mark.asyncio
+    async def test_domain_knowledge_with_project_id_is_project_scoped(
+        self, mock_mcp_service, mock_task_manager
+    ):
+        """#224: domain_knowledge used to be forced global even with an
+        explicit project_id (while metadata.project_id was still stamped)."""
+        await mock_call("domain_knowledge", "my-project")
+        call_kwargs = mock_task_manager.enqueue_raw.call_args[1]
+        assert call_kwargs["scope"] == "project"
+        assert call_kwargs["project_id"] == "my-project"
+
+    @pytest.mark.asyncio
+    async def test_domain_knowledge_without_project_id_stays_global(
+        self, mock_mcp_service, mock_task_manager
+    ):
+        await mock_call("domain_knowledge", None)
+        call_kwargs = mock_task_manager.enqueue_raw.call_args[1]
+        assert call_kwargs["scope"] == "global"
+
+    @pytest.mark.asyncio
+    async def test_preference_with_project_id_stays_global(
+        self, mock_mcp_service, mock_task_manager
+    ):
+        await mock_call("preference", "my-project")
+        assert mock_task_manager.enqueue_raw.call_args[1]["scope"] == "global"
 
     @pytest.mark.asyncio
     async def test_v2_fields_forwarded_to_enqueue(self, mock_mcp_service, mock_task_manager):
@@ -464,7 +497,9 @@ class TestEditMemoryTool:
         data = json.loads(result[0].text)
         assert data["graph"] == "migration_queued"
         assert data["graph_task_id"] == "task-graph"
-        mock_task_manager.enqueue_graph_enrichment.assert_awaited_once_with(**job)
+        mock_task_manager.enqueue_graph_enrichment.assert_awaited_once_with(
+            **job, requester_user_id="e"
+        )
 
     @pytest.mark.asyncio
     async def test_edit_permission_error_surfaced(self, mock_mcp_service):
@@ -731,6 +766,11 @@ class TestRememberProvenanceValidation:
 
 
 class TestScheduleDreamTool:
+    @pytest.fixture(autouse=True)
+    def _caller_is_dictator(self, monkeypatch):
+        # schedule_dream is dictator-only; these tests exercise the sweep path.
+        monkeypatch.setattr(mcp_server.settings, "dictator_user_ids", mcp_server.settings.default_user_id)
+
     @pytest.mark.asyncio
     async def test_refuses_when_dreaming_disabled(self, monkeypatch):
         from extensions.dreaming.config import dreaming_settings

@@ -12,10 +12,13 @@ never contain ``@``. Two-step resolution:
 
 The legacy slug folds every run of disallowed characters to one ``-``, so
 distinct emails can share an id (``a+b@x.com`` and ``a-b@x.com``).  Under the
-enforced auth profile (``NS_AUTH_PROFILE=enforced``, the default for new
-deployments) a fresh identity gets :func:`collision_free_user_id` instead: the
+enforced auth profile (``NS_AUTH_PROFILE=enforced``, opt-in: the setting
+defaults to ``legacy_compat``) a fresh identity gets :func:`collision_free_user_id` instead: the
 same slug whenever the slug can be read back to exactly one email, otherwise an
-id no slug can produce.  ``legacy_compat`` keeps the legacy slug byte for byte.
+id no slug can produce.  ``legacy_compat`` keeps the legacy slug byte for byte.  Switching an existing
+deployment to ``enforced`` also re-keys graph group ids (see
+``docs/neuralscape/03-memory-model.md``): data under a legacy name that the new
+names no longer match stops being read.
 """
 
 from __future__ import annotations

@@ -24,6 +24,30 @@ def _b64url_decode(s: str) -> bytes:
     return base64.urlsafe_b64decode(s + pad)
 
 
+def token_fingerprint(token: str) -> str:
+    """SHA-256 hex digest of a token: what ``NEURALSCAPE_REVOKED_TOKENS`` lists.
+
+    The digest is one-way, so the revocation list is safe to keep in an env
+    file or a ticket; the token itself never has to be written down.
+    """
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def _revoked_digests() -> set[str] | None:
+    """Digests listed in ``NEURALSCAPE_REVOKED_TOKENS`` (empty set when unset).
+
+    Read from the live settings object so a test or operator override applies
+    immediately. Returns ``None`` when the list cannot be read or parsed:
+    callers must then FAIL CLOSED and reject the token, never accept it.
+    """
+    try:
+        from config import settings
+
+        return settings.revoked_token_digests()
+    except Exception:  # noqa: BLE001 - unreadable revocation list must not accept tokens
+        return None
+
+
 def sign_payload(claims: dict, secret: str) -> str:
     """Sign an arbitrary claims dict into a two-segment HMAC token.
 
@@ -145,12 +169,19 @@ def verify_user_token(token: str, secret: str) -> dict | None:
     """Validate a Bearer access token. Returns the payload dict or None.
 
     Returns None for: malformed, tampered, expired, or wrong-secret tokens,
-    tokens missing a non-empty ``user_id``, or tokens whose ``typ`` is not an
-    access type (i.e. OAuth codes/refresh tokens are rejected here). Never
-    raises (callers treat None as "auth failed").
+    tokens missing a non-empty ``user_id``, tokens whose ``typ`` is not an
+    access type (i.e. OAuth codes/refresh tokens are rejected here), and
+    tokens whose SHA-256 digest is listed in ``NEURALSCAPE_REVOKED_TOKENS``.
+    Every caller (the bearer middleware, OAuth token-paste login) therefore
+    honours revocation. Never raises (callers treat None as "auth failed").
     """
     payload = verify_payload(token, secret)
     if payload is None:
+        return None
+    revoked = _revoked_digests()
+    if revoked is None:  # revocation list unreadable: fail closed
+        return None
+    if revoked and token_fingerprint(token) in revoked:
         return None
     user_id = payload.get("user_id")
     if not isinstance(user_id, str) or not user_id:

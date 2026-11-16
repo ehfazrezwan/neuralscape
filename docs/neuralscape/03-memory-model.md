@@ -276,7 +276,7 @@ A search by user `alice` walks group_ids `["user--alice", "shared"]`
 (plus the project-scoped variants when the request supplies
 `project_id`).
 
-#### Collision-free names under the enforced auth profile
+#### Collision-free names
 
 The `--` delimiter may appear inside a legal id, so the legacy names are not
 one-to-one: user `alice--project--payroll` and user `alice` in project
@@ -284,19 +284,11 @@ one-to-one: user `alice--project--payroll` and user `alice` in project
 folds every run of disallowed characters to one `-`, so `a+b@example.com` and
 `a-b@example.com` both slug to `a-b-example.com`.
 
-With `NS_AUTH_PROFILE=enforced` (the default for new deployments):
-
-- **Group ids.** A tuple whose user, project and workspace are all *plain*
-  keeps its legacy name byte for byte. Plain means the value uses only
-  Graphiti's group-id characters (letters, digits, `_` and `-`, so no `.`),
-  contains no `--`, and does not start or end with `-`. Any other tuple is
-  named `nsg1--` followed by the hex of a length-prefixed encoding of the
-  whole tuple. Every placement has exactly one name: decoding refuses an
-  encoding of a plain tuple. Every read set (`_get_group_ids` and the
-  narrowed sets of the search graph leg), dreaming pool keys and cards,
-  project listing and the policy migration parser use the same names and
-  decode them exactly. An `nsg1--` name that does not decode is never treated
-  as a team pool.
+- **Group ids.** Injective (collision-free) graph group ids are owned by PR #501
+  (`GRAPH_GROUP_ID_INJECTIVE_ENABLED`, default off) and are not part of the authority slice. Until it is enabled
+  the legacy names still collide for ids containing `--`. Deployments using `NS_AUTH_PROFILE=enforced` should
+  enable it once #501 lands. The policy layer does not depend on it: it keys pools by the structured `ns1`
+  namespace, never by a group name.
 - **Fresh login ids.** An unlinked identity keeps its legacy slug whenever the
   slug reads back to exactly one address. That means a local part of letters,
   digits, `_` and `.` that starts with a letter or digit, a domain that ends
@@ -304,17 +296,16 @@ With `NS_AUTH_PROFILE=enforced` (the default for new deployments):
   `_x` followed by the hex of the address, or `_h` followed by its SHA-256
   digest when that would exceed 100 characters. A slug never starts with `_`.
 
-`legacy_compat` (the default for upgraded deployments) keeps every legacy
-name, including the collisions.
+`legacy_compat` (the default) keeps the legacy slug for fresh logins, including its collisions.
 
-**Migration when switching an existing deployment to `enforced`:**
+**Migration:**
 
 - **Unaffected:** plain tuples and unambiguous emails keep their ids, so most
   data needs no change. Identities that are already linked (durable identity
   store or `AUTH_IDENTITY_MAP`) also keep their ids, because the new derivation
   applies only to fresh, unlinked logins.
-- **Group ids that change:** only for users, projects or workspaces whose
-  value contains `.` or `--`, or starts or ends with `-`. A dotted value
+- **Group ids that change (when #501's flag is on):** only for users, projects or workspaces whose
+  value contains `.` or `--`. A dotted value
   (for example the slug `first.last-example.com`) never had a usable legacy
   graph name, because Graphiti refuses `.` in a group id, so it has no graph
   data to move; its dreaming card pool key does change. Their old graph data stays
@@ -329,6 +320,10 @@ name, including the collisions.
   under the slug rule. If such a person used the deployment before under the
   slug id, link that id explicitly (`AUTH_IDENTITY_MAP` or the link flow)
   before their first login under `enforced`.
+
+**Re-run the policy migration after changing `NEURALSCAPE_API_KEY_USER_ID`** (or `DICTATOR_USER_IDS`, or the
+default user): the shared key's administrator grant is computed from them when the migration runs, not at
+request time.
 
 ### Dual-pool search
 

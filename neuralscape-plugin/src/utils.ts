@@ -2,7 +2,7 @@
  * Shared utilities for Neuralscape Claude Code plugin hooks.
  */
 
-import { appendFile, mkdir, readdir, readFile, stat, unlink, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, open, readdir, readFile, stat, unlink, writeFile } from "node:fs/promises";
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join as pathJoin, parse as parsePath } from "node:path";
@@ -61,8 +61,9 @@ const NEURALSCAPE_API_KEY = readConfig("API_KEY", "");
 // Removing it would orphan memories existing installs stored under that id.
 // Token-authenticated servers ignore client-claimed ids (identity comes from
 // the Bearer token), so this can't spoof identity on multi-user deployments.
+const CONFIGURED_USER_ID = readConfig("USER_ID", "");
 const NEURALSCAPE_USER_ID =
-  readConfig("USER_ID", "") ||
+  CONFIGURED_USER_ID ||
   process.env.USER?.trim() ||
   process.env.USERNAME?.trim() ||
   /* v8 ignore next — fallback when neither $USER nor $USERNAME set */
@@ -90,7 +91,12 @@ export interface HookInput {
   hook_event_name?: string;
   tool_name?: string;
   tool_input?: Record<string, unknown>;
-  tool_output?: string;
+  /** PostToolUse: the tool's result as Claude Code sends it — a string for
+   *  some tools, an object (e.g. Bash `{stdout, stderr, ...}`) for most. */
+  tool_response?: unknown;
+  /** @deprecated Not sent by Claude Code; kept as a fallback for older or
+   *  non-Claude-Code callers. Use `tool_response`. */
+  tool_output?: unknown;
   prompt?: string;
   stop_hook_active?: boolean;
   last_assistant_message?: string;
@@ -293,6 +299,13 @@ export function hasUserId(): boolean {
   return NEURALSCAPE_USER_ID.length > 0;
 }
 
+/** Where the effective user id came from: the user's own config, the OS
+ *  login-name fallback (see the comment above NEURALSCAPE_USER_ID), or nowhere. */
+export function getUserIdSource(): "config" | "os" | "none" {
+  if (CONFIGURED_USER_ID) return "config";
+  return NEURALSCAPE_USER_ID ? "os" : "none";
+}
+
 export function getServiceUrl(): string {
   return NEURALSCAPE_URL;
 }
@@ -362,6 +375,72 @@ export function getProjectId(cwd?: string): string | undefined {
 
 // ── HTTP Client ──────────────────────────────────────────────────
 
+/** The service answered, but not with 2xx. `message` keeps the legacy
+ *  `HTTP <status>: <text>` shape so log lines and old assertions still match. */
+export class NeuralscapeHttpError extends Error {
+  readonly status: number;
+  constructor(status: number, statusText = "") {
+    super(`HTTP ${status}: ${statusText}`);
+    this.name = "NeuralscapeHttpError";
+    this.status = status;
+  }
+}
+
+/** No usable answer: DNS/connection failure, reset, or the request timeout. */
+export class NeuralscapeNetworkError extends Error {
+  constructor(detail: string) {
+    super(`network error: ${detail}`);
+    this.name = "NeuralscapeNetworkError";
+  }
+}
+
+/** What a failed call means for the user. `auth`, `not_found` and `client`
+ *  mean the service IS reachable but the plugin's setup is wrong; `server`
+ *  and `network` mean the service is down or failing. */
+export type FailureKind = "auth" | "not_found" | "client" | "server" | "network";
+
+export function classifyFailure(error: unknown): FailureKind {
+  if (error instanceof NeuralscapeHttpError) {
+    if (error.status === 401 || error.status === 403) return "auth";
+    if (error.status === 404) return "not_found";
+    if (error.status >= 500) return "server";
+    return "client";
+  }
+  // NeuralscapeNetworkError, a bare fetch/abort error, or anything unexpected:
+  // treated as a transport failure, the pre-existing behavior.
+  return "network";
+}
+
+/** Failures that count toward the "unreachable" streak: the service is down
+ *  or failing. Config problems (auth/404/other 4xx) do not: the service answered. */
+export function isUnreachableKind(kind: FailureKind): boolean {
+  return kind === "network" || kind === "server";
+}
+
+/** Count a failed call toward the unreachable streak when (and only when) it
+ *  was a transport/server failure. Returns the kind, and the new count when
+ *  the streak advanced. Never throws. */
+export async function recordFailure(
+  error: unknown,
+): Promise<{ kind: FailureKind; count: number | null }> {
+  const kind = classifyFailure(error);
+  const count = isUnreachableKind(kind) ? await recordTransportFailure() : null;
+  return { kind, count };
+}
+
+function wrapTransportError(error: unknown): unknown {
+  if (error instanceof NeuralscapeHttpError || error instanceof NeuralscapeNetworkError) return error;
+  // fetch() rejects with TypeError on connection failure; abort() on timeout.
+  if (error instanceof Error && (error.name === "AbortError" || error.name === "TimeoutError")) {
+    return new NeuralscapeNetworkError(`timed out after ${REQUEST_TIMEOUT_MS}ms`);
+  }
+  if (error instanceof TypeError) {
+    return new NeuralscapeNetworkError("could not connect");
+  }
+  // e.g. a 2xx body that is not JSON: leave as is (classified as network, as before).
+  return error;
+}
+
 export async function neuralscapeGet(
   endpoint: string,
   params?: Record<string, string>
@@ -383,9 +462,11 @@ export async function neuralscapeGet(
       signal: controller.signal,
     });
     if (!response.ok) {
-      throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+      throw new NeuralscapeHttpError(response.status, response.statusText);
     }
     return await response.json();
+  } catch (error) {
+    throw wrapTransportError(error);
   } finally {
     clearTimeout(timeout);
   }
@@ -408,9 +489,11 @@ export async function neuralscapePost(
       signal: controller.signal,
     });
     if (!response.ok) {
-      throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+      throw new NeuralscapeHttpError(response.status, response.statusText);
     }
     return await response.json();
+  } catch (error) {
+    throw wrapTransportError(error);
   } finally {
     clearTimeout(timeout);
   }
@@ -506,10 +589,22 @@ export function getBufferPath(sessionId: string): string {
   return pathJoin(getObservationDir(), `${safe}.jsonl`);
 }
 
-/** Path to the per-session "stale" marker dropped by the Stop hook. */
-export function getStaleMarkerPath(sessionId: string): string {
-  return getBufferPath(sessionId) + ".stale";
+/**
+ * Path to the per-session "session ended" marker, written once by the
+ * SessionEnd hook. (Versions up to 2.9.3 wrote `<buffer>.stale` from the Stop
+ * hook, which fires after every turn and so says nothing about the session
+ * having ended; those markers are ignored and removed.)
+ */
+export function getEndedMarkerPath(sessionId: string): string {
+  return getBufferPath(sessionId) + ".ended";
 }
+
+/** Marker suffix written by plugin versions up to 2.9.3 (meaningless; cleaned up). */
+const LEGACY_STALE_SUFFIX = ".stale";
+const ENDED_SUFFIX = ".ended";
+
+/** Local copy of the last compact snapshot, next to the buffers. */
+const COMPACT_SNAPSHOT_FILE_SUFFIX = ".compact-snapshot.json";
 
 /**
  * Append a single observation row (already-stringified-able JSON) to the
@@ -537,7 +632,13 @@ export interface BufferStats {
   sessionId: string;
   lineCount: number;
   oldestTs: string | null;
-  isStale: boolean; // true if a `.stale` marker exists alongside the buffer
+  /** Last write to the buffer (ms since epoch); 0 when the file is missing. */
+  mtimeMs: number;
+  /**
+   * True when the SessionEnd hook marked this session as ended and the buffer
+   * has not been written since (a session that resumed and kept working is not ended).
+   */
+  isEnded: boolean;
 }
 
 /**
@@ -562,21 +663,81 @@ export async function getBufferStats(path: string): Promise<BufferStats> {
   } catch {
     // file missing or unreadable: lineCount stays 0
   }
-  let isStale = false;
+  let mtimeMs = 0;
   try {
-    await stat(path + ".stale");
-    isStale = true;
+    mtimeMs = (await stat(path)).mtimeMs;
   } catch {
-    isStale = false;
+    mtimeMs = 0;
   }
-  return { path, sessionId, lineCount, oldestTs, isStale };
+  let isEnded = false;
+  try {
+    const marker = await stat(path + ENDED_SUFFIX);
+    isEnded = lineCount > 0 && marker.mtimeMs >= mtimeMs;
+  } catch {
+    isEnded = false;
+  }
+  return { path, sessionId, lineCount, oldestTs, mtimeMs, isEnded };
+}
+
+/** A buffer nobody has written to for this long belongs to a session that is gone (it crashed before SessionEnd). */
+export const DEFAULT_PENDING_IDLE_HOURS = 12;
+
+/** Hours of silence after which an un-ended buffer counts as abandoned (`PENDING_IDLE_HOURS`, default 12). */
+export function getPendingIdleHours(): number {
+  const parsed = parseFloat(readConfig("PENDING_IDLE_HOURS", ""));
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_PENDING_IDLE_HOURS;
+}
+
+/** Local compact snapshots are continuity artifacts like the stored ones: dropped after two weeks. */
+const COMPACT_SNAPSHOT_FILE_MAX_AGE_MS = 14 * 24 * 60 * 60 * 1000;
+
+/**
+ * Remove marker files that can no longer matter. The compile-observations
+ * skill empties a buffer with the Write tool, which cannot delete the
+ * markers next to it, so they would otherwise accumulate:
+ *   - `.ended` markers whose buffer is empty or missing;
+ *   - `.stale` markers written by plugin versions up to 2.9.3 (they came
+ *     from the per-turn Stop hook and carry no information);
+ *   - local compact snapshots older than two weeks.
+ * Never throws.
+ */
+export async function cleanupOrphanMarkers(entries: string[], now: number = Date.now()): Promise<void> {
+  const dir = getObservationDir();
+  const buffers = new Set(entries.filter((n) => n.endsWith(".jsonl")));
+  for (const name of entries) {
+    try {
+      if (name.endsWith(".jsonl" + LEGACY_STALE_SUFFIX)) {
+        await unlink(pathJoin(dir, name));
+      } else if (name.endsWith(".jsonl" + ENDED_SUFFIX)) {
+        const bufferName = name.slice(0, -ENDED_SUFFIX.length);
+        let empty = !buffers.has(bufferName);
+        if (!empty) empty = (await stat(pathJoin(dir, bufferName))).size === 0;
+        if (empty) await unlink(pathJoin(dir, name));
+      } else if (name.endsWith(COMPACT_SNAPSHOT_FILE_SUFFIX) || name.endsWith(".lastturn")) {
+        const age = now - (await stat(pathJoin(dir, name))).mtimeMs;
+        if (age > COMPACT_SNAPSHOT_FILE_MAX_AGE_MS) await unlink(pathJoin(dir, name));
+      }
+    } catch {
+      // raced with another hook or already gone — fine
+    }
+  }
 }
 
 /**
- * List every non-empty buffer file in the observation directory whose
- * session id is NOT the current one (i.e. left behind by prior sessions).
+ * List the non-empty buffers left behind by sessions that are OVER.
+ *
+ * A buffer belongs to a finished session when it is not the current one and
+ *   (a) the SessionEnd hook marked it ended and it has not been written since, or
+ *   (b) nobody has written to it for `PENDING_IDLE_HOURS` (default 12): the
+ *       session crashed or was killed and SessionEnd never fired.
+ * A buffer that is being written by another terminal's live session is neither,
+ * so it is never offered for compilation and truncation. Markers from empty
+ * or missing buffers are removed as a side effect.
  */
-export async function listPendingBuffers(currentSessionId?: string): Promise<BufferStats[]> {
+export async function listPendingBuffers(
+  currentSessionId?: string,
+  now: number = Date.now(),
+): Promise<BufferStats[]> {
   const dir = getObservationDir();
   let entries: string[] = [];
   try {
@@ -584,6 +745,8 @@ export async function listPendingBuffers(currentSessionId?: string): Promise<Buf
   } catch {
     return [];
   }
+  await cleanupOrphanMarkers(entries, now);
+  const idleMs = getPendingIdleHours() * 60 * 60 * 1000;
   const results: BufferStats[] = [];
   for (const name of entries) {
     if (!name.endsWith(".jsonl")) continue;
@@ -591,6 +754,8 @@ export async function listPendingBuffers(currentSessionId?: string): Promise<Buf
     const stats = await getBufferStats(path);
     if (stats.lineCount === 0) continue;
     if (currentSessionId && stats.sessionId === currentSessionId) continue;
+    const abandoned = now - stats.mtimeMs >= idleMs;
+    if (!stats.isEnded && !abandoned) continue;
     results.push(stats);
   }
   return results;
@@ -598,16 +763,19 @@ export async function listPendingBuffers(currentSessionId?: string): Promise<Buf
 
 /**
  * Truncate a buffer file to empty (preserves the file/inode for reuse).
- * Also removes any `.stale` marker. Used by the compile-observations skill
- * after successfully POSTing all extracted memories.
+ * Also removes the end marker. (The compile-observations skill itself empties
+ * buffers with the Write tool; the next `listPendingBuffers` call removes the
+ * marker it leaves behind.)
  */
 export async function truncateBuffer(path: string): Promise<void> {
   try {
     await writeFile(path, "", "utf-8");
-    try {
-      await unlink(path + ".stale");
-    } catch {
-      // no marker — fine
+    for (const suffix of [ENDED_SUFFIX, LEGACY_STALE_SUFFIX]) {
+      try {
+        await unlink(path + suffix);
+      } catch {
+        // no marker — fine
+      }
     }
   } catch (error) {
     logError(`truncateBuffer failed for ${path}`, error);
@@ -615,16 +783,100 @@ export async function truncateBuffer(path: string): Promise<void> {
 }
 
 /**
- * Write a small sentinel file next to the buffer indicating that the Stop
- * hook flushed without compilation. The next SessionStart picks these up.
+ * Write the "session ended" marker next to the buffer. Called once by the
+ * SessionEnd hook (never by Stop, which fires after every turn). The next
+ * SessionStart, in any terminal, treats the buffer as ready to compile
+ * as long as it is not written to again after the marker.
  */
-export async function markBufferStale(sessionId: string): Promise<void> {
+export async function markBufferEnded(sessionId: string): Promise<void> {
   try {
     const dir = getObservationDir();
     await mkdir(dir, { recursive: true });
-    await writeFile(getStaleMarkerPath(sessionId), new Date().toISOString(), "utf-8");
+    await writeFile(getEndedMarkerPath(sessionId), new Date().toISOString(), { encoding: "utf-8", mode: 0o600 });
   } catch (error) {
-    logError("markBufferStale failed", error);
+    logError("markBufferEnded failed", error);
+  }
+}
+
+// ── Local compact snapshot (survives a slow or unreachable service) ──
+
+export interface LocalCompactSnapshot {
+  sessionId: string;
+  projectId?: string;
+  content: string;
+  createdAt: string;
+}
+
+/** Path to the local copy of a session's latest compact snapshot. */
+export function getCompactSnapshotPath(sessionId: string): string {
+  const safe = sessionId.replace(/[^A-Za-z0-9._-]/g, "_") || "unknown";
+  return pathJoin(getObservationDir(), `${safe}${COMPACT_SNAPSHOT_FILE_SUFFIX}`);
+}
+
+/**
+ * Keep a copy of the compact snapshot on disk. POST /v1/memories/raw only
+ * enqueues the write (202), so the SessionStart that follows the compaction
+ * can run before the memory is searchable; this copy is read first.
+ */
+export async function writeLocalCompactSnapshot(snapshot: LocalCompactSnapshot): Promise<void> {
+  try {
+    await mkdir(getObservationDir(), { recursive: true });
+    await writeFile(getCompactSnapshotPath(snapshot.sessionId), JSON.stringify(snapshot), { encoding: "utf-8", mode: 0o600 });
+  } catch (error) {
+    logError("writeLocalCompactSnapshot failed (non-critical)", error);
+  }
+}
+
+/**
+ * Session ids that came before this one, read from the head of a resumed or forked transcript.
+ * Claude Code starts a resumed/forked session under a NEW id, and the new transcript begins with
+ * the earlier session's entries, which carry their own `sessionId`. Returns the distinct ids that
+ * differ from `currentSessionId`, in order of appearance. Reads at most the first 8 MiB; only the
+ * `sessionId` key of each line is looked at. Empty when nothing is found or the file is unreadable.
+ */
+export async function readPredecessorSessionIds(
+  transcriptPath: string | undefined,
+  currentSessionId: string | undefined,
+): Promise<string[]> {
+  if (!transcriptPath) return [];
+  const MAX_BYTES = 8 * 1024 * 1024;
+  let handle;
+  try {
+    handle = await open(transcriptPath, "r");
+    const buf = Buffer.alloc(MAX_BYTES);
+    const { bytesRead } = await handle.read(buf, 0, MAX_BYTES, 0);
+    const text = buf.subarray(0, bytesRead).toString("utf-8");
+    const ids: string[] = [];
+    for (const line of text.split("\n")) {
+      if (!line.includes('"sessionId"')) continue;
+      try {
+        const id = JSON.parse(line)?.sessionId;
+        if (typeof id === "string" && id && id !== currentSessionId && !ids.includes(id)) ids.push(id);
+      } catch {
+        // a partial last line or a non-JSON line
+      }
+    }
+    return ids;
+  } catch {
+    return [];
+  } finally {
+    await handle?.close();
+  }
+}
+
+/** Read a session's local compact snapshot; null when absent or unreadable. */
+export async function readLocalCompactSnapshot(sessionId: string): Promise<LocalCompactSnapshot | null> {
+  try {
+    const parsed = JSON.parse(await readFile(getCompactSnapshotPath(sessionId), "utf-8"));
+    if (typeof parsed?.content !== "string" || typeof parsed?.createdAt !== "string") return null;
+    return {
+      sessionId: String(parsed.sessionId ?? sessionId),
+      projectId: typeof parsed.projectId === "string" ? parsed.projectId : undefined,
+      content: parsed.content,
+      createdAt: parsed.createdAt,
+    };
+  } catch {
+    return null;
   }
 }
 

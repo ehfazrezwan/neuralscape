@@ -12,8 +12,8 @@ A scoped credential is bound to ``(subject, tenant, scope, expiry)``:
   credential.  Presenting an already-consumed refresh token is a replay and
   revokes the whole family;
 * revoking a credential or offboarding the subject retires it in the authority
-  store, which is also what fences queued work at publication
-  (``publication_fence``/``hold_current``);
+  store.  The publication fence (``publication_fence``/``hold_current``) is what will stop queued work at
+  publication, but it has no caller in this slice (wired by slices 05/07), so queued work is not yet stopped;
 * service accounts are owned by a recorded human controller, hold only their
   own statements, may have at most two active credential families (so a key
   can be rotated without downtime), and can be disabled.
@@ -28,8 +28,8 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
-import os
 import secrets
+import threading
 import time
 from collections.abc import Callable, Sequence
 from contextvars import ContextVar
@@ -60,6 +60,9 @@ MAX_REFRESH_TTL = 90 * 24 * 3600
 # A duplicate refresh submission within this many seconds of the first (a lost
 # response, two tabs) returns the same successor instead of revoking the family.
 DEFAULT_REFRESH_GRACE = 5.0
+# The subject -> memory ``user_id`` lookup is cached (see ``CredentialService.memory_user_id``).
+_ALIAS_CACHE_MAX = 10_000
+_ALIAS_MISS_TTL = 5.0
 
 # The credential verified for the current request (HTTP) or MCP call.
 current_credential: ContextVar[VerifiedCredential | None] = ContextVar(
@@ -82,10 +85,7 @@ class ScopeError(ValueError):
 
 
 def enabled() -> bool:
-    flag = getattr(settings, "credentials_enabled", None)
-    if flag is None:
-        flag = os.environ.get("CREDENTIALS_ENABLED", "").strip().lower() in {"1", "true", "yes"}
-    return bool(flag)
+    return bool(settings.credentials_enabled)
 
 
 def accepts_scoped_credentials() -> bool:
@@ -133,6 +133,8 @@ class CredentialService:
         self._refresh_grace = refresh_grace
         self._allow_scoped_refresh_minting = allow_scoped_refresh_minting
         self._pepper: bytes | None = None
+        self._aliases: dict[str, tuple[str | None, float]] = {}
+        self._alias_lock = threading.Lock()
 
     # ── scope ────────────────────────────────────────────────────────────
 
@@ -314,6 +316,29 @@ class CredentialService:
         from identity_binding import resolve_binding
 
         return resolve_binding(self._store, "local", user_id)
+
+    def memory_user_id(self, subject_id: str) -> str:
+        """The ``user_id`` the memory layer keys this subject's rows by.
+
+        Rows are stored under the legacy ``user_id`` an existing-token user wrote them with, and the
+        ``("local", user_id)`` binding is what ties that id to the subject.  A scoped credential names
+        the opaque subject, so the memory layer must be told the bound ``user_id`` or it would look in
+        an empty namespace (reads empty, get 404, while the owner token sees the rows).  A subject
+        with no such binding (a service account) owns rows under its own subject id.
+        """
+
+        with self._alias_lock:
+            hit = self._aliases.get(subject_id)
+            if hit is not None and (hit[0] is not None or hit[1] > self._clock()):
+                return hit[0] or subject_id
+        alias = self._store.binding_alias(subject_id, "local")
+        with self._alias_lock:
+            if len(self._aliases) >= _ALIAS_CACHE_MAX:
+                self._aliases.clear()
+            # A binding is never changed once made, so a hit is kept; a miss only briefly, because a
+            # binding may be created for the subject later.
+            self._aliases[subject_id] = (alias, self._clock() + _ALIAS_MISS_TTL)
+        return alias or subject_id
 
     # ── service accounts ─────────────────────────────────────────────────
 
