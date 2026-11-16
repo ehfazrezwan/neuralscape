@@ -5,7 +5,7 @@ come back with the stored fact in well under the plugin's ~8 s client timeout,
 whether or not the graph leg finished in time (a late graph leg is dropped, the
 vector results are returned). The wedged case pauses Neo4j on the throwaway
 stack (gated like the destructive fault-injection scenarios: needs
-NS_ALLOW_DESTRUCTIVE=1 and a compose project named nscampaign*) and always
+NS_ALLOW_DESTRUCTIVE=1 and a disposable compose project on the allowlist) and always
 unpauses it.
 """
 
@@ -62,7 +62,7 @@ def test_wedged_graph_does_not_stall_the_recall(ctx, a):
     try:
         guard.check_compose_project(ctx.compose_project or "")
     except guard.GuardError:
-        pytest.skip("destructive: needs a disposable compose project (nscampaign*, nstest-*)")
+        pytest.skip("destructive: needs a disposable compose project on the allowlist (for example nstest-*)")
     if os.environ.get("NS_ALLOW_DESTRUCTIVE") != "1":
         pytest.skip("destructive: needs NS_ALLOW_DESTRUCTIVE=1")
     marker = f"zq-{ctx.run_id}-glbw"
