@@ -227,9 +227,11 @@ def test_mcp_retag_memories_adds_a_tag(ctx, a, mcp_a, ed):
     rb = ed["retag_b"].require()
     mcp_a.initialize()
     mcp_tag = ed["retag"] + "-mcp"
+    # The MCP tool takes filters and ops as flat arguments (mcp_server.py retag_memories
+    # schema), unlike the REST body's {"filters": ..., "ops": ...}.
     out = mcp_json(mcp_a, "retag_memories", {
-        "filters": {"tags_contains": [ed["retag"]], "project_id": ctx.project_id},
-        "ops": {"add_tags": [mcp_tag]},
+        "tags_contains": [ed["retag"]], "project_id": ctx.project_id,
+        "add_tags": [mcp_tag],
     })
     assert out.get("status") == "accepted" and out.get("task_id"), f"MCP retag: {out}"
     done = a.poll_task(out["task_id"], timeout=120)
