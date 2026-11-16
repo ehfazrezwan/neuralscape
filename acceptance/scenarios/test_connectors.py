@@ -14,7 +14,7 @@ from dataclasses import dataclass
 
 import pytest
 
-from nsaccept import eventually, expect_check_fails, needs, negative_control, profiles, proves
+from nsaccept import eventually, expect_check_fails, needs, negative_control, precondition, profiles, proves
 from nsaccept.client import NSClient
 from nsaccept.sidecar import CONNECTOR_ITEMS_PATH, SINK_NAME, PORT, connector_marker
 
@@ -132,6 +132,7 @@ def test_registering_stores_the_credential_encrypted_and_never_returns_it(ctx, a
 @negative_control
 def test_secret_check_fails_when_the_credential_is_in_the_body(conn: Conn):
     _ready(conn)
+    precondition(check_no_secret, conn.created, conn.credential, what="the registration response holds no credential")
     expect_check_fails(check_no_secret, {"credentials": {"bearer": conn.credential}}, conn.credential)
 
 
@@ -154,8 +155,9 @@ def test_a_sync_imports_the_stub_sources_items_with_the_decrypted_credential(ctx
 
 @proves("ingest.connector-sync")
 @negative_control
-def test_recall_check_fails_for_user_b_and_for_the_wrong_item(ctx, b, conn: Conn):
+def test_recall_check_fails_for_user_b_and_for_the_wrong_item(ctx, a, b, conn: Conn):
     _ready(conn)
+    precondition(check_recalled_from_connector, a, connector_marker(ctx.run_id, 1), ctx.project_id, conn.connector_id, "item-1", what="A recalls the imported item")
     expect_check_fails(check_recalled_from_connector, b, connector_marker(ctx.run_id, 1), ctx.project_id, conn.connector_id, "item-1")
 
 
@@ -227,6 +229,50 @@ def test_only_an_allowlisted_stdio_command_may_be_registered(ctx, a):
 @proves("auth.connector-mcp-stdio")
 @negative_control
 def test_stdio_refusal_check_fails_for_the_allowlisted_command(ctx, a):
+    precondition(check_stdio_refused, a, _mcp(ctx, f"acc-{ctx.run_id}-sh0", {"transport": "stdio", "command": "sh", "args": ["-c", "id"]}), what="an unlisted stdio command is refused")
     ok_id = f"acc-{ctx.run_id}-stdio0"
     expect_check_fails(check_stdio_refused, a, _mcp(ctx, ok_id, {"transport": "stdio", "command": "echo", "args": ["acc-allowed-stdio"]}))
+    a.delete(f"/v1/connectors/{ok_id}")
+
+
+# ── destination policy (SSRF guard) ──────────────────────────────
+
+
+def check_destination_refused(client: NSClient, body: dict) -> None:
+    r = client.post("/v1/connectors", json=body)
+    assert r.status_code == 422, f"{body['config']} -> {r.status_code}: {r.text[:160]}"
+    assert client.get(f"/v1/connectors/{body['connector_id']}").status_code == 404, "a refused connector was stored anyway"
+
+
+def _rest_to(ctx, conn_id: str, list_url: str) -> dict:
+    return {
+        "connector_id": conn_id, "connector_type": "generic_rest", "credentials": {"bearer": f"zq-{ctx.run_id}-ssrf"},
+        "config": {"list_url": list_url, "items_path": "items"},
+        "default_category": "domain_knowledge", "default_scope": "global",
+    }
+
+
+@proves("ingest.connector-rest-api", "auth.connector-mcp-stdio")
+def test_connectors_cannot_target_internal_or_metadata_addresses(ctx, a):
+    # An internal host that the profile does NOT allowlist (same host, other port), loopback,
+    # the cloud metadata address, an IPv4-mapped loopback, a decimal-spelled loopback.
+    for n, url in enumerate((
+        f"http://{SINK_NAME}:9999/items", "http://127.0.0.1:8199/health", "https://127.0.0.1/items",
+        "https://169.254.169.254/latest/meta-data/", "https://[::ffff:127.0.0.1]/items", "https://2130706433/items",
+    )):
+        check_destination_refused(a, _rest_to(ctx, f"acc-{ctx.run_id}-ssrf{n}", url))
+    check_destination_refused(a, _mcp(ctx, f"acc-{ctx.run_id}-ssrfm", {"url": f"https://{SINK_NAME}:9999/mcp"}))
+
+
+@proves("ingest.connector-rest-api", "auth.connector-mcp-stdio")
+@negative_control
+def test_destination_refusal_check_fails_for_the_allowlisted_sink(ctx, a, sink):
+    # The check must pass for a destination the guard refuses (loopback) before it is shown to fail
+    # for the allowlisted sink; otherwise a broken route would make this control pass vacuously.
+    precondition(
+        check_destination_refused, a, _rest_to(ctx, f"acc-{ctx.run_id}-ssrfpre", "https://127.0.0.1/items"),
+        what="a loopback destination is refused",
+    )
+    ok_id = f"acc-{ctx.run_id}-ssrf0"
+    expect_check_fails(check_destination_refused, a, _rest_to(ctx, ok_id, f"http://{SINK_NAME}:{PORT}{CONNECTOR_ITEMS_PATH}"))
     a.delete(f"/v1/connectors/{ok_id}")
