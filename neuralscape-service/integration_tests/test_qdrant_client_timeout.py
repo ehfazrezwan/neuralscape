@@ -31,6 +31,7 @@ def _service(stores, unique_ns, monkeypatch, timeout):
 def test_service_client_uses_configured_timeout(stores, llm_key, unique_ns, monkeypatch):
     svc, memory = _service(stores, unique_ns, monkeypatch, 41)
     client = memory.vector_store.client
+    # Private attribute on purpose: qdrant-client exposes no public getter for the configured timeout.
     assert client._client._timeout == 41
     # The client is live against the real store with that timeout.
     assert client.collection_exists(unique_ns.qdrant_collection)
@@ -41,4 +42,4 @@ def test_default_timeout_is_not_the_client_default(stores, llm_key, unique_ns, m
 
     default = config.Settings.model_fields["qdrant_timeout"].default
     svc, memory = _service(stores, unique_ns, monkeypatch, default)
-    assert memory.vector_store.client._client._timeout == default == 30
+    assert memory.vector_store.client._client._timeout == default == config.DEFAULT_QDRANT_TIMEOUT_S == 30

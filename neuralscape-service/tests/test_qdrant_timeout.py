@@ -68,22 +68,34 @@ def test_fork_config_accepts_timeout():
     assert QdrantConfig(path="/tmp/x").timeout is None
 
 
-def test_real_client_reports_configured_timeout(monkeypatch):
-    """No fake: the fork builds a real (never-connecting) client; creation is stubbed."""
-    import mem0.vector_stores.qdrant as q
+def test_zero_and_negative_timeout_rejected(monkeypatch):
+    monkeypatch.delenv("QDRANT_TIMEOUT", raising=False)
+    for bad in (0, -5):
+        with pytest.raises(ValueError):
+            _settings(qdrant_timeout=bad)
+    monkeypatch.setenv("QDRANT_TIMEOUT", "0")
+    with pytest.raises(ValueError):
+        _settings()
 
-    monkeypatch.setattr(q.Qdrant, "create_col", lambda self, *a, **k: None)
-    store = q.Qdrant(collection_name="c", embedding_model_dims=4, url="http://127.0.0.1:1", timeout=33)
-    assert store.client._client._timeout == 33
-    default = q.Qdrant(collection_name="c", embedding_model_dims=4, url="http://127.0.0.1:1")
-    assert default.client._client._timeout == 5
+
+def test_default_is_defined_once():
+    import config
+
+    assert config.DEFAULT_QDRANT_TIMEOUT_S == 30
+    assert _settings().qdrant_timeout == config.DEFAULT_QDRANT_TIMEOUT_S
 
 
-def test_policy_migration_pool_source_sets_timeout():
+def test_policy_migration_pool_source_sets_timeout(monkeypatch):
+    import qdrant_client
+
+    import config
     import policy_migration as pm
 
-    assert pm.QdrantPoolSource("http://127.0.0.1:1", "c")._client._client._timeout == 30
-    assert pm.QdrantPoolSource("http://127.0.0.1:1", "c", timeout=7)._client._client._timeout == 7
+    _FakeClient.seen = []
+    monkeypatch.setattr(qdrant_client, "QdrantClient", _FakeClient)
+    pm.QdrantPoolSource("http://q:6333", "c")
+    pm.QdrantPoolSource("http://q:6333", "c", timeout=7)
+    assert [k["timeout"] for k in _FakeClient.seen] == [config.DEFAULT_QDRANT_TIMEOUT_S, 7]
 
 
 def test_no_async_qdrant_client_is_built_anywhere():
