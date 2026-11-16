@@ -403,7 +403,14 @@ async def process_memory_raw_batch(ctx: dict, items: list[dict]) -> dict:
     service: MemoryService = ctx["service"]
 
     dedup_ids: set[str] = set()
-    memories = await asyncio.to_thread(service.store_raw_batch, items, dedup_ids=dedup_ids)
+    # Graph enrichment (slow Graphiti extraction) is deferred to the graph
+    # queue, one job per stored row, exactly like process_memory_raw: a 25-item
+    # checkpoint must not run 25 add_episode calls inside this fast-queue job.
+    graph_jobs: list[dict] = []
+    memories = await asyncio.to_thread(
+        service.store_raw_batch, items, dedup_ids=dedup_ids, graph_jobs=graph_jobs
+    )
+    graph_jobs_enqueued = await _enqueue_graph_jobs(ctx, graph_jobs, adapter=None)
 
     # Dedup survivors weren't re-enriched: queue the cheap stale-graph check
     # for each (same semantics as process_memory_raw's dedup hits).
@@ -444,7 +451,12 @@ async def process_memory_raw_batch(ctx: dict, items: list[dict]) -> dict:
             })
         _rebuild_category_index(registry)
 
-    return {"memories": [m.model_dump(exclude_none=True) for m in memories]}
+    return {
+        "memories": [m.model_dump(exclude_none=True) for m in memories],
+        # Rows whose graph enrichment was handed to the graph queue (the rest of
+        # graph_jobs, if any, were enriched inline after an enqueue failure).
+        "graph_jobs_enqueued": graph_jobs_enqueued,
+    }
 
 
 async def _enqueue_graph_jobs(ctx: dict, jobs: list[dict], adapter: str | None) -> int:
@@ -495,6 +507,7 @@ async def _enqueue_graph_jobs(ctx: dict, jobs: list[dict], adapter: str | None) 
                     memory_id=job["memory_id"],
                     source_ref=job.get("source_ref"),
                     graph_ontology=graph_ontology,
+                    workspace=job.get("workspace"),
                 )
             except Exception as e2:  # noqa: BLE001 — enrichment is best-effort
                 logger.warning(
