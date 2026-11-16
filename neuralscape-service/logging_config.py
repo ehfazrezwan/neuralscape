@@ -16,7 +16,7 @@ from config import settings
 REQUEST_ID_HEADER = "X-Request-ID"
 # An incoming id is echoed into logs and a response header, so accept only a
 # short token of safe characters; anything else is replaced by a generated id.
-_SANE_REQUEST_ID = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
+_SANE_REQUEST_ID = re.compile(r"[A-Za-z0-9._:-]{1,128}")
 
 _ARQ_LOGGERS = ("arq", "arq.worker", "arq.jobs", "arq.connections", "arq.cron")
 
@@ -26,7 +26,7 @@ def _request_id_from(scope) -> str:
     for name, value in scope.get("headers") or ():
         if name.lower() == wanted:
             candidate = value.decode("latin-1")
-            if _SANE_REQUEST_ID.match(candidate):
+            if _SANE_REQUEST_ID.fullmatch(candidate):
                 return candidate
             break
     return uuid.uuid4().hex
@@ -49,6 +49,9 @@ class RequestIdMiddleware:
             return
 
         request_id = _request_id_from(scope)
+        # Kept on the scope too: the 500 handler runs outside this middleware,
+        # after the contextvar is gone, and reads the id from here.
+        scope.setdefault("state", {})["request_id"] = request_id
         structlog.contextvars.bind_contextvars(request_id=request_id)
 
         async def send_with_id(message) -> None:
@@ -64,6 +67,11 @@ class RequestIdMiddleware:
             await self.app(scope, receive, send_with_id)
         finally:
             structlog.contextvars.unbind_contextvars("request_id")
+
+
+def request_id_of(request) -> str | None:
+    """The id RequestIdMiddleware assigned to this request, if it ran."""
+    return (request.scope.get("state") or {}).get("request_id")
 
 
 def configure_logging(*, worker: bool = False) -> None:
@@ -104,12 +112,18 @@ def configure_logging(*, worker: bool = False) -> None:
         cache_logger_on_first_use=True,
     )
 
+    # JSON has no traceback rendering of its own; the console renderer does.
+    exc_processors: list[structlog.types.Processor] = (
+        [] if log_format == "console" else [structlog.processors.format_exc_info]
+    )
+
     formatter = structlog.stdlib.ProcessorFormatter(
         # Plain ``logging.getLogger`` records (most of the service) get the
         # level, logger name, timestamp and the bound request/job ids too.
         foreign_pre_chain=shared_processors,
         processors=[
             structlog.stdlib.ProcessorFormatter.remove_processors_meta,
+            *exc_processors,
             renderer,
         ],
     )

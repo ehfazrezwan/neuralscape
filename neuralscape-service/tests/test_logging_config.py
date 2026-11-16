@@ -164,7 +164,7 @@ def test_incoming_request_id_is_accepted_when_sane(capsys):
     assert inside["request_id"] == "trace-abc_123.4:5"
 
 
-@pytest.mark.parametrize("bad", ["has space", "x" * 129, "semi;colon", 'quo"te', "<script>"])
+@pytest.mark.parametrize("bad", ["good-id\n", "has space", "x" * 129, "semi;colon", 'quo"te', "<script>"])
 def test_unsafe_incoming_request_id_is_replaced(bad):
     resp = TestClient(_app_logging_in_request()).get("/ping", headers={REQUEST_ID_HEADER: bad})
     assert resp.headers[REQUEST_ID_HEADER] != bad
@@ -193,6 +193,50 @@ def test_request_id_is_on_auth_rejections_and_public_probes(monkeypatch):
     live = client.get("/health/live", headers={REQUEST_ID_HEADER: "probe-1"})
     assert live.status_code == 200
     assert live.headers[REQUEST_ID_HEADER] == "probe-1"
+
+
+def test_unhandled_500_keeps_the_request_id_in_header_and_log_line(capsys, monkeypatch):
+    import main
+
+    @main.app.get("/_boom_for_test")
+    async def boom():
+        raise RuntimeError("kaboom")
+
+    monkeypatch.setattr(settings, "neuralscape_auth_disabled", True)
+    monkeypatch.setattr(settings, "neuralscape_api_key", "")
+    monkeypatch.setattr(settings, "neuralscape_user_token_secret", "")
+    configure_logging()
+    try:
+        resp = TestClient(main.app, raise_server_exceptions=False).get(
+            "/_boom_for_test", headers={REQUEST_ID_HEADER: "boom-1"}
+        )
+    finally:
+        main.app.router.routes[:] = [r for r in main.app.router.routes if getattr(r, "path", "") != "/_boom_for_test"]
+    assert resp.status_code == 500
+    assert resp.headers[REQUEST_ID_HEADER] == "boom-1"
+    logged = [json.loads(line) for line in _lines(capsys)]
+    unhandled = next(r for r in logged if r["event"].startswith("Unhandled error"))
+    assert unhandled["request_id"] == "boom-1"
+    assert "request_id" not in structlog.contextvars.get_contextvars()
+
+
+# ── tracebacks ───────────────────────────────────────────────────
+
+
+def test_exceptions_render_a_traceback_string_in_json(capsys):
+    configure_logging()
+    try:
+        raise ValueError("boom-plain")
+    except ValueError:
+        logging.getLogger("tests.exc").exception("stdlib failure")
+    try:
+        raise ValueError("boom-native")
+    except ValueError:
+        structlog.get_logger("tests.exc").exception("native failure")
+    plain, native = [json.loads(line) for line in _lines(capsys)]
+    for record, marker in ((plain, "boom-plain"), (native, "boom-native")):
+        assert isinstance(record["exception"], str)
+        assert "Traceback" in record["exception"] and f"ValueError: {marker}" in record["exception"]
 
 
 # ── worker job context ───────────────────────────────────────────

@@ -400,7 +400,7 @@ SCENARIOS: tuple[Scenario, ...] = (
              "test_graph_removal_deletes_unsupported_edges_only_from_removed_episode", False,
              "An edge supported only by the removed episode is deleted; an unrelated edge is kept."),
     Scenario("readiness-probes-backends", "control", ("G2.03", "G2.04"),
-             "test_health_reports_an_unreachable_vector_store", False,
+             "test_health_reports_an_unreachable_vector_store", True,
              "Health probes the vector store for real, so an unreachable one is reported unhealthy (503)."),
     Scenario("readiness-controls", "control", ("G2.03",),
              "test_health_reports_an_uninitialized_vector_store_as_degraded", False,
