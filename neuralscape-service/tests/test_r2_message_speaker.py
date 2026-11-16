@@ -49,7 +49,7 @@ class TestAdapterEpisodeSourceMapping:
         """episode_source="message" → EpisodeType.message."""
         memory_graph.add(
             data="user: hello\nassistant: hi",
-            filters={"user_id": "u1"},
+            filters={"user_id": "u1", "group_id": "g1"},
             episode_source="message",
         )
 
@@ -61,7 +61,7 @@ class TestAdapterEpisodeSourceMapping:
         """episode_source="text" → EpisodeType.text."""
         memory_graph.add(
             data="Single fact about something",
-            filters={"user_id": "u1"},
+            filters={"user_id": "u1", "group_id": "g1"},
             episode_source="text",
         )
 
@@ -73,7 +73,7 @@ class TestAdapterEpisodeSourceMapping:
         """No episode_source kwarg → defaults to "text" → EpisodeType.text (legacy)."""
         memory_graph.add(
             data="Single fact",
-            filters={"user_id": "u1"},
+            filters={"user_id": "u1", "group_id": "g1"},
         )
 
         mock_graphiti.add_episode.assert_called_once()
@@ -84,7 +84,7 @@ class TestAdapterEpisodeSourceMapping:
         """Unknown episode_source value → falls back to EpisodeType.text."""
         memory_graph.add(
             data="Some data",
-            filters={"user_id": "u1"},
+            filters={"user_id": "u1", "group_id": "g1"},
             episode_source="unknown_type",
         )
 

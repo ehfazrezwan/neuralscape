@@ -97,7 +97,10 @@ ENTRIES:
 def _call_gemini(prompt: str) -> str:
     """Call Gemini synchronously (for use via asyncio.to_thread)."""
     model = compiler_settings.get_llm_model(core_settings.gemini_llm_model)
-    client = genai.Client(api_key=core_settings.google_api_key)
+    client = genai.Client(
+        api_key=core_settings.google_api_key,
+        http_options=core_settings.gemini_http_options(),
+    )
     from usage_capture import current_operation, record_failed_provider_attempt, record_generation_usage
 
     try:

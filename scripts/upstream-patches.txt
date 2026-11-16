@@ -23,6 +23,7 @@
 patched graphiti/graphiti_core/cross_encoder/gemini_reranker_client.py
 patched graphiti/graphiti_core/driver/neo4j_driver.py
 patched graphiti/graphiti_core/embedder/gemini.py
+patched graphiti/graphiti_core/graphiti.py
 patched graphiti/graphiti_core/llm_client/config.py
 patched graphiti/graphiti_core/llm_client/gemini_client.py
 patched graphiti/graphiti_core/search/search.py
@@ -35,8 +36,11 @@ owned graphiti/graphiti_core/llm_client/hybrid_decision_client.py
 
 # --- mem0 (patched) ---
 patched mem0/mem0/configs/embeddings/base.py
+patched mem0/mem0/configs/llms/base.py
 patched mem0/mem0/configs/vector_stores/qdrant.py
+patched mem0/mem0/embeddings/gemini.py
 patched mem0/mem0/embeddings/openai.py
+patched mem0/mem0/llms/gemini.py
 patched mem0/mem0/graphs/configs.py
 patched mem0/mem0/memory/main.py
 patched mem0/mem0/memory/graphiti_memory.py
