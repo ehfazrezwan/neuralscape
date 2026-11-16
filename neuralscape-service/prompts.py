@@ -196,6 +196,23 @@ the output contract.
 """
 
 
+# Ingest-only addendum (default text-ingest extractor): distilled facts must not
+# change how strongly the source states something. Inserted before the document
+# text, so the JSON output contract above is unchanged.
+INGEST_MODALITY_RULE = """9. PRESERVE MODALITY. Keep the source's strength of obligation exactly as written: "should", "may", "could", "might", "recommend", "suggest" and "ideally" must stay soft (do not turn them into "must", "required", "mandatory" or "always"); a proposal, question or tentative finding must stay a proposal, question or tentative finding, not an adopted rule. Use "must"/"required" only when the source itself says so. Never add a stronger modal than the source has.
+
+"""
+
+
+def add_ingest_modality_rule(prompt_content: str) -> str:
+    """Insert :data:`INGEST_MODALITY_RULE` ahead of the ``CONVERSATION:`` marker."""
+    marker = "CONVERSATION:\n"
+    i = prompt_content.rfind(marker)
+    if i < 0:
+        return prompt_content
+    return prompt_content[:i] + INGEST_MODALITY_RULE + prompt_content[i:]
+
+
 def append_operator_guidance(prompt_content: str, guidance: str | None) -> str:
     """Append the clearly-delimited operator-guidance addendum (E4).
 

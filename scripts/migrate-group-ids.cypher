@@ -24,8 +24,8 @@
 //   project--{id} (and the bare "global") to the PRIVATE pool
 //   user--<uid>--project--{id}, via the service's own driver, with a
 //   dry-run default. It does NOT handle project:{id} rows.
-//   This file handles BOTH legacy shapes with plain cypher-shell, and covers
-//   Saga nodes. The two agree when you pass the private prefix:
+//   This file handles BOTH legacy shapes with plain cypher-shell (both tools
+//   cover node labels incl. Saga and all relationship types). The two agree when you pass the private prefix:
 //     single-owner install (the normal case)  ->
 //         target_prefix => 'user--<uid>--project--'   (same as --owner <uid>)
 //     rows that are genuinely team knowledge  ->

@@ -19,8 +19,8 @@ and then re-running ``store_raw`` (which will write the matching
 ``shared``/``shared--project--...`` graph entries on next ingestion).
 
 Usage:
-    python scripts/migrate_graph_groups.py --owner ehfaz                    # dry-run
-    python scripts/migrate_graph_groups.py --owner ehfaz --apply
+    python scripts/migrate_graph_groups.py --owner ehfaz --target-format legacy            # dry-run (default)
+    python scripts/migrate_graph_groups.py --owner ehfaz --target-format legacy --apply
     python scripts/migrate_graph_groups.py --audit-delimiter-ids            # read-only
 
 ``--audit-delimiter-ids`` (no Neo4j needed) lists the memories whose graph group
@@ -32,10 +32,23 @@ memory keeps its group id byte for byte, so only the listed rows need attention:
 their graph facts under the old (ambiguous) group should be re-enriched into the
 new group (edit the memory, or re-ingest it). The audit never writes anything.
 
+Safe to re-run: the rewrite is idempotent (a second run finds no legacy group and changes
+nothing). If the owner's target group (for example ``user--<owner>``) already holds data,
+the legacy rows are MERGED into it, not replaced. Each legacy group is renamed in ONE
+transaction, so a very large group can exhaust memory or hit the transaction timeout;
+batching is not implemented (a stated limit), so run it where such a group fits.
+
+Rewrites node group ids (Episodic, Entity, Community, Saga) AND edge group ids
+(``RELATES_TO`` / ``MENTIONS`` / ``HAS_MEMBER`` / ``HAS_EPISODE`` / ``NEXT_EPISODE``
+relationships), naming each target with the service's own group-id builder in the
+format you choose with ``--target-format`` (it refuses to run when that disagrees with
+the service's current setting, unless ``--force``). Every legacy group becomes PRIVATE
+to ``--owner``. Each legacy group is renamed in one transaction and verified afterwards. Run it once, on a deployment that
+predates the multi-user model; on a current install it finds nothing and exits.
+
 Relationship to ``scripts/migrate-group-ids.cypher`` (repo root): that file is
 a plain cypher-shell alternative that ALSO handles the ``project:{pid}`` shape
-(mem0's Graphiti adapter fallback) and Saga nodes, and takes an explicit
-``target_prefix``. For ``project--{pid}`` rows the two agree when that file is
+(mem0's Graphiti adapter fallback) and takes an explicit ``target_prefix``. For ``project--{pid}`` rows the two agree when that file is
 run with ``target_prefix => 'user--<owner>--project--'`` (this script's
 ``--owner`` mapping). Use this script for ``global`` and ``project--`` rows with
 its dry-run default; use the cypher file for ``project:`` rows, or to send
@@ -117,6 +130,106 @@ def audit_delimiter_ids(client, collection: str) -> list[dict]:
             return out
 
 
+# Graphiti stores group_id on these node labels and on these relationship types.
+# (Entity edges are ``RELATES_TO`` *relationships*; there is no ``EntityEdge`` node
+# label, so a node-only rewrite silently leaves every fact's edge in the legacy group.)
+NODE_LABELS = ("Episodic", "Entity", "Community", "Saga")
+REL_TYPES = ("RELATES_TO", "MENTIONS", "HAS_MEMBER", "HAS_EPISODE", "NEXT_EPISODE")
+TARGET_FORMATS = ("legacy", "injective")
+
+
+def current_format(settings) -> str:
+    """The group-id format the running service uses (``GRAPH_GROUP_ID_INJECTIVE_ENABLED``)."""
+    return "injective" if settings.graph_group_id_injective_enabled else "legacy"
+
+
+def rewrite_target(group_id: str, owner: str, fmt: str = "legacy") -> str | None:
+    """The group id (in format ``fmt``) for a legacy one, or None when it is not legacy.
+
+    ``fmt`` is explicit: the result never depends on the process's flag state. The service's
+    own builder (``memory.groups._build_group_id``) names the target with the flag forced to
+    ``fmt``, so the name cannot drift from what the service reads and writes in that format.
+    """
+    from config import settings  # noqa: E402
+    from memory.groups import _build_group_id  # noqa: E402
+
+    if fmt not in TARGET_FORMATS:
+        raise ValueError(f"unknown target format {fmt!r}")
+    if group_id == "global":
+        args = ("private", owner, None, None)
+    elif group_id.startswith("project--") and len(group_id) > len("project--"):
+        args = ("private", owner, group_id[len("project--"):], None)
+    else:
+        return None
+    was = settings.graph_group_id_injective_enabled
+    settings.graph_group_id_injective_enabled = fmt == "injective"
+    try:
+        return _build_group_id(*args)
+    finally:
+        settings.graph_group_id_injective_enabled = was
+
+
+def scan_legacy_groups(session, owner: str, fmt: str = "legacy") -> dict[str, list[tuple[str, str, int]]]:
+    """Per node label / relationship type: ``[(legacy_group_id, new_group_id, row_count)]``."""
+    where = "x.group_id = 'global' OR x.group_id STARTS WITH 'project--'"
+    plan: dict[str, list[tuple[str, str, int]]] = {}
+    queries = [(f"{label}", f"MATCH (x:{label}) WHERE {where} RETURN x.group_id AS g, count(x) AS c") for label in NODE_LABELS]
+    queries += [
+        (rel, f"MATCH ()-[x:{rel}]->() WHERE {where} RETURN x.group_id AS g, count(x) AS c")
+        for rel in REL_TYPES
+    ]
+    for kind, cypher in queries:
+        rows = []
+        for record in session.run(cypher):
+            new = rewrite_target(record["g"], owner, fmt)
+            if new is not None:
+                rows.append((record["g"], new, record["c"]))
+        plan[kind] = sorted(rows)
+    return plan
+
+
+def _remaining(session, old: str) -> int:
+    # Deliberately label-less: this is the verification step, so it counts ANY node or
+    # relationship still carrying the old group id, including labels this script does not list.
+    nodes = session.run("MATCH (x) WHERE x.group_id = $old RETURN count(x) AS c", old=old).single()["c"]
+    rels = session.run("MATCH ()-[x]->() WHERE x.group_id = $old RETURN count(x) AS c", old=old).single()["c"]
+    return nodes + rels
+
+
+def apply_rewrites(session, plan: dict[str, list[tuple[str, str, int]]], print_fn=print) -> int:
+    """Rewrite every planned legacy group id; returns the number of rows changed.
+
+    One transaction per legacy group id covers every label and relationship type, so an
+    interrupted run never leaves one group's facts split between old and new names; after
+    the commit the old name must be gone, or the run stops with an error.
+    """
+    by_old: dict[str, str] = {}
+    for per in plan.values():
+        for old, new, _ in per:
+            by_old[old] = new
+    per_kind = {kind: 0 for kind in plan}
+    updated = 0
+    for old, new in sorted(by_old.items()):
+        with session.begin_transaction() as tx:
+            for kind, per in plan.items():
+                if not any(o == old for o, _, _ in per):
+                    continue
+                if kind in NODE_LABELS:
+                    cypher = f"MATCH (x:{kind} {{group_id: $old}}) SET x.group_id = $new RETURN count(x) AS c"
+                else:
+                    cypher = f"MATCH ()-[x:{kind} {{group_id: $old}}]->() SET x.group_id = $new RETURN count(x) AS c"
+                n = tx.run(cypher, old=old, new=new).single()["c"]
+                per_kind[kind] += n
+                updated += n
+            tx.commit()
+        left = _remaining(session, old)
+        if left:
+            raise RuntimeError(f"verification failed: {left} rows still carry group_id {old!r} after the rewrite")
+    for kind, n in per_kind.items():
+        print_fn(f"  {kind:<11}  rewrote {n} rows")
+    return updated
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument(
@@ -128,6 +241,19 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--owner",
         help="The user_id every legacy group_id should be rewritten to belong to.",
+    )
+    parser.add_argument(
+        "--target-format",
+        choices=TARGET_FORMATS,
+        help="The group-id format to rewrite INTO ('legacy' = delimiter-joined names, 'injective' = "
+             "nsg1-- names). Required, and it must match the service's GRAPH_GROUP_ID_INJECTIVE_ENABLED "
+             "setting (use --force to override); a wrong choice renames every group to a name the service "
+             "does not read.",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Run even though --target-format disagrees with the service's current setting.",
     )
     parser.add_argument(
         "--apply",
@@ -153,6 +279,18 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if not args.owner:
         parser.error("--owner is required (unless --audit-delimiter-ids)")
+    if not args.target_format:
+        parser.error("--target-format legacy|injective is required (unless --audit-delimiter-ids)")
+    live = current_format(settings)
+    print(f"Target format: {args.target_format} (service is configured for: {live})")
+    if args.target_format != live and not args.force:
+        print(
+            f"error: --target-format {args.target_format} disagrees with the service's current "
+            f"GRAPH_GROUP_ID_INJECTIVE_ENABLED setting ({live}); refusing. Use --force only if you are "
+            "migrating ahead of a deliberate flag change.",
+            file=sys.stderr,
+        )
+        return 2
 
     from neo4j import GraphDatabase  # noqa: E402
 
@@ -165,36 +303,16 @@ def main(argv: list[str] | None = None) -> int:
         auth=(settings.neo4j_user, settings.neo4j_password),
     )
 
-    # Graphiti puts group_id on Episodic, Entity, EntityEdge, and Community nodes.
-    # We rewrite all of them. The Cypher uses a CASE expression so each row
-    # gets the right new value based on whether its old group_id had the
-    # `project--` prefix or was the bare `"global"` namespace.
-    targets = ["Episodic", "Entity", "EntityEdge", "Community"]
     new_owner = args.owner
-
-    plan: dict[str, dict[str, int]] = {}
     with driver.session(database=settings.neo4j_database) as session:
-        for label in targets:
-            count_legacy_global = session.run(
-                f"MATCH (n:{label}) WHERE n.group_id = 'global' RETURN count(n) AS c"
-            ).single()["c"]
-            count_legacy_project = session.run(
-                f"MATCH (n:{label}) WHERE n.group_id STARTS WITH 'project--' "
-                f"RETURN count(n) AS c"
-            ).single()["c"]
-            plan[label] = {
-                "global": count_legacy_global,
-                "project": count_legacy_project,
-                "total": count_legacy_global + count_legacy_project,
-            }
+        plan = scan_legacy_groups(session, new_owner, args.target_format)
 
-    total_overall = sum(p["total"] for p in plan.values())
+    total_overall = sum(n for per in plan.values() for _, _, n in per)
     print(f"Legacy group_id audit (owner = {new_owner!r}):")
-    for label, p in plan.items():
-        print(
-            f"  {label:<11}  global → user--{new_owner}: {p['global']:>5}"
-            f"   |  project--<x> → user--{new_owner}--project--<x>: {p['project']:>5}"
-        )
+    for kind, per in plan.items():
+        print(f"  {kind:<11}  {sum(n for _, _, n in per):>5} rows in {len(per)} legacy group(s)")
+        for old, new, n in per:
+            print(f"      {old!r} -> {new!r}: {n}")
     print(f"  {'TOTAL':<11}  {total_overall} rows to rewrite")
 
     if not args.apply:
@@ -202,27 +320,13 @@ def main(argv: list[str] | None = None) -> int:
         driver.close()
         return 0
 
-    print(f"\nRewriting {total_overall} rows...")
-    updated_total = 0
+    print(
+        f"\nWARNING: every legacy 'global' and 'project--*' group becomes PRIVATE to {new_owner!r}. "
+        "Nothing is shared by this script."
+    )
+    print(f"Rewriting {total_overall} rows (one transaction per legacy group, verified afterwards)...")
     with driver.session(database=settings.neo4j_database) as session:
-        for label in targets:
-            # global -> user--{owner}
-            res = session.run(
-                f"MATCH (n:{label}) WHERE n.group_id = 'global' "
-                f"SET n.group_id = $new_id RETURN count(n) AS c",
-                new_id=f"user--{new_owner}",
-            )
-            n1 = res.single()["c"]
-            # project--xxx -> user--{owner}--project--xxx
-            res = session.run(
-                f"MATCH (n:{label}) WHERE n.group_id STARTS WITH 'project--' "
-                f"SET n.group_id = 'user--' + $owner + '--' + n.group_id "
-                f"RETURN count(n) AS c",
-                owner=new_owner,
-            )
-            n2 = res.single()["c"]
-            updated_total += n1 + n2
-            print(f"  {label:<11}  rewrote {n1 + n2} rows")
+        updated_total = apply_rewrites(session, plan, print_fn=print)
     driver.close()
     print(f"Done: {updated_total} rows rewritten.")
     return 0

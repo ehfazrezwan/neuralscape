@@ -291,23 +291,44 @@ class TestWebhookGuard:
     def test_post_never_follows_redirects_and_caps_timeout(self, monkeypatch):
         captured = {}
 
-        def fake_httpx_post(url, **kwargs):
-            captured.update(kwargs, url=url)
-            return MagicMock(status_code=204)
+        class FakeClient:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def post(self, url, **kwargs):
+                captured["url"] = url
+                return MagicMock(status_code=204)
 
         import httpx
 
-        monkeypatch.setattr(httpx, "post", fake_httpx_post)
+        monkeypatch.setattr(webhooks, "_resolve", lambda host, port: ["203.0.113.7"])
+        monkeypatch.setattr(httpx, "Client", FakeClient)
         webhooks._post("https://x.test/hook", {"event": "queue.empty"})
+        assert captured["url"] == "https://x.test/hook"
         assert captured["follow_redirects"] is False
         assert captured["timeout"] <= 5.0
 
     def test_post_swallows_delivery_errors(self, monkeypatch):
         import httpx
 
-        monkeypatch.setattr(
-            httpx, "post", MagicMock(side_effect=httpx.ConnectError("refused"))
-        )
+        class BoomClient:
+            def __init__(self, **kwargs):
+                pass
+
+            def __enter__(self):
+                raise httpx.ConnectError("refused")
+
+            def __exit__(self, *exc):
+                return False
+
+        monkeypatch.setattr(webhooks, "_resolve", lambda host, port: ["203.0.113.7"])
+        monkeypatch.setattr(httpx, "Client", BoomClient)
         webhooks._post("https://x.test/hook", {})  # must not raise
 
 
