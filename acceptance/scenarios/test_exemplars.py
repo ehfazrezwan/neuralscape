@@ -15,7 +15,7 @@ from urllib.parse import urlparse
 
 import pytest
 
-from nsaccept import expect_check_fails, needs, negative_control, profiles, proves
+from nsaccept import expect_check_fails, needs, negative_control, precondition, profiles, proves
 from nsaccept.client import NSClient
 from nsaccept.pdfgen import make_pdf_with_image
 from nsaccept.upload import upload_files
@@ -100,5 +100,6 @@ def test_image_check_fails_for_another_user_and_for_a_made_up_id(a, b, exemplar)
     summaries = exemplar["result"].get("exemplars") or []
     assert summaries, "no exemplar was indexed"
     image_id = exemplar_id_from(summaries[0])
+    precondition(check_serves_image, a, image_id, what="the owner is served the exemplar image")
     expect_check_fails(check_serves_image, b, image_id)
     expect_check_fails(check_serves_image, a, "0" * 16)
