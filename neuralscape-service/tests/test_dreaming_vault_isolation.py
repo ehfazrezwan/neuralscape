@@ -29,3 +29,10 @@ def test_only_the_dream_diary_carries_another_users_private_text(tmp_path):
         if p.is_file() and ("Rust" in p.read_text() or "zqTOKEN" in p.read_text())
     )
     assert carriers == ["Dreams/user-someone-else.md"], carriers
+
+
+def test_dreams_index_is_not_a_diary_page_and_stays_clean(tmp_path):
+    reflect.write_diary(tmp_path / "Dreams", POOL, "## Dream\nRust zqTOKEN\n", source_memory_ids=["m1"])
+    refresh_bundle_indexes(tmp_path)
+    index = (tmp_path / "Dreams" / "index.md").read_text()
+    assert "zqTOKEN" not in index and "Rust" not in index

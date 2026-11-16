@@ -399,19 +399,23 @@ def test_unchanged_staged_id_set_is_skipped_without_llm_work(dream_env, swept):
 # ── multi-user isolation (privacy) ──────────────────────────────────
 
 
-def _vault_text(env, *, include_dreams: bool = False) -> str:
-    """Every vault file except ``Dreams/`` (the per-pool review diary).
+def _is_pool_diary(env, path) -> bool:
+    """Exactly the per-pool diary pages ``Dreams/<pool>.md`` (not ``Dreams/index.md``)."""
+    return path.parent == env.vault / "Dreams" and path.name != "index.md"
 
-    ``Dreams/<pool>.md`` is written for EVERY pool, other users' private pools
-    included, and cites their insight text: the owner accepted that as
-    single-operator by design. Everything else (Home, Me/, Knowledge/, Projects/,
-    cards, the OKF index files) must never carry another user's private content.
+
+def _vault_text(env, *, include_diaries: bool = False) -> str:
+    """Every vault file except the per-pool diary pages ``Dreams/<pool>.md``.
+
+    Those are written for EVERY pool, other users' private pools included, and
+    cite their insight text: the owner accepted that as single-operator by
+    design. Everything else, ``Dreams/index.md`` included, must never carry
+    another user's private content.
     """
-    dreams = env.vault / "Dreams"
     return "\n".join(
         p.read_text(encoding="utf-8", errors="ignore")
         for p in sorted(env.vault.rglob("*"))
-        if p.is_file() and (include_dreams or dreams not in p.parents)
+        if p.is_file() and (include_diaries or not _is_pool_diary(env, p))
     )
 
 
@@ -432,6 +436,16 @@ def test_other_users_private_pool_swept_but_never_leaks(dream_env, swept):
     assert not [h for h in mine if swept.other_tok in h.memory or "rust" in h.memory.lower()]
     theirs = env.service.search(query="Python FastAPI backend", user_id=swept.other_user, limit=20)
     assert not [h for h in theirs if "fastapi" in h.memory.lower()]
+
+
+def test_leak_scan_covers_the_dreams_index_but_not_the_pool_diaries(dream_env, swept):
+    env = dream_env
+    diary = env.vault / "Dreams" / "index.md"
+    assert diary.exists(), "Dreams/index.md missing: the scan's coverage cannot be shown"
+    assert not _is_pool_diary(env, diary)
+    others = [p for p in (env.vault / "Dreams").glob("*.md") if p.name != "index.md"]
+    assert others and all(_is_pool_diary(env, p) for p in others)
+    assert diary.read_text(encoding="utf-8") in _vault_text(env), "Dreams/index.md is not scanned"
 
 
 def test_dream_diary_is_written_for_every_pool_by_design(dream_env, swept):
