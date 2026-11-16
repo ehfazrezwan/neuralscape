@@ -410,12 +410,17 @@ def _mock_context_store(service, rows, total=None, standards=()):
 
 def _flt_keys(flt):
     """All FieldCondition keys reachable in a (nested) qdrant Filter."""
-    from qdrant_client.models import FieldCondition
+    from qdrant_client.models import FieldCondition, Filter, IsEmptyCondition
 
     out = []
     for bucket in (flt.must, flt.should, flt.must_not):
         for c in bucket or []:
-            out.extend([c.key] if isinstance(c, FieldCondition) else _flt_keys(c))
+            if isinstance(c, FieldCondition):
+                out.append(c.key)
+            elif isinstance(c, IsEmptyCondition):
+                out.append(c.is_empty.key)
+            elif isinstance(c, Filter):
+                out.extend(_flt_keys(c))
     return out
 
 

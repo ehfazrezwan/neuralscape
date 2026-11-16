@@ -186,13 +186,19 @@ class ReadsMixin:
         )
 
     def _global_context_filter(self, user_id: str):
-        """Caller's own global-scope rows, tombstones excluded."""
+        """Caller's own global-scope rows, tombstones excluded.
+
+        Memory workspace only (the condition recall's default uses), so a
+        caller's own reference-workspace rows never flood session-start context.
+        """
         from qdrant_client.models import FieldCondition, Filter, MatchValue
+        from memory.search import _workspace_filter
 
         return Filter(
             must=[
                 FieldCondition(key="user_id", match=MatchValue(value=user_id)),
                 FieldCondition(key="metadata.scope", match=MatchValue(value="global")),
+                _workspace_filter(["memory"]),
             ],
             must_not=[self._tombstone_condition()],
         )
@@ -213,10 +219,12 @@ class ReadsMixin:
             MatchExcept,
             MatchValue,
         )
+        from memory.search import _workspace_filter
 
         own = Filter(
             must=[
                 FieldCondition(key="user_id", match=MatchValue(value=user_id)),
+                _workspace_filter(["memory"]),
                 Filter(
                     should=[
                         FieldCondition(
