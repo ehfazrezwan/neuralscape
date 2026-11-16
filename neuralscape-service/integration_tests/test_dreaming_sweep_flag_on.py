@@ -43,11 +43,18 @@ SEED = {
     "secret": ("task_context", "The staging API key is sk-e2e-FAKE-abc123456789 for testing"),
     "live": ("task_context", "The payment module validates cards through validate_card() in billing.py"),
 }
-OTHER_SEED = [  # minimum for a second pool that still reaches the reflection pass
+# A second pool that must reach the reflection pass AND still hold at least two
+# live rows after the sweep's own consolidation. The consolidation stage may merge
+# near-duplicates, fold a pattern into one row, or prune a row it judges noise or
+# credential-like (a gate-cleared secret prune hard-deletes), so these rows are
+# deliberately unrelated to each other (no shared topic, no pattern of three) and
+# each states a distinct, substantive fact. One carries the leak marker.
+OTHER_SEED = [
     ("preference", "User prefers Rust for systems work and keeps a {tok} cheat sheet"),
+    ("personal_fact", "The user is a native Portuguese speaker who lives in Lisbon"),
+    ("preference", "The user drinks green tea instead of coffee in the morning"),
     ("workflow", "The user profiles every release build before shipping"),
-    ("workflow", "The user benchmarks the hot path after each refactor"),
-    ("workflow", "The user reviews flamegraphs before merging performance changes"),
+    ("decision", "The user chose a standing desk with a walnut top for the home office"),
 ]
 PROJECT_SEED = [
     "The project backend is a FastAPI service using Python 3.12",
