@@ -260,16 +260,44 @@ class CoreMixin:
         return self._genai_model
 
     def close(self):
-        """Clean up resources."""
+        """Clean up resources: Graphiti driver, bridge loop, Qdrant and embedder clients.
+
+        Idempotent (a second call is a no-op). The Qdrant and embedder client
+        closes never raise; a failure closing the Graphiti driver still
+        propagates, after everything else has been released.
+        """
+        if getattr(self, "_closed", False):
+            return
+        self._closed = True
         try:
             if self._graphiti and self._bridge:
                 self._bridge.run(self._graphiti.close())
         finally:
             # Stop the bridge loop AFTER the driver closed on it (even when that
             # close raised), so no task or driver outlives its loop.
-            shutdown = getattr(self._bridge, "shutdown", None)
-            if callable(shutdown):
-                shutdown()
+            try:
+                shutdown = getattr(self._bridge, "shutdown", None)
+                if callable(shutdown):
+                    shutdown()
+            finally:
+                self._close_http_clients()
+
+    def _close_http_clients(self) -> None:
+        """Best-effort close of the Qdrant client and the embedder's HTTP client."""
+        memory = self._memory
+        if memory is None:
+            return
+        for owner, attr in (
+            (getattr(memory, "vector_store", None), "client"),
+            (getattr(memory, "embedding_model", None), "client"),
+        ):
+            client = getattr(owner, attr, None)
+            closer = getattr(client, "close", None)
+            if callable(closer):
+                try:
+                    closer()
+                except Exception as e:  # noqa: BLE001 - shutdown must not raise from here
+                    logger.debug("client close failed (ignored): %s", e)
 
     def _ensure_created_at_index(self) -> None:
         """Best-effort: ensure a DATETIME payload index on ``created_at``.

@@ -412,3 +412,70 @@ def unique_ns(request):
     if errors:
         # Leaked data would poison later runs: make the teardown an error.
         pytest.fail(redact(f"unique_ns cleanup failed: {errors}"), pytrace=False)
+
+
+# --------------------------------------------------------------------------
+# MemoryService teardown: close every service a test (or fixture) builds
+# --------------------------------------------------------------------------
+#
+# Each MemoryService that reaches its lazy init owns a Graphiti bridge (an
+# event-loop thread plus its selector and wake-up sockets), a Neo4j driver pool,
+# a Qdrant client and an embedder HTTP client. Most integration tests build one
+# and never close it, so a long run piles up file descriptors until the process
+# hits its NOFILE limit (the gate died with "Too many open files" while writing
+# the junit file). Tracking at construction needs no edit to the test files and
+# no product hook: one session-wide wrapper around the mixin ``__init__`` records
+# every instance, and autouse fixtures close what was created in their scope.
+# ``MemoryService.close()`` is idempotent, so tests that close their own are safe.
+
+_TRACKED_SERVICES: list = []
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _track_memory_services():
+    try:
+        import third_party_telemetry  # noqa: F401  (guard must precede service imports)
+        from memory import core as _core
+    except Exception:  # noqa: BLE001 - tests that never touch the service still run
+        yield
+        return
+    original = _core.CoreMixin.__init__
+
+    def tracking_init(self, *args, **kwargs):
+        original(self, *args, **kwargs)
+        _TRACKED_SERVICES.append(self)
+
+    _core.CoreMixin.__init__ = tracking_init
+    try:
+        yield
+    finally:
+        _core.CoreMixin.__init__ = original
+        _close_tracked_services(0)
+
+
+def _close_tracked_services(start: int) -> None:
+    """Close (and forget) every service tracked since index ``start``, newest first."""
+    services = _TRACKED_SERVICES[start:]
+    del _TRACKED_SERVICES[start:]
+    shared = sys.modules.get("memory_service")
+    for svc in reversed(services):
+        try:
+            svc.close()
+        except Exception:  # noqa: BLE001 - teardown is best effort
+            pass
+        if shared is not None and getattr(shared, "_shared_service", None) is svc:
+            shared._shared_service = None  # the next get_shared_service() builds a fresh one
+
+
+@pytest.fixture(autouse=True)
+def _close_services_built_by_the_test(_track_memory_services):
+    mark = len(_TRACKED_SERVICES)
+    yield
+    _close_tracked_services(mark)
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _close_services_built_by_module_fixtures(_track_memory_services):
+    mark = len(_TRACKED_SERVICES)
+    yield
+    _close_tracked_services(mark)
