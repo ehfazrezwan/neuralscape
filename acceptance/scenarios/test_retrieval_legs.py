@@ -5,7 +5,7 @@ away when that leg is broken:
 
 - the keyword (BM25) leg and the pool's rank fusion: a memory that only a
   rare token can find is still returned although closer-in-meaning decoys
-  fill the dense leg (the fix for the "keyword-only hits sink" bug, read-01);
+  fill the dense leg (the fix for the "keyword-only hits sink" bug, PR 463);
 - the BM25 slot and encoder reported by ``/health``;
 - the verbatim-episode leg and the vector/graph merit merge of unified recall
   (rows without a score only ever fill slots below scored rows);
@@ -209,7 +209,7 @@ def test_a_bare_rare_token_recalls_its_exact_memory_among_near_miss_spellings(a,
     """Each rare token is stored next to three spellings one character away (other whole tokens, near-identical
     embeddings), and the recall limit (2) is smaller than that family, so the dense leg cannot tell the exact
     token from its near-misses. Each exact-token memory must still be among the top two vector rows: that
-    takes the keyword leg and the pool's rank fusion (read-01). It cannot be asserted FIRST: a lexical-only hit
+    takes the keyword leg and the pool's rank fusion (PR 463). It cannot be asserted FIRST: a lexical-only hit
     ties with the dense leg's first hit in the rank fusion. Chance of passing without the keyword leg: about
     (2/12)^3, i.e. 1 in 200."""
     assert not rare["error"], rare["error"]
