@@ -43,7 +43,10 @@ def test_both_timeouts_are_applied(monkeypatch):
     fake = types.SimpleNamespace(connect=lambda dsn, **kw: Conn())
     monkeypatch.setitem(sys.modules, "psycopg", fake)
     try:
-        usage_store.PostgresUsageStore("dbname=x", statement_timeout_ms=5000, lock_timeout_ms=2000)
+        usage_store.PostgresUsageStore(
+            "dbname=x", statement_timeout_ms=5000, lock_timeout_ms=2000, append_budget_s=1.5
+        )
     except _Stop:
         pass
-    assert seen == [("statement_timeout", "5000ms"), ("lock_timeout", "2000ms")]
+    # The session's timeouts are the write budget; the longer ones are for reads, per transaction.
+    assert seen == [("statement_timeout", "1500ms"), ("lock_timeout", "1500ms")]

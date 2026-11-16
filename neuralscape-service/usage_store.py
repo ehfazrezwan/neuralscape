@@ -111,6 +111,12 @@ def _checksum(statements: list[str]) -> str:
     return hashlib.sha256("\n".join(statements).encode("utf-8")).hexdigest()
 
 
+class _WriteDeadline:
+    """Set by the deadline timer of one write attempt when it fires."""
+
+    fired = False
+
+
 class _SqlUsageStore:
     dialect = ""
     _insert_time = "?"
@@ -416,11 +422,19 @@ class PostgresUsageStore(_SqlUsageStore):
     """PostgreSQL usage store.
 
     One connection, reopened when it drops (a restart, a failover, a killed backend) and never held
-    across an unbounded wait: an append has a short budget (``append_budget_s``) covering the wait for
-    the connection lock, the statement and one reconnect-and-retry (the insert is idempotent), so a slow
-    or absent database costs the provider-call thread at most that budget.  Reads and the rollup use the
-    longer session timeouts.  After a failed reconnect the store fails fast for ``reconnect_cooldown_s``
-    instead of paying a connect timeout on every call.
+    across an unbounded wait: a write (an append or a gap count) has a short budget (``append_budget_s``)
+    covering the wait for the connection lock, the transaction's setup (``BEGIN``, the timeouts), the
+    statement and one reconnect-and-retry (the insert is idempotent), so a slow or absent database costs
+    the provider-call thread at most that budget.
+
+    The budget is enforced in three layers: the connection's *session* ``statement_timeout`` and
+    ``lock_timeout`` are the append budget, so even ``BEGIN`` and the timeout statement are bounded by the
+    server; the remaining budget is applied again inside the transaction after setup; and a client-side
+    timer cancels the running statement (``cancel_safe``) at the deadline, whatever it is stuck on, and the
+    call raises :class:`UsageStoreError`.  Reads, the rollup and migrations ask for the longer timeouts
+    (``statement_timeout_ms``, ``lock_timeout_ms``) with ``SET LOCAL`` inside their own transactions.
+    After a failed reconnect the store fails fast for ``reconnect_cooldown_s`` instead of paying a connect
+    timeout on every call.
     """
 
     dialect = "postgres"
@@ -456,15 +470,24 @@ class PostgresUsageStore(_SqlUsageStore):
         self._migrate()
 
     def _open_connection(self, connect_timeout: float) -> Any:
-        conn = self._psycopg.connect(self._dsn, autocommit=True, connect_timeout=connect_timeout)
-        # A stuck statement or a held lock (the migration advisory lock included) must fail
-        # the call, not hang the writer or the rollup route for ever.
-        for name, value in (
-            ("statement_timeout", self._statement_timeout_ms),
-            ("lock_timeout", self._lock_timeout_ms),
-        ):
-            conn.execute("SELECT set_config(%s, %s, false)", (name, f"{int(value)}ms"))
+        conn = self._psycopg.connect(
+            self._dsn,
+            autocommit=True,
+            connect_timeout=connect_timeout,
+            # Data sent and not acknowledged for this long fails the connection (a network stall the
+            # server's own timeouts cannot see); never shorter than the connect grace.
+            tcp_user_timeout=int(max(self._append_budget_s, 1.0) * 1000) + 1_000,
+        )
+        # The session's timeouts are the WRITE budget: a stuck statement, ``BEGIN`` included, or a held
+        # lock fails within it.  Reads, the rollup and migrations raise them for their own transaction
+        # (``_txn``); nothing waits on the longer values by default.
+        budget_ms = self._budget_ms()
+        for name in ("statement_timeout", "lock_timeout"):
+            conn.execute("SELECT set_config(%s, %s, false)", (name, f"{budget_ms}ms"))
         return conn
+
+    def _budget_ms(self) -> int:
+        return max(1, int(self._append_budget_s * 1000))
 
     @staticmethod
     def _assert_durable_settings(conn: Any) -> None:
@@ -555,10 +578,19 @@ class PostgresUsageStore(_SqlUsageStore):
         return sql.replace("?", "%s")
 
     @contextlib.contextmanager
-    def _txn(self, deadline: float | None = None) -> Iterator[Any]:
+    def _txn(self, deadline: float | None = None, *, long_timeouts: bool = True) -> Iterator[Any]:
+        """One transaction.  The session's timeouts are the short write budget; a read, the rollup or a
+        migration (``long_timeouts``) raises them for this transaction only (``SET LOCAL``), a write keeps
+        them and tightens them to what is left of its own deadline."""
+
         self._ensure_connection(deadline)
         try:
             with self._conn.transaction():
+                if long_timeouts:
+                    self._conn.execute(
+                        "SELECT set_config('statement_timeout', %s, true), set_config('lock_timeout', %s, true)",
+                        (f"{int(self._statement_timeout_ms)}ms", f"{int(self._lock_timeout_ms)}ms"),
+                    )
                 yield self._conn
         except Exception as error:
             if self._connection_failure(error):
@@ -571,10 +603,35 @@ class PostgresUsageStore(_SqlUsageStore):
             return self._append_budget_s
         return max(0.0, min(self._append_budget_s, float(budget_s)))
 
+    def _deadline_cancel(self, guard: "_WriteDeadline") -> None:
+        """Timer callback: the write's deadline passed, so cancel whatever the connection is running.
+
+        Runs on the timer thread.  ``cancel_safe`` opens a second connection to ask the server to cancel
+        (the driver's blocking call cannot be interrupted from here); the write's thread then sees the
+        cancelled statement and raises :class:`UsageStoreError`."""
+
+        guard.fired = True
+        conn = self._conn
+        if conn is None:
+            return
+        try:
+            cancel = getattr(conn, "cancel_safe", None)
+            if cancel is not None:
+                cancel(timeout=1.0)
+            else:
+                conn.cancel()
+        except Exception:  # noqa: BLE001 - the connection is dropped by the write's thread either way
+            pass
+
     def _run_write(self, work: Callable[[Any], Any], budget_s: float | None = None) -> Any:
         """A write (an append, a gap count) within the append budget: the wait for the connection
-        lock, the statement and, after a dropped connection, one reconnect and one retry (every
-        write here is idempotent or additive-and-recorded, and a failed first try did not commit)."""
+        lock, the transaction's setup, the statement and, after a dropped connection, one reconnect and
+        one retry (every write here is idempotent or additive-and-recorded, and a failed first try did
+        not commit).
+
+        A timer armed for the whole attempt cancels the running statement at the deadline (see
+        ``_deadline_cancel``) and the call raises :class:`UsageStoreError`, so a slow ``BEGIN``, a slow
+        timeout statement or a stalled network cannot stretch the call past its budget."""
 
         deadline = self._monotonic() + self._write_budget(budget_s)
         last: BaseException | None = None
@@ -584,26 +641,39 @@ class PostgresUsageStore(_SqlUsageStore):
                 break
             if not self._lock.acquire(timeout=remaining):
                 raise UsageStoreError("usage store busy: the append budget was spent waiting for the connection")
+            guard = _WriteDeadline()
+            timer = threading.Timer(max(0.0, deadline - self._monotonic()), self._deadline_cancel, args=(guard,))
+            timer.daemon = True
+            timer.start()
             try:
                 try:
-                    with self._txn(deadline) as c:
-                        # The statement budget is what is left after the (re)connect, not before it.
+                    with self._txn(deadline, long_timeouts=False) as c:
+                        # What is left after the (re)connect and ``BEGIN``, applied again to the statements.
                         left = deadline - self._monotonic()
                         if left <= 0:
-                            raise UsageStoreError("usage store append budget spent connecting")
+                            raise UsageStoreError("usage store append budget spent before the statement")
                         budget_ms = max(1, int(left * 1000))
                         c.execute(
                             "SELECT set_config('statement_timeout', %s, true),"
                             " set_config('lock_timeout', %s, true)",
                             (f"{budget_ms}ms", f"{budget_ms}ms"),
                         )
+                        if deadline - self._monotonic() <= 0:  # the setup itself used the rest
+                            raise UsageStoreError("usage store append budget spent in the transaction setup")
                         return work(c)
                 except Exception as error:
+                    if guard.fired:
+                        raise UsageStoreError("usage store write exceeded its deadline") from error
                     if attempt == 0 and self._connection_failure(error):
                         last = error
                         continue
                     raise
             finally:
+                timer.cancel()
+                if guard.fired:
+                    # A cancel was sent (or is in flight): never reuse the connection, so a late cancel
+                    # cannot hit the next write's statement.
+                    self._drop_connection()
                 self._lock.release()
         if last is not None:
             raise last
@@ -659,6 +729,8 @@ def uninstall_usage_capture(store: _SqlUsageStore | None) -> None:
 
     try:
         recorder = usage_capture.get_usage_recorder()
+        if hasattr(recorder, "wait_gap_flush"):
+            recorder.wait_gap_flush(timeout=5.0)  # a background cycle may hold claimed counts
         if hasattr(recorder, "flush_gaps"):
             recorder.flush_gaps()
     except Exception:

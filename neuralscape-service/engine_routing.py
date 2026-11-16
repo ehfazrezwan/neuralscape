@@ -251,6 +251,7 @@ class CatchUpReport:
     conflicts: list[tuple[str, str, int]] = field(default_factory=list)
     repaired_dirty: int = 0
     unrepaired: int = 0  # dirty keys that need content and had no canonical state to copy
+    skipped: int = 0  # canonical keys the source listed but could not read (nothing was projected for them)
 
 
 class RoutingError(Exception):
@@ -658,10 +659,21 @@ class EngineRouter:
         if self._phase is not RoutePhase.STEADY:
             raise RoutingError("backfill needs no open dual-write window")
         report = CatchUpReport()
-        for state in source.states():
-            self._copy_state(self._active.adapter, state, report)
-        if not report.conflicts:
-            self._active.synced = True
+        backend = self._active
+        try:
+            for state in source.states():
+                # One record at a time under the write lock: no live write can land between the engine's
+                # revision check and its write, so a newer revision is never overwritten with older labels.
+                with self._write_lock:
+                    if self._active is not backend:
+                        raise RoutingError("the serving engine changed during the backfill")
+                    self._copy_state(backend.adapter, state, report)
+        except BaseException:
+            backend.synced = False  # a run that failed part-way proves nothing: an earlier "synced" no longer holds
+            raise
+        report.skipped = int(getattr(source, "skipped", 0) or 0)
+        # Every run decides afresh: a later backfill that ends with conflicts withdraws an earlier clean one.
+        backend.synced = not report.conflicts
         self._notify("backfilled", {"copied": report.copied, "relabeled": report.relabeled, "tombstoned": report.tombstoned, "conflicts": len(report.conflicts)})
         return report
 

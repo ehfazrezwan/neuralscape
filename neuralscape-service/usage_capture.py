@@ -664,9 +664,15 @@ class DurableUsageRecorder:
       capture seams never name an event that is not in the store as a
       predecessor;
     * every event that could not be stored is counted per task and persisted as
-      a gap by :meth:`flush_gaps`, so a rollup reports the task as incomplete
-      rather than complete or missing.  Gaps wait in memory until the store takes
-      them: they are lost if the process dies first.
+      a gap, so a rollup reports the task as incomplete rather than complete or
+      missing.  Gaps wait in memory until the store takes them: they are lost if
+      the process dies first.
+
+    Gaps are written OFF the provider-call path: when a write succeeds while gaps are
+    waiting, a single background thread flushes them (``GAP_FLUSH_BUDGET_S`` per cycle, each
+    write within what is left of it), so recovery never adds to a provider call's latency; counts
+    a cycle does not reach stay for the next one.  :meth:`flush_gaps` is the synchronous flush
+    (shutdown); :meth:`wait_gap_flush` waits for a running background cycle.
     """
 
     #: Tells capture seams to write a pending event before each provider call.
@@ -677,6 +683,10 @@ class DurableUsageRecorder:
 
     #: Longest the retries of one event may take (the call runs on the provider-call thread).
     RECORD_BUDGET_S = 2.5
+
+    #: Longest one background gap-flush cycle runs.  Short on purpose: the flusher shares the store's
+    #: connection with the call path, so a gap write never holds it for longer than this.
+    GAP_FLUSH_BUDGET_S = 0.5
 
     def __init__(
         self,
@@ -704,6 +714,7 @@ class DurableUsageRecorder:
         # Keys a flush has claimed and not yet persisted or put back: they still hold a slot, so a failed
         # flush cycle cannot make room for a fresh set of keys (the map would grow by a flush each cycle).
         self._in_flight: dict[tuple[str, str], int] = {}
+        self._flusher: Any = None  # the running background flush thread, if any
         self.failures = 0
         #: Events that failed to store whose task could not even be remembered (the counter map was full).
         self.gaps_overflowed = 0
@@ -739,9 +750,9 @@ class DurableUsageRecorder:
                 break
             else:
                 if self._unrecorded:
-                    # The store is taking writes again.  Recovery shares what is left of this call's
-                    # budget; counts it does not reach stay in memory for the next call.
-                    self.flush_gaps(max_s=max(0.0, deadline - self._monotonic()))
+                    # The store is taking writes again: recover the gaps in the background, never on
+                    # this (provider-call) thread.
+                    self._start_gap_flush()
                 return True
         self.failures += 1
         key = (event.tenant_id, event.task_id)
@@ -788,6 +799,39 @@ class DurableUsageRecorder:
         if budget_s is not None and cls._accepts_budget(method):
             kwargs["budget_s"] = budget_s
         return method(*args, **kwargs)
+
+    def _start_gap_flush(self) -> None:
+        """Start one background flush cycle unless one is already running (never blocks, never raises)."""
+        import threading
+
+        try:
+            with self._lock:
+                if self._flusher is not None:
+                    return
+                thread = threading.Thread(target=self._background_flush, name="usage-gap-flush", daemon=True)
+                self._flusher = thread
+            thread.start()
+        except Exception:  # noqa: BLE001 - recovery is best effort; the counts stay for the next success
+            with self._lock:
+                self._flusher = None
+
+    def _background_flush(self) -> None:
+        try:
+            self.flush_gaps(max_s=self.GAP_FLUSH_BUDGET_S)
+        except Exception:  # noqa: BLE001 - never lets a daemon thread die loudly
+            logger.error("background usage gap flush failed", exc_info=True)
+        finally:
+            with self._lock:
+                self._flusher = None
+
+    def wait_gap_flush(self, timeout: float | None = None) -> bool:
+        """Wait for a running background flush cycle; ``True`` when none is running afterwards."""
+        with self._lock:
+            thread = self._flusher
+        if thread is not None:
+            thread.join(timeout)
+        with self._lock:
+            return self._flusher is None
 
     def flush_gaps(self, max_s: float | None = None) -> None:
         """Persist the per-task counts of events that could not be stored (best effort).

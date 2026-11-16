@@ -206,3 +206,115 @@ def test_a_projection_written_with_the_rows_scope_carries_the_global_label():
     switch.project_apply("t", "m1", text="likes tea", user_id="alice", visibility="private", project_id="p9",
                          scope="global", revision=1)
     assert store.get(ctx(), "m1").labels == ("owner:alice", "vis:private", "project:p9", "scope:global")
+
+
+# -- the relabel is fenced against a newer revision landing between the check and the write ---------------------------
+
+
+def _land_a_newer_revision_before_each_label_write(adapter, record):
+    """Make ``record`` (a newer revision) land in the store right before the adapter's relabel write."""
+
+    client = adapter._store.client
+    real = client.set_payload
+    landed = []
+
+    def set_payload(*args, **kwargs):
+        if not landed:
+            landed.append(True)
+            adapter.apply(ctx(), record)  # the newer revision arrives between the revision check and this write
+        return real(*args, **kwargs)
+
+    client.set_payload = set_payload
+    return landed
+
+
+def test_a_newer_revision_landing_between_the_check_and_the_relabel_keeps_its_own_labels():
+    adapter = _qdrant()
+    adapter.apply(ctx(), rec("m1", "likes coffee", LEGACY))
+    newer = rec("m1", "likes coffee now", PROJECT, revision=2)
+    landed = _land_a_newer_revision_before_each_label_write(adapter, newer)
+    with pytest.raises(PortFailure) as raised:
+        adapter.apply(ctx(), rec("m1", "likes coffee", GLOBAL))
+    assert landed and raised.value.code is InternalErrorCode.STALE_REVISION
+    held = adapter.get(ctx(), "m1")
+    assert (held.revision, held.text, held.labels) == (2, "likes coffee now", tuple(PROJECT))
+
+
+def test_a_removal_landing_between_the_check_and_the_relabel_is_not_overwritten_with_labels():
+    adapter = _qdrant()
+    adapter.apply(ctx(), rec("m1", "likes coffee", LEGACY))
+    client = adapter._store.client
+    real = client.set_payload
+
+    def set_payload(*args, **kwargs):
+        adapter.remove(ctx(), "m1", 1)
+        return real(*args, **kwargs)
+
+    client.set_payload = set_payload
+    with pytest.raises(PortFailure) as raised:
+        adapter.apply(ctx(), rec("m1", "likes coffee", GLOBAL))
+    assert raised.value.code is InternalErrorCode.IDEMPOTENCY_CONFLICT
+    assert adapter.get(ctx(), "m1") is None  # still removed
+
+
+def test_backfill_reports_the_raced_record_as_superseded_and_does_not_lose_the_newer_labels():
+    adapter = _qdrant()
+    adapter.apply(ctx(), rec("m1", "likes coffee", LEGACY))
+    _land_a_newer_revision_before_each_label_write(adapter, rec("m1", "likes coffee now", PROJECT, revision=2))
+    router = EngineRouter(Backend("e", adapter))
+    report = router.backfill(Source(CanonicalState("t", "m1", 1, False, "likes coffee", GLOBAL)))
+    assert (report.superseded, report.relabeled, report.conflicts) == (1, 0, [])
+    held = adapter.get(ctx(), "m1")
+    assert (held.revision, held.labels) == (2, tuple(PROJECT))
+
+
+def test_a_live_write_cannot_land_inside_a_backfills_copy_of_one_record():
+    """Across the engine's check and write the router's write lock is held, so a live write waits for it."""
+
+    import threading
+
+    adapter = _qdrant()
+    adapter.apply(ctx(), rec("m1", "likes coffee", LEGACY))
+    router = EngineRouter(Backend("e", adapter))
+    client = adapter._store.client
+    real = client.set_payload
+    finished_inside_the_gap = []
+
+    def set_payload(*args, **kwargs):
+        worker = threading.Thread(
+            target=lambda: router.apply(router.route(), ctx(), rec("m1", "likes coffee now", PROJECT, revision=2))
+        )
+        worker.start()
+        worker.join(timeout=0.4)
+        finished_inside_the_gap.append(not worker.is_alive())
+        result = real(*args, **kwargs)
+        set_payload.worker = worker
+        return result
+
+    client.set_payload = set_payload
+    report = router.backfill(Source(CanonicalState("t", "m1", 1, False, "likes coffee", GLOBAL)))
+    set_payload.worker.join(timeout=5)
+    assert finished_inside_the_gap == [False]  # the live write waited for the copy to finish
+    assert report.relabeled == 1
+    held = adapter.get(ctx(), "m1")
+    assert (held.revision, held.labels) == (2, tuple(PROJECT))
+
+
+def test_project_row_projects_the_current_row_with_its_scope_label():
+    store = _reference()
+    row = SimpleNamespace(memory="likes tea", owner_user_id="alice", visibility="private", project_id="p9", scope="global")
+    service = SimpleNamespace(get_memory=lambda memory_id: row if memory_id == "m1" else None)
+    ledger = SimpleNamespace(get_tombstone=lambda t, m: None, get_object_ref=lambda t, m, r: object() if r == 1 else None)
+    switch = EngineSwitch(EngineRouter(Backend("e", store)), ledger=ledger, service=service, tenant_for=lambda user: "t")
+    switch.project_row("t", "m1")
+    held = store.get(ctx(), "m1")
+    assert (held.text, held.revision) == ("likes tea", 1)
+    assert held.labels == ("owner:alice", "vis:private", "project:p9", "scope:global")
+    switch.project_row("t", "missing")  # no row: nothing is projected, nothing raises
+    assert store.get(ctx(), "missing") is None
+
+
+def test_project_apply_needs_the_scope_so_a_global_row_cannot_lose_its_label():
+    switch = EngineSwitch(EngineRouter(Backend("e", _reference())), ledger=None, service=None, tenant_for=lambda u: "t")
+    with pytest.raises(TypeError):
+        switch.project_apply("t", "m1", text="x", user_id="alice", project_id="p9")

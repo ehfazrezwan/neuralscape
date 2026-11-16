@@ -282,12 +282,14 @@ class Settings(BaseSettings):
     engine_pgvector_dimensions: int = 0
 
     # ── Engine routing (V3 switch; default OFF) ───────────────────────────
-    # When enabled, the vector stage of ledger writes/edits/deletes also projects
-    # the memory into a routed engine (generation 1 = a Qdrant projection
-    # collection), an operator can run dual-write/catch-up/flip/rollback through
-    # the dictator-only /v1/admin/engine-switch/* routes, and, if
-    # ENGINE_ROUTING_RECALL_ENABLED, /v1/search serves its vector recall from the
-    # routed engine.  The router keeps its state in one process: enable only
+    # When enabled, an operator can run dual-write/catch-up/flip/rollback of a routed engine
+    # (generation 1 = a Qdrant projection collection) through the dictator-only
+    # /v1/admin/engine-switch/* routes.  NOTHING in this revision projects ledger writes, edits or
+    # deletes into that engine: the producer is a later change.  Until it lands, the routed engine
+    # holds only what a backfill copied, so ENGINE_ROUTING_RECALL_ENABLED is INERT: /v1/search keeps
+    # serving from the ordinary path and the engine reports routed recall as refused
+    # (projection_producer_inactive).  Once a producer exists, recall is served from the routed
+    # engine only after a clean backfill.  The router keeps its state in one process: enable only
     # where the API and the ledger worker share a process.
     engine_routing_enabled: bool = False
     engine_routing_recall_enabled: bool = False

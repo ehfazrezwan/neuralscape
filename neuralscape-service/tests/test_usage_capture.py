@@ -380,13 +380,17 @@ def test_failed_gap_flush_keeps_the_count_for_a_later_flush():
     assert store.gaps == 3 and recorder.unrecorded == {}
 
 
-def test_gap_recovery_on_the_provider_call_path_is_bounded_by_the_record_budget():
-    """Before: one successful append flushed every pending task gap synchronously, so 1,000 pending tasks at
-    100 ms a write held the provider-call thread for 100 s.  Counts the budget does not reach are kept."""
+def test_gap_recovery_runs_off_the_provider_call_thread_and_one_cycle_is_bounded():
+    """Before: one successful append flushed every pending task gap on the provider-call thread, so 1,000
+    pending tasks at 100 ms a write held it for 100 s (then, bounded, for the rest of its budget).  Now the
+    flush is a background cycle of at most ``GAP_FLUSH_BUDGET_S``; counts it does not reach are kept."""
+    import threading
+
     from usage_capture import DurableUsageRecorder
     from tests.test_usage_store import event
 
     clock = {"now": 0.0}
+    gap_threads = set()
 
     class Store:
         def __init__(self):
@@ -396,6 +400,7 @@ def test_gap_recovery_on_the_provider_call_path_is_bounded_by_the_record_budget(
             return True
 
         def record_gap(self, tenant_id, task_id, count):
+            gap_threads.add(threading.current_thread())
             clock["now"] += 0.1  # each gap write costs 100 ms
             self.gaps[(tenant_id, task_id)] = count
 
@@ -404,13 +409,107 @@ def test_gap_recovery_on_the_provider_call_path_is_bounded_by_the_record_budget(
     for i in range(1000):
         recorder._unrecorded[("t", f"task-{i}")] = 1
     assert recorder.record(event("e1")) is True
-    assert 1 <= len(store.gaps) <= 11  # about one second of recovery, not a hundred
+    assert recorder.wait_gap_flush(timeout=5)
+    assert threading.current_thread() not in gap_threads and gap_threads  # never on the calling thread
+    assert 1 <= len(store.gaps) <= 6  # one background cycle (0.5 s of 0.1 s writes), not a hundred seconds
     assert len(store.gaps) + len(recorder.unrecorded) == 1000  # nothing dropped
     first = len(store.gaps)
-    recorder.record(event("e2"))  # the next call carries on where this one stopped
+    recorder.record(event("e2"))  # the next success starts the next cycle
+    assert recorder.wait_gap_flush(timeout=5)
     assert len(store.gaps) > first
     recorder.flush_gaps()  # an unbounded flush (shutdown) still drains the rest
     assert len(store.gaps) == 1000 and recorder.unrecorded == {}
+
+
+def test_a_slow_gap_write_does_not_delay_the_record_call():
+    """The call returns as soon as its own append is stored; the gap write is somebody else's wait."""
+    import threading
+    import time
+
+    from usage_capture import DurableUsageRecorder
+    from tests.test_usage_store import event
+
+    release = threading.Event()
+    started = threading.Event()
+
+    class Store:
+        def append(self, e, *, ledger_attempt=None):
+            return True
+
+        def record_gap(self, *a, **kw):
+            started.set()
+            release.wait(10)
+
+    recorder = DurableUsageRecorder(Store())
+    recorder._unrecorded[("t", "k")] = 1
+    begun = time.monotonic()
+    assert recorder.record(event("e1")) is True
+    assert time.monotonic() - begun < 1.0  # not the gap write's 10 s
+    assert started.wait(5)
+    assert recorder.wait_gap_flush(timeout=0.05) is False  # still running in the background
+    release.set()
+    assert recorder.wait_gap_flush(timeout=5)
+
+
+def test_only_one_background_gap_flush_runs_at_a_time():
+    import threading
+
+    from usage_capture import DurableUsageRecorder
+    from tests.test_usage_store import event
+
+    release, entered = threading.Event(), []
+
+    class Store:
+        def append(self, e, *, ledger_attempt=None):
+            return True
+
+        def record_gap(self, *a, **kw):
+            entered.append(threading.current_thread())
+            release.wait(10)
+
+    recorder = DurableUsageRecorder(Store())
+    recorder._unrecorded[("t", "a")] = 1
+    recorder.record(event("e1"))
+    recorder._unrecorded[("t", "b")] = 1
+    recorder.record(event("e2"))
+    release.set()
+    assert recorder.wait_gap_flush(timeout=5)
+    assert len(set(entered)) == 1  # the second success did not start a second flusher
+
+
+def test_the_shutdown_flush_waits_for_a_running_cycle_and_persists_what_is_left(monkeypatch):
+    import threading
+
+    import usage_capture
+    import usage_store
+    from usage_capture import DurableUsageRecorder
+    from tests.test_usage_store import event
+
+    gate = threading.Event()
+    gaps = {}
+
+    class Store:
+        def append(self, e, *, ledger_attempt=None):
+            return True
+
+        def record_gap(self, tenant_id, task_id, count, **kw):
+            gate.wait(5)
+            gaps[(tenant_id, task_id)] = gaps.get((tenant_id, task_id), 0) + count
+
+        def close(self):
+            pass
+
+    recorder = DurableUsageRecorder(Store())
+    usage_capture.set_usage_recorder(recorder)
+    try:
+        recorder._unrecorded[("t", "a")] = 1
+        recorder.record(event("e1"))  # a cycle starts and waits on the gate
+        recorder._unrecorded[("t", "b")] = 2
+        threading.Timer(0.1, gate.set).start()
+        usage_store.uninstall_usage_capture(recorder._store)
+    finally:
+        usage_capture.set_usage_recorder(None)
+    assert gaps == {("t", "a"): 1, ("t", "b"): 2}
 
 
 def test_one_deadline_bounds_every_retry_and_the_gap_flush_of_a_record_call():
@@ -444,7 +543,9 @@ def test_one_deadline_bounds_every_retry_and_the_gap_flush_of_a_record_call():
     assert budgets[0] == 2.5 and all(b <= 0.5 + 1e-9 for b in budgets[1:])
 
 
-def test_a_gap_write_started_late_in_a_record_call_gets_only_the_remaining_budget():
+def test_a_background_gap_write_gets_its_own_short_budget_not_the_call_paths_leftover():
+    import threading
+
     from usage_capture import DurableUsageRecorder
     from tests.test_usage_store import event
 
@@ -464,9 +565,11 @@ def test_a_gap_write_started_late_in_a_record_call_gets_only_the_remaining_budge
     recorder._unrecorded[("t", "a")] = 1
     recorder._unrecorded[("t", "b")] = 1
     assert recorder.record(event("e1")) is True
-    assert gap_budgets == [0.5]  # the second gap is not started: the deadline passed
-    assert clock["now"] <= 2.5 + 1e-9
-    assert recorder.unrecorded == {("t", "b"): 1}  # kept for the next call
+    assert clock["now"] >= 2.0
+    assert recorder.wait_gap_flush(timeout=5)
+    assert gap_budgets and all(b <= DurableUsageRecorder.GAP_FLUSH_BUDGET_S + 1e-9 for b in gap_budgets)
+    assert len(gap_budgets) == 1  # the cycle's budget was spent by the first write; the rest is kept
+    assert recorder.unrecorded == {("t", "b"): 1}
 
 
 def test_the_sqlite_store_caps_a_write_at_the_callers_remaining_budget(tmp_path):

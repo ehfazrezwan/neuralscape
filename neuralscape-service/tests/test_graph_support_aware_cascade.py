@@ -943,3 +943,22 @@ def test_the_episode_group_check_reads_the_reference_at_either_depth():
     inner_ref = {"user_id": "u", "metadata": {"metadata": {"graph_episode_uuid": "ep-1"}}}
     assert ProvenanceMixin._row_records_episode_in_group(inner_ref, "ep-1", "no-such-group") is True
     assert ProvenanceMixin._row_records_episode_in_group(inner_ref, "ep-9", "no-such-group") is False
+
+
+def test_a_wrapped_survivor_with_a_name_only_outer_reference_is_re_enriched_and_a_racing_uuid_is_kept():
+    """The name-only branch (reference recorded as a name, no uuid yet) at the outer depth of a wrapped row."""
+    svc, put, get = _local_store_service()
+    put(WRAPPED_ID, {"graph_episode_name": "name-1", "metadata": {"owner_user_id": "u", "visibility": "private"}})
+    assert svc._reenrich_survivors([(WRAPPED_ID, get(WRAPPED_ID))], "ep-1") == 1
+    row = get(WRAPPED_ID)["metadata"]
+    assert row["graph_episode_name"] is None and row["metadata"]["graph_reenrich_pending"] == "ep-1"
+    assert [job["memory_id"] for job in svc.jobs] == [WRAPPED_ID]
+
+    # A concurrent write added a uuid under the same name after the row was read: it is not cleared.
+    svc2, put2, get2 = _local_store_service()
+    put2(WRAPPED_ID, {"graph_episode_name": "name-1", "graph_episode_uuid": "ep-9",
+                      "metadata": {"owner_user_id": "u"}})
+    stale = (WRAPPED_ID, {"data": "fact", "user_id": "u", "metadata": {
+        "graph_episode_name": "name-1", "metadata": {"owner_user_id": "u"}}})
+    assert svc2._reenrich_survivors([stale], "ep-1") == 0
+    assert get2(WRAPPED_ID)["metadata"]["graph_episode_uuid"] == "ep-9" and svc2.jobs == []
