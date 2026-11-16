@@ -127,6 +127,11 @@ class CoreMixin:
         if self._memory is None:
             with self._init_lock:
                 if self._memory is None:
+                    # Every Gemini client the vendored libraries build must reach the configured endpoint
+                    # (unset: unchanged), in the API, every worker queue and a stdio MCP process alike.
+                    from provider_routing import apply_from_settings
+
+                    apply_from_settings(settings)
                     from mem0 import Memory
 
                     config = settings.get_mem0_config()
@@ -264,6 +269,9 @@ class CoreMixin:
         if self._genai_model is None:
             with self._init_lock:
                 if self._genai_model is None:
+                    from provider_routing import apply_from_settings
+
+                    apply_from_settings(settings)
                     endpoint = getattr(settings, "ns_gemini_base_url", "")
                     if isinstance(endpoint, str) and endpoint:
                         from inference_facade import build_gemini_client
