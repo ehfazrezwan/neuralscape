@@ -1318,8 +1318,8 @@ def _code_graph_tools() -> list[Tool]:
         Tool(
             name="query_code_graph",
             description=(
-                "Search a project's code knowledge graph (built by Graphify, served "
-                "by Neuralscape) with BFS/DFS traversal from the best-matching nodes. "
+                "Search a project's code knowledge graph with BFS/DFS traversal from "
+                "the best-matching nodes. Only server-indexed repos (CODE_REPOS) answer. "
                 "Use this — not recalled memories — for CODE STRUCTURE questions "
                 "(what calls X, what's in module Y): the graph reflects the code as "
                 "analyzed, while structural memories would rot. Memories whose "
@@ -1344,7 +1344,7 @@ def _code_graph_tools() -> list[Tool]:
                 "List the direct incoming/outgoing neighbors of one code-graph node "
                 "(function/class/file/module) with each edge's relation and "
                 "confidence tag (EXTRACTED/INFERRED/AMBIGUOUS). The precise tool for "
-                "'what directly touches X?'."
+                "'what directly touches X?'. Needs a repo indexed server-side (CODE_REPOS)."
             ),
             inputSchema={
                 "type": "object",
@@ -1362,7 +1362,8 @@ def _code_graph_tools() -> list[Tool]:
                 "Shortest connection path between two code-graph symbols — how does "
                 "A reach B? Each hop shows the relation and its confidence tag. "
                 "Useful for tracing an unexpected coupling flagged in a 'boundary' "
-                "memory back through the actual code structure."
+                "memory back through the actual code structure. Needs a repo indexed "
+                "server-side (CODE_REPOS)."
             ),
             inputSchema={
                 "type": "object",
@@ -1379,12 +1380,11 @@ def _code_graph_tools() -> list[Tool]:
             name="locate",
             description=(
                 "Hybrid code retrieval: find symbols (functions, classes, methods) by "
-                "natural-language description or name pattern. Uses dense embeddings + "
-                "BM25 lexical search + graph degree signal for ranking. Returns file:line "
-                "locations with signatures and docstrings. Use this to find relevant code "
-                "before diving into structure queries (query_code_graph, get_code_neighbors, "
-                "code_path). E3: requires NativeEngine (repo:<name> refs); raises "
-                "EngineCapabilityError on GraphifyJsonEngine (.json artifacts)."
+                "natural-language description or name pattern (BM25 + optional dense + "
+                "graph degree). Returns file:line with signatures and docstrings. Use "
+                "before structure queries (query_code_graph, get_code_neighbors, "
+                "code_path). Engines: code-native, code-cbm; repo indexed server-side "
+                "(CODE_REPOS)."
             ),
             inputSchema={
                 "type": "object",
@@ -1399,12 +1399,10 @@ def _code_graph_tools() -> list[Tool]:
         Tool(
             name="code_impact",
             description=(
-                "Compute blast radius from a given symbol: BFS over CALLS/IMPORTS edges "
-                "to find all symbols affected by changes to the given symbol. Returns a "
-                "text summary (file:line format) of affected symbols. Use this to understand "
-                "the impact of modifying or deleting a symbol. E7: requires NativeEngine "
-                "(repo:<name> refs); raises EngineCapabilityError on GraphifyJsonEngine "
-                "(.json artifacts)."
+                "Blast radius of a symbol: BFS over CALLS/IMPORTS edges to the symbols "
+                "affected by changing it, as file:line text. Use before modifying or "
+                "deleting a symbol. Engines: code-native, "
+                "code-graphify-lib; repo indexed server-side (CODE_REPOS)."
             ),
             inputSchema={
                 "type": "object",
@@ -1420,16 +1418,18 @@ def _code_graph_tools() -> list[Tool]:
             name="code_graph_index",
             description=(
                 "Phase G: index a repository INTO a code knowledge system through "
-                "Neuralscape (async). Enqueues on the ingest queue and returns a "
+                "Neuralscape (async). Operator-side only: the repo must already be on the "
+                "server's disk and mapped in CODE_REPOS (no upload or clone); otherwise the "
+                "task fails with an error naming CODE_REPOS. "
+                "Enqueues on the ingest queue and returns a "
                 "task_id to poll via the memory status endpoint. Once complete, the "
                 "corpus is queryable via the code tools with knowledge_system set. "
-                "Records repo_sha/indexed_at/engine_version per code_space, sets the "
-                "project's routing config, and runs the external-engine liveness diff."
+                "Records index metadata and sets the project's routing config."
             ),
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "repo_source": {"type": "string", "description": "Absolute path (or ref) of the repo to index"},
+                    "repo_source": {"type": "string", "description": "Server-side absolute path (in CODE_REPOS)"},
                     "system": {"type": "string", "description": "Target code system: code-cbm | code-graphify-lib | code-native"},
                     "project_id": {"type": "string", "description": "Project scope; sets routing config so later recalls route to this engine"},
                     "code_space": {"type": "string", "description": "Explicit code_space (code--owner--repo); default derived from user_id + repo basename"},
@@ -2368,7 +2368,25 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
                 from pathlib import Path as _P
 
                 repo_name = _P(str(repo_source).rstrip("/")).name or "repo"
-                code_space = f"code--{user_id}--{repo_name}"
+                from knowledge.code_dispatch import build_code_space
+
+                try:
+                    code_space = build_code_space(user_id, repo_name)
+                except ValueError as e:
+                    return [TextContent(type="text", text=json.dumps({"error": str(e)}))]
+            from knowledge.code_dispatch import (
+                code_space_access_error,
+                code_space_shape_error,
+                repo_source_error,
+            )
+
+            refused = (
+                code_space_shape_error(code_space)
+                or code_space_access_error(code_space, user_id)
+                or repo_source_error(repo_source, settings)
+            )
+            if refused:
+                return [TextContent(type="text", text=json.dumps({"error": refused}))]
             task_id = await _task_manager.enqueue_code_index({
                 "system": system,
                 "repo_source": repo_source,
@@ -2395,8 +2413,11 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
             if not graph_id or not system:
                 return [TextContent(type="text", text=json.dumps(
                     {"error": "graph_id and system are required"}))]
-            from knowledge.code_dispatch import teardown_code_space
+            from knowledge.code_dispatch import code_space_access_error, teardown_code_space
 
+            denied = code_space_access_error(graph_id, user_id)
+            if denied:
+                return [TextContent(type="text", text=json.dumps({"error": denied}))]
             result = await asyncio.to_thread(
                 teardown_code_space, system, graph_id, user_id, settings
             )
@@ -2440,6 +2461,11 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
                 if not code_space:
                     return [TextContent(type="text", text=json.dumps(
                         {"error": "knowledge_system requires graph_id (the code_space)"}))]
+                from knowledge.code_dispatch import code_space_access_error
+
+                denied = code_space_access_error(code_space, user_id)
+                if denied:
+                    return [TextContent(type="text", text=json.dumps({"error": denied}))]
                 from knowledge.base import RecallRequest
 
                 if explicit_system == "auto":

@@ -20,11 +20,13 @@ export interface Fixture {
   requests: Recorded[];
   /** Body returned for GET /v1/context/<anything>. */
   context: Record<string, unknown>;
+  /** POST paths answered with HTTP 500. */
+  failPosts: Set<string>;
   close(): Promise<void>;
 }
 
 export async function startFixture(): Promise<Fixture> {
-  const fx = { url: "", requests: [] as Recorded[], context: {} as Record<string, unknown> } as Fixture;
+  const fx = { url: "", requests: [] as Recorded[], context: {} as Record<string, unknown>, failPosts: new Set<string>() } as Fixture;
   const server: Server = createServer((req, res) => {
     let body = "";
     req.on("data", (d) => (body += d));
@@ -38,6 +40,11 @@ export async function startFixture(): Promise<Fixture> {
       }
       if (req.method === "GET") {
         res.writeHead(404, { "Content-Type": "application/json" });
+        res.end("{}");
+        return;
+      }
+      if (fx.failPosts.has(path)) {
+        res.writeHead(500, { "Content-Type": "application/json" });
         res.end("{}");
         return;
       }
