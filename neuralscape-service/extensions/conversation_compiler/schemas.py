@@ -52,7 +52,16 @@ class CompileResult(BaseModel):
     date: str
     articles: list[CompiledArticle] = Field(default_factory=list)
     entries_compiled: int = 0
+    # True only when post-compile dedup ran for every user and skipped nothing. False with
+    # ``dedup_skipped_reason`` set: it ran, but part of it was skipped (see the fields below).
     dedup_triggered: bool = False
+    # Exact groups + semantic pages dedup skipped because its lock store (Redis) did not
+    # answer, summed over the users; nothing destructive runs unlocked.
+    dedup_skipped: int = 0
+    # Exact groups dedup abandoned (survivor changed under the lock, or lock store down).
+    dedup_exact_groups_abandoned: int = 0
+    # Short reason when ``dedup_skipped`` > 0 (e.g. "lock store unreachable"), else None.
+    dedup_skipped_reason: Optional[str] = None
     # Sibling re-ingests the post-compile dedup produced (see MemoryService.dedup_memories)
     dedup_graph_jobs_enqueued: int = 0
     dedup_graph_jobs_not_enqueued: int = 0
