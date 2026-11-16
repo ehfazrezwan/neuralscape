@@ -994,7 +994,7 @@ class TestStaleGraphCheckOnDedupHit:
         survivor = MemoryResponse(id="old", memory="x", scope="global", visibility="private")
         service = MagicMock()
 
-        def _batch(items, dedup_ids=None):
+        def _batch(items, dedup_ids=None, graph_jobs=None):
             dedup_ids.add("old")
             return [survivor]
 
