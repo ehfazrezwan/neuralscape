@@ -222,8 +222,9 @@ def test_required_baseline_areas_each_have_an_expected_failure_and_a_control() -
         "stale-revision": ("stale-revision-edit", "patch-partial-control"),
     }
     by_id = {s.id: s for s in SCENARIOS}
+    fixed = {"identity"}  # defect fixed: its scenario is now a control
     for area, (failure, control) in areas.items():
-        assert by_id[failure].kind == "expected-failure", area
+        assert by_id[failure].kind == ("control" if area in fixed else "expected-failure"), area
         assert by_id[control].kind == "control", area
     for area, ids in fixed.items():
         for scenario_id in ids:
