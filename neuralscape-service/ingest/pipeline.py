@@ -29,6 +29,7 @@ from schemas import (
     PROJECT_CATEGORIES,
     MemoryScope,
     default_scope_for_category,
+    normalize_workspace,
 )
 
 logger = logging.getLogger(__name__)
@@ -124,8 +125,10 @@ def ingest_document(service, doc: IngestDoc) -> dict:
     # the caller explicitly overrode workspace. This makes the trigger case (trading books
     # poisoning the identity card) impossible by default — ingested reference content lands
     # in its own partition, fenced out of card/reflection/default recall.
-    effective_workspace = doc.workspace
-    if effective_workspace is None and adapter.name != "default":
+    # An explicit "memory" (or "") is the memory workspace: stored untagged so the dedup key
+    # matches rows written without a workspace, and it suppresses the adapter-derived default.
+    effective_workspace = normalize_workspace(doc.workspace)
+    if doc.workspace is None and adapter.name != "default":
         # Auto-derive a reference workspace name: adapter-name[--title-slug]
         base_name = f"ref-{adapter.name}"
         title_slug = None

@@ -84,6 +84,7 @@ from schemas import (
     TimelineRequest,
     TimelineResponse,
     normalize_visibility,
+    normalize_workspace,
 )
 from authority_store import AuthorityUnavailable
 from task_manager import TaskManager, TaskStatusUnavailable
@@ -945,6 +946,7 @@ async def v1_ingest_document(req: IngestDocumentRequest, request: Request):
         "extract_facts": req.extract_facts,
         "index_passages": req.index_passages,
         "adapter": req.adapter,
+        "workspace": normalize_workspace(req.workspace),
     }
     doc = {k: v for k, v in doc.items() if v is not None}
 
@@ -1037,6 +1039,7 @@ async def v1_ingest_text(req: IngestTextRequest, request: Request):
         "index_passages": req.index_passages,
         "adapter": req.adapter,
         "occurred_at": req.occurred_at,
+        "workspace": normalize_workspace(req.workspace),
     }
     doc = {k: v for k, v in doc.items() if v is not None}
 
@@ -1077,6 +1080,10 @@ async def v1_ingest_files(
     extract_facts: bool = Form(True),
     index_passages: bool = Form(True),
     adapter: str = Form("default", description="Knowledge adapter (e.g. 'default', 'trading_strategy')"),
+    workspace: str | None = Form(
+        None,
+        description="Workspace partition: absent or 'memory' = memory type; any other value = reference workspace",
+    ),
     page_offset: int = Form(
         0,
         description=(
@@ -1114,6 +1121,11 @@ async def v1_ingest_files(
     except ValueError as ve:
         raise HTTPException(status_code=400, detail=str(ve)) from ve
 
+    try:
+        workspace = normalize_workspace(workspace)
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve)) from ve
+
     resolved_user_id = _resolve_user_id(request, user_id)
     # Standard-tier ingestion (a dictator uploading org standards) is allowed, but
     # only for authorized dictators — reject others synchronously so we don't
@@ -1133,6 +1145,7 @@ async def v1_ingest_files(
         "extract_facts": extract_facts,
         "index_passages": index_passages,
         "adapter": adapter,
+        "workspace": workspace,
         "page_offset": page_offset or None,  # omitted when 0 (the default)
         "agent_id": None,
         "run_id": None,
