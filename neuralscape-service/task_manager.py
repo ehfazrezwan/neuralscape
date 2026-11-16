@@ -382,8 +382,12 @@ class TaskManager:
         visibility = doc.get("visibility")
         adapter = doc.get("adapter", "default")
         partition = doc.get("user_id") or "ingest"
+        workspace = doc.get("workspace")
         job_id = _generate_job_id(
-            f"ingest:{visibility}:{adapter}:{connector_id}:{content}", partition
+            f"ingest:{visibility}:{adapter}:{connector_id}:"
+            + (f"ws={workspace}:" if workspace else "")
+            + content,
+            partition,
         )
 
         job = await self.pool.enqueue_job(
@@ -413,12 +417,14 @@ class TaskManager:
         visibility = options.get("visibility")
         adapter = options.get("adapter", "default")
         page_offset = options.get("page_offset") or 0
+        workspace = options.get("workspace")
         content_key = (payload.get("source_ref") or {}).get("external_id") or payload.get(
             "stored_path"
         ) or payload.get("data_b64", "")
         job_id = _generate_job_id(
             f"ingest-file:{visibility}:{adapter}:{page_offset}:"
-            f"{payload.get('filename', '')}:{content_key}",
+            + (f"ws={workspace}:" if workspace else "")
+            + f"{payload.get('filename', '')}:{content_key}",
             partition,
         )
         job = await self.pool.enqueue_job(
@@ -448,7 +454,9 @@ class TaskManager:
         ) or payload.get("data_b64", "")
         job_id = _generate_job_id(
             f"ingest-okf:{options.get('visibility')}:{options.get('scope')}:"
-            f"{options.get('project_id')}:{payload.get('filename', '')}:{content_key}",
+            f"{options.get('project_id')}:"
+            + (f"ws={options.get('workspace')}:" if options.get("workspace") else "")
+            + f"{payload.get('filename', '')}:{content_key}",
             partition,
         )
         job = await self.pool.enqueue_job(
