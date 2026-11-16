@@ -20,7 +20,6 @@ Comprehensive reference for the Neuralscape codebase. Read in order or jump to w
 | 21 | [Document & File Ingestion](./21-document-ingestion.md) | Ingest files/folders/zips + manual context; Docling/MarkItDown parsing; artifact storage; dedicated ingest worker |
 | 28 | [Hybrid Inference Evaluation](./28-hybrid-inference-evaluation.md) | Decision-model and small-local-model feasibility, graph/vector acceptance checks, measured cost/latency, limitations and opt-in testing |
 | 29 | [Source Extraction Evaluation](./29-source-extraction-evaluation.md) | Source-selection redesign, held-out extraction benchmarks, graph/vector validation and fallback tradeoffs |
-| 31 | [Usage Scenario Reports](./31-usage-scenario-reports.md) | Per-person scenario reports and the usage pilot |
 
 ## Quick links by audience
 

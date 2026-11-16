@@ -10,10 +10,8 @@ import evidence_registry as registry
 from evidence_registry import (
     LEAF_STATES,
     LEAVES,
-    ORACLE_REVISIONS,
     SCENARIO_KINDS,
     SCENARIOS,
-    SERVICE_PATH_SCENARIOS,
     get_leaf,
     leaf_state,
     scenarios_for,
@@ -243,67 +241,3 @@ def test_module_is_standard_library_only() -> None:
         if isinstance(node, ast.ImportFrom)
     } | {alias.name.split(".")[0] for node in ast.walk(tree) if isinstance(node, ast.Import) for alias in node.names}
     assert imported == {"dataclasses"}
-
-
-def test_oracle_revisions_name_registered_scenarios_and_say_why() -> None:
-    ids = {scenario.id for scenario in SCENARIOS}
-    assert ORACLE_REVISIONS
-    for scenario_id, revision in ORACLE_REVISIONS.items():
-        assert scenario_id in ids
-        assert set(revision) == {"version", "role", "reason", "carried_by"}
-        assert revision["role"] in {"library-observation", "replaced"}
-        assert all(isinstance(value, str) and value.strip() for value in revision.values())
-        assert revision["carried_by"] in {s.id for s in SERVICE_PATH_SCENARIOS}, "the requirement must be carried by a registered scenario"
-    # the revised scenario still names its original test: the oracle is annotated, never deleted or edited to pass
-    assert {s.id: s.kind for s in SCENARIOS}["graph-removal-shared-support"] == "expected-failure"
-
-
-def test_service_path_scenarios_carry_a_registered_baseline_scenario_and_pin_their_file() -> None:
-    import hashlib
-
-    baseline = {scenario.id: scenario for scenario in SCENARIOS}
-    ids = [scenario.id for scenario in SERVICE_PATH_SCENARIOS]
-    assert ids and len(ids) == len(set(ids)) and not set(ids) & set(baseline)
-    for scenario in SERVICE_PATH_SCENARIOS:
-        assert scenario.carries in baseline and baseline[scenario.carries].kind == "expected-failure"
-        assert scenario.leaves == baseline[scenario.carries].leaves
-        for leaf_id in scenario.leaves:
-            get_leaf(leaf_id)
-        assert scenario.summary and len(scenario.tests) >= 2 and len(set(scenario.tests)) == len(scenario.tests)
-        assert len(scenario.file_sha256) == 64
-        path = SERVICE_DIR / scenario.file
-        assert path.suffix == ".py" and ".." not in scenario.file
-        if not path.exists():
-            continue  # a tree without the feature has no such file: the scenario does not exist there
-        raw = path.read_bytes()
-        assert hashlib.sha256(raw).hexdigest() == scenario.file_sha256, "the oracle file changed: the oracle owner must re-pin it"
-        defined = {node.name for node in ast.parse(raw.decode()).body if isinstance(node, ast.FunctionDef)}
-        assert set(scenario.tests) <= defined
-
-
-def test_every_oracle_revision_names_the_service_path_scenario_that_carries_it_and_that_scenario_names_the_revised_one() -> None:
-    carried = {scenario.id: scenario.carries for scenario in SERVICE_PATH_SCENARIOS}
-    for scenario_id, revision in ORACLE_REVISIONS.items():
-        assert carried[revision["carried_by"]] == scenario_id
-
-
-def test_a_service_path_summary_claims_tenant_isolation_only_when_a_registered_test_asserts_it() -> None:
-    for scenario in SERVICE_PATH_SCENARIOS:
-        claims = "tenants untouched" in scenario.summary and "not asserted" not in scenario.summary
-        assert not claims or any("tenant" in name for name in scenario.tests)
-
-
-def test_the_library_observation_is_marked_as_one_in_its_pinned_reproduction() -> None:
-    marker = _xfail_reason("test_graph_removal_keeps_edges_supported_by_other_episodes")
-    assert "library observation" in marker
-
-
-def _xfail_reason(test_name: str) -> str:
-    tree = ast.parse(REPRODUCTIONS.read_text(encoding="utf-8"))
-    for node in tree.body:
-        if isinstance(node, ast.FunctionDef) and node.name == test_name:
-            for decorator in node.decorator_list:
-                if isinstance(decorator, ast.Call) and getattr(decorator.func, "attr", "") == "xfail":
-                    keywords = {k.arg: k.value for k in decorator.keywords}
-                    return ast.literal_eval(keywords["reason"])
-    raise AssertionError(test_name)

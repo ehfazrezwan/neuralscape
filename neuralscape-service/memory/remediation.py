@@ -178,9 +178,7 @@ class RemediationMixin:
                 # resolution — this guarantees we expire the exact episode
                 # we just previewed, not a second lookup that could in
                 # principle land on a different row.
-                # Leak remediation stays most-restrictive whatever the delete-path setting: co-support
-                # here may come from paraphrases of the very content being removed.
-                cascade = self._cascade_expire_episode(group_id, episode_uuid=resolved_uuid, support_aware=False)
+                cascade = self._cascade_expire_episode(group_id, episode_uuid=resolved_uuid)
                 if cascade.get("resolved"):
                     edges_expired += cascade["edges_expired"]
                     nodes_removed += cascade["nodes_removed"]
