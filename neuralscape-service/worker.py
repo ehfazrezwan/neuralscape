@@ -1662,6 +1662,61 @@ async def connector_sync_cron(ctx: dict) -> dict:
     return {"enqueued": enqueued}
 
 
+def _artifact_reference_counter(service):
+    """``(owner_dir, file_id) -> number of memory rows referencing the artifact``.
+
+    A row references an artifact through its ``source_ref``: ``parent_id`` /
+    ``external_id`` equal the artifact id (file uploads) or ``url`` is the
+    artifact's download URL (bundle concepts). The count is over ALL rows
+    (any owner, any visibility, tombstoned included): scoping it to an owner
+    would need a lossy directory-name-to-user mapping, and an owner directory
+    that maps to nobody must never read as "unreferenced". The cost is an
+    unindexed payload filter per candidate artifact, bounded by the sweep.
+    ``owner_dir`` is accepted for the sweep's callback signature only.
+    """
+    from qdrant_client.models import FieldCondition, Filter, MatchValue
+
+    client = service._get_memory().vector_store.client
+    collection = settings.qdrant_collection
+
+    def count(owner_dir: str, file_id: str) -> int:
+        should = []
+        for prefix in ("metadata.source_ref.", "metadata.metadata.source_ref."):
+            for key in ("parent_id", "external_id"):
+                should.append(FieldCondition(key=prefix + key, match=MatchValue(value=file_id)))
+            should.append(
+                FieldCondition(key=prefix + "url", match=MatchValue(value=f"/v1/ingest/artifacts/{file_id}"))
+            )
+        return client.count(
+            collection_name=collection,
+            count_filter=Filter(should=should),
+            exact=True,
+        ).count
+
+    return count
+
+
+async def artifact_gc_cron(ctx: dict) -> dict:
+    """Cron job: remove orphaned ingest artifacts (flag ``ARTIFACT_GC_ENABLED``, off by default).
+
+    Reports only unless ``ARTIFACT_GC_DRY_RUN=false``. See
+    ``ingest.storage.sweep_orphan_artifacts`` for the guards.
+    """
+    if not settings.artifact_gc_enabled:
+        return {"skipped": True, "reason": "ARTIFACT_GC_ENABLED=false"}
+    from ingest.storage import sweep_orphan_artifacts
+
+    service: MemoryService = ctx["service"]
+    counter = _artifact_reference_counter(service)
+    return await asyncio.to_thread(
+        sweep_orphan_artifacts,
+        settings,
+        counter,
+        grace_days=settings.artifact_gc_grace_days,
+        dry_run=settings.artifact_gc_dry_run,
+    )
+
+
 def _connector_sync_cron_hours() -> list[int]:
     """Translate the connector sync interval (hours) into a set of hours-of-day."""
     interval = max(1, min(24, settings.connector_sync_cron_hours))
@@ -1924,6 +1979,15 @@ class IngestWorkerSettings:
             hour=set(_connector_sync_cron_hours()),
             minute=50,
             timeout=600,
+            unique=True,
+            max_tries=1,
+            run_at_startup=False,
+        ),
+        cron(
+            artifact_gc_cron,
+            hour={4},
+            minute=20,
+            timeout=1800,
             unique=True,
             max_tries=1,
             run_at_startup=False,
