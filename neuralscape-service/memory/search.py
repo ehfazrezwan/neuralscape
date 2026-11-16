@@ -9,7 +9,13 @@ import time
 
 from config import settings
 from schemas import MemoryResponse, MemoryVisibility
-from memory.groups import _build_group_id, _edge_is_invalidated, _get_group_ids, _live_edges_filter
+from memory.groups import (
+    _build_group_id,
+    _edge_is_invalidated,
+    _get_group_ids,
+    _live_edges_filter,
+    _scoped_groups,
+)
 from memory.ranking import (
     RRF_K,
     _dense_score_floor,
@@ -1311,6 +1317,12 @@ class SearchMixin:
         if g is None:
             return {"edges": [], "nodes": [], "episodes": [], "communities": []}
 
+        # Fail closed: Graphiti reads an empty group list as "no group
+        # filter". No groups means no results, and no graph call.
+        group_ids = _scoped_groups(group_ids)
+        if not group_ids:
+            return {"edges": [], "nodes": [], "episodes": [], "communities": []}
+
         from graphiti_core.search.search_config import (
             EpisodeReranker,
             EpisodeSearchConfig,
@@ -1514,7 +1526,9 @@ class SearchMixin:
         # Multi-user: search across the caller's private namespace + the
         # shared pool, plus project-scoped variants. Replaces the prior
         # cross-user `"global"`/`"project--..."` group_ids.
-        group_ids = _get_group_ids(user_id, project_id)
+        group_ids = _scoped_groups(_get_group_ids(user_id, project_id))
+        if not group_ids:
+            return {"edges": [], "nodes": [], "episodes": [], "communities": []}
 
         # Audit 27 #10: never mutate the shared module-level recipe singleton
         # — deep-copy before setting the per-call limit.
