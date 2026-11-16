@@ -123,12 +123,24 @@ _PROVIDER_FENCE = tuple(
 # mem0 ``Memory`` methods that make up its native add/search pipeline. The
 # service writes and reads Qdrant itself; the only Memory methods it calls are
 # get / get_all / delete / delete_all / _update_memory (+ vector_store, db,
-# embedding_model attributes). ``memory/edit.py`` also mirrors mem0's own update upkeep
-# by calling ``_remove_memory_from_entity_store`` / ``_link_entities_for_memory`` after
-# its text CAS, so those two entity-store helpers are deliberately reachable.
+# embedding_model attributes).
 FORBIDDEN_MEMORY_METHODS = {
     "add", "search", "update", "chat", "history", "reset", "entity_store",
     "_search_vector_store", "_add_to_vector_store", "_create_memory",
+    "_link_entities_for_memory", "_remove_memory_from_entity_store",
+}
+
+# NOT AN ENDORSEMENT. Exactly two calls, in exactly one file, are tolerated
+# pending an OWNER decision. The entity store (the Qdrant collection
+# ``<collection>_entities``) is read only by mem0's native search, which this
+# service never calls. These calls keep it written from the compare-and-set edit
+# path (PR #531), so they are orphan work (an embedding call per extracted entity
+# on every content edit) whose removal is the owner's call. The exception exists
+# only so this fence does not turn dev red; any other file calling them, or
+# edit.py calling any other forbidden method, still fails.
+PENDING_OWNER_DECISION = {
+    ("memory/edit.py", "_remove_memory_from_entity_store"),
+    ("memory/edit.py", "_link_entities_for_memory"),
 }
 
 
@@ -233,6 +245,25 @@ def _memory_handles(tree: ast.AST) -> set[str]:
     return names
 
 
+def _pipeline_calls(tree: ast.AST) -> list[tuple[int, str, str]]:
+    """(lineno, receiver, attr) of every forbidden-method access through a ``Memory`` handle."""
+
+    handles = _memory_handles(tree)
+    calls = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Attribute) or node.attr not in FORBIDDEN_MEMORY_METHODS:
+            continue
+        receiver = ast.unparse(node.value)
+        if (
+            receiver in handles
+            or receiver in {"self._memory", "_async_memory", "self.memory"}
+            or receiver.endswith("_get_memory()")
+            or receiver.endswith("_get_async_memory()")
+        ):
+            calls.append((node.lineno, receiver, node.attr))
+    return calls
+
+
 def test_the_service_never_calls_mem0s_native_add_or_search_pipeline():
     """mem0's ``Memory.add`` / ``search`` / hybrid ``_search_vector_store`` / entity store are unreachable.
 
@@ -243,21 +274,17 @@ def test_the_service_never_calls_mem0s_native_add_or_search_pipeline():
     """
 
     offenders = []
+    used = set()
     for path in _service_sources():
-        tree = ast.parse(path.read_text())
-        handles = _memory_handles(tree)
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.Attribute) or node.attr not in FORBIDDEN_MEMORY_METHODS:
+        rel = path.relative_to(SERVICE).as_posix()
+        for lineno, receiver, attr in _pipeline_calls(ast.parse(path.read_text())):
+            if (rel, attr) in PENDING_OWNER_DECISION:
+                used.add((rel, attr))
                 continue
-            receiver = ast.unparse(node.value)
-            if (
-                receiver in handles
-                or receiver in {"self._memory", "_async_memory", "self.memory"}
-                or receiver.endswith("_get_memory()")
-                or receiver.endswith("_get_async_memory()")
-            ):
-                offenders.append(f"{path.relative_to(SERVICE)}:{node.lineno} {receiver}.{node.attr}")
+            offenders.append(f"{rel}:{lineno} {receiver}.{attr}")
     assert offenders == [], offenders
+    stale = PENDING_OWNER_DECISION - used
+    assert not stale, f"no longer called; delete the stale PENDING_OWNER_DECISION entries: {sorted(stale)}"
 
 
 def test_the_pipeline_pin_would_catch_a_violation(tmp_path):
@@ -272,6 +299,25 @@ def test_the_pipeline_pin_would_catch_a_violation(tmp_path):
         if isinstance(n, ast.Attribute) and n.attr in FORBIDDEN_MEMORY_METHODS
     ]
     assert hits == ["m.add", "self._get_memory().search"]
+
+
+def test_the_owner_decision_exception_is_scoped_to_edit_py():
+    """The same entity-store calls attributed to any other path are NOT excused."""
+
+    tree = ast.parse(
+        "def f(self):\n    m = self._get_memory()\n"
+        "    m._link_entities_for_memory('i', 't', {})\n    m._remove_memory_from_entity_store('i')\n"
+        "    m.add([])\n"
+    )
+    calls = _pipeline_calls(tree)
+    assert [c[2] for c in calls] == ["_link_entities_for_memory", "_remove_memory_from_entity_store", "add"]
+    flagged = [(p, a) for p in ("memory/edit.py", "memory/write.py") for _, _, a in calls if (p, a) not in PENDING_OWNER_DECISION]
+    assert flagged == [
+        ("memory/edit.py", "add"),
+        ("memory/write.py", "_link_entities_for_memory"),
+        ("memory/write.py", "_remove_memory_from_entity_store"),
+        ("memory/write.py", "add"),
+    ]
 
 
 # ---------------------------------------------------------------------------
