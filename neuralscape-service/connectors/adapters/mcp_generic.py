@@ -100,10 +100,10 @@ class MCPConnectorAdapter(ConnectorAdapter):
             allowed = settings.connector_allowed_hosts_set()
             try:
                 await validate_url(url, allowed)
-            except ConnectorConfigError:
+            except ConnectorConfigError as exc:
                 logger.warning(
-                    "MCP connector destination refused at session time: connector_id=%s owner=%s",
-                    self.connector_id, getattr(self, "owner_user_id", None),
+                    "MCP connector destination refused at session time: connector_id=%s owner=%s reason=%s",
+                    self.connector_id, getattr(self, "owner_user_id", None), getattr(exc, "reason", None),
                 )
                 raise
             async with streamablehttp_client(

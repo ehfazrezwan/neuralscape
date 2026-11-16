@@ -75,11 +75,11 @@ class GenericRestAdapter(ConnectorAdapter):
     async def _get(self, http: httpx.AsyncClient, url: str) -> httpx.Response:
         try:
             return await http.get(url)
-        except ConnectorConfigError:
-            # Ids only: never the URL or headers (caller-chosen, may hold credentials).
+        except ConnectorConfigError as exc:
+            # Ids and the refusal category only: never the URL or headers (caller-chosen).
             logger.warning(
-                "REST connector destination refused at fetch time: connector_id=%s owner=%s",
-                self.connector_id, getattr(self, "owner_user_id", None),
+                "REST connector destination refused at fetch time: connector_id=%s owner=%s reason=%s",
+                self.connector_id, getattr(self, "owner_user_id", None), getattr(exc, "reason", None),
             )
             raise
 

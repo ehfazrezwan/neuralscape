@@ -16,9 +16,14 @@ The rules (one module, used by every adapter that takes a URL):
   (``::ffff:127.0.0.1``, ``::127.0.0.1``, 6to4, Teredo, NAT64). Literal IPs and
   the odd IPv4 spellings (``2130706433``, ``0x7f.1``, ``0177.0.0.1``) are parsed
   the way the C library will read them, so they cannot slip through as names.
-* an operator who really needs an internal target lists exact hostnames
-  (optionally ``host:port``) in ``CONNECTOR_ALLOWED_HOSTS``. Allowlisted hosts
-  skip the address refusal and may use ``http``. Default: empty.
+* an operator who really needs an internal target lists exact hostnames in
+  ``CONNECTOR_ALLOWED_HOSTS``: a bare ``host`` covers the default ports (80, 443)
+  only, any other port needs ``host:port``. Allowlisted hosts skip the private-range
+  refusal and may use ``http``, but link-local and cloud-metadata addresses
+  (169.254.0.0/16, fe80::/10, 168.63.129.16, fd00:ec2::254) stay refused. Default: empty.
+* every refusal that concerns the network location carries one generic message
+  (the caller cannot tell "does not resolve" from "is private"); the category is
+  in ``DestinationRefused.reason`` for the operator's log.
 
 Enforcement runs twice. At registration (``validate_connector_destinations``,
 called by ``POST /v1/connectors``) so a bad config is a 422 and never stored.
@@ -58,8 +63,28 @@ Resolver = Callable[[str, int], Awaitable[list[str]]]
 _IPV4_LOOSE = re.compile(r"^[0-9a-fA-FxX.]+$")
 
 
+# Upper bound on one name lookup. A resolver that hangs must refuse, not stall the worker.
+RESOLVE_TIMEOUT_S = 10.0
+
+# One message for every "the network location is not acceptable" outcome (unresolvable,
+# non-public, unusable address): the caller must not learn which, or use the API as a
+# probe of internal DNS. ``reason`` carries the category for the operator's log only.
+_NOT_PERMITTED = "connector destination is not permitted (use a public https host, or ask the operator to add it to CONNECTOR_ALLOWED_HOSTS)"
+
+# Never reachable, even for an allowlisted name: link-local (169.254.0.0/16, fe80::/10) and
+# the cloud metadata endpoints that live outside it.
+_METADATA = frozenset({
+    ipaddress.ip_address("168.63.129.16"),  # Azure wire server / metadata
+    ipaddress.ip_address("fd00:ec2::254"),  # AWS IPv6 metadata
+})
+
+
 class DestinationRefused(ConnectorConfigError):
     """The URL points somewhere connectors may not fetch (message is safe to show the caller)."""
+
+    def __init__(self, message: str, reason: str = "scheme_or_url"):
+        super().__init__(message)
+        self.reason = reason  # category for logs; never shown to the caller
 
 
 async def resolve_host(host: str, port: int) -> list[str]:
@@ -78,12 +103,12 @@ def parse_allowed_hosts(csv: str) -> frozenset[str]:
 
 
 def _allowlisted(host: str, port: int, allowed: frozenset[str]) -> bool:
-    return bool(allowed) and (
-        host in allowed
-        or f"{host}:{port}" in allowed
-        or f"[{host}]" in allowed
-        or f"[{host}]:{port}" in allowed
-    )
+    """A bare entry covers the default ports only (80, 443); any other port needs ``host:port``."""
+    if not allowed:
+        return False
+    if port in (80, 443) and (host in allowed or f"[{host}]" in allowed):
+        return True
+    return f"{host}:{port}" in allowed or f"[{host}]:{port}" in allowed
 
 
 def _literal_ip(host: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
@@ -116,11 +141,19 @@ def _embedded_ipv4(ip: ipaddress.IPv6Address) -> list[ipaddress.IPv4Address]:
     return found
 
 
+def _never_allowed(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    """Link-local and cloud-metadata addresses: refused for everyone, allowlist or not."""
+    if isinstance(ip, ipaddress.IPv6Address) and any(_never_allowed(v4) for v4 in _embedded_ipv4(ip)):
+        return True
+    return ip.is_link_local or ip in _METADATA
+
+
 def _non_public(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
     if isinstance(ip, ipaddress.IPv6Address) and any(_non_public(v4) for v4 in _embedded_ipv4(ip)):
         return True
     return bool(
-        ip.is_loopback
+        ip in _METADATA
+        or ip.is_loopback
         or ip.is_link_local
         or ip.is_private
         or ip.is_unspecified
@@ -136,6 +169,7 @@ async def validate_target(
     port: int | None,
     allowed: frozenset[str],
     resolver: Resolver | None = None,
+    timeout: float | None = None,
 ) -> list[str]:
     """Raise :class:`DestinationRefused` unless ``scheme://host:port`` may be fetched.
 
@@ -157,23 +191,23 @@ async def validate_target(
         addresses = [str(literal)]
     else:
         try:
-            addresses = await (resolver or resolve_host)(host, port)
+            bound = RESOLVE_TIMEOUT_S if timeout is None else min(timeout, RESOLVE_TIMEOUT_S)
+            addresses = await asyncio.wait_for((resolver or resolve_host)(host, port), bound)
+        except asyncio.TimeoutError:
+            raise DestinationRefused(_NOT_PERMITTED, "resolve_timeout") from None
         except OSError:
-            raise DestinationRefused("connector host could not be resolved") from None
+            raise DestinationRefused(_NOT_PERMITTED, "unresolvable") from None
         if not addresses:
-            raise DestinationRefused("connector host could not be resolved")
-    if not internal_ok:
-        for address in addresses:
-            try:
-                ip = ipaddress.ip_address(address)
-            except ValueError:
-                raise DestinationRefused("connector host resolved to an unusable address") from None
-            if _non_public(ip):
-                raise DestinationRefused(
-                    "connector host resolves to a non-public address "
-                    "(loopback, private, link-local or reserved); an operator can allow an internal "
-                    "host with CONNECTOR_ALLOWED_HOSTS"
-                )
+            raise DestinationRefused(_NOT_PERMITTED, "unresolvable")
+    for address in addresses:
+        try:
+            ip = ipaddress.ip_address(address)
+        except ValueError:
+            raise DestinationRefused(_NOT_PERMITTED, "unusable_address") from None
+        if _never_allowed(ip):
+            raise DestinationRefused(_NOT_PERMITTED, "link_local_or_metadata")
+        if not internal_ok and _non_public(ip):
+            raise DestinationRefused(_NOT_PERMITTED, "non_public")
     return addresses
 
 
@@ -233,14 +267,14 @@ class _GuardedBackend(httpcore.AsyncNetworkBackend):
     async def connect_tcp(self, host, port, timeout=None, local_address=None, socket_options=None):
         # Scheme rules are the request hook's job (it sees the URL); here the question
         # is only "which address", so judge as https: the allowlist still applies.
-        addresses = await validate_target("https", host, port, self._allowed, self._resolver)
+        addresses = await validate_target("https", host, port, self._allowed, self._resolver, timeout)
         last: Exception | None = None
         for address in addresses:
             try:
                 return await self._inner.connect_tcp(
                     address, port, timeout=timeout, local_address=local_address, socket_options=socket_options
                 )
-            except httpcore.ConnectError as exc:
+            except (httpcore.ConnectError, httpcore.ConnectTimeout) as exc:
                 last = exc
         raise last or httpcore.ConnectError("no address to connect to")
 
@@ -271,7 +305,8 @@ def guarded_async_client(
 
     async def check_request(request: httpx.Request) -> None:
         url = request.url
-        await validate_target(url.scheme, url.raw_host.decode("ascii", "replace"), url.port, allowed, resolver)
+        timeout = request.extensions.get("timeout", {}).get("connect")
+        await validate_target(url.scheme, url.raw_host.decode("ascii", "replace"), url.port, allowed, resolver, timeout)
 
     if transport is None:
         transport = httpx.AsyncHTTPTransport()

@@ -98,8 +98,9 @@ async def test_public_hostname_ok_and_returns_validated_addresses():
 @pytest.mark.asyncio
 async def test_hostname_resolving_to_non_public_refused(host):
     name = "localhost" if host == "localhost" else f"{host}.example.com"
-    with pytest.raises(DestinationRefused, match="non-public"):
+    with pytest.raises(DestinationRefused, match="not permitted") as exc:
         await validate_url(f"https://{name}/", NO_ALLOW)
+    assert exc.value.reason in ("non_public", "link_local_or_metadata")
 
 
 @pytest.mark.asyncio
@@ -111,8 +112,13 @@ async def test_mixed_public_and_private_answer_refused():
 
 @pytest.mark.asyncio
 async def test_unresolvable_host_refused():
-    with pytest.raises(DestinationRefused, match="resolved"):
+    with pytest.raises(DestinationRefused, match="not permitted") as unresolved:
         await validate_url("https://nowhere.example.com/", NO_ALLOW)
+    with pytest.raises(DestinationRefused) as private:
+        await validate_url("https://sneaky.example.com/", NO_ALLOW)
+    # The caller cannot tell "does not resolve" from "is private": same text, category only in .reason
+    assert str(unresolved.value) == str(private.value)
+    assert (unresolved.value.reason, private.value.reason) == ("unresolvable", "non_public")
 
 
 @pytest.mark.parametrize("url", ["http://api.example.com/x", "ftp://api.example.com/", "file:///etc/passwd",
@@ -154,7 +160,33 @@ class TestAllowlist:
     async def test_allowlisted_internal_host_accepted_over_https_and_http(self):
         allow = parse_allowed_hosts("internal-mcp.corp")
         assert await validate_url("https://internal-mcp.corp/mcp", allow) == ["10.9.9.9"]
-        assert await validate_url("http://internal-mcp.corp:9000/mcp", allow) == ["10.9.9.9"]
+        assert await validate_url("http://internal-mcp.corp/mcp", allow) == ["10.9.9.9"]
+
+    @pytest.mark.asyncio
+    async def test_bare_entry_means_the_default_ports_only(self):
+        allow = parse_allowed_hosts("internal-mcp.corp")
+        for url in ("http://internal-mcp.corp:9000/mcp", "https://internal-mcp.corp:8443/mcp"):
+            with pytest.raises(DestinationRefused):
+                await validate_url(url, allow)
+        assert await validate_url("http://internal-mcp.corp:9000/mcp", parse_allowed_hosts("internal-mcp.corp:9000"))
+
+    @pytest.mark.parametrize("addr,host", [
+        ("169.254.169.254", "meta.example.com"), ("168.63.129.16", "azure.example.com"),
+        ("fe80::1", "ll.example.com"), ("fd00:ec2::254", "v6.example.com"), ("::ffff:169.254.169.254", "mapped-meta.example.com"),
+    ])
+    @pytest.mark.asyncio
+    async def test_allowlisted_name_still_cannot_reach_link_local_or_metadata(self, addr, host):
+        dns = fake_dns({host: [addr]})
+        with pytest.raises(DestinationRefused) as exc:
+            await validate_url(f"https://{host}/", parse_allowed_hosts(host), dns)
+        assert exc.value.reason == "link_local_or_metadata"
+        with pytest.raises(DestinationRefused):
+            await validate_url(f"https://[{addr}]/" if ":" in addr else f"https://{addr}/", parse_allowed_hosts(addr))
+
+    @pytest.mark.asyncio
+    async def test_allowlisted_name_may_still_be_private_or_loopback(self):
+        dns = fake_dns({"h.corp": ["10.1.1.1", "127.0.0.1"]})
+        assert await validate_url("https://h.corp/", parse_allowed_hosts("h.corp"), dns)
 
     @pytest.mark.asyncio
     async def test_host_port_entry_is_exact(self):
@@ -259,7 +291,7 @@ class TestRegistration:
     def test_allowlisted_internal_host_registers_over_http(self, client, monkeypatch):
         from config import settings
 
-        monkeypatch.setattr(settings, "connector_allowed_hosts", "internal-mcp.corp")
+        monkeypatch.setattr(settings, "connector_allowed_hosts", "internal-mcp.corp:9000")
         assert client.post("/v1/connectors", json=_body("mcp", {"url": "http://internal-mcp.corp:9000/mcp"})).status_code == 201
         # ...and only that host
         assert client.post("/v1/connectors", json=_body("mcp", {"url": "http://sneaky.example.com/mcp"}, "c3")).status_code == 422
@@ -505,7 +537,7 @@ async def test_backend_refuses_private_and_unix_sockets_and_honours_allowlist():
     with pytest.raises(DestinationRefused):
         await deny.connect_unix_socket("/var/run/docker.sock")
     assert inner.connected == []
-    allow = _GuardedBackend(parse_allowed_hosts("internal-mcp.corp"), DNS, inner)
+    allow = _GuardedBackend(parse_allowed_hosts("internal-mcp.corp:9000"), DNS, inner)
     await allow.connect_tcp("internal-mcp.corp", 9000)
     assert inner.connected == [("10.9.9.9", 9000)]
 
@@ -529,3 +561,79 @@ def test_guarded_client_ignores_proxy_environment(monkeypatch):
     monkeypatch.setenv("HTTPS_PROXY", "http://10.0.0.1:3128")
     client = guarded_async_client(allowed=NO_ALLOW)
     assert client._mounts == {}
+
+
+# ── review fixes: DNS timeout, connect timeout, mutation killers ────────────
+
+
+@pytest.mark.asyncio
+async def test_hung_dns_lookup_is_refused_not_awaited_forever(monkeypatch):
+    import asyncio
+
+    async def hangs(host, port):
+        await asyncio.sleep(3600)
+
+    monkeypatch.setattr(destination, "RESOLVE_TIMEOUT_S", 0.05)
+    with pytest.raises(DestinationRefused) as exc:
+        await validate_url("https://slow.example.com/", NO_ALLOW, hangs)
+    assert exc.value.reason == "resolve_timeout"
+
+
+@pytest.mark.asyncio
+async def test_lookup_is_bounded_by_the_clients_connect_timeout():
+    import asyncio
+
+    async def hangs(host, port):
+        await asyncio.sleep(3600)
+
+    with pytest.raises(DestinationRefused) as exc:
+        await destination.validate_target("https", "slow.example.com", 443, NO_ALLOW, hangs, timeout=0.05)
+    assert exc.value.reason == "resolve_timeout"
+
+
+@pytest.mark.asyncio
+async def test_connect_falls_through_addresses_on_connect_timeout():
+    class Slow(FakeInner):
+        async def connect_tcp(self, host, port, **kw):
+            self.connected.append((host, port))
+            if host == "8.8.8.8":
+                raise httpcore.ConnectTimeout("slow")
+            return object()
+
+    inner = Slow()
+    backend = _GuardedBackend(NO_ALLOW, fake_dns({"h.example.com": ["8.8.8.8", PUBLIC]}), inner)
+    await backend.connect_tcp("h.example.com", 443)
+    assert inner.connected == [("8.8.8.8", 443), (PUBLIC, 443)]
+
+
+def test_loose_ipv4_spellings_parse_to_the_address_libc_will_connect_to():
+    """Direct parser test: independent of how the stdlib classifies the result."""
+    lit = destination._literal_ip
+    for text in ("2130706433", "0x7f.1", "0177.0.0.1", "0x7f000001", "127.1"):
+        assert lit(text) == ipaddress.IPv4Address("127.0.0.1"), text
+    assert lit("abc.def") is None and lit("api.example.com") is None and lit("deadbeef") is None
+    assert lit("::1") == ipaddress.IPv6Address("::1")
+
+
+@pytest.mark.asyncio
+async def test_loose_ipv4_literal_is_refused_even_if_dns_would_say_public():
+    async def says_public(host, port):
+        return [PUBLIC]
+
+    for host in ("2130706433", "0x7f.1", "0177.0.0.1"):
+        with pytest.raises(DestinationRefused):
+            await validate_url(f"https://{host}/", NO_ALLOW, says_public)
+
+
+def test_embedded_ipv4_decides_even_when_the_stdlib_calls_the_ipv6_address_global(monkeypatch):
+    carrier = ipaddress.IPv6Address("2606:4700::1111")  # public, carries nothing
+    assert not destination._non_public(carrier)
+    monkeypatch.setattr(destination, "_embedded_ipv4", lambda ip: [ipaddress.IPv4Address("10.0.0.1")])
+    assert destination._non_public(carrier)
+    assert destination._never_allowed(carrier) is False  # 10.0.0.1 is private, not link-local
+    monkeypatch.setattr(destination, "_embedded_ipv4", lambda ip: [ipaddress.IPv4Address("169.254.169.254")])
+    assert destination._never_allowed(carrier)
+
+
+def test_azure_wire_server_refused_for_everyone():
+    assert destination._non_public(ipaddress.ip_address("168.63.129.16"))
