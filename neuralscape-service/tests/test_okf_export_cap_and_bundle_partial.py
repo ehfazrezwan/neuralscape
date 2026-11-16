@@ -109,8 +109,25 @@ class TestExportIsNeverSilentlyCut:
         assert stats["truncated"] is False
         assert "INCOMPLETE" not in zipfile.ZipFile(io.BytesIO(data)).read("log.md").decode()
 
-    def test_the_default_cap_is_documented_and_raised(self):
-        assert okf_export.MAX_EXPORT_MEMORIES == 50_000
+    def test_the_cap_is_a_setting_with_a_default_and_an_override(self, monkeypatch):
+        from config import Settings, settings
+
+        assert Settings(_env_file=None).okf_export_max_memories == 50_000
+        assert okf_export.export_cap() == settings.okf_export_max_memories
+        monkeypatch.setenv("OKF_EXPORT_MAX_MEMORIES", "7")
+        assert Settings(_env_file=None).okf_export_max_memories == 7
+        monkeypatch.setenv("OKF_EXPORT_MAX_MEMORIES", "0")
+        with pytest.raises(ValueError):
+            Settings(_env_file=None)
+
+    def test_the_setting_is_what_an_export_reads(self, monkeypatch):
+        from config import settings
+
+        monkeypatch.setattr(settings, "okf_export_max_memories", 5)
+        svc, _ = _service(12)
+        _, stats = export_bundle(svc, user_id="alice", visibility="private")  # no explicit limit
+        assert stats["concepts"] == 5 and stats["truncated"] is True
+        assert stats["truncated_pools"] == {"personal": {"exported": 5, "total": 12}}
 
 
 class TestCountFailureNeverLooksComplete:

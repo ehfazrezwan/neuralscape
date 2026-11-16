@@ -32,10 +32,16 @@ from okf import translate
 
 logger = logging.getLogger(__name__)
 
-#: Ceiling on rows per pool scroll — bounds memory for a pathological export.
-#: It is never silent: a pool that hits it is reported as truncated, with the
-#: exported and total counts (response headers, the bundle's ``log.md``).
-MAX_EXPORT_MEMORIES = 50_000
+def export_cap() -> int:
+    """Ceiling on rows per pool scroll (``OKF_EXPORT_MAX_MEMORIES``, default 50,000).
+
+    Bounds memory for a pathological export. It is never silent: a pool that
+    hits it is reported as truncated, with the exported and total counts
+    (response headers, the bundle's ``log.md``).
+    """
+    from config import settings
+
+    return int(settings.okf_export_max_memories)
 
 _GLOBAL_DIR = "global"
 _PROJECTS_DIR = "projects"
@@ -150,7 +156,7 @@ def collect_memories(
     project_id: str | None = None,
     scope: str | None = None,
     visibility: str | None = None,
-    limit: int = MAX_EXPORT_MEMORIES,
+    limit: int | None = None,
 ) -> list[dict]:
     """Rows only; see :func:`collect_memories_with_info` for the truncation report."""
     return collect_memories_with_info(
@@ -166,7 +172,7 @@ def collect_memories_with_info(
     project_id: str | None = None,
     scope: str | None = None,
     visibility: str | None = None,
-    limit: int = MAX_EXPORT_MEMORIES,
+    limit: int | None = None,
 ) -> tuple[list[dict], dict]:
     """Every memory the caller's identity can read, as plain row dicts, plus a report.
 
@@ -186,6 +192,7 @@ def collect_memories_with_info(
     m = service._get_memory()
     client = m.vector_store.client
     collection = settings.qdrant_collection
+    limit = export_cap() if limit is None else limit
 
     common: list = []
     if scope:
@@ -440,7 +447,7 @@ def export_bundle(
         project_id=project_id,
         scope=scope,
         visibility=visibility,
-        limit=MAX_EXPORT_MEMORIES if limit is None else limit,
+        limit=limit,
     )
     files = build_bundle(memories, bundle_name=bundle_name, truncation=info)
     stats = {
