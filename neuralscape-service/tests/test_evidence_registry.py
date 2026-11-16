@@ -209,10 +209,7 @@ def test_known_failure_rules_hold_as_the_list_shrinks_to_zero() -> None:
 
 def test_required_baseline_areas_each_have_an_expected_failure_and_a_control() -> None:
     areas = {
-        "namespace": ("group-id-tuple-collision", "group-id-distinct-controls"),
         "identity": ("email-slug-collision", "email-slug-controls"),
-        "queued-visibility": ("queued-visibility-publication", "queued-job-deleted-memory-control"),
-        "stale-revision": ("stale-revision-edit", "patch-partial-control"),
         "graph-deletion": ("graph-removal-shared-support", "graph-removal-controls"),
         "readiness": ("readiness-probes-backends", "readiness-controls"),
     }
@@ -220,6 +217,9 @@ def test_required_baseline_areas_each_have_an_expected_failure_and_a_control() -
     fixed = {
         "backup": ("backup-covers-compose-volumes", "backup-volume-controls"),
         "job-key": ("job-key-store-scope-control", "job-key-raw-options-control", "job-key-controls"),
+        "namespace": ("group-id-tuple-collision", "group-id-distinct-controls"),
+        "queued-visibility": ("queued-visibility-publication", "queued-job-deleted-memory-control"),
+        "stale-revision": ("stale-revision-edit", "patch-partial-control"),
     }
     # Areas still listed above whose defect has been fixed: the scenario that
     # used to be the expected failure is now a control too.

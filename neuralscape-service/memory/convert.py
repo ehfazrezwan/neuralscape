@@ -5,6 +5,7 @@ code is verbatim — behavior unchanged.
 """
 
 from config import settings
+from memory.edit import revision_of
 from schemas import MemoryResponse, MemoryVisibility
 
 class ConvertMixin:
@@ -112,6 +113,8 @@ class ConvertMixin:
             # Legacy rows (conversation extraction before owner stamping) carry
             # the owner only as the payload's top-level user_id.
             owner_user_id=metadata.get("owner_user_id") or mem.get("user_id") or None,
+            revision=revision_of(metadata),
+            workspace=metadata.get("workspace"),
             sensitivity=metadata.get("sensitivity"),
             sensitivity_source=metadata.get("sensitivity_source"),
             title=metadata.get("title"),
