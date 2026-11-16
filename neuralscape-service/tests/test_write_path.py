@@ -660,8 +660,8 @@ class TestStoreRawBatchTwoPass:
             for i in (2, 7)
         }
         service._find_by_content_hash = (
-            lambda user_id, content_hash, scope, project_id=None, visibility=None, workspace=None:
-            dup_rows.get(content_hash)
+            lambda user_id, content_hash, scope, project_id=None, visibility=None, workspace=None,
+            category=None: dup_rows.get(content_hash)
         )
         service._bump_times_derived = MagicMock()
         service._revive_if_tombstoned = MagicMock(return_value=False)
