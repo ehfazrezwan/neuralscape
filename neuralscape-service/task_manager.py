@@ -90,6 +90,24 @@ _STATUS_MAP = {
 }
 
 
+def _fenced_view(result: object) -> tuple[str, str] | None:
+    """``("fenced", reason)`` when ``result`` is the cutover fence's own marker, else ``None``.
+
+    The one mapping used by polling (``get_status``) and waiting (``wait_for_result``), so a caller
+    is never told a write finished when the fence ran nothing.
+    """
+
+    from ledger.cutover import FENCED_RESULT
+
+    if (
+        isinstance(result, dict)
+        and result.get("status") == FENCED_RESULT["status"]
+        and result.get("executed") is False
+        and result.get("reason") == FENCED_RESULT["reason"]
+    ):
+        return "fenced", result["reason"]
+    return None
+
 async def enqueue_graph_jobs_standalone(jobs: list[dict]) -> dict:
     """Enqueue graph re-ingest jobs from code with no queue handle (the dream
     sweep's prune, the post-compile dedup) through a short-lived TaskManager.
@@ -136,6 +154,33 @@ class TaskManager:
             default_queue_name=settings.arq_queue_name,
         )
         logger.info("TaskManager connected to Redis")
+        if settings.ledger_enabled:
+            await self._open_ledger()
+        else:
+            from ledger import warn_if_ledger_bypassed
+
+            await asyncio.to_thread(warn_if_ledger_bypassed, settings, logger)
+
+    async def _open_ledger(self) -> None:
+        """Open the durable ledger and wake workers for any committed but
+        unqueued obligation (crash between commit and enqueue)."""
+        from authority_store_sql import build_authority_store
+        from ledger import open_ledger
+        from write_producer import DurableWriteProducer, PrincipalResolver, open_payload_store
+
+        self.ledger = await asyncio.to_thread(open_ledger, settings)
+        # With the authority store enabled the write path is governed: intents
+        # carry the bound principal, and the worker fences each stage.
+        self.authority = await asyncio.to_thread(build_authority_store, settings)
+        self.producer = DurableWriteProducer(
+            self.ledger,
+            await asyncio.to_thread(open_payload_store, settings),
+            principals=None if self.authority is None else PrincipalResolver(self.authority),
+        )
+        if settings.ledger_cutover_enabled:
+            await self._open_cutover()
+        await self.dispatch_ledger()
+        logger.info("TaskManager durable ledger enabled (backend=%s)", settings.ledger_backend)
 
     def _durable_route(self) -> bool:
         """Whether a new write is accepted by the ledger (the cutover phase decides when enabled)."""
@@ -143,6 +188,49 @@ class TaskManager:
         if self.producer is None:
             return False
         return self.cutover is None or self.cutover.writes_use_ledger()
+
+    async def _open_cutover(self) -> None:
+        """Build the cutover controller over the ledger's payload store (see ``ledger.cutover``)."""
+
+        from ledger.cutover import CutoverController
+
+        self.cutover = CutoverController(
+            self.producer.payloads, legacy_inflight=self._legacy_inflight_sync,
+        )
+
+    def _legacy_inflight_sync(self) -> int:
+        """Queued plus running legacy jobs across the legacy queues (0 means drained).
+
+        A plain synchronous client: the cutover controller runs in a worker thread, where the ARQ
+        pool (bound to the server's event loop) cannot be used.
+        """
+
+        import redis
+
+        client = redis.Redis.from_url(settings.redis_url)
+        try:
+            total = 0
+            for name in {settings.arq_queue_name, settings.graph_queue_name, settings.ingest_queue_name}:
+                total += int(client.zcard(name))
+            for key in client.scan_iter(match="arq:in-progress:*"):
+                job_id = (key.decode() if isinstance(key, bytes) else str(key)).removeprefix("arq:in-progress:")
+                if not job_id.startswith(("ledger-wake:", "cron:")):  # ledger wake-ups and cron ticks are not legacy writes
+                    total += 1
+            return total
+        finally:
+            client.close()
+
+    async def _enqueue_wake(self, intent_id: str, job_id: str) -> None:
+        """Queue a wake-up; the worker pulls the obligation from the ledger."""
+        from write_producer import WAKE_FUNCTION, ledger_queue_name
+
+        await self.pool.enqueue_job(WAKE_FUNCTION, _queue_name=ledger_queue_name(), _job_id=job_id)
+
+    async def dispatch_ledger(self) -> int:
+        """Wake workers for committed obligations not yet queued."""
+        if self.producer is None or self.pool is None:
+            return 0
+        return await self.producer.dispatch_unqueued(self._enqueue_wake)
 
     async def _track_task(
         self, user_id: str | None, task_id: str, *, grant_read: bool = True
@@ -206,7 +294,6 @@ class TaskManager:
         agent_id: str | None = None,
         run_id: str | None = None,
         occurred_at: str | None = None,
-        # Durable path only (LEDGER_ENABLED): accepted and unused until writes use the ledger.
         idempotency_key: str | None = None,
     ) -> str:
         """Enqueue memory extraction task. Returns task_id (job_id).
@@ -219,6 +306,12 @@ class TaskManager:
         is a distinct job, not a duplicate. A retry of the identical request
         still derives the identical id.
         """
+        if self._durable_route():
+            return await self.enqueue_job_durable(
+                "memory.write.extracted", user_id=user_id, idempotency_key=idempotency_key, project_id=project_id,
+                payload={"messages": messages, "user_id": user_id, "project_id": project_id,
+                         "agent_id": agent_id, "run_id": run_id, "occurred_at": occurred_at},
+            )
         # Generate deterministic job ID from message content
         content_str = "|".join(
             m.get("content", "") for m in messages
@@ -277,10 +370,17 @@ class TaskManager:
         # Data-layer connectors
         memory_kind: str | None = None,
         source_ref: dict | None = None,
-        # Durable path only (LEDGER_ENABLED): accepted and unused until writes use the ledger.
+        # Durable path only (LEDGER_ENABLED): caller-chosen idempotency key.
         idempotency_key: str | None = None,
     ) -> str:
         """Enqueue raw memory storage task. Returns task_id (job_id).
+
+        With ``LEDGER_ENABLED`` the write is durably accepted in the ledger
+        first (intent + outbox in one transaction) and the returned task id is
+        the intent id; the queue only carries a wake-up.  The same
+        ``idempotency_key`` with the same payload returns the original intent;
+        with a different payload the ledger's ``IdempotencyConflict`` is
+        raised.  Without the flag nothing below changes.
 
         Uses a deterministic job ID based on content hash to prevent
         duplicate enqueues of the same fact. v2 + multi-user fields are
@@ -349,6 +449,23 @@ class TaskManager:
         # Drop None values so the worker signature can default cleanly
         v2_extras = {k: v for k, v in v2_extras.items() if v is not None}
 
+        if self._durable_route():
+            return await self._enqueue_raw_durable(
+                user_id=user_id,
+                payload={
+                    "content": content,
+                    "user_id": user_id,
+                    "category": category,
+                    "scope": scope,
+                    "project_id": project_id,
+                    "tags": tags,
+                    "agent_id": agent_id,
+                    "run_id": run_id,
+                    "v2_extras": v2_extras,
+                },
+                idempotency_key=idempotency_key,
+            )
+
         job = await self.pool.enqueue_job(
             "process_memory_raw",
             content,
@@ -366,7 +483,49 @@ class TaskManager:
         await self._track_task(user_id, task_id)
         return task_id
 
-    async def enqueue_ingest_document(self, doc: dict) -> str:
+    async def _enqueue_raw_durable(
+        self, *, user_id: str, payload: dict, idempotency_key: str | None
+    ) -> str:
+        """Commit the intent and outbox obligation, then wake a worker.
+
+        The client is told "accepted" only after the ledger commit.  A failure
+        to enqueue the wake-up never fails the write: the committed obligation
+        is recovered by the worker's ledger poll or the next dispatch.
+        """
+        result = await asyncio.to_thread(
+            self.producer.accept_raw,
+            user_id=user_id,
+            payload=payload,
+            idempotency_key=idempotency_key,
+        )
+        try:
+            await self.dispatch_ledger()
+        except Exception:  # noqa: BLE001 - durable accept already happened
+            logger.warning("ledger dispatch failed after accept", exc_info=True)
+        return result.intent_id
+
+    async def _accepted_durably(self, accept) -> str:
+        """Commit through the ledger, then wake a worker (never failing the accepted write)."""
+
+        result = await asyncio.to_thread(accept)
+        try:
+            await self.dispatch_ledger()
+        except Exception:  # noqa: BLE001 - durable accept already happened
+            logger.warning("ledger dispatch failed after accept", exc_info=True)
+        return result.intent_id
+
+    async def enqueue_delete_durable(
+        self, *, user_id: str, memory_id: str, memory_row: dict | None, idempotency_key: str | None = None
+    ) -> str:
+        """Accept an ordinary delete (raises ``ledger.port.HoldActive`` under a hold)."""
+
+        return await self._accepted_durably(
+            lambda: self.producer.accept_delete(
+                user_id=user_id, memory_id=memory_id, memory_row=memory_row, idempotency_key=idempotency_key
+            )
+        )
+
+    async def enqueue_ingest_document(self, doc: dict, *, idempotency_key: str | None = None) -> str:
         """Enqueue a document-ingest task (chunk → passages + facts). Returns job_id.
 
         Deterministic job id from the content hash + connector instance so the
@@ -377,6 +536,13 @@ class TaskManager:
         the same reason — re-ingesting the same content under a different adapter
         (different taxonomy/extractor/ontology) is a distinct job, not a duplicate.
         """
+        if self._durable_route():
+            return await self._accepted_durably(
+                lambda: self.producer.accept_ingest(
+                    user_id=doc.get("user_id") or settings.default_user_id, doc=doc,
+                    idempotency_key=idempotency_key,
+                )
+            )
         content = doc.get("content", "")
         connector_id = (doc.get("source") or {}).get("connector_id", "")
         visibility = doc.get("visibility")
@@ -396,7 +562,52 @@ class TaskManager:
         await self._track_task(doc.get("user_id"), task_id)
         return task_id
 
-    async def enqueue_ingest_file(self, payload: dict) -> str:
+    async def enqueue_job_durable(
+        self, operation: str, *, payload: dict, user_id: str | None = None,
+        idempotency_key: str | None = None, visibility: str | None = None,
+        project_id: str | None = None, workspace: str | None = None, stable=None,
+    ) -> str:
+        """Accept one single-stage legacy job through the ledger (raises ``HoldActive`` for deletes)."""
+
+        return await self._accepted_durably(
+            lambda: self.producer.accept_job(
+                operation=operation, payload=payload, user_id=user_id or settings.default_user_id,
+                idempotency_key=idempotency_key, visibility=visibility, project_id=project_id,
+                workspace=workspace, stable=stable,
+            )
+        )
+
+    async def enqueue_system_jobs_durable(self, operation: str, payload: dict | None = None,
+                                          idempotency_key: str | None = None) -> list[str]:
+        """Accept a cron/admin-started job under explicit service principals (never a default user)."""
+
+        results = await asyncio.to_thread(
+            self.producer.accept_system_jobs, operation=operation, payload=payload,
+            idempotency_key=idempotency_key,
+        )
+        try:
+            await self.dispatch_ledger()
+        except Exception:  # noqa: BLE001 - durable accept already happened
+            logger.warning("ledger dispatch failed after accept", exc_info=True)
+        return [r.intent_id for r in results]
+
+    async def enqueue_conversation_flush(self, **kwargs) -> str:
+        return await self.enqueue_job_durable(
+            "conversation.flush", payload=kwargs, user_id=kwargs.get("user_id"),
+            project_id=kwargs.get("project_id"),
+        )
+
+    async def enqueue_conversation_compile(self, date: str | None, user_id: str) -> str:
+        return await self.enqueue_job_durable(
+            "conversation.compile", payload={"date": date, "user_id": user_id}, user_id=user_id,
+        )
+
+    async def enqueue_markdown_write(self, rel_path: str, content: str, user_id: str | None = None) -> str:
+        return await self._accepted_durably(
+            lambda: self.producer.accept_markdown_write(rel_path=rel_path, content=content, user_id=user_id)
+        )
+
+    async def enqueue_ingest_file(self, payload: dict, *, idempotency_key: str | None = None) -> str:
         """Enqueue a single-file ingest task (parse → passages + facts). Returns job_id.
 
         ``payload`` carries ``{filename, source_ref, options}`` plus either
@@ -408,6 +619,13 @@ class TaskManager:
         different tier / adapter / page numbering is a distinct job, not
         coalesced onto (and dropped by) an earlier one. Runs on the ingest queue.
         """
+        if self._durable_route():
+            options = payload.get("options") or {}
+            return await self.enqueue_job_durable(
+                "ingest.file", payload={"payload": payload}, user_id=payload.get("user_id"),
+                idempotency_key=idempotency_key, visibility=options.get("visibility"),
+                project_id=options.get("project_id"),
+            )
         partition = payload.get("user_id") or "ingest"
         options = payload.get("options") or {}
         visibility = options.get("visibility")
@@ -431,7 +649,7 @@ class TaskManager:
         await self._track_task(payload.get("user_id"), task_id)
         return task_id
 
-    async def enqueue_ingest_okf_bundle(self, payload: dict) -> str:
+    async def enqueue_ingest_okf_bundle(self, payload: dict, *, idempotency_key: str | None = None) -> str:
         """Enqueue a whole-bundle OKF ingest task. Returns job_id.
 
         Same payload contract as ``enqueue_ingest_file`` (the artifact is
@@ -441,6 +659,13 @@ class TaskManager:
         bundle imported into a different pool is a distinct job rather
         than being coalesced onto (and dropped by) an earlier one.
         """
+        if self._durable_route():
+            options = payload.get("options") or {}
+            return await self.enqueue_job_durable(
+                "ingest.okf", payload={"payload": payload}, user_id=payload.get("user_id"),
+                idempotency_key=idempotency_key, visibility=options.get("visibility"),
+                project_id=options.get("project_id"),
+            )
         partition = payload.get("user_id") or "ingest"
         options = payload.get("options") or {}
         content_key = (payload.get("source_ref") or {}).get("external_id") or payload.get(
@@ -461,7 +686,7 @@ class TaskManager:
         await self._track_task(payload.get("user_id"), task_id)
         return task_id
 
-    async def enqueue_code_index(self, payload: dict) -> str:
+    async def enqueue_code_index(self, payload: dict, *, idempotency_key: str | None = None) -> str:
         """Phase G: enqueue a through-NS code-index task on the ingest queue.
 
         ``payload`` = ``{system, repo_source, code_space, project_id, user_id}``.
@@ -473,6 +698,11 @@ class TaskManager:
         result would otherwise be cached under a deterministic id and a later
         re-index would return the stale result instead of re-running.
         """
+        if self._durable_route():
+            return await self.enqueue_job_durable(
+                "code.index", payload={"payload": payload}, user_id=payload.get("user_id"),
+                idempotency_key=idempotency_key, project_id=payload.get("project_id"),
+            )
         job = await self.pool.enqueue_job(
             "process_code_index",
             payload,
@@ -503,6 +733,15 @@ class TaskManager:
         owner) under the same id gets a new job id: its syncs never share a
         cached job, result or read grant with the previous instance.
         """
+        if self._durable_route():
+            owner = (record or {}).get("owner_user_id")
+            if not owner:  # never sync under a default identity, from the API any more than from the cron
+                raise ValueError("connector has no owner; refusing to sync under a default user")
+            return await self._accepted_durably(
+                lambda: self.producer.accept_connector_sync(
+                    user_id=owner, connector_id=connector_id, record=record, idempotency_key=idempotency_key
+                )
+            )
         job_id = connector_sync_job_id(connector_id, user_id, generation)
         job = await enqueue_connector_sync_job(self.pool, connector_id, generation, job_id)
         task_id = job_id if job is None else job.job_id
@@ -517,6 +756,10 @@ class TaskManager:
         cannot collide even when item content includes delimiter characters
         like ``|`` or quotes.
         """
+        if self._durable_route():
+            return await self._accepted_durably(
+                lambda: self.producer.accept_batch(items=items, idempotency_key=idempotency_key)
+            )
         # Canonical JSON gives us a representation that's stable across
         # re-orderings of dict keys (sort_keys=True) and unambiguous w.r.t.
         # special characters — far safer than join(delimiter, ...).
@@ -549,6 +792,11 @@ class TaskManager:
         collide while an identical replay coalesces within ARQ's dedup window
         — the same guarantee enqueue_raw_batch relies on.
         """
+        if self._durable_route():
+            return await self.enqueue_job_durable(
+                "memory.retag", payload={"caller_user_id": caller_user_id, "filters": filters, "ops": ops},
+                user_id=caller_user_id, idempotency_key=idempotency_key, project_id=filters.get("project_id"),
+            )
         canonical = json.dumps(
             {"filters": filters, "ops": ops}, sort_keys=True, separators=(",", ":")
         )
@@ -696,8 +944,11 @@ class TaskManager:
         ask for it, while ``get_queue_status`` keeps its existing queue set.
 
         Returns:
-            Dict with task_id, status, result, error keys.
+            Dict with task_id, status, result, error keys.  For a durable
+            (ledger) intent the result carries the per-stage receipt.
         """
+        if self.producer is not None and task_id.startswith("intent-"):
+            return await self._durable_status(task_id, user_id)
         if enforce_owner and not await self.is_task_owner(task_id, user_id):
             return {"task_id": task_id, "status": "not_found", "result": None, "error": None}
         job, status = await self._find_job(task_id, include_graph=include_graph)
@@ -712,6 +963,10 @@ class TaskManager:
             if info is not None:
                 if info.success:
                     result = info.result
+                    fenced = _fenced_view(result)
+                    if fenced:
+                        # the job ran nothing: a poller must not be told the write finished
+                        api_status, error = fenced
                 else:
                     api_status = "failed"
                     error = str(info.result) if info.result else "Unknown error"
@@ -722,6 +977,30 @@ class TaskManager:
             "result": result,
             "error": error,
         }
+
+    def _read_owned_intent(self, task_id: str, user_id: str | None):
+        """``(tenant, stored, receipts)`` for an intent the caller may read, else ``(tenant, None, ())``.
+
+        With the authority store the read is scoped to the caller's tenant and to the subject that made
+        the write.
+        """
+
+        producer = self.producer
+        tenant = producer.tenant_for(user_id)
+        if tenant is None:
+            return None, None, ()
+        stored = self.ledger.get_intent(tenant, task_id)
+        if stored is not None and producer.principals is not None:
+            subject = producer.principal_for(user_id).subject_id
+            if stored.intent.actor_id != subject:
+                stored = None
+        return tenant, stored, (self.ledger.receipts(tenant, task_id) if stored else ())
+
+    def _output_resolver(self, task_id: str):
+        from write_producer import stage_output_refs
+
+        payloads = self.producer.payloads
+        return lambda handle: stage_output_refs(payloads, handle, expected_intent_id=task_id)
 
     def job_owner(self, tenant_id: str, task_id: str):
         """The principal an accepted job is bound to (synchronous; used by the enforcer).
@@ -752,19 +1031,113 @@ class TaskManager:
             return None
         return JobOwner(user_id=user.decode() if isinstance(user, bytes) else str(user))
 
-    async def wait_for_result(self, task_id: str, timeout: float = 300.0) -> dict:
+    async def _durable_status(self, task_id: str, user_id: str | None = None) -> dict:
+        """Receipt-facade status for a ledger intent (never derived from ARQ).
+
+        With the authority store the read is scoped to the caller's tenant and
+        to the subject that made the write; anything else is ``not_found``.
+        """
+        from receipts import legacy_task_status
+        from write_producer import MemoryRevisions
+
+        def read():
+            tenant, stored, receipts = self._read_owned_intent(task_id, user_id)
+            if tenant is None:
+                return None, (), None
+            revisions = MemoryRevisions(self.ledger)
+            return stored, receipts, (lambda memory_id: revisions.latest(tenant, memory_id))
+
+        stored, receipts, revision_of = await asyncio.to_thread(read)
+        return legacy_task_status(task_id, stored, receipts, revision_of, self._output_resolver(task_id))
+
+    async def task_outputs(
+        self, task_id: str, user_id: str | None = None, *, offset: int = 0, limit: int = 256
+    ) -> dict | None:
+        """One page of a durable intent's outputs, with aggregated lists expanded; ``None`` if not readable.
+
+        Raises ``LookupError`` when an aggregated list is no longer available (the page would be incomplete).
+        """
+        from receipts import output_view, outputs_compacted, receipt_outputs
+        from write_producer import MemoryRevisions
+
+        if self.producer is None or not task_id.startswith("intent-"):
+            return None
+
+        def read():
+            tenant, stored, receipts = self._read_owned_intent(task_id, user_id)
+            if stored is None:
+                return None
+            pairs, unavailable = receipt_outputs(receipts, self._output_resolver(task_id))
+            if unavailable or outputs_compacted(stored):
+                raise LookupError("the outputs of this task are no longer available")
+            revisions = MemoryRevisions(self.ledger)
+            page = pairs[offset:offset + limit]
+            return {
+                "task_id": task_id,
+                "total": len(pairs),
+                "offset": offset,
+                "limit": limit,
+                "outputs": [output_view(k, i, lambda m: revisions.latest(tenant, m)) for k, i in page],
+                "next_offset": offset + len(page) if offset + len(page) < len(pairs) else None,
+            }
+
+        return await asyncio.to_thread(read)
+
+    async def enqueue_edit(
+        self,
+        *,
+        memory_id: str,
+        user_id: str,
+        changes: dict,
+        expected_revision: int,
+        memory_row: dict,
+        idempotency_key: str | None = None,
+    ) -> tuple[str, int]:
+        """Durably accept a governed correction; returns ``(task_id, new_revision)``.
+
+        Raises ``write_producer.StaleRevision`` (no write) for a stale expected
+        revision, and the ledger's ``IdempotencyConflict`` for key reuse.
+        """
+        result, new_revision = await asyncio.to_thread(
+            self.producer.accept_edit,
+            user_id=user_id,
+            memory_id=memory_id,
+            changes=changes,
+            expected_revision=expected_revision,
+            memory_row=memory_row,
+            idempotency_key=idempotency_key,
+        )
+        try:
+            await self.dispatch_ledger()
+        except Exception:  # noqa: BLE001 - durable accept already happened
+            logger.warning("ledger dispatch failed after accept", exc_info=True)
+        return result.intent_id, new_revision
+
+    async def wait_for_result(
+        self, task_id: str, timeout: float = 300.0, user_id: str | None = None
+    ) -> dict:
         """Wait for a task to complete and return its status.
 
         Used by MCP tools with wait=true.
         """
+        if self.producer is not None and task_id.startswith("intent-"):
+            deadline = time.monotonic() + timeout
+            while True:
+                status = await self._durable_status(task_id, user_id)
+                if status["status"] in ("completed", "failed", "not_found"):
+                    return status
+                if time.monotonic() >= deadline:
+                    return {**status, "status": "failed", "error": "timed out waiting for the receipt"}
+                await asyncio.sleep(0.25)
         job, _ = await self._find_job(task_id)
         try:
             result = await job.result(timeout=timeout)
+            fenced = _fenced_view(result)
             return {
                 "task_id": task_id,
-                "status": "completed",
+                "status": fenced[0] if fenced else "completed",
                 "result": result,
-                "error": None,
+                "error": fenced[1] if fenced else None,
             }
         except Exception as e:
             return {

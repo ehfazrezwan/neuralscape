@@ -418,6 +418,63 @@ SCENARIOS: tuple[Scenario, ...] = (
              "The compose file declares the stores a backup must cover."),
 )
 
+@dataclass(frozen=True)
+class ServicePathScenario:
+    """A scenario that exercises a requirement through the service (route, worker) rather than a library call.
+
+    ``file`` is an integration test module (a path under the service directory) owned by the lane that built the
+    feature; the oracle owner registers it, pins its content hash and names the tests that are the oracle.  A
+    tree without the feature does not have the file, and there the scenario simply fails to exist (the library
+    observation keeps its expected failure).
+    """
+
+    id: str
+    carries: str                 # the baseline scenario whose product requirement this one carries
+    leaves: tuple[str, ...]
+    file: str                    # relative to the service directory
+    file_sha256: str
+    tests: tuple[str, ...]       # the oracle tests; two sides of one flag, so the scenario flips with the feature
+    needs_real_service: bool
+    summary: str
+
+
+SERVICE_PATH_SCENARIOS: tuple[ServicePathScenario, ...] = (
+    ServicePathScenario(
+        "graph-removal-service-path", "graph-removal-shared-support", ("A7.02", "A7.03"),
+        "integration_tests/test_graph_support_aware_removal_integration.py",
+        "875c8a216de6b156be1095c30ce03d2a2be41662d6d6266cd4a4236fc5c37e1a",
+        (
+            "test_api_delete_keeps_a_fact_another_memory_still_supports",
+            "test_a_correction_replaces_the_superseded_episode_and_keeps_still_asserted_facts",
+            "test_with_the_flag_off_the_legacy_cascade_still_expires_the_shared_fact",
+        ),
+        True,
+        "On a real graph and a real row store, deleting one memory through the delete route and correcting one "
+        "keep an edge another memory still supports (detaching the removed episode) and remove edges and orphan "
+        "entities only it supported; with the feature flag off the legacy cascade is the pinned difference.  "
+        "Tenant isolation is not asserted by these tests.",
+    ),
+)
+
+
+# Versioned changes to the meaning of a preserved oracle.  An oracle is never edited to make a
+# candidate pass; when review shows it observes the wrong thing, the scenario keeps its test and
+# gains a revision here that names the new role and what carries the product requirement instead.
+ORACLE_REVISIONS: dict[str, dict[str, str]] = {
+    "graph-removal-shared-support": {
+        "version": "v3",
+        "role": "library-observation",
+        "reason": (
+            "The test drives the vendored library's episode removal, which no service code calls; the product "
+            "removes episodes through the current-stack graph adapter. It stays as an observation of the "
+            "library's behaviour and stops standing for the product requirement. v2 gave it that role; v3 names "
+            "the registered service-path scenario that now carries the requirement."
+        ),
+        "carried_by": "graph-removal-service-path",
+    },
+}
+
+
 _LEAVES_BY_ID = {leaf.id: leaf for leaf in LEAVES}
 
 
@@ -453,6 +510,9 @@ __all__ = [
     "Leaf",
     "SCENARIOS",
     "SCENARIO_KINDS",
+    "SERVICE_PATH_SCENARIOS",
+    "ORACLE_REVISIONS",
+    "ServicePathScenario",
     "Scenario",
     "get_leaf",
     "leaf_state",

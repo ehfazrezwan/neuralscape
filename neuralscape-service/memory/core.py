@@ -130,10 +130,23 @@ class CoreMixin:
         if self._memory is None:
             with self._init_lock:
                 if self._memory is None:
+                    # Every Gemini client the vendored libraries build must reach the configured endpoint
+                    # (unset: unchanged), in the API, every worker queue and a stdio MCP process alike.
+                    from provider_routing import apply_from_settings
+
+                    apply_from_settings(settings)
                     from mem0 import Memory
 
                     config = settings.get_mem0_config()
                     self._memory = _memory_from_config(Memory, config)
+                    # Capture provider usage only when a recorder is installed.
+                    from usage_capture import get_usage_recorder
+
+                    capture_usage = get_usage_recorder() is not None
+                    if capture_usage:
+                        from usage_wrappers import install_mem0_wrappers
+
+                        install_mem0_wrappers(self._memory)
 
                     # Re-attach the Graphiti adapter mem0 v2.0.2 stopped
                     # auto-creating. The MemoryGraph constructor in
@@ -178,6 +191,10 @@ class CoreMixin:
                     if hasattr(self._memory, "graph") and hasattr(self._memory.graph, "graphiti"):
                         self._graphiti = self._memory.graph.graphiti
                         self._bridge = self._memory.graph._bridge
+                        if capture_usage:
+                            from usage_wrappers import install_graphiti_wrappers
+
+                            install_graphiti_wrappers(self._graphiti)
 
                     self._ensure_indexes_at_startup()
 
@@ -256,7 +273,17 @@ class CoreMixin:
         if self._genai_model is None:
             with self._init_lock:
                 if self._genai_model is None:
-                    self._genai_model = genai.Client(api_key=settings.google_api_key)
+                    from provider_routing import apply_from_settings
+
+                    apply_from_settings(settings)
+                    endpoint = getattr(settings, "ns_gemini_base_url", "")
+                    if isinstance(endpoint, str) and endpoint:
+                        from inference_facade import build_gemini_client
+
+                        self._genai_model = build_gemini_client(settings, genai)
+                    else:
+                        # Default (and any mocked setting): unchanged.
+                        self._genai_model = genai.Client(api_key=settings.google_api_key)
         return self._genai_model
 
     def close(self):

@@ -937,6 +937,30 @@ class SqlLedger(LedgerPort):
         records.update(ref.id for ref in intent.target_refs)
         return records
 
+    # The resolver of an aggregated stage output (``receipts.STAGE_OUTPUTS_RESOLVER``): one handle standing for a list
+    # kept outside the ledger.  Named here because the ledger package cannot import the write path.
+    AGGREGATED_OUTPUTS_RESOLVER = "ns:stage-outputs"
+
+    def _touches_held(self, c: Any, tenant_id: str, stored_intent: Intent, intent_id: str, held: set[str]) -> bool:
+        """Whether the intent touched a held record: named by the intent, or created or changed by one of its stages.
+
+        A write that creates a memory does not know its id when it is accepted (its source is a placeholder
+        record); the id exists only as a stage output.  A hold on that memory must keep the intent that created
+        it, so the receipts' output references count.  An output list too long for a receipt is kept behind one
+        aggregated handle the ledger cannot read: while the tenant has any active hold such an intent is left
+        whole (kept, never guessed at); releasing the holds lets it be pruned.
+        """
+
+        if not held:
+            return False
+        if held & self._intent_records(stored_intent):
+            return True
+        for receipt in self._load_receipts(c, tenant_id, intent_id):
+            for ref in receipt.output_refs:
+                if ref.id in held or ref.resolver == self.AGGREGATED_OUTPUTS_RESOLVER:
+                    return True
+        return False
+
     def _is_retired(self, stage: str, row_key: str, row_digest: str) -> bool:
         if stage == "idempotency":
             return row_key.startswith(self.RETIRED_PREFIX)
@@ -970,7 +994,7 @@ class SqlLedger(LedgerPort):
                     break
                 for intent_id, body in rows:
                     last = intent_id
-                    if held & self._intent_records(Intent.model_validate_json(body)):
+                    if held and self._touches_held(c, tenant_id, Intent.model_validate_json(body), intent_id, held):
                         continue  # a held record blocks pruning of the work that touched it
                     found.append(intent_id)
                     if len(found) >= limit:
@@ -1005,7 +1029,7 @@ class SqlLedger(LedgerPort):
         )
         if row is None or self._is_retired(stage, row[0], row[1]):
             return False
-        if self._held_records(c, tenant_id) & self._intent_records(stored.intent):
+        if self._touches_held(c, tenant_id, stored.intent, intent_id, self._held_records(c, tenant_id)):
             return False
         retired = self._retired(intent_id)
         values = json.loads(stored.intent.model_dump_json())

@@ -160,6 +160,29 @@ def test_all_three_worker_settings_use_the_heartbeat_hooks():
         assert cls.on_startup is worker.startup and cls.on_shutdown is worker.shutdown
 
 
+def test_the_ledger_worker_wraps_the_same_hooks():
+    """It runs ``startup``/``shutdown`` (so it beats too) and adds only the engine switch around them."""
+    cls = worker.LedgerWorkerSettings
+    assert cls.on_startup is worker.ledger_startup and cls.on_shutdown is worker.ledger_shutdown
+
+
+@pytest.mark.asyncio
+async def test_the_ledger_worker_hooks_run_the_shared_hooks(monkeypatch):
+    calls = []
+
+    async def fake_startup(ctx):
+        calls.append("startup")
+
+    async def fake_shutdown(ctx):
+        calls.append("shutdown")
+
+    monkeypatch.setattr(worker, "startup", fake_startup)
+    monkeypatch.setattr(worker, "shutdown", fake_shutdown)
+    await worker.ledger_startup({})
+    await worker.ledger_shutdown({})
+    assert calls == ["startup", "shutdown"]
+
+
 # ── the beat survives a slow sync call inside each wrapped task ──────
 
 

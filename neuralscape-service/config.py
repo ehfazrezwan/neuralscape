@@ -226,6 +226,30 @@ class Settings(BaseSettings):
     llm_retry_base_delay: float = 1.0  # seconds
     llm_retry_max_delay: float = 30.0  # seconds
 
+    # ── Recipient-aware inference facade (default OFF) ───────────────
+    # When enabled, the two extraction generate_content calls go through
+    # inference_facade: every primary/fallback recipient is checked against the
+    # processing policy and current authority before content is sent, one
+    # absolute deadline covers retries and fallbacks, and each attempt's usage
+    # is recorded. Off ⇒ the existing retry path is unchanged.
+    inference_facade_enabled: bool = False
+    inference_deadline_seconds: float = 60.0
+    # Empty ⇒ the configured Gemini primary/fallback models are the approved
+    # recipients ("gemini:<model>").
+    inference_approved_recipient_ids: list[str] = []
+    inference_fallback_policy: str = "within_approved_recipients"  # or "deny"
+    inference_policy_epoch: int = 0
+    # Opt in to answering processing-authority questions from this same
+    # configuration.  It cannot deny anything the policy allows, so it is off by
+    # default: without an installed authority every dispatch is denied.
+    inference_static_authority_enabled: bool = False
+
+    # Optional Gemini endpoint override (e.g. an egress proxy or regional
+    # endpoint). Empty ⇒ the SDK default. When set, recipient ids in the
+    # inference facade name the endpoint host so approvals match the real
+    # destination.
+    ns_gemini_base_url: str = ""
+
     # ── pgvector direct-store adapter (default OFF) ──
     # Used as the shadow backend of the engine switch (build_default_switch) when ENGINE_ROUTING_ENABLED.
     # Like the ENGINE_ROUTING_* settings below it has no effect until a later change wires the ledger producer.
@@ -420,6 +444,25 @@ class Settings(BaseSettings):
     # bm25 episode snippets from Graphiti; additive+capped; flip off if the
     # read-latency floor is breached (mission constraint: ≤+20%).
     graph_episode_recall_enabled: bool = True
+    # Support-aware graph removal on delete and correction: removing one memory's
+    # episode keeps every edge another live episode still supports, removes an edge
+    # (and an entity nothing else references) only when its last support goes, and
+    # removes a corrected memory's superseded episode after re-enrichment.  An
+    # episode several memories share (one conversation, several extracted facts)
+    # is removed with the deleted or corrected memory, and the surviving memories
+    # are re-enriched into fresh episodes of their own through the durable path
+    # (a ledger job, or the graph queue), so their facts return and the removed
+    # memory's do not; until then their facts may be absent and their rows carry
+    # graph_reenrich_pending.  Each survivor is re-enriched from its own fact
+    # text, so relations that only the whole conversation expressed do not come
+    # back.  A memory deleted while it is being enriched has the episode just
+    # written removed again.  A superseded episode that cannot be removed is
+    # recorded on the row and retried by the next correction or the delete.  An edge that loses its last support is deleted, not soft-expired,
+    # so views listing expired edges no longer show it.  Off = the legacy
+    # most-restrictive cascade (an edge is expired even when another live
+    # episode supports it).  The governed profile turns it on.
+    graph_support_aware_removal_enabled: bool = False
+
     # Injective graph group ids (env GRAPH_GROUP_ID_INJECTIVE_ENABLED). Off (the
     # default): group ids are exactly the legacy delimiter-joined names, byte for
     # byte, for every id. On: a tuple with a component containing "--", "." or
@@ -804,6 +847,21 @@ class Settings(BaseSettings):
     #   ledger_sqlite_path   → database file on a local filesystem.
     #   ledger_postgres_dsn  → libpq connection string for the cell database.
     ledger_enabled: bool = False
+    #   ledger_cutover_enabled → writes follow the online cutover phase (legacy until started) and the
+    #     privileged cutover admin routes are mounted; off keeps the ledger on whenever ledger_enabled is.
+    ledger_cutover_enabled: bool = False
+    #   ledger_retention_* → retention enforcement (off unless ledger_retention_enabled).  The windows are
+    #     engineering defaults, counted from an intent's terminal time.  Tombstones and the audit record
+    #     are never pruned until configured; tombstone retention is refused unless a backup expiry is set
+    #     and it is at least that expiry plus the restore window.
+    ledger_retention_enabled: bool = False
+    ledger_retention_idempotency_days: float = 7.0
+    ledger_retention_content_days: float = 30.0
+    ledger_retention_stale_processing_hours: float = 24.0
+    ledger_retention_tombstone_days: float | None = None
+    ledger_retention_audit_days: float | None = None
+    ledger_retention_backup_expiry_days: float | None = None
+    ledger_retention_restore_window_days: float = 30.0
     #   ledger_retention_postgres_dsn → a maintenance role that may delete aged tombstones (PostgreSQL only;
     #     the runtime role cannot).  Used only by the tombstone retention
     #     job (PostgreSQL), which a later slice adds.
@@ -816,6 +874,12 @@ class Settings(BaseSettings):
     #     schema must already be migrated and granted (``PostgresLedger(dsn)`` as the owner, then
     #     ``ledger.postgres.grant_runtime_role``).
     ledger_postgres_migrate_on_open: bool = True
+    #   ledger_cron_subjects → JSON object {tenant_id: worker/service-account subject id}.
+    #     With the authority store on, cron-started jobs (dream sweep, playbooks, dedup,
+    #     expiry) are accepted once per listed tenant under that explicit
+    #     subject; a tenant with no entry gets no cron job (never a default user).
+    ledger_cron_subjects: str = ""
+
     # ── Tenant admission control (cell edge; every limit unset = unlimited) ───
     # Mechanism only: no default numbers, no advertised quota (that policy is
     # not selected).  Used by ``tenant_admission`` (ASGI middleware or the edge
@@ -839,6 +903,17 @@ class Settings(BaseSettings):
     authority_postgres_dsn: str = ""
     #   authority_postgres_migrate_on_open → as for the ledger: False is the least-privilege runtime role.
     authority_postgres_migrate_on_open: bool = True
+
+    # ── Durable usage events ───────────────────────────────────────────────
+    # Off by default: no usage event is persisted unless enabled.
+    #   usage_store_backend      → "sqlite" (single-node, WAL, synchronous=FULL) or
+    #                              "postgres".
+    #   usage_store_sqlite_path  → database file on a local filesystem.
+    #   usage_store_postgres_dsn → libpq connection string for the cell database.
+    usage_store_enabled: bool = False
+    usage_store_backend: str = "sqlite"
+    usage_store_sqlite_path: str = "data/usage.sqlite3"
+    usage_store_postgres_dsn: str = ""
 
     # Service
     host: str = "0.0.0.0"
@@ -1286,6 +1361,19 @@ class Settings(BaseSettings):
                 errors.append("LLM_GATEWAY_BASE_URL is required when LLM_GATEWAY_ENABLED is true")
             if not self.llm_gateway_api_key:
                 errors.append("LLM_GATEWAY_API_KEY is required when LLM_GATEWAY_ENABLED is true")
+        if self.engine_routing_enabled is True and self.engine_routing_dimensions <= 0:
+            errors.append("ENGINE_ROUTING_DIMENSIONS must be positive when ENGINE_ROUTING_ENABLED is true")
+        if self.engine_pgvector_enabled is True:
+            if not self.engine_pgvector_dsn:
+                errors.append("ENGINE_PGVECTOR_DSN is required when ENGINE_PGVECTOR_ENABLED is true")
+            if self.engine_pgvector_dimensions <= 0:
+                errors.append("ENGINE_PGVECTOR_DIMENSIONS must be positive when ENGINE_PGVECTOR_ENABLED is true")
+        if self.ns_gemini_base_url:
+            from urllib.parse import urlsplit
+
+            parts = urlsplit(self.ns_gemini_base_url)
+            if parts.scheme not in ("http", "https") or not parts.hostname or parts.username or parts.password:
+                errors.append("NS_GEMINI_BASE_URL must be an http(s) URL without embedded credentials")
         if self.connectors_enabled and not self.vault_key:
             errors.append("NEURALSCAPE_VAULT_KEY is required when CONNECTORS_ENABLED is true")
         # Federated login: a non-token provider needs the OAuth AS turned on

@@ -1,9 +1,9 @@
 """The service with ``LEDGER_ENABLED=true``: configuration is checked at startup and ordinary writes still work.
 
-In this slice the ledger is a library: no write is routed through it (the producer on the task manager stays
-``None``), so with the flag on the service must behave as it does with the flag off.  These tests prove that
-turning the flag on neither breaks the app nor changes a write's answer, and that the ledger the flag points at
-can be opened and migrated.
+Without a producer on the task manager (the state before ``TaskManager.connect`` opens the ledger) the flag changes
+no write's answer; with one, the write routes accept durably.  These tests prove that turning the flag on neither
+breaks the app nor changes a write's answer in the first state, and that the ledger the flag points at can be
+opened and migrated.  The durable answers themselves are in ``test_v1_durable_write`` and ``test_producers_*``.
 
 These need no external service (the queue is faked) and run with the ordinary suite.  The real-Redis write
 is ``integration_tests/test_ledger_flag_on_real_redis.py``.
@@ -99,15 +99,15 @@ def test_flag_on_write_still_answers_on_the_legacy_path(flag_on, fake_queue):
     assert "idempotency_key" not in fake_queue.pool.enqueue_job.await_args.kwargs
 
 
-def test_flag_on_idempotency_key_header_is_ignored_until_writes_use_the_ledger(flag_on, fake_queue):
+def test_flag_on_without_a_producer_the_idempotency_key_header_is_ignored(flag_on, fake_queue):
     client = TestClient(main.app)
     resp = client.post("/v1/memories/raw", json=_RAW, headers={"Idempotency-Key": "retry-1"})
     assert resp.status_code == 202
-    # Not durable: an over-long key is not validated either, so the header can never make a write fail.
+    # Not durable (no producer): an over-long key is not validated either, so the header can never make a write fail.
     assert client.post("/v1/memories/raw", json=_RAW, headers={"Idempotency-Key": "x" * 500}).status_code == 202
 
 
-def test_flag_on_batch_write_answer_on_the_legacy_path(flag_on, fake_queue):
+def test_flag_on_without_a_producer_a_batch_answers_on_the_legacy_path(flag_on, fake_queue):
     client = TestClient(main.app)
     headers = {"Idempotency-Key": "retry-2"}
     batch = client.post("/v1/memories/raw/batch", json={"memories": [_RAW]}, headers=headers)
@@ -115,28 +115,33 @@ def test_flag_on_batch_write_answer_on_the_legacy_path(flag_on, fake_queue):
     assert batch.json()["task_id"]
 
 
-class _FakeProducer:
-    """Stands in for a ledger producer so the task manager reports the durable route."""
-
-
 @pytest.fixture()
 def durable(monkeypatch, flag_on, fake_queue):
-    fake_queue.producer = _FakeProducer()
-    monkeypatch.setattr(fake_queue, "_durable_route", lambda: True)
+    """The task manager as ``connect`` leaves it with the flag on: a real ledger and write producer."""
+
+    from ledger.sqlite import SqliteLedger
+    from write_producer import DurableWriteProducer, SqlitePayloadStore
+
+    ledger = SqliteLedger(str(flag_on))
+    payloads = SqlitePayloadStore(str(flag_on) + ".payloads")
+    fake_queue.ledger, fake_queue.producer = ledger, DurableWriteProducer(ledger, payloads)
     assert main._durable() is True
-    return fake_queue
+    yield fake_queue
+    payloads.close()
+    ledger.close()
 
 
 def test_durable_branch_accepts_an_idempotency_key_without_a_500(durable):
-    # The durable wiring hands the key to the task manager; the manager accepts it (unused until writes
-    # use the ledger) instead of raising TypeError.
     client = TestClient(main.app)
     headers = {"Idempotency-Key": "retry-4"}
-    assert client.post("/v1/memories/raw", json=_RAW, headers=headers).status_code == 202
+    first = client.post("/v1/memories/raw", json=_RAW, headers=headers)
+    assert first.status_code == 202 and first.json()["task_id"].startswith("intent-")
+    again = client.post("/v1/memories/raw", json=_RAW, headers=headers)
+    assert again.status_code == 202 and again.json()["task_id"] == first.json()["task_id"]  # the original intent
     assert client.post("/v1/memories/raw/batch", json={"memories": [_RAW]}, headers=headers).status_code == 202
     legacy = client.post("/memories/async", json={"messages": [{"role": "user", "content": "hello"}], "user_id": "alice"},
                          headers=headers)
-    assert legacy.status_code == 200 and legacy.json()["task_id"]
+    assert legacy.status_code == 200 and legacy.json()["task_id"].startswith("intent-")
 
 
 def test_durable_branch_rejects_an_over_long_idempotency_key(durable):

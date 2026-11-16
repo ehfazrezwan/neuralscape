@@ -281,15 +281,17 @@ async def _make_llm_call(settings: DreamingSettings):
     a broken LLM disabled consolidation forever.
     """
     from extensions.conversation_compiler.compile import _async_call_gemini
+    from usage_capture import operation_scope
 
     async def call(prompt: str) -> str:
         last_exc: Exception | None = None
         attempts = max(1, settings.llm_max_retries + 1)
         for attempt in range(attempts):
             try:
-                return await asyncio.wait_for(
-                    _async_call_gemini(prompt), timeout=settings.llm_timeout_seconds
-                )
+                with operation_scope("llm_dreaming"):
+                    return await asyncio.wait_for(
+                        _async_call_gemini(prompt), timeout=settings.llm_timeout_seconds
+                    )
             except Exception as exc:  # timeout or transport — retry with backoff
                 last_exc = exc
                 logger.warning(

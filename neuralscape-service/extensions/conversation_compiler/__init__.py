@@ -30,6 +30,15 @@ from .routes import create_router
 
 logger = structlog.get_logger(__name__)
 
+
+def _ledger_on(task_manager) -> bool:
+    """True only when the durable ledger is enabled *and* this task manager has a producer."""
+
+    from config import settings
+
+    return bool(settings.ledger_enabled and task_manager is not None
+                and getattr(task_manager, "producer", None) is not None)
+
 # Load manifest from JSON file
 _MANIFEST_PATH = Path(__file__).parent / "manifest.json"
 _manifest_data = json.loads(_MANIFEST_PATH.read_text(encoding="utf-8"))
@@ -265,6 +274,10 @@ class ConversationCompilerExtension:
         logger.info("Auto-compile triggered on session end", date=today)
 
         # PRIMARY FIX: enqueue to ARQ instead of blocking the event loop
+        if self._task_manager and _ledger_on(self._task_manager):
+            task_id = await self._task_manager.enqueue_conversation_compile(today, user_id)
+            return {"status": "accepted", "task_id": task_id, "date": today}
+
         if self._task_manager and self._task_manager.pool:
             try:
                 job = await self._task_manager.pool.enqueue_job(

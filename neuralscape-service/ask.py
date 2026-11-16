@@ -171,14 +171,16 @@ def _make_llm_call(tier: ReasoningTier):
     the caller needs an honest failure, not a silent empty answer.
     """
     from extensions.conversation_compiler.compile import _async_call_gemini
+    from usage_capture import operation_scope
 
     async def call(prompt: str) -> str:
         last_exc: Exception | None = None
         for attempt in range(2):  # one retry — the caller is waiting
             try:
-                return await asyncio.wait_for(
-                    _async_call_gemini(prompt), timeout=tier.llm_timeout_s
-                )
+                with operation_scope("llm_ask"):
+                    return await asyncio.wait_for(
+                        _async_call_gemini(prompt), timeout=tier.llm_timeout_s
+                    )
             except Exception as exc:  # timeout or transport
                 last_exc = exc
                 logger.warning(
@@ -545,6 +547,34 @@ def _clip_words(answer: str, max_words: int) -> str:
 
 
 async def ask_memory(
+    service,
+    *,
+    question: str,
+    user_id: str,
+    reasoning_level: str = "low",
+    project_id: str | None = None,
+    llm_call=None,
+) -> dict:
+    """Answer ``question`` from the caller's memories at ``reasoning_level``.
+
+    The provider calls made under it (the answering model, and the searches' embeddings) are
+    attributed to ``user_id`` when usage capture is on (``usage_capture.ensure_attempt``).  See
+    :func:`_ask_memory` for the contract.
+    """
+    from usage_capture import ensure_attempt
+
+    with ensure_attempt(user_id, "ask"):
+        return await _ask_memory(
+            service,
+            question=question,
+            user_id=user_id,
+            reasoning_level=reasoning_level,
+            project_id=project_id,
+            llm_call=llm_call,
+        )
+
+
+async def _ask_memory(
     service,
     *,
     question: str,
