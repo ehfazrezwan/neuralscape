@@ -114,6 +114,7 @@ file, each preceded by a stack restart with that file's lines added to the API a
 | `oauth-supabase` | `AUTH_PROVIDER=supabase` against a fake Supabase auth service (sidecar `nsc-acc-supabase` serving the project's JWKS), plus the domain and exact-address sign-in allowlists | `test_oauth` (provider part), `test_oauth_supabase_login` (end-to-end sign-in) |
 | `cbm` | `CBM_ENABLED`, service `cbm-bridge` | `test_code_graph_cbm` |
 | `docling` | Docling + `EXEMPLAR_STORE_ENABLED` + `DOCLING_EXTRACT_IMAGES` | `test_ingest` (Docling), `test_exemplars` |
+| `autoheal` | `NS_TEST_STALL_HEARTBEAT_FILE` on the workers, service `autoheal`; destructive, see "Autoheal" | `test_fault_injection_autoheal` |
 | `legacy-key` | `NEURALSCAPE_API_KEY=<generate:hex32>` + `NEURALSCAPE_API_KEY_USER_ID=acc-legacy`; the gate exports the key as `NS_LEGACY_KEY`; **own stack restart** | `test_legacy_key` |
 
 **Placeholders.** No secret is written in a profile. A line like `VAULT_KEY=<generate:fernet>` (or
@@ -164,7 +165,8 @@ the seeds on the single graph worker) and the native index; budget about 15 minu
   one function, `guard.check_compose_project`: case-insensitive after strip, refuses `neuralscape`, and refuses any name
   outside the disposable prefix `nstest-` (add prefixes only with `NS_COMPOSE_ALLOWLIST`).
   Only two read-only `exec` forms exist besides the Qdrant one: vault `grep -rl` under `/data/vault` and
-  `redis-cli GET ns:connector:<id>`.
+  `redis-cli GET ns:connector:<id>`; the destructive ones (`NS_ALLOW_DESTRUCTIVE=1`) are `redis-cli FLUSHALL` and
+  `touch` / `rm -f` of the worker stall file.
 - **LLM-dependent assertions** (an LLM decision, not wording, but a decision nonetheless): the contradicting fact is
   invalidated (not merged), a reflection insight is stored, the identity card keeps the user's name token, speaker
   attribution on two real extractions, the Docling figure detection. A red here is a real finding for the owning lane
@@ -396,10 +398,41 @@ Runtime estimate (2 CPUs): seeding with graph enrichment 2-5 min, backup 2-5 min
 the after-backup marker with its graph episode 2-5 min, wipe 1-2 min, restore 3-6 min, checks 1-3 min:
 about 12-25 min, every wait bounded (the whole fixture cannot exceed about 90 min).
 
-**`ops.autoheal` is NOT proven here.** The autoheal sidecar (behind the docker-socket proxy) restarts a
-container whose healthcheck turns `unhealthy`, but no labelled container has a healthcheck the harness can
-fail and then restore through an allow-listed command: the workers' check is `python -c "sys.exit(0)"`, and
-the API's probes `/health/live` on its own port (breaking it would need signals or file edits inside the
-container, and a stopped process is only recovered by the very restart under test). `docker pause` does not
-count (paused containers run no checks). Left unproven rather than forced; a clean proof needs a test hook in
-the product (for example a healthcheck that reads a file the harness may remove).
+## Autoheal (destructive; `test_fault_injection_autoheal.py`)
+
+Atlas `ops.autoheal`. Wedges the fast ARQ worker with the product's own test hook and proves the `autoheal`
+sidecar restarts it and it then takes work again. The worker touches `/tmp/ns-worker.heartbeat` every 10 s
+from its event loop; its compose healthcheck fails when that file is older than 240 s (every 30 s, 3 retries);
+while the file named by `NS_TEST_STALL_HEARTBEAT_FILE` exists the worker stops beating. The scenario:
+precondition (a failure, never a skip) that the `autoheal` service runs in the project and the worker carries
+the project-scoped label `com.neuralscape.autoheal.<compose project name>=true`; `touch` the stall file in the
+worker; wait (at most 9 min) for health `unhealthy`, then for the container's `State.StartedAt` to change;
+remove the stall file; wait for `healthy`; check a fresh REST write completes and is listed. Autoheal restarts
+through Docker's restart API, so `RestartCount` must NOT move (a crash would move it); the pure check
+`check_autoheal_recovery` asserts that, exactly one restart, and unhealthy-before-restart. The stall file is
+removed in a `finally`; if autoheal never acts the harness removes the file, runs `compose restart <worker>`,
+waits for the worker, and still fails the scenario. Negative control: the same checks on canned inspections
+(StartedAt unchanged, stays unhealthy, never unhealthy, RestartCount moved) and on canned wiring (no sidecar,
+old unscoped label, another project's label, opted-out value) must fail.
+
+**Stall path.** `/dev/shm/ns-test-stall-hb`: `/dev/shm` is a per-container tmpfs that Docker mounts empty on
+every container start, so a stall file cannot survive the restart and wedge the worker a second time (`/tmp`
+does survive a restart). The scenario does not rely on that: it deletes the file right after it sees the restart
+and again in the `finally`.
+
+**What the gate must provide** (a dedicated destructive run, throwaway project, about 10 minutes):
+
+- the compose project's `autoheal` service running (its `docker-socket-proxy` dependency comes up with it), in the
+  SAME compose project as the stack; the workers must carry `com.neuralscape.autoheal.<project>=true` (PR #610's
+  label key; `WORKER_AUTOHEAL` must not be `false`);
+- `profiles/autoheal.env` applied to the API and every worker (`NS_TEST_STALL_HEARTBEAT_FILE=/dev/shm/ns-test-stall-hb`;
+  `NS_TEST_HOOKS_ALLOW_WITH_PUBLIC_URL=1` is in the profile for stacks that set a public URL), with a stack restart
+  before the run; the profile header is `# requires: compose` + `# services: autoheal`;
+- `NS_ALLOW_DESTRUCTIVE=1`, `--compose-project <disposable name>` and `--profile autoheal`, selected with the
+  destructive pass's `-k "test_fault_injection or test_backup_restore"`. It is not part of any other profile's run.
+
+New allow-listed compose forms (`nsaccept/restore.py`, both need `NS_ALLOW_DESTRUCTIVE=1`, API/worker services
+only, the path must match `/dev/shm/ns-test-stall-[a-z0-9-]{1,32}`): `exec -T <service> touch <path>` and
+`exec -T <service> rm -f <path>`. The read-only `runctx.container_inspect(<container id>)` returns health, StartedAt,
+RestartCount, state and labels from `docker inspect --format` (never the environment). Each refusal is self-tested
+(`selftest/test_autoheal_plumbing.py`).
