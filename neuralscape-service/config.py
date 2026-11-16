@@ -477,6 +477,14 @@ class Settings(BaseSettings):
     # (Object storage — GCS/S3 — is a later swap behind this same interface.)
     ingest_storage_enabled: bool = True
     ingest_storage_dir: str = "~/.neuralscape/ingest"  # volume mount in prod
+    # Orphan-artifact sweep (ingest worker cron). Off by default: it deletes
+    # files. When on, it only ever removes an artifact that NO memory row
+    # references (by its owner) and that is older than the grace period; with
+    # ``artifact_gc_dry_run`` (default True) it only reports what it would
+    # remove. Env: ARTIFACT_GC_ENABLED / ARTIFACT_GC_DRY_RUN / ARTIFACT_GC_GRACE_DAYS.
+    artifact_gc_enabled: bool = False
+    artifact_gc_dry_run: bool = True
+    artifact_gc_grace_days: int = Field(default=7, ge=1)
 
     # ── Visual setup exemplars (VISUAL_EXEMPLARS_SPEC) ───────────────
     # The trading adapter can extract chart images from a book, store the bytes,
