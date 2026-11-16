@@ -138,6 +138,8 @@ Configured in `neuralscape-service/logging_config.py` via structlog. Two knobs:
 - `LOG_LEVEL` (default `INFO`)
 - `LOG_FORMAT` (`json` default; `console` for local dev)
 
+Both (and `NEURALSCAPE_EXTENSIONS`) are settings: the process environment wins when it sets them, otherwise the service `.env` applies. Both env templates (`.env.example`, `.env.production`) load as `neuralscape-service/.env` for a local run; keys marked "Compose-only" in them, and keys owned by the extension settings (`DREAMING_*`, `STRATEGY_SYNTHESIZER_*`, the conversation compiler's keys), are accepted there, while any other unknown key is still rejected (`tests/test_env_templates.py`).
+
 The processor chain is `merge_contextvars → add_log_level → add_logger_name → TimeStamper(iso) → StackInfoRenderer → UnicodeDecoder`, then either `JSONRenderer` or `ConsoleRenderer` (`logging_config.py:23-35`). Output goes to stdout so docker captures it. Per-logger noise reduction at `logging_config.py:63-64` clamps `httpcore`, `httpx`, `neo4j`, `urllib3`, and `uvicorn.access` to WARNING — keep this in mind if you are debugging Neo4j driver issues and need to bump that one up.
 
 ## Scripts

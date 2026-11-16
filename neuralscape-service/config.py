@@ -9,11 +9,75 @@ from urllib.parse import urlparse
 
 from arq.connections import RedisSettings
 from pydantic import Field, field_validator, model_validator
-from pydantic_settings import BaseSettings, NoDecode
+from pydantic_settings import BaseSettings, NoDecode, PydanticBaseSettingsSource
 
 _logger = logging.getLogger(__name__)
 
 _LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1", "[::1]"}
+
+# ── Keys a service .env may hold that Settings does not own ──────────────────
+# Settings reads ``.env`` from the working directory and rejects unknown keys, so a
+# typo fails loudly. Three kinds of keys in that file are legitimate without being
+# Settings fields, and only these are tolerated (and only from the file):
+#
+# * Compose-only keys: read by ``docker compose`` for interpolation in
+#   docker-compose*.yml, never by the service. They appear in the env templates so
+#   the same file can serve both a Compose run and a local run.
+COMPOSE_ONLY_KEYS = frozenset({
+    "CLOUDFLARE_TUNNEL_TOKEN",  # cloudflared sidecar
+    "DOMAIN",  # reverse-proxy host name
+    "REDIS_PASSWORD",  # interpolated into REDIS_URL and the redis service
+    "EMBEDDING_MODEL_NAME",  # interpolated into GEMINI_EMBEDDER_MODEL
+})
+# * Vendored-env keys: read straight from the process environment by vendored library
+#   code (mem0 adapter), not by Settings. Tolerated in the file so a template can
+#   document them, but a value there is NOT read by a local run: export it instead.
+VENDORED_ENV_KEYS = frozenset({
+    "GRAPHITI_BRIDGE_TIMEOUT_S",  # mem0 graphiti adapter: per-call bridge timeout
+})
+# * Keys owned by the extension settings classes that read the same ``.env``
+#   (extensions/*/config.py, which config.py cannot import; a test keeps these in
+#   step): every key under a prefixed class's env prefix (those classes ignore
+#   unknown keys themselves), and the field names of the unprefixed class.
+EXTENSION_ENV_PREFIXES = ("DREAMING_", "STRATEGY_SYNTHESIZER_")
+EXTENSION_ENV_KEYS = frozenset({  # conversation_compiler.config.CompilerSettings (no prefix)
+    "OBSIDIAN_VAULT_PATH", "COMPILER_LLM_MODEL", "COMPILE_AFTER_HOUR", "AUTO_COMPILE", "NEURALSCAPE_URL",
+})
+
+
+def _owned_elsewhere(key: str) -> bool:
+    upper = key.upper()
+    return upper in COMPOSE_ONLY_KEYS or upper in VENDORED_ENV_KEYS or upper in EXTENSION_ENV_KEYS or upper.startswith(EXTENSION_ENV_PREFIXES)
+
+
+class _ServiceDotEnvSource(PydanticBaseSettingsSource):
+    """The ``.env`` source minus keys owned elsewhere (see above); everything else unchanged."""
+
+    def __init__(self, settings_cls: type[BaseSettings], inner: PydanticBaseSettingsSource) -> None:
+        super().__init__(settings_cls)
+        self._inner = inner
+
+    def _set_current_state(self, state: dict) -> None:
+        super()._set_current_state(state)
+        self._inner._set_current_state(state)
+
+    def _set_settings_sources_data(self, states: dict) -> None:
+        super()._set_settings_sources_data(states)
+        self._inner._set_settings_sources_data(states)
+
+    def get_field_value(self, field, field_name):  # pragma: no cover - __call__ delegates whole
+        return self._inner.get_field_value(field, field_name)
+
+    def __call__(self) -> dict:
+        fields = self.settings_cls.model_fields
+        return {k: v for k, v in self._inner().items() if k in fields or not _owned_elsewhere(k)}
+
+
+def process_env_or(name: str, configured: str) -> str:
+    """A flag the process environment may set at call time (as it always could); otherwise its
+    configured value from ``settings`` (the service .env, then the default)."""
+    value = os.environ.get(name)
+    return configured if value is None else value
 
 
 # Dimension of the mem0 / Qdrant vectors (embedder ``embedding_dims`` and the
@@ -43,6 +107,12 @@ class Settings(BaseSettings):
     # fixed at VECTOR_EMBEDDING_DIMS; recall compares the two on the common
     # Matryoshka prefix (see docs/GRAPH_EMBEDDING_DIMENSION.md).
     graphiti_embedding_dim: int = Field(default=1024, ge=1)
+
+    # ── Process-level flags ───────────────────────────────────────────
+    # Read through ``process_env_or`` (the process environment at call time
+    # first, exactly as before), so a value in the service .env applies too.
+    # (log_level / log_format are declared at the top of this class.)
+    neuralscape_extensions: str = ""  # comma-separated import paths (extensions discovery)
 
     # Hybrid experiments are independently opt-in; each needs its flag plus an endpoint and key.
     hybrid_inference_api_key: str = Field(default="", repr=False)
@@ -168,6 +238,21 @@ class Settings(BaseSettings):
     graph_supersession_enabled: bool = False
     graph_supersession_min_similarity: float = 0.85
     graph_supersession_margin: float = 0.05
+
+    # ── Graph-leg latency budget (flag, default OFF) ──────────────────
+    # search() overlaps the Graphiti leg with the vector pools and joins it
+    # before the weave. Off (default): the join waits up to 45 s (the inner
+    # bridge call is 30 s), so a wedged graph stalls a recall whose vector
+    # results are already in hand. On: the join waits at most
+    # GRAPH_LEG_BUDGET_S seconds measured from when the leg was SUBMITTED,
+    # then the recall returns the vector-only results and logs one warning.
+    # The late leg is left to finish on its own pool thread. Caveat: after a
+    # sustained slow graph, stuck legs (up to the 30 s bridge timeout + 10 s
+    # enrichment) can hold all 16 pool threads, so searches stay vector-only
+    # until threads free, i.e. within ~40 s of the graph recovering.
+    # Env: GRAPH_LEG_BUDGET_ENABLED, GRAPH_LEG_BUDGET_S.
+    graph_leg_budget_enabled: bool = False
+    graph_leg_budget_s: float = 4.0
 
     # Dedup cron
     dedup_similarity_threshold: float = 0.95
@@ -309,6 +394,17 @@ class Settings(BaseSettings):
     # bm25 episode snippets from Graphiti; additive+capped; flip off if the
     # read-latency floor is breached (mission constraint: ≤+20%).
     graph_episode_recall_enabled: bool = True
+    # Injective graph group ids (env GRAPH_GROUP_ID_INJECTIVE_ENABLED). Off (the
+    # default): group ids are exactly the legacy delimiter-joined names, byte for
+    # byte, for every id. On: a tuple with a component containing "--", "." or
+    # any character outside [A-Za-z0-9_-] is named "nsg1--<hex>" so distinct
+    # (user, project, workspace) tuples can never share a namespace. Enabling
+    # re-homes those ids' future graph writes: run
+    # scripts/migrate_graph_groups.py --audit-delimiter-ids first. The read-side
+    # call sites (memory/search.py narrowed branches, memory/reads.py
+    # list_projects, dreaming card/consolidate pool names) must adopt the
+    # builder before this is enabled.
+    graph_group_id_injective_enabled: bool = False
     # Bounded second-chance re-ask for false abstentions (T2.1): when the
     # normal answering loop produces an abstention AND at least one evidence
     # row shares ≥2 content keywords with the question, re-ask ONCE with
@@ -535,6 +631,21 @@ class Settings(BaseSettings):
     # digests of tokens to reject with 401. Get a digest with
     # `python scripts/revoke_token.py <token>`. Empty = no revocation.
     neuralscape_revoked_tokens: str = ""
+    # Live revocation: digests also live in the Redis set `ns:auth:revoked_tokens`
+    # (`scripts/revoke_token.py --redis`). Each API process keeps a snapshot of
+    # that set and re-reads it at most every this-many seconds (0 = every
+    # request). Staleness bound for a revocation = this value.
+    revocation_refresh_interval_seconds: float = 5.0
+    # Connect/read timeout for that read, so a Redis outage costs one short
+    # delay per interval, not one per request.
+    revocation_redis_timeout_seconds: float = 1.0
+    # Cold start: until this process has completed ONE successful read of the
+    # Redis revocation set, per-user tokens are refused with 503 + Retry-After
+    # (not 401, so clients retry instead of dropping credentials). The env list
+    # is enforced either way. false = fail open on the Redis list (warning only).
+    revocation_fail_closed_on_cold_start: bool = True
+    # Retry interval for that first load (seconds; capped by the refresh interval).
+    revocation_cold_retry_seconds: float = 1.0
     # Multi-user HMAC-signed tokens. When set, the server also accepts tokens of the
     # form `{base64url(payload)}.{hmac_sha256(secret, payload)}` where payload is
     # `{"user_id": "...", "exp": <unix-ts>}`. The verified user_id is attached to
@@ -745,6 +856,20 @@ class Settings(BaseSettings):
         return backend
 
     @model_validator(mode="after")
+    def _refuse_injective_group_ids_until_read_side_adopted(self) -> "Settings":
+        # Fail closed: with this on, writes use nsg1-- names but the narrowed read
+        # branches (memory/search.py), list_projects (memory/reads.py) and the
+        # dreaming pool names still use legacy names, so reads would miss writes
+        # (and a '--' user id would query another user's legacy pool). Remove this
+        # guard in the PR that routes those call sites through the group-id builder.
+        if self.graph_group_id_injective_enabled:
+            raise ValueError(
+                "GRAPH_GROUP_ID_INJECTIVE_ENABLED cannot be enabled yet: the read-side call sites "
+                "have not adopted the injective group-id builder (tracked follow-up, lane read-10)"
+            )
+        return self
+
+    @model_validator(mode="after")
     def _validate_ledger_target(self) -> "Settings":
         # Fail at startup, not at the first write, when the ledger is on but has nowhere to live.
         if not self.ledger_enabled:
@@ -754,6 +879,13 @@ class Settings(BaseSettings):
         if self.ledger_backend == "postgres" and not self.ledger_postgres_dsn.strip():
             raise ValueError("LEDGER_ENABLED with LEDGER_BACKEND=postgres requires LEDGER_POSTGRES_DSN")
         return self
+
+    @field_validator("graph_leg_budget_s")
+    @classmethod
+    def _validate_graph_leg_budget(cls, value: float) -> float:
+        if not (math.isfinite(value) and value > 0):
+            raise ValueError("GRAPH_LEG_BUDGET_S must be a finite number > 0")
+        return value
 
     @field_validator("tenant_admission_rate_per_second")
     @classmethod
@@ -787,6 +919,13 @@ class Settings(BaseSettings):
         if value <= 0:
             raise ValueError("OAuth token TTLs must be > 0 seconds")
         return value
+
+    @classmethod
+    def settings_customise_sources(cls, settings_cls, init_settings, env_settings, dotenv_settings,
+                                   file_secret_settings):
+        # Same sources and priority as the default; the .env source tolerates the
+        # Compose-only and extension-owned keys declared at the top of this module.
+        return init_settings, env_settings, _ServiceDotEnvSource(settings_cls, dotenv_settings), file_secret_settings
 
     @field_validator("code_repos", mode="after")
     @classmethod

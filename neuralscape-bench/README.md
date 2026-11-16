@@ -5,6 +5,33 @@ End-to-end performance benchmark + dashboard for the Neuralscape memory service.
 Drives the REST API and measures four metric families, with a one-shot A/B that
 compares the untuned `dev` baseline against a tuned candidate branch.
 
+> **Status: benchmark runs are paused.** The harnesses, their tests and CI are
+> maintained, but no new measurements are being taken or published. Everything
+> under `results/` is a historical record from older Neuralscape commits (see
+> [`results/README.md`](results/README.md)); none of it is a publishable number.
+> Do not quote a figure from this directory without that context.
+
+## Module map
+
+All paths are relative to `neuralscape-bench/`.
+
+| Path | What it is |
+|---|---|
+| `neuralscape_bench/runner.py` | Single-run latency/throughput engine (`python -m neuralscape_bench.runner`). |
+| `neuralscape_bench/stress.py` | Multi-user concurrency stress test. |
+| `neuralscape_bench/orchestrator.py` | One-shot A/B of a baseline stack against a candidate branch. |
+| `neuralscape_bench/dashboard.py`, `static/` | FastAPI dashboard over `results/*.json`. |
+| `neuralscape_bench/client.py`, `models.py` | Async REST client; pure data models and statistics. |
+| `neuralscape_bench/accuracy/` | Memory-accuracy battery: `run.py` (CLI), `stack.py` (isolated stack up/down), `ingest.py`, `answer.py`, `judge.py`, `metrics.py`, `report.py`, `costs.py`, `download.py`, `sampling.py`, `schema.py`, `manifest.py` (resume state). |
+| `neuralscape_bench/accuracy/suites/` | One loader per suite: `locomo`, `longmemeval`, `dmr`, `beam`, `convomem`, `membench`. |
+| `neuralscape_bench/service_baseline/` | Mechanics-only service baseline harness (fake provider, closed-loop driver, run recorder). Usage and safety rules: [`scripts/service_baseline/README.md`](scripts/service_baseline/README.md). |
+| `neuralscape_bench/run_manifest.py` | Deterministic run-record models (evidence about a run; not an authorization). |
+| `icebench/` | Code-intelligence benchmark: `run.py` (CLI: `corpora`, `index`, `query`, `score`, `report`), `corpora.py`, `corpus_filters.py`, `rail.py` (memory cap + timeout), `schema.py`, `adapters/` (Neuralscape engines), `systems/` (standalone competitor adapters; see [`icebench/systems/CAPABILITIES.md`](icebench/systems/CAPABILITIES.md)), `trackq/` (query generation, oracle, scoring), `tokensave/` (token-savings navigation benchmark), `report/` (Markdown + HTML report). |
+| `trackb/` | Track B harnesses that follow a competitor's published method: `longmemeval_ref/`, `mem0_locomo/`, and `mem0_tracka/` (a mem0 control run under the Track A settings). |
+| `scripts/` | CI helpers (`ci_run_suite.sh`, `ci_skip_gate.py`, `ci_wheel_smoke.py`) and `service_baseline/` scripts. |
+| `ci/expected_skips.json` | Declared skips for the skip gate. |
+| `tests/`, `icebench/**/tests`, `trackb/**/tests` | The test suites. |
+
 ## Metrics
 
 - **Write latency** — `POST /v1/memories/raw`: enqueue (202) latency *and*
@@ -112,7 +139,22 @@ the competitors' *self-reported* figures.
 Datasets download at run time into `datasets/` (**gitignored — never
 committed**). Raw per-question outputs (contain conversation text) live under
 `results/raw/` (gitignored). Only aggregate `results/accuracy-*.json` +
-battery markdown are committed.
+battery markdown are committed, and those are historical (see
+[`results/README.md`](results/README.md)).
+
+Suite notes that follow from the current code:
+
+- **BEAM retrieval recall is reported as incompatible**, not as a number. Its
+  gold ids are user-level while its documents are whole multi-turn
+  conversations, so session attribution does not apply; reports print
+  `n/a (incompatible: ...)` for that column (`retrieval_incompatible` in
+  `accuracy/suites/beam.py`). BEAM answer accuracy is still judged.
+- **ConvoMem question ids are namespaced per category** so ids from different
+  categories cannot collide (this fixed a resume/judging defect).
+- **DMR:** speaker identity is no longer encoded twice in turn content, and
+  every session gets a deterministic `occurred_at` anchored to a fixed time.
+- **Run manifest (pending #542):** an opt-in `--manifest` option on the accuracy
+  runner that records a `run_manifest` for the run is in review and not yet on `dev`.
 
 > BEAM note: Honcho publishes BEAM results (github.com/plastic-labs/honcho-benchmarks
 > holds their result JSONs), but that repo contains no dataset/harness — the
@@ -157,7 +199,10 @@ correct. 429/5xx everywhere get exponential backoff — throttle, don't fail.
 write→recall→ask). A post-dream re-run is the NS-differentiator experiment
 and is deliberately left as future work.
 
-### Estimated full-run token costs (analytic — no paid runs yet)
+### Estimated full-run token costs (analytic estimates)
+
+These are model-based estimates, not measured spend. They predate the
+historical runs in `results/`, and a real run's cost can differ.
 
 From `--phase estimate` over the real datasets (assumptions: 4 chars/token;
 ingest = 3.5 LLM input passes per session token (NS extraction + Graphiti
@@ -182,9 +227,53 @@ haystack suites (LME, DMR, ConvoMem, MemBench). LongMemEval_M is ~10× S on
 ingest — run it only after S numbers justify it. Wall-clock is dominated by
 extraction/enrichment throughput of the single-stack worker, not tokens.
 
+## ICEBench (code intelligence)
+
+`icebench/run.py` drives the `corpora -> index -> query -> score -> report`
+flow. By default the indexed corpus copy has **docstrings stripped**, so the
+`nl_locate` queries (which are docstrings) are not present verbatim in what the
+systems index. `--no-strip-docstrings` (on `index` and `query`, which must
+agree) indexes the corpus unmodified; the run is then labelled as a leaked
+upper bound and the report carries that protocol label. See
+`docs/ice-benchmark/ice-fable-review.md` section 3.1 for why this exists.
+
+Competitor adapters live in `icebench/systems/`; what each one calls is in
+[`icebench/systems/CAPABILITIES.md`](icebench/systems/CAPABILITIES.md).
+
 ## Tests
 
 ```bash
 uv run pytest -q   # pure stats, client request/poll (mocked transport), dashboard API,
                    # accuracy suite parsers/metrics/judge/manifests (fixture-based)
 ```
+
+### CI coverage (`.github/workflows/bench-ci.yml`)
+
+The `bench-ci` workflow runs on pull requests and pushes that touch
+`neuralscape-bench/**` (documentation-only changes included). It builds the
+wheel and runs the suites against the **installed wheel**, not the source tree,
+on the host and again in a container with no network:
+
+- copied suites: `tests/`, `icebench/tests`, `icebench/trackq/tests`,
+  `icebench/tokensave/tests`;
+- suites run from the installed package (`--pyargs`): `icebench/report`, the
+  `cbm_standalone` and `graphify_standalone` adapter tests, and the `trackb`
+  suites (`longmemeval_ref` except its loader test, which needs the downloaded
+  dataset; `mem0_locomo`; `mem0_tracka`).
+
+`scripts/ci_run_suite.sh` is the single list of suites; `ci_wheel_smoke.py`
+asserts that every suite ran.
+
+**Skip gate.** `scripts/ci_skip_gate.py` reads the JUnit report and fails the
+run on any failure or error, on a skip that is not declared in
+`ci/expected_skips.json`, on a declared skip with a different reason, and on a
+declared skip that no longer happens. If you add a test that must skip in CI
+(for example one needing a binary the image does not carry), add an entry with
+a reason and a `why`; do not weaken the gate. Live-binary smokes for the
+competitor adapters are expected skips for this reason.
+
+## Third-party files
+
+`static/chart.umd.min.js` is a vendored copy of Chart.js 4.4.1 (MIT licence;
+the file header carries the notice, and it bundles `@kurkle/color` 0.3.2, also
+MIT). It is not our code; update it by replacing the file, not by editing it.
