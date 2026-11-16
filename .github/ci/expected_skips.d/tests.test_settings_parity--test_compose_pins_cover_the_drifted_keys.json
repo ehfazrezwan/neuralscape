@@ -1,0 +1,8 @@
+{
+  "test": "tests.test_settings_parity::test_compose_pins_cover_the_drifted_keys",
+  "reason_contains": "repo-root compose files are not in the packaged test image",
+  "profiles": [
+    "container"
+  ],
+  "why": "host-only check: the packaged test image does not contain the repo-root docker-compose*.yml files; the host suite runs it"
+}
