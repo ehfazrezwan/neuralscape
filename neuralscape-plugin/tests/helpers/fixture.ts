@@ -22,11 +22,13 @@ export interface Fixture {
   context: Record<string, unknown>;
   /** POST paths answered with HTTP 500. */
   failPosts: Set<string>;
+  /** How POST /v1/context/assemble answers: a status and JSON body, or `destroy` to drop the connection. */
+  assemble: { status: number; body: Record<string, unknown>; destroy?: boolean };
   close(): Promise<void>;
 }
 
 export async function startFixture(): Promise<Fixture> {
-  const fx = { url: "", requests: [] as Recorded[], context: {} as Record<string, unknown>, failPosts: new Set<string>() } as Fixture;
+  const fx = { url: "", requests: [] as Recorded[], context: {} as Record<string, unknown>, failPosts: new Set<string>(), assemble: { status: 200, body: {} } } as Fixture;
   const server: Server = createServer((req, res) => {
     let body = "";
     req.on("data", (d) => (body += d));
@@ -41,6 +43,15 @@ export async function startFixture(): Promise<Fixture> {
       if (req.method === "GET") {
         res.writeHead(404, { "Content-Type": "application/json" });
         res.end("{}");
+        return;
+      }
+      if (req.method === "POST" && path === "/v1/context/assemble") {
+        if (fx.assemble.destroy) {
+          req.socket.destroy();
+          return;
+        }
+        res.writeHead(fx.assemble.status, { "Content-Type": "application/json" });
+        res.end(JSON.stringify(fx.assemble.body));
         return;
       }
       if (fx.failPosts.has(path)) {

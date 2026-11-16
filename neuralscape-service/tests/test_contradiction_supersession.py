@@ -34,8 +34,9 @@ class FakeQdrant:
     """Just enough of QdrantClient: scroll / retrieve / set_payload / query_points.
 
     Filters are evaluated from the real ``qdrant_client.models.Filter`` the
-    production code builds (must / must_not over FieldCondition with
-    MatchValue / MatchAny on dotted payload keys).
+    production code builds: must / should / must_not, nested ``Filter``
+    conditions, ``IsEmptyCondition`` and FieldCondition with MatchValue /
+    MatchAny / MatchExcept on dotted payload keys.
     """
 
     def __init__(self):
@@ -66,18 +67,42 @@ class FakeQdrant:
         return cur
 
     def _cond(self, payload, cond):
+        """Evaluate one condition the way Qdrant does.
+
+        Supports a nested ``Filter`` (recursive must / should / must_not),
+        ``IsEmptyCondition`` (key absent, null or ``[]``) and
+        ``FieldCondition`` with ``MatchValue`` / ``MatchAny`` /
+        ``MatchExcept``. Anything else fails loudly so a new filter shape
+        cannot silently pass in this fake.
+        """
+        from qdrant_client.models import Filter, IsEmptyCondition
+
+        if isinstance(cond, Filter):
+            return self._passes(payload, cond)
+        if isinstance(cond, IsEmptyCondition):
+            val = self._value(payload, cond.is_empty.key)
+            return val is None or val == []
         val = self._value(payload, cond.key)
         m = cond.match
-        if hasattr(m, "any"):
+        if m is None:
+            raise NotImplementedError(f"fake Qdrant: unsupported condition {cond!r}")
+        if getattr(m, "any", None) is not None:
             return val in m.any
-        return val == m.value
+        if getattr(m, "except_", None) is not None:
+            # Qdrant: MatchExcept is false when the key is absent.
+            return val is not None and val not in m.except_
+        if hasattr(m, "value"):
+            return val == m.value
+        raise NotImplementedError(f"fake Qdrant: unsupported match {m!r}")
 
     def _passes(self, payload, flt):
         if flt is None:
             return True
-        return all(self._cond(payload, c) for c in (flt.must or [])) and not any(
-            self._cond(payload, c) for c in (flt.must_not or [])
-        )
+        if not all(self._cond(payload, c) for c in (flt.must or [])):
+            return False
+        if flt.should and not any(self._cond(payload, c) for c in flt.should):
+            return False
+        return not any(self._cond(payload, c) for c in (flt.must_not or []))
 
     def _pt(self, pid):
         p = self.points[pid]
@@ -132,6 +157,15 @@ class FakeGraph:
         for u in uuids:
             self.edges[u]["expired_at"] = datetime.now(timezone.utc)
 
+    @staticmethod
+    def _episode_clause(cypher, episodes, new_ep):
+        """Evaluate whichever episode predicate the Cypher text actually uses,
+        so the fake can't drift from the production statement."""
+        if "NOT $new_episode_uuid IN" in cypher:
+            return new_ep not in episodes
+        assert "ep <> $new_episode_uuid" in cypher, "unrecognised episode predicate"
+        return any(ep != new_ep for ep in episodes)
+
     # driver surface
     def session(self):
         graph = self
@@ -163,7 +197,7 @@ class FakeGraph:
                         if e["group_id"] == params["group_id"]
                         and e["invalid_at"] is not None
                         and e["expired_at"] >= since
-                        and params["new_episode_uuid"] not in e["episodes"]
+                        and graph._episode_clause(cypher, e["episodes"], params["new_episode_uuid"])
                     ]
                 else:
                     counts: dict[str, int] = {}
@@ -270,6 +304,44 @@ class TestSingleRowEpisode:
 
         assert not qdrant.meta("old").get("dream_tombstoned")
         assert "superseded_reason" not in qdrant.meta("old")
+
+    def test_old_edge_that_gained_the_new_episode_as_a_duplicate_is_superseded(self, env):
+        """Real-store shape (VPS gate failure): the new episode's extracted edge
+        dedups onto the old edge, Graphiti APPENDS the new episode to it and
+        then invalidates it, so the old edge cites [old, new]."""
+        svc, qdrant, graph = env
+        qdrant.add("old", user="u1", data="User lives in Paris",
+                   metadata={"graph_episode_uuid": "ep-old", "graph_episode_kind": "fact"})
+        qdrant.add("new", user="u1", data="User moved to London and no longer lives in Paris")
+        graph.add_edge("E1", "User lives in Paris", ["ep-old"])
+
+        def _add(**kw):
+            graph.edges["E1"]["episodes"].append("ep-new")  # dedup appends the new episode
+            graph.invalidate("E1")
+            return {"episode_uuid": "ep-new", "episode_name": "n"}
+
+        svc._memory.graph.add.side_effect = _add
+        _enrich(svc)
+
+        assert qdrant.meta("old")["dream_tombstoned"] is True
+        assert qdrant.meta("old")["superseded_edge_uuids"] == ["E1"]
+        assert not qdrant.meta("new").get("dream_tombstoned")
+
+    def test_edge_born_expired_by_the_new_episode_alone_is_not_a_contradiction(self, env):
+        svc, qdrant, graph = env
+        qdrant.add("old", user="u1", data="d",
+                   metadata={"graph_episode_uuid": "ep-old", "graph_episode_kind": "fact"})
+        qdrant.add("new", user="u1", data="x")
+        graph.add_edge("E1", "live old fact", ["ep-old"])
+        graph.add_edge("E2", "born expired", ["ep-new"])
+
+        def _add(**kw):
+            graph.invalidate("E2")
+            return {"episode_uuid": "ep-new", "episode_name": "n"}
+
+        svc._memory.graph.add.side_effect = _add
+        _enrich(svc)
+        assert not qdrant.meta("old").get("dream_tombstoned")
 
     def test_delete_cascade_expiry_is_not_a_contradiction(self, env):
         """A cascade only sets expired_at (no invalid_at) — must not supersede."""
@@ -967,3 +1039,60 @@ class TestStaleCheckEnqueueIsFlagged:
         monkeypatch.setattr(settings, "graph_supersession_enabled", True)
         await worker._enqueue_stale_graph_check({"redis": redis}, mem, "x", "u1", None)
         redis.enqueue_job.assert_awaited_once()
+
+
+# ──────────────────────────────────────────────
+# The fake's filter semantics match qdrant-client's own in-process engine
+# ──────────────────────────────────────────────
+
+
+def test_fake_filter_matches_qdrant_local_engine_on_nested_workspace_filter():
+    """Nested Filter / IsEmpty / MatchExcept: the fake must agree with Qdrant.
+
+    The shape mirrors a workspace pushdown (``workspace`` absent, empty,
+    "memory" or one of the reference workspaces) combined with the
+    tombstone must_not the read paths add.
+    """
+    from qdrant_client import QdrantClient
+    from qdrant_client.models import (
+        Distance, FieldCondition, Filter, IsEmptyCondition, MatchAny,
+        MatchExcept, MatchValue, PayloadField, PointStruct, VectorParams,
+    )
+
+    rows = {
+        1: {"user_id": "u", "metadata": {"category": "preference"}},
+        2: {"user_id": "u", "metadata": {"workspace": None, "category": "preference"}},
+        3: {"user_id": "u", "metadata": {"workspace": "", "category": "preference"}},
+        4: {"user_id": "u", "metadata": {"workspace": "memory", "category": "preference"}},
+        5: {"user_id": "u", "metadata": {"workspace": "ref-a", "category": "preference"}},
+        6: {"user_id": "u", "metadata": {"workspace": "ref-b", "category": "preference"}},
+        7: {"user_id": "u", "metadata": {"workspace": "memory", "category": "preference", "dream_tombstoned": True}},
+        8: {"user_id": "v", "metadata": {"workspace": "memory", "category": "preference"}},
+        10: {"user_id": "u", "metadata": {"workspace": "memory"}},  # no category: MatchExcept is false
+        9: {"user_id": "u", "metadata": {"workspace": "memory", "category": "secret"}},
+    }
+    flt = Filter(
+        must=[
+            FieldCondition(key="user_id", match=MatchValue(value="u")),
+            Filter(should=[
+                IsEmptyCondition(is_empty=PayloadField(key="metadata.workspace")),
+                FieldCondition(key="metadata.workspace", match=MatchValue(value="memory")),
+                FieldCondition(key="metadata.workspace", match=MatchValue(value="")),
+                FieldCondition(key="metadata.workspace", match=MatchAny(any=["ref-a"])),
+            ]),
+            FieldCondition(key="metadata.category", match=MatchExcept(**{"except": ["secret"]})),
+        ],
+        must_not=[FieldCondition(key="metadata.dream_tombstoned", match=MatchValue(value=True))],
+    )
+
+    real = QdrantClient(":memory:")
+    real.create_collection("c", vectors_config=VectorParams(size=3, distance=Distance.COSINE))
+    real.upsert("c", points=[PointStruct(id=i, vector=[1.0, 0.0, 0.0], payload=p) for i, p in rows.items()])
+    real_ids = sorted(p.id for p in real.scroll("c", scroll_filter=flt, limit=100)[0])
+
+    fake = FakeQdrant()
+    fake_ids = sorted(i for i, p in rows.items() if fake._passes(p, flt))
+
+    assert fake_ids == real_ids
+    # Sanity: the expected rows, so a vacuous agreement (both empty) fails.
+    assert real_ids == [1, 2, 3, 4, 5]

@@ -48,6 +48,7 @@ class ConvertMixin:
                 "memory": payload.get("data", ""),
                 "metadata": payload.get("metadata", {}) or {},
                 "ns_revision": payload.get("ns_revision"),
+                "user_id": payload.get("user_id"),
                 "created_at": payload.get("created_at"),
                 "updated_at": payload.get("updated_at"),
             }
@@ -113,7 +114,9 @@ class ConvertMixin:
             memory_kind=metadata.get("memory_kind"),
             source_ref=metadata.get("source_ref"),
             visibility=metadata.get("visibility"),
-            owner_user_id=metadata.get("owner_user_id"),
+            # Legacy rows (conversation extraction before owner stamping) carry
+            # the owner only as the payload's top-level user_id.
+            owner_user_id=metadata.get("owner_user_id") or mem.get("user_id") or None,
             revision=revision_of(metadata, top_revision),
             workspace=metadata.get("workspace"),
             sensitivity=metadata.get("sensitivity"),

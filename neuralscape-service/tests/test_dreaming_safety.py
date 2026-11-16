@@ -37,6 +37,7 @@ from extensions.dreaming import consolidate, gate, graph_patcher, prompts, sweep
 from extensions.dreaming.config import DreamingSettings
 from extensions.dreaming.consolidate import PoolBatch
 from tests.test_dreaming import FakeRedis
+from tests.test_dreaming_rewrite_atomic import rewrite_view
 
 
 # ── Shared helpers ──────────────────────────────────────────────────
@@ -185,9 +186,9 @@ class TestReversibleRewrites:
         old = "User works at OldCorp on the Berlin team"
         service, client = self._service({"data": old, "metadata": {}})
         consolidate._rewrite_content(service, "m1", "User works at Acme")
-        point = client.upsert.call_args.kwargs["points"][0]
-        assert point.payload["data"] == "User works at Acme"
-        assert point.payload["metadata"]["dream_prev_content"] == old
+        point = rewrite_view(client, "m1")
+        assert point["data"] == "User works at Acme"
+        assert point["metadata"]["dream_prev_content"] == old
 
     def test_rewrite_overwrites_older_stash_one_level_of_undo(self):
         service, client = self._service({
@@ -195,8 +196,8 @@ class TestReversibleRewrites:
             "metadata": {"dream_prev_content": "ancient stash"},
         })
         consolidate._rewrite_content(service, "m1", "newest text")
-        point = client.upsert.call_args.kwargs["points"][0]
-        assert point.payload["metadata"]["dream_prev_content"] == "current text"
+        point = rewrite_view(client, "m1")
+        assert point["metadata"]["dream_prev_content"] == "current text"
 
     def test_noop_rewrite_keeps_existing_stash(self):
         """Rewriting to identical text must not clobber the undo point with
@@ -206,19 +207,21 @@ class TestReversibleRewrites:
             "metadata": {"dream_prev_content": "useful older stash"},
         })
         consolidate._rewrite_content(service, "m1", "same text")
-        point = client.upsert.call_args.kwargs["points"][0]
-        assert point.payload["metadata"]["dream_prev_content"] == "useful older stash"
+        point = rewrite_view(client, "m1")
+        # no-op rewrite: the stash key is not in the patch, so the existing
+        # nested value is left untouched by the server-side merge
+        assert "dream_prev_content" not in point["metadata"]
 
     def test_rewrite_still_recomputes_hash(self):
         """Regression guard on the audit-#6 fix (PR #120): the stash must
-        ride the SAME upsert that recomputes the content hash."""
+        ride the same rewrite that recomputes the content hash."""
         from memory_service import content_hash
 
         service, client = self._service({"data": "old", "hash": "stale", "metadata": {}})
         consolidate._rewrite_content(service, "m1", "fresh text")
-        point = client.upsert.call_args.kwargs["points"][0]
-        assert point.payload["hash"] == content_hash("fresh text")
-        assert point.payload["metadata"]["dream_prev_content"] == "old"
+        point = rewrite_view(client, "m1")
+        assert point["hash"] == content_hash("fresh text")
+        assert point["metadata"]["dream_prev_content"] == "old"
 
     @pytest.mark.asyncio
     async def test_merge_survivor_stashes_prev_content(self):
@@ -234,8 +237,8 @@ class TestReversibleRewrites:
               "content": "merged fact", "confidence": 0.9}],
             dry_run=False,
         )
-        point = client.upsert.call_args.kwargs["points"][0]
-        assert point.payload["metadata"]["dream_prev_content"] == "original survivor text"
+        point = rewrite_view(client, "surv")
+        assert point["metadata"]["dream_prev_content"] == "original survivor text"
 
     def test_merge_prompt_has_no_word_cap_and_demands_preservation(self):
         text = prompts.CONSOLIDATION_PROMPT

@@ -52,6 +52,11 @@ def make_service(uid):
     def factory():
         svc = MemoryService()
         svc._get_memory()
+        if svc._graphiti is not None:
+            # The driver only schedules its index build fire-and-forget at
+            # construction; finish it on the service's own bridge loop before
+            # the test starts so nothing is left running when the service closes.
+            svc._run_on_bridge(svc._graphiti.build_indices_and_constraints(), timeout=120)
         created.append(svc)
         return svc
 
@@ -104,6 +109,11 @@ def test_extraction_on_stores_verbatim_source_facts_with_evidence(fake_hybrid, m
         assert reread.category_evidence and reread.category_evidence['mode'] == 'certain'
         assert reread.category_evidence['primary_category'] == reread.category
         assert reread.owner_user_id == uid
+        assert reread.visibility == 'private'  # conversation extractions are stamped private
+    # A private-filtered store read finds the extracted rows (real Qdrant):
+    # the filter keys on metadata.visibility, which unstamped rows would miss.
+    dry = service.retag_memories(uid, {'visibility': 'private'}, {'add_tags': ['probe']}, True)
+    assert dry['matched'] == len(stored), dry
 
 
 def test_extraction_off_never_calls_hybrid_and_stores_via_gemini(fake_hybrid, service, uid, make_service):

@@ -345,7 +345,7 @@ FACTS = [
 ]
 
 
-def seed_conversation(w, *, n=6, user=OWNER, tag="c1", ref_name=True, start=1):
+def seed_conversation(w, *, n=6, user=OWNER, tag="c1", ref_name=True, start=1, stamp_owner=True):
     """One conversation episode -> n fact rows, all stamped with the same refs."""
     group = f"user--{user}"
     ep_uuid, ep_name = f"ep-{tag}", f"mem0_episode_{tag}"
@@ -361,6 +361,11 @@ def seed_conversation(w, *, n=6, user=OWNER, tag="c1", ref_name=True, start=1):
         if ref_name:
             meta["graph_episode_name"] = ep_name
         w.q.add(pid, fact, user_id=user, **meta)
+        if not stamp_owner:
+            # real conversation extraction (_batch_store_facts) writes NO
+            # owner_user_id/visibility into metadata; only payload user_id
+            w.q.meta(pid).pop("owner_user_id")
+            w.q.meta(pid).pop("visibility")
     return SimpleNamespace(ids=ids, facts=facts, uuid=ep_uuid, name=ep_name,
                            edges=edge_uuids, group=group)
 
@@ -764,6 +769,12 @@ class TestMalformedId:
         with pytest.raises(LookupError):
             w.svc.delete_memory("not-a-uuid", OWNER)
 
+    def test_wellformed_missing_id_is_lookup_error_not_a_store_call(self, world):
+        w = world
+        with pytest.raises(LookupError):
+            w.svc.delete_memory(rid(999), OWNER)
+        w.svc._memory.delete.assert_not_called()  # nothing was sent to the store
+
     def test_wellformed_id_store_failure_still_propagates(self, world):
         w = world
         w.svc._memory.get.side_effect = ConnectionError("qdrant down")
@@ -897,6 +908,14 @@ class TestRestSurface:
         world.svc._memory.get.side_effect = ValueError("Point id is not a valid UUID")
         assert rest.client.delete("/v1/memories/not-a-uuid").status_code == 404
 
+    def test_unknown_wellformed_id_is_404_not_500(self, world, rest):
+        resp = rest.client.delete(f"/v1/memories/{rid(999)}")
+        assert resp.status_code == 404, resp.text
+
+    def test_wellformed_id_store_failure_is_still_500(self, world, rest):
+        world.svc._memory.get.side_effect = ConnectionError("qdrant down")
+        assert rest.client.delete(f"/v1/memories/{rid(1)}").status_code == 500
+
     def test_other_users_rows_untouched(self, world, rest):
         conv = seed_conversation(world, n=3)
         bob = seed_conversation(world, n=3, tag="cb", user=OTHER, start=80)
@@ -946,6 +965,15 @@ class TestMcpSurface:
         assert data["graph"] == "migration_queued"
         assert data["sibling_graph_jobs_enqueued"] == 3
         assert _enqueued_ids(mcp.tm) == sorted(conv.ids)
+
+    @pytest.mark.asyncio
+    async def test_unknown_wellformed_id_returns_not_found_error(self, world, mcp):
+        import json
+
+        out = await mcp_server.call_tool(
+            "delete_memories", {"user_id": OWNER, "memory_id": rid(999)}
+        )
+        assert "not found" in json.loads(out[0].text)["error"].lower()
 
     @pytest.mark.asyncio
     async def test_malformed_id_returns_error_not_crash(self, world, mcp):
@@ -1254,3 +1282,65 @@ class TestDeleteEditPermissionMatrix:
     def test_missing_memory_is_lookup_error(self, world):
         with pytest.raises(LookupError):
             world.svc.patch_memory(rid(404), OWNER, {"tags": ["x"]})
+
+
+# ──────────────────────────────────────────────
+# Rows as the real conversation path writes them: no owner_user_id in metadata
+# ──────────────────────────────────────────────
+
+
+class TestOwnerlessConversationRows:
+    """Regression: the bulk/dedup paths handed the cascade rows with no owner,
+    so the group derived as ``user--`` and the episode was never found
+    (found by the first real-store integration run, teardown warning
+    'Nuke-all delete ... could not resolve/verify graph cleanup')."""
+
+    def test_nuke_all_resolves_and_removes_the_episode(self, world):
+        w = world
+        conv = seed_conversation(w, n=3, stamp_owner=False)
+        out = w.svc.delete_memories(user_id=OWNER, include_shared=True)
+        assert out["graph_cascade_unresolved_ids"] == []
+        assert conv.uuid not in w.g.episodes and w.g.live_edges(conv.group) == []
+
+    def test_private_only_wipe_resolves_and_removes_the_episode(self, world):
+        w = world
+        conv = seed_conversation(w, n=3, stamp_owner=False)
+        out = w.svc.delete_memories(user_id=OWNER)
+        assert out["graph_cascade_unresolved_ids"] == []
+        assert conv.uuid not in w.g.episodes
+        assert episode_recall(w, "Biscuit") == []
+
+    def test_null_category_path_resolves(self, world):
+        w = world
+        conv = seed_conversation(w, n=3, stamp_owner=False)
+        w.svc._list_null_category_memories = MagicMock(return_value=[
+            {"id": i, "data": w.q.points[i]["data"], "metadata": w.q.points[i]["metadata"]}
+            for i in conv.ids[:1]
+        ])
+        out = w.svc.delete_memories(user_id=OWNER, filter_null_category=True)
+        assert out["graph_cascade_unresolved_ids"] == []
+        assert {j["memory_id"] for j in out["graph_jobs"]} == set(conv.ids[1:])
+        assert conv.uuid not in w.g.episodes
+
+    def test_dedup_delete_resolves_episode_and_repairs_siblings(self, world):
+        w = world
+        conv = seed_conversation(w, n=3, stamp_owner=False)
+        for pid in conv.ids:
+            w.q.points[pid]["hash"] = f"h-{pid}"
+            w.q.points[pid]["created_at"] = "2026-01-01"
+        w.q.points[conv.ids[0]]["hash"] = "H-dup"
+        w.q.add(rid(700), w.q.points[conv.ids[0]]["data"])
+        w.q.points[rid(700)]["hash"] = "H-dup"
+        w.q.points[rid(700)]["created_at"] = "2026-02-01"
+        w.q.meta(rid(700)).pop("owner_user_id")
+        w.q.meta(rid(700)).pop("visibility")
+        out = w.svc.dedup_memories(OWNER, semantic=False)
+        assert out["exact_duplicates_removed"] == 1
+        assert conv.uuid not in w.g.episodes
+        assert {j["memory_id"] for j in out["graph_jobs"]} == set(conv.ids[1:])
+
+    def test_expiry_sweep_collectorless_path_resolves(self, world):
+        w = world
+        conv = seed_conversation(w, n=2, stamp_owner=False)
+        w.svc._delete_qdrant_memory_with_graph_cleanup(conv.ids[0], w.q.points[conv.ids[0]])
+        assert conv.uuid not in w.g.episodes

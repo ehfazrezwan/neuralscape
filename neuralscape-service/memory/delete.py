@@ -15,7 +15,7 @@ import uuid
 
 from datetime import datetime, timezone
 from config import settings
-from schemas import MemoryVisibility
+from schemas import MemoryVisibility, normalize_visibility
 from memory.groups import _build_group_id
 from memory.junk import _deleted_msg
 from memory.ranking import _mem_is_tombstoned, _times_derived_from_metadata
@@ -60,6 +60,24 @@ def _dedup_meta(payload: dict) -> tuple[dict, bool]:
     return meta, False
 
 
+def _dedup_visibility(meta: dict) -> str | None:
+    """Visibility as the dedup partition sees it: an absent stamp is private.
+
+    Conversation-extracted rows used to carry no ``metadata.visibility`` and
+    are now stamped ``private``; every reader already treats an absent value as
+    de-facto private, so the two must share one partition or dedup would stop
+    merging a new row with its legacy twin. An unrecognised value stays its own
+    (raw) partition — stricter, never a cross-partition merge.
+    """
+    vis = meta.get("visibility")
+    if vis is None or vis == "":
+        return MemoryVisibility.PRIVATE.value
+    try:
+        return normalize_visibility(vis)
+    except (ValueError, TypeError):
+        return vis
+
+
 def _dedup_partition(payload: dict) -> tuple:
     """Partition identity a semantic near-duplicate must share to be merged.
 
@@ -81,7 +99,7 @@ def _dedup_partition(payload: dict) -> tuple:
         payload.get("user_id"),
         meta.get("scope"),
         meta.get("project_id") or None,
-        meta.get("visibility"),
+        _dedup_visibility(meta),
         workspace,
     )
 
@@ -123,6 +141,27 @@ def _is_tombstoned(payload: dict) -> bool:
 # cannot always exclude) cannot crowd an in-partition duplicate out of the
 # result. The last size is the hard cap per row.
 _DEDUP_TOP_K_STEPS = (10, 40, 160)
+
+
+def _exact_category(payload: dict):
+    """Category component of the exact-phase group key (same hash, other category: not a duplicate)."""
+    return _dedup_meta(payload)[0].get("category")
+
+
+def _differs_only_by_category(a: dict, b: dict) -> bool:
+    """True for two rows with the SAME text hash but different categories.
+
+    Such a pair can only exist because someone wrote the same text on purpose
+    under two categories (the explicit write path keys on the category), so
+    no dedup phase may merge them. Near-duplicates with different hashes are
+    unaffected and still merge across categories.
+    """
+    ha, hb = a.get("hash"), b.get("hash")
+    if not ha or ha != hb:
+        return False
+    ca = _dedup_meta(a)[0].get("category")
+    cb = _dedup_meta(b)[0].get("category")
+    return ca != cb
 
 
 def _dense_vector(vector) -> list[float] | None:
@@ -167,6 +206,11 @@ class DeleteMixin:
             if not _is_valid_point_id(memory_id):
                 raise LookupError(f"Memory {memory_id} not found") from None
             raise
+        if mem is None:
+            # A well-formed id that names no stored point: not found, not a
+            # server fault (the route maps LookupError to 404; a genuine
+            # store failure raised above and still propagates).
+            raise LookupError(f"Memory {memory_id} not found")
 
         # Permission gate: enforce ownership/visibility rules when caller_user_id
         # is provided (backward-compatible: None skips the gate, existing tests).
@@ -369,6 +413,7 @@ class DeleteMixin:
                     cascade_rows.append({
                         "id": mid,
                         "mem": {"memory": mem_info.get("data", ""), "metadata": meta},
+                        "user_id": user_id,
                         "group_id": None,
                     })
                     deleted_count += 1
@@ -572,6 +617,7 @@ class DeleteMixin:
                 {
                     "id": mid,
                     "mem": {"memory": payload.get("data", ""), "metadata": metadata},
+                    "user_id": user_id,
                     "group_id": None,
                 }
                 for mid, payload, metadata in private_rows
@@ -704,7 +750,7 @@ class DeleteMixin:
         # there are no surviving siblings to repair — only dedupe the cascade
         # to once per distinct episode.
         rows = [
-            {"id": mem.get("id", ""), "mem": mem, "group_id": None}
+            {"id": mem.get("id", ""), "mem": mem, "user_id": user_id, "group_id": None}
             for mem in private_memories + shared_memories
         ]
         batch = self._cascade_rows_once(
@@ -844,13 +890,15 @@ class DeleteMixin:
                 mem = {
                     "memory": payload.get("data", ""),
                     "metadata": payload.get("metadata", {}),
+                    "user_id": payload.get("user_id"),
                 }
                 if collector is None:
                     self._cascade_or_fallback_expire(mem, memory_id=memory_id)
                     return
                 collector.setdefault("deleted", set()).add(memory_id)
                 batch = self._cascade_rows_once(
-                    [{"id": memory_id, "mem": mem, "group_id": None}],
+                    [{"id": memory_id, "mem": mem, "user_id": payload.get("user_id"),
+                      "group_id": None}],
                     deleted_ids=collector["deleted"],
                 )
                 collector.setdefault("graph_jobs", []).extend(batch["graph_jobs"])
@@ -920,7 +968,7 @@ class DeleteMixin:
             for mem in page:
                 h = mem["payload"].get("hash")
                 if h and not _is_tombstoned(mem["payload"]):
-                    key = (h, _dedup_partition(mem["payload"]))
+                    key = (h, _dedup_partition(mem["payload"]), _exact_category(mem["payload"]))
                     key_counts[key] = key_counts.get(key, 0) + 1
 
         exact_removed = 0
@@ -931,7 +979,7 @@ class DeleteMixin:
                     h = mem["payload"].get("hash")
                     if not h or _is_tombstoned(mem["payload"]):
                         continue
-                    key = (h, _dedup_partition(mem["payload"]))
+                    key = (h, _dedup_partition(mem["payload"]), _exact_category(mem["payload"]))
                     if key_counts.get(key, 0) > 1:
                         hash_groups.setdefault(key, []).append(mem)
         del key_counts
@@ -1143,6 +1191,8 @@ class DeleteMixin:
             if _dedup_partition(hit_payload) != partition:
                 continue
             if _is_tombstoned(hit_payload):
+                continue
+            if _differs_only_by_category(payload, hit_payload):
                 continue
             out.append(hit)
         return out

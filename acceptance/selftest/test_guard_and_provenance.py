@@ -13,7 +13,7 @@ ACCEPTANCE = Path(__file__).resolve().parents[1]
 def test_prod_compose_project_refused():
     with pytest.raises(guard.GuardError, match="production"):
         guard.check("http://127.0.0.1:18199", "neuralscape", env={})
-    guard.check("http://127.0.0.1:18199", "nscampaign", env={})
+    guard.check("http://127.0.0.1:18199", "nstest-acceptance", env={})
 
 
 def test_prod_compose_project_not_overridable():
@@ -123,13 +123,13 @@ def test_production_project_refused_in_every_spelling(name):
         guard.check_compose_project(name, env={})
 
 
-@pytest.mark.parametrize("name", ["neuralscape-prod", "prod", "myproject", "nscamp", "xnscampaign", "nstest", ""])
+@pytest.mark.parametrize("name", ["neuralscape-prod", "prod", "myproject", "nstes", "xnstest-a", "nstest", "acceptance", ""])
 def test_non_disposable_projects_refused(name):
     with pytest.raises(guard.GuardError):
         guard.check_compose_project(name, env={})
 
 
-@pytest.mark.parametrize("name", ["nscampaign", "nscampaign2", " NSCampaign-x ", "nstest-a", "nstest-"])
+@pytest.mark.parametrize("name", ["nstest-acceptance", "nstest-a2", " NSTest-X ", "nstest-a", "nstest-"])
 def test_disposable_projects_pass_and_are_normalised(name):
     assert guard.check_compose_project(name, env={}) == name.strip()
 
@@ -139,7 +139,7 @@ def test_allowlist_is_overridable_only_by_env():
     assert guard.check_compose_project("lab-1", env=env) == "lab-1"
     assert guard.check_compose_project("scratch9", env=env) == "scratch9"
     with pytest.raises(guard.GuardError):
-        guard.check_compose_project("nscampaign", env=env)
+        guard.check_compose_project("nstest-acceptance", env=env)
     with pytest.raises(guard.GuardError, match="production"):
         guard.check_compose_project("neuralscape", env={"NS_COMPOSE_ALLOWLIST": "neural"})
 
