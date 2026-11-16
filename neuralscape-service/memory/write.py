@@ -202,6 +202,9 @@ class WriteMixin:
                 )
             except Exception as e:  # noqa: BLE001
                 logger.warning(f"Stamping graph_episode_kind failed (non-fatal): {e}")
+        # Diagnostics for integration failures: what the step saw / why it died.
+        self._supersession_trace = None
+        self._supersession_error = None
         try:
             from memory.supersession import supersede_contradicted_rows
 
@@ -215,6 +218,7 @@ class WriteMixin:
                 superseded_by=superseded_by,
             )
         except Exception as e:  # noqa: BLE001 — supersession is best-effort
+            self._supersession_error = repr(e)
             logger.warning(f"Graph-contradiction supersession failed (non-critical): {e}")
 
     def _attach_memory_id_to_graph_nodes(

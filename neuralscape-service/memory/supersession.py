@@ -146,6 +146,40 @@ def _best_row_for_fact(
     return None
 
 
+def _dead_edge_dominates(
+    service, row_id: str, row_payload: dict, dead_fact: str, live_facts: list[str]
+) -> tuple[bool, dict]:
+    """Is the contradicted edge the row's MAIN claim, not an incidental one?
+
+    One stored fact routinely yields several edges (e.g. "Alice lives in
+    Paris, France" -> "Alice resides in Paris" + "Paris is a city in
+    France"). Requiring every edge to be dead would never supersede such a
+    row. Instead the dead edge must be a clearly better match to the row
+    than every still-live edge of the same episode (cosine on the stored
+    dense vector, margin ``graph_supersession_margin``). Any embedding
+    failure leaves the row alone. Returns ``(decision, evidence)``.
+    """
+    margin = settings.graph_supersession_margin
+    evidence: dict = {"dead_sim": None, "best_live_sim": None, "margin": margin}
+    try:
+        embedder = service._get_memory().embedding_model
+        row_vec = service._fetch_dense_vectors([row_id]).get(row_id)
+        if row_vec is None:
+            row_vec = embedder.embed(row_payload.get("data") or "", memory_action="add")
+        dead = _cosine(list(row_vec), list(embedder.embed(dead_fact, memory_action="add")))
+        live = [
+            _cosine(list(row_vec), list(embedder.embed(f, memory_action="add")))
+            for f in live_facts
+        ]
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"Supersession dominance check failed (leaving row): {e}")
+        evidence["error"] = str(e)
+        return False, evidence
+    best_live = max(live) if live else 0.0
+    evidence.update(dead_sim=round(dead, 4), best_live_sim=round(best_live, 4))
+    return (dead - best_live) >= margin, evidence
+
+
 def supersede_contradicted_rows(
     service,
     *,
@@ -163,9 +197,18 @@ def supersede_contradicted_rows(
     probe never fails the write.
     """
     from extensions.dreaming.graph_patcher import (
-        count_live_edges_by_episode,
         find_contradicted_edges,
+        live_edge_facts_by_episode,
     )
+
+    # Decision trace for diagnostics (kept on the service so an integration
+    # test can print what the probe saw and why each row was/wasn't superseded).
+    trace: list[dict] = []
+    service._supersession_trace = trace
+    trace.append({
+        "stage": "start", "group_id": group_id, "owner": owner_user_id,
+        "new_episode": new_episode_uuid, "write_started_at": write_started_at.isoformat(),
+    })
 
     if not new_episode_uuid:
         logger.debug("Supersession skipped: no episode uuid for this write")
@@ -187,6 +230,7 @@ def supersede_contradicted_rows(
             new_episode_uuid=new_episode_uuid,
         )
     ) or []
+    trace.append({"stage": "probe", "edges": edges})
     if not edges:
         return []
 
@@ -194,10 +238,15 @@ def supersede_contradicted_rows(
     if not episode_uuids:
         return []
     rows = _rows_by_episode(service, owner_user_id, episode_uuids, set(new_memory_ids))
+    trace.append({
+        "stage": "rows", "lookup_key": "metadata.graph_episode_uuid",
+        "episode_uuids": episode_uuids,
+        "matched": {ep: [pid for pid, _ in rs] for ep, rs in rows.items()},
+    })
     if not rows:
         return []
 
-    live_counts: dict[str, int] | None = None
+    live_facts: dict[str, list[str]] | None = None
     # row id -> edge uuids that justify superseding it
     chosen: dict[str, list[str]] = {}
     for edge in edges:
@@ -207,26 +256,41 @@ def supersede_contradicted_rows(
             if not ep_rows:
                 continue
             # Single-fact episodes (stamped by enrich_graph with
-            # graph_episode_kind="fact") ARE their one row: no content gate
-            # needed, just "every edge of the episode is dead". Anything else
-            # (conversation episodes, pre-flag rows) may hold unrelated facts
-            # in a lone stamped row (dedup hits are not stamped), so the
-            # vector similarity gate applies even with a single row.
+            # graph_episode_kind="fact") ARE their one row, but one fact can
+            # yield several edges, so "every edge dead" is too strict: the
+            # contradicted edge must dominate the row's still-live edges
+            # (_dead_edge_dominates). Anything else (conversation episodes,
+            # pre-flag rows) may hold unrelated facts in a lone stamped row
+            # (dedup hits are not stamped), so the similarity gate applies.
             single_fact = len(ep_rows) == 1 and (
                 _row_meta(ep_rows[0][1]).get("graph_episode_kind") == "fact"
             )
             if single_fact:
-                if live_counts is None:
-                    live_counts = _bridge(
-                        count_live_edges_by_episode(
+                if live_facts is None:
+                    live_facts = _bridge(
+                        live_edge_facts_by_episode(
                             driver, group_id=group_id, episode_uuids=list(rows)
                         )
                     )
-                if live_counts.get(ep, 1) != 0:
-                    continue  # row still backed by a live edge
+                still_live = live_facts.get(ep, [])
                 pid = ep_rows[0][0]
+                if still_live:
+                    ok, evidence = _dead_edge_dominates(
+                        service, pid, ep_rows[0][1], fact, still_live
+                    )
+                    trace.append({"stage": "decide", "row": pid, "episode": ep,
+                                  "mode": "single_fact_partial", "dead_fact": fact,
+                                  "live_facts": still_live, "supersede": ok, **evidence})
+                    if not ok:
+                        continue
+                else:
+                    trace.append({"stage": "decide", "row": pid, "episode": ep,
+                                  "mode": "single_fact_all_dead", "supersede": True})
             else:
                 pid = _best_row_for_fact(service, fact, ep_rows)
+                trace.append({"stage": "decide", "row": pid, "episode": ep,
+                              "mode": "multi_or_unstamped", "rows": [r for r, _ in ep_rows],
+                              "supersede": pid is not None})
                 if pid is None:
                     continue
             chosen.setdefault(pid, [])

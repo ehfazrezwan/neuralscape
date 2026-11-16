@@ -179,7 +179,17 @@ class FakeGraph:
 
             async def run(self_inner, cypher, **params):
                 graph.calls.append(cypher)
-                if "count(r) AS total" in cypher:
+                if "collect(r.fact) AS facts" in cypher:
+                    by_ep: dict[str, list[str]] = {}
+                    for e in graph.edges.values():
+                        if e["group_id"] != params["group_id"]:
+                            continue
+                        if e["invalid_at"] is None and e["expired_at"] is None:
+                            for ep in e["episodes"]:
+                                if ep in params["episode_uuids"]:
+                                    by_ep.setdefault(ep, []).append(e["fact"])
+                    rows = [{"episode_uuid": k, "facts": v} for k, v in by_ep.items()]
+                elif "count(r) AS total" in cypher:
                     eps = [
                         e for e in graph.edges.values()
                         if e["group_id"] == params["group_id"]
@@ -341,6 +351,45 @@ class TestSingleRowEpisode:
 
         svc._memory.graph.add.side_effect = _add
         _enrich(svc)
+        assert not qdrant.meta("old").get("dream_tombstoned")
+
+    def test_one_fact_two_edges_dead_main_claim_supersedes_row(self, env):
+        """Real-store shape (gate): "Alice lives in Paris, France." yields TWO
+        edges from one episode; Graphiti invalidates the residence edge only.
+        The incidental "Paris is a city in France" edge stays live, and the
+        row must still be superseded because the dead edge is its main claim."""
+        svc, qdrant, graph = env
+        qdrant.add("old", user="u1", data="Alice lives in Paris, France.",
+                   metadata={"graph_episode_uuid": "ep-old", "graph_episode_kind": "fact"},
+                   vector=[1.0, 0.0, 0.0])
+        qdrant.add("new", user="u1", data="Alice moved to London and no longer lives in Paris.")
+        graph.add_edge("E1", "Alice resides in the city of Paris.", ["ep-old"])
+        graph.add_edge("E2", "Paris is a city situated in France.", ["ep-old"])  # stays live
+        svc._embed_map["Alice resides in the city of Paris."] = [0.95, 0.05, 0.0]
+        svc._embed_map["Paris is a city situated in France."] = [0.2, 0.0, 0.98]
+        svc._memory.graph.add.side_effect = _graph_add(graph, episode_uuid="ep-new", invalidate=["E1"])
+
+        _enrich(svc)
+
+        assert qdrant.meta("old")["dream_tombstoned"] is True
+        assert qdrant.meta("old")["superseded_edge_uuids"] == ["E1"]
+        decide = [t for t in svc._supersession_trace if t["stage"] == "decide"]
+        assert decide and decide[0]["mode"] == "single_fact_partial" and decide[0]["supersede"] is True
+
+    def test_dead_edge_that_is_not_the_rows_main_claim_leaves_the_row(self, env):
+        svc, qdrant, graph = env
+        qdrant.add("old", user="u1", data="Alice lives in Paris, France.",
+                   metadata={"graph_episode_uuid": "ep-old", "graph_episode_kind": "fact"},
+                   vector=[1.0, 0.0, 0.0])
+        qdrant.add("new", user="u1", data="x")
+        graph.add_edge("E1", "Alice once visited Rome.", ["ep-old"])  # dead, unrelated to the row
+        graph.add_edge("E2", "Alice resides in the city of Paris.", ["ep-old"])  # live, main claim
+        svc._embed_map["Alice once visited Rome."] = [0.0, 0.0, 1.0]
+        svc._embed_map["Alice resides in the city of Paris."] = [0.97, 0.0, 0.1]
+        svc._memory.graph.add.side_effect = _graph_add(graph, episode_uuid="ep-new", invalidate=["E1"])
+
+        _enrich(svc)
+
         assert not qdrant.meta("old").get("dream_tombstoned")
 
     def test_delete_cascade_expiry_is_not_a_contradiction(self, env):
