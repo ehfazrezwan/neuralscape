@@ -96,11 +96,15 @@ def test_words_only_in_the_old_text_stop_matching_a_rewritten_row(dream_env, swe
     ids, _ = swept_rows
     live = _live(env, ids)
     assert live, "no live row left to rewrite"
-    t, pt = next(iter(live.items()))
+    # pick a row that still carries its token AND is provably found by it now
+    picked = None
+    for t, pt in live.items():
+        if t in pt.payload.get("data", "") and str(pt.id) in env.lexical_ids(t, limit=5):
+            picked = (t, pt)
+            break
+    assert picked, "no live row still contains its rare token and matches it: the control would be vacuous"
+    t, pt = picked
     new_tok = "zq" + uuid.uuid4().hex[:8]
-    assert str(pt.id) in env.lexical_ids(t, limit=5) or t not in pt.payload.get("data", ""), (
-        "control: the row should match its own token before the rewrite"
-    )
     consolidate._rewrite_content(env.service, str(pt.id), f"A fully rewritten fact about gardening {new_tok}")
     assert str(pt.id) in env.lexical_ids(new_tok, limit=5), "rewritten row not found by its new token"
     assert str(pt.id) not in env.lexical_ids(t, limit=5), "rewritten row still matches a token only its old text had"
