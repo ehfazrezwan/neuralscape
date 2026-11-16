@@ -519,10 +519,19 @@ class TestToken:
         other_id, _ = _register(client, "https://other.example.com/cb")
         wrong = self._refresh(client, tok["refresh_token"], other_id)
         assert wrong.status_code == 400 and wrong.json()["error"] == "invalid_grant"
-        missing = self._refresh(client, tok["refresh_token"], "")
-        assert missing.status_code == 400 and missing.json()["error"] == "invalid_grant"
         # the legitimate client can still redeem it
         assert self._refresh(client, tok["refresh_token"], client_id).status_code == 200
+
+    def test_refresh_without_client_id_continues_the_bound_client(self, client):
+        """A public client may omit client_id on refresh (RFC 6749 3.2.1, 6)."""
+        client_id, tok = self._tokens(client)
+        resp = self._refresh(client, tok["refresh_token"], "")
+        assert resp.status_code == 200, resp.text
+        new = resp.json()
+        assert verify_payload(new["refresh_token"], SECRET)["client_id"] == client_id
+        # still single-use: the consumed token cannot be replayed without client_id
+        replay = self._refresh(client, tok["refresh_token"], "")
+        assert replay.status_code == 400 and replay.json()["error"] == "invalid_grant"
 
     def test_legacy_refresh_token_without_jti_or_client_is_rejected(self, client):
         client_id, _ = self._tokens(client)
@@ -1002,4 +1011,28 @@ class TestClientIdentityIsUnique:
             },
         )
         assert resp.status_code == 400
-        assert resp.json()["error"] == "invalid_grant"
+        assert resp.json() == {"error": "invalid_grant", "error_description": "client mismatch"}
+
+    def test_client_ids_issued_before_the_jti_still_work(self, client):
+        """Back-compat: a client_id without a jti (pre-change registration) still
+        authorizes and redeems codes."""
+        redirect = "https://claude.ai/api/mcp/auth_callback"
+        legacy_client = sign_payload(
+            {"typ": "client", "redirect_uris": [redirect], "iat": int(time.time())}, SECRET
+        )
+        verifier, challenge = _pkce()
+        login = issue_user_token(USER, SECRET, 3600)
+        loc = _login_to_code(client, legacy_client, redirect, challenge, login).headers["location"]
+        code = loc.split("code=")[1].split("&")[0]
+        resp = client.post(
+            "/oauth/token",
+            data={
+                "grant_type": "authorization_code",
+                "code": code,
+                "code_verifier": verifier,
+                "redirect_uri": redirect,
+                "client_id": legacy_client,
+            },
+        )
+        assert resp.status_code == 200, resp.text
+
