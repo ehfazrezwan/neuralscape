@@ -335,7 +335,7 @@ def _remove_episode(monkeypatch, episode_uuid: str, edges: list):
     strict=True,
     raises=AssertionError,
     reason=(
-        "library observation (oracle v2): the vendored library's episode removal deletes every edge whose first "
+        "library observation (oracle v3): the vendored library's episode removal deletes every edge whose first "
         "supporting episode is the removed one, even when other episodes still support the edge; the service "
         "removes episodes through the graph adapter, so this no longer stands for the product requirement"
     ),

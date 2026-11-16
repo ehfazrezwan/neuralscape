@@ -106,39 +106,52 @@ def _events(store, tenant, task_id=None):
     return list(store.events(tenant, task_id))
 
 
-def _remember_through_the_worker(service, stores, user_id, job_id):
-    """The worker path: ``on_job_start`` binds the job to its owner, ``process_memory_store`` extracts and stores."""
-    import redis.asyncio as aioredis
+def _remember_through_the_worker(service, stores, user_id, job_id, graph_queue):
+    """The worker path: ``on_job_start`` binds the job to its owner, ``process_memory_store`` extracts and stores.
+
+    ``ctx["redis"]`` is the ARQ pool the worker really has, so the graph enrichment is deferred to a graph-queue
+    job (``graph_queue``, a queue nothing consumes) as in production, not run inline; the queued job is removed
+    afterwards.  Returns the job's result and the number of graph jobs it queued.
+    """
+    from arq import create_pool
+    from arq.connections import RedisSettings
 
     import worker
     from task_manager import _task_user_key
 
     async def run():
-        client = aioredis.from_url(stores.redis_url)
+        pool = await create_pool(RedisSettings.from_dsn(stores.redis_url))
         try:
-            await client.set(_task_user_key(job_id), user_id, ex=300)  # the enqueue-time record
-            ctx = {"job_id": job_id, "job_try": 1, "redis": client, "service": service, "extension_registry": None}
+            await pool.set(_task_user_key(job_id), user_id, ex=300)  # the enqueue-time record
+            ctx = {"job_id": job_id, "job_try": 1, "redis": pool, "service": service, "extension_registry": None}
             await worker._make_on_job_start("nsit")(ctx)
             try:
-                return await worker.process_memory_store(ctx, FACT_MESSAGES, user_id)
+                result = await worker.process_memory_store(ctx, FACT_MESSAGES, user_id)
             finally:
                 await worker._make_after_job_end("nsit")(ctx)
+            queued = await pool.zrange(graph_queue, 0, -1)
+            return result, len(queued)
         finally:
-            await client.delete(_task_user_key(job_id))
-            await client.aclose()
+            for member in await pool.zrange(graph_queue, 0, -1):
+                await pool.delete(b"arq:job:" + (member if isinstance(member, bytes) else member.encode()))
+            await pool.delete(graph_queue, _task_user_key(job_id))
+            await pool.aclose()
 
     return asyncio.run(run())
 
 
-def test_remember_search_and_ask_are_recorded_for_the_person_without_content(flag_on, stores, unique_ns):
+def test_remember_search_and_ask_are_recorded_for_the_person_without_content(flag_on, flags, stores, unique_ns):
     from ask import ask_memory
 
     service, store = flag_on
     user, job_id = unique_ns.user_id, f"nsit-job-{uuid.uuid4().hex[:10]}"
+    graph_queue = f"nsit-graph-{uuid.uuid4().hex[:8]}"
+    flags(graph_queue_name=graph_queue)
 
     # -- remember: the worker's job context + real extraction and embedding -------------------------------
-    result = _remember_through_the_worker(service, stores, user, job_id)
+    result, queued = _remember_through_the_worker(service, stores, user, job_id, graph_queue)
     assert result["memories"], "the extraction stored nothing; the real model returned no facts"
+    assert queued >= 1, "the graph enrichment was not deferred to the graph queue (it ran inline)"
     stored = _events(store, user, job_id)
     operations = {event.operation for event in stored}
     assert "llm_extraction" in operations, operations
@@ -158,10 +171,21 @@ def test_remember_search_and_ask_are_recorded_for_the_person_without_content(fla
     (search_events,) = [_events(store, user, t) for t in search_tasks]
     assert {e.operation for e in search_events} == {"mem0_embedding"}  # the query embedding, nothing else
 
+    # -- a full search (graph leg included): Graphiti's own provider calls run on a pool thread and are
+    #    attributed to the caller too ----------------------------------------------------------------------
+    before_full = {e.task_id for e in _events(store, user)}
+    assert service.search(query=QUESTION, user_id=user, include_shared=False)
+    full_tasks = {e.task_id for e in _events(store, user)} - before_full
+    assert len(full_tasks) == 1
+    (full_events,) = [_events(store, user, t) for t in full_tasks]
+    full_operations = {e.operation for e in full_events}
+    assert {"mem0_embedding", "graphiti_embedding"} <= full_operations, full_operations
+    tasks_before |= full_tasks
+
     # -- Ask: the answering model and its searches, attributed to the asker ------------------------------
     answered = asyncio.run(ask_memory(service, question=QUESTION, user_id=user, reasoning_level="minimal"))
     assert answered["status"], answered
-    ask_tasks = {e.task_id for e in _events(store, user)} - tasks_before - search_tasks
+    ask_tasks = {e.task_id for e in _events(store, user)} - tasks_before - search_tasks - full_tasks
     assert len(ask_tasks) == 1
     (ask_events,) = [_events(store, user, t) for t in ask_tasks]
     ask_generation = [e for e in ask_events if e.operation == "llm_ask" and e.status == "final"]
@@ -204,25 +228,44 @@ def test_remember_search_and_ask_are_recorded_for_the_person_without_content(fla
 
 
 def test_the_same_calls_record_nothing_with_the_flag_off(flags, stores, isolated_stores, usage_pg, llm_key, unique_ns):
+    """The control: the same store, opened and recording with the flag on, gains nothing once the flag is off."""
+    import usage_store
     from ask import ask_memory
     from config import settings
     from memory_service import MemoryService
-    from usage_store import PostgresUsageStore
 
-    flags(usage_store_enabled=False, usage_store_backend="postgres", usage_store_postgres_dsn=usage_pg)
+    user = unique_ns.user_id
+
+    def the_calls(service):
+        service.store_raw(content="The user lives in Lisbon.", user_id=user, category="personal_fact",
+                          add_to_graph=False)
+        assert service.search(query=QUESTION, user_id=user, include_shared=False, vector_only=True)
+        asyncio.run(ask_memory(service, question=QUESTION, user_id=user, reasoning_level="minimal"))
+
+    # flag ON: the very same calls are recorded in this store (so an empty result below means something)
+    flags(usage_store_enabled=True, usage_store_backend="postgres", usage_store_postgres_dsn=usage_pg)
+    store = usage_store.install_usage_capture(settings)
+    try:
+        service = MemoryService()
+        service._get_memory()
+        isolated_stores["service"] = service
+        the_calls(service)
+        recorded = len(_events(store, user))
+        assert recorded > 0, "the control recorded nothing with the flag on"
+    finally:
+        usage_store.uninstall_usage_capture(store)
+
+    # flag OFF: no recorder, the same calls, and the store the flag-on run filled does not grow
+    flags(usage_store_enabled=False)
     assert uc.get_usage_recorder() is None
     service = MemoryService()
     service._get_memory()
     isolated_stores["service"] = service
-    user = unique_ns.user_id
-    service.store_raw(content="The user lives in Lisbon.", user_id=user, category="personal_fact", add_to_graph=False)
-    assert service.search(query=QUESTION, user_id=user, include_shared=False, vector_only=True)
-    asyncio.run(ask_memory(service, question=QUESTION, user_id=user, reasoning_level="minimal"))
+    the_calls(service)
     assert uc.get_usage_recorder() is None and uc.current_attempt_context() is None
-
-    probe = PostgresUsageStore(settings.usage_store_postgres_dsn)  # an empty store the service never opened
+    probe = usage_store.PostgresUsageStore(usage_pg)
     try:
-        assert _events(probe, user) == []
+        assert len(_events(probe, user)) == recorded
     finally:
         probe.close()
 

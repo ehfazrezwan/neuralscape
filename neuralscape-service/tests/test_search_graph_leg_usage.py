@@ -107,3 +107,32 @@ def test_two_concurrent_searches_keep_their_own_callers(service):
         uc.set_usage_recorder(previous)
     assert sorted(seen) == ["alice", "bob"]
     assert sorted(e.tenant_id for e in recorder.events) == ["alice", "bob"]
+
+
+def test_the_bridge_hop_keeps_the_callers_attribution(service):
+    """Graphiti's calls run as tasks on the bridge loop's thread; the caller's context travels with the coroutine."""
+    import asyncio
+    import threading
+
+    loop = asyncio.new_event_loop()
+    thread = threading.Thread(target=loop.run_forever, daemon=True)
+    thread.start()
+    service._bridge = SimpleNamespace(_loop=loop)
+    recorder = uc.InMemoryUsageRecorder()
+    previous = uc.set_usage_recorder(recorder)
+
+    async def provider_call_on_the_bridge():
+        context = uc.current_attempt_context()
+        uc.record_provider_usage(_provider_response(), operation="graphiti_embedding", model="m")
+        return context.tenant_id if context else None
+
+    try:
+        with uc.ensure_attempt("alice", "search"):
+            tenant = service._run_on_bridge(provider_call_on_the_bridge(), timeout=10)
+    finally:
+        uc.set_usage_recorder(previous)
+        loop.call_soon_threadsafe(loop.stop)
+        thread.join(5)
+        loop.close()
+    assert tenant == "alice"
+    assert [e.tenant_id for e in recorder.events] == ["alice"]

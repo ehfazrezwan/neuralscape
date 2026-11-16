@@ -224,7 +224,9 @@ class ProvenanceMixin:
             resolved_name = found.get("name")
             survivors: list = []
             if support_aware and exclude_ids is not None:
-                survivors = self._episode_survivors(resolved_uuid, resolved_name or episode_name, exclude_ids) or []
+                survivors = self._episode_survivors(
+                    resolved_uuid, resolved_name or episode_name, exclude_ids, group_id
+                ) or []
             if support_aware:
                 counts = self._support_aware_episode_removal(group_id, [resolved_uuid])
                 if counts is not None:
@@ -338,7 +340,11 @@ class ProvenanceMixin:
         superseded = metadata.get(SUPERSEDED_EPISODES_KEY)
         if ((memory_id or whole_user) and isinstance(superseded, list) and superseded
                 and getattr(settings, "graph_support_aware_removal_enabled", False)):
-            left = self._retire_episodes(exclude_ids, [u for u in superseded if isinstance(u, str)])
+            left = self._retire_episodes(
+                exclude_ids,
+                [u for u in superseded if isinstance(u, str)],
+                owner_user_id=metadata.get("owner_user_id") or mem.get("user_id") or None,
+            )
             if left:
                 logger.warning(
                     "Superseded graph episodes of memory=%s could not be removed: %s", memory_id, left,
@@ -381,9 +387,19 @@ class ProvenanceMixin:
             return None
 
     def _episode_survivors(
-        self, episode_uuid: str, episode_name: str | None, exclude_ids: tuple[str, ...]
+        self,
+        episode_uuid: str,
+        episode_name: str | None,
+        exclude_ids: tuple[str, ...],
+        group_id: str | None = None,
     ) -> list[tuple[str, dict]] | None:
         """The memory rows outside ``exclude_ids`` that record this episode (by uuid or name).
+
+        An episode name is minted from a timestamp (or a content hash), so two groups can in
+        principle hold episodes of one name.  With ``group_id`` a row that records the episode by
+        name only counts when the group its own fields build is that group, so another
+        tenant's row is never re-enriched because of a name collision; a uuid is unique and
+        needs no such check.
 
         Pages through the rows that reference the episode (the facts of one conversation, so
         few; both reference fields carry a keyword payload index) and compares ids here, so a
@@ -409,12 +425,34 @@ class ProvenanceMixin:
                     with_payload=True,
                     with_vectors=False,
                 )
-                survivors += [(str(p.id), p.payload or {}) for p in points if str(p.id) not in excluded]
+                survivors += [
+                    (str(p.id), p.payload or {})
+                    for p in points
+                    if str(p.id) not in excluded
+                    and (group_id is None or self._row_records_episode_in_group(p.payload or {}, episode_uuid, group_id))
+                ]
                 if offset is None or not points:
                     return survivors
         except Exception:
             logger.warning("Episode reference check failed for episode=%s", episode_uuid, exc_info=True)
             return None
+
+    @staticmethod
+    def _row_records_episode_in_group(payload: dict, episode_uuid: str, group_id: str) -> bool:
+        """A row recording the episode by its uuid, or by name from the very group the episode lives in."""
+
+        meta = payload.get("metadata") or {}
+        if isinstance(meta.get("metadata"), dict):
+            meta = meta["metadata"]
+        if meta.get("graph_episode_uuid") == episode_uuid:
+            return True
+        row_group = _build_group_id(
+            meta.get("visibility") or MemoryVisibility.PRIVATE.value,
+            meta.get("owner_user_id") or payload.get("user_id") or "",
+            meta.get("project_id"),
+            meta.get("workspace"),
+        )
+        return row_group == group_id
 
     def _reenrich_survivors(self, survivors: list[tuple[str, dict]], removed_episode: str) -> int:
         """Re-enrich each surviving sibling of a removed shared episode into a fresh episode.
@@ -518,15 +556,36 @@ class ProvenanceMixin:
             return None
         return {r["uuid"]: (r["group_id"], r.get("name")) for r in records}
 
-    def _retire_episodes(self, exclude_ids: tuple[str, ...] | None, episode_uuids: list[str]) -> list[str]:
+    @staticmethod
+    def _group_may_belong_to(group: str, owner_user_id: str | None) -> bool:
+        """Whether an episode in ``group`` may be one ``owner_user_id``'s memory wrote.
+
+        Shared and standard pools hold anyone's episodes; a private group names its owner, so another
+        user's private group is refused.  An injectively encoded group name does not carry its owner
+        and is not judged here.
+        """
+
+        if not owner_user_id or group.startswith(("nsg1--", "shared", "standard")):
+            return True
+        private = _build_group_id("private", owner_user_id)
+        return group == private or group.startswith(private + "--")
+
+    def _retire_episodes(
+        self,
+        exclude_ids: tuple[str, ...] | None,
+        episode_uuids: list[str],
+        owner_user_id: str | None = None,
+    ) -> list[str]:
         """Support-aware removal of episodes the rows in ``exclude_ids`` no longer stand on.
 
         Each episode is removed in the group it lives in (a correction may have moved the memory
         to another group); an episode already gone is done.  An episode other memories still
         record is removed as well and those memories are re-enriched into fresh episodes, as on
         delete; if the rows cannot be checked the episode is still removed (fail closed) and no
-        sibling is known (``exclude_ids`` ``None``: no row check).  Returns the episodes that
-        could not be removed, for a later retry.
+        sibling is known (``exclude_ids`` ``None``: no row check).  With ``owner_user_id`` an
+        episode that lives in another user's private group is left alone (a row never legitimately
+        records one; the check is defence in depth against a corrupted or forged row).  Returns the
+        episodes that could not be removed, for a later retry.
         """
         candidates = list(dict.fromkeys(u for u in episode_uuids if u))
         if not candidates:
@@ -539,7 +598,14 @@ class ProvenanceMixin:
             if episode not in groups:
                 continue
             group, name = groups[episode]
-            survivors = [] if exclude_ids is None else (self._episode_survivors(episode, name, exclude_ids) or [])
+            if not self._group_may_belong_to(group, owner_user_id):
+                logger.warning(
+                    "Not retiring episode=%s: it lives in group_id=%r, which is not the owner's", episode, group,
+                )
+                continue
+            survivors = (
+                [] if exclude_ids is None else (self._episode_survivors(episode, name, exclude_ids, group) or [])
+            )
             if self._support_aware_episode_removal(group, [episode]) is None:
                 left.append(episode)
                 continue

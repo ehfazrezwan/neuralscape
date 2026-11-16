@@ -528,6 +528,7 @@ def record_provider_usage(
 ) -> None:
     """Record one completed provider call (generation or embedding); never raises."""
     if response is not None and _attempt_recorded.get() is response:
+        _attempt_recorded.set(None)  # the duplicate is consumed: do not keep the response alive
         return
     _emit(operation=operation, model=model, kind=kind, response=response)
 

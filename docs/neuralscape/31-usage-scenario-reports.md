@@ -68,11 +68,32 @@ records an event only when it runs under an attempt context, which names the per
   tenant `unattributed`, not dropped. This covers extraction, graph enrichment and the other provider calls a job makes.
 * **Search and Ask** on the API and MCP side: `MemoryService.search`, `search_graph` and `ask.ask_memory` bind the caller.
   Ask's answering model call is recorded as `llm_ask`; the embeddings of its searches are recorded as `mem0_embedding`.
+  The graph leg of a search runs on a pool thread that carries the caller's context, so Graphiti's own embedding and
+  rerank calls are recorded for the caller too.
+* A raw batch holding items of more than one user is recorded under `unattributed`: the enqueue-time record keeps one
+  writer only, and billing the whole batch to that one person would be wrong.
 * A caller that already bound a context (a ledger stage, with its ledger attempt) keeps it.
 
 Calls made outside these entry points (a script, a one-off CLI) are not recorded. The SQLite backend is a file per
 process host; with the API and the workers in separate containers use the PostgreSQL backend so one ledger holds
 everything. No route reads the ledger in this slice.
+
+**Start-up is fail-closed.** If the store is enabled and cannot be opened (an unreachable PostgreSQL, an unwritable
+SQLite path, a refused schema), the API and the worker refuse to start with the store's own error, before they build
+any provider client: capture the operator asked for never silently turns into "records nothing". Unset the flag to run
+without it.
+
+**A sick store never stalls a provider call for long.** The PostgreSQL store reopens its connection after a restart or
+a killed backend; every write has a budget of about two seconds (the wait for the connection, the statement and one
+reconnect), after which the event is counted as unrecorded for its task (the rollup then reports the task as
+incomplete) and, while the database stays unreachable, further writes fail at once for a few seconds instead of paying
+a connect timeout each. The in-memory count of unrecorded writes is bounded; past its bound the recorder only counts
+the drops (`gaps_overflowed`) and logs each failure.
+
+**Retention.** `usage_events` and `usage_gaps` have no purge: rows stay until an operator removes them. The tables are
+content-free (identifiers, labels, token counts) and small per call, but they grow with every provider call. Plan the
+retention yourself (for example delete events of closed tasks older than your reporting horizon); a rollup refuses a
+task with more events than it will read rather than truncating it.
 
 ## Limits
 

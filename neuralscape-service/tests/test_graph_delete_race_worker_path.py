@@ -48,6 +48,8 @@ def service(monkeypatch):
 
     def lookup(group, field, value, **kw):
         svc.lookups.append((group, field, value))
+        if "episode" in svc.legacy:  # the episode node was removed: a real graph no longer has it
+            return None
         return dict(EPISODE)
 
     monkeypatch.setattr(svc, "_lookup_episode", lookup)

@@ -1868,10 +1868,6 @@ async def shutdown(ctx: dict) -> None:
     service: MemoryService = ctx.get("service")
     if service:
         service.close()
-    for key in ("ledger_payloads", "ledger", "authority"):
-        handle = ctx.get(key)
-        if handle is not None:
-            handle.close()
     usage_store = ctx.get("usage_store")
     if usage_store is not None:
         from usage_store import uninstall_usage_capture

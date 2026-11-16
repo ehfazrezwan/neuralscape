@@ -1335,7 +1335,7 @@ class WriteMixin:
                 # and they are re-enriched into fresh episodes; one that cannot be removed now
                 # is recorded on the row and retried by the next correction or the delete.
                 left = self._retire_episodes(
-                    (memory_id,), [u for u in previous_episodes if u != episode_uuid]
+                    (memory_id,), [u for u in previous_episodes if u != episode_uuid], owner_user_id=user_id,
                 )
                 self._record_superseded_episodes(memory_id, previous_episodes, left)
             if reenrich_pending and (episode_uuid or episode_name):

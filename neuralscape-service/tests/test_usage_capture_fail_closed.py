@@ -40,14 +40,19 @@ def test_install_with_an_unusable_store_raises_and_installs_nothing(tmp_path):
 
 
 def test_an_unreachable_postgres_store_raises_at_install(monkeypatch):
+    import sys
+    import types
+
     from config import Settings
 
+    def refuse(dsn, **kwargs):
+        raise OSError("connection refused")
+
+    monkeypatch.setitem(sys.modules, "psycopg", types.SimpleNamespace(connect=refuse))
     broken = Settings(
-        usage_store_enabled=True, usage_store_backend="postgres",
-        usage_store_postgres_dsn="host=127.0.0.1 port=1 dbname=none connect_timeout=1",
+        usage_store_enabled=True, usage_store_backend="postgres", usage_store_postgres_dsn="host=127.0.0.1 port=1",
     )
-    pytest.importorskip("psycopg")  # a declared condition: the optional PostgreSQL driver
-    with pytest.raises(Exception):
+    with pytest.raises(OSError):
         usage_store.install_usage_capture(broken)
     assert uc.get_usage_recorder() is None
 

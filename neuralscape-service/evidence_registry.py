@@ -422,8 +422,8 @@ SCENARIOS: tuple[Scenario, ...] = (
 class ServicePathScenario:
     """A scenario that exercises a requirement through the service (route, worker) rather than a library call.
 
-    ``file`` is an integration test module (a path under the service directory) owned by the lane that built the
-    feature; the oracle owner registers it, pins its content hash and names the tests that are the oracle.  A
+    ``file`` is an integration test module (a path under the service directory) owned by the change that
+    introduced the feature; the oracle owner registers it, pins its content hash and names the tests that are the oracle.  A
     tree without the feature does not have the file, and there the scenario simply fails to exist (the library
     observation keeps its expected failure).
     """
@@ -442,7 +442,7 @@ SERVICE_PATH_SCENARIOS: tuple[ServicePathScenario, ...] = (
     ServicePathScenario(
         "graph-removal-service-path", "graph-removal-shared-support", ("A7.02", "A7.03"),
         "integration_tests/test_graph_support_aware_removal_integration.py",
-        "875c8a216de6b156be1095c30ce03d2a2be41662d6d6266cd4a4236fc5c37e1a",
+        "85b13542b4834f2d458c5354d049071363234cfe21d863575379032d9a27b1ef",
         (
             "test_api_delete_keeps_a_fact_another_memory_still_supports",
             "test_a_correction_replaces_the_superseded_episode_and_keeps_still_asserted_facts",

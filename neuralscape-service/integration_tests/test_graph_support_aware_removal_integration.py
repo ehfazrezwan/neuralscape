@@ -18,7 +18,9 @@ X->Y, while only A supports X->Z.
   not stay retrievable; facts another episode supports stay), and every surviving sibling is re-enriched into a
   fresh episode of its own, so its facts come back.  A correction whose removal fails records the superseded
   episode on the row and the next correction or the delete retries it, in the group the episode lives in.
-* A memory deleted while it is being enriched leaves nothing in the graph, flag on and off.
+* A memory deleted while it is being enriched leaves nothing in the graph: through the graph worker job, with
+  ``GRAPH_DELETE_RACE_CLEANUP_ENABLED`` on and off and the support-aware removal on and off; the job returns the
+  same skip every time and never takes the lossy fallback.
 
 The durable (ledger job) form of the sibling re-enrichment belongs with the write producer (a later slice).
 A missing store fails the test on the gate and skips it elsewhere (``integration_tests/README.md``).
@@ -31,7 +33,6 @@ from types import SimpleNamespace
 
 import pytest
 
-from config import settings
 from memory.groups import _build_group_id
 from memory_service import MemoryService
 
@@ -173,11 +174,11 @@ def seed(graphiti, bridge):
 
 
 @pytest.fixture(autouse=True)
-def _clean_rows(rows_collection, monkeypatch):
+def _clean_rows(rows_collection, flags):
     from qdrant_client.models import PointIdsList
 
     client, name = rows_collection
-    monkeypatch.setattr(settings, "qdrant_collection", name)
+    flags(qdrant_collection=name)
     points, _ = client.scroll(name, limit=1000, with_payload=False)
     if points:
         client.delete(name, points_selector=PointIdsList(points=[p.id for p in points]))
@@ -216,17 +217,17 @@ def locks_left(graph):
     return q(graphiti, bridge, "MATCH (l:NsLock) RETURN count(l) AS n")[0]["n"]
 
 
-def delete_through_the_api(service, monkeypatch, memory_id):
+def delete_through_the_api(service, monkeypatch, flags, memory_id):
     from fastapi.testclient import TestClient
 
     import main
 
     monkeypatch.setattr(main, "_service", service)
-    monkeypatch.setattr(settings, "default_user_id", OWNER)
-    monkeypatch.setattr(settings, "ledger_enabled", False)
-    monkeypatch.setattr(settings, "neuralscape_auth_disabled", True)
-    monkeypatch.setattr(settings, "neuralscape_user_token_secret", "")
-    monkeypatch.setattr(settings, "neuralscape_api_key", "")
+    flags(default_user_id=OWNER)
+    flags(ledger_enabled=False)
+    flags(neuralscape_auth_disabled=True)
+    flags(neuralscape_user_token_secret="")
+    flags(neuralscape_api_key="")
     response = TestClient(main.app).delete(f"/v1/memories/{memory_id}")
     assert response.status_code == 200, response.text
     return response.json()
@@ -243,25 +244,25 @@ def assert_support_aware_outcome(graph, ids):
     assert locks_left(graph) == 0
 
 
-def test_api_delete_keeps_a_fact_another_memory_still_supports(graph, rows_collection, monkeypatch):
-    monkeypatch.setattr(settings, "graph_support_aware_removal_enabled", True)
+def test_api_delete_keeps_a_fact_another_memory_still_supports(graph, rows_collection, monkeypatch, flags):
+    flags(graph_support_aware_removal_enabled=True)
     ids = seed(*graph)
-    result = delete_through_the_api(make_service(graph, ids, rows_collection), monkeypatch, MEM_A)
+    result = delete_through_the_api(make_service(graph, ids, rows_collection), monkeypatch, flags, MEM_A)
     assert result.get("graph_cascade") == "resolved"
     assert_support_aware_outcome(graph, ids)
 
 
-def test_with_the_flag_off_the_legacy_cascade_still_expires_the_shared_fact(graph, rows_collection, monkeypatch):
-    monkeypatch.setattr(settings, "graph_support_aware_removal_enabled", False)
+def test_with_the_flag_off_the_legacy_cascade_still_expires_the_shared_fact(graph, rows_collection, monkeypatch, flags):
+    flags(graph_support_aware_removal_enabled=False)
     ids = seed(*graph)
-    delete_through_the_api(make_service(graph, ids, rows_collection), monkeypatch, MEM_A)
+    delete_through_the_api(make_service(graph, ids, rows_collection), monkeypatch, flags, MEM_A)
     assert edge(graph, ids["XY"])["expired"] is True  # most-restrictive: expired despite B's support
     only_a = edge(graph, ids["XZ"])
     assert only_a is None or only_a["expired"] is True  # gone with the sole-mentioned entity, or expired
 
 
-def test_a_correction_replaces_the_superseded_episode_and_keeps_still_asserted_facts(graph, rows_collection, monkeypatch):
-    monkeypatch.setattr(settings, "graph_support_aware_removal_enabled", True)
+def test_a_correction_replaces_the_superseded_episode_and_keeps_still_asserted_facts(graph, rows_collection, monkeypatch, flags):
+    flags(graph_support_aware_removal_enabled=True)
     ids = seed(*graph)
     service = make_service(graph, ids, rows_collection)
     graphiti, bridge = graph
@@ -293,9 +294,9 @@ def test_a_correction_replaces_the_superseded_episode_and_keeps_still_asserted_f
     assert locks_left(graph) == 0
 
 
-def test_with_the_flag_off_a_correction_leaves_the_superseded_episode(graph, rows_collection, monkeypatch):
+def test_with_the_flag_off_a_correction_leaves_the_superseded_episode(graph, rows_collection, monkeypatch, flags):
     """Pinned legacy behavior: the old episode keeps its facts live (the defect the flag fixes)."""
-    monkeypatch.setattr(settings, "graph_support_aware_removal_enabled", False)
+    flags(graph_support_aware_removal_enabled=False)
     ids = seed(*graph)
     service = make_service(graph, ids, rows_collection)
     service._memory.graph.add = lambda **kwargs: {"episode_uuid": str(uuid.uuid4())}
@@ -410,20 +411,20 @@ def assert_the_shared_episode_is_gone_and_the_sibling_is_back(service, graph, id
     assert locks_left(graph) == 0
 
 
-def test_a_delete_removes_the_shared_episode_and_re_enriches_the_surviving_sibling(graph, rows_collection, monkeypatch):
-    monkeypatch.setattr(settings, "graph_support_aware_removal_enabled", True)
+def test_a_delete_removes_the_shared_episode_and_re_enriches_the_surviving_sibling(graph, rows_collection, monkeypatch, flags):
+    flags(graph_support_aware_removal_enabled=True)
     ids = seed(*graph)
     service = make_service(graph, ids, rows_collection)
     add_sibling(service, graph, ids)
     install_graph_add(service, graph, ids)
-    result = delete_through_the_api(service, monkeypatch, MEM_A)
+    result = delete_through_the_api(service, monkeypatch, flags, MEM_A)
     assert result.get("graph_cascade") == "resolved"
     assert_the_shared_episode_is_gone_and_the_sibling_is_back(service, graph, ids)
     assert edge(graph, ids["XY"])["episodes"] == [ids["EB"]]
 
 
-def test_a_correction_removes_the_shared_episode_and_re_enriches_the_surviving_sibling(graph, rows_collection, monkeypatch):
-    monkeypatch.setattr(settings, "graph_support_aware_removal_enabled", True)
+def test_a_correction_removes_the_shared_episode_and_re_enriches_the_surviving_sibling(graph, rows_collection, monkeypatch, flags):
+    flags(graph_support_aware_removal_enabled=True)
     ids = seed(*graph)
     service = make_service(graph, ids, rows_collection)
     add_sibling(service, graph, ids)
@@ -434,28 +435,28 @@ def test_a_correction_removes_the_shared_episode_and_re_enriches_the_surviving_s
     assert not service._memory.meta(MEM_A).get("graph_episode_superseded")
 
 
-def test_a_sibling_referencing_the_episode_by_name_only_is_re_enriched_too(graph, rows_collection, monkeypatch):
+def test_a_sibling_referencing_the_episode_by_name_only_is_re_enriched_too(graph, rows_collection, monkeypatch, flags):
     """A re-run conversation stamps only the deterministic episode name on its new rows."""
-    monkeypatch.setattr(settings, "graph_support_aware_removal_enabled", True)
+    flags(graph_support_aware_removal_enabled=True)
     ids = seed(*graph)
     service = make_service(graph, ids, rows_collection)
     service._memory.client.set_payload(service._memory.collection, payload={"graph_episode_name": "ep-a"}, points=[MEM_A], key="metadata")
     add_sibling(service, graph, ids, by_name_only=True)
     install_graph_add(service, graph, ids)
-    delete_through_the_api(service, monkeypatch, MEM_A)
+    delete_through_the_api(service, monkeypatch, flags, MEM_A)
     assert_the_shared_episode_is_gone_and_the_sibling_is_back(service, graph, ids)
 
 
-def test_until_re_enrichment_runs_the_sibling_waits_marked_and_its_facts_are_absent(graph, rows_collection, monkeypatch):
+def test_until_re_enrichment_runs_the_sibling_waits_marked_and_its_facts_are_absent(graph, rows_collection, monkeypatch, flags):
     """With a durable dispatch installed the delete only schedules the sibling: availability loss, no exposure."""
-    monkeypatch.setattr(settings, "graph_support_aware_removal_enabled", True)
+    flags(graph_support_aware_removal_enabled=True)
     ids = seed(*graph)
     service = make_service(graph, ids, rows_collection)
     add_sibling(service, graph, ids)
     install_graph_add(service, graph, ids)
     jobs = []
     service.set_graph_reenrich_dispatch(jobs.append)
-    delete_through_the_api(service, monkeypatch, MEM_A)
+    delete_through_the_api(service, monkeypatch, flags, MEM_A)
     assert [job["memory_id"] for job in jobs] == [MEM_C] and jobs[0]["removed_episode"] == ids["EA"]
     row = service._memory.meta(MEM_C)
     assert row["graph_reenrich_pending"] == ids["EA"] and row["graph_episode_uuid"] is None
@@ -464,31 +465,31 @@ def test_until_re_enrichment_runs_the_sibling_waits_marked_and_its_facts_are_abs
     assert_the_shared_episode_is_gone_and_the_sibling_is_back(service, graph, ids)
 
 
-def test_with_the_flag_off_a_delete_still_removes_a_shared_episode(graph, rows_collection, monkeypatch):
+def test_with_the_flag_off_a_delete_still_removes_a_shared_episode(graph, rows_collection, monkeypatch, flags):
     """Pinned legacy behavior: the most-restrictive cascade does not look at sibling rows."""
-    monkeypatch.setattr(settings, "graph_support_aware_removal_enabled", False)
+    flags(graph_support_aware_removal_enabled=False)
     ids = seed(*graph)
     service = make_service(graph, ids, rows_collection)
     add_sibling(service, graph, ids)
-    delete_through_the_api(service, monkeypatch, MEM_A)
+    delete_through_the_api(service, monkeypatch, flags, MEM_A)
     assert not exists(graph, "Episodic", ids["EA"]) and edge(graph, ids["XY"])["expired"] is True
 
 
-def test_a_ghost_episode_id_in_an_edge_does_not_keep_the_edge_alive(graph, rows_collection, monkeypatch):
-    monkeypatch.setattr(settings, "graph_support_aware_removal_enabled", True)
+def test_a_ghost_episode_id_in_an_edge_does_not_keep_the_edge_alive(graph, rows_collection, monkeypatch, flags):
+    flags(graph_support_aware_removal_enabled=True)
     ids = seed(*graph)
     graphiti, bridge = graph
     q(graphiti, bridge, "MATCH ()-[r:RELATES_TO {uuid: $u}]->() SET r.episodes = r.episodes + $ghost",
       u=ids["XZ"], ghost=str(uuid.uuid4()))  # an id no episode has (e.g. one removed out of band)
-    delete_through_the_api(make_service(graph, ids, rows_collection), monkeypatch, MEM_A)
+    delete_through_the_api(make_service(graph, ids, rows_collection), monkeypatch, flags, MEM_A)
     assert edge(graph, ids["XZ"]) is None and not exists(graph, "Entity", ids["Z"])
     assert_support_aware_outcome(graph, ids)
 
 
-def test_a_failed_correction_removal_is_recorded_and_retried_by_the_next_correction(graph, rows_collection, monkeypatch):
+def test_a_failed_correction_removal_is_recorded_and_retried_by_the_next_correction(graph, rows_collection, monkeypatch, flags):
     import engine_adapters_current
 
-    monkeypatch.setattr(settings, "graph_support_aware_removal_enabled", True)
+    flags(graph_support_aware_removal_enabled=True)
     ids = seed(*graph)
     service = make_service(graph, ids, rows_collection)
     real = engine_adapters_current.GraphitiGraphAdapter.remove_episodes
@@ -506,10 +507,10 @@ def test_a_failed_correction_removal_is_recorded_and_retried_by_the_next_correct
     assert locks_left(graph) == 0
 
 
-def test_a_failed_correction_removal_is_retried_by_the_delete(graph, rows_collection, monkeypatch):
+def test_a_failed_correction_removal_is_retried_by_the_delete(graph, rows_collection, monkeypatch, flags):
     import engine_adapters_current
 
-    monkeypatch.setattr(settings, "graph_support_aware_removal_enabled", True)
+    flags(graph_support_aware_removal_enabled=True)
     ids = seed(*graph)
     service = make_service(graph, ids, rows_collection)
     real = engine_adapters_current.GraphitiGraphAdapter.remove_episodes
@@ -517,7 +518,7 @@ def test_a_failed_correction_removal_is_retried_by_the_delete(graph, rows_collec
                         lambda self, *a, **k: (_ for _ in ()).throw(RuntimeError("neo4j unavailable")))
     first = correct(service, graph, ids)
     monkeypatch.setattr(engine_adapters_current.GraphitiGraphAdapter, "remove_episodes", real)
-    delete_through_the_api(service, monkeypatch, MEM_A)
+    delete_through_the_api(service, monkeypatch, flags, MEM_A)
     assert not exists(graph, "Episodic", ids["EA"]) and not exists(graph, "Episodic", first)
     assert_support_aware_outcome_without_a(graph, ids)
 
@@ -529,8 +530,8 @@ def assert_support_aware_outcome_without_a(graph, ids):
     assert locks_left(graph) == 0
 
 
-def test_a_correction_into_another_group_removes_the_superseded_episode_where_it_lives(graph, rows_collection, monkeypatch):
-    monkeypatch.setattr(settings, "graph_support_aware_removal_enabled", True)
+def test_a_correction_into_another_group_removes_the_superseded_episode_where_it_lives(graph, rows_collection, monkeypatch, flags):
+    flags(graph_support_aware_removal_enabled=True)
     ids = seed(*graph)
     service = make_service(graph, ids, rows_collection)
     new_episode = correct(service, graph, ids, visibility="shared")  # the corrected memory moved group
@@ -550,16 +551,15 @@ def episodes_with(graph, text):
     return [r["uuid"] for r in q(graphiti, bridge, "MATCH (e:Episodic) WHERE e.content = $t RETURN e.uuid AS uuid", t=text)]
 
 
-@pytest.mark.parametrize("support_aware", [True, False], ids=["support-aware", "legacy"])
-def test_a_memory_deleted_during_its_enrichment_leaves_no_episode(graph, rows_collection, monkeypatch, support_aware):
-    monkeypatch.setattr(settings, "graph_support_aware_removal_enabled", support_aware)
-    ids = seed(*graph)
-    service = make_service(graph, ids, rows_collection)
-    service._memory.put(MEM_NEW, "oolong in the afternoon", {"owner_user_id": OWNER, "visibility": "private"})
+DELETED_TEXT = "oolong in the afternoon"
+
+
+def arm_the_delete_during_extraction(service, graph, ids):
+    """The user deletes the memory while the graph write runs: the delete finds no episode yet, so it removes nothing."""
+    service._memory.put(MEM_NEW, DELETED_TEXT, {"owner_user_id": OWNER, "visibility": "private"})
     graphiti, bridge = graph
 
     def add_while_the_user_deletes(**kwargs):
-        # The delete lands during extraction: it finds no episode yet, so it removes nothing.
         result = service.delete_memory(MEM_NEW)
         assert result.get("graph_cascade") == "unresolved"
         episode = str(uuid.uuid4())
@@ -573,21 +573,74 @@ def test_a_memory_deleted_during_its_enrichment_leaves_no_episode(graph, rows_co
         return {"episode_uuid": episode, "episode_name": "ep-" + episode}
 
     service._memory.graph.add = add_while_the_user_deletes
-    service.enrich_graph("oolong in the afternoon", OWNER, None, "private", MEM_NEW)
-    assert episodes_with(graph, "oolong in the afternoon") == []  # the deleted memory's text is not in the graph
+
+
+@pytest.mark.parametrize("support_aware", [True, False], ids=["support-aware", "legacy"])
+@pytest.mark.parametrize("race_cleanup", [True, False], ids=["race-cleanup-on", "race-cleanup-off"])
+def test_a_memory_deleted_during_its_graph_job_leaves_no_episode_and_the_job_resolves(
+    graph, rows_collection, monkeypatch, support_aware, race_cleanup, flags
+):
+    """The graph worker job (``process_graph_enrichment``) around the real ``enrich_graph``.
+
+    With ``GRAPH_DELETE_RACE_CLEANUP_ENABLED`` off the worker's own post-enrichment check removes the episode; on, the
+    enrichment removes it and the worker takes that as done.  Either way the job returns the same skip, raises
+    nothing, never falls back to the lossy substring expiry, and the deleted text is not in the graph.
+    """
+    import asyncio
+
+    import worker
+
+    flags(graph_support_aware_removal_enabled=support_aware, graph_delete_race_cleanup_enabled=race_cleanup)
+    ids = seed(*graph)
+    service = make_service(graph, ids, rows_collection)
+    arm_the_delete_during_extraction(service, graph, ids)
+    substring_fallbacks = []
+    monkeypatch.setattr(service, "_expire_graph_edges_for_memory", lambda mem: substring_fallbacks.append(mem))
+    outcome = asyncio.run(worker.process_graph_enrichment({"service": service}, MEM_NEW, DELETED_TEXT, OWNER, None, "private"))
+    assert outcome == {"memory_id": MEM_NEW, "enriched": False, "skipped": "changed_during_enrichment"}
+    assert substring_fallbacks == []  # no lossy fallback, whichever side removed the episode
+    assert episodes_with(graph, DELETED_TEXT) == []  # the deleted memory's text is not in the graph
     assert exists(graph, "Episodic", ids["EA"]) and exists(graph, "Episodic", ids["EB"])  # others untouched
     assert locks_left(graph) == 0
 
 
-def test_a_survivor_deleted_during_its_re_enrichment_leaves_nothing_in_the_graph(graph, rows_collection, monkeypatch):
-    monkeypatch.setattr(settings, "graph_support_aware_removal_enabled", True)
+@pytest.mark.parametrize("support_aware", [True, False], ids=["support-aware", "legacy"])
+def test_an_inline_enrichment_of_a_memory_deleted_meanwhile_is_cleaned_up_with_the_flag_on(
+    graph, rows_collection, support_aware, flags
+):
+    flags(graph_support_aware_removal_enabled=support_aware, graph_delete_race_cleanup_enabled=True)
+    ids = seed(*graph)
+    service = make_service(graph, ids, rows_collection)
+    arm_the_delete_during_extraction(service, graph, ids)
+    done = {}
+    assert service.enrich_graph(DELETED_TEXT, OWNER, None, "private", MEM_NEW, outcome=done) is True
+    assert done == {"cleaned_up": True}
+    assert episodes_with(graph, DELETED_TEXT) == []
+    assert exists(graph, "Episodic", ids["EA"]) and exists(graph, "Episodic", ids["EB"])
+    assert locks_left(graph) == 0
+
+
+def test_with_the_flag_off_an_inline_enrichment_leaves_the_cleanup_to_its_caller(graph, rows_collection, flags):
+    """The default path is unchanged: ``enrich_graph`` alone does not remove the episode (the worker job does)."""
+    flags(graph_delete_race_cleanup_enabled=False)
+    ids = seed(*graph)
+    service = make_service(graph, ids, rows_collection)
+    arm_the_delete_during_extraction(service, graph, ids)
+    done = {}
+    assert service.enrich_graph(DELETED_TEXT, OWNER, None, "private", MEM_NEW, outcome=done) is True
+    assert done == {}
+    assert len(episodes_with(graph, DELETED_TEXT)) == 1
+
+
+def test_a_survivor_deleted_during_its_re_enrichment_leaves_nothing_in_the_graph(graph, rows_collection, monkeypatch, flags):
+    flags(graph_support_aware_removal_enabled=True)
     ids = seed(*graph)
     service = make_service(graph, ids, rows_collection)
     add_sibling(service, graph, ids)
     jobs = []
     service.set_graph_reenrich_dispatch(jobs.append)
     install_graph_add(service, graph, ids)
-    delete_through_the_api(service, monkeypatch, MEM_A)  # schedules the sibling's re-enrichment
+    delete_through_the_api(service, monkeypatch, flags, MEM_A)  # schedules the sibling's re-enrichment
     assert [job["memory_id"] for job in jobs] == [MEM_C]
     real_add = service._memory.graph.add
 
