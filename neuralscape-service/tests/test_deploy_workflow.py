@@ -9,7 +9,7 @@ properties that must not regress:
 * the remote health-polling loops still exist.
 
 In the packaged test image only the service tree exists (no ``.github``), so each
-test skips when the repo-level file is absent; the host CI job runs them.
+test returns early (no skipif) when the repo-level file is absent; the host CI job runs them.
 """
 
 from __future__ import annotations
