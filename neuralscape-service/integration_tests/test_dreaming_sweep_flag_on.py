@@ -231,12 +231,22 @@ def test_reflections_stored_with_provenance_and_diary_written(dream_env, swept):
         scroll_filter=Filter(must=[FieldCondition(key="metadata.source_type", match=MatchValue(value="dream"))]),
     )
     assert recs, "insights reported stored but none carries source_type=dream"
-    seeded = set(swept.ids.values())
+    # The collection also holds the second user's insights (the sweep covers
+    # every pool), which legitimately cite that user's rows. Each insight must
+    # cite only rows of its own pool: pick the allowed set by owner, so a
+    # cross-pool citation still fails (the owner-keyed isolation test covers
+    # the reverse direction).
+    own_pool_ids = set(swept.ids.values()) | set(swept.proj_ids)
+    other_pool_ids = set(swept.other_ids)
+    assert any(r.payload["metadata"].get("owner_user_id") != swept.other_user for r in recs), (
+        "no insight of the operator pools was stored"
+    )
     for r in recs:
         md = r.payload["metadata"]
         assert md.get("epistemic_level") in ("deductive", "inductive", "reflection"), md.get("epistemic_level")
         derived = md.get("derived_from") or []
-        assert derived and set(derived) <= seeded | set(swept.proj_ids), f"bad derived_from {derived}"
+        allowed = other_pool_ids if md.get("owner_user_id") == swept.other_user else own_pool_ids
+        assert derived and set(derived) <= allowed, f"bad derived_from {derived} (owner {md.get('owner_user_id')})"
         env.seeded_ids.add(str(r.id))
     assert diary_page_path(env.sweep_settings().dreams_dir, env.pool).exists()
     assert "Reflections" in _diary(env)
@@ -292,9 +302,17 @@ def test_vault_topic_pages_home_and_hub_written(dream_env, swept):
     assert prep.status == "dreamt", f"{prep.status}: {prep.reason} {prep.errors}"
     hub = vault / "Projects" / swept.pid / f"{swept.pid}.md"
     assert prep.pages_written > 0 and hub.exists(), f"project hub missing: {hub}"
-    topics = [p for p in (vault / "Projects" / swept.pid).glob("*.md") if p.stem not in (swept.pid, "Card")]
+    # index.md / log.md are OKF bundle files (standard markdown links, written
+    # by refresh_bundle_indexes), not librarian topic pages: exclude them.
+    from okf.translate import is_reserved_filename
+
+    topics = [
+        p for p in (vault / "Projects" / swept.pid).glob("*.md")
+        if p.stem not in (swept.pid, "Card") and not is_reserved_filename(p.name)
+    ]
     assert topics, "no project topic pages"
-    assert f"[[{swept.pid}]]" in topics[0].read_text(encoding="utf-8"), "topic page does not link its hub"
+    for page in topics:
+        assert f"[[{swept.pid}]]" in page.read_text(encoding="utf-8"), f"topic page {page.name} does not link its hub"
 
 
 # ── recall traces ───────────────────────────────────────────────────
