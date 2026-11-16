@@ -389,3 +389,117 @@ def test_raw_write_does_not_retry_a_non_transient_embed_error():
         with pytest.raises(ValueError):
             svc.store_raw(content="x", user_id="u", category="personal_fact")
     assert mem.embedding_model.embed.call_count == 1
+
+
+# ── the two BATCH embed calls retry a transient timeout the same way ──────────
+#
+# store_raw_batch (one embed_batch for every new item) and _batch_store_facts (one
+# embed_batch for every extracted fact) wrap the embed in retry_transient: a timed-out
+# attempt is retried, and the batch is stored once; when every attempt times out the
+# job fails with the original error class and nothing was stored.
+
+
+def _raw_batch_service(embed_batch):
+    from memory_service import MemoryService
+
+    svc = MemoryService()
+    mem = MagicMock()
+    mem.embedding_model.embed_batch.side_effect = embed_batch
+
+    def prepare(**kwargs):
+        text = kwargs["content"]
+        return ({"content": text, "dedup_key": text, "mid": f"id-{text}", "response": MagicMock()}, None)
+
+    finalize = MagicMock()
+    return svc, mem, prepare, finalize
+
+
+def _run_raw_batch(svc, mem, prepare, finalize):
+    items = [
+        {"content": "alpha", "user_id": "u", "category": "personal_fact"},
+        {"content": "beta", "user_id": "u", "category": "personal_fact"},
+    ]
+    with patch.object(svc, "_prepare_raw_store", side_effect=prepare), \
+         patch.object(svc, "_get_memory", return_value=mem), \
+         patch.object(svc, "_finalize_raw_store", finalize), \
+         patch("memory.retry.time.sleep"):
+        return svc.store_raw_batch(items)
+
+
+def test_raw_batch_retries_a_timed_out_embed_and_stores_the_batch_once():
+    import httpx
+
+    calls = []
+
+    def embed_batch(texts, memory_action=None):
+        calls.append(list(texts))
+        if len(calls) == 1:
+            raise httpx.ReadTimeout("The read operation timed out")
+        return [[0.1, 0.2], [0.3, 0.4]]
+
+    svc, mem, prepare, finalize = _raw_batch_service(embed_batch)
+    results = _run_raw_batch(svc, mem, prepare, finalize)
+    assert calls == [["alpha", "beta"], ["alpha", "beta"]]  # one embed call per attempt, same batch
+    assert finalize.call_count == 2  # each row stored exactly once
+    assert [c.args[1] for c in finalize.call_args_list] == [[0.1, 0.2], [0.3, 0.4]]
+    assert len(results) == 2
+
+
+def test_raw_batch_fails_with_the_same_error_class_when_every_attempt_times_out():
+    import httpx
+
+    def embed_batch(texts, memory_action=None):
+        raise httpx.ReadTimeout("The read operation timed out")
+
+    svc, mem, prepare, finalize = _raw_batch_service(embed_batch)
+    with pytest.raises(httpx.ReadTimeout):
+        _run_raw_batch(svc, mem, prepare, finalize)
+    finalize.assert_not_called()  # nothing was stored
+    assert mem.embedding_model.embed_batch.call_count > 1
+
+
+def _facts_service(embed_batch):
+    from memory_service import MemoryService
+
+    svc = MemoryService()
+    svc._memory = MagicMock()
+    svc._memory.embedding_model.embed_batch.side_effect = embed_batch
+    svc._find_by_content_hash = MagicMock(return_value=None)
+    return svc
+
+
+FACTS = [("preference", "likes tea in the morning"), ("convention", "uses tabs for indentation")]
+
+
+def test_fact_batch_retries_a_timed_out_embed_and_stores_the_facts_once():
+    import httpx
+
+    calls = []
+
+    def embed_batch(texts, memory_action=None):
+        calls.append(list(texts))
+        if len(calls) == 1:
+            raise httpx.ReadTimeout("The read operation timed out")
+        return [[0.1, 0.2], [0.3, 0.4]]
+
+    svc = _facts_service(embed_batch)
+    with patch("memory.retry.time.sleep"):
+        stored = svc._batch_store_facts(facts=FACTS, user_id="u1")
+    assert len(calls) == 2 and calls[0] == calls[1]  # one embed call per attempt
+    insert = svc._memory.vector_store.insert
+    insert.assert_called_once()  # a single upsert: no duplicate rows
+    assert insert.call_args.kwargs["vectors"] == [[0.1, 0.2], [0.3, 0.4]]
+    assert len(insert.call_args.kwargs["ids"]) == 2 == len(stored)
+
+
+def test_fact_batch_fails_with_the_same_error_class_when_every_attempt_times_out():
+    import httpx
+
+    def embed_batch(texts, memory_action=None):
+        raise httpx.ReadTimeout("The read operation timed out")
+
+    svc = _facts_service(embed_batch)
+    with patch("memory.retry.time.sleep"), pytest.raises(httpx.ReadTimeout):
+        svc._batch_store_facts(facts=FACTS, user_id="u1")
+    svc._memory.vector_store.insert.assert_not_called()  # nothing was stored
+    assert svc._memory.embedding_model.embed_batch.call_count > 1
