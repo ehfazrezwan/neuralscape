@@ -15,30 +15,41 @@ Pure functions, no web-framework deps — trivially unit-testable.
 
 from __future__ import annotations
 
+import re
+
 
 def normalize_email(email: str | None) -> str:
     """Lowercase + strip. Returns '' for falsy input."""
     return (email or "").strip().lower()
 
 
-def email_domain(email: str) -> str:
-    """The domain part of a normalized email, or '' if malformed.
+# Characters that may never appear anywhere in an address: ASCII/C1 controls,
+# space, NBSP, soft hyphen, Unicode separators (U+2028/2029, U+3000, ...) and
+# invisible format characters (zero-width, bidi marks, BOM). The SAME class is
+# used by ``supabase/allowlist_hook.sql`` (which cannot hold NUL); keep in step.
+_FORBIDDEN = re.compile(
+    "[\u0000-\u0020\u007f-\u00a0\u00ad\u180e\u1680\u2000-\u200f"
+    "\u2028-\u202f\u205f-\u2064\u2066-\u206f\u3000\ufeff]"
+)
 
-    Requires exactly one ``@`` with a non-empty local-part AND domain, and no
-    whitespace or control characters anywhere, so ``@example.com``, ``a@`` and
-    ``x@evil.com@example.com`` are all rejected — important because this feeds
-    the allowlist's domain gate. Kept in step with the Supabase hook SQL
-    (``supabase/allowlist_hook.sql``), which also rejects more than one ``@``.
+
+def email_domain(email: str | None) -> str:
+    """The (lowercased) domain of an address, or '' if malformed.
+
+    The RAW value is validated (no stripping): exactly one ``@``, a non-empty
+    local-part AND domain, and no whitespace/control/invisible characters
+    anywhere. So ``@example.com``, ``a@``, ``x@evil.com@example.com`` and
+    ``x@example.com`` followed by a newline are all rejected. This feeds the
+    allowlist's domain gate and matches the Supabase hook SQL
+    (``supabase/allowlist_hook.sql``).
     """
-    norm = normalize_email(email)
-    if any(ch.isspace() or not ch.isprintable() for ch in norm):
+    raw = email or ""
+    if _FORBIDDEN.search(raw) or raw.count("@") != 1:
         return ""
-    if norm.count("@") != 1:
-        return ""
-    local, _, domain = norm.partition("@")
+    local, _, domain = raw.partition("@")
     if not local or not domain:
         return ""
-    return domain
+    return domain.lower()
 
 
 def is_email_allowed(
@@ -58,13 +69,11 @@ def is_email_allowed(
     """
     if not email_verified:
         return False
-    norm = normalize_email(email)
-    # Require a well-formed address: non-empty local-part AND domain. This
-    # rejects malformed inputs like "@example.com" that would otherwise slip
-    # through the domain gate (email_domain returns '' for those).
-    domain = email_domain(norm)
+    # Validate the raw value: padding/embedded whitespace is denied, not trimmed.
+    domain = email_domain(email)
     if not domain:
         return False
+    norm = normalize_email(email)
     if not allowed_domains and not email_allowlist:
         # Fail closed: an unconfigured allowlist must not admit the world.
         return False
