@@ -92,7 +92,7 @@ def _scroll(client, collection: str, must: list, limit: int) -> tuple[list, dict
             return points, None
     # The loop only exits here when ``limit`` rows were read and Qdrant still
     # had a next page: the pool is larger than the cap.
-    total = len(points)
+    total: int | None = None
     try:
         total = int(
             client.count(
@@ -102,7 +102,10 @@ def _scroll(client, collection: str, must: list, limit: int) -> tuple[list, dict
             ).count
         )
     except Exception:  # noqa: BLE001 - the flag matters more than the exact number
-        logger.warning("OKF export: exact pool count failed; reporting at-least counts", exc_info=True)
+        # A failed count must never turn into "complete": Qdrant still had a next
+        # page, so the pool IS larger than the cap. Report the cut with an unknown total.
+        logger.warning("OKF export: exact pool count failed; reporting truncation without a total", exc_info=True)
+        return points, {"exported": len(points), "total": None}
     if total <= len(points):  # exactly at the cap with nothing more: not truncated
         return points, None
     return points, {"exported": len(points), "total": total}
@@ -399,7 +402,8 @@ def build_bundle(
     )
     if truncation and truncation.get("truncated"):
         parts = ", ".join(
-            f"{name} pool {c['exported']} of {c['total']}"
+            f"{name} pool {c['exported']} of "
+            + (str(c["total"]) if c["total"] is not None else f"more than {c['exported']}")
             for name, c in sorted(truncation.get("pools", {}).items())
         )
         export_text += f" INCOMPLETE: the export cap was reached ({parts})."

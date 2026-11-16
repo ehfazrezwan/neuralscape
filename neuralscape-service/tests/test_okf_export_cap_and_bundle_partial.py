@@ -113,6 +113,39 @@ class TestExportIsNeverSilentlyCut:
         assert okf_export.MAX_EXPORT_MEMORIES == 50_000
 
 
+class TestCountFailureNeverLooksComplete:
+    def test_a_failing_count_reports_truncation_with_an_unknown_total(self):
+        svc, client = _service(12)
+
+        def boom(**kw):
+            raise RuntimeError("qdrant count timeout")
+
+        client.count = boom
+        rows, info = collect_memories_with_info(svc, user_id="alice", visibility="private", limit=5)
+        assert len(rows) == 5
+        assert info == {"truncated": True, "pools": {"personal": {"exported": 5, "total": None}}}
+
+    def test_export_bundle_still_says_incomplete_and_the_route_says_unknown(self):
+        svc, client = _service(12)
+        client.count = lambda **kw: (_ for _ in ()).throw(RuntimeError("down"))
+        data, stats = export_bundle(svc, user_id="alice", visibility="private", limit=5)
+        assert stats["truncated"] is True
+        log = zipfile.ZipFile(io.BytesIO(data)).read("log.md").decode()
+        assert "INCOMPLETE" in log and "more than 5" in log
+
+    def test_route_header_total_is_unknown(self, monkeypatch):
+        import main
+        from fastapi.testclient import TestClient
+
+        monkeypatch.setattr(main, "_service", MagicMock())
+        monkeypatch.setattr(okf_export, "export_bundle", lambda *a, **k: (b"PK", {
+            "concepts": 5, "files": 9, "truncated": True,
+            "truncated_pools": {"personal": {"exported": 5, "total": None}},
+        }))
+        resp = TestClient(main.app).get("/v1/export/okf")
+        assert resp.headers["X-OKF-Truncated"] == "true" and resp.headers["X-OKF-Personal-Total"] == "unknown"
+
+
 class TestExportRoute:
     @pytest.fixture
     def client(self, monkeypatch):
@@ -199,6 +232,21 @@ class TestBundleImportReportsFailures:
         _patch_ingest(monkeypatch, lambda c: False)
         out = _run({**FILES, "d.md": "---\ntype: Topic\ntitle: Empty\n---\n\n"})
         assert out["status"] == "completed" and out["failed"] == 0
+
+    def test_urls_and_credentials_are_scrubbed_from_the_failure_report(self, monkeypatch):
+        import ingest.pipeline as pipeline
+
+        def boom(s, d):
+            raise RuntimeError(
+                "connect to http://user:hunter2@qdrant.internal:6333/collections failed; "
+                "Authorization: Bearer abc.def.ghi api_key=sk-12345 password: p4ss"
+            )
+
+        monkeypatch.setattr(pipeline, "ingest_document", boom)
+        err = _run()["failed_concepts"][0]["error"]
+        for leaked in ("hunter2", "qdrant.internal", "abc.def.ghi", "sk-12345", "p4ss"):
+            assert leaked not in err, err
+        assert err.startswith("RuntimeError:") and "<url>" in err
 
     def test_error_text_is_bounded(self, monkeypatch):
         import ingest.pipeline as pipeline

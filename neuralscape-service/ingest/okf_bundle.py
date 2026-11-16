@@ -27,6 +27,7 @@ All OKF name knowledge (keys, reserved files, type mapping) comes from
 from __future__ import annotations
 
 import logging
+import re
 import posixpath
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
@@ -36,6 +37,25 @@ from pathlib import Path
 from okf import translate
 
 logger = logging.getLogger(__name__)
+
+_URL_RE = re.compile(r"[A-Za-z][A-Za-z0-9+.\-]*://\S+")
+_SECRET_RE = re.compile(
+    r"(?i)\b(password|passwd|token|secret|api[_-]?key|access[_-]?key|authorization)\b(\s*[=:]\s*)\S+"
+)
+_BEARER_RE = re.compile(r"(?i)\bBearer\s+\S+")
+
+
+def safe_error(exc: BaseException, limit: int = 200) -> str:
+    """``ClassName: message`` with URLs and credential-looking values removed, bounded.
+
+    Failure reports travel to API clients (task status), so a backend error that
+    embeds a store URL with a password or a bearer token must not leak it.
+    """
+    text = str(exc)
+    text = _BEARER_RE.sub("Bearer <redacted>", text)
+    text = _SECRET_RE.sub(lambda m: f"{m.group(1)}{m.group(2)}<redacted>", text)
+    text = _URL_RE.sub("<url>", text)
+    return f"{type(exc).__name__}: {text[:limit]}"
 
 #: Cap on relationship-hint memories per bundle (a wiki with thousands of
 #: cross-links should not mint thousands of link rows).
@@ -413,7 +433,7 @@ def ingest_okf_bundle(
             summary["failed_concepts"].append({
                 "concept_id": concept.concept_id,
                 # class + a bounded message: enough to act on, never a payload dump
-                "error": f"{type(exc).__name__}: {str(exc)[:200]}",
+                "error": safe_error(exc),
             })
             continue
         summary["concepts"] += 1
