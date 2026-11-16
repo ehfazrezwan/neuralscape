@@ -360,6 +360,7 @@ def deleted(ctx, a, mcp_a) -> Deleted:
         if d.response.get("status") != 200:  # a partial failure must not leave the space behind
             try:
                 a.delete("/v1/code-graph/graph", params={"graph_id": d.code_space, "system": SYSTEM})
+                a.request("DELETE", "/v1/memories", json={"project_id": d.project})
             except Exception:  # noqa: BLE001 - cleanup is best effort
                 pass
     return d
@@ -374,11 +375,16 @@ def _build_deleted(ctx, a, mcp_a, d: Deleted) -> None:
     canonical = ".".join(p for i, p in enumerate(fqn.split(".")) if not (i == 0 and p in ("src", "lib")))
     task = a.store_raw(
         f"{d.marker} We keep resolve_systems side-effect free so the router can be called on every recall.", "decision",
-        scope="project", project_id=d.project, visibility="private",
-        source_ref={"connector_id": f"acc-{ctx.run_id}-delanchor", "connector_type": "file_upload", "external_id": f"svc::{canonical}"},
+        scope="project", project_id=d.project, visibility="shared",
+        source_ref={"connector_id": f"acc-{ctx.run_id}-delanchor", "connector_type": "file_upload", "external_id": f"svcdel::{canonical}"},
     )
     assert a.poll_task(task, timeout=120)["status"] == "completed", "the anchored memory was not stored"
     d.before = cg_get(a, "query", question=SYMBOL, graph_id=d.code_space, knowledge_system=SYSTEM)["result"]
+
+    def anchored():
+        check_mentions(cg_get(a, "neighbors", label=SYMBOL, graph_id=d.code_space, knowledge_system=SYSTEM)["result"], d.marker)
+
+    eventually(anchored, timeout=60, interval=3, what="the memory anchored to the symbol in the svcdel space")  # so "it survived" can fail
     resp = a.delete("/v1/code-graph/graph", params={"graph_id": d.code_space, "system": SYSTEM})
     d.response = {"status": resp.status_code, **(resp.json() if resp.status_code == 200 else {"text": resp.text[:200]})}
     d.after = cg_get(a, "query", question=SYMBOL, graph_id=d.code_space, knowledge_system=SYSTEM)["result"]
