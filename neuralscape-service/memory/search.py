@@ -922,7 +922,7 @@ class SearchMixin:
             from hybrid_inference import rerank
 
             combined = rerank(query, combined)
-        results = combined[:limit]
+        results = self._truncate_keeping_episode_rows(combined, limit)
 
         # Dreaming: fire-and-forget recall trace (reinforcement signal for
         # the dream sweep's promotion/retention scoring). Runs on a daemon
@@ -1778,6 +1778,37 @@ class SearchMixin:
         )
         fused = [e["row"] for e in entries]
         return fused if limit is None else fused[:limit]
+
+    @staticmethod
+    def _truncate_keeping_episode_rows(
+        combined: list[MemoryResponse], limit: int
+    ) -> list[MemoryResponse]:
+        """Top-``limit`` of the fused list, without the episode leg being starved.
+
+        Verbatim-episode rows carry no score, so fusion ranks them below every
+        scored row. When the vector and graph legs alone fill ``limit`` (the
+        usual case on a populated project) a plain slice dropped every episode
+        row and the leg never surfaced. The leg is additive and capped (at
+        most 3 rows), so the rows that would have been cut are kept in the tail
+        and the lowest-ranked scored rows give up that many slots (rows already
+        inside the head stay where they are, the kept head order is unchanged):
+        the list never grows past ``limit``, and at most ``limit // 4`` slots are ever handed over, so a
+        small ``limit`` keeps its scored hits.
+        """
+        head = combined[:limit]
+        cut_episodes = [r for r in combined[limit:] if r.source == "episode"]
+        if not cut_episodes:
+            return head
+        in_head = sum(1 for r in head if r.source == "episode")
+        quota = max(0, limit // 4 - in_head)
+        # Rows already inside the head keep their place; only cut episode rows
+        # are appended, each taking the slot of the lowest-ranked scored row.
+        scored_positions = [i for i, r in enumerate(head) if r.source != "episode"]
+        n = min(len(cut_episodes), quota, len(scored_positions))
+        if n == 0:
+            return head
+        drop = set(scored_positions[-n:])
+        return [r for i, r in enumerate(head) if i not in drop] + cut_episodes[:n]
 
     def _merge_results(self, *result_sets) -> list[dict]:
         """Merge multiple result sets, deduplicate by ID, sort by score descending."""
