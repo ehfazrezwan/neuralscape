@@ -132,7 +132,9 @@ def test_real_cypher_supersedes_fully_invalidated_single_row_only(graph_env):
     _row(qdrant, collection, old_full, "u1", "ep-full")
     _row(qdrant, collection, old_partial, "u1", "ep-partial")
     _row(qdrant, collection, new, "u1", "ep-new")
-    _seed_edge(cypher, group, "e-full", "Berlin", ["ep-full"], invalid=True, expired=True)
+    # Graphiti appends the new episode to an old edge it dedups onto, then
+    # invalidates it: the contradicted edge cites [old, new].
+    _seed_edge(cypher, group, "e-full", "Berlin", ["ep-full", "ep-new"], invalid=True, expired=True)
     _seed_edge(cypher, group, "e-p1", "Berlin2", ["ep-partial"], invalid=True, expired=True)
     _seed_edge(cypher, group, "e-p2", "Acme", ["ep-partial"])  # still live
     # new episode's own born-expired edge and a delete-cascade edge: not contradictions
