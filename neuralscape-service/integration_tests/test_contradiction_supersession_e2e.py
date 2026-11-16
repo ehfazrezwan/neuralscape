@@ -142,38 +142,82 @@ def test_contradicting_fact_supersedes_old_row_and_reassertion_revives_it(svc):
 
 
 COMPOUND = "Alice lives in Paris and works at Acme Corp."
-# A positive replacement (new value for the same relation), like the Paris case:
-# a bare negation makes Graphiti mint a new "no longer works" edge instead of
-# invalidating the old job edge.
-JOB_ENDED = "Alice now works at Globex Corp; she left Acme Corp."
+
+
+def _cypher(service, query, **params):
+    async def _run():
+        async with service._graphiti.driver.session() as s:
+            r = await s.run(query, **params)
+            return await r.data()
+
+    return service._run_on_bridge(_run(), timeout=30.0)
 
 
 def test_compound_row_whose_job_edge_dies_is_not_superseded(svc):
-    """One stored fact with two claims: the JOB edge is invalidated while the
-    residence edge stays live. The row still holds a true fact, so it must NOT
-    be tombstoned, decided on REAL embedding cosines (printed in the failure
-    message via the decision trace: dead_sim / best_live_sim / floor / margin).
-    If Graphiti does not invalidate the job edge the test fails and says so
-    instead of passing vacuously."""
+    """One stored fact with two claims; the JOB edge dies, the residence edge
+    stays live: the row still holds a true fact and must NOT be tombstoned.
+
+    Deterministic precondition (no LLM judgement of a contradiction): the
+    compound row is written through the real path (real extraction creates the
+    edges on real Neo4j), then the job edge is invalidated directly in Neo4j,
+    exactly as Graphiti's contradiction pass would leave it, and the real
+    supersession decision path runs over it. The decision is made on REAL
+    embedding cosines, printed for calibration."""
+    from datetime import datetime, timezone
+
     user = f"it-supersede-{uuid.uuid4().hex[:10]}"
     group = _build_group_id("private", user, None)
+    new_episode = "ep-synthetic-later-write"
     try:
         row, _ = _write(svc, user, COMPOUND)
-        ender, _ = _write(svc, user, JOB_ENDED)
 
-        diag = getattr(svc, "_supersession_diag", {}).get(ender.id) or {}
-        decisions = [t for t in diag.get("trace", []) if t.get("stage") == "decide"]
-        edges = _edge_dump(svc, group)
-        assert decisions, (
-            "Graphiti did not invalidate any edge of the compound row (LLM judged the job "
-            "statement non-contradictory, or the probe missed it), so the partial-edge decision "
-            f"never ran. step error={diag.get('error')!r} trace={diag.get('trace')!r} edges={edges}"
+        edges = _cypher(
+            svc,
+            "MATCH ()-[r:RELATES_TO {group_id:$g}]->() RETURN r.uuid AS uuid, r.fact AS fact, "
+            "r.invalid_at AS invalid_at, r.expired_at AS expired_at, r.episodes AS episodes",
+            g=group,
         )
-        assert all(d["supersede"] is False for d in decisions), (
-            "compound row was superseded although a true claim (residence) stays live; real "
-            f"embedding cosines decided it: {decisions!r} edges={edges}"
+        job = [e for e in edges if "acme" in (e["fact"] or "").lower()]
+        live_residence = [
+            e for e in edges
+            if "paris" in (e["fact"] or "").lower() and e["invalid_at"] is None and e["expired_at"] is None
+        ]
+        assert len(job) == 1, f"expected exactly one job edge mentioning Acme, got {job!r} (all: {edges!r})"
+        assert live_residence, f"extraction produced no live residence edge for Paris: {edges!r}"
+
+        window_start = datetime.now(timezone.utc)
+        now = datetime.now(timezone.utc).isoformat()
+        _cypher(
+            svc,
+            "MATCH ()-[r:RELATES_TO {uuid:$u}]->() "
+            "SET r.invalid_at = datetime($now), r.expired_at = datetime($now)",
+            u=job[0]["uuid"], now=now,
+        )
+
+        svc._maybe_supersede_contradicted(
+            group_id=group,
+            owner_user_id=user,
+            write_started_at=window_start,
+            episode_uuid=new_episode,
+            new_memory_ids={"synthetic-new-memory"},
+        )
+
+        diag = getattr(svc, "_supersession_diag", {}).get(new_episode) or {}
+        trace = diag.get("trace", [])
+        probe = [t for t in trace if t.get("stage") == "probe"]
+        assert probe and any(e["uuid"] == job[0]["uuid"] for e in probe[0]["edges"]), (
+            f"the probe did not find the dead job edge: error={diag.get('error')!r} trace={trace!r}"
+        )
+        decisions = [t for t in trace if t.get("stage") == "decide"]
+        assert any(d.get("mode") == "single_fact_partial" for d in decisions), (
+            f"the partial-edge decision never ran: error={diag.get('error')!r} trace={trace!r} "
+            f"row meta={_meta(svc, row.id)!r}"
         )
         print(f"compound-row decision cosines (calibration): {decisions!r}")
+        assert all(d["supersede"] is False for d in decisions), (
+            "compound row was superseded although a true claim (residence) stays live; real "
+            f"embedding cosines decided it: {decisions!r} edges={edges!r}"
+        )
         assert not _meta(svc, row.id).get("dream_tombstoned"), f"row tombstoned: {decisions!r}"
         listed, _ = _live_ids(svc, user, "Where does Alice live and work?")
         assert row.id in listed
@@ -181,11 +225,7 @@ def test_compound_row_whose_job_edge_dies_is_not_superseded(svc):
         try:
             svc.delete_memories(user_id=user, include_shared=True)
         finally:
-            async def _purge():
-                async with svc._graphiti.driver.session() as s:
-                    await s.run("MATCH (n {group_id:$g}) DETACH DELETE n", g=group)
-
             try:
-                svc._run_on_bridge(_purge(), timeout=30.0)
+                _cypher(svc, "MATCH (n {group_id:$g}) DETACH DELETE n", g=group)
             except Exception:
                 pass
