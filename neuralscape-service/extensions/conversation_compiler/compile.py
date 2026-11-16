@@ -99,6 +99,11 @@ def _call_gemini(prompt: str) -> str:
     model = compiler_settings.get_llm_model(core_settings.gemini_llm_model)
     client = genai.Client(api_key=core_settings.google_api_key)
     response = client.models.generate_content(model=model, contents=prompt)
+    # Usage capture (a no-op unless a recorder is installed and an attempt is bound): the shared
+    # Gemini path of the compiler, the dreaming sweep and Ask; Ask labels its calls ``llm_ask``.
+    from usage_capture import current_operation, record_generation_usage
+
+    record_generation_usage(response, operation=current_operation("llm_compile"), model=model)
     return response.text or ""
 
 
