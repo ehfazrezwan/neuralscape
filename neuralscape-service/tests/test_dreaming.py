@@ -17,6 +17,7 @@ import pytest
 
 from extensions.dreaming import consolidate, gate, prompts, reflect, scoring
 from extensions.dreaming.consolidate import PoolBatch
+from tests.test_dreaming_rewrite_atomic import rewrite_view
 
 
 # ── Fakes ───────────────────────────────────────────────────────────
@@ -464,15 +465,16 @@ async def test_apply_actions_merge_sums_times_derived():
     )
 
     assert not result.errors
-    # survivor rewritten via upsert with the summed counter: 2 + 1 + 3 = 6
-    upserted = client.upsert.call_args.kwargs["points"][0]
-    assert upserted.id == "a"
-    assert upserted.payload["data"] == "merged fact"
-    assert upserted.payload["metadata"]["times_derived"] == 6
+    # survivor rewritten with the summed counter: 2 + 1 + 3 = 6
+    client.upsert.assert_not_called()
+    rewritten = rewrite_view(client, "a")
+    assert rewritten["data"] == "merged fact"
+    assert rewritten["metadata"]["times_derived"] == 6
     # losers tombstoned, not counted twice (nested-key patch, audit 27 #30)
     tombstoned = {
         call.kwargs["points"][0]: call.kwargs["payload"]
         for call in client.set_payload.call_args_list
+        if call.kwargs["points"][0] != "a"
     }
     assert set(tombstoned) == {"b", "c"}
     assert all(meta["superseded_by"] == "a" for meta in tombstoned.values())
@@ -514,12 +516,17 @@ async def test_apply_actions_merge_stamps_provenance_and_reinforcement():
     )
 
     assert not result.errors
-    # exactly one upsert: content + provenance + reinforcement land atomically
-    assert client.upsert.call_count == 1
-    upserted = client.upsert.call_args.kwargs["points"][0]
-    assert upserted.id == "a"
-    assert upserted.payload["data"] == "merged fact"
-    meta = upserted.payload["metadata"]
+    # never a whole-point upsert: content + provenance + reinforcement land
+    # as atomic key patches (one nested metadata patch carries both keys)
+    client.upsert.assert_not_called()
+    meta_patches = [
+        c for c in client.set_payload.call_args_list
+        if c.kwargs["points"] == ["a"] and c.kwargs.get("key") == "metadata"
+    ]
+    assert len(meta_patches) == 1
+    rewritten = rewrite_view(client, "a")
+    assert rewritten["data"] == "merged fact"
+    meta = rewritten["metadata"]
     assert meta["derived_from"] == ["seed", "b"]   # union, existing first
     assert meta["times_derived"] == 5              # 2 + 3
 
@@ -548,8 +555,7 @@ async def test_apply_actions_merge_defaults_missing_rows_to_one():
         dry_run=False,
     )
 
-    upserted = client.upsert.call_args.kwargs["points"][0]
-    assert upserted.payload["metadata"]["times_derived"] == 2  # a(1) + gone(1)
+    assert rewrite_view(client, "a")["metadata"]["times_derived"] == 2  # a(1) + gone(1)
 
 
 @pytest.mark.asyncio
