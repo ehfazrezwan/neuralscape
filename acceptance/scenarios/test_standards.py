@@ -287,7 +287,12 @@ def test_admin_open_check_fails_for_a_non_dictator(ctx, a, dictator):
 
 
 def check_config(body: dict, project: str, systems: list[str], fuse: bool, engine: str | None) -> None:
-    assert body == {"project_id": project, "code_systems": systems, "fuse_code_into_recall": fuse, "default_engine": engine}, f"config: {body}"
+    # code_space / op_preference are read-only here (the PUT body cannot set them; only indexing does), and
+    # this project is never indexed, so both stay None through every write and read.
+    assert body == {
+        "project_id": project, "code_systems": systems, "fuse_code_into_recall": fuse, "default_engine": engine,
+        "code_space": None, "op_preference": None,
+    }, f"config: {body}"
 
 
 @proves("knowledge.router", "auth.dictator-role")
@@ -314,8 +319,8 @@ def test_the_dictator_may_set_a_projects_knowledge_config_and_others_may_not(ctx
 @proves("knowledge.router")
 @negative_control
 def test_config_check_fails_for_the_default_config(ctx):
-    precondition(check_config, {"project_id": "p", "code_systems": ["code-native"], "fuse_code_into_recall": False, "default_engine": "code-native"}, "p", ["code-native"], False, "code-native", what="a matching config passes")
-    expect_check_fails(check_config, {"project_id": "p", "code_systems": [], "fuse_code_into_recall": True, "default_engine": None}, "p", ["code-native"], False, "code-native")
+    precondition(check_config, {"project_id": "p", "code_systems": ["code-native"], "fuse_code_into_recall": False, "default_engine": "code-native", "code_space": None, "op_preference": None}, "p", ["code-native"], False, "code-native", what="a matching config passes")
+    expect_check_fails(check_config, {"project_id": "p", "code_systems": [], "fuse_code_into_recall": True, "default_engine": None, "code_space": None, "op_preference": None}, "p", ["code-native"], False, "code-native")
 
 
 def check_instructions(client: NSClient, project: str, text: str | None) -> None:
