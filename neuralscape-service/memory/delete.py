@@ -41,7 +41,7 @@ def semantic_dedup_phase_enabled() -> bool:
     return (not dreaming_settings.enabled) or bool(settings.dedup_semantic_tombstone_enabled)
 
 
-# Sentinel: no dream-pool lock is held (Redis unreachable with dreaming off), so no neighbour pool check.
+# Sentinel: no dream-pool lock is held by the caller, so no neighbour pool check.
 _NO_POOL_GUARD: str = "\0no-pool-guard"
 # Expiry of the dream lock dedup holds while it works on one page of a pool's rows:
 # long enough for a page of vector searches, short enough that a crashed run frees
@@ -1107,16 +1107,21 @@ class DeleteMixin:
         on or off: a forced sweep runs with dreaming off). A pool whose lock is
         held elsewhere is skipped and counted; rows are re-read after the lock
         is taken and only those fresh rows are used; the lock's ownership is
-        verified (and its expiry renewed) before every delete or tombstone, and a
-        pool whose lock was lost is abandoned and counted. A duplicate group
-        spanning several pools verifies and renews ALL of its pools' locks before
-        each delete, and re-reads its survivor (live, same key) as well: a group
-        that fails either check is abandoned with no further write. Redis
-        unreachable: a failed probe is not remembered, Redis is asked again for
-        every duplicate group and every phase-2 page; while it does not answer,
-        dreaming on skips the phase-2 page (phase 1 still runs), dreaming off
-        runs unlocked, as before the lock existed (a sweep needs Redis for its
-        own lock, so none can be running).
+        verified (and its expiry renewed) before every delete or tombstone. In
+        the semantic phase a pool whose lock was lost is abandoned for the rest
+        of the run and counted in ``lock_lost_pools``; in the exact phase the
+        group is abandoned with no further write (later groups of that pool try
+        the lock again, and a row that changed pool is counted in
+        ``lock_lost_pools``). A duplicate group spanning several pools verifies
+        and renews ALL of its pools' locks before each delete, and re-reads its
+        survivor (live, same key, same pool) as well: a group that fails either
+        check is abandoned with no further write. Redis unreachable: nothing
+        destructive runs, whatever the dreaming setting (a sweep that took its
+        lock before the failed probe may still be running). A failed probe is not
+        remembered, Redis is asked again for every duplicate group and every
+        phase-2 page; while it does not answer, the exact group is skipped
+        (counted in ``exact_groups_abandoned``) and the phase-2 page is skipped
+        (counted in ``semantic_skipped``).
 
         ``semantic=False`` skips phase 2. The dreaming sweep's MERGE action
         supersedes it when ``DREAMING_ENABLED=true``: where this phase
@@ -1149,8 +1154,9 @@ class DeleteMixin:
         exact_locked: set[str] = set()
         semantic_locked: set[str] = set()
         lock_lost: set[str] = set()
-        exact_abandoned = 0  # groups dropped because their survivor changed under the lock
-        semantic_pages_unlocked_skipped = 0  # pages skipped: Redis down, dreaming on
+        # groups dropped because their survivor changed under the lock, or Redis did not answer
+        exact_abandoned = 0
+        semantic_pages_unlocked_skipped = 0  # pages skipped: Redis did not answer
 
         def lock_fields() -> dict:
             return {
@@ -1206,7 +1212,13 @@ class DeleteMixin:
             pools = sorted({p for p in (_dream_pool_of(r["payload"]) for r in group) if p})
             held: list[str] = []
             try:
-                if pools and locks.redis() is not None:
+                if pools:
+                    if locks.redis() is None:
+                        # Redis does not answer: a sweep that took its lock before
+                        # the failed probe may still be running, so a delete here
+                        # could remove the last live copy. Nothing runs unlocked.
+                        exact_abandoned += 1
+                        continue
                     busy = []
                     for p in pools:
                         if locks.acquire(p) is None:
@@ -1258,6 +1270,13 @@ class DeleteMixin:
                                 exact_abandoned += 1
                                 reinforcement = 0  # no write in favour of a changed survivor
                                 break
+                            # The re-read survivor is the one the rest of the group
+                            # uses; if its pool changed (e.g. its owner), that pool's
+                            # lock must be ours too, or the group is abandoned.
+                            fresh_pool = _dream_pool_of(live[0]["payload"])
+                            if fresh_pool != _dream_pool_of(survivor["payload"]):
+                                locks.require(fresh_pool)
+                            survivor = live[0]
                         try:
                             self._delete_qdrant_memory_with_graph_cleanup(
                                 mid, dup["payload"], collector=collector
@@ -1305,20 +1324,17 @@ class DeleteMixin:
         # that pool's rows (the sweep's own key, non-blocking), whenever Redis
         # answers: a pool whose lock it cannot take is mid-sweep and is skipped
         # this run (reported, the next run picks it up). Redis is asked again for
-        # every page while it has not answered: with Redis down and dreaming on a
-        # page cannot take any lock, so it is skipped (never run unlocked) and the
-        # next page tries again; with Redis down and dreaming off the page runs
-        # unlocked (no sweep can hold a lock either: a forced sweep needs Redis
-        # for its own).
-        dreaming_on = self._dreaming_enabled()
+        # every page while it has not answered: a page that cannot take its lock is
+        # skipped and counted, never run unlocked, whatever the dreaming setting (a
+        # sweep, forced or scheduled, may have taken its lock before the failed
+        # probe), and the next page tries again.
         for page in self._iter_user_memory_pages(user_id, batch_size):
             # Probed again for every page while the last probe failed: Redis
             # coming back mid-run is picked up at the next page.
             lock_redis = locks.redis()
-            if lock_redis is None and dreaming_on:
+            if lock_redis is None:
                 semantic_pages_unlocked_skipped += 1
                 continue
-            locked_mode = lock_redis is not None
             chunk = [
                 mem for mem in page
                 if mem["id"] not in deleted_ids and not _is_tombstoned(mem["payload"])
@@ -1327,7 +1343,7 @@ class DeleteMixin:
                 continue
             groups: dict[str | None, list[dict]] = {}
             for mem in chunk:
-                pool = _dream_pool_of(mem["payload"]) if locked_mode else None
+                pool = _dream_pool_of(mem["payload"])
                 groups.setdefault(pool, []).append(mem)
             for pool, rows in groups.items():
                 if pool is not None and pool in lock_lost:
@@ -1351,7 +1367,7 @@ class DeleteMixin:
                         semantic_removed += self._semantic_dedup_one(
                             m, user_id, mem, stored_vectors.get(mem["id"]), threshold,
                             deleted_ids, collector=collector,
-                            held_pool=pool if locked_mode else _NO_POOL_GUARD,
+                            held_pool=pool,
                             lock_guard=(lambda p=pool: locks.require(p)) if token else None,
                         )
                 except _PoolLockLost as lost:

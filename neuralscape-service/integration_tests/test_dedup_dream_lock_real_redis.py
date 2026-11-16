@@ -1,8 +1,8 @@
 """Dedup respects the dream sweep's pool lock, on real Qdrant and real Redis.
 
 A sweep marks a pool busy with ``dreaming:lock:{pool}``. While that key is held,
-``dedup_memories`` must not delete or tombstone a row of the pool and must report the pool
-as skipped; once the lock is released the same duplicates are handled. This test fails if
+``dedup_memories`` must not delete or tombstone a row of the pool, in either phase (exact
+hash and semantic), and must report the pool as skipped; once the lock is released the same duplicates are handled. This test fails if
 dedup stops honouring the lock (wrong key, no check) or if the lock's compare-and-renew /
 compare-and-delete scripts misbehave on a real server.
 
@@ -122,6 +122,51 @@ def test_dedup_skips_a_pool_a_sweep_holds_and_handles_it_once_released(
     assert done["semantic_skipped_locked_pools"] == 0 and done["semantic_duplicates_removed"] == 1, done
     assert _gone_or_tombstoned(rows, old_id) and not _gone_or_tombstoned(rows, new_id)
     assert (old_id in rows) is tombstone  # tombstone mode keeps the row, hard delete removes it
+    assert redis_client.get(f"dreaming:lock:{pool}") is None, "dedup released the lock it took"
+
+
+def test_exact_phase_skips_a_pool_a_sweep_holds_and_handles_it_once_released(
+    svc, flags, redis_client, unique_ns
+):
+    """The exact-hash phase honours the same lock: two rows with one hash, one hard delete."""
+    from extensions.dreaming import gate
+    from memory.delete import _dream_pool_of
+
+    uid, project = unique_ns.user_id, unique_ns.project_id
+    text = f"zq-{uuid.uuid4().hex[:8]} The release train leaves on the first Monday of the month"
+    old_id = _store(svc, uid, text, project)
+    time.sleep(1.1)
+    new_id = _store(svc, uid, f"{text} (second copy, different words)", project)
+
+    # make the two rows exact duplicates: one hash (the write path would have merged them)
+    old_hash = _rows(svc, uid)[old_id]["hash"]
+    svc._memory.vector_store.client.set_payload(
+        collection_name=unique_ns.qdrant_collection, payload={"hash": old_hash}, points=[new_id]
+    )
+
+    rows = _rows(svc, uid)
+    assert rows[old_id]["hash"] == rows[new_id]["hash"]
+    pool = _dream_pool_of(rows[old_id])
+    assert pool and pool == _dream_pool_of(rows[new_id])
+    redis_client.nsit_pools.append(pool)
+
+    sweep_token = gate.acquire_lock(redis_client, pool)
+    assert sweep_token, "the pool lock must be free before the test starts"
+
+    held = svc.dedup_memories(uid, semantic=False)
+
+    rows = _rows(svc, uid)
+    assert old_id in rows and new_id in rows, held
+    assert held["exact_duplicates_removed"] == 0 and held["exact_skipped_locked_pools"] == 1, held
+    assert redis_client.get(f"dreaming:lock:{pool}").decode() == sweep_token, "the sweep's lock is untouched"
+
+    gate.release_lock(redis_client, pool, sweep_token)
+
+    done = svc.dedup_memories(uid, semantic=False)
+
+    rows = _rows(svc, uid)
+    assert done["exact_duplicates_removed"] == 1 and done["exact_skipped_locked_pools"] == 0, done
+    assert old_id not in rows and new_id in rows  # the older copy goes, the newest stays
     assert redis_client.get(f"dreaming:lock:{pool}") is None, "dedup released the lock it took"
 
 

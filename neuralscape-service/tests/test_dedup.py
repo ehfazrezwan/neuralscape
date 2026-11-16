@@ -36,9 +36,37 @@ def _make_hit(id, score, payload):
     return hit
 
 
+class _UpRedis:
+    """A Redis that always answers and holds no foreign lock: dedup takes its pool locks
+    on it (it does nothing destructive without Redis, so these tests need one)."""
+
+    def __init__(self):
+        self.keys: dict[str, str] = {}
+
+    def ping(self):
+        return True
+
+    def set(self, key, value, nx=False, px=None):
+        if nx and key in self.keys:
+            return None
+        self.keys[key] = value
+        return True
+
+    def get(self, key):
+        return self.keys.get(key)
+
+    def delete(self, key):
+        self.keys.pop(key, None)
+
+    def pexpire(self, key, ms):
+        return 1 if key in self.keys else 0
+
+
 @pytest.fixture
-def service():
+def service(monkeypatch):
     """Create a MemoryService with mocked internals for dedup testing."""
+    redis = _UpRedis()
+    monkeypatch.setattr("extensions.dreaming.sweep._get_redis", lambda: redis)
     svc = MemoryService()
     svc._memory = MagicMock(name="Memory")
     svc._graphiti = MagicMock(name="Graphiti")
@@ -52,6 +80,16 @@ def service():
     svc._memory.vector_store.search.return_value = []
     # Default: vector_store.delete succeeds
     svc._memory.vector_store.delete.return_value = None
+    # Default: a re-read (taken once a pool lock is held) sees the rows the test's
+    # scroll serves, unchanged. _FakeQdrant installs its own, richer retrieve.
+    client = svc._memory.vector_store.client
+
+    def retrieve_scrolled_rows(collection_name=None, ids=None, **kwargs):
+        served = client.scroll.return_value
+        points = served[0] if isinstance(served, tuple) else []
+        return [p for p in points if p.id in set(ids or [])]
+
+    client.retrieve.side_effect = retrieve_scrolled_rows
     return svc
 
 
@@ -390,11 +428,19 @@ class TestDedupAllMemories:
 def _set_retrieve(service, payload_by_id: dict):
     """Make client.retrieve return real point mocks for known ids."""
 
+    client = service._memory.vector_store.client
+    served = client.scroll.return_value
+    scrolled = {p.id: p for p in (served[0] if isinstance(served, tuple) else [])}
+
     def _retrieve(collection_name=None, ids=None, **kwargs):
         out = []
         for mid in ids or []:
             if mid in payload_by_id:
-                out.append(_make_point(mid, payload_by_id[mid]))
+                # the override on top of what the scroll served (a re-read of the same row)
+                base = scrolled[mid].payload if mid in scrolled else {}
+                out.append(_make_point(mid, {**base, **payload_by_id[mid]}))
+            elif mid in scrolled:  # a re-read of a row the scroll served: unchanged
+                out.append(scrolled[mid])
         return out
 
     service._memory.vector_store.client.retrieve.side_effect = _retrieve
@@ -495,11 +541,13 @@ class TestExactDedupReinforcement:
                                "created_at": "2025-06-01T00:00:00", "metadata": {}}),
         ]
         service._memory.vector_store.client.scroll.return_value = (memories, None)
-        service._memory.vector_store.client.retrieve.side_effect = Exception("Qdrant down")
+        # the group's re-read works; the counter write on the survivor fails
+        service._memory.vector_store.client.set_payload.side_effect = Exception("Qdrant down")
 
         result = service.dedup_memories("u1", semantic=False)
 
         assert result["exact_duplicates_removed"] == 1  # delete still happened
+        service._memory.vector_store.client.set_payload.assert_called_once()
 
 
 class TestSemanticDedupReinforcement:

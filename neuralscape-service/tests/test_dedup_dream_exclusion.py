@@ -196,7 +196,7 @@ class TestSemanticPhaseHoldsTheDreamLock:
         assert sum("dream lock unavailable" in r.getMessage() and r.levelno == logging.WARNING
                    for r in caplog.records) == 1
 
-    def test_redis_down_does_not_stop_the_exact_phase(self, service, redis):
+    def test_redis_down_skips_the_exact_groups_and_reports_them(self, service, redis):
         fake = _FakeQdrant(service, [
             _row("e1", TEXT, "2025-01-01T00:00:00", scope="global", visibility="private"),
             _row("e2", TEXT, "2025-06-01T00:00:00", scope="global", visibility="private"),
@@ -205,9 +205,10 @@ class TestSemanticPhaseHoldsTheDreamLock:
             fake.payloads[pid]["hash"] = "same-hash"
         redis.fail = True
 
-        result = service.dedup_memories("u1")
+        result = service.dedup_memories("u1", semantic=False)
 
-        assert result["exact_duplicates_removed"] == 1 and _deleted(service) == ["e1"]
+        assert result["exact_duplicates_removed"] == 0 and _deleted(service) == []
+        assert result["exact_groups_abandoned"] == 1
 
     def test_exact_phase_skips_a_pool_that_is_locked_and_reports_it(self, service, redis):
         fake = _FakeQdrant(service, [
@@ -253,12 +254,19 @@ class TestSemanticPhaseHoldsTheDreamLock:
 
         assert result["semantic_duplicates_removed"] == 0 and _tombstoned(service) == []
 
-    def test_dreaming_off_with_redis_down_runs_unlocked(self, service, redis, monkeypatch):
+    @pytest.mark.parametrize("dreaming", [True, False], ids=["dreaming-on", "dreaming-off"])
+    def test_redis_down_does_nothing_destructive_whatever_the_dreaming_setting(
+        self, service, redis, monkeypatch, dreaming
+    ):
         _pair(service)
         redis.fail = True
-        monkeypatch.setattr(dreaming_settings, "enabled", False)
+        monkeypatch.setattr(dreaming_settings, "enabled", dreaming)
 
-        assert service.dedup_memories("u1")["semantic_duplicates_removed"] == 1
+        result = service.dedup_memories("u1")
+
+        assert result["semantic_duplicates_removed"] == 0
+        assert "unavailable" in result["semantic_skipped"]
+        assert _deleted(service) == [] and _tombstoned(service) == []
 
 
 # ── apply_actions: every action re-checks tombstones ────────────────────────────

@@ -18,7 +18,11 @@ from memory_service import MemoryService
 
 
 @pytest.fixture
-def service():
+def service(monkeypatch):
+    from tests.test_dedup import _UpRedis
+
+    up = _UpRedis()  # dedup takes pool locks and does nothing destructive without Redis
+    monkeypatch.setattr("extensions.dreaming.sweep._get_redis", lambda: up)
     svc = MemoryService()
     svc._memory = MagicMock(name="Memory")
     svc._memory.embedding_model.embed.return_value = [0.1] * 8
@@ -120,6 +124,7 @@ class TestDedupPartitionParity:
             {"id": "new", "payload": {**self.NEW, "hash": "H", "created_at": "2026-02-01"}},
         ]
         service._iter_user_memory_pages = MagicMock(side_effect=lambda uid, bs: iter([rows]))
+        service._live_rows = MagicMock(side_effect=lambda r: r)  # the re-read after the pool lock
         service._delete_qdrant_memory_with_graph_cleanup = MagicMock()
         out = service.dedup_memories("u", semantic=False)
         assert out["exact_duplicates_removed"] == 1

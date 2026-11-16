@@ -244,14 +244,17 @@ class TestLockWithDreamingOff:
         assert result["semantic_duplicates_removed"] == 1 and _deleted(service) == ["a_old"]
         assert clock.keys == {}
 
-    def test_redis_down_runs_unlocked_as_before(self, service, clock, dreaming_off_defaults):
+    def test_redis_down_skips_the_page_instead_of_running_unlocked(self, service, clock, dreaming_off_defaults):
         _FakeQdrant(service, [
             _row("a_old", A, "2025-01-01T00:00:00", scope="global", visibility="private"),
             _row("a_new", A, "2025-06-01T00:00:00", scope="global", visibility="private"),
         ])
         clock.fail = True
 
-        assert service.dedup_memories("u1")["semantic_duplicates_removed"] == 1
+        res = service.dedup_memories("u1")
+
+        assert res["semantic_duplicates_removed"] == 0 and _deleted(service) == []
+        assert "unavailable" in res["semantic_skipped"]
 
     def test_one_lock_round_trip_per_page_with_duplicates(
         self, service, clock, dreaming_off_defaults
@@ -396,11 +399,14 @@ class TestExactPhaseLocksAndRereads:
         assert clock.pings == 0 and clock.sets == 0
         assert result["exact_duplicates_removed"] == 0
 
-    def test_redis_down_still_runs_the_exact_phase(self, service, clock):
+    def test_redis_down_skips_the_exact_group_instead_of_running_unlocked(self, service, clock):
         _exact_rows(service)
         clock.fail = True
 
-        assert service.dedup_memories("u1", semantic=False)["exact_duplicates_removed"] == 1
+        res = service.dedup_memories("u1", semantic=False)
+
+        assert res["exact_duplicates_removed"] == 0 and _deleted(service) == []
+        assert res["exact_groups_abandoned"] == 1
 
 
 # ── 5. gate.refresh_lock ────────────────────────────────────────────────────────

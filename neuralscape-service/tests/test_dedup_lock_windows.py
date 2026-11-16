@@ -3,7 +3,8 @@
 (1) A duplicate group spanning two pools verifies and renews the locks of ALL its pools
 before every delete, re-reads its survivor, and writes nothing once any check fails;
 ``require`` refuses a pool this run holds no lock for. (2) A failed Redis probe is not
-remembered: Redis answering again mid-run takes effect at the next group / page. (3) The
+remembered, and while Redis does not answer nothing destructive runs (the group / page is
+skipped and counted, whatever the dreaming setting). (3) The
 exact phase uses only the rows it re-read after taking the lock. (4) The lock's
 ``refresh`` / ``release`` Lua scripts are EXECUTED here, by a small interpreter for the
 script shape, so a wrong key or a wrong compare fails a test.
@@ -249,12 +250,32 @@ class TestCrossPoolGroups:
         assert _deleted(service) == [] and res["lock_lost_pools"] == 1
 
 
-# ── a Redis that comes back mid-run ──────────────────────────────────────────────
+# ── a Redis that does not answer: nothing destructive runs ──────────────────────
 
 
-class TestRedisFlap:
-    def test_semantic_pages_are_probed_again_while_the_probe_failed(
-        self, service, sredis, dreaming_off_hard, monkeypatch
+def _ping_fails(redis, times):
+    """The first ``times`` probes (pings) fail, later ones answer: a transient Redis error."""
+    real = redis.ping
+    n = {"calls": 0}
+
+    def ping():
+        n["calls"] += 1
+        if n["calls"] <= times:
+            raise ConnectionError("transient timeout")
+        return real()
+
+    redis.ping = ping
+
+
+class TestRedisUnreachable:
+    @pytest.fixture(params=[True, False], ids=["dreaming-on", "dreaming-off"])
+    def dreaming(self, request, monkeypatch):
+        monkeypatch.setattr(dreaming_settings, "enabled", request.param)
+        monkeypatch.setattr(settings, "dedup_semantic_tombstone_enabled", request.param)
+        return request.param
+
+    def test_a_semantic_page_is_skipped_and_the_next_page_probes_again(
+        self, service, sredis, dreaming, monkeypatch
     ):
         monkeypatch.setattr(settings, "dedup_batch_size", 2)
         _FakeQdrant(service, [
@@ -263,52 +284,15 @@ class TestRedisFlap:
             _row("b_old", B, "2025-01-01T00:00:00", scope="global", visibility="private"),
             _row("b_new", B, "2025-06-01T00:00:00", scope="global", visibility="private"),
         ])
-        sredis.fail = True  # page 1: Redis is down, dreaming off: runs unlocked
-        inner = service._memory.vector_store.delete.side_effect
-        sweep = []
-
-        def delete_then_redis_back_and_forced_sweep_starts(pid):
-            inner(pid)
-            sredis.fail = False
-            sweep.append(gate.acquire_lock(sredis, POOL))
-
-        service._memory.vector_store.delete.side_effect = delete_then_redis_back_and_forced_sweep_starts
+        _ping_fails(sredis, 1)  # page 1's probe fails, page 2's answers
 
         res = service.dedup_memories("u1")
 
-        assert sweep and sweep[0], "the forced sweep took the pool"
-        assert _deleted(service) == ["a_old"], "page 2 must see the sweep's lock, not run unlocked"
-        assert res["semantic_skipped_locked_pools"] == 1 and res["semantic_duplicates_removed"] == 1
-
-    def test_with_dreaming_on_a_page_skipped_for_a_down_redis_is_retried_on_the_next(
-        self, service, sredis, dream_on_tombstone, monkeypatch  # noqa: F811
-    ):
-        monkeypatch.setattr(settings, "dedup_batch_size", 2)
-        _FakeQdrant(service, [
-            _row("a_old", A, "2025-01-01T00:00:00", scope="global", visibility="private"),
-            _row("a_new", A, "2025-06-01T00:00:00", scope="global", visibility="private"),
-            _row("b_old", B, "2025-01-01T00:00:00", scope="global", visibility="private"),
-            _row("b_new", B, "2025-06-01T00:00:00", scope="global", visibility="private"),
-        ])
-        sredis.fail = True
-        pages = type(service)._iter_user_memory_pages
-        n = {"calls": 0}
-
-        def pages_then_redis_back(self_, *a, **kw):
-            n["calls"] += 1  # call 1 is phase 1's key count (no duplicates: no second pass); call 2 is phase 2
-            for i, page in enumerate(pages(self_, *a, **kw), start=1):
-                if n["calls"] == 2 and i == 2:
-                    sredis.fail = False  # Redis is back before phase 2's page 2 is looked at
-                yield page
-
-        monkeypatch.setattr(type(service), "_iter_user_memory_pages", pages_then_redis_back)
-
-        res = service.dedup_memories("u1")
-
-        assert _tombstoned(service) == ["b_old"], "page 1 skipped (no lock, never unlocked), page 2 done under the lock"
+        removed = _tombstoned(service) if dreaming else _deleted(service)
+        assert removed == ["b_old"], "page 1 skipped (never unlocked), page 2 done under the lock"
         assert "1 page" in res["semantic_skipped"] and "unavailable" in res["semantic_skipped"]
 
-    def test_exact_groups_are_probed_again_while_the_probe_failed(self, service, sredis):
+    def test_an_exact_group_is_skipped_and_the_next_group_probes_again(self, service, sredis, dreaming):
         fake = _FakeQdrant(service, [
             _row("x1", A, "2025-01-01T00:00:00", scope="global", visibility="private"),
             _row("x2", A, "2025-02-01T00:00:00", scope="global", visibility="private"),
@@ -319,21 +303,56 @@ class TestRedisFlap:
             fake.payloads[pid]["hash"] = "hA"
         for pid in ("y1", "y2"):
             fake.payloads[pid]["hash"] = "hB"
-        sredis.fail = True
-        inner = service._memory.vector_store.delete.side_effect
-        sweep = []
-
-        def delete_then_redis_back_and_sweep_starts(pid):
-            inner(pid)
-            sredis.fail = False
-            sweep.append(gate.acquire_lock(sredis, POOL))
-
-        service._memory.vector_store.delete.side_effect = delete_then_redis_back_and_sweep_starts
+        _ping_fails(sredis, 1)
 
         res = service.dedup_memories("u1", semantic=False)
 
-        assert _deleted(service) == ["x1"], "group 2 must meet the sweep's lock"
-        assert res["exact_skipped_locked_pools"] == 1
+        assert _deleted(service) == ["y1"], "group x skipped, group y done under the lock"
+        assert res["exact_groups_abandoned"] == 1 and res["exact_duplicates_removed"] == 1
+
+    def test_an_exact_group_is_not_deleted_while_a_sweep_that_took_the_lock_first_still_runs(
+        self, service, sredis, dreaming
+    ):
+        """The sweep took the pool lock before dedup's probe failed once: the sweep is
+        still running, so every live copy must survive this dedup pass."""
+        fake = _FakeQdrant(service, [
+            _row("x1", A, "2025-01-01T00:00:00", scope="global", visibility="private"),
+            _row("x2", A, "2025-02-01T00:00:00", scope="global", visibility="private"),
+            _row("x3", A, "2025-06-01T00:00:00", scope="global", visibility="private"),
+        ])
+        for pid in fake.payloads:
+            fake.payloads[pid]["hash"] = "hA"
+        sweep_token = gate.acquire_lock(sredis, POOL)
+        _ping_fails(sredis, 1)
+        inner = service._memory.vector_store.delete.side_effect
+
+        def delete_while_the_sweep_prunes_the_survivor(pid):
+            inner(pid)
+            fake.payloads["x3"]["metadata"].update(dream_tombstoned=True, pruned=True)
+
+        service._memory.vector_store.delete.side_effect = delete_while_the_sweep_prunes_the_survivor
+
+        res = service.dedup_memories("u1", semantic=False)
+
+        assert _deleted(service) == [] and _live_with(fake, A) == ["x1", "x2", "x3"]
+        assert res["exact_groups_abandoned"] == 1
+        assert sredis.keys[_key(POOL)] == sweep_token, "the sweep's lock is untouched"
+
+    def test_a_semantic_page_is_not_hard_deleted_while_a_sweep_that_took_the_lock_first_still_runs(
+        self, service, sredis, dreaming
+    ):
+        _FakeQdrant(service, [
+            _row("a_old", A, "2025-01-01T00:00:00", scope="global", visibility="private"),
+            _row("a_new", A, "2025-06-01T00:00:00", scope="global", visibility="private"),
+        ])
+        sweep_token = gate.acquire_lock(sredis, POOL)
+        _ping_fails(sredis, 1)
+
+        res = service.dedup_memories("u1")
+
+        assert _deleted(service) == [] and _tombstoned(service) == []
+        assert res["semantic_duplicates_removed"] == 0 and "unavailable" in res["semantic_skipped"]
+        assert sredis.keys[_key(POOL)] == sweep_token
 
 
 # ── the exact phase uses only the re-read rows ───────────────────────────────────
@@ -359,3 +378,57 @@ def test_exact_phase_uses_the_rows_it_re_read_after_taking_the_lock(service, sre
     assert _deleted(service) == ["x_old"]
     # survivor's own 1 + the dropped row's CURRENT 3 (the page snapshot said 1)
     assert fake.payloads["y_new"]["metadata"].get("times_derived") == 4
+
+
+# ── the survivor is re-read for its owner too; the counter write is lock-checked ──
+
+
+def test_a_survivor_whose_owner_changed_mid_group_abandons_the_group(service, sredis):
+    import copy
+
+    from tests.test_dedup import _make_point
+
+    fake = _cross_pool(service, survivor_owner="u1")
+    orig_retrieve = fake.retrieve
+
+    def retrieve(*a, **kw):  # real Qdrant returns copies
+        return [_make_point(p.id, copy.deepcopy(p.payload)) for p in orig_retrieve(*a, **kw)]
+
+    service._memory.vector_store.client.retrieve.side_effect = retrieve
+    inner = service._memory.vector_store.delete.side_effect
+
+    def delete_then_survivor_moves_to_a_pool_we_do_not_hold(pid):
+        inner(pid)
+        fake.payloads["m2"]["metadata"]["owner_user_id"] = "u7"  # same exact key, pool user--u7
+
+    service._memory.vector_store.delete.side_effect = delete_then_survivor_moves_to_a_pool_we_do_not_hold
+
+    res = service.dedup_memories("u1", semantic=False)
+
+    assert len(_deleted(service)) == 1, "no delete once the survivor sits in a pool this run does not hold"
+    assert res["lock_lost_pools"] == 1
+    assert fake.payloads["m2"]["metadata"].get("times_derived") is None
+    assert sredis.keys == {}
+
+
+def test_the_counter_bump_is_checked_against_the_lock_after_the_last_delete(service, sredis):
+    """The lock expires and a sweep takes the pool during the group's LAST (slow) delete:
+    the survivor's counter must not be written."""
+    fake = _FakeQdrant(service, [
+        _row("x_old", A, "2025-01-01T00:00:00", scope="global", visibility="private"),
+        _row("y_new", A, "2025-06-01T00:00:00", scope="global", visibility="private"),
+    ])
+    fake.payloads["x_old"]["hash"] = fake.payloads["y_new"]["hash"] = "hA"
+    inner = service._memory.vector_store.delete.side_effect
+
+    def last_delete_outlives_the_lock(pid):
+        inner(pid)
+        sredis.now += 11 * MIN  # the 10-minute lock expired ...
+        assert gate.acquire_lock(sredis, POOL)  # ... and a sweep took the pool
+
+    service._memory.vector_store.delete.side_effect = last_delete_outlives_the_lock
+
+    res = service.dedup_memories("u1", semantic=False)
+
+    assert _deleted(service) == ["x_old"] and res["lock_lost_pools"] == 1
+    assert fake.payloads["y_new"]["metadata"].get("times_derived") is None, "no write after the lock was lost"
