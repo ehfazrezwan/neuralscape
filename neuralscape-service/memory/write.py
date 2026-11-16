@@ -241,8 +241,15 @@ class WriteMixin:
         owner_user_id: str,
         write_started_at: datetime,
         source_ref: dict | None = None,
+        episode_uuid: str | None = None,
+        episode_name: str | None = None,
     ) -> None:
-        """Stamp ``memory_id``/visibility/owner onto recently-created Graphiti nodes.
+        """Stamp ``memory_id``/visibility/owner onto the Graphiti nodes a write produced.
+
+        ``episode_uuid`` / ``episode_name`` identify the write's own episode:
+        the nodes stamped are that episode and the entities it mentions, so
+        concurrent graph jobs in one group never stamp each other's nodes.
+        With neither, the legacy creation-time window is used (logged).
 
         Called by every store path after the Graphiti write completes. The
         wiki synthesizer uses these properties to walk community → source
@@ -271,6 +278,8 @@ class WriteMixin:
             owner_user_id=owner_user_id,
             write_started_at=write_started_at,
             window_seconds=synthesizer_settings.attach_window_seconds,
+            episode_uuid=episode_uuid,
+            episode_name=episode_name,
         )
         try:
             self._run_on_bridge(coro, timeout=10.0)
@@ -290,6 +299,8 @@ class WriteMixin:
                 source_ref=source_ref,
                 write_started_at=write_started_at,
                 window_seconds=synthesizer_settings.attach_window_seconds,
+                episode_uuid=episode_uuid,
+                episode_name=episode_name,
             )
             try:
                 self._run_on_bridge(src_coro, timeout=10.0)
@@ -605,12 +616,10 @@ class WriteMixin:
                     # 1-episode → N-memories shape: a single graph.add produces
                     # entities that could legitimately belong to any of the N
                     # extracted memories. We call attach_memory_id once per
-                    # stored memory; the Cypher uses ``coalesce(memory_id,
-                    # $memory_id)``, so the first call wins and later calls are
-                    # no-ops on the same node. The result is each fresh entity
-                    # carries one representative memory_id from the batch — not
-                    # a perfect mapping, but enough for the wiki synthesizer
-                    # to walk community → source memory.
+                    # stored memory against THIS episode's nodes; ``memory_id``
+                    # is coalesced (first memory wins, the representative id the
+                    # wiki synthesizer walks) while ``memory_ids`` accumulates
+                    # every memory id of the episode.
                     for mem in stored:
                         mid = getattr(mem, "id", "") or ""
                         self._attach_memory_id_to_graph_nodes(
@@ -619,6 +628,8 @@ class WriteMixin:
                             visibility=MemoryVisibility.PRIVATE.value,
                             owner_user_id=user_id,
                             write_started_at=graph_write_started_at,
+                            episode_uuid=episode_uuid,
+                            episode_name=episode_name,
                         )
                         # Provenance durability: same episode → N memories;
                         # stamp each row so a later cascade can resolve the
@@ -641,6 +652,87 @@ class WriteMixin:
             logger.warning(f"Graph storage failed (non-critical): {e}")
 
         return (stored, stats) if return_stats else stored
+
+    def _episode_is_dead(self, group_id: str, episode_uuid: str) -> bool:
+        """True when the episode has edges and EVERY one is invalidated/expired.
+
+        The same liveness the stale-graph check uses (``total > 0 and live ==
+        0``). Fail-safe: any probe error reads as "not dead" (reuse, no LLM).
+        """
+        try:
+            from extensions.dreaming.graph_patcher import episode_edge_counts
+
+            coro = episode_edge_counts(
+                self._graphiti.driver, group_id=group_id, episode_uuid=episode_uuid
+            )
+            try:
+                counts = self._run_on_bridge(coro, timeout=10.0)
+            except Exception:
+                coro.close()
+                raise
+            return counts["total"] > 0 and counts["live"] == 0
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _resolve_single_fact_episode(
+        self, memory_id: str, content: str, group_id: str
+    ) -> tuple[str, str | None]:
+        """``(episode_name, existing_uuid)`` for a single-fact enrichment.
+
+        The name is deterministic in (memory id, content, group). If an episode
+        with that name exists it is reused (``existing_uuid`` set: a repeated or
+        retried job skips the second LLM-priced add) — unless stale repair is
+        enabled (``GRAPH_SUPERSESSION_ENABLED``) and that episode is DEAD, in
+        which case the name is re-seeded with the dead episode's uuid and the
+        chain is followed: base -> dead ep1 -> name(ep1) -> ... until a name is
+        free (add a new episode) or a live episode is found (reuse it). This
+        resolves the same episode for every retry, so a repaired row never
+        flip-flops back to the dead one. With the flag off there is no repair, so
+        the first existing episode is reused with no liveness probe.
+        """
+        seed = ""
+        for _ in range(5):
+            key = hashlib.sha256("\n".join((memory_id, content, group_id, seed)).encode()).hexdigest()
+            name = f"mem0_episode_{key[:32]}"
+            found = self._graph_episode_uuid(group_id, name)
+            if not found:
+                return name, None
+            if not settings.graph_supersession_enabled or not self._episode_is_dead(group_id, found):
+                return name, found
+            seed = found
+        return name, found
+
+    def _graph_episode_uuid(self, group_id: str, episode_name: str) -> str | None:
+        """uuid of the Episodic node with this name in the group, else None.
+
+        Same fail-open contract as :meth:`_graph_episode_exists` (any error or a
+        non-real bridge loop returns None, i.e. "write it").
+        """
+        if not (self._graphiti and self._bridge):
+            return None
+        import asyncio as _asyncio
+
+        if not isinstance(getattr(self._bridge, "_loop", None), _asyncio.AbstractEventLoop):
+            return None
+        cypher = (
+            "MATCH (e:Episodic {group_id: $group_id, name: $name}) "
+            "RETURN e.uuid AS uuid LIMIT 1"
+        )
+
+        async def _run():
+            async with self._graphiti.driver.session() as session:
+                result = await session.run(cypher, group_id=group_id, name=episode_name)
+                return await result.data()
+
+        coro = _run()
+        try:
+            records = self._run_on_bridge(coro, timeout=10.0) or []
+            uuid = records[0].get("uuid") if records else None
+            return uuid if isinstance(uuid, str) and uuid else None
+        except Exception:
+            coro.close()
+            logger.debug("graph episode uuid lookup failed (fail-open)", exc_info=True)
+            return None
 
     def _graph_episode_exists(self, group_id: str, episode_name: str) -> bool:
         """One cheap Cypher lookup: does an Episodic node with this
@@ -1239,6 +1331,7 @@ class WriteMixin:
         graph_ontology: dict | None = None,
         occurred_at: str | None = None,
         workspace: str | None = None,
+        result_out: dict | None = None,
     ) -> bool:
         """Add content to the knowledge graph + attach memory_id back-refs.
 
@@ -1263,6 +1356,19 @@ class WriteMixin:
         to report honest enrichment status instead of assuming success — a
         transient Gemini 503 leaves the memory vector-only, and that must be
         observable rather than reported as ``enriched=True``.
+
+        ``result_out`` is an optional out-parameter: when a dict is passed it is
+        filled with ``episode_uuid`` / ``episode_name`` of the episode this call
+        wrote (or found already written), so the graph worker can pin the exact
+        episode without diffing the row's ref before and after. The return
+        value is unchanged.
+
+        Idempotency: the episode is named deterministically from the memory id,
+        content and group (see :meth:`_resolve_single_fact_episode`). A repeated
+        or retried job (the first attempt wrote the episode but died before
+        recording it) finds the existing LIVE episode, skips the second
+        LLM-priced add and re-runs only the attach/persist steps. With stale
+        repair on, a dead episode is not reused: a new one is added.
         """
         if not (self._graphiti and self._bridge):
             return False
@@ -1272,17 +1378,30 @@ class WriteMixin:
         group_id = _build_group_id(visibility, user_id, project_id, workspace)
         graph_write_started_at = datetime.now(timezone.utc)
         try:
-            graph_result = retry_transient(
-                self._memory.graph.add,
-                data=content,
-                filters={"user_id": user_id, "group_id": group_id},
-                reference_time=_occurred_at_to_datetime(occurred_at),
-                operation="enrich_graph add",
-                **(graph_ontology or {}),
-            )
-            # Best-effort: attach memory_id back-reference onto the entity nodes
-            # Graphiti just created in this group, so the wiki synthesizer can
-            # walk community → source memories.
+            episode_name, existing_uuid = self._resolve_single_fact_episode(memory_id, content, group_id)
+            if existing_uuid:
+                logger.info(
+                    f"Skipping graph add for memory {memory_id} — episode "
+                    f"{episode_name} already exists in group {group_id} (retried job)"
+                )
+                graph_result = {"episode_uuid": existing_uuid, "episode_name": episode_name}
+            else:
+                graph_result = retry_transient(
+                    self._memory.graph.add,
+                    data=content,
+                    filters={"user_id": user_id, "group_id": group_id},
+                    episode_name=episode_name,
+                    reference_time=_occurred_at_to_datetime(occurred_at),
+                    operation="enrich_graph add",
+                    **(graph_ontology or {}),
+                )
+            if result_out is not None:
+                result_out["episode_uuid"] = (graph_result or {}).get("episode_uuid")
+                result_out["episode_name"] = (graph_result or {}).get("episode_name") or episode_name
+            # Best-effort: attach the memory_id back-reference onto THIS
+            # episode's nodes (the episode + the entities it mentions), so the
+            # wiki synthesizer can walk community → source memories and
+            # concurrent jobs in the group never stamp each other's nodes.
             self._attach_memory_id_to_graph_nodes(
                 group_id=group_id,
                 memory_id=memory_id,
@@ -1290,14 +1409,14 @@ class WriteMixin:
                 owner_user_id=user_id,
                 write_started_at=graph_write_started_at,
                 source_ref=source_ref,
+                episode_uuid=(graph_result or {}).get("episode_uuid"),
+                episode_name=(graph_result or {}).get("episode_name") or episode_name,
             )
-            # Provenance durability: this single-fact path does NOT name its
-            # episode deterministically — MemoryGraph.add() mints a
-            # timestamp-based name when no episode_name is supplied. Persist
-            # whatever uuid/name Graphiti actually resolved onto the Qdrant
-            # row so a later visibility flip / delete can cascade-expire the
-            # EXACT episode (memory/provenance.py) instead of falling back to
-            # a lossy heuristic. Additive — never blocks the graph result.
+            # Provenance durability: persist the uuid/name Graphiti resolved
+            # onto the Qdrant row so a later visibility flip / delete can
+            # cascade-expire the EXACT episode (memory/provenance.py) instead
+            # of falling back to a lossy heuristic. Additive — never blocks
+            # the graph result.
             episode_uuid = (graph_result or {}).get("episode_uuid")
             episode_name = (graph_result or {}).get("episode_name")
             if episode_uuid or episode_name:
