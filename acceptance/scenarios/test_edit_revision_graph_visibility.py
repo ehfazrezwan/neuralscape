@@ -36,6 +36,15 @@ def _find(client, project_id, marker):
     return hits[0]
 
 
+def _private_episode_listed(client, project_id, marker) -> None:
+    """The owner's PRIVATE-group episode of the marker exists. (The owner also reads the shared group, so a
+    transient shared episode of a stale job must not count as the owner having reached it.)"""
+    r = client.get("/v1/graph/episodes", params={"project_id": project_id, "limit": 100})
+    assert r.status_code == 200, f"GET /v1/graph/episodes -> {r.status_code}"
+    rows = [e for e in r.json().get("episodes", []) if marker in (e.get("content") or "")]
+    assert any(str(e.get("group_id", "")).startswith("user--") for e in rows), "no private-group episode yet"
+
+
 def _episodes_text(client, project_id) -> str:
     r = client.get("/v1/graph/episodes", params={"project_id": project_id, "limit": 100})
     assert r.status_code == 200, f"GET /v1/graph/episodes -> {r.status_code}"
@@ -133,7 +142,7 @@ def check_marker_not_visible_through_graph(client, n) -> None:
 @proves("model.graph-group-ids", "graph.deferred-enrichment")
 def test_owner_reaches_the_narrowed_memory_in_their_own_graph(a, narrowed):
     eventually(
-        lambda: _assert_in(_episodes_text(a, narrowed["project_id"]), narrowed["marker"]),
+        lambda: _private_episode_listed(a, narrowed["project_id"], narrowed["marker"]),
         timeout=300, what="narrowed memory's episode in the owner's private graph",
     )
 
@@ -156,8 +165,9 @@ def _assert_in(text: str, marker: str) -> None:
 
 @proves("model.graph-group-ids", "graph.deferred-enrichment")
 def test_narrowed_memory_is_absent_from_the_shared_graph_pool(b, narrowed):
-    # (ordered after the owner reached it: both jobs have had their chance to run)
-    check_marker_not_visible_through_graph(b, narrowed)
+    # (ordered after the owner's private episode exists, i.e. the edit's re-ingest finished. The queued stale job
+    # writes the shared episode and expires it moments later, so absence is awaited, then it must hold.)
+    eventually(lambda: check_marker_not_visible_through_graph(b, narrowed), timeout=60, interval=2, what="shared pool free of the narrowed memory")
     # and stays absent for the whole observation window: a late-running stale job must not publish it either
     _holds_for(lambda: check_marker_not_visible_through_graph(b, narrowed), window=30, interval=5)
     assert b.get(f"/v1/memories/{narrowed['id']}").status_code == 404, "B can read the narrowed memory"
@@ -167,7 +177,7 @@ def test_narrowed_memory_is_absent_from_the_shared_graph_pool(b, narrowed):
 @negative_control
 def test_graph_check_fails_for_the_owner(a, narrowed):
     eventually(
-        lambda: _assert_in(_episodes_text(a, narrowed["project_id"]), narrowed["marker"]),
+        lambda: _private_episode_listed(a, narrowed["project_id"], narrowed["marker"]),
         timeout=300, what="owner sees the episode",
     )
     expect_check_fails(check_marker_not_visible_through_graph, a, narrowed)
