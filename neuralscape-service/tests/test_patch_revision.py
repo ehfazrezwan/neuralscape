@@ -428,3 +428,65 @@ def test_the_lock_is_per_memory(world, edit_lock_redis):
     edit_lock_redis.store[f"ns:edit-lock:{M2}"] = "someone"
     world.patch_memory(M1, "ehfaz", {"tags": ["unaffected"]}, expected_revision="0")
     assert _tags(world) == ["unaffected"]
+
+
+# ── retag takes the same per-memory lock ───────────────────────────────
+
+
+def _retag(world):
+    return world.retag_memories("ehfaz", {"category": "personal_fact"}, {"add_tags": ["bulk"]})
+
+
+def test_retag_writes_under_the_lock_bumps_the_revision_in_its_single_write_and_releases(world, edit_lock_redis):
+    seen = {}
+    real_update = world._memory.vector_store.update.side_effect
+
+    def watching_update(pid, payload=None, vector=None):
+        seen["lock_held_during_write"] = edit_lock_redis.store.get(LOCK_KEY) is not None
+        return real_update(pid, payload=payload, vector=vector)
+
+    world._memory.vector_store.update.side_effect = watching_update
+    out = _retag(world)
+    assert out["updated"] == 1 and out["skipped_busy_ids"] == []
+    assert seen["lock_held_during_write"] is True
+    assert world.fake.points[M1]["metadata"]["revision"] == 1 and "bulk" in _tags(world)
+    assert edit_lock_redis.store == {}
+
+
+def test_retag_skips_a_row_another_edit_holds_and_reports_it(world, edit_lock_redis):
+    edit_lock_redis.store[LOCK_KEY] = "another-writer"
+    out = _retag(world)
+    assert out["updated"] == 0 and out["skipped_busy_ids"] == [M1]
+    assert _tags(world) == ["t0"] and "revision" not in world.fake.points[M1]["metadata"]
+    assert edit_lock_redis.store[LOCK_KEY] == "another-writer"
+
+
+def test_retag_lost_lock_writes_nothing(world, edit_lock_redis, monkeypatch):
+    """The lock is stolen after retag acquired it and before the fence."""
+    real_get = world._memory.vector_store.get.side_effect
+
+    def get_then_steal(vector_id):
+        point = real_get(vector_id=vector_id)
+        edit_lock_redis.store[LOCK_KEY] = "thief"       # TTL lapsed, someone else took it
+        return point
+
+    world._memory.vector_store.get.side_effect = get_then_steal
+    out = _retag(world)
+    assert out["updated"] == 0 and out["skipped_busy_ids"] == [M1]
+    assert _tags(world) == ["t0"]
+
+
+def test_retag_skips_a_row_that_a_patch_changed_since_the_scroll(world, monkeypatch):
+    """A PATCH commits between retag's scroll and its locked re-check: retag must not overwrite it from the stale scroll."""
+    real_scroll = world.fake.scroll
+
+    def scroll_then_patch(*a, **k):
+        import copy
+
+        result = copy.deepcopy(real_scroll(*a, **k))      # the scroll's view is a snapshot, not a live reference
+        world.patch_memory(M1, "ehfaz", {"tags": ["patched-meanwhile"]}, expected_revision="0")
+        return result
+
+    world.fake.scroll = scroll_then_patch
+    out = _retag(world)
+    assert out["skipped_busy_ids"] == [M1] and _tags(world) == ["patched-meanwhile"]

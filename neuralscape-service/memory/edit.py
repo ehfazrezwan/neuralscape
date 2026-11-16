@@ -34,9 +34,13 @@ a conditional upsert is unavailable on the deployed server.
 DOCUMENTED LIMITS: (1) mem0's ``update`` upserts unconditionally, so a writer
 whose lock TTL expires INSIDE that call (embedder stalled past
 ``_LOCK_TTL_MS``) can still overwrite a later edit; the fence runs immediately
-before the call. (2) ``retag_memories`` and non-patch writers (dedup counters,
-the dreaming graph patcher) do not take the lock; ``retag`` bumps the revision
-by read-then-write, so a revision is unique only among ``patch_memory`` writers.
+before the call. (2) ``retag_memories`` takes the same lock per row it changes, re-checks the
+row's revision under it and bumps the revision in its single write (a busy or
+moved row is skipped and reported in ``skipped_busy_ids``). The writers that do
+NOT take the lock are the dedup counters (the dedup paths in
+``memory/write.py`` / ``memory/delete.py``) and the dreaming graph patcher
+(``extensions/dreaming/graph_patcher.py``); they never change the patchable
+fields a revision guards.
 (3) With Redis unreachable a conditional edit is refused (503); an unconditional
 one proceeds unlocked with a warning.
 """
@@ -565,6 +569,7 @@ class EditMixin:
         now_iso = datetime.now(timezone.utc).isoformat()
 
         matched = updated = skipped_forbidden = skipped_invalid = 0
+        skipped_busy_ids: list[str] = []
         graph_jobs: list[dict] = []
         # Zero-effect detection (audit): a memory whose episode can't be
         # resolved must be COUNTED and its id REPORTED, never silently
@@ -648,12 +653,35 @@ class EditMixin:
                 updated += 1
                 if dry_run:
                     continue
-                # A retag changes patchable fields: bump the revision so a
-                # concurrent PATCH holding the old one is refused.
-                new_meta["revision"] = int(revision_of(meta)) + 1
-                m.vector_store.update(
-                    str(pt.id), payload={"metadata": new_meta, "updated_at": now_iso}
-                )
+                # A retag changes patchable fields: under the SAME per-memory lock a PATCH takes,
+                # re-check that the row is still at the revision the scroll saw, then write once with
+                # revision+1. A busy row, a lost lock or a row that moved on is skipped and reported
+                # (``skipped_busy_ids``) rather than overwritten from a stale scroll.
+                busy = False
+                try:
+                    with _EditLock(str(pt.id), required=False) as lock:
+                        fresh = m.vector_store.get(vector_id=str(pt.id))
+                        fresh_payload = getattr(fresh, "payload", None)
+                        if fresh is None:
+                            busy = True
+                        elif isinstance(fresh_payload, dict):
+                            fresh_meta = fresh_payload.get("metadata") or {}
+                            if isinstance(fresh_meta.get("metadata"), dict):
+                                fresh_meta = fresh_meta["metadata"]
+                            busy = revision_of(fresh_meta) != revision_of(meta)
+                        if not busy and not lock.held():
+                            busy = True
+                        if not busy:
+                            new_meta["revision"] = int(revision_of(meta)) + 1
+                            m.vector_store.update(
+                                str(pt.id), payload={"metadata": new_meta, "updated_at": now_iso}
+                            )
+                except EditBusy:
+                    busy = True
+                if busy:
+                    updated -= 1
+                    skipped_busy_ids.append(str(pt.id))
+                    continue
                 owner = meta.get("owner_user_id") or payload.get("user_id", "")
                 visibility = meta.get("visibility") or MemoryVisibility.PRIVATE.value
                 # WT6: include workspace in group_id derivation
@@ -726,6 +754,8 @@ class EditMixin:
             "updated": updated,
             "skipped_forbidden": skipped_forbidden,
             "skipped_invalid": skipped_invalid,
+            # Rows another edit held (lock busy / lost) or that changed since the scroll: not retagged.
+            "skipped_busy_ids": skipped_busy_ids,
             "graph_jobs": graph_jobs,
             # Rows whose old-group episode could not be resolved/verified —
             # the substring fallback ran but its effect is unverifiable.
