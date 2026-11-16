@@ -170,6 +170,12 @@ class _AsyncBridge:
     def __init__(self):
         self._loop = asyncio.new_event_loop()
         self._stopped = False
+        # Futures handed out by run() that have not finished. shutdown() cancels
+        # whatever is left in here, so a caller blocked on a loop that was stopped,
+        # wedged or missed by the task snapshot is released instead of waiting out
+        # the bridge limit. ``_state_lock`` orders "stopped" against "submitted".
+        self._state_lock = threading.Lock()
+        self._inflight: set = set()
         self._thread = threading.Thread(target=self._run_loop, daemon=True)
         self._thread.start()
 
@@ -187,14 +193,33 @@ class _AsyncBridge:
         cancelled on the loop and ``TimeoutError`` is raised, which the
         service's graph callers already log and treat as non-critical.
         """
-        if self._stopped or self._loop.is_closed():
+        limit = timeout if timeout is not None and timeout > 0 else _bridge_timeout_from_env()
+        with self._state_lock:
+            # Checked and submitted under the lock shutdown() takes to set the flag:
+            # a call either fails here, or is tracked before shutdown's final sweep.
+            if self._stopped or self._loop.is_closed():
+                stopped = True
+            else:
+                stopped = False
+                try:
+                    future = asyncio.run_coroutine_threadsafe(coro, self._loop)
+                except RuntimeError:
+                    stopped = True
+                else:
+                    self._inflight.add(future)
+        if stopped:
             if asyncio.iscoroutine(coro):
                 coro.close()  # never leave an un-awaited coroutine behind
             raise RuntimeError("Graphiti bridge is shut down")
-        limit = timeout if timeout is not None and timeout > 0 else _bridge_timeout_from_env()
-        future = asyncio.run_coroutine_threadsafe(coro, self._loop)
+        future.add_done_callback(self._inflight.discard)
         try:
             return future.result(timeout=limit)
+        except concurrent.futures.CancelledError:
+            if self._stopped:
+                raise RuntimeError(
+                    "Graphiti bridge was shut down while this call was waiting"
+                ) from None
+            raise
         except concurrent.futures.TimeoutError:
             if future.done():
                 # The coroutine itself raised TimeoutError (driver/LLM timeout,
@@ -208,6 +233,13 @@ class _AsyncBridge:
                 f"Graphiti bridge call did not finish within {limit:g}s and was cancelled"
             ) from None
 
+    def _release_waiters(self) -> None:
+        """Cancel every future run() handed out that is still pending, so its waiter
+        returns now (concurrent futures need no loop to cancel)."""
+        with self._state_lock:
+            leftover = list(self._inflight)
+        for future in leftover:
+            future.cancel()
 
     def shutdown(self, timeout: float = 10.0) -> None:
         """NEURALSCAPE PATCH: stop the bridge loop cleanly (not in upstream).
@@ -219,6 +251,16 @@ class _AsyncBridge:
         running event loop' noise. Idempotent; a later ``run()`` raises
         RuntimeError.
         """
+        with self._state_lock:
+            self._stopped = True
+        try:
+            self._shutdown_loop(timeout)
+        finally:
+            # On every path (late submit missed by the task snapshot, a loop that never
+            # answered, a stopped loop): nobody stays blocked in run().
+            self._release_waiters()
+
+    def _shutdown_loop(self, timeout: float) -> None:
         if self._loop.is_closed():
             return
 
@@ -230,7 +272,25 @@ class _AsyncBridge:
             await asyncio.gather(*pending, return_exceptions=True)
             await self._loop.shutdown_asyncgens()
 
-        self._stopped = True
+        if not self._loop.is_running():
+            # The loop was already stopped (nothing can answer a cancel request):
+            # skip the wait for it, just release the loop.
+            self._thread.join(timeout=timeout)
+            if not self._thread.is_alive():
+                # The thread is gone, so nothing else drives the loop: run the
+                # cancellation here, bounded, so tasks still pending on it are
+                # cancelled (and never-started coroutines closed) before it closes.
+                try:
+                    self._loop.run_until_complete(
+                        asyncio.wait_for(_cancel_all(), timeout=timeout)
+                    )
+                except Exception:
+                    logger.warning(
+                        "Graphiti bridge shutdown: cancelling tasks on a stopped loop failed",
+                        exc_info=True,
+                    )
+                self._loop.close()
+            return
         try:
             asyncio.run_coroutine_threadsafe(_cancel_all(), self._loop).result(timeout=timeout)
         except Exception:
@@ -239,6 +299,10 @@ class _AsyncBridge:
         self._thread.join(timeout=timeout)
         if not self._thread.is_alive():
             self._loop.close()
+        else:
+            logger.warning(
+                "Graphiti bridge thread did not stop within %.0fs; abandoning it", timeout
+            )
 
 
 def _hybrid_egress_ok(text: str) -> bool:
