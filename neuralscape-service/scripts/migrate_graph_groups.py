@@ -32,6 +32,11 @@ memory keeps its group id byte for byte, so only the listed rows need attention:
 their graph facts under the old (ambiguous) group should be re-enriched into the
 new group (edit the memory, or re-ingest it). The audit never writes anything.
 
+Rewrites node group ids (Episodic, Entity, Community) AND edge group ids
+(``RELATES_TO`` / ``MENTIONS`` / ``HAS_MEMBER`` relationships), and names each
+target with the service's own group-id builder. Run it once, on a deployment that
+predates the multi-user model; on a current install it finds nothing and exits.
+
 The script writes to Neo4j via direct Cypher (Graphiti's own driver),
 so the backend service does NOT need to be running.
 """
@@ -107,6 +112,63 @@ def audit_delimiter_ids(client, collection: str) -> list[dict]:
             return out
 
 
+# Graphiti stores group_id on these node labels and on these relationship types.
+# (Entity edges are ``RELATES_TO`` *relationships*; there is no ``EntityEdge`` node
+# label, so a node-only rewrite silently leaves every fact's edge in the legacy group.)
+NODE_LABELS = ("Episodic", "Entity", "Community")
+REL_TYPES = ("RELATES_TO", "MENTIONS", "HAS_MEMBER")
+
+
+def rewrite_target(group_id: str, owner: str) -> str | None:
+    """The current group id for a legacy one, or None when it is not legacy.
+
+    Uses the service's own builder (``memory.groups._build_group_id``) so the
+    target can never drift from what the service reads and writes.
+    """
+    from memory.groups import _build_group_id  # noqa: E402
+
+    if group_id == "global":
+        return _build_group_id("private", owner, None, None)
+    if group_id.startswith("project--") and len(group_id) > len("project--"):
+        return _build_group_id("private", owner, group_id[len("project--"):], None)
+    return None
+
+
+def scan_legacy_groups(session, owner: str) -> dict[str, list[tuple[str, str, int]]]:
+    """Per node label / relationship type: ``[(legacy_group_id, new_group_id, row_count)]``."""
+    where = "x.group_id = 'global' OR x.group_id STARTS WITH 'project--'"
+    plan: dict[str, list[tuple[str, str, int]]] = {}
+    queries = [(f"{label}", f"MATCH (x:{label}) WHERE {where} RETURN x.group_id AS g, count(x) AS c") for label in NODE_LABELS]
+    queries += [
+        (rel, f"MATCH ()-[x:{rel}]->() WHERE {where} RETURN x.group_id AS g, count(x) AS c")
+        for rel in REL_TYPES
+    ]
+    for kind, cypher in queries:
+        rows = []
+        for record in session.run(cypher):
+            new = rewrite_target(record["g"], owner)
+            if new is not None:
+                rows.append((record["g"], new, record["c"]))
+        plan[kind] = sorted(rows)
+    return plan
+
+
+def apply_rewrites(session, plan: dict[str, list[tuple[str, str, int]]], print_fn=print) -> int:
+    """Rewrite every planned legacy group id; returns the number of rows changed."""
+    updated = 0
+    for kind, per in plan.items():
+        done = 0
+        for old, new, _ in per:
+            if kind in NODE_LABELS:
+                cypher = f"MATCH (x:{kind} {{group_id: $old}}) SET x.group_id = $new RETURN count(x) AS c"
+            else:
+                cypher = f"MATCH ()-[x:{kind} {{group_id: $old}}]->() SET x.group_id = $new RETURN count(x) AS c"
+            done += session.run(cypher, old=old, new=new).single()["c"]
+        updated += done
+        print_fn(f"  {kind:<11}  rewrote {done} rows")
+    return updated
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument(
@@ -155,36 +217,16 @@ def main(argv: list[str] | None = None) -> int:
         auth=(settings.neo4j_user, settings.neo4j_password),
     )
 
-    # Graphiti puts group_id on Episodic, Entity, EntityEdge, and Community nodes.
-    # We rewrite all of them. The Cypher uses a CASE expression so each row
-    # gets the right new value based on whether its old group_id had the
-    # `project--` prefix or was the bare `"global"` namespace.
-    targets = ["Episodic", "Entity", "EntityEdge", "Community"]
     new_owner = args.owner
-
-    plan: dict[str, dict[str, int]] = {}
     with driver.session(database=settings.neo4j_database) as session:
-        for label in targets:
-            count_legacy_global = session.run(
-                f"MATCH (n:{label}) WHERE n.group_id = 'global' RETURN count(n) AS c"
-            ).single()["c"]
-            count_legacy_project = session.run(
-                f"MATCH (n:{label}) WHERE n.group_id STARTS WITH 'project--' "
-                f"RETURN count(n) AS c"
-            ).single()["c"]
-            plan[label] = {
-                "global": count_legacy_global,
-                "project": count_legacy_project,
-                "total": count_legacy_global + count_legacy_project,
-            }
+        plan = scan_legacy_groups(session, new_owner)
 
-    total_overall = sum(p["total"] for p in plan.values())
+    total_overall = sum(n for per in plan.values() for _, _, n in per)
     print(f"Legacy group_id audit (owner = {new_owner!r}):")
-    for label, p in plan.items():
-        print(
-            f"  {label:<11}  global → user--{new_owner}: {p['global']:>5}"
-            f"   |  project--<x> → user--{new_owner}--project--<x>: {p['project']:>5}"
-        )
+    for kind, per in plan.items():
+        print(f"  {kind:<11}  {sum(n for _, _, n in per):>5} rows in {len(per)} legacy group(s)")
+        for old, new, n in per:
+            print(f"      {old!r} -> {new!r}: {n}")
     print(f"  {'TOTAL':<11}  {total_overall} rows to rewrite")
 
     if not args.apply:
@@ -193,26 +235,8 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     print(f"\nRewriting {total_overall} rows...")
-    updated_total = 0
     with driver.session(database=settings.neo4j_database) as session:
-        for label in targets:
-            # global -> user--{owner}
-            res = session.run(
-                f"MATCH (n:{label}) WHERE n.group_id = 'global' "
-                f"SET n.group_id = $new_id RETURN count(n) AS c",
-                new_id=f"user--{new_owner}",
-            )
-            n1 = res.single()["c"]
-            # project--xxx -> user--{owner}--project--xxx
-            res = session.run(
-                f"MATCH (n:{label}) WHERE n.group_id STARTS WITH 'project--' "
-                f"SET n.group_id = 'user--' + $owner + '--' + n.group_id "
-                f"RETURN count(n) AS c",
-                owner=new_owner,
-            )
-            n2 = res.single()["c"]
-            updated_total += n1 + n2
-            print(f"  {label:<11}  rewrote {n1 + n2} rows")
+        updated_total = apply_rewrites(session, plan, print_fn=print)
     driver.close()
     print(f"Done: {updated_total} rows rewritten.")
     return 0
