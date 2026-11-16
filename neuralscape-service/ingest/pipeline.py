@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
@@ -79,6 +80,47 @@ class IngestDoc:
     # = reference workspace (fenced out of card/reflection/default recall). None
     # defers to adapter-based defaulting in ingest_document.
     workspace: str | None = None
+
+
+# ── Modality post-check (issue #444) ──
+# An LLM distilling "X should do Y" sometimes writes "X must do Y". Such a fact is
+# not "directly restating the document", so it must not carry the "explicit"
+# label. Deterministic and free (no LLM call): a fact whose obligation words are
+# stronger than those of the best-matching source sentence is labelled with the
+# inferred level instead.
+_OBLIGATION_RE = re.compile(
+    r"\b(must|shall|required?|requires?|requiring|mandatory|mandated|obligatory|"
+    r"need(?:s|ed)?|has to|have to|imperative|essential)\b",
+    re.IGNORECASE,
+)
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+|\n+")
+_WORD_RE = re.compile(r"[a-z]{4,}")
+_STOP = frozenset(
+    "that this with from have they them their will would should could there which about into than then when what "
+    "while where been being were also each every only over such some more most other these those".split()
+)
+# Label for a fact whose obligation strength exceeds the source's: extractor-inferred
+# (not stated), and not "deductive" (the stronger norm is not entailed by the source).
+MODALITY_UPGRADED_LEVEL = "inductive"
+
+
+def _content_stems(text: str) -> set[str]:
+    return {w[:5] for w in _WORD_RE.findall(text.lower()) if w not in _STOP}
+
+
+def modality_upgraded(fact: str, source_text: str) -> bool:
+    """True when ``fact`` states an obligation the best-matching source sentence does not."""
+    if not _OBLIGATION_RE.search(fact):
+        return False
+    fact_stems = _content_stems(fact)
+    best, best_overlap = None, 0
+    for sentence in _SENTENCE_SPLIT_RE.split(source_text):
+        overlap = len(fact_stems & _content_stems(sentence))
+        if overlap > best_overlap:
+            best, best_overlap = sentence, overlap
+    if best is None or best_overlap < 2:
+        best = source_text  # cannot locate the sentence: compare with the whole document
+    return not _OBLIGATION_RE.search(best)
 
 
 def _served_tokens(stored) -> int:
@@ -245,7 +287,11 @@ def ingest_document(service, doc: IngestDoc) -> dict:
                     # Distilled facts restate what the document says directly
                     # → epistemically "explicit" (A1). Verbatim passages carry
                     # no level (they're source text, not extracted claims).
-                    epistemic_level="explicit",
+                    epistemic_level=(
+                        MODALITY_UPGRADED_LEVEL
+                        if adapter.extractor == "default" and modality_upgraded(content, doc.content)
+                        else "explicit"
+                    ),
                     visibility=doc.visibility,
                     sensitivity_override=doc.sensitivity_override,
                     memory_kind="fact",
