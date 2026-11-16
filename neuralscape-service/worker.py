@@ -17,7 +17,7 @@ from arq.jobs import Job
 import adapters  # noqa: F401 — registers knowledge-adapter taxonomies at import (deterministic MEMORY_CATEGORIES across all workers)
 from config import parse_redis_settings, settings
 from memory_service import MemoryService
-from task_manager import connector_sync_job_id
+from task_manager import connector_sync_job_id, enqueue_connector_sync_job
 
 logger = logging.getLogger(__name__)
 
@@ -1032,6 +1032,19 @@ def _git_head_sha(repo_path: str) -> str | None:
     return None
 
 
+def _row_episode_uuid(service, memory_id: str) -> str | None:
+    """The graph episode uuid stamped on the row's payload (None when unknown / row gone / not a real store)."""
+    try:
+        point = service._memory.vector_store.get(vector_id=memory_id)
+        meta = ((getattr(point, "payload", None) or {}).get("metadata")) or {}
+        if isinstance(meta.get("metadata"), dict):
+            meta = meta["metadata"]
+        uuid = meta.get("graph_episode_uuid")
+        return uuid if isinstance(uuid, str) and uuid else None
+    except Exception:  # noqa: BLE001 - best effort; the content match is the fallback
+        return None
+
+
 async def process_graph_enrichment(
     ctx: dict,
     memory_id: str,
@@ -1084,6 +1097,31 @@ async def process_graph_enrichment(
     # occurred_at as a top-level MemoryResponse field (mapped from the payload
     # metadata in _mem_to_response), so read it directly.
     occurred_at = getattr(mem, "occurred_at", None)
+
+    # The job carries the visibility/project/content the memory had WHEN IT WAS
+    # ENQUEUED. A narrowing edit (shared -> private), a project move or a content
+    # rewrite can land while the job sits in the queue; publishing the queued
+    # values would put the memory into a graph group its owner has since
+    # withdrawn it from. The row just re-read above is authoritative: derive the
+    # group (visibility + project + workspace) from it, and skip rather than
+    # enrich text the memory no longer holds (the edit that changed the content
+    # enqueues its own re-ingest of the new text).
+    current_content = getattr(mem, "memory", None)
+    if isinstance(current_content, str) and " ".join(current_content.split()) != " ".join(content.split()):
+        logger.info(
+            "Skipping graph enrichment for memory %s — its content changed while the job "
+            "was queued (the edit enqueues its own re-ingest).", memory_id,
+        )
+        return {"memory_id": memory_id, "enriched": False, "skipped": "content_changed"}
+    current_visibility = getattr(mem, "visibility", None) or "private"  # legacy null == private
+    current_project = getattr(mem, "project_id", project_id) or None
+    current_workspace = getattr(mem, "workspace", None) or None
+    if (current_visibility, current_project) != ((visibility or "private"), (project_id or None)):
+        logger.info(
+            "Graph enrichment for memory %s: row changed while queued "
+            "(visibility %r -> %r, project %r -> %r); using the current values.",
+            memory_id, visibility, current_visibility, project_id, current_project,
+        )
     if only_if_stale:
         # Re-enrichment must reproduce the original write: carry the row's
         # connector provenance. Reference-workspace / adapter rows (their
@@ -1096,8 +1134,8 @@ async def process_graph_enrichment(
             service.graph_row_is_stale,
             memory_id,
             user_id,
-            project_id,
-            visibility or getattr(mem, "visibility", None) or "private",
+            current_project,
+            current_visibility,
             getattr(mem, "workspace", None),
         )
         if not stale:
@@ -1110,17 +1148,76 @@ async def process_graph_enrichment(
         from adapters import require_adapter
 
         graph_ontology = require_adapter(adapter).graph_ontology_kwargs()
+    episode_before = _row_episode_uuid(service, memory_id)
     enriched = await asyncio.to_thread(
         service.enrich_graph,
         content=content,
         user_id=user_id,
-        project_id=project_id,
-        visibility=visibility or "private",
+        project_id=current_project,
+        visibility=current_visibility,
         memory_id=memory_id,
         source_ref=source_ref,
         graph_ontology=graph_ontology,
         occurred_at=occurred_at,
+        workspace=current_workspace,
     )
+    episode_after = _row_episode_uuid(service, memory_id) if enriched else None
+    if enriched:
+        # The first check above only covers the time the job sat in the queue.
+        # Extraction itself takes minutes: re-read the row now and, if it was
+        # deleted or moved (visibility/project/workspace) or rewritten while we
+        # were writing, expire the episode we just published — the edit/delete
+        # cascade ran BEFORE it existed, so nothing else would ever expire it.
+        expire = getattr(service, "_cascade_or_fallback_expire", None)
+        after = await asyncio.to_thread(service.get_memory, memory_id)
+        if after is None:
+            changed = True
+        else:
+            text_after = getattr(after, "memory", None)
+            changed = (
+                (getattr(after, "visibility", None) or "private") != current_visibility
+                or (getattr(after, "project_id", current_project) or None) != current_project
+                or (getattr(after, "workspace", None) or None) != current_workspace
+                or (isinstance(text_after, str) and " ".join(text_after.split()) != " ".join(content.split()))
+            )
+        if changed and callable(expire):
+            from memory.groups import _build_group_id
+
+            written_group = _build_group_id(current_visibility, user_id, current_project, current_workspace)
+            logger.warning(
+                "Memory %s changed or was deleted while its graph enrichment ran; "
+                "expiring the episode just written to group %r.", memory_id, written_group,
+            )
+            # Pin the episode THIS job wrote when it can be told apart (the row's
+            # episode ref changed across our enrich_graph call): the cascade then
+            # resolves by uuid first, so a newer re-ingested episode of the same
+            # memory is never the one expired. Otherwise exact-content match.
+            ours = episode_after if episode_after and episode_after != episode_before else None
+            resolved = False
+            for attempt, pause in enumerate((0, 1.0, 3.0), start=1):
+                if pause:
+                    await asyncio.sleep(pause)
+                result = await asyncio.to_thread(
+                    expire,
+                    {"memory": content, "metadata": {"graph_episode_uuid": ours} if ours else {}, "user_id": user_id},
+                    group_id=written_group,
+                    memory_id=memory_id,
+                )
+                resolved = bool(isinstance(result, dict) and result.get("resolved"))
+                if resolved:
+                    break
+                logger.warning(
+                    "Cleanup of the stale episode for memory %s (group %r) unresolved on attempt %d",
+                    memory_id, written_group, attempt,
+                )
+            if not resolved:
+                # Never swallow it: a shared episode of a now-private/deleted memory must not stay readable
+                # unnoticed. Fail the job visibly with the identity needed to retry the cleanup.
+                raise RuntimeError(
+                    f"graph cleanup unresolved for memory {memory_id}: group_id={written_group!r} "
+                    f"episode_uuid={ours!r}; re-run the episode cascade for this group/episode"
+                )
+            return {"memory_id": memory_id, "enriched": False, "skipped": "changed_during_enrichment"}
     if not enriched:
         logger.warning(
             "Graph enrichment did not complete for memory %s — it remains "
@@ -1525,17 +1622,18 @@ async def connector_sync_cron(ctx: dict) -> dict:
         if not rec.get("enabled", True):
             continue
         # Same job id as an API-triggered sync of this connector instance
-        # (task_manager.connector_sync_job_id), so the two coalesce.
-        await redis.enqueue_job(
-            "process_connector_sync",
+        # (task_manager.connector_sync_job_id), so the two coalesce while one is
+        # in flight; a finished run's cached result is cleared (not skipped).
+        job = await enqueue_connector_sync_job(
+            redis,
             rec["connector_id"],
             rec.get("generation"),
-            _job_id=connector_sync_job_id(
+            connector_sync_job_id(
                 rec["connector_id"], rec.get("owner_user_id"), rec.get("generation")
             ),
-            _queue_name=settings.ingest_queue_name,
         )
-        enqueued += 1
+        if job is not None:
+            enqueued += 1
     logger.info(f"Connector sync cron: enqueued {enqueued} connector(s)")
     return {"enqueued": enqueued}
 
