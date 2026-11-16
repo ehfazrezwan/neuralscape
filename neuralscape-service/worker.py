@@ -262,7 +262,9 @@ async def process_memory_raw(
     # must not pay the graph pass + edge enrichment of a full hybrid recall,
     # and must not pollute the dreaming recall traces.
     try:
-        existing = service.search(
+        # Off the loop: retry_transient may time.sleep for tens of seconds.
+        existing = await asyncio.to_thread(
+            service.search,
             query=content,
             user_id=user_id,
             project_id=project_id,
@@ -1219,7 +1221,7 @@ async def process_graph_enrichment(
         from adapters import require_adapter
 
         graph_ontology = require_adapter(adapter).graph_ontology_kwargs()
-    episode_before = _row_episode_uuid(service, memory_id)
+    episode_before = await asyncio.to_thread(_row_episode_uuid, service, memory_id)
     enriched = await asyncio.to_thread(
         service.enrich_graph,
         content=content,
@@ -1232,7 +1234,7 @@ async def process_graph_enrichment(
         occurred_at=occurred_at,
         workspace=current_workspace,
     )
-    episode_after = _row_episode_uuid(service, memory_id) if enriched else None
+    episode_after = await asyncio.to_thread(_row_episode_uuid, service, memory_id) if enriched else None
     if enriched:
         # The first check above only covers the time the job sat in the queue.
         # Extraction itself takes minutes: re-read the row now and, if it was
@@ -1801,9 +1803,15 @@ async def startup(ctx: dict) -> None:
 
     configure_logging(worker=True)
     logger.info("ARQ worker starting up...")
+    # First, so the healthcheck sees a beat as early as possible; the (sync)
+    # warm-up below runs in a thread, so the beat keeps going through it.
+    from worker_liveness import start_heartbeat
+
+    start_heartbeat(ctx)
     logger.info(third_party_telemetry.startup_log_line())
     service = MemoryService()
-    service._get_memory()  # warm up connections
+    # Off the loop so the liveness heartbeat keeps beating through a slow cold start.
+    await asyncio.to_thread(service._get_memory)  # warm up connections
     from hybrid_inference import warmup_extraction
     await asyncio.to_thread(warmup_extraction)
     ctx["service"] = service
@@ -1835,6 +1843,9 @@ async def startup(ctx: dict) -> None:
 async def shutdown(ctx: dict) -> None:
     """Worker shutdown: close connections."""
     logger.info("ARQ worker shutting down...")
+    from worker_liveness import stop_heartbeat
+
+    await stop_heartbeat(ctx)
     registry = ctx.get("extension_registry")
     if registry:
         await registry.shutdown_all()
