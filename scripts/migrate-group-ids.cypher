@@ -60,8 +60,9 @@
 //       < scripts/migrate-group-ids.cypher
 //
 // Idempotent: rewritten ids no longer start with a legacy prefix, so a second
-// run migrates nothing. Graphiti node labels: Entity, Episodic, Community,
-// Saga. Relationship types carrying group_id: RELATES_TO, MENTIONS,
+// run migrates nothing (each pass still reports its label with migrated = 0: the
+// count is aggregated before the label is returned, so an empty pass is not silent).
+// Graphiti node labels: Entity, Episodic, Community, Saga. Relationship types carrying group_id: RELATES_TO, MENTIONS,
 // HAS_MEMBER, HAS_EPISODE, NEXT_EPISODE (the relationship pass is not
 // restricted to a type, so it covers all of them).
 
@@ -74,31 +75,36 @@ RETURN 1 / ok AS target_prefix_valid;
 MATCH (n:Episodic)
 WHERE n.group_id STARTS WITH 'project:' OR n.group_id STARTS WITH 'project--'
 SET n.group_id = $target_prefix + CASE WHEN n.group_id STARTS WITH 'project:' THEN substring(n.group_id, size('project:')) ELSE substring(n.group_id, size('project--')) END
-RETURN 'Episodic' AS label, count(*) AS migrated;
+WITH count(n) AS migrated
+RETURN 'Episodic' AS label, migrated;
 
 // --- Migrate Entity group_ids ---
 MATCH (n:Entity)
 WHERE n.group_id STARTS WITH 'project:' OR n.group_id STARTS WITH 'project--'
 SET n.group_id = $target_prefix + CASE WHEN n.group_id STARTS WITH 'project:' THEN substring(n.group_id, size('project:')) ELSE substring(n.group_id, size('project--')) END
-RETURN 'Entity' AS label, count(*) AS migrated;
+WITH count(n) AS migrated
+RETURN 'Entity' AS label, migrated;
 
 // --- Migrate Community group_ids ---
 MATCH (n:Community)
 WHERE n.group_id STARTS WITH 'project:' OR n.group_id STARTS WITH 'project--'
 SET n.group_id = $target_prefix + CASE WHEN n.group_id STARTS WITH 'project:' THEN substring(n.group_id, size('project:')) ELSE substring(n.group_id, size('project--')) END
-RETURN 'Community' AS label, count(*) AS migrated;
+WITH count(n) AS migrated
+RETURN 'Community' AS label, migrated;
 
 // --- Migrate Saga group_ids ---
 MATCH (n:Saga)
 WHERE n.group_id STARTS WITH 'project:' OR n.group_id STARTS WITH 'project--'
 SET n.group_id = $target_prefix + CASE WHEN n.group_id STARTS WITH 'project:' THEN substring(n.group_id, size('project:')) ELSE substring(n.group_id, size('project--')) END
-RETURN 'Saga' AS label, count(*) AS migrated;
+WITH count(n) AS migrated
+RETURN 'Saga' AS label, migrated;
 
 // --- Migrate relationship group_ids (RELATES_TO, MENTIONS, HAS_MEMBER, HAS_EPISODE, NEXT_EPISODE) ---
 MATCH ()-[r]->()
 WHERE r.group_id STARTS WITH 'project:' OR r.group_id STARTS WITH 'project--'
 SET r.group_id = $target_prefix + CASE WHEN r.group_id STARTS WITH 'project:' THEN substring(r.group_id, size('project:')) ELSE substring(r.group_id, size('project--')) END
-RETURN 'relationships' AS label, count(*) AS migrated;
+WITH count(r) AS migrated
+RETURN 'relationships' AS label, migrated;
 
 // --- Verify: no remaining legacy-format group_ids ---
 MATCH (n) WHERE n.group_id STARTS WITH 'project:' OR n.group_id STARTS WITH 'project--' RETURN count(*) AS remaining_nodes;

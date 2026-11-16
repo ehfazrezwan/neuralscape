@@ -198,3 +198,21 @@ def test_cypher_guard_regex_rejects_double_dash_inside_uid():
         assert not pattern.fullmatch(bad), bad
     header = "\n".join(l for l in CYPHER.read_text().splitlines() if l.startswith("//"))
     assert "GRAPH_GROUP_ID_INJECTIVE_ENABLED" in header
+
+
+def test_each_migration_pass_always_reports_its_count_even_when_it_matches_nothing():
+    """A pass that ends ``RETURN '<label>' AS label, count(*)`` has a constant grouping
+    key, so Neo4j returns NO row when nothing matched: a second run printed nothing
+    for the five passes (and the real-Neo4j idempotency check saw zero rows). The count
+    must be aggregated first (``WITH count(x) AS migrated``), which always yields one row.
+    """
+    if not CYPHER.is_file():
+        return
+    body = "\n".join(
+        line for line in CYPHER.read_text().splitlines() if not line.lstrip().startswith("//")
+    )
+    passes = [s.strip() for s in body.split(";") if "AS migrated" in s]
+    assert len(passes) == 5
+    for stmt in passes:
+        assert re.search(r"\nWITH count\((n|r)\) AS migrated\s*\nRETURN '[A-Za-z]+' AS label, migrated$", stmt), stmt
+        assert "count(*)" not in stmt, stmt
