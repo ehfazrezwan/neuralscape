@@ -120,11 +120,13 @@ class RedisAliasSource:
 class QdrantPoolSource:
     """Read-only scroll over vector payloads (owner, visibility, placement)."""
 
-    def __init__(self, url: str, collection: str, *, batch: int = 256, timeout: int = 30) -> None:
+    def __init__(self, url: str, collection: str, *, batch: int = 256, timeout: int | None = None) -> None:
         from qdrant_client import QdrantClient
 
-        # Same default as the service's QDRANT_TIMEOUT (qdrant-client's own ~5 s is too short for big scrolls).
-        self._client = QdrantClient(url=url, timeout=timeout)
+        from config import DEFAULT_QDRANT_TIMEOUT_S
+
+        # The service's default (qdrant-client's own ~5 s is too short for big scrolls).
+        self._client = QdrantClient(url=url, timeout=timeout or DEFAULT_QDRANT_TIMEOUT_S)
         self._collection = collection
         self._batch = batch
 
