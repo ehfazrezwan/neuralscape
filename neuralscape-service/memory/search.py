@@ -81,6 +81,40 @@ def _note_graph_leg_budget_timeout() -> int:
 # the search mixin free of an ask.py import (which would be circular).
 _EPISODE_SNIPPET_CLIP = 600
 
+def _effective_workspaces(workspaces: list[str] | None) -> list[str]:
+    """Workspaces a recall may read. Absent or empty means ``["memory"]``."""
+    return list(workspaces) if workspaces else ["memory"]
+
+
+def _workspace_filter(effective: list[str]):
+    """Qdrant condition limiting rows to the requested workspaces.
+
+    ``"memory"`` matches rows whose ``metadata.workspace`` is absent, null or
+    ``"memory"`` (legacy rows carry no workspace); every other name matches
+    exactly. Part of the Qdrant query filter, so the dense and BM25 legs both
+    apply it before ``limit`` cuts the pool.
+    """
+    from qdrant_client.models import (
+        FieldCondition,
+        Filter,
+        IsEmptyCondition,
+        MatchAny,
+        MatchValue,
+        PayloadField,
+    )
+
+    refs = [w for w in effective if w != "memory"]
+    should: list = []
+    if "memory" in effective:
+        should.append(IsEmptyCondition(is_empty=PayloadField(key="metadata.workspace")))
+        should.append(FieldCondition(key="metadata.workspace", match=MatchValue(value="memory")))
+        # Legacy/odd rows with an empty-string workspace were memory rows.
+        should.append(FieldCondition(key="metadata.workspace", match=MatchValue(value="")))
+    if refs:
+        should.append(FieldCondition(key="metadata.workspace", match=MatchAny(any=refs)))
+    return Filter(should=should)
+
+
 class SearchMixin:
     """SearchMixin for MemoryService (mechanical split — see memory_service.py)."""
 
@@ -157,17 +191,11 @@ class SearchMixin:
         if concepts:
             must.append(FieldCondition(key="metadata.concepts", match=MatchAny(any=concepts)))
 
-        # Workspace filter (WT6): default to memory type only (reference fenced out).
-        # Explicit workspaces list opens the door to reference content. For now,
-        # simple implementation: filter post-retrieval if needed. A future optimization
-        # can use Qdrant's should/must filter combinations.
-        # When workspaces=None or ["memory"], exclude any rows with non-memory workspace.
-        effective_workspaces = workspaces if workspaces is not None else ["memory"]
-        if effective_workspaces == ["memory"]:
-            # Memory-only: exclude rows with a non-None, non-"memory" workspace.
-            # This is done post-retrieval for simplicity (Qdrant's filter syntax
-            # doesn't cleanly express "IsEmpty OR IsNull OR MatchValue('memory')").
-            pass  # Applied as post-filter below
+        # Workspace filter (WT6): in the Qdrant filter, so the pool is cut to the
+        # requested workspaces before ``limit``. The per-hit check below stays
+        # as defence in depth.
+        effective_workspaces = _effective_workspaces(workspaces)
+        must.append(_workspace_filter(effective_workspaces))
 
         # qdrant-client v1.13+ removed `.search()` in favor of `.query_points()`;
         # the response wraps hits in a `.points` attribute.
@@ -355,6 +383,10 @@ class SearchMixin:
         if concepts:
             must.append(FieldCondition(key="metadata.concepts", match=MatchAny(any=concepts)))
 
+        # Workspace filter (WT6): same Qdrant-side filter as the shared pool.
+        effective_workspaces = _effective_workspaces(workspaces)
+        must.append(_workspace_filter(effective_workspaces))
+
         qfilter = Filter(must=must, must_not=must_not)
         result = client.query_points(
             collection_name=settings.qdrant_collection,
@@ -370,9 +402,6 @@ class SearchMixin:
         lexical_hits = self._lexical_pool_hits(m, query, qfilter, limit)
         fused = _rrf_fuse(dense_hits, lexical_hits, limit)
         dense_floor = _dense_score_floor(dense_hits)
-
-        # Workspace filter (WT6): same post-retrieval filter as shared pool
-        effective_workspaces = workspaces if workspaces is not None else ["memory"]
 
         out: list[MemoryResponse] = []
         pool_keys = _fused_order_keys(fused, dense_hits)
@@ -489,6 +518,7 @@ class SearchMixin:
                     visibility=visibility,
                     include_shared=include_shared,
                     include_episodes=settings.graph_episode_recall_enabled,
+                    workspaces=workspaces,
                 )
             except Exception as e:
                 logger.warning(f"Graph search submit failed (non-critical): {e}")
@@ -1191,6 +1221,7 @@ class SearchMixin:
         visibility: str | None,
         include_shared: bool,
         include_episodes: bool = False,
+        workspaces: list[str] | None = None,
     ) -> dict:
         """search_graph with multi-user visibility scoping.
 
@@ -1227,6 +1258,15 @@ class SearchMixin:
         else:
             # Default: full read-set (caller's private + shared + standard).
             group_ids = _get_group_ids(user_id, project_id)
+
+        # Workspace partition (WT6): reference workspaces live in groups named
+        # ``<base>--ws--<workspace>`` (see groups._build_group_id). Derive them
+        # only from the caller's own readable base groups, so a workspace name
+        # can never widen who may read. Default (None) is unchanged.
+        if workspaces:
+            refs = [w for w in workspaces if w != "memory"]
+            ws_groups = [f"{g}--ws--{w}" for g in group_ids for w in refs]
+            group_ids = (group_ids if "memory" in workspaces else []) + ws_groups
 
         return self._do_graph_search(
             query=query, group_ids=group_ids, limit=limit, include_episodes=include_episodes
