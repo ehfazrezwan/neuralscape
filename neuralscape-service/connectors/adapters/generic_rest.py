@@ -69,12 +69,14 @@ class GenericRestAdapter(ConnectorAdapter):
             ext_id = item.get(id_field)
             if ext_id is None:
                 continue
+            revision = _dig(item, self.config.get("revision_field"))
             resources.append(
                 ConnectorResource(
                     external_id=str(ext_id),
                     title=_dig(item, self.config.get("title_field")),
                     url=_dig(item, self.config.get("url_field")),
-                    revision=_dig(item, self.config.get("revision_field")) and str(_dig(item, self.config.get("revision_field"))),
+                    # ``is not None``: a numeric revision of 0 is still a revision.
+                    revision=str(revision) if revision is not None else None,
                     raw=item,
                 )
             )

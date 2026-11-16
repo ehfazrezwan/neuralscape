@@ -21,7 +21,9 @@ Everything is signed with the existing ``NEURALSCAPE_USER_TOKEN_SECRET`` via
 ``tokens.sign_payload`` and distinguished by a ``typ`` claim:
 
 * ``typ="client"``  → the Dynamic-Client-Registration ``client_id`` itself
-  (encodes the registered ``redirect_uris``; no server-side client store).
+  (encodes the registered ``redirect_uris`` plus a random ``jti`` so every
+  registration is a distinct client; no server-side client store. Client ids
+  issued before the ``jti`` existed still decode).
 * ``typ="code"``    → an authorization code (encodes user_id, client_id,
   redirect_uri, PKCE challenge; ~5 min TTL; single-use via Redis).
 * ``typ="access"``  → the Bearer access token. Identical in shape to an
@@ -358,8 +360,17 @@ async def register(request: Request) -> JSONResponse:
         )
 
     issued_at = int(time.time())
+    # A random jti makes every registration a distinct client. Without it the
+    # signed client_id was a pure function of (redirect_uris, issue second), so
+    # two registrations with the same redirect URIs in the same second got the
+    # SAME client_id and could redeem each other's codes and refresh tokens.
     client_id = sign_payload(
-        {"typ": "client", "redirect_uris": redirect_uris, "iat": issued_at},
+        {
+            "typ": "client",
+            "redirect_uris": redirect_uris,
+            "iat": issued_at,
+            "jti": secrets.token_urlsafe(12),
+        },
         _secret(),
     )
     return JSONResponse(
@@ -964,9 +975,14 @@ async def token(
         bound_client = claims.get("client_id")
         if not all(isinstance(v, str) and v for v in (jti, fam, bound_client)):
             return _token_error("invalid_grant", "refresh_token is invalid or expired")
-        # Checked before consuming so a wrong client cannot burn the real
-        # client's token. Compare bytes: compare_digest rejects non-ASCII str.
-        if not client_id or not secrets.compare_digest(
+        # The refresh token is bound to the client it was issued to. A public
+        # client MAY omit client_id on the refresh grant (RFC 6749 3.2.1 and 6;
+        # OAuth 2.1 4.3.1); the bound client then continues the session. When a
+        # client_id IS sent it must match exactly, checked before consuming so a
+        # wrong client cannot burn the real client's token. Compare bytes:
+        # compare_digest rejects non-ASCII str. (Requiring client_id would add
+        # no security for a public client: client_id is not a secret.)
+        if client_id and not secrets.compare_digest(
             bound_client.encode("utf-8"), client_id.encode("utf-8")
         ):
             return _token_error("invalid_grant", "client mismatch")
@@ -1000,6 +1016,7 @@ async def token(
             except _ReplayGuardUnavailable:
                 return _guard_unavailable()
             return _token_error("invalid_grant", "refresh_token already used")
-        return _token_response(user_id, client_id, family=fam, src=claims.get("src"))
+        # Rotate within the client the token is bound to (client_id may be omitted).
+        return _token_response(user_id, bound_client, family=fam, src=claims.get("src"))
 
     return _token_error("unsupported_grant_type", f"grant_type '{grant_type}' not supported")

@@ -588,6 +588,20 @@ async def _enqueue_delete_sibling_jobs(deleted) -> None:
 # ── Apply primitives (Qdrant + graph) ───────────────────────────────
 
 
+def _encode_sparse_with_retry(vs, text: str, attempts: int = 3):
+    """``vs._encode_bm25`` (swallows its own errors, returns None) with a short retry."""
+    import time
+
+    for i in range(attempts):
+        sparse = vs._encode_bm25(text)
+        if sparse is not None:
+            return sparse
+        if vs._get_bm25_encoder() is None:
+            return None  # permanently unavailable: retrying cannot help
+        time.sleep(0.2 * (i + 1))
+    return None
+
+
 def _rewrite_content(
     service,
     memory_id: str,
@@ -623,9 +637,11 @@ def _rewrite_content(
     calls, so a failure part-way leaves a partly updated row (for example a
     new undo stash with the old text). Every step only adds or replaces keys
     this rewrite owns, so a retry (the sweep re-flags the row) converges and
-    nothing another writer set is ever overwritten. If no BM25 encoder is
-    available the row's sparse vector is deleted rather than left matching
-    the old text.
+    nothing another writer set is ever overwritten. If the BM25
+    encoder fails on the new text (after retries) the rewrite is refused
+    before any write; if the encoder is permanently unavailable the row's
+    sparse vector is dropped. A sparse vector derived from the old text is
+    never left on a rewritten row.
     """
     from config import settings as core_settings
 
@@ -679,19 +695,25 @@ def _rewrite_content(
 
     drop_stale_bm25 = False
     if getattr(vs, "_has_bm25_slot", False) is True:
-        named: dict = {"": dense}
-        sparse = vs._encode_bm25(new_content)
-        if sparse is not None:
-            named["bm25"] = sparse
-        else:
-            # No encoder: the OLD text's sparse vector must not keep the row
-            # keyword-findable by words it no longer contains (privacy).
+        sparse = _encode_sparse_with_retry(vs, new_content)
+        if sparse is None and vs._get_bm25_encoder() is not None:
+            # The encoder exists but failed on this text (transient). Writing
+            # now would either drop the row's lexical leg or leave the OLD
+            # text's sparse vector: refuse BEFORE any write. The row stays
+            # consistent (old text, old vectors), the action is reported as an
+            # error, and the next sweep retries.
+            raise RuntimeError(f"bm25 encoding failed for {memory_id}; rewrite not applied")
+        vector: object = {"": dense, "bm25": sparse} if sparse is not None else {"": dense}
+        if sparse is None:
+            # Encoder permanently unavailable: lexical recall is already dead
+            # for every row (new writes get no sparse vector either). Drop this
+            # row's sparse vector below rather than leave one derived from the
+            # OLD text, which the rewrite may have removed on purpose.
             drop_stale_bm25 = True
             logger.warning(
-                "BM25 encoding unavailable for rewrite of %s; dropping its sparse vector",
-                memory_id,
+                "BM25 encoder unavailable; rewrite of %s updates the dense vector "
+                "and drops its stale sparse vector", memory_id,
             )
-        vector = named
     else:
         vector = dense
 
