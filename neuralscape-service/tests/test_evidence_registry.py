@@ -221,10 +221,12 @@ def test_required_baseline_areas_each_have_an_expected_failure_and_a_control() -
         "backup": ("backup-covers-compose-volumes", "backup-volume-controls"),
         "job-key": ("job-key-store-scope-control", "job-key-raw-options-control", "job-key-controls"),
     }
+    # Areas still listed above whose defect has been fixed: the scenario that
+    # used to be the expected failure is now a control too.
+    fixed_in_place = {"identity"}
     by_id = {s.id: s for s in SCENARIOS}
-    fixed_areas = {"identity"}  # defect fixed: its scenario is now a control
     for area, (failure, control) in areas.items():
-        assert by_id[failure].kind == ("control" if area in fixed_areas else "expected-failure"), area
+        assert by_id[failure].kind == ("control" if area in fixed_in_place else "expected-failure"), area
         assert by_id[control].kind == "control", area
     for area, ids in fixed.items():
         for scenario_id in ids:
