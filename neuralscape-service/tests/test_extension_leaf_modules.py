@@ -26,6 +26,12 @@ def test_manifest_loads_and_validates(ext):
     assert isinstance(m.hooks, list)
 
 
+def test_dreaming_manifest_exact_values():
+    m = ExtensionManifest(**json.loads((EXT / "dreaming" / "manifest.json").read_text(encoding="utf-8")))
+    assert (m.name, m.version, m.author) == ("dreaming", "0.2.0", "Neuralscape")
+    assert m.description.startswith("Background memory consolidation:") and "humane vault" in m.description
+
+
 def test_cron_driven_extensions_declare_no_event_hooks():
     for ext in ("dreaming", "strategy_synthesizer"):
         assert ExtensionManifest(**json.loads((EXT / ext / "manifest.json").read_text())).hooks == []
@@ -79,6 +85,7 @@ class TestCompilerSettings:
 
         s = CompilerSettings(_env_file=None)
         assert (s.obsidian_vault_path, s.compile_after_hour, s.auto_compile) == ("/data/vault", 18, True)
+        assert s.neuralscape_url == "http://localhost:8199" and s.compiler_llm_model == ""
         assert s.get_llm_model("fallback-model") == "fallback-model"
 
     def test_env_overrides_and_configured_model_wins(self, monkeypatch):
@@ -109,7 +116,8 @@ class TestCompilerSettings:
         from extensions.conversation_compiler.config import CompilerSettings
 
         monkeypatch.setenv("SOMETHING_ELSE", "1")
-        CompilerSettings(_env_file=None)
+        settings = CompilerSettings(_env_file=None, not_a_field="x")      # an unknown field through the real input path
+        assert not hasattr(settings, "not_a_field") and settings.auto_compile is True
 
 
 # ── conversation_compiler schemas ──
@@ -122,7 +130,7 @@ class TestCompilerSchemas:
         ok = FlushRequest(user_message="hi", assistant_response="yo", session_id="s", user_id="alice")
         assert ok.channel == "api" and ok.project_id is None
         for bad in ({"user_message": ""}, {"assistant_response": ""}, {"session_id": ""}, {"user_id": ""},
-                    {"user_message": "x" * 50001}, {"channel": "c" * 51}, {"user_id": "u" * 101}):
+                    {"user_message": "x" * 50001}, {"channel": "c" * 51}, {"user_id": "u" * 101}, {"session_id": "s" * 201}):
             with pytest.raises(ValidationError):
                 FlushRequest(**{"user_message": "hi", "assistant_response": "yo", "session_id": "s", "user_id": "alice", **bad})
 
@@ -208,7 +216,8 @@ class TestDreamingPrompts:
         from extensions.dreaming.prompts import parse_json_object, parse_json_response
 
         assert parse_json_response(raw, key="actions") == []
-        assert parse_json_object(raw) in ({}, {"actions": "oops"}, {"other": []})
+        expected = {'{"actions": "oops"}': {"actions": "oops"}, '{"other": []}': {"other": []}}.get(raw, {})
+        assert parse_json_object(raw) == expected
 
     def test_non_dict_items_are_dropped(self):
         from extensions.dreaming.prompts import parse_json_response
@@ -234,6 +243,12 @@ class TestPlaybookRenderer:
         assert playbook_page_path(tmp_path, "###", "S1") == tmp_path / "shared" / "s1.md"   # unusable owner slug
         assert playbook_page_path(tmp_path, "alice", "!!!") is None                        # unusable strategy slug
 
+    def test_rel_path_falls_back_to_shared_for_an_empty_or_unusable_owner(self):
+        from extensions.strategy_synthesizer.playbook_renderer import playbook_rel_path
+
+        assert playbook_rel_path("", "S1") == "Playbooks/shared/s1.md"
+        assert playbook_rel_path("###", "S1") == "Playbooks/shared/s1.md"
+
     def test_rel_path_matches_the_absolute_layout(self, tmp_path):
         from extensions.strategy_synthesizer.playbook_renderer import playbook_page_path, playbook_rel_path
 
@@ -248,12 +263,15 @@ class TestPlaybookRenderer:
 
         now = datetime(2026, 5, 6, 12, 0, tzinfo=timezone.utc)
         page = render_page(strategy_name="Gap Fill", owner="alice", body="\n  Entry: gap > 2%.  \n", source_memory_ids=["m1", "m2"],
-                           version_number=3, source_count=2, now=now)
+                           version_number=3, source_count=7, now=now)
         fm, body = split_existing_page(page)
         assert fm["kind"] == "strategy_playbook" and fm["strategy_name"] == "Gap Fill" and fm["owner"] == "alice"
-        assert fm["version_number"] == "3" and fm["source_count"] == "2" and fm["source_memory_ids"] == "[m1, m2]"
+        assert fm["version_number"] == "3" and fm["source_count"] == "7" and fm["source_memory_ids"] == "[m1, m2]"
+        assert fm["title"] == "Gap Fill"
         assert fm["last_synthesized"] == now.isoformat()
         assert body.startswith("# Gap Fill — Playbook") and body.rstrip().endswith("Entry: gap > 2%.")
+        # the body is stripped: no leading/trailing whitespace around it in the page
+        assert "# Gap Fill — Playbook\n\nEntry: gap > 2%.\n" in page and "  Entry" not in page and "2%.  " not in page
 
     def test_owner_defaults_to_shared_and_empty_ids_render_as_an_empty_list(self):
         from extensions.strategy_synthesizer.playbook_renderer import render_page, split_existing_page
@@ -276,6 +294,40 @@ class TestPlaybookRenderer:
         write_page(target, "one")
         write_page(target, "two")
         assert target.read_text() == "two" and not list(target.parent.glob("*.tmp*"))
+
+    def test_write_page_goes_through_a_temp_file_and_a_rename(self, tmp_path, monkeypatch):
+        import extensions.conversation_compiler.obsidian_writer as ow
+        from extensions.strategy_synthesizer.playbook_renderer import write_page
+
+        target = tmp_path / "Playbooks" / "alice" / "s.md"
+        write_page(target, "old")
+        renames = []
+        real = ow.os.rename
+
+        def spy(src, dst):
+            renames.append((Path(src), Path(dst), target.read_text()))
+            return real(src, dst)
+
+        monkeypatch.setattr(ow.os, "rename", spy)
+        write_page(target, "new")
+        (src, dst, seen), = renames
+        assert dst == target and src.parent == target.parent and src.suffix == ".tmp" and src != target
+        assert seen == "old"                       # the target still held the old page until the rename
+
+    def test_an_interrupted_write_leaves_the_old_page_and_no_temp_file(self, tmp_path, monkeypatch):
+        import extensions.conversation_compiler.obsidian_writer as ow
+        from extensions.strategy_synthesizer.playbook_renderer import write_page
+
+        target = tmp_path / "Playbooks" / "alice" / "s.md"
+        write_page(target, "old")
+
+        def boom(src, dst):
+            raise OSError("disk gone")
+
+        monkeypatch.setattr(ow.os, "rename", boom)
+        with pytest.raises(OSError):
+            write_page(target, "new")
+        assert target.read_text() == "old" and not list(target.parent.glob("*.tmp"))
 
 
 # ── adapters.trading package ──
