@@ -1237,6 +1237,15 @@ async def expire_old_memories_cron(ctx: dict) -> dict:
     """Cron job: purge memories whose expires_at is in the past (memory-model v2)."""
     service: MemoryService = ctx["service"]
     result = await asyncio.to_thread(service.expire_old_memories)
+    # Sibling facts that shared an expired row's conversation episode need a
+    # single-fact graph re-ingest (graph queue), like a bulk delete.
+    sibling_jobs = result.pop("graph_jobs", [])
+    if sibling_jobs:
+        result["graph_jobs_enqueued"] = await _enqueue_graph_jobs(ctx, sibling_jobs, None)
+    if result.get("graph_cascade_unresolved_ids"):
+        logger.warning(
+            f"Expiry cron: graph cleanup unresolved for {len(result['graph_cascade_unresolved_ids'])} expired memories"
+        )
     if result.get("deleted_count"):
         logger.info(f"Expiry cron: purged {result['deleted_count']} memories")
     return result
