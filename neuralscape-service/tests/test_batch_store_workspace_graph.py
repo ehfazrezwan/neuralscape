@@ -54,10 +54,10 @@ def test_same_text_in_two_workspaces_is_two_rows_not_a_batch_duplicate(service):
 
 def test_graph_jobs_replace_inline_enrichment(service):
     jobs: list[dict] = []
-    out = service.store_raw_batch(_items("ref-books"), graph_jobs=jobs)
+    out = service.store_raw_batch(_items("memory"), graph_jobs=jobs)
     service.enrich_graph.assert_not_called()
     assert [j["memory_id"] for j in jobs] == [m.id for m in out]
-    assert {j["workspace"] for j in jobs} == {"ref-books"}
+    assert {j["workspace"] for j in jobs} == {"memory"}
     assert all(j["user_id"] == "alice" and j["content"] and j["visibility"] for j in jobs)
 
 
@@ -127,7 +127,7 @@ async def test_enqueue_failure_falls_back_to_inline_enrichment_with_workspace_an
     def store(items, dedup_ids=None, graph_jobs=None):
         graph_jobs.append({
             "memory_id": "m1", "content": "batch fact", "user_id": "alice", "project_id": "p1",
-            "visibility": "shared", "source_ref": {"url": "x"}, "workspace": "ref-books",
+            "visibility": "shared", "source_ref": {"url": "x"}, "workspace": "memory",
             "occurred_at": OCCURRED,
         })
         return [MemoryResponse(id="m1", memory="batch fact", category="preference")]
@@ -135,11 +135,11 @@ async def test_enqueue_failure_falls_back_to_inline_enrichment_with_workspace_an
     ctx["service"].store_raw_batch.side_effect = store
     ctx["redis"].enqueue_job.side_effect = ConnectionError("redis down")
 
-    out = await worker.process_memory_raw_batch(ctx, _items("ref-books"))
+    out = await worker.process_memory_raw_batch(ctx, _items("memory"))
 
     assert out["graph_jobs_enqueued"] == 0
     kwargs = ctx["service"].enrich_graph.call_args.kwargs
-    assert kwargs["memory_id"] == "m1" and kwargs["workspace"] == "ref-books"
+    assert kwargs["memory_id"] == "m1" and kwargs["workspace"] == "memory"
     assert kwargs["occurred_at"] == OCCURRED  # the event time must not be lost on the fallback
     assert kwargs["source_ref"] == {"url": "x"} and kwargs["visibility"] == "shared"
 
@@ -199,3 +199,66 @@ def test_a_plain_duplicate_is_neither_enriched_nor_deferred(service, monkeypatch
     service.store_raw_batch(_items()[:1], dedup_ids=dedup_ids, graph_jobs=jobs)
     assert jobs == [] and dedup_ids == {survivor.id}
     service.enrich_graph.assert_not_called()
+
+
+# ── reference-workspace rows are vector-only (matches the raw single write) ──
+
+
+def _mixed():
+    base = {"user_id": "alice", "category": "preference"}
+    return [
+        {"content": "memory fact one", **base},
+        {"content": "reference passage one", "workspace": "ref-books", **base},
+        {"content": "memory fact two", "workspace": "memory", **base},
+        {"content": "reference passage two", "workspace": "ref-other", **base},
+    ]
+
+
+def test_a_mixed_batch_gives_graph_jobs_to_memory_rows_only(service):
+    jobs: list[dict] = []
+    out = service.store_raw_batch(_mixed(), graph_jobs=jobs)
+    assert len(out) == 4  # every row is stored
+    assert sorted(j["content"] for j in jobs) == ["memory fact one", "memory fact two"]
+    service.enrich_graph.assert_not_called()
+
+
+def test_a_mixed_batch_without_a_job_list_enriches_only_memory_rows_inline(service):
+    service.store_raw_batch(_mixed())
+    assert sorted(c.kwargs["content"] for c in service.enrich_graph.call_args_list) == [
+        "memory fact one", "memory fact two",
+    ]
+
+
+def test_a_revived_reference_duplicate_gets_no_job_and_no_inline_enrichment(service, monkeypatch):
+    monkeypatch.setattr(settings, "graph_supersession_enabled", True)
+    survivor = MemoryResponse(id="old-ref", memory="reference passage one", category="preference",
+                              visibility="private", workspace="ref-books")
+    service._find_by_content_hash = lambda **kw: survivor
+    service._bump_times_derived = MagicMock()
+    service._revive_if_tombstoned = MagicMock(return_value=True)
+    item = {"content": "reference passage one", "workspace": "ref-books", "user_id": "alice", "category": "preference"}
+
+    jobs: list[dict] = []
+    service.store_raw_batch([item], graph_jobs=jobs)
+    assert jobs == []
+    service.store_raw_batch([item])
+    service.enrich_graph.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_the_enqueue_failure_fallback_skips_reference_rows(ctx):
+    def store(items, dedup_ids=None, graph_jobs=None):
+        for mid, ws in (("m-mem", None), ("m-ref", "ref-books")):
+            graph_jobs.append({"memory_id": mid, "content": f"c-{mid}", "user_id": "alice", "project_id": None,
+                               "visibility": "private", "source_ref": None, "workspace": ws})
+        return [MemoryResponse(id="m-mem", memory="c-m-mem", category="preference")]
+
+    ctx["service"].store_raw_batch.side_effect = store
+    ctx["redis"].enqueue_job.side_effect = ConnectionError("redis down")
+
+    await worker.process_memory_raw_batch(ctx, _items())
+
+    enriched = [c.kwargs["memory_id"] for c in ctx["service"].enrich_graph.call_args_list]
+    assert enriched == ["m-mem"], "the reference row must not be enriched, even by the fallback"
+    queued = [c.args[1] for c in ctx["redis"].enqueue_job.call_args_list]
+    assert "m-ref" not in queued

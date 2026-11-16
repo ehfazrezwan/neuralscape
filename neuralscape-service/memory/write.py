@@ -1677,7 +1677,10 @@ class WriteMixin:
             if kind == "dup":
                 results.append(obj)
                 enriched_inline = bool(
-                    settings.graph_supersession_enabled and getattr(obj, "revived", None)
+                    settings.graph_supersession_enabled
+                    and getattr(obj, "revived", None)
+                    # reference-workspace rows are vector-only: never graph-enriched
+                    and getattr(obj, "workspace", None) in (None, "", "memory")
                 )
                 if dedup_ids is not None and not enriched_inline:
                     dedup_ids.add(obj.id)
@@ -1726,10 +1729,15 @@ class WriteMixin:
                 results.append(obj["response"])
                 continue
             try:
-                self._finalize_raw_store(obj, next(emb_iter), add_to_graph=graph_jobs is None)
+                # Reference-workspace rows are vector-only (no graph episode, no
+                # extraction LLM), inline or deferred.
+                graph_row = obj.get("workspace") in (None, "", "memory")
+                self._finalize_raw_store(
+                    obj, next(emb_iter), add_to_graph=graph_jobs is None and graph_row
+                )
                 finalized_mids.add(obj["mid"])
                 results.append(obj["response"])
-                if graph_jobs is not None:
+                if graph_jobs is not None and graph_row:
                     graph_jobs.append({
                         "memory_id": obj["mid"],
                         "content": obj["content"],

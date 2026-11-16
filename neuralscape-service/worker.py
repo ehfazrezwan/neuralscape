@@ -410,6 +410,9 @@ async def process_memory_raw_batch(ctx: dict, items: list[dict]) -> dict:
     memories = await asyncio.to_thread(
         service.store_raw_batch, items, dedup_ids=dedup_ids, graph_jobs=graph_jobs
     )
+    # Reference-workspace rows are vector-only: no job, no fallback (the store
+    # already leaves them out; this keeps the rule at the one place that enqueues).
+    graph_jobs = [j for j in graph_jobs if j.get("workspace") in (None, "", "memory")]
     graph_jobs_enqueued = await _enqueue_graph_jobs(ctx, graph_jobs, adapter=None)
 
     # Dedup survivors weren't re-enriched: queue the cheap stale-graph check
