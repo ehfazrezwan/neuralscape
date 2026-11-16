@@ -4,6 +4,17 @@ All notable changes to the `neuralscape` Claude plugin are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 the project adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.9.11] - 2026-11-16
+
+### Fixed
+- The `sync` skill hand-wrote curl for the conversation-compiler flush and compile calls: no Authorization header (a token-protected server answered 401) and no `<private>` handling, unlike the hooks. The `ingest` (binary upload) and `search` (REST fallback) skills required an explicit URL variable and ignored the URL baked into `.mcp.json`, so they refused on a default install. All three now call a bundled helper, `scripts/sync.js`, which resolves the URL the hooks' way (explicit `URL` option, then the baked `.mcp.json` URL, then `http://localhost:8199`), sends the `API_KEY` as a Bearer token, and redacts `<private>` text fail-closed before a turn leaves the machine.
+
+### Added
+- `scripts/sync.js` (source `src/hooks/sync.ts`): `print-config` (resolved URL and its source, whether a key is set, never the key), `flush`, `request <GET|POST> /v1/...` and `upload`. Subprocess tests cover the default-install config, the Authorization header on every call, and that private text never reaches a POST body.
+
+### Changed
+- README: the MCP tool count no longer says 8; it names the categories and gives 26 core tools plus 7 code-graph tools (when the server has the `code-graph` extra), as of 2.9.x. The skills' REST section describes the helper.
+
 ## [2.9.10] - 2026-11-16
 
 ### Fixed
