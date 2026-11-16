@@ -43,7 +43,6 @@ class Native:
     project: str
     repo_source: str
     index: dict = field(default_factory=dict)
-    deleted_nodes: int = 0
     error: str = ""
 
 
@@ -101,11 +100,9 @@ def test_index_pipeline_reports_an_unconfigured_repo_as_not_indexed(ctx, a, nati
 
     precondition(check, n.index, "the configured repo", what="the configured repo was indexed")
     r = a.post("/v1/code-graph/index", json={"repo_source": "/nowhere", "system": SYSTEM, "code_space": f"code--{ctx.user_a}--not-configured"})
-    if r.status_code == 202:  # accepted, then answered honestly by the worker ...
-        st = a.poll_task(r.json()["task_id"], timeout=300)
-        outcome = (st.get("result") or {}) if st.get("status") == "completed" else {"ok": False, "status": st.get("status"), "error": st.get("error")}
-    else:  # ... or refused up front: either way it was not indexed
-        outcome = {"ok": False, "http": r.status_code, "body": r.text[:120]}
+    # dev refuses an unconfigured repo up front: 400, never an accepted task
+    assert r.status_code == 400, f"POST /v1/code-graph/index for a repo not in CODE_REPOS -> {r.status_code} (want 400): {r.text[:160]}"
+    outcome = {"ok": False, "http": r.status_code, "body": r.text[:120]}
     expect_check_fails(check, outcome, "an unconfigured repo")  # the "it was indexed" check cannot pass for a repo that is not in CODE_REPOS
 
 
@@ -289,7 +286,11 @@ def test_fusion_check_fails_for_prose_recall_and_for_a_plain_list(ctx, a, mcp_a,
     n = _ready(native)
     mcp_a.initialize()
     coding = fused_recall(mcp_a, n.project, f"callers of `{SYMBOL}`")
-    assert isinstance(coding, dict) and coding.get("fused") is True, f"PRECONDITION FAILED (a coding query on the configured project fuses): {str(coding)[:200]}"
+
+    def fuses():
+        assert isinstance(coding, dict) and coding.get("fused") is True, f"not fused: {str(coding)[:200]}"
+
+    precondition(fuses, what="a coding query on the configured project fuses")
     prose = fused_recall(mcp_a, n.project, "what colour is the lighthouse lamp")  # no coding signal: the router keeps it base-only
     expect_check_fails(check_fused, prose, symbol=SYMBOL, marker="x")
     expect_check_fails(check_fused, [], symbol=SYMBOL, marker="x")
@@ -329,40 +330,79 @@ def test_anchor_check_fails_for_another_user(ctx, a, b, native: Native):
 
 
 # ── cold delete ──────────────────────────────────────────────────
+# The delete is destructive, so it runs against its OWN code space (indexed, anchored and deleted inside
+# one fixture, results recorded). The tests below only read what the fixture recorded, so nothing here
+# depends on test order and the main space stays intact for every other scenario.
+
+
+@dataclass
+class Deleted:
+    code_space: str
+    project: str
+    marker: str
+    before: str = ""
+    after: str = ""
+    response: dict = field(default_factory=dict)
+    again_status: int = 0
+    mcp_result: dict = field(default_factory=dict)
+    error: str = ""
+
+
+@pytest.fixture(scope="module")
+def deleted(ctx, a, mcp_a) -> Deleted:
+    d = Deleted(f"code--{ctx.user_a}-del--svc", f"{ctx.project_id}-del", f"zq-{ctx.run_id}-delanchor")
+    try:
+        r = a.post("/v1/code-graph/index", json={"repo_source": repo_source_of(ctx), "system": SYSTEM, "code_space": d.code_space})
+        assert r.status_code == 202, f"POST /v1/code-graph/index (delete fixture) -> {r.status_code}: {r.text[:200]}"
+        st = a.poll_task(r.json()["task_id"], timeout=INDEX_WAIT)
+        assert st.get("status") == "completed" and (st.get("result") or {}).get("ok") is True, f"delete fixture index ended as {st}"
+        fqn = check_located(cg_get(a, "locate", query=SYMBOL, graph_id=d.code_space, knowledge_system=SYSTEM, k=5), SYMBOL)["fqn"]
+        canonical = ".".join(p for i, p in enumerate(fqn.split(".")) if not (i == 0 and p in ("src", "lib")))
+        task = a.store_raw(
+            f"{d.marker} We keep resolve_systems side-effect free so the router can be called on every recall.", "decision",
+            scope="project", project_id=d.project, visibility="private",
+            source_ref={"connector_id": f"acc-{ctx.run_id}-delanchor", "connector_type": "file_upload", "external_id": f"svc::{canonical}"},
+        )
+        assert a.poll_task(task, timeout=120)["status"] == "completed", "the anchored memory was not stored"
+        d.before = cg_get(a, "query", question=SYMBOL, graph_id=d.code_space, knowledge_system=SYSTEM)["result"]
+        resp = a.delete("/v1/code-graph/graph", params={"graph_id": d.code_space, "system": SYSTEM})
+        d.response = {"status": resp.status_code, **(resp.json() if resp.status_code == 200 else {"text": resp.text[:200]})}
+        d.after = cg_get(a, "query", question=SYMBOL, graph_id=d.code_space, knowledge_system=SYSTEM)["result"]
+        d.again_status = a.delete("/v1/code-graph/graph", params={"graph_id": d.code_space, "system": SYSTEM}).status_code
+        mcp_a.initialize()
+        d.mcp_result = json.loads(mcp_text(mcp_a, "code_graph_delete", {"graph_id": d.code_space, "system": SYSTEM}))
+    except AssertionError as exc:
+        d.error = str(exc)
+    return d
+
+
+def _deleted(d: Deleted) -> Deleted:
+    assert not d.error, d.error
+    return d
 
 
 @proves("knowledge.code-graph-delete")
-def test_deleting_the_code_space_empties_it_and_keeps_the_memories(ctx, a, mcp_a, native: Native):
-    n = _ready(native)
-    before = cg_get(a, "query", question=SYMBOL, graph_id=n.code_space, knowledge_system=SYSTEM)["result"]
-    check_mentions(before, SYMBOL, "router.py")  # a located hit names its file; an empty answer only echoes the question
-    r = a.delete("/v1/code-graph/graph", params={"graph_id": n.code_space, "system": SYSTEM})
-    assert r.status_code == 200 and r.json().get("deleted") is True, f"DELETE /v1/code-graph/graph -> {r.status_code}: {r.text[:200]}"
-    assert r.json()["engine_result"]["nodes_deleted"] > 0, f"nothing was deleted from the indexed space: {r.json()}"
-    after = cg_get(a, "query", question=SYMBOL, graph_id=n.code_space, knowledge_system=SYSTEM)["result"]
-    n.deleted_nodes = r.json()["engine_result"]["nodes_deleted"]
-    expect_check_fails(check_mentions, after, "router.py")  # the graph is gone (an empty answer still echoes the symbol name)
-    anchored = [h for h in a.search(f"zq-{ctx.run_id}-anchor resolve_systems side-effect free", project_id=n.project) if f"zq-{ctx.run_id}-anchor" in h.get("memory", "")]
+def test_deleting_the_code_space_empties_it_and_keeps_the_memories(a, deleted: Deleted):
+    d = _deleted(deleted)
+    check_mentions(d.before, SYMBOL, "router.py")  # a located hit names its file; an empty answer only echoes the question
+    assert d.response.get("status") == 200 and d.response.get("deleted") is True, f"DELETE /v1/code-graph/graph: {d.response}"
+    assert d.response["engine_result"]["nodes_deleted"] > 0, f"nothing was deleted from the indexed space: {d.response}"
+    expect_check_fails(check_mentions, d.after, "router.py")  # the graph is gone (an empty answer still echoes the symbol name)
+    anchored = [h for h in a.search(f"{d.marker} resolve_systems side-effect free", project_id=d.project) if d.marker in h.get("memory", "")]
     assert anchored, "deleting the code graph deleted the memory anchored to it"
-    again = a.delete("/v1/code-graph/graph", params={"graph_id": n.code_space, "system": SYSTEM})
-    assert again.status_code == 200, f"second DELETE (idempotent) -> {again.status_code}"
-    mcp_a.initialize()
-    out = json.loads(mcp_text(mcp_a, "code_graph_delete", {"graph_id": n.code_space, "system": SYSTEM}))
-    assert "error" not in out, f"MCP code_graph_delete: {out}"
-
-
-def _positive_delete(n: Native) -> None:
-    assert n.deleted_nodes > 0, "the indexed space's delete removed no nodes (or its test did not run first)"
+    assert d.again_status == 200, f"second DELETE (idempotent) -> {d.again_status}"
+    assert "error" not in d.mcp_result, f"MCP code_graph_delete: {d.mcp_result}"
 
 
 @proves("knowledge.code-graph-delete")
 @negative_control
-def test_delete_check_fails_for_a_space_that_was_never_there(ctx, b, native: Native):
-    precondition(lambda: _positive_delete(native), what="deleting the indexed space removed nodes")
+def test_delete_check_fails_for_a_space_that_was_never_there(ctx, b, deleted: Deleted):
+    d = _deleted(deleted)
+
+    def check(response: dict):
+        assert response.get("status") == 200 and response["engine_result"]["nodes_deleted"] > 0, f"deleted something: {response}"
+
+    precondition(check, d.response, what="deleting the indexed space removed nodes")
     r = b.delete("/v1/code-graph/graph", params={"graph_id": f"code--{ctx.user_b}--svc", "system": SYSTEM})
     assert r.status_code == 200, f"DELETE of an unindexed space -> {r.status_code}"
-
-    def check():
-        assert r.json()["engine_result"]["nodes_deleted"] > 0, f"deleted something: {r.json()}"
-
-    expect_check_fails(check)
+    expect_check_fails(check, {"status": r.status_code, **r.json()})

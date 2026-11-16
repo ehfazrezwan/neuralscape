@@ -386,16 +386,36 @@ def test_a_negative_control_whose_precondition_fails_reports_the_precondition_no
 
 
 def test_every_negative_control_in_the_flag_scenarios_states_a_precondition():
-    import re as _re
+    """AST scan: each function decorated with negative_control must CALL precondition(...) (a comment or a
+    string cannot satisfy it). The framing control is exempt: it compares against an ordinary page."""
+    import ast
 
     flagged = ["test_dreaming", "test_standards", "test_connectors", "test_webhook", "test_code_graph", "test_code_graph_cbm",
                "test_oauth", "test_speaker", "test_exemplars"]
-    # controls that cannot state one: the framing check compares against an ordinary page (the product header is what is under test)
     exempt = {"test_frame_check_fails_for_a_page_without_the_headers"}
-    missing = []
+
+    def deco_name(d):
+        d = d.func if isinstance(d, ast.Call) else d
+        return d.id if isinstance(d, ast.Name) else getattr(d, "attr", "")
+
+    def calls_precondition(fn):
+        return any(isinstance(n, ast.Call) and deco_name(n.func) == "precondition" for n in ast.walk(fn))
+
+    missing, seen = [], 0
     for mod in flagged:
-        src = (ACCEPTANCE / "scenarios" / f"{mod}.py").read_text()
-        for m in _re.finditer(r"@negative_control\n(?:@[^\n]*\n)*def (test_\w+)\(.*?(?=\n@proves|\n@profiles|\n@needs|\n@negative_control|\Z)", src, _re.S):
-            if m.group(1) not in exempt and "precondition" not in m.group(0) and "PRECONDITION" not in m.group(0):
-                missing.append(f"{mod}::{m.group(1)}")
-    assert missing == [], f"negative controls without a precondition: {missing}"
+        tree = ast.parse((ACCEPTANCE / "scenarios" / f"{mod}.py").read_text())
+        for fn in [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)]:
+            if any(deco_name(d) == "negative_control" for d in fn.decorator_list):
+                seen += 1
+                if fn.name not in exempt and not calls_precondition(fn):
+                    missing.append(f"{mod}::{fn.name}")
+    assert seen > 20, f"scan found only {seen} negative controls"
+    assert missing == [], f"negative controls that never call precondition(): {missing}"
+
+
+def test_a_comment_or_string_does_not_satisfy_the_precondition_scan():
+    import ast
+
+    src = "@negative_control\ndef test_x():\n    # precondition(...)\n    s = 'precondition(x)'\n"
+    fn = ast.parse(src).body[0]
+    assert not any(isinstance(n, ast.Call) for n in ast.walk(fn))

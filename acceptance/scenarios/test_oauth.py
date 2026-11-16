@@ -220,7 +220,7 @@ def test_the_consent_page_offers_the_token_login_and_validates_the_request(ctx, 
     for needle in ('action="/oauth/authorize"', 'name="token"', f'value="{html.escape(client_id)}"', 'name="code_challenge"', "Connect Neuralscape"):
         assert needle in page.text, f"consent page lacks {needle!r}"
     # the stylesheet always defines .provider-btn, so look for an ELEMENT using it, or a link to a provider
-    assert not re.search(r"<(a|button)\b[^>]*class=\"[^\"]*\bprovider-btn\b", page.text), "token mode shows a provider button element"
+    assert not re.search(r"""<(a|button)\b[^>]*class=["'][^"']*\bprovider-btn\b""", page.text), "token mode shows a provider button element"
     assert "accounts.google.com/o/oauth2" not in page.text and "ns-google-btn" not in page.text, "token mode links to an identity provider"
     bad_cases = {
         "response_type": {**authorize_url_params(client_id, challenge, "s"), "response_type": "token"},
@@ -298,7 +298,7 @@ def test_an_authorization_code_redeems_once(login: Login):
 @proves("auth.oauth-server")
 def test_the_access_token_is_a_bearer_for_rest_and_mcp_and_identifies_the_user(ctx, a, login: Login):
     lg = _ok(login)
-    check_bearer_identifies(ctx.base_url, lg.tokens["access_token"], ctx.user_a, a, f"zq-{ctx.run_id}-oauth")
+    check_bearer_identifies(ctx.base_url, lg.tokens["access_token"], ctx.user_a, a, f"zq-{ctx.run_id}-bearerlogin")
     check_mcp_accepts(ctx.base_url, lg.tokens["access_token"])
 
 
@@ -306,8 +306,8 @@ def test_the_access_token_is_a_bearer_for_rest_and_mcp_and_identifies_the_user(c
 @proves("auth.oauth-server")
 @negative_control
 def test_bearer_check_fails_for_a_token_signed_with_the_wrong_secret(ctx, a, login: Login):
-    precondition(check_bearer_identifies, ctx.base_url, _ok(login).tokens["access_token"], ctx.user_a, a, f"zq-{ctx.run_id}-oauth00", what="a real access token identifies A")
-    expect_check_fails(check_bearer_identifies, ctx.base_url, ctx.bad_token, ctx.user_a, a, f"zq-{ctx.run_id}-oauth0")
+    precondition(check_bearer_identifies, ctx.base_url, _ok(login).tokens["access_token"], ctx.user_a, a, f"zq-{ctx.run_id}-bearerpre", what="a real access token identifies A")
+    expect_check_fails(check_bearer_identifies, ctx.base_url, ctx.bad_token, ctx.user_a, a, f"zq-{ctx.run_id}-bearerwrong")
 
 
 @profiles("flags-on")
@@ -316,7 +316,7 @@ def test_a_refresh_token_yields_a_working_access_token_for_the_same_user(ctx, a,
     lg = _ok(login)
     new = lg.refreshed
     assert new["access_token"] and new["access_token"] != lg.tokens["access_token"], "refresh returned the same access token"
-    check_bearer_identifies(ctx.base_url, new["access_token"], ctx.user_a, a, f"zq-{ctx.run_id}-oauth2")
+    check_bearer_identifies(ctx.base_url, new["access_token"], ctx.user_a, a, f"zq-{ctx.run_id}-bearerrefreshed")
 
 
 @profiles("flags-on")
