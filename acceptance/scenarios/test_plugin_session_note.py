@@ -76,7 +76,8 @@ def test_session_end_sends_one_structured_note_and_no_memories(ended: Ended):
         f"investigated {note.get('investigated')!r}"
     )
     assert note.get("completed"), "no 'completed' field"
-    assert posts[0].bearer == ended.s.token, "the note was not sent with the configured API key"
+    bearer_ok = posts[0].bearer == ended.s.token  # bool: a failing assert must not print either token
+    assert bearer_ok, "the note was not sent with the configured API key"
     marker = ended.s.sandbox.observations / f"{ended.s.session_id}.jsonl.ended"
     assert marker.is_file(), "SessionEnd left no 'session ended' marker next to the buffer"
 

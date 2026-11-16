@@ -28,7 +28,8 @@ def check_identity_on_the_wire(proxy: RecordingProxy, *, project: str, user: str
     assert len(asked) == 1, f"{len(asked)} context requests reached the configured URL (want 1)"
     call = asked[0]
     assert call.query.get("user_id") == [user], f"user_id sent: {call.query.get('user_id')}"
-    assert call.bearer == token, "the API_KEY option was not sent as the bearer token"
+    bearer_ok = call.bearer == token  # bool: a failing assert must not print either token
+    assert bearer_ok, "the API_KEY option was not sent as the bearer token"
     assert call.status == 200, f"the service answered {call.status} to the hook's own identity"
 
 

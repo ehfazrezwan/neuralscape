@@ -9,6 +9,8 @@ import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from . import guard
+
 # acceptance/nsaccept/hooks.py -> repo root is two levels above acceptance/
 REPO_ROOT = Path(os.environ.get("NS_REPO_ROOT") or Path(__file__).resolve().parents[2])
 DEFAULT_SCRIPTS_DIR = REPO_ROOT / "neuralscape-plugin" / "scripts"
@@ -79,6 +81,9 @@ def run_hook(
     call, removed afterwards). ``raw_stdin``: send this text instead of the
     JSON payload (malformed-input cases).
     """
+    # An empty URL makes the plugin fall back to its baked production URL, and a
+    # non-loopback one aims it at a real server: refuse both before spawning node.
+    guard.check(base_url, None)
     script = (scripts_dir or DEFAULT_SCRIPTS_DIR) / f"{name}.js"
     if not script.is_file():
         raise FileNotFoundError(f"hook script not found: {script}")

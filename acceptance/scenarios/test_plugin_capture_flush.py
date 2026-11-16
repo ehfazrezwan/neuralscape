@@ -190,7 +190,8 @@ def check_flush_body(cap: Captured, *, user_has: str, assistant_has: str, absent
     assert body.get("channel") == "claude-code", f"channel {body.get('channel')!r}"
     assert body.get("project_id") == cap.project, f"project_id {body.get('project_id')!r}"
     assert body.get("user_id") == user_id, f"user_id {body.get('user_id')!r}"
-    assert call.bearer == cap.session.token, "the flush was not sent with the configured API key"
+    bearer_ok = call.bearer == cap.session.token  # bool: a failing assert must not print either token
+    assert bearer_ok, "the flush was not sent with the configured API key"
     assert call.status == 202, f"/flush answered {call.status}"
 
 
