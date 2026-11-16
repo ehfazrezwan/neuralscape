@@ -200,14 +200,16 @@ class TestBm25Preserved:
         )
         assert result.errors and not result.applied
 
-    def test_encoder_permanently_unavailable_updates_dense_only_and_never_deletes(self):
+    def test_encoder_permanently_unavailable_drops_the_stale_sparse_vector(self):
         service, client, vs = _service(
-            {"m1": {"data": "old", "metadata": {}}}, bm25_slot=True, sparse=None
+            {"m1": {"data": "old secret text", "metadata": {}}}, bm25_slot=True, sparse=None
         )
+        client.vectors["m1"] = {"": [0.1] * 8, "bm25": SPARSE}  # derived from the OLD text
         vs._get_bm25_encoder = MagicMock(return_value=None)
         consolidate._rewrite_content(service, "m1", "new")
-        assert client.vectors["m1"] == {"": [0.25] * 8}
-        assert "delete_vectors" not in client.calls
+        assert client.vectors["m1"] == {"": [0.25] * 8}  # dense updated, old sparse gone
+        assert "delete_vectors" in client.calls
+        assert client.payloads["m1"]["data"] == "new"
 
     def test_stale_text_lemmatized_shadow_is_dropped(self):
         service, client, _ = _service(

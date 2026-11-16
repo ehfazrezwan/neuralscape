@@ -641,7 +641,9 @@ def _rewrite_content(
     this rewrite owns, so a retry (the sweep re-flags the row) converges and
     nothing another writer set is ever overwritten. If the BM25
     encoder fails on the new text (after retries) the rewrite is refused
-    before any write; a row's sparse vector is never dropped or left stale.
+    before any write; if the encoder is permanently unavailable the row's
+    sparse vector is dropped. A sparse vector derived from the old text is
+    never left on a rewritten row.
     """
     from config import settings as core_settings
 
@@ -693,6 +695,7 @@ def _rewrite_content(
 
     from qdrant_client.models import PointVectors
 
+    drop_stale_bm25 = False
     if getattr(vs, "_has_bm25_slot", False) is True:
         sparse = _encode_sparse_with_retry(vs, new_content)
         if sparse is None and vs._get_bm25_encoder() is not None:
@@ -704,7 +707,15 @@ def _rewrite_content(
             raise RuntimeError(f"bm25 encoding failed for {memory_id}; rewrite not applied")
         vector: object = {"": dense, "bm25": sparse} if sparse is not None else {"": dense}
         if sparse is None:
-            logger.warning("BM25 encoder unavailable; rewrite of %s updates the dense vector only", memory_id)
+            # Encoder permanently unavailable: lexical recall is already dead
+            # for every row (new writes get no sparse vector either). Drop this
+            # row's sparse vector below rather than leave one derived from the
+            # OLD text, which the rewrite may have removed on purpose.
+            drop_stale_bm25 = True
+            logger.warning(
+                "BM25 encoder unavailable; rewrite of %s updates the dense vector "
+                "and drops its stale sparse vector", memory_id,
+            )
     else:
         vector = dense
 
@@ -715,6 +726,10 @@ def _rewrite_content(
         collection_name=collection,
         points=[PointVectors(id=memory_id, vector=vector)],
     )
+    if drop_stale_bm25:
+        client.delete_vectors(
+            collection_name=collection, points=[memory_id], vector=["bm25"],
+        )
     if "text_lemmatized" in payload:
         # The lemmatized shadow of the OLD text would otherwise feed the
         # next BM25 re-encode (the store prefers it over ``data``).
