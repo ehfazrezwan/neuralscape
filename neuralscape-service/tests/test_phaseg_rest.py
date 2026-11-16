@@ -61,6 +61,13 @@ class TestKnowledgeSystemDispatch:
 
 
 class TestIndexTrigger:
+    @pytest.fixture(autouse=True)
+    def _code_repos(self, monkeypatch):
+        monkeypatch.setattr(
+            main.settings, "code_repos",
+            {"smallpy": "/repos/smallpy", "pallets-click": "/repos/pallets-click"},
+        )
+
     def test_index_enqueues_on_ingest_queue(self, client):
         enqueue = AsyncMock(return_value="ns-code-idx-1")
         with patch("adapters.code_graph.code_graph_available", return_value=True), \

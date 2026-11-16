@@ -154,6 +154,23 @@ class TestCBMImport:
         finally:
             tmp_path.unlink(missing_ok=True)
 
+    def test_validate_sqlite_rejects_unexpected_columns_clearly(self):
+        """Right tables, different columns (a real CBM store): clear error, no 'no such column'."""
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp:
+            tmp_path = Path(tmp.name)
+
+        try:
+            conn = sqlite3.connect(tmp_path)
+            conn.execute("CREATE TABLE nodes (id INTEGER PRIMARY KEY, label TEXT, qualified_name TEXT)")
+            conn.execute("CREATE TABLE edges (id INTEGER PRIMARY KEY, src INTEGER, dst INTEGER, type TEXT)")
+            conn.commit()
+            conn.close()
+
+            with pytest.raises(CBMImportError, match="lacks the columns this importer assumes"):
+                _validate_sqlite(tmp_path)
+        finally:
+            tmp_path.unlink(missing_ok=True)
+
     def test_validate_sqlite_not_a_database(self):
         """Reject non-SQLite file."""
         with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp:
