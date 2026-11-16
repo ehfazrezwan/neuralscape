@@ -1927,8 +1927,11 @@ class WriteMixin:
             seen_in_batch.add(batch_key)
 
             # Storage-level idempotency (audit 27 #21). visibility=None on
-            # purpose: conversation-path rows don't stamp metadata.visibility,
-            # so a visibility condition would never match them. workspace defaults
+            # purpose: the lookup is tier-agnostic, so it matches stamped rows
+            # and older rows that predate the stamp (rows written before
+            # owner/visibility stamping carry no metadata.visibility), and a
+            # private raw write dedups against a stamped extracted twin.
+            # workspace defaults
             # to None here (memory type) unless the caller overrode it.
             lookup_kwargs = dict(
                 user_id=user_id,
