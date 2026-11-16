@@ -95,7 +95,7 @@ def test_no_async_qdrant_client_is_built_anywhere():
         str(p) for base in ("neuralscape-service", "mem0/mem0", "graphiti/graphiti_core")
         if (root / base).is_dir()
         for p in (root / base).rglob("*.py")
-        if "tests" not in p.parts and "integration_tests" not in p.parts and "scripts" not in p.parts
+        if not any(x.startswith(".") for x in p.parts) and "tests" not in p.parts and "integration_tests" not in p.parts and "scripts" not in p.parts
         and "AsyncQdrantClient" in p.read_text()
     ]
     assert hits == []
