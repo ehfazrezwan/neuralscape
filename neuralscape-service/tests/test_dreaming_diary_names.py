@@ -379,3 +379,60 @@ def test_index_carries_no_diary_or_legacy_body_text(tmp_path):
     for text in ("LEGACY-BODY-SECRET", "PAGE-BODY-SECRET-V", "PAGE-BODY-SECRET-O", "## Dream", "Reflections"):
         assert text not in index, text
     assert legacy.name in index  # names are listed
+
+
+# ── Name length: the whole file name stays writable on a 255-byte filesystem ──
+
+WIDE = "user--" + "\U00020000" * 300          # 4-byte characters
+MIXED = "user--" + "é" * 40 + "\U00020000" * 40 + "x" * 40  # a 2-byte / 4-byte boundary
+
+
+def test_slug_is_capped_at_48_characters():
+    """The readability cap: dropping it lets an ASCII id grow a 100-char slug."""
+    name = reflect.diary_page_path(reflect.Path("/v/Dreams"), "p" * 100).name
+    slug = name[: -len(reflect.DIARY_SEP) - reflect.DIARY_DIGEST_LEN - len(".md")]
+    assert len(slug) == reflect.DIARY_SLUG_MAX_CHARS == 48
+
+
+@pytest.mark.parametrize("pool", [WIDE, MIXED, "user--" + "ab" * 400])
+def test_page_and_temp_names_fit_in_the_filename_limit(pool):
+    name = reflect.diary_page_path(reflect.Path("/v/Dreams"), pool).name
+    assert len(name.encode("utf-8")) <= reflect.DIARY_NAME_MAX_BYTES == 200
+    assert name.endswith(".md") and f"{reflect.DIARY_SEP}" in name
+    assert name.encode("utf-8").decode("utf-8") == name  # no character cut in half
+    stem = name[: -len(".md")]
+    temp = f".{stem}.abcdefgh.tmp"  # the shape tempfile.mkstemp gives _atomic_write
+    assert len(temp.encode("utf-8")) <= 255
+
+
+def test_the_byte_cap_alone_is_what_bounds_wide_ids():
+    """48 four-byte characters would be 192 slug bytes: the byte cap must bite."""
+    from extensions.conversation_compiler.obsidian_writer import _slugify
+
+    assert len(_slugify(WIDE)[:48].encode("utf-8")) > reflect.DIARY_SLUG_MAX_BYTES
+    name = reflect.diary_page_path(reflect.Path("/v/Dreams"), WIDE).name
+    digest = hashlib.sha256(WIDE.encode("utf-8")).hexdigest()[:32]
+    assert name.endswith(f"--{digest}.md")
+
+
+def test_wide_id_page_is_writable_and_indexed(tmp_path):
+    dreams = tmp_path / "Dreams"
+    assert _write(dreams, WIDE, "WIDE-TEXT") is not None
+    assert "WIDE-TEXT" in reflect.diary_page_path(dreams, WIDE).read_text()
+    refresh_bundle_indexes(tmp_path)
+    assert reflect.diary_page_path(dreams, WIDE).name in (dreams / "index.md").read_text()
+
+
+def test_unwritable_page_warns_with_the_digest_not_the_pool_text(tmp_path, monkeypatch, caplog):
+    from extensions.conversation_compiler import obsidian_writer
+
+    def boom(path, content):
+        raise OSError(36, "File name too long")
+
+    monkeypatch.setattr(obsidian_writer, "_atomic_write", boom)
+    pool = "user--secret-project-name"
+    with caplog.at_level("WARNING"):
+        assert _write(tmp_path / "Dreams", pool, "x") is None
+    digest = hashlib.sha256(pool.encode("utf-8")).hexdigest()[:32]
+    text = "\n".join(r.getMessage() for r in caplog.records if r.levelname == "WARNING")
+    assert digest in text and "secret-project-name" not in text
