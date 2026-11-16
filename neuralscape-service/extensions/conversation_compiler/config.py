@@ -35,11 +35,6 @@ class CompilerSettings(BaseSettings):
         description="Whether to auto-compile daily logs after compile_after_hour",
     )
 
-    neuralscape_url: str = Field(
-        default="http://localhost:8199",
-        description="NeuralScape API base URL (used for health checks only)",
-    )
-
     model_config = {
         "env_prefix": "",
         "env_file": ".env",

@@ -612,7 +612,7 @@ All settings are environment variables (loaded from `.env`):
 | `ARQ_JOB_TIMEOUT` | `300` | Max seconds per background task (5 min) |
 | `DEDUP_SIMILARITY_THRESHOLD` | `0.95` | Cosine similarity threshold for semantic dedup |
 | `DEDUP_BATCH_SIZE` | `100` | Qdrant scroll page size during dedup |
-| `DEDUP_CRON_HOURS` | `{0,6,12,18}` | Hours (UTC) when the dedup cron runs |
+| `DEDUP_CRON_HOURS` | `0,6,12,18` | Hours (UTC) when the dedup cron runs: comma list or JSON list; blank = default; `[]` disables it |
 
 ## Tests
 
