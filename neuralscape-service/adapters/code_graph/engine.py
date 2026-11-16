@@ -16,6 +16,16 @@ from dataclasses import dataclass
 from typing import Protocol
 
 
+# Code indexing is operator-side by design: the service reads repositories from
+# its own disk and nothing uploads or clones one. Errors and tool descriptions
+# reuse this wording.
+CODE_REPOS_REQUIREMENT = (
+    "The repository must be present on the NeuralScape server and mapped in the "
+    "server's CODE_REPOS setting (JSON object of repo name to directory, e.g. "
+    "CODE_REPOS='{\"myrepo\": \"/srv/repos/myrepo\"}')."
+)
+
+
 class EngineCapabilityError(Exception):
     """Raised when a CodeIntelEngine implementation lacks a requested capability."""
 

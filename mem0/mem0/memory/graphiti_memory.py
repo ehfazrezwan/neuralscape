@@ -77,26 +77,38 @@ def _create_llm_client(
         raise ValueError(f"Unsupported Graphiti LLM provider: {provider}")
 
 
-def _create_embedder(provider: str, model: str | None, api_key: str | None):
-    """Create a Graphiti embedder client based on provider name."""
+def _create_embedder(
+    provider: str,
+    model: str | None,
+    api_key: str | None,
+    embedding_dim: int | None = None,
+):
+    """Create a Graphiti embedder client based on provider name.
+
+    NEURALSCAPE PATCH: ``embedding_dim`` is passed explicitly. Without it the
+    config inherits Graphiti's ambient ``EMBEDDING_DIM`` env default (1024),
+    which nothing in the deployment sets, so the stored graph vector size was
+    an accident of the environment. ``None`` keeps that legacy behaviour.
+    """
+    dim_kwargs = {"embedding_dim": int(embedding_dim)} if embedding_dim else {}
     if provider == "gemini":
         from graphiti_core.embedder.gemini import GeminiEmbedder, GeminiEmbedderConfig
 
-        config = GeminiEmbedderConfig(api_key=api_key)
+        config = GeminiEmbedderConfig(api_key=api_key, **dim_kwargs)
         if model:
             config.embedding_model = model
         return GeminiEmbedder(config=config)
     elif provider == "openai":
         from graphiti_core.embedder.openai import OpenAIEmbedder, OpenAIEmbedderConfig
 
-        config = OpenAIEmbedderConfig(api_key=api_key)
+        config = OpenAIEmbedderConfig(api_key=api_key, **dim_kwargs)
         if model:
             config.embedding_model = model
         return OpenAIEmbedder(config=config)
     elif provider == "voyage":
         from graphiti_core.embedder.voyage import VoyageEmbedder, VoyageEmbedderConfig
 
-        config = VoyageEmbedderConfig(api_key=api_key)
+        config = VoyageEmbedderConfig(api_key=api_key, **dim_kwargs)
         if model:
             config.embedding_model = model
         return VoyageEmbedder(config=config)
@@ -277,6 +289,7 @@ class MemoryGraph:
             provider=graph_config.graphiti_embedder_provider,
             model=graph_config.graphiti_embedder_model,
             api_key=graph_config.graphiti_embedder_api_key,
+            embedding_dim=getattr(graph_config, "graphiti_embedding_dim", None),
         )
 
         # NEURALSCAPE PATCH: attach the optional decision client only when the
@@ -542,6 +555,10 @@ class MemoryGraph:
 
         Returns:
             list[dict]: List of {"source", "relationship", "destination"} triples.
+
+        Raises:
+            Exception: whatever the Graphiti bridge raised (never disguised as
+            an empty result).
         """
         self._ensure_indices()
         group_ids = self._get_group_ids(filters)
@@ -559,8 +576,11 @@ class MemoryGraph:
             logger.info(f"Graphiti search returned {len(results)} results")
             return results
         except Exception as e:
-            logger.error(f"Graphiti search failed: {e}")
-            return []
+            # NEURALSCAPE PATCH: a broken bridge must not look like an empty
+            # graph. Log with the traceback and let the caller decide whether
+            # to degrade.
+            logger.error(f"Graphiti search failed: {e}", exc_info=True)
+            raise
 
     def delete_all(self, filters):
         """Delete all graph data for a user/group via Graphiti.
@@ -591,6 +611,9 @@ class MemoryGraph:
 
         Returns:
             list[dict]: List of {"source", "relationship", "target"} triples.
+
+        Raises:
+            Exception: whatever the Graphiti bridge raised (see search()).
         """
         self._ensure_indices()
         group_ids = self._get_group_ids(filters)
@@ -620,5 +643,6 @@ class MemoryGraph:
             logger.info(f"Graphiti get_all returned {len(results)} relationships")
             return results
         except Exception as e:
-            logger.error(f"Graphiti get_all failed: {e}")
-            return []
+            # NEURALSCAPE PATCH: see search() — surface the failure.
+            logger.error(f"Graphiti get_all failed: {e}", exc_info=True)
+            raise
