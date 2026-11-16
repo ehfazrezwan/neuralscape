@@ -21,6 +21,16 @@ and then re-running ``store_raw`` (which will write the matching
 Usage:
     python scripts/migrate_graph_groups.py --owner ehfaz                    # dry-run
     python scripts/migrate_graph_groups.py --owner ehfaz --apply
+    python scripts/migrate_graph_groups.py --audit-delimiter-ids            # read-only
+
+``--audit-delimiter-ids`` (no Neo4j needed) lists the memories whose graph group
+id WOULD CHANGE when ``GRAPH_GROUP_ID_INJECTIVE_ENABLED`` is turned on. The old builder joined
+user / project / workspace with ``--``, so ids that themselves contain ``--``
+(or a ``.`` / other character outside ``[A-Za-z0-9_-]``, which Graphiti rejects) aliased
+other tuples' namespaces; those tuples are now named ``nsg1--<hex>``. Every other
+memory keeps its group id byte for byte, so only the listed rows need attention:
+their graph facts under the old (ambiguous) group should be re-enriched into the
+new group (edit the memory, or re-ingest it). The audit never writes anything.
 
 The script writes to Neo4j via direct Cypher (Graphiti's own driver),
 so the backend service does NOT need to be running.
@@ -37,11 +47,76 @@ if str(_SERVICE_DIR) not in sys.path:
     sys.path.insert(0, str(_SERVICE_DIR))
 
 
+def _legacy_group_id(visibility: str, owner: str, project: str | None, workspace: str | None) -> str:
+    """The pre-fix (delimiter-joined, non-injective) group id, for the audit only."""
+    if visibility == "standard":
+        base = f"standard--project--{project}" if project else "standard"
+    elif visibility == "shared":
+        base = f"shared--project--{project}" if project else "shared"
+    else:
+        base = f"user--{owner}--project--{project}" if project else f"user--{owner}"
+    return f"{base}--ws--{workspace}" if workspace and workspace != "memory" else base
+
+
+def changed_group_rows(points) -> list[dict]:
+    """Rows (Qdrant points) whose graph group id differs from the legacy name.
+
+    ``points`` is any iterable of objects with ``.id`` and ``.payload`` (a Qdrant
+    scroll result). Pure function: no I/O, so it is unit-testable with fakes.
+    """
+    from config import settings  # noqa: E402
+    from memory.groups import _build_group_id  # noqa: E402
+
+    rows: list[dict] = []
+    for pt in points:
+        payload = pt.payload or {}
+        meta = payload.get("metadata") or {}
+        if isinstance(meta.get("metadata"), dict):
+            meta = meta["metadata"]
+        visibility = meta.get("visibility") or "private"
+        owner = meta.get("owner_user_id") or payload.get("user_id") or ""
+        project = meta.get("project_id") or None
+        workspace = meta.get("workspace") or None
+        old = _legacy_group_id(visibility, owner, project, workspace)
+        # What GRAPH_GROUP_ID_INJECTIVE_ENABLED=true would name it: the real
+        # builder with the flag forced on (no parallel encoding rule here).
+        flag_was = settings.graph_group_id_injective_enabled
+        settings.graph_group_id_injective_enabled = True
+        try:
+            new = _build_group_id(visibility, owner, project, workspace)
+        finally:
+            settings.graph_group_id_injective_enabled = flag_was
+        if old != new:
+            rows.append({"id": str(pt.id), "owner": owner, "project_id": project,
+                         "workspace": workspace, "visibility": visibility,
+                         "old_group_id": old, "new_group_id": new})
+    return rows
+
+
+def audit_delimiter_ids(client, collection: str) -> list[dict]:
+    """Scroll the whole collection and return ``changed_group_rows`` over it."""
+    out: list[dict] = []
+    offset = None
+    while True:
+        points, offset = client.scroll(
+            collection_name=collection, limit=500, offset=offset,
+            with_payload=True, with_vectors=False,
+        )
+        out.extend(changed_group_rows(points))
+        if offset is None:
+            return out
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument(
+        "--audit-delimiter-ids",
+        action="store_true",
+        help="Read-only: list memories whose graph group id changed with the injective "
+             "group-id builder (ids containing '--', '.' or other characters outside [A-Za-z0-9_-]).",
+    )
+    parser.add_argument(
         "--owner",
-        required=True,
         help="The user_id every legacy group_id should be rewritten to belong to.",
     )
     parser.add_argument(
@@ -52,6 +127,23 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     from config import settings  # noqa: E402
+
+    if args.audit_delimiter_ids:
+        from qdrant_client import QdrantClient  # noqa: E402
+
+        client = QdrantClient(url=settings.qdrant_url) if settings.qdrant_url else QdrantClient(
+            path=str(Path(settings.qdrant_path).expanduser())
+        )
+        rows = audit_delimiter_ids(client, settings.qdrant_collection)
+        print(f"{len(rows)} memories have a changed graph group id.")
+        for r in rows:
+            print(f"  {r['id']}  {r['old_group_id']!r} -> {r['new_group_id']}")
+        if rows:
+            print("Re-enrich these memories so their graph facts live under the new group.")
+        return 0
+    if not args.owner:
+        parser.error("--owner is required (unless --audit-delimiter-ids)")
+
     from neo4j import GraphDatabase  # noqa: E402
 
     if not settings.neo4j_password:
