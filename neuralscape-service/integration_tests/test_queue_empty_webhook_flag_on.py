@@ -27,21 +27,26 @@ import pytest
 
 class _Sink:
     def __init__(self, redirect_to: str | None = None):
-        self.bodies: list[dict] = []
+        self.bodies: list[dict] = []  # JSON bodies of the POSTs it accepted
+        self.methods: list[str] = []  # EVERY request it saw, of any method (a followed redirect would show as GET)
         sink = self
 
         class Handler(BaseHTTPRequestHandler):
-            def do_POST(self):  # noqa: N802
+            def _handle(self):
                 length = int(self.headers.get("Content-Length", 0))
-                raw = self.rfile.read(length)
+                raw = self.rfile.read(length) if length else b""
+                sink.methods.append(self.command)
                 if redirect_to:
                     self.send_response(302)
                     self.send_header("Location", redirect_to)
                     self.end_headers()
                     return
-                sink.bodies.append(json.loads(raw))
+                if self.command == "POST" and raw:
+                    sink.bodies.append(json.loads(raw))
                 self.send_response(200)
                 self.end_headers()
+
+            do_POST = do_GET = do_PUT = do_HEAD = _handle  # noqa: N815
 
             def log_message(self, *a):
                 pass
@@ -86,6 +91,10 @@ async def _run_one_job(stores, queue, user_id):
     redis_settings = RedisSettings.from_dsn(stores.redis_url)
     pool = await create_pool(redis_settings)
     job_id = f"it-wh-{uuid.uuid4().hex[:8]}"
+    leftovers = [
+        queue, f"{queue}:health-check", f"ns:task-user:{job_id}", f"arq:job:{job_id}",
+        f"arq:result:{job_id}", f"arq:retry:{job_id}", f"arq:in-progress:{job_id}",
+    ]
     try:
         await pool.set(f"ns:task-user:{job_id}", user_id, ex=300)
         await pool.enqueue_job("noop", _job_id=job_id, _queue_name=queue)
@@ -94,13 +103,14 @@ async def _run_one_job(stores, queue, user_id):
             redis_settings=redis_settings,
             queue_name=queue,
             burst=True,
+            keep_result=0,  # leave no result key behind
             handle_signals=False,
             after_job_end=ns_worker._make_after_job_end(queue),
         )
         await w.main()
         await w.close()
     finally:
-        await pool.delete(f"ns:task-user:{job_id}")
+        await pool.delete(*leftovers)  # every key this run could have created
         await pool.aclose()
     return job_id
 
@@ -139,8 +149,12 @@ def test_redirects_are_not_followed():
     redirector = _Sink(redirect_to=target.url)
     try:
         assert webhooks.fire_queue_empty(redirector.url, {"event": "queue.empty"}) is True
-        time.sleep(2.0)
-        assert target.bodies == [], "the webhook followed a redirect to another host"
+        end = time.time() + 10
+        while time.time() < end and not redirector.methods:
+            time.sleep(0.1)
+        time.sleep(1.0)  # room for a (wrongly) followed redirect to arrive
+        assert redirector.methods == ["POST"], "the webhook was not delivered to the redirecting endpoint"
+        assert target.methods == [], f"the webhook followed a redirect: the target saw {target.methods}"
     finally:
         target.close()
         redirector.close()

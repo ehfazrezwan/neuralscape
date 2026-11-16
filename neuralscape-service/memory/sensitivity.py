@@ -27,9 +27,10 @@ that is paraphrased without any of the words above (``"the household takes home
 roughly eighty-five thousand a year after tax"``) is NOT caught by default. The
 optional LLM hint (a trailing ``(sensitivity: <class>)`` tag on an extracted
 fact) is only ever REQUESTED by the speaker-aware extraction prompt, i.e. when
-``EXTRACTION_REQUIRE_SPEAKER`` is on; with the default legacy prompt production
-coverage is this regex floor alone. The hint can only add a class, never remove
-one the regex found.
+``EXTRACTION_REQUIRE_SPEAKER`` is on. The default legacy prompt never asks for
+it, so by default the model emits no tag and coverage is this regex floor; a tag
+a model emits anyway is still honoured (the parser accepts it on either prompt).
+The hint can only add a class, never remove one the regex found.
 """
 
 import re
