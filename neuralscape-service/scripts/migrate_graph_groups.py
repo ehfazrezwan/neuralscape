@@ -32,6 +32,16 @@ memory keeps its group id byte for byte, so only the listed rows need attention:
 their graph facts under the old (ambiguous) group should be re-enriched into the
 new group (edit the memory, or re-ingest it). The audit never writes anything.
 
+Relationship to ``scripts/migrate-group-ids.cypher`` (repo root): that file is
+a plain cypher-shell alternative that ALSO handles the ``project:{pid}`` shape
+(mem0's Graphiti adapter fallback) and Saga nodes, and takes an explicit
+``target_prefix``. For ``project--{pid}`` rows the two agree when that file is
+run with ``target_prefix => 'user--<owner>--project--'`` (this script's
+``--owner`` mapping). Use this script for ``global`` and ``project--`` rows with
+its dry-run default; use the cypher file for ``project:`` rows, or to send
+legacy rows to the shared pool (``'shared--project--'``). Do not run both over
+the same rows: once one rewrites a row the other no longer matches it.
+
 The script writes to Neo4j via direct Cypher (Graphiti's own driver),
 so the backend service does NOT need to be running.
 """
