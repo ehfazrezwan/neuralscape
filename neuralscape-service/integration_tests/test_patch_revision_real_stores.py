@@ -188,6 +188,10 @@ def test_rest_route_answers_409_for_a_stale_revision_and_enqueues_nothing(world,
 
     monkeypatch.setattr(settings, "neuralscape_api_key", "")
     monkeypatch.setattr(settings, "neuralscape_user_token_secret", "")
+    # Auth is fail-closed: with no credential configured the middleware answers EVERY non-public request
+    # (the first GET below) with 503 AUTH_NOT_CONFIGURED unless the operator opt-out is explicit. The unit
+    # suite's autouse fixture sets it; integration_tests/ has none, so this test must say it itself.
+    monkeypatch.setattr(settings, "neuralscape_auth_disabled", True)
     queue = f"ns-test-patchrev-{uuid.uuid4().hex[:8]}"
     loop = asyncio.new_event_loop()
     pool = loop.run_until_complete(create_pool(parse_redis_settings(), default_queue_name=queue))
