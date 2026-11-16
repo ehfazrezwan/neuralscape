@@ -28,6 +28,7 @@ ALL_STAGES = frozenset({"builder", "runtime", "test"})
 EXPECTED_STAGES: dict[str, frozenset[str]] = {
     "docs": frozenset(),  # documentation only; never read by code or tests in the image
     "tests": frozenset({"test"}),  # the unit suite runs only in the test stage
+    "integration_tests": frozenset({"test"}),  # run by the gate inside the test image; never shipped to production
     "scripts": frozenset({"runtime", "test"}),  # operator scripts; nothing is built from them
     "vendor": frozenset({"builder", "test"}),  # wheels installed into the venv the runtime copies
 }
