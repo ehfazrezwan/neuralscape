@@ -260,16 +260,45 @@ class CoreMixin:
         return self._genai_model
 
     def close(self):
-        """Clean up resources."""
+        """Clean up resources: Graphiti driver, bridge loop, Qdrant and embedder clients.
+
+        Idempotent (a second call is a no-op). The Qdrant and embedder client
+        closes never raise; a failure closing the Graphiti driver still
+        propagates, after everything else has been released.
+        """
+        if getattr(self, "_closed", False):
+            return
+        self._closed = True
         try:
             if self._graphiti and self._bridge:
                 self._bridge.run(self._graphiti.close())
         finally:
             # Stop the bridge loop AFTER the driver closed on it (even when that
             # close raised), so no task or driver outlives its loop.
-            shutdown = getattr(self._bridge, "shutdown", None)
-            if callable(shutdown):
-                shutdown()
+            try:
+                shutdown = getattr(self._bridge, "shutdown", None)
+                if callable(shutdown):
+                    shutdown()
+            finally:
+                self._close_http_clients()
+
+    def _close_http_clients(self) -> None:
+        """Best-effort close of the Qdrant client, the embedder's HTTP client and mem0's
+        own resources (the SQLite history connection)."""
+        memory = self._memory
+        if memory is None:
+            return
+        closers = [
+            getattr(getattr(getattr(memory, "vector_store", None), "client", None), "close", None),
+            getattr(getattr(getattr(memory, "embedding_model", None), "client", None), "close", None),
+            getattr(memory, "close", None),  # mem0 Memory.close(): history SQLite connection
+        ]
+        for closer in closers:
+            if callable(closer):
+                try:
+                    closer()
+                except Exception as e:  # noqa: BLE001 - shutdown must not raise from here
+                    logger.debug("client close failed (ignored): %s", e)
 
     def _ensure_created_at_index(self) -> None:
         """Best-effort: ensure a DATETIME payload index on ``created_at``.
