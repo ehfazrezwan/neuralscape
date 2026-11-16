@@ -1632,6 +1632,11 @@ async def startup(ctx: dict) -> None:
 
     configure_logging(worker=True)
     logger.info("ARQ worker starting up...")
+    # First, so the healthcheck sees a beat as early as possible; the (sync)
+    # warm-up below is covered by the container's start_period.
+    from worker_liveness import start_heartbeat
+
+    start_heartbeat(ctx)
     service = MemoryService()
     service._get_memory()  # warm up connections
     from hybrid_inference import warmup_extraction
@@ -1665,6 +1670,9 @@ async def startup(ctx: dict) -> None:
 async def shutdown(ctx: dict) -> None:
     """Worker shutdown: close connections."""
     logger.info("ARQ worker shutting down...")
+    from worker_liveness import stop_heartbeat
+
+    await stop_heartbeat(ctx)
     registry = ctx.get("extension_registry")
     if registry:
         await registry.shutdown_all()

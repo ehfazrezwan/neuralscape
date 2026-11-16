@@ -503,3 +503,64 @@ def test_overlay_pinning_the_project_image_on_latest_never_pulls_it() -> None:
                 checked += 1
                 assert (spec or {}).get("pull_policy") == "never", (name, service)
     assert checked >= 8  # four services in each of the vps and deploy overlays
+
+
+# ── autoheal services need a real healthcheck ───────────────────────
+
+_AUTOHEAL_LABEL = "com.neuralscape.autoheal"
+_NOOP_RE = re.compile(r"sys\.exit\(\s*0\s*\)|^\s*(true|exit 0|:)\s*$")
+_WORKERS = ("neuralscape-worker", "neuralscape-graph-worker", "neuralscape-ingest-worker")
+
+
+def _has_autoheal(svc: dict) -> bool:
+    labels = svc.get("labels") or {}
+    if isinstance(labels, list):
+        labels = dict(str(i).partition("=")[::2] for i in labels)
+    return str(labels.get(_AUTOHEAL_LABEL, "")).strip("\"'").lower() == "true"
+
+
+def _check_cmd(svc: dict) -> str:
+    test = (svc.get("healthcheck") or {}).get("test") or []
+    if isinstance(test, str):
+        return test
+    return " ".join(str(t) for t in test[1:]) if test and test[0] in ("CMD", "CMD-SHELL") else " ".join(map(str, test))
+
+
+def test_no_autoheal_service_has_a_noop_healthcheck_in_any_compose_file() -> None:
+    if not _have_repo():
+        return
+    seen = 0
+    for combo in ((BASE,), (BASE, "docker-compose.vps.yml"), (BASE, "docker-compose.deploy.yml"), (BASE, "docker-compose.prod.yml")):
+        for name, svc in _services(*combo).items():
+            if not _has_autoheal(svc):
+                continue
+            seen += 1
+            cmd = _check_cmd(svc)
+            assert cmd.strip() and not _NOOP_RE.search(cmd), f"{combo}: {name} healthcheck is a no-op: {cmd!r}"
+    assert seen
+    # And no file at all carries the no-op, labelled or not.
+    for name in ALL_FILES:
+        for service, svc in _load(name).get("services", {}).items():
+            assert "sys.exit(0)" not in _check_cmd(svc), f"{name}: {service} has an always-healthy healthcheck"
+
+
+def test_every_worker_is_autohealed_with_the_heartbeat_check() -> None:
+    if not _have_repo():
+        return
+    for combo in ((BASE,), (BASE, "docker-compose.vps.yml"), (BASE, "docker-compose.deploy.yml"), (BASE, "docker-compose.prod.yml")):
+        services = _services(*combo)
+        for worker in _WORKERS:
+            svc = services[worker]
+            assert _has_autoheal(svc), f"{combo}: {worker} lacks the autoheal label"
+            assert "ns-worker.heartbeat" in _check_cmd(svc), f"{combo}: {worker} healthcheck ignores the heartbeat"
+            assert str(svc["healthcheck"].get("start_period", "0s")).rstrip("s") != "0"
+
+
+def test_helm_worker_liveness_probes_check_the_heartbeat() -> None:
+    chart = REPO_ROOT / "deploy" / "charts" / "neuralscape" / "templates"
+    if not chart.is_dir():
+        return
+    for name in ("worker", "graph-worker", "ingest-worker"):
+        text = (chart / f"{name}-deployment.yaml").read_text(encoding="utf-8")
+        assert "sys.exit(0)" not in text, f"{name}: no-op liveness probe"
+        assert "ns-worker.heartbeat" in text, f"{name}: probe ignores the heartbeat"

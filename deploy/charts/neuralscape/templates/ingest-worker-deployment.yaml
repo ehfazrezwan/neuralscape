@@ -39,12 +39,14 @@ spec:
             {{- include "neuralscape.ingestVolumeMount" . | nindent 12 }}
           resources:
             {{- toYaml .Values.ingestWorker.resources | nindent 12 }}
+          # Liveness only: the worker event loop touches the heartbeat file
+          # (worker_liveness.py); fail when it is missing or >120s old.
           livenessProbe:
             exec:
-              command: ["python", "-c", "import sys; sys.exit(0)"]
-            initialDelaySeconds: 30
+              command: ["python", "-c", "import os,sys,time; sys.exit(0 if time.time()-os.stat('/tmp/ns-worker.heartbeat').st_mtime<120 else 1)"]
+            initialDelaySeconds: 180
             periodSeconds: 30
-            timeoutSeconds: 5
+            timeoutSeconds: 10
             failureThreshold: 3
       volumes:
         - name: vault
