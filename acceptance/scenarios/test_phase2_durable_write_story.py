@@ -354,6 +354,9 @@ def test_blindness_check_fails_for_the_record_that_stays_shared(b, story):
         check_not_recalled(client, story.ctl, f"{story.ctl} harbour bell dusk")
         check_blind_by_id(client, story.ctl_id)
 
+    # the same check passes first for a principal that truly cannot see a record: B, on the narrowed one
+    check_not_recalled(b, story.new, story.q_new)
+    check_blind_by_id(b, story.memory_id)
     expect_check_fails(check_ctl_is_blind, b)
 
 

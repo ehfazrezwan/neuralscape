@@ -34,7 +34,7 @@ from nsaccept.mcp import MCPClient
 from nsaccept.redmark import expected_red
 
 from phase2_kit import (
-    DENIED, RED_MEMBERSHIP, RED_ONBOARDING_POLICY, RED_TENANT_CELLS, Step, bundle_text, call, check_recalled,
+    DENIED, RED_MEMBERSHIP, RED_TENANT_CELLS, Step, bundle_text, call, check_recalled,
     client_for, memory_id_of, okf_export,
 )
 
