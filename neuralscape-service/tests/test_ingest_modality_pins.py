@@ -108,7 +108,6 @@ def test_curly_apostrophes_are_normalised_in_both_directions():
     assert levels("Users should not share passwords.", "Users mustn’t share passwords.") == [INFERRED]
     assert levels("Users may register accounts.", "Users don’t need to register accounts.") == [EXPLICIT]
     assert levels("Users mustn’t share passwords.", "Users must not share passwords.") == [EXPLICIT]
-    assert levels("Users ʼneednʼnt register accounts today.", "Users must register accounts today.") == [INFERRED] or True
 
 
 # ── splitting ──
@@ -191,3 +190,28 @@ def test_a_tie_is_decided_for_any_obligation_clause_whatever_its_position():
                   "Staff must review the written summary.") == [EXPLICIT]
     assert levels("Staff should review the written summary. Staff must review the written summary.",
                   "Staff must review the written summary.") == [EXPLICIT]
+
+
+# ── each typographic apostrophe is normalised on its own ──
+
+CURLY = {"right single quote U+2019": "\u2019", "modifier letter apostrophe U+02BC": "\u02bc", "left single quote U+2018": "\u2018"}
+
+
+@pytest.mark.parametrize("char", list(CURLY.values()), ids=list(CURLY))
+def test_each_typographic_apostrophe_is_read_as_an_apostrophe(char):
+    assert levels("Users should not share passwords.", f"Users mustn{char}t share passwords.") == [INFERRED]
+    assert levels("Users may register accounts.", f"Users don{char}t need to register accounts.") == [EXPLICIT]
+    assert levels(f"Users mustn{char}t share passwords.", "Users must not share passwords.") == [EXPLICIT]
+
+
+# ── an obligation word in a LABEL does not make a soft value obligatory ──
+
+
+@pytest.mark.parametrize("label", ["Required", "Mandatory", "Requirement", "Must", "Obligatory"])
+def test_an_obligation_word_in_a_label_does_not_bless_a_soft_value(label):
+    assert levels(f"{label}: users should register accounts.", "Users must register accounts.") == [INFERRED]
+
+
+def test_a_label_obligation_with_a_plain_or_obligatory_value_stays_faithful():
+    assert levels("Required: wear badges at all times.", "Employees must wear badges at all times.") == [EXPLICIT]
+    assert levels("Required: employees must wear badges at all times.", "Employees must wear badges at all times.") == [EXPLICIT]

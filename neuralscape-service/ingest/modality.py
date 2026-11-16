@@ -106,7 +106,11 @@ class ModalitySource:
             for clause in _CLAUSE_SPLIT_RE.split(sentence):
                 stems = _stems(clause)
                 if stems:
-                    normative = has_obligation(clause) or _is_normative_form(clause)
+                    # An obligation word in a LABEL ("Required: users should register") says nothing
+                    # about the value after it: judge a "Label: value" clause by its value.
+                    m = _LABEL_VALUE_RE.match(clause)
+                    obligated = has_obligation(m["value"] if m and _SOFT_RE.search(m["value"]) else clause)
+                    normative = obligated or _is_normative_form(clause)
                     self.clauses.append((stems, normative))
 
     def check(self, fact: str) -> str:
