@@ -1693,6 +1693,7 @@ class WriteMixin:
         self,
         items: list[dict],
         dedup_ids: set[str] | None = None,
+        graph_jobs: list[dict] | None = None,
     ) -> list[MemoryResponse]:
         """Store multiple pre-categorized facts (memory-model v2).
 
@@ -1718,6 +1719,13 @@ class WriteMixin:
         ``dedup_ids`` is an optional OUTPUT set: the ids of pre-existing rows
         that content-hash dedup hit and that were NOT re-enriched inline, so
         the caller can enqueue the cheap stale-graph check for them.
+
+        ``graph_jobs`` is an optional OUTPUT list. When given, graph enrichment
+        is NOT run inline: one ``{memory_id, content, user_id, project_id,
+        visibility, source_ref, workspace}`` entry is appended per newly stored (or
+        revived) row for the caller to enqueue on the graph queue, as
+        ``process_memory_raw`` does. When None (the default) each new row is
+        graph-enriched inline, as before.
 
         Returns:
             List of MemoryResponse objects for successful items, input order.
@@ -1764,6 +1772,7 @@ class WriteMixin:
                     source_ref=item.get("source_ref"),
                     sensitivity_override=item.get("sensitivity_override", False),
                     category_evidence=item.get('category_evidence'),
+                    workspace=item.get("workspace"),
                 )
                 if existing is not None:
                     entries.append(("dup", existing))
@@ -1805,11 +1814,25 @@ class WriteMixin:
             if kind == "dup":
                 results.append(obj)
                 enriched_inline = bool(
-                    settings.graph_supersession_enabled and getattr(obj, "revived", None)
+                    settings.graph_supersession_enabled
+                    and getattr(obj, "revived", None)
+                    # reference-workspace rows are vector-only: never graph-enriched
+                    and getattr(obj, "workspace", None) in (None, "", "memory")
                 )
                 if dedup_ids is not None and not enriched_inline:
                     dedup_ids.add(obj.id)
-                if enriched_inline:
+                if enriched_inline and graph_jobs is not None:
+                    graph_jobs.append({
+                        "memory_id": obj.id,
+                        "content": obj.memory,
+                        "user_id": items[idx]["user_id"],
+                        "project_id": getattr(obj, "project_id", None),
+                        "visibility": getattr(obj, "visibility", None) or "private",
+                        "source_ref": getattr(obj, "source_ref", None),
+                        "workspace": getattr(obj, "workspace", None),
+                        "occurred_at": getattr(obj, "occurred_at", None),
+                    })
+                elif enriched_inline:
                     # Re-asserted fact revived a tombstoned row: it must reach
                     # Graphiti's contradiction engine again (this batch path
                     # enriches inline, like its new rows). Best-effort.
@@ -1843,9 +1866,25 @@ class WriteMixin:
                 results.append(obj["response"])
                 continue
             try:
-                self._finalize_raw_store(obj, next(emb_iter))
+                # Reference-workspace rows are vector-only (no graph episode, no
+                # extraction LLM), inline or deferred.
+                graph_row = obj.get("workspace") in (None, "", "memory")
+                self._finalize_raw_store(
+                    obj, next(emb_iter), add_to_graph=graph_jobs is None and graph_row
+                )
                 finalized_mids.add(obj["mid"])
                 results.append(obj["response"])
+                if graph_jobs is not None and graph_row:
+                    graph_jobs.append({
+                        "memory_id": obj["mid"],
+                        "content": obj["content"],
+                        "user_id": obj["user_id"],
+                        "project_id": obj["project_id"],
+                        "visibility": obj["effective_visibility"],
+                        "source_ref": obj["source_ref"],
+                        "workspace": obj.get("workspace"),
+                        "occurred_at": getattr(obj["response"], "occurred_at", None),
+                    })
             except Exception as e:
                 logger.warning(f"Batch item {idx} failed (continuing): {e}")
         logger.info(
