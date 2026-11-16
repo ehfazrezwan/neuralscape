@@ -66,9 +66,18 @@ class TestGraphPatcher:
         assert n == 3
         cypher, params = log[0]
         assert "n.memory_id IN $mids" in cypher and "strategy_playbook_path" in cypher
+        # both back-reference properties are SET (pins the clause, not just the parameters)
+        assert "n.strategy_playbook_path = $playbook_path" in cypher
+        assert "n.strategy_synthesized_at = $synthesized_at" in cypher
         assert params["mids"] == ["m1", "m2"]  # blanks dropped
         assert params["playbook_path"] == "Playbooks/alice/s.md"
         assert params["synthesized_at"] == when.isoformat()
+
+    def test_the_timestamp_defaults_to_now_in_utc(self):
+        svc, log = _service(record={"patched": 1})
+        _run(patch_playbook_path_by_memory_ids(svc, memory_ids=["m1"], playbook_path="p.md"))
+        stamp = datetime.fromisoformat(log[0][1]["synthesized_at"])
+        assert stamp.tzinfo is not None and abs((datetime.now(timezone.utc) - stamp).total_seconds()) < 60
 
     def test_no_ids_or_no_path_is_a_no_op(self):
         svc, log = _service(record={"patched": 1})
