@@ -447,6 +447,16 @@ class CoreMixin:
                 self._ensure_created_at_index()
             except Exception as e:  # noqa: BLE001
                 logger.debug(f"startup payload index ensure failed (non-fatal): {e}")
+            # Graphiti's Neo4j indices/constraints: otherwise built lazily on
+            # the first graph add/search, so a fresh database serves its first
+            # queries (and the label-scoped patch Cypher) without them.
+            # Idempotent; best-effort.
+            try:
+                ensure_graph = getattr(getattr(self._memory, "graph", None), "_ensure_indices", None)
+                if callable(ensure_graph):
+                    ensure_graph()
+            except Exception as e:  # noqa: BLE001
+                logger.debug(f"startup graph index ensure failed (non-fatal): {e}")
 
         thread = threading.Thread(target=_run, name="qdrant-index-ensure", daemon=True)
         self._index_ensure_thread = thread

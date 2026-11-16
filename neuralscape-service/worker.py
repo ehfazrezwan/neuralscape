@@ -1185,6 +1185,9 @@ async def process_graph_enrichment(
 
         graph_ontology = require_adapter(adapter).graph_ontology_kwargs()
     episode_before = await asyncio.to_thread(_row_episode_uuid, service, memory_id)
+    # enrich_graph reports the episode it wrote through this out-parameter so
+    # stale-job expiry can pin it directly (no before/after diff of the row ref).
+    graph_written: dict = {}
     enriched = await asyncio.to_thread(
         service.enrich_graph,
         content=content,
@@ -1196,6 +1199,7 @@ async def process_graph_enrichment(
         graph_ontology=graph_ontology,
         occurred_at=occurred_at,
         workspace=current_workspace,
+        result_out=graph_written,
     )
     episode_after = await asyncio.to_thread(_row_episode_uuid, service, memory_id) if enriched else None
     if enriched:
@@ -1228,7 +1232,12 @@ async def process_graph_enrichment(
             # episode ref changed across our enrich_graph call): the cascade then
             # resolves by uuid first, so a newer re-ingested episode of the same
             # memory is never the one expired. Otherwise exact-content match.
-            ours = episode_after if episode_after and episode_after != episode_before else None
+            written_uuid = graph_written.get("episode_uuid")
+            ours = (
+                written_uuid if isinstance(written_uuid, str) and written_uuid
+                else episode_after if episode_after and episode_after != episode_before
+                else None
+            )
             resolved = False
             for attempt, pause in enumerate((0, 1.0, 3.0), start=1):
                 if pause:
