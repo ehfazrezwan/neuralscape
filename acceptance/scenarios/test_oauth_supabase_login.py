@@ -483,7 +483,7 @@ def test_the_link_page_refuses_a_bad_token_and_a_forged_ticket(ctx, anon, idp):
 @proves("auth.identity-store")
 @negative_control
 def test_link_refusal_check_fails_for_a_good_claim(ctx, anon, idp, claim_login: Recorded):
-    precondition(check_refused, attempt(ctx, anon, idp, idp.token(f"sb-{uuid.uuid4()}", f"o.{ctx.run_id}@elsewhere.example")), status=403, needle="not authorized")
+    precondition(check_refused, attempt(ctx, anon, idp, idp.token(f"sb-{uuid.uuid4()}", MAPPED_EMAIL), mutate_state=lambda s: "garbage"), status=400)
     expect_check_fails(check_refused, _ok(claim_login).first.redirect, status=400)
 
 
@@ -517,9 +517,10 @@ def test_an_unverified_email_is_refused_even_on_an_allowed_domain(ctx, anon, idp
 @negative_control
 def test_refusal_check_fails_for_a_login_that_succeeded(ctx, anon, idp, mapped_login: Recorded):
     precondition(check_refused, attempt(ctx, anon, idp, idp.token(f"sb-{uuid.uuid4()}", f"o.{ctx.run_id}@elsewhere.example")), status=403, needle="not authorized")
+    precondition(check_refused, attempt(ctx, anon, idp, idp.token(f"sb-{uuid.uuid4()}", f"o.{ctx.run_id}@elsewhere.example")), status=403)
     ok = _ok(mapped_login).first
     expect_check_fails(check_refused, ok.first, status=403, needle="not authorized")
-    expect_check_fails(check_refused, ok.redirect, status=303)  # a redirect is never a refusal
+    expect_check_fails(check_refused, ok.redirect, status=403)  # a redirect is never a refusal
 
 
 # ═══ the token itself (signature, audience, expiry) ═══════════════════════
@@ -633,10 +634,10 @@ def test_a_callback_from_a_browser_that_did_not_start_the_login_is_refused(ctx, 
         st = start_login(ctx, anon, attacker)
         require_binding_deployed(st.consent)
         resp = victim.callback(st.login_state, idp.token(f"sb-{uuid.uuid4()}", MAPPED_EMAIL))  # the victim has no cookie for this state
-        check_refused(resp, status=(400, 403), needle=BINDING_REFUSED)
+        check_refused(resp, status=403, needle=BINDING_REFUSED)
         # nor does a cookie from the victim's own, different login unlock the attacker's state
         start_login(ctx, anon, victim)
-        check_refused(victim.callback(st.login_state, idp.token(f"sb-{uuid.uuid4()}", MAPPED_EMAIL)), status=(400, 403), needle=BINDING_REFUSED)
+        check_refused(victim.callback(st.login_state, idp.token(f"sb-{uuid.uuid4()}", MAPPED_EMAIL)), status=403, needle=BINDING_REFUSED)
     finally:
         attacker.close()
         victim.close()
@@ -652,7 +653,7 @@ def test_a_login_state_cannot_be_completed_twice(ctx, anon, idp):
         require_binding_deployed(st.consent)
         token = idp.token(f"sb-{uuid.uuid4()}", MAPPED_EMAIL)
         code_from(browser.callback(st.login_state, token), st)  # the first completion works
-        check_refused(browser.callback(st.login_state, token), status=(400, 403), needle=BINDING_REFUSED)
+        check_refused(browser.callback(st.login_state, token), status=403, needle=BINDING_REFUSED)
     finally:
         browser.close()
 
@@ -665,7 +666,7 @@ def test_binding_check_fails_for_the_browser_that_did_start_the_login(ctx, anon,
         st = start_login(ctx, anon, browser)
         ok = browser.callback(st.login_state, idp.token(f"sb-{uuid.uuid4()}", MAPPED_EMAIL))
         code_from(ok, st)  # the browser that started the login is let through, with or without the binding
-        precondition(check_refused, attempt(ctx, anon, idp, idp.token(f"sb-{uuid.uuid4()}", f"o.{ctx.run_id}@elsewhere.example")), status=(400, 403))
-        expect_check_fails(check_refused, ok, status=(400, 403), needle=BINDING_REFUSED)
+        precondition(check_refused, attempt(ctx, anon, idp, idp.token(f"sb-{uuid.uuid4()}", f"o.{ctx.run_id}@elsewhere.example")), status=403, needle="not authorized")
+        expect_check_fails(check_refused, ok, status=403, needle="not authorized")
     finally:
         browser.close()
