@@ -63,7 +63,12 @@ def test_invalidate_stamps_the_old_rows_edges_and_leaves_unrelated_edges_live(dr
     old = env.store(old_text, "personal_fact")
     new = env.store(new_text, "personal_fact")
     other = env.store(other_text, "personal_fact")
-    for mid, text in ((old, old_text), (new, new_text), (other, other_text)):
+    # The superseding row is deliberately NOT graph-enriched: Graphiti's own edge resolution
+    # would see "now works at Orchid Bay" contradict the old fact and invalidate the old edge
+    # at ingest time, so the old row's edges would already be stamped before the dream action
+    # runs and the test could not tell the dream's stamping from Graphiti's. The action only
+    # needs the new row's id (superseded_by), not its graph episode.
+    for mid, text in ((old, old_text), (other, other_text)):
         _enrich(env, mid, text)
 
     old_edges, other_edges = _edges_of(env, old), _edges_of(env, other)
