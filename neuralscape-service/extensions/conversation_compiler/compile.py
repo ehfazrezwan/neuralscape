@@ -207,9 +207,18 @@ def _entries_to_text(entries: list[dict]) -> str:
 
 
 async def _dedup_compiled_users(
-    service: MemoryService, entries: list[dict], fallback_user_id: str
+    service: MemoryService,
+    entries: list[dict],
+    fallback_user_id: str,
+    include_requester: bool = False,
 ) -> tuple[bool, int, int]:
     """Run post-compile dedup for each user that owns a compiled entry.
+
+    ``include_requester`` adds ``fallback_user_id`` (the user the compile was
+    requested for) even when every entry belongs to someone else. The vault is
+    one shared tree and only receives *shared* facts, so a requester whose
+    memories are all private owns no entry on a day other users wrote to; their
+    own explicit compile must still tidy their own memories.
 
     The semantic phase is skipped when dreaming is enabled, exactly like the
     dedup cron. ``dedup_memories`` is synchronous, so each call runs in a
@@ -219,7 +228,7 @@ async def _dedup_compiled_users(
     enqueued from the ``graph_jobs`` the dedup runs returned.
     """
     users = {e["user_id"] for e in entries if e.get("user_id")}
-    if not users or any(not e.get("user_id") for e in entries):
+    if include_requester or not users or any(not e.get("user_id") for e in entries):
         users.add(fallback_user_id)
     semantic = _semantic_dedup_enabled()
     ok = True
@@ -268,11 +277,12 @@ async def compile_date(
         user_id: User the compile was requested for; post-compile dedup runs
             for the owners recorded on the entries and falls back to this user
             for entries without one. Defaults to ``DEFAULT_USER_ID``.
-        dedup_when_empty: When the date has no entries to compile, still run
-            the post-compile dedup for ``user_id`` (an explicit compile
-            request is also the user's "tidy my memories" trigger, and the
-            vault only receives *shared* facts: a user whose memories are all
-            private has no entries but still has near-duplicates).
+        dedup_when_empty: Marks an explicit compile request, which is also the
+            user's "tidy my memories" trigger: the post-compile dedup always
+            includes ``user_id`` itself, whether the date has no entries or
+            only other users' entries (the vault only receives *shared* facts,
+            so a user whose memories are all private owns no entry but still
+            has near-duplicates).
             ``compile_all_pending`` passes False so a backlog of empty dates
             does not scan the pool once per date.
 
@@ -414,7 +424,7 @@ async def compile_date(
     # owners were recorded fall back to the ``user_id`` the compile was
     # requested for. Sibling graph jobs the dedup returns are enqueued.
     dedup_triggered, sibling_enqueued, sibling_failed = await _dedup_compiled_users(
-        service, entries, user_id
+        service, entries, user_id, include_requester=dedup_when_empty
     )
 
     result = CompileResult(
