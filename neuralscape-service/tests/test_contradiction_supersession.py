@@ -416,6 +416,21 @@ class TestSingleRowEpisode:
         _enrich(svc)
         assert not qdrant.meta("old").get("dream_tombstoned")
 
+    def test_partial_floor_default_is_pinned_at_085(self):
+        from config import Settings
+
+        assert Settings.model_fields["graph_supersession_partial_min_similarity"].default == 0.85
+
+    def test_dead_edge_at_084_with_a_big_margin_is_left_alone(self, env):
+        svc, qdrant = self._partial_setup(env, [0.84, 0.5426, 0.0], [0.0, 0.0, 1.0])
+        _enrich(svc)
+        assert not qdrant.meta("old").get("dream_tombstoned")
+
+    def test_dead_edge_at_086_with_the_margin_supersedes(self, env):
+        svc, qdrant = self._partial_setup(env, [0.86, 0.5103, 0.0], [0.0, 0.0, 1.0])
+        _enrich(svc)
+        assert qdrant.meta("old")["dream_tombstoned"] is True
+
     def test_embedder_failure_leaves_the_row(self, env):
         svc, qdrant = self._partial_setup(env, [1.0, 0.0, 0.0], [0.0, 0.0, 1.0])
         svc._memory.embedding_model.embed.side_effect = RuntimeError("embed down")
