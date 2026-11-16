@@ -154,7 +154,11 @@ def card_read_allowed(pool: str, caller_user_id: str | None, *, is_dictator: boo
         # Injective (flag-on) name of a private pool: only its exact owner reads it.
         return placement.owner == caller_user_id
     if not settings.graph_group_id_injective_enabled:
-        return pool == f"user--{caller_user_id}" or pool.startswith(f"user--{caller_user_id}--")
+        # Exact boundary: the caller's id must be followed by the end of the name or
+        # by '--project--' / '--ws--'. A bare '--' prefix also matched other users'
+        # pools ('alice' vs owner 'alice-', or owner 'alice--bob').
+        own = f"user--{caller_user_id}"
+        return pool == own or pool.startswith((f"{own}--project--", f"{own}--ws--"))
     # Flag on: a bare prefix match would let plain 'alice' read the legacy card of
     # a colliding '--' user (e.g. 'alice--project--x'). Accept only a name the
     # builder itself produces for THIS caller.

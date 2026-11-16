@@ -443,3 +443,69 @@ def test_card_mcp_tool_exact_ownership(flag, monkeypatch, on, denied):
     body = json.loads(out[0].text)
     assert ("not readable" in str(body.get("error", ""))) is denied
     assert bool(redis.reads) is (not denied)
+
+
+# ── default-config (flag OFF) card authorisation: exact boundary ─────────
+
+COLLIDING = ["user--alice---project--x", "user--alice---ws--w", "user--alice--bob"]
+OWN = ["user--alice", "user--alice--project--x", "user--alice--ws--w", "user--alice--project--x--ws--w"]
+
+
+def test_flag_off_card_read_denies_prefix_colliding_owners(flag):
+    from extensions.dreaming.card import card_read_allowed
+
+    flag(False)
+    for pool in COLLIDING:
+        assert not card_read_allowed(pool, "alice"), pool
+    for pool in OWN:
+        assert card_read_allowed(pool, "alice"), pool
+    assert not card_read_allowed("user--alicia", "alice") and not card_read_allowed("user--alice-", "alice")
+    # the 'alice-' owner reads his own, and 'alice--bob' hers
+    assert card_read_allowed("user--alice---project--x", "alice-")
+    assert card_read_allowed("user--alice--bob", "alice--bob")
+    # dictator and anonymous behaviour unchanged
+    assert card_read_allowed(COLLIDING[0], "root", is_dictator=True)
+    assert not card_read_allowed("user--alice", None)
+    assert card_read_allowed("shared--project--p", None)
+
+
+@pytest.mark.parametrize("on", [False, True])
+@pytest.mark.parametrize("pool", COLLIDING)
+def test_card_rest_route_denies_colliding_pools_flag_off_or_on(flag, monkeypatch, on, pool):
+    flag(on)
+    redis = _CardRedis()
+    r = _rest_client(monkeypatch, redis).get(
+        "/v1/extensions/dreaming/card", params={"pool": pool, "user_id": "alice"})
+    assert r.status_code == 403 and redis.reads == []
+
+
+@pytest.mark.parametrize("on", [False, True])
+@pytest.mark.parametrize("pool", COLLIDING)
+def test_card_mcp_tool_denies_colliding_pools_flag_off_or_on(flag, monkeypatch, on, pool):
+    import asyncio
+    import json
+
+    import extensions.dreaming.sweep as sweep
+    import mcp_server
+
+    flag(on)
+    redis = _CardRedis()
+    monkeypatch.setattr(sweep, "_get_redis", lambda: redis)
+    out = asyncio.run(mcp_server.call_tool("get_card", {"pool": pool, "user_id": "alice"}))
+    assert "not readable" in json.loads(out[0].text).get("error", "") and redis.reads == []
+
+
+@pytest.mark.parametrize("pool", OWN)
+def test_card_rest_route_allows_own_pools(flag, monkeypatch, pool):
+    flag(False)
+    r = _rest_client(monkeypatch, _CardRedis()).get(
+        "/v1/extensions/dreaming/card", params={"pool": pool, "user_id": "alice"})
+    assert r.status_code == 200
+
+
+def test_list_projects_prefix_values_are_pinned(service, flag):
+    flag(False)
+    got = _capture_query(service)
+    assert got["params"] == {"user_prefix": "user--alice--x--project--", "shared_prefix": "shared--project--"}
+    flag(True)
+    assert _capture_query(service)["params"]["shared_prefix"] == "shared--project--"
