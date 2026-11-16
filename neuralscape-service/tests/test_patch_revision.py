@@ -69,12 +69,19 @@ class FakeQdrant:
         self.points: dict[str, dict] = {}
         self.writes: list[str] = []          # every call that mutated a payload
         self.before_filtered_write = None    # hook: simulate a concurrent writer winning the race
+        self.vectors: dict[str, list] = {}   # dense vector per point (the "stored vector")
+        self.before_vector_write = None      # hook: a stalled writer / a concurrent edit or delete
+        self.after_set_payload = None
+        import threading
+
+        self.atomic = threading.Lock()       # the server applies one filtered write at a time
 
     def add(self, pid, data="Old content", *, owner="ehfaz", **meta):
         md = {"owner_user_id": owner, "visibility": "private", "category": "personal_fact",
               "scope": "global", "project_id": None, "tags": ["t0"]}
         md.update(meta)
         self.points[pid] = {"data": data, "hash": "h", "user_id": owner, "metadata": md}
+        self.vectors[pid] = self.embed(data, "update")
 
     # -- raw qdrant client
     def retrieve(self, collection_name, ids, with_payload=True, with_vectors=False):
@@ -84,17 +91,28 @@ class FakeQdrant:
         if self.before_filtered_write and not isinstance(points, list):
             hook, self.before_filtered_write = self.before_filtered_write, None
             hook(self)
-        if isinstance(points, list):
-            targets = list(points)
-        else:  # a Filter: server-side select-and-apply
-            targets = [pid for pid, p in self.points.items() if _eval(points, pid, p)]
-        for pid in targets:
-            target = self.points[pid]
-            if key:
-                for part in key.split("."):
-                    target = target.setdefault(part, {})
-            target.update(payload)
-            self.writes.append(f"set_payload:{pid}")
+        with self.atomic:
+            if isinstance(points, list):
+                targets = [t for t in points if t in self.points]
+            else:  # a Filter: server-side select-and-apply (never creates a point)
+                targets = [pid for pid, p in self.points.items() if _eval(points, pid, p)]
+            for pid in targets:
+                target = self.points[pid]
+                if key:
+                    for part in key.split("."):
+                        target = target.setdefault(part, {})
+                target.update(payload)
+                self.writes.append(f"set_payload:{pid}")
+
+    def update_vectors(self, collection_name, points):
+        if self.before_vector_write:
+            hook, self.before_vector_write = self.before_vector_write, None
+            hook(self)
+        for pv in points:
+            if pv.id not in self.points:
+                raise KeyError(pv.id)                      # the engine's behaviour for a missing point
+            self.vectors[pv.id] = pv.vector[""]
+            self.writes.append(f"update_vectors:{pv.id}")
 
     def delete_payload(self, collection_name, keys, points):
         for pid in [p for p, v in self.points.items() if _eval(points, p, v)]:
@@ -127,7 +145,7 @@ class FakeQdrant:
         if self.before_embed:
             hook, self.before_embed = self.before_embed, None
             hook(self)
-        return [0.1, 0.1, 0.1, 0.1]
+        return [float(len(text)), float(sum(map(ord, text)) % 97), 0.0, 0.0]   # deterministic per text
 
     def mem0_update(self, pid, data, metadata=None):
         if self.before_mem0_update:
@@ -160,9 +178,7 @@ def world():
     mem.vector_store.client = fake
     mem.vector_store.get.side_effect = fake.vs_get
     mem.vector_store.update.side_effect = fake.vs_update
-    mem._update_memory.side_effect = lambda memory_id, data, existing_embeddings, metadata=None: fake.mem0_update(
-        memory_id, data, metadata
-    )
+    mem.vector_store._has_bm25_slot = False
     mem.embedding_model.embed.side_effect = fake.embed
     mem.get.side_effect = fake.mem0_get
     svc._cascade_rows_once = MagicMock(return_value={
@@ -211,7 +227,7 @@ def test_stale_content_edit_is_refused_before_any_re_embed(world):
     world.patch_memory(M1, "ehfaz", {"tags": ["winner"]})
     with pytest.raises(RevisionConflict):
         world.patch_memory(M1, "ehfaz", {"content": "stale text"}, expected_revision="0")
-    world._memory._update_memory.assert_not_called()
+    world._memory.embedding_model.embed.assert_not_called()
     assert world.fake.points[M1]["data"] == "Old content"
 
 
@@ -269,7 +285,6 @@ def test_absent_revision_is_last_writer_wins_as_before(world):
     world.patch_memory(M1, "ehfaz", {"tags": ["two"]})     # no precondition: always applies
     assert _tags(world) == ["two"]
     assert world.get_memory(M1).revision == "2"
-    world._memory.vector_store.update.assert_called()       # the historical write path
 
 
 # ── guards ────────────────────────────────────────────────────────────
@@ -300,219 +315,166 @@ def test_revision_of_tolerates_missing_and_garbage():
     assert revision_of({"revision": 4}) == "4"
 
 
-# ── protocol: per-memory lock, one write (I1-I3) ───────────────────────
+# ── the compare-and-set (I1-I4) ────────────────────────────────────────
 
 
 class _Crash(BaseException):
     """A hard crash: skips ``except Exception`` cleanup, like a killed process."""
 
 
-LOCK_KEY = f"ns:edit-lock:{M1}"
+def test_I1_a_writer_that_loses_the_race_between_its_read_and_its_cas_changes_nothing(world):
+    """Another edit commits after our precondition check but before our filtered write: the store applies NOTHING."""
+    def interloper(fake):
+        fake.points[M1]["metadata"]["tags"] = ["interloper"]
+        fake.points[M1]["metadata"]["revision"] = 1
+
+    world.fake.before_filtered_write = interloper
+    with pytest.raises(RevisionConflict) as err:
+        world.patch_memory(M1, "ehfaz", {"content": "mine"}, expected_revision="0")
+    assert err.value.current_revision == "1"
+    assert world.fake.points[M1]["data"] == "Old content" and _tags(world) == ["interloper"]
+    assert "vector_pending" not in world.fake.points[M1]
 
 
-def test_I1_no_claimed_intermediate_state_is_ever_visible_or_stored(world, edit_lock_redis):
-    """A reader during the re-embed sees the OLD row (old content, old revision); afterwards the new row. No pending marks."""
-    seen = {}
-
-    def during(fake):
-        seen["read"] = world.get_memory(M1)
-        seen["stored"] = dict(fake.points[M1]["metadata"])
-
-    world.fake.before_mem0_update = during
-    world.patch_memory(M1, "ehfaz", {"content": "new text"}, expected_revision="0")
-    assert (seen["read"].revision, seen["read"].memory) == ("0", "Old content")
-    assert not any(k.startswith("revision_") for k in seen["stored"])          # nothing claimed, nothing pending
-    meta = world.fake.points[M1]["metadata"]
-    assert world.fake.points[M1]["data"] == "new text" and meta["revision"] == 1
-    assert not any(k.startswith("revision_") for k in meta)
-    assert edit_lock_redis.store == {}                                         # lock released
+def test_I1_the_row_changes_in_one_write_text_metadata_and_revision_together(world):
+    before = len(world.fake.writes)
+    world.patch_memory(M1, "ehfaz", {"content": "new text", "tags": ["x"]}, expected_revision="0")
+    cas = [w for w in world.fake.writes[before:] if w.startswith("set_payload")]
+    assert cas[0] == f"set_payload:{M1}"
+    point = world.fake.points[M1]
+    assert point["data"] == "new text" and point["metadata"]["tags"] == ["x"] and point["metadata"]["revision"] == 1
+    assert point["hash"] and point["updated_at"]                      # derived text fields written with it
 
 
-def test_I1_a_busy_row_refuses_a_second_writer_and_changes_nothing(world):
-    """A second writer (conditional or not) arriving during the first one's re-embed is refused with EditBusy."""
-    from memory.edit import EditBusy
+def test_I2_a_committed_edit_survives_seventy_successors_landing_before_its_read_back(world):
+    real_retrieve = world.fake.retrieve
+    state = {"done": False}
 
-    outcomes = []
+    def retrieve_after_successors(collection_name, ids, with_payload=True, with_vectors=False):
+        if not state["done"] and world.fake.points[M1]["metadata"].get("revision") == 1:
+            state["done"] = True
+            for r in range(1, 71):
+                world.patch_memory(M1, "ehfaz", {"tags": [f"s{r}"]}, expected_revision=str(r))
+        return real_retrieve(collection_name, ids, with_payload, with_vectors)
 
-    def during(fake):
-        for kwargs in ({"expected_revision": "0"}, {}):
-            try:
-                world.patch_memory(M1, "ehfaz", {"tags": ["intruder"]}, **kwargs)
-                outcomes.append("committed")
-            except EditBusy:
-                outcomes.append("busy")
-
-    world.fake.before_mem0_update = during
-    world.patch_memory(M1, "ehfaz", {"content": "first writer's text"}, expected_revision="0")
-    assert outcomes == ["busy", "busy"]
-    assert world.fake.points[M1]["data"] == "first writer's text" and _tags(world) == ["t0"]
-    world.patch_memory(M1, "ehfaz", {"tags": ["after"]}, expected_revision="1")      # usable again
-
-
-def test_I1_a_failed_rewrite_releases_the_lock_and_leaves_the_row_untouched(world, edit_lock_redis):
-    world.fake.fail_mem0_update = True
-    with pytest.raises(RuntimeError):
-        world.patch_memory(M1, "ehfaz", {"content": "never lands"}, expected_revision="0")
-    assert edit_lock_redis.store == {}
-    assert world.fake.points[M1]["data"] == "Old content" and world.get_memory(M1).revision == "0"
-    world.patch_memory(M1, "ehfaz", {"tags": ["ok"]}, expected_revision="0")
-
-
-def test_I2_a_committed_edit_is_never_reported_as_a_conflict_whatever_arrives_after_it(world):
-    """There is no post-write confirmation to be fooled: a successor arriving while the post-write graph work runs
-    is refused as busy, and the original edit returns its normal result including the graph job and cleanup."""
-    from memory.edit import EditBusy
-
-    seen = {}
-    real = world._cascade_rows_once
-
-    def cascade_then_successor(*a, **k):
-        try:
-            world.patch_memory(M1, "ehfaz", {"tags": ["successor"]}, expected_revision="1")
-            seen["successor"] = "committed"
-        except EditBusy:
-            seen["successor"] = "busy"
-        return real(*a, **k)
-
-    world._cascade_rows_once = cascade_then_successor
+    world.fake.retrieve = retrieve_after_successors
     out = world.patch_memory(M1, "ehfaz", {"visibility": "shared"}, expected_revision="0")   # partition change
     assert out["graph"] != "unchanged" and out["graph_job"] is not None
-    assert seen["successor"] == "busy"
-    assert world.fake.points[M1]["metadata"]["revision"] == 1
+    world._cascade_rows_once.assert_called()
+    assert world.fake.points[M1]["metadata"]["revision"] == 71
 
 
-def test_I3_a_writer_whose_lock_was_lost_fails_at_the_fence_instead_of_writing(world, edit_lock_redis, monkeypatch):
-    """The lock expired and another writer took it: the original writer must change nothing."""
-    import memory.edit as edit
-    from memory.edit import EditBusy
+def test_I3_exactly_one_of_n_concurrent_edits_holding_the_same_revision_wins_every_round(world):
+    import threading
 
-    real_title = edit.distill_title
+    for round_no in range(30):
+        pid = f"00000000-0000-4000-8000-{round_no + 100:012d}"
+        world.fake.add(pid)
+        n = 8
+        barrier = threading.Barrier(n)
+        results = []
 
-    def steal(text):
-        edit_lock_redis.store[LOCK_KEY] = "thief"          # TTL lapsed + someone else acquired it, before the fence
-        return real_title(text)
+        def attempt(i):
+            barrier.wait()
+            try:
+                world.patch_memory(pid, "ehfaz", {"content": f"writer {i} round {round_no}"}, expected_revision="0")
+                results.append(("win", i))
+            except RevisionConflict:
+                results.append(("lose", i))
 
-    monkeypatch.setattr(edit, "distill_title", steal)
-    with pytest.raises(EditBusy):
-        world.patch_memory(M1, "ehfaz", {"content": "stalled writer"}, expected_revision="0")
-    assert world.fake.points[M1]["data"] == "Old content" and world.get_memory(M1).revision == "0"
-    assert edit_lock_redis.store[LOCK_KEY] == "thief"       # and our release did not delete the thief's lock
+        threads = [threading.Thread(target=attempt, args=(i,)) for i in range(n)]
+        [t.start() for t in threads]
+        [t.join(timeout=30) for t in threads]
+        wins = [i for kind, i in results if kind == "win"]
+        assert len(results) == n and len(wins) == 1, (round_no, results)
+        assert world.fake.points[pid]["data"] == f"writer {wins[0]} round {round_no}"   # the winner's text, none lost
+        assert world.fake.points[pid]["metadata"]["revision"] == 1
 
 
-def test_I3_a_crashed_writers_lock_blocks_others_only_until_its_ttl(world, edit_lock_redis):
-    from memory.edit import EditBusy
+def test_I4_a_stalled_writer_resumes_after_a_later_edit_and_the_vector_converges_to_the_final_text(world):
+    """A's text CAS committed; A stalls before its vector write; B edits (text + vector); A resumes with a STALE
+    vector -> it re-reads the revision, re-embeds B's text and writes again. Final vector == embed(final text)."""
+    def stall_then_B_commits(fake):
+        world.patch_memory(M1, "ehfaz", {"content": "B's later text"}, expected_revision="1")
 
+    world.fake.before_vector_write = stall_then_B_commits
+    world.patch_memory(M1, "ehfaz", {"content": "A's text"}, expected_revision="0")
+    point = world.fake.points[M1]
+    assert point["data"] == "B's later text" and point["metadata"]["revision"] == 2
+    assert world.fake.vectors[M1] == world.fake.embed("B's later text", "update")        # converged to the final text
+    assert point.get("vector_pending") is None and point.get("vector_revision") == 2      # marker clean
+
+
+def test_I4_a_delete_landing_between_the_text_cas_and_the_vector_write_is_not_resurrected(world):
+    def delete_now(fake):
+        del fake.points[M1]
+        del fake.vectors[M1]
+
+    world.fake.before_vector_write = delete_now
+    world.patch_memory(M1, "ehfaz", {"content": "edit racing a delete"}, expected_revision="0")   # no exception
+    assert M1 not in world.fake.points and M1 not in world.fake.vectors
+
+
+def test_I4_a_crashed_writer_leaves_a_detectable_marker_and_repair_converges_the_vector(world):
     def crash(fake):
         raise _Crash()
 
-    world.fake.before_mem0_update = crash
+    world.fake.before_vector_write = crash
     with pytest.raises(_Crash):
-        world.patch_memory(M1, "ehfaz", {"content": "dies mid-rewrite"}, expected_revision="0")
-    # a hard crash skips ``__exit__`` cleanup only if the process dies; here the context manager still releases,
-    # so emulate the dead process by leaving the key behind, then let the TTL (simulated) clear it.
-    edit_lock_redis.store[LOCK_KEY] = "dead-writer"
-    with pytest.raises(EditBusy):
-        world.patch_memory(M1, "ehfaz", {"tags": ["too-soon"]}, expected_revision="0")
-    del edit_lock_redis.store[LOCK_KEY]                     # Redis expires the key after the TTL
-    world.patch_memory(M1, "ehfaz", {"tags": ["after-ttl"]}, expected_revision="0")
-    assert _tags(world) == ["after-ttl"]
+        world.patch_memory(M1, "ehfaz", {"content": "crashed before its vector"}, expected_revision="0")
+    point = world.fake.points[M1]
+    assert point["data"] == "crashed before its vector" and point["vector_pending"] is True
+    assert world.fake.vectors[M1] != world.fake.embed(point["data"], "update")           # stale, detectably
+    out = world.repair_stale_vectors(min_age_s=0)
+    assert out["repaired"] == 1 and out["failed"] == 0
+    assert world.fake.vectors[M1] == world.fake.embed("crashed before its vector", "update")
+    assert point.get("vector_pending") is None and point["vector_revision"] == 1
 
 
-def test_a_conditional_edit_is_refused_when_redis_is_unreachable_and_an_unconditional_one_proceeds(world, monkeypatch):
+def test_correctness_holds_with_redis_down_the_lock_expired_or_the_lock_lost(world, edit_lock_redis, monkeypatch):
+    """The lock is only a contention reducer: with Redis down a conditional edit still commits and a stale one still conflicts."""
     import memory.edit as edit
-    from memory.edit import EditLockUnavailable
 
     def down():
         raise ConnectionError("redis down")
 
     monkeypatch.setattr(edit, "_redis_client", down)
-    with pytest.raises(EditLockUnavailable):
-        world.patch_memory(M1, "ehfaz", {"tags": ["x"]}, expected_revision="0")
-    assert _tags(world) == ["t0"]
-    world.patch_memory(M1, "ehfaz", {"tags": ["y"]})          # unconditional: proceeds unlocked (warned)
-    assert _tags(world) == ["y"]
+    world.patch_memory(M1, "ehfaz", {"content": "committed without redis"}, expected_revision="0")
+    with pytest.raises(RevisionConflict):
+        world.patch_memory(M1, "ehfaz", {"content": "stale"}, expected_revision="0")
+    assert world.fake.points[M1]["data"] == "committed without redis"
 
 
-def test_the_lock_is_per_memory(world, edit_lock_redis):
-    world.fake.add(M2)
-    edit_lock_redis.store[f"ns:edit-lock:{M2}"] = "someone"
-    world.patch_memory(M1, "ehfaz", {"tags": ["unaffected"]}, expected_revision="0")
-    assert _tags(world) == ["unaffected"]
+def test_a_lock_held_by_someone_else_does_not_block_the_edit_the_cas_decides(world, edit_lock_redis):
+    edit_lock_redis.store[f"ns:edit-lock:{M1}"] = "another-writer"
+    world.patch_memory(M1, "ehfaz", {"content": "proceeds"}, expected_revision="0")
+    assert world.fake.points[M1]["data"] == "proceeds"
+    assert edit_lock_redis.store[f"ns:edit-lock:{M1}"] == "another-writer"      # we never touched their lock
 
 
-# ── retag takes the same per-memory lock ───────────────────────────────
+def test_the_history_row_is_written_as_mem0_writes_it(world):
+    world.patch_memory(M1, "ehfaz", {"content": "new text"}, expected_revision="0")
+    call = world._memory.db.add_history.call_args
+    assert call.args[:4] == (M1, "Old content", "new text", "UPDATE")
+    assert call.kwargs["created_at"] is None or isinstance(call.kwargs["created_at"], str)
 
 
-def _retag(world):
-    return world.retag_memories("ehfaz", {"category": "personal_fact"}, {"add_tags": ["bulk"]})
-
-
-def test_retag_writes_under_the_lock_bumps_the_revision_in_its_single_write_and_releases(world, edit_lock_redis):
-    seen = {}
-    real_update = world._memory.vector_store.update.side_effect
-
-    def watching_update(pid, payload=None, vector=None):
-        seen["lock_held_during_write"] = edit_lock_redis.store.get(LOCK_KEY) is not None
-        return real_update(pid, payload=payload, vector=vector)
-
-    world._memory.vector_store.update.side_effect = watching_update
-    out = _retag(world)
+def test_retag_goes_through_the_same_compare_and_set(world):
+    out = world.retag_memories("ehfaz", {"category": "personal_fact"}, {"add_tags": ["bulk"]})
     assert out["updated"] == 1 and out["skipped_busy_ids"] == []
-    assert seen["lock_held_during_write"] is True
     assert world.fake.points[M1]["metadata"]["revision"] == 1 and "bulk" in _tags(world)
-    assert edit_lock_redis.store == {}
 
 
-def test_retag_skips_a_row_another_edit_holds_and_reports_it(world, edit_lock_redis):
-    edit_lock_redis.store[LOCK_KEY] = "another-writer"
-    out = _retag(world)
-    assert out["updated"] == 0 and out["skipped_busy_ids"] == [M1]
-    assert _tags(world) == ["t0"] and "revision" not in world.fake.points[M1]["metadata"]
-    assert edit_lock_redis.store[LOCK_KEY] == "another-writer"
+def test_retag_skips_a_row_a_patch_changed_since_the_scroll(world):
+    import copy
 
-
-def test_retag_lost_lock_writes_nothing(world, edit_lock_redis, monkeypatch):
-    """The lock is stolen after retag acquired it and before the fence."""
-    real_get = world._memory.vector_store.get.side_effect
-
-    def get_then_steal(vector_id):
-        point = real_get(vector_id=vector_id)
-        edit_lock_redis.store[LOCK_KEY] = "thief"       # TTL lapsed, someone else took it
-        return point
-
-    world._memory.vector_store.get.side_effect = get_then_steal
-    out = _retag(world)
-    assert out["updated"] == 0 and out["skipped_busy_ids"] == [M1]
-    assert _tags(world) == ["t0"]
-
-
-def test_retag_skips_a_row_that_a_patch_changed_since_the_scroll(world, monkeypatch):
-    """A PATCH commits between retag's scroll and its locked re-check: retag must not overwrite it from the stale scroll."""
     real_scroll = world.fake.scroll
 
     def scroll_then_patch(*a, **k):
-        import copy
-
-        result = copy.deepcopy(real_scroll(*a, **k))      # the scroll's view is a snapshot, not a live reference
+        result = copy.deepcopy(real_scroll(*a, **k))      # a snapshot, not a live reference
         world.patch_memory(M1, "ehfaz", {"tags": ["patched-meanwhile"]}, expected_revision="0")
         return result
 
     world.fake.scroll = scroll_then_patch
-    out = _retag(world)
+    out = world.retag_memories("ehfaz", {"category": "personal_fact"}, {"add_tags": ["bulk"]})
     assert out["skipped_busy_ids"] == [M1] and _tags(world) == ["patched-meanwhile"]
-
-
-def test_I3_A_lock_expires_during_the_re_embed_B_commits_then_A_changes_nothing_and_reports_a_conflict(world, edit_lock_redis):
-    """The required interleaving: (1) A holds the lock, (2) A's lock expires while A re-embeds, (3) B takes the lock
-    and commits, (4) A tries to write: A changes NOTHING and gets a conflict; B's content AND revision remain."""
-    def expire_then_B_commits(fake):
-        edit_lock_redis.store.pop(LOCK_KEY, None)                                     # (2) A's TTL lapses
-        world.patch_memory(M1, "ehfaz", {"content": "B's text"}, expected_revision="0")   # (3) B commits
-
-    world.fake.before_embed = expire_then_B_commits
-    with pytest.raises(RevisionConflict) as err:
-        world.patch_memory(M1, "ehfaz", {"content": "A's text"}, expected_revision="0")   # (4)
-    assert err.value.current_revision == "1"
-    assert world.fake.points[M1]["data"] == "B's text"                                  # B's content remains
-    assert world.fake.points[M1]["metadata"]["revision"] == 1                           # B's revision remains
-    assert world.get_memory(M1).revision == "1"

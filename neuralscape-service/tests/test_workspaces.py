@@ -220,9 +220,9 @@ def test_workspace_retag_operation(service):
     assert result["updated"] == 1
 
     # The row was rewritten with the new workspace stamp.
-    service._memory.vector_store.update.assert_called_once()
-    _, kwargs = service._memory.vector_store.update.call_args
-    assert kwargs["payload"]["metadata"]["workspace"] == "ref-migrated"
+    set_payload = service._memory.vector_store.client.set_payload   # the filter-scoped compare-and-set
+    set_payload.assert_called_once()
+    assert set_payload.call_args.kwargs["payload"]["metadata"]["workspace"] == "ref-migrated"
 
 
 def _qhit(mid, data, metadata, score=0.9):

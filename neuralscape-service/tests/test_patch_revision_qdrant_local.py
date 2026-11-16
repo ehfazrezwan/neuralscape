@@ -1,16 +1,30 @@
-"""The conditional edit (per-memory Redis lock + ONE write carrying content, metadata and revision) against a REAL
-Qdrant engine (the client's local mode) instead of a hand-written store fake; Redis is the in-memory ``FakeRedis``
-from ``conftest`` (the real Redis is covered by ``integration_tests/test_patch_revision_real_stores.py``)."""
+"""The edit compare-and-set against a REAL Qdrant engine (the client's local mode) instead of a hand-written store fake.
 
+Checks the primitives the design relies on exactly as the engine implements them: a filter-scoped ``set_payload``
+only touches a point that exists AND matches (it cannot create or resurrect one), ``update_vectors`` raises for a
+missing point, and the full edit protocol (text CAS, vector write, vector_revision) converges. The server itself is
+covered by ``integration_tests/test_patch_revision_real_stores.py`` on the gate.
+"""
+
+import threading
 import uuid
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 from qdrant_client import QdrantClient
-from qdrant_client.models import Distance, PointStruct, VectorParams
+from qdrant_client.models import (
+    Distance,
+    FieldCondition,
+    Filter,
+    HasIdCondition,
+    MatchValue,
+    PointStruct,
+    PointVectors,
+    VectorParams,
+)
 
-import memory.edit as edit
-from memory.edit import EditBusy, RevisionConflict
+from memory.edit import RevisionConflict
 from memory_service import MemoryService
 
 DIM = 4
@@ -20,39 +34,33 @@ class _Crash(BaseException):
     pass
 
 
+def _unit(v):
+    n = sum(x * x for x in v) ** 0.5
+    return [x / n for x in v]          # cosine collections store normalised vectors
+
+
+def _embed(text, action="update"):
+    return [float(len(text)), float(sum(map(ord, text)) % 97), 0.0, 0.0]
+
+
 class _Shim:
     def __init__(self, client, collection):
         self.client, self.collection = client, collection
-        self.vector_store = SimpleNamespace(client=client, get=self._get, update=self._set)
-        self.before_update = None
-        self.before_embed = None
-        self.embedding_model = SimpleNamespace(embed=self._embed)
+        self.vector_store = SimpleNamespace(client=client, get=self._get, update=None, _has_bm25_slot=False)
+        self.embedding_model = SimpleNamespace(embed=_embed)
+        self.db = MagicMock()
+        self._remove_memory_from_entity_store = MagicMock()
+        self._link_entities_for_memory = MagicMock()
 
     def _get(self, vector_id):
         pts = self.client.retrieve(self.collection, ids=[vector_id], with_payload=True)
         return pts[0] if pts else None
 
-    def _set(self, vector_id, vector=None, payload=None):
-        self.client.set_payload(self.collection, payload=payload, points=[vector_id])
-
-    def _embed(self, text, action):
-        if self.before_embed:
-            hook, self.before_embed = self.before_embed, None
-            hook()
-        return [0.1] * DIM
-
-    def _update_memory(self, memory_id, data, existing_embeddings, metadata=None):
-        if self.before_update:
-            hook, self.before_update = self.before_update, None
-            hook()
-        old = self._get(memory_id).payload
-        payload = {"data": data, "hash": "h", "user_id": old["user_id"], "created_at": old["created_at"],
-                   "metadata": (metadata or {}).get("metadata", {})}
-        self.client.upsert(self.collection, points=[PointStruct(id=memory_id, vector=[0.1] * DIM, payload=payload)])
-
     def get(self, memory_id):
-        pt = self._get(memory_id)
-        p = pt.payload
+        point = self._get(memory_id)
+        if point is None:
+            return None
+        p = point.payload
         return {"id": memory_id, "memory": p["data"], "user_id": p["user_id"], "created_at": p["created_at"],
                 "metadata": p["metadata"]}
 
@@ -63,14 +71,14 @@ def world(monkeypatch):
 
     client = QdrantClient(":memory:")
     collection = "c"
-    client.create_collection(collection, vectors_config=VectorParams(size=DIM, distance=Distance.COSINE))
+    client.create_collection(collection, vectors_config={"": VectorParams(size=DIM, distance=Distance.COSINE)})
     monkeypatch.setattr(settings, "qdrant_collection", collection)
     svc = MemoryService()
     svc._memory = _Shim(client, collection)
     svc._graphiti = None
     svc._bridge = None
     pid = str(uuid.uuid4())
-    client.upsert(collection, points=[PointStruct(id=pid, vector=[0.1] * DIM, payload={
+    client.upsert(collection, points=[PointStruct(id=pid, vector={"": _embed("old")}, payload={
         "data": "old", "hash": "h", "user_id": "u", "created_at": "2026-01-01T00:00:00+00:00",
         "metadata": {"owner_user_id": "u", "visibility": "private", "category": "personal_fact",
                      "scope": "global", "project_id": None, "tags": ["t0"]}})])
@@ -78,77 +86,129 @@ def world(monkeypatch):
     return svc
 
 
-def _meta(world):
-    return world.client.retrieve("c", ids=[world.pid], with_payload=True)[0].payload["metadata"]
+def _payload(world, pid=None):
+    return world.client.retrieve("c", ids=[pid or world.pid], with_payload=True)[0].payload
 
 
-def test_I1_the_row_changes_in_one_write_and_a_reader_never_sees_a_claimed_state(world, edit_lock_redis):
-    seen = {}
+def _vector(world, pid=None):
+    v = world.client.retrieve("c", ids=[pid or world.pid], with_vectors=True)[0].vector
+    return v[""] if isinstance(v, dict) else v
 
-    def during():
-        seen["meta"] = dict(_meta(world))
-        seen["text"] = world._memory.get(world.pid)["memory"]
-        for kwargs in ({"expected_revision": "0"}, {}):
-            try:
-                world.patch_memory(world.pid, "u", {"tags": ["intruder"]}, **kwargs)
-            except EditBusy:
-                seen.setdefault("busy", 0)
-                seen["busy"] += 1
 
-    world._memory.before_update = during
-    world.patch_memory(world.pid, "u", {"content": "new"}, expected_revision="0")
-    assert seen["text"] == "old" and "revision" not in seen["meta"] and not any(k.startswith("revision_") for k in seen["meta"])
-    assert seen["busy"] == 2
-    meta = _meta(world)
-    assert world._memory.get(world.pid)["memory"] == "new" and meta["revision"] == 1
-    assert not any(k.startswith("revision_") for k in meta) and edit_lock_redis.store == {}
+# ── the primitives, as the real engine implements them ─────────────────
+
+
+def test_primitive_a_filtered_set_payload_never_creates_or_resurrects_a_point(world):
+    missing = str(uuid.uuid4())
+    world.client.set_payload("c", payload={"data": "ghost"}, points=Filter(must=[HasIdCondition(has_id=[missing])]))
+    assert world.client.retrieve("c", ids=[missing]) == []
+
+
+def test_primitive_a_filtered_set_payload_skips_a_non_matching_point(world):
+    flt = Filter(must=[HasIdCondition(has_id=[world.pid]), FieldCondition(key="metadata.revision", match=MatchValue(value=7))])
+    world.client.set_payload("c", payload={"data": "x"}, points=flt)
+    assert _payload(world)["data"] == "old"
+
+
+def test_primitive_update_vectors_on_a_missing_point_raises_and_creates_nothing(world):
+    missing = str(uuid.uuid4())
+    with pytest.raises(Exception):
+        world.client.update_vectors("c", points=[PointVectors(id=missing, vector={"": _embed("x")})])
+    assert world.client.retrieve("c", ids=[missing]) == []
+
+
+# ── the protocol on the real engine ────────────────────────────────────
+
+
+def test_I1_one_filtered_write_carries_text_metadata_and_revision_and_the_vector_converges(world):
+    world.patch_memory(world.pid, "u", {"content": "new text"}, expected_revision="0")
+    p = _payload(world)
+    assert p["data"] == "new text" and p["metadata"]["revision"] == 1
+    assert _vector(world) == pytest.approx(_unit(_embed("new text")))
+    assert p.get("vector_pending") is None and p["vector_revision"] == 1
 
 
 def test_I1_a_stale_edit_changes_nothing(world):
     world.patch_memory(world.pid, "u", {"tags": ["winner"]}, expected_revision="0")
-    before = _meta(world)
+    before = _payload(world)
     with pytest.raises(RevisionConflict):
         world.patch_memory(world.pid, "u", {"content": "stale"}, expected_revision="0")
-    assert _meta(world) == before and world._memory.get(world.pid)["memory"] == "old"
+    assert _payload(world) == before
 
 
-def test_I1_a_failed_rewrite_releases_the_lock_and_changes_nothing(world, edit_lock_redis):
-    def boom():
-        raise RuntimeError("embedder down")
-
-    world._memory.before_update = boom
-    with pytest.raises(RuntimeError):
-        world.patch_memory(world.pid, "u", {"content": "x"}, expected_revision="0")
-    assert edit_lock_redis.store == {} and world._memory.get(world.pid)["memory"] == "old"
-    world.patch_memory(world.pid, "u", {"tags": ["ok"]}, expected_revision="0")
-
-
-def test_I2_many_successors_after_a_commit_never_turn_it_into_a_conflict(world):
-    world.patch_memory(world.pid, "u", {"tags": ["mine"]}, expected_revision="0")      # committed
+def test_I2_seventy_successors_after_a_commit_never_turn_it_into_a_conflict(world):
+    world.patch_memory(world.pid, "u", {"tags": ["mine"]}, expected_revision="0")
     for r in range(1, 71):
         world.patch_memory(world.pid, "u", {"tags": [f"s{r}"]}, expected_revision=str(r))
-    assert _meta(world)["revision"] == 71
+    assert _payload(world)["metadata"]["revision"] == 71
 
 
-def test_I3_a_lost_lock_fails_the_writer_before_it_can_write(world, edit_lock_redis, monkeypatch):
-    real_title = edit.distill_title
+def test_I3_exactly_one_of_n_concurrent_edits_wins_each_round_on_the_real_engine(world):
+    for round_no in range(10):
+        pid = str(uuid.uuid4())
+        world.client.upsert("c", points=[PointStruct(id=pid, vector={"": _embed("old")}, payload={
+            "data": "old", "hash": "h", "user_id": "u", "created_at": "2026-01-01T00:00:00+00:00",
+            "metadata": {"owner_user_id": "u", "visibility": "private", "category": "personal_fact",
+                         "scope": "global", "project_id": None, "tags": ["t0"]}})])
+        n = 6
+        barrier = threading.Barrier(n)
+        results = []
 
-    def steal(text):
-        edit_lock_redis.store[f"ns:edit-lock:{world.pid}"] = "thief"
-        return real_title(text)
+        def attempt(i):
+            barrier.wait()
+            try:
+                world.patch_memory(pid, "u", {"content": f"writer {i} round {round_no}"}, expected_revision="0")
+                results.append(("win", i))
+            except RevisionConflict:
+                results.append(("lose", i))
 
-    monkeypatch.setattr(edit, "distill_title", steal)
-    with pytest.raises(EditBusy):
-        world.patch_memory(world.pid, "u", {"content": "stalled"}, expected_revision="0")
-    assert world._memory.get(world.pid)["memory"] == "old" and "revision" not in _meta(world)
+        threads = [threading.Thread(target=attempt, args=(i,)) for i in range(n)]
+        [t.start() for t in threads]
+        [t.join(timeout=60) for t in threads]
+        wins = [i for kind, i in results if kind == "win"]
+        assert len(results) == n and len(wins) == 1, (round_no, results)
+        assert _payload(world, pid)["data"] == f"writer {wins[0]} round {round_no}"
 
 
-def test_I3_a_lock_that_expires_during_the_re_embed_lets_B_commit_and_A_changes_nothing(world, edit_lock_redis):
-    def expire_then_B():
-        edit_lock_redis.store.pop(f"ns:edit-lock:{world.pid}", None)
-        world.patch_memory(world.pid, "u", {"content": "B's text"}, expected_revision="0")
+def test_I4_a_stalled_writer_resumes_after_a_later_edit_and_the_vector_is_the_final_texts(world, monkeypatch):
+    real = world.client.update_vectors
+    state = {"armed": True}
 
-    world._memory.before_embed = expire_then_B
-    with pytest.raises(RevisionConflict):
-        world.patch_memory(world.pid, "u", {"content": "A's text"}, expected_revision="0")
-    assert world._memory.get(world.pid)["memory"] == "B's text" and _meta(world)["revision"] == 1
+    def stalled(collection_name, points):
+        if state["armed"]:
+            state["armed"] = False          # A stalls right before its vector write; B edits meanwhile
+            world.patch_memory(world.pid, "u", {"content": "B's later text"}, expected_revision="1")
+        return real(collection_name, points)
+
+    monkeypatch.setattr(world.client, "update_vectors", stalled)
+    world.patch_memory(world.pid, "u", {"content": "A's text"}, expected_revision="0")
+    p = _payload(world)
+    assert p["data"] == "B's later text" and p["metadata"]["revision"] == 2
+    assert _vector(world) == pytest.approx(_unit(_embed("B's later text")))
+    assert p.get("vector_pending") is None and p["vector_revision"] == 2
+
+
+def test_I4_a_delete_during_the_edit_is_not_resurrected_on_the_real_engine(world, monkeypatch):
+    real = world.client.update_vectors
+
+    def delete_then_write(collection_name, points):
+        world.client.delete("c", points_selector=[world.pid])
+        return real(collection_name, points)
+
+    monkeypatch.setattr(world.client, "update_vectors", delete_then_write)
+    world.patch_memory(world.pid, "u", {"content": "racing a delete"}, expected_revision="0")
+    assert world.client.retrieve("c", ids=[world.pid]) == []
+
+
+def test_I4_a_crash_leaves_a_marker_and_repair_converges_on_the_real_engine(world, monkeypatch):
+    def crash(collection_name, points):
+        raise _Crash()
+
+    monkeypatch.setattr(world.client, "update_vectors", crash)
+    with pytest.raises(_Crash):
+        world.patch_memory(world.pid, "u", {"content": "crashed"}, expected_revision="0")
+    assert _payload(world)["vector_pending"] is True
+    monkeypatch.setattr(world.client, "update_vectors", QdrantClient.update_vectors.__get__(world.client))
+    out = world.repair_stale_vectors(min_age_s=0)
+    assert out["repaired"] == 1
+    assert _vector(world) == pytest.approx(_unit(_embed("crashed"))) and _payload(world).get("vector_pending") is None

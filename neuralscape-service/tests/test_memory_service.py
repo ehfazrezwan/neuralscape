@@ -1027,9 +1027,9 @@ class TestPatchMemory:
         service._memory.vector_store.get.return_value = _edit_point(meta=dict(_SHARED_META))
         result = service.patch_memory("m1", "robb", {"tags": ["project:bon002"]})
 
-        service._memory._update_memory.assert_not_called()
-        call = service._memory.vector_store.update.call_args
-        assert call.args[0] == "m1" or call.kwargs.get("vector_id") == "m1"
+        service._memory.vector_store.client.update_vectors.assert_not_called()   # metadata-only: no vector work
+        call = service._memory.vector_store.client.set_payload.call_args
+        assert call.kwargs["points"] is not None                                  # a filter-scoped compare-and-set
         new_meta = call.kwargs["payload"]["metadata"]
         assert new_meta["tags"] == ["project:bon002"]
         assert new_meta["owner_user_id"] == "javi"          # preserved
@@ -1044,9 +1044,9 @@ class TestPatchMemory:
         service._memory.vector_store.get.return_value = _edit_point(meta=meta)
         service.patch_memory('m1', 'ehfaz', changes)
         if 'content' in changes:
-            stored = service._memory._update_memory.call_args.kwargs['metadata']['metadata']
+            stored = service._memory.vector_store.client.set_payload.call_args.kwargs['payload']['metadata']
         else:
-            stored = service._memory.vector_store.update.call_args.kwargs['payload']['metadata']
+            stored = service._memory.vector_store.client.set_payload.call_args.kwargs['payload']['metadata']
         assert 'category_evidence' not in stored
         assert stored['visibility'] == 'shared' and stored['owner_user_id'] == 'ehfaz'
 
@@ -1061,9 +1061,9 @@ class TestPatchMemory:
         service._cascade_or_fallback_expire = MagicMock(return_value={"resolved": True})
         result = service.patch_memory("m1", "ehfaz", {"content": "New content"})
 
-        call = service._memory._update_memory.call_args
-        assert call.args[:2] == ("m1", "New content")
-        nested = call.kwargs["metadata"]["metadata"]
+        call = service._memory.vector_store.client.set_payload.call_args
+        assert call.kwargs["payload"]["data"] == "New content"
+        nested = call.kwargs["payload"]["metadata"]
         assert nested["category"] == "decision"
         assert nested["owner_user_id"] == "ehfaz"
         assert nested["visibility"] == "shared"
@@ -1120,7 +1120,7 @@ class TestPatchMemory:
         meta = {"category": "decision", "owner_user_id": "ehfaz", "visibility": "private"}
         service._memory.vector_store.get.return_value = _edit_point(meta=meta)
         service.patch_memory("m1", "ehfaz", {"category": "tech_stack", "project_id": "p1"})
-        new_meta = service._memory.vector_store.update.call_args.kwargs["payload"]["metadata"]
+        new_meta = service._memory.vector_store.client.set_payload.call_args.kwargs["payload"]["metadata"]
         assert new_meta["scope"] == "project" and new_meta["project_id"] == "p1"
 
     def test_clearing_project_id_flips_flexible_scope_to_global(self, service):
@@ -1134,7 +1134,7 @@ class TestPatchMemory:
                           "edges_expired": 0, "nodes_removed": 0, "summaries_cleared": 0}
         )
         result = service.patch_memory("m1", "ehfaz", {"project_id": None})
-        new_meta = service._memory.vector_store.update.call_args.kwargs["payload"]["metadata"]
+        new_meta = service._memory.vector_store.client.set_payload.call_args.kwargs["payload"]["metadata"]
         assert new_meta["scope"] == "global" and new_meta["project_id"] is None
         # private user--ehfaz--project--neuralscape → user--ehfaz: partition moved
         assert result["graph"] == "migration_pending"
@@ -1253,7 +1253,7 @@ class TestRetagMemories:
         )
         assert result["matched"] == 2 and result["updated"] == 2
         payloads = [c.kwargs["payload"]["metadata"] for c in
-                    service._memory.vector_store.update.call_args_list]
+                    service._memory.vector_store.client.set_payload.call_args_list]
         assert payloads[0]["tags"] == ["project:bon002"]
         assert payloads[1]["tags"] == ["keep", "project:bon002"]
         assert result["graph_jobs"] == []  # no project change → no graph work
@@ -1274,7 +1274,7 @@ class TestRetagMemories:
         self._scroll_returning(service, pts)
         result = service.retag_memories("robb", {"category": "decision"}, {"add_tags": ["already"]})
         assert result["matched"] == 1 and result["updated"] == 0
-        service._memory.vector_store.update.assert_not_called()
+        service._memory.vector_store.client.set_payload.assert_not_called()
 
     def test_retag_dry_run_writes_nothing(self, service):
         pts = [_edit_point("m1", meta=dict(_SHARED_META))]
@@ -1283,7 +1283,7 @@ class TestRetagMemories:
             "robb", {"category": "decision"}, {"add_tags": ["t"]}, dry_run=True
         )
         assert result["updated"] == 1 and result["dry_run"] is True
-        service._memory.vector_store.update.assert_not_called()
+        service._memory.vector_store.client.set_payload.assert_not_called()
 
     def test_retag_project_change_produces_graph_jobs(self, service):
         service._expire_graph_edges_for_memory = MagicMock()
