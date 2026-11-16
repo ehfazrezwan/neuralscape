@@ -13,7 +13,9 @@ this file and drive the real path:
 * graphify-lib: in-process, on by default with the code-graph extra.
 * CBM (``CBM_ENABLED=true``): needs the cbm-bridge container and binary, which the
   standard store stack does not run. It runs when ``CBM_BRIDGE_URL`` is reachable
-  and skips with that reason otherwise.
+  and otherwise skips, except under NS_INTEGRATION_REQUIRED where it FAILS naming
+  CBM_BRIDGE_URL (a gate profile without CBM sets NS_INTEGRATION_WAIVE=cbm).
+  The decision lives in ``cbm_gate.py``.
 
 Needs the fixtures from the integration-test convention (``stores``, ``llm_key``,
 ``flags``, ``unique_ns``).
@@ -23,8 +25,6 @@ from __future__ import annotations
 
 import asyncio
 import importlib
-import os
-import urllib.request
 from pathlib import Path
 
 import pytest
@@ -227,29 +227,19 @@ def test_graphify_lib_binds_and_answers_for_code_repos_fixture(unique_ns, code_r
     assert "parse_arguments" in n.content, n.content
 
 
-def _cbm_bridge_url() -> str | None:
-    url = os.environ.get("CBM_BRIDGE_URL")
-    if not url:
-        return None
-    try:
-        with urllib.request.urlopen(url.rstrip("/") + "/health", timeout=3) as resp:  # noqa: S310
-            return url if resp.status == 200 else None
-    except Exception:  # noqa: BLE001
-        return None
-
-
 def test_cbm_engine_indexes_and_answers_when_bridge_reachable(unique_ns, code_repos, repo_dir, registry_snapshot, monkeypatch):
     """Needs the cbm-bridge container + CBM binary (not in the standard store stack).
 
     The bridge indexes by path, so the repo copy's directory must be visible to the
     bridge container too (run with TMPDIR on a shared mount).
     """
-    url = _cbm_bridge_url()
-    if url is None:
-        pytest.skip(
-            "cbm-bridge not reachable: set CBM_BRIDGE_URL to a running cbm-bridge "
-            "(the gate's store stack does not run it)"
-        )
+    from integration_tests.cbm_gate import FAIL, SKIP, cbm_decision
+
+    action, reason = cbm_decision()
+    if action == FAIL:
+        pytest.fail(reason, pytrace=False)
+    if action == SKIP:
+        pytest.skip(reason)
     import knowledge
 
     monkeypatch.setenv("CBM_ENABLED", "true")

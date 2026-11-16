@@ -78,12 +78,41 @@ def auth_settings():
         setattr(settings, f, v)
 
 
-class _Req:
-    """Minimal stand-in for fastapi.Request used by provider.complete()."""
+@pytest.fixture(autouse=True)
+def _login_nonce_store(monkeypatch):
+    """In-memory stand-in for the Redis single-use claim of a login nonce."""
+    used: set[str] = set()
 
-    def __init__(self, query=None, form=None):
+    async def _consume(nonce):
+        if nonce in used:
+            return False
+        used.add(nonce)
+        return True
+
+    monkeypatch.setattr(lp, "_consume_login_nonce", _consume)
+    return used
+
+
+class _Req:
+    """Minimal stand-in for fastapi.Request used by provider.complete().
+
+    ``cookies`` defaults to the browser that started the login: the binding
+    cookie matching the request's own login_state (the happy path). Pass
+    ``cookies={}`` (no cookie) or another browser's cookie to model an attack.
+    """
+
+    def __init__(self, query=None, form=None, cookies=None):
         self.query_params = query or {}
         self._form = form or {}
+        if cookies is None:
+            parsed = lp.verify_login_state_nonce(
+                (self.query_params.get("state") or self._form.get("state") or ""), _SECRET
+            )
+            cookies = (
+                {lp.login_binding_cookie_name(): lp.sign_login_binding(parsed[1], _SECRET)} if parsed else {}
+            )
+        self.cookies = cookies
+        self.headers = {"cookie": "; ".join(f"{k}={v}" for k, v in cookies.items())}
 
     async def form(self):
         return self._form
