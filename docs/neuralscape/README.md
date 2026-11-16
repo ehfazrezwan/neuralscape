@@ -21,6 +21,7 @@ Comprehensive reference for the Neuralscape codebase. Read in order or jump to w
 | 28 | [Hybrid Inference Evaluation](./28-hybrid-inference-evaluation.md) | Decision-model and small-local-model feasibility, graph/vector acceptance checks, measured cost/latency, limitations and opt-in testing |
 | 29 | [Source Extraction Evaluation](./29-source-extraction-evaluation.md) | Source-selection redesign, held-out extraction benchmarks, graph/vector validation and fallback tradeoffs |
 | 31 | [Usage Scenario Reports](./31-usage-scenario-reports.md) | Per-person scenario reports and the usage pilot |
+| 32 | [Durable Writes](./32-durable-writes.md) | The ledger write path (`LEDGER_ENABLED`): which writes it takes, idempotency and revisions, the ledger worker, online cutover, retention, holds |
 
 ## Quick links by audience
 

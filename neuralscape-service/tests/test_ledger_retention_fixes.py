@@ -339,6 +339,57 @@ def scenario_a_marker_in_the_earlier_key_format_is_still_finished(store) -> None
     assert payloads.get("intent-p8") is None and pending_markers(payloads) == []
 
 
+# ------------------------------------------------------------------ P-08 (C13): a hold on what a write created
+def scenario_a_hold_on_the_record_a_write_created_keeps_the_creating_intents_payload(store) -> None:
+    """A raw write names no memory id when it is accepted (its source record is ``write-<intent>``); the id it
+    created exists only as a stage output.  A hold placed on that memory must protect the intent that created
+    it, or its original content is pruned at the end of the window although the record is held."""
+
+    ledger = store.open()
+    run_to_terminal(store, ledger, "created", record="write-intent-created")
+    outputs = [ref.id for receipt in ledger.receipts(T, "intent-created") for ref in receipt.output_refs]
+    assert outputs and "write-intent-created" not in outputs  # the created id is only in the receipts
+    payloads = Payloads()
+    payloads.put("intent-created", {"content": "the memory the hold exists to keep"})
+    ledger.place_hold(T, "hold-created", outputs[0], "legal", "counsel", "cred-c")
+    store.age(60 * DAY)
+    report = RetentionSweeper(ledger, POLICY, payloads=payloads).sweep(T)
+    assert report.content_compacted == 0 and report.idempotency_released == 0
+    assert "intent-created" in payloads.rows, "the held memory's creating payload was deleted"
+    assert [ref.id for receipt in ledger.receipts(T, "intent-created") for ref in receipt.output_refs] == outputs
+    ledger.release_hold(T, "hold-created", "counsel", "closed")
+    again = RetentionSweeper(ledger, POLICY, payloads=payloads).sweep(T)
+    assert again.content_compacted == 1 and "intent-created" not in payloads.rows  # released: pruned in full
+
+
+def scenario_an_aggregated_output_list_is_held_while_any_hold_exists_in_the_tenant(store) -> None:
+    """Past the receipt's output bound the list lives behind one handle the ledger cannot read: while the
+    tenant has any active hold, that intent is left whole rather than guessed at."""
+
+    from contracts_references import ReferenceHandle
+    from ledger.dispatch import Applied, StageContext
+    from tests.test_ledger_dispatch import Handler, all_handlers, drain
+    from ledger.dispatch import StageWorker
+    from receipts import STAGE_OUTPUTS_RESOLVER
+
+    class Aggregated(Handler):
+        def apply(self, ctx: StageContext) -> Applied:
+            self.external.put(ctx)
+            return Applied((ReferenceHandle(kind="artifact", id=f"{ctx.intent.id}:outputs-job:1", tenant_id=ctx.tenant_id,
+                                            resolver=STAGE_OUTPUTS_RESOLVER),))
+
+    ledger = store.open()
+    external = store.external()
+    ledger.accept(make("big", record="write-big"))
+    drain(StageWorker(ledger, all_handlers(external, **{ProcessingStage.VECTOR: Aggregated(external)}), owner="w"), limit=4)
+    assert ledger.get_intent(T, "intent-big").status is IntentStatus.APPLIED
+    ledger.place_hold(T, "hold-other", "mem-somewhere", "legal", "counsel", "cred-c")
+    store.age(60 * DAY)
+    assert RetentionSweeper(ledger, POLICY).sweep(T).content_compacted == 0
+    ledger.release_hold(T, "hold-other", "counsel", "closed")
+    assert RetentionSweeper(ledger, POLICY).sweep(T).content_compacted == 1
+
+
 FIX_SCENARIOS = {
     name.removeprefix("scenario_"): fn for name, fn in sorted(globals().items()) if name.startswith("scenario_")
 }

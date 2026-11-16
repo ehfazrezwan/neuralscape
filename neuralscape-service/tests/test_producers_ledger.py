@@ -718,3 +718,51 @@ def test_effect_ids_of_the_v1_write_path_differ_across_tenants(tmp_path) -> None
         payloads.close()
         ledger.close()
     assert not effects[0] & effects[1]
+
+
+# ----------------------------------------------------------- P-08 (C12): identical writes, no Idempotency-Key
+def identical_writes_without_a_key_scenario(ledger, payloads) -> None:
+    """The contract, shown on whichever ledger backend is passed in.
+
+    Without a client key every request is its own intent: the ledger cannot tell a retry from a second,
+    deliberate save, and a content-derived key would let a re-save of deleted content be skipped as a replay
+    of the old receipt.  A client that wants retry safety sends ``Idempotency-Key``.  What stays true without
+    one: applying the same content one intent after another leaves one row (the service's content-hash dedup),
+    and a re-save after a delete is executed.
+    """
+
+    service = Service()
+    producer = DurableWriteProducer(ledger, payloads)
+    env_ = (ledger, payloads, producer, service)
+    payload = {"content": "prefers dark mode", "user_id": "user-1", "category": "preference"}
+
+    first = producer.accept_raw(user_id="user-1", payload=dict(payload))
+    second = producer.accept_raw(user_id="user-1", payload=dict(payload))
+    assert first.created and second.created and first.intent_id != second.intent_id
+
+    keyed = [producer.accept_raw(user_id="user-1", payload=dict(payload), idempotency_key="retry-1") for _ in range(3)]
+    assert len({result.intent_id for result in keyed}) == 1 and [result.created for result in keyed] == [True, False, False]
+    with pytest.raises(IdempotencyConflict):
+        producer.accept_raw(user_id="user-1", payload={**payload, "content": "something else"}, idempotency_key="retry-1")
+
+    drain(env_)
+    assert len(service.rows) == 1 and service.store_calls == 3  # three distinct intents, one stored row
+    (memory_id,) = service.rows
+    for intent_id in (first.intent_id, second.intent_id, keyed[0].intent_id):
+        assert ledger.get_intent(tenant_of(ledger, intent_id), intent_id).status is IntentStatus.APPLIED
+
+    deleted = producer.accept_delete(user_id="user-1", memory_id=memory_id,
+                                     memory_row={"owner_user_id": "user-1", "visibility": "private"})
+    drain(env_)
+    assert service.rows == {} and ledger.get_intent(T, deleted.intent_id).status is IntentStatus.APPLIED
+    again = producer.accept_raw(user_id="user-1", payload=dict(payload))
+    drain(env_)
+    assert again.created and len(service.rows) == 1  # the re-save was executed, not replayed from the old receipt
+
+
+def tenant_of(ledger, intent_id):
+    return T
+
+
+def test_identical_writes_without_a_key_are_distinct_intents_and_a_resave_after_a_delete_runs(env) -> None:
+    identical_writes_without_a_key_scenario(env[0], env[1])

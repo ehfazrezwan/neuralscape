@@ -54,6 +54,8 @@ There are three ARQ worker classes in `neuralscape-service/worker.py`, each cons
 | `GraphWorkerSettings` (slow) | `graph_queue_name` (`neuralscape:graph`) | `process_graph_enrichment`, `run_dream_sweep`, `process_session_summary` | dedup (`dedup_all_memories`, hours from `DEDUP_CRON_HOURS`; disabled when empty), `dream_sweep_cron`, `synthesize_strategy_playbooks_cron` |
 | `IngestWorkerSettings` (bulk) | `ingest_queue_name` (`neuralscape:ingest`) | `process_ingest_document`, `process_ingest_file`, `process_ingest_okf_bundle`, `process_connector_sync`, `process_code_index` | `connector_sync_cron` |
 
+A fourth class, `LedgerWorkerSettings` (queue `<ARQ_QUEUE_NAME>:ledger`), exists only for the durable write path and runs only when `LEDGER_ENABLED` is on; see [32-durable-writes](./32-durable-writes.md).
+
 For example, `process_memory_raw` does the vector write and defers Graphiti enrichment to a `process_graph_enrichment` job on the graph queue, so the task result reflects the vector write while enrichment finishes later on the graph worker. The shape of the fast worker's settings is:
 
 ```python
