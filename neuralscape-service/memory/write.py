@@ -986,7 +986,11 @@ class WriteMixin:
 
         # ── Direct embed + Qdrant insert (bypass m.add) ──
         m = self._get_memory()
-        embedding = m.embedding_model.embed(content, memory_action="add")
+        # Retry transient embed errors (e.g. a request timeout) before any row is
+        # written; the retry wraps only the embedding request.
+        embedding = retry_transient(
+            m.embedding_model.embed, content, memory_action="add", operation="raw store embed"
+        )
         self._finalize_raw_store(
             prepared,
             embedding,
@@ -1781,7 +1785,10 @@ class WriteMixin:
         # ── Pass 2: ONE batch embed for all new items, then per-item work ──
         new_texts = [p["content"] for kind, p in entries if kind == "new"]
         embeddings = (
-            m.embedding_model.embed_batch(new_texts, memory_action="add")
+            retry_transient(
+                m.embedding_model.embed_batch, new_texts, memory_action="add",
+                operation="raw batch embed",
+            )
             if new_texts
             else []
         )
@@ -2231,7 +2238,10 @@ class WriteMixin:
         # Skipped entirely when everything dedup'd — a straight ARQ re-run of
         # an already-stored conversation inserts ZERO new points.
         if texts:
-            embeddings = m.embedding_model.embed_batch(texts, memory_action="add")
+            embeddings = retry_transient(
+                m.embedding_model.embed_batch, texts, memory_action="add",
+                operation="fact batch embed",
+            )
             # Validate embed count matches text count before zipping — a
             # misaligned embed/fact zip silently writes garbage vectors.
             if len(embeddings) != len(texts):
