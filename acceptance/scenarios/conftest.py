@@ -59,7 +59,10 @@ def check_search_finds_marker(client, fact: Fact) -> None:
 
 @pytest.fixture(scope="session")
 def a_fact(ctx, a) -> Fact:
-    marker = f"zq-{ctx.run_id}-marker"
+    # The profile is part of the marker: a gate pins one run id across every profile of a run and a write's job
+    # id is derived from its content, so a later profile re-submitting the same text would be answered with the
+    # earlier profile's finished job (still in Redis) and never store the fact in its own fresh stores.
+    marker = f"zq-{ctx.run_id}-{ctx.profile}-marker"
     fact = Fact(
         marker=marker,
         content=(

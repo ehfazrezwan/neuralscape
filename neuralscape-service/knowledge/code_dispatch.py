@@ -325,7 +325,9 @@ def _resolve_cbm_engine(code_space: str, settings, *, for_index: bool):
     if ent is not None:
         engine = ent
     else:
-        bridge_url = os.getenv("CBM_BRIDGE_URL", "http://cbm-bridge:8200")
+        from config import process_env_or
+
+        bridge_url = process_env_or("CBM_BRIDGE_URL", settings.cbm_bridge_url)
         engine = CBMEngine(bridge_url=bridge_url, code_space=code_space)
         _cbm_cache[code_space] = engine
 

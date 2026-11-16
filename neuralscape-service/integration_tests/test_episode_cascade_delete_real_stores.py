@@ -12,9 +12,10 @@ extracted facts). Then:
 3. a bulk private delete of the user leaves zero rows and zero live edges in
    the user's group.
 
-Invoked explicitly (outside ``tests/``). A missing or unreachable service is a
-test FAILURE, never a skip. Required env: NEO4J_URI, NEO4J_USER, NEO4J_PASSWORD,
-QDRANT_URL, GOOGLE_API_KEY (the LLM).
+Uses the integration fixtures (``stores``, ``llm_key``, ``flags``, ``unique_ns``):
+the rows live in a throwaway Qdrant collection dropped afterwards, the user's
+graph group is purged by ``unique_ns.on_cleanup``. On the gate
+(``NS_INTEGRATION_REQUIRED=1``) missing stores or key fail the test.
 """
 
 from __future__ import annotations
@@ -22,41 +23,40 @@ from __future__ import annotations
 import third_party_telemetry  # noqa: F401  (telemetry guard; must precede mem0/graphiti imports)
 
 import asyncio
-import os
 import time
-import uuid
 
 import pytest
 
 from integration_tests.cascade_markers import VICTIM_MARKER, conversation, select_victims
 
-pytestmark = pytest.mark.integration
 
-REQUIRED_ENV = ("NEO4J_URI", "NEO4J_USER", "NEO4J_PASSWORD", "QDRANT_URL", "GOOGLE_API_KEY")
+@pytest.fixture
+def svc(flags, stores, llm_key, unique_ns):
+    from qdrant_client import QdrantClient
 
-
-@pytest.fixture(scope="module")
-def svc():
-    missing = [k for k in REQUIRED_ENV if not os.environ.get(k)]
-    assert not missing, f"integration environment incomplete, missing: {missing}"
+    flags(qdrant_collection=unique_ns.qdrant_collection, qdrant_url=stores.qdrant_url)
+    unique_ns.on_cleanup(
+        lambda: QdrantClient(url=stores.qdrant_url).delete_collection(unique_ns.qdrant_collection)
+    )
     from memory_service import MemoryService
 
     service = MemoryService()
     service._get_memory()  # real mem0 + Graphiti; raises if a store is unreachable
     assert service._graphiti is not None and service._bridge is not None, "graph store not initialised"
-    yield service
+    return service
 
 
 @pytest.fixture
-def user(svc):
-    uid = f"it-epcascade-{uuid.uuid4().hex[:12]}"
-    yield uid
-    # Always clean up: vectors + every graph node/edge in the user's groups.
-    try:
-        svc.delete_memories(user_id=uid, include_shared=True)
-    finally:
+def user(svc, unique_ns):
+    uid = unique_ns.user_id
+
+    def _purge():
+        # vectors are dropped with the collection; remove every graph node/edge in the user's group
         _cypher(svc, "MATCH (n {group_id: $g}) DETACH DELETE n", g=f"user--{uid}")
         _cypher(svc, "MATCH ()-[r:RELATES_TO {group_id: $g}]->() DELETE r", g=f"user--{uid}")
+
+    unique_ns.on_cleanup(_purge)
+    return uid
 
 
 def _cypher(svc, query: str, **params):
