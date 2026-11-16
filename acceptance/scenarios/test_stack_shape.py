@@ -5,10 +5,10 @@ queue completes a job, and the API logs structured JSON events.
   stack (API, the three ARQ workers, Neo4j, Redis, Qdrant) are all running, none has exited
   or restarted, and every one that declares a health check reports healthy.
 - Worker queues: a job completes on the fast (main), the graph and the ingest queue. The cron
-  schedules of those workers are not observable in a run this short and are not claimed.
+  schedules of those workers are not observable in a run this short and are not claimed; which worker
+  served which queue is not asserted either.
 - Logging: the API's stdout lines that are JSON are structlog events. The request-id header
-  and the level/timestamp keys on every line are the sec-08 behaviour: **expected red until
-  sec-08 (PR 515)**.
+  and the level/timestamp keys on every line are the behaviour of PR 515 (on dev): real findings if red.
 """
 
 from __future__ import annotations
@@ -17,7 +17,7 @@ import json
 import os
 
 from conftest import GraphSeed
-from nsaccept import eventually, expect_check_fails, expected_red, needs, negative_control, proves
+from nsaccept import eventually, expect_check_fails, needs, negative_control, proves
 from nsaccept.client import NSClient
 from nsaccept.helpers import graph_listing
 from nsaccept.runctx import app_services, container_restart_count, parse_ps_json, qdrant_service
@@ -111,7 +111,7 @@ def test_stack_shape_check_fails_for_an_exited_unhealthy_restarted_or_absent_ser
 # ── worker queues ────────────────────────────────────────────────
 
 
-@proves("queue.arq-workers")
+@proves("queue.task-manager")
 def test_a_job_completes_on_each_of_the_main_graph_and_ingest_queues(ctx, a, a_fact, graph_seed: GraphSeed):
     """A job completes on each of the three queues (not a proof of the worker split). main: the raw write task completed (fast worker). ingest: a text ingest runs to completion on the
     ingest worker. graph: the first seed write's episode was written by the graph worker."""
@@ -134,7 +134,7 @@ def test_a_job_completes_on_each_of_the_main_graph_and_ingest_queues(ctx, a, a_f
     )
 
 
-@proves("queue.arq-workers")
+@proves("queue.task-manager")
 @negative_control
 def test_queue_checks_fail_for_a_job_that_never_ran(ctx, a, graph_seed: GraphSeed):
     graph_seed.first.require()
@@ -159,17 +159,15 @@ def test_the_api_log_is_json_events(ctx, a):
 
 
 @proves("ops.structured-logging")
-@expected_red("#515")
 @needs("compose")
 def test_every_json_log_line_carries_level_and_timestamp(ctx, a):
-    """Expected red until sec-08 (PR 515): plain `logging` records are rendered without level or timestamp today."""
+    """Request-id / structlog behaviour of PR 515: every JSON line carries level and timestamp."""
     check_levelled_timestamped(api_log_tail(ctx, a))
 
 
 @proves("ops.structured-logging")
-@expected_red("#515")
 def test_each_response_echoes_or_generates_a_request_id(ctx, a, anon):
-    """Expected red until sec-08 (PR 515): a sane incoming X-Request-ID is echoed, an unsafe one is replaced by a
+    """PR 515 behaviour: a sane incoming X-Request-ID is echoed, an unsafe one is replaced by a
     generated id, and a request without one gets one, on 200s and on auth rejections alike."""
     rid = f"zq-{ctx.run_id}-rid"
     check_request_id_echo(a.get("/v1/queue/status", headers={"X-Request-ID": rid}).headers, rid)
