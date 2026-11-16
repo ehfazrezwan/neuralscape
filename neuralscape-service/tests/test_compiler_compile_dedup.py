@@ -138,3 +138,58 @@ def test_owner_ids_with_parentheses_or_percent_round_trip(writer, owner):
     (entry,) = writer.get_daily_log_entries("2026-05-16")
     assert entry["user_id"] == owner
     assert entry["content"] == "Chose X" and entry["session_id"] == "s"
+
+
+# ── a date with no entries still dedups for the requesting user ───────
+
+
+@pytest.mark.asyncio
+async def test_explicit_compile_of_an_empty_date_still_dedups_the_requester(writer):
+    """The vault only gets *shared* facts, so a user with only private memories
+    has no entries for any date; their /compile must still run dedup."""
+    service = MagicMock()
+    result = await _compile(writer, service, date="2026-05-20", user_id="alice")
+    assert result.entries_compiled == 0 and result.articles == []
+    service.dedup_memories.assert_called_once()
+    assert service.dedup_memories.call_args.args[0] == "alice"
+    assert result.dedup_triggered is True
+
+
+@pytest.mark.asyncio
+async def test_empty_date_dedup_failure_is_reported_not_raised(writer):
+    service = MagicMock()
+    service.dedup_memories.side_effect = RuntimeError("qdrant down")
+    result = await _compile(writer, service, date="2026-05-20", user_id="alice")
+    assert result.dedup_triggered is False
+
+
+@pytest.mark.asyncio
+async def test_empty_date_dedup_honours_dreaming_and_enqueues_graph_jobs(writer, monkeypatch):
+    from extensions.conversation_compiler import compile as compile_mod
+    from extensions.dreaming.config import dreaming_settings
+
+    monkeypatch.setattr(dreaming_settings, "enabled", True)
+    enq = AsyncMock(return_value=(1, 0))
+    monkeypatch.setattr(compile_mod, "_enqueue_sibling_jobs", enq)
+    service = MagicMock()
+    service.dedup_memories.return_value = {"graph_jobs": [{"memory_id": "m1"}]}
+    result = await _compile(writer, service, date="2026-05-20", user_id="alice")
+    service.dedup_memories.assert_called_once_with("alice", semantic=False)
+    assert result.dedup_graph_jobs_enqueued == 1
+
+
+@pytest.mark.asyncio
+async def test_backlog_compile_does_not_dedup_once_per_empty_date(writer):
+    # two dated logs that parse to no entries: compile_all_pending must not scan the pool for each
+    for d in ("2026-05-14", "2026-05-15"):
+        path = writer._raw_path(f"Daily/{d}.md")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("---\ncompiled: false\n---\n# empty\n")
+    service = MagicMock()
+    with patch(
+        "extensions.conversation_compiler.compile._async_call_gemini",
+        new=AsyncMock(return_value="summary"),
+    ):
+        results = await compile_all_pending(service, writer, user_id="alice")
+    assert len(results) == 2
+    service.dedup_memories.assert_not_called()
