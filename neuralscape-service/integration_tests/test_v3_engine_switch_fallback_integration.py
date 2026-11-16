@@ -23,7 +23,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from tests.test_v3_engine_switch_integration import (  # noqa: F401  (fixture and helpers)
+from test_v3_engine_switch_integration import (  # noqa: F401  (fixture and helpers)
     PG_DSN,
     QDRANT_URL,
     REDIS_URL,
@@ -33,13 +33,13 @@ from tests.test_v3_engine_switch_integration import (  # noqa: F401  (fixture an
     world,
 )
 
-pytestmark = [
-    pytest.mark.integration,
-    pytest.mark.skipif(
-        not (REDIS_URL and QDRANT_URL and PG_DSN),
-        reason="V1_TEST_REDIS_URL, ENGINE_TEST_QDRANT_URL and ENGINE_TEST_PG_DSN are not all set (V3 switch integration)",
-    ),
-]
+from ledger_env import require_env  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _fail_when_required_store_is_missing():
+    require_env(Redis=REDIS_URL, Qdrant=QDRANT_URL, PostgreSQL=PG_DSN)
+
 
 import engine_adapters_switch as sw  # noqa: E402
 from engine_ports import EngineRecord, OperationContext  # noqa: E402

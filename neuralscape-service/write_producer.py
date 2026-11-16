@@ -1731,10 +1731,10 @@ class _LegacyJob(_Base):
             target = getattr(worker_module, spec.target)
             target = getattr(target, "__wrapped__", target)  # the cutover fence guards legacy queue jobs, not ledger stages
             result = self.w.await_(target(self.w.job_ctx, *[job.get(k) for k in spec.args]))
-        elif spec.kind == "service_method":
+        else:  # service_method
             result = getattr(self.w.service, spec.target)(**{k: job.get(k) for k in spec.args})
-        else:  # mem0
-            result = getattr(self.w.service._get_memory(), spec.target)(**{k: job.get(k) for k in spec.args})
+        if isinstance(result, list):  # extract_and_store returns the stored rows
+            result = {"memories": [{"id": getattr(m, "id", None)} for m in result]}
         return self._outcome(result, ctx)
 
     def _outcome(self, result: Any, ctx: StageContext):
@@ -1749,6 +1749,9 @@ class _LegacyJob(_Base):
             raise StageFailure("partial_extraction", "extraction was partial; retrying", retryable=True)
         if result.get("graph_cascade_unresolved_ids"):
             raise StageFailure("graph_cascade_unresolved", "graph cleanup could not be verified", retryable=False)
+        if result.get("failed_ids") or result.get("truncated"):
+            # A delete that left rows behind is not applied; repeating it is safe (see ``reentrancy``).
+            raise StageFailure("delete_incomplete", "the delete did not reach every row", retryable=True)
         ids = [m.get("id") for m in result.get("memories", []) if isinstance(m, dict) and m.get("id")]
         ids += [i for i in result.get("memory_ids", []) if isinstance(i, str)]
         unique = list(dict.fromkeys(ids))

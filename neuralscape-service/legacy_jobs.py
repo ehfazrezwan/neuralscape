@@ -26,7 +26,7 @@ from contracts_lifecycle import ProcessingStage
 class JobSpec:
     operation: str
     stage: ProcessingStage
-    kind: str  # "worker_fn" (async function in worker.py) | "service_method" | "mem0"
+    kind: str  # "worker_fn" (async function in worker.py) | "service_method"
     target: str
     args: tuple[str, ...] = ()
     system: bool = False  # started by a cron under a service/worker principal
@@ -72,10 +72,10 @@ JOB_SPECS: dict[str, JobSpec] = {
                            "(support-aware); a memory deleted meanwhile is skipped"),
         JobSpec("derivatives.retract", G, "service_method", "rescope_private_derivatives", ("user_id", "dry_run"),
                 reentrancy="retracting already-retracted derivatives is a no-op"),
-        JobSpec("memory.add.legacy", V, "mem0", "add", ("messages", "user_id", "agent_id", "run_id", "metadata"),
-                reentrancy="mem0 add is not idempotent: a crash after the write can add twice"),
-        JobSpec("memory.delete_all.legacy", V, "mem0", "delete_all", ("user_id", "agent_id", "run_id"),
-                reentrancy="deleting the same scope twice deletes nothing the second time"),
+        JobSpec("memory.add.legacy", V, "service_method", "extract_and_store", ("messages", "user_id", "agent_id", "run_id"),
+                reentrancy="stores dedup by content hash; extraction is repeated"),
+        JobSpec("memory.delete_all.legacy", V, "service_method", "delete_memories", ("user_id",),
+                reentrancy="deleting the caller's memories twice deletes nothing the second time"),
     )
 }
 

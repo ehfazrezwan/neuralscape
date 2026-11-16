@@ -13,7 +13,7 @@ Because the legacy service has no tenant concept, shared-pool tenant isolation
 is not tested here; the tests use private pools, where isolation is enforced by
 the API-boundary policy and the fence.
 
-Needs ``V1_TEST_REDIS_URL`` (a disposable Redis; the tests FLUSH it).
+Needs a disposable Redis (``V1_TEST_REDIS_URL``, else database 14 of ``REDIS_URL``; the tests FLUSH it).
 """
 
 from __future__ import annotations
@@ -51,12 +51,12 @@ from write_producer import (
     ledger_queue_name,
 )
 
-REDIS_URL = os.environ.get("V1_TEST_REDIS_URL")
+from ledger_env import REDIS_URL, require_env  # noqa: E402
 
-pytestmark = [
-    pytest.mark.integration,
-    pytest.mark.skipif(not REDIS_URL, reason="V1_TEST_REDIS_URL not set (V1 governed memory integration)"),
-]
+@pytest.fixture(autouse=True)
+def _fail_when_required_store_is_missing():
+    """Missing Redis is a failure on the gate (NS_INTEGRATION_REQUIRED) and a skip elsewhere."""
+    require_env(**{"Redis (V1_TEST_REDIS_URL or REDIS_URL)": REDIS_URL})
 
 SECRET = "v1-integration-secret"
 CONTENT_ACTIONS = ("read", "search", "list", "create", "update", "delete", "background_derive")
@@ -226,7 +226,7 @@ async def connected_manager():
 
     manager = TaskManager()
     await manager.connect()
-    await manager.pool.flushall()
+    await manager.pool.flushdb()
     return manager
 
 

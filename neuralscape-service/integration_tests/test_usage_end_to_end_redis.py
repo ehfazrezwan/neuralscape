@@ -1,7 +1,7 @@
 """API write -> real Redis -> real ARQ worker -> durable usage, correlated.
 
-Needs ``V1_TEST_REDIS_URL`` pointing at a disposable Redis (the tests FLUSH it);
-skipped, with that reason, otherwise.  The same assertions hold without Redis in
+Needs a disposable Redis (``V1_TEST_REDIS_URL``, else database 14 of ``REDIS_URL``; the tests FLUSH it);
+a failure under ``NS_INTEGRATION_REQUIRED`` and a skip elsewhere when it is missing.  The same assertions hold without Redis in
 ``test_usage_end_to_end.py``/``..._route.py``; this adds the real queue and the
 production ``process_ledger_work`` entry point.
 """
@@ -15,7 +15,7 @@ import pytest
 import usage_capture as uc
 from config import settings
 from tests.test_usage_end_to_end import ExtractingService, _response
-from tests.test_v1_durable_write_integration import (  # noqa: F401  (fixtures)
+from test_v1_durable_write_integration import (  # noqa: F401  (fixtures)
     RAW,
     connected_manager,
     env,
@@ -24,12 +24,12 @@ from tests.test_v1_durable_write_integration import (  # noqa: F401  (fixtures)
 from usage_store import SqliteUsageStore, task_rollup
 from write_producer import DEFAULT_TENANT
 
-REDIS_URL = os.environ.get("V1_TEST_REDIS_URL")
+from ledger_env import REDIS_URL, require_env  # noqa: E402
 
-pytestmark = [
-    pytest.mark.integration,
-    pytest.mark.skipif(not REDIS_URL, reason="V1_TEST_REDIS_URL not set (usage end-to-end integration)"),
-]
+@pytest.fixture(autouse=True)
+def _fail_when_required_store_is_missing():
+    """Missing Redis is a failure on the gate (NS_INTEGRATION_REQUIRED) and a skip elsewhere."""
+    require_env(**{"Redis (V1_TEST_REDIS_URL or REDIS_URL)": REDIS_URL})
 
 
 @pytest.mark.asyncio

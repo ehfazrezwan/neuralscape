@@ -2152,6 +2152,48 @@ async def shutdown(ctx: dict) -> None:
     logger.info("ARQ worker stopped.")
 
 
+def _start_worker_engine_switch(ctx: dict, service: MemoryService) -> None:
+    """Install this process's engine switch so the ledger's vector stage projects into the routed engine.
+
+    The vector stage runs here, in the ledger worker, so ``projection_switch`` must find a switch in this
+    process (the API builds its own for the admin routes and routed recall).  Nothing is built unless
+    ``ENGINE_ROUTING_ENABLED`` is set and the ledger is open; a switch that cannot be built is reported by
+    ``engine_adapters_switch.start`` and the stage then skips the projection, exactly as with routing off.
+    """
+
+    if settings.engine_routing_enabled is not True or ctx.get("ledger") is None:
+        return
+    import engine_adapters_switch
+
+    producer = _producer_from_ctx(ctx)
+    store = getattr(service._get_memory(), "vector_store", None)
+    engine_adapters_switch.start(
+        settings,
+        ledger=ctx["ledger"],
+        service=service,
+        tenant_for=producer.tenant_for,
+        embed=lambda text: service._get_memory().embedding_model.embed(text),
+        qdrant_client=getattr(store, "client", None),
+    )
+
+
+async def ledger_startup(ctx: dict) -> None:
+    """``startup`` plus the engine switch, which only the process that runs the vector stage needs."""
+
+    await startup(ctx)
+    if ctx.get("ledger") is not None and ctx.get("service") is not None:
+        await asyncio.to_thread(_start_worker_engine_switch, ctx, ctx["service"])
+
+
+async def ledger_shutdown(ctx: dict) -> None:
+    import sys
+
+    module = sys.modules.get("engine_adapters_switch")  # never imported: nothing was started
+    if module is not None:
+        await asyncio.to_thread(module.stop)
+    await shutdown(ctx)
+
+
 class WorkerSettings:
     """Light/fast worker: vector writes, reads, conversation tasks, light crons.
 
@@ -2331,8 +2373,8 @@ class LedgerWorkerSettings:
             else []
         ),
     ]
-    on_startup = startup
-    on_shutdown = shutdown
+    on_startup = ledger_startup
+    on_shutdown = ledger_shutdown
     redis_settings = parse_redis_settings()
     queue_name = f"{settings.arq_queue_name}:ledger"
     max_jobs = 4

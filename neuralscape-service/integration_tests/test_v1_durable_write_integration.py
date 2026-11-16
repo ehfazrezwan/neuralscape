@@ -1,9 +1,9 @@
 """Durable write path against a real Redis, a real ARQ worker and a SQLite ledger.
 
-Needs ``V1_TEST_REDIS_URL`` pointing at a disposable Redis (the tests FLUSH it).
+Needs a disposable Redis (``V1_TEST_REDIS_URL``, else database 14 of ``REDIS_URL``; the tests FLUSH it).
 The memory service is a file-backed fake (no LLM, no embedder), so a worker
-process can be killed and the surviving state still inspected.  Skipped, with
-that reason, when the variable is unset.
+process can be killed and the surviving state still inspected.  A failure under
+``NS_INTEGRATION_REQUIRED`` and a skip elsewhere when Redis is missing.
 """
 
 from __future__ import annotations
@@ -30,12 +30,12 @@ from write_producer import (
     ledger_queue_name,
 )
 
-REDIS_URL = os.environ.get("V1_TEST_REDIS_URL")
+from ledger_env import REDIS_URL, require_env  # noqa: E402
 
-pytestmark = [
-    pytest.mark.integration,
-    pytest.mark.skipif(not REDIS_URL, reason="V1_TEST_REDIS_URL not set (durable write integration)"),
-]
+@pytest.fixture(autouse=True)
+def _fail_when_required_store_is_missing():
+    """Missing Redis is a failure on the gate (NS_INTEGRATION_REQUIRED) and a skip elsewhere."""
+    require_env(**{"Redis (V1_TEST_REDIS_URL or REDIS_URL)": REDIS_URL})
 
 RAW = dict(content="prefers dark mode", user_id="user-1", category="preference")
 
@@ -117,7 +117,7 @@ async def connected_manager():
 
     manager = TaskManager()
     await manager.connect()
-    await manager.pool.flushall()
+    await manager.pool.flushdb()
     return manager
 
 
@@ -258,7 +258,7 @@ async def test_queue_loss_after_dispatch_is_recovered_by_the_ledger_poll(env) ->
     try:
         task_id = await manager.enqueue_raw(**RAW)
         assert manager.ledger.scan_unqueued() == ()  # handed to the queue ...
-        await manager.pool.flushall()  # ... and the queue is lost
+        await manager.pool.flushdb()  # ... and the queue is lost
         await run_arq_worker(env, service)
         assert (await manager.get_status(task_id))["status"] == "queued"  # nothing ran: honest
 

@@ -178,13 +178,20 @@ def test_ledger_is_disabled_by_default_and_factory_validates(tmp_path: Path) -> 
     assert settings.ledger_enabled is False
     with pytest.raises(RuntimeError, match="disabled"):
         open_ledger(settings)
-    enabled = Settings(ledger_enabled=True, ledger_backend="sqlite", ledger_sqlite_path="")
+    # Settings itself refuses a ledger with nowhere to live (start-up, not the first write) ...
     with pytest.raises(ValueError, match="LEDGER_SQLITE_PATH"):
-        open_ledger(enabled)
+        Settings(ledger_enabled=True, ledger_backend="sqlite", ledger_sqlite_path="")
     with pytest.raises(ValueError, match="LEDGER_POSTGRES_DSN"):
-        open_ledger(Settings(ledger_enabled=True, ledger_backend="postgres"))
+        Settings(ledger_enabled=True, ledger_backend="postgres")
     with pytest.raises(ValueError, match="LEDGER_BACKEND"):
-        open_ledger(Settings(ledger_enabled=True, ledger_backend="redis"))
+        Settings(ledger_enabled=True, ledger_backend="redis")
+    # ... and the factory refuses the same settings if they were built without validation.
+    with pytest.raises(ValueError, match="LEDGER_SQLITE_PATH"):
+        open_ledger(Settings.model_construct(ledger_enabled=True, ledger_backend="sqlite", ledger_sqlite_path=""))
+    with pytest.raises(ValueError, match="LEDGER_POSTGRES_DSN"):
+        open_ledger(Settings.model_construct(ledger_enabled=True, ledger_backend="postgres", ledger_postgres_dsn=""))
+    with pytest.raises(ValueError, match="LEDGER_BACKEND"):
+        open_ledger(Settings.model_construct(ledger_enabled=True, ledger_backend="redis"))
     ledger = open_ledger(
         Settings(ledger_enabled=True, ledger_backend="sqlite", ledger_sqlite_path=str(tmp_path / "f.db"))
     )

@@ -125,7 +125,7 @@ def test_a_fenced_job_reaches_the_polling_client_as_fenced_not_completed() -> No
         async def result_info(self):
             return SimpleNamespace(success=True, result=dict(FENCED_RESULT))
 
-    async def find(task_id):
+    async def find(task_id, **_kw):
         return Job(), JobStatus.complete
 
     manager._find_job = find  # type: ignore[method-assign]
@@ -137,7 +137,7 @@ def test_a_fenced_job_reaches_the_polling_client_as_fenced_not_completed() -> No
         async def result_info(self):
             return SimpleNamespace(success=True, result={"status": "fenced", "other": "a job's own field"})
 
-    async def find_done(task_id):
+    async def find_done(task_id, **_kw):
         return Done(), JobStatus.complete
 
     manager._find_job = find_done  # type: ignore[method-assign]
@@ -176,58 +176,6 @@ def test_the_backfill_route_answers_503_when_the_memory_service_is_not_initializ
 
 # ================================================================== second review round
 # ---- waiting callers are told "fenced" too
-async def fenced_job(ctx):  # module level: ARQ names a function by its qualified name
-    return dict(FENCED_RESULT)
-
-
-async def normal_job(ctx):
-    return {"stored": 1}
-
-
-def _redis_url():
-    import os
-
-    return os.environ.get("V1_TEST_REDIS_URL")
-
-
-@pytest.mark.skipif(not _redis_url(), reason="V1_TEST_REDIS_URL not set (real ARQ and Redis)")
-def test_wait_for_result_reports_a_fenced_job_as_fenced_on_real_arq(monkeypatch) -> None:
-    import uuid
-
-    from arq import create_pool
-    from arq.worker import create_worker
-
-    import task_manager
-    from config import parse_redis_settings, settings
-
-    queue = f"fenced-test-{uuid.uuid4().hex[:8]}"
-    monkeypatch.setattr(settings, "redis_url", _redis_url())
-    monkeypatch.setattr(settings, "arq_queue_name", queue)
-
-    async def go():
-        pool = await create_pool(parse_redis_settings(), default_queue_name=queue)
-        manager = task_manager.TaskManager()
-        manager.pool = pool
-        fenced = await pool.enqueue_job("fenced_job", _queue_name=queue)
-        normal = await pool.enqueue_job("normal_job", _queue_name=queue)
-        worker = create_worker(
-            type("S", (), {"functions": [fenced_job, normal_job], "redis_settings": parse_redis_settings(),
-                           "queue_name": queue, "burst": True, "poll_delay": 0.05}),
-        )
-        await worker.async_run()
-        await worker.close()
-        waited = await manager.wait_for_result(fenced.job_id, timeout=10)
-        polled = await manager.get_status(fenced.job_id)
-        ordinary = await manager.wait_for_result(normal.job_id, timeout=10)
-        await pool.aclose()
-        return waited, polled, ordinary
-
-    waited, polled, ordinary = asyncio.run(go())
-    assert polled["status"] == "fenced", polled
-    assert waited["status"] == "fenced" and waited["error"] == "legacy_write_after_cutover"  # used to be "completed"
-    assert ordinary["status"] == "completed" and ordinary["result"] == {"stored": 1}
-
-
 def test_get_status_and_wait_share_one_fence_mapping() -> None:
     import task_manager
 

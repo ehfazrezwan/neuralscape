@@ -141,7 +141,7 @@ def wired(monkeypatch, tmp_path):
     install_or_refuse(None, job_owner=lambda tenant, job: owners.get(job))
     task_manager = MagicMock()
     task_manager.get_status = AsyncMock(
-        side_effect=lambda task_id, user_id=None: {"task_id": task_id, "status": "completed", "result": None, "error": None}
+        side_effect=lambda task_id, user_id=None, **_kw: {"task_id": task_id, "status": "completed", "result": None, "error": None}
     )
     monkeypatch.setattr(main, "_task_manager", task_manager)
     client = TestClient(main.app, raise_server_exceptions=False)

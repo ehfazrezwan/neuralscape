@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import sqlite3
 from types import SimpleNamespace
 
 import pytest
@@ -160,7 +161,10 @@ def test_a_shared_service_client_is_reused_and_never_closed(routed, monkeypatch)
     assert switch is not None and switch._closers == []
     asyncio.run(main._stop_engine_switch())
     assert shared.collection_exists("engine_projection_test")  # still open: the service owns it
-    shared.close()
+    try:
+        shared.close()
+    except sqlite3.ProgrammingError:
+        pass  # a local on-disk Qdrant is thread-affine: the collection was made on the startup thread (cleanup only)
 
 
 def test_the_app_lifespan_starts_the_switch_after_connecting_and_stops_it_before_closing():
@@ -179,3 +183,70 @@ def test_the_app_lifespan_starts_the_switch_after_connecting_and_stops_it_before
         assert awaited.count(name) == 1, (name, awaited)
     assert awaited.index("_task_manager.connect") < awaited.index("_start_engine_switch")  # the ledger is open
     assert awaited.index("_stop_engine_switch") < awaited.index("_task_manager.close")  # before the ledger closes
+
+
+# ---------------------------------------------------------------- the ledger worker's own switch
+# The vector stage runs in the ledger worker process, so projection needs a switch there too.
+
+
+def _worker_ctx(tmp_path):
+    from write_producer import SqlitePayloadStore
+
+    return {"ledger": SqliteLedger(str(tmp_path / "ledger.db")), "ledger_payloads": SqlitePayloadStore(str(tmp_path / "kv.db"))}
+
+
+def test_the_ledger_worker_builds_the_switch_the_vector_stage_projects_into(routed):
+    import worker
+    from write_producer import _project_remove, _project_row  # noqa: F401  (the stage's own entry points)
+
+    ctx = _worker_ctx(routed)
+    try:
+        assert sw.projection_switch(settings) is None  # before start-up: nothing to project into
+        worker._start_worker_engine_switch(ctx, _FakeService())
+        switch = sw.projection_switch(settings)
+        assert isinstance(switch, sw.EngineSwitch)
+        assert switch.router.generation == 1
+    finally:
+        ctx["ledger"].close()
+        ctx["ledger_payloads"].close()
+
+
+def test_the_ledger_worker_builds_nothing_with_routing_off_or_no_ledger(routed, monkeypatch):
+    import worker
+
+    ctx = _worker_ctx(routed)
+    try:
+        monkeypatch.setattr(settings, "engine_routing_enabled", False)
+        worker._start_worker_engine_switch(ctx, _FakeService())
+        assert sw.get_switch() is None
+        monkeypatch.setattr(settings, "engine_routing_enabled", True)
+        worker._start_worker_engine_switch({}, _FakeService())
+        assert sw.get_switch() is None
+    finally:
+        ctx["ledger"].close()
+        ctx["ledger_payloads"].close()
+
+
+def test_a_worker_vector_stage_row_reaches_the_routed_engine(routed):
+    """The stage's ``_project_row`` finds the worker's switch and writes the record into generation 1."""
+    import worker
+    from contracts_lifecycle import ProcessingStage  # noqa: F401
+    from ledger.conformance import ref
+    from write_producer import _project_row
+
+    ctx = _worker_ctx(routed)
+    try:
+        ctx["ledger"].put_object_ref(ref("mem-1"))
+        service = _FakeService()
+        service.get_memory = lambda memory_id, user_id=None: SimpleNamespace(
+            memory="green tea", owner_user_id="alice", visibility="private", project_id=None)
+        worker._start_worker_engine_switch(ctx, service)
+        tenant = "tenant-default"
+        switch = sw.get_switch()
+        switch._tenant_for = lambda user_id: tenant
+        _project_row(tenant, "mem-1")
+        hits = switch.recall("alice", "green tea", 3)
+        assert [hit.record_id for hit in hits] == ["mem-1"]
+    finally:
+        ctx["ledger"].close()
+        ctx["ledger_payloads"].close()

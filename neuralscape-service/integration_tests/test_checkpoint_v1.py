@@ -20,9 +20,8 @@ MOCKED (labelled):
 * The "client" is an in-process ASGI HTTP client against the real app, not a
   network client and not the plugin hooks.
 
-Needs ``LEDGER_TEST_PG_DSN`` (a disposable PostgreSQL where the role may create
-databases), ``V1_TEST_REDIS_URL`` (a disposable Redis; the tests FLUSH it),
-``ENGINE_TEST_QDRANT_URL`` and ``ENGINE_TEST_NEO4J_URI`` / ``ENGINE_TEST_NEO4J_PASSWORD``.
+Needs a disposable PostgreSQL where the role may create databases, a disposable Redis (the tests FLUSH it), Qdrant
+and Neo4j: addresses as in ``ledger_env``.  A failure under ``NS_INTEGRATION_REQUIRED``, a skip elsewhere.
 """
 
 from __future__ import annotations
@@ -54,24 +53,14 @@ from schemas import MemoryResponse
 from tokens import issue_user_token
 from write_producer import MemoryRowLookup
 
-PG_BASE = os.environ.get("LEDGER_TEST_PG_DSN")
-REDIS_URL = os.environ.get("V1_TEST_REDIS_URL")
-QDRANT_URL = os.environ.get("ENGINE_TEST_QDRANT_URL")
-NEO4J_URI = os.environ.get("ENGINE_TEST_NEO4J_URI")
-NEO4J_PASSWORD = os.environ.get("ENGINE_TEST_NEO4J_PASSWORD", "neo4j")
+from ledger_env import LEDGER_PG_DSN as PG_BASE, NEO4J_PASSWORD, NEO4J_URI, QDRANT_URL, REDIS_URL, require_env
 
-REQUIRED = {
-    "LEDGER_TEST_PG_DSN": PG_BASE,
-    "V1_TEST_REDIS_URL": REDIS_URL,
-    "ENGINE_TEST_QDRANT_URL": QDRANT_URL,
-    "ENGINE_TEST_NEO4J_URI": NEO4J_URI,
-}
-MISSING = sorted(name for name, value in REQUIRED.items() if not value)
 
-pytestmark = [
-    pytest.mark.integration,
-    pytest.mark.skipif(bool(MISSING), reason="checkpoint real-service environment not set (checkpoint integration)"),
-]
+@pytest.fixture(autouse=True)
+def _fail_when_required_store_is_missing():
+    """Missing infrastructure is a failure on the gate (NS_INTEGRATION_REQUIRED) and a skip elsewhere."""
+    require_env(PostgreSQL=PG_BASE, Redis=REDIS_URL, Qdrant=QDRANT_URL, Neo4j=NEO4J_URI)
+
 
 SECRET = "checkpoint-integration-secret"
 DIMS = 64
@@ -441,7 +430,7 @@ async def connected_manager():
 
     manager = TaskManager()
     await manager.connect()
-    await manager.pool.flushall()
+    await manager.pool.flushdb()
     return manager
 
 

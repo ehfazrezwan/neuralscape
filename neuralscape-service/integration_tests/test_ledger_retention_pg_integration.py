@@ -1,7 +1,7 @@
 """Retention scenarios against PostgreSQL as the non-superuser runtime role.
 
-Needs ``LEDGER_TEST_PG_DSN`` (same contract as the other ledger integration modules); skipped, with the
-declared reason, when it is unset.  Tombstone pruning runs under a separate maintenance role, because the
+Needs ``LEDGER_TEST_PG_DSN`` (same contract as the other ledger integration modules); a failure under
+``NS_INTEGRATION_REQUIRED``, a skip elsewhere.  Tombstone pruning runs under a separate maintenance role, because the
 runtime role can only insert tombstones.
 """
 
@@ -13,6 +13,8 @@ from pathlib import Path
 
 import pytest
 
+from ledger_env import require_env
+
 psycopg = pytest.importorskip("psycopg")
 from psycopg import errors  # noqa: E402
 from psycopg.conninfo import make_conninfo  # noqa: E402
@@ -20,16 +22,19 @@ from psycopg.conninfo import make_conninfo  # noqa: E402
 from ledger.postgres import PostgresLedger, grant_retention_role  # noqa: E402
 from ledger.retention import DAY, RetentionPolicy, RetentionSweeper  # noqa: E402
 from tests.test_ledger_dispatch import External  # noqa: E402
-from tests.test_ledger_postgres_integration import PASSWORD, PostgresStore, _STORES  # noqa: E402
+from test_ledger_postgres_integration import PASSWORD, PostgresStore, _STORES  # noqa: E402
 from tests.test_ledger_retention import SCENARIOS, T, make, run_to_terminal  # noqa: E402
 from tests.test_ledger_retention_fixes import FIX_SCENARIOS  # noqa: E402
 
 DSN = os.environ.get("LEDGER_TEST_PG_DSN")
 
-pytestmark = [
-    pytest.mark.integration,
-    pytest.mark.skipif(not DSN, reason="LEDGER_TEST_PG_DSN not set (postgres ledger integration)"),
-]
+
+
+@pytest.fixture(autouse=True)
+def _fail_when_required_store_is_missing():
+    """Missing PostgreSQL is a failure on the gate (NS_INTEGRATION_REQUIRED) and a skip elsewhere."""
+    if not DSN:
+        require_env(**{"PostgreSQL (LEDGER_TEST_PG_DSN)": DSN})
 
 
 class RetentionPostgresStore(PostgresStore):

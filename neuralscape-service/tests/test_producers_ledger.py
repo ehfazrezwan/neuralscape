@@ -427,7 +427,8 @@ def test_connector_sync_api_and_legacy_path(env, monkeypatch) -> None:
     monkeypatch.setattr(settings, "ledger_enabled", False)
     response = client.post("/v1/connectors/conn-1/sync")
     assert response.status_code == 202 and legacy.pool.jobs[0][0] == "process_connector_sync"
-    assert legacy.pool.jobs[0][2]["_job_id"] == "sync-conn-1"  # legacy coalescing preserved
+    # legacy coalescing preserved: the id still names the connector instance (owner + generation)
+    assert legacy.pool.jobs[0][2]["_job_id"] == tm_module.connector_sync_job_id("conn-1", "user-1", None)
 
 
 # ------------------------------------------------------------------- ordinary delete
@@ -611,7 +612,7 @@ def test_ledger_off_keeps_every_new_producer_on_its_legacy_path() -> None:
     assert manager.producer is None
     ingest = asyncio.run(manager.enqueue_ingest_document(dict(DOC)))
     sync = asyncio.run(manager.enqueue_connector_sync("conn-1"))
-    assert not ingest.startswith("intent-") and sync == "sync-conn-1"
+    assert not ingest.startswith("intent-") and sync == tm_module.connector_sync_job_id("conn-1", None, None)
     assert [j[0] for j in manager.pool.jobs] == ["process_ingest_document", "process_connector_sync"]
 
 

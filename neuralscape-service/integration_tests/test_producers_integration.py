@@ -1,11 +1,11 @@
 """Ledger-gated producers against a real Redis, a real ARQ worker and a SQLite ledger.
 
-Needs ``V1_TEST_REDIS_URL`` pointing at a disposable Redis (the tests FLUSH it).
+Needs a disposable Redis (``V1_TEST_REDIS_URL``, else database 14 of ``REDIS_URL``; the tests FLUSH it).
 **Mocked and labelled:** the memory service (file-backed, so a killed worker's
 effects survive; no LLM, no embedder, no vector or graph store), the "LLM" that
 distils facts, and the connector vault/adapter.  Real: Redis, ARQ, the task
 manager, the ledger, the dispatcher worker, the ingest pipeline's chunking, and
-a real ``SIGKILL``.  Skipped, with that reason, when the variable is unset.
+a real ``SIGKILL``.  A failure under ``NS_INTEGRATION_REQUIRED`` and a skip elsewhere when Redis is missing.
 """
 
 from __future__ import annotations
@@ -27,12 +27,12 @@ from ledger.port import HoldActive
 from ledger.sqlite import SqliteLedger
 from write_producer import DEFAULT_TENANT, LedgerWriteWorker, SqlitePayloadStore, ledger_queue_name
 
-REDIS_URL = os.environ.get("V1_TEST_REDIS_URL")
+from ledger_env import REDIS_URL, require_env  # noqa: E402
 
-pytestmark = [
-    pytest.mark.integration,
-    pytest.mark.skipif(not REDIS_URL, reason="V1_TEST_REDIS_URL not set (producers integration)"),
-]
+@pytest.fixture(autouse=True)
+def _fail_when_required_store_is_missing():
+    """Missing Redis is a failure on the gate (NS_INTEGRATION_REQUIRED) and a skip elsewhere."""
+    require_env(**{"Redis (V1_TEST_REDIS_URL or REDIS_URL)": REDIS_URL})
 
 DOC = {"content": "Tea notes.\n\nGreen tea is best.", "source": {"connector_id": "manual", "external_id": "d1"},
        "user_id": "user-1", "category": "domain_knowledge", "scope": "global"}
@@ -158,7 +158,7 @@ async def connected_manager():
 
     manager = TaskManager()
     await manager.connect()
-    await manager.pool.flushall()
+    await manager.pool.flushdb()
     return manager
 
 
@@ -260,7 +260,7 @@ async def test_queue_loss_after_dispatch_is_recovered_by_the_ledger_poll(env) ->
     service = FileService(str(env / "state.json"))
     try:
         task_id = await manager.enqueue_ingest_document(dict(DOC))
-        await manager.pool.flushall()  # the wake-up is lost
+        await manager.pool.flushdb()  # the wake-up is lost
         await run_arq_worker(env, service)
         assert (await manager.get_status(task_id))["status"] == "queued"  # nothing ran: honest
 

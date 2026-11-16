@@ -6,8 +6,8 @@ the routed engine projection; recall through POST /v1/search; the privileged /v1
 Real: Redis (ARQ pool; every accepted write enqueues its wake-up there), the SQLite ledger and payload store,
 the dispatcher worker, FastAPI, the router, Qdrant (generation 1 projection collection) and PostgreSQL/pgvector
 (the shadow).  Mocked and labelled: the memory service's row store (a dict; no mem0, no graph, no LLM) and the
-embedder (deterministic token hash).  Skipped, with that reason, unless V1_TEST_REDIS_URL, ENGINE_TEST_QDRANT_URL
-and ENGINE_TEST_PG_DSN point at disposable services (Redis is FLUSHed).
+embedder (deterministic token hash).  A failure under NS_INTEGRATION_REQUIRED and a skip elsewhere unless a disposable Redis (V1_TEST_REDIS_URL, else
+database 14 of REDIS_URL), Qdrant and PostgreSQL/pgvector (``engine_env``) are reachable; Redis is FLUSHed.
 """
 
 import asyncio
@@ -18,17 +18,14 @@ from types import SimpleNamespace
 
 import pytest
 
-REDIS_URL = os.environ.get("V1_TEST_REDIS_URL")
-QDRANT_URL = os.environ.get("ENGINE_TEST_QDRANT_URL")
-PG_DSN = os.environ.get("ENGINE_TEST_PG_DSN")
+from ledger_env import ENGINE_PG_DSN as PG_DSN, QDRANT_URL, REDIS_URL, require_env
 
-pytestmark = [
-    pytest.mark.integration,
-    pytest.mark.skipif(
-        not (REDIS_URL and QDRANT_URL and PG_DSN),
-        reason="V1_TEST_REDIS_URL, ENGINE_TEST_QDRANT_URL and ENGINE_TEST_PG_DSN are not all set (V3 switch integration)",
-    ),
-]
+
+@pytest.fixture(autouse=True)
+def _fail_when_required_store_is_missing():
+    """Missing infrastructure is a failure on the gate (NS_INTEGRATION_REQUIRED) and a skip elsewhere."""
+    require_env(Redis=REDIS_URL, Qdrant=QDRANT_URL, PostgreSQL=PG_DSN)
+
 
 from fastapi.testclient import TestClient  # noqa: E402
 
@@ -130,7 +127,7 @@ class World:
     def __init__(self, tmp_path, monkeypatch):
         import redis as redis_lib
 
-        redis_lib.Redis.from_url(REDIS_URL).flushall()
+        redis_lib.Redis.from_url(REDIS_URL).flushdb()
         self.redis_url = REDIS_URL
         self.ledger = SqliteLedger(str(tmp_path / "ledger.db"))
         self.payloads = SqlitePayloadStore(str(tmp_path / "ledger.db.payloads"))

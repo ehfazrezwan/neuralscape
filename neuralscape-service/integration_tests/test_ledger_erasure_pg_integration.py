@@ -1,6 +1,6 @@
 """Erasure scenarios against PostgreSQL as the non-superuser runtime role.
 
-Needs ``LEDGER_TEST_PG_DSN``; skipped with the declared reason when unset.
+Needs ``LEDGER_TEST_PG_DSN`` (a disposable PostgreSQL); a failure under ``NS_INTEGRATION_REQUIRED``, a skip elsewhere.
 """
 
 from __future__ import annotations
@@ -10,12 +10,14 @@ from pathlib import Path
 
 import pytest
 
+from ledger_env import require_env
+
 pytest.importorskip("psycopg")
 import psycopg  # noqa: E402
 
 from ledger.conformance import make_intent, ref  # noqa: E402
-from tests.test_ledger_dispatch_pg_integration import DispatchPostgresStore  # noqa: E402
-from tests.test_ledger_dispatch_pg_integration import (  # noqa: E402,F401
+from test_ledger_dispatch_pg_integration import DispatchPostgresStore  # noqa: E402
+from test_ledger_dispatch_pg_integration import (  # noqa: E402,F401
     _close_connections_after_each_test,
     _drop_everything_at_end,
 )
@@ -23,10 +25,13 @@ from tests.test_ledger_erasure import SCENARIOS, good_owner, erase  # noqa: E402
 
 DSN = os.environ.get("LEDGER_TEST_PG_DSN")
 
-pytestmark = [
-    pytest.mark.integration,
-    pytest.mark.skipif(not DSN, reason="LEDGER_TEST_PG_DSN not set (postgres ledger integration)"),
-]
+
+
+@pytest.fixture(autouse=True)
+def _fail_when_required_store_is_missing():
+    """Missing PostgreSQL is a failure on the gate (NS_INTEGRATION_REQUIRED) and a skip elsewhere."""
+    if not DSN:
+        require_env(**{"PostgreSQL (LEDGER_TEST_PG_DSN)": DSN})
 
 
 class ErasurePostgresStore(DispatchPostgresStore):

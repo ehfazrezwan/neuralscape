@@ -1,9 +1,9 @@
 """Remaining-writer scenarios against a real Redis, real ARQ workers and a SQLite ledger.
 
-Needs ``V1_TEST_REDIS_URL`` (the tests FLUSH it).  **Mocked and labelled:** the memory
+Needs a disposable Redis (``V1_TEST_REDIS_URL``, else database 14 of ``REDIS_URL``; the tests FLUSH it).  **Mocked and labelled:** the memory
 service (file-backed, no LLM/embedder/stores).  Real: Redis, ARQ, the task manager, the
-ledger, the dispatcher worker, the cron wrappers and the vault file writes.  Skipped, with
-the declared reason, when the variable is unset.
+ledger, the dispatcher worker, the cron wrappers and the vault file writes.  A failure
+under ``NS_INTEGRATION_REQUIRED`` and a skip elsewhere when Redis is missing.
 """
 
 from __future__ import annotations
@@ -12,7 +12,7 @@ import os
 
 import pytest
 
-from tests.test_producers_integration import (  # noqa: F401  (fixtures and helpers)
+from test_producers_integration import (  # noqa: F401  (fixtures and helpers)
     FileService,
     connected_manager,
     env,
@@ -21,12 +21,12 @@ from tests.test_producers_integration import (  # noqa: F401  (fixtures and help
     stages_of,
 )
 
-REDIS_URL = os.environ.get("V1_TEST_REDIS_URL")
+from ledger_env import REDIS_URL, require_env  # noqa: E402
 
-pytestmark = [
-    pytest.mark.integration,
-    pytest.mark.skipif(not REDIS_URL, reason="V1_TEST_REDIS_URL not set (writers integration)"),
-]
+@pytest.fixture(autouse=True)
+def _fail_when_required_store_is_missing():
+    """Missing Redis is a failure on the gate (NS_INTEGRATION_REQUIRED) and a skip elsewhere."""
+    require_env(**{"Redis (V1_TEST_REDIS_URL or REDIS_URL)": REDIS_URL})
 
 
 class WriterService(FileService):

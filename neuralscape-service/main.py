@@ -11,6 +11,7 @@ import base64
 import hashlib
 import json
 import logging
+import re
 import time
 from typing import Any
 from contextlib import asynccontextmanager
@@ -87,7 +88,7 @@ from schemas import (
     normalize_visibility,
 )
 from authority_store import AuthorityUnavailable
-from ledger.port import HoldActive, IdempotencyConflict
+from ledger.port import HoldActive
 from write_producer import UnboundPrincipal
 from task_manager import TaskManager, TaskStatusUnavailable
 

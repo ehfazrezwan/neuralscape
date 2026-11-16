@@ -107,7 +107,9 @@ class Service:
     def extract_and_store(self, **kw):
         self.calls.append(("extract_and_store", kw["user_id"]))
         mems = [Row("fact one", id="mem-f1")]
-        return mems, {"windows_failed": kw.get("fail", 0)}
+        if kw.get("return_stats"):
+            return mems, {"windows_failed": kw.get("fail", 0)}
+        return mems
 
     def retag_memories(self, caller, filters, ops, dry_run=False):
         self.calls.append(("retag", caller, filters, ops))
@@ -363,18 +365,31 @@ def test_a_hold_placed_after_accept_still_blocks_the_bulk_delete_stage(env) -> N
     assert service.calls == []
 
 
-def test_legacy_mem0_writers_run_through_the_ledger(env) -> None:
+def test_legacy_writers_run_through_the_ledger_and_the_memory_service(env) -> None:
     ledger, _, _, service, manager = env
     add = run(manager.enqueue_job_durable(
         "memory.add.legacy", user_id="user-1",
         payload={"messages": [{"role": "user", "content": "hi"}], "user_id": "user-1", "agent_id": None,
-                 "run_id": None, "metadata": {"k": "v"}}))
+                 "run_id": None}))
     clear = run(manager.enqueue_job_durable(
-        "memory.delete_all.legacy", user_id="user-1", payload={"user_id": "user-1", "agent_id": "a", "run_id": None}))
+        "memory.delete_all.legacy", user_id="user-1", payload={"user_id": "user-1"}))
     drain(env)
     assert view(env, add)[0] is IntentStatus.APPLIED and view(env, clear)[0] is IntentStatus.APPLIED
-    assert service.mem0.added[0]["metadata"] == {"k": "v"}
-    assert service.mem0.deleted_all == [{"user_id": "user-1", "agent_id": "a", "run_id": None}]
+    # The legacy routes run the same service methods their synchronous form calls, never the mem0 client.
+    assert ("extract_and_store", "user-1") in service.calls
+    assert ("delete_memories", {"user_id": "user-1"}) in service.calls
+    assert service.mem0.added == [] and service.mem0.deleted_all == []
+    outputs = view(env, add)[2]["outputs"]
+    assert [o["id"] for o in outputs] == ["mem-f1"]  # the stored row is the add's receipted output
+
+
+def test_an_incomplete_delete_is_not_recorded_as_applied(env) -> None:
+    ledger, _, _, service, manager = env
+    service.delete_memories = lambda **kw: {"deleted_count": 1, "failed_ids": ["m-9"], "truncated": False}
+    task_id = run(manager.enqueue_job_durable("memory.delete_all.legacy", user_id="user-1",
+                                              payload={"user_id": "user-1"}))
+    drain(env)
+    assert view(env, task_id)[0] is not IntentStatus.APPLIED
 
 
 def test_rescope_enriches_its_graph_jobs_inline_and_reports_failure(env) -> None:
@@ -742,7 +757,6 @@ def test_legacy_apis_accept_durably_and_keep_their_sync_paths_when_off(env, monk
     ledger, _, _, service, manager = env
     monkeypatch.setattr(main, "_task_manager", manager)
     monkeypatch.setattr(main, "_service", service)
-    monkeypatch.setattr(main, "_get_memory", lambda: service.mem0)
     monkeypatch.setattr(main, "_resolve_user_id", lambda request, explicit: explicit or "user-1")
     monkeypatch.setattr(settings, "ledger_enabled", True)
     client = TestClient(main.app)
@@ -752,7 +766,7 @@ def test_legacy_apis_accept_durably_and_keep_their_sync_paths_when_off(env, monk
     replay = client.post("/memories", json={"messages": [{"role": "user", "content": "hi"}]},
                          headers={"Idempotency-Key": "a-1"})
     assert added.status_code == replay.status_code == 202 and added.json()["task_id"] == replay.json()["task_id"]
-    assert added.json()["poll_url"].startswith("/memories/status/") and service.mem0.added == []
+    assert added.json()["poll_url"].startswith("/memories/status/") and service.calls == []
 
     bulk = client.request("DELETE", "/v1/memories", json={"scope": "global"})
     assert bulk.status_code == 202
@@ -761,12 +775,12 @@ def test_legacy_apis_accept_durably_and_keep_their_sync_paths_when_off(env, monk
     wipe = client.delete("/memories")
     for response in (refused, wipe):
         assert response.status_code == 409 and response.json()["detail"]["error"]["code"] == "hold_active"
-    assert service.mem0.deleted_all == []
+    assert service.calls == []
 
     monkeypatch.setattr(settings, "ledger_enabled", False)
     sync_add = client.post("/memories", json={"messages": [{"role": "user", "content": "hi"}]})
-    assert sync_add.status_code == 200 and service.mem0.added  # the legacy synchronous path, untouched
-    assert client.delete("/memories").status_code == 200 and service.mem0.deleted_all
+    assert sync_add.status_code == 200 and ("extract_and_store", "user-1") in service.calls  # synchronous path, untouched
+    assert client.delete("/memories").status_code == 200 and ("delete_memories", {"user_id": "user-1"}) in service.calls
 
 
 # ------------------------------------------------------- session summaries and MCP delete
