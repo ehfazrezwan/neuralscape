@@ -25,6 +25,7 @@ RUN_LAST = {
     "test_edit_delete": 2,
     "test_delete_privacy": 3,  # bulk-deletes ctx.project_id
     "test_fault_injection": 4,
+    "test_backup_restore": 5,  # wipes every store, then restores a backup: after everything else, fault injection included
 }
 
 

@@ -301,3 +301,56 @@ listing is always `docker compose -p <project> ps`, never global `docker ps`.
 `run.sh` needs only `uv`: it runs `uv run --no-project --python 3.12 --with-requirements ...`
 (uv may download a managed CPython; downloads are allowed). Set `NS_UV=/path/to/uv` for a
 standalone binary that is not on `PATH`. Without uv it falls back to python3 >= 3.10 + venv.
+
+
+## Backup then restore (destructive; `test_backup_restore.py`)
+
+Atlas `ops.backups`. Runs the real `scripts/backup-volumes.sh -p <project> --quiesce -d <tmp>`
+on the stack under test, wipes every store, restores the backup per the script's RESTORE
+section and proves the data came back from the backup (and not a marker written after it).
+It **wipes every memory on the stack**, so it runs last (`RUN_LAST`), only with
+`NS_ALLOW_DESTRUCTIVE=1`, `--compose-project <disposable name>` (`guard.check_compose_project`) and a
+docker CLI; otherwise its stack scenarios skip with that reason.
+
+What the gate must provide:
+
+- `NS_ALLOW_DESTRUCTIVE=1` (throwaway stack only).
+- `NS_COMPOSE_FILES=docker-compose.yml:<the gate's override file>` (colon separated, the `COMPOSE_FILE`
+  convention; relative paths resolve against `NS_REPO_ROOT`, default the checkout holding `acceptance/`).
+  Each entry becomes `-f <file>` on the backup script **and on every `docker compose` call the harness
+  makes** (cwd = the repo root). Unset: no `-f`, as before.
+- The harness runs on the gate host from the checkout under test (`NS_REPO_ROOT` if elsewhere); the
+  backup script is that checkout's own. `NEO4J_DATABASE` (default `memory`) must match the stack's.
+- The backup destination is a fresh `nsc-backup-*` directory the scenario creates under the temp dir
+  (anything else is refused) and removes afterwards. The temp dir must be on the docker host's filesystem
+  (the restore bind-mounts it).
+
+Flow (one module fixture records, the scenarios assert): seed (raw memory -> vector search -> graph
+episode; a small uploaded file -> artifact bytes + passage; the memory's task id) -> backup (exit 0, one
+complete `ns-backup-<stamp>`, no `.partial`, MANIFEST lists redis/qdrant/files/neo4j, parts non-empty,
+`sha256sum -c SHA256SUMS`) -> a second memory is written after the backup -> wipe (bulk delete through
+the API, stop the app, delete both Qdrant collections, `redis-cli FLUSHALL`, empty `/data/ingest`, start the
+app; markers, task status and artifact are proven GONE) -> restore (stop app; stop neo4j, `neo4j-admin
+database load --overwrite-destination`, start; Qdrant snapshot upload with `priority=snapshot`; stop redis,
+`cp dump.rdb`, start; tar extract of the files part; start the app) -> assertions: backed-up marker back in
+vector recall, graph listing, task status and artifact download; the after-backup marker absent from all three
+(the negative control); no service's `RestartCount` rose; all services running and healthy; a fresh write is
+recalled. A finalizer starts every service again and fails with `compose ps` if the stack does not come back.
+
+New allow-listed compose shapes (`nsaccept/restore.py`, validated before running; each refusal is self-tested):
+`run --rm --no-deps -T` with exactly the neo4j load, the Qdrant upload (the harness's own script, read-only
+mount), the files tar extract (stdin = the backup's own tar) and the `/data/ingest` wipe (the last one and
+`exec -T redis redis-cli FLUSHALL` also need `NS_ALLOW_DESTRUCTIVE=1`); `cp <B>/redis/dump.rdb redis:/data/dump.rdb`.
+Every host path must lie in `<scenario temp root>/ns-backup-<stamp>/<part>`; nothing else is mountable.
+
+Runtime estimate (2 CPUs): seeding with graph enrichment 2-5 min, backup 2-5 min (neo4j is stopped for the dump),
+the after-backup marker with its graph episode 2-5 min, wipe 1-2 min, restore 3-6 min, checks 1-3 min:
+about 12-25 min, every wait bounded (the whole fixture cannot exceed about 90 min).
+
+**`ops.autoheal` is NOT proven here.** The autoheal sidecar (behind the docker-socket proxy) restarts a
+container whose healthcheck turns `unhealthy`, but no labelled container has a healthcheck the harness can
+fail and then restore through an allow-listed command: the workers' check is `python -c "sys.exit(0)"`, and
+the API's probes `/health/live` on its own port (breaking it would need signals or file edits inside the
+container, and a stopped process is only recovered by the very restart under test). `docker pause` does not
+count (paused containers run no checks). Left unproven rather than forced; a clean proof needs a test hook in
+the product (for example a healthcheck that reads a file the harness may remove).
