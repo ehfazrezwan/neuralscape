@@ -38,7 +38,21 @@ _SOCKET_TIMEOUT = 1.0
 _mem_meta: dict[str, dict] = {}
 _mem_cfg: dict[str, dict] = {}
 _mem_cfg_at: dict[str, float] = {}
-_L1_TTL = 30.0
+_L1_TTL = 30.0  # fallback when settings are unavailable
+
+
+def config_ttl() -> float:
+    """Seconds a cached project config may be served before a Redis re-read.
+
+    Settings-driven (``knowledge_config_cache_ttl_s``) so the router mirror and
+    this L1 share one staleness bound; falls back to _L1_TTL.
+    """
+    try:
+        from config import settings
+
+        return max(0.0, float(settings.knowledge_config_cache_ttl_s))
+    except Exception:  # noqa: BLE001
+        return _L1_TTL
 
 _client = None
 _client_probe_at = 0.0
@@ -135,8 +149,11 @@ def save_project_config(project_id: str, config: dict) -> None:
         logger.debug("save_project_config Redis write failed (non-fatal)", exc_info=True)
 
 
-def load_project_config(project_id: str) -> dict | None:
+def load_project_config(project_id: str, max_age: float | None = None) -> dict | None:
     """Fetch a project's routing config (L1 → Redis). None if unset.
+
+    ``max_age`` overrides the L1 freshness bound for this call (0 forces a
+    Redis read; used by the router's refresh so one bound governs both layers).
 
     On the router hot path: a fresh L1 hit is free; a miss (or an L1 entry older
     than _L1_TTL) costs at most one bounded Redis GET (then cached). A None result
@@ -144,27 +161,46 @@ def load_project_config(project_id: str) -> dict | None:
     changed default_engine/code_space become visible to a long-running process
     (Fable should-fix a).
     """
+    return _load_project_config(project_id, max_age)[1]
+
+
+def refresh_project_config(project_id: str) -> tuple[bool, dict | None]:
+    """Force a Redis read, bypassing L1. Returns (authoritative, config).
+
+    ``authoritative`` is True only when Redis answered. Then a missing key means
+    the config is gone (another process deleted or cleared it): the L1 entry is
+    dropped and (True, None) returned. Redis down/erroring or an unparseable
+    value is (False, <L1 value or None>): the caller keeps what it has.
+    """
+    return _load_project_config(project_id, 0.0)
+
+
+def _load_project_config(project_id: str, max_age: float | None) -> tuple[bool, dict | None]:
     import time as _t
 
+    ttl = config_ttl() if max_age is None else max_age
     hit = _mem_cfg.get(project_id)
-    if hit is not None and (_t.monotonic() - _mem_cfg_at.get(project_id, 0.0)) < _L1_TTL:
-        return hit
+    if hit is not None and (_t.monotonic() - _mem_cfg_at.get(project_id, 0.0)) < ttl:
+        return False, hit
     r = _redis()
     if r is None:
-        return hit  # Redis down → serve the (possibly stale) L1 value, if any
+        return False, hit  # Redis down → serve the (possibly stale) L1 value, if any
     try:
         raw = r.get(_CFG_PREFIX + project_id)
     except Exception:  # noqa: BLE001
-        return hit
+        return False, hit
     if not raw:
-        return hit
+        # Redis answered and the key is absent: authoritative, drop L1.
+        _mem_cfg.pop(project_id, None)
+        _mem_cfg_at.pop(project_id, None)
+        return True, None
     try:
         cfg = json.loads(raw)
     except (ValueError, TypeError):
-        return hit
+        return False, hit
     _mem_cfg[project_id] = cfg
     _mem_cfg_at[project_id] = _t.monotonic()
-    return cfg
+    return True, cfg
 
 
 def _reset_for_tests() -> None:
