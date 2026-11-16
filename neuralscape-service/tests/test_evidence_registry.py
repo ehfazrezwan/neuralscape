@@ -209,21 +209,24 @@ def test_known_failure_rules_hold_as_the_list_shrinks_to_zero() -> None:
 
 def test_required_baseline_areas_each_have_an_expected_failure_and_a_control() -> None:
     areas = {
+        "identity": ("email-slug-collision", "email-slug-controls"),
         "graph-deletion": ("graph-removal-shared-support", "graph-removal-controls"),
         "readiness": ("readiness-probes-backends", "readiness-controls"),
     }
     # Areas whose pinned defect has been fixed: both scenarios are now controls.
     fixed = {
-        "identity": ("email-slug-collision", "email-slug-controls"),
         "backup": ("backup-covers-compose-volumes", "backup-volume-controls"),
         "job-key": ("job-key-store-scope-control", "job-key-raw-options-control", "job-key-controls"),
         "namespace": ("group-id-tuple-collision", "group-id-distinct-controls"),
         "queued-visibility": ("queued-visibility-publication", "queued-job-deleted-memory-control"),
         "stale-revision": ("stale-revision-edit", "patch-partial-control"),
     }
+    # Areas still listed above whose defect has been fixed: the scenario that
+    # used to be the expected failure is now a control too.
+    fixed_in_place = {"identity"}
     by_id = {s.id: s for s in SCENARIOS}
     for area, (failure, control) in areas.items():
-        assert by_id[failure].kind == "expected-failure", area
+        assert by_id[failure].kind == ("control" if area in fixed_in_place else "expected-failure"), area
         assert by_id[control].kind == "control", area
     for area, ids in fixed.items():
         for scenario_id in ids:
