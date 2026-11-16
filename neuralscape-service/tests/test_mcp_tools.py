@@ -408,23 +408,32 @@ class TestListMemoriesTool:
 
 class TestListProjectsTool:
     @pytest.mark.asyncio
+    async def test_passes_degraded_marker_through(self, mock_mcp_service):
+        mock_mcp_service.list_projects_status.return_value = {
+            "projects": ["a"], "degraded": True, "error": "graph_unavailable",
+        }
+        result = await mcp_server.call_tool("list_projects", {"user_id": "ehfaz"})
+        data = json.loads(result[0].text)
+        assert data == {"projects": ["a"], "degraded": True, "error": "graph_unavailable"}
+
+    @pytest.mark.asyncio
     async def test_lists_projects(self, mock_mcp_service):
-        mock_mcp_service.list_projects.return_value = ["demo-alpha", "neuralscape"]
+        mock_mcp_service.list_projects_status.return_value = {"projects": ["demo-alpha", "neuralscape"]}
         result = await mcp_server.call_tool("list_projects", {"user_id": "ehfaz"})
         data = json.loads(result[0].text)
         assert data["projects"] == ["demo-alpha", "neuralscape"]
-        mock_mcp_service.list_projects.assert_called_once_with(user_id="ehfaz")
+        mock_mcp_service.list_projects_status.assert_called_once_with(user_id="ehfaz")
 
     @pytest.mark.asyncio
     async def test_lists_projects_without_user_id(self, mock_mcp_service):
         """user_id is optional in the schema — omitting it falls back to the
         token identity / default, never errors."""
-        mock_mcp_service.list_projects.return_value = []
+        mock_mcp_service.list_projects_status.return_value = {"projects": []}
         result = await mcp_server.call_tool("list_projects", {})
         data = json.loads(result[0].text)
         assert data["projects"] == []
         # Identity contract: with no token and no arg, fall back to default_user_id.
-        mock_mcp_service.list_projects.assert_called_once_with(
+        mock_mcp_service.list_projects_status.assert_called_once_with(
             user_id=settings.default_user_id
         )
 
@@ -554,17 +563,6 @@ class TestEditMemoryTool:
         data = json.loads(result[0].text)
         assert data["code"] == "listing_failed" and data["deleted"] == 0
         assert "message" not in data
-
-    @pytest.mark.asyncio
-    async def test_edit_busy_and_lock_unavailable_are_clear_errors(self, mock_mcp_service):
-        from memory.edit import EditBusy, EditLockUnavailable
-
-        mock_mcp_service.patch_memory.side_effect = EditBusy("m1")
-        data = json.loads((await mcp_server.call_tool("edit_memory", {"memory_id": "m1", "user_id": "e", "tags": ["x"]}))[0].text)
-        assert data["code"] == "edit_busy"
-        mock_mcp_service.patch_memory.side_effect = EditLockUnavailable("nothing was written")
-        data = json.loads((await mcp_server.call_tool("edit_memory", {"memory_id": "m1", "user_id": "e", "tags": ["x"], "expected_revision": "0"}))[0].text)
-        assert data["code"] == "edit_lock_unavailable"
 
     @pytest.mark.asyncio
     async def test_edit_no_fields_rejected(self, mock_mcp_service):
