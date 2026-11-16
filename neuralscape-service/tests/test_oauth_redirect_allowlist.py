@@ -194,8 +194,106 @@ def test_hand_signed_client_with_unlisted_host_is_refused_at_authorize(client, m
     assert _authorize_post(client, forged, UNLISTED).status_code == 400
 
 
+def _token_exchange(client, client_id, code, verifier, uri):
+    return client.post(
+        "/oauth/token",
+        data=dict(grant_type="authorization_code", code=code, code_verifier=verifier,
+                  redirect_uri=uri, client_id=client_id),
+    )
+
+
+VERIFIER = "verifier-bytes-must-be-43-128-chars-long-xxxxxxxx"
+
+
+def _code_for(client, uri):
+    from urllib.parse import parse_qs, urlparse
+
+    client_id = _register(client, uri).json()["client_id"]
+    resp = _authorize_post(client, client_id, uri)
+    assert resp.status_code == 303, resp.text
+    return client_id, parse_qs(urlparse(resp.headers["location"]).query)["code"][0]
+
+
+def test_token_exchange_refuses_a_code_issued_before_the_list_was_set(client, monkeypatch):
+    client_id, code = _code_for(client, UNLISTED)  # list empty: issued
+    _allow(monkeypatch, "claude.ai")
+    resp = _token_exchange(client, client_id, code, VERIFIER, UNLISTED)
+    assert resp.status_code == 400 and resp.json()["error"] == "invalid_grant"
+    assert "access_token" not in resp.text
+
+
+def test_token_exchange_still_works_for_a_listed_host(client, monkeypatch):
+    client_id, code = _code_for(client, LISTED)
+    _allow(monkeypatch, "claude.ai")
+    assert _token_exchange(client, client_id, code, VERIFIER, LISTED).status_code == 200
+
+
+def test_code_issuance_choke_point_refuses_an_unlisted_host(monkeypatch):
+    """Every login path ends in _issue_code_and_redirect; it refuses on its own."""
+    from login_providers import AuthorizeContext
+
+    _allow(monkeypatch, "claude.ai")
+    ctx = AuthorizeContext("cid", UNLISTED, "s", _challenge(), "S256", "")
+    resp = oauth._issue_code_and_redirect(ctx, "alice")
+    assert resp.status_code == 400 and "location" not in resp.headers
+    ok = oauth._issue_code_and_redirect(AuthorizeContext("cid", LISTED, "s", _challenge(), "S256", ""), "alice")
+    assert ok.status_code == 303
+
+
+def _link_ticket(redirect_uri):
+    from login_providers import AuthorizeContext, LoginNeedsLink, sign_link_ticket
+
+    ctx = AuthorizeContext("cid", redirect_uri, "s", _challenge(), "S256", "")
+    return sign_link_ticket(
+        LoginNeedsLink(ctx=ctx, email="a@example.com", sub="sub-1", suggested_user_id="newbie"), SECRET
+    )
+
+
+def test_link_flow_refuses_a_ticket_issued_before_the_list_was_set(client, monkeypatch):
+    link = AsyncMock()
+    monkeypatch.setattr(oauth.identity_store, "link", link)
+    monkeypatch.setattr(oauth, "provision_user_id", AsyncMock(return_value="newbie"))
+    ticket = _link_ticket(UNLISTED)  # minted while the list was empty
+    _allow(monkeypatch, "claude.ai")
+    resp = client.post("/oauth/link", data={"ticket": ticket, "action": "new"}, follow_redirects=False)
+    assert resp.status_code == 400 and "location" not in resp.headers
+    assert "redirect host is not allowed" in resp.text
+    link.assert_not_awaited()  # nothing persisted for a login that cannot finish
+
+
+def test_link_flow_still_issues_a_code_for_a_listed_host(client, monkeypatch):
+    monkeypatch.setattr(oauth.identity_store, "link", AsyncMock())
+    monkeypatch.setattr(oauth, "provision_user_id", AsyncMock(return_value="newbie"))
+    _allow(monkeypatch, "claude.ai")
+    resp = client.post("/oauth/link", data={"ticket": _link_ticket(LISTED), "action": "new"}, follow_redirects=False)
+    assert resp.status_code == 303
+
+
 def test_config_parse_helper(monkeypatch):
-    _allow(monkeypatch, " A.example , b.example:8443,, ")
+    _allow(monkeypatch, " A.example , b.example:8443 ")
     assert settings.oauth_redirect_host_allowlist_set() == {"a.example", "b.example:8443"}
     _allow(monkeypatch, "")
     assert settings.oauth_redirect_host_allowlist_set() == set()
+
+
+@pytest.mark.parametrize("value", [",", " , ,", "a.example,,b.example", "a.example,", "https://claude.ai",
+                                   "claude.ai/cb", "claude.ai:0", "claude.ai:99999", "claude.ai:http",
+                                   "claude.ai:", "[::1]", "::1", "user@claude.ai", "cl\u00e4ude.ai",
+                                   "claude ai", "*.claude.ai", ".claude.ai", "-bad.example"])
+def test_malformed_entries_are_rejected_at_startup(value):
+    from pydantic import ValidationError
+
+    from config import Settings
+
+    with pytest.raises(ValidationError) as exc:
+        Settings(oauth_redirect_host_allowlist=value)
+    assert "OAUTH_REDIRECT_HOST_ALLOWLIST" in str(exc.value)
+
+
+def test_well_formed_value_is_normalised_at_startup():
+    from config import Settings
+
+    s = Settings(oauth_redirect_host_allowlist=" Claude.AI , B.example:8443 ")
+    assert s.oauth_redirect_host_allowlist == "claude.ai,b.example:8443"
+    assert Settings(oauth_redirect_host_allowlist="").oauth_redirect_host_allowlist == ""
+    assert Settings(oauth_redirect_host_allowlist="  ").oauth_redirect_host_allowlist == ""

@@ -778,12 +778,22 @@ async def authorize_submit(
     return _issue_code_and_redirect(ctx, payload["user_id"], src=src)
 
 
+_REDIRECT_HOST_REFUSED = "This client's redirect host is not allowed on this server."
+
+
 def _issue_code_and_redirect(
     ctx: AuthorizeContext, user_id: str, src: str | None = None
-) -> RedirectResponse:
+) -> RedirectResponse | HTMLResponse:
     """Mint a PKCE-bound authorization code for ``user_id`` and 303 back to the
     MCP client's redirect_uri. Shared by every login provider — the only thing
-    that varies upstream is how ``user_id`` was authenticated."""
+    that varies upstream is how ``user_id`` was authenticated.
+
+    Every code issuance passes here, so this is where the redirect host
+    allowlist is re-checked for the federated callbacks and the link flow, whose
+    signed state or ticket may predate the list. A refusal renders an error page
+    and issues no code."""
+    if not _redirect_host_allowed(ctx.redirect_uri):
+        return _login_error_page(LoginError(_REDIRECT_HOST_REFUSED, 400))
     code = sign_payload(
         {
             "typ": "code",
@@ -970,6 +980,9 @@ async def oauth_link(
         return _login_error_page(LoginError("This link request expired. Please sign in again.", 400))
 
     ctx = claims["ctx"]
+    if not _redirect_host_allowed(ctx.redirect_uri):
+        # Refuse before anything is persisted for a login that cannot finish.
+        return _login_error_page(LoginError(_REDIRECT_HOST_REFUSED, 400))
     sub = claims.get("sub") or None
     email = claims.get("email") or None
 
@@ -1089,6 +1102,10 @@ async def token(
             return _token_error("invalid_grant", "client mismatch")
         if not redirect_uri or claims.get("redirect_uri") != redirect_uri:
             return _token_error("invalid_grant", "redirect_uri mismatch")
+        if not _redirect_host_allowed(redirect_uri):
+            # A code issued before the allowlist was set is not redeemable for a
+            # host that is no longer listed.
+            return _token_error("invalid_grant", "redirect_uri host is not allowed")
         if not _verify_pkce(code_verifier, claims.get("code_challenge", "")):
             return _token_error("invalid_grant", "PKCE verification failed")
         jti = claims.get("jti")
