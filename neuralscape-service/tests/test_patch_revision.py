@@ -782,8 +782,97 @@ def test_repair_honours_the_attempt_budget_for_rows_that_also_carry_a_vector_rev
     assert point["vector_repair_attempts"] == 2             # not 8: pass 2 no longer bypasses the budget
 
 
-def test_a_new_edit_resets_the_repair_attempt_budget(world):
+def test_a_new_edit_resets_the_repair_attempt_budget_in_its_own_commit(world, monkeypatch):
     world.patch_memory(M1, "ehfaz", {"content": "x"}, expected_revision="0")
     world.fake.points[M1]["vector_repair_attempts"] = 4
+    monkeypatch.setattr(MemoryService, "_sync_vector", lambda *a, **k: True)     # the edit's OWN sync does not run
     world.patch_memory(M1, "ehfaz", {"content": "y"}, expected_revision="1")
-    assert world.fake.points[M1].get("vector_repair_attempts") is None
+    assert world.fake.points[M1].get("vector_repair_attempts") is None            # reset by the commit itself
+
+
+# ── access control is never behind the text; a failed deferred apply never fails a committed edit ──
+
+
+def _seed_shared(world):
+    world.fake.points[M1]["metadata"]["visibility"] = "shared"
+
+
+def test_a_narrowing_content_edit_narrows_visibility_BEFORE_the_new_text_lands(world):
+    """shared -> private with new content: at the instant of the commit the old audience filter must already be closed."""
+    _seed_shared(world)
+    seen = {}
+
+    def before_commit():
+        point = world.fake.points[M1]
+        seen["vis"], seen["data"] = point["metadata"]["visibility"], point["data"]
+
+    _hook_before_nth_set_payload(world, 2, before_commit)          # call 1 = the narrowing, call 2 = the text commit
+    world.patch_memory(M1, "ehfaz", {"content": "private text", "visibility": "private"}, expected_revision="0")
+    assert seen == {"vis": "private", "data": "Old content"}       # narrowed first; the new text was not out yet
+
+
+def test_a_narrowing_edit_stays_narrow_even_when_the_deferred_metadata_apply_raises(world, monkeypatch):
+    _seed_shared(world)
+
+    def boom(*a, **k):
+        raise ConnectionError("apply failed")
+
+    monkeypatch.setattr(MemoryService, "_apply_pending_meta", staticmethod(boom))
+    out = world.patch_memory(M1, "ehfaz", {"content": "private text", "visibility": "private"}, expected_revision="0")
+    point = world.fake.points[M1]
+    assert point["data"] == "private text" and point["metadata"]["visibility"] == "private"     # no exposure window
+    assert out["graph"] != "unchanged"
+
+
+def test_a_widening_edit_keeps_visibility_deferred_so_old_text_is_never_exposed_wider_than_the_new_state(world):
+    seen = {}
+    _hook_before_nth_set_payload(world, 1, lambda: seen.setdefault("vis", world.fake.points[M1]["metadata"]["visibility"]))
+    world.patch_memory(M1, "ehfaz", {"content": "now shared", "visibility": "shared"}, expected_revision="0")
+    assert seen["vis"] == "private"                                    # not widened ahead of the commit
+    assert world.fake.points[M1]["metadata"]["visibility"] == "shared"
+
+
+def test_a_failing_deferred_apply_does_not_fail_the_committed_edit_and_the_follow_up_work_still_runs(world, monkeypatch):
+    def boom(*a, **k):
+        raise ConnectionError("apply failed")
+
+    monkeypatch.setattr(MemoryService, "_apply_pending_meta", staticmethod(boom))
+    out = world.patch_memory(M1, "ehfaz", {"content": "committed", "tags": ["x"]}, expected_revision="0")   # no raise
+    point = world.fake.points[M1]
+    assert point["data"] == "committed" and point["ns_meta_pending"] is True       # left for repair
+    world._memory.db.add_history.assert_called_once()                              # history row written
+    world._cascade_rows_once.assert_called()                                       # graph cascade ran
+    assert out["graph_job"] is not None                                            # and the re-ingest job is returned
+    assert world.fake.vectors[M1] == world.fake.embed("committed", "update")       # vector synced
+
+
+def test_retag_continues_past_a_row_whose_deferred_apply_fails(world, monkeypatch):
+    world.fake.add(M2)
+    real = MemoryService._apply_pending_meta
+    calls = {"n": 0}
+
+    def flaky(*a, **k):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise ConnectionError("first apply fails")
+        return real(*a, **k)
+
+    monkeypatch.setattr(MemoryService, "_apply_pending_meta", staticmethod(flaky))
+    out = world.retag_memories("ehfaz", {"category": "personal_fact"}, {"add_tags": ["bulk"]})
+    assert out["updated"] == 2                                                     # the sweep was not aborted midway
+
+
+def test_meta_repair_has_an_attempt_budget_and_reports_what_it_applied(world, monkeypatch):
+    def boom(*a, **k):
+        raise ConnectionError("apply failed")
+
+    monkeypatch.setattr(MemoryService, "_apply_pending_meta", staticmethod(boom))
+    world.patch_memory(M1, "ehfaz", {"tags": ["x"]}, expected_revision="0")
+    world.fake.points[M1]["ns_meta_pending_at"] = 0.0
+    for _ in range(8):
+        world.repair_stale_vectors(min_age_s=0, max_attempts=3)
+    assert world.fake.points[M1]["ns_meta_repair_attempts"] == 3                   # stopped being retried
+    monkeypatch.undo()
+    world.fake.points[M1]["ns_meta_repair_attempts"] = 0
+    assert world.repair_stale_vectors(min_age_s=0)["meta_repaired"] == 1
+    assert world.fake.points[M1]["metadata"]["tags"] == ["x"]

@@ -350,3 +350,41 @@ def test_a_nested_writer_between_the_commit_and_the_metadata_apply_survives_on_t
     world.patch_memory(world.pid, "u", {"tags": ["x"]}, expected_revision="0")
     meta = _payload(world)["metadata"]
     assert meta["tags"] == ["x"] and meta["graph_episode_uuid"] == "ep-between" and meta["revision"] == 1
+
+
+def test_a_narrowing_edit_with_a_failing_apply_leaves_no_exposure_window_on_the_real_engine(world, monkeypatch):
+    world.client.set_payload("c", payload={"visibility": "shared"}, points=[world.pid], key="metadata")
+
+    def boom(*a, **k):
+        raise ConnectionError("apply failed")
+
+    monkeypatch.setattr(MemoryService, "_apply_pending_meta", staticmethod(boom))
+    world.patch_memory(world.pid, "u", {"content": "private text", "visibility": "private"}, expected_revision="0")
+    p = _payload(world)
+    assert p["data"] == "private text" and p["metadata"]["visibility"] == "private"
+    assert p["ns_meta_pending"] is True and p["ns_revision"] == 1            # committed; derived metadata left for repair
+    # a shared-pool filter (the old audience) does not return the new text
+    from qdrant_client.models import FieldCondition, Filter, MatchValue
+
+    hits, _ = world.client.scroll("c", scroll_filter=Filter(must=[
+        FieldCondition(key="metadata.visibility", match=MatchValue(value="shared"))]), with_payload=True)
+    assert not any(h.payload["data"] == "private text" for h in hits)
+
+
+def test_a_second_set_payload_raising_does_not_fail_the_committed_edit_on_the_real_engine(world, monkeypatch):
+    real = world.client.set_payload
+    state = {"calls": 0}
+
+    def flaky(collection_name, payload, points, key=None):
+        state["calls"] += 1
+        if state["calls"] == 2:
+            raise ConnectionError("second call fails")
+        return real(collection_name, payload=payload, points=points, key=key)
+
+    monkeypatch.setattr(world.client, "set_payload", flaky)
+    world.patch_memory(world.pid, "u", {"content": "committed", "tags": ["x"]}, expected_revision="0")   # no raise
+    p = _payload(world)
+    assert p["data"] == "committed" and p["ns_revision"] == 1 and p["ns_meta_pending"] is True
+    monkeypatch.setattr(world.client, "set_payload", real)
+    assert world.repair_stale_vectors(min_age_s=0)["meta_repaired"] >= 1
+    assert _payload(world)["metadata"]["tags"] == ["x"]

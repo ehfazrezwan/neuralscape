@@ -45,8 +45,12 @@ INVARIANTS of an edit (tests: ``tests/test_patch_revision.py``,
   delete during an edit is never resurrected.
 
 DOCUMENTED LIMITS: (1) the dense/BM25 vector and the nested metadata are eventually consistent with the
-text (a reader can briefly see new text with the previous vector, or with the previous nested metadata);
-a mismatch is detectable (``vector_pending``, ``ns_meta_pending``) and repaired. A crash inside the few
+text (a reader can briefly see new text with the previous vector, or with the previous nested metadata; an
+EXCEPTION in the deferred apply, not only a crash, leaves the nested metadata behind the text until repair, and
+the edit still succeeds). What is NOT deferred: the access-control keys (``visibility``, ``project_id``,
+``scope``, ``category``) of an edit that does not widen the audience are written BEFORE the text commit, so the
+new text is never readable by the old audience; an edit that widens visibility defers them. If such a commit
+then loses the race, the narrowing stays (the fail-closed direction). A mismatch is detectable (``vector_pending``, ``ns_meta_pending``) and repaired. A crash inside the few
 milliseconds between a stale vector write and its post-check is not detectable. (2) Writers that bypass
 ``patch_memory`` (dedup counters, the dreaming graph patcher) do not bump the revision; they never change the
 patchable fields a revision guards. (3) The repair scans filter on fields that are not payload-indexed (the
@@ -376,6 +380,7 @@ class EditMixin:
         fields.update({
             "ns_revision": new_revision, "ns_token": token, "ns_nonces": nonces,
             "ns_meta_pending": True, "ns_meta_pending_at": now, "ns_meta_delta": delta,
+            "ns_meta_repair_attempts": None,
         })
         client.set_payload(
             collection_name=collection, payload=fields,
@@ -389,7 +394,44 @@ class EditMixin:
             entry = (stored_payload.get("ns_nonces") or {}).get(str(new_revision))
             if not isinstance(entry, dict) or entry.get("n") != token:
                 raise RevisionConflict(memory_id, expected_revision or current_revision, _payload_revision(stored_payload))
-        self._apply_pending_meta(client, collection, memory_id, new_revision, token, delta, parent_key)
+        try:
+            self._apply_pending_meta(client, collection, memory_id, new_revision, token, delta, parent_key)
+        except Exception as e:  # noqa: BLE001
+            # The edit is COMMITTED (text + revision). A store error in the deferred metadata apply must not turn the
+            # response into an error or skip the history/graph work: ``ns_meta_pending`` + the parked delta stay for
+            # ``repair_stale_vectors`` (and any later edit folds them in).
+            logger.warning("Deferred metadata apply failed for %s (left pending for repair): %s", memory_id, e)
+
+    _ACCESS_KEYS = ("visibility", "project_id", "scope", "category")
+    _VISIBILITY_RANK = {"private": 0, "shared": 1, "standard": 2}
+
+    def _narrow_access_before_text(self, m, memory_id, new_meta, stored_meta, current_revision, parent_key) -> None:
+        """Move the access-control keys BEFORE the text lands when a content edit does not widen the audience.
+
+        The text commit and the nested metadata apply are separate calls, and every pool filter reads
+        ``metadata.visibility`` / ``project_id`` / ``scope``: a narrowing edit (shared -> private, or a project move)
+        must not expose its NEW text to the OLD audience for the instant (or, on a failed apply, the hours until
+        repair) between them. So those keys are written first, conditional on the same revision. An edit that WIDENS
+        visibility keeps them deferred (the old text reaching the wider audience first is what the owner is
+        sharing anyway). Known edge: if the commit then loses the race the narrowing stays applied (the fail-closed
+        direction).
+        """
+        delta = {
+            k: new_meta.get(k) for k in self._ACCESS_KEYS if new_meta.get(k) != stored_meta.get(k)
+        }
+        if not delta:
+            return
+        rank = self._VISIBILITY_RANK
+        old_rank = rank.get(str(stored_meta.get("visibility") or "private"), 0)
+        new_rank = rank.get(str(new_meta.get("visibility") or "private"), 0)
+        if new_rank > old_rank:
+            return
+        m.vector_store.client.set_payload(
+            collection_name=settings.qdrant_collection,
+            payload=delta,
+            points=_cas_filter(memory_id, current_revision, parent_key),
+            key=parent_key,
+        )
 
     @staticmethod
     def _apply_pending_meta(client, collection, memory_id, revision, token, delta, parent_key) -> None:
@@ -531,21 +573,44 @@ class EditMixin:
             FieldCondition(key="ns_meta_pending_at", range=Range(lt=_now_epoch() - min_age_s)),
         ])
         meta_repaired = 0
-        points, _ = client.scroll(
-            collection_name=collection, scroll_filter=meta_filter, limit=min(100, limit),
-            with_payload=True, with_vectors=False,
-        )
-        for pt in points:
-            payload = pt.payload or {}
-            parent = "metadata.metadata" if isinstance((payload.get("metadata") or {}).get("metadata"), dict) else "metadata"
-            try:
-                self._apply_pending_meta(
-                    client, collection, str(pt.id), int(payload.get("ns_revision") or 0),
-                    payload.get("ns_token"), payload.get("ns_meta_delta") or {}, parent,
-                )
-                meta_repaired += 1
-            except Exception as e:  # noqa: BLE001
-                logger.warning("Metadata repair failed for %s: %s", pt.id, e)
+        meta_filter_budgeted = Filter(must=[
+            meta_filter,
+            Filter(should=[
+                IsEmptyCondition(is_empty=PayloadField(key="ns_meta_repair_attempts")),
+                FieldCondition(key="ns_meta_repair_attempts", range=Range(lt=max_attempts)),
+            ]),
+        ])
+        offset = None
+        budget = limit
+        while budget > 0:
+            points, offset = client.scroll(
+                collection_name=collection, scroll_filter=meta_filter_budgeted, limit=min(100, budget),
+                offset=offset, with_payload=True, with_vectors=False,
+            )
+            for pt in points:
+                budget -= 1
+                payload = pt.payload or {}
+                parent = "metadata.metadata" if isinstance((payload.get("metadata") or {}).get("metadata"), dict) else "metadata"
+                revision, token = int(payload.get("ns_revision") or 0), payload.get("ns_token")
+                try:
+                    self._apply_pending_meta(
+                        client, collection, str(pt.id), revision, token, payload.get("ns_meta_delta") or {}, parent,
+                    )
+                    meta_repaired += 1
+                except Exception as e:  # noqa: BLE001
+                    attempts = int(payload.get("ns_meta_repair_attempts") or 0) + 1
+                    logger.warning("Metadata repair failed for %s (attempt %d/%d): %s", pt.id, attempts, max_attempts, e)
+                    if attempts >= max_attempts:
+                        logger.error("Metadata repair attempts exhausted for %s; it stays pending for an operator", pt.id)
+                    try:
+                        client.set_payload(
+                            collection_name=collection, payload={"ns_meta_repair_attempts": attempts},
+                            points=_cas_filter(str(pt.id), str(revision), parent, token=token),
+                        )
+                    except Exception:  # noqa: BLE001
+                        pass
+            if offset is None or not points:
+                break
 
         scanned = repaired = failed = 0
         seen: set[str] = set()
@@ -766,6 +831,9 @@ class EditMixin:
         # the text fields, both filter-scoped. Not applied -> RevisionConflict, nothing written.
         text_fields: dict = {"updated_at": now_iso}
         if edits_content:
+            self._narrow_access_before_text(
+                m, memory_id, new_meta, stored_meta, current_revision, parent_key
+            )
             text_fields.update(self._text_fields(changes["content"], now_iso))
             text_fields["vector_pending"] = True            # cleared once the vector matches this text
             text_fields["vector_pending_at"] = _now_epoch()

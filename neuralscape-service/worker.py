@@ -1243,8 +1243,8 @@ async def repair_stale_vectors_cron(ctx: dict) -> dict:
     """
     service: MemoryService = ctx["service"]
     result = await asyncio.to_thread(service.repair_stale_vectors)
-    if result.get("scanned"):
-        logger.info(f"Vector repair cron: {result}")
+    if result.get("scanned") or result.get("meta_repaired"):
+        logger.info(f"Edit repair cron: {result}")
     return result
 
 
