@@ -543,7 +543,7 @@ def test_ask_check_fails_for_user_b(b, rd):
 # ── savings meter ────────────────────────────────────────────────
 
 
-@proves("read.savings-meter")
+@proves("read.savings-meter", "ops.telemetry-executor", "queue.telemetry-executor")
 def test_metrics_count_this_users_recall_events(ctx, a, b, rd):
     rd["dense"].require()
     check_meter_belongs_to(a, ctx.user_a)
@@ -607,7 +607,7 @@ def test_single_get_check_fails_for_user_b(b, rd):
     expect_check_fails(check, b)
 
 
-@proves("read.legacy-rest-reads")
+@proves("read.legacy-rest-reads", "fork.mem0.v2-kwarg-api")
 def test_legacy_list_and_search_routes_answer_with_the_callers_memories(ctx, a, rd):
     """Atlas: broken (issue #430): the legacy routes call mem0 with keyword
     arguments the fork no longer accepts and answer 500."""
