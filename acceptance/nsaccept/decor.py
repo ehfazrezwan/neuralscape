@@ -28,6 +28,16 @@ def needs(*capabilities: str) -> Callable:
     return pytest.mark.ns_needs(*capabilities)
 
 
+def expected_red(reference: str) -> Callable:
+    """Mark a scenario as known to fail until ``reference`` (a PR) lands.
+
+    NOT an xfail: the scenario still runs and a failure is still reported as ``fail``; the results
+    JSON only carries ``expected_red`` (the reference) so a reader can tell known from new reds."""
+    if not reference:
+        raise ValueError("@expected_red needs a reference, e.g. '#515'")
+    return pytest.mark.ns_expected_red(reference)
+
+
 def negative_control(fn: Callable) -> Callable:
     """Mark a scenario as a negative control (reported with negative_control=true)."""
     return pytest.mark.ns_negative_control(fn)
