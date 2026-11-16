@@ -144,6 +144,139 @@ class TestColdStart:
         assert redis.reads == 1
 
 
+class TestColdStartFailsClosed:
+    """No successful Redis load yet: valid per-user tokens get 503 + Retry-After."""
+
+    def test_503_with_retry_after_not_401(self, redis, client):
+        redis.down = True
+        r = _get(client, _token())
+        assert r.status_code == 503
+        assert r.headers["retry-after"] == "1"
+        assert "unavailable" in r.json()["detail"]
+
+    def test_env_listed_token_is_still_401_and_bad_tokens_stay_401(self, redis, client, monkeypatch):
+        redis.down = True
+        leaked = _token("a")
+        monkeypatch.setattr(settings, "neuralscape_revoked_tokens", token_fingerprint(leaked))
+        assert _get(client, leaked).status_code == 401  # env list: the hard guarantee
+        assert _get(client, "abc.def").status_code == 401  # not a valid token at all
+
+    def test_public_paths_are_unaffected(self, redis, monkeypatch):
+        redis.down = True
+        app = FastAPI()
+        app.add_middleware(BearerAuthMiddleware)
+
+        @app.get("/health")
+        async def health():
+            return {"ok": True}
+
+        @app.get("/oauth/anything")
+        async def oauth_anything():
+            return {"ok": True}
+
+        c = TestClient(app, raise_server_exceptions=False)
+        assert c.get("/health").status_code == 200
+        assert c.get("/oauth/anything").status_code == 200
+
+    def test_flag_off_restores_fail_open(self, redis, client, monkeypatch):
+        monkeypatch.setattr(settings, "revocation_fail_closed_on_cold_start", False)
+        redis.down = True
+        assert _get(client, _token()).status_code == 200
+
+    def test_redis_not_configured_changes_nothing(self, redis, client, monkeypatch):
+        monkeypatch.setattr(settings, "redis_url", "")
+        redis.down = True
+        assert _get(client, _token()).status_code == 200
+
+    def test_legacy_shared_key_with_a_dot_is_unaffected(self, redis, client, monkeypatch):
+        key = "legacy.key." + secrets.token_hex(8)
+        monkeypatch.setattr(settings, "neuralscape_api_key", key)
+        redis.down = True
+        assert _get(client, key).status_code == 200
+
+    def test_recovers_within_the_cold_retry_interval_and_revocations_apply(self, redis, client, monkeypatch):
+        import time
+
+        monkeypatch.setattr(settings, "revocation_refresh_interval_seconds", 60.0)
+        monkeypatch.setattr(settings, "revocation_cold_retry_seconds", 0.05)
+        leaked, fine = _token("a"), _token("b")
+        redis.sadd(REVOKED_SET_KEY, token_fingerprint(leaked))
+        redis.down = True
+        assert _get(client, fine).status_code == 503
+        redis.down = False
+        assert _get(client, fine).status_code == 503  # still inside the retry backoff
+        time.sleep(0.08)
+        assert _get(client, fine).status_code == 200
+        assert _get(client, leaked).status_code == 401
+
+    def test_after_one_load_an_outage_keeps_serving(self, redis, client):
+        tok = _token()
+        assert _get(client, tok).status_code == 200  # first load done
+        redis.down = True
+        assert _get(client, tok).status_code == 200
+
+    def test_cold_failure_backs_off_at_the_cold_retry_not_the_full_interval(self, redis, client, monkeypatch):
+        monkeypatch.setattr(settings, "revocation_refresh_interval_seconds", 60.0)
+        monkeypatch.setattr(settings, "revocation_cold_retry_seconds", 5.0)
+        redis.down = True
+        for _ in range(3):
+            _get(client, _token())
+        assert redis.reads == 1
+        assert tokens._snapshot.next_attempt - __import__("time").monotonic() <= 5.0
+
+    def test_failure_and_first_success_are_logged_as_warnings(self, redis, client, caplog):
+        with caplog.at_level(logging.WARNING, logger="tokens"):
+            redis.down = True
+            _get(client, _token())
+            redis.down = False
+            _get(client, _token())
+        msgs = [r.message for r in caplog.records if r.levelno == logging.WARNING]
+        assert any("503 until the first successful load" in m for m in msgs)
+        assert any("first load succeeded" in m for m in msgs)
+
+    def test_state_for_health(self, redis, client, monkeypatch):
+        assert tokens.revocation_state() == "unavailable"
+        _get(client, _token())
+        assert tokens.revocation_state() == "ok"
+        redis.down = True
+        tokens._snapshot.next_attempt = 0.0
+        _get(client, _token())
+        assert tokens.revocation_state() == "stale"
+        monkeypatch.setattr(settings, "redis_url", "")
+        assert tokens.revocation_state() == "not_configured"
+
+
+@pytest.mark.asyncio
+class TestWarmRevocations:
+    async def test_retries_until_redis_is_up_then_stops(self, redis, monkeypatch, caplog):
+        monkeypatch.setattr(settings, "revocation_cold_retry_seconds", 0.05)
+        import asyncio
+
+        redis.down = True
+        task = asyncio.create_task(tokens.warm_revocations(max_delay=0.05))
+        await asyncio.sleep(0.3)
+        assert not task.done() and tokens.revocation_state() == "unavailable"
+        redis.down = False
+        with caplog.at_level(logging.WARNING, logger="tokens"):
+            await asyncio.wait_for(task, 2)
+        assert tokens.revocation_state() == "ok"
+
+    async def test_startup_warning_when_the_first_attempt_fails(self, redis, caplog):
+        import asyncio
+
+        redis.down = True
+        with caplog.at_level(logging.WARNING, logger="tokens"):
+            task = asyncio.create_task(tokens.warm_revocations(max_delay=0.05))
+            await asyncio.sleep(0.1)
+            task.cancel()
+        assert any("starting without revocation state" in r.message for r in caplog.records)
+
+    async def test_noop_when_redis_is_not_configured(self, redis, monkeypatch):
+        monkeypatch.setattr(settings, "redis_url", "")
+        await tokens.warm_revocations()
+        assert redis.reads == 0
+
+
 class TestSnapshotCache:
     def test_requests_within_the_interval_cost_no_redis_read(self, redis, client, monkeypatch):
         monkeypatch.setattr(settings, "revocation_refresh_interval_seconds", 60.0)
@@ -168,9 +301,10 @@ class TestSnapshotCache:
 
 
 class TestRedisOutage:
-    def test_down_at_cold_start_env_list_is_enforced_and_warning_logged(
+    def test_flag_off_down_at_cold_start_env_list_is_enforced_and_warning_logged(
         self, redis, client, monkeypatch, caplog
     ):
+        monkeypatch.setattr(settings, "revocation_fail_closed_on_cold_start", False)
         redis.down = True
         leaked, fine = _token("a"), _token("b")
         monkeypatch.setattr(settings, "neuralscape_revoked_tokens", token_fingerprint(leaked))
@@ -201,7 +335,8 @@ class TestRedisOutage:
         assert _get(client, second).status_code == 401  # Redis is back: caught up
         assert _get(client, first).status_code == 401
 
-    def test_recovery_is_logged(self, redis, client, caplog):
+    def test_recovery_after_a_snapshot_is_logged(self, redis, client, caplog):
+        _get(client, _token())  # snapshot loaded
         redis.down = True
         _get(client, _token())
         redis.down = False
@@ -230,6 +365,7 @@ class TestRedisOutage:
         monkeypatch.undo()  # drop the conftest stub so the real factory is used
         monkeypatch.setattr(settings, "neuralscape_user_token_secret", SECRET)
         monkeypatch.setattr(settings, "neuralscape_auth_disabled", False)
+        monkeypatch.setattr(settings, "revocation_fail_closed_on_cold_start", False)
         monkeypatch.setattr(settings, "redis_url", "redis://127.0.0.1:1")
         monkeypatch.setattr(settings, "revocation_refresh_interval_seconds", 0.0)
         leaked, fine = _token("a"), _token("b")
@@ -389,3 +525,32 @@ class TestRevokeScript:
         mod, _ = script
         self._feed(monkeypatch, "")
         assert mod.main(["--redis"]) == 2
+
+
+class TestHealthReportsRevocation:
+    @pytest.fixture
+    def health(self, redis, monkeypatch):
+        from unittest.mock import AsyncMock, MagicMock
+
+        import main
+
+        tm = MagicMock()
+        tm.pool = MagicMock()
+        tm.pool.ping = AsyncMock(return_value=True)
+        svc = MagicMock()
+        svc._memory = object()
+        svc._graphiti = object()
+        monkeypatch.setattr(main, "_task_manager", tm)
+        monkeypatch.setattr(main, "_service", svc)
+        return lambda: TestClient(main.app, raise_server_exceptions=False).get("/health")
+
+    def test_unavailable_then_ok(self, redis, health, client):
+        redis.down = True
+        assert health().json()["checks"]["revocation"] == "unavailable"
+        redis.down = False
+        _get(client, _token())
+        assert health().json()["checks"]["revocation"] == "ok"
+
+    def test_absent_when_not_configured(self, redis, health, monkeypatch):
+        monkeypatch.setattr(settings, "redis_url", "")
+        assert "revocation" not in health().json()["checks"]

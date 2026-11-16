@@ -532,6 +532,13 @@ class Settings(BaseSettings):
     # Connect/read timeout for that read, so a Redis outage costs one short
     # delay per interval, not one per request.
     revocation_redis_timeout_seconds: float = 1.0
+    # Cold start: until this process has completed ONE successful read of the
+    # Redis revocation set, per-user tokens are refused with 503 + Retry-After
+    # (not 401, so clients retry instead of dropping credentials). The env list
+    # is enforced either way. false = fail open on the Redis list (warning only).
+    revocation_fail_closed_on_cold_start: bool = True
+    # Retry interval for that first load (seconds; capped by the refresh interval).
+    revocation_cold_retry_seconds: float = 1.0
     # Multi-user HMAC-signed tokens. When set, the server also accepts tokens of the
     # form `{base64url(payload)}.{hmac_sha256(secret, payload)}` where payload is
     # `{"user_id": "...", "exp": <unix-ts>}`. The verified user_id is attached to

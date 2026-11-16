@@ -61,16 +61,22 @@ def _disable_auth_for_tests():
 def _isolate_revocation_snapshot(monkeypatch):
     """Keep unit tests off any real Redis and clear the cached revocation snapshot.
 
-    The bearer middleware reads the live Redis denylist; here it sees an
-    unreachable Redis unless a test installs its own fake client through
+    The bearer middleware reads the live Redis denylist; here it sees a
+    reachable, empty one (so the cold-start 503 never fires) unless a test installs its own fake client through
     ``tokens._new_redis_client``.
     """
     import tokens
 
-    def _no_redis():
-        raise ConnectionError("unit tests do not reach a real Redis")
+    class _EmptyRedis:
+        """A reachable Redis whose revocation set is empty."""
 
-    monkeypatch.setattr(tokens, "_new_redis_client", _no_redis)
+        async def smembers(self, key):
+            return set()
+
+        async def aclose(self):
+            return None
+
+    monkeypatch.setattr(tokens, "_new_redis_client", _EmptyRedis)
     tokens.reset_revocation_snapshot()
     yield
     tokens.reset_revocation_snapshot()

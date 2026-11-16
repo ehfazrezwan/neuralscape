@@ -186,11 +186,22 @@ rejected (fail closed).
   enforced: everything revoked up to the outage stays revoked. A revocation
   made during the outage is not seen until Redis is back (at most one interval
   after it returns).
-- At cold start with Redis down there is no snapshot yet: only the env list is
-  enforced, and tokens are NOT refused on account of the outage (fail open for
-  the Redis list only, so a Redis restart does not lock every user out). This
-  is logged as a warning (`token revocation: Redis unreachable ... env list
-  only`). Operators who need a hard guarantee put the digest in the env list.
+- **Cold start** (the process has not yet completed one successful read of the
+  Redis set): by default (`REVOCATION_FAIL_CLOSED_ON_COLD_START=true`) a valid
+  per-user token gets **503 with `Retry-After: 1`**, not 401, so clients retry
+  and keep their credentials. A token on the env list is still 401, an invalid
+  token still 401, and the public paths (`/health`, `/health/live`,
+  `/.well-known/*`, `/oauth/*`) and the legacy shared key are unaffected. The
+  first load is attempted at startup in the background with a short backoff
+  (and again by requests every `REVOCATION_COLD_RETRY_SECONDS`, default 1), so a
+  start where Redis is healthy never shows the 503 window. Once one load has
+  succeeded, a later outage keeps the last snapshot (above). The detailed
+  `/health` reports `checks.revocation`: `ok`, `unavailable` (cold start, no load
+  yet) or `stale` (loaded, Redis down now); absent when no Redis URL or no
+  per-user token secret is configured, in which case nothing here applies.
+  Startup logs a WARNING when it begins without revocation state and another when
+  the first load succeeds. Set the flag to `false` to fail open on the Redis list
+  instead (warning only, env list still enforced).
 - After a failed read the next attempt waits one interval, so an outage adds one
   short connect timeout (`REVOCATION_REDIS_TIMEOUT_SECONDS`, default 1) per
   interval, not per request. The warning is logged once per outage window.

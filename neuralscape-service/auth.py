@@ -38,7 +38,12 @@ from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from config import settings
-from tokens import issue_user_token, refresh_revocations, verify_user_token  # noqa: F401 (re-export)
+from tokens import (  # noqa: F401 (re-export)
+    issue_user_token,
+    refresh_revocations,
+    revocation_cold_unavailable,
+    verify_user_token,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -160,6 +165,18 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
             # (cached; at most one Redis read per REVOCATION_REFRESH_INTERVAL_SECONDS).
             await refresh_revocations()
             payload = verify_user_token(token, token_secret)
+            if payload is not None and revocation_cold_unavailable():
+                # A valid, env-list-clean token but no successful Redis load yet:
+                # we cannot tell whether it was revoked live. Refuse with 503
+                # (retry), never 401, so clients keep their credentials.
+                return JSONResponse(
+                    status_code=503,
+                    headers={"Retry-After": "1"},
+                    content={
+                        "detail": "Token revocation state is unavailable (the revocation "
+                        "store has not been reachable since startup); retry shortly."
+                    },
+                )
             if payload is not None:
                 request.state.user_id = payload["user_id"]
                 request.state.auth_mode = "user_token"

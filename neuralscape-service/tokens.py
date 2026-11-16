@@ -56,6 +56,7 @@ class _RevocationSnapshot:
         self.next_attempt = 0.0  # time.monotonic() before which no refresh is tried
         self.last_error_logged = 0.0
         self.degraded = False
+        self.ever_failed = False
         self.lock = None  # asyncio.Lock, created lazily inside the running loop
         self.lock_loop = None
 
@@ -117,7 +118,9 @@ async def refresh_revocations(force: bool = False) -> bool:
         if not force and now < snap.next_attempt:
             return False  # another request refreshed while we waited
         interval = _refresh_interval()
-        snap.next_attempt = now + interval
+        # Until the first successful load, retry quickly: a normal start where
+        # Redis comes up just after the API should leave the 503 window short.
+        snap.next_attempt = now + (interval if snap.loaded else min(interval, _cold_retry()))
         client = None
         try:
             client = _new_redis_client()
@@ -129,16 +132,21 @@ async def refresh_revocations(force: bool = False) -> bool:
         except Exception as exc:  # noqa: BLE001 - Redis down must not break auth
             if now - snap.last_error_logged >= 30.0 or not snap.degraded:
                 snap.last_error_logged = now
+                if snap.loaded:
+                    enforcing = f"the last snapshot ({len(snap.digests)} digests) plus the env list"
+                elif _fail_closed_on_cold_start():
+                    enforcing = (
+                        "the env list; per-user tokens get 503 until the first successful load"
+                    )
+                else:
+                    enforcing = "the env list only (no Redis snapshot yet)"
                 logger.warning(
                     "token revocation: Redis unreachable (%s); enforcing %s",
                     type(exc).__name__,
-                    (
-                        f"the last snapshot ({len(snap.digests)} digests) plus the env list"
-                        if snap.loaded
-                        else "the env list only (no Redis snapshot yet)"
-                    ),
+                    enforcing,
                 )
             snap.degraded = True
+            snap.ever_failed = True
             return False
         finally:
             if client is not None:
@@ -146,12 +154,91 @@ async def refresh_revocations(force: bool = False) -> bool:
                     await client.aclose()
                 except Exception:  # noqa: BLE001
                     pass
-        if snap.degraded:
+        if not snap.loaded and snap.ever_failed:
+            logger.warning(
+                "token revocation: first load succeeded (%d digests); per-user tokens are accepted again",
+                len(digests),
+            )
+        elif snap.degraded:
             logger.info("token revocation: Redis reachable again; snapshot refreshed")
         snap.degraded = False
         snap.digests = digests
         snap.loaded = True
         return True
+
+
+def _cold_retry() -> float:
+    try:
+        from config import settings
+
+        return max(0.05, float(settings.revocation_cold_retry_seconds))
+    except Exception:  # noqa: BLE001
+        return 1.0
+
+
+def _fail_closed_on_cold_start() -> bool:
+    try:
+        from config import settings
+
+        return bool(settings.revocation_fail_closed_on_cold_start)
+    except Exception:  # noqa: BLE001
+        return True
+
+
+def revocation_configured() -> bool:
+    """True when per-user tokens are in use and a Redis URL is set."""
+    try:
+        from config import settings
+
+        return bool(settings.neuralscape_user_token_secret) and bool(settings.redis_url)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def revocation_cold_unavailable() -> bool:
+    """True while per-user tokens must be refused with 503.
+
+    That is: the Redis revocation set is in use, the process has not yet
+    completed one successful load, and ``REVOCATION_FAIL_CLOSED_ON_COLD_START``
+    is on. The env list is enforced either way.
+    """
+    return revocation_configured() and not _snapshot.loaded and _fail_closed_on_cold_start()
+
+
+def revocation_state() -> str:
+    """``ok`` | ``unavailable`` (no load yet) | ``stale`` (loaded, Redis down now) | ``not_configured``."""
+    if not revocation_configured():
+        return "not_configured"
+    if not _snapshot.loaded:
+        return "unavailable"
+    return "stale" if _snapshot.degraded else "ok"
+
+
+async def warm_revocations(max_delay: float = 5.0) -> None:
+    """Load the Redis revocation set at startup, retrying with a short backoff.
+
+    Run as a background task from the app lifespan so a normal start (Redis up
+    before or just after the API) never shows the cold-start 503 window.
+    Returns once the first load succeeded. Never raises.
+    """
+    import asyncio
+
+    if not revocation_configured():
+        return
+    delay = 0.25
+    first = True
+    while not _snapshot.loaded:
+        if await refresh_revocations(force=True):
+            return
+        if first:
+            first = False
+            if _fail_closed_on_cold_start():
+                logger.warning(
+                    "token revocation: starting without revocation state; per-user tokens get 503 "
+                    "(Retry-After) until Redis is reachable (retrying)"
+                )
+        await asyncio.sleep(delay)
+        delay = min(delay * 2, max_delay)
 
 
 def identity_fingerprint(provider: str, user_id: str) -> str:

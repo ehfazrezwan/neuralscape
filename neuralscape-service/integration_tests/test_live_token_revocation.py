@@ -121,13 +121,51 @@ def test_revocation_lands_within_the_snapshot_interval(api, stores, secret, dige
         time.sleep(0.1)
 
 
-def test_env_list_is_honoured_when_redis_is_unreachable(api, secret, flags, unique_ns):
+def test_cold_start_without_redis_env_list_holds_and_other_tokens_get_503(api, secret, flags, unique_ns):
     leaked = issue_user_token(unique_ns.user_id, secret, 3600)
     fine = issue_user_token(unique_ns.user_id, secret, 7200)
     flags(redis_url=UNREACHABLE_REDIS, neuralscape_revoked_tokens=token_fingerprint(leaked))
     tokens.reset_revocation_snapshot()  # cold start, Redis down
+    assert _get(api, leaked).status_code == 401  # env list: the hard guarantee
+    refused = _get(api, fine)
+    assert refused.status_code == 503 and refused.headers["retry-after"]  # retry, do not drop credentials
+
+
+def test_flag_off_cold_start_without_redis_fails_open_on_the_redis_list(api, secret, flags, unique_ns):
+    leaked = issue_user_token(unique_ns.user_id, secret, 3600)
+    fine = issue_user_token(unique_ns.user_id, secret, 7200)
+    flags(
+        redis_url=UNREACHABLE_REDIS,
+        neuralscape_revoked_tokens=token_fingerprint(leaked),
+        revocation_fail_closed_on_cold_start=False,
+    )
+    tokens.reset_revocation_snapshot()
     assert _get(api, leaked).status_code == 401
     assert _get(api, fine).status_code == 200
+
+
+def test_api_started_without_redis_recovers_when_redis_appears(
+    api, stores, secret, digests, unique_ns, flags
+):
+    """Redis cannot be stopped on the gate, so "down at start" is modelled by starting the
+    app against an unreachable URL and then pointing it at the real Redis (what a Redis that
+    comes up later looks like to the process: the same URL starts answering)."""
+    revoked = issue_user_token(unique_ns.user_id, secret, 3600)
+    fine = issue_user_token(unique_ns.user_id, secret, 7200)
+    digests.append(token_fingerprint(revoked))
+    assert _script(stores, "--redis", token=revoked).returncode == 0
+
+    flags(redis_url=UNREACHABLE_REDIS, revocation_refresh_interval_seconds=1.0,
+          revocation_cold_retry_seconds=0.2)
+    tokens.reset_revocation_snapshot()
+    assert _get(api, fine).status_code == 503  # started without Redis
+
+    flags(redis_url=stores.redis_url)  # Redis is reachable now
+    deadline = time.monotonic() + 0.2 + 3.0  # cold retry interval + slack
+    while _get(api, fine).status_code != 200:
+        assert time.monotonic() < deadline, "did not recover within the cold-start retry interval"
+        time.sleep(0.05)
+    assert _get(api, revoked).status_code == 401  # the digest already in Redis is enforced
 
 
 def test_redis_going_away_keeps_the_last_snapshot_then_catches_up(
