@@ -1,0 +1,24 @@
+{
+  "event": {
+    "cwd": "/home/user/sample-project",
+    "hook_event_name": "PostToolUse",
+    "permission_mode": "default",
+    "session_id": "sess-0001",
+    "tool_input": {
+      "prompt": "summarize",
+      "url": "https://example.invalid/page"
+    },
+    "tool_name": "WebFetch",
+    "tool_response": "The page says the cache TTL is sixty seconds.",
+    "tool_use_id": "toolu_string",
+    "transcript_path": "/home/user/.claude/projects/sample/sess-0001.jsonl"
+  },
+  "fixture": "string-response",
+  "provenance": {
+    "client": "claude-code",
+    "client_version_tag": "hook-shape-v1 (documented PostToolUse/transcript shapes)",
+    "contains_real_data": false,
+    "kind": "synthetic-sanitized",
+    "replace_with": "a sanitized capture when one is available; keep the tag and expected file"
+  }
+}

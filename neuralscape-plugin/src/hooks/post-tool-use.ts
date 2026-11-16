@@ -83,6 +83,38 @@ export function asString(v: unknown): string {
 }
 
 /**
+ * Render a tool result by shape. Text blocks (MCP results) become their joined text; non-text
+ * blocks become a short `[<type>]` placeholder (never raw JSON, so image data cannot bloat the
+ * buffer); empty values ({}, [], "", null) become empty output; a Bash-style result that was
+ * interrupted keeps its stdout/stderr text plus an explicit `[interrupted]` marker; any other
+ * value is JSON as before. Redaction runs on the rendered text, before truncation.
+ */
+export function renderToolResponse(v: unknown): string {
+  if (v == null) return "";
+  if (typeof v === "string") return v;
+  if (Array.isArray(v)) {
+    if (v.length > 0 && v.every((b) => b && typeof b === "object" && typeof (b as { type?: unknown }).type === "string")) {
+      return v
+        .map((b) => {
+          const block = b as { type: string; text?: unknown };
+          return block.type === "text" && typeof block.text === "string" ? block.text : `[${block.type}]`;
+        })
+        .join("\n");
+    }
+    return v.length === 0 ? "" : asString(v);
+  }
+  if (typeof v === "object") {
+    const o = v as Record<string, unknown>;
+    if (Object.keys(o).length === 0) return "";
+    if (o.interrupted === true && ("stdout" in o || "stderr" in o)) {
+      const parts = [o.stdout, o.stderr].filter((x): x is string => typeof x === "string" && x !== "");
+      return [...parts, "[interrupted]"].join("\n");
+    }
+  }
+  return asString(v);
+}
+
+/**
  * Normalize a path for prefix comparison: forward slashes, lower-cased on
  * Windows, trimmed. We need this because the observation_dir resolved
  * locally may differ in slash direction from what the tool input contains.
@@ -151,7 +183,7 @@ export function buildObservationRow(input: HookInput): Record<string, unknown> {
     // Claude Code sends the result as `tool_response` (string or object);
     // `tool_output` is a legacy fallback. Redact BEFORE truncating so a
     // <private> span split by the elision cannot leak its kept half.
-    output: truncateOutput(redactPrivate(asString(input.tool_response ?? input.tool_output), { failClosed: true })),
+    output: truncateOutput(redactPrivate(renderToolResponse(input.tool_response ?? input.tool_output), { failClosed: true })),
   };
 }
 

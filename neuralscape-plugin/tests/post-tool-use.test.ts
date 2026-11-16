@@ -358,3 +358,26 @@ describe("buildObservationRow", () => {
     expect(row.ts).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/);
   });
 });
+
+describe("renderToolResponse shapes", () => {
+  const out = (r: unknown) => buildObservationRow({ tool_name: "Bash", tool_input: { command: "x" }, tool_response: r }).output;
+
+  it("joins text blocks and summarises non-text blocks without raw JSON", () => {
+    expect(out([{ type: "text", text: "a" }, { type: "image", source: { data: "AAAA" } }, { type: "text", text: "b" }])).toBe("a\n[image]\nb");
+  });
+  it("renders empty values as empty output", () => {
+    for (const r of [{}, [], "", null]) expect(out(r)).toBe("");
+  });
+  it("keeps stdout/stderr and adds an explicit marker when interrupted", () => {
+    expect(out({ stdout: "partial", stderr: "oops", interrupted: true })).toBe("partial\noops\n[interrupted]");
+    expect(out({ stdout: "", stderr: "", interrupted: true })).toBe("[interrupted]");
+  });
+  it("renders a non-block array and other objects as JSON", () => {
+    expect(out([1, 2])).toBe("[1,2]");
+    expect(out({ a: 1 })).toBe('{"a":1}');
+  });
+  it("redacts private spans in text blocks and interrupted output", () => {
+    expect(out([{ type: "text", text: "ok <private>SECRET-X" }])).not.toContain("SECRET-X");
+    expect(out({ stdout: "ok <private>SECRET-Y", interrupted: true })).not.toContain("SECRET-Y");
+  });
+});
