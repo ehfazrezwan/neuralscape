@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import hashlib
+import random
+import re
+import unicodedata
 
 import pytest
 
@@ -49,9 +52,8 @@ def test_case_differing_ids_get_distinct_files(tmp_path):
 def test_name_is_stable_and_readable():
     p1 = reflect.diary_page_path(reflect.Path("/v/Dreams"), A)
     assert p1 == reflect.diary_page_path(reflect.Path("/v/Dreams"), A)
-    assert p1.name.startswith("user-a-b-") and p1.name.endswith(".md")
-    assert p1.name == "user-a-b-" + p1.name.split("-")[-1]  # slug + 16-hex digest
-    assert len(p1.stem.rsplit("-", 1)[1]) == 16
+    digest = hashlib.sha256(A.encode("utf-8")).hexdigest()[:32]
+    assert p1.name == f"user-a-b--{digest}.md"  # slug + "--" + 32-hex digest of the exact id
 
 
 def test_index_links_resolve(tmp_path):
@@ -211,4 +213,169 @@ def test_unwritable_pool_ids_do_not_break_write(tmp_path):
     long_pool = "user--" + "x" * 300
     assert len(reflect.diary_page_path(dreams, long_pool).name.encode()) < 255
     assert _write(dreams, long_pool, "x") is not None
-    assert hashlib.sha256(long_pool.encode()).hexdigest()[:16] in reflect.diary_page_path(dreams, long_pool).name
+    assert hashlib.sha256(long_pool.encode()).hexdigest()[:32] in reflect.diary_page_path(dreams, long_pool).name
+
+
+# ── cross-pool path without a hash collision: a pre-fix file named like a new page ──
+
+
+def _sha(pool, n=32):
+    return hashlib.sha256(pool.encode("utf-8")).hexdigest()[:n]
+
+
+V = "shared--project--alpha"
+O = V + "-" + _sha(V, 16)  # the pre-fix 16-hex name of V's page, as another pool's id
+
+
+def test_prefix_file_named_like_another_pools_page_is_not_read_or_overwritten(tmp_path):
+    """The reviewer's repro. O's pre-fix file is ``slug(V)-<16 hex of V>.md``,
+    which the previous scheme used as V's page. It must stay untouched and
+    its text must never reach V's page (nor V's text O's)."""
+    assert O == "shared--project--alpha-c3df39628649efbe"
+    dreams = tmp_path / "Dreams"
+    legacy, secret = _make_legacy(dreams, O)
+    assert legacy.name == "shared-project-alpha-c3df39628649efbe.md"
+    before = legacy.read_bytes()
+    _write(dreams, V, "V-ENTRY")
+    _write(dreams, O, "O-ENTRY")
+    _write(dreams, V, "V-ENTRY-2")
+    pv = reflect.diary_page_path(dreams, V)
+    po = reflect.diary_page_path(dreams, O)
+    assert len({pv, po, legacy}) == 3
+    assert legacy.read_bytes() == before
+    tv, to = pv.read_text(), po.read_text()
+    assert secret not in tv and secret not in to
+    assert "V-ENTRY" in tv and "O-ENTRY" not in tv
+    assert "O-ENTRY" in to and "V-ENTRY" not in to
+    refresh_bundle_indexes(tmp_path)
+    assert legacy.read_bytes() == before
+
+
+def _legacy_names(pool):
+    """Every name an earlier version of this code could have written for ``pool``."""
+    from extensions.conversation_compiler.obsidian_writer import _slugify
+
+    slug = _slugify(pool) or "pool"
+    cap = slug[:48].strip("-") or "pool"
+    return {
+        f"{slug}.md",
+        f"{cap}-{_sha(pool, 10)}.md",  # intermediate 10-hex form
+        f"{cap}-{_sha(pool, 16)}.md",  # intermediate 16-hex form
+    }
+
+
+def _adversarial_pools():
+    rng = random.Random(611)
+    alphabet = "ab-_ .:A0\u00e9\u2028"
+    pools = {V, O, A, B, LONG1, LONG2, "", "-", "--", "x"}
+    for _ in range(150):
+        pools.add("user--" + "".join(rng.choice(alphabet) for _ in range(rng.randint(0, 40))))
+    for base in list(pools):
+        for n in (10, 16, 32, 64):
+            h = _sha(base, n)
+            pools.update({f"{base}-{h}", f"{base}--{h}", f"{base}_{h}", f"{base} {h}", h, f"-{h}", f"--{h}"})
+    return sorted(pools)
+
+
+def test_legacy_style_names_never_equal_new_style_names(tmp_path):
+    dreams = tmp_path / "Dreams"
+    pools = _adversarial_pools()
+    assert len(pools) > 1000
+    legacy_names, new_names = set(), set()
+    for pool in pools:
+        legacy_names |= _legacy_names(pool)
+        new_names.add(reflect.diary_page_path(dreams, pool).name)
+    assert not (legacy_names & new_names)
+    # the generator really produces the dangerous shape: some pool's pre-fix
+    # name carries another pool's exact old-scheme digest suffix
+    assert _legacy_names(O) & {f"shared-project-alpha-{_sha(V, 16)}.md"}
+    # distinct ids -> distinct pages
+    assert len(new_names) == len(pools)
+
+
+def test_classifier_puts_every_legacy_name_prefix_and_every_new_name_new(tmp_path):
+    pools = _adversarial_pools()
+    new_names = {reflect.diary_page_path(tmp_path, p).name for p in pools}
+    legacy_names = set().union(*(_legacy_names(p) for p in pools))
+    for name in new_names:
+        assert okf_vault._DIARY_DIGEST_RE.search(name), name
+    for name in legacy_names:
+        assert not okf_vault._DIARY_DIGEST_RE.search(name), name
+    # and through the real index builder, on a sample of files
+    sample_new = sorted(new_names)[:60]
+    sample_legacy = sorted(legacy_names)[:60]
+    dreams = tmp_path / "Dreams"
+    dreams.mkdir()
+    for name in sample_new + sample_legacy:
+        if len(name.encode()) < 255:
+            (dreams / name).write_text(f"---\ntitle: T-{name}\n---\n\n# body\n", encoding="utf-8")
+    refresh_bundle_indexes(tmp_path)
+    index = (dreams / "index.md").read_text()
+    head = index.index(okf_vault.LEGACY_DIARY_HEADING)
+    for name in sample_new:
+        assert index.count(f"({name.replace(' ', '%20')})") == 1
+        assert f"({name.replace(' ', '%20')})" in index[:head]
+    for name in sample_legacy:
+        assert f"({name.replace(' ', '%20')})" in index[head:]
+        assert f"({name.replace(' ', '%20')})" not in index[:head]
+
+
+def test_new_names_use_double_hyphen_and_32_hex():
+    for pool in (V, O, A, "", "x" * 300, "user--\u212b"):
+        name = reflect.diary_page_path(reflect.Path("/v/Dreams"), pool).name
+        assert re.fullmatch(r"[^/]+--[0-9a-f]{32}\.md", name), name
+        assert "--" not in name.rsplit("--", 1)[0]  # the slug itself has no "--"
+
+
+# ── the EXACT id is hashed: no strip, no normalisation, no case fold ──
+
+EXACT_PAIRS = [
+    ("user--a\n", "user--a"),
+    ("user--a\u2028", "user--a"),
+    ("user--a ", "user--a"),
+    (" user--a", "user--a"),
+    ("user--\u212b", "user--\u00c5"),  # ANGSTROM SIGN vs A-ring: NFC folds them, slugs are equal
+    ("user--\u212a", "user--K"),        # KELVIN SIGN vs K: NFC folds them, slugs are equal
+    ("user--cafe\u0301", "user--caf\u00e9"),  # decomposed vs composed e-acute
+    ("user--Alice", "user--alice"),
+]
+
+
+@pytest.mark.parametrize("p1,p2", EXACT_PAIRS)
+def test_pools_differing_only_by_whitespace_or_normalisation_get_separate_pages(tmp_path, p1, p2):
+    assert p1 != p2
+    dreams = tmp_path / "Dreams"
+    a, b = reflect.diary_page_path(dreams, p1), reflect.diary_page_path(dreams, p2)
+    assert a != b and a.name.lower() != b.name.lower()
+    _write(dreams, p1, "SECRET-ONE")
+    _write(dreams, p2, "SECRET-TWO")
+    assert "SECRET-TWO" not in a.read_text() and "SECRET-ONE" not in b.read_text()
+
+
+def test_normalisation_pairs_really_equalise_under_the_mutated_transforms():
+    """Guards the pair list: each mutation target must actually merge some pair."""
+    from extensions.conversation_compiler.obsidian_writer import _slugify
+
+    stripped = [(x, y) for x, y in EXACT_PAIRS if x.strip() == y.strip() and x != y]
+    nfc = [(x, y) for x, y in EXACT_PAIRS
+           if unicodedata.normalize("NFC", x) == unicodedata.normalize("NFC", y)]
+    assert len(stripped) >= 3 and len(nfc) >= 3
+    # NFC-only pairs whose slugs are equal: only the digest keeps these apart
+    # (the e-acute pair differs in the slug too, so it cannot catch an NFC mutant)
+    assert len([1 for x, y in nfc if _slugify(x) == _slugify(y)]) >= 2
+    assert len([1 for x, y in stripped if _slugify(x) == _slugify(y)]) >= 3
+
+
+# ── Dreams/index.md lists names and frontmatter titles only, never diary content ──
+
+
+def test_index_carries_no_diary_or_legacy_body_text(tmp_path):
+    dreams = tmp_path / "Dreams"
+    legacy, legacy_secret = _make_legacy(dreams, O, secret="LEGACY-BODY-SECRET")
+    _write(dreams, V, "PAGE-BODY-SECRET-V")
+    _write(dreams, O, "PAGE-BODY-SECRET-O")
+    refresh_bundle_indexes(tmp_path)
+    index = (dreams / "index.md").read_text()
+    for text in ("LEGACY-BODY-SECRET", "PAGE-BODY-SECRET-V", "PAGE-BODY-SECRET-O", "## Dream", "Reflections"):
+        assert text not in index, text
+    assert legacy.name in index  # names are listed

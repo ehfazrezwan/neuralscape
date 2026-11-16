@@ -134,26 +134,33 @@ def store_insights(service, batch: PoolBatch, insights: list[dict], *, dry_run: 
 # ── Diary ───────────────────────────────────────────────────────────
 
 
+#: Diary page names are ``{slug}--{DIARY_DIGEST_LEN hex}.md``.
+DIARY_SEP = "--"
+DIARY_DIGEST_LEN = 32
+
+
 def diary_page_path(dreams_dir: Path, pool: str) -> Path:
-    """The pool's diary page: a readable slug plus a hash of the EXACT pool id.
+    """The pool's diary page: a readable slug, ``--``, and a hash of the EXACT pool id.
 
-    The slug alone is lossy (``--``/``_`` collapse, 80-char truncation), so
-    two different pools could share one file and mix private text. The
-    16-hex (64-bit) SHA-256 suffix of the unmodified, case-preserving pool id
-    keeps names distinct and stable across runs. This is the only place a
-    diary name is computed.
+    Name: ``{slug}--{32 hex}.md``. The digest is the first 32 hex (128 bits)
+    of the SHA-256 of the unmodified, case-preserving, un-normalised pool id
+    (no strip, no NFC), so distinct ids never share a page.
 
-    Pre-fix slug-only files are never read, moved or written: every pool
-    starts its collision-free page fresh and the old files stay as they are
-    (``Dreams/index.md`` lists them under a separate heading).
+    The pre-fix naming was ``{slug}.md`` with the slug built by ``_slugify``,
+    which collapses every run of hyphens to one, so a pre-fix name can never
+    contain ``--``. New names always do. The two name sets are therefore
+    disjoint by construction: this pool's page can never be a pre-fix file,
+    whatever pool ids exist. Pre-fix files are never read, moved or written
+    here (``Dreams/index.md`` lists their names under a separate heading).
+    This is the only place a diary name is computed.
     """
     import hashlib
 
     from extensions.conversation_compiler.obsidian_writer import _slugify
 
     slug = (_slugify(pool) or "pool")[:48].strip("-") or "pool"
-    digest = hashlib.sha256(pool.encode("utf-8")).hexdigest()[:16]
-    return dreams_dir / f"{slug}-{digest}.md"
+    digest = hashlib.sha256(pool.encode("utf-8")).hexdigest()[:DIARY_DIGEST_LEN]
+    return dreams_dir / f"{slug}{DIARY_SEP}{digest}.md"
 
 
 def render_diary_entry(

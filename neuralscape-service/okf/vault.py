@@ -36,9 +36,10 @@ _DIR_DESCRIPTIONS = {
 }
 
 
-#: Dream-diary pages are named ``<slug>-<16-hex sha256 of the pool id>.md``.
-#: A ``Dreams/*.md`` file without that suffix is a pre-fix slug-only file.
-_DIARY_DIGEST_RE = re.compile(r"-[0-9a-f]{16}\.md$")
+#: Dream-diary pages are named ``<slug>--<32-hex sha256 of the pool id>.md``.
+#: The pre-fix names never contain ``--`` (the slugifier collapses hyphen
+#: runs), so a ``Dreams/*.md`` file without this tail is a pre-fix file.
+_DIARY_DIGEST_RE = re.compile(r"--[0-9a-f]{32}\.md$")
 
 LEGACY_DIARY_HEADING = (
     "Pre-fix diary files (may hold entries from pools whose names collided)"
