@@ -1,8 +1,11 @@
 """Repo-level migration scripts: retired wiki layout migration + group-id cypher.
 
-``scripts/`` lives at the repo root; the packaged test image carries only the
-service tree, so every test here returns early when it is absent (same
-precedent as ``test_upstream_patch_markers.py``).
+``scripts/`` lives at the repo root; the packaged test image has no repo-level
+``scripts/`` directory (the Dockerfile test stage copies the one cypher file
+into ``integration_tests/repo_scripts/`` for the real-Neo4j test only), so every
+test here returns early when the repo-root files are absent (same precedent as
+``test_upstream_patch_markers.py``). The real-Neo4j test in
+``integration_tests/test_migrate_group_ids_neo4j.py`` is what exercises the cypher.
 """
 
 import re
