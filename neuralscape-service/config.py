@@ -9,11 +9,75 @@ from urllib.parse import urlparse
 
 from arq.connections import RedisSettings
 from pydantic import Field, field_validator, model_validator
-from pydantic_settings import BaseSettings, NoDecode
+from pydantic_settings import BaseSettings, NoDecode, PydanticBaseSettingsSource
 
 _logger = logging.getLogger(__name__)
 
 _LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1", "[::1]"}
+
+# ── Keys a service .env may hold that Settings does not own ──────────────────
+# Settings reads ``.env`` from the working directory and rejects unknown keys, so a
+# typo fails loudly. Three kinds of keys in that file are legitimate without being
+# Settings fields, and only these are tolerated (and only from the file):
+#
+# * Compose-only keys: read by ``docker compose`` for interpolation in
+#   docker-compose*.yml, never by the service. They appear in the env templates so
+#   the same file can serve both a Compose run and a local run.
+COMPOSE_ONLY_KEYS = frozenset({
+    "CLOUDFLARE_TUNNEL_TOKEN",  # cloudflared sidecar
+    "DOMAIN",  # reverse-proxy host name
+    "REDIS_PASSWORD",  # interpolated into REDIS_URL and the redis service
+    "EMBEDDING_MODEL_NAME",  # interpolated into GEMINI_EMBEDDER_MODEL
+})
+# * Vendored-env keys: read straight from the process environment by vendored library
+#   code (mem0 adapter), not by Settings. Tolerated in the file so a template can
+#   document them, but a value there is NOT read by a local run: export it instead.
+VENDORED_ENV_KEYS = frozenset({
+    "GRAPHITI_BRIDGE_TIMEOUT_S",  # mem0 graphiti adapter: per-call bridge timeout
+})
+# * Keys owned by the extension settings classes that read the same ``.env``
+#   (extensions/*/config.py, which config.py cannot import; a test keeps these in
+#   step): every key under a prefixed class's env prefix (those classes ignore
+#   unknown keys themselves), and the field names of the unprefixed class.
+EXTENSION_ENV_PREFIXES = ("DREAMING_", "STRATEGY_SYNTHESIZER_")
+EXTENSION_ENV_KEYS = frozenset({  # conversation_compiler.config.CompilerSettings (no prefix)
+    "OBSIDIAN_VAULT_PATH", "COMPILER_LLM_MODEL", "COMPILE_AFTER_HOUR", "AUTO_COMPILE", "NEURALSCAPE_URL",
+})
+
+
+def _owned_elsewhere(key: str) -> bool:
+    upper = key.upper()
+    return upper in COMPOSE_ONLY_KEYS or upper in VENDORED_ENV_KEYS or upper in EXTENSION_ENV_KEYS or upper.startswith(EXTENSION_ENV_PREFIXES)
+
+
+class _ServiceDotEnvSource(PydanticBaseSettingsSource):
+    """The ``.env`` source minus keys owned elsewhere (see above); everything else unchanged."""
+
+    def __init__(self, settings_cls: type[BaseSettings], inner: PydanticBaseSettingsSource) -> None:
+        super().__init__(settings_cls)
+        self._inner = inner
+
+    def _set_current_state(self, state: dict) -> None:
+        super()._set_current_state(state)
+        self._inner._set_current_state(state)
+
+    def _set_settings_sources_data(self, states: dict) -> None:
+        super()._set_settings_sources_data(states)
+        self._inner._set_settings_sources_data(states)
+
+    def get_field_value(self, field, field_name):  # pragma: no cover - __call__ delegates whole
+        return self._inner.get_field_value(field, field_name)
+
+    def __call__(self) -> dict:
+        fields = self.settings_cls.model_fields
+        return {k: v for k, v in self._inner().items() if k in fields or not _owned_elsewhere(k)}
+
+
+def process_env_or(name: str, configured: str) -> str:
+    """A flag the process environment may set at call time (as it always could); otherwise its
+    configured value from ``settings`` (the service .env, then the default)."""
+    value = os.environ.get(name)
+    return configured if value is None else value
 
 
 # Dimension of the mem0 / Qdrant vectors (embedder ``embedding_dims`` and the
@@ -43,6 +107,12 @@ class Settings(BaseSettings):
     # fixed at VECTOR_EMBEDDING_DIMS; recall compares the two on the common
     # Matryoshka prefix (see docs/GRAPH_EMBEDDING_DIMENSION.md).
     graphiti_embedding_dim: int = Field(default=1024, ge=1)
+
+    # ── Process-level flags ───────────────────────────────────────────
+    # Read through ``process_env_or`` (the process environment at call time
+    # first, exactly as before), so a value in the service .env applies too.
+    # (log_level / log_format are declared at the top of this class.)
+    neuralscape_extensions: str = ""  # comma-separated import paths (extensions discovery)
 
     # Hybrid experiments are independently opt-in; each needs its flag plus an endpoint and key.
     hybrid_inference_api_key: str = Field(default="", repr=False)
@@ -802,6 +872,13 @@ class Settings(BaseSettings):
         if value <= 0:
             raise ValueError("OAuth token TTLs must be > 0 seconds")
         return value
+
+    @classmethod
+    def settings_customise_sources(cls, settings_cls, init_settings, env_settings, dotenv_settings,
+                                   file_secret_settings):
+        # Same sources and priority as the default; the .env source tolerates the
+        # Compose-only and extension-owned keys declared at the top of this module.
+        return init_settings, env_settings, _ServiceDotEnvSource(settings_cls, dotenv_settings), file_secret_settings
 
     @field_validator("code_repos", mode="after")
     @classmethod
