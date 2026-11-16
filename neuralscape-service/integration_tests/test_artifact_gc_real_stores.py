@@ -47,12 +47,12 @@ def env(flags, stores, llm_key, unique_ns, tmp_path):
     return service, unique_ns
 
 
-def _artifact(uid, data):
+def _artifact(uid, data, age_days=30):
     from config import settings
     from ingest.storage import store_artifact
 
     art = store_artifact(data, "doc.txt", uid, None, "domain_knowledge", settings)
-    old = time.time() - 30 * DAY
+    old = time.time() - age_days * DAY
     os.utime(art.abs_path, (old, old))
     return art
 
@@ -99,3 +99,25 @@ def test_dry_run_deletes_nothing_even_with_the_flag_on(env, flags):
     out = _gc(service)
     assert out["orphans"] == 1 and out["deleted"] == 0 and out["dry_run"] is True
     assert os.path.exists(orphan.abs_path)
+
+
+def test_an_artifact_inside_the_grace_period_is_kept_even_with_no_references(env):
+    service, ns = env
+    young = _artifact(ns.user_id, f"young {ns.group_prefix}".encode(), age_days=0)
+    out = _gc(service)
+    assert out["too_new"] == 1 and out["deleted"] == 0, out
+    assert os.path.exists(young.abs_path)
+
+
+def test_a_qdrant_failure_during_the_reference_check_deletes_nothing(env, monkeypatch):
+    service, ns = env
+    orphan = _artifact(ns.user_id, f"orphan {ns.group_prefix}".encode())
+    client = service._get_memory().vector_store.client
+
+    def down(*a, **k):
+        raise ConnectionError("qdrant unreachable")
+
+    monkeypatch.setattr(client, "count", down)
+    out = _gc(service)
+    assert out["deleted"] == 0 and out["errors"] == 1, out
+    assert os.path.exists(orphan.abs_path), "an unprovable orphan must be kept"
