@@ -242,3 +242,83 @@ async def test_mcp_tool_erases_a_tombstoned_row(routed, monkeypatch):
     res = await mcp_server.call_tool("delete_memories", {"user_id": "u1", "category": "tech_stack"})
     body = json.loads(res[0].text)
     assert rows == [] and "including 1 tombstoned" in body["message"]
+
+
+# ── cross-user: another user's tombstoned row is never touched ──
+
+class _UserScopedStore:
+    """Rows carry an owner; every listing/delete honours ``user_id`` so a missing filter fails the test."""
+
+    def __init__(self, rows):
+        self.rows = rows
+        self.seen_user_ids = []
+
+    @staticmethod
+    def _meta(r):
+        m = r.get("metadata") or {}
+        return m["metadata"] if isinstance(m.get("metadata"), dict) else m
+
+    def get_all(self, filters, top_k):
+        self.seen_user_ids.append(filters.get("user_id"))
+        out = [r for r in self.rows if r["user_id"] == filters.get("user_id")]
+        for key, field in (("metadata.category", "category"), ("metadata.scope", "scope"),
+                           ("metadata.project_id", "project_id")):
+            if key in filters:
+                out = [r for r in out if self._meta(r).get(field) == filters[key]]
+        return {"results": out[:top_k]}
+
+    def delete(self, mid):
+        self.rows[:] = [r for r in self.rows if r["id"] != mid]
+
+    def delete_all(self, user_id):
+        self.seen_user_ids.append(user_id)
+        self.rows[:] = [r for r in self.rows if r["user_id"] != user_id]
+
+    def list_null(self, user_id, scope=None, project_id=None, limit=500):
+        self.seen_user_ids.append(user_id)
+        return [
+            {"id": r["id"], "data": "x", "metadata": self._meta(r)}
+            for r in self.rows if r["user_id"] == user_id and "category" not in self._meta(r)
+        ][:limit]
+
+    def scroll(self, uid):
+        self.seen_user_ids.append(uid)
+        return [
+            {"id": r["id"], "payload": {"data": "x", "metadata": self._meta(r)}}
+            for r in self.rows if r["user_id"] == uid
+        ]
+
+
+def _owned(mid, owner, *, tombstoned=True, **meta):
+    base = {"visibility": "private", **meta}
+    if tombstoned:
+        base["dream_tombstoned"] = True
+    return {"id": mid, "user_id": owner, "memory": "x", "metadata": {"metadata": base}}
+
+
+def _wire_users(svc, rows):
+    st = _UserScopedStore(rows)
+    svc._memory.get_all.side_effect = st.get_all
+    svc._memory.delete.side_effect = st.delete
+    svc._memory.vector_store.delete.side_effect = st.delete
+    svc._memory.delete_all.side_effect = st.delete_all
+    svc._list_null_category_memories = st.list_null
+    svc._scroll_all_user_memories = st.scroll
+    svc._expire_user_graph_writes = MagicMock(return_value=[])
+    return st
+
+
+@pytest.mark.parametrize("call,mine,theirs", [
+    ({"category": "tech_stack"}, {"category": "tech_stack"}, {"category": "tech_stack"}),
+    ({"scope": "project"}, {"scope": "project"}, {"scope": "project"}),
+    ({"project_id": "p1"}, {"project_id": "p1"}, {"project_id": "p1"}),
+    ({"filter_null_category": True}, {}, {}),
+    ({}, {"category": "x"}, {"category": "x"}),                       # private-only default
+    ({"include_shared": True}, {"category": "x"}, {"category": "x"}),  # delete_all path
+], ids=["category", "scope", "project", "null-category", "private-only", "include-shared"])
+def test_another_users_tombstoned_row_survives_the_callers_delete(svc, call, mine, theirs):
+    rows = [_owned("mine", "u", **mine), _owned("theirs", "other", **theirs)]
+    st = _wire_users(svc, rows)
+    svc.delete_memories(user_id="u", **call)
+    assert [r["id"] for r in rows] == ["theirs"], "only the caller's tombstone may be erased"
+    assert st.seen_user_ids and set(st.seen_user_ids) == {"u"}, st.seen_user_ids

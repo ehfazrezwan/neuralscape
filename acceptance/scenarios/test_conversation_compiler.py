@@ -178,7 +178,9 @@ def test_filtered_bulk_delete_erases_a_dedup_tombstoned_row(ctx, a, flushed):
     eventually(lambda: check_both_copies_recalled(a, marker, project), timeout=90, what="both copies recalled")
     resp = a.post(f"{PREFIX}/compile", json={"date": _today(), "user_id": a.user_id})
     assert resp.status_code == 202, f"POST /compile -> {resp.status_code}"
-    assert a.poll_task(resp.json()["task_id"], timeout=300).get("status") == "completed"
+    done = a.poll_task(resp.json()["task_id"], timeout=300)
+    assert done.get("status") == "completed"
+    assert (done.get("result") or {}).get("dedup_triggered") is True, f"dedup did not run: {done}"
     eventually(lambda: check_pair_collapsed_to_the_newer(a, marker, project), timeout=60, what="older copy hidden")
 
     def audit_rows():
