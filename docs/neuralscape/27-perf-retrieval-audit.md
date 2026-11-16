@@ -1,5 +1,7 @@
 # 27 — Performance & Retrieval-Accuracy Audit (post-sprint, dev @ 3e42a89)
 
+> **Status (as of 2026-11-16, dev 6a81341f):** snapshot. An audit as of dev `3e42a89` on 2026-07-04. Several findings have since been fixed (for example the dense-only retrieval path now has a sparse BM25 leg in `memory/search.py`), and the fixes landed as separate PRs rather than the single `fix/retrieval-recall` branch it names. Each finding has not been re-verified here. Line numbers in this page are as of the snapshot and refer to the pre-split `memory_service.py`; that code now lives in the `memory/` package (`write.py`, `search.py`, `reads.py`, `edit.py`, `delete.py`, `graph_admin.py`, `core.py`, `groups.py`, `junk.py`, `retry.py`, `ranking.py`), with `memory_service.py` as a thin facade.
+
 Six parallel code audits over every feature merged in the 2026-07-03/04 sprint (PRs #97–#118),
 hunting for pathways that degrade latency, ranking/recall, extraction quality, or fail
 silently. ~55 findings, deduplicated and ranked below. Companion to `25-…` (chronicle) and

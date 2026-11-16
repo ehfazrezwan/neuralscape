@@ -80,6 +80,8 @@ declare
   v_email  text;
   v_domain text;
 begin
+  -- Deliberately NOT trimmed: padding / embedded whitespace is denied (the
+  -- service-side gate in allowlist.py applies the identical rule).
   v_email := lower(event->'user'->>'email');
 
   -- Require a well-formed address: a non-empty local-part AND domain. The
@@ -91,6 +93,9 @@ begin
      or length(v_email) - length(replace(v_email, '@', '')) <> 1   -- exactly one '@'
      or position('@' in v_email) <= 1
      or split_part(v_email, '@', 2) = ''
+     -- no control / whitespace / invisible characters anywhere; the same
+     -- class as _FORBIDDEN in allowlist.py (keep in step)
+     or v_email ~ '[\u0001-\u0020\u007f-\u00a0\u00ad\u180e\u1680\u2000-\u200f\u2028-\u202f\u205f-\u2064\u2066-\u206f\u3000\ufeff]'
   then
     return pg_catalog.jsonb_build_object(
       'error', pg_catalog.jsonb_build_object(
