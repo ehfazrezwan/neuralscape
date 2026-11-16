@@ -483,6 +483,22 @@ def test_dream_diary_is_written_for_every_pool_by_design(dream_env, swept):
     assert swept.other_pool in page.read_text(encoding="utf-8")
 
 
+def test_dream_diary_is_written_for_every_pool_by_design(dream_env, swept):
+    """Documented contract (single-operator vault): a ``Dreams/<pool>.md`` exists for EVERY
+    swept pool, another user's private pool included, and cites that pool's content.
+
+    Pinned so a policy change is a visible test change.
+    """
+    from extensions.dreaming.reflect import diary_page_path
+
+    env = dream_env
+    dreams = env.sweep_settings().dreams_dir
+    for pool in (env.pool, swept.other_pool, swept.project_pool):
+        page = diary_page_path(dreams, pool)
+        assert page.exists(), f"no dream diary page for {pool}"
+        assert pool in page.read_text(encoding="utf-8"), f"diary for {pool} does not name its pool"
+
+
 def test_insights_only_cite_their_own_pool(dream_env, swept):
     from qdrant_client.models import FieldCondition, Filter, MatchValue
 
