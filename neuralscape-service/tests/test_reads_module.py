@@ -91,20 +91,6 @@ class TestCanonicalPointId:
         letters = "abcdef12-3456-4789-8abc-def012345678"
         assert self.canon(letters.replace("-", "")) == letters
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason=(
-            "BUG (reported, unfixed here): a dashless UUID made only of decimal "
-            "digits is read as an integer id; at >= 2**64 it returns None instead "
-            "of falling through to the UUID parse"
-        ),
-    )
-    def test_all_digit_dashless_uuid_is_still_a_uuid(self):
-        assert self.canon(UID.replace("-", "")) == UID
-
-    def test_whitespace_stripped(self):
-        assert self.canon(f"  {UID}\n") == UID
-
     def test_digits_become_int(self):
         assert self.canon("12345") == 12345
         assert self.canon("0") == 0

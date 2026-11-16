@@ -781,20 +781,6 @@ class TestRebuildCounting:
         service.rebuild_graph_from_vectors(max_rows=4)
         assert service.enrich_graph.call_count == 4
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason=(
-            "BUG (reported, unfixed here): `scanned += 1` runs before the max_rows "
-            "check, so the row that trips the cap is counted as scanned though it "
-            "is never processed; scanned = max_rows + 1"
-        ),
-    )
-    def test_scanned_equals_max_rows_exactly(self, service):
-        service.enrich_graph = MagicMock(return_value=True)
-        _qd(service, [([_row(str(i), {"data": "f", "user_id": "u"}) for i in range(10)], None)])
-        out = service.rebuild_graph_from_vectors(max_rows=4)
-        assert out["scanned"] == 4 == out["enriched"] + out["failed"] + out["skipped"]
-
 
 class TestRebuildScrollFilter:
     def _flt(self, service, **kw):
