@@ -156,11 +156,24 @@ def test_recall_fuses_code_structure_and_anchored_memories_with_the_project_conf
     tag = uuid.uuid4().hex[:6]
 
     def cleanup():
-        code_dispatch.teardown_code_space("code-native", code_space, owner, code_repos)
+        torn = code_dispatch.teardown_code_space("code-native", code_space, owner, code_repos)
         _PROJECT_CONFIGS.pop(project, None)
         r = index_store._redis()
         if r is not None:
             r.delete(index_store._KEY_PREFIX + code_space, index_store._CFG_PREFIX + project)
+        # The native engine deliberately preserves :CodeAnchor nodes (and index()
+        # creates one per symbol), so remove everything carrying this code_space.
+        from neo4j import GraphDatabase
+
+        driver = GraphDatabase.driver(stores.neo4j_uri, auth=(stores.neo4j_user, stores.neo4j_password))
+        try:
+            with driver.session(database=stores.neo4j_database) as session:
+                session.run("MATCH (n {code_space: $cs}) DETACH DELETE n", cs=code_space).consume()
+                left = session.run("MATCH (n {code_space: $cs}) RETURN count(n) AS c", cs=code_space).single()["c"]
+        finally:
+            driver.close()
+        assert torn.get("deleted") is True, f"teardown_code_space refused: {torn}"
+        assert left == 0, f"{left} nodes with code_space {code_space} remain"
 
     unique_ns.on_cleanup(cleanup)
 

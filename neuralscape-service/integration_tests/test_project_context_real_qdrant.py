@@ -174,4 +174,8 @@ def test_project_context_nested_filter_ordering_paging_and_count_on_real_qdrant(
     assert mate_own <= mate_ids, "a user sees their own rows and the project's shared rows"
     assert not mate_ids & my_private, "the owner's private rows leaked to a teammate"
     assert not mate_ids & {hidden["own-other-project"], hidden["own-tombstoned"], hidden["mate-shared-other-project"]}
+    # The reference-workspace fence applies to the SHARED branch only (it is why
+    # the owner's view above never lists this row); the author's own branch has
+    # no workspace filter, so the teammate sees their own reference row.
+    assert hidden["mate-shared-reference"] in mate_ids
     assert mate_view.total == len(mate_ids) == mate_view.returned
