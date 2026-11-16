@@ -383,33 +383,20 @@ class WriteMixin:
                 require_speaker=settings.extraction_require_speaker,
             )
             try:
-                if settings.inference_facade_enabled is True:
-                    # Recipient-authorized, single-deadline, usage-recorded path.
-                    from inference_facade import service_complete_text
-
-                    response_text = service_complete_text(
-                        client=client,
-                        tenant_id=user_id,
-                        prompt=extraction_messages[0]["content"],
-                        operation="llm_extraction",
-                        settings=settings,
-                    )
-                else:
-                    response = retry_transient(
-                        client.models.generate_content,
-                        model=settings.gemini_llm_model,
-                        contents=extraction_messages[0]["content"],
-                        config=GenerateContentConfig(
-                            http_options=HttpOptions(timeout=60_000),  # milliseconds
-                        ),
-                        operation="LLM extraction",
-                        fallback_model=settings.gemini_llm_fallback_model,
-                    )
-                    record_generation_usage(
-                        response, operation="llm_extraction", model=settings.gemini_llm_model
-                    )
-                    response_text = response.text
-                parsed_facts_all.extend(parse_extraction_response_rich(response_text))
+                response = retry_transient(
+                    client.models.generate_content,
+                    model=settings.gemini_llm_model,
+                    contents=extraction_messages[0]["content"],
+                    config=GenerateContentConfig(
+                        http_options=HttpOptions(timeout=60_000),  # milliseconds
+                    ),
+                    operation="LLM extraction",
+                    fallback_model=settings.gemini_llm_fallback_model,
+                )
+                record_generation_usage(
+                    response, operation="llm_extraction", model=settings.gemini_llm_model
+                )
+                parsed_facts_all.extend(parse_extraction_response_rich(response.text))
             except Exception as e:
                 # One window failing must not zero the whole session — keep
                 # the other windows' facts and report the failure honestly
@@ -750,44 +737,26 @@ class WriteMixin:
         try:
             from google.genai.types import GenerateContentConfig, HttpOptions
 
-            if settings.inference_facade_enabled is True:
-                # Recipient-authorized, single-deadline, usage-recorded path.
-                from inference_facade import service_complete_text
-
-                response_text = service_complete_text(
-                    client=client,
-                    tenant_id=user_id,
-                    prompt=extraction_messages[0]["content"],
-                    operation="llm_extraction_ingest",
-                    settings=settings,
-                )
-            else:
-                response = retry_transient(
-                    client.models.generate_content,
-                    model=settings.gemini_llm_model,
-                    contents=extraction_messages[0]["content"],
-                    config=GenerateContentConfig(
-                        http_options=HttpOptions(timeout=60_000),
-                    ),
-                    operation="LLM extraction (ingest)",
-                    fallback_model=settings.gemini_llm_fallback_model,
-                )
-                record_generation_usage(
-                    response,
-                    operation="llm_extraction_ingest",
-                    model=settings.gemini_llm_model,
-                )
-                response_text = response.text
+            response = retry_transient(
+                client.models.generate_content,
+                model=settings.gemini_llm_model,
+                contents=extraction_messages[0]["content"],
+                config=GenerateContentConfig(
+                    http_options=HttpOptions(timeout=60_000),
+                ),
+                operation="LLM extraction (ingest)",
+                fallback_model=settings.gemini_llm_fallback_model,
+            )
+            record_generation_usage(
+                response,
+                operation="llm_extraction_ingest",
+                model=settings.gemini_llm_model,
+            )
             if extractor is not None:
-                parsed_facts = extractor.parse(response_text)
+                parsed_facts = extractor.parse(response.text)
             else:
-                parsed_facts = parse_extraction_response(response_text)
+                parsed_facts = parse_extraction_response(response.text)
         except Exception as e:
-            if settings.inference_facade_enabled is True:
-                from inference_facade import RecipientDenied
-
-                if isinstance(e, RecipientDenied):
-                    raise  # an authorization denial is explicit, never an empty result
             logger.error(f"Ingest extraction failed: {e}")
             return []
         return [(cat, content) for cat, content in parsed_facts if not _is_junk_fact(content)]

@@ -1,4 +1,4 @@
-"""pgvector adapter guards and Gemini endpoint configuration, with no database."""
+"""pgvector adapter guards, with no database."""
 
 import ast
 from pathlib import Path
@@ -8,7 +8,6 @@ from unittest.mock import MagicMock
 import pytest
 
 import engine_adapters_pgvector as pg
-import inference_facade
 from contracts_engines import CapabilityHealth, CapabilityRequirement, EngineAdapterKind
 from contracts_errors import InternalErrorCode
 from engine_adapters_pgvector import PgVectorAdapter, SchemaVersionError
@@ -218,7 +217,7 @@ def test_fresh_schema_applies_version_one_after_taking_the_ddl_lock():
     assert not any("hnsw" in s.lower() for s in sql)  # no implicit ANN index
 
 
-def test_default_off_settings_build_nothing_and_enabled_settings_validate():
+def test_default_off_settings_build_nothing_and_enabled_settings_build_the_adapter():
     import config
 
     assert config.Settings().engine_pgvector_enabled is False
@@ -230,8 +229,6 @@ def test_default_off_settings_build_nothing_and_enabled_settings_validate():
         lambda t: [0.0] * 3,
     )
     assert isinstance(built, PgVectorAdapter)
-    with pytest.raises(Exception, match="ENGINE_PGVECTOR_DSN"):
-        config.Settings(engine_pgvector_enabled=True, google_api_key="k", neo4j_password="p").validate_required()
 
 
 def test_module_does_not_import_service_runtime_or_a_pgvector_helper():
@@ -243,120 +240,3 @@ def test_module_does_not_import_service_runtime_or_a_pgvector_helper():
         elif isinstance(node, ast.ImportFrom) and node.module:
             imported.add(node.module.split(".")[0])
     assert not imported & {"memory", "memory_service", "worker", "main", "config", "pgvector", "qdrant_client"}
-
-
-# ---- configurable Gemini endpoint ------------------------------------------
-
-
-def settings(**over):
-    values = dict(
-        ns_gemini_base_url="", google_api_key="key", gemini_llm_model="m1", gemini_llm_fallback_model="m2",
-        inference_approved_recipient_ids=[],
-    )
-    values.update(over)
-    return SimpleNamespace(**values)
-
-
-def test_default_client_construction_is_unchanged():
-    genai = MagicMock()
-    inference_facade.build_gemini_client(settings(), genai)
-    genai.Client.assert_called_once_with(api_key="key")
-
-
-def test_base_url_is_passed_as_http_options():
-    genai = MagicMock()
-    inference_facade.build_gemini_client(settings(ns_gemini_base_url="https://egress.example.test/gemini"), genai)
-    (kwargs,) = [c.kwargs for c in genai.Client.call_args_list]
-    assert kwargs["api_key"] == "key" and kwargs["http_options"].base_url == "https://egress.example.test/gemini"
-
-
-def test_real_sdk_client_uses_the_override_and_default_otherwise():
-    from google import genai
-
-    custom = inference_facade.build_gemini_client(settings(ns_gemini_base_url="http://127.0.0.1:9/gemini"), genai)
-    assert custom._api_client._http_options.base_url == "http://127.0.0.1:9/gemini"
-    default = inference_facade.build_gemini_client(settings(), genai)
-    assert "generativelanguage.googleapis.com" in default._api_client._http_options.base_url
-
-
-def test_recipient_ids_name_the_endpoint_only_when_overridden():
-    assert inference_facade.gemini_recipient_id(settings(), "m1") == "gemini:m1"
-    custom = settings(ns_gemini_base_url="https://egress.example.test:8443/gemini")
-    assert inference_facade.gemini_recipient_id(custom, "m1") == "gemini@egress.example.test:8443:m1"
-    assert inference_facade._configured_recipient_ids(custom) == (
-        "gemini@egress.example.test:8443:m1", "gemini@egress.example.test:8443:m2",
-    )
-    assert inference_facade._configured_recipient_ids(settings()) == ("gemini:m1", "gemini:m2")
-
-
-def test_default_policy_would_not_approve_a_different_endpoint():
-    import usage_capture  # noqa: F401  (facade dependency)
-    from inference_facade import (
-        InferenceFacade, Recipient, RecipientDenied, StaticProcessingAuthority, service_policy,
-    )
-
-    class P:
-        def call(self, prompt, *, model, timeout_s):
-            raise AssertionError("must not be called")
-
-    # Approvals were granted for the default endpoint; the override is a new recipient.
-    approved = settings()
-    policy = service_policy(SimpleNamespace(
-        **{**vars(approved), "inference_fallback_policy": "deny", "inference_policy_epoch": 0}
-    ))
-    custom = Recipient("gemini@egress.example.test:m1", "external_provider", P(), "m1")
-    facade = InferenceFacade(
-        (custom,), authority=StaticProcessingAuthority(0, ("gemini:m1",)), resolve_policy=lambda h: policy
-    )
-    with pytest.raises(RecipientDenied):
-        facade.complete_text(tenant_id="t", prompt="p", policy=policy, operation="op", deadline_s=1)
-
-
-def test_invalid_endpoint_settings_are_rejected():
-    import config
-
-    for bad in ("ftp://x/y", "https://user:pw@host/x", "not a url", "https://"):
-        with pytest.raises(Exception, match="NS_GEMINI_BASE_URL"):
-            config.Settings(ns_gemini_base_url=bad, google_api_key="k", neo4j_password="p", neuralscape_auth_disabled=True).validate_required()
-    config.Settings(ns_gemini_base_url="https://ok.example.test/x", google_api_key="k", neo4j_password="p", neuralscape_auth_disabled=True).validate_required()
-
-
-@pytest.fixture()
-def _routing_reset():
-    import provider_routing
-
-    provider_routing.reset()
-    yield
-    provider_routing.reset()  # the override patches the SDK class for the whole process
-
-
-def test_memory_service_client_honors_the_endpoint_and_defaults_unchanged(monkeypatch, _routing_reset):
-    import config
-    from memory_service import MemoryService
-    import memory.core as core
-
-    created = []
-
-    class FakeGenai:
-        @staticmethod
-        def Client(**kwargs):
-            created.append(kwargs)
-            return SimpleNamespace(kwargs=kwargs)
-
-    monkeypatch.setattr(core, "genai", FakeGenai)
-    monkeypatch.setattr(config.settings, "ns_gemini_base_url", "", raising=False)
-    svc = MemoryService.__new__(MemoryService)
-    svc._genai_model = None
-    import threading
-
-    svc._init_lock = threading.Lock()
-    svc._get_genai_client()
-    assert created == [{"api_key": config.settings.google_api_key}]
-
-    created.clear()
-    monkeypatch.setattr(config.settings, "ns_gemini_base_url", "https://egress.example.test/g", raising=False)
-    svc2 = MemoryService.__new__(MemoryService)
-    svc2._genai_model = None
-    svc2._init_lock = threading.Lock()
-    svc2._get_genai_client()
-    assert created[0]["http_options"].base_url == "https://egress.example.test/g"

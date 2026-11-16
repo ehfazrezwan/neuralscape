@@ -226,28 +226,9 @@ class Settings(BaseSettings):
     llm_retry_base_delay: float = 1.0  # seconds
     llm_retry_max_delay: float = 30.0  # seconds
 
-    # ── Recipient-aware inference facade (default OFF) ───────────────
-    # When enabled, the two extraction generate_content calls go through
-    # inference_facade: every primary/fallback recipient is checked against the
-    # processing policy and current authority before content is sent, one
-    # absolute deadline covers retries and fallbacks, and each attempt's usage
-    # is recorded. Off ⇒ the existing retry path is unchanged.
-    inference_facade_enabled: bool = False
-    inference_deadline_seconds: float = 60.0
-    # Empty ⇒ the configured Gemini primary/fallback models are the approved
-    # recipients ("gemini:<model>").
-    inference_approved_recipient_ids: list[str] = []
-    inference_fallback_policy: str = "within_approved_recipients"  # or "deny"
-    inference_policy_epoch: int = 0
-    # Opt in to answering processing-authority questions from this same
-    # configuration.  It cannot deny anything the policy allows, so it is off by
-    # default: without an installed authority every dispatch is denied.
-    inference_static_authority_enabled: bool = False
-
-    # Optional Gemini endpoint override (e.g. an egress proxy or regional
-    # endpoint). Empty ⇒ the SDK default. When set, recipient ids in the
-    # inference facade name the endpoint host so approvals match the real
-    # destination.
+    # Optional Gemini endpoint override (e.g. an egress proxy or regional endpoint, or a deterministic
+    # local stand-in for offline runs). Empty ⇒ the SDK default. When set, every Gemini client the
+    # process builds (the service's own and the ones mem0 and Graphiti build) is routed to it.
     ns_gemini_base_url: str = ""
 
     # ── pgvector direct-store adapter (default OFF) ──
@@ -455,8 +436,7 @@ class Settings(BaseSettings):
     # memory's do not; until then their facts may be absent and their rows carry
     # graph_reenrich_pending.  Each survivor is re-enriched from its own fact
     # text, so relations that only the whole conversation expressed do not come
-    # back.  A memory deleted while it is being enriched has the episode just
-    # written removed again.  A superseded episode that cannot be removed is
+    # back.  A superseded episode that cannot be removed is
     # recorded on the row and retried by the next correction or the delete.  An edge that loses its last support is deleted, not soft-expired,
     # so views listing expired edges no longer show it.  Off = the legacy
     # most-restrictive cascade (an edge is expired even when another live

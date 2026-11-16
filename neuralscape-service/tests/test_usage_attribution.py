@@ -244,5 +244,5 @@ def test_defaults_record_nothing_and_open_no_store():
     from config import Settings
 
     s = Settings()
-    assert s.usage_store_enabled is False and s.inference_facade_enabled is False
+    assert s.usage_store_enabled is False
     assert s.graph_support_aware_removal_enabled is False and s.ns_gemini_base_url == ""
