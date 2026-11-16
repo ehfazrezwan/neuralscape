@@ -1,0 +1,2 @@
+{"cwd": "/home/user/sample-project", "message": {"content": "Please summarize the incident report in two sentences.", "role": "user"}, "parentUuid": null, "sessionId": "sess-0001", "type": "user", "uuid": "u1"}
+{"isApiErrorMessage": true, "message": {"content": [{"text": "API Error: the request timed out before a response arrived.", "type": "text"}], "model": "<synthetic>", "role": "assistant"}, "parentUuid": "u1", "sessionId": "sess-0001", "type": "assistant", "uuid": "a1"}

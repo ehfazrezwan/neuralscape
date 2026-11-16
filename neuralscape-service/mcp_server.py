@@ -690,10 +690,10 @@ async def list_tools() -> list[Tool]:
         Tool(
             name="search_knowledge_graph",
             description=(
-                "Search the knowledge graph for entities, relationships, and facts. "
-                "Use this for structured queries about relationships between concepts, "
-                "people, technologies, or decisions. Returns graph edges (facts), "
-                "entity nodes, episodes, and communities."
+                "Search the knowledge graph for entities, relationships and facts "
+                "about people, technologies or decisions. Returns edges, nodes, "
+                "episodes, communities. degraded:true (graph_unavailable) means an "
+                "outage, not no facts."
             ),
             inputSchema={
                 "type": "object",

@@ -1,4 +1,6 @@
-# F2 — Native Code-Intel Engine (DRAFT v1, 2026-07-05)
+# F2 — Native Code-Intel Engine (spec of 2026-07-05; shipped)
+
+> **Status (as of 2026-11-16, dev 6a81341f):** shipped, with a few unbuilt items. The native code-intel engine specified here is built. E1 through E7 shipped: the engine protocol (`adapters/code_graph/engine.py`), `NativeEngine` with its indexer, `locate`, anchors and memory enrichment, `detect_changes` with the dreaming liveness consumer (`extensions/dreaming/liveness.py`), snapshot export and import, and the index CLI; the MCP tools `locate`, `code_impact` and `code_graph_index` and their REST twins exist. The optional `code_cypher` read-only tool described below was not built. Treat the sequencing section as history; the current behavior is in the code and in [22-knowledge-adapters](./neuralscape/22-knowledge-adapters.md).
 
 Builds on the 2026-07-04 decision: absorb codebase-memory-mcp's *capabilities*
 and graphify's *semantics* onto NS-native storage instead of wrapping either
@@ -147,6 +149,8 @@ deployments the gate is simply "engine configured").
 | graphify | graph.json path | `GraphifyJsonEngine` kept as the artifact-file engine |
 
 ## Sequencing
+
+All of E1-E6 below have shipped (E7, the invocation surface for `index` and `code_impact`, was added afterwards). The list is kept as the order the work was built in.
 
 - **E1** — engine protocol + `GraphifyJsonEngine` wrapper. Pure refactor, zero
   behavior change, lands the seam. (Small; can ship independently.)

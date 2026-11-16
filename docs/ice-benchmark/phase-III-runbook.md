@@ -1,5 +1,7 @@
 # Phase III runbook — measured benchmark (resumable)
 
+> **Status (as of 2026-11-16, dev 6a81341f):** historical. A session-specific runbook for resuming the Phase III measurement run. It refers to a benchmark VM and working directories that no longer exist, and its branch state is out of date (the `ice/benchmark` work was merged long ago). Keep it for how the run was organized, not as steps to follow.
+
 State as of 2026-07-08 ~16:55. Written so the measured full matrix + report +
 Fable + final PR can be completed in a resumed session / verified-quiet window.
 
