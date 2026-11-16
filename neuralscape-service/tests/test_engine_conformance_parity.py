@@ -1,4 +1,4 @@
-"""The reference fakes and the real adapters answer to the same conformance cases (P1-ACC-2).
+"""The reference fakes and the real adapters answer to the same conformance cases.
 
 The deterministic reference fakes in ``engine_ports`` are only worth shipping if they are held to the
 exact suites the real adapters run.  The real adapters (pgvector, Qdrant, Graphiti) are exercised against

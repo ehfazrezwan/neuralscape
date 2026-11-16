@@ -1928,6 +1928,7 @@ async def v1_register_connector(req: ConnectorConfigRequest, request: Request):
     disabled) a replacement may change the owner; the vault then starts a new
     instance with fresh sync state.
     """
+    from connectors.destination import validate_connector_destinations
     from connectors.stdio_policy import ConnectorConfigError, validate_mcp_config
     from connectors.vault import ConnectorOwnedElsewhere
 
@@ -1942,6 +1943,15 @@ async def v1_register_connector(req: ConnectorConfigRequest, request: Request):
                 req.connector_id, _resolve_user_id(request, None),
             )
             raise HTTPException(status_code=422, detail=str(e))
+    try:
+        await validate_connector_destinations(req.connector_type, req.config, settings.connector_allowed_hosts_set())
+    except ConnectorConfigError as e:
+        # Ids and the refusal category only: the URL is caller-chosen and may carry credentials.
+        logger.warning(
+            "Connector destination refused at registration: connector_id=%s owner=%s reason=%s",
+            req.connector_id, _resolve_user_id(request, None), getattr(e, "reason", None),
+        )
+        raise HTTPException(status_code=422, detail=str(e))
     resolved_user_id = _resolve_user_id(request, None)
     record = req.model_dump(mode="json", exclude_none=True)
     record["owner_user_id"] = resolved_user_id
@@ -4097,8 +4107,6 @@ async def _stop_engine_switch() -> None:
 def _engine_switch_or_error():
     from engine_adapters_switch import get_switch, unavailable_reason
 
-    if settings.engine_routing_enabled is not True:
-        raise HTTPException(status_code=404, detail="Not Found")
     switch = get_switch()
     if switch is None:
         raise HTTPException(status_code=503, detail={"error": {
@@ -4111,6 +4119,10 @@ def _engine_switch_or_error():
 
 
 async def _engine_switch_call(request: Request, operation: str):
+    # The flag is checked first: with routing off every caller (any identity) gets the same 404 and no
+    # engine module is imported.
+    if settings.engine_routing_enabled is not True:
+        raise HTTPException(status_code=404, detail="Not Found")
     from engine_routing import RoutingError
 
     _require_dictator_admin(request)
