@@ -17,7 +17,7 @@ from arq.jobs import Job
 import adapters  # noqa: F401 — registers knowledge-adapter taxonomies at import (deterministic MEMORY_CATEGORIES across all workers)
 from config import parse_redis_settings, settings
 from memory_service import MemoryService
-from task_manager import connector_sync_job_id
+from task_manager import connector_sync_job_id, enqueue_connector_sync_job
 
 logger = logging.getLogger(__name__)
 
@@ -1627,17 +1627,18 @@ async def connector_sync_cron(ctx: dict) -> dict:
         if not rec.get("enabled", True):
             continue
         # Same job id as an API-triggered sync of this connector instance
-        # (task_manager.connector_sync_job_id), so the two coalesce.
-        await redis.enqueue_job(
-            "process_connector_sync",
+        # (task_manager.connector_sync_job_id), so the two coalesce while one is
+        # in flight; a finished run's cached result is cleared (not skipped).
+        job = await enqueue_connector_sync_job(
+            redis,
             rec["connector_id"],
             rec.get("generation"),
-            _job_id=connector_sync_job_id(
+            connector_sync_job_id(
                 rec["connector_id"], rec.get("owner_user_id"), rec.get("generation")
             ),
-            _queue_name=settings.ingest_queue_name,
         )
-        enqueued += 1
+        if job is not None:
+            enqueued += 1
     logger.info(f"Connector sync cron: enqueued {enqueued} connector(s)")
     return {"enqueued": enqueued}
 

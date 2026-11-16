@@ -281,6 +281,30 @@ local stub (JSON, SSE, session id), REST client polling, hook runner, and a lint
 over the real scenarios. `run.sh` never collects it; run `run.sh --selftest`.
 
 
+## Plugin scenarios (the built hook scripts)
+
+`test_plugin_*.py` drive `neuralscape-plugin/scripts/*.js` with `node`, using the payloads Claude Code
+sends and a transcript JSONL in the shape it writes. The kit:
+
+- `nsaccept.hooks.HookSandbox` + `run_hook(..., sandbox=...)`: one throwaway `CLAUDE_PLUGIN_DATA` / `HOME` /
+  working directory that survives several hook calls (buffers, cursors, snapshots are on disk);
+  `raw_stdin=` sends malformed input.
+- `nsaccept.transcript.Transcript`: a transcript writer (user prompt, tool call + result, thinking, sub-agent,
+  injected-meta and compaction entries).
+- `nsaccept.proxy.RecordingProxy`: the hook's URL option points at it; it records every request (path, query,
+  body, bearer, answer) and forwards to the stack. The two LLM routes (`/flush`, `/compile`) are answered locally
+  unless `forward_llm=True`, so a scenario that only needs to see what a hook SENDS costs no extraction call;
+  `fail` / `delay` inject faults.
+- `scenarios/plugin_kit.Session`: one simulated Claude Code session (`session_start`, `user_prompt`, `bash`,
+  `post_tool`, `stop`, `pre_compact`, `pre_read`, `session_end`, buffers, cursor) plus the recall helpers.
+
+Budget: exactly two LLM extraction flushes in the whole set (`test_plugin_capture_flush`: one turn,
+`test_plugin_generic_adapter`: one turn). Everything else is LLM-free. Scenarios that are red on purpose
+until a named PR lands say so in their docstring ("EXPECTED RED until PR #...").
+`selftest/test_plugin_kit.py` runs the same helpers against the real built hooks with the proxy answering
+everything, so the hook-side assertions are checked without a stack (needs `node`).
+
+
 ## Destructive scenarios
 
 `test_fault_injection::test_api_and_workers_started_together_on_empty_collections_stay_up`
