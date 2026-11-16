@@ -20,6 +20,7 @@ import uuid
 from pathlib import Path
 
 import pytest
+from conftest import unavailable
 from neo4j import GraphDatabase
 from neo4j.exceptions import ClientError
 
@@ -35,6 +36,19 @@ REL_TYPES = [
     ("NEXT_EPISODE", "Episodic", "Episodic"),
 ]
 LEGACY = re.compile(r"^project(:|--)")
+
+
+@pytest.fixture(scope="session")
+def cypher_file() -> Path:
+    """The migration file under test must exist.
+
+    The packaged test image copies it in explicitly (Dockerfile, test stage).
+    Under NS_INTEGRATION_REQUIRED (gate / Actions) a missing file is a FAILURE,
+    never a skip, so a gate can not pass without exercising the Cypher.
+    """
+    if not CYPHER.is_file():
+        unavailable(f"the migration under test is missing: {CYPHER}")
+    return CYPHER
 
 
 def _gids(pid: str, uid: str) -> list[str]:
@@ -61,9 +75,7 @@ def _statements() -> list[str]:
 
 
 @pytest.fixture
-def graph(neo4j_conn):
-    if not CYPHER.is_file():
-        pytest.skip("repo-level scripts/ is not present in this image")
+def graph(cypher_file, neo4j_conn):
     driver = GraphDatabase.driver(neo4j_conn.uri, auth=(neo4j_conn.user, neo4j_conn.password))
     run = f"it-mig-{uuid.uuid4().hex[:10]}"
 
