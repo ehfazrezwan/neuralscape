@@ -43,25 +43,7 @@ def _blob(hits: dict) -> str:
     return " ".join(str(x) for key in ("edges", "episodes", "nodes") for x in (hits.get(key) or [])).lower()
 
 
-def test_reads_find_the_encoded_write_and_a_colliding_plain_user_sees_nothing(svc, unique_ns, flags):
-    from memory.groups import ENCODED_GROUP_PREFIX, _build_group_id
-
-    flags(graph_group_id_injective_enabled=True)
-    plain = unique_ns.user_id  # the colliding user: plain id, reads user--<plain>--project--<legacy>
-    owner = f"{plain}--project--legacy"  # legacy name of its private group == plain's project group
-    project = f"{unique_ns.project_id}.v2"  # '.' needs encoding
-    token = f"Quillfeather{uuid.uuid4().hex[:8]}"
-    content = f"My dog is named {token} and lives in Reykjavik."
-    group = _build_group_id("private", owner, project)
-    assert group.startswith(ENCODED_GROUP_PREFIX)
-    legacy = f"user--{owner}--project--{project}"
-
-    def cleanup():
-        svc.delete_memories(user_id=owner, include_shared=True)
-        _cypher(svc, "MATCH (n) WHERE n.group_id IN [$a, $b] DETACH DELETE n", a=group, b=legacy)
-
-    unique_ns.on_cleanup(cleanup)
-
+def _write(svc, owner, project, content):
     stored, created = svc.store_raw(
         content=content, user_id=owner, category="personal_fact", visibility="private",
         project_id=project, add_to_graph=False, return_created=True,
@@ -69,29 +51,64 @@ def test_reads_find_the_encoded_write_and_a_colliding_plain_user_sees_nothing(sv
     assert created and stored
     assert svc.enrich_graph(content=content, user_id=owner, project_id=project, visibility="private",
                             memory_id=stored[0].id) is True
+
+
+def test_reads_find_the_encoded_write_and_a_colliding_plain_user_sees_nothing(svc, unique_ns, flags):
+    from memory.groups import ENCODED_GROUP_PREFIX, _build_group_id
+
+    flags(graph_group_id_injective_enabled=True)
+    plain = unique_ns.user_id
+    # Legacy naming aliases these two: user 'owner' (no project) and user 'plain' in
+    # project 'legacy' both map to 'user--<plain>--project--legacy'. Both ids and the
+    # project are plain-alphabet, so the OLD read code queried that shared name.
+    owner = f"{plain}--project--legacy"
+    project = f"{unique_ns.project_id}.v2"  # '.' needs encoding
+    tok_a = f"Quillfeather{uuid.uuid4().hex[:8]}"  # owner, dotted project
+    tok_b = f"Quillfeather{uuid.uuid4().hex[:8]}"  # owner, no project (the aliased group)
+    group_a = _build_group_id("private", owner, project)
+    group_b = _build_group_id("private", owner)
+    legacy_b = f"user--{plain}--project--legacy"
+    assert group_a.startswith(ENCODED_GROUP_PREFIX) and group_b.startswith(ENCODED_GROUP_PREFIX)
+    assert group_b != legacy_b
+
+    def cleanup():
+        svc.delete_memories(user_id=owner, include_shared=True)
+        _cypher(svc, "MATCH (n) WHERE n.group_id IN [$a, $b, $c] DETACH DELETE n",
+                a=group_a, b=group_b, c=legacy_b)
+
+    unique_ns.on_cleanup(cleanup)
+
+    _write(svc, owner, project, f"My dog is named {tok_a} and lives in Reykjavik.")
+    _write(svc, owner, None, f"My cat is named {tok_b} and lives in Oslo.")
     assert _cypher(svc, "MATCH (e:Episodic {group_id: $g}) WHERE e.content CONTAINS $t RETURN e.uuid AS u",
-                   g=group, t=token), "the write did not land in the encoded group"
+                   g=group_a, t=tok_a), "write A did not land in its encoded group"
+    assert _cypher(svc, "MATCH (e:Episodic {group_id: $g}) WHERE e.content CONTAINS $t RETURN e.uuid AS u",
+                   g=group_b, t=tok_b), "write B did not land in its encoded group"
+    assert _cypher(svc, "MATCH (n {group_id: $g}) RETURN count(n) AS c", g=legacy_b)[0]["c"] == 0
 
-    # narrowed private branch, with and without the episode leg
+    # the owner finds both through the narrowed private branch, episode leg on and off
     for episodes in (False, True):
-        hits = svc._search_graph_for_visibility(
-            query=token, user_id=owner, project_id=project, limit=10, visibility="private",
-            include_shared=True, include_episodes=episodes)
-        assert token.lower() in _blob(hits), f"narrowed private search missed the write (episodes={episodes})"
-    # opt-out-of-shared branch and the default read set
+        for tok, proj in ((tok_a, project), (tok_b, None)):
+            hits = svc._search_graph_for_visibility(
+                query=tok, user_id=owner, project_id=proj, limit=10, visibility="private",
+                include_shared=True, include_episodes=episodes)
+            assert tok.lower() in _blob(hits), f"narrowed private search missed {tok} (episodes={episodes})"
     hits = svc._search_graph_for_visibility(
-        query=token, user_id=owner, project_id=project, limit=10, visibility=None,
+        query=tok_a, user_id=owner, project_id=project, limit=10, visibility=None,
         include_shared=False, include_episodes=True)
-    assert token.lower() in _blob(hits)
-    assert token.lower() in _blob(svc.search_graph(token, user_id=owner, project_id=project, limit=10))
-
-    # list_projects finds the encoded project
+    assert tok_a.lower() in _blob(hits)
+    assert tok_a.lower() in _blob(svc.search_graph(tok_a, user_id=owner, project_id=project, limit=10))
     assert project in svc.list_projects(owner)
 
-    # the colliding plain user: same legacy group name, no access
-    colliding = svc._search_graph_for_visibility(
-        query=token, user_id=plain, project_id="legacy--project--" + project, limit=10, visibility="private",
-        include_shared=True, include_episodes=True)
-    assert token.lower() not in _blob(colliding), "plain user read the encoded user's fact"
-    assert token.lower() not in _blob(svc.search_graph(token, user_id=plain, project_id=f"legacy--project--{project}", limit=10))
+    # the colliding PLAIN user: plain id, plain project 'legacy' -> legacy name == owner's old group
+    for episodes in (False, True):
+        colliding = svc._search_graph_for_visibility(
+            query=tok_b, user_id=plain, project_id="legacy", limit=10, visibility="private",
+            include_shared=True, include_episodes=episodes)
+        assert tok_b.lower() not in _blob(colliding), "plain user read the encoded owner's fact"
+    opt_out = svc._search_graph_for_visibility(
+        query=tok_b, user_id=plain, project_id="legacy", limit=10, visibility=None,
+        include_shared=False, include_episodes=True)
+    assert tok_b.lower() not in _blob(opt_out)
+    assert tok_b.lower() not in _blob(svc.search_graph(tok_b, user_id=plain, project_id="legacy", limit=10))
     assert project not in svc.list_projects(plain)

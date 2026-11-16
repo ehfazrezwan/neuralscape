@@ -32,6 +32,7 @@ import re
 from datetime import datetime, timezone
 from pathlib import Path
 
+from config import settings
 from memory.groups import _build_group_id, decode_group_id
 
 from .consolidate import PoolBatch
@@ -125,6 +126,9 @@ def resolve_card_pool(
     return None
 
 
+_LEGACY_PRIVATE_TAIL = re.compile(r"(?:--project--(?P<project>.+?))?(?:--ws--(?P<workspace>.+))?")
+
+
 def card_read_allowed(pool: str, caller_user_id: str | None, *, is_dictator: bool = False) -> bool:
     """May this caller read this pool's card?
 
@@ -149,7 +153,16 @@ def card_read_allowed(pool: str, caller_user_id: str | None, *, is_dictator: boo
     if private_encoded:
         # Injective (flag-on) name of a private pool: only its exact owner reads it.
         return placement.owner == caller_user_id
-    return pool == f"user--{caller_user_id}" or pool.startswith(f"user--{caller_user_id}--")
+    if not settings.graph_group_id_injective_enabled:
+        return pool == f"user--{caller_user_id}" or pool.startswith(f"user--{caller_user_id}--")
+    # Flag on: a bare prefix match would let plain 'alice' read the legacy card of
+    # a colliding '--' user (e.g. 'alice--project--x'). Accept only a name the
+    # builder itself produces for THIS caller.
+    rest = pool[len(f"user--{caller_user_id}"):] if pool.startswith(f"user--{caller_user_id}") else None
+    match = _LEGACY_PRIVATE_TAIL.fullmatch(rest) if rest is not None else None
+    if match is None:
+        return False
+    return pool == _build_group_id("private", caller_user_id, match["project"], match["workspace"])
 
 
 def card_target(vault: Path, batch: PoolBatch, operator_user_id: str) -> tuple[bool, Path | None]:

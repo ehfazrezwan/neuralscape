@@ -402,8 +402,7 @@ class Settings(BaseSettings):
     # re-homes those ids' future graph writes: run
     # scripts/migrate_graph_groups.py --audit-delimiter-ids first. The read-side
     # call sites (memory/search.py narrowed branches, memory/reads.py
-    # list_projects, dreaming card/consolidate pool names) must adopt the
-    # builder before this is enabled.
+    # list_projects, dreaming card/consolidate pool names) use the same builder.
     graph_group_id_injective_enabled: bool = False
     # Bounded second-chance re-ask for false abstentions (T2.1): when the
     # normal answering loop produces an abstention AND at least one evidence

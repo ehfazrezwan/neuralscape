@@ -196,9 +196,31 @@ def test_flag_off_list_projects_query_is_byte_identical(service, flag):
 def test_flag_on_list_projects_scans_the_encoded_groups_and_never_a_legacy_prefix_for_odd_ids(service, flag):
     flag(True)
     got = _capture_query(service)
-    assert "$encoded_prefix" in got["cypher"]
-    assert got["params"]["encoded_prefix"] == "nsg1--"
-    assert got["params"]["user_prefix"] == "nsg1--"  # no legacy user-- prefix for a '--' caller
+    assert "$encoded_private_prefix" in got["cypher"] and "$encoded_shared_prefix" in got["cypher"]
+    # bounded to this caller's private groups and the shared pool, not every user's
+    assert got["params"]["encoded_private_prefix"] == got["params"]["user_prefix"]  # no legacy user-- prefix for a '--' caller
+    assert got["params"]["encoded_private_prefix"] != "nsg1--"
+    assert got["params"]["encoded_shared_prefix"] != "nsg1--"
+
+
+@pytest.mark.parametrize("owner", ["alice--x", "alice", "a.b", ""])
+@pytest.mark.parametrize("project,workspace", [(None, None), ("p.v2", None), ("p--q", "w.1"), ("plain", "ws")])
+def test_flag_on_encoded_prefixes_bound_this_callers_groups_only(flag, owner, project, workspace):
+    from memory.groups import GroupKey, _encode_group_key
+
+    flag(True)
+    private = _encode_group_key(GroupKey("private", owner, None, None))[:-4]
+    shared = _encode_group_key(GroupKey("shared", None, None, None))[:-6]
+    mine = _build_group_id("private", owner, project, workspace)
+    pool_g = _build_group_id("shared", "", project, workspace)
+    for g, prefix in ((mine, private), (pool_g, shared)):
+        if g.startswith("nsg1--"):
+            assert g.startswith(prefix), (g, prefix)
+    # another owner's (even a longer-named one's) encoded group never matches
+    for other in ("alice--xy", "bob.z", "alice-.x"):
+        if other != owner:
+            assert not _build_group_id("private", other, project, workspace).startswith(private) or not (
+                _build_group_id("private", other, project, workspace).startswith("nsg1--"))
 
 
 def test_flag_on_list_projects_keeps_the_plain_callers_legacy_prefix(service, flag):
@@ -315,3 +337,109 @@ def test_the_flag_can_be_enabled_and_defaults_off(monkeypatch):
     assert Settings().graph_group_id_injective_enabled is True
     monkeypatch.delenv("GRAPH_GROUP_ID_INJECTIVE_ENABLED")
     assert Settings().graph_group_id_injective_enabled is False
+
+
+def test_flag_on_list_projects_ignores_flag_off_era_rows_of_a_colliding_user(service, flag):
+    flag(True)
+    service._run_on_bridge = _bridge([
+        {"group_id": "user--alice--project--q--project--r"},       # user 'alice--project--q', project 'r'
+        {"group_id": "user--alice--project--q--project--r--ws--w"},
+        {"group_id": "user--alice--project--mine"},
+        {"group_id": "user--alice--project--mine--ws--ref"},
+        {"group_id": "shared--project--team"},
+        {"group_id": "shared--project--a--project--b"},
+    ])
+    assert service.list_projects("alice") == ["mine", "team"]
+
+
+def test_flag_off_list_projects_still_returns_the_raw_tail(service, flag):
+    flag(False)
+    service._run_on_bridge = _bridge([{"group_id": "user--alice--project--q--project--r"}])
+    assert service.list_projects("alice") == ["q--project--r"]
+
+
+def test_flag_on_card_read_ignores_the_bare_prefix_of_a_colliding_user(flag):
+    from extensions.dreaming.card import card_read_allowed
+
+    flag(True)
+    # ('user--alice--project--x' itself is alice's own project name: the builder
+    # produces it for her, so a legacy row under it cannot be told apart.)
+    for pool in ("user--alice--project--x--project--y", "user--alice--bob", "user--alice--ws--a--b",
+                 "user--alice--project--x--ws--y--ws--z"):
+        assert not card_read_allowed(pool, "alice"), pool
+    # alice's own legacy names the builder produces for her are still readable
+    for pool in ("user--alice", "user--alice--project--payroll", "user--alice--ws--ref",
+                 "user--alice--project--payroll--ws--ref"):
+        assert card_read_allowed(pool, "alice"), pool
+    assert not card_read_allowed("user--alicia", "alice")
+    assert card_read_allowed("user--alice--project--x", "root", is_dictator=True)
+
+
+def test_flag_on_card_read_surfaces_enforce_exact_ownership(flag, monkeypatch):
+    """The shared guard behind REST ``/extensions/dreaming/card`` and MCP ``get_card``."""
+    from extensions.dreaming.card import build_card_view
+
+    flag(True)
+    redis = MagicMock()
+    redis.get.return_value = None
+    denied = build_card_view("user--alice--project--x--project--y", "alice", is_dictator=False, redis=redis)
+    allowed = build_card_view("user--alice", "alice", is_dictator=False, redis=redis)
+    assert denied == {"status": "forbidden"} and allowed["status"] == "not_found"
+    redis.get.assert_called_once()  # the denied read never touched the store
+
+
+class _CardRedis:
+    def __init__(self):
+        import json
+
+        self.reads = []
+        self._card = json.dumps({"lines": ["likes tea"], "updated_at": "t"})
+
+    def get(self, key):
+        self.reads.append(key)
+        return self._card
+
+
+def _rest_client(monkeypatch, redis):
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    import extensions.dreaming as dreaming
+    import extensions.dreaming.sweep as sweep
+
+    monkeypatch.setattr(sweep, "_get_redis", lambda: redis)
+    ext = next(v for v in vars(dreaming).values()
+               if isinstance(v, type) and hasattr(v, "get_routes") and v.__module__ == dreaming.__name__)()
+    app = FastAPI()
+    app.include_router(ext.get_routes(), prefix="/v1/extensions/dreaming")
+    return TestClient(app)
+
+
+@pytest.mark.parametrize("on,status", [(True, 403), (False, 200)])
+def test_card_rest_route_exact_ownership(flag, monkeypatch, on, status):
+    """Flag on: plain 'alice' cannot read the legacy card of colliding user 'alice--project--x'
+    (flag off keeps today's prefix behaviour)."""
+    flag(on)
+    redis = _CardRedis()
+    client = _rest_client(monkeypatch, redis)
+    r = client.get("/v1/extensions/dreaming/card", params={"pool": "user--alice--project--x--project--y", "user_id": "alice"})
+    assert r.status_code == status
+    if status == 403:
+        assert redis.reads == []  # the store was never touched
+
+
+@pytest.mark.parametrize("on,denied", [(True, True), (False, False)])
+def test_card_mcp_tool_exact_ownership(flag, monkeypatch, on, denied):
+    import asyncio
+    import json
+
+    import extensions.dreaming.sweep as sweep
+    import mcp_server
+
+    flag(on)
+    redis = _CardRedis()
+    monkeypatch.setattr(sweep, "_get_redis", lambda: redis)
+    out = asyncio.run(mcp_server.call_tool("get_card", {"pool": "user--alice--project--x--project--y", "user_id": "alice"}))
+    body = json.loads(out[0].text)
+    assert ("not readable" in str(body.get("error", ""))) is denied
+    assert bool(redis.reads) is (not denied)

@@ -1275,7 +1275,7 @@ class SearchMixin:
                 for pid in (None, project_id):
                     placements.setdefault(_build_group_id(pool, owner, pid), (pool, owner, pid))
             ws_groups = [
-                _build_group_id(*placements[g], workspace=w) if g in placements else f"{g}--ws--{w}"
+                _build_group_id(*placements[g], workspace=w)
                 for g in group_ids
                 for w in refs
             ]
