@@ -6,6 +6,7 @@ import multiprocessing
 import os
 import sqlite3
 import sys
+import textwrap
 import threading
 import time
 from pathlib import Path
@@ -43,6 +44,13 @@ POST = (SourceVersion(record_id="mem-1", content_revision=4, policy_epoch=7),)
 # may.  Leases are long (30 s and more) and their expiry is moved explicitly (``store.shift_leases``), so no scenario
 # waits for wall-clock time to pass and a stalled runner cannot lapse a lease that a scenario still relies on.
 WAIT = 120.0
+
+# Lease for a scenario that holds ONE claim across heavy work (tens of thousands of references built, validated and
+# recorded).  Lease expiry reads the database server's clock, so on a loaded runner the work can outlast a short lease and
+# the lease check then fires before the rule the scenario is about.  Those scenarios test receipt validation, not lease
+# expiry, so they take a lease far longer than any plausible run.
+HEAVY_PAYLOAD_LEASE_SECONDS = 3600.0
+HEAVY_PAYLOAD_REFS = 10_000
 
 
 class Crash(BaseException):
@@ -741,7 +749,7 @@ def scenario_the_store_refuses_a_receipt_the_claim_could_never_validate(store) -
     ledger = store.open()
     built = intent("memory.write.raw")
     ledger.accept(built)
-    claim = ledger.claim("w", 30.0)
+    claim = ledger.claim("w", HEAVY_PAYLOAD_LEASE_SECONDS)
     requirement = next(r for r in built.stage_requirements if r.stage is C)
     now = datetime.now(timezone.utc)
     oversized = StageReceipt(
@@ -856,7 +864,7 @@ def scenario_the_history_moving_between_check_and_write_is_validated_again_in_th
     ledger = store.open()
     built = intent("memory.write.raw")
     ledger.accept(built)
-    claim = ledger.claim("w", 30.0)
+    claim = ledger.claim("w", HEAVY_PAYLOAD_LEASE_SECONDS)
     first = _receipt_for(built, C, claim, StageStatus.APPLIED, refs=40_000)
     ledger.record_receipt(first, "tenant-1", claim)
     big = _receipt_for(built, V, claim, StageStatus.APPLIED, refs=40_000, tag="v")
@@ -1105,6 +1113,30 @@ def test_registry_declares_no_source_witness_only_where_there_are_no_inputs() ->
     assert all(r.no_source_witness is False for r in with_inputs if r.upstream_stages)  # fed by the commit
     bare = build_requirements("memory.write.raw", intent_id="i", preconditions=(), committed=())
     assert all(r.no_source_witness for r in bare)
+
+
+def test_a_scenario_holding_one_claim_across_a_heavy_payload_takes_a_long_lease() -> None:
+    """Guard (source inspection, no database): a scenario that builds ``HEAVY_PAYLOAD_REFS`` or more references and
+    claims directly must pass a lease of ``HEAVY_PAYLOAD_LEASE_SECONDS`` or more.  A 30 s lease lapsed on a loaded
+    PostgreSQL runner mid-scenario and surfaced as ``StaleLease`` instead of the rule under test."""
+    import ast
+    import inspect
+
+    offenders = []
+    for name, fn in SCENARIOS.items():
+        tree = ast.parse(textwrap.dedent(inspect.getsource(fn)))
+        heavy = any(isinstance(n, ast.Constant) and isinstance(n.value, int) and not isinstance(n.value, bool)
+                    and n.value >= HEAVY_PAYLOAD_REFS for n in ast.walk(tree))
+        if not heavy:
+            continue
+        for call in (n for n in ast.walk(tree) if isinstance(n, ast.Call)
+                     and isinstance(n.func, ast.Attribute) and n.func.attr == "claim"):
+            lease = call.args[1] if len(call.args) > 1 else None
+            ok = (isinstance(lease, ast.Name) and lease.id == "HEAVY_PAYLOAD_LEASE_SECONDS") or (
+                isinstance(lease, ast.Constant) and lease.value >= HEAVY_PAYLOAD_LEASE_SECONDS)
+            if not ok:
+                offenders.append(f"{name}:{call.lineno}")
+    assert not offenders, f"short lease held across a heavy payload: {offenders}"
 
 
 @pytest.mark.parametrize("name", sorted(SCENARIOS))
