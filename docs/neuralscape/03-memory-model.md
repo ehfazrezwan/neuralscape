@@ -7,13 +7,15 @@ source: handwritten
 
 # Memory Model
 
+> **Status (as of 2026-11-16, dev 6a81341f):** current reference. Code citations name modules and functions, not line numbers; the implementation lives in the `neuralscape-service/memory/` package behind the `memory_service.py` facade. Where a snippet is marked abridged it is a simplified excerpt, so read the named module for the real code.
+
 ## Overview
 
 The neuralscape memory model is structured along three orthogonal axes: **13 categories** organized into **5 type groups**, with **2 scopes** (`global` and `project`). Every memory carries a category that determines its conceptual role and a scope that determines its visibility boundary. Categories also map to a fixed Obsidian vault folder so the on-disk mirror stays predictable. This page is the canonical schema reference; for the write/read pipelines that consume these values, see [memory-service-core](./04-memory-service-core.md).
 
 ## Categories
 
-The full taxonomy is defined in `neuralscape-service/schemas.py:18-40` (enum) and `neuralscape-service/schemas.py:47-61` (descriptions). Default scope is computed by `default_scope_for_category` (`schemas.py:73-79`).
+The full taxonomy is defined in `neuralscape-service/schemas.py` (enum) and `neuralscape-service/schemas.py` (descriptions). Default scope is computed by `default_scope_for_category` (`schemas.py`).
 
 | # | Category | Type Group | Default Scope | Description |
 |---|----------|-----------|---------------|-------------|
@@ -31,7 +33,7 @@ The full taxonomy is defined in `neuralscape-service/schemas.py:18-40` (enum) an
 | 12 | `procedure` | Procedural | flexible | Step-by-step how-to patterns |
 | 13 | `task_context` | Working | flexible | Current task, recent changes, blockers |
 
-Flexible-default categories resolve to `global` unless the caller supplies `project_id` or an explicit scope. Category descriptions surface to the LLM extractor in `neuralscape-service/prompts.py:31-43`.
+Flexible-default categories resolve to `global` unless the caller supplies `project_id` or an explicit scope. Category descriptions surface to the LLM extractor in `neuralscape-service/prompts.py`.
 
 ## Type taxonomy
 
@@ -43,7 +45,7 @@ Flexible-default categories resolve to `global` unless the caller supplies `proj
 
 ## Scope rules
 
-Three sets in `schemas.py:64-70` partition the 13 categories:
+Three sets in `schemas.py` partition the 13 categories:
 
 ```python
 GLOBAL_CATEGORIES   = {"preference", "personal_fact", "technical_skill", "domain_knowledge"}
@@ -51,7 +53,7 @@ PROJECT_CATEGORIES  = {"tech_stack", "convention", "architecture", "dependency"}
 FLEXIBLE_CATEGORIES = {"decision", "interaction", "workflow", "procedure", "task_context"}
 ```
 
-The service layer overrides the schema default in `neuralscape-service/memory_service.py:500-520`:
+The service layer overrides the schema default when it stores extracted facts (`MemoryService._batch_store_facts` in `neuralscape-service/memory/write.py`):
 
 - `PROJECT_CATEGORIES` require `project_id`. If missing, `_infer_project_id()` attempts to extract one from content; on failure the memory falls back to `global` with a warning.
 - If `project_id` is provided **and** the category is not in `GLOBAL_CATEGORIES`, scope is forced to `project`.
@@ -60,16 +62,22 @@ The service layer overrides the schema default in `neuralscape-service/memory_se
 
 ## group_id format
 
-Both Graphiti's `group_id` and Qdrant's metadata filter use the same scoping token, built by `_build_group_id` and `_get_group_ids` in `memory_service.py:175-187`:
+Graphiti's `group_id` is built by `_build_group_id` (and read back as a set by `_get_group_ids`) in `neuralscape-service/memory/groups.py`. The current multi-user, workspace-aware format is:
 
-- Global: `"global"`
-- Project: `"project--{project_id}"` — note the **double hyphen**, not a colon
+| visibility | project_id | group_id |
+|---|---|---|
+| private | none | `user--{user_id}` |
+| private | set | `user--{user_id}--project--{project_id}` |
+| shared | none | `shared` |
+| shared | set | `shared--project--{project_id}` |
 
-This convention was standardized in commit `2edd9b5` (`fix(graphiti): align group_id format to use double-hyphen for project scoping`). Search with `project_id` queries both `global` and `project--{project_id}` group_ids and merges results.
+A non-default workspace appends `--ws--{workspace}` (the default `memory` workspace adds no suffix, so existing ids are unchanged). Components that would be ambiguous under the `--` delimiter are encoded injectively; see the comments at the top of `memory/groups.py` for the exact rule. The Qdrant side filters on the `metadata.*` payload fields (scope, project_id, visibility, user) rather than on a group_id string.
+
+> **Historical note.** Earlier versions used the bare tokens `global` and `project--{project_id}` for every user (commit `2edd9b5`). That layout let users share one graph namespace and was replaced by the per-user and `shared` namespaces above. Search with a `project_id` reads the caller's global and project groups, plus the shared groups when `include_shared` is set, and merges the results.
 
 ## Vault folder mapping
 
-`CATEGORY_VAULT_PATHS` (`schemas.py:83-97`) maps each category to its Obsidian vault folder:
+`CATEGORY_VAULT_PATHS` (`schemas.py`) maps each category to its Obsidian vault folder:
 
 ```python
 CATEGORY_VAULT_PATHS: dict[str, str] = {
@@ -89,13 +97,13 @@ CATEGORY_VAULT_PATHS: dict[str, str] = {
 }
 ```
 
-This dictionary is mirrored in `neuralscape-plugin/src/types.ts:25-147`. The two sources must stay synchronized — see [plugin-system](./09-plugin-system.md) for plugin-side handling.
+This dictionary is mirrored in `neuralscape-plugin/src/types.ts`. The two sources must stay synchronized — see [plugin-system](./09-plugin-system.md) for plugin-side handling.
 
 ## Memory IDs and metadata
 
-- **ID**: UUID v4 generated at insert time via `str(uuid.uuid4())` (`memory_service.py:404, 522`).
+- **ID**: UUID v4 generated at insert time via `str(uuid.uuid4())` (`store_raw` and `_batch_store_facts` in `memory/write.py`).
 - **Content hash**: `hashlib.md5(content.encode()).hexdigest()` (32-char hex), stored in payload for dedup.
-- **Qdrant payload metadata** (`memory_service.py:414-424, 530-537`):
+- **Qdrant payload metadata** (built in `store_raw` and `_batch_store_facts` in `memory/write.py`; the field list below is the core set, and the payload also carries the optional v2 fields, visibility, `user_id`, `hash` and timestamps):
 
 ```python
 "metadata": {
@@ -114,26 +122,26 @@ This dictionary is mirrored in `neuralscape-plugin/src/types.ts:25-147`. The two
 
 ## Pydantic schemas
 
-Request models (`schemas.py:109-175`):
+Request models (`schemas.py`):
 
-- **`StoreMemoryRequest`** (109-118) — `messages` (list of `{role, content}`, ≤500), `user_id`, optional `project_id`/`agent_id`/`run_id`. LLM extraction path.
-- **`RawMemoryRequest`** (121-134) — pre-categorized single fact: `content` (1-10000 chars), `user_id`, `category`, `scope` (default `"global"`), optional `project_id`/`tags` (≤20)/`agent_id`/`run_id`.
-- **`SearchMemoryRequest`** (137-144) — `query` (1-2000), `user_id`, optional `project_id`, `categories` (≤13), `scope`, `limit` (1-100, default 10).
-- **`GraphSearchRequest`** (147-156) — Graphiti-only search with optional `search_config` override.
+- **`StoreMemoryRequest`** — `messages` (list of `{role, content}`, ≤500), `user_id`, optional `project_id`/`agent_id`/`run_id`. LLM extraction path.
+- **`RawMemoryRequest`** — pre-categorized single fact: `content` (1-10000 chars), `user_id`, `category`, `scope` (default `"global"`), optional `project_id`/`tags` (≤20)/`agent_id`/`run_id`.
+- **`SearchMemoryRequest`** — `query` (1-2000), `user_id`, optional `project_id`, `categories` (≤13), `scope`, `limit` (1-100, default 10).
+- **`GraphSearchRequest`** — Graphiti-only search with optional `search_config` override.
 - **`PatchMemoryRequest`** — presence-keyed partial update (`content`, `category`, `project_id`, `tags`, `visibility`, v2 fields); handlers read `model_fields_set` so explicit `null` (clear) is distinct from absent. Replaced `UpdateMemoryRequest`.
 - **`RetagRequest`** (`RetagFilters` + `RetagOps`) — bulk retag; a model validator requires ≥1 *effective* (non-empty) filter and ≥1 op, and rejects `add_tags ∩ remove_tags`.
-- **`BulkDeleteRequest`** (166-175) — filtered bulk delete; `filter_null_category` restricts to memories missing a category. `include_shared` (default `False`) gates whether the caller's *shared* writes are removed: by default shared memories are preserved on every bulk path (team artifacts shouldn't be wipeable by one user's sweep, including via the MCP `delete_memories` tool an LLM agent can trigger).
+- **`BulkDeleteRequest`** — filtered bulk delete; `filter_null_category` restricts to memories missing a category. `include_shared` (default `False`) gates whether the caller's *shared* writes are removed: by default shared memories are preserved on every bulk path (team artifacts shouldn't be wipeable by one user's sweep, including via the MCP `delete_memories` tool an LLM agent can trigger).
 
-Response models (`schemas.py:183-234`):
+Response models (`schemas.py`):
 
-- **`MemoryResponse`** (183-194) — `id`, `memory`, `category`, `scope`, `project_id`, `tags`, `score`, `created_at`, `updated_at`, `source`.
+- **`MemoryResponse`** — `id`, `memory`, `category`, `scope`, `project_id`, `tags`, `score`, `created_at`, `updated_at`, `source`.
 - **`StoreMemoryResponse`**, **`SearchMemoryResponse`**, **`ContextResponse`**, **`TaskAcceptedResponse`** (async 202 acks), **`TaskStatusResponse`** (poll), **`CategoryListResponse`**.
 
 Write-path internals (extraction, dedup, persistence) live in [memory-service-core](./04-memory-service-core.md) and [llm-extraction](./05-llm-extraction.md).
 
 ## Validation
 
-- **ID pattern** (`schemas.py:106`): `_ID_PATTERN = r"^[a-zA-Z0-9_.\-]+$"` applied to `user_id`, `project_id`, and `agent_id` (not `run_id`).
+- **ID pattern** (`schemas.py`): `_ID_PATTERN = r"^[a-zA-Z0-9_.\-]+$"` applied to `user_id`, `project_id`, and `agent_id` (not `run_id`).
 - **Length limits**: `user_id` 1-100, `project_id` ≤100, `agent_id` ≤100, `content` 1-10000, `query` 1-2000, `messages` list ≤500, `tags` ≤20, `limit` 1-100, context `max_chars` 500-32000.
 - **Vocab validators**: `schemas.py` carries `@field_validator`s for the memory-model v2 controlled vocabularies (`domain`, `observation_type`, `concepts`, `source_type`, `memory_kind`) and `@model_validator`s for retag shape. *Category* validation, by contrast, is enforced at the service layer — `MEMORY_CATEGORIES` is extended by knowledge adapters at import, so membership must be checked at call time; the extraction parser (`prompts.py`) falls back to `personal_fact` on unknown input rather than raising.
 
@@ -182,7 +190,7 @@ All seven are **optional** and stored under `metadata.<field>` in the Qdrant pay
 
 ### Controlled vocabularies
 
-Defined in `neuralscape-service/schemas.py:104-126`:
+Defined in `neuralscape-service/schemas.py`:
 
 ```python
 DOMAIN_VOCAB = {
