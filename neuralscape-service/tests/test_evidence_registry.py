@@ -221,9 +221,10 @@ def test_required_baseline_areas_each_have_an_expected_failure_and_a_control() -
         "queued-visibility": ("queued-visibility-publication", "queued-job-deleted-memory-control"),
         "stale-revision": ("stale-revision-edit", "patch-partial-control"),
     }
+    fixed_in_place: set[str] = set()   # (identity moved into ``fixed`` above)
     by_id = {s.id: s for s in SCENARIOS}
     for area, (failure, control) in areas.items():
-        assert by_id[failure].kind == "expected-failure", area
+        assert by_id[failure].kind == ("control" if area in fixed_in_place else "expected-failure"), area
         assert by_id[control].kind == "control", area
     for area, ids in fixed.items():
         for scenario_id in ids:
