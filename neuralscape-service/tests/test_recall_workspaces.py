@@ -278,3 +278,14 @@ def test_workspace_does_not_cross_users(service, pool):
     # the owner still reads her own private row
     mine = _texts(service.search("q", "userA", limit=20, workspaces=["ref-x"], include_shared=False, vector_only=True))
     assert "A private ref row" in mine
+
+
+def test_tombstoned_rows_stay_excluded_under_every_workspace_selection(service, pool):
+    """Supersession tombstones (dream_tombstoned) combine with the workspace filter."""
+    for pid, ws in ((500, "__absent__"), (501, "ref-x")):
+        p = _point(pid, f"tombstoned {pid}", workspace=ws, cos=0.999)
+        p.payload["metadata"]["dream_tombstoned"] = True
+        pool.upsert(COLLECTION, [p])
+    for kw in ({}, {"workspaces": ["ref-x"]}, {"workspaces": ["memory", "ref-x"]}):
+        got = _texts(service.search("q", "u1", limit=50, include_shared=False, vector_only=True, **kw))
+        assert not any(t.startswith("tombstoned") for t in got)
