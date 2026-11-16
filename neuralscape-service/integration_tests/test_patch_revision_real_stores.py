@@ -78,6 +78,10 @@ def world(stores, unique_ns, monkeypatch):
     client.create_collection(collection, vectors_config=VectorParams(size=DIM, distance=Distance.COSINE))
     unique_ns.on_cleanup(lambda: client.delete_collection(collection))
     monkeypatch.setattr(settings, "qdrant_collection", collection)
+    monkeypatch.setattr(settings, "redis_url", stores.redis_url)        # the per-memory edit lock uses the REAL Redis
+    import memory.edit as edit
+
+    monkeypatch.setattr(edit, "_LOCK_WAIT_S", 0.0)
     svc = MemoryService()
     svc._memory = _Mem0Shim(client, collection)
     svc._graphiti = None
@@ -139,7 +143,7 @@ def test_content_edit_claims_the_revision_atomically_before_the_rewrite(world):
 
 
 def test_concurrent_patches_holding_one_revision_have_exactly_one_winner(world):
-    from memory.edit import RevisionConflict
+    from memory.edit import EditBusy, RevisionConflict
 
     pid = _seed(world)
     n = 12
@@ -152,7 +156,7 @@ def test_concurrent_patches_holding_one_revision_have_exactly_one_winner(world):
         try:
             world.patch_memory(pid, world.owner, {"tags": [f"writer-{i}"]}, expected_revision="0")
             result = f"win:{i}"
-        except RevisionConflict:
+        except (RevisionConflict, EditBusy):
             result = "conflict"
         with lock:
             outcomes.append(result)
@@ -240,36 +244,33 @@ def test_rest_route_answers_409_for_a_stale_revision_and_enqueues_nothing(world,
         loop.close()
 
 
-class _Crash(BaseException):
-    """A hard crash: skips ``except Exception`` cleanup, like a killed process."""
-
-
-def test_claim_blocks_a_second_writer_and_the_rewrite_publishes_revision_with_content(world):
-    """Real server: IsEmpty on a nested key + a numeric Range on the lease + nested Filter + nested set_payload."""
-    from memory.edit import RevisionConflict
+def test_the_real_lock_blocks_a_second_writer_during_a_content_rewrite_and_publishes_one_state(world):
+    """Real Redis lock + real Qdrant: a reader during the rewrite sees the OLD row; a second writer is refused;
+    afterwards content and revision changed together."""
+    from memory.edit import EditBusy
 
     pid = _seed(world)
-    seen = {}
+    seen = {"busy": 0}
 
     def during():
-        seen["pending"] = _stored(world, pid)["metadata"].get("revision_pending")
         seen["read"] = world.get_memory(pid)
-        try:
-            world.patch_memory(pid, world.owner, {"tags": ["second"]}, expected_revision="0")
-        except RevisionConflict as e:
-            seen["refused"] = e
+        for kwargs in ({"expected_revision": "0"}, {}):
+            try:
+                world.patch_memory(pid, world.owner, {"tags": ["intruder"]}, **kwargs)
+            except EditBusy:
+                seen["busy"] += 1
 
     world._memory.before_update = during
     world.patch_memory(pid, world.owner, {"content": "new text"}, expected_revision="0")
-    assert seen["pending"] and "refused" in seen
-    assert (seen["read"].revision, seen["read"].memory) == ("0", "the original text")   # consistent old view
+    assert seen["busy"] == 2
+    assert (seen["read"].revision, seen["read"].memory) == ("0", "the original text")
     stored = _stored(world, pid)
     assert stored["data"] == "new text" and stored["metadata"]["revision"] == 1
-    assert "revision_pending" not in stored["metadata"]
-    world.patch_memory(pid, world.owner, {"tags": ["after"]}, expected_revision="1")
+    assert not any(k.startswith("revision_") for k in stored["metadata"])
+    world.patch_memory(pid, world.owner, {"tags": ["after"]}, expected_revision="1")      # lock released
 
 
-def test_a_failed_rewrite_releases_the_mark_on_the_real_server(world):
+def test_a_failed_rewrite_releases_the_real_lock(world):
     pid = _seed(world)
 
     def boom():
@@ -278,26 +279,23 @@ def test_a_failed_rewrite_releases_the_mark_on_the_real_server(world):
     world._memory.before_update = boom
     with pytest.raises(RuntimeError):
         world.patch_memory(pid, world.owner, {"content": "x"}, expected_revision="0")
-    meta = _stored(world, pid)["metadata"]
-    assert meta.get("revision_pending") is None and meta.get("revision_pending_at") is None
+    assert _stored(world, pid)["data"] == "the original text"
     world.patch_memory(pid, world.owner, {"tags": ["ok"]}, expected_revision="0")
 
 
-def test_a_crashed_writers_mark_expires_with_the_lease_on_the_real_server(world, monkeypatch):
+def test_a_stolen_lock_fails_the_original_writer_at_the_fence(world, monkeypatch):
     import memory.edit as edit
-    from memory.edit import RevisionConflict
+    from memory.edit import EditBusy
 
     pid = _seed(world)
+    real_title = edit.distill_title
 
-    def crash():
-        raise _Crash()
+    def steal(text):
+        edit._redis_client().set(f"ns:edit-lock:{pid}", "thief", px=60000)     # TTL lapsed, someone else holds it
+        return real_title(text)
 
-    world._memory.before_update = crash
-    with pytest.raises(_Crash):
-        world.patch_memory(pid, world.owner, {"content": "x"}, expected_revision="0")
-    with pytest.raises(RevisionConflict):
-        world.patch_memory(pid, world.owner, {"tags": ["soon"]}, expected_revision="0")
-    real = edit._now_epoch()
-    monkeypatch.setattr(edit, "_now_epoch", lambda: real + edit._PENDING_LEASE_S + 5)
-    world.patch_memory(pid, world.owner, {"tags": ["later"]}, expected_revision="0")
-    assert _stored(world, pid)["metadata"]["tags"] == ["later"]
+    monkeypatch.setattr(edit, "distill_title", steal)
+    with pytest.raises(EditBusy):
+        world.patch_memory(pid, world.owner, {"content": "stalled"}, expected_revision="0")
+    assert _stored(world, pid)["data"] == "the original text"
+    edit._redis_client().delete(f"ns:edit-lock:{pid}")

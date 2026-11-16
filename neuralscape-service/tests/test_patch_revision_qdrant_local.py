@@ -1,10 +1,6 @@
-"""The revision claim / pending lease run against a REAL Qdrant engine (local mode), not a hand-written filter fake.
-
-Local mode is the Qdrant client's own in-process implementation of payload filters, so it exercises the real
-semantics of the pieces the fake could only assume: ``IsEmptyCondition`` on a nested key, a numeric ``Range`` on
-the lease timestamp, nested ``Filter`` composition, filtered ``set_payload`` and ``delete_payload`` with dotted keys.
-(The server itself is covered by ``integration_tests/test_patch_revision_real_stores.py`` on the gate.)
-"""
+"""The conditional edit (per-memory Redis lock + ONE write carrying content, metadata and revision) against a REAL
+Qdrant engine (the client's local mode) instead of a hand-written store fake; Redis is the in-memory ``FakeRedis``
+from ``conftest`` (the real Redis is covered by ``integration_tests/test_patch_revision_real_stores.py``)."""
 
 import uuid
 from types import SimpleNamespace
@@ -14,7 +10,7 @@ from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, PointStruct, VectorParams
 
 import memory.edit as edit
-from memory.edit import RevisionConflict
+from memory.edit import EditBusy, RevisionConflict
 from memory_service import MemoryService
 
 DIM = 4
@@ -78,63 +74,62 @@ def _meta(world):
     return world.client.retrieve("c", ids=[world.pid], with_payload=True)[0].payload["metadata"]
 
 
-def test_claim_blocks_a_second_writer_then_the_rewrite_publishes_revision_and_content(world):
+def test_I1_the_row_changes_in_one_write_and_a_reader_never_sees_a_claimed_state(world, edit_lock_redis):
     seen = {}
 
     def during():
-        seen["pending"] = _meta(world).get("revision_pending")
-        try:
-            world.patch_memory(world.pid, "u", {"tags": ["second"]}, expected_revision="0")
-        except RevisionConflict as e:
-            seen["refused"] = e
+        seen["meta"] = dict(_meta(world))
+        seen["text"] = world._memory.get(world.pid)["memory"]
+        for kwargs in ({"expected_revision": "0"}, {}):
+            try:
+                world.patch_memory(world.pid, "u", {"tags": ["intruder"]}, **kwargs)
+            except EditBusy:
+                seen.setdefault("busy", 0)
+                seen["busy"] += 1
 
     world._memory.before_update = during
     world.patch_memory(world.pid, "u", {"content": "new"}, expected_revision="0")
-    assert seen["pending"] and "refused" in seen
-    assert world._memory.get(world.pid)["memory"] == "new"
+    assert seen["text"] == "old" and "revision" not in seen["meta"] and not any(k.startswith("revision_") for k in seen["meta"])
+    assert seen["busy"] == 2
     meta = _meta(world)
-    assert meta["revision"] == 1 and "revision_pending" not in meta       # the rewrite replaced the payload
-    world.patch_memory(world.pid, "u", {"tags": ["after"]}, expected_revision="1")
+    assert world._memory.get(world.pid)["memory"] == "new" and meta["revision"] == 1
+    assert not any(k.startswith("revision_") for k in meta) and edit_lock_redis.store == {}
 
 
-def test_a_failed_rewrite_releases_the_mark_with_a_nested_set_payload(world):
+def test_I1_a_stale_edit_changes_nothing(world):
+    world.patch_memory(world.pid, "u", {"tags": ["winner"]}, expected_revision="0")
+    before = _meta(world)
+    with pytest.raises(RevisionConflict):
+        world.patch_memory(world.pid, "u", {"content": "stale"}, expected_revision="0")
+    assert _meta(world) == before and world._memory.get(world.pid)["memory"] == "old"
+
+
+def test_I1_a_failed_rewrite_releases_the_lock_and_changes_nothing(world, edit_lock_redis):
     def boom():
         raise RuntimeError("embedder down")
 
     world._memory.before_update = boom
     with pytest.raises(RuntimeError):
         world.patch_memory(world.pid, "u", {"content": "x"}, expected_revision="0")
-    meta = _meta(world)
-    assert meta.get("revision_pending") is None and meta.get("revision_pending_at") is None
+    assert edit_lock_redis.store == {} and world._memory.get(world.pid)["memory"] == "old"
     world.patch_memory(world.pid, "u", {"tags": ["ok"]}, expected_revision="0")
 
 
-def test_a_crashed_writers_mark_blocks_until_the_numeric_lease_expires(world, monkeypatch):
-    def crash():
-        raise _Crash()
-
-    world._memory.before_update = crash
-    with pytest.raises(_Crash):
-        world.patch_memory(world.pid, "u", {"content": "x"}, expected_revision="0")
-    with pytest.raises(RevisionConflict):
-        world.patch_memory(world.pid, "u", {"tags": ["soon"]}, expected_revision="0")
-    real = edit._now_epoch()
-    monkeypatch.setattr(edit, "_now_epoch", lambda: real + edit._PENDING_LEASE_S + 5)
-    world.patch_memory(world.pid, "u", {"tags": ["later"]}, expected_revision="0")
-    assert _meta(world)["tags"] == ["later"]
-
-
-def test_I2_on_a_real_engine_a_committed_edit_survives_successors_before_its_confirmation(world):
-    real_retrieve = world.client.retrieve
-    state = {"done": False}
-
-    def retrieve(collection_name, ids, **kw):
-        if not state["done"] and real_retrieve(collection_name, ids, **kw)[0].payload["metadata"].get("revision") == 1:
-            state["done"] = True
-            for r in range(1, 71):
-                world.patch_memory(world.pid, "u", {"tags": [f"s{r}"]}, expected_revision=str(r))
-        return real_retrieve(collection_name, ids, **kw)
-
-    world.client.retrieve = retrieve
-    world.patch_memory(world.pid, "u", {"tags": ["mine"]}, expected_revision="0")      # must not raise
+def test_I2_many_successors_after_a_commit_never_turn_it_into_a_conflict(world):
+    world.patch_memory(world.pid, "u", {"tags": ["mine"]}, expected_revision="0")      # committed
+    for r in range(1, 71):
+        world.patch_memory(world.pid, "u", {"tags": [f"s{r}"]}, expected_revision=str(r))
     assert _meta(world)["revision"] == 71
+
+
+def test_I3_a_lost_lock_fails_the_writer_before_it_can_write(world, edit_lock_redis, monkeypatch):
+    real_title = edit.distill_title
+
+    def steal(text):
+        edit_lock_redis.store[f"ns:edit-lock:{world.pid}"] = "thief"
+        return real_title(text)
+
+    monkeypatch.setattr(edit, "distill_title", steal)
+    with pytest.raises(EditBusy):
+        world.patch_memory(world.pid, "u", {"content": "stalled"}, expected_revision="0")
+    assert world._memory.get(world.pid)["memory"] == "old" and "revision" not in _meta(world)

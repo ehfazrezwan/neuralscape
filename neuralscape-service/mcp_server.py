@@ -31,7 +31,7 @@ from mcp.types import TextContent, Tool
 import adapters  # noqa: F401 — registers knowledge-adapter taxonomies at import (deterministic MEMORY_CATEGORIES for validation; tool enums stay core-13)
 from config import settings
 from memory.delete import MemoryListingFailed
-from memory.edit import RevisionConflict
+from memory.edit import EditBusy, EditLockUnavailable, RevisionConflict
 from memory_service import get_shared_service
 from schemas import CORE_MEMORY_CATEGORIES
 from task_manager import TaskManager
@@ -2252,6 +2252,10 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
                     "expected_revision": rc.expected_revision,
                     "current_revision": rc.current_revision,
                 }))]
+            except EditBusy as eb:
+                return [TextContent(type="text", text=json.dumps({"error": str(eb), "code": "edit_busy"}))]
+            except EditLockUnavailable as eu:
+                return [TextContent(type="text", text=json.dumps({"error": str(eu), "code": "edit_lock_unavailable"}))]
             except (LookupError, PermissionError, ValueError) as e:
                 return [TextContent(type="text", text=json.dumps({"error": str(e)}))]
 

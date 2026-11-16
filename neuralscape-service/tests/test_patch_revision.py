@@ -223,30 +223,6 @@ def test_a_retag_bumps_the_revision_so_a_concurrent_patch_is_refused(world):
 # ── race: the other writer lands between our read and our write ───────
 
 
-def test_race_on_a_metadata_patch_loses_atomically(world):
-    def interloper(fake):  # lands after our pre-check, before our filtered write
-        fake.points[M1]["metadata"]["tags"] = ["interloper"]
-        fake.points[M1]["metadata"]["revision"] = 1
-
-    world.fake.before_filtered_write = interloper
-    with pytest.raises(RevisionConflict) as err:
-        world.patch_memory(M1, "ehfaz", {"tags": ["mine"]}, expected_revision="0")
-
-    assert err.value.current_revision == "1"
-    assert _tags(world) == ["interloper"]               # the filtered write was a server-side no-op
-
-
-def test_race_on_a_content_edit_loses_before_the_re_embed(world):
-    def interloper(fake):
-        fake.points[M1]["metadata"]["revision"] = 1
-
-    world.fake.before_filtered_write = interloper
-    with pytest.raises(RevisionConflict):
-        world.patch_memory(M1, "ehfaz", {"content": "mine"}, expected_revision="0")
-    world._memory.update.assert_not_called()
-    assert world.fake.points[M1]["data"] == "Old content"
-
-
 # ── correct revision applies ──────────────────────────────────────────
 
 
@@ -314,77 +290,107 @@ def test_revision_of_tolerates_missing_and_garbage():
     assert revision_of({"revision": 4}) == "4"
 
 
-def test_the_internal_write_nonce_is_never_returned_in_a_response(world):
-    out = world.patch_memory(M1, "ehfaz", {"tags": ["x"]}, expected_revision="0")
-    assert "revision_nonces" in world.fake.points[M1]["metadata"]    # stored (needed to identify the winner) ...
-    dumped = str(out["memory"].model_dump()) + str(world.get_memory(M1).model_dump())
-    assert "revision_nonce" not in dumped                              # ... but not part of any response model
-
-
-# ── review findings 5 and 6 ───────────────────────────────────────────
-
-
-def test_a_committed_conditional_patch_is_not_reported_as_a_conflict_when_a_successor_already_landed(world):
-    """Finding 5: our filtered write committed; a successor (holding the new revision) lands before the
-    confirming read. Success must be decided from OUR revision's nonce, not the latest write's."""
-    real_retrieve = world.fake.retrieve
-    state = {"done": False}
-
-    def retrieve_after_successor(collection_name, ids, with_payload=True, with_vectors=False):
-        if not state["done"] and world.fake.points[M1]["metadata"].get("revision") == 1:
-            state["done"] = True    # the successor lands between our write and our confirming read
-            world.patch_memory(M1, "ehfaz", {"tags": ["successor"]}, expected_revision="1")
-        return real_retrieve(collection_name, ids, with_payload, with_vectors)
-
-    world.fake.retrieve = retrieve_after_successor
-    out = world.patch_memory(M1, "ehfaz", {"tags": ["mine"]}, expected_revision="0")   # must NOT raise
-    assert out["memory"] is not None
-    assert world.fake.points[M1]["metadata"]["revision"] == 2 and _tags(world) == ["successor"]
+# ── protocol: per-memory lock, one write (I1-I3) ───────────────────────
 
 
 class _Crash(BaseException):
     """A hard crash: skips ``except Exception`` cleanup, like a killed process."""
 
 
-def test_a_second_conditional_writer_cannot_commit_inside_a_content_edits_rewrite_window(world):
-    """The rewrite is in flight; a writer must be refused, not commit and then be overwritten (lost update);
-    and a read during the window is a consistent OLD view (old revision + old content)."""
+LOCK_KEY = f"ns:edit-lock:{M1}"
+
+
+def test_I1_no_claimed_intermediate_state_is_ever_visible_or_stored(world, edit_lock_redis):
+    """A reader during the re-embed sees the OLD row (old content, old revision); afterwards the new row. No pending marks."""
     seen = {}
 
-    def during_rewrite(fake):
+    def during(fake):
         seen["read"] = world.get_memory(M1)
-        try:
-            world.patch_memory(M1, "ehfaz", {"tags": ["second"]}, expected_revision="0")
-        except RevisionConflict as e:
-            seen["refused"] = e
+        seen["stored"] = dict(fake.points[M1]["metadata"])
 
-    world.fake.before_mem0_update = during_rewrite
-    world.patch_memory(M1, "ehfaz", {"content": "first writer's text"}, expected_revision="0")
-    assert "refused" in seen
-    assert (seen["read"].revision, seen["read"].memory) == ("0", "Old content")      # not N+1 with stale text
-    assert world.fake.points[M1]["data"] == "first writer's text"
+    world.fake.before_mem0_update = during
+    world.patch_memory(M1, "ehfaz", {"content": "new text"}, expected_revision="0")
+    assert (seen["read"].revision, seen["read"].memory) == ("0", "Old content")
+    assert not any(k.startswith("revision_") for k in seen["stored"])          # nothing claimed, nothing pending
     meta = world.fake.points[M1]["metadata"]
-    assert "revision_pending" not in meta and meta["revision"] == 1                  # published with the content
-    world.patch_memory(M1, "ehfaz", {"tags": ["after"]}, expected_revision="1")      # and the row is usable again
+    assert world.fake.points[M1]["data"] == "new text" and meta["revision"] == 1
+    assert not any(k.startswith("revision_") for k in meta)
+    assert edit_lock_redis.store == {}                                         # lock released
 
 
-def test_a_failed_rewrite_releases_the_pending_mark(world):
-    during = {}
+def test_I1_a_busy_row_refuses_a_second_writer_and_changes_nothing(world):
+    """A second writer (conditional or not) arriving during the first one's re-embed is refused with EditBusy."""
+    from memory.edit import EditBusy
 
-    def hook(fake):
-        during["pending"] = fake.points[M1]["metadata"].get("revision_pending")
+    outcomes = []
 
-    world.fake.before_mem0_update = hook
+    def during(fake):
+        for kwargs in ({"expected_revision": "0"}, {}):
+            try:
+                world.patch_memory(M1, "ehfaz", {"tags": ["intruder"]}, **kwargs)
+                outcomes.append("committed")
+            except EditBusy:
+                outcomes.append("busy")
+
+    world.fake.before_mem0_update = during
+    world.patch_memory(M1, "ehfaz", {"content": "first writer's text"}, expected_revision="0")
+    assert outcomes == ["busy", "busy"]
+    assert world.fake.points[M1]["data"] == "first writer's text" and _tags(world) == ["t0"]
+    world.patch_memory(M1, "ehfaz", {"tags": ["after"]}, expected_revision="1")      # usable again
+
+
+def test_I1_a_failed_rewrite_releases_the_lock_and_leaves_the_row_untouched(world, edit_lock_redis):
     world.fake.fail_mem0_update = True
     with pytest.raises(RuntimeError):
         world.patch_memory(M1, "ehfaz", {"content": "never lands"}, expected_revision="0")
-    assert during["pending"]                                                        # the mark WAS set during the rewrite
-    assert world.fake.points[M1]["metadata"].get("revision_pending") is None      # and released on failure
-    world.patch_memory(M1, "ehfaz", {"tags": ["ok"]}, expected_revision="0")        # revision unchanged: not wedged
+    assert edit_lock_redis.store == {}
+    assert world.fake.points[M1]["data"] == "Old content" and world.get_memory(M1).revision == "0"
+    world.patch_memory(M1, "ehfaz", {"tags": ["ok"]}, expected_revision="0")
 
 
-def test_a_crashed_writer_blocks_conditional_writers_only_until_the_lease_expires(world, monkeypatch):
+def test_I2_a_committed_edit_is_never_reported_as_a_conflict_whatever_arrives_after_it(world):
+    """There is no post-write confirmation to be fooled: a successor arriving while the post-write graph work runs
+    is refused as busy, and the original edit returns its normal result including the graph job and cleanup."""
+    from memory.edit import EditBusy
+
+    seen = {}
+    real = world._cascade_rows_once
+
+    def cascade_then_successor(*a, **k):
+        try:
+            world.patch_memory(M1, "ehfaz", {"tags": ["successor"]}, expected_revision="1")
+            seen["successor"] = "committed"
+        except EditBusy:
+            seen["successor"] = "busy"
+        return real(*a, **k)
+
+    world._cascade_rows_once = cascade_then_successor
+    out = world.patch_memory(M1, "ehfaz", {"visibility": "shared"}, expected_revision="0")   # partition change
+    assert out["graph"] != "unchanged" and out["graph_job"] is not None
+    assert seen["successor"] == "busy"
+    assert world.fake.points[M1]["metadata"]["revision"] == 1
+
+
+def test_I3_a_writer_whose_lock_was_lost_fails_at_the_fence_instead_of_writing(world, edit_lock_redis, monkeypatch):
+    """The lock expired and another writer took it: the original writer must change nothing."""
     import memory.edit as edit
+    from memory.edit import EditBusy
+
+    real_title = edit.distill_title
+
+    def steal(text):
+        edit_lock_redis.store[LOCK_KEY] = "thief"          # TTL lapsed + someone else acquired it, before the fence
+        return real_title(text)
+
+    monkeypatch.setattr(edit, "distill_title", steal)
+    with pytest.raises(EditBusy):
+        world.patch_memory(M1, "ehfaz", {"content": "stalled writer"}, expected_revision="0")
+    assert world.fake.points[M1]["data"] == "Old content" and world.get_memory(M1).revision == "0"
+    assert edit_lock_redis.store[LOCK_KEY] == "thief"       # and our release did not delete the thief's lock
+
+
+def test_I3_a_crashed_writers_lock_blocks_others_only_until_its_ttl(world, edit_lock_redis):
+    from memory.edit import EditBusy
 
     def crash(fake):
         raise _Crash()
@@ -392,71 +398,33 @@ def test_a_crashed_writer_blocks_conditional_writers_only_until_the_lease_expire
     world.fake.before_mem0_update = crash
     with pytest.raises(_Crash):
         world.patch_memory(M1, "ehfaz", {"content": "dies mid-rewrite"}, expected_revision="0")
-    with pytest.raises(RevisionConflict):                                           # pending mark is live: refused
+    # a hard crash skips ``__exit__`` cleanup only if the process dies; here the context manager still releases,
+    # so emulate the dead process by leaving the key behind, then let the TTL (simulated) clear it.
+    edit_lock_redis.store[LOCK_KEY] = "dead-writer"
+    with pytest.raises(EditBusy):
         world.patch_memory(M1, "ehfaz", {"tags": ["too-soon"]}, expected_revision="0")
-    real = edit._now_epoch()
-    monkeypatch.setattr(edit, "_now_epoch", lambda: real + edit._PENDING_LEASE_S + 5)
-    world.patch_memory(M1, "ehfaz", {"tags": ["after-lease"]}, expected_revision="0")   # lease expired: not wedged
-    assert _tags(world) == ["after-lease"]
+    del edit_lock_redis.store[LOCK_KEY]                     # Redis expires the key after the TTL
+    world.patch_memory(M1, "ehfaz", {"tags": ["after-ttl"]}, expected_revision="0")
+    assert _tags(world) == ["after-ttl"]
 
 
-def test_a_lost_claim_aborts_the_rewrite_before_it_can_overwrite_another_writers_edit(world):
-    """Finding (lease expiry): the lease ran out while writer 1 was still working, writer 2 committed; writer 1
-    must be refused at the fence instead of overwriting writer 2's edit."""
-    real_retrieve = world.fake.retrieve
-    state = {"calls": 0, "armed": True}
-
-    def retrieve(collection_name, ids, with_payload=True, with_vectors=False):
-        state["calls"] += 1
-        if state["calls"] == 2 and state["armed"]:      # the fence read: claim confirm was call 1
-            state["armed"] = False
-            meta = world.fake.points[M1]["metadata"]
-            meta["revision_pending_at"] = 0.0                                  # lease expired
-            world.patch_memory(M1, "ehfaz", {"tags": ["second-writer"]}, expected_revision="0")   # commits
-        return real_retrieve(collection_name, ids, with_payload, with_vectors)
-
-    world.fake.retrieve = retrieve
-    with pytest.raises(RevisionConflict):
-        world.patch_memory(M1, "ehfaz", {"content": "first writer's text"}, expected_revision="0")
-    assert world.fake.points[M1]["data"] == "Old content"            # the rewrite never ran
-    assert _tags(world) == ["second-writer"]                         # writer 2's edit survived
-
-
-def test_I2_a_committed_conditional_patch_survives_seventy_successor_writes_before_its_confirmation(world):
-    """I2: no number of successor commits can turn a committed conditional edit into a conflict, and the caller
-    still gets what it needs to run graph cleanup (a committed partition change keeps its job and cascade)."""
-    real_retrieve = world.fake.retrieve
-    state = {"done": False}
-
-    def retrieve_after_successors(collection_name, ids, with_payload=True, with_vectors=False):
-        if not state["done"] and world.fake.points[M1]["metadata"].get("revision") == 1:
-            state["done"] = True
-            for r in range(1, 71):
-                world.patch_memory(M1, "ehfaz", {"tags": [f"s{r}"]}, expected_revision=str(r))
-        return real_retrieve(collection_name, ids, with_payload, with_vectors)
-
-    world.fake.retrieve = retrieve_after_successors
-    out = world.patch_memory(M1, "ehfaz", {"visibility": "shared"}, expected_revision="0")   # partition change
-    assert out["graph"] != "unchanged" and out["graph_job"] is not None
-    world._cascade_rows_once.assert_called()                                  # the old group's cleanup ran
-    assert world.fake.points[M1]["metadata"]["revision"] == 71
-
-
-def test_I3_a_claim_whose_lease_lapsed_fails_the_writer_even_if_its_nonce_is_still_present(world, monkeypatch):
-    """I3: the fence rejects an expired lease on its own: no other writer has to have committed yet."""
+def test_a_conditional_edit_is_refused_when_redis_is_unreachable_and_an_unconditional_one_proceeds(world, monkeypatch):
     import memory.edit as edit
+    from memory.edit import EditLockUnavailable
 
-    real = edit._now_epoch()
-    real_retrieve = world.fake.retrieve
-    calls = {"n": 0}
+    def down():
+        raise ConnectionError("redis down")
 
-    def retrieve(collection_name, ids, with_payload=True, with_vectors=False):
-        calls["n"] += 1
-        if calls["n"] == 2:     # call 1 confirms the claim, call 2 is the fence: the lease lapses in between
-            monkeypatch.setattr(edit, "_now_epoch", lambda: real + edit._PENDING_LEASE_S + 10)
-        return real_retrieve(collection_name, ids, with_payload, with_vectors)
+    monkeypatch.setattr(edit, "_redis_client", down)
+    with pytest.raises(EditLockUnavailable):
+        world.patch_memory(M1, "ehfaz", {"tags": ["x"]}, expected_revision="0")
+    assert _tags(world) == ["t0"]
+    world.patch_memory(M1, "ehfaz", {"tags": ["y"]})          # unconditional: proceeds unlocked (warned)
+    assert _tags(world) == ["y"]
 
-    world.fake.retrieve = retrieve
-    with pytest.raises(RevisionConflict):
-        world.patch_memory(M1, "ehfaz", {"content": "stalled writer"}, expected_revision="0")
-    assert world.fake.points[M1]["data"] == "Old content"                   # the rewrite never ran
+
+def test_the_lock_is_per_memory(world, edit_lock_redis):
+    world.fake.add(M2)
+    edit_lock_redis.store[f"ns:edit-lock:{M2}"] = "someone"
+    world.patch_memory(M1, "ehfaz", {"tags": ["unaffected"]}, expected_revision="0")
+    assert _tags(world) == ["unaffected"]
