@@ -22,7 +22,7 @@ from __future__ import annotations
 
 from typing import Protocol, runtime_checkable
 
-from prompts import build_extraction_messages, parse_extraction_response
+from prompts import add_ingest_modality_rule, build_extraction_messages, parse_extraction_response
 
 
 @runtime_checkable
@@ -47,7 +47,11 @@ class DefaultExtractor:
     name = "default"
 
     def build_messages(self, text: str) -> list[dict]:
-        return build_extraction_messages([{"role": "user", "content": text}])
+        # Ingest only: distilled facts must keep the document's modality
+        # (should stays should). The conversation path is unchanged.
+        messages = build_extraction_messages([{"role": "user", "content": text}])
+        messages[0]["content"] = add_ingest_modality_rule(messages[0]["content"])
+        return messages
 
     def parse(self, response_text: str) -> list[tuple[str, str]]:
         return parse_extraction_response(response_text)

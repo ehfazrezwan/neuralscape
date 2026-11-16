@@ -830,6 +830,49 @@ async def test_siit_and_local_use_nat64_forms_of_metadata_refused_even_when_allo
                 await validate_url("https://h.corp/", allow, dns)
 
 
+def _local_nat64(prefix_len: int, v4: str, suffix: int = 0) -> str:
+    """Encode ``v4`` under 64:ff9b:1::/48 in the RFC 6052 layout for ``prefix_len`` (built from the
+    RFC's bit layout, independently of the decoder's byte table)."""
+    if prefix_len == 96:
+        return str(ipaddress.IPv6Address(bytes.fromhex("0064ff9b0001") + bytes(6) + ipaddress.IPv4Address(v4).packed))
+    prefix = int.from_bytes(bytes.fromhex("0064ff9b0001") + bytes(10), "big")
+    v4_bits = int(ipaddress.IPv4Address(v4))
+    # Bits 64-71 are the zero "u" octet: the IPv4 bits before it end at bit 64, the rest follow it.
+    before = min(32, 64 - prefix_len)
+    high, low = v4_bits >> (32 - before), v4_bits & ((1 << (32 - before)) - 1)
+    value = prefix | (high << (128 - prefix_len - before))
+    if 32 - before:
+        value |= low << (128 - 72 - (32 - before))
+    return str(ipaddress.IPv6Address(value | suffix))
+
+
+@pytest.mark.parametrize("prefix_len", [48, 56, 64, 96])
+@pytest.mark.parametrize("v4", ["169.254.169.254", "168.63.129.16", "100.100.100.200", "192.0.0.192"])
+@pytest.mark.asyncio
+async def test_every_rfc6052_layout_of_local_use_nat64_metadata_refused_when_allowlisted(prefix_len, v4):
+    addr = _local_nat64(prefix_len, v4)
+    assert ipaddress.IPv6Address(addr) in ipaddress.IPv6Network("64:ff9b:1::/48"), addr
+    assert ipaddress.IPv4Address(v4) in destination._embedded_ipv4(ipaddress.IPv6Address(addr)), addr
+    assert destination._never_allowed(ipaddress.ip_address(addr)), addr
+    dns = fake_dns({"h.corp": [addr]})
+    for allow in (NO_ALLOW, parse_allowed_hosts("h.corp")):
+        with pytest.raises(DestinationRefused) as exc:
+            await validate_url("https://h.corp/", allow, dns)
+    assert exc.value.reason == "link_local_or_metadata"
+
+
+@pytest.mark.parametrize("prefix_len", [48, 56, 64, 96])
+@pytest.mark.asyncio
+async def test_allowlisted_private_target_behind_local_use_nat64_still_accepted(prefix_len):
+    addr = _local_nat64(prefix_len, "10.20.30.40")
+    assert ipaddress.IPv4Address("10.20.30.40") in destination._embedded_ipv4(ipaddress.IPv6Address(addr))
+    assert not destination._never_allowed(ipaddress.ip_address(addr)), addr
+    dns = fake_dns({"h.corp": [addr]})
+    assert await validate_url("https://h.corp/", parse_allowed_hosts("h.corp"), dns) == [addr]
+    with pytest.raises(DestinationRefused):
+        await validate_url("https://h.corp/", NO_ALLOW, dns)
+
+
 @pytest.mark.parametrize("addr", ["fd20:ce::254%eth0", "fd00:ec2::254%lo", "fe80::1%eth0", "::1%lo"])
 @pytest.mark.asyncio
 async def test_zone_scoped_literals_do_not_defeat_the_checks(addr):

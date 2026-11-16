@@ -839,13 +839,19 @@ class TestCRUD:
         assert deleted_ids == ["m_priv"]
         assert "preserved 1 shared" in result["message"]
 
-    def test_delete_memories_all_include_shared_nukes_everything(self, service):
-        """include_shared=True restores the old full-nuke path."""
-        # The graph cleanup lists the user's rows first; a listing that cannot
-        # run now refuses the whole delete (MemoryListingFailed), so give it one.
-        service._scroll_all_user_memories = MagicMock(return_value=[])
+    def test_delete_memories_all_include_shared_deletes_own_rows_per_row(self, service):
+        """include_shared=True deletes the caller's private + own shared rows one by
+        one (never mem0 ``delete_all``, which also erased ``standard`` rows)."""
+        service._scroll_all_user_memories = MagicMock(return_value=[
+            {"id": "m_priv", "payload": {"data": "p", "metadata": {"visibility": "private"}}},
+            {"id": "m_shared", "payload": {"data": "s", "metadata": {"visibility": "shared"}}},
+        ])
+        service._memory.vector_store.delete = MagicMock()
         result = service.delete_memories(user_id="ehfaz", include_shared=True)
-        service._memory.delete_all.assert_called_once_with(user_id="ehfaz")
+        service._memory.delete_all.assert_not_called()
+        deleted_ids = [c.args[0] for c in service._memory.vector_store.delete.call_args_list]
+        assert deleted_ids == ["m_priv", "m_shared"]
+        assert "including 1 shared" in result["message"]
 
     def test_delete_memories_with_filters(self, service):
         service._memory.get_all.return_value = {
@@ -1014,6 +1020,13 @@ class TestReasoningChainReadGate:
         assert chain["children"][0]["content"] == "alice's private premise"
 
 
+
+def _applied_meta_delta(service):
+    """The deferred nested metadata apply (the LAST ``key="metadata"`` write; an access-control narrowing may precede the commit)."""
+    nested = [c for c in service._memory.vector_store.client.set_payload.call_args_list if c.kwargs.get("key") == "metadata"]
+    return nested[-1].kwargs["payload"]
+
+
 class TestPatchMemory:
     @pytest.fixture(autouse=True)
     def _stub_response(self, service):
@@ -1027,15 +1040,16 @@ class TestPatchMemory:
         service._memory.vector_store.get.return_value = _edit_point(meta=dict(_SHARED_META))
         result = service.patch_memory("m1", "robb", {"tags": ["project:bon002"]})
 
-        service._memory._update_memory.assert_not_called()
-        call = service._memory.vector_store.update.call_args
-        assert call.args[0] == "m1" or call.kwargs.get("vector_id") == "m1"
-        new_meta = call.kwargs["payload"]["metadata"]
-        assert new_meta["tags"] == ["project:bon002"]
-        assert new_meta["owner_user_id"] == "javi"          # preserved
-        assert new_meta["visibility"] == "shared"            # preserved
-        assert new_meta["category"] == "decision"            # preserved
-        assert "updated_at" in call.kwargs["payload"]
+        service._memory.vector_store.client.update_vectors.assert_not_called()   # metadata-only: no vector work
+        commit, apply_meta, clear = service._memory.vector_store.client.set_payload.call_args_list
+        assert commit.kwargs["points"] is not None and "key" not in commit.kwargs     # ONE top-level filter-scoped commit
+        assert commit.kwargs["payload"]["ns_revision"] == 1 and "updated_at" in commit.kwargs["payload"]
+        assert apply_meta.kwargs["key"] == "metadata"                                 # derived metadata: nested delta
+        delta = apply_meta.kwargs["payload"]
+        assert delta["tags"] == ["project:bon002"] and delta["revision"] == 1
+        # untouched keys are NOT rewritten (so concurrent nested writers' keys survive)
+        assert "owner_user_id" not in delta and "visibility" not in delta and "category" not in delta
+        assert clear.kwargs["payload"]["ns_meta_pending"] is None
         assert result["graph"] == "unchanged" and result["graph_job"] is None
 
     @pytest.mark.parametrize('changes', [{'content': 'New content'}, {'category': 'interaction'}])
@@ -1044,11 +1058,11 @@ class TestPatchMemory:
         service._memory.vector_store.get.return_value = _edit_point(meta=meta)
         service.patch_memory('m1', 'ehfaz', changes)
         if 'content' in changes:
-            stored = service._memory._update_memory.call_args.kwargs['metadata']['metadata']
+            stored = _applied_meta_delta(service)
         else:
-            stored = service._memory.vector_store.update.call_args.kwargs['payload']['metadata']
-        assert 'category_evidence' not in stored
-        assert stored['visibility'] == 'shared' and stored['owner_user_id'] == 'ehfaz'
+            stored = _applied_meta_delta(service)
+        assert stored.get('category_evidence') is None and 'category_evidence' in stored   # removed key written as null
+        assert 'visibility' not in stored and 'owner_user_id' not in stored            # untouched keys not rewritten
 
     def test_content_edit_passes_merged_metadata_to_mem0(self, service):
         """REGRESSION: mem0's _update_memory rebuilds the ENTIRE payload from
@@ -1061,13 +1075,14 @@ class TestPatchMemory:
         service._cascade_or_fallback_expire = MagicMock(return_value={"resolved": True})
         result = service.patch_memory("m1", "ehfaz", {"content": "New content"})
 
-        call = service._memory._update_memory.call_args
-        assert call.args[:2] == ("m1", "New content")
-        nested = call.kwargs["metadata"]["metadata"]
-        assert nested["category"] == "decision"
-        assert nested["owner_user_id"] == "ehfaz"
-        assert nested["visibility"] == "shared"
-        assert nested["tags"] == ["old-tag"]
+        commit, apply_meta, _clear = service._memory.vector_store.client.set_payload.call_args_list
+        assert commit.kwargs["payload"]["data"] == "New content"        # text + revision: ONE commit call
+        assert commit.kwargs["payload"]["ns_revision"] == 1
+        delta = apply_meta.kwargs["payload"]                            # metadata: ONLY the changed keys, nested
+        assert delta["revision"] == 1 and delta["title"] and "token_estimate" in delta
+        # untouched metadata (category, owner, visibility, tags) is not rewritten, so it survives intact
+        for untouched in ("category", "owner_user_id", "visibility", "tags"):
+            assert untouched not in delta
         assert result["graph"] == "reingest_pending"
         assert result["graph_job"]["content"] == "New content"
         service._cascade_or_fallback_expire.assert_called_once()
@@ -1120,7 +1135,7 @@ class TestPatchMemory:
         meta = {"category": "decision", "owner_user_id": "ehfaz", "visibility": "private"}
         service._memory.vector_store.get.return_value = _edit_point(meta=meta)
         service.patch_memory("m1", "ehfaz", {"category": "tech_stack", "project_id": "p1"})
-        new_meta = service._memory.vector_store.update.call_args.kwargs["payload"]["metadata"]
+        new_meta = _applied_meta_delta(service)
         assert new_meta["scope"] == "project" and new_meta["project_id"] == "p1"
 
     def test_clearing_project_id_flips_flexible_scope_to_global(self, service):
@@ -1134,7 +1149,7 @@ class TestPatchMemory:
                           "edges_expired": 0, "nodes_removed": 0, "summaries_cleared": 0}
         )
         result = service.patch_memory("m1", "ehfaz", {"project_id": None})
-        new_meta = service._memory.vector_store.update.call_args.kwargs["payload"]["metadata"]
+        new_meta = _applied_meta_delta(service)
         assert new_meta["scope"] == "global" and new_meta["project_id"] is None
         # private user--ehfaz--project--neuralscape → user--ehfaz: partition moved
         assert result["graph"] == "migration_pending"
@@ -1252,8 +1267,8 @@ class TestRetagMemories:
             {"add_tags": ["project:bon002"], "remove_tags": ["old-tag"]},
         )
         assert result["matched"] == 2 and result["updated"] == 2
-        payloads = [c.kwargs["payload"]["metadata"] for c in
-                    service._memory.vector_store.update.call_args_list]
+        payloads = [c.kwargs["payload"] for c in
+                    service._memory.vector_store.client.set_payload.call_args_list[1::3]]   # per row: commit, metadata, clear
         assert payloads[0]["tags"] == ["project:bon002"]
         assert payloads[1]["tags"] == ["keep", "project:bon002"]
         assert result["graph_jobs"] == []  # no project change → no graph work
@@ -1274,7 +1289,7 @@ class TestRetagMemories:
         self._scroll_returning(service, pts)
         result = service.retag_memories("robb", {"category": "decision"}, {"add_tags": ["already"]})
         assert result["matched"] == 1 and result["updated"] == 0
-        service._memory.vector_store.update.assert_not_called()
+        service._memory.vector_store.client.set_payload.assert_not_called()
 
     def test_retag_dry_run_writes_nothing(self, service):
         pts = [_edit_point("m1", meta=dict(_SHARED_META))]
@@ -1283,7 +1298,7 @@ class TestRetagMemories:
             "robb", {"category": "decision"}, {"add_tags": ["t"]}, dry_run=True
         )
         assert result["updated"] == 1 and result["dry_run"] is True
-        service._memory.vector_store.update.assert_not_called()
+        service._memory.vector_store.client.set_payload.assert_not_called()
 
     def test_retag_project_change_produces_graph_jobs(self, service):
         service._expire_graph_edges_for_memory = MagicMock()
@@ -1731,13 +1746,18 @@ class TestBulkDeleteNullCategory:
         Note: under the multi-user model, the unfiltered path also no
         longer calls delete_all by default (shared writes are preserved).
         We test both that the filter_null_category branch is taken when
-        the flag is set, and that include_shared=True restores the
-        legacy delete_all sweep.
+        the flag is set, and that include_shared=True no longer uses
+        mem0's delete_all either (it deletes the caller's own rows per row).
         """
-        # Unfiltered + include_shared=True = legacy delete_all path
-        service._scroll_all_user_memories = MagicMock(return_value=[])
+        service._scroll_all_user_memories = MagicMock(return_value=[
+            {"id": "p", "payload": {"data": "p", "metadata": {"visibility": "private"}}},
+            {"id": "s", "payload": {"data": "s", "metadata": {"visibility": "shared"}}},
+            {"id": "std", "payload": {"data": "t", "metadata": {"visibility": "standard"}}},
+        ])
+        service._memory.vector_store.delete = MagicMock()
         service.delete_memories(user_id="ehfaz", include_shared=True)
-        service._memory.delete_all.assert_called_once()
+        service._memory.delete_all.assert_not_called()
+        assert [c.args[0] for c in service._memory.vector_store.delete.call_args_list] == ["p", "s"]
 
         service._memory.reset_mock()
 
@@ -2722,17 +2742,14 @@ class TestExpireOldMemories:
         mock_client.scroll.side_effect = [
             ([expired, future_pt, no_expiry], None),  # next_offset=None terminates
         ]
-        # Mock the delete + graph cleanup helper
-        service._delete_qdrant_memory_with_graph_cleanup = MagicMock()
+        service._memory.vector_store.delete = MagicMock()
 
         result = service.expire_old_memories(batch_size=100)
 
         assert result["deleted_count"] == 1
         assert result["per_user"] == {"alice": 1}
         # Only the expired one was deleted
-        service._delete_qdrant_memory_with_graph_cleanup.assert_called_once()
-        deleted_id = service._delete_qdrant_memory_with_graph_cleanup.call_args[0][0]
-        assert deleted_id == "expired-1"
+        service._memory.vector_store.delete.assert_called_once_with("expired-1")
 
     def test_handles_per_point_delete_failure(self, service):
         """A failed delete on one point doesn't abort the run."""
@@ -2747,7 +2764,7 @@ class TestExpireOldMemories:
         mock_client.scroll.side_effect = [([p1, p2], None)]
 
         # First delete fails, second succeeds
-        service._delete_qdrant_memory_with_graph_cleanup = MagicMock(
+        service._memory.vector_store.delete = MagicMock(
             side_effect=[Exception("Qdrant transient"), None]
         )
 
@@ -2770,7 +2787,7 @@ class TestExpireOldMemories:
             ([p1], "cursor"),
             ([p2], None),
         ]
-        service._delete_qdrant_memory_with_graph_cleanup = MagicMock()
+        service._memory.vector_store.delete = MagicMock()
 
         result = service.expire_old_memories(batch_size=1)
         assert result["deleted_count"] == 2
@@ -2799,11 +2816,11 @@ class TestExpireOldMemories:
         mock_client = MagicMock()
         service._memory.vector_store.client = mock_client
         mock_client.scroll.side_effect = [([pt], None)]
-        service._delete_qdrant_memory_with_graph_cleanup = MagicMock()
+        service._memory.vector_store.delete = MagicMock()
 
         result = service.expire_old_memories()
         assert result["deleted_count"] == 0
-        service._delete_qdrant_memory_with_graph_cleanup.assert_not_called()
+        service._memory.vector_store.delete.assert_not_called()
 
     def test_cold_start_initializes_memory(self, service):
         """expire_old_memories must call _get_memory() before touching client.
@@ -3602,10 +3619,17 @@ class TestBulkDeleteSharedProtection:
         service._memory.delete_all.assert_not_called()
         assert "preserved 1 shared" in result["message"]
 
-    def test_include_shared_true_uses_delete_all(self, service):
-        service._scroll_all_user_memories = MagicMock(return_value=[])
+    def test_include_shared_true_does_not_use_delete_all(self, service):
+        service._scroll_all_user_memories = MagicMock(return_value=[
+            self._mem("priv-1", "private"),
+            self._mem("share-1", "shared"),
+            self._mem("std-1", "standard"),
+        ])
+        service._memory.vector_store.delete = MagicMock()
         service.delete_memories(user_id="alice", include_shared=True)
-        service._memory.delete_all.assert_called_once_with(user_id="alice")
+        service._memory.delete_all.assert_not_called()
+        deleted = [c.args[0] for c in service._memory.vector_store.delete.call_args_list]
+        assert deleted == ["priv-1", "share-1"]
 
     def test_filtered_delete_skips_shared_by_default(self, service):
         """Even with a category filter, shared writes survive by default."""

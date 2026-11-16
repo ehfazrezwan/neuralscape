@@ -236,15 +236,26 @@ def test_only_the_dictator_may_trigger_a_sweep(ctx, a, mcp_a, mcp_dictator, drea
 
 @proves("ext.dreaming-sweep")
 def test_schedule_dream_over_mcp_runs_a_dry_run_that_writes_nothing(ctx, b, mcp_dictator, dictator, dream: Dream):
+    """The fixture's forced sweep already stamped B's pool, and staging is incremental (only rows new or
+    changed since that stamp), so a fresh private row is written first. The MCP dry run must then stage it,
+    write nothing, and leave the pool unstamped: a second dry run stages the same row again."""
     _ready(dream)
+    marker = f"zq-{ctx.run_id}-dryrun"
+    write_raw(
+        b, f"{marker} B keeps a laminated tide table pinned inside the boat shed door.", "preference",
+        marker=marker, scope="global", visibility="private",
+    ).require()
     before = sorted(r["id"] for r in list_rows(b))
     mcp_dictator.initialize()
-    out = mcp_json(mcp_dictator, "schedule_dream", {"pool": dream.pool_b, "dry_run": True, "force": True})
-    assert out.get("status") == "enqueued" and out.get("job_id"), f"schedule_dream answered {out}"
-    result = _finish(dictator, out["job_id"])
-    assert result["dry_run"] is True, f"dry_run flag lost: {result.get('dry_run')}"
-    check_dreamt(result, dream.pool_b)
-    assert sorted(r["id"] for r in list_rows(b)) == before, "a dry-run sweep changed B's memories"
+    staged = []
+    for attempt in ("first", "second"):
+        out = mcp_json(mcp_dictator, "schedule_dream", {"pool": dream.pool_b, "dry_run": True, "force": True})
+        assert out.get("status") == "enqueued" and out.get("job_id"), f"{attempt} schedule_dream answered {out}"
+        result = _finish(dictator, out["job_id"])
+        assert result["dry_run"] is True, f"{attempt}: dry_run flag lost: {result.get('dry_run')}"
+        staged.append(check_dreamt(result, dream.pool_b)["staged"])  # >= 1: the fresh row is new since the last stamp
+        assert sorted(r["id"] for r in list_rows(b)) == before, f"the {attempt} dry-run sweep changed B's memories"
+    assert staged[1] >= 1, f"the second dry run staged {staged[1]}: the first dry run stamped the pool (staged {staged})"
 
 
 # ── deep consolidation: contradiction -> supersession ────────────
