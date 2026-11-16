@@ -257,11 +257,12 @@ async def test_heartbeat_continues_during_graph_enrichment_row_lookup(tmp_path, 
 
 @pytest.mark.asyncio
 async def test_beat_task_survives_unexpected_errors_and_logs(tmp_path, monkeypatch, caplog):
+    caplog.set_level("WARNING", logger="worker_liveness")
     calls = {"n": 0}
 
     def flaky(path=None):
         calls["n"] += 1
-        if calls["n"] == 1:
+        if calls["n"] <= 2:
             raise RuntimeError("boom")
 
     monkeypatch.setattr(wl, "beat", flaky)
@@ -269,4 +270,20 @@ async def test_beat_task_survives_unexpected_errors_and_logs(tmp_path, monkeypat
     wl.start_heartbeat(ctx, str(tmp_path / "hb"), interval=0.02)
     await asyncio.sleep(0.15)
     assert calls["n"] >= 3 and not ctx["_liveness_task"].done()
+    assert "worker heartbeat write failed" in caplog.text
     await wl.stop_heartbeat(ctx)
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_continues_during_strategy_synthesizer_scroll(tmp_path, monkeypatch):
+    from extensions.strategy_synthesizer import synthesizer as syn
+    from extensions.strategy_synthesizer.config import StrategySynthesizerSettings
+
+    def slow_scroll(service):
+        time.sleep(0.4)  # the sync Qdrant scroll
+        return []
+
+    monkeypatch.setattr(syn, "_scroll_trading_memories", slow_scroll)
+    cfg = StrategySynthesizerSettings(enabled=True)
+    n = await _beats_during(tmp_path, lambda: syn.synthesize_all(service=object(), settings=cfg))
+    assert n >= 5, "heartbeat stalled during the synthesizer's Qdrant scroll"

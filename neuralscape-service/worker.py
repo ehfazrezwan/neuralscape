@@ -1732,7 +1732,7 @@ async def startup(ctx: dict) -> None:
     configure_logging(worker=True)
     logger.info("ARQ worker starting up...")
     # First, so the healthcheck sees a beat as early as possible; the (sync)
-    # warm-up below is covered by the container's start_period.
+    # warm-up below runs in a thread, so the beat keeps going through it.
     from worker_liveness import start_heartbeat
 
     start_heartbeat(ctx)
