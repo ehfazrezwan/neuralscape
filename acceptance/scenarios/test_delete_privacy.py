@@ -39,22 +39,41 @@ def _require(cond: bool, msg: str) -> None:
     assert cond, msg
 
 
+# Isolation: every read below is made by a per-run user (acc-<runid>-a/-b) and the
+# server scopes it by the token's identity, so the fixed letters-only markers can
+# never match another run's data. Reads cover BOTH the per-run project and the
+# user-wide (global) pool: the extractor may file a personal fact (the dog's name)
+# as global scope, which a project-filtered read would not see.
+
+
 def _memories(client, project_id):
-    r = client.get("/v1/memories", params={"project_id": project_id, "limit": 100})
-    assert r.status_code == 200, f"GET /v1/memories -> {r.status_code}"
-    return r.json()
+    rows, seen = [], set()
+    for params in ({"project_id": project_id, "limit": 100}, {"limit": 100}):
+        r = client.get("/v1/memories", params=params)
+        assert r.status_code == 200, f"GET /v1/memories {params} -> {r.status_code}"
+        for m in r.json():
+            if m.get("id") not in seen:
+                seen.add(m.get("id"))
+                rows.append(m)
+    return rows
 
 
 def _episodes_text(client, project_id) -> str:
-    r = client.get("/v1/graph/episodes", params={"project_id": project_id, "limit": 100})
-    assert r.status_code == 200, f"GET /v1/graph/episodes -> {r.status_code}"
-    return r.text
+    out = []
+    for params in ({"project_id": project_id, "limit": 100}, {"limit": 100}):
+        r = client.get("/v1/graph/episodes", params=params)
+        assert r.status_code == 200, f"GET /v1/graph/episodes {params} -> {r.status_code}"
+        out.append(r.text)
+    return "\n".join(out)
 
 
 def _graph_search_text(client, project_id, query) -> str:
-    r = client.post("/v1/graph/search", json={"query": query, "project_id": project_id, "limit": 20})
-    assert r.status_code == 200, f"POST /v1/graph/search -> {r.status_code}"
-    return r.text
+    out = []
+    for body in ({"query": query, "project_id": project_id, "limit": 20}, {"query": query, "limit": 20}):
+        r = client.post("/v1/graph/search", json=body)
+        assert r.status_code == 200, f"POST /v1/graph/search -> {r.status_code}"
+        out.append(r.text)
+    return "\n".join(out)
 
 
 @pytest.fixture(scope="module")
@@ -91,7 +110,7 @@ def check_victim_absent_everywhere(client, c: Convo) -> None:
     """The real privacy check: the deleted fact is unreachable through every read surface."""
     marker = c.markers["dog"]
     assert client.get(f"/v1/memories/{c.ids['dog']}").status_code == 404, "memory still readable by id"
-    hits = client.search(marker, project_id=c.project_id)
+    hits = client.search(marker, project_id=c.project_id) + client.search(marker)
     assert not any(has(marker, h.get("memory", "")) for h in hits), "deleted fact still in search"
     assert not has(marker, _graph_search_text(client, c.project_id, marker)), "deleted fact in graph search"
     assert not has(marker, _episodes_text(client, c.project_id)), "deleted fact in episode recall"
@@ -142,7 +161,8 @@ def test_bulk_delete_leaves_nothing(a, convo):
     assert r.status_code == 200, f"bulk DELETE -> {r.status_code}: {r.text[:200]}"
     assert _memories(a, convo.project_id) == [], "memories remain after bulk delete"
     for marker in convo.markers.values():
-        assert not any(has(marker, h.get("memory", "")) for h in a.search(marker, project_id=convo.project_id))
+        hits = a.search(marker, project_id=convo.project_id) + a.search(marker)
+        assert not any(has(marker, h.get("memory", "")) for h in hits)
     eventually(
         lambda: _require(
             not any(has(m, _episodes_text(a, convo.project_id)) for m in convo.markers.values()),
