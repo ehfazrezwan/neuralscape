@@ -332,8 +332,8 @@ present. If a wipe happened and the restore fails (it is retried once) the backu
 path is in the failure detail; it is deleted only after a successful restore (or when no wipe happened).
 
 Note the graph wipe is **logical**: a bulk delete through the API removes the project's episodes; the Neo4j volume
-is not physically emptied. The graph part is proven by the after-backup marker (written to Neo4j after the backup)
-being absent once `neo4j-admin database load` has run.
+is not physically emptied. The graph part is proven both ways: the pre-backup marker being present again shows the graph was RESTORED, and the
+after-backup marker (written to Neo4j after the backup) being absent shows it was ROLLED BACK by `neo4j-admin database load`.
 
 Flow (one module fixture records, the scenarios assert): seed (raw memory -> vector search -> graph
 episode; a small uploaded file -> artifact bytes + passage; the memory's task id) -> backup (exit 0, one

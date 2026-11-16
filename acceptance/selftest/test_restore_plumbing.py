@@ -360,3 +360,89 @@ def test_the_backup_is_removed_only_when_no_wipe_happened_or_the_restore_succeed
     assert f.keep_backup  # wiped, not restored
     f.steps["restore"] = ""
     assert not f.keep_backup
+
+
+# ── the fixture's own wiring (not just the units) ────────────────
+
+
+def _scenario_module():
+    import importlib.util
+    import sys
+
+    path = Path(__file__).resolve().parents[1] / "scenarios" / "test_backup_restore.py"
+    sys.path.insert(0, str(path.parent))
+    try:
+        spec = importlib.util.spec_from_file_location("br_scenario_under_test", path)
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = mod  # dataclasses look the module up here
+        spec.loader.exec_module(mod)
+    finally:
+        sys.path.remove(str(path.parent))
+    return mod
+
+
+def _fixture_body(mod):
+    f = mod.story
+    return getattr(f, "__wrapped__", None) or f._get_wrapped_function()
+
+
+def _drive(monkeypatch, restore_fails: bool):
+    """Run the real `story` fixture body with fake steps and a fake ctx; return (story, root_exists_after_finalizer)."""
+    from types import SimpleNamespace
+
+    mod = _scenario_module()
+    monkeypatch.setenv("NS_ALLOW_DESTRUCTIVE", "1")
+    monkeypatch.setattr(mod.stack, "ensure_running", lambda *a, **k: None)
+    for name in ("_preflight", "_seed", "_backup", "_after_backup_marker", "_wipe", "_prove_gone", "_post_restore",
+                 "_post_graph", "_post_task", "_post_artifact", "_fresh_write"):
+        monkeypatch.setattr(mod, name, lambda *a, **k: None)
+    monkeypatch.setattr(mod.stack, "restart_counts", lambda *a, **k: {})
+
+    def fake_restore(*a, **k):
+        if restore_fails:
+            raise AssertionError("restore broke")
+
+    monkeypatch.setattr(mod, "_restore", fake_restore)
+    ctx = SimpleNamespace(compose_project="nstest-x", run_id="r1", project_id="acc-r1-proj")
+    gen = _fixture_body(mod)(ctx, object())
+    s = next(gen)
+    root = s.root
+    try:
+        next(gen)
+    except StopIteration:
+        pass
+    return s, root.exists()
+
+
+def test_a_failed_restore_keeps_the_backup_directory_through_the_real_fixture(monkeypatch):
+    s, exists = _drive(monkeypatch, restore_fails=True)
+    try:
+        assert exists, "the fixture finalizer deleted the only copy of the data"
+        assert "KEPT at" in s.steps["restore"] and "remove that directory" in s.steps["restore"]
+    finally:
+        import shutil
+
+        shutil.rmtree(s.root, ignore_errors=True)
+
+
+def test_a_successful_restore_removes_the_backup_directory(monkeypatch):
+    s, exists = _drive(monkeypatch, restore_fails=False)
+    assert not exists
+
+
+def test_the_fixture_gate_refuses_without_the_switch_and_for_foreign_projects(monkeypatch):
+    from types import SimpleNamespace
+
+    mod = _scenario_module()
+    monkeypatch.delenv("NS_ALLOW_DESTRUCTIVE", raising=False)
+    with pytest.raises(pytest.skip.Exception, match="NS_ALLOW_DESTRUCTIVE"):
+        mod._gate(SimpleNamespace(compose_project="nstest-x"))
+    monkeypatch.setenv("NS_ALLOW_DESTRUCTIVE", "1")
+    for bad in ("neuralscape", "somethingelse"):
+        with pytest.raises(guard.GuardError):
+            mod._gate(SimpleNamespace(compose_project=bad))
+    mod._gate(SimpleNamespace(compose_project="nstest-x"))  # allowed
+    # and the real fixture body goes through the same gate: nothing is created when it refuses
+    monkeypatch.delenv("NS_ALLOW_DESTRUCTIVE")
+    with pytest.raises(pytest.skip.Exception):
+        next(_fixture_body(mod)(SimpleNamespace(compose_project="nstest-x", run_id="r", project_id="p"), object()))

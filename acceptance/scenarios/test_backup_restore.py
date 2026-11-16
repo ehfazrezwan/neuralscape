@@ -54,6 +54,7 @@ SEARCH_WAIT = 120
 TASK_WAIT = 180
 BACKUP_TIMEOUT = 1800
 STEP_TIMEOUT = 900
+QDRANT_COLLECTION = os.environ.get("NS_QDRANT_COLLECTION", "neuralscape_memories")
 PARTS = {"redis", "qdrant", "files", "neo4j"}
 
 
@@ -90,7 +91,7 @@ def check_gone(check, *args) -> None:
     raise AssertionError(f"{check.__name__} still passes: the data is still there")
 
 
-def check_backup_layout(root: Path, db: str = "memory") -> Path:
+def check_backup_layout(root: Path, db: str = "memory", collection: str | None = None) -> Path:
     """One complete ``ns-backup-<stamp>`` (no ``.partial`` left), MANIFEST with every
     part, every part's files present and non-empty. Returns the backup directory."""
     root = Path(root)
@@ -112,6 +113,8 @@ def check_backup_layout(root: Path, db: str = "memory") -> Path:
         assert f.is_file() and f.stat().st_size > 0, f"{rel} missing or empty"
     index = json.loads((b / "qdrant" / "index.json").read_text())
     assert index, "qdrant/index.json lists no collections"
+    if collection is not None:
+        assert collection in index, f"qdrant/index.json lacks the memories collection {collection!r}: {sorted(index)}"
     for name, fname in index.items():
         f = b / "qdrant" / fname
         assert f.is_file() and f.stat().st_size > 0, f"qdrant snapshot for {name} missing or empty"
@@ -182,7 +185,7 @@ def _backup(ctx, story: Story) -> None:
     story.backup_exit = proc.returncode
     story.backup_tail = scrub((proc.stderr or "")[-400:])
     assert proc.returncode == 0, f"backup-volumes.sh exited {proc.returncode}: {story.backup_tail}"
-    story.backup_dir = check_backup_layout(story.root, restore.neo4j_database())
+    story.backup_dir = check_backup_layout(story.root, restore.neo4j_database(), QDRANT_COLLECTION)  # before any wipe
     out = (proc.stdout or "").strip().splitlines()
     assert out and Path(out[-1]).resolve() == story.backup_dir.resolve(), f"script printed {out[-1:]!r}, found {story.backup_dir}"
     check_checksums(story.backup_dir)
@@ -352,7 +355,8 @@ def story(ctx, a):
         run_flow(flow, fns)
         if flow.keep_backup:
             # The backup is the only copy of the data: leave it for the operator, say where.
-            note = f"; the backup is KEPT at {s.root} (restore it by hand per scripts/backup-volumes.sh)"
+            note = (f"; the backup is KEPT at {s.root} (restore it by hand per scripts/backup-volumes.sh, "
+                    "then remove that directory)")
             s.steps["restore"] = (s.steps.get("restore") or "restore did not run") + note
         yield s
     finally:
@@ -458,6 +462,8 @@ def test_layout_check_fails_for_partial_empty_or_incomplete_backups(tmp_path):
     (good / "MANIFEST.txt").write_text("parts=redis qdrant files neo4j\n")
     assert check_backup_layout(root) == good  # complete: passes
     (good / "redis" / "dump.rdb").write_text("")
+    assert check_backup_layout(root, collection="c") == good
+    expect_check_fails(check_backup_layout, root, "memory", "neuralscape_memories")  # the memories collection is not in the backup
     expect_check_fails(check_backup_layout, root)  # an empty part
     (good / "redis" / "dump.rdb").write_text("r")
     (good / "qdrant" / "c.snap").unlink()
