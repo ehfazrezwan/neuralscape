@@ -611,6 +611,13 @@ class Settings(BaseSettings):
     # {} instead of crashing pydantic's JSON source parser at startup.
     code_op_preference: Annotated[dict[str, list[str]], NoDecode] = {}
 
+    # Bound (seconds) on how long a process may serve a cached per-project
+    # knowledge config before re-reading the cross-process store. A config the
+    # ingest worker rewrites at index time becomes visible to a long-running API
+    # process within this bound. Same-process writes are always immediate. 0
+    # disables the cache (every read re-checks the store).
+    knowledge_config_cache_ttl_s: float = 5.0
+
     # Auth
     # Legacy single shared API key. When set without `neuralscape_user_token_secret`,
     # all requests must present this exact token in `Authorization: Bearer ...` and

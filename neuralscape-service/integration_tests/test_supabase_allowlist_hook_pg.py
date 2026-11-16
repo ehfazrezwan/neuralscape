@@ -136,6 +136,31 @@ def test_hook_denies_addresses_with_more_than_one_at_sign(hook_db):
     assert _hook(hook_db, "x@corp.example") == {}
 
 
+def test_hook_denies_whitespace_control_and_invisible_characters(hook_db):
+    """Same rule as ``allowlist.py``: the raw value is judged, never trimmed.
+
+    Keep in step with ``tests/test_email_allowlist.py`` (the Python table).
+    """
+
+    hook_db.execute("insert into public.signup_email_domains (domain) values ('corp.example')")
+    hook_db.execute("insert into public.signup_email_addresses (email) values ('guest@elsewhere.example')")
+    for email in (
+        "  x@corp.example  ",
+        "x@corp.example ",
+        "x@corp.example\n",
+        "x @corp.example",
+        "x@corp .example",
+        "x\n@corp.example",
+        "x\u2028@corp.example",  # LINE SEPARATOR
+        "x\u00a0@corp.example",  # NBSP
+        "x\u200b@corp.example",  # zero-width space
+        "x\uff20corp.example",  # full-width commercial at: no '@' at all
+    ):
+        assert _denied(_hook(hook_db, email)), repr(email)
+    for email in ("x@corp.example", "X@CORP.EXAMPLE", "\u00e9@corp.example", "Guest@Elsewhere.example"):
+        assert _hook(hook_db, email) == {}, repr(email)
+
+
 def test_hook_function_pins_an_empty_search_path(hook_db):
     config = hook_db.execute(
         "select proconfig from pg_proc where proname = 'hook_restrict_signup'"

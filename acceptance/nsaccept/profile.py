@@ -19,6 +19,8 @@ from pathlib import Path
 PLACEHOLDER_RE = re.compile(r"^<generate:(fernet|hex32)>$")
 SECRET_KEY_RE = re.compile(r"(KEY|SECRET|TOKEN|PASSWORD|PASSWD|CREDENTIAL)", re.IGNORECASE)
 REDACTED = "<redacted>"
+#: A feature switch such as ``CREDENTIALS_ENABLED=true`` has a secret-looking name but cannot hold a secret.
+BOOLEAN_VALUES = frozenset({"true", "false"})
 HEADER_RE = re.compile(r"^#\s*(services|sidecars|mounts|requires)\s*:\s*(.*)$", re.IGNORECASE)
 
 
@@ -64,7 +66,7 @@ def parse_text(text: str) -> Profile:
         ph = PLACEHOLDER_RE.match(value)
         if ph:
             prof.placeholders[key] = ph.group(1)
-        elif value and SECRET_KEY_RE.search(key):
+        elif value and SECRET_KEY_RE.search(key) and value.lower() not in BOOLEAN_VALUES:
             value = REDACTED  # never record a literal secret, whatever put it there
         prof.flags[key] = value
     return prof
