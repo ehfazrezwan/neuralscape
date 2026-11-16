@@ -77,3 +77,31 @@ def test_real_client_reports_configured_timeout(monkeypatch):
     assert store.client._client._timeout == 33
     default = q.Qdrant(collection_name="c", embedding_model_dims=4, url="http://127.0.0.1:1")
     assert default.client._client._timeout == 5
+
+
+def test_policy_migration_pool_source_sets_timeout():
+    import policy_migration as pm
+
+    assert pm.QdrantPoolSource("http://127.0.0.1:1", "c")._client._client._timeout == 30
+    assert pm.QdrantPoolSource("http://127.0.0.1:1", "c", timeout=7)._client._client._timeout == 7
+
+
+def test_no_async_qdrant_client_is_built_anywhere():
+    """The service and fork only build the sync client; if an async one appears it must take the timeout."""
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parents[2]
+    hits = [
+        str(p) for base in ("neuralscape-service", "mem0/mem0", "graphiti/graphiti_core")
+        if (root / base).is_dir()
+        for p in (root / base).rglob("*.py")
+        if "tests" not in p.parts and "integration_tests" not in p.parts and "scripts" not in p.parts
+        and "AsyncQdrantClient" in p.read_text()
+    ]
+    assert hits == []
+
+
+def test_health_probe_keeps_its_own_short_bound():
+    import main
+
+    assert main._VECTOR_STORE_PROBE_TIMEOUT_S == 2.0
