@@ -517,7 +517,8 @@ def _has_autoheal(svc: dict) -> bool:
     if isinstance(labels, list):
         labels = dict(str(i).partition("=")[::2] for i in labels)
     value = str(labels.get(_AUTOHEAL_LABEL, "")).strip("\"'").lower()
-    # `${WORKER_AUTOHEAL:-true}`: on by default, operator opt-out via .env.
+    # The label value is literal "true" or the interpolation `${WORKER_AUTOHEAL:-true}`
+    # (on by default; an operator sets WORKER_AUTOHEAL=false in .env to opt out).
     return value in ("true", "${worker_autoheal:-true}")
 
 

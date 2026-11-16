@@ -99,6 +99,14 @@ def test_check_command_bound_matches_module_constant():
     if cmd is None:
         return
     assert f"<{wl.HEARTBEAT_MAX_AGE_S} " in cmd[-1]
+    # Every worker in compose and every Helm probe carries the same literal bound.
+    data = yaml.safe_load((REPO_ROOT / "docker-compose.yml").read_text(encoding="utf-8"))
+    for name in ("neuralscape-worker", "neuralscape-graph-worker", "neuralscape-ingest-worker"):
+        assert f"<{wl.HEARTBEAT_MAX_AGE_S} " in data["services"][name]["healthcheck"]["test"][-1], name
+    tmpl = REPO_ROOT / "deploy" / "charts" / "neuralscape" / "templates"
+    for f in ("worker", "graph-worker", "ingest-worker"):
+        text = (tmpl / f"{f}-deployment.yaml").read_text(encoding="utf-8")
+        assert text.count(f"<{wl.HEARTBEAT_MAX_AGE_S} ") == 2, f"{f}: startup+liveness probes must use the bound"
     assert wl.HEARTBEAT_FILE.endswith("ns-worker.heartbeat") and "ns-worker.heartbeat" in cmd[-1]
     assert "NS_WORKER_HEARTBEAT_FILE" in cmd[-1]
 
@@ -334,4 +342,16 @@ async def test_stall_hook_is_refused_and_warned_when_a_public_url_is_set(tmp_pat
 
 def test_stall_hook_is_inert_without_the_env_var(monkeypatch):
     monkeypatch.delenv(wl.STALL_ENV, raising=False)
+    assert wl._stall_requested() is False
+
+
+@pytest.mark.asyncio
+async def test_second_opt_in_allows_the_stall_with_a_public_url(tmp_path, monkeypatch):
+    stall = tmp_path / "stall"
+    stall.touch()
+    monkeypatch.setenv(wl.STALL_ENV, str(stall))
+    monkeypatch.setenv(wl.ALLOW_PUBLIC_ENV, "1")
+    monkeypatch.setattr(worker.settings, "neuralscape_public_url", "https://ns.example.com")
+    assert wl._stall_requested() is True
+    monkeypatch.setenv(wl.ALLOW_PUBLIC_ENV, "0")
     assert wl._stall_requested() is False

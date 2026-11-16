@@ -42,6 +42,7 @@ def beat(path: str | None = None) -> None:
 
 
 STALL_ENV = "NS_TEST_STALL_HEARTBEAT_FILE"
+ALLOW_PUBLIC_ENV = "NS_TEST_HOOKS_ALLOW_WITH_PUBLIC_URL"
 _stall_refused_logged = False
 
 
@@ -49,8 +50,9 @@ def _stall_requested() -> bool:
     """Test-only fault: while the file named by ``NS_TEST_STALL_HEARTBEAT_FILE`` exists, stop beating.
 
     Reversible (delete the file). Refused, with a warning, whenever the deployment
-    has a public URL configured (``NEURALSCAPE_PUBLIC_URL``), so it can never be
-    switched on in an internet-facing deployment.
+    has a public URL configured (``NEURALSCAPE_PUBLIC_URL``), unless a second,
+    explicit opt-in ``NS_TEST_HOOKS_ALLOW_WITH_PUBLIC_URL=1`` is also set (the
+    flags-on acceptance profile sets a public URL). Neither is set by default.
     """
     global _stall_refused_logged
     target = os.environ.get(STALL_ENV)
@@ -58,10 +60,13 @@ def _stall_requested() -> bool:
         return False
     from config import settings
 
-    if settings.neuralscape_public_url:
+    if settings.neuralscape_public_url and os.environ.get(ALLOW_PUBLIC_ENV) != "1":
         if not _stall_refused_logged:
             _stall_refused_logged = True
-            logger.warning("%s ignored: NEURALSCAPE_PUBLIC_URL is set (not a test deployment)", STALL_ENV)
+            logger.warning(
+                "%s ignored: NEURALSCAPE_PUBLIC_URL is set (set %s=1 to allow it in a test profile)",
+                STALL_ENV, ALLOW_PUBLIC_ENV,
+            )
         return False
     return os.path.exists(target)
 
