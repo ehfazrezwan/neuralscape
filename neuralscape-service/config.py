@@ -85,6 +85,9 @@ def process_env_or(name: str, configured: str) -> str:
 # separately via ``Settings.graphiti_embedding_dim``.
 VECTOR_EMBEDDING_DIMS = 768
 
+# Default per-request timeout (seconds) for Qdrant calls; the one place the value lives.
+DEFAULT_QDRANT_TIMEOUT_S = 30
+
 # (ambient EMBEDDING_DIM, GRAPHITI_EMBEDDING_DIM) pairs already warned about.
 _AMBIENT_DIM_WARNED: set = set()
 
@@ -183,6 +186,9 @@ class Settings(BaseSettings):
     qdrant_on_disk: bool = True
     qdrant_path: str = "~/.neuralscape/qdrant"  # only used when qdrant_url is not set
     qdrant_collection: str = "neuralscape_memories"
+    # Per-request timeout (seconds) for every call the service makes to Qdrant. qdrant-client's
+    # own default is 5 s, which a loaded host can exceed on pool scrolls and large retrieves.
+    qdrant_timeout: int = Field(default=DEFAULT_QDRANT_TIMEOUT_S, ge=1)
 
     # Redis / ARQ
     redis_url: str = "redis://localhost:6379"
@@ -1334,6 +1340,7 @@ class Settings(BaseSettings):
         qdrant_config: dict = {
             "collection_name": self.qdrant_collection,
             "embedding_model_dims": VECTOR_EMBEDDING_DIMS,
+            "timeout": self.qdrant_timeout,
         }
         if self.qdrant_url:
             qdrant_config["url"] = self.qdrant_url
