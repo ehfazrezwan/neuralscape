@@ -1,8 +1,10 @@
 # Plan: Pluggable Knowledge Adapters + a Trading‑Strategy Learning Adapter
 
+> **Status (as of 2026-11-16, dev 6a81341f):** historical. This plan was implemented. The adapter seam, graph custom-types plumbing, the trading adapter (`adapters/trading/`) and the `strategy_synthesizer` extension (`extensions/strategy_synthesizer/`) are built; the book-ingest step is an operator action, and the graph-to-strategy compiler and ensemble work (its Phases 5 and 6) live in the consuming platform, not here. Current truth: [22-knowledge-adapters](./neuralscape/22-knowledge-adapters.md) and [23-knowledge-adapters-implementation-notes](./neuralscape/23-knowledge-adapters-implementation-notes.md). The "Nothing here is built yet" line below describes the day it was written.
+
 **Audience:** a Claude Code session working in the `neuralscape` repo.
 **Author:** handed off from the Bellwether project (the trading platform that will *consume* this).
-**Status:** design + implementation plan. Nothing here is built yet.
+**Status when written (2026-07-02):** design + implementation plan; nothing was built yet. It has since been built (see the status note above).
 
 > This document is self‑contained. It cites the exact files/seams in `neuralscape-service` you'll
 > touch, the taxonomy to build, and the phased implementation with acceptance criteria. Verify

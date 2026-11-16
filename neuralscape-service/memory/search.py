@@ -9,7 +9,7 @@ import time
 
 from config import settings
 from schemas import MemoryResponse, MemoryVisibility
-from memory.groups import _edge_is_invalidated, _get_group_ids, _live_edges_filter
+from memory.groups import _build_group_id, _edge_is_invalidated, _get_group_ids, _live_edges_filter
 from memory.ranking import (
     RRF_K,
     _dense_score_floor,
@@ -66,7 +66,20 @@ _GRAPH_SEARCH_JOIN_TIMEOUT_S = 45.0
 import threading as _threading
 
 _graph_leg_budget_timeouts = 0
+
 _graph_leg_budget_lock = _threading.Lock()
+
+
+def _degraded_graph_result() -> dict:
+    """Empty graph-search result marked as an outage, not as "no facts"."""
+    return {
+        "edges": [],
+        "nodes": [],
+        "episodes": [],
+        "communities": [],
+        "degraded": True,
+        "error": "graph_unavailable",
+    }
 
 
 def _note_graph_leg_budget_timeout() -> int:
@@ -1235,26 +1248,27 @@ class SearchMixin:
         def _standard_groups() -> list[str]:
             if not settings.standards_enabled:
                 return []
-            return ["standard"] + ([f"standard--project--{project_id}"] if project_id else [])
+            return ["standard"] + ([_build_group_id("standard", "", project_id)] if project_id else [])
+
+        def _private_groups() -> list[str]:
+            groups = [_build_group_id("private", user_id)]
+            if project_id:
+                groups.append(_build_group_id("private", user_id, project_id))
+            return groups
 
         if visibility == MemoryVisibility.PRIVATE.value:
-            group_ids = [f"user--{user_id}"]
-            if project_id:
-                group_ids.append(f"user--{user_id}--project--{project_id}")
+            group_ids = _private_groups()
         elif visibility == MemoryVisibility.STANDARD.value:
             group_ids = _standard_groups()
         elif visibility == MemoryVisibility.SHARED.value:
             group_ids = ["shared"]
             if project_id:
-                group_ids.append(f"shared--project--{project_id}")
+                group_ids.append(_build_group_id("shared", "", project_id))
         elif not include_shared:
             # No explicit visibility, but caller opted out of shared pool.
             # Standards remain in-scope — they are binding and independent of
             # the shared opt-out.
-            group_ids = [f"user--{user_id}"]
-            if project_id:
-                group_ids.append(f"user--{user_id}--project--{project_id}")
-            group_ids += _standard_groups()
+            group_ids = _private_groups() + _standard_groups()
         else:
             # Default: full read-set (caller's private + shared + standard).
             group_ids = _get_group_ids(user_id, project_id)
@@ -1265,7 +1279,19 @@ class SearchMixin:
         # can never widen who may read. Default (None) is unchanged.
         if workspaces:
             refs = [w for w in workspaces if w != "memory"]
-            ws_groups = [f"{g}--ws--{w}" for g in group_ids for w in refs]
+            # Name each workspace group through the builder (the injective
+            # encoding covers the whole tuple, so a suffix cannot be appended
+            # to an encoded base). The caller's possible bases are mapped back
+            # to their placement by building them, not by parsing names.
+            placements: dict[str, tuple[str, str, str | None]] = {}
+            for pool, owner in (("private", user_id), ("shared", ""), ("standard", "")):
+                for pid in (None, project_id):
+                    placements.setdefault(_build_group_id(pool, owner, pid), (pool, owner, pid))
+            ws_groups = [
+                _build_group_id(*placements[g], workspace=w)
+                for g in group_ids
+                for w in refs
+            ]
             group_ids = (group_ids if "memory" in workspaces else []) + ws_groups
 
         return self._do_graph_search(
@@ -1469,10 +1495,17 @@ class SearchMixin:
             search_config: Optional SearchConfig dict override
 
         Returns:
-            Dict with edges, nodes, episodes, communities.
+            Dict with edges, nodes, episodes, communities. When the graph is
+            configured but the search fails, the lists are empty and the dict
+            also carries ``"degraded": True, "error": "graph_unavailable"``
+            (absent on success). A graph that is not configured at all returns
+            the plain empty lists, unchanged.
         """
         g = self._get_graphiti()
         if g is None:
+            if getattr(self, "_graph_init_error", None):
+                # Configured but failed to initialise: an outage, not "off".
+                return _degraded_graph_result()
             return {"edges": [], "nodes": [], "episodes": [], "communities": []}
 
         from graphiti_core.search.search_config import SearchConfig
@@ -1507,35 +1540,38 @@ class SearchMixin:
                     search_filter=_live_edges_filter(),
                 )
             )
-
-            return {
-                "edges": [
-                    {
-                        "uuid": e.uuid,
-                        "name": e.name,
-                        "fact": e.fact,
-                        "valid_at": _dt_to_iso(getattr(e, "valid_at", None)),
-                        "invalid_at": _dt_to_iso(getattr(e, "invalid_at", None)),
-                        "created_at": _dt_to_iso(getattr(e, "created_at", None)),
-                    }
-                    for e in results.edges
-                ],
-                "nodes": [
-                    {"uuid": n.uuid, "name": n.name, "summary": n.summary}
-                    for n in results.nodes
-                ],
-                "episodes": [
-                    {"uuid": ep.uuid, "name": ep.name, "content": ep.content}
-                    for ep in results.episodes
-                ],
-                "communities": [
-                    {"uuid": c.uuid, "name": c.name}
-                    for c in results.communities
-                ],
-            }
         except Exception as e:
+            # An outage (Neo4j down, bridge timeout, Graphiti error) must not
+            # read as "no facts": mark the empty result degraded so REST and
+            # MCP callers can tell the two apart.
             logger.error(f"Graph search failed: {e}")
-            return {"edges": [], "nodes": [], "episodes": [], "communities": []}
+            return _degraded_graph_result()
+
+        return {
+            "edges": [
+                {
+                    "uuid": e.uuid,
+                    "name": e.name,
+                    "fact": e.fact,
+                    "valid_at": _dt_to_iso(getattr(e, "valid_at", None)),
+                    "invalid_at": _dt_to_iso(getattr(e, "invalid_at", None)),
+                    "created_at": _dt_to_iso(getattr(e, "created_at", None)),
+                }
+                for e in results.edges
+            ],
+            "nodes": [
+                {"uuid": n.uuid, "name": n.name, "summary": n.summary}
+                for n in results.nodes
+            ],
+            "episodes": [
+                {"uuid": ep.uuid, "name": ep.name, "content": ep.content}
+                for ep in results.episodes
+            ],
+            "communities": [
+                {"uuid": c.uuid, "name": c.name}
+                for c in results.communities
+            ],
+        }
 
     def keyword_search(
         self,

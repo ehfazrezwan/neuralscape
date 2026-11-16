@@ -1486,8 +1486,8 @@ def test_readiness_publication_freezes_nested_model_before_stored_name_hook() ->
     with pytest.raises(ValidationError):
         _validate_publication(candidate)
 
-    assert name.calls > 0
-    assert child.capability == "api_acceptance"
+    assert name.calls == 0  # the stored name is read as plain text: its hook never runs
+    assert child.capability == ""
 
 
 def test_readiness_publication_freezes_tuple_before_traversal_hook() -> None:
@@ -1572,8 +1572,8 @@ def test_readiness_publication_retains_invalid_root_before_name_hook_repair() ->
     with pytest.raises(ValidationError):
         _validate_publication(candidate)
 
-    assert name.calls > 0
-    assert candidate.tenant_id == "tenant-a"
+    assert name.calls == 0
+    assert candidate.tenant_id == ""
 
 
 def test_capability_receiver_retains_invalid_scalar_before_name_hook_repair() -> None:
@@ -1587,8 +1587,8 @@ def test_capability_receiver_retains_invalid_scalar_before_name_hook_repair() ->
     with pytest.raises(ValidationError):
         evaluate(candidate)
 
-    assert name.calls > 0
-    assert candidate.capability == "exact_reads"
+    assert name.calls == 0
+    assert candidate.capability == ""
 
 
 def test_readiness_publication_preserves_valid_tuple_subclass() -> None:
@@ -1633,8 +1633,8 @@ def test_readiness_publication_freezes_later_model_edge_before_name_callback() -
     with pytest.raises(ValidationError):
         _validate_publication(candidate)
 
-    assert name.calls > 0
-    assert candidate.capabilities is replacement
+    assert name.calls == 0
+    assert candidate.capabilities is original_edge
     assert original_edge[0].capability == ""
 
 
@@ -1645,7 +1645,7 @@ def test_readiness_publication_preserves_benign_string_subclass_name() -> None:
     result = _validate_publication(candidate)
 
     assert result.tenant_id == "tenant-a"
-    assert name.calls > 0
+    assert name.calls == 0
 
 
 def test_readiness_boundaries_preserve_absent_fields_set_policy() -> None:
@@ -1698,29 +1698,29 @@ def test_public_first_lazy_capability_is_captured_at_first_observation_not_entry
     # when the iterator first exposes it, so a callback that runs earlier in the
     # same call may change it first.  Entry-time capture is not promised.
     candidate, child, divergent = _public_only_invalid_capability_case()
-    name = _install_repairing_stored_name(
-        candidate,
-        lambda: _set_native_field(child, "capability", "exact_reads"),
+    extras = RepairingEmptyExtraMapping(
+        lambda: _set_native_field(child, "capability", "exact_reads")
     )
+    PYDANTIC_EXTRA_DESCRIPTOR.__set__(candidate, extras)
 
     result = _validate_publication(candidate)
 
-    assert name.calls > 0
+    assert extras.calls > 0
     assert divergent.calls == 1
     assert result.capabilities[0].capability == "exact_reads"
 
 
 def test_public_first_lazy_capability_is_frozen_once_first_observed() -> None:
     candidate, child, divergent = _public_only_invalid_capability_case()
-    name = _install_repairing_stored_name(
-        child,
-        lambda: _set_native_field(child, "capability", "exact_reads"),
+    extras = RepairingEmptyExtraMapping(
+        lambda: _set_native_field(child, "capability", "exact_reads")
     )
+    PYDANTIC_EXTRA_DESCRIPTOR.__set__(child, extras)
 
     with pytest.raises(ValidationError):
         _validate_publication(candidate)
 
-    assert name.calls > 0
+    assert extras.calls > 0
     assert divergent.calls == 1
     assert child.capability == "exact_reads"
 
