@@ -10,7 +10,7 @@ Surfaces: ``POST /v1/memories/raw`` (with an ``Idempotency-Key``), ``GET /v1/mem
 ``POST /v1/ingest/files`` (an OKF bundle), ``POST /v1/portability/exports``.
 
 Some steps are written against behaviour a later slice delivers and carry ``@expected_red(...)`` with the
-slice and its lane: they run, they fail honestly today, and they are never skipped or loosened.
+slice: they run, they fail honestly today, and they are never skipped or loosened.
 """
 
 from __future__ import annotations
@@ -292,7 +292,8 @@ def test_the_saved_fact_is_recalled_by_its_owner_and_by_the_other_user_while_sha
 
 @proves("read.hybrid-search-core", "model.visibility-tiers")
 @negative_control
-def test_recall_check_fails_for_a_marker_that_was_never_written(b, story):
+def test_recall_check_fails_for_a_marker_that_was_never_written(a, b, story):
+    check_recalled(a, story.ctl, f"{story.ctl} harbour bell dusk")  # the same check passes for a real marker first
     expect_check_fails(check_recalled, b, f"{story.old}-never", story.q_old)
 
 
@@ -318,6 +319,7 @@ def test_the_correction_replaces_the_recalled_text_and_keeps_the_record(story):
 @proves("edit.patch-memory")
 @negative_control
 def test_correction_check_fails_for_the_replaced_text(story):
+    check_row_text(story.row_after_correct, story.new)  # the same check passes for the corrected text first
     expect_check_fails(check_row_text, story.row_after_correct, story.old)
 
 
@@ -423,7 +425,8 @@ def test_the_other_users_export_carries_nothing_of_the_narrowed_record(story):
 
 @proves("ingest.okf-export")
 @negative_control
-def test_export_check_fails_for_the_other_user(b, story):
+def test_export_check_fails_for_the_other_user(a, b, story):
+    check_export_carries(a, story.new)  # the same check passes for the owner first
     expect_check_fails(check_export_carries, b, story.new)
 
 
@@ -444,7 +447,8 @@ def test_the_record_restored_from_the_bundle_is_the_corrected_one_and_stays_priv
 
 @proves("ingest.okf-bundle-import")
 @negative_control
-def test_restore_check_fails_for_the_user_the_record_was_never_shared_with(b, story):
+def test_restore_check_fails_for_the_user_the_record_was_never_shared_with(a, b, story):
+    check_recalled(a, story.new, story.q_new)  # the same check passes for the owner first
     expect_check_fails(check_recalled, b, story.new, story.q_new)
 
 

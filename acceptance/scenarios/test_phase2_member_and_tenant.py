@@ -1,7 +1,7 @@
 """The member journey and two real tenants (profile ``phase2``; gaps O-18 and E-06).
 
 Both are written against behaviour that later Phase 2 slices deliver, so every positive scenario here
-carries ``@expected_red`` with its slice and lane. They run and fail honestly today; nothing is skipped.
+carries ``@expected_red`` with its slice. They run and fail honestly today; nothing is skipped.
 
 Member journey (gap O-18). The tenant's first administrator is created by an operator (the gate binds
 acceptance user A as that administrator before the run). A invites a new person, the person joins with the
@@ -132,7 +132,7 @@ def test_join_check_fails_for_an_invite_nobody_issued(journey):
 
 
 @proves("archive.phase2-onb", "model.visibility-tiers")
-@expected_red(RED_ONBOARDING_POLICY)
+@expected_red(RED_MEMBERSHIP)  # first failing step today is the missing join; the private-capture rule itself belongs to the onboarding policy slice, reached after it
 def test_a_members_default_capture_is_private_to_them_and_never_team_visible(journey):
     assert journey.join.status == 200, f"the member never joined: {journey.join.describe()}"
     if journey.capture.status != 202 and not journey.capture.ok:
@@ -151,7 +151,7 @@ def _must_not_recall(client: NSClient, marker: str, words: str = "harbour kiosk 
     assert not any(marker in h.get("memory", "") for h in hits), f"{marker} was recalled"
 
 
-@proves("archive.phase2-onb", "model.visibility-tiers")
+@proves("model.visibility-tiers")
 @negative_control
 def test_not_recalled_check_fails_for_a_fact_shared_with_the_team(a, b, ctx):
     """The 'nobody else recalls it' check must be able to fail: a SHARED fact is recalled by the other member."""
@@ -218,9 +218,12 @@ def tenants(ctx, a) -> Tenants:
         t.t2_export_text = bundle_text(okf_export(t.t2))
     except AssertionError as exc:
         t.error = str(exc)
-    t.a_blind_to_t2 = _held(lambda: _must_not_recall(a, t.t2_marker))
     own_q = f"{t.t2_marker} tenant two crane log blue folder"
     t.t2_own_rest = _held(lambda: eventually(lambda: check_recalled(t.t2, t.t2_marker, own_q), timeout=90, what="tenant two recalls its own record over REST"))
+    if not t.t2_own_rest:  # only meaningful once tenant two's own record is known to be recallable
+        t.a_blind_to_t2 = _held(lambda: _must_not_recall(a, t.t2_marker))
+    else:
+        t.a_blind_to_t2 = "not checked: tenant two's own record was not recallable"
     try:
         t.t2_mcp.initialize()
         t.mcp_t2_hits = json.dumps(mcp_json(t.t2_mcp, "recall_memories", {"query": f"{t.shared_marker} berth plan harbour board", "limit": 20}))
@@ -263,7 +266,7 @@ def test_a_record_shared_inside_one_tenant_is_not_shared_into_the_other_over_res
     assert not tenants.a_blind_to_t2, f"tenant one recalled tenant two's private record: {tenants.a_blind_to_t2}"
 
 
-@proves("archive.phase2-ten", "model.visibility-tiers")
+@proves("model.visibility-tiers")
 @negative_control
 def test_recall_check_fails_for_a_same_tenant_user_reading_a_private_record(a, b, ctx):
     from nsaccept.helpers import write_raw

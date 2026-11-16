@@ -48,7 +48,7 @@ failure message, which the results JSON already carries in `detail`.
 | durable write cutover | accepted receipt; correction names and returns a revision; replay of the original write; stale edit refused; the receipt survives an API restart |
 | portable export | tenant export is a verified bundle only its owner downloads |
 | membership and onboarding | scoped credentials (issuing needs `manage_credentials`), including revoke; invite, join and list |
-| onboarding policy | a member's default capture is private |
+| onboarding policy | (none today) the private-capture rule is reached only after a member can join, so its scenario is labelled membership and onboarding |
 | tenant cells | two real tenants (needs `NS_TOKEN_T2` and `NS_USER_T2`) |
 
 ## Evidence rule
