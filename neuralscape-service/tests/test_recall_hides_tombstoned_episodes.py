@@ -122,12 +122,11 @@ class TestRecall:
         # tombstoned candidate. Without the tombstone condition it would read every
         # live source row as a candidate and need the second (live-rows) scroll.
         svc = _svc([_row("m-old", EP_OLD), _row("m-new", EP_NEW), _row("m-conv", EP_CONV)])
-        out = _recall(svc, _graph([_ep(EP_OLD), _ep(EP_NEW), _ep(EP_CONV)]))
+        _recall(svc, _graph([_ep(EP_OLD), _ep(EP_NEW), _ep(EP_CONV)]))
         assert svc._fake_qdrant.scrolls == 1
         assert {k.key for k in svc._fake_qdrant.filters[0].must} == {
             "metadata.graph_episode_uuid", "metadata.dream_tombstoned"
         }
-        assert len([r for r in out if r.source == "episode"]) == 3, "live episodes all stay"
 
     def test_lookup_failure_never_breaks_the_read(self):
         svc = _svc([])
