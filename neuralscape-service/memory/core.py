@@ -337,6 +337,22 @@ class CoreMixin:
         # collection each time.
         ("metadata.graph_episode_uuid", "keyword"),
         ("metadata.graph_episode_name", "keyword"),
+        # Edit compare-and-set (memory/edit.py): every edit's conditional write
+        # filters on the row's revision and token, and the repair crons scroll
+        # on the pending markers. These are top-level payload keys (not under
+        # ``metadata``); ``metadata.revision`` is the legacy mirror the same
+        # filter falls back to for rows written before the top-level revision.
+        ("ns_revision", "integer"),
+        ("ns_token", "keyword"),
+        ("ns_text_revision", "integer"),
+        ("ns_meta_pending", "bool"),
+        ("ns_meta_pending_at", "float"),
+        ("ns_meta_repair_attempts", "integer"),
+        ("vector_pending", "bool"),
+        ("vector_pending_at", "float"),
+        ("vector_revision", "integer"),
+        ("vector_repair_attempts", "integer"),
+        ("metadata.revision", "integer"),
     )
 
     # After a failed attempt, do not retry on every search against a flaky
@@ -368,6 +384,8 @@ class CoreMixin:
             schema_by_name = {
                 "bool": PayloadSchemaType.BOOL,
                 "keyword": PayloadSchemaType.KEYWORD,
+                "integer": PayloadSchemaType.INTEGER,
+                "float": PayloadSchemaType.FLOAT,
             }
             client = self._get_memory().vector_store.client
             for field_name, schema_name in self._FILTER_INDEX_FIELDS:
