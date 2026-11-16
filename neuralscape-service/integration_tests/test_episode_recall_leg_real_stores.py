@@ -88,34 +88,54 @@ def test_episode_row_is_found_on_a_default_recall_across_all_groups(svc, unique_
     """The request shape of the REST route with only ``query``, ``project_id`` and ``limit``: no scope, no
     visibility, shared pool included, so the graph legs search the caller's private, shared and project
     groups together. The fulltext group filter used to require only the LAST group of that list, so an
-    episode in the caller's private project group never matched."""
+    episode in the caller's private project group never matched.
+
+    The episode comes from a CONVERSATION write (``extract_and_store``, the entry point the service uses):
+    its episode is the transcript while the stored memory is the extractor's distilled fact, so the two are
+    not content twins. A raw write would not do: its episode text equals the memory text, and recall's
+    twin-drop (``_deduplicate_responses``) then correctly returns that text once, as the memory row."""
     from memory.groups import _build_group_id, _get_group_ids
 
     flags(graph_episode_recall_enabled=True)
     user, project = unique_ns.user_id, unique_ns.project_id
-    token = f"Marblequill{uuid.uuid4().hex[:8]}"
-    fact = f"The {token} gateway terminates its tunnels in the Oslo region."
+    token = "Marblequill"  # letters only: the extractor keeps an invented proper noun but drops digit suffixes
     group = _build_group_id("private", user, project)
     unique_ns.on_cleanup(lambda: (
         svc.delete_memories(user_id=user, include_shared=True),
         _cypher(svc, "MATCH (n {group_id: $g}) DETACH DELETE n", g=group),
     ))
 
-    stored, created = svc.store_raw(
-        content=fact, user_id=user, category="tech_stack", visibility="private", project_id=project,
-        add_to_graph=False, return_created=True,
+    messages = [
+        {"role": "user", "content": (
+            f"For my notes: the {token} gateway is where we terminate our tunnels, and as far as I can "
+            "tell it runs out of the Oslo datacentre these days."
+        )},
+        {"role": "assistant", "content": "Understood, I will keep that in mind."},
+    ]
+    stored = svc.extract_and_store(messages, user_id=user, project_id=project)
+    assert stored, "the extractor stored no memory from the conversation"
+    episode_rows = _cypher(
+        svc, "MATCH (e:Episodic {group_id: $g}) WHERE e.content CONTAINS $t RETURN e.content AS c", g=group, t=token
     )
-    assert created and stored
-    assert svc.enrich_graph(content=fact, user_id=user, project_id=project, visibility="private",
-                            memory_id=stored[0].id) is True
-    assert _cypher(svc, "MATCH (e:Episodic {group_id: $g}) WHERE e.content CONTAINS $t RETURN e.uuid AS u",
-                   g=group, t=token), "the episode was not written to the graph"
+    assert episode_rows, "the episode was not written to the graph"
+
+    # Precondition: no stored memory is a content twin of the episode row recall would build from it. A
+    # verbatim extraction would make recall drop the episode row as a twin of the memory row and this test
+    # would fail for a reason that has nothing to do with the group filter.
+    episode_text = svc.normalize_memory_content(f"[verbatim session excerpt] {episode_rows[0]['c']}")
+    for memory in stored:
+        twin = svc.find_duplicate_content(svc.normalize_memory_content(memory.memory), [episode_text])
+        assert twin is None, (
+            f"precondition: the extractor kept {memory.memory!r} verbatim from the transcript, so the episode "
+            "row would be dropped as its twin; use a transcript line the extractor will paraphrase"
+        )
+
     groups = _get_group_ids(user, project)
     assert group in groups and groups[-1] != group, "precondition: the episode's group is not the last one searched"
 
     deadline = time.monotonic() + 30
     while True:
-        results = svc.search(fact, user_id=user, project_id=project, limit=30)
+        results = svc.search(f"{token} gateway tunnels", user_id=user, project_id=project, limit=30)
         episodes = [r for r in results if r.source == "episode" and token in r.memory]
         if episodes or time.monotonic() > deadline:
             break
