@@ -184,7 +184,8 @@ def test_stop_delivers_the_real_turn_once_and_only_the_turn(lane):
     assert s.offset() == 6
     s.stop(final)
     check_sent_exactly_once(proxy, "zq-code")  # nothing new: nothing sent
-    assert len(proxy.calls(COMPILE)) == 2  # the compile trigger is not under test here (see PR #514)
+    # compile frequency is plugin policy (windowed per session since 2.9.8), not under test here
+    assert len(proxy.calls(COMPILE)) >= 1
 
 
 @needs_node
