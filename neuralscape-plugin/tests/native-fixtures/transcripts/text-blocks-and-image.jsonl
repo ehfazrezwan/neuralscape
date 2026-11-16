@@ -1,0 +1,2 @@
+{"message": {"content": [{"text": "Here is the failing screenshot, what does it show?", "type": "text"}, {"source": {"data": "IMAGE-BYTES-SAMPLE", "media_type": "image/png", "type": "base64"}, "type": "image"}], "role": "user"}, "sessionId": "sess-0001", "type": "user", "uuid": "u1"}
+{"message": {"content": [{"text": "The screenshot shows a timeout error on the login form after thirty seconds.", "type": "text"}], "model": "model-sample", "role": "assistant"}, "parentUuid": "u1", "sessionId": "sess-0001", "type": "assistant", "uuid": "a1"}

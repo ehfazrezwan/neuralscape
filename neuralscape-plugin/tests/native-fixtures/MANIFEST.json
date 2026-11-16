@@ -1,0 +1,28 @@
+{
+  "algorithm": "sha256",
+  "files": {
+    "README.md": "a5a8d20eda758084299e7c477f1b226dca4b7cae8c897342d7582d5ca671eb7c",
+    "events/bash-error-exit.json": "9239f2196ef2443a9d3c036616da994ba26987571bc1a53bb3fba60ad2f52425",
+    "events/bash-interrupted.json": "3453e08989c24f54b3108954ff45022ad1ea267fa96f2288585405b27244f503",
+    "events/bash-stdout-and-stderr.json": "6d73344957eab7e6daa5a3fa7dbd01375db15bad45501960558ec4f000741777",
+    "events/boring-bash.json": "6afbc7ef204511cdd5a8ebc726f1ca6e914fe6f5d0ac09a762af1e2c344c8527",
+    "events/edit-structured.json": "deb3f0d29f0997e3f303288eeb4492483508735e6dfba291a587cba80804f7aa",
+    "events/empty-response.json": "2ed8f50b7a34e585c1399ae46d12a823219f6adac4dddda6b87019345e0d59ff",
+    "events/large-response-truncated.json": "b335b5846bdcaa03408d4c066406d5a778f2aff72550d300d7d9cabf274b302b",
+    "events/legacy-tool-output-string.json": "764621db7acfde728d5098e09f3030f7376be52631fc9bc22e1684044cf97e6a",
+    "events/mcp-text-blocks.json": "f59367bae6cef6d3ae44468c61316b40084b9f0045b403ea4ee8f47c034aced7",
+    "events/own-plugin-tool.json": "b1de2b26fbc6cf4f4ee15489c0d80da6c8e55abe8cd9b0eeb249ce13cc28f753",
+    "events/private-span.json": "ccc166f912a20833f245ed2b6cba38c7d5eca8785236202aca532fb6484ab58f",
+    "events/read-tool-denied.json": "04c1adcc7a455d4cf066ae6c51db95282cc5c319db1ca3bb6a29799da1125231",
+    "events/string-response.json": "8aa55826e7d0b0a2e75f8691a6b262d914b5cfc8911398a39f2e07ee936aa914",
+    "events/write-created.json": "61d0e416604d2c35955e728da6ce53dd642ac04a6c56b651bee3e037c1ba9983",
+    "expected/events.json": "3e7e53ba0357ade4b27350197f94db1f3db5177dedddc74db3fabe24ab15f007",
+    "expected/transcripts.json": "8eb6cd62763d69b2c600b0f3d9777af399b3517753c09e23973ad43da9b9ce0b",
+    "transcripts/error-message-turn.jsonl": "942b56e11cf3510de49079b32164de76ce2dccadd8d7fd70ea080ef42b673f8e",
+    "transcripts/interrupted-final-line.jsonl": "c650c9756ae6682b8a4e8394aaf4d605178f12ac6a1ddc602fc3fedc01f0fe7b",
+    "transcripts/plain-text-turn.jsonl": "c507020876ed06531b958d8bf9e6e19125b9937b24156814c63b27a5ad7e7bb1",
+    "transcripts/summary-and-system-only.jsonl": "e7021a8edf47aa753abf9e8de6256937c54504885db62d6c8a4ec4cca48d9d4c",
+    "transcripts/text-blocks-and-image.jsonl": "7c7a23f6f981906151e5ebb94dd652c5603262c698843de3550650b1eae28223",
+    "transcripts/tool-use-and-result.jsonl": "b5b57f917f93f670d41ee7a240c0d28c58b50106ecb4dde7668b2608e6e85bad"
+  }
+}

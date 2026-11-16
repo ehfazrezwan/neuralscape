@@ -300,7 +300,7 @@ describe("buildObservationRow", () => {
   });
 
   it("captures an object tool_response as JSON (never [object Object])", () => {
-    const resp = { stdout: "built 3 files", stderr: "", interrupted: false, isImage: false };
+    const resp = { status: "built", files: 3, nested: { ok: true } };
     const row = buildObservationRow({
       tool_name: "Bash",
       tool_input: { command: "make build" },
@@ -356,5 +356,44 @@ describe("buildObservationRow", () => {
   it("ts is ISO 8601", () => {
     const row = buildObservationRow({ tool_name: "Edit" });
     expect(row.ts).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/);
+  });
+});
+
+describe("renderToolResponse shapes", () => {
+  const out = (r: unknown) => buildObservationRow({ tool_name: "Bash", tool_input: { command: "x" }, tool_response: r }).output;
+
+  it("joins text blocks and summarises non-text blocks without raw JSON", () => {
+    expect(out([{ type: "text", text: "a" }, { type: "image", source: { data: "AAAA" } }, { type: "text", text: "b" }])).toBe("a\n[image]\nb");
+  });
+  it("renders empty values as empty output", () => {
+    for (const r of [{}, [], "", null]) expect(out(r)).toBe("");
+  });
+  it("keeps stdout/stderr and adds an explicit marker when interrupted", () => {
+    expect(out({ stdout: "partial", stderr: "oops", interrupted: true })).toBe("partial\noops\n[interrupted]");
+    expect(out({ stdout: "", stderr: "", interrupted: true })).toBe("[interrupted]");
+  });
+  it("renders a non-interrupted Bash-shaped result as plain text, not JSON with escaped newlines", () => {
+    expect(out({ stdout: "line1\nline2", stderr: "warn", interrupted: false, isImage: false })).toBe("line1\nline2\nwarn");
+    expect(out({ stdout: "", stderr: "", interrupted: false })).toBe("");
+  });
+  it("renders a block's content: resource text with its uri, text without string text as JSON, image/audio as placeholders, unknown types as JSON", () => {
+    expect(out([{ type: "resource", resource: { uri: "file:///a.md", text: "doc body" } }])).toBe("[resource file:///a.md] doc body");
+    expect(out([{ type: "resource", resource: { text: "no uri" } }])).toBe("no uri");
+    expect(out([{ type: "resource", resource: { uri: "file:///b.bin", blob: "AAAA" } }])).toBe("[resource file:///b.bin]");
+    expect(out([{ type: "resource" }])).toBe('{"type":"resource"}');
+    expect(out([{ type: "text", text: 5 }])).toBe('{"type":"text","text":5}');
+    expect(out([{ type: "image", source: { data: "AAAA" } }, { type: "audio", data: "BBBB" }])).toBe("[image]\n[audio]");
+    expect(out([{ type: "tool_reference", tool_name: "x" }])).toBe('{"type":"tool_reference","tool_name":"x"}');
+  });
+  it("redacts a private span inside a resource's text", () => {
+    expect(out([{ type: "resource", resource: { uri: "file:///a", text: "ok <private>SECRET-Z" } }])).not.toContain("SECRET-Z");
+  });
+  it("renders a non-block array and other objects as JSON", () => {
+    expect(out([1, 2])).toBe("[1,2]");
+    expect(out({ a: 1 })).toBe('{"a":1}');
+  });
+  it("redacts private spans in text blocks and interrupted output", () => {
+    expect(out([{ type: "text", text: "ok <private>SECRET-X" }])).not.toContain("SECRET-X");
+    expect(out({ stdout: "ok <private>SECRET-Y", interrupted: true })).not.toContain("SECRET-Y");
   });
 });
