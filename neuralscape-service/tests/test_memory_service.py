@@ -841,6 +841,9 @@ class TestCRUD:
 
     def test_delete_memories_all_include_shared_nukes_everything(self, service):
         """include_shared=True restores the old full-nuke path."""
+        # The graph cleanup lists the user's rows first; a listing that cannot
+        # run now refuses the whole delete (MemoryListingFailed), so give it one.
+        service._scroll_all_user_memories = MagicMock(return_value=[])
         result = service.delete_memories(user_id="ehfaz", include_shared=True)
         service._memory.delete_all.assert_called_once_with(user_id="ehfaz")
 
@@ -1024,7 +1027,7 @@ class TestPatchMemory:
         service._memory.vector_store.get.return_value = _edit_point(meta=dict(_SHARED_META))
         result = service.patch_memory("m1", "robb", {"tags": ["project:bon002"]})
 
-        service._memory.update.assert_not_called()
+        service._memory._update_memory.assert_not_called()
         call = service._memory.vector_store.update.call_args
         assert call.args[0] == "m1" or call.kwargs.get("vector_id") == "m1"
         new_meta = call.kwargs["payload"]["metadata"]
@@ -1041,7 +1044,7 @@ class TestPatchMemory:
         service._memory.vector_store.get.return_value = _edit_point(meta=meta)
         service.patch_memory('m1', 'ehfaz', changes)
         if 'content' in changes:
-            stored = service._memory.update.call_args.kwargs['metadata']['metadata']
+            stored = service._memory._update_memory.call_args.kwargs['metadata']['metadata']
         else:
             stored = service._memory.vector_store.update.call_args.kwargs['payload']['metadata']
         assert 'category_evidence' not in stored
@@ -1058,7 +1061,7 @@ class TestPatchMemory:
         service._cascade_or_fallback_expire = MagicMock(return_value={"resolved": True})
         result = service.patch_memory("m1", "ehfaz", {"content": "New content"})
 
-        call = service._memory.update.call_args
+        call = service._memory._update_memory.call_args
         assert call.args[:2] == ("m1", "New content")
         nested = call.kwargs["metadata"]["metadata"]
         assert nested["category"] == "decision"
@@ -1732,6 +1735,7 @@ class TestBulkDeleteNullCategory:
         legacy delete_all sweep.
         """
         # Unfiltered + include_shared=True = legacy delete_all path
+        service._scroll_all_user_memories = MagicMock(return_value=[])
         service.delete_memories(user_id="ehfaz", include_shared=True)
         service._memory.delete_all.assert_called_once()
 
@@ -3599,16 +3603,18 @@ class TestBulkDeleteSharedProtection:
         assert "preserved 1 shared" in result["message"]
 
     def test_include_shared_true_uses_delete_all(self, service):
+        service._scroll_all_user_memories = MagicMock(return_value=[])
         service.delete_memories(user_id="alice", include_shared=True)
         service._memory.delete_all.assert_called_once_with(user_id="alice")
 
     def test_filtered_delete_skips_shared_by_default(self, service):
         """Even with a category filter, shared writes survive by default."""
-        from schemas import MemoryResponse
-        service.list_memories = MagicMock(return_value=[
-            MemoryResponse(id="t-priv", memory="x", visibility="private"),
-            MemoryResponse(id="t-share", memory="x", visibility="shared"),
-        ])
+        # The filtered sweep lists RAW mem0 dicts (so tombstones and page size stay visible).
+        service._ensure_filter_indexes = MagicMock()
+        service._memory.get_all.return_value = {"results": [
+            {"id": "t-priv", "memory": "x", "metadata": {"metadata": {"visibility": "private"}}},
+            {"id": "t-share", "memory": "x", "metadata": {"metadata": {"visibility": "shared"}}},
+        ]}
         service._memory.get.return_value = {"memory": "x", "metadata": {}}
         service._memory.delete = MagicMock()
         result = service.delete_memories(user_id="alice", category="tech_stack")
@@ -3617,11 +3623,12 @@ class TestBulkDeleteSharedProtection:
         assert "preserved 1 shared" in result["message"]
 
     def test_filtered_delete_with_include_shared_true_removes_shared(self, service):
-        from schemas import MemoryResponse
-        service.list_memories = MagicMock(return_value=[
-            MemoryResponse(id="t-priv", memory="x", visibility="private"),
-            MemoryResponse(id="t-share", memory="x", visibility="shared"),
-        ])
+        # The filtered sweep lists RAW mem0 dicts (so tombstones and page size stay visible).
+        service._ensure_filter_indexes = MagicMock()
+        service._memory.get_all.return_value = {"results": [
+            {"id": "t-priv", "memory": "x", "metadata": {"metadata": {"visibility": "private"}}},
+            {"id": "t-share", "memory": "x", "metadata": {"metadata": {"visibility": "shared"}}},
+        ]}
         service._memory.get.return_value = {"memory": "x", "metadata": {}}
         service._memory.delete = MagicMock()
         service.delete_memories(user_id="alice", category="tech_stack", include_shared=True)
