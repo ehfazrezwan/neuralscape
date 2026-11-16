@@ -25,7 +25,7 @@ class Convo:
         # The real extractor keeps an invented proper noun but drops digits/hex glued to it
         # (dev 8c3e130e: "Quillfeather<run tag>" never came back verbatim), so per-run
         # uniqueness comes from the per-run project id, not from the marker (as in #510).
-        self.markers = {"dog": "Quillfeather", "city": "Brindlemoor", "tea": "Velvetbrew"}
+        self.markers = {"dog": "Thistlewhisk", "city": "Brindlemoor", "tea": "Velvetbrew"}
         self.ids: dict[str, str] = {}     # marker key -> memory id
         self.ready = False
 
@@ -111,6 +111,9 @@ def check_victim_absent_everywhere(client, c: Convo) -> None:
     marker = c.markers["dog"]
     assert client.get(f"/v1/memories/{c.ids['dog']}").status_code == 404, "memory still readable by id"
     hits = client.search(marker, project_id=c.project_id) + client.search(marker)
+    # Exact: the deleted row's id is gone from every search result.
+    assert c.ids["dog"] not in {h.get("id") for h in hits}, "deleted memory id still in search"
+    # Broad: no row in this run's per-run user pool still carries the marker word.
     assert not any(has(marker, h.get("memory", "")) for h in hits), "deleted fact still in search"
     assert not has(marker, _graph_search_text(client, c.project_id, marker)), "deleted fact in graph search"
     assert not has(marker, _episodes_text(client, c.project_id)), "deleted fact in episode recall"
@@ -162,6 +165,8 @@ def test_bulk_delete_leaves_nothing(a, convo):
     assert _memories(a, convo.project_id) == [], "memories remain after bulk delete"
     for marker in convo.markers.values():
         hits = a.search(marker, project_id=convo.project_id) + a.search(marker)
+        left = set(convo.ids.values()) & {h.get("id") for h in hits}
+        assert not left, f"bulk-deleted memory ids still in search: {sorted(left)}"
         assert not any(has(marker, h.get("memory", "")) for h in hits)
     eventually(
         lambda: _require(
