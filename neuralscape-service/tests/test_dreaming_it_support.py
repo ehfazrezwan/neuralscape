@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import pytest
 
+from types import SimpleNamespace
+
+from integration_tests import _dreaming_support as sup
 from integration_tests._dreaming_support import DreamEnv, _is_timeout, timed
 
 
@@ -50,3 +53,56 @@ def test_failure_keeps_the_original_exception():
         with timed(env, "c"):
             raise ReadTimeout("timed out")
     assert isinstance(exc.value.__cause__, ReadTimeout)
+
+
+# ── _wait_collection_ready: retry on timeout, honour the deadline ─────
+
+
+def _ready_env(get_collection):
+    env = _env()
+    env.collection = "c"
+    env.service = SimpleNamespace(
+        _memory=SimpleNamespace(vector_store=SimpleNamespace(client=SimpleNamespace(get_collection=get_collection)))
+    )
+    return env
+
+
+def _fast_clock(monkeypatch):
+    now = [0.0]
+    monkeypatch.setattr(sup.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(sup.time, "sleep", lambda d: now.__setitem__(0, now[0] + d))
+    return now
+
+
+def test_wait_ready_retries_a_timed_out_poll_until_green(monkeypatch):
+    _fast_clock(monkeypatch)
+    calls = []
+
+    def get_collection(name):
+        calls.append(name)
+        if len(calls) < 3:
+            raise ReadTimeout("timed out")
+        return SimpleNamespace(status="green")
+
+    sup._wait_collection_ready(_ready_env(get_collection), deadline_s=30.0)
+    assert len(calls) == 3
+
+
+def test_wait_ready_keeps_polling_a_non_green_status(monkeypatch):
+    _fast_clock(monkeypatch)
+    seq = iter(["yellow", "yellow", "green"])
+    sup._wait_collection_ready(_ready_env(lambda n: SimpleNamespace(status=next(seq))), deadline_s=30.0)
+
+
+def test_wait_ready_gives_up_at_the_deadline_and_says_why(monkeypatch):
+    now = _fast_clock(monkeypatch)
+    calls = []
+
+    def get_collection(name):
+        calls.append(1)
+        raise ReadTimeout("timed out")
+
+    with pytest.raises(pytest.fail.Exception) as exc:
+        sup._wait_collection_ready(_ready_env(get_collection), deadline_s=5.0)
+    assert "not green after 5s" in str(exc.value) and "ReadTimeout" in str(exc.value)
+    assert 4 <= len(calls) <= 6 and now[0] < 8.0  # bounded by the deadline, not unbounded
