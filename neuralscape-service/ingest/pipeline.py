@@ -151,6 +151,7 @@ def ingest_document(service, doc: IngestDoc) -> dict:
     # Store failures are tolerated (one bad chunk must not abort a book) but
     # never silent: they are returned so callers can report an incomplete ingest.
     store_errors: list[str] = []
+    store_ok = 0  # successful store calls (passages + facts), for failure reports
     passage_count = 0
     fact_count = 0
     # M1 (ingest lifecycle): sum of the token cost of everything we STORE
@@ -199,6 +200,7 @@ def ingest_document(service, doc: IngestDoc) -> dict:
                     add_to_graph=False,
                 )
                 memory_ids.extend(m.id for m in stored)
+                store_ok += 1
                 passage_count += len(stored)
                 if meter_on:
                     served_tok += _served_tokens(stored)
@@ -262,6 +264,7 @@ def ingest_document(service, doc: IngestDoc) -> dict:
                        if (category, content) in category_evidence else {}),
                 )
                 memory_ids.extend(m.id for m in stored)
+                store_ok += 1
                 fact_count += len(stored)
                 if meter_on:
                     served_tok += _served_tokens(stored)
@@ -307,6 +310,7 @@ def ingest_document(service, doc: IngestDoc) -> dict:
         "parent_id": parent_id,
         # "ClassName: message" per passage/fact store that failed (empty = clean).
         "store_errors": store_errors,
+        "stores_succeeded": store_ok,
         # Deferred graph-enrichment payloads + the adapter whose ontology applies.
         # Callers (the ingest worker) enqueue these onto the graph queue and then
         # drop the key from any client-facing result.

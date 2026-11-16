@@ -260,6 +260,28 @@ class TestBundleImportReportsFailures:
         assert out["status"] == "partial"
         assert out["concepts"] == 2 and out["failed"] == 1
         assert [f["concept_id"] for f in out["failed_concepts"]] == ["b"]
+        (fc,) = out["failed_concepts"]
+        assert fc["stores_failed"] >= 1 and fc["stores_succeeded"] == 0
+
+        # a concept where some chunks store and some fail reports both numbers
+        calls = {"n": 0}
+
+        def flaky(*a, **kw):
+            calls["n"] += 1
+            if calls["n"] == 2:
+                raise RuntimeError("one chunk rejected")
+            return [MagicMock(id=f"m{calls['n']}")]
+
+        svc.store_raw.side_effect = flaky
+        long_body = "\n\n".join(f"Paragraph {i} " + "word " * 300 for i in range(6))
+        out = ingest_okf_bundle(
+            svc, files={"index.md": FILES["index.md"],
+                        "z.md": f"---\ntype: Topic\ntitle: Z\n---\n\n{long_body}\n"},
+            bundle_uri="b.zip", user_id="alice", extract_facts=False, llm_call=lambda p: "{}",
+        )
+        (fz,) = out["failed_concepts"]
+        assert fz["stores_failed"] == 1 and fz["stores_succeeded"] == calls["n"] - 1 >= 1
+        assert out["memory_ids"], "what did store is kept"
 
         svc.store_raw.side_effect = RuntimeError("down")
         out = ingest_okf_bundle(

@@ -449,6 +449,8 @@ def ingest_okf_bundle(
             summary["failed_concepts"].append({
                 "concept_id": concept.concept_id,
                 "error": _scrub(store_errors[0]),
+                "stores_failed": len(store_errors),
+                "stores_succeeded": result.get("stores_succeeded", 0),
             })
         else:
             summary["concepts"] += 1
