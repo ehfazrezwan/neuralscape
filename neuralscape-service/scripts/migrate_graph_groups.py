@@ -32,6 +32,12 @@ memory keeps its group id byte for byte, so only the listed rows need attention:
 their graph facts under the old (ambiguous) group should be re-enriched into the
 new group (edit the memory, or re-ingest it). The audit never writes anything.
 
+Safe to re-run: the rewrite is idempotent (a second run finds no legacy group and changes
+nothing). If the owner's target group (for example ``user--<owner>``) already holds data,
+the legacy rows are MERGED into it, not replaced. Each legacy group is renamed in ONE
+transaction, so a very large group can exhaust memory or hit the transaction timeout;
+batching is not implemented (a stated limit), so run it where such a group fits.
+
 Rewrites node group ids (Episodic, Entity, Community, Saga) AND edge group ids
 (``RELATES_TO`` / ``MENTIONS`` / ``HAS_MEMBER`` / ``HAS_EPISODE`` / ``NEXT_EPISODE``
 relationships), naming each target with the service's own group-id builder in the
@@ -174,6 +180,8 @@ def scan_legacy_groups(session, owner: str, fmt: str = "legacy") -> dict[str, li
 
 
 def _remaining(session, old: str) -> int:
+    # Deliberately label-less: this is the verification step, so it counts ANY node or
+    # relationship still carrying the old group id, including labels this script does not list.
     nodes = session.run("MATCH (x) WHERE x.group_id = $old RETURN count(x) AS c", old=old).single()["c"]
     rels = session.run("MATCH ()-[x]->() WHERE x.group_id = $old RETURN count(x) AS c", old=old).single()["c"]
     return nodes + rels

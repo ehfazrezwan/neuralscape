@@ -102,6 +102,16 @@ class TestMigrateGraphGroups:
         with pytest.raises(ValueError):
             rewrite_target("global", "alice", "bogus")
 
+    def test_a_non_plain_owner_is_named_by_the_builder_not_by_string_formatting(self):
+        from scripts.migrate_graph_groups import rewrite_target
+
+        # a '.' (or '--') in the owner is not injective-safe: the injective name is the nsg1-- encoding
+        injective = rewrite_target("global", "a.b", "injective")
+        assert injective.startswith("nsg1--") and "a.b" not in injective
+        assert rewrite_target("global", "a.b", "legacy") == "user--a.b"
+        assert rewrite_target("project--p", "a--b", "injective").startswith("nsg1--")
+        assert rewrite_target("global", "alice", "injective") == "user--alice"      # plain owners keep the legacy name
+
     def test_scan_covers_nodes_and_every_edge_relationship_type(self):
         from scripts.migrate_graph_groups import scan_legacy_groups
 
