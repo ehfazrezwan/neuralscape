@@ -132,6 +132,15 @@ class FakeGraph:
         for u in uuids:
             self.edges[u]["expired_at"] = datetime.now(timezone.utc)
 
+    @staticmethod
+    def _episode_clause(cypher, episodes, new_ep):
+        """Evaluate whichever episode predicate the Cypher text actually uses,
+        so the fake can't drift from the production statement."""
+        if "NOT $new_episode_uuid IN" in cypher:
+            return new_ep not in episodes
+        assert "ep <> $new_episode_uuid" in cypher, "unrecognised episode predicate"
+        return any(ep != new_ep for ep in episodes)
+
     # driver surface
     def session(self):
         graph = self
@@ -163,7 +172,7 @@ class FakeGraph:
                         if e["group_id"] == params["group_id"]
                         and e["invalid_at"] is not None
                         and e["expired_at"] >= since
-                        and params["new_episode_uuid"] not in e["episodes"]
+                        and graph._episode_clause(cypher, e["episodes"], params["new_episode_uuid"])
                     ]
                 else:
                     counts: dict[str, int] = {}
@@ -270,6 +279,44 @@ class TestSingleRowEpisode:
 
         assert not qdrant.meta("old").get("dream_tombstoned")
         assert "superseded_reason" not in qdrant.meta("old")
+
+    def test_old_edge_that_gained_the_new_episode_as_a_duplicate_is_superseded(self, env):
+        """Real-store shape (VPS gate failure): the new episode's extracted edge
+        dedups onto the old edge, Graphiti APPENDS the new episode to it and
+        then invalidates it, so the old edge cites [old, new]."""
+        svc, qdrant, graph = env
+        qdrant.add("old", user="u1", data="User lives in Paris",
+                   metadata={"graph_episode_uuid": "ep-old", "graph_episode_kind": "fact"})
+        qdrant.add("new", user="u1", data="User moved to London and no longer lives in Paris")
+        graph.add_edge("E1", "User lives in Paris", ["ep-old"])
+
+        def _add(**kw):
+            graph.edges["E1"]["episodes"].append("ep-new")  # dedup appends the new episode
+            graph.invalidate("E1")
+            return {"episode_uuid": "ep-new", "episode_name": "n"}
+
+        svc._memory.graph.add.side_effect = _add
+        _enrich(svc)
+
+        assert qdrant.meta("old")["dream_tombstoned"] is True
+        assert qdrant.meta("old")["superseded_edge_uuids"] == ["E1"]
+        assert not qdrant.meta("new").get("dream_tombstoned")
+
+    def test_edge_born_expired_by_the_new_episode_alone_is_not_a_contradiction(self, env):
+        svc, qdrant, graph = env
+        qdrant.add("old", user="u1", data="d",
+                   metadata={"graph_episode_uuid": "ep-old", "graph_episode_kind": "fact"})
+        qdrant.add("new", user="u1", data="x")
+        graph.add_edge("E1", "live old fact", ["ep-old"])
+        graph.add_edge("E2", "born expired", ["ep-new"])
+
+        def _add(**kw):
+            graph.invalidate("E2")
+            return {"episode_uuid": "ep-new", "episode_name": "n"}
+
+        svc._memory.graph.add.side_effect = _add
+        _enrich(svc)
+        assert not qdrant.meta("old").get("dream_tombstoned")
 
     def test_delete_cascade_expiry_is_not_a_contradiction(self, env):
         """A cascade only sets expired_at (no invalid_at) — must not supersede."""

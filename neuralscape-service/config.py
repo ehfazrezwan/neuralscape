@@ -90,6 +90,10 @@ _AMBIENT_DIM_WARNED: set = set()
 
 
 class Settings(BaseSettings):
+    # Logging (read by logging_config.configure_logging; `.env` values count)
+    log_level: str = "INFO"
+    log_format: str = "json"  # "json" or "console"
+
     # Gemini (direct Google AI Studio)
     google_api_key: str = ""
     gemini_llm_model: str = "gemini-3.1-flash-lite"
@@ -107,8 +111,7 @@ class Settings(BaseSettings):
     # ── Process-level flags ───────────────────────────────────────────
     # Read through ``process_env_or`` (the process environment at call time
     # first, exactly as before), so a value in the service .env applies too.
-    log_level: str = "INFO"  # logging_config.configure_logging
-    log_format: str = "json"  # "json" or "console"
+    # (log_level / log_format are declared at the top of this class.)
     neuralscape_extensions: str = ""  # comma-separated import paths (extensions discovery)
 
     # Hybrid experiments are independently opt-in; each needs its flag plus an endpoint and key.

@@ -6,12 +6,21 @@
 # on every deploy) — put machine-specific tweaks in .env or a non-tracked
 # local override, never here.
 
+# `pull_policy: never`: deploy.yml docker-loads the exact sha image and tags it
+# :latest LOCALLY on purpose. The registry no longer carries a :latest at all, and
+# an old one is an unreviewed image, so a manual `docker compose pull` (or
+# `up --pull always`) with NS_IMAGE unset must never replace the deployed build.
+# Only the deploy workflow introduces an image, by `docker load` + NS_IMAGE.
 services:
   neuralscape:
     image: ${NS_IMAGE:-ghcr.io/ehfazrezwan/neuralscape:latest}
+    pull_policy: never
   neuralscape-worker:
     image: ${NS_IMAGE:-ghcr.io/ehfazrezwan/neuralscape:latest}
+    pull_policy: never
   neuralscape-graph-worker:
     image: ${NS_IMAGE:-ghcr.io/ehfazrezwan/neuralscape:latest}
+    pull_policy: never
   neuralscape-ingest-worker:
     image: ${NS_IMAGE:-ghcr.io/ehfazrezwan/neuralscape:latest}
+    pull_policy: never
