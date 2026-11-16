@@ -134,11 +134,60 @@ def store_insights(service, batch: PoolBatch, insights: list[dict], *, dry_run: 
 # ── Diary ───────────────────────────────────────────────────────────
 
 
+#: Diary page names are ``{slug}--{DIARY_DIGEST_LEN hex}.md``.
+DIARY_SEP = "--"
+DIARY_DIGEST_LEN = 32
+#: Longest slug, in characters; a readability cap, not the safety bound.
+DIARY_SLUG_MAX_CHARS = 48
+#: The whole page name (slug + ``--`` + digest + ``.md``) stays within this many
+#: UTF-8 bytes, well under the 255-byte file-name limit of ext4 (and the
+#: temp-file name ``_atomic_write`` derives from it).
+DIARY_NAME_MAX_BYTES = 200
+DIARY_SLUG_MAX_BYTES = DIARY_NAME_MAX_BYTES - len(DIARY_SEP) - DIARY_DIGEST_LEN - len(".md")
+
+
+def _pool_digest(pool: str) -> str:
+    """Digest of the exact pool id (names the page; safe to log, unlike the id's text)."""
+    import hashlib
+
+    return hashlib.sha256(pool.encode("utf-8")).hexdigest()[:DIARY_DIGEST_LEN]
+
+
+def _log_digest(pool: str) -> str:
+    """``_pool_digest`` for log lines: never raises (an id that cannot be encoded has none)."""
+    try:
+        return _pool_digest(pool)
+    except Exception:
+        return "unavailable"
+
+
+def _cap_slug(slug: str) -> str:
+    """Cap ``slug`` by characters, then by UTF-8 bytes without cutting a character in half."""
+    slug = slug[:DIARY_SLUG_MAX_CHARS]
+    if len(slug.encode("utf-8")) > DIARY_SLUG_MAX_BYTES:
+        slug = slug.encode("utf-8")[:DIARY_SLUG_MAX_BYTES].decode("utf-8", errors="ignore")
+    return slug.strip("-")
+
+
 def diary_page_path(dreams_dir: Path, pool: str) -> Path:
+    """The pool's diary page: a readable slug, ``--``, and a hash of the EXACT pool id.
+
+    Name: ``{slug}--{32 hex}.md``. The digest is the first 32 hex (128 bits)
+    of the SHA-256 of the unmodified, case-preserving, un-normalised pool id
+    (no strip, no NFC), so distinct ids never share a page.
+
+    The pre-fix naming was ``{slug}.md`` with the slug built by ``_slugify``,
+    which collapses every run of hyphens to one, so a pre-fix name can never
+    contain ``--``. New names always do. The two name sets are therefore
+    disjoint by construction: this pool's page can never be a pre-fix file,
+    whatever pool ids exist. Pre-fix files are never read, moved or written
+    here (``Dreams/index.md`` lists their names under a separate heading).
+    This is the only place a diary name is computed.
+    """
     from extensions.conversation_compiler.obsidian_writer import _slugify
 
-    slug = _slugify(pool) or "pool"
-    return dreams_dir / f"{slug}.md"
+    slug = _cap_slug(_slugify(pool) or "pool") or "pool"
+    return dreams_dir / f"{slug}{DIARY_SEP}{_pool_digest(pool)}.md"
 
 
 def render_diary_entry(
@@ -196,7 +245,13 @@ def write_diary(
     """
     from extensions.conversation_compiler.obsidian_writer import _atomic_write
 
-    path = diary_page_path(dreams_dir, pool)
+    try:
+        path = diary_page_path(dreams_dir, pool)
+    except Exception as exc:
+        logger.warning(
+            "diary path failed for pool digest %s (non-fatal): %s", _log_digest(pool), type(exc).__name__
+        )
+        return None
     title = f"Dreams — {pool}"
     try:
         existing = path.read_text(encoding="utf-8") if path.exists() else ""
@@ -232,8 +287,12 @@ def write_diary(
     try:
         _atomic_write(path, content)
         return f"Dreams/{path.name}"
-    except Exception:
-        logger.warning("diary write failed for %s (non-fatal)", pool, exc_info=True)
+    except Exception as exc:
+        # No traceback: an OS error's message carries the page's path, whose slug is pool text.
+        logger.warning(
+            "diary write failed for pool digest %s (non-fatal): %s",
+            _log_digest(pool), type(exc).__name__,
+        )
         return None
 
 
