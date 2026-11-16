@@ -21,9 +21,18 @@ class Convo:
     def __init__(self, tag: str, project_id: str):
         self.tag = tag
         self.project_id = project_id
-        self.markers = {"dog": f"Quillfeather{tag}", "city": f"Reykjavik{tag}", "tea": f"Lapsangtea{tag}"}
+        # Letters-only invented proper nouns, matched as whole words, case-insensitively.
+        # The real extractor keeps an invented proper noun but drops digits/hex glued to it
+        # (dev 8c3e130e: "Quillfeather<run tag>" never came back verbatim), so per-run
+        # uniqueness comes from the per-run project id, not from the marker (as in #510).
+        self.markers = {"dog": "Quillfeather", "city": "Brindlemoor", "tea": "Velvetbrew"}
         self.ids: dict[str, str] = {}     # marker key -> memory id
         self.ready = False
+
+
+def has(marker: str, text: str) -> bool:
+    """Whole-word, case-insensitive marker match (the extractor may re-case words)."""
+    return re.search(rf"\b{re.escape(marker)}\b", text or "", re.IGNORECASE) is not None
 
 
 def _require(cond: bool, msg: str) -> None:
@@ -53,8 +62,8 @@ def convo(ctx, a) -> Convo:
     tag = re.sub(r"[^A-Za-z0-9]", "", ctx.run_id)[:10] or "run"
     c = Convo(tag, ctx.project_id)
     msgs = [{"role": "user", "content": (
-        f"Profile facts. My dog is named {c.markers['dog']}. I live in {c.markers['city']}. "
-        f"My favourite tea is {c.markers['tea']}."
+        f"Profile facts. My dog is named {c.markers['dog']}. I live in the town of {c.markers['city']}. "
+        f"My favourite tea is the {c.markers['tea']} blend."
     )}, {"role": "assistant", "content": "Noted."}]
     resp = a.post("/v1/memories", json={"messages": msgs, "project_id": c.project_id})
     assert resp.status_code == 202, f"POST /v1/memories -> {resp.status_code}: {resp.text[:200]}"
@@ -64,14 +73,14 @@ def convo(ctx, a) -> Convo:
     def have_facts():
         rows = _memories(a, c.project_id)
         for key, marker in c.markers.items():
-            hit = [m for m in rows if marker in m.get("memory", "")]
+            hit = [m for m in rows if has(marker, m.get("memory", ""))]
             assert hit, f"no extracted fact carries {marker}"
             c.ids[key] = hit[0]["id"]
 
     eventually(have_facts, timeout=120, what="three extracted facts stored")
     # graph enrichment runs async on the graph worker
     eventually(
-        lambda: _require(c.markers["dog"] in _episodes_text(a, c.project_id), "episode not in graph"),
+        lambda: _require(has(c.markers["dog"], _episodes_text(a, c.project_id)), "episode not in graph"),
         timeout=300, what="conversation episode in the graph",
     )
     c.ready = True
@@ -83,9 +92,9 @@ def check_victim_absent_everywhere(client, c: Convo) -> None:
     marker = c.markers["dog"]
     assert client.get(f"/v1/memories/{c.ids['dog']}").status_code == 404, "memory still readable by id"
     hits = client.search(marker, project_id=c.project_id)
-    assert not any(marker in h.get("memory", "") for h in hits), "deleted fact still in search"
-    assert marker not in _graph_search_text(client, c.project_id, marker), "deleted fact in graph search"
-    assert marker not in _episodes_text(client, c.project_id), "deleted fact in episode recall"
+    assert not any(has(marker, h.get("memory", "")) for h in hits), "deleted fact still in search"
+    assert not has(marker, _graph_search_text(client, c.project_id, marker)), "deleted fact in graph search"
+    assert not has(marker, _episodes_text(client, c.project_id)), "deleted fact in episode recall"
 
 
 @proves("delete.single", "graph.episode-cascade")
@@ -109,13 +118,13 @@ def test_deleted_fact_is_absent_everywhere_siblings_remain(a, convo):
     # ... and regain graph evidence once their re-ingest has run
     eventually(
         lambda: _require(
-            convo.markers["city"] in _episodes_text(a, convo.project_id)
-            and convo.markers["tea"] in _episodes_text(a, convo.project_id),
+            has(convo.markers["city"], _episodes_text(a, convo.project_id))
+            and has(convo.markers["tea"], _episodes_text(a, convo.project_id)),
             "siblings not back in the graph yet",
         ),
         timeout=300, what="siblings re-enriched into the graph",
     )
-    assert convo.markers["dog"] not in _episodes_text(a, convo.project_id), "deleted fact reappeared"
+    assert not has(convo.markers["dog"], _episodes_text(a, convo.project_id)), "deleted fact reappeared"
 
 
 @proves("delete.single", "auth.request-identity-resolution")
@@ -133,10 +142,10 @@ def test_bulk_delete_leaves_nothing(a, convo):
     assert r.status_code == 200, f"bulk DELETE -> {r.status_code}: {r.text[:200]}"
     assert _memories(a, convo.project_id) == [], "memories remain after bulk delete"
     for marker in convo.markers.values():
-        assert not any(marker in h.get("memory", "") for h in a.search(marker, project_id=convo.project_id))
+        assert not any(has(marker, h.get("memory", "")) for h in a.search(marker, project_id=convo.project_id))
     eventually(
         lambda: _require(
-            not any(m in _episodes_text(a, convo.project_id) for m in convo.markers.values()),
+            not any(has(m, _episodes_text(a, convo.project_id)) for m in convo.markers.values()),
             "episode text remains after bulk delete",
         ),
         timeout=60, what="no episode text after bulk delete",

@@ -62,3 +62,21 @@ def test_mcp_retag_calls_use_the_tools_flat_arguments():
         assert keys & {"add_tags", "remove_tags", "set_category", "set_project_id"}, (
             f"{name}: MCP retag_memories call has no operation argument: {sorted(keys)}"
         )
+
+
+def test_delete_privacy_markers_are_letters_only_invented_words():
+    """The extractor drops digits/hex glued to a proper noun (dev 8c3e130e), so a marker
+    must be a letters-only word that survives extraction verbatim."""
+    tree = ast.parse((SCENARIOS / "test_delete_privacy.py").read_text(encoding="utf-8"))
+    markers = []
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Assign)
+            and any(isinstance(t, ast.Attribute) and t.attr == "markers" for t in node.targets)
+            and isinstance(node.value, ast.Dict)
+        ):
+            markers = [v.value for v in node.value.values if isinstance(v, ast.Constant)]
+            assert len(markers) == len(node.value.values), "markers must be literal strings, not run-tag f-strings"
+    assert markers, "Convo.markers not found"
+    for m in markers:
+        assert re.fullmatch(r"[A-Za-z]+", m), f"marker {m!r} is not a letters-only word"
