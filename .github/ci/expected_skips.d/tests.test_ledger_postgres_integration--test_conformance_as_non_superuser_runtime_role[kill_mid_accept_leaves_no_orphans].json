@@ -1,9 +1,0 @@
-{
-  "test": "tests.test_ledger_postgres_integration::test_conformance_as_non_superuser_runtime_role[kill_mid_accept_leaves_no_orphans]",
-  "reason_contains": "LEDGER_TEST_PG_DSN not set (postgres ledger inte",
-  "profiles": [
-    "container",
-    "host"
-  ],
-  "why": "missing infrastructure: needs a PostgreSQL DSN (declared by Phase 2 slice 1); these tests belong under integration_tests/ with the pg_dsn fixture"
-}

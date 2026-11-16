@@ -133,6 +133,10 @@ def _verify_pkce(code_verifier: str, code_challenge: str) -> bool:
     """RFC 7636 S256: BASE64URL(SHA256(verifier)) == challenge."""
     if not code_verifier or not code_challenge:
         return False
+    # A verifier is unreserved ASCII (RFC 7636 4.1): anything else cannot match, and would make
+    # ``encode("ascii")`` / ``compare_digest`` raise (a server error) instead of failing the check.
+    if not code_verifier.isascii() or not code_challenge.isascii():
+        return False
     digest = hashlib.sha256(code_verifier.encode("ascii")).digest()
     return secrets.compare_digest(_b64url(digest), code_challenge)
 

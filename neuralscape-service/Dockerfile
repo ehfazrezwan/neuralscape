@@ -23,6 +23,7 @@ COPY neuralscape-service/knowledge/ neuralscape-service/knowledge/
 COPY neuralscape-service/ingest/ neuralscape-service/ingest/
 COPY neuralscape-service/connectors/ neuralscape-service/connectors/
 COPY neuralscape-service/okf/ neuralscape-service/okf/
+COPY neuralscape-service/supabase/ neuralscape-service/supabase/
 COPY neuralscape-service/integration_tests/ neuralscape-service/integration_tests/
 COPY neuralscape-service/ledger/ neuralscape-service/ledger/
 
@@ -84,6 +85,7 @@ COPY neuralscape-service/knowledge/ neuralscape-service/knowledge/
 COPY neuralscape-service/ingest/ neuralscape-service/ingest/
 COPY neuralscape-service/connectors/ neuralscape-service/connectors/
 COPY neuralscape-service/okf/ neuralscape-service/okf/
+COPY neuralscape-service/supabase/ neuralscape-service/supabase/
 COPY neuralscape-service/integration_tests/ neuralscape-service/integration_tests/
 COPY neuralscape-service/ledger/ neuralscape-service/ledger/
 # Operator-facing scripts (relocate_vault_to_raw, issue_user_token,
@@ -146,6 +148,7 @@ COPY neuralscape-service/knowledge/ neuralscape-service/knowledge/
 COPY neuralscape-service/ingest/ neuralscape-service/ingest/
 COPY neuralscape-service/connectors/ neuralscape-service/connectors/
 COPY neuralscape-service/okf/ neuralscape-service/okf/
+COPY neuralscape-service/supabase/ neuralscape-service/supabase/
 COPY neuralscape-service/ledger/ neuralscape-service/ledger/
 
 # Resolve WITH dev deps so pytest, pytest-asyncio, etc. are available.
