@@ -9,6 +9,7 @@ COPY pyproject.toml README.md ./
 COPY neuralscape_bench ./neuralscape_bench
 COPY icebench ./icebench
 COPY static ./static
+COPY scripts/service_baseline ./scripts/service_baseline
 
 RUN python -m pip install --no-cache-dir build \
     && python -m build --wheel --outdir /tmp/wheels \
