@@ -1927,8 +1927,11 @@ class WriteMixin:
             seen_in_batch.add(batch_key)
 
             # Storage-level idempotency (audit 27 #21). visibility=None on
-            # purpose: conversation-path rows don't stamp metadata.visibility,
-            # so a visibility condition would never match them. workspace defaults
+            # purpose: the lookup is tier-agnostic, so it matches stamped rows
+            # and older rows that predate the stamp (rows written before
+            # owner/visibility stamping carry no metadata.visibility), and a
+            # private raw write dedups against a stamped extracted twin.
+            # workspace defaults
             # to None here (memory type) unless the caller overrode it.
             lookup_kwargs = dict(
                 user_id=user_id,
@@ -2007,7 +2010,13 @@ class WriteMixin:
                     "run_id": run_id,
                     "source": source,
                     **({'category_evidence': evidence} if evidence is not None else {}),
-                    **({"visibility": fact_forced_visibility} if fact_forced_visibility else {}),
+                    # Owner + tier are always stamped (conversation extractions
+                    # are private by default — the same assumption
+                    # extract_and_store's graph group makes). Previously only a
+                    # sensitivity-forced fact carried visibility, and no row
+                    # carried owner_user_id, so reads/deletes had to guess it.
+                    "owner_user_id": user_id,
+                    "visibility": fact_forced_visibility or MemoryVisibility.PRIVATE.value,
                     **({"sensitivity": fact_sensitivity} if fact_sensitivity else {}),
                     **({"sensitivity_source": fact_sensitivity_source} if fact_sensitivity_source else {}),
                     # Extraction stores directly-stated facts → epistemically
@@ -2095,7 +2104,8 @@ class WriteMixin:
                     title=distill_title(content),
                     token_estimate=stamp_tokens(content),
                     speaker=spk,
-                    visibility=forced_visibility,
+                    visibility=forced_visibility or MemoryVisibility.PRIVATE.value,
+                    owner_user_id=user_id,
                     sensitivity=fact_sensitivity,
                     sensitivity_source=fact_sensitivity_source,
                     category_evidence=payloads[idx]['metadata'].get('category_evidence'),
