@@ -1,0 +1,6 @@
+# Optional override for the service baseline stack: the default network becomes internal, so no container has a
+# route out of the host. The stack publishes no host ports and the driver runs inside the network, so nothing
+# the baseline measures needs egress. Use it with: runner.py --compose-override scripts/service_baseline/compose.no-egress.yml
+networks:
+  default:
+    internal: true

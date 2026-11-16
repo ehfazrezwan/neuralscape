@@ -148,8 +148,8 @@ export async function flushTurns(
     try {
       // <private>…</private> spans never leave the machine (D4).
       await neuralscapePost("/v1/extensions/conversation-compiler/flush", {
-        user_message: boundText(redactPrivate(turn.userMessage)),
-        assistant_response: boundText(redactPrivate(turn.assistantResponse)),
+        user_message: boundText(redactPrivate(turn.userMessage, { failClosed: true })),
+        assistant_response: boundText(redactPrivate(turn.assistantResponse, { failClosed: true })),
         session_id: turn.sessionId,
         channel: turn.channel,
         timestamp: turn.timestamp,
