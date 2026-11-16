@@ -322,3 +322,20 @@ def test_checkpoint_dedups_against_a_twin_in_the_same_reference_workspace(servic
     prepared = prepare_checkpoint(service, req, "alice")
     assert [v["verdict"] for v in prepared["verdicts"]] == ["duplicate"]
     assert prepared["to_enqueue"] == []
+
+
+@pytest.mark.asyncio
+async def test_two_reference_rows_and_one_plain_row_enqueue_exactly_one_graph_job(service, ctx):
+    """The shape the real-store test drives: rows in a reference workspace are stored (in that
+    workspace) but get no graph job, so a 2 + 1 batch reports and enqueues ONE job, not three."""
+    ctx["service"] = service
+    items = [
+        {"content": f"Reference batch fact {n}", "user_id": "alice", "category": "preference",
+         "workspace": "ref-books"} for n in (1, 2)
+    ] + [{"content": "Plain batch fact", "user_id": "alice", "category": "preference"}]
+    out = await worker.process_memory_raw_batch(ctx, items)
+    assert len(out["memories"]) == 3
+    assert out["graph_jobs_enqueued"] == 1
+    calls = ctx["redis"].enqueue_job.call_args_list
+    assert [c.args[0] for c in calls] == ["process_graph_enrichment"]
+    service.enrich_graph.assert_not_called()

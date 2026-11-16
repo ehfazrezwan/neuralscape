@@ -83,10 +83,15 @@ def test_batch_items_keep_their_workspace_and_graph_jobs_go_to_the_graph_queue(f
 
     status, graph_jobs = asyncio.run(scenario())
     assert status["status"] == "completed", status
-    assert status["result"]["graph_jobs_enqueued"] == 3
+    # Rows in a reference workspace are vector-only: stored, but no graph job. Only the plain
+    # (memory-workspace) item gets one.
+    assert status["result"]["graph_jobs_enqueued"] == 1
 
     rows = [r["payload"] for r in service._scroll_all_user_memories(uid)]
     by_ws = sorted((r.get("metadata") or {}).get("workspace") or "memory" for r in rows)
     assert by_ws == ["memory", "ref-nsit-books", "ref-nsit-books"], rows
 
-    assert len(graph_jobs) == 3 and all(j.function == "process_graph_enrichment" for j in graph_jobs)
+    assert len(graph_jobs) == 1 and all(j.function == "process_graph_enrichment" for j in graph_jobs)
+    # ...and that one job is the plain row's, not a reference row's.
+    job_text = " ".join(map(str, graph_jobs[0].args))
+    assert "pilot huts" in job_text and "tide tables" not in job_text
