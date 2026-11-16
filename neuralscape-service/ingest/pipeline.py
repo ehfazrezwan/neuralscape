@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
@@ -49,7 +50,7 @@ _FIXED_MESSAGES = {
 
 def sanitized_error(exc: BaseException, kind: str) -> str:
     """``ClassName: <fixed message for kind>`` -- no exception text, bounded."""
-    name = "".join(ch for ch in type(exc).__name__ if ch.isalnum() or ch == "_")[:60] or "Error"
+    name = re.sub(r"[^A-Za-z0-9_]", "", type(exc).__name__)[:60] or "Error"  # ASCII only
     return f"{name}: {_FIXED_MESSAGES.get(kind, 'store failed')}"[:MAX_STORE_ERROR_CHARS]
 
 

@@ -106,6 +106,57 @@ class TestIngestDocumentStoreErrors:
         _assert_clean(out)
 
 
+HOSTILE_NAMES = ("Bad\nName: injected", "\u00dcn\u00efcode")
+
+
+def _hostile_service(name):
+    Hostile = type("X", (Exception,), {})
+    Hostile.__name__ = name
+
+    class Svc(_LeakyService):
+        def store_raw(self, **kw):
+            raise Hostile(SECRET_URL)
+
+    return Svc()
+
+
+class TestClassNameIsAsciiOnly:
+    @pytest.mark.parametrize("name", HOSTILE_NAMES)
+    def test_store_errors_carry_only_ascii_identifier_chars(self, name):
+        out = ingest_document(_hostile_service(name), _doc())
+        assert out["store_errors"]
+        for entry in out["store_errors"]:
+            assert entry.isascii() and "\n" not in entry
+            assert entry.count(":") == 1  # only the fixed separator
+        _assert_clean(out)
+
+    def test_injected_colon_text_cannot_forge_a_second_field(self):
+        out = ingest_document(_hostile_service(HOSTILE_NAMES[0]), _doc())
+        assert out["store_errors"][0] == "BadNameinjected: passage store failed"
+
+    def test_non_ascii_letters_are_dropped_with_fallback(self):
+        out = ingest_document(_hostile_service(HOSTILE_NAMES[1]), _doc())
+        assert out["store_errors"][0] == "ncode: passage store failed"
+        out = ingest_document(_hostile_service("\u00dc\u00ef"), _doc())
+        assert out["store_errors"][0] == "Error: passage store failed"
+
+    @pytest.mark.parametrize("name", HOSTILE_NAMES)
+    def test_okf_bundle_failed_concepts_are_ascii_only(self, name):
+        from ingest.okf_bundle import ingest_okf_bundle
+
+        files = {
+            "index.md": "---\nokf_version: 0.1\n---\n",
+            "a.md": f"---\ntype: Topic\ntitle: A\n---\n\n{DOC_TEXT}\n",
+        }
+        out = ingest_okf_bundle(
+            _hostile_service(name), files=files, bundle_uri="b.zip", user_id="alice",
+            extract_facts=False, llm_call=lambda p: "{}",
+        )
+        err = out["failed_concepts"][0]["error"]
+        assert err.isascii() and "\n" not in err and err.count(":") == 1
+        assert json.dumps(out).isascii()
+
+
 class TestEveryCallerPathIsClean:
     @pytest.mark.asyncio
     async def test_worker_task_status_result(self):
