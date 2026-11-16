@@ -1239,10 +1239,41 @@ async def process_graph_enrichment(
     return {"memory_id": memory_id, "enriched": enriched}
 
 
+_EXPIRY_LOG_ID_CAP = 20
+
+
+def _log_expiry_graph_problems(result: dict) -> None:
+    """Warn about expired rows whose graph cleanup or sibling repair did not complete.
+
+    The expired rows are already gone, so a re-run never retries them: the log
+    line (counts + a capped id list) is the operator's trace besides the job result.
+    """
+    unresolved = result.get("graph_cascade_unresolved_ids") or []
+    unrepaired = result.get("graph_sibling_unrepaired_ids") or []
+    if unresolved:
+        logger.warning(
+            f"Expiry cron: graph cleanup unresolved for {len(unresolved)} expired memories "
+            f"(first {_EXPIRY_LOG_ID_CAP}: {unresolved[:_EXPIRY_LOG_ID_CAP]})"
+        )
+    if unrepaired:
+        logger.warning(
+            f"Expiry cron: {len(unrepaired)} sibling memories could not be repaired "
+            f"(first {_EXPIRY_LOG_ID_CAP}: {unrepaired[:_EXPIRY_LOG_ID_CAP]})"
+        )
+    if result.get("graph_sibling_repair_failed"):
+        logger.warning("Expiry cron: sibling lookup failed; siblings of expired memories may have stale graph refs")
+
+
 async def expire_old_memories_cron(ctx: dict) -> dict:
     """Cron job: purge memories whose expires_at is in the past (memory-model v2)."""
     service: MemoryService = ctx["service"]
     result = await asyncio.to_thread(service.expire_old_memories)
+    # Sibling facts that shared an expired row's conversation episode need a
+    # single-fact graph re-ingest (graph queue), like a bulk delete.
+    sibling_jobs = result.pop("graph_jobs", [])
+    if sibling_jobs:
+        result["graph_jobs_enqueued"] = await _enqueue_graph_jobs(ctx, sibling_jobs, None)
+    _log_expiry_graph_problems(result)
     if result.get("deleted_count"):
         logger.info(f"Expiry cron: purged {result['deleted_count']} memories")
     return result
