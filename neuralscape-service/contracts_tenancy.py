@@ -450,6 +450,11 @@ def _closed_graph_snapshot_session() -> tuple[
                 _refuse_duplicate_texts(
                     stored_entries, extra_entries if extras_are_native else ()  # type: ignore[arg-type]
                 )
+                # Field names are reduced to plain text before any set or result use, so a text
+                # subclass's own hash, equality or string hooks never decide membership or a key.
+                stored_entries = tuple(
+                    (_plain_key(name), field_value) for name, field_value in stored_entries
+                )
                 stored_names = {name for name, _field_value in stored_entries}
                 undeclared = stored_names - declared.keys()
                 if (
