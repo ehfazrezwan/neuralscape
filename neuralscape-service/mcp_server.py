@@ -148,6 +148,17 @@ def _meter_code_nav_bg(name: str, user_id: str, *, served_text=None, served_obj=
     sm.meter_code_nav_bg(op, user_id, served_text=served_text, served_obj=served_obj, files=files)
 
 
+def _ingest_workspace(arguments: dict) -> str | None:
+    """The normalised ``workspace`` argument of an ingest tool (None = memory workspace);
+    ValueError if malformed."""
+    from schemas import normalize_workspace
+
+    ws = arguments.get("workspace")
+    if ws is not None and not isinstance(ws, str):
+        raise ValueError("workspace must be a string")
+    return normalize_workspace(ws)
+
+
 def _standard_write_error(visibility, user_id: str) -> list[TextContent] | None:
     """Return an MCP error payload if a ``standard``-tier write isn't allowed.
 
@@ -602,7 +613,8 @@ async def list_tools() -> list[Tool]:
                     "extract_facts": {"type": "boolean", "description": "Also run LLM extraction for distilled facts (default true)"},
                     "index_passages": {"type": "boolean", "description": "Chunk + store verbatim passages (default true)"},
                     "tags": {"type": "array", "items": {"type": "string"}},
-                    "adapter": {"type": "string", "description": "Knowledge adapter selecting taxonomy/chunker/extractor/graph-ontology (e.g. 'default', 'trading_strategy'). Default 'default'."},
+                    "adapter": {"type": "string", "description": "Knowledge adapter (e.g. 'trading_strategy'). Default 'default'."},
+                    "workspace": {"type": "string", "description": "Reference workspace (default: memory)."},
                     "wait": {"type": "boolean", "description": "Wait for ingest to finish before returning. Default false."},
                 },
                 "required": ["content", "source"],
@@ -646,7 +658,8 @@ async def list_tools() -> list[Tool]:
                     "extract_facts": {"type": "boolean", "description": "Also run LLM extraction for distilled facts (default true)"},
                     "index_passages": {"type": "boolean", "description": "Chunk + store verbatim passages (default true)"},
                     "tags": {"type": "array", "items": {"type": "string"}},
-                    "adapter": {"type": "string", "description": "Knowledge adapter selecting taxonomy/chunker/extractor/graph-ontology (e.g. 'default', 'trading_strategy'). Default 'default'."},
+                    "adapter": {"type": "string", "description": "Knowledge adapter (e.g. 'trading_strategy'). Default 'default'."},
+                    "workspace": {"type": "string", "description": "Reference workspace (default: memory)."},
                     "wait": {"type": "boolean", "description": "Wait for ingest to finish before returning. Default false."},
                 },
                 "required": ["content"],
@@ -2023,6 +2036,10 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
                 validate_adapter_name(arguments.get("adapter", "default"))
             except ValueError as ve:
                 return [TextContent(type="text", text=json.dumps({"status": "error", "error": str(ve)}))]
+            try:
+                _ingest_workspace(arguments)
+            except ValueError as ve:
+                return [TextContent(type="text", text=json.dumps({"status": "error", "error": str(ve)}))]
             scope = arguments.get("scope")
             project_id = arguments.get("project_id")
             if not scope:
@@ -2040,6 +2057,7 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
                 "extract_facts": arguments.get("extract_facts", True),
                 "index_passages": arguments.get("index_passages", True),
                 "adapter": arguments.get("adapter", "default"),
+                "workspace": _ingest_workspace(arguments),
             }
             doc = {k: v for k, v in doc.items() if v is not None}
 
@@ -2124,6 +2142,7 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
                 "extract_facts": req.extract_facts,
                 "index_passages": req.index_passages,
                 "adapter": req.adapter,
+                "workspace": req.workspace,
             }
             # source is a dict with None title possibly — keep it; drop top-level Nones only.
             doc = {k: v for k, v in doc.items() if v is not None}
