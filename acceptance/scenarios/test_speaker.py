@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 
 import pytest
 
-from nsaccept import expect_check_fails, negative_control, profiles, proves
+from nsaccept import expect_check_fails, negative_control, precondition, profiles, proves
 from nsaccept.client import NSClient
 
 pytestmark = profiles("flags-on")
@@ -93,5 +93,6 @@ def test_a_single_anonymous_user_is_labelled_user(convo: Convo):
 @negative_control
 def test_attribution_check_fails_for_the_other_speaker_and_for_an_unknown_marker(convo: Convo):
     c = _ok(convo)
+    precondition(check_attributed, c.named, c.marker_maren, "Maren", what="Maren's fact is attributed to Maren")
     expect_check_fails(check_attributed, c.named, c.marker_maren, "Tobias")
     expect_check_fails(check_attributed, c.named, f"{c.marker_maren}-never", "Maren")

@@ -7,6 +7,8 @@ source: handwritten
 
 # Storage Backends & Subtree Dependencies
 
+> **Status (as of 2026-11-16, dev 6a81341f):** current reference. Code citations name modules and functions, not line numbers; the implementation lives in the `neuralscape-service/memory/` package behind the `memory_service.py` facade. Where a snippet is marked abridged it is a simplified excerpt, so read the named module for the real code.
+
 ## Overview
 
 Neuralscape persists memory across two physically distinct stores, glued together by the `mem0` orchestration layer. Each fact written by the service ends up in **both** systems, indexed differently:
@@ -26,12 +28,12 @@ Every successful write fans out across both stores. Reads fan in.
 **Write path** (see [04-memory-service-core](./04-memory-service-core.md)):
 
 1. `MemoryService.extract_and_store` calls Gemini to extract structured facts from a conversation.
-2. `_batch_store_facts` embeds all facts in a **single** Gemini batch call, then upserts them into Qdrant via `vector_store.insert(vectors, ids, payloads)` — one network call per extraction (`memory_service.py:545-553`).
+2. `_batch_store_facts` embeds all facts in a **single** Gemini batch call, then upserts them into Qdrant via `vector_store.insert(vectors, ids, payloads)` — one network call per extraction (in `_batch_store_facts`, `memory/write.py`).
 3. The cleaned conversation text is then handed to Graphiti via `self._memory.graph.add(data=raw_text, filters={"user_id", "group_id"})`. Graphiti runs its own LLM extraction pass internally (entity + relation extraction, dedup, edge invalidation) and writes nodes/edges into Neo4j.
 
 The two stores hold **different shapes of the same conversation**: Qdrant gets categorized, hashed, dedup-friendly fact strings; Neo4j gets the raw narrative as a temporal episode plus the entities/relations Graphiti derives from it.
 
-**Read path**: search hits Qdrant for vector similarity (with optional dual-scope merge) and Graphiti for graph-aware hybrid retrieval (semantic + keyword + traversal). Results are merged in `MemoryService` before returning. The `metadata.*` payload prefix and the `project--{id}` group-id format are the two cross-store conventions that keep results from leaking between scopes.
+**Read path**: search hits Qdrant for vector similarity (with optional dual-scope merge) and Graphiti for graph-aware hybrid retrieval (semantic + keyword + traversal). Results are merged in `MemoryService` before returning. The `metadata.*` payload prefix and the multi-user group-id format are the two cross-store conventions that keep results from leaking between scopes.
 
 See [03-memory-model](./03-memory-model.md) for scope/category semantics and [07-async-pipeline](./07-async-pipeline.md) for how writes get queued through Redis/ARQ before reaching either store.
 
@@ -39,8 +41,8 @@ See [03-memory-model](./03-memory-model.md) for scope/category semantics and [07
 
 The repo carries two large vendored projects in-tree:
 
-- **`graphiti/`** — full copy of `getzep/graphiti` v0.28.2. Contains `graphiti_core/` (the library), `server/` (a standalone API), `mcp_server/` (Graphiti's own MCP), and `tests/`. Neuralscape only consumes `graphiti_core` via the editable install.
-- **`mem0/`** — full copy of `mem0ai/mem0` v1.0.10. Contains `mem0/memory/` (with the custom `graphiti_memory.py` adapter), `mem0/vector_stores/qdrant.py` (with the metadata-prefix filter fix), `mem0/configs/`, `mem0/embedchain/`, and `tests/`.
+- **`graphiti/`** — a subtree of `getzep/graphiti`, currently v0.28.2 (see `graphiti/pyproject.toml`). It is pruned to the library core: `graphiti_core/` plus packaging files. Upstream's `server/`, `mcp_server/` and tests are deliberately not tracked. Neuralscape consumes `graphiti_core` via the editable install.
+- **`mem0/`** — a subtree of `mem0ai/mem0`, currently v2.0.2 (see `mem0/pyproject.toml`), pruned to the `mem0/mem0` library plus packaging files. Upstream removed its self-hostable OSS graph layer in the 2.x line, so Neuralscape restores and maintains that layer itself, and `mem0/mem0/memory/graphiti_memory.py` (the adapter that presents Graphiti as a mem0 graph provider) is net-new Neuralscape code. See [14-upstream-delta-report](./14-upstream-delta-report.md). The `mem0/vector_stores/qdrant.py` wrapper carries the metadata-prefix filter fix.
 
 These were brought in via `git subtree add`, which means upstream history is squashed into local commits. Updates are pulled with `git subtree pull --squash`, and any local changes ride on top as ordinary commits.
 
@@ -49,7 +51,7 @@ These were brought in via `git subtree add`, which means upstream history is squ
 There are four neuralscape-specific commits layered onto subtree history:
 
 - `6c94f20` — `fix(search): prefix metadata keys in Qdrant filters for vector search`. Required because mem0 stores user payload under a nested `metadata` object, but its filter builder previously emitted top-level keys.
-- `2edd9b5` — `fix(graphiti): align group_id format to use double-hyphen for project scoping`. Standardises on `project--{id}` to avoid collisions with the `:` separator Graphiti uses internally.
+- `2edd9b5` — `fix(graphiti): align group_id format to use double-hyphen for project scoping`. Standardised (at the time) on `project--{id}` to avoid collisions with the `:` separator Graphiti uses internally.
 - `f591781` — `feat(conversation-compiler): rebuild category index after memory_stored vault writes`. Hooks into the worker event stream.
 - `2cf1da8` — `feat(worker): emit memory_stored events`. Producer side of the same event.
 
@@ -60,7 +62,7 @@ There are no `.patch` files anywhere. Every modification is a real commit visibl
 Both subtrees are declared as editable path dependencies in the service's pyproject:
 
 ```toml
-# neuralscape-service/pyproject.toml:33-35
+# neuralscape-service/pyproject.toml, [tool.uv.sources]
 [tool.uv.sources]
 graphiti-core = { path = "../graphiti", editable = true }
 mem0ai = { path = "../mem0", editable = true }
@@ -69,7 +71,7 @@ mem0ai = { path = "../mem0", editable = true }
 mem0 itself depends on `graphiti-core` and overrides it the same way:
 
 ```toml
-# mem0/pyproject.toml:166-167
+# mem0/pyproject.toml, [tool.uv.sources]
 [tool.uv.sources]
 graphiti-core = { path = "../graphiti", editable = true }
 ```
@@ -77,7 +79,7 @@ graphiti-core = { path = "../graphiti", editable = true }
 mem0 also declares an optional extra so that downstream consumers can pull a Graphiti-enabled build without the editable override:
 
 ```toml
-# mem0/pyproject.toml:71-72
+# mem0/pyproject.toml, optional extras
 graphiti = ["graphiti-core[google-genai]>=0.28.0"]
 ```
 
@@ -85,10 +87,10 @@ The net effect: `uv sync` from `neuralscape-service/` resolves both `mem0ai` and
 
 ## mem0 configuration
 
-The single function that wires every backend together is `Settings.get_mem0_config()` in `neuralscape-service/config.py:79-132`. It returns the dict consumed by `Memory.from_config(...)`.
+The single function that wires every backend together is `Settings.get_mem0_config()` in `neuralscape-service/config.py`. It returns the dict consumed by `Memory.from_config(...)`.
 
 ```python
-# neuralscape-service/config.py:92-132 (abridged)
+# neuralscape-service/config.py, Settings.get_mem0_config (abridged)
 return {
     "llm":          {"provider": "gemini", "config": {"model": ..., "api_key": ...}},
     "embedder":     {"provider": "gemini", "config": {"model": ..., "embedding_dims": 768}},
@@ -106,18 +108,18 @@ Section by section:
 - **`graph_store`** — Graphiti, with its own `graphiti_llm_*`, `graphiti_embedder_*`, and `graphiti_reranker_*` triplets. `database: "memory"` is non-default — Graphiti must run against a Neo4j database named `memory`, not the default `neo4j`. `store_raw_episode_content=True` keeps the verbatim conversation text on each episode node; `update_communities=False` skips Leiden community recomputation on every write.
 - **`version: "v1.1"`** — selects the v1.1 schema in mem0 (post-breaking-change).
 
-`Memory.from_config(config)` is called lazily and **once** in `MemoryService._get_memory()` (`memory_service.py:203-221`), guarded by `self._init_lock` so concurrent cold-start requests don't double-instantiate. Once initialized, the underlying Graphiti instance is cached as `self._memory.graph.graphiti` and the async bridge as `self._memory.graph._bridge`.
+`Memory.from_config(config)` is called lazily and **once** in `MemoryService._get_memory()` (`memory/core.py`), guarded by `self._init_lock` so concurrent cold-start requests don't double-instantiate. Once initialized, the underlying Graphiti instance is cached as `self._memory.graph.graphiti` and the async bridge as `self._memory.graph._bridge`.
 
 ## Qdrant
 
-**Collection.** Single collection `neuralscape_memories` (config.py:29). 768-dim vectors. COSINE distance — that's the mem0 default and is not overridden.
+**Collection.** Single collection `neuralscape_memories` (`qdrant_collection` in `config.py`). 768-dim vectors. COSINE distance — that's the mem0 default and is not overridden.
 
 **Storage modes.** Same `QdrantClient` API in both modes; the switch is purely config:
 
 - **Local on-disk**: `QdrantClient(path="~/.neuralscape/qdrant")`. No server process required. Used in dev and CI.
 - **Server**: `QdrantClient(url="http://localhost:6333")`. Used in Docker compose and production.
 
-The mem0 wrapper at `mem0/mem0/vector_stores/qdrant.py:57-72` handles both. One important caveat: **payload indexes are only created in server mode**. Local on-disk Qdrant doesn't support `create_payload_index`, so categorical filters fall back to scan-based filtering.
+The mem0 wrapper at `mem0/mem0/vector_stores/qdrant.py` handles both. One important caveat: **payload indexes are only created in server mode**. Local on-disk Qdrant doesn't support `create_payload_index`, so categorical filters fall back to scan-based filtering.
 
 **Payload schema.** Every Qdrant point carries:
 
@@ -141,7 +143,7 @@ The mem0 wrapper at `mem0/mem0/vector_stores/qdrant.py:57-72` handles both. One 
 }
 ```
 
-Origin: `memory_service.py:407-424` (single-fact path) and `memory_service.py:523-537` (batch path). `hash` is MD5 of the content string and is used for fact-level dedup before re-embedding (see `_batch_store_facts`).
+Origin: `store_raw` (single-fact path) and `_batch_store_facts` (batch path) in `memory/write.py`; the real payload carries more fields than shown (visibility, v2 fields, timestamps). `hash` is MD5 of the content string and is used for fact-level dedup before re-embedding (see `_batch_store_facts`).
 
 **The metadata-prefix gotcha.** This is the single most common foot-gun in the codebase. Because user data lives nested under `metadata`, every filter must use a dotted key:
 
@@ -153,17 +155,17 @@ filters = {
 }
 ```
 
-Top-level keys (`user_id`, `agent_id`, `run_id`) stay un-prefixed because they live at the payload root. The fix that aligned this was commit `6c94f20`. Filter operators are the standard Qdrant set, exposed by `mem0/mem0/vector_stores/qdrant.py:142-283`: `eq`, `ne`, `gt`, `gte`, `lt`, `lte`, `in`, `nin`, `contains`, `icontains`, plus boolean `AND`, `OR`, `NOT`.
+Top-level keys (`user_id`, `agent_id`, `run_id`) stay un-prefixed because they live at the payload root. The fix that aligned this was commit `6c94f20`. Filter operators are the standard Qdrant set, exposed by `mem0/mem0/vector_stores/qdrant.py`: `eq`, `ne`, `gt`, `gte`, `lt`, `lte`, `in`, `nin`, `contains`, `icontains`, plus boolean `AND`, `OR`, `NOT`.
 
-**Dual-scope search.** When a search supplies `project_id` but no explicit `scope`, `MemoryService.search` runs **two** Qdrant queries — one for `metadata.scope = "project"` with the matching `project_id`, one for `metadata.scope = "global"` — then merges results by score and dedups by ID (`memory_service.py:622-643`). This is why a project-scoped agent transparently sees both project-specific and user-wide memories.
+**Dual-scope search.** When a search supplies `project_id` but no explicit `scope`, `MemoryService.search` runs **two** Qdrant queries — one for `metadata.scope = "project"` with the matching `project_id`, one for `metadata.scope = "global"` — then merges results by score and dedups by ID (in `search`, `memory/search.py`). This is why a project-scoped agent transparently sees both project-specific and user-wide memories.
 
-**Batching.** `_batch_store_facts` (`memory_service.py:545-553`) issues a single `embed_batch()` call to Gemini and a single `vector_store.insert(vectors, ids, payloads)` call to Qdrant per extraction, regardless of how many facts the LLM returned. This keeps write amplification linear in extractions, not facts.
+**Batching.** `_batch_store_facts` (in `_batch_store_facts`, `memory/write.py`) issues a single `embed_batch()` call to Gemini and a single `vector_store.insert(vectors, ids, payloads)` call to Qdrant per extraction, regardless of how many facts the LLM returned. This keeps write amplification linear in extractions, not facts.
 
 ## Neo4j + Graphiti
 
 **Database.** Single Neo4j instance over the bolt protocol at `neo4j://127.0.0.1:7687`. The target database is `memory` — **not** the Neo4j default `neo4j`. The database must already exist before the service starts; it isn't auto-created. User defaults to `neo4j`; password is required.
 
-**Indices and constraints.** On first use, `MemoryGraph._ensure_indices` runs `graphiti.build_indices_and_constraints()` on the bridge loop (`mem0/mem0/memory/graphiti_memory.py:192-200`). Defined in `graphiti/graphiti_core/graph_queries.py`, this creates:
+**Indices and constraints.** On first use, `MemoryGraph._ensure_indices` runs `graphiti.build_indices_and_constraints()` on the bridge loop (`mem0/mem0/memory/graphiti_memory.py`). Defined in `graphiti/graphiti_core/graph_queries.py`, this creates:
 
 - **EntityNode**: range indices on `uuid`, `group_id`, `name`, `created_at`; fulltext on `name + summary`.
 - **EpisodicNode**: range indices on `uuid`, `group_id`, `created_at`, `valid_at`; fulltext on `content`.
@@ -174,13 +176,16 @@ Top-level keys (`user_id`, `agent_id`, `run_id`) stay un-prefixed because they l
 
 The temporal indices (`valid_at`, `invalid_at`) are what make Graphiti's bi-temporal queries fast.
 
-**group_id scoping.** All Graphiti reads/writes are scoped by `group_id`. Format (locked in by commit `2edd9b5`):
+**group_id scoping.** All Graphiti reads/writes are scoped by `group_id`. The current multi-user format (see [03-memory-model](./03-memory-model.md)) is:
 
-- Global: `"global"`
-- Project: `"project--{project_id}"` (double-hyphen on purpose — single-hyphen project IDs would otherwise be ambiguous)
-- Multi-group search: `["global", "project--{id}"]` so a project search includes overarching memories.
+- Private: `user--{user_id}`, or `user--{user_id}--project--{project_id}` when project-scoped
+- Shared: `shared`, or `shared--project--{project_id}`
+- A non-default workspace appends `--ws--{workspace}`
+- Multi-group search reads the set returned by `_get_group_ids`, so a project search includes the caller's overarching groups (and shared groups when requested).
 
-Built by `_build_group_id` and `_get_group_ids` in `memory_service.py:175-187`, with a parallel implementation in `mem0/mem0/memory/graphiti_memory.py:202-228` that handles the legacy `user_id`-as-group fallback for older callers.
+The first design (commit `2edd9b5`) used the bare tokens `global` and `project--{id}`; that layout is historical.
+
+Built by `_build_group_id` and `_get_group_ids` in `memory/groups.py`, with a parallel implementation in `mem0/mem0/memory/graphiti_memory.py` that handles the legacy `user_id`-as-group fallback for older callers.
 
 **Episode model.** Every conversation becomes one episode:
 
@@ -193,7 +198,7 @@ Built by `_build_group_id` and `_get_group_ids` in `memory_service.py:175-187`, 
 
 `add_episode` returns a list of `EntityEdge` objects: `(source_node_uuid, target_node_uuid, name, fact)` — the relations Graphiti extracted from the episode.
 
-**Async bridge.** Graphiti's Neo4j driver is async, but `MemoryService` is synchronous and called from FastAPI's threadpool. To bridge the two, `MemoryGraph.__init__` spins up a dedicated daemon thread running its own `asyncio` event loop (`mem0/mem0/memory/graphiti_memory.py:102-123`):
+**Async bridge.** Graphiti's Neo4j driver is async, but `MemoryService` is synchronous and called from FastAPI's threadpool. To bridge the two, `MemoryGraph.__init__` spins up a dedicated daemon thread running its own `asyncio` event loop (`mem0/mem0/memory/graphiti_memory.py`):
 
 ```python
 class _AsyncBridge:

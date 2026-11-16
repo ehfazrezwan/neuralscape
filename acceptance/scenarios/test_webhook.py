@@ -10,7 +10,7 @@ from datetime import datetime
 
 import pytest
 
-from nsaccept import eventually, expect_check_fails, needs, negative_control, profiles, proves
+from nsaccept import eventually, expect_check_fails, needs, negative_control, precondition, profiles, proves
 from nsaccept.helpers import write_raw
 from nsaccept.sidecar import QUEUE_EMPTY_PATH
 
@@ -59,6 +59,7 @@ def test_draining_the_queue_posts_a_queue_empty_event_for_the_writer(ctx, sink, 
 @negative_control
 def test_event_check_fails_for_a_user_who_never_wrote_and_for_no_new_event(ctx, sink, drained):
     drained.require()
+    precondition(lambda: eventually(lambda: check_queue_empty_event(sink, ctx.user_a, drained.before), timeout=WEBHOOK_WAIT, interval=3, what="queue.empty webhook"), what="the writer's new queue.empty event arrived")
     expect_check_fails(check_queue_empty_event, sink, "acc-nobody-wrote")
     # earlier events must not satisfy the check: with the snapshot taken AFTER the event arrived, nothing is new
     eventually(lambda: check_queue_empty_event(sink, ctx.user_a, drained.before), timeout=WEBHOOK_WAIT, interval=3, what="queue.empty webhook")
