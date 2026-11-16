@@ -523,9 +523,13 @@ async def apply_actions(
                 and act.get("contains_secret")
                 and not act.get("secret_claim_downgraded")
             ):
-                touched = list(dict.fromkeys(
-                    [*(act.get("memory_ids") or []), *([act["survivor_id"]] if a_type == "merge" else [])]
-                ))
+                touched = list(dict.fromkeys([
+                    *(act.get("memory_ids") or []),
+                    *([act["survivor_id"]] if a_type == "merge" else []),
+                    # an invalidate points its rows at the row that replaces them
+                    *([act["superseded_by_id"]]
+                      if a_type == "invalidate" and act.get("superseded_by_id") else []),
+                ]))
                 hidden = await asyncio.to_thread(_tombstoned_ids, service, touched)
                 if hidden:
                     result.skipped.append({

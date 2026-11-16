@@ -42,6 +42,12 @@ _RELEASE_SCRIPT = (
     "then return redis.call('del', KEYS[1]) else return 0 end"
 )
 
+# Compare-and-renew: extends the expiry only while the caller still owns the key.
+_REFRESH_SCRIPT = (
+    "if redis.call('get', KEYS[1]) == ARGV[1] "
+    "then return redis.call('pexpire', KEYS[1], ARGV[2]) else return 0 end"
+)
+
 
 @dataclass(slots=True)
 class GateDecision:
@@ -154,6 +160,34 @@ def release_lock(redis, pool: str, token: str | None) -> None:
                 redis.delete(key)
     except Exception:
         logger.warning("dream lock release failed for %s", pool, exc_info=True)
+
+
+def refresh_lock(redis, pool: str, token: str | None, *, ttl_ms: int | None = None) -> bool:
+    """True iff ``token`` still owns the pool's lock; also renews its expiry.
+
+    A compare-and-PEXPIRE (one script round trip): the owner keeps the lock
+    alive for as long as it keeps proving it holds it, and a holder whose lock
+    expired (and may have been taken by a sweep) learns so before it writes.
+    Fails closed: a Redis error or a missing token reads as "not ours".
+    """
+    if not token:
+        return False
+    key = _LOCK_KEY.format(pool=pool)
+    ttl = int(ttl_ms or _LOCK_STALE_MS)
+    try:
+        if hasattr(redis, "eval"):
+            return bool(redis.eval(_REFRESH_SCRIPT, 1, key, token, ttl))
+        current = redis.get(key)  # test doubles without scripting: non-atomic
+        if isinstance(current, (bytes, bytearray)):
+            current = current.decode()
+        if current != token:
+            return False
+        if hasattr(redis, "pexpire"):
+            redis.pexpire(key, ttl)
+        return True
+    except Exception:
+        logger.warning("dream lock refresh failed for %s", pool, exc_info=True)
+        return False
 
 
 def is_locked(redis, pool: str) -> bool:

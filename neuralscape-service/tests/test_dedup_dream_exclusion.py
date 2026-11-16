@@ -53,6 +53,9 @@ class _FakeRedis:
     def exists(self, key):
         return key in self.keys
 
+    def pexpire(self, key, ms):
+        return 1 if key in self.keys else 0
+
 
 @pytest.fixture
 def dream_on_tombstone(monkeypatch):
@@ -206,7 +209,7 @@ class TestSemanticPhaseHoldsTheDreamLock:
 
         assert result["exact_duplicates_removed"] == 1 and _deleted(service) == ["e1"]
 
-    def test_exact_phase_still_runs_when_the_pool_is_locked(self, service, redis):
+    def test_exact_phase_skips_a_pool_that_is_locked_and_reports_it(self, service, redis):
         fake = _FakeQdrant(service, [
             _row("e1", TEXT, "2025-01-01T00:00:00", scope="global", visibility="private"),
             _row("e2", TEXT, "2025-06-01T00:00:00", scope="global", visibility="private"),
@@ -217,8 +220,8 @@ class TestSemanticPhaseHoldsTheDreamLock:
 
         result = service.dedup_memories("u1")
 
-        assert result["exact_duplicates_removed"] == 1
-        assert _deleted(service) == ["e1"]
+        assert result["exact_duplicates_removed"] == 0 and _deleted(service) == []
+        assert result["exact_skipped_locked_pools"] == 1
 
     def test_row_tombstoned_between_page_read_and_lock_is_left_alone(
         self, service, redis, monkeypatch
@@ -250,9 +253,8 @@ class TestSemanticPhaseHoldsTheDreamLock:
 
         assert result["semantic_duplicates_removed"] == 0 and _tombstoned(service) == []
 
-    def test_dreaming_off_never_consults_the_lock(self, service, redis, monkeypatch):
+    def test_dreaming_off_with_redis_down_runs_unlocked(self, service, redis, monkeypatch):
         _pair(service)
-        assert gate.acquire_lock(redis, POOL)
         redis.fail = True
         monkeypatch.setattr(dreaming_settings, "enabled", False)
 
@@ -411,7 +413,6 @@ class TestSkipsAreReported:
         assert "skipped 3 staged action" in msg
         assert "merge: tombstoned since staging': 2" in msg
         assert "rewrite: tombstoned since staging': 1" in msg
-        assert "a" not in msg.split("{")[0].split("drm_")[-1][10:] or True  # ids are not logged
         assert ": a" not in msg and ": c" not in msg
 
 
