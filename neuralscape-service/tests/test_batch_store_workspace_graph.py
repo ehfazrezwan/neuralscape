@@ -108,3 +108,94 @@ async def test_checkpoint_batch_runs_end_to_end_with_no_inline_graph_calls(servi
     service.enrich_graph.assert_not_called()
     assert out["graph_jobs_enqueued"] == 6
     assert ctx["redis"].enqueue_job.await_count == 6
+
+
+# ── occurred_at, the enqueue-failure fallback, the revived duplicate ─────
+
+OCCURRED = "2026-01-02T03:04:05+00:00"
+
+
+def test_new_rows_graph_jobs_carry_their_event_time(service):
+    jobs: list[dict] = []
+    items = [{**it, "occurred_at": OCCURRED} for it in _items()]
+    service.store_raw_batch(items, graph_jobs=jobs)
+    assert [j["occurred_at"] for j in jobs] == [OCCURRED, OCCURRED]
+
+
+@pytest.mark.asyncio
+async def test_enqueue_failure_falls_back_to_inline_enrichment_with_workspace_and_event_time(ctx):
+    def store(items, dedup_ids=None, graph_jobs=None):
+        graph_jobs.append({
+            "memory_id": "m1", "content": "batch fact", "user_id": "alice", "project_id": "p1",
+            "visibility": "shared", "source_ref": {"url": "x"}, "workspace": "ref-books",
+            "occurred_at": OCCURRED,
+        })
+        return [MemoryResponse(id="m1", memory="batch fact", category="preference")]
+
+    ctx["service"].store_raw_batch.side_effect = store
+    ctx["redis"].enqueue_job.side_effect = ConnectionError("redis down")
+
+    out = await worker.process_memory_raw_batch(ctx, _items("ref-books"))
+
+    assert out["graph_jobs_enqueued"] == 0
+    kwargs = ctx["service"].enrich_graph.call_args.kwargs
+    assert kwargs["memory_id"] == "m1" and kwargs["workspace"] == "ref-books"
+    assert kwargs["occurred_at"] == OCCURRED  # the event time must not be lost on the fallback
+    assert kwargs["source_ref"] == {"url": "x"} and kwargs["visibility"] == "shared"
+
+
+@pytest.mark.asyncio
+async def test_a_failed_inline_fallback_never_fails_the_job(ctx):
+    def store(items, dedup_ids=None, graph_jobs=None):
+        graph_jobs.append({"memory_id": "m1", "content": "c", "user_id": "alice", "project_id": None,
+                           "visibility": "private", "source_ref": None, "workspace": None})
+        return [MemoryResponse(id="m1", memory="c", category="preference")]
+
+    ctx["service"].store_raw_batch.side_effect = store
+    ctx["redis"].enqueue_job.side_effect = ConnectionError("redis down")
+    ctx["service"].enrich_graph.side_effect = RuntimeError("graph down too")
+    out = await worker.process_memory_raw_batch(ctx, _items())
+    assert out["graph_jobs_enqueued"] == 0 and len(out["memories"]) == 1
+
+
+def _revived_service(service, monkeypatch):
+    monkeypatch.setattr(settings, "graph_supersession_enabled", True)
+    survivor = MemoryResponse(
+        id="old-1", memory="batch fact 1 about harbours", category="preference", visibility="private",
+        occurred_at=OCCURRED, project_id="p1",
+    )
+    service._find_by_content_hash = lambda **kw: survivor
+    service._bump_times_derived = MagicMock()
+    service._revive_if_tombstoned = MagicMock(return_value=True)  # the dup was a tombstoned row
+    return survivor
+
+
+def test_a_revived_duplicate_is_deferred_to_the_graph_queue_not_enriched_inline(service, monkeypatch):
+    _revived_service(service, monkeypatch)
+    jobs: list[dict] = []
+    dedup_ids: set[str] = set()
+
+    out = service.store_raw_batch(_items()[:1], dedup_ids=dedup_ids, graph_jobs=jobs)
+
+    assert [m.id for m in out] == ["old-1"]
+    assert [j["memory_id"] for j in jobs] == ["old-1"]
+    assert jobs[0]["occurred_at"] == OCCURRED and jobs[0]["project_id"] == "p1"
+    assert "old-1" not in dedup_ids  # re-asserted: it must re-enter the graph, not take the stale-check path
+    service.enrich_graph.assert_not_called()
+
+
+def test_a_revived_duplicate_without_a_job_list_is_enriched_inline_with_its_event_time(service, monkeypatch):
+    _revived_service(service, monkeypatch)
+    service.store_raw_batch(_items()[:1])
+    kwargs = service.enrich_graph.call_args.kwargs
+    assert kwargs["memory_id"] == "old-1" and kwargs["occurred_at"] == OCCURRED
+
+
+def test_a_plain_duplicate_is_neither_enriched_nor_deferred(service, monkeypatch):
+    survivor = _revived_service(service, monkeypatch)
+    service._revive_if_tombstoned = MagicMock(return_value=False)  # an ordinary live dup
+    jobs: list[dict] = []
+    dedup_ids: set[str] = set()
+    service.store_raw_batch(_items()[:1], dedup_ids=dedup_ids, graph_jobs=jobs)
+    assert jobs == [] and dedup_ids == {survivor.id}
+    service.enrich_graph.assert_not_called()

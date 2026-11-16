@@ -507,6 +507,7 @@ async def _enqueue_graph_jobs(ctx: dict, jobs: list[dict], adapter: str | None) 
                     memory_id=job["memory_id"],
                     source_ref=job.get("source_ref"),
                     graph_ontology=graph_ontology,
+                    occurred_at=job.get("occurred_at"),
                     workspace=job.get("workspace"),
                 )
             except Exception as e2:  # noqa: BLE001 — enrichment is best-effort

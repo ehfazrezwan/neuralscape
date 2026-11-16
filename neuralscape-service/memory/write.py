@@ -1690,6 +1690,7 @@ class WriteMixin:
                         "visibility": getattr(obj, "visibility", None) or "private",
                         "source_ref": getattr(obj, "source_ref", None),
                         "workspace": getattr(obj, "workspace", None),
+                        "occurred_at": getattr(obj, "occurred_at", None),
                     })
                 elif enriched_inline:
                     # Re-asserted fact revived a tombstoned row: it must reach
@@ -1737,6 +1738,7 @@ class WriteMixin:
                         "visibility": obj["effective_visibility"],
                         "source_ref": obj["source_ref"],
                         "workspace": obj.get("workspace"),
+                        "occurred_at": getattr(obj["response"], "occurred_at", None),
                     })
             except Exception as e:
                 logger.warning(f"Batch item {idx} failed (continuing): {e}")
