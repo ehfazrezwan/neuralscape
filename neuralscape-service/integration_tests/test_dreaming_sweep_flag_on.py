@@ -26,7 +26,7 @@ from extensions.dreaming import gate
 from extensions.dreaming.card import build_card_view, load_card, resolve_card_pool
 from extensions.dreaming.reflect import diary_page_path
 from extensions.dreaming.sweep import _STAGED_IDS_KEY, dream_all, get_last_run
-from integration_tests._dreaming_support import dream_env  # noqa: F401  (fixture)
+from integration_tests._dreaming_support import dream_env, timed  # noqa: F401  (fixture)
 
 pytestmark = pytest.mark.integration
 
@@ -43,9 +43,8 @@ SEED = {
     "secret": ("task_context", "The staging API key is sk-e2e-FAKE-abc123456789 for testing"),
     "live": ("task_context", "The payment module validates cards through validate_card() in billing.py"),
 }
-OTHER_SEED = [
+OTHER_SEED = [  # minimum for a second pool that still reaches the reflection pass
     ("preference", "User prefers Rust for systems work and keeps a {tok} cheat sheet"),
-    ("preference", "The user likes using Rust for low-level systems programming"),
     ("workflow", "The user profiles every release build before shipping"),
     ("workflow", "The user benchmarks the hot path after each refactor"),
     ("workflow", "The user reviews flamegraphs before merging performance changes"),
@@ -81,18 +80,22 @@ def swept(dream_env):
     env.clear_pool_state()
 
     client = env.service._memory.vector_store.client
-    client.set_payload(
-        collection_name=env.collection,
-        payload={"code_liveness_stale": True, "code_liveness_reason": "anchor validate_card was removed",
-                 "code_liveness_anchor": "billing.py::validate_card"},
-        points=[ids["live"]], key="metadata",
-    )
+    with timed(env, "set_payload (liveness flag)"):
+        client.set_payload(
+            collection_name=env.collection,
+            payload={"code_liveness_stale": True, "code_liveness_reason": "anchor validate_card was removed",
+                     "code_liveness_anchor": "billing.py::validate_card"},
+            points=[ids["live"]], key="metadata",
+        )
     settings = env.sweep_settings()
     before_noise = env.meta(ids["noise"]).get("dream_tombstoned")
 
-    dry = asyncio.run(dream_all(service=env.service, settings=settings, dry_run=True, force=True))
-    after_dry = {n: env.payload(i) for n, i in ids.items()}
-    real = asyncio.run(dream_all(service=env.service, settings=settings, dry_run=False, force=True))
+    with timed(env, "dream_all dry run (enumerate + hydrate + LLM)"):
+        dry = asyncio.run(dream_all(service=env.service, settings=settings, dry_run=True, force=True))
+    with timed(env, "read back seeded rows"):
+        after_dry = {n: env.payload(i) for n, i in ids.items()}
+    with timed(env, "dream_all real sweep (apply + reflect + vault)"):
+        real = asyncio.run(dream_all(service=env.service, settings=settings, dry_run=False, force=True))
     reports = {p.pool: p for p in real.pools}
     return SimpleNamespace(
         ids=ids, proj_ids=proj_ids, other_user=other_user, other_tok=other_tok,
