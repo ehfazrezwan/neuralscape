@@ -55,3 +55,16 @@ def expect_check_fails(check: Callable[..., Any], *args: Any, **kwargs: Any) -> 
         "negative control: check passed with a deliberately wrong input, "
         "so it cannot fail and proves nothing"
     )
+
+
+def precondition(check: Callable[..., Any], *args: Any, what: str = "the positive path", **kwargs: Any) -> Any:
+    """Run a negative control's PRECONDITION: ``check`` with the RIGHT input must pass.
+
+    If it does not, the setup failed (an index that was never built, a write that never
+    landed), and the control would be vacuous: either "passing" because everything fails, or
+    failing for the wrong reason. Fail loudly as a precondition failure and say which.
+    """
+    try:
+        return check(*args, **kwargs)
+    except AssertionError as exc:
+        raise AssertionError(f"PRECONDITION FAILED ({what}): the check does not pass even with the right input, so this negative control proves nothing: {exc}") from exc

@@ -13,6 +13,10 @@ config:
   - ``detail_content_field``: dotted path to text in the detail response
   - ``retrieval``: optional explicit retrieval handle to stamp on memories
 credentials (optional): ``{"bearer": "..."}`` or ``{"headers": {...}}``.
+
+Every URL fetched (``list_url``, ``item_url_template``) must pass
+``connectors.destination`` (public https host unless ``CONNECTOR_ALLOWED_HOSTS``).
+``url_field`` is only stored as the resource's link, never fetched here.
 """
 
 from __future__ import annotations
@@ -23,6 +27,8 @@ from typing import Any
 import httpx
 
 from connectors.base import ConnectorAdapter, ConnectorResource
+from connectors.destination import guarded_async_client
+from connectors.stdio_policy import ConnectorConfigError
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +51,8 @@ class GenericRestAdapter(ConnectorAdapter):
     def __init__(self, connector_id: str, credentials: dict, config: dict | None = None):
         super().__init__(connector_id, credentials, config)
         self._http: httpx.AsyncClient | None = None
+        # Test seam: a fake transport (the destination checks still run).
+        self._transport: httpx.AsyncBaseTransport | None = None
 
     def _get_http(self) -> httpx.AsyncClient:
         if self._http is None:
@@ -53,14 +61,33 @@ class GenericRestAdapter(ConnectorAdapter):
             bearer = self.credentials.get("bearer")
             if bearer:
                 headers["Authorization"] = f"Bearer {bearer}"
-            self._http = httpx.AsyncClient(headers=headers, timeout=30.0)
+            # Guarded client: every request (and redirect hop) is checked against the
+            # destination policy and connects to the address it validated.
+            # follow_redirects stays off: a 3xx is an error here, never a new target.
+            self._http = guarded_async_client(
+                headers=headers,
+                timeout=30.0,
+                follow_redirects=False,
+                transport=self._transport,
+            )
         return self._http
+
+    async def _get(self, http: httpx.AsyncClient, url: str) -> httpx.Response:
+        try:
+            return await http.get(url)
+        except ConnectorConfigError as exc:
+            # Ids and the refusal category only: never the URL or headers (caller-chosen).
+            logger.warning(
+                "REST connector destination refused at fetch time: connector_id=%s owner=%s reason=%s",
+                self.connector_id, getattr(self, "owner_user_id", None), getattr(exc, "reason", None),
+            )
+            raise
 
     async def list_resources(
         self, cursor: str | None = None
     ) -> tuple[list[ConnectorResource], str | None]:
         http = self._get_http()
-        resp = await http.get(self.config["list_url"])
+        resp = await self._get(http, self.config["list_url"])
         resp.raise_for_status()
         items = _dig(resp.json(), self.config.get("items_path")) or []
         id_field = self.config.get("id_field", "id")
@@ -93,7 +120,7 @@ class GenericRestAdapter(ConnectorAdapter):
             # Nothing more to fetch; serialize the raw item as a fallback.
             return str(resource.raw)
         http = self._get_http()
-        resp = await http.get(template.format(id=resource.external_id))
+        resp = await self._get(http, template.format(id=resource.external_id))
         resp.raise_for_status()
         body = resp.json()
         text = _dig(body, self.config.get("detail_content_field"))
