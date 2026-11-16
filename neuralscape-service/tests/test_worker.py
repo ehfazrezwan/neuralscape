@@ -291,6 +291,11 @@ class TestProcessMemoryRaw:
 class TestProcessGraphEnrichment:
     @pytest.mark.asyncio
     async def test_calls_enrich_graph(self, ctx):
+        # The job re-reads the row and enriches its CURRENT state; an unset mock
+        # row would feed MagicMock attributes into the group id.
+        ctx["service"].get_memory.return_value = MemoryResponse(
+            id="mem-1", memory="hello", visibility="shared", project_id="proj"
+        )
         await worker.process_graph_enrichment(
             ctx, memory_id="mem-1", content="hello", user_id="ehfaz",
             project_id="proj", visibility="shared",
@@ -302,6 +307,7 @@ class TestProcessGraphEnrichment:
 
     @pytest.mark.asyncio
     async def test_defaults_visibility_to_private(self, ctx):
+        ctx["service"].get_memory.return_value = MemoryResponse(id="m", memory="c")  # legacy: no visibility
         await worker.process_graph_enrichment(ctx, memory_id="m", content="c", user_id="u")
         assert ctx["service"].enrich_graph.call_args[1]["visibility"] == "private"
 
