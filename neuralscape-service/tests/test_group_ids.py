@@ -244,9 +244,8 @@ def test_the_audit_names_match_the_builder_with_the_flag_on():
             meta["visibility"], meta["owner_user_id"], meta.get("project_id"), meta.get("workspace"))
 
 
-def test_enabling_the_flag_is_refused_until_the_read_side_adopts_the_builder():
+def test_the_flag_can_be_enabled_now_that_the_read_side_uses_the_builder():
     from config import Settings
 
-    with pytest.raises(ValueError, match="cannot be enabled yet"):
-        Settings(graph_group_id_injective_enabled=True)
+    assert Settings(graph_group_id_injective_enabled=True).graph_group_id_injective_enabled is True
     assert Settings(graph_group_id_injective_enabled=False).graph_group_id_injective_enabled is False

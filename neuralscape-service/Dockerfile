@@ -24,7 +24,6 @@ COPY neuralscape-service/ingest/ neuralscape-service/ingest/
 COPY neuralscape-service/connectors/ neuralscape-service/connectors/
 COPY neuralscape-service/okf/ neuralscape-service/okf/
 COPY neuralscape-service/supabase/ neuralscape-service/supabase/
-COPY neuralscape-service/integration_tests/ neuralscape-service/integration_tests/
 COPY neuralscape-service/ledger/ neuralscape-service/ledger/
 
 # Install all dependencies using uv from the neuralscape-service project
@@ -86,7 +85,6 @@ COPY neuralscape-service/ingest/ neuralscape-service/ingest/
 COPY neuralscape-service/connectors/ neuralscape-service/connectors/
 COPY neuralscape-service/okf/ neuralscape-service/okf/
 COPY neuralscape-service/supabase/ neuralscape-service/supabase/
-COPY neuralscape-service/integration_tests/ neuralscape-service/integration_tests/
 COPY neuralscape-service/ledger/ neuralscape-service/ledger/
 # Operator-facing scripts (relocate_vault_to_raw, issue_user_token,
 # migrate_graph_groups, bulk_promote_visibility). Production operators

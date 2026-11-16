@@ -233,3 +233,46 @@ def test_stdio_refusal_check_fails_for_the_allowlisted_command(ctx, a):
     ok_id = f"acc-{ctx.run_id}-stdio0"
     expect_check_fails(check_stdio_refused, a, _mcp(ctx, ok_id, {"transport": "stdio", "command": "echo", "args": ["acc-allowed-stdio"]}))
     a.delete(f"/v1/connectors/{ok_id}")
+
+
+# ── destination policy (SSRF guard) ──────────────────────────────
+
+
+def check_destination_refused(client: NSClient, body: dict) -> None:
+    r = client.post("/v1/connectors", json=body)
+    assert r.status_code == 422, f"{body['config']} -> {r.status_code}: {r.text[:160]}"
+    assert client.get(f"/v1/connectors/{body['connector_id']}").status_code == 404, "a refused connector was stored anyway"
+
+
+def _rest_to(ctx, conn_id: str, list_url: str) -> dict:
+    return {
+        "connector_id": conn_id, "connector_type": "generic_rest", "credentials": {"bearer": f"zq-{ctx.run_id}-ssrf"},
+        "config": {"list_url": list_url, "items_path": "items"},
+        "default_category": "domain_knowledge", "default_scope": "global",
+    }
+
+
+@proves("ingest.connector-rest-api", "auth.connector-mcp-stdio")
+def test_connectors_cannot_target_internal_or_metadata_addresses(ctx, a):
+    # An internal host that the profile does NOT allowlist (same host, other port), loopback,
+    # the cloud metadata address, an IPv4-mapped loopback, a decimal-spelled loopback.
+    for n, url in enumerate((
+        f"http://{SINK_NAME}:9999/items", "http://127.0.0.1:8199/health", "https://127.0.0.1/items",
+        "https://169.254.169.254/latest/meta-data/", "https://[::ffff:127.0.0.1]/items", "https://2130706433/items",
+    )):
+        check_destination_refused(a, _rest_to(ctx, f"acc-{ctx.run_id}-ssrf{n}", url))
+    check_destination_refused(a, _mcp(ctx, f"acc-{ctx.run_id}-ssrfm", {"url": f"https://{SINK_NAME}:9999/mcp"}))
+
+
+@proves("ingest.connector-rest-api", "auth.connector-mcp-stdio")
+@negative_control
+def test_destination_refusal_check_fails_for_the_allowlisted_sink(ctx, a, sink):
+    # The check must pass for a destination the guard refuses (loopback) before it is shown to fail
+    # for the allowlisted sink; otherwise a broken route would make this control pass vacuously.
+    precondition(
+        check_destination_refused, a, _rest_to(ctx, f"acc-{ctx.run_id}-ssrfpre", "https://127.0.0.1/items"),
+        what="a loopback destination is refused",
+    )
+    ok_id = f"acc-{ctx.run_id}-ssrf0"
+    expect_check_fails(check_destination_refused, a, _rest_to(ctx, ok_id, f"http://{SINK_NAME}:{PORT}{CONNECTOR_ITEMS_PATH}"))
+    a.delete(f"/v1/connectors/{ok_id}")

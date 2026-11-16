@@ -28,6 +28,7 @@ COMPOSE_ONLY_KEYS = frozenset({
     "DOMAIN",  # reverse-proxy host name
     "REDIS_PASSWORD",  # interpolated into REDIS_URL and the redis service
     "EMBEDDING_MODEL_NAME",  # interpolated into GEMINI_EMBEDDER_MODEL
+    "WORKER_AUTOHEAL",  # label value on the worker services (opt out of autoheal restarts)
 })
 # * Vendored-env keys: read straight from the process environment by vendored library
 #   code (mem0 adapter), not by Settings. Tolerated in the file so a template can
@@ -225,6 +226,31 @@ class Settings(BaseSettings):
     llm_retry_base_delay: float = 1.0  # seconds
     llm_retry_max_delay: float = 30.0  # seconds
 
+    # ── pgvector direct-store adapter (default OFF) ──
+    # Used as the shadow backend of the engine switch (build_default_switch) when ENGINE_ROUTING_ENABLED.
+    # Like the ENGINE_ROUTING_* settings below it has no effect until a later change wires the ledger producer.
+    engine_pgvector_enabled: bool = False
+    engine_pgvector_dsn: str = ""
+    engine_pgvector_schema: str = "ns_engine"
+    engine_pgvector_dimensions: int = 0
+
+    # ── Engine routing (V3 switch; default OFF) ───────────────────────────
+    # When enabled, the vector stage of ledger writes/edits/deletes also projects
+    # the memory into a routed engine (generation 1 = a Qdrant projection
+    # collection), an operator can run dual-write/catch-up/flip/rollback through
+    # the dictator-only /v1/admin/engine-switch/* routes, and, if
+    # ENGINE_ROUTING_RECALL_ENABLED, /v1/search serves its vector recall from the
+    # routed engine.  The router keeps its state in one process: enable only
+    # where the API and the ledger worker share a process.
+    engine_routing_enabled: bool = False
+    engine_routing_recall_enabled: bool = False
+    engine_routing_qdrant_collection: str = "neuralscape_engine_projection"
+    engine_routing_dimensions: int = 0
+    # Seconds the previous generation is kept for rollback after a flip.  When it elapses the
+    # first routed write releases and destroys it (erased text must not outlive the window).
+    # 0 keeps it until an explicit release.
+    engine_routing_rollback_window_seconds: float = 0.0
+
     # ── Graph-contradiction supersession (flag, default OFF) ──────────
     # When Graphiti's add_episode invalidates an older RELATES_TO edge, mark
     # the Qdrant row that edge came from with a reversible tombstone
@@ -402,8 +428,7 @@ class Settings(BaseSettings):
     # re-homes those ids' future graph writes: run
     # scripts/migrate_graph_groups.py --audit-delimiter-ids first. The read-side
     # call sites (memory/search.py narrowed branches, memory/reads.py
-    # list_projects, dreaming card/consolidate pool names) must adopt the
-    # builder before this is enabled.
+    # list_projects, dreaming card/consolidate pool names) use the same builder.
     graph_group_id_injective_enabled: bool = False
     # Bounded second-chance re-ask for false abstentions (T2.1): when the
     # normal answering loop produces an abstention AND at least one evidence
@@ -442,6 +467,10 @@ class Settings(BaseSettings):
     # stdio entirely. Allowlisting a general interpreter
     # (python, node, npx, sh ...) is equivalent to allowing arbitrary code.
     connector_stdio_commands: str = ""
+    # Comma-separated exact hostnames (optionally host:port) a connector may fetch
+    # even though they are internal (loopback / private / link-local) or plain http.
+    # Empty (default): connectors may only reach public hosts over https.
+    connector_allowed_hosts: str = ""
 
     # ── Document/file ingestion ───────────────────────────────────────
     # Rich formats (PDF, MS Office docx/xlsx/pptx, HTML, …) are converted to
@@ -723,6 +752,13 @@ class Settings(BaseSettings):
     # Format: "alice@example.com:alice,ops@example.com:ops-bot"
     auth_identity_map: str = ""
 
+    # Optional allowlist of hosts an OAuth client may register as a redirect
+    # target (comma-separated, case-insensitive; "host" or "host:port"). Empty
+    # (the default) keeps today's rule: any https URI, or http to loopback.
+    # A bare host matches the scheme's default port only. Loopback hosts stay
+    # allowed for native clients even when this is set (RFC 8252 section 7.3).
+    oauth_redirect_host_allowlist: str = ""
+
     # ── Dictator role + authoritative "standard" memory tier ─────────────
     # Feature-flagged OFF by default so the public/generic build behaves
     # identically until a deployment opts in.
@@ -847,6 +883,40 @@ class Settings(BaseSettings):
             raise ValueError("NEURALSCAPE_PUBLIC_URL must use https:// (except loopback hosts)")
         return value.rstrip("/")
 
+    @field_validator("oauth_redirect_host_allowlist")
+    @classmethod
+    def _validate_oauth_redirect_host_allowlist(cls, value: str) -> str:
+        """Reject malformed entries at startup instead of ignoring them.
+
+        A bad entry silently dropped (or a value of only separators, which would
+        parse to an empty list = allow everything) would leave the operator
+        believing a restriction is in force when it is not.
+        """
+        import re
+
+        raw = (value or "").strip()
+        if not raw:
+            return ""
+        host_re = re.compile(r"^[a-z0-9]([a-z0-9.-]{0,251}[a-z0-9])?$")
+        out: list[str] = []
+        for part in raw.split(","):
+            entry = part.strip().lower()
+            if not entry:
+                raise ValueError(
+                    "OAUTH_REDIRECT_HOST_ALLOWLIST has an empty entry (stray or doubled comma); "
+                    "list hostnames as 'host' or 'host:port'"
+                )
+            host, sep, port = entry.partition(":")
+            bad_port = sep and not (port.isascii() and port.isdigit() and 0 < int(port) <= 65535)
+            if not entry.isascii() or not host_re.match(host) or bad_port:
+                raise ValueError(
+                    f"OAUTH_REDIRECT_HOST_ALLOWLIST entry {part.strip()!r} is not a valid "
+                    "'host' or 'host:port' (ASCII hostname, no scheme, path, userinfo or "
+                    "brackets; port 1-65535; use the punycode form for an IDN host)"
+                )
+            out.append(entry)
+        return ",".join(out)
+
     @field_validator("ledger_backend")
     @classmethod
     def _validate_ledger_backend(cls, value: str) -> str:
@@ -854,20 +924,6 @@ class Settings(BaseSettings):
         if backend not in ("sqlite", "postgres"):
             raise ValueError("LEDGER_BACKEND must be 'sqlite' or 'postgres'")
         return backend
-
-    @model_validator(mode="after")
-    def _refuse_injective_group_ids_until_read_side_adopted(self) -> "Settings":
-        # Fail closed: with this on, writes use nsg1-- names but the narrowed read
-        # branches (memory/search.py), list_projects (memory/reads.py) and the
-        # dreaming pool names still use legacy names, so reads would miss writes
-        # (and a '--' user id would query another user's legacy pool). Remove this
-        # guard in the PR that routes those call sites through the group-id builder.
-        if self.graph_group_id_injective_enabled:
-            raise ValueError(
-                "GRAPH_GROUP_ID_INJECTIVE_ENABLED cannot be enabled yet: the read-side call sites "
-                "have not adopted the injective group-id builder (tracked follow-up, lane read-10)"
-            )
-        return self
 
     @model_validator(mode="after")
     def _validate_ledger_target(self) -> "Settings":
@@ -1139,6 +1195,14 @@ class Settings(BaseSettings):
             if e.strip()
         }
 
+    def oauth_redirect_host_allowlist_set(self) -> set[str]:
+        """Lowercased ``host`` / ``host:port`` entries of the redirect-host allowlist."""
+        return {
+            e.strip().lower()
+            for e in self.oauth_redirect_host_allowlist.split(",")
+            if e.strip()
+        }
+
     def identity_map_dict(self) -> dict[str, str]:
         """Parse "email:user_id,email2:user_id2" into a lowercased-email map."""
         out: dict[str, str] = {}
@@ -1175,6 +1239,12 @@ class Settings(BaseSettings):
             if parts:
                 out.add(shlex.join(parts))
         return out
+
+    def connector_allowed_hosts_set(self) -> frozenset[str]:
+        """Parsed CSV of hosts connectors may reach despite the destination policy."""
+        from connectors.destination import parse_allowed_hosts
+
+        return parse_allowed_hosts(self.connector_allowed_hosts)
 
     # ── sensitivity gate helpers ──────────────────────────────────────────
     def sensitivity_private_classes_set(self) -> set[str]:
