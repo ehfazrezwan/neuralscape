@@ -30,13 +30,23 @@ def semantic_dedup_phase_enabled() -> bool:
     so the LOSSY phase (hard delete) is skipped. With
     ``DEDUP_SEMANTIC_TOMBSTONE_ENABLED`` phase 2 is not lossy (it only tombstones:
     reversible, nothing deleted, nothing cascaded), so an operator who opted in
-    gets it whether or not dreaming is on. Two guards keep it off the sweep's rows:
-    ``dedup_memories`` skips a pool whose dream lock is held, and the sweep's
-    ``apply_actions`` skips a MERGE whose rows were tombstoned after staging.
+    gets it whether or not dreaming is on. With dreaming on, two guards keep it off
+    the sweep's rows: ``dedup_memories`` holds a pool's dream lock for as long as
+    it works on that pool's rows (and skips the pool if it cannot take it), and
+    the sweep's ``apply_actions`` skips any action whose rows were tombstoned
+    after staging.
     """
     from extensions.dreaming.config import dreaming_settings
 
     return (not dreaming_settings.enabled) or bool(settings.dedup_semantic_tombstone_enabled)
+
+
+# Sentinel: no dream-pool lock is held (dreaming off), so no neighbour pool check.
+_NO_POOL_GUARD: str = "\0no-pool-guard"
+# Expiry of the dream lock dedup holds while it works on one page of a pool's rows:
+# long enough for a page of vector searches, short enough that a crashed run frees
+# the pool for the sweep quickly.
+_DEDUP_LOCK_TTL_MS = 10 * 60 * 1000
 
 
 def _dream_pool_of(payload: dict) -> str | None:
@@ -971,22 +981,36 @@ class DeleteMixin:
 
         return bool(dreaming_settings.enabled)
 
-    def _dream_pool_locked(self, pool: str, cache: dict[str, bool]) -> bool:
-        """Whether the dream sweep currently holds ``pool``'s lock (cached per run).
+    @staticmethod
+    def _dream_lock_client():
+        """A Redis client that answers, or None (dedup then skips the semantic phase)."""
+        try:
+            from extensions.dreaming.sweep import _get_redis
 
-        Fails open: no Redis client or a Redis error reads as not locked
-        (``gate.is_locked`` already does the latter).
-        """
-        if pool not in cache:
-            try:
-                from extensions.dreaming import gate
-                from extensions.dreaming.sweep import _get_redis
+            client = _get_redis()
+            client.ping()
+            return client
+        except Exception:
+            logger.warning(
+                "dream lock unavailable (Redis down): the semantic dedup phase is skipped "
+                "this run, nothing is tombstoned without the pool's dream lock",
+                exc_info=True,
+            )
+            return None
 
-                cache[pool] = gate.is_locked(_get_redis(), pool)
-            except Exception:
-                logger.warning("dream lock probe failed for %s", pool, exc_info=True)
-                cache[pool] = False
-        return cache[pool]
+    def _live_rows(self, rows: list[dict]) -> list[dict]:
+        """``rows`` minus any tombstoned since the page was read (fresh Qdrant read)."""
+        points = self._memory.vector_store.client.retrieve(
+            collection_name=settings.qdrant_collection,
+            ids=[r["id"] for r in rows],
+            with_payload=True,
+            with_vectors=False,
+        )
+        hidden = {
+            str(pt.id) for pt in points or []
+            if _is_tombstoned(getattr(pt, "payload", None) or {})
+        }
+        return [r for r in rows if r["id"] not in hidden]
 
     def dedup_memories(self, user_id: str, *, semantic: bool = True) -> dict:
         """Remove duplicate memories for a user in two phases.
@@ -1114,34 +1138,66 @@ class DeleteMixin:
 
         # One page at a time, so stored vectors are held for at most
         # ``batch_size`` rows (a full user pool of 768-d vectors would not fit).
-        # With dreaming on, a pool whose dream lock is held is mid-sweep: the
-        # sweep may be folding a MERGE into one of these very rows, so phase 2
-        # leaves that pool alone this run (the next run picks it up).
+        # With dreaming on, phase 2 HOLDS the dream lock of each pool for the
+        # time it works on that pool's rows (the sweep's own key, non-blocking):
+        # a pool whose lock it cannot take is mid-sweep and is skipped this run
+        # (reported, the next run picks it up). With Redis down it cannot take
+        # any lock, so the whole phase is skipped, never run unlocked.
         locked_pools: set[str] = set()
-        pool_lock_cache: dict[str, bool] = {}
         dreaming_on = self._dreaming_enabled()
+        lock_redis = None
+        if dreaming_on:
+            lock_redis = self._dream_lock_client()
+            if lock_redis is None:
+                logger.info(
+                    "dedup run user=%s scanned=%d exact_removed=%d semantic=skipped "
+                    "(dream lock unavailable)", user_id, total_checked, exact_removed,
+                )
+                return {
+                    "user_id": user_id,
+                    "exact_duplicates_removed": exact_removed,
+                    "semantic_duplicates_removed": 0,
+                    "semantic_skipped": "dream lock unavailable (Redis)",
+                    "total_checked": total_checked,
+                    **self._dedup_graph_summary(collector, deleted_ids),
+                }
         for page in self._iter_user_memory_pages(user_id, batch_size):
             chunk = [
                 mem for mem in page
                 if mem["id"] not in deleted_ids and not _is_tombstoned(mem["payload"])
             ]
-            if dreaming_on:
-                unlocked = []
-                for mem in chunk:
-                    pool = _dream_pool_of(mem["payload"])
-                    if pool is not None and self._dream_pool_locked(pool, pool_lock_cache):
-                        locked_pools.add(pool)
-                    else:
-                        unlocked.append(mem)
-                chunk = unlocked
             if not chunk:
                 continue
-            stored_vectors = self._fetch_dense_vectors([mem["id"] for mem in chunk])
+            groups: dict[str | None, list[dict]] = {}
             for mem in chunk:
-                semantic_removed += self._semantic_dedup_one(
-                    m, user_id, mem, stored_vectors.get(mem["id"]), threshold, deleted_ids,
-                    collector=collector,
-                )
+                pool = _dream_pool_of(mem["payload"]) if dreaming_on else None
+                groups.setdefault(pool, []).append(mem)
+            for pool, rows in groups.items():
+                token = None
+                if pool is not None:
+                    from extensions.dreaming import gate
+
+                    token = gate.acquire_lock(lock_redis, pool, ttl_ms=_DEDUP_LOCK_TTL_MS)
+                    if token is None:
+                        locked_pools.add(pool)
+                        continue
+                try:
+                    if pool is not None:
+                        # Rows may have been tombstoned by a sweep that ran
+                        # between reading the page and taking the lock.
+                        rows = self._live_rows(rows)
+                        if not rows:
+                            continue
+                    stored_vectors = self._fetch_dense_vectors([mem["id"] for mem in rows])
+                    for mem in rows:
+                        semantic_removed += self._semantic_dedup_one(
+                            m, user_id, mem, stored_vectors.get(mem["id"]), threshold,
+                            deleted_ids, collector=collector,
+                            held_pool=pool if dreaming_on else _NO_POOL_GUARD,
+                        )
+                finally:
+                    if token is not None:
+                        gate.release_lock(lock_redis, pool, token)
 
         logger.info(
             "dedup run user=%s scanned=%d exact_removed=%d semantic_pairs_merged=%d "
@@ -1184,8 +1240,16 @@ class DeleteMixin:
         threshold: float,
         deleted_ids: set[str],
         collector: dict | None = None,
+        held_pool: str | None = _NO_POOL_GUARD,
     ) -> int:
         """Phase 2 for one memory: merge near-duplicates in its own partition.
+
+        ``held_pool`` is the dream pool whose lock the caller holds (None: a tier
+        the sweep never touches). A neighbour in another pool is left alone: the
+        lock covers one pool, and the sweep may be working on the other. The
+        dedup partition normally lies inside one pool; the two differ only for
+        rows whose ``owner_user_id`` is not their ``user_id``. Left at the
+        default no pool check is made (dreaming off: no lock is held).
 
         Searches with the row's STORED dense vector (the embedder is only
         called when the row has none) and restricts candidates to the same
@@ -1220,6 +1284,8 @@ class DeleteMixin:
             hit_payload = hit.get("payload", {}) if isinstance(hit, dict) else (hit.payload or {})
 
             if hit_id == mid or hit_id in deleted_ids:
+                continue
+            if held_pool is not _NO_POOL_GUARD and _dream_pool_of(hit_payload) != held_pool:
                 continue
 
             # Merge the older one into the newer

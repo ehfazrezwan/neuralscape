@@ -118,18 +118,19 @@ def check_volume_gate(new_memory_count: int, *, min_new_memories: int) -> GateDe
     return GateDecision(True)
 
 
-def acquire_lock(redis, pool: str) -> str | None:
+def acquire_lock(redis, pool: str, *, ttl_ms: int | None = None) -> str | None:
     """Take the pool's dream lock. Returns an owner token, or None if held.
 
     ``SET NX PX`` is atomic across processes; the PX expiry doubles as the
     stale-reclaim (>1h) so a crashed sweep can never wedge a pool forever.
     Pass the token back to :func:`release_lock` — release is a no-op unless
-    the token still owns the key.
+    the token still owns the key. ``ttl_ms`` shortens the expiry for a holder
+    with a bounded job (the semantic dedup pass); the default is the sweep's.
     """
     key = _LOCK_KEY.format(pool=pool)
     token = uuid.uuid4().hex
     try:
-        if redis.set(key, token, nx=True, px=_LOCK_STALE_MS):
+        if redis.set(key, token, nx=True, px=ttl_ms or _LOCK_STALE_MS):
             return token
         return None
     except Exception:
