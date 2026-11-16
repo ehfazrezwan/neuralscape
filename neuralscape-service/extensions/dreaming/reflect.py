@@ -135,10 +135,45 @@ def store_insights(service, batch: PoolBatch, insights: list[dict], *, dry_run: 
 
 
 def diary_page_path(dreams_dir: Path, pool: str) -> Path:
+    """The pool's diary page: a readable slug plus a hash of the EXACT pool id.
+
+    The slug alone is lossy (``--``/``_`` collapse, 80-char truncation), so
+    two different pools could share one file and mix private text. The
+    10-hex SHA-256 suffix of the unmodified pool id keeps names distinct and
+    stable across runs. This is the only place a diary name is computed.
+    """
+    import hashlib
+
     from extensions.conversation_compiler.obsidian_writer import _slugify
 
-    slug = _slugify(pool) or "pool"
-    return dreams_dir / f"{slug}.md"
+    slug = (_slugify(pool) or "pool")[:48].strip("-") or "pool"
+    digest = hashlib.sha256(pool.encode("utf-8")).hexdigest()[:10]
+    return dreams_dir / f"{slug}-{digest}.md"
+
+
+def legacy_diary_page_path(dreams_dir: Path, pool: str) -> Path:
+    """The pre-hash name (slug only), kept for one-time migration."""
+    from extensions.conversation_compiler.obsidian_writer import _slugify
+
+    return dreams_dir / f"{_slugify(pool) or 'pool'}.md"
+
+
+def _migrate_legacy_diary(dreams_dir: Path, pool: str, path: Path) -> None:
+    """Move the old slug-only diary to the new name when it is provably this pool's.
+
+    The old file's ``pool`` frontmatter must equal ``pool`` exactly. A file
+    that belongs to another pool (a collision) or carries no pool stays where
+    it is and is never written again.
+    """
+    old = legacy_diary_page_path(dreams_dir, pool)
+    if old == path or not old.exists() or path.exists():
+        return
+    try:
+        fm, _ = okf_translate.parse_document(old.read_text(encoding="utf-8"))
+        if str(fm.get("pool", "")).strip().strip("'\"") == pool:
+            old.replace(path)
+    except Exception:
+        logger.warning("legacy diary migration failed for %s (non-fatal)", pool, exc_info=True)
 
 
 def render_diary_entry(
@@ -197,6 +232,7 @@ def write_diary(
     from extensions.conversation_compiler.obsidian_writer import _atomic_write
 
     path = diary_page_path(dreams_dir, pool)
+    _migrate_legacy_diary(dreams_dir, pool, path)
     title = f"Dreams — {pool}"
     try:
         existing = path.read_text(encoding="utf-8") if path.exists() else ""
