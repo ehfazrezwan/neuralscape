@@ -256,7 +256,10 @@ class CoreMixin:
         if self._genai_model is None:
             with self._init_lock:
                 if self._genai_model is None:
-                    self._genai_model = genai.Client(api_key=settings.google_api_key)
+                    self._genai_model = genai.Client(
+                        api_key=settings.google_api_key,
+                        http_options=settings.gemini_http_options(),
+                    )
         return self._genai_model
 
     def close(self):

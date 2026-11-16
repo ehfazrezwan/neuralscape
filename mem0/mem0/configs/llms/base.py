@@ -25,6 +25,8 @@ class BaseLlmConfig(ABC):
         vision_details: Optional[str] = "auto",
         reasoning_effort: Optional[str] = None,
         http_client_proxies: Optional[Union[Dict, str]] = None,
+        # NEURALSCAPE PATCH: per-request timeout in seconds for providers that honour it (gemini).
+        request_timeout_s: Optional[float] = None,
     ):
         """
         Initialize a base configuration class instance for the LLM.
@@ -65,3 +67,4 @@ class BaseLlmConfig(ABC):
         self.vision_details = vision_details
         self.reasoning_effort = reasoning_effort
         self.http_client = httpx.Client(proxies=http_client_proxies) if http_client_proxies else None
+        self.request_timeout_s = request_timeout_s  # NEURALSCAPE PATCH

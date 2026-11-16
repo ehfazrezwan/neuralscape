@@ -99,6 +99,7 @@ All settings live in `neuralscape-service/config.py` as a Pydantic `BaseSettings
 | `qdrant_path` | `~/.neuralscape/qdrant` | `config.py` |
 | `qdrant_collection` | `neuralscape_memories` | `config.py` |
 | `qdrant_timeout` | `30` (seconds; env `QDRANT_TIMEOUT`) | `config.py` |
+| `gemini_request_timeout_s` | `120` (seconds, must be > 0; env `GEMINI_REQUEST_TIMEOUT_S`) | `config.py` |
 | `arq_queue_name` | `neuralscape:queue` | `config.py` |
 | `arq_max_retries` | `3` | `config.py` |
 | `arq_job_timeout` | `300` (sec) | `config.py` |
