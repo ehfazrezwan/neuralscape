@@ -5,7 +5,6 @@
 | node | status | what is missing |
 |---|---|---|
 | `fork.mem0.entity-store` | dead-code | unreachable on a live path: since PR #479 no route calls mem0's add/search, so the entity side-collection is never touched (writes go through the service's own store_raw / extract_and_store); the lock and cold-start retry are covered by (#481) real-store integration tests |
-| `ops.autoheal` | gap | the autoheal sidecar and its docker-socket proxy are not part of the gate's stack (app services and backing stores only), and proving it means making a container unhealthy and waiting out its 90 s start delay plus poll interval; wiring reviewed with (#488) |
 | `ext.dreaming-graph-patcher` | gap | its effects are Neo4j node properties (memory_id, ns_visibility/ns_owner stamps, dream_superseded_by) that no REST or MCP read exposes; the one observable effect (edge invalidation of a superseded fact) rides on the graph-supersession and flags-on dreaming scenarios, which claim their own nodes; the attach-window mislabel bug is owned by (#501) |
 | `fork.mem0.add-pipeline` | dead-code | mem0's native add is on no live path: since PR #479 legacy POST /memories runs the service's own extract_and_store and the service bypasses m.add everywhere; that legacy write is exercised by the delete.legacy-passthrough scenarios |
 | `fork.graphiti.custom-ontology` | gap | ontology-typed nodes are written into the reference-workspace graph group of an adapter ingest; the recall graph leg for those groups landed with PR #504 (merged), but no scenario inspects ontology-typed nodes yet |
