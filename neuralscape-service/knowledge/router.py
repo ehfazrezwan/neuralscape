@@ -132,6 +132,10 @@ _MERGEABLE_FIELDS = frozenset(
 _NON_NULLABLE_FIELDS = frozenset({"code_systems", "fuse_code_into_recall"})
 
 
+class KnowledgeConfigStoreError(RuntimeError):
+    """The authoritative (Redis) read failed, so a merge was refused and nothing written."""
+
+
 def merge_project_config(project_id: str, **updates) -> ProjectKnowledgeConfig:
     """Apply ``updates`` onto the project's stored config and persist the result.
 
@@ -141,23 +145,28 @@ def merge_project_config(project_id: str, **updates) -> ProjectKnowledgeConfig:
     stored config the defaults apply. ``code_systems`` and
     ``fuse_code_into_recall`` given as None are treated as not supplied;
     ``default_engine``, ``code_space`` and ``op_preference`` may be set to None
-    to clear them. Reads Redis directly (bypassing the store's 30s in-process
-    cache) so a config a worker wrote moments ago is not overwritten with a stale copy.
+    to clear them. Reads Redis directly (bypassing the in-process caches) so a
+    config a worker wrote moments ago is not overwritten; if that read fails,
+    raises KnowledgeConfigStoreError and writes nothing (local copy used only
+    when no Redis client exists).
     """
     unknown = set(updates) - _MERGEABLE_FIELDS
     if unknown:
         raise ValueError(f"unknown project knowledge config field(s): {sorted(unknown)}")
     from knowledge import index_store
 
-    raw = None
     client = index_store._redis()
     if client is not None:
+        # Redis is the authority: never merge onto a local copy (up to 30s old)
+        # that could hold an older code_space than a worker just wrote.
         try:
             blob = client.get(index_store._CFG_PREFIX + project_id)
             raw = json.loads(blob) if blob else None
-        except Exception:  # noqa: BLE001 — fall back to the cached read below
-            raw = None
-    if raw is None:
+        except Exception as exc:  # noqa: BLE001
+            raise KnowledgeConfigStoreError(
+                f"cannot read the stored knowledge config for {project_id!r}; nothing was changed, retry shortly"
+            ) from exc
+    else:  # memory-only mode (no Redis client)
         raw = index_store.load_project_config(project_id)
     if raw:
         current = ProjectKnowledgeConfig(
@@ -169,7 +178,8 @@ def merge_project_config(project_id: str, **updates) -> ProjectKnowledgeConfig:
             op_preference=raw.get("op_preference"),
         )
     else:
-        current = _PROJECT_CONFIGS.get(project_id) or ProjectKnowledgeConfig(project_id=project_id)
+        local = _PROJECT_CONFIGS.get(project_id) if client is None else None
+        current = local or ProjectKnowledgeConfig(project_id=project_id)
     merged = ProjectKnowledgeConfig(
         project_id=project_id,
         code_systems=list(current.code_systems or []),

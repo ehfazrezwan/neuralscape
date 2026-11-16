@@ -1204,10 +1204,9 @@ async def list_tools() -> list[Tool]:
         Tool(
             name="set_project_knowledge_config",
             description=(
-                "Set/update a project's knowledge routing config (Phase D): which code "
-                "systems are available, whether to fuse code into generic recall (default "
-                "TRUE per decision #3), and which engine to prefer. Typically set at index "
-                "time but can be edited later."
+                "Set a project's knowledge routing config: code systems, whether to fuse "
+                "code into generic recall (default true), preferred engine. Only fields "
+                "you pass change."
             ),
             inputSchema={
                 "type": "object",
@@ -1226,8 +1225,8 @@ async def list_tools() -> list[Tool]:
                         "description": "Enable code fusion for generic recall (default TRUE)",
                     },
                     "default_engine": {
-                        "type": "string",
-                        "description": "Default code engine name (e.g. 'code-cbm')",
+                        "type": ["string", "null"],
+                        "description": "Default engine (e.g. 'code-cbm'); null clears",
                     },
                 },
                 "required": ["project_id"],
@@ -2690,7 +2689,7 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
             return [TextContent(type="text", text=json.dumps(result, default=str))]
 
         elif name == "set_project_knowledge_config":
-            from knowledge.router import merge_project_config
+            from knowledge.router import KnowledgeConfigStoreError, merge_project_config
 
             if not is_admin_user(user_id):
                 return [TextContent(type="text", text=json.dumps(
@@ -2706,7 +2705,10 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
                 for k in ("code_systems", "fuse_code_into_recall", "default_engine")
                 if k in arguments
             }
-            config = merge_project_config(project_id, **sent)
+            try:
+                config = merge_project_config(project_id, **sent)
+            except KnowledgeConfigStoreError as e:
+                return [TextContent(type="text", text=json.dumps({"error": str(e)}))]
             result = {
                 "project_id": config.project_id,
                 "code_systems": config.code_systems,

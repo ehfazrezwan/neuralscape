@@ -96,3 +96,26 @@ async def test_mcp_set_keeps_code_space_in_real_redis(real_config, unique_ns):
     rec = stored()
     assert rec["code_space"] == f"code--{unique_ns.user_id}--svc"
     assert rec["default_engine"] == "code-cbm"
+
+
+def test_edit_keeps_a_newer_code_space_written_behind_primed_local_caches(real_config, unique_ns):
+    """The caches hold an old code_space; Redis (the worker) holds a newer one."""
+    seed, stored = real_config
+    seed()
+    old = f"code--{unique_ns.user_id}--svc"
+    new = f"code--{unique_ns.user_id}--reindexed"
+    kr.get_project_config(unique_ns.project_id)  # prime router mirror + index_store L1 with `old`
+    assert index_store._mem_cfg and kr._PROJECT_CONFIGS
+    client = redis.Redis.from_url(settings.redis_url, decode_responses=True)
+    rec = stored()
+    rec["code_space"] = new
+    client.set(index_store._CFG_PREFIX + unique_ns.project_id, json.dumps(rec))
+    assert kr.get_project_config(unique_ns.project_id).code_space == old  # caches really are stale
+    r = TestClient(app).put(
+        f"/v1/projects/{unique_ns.project_id}/knowledge-config",
+        json={"project_id": unique_ns.project_id, "fuse_code_into_recall": False},
+        headers=_hdr(unique_ns.user_id),
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["code_space"] == new
+    assert stored()["code_space"] == new

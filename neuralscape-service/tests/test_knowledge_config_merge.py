@@ -135,3 +135,84 @@ def test_merge_helper_rejects_unknown_fields_and_can_set_code_space():
     cfg = kr.merge_project_config(PID, code_systems=["code-native"], code_space="code--a--b")
     assert cfg.code_space == "code--a--b"
     assert kr.merge_project_config(PID, default_engine="code-native").code_space == "code--a--b"
+
+
+# ── Redis is the authority for the merge ─────────────────────────
+
+
+class FakeRedis:
+    def __init__(self):
+        self.data = {}
+        self.fail_get = False
+
+    def get(self, key):
+        if self.fail_get:
+            raise ConnectionError("redis down")
+        return self.data.get(key)
+
+    def set(self, key, value):
+        self.data[key] = value
+
+
+@pytest.fixture()
+def fake_redis(monkeypatch):
+    r = FakeRedis()
+    monkeypatch.setattr(index_store, "_redis", lambda: r)
+    return r
+
+
+def test_merge_refuses_and_writes_nothing_when_the_redis_read_fails(fake_redis):
+    _indexed()  # local copies + fake redis hold code_space
+    before = dict(fake_redis.data)
+    fake_redis.fail_get = True
+    with pytest.raises(kr.KnowledgeConfigStoreError):
+        kr.merge_project_config(PID, fuse_code_into_recall=False)
+    assert fake_redis.data == before
+    assert kr._PROJECT_CONFIGS[PID].fuse_code_into_recall is True  # local mirror untouched too
+
+
+def test_rest_put_is_503_and_mcp_is_an_error_when_the_redis_read_fails(fake_redis):
+    _indexed()
+    before = dict(fake_redis.data)
+    fake_redis.fail_get = True
+    r = _put({"project_id": PID, "fuse_code_into_recall": False})
+    assert r.status_code == 503 and "nothing was changed" in r.json()["detail"]
+    assert fake_redis.data == before
+
+
+@pytest.mark.asyncio
+async def test_mcp_set_returns_an_error_when_the_redis_read_fails(fake_redis):
+    _indexed()
+    before = dict(fake_redis.data)
+    fake_redis.fail_get = True
+    out = await _mcp("set_project_knowledge_config", {"project_id": PID, "fuse_code_into_recall": False})
+    assert "nothing was changed" in out["error"]
+    assert fake_redis.data == before
+
+
+def test_merge_keeps_a_newer_code_space_a_worker_wrote_behind_stale_local_caches(fake_redis):
+    _indexed()  # both local caches now hold code--alice--svc
+    newer = json.loads(fake_redis.data[index_store._CFG_PREFIX + PID])
+    newer["code_space"] = "code--alice--worker-new"
+    fake_redis.data[index_store._CFG_PREFIX + PID] = json.dumps(newer)  # worker write, caches not told
+    cfg = kr.merge_project_config(PID, fuse_code_into_recall=False)
+    assert cfg.code_space == "code--alice--worker-new"
+    assert json.loads(fake_redis.data[index_store._CFG_PREFIX + PID])["code_space"] == "code--alice--worker-new"
+
+
+def test_redis_has_no_config_means_defaults_even_if_a_local_copy_exists(fake_redis):
+    _indexed()
+    fake_redis.data.clear()  # authority says: none
+    assert kr.merge_project_config(PID, fuse_code_into_recall=False).code_space is None
+
+
+@pytest.mark.asyncio
+async def test_mcp_null_default_engine_clears_it_and_the_schema_allows_null():
+    import mcp_server
+
+    tool = next(t for t in await mcp_server.list_tools() if t.name == "set_project_knowledge_config")
+    assert "null" in tool.inputSchema["properties"]["default_engine"]["type"]
+    _indexed()
+    out = await _mcp("set_project_knowledge_config", {"project_id": PID, "default_engine": None})
+    assert out["default_engine"] is None and out["code_space"] == "code--alice--svc"
+    assert out["code_systems"] == ["code-native"]

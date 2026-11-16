@@ -3520,11 +3520,15 @@ async def v1_set_project_knowledge_config(
             status_code=403,
             detail=f"User {user_id!r} is not authorized to set project knowledge config.",
         )
-    from knowledge.router import merge_project_config
+    from knowledge.router import KnowledgeConfigStoreError, merge_project_config
 
     # Only the fields the caller sent change; code_space/op_preference survive.
+    # An explicit null default_engine clears it.
     sent = req.model_dump(exclude_unset=True, exclude={"project_id"})
-    config = merge_project_config(project_id, **sent)
+    try:
+        config = merge_project_config(project_id, **sent)
+    except KnowledgeConfigStoreError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     return ProjectKnowledgeConfigResponse(
         project_id=config.project_id,
         code_systems=config.code_systems,
