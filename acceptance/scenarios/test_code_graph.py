@@ -102,6 +102,7 @@ def test_index_pipeline_reports_an_unconfigured_repo_as_not_indexed(ctx, a, nati
     r = a.post("/v1/code-graph/index", json={"repo_source": "/nowhere", "system": SYSTEM, "code_space": f"code--{ctx.user_a}--not-configured"})
     # dev refuses an unconfigured repo up front: 400, never an accepted task
     assert r.status_code == 400, f"POST /v1/code-graph/index for a repo not in CODE_REPOS -> {r.status_code} (want 400): {r.text[:160]}"
+    assert "CODE_REPOS" in str(r.json().get("detail", "")), f"the refusal does not name CODE_REPOS: {r.text[:200]}"
     outcome = {"ok": False, "http": r.status_code, "body": r.text[:120]}
     expect_check_fails(check, outcome, "an unconfigured repo")  # the "it was indexed" check cannot pass for a repo that is not in CODE_REPOS
 
@@ -350,30 +351,40 @@ class Deleted:
 
 @pytest.fixture(scope="module")
 def deleted(ctx, a, mcp_a) -> Deleted:
-    d = Deleted(f"code--{ctx.user_a}-del--svc", f"{ctx.project_id}-del", f"zq-{ctx.run_id}-delanchor")
+    d = Deleted(f"code--{ctx.user_a}--svcdel", f"{ctx.project_id}-del", f"zq-{ctx.run_id}-delanchor")
     try:
-        r = a.post("/v1/code-graph/index", json={"repo_source": repo_source_of(ctx), "system": SYSTEM, "code_space": d.code_space})
-        assert r.status_code == 202, f"POST /v1/code-graph/index (delete fixture) -> {r.status_code}: {r.text[:200]}"
-        st = a.poll_task(r.json()["task_id"], timeout=INDEX_WAIT)
-        assert st.get("status") == "completed" and (st.get("result") or {}).get("ok") is True, f"delete fixture index ended as {st}"
-        fqn = check_located(cg_get(a, "locate", query=SYMBOL, graph_id=d.code_space, knowledge_system=SYSTEM, k=5), SYMBOL)["fqn"]
-        canonical = ".".join(p for i, p in enumerate(fqn.split(".")) if not (i == 0 and p in ("src", "lib")))
-        task = a.store_raw(
-            f"{d.marker} We keep resolve_systems side-effect free so the router can be called on every recall.", "decision",
-            scope="project", project_id=d.project, visibility="private",
-            source_ref={"connector_id": f"acc-{ctx.run_id}-delanchor", "connector_type": "file_upload", "external_id": f"svc::{canonical}"},
-        )
-        assert a.poll_task(task, timeout=120)["status"] == "completed", "the anchored memory was not stored"
-        d.before = cg_get(a, "query", question=SYMBOL, graph_id=d.code_space, knowledge_system=SYSTEM)["result"]
-        resp = a.delete("/v1/code-graph/graph", params={"graph_id": d.code_space, "system": SYSTEM})
-        d.response = {"status": resp.status_code, **(resp.json() if resp.status_code == 200 else {"text": resp.text[:200]})}
-        d.after = cg_get(a, "query", question=SYMBOL, graph_id=d.code_space, knowledge_system=SYSTEM)["result"]
-        d.again_status = a.delete("/v1/code-graph/graph", params={"graph_id": d.code_space, "system": SYSTEM}).status_code
-        mcp_a.initialize()
-        d.mcp_result = json.loads(mcp_text(mcp_a, "code_graph_delete", {"graph_id": d.code_space, "system": SYSTEM}))
+        _build_deleted(ctx, a, mcp_a, d)
     except AssertionError as exc:
         d.error = str(exc)
+    finally:
+        if d.response.get("status") != 200:  # a partial failure must not leave the space behind
+            try:
+                a.delete("/v1/code-graph/graph", params={"graph_id": d.code_space, "system": SYSTEM})
+            except Exception:  # noqa: BLE001 - cleanup is best effort
+                pass
     return d
+
+
+def _build_deleted(ctx, a, mcp_a, d: Deleted) -> None:
+    r = a.post("/v1/code-graph/index", json={"repo_source": repo_source_of(ctx), "system": SYSTEM, "code_space": d.code_space})
+    assert r.status_code == 202, f"POST /v1/code-graph/index (delete fixture) -> {r.status_code}: {r.text[:200]}"
+    st = a.poll_task(r.json()["task_id"], timeout=INDEX_WAIT)
+    assert st.get("status") == "completed" and (st.get("result") or {}).get("ok") is True, f"delete fixture index ended as {st}"
+    fqn = check_located(cg_get(a, "locate", query=SYMBOL, graph_id=d.code_space, knowledge_system=SYSTEM, k=5), SYMBOL)["fqn"]
+    canonical = ".".join(p for i, p in enumerate(fqn.split(".")) if not (i == 0 and p in ("src", "lib")))
+    task = a.store_raw(
+        f"{d.marker} We keep resolve_systems side-effect free so the router can be called on every recall.", "decision",
+        scope="project", project_id=d.project, visibility="private",
+        source_ref={"connector_id": f"acc-{ctx.run_id}-delanchor", "connector_type": "file_upload", "external_id": f"svc::{canonical}"},
+    )
+    assert a.poll_task(task, timeout=120)["status"] == "completed", "the anchored memory was not stored"
+    d.before = cg_get(a, "query", question=SYMBOL, graph_id=d.code_space, knowledge_system=SYSTEM)["result"]
+    resp = a.delete("/v1/code-graph/graph", params={"graph_id": d.code_space, "system": SYSTEM})
+    d.response = {"status": resp.status_code, **(resp.json() if resp.status_code == 200 else {"text": resp.text[:200]})}
+    d.after = cg_get(a, "query", question=SYMBOL, graph_id=d.code_space, knowledge_system=SYSTEM)["result"]
+    d.again_status = a.delete("/v1/code-graph/graph", params={"graph_id": d.code_space, "system": SYSTEM}).status_code
+    mcp_a.initialize()
+    d.mcp_result = json.loads(mcp_text(mcp_a, "code_graph_delete", {"graph_id": d.code_space, "system": SYSTEM}))
 
 
 def _deleted(d: Deleted) -> Deleted:

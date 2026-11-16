@@ -66,7 +66,7 @@ def test_the_flags_on_profile_turns_on_every_flag_the_scenarios_need():
     assert flags["DICTATOR_USER_IDS"] == "acc-dictator"
     assert flags["VAULT_KEY"] == "<generate:fernet>"
     assert flags["WEBHOOK_QUEUE_EMPTY_URL"] == f"http://{sidecar.SINK_NAME}:{sidecar.PORT}{sidecar.QUEUE_EMPTY_PATH}"
-    assert json.loads(flags["CODE_REPOS"]) == {"svc": "/app/neuralscape-service/knowledge"}
+    assert json.loads(flags["CODE_REPOS"]) == {"svc": "/app/neuralscape-service/knowledge", "svcdel": "/app/neuralscape-service/knowledge"}
     assert 0 < float(flags["DREAMING_SALIENCE_RECALL_K"]) <= 0.1
 
 
@@ -399,7 +399,10 @@ def test_every_negative_control_in_the_flag_scenarios_states_a_precondition():
         return d.id if isinstance(d, ast.Name) else getattr(d, "attr", "")
 
     def calls_precondition(fn):
-        return any(isinstance(n, ast.Call) and deco_name(n.func) == "precondition" for n in ast.walk(fn))
+        """A precondition(...) call that comes BEFORE the first expect_check_fails(...) call (by position)."""
+        pre = [n.lineno for n in ast.walk(fn) if isinstance(n, ast.Call) and deco_name(n.func) == "precondition"]
+        neg = [n.lineno for n in ast.walk(fn) if isinstance(n, ast.Call) and deco_name(n.func) == "expect_check_fails"]
+        return bool(pre) and (not neg or min(pre) < min(neg))
 
     missing, seen = [], 0
     for mod in flagged:
@@ -410,7 +413,7 @@ def test_every_negative_control_in_the_flag_scenarios_states_a_precondition():
                 if fn.name not in exempt and not calls_precondition(fn):
                     missing.append(f"{mod}::{fn.name}")
     assert seen > 20, f"scan found only {seen} negative controls"
-    assert missing == [], f"negative controls that never call precondition(): {missing}"
+    assert missing == [], f"negative controls that never call precondition() before the wrong-input check: {missing}"
 
 
 def test_a_comment_or_string_does_not_satisfy_the_precondition_scan():
