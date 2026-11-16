@@ -101,7 +101,9 @@ def _restoring_app_state(main):
     into the extension instances. Left in place, those mounted routes shadow the router another test
     builds for itself on the same paths (``test_extension_route_identity_redis``), so snapshot and restore
     the router's route list, the OpenAPI cache, the module globals the lifespan assigns, and the
-    extensions' injected task manager.
+    extensions' injected task manager. The lifespan also builds the shared ``MemoryService`` (``main._service``),
+    installs the policy on it and closes it at shutdown, so the real startup runs against a throwaway service
+    and the shared one is put back untouched.
     """
 
     app = main.app
@@ -109,9 +111,17 @@ def _restoring_app_state(main):
     extensions = dict(registry._extensions)
     injected = {name: getattr(e.instance, "_task_manager", None) for name, e in extensions.items()}
     saved = (list(app.router.routes), app.openapi_schema, main._vault, main._task_manager, registry)
+    from memory_service import MemoryService
+
+    shared_service = main._service
+    scratch_service = MemoryService()
+    main._service = scratch_service
     try:
         yield
     finally:
+        main._service = shared_service
+        with contextlib.suppress(Exception):  # the lifespan's shutdown already closed it once
+            scratch_service.close()
         app.router.routes[:] = saved[0]
         app.openapi_schema = saved[1]
         main._vault, main._task_manager, main._extension_registry = saved[2], saved[3], saved[4]
@@ -240,6 +250,21 @@ def test_credentials_are_ciphertext_at_rest_and_never_returned(env):
         assert r.status_code == 200 and BEARER not in r.text and "credentials_enc" not in r.text
 
 
+def test_a_non_allowlisted_http_source_is_still_refused_with_the_allowlist_set(env):
+    """The loopback allowlist entry must not open the guard: another port, or a public http host, is a 422 and nothing is stored."""
+    host = env.source.url.split("/")[2]
+    other_port = f"http://{host.split(':')[0]}:{int(host.split(':')[1]) + 1}/items"
+    for n, url in enumerate((other_port, "http://api.example.com/items")):
+        cid = f"{env.cid}-refused{n}"
+        cfg = {"list_url": url, "items_path": "items", "id_field": "id", "revision_field": "rev", "content_field": "body"}
+        resp = _register(env, env.alice, cid=cid, config=cfg)
+        assert resp.status_code == 422, (url, resp.status_code, resp.text)
+        assert _raw(env, cid) is None
+        assert env.client.get(f"/v1/connectors/{cid}", headers=_bearer(env.alice)).status_code == 404
+    # the allowlisted source itself is accepted (the guard is on, not blanket-off)
+    assert _register(env, env.alice).status_code == 201
+
+
 def test_owner_can_list_get_and_delete_and_others_see_nothing(env):
     assert _register(env, env.alice).status_code == 201
     mine = env.client.get("/v1/connectors", headers=_bearer(env.alice)).json()["connectors"]
@@ -342,25 +367,34 @@ def test_real_startup_helper_leaves_no_mounted_routes_or_globals_behind(monkeypa
     import main
     from fastapi import APIRouter
 
-    sentinel_tm, sentinel_vault = object(), object()
+    sentinel_tm, sentinel_vault, sentinel_service = object(), object(), object()
     monkeypatch.setattr(main, "_task_manager", sentinel_tm)
     monkeypatch.setattr(main, "_vault", sentinel_vault)
+    monkeypatch.setattr(main, "_service", sentinel_service)
+    # a stand-in extension carrying an injected task manager, so the registry restore and the re-injection are both observable
+    original_tm = object()
+    stand_in = SimpleNamespace(instance=SimpleNamespace(_task_manager=original_tm))
+    monkeypatch.setitem(main._extension_registry._extensions, "restore-probe", stand_in)
     routes_before = list(main.app.router.routes)
     schema_before = main.app.openapi_schema
     extensions_before = dict(main._extension_registry._extensions)
 
     with _restoring_app_state(main):
+        assert main._service is not sentinel_service, "the real startup must run against a throwaway service"
         # what the lifespan does, minus the stores it needs
         router = APIRouter()
         router.add_api_route("/v1/extensions/real-startup-probe/x", lambda: None, methods=["POST"])
         main.app.include_router(router)
         main.app.openapi_schema = {"stale": True}
         main._vault, main._task_manager = None, object()
-        main._extension_registry._extensions["probe"] = object()
-        main._extension_registry._extensions.pop(next(iter(extensions_before), "none"), None)
+        main._extension_registry._extensions.pop("restore-probe")
+        stand_in.instance._task_manager = object()
         assert len(main.app.router.routes) > len(routes_before)
 
     assert main.app.router.routes == routes_before
     assert main.app.openapi_schema is schema_before
     assert main._vault is sentinel_vault and main._task_manager is sentinel_tm
+    assert main._service is sentinel_service
     assert main._extension_registry._extensions == extensions_before
+    assert main._extension_registry._extensions["restore-probe"] is stand_in
+    assert stand_in.instance._task_manager is original_tm
