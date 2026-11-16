@@ -624,3 +624,92 @@ class TestDedupProbeIncludesWorkspace:
 
 
 _ROW_WS: dict = {}
+
+
+class TestRequestLevelProjectId:
+    """The save-session call shape: project_id once at the top level, items without their own."""
+
+    @staticmethod
+    def _svc():
+        svc = MagicMock()
+        svc._find_by_content_hash.return_value = None
+        return svc
+
+    def test_project_category_items_inherit_the_request_project_id(self):
+        req = CheckpointRequest(project_id="p-top", memories=[
+            {"content": "a", "category": "convention"},
+            {"content": "b", "category": "decision", "project_id": "p-own"},
+        ])
+        out = prepare_checkpoint(self._svc(), req, "alice")
+        assert [m["project_id"] for m in out["to_enqueue"]] == ["p-top", "p-own"]
+        assert out["to_enqueue"][0]["scope"] == "project"
+
+    def test_global_category_items_do_not_get_a_project_id(self):
+        req = CheckpointRequest(project_id="p-top", memories=[{"content": "a", "category": "preference"}])
+        out = prepare_checkpoint(self._svc(), req, "alice")
+        assert "project_id" not in out["to_enqueue"][0] and out["to_enqueue"][0]["scope"] == "global"
+
+    def test_neither_set_refuses_the_whole_batch(self):
+        req = CheckpointRequest(memories=[
+            {"content": "a", "category": "preference"},
+            {"content": "b", "category": "convention"},
+        ])
+        with pytest.raises(ValueError, match="project_id is required"):
+            prepare_checkpoint(self._svc(), req, "alice")
+
+    def test_inherited_project_id_is_in_the_dedup_probe(self):
+        svc = self._svc()
+        prepare_checkpoint(svc, CheckpointRequest(project_id="p-top", memories=[
+            {"content": "a", "category": "convention"}]), "alice")
+        assert svc._find_by_content_hash.call_args.kwargs["project_id"] == "p-top"
+
+    def test_sensitive_standard_item_inherits_too(self):
+        req = CheckpointRequest(project_id="p-top", memories=[
+            {"content": SENSITIVE, "category": "convention", "visibility": "standard"}])
+        out = prepare_checkpoint(self._svc(), req, "alice")
+        assert out["to_enqueue"][0]["project_id"] == "p-top"
+
+
+class TestRequestLevelProjectIdSurfaces:
+    def test_rest_save_session_shape_is_accepted(self, monkeypatch):
+        import main
+
+        svc = MagicMock()
+        svc._find_by_content_hash.return_value = None
+        monkeypatch.setattr(main, "_service", svc)
+        tm = MagicMock()
+        tm.enqueue_raw_batch = AsyncMock(return_value="task-1")
+        monkeypatch.setattr(main, "_task_manager", tm)
+        resp = TestClient(main.app).post("/v1/checkpoint", json={
+            "user_id": "alice", "project_id": "p-top",
+            "memories": [{"content": "a", "category": "convention"}],
+        })
+        assert resp.status_code == 202, resp.text
+        assert tm.enqueue_raw_batch.call_args.kwargs["items"][0]["project_id"] == "p-top"
+
+    def test_rest_neither_project_id_is_400(self, monkeypatch):
+        import main
+
+        monkeypatch.setattr(main, "_service", MagicMock())
+        resp = TestClient(main.app).post("/v1/checkpoint", json={
+            "user_id": "alice", "memories": [{"content": "a", "category": "convention"}],
+        })
+        assert resp.status_code == 400 and "project_id is required" in resp.text
+
+    @pytest.mark.asyncio
+    async def test_mcp_save_session_shape_is_accepted(self, monkeypatch):
+        import mcp_server
+
+        svc = MagicMock()
+        svc._find_by_content_hash.return_value = None
+        monkeypatch.setattr(mcp_server, "_service", svc)
+        tm = MagicMock()
+        tm.enqueue_raw_batch = AsyncMock(return_value="task-2")
+        monkeypatch.setattr(mcp_server, "_task_manager", tm)
+        result = await mcp_server.call_tool("checkpoint", {
+            "user_id": "alice", "project_id": "p-top",
+            "memories": [{"content": "a", "category": "convention"}],
+        })
+        data = json.loads(result[0].text)
+        assert data["status"] == "accepted", data
+        assert tm.enqueue_raw_batch.call_args.kwargs["items"][0]["project_id"] == "p-top"

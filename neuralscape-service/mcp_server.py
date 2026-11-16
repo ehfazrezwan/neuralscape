@@ -1166,7 +1166,7 @@ async def list_tools() -> list[Tool]:
                     },
                     "project_id": {
                         "type": "string",
-                        "description": "Default project for the session note (items carry their own project_id)",
+                        "description": "Default project: used for the session note and for any item that resolves to project scope but names no project_id of its own (items may carry their own)",
                     },
                     "user_id": {
                         "type": "string",
