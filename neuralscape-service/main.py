@@ -572,18 +572,25 @@ async def delete_memories(
     user_id: str = Query(default=None),
     agent_id: str = Query(default=None),
     run_id: str = Query(default=None),
+    include_shared: bool = Query(default=False),
 ):
     """Delete the caller's memories, graph facts included. Legacy endpoint.
 
     Same path as ``DELETE /v1/memories`` with no filters: the caller's private
     writes go from the vector store AND the graph (provenance cascade); shared
-    memories they authored are preserved (use the v1 route's include_shared to
-    remove those too).
+    memories they authored are preserved unless ``include_shared=true``, which
+    also removes the caller's OWN shared rows (never another user's, never
+    ``standard`` rows).
     """
     user_id = _resolve_user_id(request, user_id)
     _reject_unsupported_entity_scope(agent_id, run_id, "delete")
     try:
-        result = await asyncio.to_thread(_service.delete_memories, user_id=user_id)
+        result = await asyncio.to_thread(
+            _service.delete_memories, user_id=user_id, include_shared=include_shared
+        )
+        # Sibling facts of a deleted conversation episode need re-enrichment;
+        # enqueue them (as v1 and MCP do) and answer with counts.
+        result = await _enqueue_sibling_graph_jobs(result)
         # Graph cleanup that could not be verified is a partial success.
         incomplete = bool(result.get("graph_cascade_unresolved_ids") or result.get("failed_ids") or result.get("truncated"))
         if result.get("failed_ids") or result.get("truncated"):
@@ -2650,17 +2657,17 @@ async def v1_list_projects(request: Request, user_id: str | None = Query(default
     """List the caller's distinct project_ids.
 
     Projects are implicit (a ``project_id`` is just a scoping label), so this
-    derives the list from the caller's stored memories. Powers the plugin's
+    derives the list from the vector store's readable rows (merged with graph
+    group ids; ``degraded``/``error`` set on a graph outage). Powers the plugin's
     `project` selection skill — especially in Claude Cowork, which has no
     working directory to infer a project from.
     """
     resolved_user_id = _resolve_user_id(request, user_id)
     try:
-        projects = await asyncio.to_thread(
-            _service.list_projects,
+        return await asyncio.to_thread(
+            _service.list_projects_status,
             user_id=resolved_user_id,
         )
-        return {"projects": projects}
     except HTTPException:
         raise
     except Exception as e:
@@ -2872,15 +2879,17 @@ async def v1_export_okf(
     filename = f"okf-bundle-{stamp}.zip"
     from fastapi.responses import Response as FastAPIResponse
 
-    return FastAPIResponse(
-        content=data,
-        media_type="application/zip",
-        headers={
-            "Content-Disposition": f'attachment; filename="{filename}"',
-            "X-OKF-Concepts": str(stats["concepts"]),
-            "X-OKF-Files": str(stats["files"]),
-        },
-    )
+    headers = {
+        "Content-Disposition": f'attachment; filename="{filename}"',
+        "X-OKF-Concepts": str(stats["concepts"]),
+        "X-OKF-Files": str(stats["files"]),
+        # Never a silent cut: a pool larger than the export cap says so.
+        "X-OKF-Truncated": "true" if stats.get("truncated") else "false",
+    }
+    for pool, cut in (stats.get("truncated_pools") or {}).items():
+        headers[f"X-OKF-{pool.capitalize()}-Exported"] = str(cut["exported"])
+        headers[f"X-OKF-{pool.capitalize()}-Total"] = str(cut["total"]) if cut["total"] is not None else "unknown"
+    return FastAPIResponse(content=data, media_type="application/zip", headers=headers)
 
 
 @v1_router.get("/memories", response_model=list[MemoryResponse])

@@ -839,13 +839,19 @@ class TestCRUD:
         assert deleted_ids == ["m_priv"]
         assert "preserved 1 shared" in result["message"]
 
-    def test_delete_memories_all_include_shared_nukes_everything(self, service):
-        """include_shared=True restores the old full-nuke path."""
-        # The graph cleanup lists the user's rows first; a listing that cannot
-        # run now refuses the whole delete (MemoryListingFailed), so give it one.
-        service._scroll_all_user_memories = MagicMock(return_value=[])
+    def test_delete_memories_all_include_shared_deletes_own_rows_per_row(self, service):
+        """include_shared=True deletes the caller's private + own shared rows one by
+        one (never mem0 ``delete_all``, which also erased ``standard`` rows)."""
+        service._scroll_all_user_memories = MagicMock(return_value=[
+            {"id": "m_priv", "payload": {"data": "p", "metadata": {"visibility": "private"}}},
+            {"id": "m_shared", "payload": {"data": "s", "metadata": {"visibility": "shared"}}},
+        ])
+        service._memory.vector_store.delete = MagicMock()
         result = service.delete_memories(user_id="ehfaz", include_shared=True)
-        service._memory.delete_all.assert_called_once_with(user_id="ehfaz")
+        service._memory.delete_all.assert_not_called()
+        deleted_ids = [c.args[0] for c in service._memory.vector_store.delete.call_args_list]
+        assert deleted_ids == ["m_priv", "m_shared"]
+        assert "including 1 shared" in result["message"]
 
     def test_delete_memories_with_filters(self, service):
         service._memory.get_all.return_value = {
@@ -1740,13 +1746,18 @@ class TestBulkDeleteNullCategory:
         Note: under the multi-user model, the unfiltered path also no
         longer calls delete_all by default (shared writes are preserved).
         We test both that the filter_null_category branch is taken when
-        the flag is set, and that include_shared=True restores the
-        legacy delete_all sweep.
+        the flag is set, and that include_shared=True no longer uses
+        mem0's delete_all either (it deletes the caller's own rows per row).
         """
-        # Unfiltered + include_shared=True = legacy delete_all path
-        service._scroll_all_user_memories = MagicMock(return_value=[])
+        service._scroll_all_user_memories = MagicMock(return_value=[
+            {"id": "p", "payload": {"data": "p", "metadata": {"visibility": "private"}}},
+            {"id": "s", "payload": {"data": "s", "metadata": {"visibility": "shared"}}},
+            {"id": "std", "payload": {"data": "t", "metadata": {"visibility": "standard"}}},
+        ])
+        service._memory.vector_store.delete = MagicMock()
         service.delete_memories(user_id="ehfaz", include_shared=True)
-        service._memory.delete_all.assert_called_once()
+        service._memory.delete_all.assert_not_called()
+        assert [c.args[0] for c in service._memory.vector_store.delete.call_args_list] == ["p", "s"]
 
         service._memory.reset_mock()
 
@@ -2731,17 +2742,14 @@ class TestExpireOldMemories:
         mock_client.scroll.side_effect = [
             ([expired, future_pt, no_expiry], None),  # next_offset=None terminates
         ]
-        # Mock the delete + graph cleanup helper
-        service._delete_qdrant_memory_with_graph_cleanup = MagicMock()
+        service._memory.vector_store.delete = MagicMock()
 
         result = service.expire_old_memories(batch_size=100)
 
         assert result["deleted_count"] == 1
         assert result["per_user"] == {"alice": 1}
         # Only the expired one was deleted
-        service._delete_qdrant_memory_with_graph_cleanup.assert_called_once()
-        deleted_id = service._delete_qdrant_memory_with_graph_cleanup.call_args[0][0]
-        assert deleted_id == "expired-1"
+        service._memory.vector_store.delete.assert_called_once_with("expired-1")
 
     def test_handles_per_point_delete_failure(self, service):
         """A failed delete on one point doesn't abort the run."""
@@ -2756,7 +2764,7 @@ class TestExpireOldMemories:
         mock_client.scroll.side_effect = [([p1, p2], None)]
 
         # First delete fails, second succeeds
-        service._delete_qdrant_memory_with_graph_cleanup = MagicMock(
+        service._memory.vector_store.delete = MagicMock(
             side_effect=[Exception("Qdrant transient"), None]
         )
 
@@ -2779,7 +2787,7 @@ class TestExpireOldMemories:
             ([p1], "cursor"),
             ([p2], None),
         ]
-        service._delete_qdrant_memory_with_graph_cleanup = MagicMock()
+        service._memory.vector_store.delete = MagicMock()
 
         result = service.expire_old_memories(batch_size=1)
         assert result["deleted_count"] == 2
@@ -2808,11 +2816,11 @@ class TestExpireOldMemories:
         mock_client = MagicMock()
         service._memory.vector_store.client = mock_client
         mock_client.scroll.side_effect = [([pt], None)]
-        service._delete_qdrant_memory_with_graph_cleanup = MagicMock()
+        service._memory.vector_store.delete = MagicMock()
 
         result = service.expire_old_memories()
         assert result["deleted_count"] == 0
-        service._delete_qdrant_memory_with_graph_cleanup.assert_not_called()
+        service._memory.vector_store.delete.assert_not_called()
 
     def test_cold_start_initializes_memory(self, service):
         """expire_old_memories must call _get_memory() before touching client.
@@ -3611,10 +3619,17 @@ class TestBulkDeleteSharedProtection:
         service._memory.delete_all.assert_not_called()
         assert "preserved 1 shared" in result["message"]
 
-    def test_include_shared_true_uses_delete_all(self, service):
-        service._scroll_all_user_memories = MagicMock(return_value=[])
+    def test_include_shared_true_does_not_use_delete_all(self, service):
+        service._scroll_all_user_memories = MagicMock(return_value=[
+            self._mem("priv-1", "private"),
+            self._mem("share-1", "shared"),
+            self._mem("std-1", "standard"),
+        ])
+        service._memory.vector_store.delete = MagicMock()
         service.delete_memories(user_id="alice", include_shared=True)
-        service._memory.delete_all.assert_called_once_with(user_id="alice")
+        service._memory.delete_all.assert_not_called()
+        deleted = [c.args[0] for c in service._memory.vector_store.delete.call_args_list]
+        assert deleted == ["priv-1", "share-1"]
 
     def test_filtered_delete_skips_shared_by_default(self, service):
         """Even with a category filter, shared writes survive by default."""

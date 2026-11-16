@@ -82,6 +82,37 @@ def container_restart_count(container_id: str, run: Callable[..., subprocess.Com
     return int((proc.stdout or "0").strip() or 0)
 
 
+#: ``docker inspect`` fields the autoheal scenario reads, and nothing else (never ``Config.Env``).
+INSPECT_FORMAT = (
+    "{{.State.StartedAt}}|{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}"
+    "|{{.RestartCount}}|{{.State.Status}}|{{json .Config.Labels}}"
+)
+
+
+def parse_inspect(text: str) -> dict:
+    """``INSPECT_FORMAT`` output -> ``{started_at, health, restart_count, status, labels}``."""
+    import json
+
+    parts = (text or "").strip().split("|", 4)
+    if len(parts) != 5:
+        raise RuntimeError(f"unexpected docker inspect output: {text[:200]!r}")
+    started, health, restarts, status, labels = parts
+    return {
+        "started_at": started, "health": health, "restart_count": int(restarts or 0), "status": status,
+        "labels": json.loads(labels) if labels and labels != "null" else {},
+    }
+
+
+def container_inspect(container_id: str, run: Callable[..., subprocess.CompletedProcess] = subprocess.run) -> dict:
+    """Health status, StartedAt, RestartCount, state and labels of one container (``docker inspect``, read-only)."""
+    if not _CONTAINER_ID.match(container_id or ""):
+        raise ConfigError(f"not a container id: {container_id!r}")
+    proc = run(["docker", "inspect", "--format", INSPECT_FORMAT, container_id], capture_output=True, text=True, timeout=30)
+    if proc.returncode != 0:
+        raise RuntimeError(f"docker inspect failed: {(proc.stderr or '').strip()[:200]}")
+    return parse_inspect(proc.stdout or "")
+
+
 def parse_ps_json(text: str) -> list[dict]:
     """``docker compose ps --format json``: a JSON array or one object per line."""
     import json
@@ -120,9 +151,7 @@ def qdrant_service() -> str:
 
 
 def app_services() -> list[str]:
-    return os.environ.get(
-        "NS_APP_SERVICES", "neuralscape,neuralscape-worker,neuralscape-graph-worker,neuralscape-ingest-worker"
-    ).split(",")
+    return restore.app_services()
 
 
 def run_compose(
@@ -153,7 +182,7 @@ def run_compose(
             raise ConfigError(
                 f"`exec` is only allowed as: exec -T {qdrant_service()} sh -c <script>, "
                 "one of the read-only inspections (vault grep, connector vault record), "
-                "or redis-cli FLUSHALL with NS_ALLOW_DESTRUCTIVE=1"
+                "or, with NS_ALLOW_DESTRUCTIVE=1, redis-cli FLUSHALL and touch / rm -f of the worker stall file"
             )
     stdin_fh = None
     if args[0] in ("run", "cp", "config"):

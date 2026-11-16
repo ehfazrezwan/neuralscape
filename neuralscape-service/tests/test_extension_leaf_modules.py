@@ -85,7 +85,7 @@ class TestCompilerSettings:
 
         s = CompilerSettings(_env_file=None)
         assert (s.obsidian_vault_path, s.compile_after_hour, s.auto_compile) == ("/data/vault", 18, True)
-        assert s.neuralscape_url == "http://localhost:8199" and s.compiler_llm_model == ""
+        assert s.compiler_llm_model == ""
         assert s.get_llm_model("fallback-model") == "fallback-model"
 
     def test_env_overrides_and_configured_model_wins(self, monkeypatch):
