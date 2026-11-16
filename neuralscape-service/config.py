@@ -294,6 +294,10 @@ class Settings(BaseSettings):
     # Dedup cron
     dedup_similarity_threshold: float = 0.95
     dedup_batch_size: int = 100
+    # OKF export (GET /v1/export/okf): most memories read per pool in one export.
+    # A pool above it is reported as truncated (headers + the bundle's log.md),
+    # never cut silently. Env: OKF_EXPORT_MAX_MEMORIES.
+    okf_export_max_memories: int = Field(default=50_000, ge=1)
     # Semantic dedup (phase 2 of the dedup cron and of post-compile dedup).
     # False (default): the older near-duplicate is hard-deleted, with the graph
     # cascade and sibling re-ingest jobs. True: it is tombstoned instead
