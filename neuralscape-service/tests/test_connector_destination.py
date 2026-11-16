@@ -6,7 +6,10 @@ fetch-time backstop in both URL-taking adapters, redirects, and the connect pin.
 
 from __future__ import annotations
 
+import asyncio
 import ipaddress
+import threading
+import time
 
 import httpcore
 import httpx
@@ -30,6 +33,7 @@ from connectors.stdio_policy import ConnectorConfigError
 from connectors.vault import ConnectorVault
 from tests.fake_vault_store import FakeVaultStore
 
+REAL_RESOLVE_HOST = destination.resolve_host  # the autouse fixture swaps the module attribute
 PUBLIC = "93.184.216.34"
 NO_ALLOW: frozenset[str] = frozenset()
 
@@ -566,29 +570,66 @@ def test_guarded_client_ignores_proxy_environment(monkeypatch):
 # ── review fixes: DNS timeout, connect timeout, mutation killers ────────────
 
 
+async def _hangs(host, port):
+    """A resolver that never answers in time. Bounded, so a missing timeout fails the test fast."""
+    await asyncio.sleep(5)
+
+
+FAST = 2.0  # outer bound for every timeout test: a removed timeout shows up as TimeoutError here
+
+
 @pytest.mark.asyncio
 async def test_hung_dns_lookup_is_refused_not_awaited_forever(monkeypatch):
-    import asyncio
-
-    async def hangs(host, port):
-        await asyncio.sleep(3600)
-
     monkeypatch.setattr(destination, "RESOLVE_TIMEOUT_S", 0.05)
     with pytest.raises(DestinationRefused) as exc:
-        await validate_url("https://slow.example.com/", NO_ALLOW, hangs)
+        await asyncio.wait_for(validate_url("https://slow.example.com/", NO_ALLOW, _hangs), FAST)
     assert exc.value.reason == "resolve_timeout"
 
 
 @pytest.mark.asyncio
 async def test_lookup_is_bounded_by_the_clients_connect_timeout():
-    import asyncio
-
-    async def hangs(host, port):
-        await asyncio.sleep(3600)
-
     with pytest.raises(DestinationRefused) as exc:
-        await destination.validate_target("https", "slow.example.com", 443, NO_ALLOW, hangs, timeout=0.05)
+        await asyncio.wait_for(
+            destination.validate_target("https", "slow.example.com", 443, NO_ALLOW, _hangs, timeout=0.05), FAST)
     assert exc.value.reason == "resolve_timeout"
+
+
+@pytest.mark.asyncio
+async def test_the_cap_applies_even_when_the_client_timeout_is_longer(monkeypatch):
+    monkeypatch.setattr(destination, "RESOLVE_TIMEOUT_S", 0.05)
+    with pytest.raises(DestinationRefused) as exc:
+        await asyncio.wait_for(
+            destination.validate_target("https", "slow.example.com", 443, NO_ALLOW, _hangs, timeout=1000), FAST)
+    assert exc.value.reason == "resolve_timeout"
+
+
+@pytest.mark.asyncio
+async def test_request_hook_passes_the_connect_timeout_to_the_lookup():
+    client = guarded_async_client(allowed=NO_ALLOW, resolver=_hangs, transport=Recorder().transport,
+                                  timeout=httpx.Timeout(5.0, connect=0.05))
+    try:
+        with pytest.raises(DestinationRefused) as exc:
+            await asyncio.wait_for(client.get("https://slow.example.com/"), FAST)
+    finally:
+        await client.aclose()
+    assert exc.value.reason == "resolve_timeout"
+
+
+@pytest.mark.asyncio
+async def test_backend_passes_the_connect_timeout_to_the_lookup():
+    backend = _GuardedBackend(NO_ALLOW, _hangs, FakeInner())
+    with pytest.raises(DestinationRefused) as exc:
+        await asyncio.wait_for(backend.connect_tcp("slow.example.com", 443, timeout=0.05), FAST)
+    assert exc.value.reason == "resolve_timeout"
+
+
+@pytest.mark.asyncio
+async def test_timeout_message_is_the_same_as_every_other_refusal():
+    with pytest.raises(DestinationRefused) as slow:
+        await destination.validate_target("https", "slow.example.com", 443, NO_ALLOW, _hangs, timeout=0.05)
+    with pytest.raises(DestinationRefused) as private:
+        await validate_url("https://sneaky.example.com/", NO_ALLOW)
+    assert str(slow.value) == str(private.value)
 
 
 @pytest.mark.asyncio
@@ -637,3 +678,116 @@ def test_embedded_ipv4_decides_even_when_the_stdlib_calls_the_ipv6_address_globa
 
 def test_azure_wire_server_refused_for_everyone():
     assert destination._non_public(ipaddress.ip_address("168.63.129.16"))
+
+
+# ── dedicated resolver pool ─────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_a_blocked_system_resolver_does_not_stall_unrelated_to_thread_calls(monkeypatch):
+    """Lookups that never return must not occupy the loop's shared default executor."""
+    release = threading.Event()
+    monkeypatch.setattr(destination.socket, "getaddrinfo", lambda *a, **k: release.wait(5) or [])
+    loop = asyncio.get_running_loop()
+    from concurrent.futures import ThreadPoolExecutor
+
+    loop.set_default_executor(ThreadPoolExecutor(max_workers=2))
+    blocked = [asyncio.ensure_future(REAL_RESOLVE_HOST(f"h{i}.example.com", 443)) for i in range(2)]
+    try:
+        await asyncio.sleep(0.1)  # both lookups are now parked in their threads
+        started = time.monotonic()
+        assert await asyncio.wait_for(asyncio.to_thread(lambda: "ok"), 1.0) == "ok"
+        assert time.monotonic() - started < 0.5
+    finally:
+        release.set()
+        await asyncio.gather(*blocked, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_saturated_resolver_pool_refuses_instead_of_queueing(monkeypatch):
+    release = threading.Event()
+    monkeypatch.setattr(destination.socket, "getaddrinfo", lambda *a, **k: release.wait(5) or [])
+    limit = destination._RESOLVER_MAX_INFLIGHT
+    running = [asyncio.ensure_future(REAL_RESOLVE_HOST(f"h{i}.example.com", 443)) for i in range(limit)]
+    try:
+        await asyncio.sleep(0.1)
+        with pytest.raises(DestinationRefused) as exc:
+            await REAL_RESOLVE_HOST("one-too-many.example.com", 443)
+        assert exc.value.reason == "resolver_busy"
+        assert str(exc.value) == str(DestinationRefused(destination._NOT_PERMITTED))
+    finally:
+        release.set()
+        await asyncio.gather(*running, return_exceptions=True)
+    # slots are returned once the threads finish
+    assert destination._inflight == 0
+    monkeypatch.setattr(destination.socket, "getaddrinfo", lambda *a, **k: [(2, 1, 6, "", (PUBLIC, 443))])
+    assert await REAL_RESOLVE_HOST("ok.example.com", 443) == [PUBLIC]
+
+
+# ── more metadata endpoints, in every IPv4-in-IPv6 form ─────────────────────
+
+METADATA_V4 = ["168.63.129.16", "100.100.100.200", "192.0.0.192", "169.254.169.254"]
+
+
+def _forms(v4: str) -> list[str]:
+    n = ipaddress.IPv4Address(v4)
+    hexpart = f"{int(n):08x}"
+    return [
+        v4,
+        f"::ffff:{v4}",
+        f"::{v4}",
+        f"64:ff9b::{hexpart[:4]}:{hexpart[4:]}",
+        f"2002:{hexpart[:4]}:{hexpart[4:]}::",
+    ]
+
+
+@pytest.mark.parametrize("addr", [f for v4 in METADATA_V4 for f in _forms(v4)] + ["fd20:ce::254", "fd00:ec2::254"])
+@pytest.mark.asyncio
+async def test_metadata_endpoints_refused_even_for_an_allowlisted_name(addr):
+    dns = fake_dns({"h.corp": [addr]})
+    for allow in (NO_ALLOW, parse_allowed_hosts("h.corp")):
+        with pytest.raises(DestinationRefused):
+            await validate_url("https://h.corp/", allow, dns)
+    assert destination._never_allowed(ipaddress.ip_address(addr)), addr
+
+
+# ── connect: address cap and one overall deadline ───────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_only_a_few_addresses_are_tried():
+    class Blackholed(FakeInner):
+        async def connect_tcp(self, host, port, **kw):
+            self.connected.append((host, port))
+            raise httpcore.ConnectTimeout("blackhole")
+
+    inner = Blackholed()
+    many = [f"93.184.{i // 200}.{i % 200 + 1}" for i in range(20)]
+    backend = _GuardedBackend(NO_ALLOW, fake_dns({"h.example.com": many}), inner)
+    with pytest.raises(httpcore.ConnectTimeout):
+        await backend.connect_tcp("h.example.com", 443, timeout=30)
+    assert [h for h, _ in inner.connected] == many[: destination.MAX_CONNECT_ATTEMPTS]
+
+
+@pytest.mark.asyncio
+async def test_connect_has_one_overall_deadline_not_one_per_address():
+    class Slow(FakeInner):
+        def __init__(self):
+            super().__init__()
+            self.timeouts = []
+
+        async def connect_tcp(self, host, port, timeout=None, **kw):
+            self.connected.append((host, port))
+            self.timeouts.append(timeout)
+            await asyncio.sleep(0.06)
+            raise httpcore.ConnectTimeout("slow")
+
+    inner = Slow()
+    addrs = ["93.184.1.1", "93.184.1.2", "93.184.1.3", "93.184.1.4"]
+    backend = _GuardedBackend(NO_ALLOW, fake_dns({"h.example.com": addrs}), inner)
+    started = time.monotonic()
+    with pytest.raises(httpcore.ConnectTimeout):
+        await backend.connect_tcp("h.example.com", 443, timeout=0.15)
+    assert time.monotonic() - started < 0.3  # not 4 x 0.15
+    assert len(inner.connected) < 4  # the budget ran out before the cap did
+    assert inner.timeouts[0] <= 0.15 and all(b < a for a, b in zip(inner.timeouts, inner.timeouts[1:]))

@@ -47,6 +47,9 @@ import asyncio
 import ipaddress
 import re
 import socket
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from collections.abc import Awaitable, Callable
 from typing import Any
 
@@ -76,7 +79,23 @@ _NOT_PERMITTED = "connector destination is not permitted (use a public https hos
 _METADATA = frozenset({
     ipaddress.ip_address("168.63.129.16"),  # Azure wire server / metadata
     ipaddress.ip_address("fd00:ec2::254"),  # AWS IPv6 metadata
+    ipaddress.ip_address("fd20:ce::254"),  # GCP metadata over IPv6
+    ipaddress.ip_address("100.100.100.200"),  # Alibaba metadata
+    ipaddress.ip_address("192.0.0.192"),  # Oracle metadata
 })
+
+# Name lookups run on their own small pool, never the loop's shared default executor:
+# a name server that never answers keeps its thread until the C resolver gives up, and
+# on the shared pool that would stall every unrelated ``to_thread`` call in the process.
+# When the pool is saturated further lookups are refused instead of queueing behind it.
+_RESOLVER_THREADS = 4
+_RESOLVER_MAX_INFLIGHT = 8  # running + queued
+_resolver_pool = ThreadPoolExecutor(max_workers=_RESOLVER_THREADS, thread_name_prefix="ns-connector-dns")
+_inflight = 0
+_inflight_lock = threading.Lock()
+
+# At most this many validated addresses are tried per connect, inside one overall deadline.
+MAX_CONNECT_ATTEMPTS = 4
 
 
 class DestinationRefused(ConnectorConfigError):
@@ -89,7 +108,27 @@ class DestinationRefused(ConnectorConfigError):
 
 async def resolve_host(host: str, port: int) -> list[str]:
     """Every distinct address ``host`` resolves to (A and AAAA), as strings."""
-    infos = await asyncio.get_running_loop().getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    global _inflight
+    with _inflight_lock:
+        if _inflight >= _RESOLVER_MAX_INFLIGHT:
+            raise DestinationRefused(_NOT_PERMITTED, "resolver_busy")
+        _inflight += 1
+
+    def lookup():
+        global _inflight
+        try:
+            return socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+        finally:
+            with _inflight_lock:
+                _inflight -= 1
+
+    try:
+        future = asyncio.get_running_loop().run_in_executor(_resolver_pool, lookup)
+    except BaseException:
+        with _inflight_lock:
+            _inflight -= 1
+        raise
+    infos = await future
     return list(dict.fromkeys(info[4][0].split("%", 1)[0] for info in infos))
 
 
@@ -267,16 +306,22 @@ class _GuardedBackend(httpcore.AsyncNetworkBackend):
     async def connect_tcp(self, host, port, timeout=None, local_address=None, socket_options=None):
         # Scheme rules are the request hook's job (it sees the URL); here the question
         # is only "which address", so judge as https: the allowlist still applies.
+        started = time.monotonic()
         addresses = await validate_target("https", host, port, self._allowed, self._resolver, timeout)
         last: Exception | None = None
-        for address in addresses:
+        # One deadline for the whole connect (lookup included), and a cap on the
+        # addresses tried: the answer list is chosen by whoever controls the name.
+        for address in addresses[:MAX_CONNECT_ATTEMPTS]:
+            remaining = None if timeout is None else timeout - (time.monotonic() - started)
+            if remaining is not None and remaining <= 0:
+                break
             try:
                 return await self._inner.connect_tcp(
-                    address, port, timeout=timeout, local_address=local_address, socket_options=socket_options
+                    address, port, timeout=remaining, local_address=local_address, socket_options=socket_options
                 )
             except (httpcore.ConnectError, httpcore.ConnectTimeout) as exc:
                 last = exc
-        raise last or httpcore.ConnectError("no address to connect to")
+        raise last or httpcore.ConnectTimeout("connect deadline exceeded")
 
     async def connect_unix_socket(self, path, timeout=None, socket_options=None):
         raise DestinationRefused("unix sockets are not permitted for connectors")

@@ -263,7 +263,7 @@ def test_connectors_cannot_target_internal_or_metadata_addresses(ctx, a):
 
 @proves("ingest.connector-rest-api", "auth.connector-mcp-stdio")
 @negative_control
-def test_destination_refusal_check_fails_for_the_allowlisted_sink(ctx, a):
+def test_destination_refusal_check_fails_for_the_allowlisted_sink(ctx, a, sink):
     ok_id = f"acc-{ctx.run_id}-ssrf0"
     expect_check_fails(check_destination_refused, a, _rest_to(ctx, ok_id, f"http://{SINK_NAME}:{PORT}{CONNECTOR_ITEMS_PATH}"))
     a.delete(f"/v1/connectors/{ok_id}")
