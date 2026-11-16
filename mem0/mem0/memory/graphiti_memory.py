@@ -415,49 +415,34 @@ class MemoryGraph:
                 self._indices_built = True
 
     def _get_group_id(self, filters: dict) -> str:
-        """Build composite group_id from mem0 filters.
+        """Return the explicit ``group_id`` the caller names.
 
-        Supports namespace scoping:
-        - If filters contain an explicit 'group_id', use it directly.
-        - If filters contain 'project_id', returns 'project:{project_id}'.
-        - Otherwise returns 'global' (overarching/cross-project memories).
-
-        Falls back to user_id for backward compatibility with old callers
-        that don't use the new scoping model.
+        NEURALSCAPE PATCH: the upstream-style fallbacks are gone. This used to
+        derive ``project:{project_id}``, ``global`` or the bare ``user_id`` when
+        no ``group_id`` was passed, and the service never reads those names: its
+        groups come from ``memory.groups._build_group_id`` (pool + owner +
+        project + workspace). A caller that omitted ``group_id`` would have
+        written, searched or DELETED graph data in a namespace nothing else
+        sees. No service caller does (every call site passes ``group_id`` or
+        ``group_ids``), so the fallback is replaced by a hard error.
         """
-        # Explicit group_id takes precedence (used by MemoryService)
-        if "group_id" in filters:
-            return filters["group_id"]
-
-        # New scoping model
-        project_id = filters.get("project_id")
-        if project_id:
-            return f"project:{project_id}"
-
-        # Default to global for new callers, user_id for legacy callers
-        scope = filters.get("scope")
-        if scope is not None:
-            return "global"
-
-        # Legacy: use user_id as group_id for backward compatibility
-        return filters.get("user_id", "default")
+        group_id = filters.get("group_id")
+        if not group_id:
+            raise ValueError(
+                "MemoryGraph requires an explicit 'group_id' in filters (build it with "
+                "memory.groups._build_group_id); the legacy project:/user_id fallback was removed"
+            )
+        return group_id
 
     def _get_group_ids(self, filters: dict) -> list[str]:
-        """Get list of group_ids for multi-scope search.
+        """Return the explicit ``group_ids`` (or the single ``group_id``) the caller names.
 
-        When project_id is provided, searches both global and project scope.
-        Otherwise returns single group_id.
+        NEURALSCAPE PATCH: see ``_get_group_id``; no implicit ``["global", "project:{id}"]``.
         """
-        # Explicit group_ids takes precedence
-        if "group_ids" in filters:
-            return filters["group_ids"]
-
-        project_id = filters.get("project_id")
-        if project_id:
-            return ["global", f"project:{project_id}"]
-
-        group_id = self._get_group_id(filters)
-        return [group_id]
+        group_ids = filters.get("group_ids")
+        if group_ids:
+            return list(group_ids)
+        return [self._get_group_id(filters)]
 
     def _build_source_description(self, filters: dict) -> str:
         """Build a source description string from mem0 filters for episode metadata."""
@@ -600,6 +585,9 @@ class MemoryGraph:
                     "destination": target_name,
                 })
 
+            if self._update_communities:
+                await self._ensure_group_communities(group_id)
+
             # NEURALSCAPE PATCH: surface the resolved episode identity so
             # callers can persist a durable memory→episode back-reference
             # (see neuralscape-service/memory/provenance.py). Additive —
@@ -617,6 +605,76 @@ class MemoryGraph:
         except Exception as e:
             logger.error(f"Graphiti add_episode failed: {e}")
             raise
+
+    async def _ensure_group_communities(self, group_id: str) -> None:
+        """NEURALSCAPE PATCH: build the first set of communities for a group.
+
+        ``add_episode(update_communities=True)`` only attaches new entities to
+        communities that already exist (``update_community`` returns nothing
+        when there is none to join), and nothing else ever creates the first
+        one, so with the flag on ``GET /v1/graph/communities`` stayed empty
+        forever. When the flag is on and this group has no *populated*
+        community yet, build them with Graphiti's clustering, scoped to THIS
+        group only (``Graphiti.build_communities`` calls ``remove_communities``,
+        which deletes every community of every group, so it is deliberately not
+        used). Later episodes grow them through ``update_community``.
+
+        Safe across processes: community and membership uuids are derived from
+        the group and the cluster (smallest member uuid), and Graphiti saves
+        with ``MERGE`` on uuid, so two workers that build at the same moment
+        write the same nodes and edges instead of duplicates. A community
+        without any ``HAS_MEMBER`` edge (a build that died between the node and
+        edge saves) counts as "not built": it is removed and rebuilt by the
+        next write. The in-process lock is per group.
+
+        Best-effort: the episode is already stored, so a failure here is logged
+        and never fails the write.
+        """
+        import uuid as _uuid
+
+        from graphiti_core.helpers import semaphore_gather
+        from graphiti_core.utils.maintenance.community_operations import build_communities
+
+        locks = self.__dict__.setdefault("_communities_locks", {})
+        lock = locks.get(group_id)
+        if lock is None:
+            lock = locks.setdefault(group_id, asyncio.Lock())
+        async with lock:
+            try:
+                g = self.graphiti
+                records, _, _ = await g.driver.execute_query(
+                    "MATCH (c:Community {group_id: $g}) "
+                    "RETURN c.uuid AS uuid, EXISTS { (c)-[:HAS_MEMBER]->() } AS populated",
+                    g=group_id,
+                )
+                if any(r["populated"] for r in records):
+                    return
+                if records:
+                    await g.driver.execute_query(
+                        "MATCH (c:Community {group_id: $g}) WHERE NOT EXISTS { (c)-[:HAS_MEMBER]->() } "
+                        "DETACH DELETE c",
+                        g=group_id,
+                    )
+                nodes, edges = await build_communities(g.driver, g.llm_client, [group_id])
+                if not nodes:
+                    return
+                for node in nodes:
+                    members = sorted(e.target_node_uuid for e in edges if e.source_node_uuid == node.uuid)
+                    old = node.uuid
+                    node.uuid = str(_uuid.uuid5(_uuid.NAMESPACE_URL, f"ns-community:{group_id}:{members[0] if members else old}"))
+                    for e in edges:
+                        if e.source_node_uuid == old:
+                            e.source_node_uuid = node.uuid
+                            e.uuid = str(_uuid.uuid5(_uuid.NAMESPACE_URL, f"ns-community-member:{node.uuid}:{e.target_node_uuid}"))
+                await semaphore_gather(
+                    *[n.generate_name_embedding(g.embedder) for n in nodes],
+                    max_coroutines=g.max_coroutines,
+                )
+                await semaphore_gather(*[n.save(g.driver) for n in nodes], max_coroutines=g.max_coroutines)
+                await semaphore_gather(*[e.save(g.driver) for e in edges], max_coroutines=g.max_coroutines)
+                logger.info(f"Built {len(nodes)} initial communities for group_id={group_id}")
+            except Exception as e:
+                logger.warning(f"Initial community build failed for group_id={group_id} (non-fatal): {e}")
 
     def search(self, query, filters, limit=100):
         """Search the graph via Graphiti's hybrid search.

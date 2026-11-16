@@ -1117,13 +1117,21 @@ class Graphiti:
                 communities = []
                 community_edges = []
                 if update_communities:
-                    communities, community_edges = await semaphore_gather(
+                    # NEURALSCAPE PATCH: ``update_community`` returns one
+                    # ``(communities, edges)`` pair PER NODE, so the gather result
+                    # is a list of N pairs. Upstream unpacked it straight into two
+                    # names, which only works when exactly two nodes resolved: any
+                    # other count (0, 1, 3, ...) raised ValueError AFTER the
+                    # episode was persisted, failing the write. Flatten instead.
+                    per_node = await semaphore_gather(
                         *[
                             update_community(self.driver, self.llm_client, self.embedder, node)
                             for node in nodes
                         ],
                         max_coroutines=self.max_coroutines,
                     )
+                    communities = [c for node_communities, _ in per_node for c in node_communities]
+                    community_edges = [e for _, node_edges in per_node for e in node_edges]
 
                 end = time()
 

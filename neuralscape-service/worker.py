@@ -288,6 +288,12 @@ async def process_memory_raw(
             if (
                 mem.memory.strip().lower() == content.strip().lower()
                 and getattr(mem, "visibility", None) == _eff_req_vis
+                # The category is part of the identity (store_raw's own dedup
+                # key includes it): the same text under two different
+                # non-empty categories is a distinct memory. A stored row with
+                # no category (written before categories were compared) keeps
+                # the old behaviour and matches under any category.
+                and (not getattr(mem, "category", None) or mem.category == category)
             ):
                 logger.info(f"Skipping duplicate memory for user {user_id}: {content[:50]}...")
                 await _enqueue_stale_graph_check(ctx, mem, content, user_id, project_id)
@@ -421,7 +427,17 @@ async def process_memory_raw_batch(ctx: dict, items: list[dict]) -> dict:
     service: MemoryService = ctx["service"]
 
     dedup_ids: set[str] = set()
-    memories = await asyncio.to_thread(service.store_raw_batch, items, dedup_ids=dedup_ids)
+    # Graph enrichment (slow Graphiti extraction) is deferred to the graph
+    # queue, one job per stored row, exactly like process_memory_raw: a 25-item
+    # checkpoint must not run 25 add_episode calls inside this fast-queue job.
+    graph_jobs: list[dict] = []
+    memories = await asyncio.to_thread(
+        service.store_raw_batch, items, dedup_ids=dedup_ids, graph_jobs=graph_jobs
+    )
+    # Reference-workspace rows are vector-only: no job, no fallback (the store
+    # already leaves them out; this keeps the rule at the one place that enqueues).
+    graph_jobs = [j for j in graph_jobs if j.get("workspace") in (None, "", "memory")]
+    graph_jobs_enqueued = await _enqueue_graph_jobs(ctx, graph_jobs, adapter=None)
 
     # Dedup survivors weren't re-enriched: queue the cheap stale-graph check
     # for each (same semantics as process_memory_raw's dedup hits).
@@ -462,7 +478,12 @@ async def process_memory_raw_batch(ctx: dict, items: list[dict]) -> dict:
             })
         _rebuild_category_index(registry)
 
-    return {"memories": [m.model_dump(exclude_none=True) for m in memories]}
+    return {
+        "memories": [m.model_dump(exclude_none=True) for m in memories],
+        # Rows whose graph enrichment was handed to the graph queue (the rest of
+        # graph_jobs, if any, were enriched inline after an enqueue failure).
+        "graph_jobs_enqueued": graph_jobs_enqueued,
+    }
 
 
 async def _enqueue_graph_jobs(ctx: dict, jobs: list[dict], adapter: str | None) -> int:
@@ -513,6 +534,8 @@ async def _enqueue_graph_jobs(ctx: dict, jobs: list[dict], adapter: str | None) 
                     memory_id=job["memory_id"],
                     source_ref=job.get("source_ref"),
                     graph_ontology=graph_ontology,
+                    occurred_at=job.get("occurred_at"),
+                    workspace=job.get("workspace"),
                 )
             except Exception as e2:  # noqa: BLE001 — enrichment is best-effort
                 logger.warning(
@@ -582,6 +605,7 @@ async def process_ingest_document(ctx: dict, doc: dict) -> dict:
         overlap=doc.get("overlap"),
         adapter=doc.get("adapter", "default"),
         occurred_at=doc.get("occurred_at"),
+        workspace=doc.get("workspace"),
     )
     result = await asyncio.to_thread(ingest_document, service, ingest_doc)
 
@@ -780,6 +804,7 @@ async def process_ingest_file(ctx: dict, payload: dict) -> dict:
         extract_facts=options.get("extract_facts", True),
         index_passages=options.get("index_passages", True),
         adapter=options.get("adapter", "default"),
+        workspace=options.get("workspace"),
     )
     result = await asyncio.to_thread(ingest_document, service, ingest_doc)
 
@@ -873,6 +898,7 @@ async def process_ingest_okf_bundle(ctx: dict, payload: dict) -> dict:
         tags=options.get("tags"),
         extract_facts=options.get("extract_facts", True),
         index_passages=options.get("index_passages", True),
+        workspace=options.get("workspace"),
         llm_call=default_type_llm(service),
     )
 
@@ -1731,6 +1757,7 @@ async def process_connector_sync(
                 scope=record.get("default_scope", "global"),
                 project_id=record.get("default_project_id"),
                 visibility=record.get("default_visibility"),
+                workspace=record.get("default_workspace"),
             )
             _ing = await asyncio.to_thread(ingest_document, service, doc)
             # Same deferral as file/document ingest: fact graph writes go to

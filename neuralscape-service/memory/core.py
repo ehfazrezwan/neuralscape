@@ -67,6 +67,57 @@ def _is_concurrent_creation(exc: BaseException) -> bool:
     return _is_collection_exists_conflict(exc) or _is_collection_not_yet_readable(exc)
 
 
+# ``Settings.get_mem0_config`` sets this ``history_db_path`` when ``MEM0_HISTORY_ENABLED``
+# is off. mem0 then opens a throwaway in-memory SQLite instead of ``~/.mem0/history.db``,
+# and ``_memory_from_config`` swaps that for ``_NoHistory`` so no row is ever kept.
+_NO_HISTORY_DB_PATH = ":memory:"
+
+
+class _NoHistory:
+    """Drop-in for mem0's ``SQLiteManager`` that records nothing.
+
+    The service writes mem0's history on every memory (``m.db.add_history`` in the
+    write path, plus mem0's own ``_update_memory`` / ``_delete_memory``) but never reads
+    it, so each row was a pointless synchronous disk write. Every method of the real
+    manager the ``Memory`` / ``AsyncMemory`` code calls is here and does nothing.
+    """
+
+    connection = None
+
+    def add_history(self, *args, **kwargs) -> None:
+        return None
+
+    def batch_add_history(self, records) -> None:
+        return None
+
+    def get_history(self, memory_id):
+        return []
+
+    def save_messages(self, messages, session_scope) -> None:
+        return None
+
+    def get_last_messages(self, session_scope, limit=10):
+        return []
+
+    def reset(self) -> None:
+        return None
+
+    def close(self) -> None:
+        return None
+
+
+def _drop_history(memory) -> None:
+    """Replace ``memory.db`` (an in-memory SQLiteManager) with ``_NoHistory``."""
+    old = getattr(memory, "db", None)
+    memory.db = _NoHistory()
+    close = getattr(old, "close", None)
+    if callable(close):
+        try:
+            close()
+        except Exception:  # noqa: BLE001 - a throwaway in-memory database
+            logger.debug("closing the throwaway mem0 history db failed", exc_info=True)
+
+
 def _memory_from_config(memory_cls, config):
     """``Memory.from_config``, tolerating a concurrent first start.
 
@@ -81,7 +132,10 @@ def _memory_from_config(memory_cls, config):
     """
     for attempt in range(1, _COLD_START_ATTEMPTS + 1):
         try:
-            return memory_cls.from_config(config)
+            memory = memory_cls.from_config(config)
+            if isinstance(config, dict) and config.get("history_db_path") == _NO_HISTORY_DB_PATH:
+                _drop_history(memory)
+            return memory
         except Exception as exc:
             if attempt == _COLD_START_ATTEMPTS or not _is_concurrent_creation(exc):
                 raise
@@ -278,7 +332,10 @@ class CoreMixin:
                     # close() dropped the old client; a rebuild after it is visible
                     # in the log. `_closed` stays set: only the memory rebuild clears it.
                     self._note_reopen_if_closed(clear=False)
-                    self._genai_model = genai.Client(api_key=settings.google_api_key)
+                    self._genai_model = genai.Client(
+                        api_key=settings.google_api_key,
+                        http_options=settings.gemini_http_options(),
+                    )
         return self._genai_model
 
     def _note_reopen_if_closed(self, *, clear: bool) -> None:

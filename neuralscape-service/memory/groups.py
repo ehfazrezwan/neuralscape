@@ -166,6 +166,10 @@ def _live_node_uuids(run_on_bridge, driver, uuids: list[str], group_ids: list[st
     """
     if not uuids:
         return set()
+    group_ids = _scoped_groups(group_ids)
+    if not group_ids:
+        # No groups, so no live nodes: return empty without a query.
+        return set()
 
     cypher = """
     MATCH (n:Entity) WHERE n.uuid IN $uuids
@@ -285,6 +289,27 @@ def _get_group_ids(caller_user_id: str, project_id: str | None = None) -> list[s
         group_ids.append(_build_group_id("private", caller_user_id, project_id))
         group_ids.append(_build_group_id("shared", caller_user_id, project_id))
     return group_ids + _standard_groups()
+
+
+def _scoped_groups(group_ids) -> list[str]:
+    """The group list a graph read may use: cleaned, and possibly empty.
+
+    Every graph read goes through this before it touches Graphiti or Neo4j.
+    Entries that are not non-blank strings are dropped and duplicates
+    collapse, order preserved.
+
+    An empty result means "no groups, so no results": the caller returns its
+    empty value and does not make the graph call. A caller that needs a
+    whole-graph read must run its own explicitly named query (the maintenance
+    scripts do), not pass a group list.
+    """
+    if not group_ids or isinstance(group_ids, (str, bytes)):
+        return []
+    cleaned: list[str] = []
+    for g in group_ids:
+        if isinstance(g, str) and g.strip() and g not in cleaned:
+            cleaned.append(g)
+    return cleaned
 
 
 def _check_edit_permission(
