@@ -216,19 +216,7 @@ class Settings(BaseSettings):
 
     # Graphiti options
     store_raw_episode_content: bool = True
-    # Keep Graphiti community nodes current (GET /v1/graph/communities reads them).
-    # On: the first write into a group builds its communities (one scoped
-    # clustering pass), and every later write joins its entities to them. Costs
-    # LLM calls per write (a summary merge plus a name per community touched),
-    # so it stays off by default.
     update_communities: bool = False
-
-    # mem0's own SQLite history (a row per add/update/delete, ``~/.mem0/history.db``).
-    # Nothing in the service reads it (``Memory.history()`` is never called), yet
-    # the write path appended to it on every memory (a synchronous disk write on
-    # an ephemeral container path). Off by default: ``MemoryService`` swaps in a
-    # no-op history store. Set true to restore the file-backed history.
-    mem0_history_enabled: bool = False
 
     # Qdrant vector store
     qdrant_url: str | None = None  # e.g. "http://localhost:6333" — if set, uses Qdrant server mode
@@ -1676,7 +1664,7 @@ class Settings(BaseSettings):
             }
             graphiti_models = self._graphiti_ai_studio_models()
 
-        mem0_config = {
+        return {
             "llm": llm_block,
             "embedder": embedder_block,
             "vector_store": {
@@ -1703,11 +1691,6 @@ class Settings(BaseSettings):
             },
             "version": "v1.1",
         }
-        if not self.mem0_history_enabled:
-            # Never touch ~/.mem0/history.db: mem0 opens a throwaway in-memory
-            # SQLite here and ``_memory_from_config`` replaces it with a no-op.
-            mem0_config["history_db_path"] = ":memory:"
-        return mem0_config
 
 
 settings = Settings()

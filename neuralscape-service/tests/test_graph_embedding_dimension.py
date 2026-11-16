@@ -335,15 +335,15 @@ def _graph(bridge):
 class TestGraphitiBridgeFailuresSurface:
     def test_search_raises_instead_of_returning_empty(self):
         with pytest.raises(RuntimeError, match="bridge exploded"):
-            _graph(_BoomBridge()).search("q", {"user_id": "u1", "group_id": "g1"})
+            _graph(_BoomBridge()).search("q", {"user_id": "u1"})
 
     def test_get_all_raises_instead_of_returning_empty(self):
         with pytest.raises(RuntimeError, match="bridge exploded"):
-            _graph(_BoomBridge()).get_all({"user_id": "u1", "group_id": "g1"})
+            _graph(_BoomBridge()).get_all({"user_id": "u1"})
 
     def test_failure_is_logged_with_traceback(self, caplog):
         with caplog.at_level("ERROR"), pytest.raises(RuntimeError):
-            _graph(_BoomBridge()).search("q", {"user_id": "u1", "group_id": "g1"})
+            _graph(_BoomBridge()).search("q", {"user_id": "u1"})
         rec = [r for r in caplog.records if "Graphiti search failed" in r.getMessage()]
         assert rec and rec[0].exc_info
 
@@ -357,10 +357,10 @@ class TestGraphitiBridgeFailuresSurface:
 
         mg.graphiti.search = _none
         mg._resolve_edge_names = _none
-        assert mg.search("q", {"user_id": "u1", "group_id": "g1"}) == []
+        assert mg.search("q", {"user_id": "u1"}) == []
 
         async def _not_found(*a, **k):
             raise gm.GroupsEdgesNotFoundError(["g"])
 
         with patch.object(gm.EntityEdge, "get_by_group_ids", _not_found):
-            assert mg.get_all({"user_id": "u1", "group_id": "g1"}) == []
+            assert mg.get_all({"user_id": "u1"}) == []
