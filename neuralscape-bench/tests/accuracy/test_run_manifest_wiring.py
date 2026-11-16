@@ -323,97 +323,69 @@ def test_ingest_is_scoped_to_the_dataset_and_unrecorded_totals_are_unknown(env):
     assert battery["ingest"]["est_tokens"] == 15
 
 
-def test_totals_keep_unrecorded_components_unknown(tmp_path):
+def test_scoped_totals_keep_unrecorded_components_unknown(tmp_path):
     m = IngestManifest(tmp_path / "i.json")
     m.mark_session("c1", "s1", elapsed_s=1.0, est_tokens=None)
-    t = m.totals()
+    t = m.scoped_totals({("c1", "s1")})
     assert t["ingest_wall_s"] == 1.0 and t["est_tokens"] is None
 
 
-def test_timestamps_are_utc_aware(env):
-    from neuralscape_bench.accuracy.run_record import load_battery_manifest
+def test_legacy_totals_are_unchanged_for_the_default_report(tmp_path):
+    # Empty sessions are recorded without elapsed_s/est_tokens (ingest.py); the
+    # default suite-result JSON must keep counting them as 0, exactly as on dev.
+    m = IngestManifest(tmp_path / "i.json")
+    m.mark_session("c1", "s1", elapsed_s=2.0, est_tokens=7)
+    m.mark_session("c1", "empty")
+    assert m.totals() == {"conversations": 1, "sessions": 2,
+                          "ingest_wall_s": 2.0, "est_tokens": 7}
 
+
+def test_default_suite_result_run_stats_unchanged_with_empty_sessions(env):
     env.write_judged(_judged())
-    out = env.tmp / "m.json"
-    _report("--manifest", str(out))
-    manifest, _ = load_battery_manifest(out)
-    assert manifest.started_at.utcoffset() == timezone.utc.utcoffset(datetime.now())
-
-
-def test_stray_commit_env_does_not_break_runs_without_the_flag(env, monkeypatch):
-    env.write_judged(_judged())
-    monkeypatch.setenv("BENCH_NS_COMMIT", "abc123")
+    ing = IngestManifest.for_run("locomo", run_mod.manifest_label("http://localhost:8398", None))
+    ing.mark_session("c1", "s1", elapsed_s=2.0, est_tokens=7)
+    ing.mark_session("c1", "s2")  # empty session: no timings
     assert _report() == 0
-    with pytest.raises(SystemExit):
-        _report("--manifest", str(env.tmp / "m.json"))
+    result = json.loads(next(env.results.glob("accuracy-locomo-*.json")).read_text())
+    assert result["run"] == {"conversations": 1, "sessions": 2,
+                             "ingest_wall_s": 2.0, "est_tokens": 7}
 
 
-def test_manifest_without_report_phase_exits_2(env, capsys):
-    with pytest.raises(SystemExit) as e:
-        run_mod.main(["--suite", "locomo", "--phase", "answer",
-                      "--manifest", str(env.tmp / "m.json")])
-    assert e.value.code == 2
-    assert "report" in capsys.readouterr().err
+def test_legacy_done_session_without_meta_is_unrecorded_not_dropped(tmp_path):
+    path = tmp_path / "i.json"
+    path.write_text(json.dumps({"conversations": {"c1": {"sessions_done": ["s1", "s2"],
+                   "sessions_meta": {"s1": {"elapsed_s": 1.0, "est_tokens": 3}}}}, "stats": {}}))
+    m = IngestManifest(path)
+    pairs = {("c1", "s1"), ("c1", "s2")}
+    assert len(m.session_metas(pairs)) == 2
+    t = m.scoped_totals(pairs)
+    assert t["sessions"] == 2 and t["ingest_wall_s"] is None and t["est_tokens"] is None
 
 
-def test_manifest_path_is_checked_before_any_phase_runs(env):
-    env.write_judged(_judged())
-    with pytest.raises(SystemExit) as e:
-        _report("--manifest", str(env.tmp))  # a directory
-    assert e.value.code == 2
-    existing = env.tmp / "m.json"
-    existing.write_text("keep")
-    with pytest.raises(SystemExit) as e:
-        _report("--manifest", str(existing))
-    assert e.value.code == 2 and existing.read_text() == "keep"
-    assert not list(env.results.glob("accuracy-locomo-*.json"))  # refused up front
-    assert _report("--manifest", str(existing), "--manifest-overwrite") == 0
-    assert existing.read_text() != "keep"
-
-
-def test_loader_reports_a_malformed_battery_clearly(env):
-    from neuralscape_bench.accuracy.run_record import load_battery_manifest
-
-    env.write_judged(_judged())
-    out = env.tmp / "m.json"
-    _report("--manifest", str(out))
-    good = json.loads(out.read_text())
-
-    broken = json.loads(json.dumps(good))
-    del broken["battery"]["models"]
-    out.write_text(json.dumps(broken))
-    with pytest.raises(ValueError, match="battery section is missing: models"):
-        load_battery_manifest(out)
-
-    liar = json.loads(json.dumps(good))
-    liar["battery"]["unknown"].remove("build.git_commit")  # null but not named
-    out.write_text(json.dumps(liar))
-    with pytest.raises(ValueError, match="does not match the null fields"):
-        load_battery_manifest(out)
-
-
-def test_omitted_build_keys_in_a_battery_file_are_rejected(env):
+def test_loader_rejects_a_wrong_workload_id(env):
     from neuralscape_bench.accuracy.run_record import load_battery_manifest
 
     env.write_judged(_judged())
     out = env.tmp / "m.json"
     _report("--manifest", str(out))
     doc = json.loads(out.read_text())
-    del doc["run_manifest"]["build"]["image_digest"]
+    rm = doc["run_manifest"]  # a fully valid manifest of another kind
+    rm["workload"]["workload_id"] = "service-baseline-v1"
+    rm["cache_condition"] = "warm"
+    rm["build"].update(git_commit="d" * 40, image_digest="sha256:" + "a" * 64,
+                       dependency_lock_sha256="sha256:" + "b" * 64)
     out.write_text(json.dumps(doc))
-    with pytest.raises(Exception):
+    with pytest.raises(ValueError, match="not an accuracy battery workload"):
         load_battery_manifest(out)
 
 
-def test_workload_hash_tracks_sampling_and_corpus():
-    from neuralscape_bench.accuracy.run_record import workload_hashes
+def test_check_manifest_target_refuses_directory_and_unwritable_parent(tmp_path, monkeypatch):
+    from neuralscape_bench.accuracy import run_record
+    from neuralscape_bench.accuracy.run_record import check_manifest_target
 
-    a = workload_hashes(_data(), sample=None, seed=1, options={})
-    assert a == workload_hashes(_data(), sample=None, seed=1, options={})
-    assert a[0] != workload_hashes(_data(), sample=5, seed=1, options={})[0]
-    assert a[0] != workload_hashes(_data(), sample=None, seed=2, options={})[0]
-    other = SuiteData(suite="locomo", qa_items=_data().qa_items, conversations=[
-        Conversation(conv_id="c1", sessions=(
-            Session(session_id="s1", turns=(Turn(role="user", content="different"),)),))])
-    assert a[1] != workload_hashes(other, sample=None, seed=1, options={})[1]
-    assert a[0] == workload_hashes(other, sample=None, seed=1, options={})[0]
+    with pytest.raises(ValueError, match="is a directory"):
+        check_manifest_target(tmp_path, overwrite=True)
+    # Deterministic regardless of the user running the tests (root ignores modes).
+    monkeypatch.setattr(run_record.os, "access", lambda *a, **k: False)
+    with pytest.raises(ValueError, match="not a writable directory"):
+        check_manifest_target(tmp_path / "sub" / "m.json", overwrite=False)

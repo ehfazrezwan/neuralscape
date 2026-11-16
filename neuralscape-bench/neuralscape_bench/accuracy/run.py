@@ -209,7 +209,7 @@ async def _run_paid(args, suite_name: str) -> Path | None:
                 data=data, config=result["config"],
                 judged=scoped,
                 ingest_metas=manifest.session_metas(pairs),
-                ingest_totals=manifest.totals(pairs),
+                ingest_totals=manifest.scoped_totals(pairs),
                 metrics=scoped_metrics,
                 concurrency=args.concurrency,
                 ns_commit=args.ns_commit, run_label=args.run_label)
