@@ -180,7 +180,17 @@ def _legacy_diary_is_provably(text: str, pool: str) -> bool:
     return first == f"# Dreams \u2014 {pool}"
 
 
-def _migrate_legacy_diary(dreams_dir: Path, pool: str, path: Path) -> None:
+_MIGRATION_NOTE_PREFIX = "> Note: the entries below were carried over from the pre-fix diary file"
+
+
+def _migration_note(old_name: str) -> str:
+    return (
+        f"{_MIGRATION_NOTE_PREFIX} `{old_name}`. "
+        "Before this fix, pools whose names collided could both have written into that file."
+    )
+
+
+def _migrate_legacy_diary(dreams_dir: Path, pool: str, path: Path) -> str | None:
     """Move the old slug-only diary to the new name when it is provably this pool's.
 
     The old file's ``pool`` frontmatter and H1 must equal ``pool`` exactly
@@ -191,12 +201,16 @@ def _migrate_legacy_diary(dreams_dir: Path, pool: str, path: Path) -> None:
     A legacy file already mixed by a past collision names only its last
     writer; the sweep does not know the other pools, so it cannot be told
     apart here. Such files may hold mixed text and need manual review.
+
+    Returns the old file name when a migration happened, else None.
     """
     old = legacy_diary_page_path(dreams_dir, pool)
     if old == path or not old.exists() or path.exists():
-        return
+        return None
     if _legacy_diary_is_provably(old.read_text(encoding="utf-8"), pool):
         old.replace(path)
+        return old.name
+    return None
 
 
 def render_diary_entry(
@@ -259,8 +273,9 @@ def write_diary(
     except Exception:
         logger.warning("diary path failed for %s (non-fatal)", pool, exc_info=True)
         return None
+    migrated_from: str | None = None
     try:
-        _migrate_legacy_diary(dreams_dir, pool, path)
+        migrated_from = _migrate_legacy_diary(dreams_dir, pool, path)
     except Exception:
         logger.warning("legacy diary migration failed for %s (non-fatal)", pool, exc_info=True)
     title = f"Dreams — {pool}"
@@ -275,6 +290,14 @@ def write_diary(
         prior = existing[idx:] if idx != -1 else ""
     entries = [e for e in ("## Dream" + p for p in prior.split("## Dream")[1:]) if e.strip()]
     entries = entries[: keep_entries - 1]
+    # One visible note above the carried-over entries: added on migration,
+    # kept (never repeated) on later writes to the same page.
+    note = _migration_note(migrated_from) if migrated_from else ""
+    if not note and existing:
+        head = existing[: existing.find("## Dream")] if "## Dream" in existing else existing
+        note = next(
+            (ln for ln in head.splitlines() if ln.startswith(_MIGRATION_NOTE_PREFIX)), ""
+        )
     ts = datetime.now(timezone.utc).isoformat()
     fm = "\n".join(
         [
@@ -292,6 +315,7 @@ def write_diary(
             "",
             f"# {title}",
             "",
+            *([note, ""] if note else []),
         ]
     )
     content = fm + entry + "\n" + "\n".join(entries)

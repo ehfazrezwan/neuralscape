@@ -75,6 +75,42 @@ def test_legacy_diary_of_this_pool_is_migrated_not_duplicated(tmp_path):
     assert "old text" in text and "new text" in text
 
 
+def _migrated_page(dreams):
+    _write(dreams, A, "old text")
+    new = reflect.diary_page_path(dreams, A)
+    legacy = reflect.legacy_diary_page_path(dreams, A)
+    new.replace(legacy)
+    return new, legacy
+
+
+def test_migrated_page_carries_one_note_naming_old_file(tmp_path):
+    dreams = tmp_path / "Dreams"
+    new, legacy = _migrated_page(dreams)
+    _write(dreams, A, "new text")
+    text = new.read_text()
+    lines = [ln for ln in text.splitlines() if "carried over from the pre-fix" in ln]
+    assert len(lines) == 1
+    assert f"`{legacy.name}`" in lines[0] and "collided" in lines[0]
+    assert text.index(lines[0]) < text.index("## Dream")
+    assert "old text" in text and "new text" in text
+
+
+def test_fresh_page_has_no_migration_note(tmp_path):
+    dreams = tmp_path / "Dreams"
+    _write(dreams, A, "fresh")
+    assert "pre-fix" not in reflect.diary_page_path(dreams, A).read_text()
+
+
+def test_migration_note_not_repeated_on_later_writes(tmp_path):
+    dreams = tmp_path / "Dreams"
+    new, _ = _migrated_page(dreams)
+    _write(dreams, A, "second")
+    _write(dreams, A, "third")
+    text = new.read_text()
+    assert text.count("carried over from the pre-fix") == 1
+    assert "third" in text and "old text" in text
+
+
 def test_legacy_file_of_another_pool_never_receives_text(tmp_path):
     dreams = tmp_path / "Dreams"
     _write(dreams, B, "B-text")
