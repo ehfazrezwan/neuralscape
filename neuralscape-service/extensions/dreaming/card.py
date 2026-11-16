@@ -32,6 +32,8 @@ import re
 from datetime import datetime, timezone
 from pathlib import Path
 
+from memory.groups import _build_group_id, decode_group_id
+
 from .consolidate import PoolBatch
 from .prompts import parse_json_object
 
@@ -117,9 +119,9 @@ def resolve_card_pool(
     if pool:
         return pool
     if project_id:
-        return f"shared--project--{project_id}"
+        return _build_group_id("shared", "", project_id)
     if user_id:
-        return f"user--{user_id}"
+        return _build_group_id("private", user_id)
     return None
 
 
@@ -136,12 +138,17 @@ def card_read_allowed(pool: str, caller_user_id: str | None, *, is_dictator: boo
     precedence every other read path uses). ``None`` denies: this guard
     never treats a missing identity as trust.
     """
-    if not pool.startswith("user--"):
+    placement = decode_group_id(pool)
+    private_encoded = placement is not None and placement.pool == "private"
+    if not private_encoded and not pool.startswith("user--"):
         return True
     if is_dictator:
         return True
     if not caller_user_id:
         return False
+    if private_encoded:
+        # Injective (flag-on) name of a private pool: only its exact owner reads it.
+        return placement.owner == caller_user_id
     return pool == f"user--{caller_user_id}" or pool.startswith(f"user--{caller_user_id}--")
 
 

@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from config import settings
 from schemas import ContextResponse, MemoryResponse, MemoryVisibility
 from memory.audit import _audit_log
+from memory.groups import _is_plain_component, decode_group_id, ENCODED_GROUP_PREFIX
 from memory.hashing import _created_at_key
 from memory.ranking import _mem_is_tombstoned
 
@@ -880,7 +881,16 @@ class ReadsMixin:
         if g is None:
             return []
 
+        # With the injective flag on, a project group whose owner or project id
+        # needs encoding is named ``nsg1--<hex>`` (see memory/groups.py), which
+        # no ``user--`` prefix seek finds: scan that prefix too and keep only
+        # the groups ``decode_group_id`` places in this caller's private pool or
+        # the shared pool. A non-plain caller id is never used in a legacy
+        # prefix (it could match another user's legacy namespace).
+        injective = settings.graph_group_id_injective_enabled
         user_prefix = f"user--{user_id}--project--"
+        if injective and not _is_plain_component(user_id):
+            user_prefix = ENCODED_GROUP_PREFIX  # matches no legacy group; scanned below anyway
         shared_prefix = "shared--project--"
         # One MATCH per indexed label so the per-label group_id range index is
         # used; UNION dedupes across labels (and is itself DISTINCT).
@@ -897,12 +907,18 @@ class ReadsMixin:
         WHERE n.group_id STARTS WITH $user_prefix OR n.group_id STARTS WITH $shared_prefix
         RETURN DISTINCT n.group_id AS group_id
         """
+        if injective:
+            cypher = cypher.replace(
+                "OR n.group_id STARTS WITH $shared_prefix",
+                "OR n.group_id STARTS WITH $shared_prefix OR n.group_id STARTS WITH $encoded_prefix",
+            )
+        params = {"user_prefix": user_prefix, "shared_prefix": shared_prefix}
+        if injective:
+            params["encoded_prefix"] = ENCODED_GROUP_PREFIX
 
         async def _run():
             async with g.driver.session() as session:
-                result = await session.run(
-                    cypher, user_prefix=user_prefix, shared_prefix=shared_prefix
-                )
+                result = await session.run(cypher, **params)
                 return await result.data()
 
         coro = _run()
@@ -918,6 +934,14 @@ class ReadsMixin:
         projects: set[str] = set()
         for rec in records:
             gid = rec.get("group_id") or ""
+            placement = decode_group_id(gid) if injective else None
+            if placement is not None:
+                if placement.project and (
+                    placement.pool == "shared"
+                    or (placement.pool == "private" and placement.owner == user_id)
+                ):
+                    projects.add(placement.project)
+                continue
             # Both namespaces end with '--project--{pid}'; everything after the
             # separator is the project id. Global groups ('user--{uid}',
             # 'shared') have no separator and are skipped.

@@ -9,7 +9,7 @@ import time
 
 from config import settings
 from schemas import MemoryResponse, MemoryVisibility
-from memory.groups import _edge_is_invalidated, _get_group_ids, _live_edges_filter
+from memory.groups import _build_group_id, _edge_is_invalidated, _get_group_ids, _live_edges_filter
 from memory.ranking import (
     RRF_K,
     _dense_score_floor,
@@ -1235,26 +1235,27 @@ class SearchMixin:
         def _standard_groups() -> list[str]:
             if not settings.standards_enabled:
                 return []
-            return ["standard"] + ([f"standard--project--{project_id}"] if project_id else [])
+            return ["standard"] + ([_build_group_id("standard", "", project_id)] if project_id else [])
+
+        def _private_groups() -> list[str]:
+            groups = [_build_group_id("private", user_id)]
+            if project_id:
+                groups.append(_build_group_id("private", user_id, project_id))
+            return groups
 
         if visibility == MemoryVisibility.PRIVATE.value:
-            group_ids = [f"user--{user_id}"]
-            if project_id:
-                group_ids.append(f"user--{user_id}--project--{project_id}")
+            group_ids = _private_groups()
         elif visibility == MemoryVisibility.STANDARD.value:
             group_ids = _standard_groups()
         elif visibility == MemoryVisibility.SHARED.value:
             group_ids = ["shared"]
             if project_id:
-                group_ids.append(f"shared--project--{project_id}")
+                group_ids.append(_build_group_id("shared", "", project_id))
         elif not include_shared:
             # No explicit visibility, but caller opted out of shared pool.
             # Standards remain in-scope — they are binding and independent of
             # the shared opt-out.
-            group_ids = [f"user--{user_id}"]
-            if project_id:
-                group_ids.append(f"user--{user_id}--project--{project_id}")
-            group_ids += _standard_groups()
+            group_ids = _private_groups() + _standard_groups()
         else:
             # Default: full read-set (caller's private + shared + standard).
             group_ids = _get_group_ids(user_id, project_id)
@@ -1265,7 +1266,19 @@ class SearchMixin:
         # can never widen who may read. Default (None) is unchanged.
         if workspaces:
             refs = [w for w in workspaces if w != "memory"]
-            ws_groups = [f"{g}--ws--{w}" for g in group_ids for w in refs]
+            # Name each workspace group through the builder (the injective
+            # encoding covers the whole tuple, so a suffix cannot be appended
+            # to an encoded base). The caller's possible bases are mapped back
+            # to their placement by building them, not by parsing names.
+            placements: dict[str, tuple[str, str, str | None]] = {}
+            for pool, owner in (("private", user_id), ("shared", ""), ("standard", "")):
+                for pid in (None, project_id):
+                    placements.setdefault(_build_group_id(pool, owner, pid), (pool, owner, pid))
+            ws_groups = [
+                _build_group_id(*placements[g], workspace=w) if g in placements else f"{g}--ws--{w}"
+                for g in group_ids
+                for w in refs
+            ]
             group_ids = (group_ids if "memory" in workspaces else []) + ws_groups
 
         return self._do_graph_search(

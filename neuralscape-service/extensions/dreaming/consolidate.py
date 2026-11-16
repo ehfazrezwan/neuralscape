@@ -37,6 +37,8 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
+from memory.groups import _build_group_id
+
 from .prompts import CONSOLIDATION_PROMPT, parse_json_object, render_memories_block
 from .scoring import score_memory
 from .traces import read_aggregates, read_dynamics
@@ -81,15 +83,11 @@ class ActionResult:
 
 def pool_key(*, visibility: str, owner_user_id: str | None, project_id: str | None, workspace: str | None = None) -> str:
     """Derive the pool key for a memory row (mirrors graph group_id + WT6 workspace suffix)."""
+    # Same builder as the write side, so a pool key IS the graph group_id (flag on: injective names).
+    # Anything but "shared" is a private pool, as before.
     if visibility == "shared":
-        base = f"shared--project--{project_id}" if project_id else "shared"
-    else:
-        uid = owner_user_id or "unknown"
-        base = f"user--{uid}--project--{project_id}" if project_id else f"user--{uid}"
-    # Workspace suffix (WT6): absent or "memory" ⇒ no suffix (backward compatible)
-    if workspace and workspace != "memory":
-        return f"{base}--ws--{workspace}"
-    return base
+        return _build_group_id("shared", "", project_id, workspace)
+    return _build_group_id("private", owner_user_id or "unknown", project_id, workspace)
 
 
 # Audit 27 #29: the enumeration scroll pulls ONLY the fields the cheap
