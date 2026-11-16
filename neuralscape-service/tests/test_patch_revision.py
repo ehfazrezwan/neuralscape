@@ -121,6 +121,13 @@ class FakeQdrant:
         self.writes.append(f"vs_update:{pid}")
 
     before_mem0_update = None             # hook: a writer that runs while the rewrite is in flight
+    before_embed = None                   # hook: runs while the (slow) re-embed is in flight
+
+    def embed(self, text, action):
+        if self.before_embed:
+            hook, self.before_embed = self.before_embed, None
+            hook(self)
+        return [0.1, 0.1, 0.1, 0.1]
 
     def mem0_update(self, pid, data, metadata=None):
         if self.before_mem0_update:
@@ -153,7 +160,10 @@ def world():
     mem.vector_store.client = fake
     mem.vector_store.get.side_effect = fake.vs_get
     mem.vector_store.update.side_effect = fake.vs_update
-    mem.update.side_effect = fake.mem0_update
+    mem._update_memory.side_effect = lambda memory_id, data, existing_embeddings, metadata=None: fake.mem0_update(
+        memory_id, data, metadata
+    )
+    mem.embedding_model.embed.side_effect = fake.embed
     mem.get.side_effect = fake.mem0_get
     svc._cascade_rows_once = MagicMock(return_value={
         "results": {}, "graph_jobs": [], "sibling_unrepaired_ids": [], "sibling_repair_failed": False,
@@ -201,7 +211,7 @@ def test_stale_content_edit_is_refused_before_any_re_embed(world):
     world.patch_memory(M1, "ehfaz", {"tags": ["winner"]})
     with pytest.raises(RevisionConflict):
         world.patch_memory(M1, "ehfaz", {"content": "stale text"}, expected_revision="0")
-    world._memory.update.assert_not_called()
+    world._memory._update_memory.assert_not_called()
     assert world.fake.points[M1]["data"] == "Old content"
 
 
@@ -490,3 +500,19 @@ def test_retag_skips_a_row_that_a_patch_changed_since_the_scroll(world, monkeypa
     world.fake.scroll = scroll_then_patch
     out = _retag(world)
     assert out["skipped_busy_ids"] == [M1] and _tags(world) == ["patched-meanwhile"]
+
+
+def test_I3_A_lock_expires_during_the_re_embed_B_commits_then_A_changes_nothing_and_reports_a_conflict(world, edit_lock_redis):
+    """The required interleaving: (1) A holds the lock, (2) A's lock expires while A re-embeds, (3) B takes the lock
+    and commits, (4) A tries to write: A changes NOTHING and gets a conflict; B's content AND revision remain."""
+    def expire_then_B_commits(fake):
+        edit_lock_redis.store.pop(LOCK_KEY, None)                                     # (2) A's TTL lapses
+        world.patch_memory(M1, "ehfaz", {"content": "B's text"}, expected_revision="0")   # (3) B commits
+
+    world.fake.before_embed = expire_then_B_commits
+    with pytest.raises(RevisionConflict) as err:
+        world.patch_memory(M1, "ehfaz", {"content": "A's text"}, expected_revision="0")   # (4)
+    assert err.value.current_revision == "1"
+    assert world.fake.points[M1]["data"] == "B's text"                                  # B's content remains
+    assert world.fake.points[M1]["metadata"]["revision"] == 1                           # B's revision remains
+    assert world.get_memory(M1).revision == "1"

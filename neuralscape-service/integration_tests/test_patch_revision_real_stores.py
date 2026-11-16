@@ -37,6 +37,7 @@ class _Mem0Shim:
         self.client = client
         self.collection = collection
         self.vector_store = SimpleNamespace(client=client, get=self._vs_get, update=self._vs_update)
+        self.embedding_model = SimpleNamespace(embed=self._embed)
 
     def _vs_get(self, vector_id):
         pts = self.client.retrieve(self.collection, ids=[vector_id], with_payload=True)
@@ -47,8 +48,15 @@ class _Mem0Shim:
         self.client.set_payload(self.collection, payload=payload, points=[vector_id])
 
     before_update = None   # hook: runs while a content rewrite is in flight
+    before_embed = None
 
-    def update(self, memory_id, data, metadata=None):
+    def _embed(self, text, action):
+        if self.before_embed:
+            hook, self.before_embed = self.before_embed, None
+            hook()
+        return [0.1] * DIM
+
+    def _update_memory(self, memory_id, data, existing_embeddings, metadata=None):
         if self.before_update:
             hook, self.before_update = self.before_update, None
             hook()
@@ -299,3 +307,21 @@ def test_a_stolen_lock_fails_the_original_writer_at_the_fence(world, monkeypatch
         world.patch_memory(pid, world.owner, {"content": "stalled"}, expected_revision="0")
     assert _stored(world, pid)["data"] == "the original text"
     edit._redis_client().delete(f"ns:edit-lock:{pid}")
+
+
+def test_a_lock_that_expires_during_the_re_embed_lets_B_commit_and_A_changes_nothing(world):
+    """Real Redis + real Qdrant: A's lock is deleted (TTL lapse) while A re-embeds; B commits; A must conflict."""
+    import memory.edit as edit
+    from memory.edit import RevisionConflict
+
+    pid = _seed(world)
+
+    def expire_then_B():
+        edit._redis_client().delete(f"ns:edit-lock:{pid}")
+        world.patch_memory(pid, world.owner, {"content": "B's text"}, expected_revision="0")
+
+    world._memory.before_embed = expire_then_B
+    with pytest.raises(RevisionConflict):
+        world.patch_memory(pid, world.owner, {"content": "A's text"}, expected_revision="0")
+    stored = _stored(world, pid)
+    assert stored["data"] == "B's text" and stored["metadata"]["revision"] == 1

@@ -25,6 +25,8 @@ class _Shim:
         self.client, self.collection = client, collection
         self.vector_store = SimpleNamespace(client=client, get=self._get, update=self._set)
         self.before_update = None
+        self.before_embed = None
+        self.embedding_model = SimpleNamespace(embed=self._embed)
 
     def _get(self, vector_id):
         pts = self.client.retrieve(self.collection, ids=[vector_id], with_payload=True)
@@ -33,7 +35,13 @@ class _Shim:
     def _set(self, vector_id, vector=None, payload=None):
         self.client.set_payload(self.collection, payload=payload, points=[vector_id])
 
-    def update(self, memory_id, data, metadata=None):
+    def _embed(self, text, action):
+        if self.before_embed:
+            hook, self.before_embed = self.before_embed, None
+            hook()
+        return [0.1] * DIM
+
+    def _update_memory(self, memory_id, data, existing_embeddings, metadata=None):
         if self.before_update:
             hook, self.before_update = self.before_update, None
             hook()
@@ -133,3 +141,14 @@ def test_I3_a_lost_lock_fails_the_writer_before_it_can_write(world, edit_lock_re
     with pytest.raises(EditBusy):
         world.patch_memory(world.pid, "u", {"content": "stalled"}, expected_revision="0")
     assert world._memory.get(world.pid)["memory"] == "old" and "revision" not in _meta(world)
+
+
+def test_I3_a_lock_that_expires_during_the_re_embed_lets_B_commit_and_A_changes_nothing(world, edit_lock_redis):
+    def expire_then_B():
+        edit_lock_redis.store.pop(f"ns:edit-lock:{world.pid}", None)
+        world.patch_memory(world.pid, "u", {"content": "B's text"}, expected_revision="0")
+
+    world._memory.before_embed = expire_then_B
+    with pytest.raises(RevisionConflict):
+        world.patch_memory(world.pid, "u", {"content": "A's text"}, expected_revision="0")
+    assert world._memory.get(world.pid)["memory"] == "B's text" and _meta(world)["revision"] == 1

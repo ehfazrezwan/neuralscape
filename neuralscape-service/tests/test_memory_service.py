@@ -1027,7 +1027,7 @@ class TestPatchMemory:
         service._memory.vector_store.get.return_value = _edit_point(meta=dict(_SHARED_META))
         result = service.patch_memory("m1", "robb", {"tags": ["project:bon002"]})
 
-        service._memory.update.assert_not_called()
+        service._memory._update_memory.assert_not_called()
         call = service._memory.vector_store.update.call_args
         assert call.args[0] == "m1" or call.kwargs.get("vector_id") == "m1"
         new_meta = call.kwargs["payload"]["metadata"]
@@ -1044,7 +1044,7 @@ class TestPatchMemory:
         service._memory.vector_store.get.return_value = _edit_point(meta=meta)
         service.patch_memory('m1', 'ehfaz', changes)
         if 'content' in changes:
-            stored = service._memory.update.call_args.kwargs['metadata']['metadata']
+            stored = service._memory._update_memory.call_args.kwargs['metadata']['metadata']
         else:
             stored = service._memory.vector_store.update.call_args.kwargs['payload']['metadata']
         assert 'category_evidence' not in stored
@@ -1061,7 +1061,7 @@ class TestPatchMemory:
         service._cascade_or_fallback_expire = MagicMock(return_value={"resolved": True})
         result = service.patch_memory("m1", "ehfaz", {"content": "New content"})
 
-        call = service._memory.update.call_args
+        call = service._memory._update_memory.call_args
         assert call.args[:2] == ("m1", "New content")
         nested = call.kwargs["metadata"]["metadata"]
         assert nested["category"] == "decision"

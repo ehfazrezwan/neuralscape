@@ -22,7 +22,19 @@ real-store test in ``integration_tests/test_patch_revision_real_stores.py``:
   post-write confirmation step to be fooled by successor writes.
 * I3 - while a writer holds the lock (through its re-embed) no other
   ``patch_memory`` can read-modify-write that row; a writer whose lock was lost
-  (TTL expiry) FAILS at the fence immediately before its write instead of writing.
+  (TTL expiry) FAILS before its write instead of writing: the embedding is
+  computed first, then two fences run (the lock token is still ours; the row is
+  still at the revision we read), then ONE mem0 ``_update_memory`` with the
+  precomputed embedding.
+
+LOCK EXPIRY / REDIS BEHAVIOUR: TTL ``_LOCK_TTL_MS`` = 120 s, wait budget
+``_LOCK_WAIT_S`` = 5 s (a writer that cannot get the lock in 5 s raises
+``EditBusy`` -> 409, nothing written). If the TTL lapses mid-edit and another
+writer commits, the original writer's second fence sees a different revision
+and raises ``RevisionConflict`` (nothing written). Redis unreachable: a
+conditional edit raises ``EditLockUnavailable`` (503, nothing written); an
+unconditional edit proceeds unlocked with a warning (the revision fence still
+applies).
 
 WHY NOT A CONDITIONAL UPSERT (option a): the pinned Qdrant server is
 ``qdrant/qdrant:v1.15.0`` (docker-compose.yml, deploy/k8s/qdrant.yaml) and the
@@ -31,10 +43,11 @@ pinned client is qdrant-client 1.16.2 (uv.lock). The client exposes
 ``PointsBatch`` have no ``update_filter`` field (it first appears in v1.16.0), so
 a conditional upsert is unavailable on the deployed server.
 
-DOCUMENTED LIMITS: (1) mem0's ``update`` upserts unconditionally, so a writer
-whose lock TTL expires INSIDE that call (embedder stalled past
-``_LOCK_TTL_MS``) can still overwrite a later edit; the fence runs immediately
-before the call. (2) ``retag_memories`` takes the same lock per row it changes, re-checks the
+DOCUMENTED LIMITS: (1) mem0's upsert is unconditional (no ``update_filter`` on
+server v1.15), so a check-then-write gap remains between the second fence (a
+Qdrant get) and the upsert inside ``_update_memory`` (a few milliseconds, no
+embedder call in it). A writer must lose its lock AND a successor must commit
+inside that gap to be overwritten. (2) ``retag_memories`` takes the same lock per row it changes, re-checks the
 row's revision under it and bumps the revision in its single write (a busy or
 moved row is skipped and reported in ``skipped_busy_ids``). The writers that do
 NOT take the lock are the dedup counters (the dedup paths in
@@ -82,12 +95,10 @@ def revision_of(meta: dict | None) -> str:
     Rows written before this existed carry no counter and read as ``"0"``. The
     counter is bumped by every ``patch_memory`` and ``retag_memories`` write, so
     a client holding a stale revision is refused. Guarantee boundary: a revision
-    names ONE state only among *conditional* writers (those sending
-    ``expected_revision``, which use a filtered compare-and-set). An
-    unconditional PATCH and a retag bump the counter by read-then-write, so two
-    of those racing each other (or a conditional writer) can end up with the same
-    token for different states; that is the existing last-writer-wins behaviour
-    they opted into, made visible rather than prevented.
+    names ONE state among writers that take the per-memory edit lock
+    (``patch_memory``, conditional or not, and ``retag_memories``); see the
+    module docstring for the protocol, the lock's expiry behaviour and the
+    writers that do not take it (dedup counters, the dreaming graph patcher).
     """
     try:
         return str(max(int((meta or {}).get("revision") or 0), 0))
@@ -396,16 +407,35 @@ class EditMixin:
         new_meta.pop("revision_nonce", None)
         new_meta.pop("revision_nonces", None)
         client = m.vector_store.client  # noqa: F841 - kept for symmetry with retag
-        # Fence: the lock must still be ours immediately before the write; if it was lost
-        # (TTL expiry) nothing is written and the caller is told so.
-        if not lock.held():
+        embedding = None
+        if edits_content:
+            # The slow part (the embedder round trip) happens BEFORE the fence so the
+            # critical section below is only a Qdrant get + upsert (milliseconds).
+            embedding = m.embedding_model.embed(changes["content"], "update")
+        # Fences: the row must still be at the revision we read (a lock that expired during the
+        # re-embed may have let another writer commit) AND the lock must still be ours. Either
+        # failing means NOTHING is written.
+        latest = m.vector_store.get(vector_id=memory_id)
+        latest_payload = getattr(latest, "payload", None)
+        if latest is None:
+            raise LookupError(f"Memory {memory_id} not found")
+        if isinstance(latest_payload, dict):
+            latest_meta = latest_payload.get("metadata") or {}
+            if isinstance(latest_meta.get("metadata"), dict):
+                latest_meta = latest_meta["metadata"]
+            if revision_of(latest_meta) != current_revision:
+                raise RevisionConflict(memory_id, expected_revision or current_revision, revision_of(latest_meta))
+        if not lock.held():                      # lost lock, row unchanged: nothing written, report busy
             raise EditBusy(memory_id)
         if edits_content:
-            # Full mem0 update: re-embed + BM25 refresh + history. Passing the
-            # merged nested metadata is load-bearing — mem0's _update_memory
-            # rebuilds the ENTIRE payload from this kwarg, so omitting it (the
-            # old update_memory bug) wipes category/scope/tags/visibility/owner.
-            m.update(memory_id, changes["content"], metadata={"metadata": new_meta})
+            # Full mem0 update with the PRE-COMPUTED embedding: BM25 refresh + history.
+            # Passing the merged nested metadata is load-bearing — mem0's _update_memory
+            # rebuilds the ENTIRE payload from this kwarg, so omitting it (the old
+            # update_memory bug) wipes category/scope/tags/visibility/owner.
+            m._update_memory(
+                memory_id, changes["content"], {changes["content"]: embedding},
+                metadata={"metadata": new_meta},
+            )
         else:
             # Metadata-only: direct payload patch. set_payload merges at top
             # level, so data/hash/created_at/user_id are preserved and the
