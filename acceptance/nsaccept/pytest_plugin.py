@@ -17,7 +17,8 @@ import httpx
 
 from . import caps, guard, profile as profile_mod, runctx
 from .decor import DEFAULT_PROFILES
-from .fixtures import a, anon, b, bad, ctx, dictator, mcp_a, mcp_b, mcp_dictator, sink  # noqa: F401  (registered as fixtures)
+from .fixtures import a, anon, b, bad, ctx, dictator, legacy, mcp_a, mcp_b, mcp_dictator, mcp_legacy, sink  # noqa: F401  (registered as fixtures)
+from . import tokens as tokens_mod
 from .tokens import scrub
 
 ACCEPTANCE_DIR = Path(__file__).resolve().parents[1]
@@ -176,6 +177,16 @@ def pytest_collection_finish(session):
         )
     config._ns_stack_commit = stack
     flags, _ = _profile_info(config.getoption("--ns-profile"))
+    prof = profile_mod.load(ACCEPTANCE_DIR / "profiles" / f"{config.getoption('--ns-profile')}.env")
+    handed = {}  # harness variables the gate exported for this profile (generated secrets)
+    if prof is not None:
+        if prof.harness_env_errors():
+            pytest.exit("harness misconfiguration: " + "; ".join(prof.harness_env_errors()), returncode=2)
+        for var in prof.harness_env():
+            value = os.environ.get(var, "").strip()
+            if value:
+                handed[var] = value
+                tokens_mod.register_secret(value)  # never in the results, whatever prints it
     dictator_ids = [u.strip() for u in flags.get("DICTATOR_USER_IDS", "").split(",") if u.strip()]
     try:
         config._ns_ctx = runctx.build(
@@ -184,6 +195,7 @@ def pytest_collection_finish(session):
             config.getoption("--ns-compose-project"),
             profile_flags=flags,
             dictator_user=dictator_ids[0] if dictator_ids else None,
+            legacy_key=handed.get("NS_LEGACY_KEY"),
         )
     except runctx.ConfigError as exc:
         pytest.exit(f"harness misconfiguration: {scrub(str(exc))}", returncode=2)

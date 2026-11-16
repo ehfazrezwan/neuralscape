@@ -28,8 +28,20 @@ _TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$")
 TOKEN_SCRUB_RE = re.compile(r"[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}")
 
 
+_SECRETS: set[str] = set()
+
+
+def register_secret(value: str | None) -> None:
+    """Remember a literal secret the run holds (a gate-generated shared key, which is not token-shaped)
+    so ``scrub`` removes it from everything destined for reports."""
+    if value and len(value) >= 8:
+        _SECRETS.add(value)
+
+
 def scrub(text: str) -> str:
-    """Remove anything token-shaped from text destined for reports."""
+    """Remove anything token-shaped, and every registered secret, from text destined for reports."""
+    for secret in sorted(_SECRETS, key=len, reverse=True):
+        text = text.replace(secret, "<redacted-secret>")
     return TOKEN_SCRUB_RE.sub("<redacted-token>", text)
 
 
