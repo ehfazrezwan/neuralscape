@@ -161,28 +161,46 @@ def load_project_config(project_id: str, max_age: float | None = None) -> dict |
     changed default_engine/code_space become visible to a long-running process
     (Fable should-fix a).
     """
+    return _load_project_config(project_id, max_age)[1]
+
+
+def refresh_project_config(project_id: str) -> tuple[bool, dict | None]:
+    """Force a Redis read, bypassing L1. Returns (authoritative, config).
+
+    ``authoritative`` is True only when Redis answered. Then a missing key means
+    the config is gone (another process deleted or cleared it): the L1 entry is
+    dropped and (True, None) returned. Redis down/erroring or an unparseable
+    value is (False, <L1 value or None>): the caller keeps what it has.
+    """
+    return _load_project_config(project_id, 0.0)
+
+
+def _load_project_config(project_id: str, max_age: float | None) -> tuple[bool, dict | None]:
     import time as _t
 
     ttl = config_ttl() if max_age is None else max_age
     hit = _mem_cfg.get(project_id)
     if hit is not None and (_t.monotonic() - _mem_cfg_at.get(project_id, 0.0)) < ttl:
-        return hit
+        return False, hit
     r = _redis()
     if r is None:
-        return hit  # Redis down → serve the (possibly stale) L1 value, if any
+        return False, hit  # Redis down → serve the (possibly stale) L1 value, if any
     try:
         raw = r.get(_CFG_PREFIX + project_id)
     except Exception:  # noqa: BLE001
-        return hit
+        return False, hit
     if not raw:
-        return hit
+        # Redis answered and the key is absent: authoritative, drop L1.
+        _mem_cfg.pop(project_id, None)
+        _mem_cfg_at.pop(project_id, None)
+        return True, None
     try:
         cfg = json.loads(raw)
     except (ValueError, TypeError):
-        return hit
+        return False, hit
     _mem_cfg[project_id] = cfg
     _mem_cfg_at[project_id] = _t.monotonic()
-    return cfg
+    return True, cfg
 
 
 def _reset_for_tests() -> None:

@@ -125,7 +125,12 @@ def get_project_config(project_id: str | None) -> ProjectKnowledgeConfig | None:
             return hit  # injected directly: authoritative
         if (_t.monotonic() - stamp[0]) < index_store.config_ttl():
             return hit
-        raw = index_store.load_project_config(project_id, max_age=0.0)
+        answered, raw = index_store.refresh_project_config(project_id)
+        if answered and not raw:
+            # Redis answered and the key is gone (deleted/cleared elsewhere).
+            _PROJECT_CONFIGS.pop(project_id, None)
+            _PROJECT_CONFIG_AT.pop(project_id, None)
+            return None
         if raw:
             _mirror_put(_config_from_raw(project_id, raw))
         else:

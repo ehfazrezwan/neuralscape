@@ -14,7 +14,9 @@ def test_worker_rewrite_visible_to_api_router_after_bound(stores, unique_ns, mon
 
     monkeypatch.setattr(config.settings, "redis_url", stores.redis_url)
     index_store._reset_for_tests()
-    monkeypatch.setattr(index_store, "config_ttl", lambda: 0.3)
+    clock = [1000.0]
+    monkeypatch.setattr(time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(index_store, "config_ttl", lambda: 5.0)
 
     def cleanup():
         router._PROJECT_CONFIGS.pop(project_id, None)
@@ -46,9 +48,7 @@ def test_worker_rewrite_visible_to_api_router_after_bound(stores, unique_ns, mon
         live.update(saved)
     assert get_project_config(project_id).code_space == "code--u--old"  # stale until the bound
 
-    deadline = time.monotonic() + 5.0
-    while time.monotonic() < deadline:
-        if get_project_config(project_id).code_space == "code--u--new":
-            break
-        time.sleep(0.1)
+    clock[0] += 1.0
+    assert get_project_config(project_id).code_space == "code--u--old"  # inside the bound
+    clock[0] += 5.0  # past the bound (controlled clock; no wall-clock race)
     assert get_project_config(project_id).code_space == "code--u--new"

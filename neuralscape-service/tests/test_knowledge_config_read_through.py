@@ -128,3 +128,47 @@ def test_directly_injected_entry_is_authoritative(env):
     router._PROJECT_CONFIGS["p"] = ProjectKnowledgeConfig(project_id="p", code_space="code--u--injected")
     clock.now += TTL * 10
     assert get_project_config("p").code_space == "code--u--injected"
+
+
+def test_config_removed_in_redis_disappears_after_bound(env):
+    redis, clock = env
+    _worker_rewrites(redis, "p", code_space="code--u--x")
+    assert get_project_config("p") is not None
+    del redis.data[index_store._CFG_PREFIX + "p"]  # another process cleared it
+    clock.now += TTL + 1
+    assert get_project_config("p") is None
+    assert "p" not in router._PROJECT_CONFIGS
+    assert index_store.load_project_config("p", max_age=0.0) is None  # L1 dropped too
+
+
+def test_redis_down_does_not_drop_mirror_even_with_empty_l1(env, monkeypatch):
+    redis, clock = env
+    _worker_rewrites(redis, "p", code_space="code--u--x")
+    get_project_config("p")
+    index_store._mem_cfg.clear()  # L1 empty, mirror populated
+    monkeypatch.setattr(index_store, "_redis", lambda: None)
+    clock.now += TTL + 1
+    assert get_project_config("p").code_space == "code--u--x"
+
+
+def test_l1_fresher_than_router_stamp_still_sees_rewrite(env):
+    """Router refresh must bypass a fresh L1 (index_store honoring max_age)."""
+    redis, clock = env
+    _worker_rewrites(redis, "p", code_space="code--u--old")
+    get_project_config("p")  # router stamp at t0, L1 at t0
+    clock.now += TTL - 1.0
+    # Another reader in this process re-primed the L1 with the (old) value just now.
+    index_store._mem_cfg["p"] = dict(index_store._mem_cfg["p"])
+    index_store._mem_cfg_at["p"] = clock.now
+    _worker_rewrites(redis, "p", code_space="code--u--new")
+    clock.now += 1.5  # router stamp expired; L1 only 1.5s old (< TTL, fresh)
+    assert get_project_config("p").code_space == "code--u--new"
+
+
+def test_inject_over_stamped_entry_is_authoritative(env):
+    redis, clock = env
+    _worker_rewrites(redis, "p", code_space="code--u--store")
+    get_project_config("p")  # stamped entry from the store
+    router._PROJECT_CONFIGS["p"] = ProjectKnowledgeConfig(project_id="p", code_space="code--u--injected")
+    clock.now += TTL * 10
+    assert get_project_config("p").code_space == "code--u--injected"
