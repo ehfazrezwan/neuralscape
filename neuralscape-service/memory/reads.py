@@ -383,7 +383,10 @@ class ReadsMixin:
         text = str(memory_id).strip()
         if text.isascii() and text.isdigit():
             n = int(text)
-            return n if n < 2**64 else None
+            if n < 2**64:
+                return n
+            # Too large for an unsigned 64-bit id: a 32-digit dashless UUID
+            # made only of decimal digits lands here, so try the UUID parse.
         try:
             return str(uuid.UUID(text))
         except (ValueError, AttributeError, TypeError):
