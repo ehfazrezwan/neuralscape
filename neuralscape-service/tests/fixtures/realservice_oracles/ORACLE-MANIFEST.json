@@ -1,0 +1,8 @@
+{
+ "oracles": {
+  "rs-job-keys.json": "91671445f9228d438c58d778000dae23135775840a4e54aec765b844f6271d0c",
+  "rs-readiness.json": "d1bfed49d761c020a3b5ee72b5b90a38c4aedacbb7bd8652bc5d0c5fd8fa1581"
+ },
+ "rule": "a changed oracle needs a changed manifest entry accepted by its reviewer; fix authors do not edit either",
+ "schema_version": "oracle-manifest-v1"
+}

@@ -1,9 +1,0 @@
-{
-  "test": "tests.test_ledger_dispatch_pg_integration::test_dispatch_scenarios_on_postgres_as_runtime_role[the_history_moving_between_check_and_write_is_validated_again_in_the_transaction]",
-  "reason_contains": "LEDGER_TEST_PG_DSN not set (postgres ledger inte",
-  "profiles": [
-    "container",
-    "host"
-  ],
-  "why": "missing infrastructure: needs a PostgreSQL DSN (declared by Phase 2 slice 1); these tests belong under integration_tests/ with the pg_dsn fixture"
-}

@@ -759,6 +759,84 @@ class TestHealthEndpointChecks:
             main._task_manager = original
             main._service = original_svc
 
+    def test_health_returns_503_when_vector_store_probe_fails_or_hangs(self, client, monkeypatch):
+        """An initialised client whose store errors or never answers is unreachable (bounded by the probe timeout)."""
+        import threading
+
+        mock_tm = MagicMock(name="TaskManager")
+        mock_tm.pool = MagicMock()
+        mock_tm.pool.ping = AsyncMock(return_value=True)
+        release = threading.Event()
+
+        def hang():
+            release.wait(5)
+            return []
+
+        monkeypatch.setattr(main, "_task_manager", mock_tm)
+        monkeypatch.setattr(main, "_VECTOR_STORE_PROBE_TIMEOUT_S", 0.1)
+        for probe in (MagicMock(side_effect=ConnectionError("refused")), hang):
+            mock_svc = MagicMock()
+            mock_svc._memory.vector_store.client.get_collections = probe
+            mock_svc._graphiti = MagicMock()
+            monkeypatch.setattr(main, "_service", mock_svc)
+            resp = client.get("/health")
+            assert resp.status_code == 503
+            assert resp.json()["checks"]["vector_store"] == "unreachable"
+        release.set()
+
+    def test_health_probe_is_single_flight_and_briefly_cached(self, monkeypatch):
+        """Concurrent and back-to-back readiness probes share one Qdrant round trip (one event loop, as in prod)."""
+        import asyncio
+        import threading
+
+        release = threading.Event()
+        calls = []
+
+        def slow():
+            calls.append(1)
+            release.wait(5)
+            return []
+
+        memory = MagicMock()
+        memory.vector_store.client.get_collections = slow
+        monkeypatch.setattr(main, "_VECTOR_STORE_PROBE_TIMEOUT_S", 0.2)
+
+        async def scenario():
+            # A hung store: several concurrent callers all time out; only one probe is in flight.
+            results = await asyncio.gather(*[main._probe_vector_store(memory) for _ in range(4)], return_exceptions=True)
+            assert all(isinstance(r, TimeoutError) for r in results)
+            assert len(calls) == 1
+            again = await asyncio.gather(main._probe_vector_store(memory), return_exceptions=True)
+            assert isinstance(again[0], TimeoutError) and len(calls) == 1
+
+            # The store answers: the completed probe is cached for the TTL.
+            release.set()
+            for _ in range(100):
+                if main._vector_probe["task"] is None:
+                    break
+                await asyncio.sleep(0.02)
+            await main._probe_vector_store(memory)
+            await main._probe_vector_store(memory)
+            assert len(calls) == 1
+
+            # Past the TTL a fresh probe is made.
+            monkeypatch.setattr(main, "_VECTOR_STORE_PROBE_TTL_S", 0.0)
+            await main._probe_vector_store(memory)
+            assert len(calls) == 2
+
+        asyncio.run(scenario())
+
+    def test_health_probes_the_vector_store_for_real(self, client, monkeypatch):
+        mock_tm = MagicMock(name="TaskManager")
+        mock_tm.pool = MagicMock()
+        mock_tm.pool.ping = AsyncMock(return_value=True)
+        mock_svc = MagicMock()
+        mock_svc._graphiti = MagicMock()
+        monkeypatch.setattr(main, "_task_manager", mock_tm)
+        monkeypatch.setattr(main, "_service", mock_svc)
+        assert client.get("/health").json()["checks"]["vector_store"] == "ok"
+        mock_svc._memory.vector_store.client.get_collections.assert_called_once()
+
 
 # ══════════════════════════════════════════════
 # Liveness endpoint: /health/live must never touch backends
