@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from integration_tests._dreaming_support import DreamEnv, timed
+from integration_tests._dreaming_support import DreamEnv, _is_timeout, timed
 
 
 def _env():
@@ -31,3 +31,22 @@ def test_other_errors_pass_through_untouched_and_are_timed():
         with timed(env, "x"):
             raise ValueError("boom")
     assert env.timings and env.timings[-1][0] == "x"
+
+
+def test_timeout_found_through_context_and_cause_chains():
+    try:
+        try:
+            raise ReadTimeout("x")
+        except ReadTimeout:
+            raise RuntimeError("during handling")  # sets __context__ only
+    except RuntimeError as exc:
+        assert exc.__cause__ is None and _is_timeout(exc)
+    assert not _is_timeout(ValueError("no"))
+
+
+def test_failure_keeps_the_original_exception():
+    env = _env()
+    with pytest.raises(pytest.fail.Exception) as exc:
+        with timed(env, "c"):
+            raise ReadTimeout("timed out")
+    assert isinstance(exc.value.__cause__, ReadTimeout)

@@ -14,12 +14,11 @@ user's graph nodes, and restores the global ``dreaming:last_run`` record.
 
 from __future__ import annotations
 
-from contextlib import contextmanager
-
 import json
 import os
 import time
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -49,12 +48,11 @@ def timed(env, label: str):
         took = time.monotonic() - start
         if _is_timeout(exc):
             slow = sorted(env.timings, key=lambda t: -t[1])[:3]
-            pytest.fail(
+            raise pytest.fail.Exception(
                 f"{label} timed out after {took:.1f}s ({type(exc).__name__}); "
                 f"{len(env.timings)} earlier calls ok, slowest: "
                 + ", ".join(f"{n} {d:.2f}s" for n, d in slow),
-                pytrace=False,
-            )
+            ) from exc
         raise
     finally:
         env.timings.append((label, time.monotonic() - start))
@@ -204,23 +202,25 @@ def dream_env(tmp_path_factory, stores, llm_key):
 
 
 def _wait_collection_ready(env: DreamEnv, deadline_s: float = 60.0) -> None:
-    """Explicit readiness: the throwaway collection answers and reports green."""
+    """Explicit readiness: the throwaway collection answers and reports green.
+
+    One timed span for the whole wait; a poll that times out is retried until the
+    deadline (that is the point of waiting), so only the total is reported.
+    """
     client = env.service._memory.vector_store.client
-    end = time.monotonic() + deadline_s
-    last = "no answer"
-    while time.monotonic() < end:
-        try:
-            with timed(env, "get_collection"):
+    with timed(env, f"wait for collection green (<= {deadline_s:.0f}s)"):
+        end = time.monotonic() + deadline_s
+        last = "no answer"
+        while time.monotonic() < end:
+            try:
                 status = str(client.get_collection(env.collection).status).lower()
-            if "green" in status:
-                return
-            last = status
-        except pytest.fail.Exception:
-            raise
-        except Exception as exc:  # noqa: BLE001
-            last = type(exc).__name__
-        time.sleep(1.0)
-    pytest.fail(f"collection {env.collection} not green after {deadline_s:.0f}s (last: {last})", pytrace=False)
+                if "green" in status:
+                    return
+                last = status
+            except Exception as exc:  # noqa: BLE001
+                last = type(exc).__name__
+            time.sleep(1.0)
+        pytest.fail(f"collection {env.collection} not green after {deadline_s:.0f}s (last: {last})")
 
 
 def _teardown(env: DreamEnv, prior_last_run, stores) -> list[str]:
