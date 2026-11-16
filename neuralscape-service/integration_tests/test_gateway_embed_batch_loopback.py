@@ -138,6 +138,15 @@ def _texts(tag, n):
     return [f"gateway stub fact {tag} number {i}" for i in range(n)]
 
 
+def _assert_each_point_holds_its_own_texts_vector(svc, uid, texts):
+    """Every stored point's vector is the stub's vector for ITS text (order within a batch cannot be swapped)."""
+    stored = _stored_vectors(svc, uid)
+    assert set(stored) == set(texts)
+    assert len({tuple(stub_vector(t)[:3]) for t in texts}) == len(texts), "test texts must embed distinctly"
+    for text in texts:
+        assert stored[text] == pytest.approx(stub_vector(text), abs=1e-5), text
+
+
 def _stored_vectors(svc, uid):
     rows = svc._scroll_all_user_memories(uid)
     vectors = svc._fetch_dense_vectors([r["id"] for r in rows])
@@ -150,12 +159,8 @@ def test_default_gateway_sends_one_input_per_request_and_stores_the_stub_vectors
 
     svc.store_raw_batch(_items(unique_ns.user_id, texts))
 
-    assert sorted(len(r) for r in stub.requests) == [1] * 5, stub.requests
-    assert sorted(r[0] for r in stub.requests) == sorted(texts)
-    stored = _stored_vectors(svc, unique_ns.user_id)
-    assert set(stored) == set(texts)
-    for text, vec in stored.items():
-        assert vec == pytest.approx(stub_vector(text), abs=1e-5)
+    assert sorted(stub.requests) == sorted([t] for t in texts), stub.requests  # one text per request
+    _assert_each_point_holds_its_own_texts_vector(svc, unique_ns.user_id, texts)
 
 
 def test_an_explicit_batch_size_chunks_the_inputs(make_svc, stub, unique_ns):
@@ -165,8 +170,9 @@ def test_an_explicit_batch_size_chunks_the_inputs(make_svc, stub, unique_ns):
 
     svc.store_raw_batch(_items(unique_ns.user_id, texts))
 
-    assert [len(r) for r in stub.requests] == [3, 3, 1], stub.requests
-    assert set(_stored_vectors(svc, unique_ns.user_id)) == set(texts)
+    # exact chunk contents, in order: chunks are sent one after another in input order
+    assert stub.requests == [texts[0:3], texts[3:6], texts[6:7]], stub.requests
+    _assert_each_point_holds_its_own_texts_vector(svc, unique_ns.user_id, texts)
 
 
 def test_a_batched_call_rejected_for_single_input_falls_back_to_per_item(make_svc, stub, unique_ns):
@@ -176,9 +182,10 @@ def test_a_batched_call_rejected_for_single_input_falls_back_to_per_item(make_sv
 
     svc.store_raw_batch(_items(unique_ns.user_id, texts))
 
-    sizes = [len(r) for r in stub.requests]
-    assert sizes[0] == 3 and sorted(sizes[1:]) == [1, 1, 1], stub.requests  # one rejected batch, then per item
-    assert set(_stored_vectors(svc, unique_ns.user_id)) == set(texts)
+    # one rejected batched call carrying all three texts in order, then one call per text
+    assert stub.requests[0] == texts, stub.requests
+    assert sorted(stub.requests[1:]) == sorted([t] for t in texts), stub.requests
+    _assert_each_point_holds_its_own_texts_vector(svc, unique_ns.user_id, texts)
 
 
 def test_a_4xx_on_one_input_fails_the_write_naming_its_index(make_svc, stub, unique_ns):
