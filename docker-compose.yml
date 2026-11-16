@@ -136,7 +136,7 @@ services:
       retries: 3
       start_period: 30s
     labels:
-      com.neuralscape.autoheal: "true"
+      - "com.neuralscape.autoheal.${COMPOSE_PROJECT_NAME:-neuralscape}=true"
     profiles:
       - cbm  # Only starts when --profile cbm is specified; also set CBM_ENABLED=true in .env
 
@@ -178,7 +178,7 @@ services:
       retries: 3
       start_period: 20s
     labels:
-      com.neuralscape.autoheal: "true"
+      - "com.neuralscape.autoheal.${COMPOSE_PROJECT_NAME:-neuralscape}=true"
     profiles:
       - resolver  # Only starts when --profile resolver is specified; also set CODE_NEIGHBORS_RESOLVER=lsp in .env
 
@@ -244,9 +244,11 @@ services:
     # Docker's restart policy only fires on container EXIT, not on a failing
     # healthcheck — a wedged-but-running API (e.g. after the host sleeps) would
     # otherwise stay wedged/unresponsive. The `autoheal` sidecar restarts it on
-    # unhealthy. Reverse-DNS label so it can't collide with another stack's.
+    # unhealthy. The label KEY embeds the compose project name, so this stack's
+    # sidecar only matches this project's containers (see the `autoheal` service).
+    # List form on purpose: Compose interpolates values, not mapping keys.
     labels:
-      com.neuralscape.autoheal: "true"
+      - "com.neuralscape.autoheal.${COMPOSE_PROJECT_NAME:-neuralscape}=true"
     deploy:
       resources:
         limits:
@@ -306,7 +308,7 @@ services:
     # Wedged-worker restart: autoheal acts on the liveness healthcheck below.
     # Opt out without editing compose: WORKER_AUTOHEAL=false in .env.
     labels:
-      com.neuralscape.autoheal: "${WORKER_AUTOHEAL:-true}"
+      - "com.neuralscape.autoheal.${COMPOSE_PROJECT_NAME:-neuralscape}=${WORKER_AUTOHEAL:-true}"
     deploy:
       resources:
         limits:
@@ -375,7 +377,7 @@ services:
     # Wedged-worker restart: autoheal acts on the liveness healthcheck below.
     # Opt out without editing compose: WORKER_AUTOHEAL=false in .env.
     labels:
-      com.neuralscape.autoheal: "${WORKER_AUTOHEAL:-true}"
+      - "com.neuralscape.autoheal.${COMPOSE_PROJECT_NAME:-neuralscape}=${WORKER_AUTOHEAL:-true}"
     deploy:
       resources:
         limits:
@@ -450,7 +452,7 @@ services:
     # Wedged-worker restart: autoheal acts on the liveness healthcheck below.
     # Opt out without editing compose: WORKER_AUTOHEAL=false in .env.
     labels:
-      com.neuralscape.autoheal: "${WORKER_AUTOHEAL:-true}"
+      - "com.neuralscape.autoheal.${COMPOSE_PROJECT_NAME:-neuralscape}=${WORKER_AUTOHEAL:-true}"
     deploy:
       resources:
         limits:
@@ -563,12 +565,16 @@ services:
       - test_venv:/app/neuralscape-service/.venv
 
   # ── Autoheal ────────────────────────────────────────────────────
-  # Restarts any container labelled `com.neuralscape.autoheal=true` whose Docker
+  # Restarts any container labelled `com.neuralscape.autoheal.<project>=true`
+  # (<project> = the compose project name) whose Docker
   # healthcheck reports `unhealthy`. Docker's own `restart: unless-stopped` only
   # fires on process EXIT, so a wedged-but-running API (e.g. after the host
   # sleeps and its event loop / backend connections go stale) would otherwise
-  # stay wedged/unresponsive until a manual restart. Scoped by a reverse-DNS
-  # label (NOT "all") so it never touches unrelated containers on the host.
+  # stay wedged/unresponsive until a manual restart. The socket proxy lets this
+  # sidecar LIST every container on the Docker host; what scopes it is the label
+  # key it filters on (NOT "all"). The key embeds the compose project name, so
+  # two stacks on one host never match each other's containers. The image
+  # matches `<key>=true` exactly, so WORKER_AUTOHEAL=false opts the workers out.
   autoheal:
     # Pinned by digest: this container restarts other containers, so a mutable
     # :latest tag is a supply-chain risk. Digest is willfarrell/autoheal:latest as
@@ -584,7 +590,8 @@ services:
       - docker-socket-proxy
     environment:
       DOCKER_SOCK: tcp://docker-socket-proxy:2375
-      AUTOHEAL_CONTAINER_LABEL: com.neuralscape.autoheal  # only this stack's containers
+      # Per-project key: only containers of THIS compose project carry it.
+      AUTOHEAL_CONTAINER_LABEL: com.neuralscape.autoheal.${COMPOSE_PROJECT_NAME:-neuralscape}
       AUTOHEAL_INTERVAL: "15"                  # seconds between health polls
       AUTOHEAL_START_PERIOD: "90"              # sidecar's own boot delay before it polls
       # An already-unhealthy/wedged API has nothing worth draining — SIGKILL it

@@ -14,11 +14,12 @@ Lives outside ``tests/`` (like ``test_native_snapshot_neo4j.py``) so the
 default host/container suites never see it; invoke explicitly with a live
 Neo4j: ``NEO4J_URI=... NEO4J_USER=... NEO4J_PASSWORD=... [NEO4J_DATABASE=neo4j]
 uv run pytest integration_tests/test_contradiction_supersession_neo4j.py -v``.
-A missing or unreachable database is a test failure, not a skip.
+Connection comes from the shared ``neo4j_conn`` fixture in ``conftest.py``: an
+unreachable database skips (or fails on the integration gate), it never breaks
+collection.
 """
 
 import asyncio
-import os
 import uuid
 from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock
@@ -27,26 +28,22 @@ import pytest
 
 from config import settings
 
-NEO4J_URI = os.environ["NEO4J_URI"]
-NEO4J_USER = os.environ["NEO4J_USER"]
-NEO4J_PASSWORD = os.environ["NEO4J_PASSWORD"]
-NEO4J_DB = os.environ.get("NEO4J_DATABASE", "neo4j")
-
 pytestmark = pytest.mark.integration
 
 
 class _DbDriver:
     """Adapt a neo4j AsyncDriver so ``.session()`` targets the configured db."""
 
-    def __init__(self, driver):
+    def __init__(self, driver, database):
         self._d = driver
+        self._db = database
 
     def session(self):
-        return self._d.session(database=NEO4J_DB)
+        return self._d.session(database=self._db)
 
 
 @pytest.fixture
-def graph_env(monkeypatch):
+def graph_env(monkeypatch, neo4j_conn):
     from neo4j import AsyncGraphDatabase
     from qdrant_client import QdrantClient, models
 
@@ -55,7 +52,9 @@ def graph_env(monkeypatch):
     monkeypatch.setattr(settings, "graph_supersession_enabled", True)
     group = f"it-supersede-{uuid.uuid4().hex[:8]}"
     loop = asyncio.new_event_loop()
-    driver = AsyncGraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
+    driver = AsyncGraphDatabase.driver(
+        neo4j_conn.uri, auth=(neo4j_conn.user, neo4j_conn.password)
+    )
 
     qdrant = QdrantClient(":memory:")
     collection = f"it_{uuid.uuid4().hex[:8]}"
@@ -68,7 +67,7 @@ def graph_env(monkeypatch):
     svc._memory = MagicMock()
     svc._memory.vector_store.client = qdrant
     svc._graphiti = MagicMock()
-    svc._graphiti.driver = _DbDriver(driver)
+    svc._graphiti.driver = _DbDriver(driver, neo4j_conn.database)
     svc._bridge = MagicMock()
     svc._run_on_bridge = lambda coro, timeout=None: loop.run_until_complete(coro)
 
