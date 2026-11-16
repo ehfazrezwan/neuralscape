@@ -34,6 +34,7 @@ from urllib.parse import quote
 
 from config import settings
 from ingest.pipeline import _fact_scope
+from schemas import normalize_workspace
 
 logger = logging.getLogger(__name__)
 
@@ -140,6 +141,7 @@ def ingest_code_graph_json(service, data: bytes, payload: dict) -> dict:
     facts = extract_semantic_layer(G, settings)
 
     project_id = options.get("project_id")
+    workspace = normalize_workspace(options.get("workspace"))
     base_tags = options.get("tags") or []
     memory_ids: list[str] = []
     graph_jobs: list[dict] = []
@@ -164,6 +166,7 @@ def ingest_code_graph_json(service, data: bytes, payload: dict) -> dict:
                 visibility=options.get("visibility"),
                 memory_kind="fact",
                 source_ref=source_ref,
+                workspace=workspace,
                 add_to_graph=False,
                 return_created=True,
             )

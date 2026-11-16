@@ -362,6 +362,7 @@ def ingest_okf_bundle(
     tags: list[str] | None = None,
     extract_facts: bool = True,
     index_passages: bool = True,
+    workspace: str | None = None,
     llm_call: Callable[[str], str] | None = None,
 ) -> dict:
     """Walk + ingest a parsed-out bundle. Returns a summary dict.
@@ -377,6 +378,7 @@ def ingest_okf_bundle(
     """
     from ingest.chunking_strategies import OkfFrontmatterStrategy
     from ingest.pipeline import IngestDoc, ingest_document, sanitized_error
+    from schemas import normalize_workspace
 
     bundle_name = (
         Path(bundle_uri.rstrip("/")).stem or "okf-bundle"
@@ -418,6 +420,7 @@ def ingest_okf_bundle(
             extract_facts=extract_facts,
             index_passages=index_passages,
             chunking_strategy=OkfFrontmatterStrategy.name,
+            workspace=workspace,
         )
         try:
             result = ingest_document(service, doc)
@@ -496,6 +499,7 @@ def ingest_okf_bundle(
                 ),
                 add_to_graph=False,
                 return_created=True,
+                workspace=normalize_workspace(workspace),
             )
         except Exception:
             logger.warning(

@@ -30,7 +30,6 @@ BASE_URL = (os.environ.get("NS_API_URL") or "http://localhost:8199").rstrip("/")
 from integration_tests.api_identity import resolve_identity  # noqa: E402
 
 _IDENTITY = resolve_identity()
-API_TOKEN = _IDENTITY.token if _IDENTITY else ""
 USER_ID = _IDENTITY.user_id if _IDENTITY else "test-async-pipeline"
 REQUIRED = os.environ.get("NS_INTEGRATION_REQUIRED", "").strip().lower() in {"1", "true", "yes", "on"}
 POLL_INTERVAL = 5  # seconds between status polls
@@ -38,11 +37,15 @@ POLL_TIMEOUT = 300  # max seconds to wait for task completion (LLM + Neo4j write
 
 
 def _auth(kwargs: dict) -> dict:
-    """Add the Bearer token (NS_API_TOKEN) when one is configured."""
+    """Add a Bearer token when one is configured.
 
-    if API_TOKEN:
+    A minted token is created for each request (not once at import): a run can
+    outlast the token's lifetime.  The user id stays the same for the whole module.
+    """
+
+    if _IDENTITY is not None and _IDENTITY.token:
         headers = dict(kwargs.get("headers") or {})
-        headers.setdefault("Authorization", f"Bearer {API_TOKEN}")
+        headers.setdefault("Authorization", _IDENTITY.headers["Authorization"])
         kwargs = dict(kwargs, headers=headers)
     return kwargs
 
