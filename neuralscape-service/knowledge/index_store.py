@@ -38,7 +38,21 @@ _SOCKET_TIMEOUT = 1.0
 _mem_meta: dict[str, dict] = {}
 _mem_cfg: dict[str, dict] = {}
 _mem_cfg_at: dict[str, float] = {}
-_L1_TTL = 30.0
+_L1_TTL = 30.0  # fallback when settings are unavailable
+
+
+def config_ttl() -> float:
+    """Seconds a cached project config may be served before a Redis re-read.
+
+    Settings-driven (``knowledge_config_cache_ttl_s``) so the router mirror and
+    this L1 share one staleness bound; falls back to _L1_TTL.
+    """
+    try:
+        from config import settings
+
+        return max(0.0, float(settings.knowledge_config_cache_ttl_s))
+    except Exception:  # noqa: BLE001
+        return _L1_TTL
 
 _client = None
 _client_probe_at = 0.0
@@ -135,8 +149,11 @@ def save_project_config(project_id: str, config: dict) -> None:
         logger.debug("save_project_config Redis write failed (non-fatal)", exc_info=True)
 
 
-def load_project_config(project_id: str) -> dict | None:
+def load_project_config(project_id: str, max_age: float | None = None) -> dict | None:
     """Fetch a project's routing config (L1 → Redis). None if unset.
+
+    ``max_age`` overrides the L1 freshness bound for this call (0 forces a
+    Redis read; used by the router's refresh so one bound governs both layers).
 
     On the router hot path: a fresh L1 hit is free; a miss (or an L1 entry older
     than _L1_TTL) costs at most one bounded Redis GET (then cached). A None result
@@ -146,8 +163,9 @@ def load_project_config(project_id: str) -> dict | None:
     """
     import time as _t
 
+    ttl = config_ttl() if max_age is None else max_age
     hit = _mem_cfg.get(project_id)
-    if hit is not None and (_t.monotonic() - _mem_cfg_at.get(project_id, 0.0)) < _L1_TTL:
+    if hit is not None and (_t.monotonic() - _mem_cfg_at.get(project_id, 0.0)) < ttl:
         return hit
     r = _redis()
     if r is None:

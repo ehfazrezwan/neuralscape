@@ -75,26 +75,17 @@ class ProjectKnowledgeConfig:
 # in-memory fast-path/back-compat mirror for callers/tests that set config in the
 # same process without Redis.
 _PROJECT_CONFIGS: dict[str, ProjectKnowledgeConfig] = {}
+# (monotonic time, config object) for mirror entries that came from, or were
+# written through to, the cross-process store. An entry is re-validated against
+# the store only while the mirror still holds that exact object; entries injected
+# directly by same-process callers/tests are authoritative and never re-validated.
+# Without this, an entry cached once was served forever and an ingest-worker
+# rewrite never reached the API process.
+_PROJECT_CONFIG_AT: dict[str, tuple[float, ProjectKnowledgeConfig]] = {}
 
 
-def get_project_config(project_id: str | None) -> ProjectKnowledgeConfig | None:
-    """Get the project's knowledge routing config, or None if not set.
-
-    Reads the in-process mirror first (free), then the cross-process store
-    (index_store; bounded Redis GET on a miss). A miss returns None — recall
-    output stays byte-identical to pre-Phase-G behavior.
-    """
-    if not project_id:
-        return None
-    hit = _PROJECT_CONFIGS.get(project_id)
-    if hit is not None:
-        return hit
-    from knowledge import index_store
-
-    raw = index_store.load_project_config(project_id)
-    if not raw:
-        return None
-    cfg = ProjectKnowledgeConfig(
+def _config_from_raw(project_id: str, raw: dict) -> ProjectKnowledgeConfig:
+    return ProjectKnowledgeConfig(
         project_id=project_id,
         code_systems=list(raw.get("code_systems") or []),
         fuse_code_into_recall=bool(raw.get("fuse_code_into_recall", True)),
@@ -102,13 +93,55 @@ def get_project_config(project_id: str | None) -> ProjectKnowledgeConfig | None:
         code_space=raw.get("code_space"),
         op_preference=raw.get("op_preference"),
     )
-    _PROJECT_CONFIGS[project_id] = cfg
+
+
+def _mirror_put(cfg: ProjectKnowledgeConfig) -> None:
+    import time as _t
+
+    _PROJECT_CONFIGS[cfg.project_id] = cfg
+    _PROJECT_CONFIG_AT[cfg.project_id] = (_t.monotonic(), cfg)
+
+
+def get_project_config(project_id: str | None) -> ProjectKnowledgeConfig | None:
+    """Get the project's knowledge routing config, or None if not set.
+
+    Reads the in-process mirror first (free). A mirror entry that came from the
+    store is re-validated against it at most once per ``knowledge_config_cache_ttl_s``
+    (one bounded Redis GET, bypassing index_store's own L1), so a config rewritten
+    by another process (the ingest worker at index time) is seen within that bound.
+    Store unreachable/empty on refresh keeps serving the mirror (best effort). A
+    miss returns None — recall output stays byte-identical to pre-Phase-G behavior.
+    """
+    import time as _t
+
+    if not project_id:
+        return None
+    from knowledge import index_store
+
+    hit = _PROJECT_CONFIGS.get(project_id)
+    if hit is not None:
+        stamp = _PROJECT_CONFIG_AT.get(project_id)
+        if stamp is None or stamp[1] is not hit:
+            return hit  # injected directly: authoritative
+        if (_t.monotonic() - stamp[0]) < index_store.config_ttl():
+            return hit
+        raw = index_store.load_project_config(project_id, max_age=0.0)
+        if raw:
+            _mirror_put(_config_from_raw(project_id, raw))
+        else:
+            _PROJECT_CONFIG_AT[project_id] = (_t.monotonic(), hit)
+        return _PROJECT_CONFIGS[project_id]
+    raw = index_store.load_project_config(project_id)
+    if not raw:
+        return None
+    cfg = _config_from_raw(project_id, raw)
+    _mirror_put(cfg)
     return cfg
 
 
 def set_project_config(config: ProjectKnowledgeConfig) -> None:
     """Set (or update) a project's knowledge routing config (in-process + persisted)."""
-    _PROJECT_CONFIGS[config.project_id] = config
+    _mirror_put(config)
     from knowledge import index_store
 
     index_store.save_project_config(
