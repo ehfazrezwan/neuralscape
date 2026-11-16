@@ -360,9 +360,9 @@ SCENARIOS: tuple[Scenario, ...] = (
     Scenario("group-id-distinct-controls", "control", ("A1.02", "A1.03"),
              "test_ordinary_namespace_tuples_stay_distinct", False,
              "Ordinary tuples remain distinct."),
-    Scenario("email-slug-collision", "expected-failure", ("G1.04",),
+    Scenario("email-slug-collision", "control", ("G1.04",),
              "test_distinct_emails_have_distinct_user_ids", False,
-             "Distinct emails can slug to the same user id."),
+             "A second email whose slug is already claimed gets a hash-suffixed user id at first login."),
     Scenario("email-slug-controls", "control", ("G1.04",),
              "test_ordinary_emails_slug_deterministically", False,
              "Ordinary emails slug deterministically and distinctly."),
@@ -405,9 +405,12 @@ SCENARIOS: tuple[Scenario, ...] = (
     Scenario("readiness-controls", "control", ("G2.03",),
              "test_health_reports_an_uninitialized_vector_store_as_degraded", False,
              "An uninitialized store and an unreachable queue are already reported."),
-    Scenario("backup-covers-compose-volumes", "expected-failure", ("G3.05", "G3.06"),
+    # Fixed by scripts/backup-volumes.sh: the former expected failure is now a
+    # passing control. needs_real_service stays True until the script has run
+    # against real stores (VPS gate / batch verification).
+    Scenario("backup-covers-compose-volumes", "control", ("G3.05", "G3.06"),
              "test_compose_backup_tooling_covers_every_persistent_volume", True,
-             "No compose backup tooling names the persistent volumes."),
+             "Compose backup tooling (scripts/backup-volumes.sh) names every persistent volume."),
     Scenario("backup-volume-controls", "control", ("G3.05",),
              "test_compose_declares_the_persistent_volumes", False,
              "The compose file declares the stores a backup must cover."),

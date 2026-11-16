@@ -101,6 +101,72 @@ profile needs; the gate then also exports `NS_HAVE_DOCLING=1`, which is what
 `@needs("docling")` checks. Add a profile file in the same PR as the scenario
 that needs it. `profiles/default.env` has no flags.
 
+## Flags-on profiles (what the gate must do for each)
+
+A feature behind a flag is not green until it is proven working **with the flag on**. Each profile file
+turns flags on for the throwaway stack only (product defaults are never flipped). One run per profile
+file, each preceded by a stack restart with that file's lines added to the API and every worker's env:
+
+| profile | flags / services | scenario files |
+|---|---|---|
+| `flags-on` | dreaming, standards, processes, dictator, connectors (+stdio allowlist), queue-empty webhook, native code graph, OAuth server (token login), speaker-aware extraction, strategy synthesizer | `test_dreaming`, `test_standards`, `test_connectors`, `test_webhook`, `test_code_graph`, `test_oauth`, `test_speaker` |
+| `oauth-google` | `AUTH_PROVIDER=google` (placeholder client id) | `test_oauth` (provider part) |
+| `oauth-supabase` | `AUTH_PROVIDER=supabase` (placeholder project URL) | `test_oauth` (provider part) |
+| `cbm` | `CBM_ENABLED`, service `cbm-bridge` | `test_code_graph_cbm` |
+| `docling` | Docling + `EXEMPLAR_STORE_ENABLED` + `DOCLING_EXTRACT_IMAGES` | `test_ingest` (Docling), `test_exemplars` |
+
+**Placeholders.** No secret is written in a profile. A line like `VAULT_KEY=<generate:fernet>` (or
+`<generate:hex32>`) is replaced by the gate with a freshly generated value before the stack starts: one
+value per KEY, identical for the API and every worker, never written back to the repo or to the results
+(the harness records the placeholder in `profile_flags`, and redacts any secret-looking key whose value is
+not a placeholder). `fernet` = `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"`,
+`hex32` = 32 random bytes as hex. Single-quoted values (`CODE_REPOS='{"svc":"..."}'`) are literal JSON.
+
+**Header lines.** `# services: a, b` names extra compose services to bring up (and exports `NS_HAVE_<NAME>=1`).
+`# sidecars: nsc-acc-sink` and `# mounts: ...` are documentation for the gate: the harness starts and removes
+the sink itself, and the `cbm` profile needs the service's `neuralscape-service/knowledge/` directory mounted
+read-only at `/corpus/knowledge` in the `cbm-bridge` container (the profile's `CODE_REPOS` names that path).
+
+**Dictator.** A profile with `DICTATOR_USER_IDS=acc-dictator` gives the run a third identity: fixtures
+`dictator` (REST) and `mcp_dictator` (MCP), `ctx.dictator_user` / `ctx.token_dictator`. The token is minted for
+the FIRST id in the list the same way as the A/B tokens (compose issuer, else `NS_TOKEN_SECRET`); a run given two
+pre-made tokens has none and `@needs("dictator")` scenarios skip. The harness exports `NS_HAVE_DICTATOR=1` when it
+has one. In `flags-on` the acceptance users A and B are NOT dictators/admins.
+
+**Sink sidecar.** `nsaccept/sidecar.py`, fixture `sink`, `@needs("compose")`: one
+`docker run -d --rm --name nsc-acc-sink --network <project>_default --memory 64m --cpus 0.25 python:3.12-alpine`
+serving the run's fixture JSON and logging every request (read back with `docker logs`). It refuses any name
+not starting `nsc-acc-`, the `neuralscape` project, more than two live sidecars, publishes no port and mounts
+nothing, issues only `docker run|logs|rm|network ls`, and is removed in the session finalizer (and at exit).
+The gate should `docker pull python:3.12-alpine` once beforehand. The stack's own `WEBHOOK_QUEUE_EMPTY_URL`
+and the connector's `list_url` use the container name `nsc-acc-sink`, which only resolves while the sink runs.
+
+**Time.** The flags-on run is dominated by the dreaming sweep (real LLM, queued behind graph enrichment of
+the seeds on the single graph worker) and the native index; budget about 15 minutes on 2 CPUs.
+
+### Reading a flags-on result honestly
+
+- **Skips are not evidence.** `flags-on` declares `# requires: compose`, and `run.sh` exits 2 without
+  `--compose-project` rather than skipping the compose-only scenarios. A skipped scenario never counts as proof.
+- **Compose projects.** Every entry point that touches Docker (`ctx.compose`, token minting, the sink) goes through
+  one function, `guard.check_compose_project`: case-insensitive after strip, refuses `neuralscape`, and refuses any name
+  outside the disposable prefixes `nscampaign` and `nstest-` (override only with `NS_COMPOSE_ALLOWLIST`).
+  Only two read-only `exec` forms exist besides the Qdrant one: vault `grep -rl` under `/data/vault` and
+  `redis-cli GET ns:connector:<id>`.
+- **LLM-dependent assertions** (an LLM decision, not wording, but a decision nonetheless): the contradicting fact is
+  invalidated (not merged), a reflection insight is stored, the identity card keeps the user's name token, speaker
+  attribution on two real extractions, the Docling figure detection. A red here is a real finding for the owning lane
+  or a model regression, not a harness bug; none was loosened to pass.
+- **Order dependence.** Within a module, tests share one fixture (the seeds, the sweeps, the index, the sync) and
+  read what it recorded, so they do not depend on each other's order; the exceptions are the last test of
+  `test_code_graph` / `test_code_graph_cbm` (they delete the code space) and `test_connectors`' delete test, which
+  use only objects they create. Do not run a single test of those modules with `-k` after a previous run on the same stack.
+- **Expected red until PR 495 (sec-03):** the consent-page framing headers and refresh-token rotation in `test_oauth`.
+- **Coverage of the old blind e2e scripts is partial** (see the PR body's disposition table): they stay in the repo
+  for the parts not ported.
+- **Hard-coded port.** The OAuth profiles carry `NEURALSCAPE_PUBLIC_URL=http://127.0.0.1:18199`; the scenarios assert
+  it equals the URL under test, so a gate on another port must edit that one line.
+
 ## Results JSON
 
 Written to `--out` (default `acceptance/results/<profile>-<commit12>.json`,
@@ -186,6 +252,9 @@ SSE, knowledge router, admin gates, session summaries), `test_fault_injection`
 that deletes the collections and starts the API + workers together; always
 restores the stack, or fails with `ps` output). Run order is alphabetical except `test_edit_delete` and
 `test_fault_injection`, which run last (see `RUN_LAST` in `scenarios/conftest.py`).
+Flags-on files (`test_dreaming`, `test_standards`, `test_connectors`, `test_webhook`, `test_code_graph`,
+`test_code_graph_cbm`, `test_oauth`, `test_speaker`, `test_exemplars`) each declare their profile once with a
+module-level `pytestmark = profiles(...)`; `scenarios/cg_helpers.py` is shared by the two code-graph files.
 `scenarios/route_table.py` lists every REST route with a harmless probe; a
 drift scenario compares it with the stack's `/openapi.json`.
 
