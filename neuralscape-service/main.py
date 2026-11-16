@@ -36,6 +36,8 @@ from policy_enforcement import enforce_request, install_or_refuse as _install_po
 from extensions import ExtensionRegistry
 from extensions.events import EventType, EVENT_PAYLOAD_MODELS
 from logging_config import REQUEST_ID_HEADER, RequestIdMiddleware, configure_logging, request_id_of
+from memory.delete import MemoryListingFailed
+from memory.edit import EditBusy, EditLockUnavailable, RevisionConflict
 from memory_service import get_shared_service
 
 # Configure structured logging before anything else
@@ -574,13 +576,16 @@ async def delete_memories(
     _reject_unsupported_entity_scope(agent_id, run_id, "delete")
     try:
         result = await asyncio.to_thread(_service.delete_memories, user_id=user_id)
-        if "scroll failed" in (result.get("message") or ""):
-            # The service reports a failed listing as a message, not an
-            # exception; never answer 200 "ok" when nothing was deleted.
-            raise HTTPException(status_code=503, detail="Memories could not be listed; nothing was deleted. Retry.")
         # Graph cleanup that could not be verified is a partial success.
-        status = "partial" if result.get("graph_cascade_unresolved_ids") else "ok"
+        incomplete = bool(result.get("graph_cascade_unresolved_ids") or result.get("failed_ids") or result.get("truncated"))
+        if result.get("failed_ids") or result.get("truncated"):
+            return JSONResponse(status_code=207, content={"status": "partial", **result})
+        status = "partial" if incomplete else "ok"
         return {"status": status, **result}
+    except MemoryListingFailed as e:
+        # The service refused because it could not list the rows: nothing was
+        # deleted, so never answer 200 "ok".
+        raise HTTPException(status_code=503, detail=str(e)) from e
     except HTTPException:
         raise
     except Exception:
@@ -2150,6 +2155,7 @@ async def v1_search_memories(req: SearchMemoryRequest, request: Request):
             memory_kind=req.memory_kind,
             visibility=req.visibility.value if req.visibility else None,
             include_shared=req.include_shared,
+            workspaces=req.workspaces,
         )
         if req.index_only:
             response = SearchIndexResponse(
@@ -3047,13 +3053,36 @@ async def v1_patch_memory(memory_id: str, req: PatchMemoryRequest, request: Requ
     authenticated user; content and visibility edits are owner-or-dictator;
     private is owner-only; standard tier is dictator-only. Dictators override
     every tier (the same admin escape hatch the delete path has).
+
+    Optional ``expected_revision`` (the ``revision`` a read returned): when it
+    is no longer current the edit is refused with 409 and nothing is written.
     """
     caller = _resolve_user_id(request, req.user_id)
-    changes = {k: getattr(req, k) for k in req.model_fields_set if k != "user_id"}
+    changes = {
+        k: getattr(req, k) for k in req.model_fields_set if k not in ("user_id", "expected_revision")
+    }
     if not changes:
         raise HTTPException(status_code=400, detail="No fields to update — provide at least one field")
+    # Pass the precondition only when sent: absent == historical last-writer-wins.
+    patch_kwargs = {"expected_revision": req.expected_revision} if req.expected_revision is not None else {}
     try:
-        result = await asyncio.to_thread(_service.patch_memory, memory_id, caller, changes)
+        result = await asyncio.to_thread(_service.patch_memory, memory_id, caller, changes, **patch_kwargs)
+    except RevisionConflict as rc:
+        # Optimistic-concurrency refusal: nothing was written. The client
+        # re-reads (the read carries the new revision), re-applies, retries.
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "revision_conflict",
+                "message": str(rc),
+                "expected_revision": rc.expected_revision,
+                "current_revision": rc.current_revision,
+            },
+        ) from rc
+    except EditBusy as eb:
+        raise HTTPException(status_code=409, detail={"error": "edit_busy", "message": str(eb)}) from eb
+    except EditLockUnavailable as eu:
+        raise HTTPException(status_code=503, detail=str(eu)) from eu
     except LookupError as e:
         raise HTTPException(status_code=404, detail=str(e)) from e
     except PermissionError as pe:
@@ -3209,12 +3238,21 @@ async def v1_bulk_delete_memories(req: BulkDeleteRequest, request: Request):
             filter_null_category=req.filter_null_category,
             include_shared=req.include_shared,
         )
+    except MemoryListingFailed as e:
+        # Listing failed => nothing was deleted; 503 so clients retry instead of
+        # believing the sweep ran. (Per-row failures after a good listing are
+        # still reported in the 200 body's counts, as before.)
+        raise HTTPException(status_code=503, detail=str(e)) from e
     except HTTPException:
         raise
     except Exception as e:
         logger.exception("v1 bulk_delete failed")
         raise HTTPException(status_code=500, detail="Failed to delete memories")
-    return await _enqueue_sibling_graph_jobs(result)
+    result = await _enqueue_sibling_graph_jobs(result)
+    if isinstance(result, dict) and (result.get("failed_ids") or result.get("truncated")):
+        # Not everything the caller asked to delete is gone: 207, never a clean 200.
+        return JSONResponse(status_code=207, content={"status": "partial", **result})
+    return result
 
 
 @v1_router.get("/categories", response_model=CategoryListResponse)
