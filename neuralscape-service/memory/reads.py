@@ -6,6 +6,7 @@ code is verbatim — behavior unchanged.
 
 import logging
 import re
+import time
 import uuid
 
 from datetime import datetime, timezone
@@ -860,6 +861,7 @@ class ReadsMixin:
     _PROJECTS_FACET_LIMIT = 10_000
     _PROJECTS_SCROLL_PAGE = 1000
     _PROJECTS_SCROLL_CAP = 100_000
+    _PROJECTS_FACET_RETRY_S = 300.0
 
     def list_projects(self, user_id: str) -> list[str]:
         """Distinct project_ids the caller can scope memory to (sorted).
@@ -889,12 +891,15 @@ class ReadsMixin:
         reported as "no projects". When the graph is configured but its query
         fails, the vector list is returned with ``"degraded": True,
         "error": "graph_unavailable"`` (same shape as graph search). A graph
-        that is simply not configured adds no marker.
+        that is simply not configured adds no marker. ``"truncated": true``
+        means a facet/scroll cap was reached and the list may be incomplete.
         """
-        projects = self._vector_project_ids(user_id)
+        projects, truncated = self._vector_project_ids(user_id)
         graph_projects, degraded = self._graph_project_ids(user_id)
         projects |= graph_projects
         out: dict = {"projects": sorted(projects)}
+        if truncated:
+            out["truncated"] = True
         if degraded:
             out["degraded"] = True
             out["error"] = "graph_unavailable"
@@ -928,35 +933,51 @@ class ReadsMixin:
             ],
         )
 
-    def _vector_project_ids(self, user_id: str) -> set[str]:
+    def _vector_project_ids(self, user_id: str) -> tuple[set[str], bool]:
         """Distinct ``metadata.project_id`` of the caller's readable rows.
 
         Prefers one Qdrant facet (server-side distinct over the keyword index
         on ``metadata.project_id``, qdrant-client >= 1.12 / server >= 1.12).
         If the facet is unavailable (older server, index not built yet) it
         falls back to a payload-only scroll, bounded by
-        ``_PROJECTS_SCROLL_CAP`` points. Raises when neither works.
+        ``_PROJECTS_SCROLL_CAP`` points. Raises when neither works. Returns
+        ``(projects, truncated)``; ``truncated`` when a cap was reached. After a
+        facet failure that the scroll survives, the facet is skipped for
+        ``_PROJECTS_FACET_RETRY_S`` so it is not retried on every call.
         """
         client = self._get_memory().vector_store.client
         flt = self._projects_filter(user_id)
         self._ensure_filter_indexes()
-        try:
-            resp = client.facet(
-                collection_name=settings.qdrant_collection,
-                key="metadata.project_id",
-                facet_filter=flt,
-                limit=self._PROJECTS_FACET_LIMIT,
-                exact=True,
-            )
-            return {
-                str(h.value)
-                for h in (getattr(resp, "hits", None) or [])
-                if isinstance(getattr(h, "value", None), str) and h.value.strip()
-            }
-        except Exception as e:
-            logger.warning(f"list_projects facet failed ({e}) — falling back to scroll")
+        if time.monotonic() >= getattr(self, "_projects_facet_retry_at", 0.0):
+            try:
+                resp = client.facet(
+                    collection_name=settings.qdrant_collection,
+                    key="metadata.project_id",
+                    facet_filter=flt,
+                    limit=self._PROJECTS_FACET_LIMIT,
+                    exact=True,
+                )
+                hits = list(getattr(resp, "hits", None) or [])
+                truncated = len(hits) >= self._PROJECTS_FACET_LIMIT
+                if truncated:
+                    logger.warning(
+                        f"list_projects facet hit its {self._PROJECTS_FACET_LIMIT}-value "
+                        "limit; list may be incomplete"
+                    )
+                return (
+                    {
+                        h.value
+                        for h in hits
+                        if isinstance(getattr(h, "value", None), str) and h.value.strip()
+                    },
+                    truncated,
+                )
+            except Exception as e:
+                logger.warning(f"list_projects facet failed ({e}) — falling back to scroll")
+                self._projects_facet_retry_at = time.monotonic() + self._PROJECTS_FACET_RETRY_S
 
         found: set[str] = set()
+        truncated = False
         offset = None
         scanned = 0
         while scanned < self._PROJECTS_SCROLL_CAP:
@@ -977,18 +998,19 @@ class ReadsMixin:
             if offset is None:
                 break
         else:
+            truncated = True
             logger.warning(
                 f"list_projects scroll hit the {self._PROJECTS_SCROLL_CAP}-point cap; "
                 "list may be incomplete"
             )
-        return found
+        return found, truncated
 
     def _graph_project_ids(self, user_id: str) -> tuple[set[str], bool]:
         """Projects encoded in Neo4j group ids, and whether the graph failed.
 
         Returns ``(projects, degraded)``; ``degraded`` is True only when the
         graph is configured but unavailable (init failed or the query failed).
-        This derives the list from Neo4j
+        The graph half of the list: derived from Neo4j
         ``group_id`` values with an index-backed ``DISTINCT`` query. Each
         project is encoded in the group_id (``user--{uid}--project--{pid}`` for
         the caller's private projects, ``shared--project--{pid}`` for the

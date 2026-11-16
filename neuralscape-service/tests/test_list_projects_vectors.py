@@ -55,13 +55,16 @@ class FakeQdrant:
 
     def facet(self, collection_name, key, facet_filter=None, limit=10, exact=False):
         assert key == "metadata.project_id"
+        self.facet_attempts = getattr(self, "facet_attempts", 0) + 1
         if self.facet_fails:
             raise RuntimeError("no index")
         seen = {}
+        self.facet_calls = getattr(self, "facet_calls", 0) + 1
         for r in self.rows:
             if _match(facet_filter, r) and _get(r, key):
                 seen[_get(r, key)] = seen.get(_get(r, key), 0) + 1
-        return SimpleNamespace(hits=[SimpleNamespace(value=v, count=c) for v, c in seen.items()])
+        hits = [SimpleNamespace(value=v, count=c) for v, c in seen.items()]
+        return SimpleNamespace(hits=hits[:limit])
 
     def scroll(self, collection_name, scroll_filter=None, limit=10, offset=None, **kw):
         self.scroll_calls += 1
@@ -142,6 +145,29 @@ class TestVectorSourceOfTruth:
         svc._memory.vector_store.client.scroll = boom
         with pytest.raises(ConnectionError):
             svc.list_projects("alice")
+
+
+class TestTruncationAndFacetCache:
+    def test_facet_limit_reached_marks_truncated(self, monkeypatch):
+        monkeypatch.setattr(MemoryService, "_PROJECTS_FACET_LIMIT", 2)
+        out = _service(ROWS).list_projects_status("alice")
+        assert out["truncated"] is True and len(out["projects"]) == 2
+
+    def test_scroll_cap_reached_marks_truncated(self, monkeypatch):
+        monkeypatch.setattr(MemoryService, "_PROJECTS_SCROLL_CAP", 2)
+        monkeypatch.setattr(MemoryService, "_PROJECTS_SCROLL_PAGE", 1)
+        out = _service(ROWS, facet_fails=True).list_projects_status("alice")
+        assert out["truncated"] is True
+
+    def test_not_truncated_below_caps(self):
+        assert "truncated" not in _service(ROWS).list_projects_status("alice")
+        assert "truncated" not in _service(ROWS, facet_fails=True).list_projects_status("alice")
+
+    def test_failed_facet_is_not_retried_every_call(self):
+        svc = _service(ROWS, facet_fails=True)
+        for _ in range(3):
+            assert svc.list_projects("alice") == ["alpha", "beta", "team"]
+        assert svc._memory.vector_store.client.facet_attempts == 1
 
 
 class TestDegradedMarker:
