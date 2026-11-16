@@ -1,0 +1,193 @@
+{
+  "cases": {
+    "bash-error-exit": {
+      "captured": true,
+      "output_contains": [
+        "Error: exit code 2",
+        "make: *** [build] failed"
+      ],
+      "receipt": {
+        "captured": true,
+        "output_empty": false,
+        "private_removed": false,
+        "truncated": false
+      },
+      "tool": "Bash"
+    },
+    "bash-interrupted": {
+      "captured": true,
+      "output_contains": [
+        "partial output before the interrupt"
+      ],
+      "output_contains_ci": [
+        "interrupted"
+      ],
+      "receipt": {
+        "captured": true,
+        "output_empty": false,
+        "private_removed": false,
+        "truncated": false
+      },
+      "tool": "Bash"
+    },
+    "bash-stdout-and-stderr": {
+      "captured": true,
+      "output_contains": [
+        "PASS suite-one",
+        "12 tests passed",
+        "warning: deprecated option"
+      ],
+      "receipt": {
+        "captured": true,
+        "output_empty": false,
+        "private_removed": false,
+        "truncated": false
+      },
+      "tool": "Bash"
+    },
+    "boring-bash": {
+      "captured": false,
+      "receipt": {
+        "captured": false
+      }
+    },
+    "edit-structured": {
+      "captured": true,
+      "input_contains": {
+        "file_path": "/home/user/sample-project/src/app.ts",
+        "new_string": "const retries = 3"
+      },
+      "output_contains": [
+        "app.ts",
+        "const retries = 3"
+      ],
+      "receipt": {
+        "captured": true,
+        "output_empty": false,
+        "private_removed": false,
+        "truncated": false
+      },
+      "tool": "Edit"
+    },
+    "empty-response": {
+      "captured": true,
+      "output_empty": true,
+      "receipt": {
+        "captured": true,
+        "output_empty": true,
+        "private_removed": false,
+        "truncated": false
+      },
+      "tool": "Bash"
+    },
+    "large-response-truncated": {
+      "captured": true,
+      "output_contains": [
+        "HEAD-MARKER",
+        "TAIL-MARKER-END",
+        "[truncated]"
+      ],
+      "output_not_contains": [
+        "MIDDLE-MARKER"
+      ],
+      "receipt": {
+        "captured": true,
+        "output_empty": false,
+        "private_removed": false,
+        "truncated": true
+      },
+      "tool": "Bash"
+    },
+    "legacy-tool-output-string": {
+      "captured": true,
+      "output_contains": [
+        "lint clean: 0 problems"
+      ],
+      "receipt": {
+        "captured": true,
+        "output_empty": false,
+        "private_removed": false,
+        "truncated": false
+      },
+      "tool": "Bash"
+    },
+    "mcp-text-blocks": {
+      "captured": true,
+      "output_contains": [
+        "The retry budget is three attempts.",
+        "Source: sample design note."
+      ],
+      "output_not_contains": [
+        "\"type\""
+      ],
+      "receipt": {
+        "captured": true,
+        "output_empty": false,
+        "private_removed": false,
+        "truncated": false
+      },
+      "tool": "mcp__sample_server__lookup"
+    },
+    "own-plugin-tool": {
+      "captured": false,
+      "receipt": {
+        "captured": false
+      }
+    },
+    "private-span": {
+      "captured": true,
+      "output_contains": [
+        "visible-line",
+        "after-line"
+      ],
+      "output_not_contains": [
+        "SAMPLE-SECRET-VALUE"
+      ],
+      "receipt": {
+        "captured": true,
+        "output_empty": false,
+        "private_removed": true,
+        "truncated": false
+      },
+      "tool": "Bash"
+    },
+    "read-tool-denied": {
+      "captured": false,
+      "receipt": {
+        "captured": false
+      }
+    },
+    "string-response": {
+      "captured": true,
+      "output_contains": [
+        "The page says the cache TTL is sixty seconds."
+      ],
+      "receipt": {
+        "captured": true,
+        "output_empty": false,
+        "private_removed": false,
+        "truncated": false
+      },
+      "tool": "WebFetch"
+    },
+    "write-created": {
+      "captured": true,
+      "input_contains": {
+        "file_path": "/home/user/sample-project/notes.md"
+      },
+      "output_contains": [
+        "notes.md",
+        "retry budget is three attempts"
+      ],
+      "receipt": {
+        "captured": true,
+        "output_empty": false,
+        "private_removed": false,
+        "truncated": false
+      },
+      "tool": "Write"
+    }
+  },
+  "note": "Expected results describe what a native event must yield. They are written from the client's event shape, not from the implementation; change them only with reviewer sign-off and update MANIFEST.json.",
+  "owner": "reviewer"
+}
