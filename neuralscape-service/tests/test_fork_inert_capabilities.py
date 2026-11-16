@@ -626,3 +626,60 @@ def test_the_gemini_reranker_orders_passages_by_the_model_score():
 
     assert [p for p, _ in ranked] == ["Alice works at acme", "Bob likes tea", "noise here"]
     assert ranked[0][1] == pytest.approx(0.93) and ranked[-1][1] == 0.0
+
+
+def test_the_gemini_reranker_works_repeatedly_on_the_bridge_loop_but_not_across_loops():
+    """The reranker's HTTP client binds to the loop of its first call.
+
+    Real searches always call it on the adapter's bridge loop, so repeated calls work; a throwaway
+    ``asyncio.run`` loop (what the first version of the real-store test did) leaves it unusable for
+    the next caller ("Event loop is closed"), which ``search_graph`` reports as a degraded result.
+    Runs against a local HTTP stub of the Gemini endpoint.
+    """
+
+    import http.server
+    import json
+    import threading
+
+    from google import genai
+    from google.genai import types
+    from graphiti_core.cross_encoder.gemini_reranker_client import GeminiRerankerClient
+    from graphiti_core.llm_client import LLMConfig
+    from mem0.memory.graphiti_memory import _AsyncBridge
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def do_POST(self):
+            self.rfile.read(int(self.headers.get("content-length", 0)))
+            body = json.dumps(
+                {"candidates": [{"content": {"role": "model", "parts": [{"text": "90"}]}, "finishReason": "STOP"}]}
+            ).encode()
+            self.send_response(200)
+            self.send_header("content-type", "application/json")
+            self.send_header("content-length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    bridge = _AsyncBridge()
+    try:
+        client = genai.Client(api_key="k", http_options=types.HttpOptions(base_url=f"http://127.0.0.1:{server.server_port}"))
+        reranker = GeminiRerankerClient(config=LLMConfig(api_key="k"), client=client)
+
+        first = bridge.run(reranker.rank("q", ["a", "b"]), timeout=30)
+        second = bridge.run(reranker.rank("q", ["a", "b"]), timeout=30)
+        assert len(first) == len(second) == 2
+
+        other = GeminiRerankerClient(config=LLMConfig(api_key="k"), client=genai.Client(
+            api_key="k", http_options=types.HttpOptions(base_url=f"http://127.0.0.1:{server.server_port}")))
+        asyncio.run(other.rank("q", ["a", "b"]))
+        with pytest.raises(Exception, match="closed"):
+            asyncio.run(other.rank("q", ["a", "b"]))  # a second throwaway loop: the pitfall
+    finally:
+        server.shutdown()
+        bridge._loop.call_soon_threadsafe(bridge._loop.stop)

@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import third_party_telemetry  # noqa: F401  (telemetry guard; must precede mem0/graphiti imports)
 
-import asyncio
+import logging
 
 EPISODE = (
     "Alice Marlowe works at Quillfeather Labs in Lisbon. "
@@ -74,7 +74,7 @@ def _cypher(svc, query: str, **params):
     return svc._run_on_bridge(_run(), timeout=60.0)
 
 
-def test_search_config_cross_encoder_ranks_real_edges(stores, llm_key, unique_ns, flags):
+def test_search_config_cross_encoder_ranks_real_edges(stores, llm_key, unique_ns, flags, caplog):
     from graphiti_core.cross_encoder.gemini_reranker_client import GeminiRerankerClient
     from memory.groups import _build_group_id
 
@@ -101,8 +101,12 @@ def test_search_config_cross_encoder_ranks_real_edges(stores, llm_key, unique_ns
     assert isinstance(reranker, GeminiRerankerClient), "the adapter did not wire the Gemini reranker"
 
     # The reranker itself, against the real model: the relevant passage scores above the unrelated one.
-    ranked = asyncio.run(
-        reranker.rank(QUERY, ["Bram Okafor collects antique teapots.", "Alice Marlowe works at Quillfeather Labs."])
+    # It must run on the adapter's bridge loop, like every real call: the Gemini async client binds its
+    # HTTP connection to the loop of its first call, and a throwaway ``asyncio.run`` loop would leave it
+    # unusable for the search below ("Event loop is closed").
+    ranked = svc._run_on_bridge(
+        reranker.rank(QUERY, ["Bram Okafor collects antique teapots.", "Alice Marlowe works at Quillfeather Labs."]),
+        timeout=120,
     )
     assert ranked[0][0].startswith("Alice Marlowe works"), ranked
     assert ranked[0][1] > ranked[1][1], f"the reranker scored both passages alike: {ranked}"
@@ -118,11 +122,12 @@ def test_search_config_cross_encoder_ranks_real_edges(stores, llm_key, unique_ns
 
     reranker.rank = counting_rank
     try:
-        result = svc.search_graph(QUERY, user_id=uid, limit=5, search_config=CROSS_ENCODER_CONFIG)
+        with caplog.at_level(logging.ERROR):
+            result = svc.search_graph(QUERY, user_id=uid, limit=5, search_config=CROSS_ENCODER_CONFIG)
     finally:
         reranker.rank = original_rank
 
-    assert not result.get("degraded"), result
+    assert not result.get("degraded"), f"graph search degraded: {result}; logged: {caplog.text[-1500:]}"
     assert result["edges"], "the graph search returned no edges for a fact that was just written"
     assert calls and calls[0][0] == QUERY, "the cross-encoder was never asked to rank: search_config did not reach it"
     assert "alice" in result["edges"][0]["fact"].lower(), (
