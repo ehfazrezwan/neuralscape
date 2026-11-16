@@ -1429,7 +1429,11 @@ class SearchMixin:
             search_config: Optional SearchConfig dict override
 
         Returns:
-            Dict with edges, nodes, episodes, communities.
+            Dict with edges, nodes, episodes, communities. When the graph is
+            configured but the search fails, the lists are empty and the dict
+            also carries ``"degraded": True, "error": "graph_unavailable"``
+            (absent on success). A graph that is not configured at all returns
+            the plain empty lists, unchanged.
         """
         g = self._get_graphiti()
         if g is None:
@@ -1494,8 +1498,18 @@ class SearchMixin:
                 ],
             }
         except Exception as e:
+            # An outage (Neo4j down, bridge timeout, Graphiti error) must not
+            # read as "no facts": mark the empty result degraded so REST and
+            # MCP callers can tell the two apart.
             logger.error(f"Graph search failed: {e}")
-            return {"edges": [], "nodes": [], "episodes": [], "communities": []}
+            return {
+                "edges": [],
+                "nodes": [],
+                "episodes": [],
+                "communities": [],
+                "degraded": True,
+                "error": "graph_unavailable",
+            }
 
     def keyword_search(
         self,

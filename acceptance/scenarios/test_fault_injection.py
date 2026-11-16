@@ -262,3 +262,46 @@ def test_stability_check_fails_for_a_restarting_or_exited_service():
     expect_check_fails(check_stack_stable, ok, {"api": 1}, ["api"])
     expect_check_fails(check_stack_stable, [{"Service": "api", "State": "exited", "ExitCode": 1}], {}, ["api"])
     expect_check_fails(check_stack_stable, [], {}, ["api"])
+
+
+# ── Neo4j outage: graph search must say "degraded", not "no facts" ─
+
+
+NEO4J = os.environ.get("NS_NEO4J_SERVICE", "neo4j")
+
+
+def check_graph_search_degraded(client: NSClient, project_id: str, *, want: bool) -> dict:
+    resp = client.post("/v1/graph/search", json={"query": "anything at all", "project_id": project_id, "limit": 3})
+    assert resp.status_code == 200, f"POST /v1/graph/search -> {resp.status_code}: {resp.text[:160]}"
+    body = resp.json()
+    if want:
+        assert body.get("degraded") is True and body.get("error") == "graph_unavailable", f"outage read as success: {body}"
+        assert body.get("status") == "degraded", body
+    else:
+        assert "degraded" not in body and body.get("status") == "ok", f"healthy graph marked degraded: {body}"
+    return body
+
+
+@proves("read.search-knowledge-graph")
+@needs("compose")
+def test_graph_search_reports_degraded_while_neo4j_is_paused(ctx, a, restore_stack):
+    """DESTRUCTIVE (pauses Neo4j): needs NS_ALLOW_DESTRUCTIVE=1 and a disposable compose project."""
+    try:
+        guard.check_compose_project(ctx.compose_project or "")
+    except guard.GuardError:
+        pytest.skip("destructive: needs a disposable compose project on the allowlist")
+    if os.environ.get("NS_ALLOW_DESTRUCTIVE") != "1":
+        pytest.skip("destructive: needs NS_ALLOW_DESTRUCTIVE=1")
+    check_graph_search_degraded(a, ctx.project_id, want=False)
+    ctx.compose("pause", NEO4J)
+    try:
+        check_graph_search_degraded(a, ctx.project_id, want=True)  # waits out the bridge timeout (~30 s)
+    finally:
+        ctx.compose("unpause", NEO4J, check=False)
+    eventually(lambda: check_graph_search_degraded(a, ctx.project_id, want=False), timeout=120, what="graph search healthy again")
+
+
+@proves("read.search-knowledge-graph")
+@negative_control
+def test_degraded_check_fails_for_a_healthy_graph(ctx, a):
+    expect_check_fails(check_graph_search_degraded, a, ctx.project_id, want=True)
