@@ -1,14 +1,18 @@
 """Real-store proof of the vault mirror's tier rule for conversation-extracted rows.
 
-Real Qdrant + the real extraction LLM + real embeddings, a throwaway collection
-and a temporary vault. Uses the integration fixtures (``stores``, ``llm_key``,
-``flags``, ``unique_ns``).
+Real Qdrant, the real embedder and the real ``store_raw`` / ``extract_and_store``
+write path over a throwaway collection and a temporary vault (``stores``,
+``llm_key``, ``flags``, ``unique_ns``). Only the extraction LLM's output is
+stubbed, so categories and texts are chosen by the test and every assertion is
+unconditional. Both paths that feed the vault are driven: ``/flush``
+(``flush_conversation_turn``) and the worker/event path
+(``process_memory_store`` -> ``memory_stored`` handler).
 
-1. A turn that yields a decision fact reaches the daily log while the stored row
-   reads back ``visibility=private`` owned by its author (recall is unchanged).
-2. ``store_raw(X, decision, private)`` followed by a turn that extracts the same
-   text X must NOT put X in the vault: the dedup survivor is the explicit
-   private row, not a row this extraction created.
+1. A created decision fact reaches the daily log while its row reads back private
+   and owned by its author; a private-category fact does not.
+2. ``store_raw(X, decision, private)`` followed by a turn extracting the same text
+   dedups onto the explicit row (asserted: same id, still one row) and X is NOT in
+   the vault, on both paths.
 """
 
 from __future__ import annotations
@@ -16,7 +20,10 @@ from __future__ import annotations
 import third_party_telemetry  # noqa: F401  (telemetry guard; must precede mem0/graphiti imports)
 
 import asyncio
+import json
 import uuid
+from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -34,6 +41,8 @@ def svc(flags, stores, llm_key, unique_ns):
 
     service = MemoryService()
     service._get_memory()
+    service._graphiti = None  # no graph episode: this test is about vectors and the vault
+    service._bridge = None
     return service
 
 
@@ -44,58 +53,85 @@ def vault(tmp_path):
     return ObsidianWriter(vault_path=tmp_path / "vault")
 
 
+def _stub_extraction(svc, lines):
+    client = MagicMock()
+    client.models.generate_content.return_value = MagicMock(text=json.dumps({"facts": lines}))
+    svc._genai_model = client
+
+
 def _vault_text(vault) -> str:
     return "\n".join(vault.read_file(f) for f in vault.list_all_files())
 
 
-def _turn(svc, vault, uid, project, user_text, assistant_text):
+def _rows_with(svc, uid, text):
+    return [r for r in svc._scroll_all_user_memories(uid) if text in r["payload"].get("data", "")]
+
+
+def _flush(svc, vault, uid, project):
     from extensions.conversation_compiler.flush import flush_conversation_turn
 
     return asyncio.run(flush_conversation_turn(
-        user_message=user_text, assistant_response=assistant_text, session_id=f"it-{uuid.uuid4().hex[:6]}",
+        user_message="u", assistant_response="a long enough assistant reply", session_id=f"it-{uuid.uuid4().hex[:6]}",
         channel="api", timestamp=None, project_id=project, user_id=uid, service=svc, writer=vault,
     ))
 
 
-def test_extracted_decision_reaches_the_daily_log_while_the_row_stays_private(svc, vault, unique_ns):
-    from schemas import MemoryVisibility, default_visibility_for_category
+def _worker_path(svc, vault, uid, project):
+    """process_memory_store, with the registry delivering events to the real extension handler."""
+    import worker
+    from extensions.conversation_compiler import ConversationCompilerExtension
 
+    ext = ConversationCompilerExtension()
+    ext._writer, ext._service = vault, MagicMock()
+
+    class Registry:
+        _extensions = [SimpleNamespace(_writer=vault)]
+
+        async def emit_event(self, name, payload):
+            if name == "memory_stored":
+                await ext._handle_memory_stored(payload)
+
+    return asyncio.run(worker.process_memory_store(
+        {"service": svc, "extension_registry": Registry()},
+        [{"role": "user", "content": "u"}, {"role": "assistant", "content": "a long enough assistant reply"}],
+        uid, project,
+    ))
+
+
+@pytest.mark.parametrize("path", ["flush", "worker"])
+def test_created_decision_reaches_the_vault_while_the_row_stays_private(svc, vault, unique_ns, path):
     uid, project = unique_ns.user_id, unique_ns.project_id
-    tag = uuid.uuid4().hex[:8]
-    name = f"zq{tag}"
-    result = _turn(
-        svc, vault, uid, project,
-        f"We decided the new queue service will be called {name}, because the name is easy to grep.",
-        f"Recorded: the decision is to name the new queue service {name} so it is easy to grep for.",
-    )
-    mine = [f for f in result.facts if name in f.content]
-    assert mine, f"the LLM extracted nothing mentioning {name}: {[f.content for f in result.facts]}"
+    name = f"zq{uuid.uuid4().hex[:8]}"
+    decision = f"We decided the queue service is called {name} because it is easy to grep"
+    private_fact = f"Alice prefers dark roast coffee {name}"
+    _stub_extraction(svc, [f"[decision] {decision}", f"[preference] {private_fact}"])
 
-    rows = [r for r in svc._scroll_all_user_memories(uid) if name in r["payload"].get("data", "")]
-    assert rows
-    for row in rows:
+    (_flush if path == "flush" else _worker_path)(svc, vault, uid, project)
+
+    text = _vault_text(vault)
+    assert decision in text, "a created shared-category fact must be mirrored"
+    assert private_fact not in text, "a private-category fact must not be mirrored"
+    for row in _rows_with(svc, uid, name):
         meta = row["payload"].get("metadata") or {}
         assert meta.get("visibility") == "private" and meta.get("owner_user_id") == uid  # recall unchanged
 
-    shared_tier = [f for f in mine if default_visibility_for_category(f.category) == MemoryVisibility.SHARED]
-    if shared_tier:  # the mirror decides by the category the model chose
-        assert name in _vault_text(vault)
-        assert vault.list_daily_logs()
-    else:
-        assert name not in _vault_text(vault)
 
-
-def test_a_turn_that_dedups_onto_an_explicit_private_row_does_not_mirror_it(svc, vault, unique_ns):
+@pytest.mark.parametrize("path", ["flush", "worker"])
+def test_a_turn_that_dedups_onto_an_explicit_private_row_does_not_publish_it(svc, vault, unique_ns, path):
     uid, project = unique_ns.user_id, unique_ns.project_id
-    tag = uuid.uuid4().hex[:8]
-    name = f"zq{tag}"
+    name = f"zq{uuid.uuid4().hex[:8]}"
     fact = f"We chose {name} as the queue service name because it is easy to grep"
-    svc.store_raw(content=fact, user_id=uid, category="decision", scope="project", project_id=project,
-                  visibility="private", add_to_graph=False)
+    explicit = svc.store_raw(content=fact, user_id=uid, category="decision", scope="project",
+                             project_id=project, visibility="private", add_to_graph=False)[0]
+    _stub_extraction(svc, [f"[decision] {fact}"])
 
-    _turn(
-        svc, vault, uid, project,
-        f"Remember: {fact}.", f"Noted: {fact}.",
-    )
+    result = (_flush if path == "flush" else _worker_path)(svc, vault, uid, project)
 
+    # the turn really deduped onto the explicit row: still exactly one row, same id
+    rows = _rows_with(svc, uid, name)
+    assert len(rows) == 1 and rows[0]["id"] == explicit.id, [r["id"] for r in rows]
+    if path == "worker":
+        assert [m["id"] for m in result["memories"]] == [explicit.id]
+    else:
+        assert result.memories_stored == 1
     assert name not in _vault_text(vault), "a private explicit write was published to the shared vault"
