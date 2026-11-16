@@ -76,6 +76,9 @@ class ActionResult:
     applied: list[dict] = field(default_factory=list)
     reported: list[dict] = field(default_factory=list)   # shadow trial: not applied
     errors: list[str] = field(default_factory=list)
+    # Staged actions not applied because the rows changed under the sweep
+    # (e.g. a MERGE row was tombstoned after staging). Not errors.
+    skipped: list[dict] = field(default_factory=list)
 
 
 # ── Pool enumeration + LIGHT staging ────────────────────────────────
@@ -512,6 +515,19 @@ async def apply_actions(
             if a_type == "merge":
                 survivor = act["survivor_id"]
                 losers = [m for m in act["memory_ids"] if m != survivor]
+                # Re-read the tombstone state right before applying: another
+                # writer (semantic dedup) may have tombstoned a row since the
+                # action was staged, and folding content into / out of a hidden
+                # row would bury the merged text.
+                hidden = await asyncio.to_thread(
+                    _tombstoned_ids, service, [survivor, *losers]
+                )
+                if hidden:
+                    result.skipped.append({
+                        **act,
+                        "skip_reason": "tombstoned since staging: " + ",".join(sorted(hidden)),
+                    })
+                    continue
                 # Reinforcement-aware merge (A2): the survivor's counter
                 # becomes the SUM of every merged row's times_derived —
                 # folding N observations into one row must not forget that
@@ -789,6 +805,26 @@ def _times_derived_of(meta: dict | None) -> int:
         return max(1, int((meta or {}).get("times_derived") or 1))
     except (TypeError, ValueError):
         return 1
+
+
+def _tombstoned_ids(service, memory_ids: list[str]) -> set[str]:
+    """Ids among ``memory_ids`` whose live row is currently tombstoned (either metadata level)."""
+    from config import settings as core_settings
+
+    client = service._memory.vector_store.client
+    points = client.retrieve(
+        collection_name=core_settings.qdrant_collection,
+        ids=list(memory_ids),
+        with_payload=True,
+        with_vectors=False,
+    )
+    hidden: set[str] = set()
+    for pt in points or []:
+        meta = (getattr(pt, "payload", None) or {}).get("metadata") or {}
+        inner = meta.get("metadata") if isinstance(meta.get("metadata"), dict) else {}
+        if meta.get("dream_tombstoned") or inner.get("dream_tombstoned"):
+            hidden.add(str(getattr(pt, "id", "")))
+    return hidden
 
 
 def _sum_times_derived(service, memory_ids: list[str]) -> int:

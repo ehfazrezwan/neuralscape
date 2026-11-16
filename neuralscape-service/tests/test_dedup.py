@@ -1022,21 +1022,28 @@ class TestDreamingOnSemanticPhase:
         assert semantic_dedup_phase_enabled() is expected
         assert _semantic_dedup_enabled() is expected
 
-    def test_dedup_cron_passes_the_shared_rule(self, monkeypatch, tombstone_on):
+    @pytest.mark.parametrize(
+        "dreaming, flag, expected",
+        [(False, False, True), (False, True, True), (True, False, False), (True, True, True)],
+    )
+    def test_dedup_cron_passes_the_shared_rule(self, monkeypatch, dreaming, flag, expected):
+        """The cron's whole truth table: forcing ``semantic`` either way fails a cell."""
         import asyncio
         from unittest.mock import MagicMock
 
         import worker
+        from config import settings
         from extensions.dreaming.config import dreaming_settings
 
-        monkeypatch.setattr(dreaming_settings, "enabled", True)
+        monkeypatch.setattr(dreaming_settings, "enabled", dreaming)
+        monkeypatch.setattr(settings, "dedup_semantic_tombstone_enabled", flag)
         svc = MagicMock()
         svc.get_all_user_ids.return_value = ["u1"]
         svc.dedup_memories.return_value = {
             "exact_duplicates_removed": 0, "semantic_duplicates_removed": 0, "graph_jobs": [],
         }
         asyncio.run(worker.dedup_all_memories({"service": svc}))
-        svc.dedup_memories.assert_called_once_with("u1", semantic=True)
+        svc.dedup_memories.assert_called_once_with("u1", semantic=expected)
 
 
 @pytest.mark.usefixtures("tombstone_on")
