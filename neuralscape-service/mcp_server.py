@@ -2198,8 +2198,8 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
             return [TextContent(type="text", text=json.dumps(output, default=str))]
 
         elif name == "list_projects":
-            projects = await asyncio.to_thread(_service.list_projects, user_id=user_id)
-            return [TextContent(type="text", text=json.dumps({"projects": projects}, default=str))]
+            out = await asyncio.to_thread(_service.list_projects_status, user_id=user_id)
+            return [TextContent(type="text", text=json.dumps(out, default=str))]
 
         elif name == "list_processes":
             processes = await asyncio.to_thread(

@@ -2650,17 +2650,17 @@ async def v1_list_projects(request: Request, user_id: str | None = Query(default
     """List the caller's distinct project_ids.
 
     Projects are implicit (a ``project_id`` is just a scoping label), so this
-    derives the list from the caller's stored memories. Powers the plugin's
+    derives the list from the vector store's readable rows (merged with graph
+    group ids; ``degraded``/``error`` set on a graph outage). Powers the plugin's
     `project` selection skill — especially in Claude Cowork, which has no
     working directory to infer a project from.
     """
     resolved_user_id = _resolve_user_id(request, user_id)
     try:
-        projects = await asyncio.to_thread(
-            _service.list_projects,
+        return await asyncio.to_thread(
+            _service.list_projects_status,
             user_id=resolved_user_id,
         )
-        return {"projects": projects}
     except HTTPException:
         raise
     except Exception as e:
