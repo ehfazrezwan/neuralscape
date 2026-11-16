@@ -4,7 +4,6 @@
 
 | node | status | what is missing |
 |---|---|---|
-| `auth.legacy-shared-key` | gap | needs NEURALSCAPE_API_KEY set on the stack AND known to the scenario; profiles hold no literal secrets and a generated placeholder value is not visible to scenarios (a literal key would also be redacted from the run record), and setting a key changes the auth surface every other scenario runs on; covered by tests/test_auth.py and the (#480) identity binding; becomes a scenario if the gate exports its generated key (own profile) |
 | `fork.mem0.entity-store` | dead-code | unreachable on a live path: since PR #479 no route calls mem0's add/search, so the entity side-collection is never touched (writes go through the service's own store_raw / extract_and_store); the lock and cold-start retry are covered by (#481) real-store integration tests |
 | `ops.autoheal` | gap | the autoheal sidecar and its docker-socket proxy are not part of the gate's stack (app services and backing stores only), and proving it means making a container unhealthy and waiting out its 90 s start delay plus poll interval; wiring reviewed with (#488) |
 | `ext.dreaming-graph-patcher` | gap | its effects are Neo4j node properties (memory_id, ns_visibility/ns_owner stamps, dream_superseded_by) that no REST or MCP read exposes; the one observable effect (edge invalidation of a superseded fact) rides on the graph-supersession and flags-on dreaming scenarios, which claim their own nodes; the attach-window mislabel bug is owned by (#501) |
