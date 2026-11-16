@@ -420,6 +420,12 @@ def test_check_fetched_fails_when_the_stack_never_asked(key):
             return [{"method": "GET", "path": p} for p in self.paths if path in (None, p)]
 
     scn.check_fetched(Sink([fakeidp.JWKS_PATH]), fakeidp.JWKS_PATH)
+    with pytest.raises(AssertionError, match="control precondition"):
+        scn.precondition(scn.check_fetched, Sink(["/other"]), fakeidp.JWKS_PATH)
+    scn.precondition(scn.check_fetched, Sink([fakeidp.JWKS_PATH]), fakeidp.JWKS_PATH)
+    with pytest.raises(AssertionError, match="login binding not deployed"):
+        scn.require_binding_deployed(_resp(200, "x"))
+    scn.require_binding_deployed(_resp(200, "x", {"set-cookie": "ns_login_bind=a; HttpOnly"}))
     with pytest.raises(AssertionError):
         scn.check_fetched(Sink(["/other"]), fakeidp.JWKS_PATH)
 

@@ -19,6 +19,10 @@ signing of the session token). Not exercised (no real Supabase can be reached fr
 supabase-js sign-in in a real browser, Google behind Supabase, and the Supabase Before-User-Created hook
 (``auth.supabase-signup-hook``, a SQL script applied by hand in the Supabase dashboard).
 
+Scope: the signature path proven is RS256 via the JWKS (what a modern Supabase project publishes). The
+verifier's ES256 branch and its HS256 branch (``SUPABASE_JWT_SECRET``, a shared secret) are NOT exercised:
+the profile deliberately sets no secret, and an HS256 token is only used as an algorithm-confusion probe.
+
 The login state is bound to the browser that started the login by PR #536 (a cookie that the callback
 requires). The harness carries that cookie the way a browser does; the scenarios that assert the binding
 are marked ``ns_expected_red("#536")`` until #536 is on the stack under test.
@@ -283,6 +287,25 @@ def check_mcp_accepts(base_url: str, access_token: str) -> None:
         m.close()
 
 
+BINDING_REFUSED = ("not started in this browser",)  # the refusal wording #536 documents
+
+
+def precondition(check, *args, **kw) -> None:
+    """A negative control proves nothing unless the SAME check first passes for the right input."""
+    try:
+        check(*args, **kw)
+    except AssertionError as exc:
+        raise AssertionError(f"control precondition: the real check does not pass for the right input: {exc}") from None
+
+
+def require_binding_deployed(consent: httpx.Response) -> None:
+    """FAIL (not skip, not pass) when /oauth/authorize sets no login-binding cookie: #536 is not deployed."""
+    assert any("ns_login_bind" in h for h in consent.headers.get_list("set-cookie")), (
+        "login binding not deployed (#536): /oauth/authorize set no ns_login_bind cookie, so a login state can be "
+        "completed by any browser and more than once"
+    )
+
+
 def check_fetched(sink: sidecar.Sink, path: str) -> None:
     got = sink.requests("GET", path)
     assert got, f"the stack never asked the fake Supabase for {path}; it saw {sorted({r['path'] for r in sink.requests()})}"
@@ -373,6 +396,8 @@ def test_the_stack_verified_the_session_token_against_the_fake_supabases_jwks(id
 @negative_control
 def test_the_login_checks_fail_for_the_wrong_user_and_a_path_nobody_asked_for(ctx, idp, slug_login: Recorded):
     d = _ok(slug_login).first
+    precondition(check_bearer_user, ctx.base_url, d.tokens["access_token"], fakeidp.expected_slug(slug_login.email), f"zq-{ctx.run_id}-sbslug1")
+    precondition(check_fetched, idp.sink, fakeidp.JWKS_PATH)
     expect_check_fails(check_bearer_user, ctx.base_url, d.tokens["access_token"], "someone-else", f"zq-{ctx.run_id}-sbslug0")
     expect_check_fails(check_fetched, idp.sink, "/auth/v1/never-asked")
 
@@ -422,6 +447,7 @@ def test_a_mapped_email_signs_straight_in_as_the_admin_assigned_user(ctx, mapped
 @negative_control
 def test_user_check_fails_for_the_slug_of_a_mapped_email(ctx, mapped_login: Recorded):
     d = _ok(mapped_login).first
+    precondition(check_bearer_user, ctx.base_url, d.tokens["access_token"], MAPPED_USER, f"zq-{ctx.run_id}-sbmap1")
     expect_check_fails(check_bearer_user, ctx.base_url, d.tokens["access_token"], fakeidp.expected_slug(MAPPED_EMAIL), f"zq-{ctx.run_id}-sbmap0")
 
 
@@ -456,7 +482,8 @@ def test_the_link_page_refuses_a_bad_token_and_a_forged_ticket(ctx, anon, idp):
 
 @proves("auth.identity-store")
 @negative_control
-def test_link_refusal_check_fails_for_a_good_claim(claim_login: Recorded):
+def test_link_refusal_check_fails_for_a_good_claim(ctx, anon, idp, claim_login: Recorded):
+    precondition(check_refused, attempt(ctx, anon, idp, idp.token(f"sb-{uuid.uuid4()}", f"o.{ctx.run_id}@elsewhere.example")), status=403, needle="not authorized")
     expect_check_fails(check_refused, _ok(claim_login).first.redirect, status=400)
 
 
@@ -488,7 +515,8 @@ def test_an_unverified_email_is_refused_even_on_an_allowed_domain(ctx, anon, idp
 
 @proves("auth.email-allowlist", "auth.login-supabase")
 @negative_control
-def test_refusal_check_fails_for_a_login_that_succeeded(mapped_login: Recorded):
+def test_refusal_check_fails_for_a_login_that_succeeded(ctx, anon, idp, mapped_login: Recorded):
+    precondition(check_refused, attempt(ctx, anon, idp, idp.token(f"sb-{uuid.uuid4()}", f"o.{ctx.run_id}@elsewhere.example")), status=403, needle="not authorized")
     ok = _ok(mapped_login).first
     expect_check_fails(check_refused, ok.first, status=403, needle="not authorized")
     expect_check_fails(check_refused, ok.redirect, status=303)  # a redirect is never a refusal
@@ -528,7 +556,7 @@ def test_the_callback_refuses_a_bad_state_and_a_missing_token(ctx, anon, idp):
     token = idp.token(f"sb-{uuid.uuid4()}", MAPPED_EMAIL)
     check_refused(attempt(ctx, anon, idp, token, mutate_state=lambda s: s[:-3] + ("AAA" if not s.endswith("AAA") else "BBB")), status=400, needle=STATE_REFUSED)
     check_refused(attempt(ctx, anon, idp, token, mutate_state=lambda s: "garbage"), status=400, needle=STATE_REFUSED)
-    check_refused(attempt(ctx, anon, idp, ""), status=(400, 403), needle="")  # no session at all
+    check_refused(attempt(ctx, anon, idp, ""), status=400, needle=("no supabase session",))  # no session at all
 
 
 @proves("auth.login-supabase")
@@ -536,6 +564,7 @@ def test_the_callback_refuses_a_bad_state_and_a_missing_token(ctx, anon, idp):
 def test_token_check_fails_for_a_token_the_published_key_signed(ctx, anon, idp):
     resp = attempt(ctx, anon, idp, idp.token(f"sb-{uuid.uuid4()}", MAPPED_EMAIL))
     assert resp.status_code == 303, f"the right key did not log in: {resp.status_code} {resp.text[:160]}"
+    precondition(check_refused, attempt(ctx, anon, idp, idp.forged(f"sb-{uuid.uuid4()}", MAPPED_EMAIL, same_kid=True)), status=401, needle="could not verify")
     expect_check_fails(check_refused, resp, status=401, needle="could not verify")
 
 
@@ -559,7 +588,14 @@ def test_the_code_a_supabase_login_issues_is_pkce_bound_and_redeems_once(ctx, an
 
 @proves("auth.oauth-server")
 @negative_control
-def test_redeem_check_fails_for_a_refused_exchange(ctx, anon):
+def test_redeem_check_fails_for_a_refused_exchange(ctx, anon, idp):
+    browser = Browser(ctx.base_url)
+    try:
+        st = start_login(ctx, anon, browser)
+        code = code_from(browser.callback(st.login_state, idp.token(f"sb-{uuid.uuid4()}", MAPPED_EMAIL)), st)
+    finally:
+        browser.close()
+    precondition(check_redeemed, exchange(anon, st, code))
     expect_check_fails(check_redeemed, anon.post("/oauth/token", data={"grant_type": "authorization_code", "code": "garbage", "code_verifier": "x" * 43,
                                                                        "redirect_uri": REDIRECT, "client_id": "nobody"}))
 
@@ -595,11 +631,12 @@ def test_a_callback_from_a_browser_that_did_not_start_the_login_is_refused(ctx, 
     attacker, victim = Browser(ctx.base_url), Browser(ctx.base_url)
     try:
         st = start_login(ctx, anon, attacker)
+        require_binding_deployed(st.consent)
         resp = victim.callback(st.login_state, idp.token(f"sb-{uuid.uuid4()}", MAPPED_EMAIL))  # the victim has no cookie for this state
-        check_refused(resp, status=(400, 403))
+        check_refused(resp, status=(400, 403), needle=BINDING_REFUSED)
         # nor does a cookie from the victim's own, different login unlock the attacker's state
         start_login(ctx, anon, victim)
-        check_refused(victim.callback(st.login_state, idp.token(f"sb-{uuid.uuid4()}", MAPPED_EMAIL)), status=(400, 403))
+        check_refused(victim.callback(st.login_state, idp.token(f"sb-{uuid.uuid4()}", MAPPED_EMAIL)), status=(400, 403), needle=BINDING_REFUSED)
     finally:
         attacker.close()
         victim.close()
@@ -612,9 +649,10 @@ def test_a_login_state_cannot_be_completed_twice(ctx, anon, idp):
     browser = Browser(ctx.base_url)
     try:
         st = start_login(ctx, anon, browser)
+        require_binding_deployed(st.consent)
         token = idp.token(f"sb-{uuid.uuid4()}", MAPPED_EMAIL)
         code_from(browser.callback(st.login_state, token), st)  # the first completion works
-        check_refused(browser.callback(st.login_state, token), status=(400, 403))
+        check_refused(browser.callback(st.login_state, token), status=(400, 403), needle=BINDING_REFUSED)
     finally:
         browser.close()
 
@@ -627,6 +665,7 @@ def test_binding_check_fails_for_the_browser_that_did_start_the_login(ctx, anon,
         st = start_login(ctx, anon, browser)
         ok = browser.callback(st.login_state, idp.token(f"sb-{uuid.uuid4()}", MAPPED_EMAIL))
         code_from(ok, st)  # the browser that started the login is let through, with or without the binding
-        expect_check_fails(check_refused, ok, status=(400, 403))
+        precondition(check_refused, attempt(ctx, anon, idp, idp.token(f"sb-{uuid.uuid4()}", f"o.{ctx.run_id}@elsewhere.example")), status=(400, 403))
+        expect_check_fails(check_refused, ok, status=(400, 403), needle=BINDING_REFUSED)
     finally:
         browser.close()
