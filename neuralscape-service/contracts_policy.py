@@ -32,6 +32,8 @@ PolicyReasonCode = Literal[
     "unsupported_policy_semantics",
 ]
 
+SUPPORTED_POLICY_CONDITIONS = frozenset({"row_owner_is_principal", "fields_subset_of"})
+
 # This is an evaluator vocabulary, not a role matrix.  Every allowed result
 # still requires a matching statement, including administrative operations.
 SUPPORTED_POLICY_ACTIONS = frozenset(
@@ -130,6 +132,32 @@ class MembershipVersion(ContractModel):
     version: SafeCounter
 
 
+class PolicyCondition(ContractModel):
+    """A versioned condition on a statement, judged against the CURRENT row.
+
+    ``row_owner_is_principal``: the row's current owner is the acting subject.
+    ``fields_subset_of``: every field the request edits is in ``values``.
+    A statement whose condition kind is not in ``SUPPORTED_POLICY_CONDITIONS``
+    makes the whole snapshot unsupported (fail closed, like an unknown action).
+    A condition is never itself a grant: the statement's effect, subject,
+    action and resource must still match.
+    """
+
+    version: Literal["condition-v1"]
+    kind: OpaqueId
+    values: tuple[OpaqueId, ...] = ()
+
+
+class ResourceContext(ContractModel):
+    """Current facts about the targeted row, supplied by the trusted resolver.
+
+    Absent facts are unknown, and an unknown fact never satisfies a condition.
+    """
+
+    row_owner_subject_id: OpaqueId | None = None
+    edited_fields: tuple[OpaqueId, ...] | None = None
+
+
 class PolicyStatement(ContractModel):
     """One exact action/resource grant or denial.
 
@@ -144,6 +172,10 @@ class PolicyStatement(ContractModel):
     credential_id: OpaqueId | None
     action: OpaqueId
     resource: ReferenceHandle
+    condition: PolicyCondition | None = None
+    # Informational provenance (for example ``legacy_dictator``) so a migrated
+    # grant stays visible and individually revocable.  It never authorizes.
+    origin: OpaqueId | None = None
 
 
 class AccessPolicy(VersionedContract):
@@ -191,6 +223,7 @@ class PolicyEvaluationInput(VersionedContract):
 
     action: OpaqueId
     resource: ReferenceHandle
+    context: ResourceContext | None = None
 
 
 class PolicyDecision(VersionedContract):
@@ -235,6 +268,7 @@ __all__ = [
     "DelegationConstraints",
     "INDEPENDENT_SUBJECT_KINDS",
     "MembershipVersion",
+    "PolicyCondition",
     "PolicyDecision",
     "PolicyEvaluationInput",
     "PolicyEffect",
@@ -242,6 +276,8 @@ __all__ = [
     "PolicyReasonCode",
     "PolicyStatement",
     "PrincipalContext",
+    "ResourceContext",
     "SUPPORTED_POLICY_ACTIONS",
+    "SUPPORTED_POLICY_CONDITIONS",
     "SubjectKind",
 ]

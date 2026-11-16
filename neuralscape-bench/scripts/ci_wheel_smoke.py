@@ -11,9 +11,21 @@ from pathlib import Path
 from xml.etree import ElementTree
 
 
-EXPECTED_SKIP_NAME = "test_fetch_corpus_mock"
-EXPECTED_SKIP_CLASS_SUFFIX = "icebench.tests.test_corpora"
-EXPECTED_SKIP_REASON = "Skipping network fetch in unit tests"
+# Every suite the CI job claims to run must actually appear in the JUnit report.
+# A suite dropped from the pytest argument list would otherwise pass silently.
+# Skips are policed separately by scripts/ci_skip_gate.py.
+REQUIRED_SUITE_PREFIXES = (
+    "tests.",
+    "icebench.tests.",
+    "icebench.trackq.tests.",
+    "icebench.tokensave.tests.",
+    "icebench.report.test_generator",
+    "icebench.systems.cbm_standalone.test_adapter",
+    "icebench.systems.graphify_standalone.test_adapter",
+    "trackb.longmemeval_ref.tests.",
+    "trackb.mem0_locomo.tests.",
+    "trackb.mem0_tracka.tests.",
+)
 
 
 def _require(condition: bool, message: str) -> None:
@@ -52,6 +64,23 @@ def smoke_installed_wheel() -> None:
     _require(
         importlib.util.find_spec("contracts_common") is None,
         "product service contract module is visible in the wheel environment",
+    )
+
+    # The trackq tests skipif tree-sitter is missing; the wheel must carry it so
+    # they run instead of skipping (ci_skip_gate.py enforces the same from JUnit).
+    from icebench.trackq.oracle import TREE_SITTER_AVAILABLE
+
+    _require(
+        TREE_SITTER_AVAILABLE,
+        "tree-sitter is not importable from the wheel environment",
+    )
+
+    import trackb
+
+    trackb_path = Path(trackb.__file__).resolve()
+    _require(
+        Path(sysconfig.get_paths()["purelib"]).resolve() in trackb_path.parents,
+        f"trackb was not imported from installed site-packages: {trackb_path}",
     )
 
     from pydantic import ValidationError
@@ -130,7 +159,7 @@ def smoke_installed_wheel() -> None:
 
 
 def assert_junit(path: Path) -> None:
-    """Fail on test failures or any skip outside the one documented network test."""
+    """Fail on test failures, an empty report, or a required suite that did not run."""
 
     root = ElementTree.parse(path).getroot()
     cases = list(root.iter("testcase"))
@@ -143,32 +172,15 @@ def assert_junit(path: Path) -> None:
     ]
     _require(not failed, f"JUnit report contains {len(failed)} failed/error tests")
 
-    skipped: list[tuple[str, str, str]] = []
-    for case in cases:
-        marker = case.find("skipped")
-        if marker is None:
-            continue
-        skipped.append(
-            (
-                case.attrib.get("classname", ""),
-                case.attrib.get("name", ""),
-                marker.attrib.get("message", ""),
-            )
-        )
+    classnames = {case.attrib.get("classname", "") for case in cases}
+    missing = [
+        prefix
+        for prefix in REQUIRED_SUITE_PREFIXES
+        if not any(name.startswith(prefix) for name in classnames)
+    ]
+    _require(not missing, f"JUnit report has no tests from required suites: {missing}")
 
-    _require(
-        len(skipped) == 1,
-        f"expected exactly one documented network skip, found {skipped}",
-    )
-    class_name, test_name, reason = skipped[0]
-    _require(
-        class_name.endswith(EXPECTED_SKIP_CLASS_SUFFIX)
-        and test_name == EXPECTED_SKIP_NAME
-        and EXPECTED_SKIP_REASON in reason,
-        f"unexpected skipped test: {skipped[0]}",
-    )
-
-    print(f"JUnit policy passed: {len(cases)} tests, one documented network skip")
+    print(f"JUnit policy passed: {len(cases)} tests, all required suites present")
 
 
 def main() -> None:
