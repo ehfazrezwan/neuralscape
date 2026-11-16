@@ -64,7 +64,8 @@ class TestExtractText:
         settings.docling_enabled = True
         settings.docling_url = "http://docling:5001"
         monkeypatch.setattr(
-            extract_mod, "_docling_convert", lambda data, fn, s: "# docling md"
+            extract_mod, "_docling_post",
+            lambda data, fn, s, embed_images=False: {"document": {"md_content": "# docling md"}},
         )
         # If Docling wins, MarkItDown must not be consulted.
         monkeypatch.setattr(

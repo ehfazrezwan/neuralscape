@@ -427,3 +427,289 @@ class TestCheckpointMcpTool:
         data = json.loads(result[0].text)
         assert data["status"] == "ok" and data["task_id"] is None
         self.tm.enqueue_raw_batch.assert_not_awaited()
+
+
+# ──────────────────────────────────────────────
+# Sensitivity gate: the verdict key must be the visibility store_raw lands at
+# ──────────────────────────────────────────────
+
+SENSITIVE = "Quarterly revenue for the Acme account was $2.4M."
+CLEAN = "The deploy window is Tuesday at noon."
+
+
+class TestSensitivityGatedKey:
+    def test_sensitive_item_with_shared_default_category_is_forced_private(self):
+        _, vis, _ = effective_storage_key({"content": SENSITIVE, "category": "decision", "project_id": "p1"})
+        assert vis == "private"
+
+    def test_explicit_shared_without_override_is_still_forced_private(self):
+        _, vis, _ = effective_storage_key(
+            {"content": SENSITIVE, "category": "decision", "visibility": "shared"}
+        )
+        assert vis == "private"
+
+    def test_explicit_visibility_with_override_is_kept(self):
+        _, vis, _ = effective_storage_key(
+            {"content": SENSITIVE, "category": "decision", "visibility": "shared", "sensitivity_override": True}
+        )
+        assert vis == "shared"
+
+    def test_override_without_explicit_visibility_does_not_bypass(self):
+        _, vis, _ = effective_storage_key(
+            {"content": SENSITIVE, "category": "decision", "sensitivity_override": True}
+        )
+        assert vis == "private"
+
+    def test_clean_item_keeps_the_category_default(self):
+        _, vis, _ = effective_storage_key({"content": CLEAN, "category": "decision"})
+        assert vis == "shared"
+
+    def test_sensitive_standard_request_is_gated_like_store_raw(self):
+        scope, vis, pid = effective_storage_key(
+            {"content": SENSITIVE, "category": "convention", "project_id": "p1", "visibility": "standard"}
+        )
+        assert (vis, pid) == ("private", "p1") and scope == "project"
+
+    def test_verdict_probes_private_partition_so_a_shared_twin_is_not_a_duplicate(self):
+        """A shared row with the same text lives in the shared partition; the sensitive item is stored private."""
+        shared_row = _existing("shared-1")
+
+        def find(*, user_id, content_hash, scope, project_id, visibility, category=None, workspace=None):
+            return shared_row if visibility == "shared" else None
+
+        svc = MagicMock()
+        svc._find_by_content_hash.side_effect = find
+        items = [
+            {"content": SENSITIVE, "category": "decision", "user_id": "u"},
+            {"content": CLEAN, "category": "decision", "user_id": "u"},
+        ]
+        verdicts = dedup_verdicts(svc, items)
+        assert verdicts[0]["verdict"] == "new"          # sensitive -> private partition, no twin
+        assert verdicts[1]["verdict"] == "duplicate"    # clean -> shared partition, as before
+
+    def test_override_with_explicit_shared_still_dedups_against_the_shared_row(self):
+        svc = MagicMock()
+        svc._find_by_content_hash.side_effect = (
+            lambda *, user_id, content_hash, scope, project_id, visibility, category=None, workspace=None:
+            _existing("shared-1") if visibility == "shared" else None
+        )
+        v = dedup_verdicts(svc, [{
+            "content": SENSITIVE, "category": "decision", "user_id": "u",
+            "visibility": "shared", "sensitivity_override": True,
+        }])
+        assert v[0]["verdict"] == "duplicate"
+
+    def test_prepare_checkpoint_enqueues_a_sensitive_item_matching_a_shared_row(self):
+        svc = MagicMock()
+        svc._find_by_content_hash.side_effect = (
+            lambda *, user_id, content_hash, scope, project_id, visibility, category=None, workspace=None:
+            _existing("shared-1") if visibility == "shared" else None
+        )
+        req = CheckpointRequest(memories=[
+            {"content": SENSITIVE, "category": "decision"},
+            {"content": CLEAN, "category": "decision"},
+        ])
+        out = prepare_checkpoint(svc, req, "u")
+        assert [v["verdict"] for v in out["verdicts"]] == ["new", "duplicate"]
+        assert [m["content"] for m in out["to_enqueue"]] == [SENSITIVE]
+
+
+class TestSensitivityGateOnPrepare:
+    """prepare_checkpoint's behaviour on the gated path (review fixes)."""
+
+    @pytest.fixture(autouse=True)
+    def _standards(self, monkeypatch):
+        from config import settings
+
+        monkeypatch.setattr(settings, "standards_enabled", True)
+        monkeypatch.setattr(settings, "dictator_user_ids", "mark")
+
+    @staticmethod
+    def _svc():
+        svc = MagicMock()
+        svc._find_by_content_hash.return_value = None
+        return svc
+
+    def test_non_dictator_sensitive_standard_with_override_is_forbidden(self):
+        req = CheckpointRequest(memories=[{
+            "content": SENSITIVE, "category": "convention", "project_id": "p1",
+            "visibility": "standard", "sensitivity_override": True,
+        }])
+        with pytest.raises(PermissionError):
+            prepare_checkpoint(self._svc(), req, "alice")
+
+    def test_non_dictator_sensitive_standard_without_override_is_accepted_private(self):
+        req = CheckpointRequest(memories=[{
+            "content": SENSITIVE, "category": "convention", "project_id": "p1",
+            "visibility": "standard",
+        }])
+        out = prepare_checkpoint(self._svc(), req, "alice")
+        assert [v["verdict"] for v in out["verdicts"]] == ["new"]
+        assert len(out["to_enqueue"]) == 1 and out["to_enqueue"][0]["scope"] == "project"
+
+    def test_sensitive_standard_probe_uses_private_visibility(self):
+        svc = self._svc()
+        req = CheckpointRequest(memories=[{
+            "content": SENSITIVE, "category": "convention", "project_id": "p1", "visibility": "standard",
+        }])
+        prepare_checkpoint(svc, req, "alice")
+        assert svc._find_by_content_hash.call_args.kwargs["visibility"] == "private"
+
+    def test_sensitive_standard_project_category_without_project_id_is_refused(self):
+        """Gated private => scope is no longer forced global; the worker would reject it after a 202."""
+        req = CheckpointRequest(memories=[{
+            "content": SENSITIVE, "category": "convention", "visibility": "standard",
+        }])
+        with pytest.raises(ValueError, match="project_id is required"):
+            prepare_checkpoint(self._svc(), req, "alice")
+
+    def test_dictator_standard_without_project_id_is_still_global(self):
+        req = CheckpointRequest(memories=[{
+            "content": CLEAN, "category": "convention", "visibility": "standard",
+        }])
+        out = prepare_checkpoint(self._svc(), req, "mark")
+        assert out["to_enqueue"][0]["scope"] == "global"
+
+
+class TestDedupProbeIncludesCategory:
+    def test_probe_passes_the_items_category(self):
+        svc = MagicMock()
+        svc._find_by_content_hash.return_value = None
+        dedup_verdicts(svc, [{"content": CLEAN, "category": "convention", "user_id": "u", "project_id": "p"}])
+        assert svc._find_by_content_hash.call_args.kwargs["category"] == "convention"
+
+    def test_same_text_in_another_category_is_new(self):
+        def find(*, user_id, content_hash, scope, project_id, visibility, category=None, workspace=None):
+            return _existing("pref-1") if category == "preference" else None
+
+        svc = MagicMock()
+        svc._find_by_content_hash.side_effect = find
+        v = dedup_verdicts(svc, [
+            {"content": CLEAN, "category": "convention", "user_id": "u"},
+            {"content": CLEAN, "category": "preference", "user_id": "u"},
+        ])
+        assert [x["verdict"] for x in v] == ["new", "duplicate"]
+
+
+class TestDedupProbeIncludesWorkspace:
+    @staticmethod
+    def _svc_with_row_in(workspace):
+        def find(*, user_id, content_hash, scope, project_id, visibility, category=None, workspace=None):
+            return _existing("row-1") if workspace == _ROW_WS.get("ws") else None
+
+        _ROW_WS["ws"] = workspace
+        svc = MagicMock()
+        svc._find_by_content_hash.side_effect = find
+        return svc
+
+    def test_same_text_in_a_reference_workspace_is_new_against_a_memory_row(self):
+        svc = self._svc_with_row_in(None)      # the existing row is in the memory workspace
+        v = dedup_verdicts(svc, [{"content": CLEAN, "category": "decision", "user_id": "u", "workspace": "book-1"}])
+        assert v[0]["verdict"] == "new"
+        assert svc._find_by_content_hash.call_args.kwargs["workspace"] == "book-1"
+
+    def test_same_text_same_workspace_is_a_duplicate(self):
+        svc = self._svc_with_row_in("book-1")
+        v = dedup_verdicts(svc, [{"content": CLEAN, "category": "decision", "user_id": "u", "workspace": "book-1"}])
+        assert v[0]["verdict"] == "duplicate"
+
+    @pytest.mark.parametrize("ws", [None, "", "memory"])
+    def test_absent_or_memory_workspace_probes_the_memory_workspace(self, ws):
+        svc = self._svc_with_row_in(None)
+        item = {"content": CLEAN, "category": "decision", "user_id": "u"}
+        if ws is not None:
+            item["workspace"] = ws
+        assert dedup_verdicts(svc, [item])[0]["verdict"] == "duplicate"
+        assert svc._find_by_content_hash.call_args.kwargs["workspace"] is None
+
+
+_ROW_WS: dict = {}
+
+
+class TestRequestLevelProjectId:
+    """The save-session call shape: project_id once at the top level, items without their own."""
+
+    @staticmethod
+    def _svc():
+        svc = MagicMock()
+        svc._find_by_content_hash.return_value = None
+        return svc
+
+    def test_project_category_items_inherit_the_request_project_id(self):
+        req = CheckpointRequest(project_id="p-top", memories=[
+            {"content": "a", "category": "convention"},
+            {"content": "b", "category": "decision", "project_id": "p-own"},
+        ])
+        out = prepare_checkpoint(self._svc(), req, "alice")
+        assert [m["project_id"] for m in out["to_enqueue"]] == ["p-top", "p-own"]
+        assert out["to_enqueue"][0]["scope"] == "project"
+
+    def test_global_category_items_do_not_get_a_project_id(self):
+        req = CheckpointRequest(project_id="p-top", memories=[{"content": "a", "category": "preference"}])
+        out = prepare_checkpoint(self._svc(), req, "alice")
+        assert "project_id" not in out["to_enqueue"][0] and out["to_enqueue"][0]["scope"] == "global"
+
+    def test_neither_set_refuses_the_whole_batch(self):
+        req = CheckpointRequest(memories=[
+            {"content": "a", "category": "preference"},
+            {"content": "b", "category": "convention"},
+        ])
+        with pytest.raises(ValueError, match="project_id is required"):
+            prepare_checkpoint(self._svc(), req, "alice")
+
+    def test_inherited_project_id_is_in_the_dedup_probe(self):
+        svc = self._svc()
+        prepare_checkpoint(svc, CheckpointRequest(project_id="p-top", memories=[
+            {"content": "a", "category": "convention"}]), "alice")
+        assert svc._find_by_content_hash.call_args.kwargs["project_id"] == "p-top"
+
+    def test_sensitive_standard_item_inherits_too(self):
+        req = CheckpointRequest(project_id="p-top", memories=[
+            {"content": SENSITIVE, "category": "convention", "visibility": "standard"}])
+        out = prepare_checkpoint(self._svc(), req, "alice")
+        assert out["to_enqueue"][0]["project_id"] == "p-top"
+
+
+class TestRequestLevelProjectIdSurfaces:
+    def test_rest_save_session_shape_is_accepted(self, monkeypatch):
+        import main
+
+        svc = MagicMock()
+        svc._find_by_content_hash.return_value = None
+        monkeypatch.setattr(main, "_service", svc)
+        tm = MagicMock()
+        tm.enqueue_raw_batch = AsyncMock(return_value="task-1")
+        monkeypatch.setattr(main, "_task_manager", tm)
+        resp = TestClient(main.app).post("/v1/checkpoint", json={
+            "user_id": "alice", "project_id": "p-top",
+            "memories": [{"content": "a", "category": "convention"}],
+        })
+        assert resp.status_code == 202, resp.text
+        assert tm.enqueue_raw_batch.call_args.kwargs["items"][0]["project_id"] == "p-top"
+
+    def test_rest_neither_project_id_is_400(self, monkeypatch):
+        import main
+
+        monkeypatch.setattr(main, "_service", MagicMock())
+        resp = TestClient(main.app).post("/v1/checkpoint", json={
+            "user_id": "alice", "memories": [{"content": "a", "category": "convention"}],
+        })
+        assert resp.status_code == 400 and "project_id is required" in resp.text
+
+    @pytest.mark.asyncio
+    async def test_mcp_save_session_shape_is_accepted(self, monkeypatch):
+        import mcp_server
+
+        svc = MagicMock()
+        svc._find_by_content_hash.return_value = None
+        monkeypatch.setattr(mcp_server, "_service", svc)
+        tm = MagicMock()
+        tm.enqueue_raw_batch = AsyncMock(return_value="task-2")
+        monkeypatch.setattr(mcp_server, "_task_manager", tm)
+        result = await mcp_server.call_tool("checkpoint", {
+            "user_id": "alice", "project_id": "p-top",
+            "memories": [{"content": "a", "category": "convention"}],
+        })
+        data = json.loads(result[0].text)
+        assert data["status"] == "accepted", data
+        assert tm.enqueue_raw_batch.call_args.kwargs["items"][0]["project_id"] == "p-top"

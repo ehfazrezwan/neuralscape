@@ -22,14 +22,13 @@ from __future__ import annotations
 import logging
 
 from config import settings
+from memory.sensitivity import resolve_gated_visibility
 from memory_service import content_hash
 from schemas import (
     GLOBAL_CATEGORIES,
     CheckpointRequest,
     MemoryVisibility,
     default_scope_for_category,
-    default_visibility_for_category,
-    normalize_visibility,
 )
 
 logger = logging.getLogger(__name__)
@@ -52,7 +51,8 @@ def effective_storage_key(item: dict) -> tuple[str, str, str | None]:
     The dedup pre-check must probe the SAME key store_raw's content-hash
     dedup uses, or the verdicts would disagree with what the worker later
     does. Mirrors store_raw: explicit scope wins; otherwise category default
-    with a project override; ``standard`` visibility forces global scope
+    with a project override; visibility is the sensitivity-gated value;
+    ``standard`` visibility forces global scope
     with no project.
     """
     category = item["category"]
@@ -62,10 +62,16 @@ def effective_storage_key(item: dict) -> tuple[str, str, str | None]:
         scope = default_scope_for_category(category).value
         if project_id and category not in GLOBAL_CATEGORIES:
             scope = "project"
-    visibility = (
-        normalize_visibility(item.get("visibility"))
-        if item.get("visibility")
-        else default_visibility_for_category(category).value
+    # The same sensitivity-gated visibility store_raw lands at (shared with
+    # worker.py's pre-store dedup, F7): sensitive content is forced private
+    # unless the caller gave an explicit visibility AND sensitivity_override.
+    # Without this a sensitive item matched a SHARED row it would never be
+    # stored beside, and was dropped as a "duplicate".
+    visibility, _, _, _ = resolve_gated_visibility(
+        item.get("content") or "",
+        category,
+        item.get("visibility") or None,
+        bool(item.get("sensitivity_override")),
     )
     if visibility == MemoryVisibility.STANDARD.value:
         scope = "global"
@@ -90,6 +96,10 @@ def dedup_verdicts(service, items: list[dict]) -> list[dict]:
             scope=scope,
             project_id=project_id,
             visibility=visibility,
+            category=item["category"],  # store_raw's dedup key includes it (#535)
+            # Workspace is part of the key too: absent / "memory" is the memory
+            # workspace, any other value a reference workspace (distinct rows).
+            workspace=(item.get("workspace") if item.get("workspace") not in (None, "", "memory") else None),
         )
         if existing is not None:
             verdicts.append(
@@ -152,10 +162,23 @@ def prepare_checkpoint(service, req: CheckpointRequest, user_id: str) -> dict:
             d["expires_at"] = d["expires_at"].isoformat()
         # Persist the derived scope on the payload so the worker's store_raw
         # writes exactly the key the verdict below probed.
-        scope, visibility, project_id = effective_storage_key(
-            {**d, "scope": d.get("scope") if "scope" in item.model_fields_set else None}
-        )
+        explicit_scope = d.get("scope") if "scope" in item.model_fields_set else None
+        scope, visibility, project_id = effective_storage_key({**d, "scope": explicit_scope})
+        if scope == "project" and not project_id and req.project_id:
+            # The documented call shape puts project_id once at the top level
+            # (the save-session skill); an item that resolves to project scope
+            # inherits it rather than being dropped.
+            d["project_id"] = req.project_id
+            scope, visibility, project_id = effective_storage_key({**d, "scope": explicit_scope})
         d["scope"] = scope
+        # Mirrors store_raw: a project-scoped item needs a project_id. A sensitive
+        # item asking for 'standard' is gated private, so scope is no longer forced
+        # global; without this the worker would reject it AFTER a 202 "new".
+        if scope == "project" and not project_id:
+            raise ValueError(
+                f"Item {idx}: project_id is required when scope='project' "
+                f"(set it on the item or on the request)"
+            )
         # Standard-tier write gate (mirrors _authorize_standard_write).
         if visibility == MemoryVisibility.STANDARD.value:
             if not settings.standards_enabled:

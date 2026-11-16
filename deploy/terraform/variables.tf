@@ -51,9 +51,8 @@ variable "node_selector" {
 }
 
 variable "image_tag" {
-  description = "Container image tag deployed by the Helm release."
+  description = "Immutable container image tag deployed by the Helm release (e.g. the tag you pushed with build-and-push.sh). Required: no default, and the chart rejects a floating \"latest\"."
   type        = string
-  default     = "latest"
 }
 
 variable "image_repository" {

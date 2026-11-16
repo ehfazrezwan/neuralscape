@@ -3,8 +3,11 @@
 A generic, parameterized deployment of Neuralscape onto an existing GKE cluster,
 reusing common platform add-ons (ingress-nginx, cert-manager, external-dns,
 External Secrets Operator). The three stateful backends (Neo4j, Qdrant, Redis)
-are **self-hosted** in-cluster; the app tier (API + fast worker + graph worker)
-ships from a single container image with three entrypoints.
+are **self-hosted** in-cluster; the app tier (API + fast worker + graph worker +
+ingest worker) ships from a single container image with four entrypoints
+(`uvicorn main:app`, `arq worker.WorkerSettings`, `arq worker.GraphWorkerSettings`,
+`arq worker.IngestWorkerSettings`), plus a Docling document-converter Deployment
+(`docling.enabled`, on by default) for rich-format ingest.
 
 > **Public repo — keep it generic.** This directory must contain **no**
 > environment- or organization-specific values (GCP project, cluster name, state
@@ -17,7 +20,7 @@ ships from a single container image with three entrypoints.
 deploy/
 ├── terraform/    # GCP secrets + IAM/Workload Identity, app Helm release, ingress
 ├── charts/
-│   └── neuralscape/   # Helm chart: API + worker + graph-worker + ServiceAccount
+│   └── neuralscape/   # Helm chart: API + worker + graph-worker + ingest-worker + docling + ServiceAccount
 └── k8s/          # namespace, ExternalSecret, Neo4j/Qdrant/Redis (kubectl/kustomize)
 ```
 
@@ -28,6 +31,8 @@ deploy/
 | neuralscape-api | Deployment + HPA (1–3) | — | Ingress (TLS, public) |
 | neuralscape-worker | Deployment (1) | — | internal |
 | neuralscape-graph-worker | Deployment (1) | — | internal |
+| neuralscape-ingest-worker | Deployment (1) | shared ingest volume (RWX, optional) | internal |
+| docling | Deployment (1) + Service | — | ClusterIP (`docling.enabled`) |
 | neo4j | Deployment (1, Recreate) | PVC 10Gi `premium-rwo` | ClusterIP |
 | qdrant | Deployment (1, Recreate) | PVC 10Gi `premium-rwo` | ClusterIP |
 | redis | Deployment (1, Recreate) | PVC 5Gi `standard-rwo` | ClusterIP |
@@ -58,6 +63,31 @@ silicon produces an arm64 image that won't schedule). Use the helper:
 deploy/build-and-push.sh REGION-docker.pkg.dev/PROJECT/REPO/neuralscape:v1
 # then set image_repository + image_tag in terraform/terraform.tfvars
 ```
+
+**Image tag policy.** The chart never deploys a floating tag. `image.tag` is
+used as given; when it is empty the chart falls back to `Chart.yaml`'s
+`appVersion`, and rendering fails if the result is empty or `latest`.
+The defaults are **unpublished placeholders**: no image is published under
+`appVersion` (`0.1.0`), and the default `image.repository`
+(`neuralscape/neuralscape`) is not where CI publishes (CI pushes
+`ghcr.io/<owner>/neuralscape:sha-<12>`). A bare `helm install` therefore renders
+and then fails to pull. The fallback exists only so a bare `helm lint` /
+`helm template` of the chart, which CI runs without values, still renders.
+**A real install must set `image.repository` and `image.tag`** to the image it
+pushed (for example `--set image.repository=ghcr.io/<owner>/neuralscape
+--set image.tag=sha-<12>`). The Terraform `image_tag` variable has no default,
+so a Terraform deploy always pins an explicit immutable tag (the one you pushed
+above); set the repository in your private values as well. The Docling image is
+pinned by release tag and digest in `values.yaml`, the same reference the
+compose stack runs.
+
+**Configuration policy.** `values.yaml` `config:` carries only what a cluster
+must set (backend addresses, mount paths, telemetry opt-out) and each key must
+be a real setting in `neuralscape-service/config.py`. It does not copy
+config.py defaults (model names, log level, auth provider, ...): leave a key
+out and config.py's default applies. `DOCLING_ENABLED` / `DOCLING_URL` and
+`INGEST_STORAGE_ENABLED` are derived in the ConfigMap from `docling.*` and
+`ingestStorage.*`. `tests/test_deploy_chart_parity.py` checks all of this.
 
 Equivalent manual command:
 ```bash
@@ -132,7 +162,7 @@ kubectl -n neuralscape exec deploy/neuralscape-api -- \
 - Rollback app: `helm -n neuralscape rollback neuralscape` or revert `image_tag`.
 - Secret rotation: `gcloud secrets versions add ...` then
   `kubectl -n neuralscape annotate externalsecret neuralscape-secrets-sync force-sync="$(date +%s)" --overwrite`
-  and `kubectl -n neuralscape rollout restart deploy/neuralscape-api deploy/neuralscape-worker deploy/neuralscape-graph-worker`.
+  and `kubectl -n neuralscape rollout restart deploy/neuralscape-api deploy/neuralscape-worker deploy/neuralscape-graph-worker deploy/neuralscape-ingest-worker`.
 
 ## Notes / optimization levers
 
@@ -143,8 +173,8 @@ kubectl -n neuralscape exec deploy/neuralscape-api -- \
 - **No HA:** RWO disks → `Recreate` strategy means brief downtime on DB pod
   restart. Acceptable for a memory layer; move to StatefulSets + replicas only if
   uptime SLAs demand it.
-- **Vault:** the conversation-compiler / wiki-synth vault is an `emptyDir` (not
-  shared/persistent). If you enable `WIKI_SYNTHESIZER_ENABLED`, switch it to an
-  RWX (e.g. Filestore) PVC so all pods share one vault.
+- **Vault:** the conversation-compiler vault is an `emptyDir` (not
+  shared/persistent). If you want one persistent vault shared by all pods,
+  switch it to an RWX (e.g. Filestore) PVC.
 - **Backups:** add a scheduled `neo4j-admin database dump` + Qdrant snapshot
   CronJob to object storage — not included here.
