@@ -57,21 +57,49 @@ def _event_time(timestamp: str | None) -> str | None:
         return None
 
 
-def _is_shared(memory) -> bool:
-    """Whether a stored memory may reach the shared vault.
+def mirror_to_vault(
+    category: str,
+    visibility: str | None,
+    *,
+    extracted: bool,
+    sensitivity: str | None = None,
+) -> bool:
+    """Whether a memory may be mirrored into the (shared) vault.
 
-    Uses the visibility the store stamped (which already reflects the
-    sensitivity gate); a row with no usable visibility falls back to the
-    category default, the same rule the memory_stored handler applies.
+    * Explicit writes (raw / checkpoint): the stored visibility decides, as it
+      always has: private never reaches the vault, shared does, and a row with
+      no visibility falls back to its category's tier.
+    * Conversation-extracted rows: the extraction path stamps every row
+      ``visibility=private`` (the row stays private in recall), so the stamp
+      says nothing about the vault; the CATEGORY's default tier decides (a
+      decision or convention is shared, a preference is not). A row the
+      sensitivity gate forced private (``sensitivity`` set) is never mirrored.
     """
-    category = getattr(memory, "category", "") or ""
-    raw = getattr(memory, "visibility", None)
+    tier = default_visibility_for_category(category)
+    if extracted:
+        return not sensitivity and tier == MemoryVisibility.SHARED
     try:
-        normalized = normalize_visibility(raw) if raw is not None else None
-        resolved = MemoryVisibility(normalized) if normalized else default_visibility_for_category(category)
+        normalized = normalize_visibility(visibility) if visibility is not None else None
+        resolved = MemoryVisibility(normalized) if normalized else tier
     except (ValueError, TypeError):
-        resolved = default_visibility_for_category(category)
+        resolved = tier
     return resolved == MemoryVisibility.SHARED
+
+
+def _is_shared(memory, *, created: bool) -> bool:
+    """Whether a row returned by the flush's extraction may reach the vault.
+
+    ``created`` is True only for rows THIS extraction created. The others are
+    content-hash dedup survivors: pre-existing rows (possibly an explicit
+    private write of the same text) that decide by their own stored
+    visibility, exactly like any explicit row.
+    """
+    return mirror_to_vault(
+        getattr(memory, "category", "") or "",
+        getattr(memory, "visibility", None),
+        extracted=created,
+        sensitivity=getattr(memory, "sensitivity", None),
+    )
 
 
 async def flush_conversation_turn(
@@ -122,17 +150,21 @@ async def flush_conversation_turn(
     # extraction guidance (per-project + per-user) is resolved inside it, as
     # for every other conversation write.
     try:
-        stored = await asyncio.to_thread(
+        result = await asyncio.to_thread(
             service.extract_and_store,
             messages=_turn_messages(user_message, assistant_response),
             user_id=user_id,
             project_id=project_id,
             run_id=session_id,
             occurred_at=_event_time(timestamp),
+            return_stats=True,
         )
     except Exception:
         logger.exception("Conversation extraction failed")
         return FlushResult(session_id=session_id, timestamp=ts)
+
+    stored, stats = result if isinstance(result, tuple) else (result, {})
+    created_ids = set((stats or {}).get("created_ids") or [])
 
     if not stored:
         logger.info("No facts extracted from conversation turn", session_id=session_id)
@@ -153,7 +185,7 @@ async def flush_conversation_turn(
     category_paths: list[str] = []
     shared_facts: list[ExtractedFact] = []
     for memory, fact in zip(stored, facts):
-        if not _is_shared(memory):
+        if not _is_shared(memory, created=getattr(memory, "id", "") in created_ids):
             continue
         shared_facts.append(fact)
         try:

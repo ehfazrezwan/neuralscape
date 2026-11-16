@@ -31,7 +31,7 @@ from mcp.types import TextContent, Tool
 import adapters  # noqa: F401 — registers knowledge-adapter taxonomies at import (deterministic MEMORY_CATEGORIES for validation; tool enums stay core-13)
 from config import settings
 from memory.delete import MemoryListingFailed
-from memory.edit import EditBusy, EditLockUnavailable, RevisionConflict
+from memory.edit import RevisionConflict
 from memory_service import get_shared_service
 from schemas import CORE_MEMORY_CATEGORIES
 from task_manager import TaskManager
@@ -1150,7 +1150,7 @@ async def list_tools() -> list[Tool]:
                     },
                     "project_id": {
                         "type": "string",
-                        "description": "Default project for the session note (items carry their own project_id)",
+                        "description": "Default project for the note; project-category items without their own inherit it",
                     },
                     "user_id": {
                         "type": "string",
@@ -1203,10 +1203,9 @@ async def list_tools() -> list[Tool]:
         Tool(
             name="set_project_knowledge_config",
             description=(
-                "Set/update a project's knowledge routing config (Phase D): which code "
-                "systems are available, whether to fuse code into generic recall (default "
-                "TRUE per decision #3), and which engine to prefer. Typically set at index "
-                "time but can be edited later."
+                "Set a project's knowledge routing config: code systems, whether to fuse "
+                "code into generic recall (default true), preferred engine. Only fields "
+                "you pass change."
             ),
             inputSchema={
                 "type": "object",
@@ -1225,8 +1224,8 @@ async def list_tools() -> list[Tool]:
                         "description": "Enable code fusion for generic recall (default TRUE)",
                     },
                     "default_engine": {
-                        "type": "string",
-                        "description": "Default code engine name (e.g. 'code-cbm')",
+                        "type": ["string", "null"],
+                        "description": "Default engine (e.g. 'code-cbm'); null clears",
                     },
                 },
                 "required": ["project_id"],
@@ -2284,10 +2283,6 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
                     "expected_revision": rc.expected_revision,
                     "current_revision": rc.current_revision,
                 }))]
-            except EditBusy as eb:
-                return [TextContent(type="text", text=json.dumps({"error": str(eb), "code": "edit_busy"}))]
-            except EditLockUnavailable as eu:
-                return [TextContent(type="text", text=json.dumps({"error": str(eu), "code": "edit_lock_unavailable"}))]
             except (LookupError, PermissionError, ValueError) as e:
                 return [TextContent(type="text", text=json.dumps({"error": str(e)}))]
 
@@ -2674,6 +2669,8 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
                     "code_systems": [],
                     "fuse_code_into_recall": True,
                     "default_engine": None,
+                    "code_space": None,
+                    "op_preference": None,
                 }
             else:
                 result = {
@@ -2681,11 +2678,13 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
                     "code_systems": config.code_systems,
                     "fuse_code_into_recall": config.fuse_code_into_recall,
                     "default_engine": config.default_engine,
+                    "code_space": config.code_space,
+                    "op_preference": config.op_preference,
                 }
             return [TextContent(type="text", text=json.dumps(result, default=str))]
 
         elif name == "set_project_knowledge_config":
-            from knowledge.router import ProjectKnowledgeConfig, set_project_config
+            from knowledge.router import KnowledgeConfigStoreError, merge_project_config
 
             if not is_admin_user(user_id):
                 return [TextContent(type="text", text=json.dumps(
@@ -2695,18 +2694,23 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
             if not project_id:
                 return [TextContent(type="text", text=json.dumps({"error": "project_id required"}))]
 
-            config = ProjectKnowledgeConfig(
-                project_id=project_id,
-                code_systems=arguments.get("code_systems") or [],
-                fuse_code_into_recall=arguments.get("fuse_code_into_recall", True),
-                default_engine=arguments.get("default_engine"),
-            )
-            set_project_config(config)
+            # Only the fields the caller sent change; code_space/op_preference survive.
+            sent = {
+                k: arguments[k]
+                for k in ("code_systems", "fuse_code_into_recall", "default_engine")
+                if k in arguments
+            }
+            try:
+                config = merge_project_config(project_id, **sent)
+            except KnowledgeConfigStoreError as e:
+                return [TextContent(type="text", text=json.dumps({"error": str(e)}))]
             result = {
                 "project_id": config.project_id,
                 "code_systems": config.code_systems,
                 "fuse_code_into_recall": config.fuse_code_into_recall,
                 "default_engine": config.default_engine,
+                "code_space": config.code_space,
+                "op_preference": config.op_preference,
             }
             return [TextContent(type="text", text=json.dumps(result, default=str))]
 
