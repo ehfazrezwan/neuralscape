@@ -26,6 +26,10 @@ _AMBIENT_DIM_WARNED: set = set()
 
 
 class Settings(BaseSettings):
+    # Logging (read by logging_config.configure_logging; `.env` values count)
+    log_level: str = "INFO"
+    log_format: str = "json"  # "json" or "console"
+
     # Gemini (direct Google AI Studio)
     google_api_key: str = ""
     gemini_llm_model: str = "gemini-3.1-flash-lite"

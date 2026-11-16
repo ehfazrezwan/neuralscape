@@ -485,3 +485,21 @@ def test_dockerfile_pins_uv_and_never_floats_a_base_image() -> None:
     for ref in uv_refs:
         assert re.fullmatch(r"ghcr\.io/astral-sh/uv:\d+\.\d+\.\d+@sha256:[0-9a-f]{64}", ref), ref
     assert len(set(uv_refs)) == 1, "builder and test stages must use the same uv"
+
+
+def test_overlay_pinning_the_project_image_on_latest_never_pulls_it() -> None:
+    """A fallback to the project's registry ``:latest`` must come with ``pull_policy: never``.
+
+    deploy.yml pushes only immutable sha tags to GHCR and tags ``:latest`` locally on
+    the VPS, so a pull of that name would fetch a stale or missing image.
+    """
+    if not _have_repo():
+        return
+    checked = 0
+    for name in OVERLAYS:
+        for service, spec in (_load(name).get("services") or {}).items():
+            image = str((spec or {}).get("image", ""))
+            if "/neuralscape:latest" in image:
+                checked += 1
+                assert (spec or {}).get("pull_policy") == "never", (name, service)
+    assert checked >= 8  # four services in each of the vps and deploy overlays

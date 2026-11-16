@@ -389,6 +389,13 @@ class _Pool:
         return True
 
 
+class _ReachableQdrantMemory:
+    """An initialized client whose backing vector store answers."""
+
+    def __init__(self) -> None:
+        self.vector_store = SimpleNamespace(client=SimpleNamespace(get_collections=lambda: []))
+
+
 class _UnreachableQdrantMemory:
     """An initialized client whose backing vector store cannot be reached."""
 
@@ -411,19 +418,12 @@ def _health(monkeypatch, *, memory, pool_reachable: bool = True) -> dict:
     return {"status_code": 200, **response}
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason=(
-        "health marks the vector store 'ok' once its client object exists and never probes the store, "
-        "so an unreachable store is reported healthy"
-    ),
-)
 def test_health_reports_an_unreachable_vector_store(monkeypatch) -> None:
     report = _health(monkeypatch, memory=_UnreachableQdrantMemory())
 
-    assert report["status"] != "ok"
-    assert report["checks"]["vector_store"] != "ok"
+    assert report["status_code"] == 503
+    assert report["status"] == "unhealthy"
+    assert report["checks"]["vector_store"] == "unreachable"
 
 
 def test_health_reports_an_uninitialized_vector_store_as_degraded(monkeypatch) -> None:
@@ -431,11 +431,11 @@ def test_health_reports_an_uninitialized_vector_store_as_degraded(monkeypatch) -
     assert report["status"] == "degraded"
     assert report["checks"]["vector_store"] == "not_initialized"
 
-    unreachable_queue = _health(monkeypatch, memory=object(), pool_reachable=False)
+    unreachable_queue = _health(monkeypatch, memory=_ReachableQdrantMemory(), pool_reachable=False)
     assert unreachable_queue["status"] == "degraded"
     assert unreachable_queue["checks"]["redis"] == "unreachable"
 
-    healthy = _health(monkeypatch, memory=object())
+    healthy = _health(monkeypatch, memory=_ReachableQdrantMemory())
     assert healthy["status"] == "ok"
 
 
