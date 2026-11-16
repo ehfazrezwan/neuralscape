@@ -1745,6 +1745,7 @@ async def startup(ctx: dict) -> None:
 
     configure_logging(worker=True)
     logger.info("ARQ worker starting up...")
+    logger.info(third_party_telemetry.startup_log_line())
     service = MemoryService()
     service._get_memory()  # warm up connections
     from hybrid_inference import warmup_extraction
