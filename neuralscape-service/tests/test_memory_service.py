@@ -2722,17 +2722,14 @@ class TestExpireOldMemories:
         mock_client.scroll.side_effect = [
             ([expired, future_pt, no_expiry], None),  # next_offset=None terminates
         ]
-        # Mock the delete + graph cleanup helper
-        service._delete_qdrant_memory_with_graph_cleanup = MagicMock()
+        service._memory.vector_store.delete = MagicMock()
 
         result = service.expire_old_memories(batch_size=100)
 
         assert result["deleted_count"] == 1
         assert result["per_user"] == {"alice": 1}
         # Only the expired one was deleted
-        service._delete_qdrant_memory_with_graph_cleanup.assert_called_once()
-        deleted_id = service._delete_qdrant_memory_with_graph_cleanup.call_args[0][0]
-        assert deleted_id == "expired-1"
+        service._memory.vector_store.delete.assert_called_once_with("expired-1")
 
     def test_handles_per_point_delete_failure(self, service):
         """A failed delete on one point doesn't abort the run."""
@@ -2747,7 +2744,7 @@ class TestExpireOldMemories:
         mock_client.scroll.side_effect = [([p1, p2], None)]
 
         # First delete fails, second succeeds
-        service._delete_qdrant_memory_with_graph_cleanup = MagicMock(
+        service._memory.vector_store.delete = MagicMock(
             side_effect=[Exception("Qdrant transient"), None]
         )
 
@@ -2770,7 +2767,7 @@ class TestExpireOldMemories:
             ([p1], "cursor"),
             ([p2], None),
         ]
-        service._delete_qdrant_memory_with_graph_cleanup = MagicMock()
+        service._memory.vector_store.delete = MagicMock()
 
         result = service.expire_old_memories(batch_size=1)
         assert result["deleted_count"] == 2
@@ -2799,11 +2796,11 @@ class TestExpireOldMemories:
         mock_client = MagicMock()
         service._memory.vector_store.client = mock_client
         mock_client.scroll.side_effect = [([pt], None)]
-        service._delete_qdrant_memory_with_graph_cleanup = MagicMock()
+        service._memory.vector_store.delete = MagicMock()
 
         result = service.expire_old_memories()
         assert result["deleted_count"] == 0
-        service._delete_qdrant_memory_with_graph_cleanup.assert_not_called()
+        service._memory.vector_store.delete.assert_not_called()
 
     def test_cold_start_initializes_memory(self, service):
         """expire_old_memories must call _get_memory() before touching client.
