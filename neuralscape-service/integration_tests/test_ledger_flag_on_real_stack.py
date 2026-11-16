@@ -58,6 +58,9 @@ def ledger_flags(request, flags, stores, unique_ns, tmp_path, llm_key):
         neuralscape_api_key="",
         default_user_id=unique_ns.user_id,
         dictator_user_ids=unique_ns.user_id,
+        # A correction replaces its episode and a delete removes every episode of the memory: the flag that
+        # makes the graph removal complete, so the erasure assertions below are about the ledger, not about it.
+        graph_support_aware_removal_enabled=True,
     )
     if request.param == "sqlite":
         flags(ledger_backend="sqlite", ledger_sqlite_path=str(tmp_path / "ledger.db"))
@@ -259,7 +262,7 @@ async def test_remember_edit_and_delete_go_through_the_ledger(stack):
     edited = await stack.settle(edit.json()["task_id"])
     assert edited["status"] == "completed", edited
     row = (await stack.client.get(f"/v1/memories/{memory_id}", params={"user_id": stack.user})).json()
-    assert "The axolotl is blue." in (row.get("memory") or row.get("memory", ""))
+    assert "The axolotl is blue." in row["memory"]
 
     # delete through the ledger: 202, then the row, the episode and the vector are gone and a tombstone remains
     deleted = await stack.client.request("DELETE", f"/v1/memories/{memory_id}", params={"user_id": stack.user})
