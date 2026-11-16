@@ -140,10 +140,50 @@ def test_merge_helper_rejects_unknown_fields_and_can_set_code_space():
 # ── Redis is the authority for the merge ─────────────────────────
 
 
+class FakePipe:
+    def __init__(self, r):
+        self.r = r
+        self.queued = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def watch(self, key):
+        self.r.watched = key
+
+    def get(self, key):
+        if self.r.fail_get:
+            raise ConnectionError("redis down")
+        return self.r.data.get(key)
+
+    def multi(self):
+        pass
+
+    def set(self, key, value):
+        self.queued.append((key, value))
+
+    def execute(self):
+        from redis.exceptions import WatchError
+
+        if self.r.fail_set:
+            raise ConnectionError("redis write failed")
+        if self.r.before_exec:
+            self.r.before_exec.pop(0)()  # a concurrent writer sneaks in
+            raise WatchError("watched key changed")
+        for k, v in self.queued:
+            self.r.data[k] = v
+
+
 class FakeRedis:
     def __init__(self):
         self.data = {}
         self.fail_get = False
+        self.fail_set = False
+        self.before_exec = []
+        self.watched = None
 
     def get(self, key):
         if self.fail_get:
@@ -152,6 +192,9 @@ class FakeRedis:
 
     def set(self, key, value):
         self.data[key] = value
+
+    def pipeline(self):
+        return FakePipe(self)
 
 
 @pytest.fixture()
@@ -216,3 +259,48 @@ async def test_mcp_null_default_engine_clears_it_and_the_schema_allows_null():
     out = await _mcp("set_project_knowledge_config", {"project_id": PID, "default_engine": None})
     assert out["default_engine"] is None and out["code_space"] == "code--alice--svc"
     assert out["code_systems"] == ["code-native"]
+
+
+def test_failed_redis_write_is_refused_and_leaves_the_mirror_untouched(fake_redis):
+    _indexed()
+    before = dict(fake_redis.data)
+    fake_redis.fail_set = True
+    with pytest.raises(kr.KnowledgeConfigStoreError):
+        kr.merge_project_config(PID, fuse_code_into_recall=False)
+    assert fake_redis.data == before
+    assert kr._PROJECT_CONFIGS[PID].fuse_code_into_recall is True
+    assert _put({"project_id": PID, "fuse_code_into_recall": False}).status_code == 503
+
+
+@pytest.mark.asyncio
+async def test_mcp_failed_redis_write_is_an_error(fake_redis):
+    _indexed()
+    fake_redis.fail_set = True
+    out = await _mcp("set_project_knowledge_config", {"project_id": PID, "fuse_code_into_recall": False})
+    assert "nothing was changed" in out["error"]
+
+
+def test_a_concurrent_write_between_read_and_write_is_not_lost(fake_redis):
+    """Worker rewrites code_space after our read; the WatchError retry merges onto it."""
+    _indexed()
+    key = index_store._CFG_PREFIX + PID
+
+    def worker_write():
+        rec = json.loads(fake_redis.data[key])
+        rec["code_space"] = "code--alice--worker-new"
+        fake_redis.data[key] = json.dumps(rec)
+
+    fake_redis.before_exec = [worker_write]
+    cfg = kr.merge_project_config(PID, fuse_code_into_recall=False)
+    assert cfg.code_space == "code--alice--worker-new" and cfg.fuse_code_into_recall is False
+    stored = json.loads(fake_redis.data[key])
+    assert stored["code_space"] == "code--alice--worker-new" and stored["fuse_code_into_recall"] is False
+
+
+def test_endless_write_conflicts_give_up_without_writing(fake_redis):
+    _indexed()
+    before = dict(fake_redis.data)
+    fake_redis.before_exec = [lambda: None] * 10
+    with pytest.raises(kr.KnowledgeConfigStoreError, match="concurrently"):
+        kr.merge_project_config(PID, fuse_code_into_recall=False)
+    assert fake_redis.data == before

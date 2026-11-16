@@ -150,17 +150,7 @@ def set_project_config(config: ProjectKnowledgeConfig) -> None:
     _mirror_put(config)
     from knowledge import index_store
 
-    index_store.save_project_config(
-        config.project_id,
-        {
-            "project_id": config.project_id,
-            "code_systems": list(config.code_systems or []),
-            "fuse_code_into_recall": config.fuse_code_into_recall,
-            "default_engine": config.default_engine,
-            "code_space": config.code_space,
-            "op_preference": config.op_preference,
-        },
-    )
+    index_store.save_project_config(config.project_id, _payload(config))
 
 
 _MERGEABLE_FIELDS = frozenset(
@@ -171,7 +161,31 @@ _NON_NULLABLE_FIELDS = frozenset({"code_systems", "fuse_code_into_recall"})
 
 
 class KnowledgeConfigStoreError(RuntimeError):
-    """The authoritative (Redis) read failed, so a merge was refused and nothing written."""
+    """The authoritative (Redis) store could not be read or written, or kept losing a
+    race with another writer, so the merge was refused and nothing was changed."""
+
+
+_MERGE_RETRIES = 5
+
+
+def _payload(config: ProjectKnowledgeConfig) -> dict:
+    return {
+        "project_id": config.project_id,
+        "code_systems": list(config.code_systems or []),
+        "fuse_code_into_recall": config.fuse_code_into_recall,
+        "default_engine": config.default_engine,
+        "code_space": config.code_space,
+        "op_preference": config.op_preference,
+    }
+
+
+def _apply_updates(project_id: str, raw: dict | None, updates: dict) -> ProjectKnowledgeConfig:
+    base = _config_from_raw(project_id, raw) if raw else ProjectKnowledgeConfig(project_id=project_id)
+    for key, value in updates.items():
+        if value is None and key in _NON_NULLABLE_FIELDS:
+            continue
+        setattr(base, key, list(value) if key == "code_systems" else value)
+    return base
 
 
 def merge_project_config(project_id: str, **updates) -> ProjectKnowledgeConfig:
@@ -183,10 +197,14 @@ def merge_project_config(project_id: str, **updates) -> ProjectKnowledgeConfig:
     stored config the defaults apply. ``code_systems`` and
     ``fuse_code_into_recall`` given as None are treated as not supplied;
     ``default_engine``, ``code_space`` and ``op_preference`` may be set to None
-    to clear them. Reads Redis directly (bypassing the in-process caches) so a
-    config a worker wrote moments ago is not overwritten; if that read fails,
-    raises KnowledgeConfigStoreError and writes nothing (local copy used only
-    when no Redis client exists).
+    to clear them.
+
+    With a Redis client the read-modify-write runs under WATCH/MULTI (bounded
+    retry), reading Redis directly, so a concurrent write (a worker's index-time
+    write, another edit) is never lost and a stale local copy is never merged. A
+    failed read or write, or exhausted retries, raises KnowledgeConfigStoreError
+    and leaves the in-process mirror untouched. Without a Redis client
+    (memory-only mode) the local copy is merged and written as before.
     """
     unknown = set(updates) - _MERGEABLE_FIELDS
     if unknown:
@@ -194,44 +212,41 @@ def merge_project_config(project_id: str, **updates) -> ProjectKnowledgeConfig:
     from knowledge import index_store
 
     client = index_store._redis()
-    if client is not None:
-        # Redis is the authority: never merge onto a local copy (up to 30s old)
-        # that could hold an older code_space than a worker just wrote.
+    if client is None:  # memory-only mode
+        local = _PROJECT_CONFIGS.get(project_id)
+        raw = _payload(local) if local else index_store.load_project_config(project_id)
+        merged = _apply_updates(project_id, raw, updates)
+        set_project_config(merged)
+        return merged
+
+    try:
+        from redis.exceptions import WatchError
+    except Exception:  # noqa: BLE001 — redis-py is a dependency; keep a local stand-in
+        class WatchError(Exception):  # type: ignore[no-redef]
+            pass
+
+    key = index_store._CFG_PREFIX + project_id
+    for _ in range(_MERGE_RETRIES):
         try:
-            blob = client.get(index_store._CFG_PREFIX + project_id)
-            raw = json.loads(blob) if blob else None
+            with client.pipeline() as pipe:
+                pipe.watch(key)
+                blob = pipe.get(key)
+                merged = _apply_updates(project_id, json.loads(blob) if blob else None, updates)
+                pipe.multi()
+                pipe.set(key, json.dumps(_payload(merged), default=str))
+                pipe.execute()
+        except WatchError:
+            continue  # someone wrote between our read and write: redo on the fresh value
         except Exception as exc:  # noqa: BLE001
             raise KnowledgeConfigStoreError(
-                f"cannot read the stored knowledge config for {project_id!r}; nothing was changed, retry shortly"
+                f"cannot read or write the stored knowledge config for {project_id!r}; nothing was changed, retry shortly"
             ) from exc
-    else:  # memory-only mode (no Redis client)
-        raw = index_store.load_project_config(project_id)
-    if raw:
-        current = ProjectKnowledgeConfig(
-            project_id=project_id,
-            code_systems=list(raw.get("code_systems") or []),
-            fuse_code_into_recall=bool(raw.get("fuse_code_into_recall", True)),
-            default_engine=raw.get("default_engine"),
-            code_space=raw.get("code_space"),
-            op_preference=raw.get("op_preference"),
-        )
-    else:
-        local = _PROJECT_CONFIGS.get(project_id) if client is None else None
-        current = local or ProjectKnowledgeConfig(project_id=project_id)
-    merged = ProjectKnowledgeConfig(
-        project_id=project_id,
-        code_systems=list(current.code_systems or []),
-        fuse_code_into_recall=current.fuse_code_into_recall,
-        default_engine=current.default_engine,
-        code_space=current.code_space,
-        op_preference=current.op_preference,
+        _mirror_put(merged)
+        index_store.cache_project_config(project_id, _payload(merged))
+        return merged
+    raise KnowledgeConfigStoreError(
+        f"the knowledge config for {project_id!r} is being changed concurrently; nothing was changed, retry"
     )
-    for key, value in updates.items():
-        if value is None and key in _NON_NULLABLE_FIELDS:
-            continue
-        setattr(merged, key, list(value) if key == "code_systems" else value)
-    set_project_config(merged)
-    return merged
 
 
 # ── Query-shape coding-signal gate (layer 3) ──
