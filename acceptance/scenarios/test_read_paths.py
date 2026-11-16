@@ -161,7 +161,7 @@ def check_meter_belongs_to(client: NSClient, user_id: str) -> None:
 
 
 LEGS_TEXT = "Quokkaforge compiles artefacts nightly on the staging cluster."
-LEGS_QUERY = "which utility assembles our deliverables each evening inside the rehearsal environment"
+LEGS_QUERY = "which utility assembles our deliverables each evening inside a rehearsal environment"
 
 
 def _words(text: str) -> set[str]:
