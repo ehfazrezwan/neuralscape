@@ -148,6 +148,9 @@ def ingest_document(service, doc: IngestDoc) -> dict:
     base["parent_id"] = parent_id
 
     memory_ids: list[str] = []
+    # Store failures are tolerated (one bad chunk must not abort a book) but
+    # never silent: they are returned so callers can report an incomplete ingest.
+    store_errors: list[str] = []
     passage_count = 0
     fact_count = 0
     # M1 (ingest lifecycle): sum of the token cost of everything we STORE
@@ -201,6 +204,7 @@ def ingest_document(service, doc: IngestDoc) -> dict:
                     served_tok += _served_tokens(stored)
             except Exception as e:
                 logger.warning(f"Passage store failed (chunk {chunk.index}): {e}")
+                store_errors.append(f"{type(e).__name__}: {e}")
 
     # ── Facts (LLM-distilled, graph-linked) ──
     # Facts are stored vector-only here (fast), with graph enrichment DEFERRED:
@@ -273,6 +277,7 @@ def ingest_document(service, doc: IngestDoc) -> dict:
                         })
             except Exception as e:
                 logger.warning(f"Fact store failed ({category}): {e}")
+                store_errors.append(f"{type(e).__name__}: {e}")
 
     logger.info(
         f"Ingested doc parent_id={parent_id} → {passage_count} passages + {fact_count} facts "
@@ -300,6 +305,8 @@ def ingest_document(service, doc: IngestDoc) -> dict:
         "facts": fact_count,
         "memory_ids": memory_ids,
         "parent_id": parent_id,
+        # "ClassName: message" per passage/fact store that failed (empty = clean).
+        "store_errors": store_errors,
         # Deferred graph-enrichment payloads + the adapter whose ontology applies.
         # Callers (the ingest worker) enqueue these onto the graph queue and then
         # drop the key from any client-facing result.

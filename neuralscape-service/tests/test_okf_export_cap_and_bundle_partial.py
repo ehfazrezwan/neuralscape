@@ -240,6 +240,34 @@ class TestBundleImportReportsFailures:
         assert failure["concept_id"] == "b"
         assert failure["error"].startswith("RuntimeError: embedding backend unavailable")
 
+    def test_swallowed_store_failures_on_the_real_ingest_path_are_reported(self):
+        """Real ingest_document (not mocked): store_raw raising is swallowed per
+        chunk inside it; the bundle must still see and report it."""
+        from ingest.okf_bundle import ingest_okf_bundle
+
+        svc = MagicMock()
+
+        def store_raw(*a, **kw):
+            if "Beta" in kw["content"]:
+                raise RuntimeError("store rejected this concept")
+            return [MagicMock(id="m-ok")]
+
+        svc.store_raw.side_effect = store_raw
+        out = ingest_okf_bundle(
+            svc, files=FILES, bundle_uri="b.zip", user_id="alice",
+            extract_facts=False, llm_call=lambda p: "{}",
+        )
+        assert out["status"] == "partial"
+        assert out["concepts"] == 2 and out["failed"] == 1
+        assert [f["concept_id"] for f in out["failed_concepts"]] == ["b"]
+
+        svc.store_raw.side_effect = RuntimeError("down")
+        out = ingest_okf_bundle(
+            svc, files=FILES, bundle_uri="b.zip", user_id="alice",
+            extract_facts=False, llm_call=lambda p: "{}",
+        )
+        assert out["status"] == "failed" and out["concepts"] == 0 and out["failed"] == 3
+
     def test_every_concept_failing_is_failed(self, monkeypatch):
         _patch_ingest(monkeypatch, lambda c: True)
         out = _run()

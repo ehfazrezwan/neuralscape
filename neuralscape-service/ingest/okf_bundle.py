@@ -51,11 +51,14 @@ def safe_error(exc: BaseException, limit: int = 200) -> str:
     Failure reports travel to API clients (task status), so a backend error that
     embeds a store URL with a password or a bearer token must not leak it.
     """
-    text = str(exc)
+    return f"{type(exc).__name__}: {_scrub(str(exc), limit)}"
+
+
+def _scrub(text: str, limit: int = 200) -> str:
     text = _BEARER_RE.sub("Bearer <redacted>", text)
     text = _SECRET_RE.sub(lambda m: f"{m.group(1)}{m.group(2)}<redacted>", text)
     text = _URL_RE.sub("<url>", text)
-    return f"{type(exc).__name__}: {text[:limit]}"
+    return text[:limit]
 
 #: Cap on relationship-hint memories per bundle (a wiki with thousands of
 #: cross-links should not mint thousands of link rows).
@@ -436,7 +439,19 @@ def ingest_okf_bundle(
                 "error": safe_error(exc),
             })
             continue
-        summary["concepts"] += 1
+        # ingest_document tolerates per-chunk store errors (and logs them); it
+        # reports them in ``store_errors``. A concept with any is incompletely
+        # ingested: count it failed, keep whatever did store.
+        store_errors = result.get("store_errors") or []
+        if store_errors:
+            logger.warning("OKF concept %s: %d store errors", concept.concept_id, len(store_errors))
+            summary["failed"] += 1
+            summary["failed_concepts"].append({
+                "concept_id": concept.concept_id,
+                "error": _scrub(store_errors[0]),
+            })
+        else:
+            summary["concepts"] += 1
         summary["passages"] += result["passages"]
         summary["facts"] += result["facts"]
         summary["memory_ids"].extend(result["memory_ids"])
