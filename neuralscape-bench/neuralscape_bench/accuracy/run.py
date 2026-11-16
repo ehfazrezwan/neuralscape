@@ -13,6 +13,12 @@ Phases are explicit and individually resumable:
         --target http://localhost:8398
     uv run python -m neuralscape_bench.accuracy.run --stack down
 
+``--manifest PATH`` (opt-in, off by default) additionally writes a validated
+run manifest per suite when the report phase runs, and the battery report reads
+it back and prints its identity (``{suite}`` in PATH expands per suite; it is
+required with more than one suite). ``--ns-commit`` names the commit of the
+stack under test when the operator knows it; otherwise it is recorded unknown.
+
 ``--suite all`` expands to every registered suite. ``--sample N --seed S``
 runs a deterministic stratified QA sample. ``--dry-run`` prints the plan
 for paid phases without network calls.
@@ -25,6 +31,7 @@ import asyncio
 import json
 import os
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 from neuralscape_bench.accuracy.costs import CostModel, estimate_suite_cost
@@ -32,6 +39,10 @@ from neuralscape_bench.accuracy.download import DATASETS_DIR
 from neuralscape_bench.accuracy.manifest import IngestManifest, read_jsonl_records
 from neuralscape_bench.accuracy.report import (
     RESULTS_DIR, build_suite_result, save_battery_markdown, save_suite_result,
+)
+from neuralscape_bench.accuracy.run_record import (
+    build_battery_manifest, describe_manifest, load_battery_manifest,
+    manifest_path_for, parse_commit, write_battery_manifest,
 )
 from neuralscape_bench.accuracy.suites import all_suite_names, get_suite
 
@@ -119,12 +130,14 @@ def cmd_estimate(args, suite_name: str, model: CostModel) -> dict:
     return d
 
 
-async def _run_paid(args, suite_name: str) -> None:
+async def _run_paid(args, suite_name: str) -> Path | None:
+    """Run the paid phases for one suite; returns the manifest path if one was written."""
     from neuralscape_bench.client import NeuralscapeClient
     from neuralscape_bench.accuracy.answer import answer_suite
     from neuralscape_bench.accuracy.ingest import ingest_suite
     from neuralscape_bench.accuracy.judge import GeminiJudge, judge_suite
 
+    started_at = datetime.now(timezone.utc)
     data = _load(args, suite_name)
     target_label = manifest_label(args.target, args.user_namespace)
     answers_path, judged_path = raw_paths(suite_name, args.run_label)
@@ -134,7 +147,7 @@ async def _run_paid(args, suite_name: str) -> None:
         _log(f"[dry-run] {suite_name}: would ingest {st['sessions']} sessions across "
              f"{st['conversations']} conversations, answer {st['qa_items']} questions "
              f"against {args.target}")
-        return
+        return None
 
     client = NeuralscapeClient(args.target, token=args.token)
     try:
@@ -186,17 +199,42 @@ async def _run_paid(args, suite_name: str) -> None:
         )
         path = save_suite_result(result)
         _log(f"[report] {suite_name} → {path}")
+        if args.manifest:
+            document = build_battery_manifest(
+                suite=suite_name, display=result["display"], phases=list(args.phase),
+                data=data, config=result["config"], judged=judged,
+                ingest_metas=manifest.session_metas(), ingest_totals=result["run"],
+                metrics=result["metrics"], concurrency=args.concurrency,
+                started_at=started_at, finished_at=datetime.now(timezone.utc),
+                ns_commit=args.ns_commit, run_label=args.run_label)
+            written = write_battery_manifest(manifest_path_for(args.manifest, suite_name), document)
+            _log(f"[manifest] {suite_name} → {written}")
+            return written
+    return None
 
 
-def _battery_report(args, suites: list[str]) -> None:
-    """Cross-suite markdown from the latest committed per-suite results."""
+def _battery_report(args, suites: list[str], manifest_paths: list[Path] | None = None) -> None:
+    """Cross-suite markdown from the latest committed per-suite results.
+
+    Each manifest written this run is read back through the strict loader; its
+    identity is printed and included in the markdown. A manifest the loader
+    rejects fails the report rather than being skipped.
+    """
+    identities: dict[str, list[str]] = {}
+    for mpath in manifest_paths or []:
+        manifest, battery = load_battery_manifest(mpath)
+        lines = describe_manifest(manifest, battery)
+        identities[battery["suite"]] = lines
+        _log(f"[manifest] {mpath}")
+        for line in lines:
+            _log(f"[manifest]   {line}")
     results: dict[str, dict | None] = {}
     for s in all_suite_names():
         latest = sorted(RESULTS_DIR.glob(f"accuracy-{s}-*.json"))
         results[s] = json.loads(latest[-1].read_text()) if latest else None
     note = (f"Config: k={args.k}, reasoning_level={args.reasoning_level}, "
             f"judge={args.judge_model}, sample={args.sample or 'full'}, seed={args.seed}.")
-    path = save_battery_markdown(results, config_note=note)
+    path = save_battery_markdown(results, config_note=note, manifest_identities=identities)
     _log(f"[report] battery summary → {path}")
 
 
@@ -234,6 +272,14 @@ def main(argv: list[str] | None = None) -> int:
                     help="Prefix bench user ids (bench-<namespace>-<suite>-<conv>) "
                          "for per-PR mini-ingests into an isolated user space; "
                          "also isolates the ingest resume manifest. Default: none.")
+    ap.add_argument("--manifest", default=None, metavar="PATH",
+                    help="Opt-in: write a validated run manifest at the report phase "
+                         "and print it back in the battery report. '{suite}' in PATH "
+                         "expands per suite (required for more than one suite). "
+                         "Default: off, nothing is written.")
+    ap.add_argument("--ns-commit", default=os.environ.get("BENCH_NS_COMMIT"),
+                    help="Full git commit of the stack under test, recorded in the "
+                         "manifest. Default $BENCH_NS_COMMIT; unset = unknown.")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--stack", default=None, choices=("up", "down"),
                     help="Manage the isolated compose stack and exit")
@@ -252,8 +298,16 @@ def main(argv: list[str] | None = None) -> int:
     if "all" in suites:
         suites = all_suite_names()
     args.phase = args.phase or ["fetch"]
+    try:
+        args.ns_commit = parse_commit(args.ns_commit)
+    except ValueError as e:
+        ap.error(f"--ns-commit: {e}")
+    if args.manifest and "report" in args.phase and len(suites) > 1 \
+            and "{suite}" not in args.manifest:
+        ap.error("--manifest needs '{suite}' in PATH when more than one suite runs")
 
     estimates = []
+    manifest_paths: list[Path] = []
     cost_model = CostModel()
     for suite_name in suites:
         if "fetch" in args.phase:
@@ -262,7 +316,9 @@ def main(argv: list[str] | None = None) -> int:
             estimates.append(cmd_estimate(args, suite_name, cost_model))
         paid = [p for p in args.phase if p in ("ingest", "answer", "judge", "report")]
         if paid:
-            asyncio.run(_run_paid(args, suite_name))
+            written = asyncio.run(_run_paid(args, suite_name))
+            if written is not None:
+                manifest_paths.append(written)
 
     if estimates:
         out = RESULTS_DIR / "cost-estimates.json"
@@ -273,7 +329,7 @@ def main(argv: list[str] | None = None) -> int:
         _log(f"[estimate] battery total ≈ ${total:.2f} → {out}")
 
     if "report" in args.phase:
-        _battery_report(args, suites)
+        _battery_report(args, suites, manifest_paths)
     return 0
 
 

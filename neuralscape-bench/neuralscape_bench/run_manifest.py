@@ -122,10 +122,16 @@ class RunState(str, Enum):
 
 
 class CacheCondition(str, Enum):
-    """Declared cache/startup condition; mixed runs must be split."""
+    """Declared cache/startup condition; mixed runs must be split.
+
+    ``UNKNOWN`` is for a driver that did not start the stack and cannot tell:
+    it is not a third temperature, and a run that declares it makes no cold or
+    warm claim.
+    """
 
     COLD = "cold"
     WARM = "warm"
+    UNKNOWN = "unknown"
 
 
 class LimitKind(str, Enum):
@@ -145,11 +151,15 @@ class ObservationKind(str, Enum):
 
 
 class BuildIdentity(_ManifestContract):
-    """Immutable source and image identities used by a run."""
+    """Immutable source and image identities used by a run.
 
-    git_commit: str = Field(pattern=r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
-    image_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
-    dependency_lock_sha256: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    ``None`` means the identity is unknown to the driver (for example a client
+    that talks to a stack it did not build).  It is never a placeholder digest.
+    """
+
+    git_commit: str | None = Field(default=None, pattern=r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
+    image_digest: str | None = Field(default=None, pattern=r"^sha256:[0-9a-f]{64}$")
+    dependency_lock_sha256: str | None = Field(default=None, pattern=r"^sha256:[0-9a-f]{64}$")
 
 
 class WorkloadIdentity(_ManifestContract):

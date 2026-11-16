@@ -61,6 +61,11 @@ class IngestManifest:
         self._data["stats"].update(kw)
         self.save()
 
+    def session_metas(self) -> list[dict]:
+        """Per-session ingest records (``elapsed_s`` is None when not recorded)."""
+        return [m for c in self._data["conversations"].values()
+                for m in c.get("sessions_meta", {}).values()]
+
     def totals(self) -> dict:
         convs = self._data["conversations"]
         metas = [m for c in convs.values() for m in c.get("sessions_meta", {}).values()]

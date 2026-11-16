@@ -6521,3 +6521,38 @@ def test_a_self_iterating_inventory_over_the_bound_is_still_refused_after_one_it
     with pytest.raises(ValueError) as caught:
         _snapshot_native(resource)
     assert str(caught.value) == run_manifest_module.SNAPSHOT_BUDGET_MESSAGE and inventory.iter_calls == 1
+
+
+# ── an identity the driver does not know is unknown, not a placeholder ──
+
+
+def test_unknown_build_identity_and_cache_condition_round_trip():
+    from neuralscape_bench.run_manifest import serialize_run_manifest, validate_run_manifest_json
+
+    planned = RunManifest(
+        schema_version=VERSION,
+        run_id="run-unknown",
+        state=RunState.PLANNED,
+        build=BuildIdentity(schema_version=VERSION),
+        workload=workload_identity(),
+        cache_condition=CacheCondition.UNKNOWN,
+        concurrency=concurrency(),
+        resources=(pending_memory(),),
+    )
+    assert (planned.build.git_commit, planned.build.image_digest,
+            planned.build.dependency_lock_sha256) == (None, None, None)
+    payload = json.loads(serialize_run_manifest(planned))
+    assert payload["build"] == {"schema_version": VERSION, "git_commit": None,
+                                "image_digest": None, "dependency_lock_sha256": None}
+    assert validate_run_manifest_json(json.dumps(payload)) == planned
+
+
+@pytest.mark.parametrize("field,value", [
+    ("git_commit", ""),
+    ("git_commit", "deadbee"),
+    ("image_digest", ""),
+    ("dependency_lock_sha256", "sha256:" + "a" * 63),
+])
+def test_a_supplied_identity_is_still_validated_even_though_none_is_allowed(field, value):
+    with pytest.raises(ValidationError):
+        BuildIdentity(schema_version=VERSION, **{field: value})
