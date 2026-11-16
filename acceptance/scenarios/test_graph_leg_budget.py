@@ -14,9 +14,12 @@ from __future__ import annotations
 import time
 
 import os
+import sys
 
 import pytest
 
+from nsaccept import guard
+from nsaccept.runctx import parse_ps_json
 from nsaccept import eventually, expect_check_fails, needs, negative_control, proves, profiles
 
 BOUND_S = 8.0  # the plugin's client timeout; budget (4 s) + embed + Qdrant leaves margin
@@ -56,8 +59,12 @@ NEO4J = os.environ.get("NS_NEO4J_SERVICE", "neo4j")
 @profiles("graph-leg-budget")
 @needs("compose")
 def test_wedged_graph_does_not_stall_the_recall(ctx, a):
-    if os.environ.get("NS_ALLOW_DESTRUCTIVE") != "1" or not (ctx.compose_project or "").startswith("nscampaign"):
-        pytest.skip("destructive: needs NS_ALLOW_DESTRUCTIVE=1 and a compose project named nscampaign*")
+    try:
+        guard.check_compose_project(ctx.compose_project or "")
+    except guard.GuardError:
+        pytest.skip("destructive: needs a disposable compose project (nscampaign*, nstest-*)")
+    if os.environ.get("NS_ALLOW_DESTRUCTIVE") != "1":
+        pytest.skip("destructive: needs NS_ALLOW_DESTRUCTIVE=1")
     marker = f"zq-{ctx.run_id}-glbw"
     content = f"{marker} the wedged-graph fact lives in the vector store."
     task = a.store_raw(content, "personal_fact", scope="global", visibility="private")
@@ -68,5 +75,18 @@ def test_wedged_graph_does_not_stall_the_recall(ctx, a):
         # Without the budget this search takes ~30-45 s (bridge timeout); with it, ~budget.
         check_recalled_fast(a, marker, content)
     finally:
-        ctx.compose("unpause", NEO4J, check=False)
+        # Restore loudly. A failure here must not mask a failure in the body above
+        # (an exception already propagating wins), but it must never pass silently.
+        restore_error = None
+        try:
+            ctx.compose("unpause", NEO4J)
+            rows = [r for r in parse_ps_json(ctx.compose("ps", "--all", "--format", "json", NEO4J).stdout or "")]
+            states = {r.get("State") for r in rows}
+            assert states == {"running"}, f"neo4j not running after unpause: {states or 'no container'}"
+        except Exception as exc:  # noqa: BLE001
+            restore_error = exc
+        if restore_error is not None and sys.exc_info()[0] is None:
+            raise restore_error
+        if restore_error is not None:
+            print(f"WARNING: neo4j restore failed while the scenario was already failing: {restore_error!r}")
     eventually(lambda: check_recalled_fast(a, marker, content), timeout=90, what="healthy again after unpause")
