@@ -39,3 +39,49 @@ def test_memory_service_close_closes_the_driver_then_stops_the_bridge():
     service._bridge.shutdown.side_effect = lambda: order.append('bridge_stopped')
     service.close()
     assert order == ['driver_closed', 'bridge_stopped']
+
+
+def test_bridge_is_stopped_even_when_driver_close_raises():
+    import pytest
+    from memory_service import MemoryService
+    service = MemoryService()
+    service._graphiti = Mock()
+    service._bridge = Mock()
+    service._bridge.run.side_effect = RuntimeError('driver close failed')
+    with pytest.raises(RuntimeError, match='driver close failed'):
+        service.close()
+    service._bridge.shutdown.assert_called_once_with()
+
+
+def test_run_after_shutdown_raises_and_closes_the_coroutine():
+    import inspect
+    import pytest
+    bridge = _AsyncBridge()
+    bridge.shutdown()
+
+    async def late():
+        return 1
+    coro = late()
+    with pytest.raises(RuntimeError, match='shut down'):
+        bridge.run(coro)
+    assert inspect.getcoroutinestate(coro) == inspect.CORO_CLOSED  # not left un-awaited
+
+
+def test_shutdown_runs_async_generator_finalizers():
+    bridge = _AsyncBridge()
+    finalised = threading.Event()
+
+    async def agen():
+        try:
+            yield 1
+            yield 2
+        finally:
+            finalised.set()
+
+    async def start():
+        gen = agen()
+        await gen.__anext__()
+        bridge._gen = gen  # keep it alive and unfinished
+    bridge.run(start())
+    bridge.shutdown()
+    assert finalised.is_set()

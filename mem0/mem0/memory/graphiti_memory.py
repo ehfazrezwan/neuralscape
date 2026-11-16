@@ -169,6 +169,7 @@ class _AsyncBridge:
 
     def __init__(self):
         self._loop = asyncio.new_event_loop()
+        self._stopped = False
         self._thread = threading.Thread(target=self._run_loop, daemon=True)
         self._thread.start()
 
@@ -186,6 +187,10 @@ class _AsyncBridge:
         cancelled on the loop and ``TimeoutError`` is raised, which the
         service's graph callers already log and treat as non-critical.
         """
+        if self._stopped or self._loop.is_closed():
+            if asyncio.iscoroutine(coro):
+                coro.close()  # never leave an un-awaited coroutine behind
+            raise RuntimeError("Graphiti bridge is shut down")
         limit = timeout if timeout is not None and timeout > 0 else _bridge_timeout_from_env()
         future = asyncio.run_coroutine_threadsafe(coro, self._loop)
         try:
@@ -205,12 +210,14 @@ class _AsyncBridge:
 
 
     def shutdown(self, timeout: float = 10.0) -> None:
-        """Cancel outstanding tasks, stop the loop and join its thread.
+        """NEURALSCAPE PATCH: stop the bridge loop cleanly (not in upstream).
 
-        Fire-and-forget work scheduled on the loop (the driver schedules its
-        index build there at construction) must not outlive the loop: left
-        running it surfaces later as 'Event loop is closed' / 'no running
-        event loop' noise from a driver whose loop is gone. Idempotent.
+        Cancel outstanding tasks, shut down async generators, stop the loop and
+        join its thread. Fire-and-forget work scheduled on the loop (the driver
+        schedules its index build there at construction) must not outlive the
+        loop: left running it surfaces later as 'Event loop is closed' / 'no
+        running event loop' noise. Idempotent; a later ``run()`` raises
+        RuntimeError.
         """
         if self._loop.is_closed():
             return
@@ -221,7 +228,9 @@ class _AsyncBridge:
             for task in pending:
                 task.cancel()
             await asyncio.gather(*pending, return_exceptions=True)
+            await self._loop.shutdown_asyncgens()
 
+        self._stopped = True
         try:
             asyncio.run_coroutine_threadsafe(_cancel_all(), self._loop).result(timeout=timeout)
         except Exception:
