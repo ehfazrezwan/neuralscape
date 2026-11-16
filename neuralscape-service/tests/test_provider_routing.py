@@ -1,9 +1,8 @@
 """``NS_GEMINI_BASE_URL`` reaches every Gemini client the process builds, in every process.
 
-The inference facade names the endpoint host in its recipient ids so an approval matches the real
-destination.  The vendored memory and graph libraries build their own clients; unless the override is
-applied to the client class they would still call the default endpoint, and the approval would name a
-destination the content does not go to.
+The service and the vendored memory and graph libraries each build their own clients; unless the
+override is applied to the client class they would still call the default endpoint.  A client built
+with an address of its own keeps it.
 """
 
 from __future__ import annotations
@@ -67,6 +66,17 @@ def test_a_non_http_url_is_refused():
         provider_routing.apply_gemini_base_url("ftp://x/y")
 
 
+def test_an_explicit_base_url_is_not_overridden():
+    provider_routing.apply_gemini_base_url("https://gateway.example.test/g")
+    own = genai.Client(api_key="k", http_options=types.HttpOptions(base_url="https://own.example.test/v1"))
+    assert _base_url(own).rstrip("/") == "https://own.example.test/v1"
+    own_dict = genai.Client(api_key="k", http_options={"base_url": "https://own.example.test/v2"})
+    assert _base_url(own_dict).rstrip("/") == "https://own.example.test/v2"
+    # an options object without an address still gets the configured one
+    plain = genai.Client(api_key="k", http_options=types.HttpOptions(timeout=7))
+    assert _base_url(plain).rstrip("/") == "https://gateway.example.test/g"
+
+
 def test_the_service_applies_it_before_it_builds_any_client(monkeypatch):
     """API, worker queues and a stdio MCP process all build clients through the service."""
     import threading
@@ -74,15 +84,44 @@ def test_the_service_applies_it_before_it_builds_any_client(monkeypatch):
     import memory.core as core
     from config import settings
 
+    monkeypatch.setattr(settings, "google_api_key", "test-key")
     monkeypatch.setattr(settings, "ns_gemini_base_url", "https://gateway.example.test/svc")
-    built = []
-    monkeypatch.setattr(core, "genai", SimpleNamespace(Client=lambda **kw: built.append(kw) or SimpleNamespace(kw=kw)))
     svc = core.CoreMixin.__new__(core.CoreMixin)
     svc._genai_model = None
     svc._init_lock = threading.Lock()
-    svc._get_genai_client()
+    client = svc._get_genai_client()  # the real SDK client class, routed
     assert provider_routing._APPLIED == ["https://gateway.example.test/svc"]
-    assert built[0]["http_options"].base_url == "https://gateway.example.test/svc"
+    assert _base_url(client).rstrip("/") == "https://gateway.example.test/svc"
+
+
+def test_the_service_builds_an_unchanged_client_when_unset(monkeypatch):
+    import threading
+
+    import memory.core as core
+    from config import settings
+
+    monkeypatch.setattr(settings, "google_api_key", "test-key")
+    monkeypatch.setattr(settings, "ns_gemini_base_url", "")
+    svc = core.CoreMixin.__new__(core.CoreMixin)
+    svc._genai_model = None
+    svc._init_lock = threading.Lock()
+    client = svc._get_genai_client()
+    assert provider_routing._APPLIED == []
+    assert "generativelanguage.googleapis.com" in _base_url(client)
+
+
+def test_invalid_endpoint_settings_are_rejected():
+    import config
+
+    for bad in ("ftp://x/y", "https://user:pw@host/x", "not a url", "https://"):
+        with pytest.raises(Exception, match="NS_GEMINI_BASE_URL"):
+            config.Settings(
+                ns_gemini_base_url=bad, google_api_key="k", neo4j_password="p", neuralscape_auth_disabled=True
+            ).validate_required()
+    config.Settings(
+        ns_gemini_base_url="https://ok.example.test/x", google_api_key="k", neo4j_password="p",
+        neuralscape_auth_disabled=True,
+    ).validate_required()
 
 
 def test_the_worker_start_up_routes_before_the_service_exists():

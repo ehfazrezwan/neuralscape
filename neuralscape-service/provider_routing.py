@@ -1,11 +1,10 @@
 """Apply ``NS_GEMINI_BASE_URL`` to every Gemini client the process creates.
 
-The setting (empty by default) already routes the inference facade's client.
-The vendored memory and graph libraries construct their own clients for
-embeddings and generation, so without this they would still call Google's
-default endpoint.  The override is applied to the client class once, at start-up,
-before any client exists: an API-compatible gateway, or a deterministic local
-stand-in for offline tests, then serves every call.
+The setting is empty by default (nothing is changed).  The service and the vendored memory and graph
+libraries each construct their own clients for embeddings and generation, so the override is applied to
+the client class once, at start-up, before any client exists: an API-compatible gateway, or a
+deterministic local stand-in for offline tests, then serves every call.  A client built with an address
+of its own keeps it.
 """
 
 from __future__ import annotations
@@ -37,12 +36,15 @@ def apply_gemini_base_url(base_url: str) -> bool:
     _ORIGINAL_INIT.append(original)
 
     def routed(self, *args, **kwargs):
+        # Fill the address in only where the caller named none: a client built for a specific
+        # endpoint (a library's own default for another provider, an explicit gateway) keeps it.
         options = kwargs.get("http_options")
         if options is None:
             kwargs["http_options"] = types.HttpOptions(base_url=base_url)
         elif isinstance(options, dict):
-            kwargs["http_options"] = {**options, "base_url": base_url}
-        else:
+            if not options.get("base_url"):
+                kwargs["http_options"] = {**options, "base_url": base_url}
+        elif getattr(options, "base_url", None) is None:
             # A copy with only the address replaced: the caller's options object may be
             # shared and must not be changed behind its back.
             kwargs["http_options"] = options.model_copy(update={"base_url": base_url})
