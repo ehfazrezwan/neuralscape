@@ -148,17 +148,6 @@ def _md_from_payload(payload: dict) -> str | None:
     return md if md and md.strip() else None
 
 
-def _docling_convert(data: bytes, filename: str, settings) -> str | None:
-    """Convert via docling-serve. Returns Markdown, or None if unavailable/failed."""
-    payload = _docling_post(data, filename, settings)
-    if payload is None:
-        return None
-    md = _md_from_payload(payload)
-    if md is None:
-        logger.warning("Docling returned no content for %s; falling back", filename)
-    return md
-
-
 def _markitdown_convert(data: bytes, ext: str) -> str | None:
     """In-process fallback conversion via MarkItDown. Returns text or None."""
     try:
@@ -384,9 +373,13 @@ def extract_text(filename: str, data: bytes, settings) -> tuple[str, str]:
         return _decode_text(data), "plain"
 
     if ext in RICH_EXTS or ext == "":
-        md = _docling_convert(data, filename, settings)
+        payload = _docling_post(data, filename, settings)
+        docling_answered = payload is not None
+        md = _md_from_payload(payload) if payload is not None else None
         if md is not None:
             return md, "docling"
+        if docling_answered:
+            logger.warning("Docling returned no content for %s; falling back", filename)
         md = _markitdown_convert(data, ext)
         if md is not None:
             return md, "markitdown"
@@ -395,7 +388,7 @@ def extract_text(filename: str, data: bytes, settings) -> tuple[str, str]:
         # decode directly so uploads never hard-fail. Otherwise give up.
         if _looks_textual(data):
             return _decode_text(data), "decoded"
-        raise _no_parser(filename)
+        raise _no_parser(filename, docling_answered)
 
     # Unknown extension: accept it only if it's genuinely textual.
     if _looks_textual(data):

@@ -99,6 +99,40 @@ class TestSweep:
         assert out["deleted"] == 2 and out["orphans"] == 5
         assert sum(os.path.exists(a.abs_path) for a in arts) == 3
 
+    def test_a_file_replaced_during_the_reference_check_is_not_deleted(self, cfg):
+        art = _store(cfg, b"re-uploaded while the sweep runs")
+
+        def racing_check(owner, fid):
+            now = time.time()
+            os.utime(art.abs_path, (now, now))  # an identical re-upload rewrites the file
+            return 0
+
+        out = sweep_orphan_artifacts(cfg, racing_check, grace_days=7, dry_run=False)
+        assert out["deleted"] == 0 and out["changed"] == 1 and os.path.exists(art.abs_path)
+
+    def test_a_replaced_inode_is_not_deleted(self, cfg):
+        art = _store(cfg, b"swapped file")
+
+        def swap(owner, fid):
+            data = open(art.abs_path, "rb").read()
+            os.replace(art.abs_path, art.abs_path + ".old")
+            with open(art.abs_path, "wb") as f:  # same bytes, new inode, old mtime
+                f.write(data)
+            old = time.time() - 30 * DAY
+            os.utime(art.abs_path, (old, old))
+            return 0
+
+        out = sweep_orphan_artifacts(cfg, swap, grace_days=7, dry_run=False)
+        assert out["deleted"] == 0 and out["changed"] == 1 and os.path.exists(art.abs_path)
+
+    def test_each_deleted_path_is_logged(self, cfg, caplog):
+        import logging
+
+        art = _store(cfg, b"loggable")
+        with caplog.at_level(logging.INFO, logger="ingest.storage"):
+            sweep_orphan_artifacts(cfg, lambda o, f: 0, grace_days=7, dry_run=False)
+        assert any("Artifact GC deleted" in r.getMessage() and art.rel_path in r.getMessage() for r in caplog.records)
+
     def test_missing_storage_root_is_a_no_op(self, tmp_path):
         out = sweep_orphan_artifacts(SimpleNamespace(ingest_storage_dir=str(tmp_path / "none")), lambda o, f: 0, grace_days=7)
         assert out["scanned"] == 0
@@ -142,21 +176,33 @@ class TestCron:
         s = Settings(_env_file=None)
         assert (s.artifact_gc_enabled, s.artifact_gc_dry_run, s.artifact_gc_grace_days) == (False, True, 7)
 
-    def test_reference_counter_matches_by_source_ref_and_sanitised_owner(self):
+    def test_reference_counter_matches_by_source_ref_on_every_users_rows(self):
         import worker
 
         svc = MagicMock()
-        svc.get_all_user_ids.return_value = ["alice@example.test", "bob"]
         client = svc._get_memory.return_value.vector_store.client
         client.count.return_value = SimpleNamespace(count=2)
         count = worker._artifact_reference_counter(svc)
 
-        assert count("alice_example.test", "0123456789abcdef") == 2
+        assert count("any_owner_dir", "0123456789abcdef") == 2
         flt = client.count.call_args.kwargs["count_filter"]
-        assert flt.must[0].match.value == "alice@example.test"
+        assert not flt.must, "no user scoping: any row anywhere that references the artifact keeps it"
         keys = {c.key for c in flt.should}
         assert "metadata.source_ref.parent_id" in keys and "metadata.source_ref.url" in keys
-        assert count("nobody", "0123456789abcdef") == 0
+        # an owner directory that maps to no known user is therefore never "unreferenced by default"
+        client.count.return_value = SimpleNamespace(count=1)
+        assert count("directory-of-nobody-we-know", "0123456789abcdef") == 1
+
+    def test_a_qdrant_failure_means_nothing_is_deleted(self, cfg):
+        import worker
+
+        art = _store(cfg, b"x")
+        svc = MagicMock()
+        svc._get_memory.return_value.vector_store.client.count.side_effect = ConnectionError("qdrant down")
+        out = sweep_orphan_artifacts(
+            cfg, worker._artifact_reference_counter(svc), grace_days=7, dry_run=False
+        )
+        assert out["deleted"] == 0 and out["errors"] == 1 and os.path.exists(art.abs_path)
 
 
 # ── MarkItDown missing ──────────────────────────────────────────────
@@ -165,7 +211,6 @@ class TestCron:
 @pytest.fixture
 def no_docling(monkeypatch):
     monkeypatch.setattr(extract_mod, "_docling_post", lambda *a, **k: None)
-    monkeypatch.setattr(extract_mod, "_docling_convert", lambda *a, **k: None)
 
 
 class TestMarkItDownMissing:
@@ -180,6 +225,21 @@ class TestMarkItDownMissing:
         monkeypatch.setattr(extract_mod, "_markitdown_convert", lambda data, ext: None)
         with pytest.raises(ExtractorUnavailable):
             extract_text_and_images("deck.pptx", b"\x00\x01binary", SimpleNamespace(docling_enabled=False))
+
+    def test_docling_answered_empty_is_a_bad_file_not_a_missing_backend(self, monkeypatch):
+        # Docling responded (it just found no content) and MarkItDown is absent: the FILE is the problem
+        monkeypatch.setattr(extract_mod, "_docling_post", lambda *a, **k: {"document": {"md_content": "  "}})
+        monkeypatch.setattr(extract_mod, "markitdown_available", lambda: False)
+        monkeypatch.setattr(extract_mod, "_markitdown_convert", lambda data, ext: None)
+        with pytest.raises(UnsupportedFile):
+            extract_text("scan.pdf", b"\x00\x01binary", SimpleNamespace(docling_enabled=True))
+
+    def test_docling_down_with_markitdown_missing_is_a_missing_backend(self, monkeypatch):
+        monkeypatch.setattr(extract_mod, "_docling_post", lambda *a, **k: None)
+        monkeypatch.setattr(extract_mod, "markitdown_available", lambda: False)
+        monkeypatch.setattr(extract_mod, "_markitdown_convert", lambda data, ext: None)
+        with pytest.raises(ExtractorUnavailable):
+            extract_text("scan.pdf", b"\x00\x01binary", SimpleNamespace(docling_enabled=True))
 
     def test_it_is_not_a_quiet_skip(self):
         assert not issubclass(ExtractorUnavailable, UnsupportedFile)

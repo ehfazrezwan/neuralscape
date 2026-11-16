@@ -196,13 +196,13 @@ def sweep_orphan_artifacts(
     The owner is the first path segment (the stored ``_safe`` user id), the
     same value the upload used, so the reference check is scoped to that user.
 
-    Returns ``{"scanned", "referenced", "too_new", "orphans", "deleted",
+    Returns ``{"scanned", "referenced", "too_new", "orphans", "changed", "deleted",
     "errors", "dry_run", "orphan_paths"}`` (paths relative to the root, capped
     at 200 for the report).
     """
     root = _root(settings)
     out = {
-        "scanned": 0, "referenced": 0, "too_new": 0, "orphans": 0,
+        "scanned": 0, "referenced": 0, "too_new": 0, "orphans": 0, "changed": 0,
         "deleted": 0, "errors": 0, "dry_run": dry_run, "orphan_paths": [],
     }
     if not root.is_dir():
@@ -221,7 +221,8 @@ def sweep_orphan_artifacts(
             continue
         out["scanned"] += 1
         try:
-            if path.stat().st_mtime > cutoff:
+            before = path.stat()
+            if before.st_mtime > cutoff:
                 out["too_new"] += 1
                 continue
             refs = reference_count(rel.parts[0], file_id)
@@ -238,8 +239,18 @@ def sweep_orphan_artifacts(
         if dry_run or out["deleted"] >= max_delete:
             continue
         try:
+            # The reference check can take a while; an identical re-upload in the
+            # meantime rewrites (or replaces) the same path. Re-stat right before
+            # the unlink and leave the file alone if anything about it moved.
+            after = path.stat()
+            if (after.st_mtime_ns, after.st_size, after.st_ino) != (
+                before.st_mtime_ns, before.st_size, before.st_ino
+            ):
+                out["changed"] += 1
+                continue
             path.unlink()
             out["deleted"] += 1
+            logger.info("Artifact GC deleted %s", rel)
             # Drop folders the removal emptied (never the storage root itself).
             for parent in path.parents:
                 if parent == root or root not in parent.parents:

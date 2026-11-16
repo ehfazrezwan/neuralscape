@@ -1725,50 +1725,35 @@ async def connector_sync_cron(ctx: dict) -> dict:
 
 
 def _artifact_reference_counter(service):
-    """``(owner_dir, file_id) -> number of memory rows (any visibility, tombstoned included) referencing it``.
+    """``(owner_dir, file_id) -> number of memory rows referencing the artifact``.
 
     A row references an artifact through its ``source_ref``: ``parent_id`` /
     ``external_id`` equal the artifact id (file uploads) or ``url`` is the
-    artifact's download URL (bundle concepts). Scoped to the owner's rows. The
-    owner directory is the sanitised user id the upload used, so rows are matched
-    by ``user_id`` after the same sanitisation.
+    artifact's download URL (bundle concepts). The count is over ALL rows
+    (any owner, any visibility, tombstoned included): scoping it to an owner
+    would need a lossy directory-name-to-user mapping, and an owner directory
+    that maps to nobody must never read as "unreferenced". The cost is an
+    unindexed payload filter per candidate artifact, bounded by the sweep.
+    ``owner_dir`` is accepted for the sweep's callback signature only.
     """
     from qdrant_client.models import FieldCondition, Filter, MatchValue
-
-    from ingest.storage import _safe
 
     client = service._get_memory().vector_store.client
     collection = settings.qdrant_collection
 
-    by_dir: dict[str, list[str]] = {}
-
     def count(owner_dir: str, file_id: str) -> int:
-        # Every user id whose sanitised form is this directory name (listed once per sweep).
-        if not by_dir:
-            for u in service.get_all_user_ids():
-                by_dir.setdefault(_safe(u, "anon"), []).append(u)
-            by_dir.setdefault("", [])  # mark as loaded even with no users
-        users = by_dir.get(owner_dir, [])
-        if not users:
-            return 0
-        total = 0
-        for uid in users:
-            should = []
-            for prefix in ("metadata.source_ref.", "metadata.metadata.source_ref."):
-                for key in ("parent_id", "external_id"):
-                    should.append(FieldCondition(key=prefix + key, match=MatchValue(value=file_id)))
-                should.append(
-                    FieldCondition(key=prefix + "url", match=MatchValue(value=f"/v1/ingest/artifacts/{file_id}"))
-                )
-            total += client.count(
-                collection_name=collection,
-                count_filter=Filter(
-                    must=[FieldCondition(key="user_id", match=MatchValue(value=uid))],
-                    should=should,
-                ),
-                exact=True,
-            ).count
-        return total
+        should = []
+        for prefix in ("metadata.source_ref.", "metadata.metadata.source_ref."):
+            for key in ("parent_id", "external_id"):
+                should.append(FieldCondition(key=prefix + key, match=MatchValue(value=file_id)))
+            should.append(
+                FieldCondition(key=prefix + "url", match=MatchValue(value=f"/v1/ingest/artifacts/{file_id}"))
+            )
+        return client.count(
+            collection_name=collection,
+            count_filter=Filter(should=should),
+            exact=True,
+        ).count
 
     return count
 
