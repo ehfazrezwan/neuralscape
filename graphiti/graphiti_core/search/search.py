@@ -109,6 +109,14 @@ async def search(
     start = time()
     validate_group_ids(group_ids)
 
+    # NEURALSCAPE PATCH (re-apply after upstream subtree syncs): fail closed on
+    # an empty group list. Upstream normalises ``[]`` / ``['']`` to ``None``
+    # below, and ``None`` means "no group filter", so an empty scope computed
+    # by a caller would search every group. An explicit empty scope returns no
+    # results and runs no query; ``None`` still means unscoped, as before.
+    if group_ids is not None and (len(group_ids) == 0 or group_ids == ['']):
+        return SearchResults()
+
     driver = driver or clients.driver
     embedder = clients.embedder
     cross_encoder = clients.cross_encoder
