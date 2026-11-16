@@ -155,7 +155,9 @@ class Settings(BaseSettings):
     llm_retry_base_delay: float = 1.0  # seconds
     llm_retry_max_delay: float = 30.0  # seconds
 
-    # ── pgvector direct-store adapter (default OFF; not wired into the service) ──
+    # ── pgvector direct-store adapter (default OFF) ──
+    # Used as the shadow backend of the engine switch (build_default_switch) when ENGINE_ROUTING_ENABLED.
+    # Like the ENGINE_ROUTING_* settings below it has no effect until the ledger producer lands (p2-05).
     engine_pgvector_enabled: bool = False
     engine_pgvector_dsn: str = ""
     engine_pgvector_schema: str = "ns_engine"

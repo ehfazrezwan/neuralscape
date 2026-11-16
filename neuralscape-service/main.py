@@ -3809,8 +3809,6 @@ async def _stop_engine_switch() -> None:
 def _engine_switch_or_error():
     from engine_adapters_switch import get_switch, unavailable_reason
 
-    if settings.engine_routing_enabled is not True:
-        raise HTTPException(status_code=404, detail="Not Found")
     switch = get_switch()
     if switch is None:
         raise HTTPException(status_code=503, detail={"error": {
@@ -3823,6 +3821,10 @@ def _engine_switch_or_error():
 
 
 async def _engine_switch_call(request: Request, operation: str):
+    # The flag is checked first: with routing off every caller (any identity) gets the same 404 and no
+    # engine module is imported.
+    if settings.engine_routing_enabled is not True:
+        raise HTTPException(status_code=404, detail="Not Found")
     from engine_routing import RoutingError
 
     _require_dictator_admin(request)

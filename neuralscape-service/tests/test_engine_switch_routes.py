@@ -148,6 +148,39 @@ def test_startup_with_routing_off_builds_nothing_and_never_imports_the_switch():
     assert seen["engine_modules"] == [], seen
 
 
+@pytest.mark.parametrize("identity", ["dictator", "non_dictator"])
+def test_flag_off_answers_404_for_every_caller_and_imports_no_engine_module(identity):
+    """The flag is checked before auth and before any engine import (a subprocess, so nothing is pre-imported)."""
+
+    code = (
+        "import json, sys; from fastapi.testclient import TestClient; import main; "
+        "from config import settings; "
+        "settings.neuralscape_auth_disabled = True; settings.neuralscape_user_token_secret = ''; "
+        "settings.neuralscape_api_key = ''; settings.engine_routing_enabled = False; "
+        f"settings.dictator_user_ids = {'default_user' if identity == 'dictator' else 'someone-else'!r}; "
+        "c = TestClient(main.app); "
+        "codes = [getattr(c, m)(p).status_code for m, p in " + repr(ROUTES) + "]; "
+        "print(json.dumps({'codes': codes, 'engine_modules': sorted(m for m in sys.modules if m.startswith('engine_'))}))"
+    )
+    env = {k: v for k, v in os.environ.items() if not k.startswith("ENGINE_")}
+    env.update({"PYTHONPATH": str(SERVICE), "GOOGLE_API_KEY": "k", "NEO4J_PASSWORD": "p"})
+    proc = subprocess.run([sys.executable, "-c", code], cwd=SERVICE, env=env, capture_output=True, text=True, timeout=300)
+    assert proc.returncode == 0, proc.stderr[-3000:]
+    seen = json.loads(proc.stdout.strip().splitlines()[-1])
+    assert seen["codes"] == [404] * len(ROUTES), seen
+    assert seen["engine_modules"] == [], seen
+
+
+def test_flag_off_with_auth_enforced_is_indistinguishable_from_an_unknown_route(monkeypatch):
+    monkeypatch.setattr(settings, "engine_routing_enabled", False)
+    monkeypatch.setattr(settings, "neuralscape_auth_disabled", False)
+    monkeypatch.setattr(settings, "neuralscape_user_token_secret", "s" * 32)
+    client = TestClient(main.app)
+    unknown = client.get("/v1/admin/no-such-route").status_code
+    for method, path in ROUTES:
+        assert _call(client, method, path).status_code == unknown, path
+
+
 # -- the flag is on --------------------------------------------------------------
 
 
@@ -266,3 +299,25 @@ def test_a_followed_switch_refuses_its_own_admin_operations(routing_on, installe
     switch.follow(lambda: switch._router)  # a migration controller owns the window
     assert TestClient(main.app).post("/v1/admin/engine-switch/flip").status_code == 409
     assert TestClient(main.app).get("/v1/admin/engine-switch/status").status_code == 200
+
+
+def test_a_late_projection_of_an_erased_record_leaves_the_engine_empty(installed, ledger):
+    switch, rows, engines = installed
+    ctx = switch_module._ctx(TENANT)
+    _register(ledger, rows, "m-erased", "text that must not come back")
+    switch.project_apply(TENANT, "m-erased", text="text that must not come back", user_id=ADMIN)
+    assert engines["a"].get(ctx, "m-erased") is not None
+    ledger.tombstone(TENANT, "m-erased", 1, "test_erasure")
+    switch.project_remove(TENANT, "m-erased")
+    assert engines["a"].get(ctx, "m-erased") is None
+    switch.project_apply(TENANT, "m-erased", text="text that must not come back", user_id=ADMIN, revision=1)
+    assert engines["a"].get(ctx, "m-erased") is None
+
+
+def test_the_tombstone_guard_holds_even_when_the_engine_never_saw_the_record(installed, ledger):
+    switch, _rows, engines = installed
+    ctx = switch_module._ctx(TENANT)
+    ledger.tombstone(TENANT, "m-never", 3, "test_erasure")  # erased before it was ever projected
+    switch.project_apply(TENANT, "m-never", text="late text", user_id=ADMIN, revision=2)
+    switch.project_apply(TENANT, "m-never", text="late text", user_id=ADMIN, revision=3)
+    assert engines["a"].get(ctx, "m-never") is None
