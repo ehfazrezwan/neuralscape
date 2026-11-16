@@ -7,7 +7,8 @@ future server — with no bespoke code.
 
 config:
   - ``transport``: "http" (Streamable HTTP, default) or "stdio"
-  - http: ``url`` (required), optional ``headers``
+  - http: ``url`` (required), optional ``headers``. Must pass
+    ``connectors.destination`` (public https host unless ``CONNECTOR_ALLOWED_HOSTS``).
   - stdio: ``command`` (required), optional ``args`` (list). Disabled unless the
     operator allowlists the exact command line in CONNECTOR_STDIO_COMMANDS; see
     ``connectors.stdio_policy``. ``env`` is not permitted.
@@ -91,7 +92,23 @@ class MCPConnectorAdapter(ConnectorAdapter):
             url = self.config.get("url")
             if not url:
                 raise ValueError("MCP connector (http) requires config.url")
-            async with streamablehttp_client(url, headers=self._headers()) as (read, write, _):
+            # Destination policy: refuse before connecting (a clear error), and give the
+            # SDK a guarded client so redirects and the actual connect are checked too.
+            from connectors.destination import mcp_client_factory, validate_url
+            from connectors.stdio_policy import ConnectorConfigError
+
+            allowed = settings.connector_allowed_hosts_set()
+            try:
+                await validate_url(url, allowed)
+            except ConnectorConfigError:
+                logger.warning(
+                    "MCP connector destination refused at session time: connector_id=%s owner=%s",
+                    self.connector_id, getattr(self, "owner_user_id", None),
+                )
+                raise
+            async with streamablehttp_client(
+                url, headers=self._headers(), httpx_client_factory=mcp_client_factory(allowed)
+            ) as (read, write, _):
                 async with ClientSession(read, write) as session:
                     await session.initialize()
                     yield session
