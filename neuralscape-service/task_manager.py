@@ -277,6 +277,8 @@ class TaskManager:
         # Data-layer connectors
         memory_kind: str | None = None,
         source_ref: dict | None = None,
+        # Workspace partition (WT6): absent / "memory" = memory workspace.
+        workspace: str | None = None,
         # Durable path only (LEDGER_ENABLED): accepted and unused until writes use the ledger.
         idempotency_key: str | None = None,
     ) -> str:
@@ -324,6 +326,9 @@ class TaskManager:
             epistemic_level=epistemic_level,
             memory_kind=memory_kind,
             source_ref=source_ref,
+            # store_raw's dedup identity includes the workspace, so the same
+            # text written to another workspace is a distinct job.
+            workspace=workspace,
         )
         job_id = _generate_job_id(
             f"raw:{visibility}:{scope}:{project_id}:{sensitivity_override}:{options}:{content}",
@@ -345,6 +350,7 @@ class TaskManager:
             "sensitivity_override": sensitivity_override,
             "memory_kind": memory_kind,
             "source_ref": source_ref,
+            "workspace": workspace,
         }
         # Drop None values so the worker signature can default cleanly
         v2_extras = {k: v for k, v in v2_extras.items() if v is not None}
