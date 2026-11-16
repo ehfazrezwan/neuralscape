@@ -28,6 +28,24 @@ def _vec(text: str) -> list[float]:
     return [float(sum(text.encode()) % 97)] * 8
 
 
+def _llm_only_retry(response):
+    """Stand-in for ``retry_transient`` that fakes only the LLM extraction call.
+
+    The embedding calls are wrapped in the same helper (transient-error retry),
+    so a blanket ``return_value`` would hand the fake LLM response to the
+    embedder too. Embedding calls (operation names ending in "embed") run the
+    real callable with its real arguments.
+    """
+
+    def _retry(fn, *args, **kwargs):
+        if str(kwargs.get("operation", "")).endswith("embed"):
+            kwargs.pop("operation")
+            return fn(*args, **kwargs)
+        return response
+
+    return _retry
+
+
 class _FakeMem0:
     """Minimal mem0 fake for testing the write path without full service init."""
 
@@ -67,7 +85,7 @@ class TestFlagOffBackwardCompat:
         mock_response = MagicMock()
         mock_response.text = '{"facts": ["[convention] Naming convention: use snake_case"]}'
 
-        with patch("memory.write.retry_transient", return_value=mock_response), \
+        with patch("memory.write.retry_transient", side_effect=_llm_only_retry(mock_response)), \
              patch.object(svc, "_get_genai_client", return_value=MagicMock()):
             # Clear any previous mock calls
             svc._memory.vector_store.insert.reset_mock()
@@ -122,7 +140,7 @@ class TestFlagOffBackwardCompat:
         mock_response = MagicMock()
         mock_response.text = '{"facts": ["[convention] Ana: use snake_case"]}'
 
-        with patch("memory.write.retry_transient", return_value=mock_response), \
+        with patch("memory.write.retry_transient", side_effect=_llm_only_retry(mock_response)), \
              patch.object(svc, "_get_genai_client", return_value=MagicMock()):
             svc._memory.vector_store.insert.reset_mock()
 
@@ -169,7 +187,7 @@ class TestFlagOffBackwardCompat:
         mock_response = MagicMock()
         mock_response.text = '{"facts": ["[architecture] API: Gateway: Auth"]}'
 
-        with patch("memory.write.retry_transient", return_value=mock_response), \
+        with patch("memory.write.retry_transient", side_effect=_llm_only_retry(mock_response)), \
              patch.object(svc, "_get_genai_client", return_value=MagicMock()):
             svc._memory.vector_store.insert.reset_mock()
 
@@ -279,7 +297,7 @@ class TestOccurredAtFallback:
 
         conversation_occurred_at = "2026-01-15T10:00:00Z"
 
-        with patch("memory.write.retry_transient", return_value=mock_response), \
+        with patch("memory.write.retry_transient", side_effect=_llm_only_retry(mock_response)), \
              patch.object(svc, "_get_genai_client", return_value=MagicMock()):
             svc._memory.vector_store.insert.reset_mock()
 
