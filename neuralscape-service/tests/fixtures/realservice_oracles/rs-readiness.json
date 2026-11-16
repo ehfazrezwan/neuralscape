@@ -1,0 +1,34 @@
+{
+ "derived_from": "tests/test_baseline_reproductions.py readiness assertions, observed with the vector-store container stopped",
+ "expected": {
+  "baseline": {
+   "facts": {
+    "stopped_status_ok": "true",
+    "stopped_vector_store_ok": "true",
+    "stores_up_status_ok": "true",
+    "stores_up_vector_store_ok": "true"
+   },
+   "verdict": "known_failure"
+  },
+  "candidate": {
+   "facts": {
+    "stopped_status_ok": "false",
+    "stopped_vector_store_ok": "false",
+    "stores_up_status_ok": "true",
+    "stores_up_vector_store_ok": "true"
+   },
+   "verdict": "candidate_pass"
+  }
+ },
+ "leaves": [
+  "G2.03",
+  "G2.04"
+ ],
+ "oracle_version": "rs-oracle-v1",
+ "owner": "author of the real-service probe (not independent); NOT accepted: needs a non-author reviewer",
+ "registry_scenarios": [
+  "readiness-probes-backends",
+  "readiness-controls"
+ ],
+ "scenario_id": "rs-readiness"
+}

@@ -1,0 +1,47 @@
+{
+ "derived_from": "tests/test_baseline_reproductions.py job-key assertions, observed through the API on a real queue",
+ "expected": {
+  "baseline": {
+   "facts": {
+    "raw_accepted": "true",
+    "raw_other_category_other_task": "false",
+    "raw_other_project_other_task": "true",
+    "raw_other_tags_other_task": "false",
+    "raw_same_inputs_same_task": "true",
+    "store_accepted": "true",
+    "store_other_agent_other_task": "false",
+    "store_other_project_other_task": "false",
+    "store_other_user_other_task": "true",
+    "store_same_inputs_same_task": "true"
+   },
+   "verdict": "known_failure"
+  },
+  "candidate": {
+   "facts": {
+    "raw_accepted": "true",
+    "raw_other_category_other_task": "true",
+    "raw_other_project_other_task": "true",
+    "raw_other_tags_other_task": "true",
+    "raw_same_inputs_same_task": "true",
+    "store_accepted": "true",
+    "store_other_agent_other_task": "true",
+    "store_other_project_other_task": "true",
+    "store_other_user_other_task": "true",
+    "store_same_inputs_same_task": "true"
+   },
+   "verdict": "candidate_pass"
+  }
+ },
+ "leaves": [
+  "A6.02",
+  "D2.07"
+ ],
+ "oracle_version": "rs-oracle-v1",
+ "owner": "author of the real-service probe (not independent); NOT accepted: needs a non-author reviewer",
+ "registry_scenarios": [
+  "job-key-omits-store-scope",
+  "job-key-omits-raw-options",
+  "job-key-controls"
+ ],
+ "scenario_id": "rs-job-keys"
+}
