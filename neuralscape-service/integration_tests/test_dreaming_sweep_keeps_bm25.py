@@ -82,3 +82,25 @@ def test_keyword_only_query_finds_every_live_row(dream_env, swept_rows):
         if str(pt.id) not in env.lexical_ids(t, limit=5):
             missed.append(t)
     assert not missed, f"keyword-only (bm25) query misses live rows: {missed}"
+
+
+def test_words_only_in_the_old_text_stop_matching_a_rewritten_row(dream_env, swept_rows):
+    """A rewritten row must not stay keyword-findable by a token only its OLD text had.
+
+    Deterministic (no LLM decision needed): rewrite a live row to text without its
+    rare token, then query the real BM25 leg for the old token and for a new one.
+    """
+    from extensions.dreaming import consolidate
+
+    env = dream_env
+    ids, _ = swept_rows
+    live = _live(env, ids)
+    assert live, "no live row left to rewrite"
+    t, pt = next(iter(live.items()))
+    new_tok = "zq" + uuid.uuid4().hex[:8]
+    assert str(pt.id) in env.lexical_ids(t, limit=5) or t not in pt.payload.get("data", ""), (
+        "control: the row should match its own token before the rewrite"
+    )
+    consolidate._rewrite_content(env.service, str(pt.id), f"A fully rewritten fact about gardening {new_tok}")
+    assert str(pt.id) in env.lexical_ids(new_tok, limit=5), "rewritten row not found by its new token"
+    assert str(pt.id) not in env.lexical_ids(t, limit=5), "rewritten row still matches a token only its old text had"
