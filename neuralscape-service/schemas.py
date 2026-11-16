@@ -745,6 +745,12 @@ class IngestTextRequest(BaseModel):
         max_length=100,
         description="Knowledge adapter selecting taxonomy/chunker/extractor/graph-ontology (e.g. 'default', 'trading_strategy').",
     )
+    workspace: str | None = Field(
+        default=None,
+        max_length=100,
+        pattern=r"^[a-zA-Z0-9_.\-]+$",
+        description="Workspace partition: absent or 'memory' = memory type; any other value = reference workspace",
+    )
     occurred_at: str | None = Field(
         default=None,
         description=(
@@ -799,6 +805,12 @@ class ConnectorConfigRequest(BaseModel):
     default_scope: str = Field(default="global")
     default_project_id: str | None = Field(default=None, max_length=100, pattern=_ID_PATTERN)
     default_visibility: MemoryVisibility | None = Field(default=None)
+    default_workspace: str | None = Field(
+        default=None,
+        max_length=100,
+        pattern=r"^[a-zA-Z0-9_.\-]+$",
+        description="Workspace for memories produced by this connector's syncs (absent = memory workspace, or the adapter's reference workspace)",
+    )
 
     @field_validator("connector_type")
     @classmethod

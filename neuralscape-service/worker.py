@@ -591,6 +591,7 @@ async def process_ingest_document(ctx: dict, doc: dict) -> dict:
         overlap=doc.get("overlap"),
         adapter=doc.get("adapter", "default"),
         occurred_at=doc.get("occurred_at"),
+        workspace=doc.get("workspace"),
     )
     result = await asyncio.to_thread(ingest_document, service, ingest_doc)
 
@@ -789,6 +790,7 @@ async def process_ingest_file(ctx: dict, payload: dict) -> dict:
         extract_facts=options.get("extract_facts", True),
         index_passages=options.get("index_passages", True),
         adapter=options.get("adapter", "default"),
+        workspace=options.get("workspace"),
     )
     result = await asyncio.to_thread(ingest_document, service, ingest_doc)
 
@@ -882,6 +884,7 @@ async def process_ingest_okf_bundle(ctx: dict, payload: dict) -> dict:
         tags=options.get("tags"),
         extract_facts=options.get("extract_facts", True),
         index_passages=options.get("index_passages", True),
+        workspace=options.get("workspace"),
         llm_call=default_type_llm(service),
     )
 
@@ -1656,6 +1659,7 @@ async def process_connector_sync(
                 scope=record.get("default_scope", "global"),
                 project_id=record.get("default_project_id"),
                 visibility=record.get("default_visibility"),
+                workspace=record.get("default_workspace"),
             )
             _ing = await asyncio.to_thread(ingest_document, service, doc)
             # Same deferral as file/document ingest: fact graph writes go to
