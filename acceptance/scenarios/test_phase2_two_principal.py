@@ -19,6 +19,7 @@ Surfaces: ``GET /v1/memories``, ``GET|PATCH|DELETE /v1/memories/{id}``, ``POST /
 
 from __future__ import annotations
 
+import uuid
 from dataclasses import dataclass, field
 
 import pytest
@@ -27,7 +28,7 @@ from nsaccept import eventually, expect_check_fails, negative_control, profiles,
 from nsaccept.client import NSClient
 from nsaccept.redmark import expected_red
 
-from p2_kit import (
+from phase2_kit import (
     DENIED, RED_MEMBERSHIP, Step, bundle_text, call, check_blind_by_id, check_export_carries,
     check_recalled, client_for, memory_id_of, okf_export,
 )
@@ -63,7 +64,8 @@ def _issue(owner: NSClient, ctx, name: str, scope: list[str]) -> tuple[Step, NSC
 @pytest.fixture(scope="module")
 def pair(ctx, a, b) -> Pair:
     run = ctx.run_id
-    p = Pair(marker=f"zq-{run}-p2priv", query=f"zq-{run}-p2priv quay crane rota")
+    nonce = uuid.uuid4().hex[:6]  # a rerun with the same NS_RUN_ID must not see leftover text
+    p = Pair(marker=f"zq-{run}{nonce}-p2priv", query=f"zq-{run}{nonce}-p2priv quay crane rota")
     p.write = call("write", a, "POST", "/v1/memories/raw", json={
         "content": f"{p.marker} The quay crane rota is posted on the east gate.",
         "category": "preference", "scope": "global", "visibility": "private",
@@ -161,15 +163,16 @@ def test_an_identity_the_authority_store_does_not_know_is_denied_everywhere(pair
 
 @proves("contracts.policy", "archive.phase2-pol")
 @negative_control
-def test_member_check_fails_for_the_identity_nobody_bound(pair):
+def test_member_check_fails_for_the_identity_nobody_bound(a, pair):
     assert pair.outsider is not None, pair.outsider_error
+    check_member_may_list(a)  # the same check passes for a bound member first
     expect_check_fails(check_member_may_list, pair.outsider)
 
 
 # ── user B at the request boundary ───────────────────────────────
 
 
-@proves("model.visibility-tiers", "contracts.policy", "archive.phase2-pol")
+@proves("model.visibility-tiers")
 def test_b_cannot_read_a_private_record_by_id_or_find_it_by_search_or_list(pair):
     assert pair.memory_id, pair.write.describe()
     assert _denied(steps(pair)["b by id"]), steps(pair)["b by id"].describe()
@@ -178,14 +181,14 @@ def test_b_cannot_read_a_private_record_by_id_or_find_it_by_search_or_list(pair)
         assert step.ok and _no_marker(step, pair.marker), f"{name} exposed the marker: {step.describe()}"
 
 
-@proves("model.visibility-tiers", "contracts.policy")
+@proves("model.visibility-tiers")
 @negative_control
 def test_blindness_check_fails_for_the_owner(a, pair):
     assert pair.memory_id, pair.write.describe()
     expect_check_fails(check_blind_by_id, a, pair.memory_id)
 
 
-@proves("edit.patch-memory", "contracts.policy", "archive.phase2-pol")
+@proves("edit.patch-memory")
 def test_b_cannot_change_or_delete_a_private_record(a, pair):
     for name in ("b patch", "b delete"):
         assert _denied(steps(pair)[name]), steps(pair)[name].describe()
@@ -195,7 +198,7 @@ def test_b_cannot_change_or_delete_a_private_record(a, pair):
     )
 
 
-@proves("edit.patch-memory", "contracts.policy")
+@proves("edit.patch-memory")
 @negative_control
 def test_change_check_fails_for_the_owner(a, pair):
     def check_change_denied(client):
@@ -213,7 +216,7 @@ def check_can_poll(client: NSClient, task_id: str) -> None:
     assert r.status_code == 200 and r.json().get("status") == "completed", f"status poll -> {r.status_code}: {r.text[:120]}"
 
 
-@proves("auth.task-status-isolation", "queue.task-owner-isolation", "contracts.policy")
+@proves("auth.task-status-isolation", "queue.task-owner-isolation")
 def test_b_cannot_poll_the_job_that_stored_a_record_and_a_can(a, pair):
     assert pair.task_id, pair.write.describe()
     assert _denied(steps(pair)["b status"]), steps(pair)["b status"].describe()
@@ -222,14 +225,16 @@ def test_b_cannot_poll_the_job_that_stored_a_record_and_a_can(a, pair):
 
 @proves("auth.task-status-isolation", "queue.task-owner-isolation")
 @negative_control
-def test_poll_check_fails_for_b(b, pair):
+def test_poll_check_fails_for_b(a, b, pair):
+    steps(pair)
+    check_can_poll(a, pair.task_id)  # the same check passes for the owner first
     expect_check_fails(check_can_poll, b, pair.task_id)
 
 
 # ── user B at the export boundary ────────────────────────────────
 
 
-@proves("ingest.okf-export", "contracts.policy", "archive.phase2-pol")
+@proves("ingest.okf-export")
 def test_b_exports_only_its_own_pool_and_a_exports_the_record(a, pair):
     step = steps(pair)["b export"]
     assert step.status == 200 and not pair.b_export_error, f"B's own export should be served: {step.describe()} {pair.b_export_error}"
@@ -237,9 +242,10 @@ def test_b_exports_only_its_own_pool_and_a_exports_the_record(a, pair):
     assert pair.marker not in pair.b_export_text, "B's export carries A's record"
 
 
-@proves("ingest.okf-export", "contracts.policy")
+@proves("ingest.okf-export")
 @negative_control
-def test_export_check_fails_for_b(b, pair):
+def test_export_check_fails_for_b(a, b, pair):
+    check_export_carries(a, pair.marker)  # the same check passes for the owner first
     expect_check_fails(check_export_carries, b, pair.marker)
 
 
@@ -308,6 +314,8 @@ def test_a_revoked_credential_stops_working(pair):
 
 @proves("contracts.policy", "archive.phase2-pol")
 @negative_control
-def test_credential_check_fails_for_the_identity_nobody_bound(pair):
+@expected_red(RED_MEMBERSHIP)
+def test_credential_check_fails_for_the_identity_nobody_bound(a, pair):
     assert pair.outsider is not None, pair.outsider_error
+    check_credential_issued(a)  # the same check passes for a member first
     expect_check_fails(check_credential_issued, pair.outsider)

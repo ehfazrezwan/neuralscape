@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import os
+import uuid
 from dataclasses import dataclass, field
 
 import pytest
@@ -32,7 +33,7 @@ from nsaccept.helpers import mcp_json
 from nsaccept.mcp import MCPClient
 from nsaccept.redmark import expected_red
 
-from p2_kit import (
+from phase2_kit import (
     DENIED, RED_MEMBERSHIP, RED_ONBOARDING_POLICY, RED_TENANT_CELLS, Step, bundle_text, call, check_recalled,
     client_for, memory_id_of, okf_export,
 )
@@ -66,7 +67,8 @@ def check_join_accepted(client: NSClient, invite: str) -> None:
 @pytest.fixture(scope="module")
 def journey(ctx, a) -> Journey:
     run = ctx.run_id
-    j = Journey(marker=f"zq-{run}-o18", query=f"zq-{run}-o18 sluice gate logbook")
+    nonce = uuid.uuid4().hex[:6]  # a rerun with the same NS_RUN_ID must not see leftover text
+    j = Journey(marker=f"zq-{run}{nonce}-o18", query=f"zq-{run}{nonce}-o18 sluice gate logbook")
     j.invite = call("invite", a, "POST", "/v1/members/invites", poll=False, json={})
     body = j.invite.body if isinstance(j.invite.body, dict) else {}
     token = str(body.get("invite", "")) if j.invite.status == 200 else ""
@@ -122,8 +124,10 @@ def test_an_administrator_invites_a_person_who_joins_once_and_is_listed(a, journ
 
 @proves("archive.phase2-onb")
 @negative_control
+@expected_red(RED_MEMBERSHIP)
 def test_join_check_fails_for_an_invite_nobody_issued(journey):
     assert journey.member is not None, journey.member_error
+    assert journey.join.status == 200, f"a real invite does not join first: {journey.join.describe()}"
     expect_check_fails(check_join_accepted, journey.member, "nsi_" + "0" * 24 + ".bogus")
 
 
@@ -131,8 +135,12 @@ def test_join_check_fails_for_an_invite_nobody_issued(journey):
 @expected_red(RED_ONBOARDING_POLICY)
 def test_a_members_default_capture_is_private_to_them_and_never_team_visible(journey):
     assert journey.join.status == 200, f"the member never joined: {journey.join.describe()}"
-    if journey.capture.status in DENIED:
-        return  # refused outright: nothing was stored, so nothing can be team-visible
+    if journey.capture.status != 202 and not journey.capture.ok:
+        err = ((journey.capture.body or {}).get("detail") or {}).get("error") if isinstance(journey.capture.body, dict) else None
+        assert journey.capture.status == 403 and isinstance(err, dict) and err.get("code") == "permission_denied", (
+            f"the capture was refused, but not by a permission denial: {journey.capture.describe()}"
+        )
+        return  # refused by policy: nothing was stored, so nothing can be team-visible
     assert journey.capture.ok and journey.capture_id, f"the capture was neither refused nor stored: {journey.capture.describe()}"
     assert not journey.member_recalls_capture, f"the member cannot recall their own capture: {journey.member_recalls_capture}"
     assert not journey.admin_recalls_capture, "the administrator recalled the member's default capture"
@@ -174,12 +182,16 @@ class Tenants:
     t2_export_text: str = ""
     a_blind_to_t2: str = ""
     mcp_t2_hits: str = ""
+    mcp_error: str = ""  # any MCP failure is a failure of the story, never "not recalled"
+    t2_own_rest: str = ""  # positive controls: tenant two recalls its OWN record over REST and over MCP
+    t2_own_mcp: str = ""
 
 
 @pytest.fixture(scope="module")
 def tenants(ctx, a) -> Tenants:
     run = ctx.run_id
-    t = Tenants(private_marker=f"zq-{run}-t1p", shared_marker=f"zq-{run}-t1s", t2_marker=f"zq-{run}-t2p")
+    nonce = uuid.uuid4().hex[:6]  # a rerun with the same NS_RUN_ID must not see leftover text
+    t = Tenants(private_marker=f"zq-{run}{nonce}-t1p", shared_marker=f"zq-{run}{nonce}-t1s", t2_marker=f"zq-{run}{nonce}-t2p")
     token, user = os.environ.get("NS_TOKEN_T2", "").strip(), os.environ.get("NS_USER_T2", "").strip()
     if not token or not user:
         t.error = "no second tenant client: the gate provides NS_TOKEN_T2 and NS_USER_T2 (a member of another tenant) once tenant cells exist"
@@ -207,16 +219,23 @@ def tenants(ctx, a) -> Tenants:
     except AssertionError as exc:
         t.error = str(exc)
     t.a_blind_to_t2 = _held(lambda: _must_not_recall(a, t.t2_marker))
+    own_q = f"{t.t2_marker} tenant two crane log blue folder"
+    t.t2_own_rest = _held(lambda: eventually(lambda: check_recalled(t.t2, t.t2_marker, own_q), timeout=90, what="tenant two recalls its own record over REST"))
     try:
         t.t2_mcp.initialize()
         t.mcp_t2_hits = json.dumps(mcp_json(t.t2_mcp, "recall_memories", {"query": f"{t.shared_marker} berth plan harbour board", "limit": 20}))
-    except AssertionError as exc:
-        t.mcp_t2_hits = f"ERROR {exc}"
+        own = json.dumps(mcp_json(t.t2_mcp, "recall_memories", {"query": own_q, "limit": 20}))
+        t.t2_own_mcp = "" if t.t2_marker in own else "tenant two's MCP recall did not return its own record"
+    except Exception as exc:  # noqa: BLE001
+        t.mcp_error = f"{type(exc).__name__}: {exc}"[:200]
     return t
 
 
 def _need(t: Tenants) -> None:
     assert not t.error, t.error
+    assert not t.mcp_error, f"MCP failed: {t.mcp_error}"
+    assert not t.t2_own_rest, f"tenant two cannot recall its own record over REST: {t.t2_own_rest}"
+    assert not t.t2_own_mcp, t.t2_own_mcp
     assert t.private_id and t.shared_id, "tenant one's setup writes did not complete"
 
 

@@ -4,9 +4,9 @@ Black-box stories for the Phase 2 slices that are on `dev` (the durable write le
 store, scoped credentials and route policy), plus the steps that need slices that are not yet there. Same
 harness, same rules as `README.md`; this file only says what the stories are and how a gate runs them.
 
-Files: `profiles/phase2.env`, `scenarios/test_p2_durable_write_story.py`, `test_p2_two_principal.py`,
-`test_p2_member_and_tenant.py` (all profile `phase2`), `test_p2_shared_pool_gate.py` (profile `default`),
-`scenarios/p2_kit.py` (helpers), `nsaccept/redmark.py` (`@expected_red`).
+Files: `profiles/phase2.env`, `scenarios/test_phase2_durable_write_story.py`, `test_phase2_two_principal.py`,
+`test_phase2_member_and_tenant.py` (all profile `phase2`), `test_phase2_shared_pool_gate.py` (profile `default`),
+`scenarios/phase2_kit.py` (helpers), `nsaccept/redmark.py` (`@expected_red`).
 
 ## What is real on dev today (read from the code, not assumed)
 
@@ -26,31 +26,39 @@ Files: `profiles/phase2.env`, `scenarios/test_p2_durable_write_story.py`, `test_
 
 | Story | Scenario file | Steps | Surfaces |
 |---|---|---|---|
-| Durable write | `test_p2_durable_write_story` | save, accepted receipt, current recall, correction, privacy narrowing, stale replay denied, export, restore, restart keeps the accepted work | `POST /v1/memories/raw`, `GET /v1/memories/status/{id}`, `POST /v1/search`, `PATCH /v1/memories/{id}`, `GET /v1/export/okf`, `POST /v1/ingest/files`, `POST /v1/portability/exports` |
-| Two principals | `test_p2_two_principal` | outsider, user B and scoped credentials denied at request, job-status and export boundaries; a revoked credential stops working | `GET/PATCH/DELETE /v1/memories/{id}`, `POST /v1/search`, `GET /v1/memories/status/{id}`, `GET /v1/export/okf`, `POST /v1/credentials` |
-| Member journey (gap O-18) | `test_p2_member_and_tenant` | invite, join, list, the member's default capture stays private | `POST /v1/members/invites`, `POST /v1/members/join`, `GET /v1/members`, `POST /v1/memories/raw` |
-| Two real tenants (gap E-06) | `test_p2_member_and_tenant` | another tenant's person sees nothing of tenant one over REST and MCP | the same read, status and export routes, MCP `recall_memories` |
-| Project-less shared facts (gap E-05) | `test_p2_shared_pool_gate` | a project-less shared fact is recalled from any project; a project's shared fact only from that project | `POST /v1/memories/raw`, `POST /v1/ingest/text`, `POST /v1/search` |
+| Durable write | `test_phase2_durable_write_story` | save, accepted receipt, current recall, correction, privacy narrowing, stale replay denied, export, restore, restart keeps the accepted work | `POST /v1/memories/raw`, `GET /v1/memories/status/{id}`, `POST /v1/search`, `PATCH /v1/memories/{id}`, `GET /v1/export/okf`, `POST /v1/ingest/files`, `POST /v1/portability/exports` |
+| Two principals | `test_phase2_two_principal` | outsider, user B and scoped credentials denied at request, job-status and export boundaries; a revoked credential stops working | `GET/PATCH/DELETE /v1/memories/{id}`, `POST /v1/search`, `GET /v1/memories/status/{id}`, `GET /v1/export/okf`, `POST /v1/credentials` |
+| Member journey (gap O-18) | `test_phase2_member_and_tenant` | invite, join, list, the member's default capture stays private | `POST /v1/members/invites`, `POST /v1/members/join`, `GET /v1/members`, `POST /v1/memories/raw` |
+| Two real tenants (gap E-06) | `test_phase2_member_and_tenant` | another tenant's person sees nothing of tenant one over REST and MCP | the same read, status and export routes, MCP `recall_memories` |
+| Project-less shared facts (gap E-05) | `test_phase2_shared_pool_gate` | a project-less shared fact is recalled from any project; a project's shared fact only from that project | `POST /v1/memories/raw`, `POST /v1/ingest/text`, `POST /v1/search` |
 
 Each scenario lists the atlas nodes it proves with `@proves`; a node is listed only where the assertion
 would fail if that node were broken.
 
 ## Expected red
 
-`@expected_red("needs Phase 2 <slice> (lane p2 <map id>)")` labels a scenario written against behaviour a
-later slice delivers. It is not a skip and not an xfail: the scenario runs, fails honestly, and a pass is a
-pass. The label is the `ns_expected_red` pytest marker (the same marker and one-argument form the
-coverage-closure PR uses for its results field) and an `EXPECTED-RED[...]` prefix on the failure message,
-which the results JSON already carries in `detail`. `selftest/test_p2_stories.py` rejects a reason that is
-not a slice plus a known lane.
+`@expected_red("needs Phase 2 <slice>")` labels a scenario written against behaviour a later slice delivers.
+The reason is one of a closed set of slice names (`nsaccept/redmark.py`). It is not a skip and not an xfail:
+the scenario runs, fails honestly, and a pass is a pass. The label is the `ns_expected_red` pytest marker
+(same marker and one-argument form the coverage-closure PR uses) and an `EXPECTED-RED[...]` prefix on the
+failure message, which the results JSON already carries in `detail`.
 
-| Reason | Lane | Scenarios that stay red until it lands |
-|---|---|---|
-| durable write cutover | p2-05 | accepted receipt; correction names and returns a revision; replay of the original write; stale edit refused; the receipt survives an API restart |
-| portable export and import | p2-10 | tenant export is a verified bundle only its owner downloads |
-| membership and onboarding | p2-07 | five scoped-credential scenarios, including revoke (issuing needs `manage_credentials`); invite, join and list |
-| onboarding policy lineage | p2-19 | a member's default capture is private |
-| tenant cells | p2-08 | two real tenants (needs `NS_TOKEN_T2` and `NS_USER_T2`) |
+| Reason | Scenarios that stay red until it lands |
+|---|---|
+| durable write cutover | accepted receipt; correction names and returns a revision; replay of the original write; stale edit refused; the receipt survives an API restart |
+| portable export | tenant export is a verified bundle only its owner downloads |
+| membership and onboarding | scoped credentials (issuing needs `manage_credentials`), including revoke; invite, join and list |
+| onboarding policy | a member's default capture is private |
+| tenant cells | two real tenants (needs `NS_TOKEN_T2` and `NS_USER_T2`) |
+
+## Evidence rule
+
+* A negative control proves something only if the same check PASSES for the right principal first. A
+  control whose check cannot pass yet (the route or receipt does not exist) is itself `@expected_red`; it is
+  never a green control that passes because the thing is missing.
+* A denial scenario carries the policy atlas ids only if it asserts something only enforcement does. The
+  outsider scenario does (an unknown identity is denied everywhere). Denials of user B are also produced by
+  the visibility and owner rules with policy off, so they carry the visibility and edit ids only.
 
 ## What the gate does for `phase2` (its own restart, not part of the flags-on union)
 
@@ -60,7 +68,7 @@ other profile's scenarios on the same stack, so this profile needs its own resta
 1. Run the `default` profile first with a fixed `NS_RUN_ID`, so the acceptance users A and B and their pools
    exist. Never write data as `acc-<runid>-outsider` (it must stay unknown).
 2. In the API container, before the restart:
-   `python -m policy_migration apply --tenant acc --authority-sqlite /data/ingest/p2-authority.db --qdrant-url http://qdrant:6333 --collection neuralscape_memories --no-legacy-dictator-grants`
+   `python -m policy_migration apply --tenant acc --authority-sqlite /data/ingest/phase2-authority.db --qdrant-url http://qdrant:6333 --collection neuralscape_memories --no-legacy-dictator-grants`
 3. Restart the API and every worker with the lines of `profiles/phase2.env`, then run
    `run.sh <url> --compose-project <gate project> --profile phase2` with the SAME `NS_RUN_ID`.
 

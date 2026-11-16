@@ -18,6 +18,7 @@ from __future__ import annotations
 import io
 import os
 import time
+import uuid
 import zipfile
 from dataclasses import dataclass, field
 
@@ -27,7 +28,7 @@ from nsaccept import eventually, expect_check_fails, negative_control, profiles,
 from nsaccept.redmark import expected_red
 from nsaccept.upload import upload_files
 
-from p2_kit import (
+from phase2_kit import (
     DENIED, RED_DURABLE_WRITES, RED_PORTABILITY, Step, bundle_text, call, check_blind_by_id,
     check_export_carries, check_not_recalled, check_recalled, memory_id_of, okf_export, receipt_of, revision_of,
 )
@@ -65,6 +66,7 @@ class Story:
     old_text_after_replay: str = ""  # "" = nobody recalls the replaced text
     b_after_replay: str = ""  # "" = B still blind
     deleted: str = ""  # "" = the original record is gone
+    recalled_after_delete: str = ""  # "" = nobody recalls the text between the delete and the restore
     restore: Step = field(default_factory=lambda: Step("restore"))
     restore_error: str = ""
     a_recalls_restored: str = ""
@@ -130,7 +132,8 @@ def _slice_bundle(data: bytes, marker: str) -> bytes:
 @pytest.fixture(scope="module")
 def story(ctx, a, b) -> Story:
     run = ctx.run_id
-    s = Story(old=f"zq-{run}-wsold", new=f"zq-{run}-wsnew", ctl=f"zq-{run}-wsctl", key=f"acc-{run}-story-save")
+    nonce = uuid.uuid4().hex[:6]  # a rerun with the same NS_RUN_ID must not see leftover text
+    s = Story(old=f"zq-{run}{nonce}-wsold", new=f"zq-{run}{nonce}-wsnew", ctl=f"zq-{run}{nonce}-wsctl", key=f"acc-{run}-{nonce}-story-save")
 
     # 1. save, with a caller-chosen idempotency key
     s.save = call("save", a, "POST", "/v1/memories/raw", json=s.save_body, headers={"Idempotency-Key": s.key})
@@ -185,6 +188,7 @@ def story(ctx, a, b) -> Story:
         s.deleted = "" if gone.status_code in (200, 202) else f"DELETE -> {gone.status_code}: {gone.text[:120]}"
         if not s.deleted:
             s.deleted = _attempt(lambda: eventually(lambda: check_blind_by_id(a, s.memory_id), timeout=60, what="record gone"))
+        s.recalled_after_delete = _attempt(check_not_recalled, a, s.new, s.q_new)
         try:
             up = upload_files(a, {f"{s.key}.zip": _slice_bundle(s.export_a, s.new)}, mime="application/zip",
                               category="domain_knowledge", scope="global", visibility="private", extract_facts=False)
@@ -269,8 +273,10 @@ def test_an_accepted_write_has_a_durable_receipt_naming_its_key_and_revision(a, 
 
 @proves("archive.phase2-led-a", "contracts.lifecycle")
 @negative_control
-def test_receipt_check_fails_for_a_user_who_does_not_own_the_task(b, story):
+@expected_red(RED_DURABLE_WRITES)
+def test_receipt_check_fails_for_a_user_who_does_not_own_the_task(a, b, story):
     assert story.save.task_id, story.save.describe()
+    check_durable_receipt(a, story.save.task_id, story.key)  # the same check passes for the owner first
     expect_check_fails(check_durable_receipt, b, story.save.task_id, story.key)
 
 
@@ -378,8 +384,9 @@ def test_a_stale_edit_at_the_old_revision_is_refused_and_does_not_widen_visibili
     assert story.row_after_replay.body.get("visibility") == "private", story.row_after_replay.describe()
 
 
-@proves("model.visibility-tiers", "edit.patch-memory")
+@proves("archive.phase2-led-b", "contracts.lifecycle")
 @negative_control
+@expected_red(RED_DURABLE_WRITES)
 def test_stale_replay_check_fails_for_a_write_with_a_fresh_key(a, story):
     """A write with a NEW key is a new write, not a replay: the replay check must be able to tell the two apart."""
 
@@ -388,6 +395,11 @@ def test_stale_replay_check_fails_for_a_write_with_a_fresh_key(a, story):
                         headers={"Idempotency-Key": f"{story.key}-fresh"})
         assert r.status_code == 202 and r.json().get("task_id") == story.save.task_id, "not the original intent"
 
+    def check_replay_key_returns_original(client):
+        r = client.post("/v1/memories/raw", json=story.save_body, headers={"Idempotency-Key": story.key})
+        assert r.status_code == 202 and r.json().get("task_id") == story.save.task_id, "not the original intent"
+
+    check_replay_key_returns_original(a)  # the same key passes first
     expect_check_fails(check_is_the_original_intent, a)
 
 
@@ -422,6 +434,7 @@ def test_export_check_fails_for_the_other_user(b, story):
 def test_the_record_restored_from_the_bundle_is_the_corrected_one_and_stays_private(story):
     assert story.export_a, f"nothing was exported, so nothing was restored: {story.export_error}"
     assert not story.deleted, f"the original record was not removed before the restore: {story.deleted}"
+    assert not story.recalled_after_delete, f"the text is still recalled after the delete, before the restore: {story.recalled_after_delete}"
     assert not story.restore_error and story.restore.final.get("status") == "completed", (
         f"restore import: {story.restore_error or story.restore.final}"
     )
@@ -463,9 +476,11 @@ def test_the_tenant_export_is_a_verified_bundle_only_its_owner_can_download(b, s
 
 @proves("archive.phase2-port", "contracts.portability")
 @negative_control
-def test_portable_export_check_fails_for_a_user_without_the_right_to_export_the_tenant(b):
+@expected_red(RED_PORTABILITY)
+def test_portable_export_check_fails_for_a_user_without_the_right_to_export_the_tenant(a, b):
     def check_exported(client):
         r = client.post("/v1/portability/exports")
         assert r.status_code == 201 and r.json().get("digest"), f"POST /v1/portability/exports -> {r.status_code}"
 
+    check_exported(a)  # the owner's export succeeds first
     expect_check_fails(check_exported, b)

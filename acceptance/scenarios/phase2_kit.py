@@ -1,4 +1,4 @@
-"""Shared helpers for the Phase 2 story scenarios (``test_p2_*``).
+"""Shared helpers for the Phase 2 story scenarios (``test_phase2_*``).
 
 Everything talks to the stack through REST only. Nothing here asserts at import or fixture time except
 the ``check_*`` functions, which are the REAL checks a scenario and its negative control both call.
@@ -16,13 +16,12 @@ from nsaccept import tokens
 from nsaccept.client import NSClient
 from nsaccept.helpers import memory_ids_in
 
-# The reasons carried by @expected_red. Neutral slice names; the ids are lane p2 map ids.
-RED_DURABLE_WRITES = "needs Phase 2 durable write cutover (lane p2 p2-05)"
-RED_MEMBERSHIP = "needs Phase 2 membership and onboarding (lane p2 p2-07)"
-RED_ONBOARDING_POLICY = "needs Phase 2 onboarding policy lineage (lane p2 p2-19)"
-RED_TENANT_CELLS = "needs Phase 2 tenant cells (lane p2 p2-08)"
-RED_PORTABILITY = "needs Phase 2 portable export and import (lane p2 p2-10)"
-KNOWN_LANES = frozenset({"p2-05", "p2-07", "p2-08", "p2-10", "p2-19"})
+# The reasons carried by @expected_red: a closed set of neutral slice names (see nsaccept/redmark.py).
+RED_DURABLE_WRITES = "needs Phase 2 durable write cutover"
+RED_MEMBERSHIP = "needs Phase 2 membership and onboarding"
+RED_ONBOARDING_POLICY = "needs Phase 2 onboarding policy"
+RED_TENANT_CELLS = "needs Phase 2 tenant cells"
+RED_PORTABILITY = "needs Phase 2 portable export"
 
 DENIED = (403, 404)  # the policy layer answers 403 for a named denial and 404 for an existence-safe one
 

@@ -14,7 +14,7 @@ from pathlib import Path
 import pytest
 
 from nsaccept import profile
-from nsaccept.redmark import REASON_RE, TAG, expected_red
+from nsaccept.redmark import REASONS, TAG, expected_red
 
 ACCEPTANCE = Path(__file__).resolve().parents[1]
 SCENARIOS = ACCEPTANCE / "scenarios"
@@ -22,11 +22,11 @@ sys.path.insert(0, str(SCENARIOS))
 
 # the scenario modules apply the evidence markers at import; the plugin registers them in a real run
 warnings.filterwarnings("ignore", category=pytest.PytestUnknownMarkWarning)
-import p2_kit  # noqa: E402
-import test_p2_durable_write_story as story_mod  # noqa: E402
-from test_p2_two_principal import _issue  # noqa: E402
+import phase2_kit  # noqa: E402
+import test_phase2_durable_write_story as story_mod  # noqa: E402
+from test_phase2_two_principal import _issue  # noqa: E402
 
-P2_FILES = ("test_p2_durable_write_story", "test_p2_two_principal", "test_p2_member_and_tenant")
+P2_FILES = ("test_phase2_durable_write_story", "test_phase2_two_principal", "test_phase2_member_and_tenant")
 
 
 # ── the profile ──────────────────────────────────────────────────
@@ -59,7 +59,7 @@ def test_the_profile_declares_that_it_needs_a_compose_project_and_its_own_restar
 # ── @expected_red ────────────────────────────────────────────────
 
 
-GOOD = "needs Phase 2 durable write cutover (lane p2 p2-05)"
+GOOD = "needs Phase 2 durable write cutover"
 
 
 def test_expected_red_marks_the_scenario_and_labels_its_assertion_failures():
@@ -88,30 +88,28 @@ def test_expected_red_does_not_hide_a_pass_or_a_non_assertion_error():
         breaks()
 
 
-@pytest.mark.parametrize("reason", ["", "later", "needs Phase 2 x (lane p2 5)", "needs Phase 3 cells (lane p2 p2-08)", "#515"])
-def test_expected_red_refuses_a_reason_that_is_not_a_slice_and_a_lane(reason):
+@pytest.mark.parametrize("reason", ["", "later", "needs Phase 2 x", "needs Phase 3 tenant cells", "#515"])
+def test_expected_red_refuses_a_reason_that_is_not_a_known_slice_name(reason):
     with pytest.raises(ValueError):
         expected_red(reason)
 
 
-def test_every_expected_red_in_the_story_files_names_a_known_slice_and_lane():
-    constants = {k: v for k, v in vars(p2_kit).items() if k.startswith("RED_")}
+def test_every_expected_red_in_the_story_files_names_a_known_slice_name():
+    constants = {k: v for k, v in vars(phase2_kit).items() if k.startswith("RED_")}
     seen = 0
     for name in P2_FILES:
         text = (SCENARIOS / f"{name}.py").read_text()
         for ref in re.findall(r"@expected_red\((\w+)\)", text):
             seen += 1
             reason = constants[ref]
-            assert REASON_RE.match(reason), reason
-            lane = re.search(r"p2-\d{2}", reason).group(0)
-            assert lane in p2_kit.KNOWN_LANES, f"{reason}: unknown lane"
+            assert reason in REASONS, reason
     assert seen >= 10, f"only {seen} expected-red scenarios found"
     for ref in re.findall(r"expected_red\(\s*['\"]", "".join((SCENARIOS / f"{n}.py").read_text() for n in P2_FILES)):
-        raise AssertionError("pass the reason through a p2_kit.RED_* constant so the wording stays neutral and in one place")
+        raise AssertionError("pass the reason through a phase2_kit.RED_* constant so the wording stays neutral and in one place")
 
 
 def test_nothing_in_the_story_files_is_skipped_or_xfailed():
-    for name in P2_FILES + ("test_p2_shared_pool_gate",):
+    for name in P2_FILES + ("test_phase2_shared_pool_gate",):
         text = (SCENARIOS / f"{name}.py").read_text()
         assert not re.search(r"pytest\.(skip|mark\.skip|mark\.xfail|xfail)|@needs\(", text), f"{name} skips or xfails a scenario"
 
@@ -140,9 +138,9 @@ def test_the_story_scenarios_run_under_phase2_and_the_shared_pool_gate_under_def
         assert all(i["profiles"] == ["phase2"] for i in by_file[name]), name
         assert any(i["negative_control"] for i in by_file[name]), f"{name} has no negative control"
         assert all(i["proves"] for i in by_file[name]), f"{name} has a scenario without @proves"
-    gate = by_file["test_p2_shared_pool_gate"]
+    gate = by_file["test_phase2_shared_pool_gate"]
     assert gate and all(i["profiles"] == ["default"] for i in gate) and any(i["negative_control"] for i in gate)
-    assert not any(i["id"].startswith(("test_p2_",)) and i["profiles"] != ["phase2"] and "shared_pool" not in i["id"] for i in inv)
+    assert not any(i["id"].startswith(("test_phase2_",)) and i["profiles"] != ["phase2"] and "shared_pool" not in i["id"] for i in inv)
 
 
 # ── helpers and the intended receipt shape ───────────────────────
@@ -185,10 +183,10 @@ def test_the_receipt_check_accepts_the_intended_shape_and_rejects_a_legacy_task(
 
 
 def test_memory_id_and_revision_come_from_either_the_legacy_result_or_the_receipt():
-    assert p2_kit.memory_id_of({"result": {"memories": [{"id": "m-legacy"}]}}) == "m-legacy"
-    assert p2_kit.memory_id_of(_status(RECEIPT)) == "mem-1"
-    assert p2_kit.memory_id_of({"result": None}) == ""
-    assert p2_kit.revision_of(_status(RECEIPT)) == 1 and p2_kit.revision_of({"result": {"memories": []}}) is None
+    assert phase2_kit.memory_id_of({"result": {"memories": [{"id": "m-legacy"}]}}) == "m-legacy"
+    assert phase2_kit.memory_id_of(_status(RECEIPT)) == "mem-1"
+    assert phase2_kit.memory_id_of({"result": None}) == ""
+    assert phase2_kit.revision_of(_status(RECEIPT)) == 1 and phase2_kit.revision_of({"result": {"memories": []}}) is None
 
 
 def test_bundle_helpers_slice_to_the_root_files_and_the_matching_concepts():
@@ -201,7 +199,7 @@ def test_bundle_helpers_slice_to_the_root_files_and_the_matching_concepts():
     sliced = story_mod._slice_bundle(data, "zq-1-new")
     with zipfile.ZipFile(io.BytesIO(sliced)) as zf:
         assert sorted(zf.namelist()) == ["global/a.md", "index.md"]
-    assert "zq-1-new" in p2_kit.bundle_text(sliced) and "somebody" not in p2_kit.bundle_text(sliced)
+    assert "zq-1-new" in phase2_kit.bundle_text(sliced) and "somebody" not in phase2_kit.bundle_text(sliced)
 
 
 def test_step_records_do_not_keep_a_credential_secret():

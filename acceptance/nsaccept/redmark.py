@@ -10,26 +10,34 @@ machine-readable with or without the results-schema change of the coverage-closu
 * an ``EXPECTED-RED[<reason>]`` prefix on the assertion message, which the results JSON ``detail``
   already carries today.
 
-The reason names the slice and its lane in neutral words:
-``needs Phase 2 <slice name> (lane p2 <map id>)``. A scenario that passes anyway is simply a pass.
+The reason is one of a closed set of neutral slice names (``REASONS``). A scenario that passes anyway is
+simply a pass.
+
+Note: the coverage-closure PR adds its own ``nsaccept.expected_red`` in ``decor.py`` with the same marker
+name and one positional reference. Keep the two compatible; this module can then re-export that one.
 """
 
 from __future__ import annotations
 
 import functools
-import re
 from typing import Callable
 
 import pytest
 
-REASON_RE = re.compile(r"^needs Phase 2 [a-z][a-z \-]+ \(lane p2 p2-\d{2}(?:, p2-\d{2})*\)$")
+REASONS = frozenset({
+    "needs Phase 2 durable write cutover",
+    "needs Phase 2 membership and onboarding",
+    "needs Phase 2 onboarding policy",
+    "needs Phase 2 tenant cells",
+    "needs Phase 2 portable export",
+})
 TAG = "EXPECTED-RED"
 
 
 def expected_red(reason: str) -> Callable:
     """Label a scenario that stays red until the slice named in ``reason`` is on dev."""
-    if not REASON_RE.match(reason or ""):
-        raise ValueError(f"@expected_red reason must look like 'needs Phase 2 <slice> (lane p2 p2-NN)', got {reason!r}")
+    if reason not in REASONS:
+        raise ValueError(f"@expected_red reason must be one of {sorted(REASONS)}, got {reason!r}")
 
     def decorate(fn: Callable) -> Callable:
         @functools.wraps(fn)
