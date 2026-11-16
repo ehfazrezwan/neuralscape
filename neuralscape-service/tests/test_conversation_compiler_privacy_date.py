@@ -217,40 +217,48 @@ class TestMemoryStoredFlushSourceSkip:
 # ──────────────────────────────────────────────
 
 
+def _stored(category, content, visibility=None):
+    """A stored-memory row as ``MemoryService.extract_and_store`` returns it."""
+    from schemas import MemoryResponse
+
+    return MemoryResponse(
+        id=f"m-{abs(hash(content)) % 10_000}",
+        memory=content,
+        category=category,
+        visibility=visibility,
+    )
+
+
 class TestFlushSharedOnly:
     """Mixed-visibility extractions should only land shared facts in the vault."""
 
     @pytest.mark.asyncio
     async def test_only_shared_categories_reach_vault(self, writer, tmp_vault):
-        # Extraction emits one preference (private) and one decision (shared);
-        # only the decision should appear in the vault.
-        fake_response = (
-            '{"facts": ['
-            '{"type": "preference", "content": "Tabs.", "project": null, "tags": []},'
-            '{"type": "decision", "content": "Use Qdrant.", "project": null, "tags": []}'
-            "]}"
-        )
+        # The main extractor stored one preference (private) and one decision
+        # (shared); only the decision should appear in the vault.
         service = MagicMock()
-        service.store_raw = MagicMock(return_value=[MagicMock(id="m-1")])
+        service.extract_and_store = MagicMock(
+            return_value=[
+                _stored("preference", "Tabs."),
+                _stored("decision", "Use Qdrant."),
+            ]
+        )
 
-        with patch(
-            "extensions.conversation_compiler.compile._async_call_gemini",
-            new=AsyncMock(return_value=fake_response),
-        ):
-            result = await flush_conversation_turn(
-                user_message="u",
-                assistant_response="a",
-                session_id="s-1",
-                channel="api",
-                timestamp="2026-05-15T12:00:00",
-                project_id=None,
-                user_id="alice",
-                service=service,
-                writer=writer,
-            )
+        result = await flush_conversation_turn(
+            user_message="u",
+            assistant_response="a",
+            session_id="s-1",
+            channel="api",
+            timestamp="2026-05-15T12:00:00",
+            project_id=None,
+            user_id="alice",
+            service=service,
+            writer=writer,
+        )
 
-        # Both facts went to NeuralScape storage (privacy doesn't gate storage).
-        assert service.store_raw.call_count == 2
+        # Both facts are stored (privacy doesn't gate storage).
+        assert result.memories_stored == 2
+        assert result.facts_extracted == 2
         # Vault writes are gated: only the shared 'decision' fact wrote.
         assert len(result.category_paths) == 1
         decision_md = tmp_vault / "_raw" / "Episodic" / "Decisions" / "entries.md"
@@ -269,33 +277,60 @@ class TestFlushSharedOnly:
     async def test_all_private_extractions_skip_vault_entirely(
         self, writer, tmp_vault
     ):
-        fake_response = (
-            '{"facts": ['
-            '{"type": "preference", "content": "P1.", "project": null, "tags": []},'
-            '{"type": "fact", "content": "F1.", "project": null, "tags": []}'
-            "]}"
-        )
         service = MagicMock()
-        service.store_raw = MagicMock(return_value=[MagicMock(id="m-1")])
+        service.extract_and_store = MagicMock(
+            return_value=[
+                _stored("preference", "P1."),
+                _stored("personal_fact", "F1."),
+            ]
+        )
 
-        with patch(
-            "extensions.conversation_compiler.compile._async_call_gemini",
-            new=AsyncMock(return_value=fake_response),
-        ):
-            result = await flush_conversation_turn(
-                user_message="u",
-                assistant_response="a",
-                session_id="s-1",
-                channel="api",
-                timestamp="2026-05-15T12:00:00",
-                project_id=None,
-                user_id="alice",
-                service=service,
-                writer=writer,
-            )
+        result = await flush_conversation_turn(
+            user_message="u",
+            assistant_response="a",
+            session_id="s-1",
+            channel="api",
+            timestamp="2026-05-15T12:00:00",
+            project_id=None,
+            user_id="alice",
+            service=service,
+            writer=writer,
+        )
 
         # Both stored, neither in vault.
-        assert service.store_raw.call_count == 2
+        assert result.memories_stored == 2
         assert result.category_paths == []
         # No daily log either.
         assert not (tmp_vault / "_raw" / "Daily" / "2026-05-15.md").exists()
+
+    @pytest.mark.asyncio
+    async def test_stamped_visibility_wins_over_category_default(
+        self, writer, tmp_vault
+    ):
+        # A decision the sensitivity gate forced private must not reach the
+        # vault even though decisions are shared by default; a preference the
+        # store stamped shared may.
+        service = MagicMock()
+        service.extract_and_store = MagicMock(
+            return_value=[
+                _stored("decision", "Salary is 200k.", visibility="private"),
+                _stored("preference", "Dark mode.", visibility="shared"),
+            ]
+        )
+
+        result = await flush_conversation_turn(
+            user_message="u",
+            assistant_response="a",
+            session_id="s-1",
+            channel="api",
+            timestamp="2026-05-15T12:00:00",
+            project_id=None,
+            user_id="alice",
+            service=service,
+            writer=writer,
+        )
+
+        assert len(result.category_paths) == 1
+        daily_text = (tmp_vault / "_raw" / "Daily" / "2026-05-15.md").read_text()
+        assert "Dark mode." in daily_text
+        assert "Salary" not in daily_text

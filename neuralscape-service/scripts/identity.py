@@ -6,6 +6,10 @@ Commands
   list                      Show durable links (Redis) + existing memory owners.
   link  <email> <user_id>   Map an email (and/or --sub) → user_id in the store.
   unlink <email>            Remove an email (and/or --sub) mapping.
+  backfill                  Link known users (AUTH_IDENTITY_MAP and/or --file of
+                            email:user_id lines) so their ids are reserved before
+                            a colliding first login can take them. DRY-RUN by
+                            default; --apply to write.
   merge <from_id> <to_id>   Re-key all memories owned by <from_id> → <to_id>
                             across Qdrant + Neo4j. DRY-RUN by default; pass
                             --apply to actually mutate data.
@@ -172,6 +176,54 @@ def cmd_unlink(args) -> int:
     return 0 if ok else 1
 
 
+def parse_backfill_pairs(text: str) -> list[tuple[str, str]]:
+    """``email:user_id`` (or whitespace/comma separated) lines; ``#`` comments."""
+    pairs = []
+    for raw in text.splitlines():
+        line = raw.split("#", 1)[0].strip()
+        if not line:
+            continue
+        for sep in (":", ",", None):
+            parts = [x.strip() for x in line.split(sep, 1)] if sep else line.split(None, 1)
+            if len(parts) == 2 and "@" in parts[0] and parts[1]:
+                pairs.append((parts[0].lower(), parts[1]))
+                break
+        else:
+            raise ValueError(f"cannot parse backfill line: {raw!r}")
+    return pairs
+
+
+def cmd_backfill(args) -> int:
+    pairs: dict[str, str] = {}
+    if args.from_env:
+        pairs.update(settings.identity_map_dict())
+    if args.file:
+        with open(args.file, encoding="utf-8") as fh:
+            pairs.update(parse_backfill_pairs(fh.read()))
+    if not pairs:
+        print("nothing to backfill (use --from-env and/or --file)")
+        return 1
+    mode = "APPLY" if args.apply else "DRY-RUN"
+    print(f"=== backfill {len(pairs)} link(s) [{mode}] ===")
+    bad = 0
+    for email, user_id in sorted(pairs.items()):
+        existing = asyncio.run(identity_store.resolve(None, email))
+        if existing == user_id:
+            print(f"  ok       {email} -> {user_id} (already linked)")
+        elif existing:
+            print(f"  CONFLICT {email} -> store has {existing!r}, wanted {user_id!r}; left alone")
+            bad += 1
+        elif args.apply:
+            ok = asyncio.run(identity_store.link(user_id, email=email))
+            print(f"  {'linked  ' if ok else 'FAILED  '} {email} -> {user_id}")
+            bad += 0 if ok else 1
+        else:
+            print(f"  would link {email} -> {user_id}")
+    if not args.apply:
+        print("DRY-RUN only. Re-run with --apply to write.")
+    return 1 if bad else 0
+
+
 def cmd_merge(args) -> int:
     from_id, to_id = args.from_id, args.to_id
     mode = "APPLY" if args.apply else "DRY-RUN"
@@ -235,6 +287,12 @@ def main() -> int:
     p_unlink.add_argument("email", nargs="?", default=None)
     p_unlink.add_argument("--sub", default=None)
     p_unlink.set_defaults(func=cmd_unlink)
+
+    p_bf = sub.add_parser("backfill")
+    p_bf.add_argument("--from-env", action="store_true", help="use AUTH_IDENTITY_MAP")
+    p_bf.add_argument("--file", default=None, help="file of email:user_id lines")
+    p_bf.add_argument("--apply", action="store_true", help="actually write links")
+    p_bf.set_defaults(func=cmd_backfill)
 
     p_merge = sub.add_parser("merge")
     p_merge.add_argument("from_id")

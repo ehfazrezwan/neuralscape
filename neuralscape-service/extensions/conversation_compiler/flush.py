@@ -1,132 +1,77 @@
-"""Flush engine — extracts facts from conversation turns via Gemini.
+"""Flush engine: runs one conversation turn through the main extraction path.
 
-Takes a conversation turn (user message + assistant response + metadata)
-and extracts structured facts, stores them in NeuralScape, and appends
-a human-readable summary to the daily log.
+A turn (user message + assistant response + metadata) is extracted and stored
+by ``MemoryService.extract_and_store`` -- the same prompt, the same category
+set, the same speaker / ``occurred_at`` / sensitivity handling and the same
+content-hash dedup that ``remember_conversation`` uses. The facts that call
+stored are then fed to the Obsidian dual-write (category folders + daily log),
+so the vault sees exactly what the memory store holds: one extraction per turn,
+one LLM call per turn, one shape of memory.
+
+Until this module was unified it carried a private extraction prompt with its
+own type vocabulary (decision / fact / pattern / gotcha / ...) mapped onto
+categories by hand, and stored facts one by one with ``store_raw``. A turn
+could therefore yield two differently-shaped memories depending on whether it
+arrived through /flush or through remember_conversation.
 """
 
 import asyncio
-import json
-import re
 from datetime import datetime
-from typing import Optional
 
 import structlog
 
 from memory_service import MemoryService
-from schemas import MemoryVisibility, default_visibility_for_category
+from schemas import (
+    MemoryVisibility,
+    default_visibility_for_category,
+    normalize_visibility,
+    validate_occurred_at,
+)
 
-from .config import compiler_settings
 from .obsidian_writer import ObsidianWriter
 from .schemas import ExtractedFact, FlushResult
 
 logger = structlog.get_logger(__name__)
 
 
-# ──────────────────────────────────────────────
-# Extraction prompt
-# ──────────────────────────────────────────────
-
-CONVERSATION_EXTRACTION_PROMPT = """\
-You are an intelligent memory extraction engine. Analyze the conversation below and extract distinct, actionable pieces of knowledge.
-
-For each fact, assign one of these types:
-- decision — A choice made, with rationale (e.g. "Chose PostgreSQL over MySQL because...")
-- preference — User preference or style choice
-- fact — Factual information learned (personal, technical, domain)
-- pattern — Technical pattern, convention, or architecture choice
-- project — Project-specific context (tech stack, dependencies, structure)
-- gotcha — Warning, pitfall, or "watch out for" insight
-- action_item — Something the user needs to do or follow up on
-- research — Investigation, comparison, or exploration of a topic
-
-Rules:
-1. Each fact must be a standalone sentence — useful without the conversation.
-2. Be specific. "Uses Python" is too vague. "Uses Python 3.12 with FastAPI for backend services" is good.
-3. Skip greetings, acknowledgments, and transient tool operations (file reads, git commands, etc.).
-4. Skip information only meaningful in the current moment ("currently running tests").
-5. Deduplicate — don't extract the same insight twice with different wording.
-6. For decisions, always include the rationale ("chose X because Y").
-7. If a project name is identifiable, include it.
-
-Respond with a JSON object:
-{
-    "facts": [
-        {"type": "decision", "content": "...", "project": "project-name-or-null", "tags": ["tag1"]},
-        {"type": "preference", "content": "...", "project": null, "tags": []}
-    ]
-}
-
-If no meaningful facts can be extracted, return: {"facts": []}
-
-CONVERSATION:
-"""
+def _turn_messages(user_message: str, assistant_response: str) -> list[dict]:
+    """The turn as the ``[{role, content}]`` list the main extractor takes."""
+    messages = [{"role": "user", "content": user_message}]
+    if assistant_response and assistant_response.strip():
+        messages.append({"role": "assistant", "content": assistant_response})
+    return messages
 
 
-def _build_extraction_prompt(
-    user_message: str,
-    assistant_response: str,
-    channel: str = "api",
-) -> str:
-    """Build the full extraction prompt for a conversation turn."""
-    return (
-        CONVERSATION_EXTRACTION_PROMPT
-        + f"channel: {channel}\n"
-        + f"user: {user_message}\n"
-        + f"assistant: {assistant_response}\n"
-    )
+def _event_time(timestamp: str | None) -> str | None:
+    """The turn's event time for ``occurred_at``, or None when it will not validate.
 
-
-def _parse_extraction_response(response_text: str) -> list[ExtractedFact]:
-    """Parse the LLM extraction response into ExtractedFact objects."""
-    text = response_text.strip()
-
-    # Strip markdown code block wrapper
-    if text.startswith("```"):
-        text = re.sub(r"^```(?:json)?\s*", "", text)
-        text = re.sub(r"\s*```$", "", text)
-
+    A client clock a little ahead of the server (or a malformed stamp) must not
+    cost the turn its facts: an unusable timestamp means "event time unknown".
+    """
+    if not timestamp:
+        return None
     try:
-        data = json.loads(text)
-        raw_facts = data.get("facts", [])
-    except (json.JSONDecodeError, AttributeError):
-        logger.warning("Failed to parse extraction response as JSON", response=text[:200])
-        return []
-
-    facts = []
-    for item in raw_facts:
-        if not isinstance(item, dict):
-            continue
-        content = item.get("content", "").strip()
-        if not content:
-            continue
-        facts.append(
-            ExtractedFact(
-                category=item.get("type", "fact"),
-                content=content,
-                project_id=item.get("project"),
-                tags=item.get("tags", []),
-            )
-        )
-    return facts
+        return validate_occurred_at(timestamp)
+    except (ValueError, TypeError):
+        logger.warning("flush timestamp is not a usable event time; omitting occurred_at", timestamp=str(timestamp)[:40])
+        return None
 
 
-# Map our extraction types to NeuralScape memory categories
-_TYPE_TO_CATEGORY = {
-    "decision": "decision",
-    "preference": "preference",
-    "fact": "personal_fact",
-    "pattern": "convention",
-    "project": "architecture",
-    "gotcha": "domain_knowledge",
-    "action_item": "task_context",
-    "research": "domain_knowledge",
-}
+def _is_shared(memory) -> bool:
+    """Whether a stored memory may reach the shared vault.
 
-
-def _map_category(extraction_type: str) -> str:
-    """Map an extraction type to a NeuralScape memory category."""
-    return _TYPE_TO_CATEGORY.get(extraction_type, "personal_fact")
+    Uses the visibility the store stamped (which already reflects the
+    sensitivity gate); a row with no usable visibility falls back to the
+    category default, the same rule the memory_stored handler applies.
+    """
+    category = getattr(memory, "category", "") or ""
+    raw = getattr(memory, "visibility", None)
+    try:
+        normalized = normalize_visibility(raw) if raw is not None else None
+        resolved = MemoryVisibility(normalized) if normalized else default_visibility_for_category(category)
+    except (ValueError, TypeError):
+        resolved = default_visibility_for_category(category)
+    return resolved == MemoryVisibility.SHARED
 
 
 async def flush_conversation_turn(
@@ -140,22 +85,23 @@ async def flush_conversation_turn(
     service: MemoryService,
     writer: ObsidianWriter,
 ) -> FlushResult:
-    """Extract facts from a conversation turn and store them.
+    """Extract facts from a conversation turn, store them, mirror shared ones to the vault.
 
-    1. Calls Gemini to extract structured facts from the conversation.
-    2. Stores each fact in NeuralScape via MemoryService.
-    3. Appends a human-readable summary to the daily log.
+    1. ``service.extract_and_store`` runs the main extraction path on the turn
+       (one LLM call), stores the facts and returns them.
+    2. Shared facts (private ones never reach the vault) are written to the
+       category folders and the daily log, from the same stored facts.
 
     Args:
         user_message: The user's message text.
         assistant_response: The assistant's response text.
-        session_id: Session identifier for grouping.
-        channel: Channel name (e.g. 'slack', 'telegram', 'api').
+        session_id: Session identifier (the main path's ``run_id``).
+        channel: Channel name (e.g. 'slack', 'telegram', 'api'); logged only.
         timestamp: ISO timestamp of the turn (defaults to now).
         project_id: Optional project context.
         user_id: The user's ID.
-        service: MemoryService instance for storing facts.
-        writer: ObsidianWriter instance for daily log writes.
+        service: MemoryService instance used for extraction and storage.
+        writer: ObsidianWriter instance for the vault mirror.
 
     Returns:
         FlushResult with extraction details.
@@ -171,75 +117,50 @@ async def flush_conversation_turn(
         user_id=user_id,
     )
 
-    # Step 1: Call Gemini for extraction. E4: operator extraction
-    # instructions (per-project + per-user) ride along as the OPERATOR
-    # GUIDANCE addendum — same contract guard as the main extraction prompt.
-    prompt = _build_extraction_prompt(user_message, assistant_response, channel)
+    # Step 1: the main extraction path. It is synchronous (LLM call, embedding,
+    # Qdrant and graph writes), so it runs off the event loop. Operator
+    # extraction guidance (per-project + per-user) is resolved inside it, as
+    # for every other conversation write.
     try:
-        from extraction_settings import resolve_instructions
-        from prompts import append_operator_guidance
-
-        guidance = resolve_instructions(user_id, project_id)
-        if guidance:
-            prompt = append_operator_guidance(prompt, guidance)
-    except Exception:  # noqa: BLE001 — guidance is best-effort, never blocks a flush
-        logger.warning("operator-guidance resolve failed (non-fatal)", exc_info=True)
-
-    try:
-        from .compile import _async_call_gemini
-
-        response_text = await _async_call_gemini(prompt)
+        stored = await asyncio.to_thread(
+            service.extract_and_store,
+            messages=_turn_messages(user_message, assistant_response),
+            user_id=user_id,
+            project_id=project_id,
+            run_id=session_id,
+            occurred_at=_event_time(timestamp),
+        )
     except Exception:
-        logger.exception("Gemini extraction failed")
+        logger.exception("Conversation extraction failed")
         return FlushResult(session_id=session_id, timestamp=ts)
 
-    # Step 2: Parse extracted facts
-    facts = _parse_extraction_response(response_text)
-    if not facts:
+    if not stored:
         logger.info("No facts extracted from conversation turn", session_id=session_id)
         return FlushResult(session_id=session_id, timestamp=ts)
 
-    # Step 3: Store each fact in NeuralScape
-    memories_stored = 0
-    for fact in facts:
-        category = _map_category(fact.category)
-        fact_project = fact.project_id or project_id
-        scope = "project" if fact_project else "global"
-        try:
-            # store_raw is sync (embedding + vector/graph writes); run it off
-            # the event loop so the sync-fallback path cannot stall the API.
-            await asyncio.to_thread(
-                service.store_raw,
-                content=fact.content,
-                user_id=user_id,
-                category=category,
-                scope=scope,
-                project_id=fact_project,
-                tags=fact.tags or None,
-            )
-            memories_stored += 1
-        except Exception:
-            logger.exception(
-                "Failed to store extracted fact",
-                fact=fact.content[:80],
-                category=category,
-            )
+    facts = [
+        ExtractedFact(
+            category=getattr(m, "category", None) or "personal_fact",
+            content=m.memory,
+            project_id=getattr(m, "project_id", None) or project_id,
+            tags=list(getattr(m, "tags", None) or []),
+        )
+        for m in stored
+    ]
 
-    # Step 3.5: Write to category folders (dual write) — shared facts only.
+    # Step 2: vault dual write (category folders) -- shared facts only.
     # Private memories never reach the vault (multi-user privacy).
     category_paths: list[str] = []
     shared_facts: list[ExtractedFact] = []
-    for fact in facts:
-        category = _map_category(fact.category)
-        if default_visibility_for_category(category) != MemoryVisibility.SHARED:
+    for memory, fact in zip(stored, facts):
+        if not _is_shared(memory):
             continue
         shared_facts.append(fact)
-        fact_project = fact.project_id or project_id
         try:
             cat_path = writer.append_category_entry(
-                category=category,
+                category=fact.category,
                 content=fact.content,
-                project_id=fact_project,
+                project_id=fact.project_id,
                 session_id=session_id,
                 timestamp=ts,
             )
@@ -248,10 +169,11 @@ async def flush_conversation_turn(
             logger.exception(
                 "Failed to write category entry",
                 fact=fact.content[:80],
-                category=category,
+                category=fact.category,
             )
 
-    # Step 4: Append shared facts to daily log
+    # Step 3: append shared facts to the daily log. The entry category is the
+    # memory's main-taxonomy category; compile.py groups on it.
     daily_log_path: str | None = None
     if shared_facts:
         log_entries = [
@@ -260,22 +182,31 @@ async def flush_conversation_turn(
                 "category": f.category,
                 "content": f.content,
                 "session_id": session_id,
+                "user_id": user_id,
             }
             for f in shared_facts
         ]
         daily_log_path = writer.append_daily_log(date, log_entries)
 
-    # Step 4.5: Update category index
+    # Step 4: update category index
     try:
         writer.update_category_index()
     except Exception:
         logger.exception("Failed to update category index")
 
+    # Step 5: chronological log line -- what GET /status reads as "last flush".
+    try:
+        writer.append_log(
+            f"Flush {session_id}: {len(stored)} memories stored, {len(shared_facts)} to the vault"
+        )
+    except Exception:
+        logger.exception("Failed to append flush log entry")
+
     logger.info(
         "Flush complete",
         session_id=session_id,
         facts_extracted=len(facts),
-        memories_stored=memories_stored,
+        memories_stored=len(stored),
         category_paths=len(category_paths),
     )
 
@@ -286,5 +217,5 @@ async def flush_conversation_turn(
         facts=facts,
         daily_log_path=daily_log_path,
         category_paths=category_paths,
-        memories_stored=memories_stored,
+        memories_stored=len(stored),
     )

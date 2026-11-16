@@ -285,14 +285,17 @@ class TestKnowledgeConfigGate:
 
 
 @pytest.mark.asyncio
-async def test_flush_store_raw_runs_off_the_event_loop(monkeypatch):
-    from extensions.conversation_compiler import compile as compile_mod
+async def test_flush_extraction_runs_off_the_event_loop():
+    from schemas import MemoryResponse
+
     from extensions.conversation_compiler import flush as flush_mod
 
-    reply = json.dumps({"facts": [{"category": "preference", "content": "likes tea", "tags": []}]})
-    monkeypatch.setattr(compile_mod, "_async_call_gemini", AsyncMock(return_value=reply))
+    def slow_extract(**kw):
+        time.sleep(0.4)  # blocking LLM call + embed + store
+        return [MemoryResponse(id="m1", memory="likes tea", category="preference")]
+
     service = MagicMock()
-    service.store_raw.side_effect = lambda **kw: time.sleep(0.4)  # blocking embed/store
+    service.extract_and_store.side_effect = slow_extract
     writer = MagicMock()
 
     ticks = 0
@@ -310,7 +313,7 @@ async def test_flush_store_raw_runs_off_the_event_loop(monkeypatch):
     )
     t.cancel()
     assert result.memories_stored == 1
-    assert ticks >= 8, f"event loop starved while store_raw ran (ticks={ticks})"
+    assert ticks >= 8, f"event loop starved while extract_and_store ran (ticks={ticks})"
 
 
 # ── MCP schedule_dream dictator gate ────────────────────────────────────
