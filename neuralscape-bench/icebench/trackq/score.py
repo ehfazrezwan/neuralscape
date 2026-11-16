@@ -284,6 +284,28 @@ def _normalize_path(path: str) -> str:
 
 
 
+def _nl_locate_corpus_metadata(results_dir: Path, run_id: str) -> dict:
+    """
+    Record whether the indexed corpus had its docstrings stripped.
+
+    Read from the run's ``<run_id>.corpus-prep.json`` sidecar (written by the
+    runner). A run without a sidecar predates stripping: its nl_locate numbers
+    are labelled as an upper bound, never presented as clean.
+    """
+    from icebench.trackq.strip import PROTOCOL_UNKNOWN
+
+    try:
+        prep = json.loads((results_dir / f"{run_id}.corpus-prep.json").read_text())
+    except (OSError, ValueError):
+        return {"docstrings_stripped": None, "protocol": PROTOCOL_UNKNOWN}
+    return {
+        "docstrings_stripped": prep.get("strip_docstrings"),
+        "protocol": prep.get("nl_locate_protocol", PROTOCOL_UNKNOWN),
+        "languages_covered": prep.get("languages_covered", []),
+        "corpora": prep.get("corpora", []),
+    }
+
+
 def score_results(run_id: str, results_dir: Path) -> int:
     """
     Score Track-Q results for a run.
@@ -406,6 +428,7 @@ def score_results(run_id: str, results_dir: Path) -> int:
         "nl_locate_min_samples": NL_LOCATE_MIN_SAMPLES,
         "undersized_nl_locate": undersized_nl_locate,
         "sample_sizes": sample_sizes,
+        "nl_locate_corpus": _nl_locate_corpus_metadata(results_dir, run_id),
     }
 
     report = ScoreReport(scores=scores, metadata=metadata)
