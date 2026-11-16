@@ -37,8 +37,8 @@ def _fake_run(calls, rc=0):
 
 def test_compose_runs_docker_compose_with_the_project():
     calls = []
-    _ctx("nscampaign").compose("pause", "qdrant", run=_fake_run(calls))
-    assert calls == [["docker", "compose", "-p", "nscampaign", "pause", "qdrant"]]
+    _ctx("nstest-acceptance").compose("pause", "qdrant", run=_fake_run(calls))
+    assert calls == [["docker", "compose", "-p", "nstest-acceptance", "pause", "qdrant"]]
 
 
 def test_compose_needs_a_project():
@@ -58,14 +58,14 @@ def test_compose_refuses_the_production_project(project):
 def test_compose_only_lets_lifecycle_verbs_through(verb):
     calls = []
     with pytest.raises(runctx.ConfigError):
-        _ctx("nscampaign").compose(verb, run=_fake_run(calls))
+        _ctx("nstest-acceptance").compose(verb, run=_fake_run(calls))
     assert calls == []
 
 
 def test_compose_raises_on_failure_unless_unchecked():
     with pytest.raises(RuntimeError, match="exited 1"):
-        _ctx("nscampaign").compose("start", "qdrant", run=_fake_run([], rc=1))
-    assert _ctx("nscampaign").compose("start", "qdrant", check=False, run=_fake_run([], rc=1)).returncode == 1
+        _ctx("nstest-acceptance").compose("start", "qdrant", run=_fake_run([], rc=1))
+    assert _ctx("nstest-acceptance").compose("start", "qdrant", check=False, run=_fake_run([], rc=1)).returncode == 1
 
 
 def test_compose_capability_follows_the_flag(monkeypatch):
@@ -268,12 +268,12 @@ def test_rows_with_and_blob_has():
 
 def test_compose_up_only_starts_existing_containers():
     calls = []
-    ctx = _ctx("nscampaign")
+    ctx = _ctx("nstest-acceptance")
     for bad in (["up", "-d", "svc"], ["up", "svc"], ["up", "-d", "--no-build", "svc"]):
         with pytest.raises(runctx.ConfigError):
             ctx.compose(*bad, run=_fake_run(calls))
     ctx.compose("up", "-d", "--no-build", "--no-recreate", "neuralscape", run=_fake_run(calls))
-    assert calls[-1][:4] == ["docker", "compose", "-p", "nscampaign"] and len(calls) == 1
+    assert calls[-1][:4] == ["docker", "compose", "-p", "nstest-acceptance"] and len(calls) == 1
 
 
 def test_parse_ps_json_accepts_array_and_json_lines():
@@ -301,17 +301,17 @@ def test_in_container_minting_never_passes_a_secret_and_refuses_production():
         seen.append(cmd)
         return subprocess.CompletedProcess(cmd, 0, "aaaaaaaaaaaaaaaaaaaa.bbbbbbbbbbbbbbbbbbbb\n", "")
 
-    tok = tokens.mint_via_compose_python("nscampaign", "u1", -60, "api", run=run)
+    tok = tokens.mint_via_compose_python("nstest-acceptance", "u1", -60, "api", run=run)
     assert tok == "aaaaaaaaaaaaaaaaaaaa.bbbbbbbbbbbbbbbbbbbb"
     cmd = seen[0]
-    assert cmd[:7] == ["docker", "compose", "-p", "nscampaign", "exec", "-T", "api"] and cmd[-2:] == ["u1", "-60"]
+    assert cmd[:7] == ["docker", "compose", "-p", "nstest-acceptance", "exec", "-T", "api"] and cmd[-2:] == ["u1", "-60"]
     assert "NEURALSCAPE_USER_TOKEN_SECRET" in cmd[9] and "print(issue_user_token" in cmd[9]
     with pytest.raises(tokens.TokenError):
         tokens.mint_via_compose_python("neuralscape", "u1", -60, run=run)
 
 
 def test_compose_exec_and_up_are_restricted_to_what_the_scenarios_use():
-    ctx, calls = _ctx("nscampaign"), []
+    ctx, calls = _ctx("nstest-acceptance"), []
     ok = _fake_run(calls)
     ctx.compose("exec", "-T", "qdrant", "sh", "-c", "curl x", run=ok)
     for bad in (("exec", "-T", "neuralscape", "sh", "-c", "x"), ("exec", "-T", "qdrant", "bash"),
