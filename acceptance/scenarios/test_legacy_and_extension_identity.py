@@ -50,6 +50,13 @@ def check_gone(client: NSClient, marker: str) -> None:
 
 
 def check_episode_present(client: NSClient, marker: str) -> None:
+    """The write's graph enrichment finished: the episode holding its transcript is listed.
+
+    A conversation write stores ONE graph episode for the whole exchange, whose body is the raw transcript
+    (carrying the marker), not the extracted facts; every memory the write stored shares it. No memory text
+    or id appears in the episode listing, and the memory rows the API returns carry no episode reference, so
+    this is a wait on the marker episode, not a per-memory check.
+    """
     episodes = [e for e in graph_listing(client, "episodes") if marker in (e.get("content") or "")]
     assert episodes, f"no graph episode carries {marker}"
 
@@ -102,7 +109,7 @@ def legacy(ctx, c) -> dict:
         {"role": "user", "content": f"For the record, my favourite tea blend is called {marker} and I always drink it in the morning. Please remember my preference."},
         {"role": "assistant", "content": f"Noted: your favourite morning tea blend is {marker}."},
     ]
-    out: dict = {"marker": marker, "error": "", "texts": []}
+    out: dict = {"marker": marker, "error": "", "texts": [], "memories": []}
     try:
         r = c.post("/memories", json={"messages": messages}, timeout=300)
         assert r.status_code == 200, f"POST /memories -> {r.status_code}: {r.text[:200]}"
@@ -110,6 +117,7 @@ def legacy(ctx, c) -> dict:
         assert body.get("status") == "ok", f"legacy add answered {str(body)[:200]}"
         stored = (body.get("result") or {}).get("memories", [])
         out["texts"] = [m.get("memory", "") for m in stored]
+        out["memories"] = stored
         out["visibilities"] = {m.get("visibility") for m in stored if marker in m.get("memory", "")}
     except AssertionError as exc:
         out["error"] = str(exc)
@@ -137,6 +145,7 @@ def test_recall_and_gone_checks_fail_where_they_should(ctx, a, c):
     eventually(lambda: check_recalls(c, marker), timeout=90, what="control write recalled")
     expect_check_fails(check_recalls, a, marker)  # A cannot see the third identity's memory
     expect_check_fails(check_gone, c, marker)  # and the "deleted" check cannot pass while it exists
+    expect_check_fails(check_episode_present, c, f"{marker}-never-written")  # a marker no episode carries is not "enriched"
 
 
 @proves("delete.legacy-passthrough")
@@ -151,7 +160,11 @@ def test_legacy_delete_naming_another_user_is_refused_and_touches_nothing(ctx, a
 def test_legacy_delete_removes_the_callers_memories_and_graph_facts_and_nobody_elses(ctx, a, c, legacy, a_fact):
     assert not legacy["error"], legacy["error"]
     assert a_fact.visible_to_a, "precondition: A's fact never became searchable"
-    eventually(lambda: check_episode_present(c, legacy["marker"]), timeout=180, interval=5, what="graph episode before the delete")
+    # Deleting before the write's graph enrichment finished leaves the delete's graph cascade nothing to
+    # resolve, so wait until the write's (single, shared) conversation episode is listed. The API exposes no
+    # per-memory episode reference, so this cannot be narrowed to each memory.
+    assert legacy["memories"], "the write produced no memories"
+    eventually(lambda: check_episode_present(c, legacy["marker"]), timeout=180, interval=5, what="the write's graph episode before the delete")
     r = c.delete("/memories", timeout=300)
     assert r.status_code == 200, f"DELETE /memories -> {r.status_code}: {r.text[:200]}"
     assert r.json().get("status") == "ok", f"legacy delete answered {str(r.json())[:200]}"

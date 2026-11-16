@@ -81,7 +81,39 @@ PROBES: list[tuple[str, str, dict]] = [
     ("POST", "/v1/extensions/conversation-compiler/query", {"json": {"__probe": True}}),
     ("POST", "/v1/extensions/conversation-compiler/lint", {"json": {"structural_only": "not-a-bool"}}),
     ("GET", "/v1/extensions/conversation-compiler/status", {}),
+    # Scoped credentials / service accounts: off unless CREDENTIALS_ENABLED (and policy enforcement).
+    # Bodies are invalid (422) or the feature answers its own 404 "Not found" (lower-case f), so
+    # nothing is ever issued, revoked, rotated or disabled.
+    ("POST", "/v1/credentials", {"json": {"__probe": True}}),
+    ("POST", "/v1/credentials/refresh", {"json": {"__probe": True}}),
+    ("POST", "/v1/credentials/revoke", {"json": {"__probe": True}}),
+    ("POST", "/v1/service-accounts", {"json": {"__probe": True}}),
+    ("POST", "/v1/service-accounts/{rand}/credentials", {"json": {"__probe": True}}),
+    ("POST", "/v1/service-accounts/{rand}/disable", {}),
+    # Engine switch: admin-only and off unless ENGINE_ROUTING_ENABLED. See FLAG_GATED_STATUSES.
+    ("GET", "/v1/admin/engine-switch/status", {}),
+    ("POST", "/v1/admin/engine-switch/start-dual-write", {}),
+    ("POST", "/v1/admin/engine-switch/catch-up", {}),
+    ("POST", "/v1/admin/engine-switch/flip", {}),
+    ("POST", "/v1/admin/engine-switch/rollback", {}),
+    ("POST", "/v1/admin/engine-switch/abandon", {}),
 ]
+
+# With routing off the engine-switch routes answer FastAPI's own-looking 404 "Not Found" to every
+# caller on purpose (so the probe's "route not mounted" test cannot tell them apart); with routing on
+# a non-admin caller gets 403. These probes are called by the (non-admin) second user, so exactly
+# these two statuses are the route being present; 405, 5xx, 200 or anything else is a failure.
+FLAG_GATED_STATUSES: dict[tuple[str, str], frozenset[int]] = {
+    (m, p): frozenset({403, 404})
+    for m, p in [
+        ("GET", "/v1/admin/engine-switch/status"),
+        ("POST", "/v1/admin/engine-switch/start-dual-write"),
+        ("POST", "/v1/admin/engine-switch/catch-up"),
+        ("POST", "/v1/admin/engine-switch/flip"),
+        ("POST", "/v1/admin/engine-switch/rollback"),
+        ("POST", "/v1/admin/engine-switch/abandon"),
+    ]
+}
 
 # Routes the sweep deliberately does not call, and where they ARE exercised.
 COVERED_ELSEWHERE: dict[tuple[str, str], str] = {

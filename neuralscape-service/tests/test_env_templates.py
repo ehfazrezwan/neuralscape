@@ -146,7 +146,7 @@ def _owned_by_an_extension(key: str) -> bool:
 def test_every_template_key_is_a_setting_or_listed_as_compose_only(template):
     import config
 
-    fields = {name.upper() for name in config.Settings.model_fields}
+    fields = config.settings_env_names()
     unexplained = [k for k in _template_keys(template)
                    if k not in fields and k not in config.COMPOSE_ONLY_KEYS and k not in config.VENDORED_ENV_KEYS and not _owned_by_an_extension(k)]
     assert not unexplained, f"{template.name}: not a setting and not listed as Compose-only: {unexplained}"

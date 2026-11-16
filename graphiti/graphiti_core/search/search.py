@@ -109,6 +109,12 @@ async def search(
     start = time()
     validate_group_ids(group_ids)
 
+    # NEURALSCAPE PATCH (re-apply after upstream subtree syncs): an explicit
+    # empty group list (``[]`` or ``['']``) returns empty results and runs no
+    # query. ``None`` keeps its meaning (no group filter), as before.
+    if group_ids is not None and (len(group_ids) == 0 or group_ids == ['']):
+        return SearchResults()
+
     driver = driver or clients.driver
     embedder = clients.embedder
     cross_encoder = clients.cross_encoder

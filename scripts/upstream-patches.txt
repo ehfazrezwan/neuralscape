@@ -26,7 +26,9 @@ patched graphiti/graphiti_core/embedder/gemini.py
 patched graphiti/graphiti_core/graphiti.py
 patched graphiti/graphiti_core/llm_client/config.py
 patched graphiti/graphiti_core/llm_client/gemini_client.py
+patched graphiti/graphiti_core/search/search.py
 patched graphiti/graphiti_core/utils/maintenance/edge_operations.py
+patched graphiti/graphiti_core/utils/maintenance/graph_data_operations.py
 patched graphiti/graphiti_core/utils/maintenance/node_operations.py
 
 # --- graphiti (owned: NS-only, not upstream) ---

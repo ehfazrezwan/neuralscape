@@ -19,7 +19,7 @@ Both counts include CI, bot and dependency-bump commits; they say "how stale", n
 
 ### 2.1 graphiti: small, fully marked
 
-`git diff 9cb6dc1b:graphiti_core HEAD:graphiti/graphiti_core` (`9cb6dc1b` is the squash of upstream `feafc422`, the last Graphiti sync) touched **9 files** (8 patched, 1 NS-owned) once the fork-marker change (PR #475) landed; `scripts/upstream-patches.txt` is the authoritative patched-file list (a test re-derives the graphiti set from this diff) and supersedes this table:
+`git diff 9cb6dc1b:graphiti_core HEAD:graphiti/graphiti_core` (`9cb6dc1b` is the squash of upstream `feafc422`, the last Graphiti sync) touched **11 files** (10 patched, 1 NS-owned) once the fork-marker change (PR #475) landed; `scripts/upstream-patches.txt` is the authoritative patched-file list (a test re-derives the graphiti set from this diff) and supersedes this table:
 
 | File | What the delta does | Marker |
 |---|---|---|
@@ -30,6 +30,8 @@ Both counts include CI, bot and dependency-bump commits; they say "how stale", n
 | `graphiti_core/llm_client/hybrid_decision_client.py` | NS-only hybrid decision client (not upstream; listed `owned` in the manifest) | n/a |
 | `graphiti_core/graphiti.py` | `add_episode(update_communities=True)` flattens the per-node `(communities, edges)` results instead of unpacking N pairs into two names (upstream raised `ValueError` after the episode was stored unless exactly two entities resolved) | `NEURALSCAPE PATCH` |
 | `graphiti_core/driver/neo4j_driver.py` | `kwargs.setdefault('database_', ...)` so queries run on the configured database (upstream put it in `params`) | `NEURALSCAPE PATCH` |
+| `graphiti_core/search/search.py` | `search()` returns empty results, and runs no query, for an empty group list (`[]` or `['']`); `None` keeps its meaning (no group filter). Upstream treated `['']` like `None`, so a caller on Graphiti's default `''` group sees empty results from this entry point; NS never uses the `''` group | `NEURALSCAPE PATCH` |
+| `graphiti_core/utils/maintenance/graph_data_operations.py` | `retrieve_episodes()` returns no episodes for an empty group list; `None` keeps its meaning (no group filter) | `NEURALSCAPE PATCH` |
 
 The saga lifecycle, `reference_time` edge field, extraction/dedup prompt patches and `summarize_sagas.py` that the 2026-06-22 edition listed are **not in the tree**: the April sync took upstream's own implementations, and the diff above proves it. There is no saga or prompt conflict cluster to resolve on a sync. `graphiti/` is pruned to `graphiti_core` plus packaging (`d3978abe`, 2026-07-05).
 

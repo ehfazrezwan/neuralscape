@@ -18,6 +18,7 @@ not rewritten), so repeated sweeps produce zero churn.
 from __future__ import annotations
 
 import logging
+import re
 from pathlib import Path
 
 from okf import translate
@@ -35,15 +36,29 @@ _DIR_DESCRIPTIONS = {
 }
 
 
+#: Dream-diary pages are named ``<slug>--<32-hex sha256 of the pool id>.md``.
+#: The pre-fix names never contain ``--`` (the slugifier collapses hyphen
+#: runs), so a ``Dreams/*.md`` file without this tail is a pre-fix file.
+_DIARY_DIGEST_RE = re.compile(r"--[0-9a-f]{32}\.md$")
+
+LEGACY_DIARY_HEADING = (
+    "Pre-fix diary files (may hold entries from pools whose names collided)"
+)
+
+
 def _href(name: str) -> str:
     return name.replace(" ", "%20")
 
 
-def _concept_entries(directory: Path, *, skip_stems: tuple[str, ...] = ()) -> list[str]:
+def _concept_entries(
+    directory: Path, *, skip_stems: tuple[str, ...] = (), keep=None
+) -> list[str]:
     """§6 index bullets for the concept documents directly in ``directory``."""
     entries: list[str] = []
     for path in sorted(directory.glob("*.md")):
         if translate.is_reserved_filename(path.name) or path.stem in skip_stems:
+            continue
+        if keep is not None and not keep(path.name):
             continue
         try:
             fm, _ = translate.parse_document(path.read_text(encoding="utf-8"))
@@ -93,10 +108,18 @@ def refresh_bundle_indexes(vault: Path) -> dict:
     for directory, label in leaf_dirs:
         if not directory.exists():
             continue
-        entries = _concept_entries(directory)
-        if not entries:
+        if label == "Dreams":
+            entries = _concept_entries(directory, keep=lambda n: _DIARY_DIGEST_RE.search(n))
+            legacy = _concept_entries(directory, keep=lambda n: not _DIARY_DIGEST_RE.search(n))
+            sections = [(label, entries)] if entries else []
+            if legacy:
+                sections.append((LEGACY_DIARY_HEADING, legacy))
+        else:
+            entries = _concept_entries(directory)
+            sections = [(label, entries)] if entries else []
+        if not sections:
             continue
-        content = translate.render_index([(label, entries)])
+        content = translate.render_index(sections)
         _write_if_changed(directory / translate.INDEX_FILENAME, content, _atomic_write, out)
 
     # ── Projects/ index: one bullet per project hub ──

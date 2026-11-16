@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
@@ -33,6 +34,32 @@ from schemas import (
 )
 
 logger = logging.getLogger(__name__)
+
+#: Caps on the failure report that leaves the process (task status, REST/MCP
+#: results). Raw exception text can carry store URLs, credentials and document
+#: content, so only a class name + a fixed per-kind message is ever returned;
+#: the raw text goes to the server log only.
+MAX_STORE_ERRORS = 5
+MAX_STORE_ERROR_CHARS = 120
+MAX_STORE_ERRORS_TOTAL_CHARS = 500
+_FIXED_MESSAGES = {
+    "passage": "passage store failed",
+    "fact": "fact store failed",
+    "concept": "concept ingest failed",
+}
+
+
+def sanitized_error(exc: BaseException, kind: str) -> str:
+    """``ClassName: <fixed message for kind>`` -- no exception text, bounded."""
+    name = re.sub(r"[^A-Za-z0-9_]", "", type(exc).__name__)[:60] or "Error"  # ASCII only
+    return f"{name}: {_FIXED_MESSAGES.get(kind, 'store failed')}"[:MAX_STORE_ERROR_CHARS]
+
+
+def _record_store_error(errors: list[str], exc: BaseException, kind: str) -> None:
+    """Append a sanitised entry, honouring the entry-count and total-length caps."""
+    entry = sanitized_error(exc, kind)
+    if len(errors) < MAX_STORE_ERRORS and sum(map(len, errors)) + len(entry) <= MAX_STORE_ERRORS_TOTAL_CHARS:
+        errors.append(entry)
 
 
 @dataclass
@@ -149,6 +176,11 @@ def ingest_document(service, doc: IngestDoc) -> dict:
     base["parent_id"] = parent_id
 
     memory_ids: list[str] = []
+    # Store failures are tolerated (one bad chunk must not abort a book) but
+    # never silent: they are returned so callers can report an incomplete ingest.
+    store_errors: list[str] = []  # sanitised + capped; see _record_store_error
+    stores_failed = 0  # true count of failed store calls (store_errors is capped)
+    store_ok = 0  # successful store calls (passages + facts), for failure reports
     passage_count = 0
     fact_count = 0
     # M1 (ingest lifecycle): sum of the token cost of everything we STORE
@@ -197,11 +229,14 @@ def ingest_document(service, doc: IngestDoc) -> dict:
                     add_to_graph=False,
                 )
                 memory_ids.extend(m.id for m in stored)
+                store_ok += 1
                 passage_count += len(stored)
                 if meter_on:
                     served_tok += _served_tokens(stored)
             except Exception as e:
                 logger.warning(f"Passage store failed (chunk {chunk.index}): {e}")
+                stores_failed += 1
+                _record_store_error(store_errors, e, "passage")
 
     # ── Facts (LLM-distilled, graph-linked) ──
     # Facts are stored vector-only here (fast), with graph enrichment DEFERRED:
@@ -267,6 +302,7 @@ def ingest_document(service, doc: IngestDoc) -> dict:
                        if (category, content) in category_evidence else {}),
                 )
                 memory_ids.extend(m.id for m in stored)
+                store_ok += 1
                 fact_count += len(stored)
                 if meter_on:
                     served_tok += _served_tokens(stored)
@@ -282,6 +318,8 @@ def ingest_document(service, doc: IngestDoc) -> dict:
                         })
             except Exception as e:
                 logger.warning(f"Fact store failed ({category}): {e}")
+                stores_failed += 1
+                _record_store_error(store_errors, e, "fact")
 
     logger.info(
         f"Ingested doc parent_id={parent_id} → {passage_count} passages + {fact_count} facts "
@@ -309,6 +347,11 @@ def ingest_document(service, doc: IngestDoc) -> dict:
         "facts": fact_count,
         "memory_ids": memory_ids,
         "parent_id": parent_id,
+        # "ClassName: <fixed message>" per failed store call (empty = clean),
+        # capped; never carries exception text. stores_failed is the full count.
+        "store_errors": store_errors,
+        "stores_failed": stores_failed,
+        "stores_succeeded": store_ok,
         # Deferred graph-enrichment payloads + the adapter whose ontology applies.
         # Callers (the ingest worker) enqueue these onto the graph queue and then
         # drop the key from any client-facing result.

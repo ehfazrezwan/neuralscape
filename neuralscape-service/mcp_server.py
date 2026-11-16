@@ -830,8 +830,8 @@ async def list_tools() -> list[Tool]:
                 "cannot be recovered. Can delete a single memory by ID, or bulk delete by "
                 "scope, category, or project_id. Bulk deletes only remove the caller's "
                 "PRIVATE memories by default; shared (team) memories the caller authored "
-                "are preserved. Set include_shared=true to also remove shared writes "
-                "(rarely correct — confirm with the user first)."
+                "are preserved. include_shared=true also deletes the caller's OWN shared "
+                "rows (never others', never standard; confirm with the user first)."
             ),
             inputSchema={
                 "type": "object",
@@ -864,10 +864,9 @@ async def list_tools() -> list[Tool]:
                     "include_shared": {
                         "type": "boolean",
                         "description": (
-                            "When True, also remove the caller's shared (team) "
-                            "writes. Default False — shared memories are team "
-                            "artifacts and one user's bulk delete shouldn't wipe "
-                            "them. Confirm with the user before enabling."
+                            "When True, also delete the caller's OWN shared rows "
+                            "(never another user's, never standard). Default "
+                            "False. Confirm with the user before enabling."
                         ),
                     },
                 },
@@ -2198,8 +2197,8 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
             return [TextContent(type="text", text=json.dumps(output, default=str))]
 
         elif name == "list_projects":
-            projects = await asyncio.to_thread(_service.list_projects, user_id=user_id)
-            return [TextContent(type="text", text=json.dumps({"projects": projects}, default=str))]
+            out = await asyncio.to_thread(_service.list_projects_status, user_id=user_id)
+            return [TextContent(type="text", text=json.dumps(out, default=str))]
 
         elif name == "list_processes":
             processes = await asyncio.to_thread(
