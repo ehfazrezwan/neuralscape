@@ -736,6 +736,12 @@ class TestMalformedId:
         with pytest.raises(LookupError):
             w.svc.delete_memory("not-a-uuid", OWNER)
 
+    def test_wellformed_missing_id_is_lookup_error_not_a_store_call(self, world):
+        w = world
+        with pytest.raises(LookupError):
+            w.svc.delete_memory(rid(999), OWNER)
+        w.svc._memory.delete.assert_not_called()  # nothing was sent to the store
+
     def test_wellformed_id_store_failure_still_propagates(self, world):
         w = world
         w.svc._memory.get.side_effect = ConnectionError("qdrant down")
@@ -869,6 +875,14 @@ class TestRestSurface:
         world.svc._memory.get.side_effect = ValueError("Point id is not a valid UUID")
         assert rest.client.delete("/v1/memories/not-a-uuid").status_code == 404
 
+    def test_unknown_wellformed_id_is_404_not_500(self, world, rest):
+        resp = rest.client.delete(f"/v1/memories/{rid(999)}")
+        assert resp.status_code == 404, resp.text
+
+    def test_wellformed_id_store_failure_is_still_500(self, world, rest):
+        world.svc._memory.get.side_effect = ConnectionError("qdrant down")
+        assert rest.client.delete(f"/v1/memories/{rid(1)}").status_code == 500
+
     def test_other_users_rows_untouched(self, world, rest):
         conv = seed_conversation(world, n=3)
         bob = seed_conversation(world, n=3, tag="cb", user=OTHER, start=80)
@@ -918,6 +932,15 @@ class TestMcpSurface:
         assert data["graph"] == "migration_queued"
         assert data["sibling_graph_jobs_enqueued"] == 3
         assert _enqueued_ids(mcp.tm) == sorted(conv.ids)
+
+    @pytest.mark.asyncio
+    async def test_unknown_wellformed_id_returns_not_found_error(self, world, mcp):
+        import json
+
+        out = await mcp_server.call_tool(
+            "delete_memories", {"user_id": OWNER, "memory_id": rid(999)}
+        )
+        assert "not found" in json.loads(out[0].text)["error"].lower()
 
     @pytest.mark.asyncio
     async def test_malformed_id_returns_error_not_crash(self, world, mcp):

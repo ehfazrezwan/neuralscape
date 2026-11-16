@@ -3296,6 +3296,8 @@ async def v1_delete_episode(
             user_id=resolved_user_id,
             project_id=project_id,
         )
+        if result.get("not_found"):
+            raise HTTPException(status_code=404, detail=result["error"])
         if "error" in result:
             raise HTTPException(status_code=500, detail=result["error"])
         return {"status": "ok", **result}
