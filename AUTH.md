@@ -254,6 +254,29 @@ then POSTs the session JWT to `POST /oauth/supabase/callback`, which verifies it
 and continues the MCP flow. The start and finish pages **must be same-origin**
 (both under `NEURALSCAPE_PUBLIC_URL`) for the PKCE exchange to work.
 
+### Login binding (Google and Supabase)
+
+The signed `login_state` that carries the authorize request across the IdP
+redirect is bound to the browser that started the login, so a state URL built by
+someone else cannot be completed in a victim's browser (login CSRF).
+
+- `GET /oauth/authorize` sets a cookie `ns_login_bind` (HttpOnly, `Secure` when
+  `NEURALSCAPE_PUBLIC_URL` is https, `SameSite=Lax`, `Path=/oauth`, 10 minutes).
+  Its signed value holds the same nonce as the `login_state`.
+- The callback (`GET /oauth/google/callback`, `POST /oauth/supabase/callback`)
+  requires the cookie, a valid signature and expiry, and
+  `state.nonce == cookie.nonce`. The nonce is then claimed once in Redis
+  (`oauth:login_nonce:<nonce>`, SET NX EX 600). A missing, mismatched, tampered,
+  expired or replayed binding answers 4xx with a "Sign-in failed" page and issues
+  no code. If Redis is down the callback answers 503 and issues nothing (fail
+  closed); the cookie is kept so the user can retry.
+- `SameSite=Lax` is sufficient: Google returns by a top-level GET, and the
+  Supabase finisher POSTs from this origin. `Strict` would drop the cookie on the
+  cross-site GET.
+- Users must finish the login in the same browser that started it, with cookies
+  enabled. Starting a second login in another tab replaces the cookie, so only
+  the most recent tab can finish.
+
 ---
 
 ## Endpoint reference

@@ -58,12 +58,17 @@ from login_providers import (
     AuthorizeContext,
     GoogleProvider,
     IdentityStoreUnavailable,
+    LOGIN_BINDING_COOKIE,
+    LOGIN_BINDING_COOKIE_PATH,
+    LOGIN_BINDING_MAX_AGE,
     LoginError,
     LoginNeedsLink,
     SupabaseProvider,
     _supabase_finish_page,
     get_login_provider,
+    new_login_nonce,
     provision_user_id,
+    sign_login_binding,
     sign_link_ticket,
     verify_link_ticket,
 )
@@ -453,6 +458,41 @@ def _render_consent(
     return _html_response(page, status_code)
 
 
+def _cookie_secure() -> bool:
+    """Secure cookie whenever the public URL is https (always, in production)."""
+    return _base_url().lower().startswith("https://")
+
+
+def _set_login_binding_cookie(response, nonce: str) -> None:
+    """Bind the login about to start to this browser.
+
+    HttpOnly (no script reads it), Secure on https, SameSite=Lax: the IdP
+    returns with a top-level GET (Google, and Supabase's redirect), and the
+    Supabase finisher then POSTs from our own origin, so Lax is sent on both;
+    Strict would drop it on the cross-site GET. Scoped to /oauth, expires with
+    the login state.
+    """
+    response.set_cookie(
+        LOGIN_BINDING_COOKIE,
+        sign_login_binding(nonce, _secret()),
+        max_age=LOGIN_BINDING_MAX_AGE,
+        path=LOGIN_BINDING_COOKIE_PATH,
+        secure=_cookie_secure(),
+        httponly=True,
+        samesite="lax",
+    )
+
+
+def _clear_login_binding_cookie(response) -> None:
+    response.delete_cookie(
+        LOGIN_BINDING_COOKIE,
+        path=LOGIN_BINDING_COOKIE_PATH,
+        secure=_cookie_secure(),
+        httponly=True,
+        samesite="lax",
+    )
+
+
 @router.get("/oauth/authorize", response_model=None)
 async def authorize(request: Request) -> HTMLResponse | JSONResponse:
     """Validate the authorize request, then hand the human-login step to the
@@ -503,11 +543,15 @@ async def authorize(request: Request) -> HTMLResponse | JSONResponse:
         code_challenge_method=code_challenge_method,
         resource=resource,
     )
-    provider_block = get_login_provider().consent_block(ctx)
+    provider = get_login_provider()
+    # The login_state in the provider's button carries this nonce; the cookie
+    # set below proves the callback comes back to the browser that started it.
+    nonce = new_login_nonce()
+    provider_block = provider.consent_block(ctx, nonce=nonce)
     # The token-paste box always shows in token mode; under a federated provider
     # it shows unless the deployer turned it off.
     show_token_form = settings.auth_provider == "token" or settings.auth_allow_token_paste
-    return _render_consent(
+    response = _render_consent(
         client_id=client_id,
         redirect_uri=redirect_uri,
         state=state,
@@ -517,6 +561,9 @@ async def authorize(request: Request) -> HTMLResponse | JSONResponse:
         provider_block=provider_block,
         show_token_form=show_token_form,
     )
+    if provider.name != "token":
+        _set_login_binding_cookie(response, nonce)
+    return response
 
 
 @router.post("/oauth/authorize", response_model=None)
@@ -698,6 +745,15 @@ async def _finish_login(result) -> HTMLResponse | RedirectResponse:
     return _issue_code_and_redirect(result.ctx, result.user_id)
 
 
+async def _finish_bound_login(result) -> HTMLResponse | RedirectResponse:
+    """``_finish_login`` for the IdP callbacks: the login binding cookie is spent
+    once the callback has been handled, unless it was refused or must be retried."""
+    response = await _finish_login(result)
+    if not (isinstance(result, LoginError) and result.keep_cookie):
+        _clear_login_binding_cookie(response)
+    return response
+
+
 # ── federated login callbacks (google / supabase) ────────────────────────
 
 
@@ -709,7 +765,7 @@ async def google_callback(request: Request) -> RedirectResponse | HTMLResponse |
         return _not_configured()
     if settings.auth_provider != "google":
         return JSONResponse(status_code=404, content={"detail": "google login not enabled"})
-    return await _finish_login(await GoogleProvider().complete(request))
+    return await _finish_bound_login(await GoogleProvider().complete(request))
 
 
 @router.get("/oauth/supabase/callback", response_model=None)
@@ -730,7 +786,7 @@ async def supabase_callback_post(request: Request) -> RedirectResponse | HTMLRes
         return _not_configured()
     if settings.auth_provider != "supabase":
         return JSONResponse(status_code=404, content={"detail": "supabase login not enabled"})
-    return await _finish_login(await SupabaseProvider().complete(request))
+    return await _finish_bound_login(await SupabaseProvider().complete(request))
 
 
 @router.post("/oauth/link", response_model=None)
