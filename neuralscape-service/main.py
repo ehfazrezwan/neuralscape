@@ -38,7 +38,7 @@ from extensions import ExtensionRegistry
 from extensions.events import EventType, EVENT_PAYLOAD_MODELS
 from logging_config import REQUEST_ID_HEADER, RequestIdMiddleware, configure_logging, request_id_of
 from memory.delete import MemoryListingFailed
-from memory.edit import EditBusy, EditLockUnavailable, RevisionConflict
+from memory.edit import RevisionConflict
 from memory_service import get_shared_service
 
 # Configure structured logging before anything else
@@ -3087,10 +3087,6 @@ async def v1_patch_memory(memory_id: str, req: PatchMemoryRequest, request: Requ
                 "current_revision": rc.current_revision,
             },
         ) from rc
-    except EditBusy as eb:
-        raise HTTPException(status_code=409, detail={"error": "edit_busy", "message": str(eb)}) from eb
-    except EditLockUnavailable as eu:
-        raise HTTPException(status_code=503, detail=str(eu)) from eu
     except LookupError as e:
         raise HTTPException(status_code=404, detail=str(e)) from e
     except PermissionError as pe:
