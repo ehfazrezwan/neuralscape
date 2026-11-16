@@ -143,7 +143,7 @@ class Settings(BaseSettings):
     # built (its own extraction/compile clients and mem0's Gemini LLM/embedder; graphiti's clients
     # keep their own 60 s). Without it an endpoint that accepts the connection and never answers
     # blocks the calling request or worker job indefinitely.
-    gemini_request_timeout_s: float = Field(default=120.0, gt=0)
+    gemini_request_timeout_s: float = Field(default=120.0, gt=0, allow_inf_nan=False)
     # Dimension of the embeddings Graphiti stores on Entity.name_embedding and
     # RELATES_TO.fact_embedding (env GRAPHITI_EMBEDDING_DIM). Passed explicitly
     # to the Graphiti embedder instead of relying on the ambient EMBEDDING_DIM

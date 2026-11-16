@@ -50,6 +50,16 @@ def test_rejects_zero_and_negative(bad, monkeypatch):
         _settings()
 
 
+@pytest.mark.parametrize("bad", ["inf", "-inf", "nan", "Infinity"])
+def test_rejects_non_finite_values_at_settings_load(bad, monkeypatch):
+    monkeypatch.setenv("GEMINI_REQUEST_TIMEOUT_S", bad)
+    with pytest.raises(ValidationError):
+        _settings()
+    monkeypatch.delenv("GEMINI_REQUEST_TIMEOUT_S")
+    with pytest.raises(ValidationError):
+        _settings(gemini_request_timeout_s=float(bad))
+
+
 # ── each client is constructed with the timeout ──────────────────────────────
 
 
@@ -133,26 +143,118 @@ def test_mem0_factories_pass_the_timeout_through():
     assert _timeout_of(c2) == 21_000
 
 
+def _unbounded_genai_clients(source: str) -> list[int]:
+    """Line numbers of google-genai client constructions without an ``http_options`` keyword.
+
+    A construction is a call whose callee resolves, through the module's own imports, to
+    ``google.genai.Client`` (``genai.Client``, an aliased module, ``google.genai.Client``, a
+    directly imported ``Client`` under any name, or ``google.genai.client.Client``).
+    """
+    import ast
+
+    tree = ast.parse(source)
+    module_names: set[str] = set()  # dotted names that refer to google.genai (or .client)
+    class_names: set[str] = set()  # bare names bound to the Client class
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for a in node.names:
+                if a.name in ("google.genai", "google.genai.client"):
+                    module_names.add(a.asname or a.name)
+                elif a.name == "google" and not a.asname:
+                    module_names.add("google.genai")
+        elif isinstance(node, ast.ImportFrom):
+            for a in node.names:
+                bound = a.asname or a.name
+                if node.module == "google" and a.name == "genai":
+                    module_names.add(bound)
+                elif node.module == "google.genai" and a.name == "client":
+                    module_names.add(bound)
+                elif node.module in ("google.genai", "google.genai.client") and a.name == "Client":
+                    class_names.add(bound)
+
+    def dotted(n):
+        parts = []
+        while isinstance(n, ast.Attribute):
+            parts.append(n.attr)
+            n = n.value
+        if isinstance(n, ast.Name):
+            parts.append(n.id)
+            return ".".join(reversed(parts))
+        return None
+
+    bad = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        name = dotted(node.func)
+        if name is None:
+            continue
+        is_client = name in class_names or (
+            name.endswith(".Client") and name.rsplit(".", 1)[0] in module_names
+        ) or name == "google.genai.Client" and "google.genai" in module_names
+        if is_client and not any(k.arg == "http_options" for k in node.keywords):
+            bad.append(node.lineno)
+    return bad
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "from google import genai\nc = genai.Client(api_key=k)",
+        "from google import genai\nc = genai.Client(api_key=k)  # http_options=...",
+        "from google import genai\nm = genai.Client(api_key=k).models",
+        "from google import genai as g\nc = g.Client(api_key=k)",
+        "from google.genai import Client\nc = Client(api_key=k)",
+        "from google.genai import Client as C\nc = C(api_key=k)",
+        "import google.genai\nc = google.genai.Client(api_key=k)",
+        "import google.genai as gg\nc = gg.Client(api_key=k)",
+        "from google import genai\nc = genai.Client(\n    api_key=k,\n)\n# http_options only in a comment",
+        "from google import genai\nc = genai.Client(api_key=k, **opts)",
+    ],
+)
+def test_client_scan_catches_unbounded_constructions(source):
+    assert _unbounded_genai_clients(source) == [next(
+        i for i, ln in enumerate(source.splitlines(), 1) if "Client(" in ln or "C(" in ln
+    )]
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "from google import genai\nc = genai.Client(api_key=k, http_options=o)",
+        "from google import genai as g\nc = g.Client(\n    api_key=k,\n    http_options=o,\n).models",
+        "from google.genai import Client\nc = Client(api_key=k, http_options=o)  # bounded",
+        "import google.genai\nc = google.genai.Client(http_options=o)",
+        "class Client: ...\nc = Client(api_key=k)",  # an unrelated local class
+        "import other\nc = other.Client(api_key=k)",
+    ],
+)
+def test_client_scan_accepts_bounded_or_unrelated_constructions(source):
+    assert _unbounded_genai_clients(source) == []
+
+
 def test_every_runtime_genai_client_construction_is_covered():
     """No service/mem0 module builds a genai.Client without http_options (graphiti has its own)."""
-    import re
     from pathlib import Path
 
     service = Path(__file__).resolve().parent.parent
     roots = [service, service.parent / "mem0" / "mem0"]
     offenders = []
+    scanned = 0
     for root in roots:
         for path in root.rglob("*.py"):
-            rel = path.relative_to(root.parent if root.name == "mem0" else root)
             parts = set(path.parts)
             if {"tests", "integration_tests", "scripts", ".venv"} & parts:
                 continue
             if path.name == "gcp_auth.py":  # unused helper; builds a Vertex/AI Studio client on demand
                 continue
-            text = path.read_text(errors="ignore")
-            for m in re.finditer(r"genai\.Client\((.*?)\)\s*$", text, re.S | re.M):
-                if "http_options" not in m.group(1):
-                    offenders.append(str(rel))
+            scanned += 1
+            try:
+                lines = _unbounded_genai_clients(path.read_text(errors="ignore"))
+            except SyntaxError:
+                continue
+            offenders += [f"{path.relative_to(root.parent)}:{n}" for n in lines]
+    assert scanned > 100  # the scan really walked the runtime packages
     assert not offenders, offenders
 
 
@@ -218,3 +320,72 @@ def test_stalled_endpoint_fails_fast_through_the_service_client(monkeypatch):
     # The same class of error the service's retry helper already treats as a transient provider
     # failure: it is retried with backoff, then falls back to the fallback model.
     assert _is_transient(err.value), repr(err.value)
+
+
+# ── a raw write retries a transient embed error before anything is stored ─────
+
+
+def _raw_service(embed_side_effect):
+    import httpx
+
+    from memory_service import MemoryService
+
+    svc = MemoryService()
+    mem = MagicMock()
+    mem.embedding_model.embed.side_effect = embed_side_effect
+    prepared = {"content": "x", "response": MagicMock()}
+    finalize = MagicMock()
+    return svc, mem, prepared, finalize, httpx
+
+
+def test_raw_write_retries_a_timed_out_embed_and_stores_one_row():
+    import httpx
+
+    calls = []
+
+    def embed(text, memory_action=None):
+        calls.append(text)
+        if len(calls) == 1:
+            raise httpx.ReadTimeout("The read operation timed out")
+        return [0.1, 0.2, 0.3]
+
+    svc, mem, prepared, finalize, _ = _raw_service(embed)
+    with patch.object(svc, "_prepare_raw_store", return_value=(prepared, None)), \
+         patch.object(svc, "_get_memory", return_value=mem), \
+         patch.object(svc, "_finalize_raw_store", finalize), \
+         patch("memory.retry.time.sleep"):
+        svc.store_raw(content="x", user_id="u", category="personal_fact")
+    assert len(calls) == 2
+    finalize.assert_called_once()
+    assert finalize.call_args.args[1] == [0.1, 0.2, 0.3]
+
+
+def test_raw_write_fails_with_the_same_error_class_when_every_attempt_times_out():
+    import httpx
+
+    def embed(text, memory_action=None):
+        raise httpx.ReadTimeout("The read operation timed out")
+
+    svc, mem, prepared, finalize, _ = _raw_service(embed)
+    with patch.object(svc, "_prepare_raw_store", return_value=(prepared, None)), \
+         patch.object(svc, "_get_memory", return_value=mem), \
+         patch.object(svc, "_finalize_raw_store", finalize), \
+         patch("memory.retry.time.sleep"):
+        with pytest.raises(httpx.ReadTimeout):
+            svc.store_raw(content="x", user_id="u", category="personal_fact")
+    finalize.assert_not_called()  # nothing was stored
+    assert mem.embedding_model.embed.call_count > 1
+
+
+def test_raw_write_does_not_retry_a_non_transient_embed_error():
+    def embed(text, memory_action=None):
+        raise ValueError("bad input")
+
+    svc, mem, prepared, finalize, _ = _raw_service(embed)
+    with patch.object(svc, "_prepare_raw_store", return_value=(prepared, None)), \
+         patch.object(svc, "_get_memory", return_value=mem), \
+         patch.object(svc, "_finalize_raw_store", finalize), \
+         patch("memory.retry.time.sleep"):
+        with pytest.raises(ValueError):
+            svc.store_raw(content="x", user_id="u", category="personal_fact")
+    assert mem.embedding_model.embed.call_count == 1
