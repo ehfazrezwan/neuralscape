@@ -10,7 +10,6 @@ import asyncio
 import base64
 import hashlib
 import json
-import re
 import logging
 import time
 from contextlib import asynccontextmanager
@@ -85,6 +84,7 @@ from schemas import (
     TimelineRequest,
     TimelineResponse,
     normalize_visibility,
+    normalize_workspace,
 )
 from authority_store import AuthorityUnavailable
 from task_manager import TaskManager, TaskStatusUnavailable
@@ -946,7 +946,7 @@ async def v1_ingest_document(req: IngestDocumentRequest, request: Request):
         "extract_facts": req.extract_facts,
         "index_passages": req.index_passages,
         "adapter": req.adapter,
-        "workspace": req.workspace,
+        "workspace": normalize_workspace(req.workspace),
     }
     doc = {k: v for k, v in doc.items() if v is not None}
 
@@ -1039,7 +1039,7 @@ async def v1_ingest_text(req: IngestTextRequest, request: Request):
         "index_passages": req.index_passages,
         "adapter": req.adapter,
         "occurred_at": req.occurred_at,
-        "workspace": req.workspace,
+        "workspace": normalize_workspace(req.workspace),
     }
     doc = {k: v for k, v in doc.items() if v is not None}
 
@@ -1121,8 +1121,10 @@ async def v1_ingest_files(
     except ValueError as ve:
         raise HTTPException(status_code=400, detail=str(ve)) from ve
 
-    if workspace is not None and not re.fullmatch(r"[a-zA-Z0-9_.\-]{1,100}", workspace):
-        raise HTTPException(status_code=400, detail="workspace may only contain letters, digits, '_', '.', '-' (max 100)")
+    try:
+        workspace = normalize_workspace(workspace)
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve)) from ve
 
     resolved_user_id = _resolve_user_id(request, user_id)
     # Standard-tier ingestion (a dictator uploading org standards) is allowed, but
