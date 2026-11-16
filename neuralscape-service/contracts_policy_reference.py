@@ -11,6 +11,7 @@ from pydantic_core import PydanticCustomError
 
 from contracts_policy import (
     SUPPORTED_POLICY_ACTIONS,
+    SUPPORTED_POLICY_CONDITIONS,
     AccessPolicy,
     PolicyDecision,
     PolicyEvaluationInput,
@@ -1207,9 +1208,47 @@ def _decision(
     )
 
 
+def _condition_state(statement, subject_id, evaluation) -> bool | None:
+    """Three-valued: ``True`` holds, ``False`` provably does not, ``None`` unknown.
+
+    No condition always holds.  Unknown facts are unknown, never false.
+    """
+
+    condition = statement.condition
+    if condition is None:
+        return True
+    context = evaluation.context
+    if context is None:
+        return None
+    if condition.kind == "row_owner_is_principal":
+        owner = context.row_owner_subject_id
+        return None if owner is None else owner == subject_id
+    if condition.kind == "fields_subset_of":
+        edited = context.edited_fields
+        if edited is None or len(edited) == 0:
+            return None  # nothing known to be edited is not a provable non-match
+        return set(edited) <= set(condition.values)
+    return None
+
+
+def _statement_applies(statement, subject_id, evaluation) -> bool:
+    """An allow applies only when its condition provably holds; a deny applies
+    unless its condition is provably false, so a condition that cannot be
+    judged can never drop a deny."""
+
+    state = _condition_state(statement, subject_id, evaluation)
+    if statement.effect == "deny":
+        return state is not False
+    return state is True
+
+
 # The statement fields ``evaluate_policy`` judges.  A field added to ``PolicyStatement`` must be
-# judged here (and listed) before a statement that sets it can authorize anything.
-_JUDGED_STATEMENT_FIELDS = frozenset({"id", "effect", "subject_id", "credential_id", "action", "resource"})
+# judged here (and listed) before a statement that sets it can authorize anything.  ``condition``
+# is judged by ``_statement_applies``; ``origin`` is provenance that never authorizes, so it is
+# deliberately left out of every decision.
+_JUDGED_STATEMENT_FIELDS = frozenset(
+    {"id", "effect", "subject_id", "credential_id", "action", "resource", "condition", "origin"}
+)
 
 
 def _is_set_unjudged(statement: PolicyStatement, name: str, field: Any) -> bool:
@@ -1328,6 +1367,12 @@ def evaluate_policy(
         for statement in policy.statements
     ):
         return deny("unsupported_policy_semantics")
+    if any(
+        statement.condition is not None
+        and statement.condition.kind not in SUPPORTED_POLICY_CONDITIONS
+        for statement in policy.statements
+    ):
+        return deny("unsupported_policy_semantics")
     if principal.delegation is not None and any(
         delegated_action not in SUPPORTED_POLICY_ACTIONS
         for delegated_action in principal.delegation.allowed_actions
@@ -1371,6 +1416,7 @@ def evaluate_policy(
         credential_id=principal.credential_id,
         action=action,
         resource=resource,
+        evaluation=evaluation,
     ):
         return deny()
 
@@ -1391,6 +1437,7 @@ def evaluate_policy(
             credential_id=principal.delegation.delegated_by_credential_id,
             action=action,
             resource=resource,
+            evaluation=evaluation,
         ):
             return deny()
 
@@ -1411,6 +1458,7 @@ def _holds_current_right(
     credential_id: str,
     action: str,
     resource: ReferenceHandle,
+    evaluation: PolicyEvaluationInput,
 ) -> bool:
     """Whether ``subject_id`` acting with ``credential_id`` has a matching allow
     and no matching deny for ``action`` on ``resource`` in ``policy``.
@@ -1430,6 +1478,7 @@ def _holds_current_right(
             statement.credential_id is None
             or statement.credential_id == credential_id
         )
+        and _statement_applies(statement, subject_id, evaluation)
     )
     if any(statement.effect == "deny" for statement in matching_statements):
         return False

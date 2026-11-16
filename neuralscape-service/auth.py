@@ -29,6 +29,7 @@ Public paths (``/health``, ``/health/live``, ``/.well-known/*``, ``/oauth/*``)
 always bypass auth.
 """
 
+import asyncio
 import hmac
 import logging
 from contextvars import ContextVar
@@ -48,9 +49,15 @@ logger = logging.getLogger(__name__)
 # without the model having to pass `user_id`. Default None = unauthenticated
 # (or the legacy-key opt-out): fall back to the request body / arguments.
 current_user_id: ContextVar[str | None] = ContextVar("current_user_id", default=None)
+# True while a request authenticated with the legacy shared key is being served, so the MCP layer (which
+# only sees ``current_user_id``) can tell that identity from a per-user token's.
+current_legacy_shared: ContextVar[bool] = ContextVar("current_legacy_shared", default=False)
 
 # Paths that never require authentication
-PUBLIC_PATHS = {"/health", "/health/live"}
+# The refresh endpoint authenticates by the single-use refresh token in its body
+# (an expired access token cannot be required to obtain a new one); the handler
+# is a 404 (not 401) unless CREDENTIALS_ENABLED and NS_POLICY_MODE=enforce.
+PUBLIC_PATHS = {"/health", "/health/live", "/v1/credentials/refresh"}
 # Path prefixes that never require auth: OAuth discovery metadata and the
 # Authorization Server endpoints themselves (the consent page, DCR, token
 # exchange). These are the public front door of the OAuth flow.
@@ -124,7 +131,12 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
         token_secret = settings.neuralscape_user_token_secret
         legacy_key = settings.neuralscape_api_key
         path = request.url.path
-        if not token_secret and not legacy_key:
+        # Scoped credentials (off unless CREDENTIALS_ENABLED and policy
+        # enforcement is on) make authentication mandatory.
+        import credentials
+
+        scoped_enabled = credentials.accepts_scoped_credentials()
+        if not token_secret and not legacy_key and not scoped_enabled:
             # The ONLY unauthenticated pass-through: an explicit operator
             # opt-out (startup logs a WARNING for it). Never a silent default.
             if settings.neuralscape_auth_disabled:
@@ -147,6 +159,12 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
         if not auth_header.startswith("Bearer "):
             return self._unauthorized(request, "Missing or invalid Authorization header")
         token = auth_header[7:]  # strip "Bearer "
+
+        # New scoped credential format, alongside the existing tokens.  A token
+        # in this format that does not verify is rejected outright; it never
+        # falls through to the shared-key comparison.
+        if scoped_enabled and token.startswith(credentials.ACCESS_PREFIX):
+            return await self._scoped_credential(request, call_next, token)
 
         # Try the per-user HMAC token path first (preferred). The token
         # carries the user_id we attach to request.state for downstream
@@ -179,20 +197,55 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
             token.encode("utf-8"), legacy_key.encode("utf-8")
         ):
             request.state.auth_mode = "legacy_shared"
-            if settings.neuralscape_legacy_key_trust_body_user_id:
-                response = await call_next(request)
-            else:
-                bound_user_id = settings.legacy_key_identity()
-                request.state.user_id = bound_user_id
-                ctx_token = current_user_id.set(bound_user_id)
-                try:
+            shared_token = current_legacy_shared.set(True)
+            try:
+                if settings.neuralscape_legacy_key_trust_body_user_id:
                     response = await call_next(request)
-                finally:
-                    current_user_id.reset(ctx_token)
+                else:
+                    bound_user_id = settings.legacy_key_identity()
+                    request.state.user_id = bound_user_id
+                    ctx_token = current_user_id.set(bound_user_id)
+                    try:
+                        response = await call_next(request)
+                    finally:
+                        current_user_id.reset(ctx_token)
+            finally:
+                current_legacy_shared.reset(shared_token)
             response.headers[DEPRECATION_HEADER] = DEPRECATION_MSG
             return response
 
         return self._unauthorized(request, "Invalid or expired token")
+
+    async def _scoped_credential(self, request: Request, call_next, token: str):
+        import credentials
+
+        service = credentials.get_service()
+        if service is None:
+            return JSONResponse(status_code=503, content={"detail": "credential service unavailable"})
+        try:
+            # Synchronous SQLite/psycopg I/O: off the event loop.
+            verified = await asyncio.to_thread(service.verify_access, token)
+        except credentials.AuthorityUnavailable:
+            return JSONResponse(status_code=503, content={"detail": "credential service unavailable"})
+        if verified is None:
+            return self._unauthorized(request, "Invalid or expired token")
+        # Downstream code (memory reads and writes, task ownership) sees the ``user_id`` the subject's
+        # rows are keyed by: the bound legacy id, or the subject id itself when there is none.  The
+        # policy layer still identifies the principal by ``request.state.credential``.
+        try:
+            memory_user = await asyncio.to_thread(service.memory_user_id, verified.subject_id)
+        except credentials.AuthorityUnavailable:
+            return JSONResponse(status_code=503, content={"detail": "credential service unavailable"})
+        request.state.user_id = memory_user
+        request.state.auth_mode = "scoped_credential"
+        request.state.credential = verified
+        user_token = current_user_id.set(memory_user)
+        credential_token = credentials.current_credential.set(verified)
+        try:
+            return await call_next(request)
+        finally:
+            credentials.current_credential.reset(credential_token)
+            current_user_id.reset(user_token)
 
     def _unauthorized(self, request: Request, detail: str) -> JSONResponse:
         """401 response, carrying an RFC 9728 ``WWW-Authenticate`` header.
