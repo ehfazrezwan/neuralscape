@@ -244,3 +244,80 @@ def test_legacy_route_graph_jobs_redis_down_is_still_200(client, mock_service, t
     assert body["graph_jobs_enqueued"] == 0
     assert body["graph_jobs_not_enqueued_ids"] == ["sib-1", "sib-2"]
     assert "graph_jobs" not in body
+
+
+# ── pins for what the real-store integration test relies on ──
+
+
+def _write_service():
+    from memory_service import MemoryService
+
+    s = MemoryService()
+    s._memory = MagicMock(name="Memory")
+    s._get_memory = lambda: s._memory
+    s._graphiti = MagicMock(name="Graphiti")
+    s._bridge = MagicMock(name="AsyncBridge")
+    s._memory.embedding_model.embed.return_value = [0.1] * 8
+    s._memory.graph.add.return_value = {"episode_uuid": "ep-1", "episode_name": "n"}
+    s._find_by_content_hash = MagicMock(return_value=None)
+    for hook in ("_attach_memory_id_to_graph_nodes", "_persist_graph_episode_ref",
+                 "_maybe_supersede_contradicted"):
+        setattr(s, hook, MagicMock())
+    return s
+
+
+def test_standard_write_is_forced_global_and_lands_in_the_org_wide_standard_group(monkeypatch):
+    """A standard row asked for at project scope is stored global with no project,
+    and its graph write goes to the org-wide ``standard`` group. The real-store
+    integration test asserts and cleans in that group; this pins the premise."""
+    from config import settings
+
+    monkeypatch.setattr(settings, "standards_enabled", True)
+    monkeypatch.setattr(settings, "dictator_user_ids", "boss")
+    monkeypatch.setattr(settings, "graph_group_id_injective_enabled", False)
+    s = _write_service()
+
+    out = s.store_raw(
+        content="All services must expose a health endpoint.", user_id="boss",
+        category="convention", scope="project", project_id="P", visibility="standard",
+        add_to_graph=True,
+    )
+
+    assert out[0].scope == "global" and out[0].project_id is None
+    payload = s._memory.vector_store.insert.call_args.kwargs["payloads"][0]
+    assert payload["metadata"]["scope"] == "global"
+    assert payload["metadata"]["project_id"] is None
+    assert payload["metadata"]["visibility"] == "standard"
+    group_ids = [c.kwargs["filters"]["group_id"] for c in s._memory.graph.add.call_args_list]
+    assert group_ids == ["standard"]
+
+
+def _footprint_module():
+    import importlib.util
+    import pathlib
+
+    path = (pathlib.Path(__file__).resolve().parent.parent / "integration_tests"
+            / "test_delete_include_own_shared_real_stores.py")
+    spec = importlib.util.spec_from_file_location("_own_shared_integration", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_episode_footprint_cleanup_is_constrained_by_episode_never_by_group(monkeypatch):
+    mod = _footprint_module()
+    calls = []
+    monkeypatch.setattr(mod, "_cypher", lambda svc, q, **kw: calls.append((q, kw)))
+
+    mod._delete_episode_footprint(object(), "ep-42")
+
+    assert len(calls) == 4
+    for query, params in calls:
+        assert params == {"ep": "ep-42"}
+        assert "$ep" in query
+        assert "group_id" not in query
+    # edges first, entities next, the episode node last (it holds the MENTIONS edges)
+    assert "DELETE r" in calls[0][0] and "size(r.episodes) = 1" in calls[0][0]
+    assert "SET r.episodes" in calls[1][0] and "<> $ep" in calls[1][0]
+    assert "MENTIONS" in calls[2][0] and "NOT (n)-[:RELATES_TO]-()" in calls[2][0]
+    assert calls[3][0].endswith("DETACH DELETE e")

@@ -566,7 +566,9 @@ class DeleteMixin:
                 "Memories could not be listed; nothing was deleted. Retry."
             ) from e
 
-        # (memory_id, payload, metadata) for every non-shared row.
+        # (memory_id, payload, metadata) for every private row, plus the
+        # caller's own shared rows when include_shared is set. Standard rows
+        # and other users' shared rows never enter this list.
         private_rows: list[tuple[str, dict, dict]] = []
         private_groups: set[str] = set()
         row_groups: dict[str, str] = {}

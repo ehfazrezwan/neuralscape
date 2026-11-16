@@ -56,15 +56,61 @@ def _cypher(svc, query: str, **params):
     return svc._run_on_bridge(_run(), timeout=60.0)
 
 
-def _episode_uuid(svc, row_id):
+def _row_meta(svc, row_id) -> dict:
+    """The stored row's payload metadata (empty dict when the row is missing)."""
     for pt in svc._memory.vector_store.client.retrieve(
         collection_name=_collection(), ids=[row_id], with_payload=True
     ):
         meta = (pt.payload or {}).get("metadata") or {}
         if isinstance(meta.get("metadata"), dict):
             meta = meta["metadata"]
-        return meta.get("graph_episode_uuid")
-    return None
+        return meta
+    return {}
+
+
+def _episode_uuid(svc, row_id):
+    return _row_meta(svc, row_id).get("graph_episode_uuid")
+
+
+def _stored_group(svc, row_id) -> str:
+    """The graph group a stored row's episode really lives in.
+
+    Computed from the row's own stored scope/project/visibility with the product's
+    group builder, never assumed from what the test asked for.
+    """
+    from memory.groups import _build_group_id
+
+    meta = _row_meta(svc, row_id)
+    return _build_group_id(
+        meta.get("visibility"), meta.get("owner_user_id"), meta.get("project_id"), meta.get("workspace")
+    )
+
+
+# The statements that remove ONE episode's own footprint. Every statement is
+# constrained by the episode uuid ($ep); none is ever constrained by group alone,
+# because the standard group is org-wide and may hold other runs' facts.
+_FOOTPRINT_STATEMENTS = (
+    # Edges only this episode produced.
+    "MATCH ()-[r:RELATES_TO]->() "
+    "WHERE $ep IN coalesce(r.episodes, []) AND size(r.episodes) = 1 DELETE r",
+    # Graphiti may have merged this fact onto an edge from another episode: keep it,
+    # drop only this episode from its provenance list.
+    "MATCH ()-[r:RELATES_TO]->() "
+    "WHERE $ep IN coalesce(r.episodes, []) AND size(r.episodes) > 1 "
+    "SET r.episodes = [x IN r.episodes WHERE x <> $ep]",
+    # Entities this episode mentions that no other episode mentions and no edge uses.
+    "MATCH (e:Episodic {uuid: $ep})-[:MENTIONS]->(n:Entity) "
+    "WHERE NOT EXISTS { MATCH (o:Episodic)-[:MENTIONS]->(n) WHERE o.uuid <> $ep } "
+    "AND NOT (n)-[:RELATES_TO]-() DETACH DELETE n",
+    # Finally the episode itself (the MENTIONS edges above needed it to exist).
+    "MATCH (e:Episodic {uuid: $ep}) DETACH DELETE e",
+)
+
+
+def _delete_episode_footprint(svc, episode_uuid):
+    """Remove only the edges, entities and episode node this one episode produced."""
+    for statement in _FOOTPRINT_STATEMENTS:
+        _cypher(svc, statement, ep=episode_uuid)
 
 
 def _collection():
@@ -107,9 +153,12 @@ def _seed(svc, unique_ns):
     ids = {
         "private": store(me, "The Quillfeather billing service deploys on Fridays.", "private"),
         "shared": store(me, "The Quillfeather team standup is at nine every weekday.", "shared"),
-        # project scope keeps the graph group inside the test's names
-        # (standard--project--<project>), never the org-wide ``standard`` group.
-        "standard": store(me, "All Quillfeather services must expose a health endpoint.", "standard"),
+        # The product forces every standard row to global scope with no project, so
+        # this row's episode lands in the org-wide ``standard`` group (not a group
+        # named after the test). The test therefore touches only what THIS episode
+        # produced there (see _delete_episode_footprint), never the whole group.
+        "standard": store(me, "All Quillfeather services must expose a health endpoint.", "standard",
+                          scope="global"),
         "others_shared": store(other, "The Quillfeather release notes live in the wiki.", "shared"),
     }
     episodes = {k: _episode_uuid(svc, v) for k, v in ids.items()}
@@ -118,29 +167,49 @@ def _seed(svc, unique_ns):
     for key, ep in episodes.items():
         assert _episode_exists(svc, ep), f"seed episode for {key} is not in Neo4j"
 
+    # Read the standard row back instead of assuming where it landed. If the product
+    # ever stops forcing standards global, fail here, loudly, not in a wrong group.
+    std_meta = _row_meta(svc, ids["standard"])
+    assert std_meta.get("scope") == "global", std_meta
+    assert not std_meta.get("project_id"), std_meta
+    assert std_meta.get("visibility") == "standard", std_meta
+    groups = {
+        "standard": _stored_group(svc, ids["standard"]),
+        "others_shared": _stored_group(svc, ids["others_shared"]),
+    }
+    assert groups["standard"] == "standard", groups
+    assert groups["others_shared"] == f"shared--project--{project}", groups
+
     def cleanup():
-        _cypher(svc, "MATCH (n) WHERE n.uuid IN $u DETACH DELETE n", u=list(episodes.values()))
+        # Standard group is org-wide: remove only this episode's own footprint, and do
+        # it first (it needs the episode's MENTIONS edges).
+        _delete_episode_footprint(svc, episodes["standard"])
+        _cypher(
+            svc, "MATCH (n) WHERE n.uuid IN $u DETACH DELETE n",
+            u=[v for k, v in episodes.items() if k != "standard"],
+        )
+        # Groups below are unique to this test (user/project names come from unique_ns).
         for g in (
             f"user--{me}", f"user--{me}--project--{project}",
             f"user--{other}", f"user--{other}--project--{project}",
-            f"shared--project--{project}", f"standard--project--{project}",
+            f"shared--project--{project}",
         ):
             _cypher(svc, "MATCH (n {group_id: $g}) DETACH DELETE n", g=g)
             _cypher(svc, "MATCH ()-[r:RELATES_TO {group_id: $g}]->() DELETE r", g=g)
 
     unique_ns.on_cleanup(cleanup)
-    return me, other, ids, episodes, project
+    return me, other, ids, episodes, groups
 
 
 def test_include_shared_true_deletes_exactly_own_private_and_shared_rows(svc, unique_ns):
-    me, other, ids, episodes, project = _seed(svc, unique_ns)
-    shared_group, standard_group = f"shared--project--{project}", f"standard--project--{project}"
+    me, other, ids, episodes, groups = _seed(svc, unique_ns)
+    shared_group, standard_group = groups["others_shared"], groups["standard"]
     # Non-vacuous: the edges of the other user's shared episode and of the standard
     # episode are live before the delete and must be byte-for-byte the same after.
     shared_edges_before = _live_edge_uuids(svc, shared_group, episodes["others_shared"])
     standard_edges_before = _live_edge_uuids(svc, standard_group, episodes["standard"])
     assert shared_edges_before, "seed produced no live edges for the other user's shared episode"
-    assert standard_edges_before, "seed produced no live edges for the standard episode"
+    assert standard_edges_before, "seed produced no live edges for the standard episode in its real group"
 
     out = svc.delete_memories(user_id=me, include_shared=True)
 
@@ -156,13 +225,13 @@ def test_include_shared_true_deletes_exactly_own_private_and_shared_rows(svc, un
     assert _episode_exists(svc, episodes["standard"])
     assert _episode_exists(svc, episodes["others_shared"])
     # The shared and standard groups are never bulk-expired: the other user's facts
-    # and the caller's standard facts keep expired_at IS NULL.
+    # and the caller's standard facts (this episode's edges) keep expired_at IS NULL.
     assert _live_edge_uuids(svc, shared_group, episodes["others_shared"]) == shared_edges_before
     assert _live_edge_uuids(svc, standard_group, episodes["standard"]) == standard_edges_before
 
 
 def test_include_shared_false_keeps_the_callers_shared_row(svc, unique_ns):
-    me, other, ids, episodes, _project = _seed(svc, unique_ns)
+    me, other, ids, episodes, _groups = _seed(svc, unique_ns)
 
     out = svc.delete_memories(user_id=me)
 
