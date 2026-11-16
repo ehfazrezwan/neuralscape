@@ -542,6 +542,12 @@ def test_insights_only_cite_their_own_pool(dream_env, swept, monkeypatch):
 
     monkeypatch.setattr(reflect_mod, "reflect", _stub_reflect)
     for pool in (env.pool, swept.other_pool):
+        # The `swept` fixture already dreamt every pool, which recorded each pool's
+        # last_dreamt_at. A second sweep stages only rows that changed since then (or
+        # have decayed), and a pool's fresh, strong rows are neither, so it would stage
+        # nothing and there would be nothing for the stub to cite. Forget the dreamt
+        # state (not the rows) so this sweep stages the pool's rows again.
+        env.clear_pool_state()
         run = asyncio.run(dream_all(service=env.service, settings=swept.settings, dry_run=False,
                                     only_pool=pool, force=True))
         assert run.pools and run.pools[0].status == "dreamt", run.pools

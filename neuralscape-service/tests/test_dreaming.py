@@ -611,6 +611,31 @@ def test_stage_pool_guards_and_gates(monkeypatch):
     assert staged.new_count == 1
 
 
+def test_stage_pool_stages_nothing_for_an_already_dreamt_pool_of_fresh_strong_rows(monkeypatch):
+    """A pool swept once (last_dreamt_at recorded) stages nothing on the next sweep unless a
+    row changed or decayed, even with force=True (force skips gates, not staging). A test that
+    sweeps a pool twice must reset the pool's dreamt state first, or its reflection sees an
+    empty batch."""
+    from extensions.dreaming import consolidate as c
+
+    monkeypatch.setattr(
+        c, "read_aggregates",
+        lambda redis, ids: {i: {"recall_count": 0, "unique_query_count": 0,
+                                "last_recalled_at": 0.0} for i in ids},
+    )
+    now = time.time()
+    written = datetime.fromtimestamp(now - 3600, tz=timezone.utc).isoformat()
+    rows = lambda: _batch([  # noqa: E731
+        {"memory_id": f"m{i}", "content": "c", "created_at": written,
+         "confidence": 0.9, "source_type": "conversation"} for i in range(3)
+    ])
+    kwargs = dict(max_memories=100, strength_half_life_days=100000, prune_strength_threshold=0.15)
+    first = c.stage_pool(rows(), FakeRedis(), last_dreamt_at=0.0, **kwargs)
+    assert len(first.memories) == 3
+    again = c.stage_pool(rows(), FakeRedis(), last_dreamt_at=now, **kwargs)
+    assert again.memories == [] and again.new_count == 0
+
+
 def test_enumerate_pools_excludes_standard_and_tombstoned():
     from types import SimpleNamespace
 
