@@ -169,6 +169,7 @@ class _AsyncBridge:
 
     def __init__(self):
         self._loop = asyncio.new_event_loop()
+        self._stopped = False
         self._thread = threading.Thread(target=self._run_loop, daemon=True)
         self._thread.start()
 
@@ -186,6 +187,10 @@ class _AsyncBridge:
         cancelled on the loop and ``TimeoutError`` is raised, which the
         service's graph callers already log and treat as non-critical.
         """
+        if self._stopped or self._loop.is_closed():
+            if asyncio.iscoroutine(coro):
+                coro.close()  # never leave an un-awaited coroutine behind
+            raise RuntimeError("Graphiti bridge is shut down")
         limit = timeout if timeout is not None and timeout > 0 else _bridge_timeout_from_env()
         future = asyncio.run_coroutine_threadsafe(coro, self._loop)
         try:
@@ -202,6 +207,38 @@ class _AsyncBridge:
             raise TimeoutError(
                 f"Graphiti bridge call did not finish within {limit:g}s and was cancelled"
             ) from None
+
+
+    def shutdown(self, timeout: float = 10.0) -> None:
+        """NEURALSCAPE PATCH: stop the bridge loop cleanly (not in upstream).
+
+        Cancel outstanding tasks, shut down async generators, stop the loop and
+        join its thread. Fire-and-forget work scheduled on the loop (the driver
+        schedules its index build there at construction) must not outlive the
+        loop: left running it surfaces later as 'Event loop is closed' / 'no
+        running event loop' noise. Idempotent; a later ``run()`` raises
+        RuntimeError.
+        """
+        if self._loop.is_closed():
+            return
+
+        async def _cancel_all():
+            current = asyncio.current_task()
+            pending = [t for t in asyncio.all_tasks() if t is not current]
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+            await self._loop.shutdown_asyncgens()
+
+        self._stopped = True
+        try:
+            asyncio.run_coroutine_threadsafe(_cancel_all(), self._loop).result(timeout=timeout)
+        except Exception:
+            logger.warning("Graphiti bridge shutdown: cancelling tasks failed", exc_info=True)
+        self._loop.call_soon_threadsafe(self._loop.stop)
+        self._thread.join(timeout=timeout)
+        if not self._thread.is_alive():
+            self._loop.close()
 
 
 def _hybrid_egress_ok(text: str) -> bool:
