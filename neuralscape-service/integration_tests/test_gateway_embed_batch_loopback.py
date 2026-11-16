@@ -25,6 +25,7 @@ from __future__ import annotations
 import third_party_telemetry  # noqa: F401  (telemetry guard; must precede mem0/graphiti imports)
 
 import json
+import math
 import threading
 import uuid
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -37,6 +38,12 @@ DIMS = 768
 def stub_vector(text: str) -> list[float]:
     base = (sum(text.encode()) % 89 + 1) / 100.0
     return [round(base + i * 1e-4, 6) for i in range(DIMS)]
+
+
+def stored_form(vec: list[float]) -> list[float]:
+    """The vector as Qdrant returns it: the collection uses Cosine distance, so Qdrant L2-normalises on upsert."""
+    norm = math.sqrt(sum(x * x for x in vec))
+    return [x / norm for x in vec]
 
 
 class StubGateway:
@@ -105,9 +112,15 @@ def make_svc(flags, stores, llm_key, unique_ns, stub, monkeypatch):
     # get_mem0_config exports OPENAI_BASE_URL / OPENAI_API_KEY; restore them afterwards.
     monkeypatch.setenv("OPENAI_BASE_URL", "")
     monkeypatch.setenv("OPENAI_API_KEY", "")
-    unique_ns.on_cleanup(
-        lambda: QdrantClient(url=stores.qdrant_url).delete_collection(unique_ns.qdrant_collection)
-    )
+
+    def drop_collection():
+        c = QdrantClient(url=stores.qdrant_url)
+        try:
+            c.delete_collection(unique_ns.qdrant_collection)
+        finally:
+            c.close()
+
+    unique_ns.on_cleanup(drop_collection)
 
     built: list = []
 
@@ -123,12 +136,14 @@ def make_svc(flags, stores, llm_key, unique_ns, stub, monkeypatch):
         from memory_service import MemoryService
 
         svc = MemoryService()
+        entry = [svc, None, None]
+        built.append(entry)  # registered before init so a partially built service is still closed
         svc._get_memory()
         # Raw writes only: no graph episode, no extraction LLM. Detach the graph
         # handles for the test body but remember them, so teardown can close the
         # Neo4j driver and stop the bridge loop thread (dropping them leaks a
         # thread, an event loop and driver sockets per service).
-        built.append((svc, svc._graphiti, svc._bridge))
+        entry[1], entry[2] = svc._graphiti, svc._bridge
         svc._graphiti = None
         svc._bridge = None
         return svc
@@ -136,12 +151,19 @@ def make_svc(flags, stores, llm_key, unique_ns, stub, monkeypatch):
     yield build
 
     for svc, graphiti, bridge in built:
-        svc._graphiti, svc._bridge = graphiti, bridge
-        for close in (
-            svc.close,  # graphiti driver + bridge loop
-            svc._memory.vector_store.client.close,  # Qdrant HTTP client
-            svc._memory.embedding_model.client.close,  # gateway/OpenAI HTTP client pool
-        ):
+        if graphiti is not None:
+            svc._graphiti, svc._bridge = graphiti, bridge
+        memory = getattr(svc, "_memory", None)
+        closers = [svc.close]  # graphiti driver + bridge loop
+        if memory is not None:
+            closers += [
+                memory.close,  # mem0 history DB connection
+                getattr(getattr(memory, "vector_store", None), "client", None) and memory.vector_store.client.close,
+                getattr(getattr(memory, "embedding_model", None), "client", None) and memory.embedding_model.client.close,
+            ]
+        for close in closers:
+            if close is None:
+                continue
             try:
                 close()
             except Exception:  # noqa: BLE001 - teardown is best effort
@@ -158,12 +180,16 @@ def _texts(tag, n):
 
 
 def _assert_each_point_holds_its_own_texts_vector(svc, uid, texts):
-    """Every stored point's vector is the stub's vector for ITS text (order within a batch cannot be swapped)."""
+    """Every stored point's vector is the stub's vector for ITS text (order within a batch cannot be swapped).
+
+    Qdrant L2-normalises on upsert (Cosine collection), so the expectation is the normalised stub vector.
+    Adjacent stub bases differ by up to ~2e-5 per element after normalisation, so abs=1e-6 still tells
+    every text's vector apart from every other's (a swapped or foreign embedder's vector fails)."""
     stored = _stored_vectors(svc, uid)
     assert set(stored) == set(texts)
     assert len({tuple(stub_vector(t)[:3]) for t in texts}) == len(texts), "test texts must embed distinctly"
     for text in texts:
-        assert stored[text] == pytest.approx(stub_vector(text), abs=1e-5), text
+        assert stored[text] == pytest.approx(stored_form(stub_vector(text)), abs=1e-6), text
 
 
 def _stored_vectors(svc, uid):
