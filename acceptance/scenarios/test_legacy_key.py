@@ -76,7 +76,7 @@ def check_mcp_deprecation_header(mcp: MCPClient) -> None:
     assert "deprecated" in value.lower(), f"no {DEPRECATION_HEADER} header with a deprecation notice on an MCP response (got {value!r})"
 
 
-def check_key_refused(base_url: str, token: str) -> None:
+def check_key_refused(base_url: str, token: str | None) -> None:
     """REST and MCP both answer 401 for this bearer string."""
     c = NSClient(base_url, token)
     m = MCPClient(base_url, token)
@@ -89,6 +89,22 @@ def check_key_refused(base_url: str, token: str) -> None:
     finally:
         c.close()
         m.close()
+
+
+def check_admin_routes_refused(client: NSClient) -> None:
+    """The legacy identity is not a dictator/admin here (DICTATOR_USER_IDS is empty and it is not the default user):
+    the admin audit route is 403 ("not authorized"), and no credential is issued."""
+    r = client.post("/v1/admin/audit-private-leakage", json={})
+    assert r.status_code == 403, f"POST /v1/admin/audit-private-leakage -> {r.status_code} (want 403): {r.text[:160]}"
+    assert "not authorized" in r.text.lower(), f"403 without the documented refusal: {r.text[:160]}"
+    c = client.post("/v1/credentials", json={"scope": ["memory:read"]})
+    assert c.status_code >= 400, f"POST /v1/credentials -> {c.status_code}: a credential may have been issued"
+    assert "access_token" not in c.text and "refresh_token" not in c.text, "a credential was issued to the shared key"
+
+
+def check_delete_refused(client: NSClient, w: Written) -> None:
+    r = client.delete(f"/v1/memories/{w.memory_id}")
+    assert r.status_code in (403, 404), f"DELETE /v1/memories/<other user's id> -> {r.status_code} (want 403/404): {r.text[:160]}"
 
 
 def check_per_user_token(client: NSClient, expected_user: str) -> None:
@@ -290,6 +306,7 @@ def test_a_wrong_or_near_miss_key_is_401_on_rest_and_mcp(ctx, bad):
         ("truncated", key[:-1]),
         ("key plus a suffix", key + "0"),
         ("random key", secrets.token_hex(32)),
+        ("no Authorization header at all", None),
         ("wrong-secret per-user token", bad.token),
     ):
         try:
@@ -369,3 +386,37 @@ def test_task_checks_fail_for_the_wrong_reader(a, legacy, legacy_write):
     precondition(check_task_readable, legacy, "/v1/memories/status", legacy_write, what="the legacy identity reads its own task")
     expect_check_fails(check_task_hidden, legacy, "/v1/memories/status", legacy_write)
     expect_check_fails(check_task_readable, a, "/v1/memories/status", legacy_write)
+
+
+# ── admin routes and cross-user delete ───────────────────────────
+
+
+@proves("auth.legacy-shared-key")
+def test_the_legacy_identity_is_not_an_admin(legacy):
+    check_admin_routes_refused(legacy)
+
+
+@proves("auth.legacy-shared-key")
+@negative_control
+def test_admin_refusal_check_fails_without_a_credential(a, anon):
+    precondition(check_admin_routes_refused, a, what="a non-dictator per-user token is refused the admin route with the documented 403")
+    expect_check_fails(check_admin_routes_refused, anon)  # no credential: a 401, not the 403 of an authenticated non-admin
+
+
+@proves("auth.legacy-shared-key")
+def test_the_legacy_key_cannot_delete_another_users_memory(a, legacy, a_write):
+    a_write.require()
+    eventually(lambda: check_recalls(a, a_write.marker), timeout=90, what="A's write recalled by A")
+    check_delete_refused(legacy, a_write)
+    assert recalled(a, a_write.marker), "A's memory is gone after the legacy key tried to delete it"
+    assert rows_with(list_rows(a), a_write.marker), "A's memory is no longer listed after the legacy key tried to delete it"
+
+
+@proves("auth.legacy-shared-key")
+@negative_control
+def test_delete_refusal_check_fails_for_the_owner(ctx, legacy, a_write):
+    a_write.require()
+    own = write_raw(legacy, f"zq-{ctx.run_id}-legacydelctl The legacy identity's own disposable note.", "preference",
+                    marker=f"zq-{ctx.run_id}-legacydelctl", scope="global", visibility="private").require()
+    precondition(check_delete_refused, legacy, a_write, what="deleting another user's memory is refused")
+    expect_check_fails(check_delete_refused, legacy, own)  # deleting its own memory succeeds

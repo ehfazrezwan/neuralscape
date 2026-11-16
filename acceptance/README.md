@@ -137,7 +137,7 @@ harness reads `NS_LEGACY_KEY` into `ctx.legacy_key` (hidden from the repr) and t
 recorded `detail`, and the results hold only the placeholder (`profile_flags`). A `legacy-key` scenario run
 without `NS_LEGACY_KEY` fails its fixture with a precondition message (it never skips: the profile exists only for
 them). `NEURALSCAPE_USER_TOKEN_SECRET` stays as the gate sets it, so users A and B keep their per-user tokens on the
-same stack. The profile changes the auth surface, so it needs its own stack restart and no other profile may share it.
+same stack. The profile changes the auth surface, so it declares `# exclusive: own-restart`: it needs its own stack restart and no other profile may share that stack (a selftest pins that no other profile file sets `NEURALSCAPE_API_KEY*` and that only `test_legacy_key.py` uses the `legacy` fixtures). Besides identity, the profile's scenarios cover the missing-bearer 401, the admin and credential routes refused to the shared key, and a cross-user delete refused.
 
 **Dictator.** A profile with `DICTATOR_USER_IDS=acc-dictator` gives the run a third identity: fixtures
 `dictator` (REST) and `mcp_dictator` (MCP), `ctx.dictator_user` / `ctx.token_dictator`. The token is minted for

@@ -24,7 +24,7 @@ REDACTED = "<redacted>"
 #: A feature switch such as ``CREDENTIALS_ENABLED=true`` has a secret-looking name but cannot hold a secret.
 BOOLEAN_VALUES = frozenset({"true", "false"})
 HARNESS_VAR_RE = re.compile(r"^NS_[A-Z][A-Z0-9_]*$")
-HEADER_RE = re.compile(r"^#\s*(services|sidecars|mounts|requires|harness-env)\s*:\s*(.*)$", re.IGNORECASE)
+HEADER_RE = re.compile(r"^#\s*(services|sidecars|mounts|requires|harness-env|exclusive)\s*:\s*(.*)$", re.IGNORECASE)
 
 
 def _unquote(value: str) -> str:
@@ -40,6 +40,11 @@ class Profile:
     placeholders: dict[str, str] = field(default_factory=dict)  # KEY -> placeholder kind
     headers: dict[str, list[str]] = field(default_factory=dict)  # services / sidecars / mounts
     sha256: str | None = None
+
+    def exclusive(self) -> bool:
+        """``# exclusive: own-restart``: the profile changes the auth surface, so it needs its own stack restart
+        and no other profile's run may share its stack."""
+        return bool(self.headers.get("exclusive"))
 
     def harness_env(self) -> dict[str, str]:
         """``# harness-env: NS_X=KEY`` headers as ``{"NS_X": "KEY"}``: the gate exports the generated

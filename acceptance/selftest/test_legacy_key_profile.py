@@ -8,7 +8,12 @@ from pathlib import Path
 
 import pytest
 
-from nsaccept import fixtures, profile, runctx, tokens
+import subprocess
+import sys
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+from nsaccept import fixtures, profile, pytest_plugin, runctx, tokens
 
 ACCEPTANCE = Path(__file__).resolve().parents[1]
 KEY = "ab" * 32  # a stand-in generated key (hex32): never a real secret
@@ -88,3 +93,107 @@ def test_the_legacy_fixtures_fail_loudly_without_the_key_and_never_skip(monkeypa
 def test_the_scenarios_never_interpolate_the_key_into_a_message():
     for line in (ACCEPTANCE / "scenarios" / "test_legacy_key.py").read_text().splitlines():
         assert not ("legacy_key" in line and re.search(r"\bf[\"']", line)), f"an f-string mentions the legacy key: {line.strip()}"
+
+
+# ── isolation from the union profiles ────────────────────────────
+
+
+def test_the_legacy_key_profile_is_exclusive_and_no_other_profile_touches_the_auth_surface():
+    profiles_dir = ACCEPTANCE / "profiles"
+    mine = profile.load(profiles_dir / "legacy-key.env")
+    assert mine.exclusive(), "legacy-key.env must declare `# exclusive: own-restart`"
+    for path in profiles_dir.glob("*.env"):
+        if path.stem == "legacy-key":
+            continue
+        other = profile.load(path)
+        assert not any(k.startswith("NEURALSCAPE_API_KEY") or k.startswith("NEURALSCAPE_LEGACY_KEY") for k in other.flags), (
+            f"{path.name} sets the legacy shared key: it would change the auth surface of its whole run"
+        )
+        assert not other.exclusive(), f"{path.name} is exclusive: only legacy-key is"
+    assert "own-restart" in (ACCEPTANCE / "README.md").read_text(), "README Profiles must document the exclusive profile"
+
+
+def test_only_the_legacy_key_scenarios_use_the_legacy_fixtures_or_profile():
+    for path in (ACCEPTANCE / "scenarios").glob("test_*.py"):
+        text = path.read_text()
+        uses = re.search(r"\bmcp_legacy\b|profiles\([^)]*legacy-key", text)
+        assert bool(uses) == (path.name == "test_legacy_key.py"), f"{path.name}: legacy-key fixtures/profile outside test_legacy_key.py"
+    assert 'pytestmark = profiles("legacy-key")' in (ACCEPTANCE / "scenarios" / "test_legacy_key.py").read_text()
+
+
+# ── the env -> ctx handoff and the scrubber, end to end ──────────
+
+
+def test_handoff_returns_and_registers_the_exported_value_only_for_declared_variables():
+    p = profile.load(ACCEPTANCE / "profiles" / "legacy-key.env")
+    assert pytest_plugin.handoff(p, {"NS_LEGACY_KEY": KEY, "NS_OTHER": "zz" * 8}) == {"NS_LEGACY_KEY": KEY}
+    assert KEY not in tokens.scrub(f"x {KEY} y")  # registered
+    assert pytest_plugin.handoff(p, {}) == {}
+
+
+def test_every_encoded_form_of_a_registered_secret_is_redacted():
+    import base64, urllib.parse
+
+    secret = "Ab/+=zq9" + "x" * 24
+    tokens.register_secret(secret)
+    for form in (secret, urllib.parse.quote(secret, safe=""), urllib.parse.quote_plus(secret),
+                 base64.b64encode(secret.encode()).decode(), base64.urlsafe_b64encode(secret.encode()).decode().rstrip("=")):
+        assert form not in tokens.scrub(f"prefix {form} suffix"), form
+
+
+class _Stack(BaseHTTPRequestHandler):
+    """Answers only what the REST identity scenario asks; reports the identity named in ``who``."""
+
+    who = "acc-legacy"
+
+    def log_message(self, *a):
+        pass
+
+    def _send(self, body):
+        data = json.dumps(body).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_GET(self):
+        self._send({"user_id": type(self).who})
+
+    def do_POST(self):
+        self.rfile.read(int(self.headers.get("Content-Length", 0)))
+        self._send({"results": []})
+
+
+def _run_scenario(tmp_path, who):
+    handler = type("H", (_Stack,), {"who": who})
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    out = tmp_path / "res.json"
+    env = {**os.environ, "PYTHONPATH": str(ACCEPTANCE), "PYTHONDONTWRITEBYTECODE": "1", "NS_TOKEN_SECRET": "selftest-secret", "NS_LEGACY_KEY": KEY}
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-m", "pytest", "-c", str(ACCEPTANCE / "pytest.ini"), "--rootdir", str(ACCEPTANCE),
+             str(ACCEPTANCE / "scenarios" / "test_legacy_key.py"), "-p", "nsaccept.pytest_plugin", "-p", "no:cacheprovider", "-q",
+             "-k", "exactly_the_configured_identity_on_rest", "--ns-base-url", f"http://127.0.0.1:{srv.server_address[1]}",
+             "--ns-profile", "legacy-key", "--ns-out", str(out)],
+            env=env, capture_output=True, text=True,
+        )
+    finally:
+        srv.shutdown()
+        srv.server_close()
+    return proc, json.loads(out.read_text())
+
+
+def test_the_exported_key_reaches_the_legacy_fixture_end_to_end(tmp_path):
+    """Fails if the plugin stops handing NS_LEGACY_KEY to the ctx: the fixture would error instead of the scenario passing."""
+    proc, res = _run_scenario(tmp_path, "acc-legacy")
+    assert [s["result"] for s in res["scenarios"]] == ["pass"], (proc.stdout[-600:], res["scenarios"])
+
+
+def test_the_exported_key_never_reaches_the_results_even_when_a_message_would_carry_it(tmp_path):
+    """The stub answers with the key as the identity, so the assertion message names it: only the registered scrubber keeps it out."""
+    proc, res = _run_scenario(tmp_path, KEY)
+    (row,) = res["scenarios"]
+    assert row["result"] == "fail" and "<redacted-secret>" in row["detail"], row
+    assert KEY not in json.dumps(res)
