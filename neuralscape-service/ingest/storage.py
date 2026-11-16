@@ -23,6 +23,7 @@ import hashlib
 import logging
 import os
 import re
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -164,3 +165,91 @@ def artifact_source_ref(
     if extra:
         ref.update(extra)
     return ref
+
+
+# ── Orphan sweep ────────────────────────────────────────────────────
+
+
+def sweep_orphan_artifacts(
+    settings,
+    reference_count,
+    *,
+    grace_days: int,
+    dry_run: bool = True,
+    now: float | None = None,
+    max_delete: int = 1000,
+) -> dict:
+    """Remove artifacts that no memory references and that are older than the grace period.
+
+    Deleting user data is irreversible, so every guard fails closed:
+
+    * only files named like an artifact (``{16 hex}`` or ``{16 hex}.<ext>``)
+      under ``{user}/{project}/{category}/`` are considered; temp files and
+      anything else is left alone;
+    * a file younger than ``grace_days`` is never touched (an upload whose
+      ingest job is still queued, or being retried, has no rows yet);
+    * ``reference_count(user_id, file_id)`` must return exactly 0; any error
+      from it, or a non-integer answer, counts as "referenced";
+    * ``dry_run`` (the default) removes nothing and only reports;
+    * at most ``max_delete`` files per run.
+
+    The owner is the first path segment (the stored ``_safe`` user id), the
+    same value the upload used, so the reference check is scoped to that user.
+
+    Returns ``{"scanned", "referenced", "too_new", "orphans", "deleted",
+    "errors", "dry_run", "orphan_paths"}`` (paths relative to the root, capped
+    at 200 for the report).
+    """
+    root = _root(settings)
+    out = {
+        "scanned": 0, "referenced": 0, "too_new": 0, "orphans": 0,
+        "deleted": 0, "errors": 0, "dry_run": dry_run, "orphan_paths": [],
+    }
+    if not root.is_dir():
+        return out
+    cutoff = (time.time() if now is None else now) - grace_days * 86400
+    for path in sorted(root.rglob("*")):
+        if not path.is_file() or path.name.startswith("."):
+            continue
+        rel = path.relative_to(root)
+        if len(rel.parts) != 4:  # {user}/{project}/{category}/{file}
+            continue
+        file_id = path.stem if _FILE_ID_RE.fullmatch(path.stem) else (
+            path.name if _FILE_ID_RE.fullmatch(path.name) else None
+        )
+        if file_id is None:
+            continue
+        out["scanned"] += 1
+        try:
+            if path.stat().st_mtime > cutoff:
+                out["too_new"] += 1
+                continue
+            refs = reference_count(rel.parts[0], file_id)
+        except Exception:  # noqa: BLE001 - cannot prove it is orphaned: keep it
+            logger.warning("Artifact GC: reference check failed for %s; keeping it", rel, exc_info=True)
+            out["errors"] += 1
+            continue
+        if not isinstance(refs, int) or isinstance(refs, bool) or refs != 0:
+            out["referenced"] += 1
+            continue
+        out["orphans"] += 1
+        if len(out["orphan_paths"]) < 200:
+            out["orphan_paths"].append(str(rel))
+        if dry_run or out["deleted"] >= max_delete:
+            continue
+        try:
+            path.unlink()
+            out["deleted"] += 1
+            # Drop folders the removal emptied (never the storage root itself).
+            for parent in path.parents:
+                if parent == root or root not in parent.parents:
+                    break
+                try:
+                    parent.rmdir()
+                except OSError:
+                    break
+        except OSError:
+            logger.warning("Artifact GC: could not remove %s", rel, exc_info=True)
+            out["errors"] += 1
+    logger.info("Artifact GC %s: %s", "dry run" if dry_run else "sweep", {k: v for k, v in out.items() if k != "orphan_paths"})
+    return out
