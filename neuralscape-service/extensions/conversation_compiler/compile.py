@@ -254,6 +254,7 @@ async def compile_date(
     service: MemoryService,
     writer: ObsidianWriter,
     user_id: str | None = None,
+    dedup_when_empty: bool = True,
 ) -> CompileResult:
     """Compile all daily log entries for a given date into structured articles.
 
@@ -267,6 +268,13 @@ async def compile_date(
         user_id: User the compile was requested for; post-compile dedup runs
             for the owners recorded on the entries and falls back to this user
             for entries without one. Defaults to ``DEFAULT_USER_ID``.
+        dedup_when_empty: When the date has no entries to compile, still run
+            the post-compile dedup for ``user_id`` (an explicit compile
+            request is also the user's "tidy my memories" trigger, and the
+            vault only receives *shared* facts: a user whose memories are all
+            private has no entries but still has near-duplicates).
+            ``compile_all_pending`` passes False so a backlog of empty dates
+            does not scan the pool once per date.
 
     Returns:
         CompileResult with details of what was compiled.
@@ -282,7 +290,15 @@ async def compile_date(
     entries = writer.get_daily_log_entries(date)
     if not entries:
         logger.info("No entries found for date", date=date)
-        return CompileResult(date=date)
+        if not dedup_when_empty:
+            return CompileResult(date=date)
+        dedup_ok, sibling_enqueued, sibling_failed = await _dedup_compiled_users(service, [], user_id)
+        return CompileResult(
+            date=date,
+            dedup_triggered=dedup_ok,
+            dedup_graph_jobs_enqueued=sibling_enqueued,
+            dedup_graph_jobs_not_enqueued=sibling_failed,
+        )
 
     # Group entries
     grouped = _group_entries(entries)
@@ -439,7 +455,9 @@ async def compile_all_pending(
     results = []
     for date in uncompiled:
         try:
-            result = await compile_date(date, service, writer, user_id=user_id)
+            result = await compile_date(
+                date, service, writer, user_id=user_id, dedup_when_empty=False
+            )
             results.append(result)
         except Exception:
             logger.exception("Failed to compile date", date=date)

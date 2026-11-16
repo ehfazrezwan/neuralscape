@@ -163,6 +163,44 @@ def test_compile_dedup_tombstone_is_reversible(ctx, a, flushed):
     assert plain_n == 1, f"the plain listing should show one copy, got {plain_n}"
 
 
+@proves("delete.bulk", "queue.dedup-cron")
+@profiles("dedup-tombstone")
+def test_filtered_bulk_delete_erases_a_dedup_tombstoned_row(ctx, a, flushed):
+    """A category-filtered DELETE /v1/memories erases the tombstoned older copy too (no listing, even the audit one, keeps it)."""
+    assert flushed["task"].get("status") == "completed", "precondition: flush did not complete"
+    project = f"{ctx.project_id}-tombdel"   # its own project: the sweep must not touch other scenarios' rows
+    marker = f"zq-{ctx.run_id}-tombdel"
+    older = f"{marker} The nightly report job runs at 02:00 UTC on weekdays"
+    for text in (older, f"{older}."):
+        task = a.store_raw(text, "convention", scope="project", project_id=project, visibility="private")
+        assert a.poll_task(task, timeout=120)["status"] == "completed"
+        time.sleep(1.1)  # distinct created_at, so "older" is well defined
+    eventually(lambda: check_both_copies_recalled(a, marker, project), timeout=90, what="both copies recalled")
+    resp = a.post(f"{PREFIX}/compile", json={"date": _today(), "user_id": a.user_id})
+    assert resp.status_code == 202, f"POST /compile -> {resp.status_code}"
+    done = a.poll_task(resp.json()["task_id"], timeout=300)
+    assert done.get("status") == "completed"
+    assert (done.get("result") or {}).get("dedup_triggered") is True, f"dedup did not run: {done}"
+    eventually(lambda: check_pair_collapsed_to_the_newer(a, marker, project), timeout=60, what="older copy hidden")
+
+    def audit_rows():
+        r = a.get("/v1/memories", params={"project_id": project, "limit": 200, "include_tombstoned": "true"})
+        assert r.status_code == 200, f"audit listing -> {r.status_code}"
+        return [m for m in r.json() if marker in m.get("memory", "")]
+
+    assert len(audit_rows()) == 2, "precondition: the older copy should be tombstoned, still on disk"
+
+    out = a.request("DELETE", "/v1/memories", json={"project_id": project, "category": "convention"})
+    assert out.status_code == 200, f"bulk DELETE -> {out.status_code}: {out.text[:160]}"
+    assert "tombstoned" in out.json().get("message", ""), f"the tombstone was not counted: {out.json()}"
+
+    def check_erased():
+        left = audit_rows()
+        assert not left, f"{len(left)} row(s) survived the filtered bulk delete (tombstone kept?)"
+
+    eventually(check_erased, timeout=60, what="tombstoned row erased")
+
+
 @proves("ext.compiler-compile", "queue.dedup-cron")
 @negative_control
 def test_dedup_check_fails_for_a_user_without_the_pair(ctx, b, flushed):
