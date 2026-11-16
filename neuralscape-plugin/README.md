@@ -192,8 +192,8 @@ Everything the plugin does against the service goes through the MCP tools above,
 | `GET /v1/memories` | PreToolUse (read gate) | File-memory lookup for the read gate |
 | `POST /v1/memories/raw` | PreCompact | Store the compact snapshot |
 | `POST /v1/checkpoint` | SessionEnd | Store the structured session note |
-| `POST /v1/extensions/conversation-compiler/flush` | Stop, PreCompact, framework adapter `message:sent` | Deliver a conversation turn |
-| `POST /v1/extensions/conversation-compiler/compile` | Stop, framework adapter `session:end` | Compile the day's turns |
+| `POST /v1/extensions/conversation-compiler/flush` | Stop, SessionEnd (a final turn the Stop hooks left pending), PreCompact, framework adapter `message:sent` | Deliver a conversation turn |
+| `POST /v1/extensions/conversation-compiler/compile` | Stop (at most once per compile interval), SessionEnd (what is left), framework adapter `session:end` | Compile the day's turns |
 
 ### From the skills (REST, via curl)
 
@@ -246,6 +246,7 @@ The plugin reads from `userConfig` prompts (modern) or env vars (legacy fallback
 |  | *Default when unset:* the hooks fall back to the **OS username** (`$USER` / `$USERNAME`) so zero-config local installs keep a stable identity. Set it explicitly on shared machines or if your OS username isn't the id you want memories filed under. Servers with token auth derive identity from the Bearer token and ignore client-claimed ids. | |
 | Compile threshold (obs) | `CLAUDE_PLUGIN_OPTION_COMPILE_THRESHOLD` (default `25`) | `NEURALSCAPE_COMPILE_THRESHOLD` |
 | Compile age (minutes) | `CLAUDE_PLUGIN_OPTION_COMPILE_AGE_MIN` (default `30`) | `NEURALSCAPE_COMPILE_AGE_MIN` |
+| Conversation compile interval (minutes) | `CLAUDE_PLUGIN_OPTION_COMPILE_INTERVAL_MIN` (default `15`; `0` = after every Stop that delivered a turn) | `NEURALSCAPE_COMPILE_INTERVAL_MIN` |
 | SessionStart context mode | `CLAUDE_PLUGIN_OPTION_CONTEXT_MODE` (`index` default \| `full` legacy) | `NEURALSCAPE_CONTEXT_MODE` |
 | Index budget (tokens) | `CLAUDE_PLUGIN_OPTION_INDEX_BUDGET_TOKENS` (default `1500`) | `NEURALSCAPE_INDEX_BUDGET_TOKENS` |
 | Code-graph deferral | `CLAUDE_PLUGIN_OPTION_CODE_GRAPH` (`auto` default \| `on` \| `off`) | `NEURALSCAPE_CODE_GRAPH` |
@@ -342,9 +343,26 @@ as an env-var alias.
 Wrap anything in `<private>…</private>` and the plugin will never store or
 transmit it: the spans are replaced with `[redacted]` **before** observation
 rows hit disk, before conversation turns are flushed to the compiler, and
-before session-note fields go into a checkpoint. Redaction is case-insensitive
-and fail-closed — an unclosed `<private>` redacts to the end of the text. The
-compile-observations skill additionally skips any work unit containing
+before session-note fields go into a checkpoint.
+
+- **Fail-closed.** Text that leaves the machine or is written to disk is
+  redacted fail-closed: an unclosed `<private>` redacts to the end of the text
+  (so a multi-line private span cannot leak its later lines), and a closing tag
+  with no opener redacts back to the start of the text. The cost is that prose
+  which merely *mentions* the tag loses what follows it.
+- **Nesting.** Spans nest: the span ends at the closing tag that balances the
+  outermost opener, and everything between inner and outer closers stays inside.
+- **Spelling.** The tag is matched case-insensitively and tolerates whitespace and
+  attributes (`< private >`, `<PRIVATE reason="draft">`, `</ private >`) and the
+  HTML-escaped form (`&lt;private&gt;` … `&lt;/private&gt;`). Other encodings
+  (numeric entities such as `&#60;private&#62;`, URL-encoded or Unicode look-alike
+  characters, full-width `＜private＞` or zero-width-joined look-alikes) are **not** recognised: use the literal ASCII tag. A tag whose closing `>` is missing (`<private` at the end of a text, `<private foo` with no `>`) counts as an opener when redacting fail-closed. A word that only starts
+  with `private` (`<privateer>`, `<private-note>`) is not a tag.
+- **Across entries.** A span may open in the prompt and close in the answer, or
+  open in one assistant message and close in a later one: the session note and the
+  flushed turn are redacted over the whole turn.
+
+The compile-observations skill additionally skips any work unit containing
 `<private>` content entirely.
 
 ## Hook failure taxonomy (never-block contract)

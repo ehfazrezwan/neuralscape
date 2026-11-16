@@ -6,7 +6,7 @@
  * Fallback: if no transcript, uses prompt + last_assistant_message for the last turn.
  */
 
-import { readFile, rename, unlink, writeFile } from "node:fs/promises";
+import { open, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { getProjectId, getUserId, logError } from "../utils.js";
 import type { FlushResult } from "../core/flush.js";
 import type { ConversationTurn, SessionEndInput } from "../core/types.js";
@@ -118,34 +118,116 @@ function extractText(msg: TranscriptMessage): string {
   return text;
 }
 
-function parseMessages(content: string): TranscriptMessage[] {
+/** Counters for tests: how much transcript text the adapter parsed (JSON lines) and how it read the file. */
+export const transcriptStats = { linesParsed: 0, fullReads: 0, tailReads: 0 };
+
+function parseLine(line: string): TranscriptMessage | null {
+  transcriptStats.linesParsed++;
+  try {
+    return JSON.parse(line);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Parse transcript text. `document` is true when the text is one JSON array (not JSONL); `consumed` is the
+ * number of leading characters that hold only complete lines, so an incremental reader can resume from there
+ * (a last line that does not parse yet is a half-written line, and is left for the next read).
+ */
+function parseTranscriptText(content: string): { messages: TranscriptMessage[]; document: boolean; consumed: number } {
   try {
     // Try JSON array first
     const parsed = JSON.parse(content);
-    if (Array.isArray(parsed)) return parsed;
+    if (Array.isArray(parsed)) {
+      transcriptStats.linesParsed += parsed.length;
+      return { messages: parsed, document: true, consumed: content.length };
+    }
   } catch {
     // not one JSON document: JSONL below
   }
   // JSONL (one object per line; a single-line file parses as one object above and lands here too)
-  return content
+  const lastBreak = content.lastIndexOf("\n");
+  const complete = content.slice(0, lastBreak + 1);
+  const tail = content.slice(lastBreak + 1);
+  const messages = complete
     .split("\n")
     .filter((line) => line.trim())
-    .map((line) => {
-      try {
-        return JSON.parse(line);
-      } catch {
-        return null;
-      }
-    })
+    .map(parseLine)
     .filter(Boolean) as TranscriptMessage[];
+  let consumed = complete.length;
+  if (tail.trim()) {
+    const last = parseLine(tail);
+    if (last) {
+      messages.push(last);
+      consumed = content.length;
+    }
+  } else {
+    consumed = content.length;
+  }
+  return { messages, document: false, consumed };
 }
+
+function parseMessages(content: string): TranscriptMessage[] {
+  return parseTranscriptText(content).messages;
+}
+
+const isConversation = (m: TranscriptMessage): boolean => {
+  const role = roleOf(m) ?? m.message?.role;
+  return role === "user" || role === "assistant";
+};
 
 /** The user/assistant entries, in order. An offset counts positions in this list. */
 function relevantMessages(content: string): TranscriptMessage[] {
-  return parseMessages(content).filter((m) => {
-    const role = roleOf(m) ?? m.message?.role;
-    return role === "user" || role === "assistant";
-  });
+  return parseMessages(content).filter(isConversation);
+}
+
+/**
+ * Reads a transcript that is still being written. The first read parses the whole file; each later read
+ * parses only the bytes appended since (the lag wait polls the file up to ~30 times, and a long
+ * session's transcript is many megabytes). A file that shrank, or is one JSON document instead of
+ * JSONL, is read in full again.
+ */
+class TranscriptReader {
+  private all: TranscriptMessage[] = [];
+  private bytes = 0;
+  private loaded = false;
+  private document = false;
+
+  constructor(private readonly path: string) {}
+
+  /** The conversation entries now in the file. */
+  async read(): Promise<TranscriptMessage[]> {
+    const size = (await stat(this.path)).size;
+    if (!this.loaded || this.document || size < this.bytes) return this.readAll();
+    if (size === this.bytes) return this.all.filter(isConversation);
+    const handle = await open(this.path, "r");
+    let appended: Buffer;
+    try {
+      appended = Buffer.alloc(size - this.bytes);
+      const { bytesRead } = await handle.read(appended, 0, appended.length, this.bytes);
+      appended = appended.subarray(0, bytesRead);
+    } finally {
+      await handle.close();
+    }
+    transcriptStats.tailReads++;
+    const text = appended.toString("utf-8");
+    const { messages, consumed } = parseTranscriptText(text);
+    this.all.push(...messages);
+    this.bytes += Buffer.byteLength(text.slice(0, consumed), "utf-8");
+    return this.all.filter(isConversation);
+  }
+
+  private async readAll(): Promise<TranscriptMessage[]> {
+    transcriptStats.fullReads++;
+    const content = await readFile(this.path, "utf-8");
+    const { messages, document, consumed } = parseTranscriptText(content);
+    this.all = messages;
+    this.document = document;
+    this.bytes = Buffer.byteLength(content.slice(0, consumed), "utf-8");
+    this.loaded = true;
+    return this.all.filter(isConversation);
+  }
 }
 
 interface ParsedTurn {
@@ -169,10 +251,10 @@ interface ParsedTurn {
  * With ``expectedFinal`` (the Stop event's ``last_assistant_message``) the last turn is delivered only when its
  * assistant text ends with that message.  The transcript is written asynchronously and can lag the conversation:
  * a turn whose final answer has not been written yet is ``lagging``, kept pending exactly like an unanswered
- * prompt (its prompt stays unread), and delivered once, complete, by a later flush.
+ * prompt (its prompt stays unread), and delivered, complete, by a later flush (the next Stop, or the SessionEnd hook).
  */
 function parseTranscript(
-  content: string,
+  source: string | TranscriptMessage[],
   startOffset: number,
   options: { expectedFinal?: string } = {}
 ): {
@@ -180,7 +262,8 @@ function parseTranscript(
   newOffset: number;
   lagging: boolean;
 } {
-  const window = relevantMessages(content).slice(startOffset);
+  const conversation = typeof source === "string" ? relevantMessages(source) : source;
+  const window = conversation.slice(startOffset);
   const turns: ParsedTurn[] = [];
   let user: { text: string; index: number } | null = null;
   let assistantParts: string[] = [];
@@ -265,11 +348,13 @@ export async function extractClaudeCodeTurns(
     try {
       const offset = await readFlushOffset(transcriptPath);
       const expectedFinal = expectedFinalOf(raw);
-      let parsed = parseTranscript(await readFile(transcriptPath, "utf-8"), offset, { expectedFinal });
-      // The transcript is written asynchronously: give a lagging final answer a moment to land.
+      const reader = new TranscriptReader(transcriptPath);
+      let parsed = parseTranscript(await reader.read(), offset, { expectedFinal });
+      // The transcript is written asynchronously: give a lagging final answer a moment to land. Each poll reads
+      // only what was appended since the last one.
       for (let waited = 0; parsed.lagging && waited < lagWaitMs(); waited += LAG_POLL_MS) {
         await pause(LAG_POLL_MS);
-        parsed = parseTranscript(await readFile(transcriptPath, "utf-8"), offset, { expectedFinal });
+        parsed = parseTranscript(await reader.read(), offset, { expectedFinal });
       }
       const { turns, newOffset } = parsed;
       if (parsed.lagging && turns.length === 0) return []; // nothing finished yet: the turn waits for the next flush
