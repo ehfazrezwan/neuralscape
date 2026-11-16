@@ -151,18 +151,6 @@ class DreamingSettings(BaseSettings):
         ),
     )
 
-    # ── Promotion gates (deep phase) ──
-    min_recall_count: int = Field(
-        default=2,
-        ge=0,
-        description="Deep promotion gate: minimum recalls for reinforcement-based promotion.",
-    )
-    min_unique_queries: int = Field(
-        default=2,
-        ge=0,
-        description="Deep promotion gate: minimum distinct query hashes.",
-    )
-
     # ── REM ──
     reflection_enabled: bool = Field(
         default=True,
@@ -200,23 +188,7 @@ class DreamingSettings(BaseSettings):
         ),
     )
 
-    # ── Trace window (recall reinforcement) ──
-    trace_ttl_days: int = Field(
-        default=30,
-        ge=1,
-        le=365,
-        description="Rolling window for recall traces in Redis.",
-    )
-
     # ── LLM ──
-    model: str = Field(
-        default="",
-        description=(
-            "Override the model used for consolidation/reflection. Empty "
-            "inherits the Neuralscape default. The dreamer is not latency-"
-            "constrained — prefer a stronger model than the extraction path."
-        ),
-    )
     llm_timeout_seconds: int = Field(
         default=300,
         ge=30,
@@ -296,7 +268,6 @@ class DreamingSettings(BaseSettings):
         "env_file": ".env",
         "env_file_encoding": "utf-8",
         "extra": "ignore",
-        "protected_namespaces": (),  # allow the `model` field name
     }
 
     @property
