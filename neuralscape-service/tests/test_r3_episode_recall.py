@@ -293,6 +293,63 @@ class TestR3SearchIntegration:
         assert len(episode_rows) == 1
 
 
+_WORDS = [f"{a}{b}" for a in "bcdfghjklm" for b in ("ar", "el", "ix", "um")]
+
+
+class TestR3EpisodeRowsSurviveTruncation:
+    """Episode rows are unscored, so fusion ranks them last; a plain top-k slice dropped
+    every one of them whenever the scored legs alone filled ``limit``."""
+
+    @staticmethod
+    def _recall(service, *, edges: int, episodes: int, limit: int):
+        mock_mem = MagicMock()
+        mock_mem.embedding_model.embed.return_value = [0.1] * 768
+        mock_mem.search.return_value = {"results": []}
+        graph_result = {
+            "edges": [
+                {"uuid": f"edge-{i}", "fact": f"{_WORDS[i]} sits beside {_WORDS[(i + 7) % 40]} in service {i * 7919}", "name": f"e{i}", "fact_embedding": [0.5] * 768}
+                for i in range(edges)
+            ],
+            "episodes": [
+                {"uuid": f"{i:012d}-ep", "content": f"Episode {i} content", "created_at": None}
+                for i in range(episodes)
+            ],
+            "nodes": [],
+            "communities": [],
+        }
+        with patch.object(service, "_get_memory", return_value=mock_mem), \
+                patch.object(service, "_do_graph_search", return_value=graph_result), \
+                patch.object(service, "_enrich_graph_results"), \
+                patch.object(service, "_enrich_graph_with_v2", side_effect=lambda responses, **kw: responses), \
+                patch("memory.search.settings.graph_episode_recall_enabled", True):
+            return service.search(query="test query", user_id="test_user", project_id=None, limit=limit)
+
+    def test_episode_rows_are_kept_when_scored_rows_fill_the_limit(self, service):
+        results = self._recall(service, edges=12, episodes=2, limit=12)
+
+        assert len(results) == 12
+        assert [r.source for r in results].count("episode") == 2
+        # unscored rows still rank last, and the cut came out of the scored tail
+        assert [r.source for r in results[-2:]] == ["episode", "episode"]
+        assert all(r.score is not None for r in results[:-2])
+
+    def test_episode_rows_never_grow_the_list_past_the_limit(self, service):
+        results = self._recall(service, edges=30, episodes=3, limit=10)
+
+        assert len(results) == 10
+        assert [r.source for r in results].count("episode") == 2  # limit // 4 slots at most
+
+    def test_a_tiny_limit_keeps_its_scored_hits(self, service):
+        results = self._recall(service, edges=5, episodes=3, limit=3)
+
+        assert [r.source for r in results] == ["graph"] * 3
+
+    def test_no_episodes_means_the_plain_slice(self, service):
+        results = self._recall(service, edges=12, episodes=0, limit=5)
+
+        assert len(results) == 5 and {r.source for r in results} == {"graph"}
+
+
 class TestR3AskEvidenceCap:
     """Test that ask evidence caps episode rows at 3 total."""
 
