@@ -2085,7 +2085,7 @@ async def startup(ctx: dict) -> None:
     if not settings.ledger_enabled:
         from ledger import warn_if_ledger_bypassed
 
-        warn_if_ledger_bypassed(settings, logger)
+        await asyncio.to_thread(warn_if_ledger_bypassed, settings, logger)  # may probe a configured PostgreSQL
     if settings.ledger_enabled:
         from ledger import open_ledger
         from write_producer import open_payload_store
