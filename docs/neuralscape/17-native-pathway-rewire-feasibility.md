@@ -1,5 +1,7 @@
 # Decoupling Neuralscape onto the Engines' "Best Pathways": Feasibility & Effort
 
+> **Status (as of 2026-11-16, dev 6a81341f):** snapshot. A decision record from 2026-06-22. Its conclusions (most bypasses are deliberate or structurally forced; do not rewire everything through the native pathways) still describe the architecture. Line numbers in this page are as of the snapshot and refer to the pre-split `memory_service.py`; that code now lives in the `memory/` package (`write.py`, `search.py`, `reads.py`, `edit.py`, `delete.py`, `graph_admin.py`, `core.py`, `groups.py`, `junk.py`, `retry.py`, `ranking.py`), with `memory_service.py` as a thin facade. `graphiti_memory.py` citations have drifted the same way.
+
 *Investigation 2026-06-22, with `git blame`/`git log` on every bypass site to recover original rationale. Question asked: "If we rewired all of NS to go through the best-performing pathways mem0 and graphiti provide, what would that look like and how much work?" Sources: vendored mem0 2.0.2, graphiti 0.28.2; upstream mem0 2.0.7, graphiti 0.29.2; NS service git history.*
 
 ---

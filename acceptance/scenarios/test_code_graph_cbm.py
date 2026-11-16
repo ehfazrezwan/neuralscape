@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 
 import pytest
 
-from nsaccept import expect_check_fails, needs, negative_control, profiles, proves
+from nsaccept import expect_check_fails, needs, negative_control, precondition, profiles, proves
 
 from cg_helpers import SYMBOL, cg_get, check_mentions, mcp_text
 
@@ -80,6 +80,7 @@ def test_cbm_answers_query_neighbors_and_locate_over_rest_and_mcp(a, mcp_a, cbm:
 @negative_control
 def test_cbm_check_fails_for_a_symbol_that_does_not_exist(ctx, a, cbm: Cbm):
     c = _ready(cbm)
+    precondition(check_mentions, cg_get(a, "query", question=SYMBOL, graph_id=c.code_space, knowledge_system=SYSTEM)["result"], SYMBOL, what="querying the real symbol finds it")
     q = cg_get(a, "query", question=f"zq_{ctx.run_id}_no_such_symbol", graph_id=c.code_space, knowledge_system=SYSTEM)
     expect_check_fails(check_mentions, q["result"], SYMBOL)
 
@@ -88,7 +89,7 @@ def test_cbm_check_fails_for_a_symbol_that_does_not_exist(ctx, a, cbm: Cbm):
 def test_deleting_the_cbm_project_empties_it(a, cbm: Cbm):
     c = _ready(cbm)
     before = cg_get(a, "query", question=SYMBOL, graph_id=c.code_space, knowledge_system=SYSTEM)
-    check_mentions(before["result"], SYMBOL)  # a real hit exists before the delete
+    check_mentions(before["result"], SYMBOL, "router")  # a real hit names its file/module; an empty answer only echoes the question
     r = a.delete("/v1/code-graph/graph", params={"graph_id": c.code_space, "system": SYSTEM})
     assert r.status_code == 200 and r.json().get("deleted") is True, f"DELETE -> {r.status_code}: {r.text[:200]}"
     engine = r.json().get("engine_result") or {}
@@ -97,4 +98,4 @@ def test_deleting_the_cbm_project_empties_it(a, cbm: Cbm):
     after = a.get("/v1/code-graph/query", params={"question": SYMBOL, "graph_id": c.code_space, "knowledge_system": SYSTEM})
     # the project is gone: the service answers 200 with no hit (never a 5xx, never the symbol)
     assert after.status_code == 200, f"query after delete -> {after.status_code}: {after.text[:200]}"
-    assert SYMBOL not in after.json().get("result", ""), f"the deleted CBM project still answers: {after.text[:200]}"
+    assert "router" not in after.json().get("result", ""), f"the deleted CBM project still answers: {after.text[:200]}"

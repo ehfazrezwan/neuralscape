@@ -17,7 +17,8 @@ import httpx
 
 from . import caps, guard, profile as profile_mod, runctx
 from .decor import DEFAULT_PROFILES
-from .fixtures import a, anon, b, bad, ctx, dictator, mcp_a, mcp_b, mcp_dictator, sink  # noqa: F401  (registered as fixtures)
+from .fixtures import a, anon, b, bad, ctx, dictator, legacy, mcp_a, mcp_b, mcp_dictator, mcp_legacy, sink  # noqa: F401  (registered as fixtures)
+from . import tokens as tokens_mod
 from .tokens import scrub
 
 ACCEPTANCE_DIR = Path(__file__).resolve().parents[1]
@@ -38,12 +39,18 @@ def pytest_addoption(parser):
     )
 
 
+def _expected_red(item) -> str | None:
+    marker = item.get_closest_marker("ns_expected_red")
+    return str(marker.args[0]) if marker and marker.args else None
+
+
 def pytest_configure(config):
     for name, doc in (
         ("ns_proves", "atlas node ids this scenario is evidence for"),
         ("ns_profiles", "profiles this scenario runs under (default: default)"),
         ("ns_needs", "capabilities required; scenario skips when absent"),
         ("ns_negative_control", "scenario is a negative control"),
+        ("ns_expected_red", "scenario is known to fail until the referenced PR lands"),
     ):
         config.addinivalue_line("markers", f"{name}: {doc}")
     config._ns_state = {}
@@ -100,6 +107,7 @@ def pytest_collection_modifyitems(config, items):
                 "proves": _marker_args(it, "ns_proves"),
                 "profiles": list(item_profiles(it)),
                 "negative_control": it.get_closest_marker("ns_negative_control") is not None,
+                "expected_red": _expected_red(it),
                 "needs": _marker_args(it, "ns_needs"),
             }
             for it in items
@@ -145,6 +153,19 @@ def _same_commit(a: str, b: str) -> bool:
     return a.startswith(b) or b.startswith(a)
 
 
+def handoff(prof, environ=None) -> dict:
+    """The harness variables the gate exported for this profile (``# harness-env:``), registered with the
+    scrubber so none of them can reach the results, whatever prints it."""
+    environ = os.environ if environ is None else environ
+    handed = {}
+    for var in prof.harness_env():
+        value = (environ.get(var) or "").strip()
+        if value:
+            handed[var] = value
+            tokens_mod.register_secret(value)
+    return handed
+
+
 def pytest_collection_finish(session):
     config = session.config
     if config.getoption("--ns-list-out"):
@@ -169,6 +190,12 @@ def pytest_collection_finish(session):
         )
     config._ns_stack_commit = stack
     flags, _ = _profile_info(config.getoption("--ns-profile"))
+    prof = profile_mod.load(ACCEPTANCE_DIR / "profiles" / f"{config.getoption('--ns-profile')}.env")
+    handed = {}
+    if prof is not None:
+        if prof.harness_env_errors():
+            pytest.exit("harness misconfiguration: " + "; ".join(prof.harness_env_errors()), returncode=2)
+        handed = handoff(prof)
     dictator_ids = [u.strip() for u in flags.get("DICTATOR_USER_IDS", "").split(",") if u.strip()]
     try:
         config._ns_ctx = runctx.build(
@@ -177,6 +204,7 @@ def pytest_collection_finish(session):
             config.getoption("--ns-compose-project"),
             profile_flags=flags,
             dictator_user=dictator_ids[0] if dictator_ids else None,
+            legacy_key=handed.get("NS_LEGACY_KEY"),
         )
     except runctx.ConfigError as exc:
         pytest.exit(f"harness misconfiguration: {scrub(str(exc))}", returncode=2)
@@ -213,8 +241,11 @@ def pytest_runtest_makereport(item, call):
             "seconds": 0.0,
             "detail": "",
             "negative_control": item.get_closest_marker("ns_negative_control") is not None,
+            "expected_red": _expected_red(item),
         },
     )
+    if _expected_red(item):
+        state["expected_red"] = _expected_red(item)  # only marked rows carry the key: a known red is not evidence
     state["seconds"] += rep.duration
     if rep.passed:
         return
@@ -247,6 +278,25 @@ def _results_path(config, commit: str) -> Path:
     return ACCEPTANCE_DIR / "results" / f"{profile}-{commit[:12]}.json"
 
 
+def _finalize(s: dict) -> dict:
+    """Per-scenario evidence rules for the results JSON: expected-red and negative-control rows are never
+    node evidence; an expected-red scenario that passes is flagged."""
+    out = dict(s)
+    out["seconds"] = round(out["seconds"], 2)
+    out["evidence"] = not (out.get("expected_red") or out.get("negative_control"))
+    out["unexpected_pass"] = bool(out.get("expected_red")) and out.get("result") == "pass"
+    return out
+
+
+def pytest_terminal_summary(terminalreporter, config):
+    state = getattr(config, "_ns_state", None) or {}
+    unexpected = [s["id"] for s in state.values() if s.get("expected_red") and s.get("result") == "pass"]
+    if unexpected:
+        terminalreporter.write_line(
+            f"ns: {len(unexpected)} expected-red scenario(s) PASSED (drop the marker?): " + ", ".join(unexpected)
+        )
+
+
 def pytest_sessionfinish(session, exitstatus):
     config = session.config
     if config.getoption("--ns-list-out") or not config._ns_state:
@@ -263,7 +313,7 @@ def pytest_sessionfinish(session, exitstatus):
         "started": _utc(config._ns_started),
         "finished": _utc(_dt.datetime.now(_dt.timezone.utc)),
         "scenarios": [
-            {**s, "seconds": round(s["seconds"], 2)} for s in config._ns_state.values()
+            _finalize(s) for s in config._ns_state.values()
         ],
     }
     path = _results_path(config, commit)

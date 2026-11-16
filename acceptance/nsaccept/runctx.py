@@ -10,7 +10,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Callable
 
-from . import guard, tokens
+from . import guard, restore, tokens
 
 
 class ConfigError(RuntimeError):
@@ -36,6 +36,10 @@ class Ctx:
     profile_flags: dict = field(default_factory=dict)
     dictator_user: str | None = None
     token_dictator: str | None = field(default=None, repr=False)
+    # The `legacy-key` profile: the gate-generated NEURALSCAPE_API_KEY (handed over through the
+    # profile's `# harness-env:` header) and the one identity it is bound to. Never in the repr or results.
+    legacy_key: str | None = field(default=None, repr=False)
+    legacy_user: str | None = None
 
     def compose(
         self,
@@ -43,6 +47,8 @@ class Ctx:
         check: bool = True,
         timeout: float = 120.0,
         run: Callable[..., subprocess.CompletedProcess] = subprocess.run,
+        backup_root: str | None = None,
+        stdin_path: str | None = None,
     ) -> subprocess.CompletedProcess:
         """``docker compose -p <project> <args...>`` against the campaign stack.
 
@@ -54,7 +60,10 @@ class Ctx:
         """
         if not self.compose_project:
             raise ConfigError("ctx.compose needs --compose-project (or NS_COMPOSE_PROJECT)")
-        return run_compose(self.compose_project, *args, check=check, timeout=timeout, run=run)
+        return run_compose(
+            self.compose_project, *args, check=check, timeout=timeout, run=run,
+            backup_root=backup_root, stdin_path=stdin_path,
+        )
 
 
 _CONTAINER_ID = __import__("re").compile(r"^[0-9a-f]{12,64}$")
@@ -85,7 +94,7 @@ def parse_ps_json(text: str) -> list[dict]:
     return [json.loads(line) for line in text.splitlines() if line.strip()]
 
 
-COMPOSE_VERBS = frozenset({"pause", "unpause", "stop", "start", "restart", "ps", "logs", "top", "exec", "up"})
+COMPOSE_VERBS = frozenset({"pause", "unpause", "stop", "start", "restart", "ps", "logs", "top", "exec", "up", "run", "cp", "config"})
 # `up` may only start existing containers: detached, no build, no recreate.
 UP_REQUIRED_FLAGS = ("-d", "--no-build", "--no-recreate")
 UP_ALLOWED_FLAGS = UP_REQUIRED_FLAGS + ("--no-deps",)
@@ -122,7 +131,12 @@ def run_compose(
     check: bool = True,
     timeout: float = 120.0,
     run: Callable[..., subprocess.CompletedProcess] = subprocess.run,
+    backup_root: str | None = None,
+    stdin_path: str | None = None,
 ) -> subprocess.CompletedProcess:
+    """Run one allow-listed ``docker compose`` command. ``run``/``cp`` (the backup
+    restore shapes in ``restore.py``) additionally need ``backup_root``, the
+    scenario's own temp directory; ``stdin_path`` feeds the files-extract form."""
     project = guard.check_compose_project(project)
     if not args or args[0] not in COMPOSE_VERBS:
         raise ConfigError(f"compose verb {args[:1]!r} is not allowed (allowed: {sorted(COMPOSE_VERBS)})")
@@ -135,13 +149,34 @@ def run_compose(
             raise ConfigError(f"`up` may only name the API/worker services {app_services()}, got {names}")
     if args[0] == "exec":
         qdrant_form = len(args) == 6 and args[1:5] == ("-T", qdrant_service(), "sh", "-c")
-        if not qdrant_form and not read_only_exec(args):
+        if not qdrant_form and not read_only_exec(args) and not restore.destructive_exec(args):
             raise ConfigError(
                 f"`exec` is only allowed as: exec -T {qdrant_service()} sh -c <script>, "
-                "or one of the read-only inspections (vault grep, connector vault record)"
+                "one of the read-only inspections (vault grep, connector vault record), "
+                "or redis-cli FLUSHALL with NS_ALLOW_DESTRUCTIVE=1"
             )
-    cmd = ["docker", "compose", "-p", project, *args]
-    proc = run(cmd, capture_output=True, text=True, timeout=timeout)
+    stdin_fh = None
+    if args[0] in ("run", "cp", "config"):
+        try:
+            restore.validate_restore_args(args, backup_root, stdin_path)
+        except restore.RestoreRefused as exc:
+            raise ConfigError(str(exc)) from exc
+    elif backup_root is not None or stdin_path is not None:
+        raise ConfigError("backup_root / stdin_path only go with the restore shapes (run, cp)")
+    try:
+        files = restore.compose_file_args()
+    except restore.RestoreRefused as exc:
+        raise ConfigError(str(exc)) from exc
+    cmd = ["docker", "compose", "-p", project, *files, *args]
+    kw: dict = {"cwd": str(restore.repo_root())} if files else {}
+    try:
+        if stdin_path is not None:
+            stdin_fh = open(stdin_path, "rb")
+            kw["stdin"] = stdin_fh
+        proc = run(cmd, capture_output=True, text=True, timeout=timeout, **kw)
+    finally:
+        if stdin_fh is not None:
+            stdin_fh.close()
     if check and proc.returncode != 0:
         raise RuntimeError(
             f"`docker compose -p {project} {' '.join(args)}` exited {proc.returncode}: "
@@ -168,6 +203,7 @@ def build(
     compose_project: str | None = None,
     profile_flags: dict | None = None,
     dictator_user: str | None = None,
+    legacy_key: str | None = None,
 ) -> Ctx:
     run_id = new_run_id()
     project_id = f"acc-{run_id}-proj"
@@ -210,6 +246,7 @@ def build(
             token_dictator = _mint_dictator(compose_project, dictator_user)
         elif secret:
             token_dictator = tokens.mint_local(dictator_user, secret)
+    tokens.register_secret(legacy_key)
     return Ctx(
         base_url=base_url.rstrip("/"),
         profile=profile,
@@ -225,6 +262,8 @@ def build(
         profile_flags=dict(profile_flags or {}),
         dictator_user=dictator_user if token_dictator else None,
         token_dictator=token_dictator,
+        legacy_key=legacy_key or None,
+        legacy_user=((profile_flags or {}).get("NEURALSCAPE_API_KEY_USER_ID") or "").strip() or None,
     )
 
 

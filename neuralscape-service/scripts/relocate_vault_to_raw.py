@@ -3,10 +3,14 @@
 The conversation-compiler used to write everything to the vault root:
 ``Daily/``, ``Sessions/``, ``Projects/``, ``Decisions/``, ``Research/``,
 the per-category folders (``Semantic/`` etc.), and a few index files.
-That collides with the new ``Wiki/`` tree produced by the wiki_synthesizer
-extension, which wants the vault root reserved for synthesized topical
-wikis. This script moves the existing rolled-up content into ``_raw/``
-so the two trees can coexist.
+That collides with the synthesized, subject-first tree the dreaming
+librarian writes (``Projects/``, ``Knowledge/``, ``Home.md``) at the vault root.
+This script moves the existing rolled-up content into ``_raw/`` so the two trees
+can coexist. Run it once, on a vault written by an older compiler.
+
+``Projects/`` is the one name both trees use. When ``Home.md`` exists at the vault
+root the librarian already owns ``Projects/``, so a forward move leaves it in place
+(with a warning) instead of burying the synthesized pages under ``_raw/``.
 
 Usage:
 
@@ -59,6 +63,10 @@ TOP_LEVEL_FILES = (
 
 RAW_DIRNAME = "_raw"
 
+# Written by the dreaming librarian at the vault root; its presence means ``Projects/``
+# holds synthesized topic pages.
+LIBRARIAN_MARKER = "Home.md"
+
 
 def plan_moves(vault: Path, reverse: bool) -> list[tuple[Path, Path]]:
     """Compute the (source, destination) pairs that need to move.
@@ -70,7 +78,18 @@ def plan_moves(vault: Path, reverse: bool) -> list[tuple[Path, Path]]:
     pairs: list[tuple[Path, Path]] = []
     raw_root = vault / RAW_DIRNAME
 
+    librarian_owns_projects = not reverse and (vault / LIBRARIAN_MARKER).exists()
+
     for name in (*TOP_LEVEL_FOLDERS, *TOP_LEVEL_FILES):
+        if librarian_owns_projects and name == "Projects":
+            if (vault / name).exists():
+                logger.warning(
+                    "%s exists at the vault root: leaving %s in place (it holds the dreaming "
+                    "librarian's pages, not legacy compiler output)",
+                    LIBRARIAN_MARKER,
+                    vault / name,
+                )
+            continue
         if reverse:
             src = raw_root / name
             dst = vault / name

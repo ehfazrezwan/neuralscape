@@ -224,17 +224,24 @@ def test_rest_retag_dry_run_then_apply_changes_category_and_tags(ctx, a, b, ed):
 
 @proves("edit.retag")
 def test_mcp_retag_memories_adds_a_tag(ctx, a, mcp_a, ed):
-    rb = ed["retag_b"].require()
+    ra, rb, outside = ed["retag_a"].require(), ed["retag_b"].require(), ed["meta"].require()
     mcp_a.initialize()
     mcp_tag = ed["retag"] + "-mcp"
+    # The MCP tool takes filters and ops as flat arguments (mcp_server.py retag_memories
+    # schema), unlike the REST body's {"filters": ..., "ops": ...}.
     out = mcp_json(mcp_a, "retag_memories", {
-        "filters": {"tags_contains": [ed["retag"]], "project_id": ctx.project_id},
-        "ops": {"add_tags": [mcp_tag]},
+        "tags_contains": [ed["retag"]], "project_id": ctx.project_id,
+        "add_tags": [mcp_tag],
     })
     assert out.get("status") == "accepted" and out.get("task_id"), f"MCP retag: {out}"
     done = a.poll_task(out["task_id"], timeout=120)
     assert done.get("status") == "completed", f"MCP retag task: {done}"
-    assert mcp_tag in get_row(a, rb.memory_id)["tags"], f"tags after MCP retag: {get_row(a, rb.memory_id)['tags']}"
+    assert (done.get("result") or {}).get("updated") == 2, f"MCP retag must update exactly the 2 filtered rows: {done}"
+    for row_ref in (ra, rb):
+        tags = get_row(a, row_ref.memory_id)["tags"]
+        assert mcp_tag in tags, f"tags after MCP retag: {tags}"
+    outside_tags = get_row(a, outside.memory_id)["tags"]
+    assert mcp_tag not in outside_tags, f"a row outside the filter was retagged: {outside_tags}"
 
 
 def check_retag_refused(client: NSClient, body: dict) -> None:

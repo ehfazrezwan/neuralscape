@@ -127,7 +127,9 @@ def test_index_store_roundtrip_in_memory():
 
     index_store._reset_for_tests()
     # Force in-memory (no redis) by stubbing the client resolver.
-    with patch("knowledge.index_store._redis", return_value=None):
+    with patch("knowledge.index_store._redis", return_value=None), patch(
+        "knowledge.index_store._redis_read", return_value=None
+    ):
         index_store.record_index("code--u1--r", {"system": "code-cbm", "symbols": 5})
         assert index_store.get_index("code--u1--r")["symbols"] == 5
         assert index_store.get_index("missing") is None
@@ -152,7 +154,9 @@ def test_router_config_persists_code_space():
 
     index_store._reset_for_tests()
     _PROJECT_CONFIGS.pop("pg", None)
-    with patch("knowledge.index_store._redis", return_value=None):
+    with patch("knowledge.index_store._redis", return_value=None), patch(
+        "knowledge.index_store._redis_read", return_value=None
+    ):
         set_project_config(ProjectKnowledgeConfig(
             project_id="pg", code_systems=["code-cbm"], default_engine="code-cbm",
             code_space="code--o--pg",

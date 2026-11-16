@@ -114,6 +114,7 @@ file, each preceded by a stack restart with that file's lines added to the API a
 | `oauth-supabase` | `AUTH_PROVIDER=supabase` (placeholder project URL) | `test_oauth` (provider part) |
 | `cbm` | `CBM_ENABLED`, service `cbm-bridge` | `test_code_graph_cbm` |
 | `docling` | Docling + `EXEMPLAR_STORE_ENABLED` + `DOCLING_EXTRACT_IMAGES` | `test_ingest` (Docling), `test_exemplars` |
+| `legacy-key` | `NEURALSCAPE_API_KEY=<generate:hex32>` + `NEURALSCAPE_API_KEY_USER_ID=acc-legacy`; the gate exports the key as `NS_LEGACY_KEY`; **own stack restart** | `test_legacy_key` |
 
 **Placeholders.** No secret is written in a profile. A line like `VAULT_KEY=<generate:fernet>` (or
 `<generate:hex32>`) is replaced by the gate with a freshly generated value before the stack starts: one
@@ -126,6 +127,17 @@ not a placeholder). `fernet` = `python -c "from cryptography.fernet import Ferne
 `# sidecars: nsc-acc-sink` and `# mounts: ...` are documentation for the gate: the harness starts and removes
 the sink itself, and the `cbm` profile needs the service's `neuralscape-service/knowledge/` directory mounted
 read-only at `/corpus/knowledge` in the `cbm-bridge` container (the profile's `CODE_REPOS` names that path).
+
+**`# harness-env: NS_X=KEY`** hands a generated secret to the harness. The gate exports the generated value of the
+profile's `KEY` (it must be a `<generate:...>` placeholder line) as the harness variable `NS_X` (it must start with
+`NS_`) for that profile's run. The `legacy-key` profile uses `# harness-env: NS_LEGACY_KEY=NEURALSCAPE_API_KEY`: the
+harness reads `NS_LEGACY_KEY` into `ctx.legacy_key` (hidden from the repr) and the fixtures `legacy` (REST) and
+`mcp_legacy` (MCP) authenticate with it as the one identity `ctx.legacy_user` (the profile's
+`NEURALSCAPE_API_KEY_USER_ID`). The value is registered with the results scrubber, so it is removed from every
+recorded `detail`, and the results hold only the placeholder (`profile_flags`). A `legacy-key` scenario run
+without `NS_LEGACY_KEY` fails its fixture with a precondition message (it never skips: the profile exists only for
+them). `NEURALSCAPE_USER_TOKEN_SECRET` stays as the gate sets it, so users A and B keep their per-user tokens on the
+same stack. The profile changes the auth surface, so it declares `# exclusive: own-restart`: it needs its own stack restart and no other profile may share that stack (a selftest pins that no other profile file sets `NEURALSCAPE_API_KEY*` and that only `test_legacy_key.py` uses the `legacy` fixtures). Besides identity, the profile's scenarios cover the missing-bearer 401, the admin and credential routes refused to the shared key, and a cross-user delete refused.
 
 **Dictator.** A profile with `DICTATOR_USER_IDS=acc-dictator` gives the run a third identity: fixtures
 `dictator` (REST) and `mcp_dictator` (MCP), `ctx.dictator_user` / `ctx.token_dictator`. The token is minted for
@@ -161,6 +173,7 @@ the seeds on the single graph worker) and the native index; budget about 15 minu
   read what it recorded, so they do not depend on each other's order; the exceptions are the last test of
   `test_code_graph` / `test_code_graph_cbm` (they delete the code space) and `test_connectors`' delete test, which
   use only objects they create. Do not run a single test of those modules with `-k` after a previous run on the same stack.
+- **`@expected_red("#<pr>")`** labels a scenario that is known to fail until that PR lands. It is not an xfail: the scenario runs, a failure is reported as `fail`, and the results JSON carries `expected_red` (the reference, else null) so known reds can be told from new ones. Nodes deliberately not covered by any scenario are listed with a reason in `COVERAGE.md`.
 - **Expected red until PR 495 (sec-03):** the consent-page framing headers and refresh-token rotation in `test_oauth`.
 - **Coverage of the old blind e2e scripts is partial** (see the PR body's disposition table): they stay in the repo
   for the parts not ported.
@@ -326,3 +339,67 @@ listing is always `docker compose -p <project> ps`, never global `docker ps`.
 `run.sh` needs only `uv`: it runs `uv run --no-project --python 3.12 --with-requirements ...`
 (uv may download a managed CPython; downloads are allowed). Set `NS_UV=/path/to/uv` for a
 standalone binary that is not on `PATH`. Without uv it falls back to python3 >= 3.10 + venv.
+
+**Evidence rule.** A results row is node evidence only when `evidence` is true: rows from `@negative_control` or `@expected_red` scenarios are never evidence (`evidence: false`). An expected-red scenario that passes is flagged `unexpected_pass: true` and named in the run summary, so the marker can be dropped.
+
+## Backup then restore (destructive; `test_backup_restore.py`)
+
+Atlas `ops.backups`. Runs the real `scripts/backup-volumes.sh -p <project> --quiesce -d <tmp>`
+on the stack under test, wipes every store, restores the backup per the script's RESTORE
+section and proves the data came back from the backup (and not a marker written after it).
+It **wipes every memory on the stack**, so it runs last (`RUN_LAST`), only with
+`NS_ALLOW_DESTRUCTIVE=1`, `--compose-project <disposable name>` (`guard.check_compose_project`) and a
+docker CLI; otherwise its stack scenarios skip with that reason.
+
+What the gate must provide:
+
+- `NS_ALLOW_DESTRUCTIVE=1`, set **only for a dedicated run** of this module on a throwaway stack (never for the ordinary acceptance run).
+- `NS_COMPOSE_FILES=docker-compose.yml:<the gate's override file>` (colon separated, the `COMPOSE_FILE`
+  convention; relative paths resolve against `NS_REPO_ROOT`, default the checkout holding `acceptance/`).
+  Each entry becomes `-f <file>` on the backup script **and on every `docker compose` call the harness
+  makes** (cwd = the repo root). Unset: no `-f`, as before.
+- The harness runs on the gate host from the checkout under test (`NS_REPO_ROOT` if elsewhere); the
+  backup script is that checkout's own. `NEO4J_DATABASE` (default `memory`) must match the stack's.
+- The backup destination is a fresh `nsc-backup-*` directory the scenario creates under the temp dir
+  (anything else is refused) and removes afterwards. The temp dir must be on the docker host's filesystem
+  (the restore bind-mounts it).
+
+Before anything is wiped a preflight proves the restore can run (any failure aborts with no wipe, and every
+scenario then fails citing it): `compose config -q` with the same `-f` files, `neo4j-admin --version` in the
+neo4j image, `tar --version` in the API image, Qdrant reachable from the API container, the backup script
+present. If a wipe happened and the restore fails (it is retried once) the backup directory is **kept** and its
+path is in the failure detail; it is deleted only after a successful restore (or when no wipe happened).
+
+Note the graph wipe is **logical**: a bulk delete through the API removes the project's episodes; the Neo4j volume
+is not physically emptied. The graph part is proven both ways: the pre-backup marker being present again shows the graph was RESTORED, and the
+after-backup marker (written to Neo4j after the backup) being absent shows it was ROLLED BACK by `neo4j-admin database load`.
+
+Flow (one module fixture records, the scenarios assert): seed (raw memory -> vector search -> graph
+episode; a small uploaded file -> artifact bytes + passage; the memory's task id) -> backup (exit 0, one
+complete `ns-backup-<stamp>`, no `.partial`, MANIFEST lists redis/qdrant/files/neo4j, parts non-empty,
+`sha256sum -c SHA256SUMS`) -> a second memory is written after the backup -> wipe (bulk delete through
+the API, stop the app, delete both Qdrant collections, `redis-cli FLUSHALL`, empty `/data/ingest`, start the
+app; markers, task status and artifact are proven GONE) -> restore (stop app; stop neo4j, `neo4j-admin
+database load --overwrite-destination`, start; Qdrant snapshot upload with `priority=snapshot`; stop redis,
+`cp dump.rdb`, start; tar extract of the files part; start the app) -> assertions: backed-up marker back in
+vector recall, graph listing, task status and artifact download; the after-backup marker absent from all three
+(the negative control); no service's `RestartCount` rose; all services running and healthy; a fresh write is
+recalled. A finalizer starts every service again and fails with `compose ps` if the stack does not come back.
+
+New allow-listed compose shapes (`nsaccept/restore.py`, validated before running; each refusal is self-tested):
+`run --rm --no-deps -T` with exactly the neo4j load, the Qdrant upload (the harness's own script, read-only
+mount), the files tar extract (stdin = the backup's own tar) and the `/data/ingest` wipe (the last one and
+`exec -T redis redis-cli FLUSHALL` also need `NS_ALLOW_DESTRUCTIVE=1`); `cp <B>/redis/dump.rdb redis:/data/dump.rdb`.
+Every host path must lie in `<scenario temp root>/ns-backup-<stamp>/<part>`; nothing else is mountable.
+
+Runtime estimate (2 CPUs): seeding with graph enrichment 2-5 min, backup 2-5 min (neo4j is stopped for the dump),
+the after-backup marker with its graph episode 2-5 min, wipe 1-2 min, restore 3-6 min, checks 1-3 min:
+about 12-25 min, every wait bounded (the whole fixture cannot exceed about 90 min).
+
+**`ops.autoheal` is NOT proven here.** The autoheal sidecar (behind the docker-socket proxy) restarts a
+container whose healthcheck turns `unhealthy`, but no labelled container has a healthcheck the harness can
+fail and then restore through an allow-listed command: the workers' check is `python -c "sys.exit(0)"`, and
+the API's probes `/health/live` on its own port (breaking it would need signals or file edits inside the
+container, and a stopped process is only recovered by the very restart under test). `docker pause` does not
+count (paused containers run no checks). Left unproven rather than forced; a clean proof needs a test hook in
+the product (for example a healthcheck that reads a file the harness may remove).

@@ -25,6 +25,12 @@ ChecksumAlgorithm = Literal["sha256"]
 EncryptionMode = Literal["plaintext_authorized_export", "encrypted"]
 ScopeKind = Literal["tenant", "projects"]
 _WINDOWS_FORBIDDEN_COMPONENT_CHARACTERS = frozenset('<>:"|?*')
+# Windows device names.  ``PurePath.is_reserved`` is deprecated (removed in 3.15) and its table
+# differs across 3.10-3.14, so the table is spelled out here and reads the same on every version.
+_WINDOWS_RESERVED_DEVICE_NAMES = frozenset(
+    {"CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"}
+    | {f"{device}{digit}" for device in ("COM", "LPT") for digit in "123456789\u00b9\u00b2\u00b3"}
+)
 _PYDANTIC_DICT_DESCRIPTOR = BaseModel.__dict__["__dict__"]
 _PYDANTIC_EXTRA_SLOT = BaseModel.__dict__["__pydantic_extra__"]
 _PYDANTIC_FIELDS_SET_SLOT = BaseModel.__dict__["__pydantic_fields_set__"]
@@ -800,11 +806,18 @@ def _normalized_bundle_path(value: str) -> str:
             raise ValueError(
                 "bundle path components must not contain Windows-forbidden characters"
             )
-    if any(PureWindowsPath(part).is_reserved() for part in path.parts):
+    if any(_is_windows_reserved_name(part) for part in path.parts):
         raise ValueError(
             "bundle path must not contain a Windows reserved device name"
         )
     return normalized
+
+
+def _is_windows_reserved_name(component: str) -> bool:
+    """Whether Windows treats the component as a device name (extension, stream and padding ignored)."""
+
+    stem = component.partition(".")[0].partition(":")[0].rstrip(" ")
+    return stem.upper() in _WINDOWS_RESERVED_DEVICE_NAMES
 
 
 def normalize_bundle_path(value: str) -> str:

@@ -226,10 +226,10 @@ jobs:
           load: true
           tags: ns-gate-rt:ci
           cache-from: type=gha
-      - name: Verify runtime image contains snapshot integration test
+      - name: Verify runtime image does not ship integration tests
         run: >-
           docker run --rm --entrypoint /bin/sh ns-gate-rt:ci
-          -ec 'test -f /app/neuralscape-service/integration_tests/test_native_snapshot_neo4j.py'
+          -ec 'test ! -e /app/neuralscape-service/integration_tests'
 
   native-snapshot-neo4j:
     runs-on: ubuntu-latest

@@ -156,7 +156,9 @@ def test_every_vendored_importer_is_behind_the_guard():
     unguarded = []
     for path in sorted(SERVICE.rglob("*.py")):
         rel = path.relative_to(SERVICE).as_posix()
-        if rel.startswith((".venv/", "tests/", "vendor/")):
+        # integration_tests/ are test modules like tests/: their engine files load the guard through
+        # engine_env (checked in test_engine_adapters_telemetry.py).
+        if rel.startswith((".venv/", "tests/", "integration_tests/", "vendor/")):
             continue
         tree = ast.parse(path.read_text())
         if not _imports_vendored(tree):
