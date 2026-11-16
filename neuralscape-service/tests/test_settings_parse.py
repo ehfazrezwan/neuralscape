@@ -33,6 +33,9 @@ def _clean_env(monkeypatch):
     for name in ("VAULT_KEY", "NEURALSCAPE_VAULT_KEY", "DEDUP_CRON_HOURS", "CODE_REPOS",
                  "CBM_ENABLED", "CBM_BRIDGE_URL", "CODE_NATIVE_ENABLED"):
         monkeypatch.delenv(name, raising=False)
+    # config.settings is built at import (collection), so an exported flag would otherwise stay.
+    monkeypatch.setattr(config.settings, "cbm_enabled", False)
+    monkeypatch.setattr(config.settings, "code_native_enabled", False)
 
 
 # ── vault key ────────────────────────────────────────────────────────

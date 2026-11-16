@@ -71,6 +71,11 @@ _INTERP = re.compile(r"^\$\{([A-Za-z_][A-Za-z0-9_]*):-(.*)\}$")
 
 REFERENCE_MARKER = "Every other setting, at its default"
 
+# Keys that sit commented out at their default in a hand-written section (before the reference
+# marker) and are the ones that had drifted: their commented line is compared too. Other commented
+# lines up there are opt-in examples.
+COMMENTED_DEFAULTS_BEFORE_MARKER = ("GEMINI_LLM_MODEL", "LOG_FORMAT")
+
 
 def _template_lines(path: Path) -> list[tuple[str, str]]:
     """(KEY, value) for every active or commented ``KEY=value`` line (value without comment)."""
@@ -84,7 +89,11 @@ def _restated_defaults(path: Path) -> list[tuple[str, str]]:
     text = path.read_text()
     head, _, tail = text.partition(REFERENCE_MARKER)
     active = re.compile(r"^([A-Z][A-Z0-9_]*)=(.*)$", re.M)
-    return [(k, v.strip()) for k, v in active.findall(head)] + [(k, v.strip()) for k, v in _KEY.findall(tail)]
+    commented = re.compile(
+        r"^#\s*(%s)=(.*)$" % "|".join(COMMENTED_DEFAULTS_BEFORE_MARKER), re.M)
+    return ([(k, v.strip()) for k, v in active.findall(head)]
+            + [(k, v.strip()) for k, v in commented.findall(head)]
+            + [(k, v.strip()) for k, v in _KEY.findall(tail)])
 
 
 def _field_for(env_key: str) -> str | None:
@@ -163,6 +172,17 @@ def test_template_values_restate_the_default(template, monkeypatch):
         f"{template.name} sets values that differ from config.py's defaults "
         f"(drop the line, make it equal, or add it to TEMPLATE_VALUES_THAT_DIFFER with a reason): {differing}"
     )
+
+
+@pytest.mark.parametrize("key", COMMENTED_DEFAULTS_BEFORE_MARKER)
+def test_commented_default_lines_are_compared(key, tmp_path, monkeypatch):
+    """A wrong commented default for the drifted keys is caught, not skipped."""
+    default = getattr(_build(monkeypatch, None, None), _field_for(key))
+    template = tmp_path / ".env.example"
+    template.write_text(f"# {key}=not-the-default\n# {REFERENCE_MARKER}\n")
+    assert (key, "not-the-default") in _restated_defaults(template)
+    assert not _same_as_default(monkeypatch, key, "not-the-default")
+    assert _same_as_default(monkeypatch, key, str(default))
 
 
 def test_template_exclusions_are_live():
