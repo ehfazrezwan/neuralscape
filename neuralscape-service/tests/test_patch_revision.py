@@ -422,20 +422,41 @@ def test_a_lost_claim_aborts_the_rewrite_before_it_can_overwrite_another_writers
     assert _tags(world) == ["second-writer"]                         # writer 2's edit survived
 
 
-def test_a_committed_conditional_patch_survives_many_successor_writes_before_its_confirmation(world):
-    """Ten successors land between our committed write and our confirming read: still success, and the
-    caller still gets what it needs to run graph cleanup (a committed partition change must not read as a conflict)."""
+def test_I2_a_committed_conditional_patch_survives_seventy_successor_writes_before_its_confirmation(world):
+    """I2: no number of successor commits can turn a committed conditional edit into a conflict, and the caller
+    still gets what it needs to run graph cleanup (a committed partition change keeps its job and cascade)."""
     real_retrieve = world.fake.retrieve
     state = {"done": False}
 
     def retrieve_after_successors(collection_name, ids, with_payload=True, with_vectors=False):
         if not state["done"] and world.fake.points[M1]["metadata"].get("revision") == 1:
             state["done"] = True
-            for r in range(1, 11):
+            for r in range(1, 71):
                 world.patch_memory(M1, "ehfaz", {"tags": [f"s{r}"]}, expected_revision=str(r))
         return real_retrieve(collection_name, ids, with_payload, with_vectors)
 
     world.fake.retrieve = retrieve_after_successors
     out = world.patch_memory(M1, "ehfaz", {"visibility": "shared"}, expected_revision="0")   # partition change
-    assert out["graph"] != "unchanged" and out["graph_job"] is not None       # cleanup + re-ingest job still produced
-    assert world.fake.points[M1]["metadata"]["revision"] == 11
+    assert out["graph"] != "unchanged" and out["graph_job"] is not None
+    world._cascade_rows_once.assert_called()                                  # the old group's cleanup ran
+    assert world.fake.points[M1]["metadata"]["revision"] == 71
+
+
+def test_I3_a_claim_whose_lease_lapsed_fails_the_writer_even_if_its_nonce_is_still_present(world, monkeypatch):
+    """I3: the fence rejects an expired lease on its own: no other writer has to have committed yet."""
+    import memory.edit as edit
+
+    real = edit._now_epoch()
+    real_retrieve = world.fake.retrieve
+    calls = {"n": 0}
+
+    def retrieve(collection_name, ids, with_payload=True, with_vectors=False):
+        calls["n"] += 1
+        if calls["n"] == 2:     # call 1 confirms the claim, call 2 is the fence: the lease lapses in between
+            monkeypatch.setattr(edit, "_now_epoch", lambda: real + edit._PENDING_LEASE_S + 10)
+        return real_retrieve(collection_name, ids, with_payload, with_vectors)
+
+    world.fake.retrieve = retrieve
+    with pytest.raises(RevisionConflict):
+        world.patch_memory(M1, "ehfaz", {"content": "stalled writer"}, expected_revision="0")
+    assert world.fake.points[M1]["data"] == "Old content"                   # the rewrite never ran

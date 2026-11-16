@@ -1,5 +1,11 @@
 """Delete path: single/bulk deletes, graph-edge expiry, and the dedup cron.
 
+BULK-DELETE INVARIANT (``delete_memories``, every sweep; tests in
+``tests/test_bulk_delete_honesty.py``): a sweep either deletes NOTHING and raises
+``MemoryListingFailed`` (REST 503), or reports exactly what it deleted, what failed
+(``failed_ids``) and whether it is incomplete (``truncated`` / ``listing_failed``,
+REST 207); and graph cleanup runs only for rows whose vector delete succeeded.
+
 Mechanically extracted from memory_service.py (mixins-with-facade split);
 code is verbatim — behavior unchanged.
 """
@@ -326,7 +332,7 @@ class DeleteMixin:
                 try:
                     batch = fetch(limit)
                 except Exception as e:
-                    if deleted_count == 0 and not failed_ids:   # nothing deleted yet (preserved rows don't count)
+                    if deleted_count == 0:   # nothing deleted at all (preserved rows and failed rows delete nothing)
                         raise MemoryListingFailed(
                             "Memories could not be listed; nothing was deleted. Retry."
                         ) from e
@@ -569,6 +575,7 @@ class DeleteMixin:
                     "group_id": None,
                 }
                 for mid, payload, metadata in private_rows
+                if mid in deleted_ids      # a row that failed to delete is still live: no graph state is touched for it
             ],
             "private-only",
             deleted_ids=deleted_ids,

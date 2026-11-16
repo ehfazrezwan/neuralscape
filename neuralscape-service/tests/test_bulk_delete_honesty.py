@@ -194,3 +194,56 @@ def test_clean_delete_reports_nothing_failed(svc):
     svc._scroll_all_user_memories = lambda uid: [_row("a")]
     out = svc.delete_memories(user_id="u")
     assert out["failed_ids"] == [] and out["failed"] == 0 and out["truncated"] is False
+
+
+# ── invariant: graph state is only ever touched for rows that were actually deleted ──
+
+
+@pytest.mark.parametrize("sweep", ["private-only", "filtered", "null-category"])
+def test_a_row_that_failed_to_delete_is_never_part_of_the_graph_cleanup(svc, sweep):
+    if sweep == "private-only":
+        svc._scroll_all_user_memories = lambda uid: [_row("ok1"), _row("bad"), _row("ok2")]
+        svc._memory.vector_store.delete.side_effect = lambda mid: (_ for _ in ()).throw(RuntimeError("x")) if mid == "bad" else None
+        kwargs = {}
+    elif sweep == "filtered":
+        rows = [_raw("ok1"), _raw("bad"), _raw("ok2")]
+        _wire_listing(svc, rows)
+        svc._memory.delete.side_effect = _deleting(rows, fail={"bad"})
+        kwargs = {"category": "tech_stack"}
+    else:
+        rows = [{"id": i, "data": "x", "metadata": {"visibility": "private"}} for i in ("ok1", "bad", "ok2")]
+        svc._list_null_category_memories = lambda user_id, scope=None, project_id=None, limit=500: rows[:limit]
+        svc._memory.vector_store.delete.side_effect = lambda mid: (_ for _ in ()).throw(RuntimeError("x")) if mid == "bad" else rows.__setitem__(slice(None), [r for r in rows if r["id"] != mid])
+        kwargs = {"filter_null_category": True}
+
+    out = svc.delete_memories(user_id="u", **kwargs)
+
+    assert out["failed_ids"] == ["bad"]
+    cascaded = [r["id"] for r in svc._bulk_graph_cleanup.call_args.args[0]]
+    assert "bad" not in cascaded and set(cascaded) == {"ok1", "ok2"}
+
+
+@pytest.mark.parametrize("sweep", ["filtered", "null-category"])
+def test_nothing_deleted_then_a_failed_listing_raises_even_when_row_deletes_failed(svc, sweep):
+    from memory.delete import MemoryListingFailed
+
+    if sweep == "filtered":
+        rows = [_raw(f"m{i}") for i in range(_BULK_PAGE)]
+        _wire_listing(svc, rows, fail_after=1)
+        svc._memory.delete.side_effect = RuntimeError("every delete fails")
+        kwargs = {"category": "tech_stack"}
+    else:
+        rows = [{"id": f"m{i}", "data": "x", "metadata": {"visibility": "private"}} for i in range(_BULK_PAGE)]
+        calls = {"n": 0}
+
+        def lister(user_id, scope=None, project_id=None, limit=500):
+            calls["n"] += 1
+            if calls["n"] > 1:
+                raise RuntimeError("down")
+            return rows[:limit]
+
+        svc._list_null_category_memories = lister
+        svc._memory.vector_store.delete.side_effect = RuntimeError("every delete fails")
+        kwargs = {"filter_null_category": True}
+    with pytest.raises(MemoryListingFailed):
+        svc.delete_memories(user_id="u", **kwargs)

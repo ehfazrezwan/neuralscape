@@ -1,7 +1,33 @@
 """Edit path: patch_memory and bulk retag housekeeping.
 
 Mechanically extracted from memory_service.py (mixins-with-facade split);
-code is verbatim — behavior unchanged.
+the revision precondition was added on top.
+
+INVARIANTS of a conditional edit (``patch_memory(..., expected_revision=N)``).
+Each has a direct controlled-interleaving test in ``tests/test_patch_revision.py``
+(step ordering through hooks, no sleeps) and ``tests/test_patch_revision_qdrant_local.py``
+(Qdrant client local mode for the real filter semantics):
+
+* I1 - it commits at exactly revision N or changes nothing, and says which: a
+  stale/lost edit raises ``RevisionConflict`` before any state change (metadata
+  edits are ONE filtered ``set_payload``; content edits first claim the row with
+  a filtered ``set_payload`` and abort if the claim fails).
+* I2 - a committed conditional edit is never reported as a conflict, whatever
+  successor writes land before the confirming read: success is read from the
+  nonce recorded for the revision we created, kept for ``_NONCE_TTL_S`` (a
+  successor chain would have to outlive that, i.e. the confirming read would
+  have to be delayed by ten minutes, to evict it).
+* I3 - while a content rewrite is pending no other conditional writer can
+  commit (the pending mark is part of every conditional filter); an expired or
+  lost claim makes the original writer FAIL at the fence instead of rewriting.
+
+DOCUMENTED LIMIT (needs a mem0-level conditional upsert, which the pinned
+Qdrant server v1.15 does not offer): mem0's ``update`` rebuilds and upserts the
+point unconditionally, so a writer that passes the fence and then stalls past
+the lease INSIDE that call can still overwrite a conditional edit committed
+after the lease expired. The fence runs immediately before the call; the
+stall window is the embedder round trip. Unconditional writers (no
+``expected_revision``) are last-writer-wins by definition and may interleave.
 """
 
 import logging
@@ -74,7 +100,8 @@ def normalize_expected_revision(value) -> str | None:
 # A content edit marks the row "pending" while it re-embeds; the mark expires so a
 # crashed writer cannot wedge the row (conditional writers are refused meanwhile).
 _PENDING_LEASE_S = 600
-_NONCE_HISTORY = 64
+_NONCE_TTL_S = 600   # how long a revision -> nonce entry is kept (eviction needs a 10-minute-late confirm)
+_NONCE_CAP = 512     # hard bound on the map size
 
 
 def _now_epoch() -> float:
@@ -185,7 +212,8 @@ class EditMixin:
         stored = (points[0].payload or {}).get("metadata") or {}
         if isinstance(stored.get("metadata"), dict):
             stored = stored["metadata"]
-        if (stored.get("revision_nonces") or {}).get(str(new_revision)) != nonce:
+        entry = (stored.get("revision_nonces") or {}).get(str(new_revision))
+        if not isinstance(entry, dict) or entry.get("n") != nonce:
             raise RevisionConflict(memory_id, expected, revision_of(stored))
 
     def _claim_revision(
@@ -218,7 +246,9 @@ class EditMixin:
         stored = (points[0].payload or {}).get("metadata") or {}
         if isinstance(stored.get("metadata"), dict):
             stored = stored["metadata"]
-        if stored.get("revision_pending") != nonce:
+        started = stored.get("revision_pending_at")
+        expired = isinstance(started, (int, float)) and started < _now_epoch() - _PENDING_LEASE_S
+        if stored.get("revision_pending") != nonce or expired:    # a lapsed lease no longer excludes other writers
             raise RevisionConflict(memory_id, expected, revision_of(stored))
 
     @staticmethod
@@ -389,11 +419,13 @@ class EditMixin:
         if expected_revision is not None:
             write_nonce = uuid.uuid4().hex
             nonces = dict(meta.get("revision_nonces") or {})
-            nonces[str(int(current_revision) + 1)] = write_nonce
-            # Keep the last _NONCE_HISTORY revisions. Our entry only has to survive the
-            # (millisecond) gap to our own confirming read, so it would take that many
-            # successor commits inside that gap to evict it.
-            for old in sorted(nonces, key=int)[:-_NONCE_HISTORY]:
+            now = _now_epoch()
+            nonces[str(int(current_revision) + 1)] = {"n": write_nonce, "t": now}
+            # Time-based retention (not count-based): drop only entries older than the TTL, so no
+            # number of successor commits can evict the evidence of a write that has not been
+            # confirmed yet; the cap only bounds a pathological write rate.
+            nonces = {r: e for r, e in nonces.items() if isinstance(e, dict) and e.get("t", 0) >= now - _NONCE_TTL_S}
+            for old in sorted(nonces, key=int)[:-_NONCE_CAP]:
                 del nonces[old]
             new_meta["revision_nonces"] = nonces
         client = m.vector_store.client

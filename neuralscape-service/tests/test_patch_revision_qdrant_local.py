@@ -122,3 +122,19 @@ def test_a_crashed_writers_mark_blocks_until_the_numeric_lease_expires(world, mo
     monkeypatch.setattr(edit, "_now_epoch", lambda: real + edit._PENDING_LEASE_S + 5)
     world.patch_memory(world.pid, "u", {"tags": ["later"]}, expected_revision="0")
     assert _meta(world)["tags"] == ["later"]
+
+
+def test_I2_on_a_real_engine_a_committed_edit_survives_successors_before_its_confirmation(world):
+    real_retrieve = world.client.retrieve
+    state = {"done": False}
+
+    def retrieve(collection_name, ids, **kw):
+        if not state["done"] and real_retrieve(collection_name, ids, **kw)[0].payload["metadata"].get("revision") == 1:
+            state["done"] = True
+            for r in range(1, 71):
+                world.patch_memory(world.pid, "u", {"tags": [f"s{r}"]}, expected_revision=str(r))
+        return real_retrieve(collection_name, ids, **kw)
+
+    world.client.retrieve = retrieve
+    world.patch_memory(world.pid, "u", {"tags": ["mine"]}, expected_revision="0")      # must not raise
+    assert _meta(world)["revision"] == 71
