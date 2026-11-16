@@ -45,6 +45,43 @@ class UnsupportedFile(Exception):
     """Raised when a file can't be turned into text by any available parser."""
 
 
+class ExtractorUnavailable(RuntimeError):
+    """Raised when the extraction BACKEND is missing, not when the file is bad.
+
+    A rich (binary) file needs Docling or the in-process MarkItDown fallback.
+    If Docling is unreachable and MarkItDown is not installed, no file of that
+    kind can be parsed: that is an operator problem, so it must fail the job
+    with a clear error (it is deliberately NOT an ``UnsupportedFile``, which the
+    worker turns into a quiet "skipped" result).
+    """
+
+
+def markitdown_available() -> bool:
+    """Whether the in-process MarkItDown fallback can be imported."""
+    try:
+        import markitdown  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+def _no_parser(filename: str, docling_answered: bool = False):
+    """The exception for "Docling gave nothing and MarkItDown produced nothing".
+
+    ``docling_answered``: Docling responded (it just found no content), so the
+    file is the problem even if MarkItDown is missing.
+    """
+    if not docling_answered and not markitdown_available():
+        return ExtractorUnavailable(
+            f"Cannot extract '{filename}': Docling is unavailable and the MarkItDown "
+            f"fallback is not installed (install the 'markitdown' dependency or restore Docling)"
+        )
+    return UnsupportedFile(
+        f"Could not extract text from '{filename}' "
+        f"(Docling unavailable and MarkItDown could not parse it)"
+    )
+
+
 def _ext(filename: str) -> str:
     return os.path.splitext(filename or "")[1].lower()
 
@@ -109,17 +146,6 @@ def _md_from_payload(payload: dict) -> str | None:
         doc = docs[0] if docs else {}
     md = (doc or {}).get("md_content") or (doc or {}).get("text_content")
     return md if md and md.strip() else None
-
-
-def _docling_convert(data: bytes, filename: str, settings) -> str | None:
-    """Convert via docling-serve. Returns Markdown, or None if unavailable/failed."""
-    payload = _docling_post(data, filename, settings)
-    if payload is None:
-        return None
-    md = _md_from_payload(payload)
-    if md is None:
-        logger.warning("Docling returned no content for %s; falling back", filename)
-    return md
 
 
 def _markitdown_convert(data: bytes, ext: str) -> str | None:
@@ -293,6 +319,7 @@ def extract_text_and_images(
 
     Raises:
         UnsupportedFile: same contract as :func:`extract_text`.
+        ExtractorUnavailable: same contract as :func:`extract_text`.
     """
     if not data:
         raise UnsupportedFile(f"'{filename}' is empty")
@@ -304,6 +331,7 @@ def extract_text_and_images(
     if ext in RICH_EXTS or ext == "":
         images: list[dict] = []
         payload = _docling_post(data, filename, settings, embed_images=True)
+        docling_answered = payload is not None
         if payload is not None:
             images = _harvest_images(payload, filename, page_offset)
             md = _md_from_payload(payload)
@@ -317,10 +345,7 @@ def extract_text_and_images(
             return md, "markitdown", images
         if _looks_textual(data):
             return _decode_text(data), "decoded", images
-        raise UnsupportedFile(
-            f"Could not extract text from '{filename}' "
-            f"(Docling unavailable and MarkItDown could not parse it)"
-        )
+        raise _no_parser(filename, docling_answered)
 
     if _looks_textual(data):
         return _decode_text(data), "decoded", []
@@ -335,6 +360,9 @@ def extract_text(filename: str, data: bytes, settings) -> tuple[str, str]:
 
     Raises:
         UnsupportedFile: If the file is empty, or no parser can extract text.
+        ExtractorUnavailable: If a rich file needs a parser and neither Docling
+            nor the MarkItDown fallback is available (an operator problem, not a
+            bad file: the ingest job fails loudly instead of skipping the file).
     """
     if not data:
         raise UnsupportedFile(f"'{filename}' is empty")
@@ -345,9 +373,13 @@ def extract_text(filename: str, data: bytes, settings) -> tuple[str, str]:
         return _decode_text(data), "plain"
 
     if ext in RICH_EXTS or ext == "":
-        md = _docling_convert(data, filename, settings)
+        payload = _docling_post(data, filename, settings)
+        docling_answered = payload is not None
+        md = _md_from_payload(payload) if payload is not None else None
         if md is not None:
             return md, "docling"
+        if docling_answered:
+            logger.warning("Docling returned no content for %s; falling back", filename)
         md = _markitdown_convert(data, ext)
         if md is not None:
             return md, "markitdown"
@@ -356,10 +388,7 @@ def extract_text(filename: str, data: bytes, settings) -> tuple[str, str]:
         # decode directly so uploads never hard-fail. Otherwise give up.
         if _looks_textual(data):
             return _decode_text(data), "decoded"
-        raise UnsupportedFile(
-            f"Could not extract text from '{filename}' "
-            f"(Docling unavailable and MarkItDown could not parse it)"
-        )
+        raise _no_parser(filename, docling_answered)
 
     # Unknown extension: accept it only if it's genuinely textual.
     if _looks_textual(data):
