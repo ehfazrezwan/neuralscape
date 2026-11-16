@@ -77,6 +77,17 @@ def _episode_exists(svc, episode_uuid) -> bool:
     return bool(_cypher(svc, "MATCH (e:Episodic {uuid: $u}) RETURN e.uuid AS uuid", u=episode_uuid))
 
 
+def _live_edge_uuids(svc, group_id, episode_uuid):
+    """Live RELATES_TO edges in ``group_id`` that the given episode produced."""
+    rows = _cypher(
+        svc,
+        "MATCH ()-[r:RELATES_TO {group_id: $g}]->() "
+        "WHERE r.expired_at IS NULL AND $ep IN coalesce(r.episodes, []) RETURN r.uuid AS uuid",
+        g=group_id, ep=episode_uuid,
+    )
+    return {r["uuid"] for r in rows}
+
+
 def _live_ids(svc, uid):
     return {r["id"] for r in svc._scroll_all_user_memories(uid)}
 
@@ -96,7 +107,9 @@ def _seed(svc, unique_ns):
     ids = {
         "private": store(me, "The Quillfeather billing service deploys on Fridays.", "private"),
         "shared": store(me, "The Quillfeather team standup is at nine every weekday.", "shared"),
-        "standard": store(me, "All Quillfeather services must expose a health endpoint.", "standard", scope="global"),
+        # project scope keeps the graph group inside the test's names
+        # (standard--project--<project>), never the org-wide ``standard`` group.
+        "standard": store(me, "All Quillfeather services must expose a health endpoint.", "standard"),
         "others_shared": store(other, "The Quillfeather release notes live in the wiki.", "shared"),
     }
     episodes = {k: _episode_uuid(svc, v) for k, v in ids.items()}
@@ -107,16 +120,27 @@ def _seed(svc, unique_ns):
 
     def cleanup():
         _cypher(svc, "MATCH (n) WHERE n.uuid IN $u DETACH DELETE n", u=list(episodes.values()))
-        for g in (f"user--{me}", f"user--{me}--project--{project}", f"shared--project--{project}"):
+        for g in (
+            f"user--{me}", f"user--{me}--project--{project}",
+            f"user--{other}", f"user--{other}--project--{project}",
+            f"shared--project--{project}", f"standard--project--{project}",
+        ):
             _cypher(svc, "MATCH (n {group_id: $g}) DETACH DELETE n", g=g)
             _cypher(svc, "MATCH ()-[r:RELATES_TO {group_id: $g}]->() DELETE r", g=g)
 
     unique_ns.on_cleanup(cleanup)
-    return me, other, ids, episodes
+    return me, other, ids, episodes, project
 
 
 def test_include_shared_true_deletes_exactly_own_private_and_shared_rows(svc, unique_ns):
-    me, other, ids, episodes = _seed(svc, unique_ns)
+    me, other, ids, episodes, project = _seed(svc, unique_ns)
+    shared_group, standard_group = f"shared--project--{project}", f"standard--project--{project}"
+    # Non-vacuous: the edges of the other user's shared episode and of the standard
+    # episode are live before the delete and must be byte-for-byte the same after.
+    shared_edges_before = _live_edge_uuids(svc, shared_group, episodes["others_shared"])
+    standard_edges_before = _live_edge_uuids(svc, standard_group, episodes["standard"])
+    assert shared_edges_before, "seed produced no live edges for the other user's shared episode"
+    assert standard_edges_before, "seed produced no live edges for the standard episode"
 
     out = svc.delete_memories(user_id=me, include_shared=True)
 
@@ -131,10 +155,14 @@ def test_include_shared_true_deletes_exactly_own_private_and_shared_rows(svc, un
     assert ids["others_shared"] in _live_ids(svc, other)
     assert _episode_exists(svc, episodes["standard"])
     assert _episode_exists(svc, episodes["others_shared"])
+    # The shared and standard groups are never bulk-expired: the other user's facts
+    # and the caller's standard facts keep expired_at IS NULL.
+    assert _live_edge_uuids(svc, shared_group, episodes["others_shared"]) == shared_edges_before
+    assert _live_edge_uuids(svc, standard_group, episodes["standard"]) == standard_edges_before
 
 
 def test_include_shared_false_keeps_the_callers_shared_row(svc, unique_ns):
-    me, other, ids, episodes = _seed(svc, unique_ns)
+    me, other, ids, episodes, _project = _seed(svc, unique_ns)
 
     out = svc.delete_memories(user_id=me)
 

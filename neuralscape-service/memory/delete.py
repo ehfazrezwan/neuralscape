@@ -536,7 +536,7 @@ class DeleteMixin:
         }
 
     def _delete_private_only(self, user_id: str, include_shared: bool = False) -> dict:
-        """Delete every PRIVATE memory the user owns; leave shared writes alone.
+        """Delete every PRIVATE memory the user owns; shared writes are kept by default.
 
         ``include_shared=True`` (the explicit opt-in) also deletes the caller's
         OWN shared rows through the same per-row cascade. ``standard`` rows are

@@ -588,6 +588,9 @@ async def delete_memories(
         result = await asyncio.to_thread(
             _service.delete_memories, user_id=user_id, include_shared=include_shared
         )
+        # Sibling facts of a deleted conversation episode need re-enrichment;
+        # enqueue them (as v1 and MCP do) and answer with counts.
+        result = await _enqueue_sibling_graph_jobs(result)
         # Graph cleanup that could not be verified is a partial success.
         incomplete = bool(result.get("graph_cascade_unresolved_ids") or result.get("failed_ids") or result.get("truncated"))
         if result.get("failed_ids") or result.get("truncated"):

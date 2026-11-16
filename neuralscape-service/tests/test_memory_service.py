@@ -1740,9 +1740,15 @@ class TestBulkDeleteNullCategory:
         the flag is set, and that include_shared=True no longer uses
         mem0's delete_all either (it deletes the caller's own rows per row).
         """
-        service._scroll_all_user_memories = MagicMock(return_value=[])
+        service._scroll_all_user_memories = MagicMock(return_value=[
+            {"id": "p", "payload": {"data": "p", "metadata": {"visibility": "private"}}},
+            {"id": "s", "payload": {"data": "s", "metadata": {"visibility": "shared"}}},
+            {"id": "std", "payload": {"data": "t", "metadata": {"visibility": "standard"}}},
+        ])
+        service._memory.vector_store.delete = MagicMock()
         service.delete_memories(user_id="ehfaz", include_shared=True)
         service._memory.delete_all.assert_not_called()
+        assert [c.args[0] for c in service._memory.vector_store.delete.call_args_list] == ["p", "s"]
 
         service._memory.reset_mock()
 
@@ -3608,9 +3614,16 @@ class TestBulkDeleteSharedProtection:
         assert "preserved 1 shared" in result["message"]
 
     def test_include_shared_true_does_not_use_delete_all(self, service):
-        service._scroll_all_user_memories = MagicMock(return_value=[])
+        service._scroll_all_user_memories = MagicMock(return_value=[
+            self._mem("priv-1", "private"),
+            self._mem("share-1", "shared"),
+            self._mem("std-1", "standard"),
+        ])
+        service._memory.vector_store.delete = MagicMock()
         service.delete_memories(user_id="alice", include_shared=True)
         service._memory.delete_all.assert_not_called()
+        deleted = [c.args[0] for c in service._memory.vector_store.delete.call_args_list]
+        assert deleted == ["priv-1", "share-1"]
 
     def test_filtered_delete_skips_shared_by_default(self, service):
         """Even with a category filter, shared writes survive by default."""

@@ -830,7 +830,8 @@ async def list_tools() -> list[Tool]:
                 "cannot be recovered. Can delete a single memory by ID, or bulk delete by "
                 "scope, category, or project_id. Bulk deletes only remove the caller's "
                 "PRIVATE memories by default; shared (team) memories the caller authored "
-                "are preserved. Set include_shared=true to also remove shared writes "
+                "are preserved. Set include_shared=true to also delete the caller's OWN "
+                "shared rows; never another user's rows, never standard rows "
                 "(rarely correct — confirm with the user first)."
             ),
             inputSchema={
@@ -864,8 +865,9 @@ async def list_tools() -> list[Tool]:
                     "include_shared": {
                         "type": "boolean",
                         "description": (
-                            "When True, also remove the caller's shared (team) "
-                            "writes. Default False — shared memories are team "
+                            "When True, also delete the caller's OWN shared (team) "
+                            "rows; never another user's rows, never standard "
+                            "rows. Default False — shared memories are team "
                             "artifacts and one user's bulk delete shouldn't wipe "
                             "them. Confirm with the user before enabling."
                         ),

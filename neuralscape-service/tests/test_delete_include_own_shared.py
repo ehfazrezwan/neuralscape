@@ -212,3 +212,35 @@ def test_legacy_route_include_shared_partial_is_207(client, real_main_service):
     resp = client.delete("/memories", params={"user_id": "u1", "include_shared": "true"})
     assert resp.status_code == 207, resp.text
     assert resp.json()["failed_ids"] == ["own-shared"]
+
+
+# ── legacy route enqueues sibling graph jobs (as v1 does) ──
+
+
+def test_legacy_route_enqueues_sibling_graph_jobs(client, mock_service, task_manager):
+    jobs = [{"memory_id": "sib-1"}, {"memory_id": "sib-2"}]
+    mock_service.delete_memories.return_value = {
+        "message": "ok", "graph_cascade_unresolved_ids": [], "graph_jobs": list(jobs),
+    }
+    task_manager.enqueue_graph_jobs = AsyncMock(
+        return_value={"graph_jobs_enqueued": 2, "graph_jobs_not_enqueued_ids": []}
+    )
+    resp = client.delete("/memories", params={"user_id": "u1", "include_shared": "true"})
+    assert resp.status_code == 200, resp.text
+    task_manager.enqueue_graph_jobs.assert_awaited_once_with(jobs)
+    body = resp.json()
+    assert body["graph_jobs_enqueued"] == 2 and "graph_jobs" not in body
+
+
+def test_legacy_route_graph_jobs_redis_down_is_still_200(client, mock_service, task_manager):
+    mock_service.delete_memories.return_value = {
+        "message": "ok", "graph_cascade_unresolved_ids": [],
+        "graph_jobs": [{"memory_id": "sib-1"}, {"memory_id": "sib-2"}],
+    }
+    task_manager.enqueue_graph_jobs = AsyncMock(side_effect=RuntimeError("redis down"))
+    resp = client.delete("/memories", params={"user_id": "u1"})
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["graph_jobs_enqueued"] == 0
+    assert body["graph_jobs_not_enqueued_ids"] == ["sib-1", "sib-2"]
+    assert "graph_jobs" not in body
