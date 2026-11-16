@@ -59,6 +59,8 @@ def check_graph_search_finds(client: NSClient, project_id: str, entity: str, oth
 @proves(
     "graph.graphiti-bridge", "graph.episodes-entities-edges", "fork.graphiti.add-episode-pipeline",
     "read.graph-listing", "model.graph-group-ids", "fork.graphiti.bitemporal",
+    "fork.mem0.graphiti-adapter", "fork.mem0.reattach-shim", "fork.mem0.async-bridge",
+    "fork.graphiti.neo4j-database-kwarg-fix",
 )
 def test_raw_write_becomes_a_dated_episode_in_the_owners_group(ctx, a, graph_seed: GraphSeed):
     graph_seed.first.require()

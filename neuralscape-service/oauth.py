@@ -21,7 +21,9 @@ Everything is signed with the existing ``NEURALSCAPE_USER_TOKEN_SECRET`` via
 ``tokens.sign_payload`` and distinguished by a ``typ`` claim:
 
 * ``typ="client"``  → the Dynamic-Client-Registration ``client_id`` itself
-  (encodes the registered ``redirect_uris``; no server-side client store).
+  (encodes the registered ``redirect_uris`` plus a random ``jti`` so every
+  registration is a distinct client; no server-side client store. Client ids
+  issued before the ``jti`` existed still decode).
 * ``typ="code"``    → an authorization code (encodes user_id, client_id,
   redirect_uri, PKCE challenge; ~5 min TTL; single-use via Redis).
 * ``typ="access"``  → the Bearer access token. Identical in shape to an
@@ -45,6 +47,7 @@ import base64
 import hashlib
 import html
 import logging
+import re
 import secrets
 import time
 from urllib.parse import urlencode, urlparse
@@ -56,14 +59,19 @@ from config import settings
 import identity_store
 from login_providers import (
     AuthorizeContext,
+    login_binding_cookie_name,
+    login_binding_cookie_path,
     GoogleProvider,
     IdentityStoreUnavailable,
+    LOGIN_BINDING_MAX_AGE,
     LoginError,
     LoginNeedsLink,
     SupabaseProvider,
     _supabase_finish_page,
     get_login_provider,
+    new_login_nonce,
     provision_user_id,
+    sign_login_binding,
     sign_link_ticket,
     verify_link_ticket,
 )
@@ -91,6 +99,9 @@ _CLIENT_TTL: int | None = None  # client_id registrations don't expire
 _LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1"}
 
 
+_BAD_HOST_CHARS = re.compile(r"[\s\x00-\x1f\x7f<>\"'`\\{}|^]")
+
+
 def _is_valid_redirect_uri(uri: str) -> bool:
     """Accept only absolute https:// URIs (or http:// to a loopback host) with
     no fragment. These are signed into the client_id and later trusted by
@@ -98,13 +109,67 @@ def _is_valid_redirect_uri(uri: str) -> bool:
     registration time to avoid open-redirect / token-leak to plaintext hosts."""
     if not isinstance(uri, str) or not uri:
         return False
-    parsed = urlparse(uri)
+    try:
+        parsed = urlparse(uri)
+        # Malformed bracketed hosts make urlparse raise; an empty host or a
+        # non-numeric port is just as unusable. All are plain refusals (400).
+        if not parsed.hostname:
+            return False
+        parsed.port  # noqa: B018 - raises ValueError on an invalid port
+    except ValueError:
+        return False
     if not parsed.netloc or parsed.fragment:
+        return False
+    # userinfo (https://claude.ai@evil.example/cb) is a classic spoof of the
+    # displayed destination and has no legitimate use in a redirect URI.
+    if "@" in parsed.netloc:
+        return False
+    # Characters that can never appear in a host (markup, quotes, whitespace,
+    # control characters) and over-long hosts (DNS caps a name at 253): refused
+    # so the consent page can always show the destination intact.
+    if _BAD_HOST_CHARS.search(parsed.netloc) or len(parsed.hostname or "") > 253:
+        return False
+    # ASCII host, no percent-escapes: what we display must be exactly where the
+    # browser goes. Browsers apply UTS 46 (not Python's IDNA 2003) to non-ASCII
+    # hosts and percent-decode them, so those can differ from any text we show.
+    # A client that needs an IDN host registers its punycode (xn--) form.
+    if "%" in parsed.netloc or not parsed.netloc.isascii():
         return False
     host = (parsed.hostname or "").lower()
     if parsed.scheme == "https":
         return True
     return parsed.scheme == "http" and host in _LOOPBACK_HOSTS
+
+
+_DEFAULT_PORTS = {"https": 443, "http": 80}
+
+
+def _redirect_host_allowed(uri: str) -> bool:
+    """True when ``uri``'s host passes ``OAUTH_REDIRECT_HOST_ALLOWLIST``.
+
+    Call only on a URI that passed ``_is_valid_redirect_uri``. An empty list
+    allows everything (today's behaviour). Loopback hosts always pass: native
+    clients (RFC 8252 section 7.3) listen on an ephemeral loopback port, so no
+    list could name it. An entry ``host`` matches the scheme's default port
+    only; ``host:port`` matches that exact port.
+    """
+    allowed = settings.oauth_redirect_host_allowlist_set()
+    if not allowed:
+        return True
+    parsed = urlparse(uri)
+    host = (parsed.hostname or "").lower()
+    if host in _LOOPBACK_HOSTS:
+        return True
+    default = _DEFAULT_PORTS.get(parsed.scheme)
+    port = parsed.port if parsed.port is not None else default
+    if port == default and host in allowed:
+        return True
+    return f"{host}:{port}" in allowed
+
+
+def _redirect_uri_usable(uri: str, registered: list) -> bool:
+    """Authorize-time check: valid, currently allowlisted, and registered."""
+    return _is_valid_redirect_uri(uri) and _redirect_host_allowed(uri) and uri in registered
 
 
 # ── helpers ──────────────────────────────────────────────────────────────
@@ -357,9 +422,29 @@ async def register(request: Request) -> JSONResponse:
             },
         )
 
+    if not all(_redirect_host_allowed(u) for u in redirect_uris):
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": "invalid_redirect_uri",
+                "error_description": (
+                    "redirect_uris host is not on this server's redirect host allowlist"
+                ),
+            },
+        )
+
     issued_at = int(time.time())
+    # A random jti makes every registration a distinct client. Without it the
+    # signed client_id was a pure function of (redirect_uris, issue second), so
+    # two registrations with the same redirect URIs in the same second got the
+    # SAME client_id and could redeem each other's codes and refresh tokens.
     client_id = sign_payload(
-        {"typ": "client", "redirect_uris": redirect_uris, "iat": issued_at},
+        {
+            "typ": "client",
+            "redirect_uris": redirect_uris,
+            "iat": issued_at,
+            "jti": secrets.token_urlsafe(12),
+        },
         _secret(),
     )
     return JSONResponse(
@@ -403,6 +488,9 @@ _CONSENT_PAGE = """<!doctype html>
   h1 {{ font-size: 19px; margin: 0 0 4px; }}
   p  {{ font-size: 14px; line-height: 1.5; color: #aab1c2; margin: 8px 0; }}
   .who {{ font-size: 13px; color: #8b93a7; margin-bottom: 18px; }}
+  .dest {{ font-size: 15px; color: #e7e9ee; background: #0d0f16; border: 1px solid #3b5bdb;
+          border-radius: 10px; padding: 10px 12px; margin: 10px 0 6px; }}
+  .dest b {{ font-size: 17px; overflow-wrap: anywhere; }}
   label {{ display:block; font-size: 13px; color:#cbd2e1; margin: 16px 0 6px; }}
   textarea {{ width: 100%; box-sizing: border-box; min-height: 84px; resize: vertical;
              font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px;
@@ -430,7 +518,8 @@ _CONSENT_PAGE = """<!doctype html>
 <body>
   <div class="card">
     <h1>Connect Neuralscape memory</h1>
-    <p class="who">{client_label} is requesting access to your Neuralscape memories.</p>
+    <p class="dest">After you sign in, access is granted to <b>{redirect_host}</b></p>
+    <p class="who">The app calls itself &ldquo;{client_label}&rdquo; and is requesting access to your Neuralscape memories. Only continue if you recognise the address above.</p>
     {error_html}
     <!--PROVIDER_BLOCK-->
     <!--DIVIDER-->
@@ -472,6 +561,7 @@ def _render_consent(
     them when both are present."""
     error_html = f'<div class="err">{html.escape(error)}</div>' if error else ""
     page = _CONSENT_PAGE.format(
+        redirect_host=html.escape(_display_host(redirect_uri)),
         client_label=html.escape(client_label),
         error_html=error_html,
     )
@@ -498,6 +588,58 @@ def _render_consent(
     return _html_response(page, status_code)
 
 
+def _display_host(uri: str) -> str:
+    """The destination for the consent page, exactly as the browser will use it:
+    the lower-cased hostname (never userinfo; ASCII only, enforced at
+    registration, so IDN hosts appear in their xn-- form) plus a non-default port."""
+    parsed = urlparse(uri)
+    host = parsed.hostname or ""
+    if ":" in host:
+        host = f"[{host}]"
+    try:
+        port = parsed.port
+    except ValueError:
+        port = None
+    if port is not None and port != {"https": 443, "http": 80}.get(parsed.scheme):
+        host = f"{host}:{port}"
+    return host or "an unknown address"
+
+
+def _cookie_secure() -> bool:
+    """Secure cookie whenever the public URL is https (always, in production)."""
+    return _base_url().lower().startswith("https://")
+
+
+def _set_login_binding_cookie(response, nonce: str) -> None:
+    """Bind the login about to start to this browser.
+
+    HttpOnly (no script reads it), Secure on https, SameSite=Lax: the IdP
+    returns with a top-level GET (Google, and Supabase's redirect), and the
+    Supabase finisher then POSTs from our own origin, so Lax is sent on both;
+    Strict would drop it on the cross-site GET. Scoped to /oauth, expires with
+    the login state.
+    """
+    response.set_cookie(
+        login_binding_cookie_name(),
+        sign_login_binding(nonce, _secret()),
+        max_age=LOGIN_BINDING_MAX_AGE,
+        path=login_binding_cookie_path(),
+        secure=_cookie_secure(),
+        httponly=True,
+        samesite="lax",
+    )
+
+
+def _clear_login_binding_cookie(response) -> None:
+    response.delete_cookie(
+        login_binding_cookie_name(),
+        path=login_binding_cookie_path(),
+        secure=_cookie_secure(),
+        httponly=True,
+        samesite="lax",
+    )
+
+
 @router.get("/oauth/authorize", response_model=None)
 async def authorize(request: Request) -> HTMLResponse | JSONResponse:
     """Validate the authorize request, then hand the human-login step to the
@@ -522,7 +664,7 @@ async def authorize(request: Request) -> HTMLResponse | JSONResponse:
     client = _decode_client(client_id)
     if client is None:
         return JSONResponse(status_code=400, content={"error": "invalid_client"})
-    if redirect_uri not in client.get("redirect_uris", []):
+    if not _redirect_uri_usable(redirect_uri, client.get("redirect_uris", [])):
         # Never redirect to an unregistered URI — surface the error locally.
         return JSONResponse(
             status_code=400,
@@ -548,11 +690,15 @@ async def authorize(request: Request) -> HTMLResponse | JSONResponse:
         code_challenge_method=code_challenge_method,
         resource=resource,
     )
-    provider_block = get_login_provider().consent_block(ctx)
+    provider = get_login_provider()
+    # The login_state in the provider's button carries this nonce; the cookie
+    # set below proves the callback comes back to the browser that started it.
+    nonce = new_login_nonce()
+    provider_block = provider.consent_block(ctx, nonce=nonce)
     # The token-paste box always shows in token mode; under a federated provider
     # it shows unless the deployer turned it off.
     show_token_form = settings.auth_provider == "token" or settings.auth_allow_token_paste
-    return _render_consent(
+    response = _render_consent(
         client_id=client_id,
         redirect_uri=redirect_uri,
         state=state,
@@ -562,6 +708,9 @@ async def authorize(request: Request) -> HTMLResponse | JSONResponse:
         provider_block=provider_block,
         show_token_form=show_token_form,
     )
+    if provider.name != "token":
+        _set_login_binding_cookie(response, nonce)
+    return response
 
 
 @router.post("/oauth/authorize", response_model=None)
@@ -592,7 +741,7 @@ async def authorize_submit(
     client = _decode_client(client_id)
     if client is None:
         return JSONResponse(status_code=400, content={"error": "invalid_client"})
-    if redirect_uri not in client.get("redirect_uris", []):
+    if not _redirect_uri_usable(redirect_uri, client.get("redirect_uris", [])):
         return JSONResponse(
             status_code=400,
             content={"error": "invalid_request", "error_description": "redirect_uri mismatch"},
@@ -629,12 +778,22 @@ async def authorize_submit(
     return _issue_code_and_redirect(ctx, payload["user_id"], src=src)
 
 
+_REDIRECT_HOST_REFUSED = "This client's redirect host is not allowed on this server."
+
+
 def _issue_code_and_redirect(
     ctx: AuthorizeContext, user_id: str, src: str | None = None
-) -> RedirectResponse:
+) -> RedirectResponse | HTMLResponse:
     """Mint a PKCE-bound authorization code for ``user_id`` and 303 back to the
     MCP client's redirect_uri. Shared by every login provider — the only thing
-    that varies upstream is how ``user_id`` was authenticated."""
+    that varies upstream is how ``user_id`` was authenticated.
+
+    Every code issuance passes here, so this is where the redirect host
+    allowlist is re-checked for the federated callbacks and the link flow, whose
+    signed state or ticket may predate the list. A refusal renders an error page
+    and issues no code."""
+    if not _redirect_host_allowed(ctx.redirect_uri):
+        return _login_error_page(LoginError(_REDIRECT_HOST_REFUSED, 400))
     code = sign_payload(
         {
             "typ": "code",
@@ -756,6 +915,15 @@ async def _finish_login(result) -> HTMLResponse | RedirectResponse:
     )
 
 
+async def _finish_bound_login(result) -> HTMLResponse | RedirectResponse:
+    """``_finish_login`` for the IdP callbacks: the login binding cookie is spent
+    once the callback has been handled, unless it was refused or must be retried."""
+    response = await _finish_login(result)
+    if not (isinstance(result, LoginError) and result.keep_cookie):
+        _clear_login_binding_cookie(response)
+    return response
+
+
 # ── federated login callbacks (google / supabase) ────────────────────────
 
 
@@ -767,7 +935,7 @@ async def google_callback(request: Request) -> RedirectResponse | HTMLResponse |
         return _not_configured()
     if settings.auth_provider != "google":
         return JSONResponse(status_code=404, content={"detail": "google login not enabled"})
-    return await _finish_login(await GoogleProvider().complete(request))
+    return await _finish_bound_login(await GoogleProvider().complete(request))
 
 
 @router.get("/oauth/supabase/callback", response_model=None)
@@ -788,7 +956,7 @@ async def supabase_callback_post(request: Request) -> RedirectResponse | HTMLRes
         return _not_configured()
     if settings.auth_provider != "supabase":
         return JSONResponse(status_code=404, content={"detail": "supabase login not enabled"})
-    return await _finish_login(await SupabaseProvider().complete(request))
+    return await _finish_bound_login(await SupabaseProvider().complete(request))
 
 
 @router.post("/oauth/link", response_model=None)
@@ -812,6 +980,9 @@ async def oauth_link(
         return _login_error_page(LoginError("This link request expired. Please sign in again.", 400))
 
     ctx = claims["ctx"]
+    if not _redirect_host_allowed(ctx.redirect_uri):
+        # Refuse before anything is persisted for a login that cannot finish.
+        return _login_error_page(LoginError(_REDIRECT_HOST_REFUSED, 400))
     sub = claims.get("sub") or None
     email = claims.get("email") or None
 
@@ -931,6 +1102,10 @@ async def token(
             return _token_error("invalid_grant", "client mismatch")
         if not redirect_uri or claims.get("redirect_uri") != redirect_uri:
             return _token_error("invalid_grant", "redirect_uri mismatch")
+        if not _redirect_host_allowed(redirect_uri):
+            # A code issued before the allowlist was set is not redeemable for a
+            # host that is no longer listed.
+            return _token_error("invalid_grant", "redirect_uri host is not allowed")
         if not _verify_pkce(code_verifier, claims.get("code_challenge", "")):
             return _token_error("invalid_grant", "PKCE verification failed")
         jti = claims.get("jti")
@@ -964,9 +1139,14 @@ async def token(
         bound_client = claims.get("client_id")
         if not all(isinstance(v, str) and v for v in (jti, fam, bound_client)):
             return _token_error("invalid_grant", "refresh_token is invalid or expired")
-        # Checked before consuming so a wrong client cannot burn the real
-        # client's token. Compare bytes: compare_digest rejects non-ASCII str.
-        if not client_id or not secrets.compare_digest(
+        # The refresh token is bound to the client it was issued to. A public
+        # client MAY omit client_id on the refresh grant (RFC 6749 3.2.1 and 6;
+        # OAuth 2.1 4.3.1); the bound client then continues the session. When a
+        # client_id IS sent it must match exactly, checked before consuming so a
+        # wrong client cannot burn the real client's token. Compare bytes:
+        # compare_digest rejects non-ASCII str. (Requiring client_id would add
+        # no security for a public client: client_id is not a secret.)
+        if client_id and not secrets.compare_digest(
             bound_client.encode("utf-8"), client_id.encode("utf-8")
         ):
             return _token_error("invalid_grant", "client mismatch")
@@ -1000,6 +1180,7 @@ async def token(
             except _ReplayGuardUnavailable:
                 return _guard_unavailable()
             return _token_error("invalid_grant", "refresh_token already used")
-        return _token_response(user_id, client_id, family=fam, src=claims.get("src"))
+        # Rotate within the client the token is bound to (client_id may be omitted).
+        return _token_response(user_id, bound_client, family=fam, src=claims.get("src"))
 
     return _token_error("unsupported_grant_type", f"grant_type '{grant_type}' not supported")

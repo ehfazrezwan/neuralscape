@@ -17,7 +17,7 @@ from arq.jobs import Job
 import adapters  # noqa: F401 — registers knowledge-adapter taxonomies at import (deterministic MEMORY_CATEGORIES across all workers)
 from config import parse_redis_settings, settings
 from memory_service import MemoryService
-from task_manager import connector_sync_job_id
+from task_manager import connector_sync_job_id, enqueue_connector_sync_job
 
 logger = logging.getLogger(__name__)
 
@@ -262,7 +262,9 @@ async def process_memory_raw(
     # must not pay the graph pass + edge enrichment of a full hybrid recall,
     # and must not pollute the dreaming recall traces.
     try:
-        existing = service.search(
+        # Off the loop: retry_transient may time.sleep for tens of seconds.
+        existing = await asyncio.to_thread(
+            service.search,
             query=content,
             user_id=user_id,
             project_id=project_id,
@@ -959,8 +961,6 @@ async def process_code_index(ctx: dict, payload: dict) -> dict:
     repo_sha = await asyncio.to_thread(_git_head_sha, repo_source)
     indexed_at = time.time()
     from knowledge import index_store
-    from knowledge.router import ProjectKnowledgeConfig, set_project_config
-
     meta = {
         "system": system,
         "repo_source": repo_source,
@@ -973,16 +973,10 @@ async def process_code_index(ctx: dict, payload: dict) -> dict:
         "cbm_project": getattr(engine, "project", None),
     }
     await asyncio.to_thread(index_store.record_index, code_space, meta)
+    config_updated, config_reason = False, "no project_id: no project config to update"
     if project_id:
-        await asyncio.to_thread(
-            set_project_config,
-            ProjectKnowledgeConfig(
-                project_id=project_id,
-                code_systems=[system],
-                fuse_code_into_recall=True,
-                default_engine=system,
-                code_space=code_space,
-            ),
+        config_updated, config_reason = await asyncio.to_thread(
+            _merge_index_into_project_config, project_id, system, code_space
         )
 
     # 3. External-engine liveness diff → dreaming consumer (best-effort).
@@ -1013,7 +1007,86 @@ async def process_code_index(ctx: dict, payload: dict) -> dict:
         "repo_sha": repo_sha,
         "indexed_at": indexed_at,
         "liveness": {"flagged": liveness.get("flagged", 0), "summary": liveness.get("summary", "")},
+        "config_updated": config_updated,
+        "config_reason": config_reason,
     }
+
+
+def _merge_index_config_dict(raw: dict | None, project_id: str, system: str, code_space: str) -> dict:
+    """The project config after an index of ``system`` into ``code_space`` (pure).
+
+    Adds ``system`` to ``code_systems`` and keeps every admin-set field. A pinned
+    ``default_engine`` is kept; ``code_space`` follows the effective default engine
+    (the pinned one, else the system just indexed), so indexing a native space for a
+    project pinned to another engine does not point that engine at the native space.
+    """
+    raw = dict(raw or {})
+    systems = list(raw.get("code_systems") or [])
+    if system not in systems:
+        systems.append(system)
+    effective_default = raw.get("default_engine") or system
+    code_space_out = code_space if system == effective_default else raw.get("code_space")
+    return {
+        "project_id": project_id,
+        "code_systems": systems,
+        "fuse_code_into_recall": bool(raw.get("fuse_code_into_recall", True)),
+        "default_engine": effective_default,
+        "code_space": code_space_out,
+        "op_preference": raw.get("op_preference"),
+    }
+
+
+def _merge_index_into_project_config(project_id: str, system: str, code_space: str) -> tuple[bool, str]:
+    """Record an index in the project's knowledge config WITHOUT replacing the config.
+
+    Read-modify-write under Redis WATCH/MULTI on the config key, so a concurrent
+    admin edit is retried over, never lost. The stored copy is read from Redis, never
+    from the in-process cache: with Redis unavailable the write is skipped (and
+    logged) rather than saving a possibly stale cached copy over the real one.
+    Returns ``(updated, reason)``: ``reason`` is empty on success, else why the config
+    was left alone.
+    """
+    import json as _json
+    import time as _time
+
+    from knowledge import index_store
+    from knowledge.router import _config_from_raw, _mirror_put
+
+    client = index_store._redis()
+    if client is None:
+        reason = "Redis unavailable: not writing from a possibly stale cache"
+        logger.warning("project config for %s not updated after indexing %s: %s", project_id, code_space, reason)
+        return False, reason
+    key = index_store._CFG_PREFIX + project_id
+    try:
+        import redis as _redis_mod
+
+        watch_error = _redis_mod.WatchError
+    except Exception:  # noqa: BLE001
+        watch_error = ()
+    for _ in range(10):
+        try:
+            with client.pipeline() as pipe:
+                pipe.watch(key)
+                blob = pipe.get(key)
+                raw = _json.loads(blob) if blob else None
+                merged = _merge_index_config_dict(raw, project_id, system, code_space)
+                pipe.multi()
+                pipe.set(key, _json.dumps(merged, default=str))
+                pipe.execute()
+        except watch_error:
+            continue  # someone changed the config between read and write: redo on the new value
+        except Exception:  # noqa: BLE001
+            logger.warning("project config for %s not updated (Redis error)", project_id, exc_info=True)
+            return False, "Redis error while writing the project config"
+        # Refresh this process's caches from what was just stored.
+        index_store._mem_cfg[project_id] = dict(merged)
+        index_store._mem_cfg_at[project_id] = _time.monotonic()
+        _mirror_put(_config_from_raw(project_id, merged))
+        return True, ""
+    reason = "too many concurrent edits to the project config"
+    logger.warning("project config for %s not updated: %s", project_id, reason)
+    return False, reason
 
 
 def _git_head_sha(repo_path: str) -> str | None:
@@ -1148,7 +1221,7 @@ async def process_graph_enrichment(
         from adapters import require_adapter
 
         graph_ontology = require_adapter(adapter).graph_ontology_kwargs()
-    episode_before = _row_episode_uuid(service, memory_id)
+    episode_before = await asyncio.to_thread(_row_episode_uuid, service, memory_id)
     enriched = await asyncio.to_thread(
         service.enrich_graph,
         content=content,
@@ -1161,7 +1234,7 @@ async def process_graph_enrichment(
         occurred_at=occurred_at,
         workspace=current_workspace,
     )
-    episode_after = _row_episode_uuid(service, memory_id) if enriched else None
+    episode_after = await asyncio.to_thread(_row_episode_uuid, service, memory_id) if enriched else None
     if enriched:
         # The first check above only covers the time the job sat in the queue.
         # Extraction itself takes minutes: re-read the row now and, if it was
@@ -1622,17 +1695,18 @@ async def connector_sync_cron(ctx: dict) -> dict:
         if not rec.get("enabled", True):
             continue
         # Same job id as an API-triggered sync of this connector instance
-        # (task_manager.connector_sync_job_id), so the two coalesce.
-        await redis.enqueue_job(
-            "process_connector_sync",
+        # (task_manager.connector_sync_job_id), so the two coalesce while one is
+        # in flight; a finished run's cached result is cleared (not skipped).
+        job = await enqueue_connector_sync_job(
+            redis,
             rec["connector_id"],
             rec.get("generation"),
-            _job_id=connector_sync_job_id(
+            connector_sync_job_id(
                 rec["connector_id"], rec.get("owner_user_id"), rec.get("generation")
             ),
-            _queue_name=settings.ingest_queue_name,
         )
-        enqueued += 1
+        if job is not None:
+            enqueued += 1
     logger.info(f"Connector sync cron: enqueued {enqueued} connector(s)")
     return {"enqueued": enqueued}
 
@@ -1729,8 +1803,15 @@ async def startup(ctx: dict) -> None:
 
     configure_logging(worker=True)
     logger.info("ARQ worker starting up...")
+    # First, so the healthcheck sees a beat as early as possible; the (sync)
+    # warm-up below runs in a thread, so the beat keeps going through it.
+    from worker_liveness import start_heartbeat
+
+    start_heartbeat(ctx)
+    logger.info(third_party_telemetry.startup_log_line())
     service = MemoryService()
-    service._get_memory()  # warm up connections
+    # Off the loop so the liveness heartbeat keeps beating through a slow cold start.
+    await asyncio.to_thread(service._get_memory)  # warm up connections
     from hybrid_inference import warmup_extraction
     await asyncio.to_thread(warmup_extraction)
     ctx["service"] = service
@@ -1762,6 +1843,9 @@ async def startup(ctx: dict) -> None:
 async def shutdown(ctx: dict) -> None:
     """Worker shutdown: close connections."""
     logger.info("ARQ worker shutting down...")
+    from worker_liveness import stop_heartbeat
+
+    await stop_heartbeat(ctx)
     registry = ctx.get("extension_registry")
     if registry:
         await registry.shutdown_all()

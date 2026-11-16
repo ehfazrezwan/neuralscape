@@ -484,6 +484,34 @@ def test_a_missing_evidence_file_still_raises_for_the_matrix_summary(tmp_path) -
         ev.matrix_artifacts(tmp_path / "nowhere.jsonl")
 
 
+def _tree(root) -> list[str]:
+    return sorted(str(entry.relative_to(root)) for entry in root.rglob("*"))
+
+
+def test_reading_a_path_whose_directory_is_missing_creates_nothing(tmp_path) -> None:
+    missing = tmp_path / "typo" / "deeper" / "evidence.jsonl"
+    with pytest.raises(FileNotFoundError):
+        ev.matrix_artifacts(missing)
+    with pytest.raises(FileNotFoundError):
+        ev.write_matrix_input(tmp_path / "out.json", [(["row"], missing, None)])
+    assert _tree(tmp_path) == []
+
+
+def test_reading_a_missing_file_in_an_existing_directory_leaves_no_lock_sidecar(tmp_path) -> None:
+    with pytest.raises(FileNotFoundError):
+        ev.matrix_artifacts(tmp_path / "nowhere.jsonl")
+    with pytest.raises(FileNotFoundError):
+        ev.EvidenceWriter(tmp_path / "nowhere.jsonl", create=False).snapshot_pinned()
+    assert _tree(tmp_path) == []
+
+
+def test_a_reader_never_makes_the_directory_but_a_writer_still_does(tmp_path) -> None:
+    ev.EvidenceWriter(tmp_path / "read" / "e.jsonl", create=False)
+    assert not (tmp_path / "read").exists()
+    ev.EvidenceWriter(tmp_path / "write" / "e.jsonl")
+    assert (tmp_path / "write").is_dir()
+
+
 # ---- the reader's lock does not need write permission
 
 def _not_root() -> None:
