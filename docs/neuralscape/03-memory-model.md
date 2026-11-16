@@ -276,6 +276,44 @@ A search by user `alice` walks group_ids `["user--alice", "shared"]`
 (plus the project-scoped variants when the request supplies
 `project_id`).
 
+#### Collision-free names
+
+The `--` delimiter may appear inside a legal id, so the legacy names are not
+one-to-one: user `alice--project--payroll` and user `alice` in project
+`payroll` both get `user--alice--project--payroll`. Likewise the email slug
+folds every run of disallowed characters to one `-`, so `a+b@example.com` and
+`a-b@example.com` both slug to `a-b-example.com`.
+
+- **Group ids.** Injective (collision-free) graph group ids are owned by PR #501
+  (`GRAPH_GROUP_ID_INJECTIVE_ENABLED`, default off) and are not part of the authority slice. Until it is enabled
+  the legacy names still collide for ids containing `--`. Deployments using `NS_AUTH_PROFILE=enforced` should
+  enable it once #501 lands. The policy layer does not depend on it: it keys pools by the structured `ns1`
+  namespace, never by a group name.
+- **Fresh login ids.** The email slug is lossy; a collision between two different emails is resolved at first
+  login (a hash-suffixed id for the newcomer, `login_providers.provision_user_id`), not by this slice. The
+  profile-gated `_x`/`_h` derivation that the authority slice carried is deferred
+  (`reports/p2-deferred-hunks/p2-02-identity-slug.patch`).
+
+**Migration:**
+
+- **Unaffected:** plain tuples keep their group ids and every existing login keeps its id.
+- **Group ids that change (when #501's flag is on):** only for users, projects or workspaces whose
+  value contains `.` or `--`. A dotted value
+  (for example the slug `first.last-example.com`) never had a usable legacy
+  graph name, because Graphiti refuses `.` in a group id, so it has no graph
+  data to move; its dreaming card pool key does change. Their old graph data stays
+  under the legacy name and is no longer read. Such a legacy name can belong
+  to more than one tuple, so it cannot be re-keyed automatically.
+  `policy_migration.parse_group_name` reports a legacy name as ambiguous when
+  the known user ids allow more than one reading.
+  `identity_binding.classify_legacy_identities` reports user ids that contain
+  `--project--` or `--ws--` with reason `namespace_delimiter`. Adjudicate each
+  affected id, then re-ingest or re-key its rows to the new name.
+
+**Re-run the policy migration after changing `NEURALSCAPE_API_KEY_USER_ID`** (or `DICTATOR_USER_IDS`, or the
+default user): the shared key's administrator grant is computed from them when the migration runs, not at
+request time.
+
 ### Dual-pool search
 
 `MemoryService.search()` runs two queries and merges:

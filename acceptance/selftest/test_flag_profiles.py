@@ -311,11 +311,11 @@ def test_check_compose_project_refuses_prod_and_non_disposable_names(name):
 
 
 def test_check_compose_project_accepts_disposable_prefixes_and_normalises():
-    assert guard.check_compose_project(" NSCampaign ", env={}).lower() == "nscampaign"
+    assert guard.check_compose_project(" NSTest-Acceptance ", env={}).lower() == "nstest-acceptance"
     assert guard.check_compose_project("nstest-abc", env={}) == "nstest-abc"
     assert guard.check_compose_project("bench-1", env={"NS_COMPOSE_ALLOWLIST": "bench-"}) == "bench-1"
     with pytest.raises(guard.GuardError):
-        guard.check_compose_project("nscampaign", env={"NS_COMPOSE_ALLOWLIST": "bench-"})
+        guard.check_compose_project("nstest-acceptance", env={"NS_COMPOSE_ALLOWLIST": "bench-"})
     with pytest.raises(guard.GuardError):  # the override cannot re-admit the production name
         guard.check_compose_project("neuralscape", env={"NS_COMPOSE_ALLOWLIST": "neuralscape"})
 
@@ -355,7 +355,7 @@ def test_only_the_two_read_only_exec_forms_pass():
     assert all(runctx.read_only_exec(a) for a in ok)
     assert not any(runctx.read_only_exec(a) for a in bad)
     with pytest.raises(runctx.ConfigError):
-        runctx.run_compose("nscampaign", *bad[0], run=lambda *a, **k: None)
+        runctx.run_compose("nstest-acceptance", *bad[0], run=lambda *a, **k: None)
 
 
 def test_run_sh_refuses_a_compose_profile_without_a_compose_project():

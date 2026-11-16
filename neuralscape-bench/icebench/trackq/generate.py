@@ -265,8 +265,15 @@ def _generate_nl_locate(corpus: Corpus, n: int, rng: random.Random) -> list[Quer
     """
     Generate nl_locate queries: use docstring as query to find function.
 
-    CodeSearchNet-style: sample functions with docstrings, strip the docstring,
-    use it as the query, and the target is (file, symbol).
+    CodeSearchNet-style: sample functions with docstrings, use the docstring as
+    the query, and the target is (file, symbol).
+
+    This function only READS docstrings from ``corpus``; it does not (and cannot)
+    remove them from what the systems index. The runner therefore has systems
+    index a docstring-stripped copy of the corpus (icebench/trackq/strip.py,
+    default on; ``--no-strip-docstrings`` opts out and marks the result "upper
+    bound, leaked"). Queries and gold are always generated from the ORIGINAL
+    corpus passed here.
     """
     corpus_path = Path(corpus.path)
 

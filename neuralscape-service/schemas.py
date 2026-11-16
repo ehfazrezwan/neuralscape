@@ -1158,8 +1158,11 @@ class MemoryResponse(BaseModel):
 
     Memory-model v2 fields render as nulls for legacy memories that didn't store them.
     Multi-user fields (`visibility`, `owner_user_id`) likewise render as null on
-    pre-multi-user memories — clients should treat null `visibility` as 'private'
-    and null `owner_user_id` as 'unknown / pre-multi-user write'.
+    pre-multi-user memories — clients should treat null `visibility` as 'private'.
+    A null `owner_user_id` in metadata is filled from the row's top-level `user_id`
+    when the memory is read, so it is only null when the row records neither
+    (pre-multi-user write). Conversation-extracted rows are stamped with both
+    (`owner_user_id`, `visibility=private`) at write time.
     """
     id: str
     memory: str
