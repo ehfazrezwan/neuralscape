@@ -109,6 +109,9 @@ def test_deleting_the_cbm_project_empties_it(a, cbm: Cbm):
     assert repo_name in re.sub(r"[^a-z0-9]+", "-", project.lower()), f"the delete names project {project!r}, not the one indexed from {c.repo_source!r}: {engine}"
     assert engine.get("status") == "deleted", f"the bridge's delete status is {engine.get('status')!r}, want 'deleted': {engine}"
     after = a.get("/v1/code-graph/query", params={"question": SYMBOL, "graph_id": c.code_space, "knowledge_system": SYSTEM})
-    # the project is gone: the service answers 200 with no hit (never a 5xx, never the symbol)
-    assert after.status_code == 200, f"query after delete -> {after.status_code}: {after.text[:200]}"
-    assert "router" not in after.json().get("result", ""), f"the deleted CBM project still answers: {after.text[:200]}"
+    # The project is gone. The cbm engine cannot bind a space the bridge no longer has a project for, and the
+    # service's answer for an unbindable engine is a 400 naming "not indexed yet" (main.py, resolve_bound_code_system
+    # -> None); only the native engine keeps answering 200 with no hit. Never a 5xx, never the symbol.
+    assert after.status_code == 400, f"query after delete -> {after.status_code} (want the 400 'not indexed' refusal): {after.text[:200]}"
+    assert "not indexed" in after.text, f"the refusal does not say the space is not indexed: {after.text[:200]}"
+    assert "router" not in after.text, f"the deleted CBM project still answers: {after.text[:200]}"

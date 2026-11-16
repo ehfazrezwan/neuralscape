@@ -466,9 +466,9 @@ def check_keyword_finds(client: NSClient, rows: list[dict], marker_of: dict[str,
         if not marker or marker not in (row.get("memory") or row.get("content") or ""):
             continue  # the sweep rewrote the text without the marker: nothing lexical to check
         checked += 1
-        hits = {h.get("id") for h in client.search(marker, limit=3)}
-        if row["id"] not in hits:
-            missed.append(row["id"])
+        found = [h for h in client.search(marker, limit=3) if h.get("source") not in ("graph", "episode")]  # the row's own (dense+BM25) legs
+        if row["id"] not in {h.get("id") for h in found}:
+            missed.append(f"{row['id']} (top rows: {[(str(h.get('id'))[:8], h.get('source')) for h in found]})")
     assert checked >= 3, f"only {checked} live rows still carry their marker; keyword check is not meaningful"
     assert not missed, f"marker-only search misses {len(missed)} of {checked} live rows (lost bm25 vector?): {missed[:3]}"
     return checked
