@@ -74,25 +74,12 @@ GOVERNED_REPLACED = {
         ("tests/test_v1_governed_memory.py::test_privacy_narrowing_between_stages_denies_only_the_derivative",
          "tests/test_publication_fence.py"),
     ),
-    "job-key-omits-store-scope": (
-        "governed writes are ledger intents, not coalescing queue job ids (see rs-job-keys under this profile)",
-        ("tests/test_v1_durable_write.py::test_the_same_key_twice_through_the_manager_is_one_intent",
-         "tests/test_v1_durable_write.py::test_api_idempotency_key_replays_and_conflicts"),
-    ),
-    "job-key-omits-raw-options": (
-        "governed writes are ledger intents, not coalescing queue job ids (see rs-job-keys under this profile)",
-        ("tests/test_producers_writers.py::test_job_idempotency_replay_and_conflict",
-         "tests/test_v1_durable_write.py::test_api_idempotency_key_replays_and_conflicts"),
-    ),
     "stale-revision-edit": (
         "governed edits require If-Match with the expected revision; a stale one is refused",
         ("tests/test_v1_governed_memory.py::test_a_stale_expected_revision_is_refused_and_writes_nothing",
          "tests/test_v1_governed_memory.py::test_two_edits_naming_the_same_revision_cannot_both_commit"),
     ),
 }
-
-OBSERVED_LIVE = {"job-key-omits-store-scope": "rs-job-keys", "job-key-omits-raw-options": "rs-job-keys",
-                 "readiness-probes-backends": "rs-readiness"}
 
 
 def _python(tree: Path) -> str:
