@@ -45,7 +45,24 @@ def _service(*, graphiti=True, fail: Exception | None = None):
 EMPTY = {"edges": [], "nodes": [], "episodes": [], "communities": []}
 
 
+def _driver_errors():
+    from neo4j.exceptions import DriverError, Neo4jError, ServiceUnavailable, SessionExpired
+
+    return [
+        ServiceUnavailable("Unable to retrieve routing information"),
+        SessionExpired("Session expired"),
+        DriverError("Driver closed"),
+        Neo4jError("neo4j error"),
+        TimeoutError("Graph operation timed out after 30.0s"),
+    ]
+
+
 class TestServiceMarker:
+    @pytest.mark.parametrize("exc", _driver_errors(), ids=lambda e: type(e).__name__)
+    def test_real_driver_and_bridge_errors_are_degraded(self, exc):
+        out = _service(fail=exc).search_graph("q", "u1")
+        assert out["degraded"] is True and out["error"] == "graph_unavailable"
+
     def test_graph_configured_but_init_failed_is_degraded(self):
         svc = _service(graphiti=False)
         svc._graph_init_error = "ConnectionError: neo4j down at startup"
@@ -154,3 +171,11 @@ class TestInitFailureIsRecorded:
         svc = self._init(monkeypatch, None)
         assert svc._graph_init_error is None
         assert svc.search_graph("q", "u1") == EMPTY
+
+
+class TestMcpToolDescription:
+    @pytest.mark.asyncio
+    async def test_description_tells_agents_what_degraded_means(self):
+        tools = await mcp_server.list_tools()
+        desc = next(t for t in tools if t.name == "search_knowledge_graph").description
+        assert "degraded" in desc and "graph_unavailable" in desc and "outage" in desc
