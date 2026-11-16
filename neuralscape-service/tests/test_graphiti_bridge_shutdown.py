@@ -35,7 +35,7 @@ def test_memory_service_close_closes_the_driver_then_stops_the_bridge():
     service._graphiti = Mock()
     service._graphiti.close = Mock(return_value='closing')
     service._bridge = Mock()
-    service._bridge.run.side_effect = lambda coro: order.append('driver_closed')
+    service._bridge.run.side_effect = lambda coro, **kw: order.append('driver_closed')
     service._bridge.shutdown.side_effect = lambda: order.append('bridge_stopped')
     service.close()
     assert order == ['driver_closed', 'bridge_stopped']

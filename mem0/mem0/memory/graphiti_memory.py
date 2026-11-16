@@ -231,6 +231,13 @@ class _AsyncBridge:
             await self._loop.shutdown_asyncgens()
 
         self._stopped = True
+        if not self._loop.is_running():
+            # The loop was already stopped (nothing can answer a cancel request):
+            # skip the wait for it, just release the loop.
+            self._thread.join(timeout=timeout)
+            if not self._thread.is_alive():
+                self._loop.close()
+            return
         try:
             asyncio.run_coroutine_threadsafe(_cancel_all(), self._loop).result(timeout=timeout)
         except Exception:
@@ -239,6 +246,10 @@ class _AsyncBridge:
         self._thread.join(timeout=timeout)
         if not self._thread.is_alive():
             self._loop.close()
+        else:
+            logger.warning(
+                "Graphiti bridge thread did not stop within %.0fs; abandoning it", timeout
+            )
 
 
 def _hybrid_egress_ok(text: str) -> bool:

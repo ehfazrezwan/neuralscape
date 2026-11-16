@@ -24,6 +24,11 @@ logger = logging.getLogger(__name__)
 # that persists still fails start-up after the last attempt.
 _COLD_START_ATTEMPTS = 8
 
+# How long close() waits for the Graphiti driver to close on the bridge loop.
+# Shutdown must never park for the bridge's general call limit (minutes): a
+# loop that was stopped or is wedged would block it for the whole limit.
+_CLOSE_DRIVER_TIMEOUT_S = 5.0
+
 
 def _is_collection_exists_conflict(exc: BaseException) -> bool:
     """Qdrant's 409 ``Collection `x` already exists!``: another process created it first.
@@ -127,6 +132,18 @@ class CoreMixin:
         Without this re-attach every graph write is a silent no-op and
         the health check reports ``graph_store: not_initialized``.
         """
+        if self._memory is not None and getattr(self, "_closed", False):
+            # close() released this service's clients, bridge and driver. Never
+            # hand those closed objects to a later caller (a request after a
+            # restart of the app inside one process, a stale holder of this
+            # service): drop them so the init below builds fresh ones.
+            with self._init_lock:
+                if getattr(self, "_closed", False):
+                    self._memory = None
+                    self._graphiti = None
+                    self._bridge = None
+                    self._genai_model = None
+                    self._closed = False
         if self._memory is None:
             with self._init_lock:
                 if self._memory is None:
@@ -269,23 +286,35 @@ class CoreMixin:
         if getattr(self, "_closed", False):
             return
         self._closed = True
+        # Snapshot first: a concurrent _get_memory() may reset the attributes.
+        graphiti, bridge, memory = self._graphiti, self._bridge, self._memory
         try:
-            if self._graphiti and self._bridge:
-                self._bridge.run(self._graphiti.close())
+            if graphiti and bridge:
+                try:
+                    bridge.run(graphiti.close(), timeout=_CLOSE_DRIVER_TIMEOUT_S)
+                except TimeoutError:
+                    # A stopped or wedged bridge loop never answers; do not
+                    # wait out the general bridge limit. The loop is torn down
+                    # right below and the driver abandoned with it.
+                    logger.warning(
+                        "Graphiti driver did not close within %.0fs; abandoning it",
+                        _CLOSE_DRIVER_TIMEOUT_S,
+                    )
         finally:
             # Stop the bridge loop AFTER the driver closed on it (even when that
             # close raised), so no task or driver outlives its loop.
             try:
-                shutdown = getattr(self._bridge, "shutdown", None)
+                shutdown = getattr(bridge, "shutdown", None)
                 if callable(shutdown):
                     shutdown()
             finally:
-                self._close_http_clients()
+                self._close_http_clients(memory)
 
-    def _close_http_clients(self) -> None:
+    def _close_http_clients(self, memory=None) -> None:
         """Best-effort close of the Qdrant client, the embedder's HTTP client and mem0's
         own resources (the SQLite history connection)."""
-        memory = self._memory
+        if memory is None:
+            memory = self._memory
         if memory is None:
             return
         closers = [
