@@ -870,6 +870,21 @@ async def process_ingest_okf_bundle(ctx: dict, payload: dict) -> dict:
     graph_jobs = result.pop("graph_jobs", [])
     result["graph_jobs_enqueued"] = await _enqueue_graph_jobs(ctx, graph_jobs, adapter=None)
 
+    if result.get("status") == "failed":
+        # Every concept with text failed: that is a failed import, not a
+        # success with zero counts. Fail the job so the task status says so.
+        first = (result.get("failed_concepts") or [{}])[0]
+        raise RuntimeError(
+            f"OKF bundle ingest failed: all {result.get('failed', 0)} concepts failed "
+            f"(first: {first.get('concept_id')}: {first.get('error')})"
+        )
+    if result.get("status") == "partial":
+        logger.warning(
+            "OKF bundle %s imported partially: %d ingested, %d failed (%s)",
+            filename, result.get("concepts", 0), result.get("failed", 0),
+            [c["concept_id"] for c in result.get("failed_concepts", [])][:10],
+        )
+
     registry = ctx.get("extension_registry")
     if registry and result.get("memory_ids"):
         await registry.emit_event("memory_stored", {
