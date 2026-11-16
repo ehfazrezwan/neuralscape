@@ -1191,8 +1191,7 @@ async def list_tools() -> list[Tool]:
                 "Set/update a project's knowledge routing config (Phase D): which code "
                 "systems are available, whether to fuse code into generic recall (default "
                 "TRUE per decision #3), and which engine to prefer. Typically set at index "
-                "time but can be edited later. Only the fields you pass change; the code_space "
-                "recorded by indexing is kept."
+                "time but can be edited later."
             ),
             inputSchema={
                 "type": "object",
