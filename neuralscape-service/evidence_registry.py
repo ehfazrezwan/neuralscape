@@ -354,9 +354,11 @@ LEAVES: tuple[Leaf, ...] = tuple(
 # needs_real_service marks reproductions that are unit-level here and must be
 # repeated against real stores before they count as qualified evidence.
 SCENARIOS: tuple[Scenario, ...] = (
-    Scenario("group-id-tuple-collision", "expected-failure", ("A1.02", "A1.03"),
+    # The three retired scenarios below keep needs_real_service=True until the
+    # real-store integration tests (integration_tests/) have run on the gate.
+    Scenario("group-id-tuple-collision", "control", ("A1.02", "A1.03"),
              "test_distinct_namespace_tuples_have_distinct_group_ids", True,
-             "Distinct (user, project) tuples can produce one graph group id."),
+             "Distinct (user, project) tuples have distinct graph group ids WHEN GRAPH_GROUP_ID_INJECTIVE_ENABLED is on (the fix is flag-gated, default off; the defect remains by default)."),
     Scenario("group-id-distinct-controls", "control", ("A1.02", "A1.03"),
              "test_ordinary_namespace_tuples_stay_distinct", False,
              "Ordinary tuples remain distinct."),
@@ -366,9 +368,9 @@ SCENARIOS: tuple[Scenario, ...] = (
     Scenario("email-slug-controls", "control", ("G1.04",),
              "test_ordinary_emails_slug_deterministically", False,
              "Ordinary emails slug deterministically and distinctly."),
-    Scenario("queued-visibility-publication", "expected-failure", ("A7.01", "A7.04"),
+    Scenario("queued-visibility-publication", "control", ("A7.01", "A7.04"),
              "test_queued_graph_job_publishes_current_visibility", True,
-             "A queued graph job publishes the visibility it was enqueued with, not the memory's current one."),
+             "A queued graph job publishes the memory's current visibility (fixed), not the one it was enqueued with."),
     Scenario("queued-job-deleted-memory-control", "control", ("A7.01", "A7.02"),
              "test_queued_graph_job_skips_a_deleted_memory", False,
              "A job for a memory deleted while queued is skipped."),
@@ -387,9 +389,9 @@ SCENARIOS: tuple[Scenario, ...] = (
     Scenario("job-key-controls", "control", ("A6.02", "D2.07"),
              "test_job_ids_are_stable_and_user_scoped", False,
              "Same inputs give one id and different users give different ids."),
-    Scenario("stale-revision-edit", "expected-failure", ("A3.01", "A3.02"),
+    Scenario("stale-revision-edit", "control", ("A3.01", "A3.02"),
              "test_patch_request_carries_an_expected_revision", True,
-             "The edit request has no revision precondition, so a stale edit cannot be refused."),
+             "The edit request carries an expected-revision precondition (fixed); behaviour is covered in tests/test_patch_revision.py."),
     Scenario("patch-partial-control", "control", ("A3.01",),
              "test_patch_request_applies_only_sent_fields", False,
              "Only supplied fields count as changes."),
