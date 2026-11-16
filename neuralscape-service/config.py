@@ -26,6 +26,10 @@ _AMBIENT_DIM_WARNED: set = set()
 
 
 class Settings(BaseSettings):
+    # Logging (read by logging_config.configure_logging; `.env` values count)
+    log_level: str = "INFO"
+    log_format: str = "json"  # "json" or "console"
+
     # Gemini (direct Google AI Studio)
     google_api_key: str = ""
     gemini_llm_model: str = "gemini-3.1-flash-lite"
@@ -669,12 +673,35 @@ class Settings(BaseSettings):
     tenant_admission_max_concurrency: int | None = None
     tenant_admission_max_queue_depth: int | None = None
 
+    # ── Durable authority store (policy snapshot + identity bindings) ────
+    # Off by default: nothing reads it unless enabled and wired to enforcement.
+    #   authority_backend       → "sqlite" (embedded, WAL, synchronous=FULL) or
+    #     "postgres" (tenant-cell profile).
+    #   authority_sqlite_path   → database file on a local filesystem.
+    #   authority_postgres_dsn  → libpq connection string for the cell database.
+    authority_enabled: bool = False
+    authority_backend: Literal["sqlite", "postgres"] = "sqlite"
+    authority_sqlite_path: str = ""
+    authority_postgres_dsn: str = ""
+    #   authority_postgres_migrate_on_open → as for the ledger: False is the least-privilege runtime role.
+    authority_postgres_migrate_on_open: bool = True
+
     # Service
     host: str = "0.0.0.0"
     port: int = 8199
     default_user_id: str = "default_user"
     default_project_id: str | None = None
     mcp_transport: str = "stdio"  # "stdio" or "http"
+
+    # Explicit action-policy enforcement (default off: no behavior change).
+    #   off      → no-op; observe → decision log only; enforce → deny on policy.
+    ns_policy_mode: Literal["off", "observe", "enforce"] = "off"
+    # Scoped credentials and service accounts (CREDENTIALS_ENABLED).  The routes and the credential format
+    # are live only when this is set AND ns_policy_mode is "enforce": a scope nothing enforces would be a lie.
+    credentials_enabled: bool = False
+    # Authentication profile: legacy_compat keeps today's shared-key/auth-off
+    # capability under named principals; enforced refuses both.
+    ns_auth_profile: Literal["legacy_compat", "enforced"] = "legacy_compat"
 
     # Vendored mem0/Graphiti usage telemetry. Declared so these keys are valid in the
     # service .env; nothing here reads them. third_party_telemetry.py applies them (or

@@ -104,6 +104,11 @@ def test_extraction_on_stores_verbatim_source_facts_with_evidence(fake_hybrid, m
         assert reread.category_evidence and reread.category_evidence['mode'] == 'certain'
         assert reread.category_evidence['primary_category'] == reread.category
         assert reread.owner_user_id == uid
+        assert reread.visibility == 'private'  # conversation extractions are stamped private
+    # A private-filtered store read finds the extracted rows (real Qdrant):
+    # the filter keys on metadata.visibility, which unstamped rows would miss.
+    dry = service.retag_memories(uid, {'visibility': 'private'}, {'add_tags': ['probe']}, True)
+    assert dry['matched'] == len(stored), dry
 
 
 def test_extraction_off_never_calls_hybrid_and_stores_via_gemini(fake_hybrid, service, uid, make_service):

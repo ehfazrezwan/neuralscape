@@ -4,6 +4,12 @@ All notable changes to the `neuralscape` Claude plugin are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 the project adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.9.9] - 2026-11-16
+
+### Added
+- `CONTEXT_MODE=assemble` (opt-in; the default stays `index`): SessionStart also calls `POST /v1/context/assemble`, the service's token-budgeted bundle (identity card, the session's rolling summary and recent messages, and relevant-memory rows for a query), and injects `bundle.text` under "Session context (assembled, ~N of M tokens)". Until now nothing called that route. The request carries `budget_tokens` (`ASSEMBLE_BUDGET_TOKENS`, default 1500, clamped to the route's 100 to 1000000), the Claude session id, the project, the user and `format: "plain"`; `query` is `ASSEMBLE_QUERY` when set, otherwise the last user prompt of the transcript on resume, compact and fork, otherwise none (a fresh session has nothing to rank by, so the bundle then holds the card and the session's own summary and messages). Binding standards, "Resuming after compaction" and "Previously..." come from the context fetch as before; the identity-card block and the index rows the bundle already shows are not rendered again. Any failure of the route falls back to the plain index: a 404 (an older server without the route) quietly, a rejected key or request (401/403, other 4xx) with a one-line notice, 5xx and network failures only on stderr (the index fetch reports a failing service). With any other `CONTEXT_MODE` the route is never called.
+- README: the endpoint inventory lists the new call; both settings are in the settings table and in the plugin's userConfig.
+
 ## [2.9.8] - 2026-11-16
 
 ### Fixed

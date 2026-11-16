@@ -223,7 +223,7 @@ def test_required_baseline_areas_each_have_an_expected_failure_and_a_control() -
     }
     # Areas still listed above whose defect has been fixed: the scenario that
     # used to be the expected failure is now a control too.
-    fixed_in_place = {"identity"}
+    fixed_in_place = {"identity", "readiness"}
     by_id = {s.id: s for s in SCENARIOS}
     for area, (failure, control) in areas.items():
         assert by_id[failure].kind == ("control" if area in fixed_in_place else "expected-failure"), area

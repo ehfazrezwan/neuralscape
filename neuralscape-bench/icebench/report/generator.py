@@ -461,12 +461,24 @@ Percentiles (p50/p95/p99) use the nearest-rank definition.
 
         return "\n".join(lines)
 
+    def _nl_locate_protocol(self) -> str:
+        """nl_locate corpus protocol label recorded by the scorer (never blank)."""
+        from icebench.trackq.strip import PROTOCOL_UNKNOWN
+
+        meta = getattr(self, "score_meta", None) or {}
+        corpus_meta = meta.get("nl_locate_corpus") or {}
+        return str(corpus_meta.get("protocol") or PROTOCOL_UNKNOWN)
+
     def _md_caveats(self) -> str:
         """Generate caveats section."""
         lines = ["## Caveats & Methodology Notes", ""]
 
         # Sample sizes
         lines.append("**Sample sizes:** Each measurement is the median of 3 repetitions.")
+        lines.append("")
+
+        # nl_locate corpus protocol (docstring leakage)
+        lines.append(f"**nl_locate corpus:** {self._nl_locate_protocol()}.")
         lines.append("")
 
         # Shared oracle bias
@@ -828,6 +840,7 @@ Percentiles (p50/p95/p99) use the nearest-rank definition.
         return f"""    <div class="card">
       <h2>Caveats &amp; Methodology Notes</h2>
       <p><strong>Sample sizes:</strong> Each measurement is the median of 3 repetitions.</p>
+      <p><strong>nl_locate corpus:</strong> {html.escape(self._nl_locate_protocol())}.</p>
       <p><strong>Shared oracle bias:</strong> All systems share the same ground-truth oracle (tree-sitter structural QA).{oracle_note}</p>
       <p><strong>NS-authored harness bias:</strong> This harness is authored by the Neuralscape team.
          Mitigations: adapters are forbidden from encoding system-specific intelligence;

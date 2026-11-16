@@ -41,6 +41,9 @@ import {
   readLocalCompactSnapshot,
   readPredecessorSessionIds,
   recordFailure,
+  classifyFailure,
+  neuralscapePost,
+  redactPrivate,
   resetTransportFailures,
 } from "../utils.js";
 
@@ -58,6 +61,7 @@ import {
   toIndexEntry,
 } from "../core/disclosure.js";
 
+import { extractRecentUserPrompts } from "../adapters/claude-code.js";
 import { COMPACT_SNAPSHOT_SESSION_TAG_PREFIX, COMPACT_SNAPSHOT_TAG } from "../core/compact.js";
 import { CATEGORY_LABELS, CATEGORY_ORDER } from "../types.js";
 
@@ -70,9 +74,114 @@ const INDEX_FETCH_LIMIT = 200;
 
 // ── Config knobs ─────────────────────────────────────────────────
 
-export function getContextMode(): "index" | "full" {
+export function getContextMode(): "index" | "full" | "assemble" {
   const raw = readConfig("CONTEXT_MODE", "index").toLowerCase();
-  return raw === "full" ? "full" : "index";
+  return raw === "full" || raw === "assemble" ? raw : "index";
+}
+
+/** Bounds of `budget_tokens` on `POST /v1/context/assemble` (schemas.AssembleContextRequest). */
+export const ASSEMBLE_MIN_BUDGET = 100;
+export const ASSEMBLE_MAX_BUDGET = 1_000_000;
+export const DEFAULT_ASSEMBLE_BUDGET_TOKENS = 1500;
+const ASSEMBLE_QUERY_MAX = 2000;
+const ASSEMBLE_SESSION_ID_MAX = 100;
+
+/** Token budget sent to the assemble route (`ASSEMBLE_BUDGET_TOKENS`), clamped to the route's bounds. */
+export function getAssembleBudgetTokens(): number {
+  const parsed = parseInt(readConfig("ASSEMBLE_BUDGET_TOKENS", ""), 10);
+  if (!Number.isFinite(parsed) || parsed <= 0) return DEFAULT_ASSEMBLE_BUDGET_TOKENS;
+  return Math.min(ASSEMBLE_MAX_BUDGET, Math.max(ASSEMBLE_MIN_BUDGET, parsed));
+}
+
+/** An optional fixed query for the assembled bundle's relevant-memory rows (`ASSEMBLE_QUERY`). */
+export function getAssembleQuery(): string | undefined {
+  const raw = readConfig("ASSEMBLE_QUERY", "").trim();
+  return raw ? raw.slice(0, ASSEMBLE_QUERY_MAX) : undefined;
+}
+
+/** The request body for `POST /v1/context/assemble` (format is always plain: the bundle is injected as text). */
+export function buildAssembleRequest(opts: {
+  budgetTokens: number;
+  userId: string;
+  sessionId?: string;
+  projectId?: string;
+  query?: string;
+}): Record<string, unknown> {
+  const body: Record<string, unknown> = {
+    budget_tokens: Math.min(ASSEMBLE_MAX_BUDGET, Math.max(ASSEMBLE_MIN_BUDGET, Math.trunc(opts.budgetTokens))),
+    format: "plain",
+    user_id: opts.userId,
+  };
+  if (opts.sessionId) body.session_id = opts.sessionId.slice(0, ASSEMBLE_SESSION_ID_MAX);
+  if (opts.projectId) body.project_id = opts.projectId;
+  if (opts.query && opts.query.trim()) body.query = opts.query.slice(0, ASSEMBLE_QUERY_MAX);
+  return body;
+}
+
+export interface AssembledBundle {
+  text: string;
+  usedTokens: number;
+  budgetTokens: number;
+}
+
+/** The plain bundle out of an assemble response, or null when it carries no text. */
+export function parseAssembleResponse(resp: unknown): AssembledBundle | null {
+  const r = resp as { bundle?: { text?: unknown }; used_tokens?: unknown; budget_tokens?: unknown } | null;
+  const text = r?.bundle?.text;
+  if (typeof text !== "string" || !text.trim()) return null;
+  return {
+    text: text.trim(),
+    usedTokens: typeof r?.used_tokens === "number" ? r.used_tokens : 0,
+    budgetTokens: typeof r?.budget_tokens === "number" ? r.budget_tokens : 0,
+  };
+}
+
+/** Memory ids the bundle's relevant-memory rows already show (`- [<id>] ...`), so the index table does not repeat them. */
+export function assembledMemoryIds(text: string): Set<string> {
+  const ids = new Set<string>();
+  for (const m of text.matchAll(/^- \[([^\]\s]+)\]/gm)) ids.add(m[1]);
+  return ids;
+}
+
+/**
+ * The assemble query: the `ASSEMBLE_QUERY` setting, else (on resume/compact/fork, where the session is
+ * continuing) the last user prompt of the transcript, else none (a fresh session has nothing to rank by).
+ */
+export async function resolveAssembleQuery(input: {
+  source?: string;
+  transcript_path?: string;
+}): Promise<string | undefined> {
+  const fixed = getAssembleQuery();
+  if (fixed) return fixed;
+  if (!isResumeSource(input.source) || !input.transcript_path) return undefined;
+  const [last] = await extractRecentUserPrompts({ transcript_path: input.transcript_path }, 1);
+  const clean = last ? redactPrivate(last, { failClosed: true }).trim() : "";
+  return clean ? clean.slice(0, ASSEMBLE_QUERY_MAX) : undefined;
+}
+
+/**
+ * Call the assemble route. Resolves null for "use the index instead": a 404 (an older server without the
+ * route) quietly; any other failure with its #500 kind logged. Never throws.
+ */
+export async function fetchAssembledBundle(body: Record<string, unknown>): Promise<{
+  bundle: AssembledBundle | null;
+  notice: string;
+}> {
+  try {
+    const bundle = parseAssembleResponse(await neuralscapePost("/v1/context/assemble", body));
+    return { bundle, notice: "" };
+  } catch (error) {
+    const kind = classifyFailure(error);
+    if (kind === "not_found") return { bundle: null, notice: "" };
+    logError(`context assemble failed (${kind}); using the index`, error);
+    // Network and server failures hit the index fetch too, which reports them; a rejected key or request is
+    // specific to this call (or its settings) and would otherwise be invisible.
+    const notice =
+      kind === "auth" || kind === "client"
+        ? `[neuralscape] CONTEXT_MODE=assemble was rejected by the service (${kind === "auth" ? "HTTP 401/403" : "HTTP 4xx"}); showing the index instead.`
+        : "";
+    return { bundle: null, notice };
+  }
 }
 
 export function getIndexBudgetTokens(): number {
@@ -238,6 +347,13 @@ export interface IndexModeInputs {
   sessionId?: string;
   /** Resume/fork: the earlier session id(s) read from the transcript head (see readPredecessorSessionIds). */
   predecessorIds?: string[];
+  /**
+   * CONTEXT_MODE=assemble: the bundle `POST /v1/context/assemble` returned. It already carries the identity
+   * card(s), the session summary / recent messages and (with a query) relevant-memory rows, so the cards are
+   * not rendered again and the index table leaves out the rows the bundle shows. Standards, "Resuming after
+   * compaction" and "Previously…" come from the context fetch and are unchanged.
+   */
+  assembled?: AssembledBundle;
 }
 
 /**
@@ -265,7 +381,15 @@ function buildContinuitySections(inputs: IndexModeInputs, now: Date): {
   const standardsBlock = formatStandards(context.standards);
   if (standardsBlock) sections.push(standardsBlock);
 
-  const cardBlock = renderCardBlock(cards);
+  if (inputs.assembled) {
+    const a = inputs.assembled;
+    sections.push(
+      `## Session context (assembled, ~${a.usedTokens} of ${a.budgetTokens} tokens)\n\n${a.text}`,
+    );
+  }
+
+  // The assembled bundle already holds the identity card(s).
+  const cardBlock = inputs.assembled ? "" : renderCardBlock(cards);
   if (cardBlock) sections.push(cardBlock);
 
   // Compact-resilience: after a compaction (or --resume), re-anchor the
@@ -336,10 +460,12 @@ export function buildIndexContext(inputs: IndexModeInputs): string {
 
   // D1: day-grouped index of everything else.
   const memories: NeuralscapeMemory[] = [];
+  const inBundle = inputs.assembled ? assembledMemoryIds(inputs.assembled.text) : new Set<string>();
   for (const cat of Object.keys(categories)) {
     for (const mem of categories[cat] ?? []) {
       if (mem.id === previouslyId) continue;
       if (resumeIds.has(mem.id)) continue;
+      if (inBundle.has(mem.id)) continue;
       memories.push(mem);
     }
   }
@@ -554,7 +680,24 @@ async function main(): Promise<void> {
     );
 
     const mode = getContextMode();
-    const codeGraphPromise = mode === "index" ? probeCodeGraph(userId) : Promise.resolve(false);
+    const codeGraphPromise = mode !== "full" ? probeCodeGraph(userId) : Promise.resolve(false);
+
+    // CONTEXT_MODE=assemble: the budgeted bundle is fetched alongside the context; any failure leaves null and
+    // the index below is rendered as usual. The route is never called in the other modes.
+    const assemblePromise: Promise<{ bundle: AssembledBundle | null; notice: string }> =
+      mode === "assemble"
+        ? resolveAssembleQuery(input).then((query) =>
+            fetchAssembledBundle(
+              buildAssembleRequest({
+                budgetTokens: getAssembleBudgetTokens(),
+                userId,
+                sessionId: input.session_id,
+                projectId,
+                query,
+              }),
+            ),
+          )
+        : Promise.resolve({ bundle: null, notice: "" });
 
     let context: ContextResponse;
     try {
@@ -589,6 +732,7 @@ async function main(): Promise<void> {
     context = await withLocalCompactSnapshot(context, input);
 
     let contextBody: string;
+    let assembleNotice = "";
     if (mode === "full") {
       // Legacy full-content injection plus the continuity blocks (resume,
       // Previously, cards): see buildFullContext.
@@ -613,10 +757,13 @@ async function main(): Promise<void> {
         (c): c is { label: string; lines: string[] } => c !== null,
       );
       const codeGraphAvailable = await codeGraphPromise.catch(() => false);
+      const assembled = await assemblePromise.catch(() => ({ bundle: null, notice: "" }));
+      assembleNotice = assembled.notice;
       contextBody = buildIndexContext({
         context,
         cards,
         codeGraphAvailable,
+        assembled: assembled.bundle ?? undefined,
         budgetTokens: getIndexBudgetTokens(),
         source: input.source,
         sessionId: input.session_id,
@@ -629,7 +776,10 @@ async function main(): Promise<void> {
 
     const identityNotice = buildIdentityNotice(userId, getUserIdSource(), getServiceUrl());
     const combined =
-      (contextBody || "") + pendingNote + (identityNotice ? `\n\n${identityNotice}` : "");
+      (contextBody || "") +
+      pendingNote +
+      (identityNotice ? `\n\n${identityNotice}` : "") +
+      (assembleNotice ? `\n\n${assembleNotice}` : "");
     if (combined.trim()) {
       outputWithContext(combined);
     } else {
