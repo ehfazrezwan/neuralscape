@@ -162,15 +162,23 @@ def prepare_checkpoint(service, req: CheckpointRequest, user_id: str) -> dict:
             d["expires_at"] = d["expires_at"].isoformat()
         # Persist the derived scope on the payload so the worker's store_raw
         # writes exactly the key the verdict below probed.
-        scope, visibility, project_id = effective_storage_key(
-            {**d, "scope": d.get("scope") if "scope" in item.model_fields_set else None}
-        )
+        explicit_scope = d.get("scope") if "scope" in item.model_fields_set else None
+        scope, visibility, project_id = effective_storage_key({**d, "scope": explicit_scope})
+        if scope == "project" and not project_id and req.project_id:
+            # The documented call shape puts project_id once at the top level
+            # (the save-session skill); an item that resolves to project scope
+            # inherits it rather than being dropped.
+            d["project_id"] = req.project_id
+            scope, visibility, project_id = effective_storage_key({**d, "scope": explicit_scope})
         d["scope"] = scope
         # Mirrors store_raw: a project-scoped item needs a project_id. A sensitive
         # item asking for 'standard' is gated private, so scope is no longer forced
         # global; without this the worker would reject it AFTER a 202 "new".
         if scope == "project" and not project_id:
-            raise ValueError(f"Item {idx}: project_id is required when scope='project'")
+            raise ValueError(
+                f"Item {idx}: project_id is required when scope='project' "
+                f"(set it on the item or on the request)"
+            )
         # Standard-tier write gate (mirrors _authorize_standard_write).
         if visibility == MemoryVisibility.STANDARD.value:
             if not settings.standards_enabled:
