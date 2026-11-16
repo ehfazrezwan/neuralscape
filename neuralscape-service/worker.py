@@ -122,6 +122,7 @@ async def process_memory_store(
         occurred_at=occurred_at,
         return_stats=True,
     )
+    created_ids = set(extraction_stats.get("created_ids") or [])
 
     # Emit memory_stored events so extensions (e.g. conversation-compiler) can write to vault
     registry = ctx.get("extension_registry")
@@ -139,6 +140,14 @@ async def process_memory_store(
                 "project_id": project_id,
                 "agent_id": agent_id,
                 "run_id": run_id,
+                # Conversation-extracted rows: the vault mirror decides by the
+                # category's tier (not the private stamp) unless the sensitivity
+                # gate forced them private. See extensions/conversation_compiler.
+                # Only rows THIS extraction created count as extracted; a
+                # dedup survivor is a pre-existing row (possibly an explicit
+                # private write) and keeps its own stored visibility.
+                "extracted": getattr(mem, "id", "") in created_ids,
+                "sensitivity": getattr(mem, "sensitivity", None),
                 "source": "worker",
             })
         # Rebuild category index once after all vault writes (not per-fact)
@@ -261,9 +270,13 @@ async def process_memory_raw(
     # vector_only (audit 27 #12): this is an internal near-dupe probe — it
     # must not pay the graph pass + edge enrichment of a full hybrid recall,
     # and must not pollute the dreaming recall traces.
+    # The probe searches the memory workspace only, so a write into a reference
+    # workspace skips it (store_raw's own dedup key includes the workspace);
+    # otherwise identical text in the memory workspace would swallow the write.
+    _workspace = v2_extras.get("workspace")
     try:
         # Off the loop: retry_transient may time.sleep for tens of seconds.
-        existing = await asyncio.to_thread(
+        existing = [] if _workspace not in (None, "memory") else await asyncio.to_thread(
             service.search,
             query=content,
             user_id=user_id,
@@ -320,6 +333,7 @@ async def process_memory_raw(
         sensitivity_override=v2_extras.get("sensitivity_override", False),
         memory_kind=v2_extras.get("memory_kind"),
         source_ref=v2_extras.get("source_ref"),
+        workspace=v2_extras.get("workspace"),
         add_to_graph=False,
         return_created=True,
     )
@@ -338,7 +352,9 @@ async def process_memory_raw(
         # Plain dedup hit: not re-enriched, but check whether the graph has
         # since gone stale for this row (flagged: GRAPH_SUPERSESSION_ENABLED).
         await _enqueue_stale_graph_check(ctx, memories[0], content, user_id, project_id)
-    if (created or revived) and memories:
+    # Reference-workspace rows are vector-only everywhere else (no graph
+    # episode, no extraction LLM), so a raw write into one is not graph-enriched.
+    if (created or revived) and memories and _workspace in (None, "memory"):
         mem = memories[0]
         try:
             await ctx["redis"].enqueue_job(
@@ -1228,6 +1244,9 @@ async def process_graph_enrichment(
         # enrich_graph removes the episode itself when the row was deleted mid-write and says so here.
         race_outcome = {}
         enrich_kwargs["outcome"] = race_outcome
+    # enrich_graph reports the episode it wrote through this out-parameter so
+    # stale-job expiry can pin it directly (no before/after diff of the row ref).
+    graph_written: dict = {}
     enriched = await asyncio.to_thread(
         service.enrich_graph,
         content=content,
@@ -1239,6 +1258,7 @@ async def process_graph_enrichment(
         graph_ontology=graph_ontology,
         occurred_at=occurred_at,
         workspace=current_workspace,
+        result_out=graph_written,
         **enrich_kwargs,
     )
     if enriched and race_outcome and race_outcome.get("cleaned_up"):
@@ -1278,7 +1298,12 @@ async def process_graph_enrichment(
             # episode ref changed across our enrich_graph call): the cascade then
             # resolves by uuid first, so a newer re-ingested episode of the same
             # memory is never the one expired. Otherwise exact-content match.
-            ours = episode_after if episode_after and episode_after != episode_before else None
+            written_uuid = graph_written.get("episode_uuid")
+            ours = (
+                written_uuid if isinstance(written_uuid, str) and written_uuid
+                else episode_after if episode_after and episode_after != episode_before
+                else None
+            )
             resolved = False
             for attempt, pause in enumerate((0, 1.0, 3.0), start=1):
                 if pause:
@@ -1333,6 +1358,19 @@ async def expire_old_memories_cron(ctx: dict) -> dict:
     result = await asyncio.to_thread(service.expire_old_memories)
     if result.get("deleted_count"):
         logger.info(f"Expiry cron: purged {result['deleted_count']} memories")
+    return result
+
+
+async def repair_stale_vectors_cron(ctx: dict) -> dict:
+    """Cron job: re-embed rows whose vector write did not finish after an edit (``vector_pending``).
+
+    An edit commits text + revision in one compare-and-set and then writes the vector; a crash or a
+    stalled writer leaves the marker, and this converges the vector to the stored text.
+    """
+    service: MemoryService = ctx["service"]
+    result = await asyncio.to_thread(service.repair_stale_vectors)
+    if result.get("scanned") or result.get("meta_repaired"):
+        logger.info(f"Edit repair cron: {result}")
     return result
 
 
@@ -1737,6 +1775,61 @@ async def connector_sync_cron(ctx: dict) -> dict:
     return {"enqueued": enqueued}
 
 
+def _artifact_reference_counter(service):
+    """``(owner_dir, file_id) -> number of memory rows referencing the artifact``.
+
+    A row references an artifact through its ``source_ref``: ``parent_id`` /
+    ``external_id`` equal the artifact id (file uploads) or ``url`` is the
+    artifact's download URL (bundle concepts). The count is over ALL rows
+    (any owner, any visibility, tombstoned included): scoping it to an owner
+    would need a lossy directory-name-to-user mapping, and an owner directory
+    that maps to nobody must never read as "unreferenced". The cost is an
+    unindexed payload filter per candidate artifact, bounded by the sweep.
+    ``owner_dir`` is accepted for the sweep's callback signature only.
+    """
+    from qdrant_client.models import FieldCondition, Filter, MatchValue
+
+    client = service._get_memory().vector_store.client
+    collection = settings.qdrant_collection
+
+    def count(owner_dir: str, file_id: str) -> int:
+        should = []
+        for prefix in ("metadata.source_ref.", "metadata.metadata.source_ref."):
+            for key in ("parent_id", "external_id"):
+                should.append(FieldCondition(key=prefix + key, match=MatchValue(value=file_id)))
+            should.append(
+                FieldCondition(key=prefix + "url", match=MatchValue(value=f"/v1/ingest/artifacts/{file_id}"))
+            )
+        return client.count(
+            collection_name=collection,
+            count_filter=Filter(should=should),
+            exact=True,
+        ).count
+
+    return count
+
+
+async def artifact_gc_cron(ctx: dict) -> dict:
+    """Cron job: remove orphaned ingest artifacts (flag ``ARTIFACT_GC_ENABLED``, off by default).
+
+    Reports only unless ``ARTIFACT_GC_DRY_RUN=false``. See
+    ``ingest.storage.sweep_orphan_artifacts`` for the guards.
+    """
+    if not settings.artifact_gc_enabled:
+        return {"skipped": True, "reason": "ARTIFACT_GC_ENABLED=false"}
+    from ingest.storage import sweep_orphan_artifacts
+
+    service: MemoryService = ctx["service"]
+    counter = _artifact_reference_counter(service)
+    return await asyncio.to_thread(
+        sweep_orphan_artifacts,
+        settings,
+        counter,
+        grace_days=settings.artifact_gc_grace_days,
+        dry_run=settings.artifact_gc_dry_run,
+    )
+
+
 def _connector_sync_cron_hours() -> list[int]:
     """Translate the connector sync interval (hours) into a set of hours-of-day."""
     interval = max(1, min(24, settings.connector_sync_cron_hours))
@@ -2018,6 +2111,14 @@ class GraphWorkerSettings:
     ]
     cron_jobs = _dedup_cron_jobs() + [
         cron(
+            repair_stale_vectors_cron,
+            minute=20,          # hourly; a no-op scroll when no row is pending
+            timeout=900,
+            unique=True,
+            max_tries=1,
+            run_at_startup=False,
+        ),
+        cron(
             dream_sweep_cron,
             # Imported lazily so importing worker.py doesn't load the
             # dreaming settings tree before the worker is actually
@@ -2075,6 +2176,15 @@ class IngestWorkerSettings:
             hour=set(_connector_sync_cron_hours()),
             minute=50,
             timeout=600,
+            unique=True,
+            max_tries=1,
+            run_at_startup=False,
+        ),
+        cron(
+            artifact_gc_cron,
+            hour={4},
+            minute=20,
+            timeout=1800,
             unique=True,
             max_tries=1,
             run_at_startup=False,

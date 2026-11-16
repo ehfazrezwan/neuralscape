@@ -36,9 +36,13 @@ async def patch_playbook_path_by_memory_ids(
     if driver is None:
         return 0
     ts = (synthesized_at or datetime.now(timezone.utc)).isoformat()
-    cypher = """
-    MATCH (n)
-    WHERE n.memory_id IN $mids
+    # Label-scoped (one MATCH per node kind Graphiti stores) so each can use its
+    # label index; a label-less MATCH (n) scans the whole database.
+    kinds = ("Entity", "Episodic", "Community")
+    cypher = "CALL {\n" + "\n        UNION\n".join(
+        f"        MATCH (n:{k}) WHERE n.memory_id IN $mids RETURN n" for k in kinds
+    ) + """
+    }
     SET n.strategy_playbook_path = $playbook_path,
         n.strategy_synthesized_at = $synthesized_at
     RETURN count(n) AS patched

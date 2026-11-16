@@ -110,8 +110,8 @@ def test_the_graph_job_calls_enrich_graph_exactly_as_before_with_the_cleanup_fla
     asyncio.run(worker.process_graph_enrichment({"service": Service()}, "m1", "c", "u", None, "private"))
     assert sorted(seen[0]) == sorted([
         "content", "user_id", "project_id", "visibility", "memory_id", "source_ref", "graph_ontology",
-        "occurred_at", "workspace",
-    ])
+        "occurred_at", "workspace", "result_out",
+    ])  # flag off: exactly dev's kwargs (result_out only); no "outcome"
 
 
 def test_the_usage_hooks_are_no_ops_without_a_recorder():

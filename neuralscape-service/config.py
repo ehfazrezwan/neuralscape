@@ -86,6 +86,9 @@ def process_env_or(name: str, configured: str) -> str:
 # separately via ``Settings.graphiti_embedding_dim``.
 VECTOR_EMBEDDING_DIMS = 768
 
+# Default per-request timeout (seconds) for Qdrant calls; the one place the value lives.
+DEFAULT_QDRANT_TIMEOUT_S = 30
+
 # (ambient EMBEDDING_DIM, GRAPHITI_EMBEDDING_DIM) pairs already warned about.
 _AMBIENT_DIM_WARNED: set = set()
 
@@ -184,6 +187,9 @@ class Settings(BaseSettings):
     qdrant_on_disk: bool = True
     qdrant_path: str = "~/.neuralscape/qdrant"  # only used when qdrant_url is not set
     qdrant_collection: str = "neuralscape_memories"
+    # Per-request timeout (seconds) for every call the service makes to Qdrant. qdrant-client's
+    # own default is 5 s, which a loaded host can exceed on pool scrolls and large retrieves.
+    qdrant_timeout: int = Field(default=DEFAULT_QDRANT_TIMEOUT_S, ge=1)
 
     # Redis / ARQ
     redis_url: str = "redis://localhost:6379"
@@ -269,6 +275,11 @@ class Settings(BaseSettings):
     graph_supersession_enabled: bool = False
     graph_supersession_min_similarity: float = 0.85
     graph_supersession_margin: float = 0.05
+    # Floor on cos(row, contradicted edge fact) when a single-fact row still has
+    # live edges: the dead edge must clearly BE the row's claim, not merely beat
+    # incidental edges. Same value as the multi-row floor; the e2e integration
+    # test prints the measured real-embedding cosines so it can be re-tuned.
+    graph_supersession_partial_min_similarity: float = 0.85
 
     # ── Graph-leg latency budget (flag, default OFF) ──────────────────
     # search() overlaps the Graphiti leg with the vector pools and joins it
@@ -523,6 +534,14 @@ class Settings(BaseSettings):
     # (Object storage — GCS/S3 — is a later swap behind this same interface.)
     ingest_storage_enabled: bool = True
     ingest_storage_dir: str = "~/.neuralscape/ingest"  # volume mount in prod
+    # Orphan-artifact sweep (ingest worker cron). Off by default: it deletes
+    # files. When on, it only ever removes an artifact that NO memory row
+    # references (by its owner) and that is older than the grace period; with
+    # ``artifact_gc_dry_run`` (default True) it only reports what it would
+    # remove. Env: ARTIFACT_GC_ENABLED / ARTIFACT_GC_DRY_RUN / ARTIFACT_GC_GRACE_DAYS.
+    artifact_gc_enabled: bool = False
+    artifact_gc_dry_run: bool = True
+    artifact_gc_grace_days: int = Field(default=7, ge=1)
 
     # ── Visual setup exemplars (VISUAL_EXEMPLARS_SPEC) ───────────────
     # The trading adapter can extract chart images from a book, store the bytes,
@@ -1459,6 +1478,7 @@ class Settings(BaseSettings):
         qdrant_config: dict = {
             "collection_name": self.qdrant_collection,
             "embedding_model_dims": VECTOR_EMBEDDING_DIMS,
+            "timeout": self.qdrant_timeout,
         }
         if self.qdrant_url:
             qdrant_config["url"] = self.qdrant_url
