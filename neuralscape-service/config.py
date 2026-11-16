@@ -183,6 +183,9 @@ class Settings(BaseSettings):
     qdrant_on_disk: bool = True
     qdrant_path: str = "~/.neuralscape/qdrant"  # only used when qdrant_url is not set
     qdrant_collection: str = "neuralscape_memories"
+    # Per-request timeout (seconds) for every call the service makes to Qdrant. qdrant-client's
+    # own default is 5 s, which a loaded host can exceed on pool scrolls and large retrieves.
+    qdrant_timeout: int = 30
 
     # Redis / ARQ
     redis_url: str = "redis://localhost:6379"
@@ -1337,6 +1340,7 @@ class Settings(BaseSettings):
         qdrant_config: dict = {
             "collection_name": self.qdrant_collection,
             "embedding_model_dims": VECTOR_EMBEDDING_DIMS,
+            "timeout": self.qdrant_timeout,
         }
         if self.qdrant_url:
             qdrant_config["url"] = self.qdrant_url
