@@ -136,3 +136,42 @@ def test_repeated_enrichment_of_one_memory_leaves_one_episode(svc, unique_ns):
                     g=group, t=tok)[0]["c"]
     assert count == 1, f"repeat enrichment minted {count} episodes"
     assert again["episode_uuid"] == first["episode_uuid"]
+
+
+def test_communities_of_the_episodes_entities_are_stamped_once_each(svc, unique_ns):
+    """Real Neo4j semantics of the selector: a Community that has the episode's entity
+    as HAS_MEMBER is stamped (memory_id + one memory_ids entry); a community of
+    another group or of an unrelated entity is not."""
+    from datetime import datetime, timezone
+
+    from extensions.dreaming.graph_patcher import attach_memory_id
+
+    g, other_g = f"{unique_ns.group_prefix}-c", f"{unique_ns.group_prefix}-x"
+    unique_ns.on_cleanup(lambda: _cypher(svc, "MATCH (n) WHERE n.group_id IN $g DETACH DELETE n", g=[g, other_g]))
+    _cypher(
+        svc,
+        "CREATE (ep:Episodic {uuid: 'ep-u', group_id: $g, name: 'n'}) "
+        "CREATE (e1:Entity {uuid: 'e1', group_id: $g}), (e2:Entity {uuid: 'e2', group_id: $g}), "
+        "       (e3:Entity {uuid: 'e3', group_id: $g}) "
+        "CREATE (ep)-[:MENTIONS]->(e1), (ep)-[:MENTIONS]->(e2) "
+        "CREATE (c1:Community {uuid: 'c1', group_id: $g})-[:HAS_MEMBER]->(e1), (c1)-[:HAS_MEMBER]->(e2) "
+        "CREATE (c2:Community {uuid: 'c2', group_id: $g})-[:HAS_MEMBER]->(e3) "
+        "CREATE (cx:Community {uuid: 'cx', group_id: $o})-[:HAS_MEMBER]->(e1)",
+        g=g, o=other_g,
+    )
+
+    async def go():
+        return await attach_memory_id(
+            svc._graphiti.driver, group_id=g, memory_id="mem-1", visibility="private",
+            owner_user_id="u", write_started_at=datetime.now(timezone.utc), episode_uuid="ep-u",
+        )
+
+    patched = svc._run_on_bridge(go(), timeout=60.0)
+    rows = {r["u"]: r for r in _cypher(
+        svc, "MATCH (n) WHERE n.group_id IN $g RETURN n.uuid AS u, n.memory_id AS m, n.memory_ids AS ms",
+        g=[g, other_g])}
+    assert patched == 4  # ep, e1, e2, c1 -- c1 is reached twice but stamped once
+    for u in ("ep-u", "e1", "e2", "c1"):
+        assert rows[u]["m"] == "mem-1" and rows[u]["ms"] == ["mem-1"], u
+    for u in ("e3", "c2", "cx"):
+        assert rows[u]["m"] is None and rows[u]["ms"] is None, u

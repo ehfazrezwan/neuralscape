@@ -384,3 +384,18 @@ def test_locks_are_taken_in_a_stable_order_and_communities_are_stamped():
                               write_started_at=NOW, episode_uuid="ep-1"))
     src = d.calls[1][0]
     assert "WITH s, n ORDER BY n.uuid" in src and "HAS_MEMBER" in src
+
+
+def test_community_stamping_is_pinned_in_the_collected_node_set():
+    """Removing the community clause or its ``collect`` must fail: the node set the
+    SET runs over is exactly episode + mentioned entities + member-of communities,
+    each collected once (DISTINCT), for both attach functions."""
+    d = _Driver()
+    _run(gp.attach_memory_id(d, episode_uuid="ep-1", **KW))
+    _run(gp.attach_source_ref(d, group_id="g", memory_id="m", source_ref={"connector_id": "c"},
+                              write_started_at=NOW, episode_uuid="ep-1"))
+    for cypher, _ in d.calls:
+        assert "collect(DISTINCT ep) + collect(DISTINCT e) + collect(DISTINCT c) AS nodes" in cypher
+        assert cypher.count("UNWIND nodes AS n") == 1  # one pass, each node stamped once
+        assert cypher.index("HAS_MEMBER") < cypher.index("AS nodes") < cypher.index("SET n.")
+        assert "c:Community {group_id: $group_id}" in cypher  # communities of this group only
