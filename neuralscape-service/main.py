@@ -546,7 +546,10 @@ async def list_graph_nodes_legacy(
         raise HTTPException(status_code=503, detail="Graphiti not initialized")
 
     from graphiti_core.nodes import EntityNode
-    from memory.groups import _live_node_uuids
+    from memory.groups import _live_node_uuids, _scoped_groups
+    # No groups means no results, and no graph call.
+    if not _scoped_groups([group_id]):
+        return {"status": "ok", "nodes": []}
     try:
         nodes = await asyncio.to_thread(
             _run_on_bridge,
@@ -607,7 +610,10 @@ async def list_graph_edges_legacy(
 
     from graphiti_core.edges import EntityEdge
     from graphiti_core.errors import GroupsEdgesNotFoundError
-    from memory.groups import _edge_is_invalidated
+    from memory.groups import _edge_is_invalidated, _scoped_groups
+    # No groups means no results, and no graph call.
+    if not _scoped_groups([group_id]):
+        return {"status": "ok", "edges": []}
     try:
         edges = await asyncio.to_thread(
             _run_on_bridge,
@@ -652,6 +658,10 @@ async def list_graph_episodes_legacy(
         raise HTTPException(status_code=503, detail="Graphiti not initialized")
 
     group_id = _resolve_user_id(request, user_id)
+    from memory.groups import _scoped_groups
+    # No groups means no results, and no graph call.
+    if not _scoped_groups([group_id]):
+        return {"status": "ok", "episodes": []}
     now = datetime.now(timezone.utc)
     try:
         episodes = await asyncio.to_thread(
@@ -696,6 +706,10 @@ async def list_graph_communities_legacy(
     from graphiti_core.nodes import CommunityNode
 
     group_id = _resolve_user_id(request, user_id)
+    from memory.groups import _scoped_groups
+    # No groups means no results, and no graph call.
+    if not _scoped_groups([group_id]):
+        return {"status": "ok", "communities": []}
     try:
         communities = await asyncio.to_thread(
             _run_on_bridge,
@@ -743,6 +757,11 @@ async def advanced_graph_search_legacy(req: LegacyGraphSearchRequest, request: R
         config = EDGE_HYBRID_SEARCH_RRF
 
     config.limit = req.limit
+
+    from memory.groups import _scoped_groups
+    # No groups means no results, and no graph call.
+    if not _scoped_groups([group_id]):
+        return {"status": "ok", "edges": [], "nodes": [], "episodes": [], "communities": []}
 
     try:
         results = await asyncio.to_thread(
