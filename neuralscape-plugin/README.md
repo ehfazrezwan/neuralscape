@@ -198,7 +198,7 @@ Everything the plugin does against the service goes through the MCP tools above,
 
 ### From the skills (REST, via the plugin's helper)
 
-Only where no MCP equivalent exists (or as the documented fallback), Claude Code only. `ns-status` also probes `GET /health`. The skills do not hand-write curl: they call the bundled helper `scripts/sync.js` (`print-config`, `flush`, `request`, `upload`), which resolves the URL like the hooks (explicit `URL` option, then the URL baked into `.mcp.json`, then `http://localhost:8199`), sends the `API_KEY` as a Bearer token, and redacts `<private>` text fail-closed for conversation turns.
+Only where no MCP equivalent exists (or as the documented fallback), Claude Code only. `ns-status` also probes `GET /health`. The `sync`, `ingest` and `search` skills do not hand-write curl: they call the bundled helper `scripts/sync.js` (`print-config`, `flush`, `search`, `request`, `upload`), which resolves the URL like the hooks (explicit `URL` option, then the URL baked into `.mcp.json`, then `http://localhost:8199`) and redacts `<private>` text fail-closed in conversation turns, search queries and request bodies. A skill's Bash tool has no `CLAUDE_PLUGIN_ROOT` or `CLAUDE_PLUGIN_OPTION_*` variables, so the helper finds the plugin root from its own location and the skills pass the non-sensitive options (`URL`, `USER_ID`) explicitly with `${user_config.KEY}` substitution. `API_KEY` is a sensitive option that Claude Code does not substitute into skills, so the helper sends a Bearer token only when `NEURALSCAPE_API_KEY` is set in the shell environment. `ns-status` still probes `/health` with curl, which the helper's `/v1/` allowance does not cover.
 
 | Call | Skill |
 |---|---|

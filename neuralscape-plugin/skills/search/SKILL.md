@@ -27,11 +27,14 @@ For an explicitly **broad scan** (survey-style, `limit` > 10), `index_only: true
 5. **REST fallback (Claude Code only, and only when MCP is truly unavailable):** if — and only if — the `recall_memories` MCP tool is not present in the session AND the plugin runtime is available (`${CLAUDE_PLUGIN_ROOT}` set, `node` on PATH), call the plugin's helper, which resolves the service URL exactly like the hooks (explicit `URL` option → the URL baked into the plugin's `.mcp.json` → `http://localhost:8199`) and sends the configured `API_KEY` as a Bearer token — no URL variable is needed and you must not hand-write curl:
 
    ```bash
-   echo '{"query": "<query>", "user_id": "<resolved>", "project_id": "<id or omit>", "limit": 10}' \
-     | node "${CLAUDE_PLUGIN_ROOT}/scripts/sync.js" request POST /v1/search
+   node "${CLAUDE_PLUGIN_ROOT}/scripts/sync.js" search --opt 'URL=${user_config.URL}' --opt 'USER_ID=${user_config.USER_ID}' --user-id '<resolved>' --project-id '<id>' --limit 10 <<'NS_QUERY_EOF'
+   <the query, exactly as the user wrote it>
+   NS_QUERY_EOF
    ```
 
-   It prints the JSON answer (8s timeout; exit `1` = the service refused or is unreachable). The REST API mirrors the MCP surface, so results render identically. Never take this path while the MCP tool exists; never require env; never error in Cowork — if neither path is available, say the memory store isn't reachable and stop.
+   The query is the heredoc body: plain text, no JSON or shell escaping needed, and a quoted delimiter means quotes, backticks and `$(...)` in it are never interpreted by the shell (pick another delimiter if the query itself contains a line equal to `NS_QUERY_EOF`; omit `--project-id` for global scope). How the helper gets its configuration: A skill's Bash tool has no `CLAUDE_PLUGIN_ROOT` and no `CLAUDE_PLUGIN_OPTION_*` variables (the plugin runtime exports those to hooks only). Claude Code substitutes `${CLAUDE_PLUGIN_ROOT}` and the non-sensitive `${user_config.KEY}` values into this skill text when it loads it, so the commands below pass them explicitly: `--opt 'URL=${user_config.URL}' --opt 'USER_ID=${user_config.USER_ID}'`. The helper finds the baked `.mcp.json` URL from its own location. The `API_KEY` option is sensitive, so Claude Code does not substitute it into skills: the helper sends a Bearer token only when `NEURALSCAPE_API_KEY` (or `CLAUDE_PLUGIN_OPTION_API_KEY`) is set in the shell environment; against a token-protected server without it the call is refused (HTTP 401) and you should say so and use the MCP path instead. Run `print-config` to see what the helper resolved (`api_key_set` tells you whether a key is present; the key itself is never printed).
+
+   It prints the JSON answer (8s timeout; exit `1` = the service refused or is unreachable; the query's `<private>` spans are redacted before sending). The REST API mirrors the MCP surface, so results render identically. Never take this path while the MCP tool exists; never require env; never error in Cowork — if neither path is available, say the memory store isn't reachable and stop.
 6. **Render results** as a compact markdown list, ordered by score:
 
    ```

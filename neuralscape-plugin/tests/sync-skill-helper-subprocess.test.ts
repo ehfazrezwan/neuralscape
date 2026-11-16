@@ -236,3 +236,142 @@ describe("the skills use the helper, not hand-written curl", () => {
     expect(text).not.toMatch(/curl\s+-/);
   });
 });
+
+// ── The way a skill really runs the helper: its Bash has NO plugin variables ──────────────────────────
+
+import { copyFileSync, existsSync } from "node:fs";
+
+/** A real plugin layout (<root>/scripts/sync.js + a baked <root>/.mcp.json), run with a stripped environment. */
+function skillRun(args: string[], stdin: string, opts: { mcpUrl?: string; env?: Record<string, string> } = {}) {
+  const root = mkdtempSync(join(tmpdir(), "ns-skill-root-"));
+  mkdirSync(join(root, "scripts"));
+  copyFileSync(join(PLUGIN_ROOT, "scripts", "sync.js"), join(root, "scripts", "sync.js"));
+  writeFileSync(join(root, "package.json"), '{"type":"module"}');
+  if (opts.mcpUrl) writeFileSync(join(root, ".mcp.json"), JSON.stringify({ mcpServers: { neuralscape: { type: "http", url: opts.mcpUrl } } }));
+  return new Promise<{ code: number | null; stdout: string; stderr: string }>((resolve, reject) => {
+    const child = spawn("node", [join(root, "scripts", "sync.js"), ...args], {
+      // exactly what a skill's Bash tool has: no CLAUDE_PLUGIN_ROOT, no CLAUDE_PLUGIN_OPTION_*
+      env: { PATH: process.env.PATH ?? "", HOME: root, ...opts.env },
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (d) => (stdout += d));
+    child.stderr.on("data", (d) => (stderr += d));
+    child.on("error", reject);
+    child.on("close", (code) => resolve({ code, stdout, stderr }));
+    child.stdin.write(stdin);
+    child.stdin.end();
+  });
+}
+
+describe("run the way a skill runs it: stripped environment, real plugin layout", () => {
+  it("finds the baked URL from its own location", async () => {
+    const r = await skillRun(["print-config"], "", { mcpUrl: "https://memory.example.test/mcp/", env: { USER: "alice" } });
+    expect(JSON.parse(r.stdout)).toMatchObject({ url: "https://memory.example.test", url_source: "baked" });
+  });
+
+  it("gets the configured URL and user from --opt (what ${user_config.*} substitution produces) and the token from NEURALSCAPE_API_KEY", async () => {
+    const r = await skillRun(
+      ["flush", "--opt", `URL=${url}`, "--opt", "USER_ID=configured-user"],
+      JSON.stringify({ turns: [{ user_message: "hello there", assistant_response: LONG("Greetings") }] }),
+      { mcpUrl: "https://baked.example.test/mcp/", env: { USER: "os-user", NEURALSCAPE_API_KEY: KEY, CLAUDE_PLUGIN_DATA: mkdtempSync(join(tmpdir(), "ns-d-")) } },
+    );
+    expect(r.code).toBe(0);
+    const call = seen.find((s) => s.path === FLUSH);
+    expect(call).toBeDefined();
+    expect(call?.headers.authorization).toBe(`Bearer ${KEY}`);
+    expect(JSON.parse(call?.raw ?? "{}")).toMatchObject({ user_id: "configured-user" });
+  });
+
+  it("an unresolved ${user_config.*} template or an empty value is ignored, never used as the URL or user", async () => {
+    const r = await skillRun(["print-config", "--opt", "URL=${user_config.URL}", "--opt", "USER_ID="], "", {
+      mcpUrl: "https://memory.example.test/mcp/",
+      env: { USER: "os-user" },
+    });
+    expect(JSON.parse(r.stdout)).toMatchObject({ url: "https://memory.example.test", url_source: "baked", user_id: "os-user", user_id_source: "os" });
+  });
+
+  it("the sensitive API_KEY cannot be passed as an --opt (it would sit in process arguments)", async () => {
+    const r = await skillRun(["print-config", "--opt", `API_KEY=${KEY}`], "", { env: { USER: "u" } });
+    expect(JSON.parse(r.stdout).api_key_set).toBe(false);
+    expect(r.stdout + r.stderr).not.toContain(KEY);
+  });
+
+  it("an environment option still wins over --opt", async () => {
+    const r = await skillRun(["print-config", "--opt", "USER_ID=from-opt"], "", { env: { CLAUDE_PLUGIN_OPTION_USER_ID: "from-env" } });
+    expect(JSON.parse(r.stdout)).toMatchObject({ user_id: "from-env" });
+  });
+});
+
+describe("search takes the query as plain stdin, safe from the shell and redacted", () => {
+  const NASTY = `it's "quoted" \`touch PWNED-BACKTICK\` $(touch PWNED-SUBST) $HOME 'x' $(echo INJECTED)`;
+
+  it("a query with quotes, backticks and $() reaches /v1/search verbatim and nothing is executed", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "ns-q-"));
+    const script = `node "${join(PLUGIN_ROOT, "scripts", "sync.js")}" search --opt 'URL=${url}' --opt 'USER_ID=u' --user-id 'u' --limit 7 <<'NS_QUERY_EOF'\n${NASTY}\nNS_QUERY_EOF\n`;
+    const out = await new Promise<{ code: number | null }>((resolve, reject) => {
+      const child = spawn("bash", ["-c", script], { cwd: dir, env: { PATH: process.env.PATH ?? "", HOME: dir, CLAUDE_PLUGIN_DATA: dir } });
+      child.on("error", reject);
+      child.on("close", (code) => resolve({ code }));
+    });
+    expect(out.code).toBe(0);
+    const call = seen.find((s) => s.path === "/v1/search");
+    expect(JSON.parse(call?.raw ?? "{}")).toEqual({ query: NASTY, user_id: "u", limit: 7 });
+    expect(existsSync(join(dir, "PWNED-BACKTICK")) || existsSync(join(dir, "PWNED-SUBST"))).toBe(false);
+  });
+
+  it("redacts <private> text in the query and refuses an empty one", async () => {
+    const env = { CLAUDE_PLUGIN_OPTION_URL: url, CLAUDE_PLUGIN_OPTION_USER_ID: "u" };
+    const ok = await run(["search"], "find notes <private>SEARCH-SECRET and more", env);
+    expect(ok.code).toBe(0);
+    expect(seen.map((s) => s.raw).join("")).not.toContain("SEARCH-SECRET");
+    expect((await run(["search"], "  \n", env)).code).toBe(2);
+  });
+});
+
+describe("request and flush hardening", () => {
+  const env = () => ({ CLAUDE_PLUGIN_OPTION_URL: url, CLAUDE_PLUGIN_OPTION_USER_ID: "u" });
+
+  it("request redacts private spans in the body", async () => {
+    const r = await run(["request", "POST", "/v1/search"], JSON.stringify({ query: "q <private>REQ-SECRET</private>", nested: { a: ["<private>REQ-SECRET2" ] } }), env());
+    expect(r.code).toBe(0);
+    expect(seen[0].raw).not.toContain("REQ-SECRET");
+  });
+
+  it.each(["/v1/../../admin", "/v1/%2e%2e/%2e%2e/x", "/v1/..%2f..%2fx", "/other", "/v1"])("request refuses %s", async (path) => {
+    const r = await run(["request", "GET", path], "", env());
+    expect(r.code).toBe(2);
+    expect(seen).toHaveLength(0);
+  });
+
+  it("a multi-line unclosed <private> span in a turn is redacted through its later lines", async () => {
+    const turn = {
+      user_message: "first line <private>OPEN-SECRET\nsecond line LATER-SECRET.\nthird line LATEST-SECRET",
+      assistant_response: LONG("Answer"),
+    };
+    const r = await run(["flush"], JSON.stringify({ turns: [turn] }), { ...env(), CLAUDE_PLUGIN_DATA: mkdtempSync(join(tmpdir(), "ns-d-")) });
+    expect(r.code).toBe(0);
+    const sent = seen.find((s) => s.path === FLUSH)?.raw ?? "";
+    for (const s of ["OPEN-SECRET", "LATER-SECRET", "LATEST-SECRET"]) expect(sent).not.toContain(s);
+  });
+
+  it("model-supplied ids, timestamps and dates are validated, not forwarded", async () => {
+    const turn = {
+      user_message: "hello there",
+      assistant_response: LONG("Greetings"),
+      session_id: "bad id <private>x</private> with spaces",
+      timestamp: "not a time",
+    };
+    const r = await run(["flush"], JSON.stringify({ turns: [turn], project_id: "evil\nproject", compile: true, date: "yesterday; drop" }), {
+      ...env(),
+      CLAUDE_PLUGIN_DATA: mkdtempSync(join(tmpdir(), "ns-d-")),
+    });
+    expect(r.code).toBe(0);
+    const body = JSON.parse(seen.find((s) => s.path === FLUSH)?.raw ?? "{}");
+    expect(body.session_id).toBe("manual-sync");
+    expect(body.project_id).not.toContain("\n");
+    expect(Number.isNaN(Date.parse(body.timestamp))).toBe(false);
+    expect(JSON.parse(seen.find((s) => s.path === COMPILE)?.raw ?? "{}").date).toMatch(/^\d{4}-\d{2}-\d{2}$/);
+  });
+});

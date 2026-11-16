@@ -12,13 +12,22 @@
  *        "compile"?: true, "date"?: "YYYY-MM-DD", "project_id"?: "..."}
  *       Same noise filter, fail-closed `<private>` redaction and Bearer auth as
  *       the Stop hook, then (optionally) the compile trigger.
+ *   node sync.js search [--user-id U] [--project-id P] [--limit N]   (the query as plain text on stdin)
+ *       POST /v1/search. The query never goes through shell quoting or JSON escaping by the caller.
  *   node sync.js request <GET|POST> </v1/...>   (JSON body on stdin for POST)
  *       An authenticated call to the configured service; prints the JSON answer.
+ *
+ * Every mode also accepts `--opt KEY=VALUE` (see skill-env.ts): a skill passes the plugin options it can read
+ * (`${user_config.URL}`, `${user_config.USER_ID}`), because a skill's Bash has no CLAUDE_PLUGIN_OPTION_* variables.
+ * The API key is a sensitive option that skills cannot read; it is taken from the environment only
+ * (CLAUDE_PLUGIN_OPTION_API_KEY or NEURALSCAPE_API_KEY).
  *   node sync.js upload [--field k=v]... <file>...
  *       Multipart POST /v1/ingest/files with the configured URL and Bearer.
  *
  * Exit codes: 0 ok, 1 the service refused/was unreachable or a flush failed, 2 bad usage/input.
  */
+
+import "../skill-env.js"; // must stay first: prepares the environment utils.ts reads at import time
 
 import { readFile } from "node:fs/promises";
 import { basename } from "node:path";
@@ -37,6 +46,7 @@ import {
   neuralscapePost,
   readBakedUrl,
   readConfig,
+  redactPrivate,
 } from "../utils.js";
 
 class UsageError extends Error {}
@@ -78,22 +88,48 @@ export function printConfig(): void {
   });
 }
 
+/** Redact every string inside a JSON value, fail-closed (a model-written body may carry `<private>` spans). */
+function redactDeep(value: unknown): unknown {
+  if (typeof value === "string") return redactPrivate(value, { failClosed: true });
+  if (Array.isArray(value)) return value.map(redactDeep);
+  if (value && typeof value === "object") {
+    return Object.fromEntries(Object.entries(value as Record<string, unknown>).map(([k, v]) => [k, redactDeep(v)]));
+  }
+  return value;
+}
+
+const ID_FORMAT = /^[\w.:@/-]{1,200}$/;
+const DATE_FORMAT = /^\d{4}-\d{2}-\d{2}$/;
+
+/** An id the model supplied, kept only when it looks like an id. */
+function idOr(value: unknown, fallback: string | undefined): string | undefined {
+  return typeof value === "string" && ID_FORMAT.test(value) ? value : fallback;
+}
+
+function isoOrNow(value: unknown): string {
+  if (typeof value === "string") {
+    const t = Date.parse(value);
+    if (Number.isFinite(t)) return new Date(t).toISOString();
+  }
+  return new Date().toISOString();
+}
+
 async function flush(): Promise<number> {
   const input = await readJsonStdin();
   const rawTurns = input.turns;
   if (!Array.isArray(rawTurns)) throw new UsageError('"turns" must be an array');
   const userId = getUserId();
   if (!userId) throw new UsageError("no user id configured (set the plugin USER_ID option)");
-  const projectId = typeof input.project_id === "string" && input.project_id ? input.project_id : getProjectId();
+  const projectId = idOr(input.project_id, getProjectId());
 
   const turns: ConversationTurn[] = rawTurns.map((t) => {
     const turn = (t ?? {}) as Record<string, unknown>;
     return {
       userMessage: typeof turn.user_message === "string" ? turn.user_message : "",
       assistantResponse: typeof turn.assistant_response === "string" ? turn.assistant_response : "",
-      sessionId: typeof turn.session_id === "string" && turn.session_id ? turn.session_id : "manual-sync",
+      sessionId: idOr(turn.session_id, "manual-sync") as string,
       channel: "claude-code-manual-sync",
-      timestamp: typeof turn.timestamp === "string" && turn.timestamp ? turn.timestamp : new Date().toISOString(),
+      timestamp: isoOrNow(turn.timestamp),
       projectId,
       userId,
     };
@@ -103,18 +139,61 @@ async function flush(): Promise<number> {
   const failed = result.firstFailedIndex !== null;
   let compiled: boolean | null = null;
   if (input.compile === true && !failed) {
-    const date = typeof input.date === "string" && input.date ? input.date : new Date().toISOString().slice(0, 10);
+    const date = typeof input.date === "string" && DATE_FORMAT.test(input.date) ? input.date : new Date().toISOString().slice(0, 10);
     compiled = await triggerCompile({ date, userId, shouldCompile: true });
   }
   print({ attempted: result.attempted, flushed: result.flushed, failed, first_failed_index: result.firstFailedIndex, compiled });
   return failed || compiled === false ? 1 : 0;
 }
 
+/** The path the request will really hit on the configured host, after URL normalisation (dot segments, %2e). */
+function normalisedV1Path(path: string): string {
+  let parsed: URL;
+  try {
+    parsed = new URL(`${getServiceUrl()}${path}`);
+  } catch {
+    throw new UsageError("path is not a valid URL path");
+  }
+  const base = new URL(getServiceUrl()).pathname.replace(/\/$/, "");
+  const rel = parsed.pathname.slice(base.length);
+  if (!parsed.pathname.startsWith(`${base}/`) || !rel.startsWith("/v1/")) throw new UsageError("path must stay under /v1/");
+  let decoded = rel;
+  try {
+    decoded = decodeURIComponent(rel);
+  } catch {
+    throw new UsageError("path has invalid percent-encoding");
+  }
+  if (/(^|[\\/])\.\.([\\/]|$)/.test(decoded)) throw new UsageError("path must not contain '..' segments");
+  return `${rel}${parsed.search}`;
+}
+
 async function request(method: string, path: string): Promise<number> {
   if (method !== "GET" && method !== "POST") throw new UsageError("method must be GET or POST");
-  if (!path.startsWith("/v1/")) throw new UsageError("path must start with /v1/");
-  const answer = method === "GET" ? await neuralscapeGet(path) : await neuralscapePost(path, await readJsonStdin());
+  const target = normalisedV1Path(path);
+  const answer =
+    method === "GET" ? await neuralscapeGet(target) : await neuralscapePost(target, redactDeep(await readJsonStdin()) as Record<string, unknown>);
   print(answer);
+  return 0;
+}
+
+async function search(args: string[]): Promise<number> {
+  let userId = getUserId();
+  let projectId: string | undefined;
+  let limit = 10;
+  for (let i = 0; i < args.length; i++) {
+    const value = args[i + 1] ?? "";
+    if (args[i] === "--user-id") userId = idOr(value, userId) as string;
+    else if (args[i] === "--project-id") projectId = idOr(value, undefined);
+    else if (args[i] === "--limit") limit = Math.min(50, Math.max(1, Math.trunc(Number(value)) || 10));
+    else throw new UsageError(`unknown search option ${args[i]}`);
+    i++;
+  }
+  const query = redactPrivate((await readStdin()).replace(/\r?\n$/, ""), { failClosed: true }).trim();
+  if (!query) throw new UsageError("the query (stdin) is empty");
+  const body: Record<string, unknown> = { query, user_id: userId, limit };
+  if (projectId) body.project_id = projectId;
+  // Not a hook call: the path goes through the same guard as `request`, and the README lists it under the skills.
+  print(await neuralscapePost(normalisedV1Path("/v1/search"), body));
   return 0;
 }
 
@@ -164,12 +243,14 @@ async function main(): Promise<number> {
       return 0;
     case "flush":
       return flush();
+    case "search":
+      return search(rest);
     case "request":
       return request((rest[0] ?? "").toUpperCase(), rest[1] ?? "");
     case "upload":
       return upload(rest);
     default:
-      throw new UsageError("usage: sync.js print-config | flush | request <GET|POST> </v1/...> | upload [--field k=v]... <file>...");
+      throw new UsageError("usage: sync.js print-config | flush | search | request <GET|POST> </v1/...> | upload [--field k=v]... <file>...");
   }
 }
 
