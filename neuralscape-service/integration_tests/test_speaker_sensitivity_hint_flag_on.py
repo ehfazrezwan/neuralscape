@@ -9,9 +9,13 @@ the extraction LLM's reply is stubbed so the test is deterministic. It proves:
   speaker is stamped in metadata, and a paraphrased sensitive fact that the regex
   floor MISSES is stored forced-private through the model's hint
   (``sensitivity_source == "llm"``);
-* with the flag OFF the legacy prompt never asks for the tag and the speaker is
-  folded into the content: the documented regex-only default. (If a model emits
-  the tag anyway it is still honoured; the default simply never requests it.)
+* with the flag OFF the legacy prompt never asks for the tag, the model's reply
+  carries none, so nothing marks the paraphrase sensitive (the regex floor misses
+  it) and it stays a plain private-by-default row with no ``sensitivity``; the
+  speaker is folded into the content. That is the documented regex-only default.
+  (A tag the model emits anyway would still be honoured: the default prompt just
+  never asks for one. Every extracted row is stamped ``visibility=private``, so
+  ``sensitivity`` / ``sensitivity_source`` are the discriminators, not visibility.)
 """
 
 from __future__ import annotations
@@ -41,10 +45,15 @@ def make_svc(flags, stores, llm_key, unique_ns):
         flags(extraction_require_speaker=require_speaker)
         svc = MemoryService()
         svc._get_memory()
+        # Extraction here is about vectors and metadata only: drop the graph handles so no
+        # Graphiti episode (and no graph LLM call) is attempted after the facts are stored.
         svc._graphiti = None
         svc._bridge = None
         client = MagicMock()
-        fact = f"[personal_fact] Alice: {PARAPHRASE} (sensitivity: financial)"
+        # With the flag on the (stubbed) model follows the prompt's tag instruction; with it
+        # off the legacy prompt never asks, so the reply carries no tag.
+        tag = " (sensitivity: financial)" if require_speaker else ""
+        fact = f"[personal_fact] Alice: {PARAPHRASE}{tag}"
         client.models.generate_content.return_value = MagicMock(text=json.dumps({"facts": [fact]}))
         svc._genai_model = client
         return svc, client
@@ -74,7 +83,7 @@ def test_flag_on_asks_for_the_hint_stamps_the_speaker_and_forces_private(make_sv
     payload = _row(svc, uid, "eighty-five thousand")
     meta = payload["metadata"]
     assert meta["speaker"] == "Alice"
-    assert meta["visibility"] == "private"
+    # every extracted row is private, so the class and its source are what show the hint was used
     assert meta.get("sensitivity") == "financial" and meta.get("sensitivity_source") == "llm"
     assert "(sensitivity" not in payload["data"]  # the tag is parsed out of the stored text
 
@@ -88,5 +97,7 @@ def test_flag_off_legacy_prompt_never_requests_the_hint_and_folds_the_speaker(ma
     prompt = client.models.generate_content.call_args.kwargs["contents"]
     assert "(sensitivity:" not in prompt, "the legacy prompt must not ask for the sensitivity tag"
     payload = _row(svc, uid, "eighty-five thousand")
-    assert "speaker" not in payload["metadata"]  # folded into the content, no metadata
+    meta = payload["metadata"]
+    assert "sensitivity" not in meta and "sensitivity_source" not in meta, meta  # regex floor misses it; no hint
+    assert "speaker" not in meta  # folded into the content, no metadata
     assert payload["data"].startswith("Alice:")
