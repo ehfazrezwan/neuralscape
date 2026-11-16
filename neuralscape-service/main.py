@@ -11,6 +11,7 @@ import base64
 import hashlib
 import json
 import logging
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
@@ -25,13 +26,14 @@ from fastapi import (
     UploadFile,
 )
 from fastapi.responses import JSONResponse, StreamingResponse
+import structlog
 from pydantic import BaseModel, Field
 
 import adapters  # noqa: F401 — registers knowledge-adapter taxonomies at import (deterministic MEMORY_CATEGORIES)
 from config import settings
 from extensions import ExtensionRegistry
 from extensions.events import EventType, EVENT_PAYLOAD_MODELS
-from logging_config import configure_logging
+from logging_config import REQUEST_ID_HEADER, RequestIdMiddleware, configure_logging, request_id_of
 from memory_service import get_shared_service
 
 # Configure structured logging before anything else
@@ -230,16 +232,29 @@ app = FastAPI(
 from auth import BearerAuthMiddleware, is_admin_user, resolve_request_user_id
 
 app.add_middleware(BearerAuthMiddleware)
+# Added last = outermost: binds request_id for every request and puts it on
+# every response, including the 401/503s BearerAuthMiddleware produces.
+app.add_middleware(RequestIdMiddleware)
 
 
 # ── Global exception handler ─────────────────────────────────────
 @app.exception_handler(Exception)
 async def generic_exception_handler(request: Request, exc: Exception):
     """Catch unhandled exceptions and return generic error to clients."""
-    logger.exception("Unhandled error on %s %s", request.method, request.url.path)
+    # ServerErrorMiddleware runs outside RequestIdMiddleware, so the contextvar
+    # is already unbound here: rebind it from the scope for the log line.
+    request_id = request_id_of(request)
+    if request_id:
+        structlog.contextvars.bind_contextvars(request_id=request_id)
+    try:
+        logger.exception("Unhandled error on %s %s", request.method, request.url.path)
+    finally:
+        if request_id:
+            structlog.contextvars.unbind_contextvars("request_id")
     return JSONResponse(
         status_code=500,
         content={"error": "Internal server error"},
+        headers={REQUEST_ID_HEADER: request_id} if request_id else None,
     )
 
 
@@ -288,6 +303,41 @@ async def health_live():
     return {"status": "alive"}
 
 
+_VECTOR_STORE_PROBE_TIMEOUT_S = 2.0
+_VECTOR_STORE_PROBE_TTL_S = 3.0
+_vector_probe: dict = {"memory": None, "loop": None, "at": None, "error": None, "task": None}
+
+
+async def _probe_vector_store(memory) -> None:
+    """Raise if the vector store does not answer within the probe timeout.
+
+    Single-flight and briefly cached: concurrent /health calls (and calls
+    within the TTL of the last answer) share one ``get_collections`` round
+    trip, and a hung call keeps its one worker thread instead of piling up a
+    new thread per request.
+    """
+    st = _vector_probe
+    loop = asyncio.get_running_loop()
+    if st["memory"] is not memory or st["loop"] is not loop:
+        st.update(memory=memory, loop=loop, at=None, error=None, task=None)
+    task = st["task"]
+    if task is None:
+        if st["at"] is not None and time.monotonic() - st["at"] < _VECTOR_STORE_PROBE_TTL_S:
+            if st["error"] is not None:
+                raise st["error"]
+            return
+        task = asyncio.ensure_future(asyncio.to_thread(memory.vector_store.client.get_collections))
+        st["task"] = task
+
+        def _record(done: asyncio.Future) -> None:
+            error = asyncio.CancelledError() if done.cancelled() else done.exception()
+            if st["task"] is done:
+                st.update(task=None, at=time.monotonic(), error=error)
+
+        task.add_done_callback(_record)
+    await asyncio.wait_for(asyncio.shield(task), timeout=_VECTOR_STORE_PROBE_TIMEOUT_S)
+
+
 def _vector_store_capabilities() -> dict:
     """Non-failing /health field: what the vector store can do (BM25 slot)."""
     try:
@@ -328,12 +378,14 @@ async def health():
     if _revocation != "not_configured":
         checks["revocation"] = _revocation
 
-    # Check vector store (Qdrant via mem0) — lightweight: just verify mem0 is initialized
+    # Check vector store (Qdrant via mem0): a real, bounded round trip, off the event loop.
     try:
-        if _service._memory is not None:
-            checks["vector_store"] = "ok"
-        else:
+        memory = _service._memory
+        if memory is None:
             checks["vector_store"] = "not_initialized"
+        else:
+            await _probe_vector_store(memory)
+            checks["vector_store"] = "ok"
     except Exception:
         checks["vector_store"] = "unreachable"
 
@@ -3259,6 +3311,8 @@ async def v1_delete_episode(
             user_id=resolved_user_id,
             project_id=project_id,
         )
+        if result.get("not_found"):
+            raise HTTPException(status_code=404, detail=result["error"])
         if "error" in result:
             raise HTTPException(status_code=500, detail=result["error"])
         return {"status": "ok", **result}

@@ -9,7 +9,7 @@ import uuid
 
 from datetime import datetime, timezone
 from config import settings
-from schemas import MemoryVisibility
+from schemas import MemoryVisibility, normalize_visibility
 from memory.groups import _build_group_id
 from memory.junk import _deleted_msg
 from memory.ranking import _times_derived_from_metadata
@@ -34,6 +34,24 @@ def _dedup_meta(payload: dict) -> tuple[dict, bool]:
     return meta, False
 
 
+def _dedup_visibility(meta: dict) -> str | None:
+    """Visibility as the dedup partition sees it: an absent stamp is private.
+
+    Conversation-extracted rows used to carry no ``metadata.visibility`` and
+    are now stamped ``private``; every reader already treats an absent value as
+    de-facto private, so the two must share one partition or dedup would stop
+    merging a new row with its legacy twin. An unrecognised value stays its own
+    (raw) partition — stricter, never a cross-partition merge.
+    """
+    vis = meta.get("visibility")
+    if vis is None or vis == "":
+        return MemoryVisibility.PRIVATE.value
+    try:
+        return normalize_visibility(vis)
+    except (ValueError, TypeError):
+        return vis
+
+
 def _dedup_partition(payload: dict) -> tuple:
     """Partition identity a semantic near-duplicate must share to be merged.
 
@@ -55,7 +73,7 @@ def _dedup_partition(payload: dict) -> tuple:
         payload.get("user_id"),
         meta.get("scope"),
         meta.get("project_id") or None,
-        meta.get("visibility"),
+        _dedup_visibility(meta),
         workspace,
     )
 
@@ -141,6 +159,11 @@ class DeleteMixin:
             if not _is_valid_point_id(memory_id):
                 raise LookupError(f"Memory {memory_id} not found") from None
             raise
+        if mem is None:
+            # A well-formed id that names no stored point: not found, not a
+            # server fault (the route maps LookupError to 404; a genuine
+            # store failure raised above and still propagates).
+            raise LookupError(f"Memory {memory_id} not found")
 
         # Permission gate: enforce ownership/visibility rules when caller_user_id
         # is provided (backward-compatible: None skips the gate, existing tests).
@@ -301,6 +324,7 @@ class DeleteMixin:
                     cascade_rows.append({
                         "id": mid,
                         "mem": {"memory": mem_info.get("data", ""), "metadata": meta},
+                        "user_id": user_id,
                         "group_id": None,
                     })
                     deleted_count += 1
@@ -468,6 +492,7 @@ class DeleteMixin:
                 {
                     "id": mid,
                     "mem": {"memory": payload.get("data", ""), "metadata": metadata},
+                    "user_id": user_id,
                     "group_id": None,
                 }
                 for mid, payload, metadata in private_rows
@@ -587,7 +612,7 @@ class DeleteMixin:
         # there are no surviving siblings to repair — only dedupe the cascade
         # to once per distinct episode.
         rows = [
-            {"id": mem.get("id", ""), "mem": mem, "group_id": None}
+            {"id": mem.get("id", ""), "mem": mem, "user_id": user_id, "group_id": None}
             for mem in private_memories + shared_memories
         ]
         batch = self._cascade_rows_once(
@@ -727,13 +752,15 @@ class DeleteMixin:
                 mem = {
                     "memory": payload.get("data", ""),
                     "metadata": payload.get("metadata", {}),
+                    "user_id": payload.get("user_id"),
                 }
                 if collector is None:
                     self._cascade_or_fallback_expire(mem, memory_id=memory_id)
                     return
                 collector.setdefault("deleted", set()).add(memory_id)
                 batch = self._cascade_rows_once(
-                    [{"id": memory_id, "mem": mem, "group_id": None}],
+                    [{"id": memory_id, "mem": mem, "user_id": payload.get("user_id"),
+                      "group_id": None}],
                     deleted_ids=collector["deleted"],
                 )
                 collector.setdefault("graph_jobs", []).extend(batch["graph_jobs"])

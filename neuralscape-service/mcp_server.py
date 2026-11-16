@@ -2191,7 +2191,11 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
             memory_id = arguments.get("memory_id")
             if memory_id:
                 # Pass caller identity so standard-tier deletes are gated to dictators.
-                result = await asyncio.to_thread(_service.delete_memory, memory_id, user_id)
+                try:
+                    result = await asyncio.to_thread(_service.delete_memory, memory_id, user_id)
+                except LookupError as e:
+                    # Same not-found answer REST gives as a 404.
+                    return [TextContent(type="text", text=json.dumps({"error": str(e)}))]
             else:
                 result = await asyncio.to_thread(
                     _service.delete_memories,
