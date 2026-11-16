@@ -1,5 +1,7 @@
 # Spec: Visual Setup Exemplars (chart images from trading books)
 
+> **Status (as of 2026-11-16, dev 6a81341f):** built, off by default. The Neuralscape side of this spec is built: `adapters/trading/exemplars.py` and the visual-exemplar ontology, the exemplar store and `GET /v1/ingest/exemplars/{image_id}`. It is behind `EXEMPLAR_STORE_ENABLED` (default off; see the exemplar settings in `config.py`), so a default deployment stores no exemplars. The live-chart matching side belongs to the consuming platform and is not in this repository. Implementation notes: [23-knowledge-adapters-implementation-notes](./neuralscape/23-knowledge-adapters-implementation-notes.md).
+
 **Companion to** `TRADING_KNOWLEDGE_ADAPTER_PLAN.md`. Scope kept intentionally lean — enough to build.
 
 ## The idea

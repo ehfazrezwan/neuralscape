@@ -5,7 +5,7 @@ Streamable HTTP, built plugin hook scripts). This package must never import
 anything from neuralscape-service or the plugin source.
 """
 
-from .checks import eventually, expect_check_fails
+from .checks import eventually, expect_check_fails, precondition
 from .decor import expected_red, needs, negative_control, profiles, proves
 
 __all__ = [
@@ -13,6 +13,7 @@ __all__ = [
     "expected_red",
     "expect_check_fails",
     "needs",
+    "precondition",
     "negative_control",
     "profiles",
     "proves",
