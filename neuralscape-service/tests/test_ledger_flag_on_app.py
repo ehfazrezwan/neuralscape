@@ -5,9 +5,8 @@ In this slice the ledger is a library: no write is routed through it (the produc
 turning the flag on neither breaks the app nor changes a write's answer, and that the ledger the flag points at
 can be opened and migrated.
 
-* ``test_flag_on_*`` need no external service (the queue is faked) and run with the ordinary suite.
-* ``test_flag_on_write_through_real_redis`` needs ``LEDGER_TEST_REDIS_URL`` (a disposable Redis) and enqueues
-  through the real ARQ pool; it is skipped, with the declared reason, when that variable is unset.
+These need no external service (the queue is faked) and run with the ordinary suite.  The real-Redis write
+is ``integration_tests/test_ledger_flag_on_real_redis.py``.
 """
 
 from __future__ import annotations
@@ -26,17 +25,6 @@ from ledger import open_ledger
 from task_manager import TaskManager
 from tests.test_task_status_owner import PipelineRedis
 
-pytestmark = pytest.mark.integration
-
-REDIS_URL = os.environ.get("LEDGER_TEST_REDIS_URL")
-REQUIRED = os.environ.get("NS_INTEGRATION_REQUIRED") == "1"
-
-
-@pytest.fixture()
-def _fail_when_required_store_is_missing():
-    """With NS_INTEGRATION_REQUIRED=1 a missing store is a failure, not a skip."""
-    if REQUIRED and not REDIS_URL:
-        pytest.fail("NS_INTEGRATION_REQUIRED=1 but LEDGER_TEST_REDIS_URL is not set")
 _RAW = {"content": "the ledger flag is on", "category": "preference", "user_id": "alice"}
 
 
@@ -125,29 +113,6 @@ def test_flag_on_batch_write_answer_on_the_legacy_path(flag_on, fake_queue):
     batch = client.post("/v1/memories/raw/batch", json={"memories": [_RAW]}, headers=headers)
     assert batch.status_code == 202
     assert batch.json()["task_id"]
-
-
-@pytest.mark.skipif(not REDIS_URL and not REQUIRED, reason="LEDGER_TEST_REDIS_URL not set (ledger flag-on real Redis)")
-@pytest.mark.asyncio
-async def test_flag_on_write_through_real_redis(_fail_when_required_store_is_missing, flag_on, monkeypatch):
-    monkeypatch.setattr(settings, "redis_url", REDIS_URL)
-    monkeypatch.setattr(settings, "arq_queue_name", "ledger-flag-on-test")
-    manager = TaskManager()
-    await manager.connect()
-    monkeypatch.setattr(main, "_task_manager", manager)
-    try:
-        import httpx
-
-        transport = httpx.ASGITransport(app=main.app)
-        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-            resp = await client.post("/v1/memories/raw", json=_RAW, headers={"Idempotency-Key": "retry-3"})
-            assert resp.status_code == 202
-            task_id = resp.json()["task_id"]
-            status = await client.get(f"/v1/memories/status/{task_id}")
-            assert status.status_code == 200
-            assert status.json()["status"] in {"queued", "pending", "processing", "in_progress", "complete", "completed"}
-    finally:
-        await manager.close()
 
 
 class _FakeProducer:
