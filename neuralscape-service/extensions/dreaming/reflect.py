@@ -142,6 +142,10 @@ def diary_page_path(dreams_dir: Path, pool: str) -> Path:
     16-hex (64-bit) SHA-256 suffix of the unmodified, case-preserving pool id
     keeps names distinct and stable across runs. This is the only place a
     diary name is computed.
+
+    Pre-fix slug-only files are never read, moved or written: every pool
+    starts its collision-free page fresh and the old files stay as they are
+    (``Dreams/index.md`` lists them under a separate heading).
     """
     import hashlib
 
@@ -150,67 +154,6 @@ def diary_page_path(dreams_dir: Path, pool: str) -> Path:
     slug = (_slugify(pool) or "pool")[:48].strip("-") or "pool"
     digest = hashlib.sha256(pool.encode("utf-8")).hexdigest()[:16]
     return dreams_dir / f"{slug}-{digest}.md"
-
-
-def legacy_diary_page_path(dreams_dir: Path, pool: str) -> Path:
-    """The pre-hash name (slug only), kept for one-time migration."""
-    from extensions.conversation_compiler.obsidian_writer import _slugify
-
-    return dreams_dir / f"{_slugify(pool) or 'pool'}.md"
-
-
-def _legacy_diary_is_provably(text: str, pool: str) -> bool:
-    """True only when ``text`` could have been written for exactly ``pool``.
-
-    Frontmatter normalises whitespace and the parser unquotes, so the
-    ``pool`` value alone cannot tell ``user--p  q`` from ``user--p q``. The
-    page's H1 is written verbatim from the pool id, so both must match
-    exactly, and the pool id must survive the frontmatter writer/parser
-    unchanged. Anything else is treated as not-this-pool.
-    """
-    if "\n" in pool or "\r" in pool:
-        return False
-    probe, _ = okf_translate.parse_document(okf_translate.render_frontmatter({"pool": pool}) + "\n")
-    if probe.get("pool") != pool:
-        return False
-    fm, body = okf_translate.parse_document(text)
-    if fm.get("pool") != pool:
-        return False
-    first = next((ln for ln in body.splitlines() if ln.strip()), "")
-    return first == f"# Dreams \u2014 {pool}"
-
-
-_MIGRATION_NOTE_PREFIX = "> Note: the entries below were carried over from the pre-fix diary file"
-
-
-def _migration_note(old_name: str) -> str:
-    return (
-        f"{_MIGRATION_NOTE_PREFIX} `{old_name}`. "
-        "Before this fix, pools whose names collided could both have written into that file."
-    )
-
-
-def _migrate_legacy_diary(dreams_dir: Path, pool: str, path: Path) -> str | None:
-    """Move the old slug-only diary to the new name when it is provably this pool's.
-
-    The old file's ``pool`` frontmatter and H1 must equal ``pool`` exactly
-    (no stripping or normalising). A file that belongs to another pool, carries
-    no pool, or whose pool id does not round-trip through the frontmatter
-    stays where it is and is never written again.
-
-    A legacy file already mixed by a past collision names only its last
-    writer; the sweep does not know the other pools, so it cannot be told
-    apart here. Such files may hold mixed text and need manual review.
-
-    Returns the old file name when a migration happened, else None.
-    """
-    old = legacy_diary_page_path(dreams_dir, pool)
-    if old == path or not old.exists() or path.exists():
-        return None
-    if _legacy_diary_is_provably(old.read_text(encoding="utf-8"), pool):
-        old.replace(path)
-        return old.name
-    return None
 
 
 def render_diary_entry(
@@ -273,11 +216,6 @@ def write_diary(
     except Exception:
         logger.warning("diary path failed for %s (non-fatal)", pool, exc_info=True)
         return None
-    migrated_from: str | None = None
-    try:
-        migrated_from = _migrate_legacy_diary(dreams_dir, pool, path)
-    except Exception:
-        logger.warning("legacy diary migration failed for %s (non-fatal)", pool, exc_info=True)
     title = f"Dreams — {pool}"
     try:
         existing = path.read_text(encoding="utf-8") if path.exists() else ""
@@ -290,14 +228,6 @@ def write_diary(
         prior = existing[idx:] if idx != -1 else ""
     entries = [e for e in ("## Dream" + p for p in prior.split("## Dream")[1:]) if e.strip()]
     entries = entries[: keep_entries - 1]
-    # One visible note above the carried-over entries: added on migration,
-    # kept (never repeated) on later writes to the same page.
-    note = _migration_note(migrated_from) if migrated_from else ""
-    if not note and existing:
-        head = existing[: existing.find("## Dream")] if "## Dream" in existing else existing
-        note = next(
-            (ln for ln in head.splitlines() if ln.startswith(_MIGRATION_NOTE_PREFIX)), ""
-        )
     ts = datetime.now(timezone.utc).isoformat()
     fm = "\n".join(
         [
@@ -315,7 +245,6 @@ def write_diary(
             "",
             f"# {title}",
             "",
-            *([note, ""] if note else []),
         ]
     )
     content = fm + entry + "\n" + "\n".join(entries)
