@@ -49,7 +49,11 @@ class TestParseExpiresAt:
 def test_content_hash_is_the_md5_hex_of_the_utf8_text():
     assert hashing.content_hash("hello") == hashlib.md5(b"hello").hexdigest()
     assert hashing.content_hash("héllo ✓") == hashlib.md5("héllo ✓".encode()).hexdigest()
-    assert hashing.content_hash("a") != hashing.content_hash("a ")  # no normalisation: exact text
+    # No normalisation at all: case and whitespace are part of the identity.
+    assert hashing.content_hash("a") != hashing.content_hash("a ")
+    assert hashing.content_hash("Hello") != hashing.content_hash("hello")
+    assert hashing.content_hash("a b") != hashing.content_hash("a  b")
+    assert hashing.content_hash("a\n") != hashing.content_hash("a")
 
 
 def test_infer_project_id_matches_known_slugs_case_insensitively(monkeypatch):
@@ -90,9 +94,13 @@ class TestIsJunkFact:
     def test_event_log_lines_are_junk(self, text):
         assert junk._is_junk_fact(text)
 
-    @pytest.mark.parametrize("text", ["", "short", "         "])
+    @pytest.mark.parametrize("text", ["", "short", "         ", "123456789", "  123456789  "])
     def test_too_short_is_junk(self, text):
         assert junk._is_junk_fact(text)
+
+    def test_the_length_boundary_is_ten_stripped_characters(self):
+        assert junk._is_junk_fact("a" * 9) and not junk._is_junk_fact("a" * 10)
+        assert not junk._is_junk_fact("  " + "a" * 10 + "  ")
 
     @pytest.mark.parametrize("text", [
         "Uses Python 3.12 with FastAPI for backend services",
@@ -129,6 +137,10 @@ class TestCleanConversationForGraph:
         msgs = [{"role": "user", "content": ""}, {"role": "user"}]
         assert junk._clean_conversation_for_graph(msgs) == msgs
 
+    def test_indented_junk_lines_and_surrounding_blank_lines_are_handled(self):
+        msgs = [{"role": "user", "content": "\n\n  Ran command: x\nkeep this line\n   \n"}]
+        assert junk._clean_conversation_for_graph(msgs) == [{"role": "user", "content": "keep this line"}]
+
     def test_other_keys_are_preserved_and_input_not_mutated(self):
         msg = {"role": "user", "content": "Read file: a\nkeep me", "name": "n"}
         out = junk._clean_conversation_for_graph([msg])
@@ -142,8 +154,13 @@ class TestCleanConversationForGraph:
 def test_audit_logger_is_a_usable_structlog_logger():
     from memory import audit
 
-    audit._audit_log.info("authoritative_context_served", user_id="u")  # must not raise unconfigured
-    assert hasattr(audit._audit_log, "info") and hasattr(audit._audit_log, "bind")
+    import structlog
+
+    with structlog.testing.capture_logs() as logs:
+        audit._audit_log.info("authoritative_context_served", user_id="u")
+        audit._audit_log.bind(tier="standard").info("served")
+    assert logs[0]["event"] == "authoritative_context_served" and logs[0]["user_id"] == "u"
+    assert logs[1]["tier"] == "standard"
 
 
 # ── retry ──
@@ -216,14 +233,47 @@ class TestRetryTransient:
             retry.retry_transient(fn, max_retries=0, model="primary", fallback_model="backup")
 
     def test_no_fallback_when_models_are_equal_or_kwarg_absent(self, no_sleep):
-        fn = MagicMock(side_effect=Exception("503"))
-        with pytest.raises(Exception):
+        fn = MagicMock(side_effect=Exception("503 primary"))
+        with pytest.raises(Exception, match="503 primary"):
             retry.retry_transient(fn, max_retries=0, model="m", fallback_model="m")
         assert fn.call_count == 1
-        fn2 = MagicMock(side_effect=Exception("503"))
-        with pytest.raises(Exception):
+        # kwarg absent: the ORIGINAL error surfaces (not a KeyError from a blind fallback lookup)
+        fn2 = MagicMock(side_effect=Exception("503 original"))
+        with pytest.raises(Exception, match="503 original") as exc:
             retry.retry_transient(fn2, max_retries=0, fallback_model="backup")
-        assert fn2.call_count == 1
+        assert exc.type is Exception and fn2.call_count == 1
+
+    def test_fallback_forwards_the_model_kwarg_and_other_arguments(self, no_sleep):
+        seen = []
+
+        def fn(a, model=None, extra=None):
+            seen.append((a, model, extra))
+            if model == "primary":
+                raise Exception("503")
+            return "ok"
+
+        assert retry.retry_transient(fn, 1, max_retries=0, model="primary", extra="x", fallback_model="backup") == "ok"
+        assert seen == [(1, "primary", "x"), (1, "backup", "x")]
+
+    def test_a_custom_model_kwarg_name_is_honoured(self, no_sleep):
+        seen = []
+
+        def fn(engine=None):
+            seen.append(engine)
+            if engine == "p":
+                raise Exception("503")
+            return "ok"
+
+        assert retry.retry_transient(fn, max_retries=0, engine="p", fallback_model="b", model_kwarg="engine") == "ok"
+        assert seen == ["p", "b"]
+
+    def test_jitter_is_added_below_the_cap(self, monkeypatch):
+        sleeps: list[float] = []
+        monkeypatch.setattr(retry.time, "sleep", sleeps.append)
+        monkeypatch.setattr(retry.random, "uniform", lambda a, b: 0.5)
+        fn = MagicMock(side_effect=[Exception("503"), "ok"])
+        retry.retry_transient(fn, max_retries=2, base_delay=1.0, max_delay=10.0)
+        assert sleeps == [1.5]
 
     def test_defaults_come_from_settings(self, no_sleep, monkeypatch):
         monkeypatch.setattr(settings, "llm_max_retries", 2)
@@ -271,6 +321,22 @@ class TestPayloadReadableBy:
         assert not ConvertMixin._payload_readable_by({}, "bob")
         assert not ConvertMixin._payload_readable_by({"user_id": "alice"}, None)
 
+    @pytest.mark.parametrize("caller", [None, ""])
+    @pytest.mark.parametrize("payload", [
+        {}, {"metadata": {}}, {"metadata": {"visibility": "private"}},
+        {"metadata": {"metadata": {}}}, {"user_id": None, "metadata": {"owner_user_id": None}},
+        {"user_id": "", "metadata": {"owner_user_id": ""}},
+    ])
+    def test_an_anonymous_caller_never_matches_a_row_without_an_owner(self, payload, caller):
+        assert not ConvertMixin._payload_readable_by(payload, caller)
+
+    def test_an_anonymous_caller_reads_only_shared_and_enabled_standard(self, monkeypatch):
+        monkeypatch.setattr(settings, "standards_enabled", True)
+        assert ConvertMixin._payload_readable_by({"metadata": {"visibility": "standard"}}, None)
+        monkeypatch.setattr(settings, "standards_enabled", False)
+        assert not ConvertMixin._payload_readable_by({"metadata": {"visibility": "standard"}}, None)
+        assert not ConvertMixin._payload_readable_by({"user_id": "alice", "metadata": {"visibility": "private"}}, None)
+
 
 class TestMemToResponse:
     def test_unwraps_the_double_nested_mem0_metadata(self, conv):
@@ -280,6 +346,24 @@ class TestMemToResponse:
         r = conv._mem_to_response(mem)
         assert (r.id, r.memory, r.category, r.scope, r.tags, r.workspace) == ("m1", "text", "preference", "global", ["a"], "ref-x")
         assert (r.visibility, r.owner_user_id, r.revision, r.score, r.source) == ("shared", "alice", "3", 0.5, "vector")
+
+    def test_every_mapped_field_comes_through(self, conv):
+        meta = {
+            "category": "decision", "scope": "project", "project_id": "p1", "tags": ["a", "b"], "occurred_at": "2026-01-02T00:00:00Z",
+            "domain": "coding", "observation_type": "decision", "concepts": ["c1"], "source_type": "tool_extraction",
+            "related_memory_ids": ["r1"], "confidence": 0.8, "expires_at": "2027-01-01T00:00:00Z", "derived_from": ["d1"],
+            "epistemic_level": "explicit", "memory_kind": "fact", "source_ref": {"connector_id": "c"}, "visibility": "shared",
+            "owner_user_id": "alice", "revision": 4, "workspace": "ref-x", "sensitivity": "high", "sensitivity_source": "auto",
+            "title": "T", "token_estimate": 42, "speaker": "Mina",
+        }
+        r = conv._mem_to_response({"id": "m1", "memory": "text", "score": 0.7, "created_at": "c", "updated_at": "u", "metadata": meta})
+        assert (r.id, r.memory, r.score, r.created_at, r.updated_at, r.source) == ("m1", "text", 0.7, "c", "u", "vector")
+        for field in ("category", "scope", "project_id", "tags", "occurred_at", "domain", "observation_type", "concepts",
+                      "source_type", "related_memory_ids", "confidence", "expires_at", "derived_from", "epistemic_level",
+                      "memory_kind", "source_ref", "visibility", "owner_user_id", "workspace", "sensitivity",
+                      "sensitivity_source", "title", "token_estimate", "speaker"):
+            assert getattr(r, field) == meta[field], field
+        assert r.revision == "4"
 
     def test_flat_metadata_also_works_and_missing_fields_are_none(self, conv):
         r = conv._mem_to_response({"id": "m", "memory": "t", "metadata": {"category": "decision"}})
