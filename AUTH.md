@@ -197,8 +197,15 @@ rejected (fail closed).
   start where Redis is healthy never shows the 503 window. Once one load has
   succeeded, a later outage keeps the last snapshot (above). The detailed
   `/health` reports `checks.revocation`: `ok`, `unavailable` (cold start, no load
-  yet) or `stale` (loaded, Redis down now); absent when no Redis URL or no
-  per-user token secret is configured, in which case nothing here applies.
+  yet) or `stale` (loaded, Redis down now). The key is absent only when no
+  per-user token secret is set or `REDIS_URL` is explicitly empty; note that
+  `REDIS_URL` defaults to `redis://localhost:6379`, so a deployment with per-user
+  tokens and no Redis at all gets 503 on every per-user call (Redis is required
+  anyway). Set `REVOCATION_FAIL_CLOSED_ON_COLD_START=false` for such a setup.
+  The OAuth consent paste, the link step and token redemption (code and refresh
+  grants) refuse with 503 `temporarily_unavailable` (same `Retry-After`) during
+  the cold-start window too, so a token revoked in Redis cannot be pasted before
+  the first load.
   Startup logs a WARNING when it begins without revocation state and another when
   the first load succeeds. Set the flag to `false` to fail open on the Redis list
   instead (warning only, env list still enforced).

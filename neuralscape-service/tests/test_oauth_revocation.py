@@ -332,3 +332,83 @@ class TestColdSnapshot:
         r = _paste(client, client_id, pasted)
         assert r.status_code == 400  # consent page re-rendered with the error
         assert "location" not in r.headers
+
+
+class TestColdStartGateOnOAuthEntryPoints:
+    """Redis up but the snapshot not loaded yet: every OAuth credential check refuses with 503."""
+
+    @staticmethod
+    def _assert_503(resp):
+        assert resp.status_code == 503, resp.text
+        assert resp.headers["retry-after"] == "1"
+        assert resp.json()["error"] == "temporarily_unavailable"
+
+    def test_paste_at_consent(self, client, stack):
+        pasted = issue_user_token(USER, SECRET, 3600)
+        client_id = _register(client)
+        # go cold only after registration (register is public and needs no revocation state)
+        class Down:
+            async def smembers(self, key):
+                raise ConnectionError("down")
+
+            async def aclose(self):
+                return None
+
+        with patch.object(tokens, "_new_redis_client", Down):
+            tokens.reset_revocation_snapshot()
+            r = _paste(client, client_id, pasted)
+        self._assert_503(r)
+        assert "location" not in r.headers
+
+    def test_token_redemption_code_and_refresh(self, client, stack):
+        pasted, client_id, tok = _session(client)
+        code = _code_from(_paste(client, client_id, issue_user_token(USER, SECRET, 7200)))
+
+        class Down:
+            async def smembers(self, key):
+                raise ConnectionError("down")
+
+            async def aclose(self):
+                return None
+
+        with patch.object(tokens, "_new_redis_client", Down):
+            tokens.reset_revocation_snapshot()
+            self._assert_503(_exchange(client, client_id, code))
+            self._assert_503(_refresh(client, client_id, tok["refresh_token"]))
+        # nothing was consumed by the refused attempts: both work once state loads
+        tokens.reset_revocation_snapshot()
+        assert _exchange(client, client_id, code).status_code == 200
+        assert _refresh(client, client_id, tok["refresh_token"]).status_code == 200
+
+    def test_link_step(self, client, stack, monkeypatch):
+        monkeypatch.setattr(oauth.identity_store, "link", AsyncMock())
+        client_id = _register(client)
+        admin = issue_user_token(USER, SECRET, 3600)
+        ticket = _link_ticket(client_id)
+
+        class Down:
+            async def smembers(self, key):
+                raise ConnectionError("down")
+
+            async def aclose(self):
+                return None
+
+        with patch.object(tokens, "_new_redis_client", Down):
+            tokens.reset_revocation_snapshot()
+            self._assert_503(_link(client, ticket, action="link", token=admin))
+
+    def test_flag_off_restores_fail_open_on_entry_points(self, client, stack, monkeypatch):
+        monkeypatch.setattr(settings, "revocation_fail_closed_on_cold_start", False)
+        pasted = issue_user_token(USER, SECRET, 3600)
+        client_id = _register(client)
+
+        class Down:
+            async def smembers(self, key):
+                raise ConnectionError("down")
+
+            async def aclose(self):
+                return None
+
+        with patch.object(tokens, "_new_redis_client", Down):
+            tokens.reset_revocation_snapshot()
+            assert _paste(client, client_id, pasted).status_code == 303

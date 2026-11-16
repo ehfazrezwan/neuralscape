@@ -71,6 +71,7 @@ from tokens import (
     identity_fingerprint,
     issue_user_token,
     refresh_revocations,
+    revocation_cold_unavailable,
     sign_payload,
     token_fingerprint,
     verify_payload,
@@ -226,6 +227,24 @@ _HTML_SECURITY_HEADERS = {
     "X-Content-Type-Options": "nosniff",
     "Cache-Control": "no-store",
 }
+
+
+def _revocation_cold_refusal() -> JSONResponse | None:
+    """503 while the Redis revocation set has not loaded once (cold start).
+
+    A pasted/redeemed credential cannot be checked against live revocations
+    yet, so refuse (clients retry) rather than accept or reject it.
+    """
+    if not revocation_cold_unavailable():
+        return None
+    return JSONResponse(
+        status_code=503,
+        headers={"Retry-After": "1"},
+        content={
+            "error": "temporarily_unavailable",
+            "error_description": "token revocation state is unavailable; retry shortly",
+        },
+    )
 
 
 def _src_revoked(src) -> bool:
@@ -577,6 +596,8 @@ async def authorize_submit(
 
     # "Login": the pasted credential is an admin-issued per-user token.
     await refresh_revocations()
+    if (cold := _revocation_cold_refusal()) is not None:
+        return cold
     payload = verify_user_token(token.strip(), _secret()) if token.strip() else None
     if payload is None:
         return _render_consent(
@@ -793,6 +814,8 @@ async def oauth_link(
     src = None
     if action == "link":
         await refresh_revocations()
+        if (cold := _revocation_cold_refusal()) is not None:
+            return cold
         payload = verify_user_token(token.strip(), _secret()) if token.strip() else None
         if payload is None:
             return _render_link_page(
@@ -889,6 +912,8 @@ async def token(
         return _not_configured()
 
     await refresh_revocations()
+    if (cold := _revocation_cold_refusal()) is not None:
+        return cold
 
     if grant_type == "authorization_code":
         claims = verify_payload(code, _secret())

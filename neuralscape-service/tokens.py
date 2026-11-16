@@ -136,7 +136,8 @@ async def refresh_revocations(force: bool = False) -> bool:
                     enforcing = f"the last snapshot ({len(snap.digests)} digests) plus the env list"
                 elif _fail_closed_on_cold_start():
                     enforcing = (
-                        "the env list; per-user tokens get 503 until the first successful load"
+                        "the env list; per-user tokens get 503 until the first successful load "
+                        "(REVOCATION_FAIL_CLOSED_ON_COLD_START=false opts out)"
                     )
                 else:
                     enforcing = "the env list only (no Redis snapshot yet)"
@@ -235,7 +236,8 @@ async def warm_revocations(max_delay: float = 5.0) -> None:
             if _fail_closed_on_cold_start():
                 logger.warning(
                     "token revocation: starting without revocation state; per-user tokens get 503 "
-                    "(Retry-After) until Redis is reachable (retrying)"
+                    "(Retry-After) until Redis is reachable (retrying); set "
+                    "REVOCATION_FAIL_CLOSED_ON_COLD_START=false to fail open instead"
                 )
         await asyncio.sleep(delay)
         delay = min(delay * 2, max_delay)
