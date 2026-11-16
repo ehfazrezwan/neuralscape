@@ -287,3 +287,51 @@ async def test_heartbeat_continues_during_strategy_synthesizer_scroll(tmp_path, 
     cfg = StrategySynthesizerSettings(enabled=True)
     n = await _beats_during(tmp_path, lambda: syn.synthesize_all(service=object(), settings=cfg))
     assert n >= 5, "heartbeat stalled during the synthesizer's Qdrant scroll"
+
+
+# ── test-only heartbeat stall hook ───────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_stall_file_pauses_the_beat_and_removing_it_resumes(tmp_path, monkeypatch):
+    stall = tmp_path / "stall"
+    monkeypatch.setenv(wl.STALL_ENV, str(stall))
+    monkeypatch.setattr(worker.settings, "neuralscape_public_url", "")
+    hb = tmp_path / "hb"
+    ctx: dict = {}
+    wl.start_heartbeat(ctx, str(hb), interval=0.02)
+    await asyncio.sleep(0.1)
+    assert wl.is_fresh(str(hb), max_age=1)
+    stall.touch()
+    await asyncio.sleep(0.05)
+    _age(hb, 100)
+    await asyncio.sleep(0.15)
+    assert not wl.is_fresh(str(hb), max_age=50), "beat must stop while the stall file exists"
+    stall.unlink()
+    await asyncio.sleep(0.15)
+    assert wl.is_fresh(str(hb), max_age=5), "beat must resume once the stall file is removed"
+    await wl.stop_heartbeat(ctx)
+
+
+@pytest.mark.asyncio
+async def test_stall_hook_is_refused_and_warned_when_a_public_url_is_set(tmp_path, monkeypatch, caplog):
+    stall = tmp_path / "stall"
+    stall.touch()
+    monkeypatch.setenv(wl.STALL_ENV, str(stall))
+    monkeypatch.setattr(worker.settings, "neuralscape_public_url", "https://ns.example.com")
+    monkeypatch.setattr(wl, "_stall_refused_logged", False)
+    caplog.set_level("WARNING", logger="worker_liveness")
+    hb = tmp_path / "hb"
+    ctx: dict = {}
+    wl.start_heartbeat(ctx, str(hb), interval=0.02)
+    await asyncio.sleep(0.1)
+    _age(hb, 100)
+    await asyncio.sleep(0.1)
+    assert wl.is_fresh(str(hb), max_age=5), "stall must be ignored in a public deployment"
+    assert wl.STALL_ENV in caplog.text and "NEURALSCAPE_PUBLIC_URL" in caplog.text
+    await wl.stop_heartbeat(ctx)
+
+
+def test_stall_hook_is_inert_without_the_env_var(monkeypatch):
+    monkeypatch.delenv(wl.STALL_ENV, raising=False)
+    assert wl._stall_requested() is False

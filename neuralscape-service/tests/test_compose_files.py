@@ -516,7 +516,9 @@ def _has_autoheal(svc: dict) -> bool:
     labels = svc.get("labels") or {}
     if isinstance(labels, list):
         labels = dict(str(i).partition("=")[::2] for i in labels)
-    return str(labels.get(_AUTOHEAL_LABEL, "")).strip("\"'").lower() == "true"
+    value = str(labels.get(_AUTOHEAL_LABEL, "")).strip("\"'").lower()
+    # `${WORKER_AUTOHEAL:-true}`: on by default, operator opt-out via .env.
+    return value in ("true", "${worker_autoheal:-true}")
 
 
 def _check_cmd(svc: dict) -> str:
@@ -564,3 +566,31 @@ def test_helm_worker_liveness_probes_check_the_heartbeat() -> None:
         text = (chart / f"{name}-deployment.yaml").read_text(encoding="utf-8")
         assert "sys.exit(0)" not in text, f"{name}: no-op liveness probe"
         assert "ns-worker.heartbeat" in text, f"{name}: probe ignores the heartbeat"
+
+
+def test_worker_autoheal_opt_out_is_an_env_var_documented_in_the_templates() -> None:
+    if not _have_repo():
+        return
+    text = (REPO_ROOT / BASE).read_text(encoding="utf-8")
+    assert text.count('com.neuralscape.autoheal: "${WORKER_AUTOHEAL:-true}"') == 3
+    for template in (".env.example", ".env.production"):
+        assert re.search(r"^#?\s*WORKER_AUTOHEAL=", (REPO_ROOT / template).read_text(encoding="utf-8"), re.M)
+
+
+def test_worker_liveness_allows_five_minutes_of_missed_beats_before_unhealthy() -> None:
+    if not _have_repo():
+        return
+    import worker_liveness as wl
+
+    for worker in _WORKERS:
+        hc = _services(BASE)[worker]["healthcheck"]
+        seconds = lambda v: int(str(v).rstrip("s"))  # noqa: E731
+        # first failed check once the beat is older than the bound, then retries-1 more intervals
+        assert wl.HEARTBEAT_MAX_AGE_S + (hc["retries"] - 1) * seconds(hc["interval"]) >= 300, worker
+        assert seconds(hc["start_period"]) >= 600, f"{worker}: start_period must cover a model download"
+    chart = REPO_ROOT / "deploy" / "charts" / "neuralscape"
+    if chart.is_dir():
+        for name in ("worker", "graph-worker", "ingest-worker"):
+            text = (chart / "templates" / f"{name}-deployment.yaml").read_text(encoding="utf-8")
+            assert "workerLiveness.enabled" in text and "startupProbe" in text
+        assert re.search(r"workerLiveness:\s*\n\s*enabled: true", (chart / "values.yaml").read_text(encoding="utf-8"))

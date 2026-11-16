@@ -304,8 +304,9 @@ services:
       - ${OBSIDIAN_VAULT_PATH:-./vault}:/data/vault
     restart: unless-stopped
     # Wedged-worker restart: autoheal acts on the liveness healthcheck below.
+    # Opt out without editing compose: WORKER_AUTOHEAL=false in .env.
     labels:
-      com.neuralscape.autoheal: "true"
+      com.neuralscape.autoheal: "${WORKER_AUTOHEAL:-true}"
     deploy:
       resources:
         limits:
@@ -317,14 +318,15 @@ services:
         max-file: "3"
     healthcheck:
       # Liveness only: the worker's event loop touches /tmp/ns-worker.heartbeat
-      # every 10s (worker_liveness.py); fail when it is missing or >120s old.
+      # every 10s (worker_liveness.py); fail when it is missing or >240s old (4 min; 5 min before unhealthy).
       # Reads one mtime: no service import, no Redis/Qdrant/Neo4j/LLM. Long jobs
       # run in threads, so only a blocked loop (a wedged worker) lets it go stale.
-      test: ["CMD", "python", "-c", "import os,sys,time; sys.exit(0 if time.time()-os.stat(os.environ.get('NS_WORKER_HEARTBEAT_FILE','/tmp/ns-worker.heartbeat')).st_mtime<120 else 1)"]
+      test: ["CMD", "python", "-c", "import os,sys,time; sys.exit(0 if time.time()-os.stat(os.environ.get('NS_WORKER_HEARTBEAT_FILE','/tmp/ns-worker.heartbeat')).st_mtime<240 else 1)"]
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 180s
+      # cold start incl. a first-run model download must fit here
+      start_period: 600s
 
   # ── Dedicated graph / heavy-work worker ─────────────────────────
   # Consumes the graph queue (GRAPH_QUEUE_NAME): slow Graphiti graph
@@ -371,8 +373,9 @@ services:
       - ${OBSIDIAN_VAULT_PATH:-./vault}:/data/vault
     restart: unless-stopped
     # Wedged-worker restart: autoheal acts on the liveness healthcheck below.
+    # Opt out without editing compose: WORKER_AUTOHEAL=false in .env.
     labels:
-      com.neuralscape.autoheal: "true"
+      com.neuralscape.autoheal: "${WORKER_AUTOHEAL:-true}"
     deploy:
       resources:
         limits:
@@ -384,14 +387,15 @@ services:
         max-file: "3"
     healthcheck:
       # Liveness only: the worker's event loop touches /tmp/ns-worker.heartbeat
-      # every 10s (worker_liveness.py); fail when it is missing or >120s old.
+      # every 10s (worker_liveness.py); fail when it is missing or >240s old (4 min; 5 min before unhealthy).
       # Reads one mtime: no service import, no Redis/Qdrant/Neo4j/LLM. Long jobs
       # run in threads, so only a blocked loop (a wedged worker) lets it go stale.
-      test: ["CMD", "python", "-c", "import os,sys,time; sys.exit(0 if time.time()-os.stat(os.environ.get('NS_WORKER_HEARTBEAT_FILE','/tmp/ns-worker.heartbeat')).st_mtime<120 else 1)"]
+      test: ["CMD", "python", "-c", "import os,sys,time; sys.exit(0 if time.time()-os.stat(os.environ.get('NS_WORKER_HEARTBEAT_FILE','/tmp/ns-worker.heartbeat')).st_mtime<240 else 1)"]
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 180s
+      # cold start incl. a first-run model download must fit here
+      start_period: 600s
 
   # ── Dedicated ingest worker ─────────────────────────────────────
   # Consumes the ingest queue (INGEST_QUEUE_NAME): bulk document/file ingestion
@@ -444,8 +448,9 @@ services:
       - exemplar_data:/data/exemplars
     restart: unless-stopped
     # Wedged-worker restart: autoheal acts on the liveness healthcheck below.
+    # Opt out without editing compose: WORKER_AUTOHEAL=false in .env.
     labels:
-      com.neuralscape.autoheal: "true"
+      com.neuralscape.autoheal: "${WORKER_AUTOHEAL:-true}"
     deploy:
       resources:
         limits:
@@ -457,14 +462,15 @@ services:
         max-file: "3"
     healthcheck:
       # Liveness only: the worker's event loop touches /tmp/ns-worker.heartbeat
-      # every 10s (worker_liveness.py); fail when it is missing or >120s old.
+      # every 10s (worker_liveness.py); fail when it is missing or >240s old (4 min; 5 min before unhealthy).
       # Reads one mtime: no service import, no Redis/Qdrant/Neo4j/LLM. Long jobs
       # run in threads, so only a blocked loop (a wedged worker) lets it go stale.
-      test: ["CMD", "python", "-c", "import os,sys,time; sys.exit(0 if time.time()-os.stat(os.environ.get('NS_WORKER_HEARTBEAT_FILE','/tmp/ns-worker.heartbeat')).st_mtime<120 else 1)"]
+      test: ["CMD", "python", "-c", "import os,sys,time; sys.exit(0 if time.time()-os.stat(os.environ.get('NS_WORKER_HEARTBEAT_FILE','/tmp/ns-worker.heartbeat')).st_mtime<240 else 1)"]
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 180s
+      # cold start incl. a first-run model download must fit here
+      start_period: 600s
 
   # ── Cloudflare tunnel ───────────────────────────────────────────
   # Exposes the API to the public internet via a Cloudflare Tunnel

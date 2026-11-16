@@ -22,8 +22,8 @@ import time
 
 HEARTBEAT_FILE = os.environ.get("NS_WORKER_HEARTBEAT_FILE", "/tmp/ns-worker.heartbeat")  # noqa: S108
 HEARTBEAT_INTERVAL_S = 10.0
-# Twelve missed beats. Compose adds interval*retries on top before a restart.
-HEARTBEAT_MAX_AGE_S = 120
+# 24 missed beats. Compose adds (retries-1)*interval, so >= 5 min of missed beats before unhealthy.
+HEARTBEAT_MAX_AGE_S = 240
 
 logger = logging.getLogger(__name__)
 
@@ -41,10 +41,36 @@ def beat(path: str | None = None) -> None:
         os.utime(target, None)
 
 
+STALL_ENV = "NS_TEST_STALL_HEARTBEAT_FILE"
+_stall_refused_logged = False
+
+
+def _stall_requested() -> bool:
+    """Test-only fault: while the file named by ``NS_TEST_STALL_HEARTBEAT_FILE`` exists, stop beating.
+
+    Reversible (delete the file). Refused, with a warning, whenever the deployment
+    has a public URL configured (``NEURALSCAPE_PUBLIC_URL``), so it can never be
+    switched on in an internet-facing deployment.
+    """
+    global _stall_refused_logged
+    target = os.environ.get(STALL_ENV)
+    if not target:
+        return False
+    from config import settings
+
+    if settings.neuralscape_public_url:
+        if not _stall_refused_logged:
+            _stall_refused_logged = True
+            logger.warning("%s ignored: NEURALSCAPE_PUBLIC_URL is set (not a test deployment)", STALL_ENV)
+        return False
+    return os.path.exists(target)
+
+
 async def heartbeat_loop(path: str | None = None, interval: float = HEARTBEAT_INTERVAL_S) -> None:
     while True:
         try:
-            beat(path)
+            if not _stall_requested():
+                beat(path)
         except Exception:  # noqa: BLE001 - never let the beat task die silently
             logger.warning("worker heartbeat write failed; the liveness check will go stale", exc_info=True)
         await asyncio.sleep(interval)

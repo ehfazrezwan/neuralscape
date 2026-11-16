@@ -38,23 +38,25 @@ spec:
               mountPath: /data/vault
           resources:
             {{- toYaml .Values.graphWorker.resources | nindent 12 }}
+          {{- if .Values.workerLiveness.enabled }}
           # Liveness only: the worker event loop touches the heartbeat file
-          # (worker_liveness.py); fail when it is missing or >120s old.
+          # (worker_liveness.py); fail when it is missing or >240s old (4 min; 5 min before unhealthy).
           # startupProbe gates the liveness probe: a slow cold start (model load,
-          # backend connect) gets up to 30 x 10s = 300s before liveness applies.
+          # backend connect) gets up to 60 x 10s = 600s before liveness applies.
           startupProbe:
             exec:
-              command: ["python", "-c", "import os,sys,time; sys.exit(0 if time.time()-os.stat(os.environ.get('NS_WORKER_HEARTBEAT_FILE','/tmp/ns-worker.heartbeat')).st_mtime<120 else 1)"]
+              command: ["python", "-c", "import os,sys,time; sys.exit(0 if time.time()-os.stat(os.environ.get('NS_WORKER_HEARTBEAT_FILE','/tmp/ns-worker.heartbeat')).st_mtime<240 else 1)"]
             periodSeconds: 10
             timeoutSeconds: 10
-            failureThreshold: 30
+            failureThreshold: 60
           livenessProbe:
             exec:
-              command: ["python", "-c", "import os,sys,time; sys.exit(0 if time.time()-os.stat(os.environ.get('NS_WORKER_HEARTBEAT_FILE','/tmp/ns-worker.heartbeat')).st_mtime<120 else 1)"]
+              command: ["python", "-c", "import os,sys,time; sys.exit(0 if time.time()-os.stat(os.environ.get('NS_WORKER_HEARTBEAT_FILE','/tmp/ns-worker.heartbeat')).st_mtime<240 else 1)"]
             initialDelaySeconds: 0
             periodSeconds: 30
             timeoutSeconds: 10
             failureThreshold: 3
+          {{- end }}
       volumes:
         - name: vault
           emptyDir: {}
