@@ -1131,6 +1131,19 @@ async def process_graph_enrichment(
     return {"memory_id": memory_id, "enriched": enriched}
 
 
+async def process_graph_reenrich(ctx: dict, memory_id: str) -> dict:
+    """Background task: re-enrich one memory into a fresh episode after its shared episode was removed.
+
+    Enqueued by the support-aware removal (``GRAPH_SUPPORT_AWARE_REMOVAL_ENABLED``) for every memory that
+    recorded the removed episode, when no ledger producer is installed.  The job carries only the memory id and
+    re-reads the owner, project and visibility from the row; a memory deleted meanwhile is skipped, and an
+    enrichment that does not complete raises so ARQ retries the job (the row keeps ``graph_reenrich_pending``
+    until it has run).
+    """
+    service: MemoryService = ctx["service"]
+    return await asyncio.to_thread(service.reenrich_memory_graph, memory_id)
+
+
 async def expire_old_memories_cron(ctx: dict) -> dict:
     """Cron job: purge memories whose expires_at is in the past (memory-model v2)."""
     service: MemoryService = ctx["service"]
@@ -1566,8 +1579,35 @@ def _make_on_job_start(queue_name: str):
                     structlog.contextvars.bind_contextvars(function=info.function)
         except Exception:  # noqa: BLE001 — observability must never fail a job
             logger.debug("binding job log context failed (non-fatal)", exc_info=True)
+        await _bind_usage_attempt(ctx)
 
     return on_job_start
+
+
+async def _bind_usage_attempt(ctx: dict) -> None:
+    """Attribute the provider calls this job makes to the person it serves (only when usage capture is on).
+
+    The person is read from the enqueue-time ``task -> user`` record; a job without one (a cron, a job
+    enqueued by another job) is recorded as unattributed rather than dropped.  The context lives as long as
+    the job's own asyncio task, and threads the job starts inherit it.  Never fails a job.
+    """
+    try:
+        import usage_capture
+
+        job_id = ctx.get("job_id")
+        if usage_capture.get_usage_recorder() is None or not job_id:
+            return
+        from task_manager import _task_user_key
+
+        tenant = None
+        redis = ctx.get("redis")
+        if redis is not None:
+            raw = await redis.get(_task_user_key(job_id))
+            if raw:
+                tenant = raw.decode() if isinstance(raw, bytes) else str(raw)
+        usage_capture.bind_job_attempt(tenant, job_id, ctx.get("job_try"))
+    except Exception:  # noqa: BLE001 — capture must never fail a job
+        logger.debug("binding the usage attempt failed (non-fatal)", exc_info=True)
 
 
 def _make_after_job_end(queue_name: str):
@@ -1588,6 +1628,12 @@ def _make_after_job_end(queue_name: str):
             await _queue_empty_webhook(ctx)
         finally:
             structlog.contextvars.unbind_contextvars("job_id", "job_try", "queue", "function")
+            try:
+                import usage_capture
+
+                usage_capture.unbind_job_attempt()
+            except Exception:  # noqa: BLE001
+                pass
 
     async def _queue_empty_webhook(ctx: dict) -> None:
         url = settings.webhook_queue_empty_url
@@ -1635,12 +1681,9 @@ async def startup(ctx: dict) -> None:
     # Durable usage capture (off unless USAGE_STORE_ENABLED).  The recorder must
     # exist before the service builds its provider clients so they are wrapped.
     if settings.usage_store_enabled:
-        import usage_capture
-        from usage_store import open_usage_store
+        from usage_store import install_usage_capture
 
-        usage_store = open_usage_store(settings)
-        ctx["usage_store"] = usage_store
-        usage_capture.set_usage_recorder(usage_capture.DurableUsageRecorder(usage_store))
+        ctx["usage_store"] = install_usage_capture(settings)
         logger.info("Durable usage store opened (backend=%s)", settings.usage_store_backend)
     from provider_routing import apply_gemini_base_url
 
@@ -1690,10 +1733,9 @@ async def shutdown(ctx: dict) -> None:
             handle.close()
     usage_store = ctx.get("usage_store")
     if usage_store is not None:
-        import usage_capture
+        from usage_store import uninstall_usage_capture
 
-        usage_capture.set_usage_recorder(None)
-        usage_store.close()
+        uninstall_usage_capture(usage_store)
     logger.info("ARQ worker stopped.")
 
 
@@ -1760,6 +1802,7 @@ class GraphWorkerSettings:
     """
     functions = [
         process_graph_enrichment,
+        process_graph_reenrich,
         run_dream_sweep,
         # Session summary refreshes (audit 27 #24): Gemini-bound, no latency
         # SLO — enqueued by _note_session_messages onto the graph queue.

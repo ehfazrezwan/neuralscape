@@ -160,6 +160,15 @@ async def lifespan(app: FastAPI):
     # Configure asyncio.to_thread executor when TO_THREAD_MAX_WORKERS>0
     _configure_to_thread_executor(asyncio.get_running_loop())
 
+    # Durable usage capture (off unless USAGE_STORE_ENABLED).  The recorder must exist before the
+    # service builds its provider clients so they are wrapped.
+    usage_store = None
+    if settings.usage_store_enabled:
+        from usage_store import install_usage_capture
+
+        usage_store = install_usage_capture(settings)
+        logger.info("Durable usage store opened (backend=%s)", settings.usage_store_backend)
+
     # Initialize the service (this also initializes mem0 + Graphiti)
     _service._get_memory()
     # Action policy: build the enforcer from settings (a no-op unless enabled).  In
@@ -223,6 +232,10 @@ async def lifespan(app: FastAPI):
 
     await _stop_engine_switch()
     await _task_manager.close()
+    if usage_store is not None:
+        from usage_store import uninstall_usage_capture
+
+        await asyncio.to_thread(uninstall_usage_capture, usage_store)
     logger.info("Neuralscape Service stopped.")
 
 

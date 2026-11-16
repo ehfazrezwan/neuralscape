@@ -8,6 +8,7 @@ import logging
 
 from config import settings
 from schemas import MemoryResponse, MemoryVisibility
+from usage_capture import attributed
 from memory.groups import _build_group_id, _edge_is_invalidated, _get_group_ids, _live_edges_filter
 from memory.ranking import (
     RRF_K,
@@ -432,6 +433,7 @@ class SearchMixin:
             logger.warning("routed engine recall failed; using the legacy vector path: %s", error)
             return None
 
+    @attributed("search")
     def search(
         self,
         query: str,
@@ -1414,6 +1416,7 @@ class SearchMixin:
                 if rec.get("fact_embedding"):
                     item["fact_embedding"] = rec["fact_embedding"]
 
+    @attributed("search_graph")
     def search_graph(
         self,
         query: str,

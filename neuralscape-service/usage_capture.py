@@ -154,6 +154,95 @@ def attempt_context(context: AttemptContext) -> Iterator[None]:
         _attempt.reset(token)
 
 
+UNATTRIBUTED_TENANT = "unattributed"
+
+
+@contextmanager
+def ensure_attempt(
+    tenant_id: str | None, operation: str, *, task_id: str | None = None, bill_owner: str | None = None
+) -> Iterator[None]:
+    """Bind an attempt context for a service entry point unless the caller already bound one.
+
+    The service's own entry points (search, ask, an ARQ job) call this so the provider calls made under them
+    are attributed to the person they serve.  A no-op unless a recorder is installed, and a context a ledger
+    stage bound already wins (it carries the ledger attempt).  The ids are opaque and content-free; a missing
+    person is recorded under :data:`UNATTRIBUTED_TENANT` rather than dropped.  Never raises.
+    """
+    token = None
+    try:
+        if _recorder is not None and _attempt.get() is None:
+            task = _bounded_id(task_id or uuid.uuid4().hex)
+            context = AttemptContext(
+                tenant_id=_bounded_id(tenant_id or UNATTRIBUTED_TENANT),
+                task_id=task,
+                attempt_id=_bounded_id(f"{task}:{operation}"),
+                bill_owner=bill_owner,
+            )
+            token = _attempt.set(_AttemptState(context))
+    except Exception:
+        logger.warning("usage attempt context could not be bound for %s", operation, exc_info=True)
+    try:
+        yield
+    finally:
+        if token is not None:
+            _attempt.reset(token)
+
+
+def attributed(operation: str, user_arg: str = "user_id") -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+    """Decorator form of :func:`ensure_attempt` for a synchronous service method taking ``user_arg``.
+
+    With no recorder installed the wrapper is one ``None`` check and a call.
+    """
+    import functools
+    import inspect
+
+    def decorate(fn: Callable[..., Any]) -> Callable[..., Any]:
+        signature = inspect.signature(fn)
+
+        @functools.wraps(fn)
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
+            if _recorder is None:
+                return fn(*args, **kwargs)
+            tenant = None
+            try:
+                value = signature.bind_partial(*args, **kwargs).arguments.get(user_arg)
+                tenant = value if isinstance(value, str) else None
+            except Exception:
+                pass
+            with ensure_attempt(tenant, operation):
+                return fn(*args, **kwargs)
+
+        return wrapper
+
+    return decorate
+
+
+def bind_job_attempt(tenant_id: str | None, task_id: str, try_number: int | None = None) -> bool:
+    """Bind an attempt context to the calling task for the rest of its life (an ARQ job); never raises.
+
+    Used from the worker's ``on_job_start`` hook, which runs in the job's own asyncio task; pair it with
+    :func:`unbind_job_attempt` in ``after_job_end``.  Returns whether a context was bound.
+    """
+    try:
+        if _recorder is None or not task_id:
+            return False
+        task = _bounded_id(str(task_id))
+        context = AttemptContext(
+            tenant_id=_bounded_id(tenant_id or UNATTRIBUTED_TENANT),
+            task_id=task,
+            attempt_id=_bounded_id(f"{task}:try{try_number or 1}"),
+        )
+        _attempt.set(_AttemptState(context))
+        return True
+    except Exception:
+        logger.warning("usage job context could not be bound for %s", task_id, exc_info=True)
+        return False
+
+
+def unbind_job_attempt() -> None:
+    _attempt.set(None)
+
+
 def _counter(value: Any) -> TokenQuantity:
     if type(value) is int and 0 <= value <= MAX_SAFE_INTEGER:
         return TokenQuantity(value=value, missing_reason=None)

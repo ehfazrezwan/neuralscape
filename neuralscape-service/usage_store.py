@@ -417,6 +417,40 @@ def open_usage_store(settings: Any = None) -> _SqlUsageStore | None:
     raise ValueError(f"unknown USAGE_STORE_BACKEND {backend!r}")
 
 
+def install_usage_capture(settings: Any = None) -> _SqlUsageStore | None:
+    """Open the configured store and install the durable recorder; ``None`` (nothing installed) when disabled.
+
+    The recorder must exist before the service builds its provider clients so they are wrapped.  The API, every
+    worker queue and any other process that makes provider calls call this at start-up.
+    """
+    store = open_usage_store(settings)
+    if store is None:
+        return None
+    import usage_capture
+
+    usage_capture.set_usage_recorder(usage_capture.DurableUsageRecorder(store))
+    return store
+
+
+def uninstall_usage_capture(store: _SqlUsageStore | None) -> None:
+    """Flush pending gaps, remove the recorder and close the store (best effort, never raises)."""
+    if store is None:
+        return
+    import usage_capture
+
+    try:
+        recorder = usage_capture.get_usage_recorder()
+        if hasattr(recorder, "flush_gaps"):
+            recorder.flush_gaps()
+    except Exception:
+        pass
+    usage_capture.set_usage_recorder(None)
+    try:
+        store.close()
+    except Exception:
+        pass
+
+
 _ATTEMPT_CATEGORIES = (
     "input_tokens",
     "output_tokens",

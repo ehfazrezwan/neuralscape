@@ -557,6 +557,34 @@ async def ask_memory(
 ) -> dict:
     """Answer ``question`` from the caller's memories at ``reasoning_level``.
 
+    The provider calls made under it (the answering model, and the searches' embeddings) are
+    attributed to ``user_id`` when usage capture is on (``usage_capture.ensure_attempt``).  See
+    :func:`_ask_memory` for the contract.
+    """
+    from usage_capture import ensure_attempt
+
+    with ensure_attempt(user_id, "ask"):
+        return await _ask_memory(
+            service,
+            question=question,
+            user_id=user_id,
+            reasoning_level=reasoning_level,
+            project_id=project_id,
+            llm_call=llm_call,
+        )
+
+
+async def _ask_memory(
+    service,
+    *,
+    question: str,
+    user_id: str,
+    reasoning_level: str = "low",
+    project_id: str | None = None,
+    llm_call=None,
+) -> dict:
+    """Answer ``question`` from the caller's memories at ``reasoning_level``.
+
     Returns the ``AskMemoryResponse`` field set as a plain dict:
     ``{status, reasoning_level, answer, citations, abstained, searches,
     memories_considered}``. Raises :class:`AskUnavailable` when the
