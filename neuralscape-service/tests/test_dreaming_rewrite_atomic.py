@@ -96,6 +96,7 @@ def _service(payloads, *, bm25_slot, sparse=None):
     vs.client = client
     vs._has_bm25_slot = bm25_slot
     vs._encode_bm25 = MagicMock(return_value=sparse)
+    vs._get_bm25_encoder = MagicMock(return_value=object())
     mem = MagicMock()
     mem.vector_store = vs
     mem.embedding_model.embed.return_value = [0.25] * 8
@@ -161,15 +162,54 @@ class TestBm25Preserved:
         vs._encode_bm25.assert_not_called()
         assert client.vectors["m1"] == [0.25] * 8
 
-    def test_encoder_unavailable_updates_dense_and_drops_stale_sparse(self):
-        service, client, _ = _service(
+    def test_transient_encode_failure_is_retried_and_keeps_bm25(self, monkeypatch):
+        monkeypatch.setattr("time.sleep", lambda *_: None)
+        service, client, vs = _service(
+            {"m1": {"data": "old", "metadata": {}}}, bm25_slot=True, sparse=SPARSE
+        )
+        vs._encode_bm25 = MagicMock(side_effect=[None, None, SPARSE])
+        vs._get_bm25_encoder = MagicMock(return_value=object())
+        consolidate._rewrite_content(service, "m1", "new")
+        assert client.vectors["m1"]["bm25"] == SPARSE
+        assert "delete_vectors" not in client.calls
+
+    def test_persistent_encode_failure_refuses_before_any_write(self, monkeypatch):
+        monkeypatch.setattr("time.sleep", lambda *_: None)
+        service, client, vs = _service(
             {"m1": {"data": "old", "metadata": {}}}, bm25_slot=True, sparse=None
         )
-        client.vectors["m1"] = {"": [0.1] * 8, "bm25": SPARSE}  # the OLD text's sparse vector
+        client.vectors["m1"] = {"": [0.1] * 8, "bm25": SPARSE}
+        vs._get_bm25_encoder = MagicMock(return_value=object())  # encoder exists, encode fails
+        with pytest.raises(RuntimeError):
+            consolidate._rewrite_content(service, "m1", "new")
+        assert client.calls == []  # no patch, no vector write, no delete
+        assert client.vectors["m1"]["bm25"] == SPARSE
+        assert client.payloads["m1"]["data"] == "old"
+
+    @pytest.mark.asyncio
+    async def test_failed_encode_is_reported_as_an_action_error(self, monkeypatch):
+        monkeypatch.setattr("time.sleep", lambda *_: None)
+        service, client, vs = _service(
+            {"a": {"data": "x", "metadata": {}}}, bm25_slot=True, sparse=None
+        )
+        vs._get_bm25_encoder = MagicMock(return_value=object())
+        result = await consolidate.apply_actions(
+            service, _batch(["a"]),
+            [{"type": "rewrite", "memory_ids": ["a"], "content": "y", "confidence": 0.9}],
+            dry_run=False,
+        )
+        assert result.errors and not result.applied
+
+    def test_encoder_permanently_unavailable_drops_the_stale_sparse_vector(self):
+        service, client, vs = _service(
+            {"m1": {"data": "old secret text", "metadata": {}}}, bm25_slot=True, sparse=None
+        )
+        client.vectors["m1"] = {"": [0.1] * 8, "bm25": SPARSE}  # derived from the OLD text
+        vs._get_bm25_encoder = MagicMock(return_value=None)
         consolidate._rewrite_content(service, "m1", "new")
-        # dense updated; the stale sparse vector must not keep matching old words
-        assert client.vectors["m1"] == {"": [0.25] * 8}
+        assert client.vectors["m1"] == {"": [0.25] * 8}  # dense updated, old sparse gone
         assert "delete_vectors" in client.calls
+        assert client.payloads["m1"]["data"] == "new"
 
     def test_stale_text_lemmatized_shadow_is_dropped(self):
         service, client, _ = _service(

@@ -630,7 +630,17 @@ class TestConnectorSyncIdentity:
                 return FakeJob(None), JobStatus.not_found
             return FakeJob(results.get(task_id)), JobStatus.complete
 
+        class _InFlight:
+            """A retained id is a run still in flight (queued): the sync coalesces onto it."""
+
+            def __init__(self, *a, **kw):
+                pass
+
+            async def status(self):
+                return JobStatus.queued
+
         ptm.pool.enqueue_job = enqueue_job
+        monkeypatch.setattr("task_manager.Job", _InFlight)
         monkeypatch.setattr(ptm, "_find_job", find_job)
         ptm.seen, ptm.results = seen, results
         return ptm
@@ -981,6 +991,7 @@ class TestConnectorSyncIdentity:
         class Pool:
             async def enqueue_job(self, fn, *args, _job_id=None, **kw):
                 seen.append(_job_id)
+                return MagicMock(job_id=_job_id)
 
         monkeypatch.setattr(settings, "connectors_enabled", True)
         await worker.connector_sync_cron({"vault": vault, "redis": Pool()})

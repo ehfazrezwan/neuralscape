@@ -25,8 +25,11 @@ import memory.search as search_mod
 BUDGET_S = 1.5
 MARGIN_S = 3.0  # query embed + Qdrant round trip on top of the budget
 DELAY_S = 12.0  # well past budget + margin, well under the 30 s bridge timeout
-FACT = "The Quillfeather deployment gate requires a signed manifest before release."
-QUERY = "What does the Quillfeather deployment gate require?"
+# A plain "X works at Y" sentence: relation extraction reliably yields an edge
+# (the supersession tests seed the same shape).
+FACT = "Dana Quillfeather works at Northwind Logistics."
+QUERY = "Where does Dana Quillfeather work?"
+ENRICH_ATTEMPTS = 3  # enrich_graph swallows Graphiti/LLM errors and returns False; real Gemini can flake under load
 
 
 def _cypher(svc, query: str, **params):
@@ -77,21 +80,34 @@ def service(stores, llm_key, unique_ns, monkeypatch):
 
 @pytest.fixture
 def seeded(service, unique_ns):
-    """One fact in Qdrant AND in the graph; waits until the graph holds a live edge."""
-    stored = service.store_raw(FACT, unique_ns.user_id, "domain_knowledge", add_to_graph=True)
+    """One fact in Qdrant AND in the graph.
+
+    ``enrich_graph`` is synchronous (the graph worker runs the same call), so
+    there is nothing to poll: it either returned True, returned False (an error
+    it swallowed), or returned True without producing an edge.  Each state fails
+    with its own message instead of timing out.
+    """
+    stored, created = service.store_raw(
+        FACT, unique_ns.user_id, "personal_fact", add_to_graph=False, return_created=True
+    )
+    assert created, "the seeded fact was not stored as a new row"
+    mem = stored[0]
     group = f"user--{unique_ns.user_id}"
-    deadline = time.monotonic() + 180
-    while time.monotonic() < deadline:
-        edges = _cypher(
-            service,
-            "MATCH ()-[r:RELATES_TO {group_id: $g}]->() WHERE r.expired_at IS NULL RETURN r.uuid AS uuid",
-            g=group,
+    ok = False
+    for _ in range(ENRICH_ATTEMPTS):
+        ok = service.enrich_graph(
+            content=FACT, user_id=unique_ns.user_id, project_id=None,
+            visibility=getattr(mem, "visibility", None) or "private", memory_id=mem.id,
         )
-        if edges:
+        if ok:
             break
-        time.sleep(3)
-    else:
-        pytest.fail("the graph never received an edge for the seeded fact within 180 s")
+    assert ok is True, f"enrich_graph returned False {ENRICH_ATTEMPTS} times (Graphiti/LLM error swallowed)"
+    edges = _cypher(
+        service,
+        "MATCH ()-[r:RELATES_TO {group_id: $g}]->() WHERE r.expired_at IS NULL RETURN r.uuid AS uuid",
+        g=group,
+    )
+    assert edges, "enrich_graph completed without error but the graph holds no live edge for the fact (extraction produced none)"
     return {m.id for m in stored}
 
 
