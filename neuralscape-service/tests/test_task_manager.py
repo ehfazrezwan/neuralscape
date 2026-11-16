@@ -9,6 +9,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from arq.jobs import JobStatus
+
 from task_manager import TaskManager, _generate_job_id
 
 
@@ -161,7 +163,10 @@ class TestEnqueueRawV2:
         from task_manager import connector_sync_job_id
 
         tm.pool.enqueue_job.return_value = None
-        job_id = await tm.enqueue_connector_sync("notion-personal", "alice", generation="g1")
+        # The id is held by a run still in flight: the request coalesces onto it.
+        with patch("task_manager.Job") as arq_job:
+            arq_job.return_value.status = AsyncMock(return_value=JobStatus.in_progress)
+            job_id = await tm.enqueue_connector_sync("notion-personal", "alice", generation="g1")
         expected = connector_sync_job_id("notion-personal", "alice", "g1")
         assert job_id == expected
         assert expected.startswith("sync-notion-personal-")
