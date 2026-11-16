@@ -308,6 +308,9 @@ class TestSingleRowEpisode:
         qdrant.add("new", user="u1", data="x")
         graph.add_edge("E1", "User lives in Berlin", ["ep-old"])
         graph.add_edge("E2", "User works at Acme", ["ep-old"])  # still live
+        # distinct, realistic: both edges ~0.88-0.90 to the row (inside the margin)
+        svc._embed_map["User lives in Berlin"] = [0.90, 0.436, 0.0]
+        svc._embed_map["User works at Acme"] = [0.88, 0.0, 0.475]
         svc._memory.graph.add.side_effect = _graph_add(graph, episode_uuid="ep-new", invalidate=["E1"])
 
         _enrich(svc)
@@ -395,8 +398,15 @@ class TestSingleRowEpisode:
         _enrich(svc)
         assert not qdrant.meta("old").get("dream_tombstoned")
 
+    def test_both_edges_near_085_with_modest_margin_is_left_alone(self, env):
+        # dead 0.86 vs live 0.84: at the floor but margin 0.02 < 0.05
+        svc, qdrant = self._partial_setup(env, [0.86, 0.51, 0.0], [0.84, 0.0, 0.54])
+        _enrich(svc)
+        assert not qdrant.meta("old").get("dream_tombstoned")
+
     def test_dead_edge_clearly_above_floor_and_margin_supersedes(self, env):
-        svc, qdrant = self._partial_setup(env, [0.95, 0.31, 0.0], [0.5, 0.0, 0.87])
+        # dead 0.92 vs live 0.80 (realistic): above floor 0.85, margin 0.12
+        svc, qdrant = self._partial_setup(env, [0.92, 0.392, 0.0], [0.8, 0.0, 0.6])
         _enrich(svc)
         assert qdrant.meta("old")["dream_tombstoned"] is True
 
@@ -428,9 +438,13 @@ class TestSingleRowEpisode:
 
     def test_embeddings_are_cached_per_call(self, env):
         svc, qdrant = self._partial_setup(env, [0.95, 0.31, 0.0], [0.5, 0.0, 0.87])
+        svc._graphiti.driver.add_edge("E3", "Alice works at Acme.", ["ep-old"])  # same dead fact text
+        svc._memory.graph.add.side_effect = _graph_add(
+            svc._graphiti.driver, episode_uuid="ep-new", invalidate=["E1", "E3"])
         _enrich(svc)
         texts = [c.args[0] for c in svc._memory.embedding_model.embed.call_args_list]
-        assert len(texts) == len(set(texts))  # no fact embedded twice
+        # two dead edges x one row: each distinct fact embedded exactly once
+        assert sorted(texts) == ["Alice resides in Paris.", "Alice works at Acme."], texts
 
     def test_diagnostics_are_per_call_not_a_shared_singleton(self, env):
         svc, qdrant, graph = env

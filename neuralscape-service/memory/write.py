@@ -225,9 +225,12 @@ class WriteMixin:
             logger.warning(f"Graph-contradiction supersession failed (non-critical): {e}")
         finally:
             store = self.__dict__.setdefault("_supersession_diag", {})
-            store[key] = diag
-            while len(store) > 32:
-                store.pop(next(iter(store)), None)
+            try:
+                store[key] = diag
+                while len(store) > 32:
+                    store.pop(next(iter(store)), None)
+            except (RuntimeError, StopIteration):  # concurrent mutation: diagnostics only
+                pass
 
     def _attach_memory_id_to_graph_nodes(
         self,

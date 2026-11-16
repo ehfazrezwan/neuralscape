@@ -240,9 +240,9 @@ class Settings(BaseSettings):
     graph_supersession_margin: float = 0.05
     # Floor on cos(row, contradicted edge fact) when a single-fact row still has
     # live edges: the dead edge must clearly BE the row's claim, not merely beat
-    # incidental edges. Lower than the multi-row floor because one fact's edge
-    # paraphrases are looser than a conversation's per-row facts.
-    graph_supersession_partial_min_similarity: float = 0.7
+    # incidental edges. Same value as the multi-row floor; the e2e integration
+    # test prints the measured real-embedding cosines so it can be re-tuned.
+    graph_supersession_partial_min_similarity: float = 0.85
 
     # ── Graph-leg latency budget (flag, default OFF) ──────────────────
     # search() overlaps the Graphiti leg with the vector pools and joins it

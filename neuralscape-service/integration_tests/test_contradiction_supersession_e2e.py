@@ -139,3 +139,49 @@ def test_contradicting_fact_supersedes_old_row_and_reassertion_revives_it(svc):
                 svc._run_on_bridge(_purge(), timeout=30.0)
             except Exception:
                 pass
+
+
+COMPOUND = "Alice lives in Paris and works at Acme Corp."
+JOB_ENDED = "Alice left Acme Corp and no longer works there."
+
+
+def test_compound_row_whose_job_edge_dies_is_not_superseded(svc):
+    """One stored fact with two claims: the JOB edge is invalidated while the
+    residence edge stays live. The row still holds a true fact, so it must NOT
+    be tombstoned, decided on REAL embedding cosines (printed in the failure
+    message via the decision trace: dead_sim / best_live_sim / floor / margin).
+    If Graphiti does not invalidate the job edge the test fails and says so
+    instead of passing vacuously."""
+    user = f"it-supersede-{uuid.uuid4().hex[:10]}"
+    group = _build_group_id("private", user, None)
+    try:
+        row, _ = _write(svc, user, COMPOUND)
+        ender, _ = _write(svc, user, JOB_ENDED)
+
+        diag = getattr(svc, "_supersession_diag", {}).get(ender.id) or {}
+        decisions = [t for t in diag.get("trace", []) if t.get("stage") == "decide"]
+        edges = _edge_dump(svc, group)
+        assert decisions, (
+            "Graphiti did not invalidate any edge of the compound row (LLM judged the job "
+            "statement non-contradictory, or the probe missed it), so the partial-edge decision "
+            f"never ran. step error={diag.get('error')!r} trace={diag.get('trace')!r} edges={edges}"
+        )
+        assert all(d["supersede"] is False for d in decisions), (
+            "compound row was superseded although a true claim (residence) stays live; real "
+            f"embedding cosines decided it: {decisions!r} edges={edges}"
+        )
+        assert not _meta(svc, row.id).get("dream_tombstoned"), f"row tombstoned: {decisions!r}"
+        listed, _ = _live_ids(svc, user, "Where does Alice live and work?")
+        assert row.id in listed
+    finally:
+        try:
+            svc.delete_memories(user_id=user, include_shared=True)
+        finally:
+            async def _purge():
+                async with svc._graphiti.driver.session() as s:
+                    await s.run("MATCH (n {group_id:$g}) DETACH DELETE n", g=group)
+
+            try:
+                svc._run_on_bridge(_purge(), timeout=30.0)
+            except Exception:
+                pass
