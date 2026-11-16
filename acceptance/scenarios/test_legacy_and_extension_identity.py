@@ -22,7 +22,7 @@ import pytest
 from conftest import check_search_finds_marker
 from nsaccept import eventually, expect_check_fails, negative_control, proves
 from nsaccept.client import NSClient
-from nsaccept.helpers import graph_listing, list_rows, rows_with
+from nsaccept.helpers import graph_listing, list_rows, rows_with, write_raw
 from nsaccept.tokens import mint_local, mint_via_compose
 
 PREFIX = "/v1/extensions/conversation-compiler"
@@ -129,10 +129,14 @@ def test_legacy_post_memories_stores_what_the_caller_can_recall(c, legacy):
 
 @proves("delete.legacy-passthrough")
 @negative_control
-def test_recall_and_gone_checks_fail_where_they_should(a, c, legacy):
-    assert not legacy["error"], legacy["error"]
-    expect_check_fails(check_recalls, a, legacy["marker"])  # A cannot see the third identity's memory
-    expect_check_fails(check_gone, c, legacy["marker"])  # and the "deleted" check cannot pass before the delete
+def test_recall_and_gone_checks_fail_where_they_should(ctx, a, c):
+    """Order-independent: uses its own fresh write by the third identity, not the legacy fixture."""
+    marker = f"zq-{ctx.run_id}-ctrlc"
+    w = write_raw(c, f"{marker} The third identity's control note is pinned beside the tide chart.", "preference", marker=marker, scope="global", visibility="private").require()
+    assert w.memory_id
+    eventually(lambda: check_recalls(c, marker), timeout=90, what="control write recalled")
+    expect_check_fails(check_recalls, a, marker)  # A cannot see the third identity's memory
+    expect_check_fails(check_gone, c, marker)  # and the "deleted" check cannot pass while it exists
 
 
 @proves("delete.legacy-passthrough")

@@ -38,12 +38,18 @@ def pytest_addoption(parser):
     )
 
 
+def _expected_red(item) -> str | None:
+    marker = item.get_closest_marker("ns_expected_red")
+    return str(marker.args[0]) if marker and marker.args else None
+
+
 def pytest_configure(config):
     for name, doc in (
         ("ns_proves", "atlas node ids this scenario is evidence for"),
         ("ns_profiles", "profiles this scenario runs under (default: default)"),
         ("ns_needs", "capabilities required; scenario skips when absent"),
         ("ns_negative_control", "scenario is a negative control"),
+        ("ns_expected_red", "scenario is known to fail until the referenced PR lands"),
     ):
         config.addinivalue_line("markers", f"{name}: {doc}")
     config._ns_state = {}
@@ -100,6 +106,7 @@ def pytest_collection_modifyitems(config, items):
                 "proves": _marker_args(it, "ns_proves"),
                 "profiles": list(item_profiles(it)),
                 "negative_control": it.get_closest_marker("ns_negative_control") is not None,
+                "expected_red": _expected_red(it),
                 "needs": _marker_args(it, "ns_needs"),
             }
             for it in items
@@ -213,6 +220,7 @@ def pytest_runtest_makereport(item, call):
             "seconds": 0.0,
             "detail": "",
             "negative_control": item.get_closest_marker("ns_negative_control") is not None,
+            "expected_red": _expected_red(item),
         },
     )
     state["seconds"] += rep.duration

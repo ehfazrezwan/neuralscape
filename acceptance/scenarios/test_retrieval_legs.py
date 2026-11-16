@@ -31,23 +31,19 @@ from nsaccept.helpers import graph_listing, write_raw
 GRAPH_WAIT = 240
 EPISODE_ROW_PREFIX = "[verbatim session excerpt]"
 
-TARGET_WORDS = ("Alpha", "Bravo", "Charlie", "Delta")
+TARGET_WORDS = ("Alpha", "Bravo", "Charlie")
+NEAR_MISSES_PER_TOKEN = 2
+RARE_LIMIT = 2  # smaller than a token's family (target + near-misses), so the dense leg alone cannot hold it
 TARGET_TEXTS = (
     "{tok} is written on the third tide gauge of the eastern breakwater.",
     "{tok} was scratched into the old ferry ticket booth.",
     "{tok} labels the brass key in the lantern cabinet.",
-    "{tok} is the nickname the harbour cat answers to.",
 )
-DECOY_TEXTS = (
-    "The orchard gate is painted green and squeaks in winter.",
-    "Grandmother's recipe needs two cups of oat flour and a pinch of salt.",
-    "The choir rehearses on Thursdays in the old chapel.",
-    "A heron nests near the third bridge every spring.",
-    "The market opens at dawn and sells smoked trout.",
-    "A narrow lane runs behind the bakery to the clock tower.",
-    "The library lends umbrellas when the weather turns.",
-    "Winter storms close the coastal road for a day or two.",
-)
+
+
+def near_misses(token: str) -> list[str]:
+    """Spellings one character away from ``token`` that are different whole tokens (so BM25 cannot match them)."""
+    return [token[:-1] + c for c in "oq"[:NEAR_MISSES_PER_TOKEN]]
 
 
 # ── helpers ──────────────────────────────────────────────────────
@@ -86,12 +82,23 @@ def vector_rows(results: list[dict]) -> list[dict]:
 # ── the real checks ──────────────────────────────────────────────
 
 
-def check_rare_token_recalled(client: NSClient, token: str, project: str, limit: int = 4) -> None:
-    """The memory holding ``token`` is among the top ``limit`` hits for the bare token."""
-    results = project_search(client, token, project, limit)
-    assert any(token in r.get("memory", "") for r in results), (
-        f"{token} not in the top {limit}: {[r.get('memory', '')[:36] for r in results]}"
-    )
+def check_rare_token_recalled(client: NSClient, token: str, project: str, limit: int = RARE_LIMIT, query: str | None = None) -> None:
+    """The memory holding exactly ``token`` is among the top ``limit`` hits for the bare token, and no
+    near-miss spelling outranks it. The near-misses embed almost identically, so only the keyword leg
+    can tell the exact token from them."""
+    results = project_search(client, query or token, project, limit)
+    texts = [r.get("memory", "") for r in results]
+    hit = [i for i, t in enumerate(texts) if token in t]
+    assert hit, f"{token} not in the top {limit}: {[t[:36] for t in texts]}"
+    misses = near_misses(token)
+    above = [i for i, t in enumerate(texts) if any(m in t for m in misses) and i < hit[0]]
+    assert len(above) <= 1, f"{len(above)} near-miss rows outrank {token}: {[t[:36] for t in texts]}"  # one tie with dense #1 is allowed
+
+
+def check_all_rare_recalled(client: NSClient, tokens: list[str], project: str, spell=lambda t: t) -> None:
+    """Every token's memory is returned for the query ``spell(token)``."""
+    for token in tokens:
+        check_rare_token_recalled(client, token, project, query=spell(token))
 
 
 def check_episode_row(client: NSClient, query: str, project: str, marker: str) -> list[dict]:
@@ -118,6 +125,8 @@ def check_unscored_rows_rank_last(results: list[dict], memory_id: str) -> None:
     assert unscored, "precondition: no unscored (episode) row in the results"
     assert len(scored) >= 2, f"precondition: fewer than two scored rows: {scores}"
     assert max(scored) < min(unscored), f"an unscored row outranks a scored one: scores in rank order {scores}"
+    texts = [" ".join((r.get("memory") or "").lower().split()) for r in results]
+    assert len(set(texts)) == len(texts), "twin rows (the same fact from the vector and graph legs) were not collapsed"
 
 
 def score_of(results: list[dict], memory_id: str) -> float:
@@ -142,11 +151,14 @@ def check_ask_used_episodes(body: dict) -> None:
 
 @pytest.fixture(scope="module")
 def rare(ctx, a, graph_seed) -> dict:
-    """Four memories each found only by one rare token, among eight unrelated decoys, in one project."""
+    """Three memories each found only by one rare token, each with two near-miss spellings written next to it."""
     project = f"{ctx.project_id}-rare"
     tokens = [f"Zx{ctx.run_id.capitalize()}{w}" for w in TARGET_WORDS]
     out: dict = {"project": project, "tokens": tokens, "error": ""}
-    texts = [t.format(tok=tok) for t, tok in zip(TARGET_TEXTS, tokens)] + list(DECOY_TEXTS)
+    texts = []
+    for template, tok in zip(TARGET_TEXTS, tokens):
+        texts.append(template.format(tok=tok))
+        texts += [template.format(tok=m) for m in near_misses(tok)]
     writes = [
         write_raw(a, text, "tech_stack", marker=text[:24], scope="project", project_id=project, visibility="private")
         for text in texts
@@ -195,12 +207,12 @@ def reinforce(ctx, a) -> dict:
 
 
 @proves("read.rrf-pool-fusion", "read.bm25-sparse-leg", "vec.bm25-sparse")
-def test_a_bare_rare_token_recalls_its_memory_although_decoys_fill_the_dense_leg(a, rare):
-    """Eight unrelated memories and four rare-token ones share a project; each query is one token and
-    the recall limit (4) is smaller than the project, so the dense leg alone returns about a third of
-    them at random. Every rare-token memory must come back: the keyword leg finds it and the pool's
-    rank fusion keeps it through the limit cut (read-01). Chance of passing without the keyword
-    leg: about (4/12)^4, i.e. 1 in 80."""
+def test_a_bare_rare_token_recalls_its_exact_memory_among_near_miss_spellings(a, rare):
+    """Each rare token is stored next to two spellings one character away (other whole tokens, near-identical
+    embeddings), and the recall limit (2) is smaller than that family, so the dense leg cannot tell the exact
+    token from its near-misses. Each exact-token memory must still come back and not sit below more than one
+    near-miss: that takes the keyword leg and the pool's rank fusion (read-01). Chance of passing without the
+    keyword leg: about (2/9)^3, i.e. 1 in 90."""
     assert not rare["error"], rare["error"]
     for token in rare["tokens"]:
         eventually(
@@ -211,13 +223,13 @@ def test_a_bare_rare_token_recalls_its_memory_although_decoys_fill_the_dense_leg
 
 @proves("read.rrf-pool-fusion", "read.bm25-sparse-leg", "vec.bm25-sparse")
 @negative_control
-def test_rare_token_check_fails_for_user_b_and_for_a_token_nobody_wrote(ctx, a, b, rare):
+def test_rare_token_check_fails_for_a_spelling_nobody_wrote_and_for_user_b(ctx, a, b, rare):
+    """Breaks the leg's reason: querying near-miss spellings that exist in no memory as a whole token gives the
+    keyword leg nothing to match, so the exact-token memories are no longer returned (all three at once)."""
     assert not rare["error"], rare["error"]
-    eventually(
-        lambda: check_rare_token_recalled(a, rare["tokens"][0], rare["project"]), timeout=90, what="control token recalled",
-    )
+    eventually(lambda: check_all_rare_recalled(a, rare["tokens"], rare["project"]), timeout=90, what="control tokens recalled")
+    expect_check_fails(check_all_rare_recalled, a, rare["tokens"], rare["project"], lambda t: t[:-1] + "z")
     expect_check_fails(check_rare_token_recalled, b, rare["tokens"][0], rare["project"])
-    expect_check_fails(check_rare_token_recalled, a, f"Zx{ctx.run_id.capitalize()}NeverWritten", rare["project"])
 
 
 @proves("vec.bm25-sparse")
@@ -226,7 +238,7 @@ def test_health_reports_the_bm25_slot_and_a_loaded_encoder(anon, a, rare):
     encoder is loaded: a pre-v3 collection or a missing encoder would silently turn the keyword leg off."""
     assert not rare["error"], rare["error"]
     eventually(  # a recall in the API process makes it load the encoder
-        lambda: check_rare_token_recalled(a, rare["tokens"][0], rare["project"], limit=12), timeout=90, what="a recall",
+        lambda: check_rare_token_recalled(a, rare["tokens"][0], rare["project"]), timeout=90, what="a recall",
     )
     body = anon.get("/health").json()
     caps = body.get("vector_store") or {}

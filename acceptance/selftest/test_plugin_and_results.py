@@ -12,7 +12,7 @@ ACCEPTANCE = Path(__file__).resolve().parents[1]
 
 SCENARIOS = '''
 import pytest
-from nsaccept import expect_check_fails, needs, negative_control, profiles, proves
+from nsaccept import expect_check_fails, expected_red, needs, negative_control, profiles, proves
 
 
 @proves("x.one", "x.two")
@@ -41,6 +41,11 @@ def test_fails():
 @proves("x.err")
 def test_errors():
     raise ConnectionError("refused")
+
+@proves("x.red")
+@expected_red("#999")
+def test_expected_red_still_fails():
+    assert False, "known red"
 
 @proves("x.neg")
 @negative_control
@@ -77,6 +82,7 @@ def test_default_profile_selection_and_outcomes(scen):
     assert set(s) == {
         "test_scen::test_default_pass", "test_scen::test_both", "test_scen::test_needs_missing",
         "test_scen::test_fails", "test_scen::test_errors", "test_scen::test_negative_control",
+        "test_scen::test_expected_red_still_fails",
     }
     assert s["test_scen::test_default_pass"]["result"] == "pass"
     assert s["test_scen::test_default_pass"]["proves"] == ["x.one", "x.two"]
@@ -87,6 +93,9 @@ def test_default_profile_selection_and_outcomes(scen):
     assert s["test_scen::test_negative_control"]["negative_control"] is True
     assert s["test_scen::test_negative_control"]["result"] == "pass"
     assert s["test_scen::test_default_pass"]["negative_control"] is False
+    red = s["test_scen::test_expected_red_still_fails"]
+    assert red["result"] == "fail" and red["expected_red"] == "#999", red  # reported as a failure, only labelled
+    assert s["test_scen::test_default_pass"]["expected_red"] is None
     assert r.ret == 1
 
 
@@ -102,7 +111,7 @@ def test_top_level_schema_and_commit(scen):
     assert doc["commit"] == "abcdef0123456789abcdef"
     assert doc["base_url"] == "http://127.0.0.1:9"
     assert doc["started"].endswith("Z") and doc["finished"].endswith("Z")
-    assert set(doc["scenarios"][0]) == {"id", "proves", "result", "seconds", "detail", "negative_control"}
+    assert set(doc["scenarios"][0]) == {"id", "proves", "result", "seconds", "detail", "negative_control", "expected_red"}
 
 
 def test_needs_is_satisfied_by_env(scen, monkeypatch):
