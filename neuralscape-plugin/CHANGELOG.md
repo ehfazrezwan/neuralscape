@@ -4,6 +4,14 @@ All notable changes to the `neuralscape` Claude plugin are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 the project adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.9.10] - 2026-11-16
+
+### Fixed
+- PostToolUse capture rendered every structured `tool_response` as raw JSON. It now renders by shape: an array of text blocks (MCP results) is stored as its joined text, with non-text blocks as a `[type]` placeholder; an empty result (`{}`, `[]`, empty string, null) is stored as empty output; a Bash-style result that was interrupted keeps its stdout/stderr text plus an explicit `[interrupted]` marker. Any other object, including a non-interrupted Bash result, is still stored as JSON. Redaction (fail-closed) runs on the rendered text before truncation.
+
+### Added
+- `tests/native-fixtures/`: sanitized synthetic native-client events and transcripts with reviewer-owned expected results, pinned by a SHA-256 manifest, parsed by the plugin's own code (`tests/native-fixtures.test.ts`). Tests only; no behaviour change beyond the fix above.
+
 ## [2.9.9] - 2026-11-16
 
 ### Added
