@@ -24,7 +24,14 @@ For an explicitly **broad scan** (survey-style, `limit` > 10), `index_only: true
 2. **Resolve `user_id`** — see the Identity block below.
 3. **Detect project scope** — an active project selected this session → else (Claude Code) the plugin's project-id resolution, in order (`PROJECT_ID` override → nearest `.neuralscape-project` marker walking up from cwd → git-repo-root basename → cwd basename) → else omit. If the user says "across all projects" or "globally", omit `project_id`.
 4. **Primary path — MCP (both platforms):** `recall_memories(query=<user's question>, user_id=<resolved>, project_id=<id or omit>, limit=10)`. For broad scans, the two-step index-first flow: `recall_memories(..., index_only=true, limit=20)` → filter the index rows → `get_memories(ids=[...])` for the payloads worth reading in full.
-5. **REST fallback (Claude Code only, and only when MCP is truly unavailable):** if — and only if — the `recall_memories` MCP tool is not present in the session AND a service URL (`CLAUDE_PLUGIN_OPTION_URL` / `NEURALSCAPE_URL`) plus `curl` are available, fall back to `POST <URL>/v1/search` with body `{"query", "user_id", "project_id", "limit": 10}` and `Authorization: Bearer <API_KEY>` if set (8s timeout). The REST API mirrors the MCP surface, so results render identically. Never take this path while the MCP tool exists; never require env; never error in Cowork — if neither path is available, say the memory store isn't reachable and stop.
+5. **REST fallback (Claude Code only, and only when MCP is truly unavailable):** if — and only if — the `recall_memories` MCP tool is not present in the session AND the plugin runtime is available (`${CLAUDE_PLUGIN_ROOT}` set, `node` on PATH), call the plugin's helper, which resolves the service URL exactly like the hooks (explicit `URL` option → the URL baked into the plugin's `.mcp.json` → `http://localhost:8199`) and sends the configured `API_KEY` as a Bearer token — no URL variable is needed and you must not hand-write curl:
+
+   ```bash
+   echo '{"query": "<query>", "user_id": "<resolved>", "project_id": "<id or omit>", "limit": 10}' \
+     | node "${CLAUDE_PLUGIN_ROOT}/scripts/sync.js" request POST /v1/search
+   ```
+
+   It prints the JSON answer (8s timeout; exit `1` = the service refused or is unreachable). The REST API mirrors the MCP surface, so results render identically. Never take this path while the MCP tool exists; never require env; never error in Cowork — if neither path is available, say the memory store isn't reachable and stop.
 6. **Render results** as a compact markdown list, ordered by score:
 
    ```

@@ -1,6 +1,6 @@
 # Neuralscape Plugin
 
-Persistent agentic memory for **Claude Code** and **Claude Cowork**, backed by your own Neuralscape service (FastAPI + mem0 + Graphiti). In Claude Code, plugin hooks auto-capture your conversations and recall relevant context on every session start; in Claude Cowork (which doesn't run plugin hooks), the cross-platform skills drive the same recall/capture loop on demand through the MCP connector. Exposes the 8 Neuralscape MCP tools.
+Persistent agentic memory for **Claude Code** and **Claude Cowork**, backed by your own Neuralscape service (FastAPI + mem0 + Graphiti). In Claude Code, plugin hooks auto-capture your conversations and recall relevant context on every session start; in Claude Cowork (which doesn't run plugin hooks), the cross-platform skills drive the same recall/capture loop on demand through the MCP connector. Exposes the Neuralscape MCP toolkit: memory read/write, projects, processes, graph search, checkpoints, ingest and code-graph tools (26 core tools, plus 7 code-graph tools when the server has the optional `code-graph` extra, as of 2.9.x; the live set is the server's `tools/list`).
 
 - **What you get:** **progressive-disclosure memory injection** on `SessionStart` (a budget-bounded, day-grouped index of your memories — the map, not the payloads — plus your identity card and a "Previously…" block from the last session), a **File Read Gate** on `PreToolUse(Read)` (large files that already have memories get a ranked per-file memory timeline injected *alongside* the read — the read always proceeds), conversation flush + compile on `Stop`, a **structured session summary** stored via one `checkpoint` call on `SessionEnd`, **incremental tool-observation capture on `PostToolUse` + threshold-driven compile on `UserPromptSubmit`** (no extra API cost — runs on your subscription), cross-platform MCP-driven skills (`recall`, `remember`, `save-session`, `project`, `search`, `ns-status`, `ns-config`) plus Claude-Code capture skills (`sync`, `capture`), and the Neuralscape MCP toolkit auto-wired via `.mcp.json`.
 - **Where it stores:** in your own Neuralscape deployment. The plugin never sends data anywhere else.
@@ -118,7 +118,7 @@ dynamic client registration and PKCE are automatic.
 ├── .mcp.json                      bundled OAuth MCP connector at the baked <URL>/mcp/
 ├── hooks/hooks.json               seven events: SessionStart, PreToolUse (Read), PostToolUse, UserPromptSubmit, PreCompact, Stop, SessionEnd
 ├── skills/{recall,remember,save-session,project,search,ns-status,ns-config,sync,capture,compile-observations,ingest,process}/SKILL.md
-├── scripts/                       built hook bundles (eight: one per hook, plus conversation-turn for OpenClaw/generic clients)
+├── scripts/                       built bundles (nine: one per hook, conversation-turn for OpenClaw/generic clients, and `sync.js`, the skills' REST helper)
 └── LICENSE / CHANGELOG.md
 ```
 
@@ -196,9 +196,9 @@ Everything the plugin does against the service goes through the MCP tools above,
 | `POST /v1/extensions/conversation-compiler/flush` | Stop, SessionEnd (a final turn the Stop hooks left pending), PreCompact, framework adapter `message:sent` | Deliver a conversation turn |
 | `POST /v1/extensions/conversation-compiler/compile` | Stop (at most once per compile interval), SessionEnd (what is left), framework adapter `session:end` | Compile the day's turns |
 
-### From the skills (REST, via curl)
+### From the skills (REST, via the plugin's helper)
 
-Only where no MCP equivalent exists (or as the documented fallback), Claude Code only. `ns-status` also probes `GET /health`.
+Only where no MCP equivalent exists (or as the documented fallback), Claude Code only. `ns-status` also probes `GET /health`. The skills do not hand-write curl: they call the bundled helper `scripts/sync.js` (`print-config`, `flush`, `request`, `upload`), which resolves the URL like the hooks (explicit `URL` option, then the URL baked into `.mcp.json`, then `http://localhost:8199`), sends the `API_KEY` as a Bearer token, and redacts `<private>` text fail-closed for conversation turns.
 
 | Call | Skill |
 |---|---|

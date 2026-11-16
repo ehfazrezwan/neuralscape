@@ -9,6 +9,7 @@ const entryPoints = [
   "src/hooks/session-summary.ts",
   "src/hooks/post-tool-use.ts",
   "src/hooks/user-prompt-submit.ts",
+  "src/hooks/sync.ts",
 ];
 
 const isWatch = process.argv.includes("--watch");
