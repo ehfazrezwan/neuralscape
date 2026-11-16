@@ -17,7 +17,11 @@ class GoogleGenAIEmbedding(EmbeddingBase):
 
         api_key = self.config.api_key or os.getenv("GOOGLE_API_KEY")
 
-        self.client = genai.Client(api_key=api_key)
+        # NEURALSCAPE PATCH: bound every request (HttpOptions.timeout is in milliseconds) so a
+        # stalled endpoint cannot block the caller indefinitely. None keeps the SDK default.
+        timeout_s = getattr(self.config, "request_timeout_s", None)
+        http_options = types.HttpOptions(timeout=max(1, int(timeout_s * 1000))) if timeout_s else None
+        self.client = genai.Client(api_key=api_key, http_options=http_options)
 
     def embed(self, text, memory_action: Optional[Literal["add", "search", "update"]] = None):
         """

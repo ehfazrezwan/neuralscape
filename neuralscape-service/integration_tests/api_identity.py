@@ -21,7 +21,7 @@ import json
 import os
 import sys
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Mapping
 
@@ -34,15 +34,32 @@ TOKEN_TTL_SECONDS = 3600
 
 @dataclass(frozen=True)
 class ApiIdentity:
+    """A user id plus a way to get a bearer for it.
+
+    A token minted from ``NEURALSCAPE_USER_TOKEN_SECRET`` lives ``TOKEN_TTL_SECONDS``
+    and a whole run can last longer, so it is minted again each time it is asked for
+    (``fresh_token()`` / ``headers``), always for the same user id so request bodies
+    keep matching it.  ``token`` is the one minted at resolution (the ``NS_API_TOKEN``
+    override is fixed: it cannot be minted again).
+    """
+
     user_id: str
     token: str
+    secret: str | None = field(default=None, repr=False, compare=False)
 
     def __repr__(self) -> str:  # never show the bearer
         return f"ApiIdentity(user_id={self.user_id!r})"
 
+    def fresh_token(self) -> str:
+        if not self.secret:
+            return self.token
+        import tokens
+
+        return tokens.issue_user_token(self.user_id, self.secret, TOKEN_TTL_SECONDS)
+
     @property
     def headers(self) -> dict:
-        return {"Authorization": f"Bearer {self.token}"}
+        return {"Authorization": f"Bearer {self.fresh_token()}"}
 
 
 def _user_from_token(token: str) -> str | None:
@@ -69,5 +86,9 @@ def resolve_identity(env: Mapping[str, str] | None = None) -> ApiIdentity | None
         import tokens
 
         user_id = f"nsit-api-{uuid.uuid4().hex[:12]}"
-        return ApiIdentity(user_id=user_id, token=tokens.issue_user_token(user_id, secret, TOKEN_TTL_SECONDS))
+        return ApiIdentity(
+            user_id=user_id,
+            token=tokens.issue_user_token(user_id, secret, TOKEN_TTL_SECONDS),
+            secret=secret,
+        )
     return None
