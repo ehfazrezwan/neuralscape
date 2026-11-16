@@ -224,7 +224,7 @@ class ProvenanceMixin:
             resolved_name = found.get("name")
             survivors: list = []
             if support_aware and exclude_ids is not None:
-                survivors = self._episode_survivors(resolved_uuid, episode_name, exclude_ids) or []
+                survivors = self._episode_survivors(resolved_uuid, resolved_name or episode_name, exclude_ids) or []
             if support_aware:
                 counts = self._support_aware_episode_removal(group_id, [resolved_uuid])
                 if counts is not None:
