@@ -1,10 +1,12 @@
 # mem0 Track A Control Harness
 
-**The ONE true controlled head-to-head**: vendored mem0-OSS as the memory layer under NSBench with identical backbone/judge/embedder as Neuralscape Track A.
+A harness that runs the vendored mem0 library as the memory layer under the NSBench accuracy battery, with the backbone, judge and embedder set to the same models the Track A runs use.
+
+**Status:** no result from this harness is committed to the repository. The runs it was built for are paused (see the benchmark README). Treat everything below as a description of what the code does, not of any outcome.
 
 ## What This Is
 
-A self-contained harness that runs mem0 (the in-repo `mem0/` subtree) as the memory layer under the NSBench accuracy battery for an honest apples-to-apples comparison. The **only variable** is the memory layer (NS vs mem0); everything else is locked:
+A self-contained harness that runs mem0 (the in-repo `mem0/` subtree) as the memory layer under the NSBench accuracy battery. It is meant to vary the memory layer (NS vs mem0) while holding the settings below constant; the caveats at the end list where the two sides still differ:
 
 - **Dataset**: Same (LoCoMo, BEAM, ConvoMem)
 - **Backbone**: `gemini-3.1-flash-lite`
@@ -12,7 +14,7 @@ A self-contained harness that runs mem0 (the in-repo `mem0/` subtree) as the mem
 - **Judge**: `gemini-3.1-flash-lite` (temp 0)
 - **Vector store**: Qdrant local/on-disk (isolated)
 
-This is **Track A control** — the baseline for NS's own Track A scores.
+It is the mem0 control for Track A.
 
 ## Configuration
 
@@ -32,9 +34,8 @@ ANSWER_MODEL    = BACKBONE_MODEL            # answer generation == backbone
 
 The vendored mem0 `GeminiLLM` passes `config.model` straight through to the
 `google-genai` client (see `mem0/mem0/llms/gemini.py`), so the **same**
-`gemini-3.1-flash-lite` backbone NS uses works verbatim — there is no
-model-string translation and no downgrade. This is what makes TB.3 a genuine
-identical-backbone control.
+`gemini-3.1-flash-lite` model id can be used verbatim, with no model-string
+translation. That lets both sides name the same backbone.
 
 ### mem0 Memory Configuration
 
@@ -79,7 +80,7 @@ mem0-the-library has **no `/ask` endpoint** — it only provides `.add()` and `.
 2. **Answer prompt**: Mirrors NSBench's `/ask` logic (retrieved memories + question → "provide a concise factual answer")
 3. **Generation**: Direct Gemini call with the same `gemini-3.1-flash-lite` backbone (temp 0)
 
-**Faithfulness**: The answer prompt is designed to mirror NSBench's reasoning approach, but it's **not byte-identical** — retrieval→context assembly parity is approximate. This is the honest caveat for any mem0-vs-NS head-to-head.
+**Faithfulness**: The answer prompt is designed to mirror NSBench's reasoning approach, but it's **not byte-identical** — retrieval→context assembly parity is approximate. Keep this in mind for any mem0-vs-NS comparison.
 
 ## Usage
 
@@ -159,7 +160,7 @@ Retrieval recall at k (session-level attribution, lexical match over distilled m
 
 ## Orchestrator Integration
 
-The orchestrator runs this harness live against the same models to produce the official mem0 baseline scores. Requirements:
+A run needs the following (no run is currently scheduled):
 
 1. **mem0 installed editable**: `uv pip install -e mem0/` (a bare `PYTHONPATH` does NOT work — `mem0/__init__.py` needs the `mem0ai` package metadata) plus `uv pip install google-genai`.
 2. **Isolated vector store**: Pass `--vector-store-path` to avoid colliding with any production Qdrant.
@@ -176,11 +177,14 @@ cd neuralscape-bench
 uv run pytest trackb/mem0_tracka/tests/ -v
 ```
 
+In CI (`bench-ci`), these tests run from the installed wheel via `--pyargs trackb.mem0_tracka.tests`, with no network, as part of `scripts/ci_run_suite.sh`. The skip gate applies to them like every other bench suite. The package is shipped in the wheel (`trackb` is in `pyproject.toml`).
+
 Coverage:
 - Config dict generation (`test_config.py`)
 - Conversation→messages mapping (`test_ingest.py`)
 - Answer prompt rendering + retrieval→generation (`test_answer.py`)
 - Report aggregation + markdown rendering (`test_report.py`)
+- CLI/run wiring (`test_run.py`)
 - Full pipeline integration with mocks (`test_integration.py`)
 
 ## Files
@@ -204,6 +208,7 @@ trackb/mem0_tracka/
 │   ├── test_ingest.py
 │   ├── test_answer.py
 │   ├── test_report.py
+│   ├── test_run.py
 │   └── test_integration.py
 └── README.md            # This file
 ```
@@ -214,8 +219,8 @@ No edits to shared files (`neuralscape-bench/pyproject.toml`, `neuralscape_bench
 
 1. **Answer prompt parity**: Designed to mirror NSBench `/ask` logic, but not byte-identical. Retrieval→context parity is approximate.
 2. **mem0 version**: Vendored subtree at v2.0.2 (the NS fork restoring the OSS graph layer).
-3. **Locked models**: Both sides use `gemini-3.1-flash-lite` backbone + `gemini-embedding-001` embedder + `gemini-3.1-flash-lite` judge (temp 0). This is the control.
-4. **Comparison scope**: This is mem0-the-library under OUR harness, not mem0's own eval harness (which uses different answer models/judges). The head-to-head is: NS memory layer vs mem0 memory layer, same everything else.
+3. **Configured models**: this harness configures `gemini-3.1-flash-lite` as backbone, `gemini-embedding-001` as embedder and `gemini-3.1-flash-lite` as judge (temp 0). That the Neuralscape side uses the same models depends on how that side is configured; check it per run.
+4. **Comparison scope**: This is mem0-the-library under OUR harness, not mem0's own eval harness (which uses different answer models/judges). It says nothing about how mem0 performs under its own published method.
 
 ## License
 

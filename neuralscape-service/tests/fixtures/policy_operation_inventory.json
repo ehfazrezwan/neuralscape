@@ -1,0 +1,5791 @@
+{
+  "auth_profile": {
+    "disabled_if_unconfigured": true,
+    "legacy_key_fallback": true,
+    "middleware_registered": true,
+    "public_paths": [
+      "/api/v1/health",
+      "/console",
+      "/health",
+      "/health/live",
+      "/v1/credentials/refresh"
+    ],
+    "public_prefixes": [
+      "/.well-known/",
+      "/oauth/",
+      "/console/"
+    ],
+    "user_id_assignments_in_dispatch": 1
+  },
+  "operations": [
+    {
+      "action": "delete",
+      "auth": {
+        "authz_gate": [],
+        "identity": "payload_user_id",
+        "middleware": "none_queue_trusted"
+      },
+      "exempt_reason": null,
+      "extra_actions": [],
+      "function": "dedup_all_memories",
+      "id": "arq_cron:GraphWorkerSettings.dedup_all_memories",
+      "method": "",
+      "note": "system worker principal with explicit retention/derivation statements",
+      "path": "GraphWorkerSettings.dedup_all_memories",
+      "privileged": false,
+      "queue": "GraphWorkerSettings",
+      "required_payload": [
+        "worker_subject_id",
+        "policy_epoch"
+      ],
+      "resolver": {
+        "kind": "system_worker",
+        "target": "system worker statements"
+      },
+      "status": "mapped",
+      "surface": "arq_cron"
+    },
+    {
+      "action": "background_derive",
+      "auth": {
+        "authz_gate": [],
+        "identity": "none",
+        "middleware": "none_queue_trusted"
+      },
+      "exempt_reason": null,
+      "extra_actions": [],
+      "function": "dream_sweep_cron",
+      "id": "arq_cron:GraphWorkerSettings.dream_sweep_cron",
+      "method": "",
+      "note": "system worker principal with explicit retention/derivation statements",
+      "path": "GraphWorkerSettings.dream_sweep_cron",
+      "privileged": false,
+      "queue": "GraphWorkerSettings",
+      "required_payload": [
+        "worker_subject_id",
+        "policy_epoch"
+      ],
+      "resolver": {
+        "kind": "system_worker",
+        "target": "system worker statements"
+      },
+      "status": "mapped",
+      "surface": "arq_cron"
+    },
+    {
+      "action": "background_derive",
+      "auth": {
+        "authz_gate": [],
+        "identity": "none",
+        "middleware": "none_queue_trusted"
+      },
+      "exempt_reason": null,
+      "extra_actions": [],
+      "function": "synthesize_strategy_playbooks_cron",
+      "id": "arq_cron:GraphWorkerSettings.synthesize_strategy_playbooks_cron",
+      "method": "",
+      "note": "system worker principal with explicit retention/derivation statements",
+      "path": "GraphWorkerSettings.synthesize_strategy_playbooks_cron",
+      "privileged": false,
+      "queue": "GraphWorkerSettings",
+      "required_payload": [
+        "worker_subject_id",
+        "policy_epoch"
+      ],
+      "resolver": {
+        "kind": "system_worker",
+        "target": "system worker statements"
+      },
+      "status": "mapped",
+      "surface": "arq_cron"
+    },
+    {
+      "action": "background_derive",
+      "auth": {
+        "authz_gate": [],
+        "identity": "payload_user_id",
+        "middleware": "none_queue_trusted"
+      },
+      "exempt_reason": null,
+      "extra_actions": [],
+      "function": "connector_sync_cron",
+      "id": "arq_cron:IngestWorkerSettings.connector_sync_cron",
+      "method": "",
+      "note": "system worker principal with explicit retention/derivation statements",
+      "path": "IngestWorkerSettings.connector_sync_cron",
+      "privileged": false,
+      "queue": "IngestWorkerSettings",
+      "required_payload": [
+        "worker_subject_id",
+        "policy_epoch"
+      ],
+      "resolver": {
+        "kind": "system_worker",
+        "target": "system worker statements"
+      },
+      "status": "mapped",
+      "surface": "arq_cron"
+    },
+    {
+      "action": "background_derive",
+      "auth": {
+        "authz_gate": [],
+        "identity": "none",
+        "middleware": "none_queue_trusted"
+      },
+      "exempt_reason": null,
+      "extra_actions": [],
+      "function": "ledger_poll_cron",
+      "id": "arq_cron:LedgerWorkerSettings.ledger_poll_cron",
+      "method": "",
+      "note": "system worker principal with explicit retention/derivation statements",
+      "path": "LedgerWorkerSettings.ledger_poll_cron",
+      "privileged": false,
+      "queue": "LedgerWorkerSettings",
+      "required_payload": [
+        "worker_subject_id",
+        "policy_epoch"
+      ],
+      "resolver": {
+        "kind": "system_worker",
+        "target": "system worker statements"
+      },
+      "status": "mapped",
+      "surface": "arq_cron"
+    },
+    {
+      "action": "delete",
+      "auth": {
+        "authz_gate": [],
+        "identity": "none",
+        "middleware": "none_queue_trusted"
+      },
+      "exempt_reason": null,
+      "extra_actions": [],
+      "function": "ledger_retention_cron",
+      "id": "arq_cron:LedgerWorkerSettings.ledger_retention_cron",
+      "method": "",
+      "note": "system worker principal with explicit retention/derivation statements; prunes ledger records past their retention window, never tombstones or audit unless configured",
+      "path": "LedgerWorkerSettings.ledger_retention_cron",
+      "privileged": false,
+      "queue": "LedgerWorkerSettings",
+      "required_payload": [
+        "worker_subject_id",
+        "policy_epoch"
+      ],
+      "resolver": {
+        "kind": "system_worker",
+        "target": "system worker statements"
+      },
+      "status": "mapped",
+      "surface": "arq_cron"
+    },
+    {
+      "action": "background_derive",
+      "auth": {
+        "authz_gate": [],
+        "identity": "payload_user_id+default_user_fallback",
+        "middleware": "none_queue_trusted"
+      },
+      "exempt_reason": null,
+      "extra_actions": [],
+      "function": "auto_compile_check",
+      "id": "arq_cron:WorkerSettings.auto_compile_check",
+      "method": "",
+      "note": "system worker principal with explicit retention/derivation statements; acts for the default user only today (settings.default_user_id)",
+      "path": "WorkerSettings.auto_compile_check",
+      "privileged": false,
+      "queue": "WorkerSettings",
+      "required_payload": [
+        "worker_subject_id",
+        "policy_epoch"
+      ],
+      "resolver": {
+        "kind": "system_worker",
+        "target": "system worker statements"
+      },
+      "status": "mapped",
+      "surface": "arq_cron"
+    },
+    {
+      "action": "delete",
+      "auth": {
+        "authz_gate": [],
+        "identity": "none",
+        "middleware": "none_queue_trusted"
+      },
+      "exempt_reason": null,
+      "extra_actions": [],
+      "function": "expire_old_memories_cron",
+      "id": "arq_cron:WorkerSettings.expire_old_memories_cron",
+      "method": "",
+      "note": "system worker principal with explicit retention/derivation statements",
+      "path": "WorkerSettings.expire_old_memories_cron",
+      "privileged": false,
+      "queue": "WorkerSettings",
+      "required_payload": [
+        "worker_subject_id",
+        "policy_epoch"
+      ],
+      "resolver": {
+        "kind": "system_worker",
+        "target": "system worker statements"
+      },
+      "status": "mapped",
+      "surface": "arq_cron"
+    },
+    {
+      "action": "background_derive",
+      "auth": {
+        "authz_gate": [],
+        "identity": "payload_user_id",
+        "middleware": "none_queue_trusted"
+      },
+      "exempt_reason": null,
+      "extra_actions": [
+        [
+          "background_replay",
+          "on_retry"
+        ]
+      ],
+      "function": "process_graph_enrichment",
+      "id": "arq_function:GraphWorkerSettings.process_graph_enrichment",
+      "method": "",
+      "note": "",
+      "path": "GraphWorkerSettings.process_graph_enrichment",
+      "privileged": false,
+      "queue": "GraphWorkerSettings",
+      "required_payload": [
+        "tenant_id",
+        "subject_id",
+        "credential_id",
+        "membership_version",
+        "policy_epoch"
+      ],
+      "resolver": {
+        "kind": "job_payload",
+        "target": "payload.resource"
+      },
+      "status": "mapped",
+      "surface": "arq_function"
+    },
+    {
+      "action": "background_derive",
+      "auth": {
+        "authz_gate": [],
+        "identity": "none",
+        "middleware": "none_queue_trusted"
+      },
+      "exempt_reason": null,
+      "extra_actions": [
+        [
+          "background_replay",
+          "on_retry"
+        ]
+      ],
+      "function": "process_graph_reenrich",
+      "id": "arq_function:GraphWorkerSettings.process_graph_reenrich",
+      "method": "",
+      "note": "re-enriches a surviving memory after its shared conversation episode was removed; the queue job carries only memory_id and re-reads the owner, project and visibility from the row",
+      "path": "GraphWorkerSettings.process_graph_reenrich",
+      "privileged": false,
+      "queue": "GraphWorkerSettings",
+      "required_payload": [
+        "tenant_id",
+        "subject_id",
+        "credential_id",
+        "membership_version",
+        "policy_epoch"
+      ],
+      "resolver": {
+        "kind": "job_payload",
+        "target": "payload.resource"
+      },
+      "status": "mapped",
+      "surface": "arq_function"
+    },
+    {
+      "action": "background_derive",
+      "auth": {
+        "authz_gate": [],
+        "identity": "payload_user_id",
+        "middleware": "none_queue_trusted"
+      },
+      "exempt_reason": null,
+      "extra_actions": [
+        [
+          "background_replay",
+          "on_retry"
+        ]
+      ],
+      "function": "process_session_summary",
+      "id": "arq_function:GraphWorkerSettings.process_session_summary",
+      "method": "",
+      "note": "",
+      "path": "GraphWorkerSettings.process_session_summary",
+      "privileged": false,
+      "queue": "GraphWorkerSettings",
+      "required_payload": [
+        "tenant_id",
+        "subject_id",
+        "credential_id",
+        "membership_version",
+        "policy_epoch"
+      ],
+      "resolver": {
+        "kind": "job_payload",
+        "target": "payload.resource"
+      },
+      "status": "mapped",
+      "surface": "arq_function"
+    },
+    {
+      "action": "background_derive",
+      "auth": {
+        "authz_gate": [],
+        "identity": "none",
+        "middleware": "none_queue_trusted"
+      },
+      "exempt_reason": null,
+      "extra_actions": [
+        [
+          "background_replay",
+          "on_retry"
+        ]
+      ],
+      "function": "run_dream_sweep",
+      "id": "arq_function:GraphWorkerSettings.run_dream_sweep",
+      "method": "",
+      "note": "",
+      "path": "GraphWorkerSettings.run_dream_sweep",
+      "privileged": false,
+      "queue": "GraphWorkerSettings",
+      "required_payload": [
+        "tenant_id",
+        "subject_id",
+        "credential_id",
+        "membership_version",
+        "policy_epoch"
+      ],
+      "resolver": {
+        "kind": "job_payload",
+        "target": "payload.resource"
+      },
+      "status": "mapped",
+      "surface": "arq_function"
+    },
+    {
+      "action": "background_derive",
+      "auth": {
+        "authz_gate": [],
+        "identity": "payload_user_id+default_user_fallback",
+        "middleware": "none_queue_trusted"
+      },
+      "exempt_reason": null,
+      "extra_actions": [
+        [
+          "background_replay",
+          "on_retry"
+        ]
+      ],
+      "function": "process_code_index",
+      "id": "arq_function:IngestWorkerSettings.process_code_index",
+      "method": "",
+      "note": "default-user fallback today (missing payload user_id becomes settings.default_user_id): must deny when absent",
+      "path": "IngestWorkerSettings.process_code_index",
+      "privileged": false,
+      "queue": "IngestWorkerSettings",
+      "required_payload": [
+        "tenant_id",
+        "subject_id",
+        "credential_id",
+        "membership_version",
+        "policy_epoch"
+      ],
+      "resolver": {
+        "kind": "job_payload",
+        "target": "payload.resource"
+      },
+      "status": "mapped",
+      "surface": "arq_function"
+    },
+    {
+      "action": "background_derive",
+      "auth": {
+        "authz_gate": [],
+        "identity": "payload_user_id+default_user_fallback",
+        "middleware": "none_queue_trusted"
+      },
+      "exempt_reason": null,
+      "extra_actions": [
+        [
+          "background_replay",
+          "on_retry"
+        ]
+      ],
+      "function": "process_connector_sync",
+      "id": "arq_function:IngestWorkerSettings.process_connector_sync",
+      "method": "",
+      "note": "default-user fallback today (missing owner_user_id becomes settings.default_user_id): must deny when absent",
+      "path": "IngestWorkerSettings.process_connector_sync",
+      "privileged": false,
+      "queue": "IngestWorkerSettings",
+      "required_payload": [
+        "tenant_id",
+        "subject_id",
+        "credential_id",
+        "membership_version",
+        "policy_epoch"
+      ],
+      "resolver": {
+        "kind": "job_payload",
+        "target": "payload.resource"
+      },
+      "status": "mapped",
+      "surface": "arq_function"
+    },
+    {
+      "action": "background_derive",
+      "auth": {
+        "authz_gate": [],
+        "identity": "payload_user_id",
+        "middleware": "none_queue_trusted"
+      },
+      "exempt_reason": null,
+      "extra_actions": [
+        [
+          "background_replay",
+          "on_retry"
+        ]
+      ],
+      "function": "process_ingest_document",
+      "id": "arq_function:IngestWorkerSettings.process_ingest_document",
+      "method": "",
+      "note": "",
+      "path": "IngestWorkerSettings.process_ingest_document",
+      "privileged": false,
+      "queue": "IngestWorkerSettings",
+      "required_payload": [
+        "tenant_id",
+        "subject_id",
+        "credential_id",
+        "membership_version",
+        "policy_epoch"
+      ],
+      "resolver": {
+        "kind": "job_payload",
+        "target": "payload.resource"
+      },
+      "status": "mapped",
+      "surface": "arq_function"
+    },
+    {
+      "action": "background_derive",
+      "auth": {
+        "authz_gate": [],
+        "identity": "payload_user_id",
+        "middleware": "none_queue_trusted"
+      },
+      "exempt_reason": null,
+      "extra_actions": [
+        [
+          "background_replay",
+          "on_retry"
+        ]
+      ],
+      "function": "process_ingest_file",
+      "id": "arq_function:IngestWorkerSettings.process_ingest_file",
+      "method": "",
+      "note": "",
+      "path": "IngestWorkerSettings.process_ingest_file",
+      "privileged": false,
+      "queue": "IngestWorkerSettings",
+      "required_payload": [
+        "tenant_id",
+        "subject_id",
+        "credential_id",
+        "membership_version",
+        "policy_epoch"
+      ],
+      "resolver": {
+        "kind": "job_payload",
+        "target": "payload.resource"
+      },
+      "status": "mapped",
+      "surface": "arq_function"
+    },
+    {
+      "action": "background_derive",
+      "auth": {
+        "authz_gate": [],
+        "identity": "payload_user_id",
+        "middleware": "none_queue_trusted"
+      },
+      "exempt_reason": null,
+      "extra_actions": [
+        [
+          "background_replay",
+          "on_retry"
+        ]
+      ],
+      "function": "process_ingest_okf_bundle",
+      "id": "arq_function:IngestWorkerSettings.process_ingest_okf_bundle",
+      "method": "",
+      "note": "",
+      "path": "IngestWorkerSettings.process_ingest_okf_bundle",
+      "privileged": false,
+      "queue": "IngestWorkerSettings",
+      "required_payload": [
+        "tenant_id",
+        "subject_id",
+        "credential_id",
+        "membership_version",
+        "policy_epoch"
+      ],
+      "resolver": {
+        "kind": "job_payload",
+        "target": "payload.resource"
+      },
+      "status": "mapped",
+      "surface": "arq_function"
+    },
+    {
+      "action": "background_derive",
+      "auth": {
+        "authz_gate": [],
+        "identity": "none",
+        "middleware": "none_queue_trusted"
+      },
+      "exempt_reason": null,
+      "extra_actions": [
+        [
+          "background_replay",
+          "on_retry"
+        ]
+      ],
+      "function": "process_ledger_work",
+      "id": "arq_function:LedgerWorkerSettings.process_ledger_work",
+      "method": "",
+      "note": "wake-up only; the worker claims the obligation and its authority from the ledger",
+      "path": "LedgerWorkerSettings.process_ledger_work",
+      "privileged": false,
+      "queue": "LedgerWorkerSettings",
+      "required_payload": [
+        "tenant_id",
+        "subject_id",
+        "credential_id",
+        "membership_version",
+        "policy_epoch"
+      ],
+      "resolver": {
+        "kind": "job_payload",
+        "target": "payload.resource"
+      },
+      "status": "mapped",
+      "surface": "arq_function"
+    },
+    {
+      "action": "background_derive",
+      "auth": {
+        "authz_gate": [],
+        "identity": "payload_user_id",
+        "middleware": "none_queue_trusted"
+      },
+      "exempt_reason": null,
+      "extra_actions": [
+        [
+          "background_replay",
+          "on_retry"
+        ]
+      ],
+      "function": "process_conversation_compile",
+      "id": "arq_function:WorkerSettings.process_conversation_compile",
+      "method": "",
+      "note": "",
+      "path": "WorkerSettings.process_conversation_compile",
+      "privileged": false,
+      "queue": "WorkerSettings",
+      "required_payload": [
+        "tenant_id",
+        "subject_id",
+        "credential_id",
+        "membership_version",
+        "policy_epoch"
+      ],
+      "resolver": {
+        "kind": "job_payload",
+        "target": "payload.resource"
+      },
+      "status": "mapped",
+      "surface": "arq_function"
+    },
+    {
+      "action": "background_derive",
+      "auth": {
+        "authz_gate": [],
+        "identity": "payload_user_id",
+        "middleware": "none_queue_trusted"
+      },
+      "exempt_reason": null,
+      "extra_actions": [
+        [
+          "background_replay",
+          "on_retry"
+        ]
+      ],
+      "function": "process_conversation_flush",
+      "id": "arq_function:WorkerSettings.process_conversation_flush",
+      "method": "",
+      "note": "",
+      "path": "WorkerSettings.process_conversation_flush",
+      "privileged": false,
+      "queue": "WorkerSettings",
+      "required_payload": [
+        "tenant_id",
+        "subject_id",
+        "credential_id",
+        "membership_version",
+        "policy_epoch"
+      ],
+      "resolver": {
+        "kind": "job_payload",
+        "target": "payload.resource"
+      },
+      "status": "mapped",
+      "surface": "arq_function"
+    },
+    {
+      "action": "background_derive",
+      "auth": {
+        "authz_gate": [],
+        "identity": "payload_user_id",
+        "middleware": "none_queue_trusted"
+      },
+      "exempt_reason": null,
+      "extra_actions": [
+        [
+          "background_replay",
+          "on_retry"
+        ]
+      ],
+      "function": "process_memory_raw",
+      "id": "arq_function:WorkerSettings.process_memory_raw",
+      "method": "",
+      "note": "",
+      "path": "WorkerSettings.process_memory_raw",
+      "privileged": false,
+      "queue": "WorkerSettings",
+      "required_payload": [
+        "tenant_id",
+        "subject_id",
+        "credential_id",
+        "membership_version",
+        "policy_epoch"
+      ],
+      "resolver": {
+        "kind": "job_payload",
+        "target": "payload.resource"
+      },
+      "status": "mapped",
+      "surface": "arq_function"
+    },
+    {
+      "action": "background_derive",
+      "auth": {
+        "authz_gate": [],
+        "identity": "payload_user_id",
+        "middleware": "none_queue_trusted"
+      },
+      "exempt_reason": null,
+      "extra_actions": [
+        [
+          "background_replay",
+          "on_retry"
+        ]
+      ],
+      "function": "process_memory_raw_batch",
+      "id": "arq_function:WorkerSettings.process_memory_raw_batch",
+      "method": "",
+      "note": "",
+      "path": "WorkerSettings.process_memory_raw_batch",
+      "privileged": false,
+      "queue": "WorkerSettings",
+      "required_payload": [
+        "tenant_id",
+        "subject_id",
+        "credential_id",
+        "membership_version",
+        "policy_epoch"
+      ],
+      "resolver": {
+        "kind": "job_payload",
+        "target": "payload.resource"
+      },
+      "status": "mapped",
+      "surface": "arq_function"
+    },
+    {
+      "action": "background_derive",
+      "auth": {
+        "authz_gate": [],
+        "identity": "payload_user_id",
+        "middleware": "none_queue_trusted"
+      },
+      "exempt_reason": null,
+      "extra_actions": [
+        [
+          "background_replay",
+          "on_retry"
+        ]
+      ],
+      "function": "process_memory_retag",
+      "id": "arq_function:WorkerSettings.process_memory_retag",
+      "method": "",
+      "note": "",
+      "path": "WorkerSettings.process_memory_retag",
+      "privileged": false,
+      "queue": "WorkerSettings",
+      "required_payload": [
+        "tenant_id",
+        "subject_id",
+        "credential_id",
+        "membership_version",
+        "policy_epoch"
+      ],
+      "resolver": {
+        "kind": "job_payload",
+        "target": "payload.resource"
+      },
+      "status": "mapped",
+      "surface": "arq_function"
+    },
+    {
+      "action": "background_derive",
+      "auth": {
+        "authz_gate": [],
+        "identity": "payload_user_id",
+        "middleware": "none_queue_trusted"
+      },
+      "exempt_reason": null,
+      "extra_actions": [
+        [
+          "background_replay",
+          "on_retry"
+        ]
+      ],
+      "function": "process_memory_store",
+      "id": "arq_function:WorkerSettings.process_memory_store",
+      "method": "",
+      "note": "",
+      "path": "WorkerSettings.process_memory_store",
+      "privileged": false,
+      "queue": "WorkerSettings",
+      "required_payload": [
+        "tenant_id",
+        "subject_id",
+        "credential_id",
+        "membership_version",
+        "policy_epoch"
+      ],
+      "resolver": {
+        "kind": "job_payload",
+        "target": "payload.resource"
+      },
+      "status": "mapped",
+      "surface": "arq_function"
+    },
+    {
+      "action": "search",
+      "auth": {
+        "authz_gate": [],
+        "identity": "context_or_argument_or_default_or_user_id",
+        "middleware": "bearer_middleware(http)|none(stdio)"
+      },
+      "dispatch": "branch",
+      "exempt_reason": null,
+      "extra_actions": [],
+      "function": "ask_memory",
+      "id": "mcp_tool:ask_memory",
+      "method": "",
+      "note": "principal from credential only; arguments.user_id must not override",
+      "path": "ask_memory",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "pool",
+        "target": "arguments.project_id"
+      },
+      "status": "mapped",
+      "surface": "mcp_tool"
+    },
+    {
+      "action": "read",
+      "auth": {
+        "authz_gate": [
+          "is_dictator"
+        ],
+        "identity": "context_or_argument_or_default_or_user_id",
+        "middleware": "bearer_middleware(http)|none(stdio)"
+      },
+      "dispatch": "branch",
+      "exempt_reason": null,
+      "extra_actions": [],
+      "function": "audit_private_leakage",
+      "id": "mcp_tool:audit_private_leakage",
+      "method": "",
+      "note": "principal from credential only; arguments.user_id must not override; dictator-only today, explicit content grant (assumption D-3)",
+      "path": "audit_private_leakage",
+      "privileged": true,
+      "required_payload": [],
+      "resolver": {
+        "kind": "pool",
+        "target": "arguments.user_id (private pool)"
+      },
+      "status": "mapped",
+      "surface": "mcp_tool"
+    },
+    {
+      "action": "create",
+      "auth": {
+        "authz_gate": [],
+        "identity": "context_or_argument_or_default_or_user_id",
+        "middleware": "bearer_middleware(http)|none(stdio)"
+      },
+      "dispatch": "branch",
+      "exempt_reason": null,
+      "extra_actions": [
+        [
+          "share",
+          "visibility=shared"
+        ],
+        [
+          "publish_standard",
+          "visibility=standard"
+        ],
+        [
+          "background_derive",
+          "credential=scoped"
+        ]
+      ],
+      "function": "checkpoint",
+      "id": "mcp_tool:checkpoint",
+      "method": "",
+      "note": "principal from credential only; arguments.user_id must not override",
+      "path": "checkpoint",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "pool",
+        "target": "arguments.memories[*].visibility+arguments.memories[*].project_id+arguments.memories[*].workspace"
+      },
+      "status": "mapped",
+      "surface": "mcp_tool"
+    },
+    {
+      "action": "delete",
+      "auth": {
+        "authz_gate": [],
+        "identity": "context_or_argument_or_default_or_user_id",
+        "middleware": "bearer_middleware(http)|none(stdio)"
+      },
+      "dispatch": "branch",
+      "exempt_reason": null,
+      "extra_actions": [],
+      "function": "code_graph_delete",
+      "id": "mcp_tool:code_graph_delete",
+      "method": "",
+      "note": "principal from credential only; arguments.user_id must not override",
+      "path": "code_graph_delete",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "pool",
+        "target": "arguments.user_id (private pool only)"
+      },
+      "status": "mapped",
+      "surface": "mcp_tool"
+    },
+    {
+      "action": "create",
+      "auth": {
+        "authz_gate": [],
+        "identity": "context_or_argument_or_default_or_user_id",
+        "middleware": "bearer_middleware(http)|none(stdio)"
+      },
+      "dispatch": "branch",
+      "exempt_reason": null,
+      "extra_actions": [
+        [
+          "background_derive",
+          "credential=scoped"
+        ]
+      ],
+      "function": "code_graph_index",
+      "id": "mcp_tool:code_graph_index",
+      "method": "",
+      "note": "principal from credential only; arguments.user_id must not override",
+      "path": "code_graph_index",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "pool",
+        "target": "arguments.user_id (private pool only)"
+      },
+      "status": "mapped",
+      "surface": "mcp_tool"
+    },
+    {
+      "action": "read",
+      "auth": {
+        "authz_gate": [],
+        "identity": "context_or_argument_or_default_or_user_id",
+        "middleware": "bearer_middleware(http)|none(stdio)"
+      },
+      "dispatch": "branch",
+      "exempt_reason": null,
+      "extra_actions": [],
+      "function": "code_impact",
+      "id": "mcp_tool:code_impact",
+      "method": "",
+      "note": "principal from credential only; arguments.user_id must not override",
+      "path": "code_impact",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "pool",
+        "target": "arguments.user_id (private pool only)"
+      },
+      "status": "mapped",
+      "surface": "mcp_tool"
+    },
+    {
+      "action": "read",
+      "auth": {
+        "authz_gate": [],
+        "identity": "context_or_argument_or_default_or_user_id",
+        "middleware": "bearer_middleware(http)|none(stdio)"
+      },
+      "dispatch": "branch",
+      "exempt_reason": null,
+      "extra_actions": [],
+      "function": "code_path",
+      "id": "mcp_tool:code_path",
+      "method": "",
+      "note": "principal from credential only; arguments.user_id must not override",
+      "path": "code_path",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "pool",
+        "target": "arguments.user_id (private pool only)"
+      },
+      "status": "mapped",
+      "surface": "mcp_tool"
+    },
+    {
+      "action": "delete",
+      "auth": {
+        "authz_gate": [],
+        "identity": "context_or_argument_or_default_or_user_id",
+        "middleware": "bearer_middleware(http)|none(stdio)"
+      },
+      "dispatch": "branch",
+      "exempt_reason": null,
+      "extra_actions": [
+        [
+          "publish_standard",
+          "target.visibility=standard"
+        ],
+        [
+          "background_derive",
+          "credential=scoped"
+        ]
+      ],
+      "function": "delete_memories",
+      "id": "mcp_tool:delete_memories",
+      "method": "",
+      "note": "principal from credential only; arguments.user_id must not override",
+      "path": "delete_memories",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "memory",
+        "target": "arguments.memory_id"
+      },
+      "status": "mapped",
+      "surface": "mcp_tool"
+    },
+    {
+      "action": "update",
+      "auth": {
+        "authz_gate": [],
+        "identity": "context_or_argument_or_default_or_user_id",
+        "middleware": "bearer_middleware(http)|none(stdio)"
+      },
+      "dispatch": "branch",
+      "exempt_reason": null,
+      "extra_actions": [
+        [
+          "share",
+          "visibility_change=shared"
+        ],
+        [
+          "publish_standard",
+          "visibility_change=standard"
+        ],
+        [
+          "publish_standard",
+          "target.visibility=standard"
+        ]
+      ],
+      "function": "edit_memory",
+      "id": "mcp_tool:edit_memory",
+      "method": "",
+      "note": "principal from credential only; arguments.user_id must not override",
+      "path": "edit_memory",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "memory",
+        "target": "arguments.memory_id"
+      },
+      "status": "mapped",
+      "surface": "mcp_tool"
+    },
+    {
+      "action": "read",
+      "auth": {
+        "authz_gate": [],
+        "identity": "context_or_argument_or_default_or_user_id",
+        "middleware": "bearer_middleware(http)|none(stdio)"
+      },
+      "dispatch": "branch",
+      "exempt_reason": null,
+      "extra_actions": [],
+      "function": "fetch_reference",
+      "id": "mcp_tool:fetch_reference",
+      "method": "",
+      "note": "principal from credential only; memory references only; authorization re-checked on every resolution",
+      "path": "fetch_reference",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "memory",
+        "target": "arguments.id"
+      },
+      "status": "mapped",
+      "surface": "mcp_tool"
+    },
+    {
+      "action": "read",
+      "auth": {
+        "authz_gate": [],
+        "identity": "context_or_argument_or_default_or_user_id",
+        "middleware": "bearer_middleware(http)|none(stdio)"
+      },
+      "dispatch": "branch",
+      "exempt_reason": null,
+      "extra_actions": [],
+      "function": "get_capabilities",
+      "id": "mcp_tool:get_capabilities",
+      "method": "",
+      "note": "read-only descriptor of offered operations; tenant cell scoped",
+      "path": "get_capabilities",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "tenant",
+        "target": "tenant"
+      },
+      "status": "mapped",
+      "surface": "mcp_tool"
+    },
+    {
+      "action": "read",
+      "auth": {
+        "authz_gate": [
+          "is_dictator"
+        ],
+        "identity": "context_or_argument_or_default_or_user_id",
+        "middleware": "bearer_middleware(http)|none(stdio)"
+      },
+      "dispatch": "branch",
+      "exempt_reason": null,
+      "extra_actions": [],
+      "function": "get_card",
+      "id": "mcp_tool:get_card",
+      "method": "",
+      "note": "principal from credential only; arguments.user_id must not override",
+      "path": "get_card",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "pool",
+        "target": "arguments.pool+arguments.project_id"
+      },
+      "status": "mapped",
+      "surface": "mcp_tool"
+    },
+    {
+      "action": "read",
+      "auth": {
+        "authz_gate": [],
+        "identity": "context_or_argument_or_default_or_user_id",
+        "middleware": "bearer_middleware(http)|none(stdio)"
+      },
+      "dispatch": "branch",
+      "exempt_reason": null,
+      "extra_actions": [],
+      "function": "get_code_neighbors",
+      "id": "mcp_tool:get_code_neighbors",
+      "method": "",
+      "note": "principal from credential only; arguments.user_id must not override",
+      "path": "get_code_neighbors",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "pool",
+        "target": "arguments.user_id (private pool only)"
+      },
+      "status": "mapped",
+      "surface": "mcp_tool"
+    },
+    {
+      "action": "read",
+      "auth": {
+        "authz_gate": [],
+        "identity": "context_or_argument_or_default_or_user_id",
+        "middleware": "bearer_middleware(http)|none(stdio)"
+      },
+      "dispatch": "branch",
+      "exempt_reason": null,
+      "extra_actions": [],
+      "function": "get_memories",
+      "id": "mcp_tool:get_memories",
+      "method": "",
+      "note": "principal from credential only; arguments.user_id must not override",
+      "path": "get_memories",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "memory",
+        "target": "arguments.ids[*]"
+      },
+      "status": "mapped",
+      "surface": "mcp_tool"
+    },
+    {
+      "action": "read",
+      "auth": {
+        "authz_gate": [],
+        "identity": "context_or_argument_or_default_or_user_id",
+        "middleware": "bearer_middleware(http)|none(stdio)"
+      },
+      "dispatch": "branch",
+      "exempt_reason": null,
+      "extra_actions": [],
+      "function": "get_process",
+      "id": "mcp_tool:get_process",
+      "method": "",
+      "note": "principal from credential only; arguments.user_id must not override",
+      "path": "get_process",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "pool",
+        "target": "arguments.project_id"
+      },
+      "status": "mapped",
+      "surface": "mcp_tool"
+    },
+    {
+      "action": "read",
+      "auth": {
+        "authz_gate": [],
+        "identity": "context_or_argument_or_default_or_user_id",
+        "middleware": "bearer_middleware(http)|none(stdio)"
+      },
+      "dispatch": "branch",
+      "exempt_reason": null,
+      "extra_actions": [],
+      "function": "get_project_context",
+      "id": "mcp_tool:get_project_context",
+      "method": "",
+      "note": "principal from credential only; arguments.user_id must not override",
+      "path": "get_project_context",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "pool",
+        "target": "arguments.project_id"
+      },
+      "status": "mapped",
+      "surface": "mcp_tool"
+    },
+    {
+      "action": "read",
+      "auth": {
+        "authz_gate": [],
+        "identity": "context_or_argument_or_default_or_user_id",
+        "middleware": "bearer_middleware(http)|none(stdio)"
+      },
+      "dispatch": "branch",
+      "exempt_reason": null,
+      "extra_actions": [],
+      "function": "get_project_knowledge_config",
+      "id": "mcp_tool:get_project_knowledge_config",
+      "method": "",
+      "note": "principal from credential only; arguments.user_id must not override; decision pending: global/project administration needs a settings-administration grant",
+      "path": "get_project_knowledge_config",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "settings",
+        "target": "arguments.project_id"
+      },
+      "status": "mapped",
+      "surface": "mcp_tool"
+    },
+    {
+      "action": "read",
+      "auth": {
+        "authz_gate": [],
+        "identity": "context_or_argument_or_default_or_user_id",
+        "middleware": "bearer_middleware(http)|none(stdio)"
+      },
+      "dispatch": "branch",
+      "exempt_reason": null,
+      "extra_actions": [],
+      "function": "get_reasoning_chain",
+      "id": "mcp_tool:get_reasoning_chain",
+      "method": "",
+      "note": "principal from credential only; arguments.user_id must not override",
+      "path": "get_reasoning_chain",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "memory",
+        "target": "arguments.memory_id"
+      },
+      "status": "mapped",
+      "surface": "mcp_tool"
+    },
+    {
+      "action": "create",
+      "auth": {
+        "authz_gate": [
+          "is_dictator"
+        ],
+        "identity": "context_or_argument_or_default_or_user_id",
+        "middleware": "bearer_middleware(http)|none(stdio)"
+      },
+      "dispatch": "branch",
+      "exempt_reason": null,
+      "extra_actions": [
+        [
+          "share",
+          "visibility=shared"
+        ],
+        [
+          "publish_standard",
+          "visibility=standard"
+        ],
+        [
+          "background_derive",
+          "credential=scoped"
+        ]
+      ],
+      "function": "ingest_document",
+      "id": "mcp_tool:ingest_document",
+      "method": "",
+      "note": "principal from credential only; arguments.user_id must not override",
+      "path": "ingest_document",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "pool",
+        "target": "arguments.visibility+arguments.project_id"
+      },
+      "status": "mapped",
+      "surface": "mcp_tool"
+    },
+    {
+      "action": "create",
+      "auth": {
+        "authz_gate": [
+          "is_dictator"
+        ],
+        "identity": "context_or_argument_or_default_or_user_id",
+        "middleware": "bearer_middleware(http)|none(stdio)"
+      },
+      "dispatch": "branch",
+      "exempt_reason": null,
+      "extra_actions": [
+        [
+          "share",
+          "visibility=shared"
+        ],
+        [
+          "publish_standard",
+          "visibility=standard"
+        ],
+        [
+          "background_derive",
+          "credential=scoped"
+        ]
+      ],
+      "function": "ingest_text",
+      "id": "mcp_tool:ingest_text",
+      "method": "",
+      "note": "principal from credential only; arguments.user_id must not override",
+      "path": "ingest_text",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "pool",
+        "target": "arguments.visibility+arguments.project_id"
+      },
+      "status": "mapped",
+      "surface": "mcp_tool"
+    },
+    {
+      "action": "list",
+      "auth": {
+        "authz_gate": [],
+        "identity": "context_or_argument_or_default_or_user_id",
+        "middleware": "bearer_middleware(http)|none(stdio)"
+      },
+      "dispatch": "branch",
+      "exempt_reason": null,
+      "extra_actions": [],
+      "function": "list_memories",
+      "id": "mcp_tool:list_memories",
+      "method": "",
+      "note": "principal from credential only; arguments.user_id must not override",
+      "path": "list_memories",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "pool",
+        "target": "arguments.project_id"
+      },
+      "status": "mapped",
+      "surface": "mcp_tool"
+    },
+    {
+      "action": "list",
+      "auth": {
+        "authz_gate": [],
+        "identity": "context_or_argument_or_default_or_user_id",
+        "middleware": "bearer_middleware(http)|none(stdio)"
+      },
+      "dispatch": "branch",
+      "exempt_reason": null,
+      "extra_actions": [],
+      "function": "list_processes",
+      "id": "mcp_tool:list_processes",
+      "method": "",
+      "note": "principal from credential only; arguments.user_id must not override",
+      "path": "list_processes",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "pool",
+        "target": "arguments.project_id"
+      },
+      "status": "mapped",
+      "surface": "mcp_tool"
+    },
+    {
+      "action": "list",
+      "auth": {
+        "authz_gate": [],
+        "identity": "context_or_argument_or_default_or_user_id",
+        "middleware": "bearer_middleware(http)|none(stdio)"
+      },
+      "dispatch": "branch",
+      "exempt_reason": null,
+      "extra_actions": [],
+      "function": "list_projects",
+      "id": "mcp_tool:list_projects",
+      "method": "",
+      "note": "principal from credential only; arguments.user_id must not override",
+      "path": "list_projects",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "pool",
+        "target": "arguments.user_id (private pool only)"
+      },
+      "status": "mapped",
+      "surface": "mcp_tool"
+    },
+    {
+      "action": "search",
+      "auth": {
+        "authz_gate": [],
+        "identity": "context_or_argument_or_default_or_user_id",
+        "middleware": "bearer_middleware(http)|none(stdio)"
+      },
+      "dispatch": "branch",
+      "exempt_reason": null,
+      "extra_actions": [],
+      "function": "locate",
+      "id": "mcp_tool:locate",
+      "method": "",
+      "note": "principal from credential only; arguments.user_id must not override",
+      "path": "locate",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "pool",
+        "target": "arguments.user_id (private pool only)"
+      },
+      "status": "mapped",
+      "surface": "mcp_tool"
+    },
+    {
+      "action": "search",
+      "auth": {
+        "authz_gate": [],
+        "identity": "context_or_argument_or_default_or_user_id",
+        "middleware": "bearer_middleware(http)|none(stdio)"
+      },
+      "dispatch": "branch",
+      "exempt_reason": null,
+      "extra_actions": [],
+      "function": "query_code_graph",
+      "id": "mcp_tool:query_code_graph",
+      "method": "",
+      "note": "principal from credential only; arguments.user_id must not override",
+      "path": "query_code_graph",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "pool",
+        "target": "arguments.user_id (private pool only)"
+      },
+      "status": "mapped",
+      "surface": "mcp_tool"
+    },
+    {
+      "action": "read",
+      "auth": {
+        "authz_gate": [],
+        "identity": "context_or_argument_or_default_or_user_id",
+        "middleware": "bearer_middleware(http)|none(stdio)"
+      },
+      "dispatch": "branch",
+      "exempt_reason": null,
+      "extra_actions": [],
+      "function": "queue_status",
+      "id": "mcp_tool:queue_status",
+      "method": "",
+      "note": "principal from credential only; arguments.user_id must not override",
+      "path": "queue_status",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "tenant",
+        "target": "credential.tenant"
+      },
+      "status": "mapped",
+      "surface": "mcp_tool"
+    },
+    {
+      "action": "search",
+      "auth": {
+        "authz_gate": [],
+        "identity": "context_or_argument_or_default_or_user_id",
+        "middleware": "bearer_middleware(http)|none(stdio)"
+      },
+      "dispatch": "branch",
+      "exempt_reason": null,
+      "extra_actions": [],
+      "function": "recall_memories",
+      "id": "mcp_tool:recall_memories",
+      "method": "",
+      "note": "principal from credential only; arguments.user_id must not override",
+      "path": "recall_memories",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "pool",
+        "target": "arguments.project_id"
+      },
+      "status": "mapped",
+      "surface": "mcp_tool"
+    },
+    {
+      "action": "create",
+      "auth": {
+        "authz_gate": [
+          "is_dictator"
+        ],
+        "identity": "context_or_argument_or_default_or_user_id",
+        "middleware": "bearer_middleware(http)|none(stdio)"
+      },
+      "dispatch": "branch",
+      "exempt_reason": null,
+      "extra_actions": [
+        [
+          "share",
+          "visibility=shared"
+        ],
+        [
+          "publish_standard",
+          "visibility=standard"
+        ],
+        [
+          "background_derive",
+          "credential=scoped"
+        ]
+      ],
+      "function": "remember",
+      "id": "mcp_tool:remember",
+      "method": "",
+      "note": "principal from credential only; arguments.user_id must not override",
+      "path": "remember",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "pool",
+        "target": "arguments.visibility+arguments.project_id"
+      },
+      "status": "mapped",
+      "surface": "mcp_tool"
+    },
+    {
+      "action": "create",
+      "auth": {
+        "authz_gate": [],
+        "identity": "context_or_argument_or_default_or_user_id",
+        "middleware": "bearer_middleware(http)|none(stdio)"
+      },
+      "dispatch": "branch",
+      "exempt_reason": null,
+      "extra_actions": [
+        [
+          "share",
+          "visibility=shared"
+        ],
+        [
+          "publish_standard",
+          "visibility=standard"
+        ],
+        [
+          "background_derive",
+          "credential=scoped"
+        ]
+      ],
+      "function": "remember_conversation",
+      "id": "mcp_tool:remember_conversation",
+      "method": "",
+      "note": "principal from credential only; arguments.user_id must not override",
+      "path": "remember_conversation",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "pool",
+        "target": "arguments.project_id"
+      },
+      "status": "mapped",
+      "surface": "mcp_tool"
+    },
+    {
+      "action": "update",
+      "auth": {
+        "authz_gate": [
+          "is_dictator"
+        ],
+        "identity": "context_or_argument_or_default_or_user_id",
+        "middleware": "bearer_middleware(http)|none(stdio)"
+      },
+      "dispatch": "branch",
+      "exempt_reason": null,
+      "extra_actions": [
+        [
+          "background_derive",
+          "credential=scoped"
+        ]
+      ],
+      "function": "rescope_private_derivatives",
+      "id": "mcp_tool:rescope_private_derivatives",
+      "method": "",
+      "note": "principal from credential only; arguments.user_id must not override; dictator-only today, explicit content grant (assumption D-3)",
+      "path": "rescope_private_derivatives",
+      "privileged": true,
+      "required_payload": [],
+      "resolver": {
+        "kind": "pool",
+        "target": "arguments.user_id (private pool)"
+      },
+      "status": "mapped",
+      "surface": "mcp_tool"
+    },
+    {
+      "action": "update",
+      "auth": {
+        "authz_gate": [],
+        "identity": "context_or_argument_or_default_or_user_id",
+        "middleware": "bearer_middleware(http)|none(stdio)"
+      },
+      "dispatch": "branch",
+      "exempt_reason": null,
+      "extra_actions": [
+        [
+          "publish_standard",
+          "target.visibility=standard"
+        ],
+        [
+          "background_derive",
+          "credential=scoped"
+        ]
+      ],
+      "function": "retag_memories",
+      "id": "mcp_tool:retag_memories",
+      "method": "",
+      "note": "principal from credential only; arguments.user_id must not override",
+      "path": "retag_memories",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "pool",
+        "target": "arguments.project_id"
+      },
+      "status": "mapped",
+      "surface": "mcp_tool"
+    },
+    {
+      "action": "background_derive",
+      "auth": {
+        "authz_gate": [],
+        "identity": "context_or_argument_or_default_or_user_id",
+        "middleware": "bearer_middleware(http)|none(stdio)"
+      },
+      "dispatch": "branch",
+      "exempt_reason": null,
+      "extra_actions": [],
+      "function": "schedule_dream",
+      "id": "mcp_tool:schedule_dream",
+      "method": "",
+      "note": "tenant-level: the handler enqueues a system sweep (an omitted pool walks every pool, a named one any owner's), so derivation on a member's own pool never authorizes it; decision pending: global/project administration needs a settings-administration grant",
+      "path": "schedule_dream",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "tenant",
+        "target": "credential.tenant"
+      },
+      "status": "mapped",
+      "surface": "mcp_tool"
+    },
+    {
+      "action": "search",
+      "auth": {
+        "authz_gate": [],
+        "identity": "context_or_argument_or_default_or_user_id",
+        "middleware": "bearer_middleware(http)|none(stdio)"
+      },
+      "dispatch": "branch",
+      "exempt_reason": null,
+      "extra_actions": [],
+      "function": "search_knowledge_graph",
+      "id": "mcp_tool:search_knowledge_graph",
+      "method": "",
+      "note": "principal from credential only; arguments.user_id must not override",
+      "path": "search_knowledge_graph",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "pool",
+        "target": "arguments.project_id"
+      },
+      "status": "mapped",
+      "surface": "mcp_tool"
+    },
+    {
+      "action": "update",
+      "auth": {
+        "authz_gate": [],
+        "identity": "context_or_argument_or_default_or_user_id",
+        "middleware": "bearer_middleware(http)|none(stdio)"
+      },
+      "dispatch": "branch",
+      "exempt_reason": null,
+      "extra_actions": [],
+      "function": "set_project_knowledge_config",
+      "id": "mcp_tool:set_project_knowledge_config",
+      "method": "",
+      "note": "principal from credential only; arguments.user_id must not override; decision pending: global/project administration needs a settings-administration grant",
+      "path": "set_project_knowledge_config",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "settings",
+        "target": "arguments.project_id"
+      },
+      "status": "mapped",
+      "surface": "mcp_tool"
+    },
+    {
+      "action": "read",
+      "auth": {
+        "authz_gate": [],
+        "identity": "context_or_argument_or_default_or_user_id",
+        "middleware": "bearer_middleware(http)|none(stdio)"
+      },
+      "dispatch": "branch",
+      "exempt_reason": null,
+      "extra_actions": [],
+      "function": "timeline",
+      "id": "mcp_tool:timeline",
+      "method": "",
+      "note": "principal from credential only; arguments.user_id must not override",
+      "path": "timeline",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "pool",
+        "target": "arguments.project_id"
+      },
+      "status": "mapped",
+      "surface": "mcp_tool"
+    },
+    {
+      "action": null,
+      "auth": {
+        "authz_gate": [],
+        "identity": "context_or_argument_or_default_or_user_id",
+        "middleware": "bearer_middleware|disabled_if_unconfigured"
+      },
+      "exempt_reason": "transport_mount (MCP tools are mapped individually; same middleware)",
+      "extra_actions": [],
+      "function": "mcp_app",
+      "id": "mount:/mcp",
+      "method": "",
+      "note": "",
+      "path": "/mcp",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "none",
+        "target": "none"
+      },
+      "status": "exempt",
+      "surface": "mount"
+    },
+    {
+      "action": "delete",
+      "auth": {
+        "authz_gate": [],
+        "identity": "token_or_body_user_id+default_user_fallback",
+        "middleware": "bearer_middleware|disabled_if_unconfigured"
+      },
+      "exempt_reason": null,
+      "extra_actions": [
+        [
+          "background_derive",
+          "credential=scoped"
+        ]
+      ],
+      "function": "delete_memories",
+      "id": "rest:DELETE /memories",
+      "method": "DELETE",
+      "note": "",
+      "path": "/memories",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "pool",
+        "target": "query.user_id (private pool only)"
+      },
+      "status": "mapped",
+      "surface": "rest"
+    },
+    {
+      "action": "delete",
+      "auth": {
+        "authz_gate": [],
+        "identity": "token_or_body_user_id+default_user_fallback",
+        "middleware": "bearer_middleware|disabled_if_unconfigured"
+      },
+      "exempt_reason": null,
+      "extra_actions": [],
+      "function": "v1_code_graph_delete",
+      "id": "rest:DELETE /v1/code-graph/graph",
+      "method": "DELETE",
+      "note": "",
+      "path": "/v1/code-graph/graph",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "pool",
+        "target": "query.user_id (private pool only)"
+      },
+      "status": "mapped",
+      "surface": "rest"
+    },
+    {
+      "action": "manage_credentials",
+      "auth": {
+        "authz_gate": [
+          "_require_owned_connector"
+        ],
+        "identity": "token_or_body_user_id+default_user_fallback",
+        "middleware": "bearer_middleware|disabled_if_unconfigured"
+      },
+      "exempt_reason": null,
+      "extra_actions": [],
+      "function": "v1_delete_connector",
+      "id": "rest:DELETE /v1/connectors/{connector_id}",
+      "method": "DELETE",
+      "note": "",
+      "path": "/v1/connectors/{connector_id}",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "connector",
+        "target": "path.connector_id"
+      },
+      "status": "mapped",
+      "surface": "rest"
+    },
+    {
+      "action": "delete",
+      "auth": {
+        "authz_gate": [],
+        "identity": "token_or_body_user_id+default_user_fallback",
+        "middleware": "bearer_middleware|disabled_if_unconfigured"
+      },
+      "exempt_reason": null,
+      "extra_actions": [
+        [
+          "publish_standard",
+          "target.visibility=standard"
+        ]
+      ],
+      "function": "v1_delete_junk_episodes",
+      "id": "rest:DELETE /v1/graph/episodes/junk",
+      "method": "DELETE",
+      "note": "",
+      "path": "/v1/graph/episodes/junk",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "pool",
+        "target": "query.project_id"
+      },
+      "status": "mapped",
+      "surface": "rest"
+    },
+    {
+      "action": "delete",
+      "auth": {
+        "authz_gate": [],
+        "identity": "token_or_body_user_id+default_user_fallback",
+        "middleware": "bearer_middleware|disabled_if_unconfigured"
+      },
+      "exempt_reason": null,
+      "extra_actions": [],
+      "function": "v1_delete_episode",
+      "id": "rest:DELETE /v1/graph/episodes/{episode_uuid}",
+      "method": "DELETE",
+      "note": "",
+      "path": "/v1/graph/episodes/{episode_uuid}",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "graph_item",
+        "target": "path.episode_uuid"
+      },
+      "status": "mapped",
+      "surface": "rest"
+    },
+    {
+      "action": "manage_membership",
+      "auth": {
+        "authz_gate": [],
+        "identity": "token_or_body_user_id",
+        "middleware": "bearer_middleware|disabled_if_unconfigured"
+      },
+      "exempt_reason": null,
+      "extra_actions": [],
+      "function": "v1_remove_member",
+      "id": "rest:DELETE /v1/members/{subject_id}",
+      "method": "DELETE",
+      "note": "",
+      "path": "/v1/members/{subject_id}",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "membership",
+        "target": "credential.tenant"
+      },
+      "status": "mapped",
+      "surface": "rest"
+    },
+    {
+      "action": "manage_membership",
+      "auth": {
+        "authz_gate": [],
+        "identity": "token_or_body_user_id",
+        "middleware": "bearer_middleware|disabled_if_unconfigured"
+      },
+      "exempt_reason": null,
+      "extra_actions": [],
+      "function": "v1_revoke_invite",
+      "id": "rest:DELETE /v1/members/invites/{invite_id}",
+      "method": "DELETE",
+      "note": "",
+      "path": "/v1/members/invites/{invite_id}",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "membership",
+        "target": "credential.tenant"
+      },
+      "status": "mapped",
+      "surface": "rest"
+    },
+    {
+      "action": "delete",
+      "auth": {
+        "authz_gate": [],
+        "identity": "token_or_body_user_id+default_user_fallback",
+        "middleware": "bearer_middleware|disabled_if_unconfigured"
+      },
+      "exempt_reason": null,
+      "extra_actions": [
+        [
+          "publish_standard",
+          "target.visibility=standard"
+        ],
+        [
+          "background_derive",
+          "credential=scoped"
+        ]
+      ],
+      "function": "v1_bulk_delete_memories",
+      "id": "rest:DELETE /v1/memories",
+      "method": "DELETE",
+      "note": "",
+      "path": "/v1/memories",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "pool",
+        "target": "body.project_id"
+      },
+      "status": "mapped",
+      "surface": "rest"
+    },
+    {
+      "action": "delete",
+      "auth": {
+        "authz_gate": [],
+        "identity": "token_or_body_user_id+default_user_fallback",
+        "middleware": "bearer_middleware|disabled_if_unconfigured"
+      },
+      "exempt_reason": null,
+      "extra_actions": [
+        [
+          "publish_standard",
+          "target.visibility=standard"
+        ],
+        [
+          "background_derive",
+          "credential=scoped"
+        ]
+      ],
+      "function": "v1_delete_memory",
+      "id": "rest:DELETE /v1/memories/{memory_id}",
+      "method": "DELETE",
+      "note": "",
+      "path": "/v1/memories/{memory_id}",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "memory",
+        "target": "path.memory_id"
+      },
+      "status": "mapped",
+      "surface": "rest"
+    },
+    {
+      "action": null,
+      "auth": {
+        "authz_gate": [],
+        "identity": "none",
+        "middleware": "public"
+      },
+      "exempt_reason": "console_session",
+      "extra_actions": [],
+      "function": "console_index",
+      "id": "rest:GET /console",
+      "method": "GET",
+      "note": "optional console page (CONSOLE_ENABLED); session-gated, every data action is a public API call authorized by that route",
+      "path": "/console",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "none",
+        "target": "none"
+      },
+      "status": "exempt",
+      "surface": "rest"
+    },
+    {
+      "action": null,
+      "auth": {
+        "authz_gate": [],
+        "identity": "none",
+        "middleware": "public"
+      },
+      "exempt_reason": "console_session",
+      "extra_actions": [],
+      "function": "console_login_form",
+      "id": "rest:GET /console/login",
+      "method": "GET",
+      "note": "optional console page (CONSOLE_ENABLED); session-gated, every data action is a public API call authorized by that route",
+      "path": "/console/login",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "none",
+        "target": "none"
+      },
+      "status": "exempt",
+      "surface": "rest"
+    },
+    {
+      "action": null,
+      "auth": {
+        "authz_gate": [],
+        "identity": "none",
+        "middleware": "public"
+      },
+      "exempt_reason": "console_session",
+      "extra_actions": [],
+      "function": "console_memories",
+      "id": "rest:GET /console/memories",
+      "method": "GET",
+      "note": "optional console page (CONSOLE_ENABLED); session-gated, every data action is a public API call authorized by that route",
+      "path": "/console/memories",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "none",
+        "target": "none"
+      },
+      "status": "exempt",
+      "surface": "rest"
+    },
+    {
+      "action": null,
+      "auth": {
+        "authz_gate": [],
+        "identity": "request_user_id",
+        "middleware": "public"
+      },
+      "exempt_reason": "console_session",
+      "extra_actions": [],
+      "function": "console_memory",
+      "id": "rest:GET /console/memories/{memory_id}",
+      "method": "GET",
+      "note": "optional console page (CONSOLE_ENABLED); session-gated, every data action is a public API call authorized by that route",
+      "path": "/console/memories/{memory_id}",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "none",
+        "target": "none"
+      },
+      "status": "exempt",
+      "surface": "rest"
+    },
+    {
+      "action": null,
+      "auth": {
+        "authz_gate": [],
+        "identity": "none",
+        "middleware": "public"
+      },
+      "exempt_reason": "console_session",
+      "extra_actions": [],
+      "function": "console_receipts",
+      "id": "rest:GET /console/receipts",
+      "method": "GET",
+      "note": "optional console page (CONSOLE_ENABLED); session-gated, every data action is a public API call authorized by that route",
+      "path": "/console/receipts",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "none",
+        "target": "none"
+      },
+      "status": "exempt",
+      "surface": "rest"
+    },
+    {
+      "action": null,
+      "auth": {
+        "authz_gate": [],
+        "identity": "none",
+        "middleware": "public"
+      },
+      "exempt_reason": "console_session",
+      "extra_actions": [],
+      "function": "console_style",
+      "id": "rest:GET /console/style.css",
+      "method": "GET",
+      "note": "optional console page (CONSOLE_ENABLED); session-gated, every data action is a public API call authorized by that route",
+      "path": "/console/style.css",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "none",
+        "target": "none"
+      },
+      "status": "exempt",
+      "surface": "rest"
+    },
+    {
+      "action": null,
+      "auth": {
+        "authz_gate": [],
+        "identity": "none",
+        "middleware": "public"
+      },
+      "exempt_reason": "console_session",
+      "extra_actions": [],
+      "function": "console_team",
+      "id": "rest:GET /console/team",
+      "method": "GET",
+      "note": "optional console page (CONSOLE_ENABLED); session-gated, every data action is a public API call authorized by that route",
+      "path": "/console/team",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "none",
+        "target": "none"
+      },
+      "status": "exempt",
+      "surface": "rest"
+    },
+    {
+      "action": "list",
+      "auth": {
+        "authz_gate": [],
+        "identity": "token_or_body_user_id+default_user_fallback",
+        "middleware": "bearer_middleware|disabled_if_unconfigured"
+      },
+      "exempt_reason": null,
+      "extra_actions": [],
+      "function": "list_graph_communities_legacy",
+      "id": "rest:GET /graph/communities",
+      "method": "GET",
+      "note": "",
+      "path": "/graph/communities",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "pool",
+        "target": "query.user_id (private pool only)"
+      },
+      "status": "mapped",
+      "surface": "rest"
+    },
+    {
+      "action": "list",
+      "auth": {
+        "authz_gate": [
+          "_authorize_include_expired",
+          "is_dictator"
+        ],
+        "identity": "token_or_body_user_id+default_user_fallback",
+        "middleware": "bearer_middleware|disabled_if_unconfigured"
+      },
+      "exempt_reason": null,
+      "extra_actions": [],
+      "function": "list_graph_edges_legacy",
+      "id": "rest:GET /graph/edges",
+      "method": "GET",
+      "note": "",
+      "path": "/graph/edges",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "pool",
+        "target": "query.user_id (private pool only)"
+      },
+      "status": "mapped",
+      "surface": "rest"
+    },
+    {
+      "action": "list",
+      "auth": {
+        "authz_gate": [],
+        "identity": "token_or_body_user_id+default_user_fallback",
+        "middleware": "bearer_middleware|disabled_if_unconfigured"
+      },
+      "exempt_reason": null,
+      "extra_actions": [],
+      "function": "list_graph_episodes_legacy",
+      "id": "rest:GET /graph/episodes",
+      "method": "GET",
+      "note": "",
+      "path": "/graph/episodes",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "pool",
+        "target": "query.user_id (private pool only)"
+      },
+      "status": "mapped",
+      "surface": "rest"
+    },
+    {
+      "action": "list",
+      "auth": {
+        "authz_gate": [
+          "_authorize_include_expired",
+          "is_dictator"
+        ],
+        "identity": "token_or_body_user_id+default_user_fallback",
+        "middleware": "bearer_middleware|disabled_if_unconfigured"
+      },
+      "exempt_reason": null,
+      "extra_actions": [],
+      "function": "list_graph_nodes_legacy",
+      "id": "rest:GET /graph/nodes",
+      "method": "GET",
+      "note": "",
+      "path": "/graph/nodes",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "pool",
+        "target": "query.user_id (private pool only)"
+      },
+      "status": "mapped",
+      "surface": "rest"
+    },
+    {
+      "action": null,
+      "auth": {
+        "authz_gate": [],
+        "identity": "none",
+        "middleware": "public"
+      },
+      "exempt_reason": "public_liveness",
+      "extra_actions": [],
+      "function": "health",
+      "id": "rest:GET /health",
+      "method": "GET",
+      "note": "",
+      "path": "/health",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "none",
+        "target": "none"
+      },
+      "status": "exempt",
+      "surface": "rest"
+    },
+    {
+      "action": null,
+      "auth": {
+        "authz_gate": [],
+        "identity": "none",
+        "middleware": "public"
+      },
+      "exempt_reason": "public_liveness",
+      "extra_actions": [],
+      "function": "health_live",
+      "id": "rest:GET /health/live",
+      "method": "GET",
+      "note": "",
+      "path": "/health/live",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "none",
+        "target": "none"
+      },
+      "status": "exempt",
+      "surface": "rest"
+    },
+    {
+      "action": "list",
+      "auth": {
+        "authz_gate": [],
+        "identity": "token_or_body_user_id+default_user_fallback",
+        "middleware": "bearer_middleware|disabled_if_unconfigured"
+      },
+      "exempt_reason": null,
+      "extra_actions": [],
+      "function": "list_memories",
+      "id": "rest:GET /memories",
+      "method": "GET",
+      "note": "",
+      "path": "/memories",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "pool",
+        "target": "query.user_id (private pool only)"
+      },
+      "status": "mapped",
+      "surface": "rest"
+    },
+    {
+      "action": "read",
+      "auth": {
+        "authz_gate": [],
+        "identity": "token_or_body_user_id+default_user_fallback",
+        "middleware": "bearer_middleware|disabled_if_unconfigured"
+      },
+      "exempt_reason": null,
+      "extra_actions": [],
+      "function": "get_task_status",
+      "id": "rest:GET /memories/status/{task_id}",
+      "method": "GET",
+      "note": "scoped to the caller tenant and subject when the ledger is enabled",
+      "path": "/memories/status/{task_id}",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "job",
+        "target": "path.task_id"
+      },
+      "status": "mapped",
+      "surface": "rest"
+    },
+    {
+      "action": "read",
+      "auth": {
+        "authz_gate": [
+          "_require_dictator_admin",
+          "is_dictator"
+        ],
+        "identity": "token_or_body_user_id+default_user_fallback",
+        "middleware": "bearer_middleware|disabled_if_unconfigured"
+      },
+      "exempt_reason": null,
+      "extra_actions": [],
+      "function": "v1_engine_switch_status",
+      "id": "rest:GET /v1/admin/engine-switch/status",
+      "method": "GET",
+      "note": "dictator-only today; privileged engine-switch operation (no content grant exists for it; a dedicated admin action needs a contract change)",
+      "path": "/v1/admin/engine-switch/status",
+      "privileged": true,
+      "required_payload": [],
+      "resolver": {
+        "kind": "settings",
+        "target": "credential.subject"
+      },
+      "status": "mapped",
+      "surface": "rest"
+    },
+    {
+      "action": "read",
+      "auth": {
+        "authz_gate": [
+          "_require_dictator_admin",
+          "is_dictator"
+        ],
+        "identity": "token_or_body_user_id+default_user_fallback",
+        "middleware": "bearer_middleware|disabled_if_unconfigured"
+      },
+      "exempt_reason": null,
+      "extra_actions": [],
+      "function": "v1_ledger_cutover_status",
+      "id": "rest:GET /v1/admin/ledger-cutover",
+      "method": "GET",
+      "note": "dictator-only operator control: status of the cutover phase, fence and backfill; never a content grant",
+      "path": "/v1/admin/ledger-cutover",
+      "privileged": true,
+      "required_payload": [],
+      "resolver": {
+        "kind": "settings",
+        "target": "credential.subject"
+      },
+      "status": "mapped",
+      "surface": "rest"
+    },
+    {
+      "action": "read",
+      "auth": {
+        "authz_gate": [],
+        "identity": "none",
+        "middleware": "bearer_middleware|disabled_if_unconfigured"
+      },
+      "exempt_reason": null,
+      "extra_actions": [],
+      "function": "v1_capabilities",
+      "id": "rest:GET /v1/capabilities",
+      "method": "GET",
+      "note": "read-only descriptor of offered operations; tenant cell scoped; unscoped today: identity comes only from the policy hook",
+      "path": "/v1/capabilities",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "tenant",
+        "target": "tenant"
+      },
+      "status": "mapped",
+      "surface": "rest"
+    },
+    {
+      "action": null,
+      "auth": {
+        "authz_gate": [],
+        "identity": "none",
+        "middleware": "bearer_middleware|disabled_if_unconfigured"
+      },
+      "exempt_reason": "static_metadata",
+      "extra_actions": [],
+      "function": "v1_list_categories",
+      "id": "rest:GET /v1/categories",
+      "method": "GET",
+      "note": "",
+      "path": "/v1/categories",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "none",
+        "target": "none"
+      },
+      "status": "exempt",
+      "surface": "rest"
+    },
+    {
+      "action": "search",
+      "auth": {
+        "authz_gate": [],
+        "identity": "token_or_body_user_id+default_user_fallback",
+        "middleware": "bearer_middleware|disabled_if_unconfigured"
+      },
+      "exempt_reason": null,
+      "extra_actions": [],
+      "function": "v1_code_graph_impact",
+      "id": "rest:GET /v1/code-graph/impact",
+      "method": "GET",
+      "note": "",
+      "path": "/v1/code-graph/impact",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "pool",
+        "target": "query.user_id (private pool only)"
+      },
+      "status": "mapped",
+      "surface": "rest"
+    },
+    {
+      "action": "search",
+      "auth": {
+        "authz_gate": [],
+        "identity": "token_or_body_user_id+default_user_fallback",
+        "middleware": "bearer_middleware|disabled_if_unconfigured"
+      },
+      "exempt_reason": null,
+      "extra_actions": [],
+      "function": "v1_code_graph_locate",
+      "id": "rest:GET /v1/code-graph/locate",
+      "method": "GET",
+      "note": "",
+      "path": "/v1/code-graph/locate",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "pool",
+        "target": "query.user_id (private pool only)"
+      },
+      "status": "mapped",
+      "surface": "rest"
+    },
+    {
+      "action": "search",
+      "auth": {
+        "authz_gate": [],
+        "identity": "token_or_body_user_id+default_user_fallback",
+        "middleware": "bearer_middleware|disabled_if_unconfigured"
+      },
+      "exempt_reason": null,
+      "extra_actions": [],
+      "function": "v1_code_graph_neighbors",
+      "id": "rest:GET /v1/code-graph/neighbors",
+      "method": "GET",
+      "note": "",
+      "path": "/v1/code-graph/neighbors",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "pool",
+        "target": "query.user_id (private pool only)"
+      },
+      "status": "mapped",
+      "surface": "rest"
+    },
+    {
+      "action": "search",
+      "auth": {
+        "authz_gate": [],
+        "identity": "token_or_body_user_id+default_user_fallback",
+        "middleware": "bearer_middleware|disabled_if_unconfigured"
+      },
+      "exempt_reason": null,
+      "extra_actions": [],
+      "function": "v1_code_graph_path",
+      "id": "rest:GET /v1/code-graph/path",
+      "method": "GET",
+      "note": "",
+      "path": "/v1/code-graph/path",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "pool",
+        "target": "query.user_id (private pool only)"
+      },
+      "status": "mapped",
+      "surface": "rest"
+    },
+    {
+      "action": "search",
+      "auth": {
+        "authz_gate": [],
+        "identity": "token_or_body_user_id+default_user_fallback",
+        "middleware": "bearer_middleware|disabled_if_unconfigured"
+      },
+      "exempt_reason": null,
+      "extra_actions": [],
+      "function": "v1_code_graph_query",
+      "id": "rest:GET /v1/code-graph/query",
+      "method": "GET",
+      "note": "",
+      "path": "/v1/code-graph/query",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "pool",
+        "target": "query.user_id (private pool only)"
+      },
+      "status": "mapped",
+      "surface": "rest"
+    },
+    {
+      "action": "list",
+      "auth": {
+        "authz_gate": [],
+        "identity": "token_or_body_user_id+default_user_fallback",
+        "middleware": "bearer_middleware|disabled_if_unconfigured"
+      },
+      "exempt_reason": null,
+      "extra_actions": [],
+      "function": "v1_list_connectors",
+      "id": "rest:GET /v1/connectors",
+      "method": "GET",
+      "note": "",
+      "path": "/v1/connectors",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "connector",
+        "target": "tenant"
+      },
+      "status": "mapped",
+      "surface": "rest"
+    },
+    {
+      "action": "read",
+      "auth": {
+        "authz_gate": [
+          "_require_owned_connector"
+        ],
+        "identity": "token_or_body_user_id+default_user_fallback",
+        "middleware": "bearer_middleware|disabled_if_unconfigured"
+      },
+      "exempt_reason": null,
+      "extra_actions": [],
+      "function": "v1_get_connector",
+      "id": "rest:GET /v1/connectors/{connector_id}",
+      "method": "GET",
+      "note": "",
+      "path": "/v1/connectors/{connector_id}",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "connector",
+        "target": "path.connector_id"
+      },
+      "status": "mapped",
+      "surface": "rest"
+    },
+    {
+      "action": "read",
+      "auth": {
+        "authz_gate": [],
+        "identity": "token_or_body_user_id+default_user_fallback",
+        "middleware": "bearer_middleware|disabled_if_unconfigured"
+      },
+      "exempt_reason": null,
+      "extra_actions": [],
+      "function": "v1_get_global_context",
+      "id": "rest:GET /v1/context/global",
+      "method": "GET",
+      "note": "",
+      "path": "/v1/context/global",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "pool",
+        "target": "query.user_id (private pool only)"
+      },
+      "status": "mapped",
+      "surface": "rest"
+    },
+    {
+      "action": "read",
+      "auth": {
+        "authz_gate": [],
+        "identity": "token_or_body_user_id+default_user_fallback",
+        "middleware": "bearer_middleware|disabled_if_unconfigured"
+      },
+      "exempt_reason": null,
+      "extra_actions": [],
+      "function": "v1_inject_context",
+      "id": "rest:GET /v1/context/inject",
+      "method": "GET",
+      "note": "",
+      "path": "/v1/context/inject",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "pool",
+        "target": "credential.subject (private pool)"
+      },
+      "status": "mapped",
+      "surface": "rest"
+    },
+    {
+      "action": "read",
+      "auth": {
+        "authz_gate": [],
+        "identity": "token_or_body_user_id+default_user_fallback",
+        "middleware": "bearer_middleware|disabled_if_unconfigured"
+      },
+      "exempt_reason": null,
+      "extra_actions": [],
+      "function": "v1_get_project_context",
+      "id": "rest:GET /v1/context/{project_id}",
+      "method": "GET",
+      "note": "",
+      "path": "/v1/context/{project_id}",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "pool",
+        "target": "path.project_id"
+      },
+      "status": "mapped",
+      "surface": "rest"
+    },
+    {
+      "action": "read",
+      "auth": {
+        "authz_gate": [],
+        "identity": "none",
+        "middleware": "bearer_middleware|disabled_if_unconfigured"
+      },
+      "exempt_reason": null,
+      "extra_actions": [],
+      "function": "v1_e2ee_changes",
+      "id": "rest:GET /v1/e2ee/spaces/{space_id}/changes",
+      "method": "GET",
+      "note": "serve ordered envelope change metadata after a cursor; tenant cell scoped; unscoped today: identity comes only from the policy hook",
+      "path": "/v1/e2ee/spaces/{space_id}/changes",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "tenant",
+        "target": "tenant"
+      },
+      "status": "mapped",
+      "surface": "rest"
+    },
+    {
+      "action": "read",
+      "auth": {
+        "authz_gate": [],
+        "identity": "none",
+        "middleware": "bearer_middleware|disabled_if_unconfigured"
+      },
+      "exempt_reason": null,
+      "extra_actions": [],
+      "function": "v1_e2ee_latest_checkpoint",
+      "id": "rest:GET /v1/e2ee/spaces/{space_id}/checkpoints/latest",
+      "method": "GET",
+      "note": "serve the latest signed checkpoint; tenant cell scoped; unscoped today: identity comes only from the policy hook",
+      "path": "/v1/e2ee/spaces/{space_id}/checkpoints/latest",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "tenant",
+        "target": "tenant"
+      },
+      "status": "mapped",
+      "surface": "rest"
+    },
+    {
+      "action": "read",
+      "auth": {
+        "authz_gate": [],
+        "identity": "none",
+        "middleware": "bearer_middleware|disabled_if_unconfigured"
+      },
+      "exempt_reason": null,
+      "extra_actions": [],
+      "function": "v1_e2ee_job_state",
+      "id": "rest:GET /v1/e2ee/spaces/{space_id}/jobs/{job_id}",
+      "method": "GET",
+      "note": "read the state of a job; tenant cell scoped; unscoped today: identity comes only from the policy hook",
+      "path": "/v1/e2ee/spaces/{space_id}/jobs/{job_id}",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "tenant",
+        "target": "tenant"
+      },
+      "status": "mapped",
+      "surface": "rest"
+    },
+    {
+      "action": "read",
+      "auth": {
+        "authz_gate": [],
+        "identity": "none",
+        "middleware": "bearer_middleware|disabled_if_unconfigured"
+      },
+      "exempt_reason": null,
+      "extra_actions": [],
+      "function": "v1_e2ee_get_membership",
+      "id": "rest:GET /v1/e2ee/spaces/{space_id}/membership",
+      "method": "GET",
+      "note": "serve the signed membership log; tenant cell scoped; unscoped today: identity comes only from the policy hook",
+      "path": "/v1/e2ee/spaces/{space_id}/membership",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "tenant",
+        "target": "tenant"
+      },
+      "status": "mapped",
+      "surface": "rest"
+    },
+    {
+      "action": "read",
+      "auth": {
+        "authz_gate": [],
+        "identity": "none",
+        "middleware": "bearer_middleware|disabled_if_unconfigured"
+      },
+      "exempt_reason": null,
+      "extra_actions": [],
+      "function": "v1_e2ee_membership_delta",
+      "id": "rest:GET /v1/e2ee/spaces/{space_id}/membership-delta",
+      "method": "GET",
+      "note": "serve membership entries after a verified sequence; tenant cell scoped; unscoped today: identity comes only from the policy hook",
+      "path": "/v1/e2ee/spaces/{space_id}/membership-delta",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "tenant",
+        "target": "tenant"
+      },
+      "status": "mapped",
+      "surface": "rest"
+    },
+    {
+      "action": "list",
+      "auth": {
+        "authz_gate": [],
+        "identity": "none",
+        "middleware": "bearer_middleware|disabled_if_unconfigured"
+      },
+      "exempt_reason": null,
+      "extra_actions": [],
+      "function": "v1_e2ee_list_objects",
+      "id": "rest:GET /v1/e2ee/spaces/{space_id}/objects",
+      "method": "GET",
+      "note": "serve the object index (ids and revisions only); tenant cell scoped; unscoped today: identity comes only from the policy hook",
+      "path": "/v1/e2ee/spaces/{space_id}/objects",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "tenant",
+        "target": "tenant"
+      },
+      "status": "mapped",
+      "surface": "rest"
+    },
+    {
+      "action": "read",
+      "auth": {
+        "authz_gate": [],
+        "identity": "none",
+        "middleware": "bearer_middleware|disabled_if_unconfigured"
+      },
+      "exempt_reason": null,
+      "extra_actions": [],
+      "function": "v1_e2ee_get_envelope",
+      "id": "rest:GET /v1/e2ee/spaces/{space_id}/objects/{object_id}",
+      "method": "GET",
+      "note": "serve an envelope (opaque); tenant cell scoped; unscoped today: identity comes only from the policy hook",
+      "path": "/v1/e2ee/spaces/{space_id}/objects/{object_id}",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "tenant",
+        "target": "tenant"
+      },
+      "status": "mapped",
+      "surface": "rest"
+    },
+    {
+      "action": "read",
+      "auth": {
+        "authz_gate": [],
+        "identity": "none",
+        "middleware": "bearer_middleware|disabled_if_unconfigured"
+      },
+      "exempt_reason": null,
+      "extra_actions": [],
+      "function": "v1_e2ee_get_wrap",
+      "id": "rest:GET /v1/e2ee/spaces/{space_id}/wraps/{epoch}/{fingerprint}",
+      "method": "GET",
+      "note": "serve one wrapped epoch key (opaque); tenant cell scoped; unscoped today: identity comes only from the policy hook",
+      "path": "/v1/e2ee/spaces/{space_id}/wraps/{epoch}/{fingerprint}",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "tenant",
+        "target": "tenant"
+      },
+      "status": "mapped",
+      "surface": "rest"
+    },
+    {
+      "action": "export",
+      "auth": {
+        "authz_gate": [],
+        "identity": "token_or_body_user_id+default_user_fallback",
+        "middleware": "bearer_middleware|disabled_if_unconfigured"
+      },
+      "exempt_reason": null,
+      "extra_actions": [],
+      "function": "v1_export_okf",
+      "id": "rest:GET /v1/export/okf",
+      "method": "GET",
+      "note": "",
+      "path": "/v1/export/okf",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "pool",
+        "target": "query.project_id+query.visibility"
+      },
+      "status": "mapped",
+      "surface": "rest"
+    },
+    {
+      "action": null,
+      "auth": {
+        "authz_gate": [],
+        "identity": "none",
+        "middleware": "bearer_middleware|disabled_if_unconfigured"
+      },
+      "exempt_reason": "static_metadata (assumption D-2)",
+      "extra_actions": [],
+      "function": "v1_list_extensions",
+      "id": "rest:GET /v1/extensions",
+      "method": "GET",
+      "note": "",
+      "path": "/v1/extensions",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "none",
+        "target": "none"
+      },
+      "status": "exempt",
+      "surface": "rest"
+    },
+    {
+      "action": "list",
+      "auth": {
+        "authz_gate": [],
+        "identity": "token_or_body_user_id+default_user_fallback",
+        "middleware": "bearer_middleware|disabled_if_unconfigured"
+      },
+      "exempt_reason": null,
+      "extra_actions": [],
+      "function": "v1_graph_communities",
+      "id": "rest:GET /v1/graph/communities",
+      "method": "GET",
+      "note": "",
+      "path": "/v1/graph/communities",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "pool",
+        "target": "query.project_id"
+      },
+      "status": "mapped",
+      "surface": "rest"
+    },
+    {
+      "action": "list",
+      "auth": {
+        "authz_gate": [
+          "_authorize_include_expired",
+          "is_dictator"
+        ],
+        "identity": "token_or_body_user_id+default_user_fallback",
+        "middleware": "bearer_middleware|disabled_if_unconfigured"
+      },
+      "exempt_reason": null,
+      "extra_actions": [],
+      "function": "v1_graph_edges",
+      "id": "rest:GET /v1/graph/edges",
+      "method": "GET",
+      "note": "",
+      "path": "/v1/graph/edges",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "pool",
+        "target": "query.project_id"
+      },
+      "status": "mapped",
+      "surface": "rest"
+    },
+    {
+      "action": "list",
+      "auth": {
+        "authz_gate": [],
+        "identity": "token_or_body_user_id+default_user_fallback",
+        "middleware": "bearer_middleware|disabled_if_unconfigured"
+      },
+      "exempt_reason": null,
+      "extra_actions": [],
+      "function": "v1_graph_episodes",
+      "id": "rest:GET /v1/graph/episodes",
+      "method": "GET",
+      "note": "",
+      "path": "/v1/graph/episodes",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "pool",
+        "target": "query.project_id"
+      },
+      "status": "mapped",
+      "surface": "rest"
+    },
+    {
+      "action": "list",
+      "auth": {
+        "authz_gate": [
+          "_authorize_include_expired",
+          "is_dictator"
+        ],
+        "identity": "token_or_body_user_id+default_user_fallback",
+        "middleware": "bearer_middleware|disabled_if_unconfigured"
+      },
+      "exempt_reason": null,
+      "extra_actions": [],
+      "function": "v1_graph_nodes",
+      "id": "rest:GET /v1/graph/nodes",
+      "method": "GET",
+      "note": "",
+      "path": "/v1/graph/nodes",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "pool",
+        "target": "query.project_id"
+      },
+      "status": "mapped",
+      "surface": "rest"
+    },
+    {
+      "action": "read",
+      "auth": {
+        "authz_gate": [],
+        "identity": "token_or_body_user_id+default_user_fallback",
+        "middleware": "bearer_middleware|disabled_if_unconfigured"
+      },
+      "exempt_reason": null,
+      "extra_actions": [],
+      "function": "v1_get_artifact",
+      "id": "rest:GET /v1/ingest/artifacts/{file_id}",
+      "method": "GET",
+      "note": "",
+      "path": "/v1/ingest/artifacts/{file_id}",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "artifact",
+        "target": "path.file_id"
+      },
+      "status": "mapped",
+      "surface": "rest"
+    },
+    {
+      "action": "read",
+      "auth": {
+        "authz_gate": [],
+        "identity": "token_or_body_user_id+default_user_fallback",
+        "middleware": "bearer_middleware|disabled_if_unconfigured"
+      },
+      "exempt_reason": null,
+      "extra_actions": [],
+      "function": "v1_get_exemplar_image",
+      "id": "rest:GET /v1/ingest/exemplars/{image_id}",
+      "method": "GET",
+      "note": "",
+      "path": "/v1/ingest/exemplars/{image_id}",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "artifact",
+        "target": "path.image_id"
+      },
+      "status": "mapped",
+      "surface": "rest"
+    },
+    {
+      "action": "manage_membership",
+      "auth": {
+        "authz_gate": [],
+        "identity": "token_or_body_user_id",
+        "middleware": "bearer_middleware|disabled_if_unconfigured"
+      },
+      "exempt_reason": null,
+      "extra_actions": [],
+      "function": "v1_list_members",
+      "id": "rest:GET /v1/members",
+      "method": "GET",
+      "note": "",
+      "path": "/v1/members",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "membership",
+        "target": "credential.tenant"
+      },
+      "status": "mapped",
+      "surface": "rest"
+    },
+    {
+      "action": "manage_membership",
+      "auth": {
+        "authz_gate": [],
+        "identity": "token_or_body_user_id",
+        "middleware": "bearer_middleware|disabled_if_unconfigured"
+      },
+      "exempt_reason": null,
+      "extra_actions": [],
+      "function": "v1_list_invites",
+      "id": "rest:GET /v1/members/invites",
+      "method": "GET",
+      "note": "",
+      "path": "/v1/members/invites",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "membership",
+        "target": "credential.tenant"
+      },
+      "status": "mapped",
+      "surface": "rest"
+    },
+    {
+      "action": "manage_membership",
+      "auth": {
+        "authz_gate": [],
+        "identity": "token_or_body_user_id",
+        "middleware": "bearer_middleware|disabled_if_unconfigured"
+      },
+      "exempt_reason": null,
+      "extra_actions": [],
+      "function": "v1_get_onboarding_policy",
+      "id": "rest:GET /v1/members/policy",
+      "method": "GET",
+      "note": "",
+      "path": "/v1/members/policy",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "membership",
+        "target": "credential.tenant"
+      },
+      "status": "mapped",
+      "surface": "rest"
+    },
+    {
+      "action": "list",
+      "auth": {
+        "authz_gate": [],
+        "identity": "token_or_body_user_id+default_user_fallback",
+        "middleware": "bearer_middleware|disabled_if_unconfigured"
+      },
+      "exempt_reason": null,
+      "extra_actions": [],
+      "function": "v1_list_memories",
+      "id": "rest:GET /v1/memories",
+      "method": "GET",
+      "note": "",
+      "path": "/v1/memories",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "pool",
+        "target": "query.project_id"
+      },
+      "status": "mapped",
+      "surface": "rest"
+    },
+    {
+      "action": "read",
+      "auth": {
+        "authz_gate": [],
+        "identity": "token_or_body_user_id+default_user_fallback",
+        "middleware": "bearer_middleware|disabled_if_unconfigured"
+      },
+      "exempt_reason": null,
+      "extra_actions": [],
+      "function": "v1_get_task_status",
+      "id": "rest:GET /v1/memories/status/{task_id}",
+      "method": "GET",
+      "note": "scoped to the caller tenant and subject when the ledger is enabled",
+      "path": "/v1/memories/status/{task_id}",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "job",
+        "target": "path.task_id"
+      },
+      "status": "mapped",
+      "surface": "rest"
+    },
+    {
+      "action": "read",
+      "auth": {
+        "authz_gate": [],
+        "identity": "token_or_body_user_id+default_user_fallback",
+        "middleware": "bearer_middleware|disabled_if_unconfigured"
+      },
+      "exempt_reason": null,
+      "extra_actions": [],
+      "function": "v1_get_task_outputs",
+      "id": "rest:GET /v1/memories/status/{task_id}/outputs",
+      "method": "GET",
+      "note": "pages the outputs of the caller's own durable task; same tenant and actor scoping as the status route",
+      "path": "/v1/memories/status/{task_id}/outputs",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "job",
+        "target": "path.task_id"
+      },
+      "status": "mapped",
+      "surface": "rest"
+    },
+    {
+      "action": "read",
+      "auth": {
+        "authz_gate": [],
+        "identity": "token_or_body_user_id+default_user_fallback",
+        "middleware": "bearer_middleware|disabled_if_unconfigured"
+      },
+      "exempt_reason": null,
+      "extra_actions": [],
+      "function": "v1_get_memory",
+      "id": "rest:GET /v1/memories/{memory_id}",
+      "method": "GET",
+      "note": "",
+      "path": "/v1/memories/{memory_id}",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "memory",
+        "target": "path.memory_id"
+      },
+      "status": "mapped",
+      "surface": "rest"
+    },
+    {
+      "action": "read",
+      "auth": {
+        "authz_gate": [],
+        "identity": "token_or_body_user_id+default_user_fallback",
+        "middleware": "bearer_middleware|disabled_if_unconfigured"
+      },
+      "exempt_reason": null,
+      "extra_actions": [],
+      "function": "v1_get_reasoning_chain",
+      "id": "rest:GET /v1/memories/{memory_id}/reasoning_chain",
+      "method": "GET",
+      "note": "",
+      "path": "/v1/memories/{memory_id}/reasoning_chain",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "memory",
+        "target": "path.memory_id"
+      },
+      "status": "mapped",
+      "surface": "rest"
+    },
+    {
+      "action": "count",
+      "auth": {
+        "authz_gate": [],
+        "identity": "token_or_body_user_id+default_user_fallback",
+        "middleware": "bearer_middleware|disabled_if_unconfigured"
+      },
+      "exempt_reason": null,
+      "extra_actions": [],
+      "function": "v1_metrics",
+      "id": "rest:GET /v1/metrics",
+      "method": "GET",
+      "note": "",
+      "path": "/v1/metrics",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "tenant",
+        "target": "credential.tenant"
+      },
+      "status": "mapped",
+      "surface": "rest"
+    },
+    {
+      "action": "export",
+      "auth": {
+        "authz_gate": [],
+        "identity": "request_user_id",
+        "middleware": "bearer_middleware|disabled_if_unconfigured"
+      },
+      "exempt_reason": null,
+      "extra_actions": [],
+      "function": "v1_download_portability_export",
+      "id": "rest:GET /v1/portability/exports/{export_id}/download",
+      "method": "GET",
+      "note": "tenant export; the service re-authorizes the verified principal itself and denies without a bound member",
+      "path": "/v1/portability/exports/{export_id}/download",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "tenant",
+        "target": "tenant"
+      },
+      "status": "mapped",
+      "surface": "rest"
+    },
+    {
+      "action": "restore",
+      "auth": {
+        "authz_gate": [],
+        "identity": "request_user_id",
+        "middleware": "bearer_middleware|disabled_if_unconfigured"
+      },
+      "exempt_reason": null,
+      "extra_actions": [],
+      "function": "v1_get_portability_import",
+      "id": "rest:GET /v1/portability/imports/{import_id}",
+      "method": "GET",
+      "note": "tenant restore; the service also requires manage_membership because it maps identities into the tenant",
+      "path": "/v1/portability/imports/{import_id}",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "tenant",
+        "target": "tenant"
+      },
+      "status": "mapped",
+      "surface": "rest"
+    },
+    {
+      "action": "list",
+      "auth": {
+        "authz_gate": [],
+        "identity": "token_or_body_user_id+default_user_fallback",
+        "middleware": "bearer_middleware|disabled_if_unconfigured"
+      },
+      "exempt_reason": null,
+      "extra_actions": [],
+      "function": "v1_list_processes",
+      "id": "rest:GET /v1/processes",
+      "method": "GET",
+      "note": "",
+      "path": "/v1/processes",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "pool",
+        "target": "query.project_id"
+      },
+      "status": "mapped",
+      "surface": "rest"
+    },
+    {
+      "action": "read",
+      "auth": {
+        "authz_gate": [],
+        "identity": "token_or_body_user_id+default_user_fallback",
+        "middleware": "bearer_middleware|disabled_if_unconfigured"
+      },
+      "exempt_reason": null,
+      "extra_actions": [],
+      "function": "v1_get_process",
+      "id": "rest:GET /v1/processes/{slug}",
+      "method": "GET",
+      "note": "",
+      "path": "/v1/processes/{slug}",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "pool",
+        "target": "path.slug+query.project_id"
+      },
+      "status": "mapped",
+      "surface": "rest"
+    },
+    {
+      "action": "list",
+      "auth": {
+        "authz_gate": [],
+        "identity": "token_or_body_user_id+default_user_fallback",
+        "middleware": "bearer_middleware|disabled_if_unconfigured"
+      },
+      "exempt_reason": null,
+      "extra_actions": [],
+      "function": "v1_list_projects",
+      "id": "rest:GET /v1/projects",
+      "method": "GET",
+      "note": "",
+      "path": "/v1/projects",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "pool",
+        "target": "query.user_id (private pool only)"
+      },
+      "status": "mapped",
+      "surface": "rest"
+    },
+    {
+      "action": "read",
+      "auth": {
+        "authz_gate": [],
+        "identity": "none",
+        "middleware": "bearer_middleware|disabled_if_unconfigured"
+      },
+      "exempt_reason": null,
+      "extra_actions": [],
+      "function": "v1_get_project_knowledge_config",
+      "id": "rest:GET /v1/projects/{project_id}/knowledge-config",
+      "method": "GET",
+      "note": "unscoped today; decision pending: global/project administration needs a settings-administration grant",
+      "path": "/v1/projects/{project_id}/knowledge-config",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "settings",
+        "target": "path.project_id"
+      },
+      "status": "mapped",
+      "surface": "rest"
+    },
+    {
+      "action": "count",
+      "auth": {
+        "authz_gate": [],
+        "identity": "token_or_body_user_id+default_user_fallback",
+        "middleware": "bearer_middleware|disabled_if_unconfigured"
+      },
+      "exempt_reason": null,
+      "extra_actions": [],
+      "function": "v1_queue_status",
+      "id": "rest:GET /v1/queue/status",
+      "method": "GET",
+      "note": "",
+      "path": "/v1/queue/status",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "tenant",
+        "target": "credential.tenant"
+      },
+      "status": "mapped",
+      "surface": "rest"
+    },
+    {
+      "action": "read",
+      "auth": {
+        "authz_gate": [],
+        "identity": "token_or_body_user_id+default_user_fallback",
+        "middleware": "bearer_middleware|disabled_if_unconfigured"
+      },
+      "exempt_reason": null,
+      "extra_actions": [],
+      "function": "v1_fetch_reference",
+      "id": "rest:GET /v1/references/{kind}/{reference_id}",
+      "method": "GET",
+      "note": "memory references only; other kinds are not found; authorization re-checked on every resolution",
+      "path": "/v1/references/{kind}/{reference_id}",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "memory",
+        "target": "path.reference_id"
+      },
+      "status": "mapped",
+      "surface": "rest"
+    },
+    {
+      "action": "read",
+      "auth": {
+        "authz_gate": [],
+        "identity": "token_or_body_user_id+default_user_fallback",
+        "middleware": "bearer_middleware|disabled_if_unconfigured"
+      },
+      "exempt_reason": null,
+      "extra_actions": [],
+      "function": "v1_get_extraction_instructions",
+      "id": "rest:GET /v1/settings/extraction-instructions",
+      "method": "GET",
+      "note": "",
+      "path": "/v1/settings/extraction-instructions",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "settings",
+        "target": "credential.subject"
+      },
+      "status": "mapped",
+      "surface": "rest"
+    },
+    {
+      "action": "read",
+      "auth": {
+        "authz_gate": [],
+        "identity": "token_or_body_user_id+default_user_fallback",
+        "middleware": "bearer_middleware|disabled_if_unconfigured"
+      },
+      "exempt_reason": null,
+      "extra_actions": [],
+      "function": "v1_event_stream",
+      "id": "rest:GET /v1/stream",
+      "method": "GET",
+      "note": "",
+      "path": "/v1/stream",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "pool",
+        "target": "query.user_id (private pool only)"
+      },
+      "status": "mapped",
+      "surface": "rest"
+    },
+    {
+      "action": "read",
+      "auth": {
+        "authz_gate": [],
+        "identity": "token_or_body_user_id+default_user_fallback",
+        "middleware": "bearer_middleware|disabled_if_unconfigured"
+      },
+      "exempt_reason": null,
+      "extra_actions": [],
+      "function": "v1_task_usage",
+      "id": "rest:GET /v1/usage/tasks/{intent_id}",
+      "method": "GET",
+      "note": "service-ledger usage of one write task; off unless USAGE_STORE_ENABLED; scoped to the caller tenant and subject",
+      "path": "/v1/usage/tasks/{intent_id}",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "job",
+        "target": "path.intent_id"
+      },
+      "status": "mapped",
+      "surface": "rest"
+    },
+    {
+      "action": "update",
+      "auth": {
+        "authz_gate": [],
+        "identity": "token_or_body_user_id+default_user_fallback",
+        "middleware": "bearer_middleware|disabled_if_unconfigured"
+      },
+      "exempt_reason": null,
+      "extra_actions": [
+        [
+          "share",
+          "visibility_change=shared"
+        ],
+        [
+          "publish_standard",
+          "visibility_change=standard"
+        ],
+        [
+          "publish_standard",
+          "target.visibility=standard"
+        ],
+        [
+          "background_derive",
+          "credential=scoped"
+        ]
+      ],
+      "function": "v1_patch_memory",
+      "id": "rest:PATCH /v1/memories/{memory_id}",
+      "method": "PATCH",
+      "note": "",
+      "path": "/v1/memories/{memory_id}",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "memory",
+        "target": "path.memory_id"
+      },
+      "status": "mapped",
+      "surface": "rest"
+    },
+    {
+      "action": null,
+      "auth": {
+        "authz_gate": [],
+        "identity": "none",
+        "middleware": "public"
+      },
+      "exempt_reason": "console_session",
+      "extra_actions": [],
+      "function": "console_export",
+      "id": "rest:POST /console/export",
+      "method": "POST",
+      "note": "optional console page (CONSOLE_ENABLED); session-gated, every data action is a public API call authorized by that route",
+      "path": "/console/export",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "none",
+        "target": "none"
+      },
+      "status": "exempt",
+      "surface": "rest"
+    },
+    {
+      "action": null,
+      "auth": {
+        "authz_gate": [],
+        "identity": "none",
+        "middleware": "public"
+      },
+      "exempt_reason": "console_session",
+      "extra_actions": [],
+      "function": "console_login",
+      "id": "rest:POST /console/login",
+      "method": "POST",
+      "note": "optional console page (CONSOLE_ENABLED); session-gated, every data action is a public API call authorized by that route",
+      "path": "/console/login",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "none",
+        "target": "none"
+      },
+      "status": "exempt",
+      "surface": "rest"
+    },
+    {
+      "action": null,
+      "auth": {
+        "authz_gate": [],
+        "identity": "none",
+        "middleware": "public"
+      },
+      "exempt_reason": "console_session",
+      "extra_actions": [],
+      "function": "console_logout",
+      "id": "rest:POST /console/logout",
+      "method": "POST",
+      "note": "optional console page (CONSOLE_ENABLED); session-gated, every data action is a public API call authorized by that route",
+      "path": "/console/logout",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "none",
+        "target": "none"
+      },
+      "status": "exempt",
+      "surface": "rest"
+    },
+    {
+      "action": null,
+      "auth": {
+        "authz_gate": [],
+        "identity": "none",
+        "middleware": "public"
+      },
+      "exempt_reason": "console_session",
+      "extra_actions": [],
+      "function": "console_correct",
+      "id": "rest:POST /console/memories/{memory_id}/correct",
+      "method": "POST",
+      "note": "optional console page (CONSOLE_ENABLED); session-gated, every data action is a public API call authorized by that route",
+      "path": "/console/memories/{memory_id}/correct",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "none",
+        "target": "none"
+      },
+      "status": "exempt",
+      "surface": "rest"
+    },
+    {
+      "action": null,
+      "auth": {
+        "authz_gate": [],
+        "identity": "none",
+        "middleware": "public"
+      },
+      "exempt_reason": "console_session",
+      "extra_actions": [],
+      "function": "console_team_invite",
+      "id": "rest:POST /console/team/invite",
+      "method": "POST",
+      "note": "optional console page (CONSOLE_ENABLED); session-gated, every data action is a public API call authorized by that route",
+      "path": "/console/team/invite",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "none",
+        "target": "none"
+      },
+      "status": "exempt",
+      "surface": "rest"
+    },
+    {
+      "action": null,
+      "auth": {
+        "authz_gate": [],
+        "identity": "none",
+        "middleware": "public"
+      },
+      "exempt_reason": "console_session",
+      "extra_actions": [],
+      "function": "console_team_remove",
+      "id": "rest:POST /console/team/remove",
+      "method": "POST",
+      "note": "optional console page (CONSOLE_ENABLED); session-gated, every data action is a public API call authorized by that route",
+      "path": "/console/team/remove",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "none",
+        "target": "none"
+      },
+      "status": "exempt",
+      "surface": "rest"
+    },
+    {
+      "action": null,
+      "auth": {
+        "authz_gate": [],
+        "identity": "none",
+        "middleware": "public"
+      },
+      "exempt_reason": "console_session",
+      "extra_actions": [],
+      "function": "console_team_revoke_invite",
+      "id": "rest:POST /console/team/revoke-invite",
+      "method": "POST",
+      "note": "optional console page (CONSOLE_ENABLED); session-gated, every data action is a public API call authorized by that route",
+      "path": "/console/team/revoke-invite",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "none",
+        "target": "none"
+      },
+      "status": "exempt",
+      "surface": "rest"
+    },
+    {
+      "action": "search",
+      "auth": {
+        "authz_gate": [],
+        "identity": "token_or_body_user_id+default_user_fallback",
+        "middleware": "bearer_middleware|disabled_if_unconfigured"
+      },
+      "exempt_reason": null,
+      "extra_actions": [],
+      "function": "advanced_graph_search_legacy",
+      "id": "rest:POST /graph/search",
+      "method": "POST",
+      "note": "",
+      "path": "/graph/search",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "pool",
+        "target": "body.user_id (private pool only)"
+      },
+      "status": "mapped",
+      "surface": "rest"
+    },
+    {
+      "action": "create",
+      "auth": {
+        "authz_gate": [],
+        "identity": "token_or_body_user_id+default_user_fallback",
+        "middleware": "bearer_middleware|disabled_if_unconfigured"
+      },
+      "exempt_reason": null,
+      "extra_actions": [
+        [
+          "share",
+          "visibility=shared"
+        ],
+        [
+          "publish_standard",
+          "visibility=standard"
+        ],
+        [
+          "background_derive",
+          "credential=scoped"
+        ]
+      ],
+      "function": "add_memory",
+      "id": "rest:POST /memories",
+      "method": "POST",
+      "note": "",
+      "path": "/memories",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "pool",
+        "target": "body.user_id (private pool only)"
+      },
+      "status": "mapped",
+      "surface": "rest"
+    },
+    {
+      "action": "create",
+      "auth": {
+        "authz_gate": [],
+        "identity": "token_or_body_user_id+default_user_fallback",
+        "middleware": "bearer_middleware|disabled_if_unconfigured"
+      },
+      "exempt_reason": null,
+      "extra_actions": [
+        [
+          "share",
+          "visibility=shared"
+        ],
+        [
+          "publish_standard",
+          "visibility=standard"
+        ],
+        [
+          "background_derive",
+          "credential=scoped"
+        ]
+      ],
+      "function": "add_memory_async",
+      "id": "rest:POST /memories/async",
+      "method": "POST",
+      "note": "",
+      "path": "/memories/async",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "pool",
+        "target": "body.user_id (private pool only)"
+      },
+      "status": "mapped",
+      "surface": "rest"
+    },
+    {
+      "action": "search",
+      "auth": {
+        "authz_gate": [],
+        "identity": "token_or_body_user_id+default_user_fallback",
+        "middleware": "bearer_middleware|disabled_if_unconfigured"
+      },
+      "exempt_reason": null,
+      "extra_actions": [],
+      "function": "search_memories",
+      "id": "rest:POST /search",
+      "method": "POST",
+      "note": "",
+      "path": "/search",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "pool",
+        "target": "body.user_id (private pool only)"
+      },
+      "status": "mapped",
+      "surface": "rest"
+    },
+    {
+      "action": "read",
+      "auth": {
+        "authz_gate": [
+          "_require_dictator_admin",
+          "is_dictator"
+        ],
+        "identity": "token_or_body_user_id+default_user_fallback",
+        "middleware": "bearer_middleware|disabled_if_unconfigured"
+      },
+      "exempt_reason": null,
+      "extra_actions": [],
+      "function": "v1_audit_private_leakage",
+      "id": "rest:POST /v1/admin/audit-private-leakage",
+      "method": "POST",
+      "note": "dictator-only today; needs an explicit content grant, never an admin role (assumption D-3)",
+      "path": "/v1/admin/audit-private-leakage",
+      "privileged": true,
+      "required_payload": [],
+      "resolver": {
+        "kind": "pool",
+        "target": "body.user_id (private pool)"
+      },
+      "status": "mapped",
+      "surface": "rest"
+    },
+    {
+      "action": "update",
+      "auth": {
+        "authz_gate": [
+          "_require_dictator_admin",
+          "is_dictator"
+        ],
+        "identity": "token_or_body_user_id+default_user_fallback",
+        "middleware": "bearer_middleware|disabled_if_unconfigured"
+      },
+      "exempt_reason": null,
+      "extra_actions": [],
+      "function": "v1_engine_switch_abandon",
+      "id": "rest:POST /v1/admin/engine-switch/abandon",
+      "method": "POST",
+      "note": "dictator-only today; privileged engine-switch operation (no content grant exists for it; a dedicated admin action needs a contract change)",
+      "path": "/v1/admin/engine-switch/abandon",
+      "privileged": true,
+      "required_payload": [],
+      "resolver": {
+        "kind": "settings",
+        "target": "credential.subject"
+      },
+      "status": "mapped",
+      "surface": "rest"
+    },
+    {
+      "action": "update",
+      "auth": {
+        "authz_gate": [
+          "_require_dictator_admin",
+          "is_dictator"
+        ],
+        "identity": "token_or_body_user_id+default_user_fallback",
+        "middleware": "bearer_middleware|disabled_if_unconfigured"
+      },
+      "exempt_reason": null,
+      "extra_actions": [],
+      "function": "v1_engine_switch_catch_up",
+      "id": "rest:POST /v1/admin/engine-switch/catch-up",
+      "method": "POST",
+      "note": "dictator-only today; privileged engine-switch operation (no content grant exists for it; a dedicated admin action needs a contract change)",
+      "path": "/v1/admin/engine-switch/catch-up",
+      "privileged": true,
+      "required_payload": [],
+      "resolver": {
+        "kind": "settings",
+        "target": "credential.subject"
+      },
+      "status": "mapped",
+      "surface": "rest"
+    },
+    {
+      "action": "update",
+      "auth": {
+        "authz_gate": [
+          "_require_dictator_admin",
+          "is_dictator"
+        ],
+        "identity": "token_or_body_user_id+default_user_fallback",
+        "middleware": "bearer_middleware|disabled_if_unconfigured"
+      },
+      "exempt_reason": null,
+      "extra_actions": [],
+      "function": "v1_engine_switch_flip",
+      "id": "rest:POST /v1/admin/engine-switch/flip",
+      "method": "POST",
+      "note": "dictator-only today; privileged engine-switch operation (no content grant exists for it; a dedicated admin action needs a contract change)",
+      "path": "/v1/admin/engine-switch/flip",
+      "privileged": true,
+      "required_payload": [],
+      "resolver": {
+        "kind": "settings",
+        "target": "credential.subject"
+      },
+      "status": "mapped",
+      "surface": "rest"
+    },
+    {
+      "action": "update",
+      "auth": {
+        "authz_gate": [
+          "_require_dictator_admin",
+          "is_dictator"
+        ],
+        "identity": "token_or_body_user_id+default_user_fallback",
+        "middleware": "bearer_middleware|disabled_if_unconfigured"
+      },
+      "exempt_reason": null,
+      "extra_actions": [],
+      "function": "v1_engine_switch_rollback",
+      "id": "rest:POST /v1/admin/engine-switch/rollback",
+      "method": "POST",
+      "note": "dictator-only today; privileged engine-switch operation (no content grant exists for it; a dedicated admin action needs a contract change)",
+      "path": "/v1/admin/engine-switch/rollback",
+      "privileged": true,
+      "required_payload": [],
+      "resolver": {
+        "kind": "settings",
+        "target": "credential.subject"
+      },
+      "status": "mapped",
+      "surface": "rest"
+    },
+    {
+      "action": "update",
+      "auth": {
+        "authz_gate": [
+          "_require_dictator_admin",
+          "is_dictator"
+        ],
+        "identity": "token_or_body_user_id+default_user_fallback",
+        "middleware": "bearer_middleware|disabled_if_unconfigured"
+      },
+      "exempt_reason": null,
+      "extra_actions": [],
+      "function": "v1_engine_switch_start",
+      "id": "rest:POST /v1/admin/engine-switch/start-dual-write",
+      "method": "POST",
+      "note": "dictator-only today; privileged engine-switch operation (no content grant exists for it; a dedicated admin action needs a contract change)",
+      "path": "/v1/admin/engine-switch/start-dual-write",
+      "privileged": true,
+      "required_payload": [],
+      "resolver": {
+        "kind": "settings",
+        "target": "credential.subject"
+      },
+      "status": "mapped",
+      "surface": "rest"
+    },
+    {
+      "action": "update",
+      "auth": {
+        "authz_gate": [
+          "_require_dictator_admin",
+          "is_dictator"
+        ],
+        "identity": "token_or_body_user_id+default_user_fallback",
+        "middleware": "bearer_middleware|disabled_if_unconfigured"
+      },
+      "exempt_reason": null,
+      "extra_actions": [],
+      "function": "v1_ledger_cutover_advance",
+      "id": "rest:POST /v1/admin/ledger-cutover/advance",
+      "method": "POST",
+      "note": "dictator-only operator control: moves to ledger-only after reconciliation; never a content grant",
+      "path": "/v1/admin/ledger-cutover/advance",
+      "privileged": true,
+      "required_payload": [],
+      "resolver": {
+        "kind": "settings",
+        "target": "credential.subject"
+      },
+      "status": "mapped",
+      "surface": "rest"
+    },
+    {
+      "action": "update",
+      "auth": {
+        "authz_gate": [
+          "_require_dictator_admin",
+          "is_dictator"
+        ],
+        "identity": "token_or_body_user_id+default_user_fallback",
+        "middleware": "bearer_middleware|disabled_if_unconfigured"
+      },
+      "exempt_reason": null,
+      "extra_actions": [],
+      "function": "v1_ledger_cutover_backfill",
+      "id": "rest:POST /v1/admin/ledger-cutover/backfill",
+      "method": "POST",
+      "note": "dictator-only operator control: continues the read-only backfill; never a content grant",
+      "path": "/v1/admin/ledger-cutover/backfill",
+      "privileged": true,
+      "required_payload": [],
+      "resolver": {
+        "kind": "settings",
+        "target": "credential.subject"
+      },
+      "status": "mapped",
+      "surface": "rest"
+    },
+    {
+      "action": "update",
+      "auth": {
+        "authz_gate": [
+          "_require_dictator_admin",
+          "is_dictator"
+        ],
+        "identity": "token_or_body_user_id+default_user_fallback",
+        "middleware": "bearer_middleware|disabled_if_unconfigured"
+      },
+      "exempt_reason": null,
+      "extra_actions": [],
+      "function": "v1_ledger_cutover_complete",
+      "id": "rest:POST /v1/admin/ledger-cutover/complete",
+      "method": "POST",
+      "note": "dictator-only operator control: completes the cutover; never a content grant",
+      "path": "/v1/admin/ledger-cutover/complete",
+      "privileged": true,
+      "required_payload": [],
+      "resolver": {
+        "kind": "settings",
+        "target": "credential.subject"
+      },
+      "status": "mapped",
+      "surface": "rest"
+    },
+    {
+      "action": "update",
+      "auth": {
+        "authz_gate": [
+          "_require_dictator_admin",
+          "is_dictator"
+        ],
+        "identity": "token_or_body_user_id+default_user_fallback",
+        "middleware": "bearer_middleware|disabled_if_unconfigured"
+      },
+      "exempt_reason": null,
+      "extra_actions": [],
+      "function": "v1_ledger_cutover_rollback",
+      "id": "rest:POST /v1/admin/ledger-cutover/rollback",
+      "method": "POST",
+      "note": "dictator-only operator control: returns writes to the legacy path; never a content grant",
+      "path": "/v1/admin/ledger-cutover/rollback",
+      "privileged": true,
+      "required_payload": [],
+      "resolver": {
+        "kind": "settings",
+        "target": "credential.subject"
+      },
+      "status": "mapped",
+      "surface": "rest"
+    },
+    {
+      "action": "update",
+      "auth": {
+        "authz_gate": [
+          "_require_dictator_admin",
+          "is_dictator"
+        ],
+        "identity": "token_or_body_user_id+default_user_fallback",
+        "middleware": "bearer_middleware|disabled_if_unconfigured"
+      },
+      "exempt_reason": null,
+      "extra_actions": [],
+      "function": "v1_ledger_cutover_start",
+      "id": "rest:POST /v1/admin/ledger-cutover/start",
+      "method": "POST",
+      "note": "dictator-only operator control: starts the cutover (dual accept); never a content grant",
+      "path": "/v1/admin/ledger-cutover/start",
+      "privileged": true,
+      "required_payload": [],
+      "resolver": {
+        "kind": "settings",
+        "target": "credential.subject"
+      },
+      "status": "mapped",
+      "surface": "rest"
+    },
+    {
+      "action": "update",
+      "auth": {
+        "authz_gate": [
+          "_require_dictator_admin",
+          "is_dictator"
+        ],
+        "identity": "token_or_body_user_id+default_user_fallback",
+        "middleware": "bearer_middleware|disabled_if_unconfigured"
+      },
+      "exempt_reason": null,
+      "extra_actions": [
+        [
+          "background_derive",
+          "credential=scoped"
+        ]
+      ],
+      "function": "v1_rescope_private_derivatives",
+      "id": "rest:POST /v1/admin/rescope-private-derivatives",
+      "method": "POST",
+      "note": "dictator-only today; explicit content grant (assumption D-3)",
+      "path": "/v1/admin/rescope-private-derivatives",
+      "privileged": true,
+      "required_payload": [],
+      "resolver": {
+        "kind": "pool",
+        "target": "body.user_id (private pool)"
+      },
+      "status": "mapped",
+      "surface": "rest"
+    },
+    {
+      "action": "search",
+      "auth": {
+        "authz_gate": [],
+        "identity": "token_or_body_user_id+default_user_fallback",
+        "middleware": "bearer_middleware|disabled_if_unconfigured"
+      },
+      "exempt_reason": null,
+      "extra_actions": [],
+      "function": "v1_ask_memory",
+      "id": "rest:POST /v1/ask",
+      "method": "POST",
+      "note": "",
+      "path": "/v1/ask",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "pool",
+        "target": "body.project_id"
+      },
+      "status": "mapped",
+      "surface": "rest"
+    },
+    {
+      "action": "create",
+      "auth": {
+        "authz_gate": [],
+        "identity": "token_or_body_user_id+default_user_fallback",
+        "middleware": "bearer_middleware|disabled_if_unconfigured"
+      },
+      "exempt_reason": null,
+      "extra_actions": [
+        [
+          "share",
+          "visibility=shared"
+        ],
+        [
+          "publish_standard",
+          "visibility=standard"
+        ],
+        [
+          "background_derive",
+          "credential=scoped"
+        ]
+      ],
+      "function": "v1_checkpoint",
+      "id": "rest:POST /v1/checkpoint",
+      "method": "POST",
+      "note": "",
+      "path": "/v1/checkpoint",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "pool",
+        "target": "body.memories[*].visibility+body.memories[*].project_id+body.memories[*].workspace"
+      },
+      "status": "mapped",
+      "surface": "rest"
+    },
+    {
+      "action": "create",
+      "auth": {
+        "authz_gate": [],
+        "identity": "token_or_body_user_id+default_user_fallback",
+        "middleware": "bearer_middleware|disabled_if_unconfigured"
+      },
+      "exempt_reason": null,
+      "extra_actions": [
+        [
+          "background_derive",
+          "credential=scoped"
+        ]
+      ],
+      "function": "v1_code_graph_index",
+      "id": "rest:POST /v1/code-graph/index",
+      "method": "POST",
+      "note": "",
+      "path": "/v1/code-graph/index",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "pool",
+        "target": "body.user_id (private pool only)"
+      },
+      "status": "mapped",
+      "surface": "rest"
+    },
+    {
+      "action": "manage_credentials",
+      "auth": {
+        "authz_gate": [],
+        "identity": "token_or_body_user_id+default_user_fallback",
+        "middleware": "bearer_middleware|disabled_if_unconfigured"
+      },
+      "exempt_reason": null,
+      "extra_actions": [],
+      "function": "v1_register_connector",
+      "id": "rest:POST /v1/connectors",
+      "method": "POST",
+      "note": "",
+      "path": "/v1/connectors",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "connector",
+        "target": "body (new connector)"
+      },
+      "status": "mapped",
+      "surface": "rest"
+    },
+    {
+      "action": "create",
+      "auth": {
+        "authz_gate": [
+          "_require_owned_connector"
+        ],
+        "identity": "token_or_body_user_id+default_user_fallback",
+        "middleware": "bearer_middleware|disabled_if_unconfigured"
+      },
+      "exempt_reason": null,
+      "extra_actions": [
+        [
+          "background_derive",
+          "credential=scoped"
+        ]
+      ],
+      "function": "v1_sync_connector",
+      "id": "rest:POST /v1/connectors/{connector_id}/sync",
+      "method": "POST",
+      "note": "",
+      "path": "/v1/connectors/{connector_id}/sync",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "connector",
+        "target": "path.connector_id (+ connector target pool)"
+      },
+      "status": "mapped",
+      "surface": "rest"
+    },
+    {
+      "action": "read",
+      "auth": {
+        "authz_gate": [],
+        "identity": "token_or_body_user_id+default_user_fallback",
+        "middleware": "bearer_middleware|disabled_if_unconfigured"
+      },
+      "exempt_reason": null,
+      "extra_actions": [],
+      "function": "v1_assemble_context",
+      "id": "rest:POST /v1/context/assemble",
+      "method": "POST",
+      "note": "",
+      "path": "/v1/context/assemble",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "pool",
+        "target": "body.project_id"
+      },
+      "status": "mapped",
+      "surface": "rest"
+    },
+    {
+      "action": "manage_credentials",
+      "auth": {
+        "authz_gate": [],
+        "identity": "token_or_body_user_id",
+        "middleware": "bearer_middleware|disabled_if_unconfigured"
+      },
+      "exempt_reason": null,
+      "extra_actions": [],
+      "function": "v1_issue_credential",
+      "id": "rest:POST /v1/credentials",
+      "method": "POST",
+      "note": "",
+      "path": "/v1/credentials",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "credential",
+        "target": "credential.subject"
+      },
+      "status": "mapped",
+      "surface": "rest"
+    },
+    {
+      "action": null,
+      "auth": {
+        "authz_gate": [],
+        "identity": "none",
+        "middleware": "public"
+      },
+      "exempt_reason": "credential_exchange (pre-principal; authenticated by the single-use refresh token)",
+      "extra_actions": [],
+      "function": "v1_refresh_credential",
+      "id": "rest:POST /v1/credentials/refresh",
+      "method": "POST",
+      "note": "",
+      "path": "/v1/credentials/refresh",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "none",
+        "target": "none"
+      },
+      "status": "exempt",
+      "surface": "rest"
+    },
+    {
+      "action": "manage_credentials",
+      "auth": {
+        "authz_gate": [],
+        "identity": "token_or_body_user_id",
+        "middleware": "bearer_middleware|disabled_if_unconfigured"
+      },
+      "exempt_reason": null,
+      "extra_actions": [],
+      "function": "v1_revoke_credential",
+      "id": "rest:POST /v1/credentials/revoke",
+      "method": "POST",
+      "note": "ownership (own subject, or the service account's controller) is checked by the handler",
+      "path": "/v1/credentials/revoke",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "credential",
+        "target": "credential.subject"
+      },
+      "status": "mapped",
+      "surface": "rest"
+    },
+    {
+      "action": "create",
+      "auth": {
+        "authz_gate": [],
+        "identity": "none",
+        "middleware": "bearer_middleware|disabled_if_unconfigured"
+      },
+      "exempt_reason": null,
+      "extra_actions": [],
+      "function": "v1_e2ee_put_checkpoint",
+      "id": "rest:POST /v1/e2ee/spaces/{space_id}/checkpoints",
+      "method": "POST",
+      "note": "store a signed checkpoint and its index; tenant cell scoped; unscoped today: identity comes only from the policy hook",
+      "path": "/v1/e2ee/spaces/{space_id}/checkpoints",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "tenant",
+        "target": "tenant"
+      },
+      "status": "mapped",
+      "surface": "rest"
+    },
+    {
+      "action": "create",
+      "auth": {
+        "authz_gate": [],
+        "identity": "none",
+        "middleware": "bearer_middleware|disabled_if_unconfigured"
+      },
+      "exempt_reason": null,
+      "extra_actions": [],
+      "function": "v1_e2ee_enqueue_job",
+      "id": "rest:POST /v1/e2ee/spaces/{space_id}/jobs",
+      "method": "POST",
+      "note": "enqueue a sealed processing job (opaque); tenant cell scoped; unscoped today: identity comes only from the policy hook",
+      "path": "/v1/e2ee/spaces/{space_id}/jobs",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "tenant",
+        "target": "tenant"
+      },
+      "status": "mapped",
+      "surface": "rest"
+    },
+    {
+      "action": "update",
+      "auth": {
+        "authz_gate": [],
+        "identity": "none",
+        "middleware": "bearer_middleware|disabled_if_unconfigured"
+      },
+      "exempt_reason": null,
+      "extra_actions": [],
+      "function": "v1_e2ee_claim_job",
+      "id": "rest:POST /v1/e2ee/spaces/{space_id}/jobs/claim",
+      "method": "POST",
+      "note": "claim a sealed job with a lease; tenant cell scoped; unscoped today: identity comes only from the policy hook",
+      "path": "/v1/e2ee/spaces/{space_id}/jobs/claim",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "tenant",
+        "target": "tenant"
+      },
+      "status": "mapped",
+      "surface": "rest"
+    },
+    {
+      "action": "update",
+      "auth": {
+        "authz_gate": [],
+        "identity": "none",
+        "middleware": "bearer_middleware|disabled_if_unconfigured"
+      },
+      "exempt_reason": null,
+      "extra_actions": [],
+      "function": "v1_e2ee_complete_job",
+      "id": "rest:POST /v1/e2ee/spaces/{space_id}/jobs/{job_id}/complete",
+      "method": "POST",
+      "note": "complete a claimed job, fenced by owner and attempt; tenant cell scoped; unscoped today: identity comes only from the policy hook",
+      "path": "/v1/e2ee/spaces/{space_id}/jobs/{job_id}/complete",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "tenant",
+        "target": "tenant"
+      },
+      "status": "mapped",
+      "surface": "rest"
+    },
+    {
+      "action": "create",
+      "auth": {
+        "authz_gate": [],
+        "identity": "none",
+        "middleware": "bearer_middleware|disabled_if_unconfigured"
+      },
+      "exempt_reason": null,
+      "extra_actions": [],
+      "function": "v1_e2ee_append_membership",
+      "id": "rest:POST /v1/e2ee/spaces/{space_id}/membership",
+      "method": "POST",
+      "note": "append a signed membership entry (ciphertext-free; verified from public material); tenant cell scoped; unscoped today: identity comes only from the policy hook",
+      "path": "/v1/e2ee/spaces/{space_id}/membership",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "tenant",
+        "target": "tenant"
+      },
+      "status": "mapped",
+      "surface": "rest"
+    },
+    {
+      "action": "create",
+      "auth": {
+        "authz_gate": [],
+        "identity": "none",
+        "middleware": "bearer_middleware|disabled_if_unconfigured"
+      },
+      "exempt_reason": null,
+      "extra_actions": [],
+      "function": "v1_e2ee_put_wraps",
+      "id": "rest:POST /v1/e2ee/spaces/{space_id}/wraps",
+      "method": "POST",
+      "note": "store wrapped epoch keys (opaque); tenant cell scoped; unscoped today: identity comes only from the policy hook",
+      "path": "/v1/e2ee/spaces/{space_id}/wraps",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "tenant",
+        "target": "tenant"
+      },
+      "status": "mapped",
+      "surface": "rest"
+    },
+    {
+      "action": "create",
+      "auth": {
+        "authz_gate": [],
+        "identity": "none",
+        "middleware": "bearer_middleware|disabled_if_unconfigured"
+      },
+      "exempt_reason": null,
+      "extra_actions": [],
+      "function": "v1_emit_extension_event",
+      "id": "rest:POST /v1/extensions/events",
+      "method": "POST",
+      "note": "unscoped today; decision pending: global/project administration needs a settings-administration grant",
+      "path": "/v1/extensions/events",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "tenant",
+        "target": "credential.tenant"
+      },
+      "status": "mapped",
+      "surface": "rest"
+    },
+    {
+      "action": "search",
+      "auth": {
+        "authz_gate": [],
+        "identity": "token_or_body_user_id+default_user_fallback",
+        "middleware": "bearer_middleware|disabled_if_unconfigured"
+      },
+      "exempt_reason": null,
+      "extra_actions": [],
+      "function": "v1_graph_search",
+      "id": "rest:POST /v1/graph/search",
+      "method": "POST",
+      "note": "",
+      "path": "/v1/graph/search",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "pool",
+        "target": "body.project_id"
+      },
+      "status": "mapped",
+      "surface": "rest"
+    },
+    {
+      "action": "create",
+      "auth": {
+        "authz_gate": [
+          "_authorize_standard_write",
+          "is_dictator"
+        ],
+        "identity": "token_or_body_user_id+default_user_fallback",
+        "middleware": "bearer_middleware|disabled_if_unconfigured"
+      },
+      "exempt_reason": null,
+      "extra_actions": [
+        [
+          "share",
+          "visibility=shared"
+        ],
+        [
+          "publish_standard",
+          "visibility=standard"
+        ],
+        [
+          "background_derive",
+          "credential=scoped"
+        ]
+      ],
+      "function": "v1_ingest_document",
+      "id": "rest:POST /v1/ingest",
+      "method": "POST",
+      "note": "",
+      "path": "/v1/ingest",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "pool",
+        "target": "body.visibility+body.project_id+body.workspace"
+      },
+      "status": "mapped",
+      "surface": "rest"
+    },
+    {
+      "action": "create",
+      "auth": {
+        "authz_gate": [
+          "_authorize_standard_write",
+          "is_dictator"
+        ],
+        "identity": "token_or_body_user_id+default_user_fallback",
+        "middleware": "bearer_middleware|disabled_if_unconfigured"
+      },
+      "exempt_reason": null,
+      "extra_actions": [
+        [
+          "share",
+          "visibility=shared"
+        ],
+        [
+          "publish_standard",
+          "visibility=standard"
+        ],
+        [
+          "background_derive",
+          "credential=scoped"
+        ]
+      ],
+      "function": "v1_ingest_files",
+      "id": "rest:POST /v1/ingest/files",
+      "method": "POST",
+      "note": "",
+      "path": "/v1/ingest/files",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "pool",
+        "target": "body.visibility+body.project_id"
+      },
+      "status": "mapped",
+      "surface": "rest"
+    },
+    {
+      "action": "create",
+      "auth": {
+        "authz_gate": [
+          "_authorize_standard_write",
+          "is_dictator"
+        ],
+        "identity": "token_or_body_user_id+default_user_fallback",
+        "middleware": "bearer_middleware|disabled_if_unconfigured"
+      },
+      "exempt_reason": null,
+      "extra_actions": [
+        [
+          "share",
+          "visibility=shared"
+        ],
+        [
+          "publish_standard",
+          "visibility=standard"
+        ],
+        [
+          "background_derive",
+          "credential=scoped"
+        ]
+      ],
+      "function": "v1_ingest_text",
+      "id": "rest:POST /v1/ingest/text",
+      "method": "POST",
+      "note": "",
+      "path": "/v1/ingest/text",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "pool",
+        "target": "body.visibility+body.project_id"
+      },
+      "status": "mapped",
+      "surface": "rest"
+    },
+    {
+      "action": "manage_membership",
+      "auth": {
+        "authz_gate": [],
+        "identity": "token_or_body_user_id",
+        "middleware": "bearer_middleware|disabled_if_unconfigured"
+      },
+      "exempt_reason": null,
+      "extra_actions": [],
+      "function": "v1_create_invite",
+      "id": "rest:POST /v1/members/invites",
+      "method": "POST",
+      "note": "",
+      "path": "/v1/members/invites",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "membership",
+        "target": "credential.tenant"
+      },
+      "status": "mapped",
+      "surface": "rest"
+    },
+    {
+      "action": null,
+      "auth": {
+        "authz_gate": [],
+        "identity": "token_or_body_user_id",
+        "middleware": "bearer_middleware|disabled_if_unconfigured"
+      },
+      "exempt_reason": "membership_join (pre-membership; authenticated by a verified identity and a single-use invite)",
+      "extra_actions": [],
+      "function": "v1_join",
+      "id": "rest:POST /v1/members/join",
+      "method": "POST",
+      "note": "",
+      "path": "/v1/members/join",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "none",
+        "target": "none"
+      },
+      "status": "exempt",
+      "surface": "rest"
+    },
+    {
+      "action": "create",
+      "auth": {
+        "authz_gate": [],
+        "identity": "token_or_body_user_id+default_user_fallback",
+        "middleware": "bearer_middleware|disabled_if_unconfigured"
+      },
+      "exempt_reason": null,
+      "extra_actions": [
+        [
+          "share",
+          "visibility=shared"
+        ],
+        [
+          "publish_standard",
+          "visibility=standard"
+        ],
+        [
+          "background_derive",
+          "credential=scoped"
+        ]
+      ],
+      "function": "v1_store_memories",
+      "id": "rest:POST /v1/memories",
+      "method": "POST",
+      "note": "",
+      "path": "/v1/memories",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "pool",
+        "target": "body.visibility+body.project_id"
+      },
+      "status": "mapped",
+      "surface": "rest"
+    },
+    {
+      "action": "read",
+      "auth": {
+        "authz_gate": [],
+        "identity": "token_or_body_user_id+default_user_fallback",
+        "middleware": "bearer_middleware|disabled_if_unconfigured"
+      },
+      "exempt_reason": null,
+      "extra_actions": [],
+      "function": "v1_batch_get_memories",
+      "id": "rest:POST /v1/memories/batch-get",
+      "method": "POST",
+      "note": "",
+      "path": "/v1/memories/batch-get",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "memory",
+        "target": "body.ids[*]"
+      },
+      "status": "mapped",
+      "surface": "rest"
+    },
+    {
+      "action": "create",
+      "auth": {
+        "authz_gate": [
+          "_authorize_standard_write",
+          "is_dictator"
+        ],
+        "identity": "token_or_body_user_id+default_user_fallback",
+        "middleware": "bearer_middleware|disabled_if_unconfigured"
+      },
+      "exempt_reason": null,
+      "extra_actions": [
+        [
+          "share",
+          "visibility=shared"
+        ],
+        [
+          "publish_standard",
+          "visibility=standard"
+        ],
+        [
+          "background_derive",
+          "credential=scoped"
+        ]
+      ],
+      "function": "v1_store_raw_memory",
+      "id": "rest:POST /v1/memories/raw",
+      "method": "POST",
+      "note": "",
+      "path": "/v1/memories/raw",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "pool",
+        "target": "body.visibility+body.project_id+body.workspace"
+      },
+      "status": "mapped",
+      "surface": "rest"
+    },
+    {
+      "action": "create",
+      "auth": {
+        "authz_gate": [
+          "_authorize_standard_write",
+          "is_dictator"
+        ],
+        "identity": "token_or_body_user_id+default_user_fallback",
+        "middleware": "bearer_middleware|disabled_if_unconfigured"
+      },
+      "exempt_reason": null,
+      "extra_actions": [
+        [
+          "share",
+          "visibility=shared"
+        ],
+        [
+          "publish_standard",
+          "visibility=standard"
+        ],
+        [
+          "background_derive",
+          "credential=scoped"
+        ]
+      ],
+      "function": "v1_store_raw_batch",
+      "id": "rest:POST /v1/memories/raw/batch",
+      "method": "POST",
+      "note": "",
+      "path": "/v1/memories/raw/batch",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "pool",
+        "target": "body.memories[*].visibility+body.memories[*].project_id+body.memories[*].workspace"
+      },
+      "status": "mapped",
+      "surface": "rest"
+    },
+    {
+      "action": "update",
+      "auth": {
+        "authz_gate": [],
+        "identity": "token_or_body_user_id+default_user_fallback",
+        "middleware": "bearer_middleware|disabled_if_unconfigured"
+      },
+      "exempt_reason": null,
+      "extra_actions": [
+        [
+          "publish_standard",
+          "target.visibility=standard"
+        ],
+        [
+          "background_derive",
+          "credential=scoped"
+        ]
+      ],
+      "function": "v1_retag_memories",
+      "id": "rest:POST /v1/memories/retag",
+      "method": "POST",
+      "note": "",
+      "path": "/v1/memories/retag",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "pool",
+        "target": "body.filters.project_id+body.filters.visibility"
+      },
+      "status": "mapped",
+      "surface": "rest"
+    },
+    {
+      "action": "export",
+      "auth": {
+        "authz_gate": [],
+        "identity": "request_user_id",
+        "middleware": "bearer_middleware|disabled_if_unconfigured"
+      },
+      "exempt_reason": null,
+      "extra_actions": [],
+      "function": "v1_create_portability_export",
+      "id": "rest:POST /v1/portability/exports",
+      "method": "POST",
+      "note": "tenant export; the service re-authorizes the verified principal itself and denies without a bound member",
+      "path": "/v1/portability/exports",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "tenant",
+        "target": "tenant"
+      },
+      "status": "mapped",
+      "surface": "rest"
+    },
+    {
+      "action": "restore",
+      "auth": {
+        "authz_gate": [],
+        "identity": "request_user_id",
+        "middleware": "bearer_middleware|disabled_if_unconfigured"
+      },
+      "exempt_reason": null,
+      "extra_actions": [],
+      "function": "v1_stage_portability_import",
+      "id": "rest:POST /v1/portability/imports",
+      "method": "POST",
+      "note": "tenant restore; the service also requires manage_membership because it maps identities into the tenant",
+      "path": "/v1/portability/imports",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "tenant",
+        "target": "tenant"
+      },
+      "status": "mapped",
+      "surface": "rest"
+    },
+    {
+      "action": "restore",
+      "auth": {
+        "authz_gate": [],
+        "identity": "request_user_id",
+        "middleware": "bearer_middleware|disabled_if_unconfigured"
+      },
+      "exempt_reason": null,
+      "extra_actions": [],
+      "function": "v1_promote_portability_import",
+      "id": "rest:POST /v1/portability/imports/{import_id}/promote",
+      "method": "POST",
+      "note": "tenant restore; the service also requires manage_membership because it maps identities into the tenant",
+      "path": "/v1/portability/imports/{import_id}/promote",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "tenant",
+        "target": "tenant"
+      },
+      "status": "mapped",
+      "surface": "rest"
+    },
+    {
+      "action": "search",
+      "auth": {
+        "authz_gate": [],
+        "identity": "token_or_body_user_id+default_user_fallback",
+        "middleware": "bearer_middleware|disabled_if_unconfigured"
+      },
+      "exempt_reason": null,
+      "extra_actions": [],
+      "function": "v1_search_memories",
+      "id": "rest:POST /v1/search",
+      "method": "POST",
+      "note": "",
+      "path": "/v1/search",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "pool",
+        "target": "body.visibility+body.project_id"
+      },
+      "status": "mapped",
+      "surface": "rest"
+    },
+    {
+      "action": "manage_membership",
+      "auth": {
+        "authz_gate": [],
+        "identity": "token_or_body_user_id",
+        "middleware": "bearer_middleware|disabled_if_unconfigured"
+      },
+      "exempt_reason": null,
+      "extra_actions": [],
+      "function": "v1_create_service_account",
+      "id": "rest:POST /v1/service-accounts",
+      "method": "POST",
+      "note": "",
+      "path": "/v1/service-accounts",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "service_account",
+        "target": "credential.tenant"
+      },
+      "status": "mapped",
+      "surface": "rest"
+    },
+    {
+      "action": "manage_credentials",
+      "auth": {
+        "authz_gate": [],
+        "identity": "token_or_body_user_id",
+        "middleware": "bearer_middleware|disabled_if_unconfigured"
+      },
+      "exempt_reason": null,
+      "extra_actions": [],
+      "function": "v1_service_account_credential",
+      "id": "rest:POST /v1/service-accounts/{subject_id}/credentials",
+      "method": "POST",
+      "note": "the handler also requires the caller to be the recorded controller",
+      "path": "/v1/service-accounts/{subject_id}/credentials",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "service_account",
+        "target": "path.subject_id"
+      },
+      "status": "mapped",
+      "surface": "rest"
+    },
+    {
+      "action": "manage_membership",
+      "auth": {
+        "authz_gate": [],
+        "identity": "token_or_body_user_id",
+        "middleware": "bearer_middleware|disabled_if_unconfigured"
+      },
+      "exempt_reason": null,
+      "extra_actions": [],
+      "function": "v1_disable_service_account",
+      "id": "rest:POST /v1/service-accounts/{subject_id}/disable",
+      "method": "POST",
+      "note": "the handler also requires the caller to be the recorded controller",
+      "path": "/v1/service-accounts/{subject_id}/disable",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "service_account",
+        "target": "path.subject_id"
+      },
+      "status": "mapped",
+      "surface": "rest"
+    },
+    {
+      "action": "read",
+      "auth": {
+        "authz_gate": [],
+        "identity": "token_or_body_user_id+default_user_fallback",
+        "middleware": "bearer_middleware|disabled_if_unconfigured"
+      },
+      "exempt_reason": null,
+      "extra_actions": [],
+      "function": "v1_timeline",
+      "id": "rest:POST /v1/timeline",
+      "method": "POST",
+      "note": "",
+      "path": "/v1/timeline",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "pool",
+        "target": "body.project_id"
+      },
+      "status": "mapped",
+      "surface": "rest"
+    },
+    {
+      "action": "create",
+      "auth": {
+        "authz_gate": [],
+        "identity": "none",
+        "middleware": "bearer_middleware|disabled_if_unconfigured"
+      },
+      "exempt_reason": null,
+      "extra_actions": [],
+      "function": "v1_e2ee_put_envelope",
+      "id": "rest:PUT /v1/e2ee/spaces/{space_id}/objects/{object_id}/revisions/{revision}",
+      "method": "PUT",
+      "note": "store a signed envelope revision (opaque); tenant cell scoped; unscoped today: identity comes only from the policy hook",
+      "path": "/v1/e2ee/spaces/{space_id}/objects/{object_id}/revisions/{revision}",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "tenant",
+        "target": "tenant"
+      },
+      "status": "mapped",
+      "surface": "rest"
+    },
+    {
+      "action": "manage_membership",
+      "auth": {
+        "authz_gate": [],
+        "identity": "token_or_body_user_id",
+        "middleware": "bearer_middleware|disabled_if_unconfigured"
+      },
+      "exempt_reason": null,
+      "extra_actions": [],
+      "function": "v1_set_onboarding_policy",
+      "id": "rest:PUT /v1/members/policy",
+      "method": "PUT",
+      "note": "",
+      "path": "/v1/members/policy",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "membership",
+        "target": "credential.tenant"
+      },
+      "status": "mapped",
+      "surface": "rest"
+    },
+    {
+      "action": "update",
+      "auth": {
+        "authz_gate": [],
+        "identity": "token_or_body_user_id+default_user_fallback",
+        "middleware": "bearer_middleware|disabled_if_unconfigured"
+      },
+      "exempt_reason": null,
+      "extra_actions": [
+        [
+          "share",
+          "visibility_change=shared"
+        ],
+        [
+          "publish_standard",
+          "visibility_change=standard"
+        ],
+        [
+          "publish_standard",
+          "target.visibility=standard"
+        ],
+        [
+          "background_derive",
+          "credential=scoped"
+        ]
+      ],
+      "function": "v1_patch_memory",
+      "id": "rest:PUT /v1/memories/{memory_id}",
+      "method": "PUT",
+      "note": "",
+      "path": "/v1/memories/{memory_id}",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "memory",
+        "target": "path.memory_id"
+      },
+      "status": "mapped",
+      "surface": "rest"
+    },
+    {
+      "action": "update",
+      "auth": {
+        "authz_gate": [],
+        "identity": "none",
+        "middleware": "bearer_middleware|disabled_if_unconfigured"
+      },
+      "exempt_reason": null,
+      "extra_actions": [],
+      "function": "v1_set_project_knowledge_config",
+      "id": "rest:PUT /v1/projects/{project_id}/knowledge-config",
+      "method": "PUT",
+      "note": "unscoped today; decision pending: global/project administration needs a settings-administration grant",
+      "path": "/v1/projects/{project_id}/knowledge-config",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "settings",
+        "target": "path.project_id"
+      },
+      "status": "mapped",
+      "surface": "rest"
+    },
+    {
+      "action": "update",
+      "auth": {
+        "authz_gate": [
+          "is_dictator"
+        ],
+        "identity": "token_or_body_user_id+default_user_fallback",
+        "middleware": "bearer_middleware|disabled_if_unconfigured"
+      },
+      "exempt_reason": null,
+      "extra_actions": [],
+      "function": "v1_put_extraction_instructions",
+      "id": "rest:PUT /v1/settings/extraction-instructions",
+      "method": "PUT",
+      "note": "",
+      "path": "/v1/settings/extraction-instructions",
+      "privileged": true,
+      "required_payload": [],
+      "resolver": {
+        "kind": "settings",
+        "target": "credential.subject"
+      },
+      "status": "mapped",
+      "surface": "rest"
+    },
+    {
+      "action": "read",
+      "auth": {
+        "authz_gate": [],
+        "identity": "none",
+        "middleware": "bearer_middleware|disabled_if_unconfigured"
+      },
+      "exempt_reason": null,
+      "extra_actions": [],
+      "function": "status",
+      "id": "rest_extension:GET /v1/extensions/conversation-compiler/status",
+      "method": "GET",
+      "note": "unscoped today",
+      "path": "/v1/extensions/conversation-compiler/status",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "job",
+        "target": "credential.tenant"
+      },
+      "status": "mapped",
+      "surface": "rest_extension"
+    },
+    {
+      "action": "read",
+      "auth": {
+        "authz_gate": [
+          "is_dictator"
+        ],
+        "identity": "token_or_body_user_id+default_user_fallback",
+        "middleware": "bearer_middleware|disabled_if_unconfigured"
+      },
+      "exempt_reason": null,
+      "extra_actions": [],
+      "function": "get_identity_card",
+      "id": "rest_extension:GET /v1/extensions/dreaming/card",
+      "method": "GET",
+      "note": "",
+      "path": "/v1/extensions/dreaming/card",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "pool",
+        "target": "query.pool+query.project_id"
+      },
+      "status": "mapped",
+      "surface": "rest_extension"
+    },
+    {
+      "action": "read",
+      "auth": {
+        "authz_gate": [],
+        "identity": "none",
+        "middleware": "bearer_middleware|disabled_if_unconfigured"
+      },
+      "exempt_reason": null,
+      "extra_actions": [],
+      "function": "dream_status",
+      "id": "rest_extension:GET /v1/extensions/dreaming/status",
+      "method": "GET",
+      "note": "unscoped today",
+      "path": "/v1/extensions/dreaming/status",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "job",
+        "target": "credential.tenant"
+      },
+      "status": "mapped",
+      "surface": "rest_extension"
+    },
+    {
+      "action": "create",
+      "auth": {
+        "authz_gate": [],
+        "identity": "request_user_id",
+        "middleware": "bearer_middleware|disabled_if_unconfigured"
+      },
+      "exempt_reason": null,
+      "extra_actions": [
+        [
+          "share",
+          "visibility=shared"
+        ],
+        [
+          "publish_standard",
+          "visibility=standard"
+        ],
+        [
+          "background_derive",
+          "credential=scoped"
+        ]
+      ],
+      "function": "compile",
+      "id": "rest_extension:POST /v1/extensions/conversation-compiler/compile",
+      "method": "POST",
+      "note": "",
+      "path": "/v1/extensions/conversation-compiler/compile",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "pool",
+        "target": "body.project_id+body.visibility"
+      },
+      "status": "mapped",
+      "surface": "rest_extension"
+    },
+    {
+      "action": "create",
+      "auth": {
+        "authz_gate": [],
+        "identity": "request_user_id",
+        "middleware": "bearer_middleware|disabled_if_unconfigured"
+      },
+      "exempt_reason": null,
+      "extra_actions": [
+        [
+          "share",
+          "visibility=shared"
+        ],
+        [
+          "publish_standard",
+          "visibility=standard"
+        ],
+        [
+          "background_derive",
+          "credential=scoped"
+        ]
+      ],
+      "function": "flush",
+      "id": "rest_extension:POST /v1/extensions/conversation-compiler/flush",
+      "method": "POST",
+      "note": "",
+      "path": "/v1/extensions/conversation-compiler/flush",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "pool",
+        "target": "body.project_id+body.visibility"
+      },
+      "status": "mapped",
+      "surface": "rest_extension"
+    },
+    {
+      "action": "read",
+      "auth": {
+        "authz_gate": [],
+        "identity": "none",
+        "middleware": "bearer_middleware|disabled_if_unconfigured"
+      },
+      "exempt_reason": null,
+      "extra_actions": [],
+      "function": "lint",
+      "id": "rest_extension:POST /v1/extensions/conversation-compiler/lint",
+      "method": "POST",
+      "note": "unscoped today",
+      "path": "/v1/extensions/conversation-compiler/lint",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "pool",
+        "target": "body.project_id"
+      },
+      "status": "mapped",
+      "surface": "rest_extension"
+    },
+    {
+      "action": "search",
+      "auth": {
+        "authz_gate": [],
+        "identity": "none",
+        "middleware": "bearer_middleware|disabled_if_unconfigured"
+      },
+      "exempt_reason": null,
+      "extra_actions": [],
+      "function": "query",
+      "id": "rest_extension:POST /v1/extensions/conversation-compiler/query",
+      "method": "POST",
+      "note": "unscoped today",
+      "path": "/v1/extensions/conversation-compiler/query",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "pool",
+        "target": "body.project_id"
+      },
+      "status": "mapped",
+      "surface": "rest_extension"
+    },
+    {
+      "action": "background_derive",
+      "auth": {
+        "authz_gate": [],
+        "identity": "none",
+        "middleware": "bearer_middleware|disabled_if_unconfigured"
+      },
+      "exempt_reason": null,
+      "extra_actions": [],
+      "function": "run_dream",
+      "id": "rest_extension:POST /v1/extensions/dreaming/run",
+      "method": "POST",
+      "note": "initiation only; unscoped today; tenant-level: the handler enqueues a system sweep (an omitted pool walks every pool, body.pool names any owner's), so derivation on a member's own pool never authorizes it; decision pending: global/project administration needs a settings-administration grant",
+      "path": "/v1/extensions/dreaming/run",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "tenant",
+        "target": "credential.tenant"
+      },
+      "status": "mapped",
+      "surface": "rest_extension"
+    },
+    {
+      "action": null,
+      "auth": {
+        "authz_gate": [],
+        "identity": "none",
+        "middleware": "bearer_middleware|disabled_if_unconfigured"
+      },
+      "exempt_reason": "static_metadata (framework documentation route)",
+      "extra_actions": [],
+      "function": "fastapi_builtin",
+      "id": "rest_framework:GET /docs",
+      "method": "GET",
+      "note": "",
+      "path": "/docs",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "none",
+        "target": "none"
+      },
+      "status": "exempt",
+      "surface": "rest_framework"
+    },
+    {
+      "action": null,
+      "auth": {
+        "authz_gate": [],
+        "identity": "none",
+        "middleware": "bearer_middleware|disabled_if_unconfigured"
+      },
+      "exempt_reason": "static_metadata (framework documentation route)",
+      "extra_actions": [],
+      "function": "fastapi_builtin",
+      "id": "rest_framework:GET /docs/oauth2-redirect",
+      "method": "GET",
+      "note": "",
+      "path": "/docs/oauth2-redirect",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "none",
+        "target": "none"
+      },
+      "status": "exempt",
+      "surface": "rest_framework"
+    },
+    {
+      "action": null,
+      "auth": {
+        "authz_gate": [],
+        "identity": "none",
+        "middleware": "bearer_middleware|disabled_if_unconfigured"
+      },
+      "exempt_reason": "static_metadata (framework documentation route)",
+      "extra_actions": [],
+      "function": "fastapi_builtin",
+      "id": "rest_framework:GET /openapi.json",
+      "method": "GET",
+      "note": "",
+      "path": "/openapi.json",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "none",
+        "target": "none"
+      },
+      "status": "exempt",
+      "surface": "rest_framework"
+    },
+    {
+      "action": null,
+      "auth": {
+        "authz_gate": [],
+        "identity": "none",
+        "middleware": "bearer_middleware|disabled_if_unconfigured"
+      },
+      "exempt_reason": "static_metadata (framework documentation route)",
+      "extra_actions": [],
+      "function": "fastapi_builtin",
+      "id": "rest_framework:GET /redoc",
+      "method": "GET",
+      "note": "",
+      "path": "/redoc",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "none",
+        "target": "none"
+      },
+      "status": "exempt",
+      "surface": "rest_framework"
+    },
+    {
+      "action": null,
+      "auth": {
+        "authz_gate": [],
+        "identity": "none",
+        "middleware": "public"
+      },
+      "exempt_reason": "oauth_protocol (pre-principal; issuance is authorized by the handler against the binding store)",
+      "extra_actions": [],
+      "function": "authorization_server_metadata",
+      "id": "rest_oauth:GET /.well-known/oauth-authorization-server",
+      "method": "GET",
+      "note": "",
+      "path": "/.well-known/oauth-authorization-server",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "none",
+        "target": "none"
+      },
+      "status": "exempt",
+      "surface": "rest_oauth"
+    },
+    {
+      "action": null,
+      "auth": {
+        "authz_gate": [],
+        "identity": "none",
+        "middleware": "public"
+      },
+      "exempt_reason": "oauth_protocol (pre-principal; issuance is authorized by the handler against the binding store)",
+      "extra_actions": [],
+      "function": "protected_resource_metadata",
+      "id": "rest_oauth:GET /.well-known/oauth-protected-resource",
+      "method": "GET",
+      "note": "",
+      "path": "/.well-known/oauth-protected-resource",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "none",
+        "target": "none"
+      },
+      "status": "exempt",
+      "surface": "rest_oauth"
+    },
+    {
+      "action": null,
+      "auth": {
+        "authz_gate": [],
+        "identity": "none",
+        "middleware": "public"
+      },
+      "exempt_reason": "oauth_protocol (pre-principal; issuance is authorized by the handler against the binding store)",
+      "extra_actions": [],
+      "function": "protected_resource_metadata_mcp",
+      "id": "rest_oauth:GET /.well-known/oauth-protected-resource/mcp",
+      "method": "GET",
+      "note": "",
+      "path": "/.well-known/oauth-protected-resource/mcp",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "none",
+        "target": "none"
+      },
+      "status": "exempt",
+      "surface": "rest_oauth"
+    },
+    {
+      "action": null,
+      "auth": {
+        "authz_gate": [],
+        "identity": "none",
+        "middleware": "public"
+      },
+      "exempt_reason": "oauth_protocol (pre-principal; issuance is authorized by the handler against the binding store)",
+      "extra_actions": [],
+      "function": "authorize",
+      "id": "rest_oauth:GET /oauth/authorize",
+      "method": "GET",
+      "note": "",
+      "path": "/oauth/authorize",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "none",
+        "target": "none"
+      },
+      "status": "exempt",
+      "surface": "rest_oauth"
+    },
+    {
+      "action": null,
+      "auth": {
+        "authz_gate": [],
+        "identity": "token_or_body_user_id",
+        "middleware": "public"
+      },
+      "exempt_reason": "oauth_protocol (pre-principal; issuance is authorized by the handler against the binding store)",
+      "extra_actions": [],
+      "function": "google_callback",
+      "id": "rest_oauth:GET /oauth/google/callback",
+      "method": "GET",
+      "note": "",
+      "path": "/oauth/google/callback",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "none",
+        "target": "none"
+      },
+      "status": "exempt",
+      "surface": "rest_oauth"
+    },
+    {
+      "action": null,
+      "auth": {
+        "authz_gate": [],
+        "identity": "none",
+        "middleware": "public"
+      },
+      "exempt_reason": "oauth_protocol (pre-principal; issuance is authorized by the handler against the binding store)",
+      "extra_actions": [],
+      "function": "supabase_callback_get",
+      "id": "rest_oauth:GET /oauth/supabase/callback",
+      "method": "GET",
+      "note": "",
+      "path": "/oauth/supabase/callback",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "none",
+        "target": "none"
+      },
+      "status": "exempt",
+      "surface": "rest_oauth"
+    },
+    {
+      "action": null,
+      "auth": {
+        "authz_gate": [],
+        "identity": "token_or_body_user_id",
+        "middleware": "public"
+      },
+      "exempt_reason": "oauth_protocol (pre-principal; issuance is authorized by the handler against the binding store)",
+      "extra_actions": [],
+      "function": "authorize_submit",
+      "id": "rest_oauth:POST /oauth/authorize",
+      "method": "POST",
+      "note": "",
+      "path": "/oauth/authorize",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "none",
+        "target": "none"
+      },
+      "status": "exempt",
+      "surface": "rest_oauth"
+    },
+    {
+      "action": null,
+      "auth": {
+        "authz_gate": [],
+        "identity": "token_or_body_user_id",
+        "middleware": "public"
+      },
+      "exempt_reason": "oauth_protocol (pre-principal; issuance is authorized by the handler against the binding store)",
+      "extra_actions": [],
+      "function": "oauth_link",
+      "id": "rest_oauth:POST /oauth/link",
+      "method": "POST",
+      "note": "",
+      "path": "/oauth/link",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "none",
+        "target": "none"
+      },
+      "status": "exempt",
+      "surface": "rest_oauth"
+    },
+    {
+      "action": null,
+      "auth": {
+        "authz_gate": [],
+        "identity": "none",
+        "middleware": "public"
+      },
+      "exempt_reason": "oauth_protocol (pre-principal; issuance is authorized by the handler against the binding store)",
+      "extra_actions": [],
+      "function": "register",
+      "id": "rest_oauth:POST /oauth/register",
+      "method": "POST",
+      "note": "",
+      "path": "/oauth/register",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "none",
+        "target": "none"
+      },
+      "status": "exempt",
+      "surface": "rest_oauth"
+    },
+    {
+      "action": null,
+      "auth": {
+        "authz_gate": [],
+        "identity": "token_or_body_user_id",
+        "middleware": "public"
+      },
+      "exempt_reason": "oauth_protocol (pre-principal; issuance is authorized by the handler against the binding store)",
+      "extra_actions": [],
+      "function": "supabase_callback_post",
+      "id": "rest_oauth:POST /oauth/supabase/callback",
+      "method": "POST",
+      "note": "",
+      "path": "/oauth/supabase/callback",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "none",
+        "target": "none"
+      },
+      "status": "exempt",
+      "surface": "rest_oauth"
+    },
+    {
+      "action": null,
+      "auth": {
+        "authz_gate": [],
+        "identity": "request_user_id",
+        "middleware": "public"
+      },
+      "exempt_reason": "oauth_protocol (pre-principal; issuance is authorized by the handler against the binding store)",
+      "extra_actions": [],
+      "function": "token",
+      "id": "rest_oauth:POST /oauth/token",
+      "method": "POST",
+      "note": "",
+      "path": "/oauth/token",
+      "privileged": false,
+      "required_payload": [],
+      "resolver": {
+        "kind": "none",
+        "target": "none"
+      },
+      "status": "exempt",
+      "surface": "rest_oauth"
+    }
+  ],
+  "schema": "operation-inventory-v2"
+}
