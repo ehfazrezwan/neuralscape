@@ -518,10 +518,35 @@ def test_dream_diary_is_written_for_every_pool_by_design(dream_env, swept):
         assert pool in page.read_text(encoding="utf-8"), f"diary for {pool} does not name its pool"
 
 
-def test_insights_only_cite_their_own_pool(dream_env, swept):
+def test_insights_only_cite_their_own_pool(dream_env, swept, monkeypatch):
     from qdrant_client.models import FieldCondition, Filter, MatchValue
 
+    from extensions.dreaming import reflect as reflect_mod
+
     env = dream_env
+
+    # The reflection LLM is the only nondeterministic step this test depends on
+    # (it may legitimately return no insight). Pin that single seam: for each pool
+    # the stub cites the pool's OWN staged memories, exactly the shape a model
+    # reply would be validated into. Sweep, hydrate, store_insights, Qdrant and the
+    # provenance fields stay real, so the isolation property is still what is tested.
+    async def _stub_reflect(batch, llm_call, *, max_insights, surprisal_top_k=0):
+        ids = [m["memory_id"] for m in batch.memories
+               if m.get("source_type") != "dream" and not m.get("dream_tombstoned")]
+        assert len(ids) >= 2, f"pool {batch.pool} has too few live memories to cite: {ids}"
+        return [{
+            "content": f"Deterministic isolation probe insight for {batch.pool} {uuid.uuid4().hex[:8]}",
+            "source_memory_ids": ids[:3], "category": "domain_knowledge", "lens": "pattern",
+            "epistemic_level": "inductive", "confidence": 0.8,
+        }]
+
+    monkeypatch.setattr(reflect_mod, "reflect", _stub_reflect)
+    for pool in (env.pool, swept.other_pool):
+        run = asyncio.run(dream_all(service=env.service, settings=swept.settings, dry_run=False,
+                                    only_pool=pool, force=True))
+        assert run.pools and run.pools[0].status == "dreamt", run.pools
+        assert run.pools[0].insights >= 1, f"stubbed reflection stored nothing for {pool}: {run.pools[0]}"
+
     client = env.service._memory.vector_store.client
     recs, _ = client.scroll(
         collection_name=env.collection, limit=100, with_payload=True, with_vectors=False,
@@ -532,7 +557,7 @@ def test_insights_only_cite_their_own_pool(dream_env, swept):
     for want in (env.user, swept.other_user):
         assert want in owners, (
             f"no insight produced for {want} (insight owners: {sorted(o for o in owners if o)}); "
-            "the LLM produced no reflection, so citation isolation is unproven"
+            "the stubbed reflection stored nothing for this pool"
         )
     for r in recs:
         md = r.payload["metadata"]
