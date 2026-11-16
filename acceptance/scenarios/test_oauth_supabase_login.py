@@ -23,9 +23,8 @@ Scope: the signature path proven is RS256 via the JWKS (what a modern Supabase p
 verifier's ES256 branch and its HS256 branch (``SUPABASE_JWT_SECRET``, a shared secret) are NOT exercised:
 the profile deliberately sets no secret, and an HS256 token is only used as an algorithm-confusion probe.
 
-The login state is bound to the browser that started the login by PR #536 (a cookie that the callback
-requires). The harness carries that cookie the way a browser does; the scenarios that assert the binding
-are marked ``ns_expected_red("#536")`` until #536 is on the stack under test.
+The login state is bound to the browser that started the login (a cookie that the callback requires).
+The harness carries that cookie the way a browser does, and three scenarios below assert the binding.
 """
 
 from __future__ import annotations
@@ -58,11 +57,6 @@ MAPPED_EMAIL = "acc-mapped@acceptance-placeholder.example"
 MAPPED_USER = "acc-supabase-mapped"
 #: what the callback says for an unusable login state (the second phrase is the browser-binding refusal of #536)
 STATE_REFUSED = ("expired or invalid", "not started in this browser")
-
-
-def expected_red(reference: str):
-    """The same ``ns_expected_red`` marker the coverage-closure PR defines: runs, fails honestly, labelled."""
-    return pytest.mark.ns_expected_red(reference)
 
 
 def b64url(raw: bytes) -> str:
@@ -609,9 +603,8 @@ def _binding_cookies(browser: Browser) -> list:
 
 
 @proves("auth.login-supabase")
-@expected_red("#536")
 def test_the_consent_page_sets_the_login_binding_cookie(ctx, anon):
-    """EXPECTED RED UNTIL PR #536 merges: ``GET /oauth/authorize`` sets an HttpOnly, SameSite=Lax binding cookie."""
+    """``GET /oauth/authorize`` sets an HttpOnly, SameSite=Lax binding cookie."""
     browser = Browser(ctx.base_url)
     try:
         st = start_login(ctx, anon, browser)
@@ -625,9 +618,8 @@ def test_the_consent_page_sets_the_login_binding_cookie(ctx, anon):
 
 
 @proves("auth.login-supabase")
-@expected_red("#536")
 def test_a_callback_from_a_browser_that_did_not_start_the_login_is_refused(ctx, anon, idp):
-    """EXPECTED RED UNTIL PR #536 merges. Login CSRF: an attacker starts a login and gets a victim's browser
+    """Login CSRF: an attacker starts a login and gets a victim's browser
     to finish it, so the code would be issued to the attacker's client for the VICTIM's account."""
     attacker, victim = Browser(ctx.base_url), Browser(ctx.base_url)
     try:
@@ -644,9 +636,8 @@ def test_a_callback_from_a_browser_that_did_not_start_the_login_is_refused(ctx, 
 
 
 @proves("auth.login-supabase")
-@expected_red("#536")
 def test_a_login_state_cannot_be_completed_twice(ctx, anon, idp):
-    """EXPECTED RED UNTIL PR #536 merges: the state's nonce is claimed once; a replay of the same callback is refused."""
+    """The state's nonce is claimed once; a replay of the same callback is refused."""
     browser = Browser(ctx.base_url)
     try:
         st = start_login(ctx, anon, browser)
