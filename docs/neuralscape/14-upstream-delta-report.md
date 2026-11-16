@@ -19,7 +19,7 @@ Both counts include CI, bot and dependency-bump commits; they say "how stale", n
 
 ### 2.1 graphiti: small, fully marked
 
-`git diff 9cb6dc1b:graphiti_core HEAD:graphiti/graphiti_core` (`9cb6dc1b` is the squash of upstream `feafc422`, the last Graphiti sync) touched **8 files** (7 patched, 1 NS-owned) once the fork-marker change (PR #475) landed; `scripts/upstream-patches.txt` is the authoritative patched-file list (a test re-derives the graphiti set from this diff) and supersedes this table:
+`git diff 9cb6dc1b:graphiti_core HEAD:graphiti/graphiti_core` (`9cb6dc1b` is the squash of upstream `feafc422`, the last Graphiti sync) touched **9 files** (8 patched, 1 NS-owned) once the fork-marker change (PR #475) landed; `scripts/upstream-patches.txt` is the authoritative patched-file list (a test re-derives the graphiti set from this diff) and supersedes this table:
 
 | File | What the delta does | Marker |
 |---|---|---|
@@ -28,6 +28,7 @@ Both counts include CI, bot and dependency-bump commits; they say "how stale", n
 | `graphiti_core/embedder/gemini.py`, `graphiti_core/cross_encoder/gemini_reranker_client.py` | `genai.Client(..., http_options=HttpOptions(timeout=GEMINI_HTTP_TIMEOUT_MS))` so a stalled call cannot hang a worker slot | `NEURALSCAPE PATCH` |
 | `graphiti_core/utils/maintenance/edge_operations.py`, `node_operations.py` | optional bounded-decision fast path behind `HYBRID_GRAPH_ENABLED` (PR #471) | `NEURALSCAPE PATCH` |
 | `graphiti_core/llm_client/hybrid_decision_client.py` | NS-only hybrid decision client (not upstream; listed `owned` in the manifest) | n/a |
+| `graphiti_core/graphiti.py` | `add_episode(update_communities=True)` flattens the per-node `(communities, edges)` results instead of unpacking N pairs into two names (upstream raised `ValueError` after the episode was stored unless exactly two entities resolved) | `NEURALSCAPE PATCH` |
 | `graphiti_core/driver/neo4j_driver.py` | `kwargs.setdefault('database_', ...)` so queries run on the configured database (upstream put it in `params`) | `NEURALSCAPE PATCH` |
 
 The saga lifecycle, `reference_time` edge field, extraction/dedup prompt patches and `summarize_sagas.py` that the 2026-06-22 edition listed are **not in the tree**: the April sync took upstream's own implementations, and the diff above proves it. There is no saga or prompt conflict cluster to resolve on a sync. `graphiti/` is pruned to `graphiti_core` plus packaging (`d3978abe`, 2026-07-05).
@@ -35,7 +36,7 @@ The saga lifecycle, `reference_time` edge field, extraction/dedup prompt patches
 ### 2.2 mem0: an NS-maintained graph layer plus a few patched files
 
 - **The OSS graph layer is an NS fork, not an upstream patch.** mem0 deleted its self-hostable graph layer in PR #4805 (`a488e190`, 2026-04-14, the v3 pipeline): `mem0/graphs/` and the `*_memory.py` graph providers no longer exist upstream, and graph memory is now a hosted-Platform-only feature. NS restored and maintains `mem0/mem0/graphs/` and `memory/{graph,memgraph,kuzu,apache_age}_memory.py`, plus `GraphStoreFactory` in `utils/factory.py`. Only the `graphiti` provider is wired in production.
-- **`memory/graphiti_memory.py` is NS-original.** It never existed upstream (`MemoryGraph` presenting Graphiti as a mem0 graph provider, and `_AsyncBridge`, the single background event loop all graph calls run on). It carries the small-model default, the reranker `config=` fix, the episode-identity return value, the idempotent episode name, and (since this refresh) a bounded bridge wait.
+- **`memory/graphiti_memory.py` is NS-original.** It never existed upstream (`MemoryGraph` presenting Graphiti as a mem0 graph provider, and `_AsyncBridge`, the single background event loop all graph calls run on). It carries the small-model default, the reranker `config=` fix, the episode-identity return value, the idempotent episode name, a bounded bridge wait, a first-community build when `UPDATE_COMMUNITIES` is on (`_ensure_group_communities`), and a hard error instead of the legacy `project:{id}` / `global` / bare-`user_id` group fallback (every service call passes an explicit `group_id`).
 - **The re-attach shim.** mem0 2.x `Memory` has no `.graph`, so `neuralscape-service/memory/core.py` `_get_memory` fabricates the config namespace the adapter reads and sets `Memory.graph` itself. Every sync re-grafts this onto a core that deliberately removed it; it is the dominant sync risk.
 - **Patched mem0 core/embedding files:**
 
@@ -159,3 +160,34 @@ Before this refresh the two forks had **zero tests** (pruned with upstream's tes
 1. **Graph re-attach shim survival.** Whether a newer mem0 `Memory` still lets the shim set `.graph` and expose `.graph.graphiti` / `._bridge`. The smoke tests cover it; run them against the new checkout before merging a sync.
 2. **`config.http_client` consumers (mem0 #5447)** and **empty-query rejection (#5258)**: audit as in section 3.
 3. **Strategic option (unchanged):** since NS already reaches past mem0 into Graphiti's bridge directly, retiring the "impersonate a mem0 graph provider" indirection in favour of an NS-owned graph port would remove the shim as a permanent re-graft. Fold into the pluggable-backend decision (`13-pluggable-backend-gap-analysis.md`).
+
+## 7. Vendored but intentionally unused
+
+Each inert-looking capability of the two forks was traced to its callers and sorted into one of two kinds. **(A) NeuralScape work that was started** was wired to a real caller and proven; **(B) upstream code NeuralScape never adopted** stays vendored (it keeps syncs mechanical) and is fenced by `neuralscape-service/tests/test_vendored_unused_fence.py`, which fails when NS code starts importing it.
+
+### 7.1 Kind A: wired and proven
+
+| Capability | Evidence it is NS work | State on dev | Proof |
+|---|---|---|---|
+| Graph communities (`UPDATE_COMMUNITIES`) | NS setting (`config.py`), passed into `add_episode` by the adapter, read back by `GET /v1/graph/communities` and the `get_graph_communities` tool | **Was broken when on**: (1) upstream `add_episode` crashed after storing the episode unless exactly two entities resolved; (2) nothing created a group's first community (`update_community` only joins existing ones), so the endpoint stayed empty. Both fixed (`NEURALSCAPE PATCH` in `graphiti.py` and `graphiti_memory.py`); the first build is scoped to the written group because `Graphiti.build_communities` calls `remove_communities`, which deletes every group's communities. The build is idempotent across workers (uuids derived from group and cluster, MERGE saves) and a community with no `HAS_MEMBER` edge counts as not built and is rebuilt | `tests/test_fork_inert_capabilities.py`, `integration_tests/test_graph_communities_flag_on.py` |
+| Cross-encoder reranker (`_create_cross_encoder`, `graphiti_reranker_provider`) | NS adapter code and NS settings; reachable because `POST /graph/search` and `POST /v1/graph/search` build a `SearchConfig` from the caller's `search_config`, so `"reranker": "cross_encoder"` reaches `cross_encoder.rank` | Works; no named recipe uses it, so it only runs on request | `tests/test_fork_inert_capabilities.py`, `integration_tests/test_graph_cross_encoder_search_config.py` |
+| mem0 SQLite history | The service itself calls `m.db.add_history` on every write (`memory/write.py`) and mem0 does on `_update_memory` / `_delete_memory`, but nothing reads it | Writes disabled by default (`MEM0_HISTORY_ENABLED=false`): `get_mem0_config` points mem0 at a throwaway in-memory database and `_memory_from_config` swaps in a no-op store. Set `MEM0_HISTORY_ENABLED=true` for the file-backed history | `tests/test_fork_inert_capabilities.py` |
+
+The dreaming communities cron in `docs/UPSTREAM_EDGE_EXPERIMENTS.md` E-3 (`DREAMING_COMMUNITIES`, a periodic rebuild off the write path) and the `RERANK_ENABLED` fused-list reranker of E-1 were never started (no code anywhere) and remain out of scope.
+
+### 7.2 Kind B: fenced, not deleted
+
+| Vendored code | Why it is not NS's | Fence |
+|---|---|---|
+| mem0 `Memory.add` / `search` / `update`, the hybrid `_search_vector_store` (lemmatisation, BM25 + entity boost), the `<collection>_entities` store (with its NS lock patch) | The legacy `POST /memories` and `POST /search` routes now call `MemoryService.extract_and_store` / `search`; the service writes and reads Qdrant itself. The only `Memory` methods it calls are `get`, `get_all`, `delete`, `delete_all`, `_update_memory`, plus the `vector_store`, `db` and `embedding_model` attributes. `_remove_memory_from_entity_store` is a no-op until something creates the entity store | AST pin on every `Memory` handle in the service |
+| mem0 vector stores other than Qdrant, LLMs and embedders other than Gemini / OpenAI, `client/`, `proxy/`, `reranker/`, the legacy graph providers (`graph_memory`, `memgraph`, `kuzu`, `apache_age`, `graphs/neptune`) | `get_mem0_config` names only `qdrant`, `gemini` / `openai` and `graphiti`; `GraphStoreFactory` still lists the others but nothing selects them | import-graph pin; config provider pin; runtime check that building the adapter's clients loads none of them |
+| Graphiti FalkorDB, Kuzu and Neptune drivers; Anthropic, Azure, Groq, GLiNER2 and generic OpenAI LLM clients; Azure and Voyage embedders; the BGE reranker | Only the Neo4j driver and the Gemini / OpenAI clients are constructed | import-graph pin |
+| Graphiti `add_episode_bulk` and `bulk_utils`, sagas, `content_chunking`, `namespaces`, `migrations`, the OpenTelemetry tracer | No service call site (E-4 in `UPSTREAM_EDGE_EXPERIMENTS.md` is the unstarted plan for bulk) | import-graph pin plus a method-name pin (`add_episode_bulk`, `build_communities`, `remove_communities`, `saga=`) |
+| 15 of Graphiti's 16 named search recipes | The service imports `EDGE_HYBRID_SEARCH_RRF` only. The recipes' building blocks (node-distance, MMR, episode-mentions and cross-encoder rerankers) are reachable through a caller's `search_config` and are not fenced | pin that the only imported recipe is `EDGE_HYBRID_SEARCH_RRF` |
+
+To adopt a fenced piece, wire and test it, then move it out of the lists in `test_vendored_unused_fence.py` and out of this table in the same PR. Fencing adds no markers to the vendored trees, so `scripts/upstream-patches.txt` is unchanged by it; it gained one line only for the `graphiti.py` communities patch.
+
+### 7.3 Dead code in the service itself
+
+`main._get_async_memory()` builds an `AsyncMemory` that nothing calls (the legacy routes use `MemoryService`); only the shutdown hook references its handle. It was left alone here because `main.py` belongs to the routes owner.
+
