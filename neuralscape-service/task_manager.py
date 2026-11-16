@@ -384,8 +384,9 @@ class TaskManager:
         partition = doc.get("user_id") or "ingest"
         workspace = doc.get("workspace")
         job_id = _generate_job_id(
-            f"ingest:{visibility}:{adapter}:{connector_id}:{content}"
-            + (f":ws={workspace}" if workspace else ""),
+            f"ingest:{visibility}:{adapter}:{connector_id}:"
+            + (f"ws={workspace}:" if workspace else "")
+            + content,
             partition,
         )
 
@@ -422,8 +423,8 @@ class TaskManager:
         ) or payload.get("data_b64", "")
         job_id = _generate_job_id(
             f"ingest-file:{visibility}:{adapter}:{page_offset}:"
-            f"{payload.get('filename', '')}:{content_key}"
-            + (f":ws={workspace}" if workspace else ""),
+            + (f"ws={workspace}:" if workspace else "")
+            + f"{payload.get('filename', '')}:{content_key}",
             partition,
         )
         job = await self.pool.enqueue_job(
@@ -453,8 +454,9 @@ class TaskManager:
         ) or payload.get("data_b64", "")
         job_id = _generate_job_id(
             f"ingest-okf:{options.get('visibility')}:{options.get('scope')}:"
-            f"{options.get('project_id')}:{payload.get('filename', '')}:{content_key}"
-            + (f":ws={options.get('workspace')}" if options.get("workspace") else ""),
+            f"{options.get('project_id')}:"
+            + (f"ws={options.get('workspace')}:" if options.get("workspace") else "")
+            + f"{payload.get('filename', '')}:{content_key}",
             partition,
         )
         job = await self.pool.enqueue_job(

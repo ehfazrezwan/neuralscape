@@ -259,3 +259,76 @@ def test_pipeline_stores_passages_and_facts_in_the_workspace():
     out = ingest_document(service, doc)
     kinds = {c.kwargs["memory_kind"]: c.kwargs["workspace"] for c in service.store_raw.call_args_list}
     assert kinds == {"passage": "ref-books", "fact": "ref-books"}, out
+
+
+# ── review follow-ups: normalisation, shared validator, code-graph path ──
+
+
+def test_normalize_workspace_is_the_single_rule():
+    from schemas import normalize_workspace
+
+    assert normalize_workspace(None) is None and normalize_workspace("") is None and normalize_workspace("memory") is None
+    assert normalize_workspace("ref-books") == "ref-books"
+    for bad in ("bad name!", "x" * 101, "a/b"):
+        with pytest.raises(ValueError):
+            normalize_workspace(bad)
+
+
+def test_pipeline_stores_an_explicit_memory_workspace_untagged_and_not_the_adapter_default():
+    from ingest.pipeline import IngestDoc, ingest_document
+
+    for explicit, adapter in (("memory", "default"), ("memory", "trading_strategy"), ("", "default")):
+        service = MagicMock()
+        service.store_raw.return_value = ([MemoryResponse(id="p", memory="x", category="domain_knowledge")], True)
+        service.extract_facts_only.return_value = []
+        ingest_document(service, IngestDoc(content="# T\n\nSome text for a passage.", source={"connector_id": "c", "external_id": "e"},
+                                           user_id="alice", workspace=explicit, adapter=adapter))
+        assert {c.kwargs["workspace"] for c in service.store_raw.call_args_list} == {None}, (explicit, adapter)
+
+
+def test_a_non_default_adapter_without_a_workspace_still_gets_its_reference_workspace():
+    from ingest.pipeline import IngestDoc, ingest_document
+
+    service = MagicMock()
+    service.store_raw.return_value = ([MemoryResponse(id="p", memory="x", category="domain_knowledge")], True)
+    service.extract_facts_only.return_value = []
+    ingest_document(service, IngestDoc(content="# T\n\nSome text for a passage.", source={"connector_id": "c", "external_id": "e"},
+                                       user_id="alice", adapter="trading_strategy"))
+    assert {c.kwargs["workspace"] for c in service.store_raw.call_args_list} == {"ref-trading_strategy"}
+
+
+def test_rest_routes_normalise_an_explicit_memory_workspace(tm):
+    _client().post("/v1/ingest/text", json={"content": "notes", "workspace": "memory"}, headers=_headers())
+    assert "workspace" not in tm.enqueue_ingest_document.call_args.args[0]
+    files = {"files": ("a.md", b"# hello\n\nbody", "text/markdown")}
+    _client().post("/v1/ingest/files", files=files, data={"workspace": "memory"}, headers=_headers())
+    assert "workspace" not in tm.enqueue_ingest_file.call_args.args[0]["options"]
+
+
+def test_code_graph_ingest_stores_facts_in_the_requested_workspace(monkeypatch):
+    import ingest.code_graph as cg
+    from types import SimpleNamespace
+
+    fact = SimpleNamespace(content="module a imports b", category="architecture", tags=[], epistemic_level="explicit", confidence=0.9)
+    monkeypatch.setattr("adapters.code_graph.semantic.load_code_graph", lambda path: MagicMock(number_of_nodes=lambda: 1, number_of_edges=lambda: 0), raising=False)
+    monkeypatch.setattr("adapters.code_graph.semantic.extract_semantic_layer", lambda G, s: [fact], raising=False)
+    monkeypatch.setattr(cg, "_code_graph_source_ref", lambda base, gid, f: {"external_id": "e"})
+    service = MagicMock()
+    service.store_raw.return_value = ([MemoryResponse(id="m", memory="x", category="architecture")], True)
+    payload = {"user_id": "alice", "source_ref": {"external_id": "g"}, "options": {"workspace": "ref-code"}}
+    cg.ingest_code_graph_json(service, b"{}", payload)
+    assert service.store_raw.call_args.kwargs["workspace"] == "ref-code"
+    payload["options"]["workspace"] = "memory"
+    cg.ingest_code_graph_json(service, b"{}", payload)
+    assert service.store_raw.call_args.kwargs["workspace"] is None
+
+
+def test_the_workspace_pattern_has_one_definition():
+    import schemas
+
+    assert schemas.RawMemoryRequest.model_fields["workspace"].metadata
+    patterns = {m.pattern for f in (schemas.RawMemoryRequest, schemas.IngestDocumentRequest, schemas.IngestTextRequest,
+                                     schemas.ConnectorConfigRequest)
+                for name in ("workspace", "default_workspace") if name in f.model_fields
+                for m in f.model_fields[name].metadata if hasattr(m, "pattern")}
+    assert patterns == {schemas.WORKSPACE_PATTERN}

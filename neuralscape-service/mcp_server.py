@@ -148,17 +148,15 @@ def _meter_code_nav_bg(name: str, user_id: str, *, served_text=None, served_obj=
     sm.meter_code_nav_bg(op, user_id, served_text=served_text, served_obj=served_obj, files=files)
 
 
-_WORKSPACE_RE = r"[a-zA-Z0-9_.\-]{1,100}"
-
-
 def _ingest_workspace(arguments: dict) -> str | None:
-    """The ``workspace`` argument of an ingest tool (None when absent); ValueError if malformed."""
-    import re as _re
+    """The normalised ``workspace`` argument of an ingest tool (None = memory workspace);
+    ValueError if malformed."""
+    from schemas import normalize_workspace
 
     ws = arguments.get("workspace")
-    if ws is not None and not (isinstance(ws, str) and _re.fullmatch(_WORKSPACE_RE, ws)):
-        raise ValueError("workspace may only contain letters, digits, '_', '.', '-' (max 100)")
-    return ws
+    if ws is not None and not isinstance(ws, str):
+        raise ValueError("workspace must be a string")
+    return normalize_workspace(ws)
 
 
 def _standard_write_error(visibility, user_id: str) -> list[TextContent] | None:
@@ -615,8 +613,8 @@ async def list_tools() -> list[Tool]:
                     "extract_facts": {"type": "boolean", "description": "Also run LLM extraction for distilled facts (default true)"},
                     "index_passages": {"type": "boolean", "description": "Chunk + store verbatim passages (default true)"},
                     "tags": {"type": "array", "items": {"type": "string"}},
-                    "adapter": {"type": "string", "description": "Knowledge adapter selecting taxonomy/chunker/extractor/graph-ontology (e.g. 'default', 'trading_strategy'). Default 'default'."},
-                    "workspace": {"type": "string", "description": "Workspace partition: absent or 'memory' = the memory workspace (a non-default adapter derives a reference workspace); any other value = that reference workspace. Recall it with workspaces=[...]."},
+                    "adapter": {"type": "string", "description": "Knowledge adapter (e.g. 'trading_strategy'). Default 'default'."},
+                    "workspace": {"type": "string", "description": "Reference workspace (default: memory)."},
                     "wait": {"type": "boolean", "description": "Wait for ingest to finish before returning. Default false."},
                 },
                 "required": ["content", "source"],
@@ -660,8 +658,8 @@ async def list_tools() -> list[Tool]:
                     "extract_facts": {"type": "boolean", "description": "Also run LLM extraction for distilled facts (default true)"},
                     "index_passages": {"type": "boolean", "description": "Chunk + store verbatim passages (default true)"},
                     "tags": {"type": "array", "items": {"type": "string"}},
-                    "adapter": {"type": "string", "description": "Knowledge adapter selecting taxonomy/chunker/extractor/graph-ontology (e.g. 'default', 'trading_strategy'). Default 'default'."},
-                    "workspace": {"type": "string", "description": "Workspace partition: absent or 'memory' = the memory workspace (a non-default adapter derives a reference workspace); any other value = that reference workspace. Recall it with workspaces=[...]."},
+                    "adapter": {"type": "string", "description": "Knowledge adapter (e.g. 'trading_strategy'). Default 'default'."},
+                    "workspace": {"type": "string", "description": "Reference workspace (default: memory)."},
                     "wait": {"type": "boolean", "description": "Wait for ingest to finish before returning. Default false."},
                 },
                 "required": ["content"],

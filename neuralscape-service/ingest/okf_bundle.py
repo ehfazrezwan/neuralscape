@@ -360,6 +360,7 @@ def ingest_okf_bundle(
     """
     from ingest.chunking_strategies import OkfFrontmatterStrategy
     from ingest.pipeline import IngestDoc, ingest_document
+    from schemas import normalize_workspace
 
     bundle_name = (
         Path(bundle_uri.rstrip("/")).stem or "okf-bundle"
@@ -454,7 +455,7 @@ def ingest_okf_bundle(
                 ),
                 add_to_graph=False,
                 return_created=True,
-                workspace=workspace,
+                workspace=normalize_workspace(workspace),
             )
         except Exception:
             logger.warning(
