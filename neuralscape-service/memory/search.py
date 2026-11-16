@@ -85,16 +85,15 @@ def _workspace_filter(effective: list[str]):
         PayloadField,
     )
 
-    key = "metadata.workspace"
     refs = [w for w in effective if w != "memory"]
     should: list = []
     if "memory" in effective:
-        should.append(IsEmptyCondition(is_empty=PayloadField(key=key)))
-        should.append(FieldCondition(key=key, match=MatchValue(value="memory")))
+        should.append(IsEmptyCondition(is_empty=PayloadField(key="metadata.workspace")))
+        should.append(FieldCondition(key="metadata.workspace", match=MatchValue(value="memory")))
         # Legacy/odd rows with an empty-string workspace were memory rows.
-        should.append(FieldCondition(key=key, match=MatchValue(value="")))
+        should.append(FieldCondition(key="metadata.workspace", match=MatchValue(value="")))
     if refs:
-        should.append(FieldCondition(key=key, match=MatchAny(any=refs)))
+        should.append(FieldCondition(key="metadata.workspace", match=MatchAny(any=refs)))
     return Filter(should=should)
 
 
