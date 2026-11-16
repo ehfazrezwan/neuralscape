@@ -28,6 +28,7 @@ COMPOSE_ONLY_KEYS = frozenset({
     "DOMAIN",  # reverse-proxy host name
     "REDIS_PASSWORD",  # interpolated into REDIS_URL and the redis service
     "EMBEDDING_MODEL_NAME",  # interpolated into GEMINI_EMBEDDER_MODEL
+    "WORKER_AUTOHEAL",  # label value on the worker services (opt out of autoheal restarts)
 })
 # * Vendored-env keys: read straight from the process environment by vendored library
 #   code (mem0 adapter), not by Settings. Tolerated in the file so a template can

@@ -82,6 +82,11 @@ api:
     targetCPUUtilizationPercentage: 75
     targetMemoryUtilizationPercentage: 80
 
+# Worker liveness (heartbeat file) probes: set enabled=false to opt out of
+# kubelet restarts of a wedged worker.
+workerLiveness:
+  enabled: true
+
 worker:
   replicaCount: 1
   resources:
