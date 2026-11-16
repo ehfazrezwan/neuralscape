@@ -65,23 +65,47 @@ SAMPLE: list[tuple[str, str, str, bool]] = [
 ]
 
 
+# Added after the re-review: cases the first 40 lacked (soft modals inside limit/label clauses, typographic
+# apostrophes). Reported separately so the original 40-pair numbers stay comparable.
+EXTRA: list[tuple[str, str, str, bool]] = [
+    ("soft-in-limit", "Passwords should be at least 12 characters.", "Passwords must be at least 12 characters.", True),
+    ("soft-in-limit", "Services may have a maximum of three retries.", "Services must have a maximum of three retries.", True),
+    ("soft-in-label", "Note: Users should register accounts.", "Users must register accounts.", True),
+    ("soft-in-label", "Tip: teams may rotate the pager weekly.", "Teams must rotate the pager weekly.", True),
+    ("soft-in-label", "Optional: staff could wear badges on site.", "Staff must wear badges on site.", True),
+    ("curly", "Users should not share passwords.", "Users mustn\u2019t share passwords.", True),
+    ("curly", "Users may register accounts.", "Users don\u2019t need to register accounts.", False),
+    ("curly", "Users mustn\u2019t share passwords.", "Users must not share passwords.", False),
+    ("limit-faithful", "Passwords have a minimum of twelve characters.", "Passwords must have a minimum of twelve characters.", False),
+    ("label-faithful", "Employees: wear badges at all times.", "Employees must wear badges at all times.", False),
+]
+
+
 def test_sample_is_forty_cases():
     assert len(SAMPLE) == 40
 
 
 def test_measured_false_positive_and_false_negative_counts(capsys):
+    _measure(SAMPLE, capsys, "fixed 40-pair sample", pin_fp=["Every deploy must be logged.", "Small changes do not need a second reviewer."])
+
+
+def test_measured_counts_on_the_added_cases(capsys):
+    _measure(EXTRA, capsys, "added re-review cases", pin_fp=[])
+
+
+def _measure(sample, capsys, title, *, pin_fp):
     fp, fn, rows = [], [], []
-    for category, source, fact, flagged in SAMPLE:
+    for category, source, fact, flagged in sample:
         got = modality_upgraded(fact, ModalitySource(source))
         rows.append((category, flagged, got))
         if got and not flagged:
             fp.append((category, fact))
         if flagged and not got:
             fn.append((category, fact))
-    n_up = sum(1 for *_, f in SAMPLE if f)
-    n_ok = len(SAMPLE) - n_up
+    n_up = sum(1 for *_, f in sample if f)
+    n_ok = len(sample) - n_up
     with capsys.disabled():
-        print(f"\nmodality_upgraded on {len(SAMPLE)} labelled pairs: "
+        print(f"\nmodality_upgraded, {title} ({len(sample)} pairs): "
               f"false negatives {len(fn)}/{n_up} (upgrades labelled explicit), "
               f"false positives {len(fp)}/{n_ok} (faithful facts relabelled inductive)")
         for c, f in fn:
@@ -96,4 +120,4 @@ def test_measured_false_positive_and_false_negative_counts(capsys):
     # heavy paraphrases (too little lexical overlap to compare, so they are "unknown" and conservatively
     # labelled inductive: documented limit, not tuned away on this sample).
     assert not fn, fn
-    assert sorted(f for _, f in fp) == ["Every deploy must be logged.", "Small changes do not need a second reviewer."], fp
+    assert sorted(f for _, f in fp) == sorted(pin_fp), fp

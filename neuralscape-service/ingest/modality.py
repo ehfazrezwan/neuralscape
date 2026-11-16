@@ -34,9 +34,15 @@ MODALITY_INFERRED_LEVEL = "inductive"
 _NEGATED_RE = re.compile(
     r"\b(?:need|needs|needed)\s+not\b|\bneedn'?t\b|\bno\s+need\b|"
     r"\b(?:do|does|did)(?:\s+not|n'?t)\s+(?:need|have)\s+to\b|"
-    r"\b(?:is|are|was|were)(?:\s+not|n'?t)\s+(?:be\s+)?(?:required|mandatory|compulsory|obligatory|necessary|obliged|obligated)\b|"
-    r"\bnot\s+(?:be\s+)?(?:required|mandatory|compulsory|obligatory|necessary|obliged|obligated)\b|"
+    r"(?:\bnot|n'?t)\s+(?:be\s+)?(?:required|mandatory|compulsory|obligatory|necessary|obliged|obligated)\b|"
     r"\bun(?:necessary|required)\b",
+    re.IGNORECASE,
+)
+# Soft modals / hedges: a clause carrying one is NOT normative even if it looks like a limit or a
+# "Label: value" line ("Note: users should register", "Tip: may ...", "Optional: ...").
+_SOFT_RE = re.compile(
+    r"\b(?:should(?:n'?t)?|may|might|could|can|recommend(?:s|ed|ation)?|suggest(?:s|ed)?|ideally|optional|optionally|"
+    r"preferably|prefer(?:s|red)?|encouraged|advisable|consider)\b",
     re.IGNORECASE,
 )
 _OBLIGATION_RE = re.compile(
@@ -55,7 +61,14 @@ _LIMIT_RE = re.compile(
 _LABEL_VALUE_RE = re.compile(r"^\s*(?P<label>[^:\n]{1,40}):\s*(?P<value>\S[^\n]*)$")
 
 
+def _norm(text: str) -> str:
+    """Typographic apostrophes (U+2019, U+02BC, U+2018) become ASCII, so ``mustn’t`` matches ``mustn't``."""
+    return text.replace("\u2019", "'").replace("\u02bc", "'").replace("\u2018", "'")
+
+
 def _is_normative_form(clause: str) -> bool:
+    if _SOFT_RE.search(clause):
+        return False
     if _LIMIT_RE.search(clause):
         return True
     m = _LABEL_VALUE_RE.match(clause)
@@ -80,6 +93,7 @@ def _stems(text: str) -> frozenset[str]:
 
 
 def has_obligation(text: str) -> bool:
+    text = _norm(text)
     return _OBLIGATION_RE.search(_NEGATED_RE.sub(" negated ", text)) is not None
 
 
