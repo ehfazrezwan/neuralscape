@@ -16,7 +16,7 @@ import uuid
 from datetime import datetime, timezone
 from config import settings
 from schemas import MemoryVisibility, normalize_visibility
-from memory.groups import _build_group_id
+from memory.groups import _build_group_id, _scoped_groups
 from memory.junk import _deleted_msg
 from memory.ranking import _mem_is_tombstoned, _times_derived_from_metadata
 
@@ -696,7 +696,9 @@ class DeleteMixin:
             group_id = _build_group_id(
                 visibility, owner, metadata.get("project_id"), metadata.get("workspace")
             )
-            group_ids = [group_id]
+            group_ids = _scoped_groups([group_id])
+            if not group_ids:
+                return
 
             results = self._run_on_bridge(
                 self._graphiti.search_(
