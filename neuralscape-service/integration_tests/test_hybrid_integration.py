@@ -52,6 +52,11 @@ def make_service(uid):
     def factory():
         svc = MemoryService()
         svc._get_memory()
+        if svc._graphiti is not None:
+            # The driver only schedules its index build fire-and-forget at
+            # construction; finish it on the service's own bridge loop before
+            # the test starts so nothing is left running when the service closes.
+            svc._run_on_bridge(svc._graphiti.build_indices_and_constraints(), timeout=120)
         created.append(svc)
         return svc
 

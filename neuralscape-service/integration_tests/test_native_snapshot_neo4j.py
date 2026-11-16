@@ -94,10 +94,36 @@ def live_database(neo4j_conn):
             loop.close()
 
 
+_CODE_SPACE_PREFIX = "code--ci--snapshot-"
+
+
+def _sweep_stale_code_spaces(loop, driver) -> None:
+    """Delete nodes leaked by earlier (killed/failed) runs on a persisted volume."""
+
+    async def _sweep() -> None:
+        async with driver.session() as session:
+            await session.run(
+                "MATCH (n) WHERE n.code_space STARTS WITH $prefix DETACH DELETE n",
+                prefix=_CODE_SPACE_PREFIX,
+            )
+
+    _submit(loop, _sweep())
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _clean_snapshot_code_spaces(live_database):
+    bridge, driver = live_database
+    _sweep_stale_code_spaces(bridge._loop, driver)
+    try:
+        yield
+    finally:
+        _sweep_stale_code_spaces(bridge._loop, driver)
+
+
 @pytest.fixture
 def live_engine(live_database):
     bridge, driver = live_database
-    code_space = f"code--ci--snapshot-{uuid.uuid4().hex}"
+    code_space = f"{_CODE_SPACE_PREFIX}{uuid.uuid4().hex}"
     engine = NativeEngine(
         repo_path="/tmp/snapshot-ci",
         code_space=code_space,
@@ -354,10 +380,28 @@ def test_arbitrary_identifiers_and_property_maps_round_trip_safely(live_engine):
     assert relationships["ANCHORED"]["target_repo"] == "snapshot-ci"
     assert "CodeAnchor" in relationships["ANCHORED"]["target_labels"]
 
+    # Scope to this test's code_space: the database volume persists across gate
+    # runs and other modules, so an unscoped MATCH (n) also counts nodes leaked
+    # by earlier runs (9 == 3 x 3 on the gate).
     all_nodes = live_engine._run_cypher(
-        "MATCH (n) RETURN labels(n) AS labels, properties(n) AS properties"
+        "MATCH (n) WHERE n.code_space = $code_space "
+        "RETURN labels(n) AS labels, properties(n) AS properties",
+        code_space=live_engine.code_space,
     )
     assert len(all_nodes) == 3
+    assert _node_count(live_engine) == 3
+    identities = sorted(
+        (
+            "CodeAnchor" if "CodeAnchor" in row["labels"] else "CodeSymbol",
+            row["properties"]["fqn"],
+        )
+        for row in all_nodes
+    )
+    assert identities == [
+        ("CodeAnchor", "pkg.source"),
+        ("CodeSymbol", "pkg.source"),
+        ("CodeSymbol", "pkg.target"),
+    ]
     assert all("compromised" not in row["properties"] for row in all_nodes)
 
 

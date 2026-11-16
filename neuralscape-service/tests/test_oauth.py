@@ -383,6 +383,23 @@ class TestToken:
         assert resp.status_code == 400
         assert resp.json()["error"] == "invalid_grant"
 
+    @pytest.mark.parametrize("verifier", ["vérifier-é" * 5, "\u2603" * 43])
+    def test_a_non_ascii_code_verifier_is_an_invalid_grant_not_a_server_error(self, client, verifier):
+        # a verifier is unreserved ASCII (RFC 7636 4.1): anything else simply does not match
+        client_id, redirect_uri, _verifier, code = self._full_flow_to_code(client)
+        resp = client.post(
+            "/oauth/token",
+            data={
+                "grant_type": "authorization_code",
+                "code": code,
+                "code_verifier": verifier,
+                "redirect_uri": redirect_uri,
+                "client_id": client_id,
+            },
+        )
+        assert resp.status_code == 400
+        assert resp.json()["error"] == "invalid_grant"
+
     def test_code_is_single_use(self, client):
         client_id, redirect_uri, verifier, code = self._full_flow_to_code(client)
         data = {

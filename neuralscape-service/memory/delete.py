@@ -117,6 +117,27 @@ def _is_tombstoned(payload: dict) -> bool:
 _DEDUP_TOP_K_STEPS = (10, 40, 160)
 
 
+def _exact_category(payload: dict):
+    """Category component of the exact-phase group key (same hash, other category: not a duplicate)."""
+    return _dedup_meta(payload)[0].get("category")
+
+
+def _differs_only_by_category(a: dict, b: dict) -> bool:
+    """True for two rows with the SAME text hash but different categories.
+
+    Such a pair can only exist because someone wrote the same text on purpose
+    under two categories (the explicit write path keys on the category), so
+    no dedup phase may merge them. Near-duplicates with different hashes are
+    unaffected and still merge across categories.
+    """
+    ha, hb = a.get("hash"), b.get("hash")
+    if not ha or ha != hb:
+        return False
+    ca = _dedup_meta(a)[0].get("category")
+    cb = _dedup_meta(b)[0].get("category")
+    return ca != cb
+
+
 def _dense_vector(vector) -> list[float] | None:
     """The unnamed dense vector of a retrieved point (``None`` if unusable).
 
@@ -830,7 +851,7 @@ class DeleteMixin:
             for mem in page:
                 h = mem["payload"].get("hash")
                 if h and not _is_tombstoned(mem["payload"]):
-                    key = (h, _dedup_partition(mem["payload"]))
+                    key = (h, _dedup_partition(mem["payload"]), _exact_category(mem["payload"]))
                     key_counts[key] = key_counts.get(key, 0) + 1
 
         exact_removed = 0
@@ -841,7 +862,7 @@ class DeleteMixin:
                     h = mem["payload"].get("hash")
                     if not h or _is_tombstoned(mem["payload"]):
                         continue
-                    key = (h, _dedup_partition(mem["payload"]))
+                    key = (h, _dedup_partition(mem["payload"]), _exact_category(mem["payload"]))
                     if key_counts.get(key, 0) > 1:
                         hash_groups.setdefault(key, []).append(mem)
         del key_counts
@@ -1053,6 +1074,8 @@ class DeleteMixin:
             if _dedup_partition(hit_payload) != partition:
                 continue
             if _is_tombstoned(hit_payload):
+                continue
+            if _differs_only_by_category(payload, hit_payload):
                 continue
             out.append(hit)
         return out
