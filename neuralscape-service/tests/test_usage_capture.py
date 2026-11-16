@@ -378,3 +378,36 @@ def test_failed_gap_flush_keeps_the_count_for_a_later_flush():
     store.fail = False
     recorder.flush_gaps()
     assert store.gaps == 3 and recorder.unrecorded == {}
+
+
+def test_gap_recovery_on_the_provider_call_path_is_bounded_by_the_record_budget():
+    """Before: one successful append flushed every pending task gap synchronously, so 1,000 pending tasks at
+    100 ms a write held the provider-call thread for 100 s.  Counts the budget does not reach are kept."""
+    from usage_capture import DurableUsageRecorder
+    from tests.test_usage_store import event
+
+    clock = {"now": 0.0}
+
+    class Store:
+        def __init__(self):
+            self.gaps = {}
+
+        def append(self, e, *, ledger_attempt=None):
+            return True
+
+        def record_gap(self, tenant_id, task_id, count):
+            clock["now"] += 0.1  # each gap write costs 100 ms
+            self.gaps[(tenant_id, task_id)] = count
+
+    store = Store()
+    recorder = DurableUsageRecorder(store, record_budget_s=1.0, monotonic=lambda: clock["now"])
+    for i in range(1000):
+        recorder._unrecorded[("t", f"task-{i}")] = 1
+    assert recorder.record(event("e1")) is True
+    assert 1 <= len(store.gaps) <= 11  # about one second of recovery, not a hundred
+    assert len(store.gaps) + len(recorder.unrecorded) == 1000  # nothing dropped
+    first = len(store.gaps)
+    recorder.record(event("e2"))  # the next call carries on where this one stopped
+    assert len(store.gaps) > first
+    recorder.flush_gaps()  # an unbounded flush (shutdown) still drains the rest
+    assert len(store.gaps) == 1000 and recorder.unrecorded == {}

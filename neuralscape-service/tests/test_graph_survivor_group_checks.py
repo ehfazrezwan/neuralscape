@@ -70,6 +70,14 @@ def test_the_cascade_and_the_retirement_pass_the_episodes_own_group(service, mon
     assert [a[3] for a in seen] == [ALICE_GROUP, ALICE_GROUP]
 
 
+def _encoded(pool, owner, project=None):
+    from memory.groups import GroupKey, _encode_group_key, decode_group_id
+
+    group = _encode_group_key(GroupKey(pool, owner, project, None))
+    assert decode_group_id(group) is not None  # a canonical encoding, not just a prefix
+    return group
+
+
 @pytest.mark.parametrize("group, owner, allowed", [
     ("user--alice", "alice", True),
     ("user--alice--project--p1", "alice", True),
@@ -79,7 +87,11 @@ def test_the_cascade_and_the_retirement_pass_the_episodes_own_group(service, mon
     ("user--bob", "alice", False),
     ("user--bob--project--p1", "alice", False),
     ("user--bob", None, True),            # no owner known: not judged (the legacy behaviour)
-    ("nsg1--ab12", "alice", True),        # an encoded name does not carry its owner
+    ("nsg1--ab12", "alice", True),        # a name that does not decode is not judged
+    (_encoded("private", "al:ice"), "al:ice", True),    # an encoded private group names its owner: its own
+    (_encoded("private", "bo:b"), "al:ice", False),     # ... another user's is refused
+    (_encoded("private", "al:ice"), None, True),        # no owner known: not judged
+    (_encoded("shared", None, "p:1"), "al:ice", True),  # an encoded shared group holds anyone's episodes
 ])
 def test_group_ownership(service, group, owner, allowed):
     assert service._group_may_belong_to(group, owner) is allowed

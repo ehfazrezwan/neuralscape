@@ -188,3 +188,39 @@ def test_install_mem0_wrappers_labels(recorder):
 def test_install_never_raises_on_odd_objects():
     uw.install_mem0_wrappers(object())
     uw.install_graphiti_wrappers(object())
+
+
+def test_async_wrappers_record_off_the_event_loop_thread(recorder):
+    """Before: ``record`` (a synchronous store write that may sleep through retries) ran on the loop thread
+    inside every awaited provider call.  The attempt context must still reach the recording thread."""
+    import threading
+
+    seen = []
+    real = recorder.record
+
+    def spying_record(event):
+        seen.append((threading.get_ident(), uc.current_attempt_context()))
+        return real(event)
+
+    recorder.record = spying_record
+    inner = SimpleNamespace(aio=SimpleNamespace(models=FakeAsyncModels()))
+    gem = uw.wrap_client(inner, "graphiti_llm")
+
+    class Boom:
+        async def create(self, **kw):
+            raise RuntimeError("down")
+
+    boom = uw.wrap_client(SimpleNamespace(chat=SimpleNamespace(completions=Boom())), "graphiti_llm")
+    loop_thread = []
+
+    async def run():
+        loop_thread.append(threading.get_ident())
+        with uc.attempt_context(CTX):
+            await gem.aio.models.generate_content(model="m", contents="x")
+            with pytest.raises(RuntimeError):
+                await boom.chat.completions.create(model="gw", messages=[])
+
+    asyncio.run(run())
+    assert len(seen) == 2  # a success and a failure were both recorded
+    assert all(thread != loop_thread[0] for thread, _ in seen)
+    assert all(context is CTX for _, context in seen)

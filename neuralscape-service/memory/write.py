@@ -16,7 +16,7 @@ from savings_meter import stamp_tokens
 from usage_capture import record_generation_usage
 from schemas import EPISTEMIC_LEVEL_VOCAB, GLOBAL_CATEGORIES, MEMORY_CATEGORIES, MemoryResponse, MemoryScope, MemoryVisibility, PROJECT_CATEGORIES, default_scope_for_category, default_visibility_for_category, normalize_visibility, validate_occurred_at
 from memory.groups import _build_group_id
-from memory.provenance import REENRICH_PENDING_KEY, SUPERSEDED_EPISODES_KEY
+from memory.provenance import REENRICH_PENDING_AT_KEY, REENRICH_PENDING_KEY, SUPERSEDED_EPISODES_KEY
 from memory.hashing import _infer_project_id, _parse_expires_at, content_hash
 from memory.junk import _clean_conversation_for_graph, _is_junk_fact
 from memory.ranking import _times_derived_from_metadata
@@ -1397,9 +1397,17 @@ class WriteMixin:
         group_id = _build_group_id(visibility, user_id, project_id, workspace)
         # A correction re-enriches an existing memory: its previous episode is replaced below.
         support_aware = bool(getattr(settings, "graph_support_aware_removal_enabled", False))
-        previous_episodes, reenrich_pending = (
-            self._previous_graph_episodes(memory_id) if support_aware else ([], False)
-        )
+        previous = self._previous_graph_episodes(memory_id) if support_aware else ([], False)
+        if previous is None:
+            # The row could not be read, so its current episode is unknown: writing a new episode now
+            # would overwrite the reference and the old episode (with the text just corrected) could
+            # never be retired.  Nothing is written; the row keeps its reference and the caller sees
+            # an incomplete enrichment (the re-enrichment job retries it).
+            logger.warning(
+                "Graph enrichment of memory %s deferred: its previous graph episode could not be read", memory_id,
+            )
+            return False
+        previous_episodes, reenrich_pending = previous
         graph_write_started_at = datetime.now(timezone.utc)
         try:
             episode_name, existing_uuid = self._resolve_single_fact_episode(memory_id, content, group_id)
@@ -1501,10 +1509,14 @@ class WriteMixin:
             logger.debug("post-enrichment row check failed for %s", memory_id, exc_info=True)
             return False
 
-    def _previous_graph_episodes(self, memory_id: str) -> tuple[list[str], bool]:
+    def _previous_graph_episodes(self, memory_id: str) -> tuple[list[str], bool] | None:
         """The episodes recorded on the memory's row before a re-enrichment (its current episode
         and any superseded one an earlier correction could not remove), and whether the row
-        awaits re-enrichment after its shared episode was removed."""
+        awaits re-enrichment after its shared episode was removed.
+
+        ``None`` when the row could not be read: that is not the same as a row with no earlier
+        episode, and the caller must not write over a reference it cannot see.
+        """
 
         try:
             row = self._memory.get(memory_id) or {}
@@ -1516,16 +1528,26 @@ class WriteMixin:
             episodes = list(dict.fromkeys(v for v in values if isinstance(v, str) and v))
             return episodes, bool(metadata.get(REENRICH_PENDING_KEY))
         except Exception:
-            logger.debug("previous graph episode lookup failed for %s", memory_id, exc_info=True)
-            return [], False
+            logger.warning("previous graph episode lookup failed for %s", memory_id, exc_info=True)
+            return None
 
     def _clear_reenrich_pending(self, memory_id: str) -> None:
         try:
-            self._memory.vector_store.client.set_payload(
+            client = self._memory.vector_store.client
+            # The marker is cleared where it was set: a row whose metadata is wrapped one level deeper
+            # keeps it there, and writing the key at the other depth would hide the row's own metadata.
+            parent = "metadata"
+            for point in client.retrieve(
+                collection_name=settings.qdrant_collection, ids=[memory_id], with_payload=True, with_vectors=False,
+            ) or []:
+                meta = (getattr(point, "payload", None) or {}).get("metadata") or {}
+                if isinstance(meta.get("metadata"), dict):
+                    parent = "metadata.metadata"
+            client.set_payload(
                 collection_name=settings.qdrant_collection,
-                payload={REENRICH_PENDING_KEY: None},
+                payload={REENRICH_PENDING_KEY: None, REENRICH_PENDING_AT_KEY: None},
                 points=[memory_id],
-                key="metadata",
+                key=parent,
             )
         except Exception as e:
             logger.warning(f"Clearing the re-enrichment marker failed for {memory_id} (non-fatal): {e}")

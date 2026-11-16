@@ -446,3 +446,49 @@ def test_a_rollup_over_the_event_cap_is_refused_not_truncated(tmp_path, monkeypa
     monkeypatch.setattr(usage_store, "MAX_ROLLUP_EVENTS", 4)
     assert len(usage_store.task_rollup(store, "tenant-1", "task-1")["attempts"]) == 4
     store.close()
+
+
+def test_sqlite_append_waits_for_a_locked_database_only_within_its_budget(tmp_path):
+    """Before: the connection's 30 s busy timeout held ``append`` (the provider-call thread) for as long as
+    another process kept the database write-locked."""
+    import time
+
+    path = str(tmp_path / "usage.db")
+    store = SqliteUsageStore(path, append_budget_s=0.3)
+    other = sqlite3.connect(path, isolation_level=None)
+    other.execute("BEGIN IMMEDIATE")  # a second writer holds the lock
+    try:
+        started = time.monotonic()
+        with pytest.raises(sqlite3.OperationalError):
+            store.append(event("e1"))
+        assert time.monotonic() - started < 3.0
+    finally:
+        other.execute("ROLLBACK")
+        other.close()
+    assert store.append(event("e1")) is True  # the connection is usable again, default timeout restored
+    assert store._conn.execute("PRAGMA busy_timeout").fetchone()[0] == 30_000
+
+
+def test_sqlite_append_does_not_wait_past_its_budget_for_the_connection_lock(tmp_path):
+    import time
+
+    store = SqliteUsageStore(str(tmp_path / "usage.db"), append_budget_s=0.2)
+    held = threading.Event()
+    release = threading.Event()
+
+    def hold():
+        with store._lock:
+            held.set()
+            release.wait(5)
+
+    thread = threading.Thread(target=hold)
+    thread.start()
+    held.wait(2)
+    try:
+        started = time.monotonic()
+        with pytest.raises(UsageStoreError, match="busy"):
+            store.append(event("e1"))
+        assert time.monotonic() - started < 2.0
+    finally:
+        release.set()
+        thread.join()

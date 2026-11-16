@@ -166,7 +166,10 @@ def test_the_survivor_lookup_pages_and_compares_ids_here(service):
                                                 ([P(id="m3", payload={"data": "c"})], None))
     assert service._episode_survivors("ep-1", "ep-name", ("m1",)) == [("m2", {"data": "b"}), ("m3", {"data": "c"})]
     call = service._memory.vector_store.client.scroll.call_args_list[0].kwargs
-    assert {c.key for c in call["scroll_filter"].should} == {"metadata.graph_episode_uuid", "metadata.graph_episode_name"}
+    assert {c.key for c in call["scroll_filter"].should} == {
+        "metadata.graph_episode_uuid", "metadata.graph_episode_name",
+        "metadata.metadata.graph_episode_uuid", "metadata.metadata.graph_episode_name",  # a wrapped row too
+    }
     assert call["with_payload"] is True
     service._memory.vector_store.client = _rows(([P(id="m1", payload={})], None))
     assert service._episode_survivors("ep-1", None, ("m1",)) == []
@@ -174,29 +177,93 @@ def test_the_survivor_lookup_pages_and_compares_ids_here(service):
     assert service._episode_survivors("ep-1", None, ("m1",)) is None
 
 
+def _marked(service, marker="ep-1"):
+    """The store answers the read-back of a conditional update as if it had applied."""
+    service._memory.vector_store.client.retrieve.side_effect = lambda **kw: [
+        P(id=kw["ids"][0], payload={"metadata": {"graph_reenrich_pending": marker}})]
+
+
+def _condition_keys(points):
+    return sorted((getattr(c, "key", None) or c.has_id[0]) for c in points.must)
+
+
+from types import SimpleNamespace as P  # noqa: E402
+
+
 def test_re_enrichment_clears_the_stale_reference_marks_the_row_and_uses_the_installed_dispatch(service):
     patches, jobs = [], []
-    service._memory.vector_store.client.set_payload.side_effect = lambda **kw: patches.append((kw["points"], kw["payload"]))
+    service._memory.vector_store.client.set_payload.side_effect = lambda **kw: patches.append(kw)
+    _marked(service)
     service.set_graph_reenrich_dispatch(jobs.append)
     rows = [
         ("m2", {"data": "fact two", "user_id": "u", "metadata": {"owner_user_id": "u", "visibility": "shared",
-                                                                "project_id": "p", "workspace": "ref"}}),
+                                                                "project_id": "p", "workspace": "ref",
+                                                                "graph_episode_uuid": "ep-1"}}),
         ("m3", {"data": "tombstoned", "metadata": {"dream_tombstoned": True}}),  # logically deleted: not re-enriched
     ]
     assert service._reenrich_survivors(rows, "ep-1") == 1
-    assert patches == [(["m2"], {"graph_episode_uuid": None, "graph_episode_name": None,
-                                 "graph_reenrich_pending": "ep-1"})]
+    (patch,) = patches
+    assert patch["payload"]["graph_episode_uuid"] is None and patch["payload"]["graph_episode_name"] is None
+    assert patch["payload"]["graph_reenrich_pending"] == "ep-1" and patch["payload"]["graph_reenrich_pending_at"] > 0
+    assert patch["key"] == "metadata"
+    assert _condition_keys(patch["points"]) == sorted(["m2", "metadata.graph_episode_uuid"])  # conditional, not by id alone
     assert jobs == [{"memory_id": "m2", "content": "fact two", "user_id": "u", "project_id": "p",
                      "visibility": "shared", "workspace": "ref", "removed_episode": "ep-1"}]
 
 
+def test_a_survivor_that_a_correction_moved_to_a_newer_episode_is_not_touched(service):
+    """Before: the clearing was an unconditional patch by id, so a reference written after the survivor lookup
+    was wiped, and no later correction could find (and retire) that episode."""
+    jobs = []
+    service._memory.vector_store.client.retrieve.side_effect = lambda **kw: [
+        P(id="m2", payload={"metadata": {"graph_episode_uuid": "ep-2"}})]  # the filter did not match: no marker
+    service.set_graph_reenrich_dispatch(jobs.append)
+    assert service._reenrich_survivors([("m2", {"data": "x", "metadata": {"graph_episode_uuid": "ep-1"}})], "ep-1") == 0
+    assert jobs == []
+
+
+def test_a_survivor_with_wrapped_metadata_is_patched_at_its_own_depth(service):
+    patches = []
+    service._memory.vector_store.client.set_payload.side_effect = lambda **kw: patches.append(kw)
+    _marked(service)
+    service.set_graph_reenrich_dispatch(lambda job: None)
+    row = ("m2", {"data": "x", "metadata": {"metadata": {"graph_episode_uuid": "ep-1", "owner_user_id": "u"}}})
+    assert service._reenrich_survivors([row], "ep-1") == 1
+    assert patches[0]["key"] == "metadata.metadata"
+    assert "metadata.metadata.graph_episode_uuid" in _condition_keys(patches[0]["points"])
+
+
+def test_a_survivor_recording_the_episode_by_name_only_is_patched_on_that_name(service):
+    patches = []
+    service._memory.vector_store.client.set_payload.side_effect = lambda **kw: patches.append(kw)
+    _marked(service)
+    service.set_graph_reenrich_dispatch(lambda job: None)
+    service._reenrich_survivors([("m2", {"data": "x", "metadata": {"graph_episode_name": "n"}})], "ep-1")
+    assert "metadata.graph_episode_name" in _condition_keys(patches[0]["points"])
+
+
+def test_a_failed_dispatch_is_logged_with_the_memory_and_leaves_the_marker(service, caplog):
+    service._memory.vector_store.client.set_payload.return_value = None
+    _marked(service)
+
+    def boom(job):
+        raise RuntimeError("queue down")
+
+    service.set_graph_reenrich_dispatch(boom)
+    with caplog.at_level("WARNING"):
+        assert service._reenrich_survivors([("m2", {"data": "x", "metadata": {"graph_episode_uuid": "ep-1"}})], "ep-1") == 0
+    assert "memory=m2" in caplog.text and "graph_reenrich_pending stays" in caplog.text
+
+
 def test_without_an_installed_dispatch_a_survivor_is_re_enriched_inline_and_a_failure_keeps_the_marker(service, monkeypatch):
     service.set_graph_reenrich_dispatch(None)
+    _marked(service)
     inline = []
     monkeypatch.setattr(service, "reenrich_memory_graph", lambda mid: inline.append(mid) or {"memory_ids": [mid]})
-    assert service._reenrich_survivors([("m2", {"data": "x", "metadata": {}})], "ep-1") == 1 and inline == ["m2"]
+    row = ("m2", {"data": "x", "metadata": {"graph_episode_uuid": "ep-1"}})
+    assert service._reenrich_survivors([row], "ep-1") == 1 and inline == ["m2"]
     monkeypatch.setattr(service, "reenrich_memory_graph", lambda mid: (_ for _ in ()).throw(RuntimeError("down")))
-    assert service._reenrich_survivors([("m2", {"data": "x", "metadata": {}})], "ep-1") == 0  # logged; marker stays
+    assert service._reenrich_survivors([row], "ep-1") == 0  # logged; marker stays
 
 
 def test_the_re_enrichment_job_reads_the_row_and_raises_when_enrichment_does_not_complete(service, monkeypatch):
@@ -328,8 +395,12 @@ def test_the_graph_queue_runs_the_re_enrichment_job_the_queue_dispatch_enqueues(
     assert asyncio.run(worker.process_graph_reenrich({"service": service}, "m2")) == {"memory_ids": ["m2"]}
     service.reenrich_memory_graph.assert_called_once_with("m2")
     service.reenrich_memory_graph.side_effect = RuntimeError("graph re-enrichment of m2 did not complete")
-    with pytest.raises(RuntimeError):  # raised, so ARQ retries it
-        asyncio.run(worker.process_graph_reenrich({"service": service}, "m2"))
+    from arq.worker import Retry
+
+    # ARQ re-runs a job only on ``Retry``; any other exception would fail it for good.
+    with pytest.raises(Retry) as retry:
+        asyncio.run(worker.process_graph_reenrich({"service": service, "job_try": 2}, "m2"))
+    assert retry.value.defer_score == 60 * 1000 and isinstance(retry.value.__cause__, RuntimeError)
 
 
 def _survivor_row():
@@ -367,3 +438,174 @@ def test_a_survivor_still_present_after_its_re_enrichment_is_left_alone(service,
     monkeypatch.setattr(service, "_cascade_expire_episode",
                         lambda *a, **kw: pytest.fail("a live memory's episode must not be removed"))
     assert service.reenrich_memory_graph("m2") == {"memory_ids": ["m2"]}
+
+
+# ── review fixes: batch removal, superseded failures, sweep, changed rows, unreadable rows ──
+
+
+def test_a_batch_cascade_counts_none_of_its_own_rows_as_survivors(service, monkeypatch):
+    """Before: ``removing`` was not forwarded, so a batch sibling that still existed counted as a survivor and the
+    shared episode stayed live (and unrepaired) when the whole batch was deleted."""
+    seen = []
+    monkeypatch.setattr(service, "_cascade_or_fallback_expire",
+                        lambda mem, **kw: seen.append((kw["memory_id"], kw["removing"])) or {"resolved": False})
+    rows = [{"id": i, "mem": {"memory": "x", "metadata": {"owner_user_id": "u"}}} for i in ("m1", "m2", "m3")]
+    service._cascade_rows_once(rows, deleted_ids=("m1", "m2", "m3"))
+    assert seen == [(i, ("m1", "m2", "m3")) for i in ("m1", "m2", "m3")]
+
+
+def test_a_failed_superseded_cleanup_is_reported_and_the_siblings_are_still_repaired(service, monkeypatch):
+    """Before: the leftover episodes were only logged and the delete reported nothing unresolved."""
+    monkeypatch.setattr(settings, "graph_support_aware_removal_enabled", True)
+    monkeypatch.setattr(service, "_cascade_expire_episode",
+                        lambda *a, **kw: {"resolved": True, "episode_uuid": "ep-1", "episode_name": "n"})
+    monkeypatch.setattr(service, "_retire_episodes", lambda *a, **kw: ["ep-0"])
+    mem = {"memory": "x", "metadata": {"owner_user_id": "u", "graph_episode_uuid": "ep-1",
+                                       "graph_episode_superseded": ["ep-0"]}}
+    result = service._cascade_or_fallback_expire(mem, memory_id="m1")
+    assert result["resolved"] is True and result["superseded_unresolved"] == ["ep-0"]
+    repaired = []
+    monkeypatch.setattr(service, "_repair_episode_siblings",
+                        lambda owner, uuids, names, **kw: repaired.append(uuids) or {"graph_jobs": [], "unrepaired_ids": []})
+    batch = service._cascade_rows_once([{"id": "m1", "mem": mem}], deleted_ids=("m1",))
+    assert batch["unresolved_ids"] == ["m1"] and repaired == [{"ep-1"}]  # reported, and the repair still ran
+
+
+def _pending_point(point_id, marker="ep-1", at=0.0, wrapped=False):
+    meta = {"graph_reenrich_pending": marker, "graph_reenrich_pending_at": at}
+    return P(id=point_id, payload={"metadata": {"metadata": meta} if wrapped else meta})
+
+
+def test_the_sweep_re_enriches_rows_still_marked_pending_within_its_bound(service, monkeypatch):
+    """Before nothing read the marker except a later write to the same memory."""
+    import time
+
+    monkeypatch.setattr(settings, "graph_support_aware_removal_enabled", True)
+    now = time.time()
+    pages = {0: ([_pending_point("m1"), _pending_point("m2", wrapped=True), _pending_point("m3", at=now),
+                  _pending_point("m4")], None)}
+    service._memory.vector_store.client.scroll.side_effect = [pages[0], ([], None)]
+    ran = []
+    monkeypatch.setattr(service, "reenrich_memory_graph", lambda mid: ran.append(mid) or {"memory_ids": [mid]})
+    out = service.sweep_pending_reenrichments(limit=2)
+    assert ran == ["m1", "m2"]  # bounded to the limit (m4 waits for the next run); the fresh marker (m3) is left alone
+    assert out["reenriched"] == 2 and out["failed"] == 0
+
+
+def test_the_sweep_counts_a_failed_row_and_keeps_going_and_never_clears_the_marker_itself(service, monkeypatch):
+    monkeypatch.setattr(settings, "graph_support_aware_removal_enabled", True)
+    service._memory.vector_store.client.scroll.side_effect = [([_pending_point("m1"), _pending_point("m2")], None),
+                                                              ([], None)]
+
+    def run(mid):
+        if mid == "m1":
+            raise RuntimeError("graph down")
+        return {"memory_ids": [mid]}
+
+    monkeypatch.setattr(service, "reenrich_memory_graph", run)
+    out = service.sweep_pending_reenrichments()
+    assert out == {"scanned": 2, "reenriched": 1, "failed": 1}
+    service._memory.vector_store.client.set_payload.assert_not_called()  # the enrichment clears it, not the sweep
+
+
+def test_the_sweep_is_a_no_op_with_the_flag_off_and_clears_a_tombstoned_rows_marker(service, monkeypatch):
+    monkeypatch.setattr(settings, "graph_support_aware_removal_enabled", False)
+    assert service.sweep_pending_reenrichments() == {"scanned": 0, "reenriched": 0, "failed": 0}
+    service._memory.vector_store.client.scroll.assert_not_called()
+    monkeypatch.setattr(settings, "graph_support_aware_removal_enabled", True)
+    service._memory.vector_store.client.scroll.side_effect = [([_pending_point("m1")], None), ([], None)]
+    monkeypatch.setattr(service, "reenrich_memory_graph", lambda mid: {"skipped": True, "reason": "memory_tombstoned"})
+    cleared = []
+    monkeypatch.setattr(service, "_clear_reenrich_pending", cleared.append)
+    assert service.sweep_pending_reenrichments()["reenriched"] == 0 and cleared == ["m1"]
+
+
+def _row_with(memory="fact", visibility="shared", project=None):
+    return {"memory": memory, "user_id": "u", "metadata": {
+        "owner_user_id": "u", "visibility": visibility, "project_id": project, "workspace": None}}
+
+
+def _enriching(service, monkeypatch, reads):
+    """``reads``: what ``memory.get`` returns on each call (the last one repeats)."""
+    seq = list(reads)
+    service._memory.get.side_effect = lambda mid: seq.pop(0) if len(seq) > 1 else seq[0]
+    written = iter(f"ep-{n}" for n in range(1, 10))
+    runs = []
+
+    def enrich(**kw):
+        uuid = next(written)
+        runs.append((kw["content"], kw["visibility"], uuid))
+        kw["result_out"].update(episode_uuid=uuid, episode_name=f"{uuid}-name")
+        return True
+
+    monkeypatch.setattr(service, "enrich_graph", enrich)
+    removed = []
+    monkeypatch.setattr(service, "_cascade_expire_episode",
+                        lambda group, **kw: removed.append((group, kw)) or {"resolved": True})
+    service._memory.vector_store.client.set_payload.side_effect = lambda **kw: removed.append(("patch", kw["payload"]))
+    return runs, removed
+
+
+def test_a_survivor_made_private_during_its_re_enrichment_loses_the_shared_episode_and_is_enriched_again(
+        service, monkeypatch):
+    """Before the guard only asked whether the row still existed: a row restricted meanwhile kept the episode
+    written into the shared group."""
+    shared, private = _row_with(visibility="shared"), _row_with(visibility="private")
+    # read for the job, read after the write (now private), then the second pass sees private twice
+    runs, removed = _enriching(service, monkeypatch, [shared, shared, private, private, private])
+    assert service.reenrich_memory_graph("m2") == {"memory_ids": ["m2"]}
+    assert [(v, u) for _, v, u in runs] == [("shared", "ep-1"), ("private", "ep-2")]
+    assert removed[0][1] == {"episode_uuid": "ep-1"} and "shared" in removed[0][0]  # removed in the group it was written to
+    assert any(r[0] == "patch" and r[1].get("graph_reenrich_pending") == "ep-1" for r in removed)  # still marked
+
+
+def test_a_survivor_whose_text_changed_during_its_re_enrichment_is_enriched_again(service, monkeypatch):
+    old, new = _row_with(memory="old text"), _row_with(memory="new text")
+    runs, removed = _enriching(service, monkeypatch, [old, old, new, new, new])
+    assert service.reenrich_memory_graph("m2") == {"memory_ids": ["m2"]}
+    assert [(c, u) for c, _, u in runs] == [("old text", "ep-1"), ("new text", "ep-2")]
+    assert removed[0][1] == {"episode_uuid": "ep-1"}
+
+
+def test_a_row_that_keeps_changing_fails_the_job_after_bounded_attempts(service, monkeypatch):
+    rows = [_row_with(memory=f"v{n}") for n in range(12)]
+    reads = []
+    for n in range(0, 10, 2):
+        reads += [rows[n], rows[n + 1]]  # every pass: the row read for the job differs from the one after it
+    runs, _ = _enriching(service, monkeypatch, reads)
+    with pytest.raises(RuntimeError, match="invalidated"):
+        service.reenrich_memory_graph("m2")
+    assert len(runs) == 3  # bounded
+
+
+def test_an_unresolved_removal_of_an_invalidated_episode_fails_the_job(service, monkeypatch):
+    old, new = _row_with(memory="old"), _row_with(memory="new")
+    _enriching(service, monkeypatch, [old, old, new])
+    monkeypatch.setattr(service, "_cascade_expire_episode", lambda *a, **kw: {"resolved": False})
+    with pytest.raises(RuntimeError, match="graph cleanup unresolved for changed memory m2"):
+        service.reenrich_memory_graph("m2")
+
+
+def test_an_unreadable_previous_episode_defers_the_enrichment_instead_of_overwriting_the_reference(
+        service, monkeypatch):
+    """Before: a failed read looked like "no earlier episode", so the new episode's reference replaced the old
+    one and the old episode (with the text just corrected) could never be retired."""
+    monkeypatch.setattr(settings, "graph_support_aware_removal_enabled", True)
+    service._memory.get.side_effect = RuntimeError("qdrant down")
+    persisted = []
+    monkeypatch.setattr(service, "_persist_graph_episode_ref", lambda *a: persisted.append(a))
+    assert service._previous_graph_episodes("m1") is None
+    ok = service.enrich_graph(content="c", user_id="u", project_id=None, visibility="private", memory_id="m1")
+    assert ok is False and persisted == []
+    service._memory.graph.add.assert_not_called()  # nothing was written to the graph either
+
+
+def test_with_the_flag_off_an_unreadable_row_does_not_stop_the_enrichment(service, monkeypatch):
+    monkeypatch.setattr(settings, "graph_support_aware_removal_enabled", False)
+    service._memory.get.side_effect = RuntimeError("qdrant down")
+    service._memory.graph.add.return_value = {"episode_uuid": "ep-new", "episode_name": "n"}
+    monkeypatch.setattr(service, "_attach_memory_id_to_graph_nodes", lambda **kw: None)
+    persisted = []
+    monkeypatch.setattr(service, "_persist_graph_episode_ref", lambda *a: persisted.append(a))
+    assert service.enrich_graph(content="c", user_id="u", project_id=None, visibility="private", memory_id="m1") is True
+    assert persisted == [("m1", "ep-new", "n")]

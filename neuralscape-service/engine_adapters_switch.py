@@ -49,6 +49,7 @@ from engine_routing import (
 
 logger = logging.getLogger("neuralscape.engine_switch")
 
+_GLOBAL_OVERFETCH = 4  # depth of the project-free leg of a routed project recall, in multiples of the limit
 CANONICAL_PAGE_SIZE = 500  # ledger rows read per page by a catch-up or backfill
 
 
@@ -294,8 +295,15 @@ class EngineSwitch:
         project_id: Optional[str] = None,
         include_shared: bool = True,
         visibility: Optional[str] = None,
+        include_global: bool = False,
     ) -> list[SearchHit]:
-        """Vector recall from the serving engine: the caller's own rows plus the shared pool."""
+        """Vector recall from the serving engine: the caller's own rows plus the shared pool.
+
+        With a ``project_id`` the project's rows carry its label, but the caller's global rows (no
+        project) do not, so ``include_global`` adds a second, project-free search per pool and
+        returns the union (``_GLOBAL_OVERFETCH`` times ``limit`` deep, since that search also meets
+        other projects' rows).  The caller keeps only rows of the project or of global scope.
+        """
 
         tenant_id = self._tenant_for(user_id)
         if tenant_id is None:
@@ -308,15 +316,18 @@ class EngineSwitch:
             pools.append((_bounded(f"owner:{user_id}"),))
         if include_shared and visibility != "private":
             pools.append(("vis:shared",))
+        wide = bool(project_id and include_global)
         for labels in pools:
-            flt = TenantFilter(
-                tenant_id=tenant_id,
-                labels_all=labels + ((_bounded(f"project:{project_id}"),) if project_id else ()),
-            )
-            for hit in router.search(token, _ctx(tenant_id), query, flt, limit):
-                if hit.record_id not in seen or hit.score > seen[hit.record_id].score:
-                    seen[hit.record_id] = hit
-        return sorted(seen.values(), key=lambda h: (-h.score, h.record_id))[:limit]
+            legs = [(labels + ((_bounded(f"project:{project_id}"),) if project_id else ()), limit)]
+            if wide:
+                legs.append((labels, limit * _GLOBAL_OVERFETCH))
+            for leg_labels, leg_limit in legs:
+                flt = TenantFilter(tenant_id=tenant_id, labels_all=leg_labels)
+                for hit in router.search(token, _ctx(tenant_id), query, flt, leg_limit):
+                    if hit.record_id not in seen or hit.score > seen[hit.record_id].score:
+                        seen[hit.record_id] = hit
+        ordered = sorted(seen.values(), key=lambda h: (-h.score, h.record_id))
+        return ordered[: limit * _GLOBAL_OVERFETCH if wide else limit]
 
     def recall_ready(self) -> tuple[bool, Optional[str]]:
         """Whether routed recall may serve: enabled, and the engine holds canonical state.

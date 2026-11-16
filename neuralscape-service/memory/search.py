@@ -486,7 +486,7 @@ class SearchMixin:
         Only a *subset* of what the normal path may return is ever returned: every engine hit is
         re-read from the memory store and kept only if the caller may read it, it is not a
         consolidation tombstone, it lives in the default ``memory`` workspace (the reference-workspace
-        fence) and, when the request names a project, it belongs to that project.  The graph and
+        fence) and, when the request names a project, it belongs to that project or is global.  The graph and
         lexical legs and the rerank are not part of a routed search.
 
         Returns ``None`` (the caller falls back to the normal path) when the engine itself fails.
@@ -495,7 +495,7 @@ class SearchMixin:
         try:
             hits = switch.recall(
                 user_id, query, limit, project_id=project_id,
-                include_shared=include_shared, visibility=visibility,
+                include_shared=include_shared, visibility=visibility, include_global=True,
             )
             if not hits:
                 return []
@@ -531,7 +531,10 @@ class SearchMixin:
                     continue
                 if (meta.get("workspace") or inner.get("workspace") or "memory") != "memory":
                     continue
-                if project_id and (meta.get("project_id") or inner.get("project_id")) != project_id:
+                if project_id and (meta.get("project_id") or inner.get("project_id")) != project_id and (
+                    # A project recall serves the project's rows and the caller's global ones.
+                    (meta.get("scope") or inner.get("scope")) != "global"
+                ):
                     continue
                 row = self._point_to_response(point)
                 row.score = hit.score

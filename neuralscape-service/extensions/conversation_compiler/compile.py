@@ -98,11 +98,16 @@ def _call_gemini(prompt: str) -> str:
     """Call Gemini synchronously (for use via asyncio.to_thread)."""
     model = compiler_settings.get_llm_model(core_settings.gemini_llm_model)
     client = genai.Client(api_key=core_settings.google_api_key)
-    response = client.models.generate_content(model=model, contents=prompt)
+    from usage_capture import current_operation, record_failed_provider_attempt, record_generation_usage
+
+    try:
+        response = client.models.generate_content(model=model, contents=prompt)
+    except BaseException as exc:
+        # A failed attempt is still an attempt: record it (no usage available), then re-raise unchanged.
+        record_failed_provider_attempt(exc, operation=current_operation("llm_compile"), model=model)
+        raise
     # Usage capture (a no-op unless a recorder is installed and an attempt is bound): the shared
     # Gemini path of the compiler, the dreaming sweep and Ask; Ask labels its calls ``llm_ask``.
-    from usage_capture import current_operation, record_generation_usage
-
     record_generation_usage(response, operation=current_operation("llm_compile"), model=model)
     return response.text or ""
 

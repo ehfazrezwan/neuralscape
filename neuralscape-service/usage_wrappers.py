@@ -14,6 +14,7 @@ recorded as a failed (or cancelled) attempt with no usage.  Streaming results ca
 
 from __future__ import annotations
 
+import asyncio
 import functools
 import inspect
 import logging
@@ -95,9 +96,9 @@ class _CapturingProxy:
                 try:
                     response = await fn(*args, **kwargs)
                 except BaseException as exc:
-                    record_failure(exc, kwargs)
+                    await asyncio.to_thread(record_failure, exc, kwargs)
                     raise
-                record(response, kwargs)
+                await asyncio.to_thread(record, response, kwargs)
                 return response
 
             return acall
@@ -115,9 +116,9 @@ class _CapturingProxy:
                     try:
                         result = await response
                     except BaseException as exc:
-                        record_failure(exc, kwargs)
+                        await asyncio.to_thread(record_failure, exc, kwargs)
                         raise
-                    record(result, kwargs)
+                    await asyncio.to_thread(record, result, kwargs)
                     return result
 
                 return awaited()

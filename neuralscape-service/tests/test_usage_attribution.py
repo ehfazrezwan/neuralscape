@@ -246,3 +246,20 @@ def test_defaults_record_nothing_and_open_no_store():
     s = Settings()
     assert s.usage_store_enabled is False
     assert s.graph_support_aware_removal_enabled is False and s.ns_gemini_base_url == ""
+
+
+def test_a_failed_gemini_call_is_recorded_and_the_error_propagates(recorder, monkeypatch):
+    """Before: a ``generate_content`` that raised skipped the recording hook, so Ask's retried attempts never
+    reached the usage ledger."""
+    from extensions.conversation_compiler import compile as compiler
+
+    boom = RuntimeError("provider down")
+    client = MagicMock()
+    client.models.generate_content.side_effect = boom
+    monkeypatch.setattr(compiler.genai, "Client", lambda **kw: client)
+    with uc.ensure_attempt("alice", "compile"):
+        with uc.operation_scope("llm_ask"):
+            with pytest.raises(RuntimeError) as raised:
+                compiler._call_gemini("prompt")
+    assert raised.value is boom
+    assert [(e.operation, e.attempt_outcome) for e in recorder.events] == [("llm_ask", "failed")]

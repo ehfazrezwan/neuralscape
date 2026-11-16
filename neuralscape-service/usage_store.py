@@ -319,8 +319,13 @@ class SqliteUsageStore(_SqlUsageStore):
         synchronous: str = "FULL",
         clock: Callable[[], float] = time.time,
         busy_timeout_ms: int = 30_000,
+        append_budget_s: float = 2.0,
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         super().__init__(clock)
+        self._busy_timeout_ms = int(busy_timeout_ms)
+        self._append_budget_s = float(append_budget_s)
+        self._monotonic = monotonic
         if synchronous.upper() not in {"FULL", "EXTRA"}:
             raise ValueError("durable usage storage requires synchronous=FULL or EXTRA")
         owner_only = path not in ("", ":memory:") and not path.startswith("file:")
@@ -345,6 +350,26 @@ class SqliteUsageStore(_SqlUsageStore):
             raise UsageStoreError(f"synchronous FULL/EXTRA is required (level={level})")
         self._conn.execute(f"PRAGMA busy_timeout={int(busy_timeout_ms)}")
         self._migrate()
+
+    def _run_write(self, work: Callable[[Any], Any]) -> Any:
+        """A write (an append, a gap count) within the append budget: the wait for the connection
+        lock and SQLite's own busy wait both draw on one deadline, so a locked database cannot hold
+        the provider-call thread for the connection's full (30 s) busy timeout."""
+
+        deadline = self._monotonic() + self._append_budget_s
+        remaining = deadline - self._monotonic()
+        if remaining <= 0 or not self._lock.acquire(timeout=remaining):
+            raise UsageStoreError("usage store busy: the append budget was spent waiting for the connection")
+        try:
+            budget_ms = max(1, int((deadline - self._monotonic()) * 1000))
+            self._conn.execute(f"PRAGMA busy_timeout={min(budget_ms, self._busy_timeout_ms)}")
+            try:
+                with self._txn() as c:
+                    return work(c)
+            finally:
+                self._conn.execute(f"PRAGMA busy_timeout={self._busy_timeout_ms}")
+        finally:
+            self._lock.release()
 
     @contextlib.contextmanager
     def _txn(self) -> Iterator[Any]:

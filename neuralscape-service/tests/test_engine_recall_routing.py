@@ -19,8 +19,14 @@ from memory_service import MemoryService
 OWN, SHARED_OTHER, PRIVATE_OTHER, OTHER_PROJECT, TOMBSTONED, REFERENCE = (str(uuid.uuid4()) for _ in range(6))
 
 
-def _point(point_id, *, owner, visibility="private", project=None, workspace=None, tombstoned=False, text="fact"):
+GLOBAL_OWN, GLOBAL_PRIVATE_OTHER, NO_SCOPE_NO_PROJECT = (str(uuid.uuid4()) for _ in range(3))
+
+
+def _point(point_id, *, owner, visibility="private", project=None, workspace=None, tombstoned=False, text="fact",
+           scope=None):
     meta = {"visibility": visibility, "owner_user_id": owner}
+    if scope:
+        meta["scope"] = scope
     if project:
         meta["project_id"] = project
     if workspace:
@@ -39,6 +45,9 @@ POINTS = {
     OTHER_PROJECT: _point(OTHER_PROJECT, owner="alice", project="p2", text="alice other project"),
     TOMBSTONED: _point(TOMBSTONED, owner="alice", project="p1", tombstoned=True, text="merged away"),
     REFERENCE: _point(REFERENCE, owner="alice", project="p1", workspace="reference", text="reference doc"),
+    GLOBAL_OWN: _point(GLOBAL_OWN, owner="alice", scope="global", text="alice global"),
+    GLOBAL_PRIVATE_OTHER: _point(GLOBAL_PRIVATE_OTHER, owner="bob", scope="global", text="bob global private"),
+    NO_SCOPE_NO_PROJECT: _point(NO_SCOPE_NO_PROJECT, owner="alice", text="belongs to nothing"),
 }
 
 
@@ -171,3 +180,45 @@ def test_an_engine_failure_falls_back_to_the_normal_path(service, routed):
 def test_the_result_is_capped_at_the_limit(service, routed):
     routed(Switch([OWN, SHARED_OTHER]))
     assert len(service.search(query="q", user_id="alice", limit=1)) == 1
+
+
+def test_a_routed_project_recall_includes_the_callers_global_rows(service, routed):
+    """Before: the hydration kept only rows whose project was the requested one, so every global row (it has no
+    project) was dropped; the normal path returns project and global rows for a project request."""
+    switch = routed(Switch([OWN, GLOBAL_OWN, GLOBAL_PRIVATE_OTHER, NO_SCOPE_NO_PROJECT, OTHER_PROJECT]))
+    results = service.search(query="q", user_id="alice", project_id="p1", limit=5)
+    assert [r.id for r in results] == [OWN, GLOBAL_OWN]  # not another user's private global, not an unscoped row
+    assert switch.calls[0][3]["include_global"] is True
+    assert not _normal_path_ran(service)
+
+
+def test_a_routed_search_without_a_project_is_unchanged(service, routed):
+    switch = routed(Switch([OWN, GLOBAL_OWN]))
+    results = service.search(query="q", user_id="alice", limit=5)
+    assert [r.id for r in results] == [OWN, GLOBAL_OWN]
+
+
+def test_the_engine_adds_a_project_free_leg_only_when_asked():
+    """The project label is on the project's rows; a global row has none, so it needs a search without it."""
+    from engine_adapters_switch import EngineSwitch
+
+    searches = []
+
+    class Router:
+        def route(self):
+            return "token"
+
+        def search(self, token, ctx, query, flt, limit):
+            searches.append((flt.labels_all, limit))
+            return [SimpleNamespace(record_id=f"r{len(searches)}", revision=1, score=1.0 - len(searches) / 10)]
+
+    switch = EngineSwitch(Router(), ledger=None, service=None, tenant_for=lambda user: "t")
+    switch.recall("alice", "q", 5, project_id="p1", visibility="private")
+    assert searches == [(("owner:alice", "project:p1"), 5)]
+    searches.clear()
+    hits = switch.recall("alice", "q", 5, project_id="p1", visibility="private", include_global=True)
+    assert searches == [(("owner:alice", "project:p1"), 5), (("owner:alice",), 20)]
+    assert len(hits) == 2
+    searches.clear()
+    switch.recall("alice", "q", 5, visibility="private", include_global=True)  # no project: nothing to widen
+    assert searches == [(("owner:alice",), 5)]

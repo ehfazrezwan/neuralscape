@@ -730,7 +730,9 @@ class DurableUsageRecorder:
                 break
             else:
                 if self._unrecorded:
-                    self.flush_gaps()  # the store is taking writes again
+                    # The store is taking writes again.  Recovery shares what is left of this call's
+                    # budget; counts it does not reach stay in memory for the next call.
+                    self.flush_gaps(max_s=max(0.0, self._budget_s - (self._monotonic() - started)))
                 return True
         self.failures += 1
         key = (event.tenant_id, event.task_id)
@@ -744,20 +746,33 @@ class DurableUsageRecorder:
         logger.error("durable usage write failed for %s", event.event_id, exc_info=True)
         return False
 
-    def flush_gaps(self) -> None:
-        """Persist the per-task counts of events that could not be stored (best effort)."""
+    def flush_gaps(self, max_s: float | None = None) -> None:
+        """Persist the per-task counts of events that could not be stored (best effort).
+
+        ``max_s`` bounds the time spent (the provider-call path passes what is left of its budget):
+        counts not reached are kept for the next flush, never dropped.
+        """
         with self._lock:
             # Claim the counts so a concurrent flush cannot persist them twice.
             pending = self._unrecorded
             self._unrecorded = {}
-        for (tenant_id, task_id), count in pending.items():
+        deadline = None if max_s is None else self._monotonic() + max_s
+        items = list(pending.items())
+        for index, ((tenant_id, task_id), count) in enumerate(items):
+            if deadline is not None and self._monotonic() >= deadline:
+                self._return_gaps(items[index:])
+                return
             try:
                 self._store.record_gap(tenant_id, task_id, count)
             except Exception:
                 logger.error("usage gap for task %s could not be stored", task_id, exc_info=True)
-                with self._lock:
-                    key = (tenant_id, task_id)
-                    if key in self._unrecorded or len(self._unrecorded) < self._max_keys:
-                        self._unrecorded[key] = self._unrecorded.get(key, 0) + count
-                    else:
-                        self.gaps_overflowed += count
+                self._return_gaps([((tenant_id, task_id), count)])
+
+    def _return_gaps(self, items: list) -> None:
+        """Put counts that were claimed but not persisted back (bounded like every other add)."""
+        with self._lock:
+            for key, count in items:
+                if key in self._unrecorded or len(self._unrecorded) < self._max_keys:
+                    self._unrecorded[key] = self._unrecorded.get(key, 0) + count
+                else:
+                    self.gaps_overflowed += count

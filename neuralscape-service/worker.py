@@ -13,6 +13,7 @@ from datetime import datetime
 import structlog
 from arq.cron import cron
 from arq.jobs import Job
+from arq.worker import Retry
 
 import adapters  # noqa: F401 — registers knowledge-adapter taxonomies at import (deterministic MEMORY_CATEGORIES across all workers)
 from config import parse_redis_settings, settings
@@ -1364,7 +1365,34 @@ async def process_graph_reenrich(ctx: dict, memory_id: str) -> dict:
     until it has run).
     """
     service: MemoryService = ctx["service"]
-    return await asyncio.to_thread(service.reenrich_memory_graph, memory_id)
+    try:
+        return await asyncio.to_thread(service.reenrich_memory_graph, memory_id)
+    except Exception as exc:
+        # ARQ re-runs a job only when it raises ``Retry``: any other exception marks it failed for good and the
+        # row would stay pending until the sweep (``graph_reenrich_sweep_cron``) or a later write found it.
+        tries = int(ctx.get("job_try") or 1)
+        logger.warning(
+            "Graph re-enrichment of memory %s failed (try %d); retrying in %ds: %s",
+            memory_id, tries, _REENRICH_RETRY_BASE_S * tries, exc,
+        )
+        raise Retry(defer=_REENRICH_RETRY_BASE_S * tries) from exc
+
+
+_REENRICH_RETRY_BASE_S = 30  # seconds of back-off per try for a failed survivor re-enrichment
+
+
+async def graph_reenrich_sweep_cron(ctx: dict) -> dict:
+    """Cron job: re-run the re-enrichment of rows left marked ``graph_reenrich_pending``.
+
+    The marker survives a lost dispatch (queue or ledger down) and a job that used up its tries; this is the
+    retry.  Bounded per run; the enrichment clears the marker itself.  A no-op unless
+    ``GRAPH_SUPPORT_AWARE_REMOVAL_ENABLED`` is on.
+    """
+    service: MemoryService = ctx["service"]
+    result = await asyncio.to_thread(service.sweep_pending_reenrichments)
+    if result.get("reenriched") or result.get("failed"):
+        logger.info(f"Re-enrichment sweep cron: {result}")
+    return result
 
 
 _EXPIRY_LOG_ID_CAP = 20
@@ -2160,6 +2188,14 @@ class GraphWorkerSettings:
             repair_stale_vectors_cron,
             minute=20,          # hourly; a no-op scroll when no row is pending
             timeout=900,
+            unique=True,
+            max_tries=1,
+            run_at_startup=False,
+        ),
+        cron(
+            graph_reenrich_sweep_cron,
+            minute=25,          # hourly; a no-op scroll when no row awaits re-enrichment
+            timeout=3600,
             unique=True,
             max_tries=1,
             run_at_startup=False,
