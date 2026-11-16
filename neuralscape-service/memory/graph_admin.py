@@ -9,7 +9,7 @@ import re
 
 from datetime import datetime, timezone
 from config import settings
-from memory.groups import _edge_is_invalidated, _get_group_ids
+from memory.groups import _edge_is_invalidated, _get_group_ids, _scoped_groups
 from memory.junk import _JUNK_RE
 
 logger = logging.getLogger(__name__)
@@ -47,7 +47,9 @@ class GraphAdminMixin:
 
         from graphiti_core.nodes import EntityNode
 
-        group_ids = _get_group_ids(user_id, project_id)
+        group_ids = _scoped_groups(_get_group_ids(user_id, project_id))
+        if not group_ids:
+            return []
 
         try:
             nodes = self._run_on_bridge(
@@ -124,7 +126,9 @@ class GraphAdminMixin:
         from graphiti_core.edges import EntityEdge
         from graphiti_core.errors import GroupsEdgesNotFoundError
 
-        group_ids = _get_group_ids(user_id, project_id)
+        group_ids = _scoped_groups(_get_group_ids(user_id, project_id))
+        if not group_ids:
+            return []
 
         try:
             edges = self._run_on_bridge(
@@ -174,7 +178,9 @@ class GraphAdminMixin:
         if not terms:
             return []
         lucene = " OR ".join(terms[:12])
-        group_ids = _get_group_ids(user_id, project_id)
+        group_ids = _scoped_groups(_get_group_ids(user_id, project_id))
+        if not group_ids:
+            return []
         cypher = """
         CALL db.index.fulltext.queryNodes('episode_content', $q) YIELD node, score
         WHERE node.group_id IN $group_ids
@@ -222,7 +228,9 @@ class GraphAdminMixin:
         if g is None:
             return []
 
-        group_ids = _get_group_ids(user_id, project_id)
+        group_ids = _scoped_groups(_get_group_ids(user_id, project_id))
+        if not group_ids:
+            return []
         now = datetime.now(timezone.utc)
 
         try:
@@ -259,7 +267,9 @@ class GraphAdminMixin:
 
         from graphiti_core.nodes import CommunityNode
 
-        group_ids = _get_group_ids(user_id, project_id)
+        group_ids = _scoped_groups(_get_group_ids(user_id, project_id))
+        if not group_ids:
+            return []
 
         try:
             communities = self._run_on_bridge(
@@ -315,7 +325,7 @@ class GraphAdminMixin:
                 logger.error(f"Failed to delete episode {episode_uuid}: {e}")
                 return {"error": str(e)}
 
-        group_ids = _get_group_ids(user_id, project_id)
+        group_ids = _scoped_groups(_get_group_ids(user_id, project_id))
         try:
             # First verify the episode exists and is in an authorized group
             async def _check_and_delete():

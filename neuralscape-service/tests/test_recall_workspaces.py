@@ -221,6 +221,22 @@ def test_rest_search_forwards_workspaces(rest_client):
     assert svc.search.call_args.kwargs["workspaces"] == ["ref-x"]
 
 
+def test_rest_search_response_lists_rows_under_results_with_workspace_and_kind(rest_client):
+    """The body of ``POST /v1/search`` is ``{"status", "results": [...]}``: there is no ``memories``
+    key (a caller indexing it gets a KeyError), and each row carries its ``workspace`` and
+    ``memory_kind`` so a caller can tell a reference passage from a memory fact."""
+    from schemas import MemoryResponse
+
+    client, svc = rest_client
+    svc.search.return_value = [
+        MemoryResponse(id="p1", memory="a passage", category="domain_knowledge",
+                       workspace="ref-books", memory_kind="passage"),
+    ]
+    body = client.post("/v1/search", json={"query": "q", "user_id": "u1", "workspaces": ["ref-books"]}).json()
+    assert "memories" not in body and set(body) >= {"status", "results"}
+    assert [(r["workspace"], r["memory_kind"]) for r in body["results"]] == [("ref-books", "passage")]
+
+
 def test_rest_search_default_passes_none(rest_client):
     client, svc = rest_client
     assert client.post("/v1/search", json={"query": "q", "user_id": "u1"}).status_code == 200

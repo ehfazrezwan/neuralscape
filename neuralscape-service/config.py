@@ -139,6 +139,11 @@ class Settings(BaseSettings):
     gemini_llm_model: str = "gemini-3.1-flash-lite"
     gemini_llm_fallback_model: str = "gemini-2.5-flash"
     gemini_embedder_model: str = "gemini-embedding-001"
+    # Per-request timeout (seconds) on every Gemini client the service builds or causes to be
+    # built (its own extraction/compile clients and mem0's Gemini LLM/embedder; graphiti's clients
+    # keep their own 60 s). Without it an endpoint that accepts the connection and never answers
+    # blocks the calling request or worker job indefinitely.
+    gemini_request_timeout_s: float = Field(default=120.0, gt=0, allow_inf_nan=False)
     # Dimension of the embeddings Graphiti stores on Entity.name_embedding and
     # RELATES_TO.fact_embedding (env GRAPHITI_EMBEDDING_DIM). Passed explicitly
     # to the Graphiti embedder instead of relying on the ambient EMBEDDING_DIM
@@ -216,7 +221,19 @@ class Settings(BaseSettings):
 
     # Graphiti options
     store_raw_episode_content: bool = True
+    # Keep Graphiti community nodes current (GET /v1/graph/communities reads them).
+    # On: the first write into a group builds its communities (one scoped
+    # clustering pass), and every later write joins its entities to them. Costs
+    # LLM calls per write (a summary merge plus a name per community touched),
+    # so it stays off by default.
     update_communities: bool = False
+
+    # mem0's own SQLite history (a row per add/update/delete, ``~/.mem0/history.db``).
+    # Nothing in the service reads it (``Memory.history()`` is never called), yet
+    # the write path appended to it on every memory (a synchronous disk write on
+    # an ephemeral container path). Off by default: ``MemoryService`` swaps in a
+    # no-op history store. Set true to restore the file-backed history.
+    mem0_history_enabled: bool = False
 
     # Qdrant vector store
     qdrant_url: str | None = None  # e.g. "http://localhost:6333" — if set, uses Qdrant server mode
@@ -1539,6 +1556,12 @@ class Settings(BaseSettings):
             "graphiti_reranker_provider": "openai",
         }
 
+    def gemini_http_options(self):
+        """``HttpOptions`` carrying the Gemini request timeout (SDK unit: milliseconds)."""
+        from google.genai import types
+
+        return types.HttpOptions(timeout=max(1, int(self.gemini_request_timeout_s * 1000)))
+
     def get_mem0_config(self) -> dict:
         """Build mem0 config dict for Memory(config=...).
 
@@ -1607,6 +1630,7 @@ class Settings(BaseSettings):
                 "config": {
                     "model": self.gemini_llm_model,
                     "api_key": self.google_api_key,
+                    "request_timeout_s": self.gemini_request_timeout_s,
                 },
             }
             embedder_block = {
@@ -1615,11 +1639,12 @@ class Settings(BaseSettings):
                     "model": self.gemini_embedder_model,
                     "api_key": self.google_api_key,
                     "embedding_dims": VECTOR_EMBEDDING_DIMS,
+                    "request_timeout_s": self.gemini_request_timeout_s,
                 },
             }
             graphiti_models = self._graphiti_ai_studio_models()
 
-        return {
+        mem0_config = {
             "llm": llm_block,
             "embedder": embedder_block,
             "vector_store": {
@@ -1646,6 +1671,11 @@ class Settings(BaseSettings):
             },
             "version": "v1.1",
         }
+        if not self.mem0_history_enabled:
+            # Never touch ~/.mem0/history.db: mem0 opens a throwaway in-memory
+            # SQLite here and ``_memory_from_config`` replaces it with a no-op.
+            mem0_config["history_db_path"] = ":memory:"
+        return mem0_config
 
 
 settings = Settings()

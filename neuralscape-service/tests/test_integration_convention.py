@@ -219,3 +219,57 @@ def test_redaction_covers_tokens_and_query_secrets(tmp_path):
     )
     out = _pytest([str(area)], tmp_path)
     assert out.returncode == 0, out.stdout + out.stderr
+
+
+def test_minted_bearer_is_created_per_request_and_outlives_the_first_hour(monkeypatch):
+    """A run that lasts longer than the token lifetime must not get 401s: the second
+    call 61 minutes later carries a token that is still valid, for the same user id."""
+    import time as _time
+
+    import tokens
+    from integration_tests.api_identity import TOKEN_TTL_SECONDS, resolve_identity
+
+    secret = "unit-" + "test-signing-" + "value"
+    identity = resolve_identity({"NEURALSCAPE_USER_TOKEN_SECRET": secret})
+    first = identity.headers["Authorization"].split(" ", 1)[1]
+    now = _time.time()
+    monkeypatch.setattr(tokens.time, "time", lambda: now + 61 * 60)
+    assert tokens.verify_user_token(first, secret) is None  # the import-time token has expired
+    later = identity.headers["Authorization"].split(" ", 1)[1]
+    payload = tokens.verify_user_token(later, secret)
+    assert payload is not None and payload["user_id"] == identity.user_id
+    assert payload["exp"] >= int(now) + 61 * 60 + TOKEN_TTL_SECONDS - 1
+
+
+def test_async_pipeline_requests_and_live_api_take_the_bearer_at_request_time(monkeypatch):
+    import time as _time
+
+    import tokens
+    from integration_tests import api_identity
+    from integration_tests.conftest import LiveApi
+
+    secret = "unit-" + "test-signing-" + "value"
+    identity = api_identity.resolve_identity({"NEURALSCAPE_USER_TOKEN_SECRET": secret})
+    api = LiveApi(url="http://h:1", user_id=identity.user_id, identity=identity)
+    now = _time.time()
+    monkeypatch.setattr(tokens.time, "time", lambda: now + 61 * 60)
+    bearer = api.headers["Authorization"].split(" ", 1)[1]
+    assert tokens.verify_user_token(bearer, secret)["user_id"] == identity.user_id
+
+    monkeypatch.setenv("NEURALSCAPE_USER_TOKEN_SECRET", secret)
+    monkeypatch.delenv("NS_API_TOKEN", raising=False)
+    monkeypatch.setenv("NS_API_URL", "http://127.0.0.1:1")  # unreachable: the module skips, imports fine
+    import importlib.util
+    from pathlib import Path as _Path
+
+    spec = importlib.util.spec_from_file_location(
+        "ns_async_pipeline_under_test", _Path(__file__).resolve().parent / "test_async_pipeline.py"
+    )
+    pipeline = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(pipeline)
+    monkeypatch.setattr(tokens.time, "time", lambda: now)
+    first = pipeline._auth({})["headers"]["Authorization"]
+    monkeypatch.setattr(tokens.time, "time", lambda: now + 61 * 60)
+    later = pipeline._auth({})["headers"]["Authorization"]
+    assert later != first
+    assert tokens.verify_user_token(later.split(" ", 1)[1], secret)["user_id"] == pipeline.USER_ID

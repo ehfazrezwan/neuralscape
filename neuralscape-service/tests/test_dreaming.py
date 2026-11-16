@@ -699,8 +699,9 @@ def test_diary_render_and_write(tmp_path):
     assert "### Proposed (not applied — review)" in entry
 
     rel = reflect.write_diary(tmp_path, "shared", entry, source_memory_ids=["a", "b"])
-    assert rel == "Dreams/shared.md"
-    text = (tmp_path / "shared.md").read_text()
+    page = reflect.diary_page_path(tmp_path, "shared")
+    assert rel == f"Dreams/{page.name}"
+    text = page.read_text()
     assert "source_memory_ids: [a, b]" in text
     assert "An insight." in text
 
@@ -709,7 +710,7 @@ def test_diary_render_and_write(tmp_path):
         pool="shared", run_id="drm_two", applied=[], reported=[], insights=[]
     )
     reflect.write_diary(tmp_path, "shared", entry2, source_memory_ids=["a", "b", "c"])
-    text2 = (tmp_path / "shared.md").read_text()
+    text2 = reflect.diary_page_path(tmp_path, "shared").read_text()
     assert "Quiet night" in text2
     assert "An insight." in text2
     assert text2.index("Quiet night") < text2.index("An insight.")  # newest first
