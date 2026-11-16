@@ -139,6 +139,11 @@ async def process_memory_store(
                 "project_id": project_id,
                 "agent_id": agent_id,
                 "run_id": run_id,
+                # Conversation-extracted rows: the vault mirror decides by the
+                # category's tier (not the private stamp) unless the sensitivity
+                # gate forced them private. See extensions/conversation_compiler.
+                "extracted": True,
+                "sensitivity": getattr(mem, "sensitivity", None),
                 "source": "worker",
             })
         # Rebuild category index once after all vault writes (not per-fact)

@@ -57,21 +57,54 @@ def _event_time(timestamp: str | None) -> str | None:
         return None
 
 
-def _is_shared(memory) -> bool:
-    """Whether a stored memory may reach the shared vault.
+def mirror_to_vault(
+    category: str,
+    visibility: str | None,
+    *,
+    extracted: bool,
+    sensitivity: str | None = None,
+) -> bool:
+    """Whether a memory may be mirrored into the (shared) vault.
 
-    Uses the visibility the store stamped (which already reflects the
-    sensitivity gate); a row with no usable visibility falls back to the
-    category default, the same rule the memory_stored handler applies.
+    * Explicit writes (raw / checkpoint): the stored visibility decides, as it
+      always has: private never reaches the vault, shared does, and a row with
+      no visibility falls back to its category's tier.
+    * Conversation-extracted rows: the extraction path stamps every row
+      ``visibility=private`` (the row stays private in recall), so the stamp
+      says nothing about the vault; the CATEGORY's default tier decides (a
+      decision or convention is shared, a preference is not). A row the
+      sensitivity gate forced private (``sensitivity`` set) is never mirrored.
     """
-    category = getattr(memory, "category", "") or ""
-    raw = getattr(memory, "visibility", None)
+    tier = default_visibility_for_category(category)
+    if extracted:
+        return not sensitivity and tier == MemoryVisibility.SHARED
     try:
-        normalized = normalize_visibility(raw) if raw is not None else None
-        resolved = MemoryVisibility(normalized) if normalized else default_visibility_for_category(category)
+        normalized = normalize_visibility(visibility) if visibility is not None else None
+        resolved = MemoryVisibility(normalized) if normalized else tier
     except (ValueError, TypeError):
-        resolved = default_visibility_for_category(category)
+        resolved = tier
     return resolved == MemoryVisibility.SHARED
+
+
+def _is_extracted(memory) -> bool:
+    """Whether a row returned by ``extract_and_store`` came from conversation extraction.
+
+    The extraction path stamps ``epistemic_level="explicit"`` on the rows it
+    writes (and the dedup-survivor lookup returns it); an explicit raw write
+    carries no epistemic level unless its caller supplies one. A turn that
+    dedups onto an explicit raw row therefore keeps that row's own visibility.
+    """
+    return getattr(memory, "epistemic_level", None) == "explicit"
+
+
+def _is_shared(memory) -> bool:
+    """Whether a stored memory returned by the flush's extraction may reach the vault."""
+    return mirror_to_vault(
+        getattr(memory, "category", "") or "",
+        getattr(memory, "visibility", None),
+        extracted=_is_extracted(memory),
+        sensitivity=getattr(memory, "sensitivity", None),
+    )
 
 
 async def flush_conversation_turn(

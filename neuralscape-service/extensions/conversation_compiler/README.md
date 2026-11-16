@@ -24,7 +24,9 @@ vault, and `POST /query` and `POST /lint` operate over the whole tree.
 That is the intended design: the vault belongs to one operator (the person or
 team who runs the server and reads the vault), and the extension is not a
 per-user store. Do not point it at a vault that several unrelated people should
-not see together. Each daily-log entry records its owner (`_(user: ...)_`) so
+not see together. **Multi-user note.** On a multi-user instance the mirror writes the shared-category facts (decisions, conventions, architecture, ...) extracted from ANY user's `/flush` or `remember_conversation` into this one operator vault, although those rows stay private to their owner in recall (conversation extraction stamps every row `visibility=private`). The mirror decides by the category's default tier, not by that stamp; a fact the sensitivity gate forced private is never mirrored. Explicit writes are mirrored only when their own visibility is shared. There is no per-user restriction on the vault.
+
+Each daily-log entry records its owner (`_(user: ...)_`) so
 the post-compile dedup can run for every user whose entries were compiled.
 
 ## Configuration
