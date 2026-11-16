@@ -114,6 +114,7 @@ file, each preceded by a stack restart with that file's lines added to the API a
 | `oauth-supabase` | `AUTH_PROVIDER=supabase` (placeholder project URL) | `test_oauth` (provider part) |
 | `cbm` | `CBM_ENABLED`, service `cbm-bridge` | `test_code_graph_cbm` |
 | `docling` | Docling + `EXEMPLAR_STORE_ENABLED` + `DOCLING_EXTRACT_IMAGES` | `test_ingest` (Docling), `test_exemplars` |
+| `legacy-key` | `NEURALSCAPE_API_KEY=<generate:hex32>` + `NEURALSCAPE_API_KEY_USER_ID=acc-legacy`; the gate exports the key as `NS_LEGACY_KEY`; **own stack restart** | `test_legacy_key` |
 
 **Placeholders.** No secret is written in a profile. A line like `VAULT_KEY=<generate:fernet>` (or
 `<generate:hex32>`) is replaced by the gate with a freshly generated value before the stack starts: one
@@ -126,6 +127,17 @@ not a placeholder). `fernet` = `python -c "from cryptography.fernet import Ferne
 `# sidecars: nsc-acc-sink` and `# mounts: ...` are documentation for the gate: the harness starts and removes
 the sink itself, and the `cbm` profile needs the service's `neuralscape-service/knowledge/` directory mounted
 read-only at `/corpus/knowledge` in the `cbm-bridge` container (the profile's `CODE_REPOS` names that path).
+
+**`# harness-env: NS_X=KEY`** hands a generated secret to the harness. The gate exports the generated value of the
+profile's `KEY` (it must be a `<generate:...>` placeholder line) as the harness variable `NS_X` (it must start with
+`NS_`) for that profile's run. The `legacy-key` profile uses `# harness-env: NS_LEGACY_KEY=NEURALSCAPE_API_KEY`: the
+harness reads `NS_LEGACY_KEY` into `ctx.legacy_key` (hidden from the repr) and the fixtures `legacy` (REST) and
+`mcp_legacy` (MCP) authenticate with it as the one identity `ctx.legacy_user` (the profile's
+`NEURALSCAPE_API_KEY_USER_ID`). The value is registered with the results scrubber, so it is removed from every
+recorded `detail`, and the results hold only the placeholder (`profile_flags`). A `legacy-key` scenario run
+without `NS_LEGACY_KEY` fails its fixture with a precondition message (it never skips: the profile exists only for
+them). `NEURALSCAPE_USER_TOKEN_SECRET` stays as the gate sets it, so users A and B keep their per-user tokens on the
+same stack. The profile changes the auth surface, so it declares `# exclusive: own-restart`: it needs its own stack restart and no other profile may share that stack (a selftest pins that no other profile file sets `NEURALSCAPE_API_KEY*` and that only `test_legacy_key.py` uses the `legacy` fixtures). Besides identity, the profile's scenarios cover the missing-bearer 401, the admin and credential routes refused to the shared key, and a cross-user delete refused.
 
 **Dictator.** A profile with `DICTATOR_USER_IDS=acc-dictator` gives the run a third identity: fixtures
 `dictator` (REST) and `mcp_dictator` (MCP), `ctx.dictator_user` / `ctx.token_dictator`. The token is minted for
