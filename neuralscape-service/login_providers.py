@@ -37,7 +37,7 @@ from jwt import PyJWKClient
 import identity_store
 from allowlist import is_email_allowed
 from config import settings
-from identity import unlinked_user_id
+from identity import disambiguate_user_id, slugify_email
 from tokens import sign_payload, verify_payload, verify_user_token
 
 logger = logging.getLogger(__name__)
@@ -180,8 +180,7 @@ async def resolve_login_identity(sub: str | None, email: str) -> tuple[str, bool
     """Map a verified identity to a ``user_id``. Returns ``(user_id, linked)``.
 
     Order: durable store → ``AUTH_IDENTITY_MAP`` seed (promoted into the store)
-    → email slug (a fresh, *unlinked* identity the caller can offer to link;
-    collision-free under the enforced auth profile, see ``identity``).
+    → email slug (a fresh, *unlinked* identity the caller can offer to link).
     """
     uid = await identity_store.resolve(sub, email)
     if uid:
@@ -190,7 +189,43 @@ async def resolve_login_identity(sub: str | None, email: str) -> tuple[str, bool
     if seed:
         await identity_store.link(seed, sub=sub, email=email)  # promote seed → durable
         return seed, True
-    return unlinked_user_id(email), False
+    return await provision_user_id(slugify_email(email), sub, email), False
+
+
+async def provision_user_id(
+    suggested: str, sub: str | None, email: str | None, *, reserve: bool = False
+) -> str:
+    """Return the id a *new* (unlinked) identity should get.
+
+    ``suggested`` is the plain email slug. The slug is lossy, so two different
+    emails can derive the same one; if it is already linked, reserved or seeded
+    (``AUTH_IDENTITY_MAP``) for a different identity the newcomer gets a
+    hash-suffixed id instead of silently sharing that user's memories. Existing
+    links never pass through here, so existing ids are unchanged.
+
+    ``reserve=False`` (the suggestion shown on the link page) only reads.
+    ``reserve=True`` (``/oauth/link`` provisioning) claims the id atomically
+    (``identity_store.reserve``), so two concurrent first logins cannot both
+    take one slug. Fails closed: raises ``IdentityStoreUnavailable`` when Redis
+    cannot answer, rather than guessing the slug is free.
+    """
+    seeds = settings.identity_map_dict()
+    candidate = suggested
+    try:
+        for hex_len in (8, 16, 64):
+            if reserve:
+                if await identity_store.reserve(candidate, sub=sub, email=email, seed_map=seeds):
+                    return candidate
+            elif not await identity_store.claimed_by_other(candidate, sub=sub, email=email, seed_map=seeds):
+                return candidate
+            candidate = disambiguate_user_id(suggested, email or "", hex_len=hex_len)
+    except identity_store.StoreUnavailable as e:
+        raise IdentityStoreUnavailable(str(e)) from e
+    return candidate
+
+
+class IdentityStoreUnavailable(RuntimeError):
+    """A first login cannot be provisioned safely because Redis is down."""
 
 
 async def _resolve_identity(
@@ -229,7 +264,10 @@ async def _resolve_identity(
         ):
             return LoginError("This account is not authorized.", 403)
 
-    user_id, linked = await resolve_login_identity(sub, email)
+    try:
+        user_id, linked = await resolve_login_identity(sub, email)
+    except IdentityStoreUnavailable:
+        return LoginError("Identity store unavailable. Please try signing in again shortly.", 503)
     if linked:
         return LoginResult(ctx=ctx, user_id=user_id)
     return LoginNeedsLink(ctx=ctx, email=email, sub=sub or "", suggested_user_id=user_id)
@@ -540,6 +578,6 @@ def get_login_provider() -> LoginProvider:
 __all__ = [
     "AuthorizeContext", "LoginResult", "LoginError", "LoginNeedsLink",
     "LoginProvider", "get_login_provider", "sign_login_state", "verify_login_state",
-    "sign_link_ticket", "verify_link_ticket", "resolve_login_identity",
+    "sign_link_ticket", "verify_link_ticket", "resolve_login_identity", "provision_user_id", "IdentityStoreUnavailable",
     "verify_user_token",
 ]

@@ -20,6 +20,7 @@ from memory_service import (
     _reinforcement_boost,
 )
 from schemas import MemoryResponse
+from tests.test_dreaming_rewrite_atomic import rewrite_view
 
 
 # ──────────────────────────────────────────────
@@ -694,11 +695,9 @@ class TestDreamRewriteHash:
         new = "User works at Acme (since 2026-06)"
         _rewrite_content(service, "m1", new)
 
-        point = service._memory.vector_store.client.upsert.call_args.kwargs[
-            "points"
-        ][0]
-        assert point.payload["data"] == new
-        assert point.payload["hash"] == hashlib.md5(new.encode()).hexdigest()
+        point = rewrite_view(service._memory.vector_store.client, "m1")
+        assert point["data"] == new
+        assert point["hash"] == hashlib.md5(new.encode()).hexdigest()
 
     def test_rewrite_hash_matches_store_raw_hash(self, service):
         """The rewrite must use the SAME hashing helper as store_raw — if the
@@ -713,7 +712,5 @@ class TestDreamRewriteHash:
 
         _rewrite_content(service, "m1", "fresh text")
 
-        point = service._memory.vector_store.client.upsert.call_args.kwargs[
-            "points"
-        ][0]
-        assert point.payload["hash"] == content_hash("fresh text")
+        point = rewrite_view(service._memory.vector_store.client, "m1")
+        assert point["hash"] == content_hash("fresh text")

@@ -96,9 +96,9 @@ MODULE_OWNERS: dict[str, tuple[str, tuple[str, ...], tuple[str, ...]]] = {
 # registry test, whatever it is called.
 NON_PRODUCT_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
     "evidence_records": (
-        "machine-readable evidence records, writer and baseline/candidate comparison for the persona probes; "
-        "harness output, not a service wire contract",
-        ("persona_evidence",),
+        "machine-readable evidence records, writer and baseline/candidate comparison for the persona probes and "
+        "the preservation run harness; harness output, not a service wire contract",
+        ("persona_evidence", "comp1_run"),
     ),
 }
 

@@ -18,6 +18,20 @@ from adapters.code_graph.native_engine import (
 )
 
 
+
+def _qdrant_404():
+    """What a real Qdrant client raises for a missing collection."""
+    import httpx
+    from qdrant_client.http.exceptions import UnexpectedResponse
+
+    return UnexpectedResponse(
+        status_code=404,
+        reason_phrase="Not Found",
+        content=b"Not found: Collection `code_index` doesn't exist!",
+        headers=httpx.Headers(),
+    )
+
+
 def _snapshot_artifact(snapshot, *, content_hash=None):
     snapshot_json = json.dumps(snapshot, sort_keys=True)
     envelope = {
@@ -202,7 +216,7 @@ def test_native_engine_locate_implemented(mock_bridge, mock_settings):
 
     # Mock empty hits
     qdrant_client.query_points = Mock(return_value=Mock(points=[]))
-    qdrant_client.get_collection = Mock(side_effect=Exception("Not found"))
+    qdrant_client.get_collection = Mock(side_effect=_qdrant_404())
     qdrant_client.create_collection = Mock()
 
     vector_store.client = qdrant_client

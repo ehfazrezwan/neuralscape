@@ -12,17 +12,14 @@
  * finished: that marker is written by the SessionEnd hook (session-summary).
  */
 
-import { commitClaudeCodeFlush } from "../adapters/claude-code.js";
 import {
   detectClient,
   getSessionEndExtractor,
-  getTurnExtractor,
+  resolveEventProjectId,
 } from "../adapters/detect.js";
-import { triggerCompile } from "../core/compile.js";
-import { flushTurns } from "../core/flush.js";
-import { type LockHandle, withTranscriptLock } from "../core/transcript-lock.js";
+import { compileForSession, triggerCompile } from "../core/compile.js";
+import { deliverClaudeCodeTurns } from "../core/deliver.js";
 import {
-  getProjectId,
   hasUserId,
   isProjectExcluded,
   logError,
@@ -44,31 +41,28 @@ async function main(): Promise<void> {
     const raw = (await parseStdin()) as Record<string, unknown>;
 
     // Excluded projects (D4): no conversation capture leaves an excluded project.
-    if (isProjectExcluded(getProjectId(raw.cwd as string | undefined))) return;
-
     const client = detectClient(raw);
+    if (isProjectExcluded(resolveEventProjectId(raw, client))) return;
+
+
+    const sessionExtractor = getSessionEndExtractor(client);
+    const input = await sessionExtractor(raw);
 
     // Claude Code: flush all turns from transcript before compiling.
     // The offset commit is bounded by the flush RESULT (audit 27 #34b):
     // full success commits the whole window, a partial failure commits only
     // past the delivered prefix, and an all-failed flush leaves the cursor
     // untouched so the next session re-flushes everything.
+    // Stop fires after EVERY assistant turn, so the compile request is
+    // windowed per session (see compileForSession); the SessionEnd hook
+    // sends whatever is still uncompiled when the session ends.
     if (client === "claude-code") {
-      const turnExtractor = getTurnExtractor(client);
-      const deliver = async (handle?: LockHandle): Promise<void> => {
-        const turns = await turnExtractor(raw);
-        const result = await flushTurns(turns, { proceed: handle?.held });
-        await commitClaudeCodeFlush(raw, result, handle?.held);
-      };
-      // Read cursor, deliver and write cursor as one step per transcript: an overlapping hook waits for it.
-      const transcriptPath = raw.transcript_path as string | undefined;
-      if (transcriptPath) await withTranscriptLock(transcriptPath, deliver);
-      else await deliver();
+      const delivered = await deliverClaudeCodeTurns(raw);
+      await compileForSession((raw.session_id as string) || "unknown", input, { delivered, final: false, lockPath: raw.transcript_path as string | undefined });
+      return;
     }
 
-    // All clients: trigger compilation of conversation-compiler
-    const sessionExtractor = getSessionEndExtractor(client);
-    const input = await sessionExtractor(raw);
+    // Other clients (a session:end event, a generic POST): one trigger at the end of the session.
     await triggerCompile(input);
   } catch (error) {
     logError("session-end hook failed", error);

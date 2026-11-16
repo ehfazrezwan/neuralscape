@@ -9,11 +9,10 @@
  */
 
 import { commitClaudeCodeFlush } from "../adapters/claude-code.js";
-import { detectClient, getTurnExtractor } from "../adapters/detect.js";
+import { detectClient, getTurnExtractor, resolveEventProjectId } from "../adapters/detect.js";
 import { flushTurns } from "../core/flush.js";
 import { type LockHandle, withTranscriptLock } from "../core/transcript-lock.js";
 import {
-  getProjectId,
   hasUserId,
   isProjectExcluded,
   logError,
@@ -35,9 +34,9 @@ async function main(): Promise<void> {
     const raw = (await parseStdin()) as Record<string, unknown>;
 
     // Excluded projects (D4): no turn capture from an excluded project.
-    if (isProjectExcluded(getProjectId(raw.cwd as string | undefined))) return;
-
     const client = detectClient(raw);
+    if (isProjectExcluded(resolveEventProjectId(raw, client))) return;
+
     const extractor = getTurnExtractor(client);
     const deliver = async (handle?: LockHandle): Promise<void> => {
       const turns = await extractor(raw);

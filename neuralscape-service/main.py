@@ -11,6 +11,7 @@ import base64
 import hashlib
 import json
 import logging
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
@@ -26,6 +27,7 @@ from fastapi import (
     UploadFile,
 )
 from fastapi.responses import JSONResponse, StreamingResponse
+import structlog
 from pydantic import BaseModel, ConfigDict, Field
 
 import adapters  # noqa: F401 — registers knowledge-adapter taxonomies at import (deterministic MEMORY_CATEGORIES)
@@ -33,7 +35,7 @@ from config import settings
 from policy_enforcement import enforce_request, install_or_refuse as _install_policy
 from extensions import ExtensionRegistry
 from extensions.events import EventType, EVENT_PAYLOAD_MODELS
-from logging_config import configure_logging
+from logging_config import REQUEST_ID_HEADER, RequestIdMiddleware, configure_logging, request_id_of
 from memory_service import get_shared_service
 
 # Configure structured logging before anything else
@@ -233,16 +235,29 @@ app = FastAPI(
 from auth import BearerAuthMiddleware, is_admin_user, resolve_request_user_id
 
 app.add_middleware(BearerAuthMiddleware)
+# Added last = outermost: binds request_id for every request and puts it on
+# every response, including the 401/503s BearerAuthMiddleware produces.
+app.add_middleware(RequestIdMiddleware)
 
 
 # ── Global exception handler ─────────────────────────────────────
 @app.exception_handler(Exception)
 async def generic_exception_handler(request: Request, exc: Exception):
     """Catch unhandled exceptions and return generic error to clients."""
-    logger.exception("Unhandled error on %s %s", request.method, request.url.path)
+    # ServerErrorMiddleware runs outside RequestIdMiddleware, so the contextvar
+    # is already unbound here: rebind it from the scope for the log line.
+    request_id = request_id_of(request)
+    if request_id:
+        structlog.contextvars.bind_contextvars(request_id=request_id)
+    try:
+        logger.exception("Unhandled error on %s %s", request.method, request.url.path)
+    finally:
+        if request_id:
+            structlog.contextvars.unbind_contextvars("request_id")
     return JSONResponse(
         status_code=500,
         content={"error": "Internal server error"},
+        headers={REQUEST_ID_HEADER: request_id} if request_id else None,
     )
 
 
@@ -291,6 +306,52 @@ async def health_live():
     return {"status": "alive"}
 
 
+_VECTOR_STORE_PROBE_TIMEOUT_S = 2.0
+_VECTOR_STORE_PROBE_TTL_S = 3.0
+_vector_probe: dict = {"memory": None, "loop": None, "at": None, "error": None, "task": None}
+
+
+async def _probe_vector_store(memory) -> None:
+    """Raise if the vector store does not answer within the probe timeout.
+
+    Single-flight and briefly cached: concurrent /health calls (and calls
+    within the TTL of the last answer) share one ``get_collections`` round
+    trip, and a hung call keeps its one worker thread instead of piling up a
+    new thread per request.
+    """
+    st = _vector_probe
+    loop = asyncio.get_running_loop()
+    if st["memory"] is not memory or st["loop"] is not loop:
+        st.update(memory=memory, loop=loop, at=None, error=None, task=None)
+    task = st["task"]
+    if task is None:
+        if st["at"] is not None and time.monotonic() - st["at"] < _VECTOR_STORE_PROBE_TTL_S:
+            if st["error"] is not None:
+                raise st["error"]
+            return
+        task = asyncio.ensure_future(asyncio.to_thread(memory.vector_store.client.get_collections))
+        st["task"] = task
+
+        def _record(done: asyncio.Future) -> None:
+            error = asyncio.CancelledError() if done.cancelled() else done.exception()
+            if st["task"] is done:
+                st.update(task=None, at=time.monotonic(), error=error)
+
+        task.add_done_callback(_record)
+    await asyncio.wait_for(asyncio.shield(task), timeout=_VECTOR_STORE_PROBE_TIMEOUT_S)
+
+
+def _vector_store_capabilities() -> dict:
+    """Non-failing /health field: what the vector store can do (BM25 slot)."""
+    try:
+        caps = _service.vector_store_capabilities()
+        if isinstance(caps, dict):
+            return caps
+    except Exception:
+        logger.debug("vector_store_capabilities failed", exc_info=True)
+    return {"bm25_sparse": None, "bm25_encoder": None}
+
+
 @app.get("/health")
 async def health():
     """Health check that verifies backend connectivity.
@@ -313,12 +374,14 @@ async def health():
     except Exception:
         checks["redis"] = "unreachable"
 
-    # Check vector store (Qdrant via mem0) — lightweight: just verify mem0 is initialized
+    # Check vector store (Qdrant via mem0): a real, bounded round trip, off the event loop.
     try:
-        if _service._memory is not None:
-            checks["vector_store"] = "ok"
-        else:
+        memory = _service._memory
+        if memory is None:
             checks["vector_store"] = "not_initialized"
+        else:
+            await _probe_vector_store(memory)
+            checks["vector_store"] = "ok"
     except Exception:
         checks["vector_store"] = "unreachable"
 
@@ -386,6 +449,7 @@ async def health():
         "status": overall,
         "service": "neuralscape-memory",
         "checks": checks,
+        "vector_store": _vector_store_capabilities(),
     }
     if knowledge_systems:
         response_data["knowledge_systems"] = knowledge_systems
@@ -1247,11 +1311,22 @@ def _code_graph_or_501():
 
 
 def _map_code_graph_error(e: Exception) -> HTTPException:
-    from adapters.code_graph.query import CodeGraphNotConfigured
+    from adapters.code_graph.query import CodeGraphNotConfigured, CodeSpaceForbidden
 
+    if isinstance(e, CodeSpaceForbidden):
+        return HTTPException(status_code=403, detail=str(e))
     if isinstance(e, CodeGraphNotConfigured):
         return HTTPException(status_code=400, detail=str(e))
     return HTTPException(status_code=404, detail=str(e))
+
+
+def _require_code_space_access(code_space: str | None, caller: str) -> None:
+    """403 unless ``caller`` owns ``code_space`` or is an admin (no-op for non-code-space refs)."""
+    from knowledge.code_dispatch import code_space_access_error
+
+    denied = code_space_access_error(code_space, caller)
+    if denied:
+        raise HTTPException(status_code=403, detail=denied)
 
 
 async def _dispatch_code_system(
@@ -1286,6 +1361,7 @@ async def _dispatch_code_system(
     """
     from knowledge.base import RecallRequest
     from knowledge.code_dispatch import (
+        code_repos_error,
         resolve_auto_bound_system,
         resolve_bound_code_system,
     )
@@ -1296,6 +1372,7 @@ async def _dispatch_code_system(
             status_code=400,
             detail="knowledge_system requires graph_id (the code_space, e.g. code--owner--repo)",
         )
+    _require_code_space_access(code_space, caller)
 
     if knowledge_system == "auto":
         # AR2 auto-selection: resolve + bind the best healthy engine for this op,
@@ -1342,7 +1419,11 @@ async def _dispatch_code_system(
                 status_code=400,
                 detail=(
                     f"could not bind an engine for '{knowledge_system}' at code_space "
-                    f"'{code_space}' (repo not in CODE_REPOS / not indexed / bridge down)"
+                    f"'{code_space}': "
+                    + (
+                        code_repos_error(code_space, settings)
+                        or "not indexed yet, or the engine's backend (e.g. the CBM bridge) is down"
+                    )
                 ),
             )
 
@@ -1384,7 +1465,12 @@ async def v1_code_graph_query(
     knowledge_system: str | None = Query(None, description="Route to a code knowledge system (code-cbm | code-graphify-lib | code-native), or 'auto' for per-op auto-selection of the measured-best healthy engine; graph_id carries the code_space. Omit for the default native/graphify-json path."),
     user_id: str | None = Query(None),
 ):
-    """Search the code graph (BFS/DFS from scored seeds) — Graphify's query, NS's surface."""
+    """Search a code_space's graph (BFS/DFS from scored seeds).
+
+    Works on any indexed code_space (native, graphify-lib, CBM or an uploaded
+    graph.json bundle). Indexing needs the repo on the server disk, mapped in
+    CODE_REPOS; nothing uploads or clones a repo.
+    """
     cg = _code_graph_or_501()
     caller = _resolve_user_id(request, user_id)
     if knowledge_system:
@@ -1425,7 +1511,12 @@ async def v1_code_graph_neighbors(
     knowledge_system: str | None = Query(None, description="Route to a code knowledge system (code-cbm | code-graphify-lib | code-native) or 'auto' (per-op auto-selection); graph_id carries the code_space."),
     user_id: str | None = Query(None),
 ):
-    """Direct in/out neighbors of one code-graph node, with relation + confidence tags."""
+    """Direct in/out neighbors of one code-graph node, with relation + confidence tags.
+
+    Queries an already-indexed code_space; indexing needs the repo on the server
+    disk, mapped in CODE_REPOS. An ambiguous bare label resolves to the best match
+    and the response lists the other candidates.
+    """
     cg = _code_graph_or_501()
     caller = _resolve_user_id(request, user_id)
     if knowledge_system:
@@ -1465,7 +1556,11 @@ async def v1_code_graph_path(
     knowledge_system: str | None = Query(None, description="Route to a code knowledge system (code-cbm | code-graphify-lib | code-native) or 'auto' (per-op auto-selection); graph_id carries the code_space."),
     user_id: str | None = Query(None),
 ):
-    """Shortest connection path between two code-graph symbols (how does A reach B?)."""
+    """Shortest connection path between two code-graph symbols (how does A reach B?).
+
+    Queries an already-indexed code_space; indexing needs the repo on the server
+    disk, mapped in CODE_REPOS.
+    """
     cg = _code_graph_or_501()
     caller = _resolve_user_id(request, user_id)
     if knowledge_system:
@@ -1506,8 +1601,9 @@ async def v1_code_graph_locate(
     """Hybrid code retrieval: find symbols by description or name pattern (E3).
 
     Uses dense embeddings + BM25 + degree signal. Returns file:line locations with
-    signatures and docstrings. E3: requires NativeEngine (repo:<name> refs); raises
-    501 on GraphifyJsonEngine (.json artifacts).
+    signatures and docstrings. Needs an engine that supports locate (native or CBM);
+    501 / capability error on engines that do not (graphify-lib, uploaded graph.json).
+    The repo must have been indexed from the server disk (mapped in CODE_REPOS).
     """
     cg = _code_graph_or_501()
     caller = _resolve_user_id(request, user_id)
@@ -1569,8 +1665,10 @@ async def v1_code_graph_impact(
     """Compute blast radius from a given symbol (E7).
 
     BFS over CALLS/IMPORTS edges to find all symbols affected by changes to the
-    given symbol. Returns a text summary (file:line format). E7: requires
-    NativeEngine (repo:<name> refs); raises 501 on GraphifyJsonEngine (.json artifacts).
+    given symbol. Returns a text summary (file:line format). Needs an engine that
+    supports impact (native or graphify-lib); 501 / capability error on an uploaded
+    graph.json. The repo must have been indexed from the server disk (mapped in
+    CODE_REPOS).
     """
     from adapters.code_graph.engine import EngineCapabilityError
 
@@ -1627,6 +1725,11 @@ async def v1_code_graph_index(req: CodeIndexRequest, request: Request):
     routing config, and runs the external-engine liveness diff. Idempotent at the
     engine level (a re-index of the same code_space overwrites); each call gets a
     unique job id so a re-index always re-runs (not coalesced on a cached result).
+
+    Operator-side by design: ``repo_source`` must be a directory ON THE SERVER and
+    the repo must be mapped in the server's ``CODE_REPOS`` (JSON object of repo name
+    to directory). There is no upload or clone path; if the repo is not mapped the
+    task finishes with ``ok: false`` and an error naming CODE_REPOS.
     """
     _code_graph_or_501()
     caller = _resolve_user_id(request, req.user_id)
@@ -1636,7 +1739,22 @@ async def v1_code_graph_index(req: CodeIndexRequest, request: Request):
         from pathlib import Path as _P
 
         repo_name = _P(req.repo_source.rstrip("/")).name or "repo"
-        code_space = f"code--{caller}--{repo_name}"
+        from knowledge.code_dispatch import build_code_space
+
+        try:
+            code_space = build_code_space(caller, repo_name)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
+    from knowledge.code_dispatch import code_space_shape_error, repo_source_error
+
+    shape = code_space_shape_error(code_space)
+    if shape:
+        raise HTTPException(status_code=400, detail=shape)
+    _require_code_space_access(code_space, caller)
+
+    refused = repo_source_error(req.repo_source, settings)
+    if refused:
+        raise HTTPException(status_code=400, detail=refused)
 
     payload = {
         "system": req.system,
@@ -1677,6 +1795,7 @@ async def v1_code_graph_delete(
     """
     _code_graph_or_501()
     caller = _resolve_user_id(request, user_id)
+    _require_code_space_access(graph_id, caller)
     from knowledge.code_dispatch import teardown_code_space
 
     result = await asyncio.to_thread(
@@ -3200,6 +3319,8 @@ async def v1_delete_episode(
             user_id=resolved_user_id,
             project_id=project_id,
         )
+        if result.get("not_found"):
+            raise HTTPException(status_code=404, detail=result["error"])
         if "error" in result:
             raise HTTPException(status_code=500, detail=result["error"])
         return {"status": "ok", **result}

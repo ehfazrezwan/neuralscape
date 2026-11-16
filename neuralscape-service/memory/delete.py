@@ -9,7 +9,7 @@ import uuid
 
 from datetime import datetime, timezone
 from config import settings
-from schemas import MemoryVisibility
+from schemas import MemoryVisibility, normalize_visibility
 from memory.groups import _build_group_id
 from memory.junk import _deleted_msg
 from memory.ranking import _times_derived_from_metadata
@@ -34,6 +34,24 @@ def _dedup_meta(payload: dict) -> tuple[dict, bool]:
     return meta, False
 
 
+def _dedup_visibility(meta: dict) -> str | None:
+    """Visibility as the dedup partition sees it: an absent stamp is private.
+
+    Conversation-extracted rows used to carry no ``metadata.visibility`` and
+    are now stamped ``private``; every reader already treats an absent value as
+    de-facto private, so the two must share one partition or dedup would stop
+    merging a new row with its legacy twin. An unrecognised value stays its own
+    (raw) partition — stricter, never a cross-partition merge.
+    """
+    vis = meta.get("visibility")
+    if vis is None or vis == "":
+        return MemoryVisibility.PRIVATE.value
+    try:
+        return normalize_visibility(vis)
+    except (ValueError, TypeError):
+        return vis
+
+
 def _dedup_partition(payload: dict) -> tuple:
     """Partition identity a semantic near-duplicate must share to be merged.
 
@@ -55,7 +73,7 @@ def _dedup_partition(payload: dict) -> tuple:
         payload.get("user_id"),
         meta.get("scope"),
         meta.get("project_id") or None,
-        meta.get("visibility"),
+        _dedup_visibility(meta),
         workspace,
     )
 
@@ -79,6 +97,45 @@ def _dedup_partition_filters(user_id: str, payload: dict) -> dict:
         if isinstance(value, str) and value and value != "*":
             filters[prefix + field] = value
     return filters
+
+
+def _is_tombstoned(payload: dict) -> bool:
+    """Whether a raw Qdrant payload is a dream/dedup tombstone (hidden from recall)."""
+    # A double-wrapped row (``metadata.metadata``) can carry the flag at
+    # either level: recall filters read the outer one, dedup/dreaming patches
+    # may have written the inner one. Either hides the row.
+    outer = payload.get("metadata", {}) or {}
+    inner, _ = _dedup_meta(payload)
+    return bool(outer.get("dream_tombstoned") or inner.get("dream_tombstoned"))
+
+
+# Semantic-dedup neighbour search: ask for a small page first and widen it
+# only while the page is full and its lowest hit still clears the threshold,
+# so copies from other partitions (which the fork's equality-only filter
+# cannot always exclude) cannot crowd an in-partition duplicate out of the
+# result. The last size is the hard cap per row.
+_DEDUP_TOP_K_STEPS = (10, 40, 160)
+
+
+def _exact_category(payload: dict):
+    """Category component of the exact-phase group key (same hash, other category: not a duplicate)."""
+    return _dedup_meta(payload)[0].get("category")
+
+
+def _differs_only_by_category(a: dict, b: dict) -> bool:
+    """True for two rows with the SAME text hash but different categories.
+
+    Such a pair can only exist because someone wrote the same text on purpose
+    under two categories (the explicit write path keys on the category), so
+    no dedup phase may merge them. Near-duplicates with different hashes are
+    unaffected and still merge across categories.
+    """
+    ha, hb = a.get("hash"), b.get("hash")
+    if not ha or ha != hb:
+        return False
+    ca = _dedup_meta(a)[0].get("category")
+    cb = _dedup_meta(b)[0].get("category")
+    return ca != cb
 
 
 def _dense_vector(vector) -> list[float] | None:
@@ -123,6 +180,11 @@ class DeleteMixin:
             if not _is_valid_point_id(memory_id):
                 raise LookupError(f"Memory {memory_id} not found") from None
             raise
+        if mem is None:
+            # A well-formed id that names no stored point: not found, not a
+            # server fault (the route maps LookupError to 404; a genuine
+            # store failure raised above and still propagates).
+            raise LookupError(f"Memory {memory_id} not found")
 
         # Permission gate: enforce ownership/visibility rules when caller_user_id
         # is provided (backward-compatible: None skips the gate, existing tests).
@@ -283,6 +345,7 @@ class DeleteMixin:
                     cascade_rows.append({
                         "id": mid,
                         "mem": {"memory": mem_info.get("data", ""), "metadata": meta},
+                        "user_id": user_id,
                         "group_id": None,
                     })
                     deleted_count += 1
@@ -450,6 +513,7 @@ class DeleteMixin:
                 {
                     "id": mid,
                     "mem": {"memory": payload.get("data", ""), "metadata": metadata},
+                    "user_id": user_id,
                     "group_id": None,
                 }
                 for mid, payload, metadata in private_rows
@@ -569,7 +633,7 @@ class DeleteMixin:
         # there are no surviving siblings to repair — only dedupe the cascade
         # to once per distinct episode.
         rows = [
-            {"id": mem.get("id", ""), "mem": mem, "group_id": None}
+            {"id": mem.get("id", ""), "mem": mem, "user_id": user_id, "group_id": None}
             for mem in private_memories + shared_memories
         ]
         batch = self._cascade_rows_once(
@@ -621,13 +685,11 @@ class DeleteMixin:
     # Dedup operations
     # ──────────────────────────────────────────────
 
-    def _scroll_all_user_memories(self, user_id: str, batch_size: int = 100) -> list[dict]:
-        """Paginate through Qdrant scroll() to collect all points for a user.
+    def _iter_user_memory_pages(self, user_id: str, batch_size: int = 100):
+        """Yield one page (a list of ``{"id", "payload"}``) at a time.
 
-        Bypasses mem0's wrapper which doesn't support pagination.
-
-        Returns:
-            List of {"id": str, "payload": dict} for every point matching user_id.
+        Streams a user's pool through Qdrant ``scroll`` so a caller that can
+        work page by page (dedup) never holds the whole pool in memory.
         """
         from qdrant_client.models import FieldCondition, Filter, MatchValue
 
@@ -637,7 +699,6 @@ class DeleteMixin:
             must=[FieldCondition(key="user_id", match=MatchValue(value=user_id))]
         )
 
-        all_points: list[dict] = []
         offset = None
         while True:
             points, next_offset = client.scroll(
@@ -648,13 +709,22 @@ class DeleteMixin:
                 with_payload=True,
                 with_vectors=False,
             )
-            for pt in points:
-                all_points.append({"id": str(pt.id), "payload": pt.payload or {}})
+            if points:
+                yield [{"id": str(pt.id), "payload": pt.payload or {}} for pt in points]
             if next_offset is None:
                 break
             offset = next_offset
 
-        return all_points
+    def _scroll_all_user_memories(self, user_id: str, batch_size: int = 100) -> list[dict]:
+        """Paginate through Qdrant scroll() to collect all points for a user.
+
+        Bypasses mem0's wrapper which doesn't support pagination. Callers that
+        can stream should use ``_iter_user_memory_pages``.
+
+        Returns:
+            List of {"id": str, "payload": dict} for every point matching user_id.
+        """
+        return [pt for page in self._iter_user_memory_pages(user_id, batch_size) for pt in page]
 
     def _fetch_dense_vectors(self, ids: list[str]) -> dict[str, list[float]]:
         """Stored dense vectors for ``ids`` (one Qdrant retrieve; ``{}`` on failure).
@@ -703,13 +773,15 @@ class DeleteMixin:
                 mem = {
                     "memory": payload.get("data", ""),
                     "metadata": payload.get("metadata", {}),
+                    "user_id": payload.get("user_id"),
                 }
                 if collector is None:
                     self._cascade_or_fallback_expire(mem, memory_id=memory_id)
                     return
                 collector.setdefault("deleted", set()).add(memory_id)
                 batch = self._cascade_rows_once(
-                    [{"id": memory_id, "mem": mem, "group_id": None}],
+                    [{"id": memory_id, "mem": mem, "user_id": payload.get("user_id"),
+                      "group_id": None}],
                     deleted_ids=collector["deleted"],
                 )
                 collector.setdefault("graph_jobs", []).extend(batch["graph_jobs"])
@@ -725,8 +797,9 @@ class DeleteMixin:
         Phase 1 — Exact: group by (payload hash, partition), keep newest,
                   delete rest.
         Phase 2 — Semantic: for each remaining memory, search for near-duplicates
-                  in the same partition above the cosine threshold, delete the
-                  older one.
+                  in the same partition above the cosine threshold and
+                  delete the older one (default) or, with
+                  ``DEDUP_SEMANTIC_TOMBSTONE_ENABLED``, tombstone it.
 
         Both phases share one partition rule (``_dedup_partition``): a row is
         only ever deleted as a duplicate of a row with the same user, scope,
@@ -738,6 +811,16 @@ class DeleteMixin:
         held), the dream merge folds those details into the survivor and
         tombstones reversibly. The lossless exact-hash phase always runs.
 
+        With ``DEDUP_SEMANTIC_TOMBSTONE_ENABLED`` (off by default) phase 2
+        does not hard-delete: the older near-duplicate gets
+        the same atomic tombstone dreaming uses (``dream_tombstoned``,
+        ``superseded_by``, ``superseded_reason="semantic_dedup"``,
+        ``superseded_at``), so recall hides it, its text stays on disk, and
+        re-deriving it revives it (``_revive_if_tombstoned``). Its
+        ``times_derived`` moves to the survivor as before. A tombstone
+        cascades nothing, so phase 2 produces no ``graph_jobs``; only the
+        exact phase's hard deletes do.
+
         Returns:
             Dict with user_id, exact_duplicates_removed, semantic_duplicates_removed,
             total_checked.
@@ -746,9 +829,12 @@ class DeleteMixin:
         threshold = settings.dedup_similarity_threshold
         batch_size = settings.dedup_batch_size
 
-        memories = self._scroll_all_user_memories(user_id, batch_size=batch_size)
         deleted_ids: set[str] = set()
         collector: dict = {}
+
+        # The pool is streamed page by page; nothing below holds all of it.
+        # Tombstoned rows (dreaming or an earlier semantic merge) are already
+        # hidden from recall and are never candidates or survivors.
 
         # ── Phase 1: Exact dedup by hash ──
         # Key on (hash, partition) — the same partition rule phase 2 uses
@@ -756,12 +842,30 @@ class DeleteMixin:
         # of the text alone, so identical text in two projects, at two tiers
         # (a standard is binding, a shared note is not) or in a reference
         # workspace vs a memory must stay separate rows.
+        # Pass 1 counts keys (small tuples); pass 2 keeps full rows only for
+        # keys seen more than once, so memory is bounded by the duplicates.
+        total_checked = 0
+        key_counts: dict[tuple, int] = {}
+        for page in self._iter_user_memory_pages(user_id, batch_size):
+            total_checked += len(page)
+            for mem in page:
+                h = mem["payload"].get("hash")
+                if h and not _is_tombstoned(mem["payload"]):
+                    key = (h, _dedup_partition(mem["payload"]), _exact_category(mem["payload"]))
+                    key_counts[key] = key_counts.get(key, 0) + 1
+
         exact_removed = 0
         hash_groups: dict[tuple, list[dict]] = {}
-        for mem in memories:
-            h = mem["payload"].get("hash")
-            if h:
-                hash_groups.setdefault((h, _dedup_partition(mem["payload"])), []).append(mem)
+        if any(c > 1 for c in key_counts.values()):
+            for page in self._iter_user_memory_pages(user_id, batch_size):
+                for mem in page:
+                    h = mem["payload"].get("hash")
+                    if not h or _is_tombstoned(mem["payload"]):
+                        continue
+                    key = (h, _dedup_partition(mem["payload"]), _exact_category(mem["payload"]))
+                    if key_counts.get(key, 0) > 1:
+                        hash_groups.setdefault(key, []).append(mem)
+        del key_counts
 
         for h, group in hash_groups.items():
             if len(group) < 2:
@@ -792,6 +896,7 @@ class DeleteMixin:
                     logger.warning(f"Failed to delete exact dup {mid}: {e}")
             if reinforcement:
                 self._bump_times_derived(survivor["id"], reinforcement)
+        del hash_groups
 
         # ── Phase 2: Semantic dedup ──
         semantic_removed = 0
@@ -801,18 +906,20 @@ class DeleteMixin:
                 "exact_duplicates_removed": exact_removed,
                 "semantic_duplicates_removed": 0,
                 "semantic_skipped": "superseded by dreaming MERGE",
-                "total_checked": len(memories),
+                "total_checked": total_checked,
                 **self._dedup_graph_summary(collector, deleted_ids),
             }
-        remaining = [mem for mem in memories if mem["id"] not in deleted_ids]
 
-        # Chunked so stored vectors are held for at most ``batch_size`` rows
-        # at a time (a full user pool of 768-d vectors would not fit).
-        for start in range(0, len(remaining), batch_size):
-            chunk = remaining[start:start + batch_size]
-            stored_vectors = self._fetch_dense_vectors(
-                [mem["id"] for mem in chunk if mem["id"] not in deleted_ids]
-            )
+        # One page at a time, so stored vectors are held for at most
+        # ``batch_size`` rows (a full user pool of 768-d vectors would not fit).
+        for page in self._iter_user_memory_pages(user_id, batch_size):
+            chunk = [
+                mem for mem in page
+                if mem["id"] not in deleted_ids and not _is_tombstoned(mem["payload"])
+            ]
+            if not chunk:
+                continue
+            stored_vectors = self._fetch_dense_vectors([mem["id"] for mem in chunk])
             for mem in chunk:
                 semantic_removed += self._semantic_dedup_one(
                     m, user_id, mem, stored_vectors.get(mem["id"]), threshold, deleted_ids,
@@ -823,7 +930,8 @@ class DeleteMixin:
             "user_id": user_id,
             "exact_duplicates_removed": exact_removed,
             "semantic_duplicates_removed": semantic_removed,
-            "total_checked": len(memories),
+            "semantic_mode": "tombstone" if settings.dedup_semantic_tombstone_enabled else "delete",
+            "total_checked": total_checked,
             **self._dedup_graph_summary(collector, deleted_ids),
         }
 
@@ -858,11 +966,11 @@ class DeleteMixin:
         called when the row has none) and restricts candidates to the same
         (user, scope, project_id, visibility, workspace) partition — pushed
         down as a Qdrant filter where the fork's filter syntax can express
-        it, and enforced strictly on every hit. Returns the number deleted.
+        it, and enforced strictly on every hit. Returns the number merged (tombstoned).
         """
         removed = 0
         mid = mem["id"]
-        if mid in deleted_ids:
+        if mid in deleted_ids or _is_tombstoned(mem["payload"]):
             return 0
 
         text = mem["payload"].get("data", "")
@@ -875,16 +983,8 @@ class DeleteMixin:
                 # Same task type the write path stores vectors with, so the
                 # query lives in the same space as the rows it is compared to.
                 vector = m.embedding_model.embed(text, memory_action="add")
-            # mem0 v2.0.2 renamed the search kwarg ``limit`` → ``top_k``
-            # on its Qdrant wrapper (``mem0/mem0/vector_stores/qdrant.py``).
-            # Calling with ``limit`` raises ``Qdrant.search() got an
-            # unexpected keyword argument 'limit'`` and dedup silently
-            # fails for every memory in the user's pool.
-            hits = m.vector_store.search(
-                query=text,
-                vectors=vector,
-                top_k=5,
-                filters=_dedup_partition_filters(user_id, mem["payload"]),
+            hits = self._partition_neighbours(
+                m, user_id, mem["payload"], text, vector, threshold, partition
             )
         except Exception as e:
             logger.warning(f"Semantic search failed for {mid}: {e}")
@@ -892,21 +992,12 @@ class DeleteMixin:
 
         for hit in hits:
             hit_id = str(hit["id"]) if isinstance(hit, dict) else str(hit.id)
-            hit_score = hit["score"] if isinstance(hit, dict) else hit.score
             hit_payload = hit.get("payload", {}) if isinstance(hit, dict) else (hit.payload or {})
 
             if hit_id == mid or hit_id in deleted_ids:
                 continue
-            if hit_score < threshold:
-                continue
-            # Never dedup across partitions — the same text in another
-            # project, scope, visibility tier (a standard is binding, a
-            # shared note is not) or workspace (a reference passage vs a
-            # memory) is a distinct memory, not a duplicate.
-            if _dedup_partition(hit_payload) != partition:
-                continue
 
-            # Delete the older one
+            # Merge the older one into the newer
             mem_created = mem["payload"].get("created_at", "")
             hit_created = hit_payload.get("created_at", "")
             older_id, older_payload, newer_id = (
@@ -918,22 +1009,103 @@ class DeleteMixin:
             if older_id in deleted_ids:
                 continue
             try:
-                self._delete_qdrant_memory_with_graph_cleanup(
-                    older_id, older_payload, collector=collector
-                )
+                if settings.dedup_semantic_tombstone_enabled:
+                    self._tombstone_semantic_duplicate(older_id, newer_id, older_payload)
+                else:
+                    self._delete_qdrant_memory_with_graph_cleanup(
+                        older_id, older_payload, collector=collector
+                    )
                 deleted_ids.add(older_id)
                 removed += 1
                 # Same reinforcement transfer as the exact phase: the
-                # near-duplicate we just dropped was a repeated
+                # near-duplicate we just merged away was a repeated
                 # observation — its counter moves to the survivor.
                 self._bump_times_derived(
                     newer_id, _times_derived_from_metadata(older_payload.get("metadata"))
                 )
             except Exception as e:
-                logger.warning(f"Failed to delete semantic dup {older_id}: {e}")
+                logger.warning(f"Failed to merge semantic dup {older_id}: {e}")
 
-            # If we deleted ourselves, stop checking this memory
+            # If we merged ourselves away, stop checking this memory
             if older_id == mid:
                 break
 
         return removed
+
+    def _partition_neighbours(
+        self, m, user_id: str, payload: dict, text: str, vector, threshold: float, partition: tuple
+    ) -> list:
+        """Live same-partition rows scoring at/above ``threshold``, best first.
+
+        The partition is pushed down as a Qdrant filter wherever the fork's
+        equality-only filter can express it; fields absent on the source row
+        (no project, default workspace, no visibility stamp) cannot be, so
+        other-partition copies can still come back. The page therefore widens
+        (``_DEDUP_TOP_K_STEPS``) while it is full and its lowest hit still
+        clears the threshold, so they cannot crowd an in-partition duplicate
+        out. Every returned hit passes the strict ``_dedup_partition`` check
+        and is not a tombstone.
+        """
+        # mem0 v2.0.2 renamed the search kwarg ``limit`` → ``top_k`` on its
+        # Qdrant wrapper; calling with ``limit`` raises and silently disables
+        # dedup for the whole pool.
+        filters = _dedup_partition_filters(user_id, payload)
+        hits: list = []
+        for top_k in _DEDUP_TOP_K_STEPS:
+            hits = m.vector_store.search(
+                query=text, vectors=vector, top_k=top_k, filters=filters
+            ) or []
+            if len(hits) < top_k:
+                break
+            lowest = hits[-1]["score"] if isinstance(hits[-1], dict) else hits[-1].score
+            if lowest < threshold:
+                break
+
+        out = []
+        for hit in hits:
+            score = hit["score"] if isinstance(hit, dict) else hit.score
+            hit_payload = hit.get("payload", {}) if isinstance(hit, dict) else (hit.payload or {})
+            if score < threshold:
+                continue
+            # Never dedup across partitions — the same text in another
+            # project, scope, visibility tier (a standard is binding, a
+            # shared note is not) or workspace (a reference passage vs a
+            # memory) is a distinct memory, not a duplicate.
+            if _dedup_partition(hit_payload) != partition:
+                continue
+            if _is_tombstoned(hit_payload):
+                continue
+            if _differs_only_by_category(payload, hit_payload):
+                continue
+            out.append(hit)
+        return out
+
+    def _tombstone_semantic_duplicate(
+        self, older_id: str, survivor_id: str, payload: dict | None = None
+    ) -> None:
+        """Hide ``older_id`` as a near-duplicate of ``survivor_id`` without deleting it.
+
+        Same atomic nested-key merge dreaming's ``_tombstone`` uses
+        (``set_payload`` with ``key="metadata"``): only these keys are
+        written server-side, so a concurrent ``times_derived`` bump is not
+        clobbered. A double-wrapped row (``metadata.metadata``, see
+        ``_dedup_meta``) is patched at BOTH levels: the outer one is what the
+        recall filters read, the inner one is where its other fields live.
+        Raises on failure so the caller does not count a merge that did not
+        happen.
+        """
+        _, wrapped = _dedup_meta(payload or {})
+        patch = {
+            "dream_tombstoned": True,
+            "superseded_by": survivor_id,
+            "superseded_reason": "semantic_dedup",
+            "superseded_at": datetime.now(timezone.utc).isoformat(),
+        }
+        client = self._memory.vector_store.client
+        for key in ("metadata", "metadata.metadata") if wrapped else ("metadata",):
+            client.set_payload(
+                collection_name=settings.qdrant_collection,
+                payload=patch,
+                points=[older_id],
+                key=key,
+            )

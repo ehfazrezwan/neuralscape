@@ -24,7 +24,7 @@ vi.mock("../src/utils.js", async (importOriginal) => {
   };
 });
 
-const { buildIndexContext, buildPendingNote, formatMemories, localSnapshotMemory, withLocalCompactSnapshot } =
+const { buildFullContext, buildIndexContext, buildPendingNote, formatMemories, localSnapshotMemory, withLocalCompactSnapshot } =
   await import("../src/hooks/session-start.js");
 const { writeLocalCompactSnapshot, getObservationDir } = await import("../src/utils.js");
 
@@ -220,5 +220,52 @@ describe("buildIndexContext edge inputs", () => {
     const resumeBlock = out.split("\n\n---\n\n").find((sec) => sec.includes("## Resuming after compaction")) ?? "";
     expect(resumeBlock).toContain("session old-sess");
     expect(resumeBlock).not.toContain("session unrelated");
+  });
+});
+
+describe("buildFullContext (CONTEXT_MODE=full)", () => {
+  const base = { cards: [], codeGraphAvailable: false, budgetTokens: 1500, now: NOW };
+
+  it("is empty when there is nothing to show", () => {
+    expect(buildFullContext({ ...base, context: { categories: {} } as ContextResponse })).toBe("");
+  });
+
+  it("renders cards, the Previously block and the memories, each memory once", () => {
+    const context = {
+      categories: {
+        task_context: [
+          {
+            id: "n1",
+            memory: "Session note:\nRequest: ship it\nNext steps: write tests",
+            tags: ["session_note"],
+            created_at: "2026-07-05T11:00:00.000Z",
+          },
+        ],
+        convention: [{ id: "c1", memory: "Prefer small PRs", category: "convention" }],
+      },
+    } as unknown as ContextResponse;
+    const out = buildFullContext({ ...base, context, cards: [{ label: "user", lines: ["likes tests"] }] });
+    expect(out).toContain("## Identity Card (user)");
+    expect(out).toContain("**Next steps:** write tests");
+    expect(out).toContain("- Prefer small PRs");
+    expect(out).not.toContain("- Session note:");
+  });
+
+  it("drops a category whose only memory was rendered as the resume block", () => {
+    const context = {
+      categories: {
+        task_context: [
+          {
+            id: "s1",
+            memory: "Compact snapshot: session sess-1 in project p\nlast prompt: do x",
+            tags: ["compact_snapshot", "session:sess-1"],
+            created_at: "2026-07-05T11:30:00.000Z",
+          },
+        ],
+      },
+    } as unknown as ContextResponse;
+    const out = buildFullContext({ ...base, context, source: "compact", sessionId: "sess-1" });
+    expect(out).toContain("## Resuming after compaction");
+    expect(out).not.toContain("# Neuralscape Memory Context");
   });
 });
