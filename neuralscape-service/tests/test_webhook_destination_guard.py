@@ -170,3 +170,105 @@ def test_proxy_environment_is_ignored(sink, monkeypatch):
     monkeypatch.setenv("http_proxy", "http://127.0.0.1:9")
     webhooks._post(f"http://127.0.0.1:{sink.port}/hook", PAYLOAD)
     assert len(sink.requests) == 1
+
+
+# --- review findings: invalid port, log redaction, one parser, bounded resolver ---------------
+
+
+@pytest.mark.parametrize("url", ["http://hooks.example.test:abc/x?token=zzz", "http://[::1]:99999999999/x?token=zzz"])
+def test_invalid_port_is_refused_loudly_at_dispatch(url, monkeypatch, caplog):
+    started = []
+    monkeypatch.setattr(threading.Thread, "start", lambda self: started.append(self))
+    with caplog.at_level(logging.WARNING, logger="webhooks"):
+        assert webhooks.fire_queue_empty(url, PAYLOAD) is False
+    assert started == []
+    assert "rejected" in caplog.text
+    assert "token=zzz" not in caplog.text
+
+
+@pytest.mark.parametrize("url", ["ftp://hooks.example.test/x?token=zzz", "gopher://u:pw@hooks.example.test/x?token=zzz", "http:///x?token=zzz"])
+def test_rejection_log_never_carries_the_query_or_userinfo(url, caplog):
+    with caplog.at_level(logging.WARNING, logger="webhooks"):
+        assert webhooks.fire_queue_empty(url, PAYLOAD) is False
+    assert "rejected" in caplog.text
+    assert "token=zzz" not in caplog.text
+    assert "pw" not in caplog.text.replace("rejected", "")
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://169\u3002254\u3002169\u3002254/latest",  # ideographic dots: urlparse sees a name, httpx sends to the IP
+        "http://169.254.169.254\t/latest",  # urlparse accepts the tab, httpx refuses the URL
+    ],
+)
+def test_parser_divergences_cannot_hide_a_metadata_host(url, monkeypatch):
+    started = []
+    monkeypatch.setattr(threading.Thread, "start", lambda self: started.append(self))
+    assert webhooks.fire_queue_empty(url, PAYLOAD) is False
+    assert started == []
+
+
+@pytest.mark.parametrize(
+    "url, host",
+    [
+        ("http://example.com\\@169.254.169.254/x", "169.254.169.254"),
+        ("http://169.254.169.254\\@example.com/x", "example.com"),
+        ("http://example.com@169.254.169.254/x", "169.254.169.254"),
+    ],
+)
+def test_host_judged_is_the_host_httpx_sends_to(url, host):
+    import httpx
+
+    assert webhooks._host_and_port(url)[0] == host == httpx.URL(url).raw_host.decode()
+
+
+def test_backslash_userinfo_to_metadata_is_refused(no_connection):
+    webhooks._post("http://example.com\\@169.254.169.254/x", PAYLOAD)
+    assert no_connection == []
+
+
+def test_a_lookup_that_never_answers_times_out_and_sends_nothing(monkeypatch, no_connection, caplog):
+    release = threading.Event()
+    monkeypatch.setattr(webhooks, "WEBHOOK_TIMEOUT_S", 0.2)
+    monkeypatch.setattr(webhooks.socket, "getaddrinfo", lambda *a, **k: release.wait(5) or [])
+    try:
+        with caplog.at_level(logging.WARNING, logger="webhooks"):
+            webhooks._post("http://slow.example.test/x", PAYLOAD)
+    finally:
+        release.set()
+    assert no_connection == []
+    assert "slow.example.test" in caplog.text and "TimeoutError" in caplog.text
+
+
+def test_concurrent_lookups_are_bounded_and_the_overflow_is_refused(monkeypatch):
+    release = threading.Event()
+    calls = []
+
+    def blocked(*args, **kwargs):
+        calls.append(args[0])
+        release.wait(5)
+        return []
+
+    monkeypatch.setattr(webhooks, "WEBHOOK_TIMEOUT_S", 0.05)
+    monkeypatch.setattr(webhooks.socket, "getaddrinfo", blocked)
+    try:
+        for i in range(webhooks.MAX_RESOLVER_THREADS):
+            with pytest.raises(TimeoutError):
+                webhooks._resolve(f"slow{i}.example.test", 80)
+        with pytest.raises(OSError, match="busy"):
+            webhooks._resolve("overflow.example.test", 80)
+        assert len(calls) == webhooks.MAX_RESOLVER_THREADS  # no extra thread was started
+    finally:
+        release.set()
+    # slots come back once the stuck lookups finish
+    deadline = __import__("time").monotonic() + 3
+    while __import__("time").monotonic() < deadline:
+        monkeypatch.setattr(webhooks.socket, "getaddrinfo", lambda *a, **k: [(2, 1, 6, "", ("127.0.0.1", 80))])
+        try:
+            assert webhooks._resolve("ok.example.test", 80) == ["127.0.0.1"]
+            break
+        except OSError:
+            __import__("time").sleep(0.05)
+    else:
+        pytest.fail("resolver slots were never released")

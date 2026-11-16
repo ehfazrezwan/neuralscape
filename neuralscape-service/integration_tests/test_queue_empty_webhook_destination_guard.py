@@ -17,7 +17,6 @@ import json
 import logging
 import threading
 import time
-import uuid
 
 import pytest
 from arq import create_pool
@@ -83,6 +82,21 @@ def _run_one_job(queue: str, job_id: str) -> None:
     asyncio.run(scenario())
 
 
+def _purge_arq_keys(redis_url: str, queue: str, job_id: str) -> None:
+    """Delete the queue, job and result keys the run created, then prove none are left."""
+    import redis
+
+    client = redis.Redis.from_url(redis_url)
+    try:
+        keys = [queue, f"arq:job:{job_id}", f"arq:result:{job_id}", f"arq:retry:{job_id}", f"arq:in-progress:{job_id}"]
+        keys += [k for k in client.scan_iter(f"*{job_id}*")]
+        client.delete(*set(keys))
+        left = [k for k in client.scan_iter(f"*{job_id}*")] + ([queue] if client.exists(queue) else [])
+        assert not left, f"ARQ keys left behind: {left}"
+    finally:
+        client.close()
+
+
 def _wait(predicate, seconds=10.0) -> bool:
     deadline = time.monotonic() + seconds
     while time.monotonic() < deadline:
@@ -95,8 +109,9 @@ def _wait(predicate, seconds=10.0) -> bool:
 def test_empty_queue_delivers_to_a_loopback_sink(stores, flags, unique_ns):
     sink = _Sink()
     unique_ns.on_cleanup(sink.close)
-    queue = f"nsit-whguard-{uuid.uuid4().hex[:8]}"
-    job_id = f"nsit-job-{uuid.uuid4().hex[:8]}"
+    queue = f"nsit-whguard-{unique_ns.group_prefix}"
+    job_id = f"nsit-job-{unique_ns.group_prefix}"
+    unique_ns.on_cleanup(lambda: _purge_arq_keys(stores.redis_url, queue, job_id))
     flags(redis_url=stores.redis_url, webhook_queue_empty_url=f"http://127.0.0.1:{sink.port}/hook")
 
     _run_one_job(queue, job_id)
@@ -107,8 +122,10 @@ def test_empty_queue_delivers_to_a_loopback_sink(stores, flags, unique_ns):
     assert sink.bodies[0]["job_id"] == job_id
 
 
-def test_empty_queue_refuses_a_link_local_target_and_logs_it(stores, flags, caplog):
-    queue = f"nsit-whguard-{uuid.uuid4().hex[:8]}"
+def test_empty_queue_refuses_a_link_local_target_and_logs_it(stores, flags, unique_ns, caplog):
+    queue = f"nsit-whguard-{unique_ns.group_prefix}"
+    job_id = f"nsit-job-{unique_ns.group_prefix}"
+    unique_ns.on_cleanup(lambda: _purge_arq_keys(stores.redis_url, queue, job_id))
     flags(redis_url=stores.redis_url, webhook_queue_empty_url="http://169.254.169.254/latest/meta-data?token=zzz")
     started: list[str] = []
     real_start = threading.Thread.start
@@ -120,7 +137,7 @@ def test_empty_queue_refuses_a_link_local_target_and_logs_it(stores, flags, capl
     threading.Thread.start = watching_start
     try:
         with caplog.at_level(logging.WARNING, logger="webhooks"):
-            _run_one_job(queue, f"nsit-job-{uuid.uuid4().hex[:8]}")
+            _run_one_job(queue, job_id)
     finally:
         threading.Thread.start = real_start
 

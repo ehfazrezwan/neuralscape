@@ -40,20 +40,53 @@ WEBHOOK_TIMEOUT_S = 5.0
 # At most this many validated addresses are tried per delivery.
 MAX_CONNECT_ATTEMPTS = 4
 
+# At most this many name lookups are in flight at once. A lookup that overruns the timeout is
+# abandoned but keeps its slot until the C resolver gives up, so a name server that never
+# answers cannot pile up threads: further lookups are refused while the slots are taken.
+MAX_RESOLVER_THREADS = 4
+_resolver_slots = threading.BoundedSemaphore(MAX_RESOLVER_THREADS)
+
+
+def _parse(url: str) -> tuple[str, str, int] | None:
+    """``(scheme, host, port)`` as httpx will send it, or None when it is not a usable URL.
+
+    Uses the parser the connector guard (and the sender) uses, so the host judged here is
+    the host contacted: userinfo, backslashes and Unicode dots cannot make two parsers disagree.
+    """
+    import httpx
+
+    try:
+        parsed = httpx.URL(url or "")
+        port = parsed.port
+    except (httpx.InvalidURL, ValueError):
+        return None
+    host = parsed.raw_host.decode("ascii", "replace").lower().rstrip(".")
+    if parsed.scheme not in ("http", "https") or not host:
+        return None
+    port = port or (443 if parsed.scheme == "https" else 80)
+    if not 0 < port < 65536:
+        return None
+    return parsed.scheme, host, port
+
+
+def _log_host(url: str) -> str:
+    """A best-effort host for log lines (never the path, query or userinfo)."""
+    try:
+        return urlparse(url or "").hostname or "?"
+    except ValueError:
+        return "?"
+
 
 def webhook_url_allowed(url: str) -> bool:
-    """Whether ``url`` is an absolute http(s) URL with a hostname."""
-    try:
-        parsed = urlparse(url or "")
-    except ValueError:
-        return False
-    return parsed.scheme in ("http", "https") and bool(parsed.hostname)
+    """Whether ``url`` is an absolute http(s) URL with a hostname (and a valid port)."""
+    return _parse(url) is not None
 
 
 def _host_and_port(url: str) -> tuple[str, int]:
-    parsed = urlparse(url)
-    host = (parsed.hostname or "").rstrip(".")
-    return host, parsed.port or (443 if parsed.scheme == "https" else 80)
+    parsed = _parse(url)
+    if parsed is None:
+        raise ValueError("not a usable webhook URL")
+    return parsed[1], parsed[2]
 
 
 def _literal_never_allowed(host: str) -> bool:
@@ -72,15 +105,23 @@ def _resolve(host: str, port: int) -> list[str]:
     webhook's own daemon thread, never on a worker's event loop).
     """
     box: dict = {}
+    if not _resolver_slots.acquire(blocking=False):
+        raise OSError("resolver busy")
 
     def lookup() -> None:
         try:
             box["infos"] = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
         except OSError as exc:
             box["error"] = exc
+        finally:
+            _resolver_slots.release()
 
     thread = threading.Thread(target=lookup, daemon=True, name="ns-queue-webhook-dns")
-    thread.start()
+    try:
+        thread.start()
+    except BaseException:
+        _resolver_slots.release()
+        raise
     thread.join(WEBHOOK_TIMEOUT_S)
     if thread.is_alive():
         raise TimeoutError(f"name lookup exceeded {WEBHOOK_TIMEOUT_S}s")
@@ -179,13 +220,14 @@ def fire_queue_empty(url: str, payload: dict) -> bool:
     and never blocks beyond thread start; name resolution happens on the
     webhook thread at send time.
     """
-    if not webhook_url_allowed(url):
+    parsed = _parse(url)
+    if parsed is None:
         logger.warning(
-            "WEBHOOK_QUEUE_EMPTY_URL rejected — only absolute http(s) URLs "
-            "with a hostname are allowed (got %r)", url,
+            "WEBHOOK_QUEUE_EMPTY_URL rejected — only absolute http(s) URLs with a hostname "
+            "and a valid port are allowed (host %s)", _log_host(url),
         )
         return False
-    host, _ = _host_and_port(url)
+    host = parsed[1]
     if _literal_never_allowed(host):
         logger.warning(
             "WEBHOOK_QUEUE_EMPTY_URL rejected — host %s is a link-local or "
