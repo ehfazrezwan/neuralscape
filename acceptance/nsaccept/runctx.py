@@ -36,6 +36,10 @@ class Ctx:
     profile_flags: dict = field(default_factory=dict)
     dictator_user: str | None = None
     token_dictator: str | None = field(default=None, repr=False)
+    # The `legacy-key` profile: the gate-generated NEURALSCAPE_API_KEY (handed over through the
+    # profile's `# harness-env:` header) and the one identity it is bound to. Never in the repr or results.
+    legacy_key: str | None = field(default=None, repr=False)
+    legacy_user: str | None = None
 
     def compose(
         self,
@@ -199,6 +203,7 @@ def build(
     compose_project: str | None = None,
     profile_flags: dict | None = None,
     dictator_user: str | None = None,
+    legacy_key: str | None = None,
 ) -> Ctx:
     run_id = new_run_id()
     project_id = f"acc-{run_id}-proj"
@@ -241,6 +246,7 @@ def build(
             token_dictator = _mint_dictator(compose_project, dictator_user)
         elif secret:
             token_dictator = tokens.mint_local(dictator_user, secret)
+    tokens.register_secret(legacy_key)
     return Ctx(
         base_url=base_url.rstrip("/"),
         profile=profile,
@@ -256,6 +262,8 @@ def build(
         profile_flags=dict(profile_flags or {}),
         dictator_user=dictator_user if token_dictator else None,
         token_dictator=token_dictator,
+        legacy_key=legacy_key or None,
+        legacy_user=((profile_flags or {}).get("NEURALSCAPE_API_KEY_USER_ID") or "").strip() or None,
     )
 
 
