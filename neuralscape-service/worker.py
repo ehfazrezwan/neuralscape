@@ -1297,6 +1297,19 @@ async def expire_old_memories_cron(ctx: dict) -> dict:
     return result
 
 
+async def repair_stale_vectors_cron(ctx: dict) -> dict:
+    """Cron job: re-embed rows whose vector write did not finish after an edit (``vector_pending``).
+
+    An edit commits text + revision in one compare-and-set and then writes the vector; a crash or a
+    stalled writer leaves the marker, and this converges the vector to the stored text.
+    """
+    service: MemoryService = ctx["service"]
+    result = await asyncio.to_thread(service.repair_stale_vectors)
+    if result.get("scanned") or result.get("meta_repaired"):
+        logger.info(f"Edit repair cron: {result}")
+    return result
+
+
 async def run_dream_sweep(
     ctx: dict,
     pool: str | None = None,
@@ -1967,6 +1980,14 @@ class GraphWorkerSettings:
         process_session_summary,
     ]
     cron_jobs = _dedup_cron_jobs() + [
+        cron(
+            repair_stale_vectors_cron,
+            minute=20,          # hourly; a no-op scroll when no row is pending
+            timeout=900,
+            unique=True,
+            max_tries=1,
+            run_at_startup=False,
+        ),
         cron(
             dream_sweep_cron,
             # Imported lazily so importing worker.py doesn't load the

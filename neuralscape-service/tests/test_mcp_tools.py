@@ -565,17 +565,6 @@ class TestEditMemoryTool:
         assert "message" not in data
 
     @pytest.mark.asyncio
-    async def test_edit_busy_and_lock_unavailable_are_clear_errors(self, mock_mcp_service):
-        from memory.edit import EditBusy, EditLockUnavailable
-
-        mock_mcp_service.patch_memory.side_effect = EditBusy("m1")
-        data = json.loads((await mcp_server.call_tool("edit_memory", {"memory_id": "m1", "user_id": "e", "tags": ["x"]}))[0].text)
-        assert data["code"] == "edit_busy"
-        mock_mcp_service.patch_memory.side_effect = EditLockUnavailable("nothing was written")
-        data = json.loads((await mcp_server.call_tool("edit_memory", {"memory_id": "m1", "user_id": "e", "tags": ["x"], "expected_revision": "0"}))[0].text)
-        assert data["code"] == "edit_lock_unavailable"
-
-    @pytest.mark.asyncio
     async def test_edit_no_fields_rejected(self, mock_mcp_service):
         result = await mcp_server.call_tool("edit_memory", {"memory_id": "m1", "user_id": "e"})
         data = json.loads(result[0].text)

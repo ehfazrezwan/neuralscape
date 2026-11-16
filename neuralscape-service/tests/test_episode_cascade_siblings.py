@@ -56,11 +56,22 @@ def _dig(payload, dotted):
     return cur
 
 
-def _match(cond, payload) -> bool:
-    from qdrant_client.models import FieldCondition, Filter, MatchAny, MatchValue
+def _match(cond, payload, pid=None) -> bool:
+    from qdrant_client.models import (
+        FieldCondition,
+        Filter,
+        HasIdCondition,
+        IsEmptyCondition,
+        MatchAny,
+        MatchValue,
+    )
 
     if isinstance(cond, Filter):
-        return _eval(cond, payload)
+        return _eval(cond, payload, pid)
+    if isinstance(cond, HasIdCondition):
+        return pid in [str(i) for i in cond.has_id]
+    if isinstance(cond, IsEmptyCondition):
+        return _dig(payload, cond.is_empty.key) in (None, [], "")
     assert isinstance(cond, FieldCondition), cond
     val = _dig(payload, cond.key)
     m = cond.match
@@ -71,12 +82,12 @@ def _match(cond, payload) -> bool:
     raise AssertionError(f"unsupported match {m!r}")
 
 
-def _eval(flt, payload) -> bool:
+def _eval(flt, payload, pid=None) -> bool:
     if flt is None:
         return True
-    if any(not _match(c, payload) for c in (flt.must or [])):
+    if any(not _match(c, payload, pid) for c in (flt.must or [])):
         return False
-    if flt.should and not any(_match(c, payload) for c in flt.should):
+    if flt.should and not any(_match(c, payload, pid) for c in flt.should):
         return False
     return True
 
@@ -110,7 +121,17 @@ class FakeQdrant:
         nxt = start + limit if start + limit < len(items) else None
         return [SimpleNamespace(id=k, payload=v) for k, v in page], nxt
 
+    def retrieve(self, collection_name, ids, with_payload=True, with_vectors=False):
+        return [SimpleNamespace(id=i, payload=self.points[i]) for i in ids if i in self.points]
+
+    def update_vectors(self, collection_name, points):
+        for pv in points:
+            if pv.id not in self.points:
+                raise KeyError(pv.id)
+
     def set_payload(self, collection_name, payload, points, key=None):
+        if not isinstance(points, list):      # a Filter (the edit compare-and-set): never creates a point
+            points = [pid for pid, v in self.points.items() if _eval(points, v, pid)]
         self.set_payload_calls.append({"payload": payload, "points": list(points), "key": key})
         for pid in points:
             target = self.points[pid]
@@ -303,6 +324,7 @@ def world():
     mem.vector_store.delete.side_effect = q.delete
     mem.vector_store.get.side_effect = q.vs_get
     mem.vector_store.update.side_effect = q.vs_update
+    mem.vector_store._has_bm25_slot = False
     mem.vector_store.client = q
     svc._memory = mem
     svc._graphiti = MagicMock(name="Graphiti")
