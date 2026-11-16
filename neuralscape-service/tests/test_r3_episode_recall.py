@@ -293,6 +293,63 @@ class TestR3SearchIntegration:
         assert len(episode_rows) == 1
 
 
+_WORDS = [f"{a}{b}" for a in "bcdfghjklm" for b in ("ar", "el", "ix", "um")]
+
+
+class TestR3EpisodeRowsSurviveTruncation:
+    """Episode rows are unscored, so fusion ranks them last; a plain top-k slice dropped
+    every one of them whenever the scored legs alone filled ``limit``."""
+
+    @staticmethod
+    def _recall(service, *, edges: int, episodes: int, limit: int):
+        mock_mem = MagicMock()
+        mock_mem.embedding_model.embed.return_value = [0.1] * 768
+        mock_mem.search.return_value = {"results": []}
+        graph_result = {
+            "edges": [
+                {"uuid": f"edge-{i}", "fact": f"{_WORDS[i]} sits beside {_WORDS[(i + 7) % 40]} in service {i * 7919}", "name": f"e{i}", "fact_embedding": [0.5] * 768}
+                for i in range(edges)
+            ],
+            "episodes": [
+                {"uuid": f"{i:012d}-ep", "content": f"Episode {i} content", "created_at": None}
+                for i in range(episodes)
+            ],
+            "nodes": [],
+            "communities": [],
+        }
+        with patch.object(service, "_get_memory", return_value=mock_mem), \
+                patch.object(service, "_do_graph_search", return_value=graph_result), \
+                patch.object(service, "_enrich_graph_results"), \
+                patch.object(service, "_enrich_graph_with_v2", side_effect=lambda responses, **kw: responses), \
+                patch("memory.search.settings.graph_episode_recall_enabled", True):
+            return service.search(query="test query", user_id="test_user", project_id=None, limit=limit)
+
+    def test_episode_rows_are_kept_when_scored_rows_fill_the_limit(self, service):
+        results = self._recall(service, edges=12, episodes=2, limit=12)
+
+        assert len(results) == 12
+        assert [r.source for r in results].count("episode") == 2
+        # unscored rows still rank last, and the cut came out of the scored tail
+        assert [r.source for r in results[-2:]] == ["episode", "episode"]
+        assert all(r.score is not None for r in results[:-2])
+
+    def test_episode_rows_never_grow_the_list_past_the_limit(self, service):
+        results = self._recall(service, edges=30, episodes=3, limit=10)
+
+        assert len(results) == 10
+        assert [r.source for r in results].count("episode") == 2  # limit // 4 slots at most
+
+    def test_a_tiny_limit_keeps_its_scored_hits(self, service):
+        results = self._recall(service, edges=5, episodes=3, limit=3)
+
+        assert [r.source for r in results] == ["graph"] * 3
+
+    def test_no_episodes_means_the_plain_slice(self, service):
+        results = self._recall(service, edges=12, episodes=0, limit=5)
+
+        assert len(results) == 5 and {r.source for r in results} == {"graph"}
+
+
 class TestR3AskEvidenceCap:
     """Test that ask evidence caps episode rows at 3 total."""
 
@@ -374,3 +431,97 @@ class TestR3AskEvidenceCap:
         non_episode_rows = [r for r in rows if r.source != "episode"]
         assert len(episode_rows) == 3
         assert len(non_episode_rows) == 3
+
+
+# ── the group filter of the keyword (BM25) fulltext leg ───────────────────────
+
+
+def _admissible_groups(lucene: str) -> set[str]:
+    """Group ids a document may belong to under Lucene's classic-parser reading of ``lucene``.
+
+    Classic rule: a clause next to ``AND`` is required, a clause next to ``OR`` is optional, and
+    ``a OR b AND c`` reads as ``a +b +c``. A group id is admissible when it appears in every
+    required clause that names groups. Only what the graph legs build is handled: top-level
+    ``group_id:"x"`` / ``( ... )`` clauses joined by ``AND`` / ``OR``."""
+    import re
+
+    tokens: list[str] = []
+    depth, buf, i = 0, "", 0
+    while i < len(lucene):
+        ch = lucene[i]
+        if ch == '"':
+            j = lucene.index('"', i + 1)
+            buf += lucene[i : j + 1]
+            i = j + 1
+            continue
+        depth += (ch == "(") - (ch == ")")
+        if ch == " " and depth == 0:
+            if buf:
+                tokens.append(buf)
+            buf = ""
+        else:
+            buf += ch
+        i += 1
+    if buf:
+        tokens.append(buf)
+    admissible: set[str] | None = None
+    for k, tok in enumerate(tokens):
+        if tok in ("AND", "OR"):
+            continue
+        must = (k > 0 and tokens[k - 1] == "AND") or (k + 1 < len(tokens) and tokens[k + 1] == "AND")
+        names = set(re.findall(r'group_id:"([^"]+)"', tok))
+        if must and names:
+            admissible = names if admissible is None else admissible & names
+    if admissible is None:  # no required group clause: nothing narrows the search
+        admissible = set(re.findall(r'group_id:"([^"]+)"', lucene))
+    return admissible
+
+
+class TestFulltextGroupFilterCoversEveryGroup:
+    """Default recall searches the caller's private, shared and project groups at once. The
+    fulltext query used to read ``g1 OR g2 OR g3 AND (q)``, which Lucene parses as ``g1 g2 +g3 +(q)``:
+    only the last group could match, so the episode row of a fact in the caller's private project
+    group (not last) never came back on a plain recall."""
+
+    @staticmethod
+    def _recall_group_ids(service) -> list[str]:
+        mock_mem = MagicMock()
+        mock_mem.embedding_model.embed.return_value = [0.1] * 768
+        mock_mem.search.return_value = {"results": []}
+        seen: dict = {}
+
+        def fake_graph_search(**kwargs):
+            seen.update(kwargs)
+            return {"edges": [], "episodes": [], "nodes": [], "communities": []}
+
+        with patch.object(service, "_get_memory", return_value=mock_mem), \
+                patch.object(service, "_do_graph_search", side_effect=fake_graph_search), \
+                patch("memory.search.settings.graph_episode_recall_enabled", True):
+            # the shape the REST /v1/search route passes for {"query", "project_id", "limit": 30}
+            service.search(query="zq-x-gseed ZqXAaa is a service", user_id="user-a", project_id="proj", limit=30)
+        assert seen["include_episodes"] is True
+        return seen["group_ids"]
+
+    def test_default_recall_groups_include_the_private_project_group_and_more_than_one(self, service):
+        groups = self._recall_group_ids(service)
+        assert "user--user-a--project--proj" in groups and len(groups) > 1
+
+    @pytest.mark.parametrize("builder", ["search_utils", "neo4j_ops"])
+    def test_every_searched_group_is_admissible(self, service, builder):
+        groups = self._recall_group_ids(service)
+        if builder == "search_utils":
+            from graphiti_core.search.search_utils import fulltext_query
+
+            driver = SimpleNamespace(provider="neo4j", fulltext_syntax="")
+            query = fulltext_query("zq-x-gseed ZqXAaa is a service", groups, driver)
+        else:
+            from graphiti_core.driver.neo4j.operations.search_ops import _build_neo4j_fulltext_query
+
+            query = _build_neo4j_fulltext_query("zq-x-gseed ZqXAaa is a service", groups)
+        assert _admissible_groups(query) == set(groups), query
+
+    def test_the_admissibility_reading_catches_the_unparenthesised_form(self):
+        groups = ["a", "b", "c"]
+        broken = 'group_id:"a" OR group_id:"b" OR group_id:"c" AND (term)'
+        assert _admissible_groups(broken) == {"c"}
+        assert _admissible_groups('(group_id:"a" OR group_id:"b" OR group_id:"c") AND (term)') == set(groups)

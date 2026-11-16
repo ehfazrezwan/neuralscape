@@ -922,7 +922,7 @@ class SearchMixin:
             from hybrid_inference import rerank
 
             combined = rerank(query, combined)
-        results = combined[:limit]
+        results = self._truncate_keeping_episode_rows(combined, limit)
 
         # Dreaming: fire-and-forget recall trace (reinforcement signal for
         # the dream sweep's promotion/retention scoring). Runs on a daemon
@@ -1778,6 +1778,33 @@ class SearchMixin:
         )
         fused = [e["row"] for e in entries]
         return fused if limit is None else fused[:limit]
+
+    @staticmethod
+    def _truncate_keeping_episode_rows(
+        combined: list[MemoryResponse], limit: int
+    ) -> list[MemoryResponse]:
+        """Top-``limit`` of the fused list, without the episode leg being starved.
+
+        Verbatim-episode rows carry no score, so fusion ranks them below every
+        scored row. When the vector and graph legs alone fill ``limit`` (the
+        usual case on a populated project) a plain slice dropped every episode
+        row and the leg never surfaced. The leg is additive and capped (at
+        most 3 rows), so the rows that would have been cut are kept in the tail
+        and the scored rows give up that many slots: the list never grows past
+        ``limit``, and at most ``limit // 4`` slots are ever handed over, so a
+        small ``limit`` keeps its scored hits.
+        """
+        head = combined[:limit]
+        if not any(r.source == "episode" for r in combined[limit:]):
+            return head
+        episodes = [r for r in combined if r.source == "episode"]
+        reserve = min(len(episodes), max(0, limit // 4))
+        if reserve == 0:
+            return head
+        keep = episodes[:reserve]
+        keep_ids = {id(r) for r in keep}
+        rest = [r for r in combined if id(r) not in keep_ids]
+        return rest[: limit - reserve] + keep
 
     def _merge_results(self, *result_sets) -> list[dict]:
         """Merge multiple result sets, deduplicate by ID, sort by score descending."""
