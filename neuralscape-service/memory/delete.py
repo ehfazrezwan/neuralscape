@@ -9,7 +9,7 @@ import logging
 from datetime import datetime, timezone
 from config import settings
 from schemas import MemoryVisibility
-from memory.groups import _build_group_id
+from memory.groups import _build_group_id, _scoped_groups
 from memory.junk import _deleted_msg
 from memory.ranking import _times_derived_from_metadata
 
@@ -347,7 +347,9 @@ class DeleteMixin:
             group_id = _build_group_id(
                 visibility, owner, metadata.get("project_id"), metadata.get("workspace")
             )
-            group_ids = [group_id]
+            group_ids = _scoped_groups([group_id])
+            if not group_ids:
+                return
 
             results = self._run_on_bridge(
                 self._graphiti.search_(
@@ -438,6 +440,9 @@ class DeleteMixin:
 
     def _expire_graph_edges_for_groups(self, group_ids: list[str]) -> None:
         """Expire all graph edges in the given groups (bulk soft-delete)."""
+        group_ids = _scoped_groups(group_ids)
+        if not group_ids:
+            return
         try:
             from graphiti_core.edges import EntityEdge
 
