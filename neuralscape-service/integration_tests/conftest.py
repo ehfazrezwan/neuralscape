@@ -465,6 +465,25 @@ def _close_tracked_services(start: int) -> None:
             pass
         if shared is not None and getattr(shared, "_shared_service", None) is svc:
             shared._shared_service = None  # the next get_shared_service() builds a fresh one
+        _drop_copies_of(svc)
+
+
+def _drop_copies_of(svc) -> None:
+    """Point every module-level or wrapper copy of a closed service at a fresh one.
+
+    ``main`` and ``mcp_server`` bind ``_service = get_shared_service()`` at import;
+    ``NSMemorySystem`` caches it lazily. Without this they would keep a closed service.
+    """
+    import gc
+
+    shared = sys.modules.get("memory_service")
+    for name in ("main", "mcp_server"):
+        mod = sys.modules.get(name)
+        if mod is not None and getattr(mod, "_service", None) is svc and shared is not None:
+            mod._service = shared.get_shared_service()
+    for obj in gc.get_objects():
+        if type(obj).__name__ == "NSMemorySystem" and getattr(obj, "_service", None) is svc:
+            obj._service = None  # lazy-loads the new shared service on next use
 
 
 @pytest.fixture(autouse=True)

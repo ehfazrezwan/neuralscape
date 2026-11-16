@@ -283,16 +283,17 @@ class CoreMixin:
                 self._close_http_clients()
 
     def _close_http_clients(self) -> None:
-        """Best-effort close of the Qdrant client and the embedder's HTTP client."""
+        """Best-effort close of the Qdrant client, the embedder's HTTP client and mem0's
+        own resources (the SQLite history connection)."""
         memory = self._memory
         if memory is None:
             return
-        for owner, attr in (
-            (getattr(memory, "vector_store", None), "client"),
-            (getattr(memory, "embedding_model", None), "client"),
-        ):
-            client = getattr(owner, attr, None)
-            closer = getattr(client, "close", None)
+        closers = [
+            getattr(getattr(getattr(memory, "vector_store", None), "client", None), "close", None),
+            getattr(getattr(getattr(memory, "embedding_model", None), "client", None), "close", None),
+            getattr(memory, "close", None),  # mem0 Memory.close(): history SQLite connection
+        ]
+        for closer in closers:
             if callable(closer):
                 try:
                     closer()
