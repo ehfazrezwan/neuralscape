@@ -33,6 +33,9 @@ packages = ["neuralscape_bench", "icebench"]
 
 [tool.hatch.build.targets.wheel.force-include]
 "static" = "neuralscape_bench/static"
+# The service baseline stack (compose files and in-container scripts) ships with the wheel so the installed
+# tests can read the exact files the harness runs.
+"scripts/service_baseline" = "neuralscape_bench/service_baseline/stack"
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
