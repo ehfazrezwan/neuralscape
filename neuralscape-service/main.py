@@ -572,18 +572,25 @@ async def delete_memories(
     user_id: str = Query(default=None),
     agent_id: str = Query(default=None),
     run_id: str = Query(default=None),
+    include_shared: bool = Query(default=False),
 ):
     """Delete the caller's memories, graph facts included. Legacy endpoint.
 
     Same path as ``DELETE /v1/memories`` with no filters: the caller's private
     writes go from the vector store AND the graph (provenance cascade); shared
-    memories they authored are preserved (use the v1 route's include_shared to
-    remove those too).
+    memories they authored are preserved unless ``include_shared=true``, which
+    also removes the caller's OWN shared rows (never another user's, never
+    ``standard`` rows).
     """
     user_id = _resolve_user_id(request, user_id)
     _reject_unsupported_entity_scope(agent_id, run_id, "delete")
     try:
-        result = await asyncio.to_thread(_service.delete_memories, user_id=user_id)
+        result = await asyncio.to_thread(
+            _service.delete_memories, user_id=user_id, include_shared=include_shared
+        )
+        # Sibling facts of a deleted conversation episode need re-enrichment;
+        # enqueue them (as v1 and MCP do) and answer with counts.
+        result = await _enqueue_sibling_graph_jobs(result)
         # Graph cleanup that could not be verified is a partial success.
         incomplete = bool(result.get("graph_cascade_unresolved_ids") or result.get("failed_ids") or result.get("truncated"))
         if result.get("failed_ids") or result.get("truncated"):
