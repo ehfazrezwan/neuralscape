@@ -967,3 +967,39 @@ class TestMcpIdentity:
             mcp_server._service = orig
         # The authenticated identity wins; the spoofed argument is ignored.
         assert svc.list_memories.call_args.kwargs["user_id"] == "alice"
+
+
+class TestClientIdentityIsUnique:
+    """RFC 7591 §3.2.1: each registration gets its own client_id, and a code or
+    refresh token issued to one client is refused for another, even when both
+    registered the same redirect URI in the same second (acceptance scenario
+    test_the_code_is_bound_to_its_client_redirect_and_verifier)."""
+
+    def test_two_registrations_in_the_same_second_get_distinct_client_ids(self, client):
+        with patch.object(oauth.time, "time", return_value=1_900_000_000):
+            first, _ = _register(client)
+            second, _ = _register(client)
+        assert first != second
+
+    def test_a_code_for_one_client_is_refused_for_another_registered_in_the_same_second(
+        self, client
+    ):
+        verifier, challenge = _pkce()
+        with patch.object(oauth.time, "time", return_value=int(time.time())):
+            client_a, redirect = _register(client)
+            client_b, _ = _register(client)
+        login = issue_user_token(USER, SECRET, 3600)
+        loc = _login_to_code(client, client_a, redirect, challenge, login).headers["location"]
+        code = loc.split("code=")[1].split("&")[0]
+        resp = client.post(
+            "/oauth/token",
+            data={
+                "grant_type": "authorization_code",
+                "code": code,
+                "code_verifier": verifier,
+                "redirect_uri": redirect,
+                "client_id": client_b,
+            },
+        )
+        assert resp.status_code == 400
+        assert resp.json()["error"] == "invalid_grant"

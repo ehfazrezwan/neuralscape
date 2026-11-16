@@ -358,8 +358,17 @@ async def register(request: Request) -> JSONResponse:
         )
 
     issued_at = int(time.time())
+    # A random jti makes every registration a distinct client. Without it the
+    # signed client_id was a pure function of (redirect_uris, issue second), so
+    # two registrations with the same redirect URIs in the same second got the
+    # SAME client_id and could redeem each other's codes and refresh tokens.
     client_id = sign_payload(
-        {"typ": "client", "redirect_uris": redirect_uris, "iat": issued_at},
+        {
+            "typ": "client",
+            "redirect_uris": redirect_uris,
+            "iat": issued_at,
+            "jti": secrets.token_urlsafe(12),
+        },
         _secret(),
     )
     return JSONResponse(
