@@ -771,3 +771,69 @@ def test_a_target_handle_that_raises_a_lookalike_refusal_is_an_invalid_attempt(t
     )
     result = pe.observe(tree)["persona-citation-resolution"]
     assert "facts" not in result and "error" in result, result
+
+
+def _run_argv(tmp_path, oracles, out) -> list[str]:
+    return ["run", "--service-dir", str(tmp_path), "--role", "baseline", "--subject-ref", "t",
+            "--oracles", str(oracles), "--out", str(out)]
+
+
+def _assert_one_line_refusal(code: int, capsys, fragment: str) -> None:
+    err = capsys.readouterr().err
+    assert code == 2
+    assert err.startswith("error: ") and fragment in err
+    assert len(err.strip().splitlines()) == 1 and "Traceback" not in err
+
+
+def test_run_turns_an_edited_oracle_into_exit_two_with_one_diagnostic_line(tmp_path, capsys) -> None:
+    copy = _oracle_copy(tmp_path)
+    target = copy / "persona-lifecycle-state.json"
+    document = json.loads(target.read_text())
+    document["expected"]["candidate"]["verdict"] = "known_failure"
+    target.write_text(json.dumps(document, indent=1, sort_keys=True) + "\n")
+    out = tmp_path / "evidence.jsonl"
+
+    _assert_one_line_refusal(pe.main(_run_argv(tmp_path, copy, out)), capsys, "manifest")
+    assert not out.exists()
+
+
+def test_run_turns_a_missing_oracle_into_exit_two_with_one_diagnostic_line(tmp_path, capsys) -> None:
+    copy = _oracle_copy(tmp_path)
+    (copy / "persona-card-freshness.json").unlink()
+
+    _assert_one_line_refusal(pe.main(_run_argv(tmp_path, copy, tmp_path / "e.jsonl")), capsys, "missing")
+
+
+def test_run_turns_a_duplicate_scenario_oracle_into_exit_two(tmp_path, capsys) -> None:
+    copy = _oracle_copy(tmp_path)
+    shutil.copy(copy / "persona-card-freshness.json", copy / "persona-card-freshness-copy.json")
+    manifest = json.loads((copy / pe.MANIFEST).read_text())
+    listed = manifest.get("oracles", manifest)
+    listed["persona-card-freshness-copy.json"] = hashlib.sha256((copy / "persona-card-freshness-copy.json").read_bytes()).hexdigest()
+    (copy / pe.MANIFEST).write_text(json.dumps(manifest, indent=1, sort_keys=True) + "\n")
+
+    _assert_one_line_refusal(pe.main(_run_argv(tmp_path, copy, tmp_path / "e.jsonl")), capsys, "persona-card-freshness")
+
+
+def test_run_turns_a_missing_oracles_directory_into_exit_two_and_creates_nothing(tmp_path, capsys) -> None:
+    out = tmp_path / "made" / "evidence.jsonl"
+
+    code = pe.main(_run_argv(tmp_path, tmp_path / "no-such-oracles", out))
+
+    _assert_one_line_refusal(code, capsys, "no-such-oracles")
+    assert not out.parent.exists()
+
+
+def test_run_turns_a_record_conflict_from_a_concurrent_writer_into_exit_two(tmp_path, capsys, monkeypatch) -> None:
+    def conflict(self, record):
+        raise ev.RecordConflict("record id already exists with different content")
+
+    monkeypatch.setattr(ev.EvidenceWriter, "write", conflict)
+
+    _assert_one_line_refusal(pe.main(_run_argv(tmp_path, ORACLES, tmp_path / "e.jsonl")), capsys, "already exists")
+
+
+def test_report_on_a_mistyped_path_creates_no_directory_or_lock(tmp_path) -> None:
+    missing = tmp_path / "typo" / "evidence.jsonl"
+    assert pe.main(["report", "--evidence", str(missing), "--out", str(tmp_path / "r.md")]) == 2
+    assert not (tmp_path / "typo").exists() and not (tmp_path / "r.md").exists()

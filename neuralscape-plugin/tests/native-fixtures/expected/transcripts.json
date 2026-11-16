@@ -1,0 +1,92 @@
+{
+  "cases": {
+    "error-message-turn": {
+      "assistant_contains": [
+        "API Error: the request timed out"
+      ],
+      "receipt": {
+        "interrupted_tail_dropped": false
+      },
+      "turns_max": 1,
+      "turns_min": 1,
+      "user_contains": [
+        "incident report"
+      ]
+    },
+    "interrupted-final-line": {
+      "assistant_contains": [
+        "npm test"
+      ],
+      "never_in_any_turn": [
+        "Second question"
+      ],
+      "receipt": {
+        "interrupted_tail_dropped": true
+      },
+      "turns_max": 1,
+      "turns_min": 1,
+      "user_contains": [
+        "unit tests"
+      ]
+    },
+    "plain-text-turn": {
+      "assistant_contains": [
+        "npm test"
+      ],
+      "receipt": {
+        "interrupted_tail_dropped": false
+      },
+      "turns_max": 1,
+      "turns_min": 1,
+      "user_contains": [
+        "unit tests"
+      ]
+    },
+    "summary-and-system-only": {
+      "receipt": {
+        "interrupted_tail_dropped": false
+      },
+      "turns_max": 0,
+      "turns_min": 0
+    },
+    "text-blocks-and-image": {
+      "assistant_contains": [
+        "timeout error"
+      ],
+      "never_in_any_turn": [
+        "IMAGE-BYTES-SAMPLE",
+        "base64"
+      ],
+      "receipt": {
+        "interrupted_tail_dropped": false
+      },
+      "turns_max": 1,
+      "turns_min": 1,
+      "user_contains": [
+        "failing screenshot"
+      ]
+    },
+    "tool-use-and-result": {
+      "assistant_contains": [
+        "I will run the test suite now.",
+        "All twelve tests pass, no failures were reported."
+      ],
+      "never_in_any_turn": [
+        "PRIVATE-REASONING-SAMPLE",
+        "TOOL-RESULT-BODY",
+        "toolu_t1",
+        "tool_use"
+      ],
+      "receipt": {
+        "interrupted_tail_dropped": false
+      },
+      "turns_max": 2,
+      "turns_min": 1,
+      "user_contains": [
+        "Run the tests"
+      ]
+    }
+  },
+  "note": "Expected results describe what a native event must yield. They are written from the client's event shape, not from the implementation; change them only with reviewer sign-off and update MANIFEST.json.",
+  "owner": "reviewer"
+}

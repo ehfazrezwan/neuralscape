@@ -404,13 +404,22 @@ def _history_allows(record: EvidenceRecord, accepted: Mapping[str, EvidenceRecor
 class EvidenceWriter:
     """Append-only JSON Lines evidence file."""
 
-    def __init__(self, path: str | os.PathLike[str], protected: Iterable[FileIdentity | str | os.PathLike[str]] = ()) -> None:
+    def __init__(
+        self,
+        path: str | os.PathLike[str],
+        protected: Iterable[FileIdentity | str | os.PathLike[str]] = (),
+        *,
+        create: bool = True,
+    ) -> None:
+        """``create=False`` is for a reader: it never makes the evidence directory (a mistyped path leaves nothing behind)."""
+
         self._protected = tuple(item if type(item) is FileIdentity else Path(item) for item in protected)   # files an append must never reach, by inode
         self._path = Path(path)
         if self._path.name.endswith(".lock"):
             raise UnsafePath("an evidence file name must not end in .lock: that suffix names the writer's lock file")
         self._lock = threading.Lock()
-        self._path.parent.mkdir(parents=True, exist_ok=True)
+        if create:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
 
     @property
     def path(self) -> Path:
@@ -461,6 +470,7 @@ class EvidenceWriter:
         target = self._target()
         directory = os.open(target.parent, _DIRECTORY_FLAGS)
         try:
+            os.stat(target.name, dir_fd=directory)   # a missing file raises here, before the lock sidecar can be created
             lock = self._open_shared_lock(target, directory)
             try:
                 if lock is not None:
@@ -814,7 +824,7 @@ def _artifacts(
     """The artifacts and the identities of every file they were read from (evidence, its lock file, the report)."""
 
     lane = _exact_required_text(producer_lane)
-    snapshot = EvidenceWriter(os.fspath(evidence_path)).snapshot_pinned()   # a path-like object is asked once
+    snapshot = EvidenceWriter(os.fspath(evidence_path), create=False).snapshot_pinned()   # a path-like object is asked once
     result = snapshot.result
     rows = compare(result.records)
     counts: dict[str, int] = {}
