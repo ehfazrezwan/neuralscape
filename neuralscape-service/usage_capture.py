@@ -717,22 +717,27 @@ class DurableUsageRecorder:
         context = current_attempt_context()
         ledger_attempt = context.ledger_attempt if context else None
         started = self._monotonic()
+        deadline = started + self._budget_s  # one deadline for the whole call: every write and the gap flush
         for attempt in range(self._retries + 1):
+            remaining = deadline - self._monotonic()
+            if attempt > 0 and remaining <= 0:
+                break
             try:
-                self._store.append(event, ledger_attempt=ledger_attempt)
+                self._store_call(self._store.append, event, budget_s=max(0.0, remaining), ledger_attempt=ledger_attempt)
             except (UsageEventConflict, ValueError, TypeError):
                 break  # not transient: retrying cannot help
             except Exception:
                 # The provider-call thread never waits longer than the budget on a sick store.
-                if attempt < self._retries and self._monotonic() - started < self._budget_s:
-                    self._sleep(self._retry_delay * (attempt + 1))
+                remaining = deadline - self._monotonic()
+                if attempt < self._retries and remaining > 0:
+                    self._sleep(min(self._retry_delay * (attempt + 1), remaining))
                     continue
                 break
             else:
                 if self._unrecorded:
                     # The store is taking writes again.  Recovery shares what is left of this call's
                     # budget; counts it does not reach stay in memory for the next call.
-                    self.flush_gaps(max_s=max(0.0, self._budget_s - (self._monotonic() - started)))
+                    self.flush_gaps(max_s=max(0.0, deadline - self._monotonic()))
                 return True
         self.failures += 1
         key = (event.tenant_id, event.task_id)
@@ -745,6 +750,20 @@ class DurableUsageRecorder:
                 self.gaps_overflowed += 1
         logger.error("durable usage write failed for %s", event.event_id, exc_info=True)
         return False
+
+    @staticmethod
+    def _store_call(method: Any, *args: Any, budget_s: float | None = None, **kwargs: Any) -> Any:
+        """Call a store write with the caller's remaining budget when the store accepts one."""
+        import inspect
+
+        if budget_s is not None:
+            try:
+                params = inspect.signature(method).parameters
+            except (TypeError, ValueError):
+                params = {}
+            if "budget_s" in params or any(p.kind is p.VAR_KEYWORD for p in params.values()):
+                kwargs["budget_s"] = budget_s
+        return method(*args, **kwargs)
 
     def flush_gaps(self, max_s: float | None = None) -> None:
         """Persist the per-task counts of events that could not be stored (best effort).
@@ -763,16 +782,18 @@ class DurableUsageRecorder:
                 self._return_gaps(items[index:])
                 return
             try:
-                self._store.record_gap(tenant_id, task_id, count)
+                left = None if deadline is None else max(0.0, deadline - self._monotonic())
+                self._store_call(self._store.record_gap, tenant_id, task_id, count, budget_s=left)
             except Exception:
                 logger.error("usage gap for task %s could not be stored", task_id, exc_info=True)
                 self._return_gaps([((tenant_id, task_id), count)])
 
     def _return_gaps(self, items: list) -> None:
-        """Put counts that were claimed but not persisted back (bounded like every other add)."""
+        """Put counts that were claimed but not persisted back, always: they already held a slot.
+
+        Only new keys are bounded (``record``); returned keys came out of this map, so the map can
+        exceed ``max_unrecorded_keys`` by at most the keys claimed in one flush (memory stays bounded)
+        and no claimed count loses its task attribution."""
         with self._lock:
             for key, count in items:
-                if key in self._unrecorded or len(self._unrecorded) < self._max_keys:
-                    self._unrecorded[key] = self._unrecorded.get(key, 0) + count
-                else:
-                    self.gaps_overflowed += count
+                self._unrecorded[key] = self._unrecorded.get(key, 0) + count

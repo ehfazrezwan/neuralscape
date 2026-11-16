@@ -267,7 +267,12 @@ class DeleteMixin:
                 )
                 cascade_result = batch["results"].get(memory_id) or {}
                 if isinstance(result, dict):
-                    result["graph_cascade"] = "resolved" if cascade_result.get("resolved") else "unresolved"
+                    left = list(cascade_result.get("superseded_unresolved") or [])
+                    # Older episodes of the row that could not be removed are still in the graph: not "resolved".
+                    resolved = bool(cascade_result.get("resolved")) and not left
+                    result["graph_cascade"] = "resolved" if resolved else "unresolved"
+                    if left:
+                        result["graph_superseded_unresolved"] = left
                     # Sibling facts that shared this memory's graph episode lost
                     # it (the episode body holds the deleted fact verbatim, so
                     # it must go); the caller enqueues these single-fact

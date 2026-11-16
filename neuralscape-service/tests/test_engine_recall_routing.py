@@ -217,8 +217,58 @@ def test_the_engine_adds_a_project_free_leg_only_when_asked():
     assert searches == [(("owner:alice", "project:p1"), 5)]
     searches.clear()
     hits = switch.recall("alice", "q", 5, project_id="p1", visibility="private", include_global=True)
-    assert searches == [(("owner:alice", "project:p1"), 5), (("owner:alice",), 20)]
-    assert len(hits) == 2
+    # the global leg is restricted by label in the engine; it returned fewer than the limit, so the
+    # pre-label (legacy) project-free search runs as a fallback
+    assert searches == [(("owner:alice", "project:p1"), 5), (("owner:alice", "scope:global"), 5),
+                        (("owner:alice",), 20)]
+    assert len(hits) == 3
     searches.clear()
     switch.recall("alice", "q", 5, visibility="private", include_global=True)  # no project: nothing to widen
     assert searches == [(("owner:alice",), 5)]
+
+
+def test_other_projects_rows_cannot_fill_the_global_leg_and_displace_global_or_project_rows():
+    """Before: the project-free leg was every row of the owner, ``4 x limit`` deep, so more than that many
+    higher-scoring rows of other projects filled it and the caller's global rows never came back."""
+    from engine_adapters_switch import EngineSwitch, labels_for
+
+    limit = 5
+    rows = {}
+    for i in range(4 * limit + 10):  # more than 4 x limit rows of another project, all scoring higher
+        rows[f"other-{i}"] = (labels_for("alice", "private", "p2"), 0.99 - i / 1000)
+    rows["proj-1"] = (labels_for("alice", "private", "p1"), 0.5)
+    rows["glob-1"] = (labels_for("alice", "private", None), 0.4)
+    rows["glob-2"] = (labels_for("alice", "private", None), 0.3)
+
+    class Router:
+        def route(self):
+            return "token"
+
+        def search(self, token, ctx, query, flt, n):
+            hits = [SimpleNamespace(record_id=rid, revision=1, score=score)
+                    for rid, (labels, score) in rows.items() if set(flt.labels_all) <= set(labels)]
+            return sorted(hits, key=lambda h: -h.score)[:n]  # the engine applies its limit after the label filter
+
+    switch = EngineSwitch(Router(), ledger=None, service=None, tenant_for=lambda user: "t")
+    ids = [h.record_id for h in switch.recall("alice", "q", limit, project_id="p1", visibility="private",
+                                              include_global=True)]
+    assert {"proj-1", "glob-1", "glob-2"} <= set(ids)
+
+
+def test_a_global_row_projected_before_the_scope_label_still_comes_back_through_the_fallback():
+    from engine_adapters_switch import EngineSwitch
+
+    legacy = ("owner:alice", "vis:private")  # a projection from before the scope label existed
+
+    class Router:
+        def route(self):
+            return "token"
+
+        def search(self, token, ctx, query, flt, n):
+            if set(flt.labels_all) <= set(legacy):
+                return [SimpleNamespace(record_id="legacy-global", revision=1, score=0.7)]
+            return []
+
+    switch = EngineSwitch(Router(), ledger=None, service=None, tenant_for=lambda user: "t")
+    hits = switch.recall("alice", "q", 5, project_id="p1", visibility="private", include_global=True)
+    assert [h.record_id for h in hits] == ["legacy-global"]

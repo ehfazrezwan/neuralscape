@@ -165,8 +165,12 @@ class _SqlUsageStore:
             return c.execute("SELECT COALESCE(MAX(version), 0) FROM usage_schema_version").fetchone()[0]
 
     # -- writes --------------------------------------------------------
-    def append(self, event: UsageEvent, *, ledger_attempt: int | None = None) -> bool:
-        """Store ``event``; return True when new, False for an identical duplicate."""
+    def append(
+        self, event: UsageEvent, *, ledger_attempt: int | None = None, budget_s: float | None = None
+    ) -> bool:
+        """Store ``event``; return True when new, False for an identical duplicate.
+
+        ``budget_s`` (the caller's remaining deadline) caps the append budget of a bounded store."""
         if not isinstance(event, UsageEvent):
             raise TypeError("append requires a UsageEvent")
         if ledger_attempt is not None and (
@@ -177,15 +181,24 @@ class _SqlUsageStore:
         # Through JSON, the same path reads take, so tuple fields (recipients) survive.
         event = UsageEvent.model_validate_json(event.model_dump_json())
         body, digest = _canonical(event)
-        return self._insert(event, body, digest, ledger_attempt)
+        return self._insert(event, body, digest, ledger_attempt, budget_s)
 
-    def _run_write(self, work: Callable[[Any], Any]) -> Any:
-        """Run ``work(connection)`` in one transaction (the PostgreSQL store bounds it, see there)."""
+    def _run_write(self, work: Callable[[Any], Any], budget_s: float | None = None) -> Any:
+        """Run ``work(connection)`` in one transaction (the bounded stores cap it, see there)."""
         with self._lock, self._txn() as c:
             return work(c)
 
-    def _insert(self, event: UsageEvent, body: str, digest: str, ledger_attempt: int | None) -> bool:
-        return self._run_write(lambda c: self._insert_in(c, event, body, digest, ledger_attempt))
+    def _insert(
+        self,
+        event: UsageEvent,
+        body: str,
+        digest: str,
+        ledger_attempt: int | None,
+        budget_s: float | None = None,
+    ) -> bool:
+        return self._run_write(
+            lambda c: self._insert_in(c, event, body, digest, ledger_attempt), budget_s
+        )
 
     def _insert_in(
         self, c: Any, event: UsageEvent, body: str, digest: str, ledger_attempt: int | None
@@ -259,7 +272,9 @@ class _SqlUsageStore:
             out.append(event)
         return tuple(out)
 
-    def record_gap(self, tenant_id: str, task_id: str, count: int = 1) -> None:
+    def record_gap(
+        self, tenant_id: str, task_id: str, count: int = 1, *, budget_s: float | None = None
+    ) -> None:
         """Add ``count`` to the task's unrecorded-write counter (never lowers it)."""
         if type(count) is not int or count < 1:
             raise ValueError("count must be a positive integer")
@@ -273,7 +288,8 @@ class _SqlUsageStore:
                     " updated_at = excluded.updated_at"
                 ),
                 (tenant_id, task_id, count, float(self._clock())),
-            )
+            ),
+            budget_s,
         )
 
     def gaps(self, tenant_id: str, task_id: str) -> int:
@@ -351,12 +367,18 @@ class SqliteUsageStore(_SqlUsageStore):
         self._conn.execute(f"PRAGMA busy_timeout={int(busy_timeout_ms)}")
         self._migrate()
 
-    def _run_write(self, work: Callable[[Any], Any]) -> Any:
+    def _write_budget(self, budget_s: float | None) -> float:
+        """The append budget, capped by the caller's remaining deadline (never negative)."""
+        if budget_s is None:
+            return self._append_budget_s
+        return max(0.0, min(self._append_budget_s, float(budget_s)))
+
+    def _run_write(self, work: Callable[[Any], Any], budget_s: float | None = None) -> Any:
         """A write (an append, a gap count) within the append budget: the wait for the connection
         lock and SQLite's own busy wait both draw on one deadline, so a locked database cannot hold
         the provider-call thread for the connection's full (30 s) busy timeout."""
 
-        deadline = self._monotonic() + self._append_budget_s
+        deadline = self._monotonic() + self._write_budget(budget_s)
         remaining = deadline - self._monotonic()
         if remaining <= 0 or not self._lock.acquire(timeout=remaining):
             raise UsageStoreError("usage store busy: the append budget was spent waiting for the connection")
@@ -500,12 +522,18 @@ class PostgresUsageStore(_SqlUsageStore):
                 self._drop_connection()  # the next call reconnects
             raise
 
-    def _run_write(self, work: Callable[[Any], Any]) -> Any:
+    def _write_budget(self, budget_s: float | None) -> float:
+        """The append budget, capped by the caller's remaining deadline (never negative)."""
+        if budget_s is None:
+            return self._append_budget_s
+        return max(0.0, min(self._append_budget_s, float(budget_s)))
+
+    def _run_write(self, work: Callable[[Any], Any], budget_s: float | None = None) -> Any:
         """A write (an append, a gap count) within the append budget: the wait for the connection
         lock, the statement and, after a dropped connection, one reconnect and one retry (every
         write here is idempotent or additive-and-recorded, and a failed first try did not commit)."""
 
-        deadline = self._monotonic() + self._append_budget_s
+        deadline = self._monotonic() + self._write_budget(budget_s)
         last: BaseException | None = None
         for attempt in range(2):  # the second try follows one reconnect
             remaining = deadline - self._monotonic()

@@ -411,3 +411,112 @@ def test_gap_recovery_on_the_provider_call_path_is_bounded_by_the_record_budget(
     assert len(store.gaps) > first
     recorder.flush_gaps()  # an unbounded flush (shutdown) still drains the rest
     assert len(store.gaps) == 1000 and recorder.unrecorded == {}
+
+
+def test_one_deadline_bounds_every_retry_and_the_gap_flush_of_a_record_call():
+    """Before: each retry started a store write with the store's own fresh budget, so a store that waited its
+    full 2 s on a held lock made ``record`` take a multiple of its 2.5 s budget."""
+    from usage_capture import DurableUsageRecorder
+    from tests.test_usage_store import event
+
+    clock = {"now": 0.0}
+    budgets = []
+
+    class Store:
+        append_budget = 2.0
+
+        def append(self, e, *, ledger_attempt=None, budget_s=None):
+            budgets.append(budget_s)
+            clock["now"] += min(self.append_budget, budget_s)  # the held lock is waited out to the budget
+            raise RuntimeError("database is locked")
+
+        def record_gap(self, *a, **kw):
+            raise AssertionError("no gap is flushed while the store is failing")
+
+    def sleep(seconds):
+        clock["now"] += seconds
+
+    recorder = DurableUsageRecorder(
+        Store(), retries=5, retry_delay=0.05, sleep=sleep, record_budget_s=2.5, monotonic=lambda: clock["now"]
+    )
+    assert recorder.record(event("e1")) is False
+    assert clock["now"] <= 2.5 + 1e-9  # one deadline for the whole call
+    assert budgets[0] == 2.5 and all(b <= 0.5 + 1e-9 for b in budgets[1:])
+
+
+def test_a_gap_write_started_late_in_a_record_call_gets_only_the_remaining_budget():
+    from usage_capture import DurableUsageRecorder
+    from tests.test_usage_store import event
+
+    clock = {"now": 0.0}
+    gap_budgets = []
+
+    class Store:
+        def append(self, e, *, ledger_attempt=None, budget_s=None):
+            clock["now"] += 2.0  # the append itself took 2 s
+            return True
+
+        def record_gap(self, tenant_id, task_id, count, *, budget_s=None):
+            gap_budgets.append(budget_s)
+            clock["now"] += min(2.0, budget_s)
+
+    recorder = DurableUsageRecorder(Store(), record_budget_s=2.5, monotonic=lambda: clock["now"])
+    recorder._unrecorded[("t", "a")] = 1
+    recorder._unrecorded[("t", "b")] = 1
+    assert recorder.record(event("e1")) is True
+    assert gap_budgets == [0.5]  # the second gap is not started: the deadline passed
+    assert clock["now"] <= 2.5 + 1e-9
+    assert recorder.unrecorded == {("t", "b"): 1}  # kept for the next call
+
+
+def test_the_sqlite_store_caps_a_write_at_the_callers_remaining_budget(tmp_path):
+    import threading
+    import time
+
+    from usage_store import SqliteUsageStore, UsageStoreError
+    from tests.test_usage_store import event
+
+    store = SqliteUsageStore(str(tmp_path / "usage.db"), append_budget_s=2.0)
+    held, release = threading.Event(), threading.Event()
+
+    def hold():
+        with store._lock:
+            held.set()
+            release.wait(5)
+
+    thread = threading.Thread(target=hold)
+    thread.start()
+    held.wait(2)
+    try:
+        started = time.monotonic()
+        with pytest.raises(UsageStoreError, match="busy"):
+            store.append(event("e1"), budget_s=0.1)
+        with pytest.raises(UsageStoreError, match="busy"):
+            store.record_gap("t", "k", 1, budget_s=0.1)
+        assert time.monotonic() - started < 1.0  # not the store's own 2 s each
+    finally:
+        release.set()
+        thread.join()
+
+
+def test_claimed_gap_counts_are_never_dropped_when_concurrent_failures_fill_the_map():
+    """Before: counts claimed by a flush that the store did not take were dropped (``gaps_overflowed``) when
+    new failures had filled the bounded map meanwhile, losing their task attribution."""
+    from usage_capture import DurableUsageRecorder
+
+    class Store:
+        def __init__(self):
+            self.recorder = None
+
+        def record_gap(self, tenant_id, task_id, count, **kw):
+            # while the flush is writing, new failures fill the (cap = 1) map with another key
+            self.recorder._unrecorded[("t", "new")] = 1
+            raise RuntimeError("down")
+
+    store = Store()
+    recorder = DurableUsageRecorder(store, max_unrecorded_keys=1)
+    store.recorder = recorder
+    recorder._unrecorded[("t", "claimed")] = 4
+    recorder.flush_gaps()
+    assert recorder.unrecorded[("t", "claimed")] == 4
+    assert recorder.gaps_overflowed == 0

@@ -55,6 +55,8 @@ SUPERSEDED_EPISODES_KEY = "graph_episode_superseded"
 # re-enrichment into a fresh episode has run (the removed episode's uuid; cleared after).
 REENRICH_PENDING_KEY = "graph_reenrich_pending"
 REENRICH_PENDING_AT_KEY = "graph_reenrich_pending_at"  # epoch seconds the marker was set (the sweep waits out a live job)
+REENRICH_ATTEMPTS_KEY = "graph_reenrich_sweep_attempts"  # failed sweep dispatches of this marker (the cap stops them)
+SWEEP_MAX_ATTEMPTS = 5  # a row that failed this many sweeps keeps its marker but is no longer retried by the sweep
 _METADATA_PARENTS = ("metadata", "metadata.metadata")  # a row may carry its metadata wrapped one level deeper
 _REENRICH_ATTEMPTS = 3  # re-enrichments of one row that a concurrent edit may invalidate in a row
 # The ledger job that re-enriches one memory into a fresh episode (see legacy_jobs).
@@ -100,11 +102,34 @@ def queue_reenrich_dispatch(pool, loop):
         except RuntimeError:
             running = None
         if running is loop:
-            loop.create_task(coro)
+            task = loop.create_task(coro)
+            memory_id = job["memory_id"]
+
+            def _enqueued(done) -> None:
+                # An enqueue that fails after the dispatch returned would otherwise surface only as an
+                # unretrieved task exception, without the memory it was for.
+                if done.cancelled():
+                    error: BaseException | None = asyncio.CancelledError()
+                else:
+                    error = done.exception()
+                if error is not None:
+                    queue_reenrich_dispatch.enqueue_failures += 1
+                    logger.warning(
+                        "Re-enrichment of memory=%s could not be enqueued (graph_reenrich_pending stays on "
+                        "the row; the graph worker's sweep retries it): %r",
+                        memory_id, error,
+                    )
+
+            task.add_done_callback(_enqueued)
         else:
             asyncio.run_coroutine_threadsafe(coro, loop).result(timeout=30)
 
     return dispatch
+
+
+_SNAPSHOT_UNREADABLE = object()  # a post-enrichment row read that failed (distinct from a missing row)
+
+queue_reenrich_dispatch.enqueue_failures = 0  # same-loop enqueues that failed after dispatch returned
 
 
 class GraphReadError(RuntimeError):
@@ -480,7 +505,9 @@ class ProvenanceMixin:
         newer episode since the survivor lookup is never undone.  A tombstoned row is not
         re-enriched.  Returns how many rows were scheduled.
         """
-        from qdrant_client.models import FieldCondition, Filter, HasIdCondition, MatchValue
+        from qdrant_client.models import (
+            FieldCondition, Filter, HasIdCondition, IsEmptyCondition, MatchValue, PayloadField,
+        )
 
         scheduled = 0
         failed = 0
@@ -502,19 +529,24 @@ class ProvenanceMixin:
                 "removed_episode": removed_episode,
             }
             # What the row recorded when it was read: the update applies only while that still holds.
+            uuid_absent = None
             if meta.get("graph_episode_uuid") == removed_episode or not meta.get("graph_episode_name"):
                 recorded = FieldCondition(
                     key=f"{parent}.graph_episode_uuid", match=MatchValue(value=removed_episode))
             else:
+                # Name-only row: the update also needs the uuid to still be absent, so a concurrent write
+                # that added a uuid under the same name is not cleared.
                 recorded = FieldCondition(
                     key=f"{parent}.graph_episode_name", match=MatchValue(value=meta["graph_episode_name"]))
+                uuid_absent = IsEmptyCondition(is_empty=PayloadField(key=f"{parent}.graph_episode_uuid"))
             try:
                 client.set_payload(
                     collection_name=settings.qdrant_collection,
                     payload={"graph_episode_uuid": None, "graph_episode_name": None,
                              REENRICH_PENDING_KEY: removed_episode,
-                             REENRICH_PENDING_AT_KEY: time.time()},
-                    points=Filter(must=[HasIdCondition(has_id=[memory_id]), recorded]),
+                             REENRICH_PENDING_AT_KEY: time.time(), REENRICH_ATTEMPTS_KEY: 0},
+                    points=Filter(must=[HasIdCondition(has_id=[memory_id]), recorded,
+                                        *([uuid_absent] if uuid_absent is not None else [])]),
                     key=parent,
                 )
                 if not self._row_marked_for_reenrichment(memory_id, removed_episode):
@@ -581,27 +613,45 @@ class ProvenanceMixin:
             for parent in _METADATA_PARENTS
         ]
         now = time.time()
-        due: list[str] = []
+        # Every marked row is looked at (pending rows are few), then the oldest marker goes first: a row that
+        # failed has its marker time bumped, so rows behind it get their turn on the next run.
+        candidates: dict[str, tuple[float, int, bool]] = {}
         for flt in filters:
             offset = None
-            while len(due) < limit:
+            while True:
                 points, offset = client.scroll(
-                    collection_name=settings.qdrant_collection, scroll_filter=flt, limit=min(100, limit * 5),
+                    collection_name=settings.qdrant_collection, scroll_filter=flt, limit=100,
                     offset=offset, with_payload=True, with_vectors=False,
                 )
                 for point in points:
                     meta = (point.payload or {}).get("metadata") or {}
-                    if isinstance(meta.get("metadata"), dict) and meta["metadata"].get(REENRICH_PENDING_KEY):
+                    wrapped = isinstance(meta.get("metadata"), dict) and meta["metadata"].get(REENRICH_PENDING_KEY)
+                    if wrapped:
                         meta = meta["metadata"]
                     if not meta.get(REENRICH_PENDING_KEY):
                         continue
-                    out["scanned"] += 1
-                    if now - float(meta.get(REENRICH_PENDING_AT_KEY) or 0) < min_age_s:
+                    pid = str(point.id)
+                    if pid in candidates:
                         continue
-                    if str(point.id) not in due and len(due) < limit:
-                        due.append(str(point.id))
+                    out["scanned"] += 1
+                    at = float(meta.get(REENRICH_PENDING_AT_KEY) or 0)
+                    if now - at < min_age_s:
+                        continue
+                    candidates[pid] = (at, int(meta.get(REENRICH_ATTEMPTS_KEY) or 0), bool(wrapped))
                 if offset is None or not points:
                     break
+        capped = sorted(pid for pid, (_, tries, _w) in candidates.items() if tries >= SWEEP_MAX_ATTEMPTS)
+        if capped:
+            out["capped"] = capped
+            logger.warning(
+                "Re-enrichment sweep gave up on %d memories after %d failed sweeps (graph_reenrich_pending stays "
+                "on the rows; the next write to each repairs it): %s",
+                len(capped), SWEEP_MAX_ATTEMPTS, capped,
+            )
+        due = sorted(
+            (pid for pid, (_, tries, _w) in candidates.items() if tries < SWEEP_MAX_ATTEMPTS),
+            key=lambda pid: (candidates[pid][0], pid),
+        )[:limit]
         for memory_id in due:
             try:
                 done = self.reenrich_memory_graph(memory_id)
@@ -614,7 +664,24 @@ class ProvenanceMixin:
                     "Sweep re-enrichment of memory=%s failed; graph_reenrich_pending stays on the row",
                     memory_id, exc_info=True,
                 )
+                self._bump_sweep_failure(memory_id, candidates[memory_id])
         return out
+
+    def _bump_sweep_failure(self, memory_id: str, candidate: tuple[float, int, bool]) -> None:
+        """A failed sweep dispatch moves the row to the back of the queue and counts the failure.
+
+        The marker itself is left in place (a capped row is still repaired by the next write)."""
+
+        _, tries, wrapped = candidate
+        try:
+            self._memory.vector_store.client.set_payload(
+                collection_name=settings.qdrant_collection,
+                payload={REENRICH_PENDING_AT_KEY: time.time(), REENRICH_ATTEMPTS_KEY: tries + 1},
+                points=[memory_id],
+                key="metadata.metadata" if wrapped else "metadata",
+            )
+        except Exception:
+            logger.warning("Recording the failed sweep of memory=%s failed", memory_id, exc_info=True)
 
     def set_graph_reenrich_dispatch(self, dispatch) -> None:
         """Install the durable path for survivor re-enrichment (``dispatch(job)``; ``None``: inline)."""
@@ -669,6 +736,16 @@ class ProvenanceMixin:
             if outcome.get("cleaned_up"):
                 return {"memory_ids": [memory_id]}
             current = self._current_enrichment_snapshot(memory_id)
+            if current is _SNAPSHOT_UNREADABLE:
+                # The row cannot be re-read, so a scope change during the enrichment cannot be ruled out:
+                # take back the episode this attempt wrote (by uuid, in the group it was written to), keep
+                # the row marked and fail the job so it is retried.
+                self._remove_written_episode(memory_id, group_id, written, row.get("memory", ""), "unverified memory")
+                self._mark_reenrich_pending(memory_id, episode_uuid or written.get("episode_name") or "unverified")
+                raise RuntimeError(
+                    f"graph re-enrichment of {memory_id} could not verify the row after enrichment; "
+                    "the episode written was removed; will be retried"
+                )
             if current is None or current == snapshot:
                 return {"memory_ids": [memory_id]}
             # The row changed under the enrichment: its text or its audience is no longer the one the
@@ -691,14 +768,15 @@ class ProvenanceMixin:
             bool(meta.get("dream_tombstoned")),
         )
 
-    def _current_enrichment_snapshot(self, memory_id: str) -> tuple | None:
-        """The snapshot of the row as stored now; ``None`` when it cannot be read (not taken for a change)."""
+    def _current_enrichment_snapshot(self, memory_id: str):
+        """The snapshot of the row as stored now; ``None`` when the row is gone, ``_SNAPSHOT_UNREADABLE``
+        when the read failed (the caller cannot tell whether the row changed)."""
 
         try:
             row = self._memory.get(memory_id)
         except Exception:
-            logger.debug("post-enrichment row read failed for %s", memory_id, exc_info=True)
-            return None
+            logger.warning("post-enrichment row read failed for %s", memory_id, exc_info=True)
+            return _SNAPSHOT_UNREADABLE
         if not row:
             return None
         meta = row.get("metadata") or {}

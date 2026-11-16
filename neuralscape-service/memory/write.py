@@ -16,7 +16,9 @@ from savings_meter import stamp_tokens
 from usage_capture import record_generation_usage
 from schemas import EPISTEMIC_LEVEL_VOCAB, GLOBAL_CATEGORIES, MEMORY_CATEGORIES, MemoryResponse, MemoryScope, MemoryVisibility, PROJECT_CATEGORIES, default_scope_for_category, default_visibility_for_category, normalize_visibility, validate_occurred_at
 from memory.groups import _build_group_id
-from memory.provenance import REENRICH_PENDING_AT_KEY, REENRICH_PENDING_KEY, SUPERSEDED_EPISODES_KEY
+from memory.provenance import (
+    REENRICH_ATTEMPTS_KEY, REENRICH_PENDING_AT_KEY, REENRICH_PENDING_KEY, SUPERSEDED_EPISODES_KEY,
+)
 from memory.hashing import _infer_project_id, _parse_expires_at, content_hash
 from memory.junk import _clean_conversation_for_graph, _is_junk_fact
 from memory.ranking import _times_derived_from_metadata
@@ -1545,7 +1547,7 @@ class WriteMixin:
                     parent = "metadata.metadata"
             client.set_payload(
                 collection_name=settings.qdrant_collection,
-                payload={REENRICH_PENDING_KEY: None, REENRICH_PENDING_AT_KEY: None},
+                payload={REENRICH_PENDING_KEY: None, REENRICH_PENDING_AT_KEY: None, REENRICH_ATTEMPTS_KEY: None},
                 points=[memory_id],
                 key=parent,
             )

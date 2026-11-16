@@ -53,12 +53,19 @@ _GLOBAL_OVERFETCH = 4  # depth of the project-free leg of a routed project recal
 CANONICAL_PAGE_SIZE = 500  # ledger rows read per page by a catch-up or backfill
 
 
+GLOBAL_SCOPE_LABEL = "scope:global"
+
+
 def labels_for(user_id: str, visibility: Optional[str], project_id: Optional[str]) -> tuple[str, ...]:
     """Filter labels that let recall reproduce the personal and shared pools."""
 
     labels = [f"owner:{user_id}", f"vis:{visibility or 'private'}"]
     if project_id:
         labels.append(f"project:{project_id}")
+    else:
+        # A row with no project is global; the label lets recall ask the engine for global rows only,
+        # before ranking and limiting, instead of filtering other projects' rows out afterwards.
+        labels.append(GLOBAL_SCOPE_LABEL)
     return tuple(label[:256] for label in labels)
 
 
@@ -301,8 +308,8 @@ class EngineSwitch:
 
         With a ``project_id`` the project's rows carry its label, but the caller's global rows (no
         project) do not, so ``include_global`` adds a second, project-free search per pool and
-        returns the union (``_GLOBAL_OVERFETCH`` times ``limit`` deep, since that search also meets
-        other projects' rows).  The caller keeps only rows of the project or of global scope.
+        returns the union: the project-free search is restricted to the ``scope:global`` label (in the engine,
+        before its limit).  The caller keeps only rows of the project or of global scope.
         """
 
         tenant_id = self._tenant_for(user_id)
@@ -317,16 +324,33 @@ class EngineSwitch:
         if include_shared and visibility != "private":
             pools.append(("vis:shared",))
         wide = bool(project_id and include_global)
+        primary: dict[str, SearchHit] = {}
+        fallback: dict[str, SearchHit] = {}
+
+        def _search(target: dict, leg_labels: tuple, leg_limit: int) -> list:
+            flt = TenantFilter(tenant_id=tenant_id, labels_all=leg_labels)
+            hits = router.search(token, _ctx(tenant_id), query, flt, leg_limit)
+            for hit in hits:
+                if hit.record_id not in target or hit.score > target[hit.record_id].score:
+                    target[hit.record_id] = hit
+            return hits
+
         for labels in pools:
-            legs = [(labels + ((_bounded(f"project:{project_id}"),) if project_id else ()), limit)]
+            _search(primary, labels + ((_bounded(f"project:{project_id}"),) if project_id else ()), limit)
             if wide:
-                legs.append((labels, limit * _GLOBAL_OVERFETCH))
-            for leg_labels, leg_limit in legs:
-                flt = TenantFilter(tenant_id=tenant_id, labels_all=leg_labels)
-                for hit in router.search(token, _ctx(tenant_id), query, flt, leg_limit):
-                    if hit.record_id not in seen or hit.score > seen[hit.record_id].score:
-                        seen[hit.record_id] = hit
-        ordered = sorted(seen.values(), key=lambda h: (-h.score, h.record_id))
+                # Global rows only (filtered by the engine before its limit), so other projects' rows can
+                # never fill the leg and displace them.
+                global_hits = _search(primary, labels + (GLOBAL_SCOPE_LABEL,), limit)
+                if len(global_hits) < limit:
+                    # Projections made before the scope label existed carry none: a leg short of its limit
+                    # may be missing such rows, so the old project-free search runs too.  Its rows only
+                    # follow the primary ones (they may belong to other projects; hydration drops those).
+                    _search(fallback, labels, limit * _GLOBAL_OVERFETCH)
+        ordered = sorted(primary.values(), key=lambda h: (-h.score, h.record_id))
+        extra = sorted(
+            (h for rid, h in fallback.items() if rid not in primary), key=lambda h: (-h.score, h.record_id)
+        )
+        ordered += extra
         return ordered[: limit * _GLOBAL_OVERFETCH if wide else limit]
 
     def recall_ready(self) -> tuple[bool, Optional[str]]:
@@ -585,6 +609,7 @@ __all__ = [
     "configure",
     "get_switch",
     "labels_for",
+    "GLOBAL_SCOPE_LABEL",
     "projection_switch",
     "recall_switch",
     "start",

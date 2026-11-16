@@ -184,7 +184,8 @@ def _marked(service, marker="ep-1"):
 
 
 def _condition_keys(points):
-    return sorted((getattr(c, "key", None) or c.has_id[0]) for c in points.must)
+    return sorted((getattr(c, "key", None) or getattr(getattr(c, "is_empty", None), "key", None) or c.has_id[0])
+                  for c in points.must)
 
 
 from types import SimpleNamespace as P  # noqa: E402
@@ -505,7 +506,10 @@ def test_the_sweep_counts_a_failed_row_and_keeps_going_and_never_clears_the_mark
     monkeypatch.setattr(service, "reenrich_memory_graph", run)
     out = service.sweep_pending_reenrichments()
     assert out == {"scanned": 2, "reenriched": 1, "failed": 1}
-    service._memory.vector_store.client.set_payload.assert_not_called()  # the enrichment clears it, not the sweep
+    # the enrichment clears the marker, not the sweep: a failure only moves the row back and counts the attempt
+    (call,) = service._memory.vector_store.client.set_payload.call_args_list
+    assert set(call.kwargs["payload"]) == {"graph_reenrich_pending_at", "graph_reenrich_sweep_attempts"}
+    assert call.kwargs["points"] == ["m1"]
 
 
 def test_the_sweep_is_a_no_op_with_the_flag_off_and_clears_a_tombstoned_rows_marker(service, monkeypatch):
@@ -609,3 +613,153 @@ def test_with_the_flag_off_an_unreadable_row_does_not_stop_the_enrichment(servic
     monkeypatch.setattr(service, "_persist_graph_episode_ref", lambda *a: persisted.append(a))
     assert service.enrich_graph(content="c", user_id="u", project_id=None, visibility="private", memory_id="m1") is True
     assert persisted == [("m1", "ep-new", "n")]
+
+
+# ── second review round ──
+
+
+class _FakeQdrant:
+    """Just enough of a Qdrant client to apply the conditional updates and scroll the marked rows."""
+
+    def __init__(self, rows):
+        self.rows = rows  # id -> metadata dict (unwrapped)
+
+    @staticmethod
+    def _holds(meta, cond):
+        from qdrant_client.models import FieldCondition, HasIdCondition, IsEmptyCondition
+
+        if isinstance(cond, FieldCondition):
+            return meta.get(cond.key.rsplit(".", 1)[-1]) == cond.match.value
+        if isinstance(cond, IsEmptyCondition):
+            return not meta.get(cond.is_empty.key.rsplit(".", 1)[-1])
+        raise AssertionError(cond)
+
+    def set_payload(self, collection_name, payload, points, key="metadata"):
+        from qdrant_client.models import Filter, HasIdCondition
+
+        ids = list(self.rows)
+        if isinstance(points, Filter):
+            ids = [i for i in ids if i in points.must[0].has_id and all(
+                self._holds(self.rows[i], c) for c in points.must[1:])]
+        else:
+            ids = [i for i in points if i in self.rows]
+        for i in ids:
+            self.rows[i].update(payload)
+
+    def retrieve(self, collection_name, ids, with_payload=True, with_vectors=False):
+        return [P(id=i, payload={"metadata": dict(self.rows[i])}) for i in ids if i in self.rows]
+
+    def scroll(self, collection_name, scroll_filter, limit, offset, with_payload, with_vectors):
+        out = [P(id=i, payload={"metadata": dict(m)}) for i, m in self.rows.items() if m.get("graph_reenrich_pending")]
+        return out, None
+
+
+def test_a_name_only_survivor_is_not_cleared_when_a_concurrent_write_added_a_uuid_under_the_same_name(service):
+    """Before: the name-only update matched on the name alone, so a uuid a concurrent write had just recorded
+    (same episode name) was wiped together with the stale reference."""
+    row = {"graph_episode_name": "n", "graph_episode_uuid": "ep-new"}  # the uuid arrived after the lookup
+    service._memory.vector_store.client = _FakeQdrant({"m2": row})
+    jobs = []
+    service.set_graph_reenrich_dispatch(jobs.append)
+    survivor = ("m2", {"data": "x", "metadata": {"graph_episode_name": "n"}})  # the snapshot had no uuid
+    assert service._reenrich_survivors([survivor], "ep-1") == 0
+    assert row["graph_episode_uuid"] == "ep-new" and "graph_reenrich_pending" not in row and jobs == []
+    row.pop("graph_episode_uuid")  # no race: the name-only row is cleared as before
+    assert service._reenrich_survivors([survivor], "ep-1") == 1
+    assert row["graph_reenrich_pending"] == "ep-1" and row["graph_episode_name"] is None
+
+
+def test_an_unreadable_row_after_enrichment_removes_the_episode_written_and_retries_the_job(service, monkeypatch):
+    """Before: a failed post-enrichment read returned success, leaving an episode that a scope change during
+    the enrichment could have put in the wrong group."""
+    reads = iter([_survivor_row(), _survivor_row()])  # the job's read and the deletion check; then the read fails
+
+    def get(memory_id):
+        try:
+            return next(reads)
+        except StopIteration:
+            raise RuntimeError("qdrant down") from None
+
+    service._memory.get.side_effect = get
+    monkeypatch.setattr(service, "enrich_graph", lambda **kw: kw["result_out"].update(episode_uuid="ep-new") or True)
+    removed, marked = [], []
+    monkeypatch.setattr(service, "_cascade_expire_episode",
+                        lambda group, **kw: removed.append((group, kw)) or {"resolved": True})
+    monkeypatch.setattr(service, "_mark_reenrich_pending", lambda mid, ep: marked.append((mid, ep)))
+    with pytest.raises(RuntimeError, match="could not verify the row"):
+        service.reenrich_memory_graph("m2")
+    assert removed == [("user--u", {"episode_uuid": "ep-new"})]
+    assert marked == [("m2", "ep-new")]
+
+
+def _sweep_world(service, monkeypatch, n=4):
+    monkeypatch.setattr(settings, "graph_support_aware_removal_enabled", True)
+    rows = {f"m{i}": {"graph_reenrich_pending": "ep-1", "graph_reenrich_pending_at": float(i)} for i in range(1, n + 1)}
+    service._memory.vector_store.client = _FakeQdrant(rows)
+    return rows
+
+
+def test_the_sweep_moves_past_rows_that_keep_failing_instead_of_retrying_the_same_first_rows(service, monkeypatch):
+    """Before: every run started from the same first ``limit`` rows, so rows behind a persistently failing
+    prefix were never reached."""
+    _sweep_world(service, monkeypatch)
+    ran = []
+
+    def run(mid):
+        ran.append(mid)
+        if mid in ("m1", "m2"):
+            raise RuntimeError("always fails")
+        return {"memory_ids": [mid]}
+
+    monkeypatch.setattr(service, "reenrich_memory_graph", run)
+    first = service.sweep_pending_reenrichments(limit=2, min_age_s=0)
+    second = service.sweep_pending_reenrichments(limit=2, min_age_s=0)
+    assert ran[:2] == ["m1", "m2"] and ran[2:4] == ["m3", "m4"]  # the failed rows went to the back
+    assert first["failed"] == 2 and second["reenriched"] == 2
+
+
+def test_a_row_that_fails_the_attempt_cap_is_reported_by_id_and_keeps_its_marker(service, monkeypatch, caplog):
+    from memory.provenance import SWEEP_MAX_ATTEMPTS
+
+    rows = _sweep_world(service, monkeypatch, n=1)
+    ran = []
+    monkeypatch.setattr(service, "reenrich_memory_graph", lambda mid: ran.append(mid) or (_ for _ in ()).throw(
+        RuntimeError("down")))
+    for _ in range(SWEEP_MAX_ATTEMPTS):
+        service.sweep_pending_reenrichments(limit=2, min_age_s=0)
+    assert len(ran) == SWEEP_MAX_ATTEMPTS
+    with caplog.at_level("WARNING"):
+        out = service.sweep_pending_reenrichments(limit=2, min_age_s=0)
+    assert len(ran) == SWEEP_MAX_ATTEMPTS and out["capped"] == ["m1"] and "m1" in caplog.text
+    assert rows["m1"]["graph_reenrich_pending"] == "ep-1"  # still marked: the next write repairs it
+
+
+def test_a_same_loop_enqueue_failure_is_logged_with_the_memory_and_counted(caplog):
+    import asyncio
+
+    from memory.provenance import queue_reenrich_dispatch
+
+    class Pool:
+        async def enqueue_job(self, *a, **kw):
+            raise ConnectionError("redis down")
+
+    async def main():
+        dispatch = queue_reenrich_dispatch(Pool(), asyncio.get_running_loop())
+        dispatch({"memory_id": "m9", "removed_episode": "ep-1"})
+        for _ in range(3):
+            await asyncio.sleep(0)
+
+    before = queue_reenrich_dispatch.enqueue_failures
+    with caplog.at_level("WARNING"):
+        asyncio.run(main())
+    assert "memory=m9" in caplog.text and queue_reenrich_dispatch.enqueue_failures == before + 1
+
+
+def test_a_single_delete_is_not_reported_resolved_while_a_superseded_episode_is_left(service, monkeypatch):
+    service._memory.get.return_value = {"memory": "x", "user_id": "u", "metadata": {"owner_user_id": "u"}}
+    service._memory.delete.return_value = {"message": "ok"}
+    mid = "00000000-0000-0000-0000-000000000001"
+    monkeypatch.setattr(service, "_cascade_rows_once", lambda *a, **kw: {
+        "results": {mid: {"resolved": True, "superseded_unresolved": ["ep-0"]}}, "graph_jobs": []})
+    out = service.delete_memory(mid, "u")
+    assert out["graph_cascade"] == "unresolved" and out["graph_superseded_unresolved"] == ["ep-0"]
