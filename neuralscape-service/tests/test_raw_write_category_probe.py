@@ -82,3 +82,15 @@ async def test_same_text_same_category_is_still_short_circuited(pool):
     ctx["service"].store_raw.assert_not_called()
     assert out["deduplicated"] is True
     assert out["memories"][0]["id"] == "old"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("old_category", [None, ""])
+async def test_stored_row_without_category_keeps_the_old_short_circuit(pool, old_category):
+    """A row stored before categories were compared matches under any category."""
+    args = _job_args_for(pool, "convention")
+    ctx = _ctx(old_category=old_category)
+    out = await worker.process_memory_raw(ctx, *args)
+    ctx["service"].store_raw.assert_not_called()
+    assert out["deduplicated"] is True
+    assert out["memories"][0]["id"] == "old"

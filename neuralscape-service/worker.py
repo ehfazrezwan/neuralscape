@@ -289,9 +289,11 @@ async def process_memory_raw(
                 mem.memory.strip().lower() == content.strip().lower()
                 and getattr(mem, "visibility", None) == _eff_req_vis
                 # The category is part of the identity (store_raw's own dedup
-                # key includes it): the same text under another category is a
-                # distinct memory, not a duplicate to short-circuit onto.
-                and getattr(mem, "category", None) == category
+                # key includes it): the same text under two different
+                # non-empty categories is a distinct memory. A stored row with
+                # no category (written before categories were compared) keeps
+                # the old behaviour and matches under any category.
+                and (not getattr(mem, "category", None) or mem.category == category)
             ):
                 logger.info(f"Skipping duplicate memory for user {user_id}: {content[:50]}...")
                 await _enqueue_stale_graph_check(ctx, mem, content, user_id, project_id)
