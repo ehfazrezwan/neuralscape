@@ -1028,14 +1028,13 @@ class TestPatchMemory:
         result = service.patch_memory("m1", "robb", {"tags": ["project:bon002"]})
 
         service._memory.vector_store.client.update_vectors.assert_not_called()   # metadata-only: no vector work
-        call = service._memory.vector_store.client.set_payload.call_args
-        assert call.kwargs["points"] is not None                                  # a filter-scoped compare-and-set
-        new_meta = call.kwargs["payload"]["metadata"]
-        assert new_meta["tags"] == ["project:bon002"]
-        assert new_meta["owner_user_id"] == "javi"          # preserved
-        assert new_meta["visibility"] == "shared"            # preserved
-        assert new_meta["category"] == "decision"            # preserved
-        assert "updated_at" in call.kwargs["payload"]
+        first, second = service._memory.vector_store.client.set_payload.call_args_list
+        assert first.kwargs["points"] is not None and first.kwargs["key"] == "metadata"   # nested, filter-scoped CAS
+        delta = first.kwargs["payload"]
+        assert delta["tags"] == ["project:bon002"] and delta["revision"] == 1
+        # untouched keys are NOT rewritten (so concurrent nested writers' keys survive)
+        assert "owner_user_id" not in delta and "visibility" not in delta and "category" not in delta
+        assert "updated_at" in second.kwargs["payload"]
         assert result["graph"] == "unchanged" and result["graph_job"] is None
 
     @pytest.mark.parametrize('changes', [{'content': 'New content'}, {'category': 'interaction'}])
@@ -1044,11 +1043,11 @@ class TestPatchMemory:
         service._memory.vector_store.get.return_value = _edit_point(meta=meta)
         service.patch_memory('m1', 'ehfaz', changes)
         if 'content' in changes:
-            stored = service._memory.vector_store.client.set_payload.call_args.kwargs['payload']['metadata']
+            stored = service._memory.vector_store.client.set_payload.call_args_list[0].kwargs['payload']
         else:
-            stored = service._memory.vector_store.client.set_payload.call_args.kwargs['payload']['metadata']
-        assert 'category_evidence' not in stored
-        assert stored['visibility'] == 'shared' and stored['owner_user_id'] == 'ehfaz'
+            stored = service._memory.vector_store.client.set_payload.call_args_list[0].kwargs['payload']
+        assert stored.get('category_evidence') is None and 'category_evidence' in stored   # removed key written as null
+        assert 'visibility' not in stored and 'owner_user_id' not in stored            # untouched keys not rewritten
 
     def test_content_edit_passes_merged_metadata_to_mem0(self, service):
         """REGRESSION: mem0's _update_memory rebuilds the ENTIRE payload from
@@ -1061,13 +1060,13 @@ class TestPatchMemory:
         service._cascade_or_fallback_expire = MagicMock(return_value={"resolved": True})
         result = service.patch_memory("m1", "ehfaz", {"content": "New content"})
 
-        call = service._memory.vector_store.client.set_payload.call_args
-        assert call.kwargs["payload"]["data"] == "New content"
-        nested = call.kwargs["payload"]["metadata"]
-        assert nested["category"] == "decision"
-        assert nested["owner_user_id"] == "ehfaz"
-        assert nested["visibility"] == "shared"
-        assert nested["tags"] == ["old-tag"]
+        first, second = service._memory.vector_store.client.set_payload.call_args_list
+        assert second.kwargs["payload"]["data"] == "New content"        # text fields: second filter-scoped call
+        delta = first.kwargs["payload"]                                  # metadata: ONLY the changed keys, nested
+        assert delta["revision"] == 1 and delta["title"] and "token_estimate" in delta
+        # untouched metadata (category, owner, visibility, tags) is not rewritten, so it survives intact
+        for untouched in ("category", "owner_user_id", "visibility", "tags"):
+            assert untouched not in delta
         assert result["graph"] == "reingest_pending"
         assert result["graph_job"]["content"] == "New content"
         service._cascade_or_fallback_expire.assert_called_once()
@@ -1120,7 +1119,7 @@ class TestPatchMemory:
         meta = {"category": "decision", "owner_user_id": "ehfaz", "visibility": "private"}
         service._memory.vector_store.get.return_value = _edit_point(meta=meta)
         service.patch_memory("m1", "ehfaz", {"category": "tech_stack", "project_id": "p1"})
-        new_meta = service._memory.vector_store.client.set_payload.call_args.kwargs["payload"]["metadata"]
+        new_meta = service._memory.vector_store.client.set_payload.call_args_list[0].kwargs["payload"]
         assert new_meta["scope"] == "project" and new_meta["project_id"] == "p1"
 
     def test_clearing_project_id_flips_flexible_scope_to_global(self, service):
@@ -1134,7 +1133,7 @@ class TestPatchMemory:
                           "edges_expired": 0, "nodes_removed": 0, "summaries_cleared": 0}
         )
         result = service.patch_memory("m1", "ehfaz", {"project_id": None})
-        new_meta = service._memory.vector_store.client.set_payload.call_args.kwargs["payload"]["metadata"]
+        new_meta = service._memory.vector_store.client.set_payload.call_args_list[0].kwargs["payload"]
         assert new_meta["scope"] == "global" and new_meta["project_id"] is None
         # private user--ehfaz--project--neuralscape → user--ehfaz: partition moved
         assert result["graph"] == "migration_pending"
@@ -1252,8 +1251,8 @@ class TestRetagMemories:
             {"add_tags": ["project:bon002"], "remove_tags": ["old-tag"]},
         )
         assert result["matched"] == 2 and result["updated"] == 2
-        payloads = [c.kwargs["payload"]["metadata"] for c in
-                    service._memory.vector_store.client.set_payload.call_args_list]
+        payloads = [c.kwargs["payload"] for c in
+                    service._memory.vector_store.client.set_payload.call_args_list[0::2]]   # per row: metadata call, text call
         assert payloads[0]["tags"] == ["project:bon002"]
         assert payloads[1]["tags"] == ["keep", "project:bon002"]
         assert result["graph_jobs"] == []  # no project change → no graph work

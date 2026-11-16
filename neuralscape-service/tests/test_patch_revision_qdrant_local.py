@@ -212,3 +212,28 @@ def test_I4_a_crash_leaves_a_marker_and_repair_converges_on_the_real_engine(worl
     out = world.repair_stale_vectors(min_age_s=0)
     assert out["repaired"] == 1
     assert _vector(world) == pytest.approx(_unit(_embed("crashed"))) and _payload(world).get("vector_pending") is None
+
+
+def test_a_nested_writer_that_does_not_bump_the_revision_is_not_erased_by_the_edit(world, monkeypatch):
+    """Real engine: ``graph_episode_uuid`` lands between the edit's read and its CAS; the CAS writes only its delta."""
+    real = world.client.set_payload
+    state = {"armed": True}
+
+    def interleaved(collection_name, payload, points, key=None):
+        if state["armed"]:
+            state["armed"] = False
+            real(collection_name, payload={"graph_episode_uuid": "ep-meanwhile"}, points=[world.pid], key="metadata")
+        return real(collection_name, payload=payload, points=points, key=key)
+
+    monkeypatch.setattr(world.client, "set_payload", interleaved)
+    world.patch_memory(world.pid, "u", {"tags": ["x"]}, expected_revision="0")
+    meta = _payload(world)["metadata"]
+    assert meta["tags"] == ["x"] and meta["revision"] == 1
+    assert meta["graph_episode_uuid"] == "ep-meanwhile"
+    assert meta["owner_user_id"] == "u" and meta["visibility"] == "private"      # untouched keys intact
+
+
+def test_a_removed_key_is_written_as_null_on_the_real_engine(world):
+    world.patch_memory(world.pid, "u", {"project_id": "p1", "category": "tech_stack"}, expected_revision="0")
+    world.patch_memory(world.pid, "u", {"project_id": None, "category": "personal_fact"}, expected_revision="1")
+    assert _payload(world)["metadata"].get("project_id") is None

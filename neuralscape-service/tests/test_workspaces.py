@@ -221,8 +221,7 @@ def test_workspace_retag_operation(service):
 
     # The row was rewritten with the new workspace stamp.
     set_payload = service._memory.vector_store.client.set_payload   # the filter-scoped compare-and-set
-    set_payload.assert_called_once()
-    assert set_payload.call_args.kwargs["payload"]["metadata"]["workspace"] == "ref-migrated"
+    assert set_payload.call_args_list[0].kwargs["payload"]["workspace"] == "ref-migrated"   # nested metadata delta
 
 
 def _qhit(mid, data, metadata, score=0.9):

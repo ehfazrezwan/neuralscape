@@ -13,6 +13,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+import memory.edit as edit_module
 from memory.edit import RevisionConflict, normalize_expected_revision, revision_of
 from memory_service import MemoryService
 
@@ -58,6 +59,8 @@ def _eval(flt, pid, payload) -> bool:
     if any(not _match(c, pid, payload) for c in (flt.must or [])):
         return False
     if flt.should and not any(_match(c, pid, payload) for c in flt.should):
+        return False
+    if any(_match(c, pid, payload) for c in (flt.must_not or [])):
         return False
     return True
 
@@ -478,3 +481,126 @@ def test_retag_skips_a_row_a_patch_changed_since_the_scroll(world):
     world.fake.scroll = scroll_then_patch
     out = world.retag_memories("ehfaz", {"category": "personal_fact"}, {"add_tags": ["bulk"]})
     assert out["skipped_busy_ids"] == [M1] and _tags(world) == ["patched-meanwhile"]
+
+
+# ── review round on #531 ───────────────────────────────────────────────
+
+
+def test_a_vector_sync_failure_after_the_commit_still_runs_the_cascade_and_answers_success(world):
+    """Fault injection: the 3rd ``retrieve`` (inside the vector sync) raises AFTER the text CAS committed."""
+    real = world.fake.retrieve
+    calls = {"n": 0}
+
+    def flaky(collection_name, ids, with_payload=True, with_vectors=False):
+        calls["n"] += 1
+        if calls["n"] == 3:
+            raise ConnectionError("qdrant blip")
+        return real(collection_name, ids, with_payload, with_vectors)
+
+    world.fake.retrieve = flaky
+    out = world.patch_memory(M1, "ehfaz", {"content": "committed text"}, expected_revision="0")   # must NOT raise
+    assert out["graph"] == "reingest_pending" and out["graph_job"]["content"] == "committed text"
+    world._cascade_rows_once.assert_called()                                  # the graph work still ran
+    point = world.fake.points[M1]
+    assert point["data"] == "committed text" and point["metadata"]["revision"] == 1
+    assert point["vector_pending"] is True                                    # left for repair
+
+
+def test_the_metadata_write_is_a_nested_delta_so_an_interleaved_nested_writer_is_not_erased(world):
+    def nested_writer(fake):
+        fake.points[M1]["metadata"]["graph_episode_uuid"] = "ep-written-meanwhile"   # no revision bump
+
+    world.fake.before_filtered_write = nested_writer
+    world.patch_memory(M1, "ehfaz", {"tags": ["x"]}, expected_revision="0")
+    meta = world.fake.points[M1]["metadata"]
+    assert meta["tags"] == ["x"] and meta["revision"] == 1
+    assert meta["graph_episode_uuid"] == "ep-written-meanwhile"                # survived: the CAS wrote only its delta
+
+
+def test_a_removed_key_is_written_as_null_not_left_stale(world):
+    world.fake.points[M1]["metadata"]["domain"] = "work"
+    world.patch_memory(M1, "ehfaz", {"domain": None}, expected_revision="0")
+    assert world.fake.points[M1]["metadata"].get("domain") is None
+
+
+def test_text_is_written_only_after_the_metadata_cas_applied_so_a_rejected_edit_leaks_no_text(world):
+    def interloper(fake):
+        fake.points[M1]["metadata"]["revision"] = 1
+
+    world.fake.before_filtered_write = interloper
+    with pytest.raises(RevisionConflict):
+        world.patch_memory(M1, "ehfaz", {"content": "must not land"}, expected_revision="0")
+    assert world.fake.points[M1]["data"] == "Old content"
+    assert not any(w == f"update_vectors:{M1}" for w in world.fake.writes)
+
+
+def test_a_writer_stalled_before_its_vector_write_adopts_the_later_text_and_reasserts_the_marker(world):
+    """A stalled A calls the vector sync after B already finished and cleared the marker."""
+    world.patch_memory(M1, "ehfaz", {"content": "B's text"}, expected_revision="0")
+    assert world.fake.points[M1].get("vector_pending") is None                 # B finished: marker clean
+    order = []
+    real_set, real_vec = world.fake.set_payload, world.fake.update_vectors
+    world.fake.set_payload = lambda *a, **k: (order.append(("set", dict(k.get("payload", {})))), real_set(*a, **k))[1]
+    world.fake.update_vectors = lambda *a, **k: (order.append(("vec", None)), real_vec(*a, **k))[1]
+    ok = world._sync_vector(world._memory, M1, "A's stale text", world.fake.embed("A's stale text", "update"), 0, "metadata")
+    assert ok is True
+    first_vec = next(i for i, (kind, _) in enumerate(order) if kind == "vec")
+    assert any(kind == "set" and p.get("vector_pending") is True for kind, p in order[:first_vec])   # re-asserted BEFORE writing
+    assert world.fake.vectors[M1] == world.fake.embed("B's text", "update")     # never A's stale vector
+    assert world.fake.points[M1].get("vector_pending") is None
+
+
+def test_repair_also_fixes_a_row_whose_vector_revision_lags_its_revision_without_a_marker(world):
+    world.patch_memory(M1, "ehfaz", {"content": "newer"}, expected_revision="0")
+    world.patch_memory(M1, "ehfaz", {"tags": ["x"]}, expected_revision="1")      # revision 2; vector_revision still 1
+    point = world.fake.points[M1]
+    point["vector_revision"] = 1
+    world.fake.vectors[M1] = [9.0, 9.0, 0.0, 0.0]                                 # stale vector, marker clean
+    out = world.repair_stale_vectors(min_age_s=0)
+    assert out["repaired"] == 1
+    assert world.fake.vectors[M1] == world.fake.embed("newer", "update") and point["vector_revision"] == 2
+
+
+def test_repair_stops_retrying_a_persistently_failing_row(world):
+    world.fake.before_vector_write = None
+    real = world.fake.update_vectors
+
+    def always_fail(collection_name, points):
+        raise ConnectionError("down")
+
+    world.fake.update_vectors = always_fail
+    world.patch_memory(M1, "ehfaz", {"content": "x"}, expected_revision="0")
+    for _ in range(7):
+        world.repair_stale_vectors(min_age_s=0, max_attempts=3)
+    assert world.fake.points[M1]["vector_repair_attempts"] == 3                   # stopped being scanned after the budget
+    world.fake.update_vectors = real
+    assert world.repair_stale_vectors(min_age_s=0, max_attempts=3)["scanned"] == 0
+
+
+def test_bm25_is_encoded_from_the_lemmatized_text_like_mem0_and_none_leaves_the_marker(world, monkeypatch):
+    from mem0.utils.lemmatization import lemmatize_for_bm25
+
+    encoded = []
+    world._memory.vector_store._has_bm25_slot = True
+    world._memory.vector_store._encode_bm25.side_effect = lambda text: (encoded.append(text), object())[1]
+    monkeypatch.setattr("qdrant_client.models.PointVectors", lambda id, vector: SimpleNamespace(id=id, vector={"": vector[""]}))
+    world.patch_memory(M1, "ehfaz", {"content": "Dogs were running quickly"}, expected_revision="0")
+    assert encoded == [lemmatize_for_bm25("Dogs were running quickly")]
+
+    world._memory.vector_store._encode_bm25.side_effect = lambda text: None      # encoder unavailable
+    world.patch_memory(M1, "ehfaz", {"content": "another text"}, expected_revision="1")
+    assert world.fake.points[M1]["vector_pending"] is True                        # left for repair, not cleared
+
+
+_ORIGINAL_REDIS_CLIENT = edit_module._redis_client      # captured before the autouse fixture swaps the seam
+
+
+def test_one_shared_redis_client_is_reused(monkeypatch):
+    import redis
+
+    created = []
+    monkeypatch.setattr(edit_module, "_REDIS", None)
+    monkeypatch.setattr(redis.Redis, "from_url", staticmethod(lambda *a, **k: created.append(1) or object()))
+    a = _ORIGINAL_REDIS_CLIENT()
+    b = _ORIGINAL_REDIS_CLIENT()
+    assert a is b and len(created) == 1
