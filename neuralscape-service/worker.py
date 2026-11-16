@@ -270,8 +270,12 @@ async def process_memory_raw(
     # vector_only (audit 27 #12): this is an internal near-dupe probe — it
     # must not pay the graph pass + edge enrichment of a full hybrid recall,
     # and must not pollute the dreaming recall traces.
+    # The probe searches the memory workspace only, so a write into a reference
+    # workspace skips it (store_raw's own dedup key includes the workspace);
+    # otherwise identical text in the memory workspace would swallow the write.
+    _workspace = v2_extras.get("workspace")
     try:
-        existing = service.search(
+        existing = [] if _workspace not in (None, "memory") else service.search(
             query=content,
             user_id=user_id,
             project_id=project_id,
@@ -327,6 +331,7 @@ async def process_memory_raw(
         sensitivity_override=v2_extras.get("sensitivity_override", False),
         memory_kind=v2_extras.get("memory_kind"),
         source_ref=v2_extras.get("source_ref"),
+        workspace=v2_extras.get("workspace"),
         add_to_graph=False,
         return_created=True,
     )
@@ -345,7 +350,9 @@ async def process_memory_raw(
         # Plain dedup hit: not re-enriched, but check whether the graph has
         # since gone stale for this row (flagged: GRAPH_SUPERSESSION_ENABLED).
         await _enqueue_stale_graph_check(ctx, memories[0], content, user_id, project_id)
-    if (created or revived) and memories:
+    # Reference-workspace rows are vector-only everywhere else (no graph
+    # episode, no extraction LLM), so a raw write into one is not graph-enriched.
+    if (created or revived) and memories and _workspace in (None, "memory"):
         mem = memories[0]
         try:
             await ctx["redis"].enqueue_job(
