@@ -23,7 +23,8 @@ from datetime import datetime, timezone
 
 from adapters import require_adapter
 from ingest.chunking_strategies import get_chunking_strategy
-from ingest.extractors import get_extractor
+from ingest.extractors import DefaultExtractor, get_extractor
+from ingest.modality import MODALITY_INFERRED_LEVEL, ModalitySource, modality_upgraded  # noqa: F401 (re-exported)
 from schemas import (
     GLOBAL_CATEGORIES,
     PROJECT_CATEGORIES,
@@ -222,9 +223,13 @@ def ingest_document(service, doc: IngestDoc) -> dict:
         evidence_kwargs = (
             {"category_evidence": category_evidence} if _settings.hybrid_extraction_enabled else {}
         )
+        extractor = get_extractor(adapter.extractor)
+        # Modality post-check (#444): only for the default extractor, judged on the RESOLVED
+        # extractor (an unknown name falls back to it). Built once per document.
+        modality_source = ModalitySource(doc.content) if type(extractor) is DefaultExtractor else None
         facts = service.extract_facts_only(
             doc.content,
-            extractor=get_extractor(adapter.extractor),
+            extractor=extractor,
             user_id=doc.user_id,
             project_id=doc.project_id,
             **evidence_kwargs,
@@ -245,7 +250,11 @@ def ingest_document(service, doc: IngestDoc) -> dict:
                     # Distilled facts restate what the document says directly
                     # → epistemically "explicit" (A1). Verbatim passages carry
                     # no level (they're source text, not extracted claims).
-                    epistemic_level="explicit",
+                    epistemic_level=(
+                        MODALITY_INFERRED_LEVEL
+                        if modality_source is not None and modality_upgraded(content, modality_source)
+                        else "explicit"
+                    ),
                     visibility=doc.visibility,
                     sensitivity_override=doc.sensitivity_override,
                     memory_kind="fact",

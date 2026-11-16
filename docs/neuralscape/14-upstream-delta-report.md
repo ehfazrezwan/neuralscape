@@ -46,6 +46,7 @@ The saga lifecycle, `reference_time` edge field, extraction/dedup prompt patches
 | `mem0/mem0/graphs/configs.py` | `graphiti_llm_small_model` and related config fields for the Graphiti graph store |
 | `mem0/mem0/memory/graphiti_memory.py` | the adapter itself (above) |
 | `mem0/mem0/embeddings/openai.py`, `mem0/mem0/configs/embeddings/base.py` | `embedding_batch_size`: chunk size and per-item fallback for OpenAI-compatible endpoints that accept one input per request |
+| `mem0/mem0/vector_stores/qdrant.py`, `mem0/mem0/configs/vector_stores/qdrant.py` | `timeout`: per-request timeout forwarded to `QdrantClient` (service setting `QDRANT_TIMEOUT`, default 30 s; qdrant-client's own default is about 5 s) |
 | `mem0/mem0/utils/factory.py` | adds `GraphStoreFactory`, marked `NEURALSCAPE PATCH` above the class |
 
 - **Fork environment knob:** `GRAPHITI_BRIDGE_TIMEOUT_S` (documented in `.env.example`) bounds one `_AsyncBridge.run` call; default 960 s, above the 900 s graph/ingest worker `job_timeout`. Before the patch the wait was unbounded.
