@@ -316,7 +316,9 @@ class DeleteMixin:
         delete — they're team artifacts and one user shouldn't be able
         to wipe team knowledge with a sweep call (which an LLM client
         can trigger via the MCP tool). Pass ``include_shared=True`` to
-        also delete the caller's shared writes (admin-style nuke).
+        also delete the caller's OWN shared writes, row by row through the same
+        graph cascade. It never deletes another user's rows or ``standard``
+        rows, and never uses mem0 ``delete_all``.
 
         Every sweep erases the caller's tombstoned rows (dreaming / semantic-dedup
         / supersession tombstones) like any other row, under the same
@@ -330,25 +332,16 @@ class DeleteMixin:
         has_any_filter = scope or category or project_id or filter_null_category
         if not has_any_filter:
             if include_shared:
-                # Caller explicitly asked to remove everything they wrote,
-                # including shared. Use mem0's bulk delete + the full
-                # graph cleanup that touches per-memory edges in shared
-                # groups too.
+                # Explicit opt-in: remove the caller's OWN private AND shared
+                # rows, row by row through the same provenance cascade the
+                # private path uses. Never mem0 ``delete_all`` (it also erased
+                # the caller's ``standard`` rows and skipped the per-row
+                # cascade); never another user's rows; never ``standard`` rows.
                 logger.warning(
-                    f"Deleting ALL memories for user={user_id} including "
-                    f"shared writes (include_shared=True)"
+                    f"Deleting ALL private + own shared memories for user={user_id} "
+                    f"(include_shared=True; standard rows preserved)"
                 )
-                unresolved_ids: list[str] = []
-                if self._graphiti and self._bridge:
-                    # strict: if the user's rows cannot be listed the graph
-                    # cleanup cannot run — refuse BEFORE delete_all rather than
-                    # delete the vectors and silently leave their graph facts live.
-                    unresolved_ids = self._expire_user_graph_writes(user_id, strict=True)
-                m.delete_all(user_id=user_id)
-                return {
-                    "message": "All memories deleted (including shared)",
-                    "graph_cascade_unresolved_ids": unresolved_ids,
-                }
+                return self._delete_private_only(user_id, include_shared=True)
 
             # Default: remove only private writes. Shared memories stay.
             logger.warning(
@@ -542,8 +535,14 @@ class DeleteMixin:
             **self._graph_repair_summary(batch),
         }
 
-    def _delete_private_only(self, user_id: str) -> dict:
+    def _delete_private_only(self, user_id: str, include_shared: bool = False) -> dict:
         """Delete every PRIVATE memory the user owns; leave shared writes alone.
+
+        ``include_shared=True`` (the explicit opt-in) also deletes the caller's
+        OWN shared rows through the same per-row cascade. ``standard`` rows are
+        always preserved and a shared row whose ``metadata.owner_user_id`` names
+        someone else is never touched. The shared group is never bulk-expired
+        (other writers' edges live there): only the per-row cascade runs for it.
 
         Used by the default (non-include_shared) unfiltered bulk-delete
         path. Scrolls the user's full set, partitions by visibility,
@@ -571,6 +570,7 @@ class DeleteMixin:
         private_rows: list[tuple[str, dict, dict]] = []
         private_groups: set[str] = set()
         row_groups: dict[str, str] = {}
+        shared_ids: set[str] = set()
         shared_preserved = 0
         standard_preserved = 0
         for mem in all_memories:
@@ -580,12 +580,17 @@ class DeleteMixin:
                 metadata = metadata["metadata"]
             visibility = metadata.get("visibility") or MemoryVisibility.PRIVATE.value
             if visibility == MemoryVisibility.SHARED.value:
-                shared_preserved += 1
+                owner = metadata.get("owner_user_id")
+                if not include_shared or (owner and owner != user_id):
+                    shared_preserved += 1
+                    continue
+                shared_ids.add(mem["id"])
+                private_rows.append((mem["id"], payload, metadata))
                 continue
             if visibility == MemoryVisibility.STANDARD.value:
-                # Authoritative tier is never collateral of a private-only
-                # wipe — standards are removed only through the explicit,
-                # dictator-gated delete paths.
+                # Authoritative tier is never collateral of a bulk wipe, with or
+                # without include_shared — standards are removed only through
+                # the explicit, dictator-gated delete paths.
                 standard_preserved += 1
                 continue
             private_rows.append((mem["id"], payload, metadata))
@@ -619,7 +624,7 @@ class DeleteMixin:
         # statement per call, not a per-edge write loop) — only AFTER the vector
         # deletes and only for groups whose rows ALL went: a row that failed to
         # delete is still live in Qdrant and must keep its graph facts.
-        failed_groups = {row_groups[f] for f in failed_ids}
+        failed_groups = {row_groups[f] for f in failed_ids if f in row_groups}
         clean_groups = sorted(private_groups - failed_groups)
         if self._graphiti and self._bridge and clean_groups:
             try:
@@ -642,11 +647,18 @@ class DeleteMixin:
                 for mid, payload, metadata in private_rows
                 if mid in deleted_ids      # a row that failed to delete is still live: no graph state is touched for it
             ],
-            "private-only",
+            "private+shared" if include_shared else "private-only",
             deleted_ids=deleted_ids,
         )
 
-        msg = f"Deleted {deleted} private memories" + _tombstones_note(tombstones_erased)
+        if include_shared:
+            shared_deleted = len(shared_ids & deleted_ids)
+            msg = (
+                f"Deleted {deleted} memories (including {shared_deleted} shared)"
+                + _tombstones_note(tombstones_erased)
+            )
+        else:
+            msg = f"Deleted {deleted} private memories" + _tombstones_note(tombstones_erased)
         if shared_preserved:
             msg += f" (preserved {shared_preserved} shared)"
         if standard_preserved:
