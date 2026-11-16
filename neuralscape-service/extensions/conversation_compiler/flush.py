@@ -86,23 +86,18 @@ def mirror_to_vault(
     return resolved == MemoryVisibility.SHARED
 
 
-def _is_extracted(memory) -> bool:
-    """Whether a row returned by ``extract_and_store`` came from conversation extraction.
+def _is_shared(memory, *, created: bool) -> bool:
+    """Whether a row returned by the flush's extraction may reach the vault.
 
-    The extraction path stamps ``epistemic_level="explicit"`` on the rows it
-    writes (and the dedup-survivor lookup returns it); an explicit raw write
-    carries no epistemic level unless its caller supplies one. A turn that
-    dedups onto an explicit raw row therefore keeps that row's own visibility.
+    ``created`` is True only for rows THIS extraction created. The others are
+    content-hash dedup survivors: pre-existing rows (possibly an explicit
+    private write of the same text) that decide by their own stored
+    visibility, exactly like any explicit row.
     """
-    return getattr(memory, "epistemic_level", None) == "explicit"
-
-
-def _is_shared(memory) -> bool:
-    """Whether a stored memory returned by the flush's extraction may reach the vault."""
     return mirror_to_vault(
         getattr(memory, "category", "") or "",
         getattr(memory, "visibility", None),
-        extracted=_is_extracted(memory),
+        extracted=created,
         sensitivity=getattr(memory, "sensitivity", None),
     )
 
@@ -155,17 +150,21 @@ async def flush_conversation_turn(
     # extraction guidance (per-project + per-user) is resolved inside it, as
     # for every other conversation write.
     try:
-        stored = await asyncio.to_thread(
+        result = await asyncio.to_thread(
             service.extract_and_store,
             messages=_turn_messages(user_message, assistant_response),
             user_id=user_id,
             project_id=project_id,
             run_id=session_id,
             occurred_at=_event_time(timestamp),
+            return_stats=True,
         )
     except Exception:
         logger.exception("Conversation extraction failed")
         return FlushResult(session_id=session_id, timestamp=ts)
+
+    stored, stats = result if isinstance(result, tuple) else (result, {})
+    created_ids = set((stats or {}).get("created_ids") or [])
 
     if not stored:
         logger.info("No facts extracted from conversation turn", session_id=session_id)
@@ -186,7 +185,7 @@ async def flush_conversation_turn(
     category_paths: list[str] = []
     shared_facts: list[ExtractedFact] = []
     for memory, fact in zip(stored, facts):
-        if not _is_shared(memory):
+        if not _is_shared(memory, created=getattr(memory, "id", "") in created_ids):
             continue
         shared_facts.append(fact)
         try:

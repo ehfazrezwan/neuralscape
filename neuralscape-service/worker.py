@@ -122,6 +122,7 @@ async def process_memory_store(
         occurred_at=occurred_at,
         return_stats=True,
     )
+    created_ids = set(extraction_stats.get("created_ids") or [])
 
     # Emit memory_stored events so extensions (e.g. conversation-compiler) can write to vault
     registry = ctx.get("extension_registry")
@@ -142,7 +143,10 @@ async def process_memory_store(
                 # Conversation-extracted rows: the vault mirror decides by the
                 # category's tier (not the private stamp) unless the sensitivity
                 # gate forced them private. See extensions/conversation_compiler.
-                "extracted": True,
+                # Only rows THIS extraction created count as extracted; a
+                # dedup survivor is a pre-existing row (possibly an explicit
+                # private write) and keeps its own stored visibility.
+                "extracted": getattr(mem, "id", "") in created_ids,
                 "sensitivity": getattr(mem, "sensitivity", None),
                 "source": "worker",
             })

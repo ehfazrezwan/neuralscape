@@ -8,6 +8,7 @@ never mirrored; explicit writes behave exactly as before.
 """
 
 import json
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -34,9 +35,12 @@ def writer(tmp_path):
     return ObsidianWriter(vault_path=tmp_path / "vault")
 
 
-async def _flush(writer, rows):
+async def _flush(writer, rows, created=None):
+    """Flush a turn whose extraction returned ``rows``; ``created`` = rows this extraction created
+    (default: all of them; the rest are dedup survivors)."""
+    created = rows if created is None else created
     svc = MagicMock()
-    svc.extract_and_store.return_value = rows
+    svc.extract_and_store.return_value = (rows, {"created_ids": [r.id for r in created]})
     return await flush_conversation_turn(
         user_message="u", assistant_response="a", session_id="s", channel="api",
         timestamp="2026-05-15T12:00:00", project_id=None, user_id="alice", service=svc, writer=writer,
@@ -91,9 +95,23 @@ class TestExplicitWritesUnchanged:
 
     @pytest.mark.asyncio
     async def test_flush_dedup_onto_an_explicit_private_row_is_not_mirrored(self, writer):
-        # a turn that dedups onto an explicit raw private write returns THAT row (no epistemic level)
-        explicit = _row("decision", "Chose Qdrant", epistemic_level=None)
-        result = await _flush(writer, [explicit])
+        # the turn re-derived text an explicit private write already holds: the survivor is
+        # returned but was not created by this extraction, so it keeps its own (private) visibility
+        survivor = _row("decision", "Chose Qdrant")
+        result = await _flush(writer, [survivor], created=[])
+        assert result.category_paths == []
+
+    @pytest.mark.asyncio
+    async def test_flush_dedup_onto_an_explicit_shared_row_is_mirrored(self, writer):
+        survivor = _row("preference", "Likes tea", visibility="shared")
+        result = await _flush(writer, [survivor], created=[])
+        assert len(result.category_paths) == 1
+
+    @pytest.mark.asyncio
+    async def test_epistemic_level_is_not_an_extraction_marker(self, writer):
+        # a caller-supplied (or ingest-stamped) epistemic level on a private row is no licence to mirror it
+        row = _row("decision", "Chose Qdrant", epistemic_level="explicit")
+        result = await _flush(writer, [row], created=[])
         assert result.category_paths == []
 
 
@@ -148,3 +166,111 @@ async def test_extracted_row_stays_private_and_invisible_to_another_user():
     assert payload["metadata"]["visibility"] == "private"
     assert payload["metadata"]["owner_user_id"] == "alice"
     assert payload["user_id"] == "alice"  # another user's search filters on their own user_id
+
+
+# ── the worker path over rows from the real _batch_store_facts ─────────
+
+
+class _Registry:
+    def __init__(self, writer):
+        self.events = []
+        self._extensions = [SimpleNamespace(_writer=writer)]
+
+    async def emit_event(self, name, payload):
+        self.events.append((name, payload))
+
+
+def _real_service(survivors=None):
+    """A real MemoryService (real _batch_store_facts) over a fake store.
+
+    ``survivors`` maps content -> pre-existing row returned by the content-hash lookup.
+    """
+    survivors = survivors or {}
+    svc = MemoryService()
+    svc._memory = MagicMock()
+    svc._memory.embedding_model.embed_batch.side_effect = lambda texts, **kw: [[0.1] * 8 for _ in texts]
+    svc._graphiti = None
+    svc._bridge = None
+    svc._get_memory = MagicMock(return_value=svc._memory)
+
+    def find(user_id, content_hash, scope, **kw):
+        from memory.hashing import content_hash as ch
+
+        for text, row in survivors.items():
+            if ch(text) == content_hash:
+                return row
+        return None
+
+    svc._find_by_content_hash = find
+    svc._bump_times_derived = MagicMock()
+    svc._revive_if_tombstoned = MagicMock(return_value=False)
+    return svc
+
+
+def _llm(svc, lines):
+    client = MagicMock()
+    client.models.generate_content.return_value = MagicMock(text=json.dumps({"facts": lines}))
+    svc._genai_model = client
+
+
+async def _run_worker(svc, writer, monkeypatch):
+    import worker
+    from config import settings
+
+    monkeypatch.setattr(settings, "sensitivity_gate_enabled", True)
+    monkeypatch.setattr(settings, "extraction_require_speaker", False)
+    registry = _Registry(writer)
+    out = await worker.process_memory_store(
+        {"service": svc, "extension_registry": registry},
+        [{"role": "user", "content": "x"}, {"role": "assistant", "content": "y"}],
+        "alice",
+    )
+    return out, registry
+
+
+def _vault_text(tmp_path):
+    daily = list((tmp_path / "vault" / "_raw" / "Daily").glob("*.md")) if (tmp_path / "vault" / "_raw" / "Daily").exists() else []
+    return "\n".join(f.read_text() for f in daily)
+
+
+@pytest.mark.asyncio
+async def test_worker_mirrors_only_clean_shared_category_created_rows(writer, tmp_path, monkeypatch):
+    svc = _real_service()
+    _llm(svc, [
+        "[decision] We chose Qdrant for vector storage",
+        "[preference] Alice likes strong tea",
+        "[decision] The contractor rate is $150,000 per year, salary band confidential",
+    ])
+    ext = ConversationCompilerExtension()
+    ext._writer, ext._service = writer, MagicMock()
+    _, registry = await _run_worker(svc, writer, monkeypatch)
+
+    payloads = {p["content"]: p for _, p in registry.events}
+    assert payloads["We chose Qdrant for vector storage"]["extracted"] is True
+    assert payloads["We chose Qdrant for vector storage"]["visibility"] == "private"  # stays private
+    sensitive = next(p for c, p in payloads.items() if "salary" in c)
+    assert sensitive["sensitivity"] and sensitive["extracted"] is True
+
+    for _, payload in registry.events:
+        await ext._handle_memory_stored(payload)
+    vault = _vault_text(tmp_path)
+    assert "We chose Qdrant" in vault
+    assert "strong tea" not in vault  # private category
+    assert "salary band" not in vault  # sensitivity gate forced it private
+
+
+@pytest.mark.asyncio
+async def test_worker_dedup_onto_an_explicit_private_row_is_not_mirrored(writer, tmp_path, monkeypatch):
+    text = "We chose Qdrant for vector storage"
+    survivor = MemoryResponse(id="exp-1", memory=text, category="decision", visibility="private",
+                              owner_user_id="alice")
+    svc = _real_service({text: survivor})
+    _llm(svc, [f"[decision] {text}"])
+    ext = ConversationCompilerExtension()
+    ext._writer, ext._service = writer, MagicMock()
+    _, registry = await _run_worker(svc, writer, monkeypatch)
+
+    (payload,) = [p for _, p in registry.events]
+    assert payload["memory_id"] == "exp-1" and payload["extracted"] is False
+    await ext._handle_memory_stored(payload)
+    assert text not in _vault_text(tmp_path)
