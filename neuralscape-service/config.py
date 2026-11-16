@@ -468,8 +468,7 @@ class Settings(BaseSettings):
     # re-homes those ids' future graph writes: run
     # scripts/migrate_graph_groups.py --audit-delimiter-ids first. The read-side
     # call sites (memory/search.py narrowed branches, memory/reads.py
-    # list_projects, dreaming card/consolidate pool names) must adopt the
-    # builder before this is enabled.
+    # list_projects, dreaming card/consolidate pool names) use the same builder.
     graph_group_id_injective_enabled: bool = False
     # Bounded second-chance re-ask for false abstentions (T2.1): when the
     # normal answering loop produces an abstention AND at least one evidence
@@ -931,20 +930,6 @@ class Settings(BaseSettings):
         if backend not in ("sqlite", "postgres"):
             raise ValueError("LEDGER_BACKEND must be 'sqlite' or 'postgres'")
         return backend
-
-    @model_validator(mode="after")
-    def _refuse_injective_group_ids_until_read_side_adopted(self) -> "Settings":
-        # Fail closed: with this on, writes use nsg1-- names but the narrowed read
-        # branches (memory/search.py), list_projects (memory/reads.py) and the
-        # dreaming pool names still use legacy names, so reads would miss writes
-        # (and a '--' user id would query another user's legacy pool). Remove this
-        # guard in the PR that routes those call sites through the group-id builder.
-        if self.graph_group_id_injective_enabled:
-            raise ValueError(
-                "GRAPH_GROUP_ID_INJECTIVE_ENABLED cannot be enabled yet: the read-side call sites "
-                "have not adopted the injective group-id builder (tracked follow-up, lane read-10)"
-            )
-        return self
 
     @model_validator(mode="after")
     def _validate_ledger_target(self) -> "Settings":

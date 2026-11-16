@@ -1,5 +1,7 @@
 # ICEBench Report
 
+> **Status (as of 2026-11-16, dev 6a81341f):** historical. The raw measurement report from the ICE benchmark run of 2026-07-08, kept as a record. Do not quote its headline numbers without reading [the independent review](./ice-fable-review.md): the independent review found the `nl_locate` figure contaminated by docstring leakage, a wrong competitor number (an index cold-start that was a cache hit in most repetitions) and capability-matrix claims contradicted by the installed binary.
+
 **Harness:** ICEBench-v1
 **Date:** 2026-07-08
 **Machine:** ns-bench 8vCPU/31GB
