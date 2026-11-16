@@ -492,3 +492,28 @@ def test_sqlite_append_does_not_wait_past_its_budget_for_the_connection_lock(tmp
     finally:
         release.set()
         thread.join()
+
+
+def test_the_recorder_stays_inside_its_budget_while_another_connection_holds_a_real_sqlite_write_lock(tmp_path):
+    """The whole ``record()`` call (every retry, the waits between them, the gap count) must end inside the
+    recorder's budget while a second connection holds the database's write lock; once the lock is released
+    the missed event's count reaches the store with the next successful write."""
+    import time
+
+    path = str(tmp_path / "usage.db")
+    store = SqliteUsageStore(path, append_budget_s=5.0)  # the recorder's budget is the tighter bound
+    recorder = uc.DurableUsageRecorder(store, retries=3, retry_delay=0.05, record_budget_s=0.6)
+    other = sqlite3.connect(path, isolation_level=None)
+    other.execute("BEGIN IMMEDIATE")  # a second writer holds the write lock for the whole call
+    try:
+        started = time.monotonic()
+        assert recorder.record(event("e1", task="task-1")) is False
+        elapsed = time.monotonic() - started
+    finally:
+        other.execute("ROLLBACK")
+        other.close()
+    assert elapsed < 0.6 + 0.4, elapsed
+    assert recorder.unrecorded == {(TENANT, "task-1"): 1}
+    assert store._conn.execute("PRAGMA busy_timeout").fetchone()[0] == 30_000  # restored after the bounded waits
+    assert recorder.record(event("e2", task="task-1")) is True  # the lock is gone: stored, and the gap flushed
+    assert recorder.unrecorded == {} and store.gaps(TENANT, "task-1") == 1

@@ -56,7 +56,13 @@ SUPERSEDED_EPISODES_KEY = "graph_episode_superseded"
 REENRICH_PENDING_KEY = "graph_reenrich_pending"
 REENRICH_PENDING_AT_KEY = "graph_reenrich_pending_at"  # epoch seconds the marker was set (the sweep waits out a live job)
 REENRICH_ATTEMPTS_KEY = "graph_reenrich_sweep_attempts"  # failed sweep dispatches of this marker (the cap stops them)
-SWEEP_MAX_ATTEMPTS = 5  # a row that failed this many sweeps keeps its marker but is no longer retried by the sweep
+SWEEP_MAX_ATTEMPTS = 5  # a row that failed this many sweeps moves to the slow lane (below); its marker stays
+# Slow lane for rows past the cap: retried only after a backoff that doubles with each further failure (a graph or
+# provider outage that outlasts the five fast tries must not strand the survivor's facts for good), and at most
+# SWEEP_CAPPED_PER_RUN of them per run, on top of ``limit``, so they never take a slot from a row still in the fast lane.
+SWEEP_CAPPED_BACKOFF_S = 3600.0
+SWEEP_CAPPED_BACKOFF_MAX_S = 86400.0
+SWEEP_CAPPED_PER_RUN = 1
 _METADATA_PARENTS = ("metadata", "metadata.metadata")  # a row may carry its metadata wrapped one level deeper
 _REENRICH_ATTEMPTS = 3  # re-enrichments of one row that a concurrent edit may invalidate in a row
 # The ledger job that re-enriches one memory into a fresh episode (see legacy_jobs).
@@ -644,14 +650,24 @@ class ProvenanceMixin:
         if capped:
             out["capped"] = capped
             logger.warning(
-                "Re-enrichment sweep gave up on %d memories after %d failed sweeps (graph_reenrich_pending stays "
-                "on the rows; the next write to each repairs it): %s",
+                "Re-enrichment sweep: %d memories failed %d sweeps and are retried at a slower pace "
+                "(graph_reenrich_pending stays on the rows; the next write to each repairs it too): %s",
                 len(capped), SWEEP_MAX_ATTEMPTS, capped,
             )
         due = sorted(
             (pid for pid, (_, tries, _w) in candidates.items() if tries < SWEEP_MAX_ATTEMPTS),
             key=lambda pid: (candidates[pid][0], pid),
         )[:limit]
+
+        def _backoff(tries: int) -> float:
+            return min(SWEEP_CAPPED_BACKOFF_S * 2 ** min(tries - SWEEP_MAX_ATTEMPTS, 10), SWEEP_CAPPED_BACKOFF_MAX_S)
+
+        # ``at`` of a failed row is the time of its last failed sweep, so "due" is a backoff since that failure.
+        slow = sorted(
+            (pid for pid in capped if now - candidates[pid][0] >= _backoff(candidates[pid][1])),
+            key=lambda pid: (candidates[pid][0], pid),
+        )[:SWEEP_CAPPED_PER_RUN]
+        due += slow
         for memory_id in due:
             try:
                 done = self.reenrich_memory_graph(memory_id)
@@ -709,6 +725,7 @@ class ProvenanceMixin:
             owner = meta.get("owner_user_id") or row.get("user_id", "")
             visibility = meta.get("visibility") or MemoryVisibility.PRIVATE.value
             snapshot = self._enrichment_snapshot(row, meta)
+            marked = bool(meta.get(REENRICH_PENDING_KEY))
             written: dict = {}
             outcome: dict = {}
             enriched = self.enrich_graph(
@@ -721,6 +738,7 @@ class ProvenanceMixin:
                 workspace=meta.get("workspace"),
                 outcome=outcome,
                 result_out=written,
+                keep_reenrich_marker=True,  # cleared below, only once the row has been verified
             )
             if not enriched:
                 raise RuntimeError(f"graph re-enrichment of {memory_id} did not complete")
@@ -747,6 +765,8 @@ class ProvenanceMixin:
                     "the episode written was removed; will be retried"
                 )
             if current is None or current == snapshot:
+                if marked and current is not None:
+                    self._clear_reenrich_pending(memory_id)  # verified: the new episode is the right one
                 return {"memory_ids": [memory_id]}
             # The row changed under the enrichment: its text or its audience is no longer the one the
             # episode was written for (a shared episode of a row now private would stay readable).

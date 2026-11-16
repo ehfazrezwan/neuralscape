@@ -1348,6 +1348,7 @@ class WriteMixin:
         workspace: str | None = None,
         outcome: dict | None = None,
         result_out: dict | None = None,
+        keep_reenrich_marker: bool = False,
     ) -> bool:
         """Add content to the knowledge graph + attach memory_id back-refs.
 
@@ -1390,6 +1391,10 @@ class WriteMixin:
         ``GRAPH_DELETE_RACE_CLEANUP_ENABLED`` is on) is an out-parameter: when the memory's row was
         deleted while it was enriched and the episode just written has been removed here, it gets
         ``outcome["cleaned_up"] = True`` so the caller knows the cleanup is already resolved.
+
+        ``keep_reenrich_marker`` leaves the row's ``graph_reenrich_pending`` marker in place after the
+        write: the re-enrichment job verifies the row after the enrichment and clears the marker itself
+        only once that check passed (a failed check must find the marker still there for the sweep).
         """
         if not (self._graphiti and self._bridge):
             return False
@@ -1485,7 +1490,7 @@ class WriteMixin:
                     (memory_id,), [u for u in previous_episodes if u != episode_uuid], owner_user_id=user_id,
                 )
                 self._record_superseded_episodes(memory_id, previous_episodes, left)
-            if reenrich_pending and (episode_uuid or episode_name):
+            if reenrich_pending and (episode_uuid or episode_name) and not keep_reenrich_marker:
                 self._clear_reenrich_pending(memory_id)
             # Contradiction supersession (flag-gated, best-effort, never raises).
             self._maybe_supersede_contradicted(

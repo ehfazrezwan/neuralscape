@@ -272,3 +272,31 @@ def test_a_global_row_projected_before_the_scope_label_still_comes_back_through_
     switch = EngineSwitch(Router(), ledger=None, service=None, tenant_for=lambda user: "t")
     hits = switch.recall("alice", "q", 5, project_id="p1", visibility="private", include_global=True)
     assert [h.record_id for h in hits] == ["legacy-global"]
+
+
+def test_an_unlabelled_global_row_behind_more_than_four_times_the_limit_of_other_project_rows_is_found():
+    """Before: the legacy fallback was ``4 x limit`` deep over every project, so that many higher-scoring rows
+    of another project pushed a global row projected before the scope label out of it."""
+    from engine_adapters_switch import EngineSwitch, _FALLBACK_MAX_HITS, labels_for
+
+    limit = 5
+    legacy = ("owner:alice", "vis:private")  # a projection made before the scope label existed
+    rows = {f"other-{i}": (labels_for("alice", "private", "p2"), 0.99 - i / 1000) for i in range(4 * limit + 10)}
+    rows["legacy-global"] = (legacy, 0.2)
+    searches = []
+
+    class Router:
+        def route(self):
+            return "token"
+
+        def search(self, token, ctx, query, flt, n):
+            searches.append(n)
+            hits = [SimpleNamespace(record_id=rid, revision=1, score=score)
+                    for rid, (labels, score) in rows.items() if set(flt.labels_all) <= set(labels)]
+            return sorted(hits, key=lambda h: -h.score)[:n]
+
+    switch = EngineSwitch(Router(), ledger=None, service=None, tenant_for=lambda user: "t")
+    ids = [h.record_id for h in switch.recall("alice", "q", limit, project_id="p1", visibility="private",
+                                              include_global=True)]
+    assert "legacy-global" in ids
+    assert max(searches) == _FALLBACK_MAX_HITS  # the deeper search is bounded

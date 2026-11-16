@@ -490,7 +490,47 @@ class PostgresUsageStore(_SqlUsageStore):
             with contextlib.suppress(Exception):
                 conn.close()
 
-    def _ensure_connection(self) -> None:
+    def _connect_within(self, remaining: float) -> Any:
+        """Open and check a connection, giving up once ``remaining`` seconds are spent.
+
+        libpq floors ``connect_timeout`` at two seconds, so the driver's own timeout cannot honour a
+        smaller deadline: the attempt runs on a helper thread that is abandoned (and closes whatever
+        it opened) when the deadline passes first."""
+
+        outcome: dict[str, Any] = {}
+        done = threading.Event()
+        abandoned = threading.Event()
+
+        def attempt() -> None:
+            try:
+                conn = self._open_connection(min(self._connect_timeout, 2))
+                try:
+                    self._assert_durable_settings(conn)
+                except BaseException:
+                    with contextlib.suppress(Exception):
+                        conn.close()
+                    raise
+                outcome["conn"] = conn
+            except BaseException as error:  # handed to the caller, which re-raises it
+                outcome["error"] = error
+            finally:
+                done.set()
+                if abandoned.is_set() and outcome.get("conn") is not None:
+                    with contextlib.suppress(Exception):
+                        outcome["conn"].close()
+
+        threading.Thread(target=attempt, name="usage-store-reconnect", daemon=True).start()
+        if not done.wait(max(0.0, remaining)):
+            abandoned.set()
+            if done.is_set() and outcome.get("conn") is not None:  # finished between the wait and the flag
+                with contextlib.suppress(Exception):
+                    outcome["conn"].close()
+            raise UsageStoreError("usage store reconnect did not finish within the remaining budget")
+        if "error" in outcome:
+            raise outcome["error"]
+        return outcome["conn"]
+
+    def _ensure_connection(self, deadline: float | None = None) -> None:
         conn = self._conn
         if conn is not None and not getattr(conn, "closed", False) and not getattr(conn, "broken", False):
             return
@@ -499,8 +539,11 @@ class PostgresUsageStore(_SqlUsageStore):
             raise UsageStoreError("usage store unavailable: reconnect is backing off")
         self._drop_connection()
         try:
-            conn = self._open_connection(min(self._connect_timeout, 2))
-            self._assert_durable_settings(conn)
+            if deadline is None:
+                conn = self._open_connection(min(self._connect_timeout, 2))
+                self._assert_durable_settings(conn)
+            else:
+                conn = self._connect_within(deadline - now)
         except Exception:
             self._retry_after = now + self._reconnect_cooldown_s
             raise
@@ -512,8 +555,8 @@ class PostgresUsageStore(_SqlUsageStore):
         return sql.replace("?", "%s")
 
     @contextlib.contextmanager
-    def _txn(self) -> Iterator[Any]:
-        self._ensure_connection()
+    def _txn(self, deadline: float | None = None) -> Iterator[Any]:
+        self._ensure_connection(deadline)
         try:
             with self._conn.transaction():
                 yield self._conn
@@ -544,7 +587,7 @@ class PostgresUsageStore(_SqlUsageStore):
             try:
                 budget_ms = max(100, int((deadline - self._monotonic()) * 1000))
                 try:
-                    with self._txn() as c:
+                    with self._txn(deadline) as c:
                         c.execute(
                             "SELECT set_config('statement_timeout', %s, true),"
                             " set_config('lock_timeout', %s, true)",

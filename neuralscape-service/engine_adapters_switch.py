@@ -50,6 +50,9 @@ from engine_routing import (
 logger = logging.getLogger("neuralscape.engine_switch")
 
 _GLOBAL_OVERFETCH = 4  # depth of the project-free leg of a routed project recall, in multiples of the limit
+# Hard bound on the legacy project-free fallback of a routed project recall (see ``EngineSwitch.recall``): when
+# the first, ``4 x limit`` deep window comes back full, one deeper search of this many hits runs per pool.
+_FALLBACK_MAX_HITS = 512
 CANONICAL_PAGE_SIZE = 500  # ledger rows read per page by a catch-up or backfill
 
 
@@ -310,6 +313,11 @@ class EngineSwitch:
         project) do not, so ``include_global`` adds a second, project-free search per pool and
         returns the union: the project-free search is restricted to the ``scope:global`` label (in the engine,
         before its limit).  The caller keeps only rows of the project or of global scope.
+
+        A projection made before the scope label existed carries no ``scope:global`` label.  When the
+        label leg is short of its limit the old project-free search runs too, ``4 x limit`` deep and, if that
+        window is full, once more ``_FALLBACK_MAX_HITS`` deep.  An unlabelled global row ranked deeper than
+        that is not found (projecting the row again, as an edit does, labels it).
         """
 
         tenant_id = self._tenant_for(user_id)
@@ -345,13 +353,19 @@ class EngineSwitch:
                     # Projections made before the scope label existed carry none: a leg short of its limit
                     # may be missing such rows, so the old project-free search runs too.  Its rows only
                     # follow the primary ones (they may belong to other projects; hydration drops those).
-                    _search(fallback, labels, limit * _GLOBAL_OVERFETCH)
+                    window = limit * _GLOBAL_OVERFETCH
+                    first = _search(fallback, labels, window)
+                    if len(first) >= window and _FALLBACK_MAX_HITS > window:
+                        # The window came back full: an unlabelled global row may rank behind more than
+                        # ``4 x limit`` rows of other projects.  One deeper search, to a hard bound, looks
+                        # for it (hydration drops every row that is not the project's or global).
+                        _search(fallback, labels, _FALLBACK_MAX_HITS)
         ordered = sorted(primary.values(), key=lambda h: (-h.score, h.record_id))
         extra = sorted(
             (h for rid, h in fallback.items() if rid not in primary), key=lambda h: (-h.score, h.record_id)
         )
-        ordered += extra
-        return ordered[: limit * _GLOBAL_OVERFETCH if wide else limit]
+        ordered += extra[:_FALLBACK_MAX_HITS]
+        return ordered if wide else ordered[:limit]
 
     def recall_ready(self) -> tuple[bool, Optional[str]]:
         """Whether routed recall may serve: enabled, and the engine holds canonical state.

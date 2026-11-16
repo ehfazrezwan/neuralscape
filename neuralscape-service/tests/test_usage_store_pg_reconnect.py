@@ -201,3 +201,82 @@ def test_the_recorders_gap_memory_is_bounded_and_counts_what_it_drops():
     assert recorder.unrecorded[(TENANT, "task-0")] == 2
     recorder.flush_gaps()  # the store is still down: nothing is lost beyond the cap, nothing grows
     assert len(recorder.unrecorded) == 3
+
+
+def test_a_reconnect_is_bounded_by_the_remaining_budget_not_a_fixed_two_seconds(monkeypatch):
+    """Before: the reconnect always waited up to two seconds, so a dropped connection plus a database that
+    accepts connections slowly held the append (the provider-call thread) past its own budget."""
+    world = World()
+    store = make_store(world, monkeypatch, append_budget_s=0.3)
+    release = threading.Event()
+    real_connect = world.connect
+
+    def slow_connect(dsn, **kwargs):
+        release.wait(5)  # a database that does not answer
+        return real_connect(dsn, **kwargs)
+
+    world.connect = slow_connect
+    monkeypatch.setitem(__import__("sys").modules, "psycopg", world.module())
+    store._psycopg = world.module()
+    store._conn.killed = True  # the next statement finds the connection dead; the retry must reconnect
+    started = time.monotonic()
+    try:
+        with pytest.raises(usage_store.UsageStoreError, match="reconnect"):
+            store.append(event("e1"))
+        assert time.monotonic() - started < 1.0
+    finally:
+        release.set()
+
+
+def test_a_reconnect_that_finishes_after_its_deadline_is_closed_not_adopted(monkeypatch):
+    world = World()
+    store = make_store(world, monkeypatch, append_budget_s=0.2)
+    release = threading.Event()
+    real_connect = world.connect
+    opened = []
+
+    def slow_connect(dsn, **kwargs):
+        release.wait(5)
+        conn = real_connect(dsn, **kwargs)
+        opened.append(conn)
+        return conn
+
+    world.connect = slow_connect
+    store._psycopg = world.module()
+    store._conn.killed = True
+    with pytest.raises(usage_store.UsageStoreError):
+        store.append(event("e1"))
+    release.set()
+    deadline = time.monotonic() + 3
+    while not (opened and opened[0].closed) and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert opened and opened[0].closed and store._conn is None  # abandoned: closed, never installed
+
+
+def test_failed_flush_cycles_do_not_grow_the_gap_map_past_its_key_bound():
+    """Before: a flush claimed the whole map, so the emptied map admitted a fresh set of keys while the
+    claimed ones were in flight; both sets came back when the flush failed, and every cycle grew the map."""
+
+    class Down:
+        recorder = None
+
+        def append(self, event, **kw):
+            raise OperationalError("down")
+
+        def record_gap(self, *a, **kw):
+            # a new key is recorded while the flush holds the claimed ones (the flush then fails)
+            Down.recorder.record(event(f"during-{len(Down.recorder.unrecorded)}-{time.monotonic()}",
+                                       task=f"fresh-{Down.seq.__next__()}"))
+            raise OperationalError("down")
+
+    import itertools
+
+    Down.seq = itertools.count()
+    recorder = uc.DurableUsageRecorder(Down(), retries=0, sleep=lambda s: None, max_unrecorded_keys=3)
+    Down.recorder = recorder
+    for index in range(3):
+        recorder.record(event(f"seed-{index}", task=f"seed-{index}"))
+    for _ in range(4):
+        recorder.flush_gaps()
+        assert len(recorder.unrecorded) <= 3
+    assert recorder.gaps_overflowed > 0  # the new keys were counted as dropped, not silently admitted

@@ -274,7 +274,8 @@ def test_the_re_enrichment_job_reads_the_row_and_raises_when_enrichment_does_not
     monkeypatch.setattr(service, "enrich_graph", lambda **kw: calls.append(kw) or True)
     assert service.reenrich_memory_graph("m2") == {"memory_ids": ["m2"]}
     assert calls == [dict(content="fact two", user_id="u", project_id="p", visibility="private", memory_id="m2",
-                          occurred_at="t", workspace="ref", outcome={}, result_out={})]
+                          occurred_at="t", workspace="ref", outcome={}, result_out={},
+                              keep_reenrich_marker=True)]
     monkeypatch.setattr(service, "enrich_graph", lambda **kw: False)
     with pytest.raises(RuntimeError, match="did not complete"):
         service.reenrich_memory_graph("m2")
@@ -763,3 +764,103 @@ def test_a_single_delete_is_not_reported_resolved_while_a_superseded_episode_is_
         "results": {mid: {"resolved": True, "superseded_unresolved": ["ep-0"]}}, "graph_jobs": []})
     out = service.delete_memory(mid, "u")
     assert out["graph_cascade"] == "unresolved" and out["graph_superseded_unresolved"] == ["ep-0"]
+
+
+# ── third review round ──
+
+
+def test_a_row_past_the_attempt_cap_is_retried_slowly_and_repaired_once_the_outage_ends(service, monkeypatch):
+    """Before: five failed sweeps excluded the row for good, so an outage that outlasted them left the
+    survivor's graph facts absent after the outage ended."""
+    from types import SimpleNamespace
+
+    from memory import provenance
+    from memory.provenance import SWEEP_CAPPED_BACKOFF_S, SWEEP_MAX_ATTEMPTS
+
+    clock = [1000.0]
+    monkeypatch.setattr(provenance, "time", SimpleNamespace(time=lambda: clock[0]))
+    rows = _sweep_world(service, monkeypatch, n=1)
+    rows["m1"]["graph_reenrich_pending_at"] = 0.0
+    outage = [True]
+    ran = []
+
+    def run(mid):
+        ran.append(mid)
+        if outage[0]:
+            raise RuntimeError("graph down")
+        service._clear_reenrich_pending(mid)  # the enrichment clears its own marker once it verified the row
+        return {"memory_ids": [mid]}
+
+    monkeypatch.setattr(service, "reenrich_memory_graph", run)
+    for _ in range(SWEEP_MAX_ATTEMPTS):
+        service.sweep_pending_reenrichments(limit=2, min_age_s=0)
+    assert len(ran) == SWEEP_MAX_ATTEMPTS
+    service.sweep_pending_reenrichments(limit=2, min_age_s=0)
+    assert len(ran) == SWEEP_MAX_ATTEMPTS  # inside the backoff the capped row is left alone
+    clock[0] += SWEEP_CAPPED_BACKOFF_S + 1
+    service.sweep_pending_reenrichments(limit=2, min_age_s=0)
+    assert len(ran) == SWEEP_MAX_ATTEMPTS + 1  # one slow retry, which fails again and doubles the wait
+    clock[0] += SWEEP_CAPPED_BACKOFF_S + 1
+    service.sweep_pending_reenrichments(limit=2, min_age_s=0)
+    assert len(ran) == SWEEP_MAX_ATTEMPTS + 1
+    outage[0] = False  # the outage ends
+    clock[0] += SWEEP_CAPPED_BACKOFF_S * 2
+    out = service.sweep_pending_reenrichments(limit=2, min_age_s=0)
+    assert out["reenriched"] == 1 and not rows["m1"].get("graph_reenrich_pending")
+
+
+def test_capped_rows_do_not_take_a_slot_from_rows_still_in_the_fast_lane(service, monkeypatch):
+    from types import SimpleNamespace
+
+    from memory import provenance
+    from memory.provenance import SWEEP_CAPPED_BACKOFF_MAX_S, SWEEP_CAPPED_PER_RUN, SWEEP_MAX_ATTEMPTS
+
+    monkeypatch.setattr(provenance, "time", SimpleNamespace(time=lambda: 10 * SWEEP_CAPPED_BACKOFF_MAX_S))
+    monkeypatch.setattr(settings, "graph_support_aware_removal_enabled", True)
+    rows = {f"c{i}": {"graph_reenrich_pending": "ep", "graph_reenrich_pending_at": float(i),
+                      "graph_reenrich_sweep_attempts": SWEEP_MAX_ATTEMPTS} for i in range(3)}
+    rows.update({f"f{i}": {"graph_reenrich_pending": "ep", "graph_reenrich_pending_at": 100.0 + i} for i in range(2)})
+    service._memory.vector_store.client = _FakeQdrant(rows)
+    ran = []
+    monkeypatch.setattr(service, "reenrich_memory_graph", lambda mid: ran.append(mid) or {"memory_ids": [mid]})
+    service.sweep_pending_reenrichments(limit=2, min_age_s=0)
+    assert ran[:2] == ["f0", "f1"]  # the fast lane gets every slot of ``limit``
+    assert len(ran) == 2 + SWEEP_CAPPED_PER_RUN and ran[2] == "c0"  # the slow lane only adds its own bounded share
+
+
+def test_a_persistent_read_failure_after_the_enrichment_leaves_the_marker_for_the_sweep(service, monkeypatch):
+    """Before: ``enrich_graph`` cleared the marker as soon as it recorded the new episode; when the row then
+    could not be read, the job's own re-mark failed too and nothing was left for the sweep to find."""
+    monkeypatch.setattr(settings, "graph_support_aware_removal_enabled", True)
+    row = {"memory": "fact", "user_id": "u", "metadata": {
+        "owner_user_id": "u", "visibility": "private", "graph_reenrich_pending": "ep-gone",
+        "graph_reenrich_pending_at": 1.0}}
+    qdrant = _FakeQdrant({"m1": row["metadata"]})
+    service._memory.vector_store.client = qdrant
+    down = [False]
+
+    def get(mid):
+        if down[0]:
+            raise RuntimeError("qdrant read down")
+        return row
+
+    service._memory.get.side_effect = get
+    service._graphiti, service._bridge = MagicMock(), MagicMock()
+    monkeypatch.setattr(service, "_resolve_single_fact_episode", lambda *a, **kw: ("ep-name", None))
+    monkeypatch.setattr(service, "_attach_memory_id_to_graph_nodes", lambda **kw: None)
+    monkeypatch.setattr(service, "_persist_graph_episode_ref", lambda *a, **kw: None)
+    monkeypatch.setattr(service, "_maybe_supersede_contradicted", lambda **kw: None)
+    monkeypatch.setattr(service, "_cascade_expire_episode", lambda group, **kw: {"resolved": True})
+
+    def add(**kw):
+        down[0] = True  # reads stay unavailable from the moment the graph write has happened
+        return {"episode_uuid": "ep-new", "episode_name": "ep-name"}
+
+    service._memory.graph.add.side_effect = add
+    with pytest.raises(RuntimeError, match="could not verify the row"):
+        service.reenrich_memory_graph("m1")  # nothing about the marker is mocked
+    assert qdrant.rows["m1"]["graph_reenrich_pending"] == "ep-gone"  # still marked: the sweep retries it
+    down[0] = False
+    service._memory.graph.add.side_effect = lambda **kw: {"episode_uuid": "ep-new", "episode_name": "ep-name"}
+    assert service.reenrich_memory_graph("m1") == {"memory_ids": ["m1"]}
+    assert not qdrant.rows["m1"].get("graph_reenrich_pending")  # cleared only after the row was verified

@@ -700,6 +700,9 @@ class DurableUsageRecorder:
         self._budget_s = self.RECORD_BUDGET_S if record_budget_s is None else float(record_budget_s)
         self._lock = threading.Lock()
         self._unrecorded: dict[tuple[str, str], int] = {}
+        # Keys a flush has claimed and not yet persisted or put back: they still hold a slot, so a failed
+        # flush cycle cannot make room for a fresh set of keys (the map would grow by a flush each cycle).
+        self._in_flight: dict[tuple[str, str], int] = {}
         self.failures = 0
         #: Events that failed to store whose task could not even be remembered (the counter map was full).
         self.gaps_overflowed = 0
@@ -742,7 +745,11 @@ class DurableUsageRecorder:
         self.failures += 1
         key = (event.tenant_id, event.task_id)
         with self._lock:
-            if key in self._unrecorded or len(self._unrecorded) < self._max_keys:
+            if (
+                key in self._unrecorded
+                or key in self._in_flight
+                or len(self._unrecorded.keys() | self._in_flight.keys()) < self._max_keys
+            ):
                 self._unrecorded[key] = self._unrecorded.get(key, 0) + 1
             else:
                 # The store has been down long enough to fill the map: keep the memory bounded and
@@ -775,6 +782,19 @@ class DurableUsageRecorder:
             # Claim the counts so a concurrent flush cannot persist them twice.
             pending = self._unrecorded
             self._unrecorded = {}
+            for key in pending:
+                self._in_flight[key] = self._in_flight.get(key, 0) + 1
+        try:
+            self._flush_claimed(pending, max_s)
+        finally:
+            with self._lock:
+                for key in pending:
+                    if self._in_flight.get(key, 0) <= 1:
+                        self._in_flight.pop(key, None)
+                    else:
+                        self._in_flight[key] -= 1
+
+    def _flush_claimed(self, pending: dict, max_s: float | None) -> None:
         deadline = None if max_s is None else self._monotonic() + max_s
         items = list(pending.items())
         for index, ((tenant_id, task_id), count) in enumerate(items):
@@ -792,8 +812,8 @@ class DurableUsageRecorder:
         """Put counts that were claimed but not persisted back, always: they already held a slot.
 
         Only new keys are bounded (``record``); returned keys came out of this map, so the map can
-        exceed ``max_unrecorded_keys`` by at most the keys claimed in one flush (memory stays bounded)
-        and no claimed count loses its task attribution."""
+        exceed ``max_unrecorded_keys`` (keys in flight count against the bound when ``record`` admits a
+        new key) and no claimed count loses its task attribution."""
         with self._lock:
             for key, count in items:
                 self._unrecorded[key] = self._unrecorded.get(key, 0) + count
