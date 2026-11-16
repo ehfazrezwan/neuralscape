@@ -31,7 +31,7 @@ The compose file is `docker-compose.yml` at the repo root. Every published port 
 | resolver-svc | Precise-neighbors resolver (pyright over LSP) | `resolver` | index-time only; also set `CODE_NEIGHBORS_RESOLVER=lsp` |
 | cloudflared | Optional tunnel | `tunnel` | for exposing the API without opening ports |
 | neuralscape-test | In-container test runner | `test` | uses the Dockerfile `test` stage |
-| autoheal, docker-socket-proxy | Restart containers labelled `com.neuralscape.autoheal` | always | the proxy limits what autoheal can ask the Docker socket to do |
+| autoheal, docker-socket-proxy | Restart containers labelled `com.neuralscape.autoheal.<project>=true` (`<project>` is the compose project name, `neuralscape` by default) | always | the proxy limits what autoheal can ask the Docker socket to do; the per-project label key keeps two stacks on one host from restarting each other's containers |
 
 Other compose files at the repo root cover deployment variants (`docker-compose.prod.yml` adds a Caddy reverse proxy, plus `docker-compose.vps.yml`, `docker-compose.deploy.yml` and `docker-compose.snapshot-test.yml`).
 
@@ -98,6 +98,7 @@ All settings live in `neuralscape-service/config.py` as a Pydantic `BaseSettings
 | `qdrant_on_disk` | `True` | `config.py` |
 | `qdrant_path` | `~/.neuralscape/qdrant` | `config.py` |
 | `qdrant_collection` | `neuralscape_memories` | `config.py` |
+| `qdrant_timeout` | `30` (seconds; env `QDRANT_TIMEOUT`) | `config.py` |
 | `arq_queue_name` | `neuralscape:queue` | `config.py` |
 | `arq_max_retries` | `3` | `config.py` |
 | `arq_job_timeout` | `300` (sec) | `config.py` |

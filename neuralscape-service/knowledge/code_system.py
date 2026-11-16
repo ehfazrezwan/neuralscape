@@ -27,6 +27,24 @@ from knowledge.base import (
 logger = logging.getLogger(__name__)
 
 
+def _caller_kwargs(method, user_id: str | None) -> dict:
+    """``{"user_id": ...}`` when the engine method takes it (the native engine does).
+
+    The native engine attaches the caller's own (private) anchored memories to
+    neighbors/locate results; without the caller id only shared memories could
+    be seen. Other engines have no such join, so they are called unchanged.
+    """
+    import inspect
+
+    if not user_id:
+        return {}
+    try:
+        params = inspect.signature(method).parameters
+    except (TypeError, ValueError):
+        return {}
+    return {"user_id": user_id} if "user_id" in params else {}
+
+
 class CodeKnowledgeSystem:
     """Wrap a CodeIntelEngine as a KnowledgeSystem (one entry per backend).
 
@@ -169,6 +187,7 @@ class CodeKnowledgeSystem:
                 content = self._engine.neighbors(
                     label=req.label,
                     relation_filter=req.relation_filter or "",
+                    **_caller_kwargs(self._engine.neighbors, req.user_id),
                 )
                 return SystemAnswer(
                     system_name=self.info.name,
@@ -250,7 +269,11 @@ class CodeKnowledgeSystem:
 
             elif op == "locate":
                 # locate returns list[LocateHit]; convert to structured hits.
-                hits_obj = self._engine.locate(query=req.query, k=req.limit)
+                hits_obj = self._engine.locate(
+                    query=req.query,
+                    k=req.limit,
+                    **_caller_kwargs(self._engine.locate, req.user_id),
+                )
                 hits = [
                     {
                         "fqn": h.fqn,

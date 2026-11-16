@@ -341,6 +341,22 @@ class CoreMixin:
         # collection each time.
         ("metadata.graph_episode_uuid", "keyword"),
         ("metadata.graph_episode_name", "keyword"),
+        # Edit compare-and-set (memory/edit.py): every edit's conditional write
+        # filters on the row's revision and token, and the repair crons scroll
+        # on the pending markers. These are top-level payload keys (not under
+        # ``metadata``); ``metadata.revision`` is the legacy mirror the same
+        # filter falls back to for rows written before the top-level revision.
+        ("ns_revision", "integer"),
+        ("ns_token", "keyword"),
+        ("ns_text_revision", "integer"),
+        ("ns_meta_pending", "bool"),
+        ("ns_meta_pending_at", "float"),
+        ("ns_meta_repair_attempts", "integer"),
+        ("vector_pending", "bool"),
+        ("vector_pending_at", "float"),
+        ("vector_revision", "integer"),
+        ("vector_repair_attempts", "integer"),
+        ("metadata.revision", "integer"),
     )
 
     # After a failed attempt, do not retry on every search against a flaky
@@ -372,6 +388,8 @@ class CoreMixin:
             schema_by_name = {
                 "bool": PayloadSchemaType.BOOL,
                 "keyword": PayloadSchemaType.KEYWORD,
+                "integer": PayloadSchemaType.INTEGER,
+                "float": PayloadSchemaType.FLOAT,
             }
             client = self._get_memory().vector_store.client
             for field_name, schema_name in self._FILTER_INDEX_FIELDS:
@@ -429,6 +447,16 @@ class CoreMixin:
                 self._ensure_created_at_index()
             except Exception as e:  # noqa: BLE001
                 logger.debug(f"startup payload index ensure failed (non-fatal): {e}")
+            # Graphiti's Neo4j indices/constraints: otherwise built lazily on
+            # the first graph add/search, so a fresh database serves its first
+            # queries (and the label-scoped patch Cypher) without them.
+            # Idempotent; best-effort.
+            try:
+                ensure_graph = getattr(getattr(self._memory, "graph", None), "_ensure_indices", None)
+                if callable(ensure_graph):
+                    ensure_graph()
+            except Exception as e:  # noqa: BLE001
+                logger.debug(f"startup graph index ensure failed (non-fatal): {e}")
 
         thread = threading.Thread(target=_run, name="qdrant-index-ensure", daemon=True)
         self._index_ensure_thread = thread
