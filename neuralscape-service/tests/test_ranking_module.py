@@ -51,6 +51,9 @@ class TestRrfFuse:
         assert [e["hit"].id for e in out] == ["a", "b", "c"]
         assert all(e["dense"] for e in out)
 
+    def test_rrf_constant_is_the_standard_sixty(self):
+        assert RRF_K == 60
+
     def test_rrf_value_for_rank_zero(self):
         out = _rrf_fuse([_hit("a", 0.9)], [], 5)
         assert out[0]["rrf"] == pytest.approx(1.0 / (RRF_K + 1))
@@ -61,6 +64,7 @@ class TestRrfFuse:
         out = _rrf_fuse(dense, lexical, 10)
         # b: 1/(k+2) + 1/(k+1); a: 1/(k+1); c: 1/(k+2)
         assert [e["hit"].id for e in out] == ["b", "a", "c"]
+        assert out[0]["rrf"] == pytest.approx(1 / 62 + 1 / 61)
         assert out[0]["rrf"] == pytest.approx(1 / (RRF_K + 2) + 1 / (RRF_K + 1))
         assert out[0]["dense"] is True
 

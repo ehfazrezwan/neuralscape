@@ -311,13 +311,14 @@ class TestSearchEpisodesFulltext:
 
     def _capture(self, service):
         """Run the real coroutine against a fake driver; return the kwargs
-        the Cypher call was given."""
+        the Cypher call was given (query text under ``_cypher``)."""
         import asyncio
 
         run_calls = {}
 
         async def srun(cypher, **kw):
             run_calls.update(kw)
+            run_calls["_cypher"] = cypher
             res = MagicMock()
 
             async def data():
@@ -345,6 +346,16 @@ class TestSearchEpisodesFulltext:
         assert run_calls["q"] == "blue OR whale"
         assert run_calls["limit"] == 2
         assert "user--alice--project--p" in run_calls["group_ids"]
+
+    def test_cypher_is_group_scoped(self, service):
+        run_calls = self._capture(service)
+        service.search_episodes_fulltext("whale song", "alice", project_id="p")
+        assert "node.group_id IN $group_ids" in run_calls["_cypher"]
+        assert set(run_calls["group_ids"]) >= {
+            "user--alice", "shared", "user--alice--project--p", "shared--project--p",
+        }
+        # never another user's private group
+        assert not any(g.startswith("user--bob") for g in run_calls["group_ids"])
 
     def test_apostrophe_tokens_kept(self, service):
         run_calls = self._capture(service)
@@ -480,7 +491,7 @@ class TestDeleteEpisode:
         log = _driver_with(service, [])
         _real_bridge(service)
         out = service.delete_episode("e1", user_id="alice")
-        assert out == {"error": "Episode e1 not found"}
+        assert out["error"] == "Episode e1 not found" and out.get("not_found") is True
         assert not any("DETACH DELETE" in c for c, _ in log)
 
     def test_infrastructure_error_returned_not_raised(self, service):
@@ -780,6 +791,19 @@ class TestRebuildCounting:
         _qd(service, [([_row(str(i), {"data": "f", "user_id": "u"}) for i in range(10)], None)])
         service.rebuild_graph_from_vectors(max_rows=4)
         assert service.enrich_graph.call_count == 4
+
+
+class TestRebuildMaxRows:
+    def test_scanned_equals_max_rows_exactly(self, service):
+        service.enrich_graph = MagicMock(return_value=True)
+        _qd(service, [([_row(str(i), {"data": "f", "user_id": "u"}) for i in range(10)], None)])
+        out = service.rebuild_graph_from_vectors(max_rows=4)
+        assert out["scanned"] == 4 == out["enriched"] + out["failed"] + out["skipped"]
+
+    def test_max_rows_larger_than_store_scans_all(self, service):
+        service.enrich_graph = MagicMock(return_value=True)
+        _qd(service, [([_row(str(i), {"data": "f", "user_id": "u"}) for i in range(3)], None)])
+        assert service.rebuild_graph_from_vectors(max_rows=50)["scanned"] == 3
 
 
 class TestRebuildScrollFilter:

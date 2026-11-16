@@ -91,6 +91,10 @@ class TestCanonicalPointId:
         letters = "abcdef12-3456-4789-8abc-def012345678"
         assert self.canon(letters.replace("-", "")) == letters
 
+    def test_all_digit_dashless_uuid_is_still_a_uuid(self):
+        # 32 decimal digits >= 2**64: must fall through to the UUID parse
+        assert self.canon(UID.replace("-", "")) == UID
+
     def test_digits_become_int(self):
         assert self.canon("12345") == 12345
         assert self.canon("0") == 0
@@ -430,6 +434,13 @@ class TestContextFilters:
         ws = [c for c in shared.must_not if c.key == "metadata.workspace"][0]
         assert ws.match.except_ == ["memory"]
         assert [c.key for c in flt.must_not] == ["metadata.dream_tombstoned"]
+        # exact predicate values, not just keys
+        assert FieldCondition(key="user_id", match=MatchValue(value="alice")) in own.must
+        assert FieldCondition(key="metadata.project_id", match=MatchValue(value="proj")) in shared.must
+        assert FieldCondition(key="metadata.visibility", match=MatchValue(value="shared")) in shared.must
+        inner = [c for c in own.must if isinstance(c, Filter)][0]
+        assert FieldCondition(key="metadata.project_id", match=MatchValue(value="proj")) in inner.should
+        assert FieldCondition(key="metadata.scope", match=MatchValue(value="global")) in inner.should
 
     def test_tombstone_condition_matches_true(self):
         cond = MemoryService._tombstone_condition()
@@ -507,6 +518,26 @@ class TestContextEdges:
         self._store(service, [_pt("a"), _pt("b")])
         ctx = service.get_project_context("u", "p", limit=0)
         assert ctx.limit == 1 and ctx.returned == 1 and ctx.has_more is True
+
+    def test_exact_fit_page_has_no_more(self, service):
+        self._store(service, [_pt("a"), _pt("b"), _pt("c")])
+        ctx = service.get_project_context("u", "p", limit=3)
+        assert ctx.returned == 3 and ctx.total == 3 and ctx.has_more is False
+        ctx = service.get_project_context("u", "p", limit=2)
+        assert ctx.returned == 2 and ctx.has_more is True
+
+    def test_page_order_newest_first_across_categories(self, service):
+        rows = [
+            _pt("old", "2026-07-01T00:00:00Z", metadata={"category": "tech_stack"}),
+            _pt("new", "2026-07-03T00:00:00Z", metadata={"category": "preference"}),
+            _pt("mid", "2026-07-02T00:00:00Z", metadata={"category": "tech_stack"}),
+        ]
+        self._store(service, rows)
+        ctx = service.get_project_context("u", "p", limit=3)
+        assert [m.id for m in ctx.categories["tech_stack"]] == ["mid", "old"]
+        assert [m.id for m in ctx.categories["preference"]] == ["new"]
+        first = _client(service).scroll.call_args_list[0].kwargs
+        assert first["order_by"].key == "created_at" and first["order_by"].direction.value == "desc"
 
     def test_standards_returned_and_audited(self, service, monkeypatch):
         self._store(service, [])
