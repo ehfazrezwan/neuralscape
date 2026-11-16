@@ -60,9 +60,9 @@ try:
         logger.info("code-graph extra is available; registering code systems")
 
         # Phase C: register CBMEngine if CBM_ENABLED=true and bridge is reachable.
-        from config import process_env_or, settings as _cfg
+        from config import parse_bool_flag, process_env_or, settings as _cfg
 
-        cbm_enabled = process_env_or("CBM_ENABLED", str(_cfg.cbm_enabled)).lower() == "true"
+        cbm_enabled = parse_bool_flag(process_env_or("CBM_ENABLED", str(_cfg.cbm_enabled)), "CBM_ENABLED")
         cbm_bridge_url = process_env_or("CBM_BRIDGE_URL", _cfg.cbm_bridge_url)
 
         if cbm_enabled:
@@ -151,7 +151,9 @@ try:
         # per-space instances are built by the query.py factory on demand). Its
         # __init__ is lazy (no Neo4j at construction), so the placeholder is safe
         # to build at import even when Neo4j is down.
-        native_enabled = process_env_or("CODE_NATIVE_ENABLED", str(_cfg.code_native_enabled)).lower() == "true"
+        native_enabled = parse_bool_flag(
+            process_env_or("CODE_NATIVE_ENABLED", str(_cfg.code_native_enabled)), "CODE_NATIVE_ENABLED"
+        )
         if native_enabled:
             try:
                 from adapters.code_graph.native_engine import NativeEngine

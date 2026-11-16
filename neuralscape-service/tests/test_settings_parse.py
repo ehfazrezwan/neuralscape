@@ -279,3 +279,59 @@ def test_an_env_file_that_still_sets_a_removed_setting_loads(tmp_path):
     )
     assert proc.returncode == 0, proc.stderr[-3000:]
     assert proc.stdout.strip().splitlines()[-1] == "ok"
+
+
+# ── review fixes: tolerant switches, one truthiness rule, init by field name ──
+
+@pytest.mark.parametrize("name", ["CBM_ENABLED", "CODE_NATIVE_ENABLED"])
+@pytest.mark.parametrize("raw", ["enabled", "maybe", "2", "tru"])
+def test_malformed_code_engine_switch_is_off_not_a_startup_failure(monkeypatch, caplog, name, raw):
+    monkeypatch.setenv(name, raw)
+    with caplog.at_level("WARNING", logger="config"):
+        s = _settings()
+    assert getattr(s, name.lower()) is False
+    assert any(name in r.getMessage() and "not a boolean" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.parametrize("name", ["CBM_ENABLED", "CODE_NATIVE_ENABLED"])
+@pytest.mark.parametrize("raw,expected", [("true", True), ("TRUE", True), ("1", True), ("yes", True),
+                                          ("on", True), ("false", False), ("0", False), ("", False)])
+def test_code_engine_switch_truthiness_forms(monkeypatch, name, raw, expected):
+    monkeypatch.setenv(name, raw)
+    assert getattr(_settings(), name.lower()) is expected
+
+
+@pytest.mark.parametrize("raw", ["null", "None", "NULL"])
+def test_code_repos_null_is_no_repos(monkeypatch, raw):
+    monkeypatch.setenv("CODE_REPOS", raw)
+    assert _settings().code_repos == {}
+
+
+def test_dedup_cron_hours_out_of_range_still_fails_startup(monkeypatch):
+    from pydantic import ValidationError
+
+    monkeypatch.setenv("DEDUP_CRON_HOURS", "0,25")
+    with pytest.raises(ValidationError):
+        _settings()
+
+
+@pytest.mark.parametrize("raw,on", [("true", True), ("1", True), ("yes", True), ("enabled", False)])
+def test_registration_and_settings_share_one_truthiness_rule(monkeypatch, knowledge_with_code_graph, raw, on):
+    knowledge, built, _ = knowledge_with_code_graph
+    monkeypatch.setenv("CBM_ENABLED", raw)
+    monkeypatch.setenv("CODE_NATIVE_ENABLED", raw)
+    assert _settings().cbm_enabled is on and _settings().code_native_enabled is on
+    importlib.reload(knowledge)
+    assert ("cbm_bridge_url" in built) is on
+    assert ("native" in built) is on
+
+
+def test_vault_key_accepts_the_field_name_as_an_init_argument():
+    assert _settings(vault_key="x").vault_key == "x"
+
+
+def test_vault_key_init_name_does_not_change_env_precedence(monkeypatch):
+    monkeypatch.setenv("VAULT_KEY", "legacy")
+    monkeypatch.setenv("NEURALSCAPE_VAULT_KEY", "documented")
+    assert _settings().vault_key == "documented"
+    assert _settings(vault_key="init").vault_key == "init"

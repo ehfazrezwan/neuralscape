@@ -95,6 +95,25 @@ def process_env_or(name: str, configured: str) -> str:
     return configured if value is None else value
 
 
+_TRUE_WORDS = frozenset({"1", "true", "t", "yes", "y", "on"})
+_FALSE_WORDS = frozenset({"0", "false", "f", "no", "n", "off", ""})
+
+
+def parse_bool_flag(value, name: str = "flag") -> bool:
+    """The one truthiness rule for the boolean on/off switches that must never stop start-up.
+
+    ``1/true/t/yes/y/on`` is on; ``0/false/f/no/n/off`` and blank is off; anything else logs a
+    warning and is off (a mistyped switch leaves the feature off, as it always did)."""
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in _TRUE_WORDS:
+        return True
+    if text not in _FALSE_WORDS:
+        logging.getLogger(__name__).warning("%s=%r is not a boolean; treating it as off", name, value)
+    return False
+
+
 # Dimension of the mem0 / Qdrant vectors (embedder ``embedding_dims`` and the
 # collection's ``embedding_model_dims``). The Graphiti store is configured
 # separately via ``Settings.graphiti_embedding_dim``.
@@ -490,7 +509,7 @@ class Settings(BaseSettings):
     connectors_enabled: bool = False
     # Env NEURALSCAPE_VAULT_KEY (documented name, wins) or VAULT_KEY (the field name,
     # accepted for existing deployments). Required when connectors_enabled.
-    vault_key: str = Field(default="", validation_alias=AliasChoices("NEURALSCAPE_VAULT_KEY", "VAULT_KEY"))
+    vault_key: str = Field(default="", validation_alias=AliasChoices("NEURALSCAPE_VAULT_KEY", "VAULT_KEY", "vault_key"))
     connector_sync_cron_hours: int = 6  # interval (hours) the sync cron fires
     # Comma-separated exact command lines an MCP connector may spawn on the
     # worker over the stdio transport (so an entry cannot itself contain a comma).
@@ -1042,6 +1061,12 @@ class Settings(BaseSettings):
         # Compose-only and extension-owned keys declared at the top of this module.
         return init_settings, env_settings, _ServiceDotEnvSource(settings_cls, dotenv_settings), file_secret_settings
 
+    @field_validator("cbm_enabled", "code_native_enabled", mode="before")
+    @classmethod
+    def _tolerant_code_engine_flags(cls, value, info):
+        """An unparseable switch is off (with a warning), never a start-up failure."""
+        return parse_bool_flag(value, info.field_name.upper())
+
     @field_validator("code_repos", mode="before")
     @classmethod
     def _parse_code_repos(cls, value):
@@ -1050,7 +1075,7 @@ class Settings(BaseSettings):
             return {}
         if isinstance(value, str):
             text = value.strip()
-            if not text:
+            if not text or text.lower() in ("null", "none"):
                 return {}
             if text.startswith("{"):
                 return json.loads(text)
