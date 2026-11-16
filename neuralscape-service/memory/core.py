@@ -6,6 +6,7 @@ split) with its behavior unchanged. The Qdrant cold-start helpers above it
 afterwards and are not part of that extraction.
 """
 
+import inspect
 import logging
 import threading
 import time
@@ -114,6 +115,8 @@ class CoreMixin:
         self._graph_init_error: str | None = None
         self._genai_model = None
         self._init_lock = threading.Lock()
+        # True from a close() that released something until the next rebuild.
+        self._closed = False
 
     def _get_memory(self):
         """Lazy-initialize mem0 Memory with Graphiti backend.
@@ -133,20 +136,20 @@ class CoreMixin:
         the health check reports ``graph_store: not_initialized``.
         """
         if self._memory is not None and getattr(self, "_closed", False):
-            # close() released this service's clients, bridge and driver. Never
-            # hand those closed objects to a later caller (a request after a
-            # restart of the app inside one process, a stale holder of this
-            # service): drop them so the init below builds fresh ones.
+            # close() released this service's clients, bridge and driver (it is the only
+            # place that sets _closed, and only when it had something to release, so
+            # everything dropped here was closed already). Never hand those closed
+            # objects to a later caller: drop them so the build below makes fresh ones.
             with self._init_lock:
-                if getattr(self, "_closed", False):
+                if self._memory is not None and getattr(self, "_closed", False):
                     self._memory = None
                     self._graphiti = None
                     self._bridge = None
-                    self._genai_model = None
-                    self._closed = False
         if self._memory is None:
             with self._init_lock:
                 if self._memory is None:
+                    # The one place `_closed` is cleared, exactly once per rebuild.
+                    self._note_reopen_if_closed(clear=True)
                     from mem0 import Memory
 
                     config = settings.get_mem0_config()
@@ -273,29 +276,64 @@ class CoreMixin:
         if self._genai_model is None:
             with self._init_lock:
                 if self._genai_model is None:
+                    # close() dropped the old client; a rebuild after it is visible
+                    # in the log. `_closed` stays set: only the memory rebuild clears it.
+                    self._note_reopen_if_closed(clear=False)
                     self._genai_model = genai.Client(api_key=settings.google_api_key)
         return self._genai_model
+
+    def _note_reopen_if_closed(self, *, clear: bool) -> None:
+        """Log ONE warning when a service that close() released builds clients again.
+
+        Caller holds ``_init_lock``. A late request, or a shutdown thread that was
+        abandoned by its timeout, reopening clients after shutdown must leave a trace.
+        """
+        if getattr(self, "_closed", False):
+            logger.warning(
+                "MemoryService %s was closed and is being reopened: building new clients "
+                "(a request or task ran after shutdown)",
+                id(self),
+            )
+            if clear:
+                self._closed = False
 
     def close(self):
         """Clean up resources: Graphiti driver, bridge loop, Qdrant and embedder clients.
 
-        Idempotent (a second call is a no-op). The Qdrant and embedder client
+        Idempotent (a second call is a no-op). A later use of the service rebuilds its
+        clients (and logs a warning); the flag and the snapshot are taken under the init lock.
+        On a stopped bridge loop the driver's sockets cannot be closed: they are
+        abandoned to the OS (bounded by the process lifetime). The Qdrant and embedder client
         closes never raise; a failure closing the Graphiti driver still
         propagates, after everything else has been released.
         """
-        if getattr(self, "_closed", False):
-            return
-        self._closed = True
-        # Snapshot first: a concurrent _get_memory() may reset the attributes.
-        graphiti, bridge, memory = self._graphiti, self._bridge, self._memory
+        # Flip the flag and take the clients under the same lock the lazy build uses,
+        # so a concurrent rebuild either finishes first (and its clients are the ones
+        # closed here) or starts afterwards (and builds fresh ones): none is orphaned.
+        # Nothing to release (never initialised, or already closed) leaves the flag
+        # alone, so the first real use after that is an ordinary build, not a "reopen".
+        with self._init_lock:
+            if getattr(self, "_closed", False):
+                return
+            graphiti, bridge, memory = self._graphiti, self._bridge, self._memory
+            genai_client = self._genai_model
+            if all(x is None for x in (graphiti, bridge, memory, genai_client)):
+                return
+            # The Gemini client holds nothing to release: drop it so a later use builds
+            # a new one (and logs it) like the other clients. The rest stays in place,
+            # closed, until the next _get_memory() replaces it.
+            self._genai_model = None
+            self._closed = True
+        coro = None
         try:
             if graphiti and bridge:
                 try:
-                    bridge.run(graphiti.close(), timeout=_CLOSE_DRIVER_TIMEOUT_S)
+                    coro = graphiti.close()
+                    bridge.run(coro, timeout=_CLOSE_DRIVER_TIMEOUT_S)
                 except TimeoutError:
                     # A stopped or wedged bridge loop never answers; do not
                     # wait out the general bridge limit. The loop is torn down
-                    # right below and the driver abandoned with it.
+                    # right below; the driver's sockets are abandoned to the OS.
                     logger.warning(
                         "Graphiti driver did not close within %.0fs; abandoning it",
                         _CLOSE_DRIVER_TIMEOUT_S,
@@ -308,7 +346,13 @@ class CoreMixin:
                 if callable(shutdown):
                     shutdown()
             finally:
-                self._close_http_clients(memory)
+                # A close that never started (stopped loop) must not be left un-awaited.
+                if coro is not None and inspect.iscoroutine(coro) and (
+                    inspect.getcoroutinestate(coro) == inspect.CORO_CREATED
+                ):
+                    coro.close()
+                if memory is not None:  # never fall back to self._memory: it may be a rebuild
+                    self._close_http_clients(memory)
 
     def _close_http_clients(self, memory=None) -> None:
         """Best-effort close of the Qdrant client, the embedder's HTTP client and mem0's

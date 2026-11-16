@@ -117,3 +117,156 @@ def test_a_closed_service_builds_fresh_clients_instead_of_reusing_closed_ones():
     fresh.vector_store.client.close.reset_mock()
     svc.close()
     fresh.vector_store.client.close.assert_called_once_with()
+
+
+# ---- the closed -> rebuilt state machine (review of the first version) ----------------------
+
+import inspect
+import logging
+
+
+def _patched_build(built, delay=0.0, gate=None):
+    """Patch the lazy build so each build is counted and returns a distinct Mock."""
+
+    def factory(Memory, cfg):
+        if gate is not None:
+            gate.wait(10)
+        if delay:
+            time.sleep(delay)
+        m = Mock()
+        built.append(m)
+        return m
+
+    return (
+        patch("memory.core._memory_from_config", factory),
+        patch("memory.core.settings"),
+        patch("memory_service.MemoryService._ensure_indexes_at_startup", lambda self: None),
+    )
+
+
+def _enter(patches):
+    from contextlib import ExitStack
+
+    stack = ExitStack()
+    for p in patches:
+        m = stack.enter_context(p)
+    from memory import core
+
+    core.settings.get_mem0_config.return_value = {}
+    return stack
+
+
+def _fresh_service():
+    from memory_service import MemoryService
+
+    return MemoryService()
+
+
+def test_close_on_a_never_initialised_service_does_not_make_the_first_build_a_reopen(caplog):
+    built = []
+    svc = _fresh_service()
+    svc.close()
+    assert not svc._closed
+    with _enter(_patched_build(built)), caplog.at_level(logging.WARNING, logger="memory.core"):
+        first = svc._get_memory()
+        second = svc._get_memory()
+    assert first is second and len(built) == 1  # one memory object for one service, nothing dropped
+    assert not [r for r in caplog.records if "reopened" in r.getMessage()]
+
+
+def test_eight_concurrent_first_uses_after_a_close_build_exactly_one_memory():
+    built = []
+    svc = _fresh_service()
+    svc.close()
+    with _enter(_patched_build(built, delay=0.2)):
+        got = []
+        threads = [threading.Thread(target=lambda: got.append(svc._get_memory())) for _ in range(8)]
+        [t.start() for t in threads]
+        [t.join(15) for t in threads]
+    assert len(built) == 1 and len({id(g) for g in got}) == 1
+
+
+def test_a_rebuild_after_a_real_close_logs_one_warning_with_the_service_id_and_is_closed_once(caplog):
+    built = []
+    svc = _fresh_service()
+    with _enter(_patched_build(built)):
+        first = svc._get_memory()
+        first.vector_store.client = Mock()
+        svc.close()
+        first.vector_store.client.close.assert_called_once_with()
+        with caplog.at_level(logging.WARNING, logger="memory.core"):
+            second = svc._get_memory()
+            third = svc._get_memory()
+            svc.close()
+    reopened = [r.getMessage() for r in caplog.records if "closed and is being reopened" in r.getMessage()]
+    assert len(reopened) == 1 and str(id(svc)) in reopened[0]
+    assert second is third and second is not first and len(built) == 2
+    second.close.assert_called_once_with()
+    first.close.assert_called_once_with()  # the first memory was closed exactly once, never dropped
+
+
+def test_genai_client_is_rebuilt_after_close_and_the_rebuild_is_logged(caplog):
+    svc = _fresh_service()
+    old = object()
+    svc._genai_model = old
+    svc.close()
+    with patch("memory.core.genai") as g, caplog.at_level(logging.WARNING, logger="memory.core"):
+        g.Client.return_value = new = object()
+        assert svc._get_genai_client() is new
+        assert svc._get_genai_client() is new
+    assert len([r for r in caplog.records if "closed and is being reopened" in r.getMessage()]) == 1
+
+
+def test_close_waits_for_a_build_in_progress_and_then_closes_what_it_built():
+    built = []
+    gate = threading.Event()
+    svc = _fresh_service()
+    with _enter(_patched_build(built, gate=gate)):
+        builder = threading.Thread(target=svc._get_memory)
+        builder.start()
+        deadline = time.monotonic() + 5
+        while not svc._init_lock.locked() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        closer = threading.Thread(target=svc.close)
+        closer.start()
+        time.sleep(0.3)
+        assert closer.is_alive()  # close() takes the init lock: it cannot slip past a running build
+        gate.set()
+        builder.join(10)
+        closer.join(10)
+    assert len(built) == 1
+    built[0].close.assert_called_once_with()  # the memory the build produced was not orphaned
+
+
+def test_close_on_a_stopped_loop_leaves_no_unawaited_close_coroutine():
+    bridge = _AsyncBridge()
+    bridge._loop.call_soon_threadsafe(bridge._loop.stop)
+    bridge._thread.join(5)
+    made = []
+
+    class Spy:
+        def close(self):
+            made.append(HangingGraphiti().close())
+            return made[-1]
+
+    svc = _service(bridge, Spy())
+    with patch("memory.core._CLOSE_DRIVER_TIMEOUT_S", BOUND_S):
+        _close_within_wall(svc)
+    assert made and inspect.getcoroutinestate(made[0]) == inspect.CORO_CLOSED
+
+
+def test_worker_shutdown_runs_the_blocking_close_off_the_event_loop():
+    import worker
+
+    seen = {}
+
+    class Svc:
+        def close(self):
+            seen["thread"] = threading.current_thread()
+
+    async def go():
+        seen["loop_thread"] = threading.current_thread()
+        await worker.shutdown({"service": Svc()})
+
+    asyncio.run(go())
+    assert seen["thread"] is not seen["loop_thread"]

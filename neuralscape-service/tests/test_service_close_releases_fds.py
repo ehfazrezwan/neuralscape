@@ -138,20 +138,26 @@ def test_integration_conftest_resets_copies_of_a_closed_shared_service(tmp_path)
             import memory_service
             from knowledge.ns_memory import NSMemorySystem
             svc = memory_service.get_shared_service()
+            from mem0.memory.graphiti_memory import _AsyncBridge
+            svc._bridge = _AsyncBridge()  # something to release, so close() marks it closed
             fake_main = types.ModuleType("main")
             fake_main._service = svc
             sys.modules["main"] = fake_main
+            fake_mcp = types.ModuleType("mcp_server")
+            fake_mcp._service = svc
+            sys.modules["mcp_server"] = fake_mcp
             ns = NSMemorySystem()
             ns._get_service()
-            seen.extend([svc, fake_main, ns])
+            seen.extend([svc, fake_main, ns, fake_mcp])
 
         def test_second_sees_fresh_copies():
             import memory_service
-            svc, fake_main, ns = seen
+            svc, fake_main, ns, fake_mcp = seen
             assert svc._closed
             assert memory_service._shared_service is not svc
             assert fake_main._service is not svc and not getattr(fake_main._service, "_closed", False)
             assert ns._service is None
+            assert fake_mcp._service is not svc and not getattr(fake_mcp._service, "_closed", False)
         '''))
     env = dict(os.environ, PYTHONPATH=os.pathsep.join([str(service_root), *sys.path]))
     result = subprocess.run(
@@ -171,3 +177,30 @@ def test_integration_conftest_closes_services_a_test_forgot_to_close(tmp_path):
         cwd=tmp_path, env=env, capture_output=True, text=True, timeout=120,
     )
     assert result.returncode == 0, result.stdout[-2500:] + result.stderr[-1500:]
+
+
+def test_close_on_a_stopped_bridge_loop_releases_the_clients_but_abandons_the_driver_sockets():
+    """Spells out the one path where sockets are NOT released: the Graphiti driver, whose
+    close needs the bridge loop. The Qdrant and embedder clients and the loop itself are."""
+    from unittest.mock import patch
+
+    class DriverGraphiti:
+        def __init__(self):
+            self.sockets = SocketClient()
+
+        async def close(self):
+            self.sockets.close()
+
+    svc = build_service()
+    svc._graphiti = driver = DriverGraphiti()
+    qdrant, embedder = svc._memory.vector_store.client, svc._memory.embedding_model.client
+    svc._bridge._loop.call_soon_threadsafe(svc._bridge._loop.stop)
+    svc._bridge._thread.join(5)
+    try:
+        with patch("memory.core._CLOSE_DRIVER_TIMEOUT_S", 0.3):
+            svc.close()
+        assert (qdrant.closed, embedder.closed) == (1, 1)  # released
+        assert svc._bridge._loop.is_closed() and not svc._bridge._thread.is_alive()  # released
+        assert driver.sockets.closed == 0  # NOT released: abandoned to the OS (bounded by the process)
+    finally:
+        driver.sockets.close()

@@ -236,6 +236,18 @@ class _AsyncBridge:
             # skip the wait for it, just release the loop.
             self._thread.join(timeout=timeout)
             if not self._thread.is_alive():
+                # The thread is gone, so nothing else drives the loop: run the
+                # cancellation here, bounded, so tasks still pending on it are
+                # cancelled (and never-started coroutines closed) before it closes.
+                try:
+                    self._loop.run_until_complete(
+                        asyncio.wait_for(_cancel_all(), timeout=timeout)
+                    )
+                except Exception:
+                    logger.warning(
+                        "Graphiti bridge shutdown: cancelling tasks on a stopped loop failed",
+                        exc_info=True,
+                    )
                 self._loop.close()
             return
         try:

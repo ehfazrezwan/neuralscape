@@ -1990,7 +1990,9 @@ async def shutdown(ctx: dict) -> None:
         await registry.shutdown_all()
     service: MemoryService = ctx.get("service")
     if service:
-        service.close()
+        # close() can take up to ~15 s (bounded driver close + bridge join): keep it
+        # off the worker's event loop.
+        await asyncio.to_thread(service.close)
     logger.info("ARQ worker stopped.")
 
 

@@ -85,3 +85,29 @@ def test_shutdown_runs_async_generator_finalizers():
     bridge.run(start())
     bridge.shutdown()
     assert finalised.is_set()
+
+
+def test_shutdown_of_a_stopped_loop_cancels_tasks_still_pending_on_it():
+    bridge = _AsyncBridge()
+    cancelled = threading.Event()
+    started = threading.Event()
+
+    async def forever():
+        started.set()
+        try:
+            await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    async def schedule():
+        asyncio.get_running_loop().create_task(forever())
+
+    bridge.run(schedule())
+    assert started.wait(2)
+    bridge._loop.call_soon_threadsafe(bridge._loop.stop)  # what a test that stops its loop does
+    bridge._thread.join(5)
+    assert not bridge._thread.is_alive()
+    bridge.shutdown(timeout=2)
+    assert cancelled.is_set()
+    assert bridge._loop.is_closed()
