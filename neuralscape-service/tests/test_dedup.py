@@ -947,6 +947,98 @@ def _merged(service) -> set[str]:
     return set(_deleted(service)) | set(_tombstoned(service))
 
 
+class TestDreamingOnSemanticPhase:
+    """Dreaming on (the flags-on stack) must not switch off the REVERSIBLE semantic phase.
+
+    Acceptance ran ``dedup-tombstone`` on a stack that also has DREAMING_ENABLED, and the
+    compile's dedup passed ``semantic=False`` there, so nothing was ever tombstoned.
+    """
+
+    TEXT = "The nightly report job runs at 02:00 UTC on weekdays"
+
+    def _pair(self, service):
+        return _FakeQdrant(service, [
+            _row("old", self.TEXT, "2025-01-01T00:00:00", scope="global", visibility="private"),
+            _row("new", self.TEXT, "2025-06-01T00:00:00", scope="global", visibility="private"),
+        ])
+
+    def _compile(self, service, tmp_path):
+        import asyncio
+        from unittest.mock import AsyncMock, patch
+
+        pytest.importorskip("fcntl")
+        from extensions.conversation_compiler.compile import compile_date
+        from extensions.conversation_compiler.obsidian_writer import ObsidianWriter
+
+        with patch(
+            "extensions.conversation_compiler.compile._async_call_gemini",
+            new=AsyncMock(return_value="summary"),
+        ):
+            return asyncio.run(
+                compile_date("2026-11-16", service, ObsidianWriter(vault_path=tmp_path / "v"), user_id="u1")
+            )
+
+    def test_compile_dedup_tombstones_with_dreaming_on_when_the_flag_is_on(
+        self, service, tmp_path, monkeypatch, tombstone_on
+    ):
+        from extensions.dreaming.config import dreaming_settings
+
+        monkeypatch.setattr(dreaming_settings, "enabled", True)
+        fake = self._pair(service)
+
+        result = self._compile(service, tmp_path)
+
+        assert result.dedup_triggered is True
+        assert fake.payloads["old"]["metadata"]["dream_tombstoned"] is True
+        assert "old" in fake.payloads and _deleted(service) == []
+
+    def test_dreaming_on_without_the_flag_still_skips_the_lossy_phase(
+        self, service, tmp_path, monkeypatch
+    ):
+        from config import settings
+        from extensions.dreaming.config import dreaming_settings
+
+        monkeypatch.setattr(dreaming_settings, "enabled", True)
+        monkeypatch.setattr(settings, "dedup_semantic_tombstone_enabled", False)
+        fake = self._pair(service)
+
+        self._compile(service, tmp_path)
+
+        assert _merged(service) == set()
+        assert "dream_tombstoned" not in fake.payloads["old"]["metadata"]
+
+    @pytest.mark.parametrize(
+        "dreaming, flag, expected",
+        [(False, False, True), (False, True, True), (True, False, False), (True, True, True)],
+    )
+    def test_cron_and_compile_share_one_rule(self, monkeypatch, dreaming, flag, expected):
+        from config import settings
+        from extensions.conversation_compiler.compile import _semantic_dedup_enabled
+        from extensions.dreaming.config import dreaming_settings
+        from memory.delete import semantic_dedup_phase_enabled
+
+        monkeypatch.setattr(dreaming_settings, "enabled", dreaming)
+        monkeypatch.setattr(settings, "dedup_semantic_tombstone_enabled", flag)
+        assert semantic_dedup_phase_enabled() is expected
+        assert _semantic_dedup_enabled() is expected
+
+    def test_dedup_cron_passes_the_shared_rule(self, monkeypatch, tombstone_on):
+        import asyncio
+        from unittest.mock import MagicMock
+
+        import worker
+        from extensions.dreaming.config import dreaming_settings
+
+        monkeypatch.setattr(dreaming_settings, "enabled", True)
+        svc = MagicMock()
+        svc.get_all_user_ids.return_value = ["u1"]
+        svc.dedup_memories.return_value = {
+            "exact_duplicates_removed": 0, "semantic_duplicates_removed": 0, "graph_jobs": [],
+        }
+        asyncio.run(worker.dedup_all_memories({"service": svc}))
+        svc.dedup_memories.assert_called_once_with("u1", semantic=True)
+
+
 @pytest.mark.usefixtures("tombstone_on")
 class TestSemanticDedupIsReversible:
     """With DEDUP_SEMANTIC_TOMBSTONE_ENABLED, phase 2 tombstones the older near-duplicate."""

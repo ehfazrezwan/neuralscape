@@ -115,11 +115,12 @@ def _semantic_dedup_enabled() -> bool:
 
     Same rule as the dedup cron (``worker.dedup_all_memories``): when
     ``DREAMING_ENABLED`` is on, the dream sweep's MERGE action owns near-dup
-    merges, so only the lossless exact-hash phase runs.
+    merges, so only the lossless exact-hash phase runs, unless
+    ``DEDUP_SEMANTIC_TOMBSTONE_ENABLED`` makes the phase reversible.
     """
-    from extensions.dreaming.config import dreaming_settings
+    from memory.delete import semantic_dedup_phase_enabled
 
-    return not dreaming_settings.enabled
+    return semantic_dedup_phase_enabled()
 
 
 def _group_entries(entries: list[dict]) -> dict[str, list[dict]]:

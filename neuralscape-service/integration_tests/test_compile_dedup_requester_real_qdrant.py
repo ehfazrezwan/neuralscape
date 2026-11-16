@@ -55,7 +55,15 @@ def _recalled(svc, uid, query, project):
     return {m.id for m in svc.search(query, user_id=uid, project_id=project, limit=20)}
 
 
-def test_compile_on_a_day_with_other_users_entries_still_dedups_the_requester(svc, unique_ns, tmp_path):
+@pytest.mark.parametrize("dreaming_on", [False, True], ids=["dreaming-off", "dreaming-on"])
+def test_compile_on_a_day_with_other_users_entries_still_dedups_the_requester(
+    svc, unique_ns, tmp_path, monkeypatch, dreaming_on
+):
+    # dreaming-on is the shape of the flags-on acceptance stack: the dream sweep owns the
+    # LOSSY merge, but the reversible tombstone phase still has to run.
+    from extensions.dreaming.config import dreaming_settings
+
+    monkeypatch.setattr(dreaming_settings, "enabled", dreaming_on)
     from extensions.conversation_compiler.compile import compile_date
     from extensions.conversation_compiler.obsidian_writer import ObsidianWriter
 
