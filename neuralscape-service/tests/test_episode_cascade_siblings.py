@@ -524,6 +524,17 @@ def _listed(ids, visibility="private"):
     return [SimpleNamespace(id=i, visibility=visibility) for i in ids]
 
 
+def _stub_listing(world, ids, visibilities=None):
+    """The filtered bulk-delete sweep lists RAW mem0 dicts via ``Memory.get_all``; serve ``ids`` that way."""
+    vis = visibilities or ["private"] * len(ids)
+    rows = [
+        {"id": i, "memory": "x", "metadata": {"metadata": {"visibility": v}}}
+        for i, v in zip(ids, vis)
+    ]
+    world.svc._ensure_filter_indexes = lambda: None
+    world.svc._memory.get_all = lambda filters, top_k: {"results": rows[:top_k]}
+
+
 class TestBulkDelete:
     def test_all_n_deleted_no_jobs_episode_cascaded_once(self, world):
         w = world
@@ -541,7 +552,7 @@ class TestBulkDelete:
     def test_subset_delete_returns_jobs_only_for_survivors(self, world):
         w = world
         conv = seed_conversation(w, n=6)
-        w.svc.list_memories = MagicMock(return_value=_listed(conv.ids[:3]))
+        _stub_listing(w, conv.ids[:3])
         out = w.svc.delete_memories(user_id=OWNER, category="personal_fact")
 
         assert set(conv.ids[:3]).isdisjoint(w.q.points)
@@ -736,6 +747,12 @@ class TestMalformedId:
         with pytest.raises(LookupError):
             w.svc.delete_memory("not-a-uuid", OWNER)
 
+    def test_wellformed_missing_id_is_lookup_error_not_a_store_call(self, world):
+        w = world
+        with pytest.raises(LookupError):
+            w.svc.delete_memory(rid(999), OWNER)
+        w.svc._memory.delete.assert_not_called()  # nothing was sent to the store
+
     def test_wellformed_id_store_failure_still_propagates(self, world):
         w = world
         w.svc._memory.get.side_effect = ConnectionError("qdrant down")
@@ -848,7 +865,7 @@ class TestRestSurface:
 
     def test_bulk_delete_subset_enqueues_only_survivors(self, world, rest):
         conv = seed_conversation(world, n=6)
-        world.svc.list_memories = MagicMock(return_value=_listed(conv.ids[:2]))
+        _stub_listing(world, conv.ids[:2])
         resp = rest.client.request(
             "DELETE", "/v1/memories", json={"user_id": OWNER, "category": "personal_fact"}
         )
@@ -868,6 +885,14 @@ class TestRestSurface:
     def test_malformed_id_is_404_not_500(self, world, rest):
         world.svc._memory.get.side_effect = ValueError("Point id is not a valid UUID")
         assert rest.client.delete("/v1/memories/not-a-uuid").status_code == 404
+
+    def test_unknown_wellformed_id_is_404_not_500(self, world, rest):
+        resp = rest.client.delete(f"/v1/memories/{rid(999)}")
+        assert resp.status_code == 404, resp.text
+
+    def test_wellformed_id_store_failure_is_still_500(self, world, rest):
+        world.svc._memory.get.side_effect = ConnectionError("qdrant down")
+        assert rest.client.delete(f"/v1/memories/{rid(1)}").status_code == 500
 
     def test_other_users_rows_untouched(self, world, rest):
         conv = seed_conversation(world, n=3)
@@ -896,7 +921,7 @@ class TestMcpSurface:
         import json
 
         conv = seed_conversation(world, n=5)
-        world.svc.list_memories = MagicMock(return_value=_listed(conv.ids[:1]))
+        _stub_listing(world, conv.ids[:1])
         mcp.tm.enqueue_graph_enrichment.side_effect = ConnectionError("redis down")
         out = await mcp_server.call_tool(
             "delete_memories", {"user_id": OWNER, "category": "personal_fact"}
@@ -918,6 +943,15 @@ class TestMcpSurface:
         assert data["graph"] == "migration_queued"
         assert data["sibling_graph_jobs_enqueued"] == 3
         assert _enqueued_ids(mcp.tm) == sorted(conv.ids)
+
+    @pytest.mark.asyncio
+    async def test_unknown_wellformed_id_returns_not_found_error(self, world, mcp):
+        import json
+
+        out = await mcp_server.call_tool(
+            "delete_memories", {"user_id": OWNER, "memory_id": rid(999)}
+        )
+        assert "not found" in json.loads(out[0].text)["error"].lower()
 
     @pytest.mark.asyncio
     async def test_malformed_id_returns_error_not_crash(self, world, mcp):
@@ -1193,10 +1227,7 @@ class TestDeleteEditPermissionMatrix:
     def test_filtered_delete_skips_shared_unless_asked_and_standard_unless_dictator(self, world):
         for i, vis in enumerate(("private", "shared", "standard"), start=1):
             self._row(world, rid(i), vis)
-        world.svc.list_memories = MagicMock(return_value=[
-            SimpleNamespace(id=rid(i), visibility=v)
-            for i, v in enumerate(("private", "shared", "standard"), start=1)
-        ])
+        _stub_listing(world, [rid(i) for i in (1, 2, 3)], ["private", "shared", "standard"])
         out = world.svc.delete_memories(user_id=OWNER, category="personal_fact")
         assert set(world.q.points) == {rid(2), rid(3)}
         assert "preserved 1 shared, 1 standard" in out["message"]

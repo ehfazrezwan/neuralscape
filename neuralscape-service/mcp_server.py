@@ -30,6 +30,8 @@ from mcp.types import TextContent, Tool
 
 import adapters  # noqa: F401 — registers knowledge-adapter taxonomies at import (deterministic MEMORY_CATEGORIES for validation; tool enums stay core-13)
 from config import settings
+from memory.delete import MemoryListingFailed
+from memory.edit import EditBusy, EditLockUnavailable, RevisionConflict
 from memory_service import get_shared_service
 from schemas import CORE_MEMORY_CATEGORIES
 from task_manager import TaskManager
@@ -195,7 +197,10 @@ async def list_tools() -> list[Tool]:
                 "OUTPUT FORMAT (M5 hardening): Normal recall returns a JSON array of memory objects. "
                 "When code fusion is enabled (project with coding query), returns a stable JSON envelope: "
                 "{fused: true, sections: {structure: {...}, semantics: {...}, memories: [...]}, ...}. "
-                "This stable envelope ensures clients never receive a surprise type flip."
+                "This stable envelope ensures clients never receive a surprise type flip. "
+                "Reference material ingested with a non-default adapter (e.g. trading_strategy) is "
+                "stored in a 'ref-<adapter>[--<title>]' workspace and is returned only when you pass "
+                "workspaces=[\"ref-...\"]."
             ),
             inputSchema={
                 "type": "object",
@@ -248,6 +253,18 @@ async def list_tools() -> list[Tool]:
                             "glyph, age, tokens, score}) instead of full payloads — "
                             "~50-100 tokens per hit. Filter these, then call "
                             "get_memories(ids=[...]) for the few you need. Default: false."
+                        ),
+                    },
+                    "workspaces": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "maxItems": 10,
+                        "description": (
+                            "Workspaces to search, e.g. [\"ref-trading_strategy\"]. Default (omit): "
+                            "the memory workspace only. Content ingested with a non-default "
+                            "adapter is stored in 'ref-<adapter>[--<title-slug>]' and is NOT "
+                            "returned unless you name that workspace here (add \"memory\" to "
+                            "search both)."
                         ),
                     },
                     "knowledge_system": {
@@ -860,18 +877,16 @@ async def list_tools() -> list[Tool]:
         Tool(
             name="edit_memory",
             description=(
-                "Partially update an existing memory in place — the memory keeps its ID, "
-                "author, and creation time (no lossy delete+recreate). Only the fields you "
-                "pass are changed; pass null to clear a clearable field (project_id, tags, "
-                "expires_at, domain, observation_type, concepts, confidence). Scope is "
-                "re-derived from category + project_id automatically. Permission model: "
+                "Partially update an existing memory in place (keeps its ID, author and "
+                "creation time). Only the fields you pass are changed; pass null to clear a clearable field (project_id, tags, "
+                "expires_at, domain, observation_type, concepts, confidence). Permission model: "
                 "SHARED memories accept metadata edits (tags/category/project_id/v2 fields) "
-                "from any authenticated teammate — housekeeping is collaborative — but "
+                "from any authenticated teammate, but "
                 "content and visibility changes are owner-or-dictator only. PRIVATE "
                 "memories are owner-only; 'standard' tier is dictator-only. Content edits "
                 "are blocked on 'passage' memories (verbatim chunks of an ingested "
-                "artifact — re-ingest the corrected source instead). Graph impact is "
-                "handled automatically: content or project/visibility changes enqueue a "
+                "artifact — re-ingest the corrected source instead). Content or "
+                "project/visibility changes enqueue a "
                 "background knowledge-graph re-ingest (reported as graph_task_id)."
             ),
             inputSchema={
@@ -888,6 +903,7 @@ async def list_tools() -> list[Tool]:
                     "concepts": {"type": ["array", "null"], "items": {"type": "string"}, "description": "Memory-model v2 concept tags (max 5)"},
                     "confidence": {"type": ["number", "null"], "description": "Memory-model v2 confidence 0.0-1.0"},
                     "expires_at": {"type": ["string", "null"], "description": "ISO 8601 expiry; null clears"},
+                    "expected_revision": {"type": "string", "description": "Revision from a prior read; stale => refused, nothing written"},
                     "user_id": {"type": "string", "description": "Caller user ID (optional under token auth)"},
                 },
                 "required": ["memory_id"],
@@ -1476,8 +1492,21 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
     arguments = arguments or {}
     user_id = current_user_id.get() or arguments.get("user_id") or settings.default_user_id
 
+    # Explicit action policy (NS_POLICY_MODE; a no-op while it is "off").
+    from policy_enforcement import enforce_mcp_call
+
+    _policy_denial = await asyncio.to_thread(enforce_mcp_call, name, arguments)
+    if _policy_denial is not None:
+        return [TextContent(type="text", text=json.dumps(_policy_denial))]
+
     try:
         if name == "recall_memories":
+            try:
+                from schemas import validate_workspace_names
+
+                _workspaces = validate_workspace_names(arguments.get("workspaces"))
+            except ValueError as ve:
+                return [TextContent(type="text", text=json.dumps({"error": str(ve)}))]
             # Phase E: fusion — when the router says code leg is warranted, execute
             # it concurrently with base legs and compose sections.
             from knowledge.router import resolve_systems
@@ -1520,6 +1549,7 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
                     limit=arguments.get("limit", 10),
                     visibility=arguments.get("visibility"),
                     include_shared=arguments.get("include_shared", True),
+                    workspaces=_workspaces,
                 )
 
             # Phase E/F: resolve ALL healthy code system(s) the ROUTER decided
@@ -2191,20 +2221,31 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
             memory_id = arguments.get("memory_id")
             if memory_id:
                 # Pass caller identity so standard-tier deletes are gated to dictators.
-                result = await asyncio.to_thread(_service.delete_memory, memory_id, user_id)
+                try:
+                    result = await asyncio.to_thread(_service.delete_memory, memory_id, user_id)
+                except LookupError as e:
+                    # Same not-found answer REST gives as a 404.
+                    return [TextContent(type="text", text=json.dumps({"error": str(e)}))]
             else:
-                result = await asyncio.to_thread(
-                    _service.delete_memories,
-                    user_id=user_id,
-                    scope=arguments.get("scope"),
-                    category=arguments.get("category"),
-                    project_id=arguments.get("project_id"),
-                    filter_null_category=arguments.get("filter_null_category", False),
-                    include_shared=arguments.get("include_shared", False),
-                )
+                try:
+                    result = await asyncio.to_thread(
+                        _service.delete_memories,
+                        user_id=user_id,
+                        scope=arguments.get("scope"),
+                        category=arguments.get("category"),
+                        project_id=arguments.get("project_id"),
+                        filter_null_category=arguments.get("filter_null_category", False),
+                        include_shared=arguments.get("include_shared", False),
+                    )
+                except MemoryListingFailed as e:
+                    # Listing failed => nothing was deleted; say so, never "ok".
+                    return [TextContent(type="text", text=json.dumps(
+                        {"error": str(e), "code": "listing_failed", "deleted": 0}))]
             # Sibling facts that shared a deleted fact's graph episode need a
             # fresh single-fact re-ingest; the delete itself has already
             # succeeded, so a queue failure is reported, never raised.
+            if isinstance(result, dict) and (result.get("failed_ids") or result.get("truncated")):
+                result["status"] = "partial"  # same honesty as REST's 207
             if isinstance(result, dict):
                 jobs = result.pop("graph_jobs", None)
                 if jobs:
@@ -2229,10 +2270,25 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
             if not changes:
                 return [TextContent(type="text", text=json.dumps(
                     {"error": "No fields to update — provide at least one editable field"}))]
+            expected_revision = arguments.get("expected_revision")
+            patch_kwargs = {"expected_revision": expected_revision} if expected_revision is not None else {}
             try:
                 result = await asyncio.to_thread(
-                    _service.patch_memory, arguments["memory_id"], user_id, changes
+                    _service.patch_memory, arguments["memory_id"], user_id, changes, **patch_kwargs
                 )
+            except RevisionConflict as rc:
+                # Nothing was written; re-read the memory (it carries the new
+                # revision), re-apply the change and retry.
+                return [TextContent(type="text", text=json.dumps({
+                    "error": str(rc),
+                    "code": "revision_conflict",
+                    "expected_revision": rc.expected_revision,
+                    "current_revision": rc.current_revision,
+                }))]
+            except EditBusy as eb:
+                return [TextContent(type="text", text=json.dumps({"error": str(eb), "code": "edit_busy"}))]
+            except EditLockUnavailable as eu:
+                return [TextContent(type="text", text=json.dumps({"error": str(eu), "code": "edit_lock_unavailable"}))]
             except (LookupError, PermissionError, ValueError) as e:
                 return [TextContent(type="text", text=json.dumps({"error": str(e)}))]
 

@@ -83,6 +83,7 @@ MODULE_OWNERS: dict[str, tuple[str, tuple[str, ...], tuple[str, ...]]] = {
     "contracts_usage_reconcile": ("usage", ("usage",), ("usage",)),
     "contracts_context": ("context", ("context",), ("clients", "lifecycle")),
     "contracts_freshness": ("context", ("lifecycle", "context"), ("clients", "context")),
+    "onboarding": ("policy", ("policy",), ("clients", "tenancy")),
     "engine_ports": ("engines", ("engines",), ("lifecycle", "portability", "context", "usage")),
 }
 
@@ -95,9 +96,9 @@ MODULE_OWNERS: dict[str, tuple[str, tuple[str, ...], tuple[str, ...]]] = {
 # registry test, whatever it is called.
 NON_PRODUCT_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
     "evidence_records": (
-        "machine-readable evidence records, writer and baseline/candidate comparison for the persona probes; "
-        "harness output, not a service wire contract",
-        ("persona_evidence",),
+        "machine-readable evidence records, writer and baseline/candidate comparison for the persona probes and "
+        "the preservation run harness; harness output, not a service wire contract",
+        ("persona_evidence", "comp1_run"),
     ),
 }
 
@@ -2102,7 +2103,7 @@ def valid_examples() -> dict[str, dict]:
 
 # Pinned digests of the generated schemas of this revision (see module doc).
 SCHEMA_DIGESTS: dict[str, str] = {
-    "AccessPolicy": "b1ec9292d59a81dd199efd000ce6d2fb87eee567ff999ae618ba75f2a804ce43",
+    "AccessPolicy": "188d273bc4ee873b54b6a3ae9d001ffa8ac066d1890a74322861baa716993ded",
     "AssemblyStageTiming": "354ca825e78dfb8fda5e216f0fdf47ff8c6eb3ad14b523ede55aad52b0a2b341",
     "AttemptUsage": "de5fe29c644755666e4cc15d2146dd73438c42b8be16023c558bb8452a2c8540",
     "AttributionSnapshot": "a5187e6340c911fc3765a36c7f7790ec0a002e19873a0b64aa0e1589cf55cd40",
@@ -2141,11 +2142,13 @@ SCHEMA_DIGESTS: dict[str, str] = {
     "ManifestFile": "d0fcd247d8d2c280f5d8645e915f9a171a00b0a4382bbc6ea5e3a988a044c40c",
     "MembershipVersion": "090001b44c8269177f4fd9ed5eaf289e56e2243d29a2c98849855ef66b3bfe0b",
     "MemoryRecord": "3f3706186d8906c3cd4f3c02b0fb969fe7868c0c2263e1433303587ee7e09d4d",
+    "OnboardingPolicy": "ac284255170787b6e6374bc15fada560887171894b375e8bec48889a937b86f2",
     "OpaqueEnvelopeBody": "5735bd4c041aaef025cd825d7c0fdae1d0097c99e247f7061628cdcabe36addf",
     "PlaintextBody": "a779dc91b1e4ab61dca0bb4f99b14f467f124e7fbf28717b71da2dabab087234",
+    "PolicyCondition": "546a5518de4e170c23800e4877c7a1f1f2bbb97c5ca58a646e658842d1cd7811",
     "PolicyDecision": "dbfbcdcf7785c25943ddcf68df8449d3ff862f91b81cf804e0219dedf3c31791",
-    "PolicyEvaluationInput": "4a21dea79896e28faadce052e3256616ac45317fb06910939b4b0c4c2ebfd3f3",
-    "PolicyStatement": "719e5a23c3e6a6f6147079826e52a9943d6bfecab3311ae248ae848c5286a8b3",
+    "PolicyEvaluationInput": "b5f3fdc1df65eff4c49c1ca290b30bd9dc4c5787652bc4a442712d0a83d23c0f",
+    "PolicyStatement": "0d60d9c33b5fdbac3927c9c90e3e6e3d2dd899bb7a52bcc22bd46d2e3e21d692",
     "PortableManifest": "0a77d59b8747e11736ee59cd5079fe4cb3073def1dad1d479e9f87699a099c7c",
     "PositionReference": "dd83ce1d7277e99ddc45aff2447c6439eac67c6defc8fea8a954a297e80ce06f",
     "PrincipalContext": "a6996c742cbd4bee745555201b8db76ab2a3fb616fd40e6545e7b67e1675ca4c",
@@ -2158,6 +2161,7 @@ SCHEMA_DIGESTS: dict[str, str] = {
     "ReconciledUsageStream": "b4c442414c15efc371685d15b46d88383f3b109596f9361b8ea2a4113705ee63",
     "ReferenceHandle": "1e94f946c4e4eb9565e8159e5fa3bddb04937730c79e03d5974faaa6f72011b8",
     "ResourceCompliance": "70d378b94fae539a8828758c829a072955de8f6cb183a85197210c422a3aca59",
+    "ResourceContext": "607013e2b5ce0879fe5fddb8abfd509db3c751e52049ee38b3c7a6c00ca54e05",
     "ResourceManifestReference": "d1f1a73436e66c4991fe8d4f359d8608c2bffcf97507fe1fe256bc1a927e26c4",
     "ScoreDistribution": "b669c910f60ea64b670cb49f2e5d4983c31db737370a96a483009390437ca041",
     "SelectedContextItem": "21539b103b690d8a93dc07b33797620434bdd112e62c42d9b7f9b0cee6475e1f",

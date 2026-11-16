@@ -76,7 +76,7 @@ def test_flush_is_accepted_and_the_task_completes(flushed):
     assert not flushed["task"].get("error"), flushed["task"].get("error")
 
 
-@proves("ext.compiler-flush", "write.remember-conversation")
+@proves("ext.compiler-flush", "write.conversation-extraction")
 def test_flushed_fact_is_stored_in_the_core_taxonomy(flushed):
     assert flushed["hits"], "the flushed decision was not stored or not searchable"
     for hit in flushed["hits"]:

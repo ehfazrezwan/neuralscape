@@ -728,6 +728,35 @@ class TaskManager:
             "error": error,
         }
 
+    def job_owner(self, tenant_id: str, task_id: str):
+        """The principal an accepted job is bound to (synchronous; used by the enforcer).
+
+        A durable intent names its submitting subject in the ledger (only on the
+        governed path, where intents carry the bound principal).  A legacy queue job
+        is mapped to the submitting user through the short-lived task→user key the
+        enqueue path records.  Unknown or unreadable is ``None`` (no access through it).
+        """
+
+        from policy_enforcement import JobOwner
+
+        if task_id.startswith("intent-"):
+            producer = self.producer
+            if self.ledger is None or producer is None or producer.principals is None:
+                return None
+            stored = self.ledger.get_intent(tenant_id, task_id)
+            return None if stored is None else JobOwner(subject_id=stored.intent.actor_id)
+        import redis
+
+        client = self._owner_client
+        if client is None:
+            client = self._owner_client = redis.Redis.from_url(
+                settings.redis_url, socket_timeout=2, socket_connect_timeout=2
+            )
+        user = client.get(_task_user_key(task_id))
+        if not user:
+            return None
+        return JobOwner(user_id=user.decode() if isinstance(user, bytes) else str(user))
+
     async def wait_for_result(self, task_id: str, timeout: float = 300.0) -> dict:
         """Wait for a task to complete and return its status.
 

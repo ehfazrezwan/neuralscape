@@ -27,7 +27,7 @@ def _is_loopback(host: str) -> bool:
         return False
 
 
-DEFAULT_COMPOSE_ALLOWLIST = ("nscampaign", "nstest-")
+DEFAULT_COMPOSE_ALLOWLIST = ("nstest-",)
 
 
 def compose_allowlist(env: dict | None = None) -> list[str]:
@@ -40,8 +40,8 @@ def compose_allowlist(env: dict | None = None) -> list[str]:
 def check_compose_project(project: str, env: dict | None = None) -> str:
     """THE rule for every compose project name the harness touches: refuse the
     production name (case-insensitive, after strip) and anything outside the
-    disposable-prefix allowlist (default ``nscampaign``, ``nstest-``; only
-    ``NS_COMPOSE_ALLOWLIST`` overrides). Returns the normalised name."""
+    disposable-prefix allowlist (default ``nstest-``; ``NS_COMPOSE_ALLOWLIST``
+    is the only way to add a prefix). Returns the normalised name."""
     name = (project or "").strip()
     if name.lower() == PROD_COMPOSE_PROJECT:
         raise GuardError(

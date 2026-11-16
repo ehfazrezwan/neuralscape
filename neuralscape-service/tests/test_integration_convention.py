@@ -28,11 +28,7 @@ FALLBACK_EXCLUDED = ["tests/test_async_pipeline.py"]  # the packaged test image 
 # declared their skips in the manifest.  Lane p2 moves them to integration_tests/
 # (pg_dsn / stores fixtures) and deletes their manifest entries; remove each name
 # here in the same PR.  Never add to this set.
-LEGACY_MARKED = {
-    "test_ledger_dispatch_pg_integration.py",
-    "test_ledger_flag_on_app.py",
-    "test_ledger_postgres_integration.py",
-}
+LEGACY_MARKED: set[str] = set()
 
 
 def _excluded_suites() -> set[str]:
