@@ -61,7 +61,23 @@ class IngestManifest:
         self._data["stats"].update(kw)
         self.save()
 
+    def session_metas(self, pairs: set[tuple[str, str]] | None = None) -> list[dict]:
+        """Per-session ingest records, optionally restricted to ``(conv_id, session_id)`` pairs.
+
+        A session marked done with no meta (legacy state) is included with no
+        timings, so it is counted as unrecorded rather than dropped.
+        """
+        out = []
+        for conv_id, c in self._data["conversations"].items():
+            metas = c.get("sessions_meta", {})
+            for session_id in dict.fromkeys([*c.get("sessions_done", []), *metas]):
+                if pairs is None or (conv_id, session_id) in pairs:
+                    out.append({**metas.get(session_id, {}),
+                                "conv_id": conv_id, "session_id": session_id})
+        return out
+
     def totals(self) -> dict:
+        """Legacy totals used by the default suite result (unrecorded counts as 0)."""
         convs = self._data["conversations"]
         metas = [m for c in convs.values() for m in c.get("sessions_meta", {}).values()]
         return {
@@ -69,6 +85,19 @@ class IngestManifest:
             "sessions": sum(len(c.get("sessions_done", [])) for c in convs.values()),
             "ingest_wall_s": round(sum(m.get("elapsed_s") or 0 for m in metas), 1),
             "est_tokens": sum(m.get("est_tokens") or 0 for m in metas),
+        }
+
+    def scoped_totals(self, pairs: set[tuple[str, str]]) -> dict:
+        """Totals for the given sessions only. A total with any unrecorded
+        component is ``None`` (unknown), never a partial sum or zero."""
+        metas = self.session_metas(pairs)
+        wall = [m.get("elapsed_s") for m in metas]
+        toks = [m.get("est_tokens") for m in metas]
+        return {
+            "conversations": len({m["conv_id"] for m in metas}),
+            "sessions": len(metas),
+            "ingest_wall_s": None if None in wall else round(sum(wall), 1),
+            "est_tokens": None if None in toks else sum(toks),
         }
 
     def save(self) -> None:

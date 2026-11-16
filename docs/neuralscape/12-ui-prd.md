@@ -1,5 +1,7 @@
 # Neuralscape Web UI — PRD
 
+> **Status (as of 2026-11-16, dev 6a81341f):** design, not built. No web UI exists on dev: there is no frontend directory, and the only HTML the service serves is the OAuth consent page. Humans reach Neuralscape through the REST API, the MCP server and the plugin; see [02-service-architecture](./02-service-architecture.md). The benchmark harness has its own small dashboard, which is not the product UI. Plan-named work that was never started.
+
 > Brief for a frontend design agent. Lists *what* to build; design agent owns *how* it looks. Beautiful, modern, minimal, functional.
 
 ## Context

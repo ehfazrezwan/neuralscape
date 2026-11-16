@@ -1,5 +1,7 @@
 # 24 — Competitive Roadmap: Memory Parity and Beyond
 
+> **Status (as of 2026-11-16, dev 6a81341f):** snapshot. The roadmap was written on 2026-07-04, and most of its sequenced items now have code on dev (index recall and timeline as the `get_memories` and `timeline` MCP tools, memory tiers and `checkpoint`, among others). It is a record of the plan and the competitive reasoning, not a status page; read the code and the changelog for what exists.
+
 **Date:** 2026-07-04
 **Status:** Living document — each phase item is intended to ship as its own PR against `dev`.
 **Inputs:** deep source-level research of three reference systems (2026-07-04):

@@ -1,5 +1,7 @@
 # ICE Mission — Fable Independent Review
 
+> **Status (as of 2026-11-16, dev 6a81341f):** historical. The independent review of the ICE benchmark mission on 2026-07-08. Its caveats are the reason the final report must be read with care: see the bottom line below. The five MUST-FIX items it raised were applied afterwards; see [HARDENING_FIXES](../../HARDENING_FIXES.md).
+
 **Reviewer:** Fable (claude-fable-5) · **Date:** 2026-07-08 · **Tree reviewed:** `ice/benchmark` @ `a9e5aa3`
 **Inputs:** ICE_MASTERPLAN.md, ICE_MISSION.md, all 11 merged ice/* PR diffs (`31ba3b4..HEAD`), ice-ckpt-1/2, engine-surface-gap.md, premise-verification.md, phase-III-runbook.md, ICE_BENCH_REPORT-ice-final.md, raw results (`ice-final.jsonl`, 2,266 rows; `ice-final.trackq.json`), systems.lock.json, status.jsonl, plus live spot-checks on the VM (suite re-run, graphify CLI, adapter/scorer/engine source).
 

@@ -5,14 +5,18 @@ code is verbatim — behavior unchanged.
 """
 
 import logging
+import re
 import uuid
 
 from datetime import datetime, timezone
 from config import settings
 from schemas import ContextResponse, MemoryResponse, MemoryVisibility
 from memory.audit import _audit_log
+from memory.groups import GroupKey, _build_group_id, _encode_group_key, _is_plain_component, decode_group_id
 from memory.hashing import _created_at_key
 from memory.ranking import _mem_is_tombstoned
+
+_LEGACY_PROJECT_TAIL = re.compile(r"(?P<project>.+?)(?:--ws--(?P<workspace>.+))?")
 
 logger = logging.getLogger(__name__)
 
@@ -379,7 +383,10 @@ class ReadsMixin:
         text = str(memory_id).strip()
         if text.isascii() and text.isdigit():
             n = int(text)
-            return n if n < 2**64 else None
+            if n < 2**64:
+                return n
+            # Too large for an unsigned 64-bit id: a 32-digit dashless UUID
+            # made only of decimal digits lands here, so try the UUID parse.
         try:
             return str(uuid.UUID(text))
         except (ValueError, AttributeError, TypeError):
@@ -880,8 +887,27 @@ class ReadsMixin:
         if g is None:
             return []
 
+        # With the injective flag on, a project group whose owner or project id
+        # needs encoding is named ``nsg1--<hex>`` (see memory/groups.py), which
+        # no ``user--`` prefix seek finds: scan that prefix too and keep only
+        # the groups ``decode_group_id`` places in this caller's private pool or
+        # the shared pool. A non-plain caller id is never used in a legacy
+        # prefix (it could match another user's legacy namespace).
+        injective = settings.graph_group_id_injective_enabled
         user_prefix = f"user--{user_id}--project--"
         shared_prefix = "shared--project--"
+        encoded_prefixes: list[str] = []
+        if injective:
+            # The encoding is field-ordered (pool, owner, project, workspace), so
+            # this caller's private groups and the shared pool each share a stable
+            # hex prefix: seek those, never every user's encoded groups. The
+            # trailing "~" (absent-field) markers are dropped to get the prefix.
+            encoded_prefixes = [
+                _encode_group_key(GroupKey("private", user_id, None, None))[:-len(b"~~".hex())],
+                _encode_group_key(GroupKey("shared", None, None, None))[:-len(b"~~~".hex())],
+            ]
+            if not _is_plain_component(user_id):
+                user_prefix = encoded_prefixes[0]  # never a legacy prefix for a non-plain caller
         # One MATCH per indexed label so the per-label group_id range index is
         # used; UNION dedupes across labels (and is itself DISTINCT).
         cypher = """
@@ -897,12 +923,20 @@ class ReadsMixin:
         WHERE n.group_id STARTS WITH $user_prefix OR n.group_id STARTS WITH $shared_prefix
         RETURN DISTINCT n.group_id AS group_id
         """
+        if injective:
+            cypher = cypher.replace(
+                "OR n.group_id STARTS WITH $shared_prefix",
+                "OR n.group_id STARTS WITH $shared_prefix"
+                " OR n.group_id STARTS WITH $encoded_private_prefix"
+                " OR n.group_id STARTS WITH $encoded_shared_prefix",
+            )
+        params = {"user_prefix": user_prefix, "shared_prefix": shared_prefix}
+        if injective:
+            params["encoded_private_prefix"], params["encoded_shared_prefix"] = encoded_prefixes
 
         async def _run():
             async with g.driver.session() as session:
-                result = await session.run(
-                    cypher, user_prefix=user_prefix, shared_prefix=shared_prefix
-                )
+                result = await session.run(cypher, **params)
                 return await result.data()
 
         coro = _run()
@@ -918,6 +952,28 @@ class ReadsMixin:
         projects: set[str] = set()
         for rec in records:
             gid = rec.get("group_id") or ""
+            placement = decode_group_id(gid) if injective else None
+            if placement is not None:
+                if placement.project and (
+                    placement.pool == "shared"
+                    or (placement.pool == "private" and placement.owner == user_id)
+                ):
+                    projects.add(placement.project)
+                continue
+            if injective:
+                # Flag on: a legacy name counts only when the builder itself
+                # produces it for exactly this caller (or the shared pool), so a
+                # flag-off-era row of a colliding '--' user is not listed.
+                tail = (
+                    gid[len(user_prefix):] if gid.startswith(user_prefix) and user_prefix.startswith("user--")
+                    else gid[len(shared_prefix):] if gid.startswith(shared_prefix) else None
+                )
+                match = _LEGACY_PROJECT_TAIL.fullmatch(tail) if tail else None
+                if match is not None:
+                    pool, owner = ("private", user_id) if gid.startswith("user--") else ("shared", "")
+                    if gid == _build_group_id(pool, owner, match["project"], match["workspace"]):
+                        projects.add(match["project"])
+                continue
             # Both namespaces end with '--project--{pid}'; everything after the
             # separator is the project id. Global groups ('user--{uid}',
             # 'shared') have no separator and are skipped.

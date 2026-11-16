@@ -1,0 +1,2 @@
+{"cwd": "/home/user/sample-project", "message": {"content": "How do I run the unit tests for this project?", "role": "user"}, "parentUuid": null, "sessionId": "sess-0001", "type": "user", "uuid": "u1"}
+{"message": {"content": "Run npm test from the project root; it runs all twelve unit tests.", "model": "model-sample", "role": "assistant"}, "parentUuid": "u1", "sessionId": "sess-0001", "type": "assistant", "uuid": "a1"}
