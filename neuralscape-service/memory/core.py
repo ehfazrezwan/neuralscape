@@ -6,7 +6,6 @@ split) with its behavior unchanged. The Qdrant cold-start helpers above it
 afterwards and are not part of that extraction.
 """
 
-import inspect
 import logging
 import threading
 import time
@@ -363,6 +362,11 @@ class CoreMixin:
         abandoned to the OS (bounded by the process lifetime). The Qdrant and embedder client
         closes never raise; a failure closing the Graphiti driver still
         propagates, after everything else has been released.
+
+        Worst-case duration (a wedged bridge loop that never answers): the driver
+        close waits 5 s, then ``_AsyncBridge.shutdown`` waits up to 10 s for its
+        tasks to cancel and up to 10 s for the loop thread to stop, so about 25 s;
+        callers still blocked in the bridge are released when it returns.
         """
         # Flip the flag and take the clients under the same lock the lazy build uses,
         # so a concurrent rebuild either finishes first (and its clients are the ones
@@ -381,12 +385,12 @@ class CoreMixin:
             # closed, until the next _get_memory() replaces it.
             self._genai_model = None
             self._closed = True
-        coro = None
         try:
             if graphiti and bridge:
                 try:
-                    coro = graphiti.close()
-                    bridge.run(coro, timeout=_CLOSE_DRIVER_TIMEOUT_S)
+                    # The bridge closes the coroutine itself when it cannot run it
+                    # (shut-down bridge) and cancels it when its loop is stopped.
+                    bridge.run(graphiti.close(), timeout=_CLOSE_DRIVER_TIMEOUT_S)
                 except TimeoutError:
                     # A stopped or wedged bridge loop never answers; do not
                     # wait out the general bridge limit. The loop is torn down
@@ -403,11 +407,6 @@ class CoreMixin:
                 if callable(shutdown):
                     shutdown()
             finally:
-                # A close that never started (stopped loop) must not be left un-awaited.
-                if coro is not None and inspect.iscoroutine(coro) and (
-                    inspect.getcoroutinestate(coro) == inspect.CORO_CREATED
-                ):
-                    coro.close()
                 if memory is not None:  # never fall back to self._memory: it may be a rebuild
                     self._close_http_clients(memory)
 
