@@ -16,19 +16,18 @@ The PR fixed three things:
    affected memories so the consumer's defensive parsing fills the
    missing vault entries.
 
-It did NOT scrub the broken values already sitting in Qdrant. That
-hadn't bitten anything yet — UNTIL the wiki synthesizer ran. The
-synthesizer's Qdrant scroll filter
-(``extensions/wiki_synthesizer/synthesizer.py:374``) matches
-``metadata.visibility == "shared"`` strictly, so legacy-format points
-become invisible to it. Result: synthesis processes 6 of 92 SHARED
-memories on a Windows deployment that ran the old code.
+It did NOT scrub the broken values already sitting in Qdrant. Anything
+that filters on ``metadata.visibility == "shared"`` strictly (the
+synthesis extensions' Qdrant scroll filters, pool listings) cannot see the
+legacy-format points, so a deployment that ran the old code under-counts
+its SHARED memories until they are scrubbed.
 
 What this script does
 ---------------------
-Scrolls Qdrant for points where ``metadata.visibility`` is in the
-legacy stringified-enum format, rewrites just the visibility field to
-canonical lowercase, and uses ``client.set_payload(..., key="metadata")``
+Scrolls Qdrant for points where ``metadata.visibility`` (or, for the
+historical double-wrapped mem0 shape, ``metadata.metadata.visibility``) is
+in the legacy stringified-enum format, rewrites just the visibility field to
+canonical lowercase, and uses ``client.set_payload(..., key=<path>)``
 so the surrounding metadata dict is preserved untouched.
 
 What it does NOT do
@@ -44,9 +43,9 @@ What it does NOT do
 
 Usage
 -----
-Inside the running ``neuralscape`` container:
+One-off repair; run once, inside the running API container:
 
-    docker exec neuralscape-neuralscape-1 \\
+    docker exec <api-container> \\
         python scripts/scrub_qdrant_visibility.py [--dry-run]
 
 Idempotent. Safe to re-run. Once everything is canonical the next run
@@ -89,15 +88,33 @@ def _qdrant_client() -> QdrantClient:
     return QdrantClient(path=str(Path(settings.qdrant_path).expanduser()))
 
 
+# (payload field to match, ``set_payload`` key that scopes the merge to its parent):
+# the normal shape, and the historical double-wrapped one.
+_PATHS = (
+    ("metadata.visibility", "metadata"),
+    ("metadata.metadata.visibility", "metadata.metadata"),
+)
+
+
 def _scrub(client: QdrantClient, collection: str, legacy: str, canonical: str,
            dry_run: bool, batch: int = 200) -> tuple[int, int]:
-    """Convert all points where ``metadata.visibility == legacy``.
+    """Convert all points where ``metadata.visibility`` (either nesting) == ``legacy``.
 
     Returns ``(scanned, updated)``. ``updated`` is 0 in dry-run mode.
     """
+    scanned = updated = 0
+    for field, key in _PATHS:
+        s, u = _scrub_path(client, collection, legacy, canonical, field, key, dry_run, batch)
+        scanned += s
+        updated += u
+    return scanned, updated
+
+
+def _scrub_path(client: QdrantClient, collection: str, legacy: str, canonical: str,
+                field: str, key: str, dry_run: bool, batch: int) -> tuple[int, int]:
     flt = Filter(must=[
         FieldCondition(
-            key="metadata.visibility",
+            key=field,
             match=MatchValue(value=legacy),
         ),
     ])
@@ -128,7 +145,7 @@ def _scrub(client: QdrantClient, collection: str, legacy: str, canonical: str,
                 collection_name=collection,
                 payload={"visibility": canonical},
                 points=ids,
-                key="metadata",
+                key=key,
                 wait=True,
             )
             updated += len(ids)
