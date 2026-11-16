@@ -319,10 +319,9 @@ class TestRebuildGraphFromVectors:
         # Rebuild with max_rows=7
         result = service.rebuild_graph_from_vectors(user_id="u1", batch_size=5, max_rows=7)
 
-        # Should have scanned 7-8 (check happens after increment, stops mid-batch)
-        # The actual count depends on when the check runs; the important thing
-        # is that it's less than 10 (didn't process all)
-        assert 7 <= result["scanned"] <= 8
+        # max_rows is exact: the row that trips the cap is not counted.
+        assert result["scanned"] == 7
+        assert result["enriched"] == 7
         assert result["scanned"] < 10  # Didn't process all rows
 
     def test_passage_chunks_excluded(self, service):
