@@ -217,11 +217,17 @@ def _prove_gone(a: NSClient, story: Story) -> None:
     """Before restoring: every marker is unreachable through every surface."""
     pid = story.project_id
     # The surfaces must ANSWER (a 5xx would also make a check "fail"): search 200, graph listing 200,
-    # the task status endpoint says not_found, the artifact download says 404.
+    # the task status endpoint answers 404/not_found, the artifact download says 404.
     a.search("readiness probe", project_id=pid, limit=1)
     graph_listing(a, "episodes", pid)
-    state = a.task_status(story.task_ids["m1"]).get("status")
-    assert state == "not_found", f"task status after FLUSHALL is {state!r}, want not_found"
+    # An unknown task is a 404 on the status route ("404 when unknown or not theirs"); a 200 body saying
+    # not_found is the same answer. Anything else means the task is still known.
+    resp = a.get(f"/v1/memories/status/{story.task_ids['m1']}")
+    if resp.status_code == 404:  # the status route's own wording; a 404 from a wrong URL says something else
+        detail = str(resp.json().get("detail", "")) if resp.headers.get("content-type", "").startswith("application/json") else ""
+        assert "not found" in detail.lower() and story.task_ids["m1"] in detail, f"task status 404 is not the handler's 'Task <id> not found': {resp.text[:160]}"
+    state = "not_found" if resp.status_code == 404 else (resp.json().get("status") if resp.status_code == 200 else f"HTTP {resp.status_code}")
+    assert state == "not_found", f"task status after FLUSHALL is {state!r}, want not_found (404)"
     code = a.get(f"/v1/ingest/artifacts/{story.file_id}").status_code
     assert code == 404, f"artifact download after the wipe -> {code}, want 404"
     for key in ("m1", "m2"):
@@ -461,9 +467,9 @@ def test_layout_check_fails_for_partial_empty_or_incomplete_backups(tmp_path):
     expect_check_fails(check_backup_layout, root)  # neo4j missing from the manifest
     (good / "MANIFEST.txt").write_text("parts=redis qdrant files neo4j\n")
     assert check_backup_layout(root) == good  # complete: passes
-    (good / "redis" / "dump.rdb").write_text("")
     assert check_backup_layout(root, collection="c") == good
     expect_check_fails(check_backup_layout, root, "memory", "neuralscape_memories")  # the memories collection is not in the backup
+    (good / "redis" / "dump.rdb").write_text("")
     expect_check_fails(check_backup_layout, root)  # an empty part
     (good / "redis" / "dump.rdb").write_text("r")
     (good / "qdrant" / "c.snap").unlink()

@@ -216,9 +216,11 @@ def test_knowledge_registry_check_fails_without_systems(anon):
 
 
 def check_default_config(body: dict, project_id: str) -> None:
-    assert body == {"project_id": project_id, "code_systems": [], "fuse_code_into_recall": True, "default_engine": None}, (
-        f"config: {body}"
-    )
+    # code_space / op_preference are read-only here: only indexing fills them, and this project is never indexed.
+    assert body == {
+        "project_id": project_id, "code_systems": [], "fuse_code_into_recall": True, "default_engine": None,
+        "code_space": None, "op_preference": None,
+    }, f"config: {body}"
 
 
 @proves("knowledge.router", "auth.knowledge-config-authz")
