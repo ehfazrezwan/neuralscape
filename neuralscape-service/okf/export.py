@@ -32,8 +32,10 @@ from okf import translate
 
 logger = logging.getLogger(__name__)
 
-#: Hard ceiling on rows per pool scroll — bounds a pathological export.
-MAX_EXPORT_MEMORIES = 5000
+#: Ceiling on rows per pool scroll — bounds memory for a pathological export.
+#: It is never silent: a pool that hits it is reported as truncated, with the
+#: exported and total counts (response headers, the bundle's ``log.md``).
+MAX_EXPORT_MEMORIES = 50_000
 
 _GLOBAL_DIR = "global"
 _PROJECTS_DIR = "projects"
@@ -59,7 +61,12 @@ def _title_for(content: str) -> str:
 # ── Collection (visibility by construction) ─────────────────────────
 
 
-def _scroll(client, collection: str, must: list, limit: int) -> list:
+def _scroll(client, collection: str, must: list, limit: int) -> tuple[list, dict | None]:
+    """Page one pool to completion (500 per request), up to ``limit`` rows.
+
+    Returns ``(points, truncation)``; ``truncation`` is None when the whole
+    pool was read, else ``{"exported": n, "total": exact pool size}``.
+    """
     from qdrant_client.models import FieldCondition, Filter, MatchValue
 
     must_not = [
@@ -82,8 +89,26 @@ def _scroll(client, collection: str, must: list, limit: int) -> list:
         )
         points.extend(page or [])
         if offset is None or not page:
-            break
-    return points
+            return points, None
+    # The loop only exits here when ``limit`` rows were read and Qdrant still
+    # had a next page: the pool is larger than the cap.
+    total: int | None = None
+    try:
+        total = int(
+            client.count(
+                collection_name=collection,
+                count_filter=Filter(must=must, must_not=must_not),
+                exact=True,
+            ).count
+        )
+    except Exception:  # noqa: BLE001 - the flag matters more than the exact number
+        # A failed count must never turn into "complete": Qdrant still had a next
+        # page, so the pool IS larger than the cap. Report the cut with an unknown total.
+        logger.warning("OKF export: exact pool count failed; reporting truncation without a total", exc_info=True)
+        return points, {"exported": len(points), "total": None}
+    if total <= len(points):  # exactly at the cap with nothing more: not truncated
+        return points, None
+    return points, {"exported": len(points), "total": total}
 
 
 def _point_to_row(point) -> dict | None:
@@ -127,7 +152,26 @@ def collect_memories(
     visibility: str | None = None,
     limit: int = MAX_EXPORT_MEMORIES,
 ) -> list[dict]:
-    """Every memory the caller's identity can read, as plain row dicts.
+    """Rows only; see :func:`collect_memories_with_info` for the truncation report."""
+    return collect_memories_with_info(
+        service, user_id=user_id, project_id=project_id, scope=scope,
+        visibility=visibility, limit=limit,
+    )[0]
+
+
+def collect_memories_with_info(
+    service,
+    *,
+    user_id: str,
+    project_id: str | None = None,
+    scope: str | None = None,
+    visibility: str | None = None,
+    limit: int = MAX_EXPORT_MEMORIES,
+) -> tuple[list[dict], dict]:
+    """Every memory the caller's identity can read, as plain row dicts, plus a report.
+
+    The report is ``{"truncated": bool, "pools": {name: {"exported", "total"}}}``
+    where ``pools`` lists only the pools that hit ``limit``.
 
     ``visibility="shared"`` builds a team bundle: ONLY the shared pool is
     scrolled, so private rows are excluded by construction (the personal-
@@ -152,6 +196,7 @@ def collect_memories(
         )
 
     rows: dict[str, dict] = {}
+    truncated_pools: dict[str, dict] = {}
 
     # Personal pool — the caller's own memories, any visibility (you can
     # always read what you wrote). Mirrors _search_personal_pool's filter.
@@ -161,7 +206,10 @@ def collect_memories(
             must.append(
                 FieldCondition(key="metadata.visibility", match=MatchValue(value=visibility))
             )
-        for point in _scroll(client, collection, must, limit):
+        points, cut = _scroll(client, collection, must, limit)
+        if cut:
+            truncated_pools["personal"] = cut
+        for point in points:
             row = _point_to_row(point)
             if row:
                 rows[row["memory_id"]] = row
@@ -172,12 +220,16 @@ def collect_memories(
         must = [
             FieldCondition(key="metadata.visibility", match=MatchValue(value="shared"))
         ] + common
-        for point in _scroll(client, collection, must, limit):
+        points, cut = _scroll(client, collection, must, limit)
+        if cut:
+            truncated_pools["shared"] = cut
+        for point in points:
             row = _point_to_row(point)
             if row:
                 rows.setdefault(row["memory_id"], row)
 
-    return list(rows.values())
+    info = {"truncated": bool(truncated_pools), "pools": truncated_pools}
+    return list(rows.values()), info
 
 
 # ── Bundle rendering ────────────────────────────────────────────────
@@ -263,8 +315,13 @@ def build_bundle(
     *,
     bundle_name: str = "neuralscape",
     generated_at: datetime | None = None,
+    truncation: dict | None = None,
 ) -> dict[str, str]:
-    """Render memories into ``{relative_path: content}`` bundle files."""
+    """Render memories into ``{relative_path: content}`` bundle files.
+
+    ``truncation`` (the report from :func:`collect_memories_with_info`, when
+    ``truncated``) is written into ``log.md`` so a cut bundle says so itself.
+    """
     now = generated_at or datetime.now(timezone.utc)
     files: dict[str, str] = {}
 
@@ -339,14 +396,18 @@ def build_bundle(
                 translate.log_entry("Update", f"Revised [{title}](/{path}).")
             )
     export_day = now.date().isoformat()
-    by_date[export_day].insert(
-        0,
-        translate.log_entry(
-            "Export",
-            f"Bundle generated from {len(memories)} memories "
-            f"([index](/{translate.INDEX_FILENAME})).",
-        ),
+    export_text = (
+        f"Bundle generated from {len(memories)} memories "
+        f"([index](/{translate.INDEX_FILENAME}))."
     )
+    if truncation and truncation.get("truncated"):
+        parts = ", ".join(
+            f"{name} pool {c['exported']} of "
+            + (str(c["total"]) if c["total"] is not None else f"more than {c['exported']}")
+            for name, c in sorted(truncation.get("pools", {}).items())
+        )
+        export_text += f" INCOMPLETE: the export cap was reached ({parts})."
+    by_date[export_day].insert(0, translate.log_entry("Export", export_text))
     dated = sorted(by_date.items(), key=lambda kv: kv[0], reverse=True)
     files[translate.LOG_FILENAME] = translate.render_log(
         f"{bundle_name} Update Log", dated
@@ -370,21 +431,27 @@ def export_bundle(
     scope: str | None = None,
     visibility: str | None = None,
     bundle_name: str = "neuralscape",
+    limit: int | None = None,
 ) -> tuple[bytes, dict]:
     """Collect → render → zip. Returns ``(zip_bytes, stats)``."""
-    memories = collect_memories(
+    memories, info = collect_memories_with_info(
         service,
         user_id=user_id,
         project_id=project_id,
         scope=scope,
         visibility=visibility,
+        limit=MAX_EXPORT_MEMORIES if limit is None else limit,
     )
-    files = build_bundle(memories, bundle_name=bundle_name)
+    files = build_bundle(memories, bundle_name=bundle_name, truncation=info)
     stats = {
         "concepts": len(memories),
         "files": len(files),
         "visibility": visibility or "all-readable",
+        "truncated": info["truncated"],
+        "truncated_pools": info["pools"],
     }
+    if info["truncated"]:
+        logger.warning("OKF export truncated at the cap: %s", info["pools"])
     logger.info(
         "OKF export for user=%s project=%s scope=%s visibility=%s → %d concepts / %d files",
         user_id, project_id, scope, visibility, stats["concepts"], stats["files"],
