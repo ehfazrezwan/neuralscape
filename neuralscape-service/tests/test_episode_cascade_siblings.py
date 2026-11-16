@@ -1322,3 +1322,97 @@ class TestOwnerlessConversationRows:
         conv = seed_conversation(w, n=2, stamp_owner=False)
         w.svc._delete_qdrant_memory_with_graph_cleanup(conv.ids[0], w.q.points[conv.ids[0]])
         assert conv.uuid not in w.g.episodes
+
+
+# ──────────────────────────────────────────────
+# TTL expiry sweep (expire_old_memories) repairs siblings like a bulk delete
+# ──────────────────────────────────────────────
+
+
+def _expire(w, *ids, when="2000-01-01T00:00:00+00:00"):
+    for i in ids:
+        w.q.meta(i)["expires_at"] = when
+
+
+class TestTtlSweep:
+    def test_expiring_one_fact_keeps_the_siblings_graph_evidence(self, world):
+        w = world
+        conv = seed_conversation(w, n=4)
+        _expire(w, conv.ids[0])
+
+        out = w.svc.expire_old_memories(batch_size=100)
+
+        assert out["deleted_count"] == 1 and out["per_user"] == {OWNER: 1}
+        assert conv.ids[0] not in w.q.points and all(i in w.q.points for i in conv.ids[1:])
+        for s in conv.ids[1:]:                       # stale refs cleared on the survivors
+            assert w.q.meta(s)["graph_episode_uuid"] is None
+        assert sorted(j["memory_id"] for j in out["graph_jobs"]) == sorted(conv.ids[1:])
+        assert out["graph_jobs_count"] == 3
+        assert out["graph_cascade_unresolved_ids"] == [] and out["graph_sibling_unrepaired_ids"] == []
+        assert conv.uuid not in w.g.episodes         # the episode holding the expired fact is gone
+
+    def test_cascade_runs_once_per_episode_for_several_expired_rows(self, world):
+        w = world
+        conv = seed_conversation(w, n=4)
+        _expire(w, conv.ids[0], conv.ids[1])
+
+        out = w.svc.expire_old_memories(batch_size=100)
+
+        assert out["deleted_count"] == 2
+        assert len(w.g.kinds("lookup_uuid")) == 1 and len(w.g.kinds("expire_episode_edges")) == 1
+        assert sorted(j["memory_id"] for j in out["graph_jobs"]) == sorted(conv.ids[2:])   # never an expired row
+
+    def test_whole_episode_expired_has_no_jobs(self, world):
+        w = world
+        conv = seed_conversation(w, n=3)
+        _expire(w, *conv.ids)
+        out = w.svc.expire_old_memories(batch_size=100)
+        assert out["deleted_count"] == 3 and out["graph_jobs"] == [] and out["graph_jobs_count"] == 0
+        assert w.q.points == {} and w.g.live_edges() == []
+
+    def test_unexpired_rows_and_other_episodes_are_untouched(self, world):
+        w = world
+        a = seed_conversation(w, n=2, tag="ca", start=1)
+        b = seed_conversation(w, n=2, tag="cb", start=10)
+        _expire(w, a.ids[0])
+        out = w.svc.expire_old_memories(batch_size=100)
+        assert {j["memory_id"] for j in out["graph_jobs"]} == {a.ids[1]}
+        assert b.uuid in w.g.episodes and all(w.q.meta(i)["graph_episode_uuid"] == b.uuid for i in b.ids)
+
+    def test_unresolved_episode_is_reported(self, world):
+        w = world
+        w.q.add(rid(500), "orphan fact", graph_episode_uuid="ep-missing", expires_at="2000-01-01T00:00:00+00:00")
+        out = w.svc.expire_old_memories(batch_size=100)
+        assert out["deleted_count"] == 1
+        assert out["graph_cascade_unresolved_ids"] == [rid(500)]
+        assert "graph_jobs_count" in out
+
+    def test_graph_disabled_still_expires_and_reports_empty_graph_keys(self, world):
+        w = world
+        conv = seed_conversation(w, n=2)
+        _expire(w, conv.ids[0])
+        w.svc._graphiti = None
+        out = w.svc.expire_old_memories(batch_size=100)
+        assert out["deleted_count"] == 1 and out["graph_jobs"] == [] and out["graph_cascade_unresolved_ids"] == []
+
+    def test_cron_enqueues_the_sibling_jobs(self, world):
+        import worker
+
+        w = world
+        conv = seed_conversation(w, n=3)
+        _expire(w, conv.ids[0])
+        enqueued = []
+
+        async def fake_enqueue(ctx, jobs, adapter):
+            enqueued.extend(jobs)
+            return len(jobs)
+
+        ctx = {"service": w.svc}
+        orig = worker._enqueue_graph_jobs
+        worker._enqueue_graph_jobs = fake_enqueue
+        try:
+            out = asyncio.run(worker.expire_old_memories_cron(ctx))
+        finally:
+            worker._enqueue_graph_jobs = orig
+        assert sorted(j["memory_id"] for j in enqueued) == sorted(conv.ids[1:])
+        assert out["graph_jobs_enqueued"] == 2 and "graph_jobs" not in out
