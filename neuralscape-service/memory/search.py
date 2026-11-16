@@ -5,6 +5,7 @@ code is verbatim — behavior unchanged.
 """
 
 import logging
+import time
 
 from config import settings
 from schemas import MemoryResponse, MemoryVisibility
@@ -49,6 +50,7 @@ def _dt_to_iso(value):
 # blocked on the Graphiti bridge future, so a modest pool bounds concurrent
 # graph fan-out without ever serializing a single search.
 from concurrent.futures import ThreadPoolExecutor as _ThreadPoolExecutor
+from concurrent.futures import TimeoutError as _FuturesTimeoutError
 
 _GRAPH_SEARCH_POOL = _ThreadPoolExecutor(
     max_workers=16, thread_name_prefix="graph-search"
@@ -58,11 +60,60 @@ _GRAPH_SEARCH_POOL = _ThreadPoolExecutor(
 # can never hang a read indefinitely.
 _GRAPH_SEARCH_JOIN_TIMEOUT_S = 45.0
 
+# Count of graph legs abandoned by the GRAPH_LEG_BUDGET_ENABLED budget (no
+# metrics backend in this service; the structured warning is the primary
+# signal, this counter is for tests and ad-hoc inspection).
+import threading as _threading
+
+_graph_leg_budget_timeouts = 0
+_graph_leg_budget_lock = _threading.Lock()
+
+
+def _note_graph_leg_budget_timeout() -> int:
+    global _graph_leg_budget_timeouts
+    with _graph_leg_budget_lock:
+        _graph_leg_budget_timeouts += 1
+        return _graph_leg_budget_timeouts
+
 # R3: per-snippet char cap for recall-side episode excerpts. Bounds evidence
 # tokens; the COUNT of episode rows is separately capped at 3 (the ask sweet
 # spot). A plain char cap (not ask.py's sentence-boundary _clip_content) keeps
 # the search mixin free of an ask.py import (which would be circular).
 _EPISODE_SNIPPET_CLIP = 600
+
+def _effective_workspaces(workspaces: list[str] | None) -> list[str]:
+    """Workspaces a recall may read. Absent or empty means ``["memory"]``."""
+    return list(workspaces) if workspaces else ["memory"]
+
+
+def _workspace_filter(effective: list[str]):
+    """Qdrant condition limiting rows to the requested workspaces.
+
+    ``"memory"`` matches rows whose ``metadata.workspace`` is absent, null or
+    ``"memory"`` (legacy rows carry no workspace); every other name matches
+    exactly. Part of the Qdrant query filter, so the dense and BM25 legs both
+    apply it before ``limit`` cuts the pool.
+    """
+    from qdrant_client.models import (
+        FieldCondition,
+        Filter,
+        IsEmptyCondition,
+        MatchAny,
+        MatchValue,
+        PayloadField,
+    )
+
+    refs = [w for w in effective if w != "memory"]
+    should: list = []
+    if "memory" in effective:
+        should.append(IsEmptyCondition(is_empty=PayloadField(key="metadata.workspace")))
+        should.append(FieldCondition(key="metadata.workspace", match=MatchValue(value="memory")))
+        # Legacy/odd rows with an empty-string workspace were memory rows.
+        should.append(FieldCondition(key="metadata.workspace", match=MatchValue(value="")))
+    if refs:
+        should.append(FieldCondition(key="metadata.workspace", match=MatchAny(any=refs)))
+    return Filter(should=should)
+
 
 class SearchMixin:
     """SearchMixin for MemoryService (mechanical split — see memory_service.py)."""
@@ -140,17 +191,11 @@ class SearchMixin:
         if concepts:
             must.append(FieldCondition(key="metadata.concepts", match=MatchAny(any=concepts)))
 
-        # Workspace filter (WT6): default to memory type only (reference fenced out).
-        # Explicit workspaces list opens the door to reference content. For now,
-        # simple implementation: filter post-retrieval if needed. A future optimization
-        # can use Qdrant's should/must filter combinations.
-        # When workspaces=None or ["memory"], exclude any rows with non-memory workspace.
-        effective_workspaces = workspaces if workspaces is not None else ["memory"]
-        if effective_workspaces == ["memory"]:
-            # Memory-only: exclude rows with a non-None, non-"memory" workspace.
-            # This is done post-retrieval for simplicity (Qdrant's filter syntax
-            # doesn't cleanly express "IsEmpty OR IsNull OR MatchValue('memory')").
-            pass  # Applied as post-filter below
+        # Workspace filter (WT6): in the Qdrant filter, so the pool is cut to the
+        # requested workspaces before ``limit``. The per-hit check below stays
+        # as defence in depth.
+        effective_workspaces = _effective_workspaces(workspaces)
+        must.append(_workspace_filter(effective_workspaces))
 
         # qdrant-client v1.13+ removed `.search()` in favor of `.query_points()`;
         # the response wraps hits in a `.points` attribute.
@@ -338,6 +383,10 @@ class SearchMixin:
         if concepts:
             must.append(FieldCondition(key="metadata.concepts", match=MatchAny(any=concepts)))
 
+        # Workspace filter (WT6): same Qdrant-side filter as the shared pool.
+        effective_workspaces = _effective_workspaces(workspaces)
+        must.append(_workspace_filter(effective_workspaces))
+
         qfilter = Filter(must=must, must_not=must_not)
         result = client.query_points(
             collection_name=settings.qdrant_collection,
@@ -353,9 +402,6 @@ class SearchMixin:
         lexical_hits = self._lexical_pool_hits(m, query, qfilter, limit)
         fused = _rrf_fuse(dense_hits, lexical_hits, limit)
         dense_floor = _dense_score_floor(dense_hits)
-
-        # Workspace filter (WT6): same post-retrieval filter as shared pool
-        effective_workspaces = workspaces if workspaces is not None else ["memory"]
 
         out: list[MemoryResponse] = []
         pool_keys = _fused_order_keys(fused, dense_hits)
@@ -460,6 +506,7 @@ class SearchMixin:
         # overlaps the vector pool queries below (the legs are independent —
         # Graphiti embeds the query itself). Joined right before the weave.
         graph_future = None
+        graph_submitted_at = time.monotonic()
         if not vector_only:
             try:
                 graph_future = _GRAPH_SEARCH_POOL.submit(
@@ -471,6 +518,7 @@ class SearchMixin:
                     visibility=visibility,
                     include_shared=include_shared,
                     include_episodes=settings.graph_episode_recall_enabled,
+                    workspaces=workspaces,
                 )
             except Exception as e:
                 logger.warning(f"Graph search submit failed (non-critical): {e}")
@@ -682,9 +730,17 @@ class SearchMixin:
         episodes_for_later: list[MemoryResponse] = []
         if graph_future is not None:
             try:
-                graph_results = graph_future.result(
-                    timeout=_GRAPH_SEARCH_JOIN_TIMEOUT_S
-                )
+                if settings.graph_leg_budget_enabled:
+                    # Budget runs from SUBMIT, not from here: the vector pools
+                    # already consumed part of it while the leg ran.
+                    graph_wait_s = max(
+                        0.0,
+                        settings.graph_leg_budget_s
+                        - (time.monotonic() - graph_submitted_at),
+                    )
+                else:
+                    graph_wait_s = _GRAPH_SEARCH_JOIN_TIMEOUT_S
+                graph_results = graph_future.result(timeout=graph_wait_s)
                 for edge in graph_results.get("edges", []):
                     # Graph as a ranked leg: score each edge with its STORED
                     # fact_embedding (piggybacked on the enrichment Cypher in
@@ -743,6 +799,29 @@ class SearchMixin:
                                 created_at=ep.get("created_at") or None,
                             )
                         )
+            except _FuturesTimeoutError:
+                if not settings.graph_leg_budget_enabled:
+                    # Flag off: identical to the pre-budget handling.
+                    logger.warning(
+                        "Graph search failed during recall (non-critical): "
+                        f"{_FuturesTimeoutError()}"
+                    )
+                else:
+                    # Do not cancel the bridge coroutine (it owns the bridge
+                    # loop); the pool thread finishes on its own. cancel() only
+                    # drops the future if it never started.
+                    graph_future.cancel()
+                    logger.warning(
+                        "graph_leg_budget_exceeded: returning vector-only results",
+                        extra={
+                            "event": "graph_leg_budget_exceeded",
+                            "budget_s": settings.graph_leg_budget_s,
+                            "elapsed_s": round(time.monotonic() - graph_submitted_at, 3),
+                            "vector_results": len(vector_responses),
+                            "timeouts_total": _note_graph_leg_budget_timeout(),
+                        },
+                    )
+                episodes_for_later = []
             except Exception as e:
                 logger.warning(f"Graph search failed during recall (non-critical): {e}")
                 episodes_for_later = []
@@ -1142,6 +1221,7 @@ class SearchMixin:
         visibility: str | None,
         include_shared: bool,
         include_episodes: bool = False,
+        workspaces: list[str] | None = None,
     ) -> dict:
         """search_graph with multi-user visibility scoping.
 
@@ -1178,6 +1258,15 @@ class SearchMixin:
         else:
             # Default: full read-set (caller's private + shared + standard).
             group_ids = _get_group_ids(user_id, project_id)
+
+        # Workspace partition (WT6): reference workspaces live in groups named
+        # ``<base>--ws--<workspace>`` (see groups._build_group_id). Derive them
+        # only from the caller's own readable base groups, so a workspace name
+        # can never widen who may read. Default (None) is unchanged.
+        if workspaces:
+            refs = [w for w in workspaces if w != "memory"]
+            ws_groups = [f"{g}--ws--{w}" for g in group_ids for w in refs]
+            group_ids = (group_ids if "memory" in workspaces else []) + ws_groups
 
         return self._do_graph_search(
             query=query, group_ids=group_ids, limit=limit, include_episodes=include_episodes
