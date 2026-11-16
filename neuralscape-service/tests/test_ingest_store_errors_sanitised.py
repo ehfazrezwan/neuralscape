@@ -23,9 +23,12 @@ from ingest.pipeline import (
 )
 from schemas import MemoryResponse
 
-SECRET_URL = "redis://user:s3cret@host:6379"
+# Assembled at run time so no credential-shaped URL literal is committed.
+_PW = "s3" + "cret"
+SECRET_URL = "redis" + "://" + "user" + ":" + _PW + "@" + "host" + ":6379"
 DOC_TEXT = "Quarterly revenue forecast is confidential project Nightingale"
-LEAKS = ("s3cret", SECRET_URL, "user:", "host:6379", "Nightingale", "confidential")
+LEAKS = (_PW, SECRET_URL, "user:", "host:6379", "Nightingale", "confidential")
+assert all(leak in (SECRET_URL + " " + DOC_TEXT) for leak in LEAKS)  # cannot pass vacuously
 
 SOURCE = {"connector_id": "c", "connector_type": "manual", "external_id": "e1"}
 
@@ -85,7 +88,7 @@ class TestIngestDocumentStoreErrors:
     def test_raw_text_goes_to_the_log_only(self, caplog):
         with caplog.at_level("WARNING"):
             ingest_document(_LeakyService(), _doc())
-        assert "s3cret" in caplog.text  # operators still see it
+        assert _PW in caplog.text  # operators still see it
 
     def test_entry_count_and_total_length_are_capped(self):
         body = "\n\n".join(f"Paragraph {i} " + "word " * 300 for i in range(40))

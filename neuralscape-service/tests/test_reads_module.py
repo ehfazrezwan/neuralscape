@@ -21,7 +21,10 @@ from qdrant_client.models import (
     FieldCondition,
     Filter,
     HasIdCondition,
+    IsEmptyCondition,
+    MatchAny,
     MatchValue,
+    PayloadField,
 )
 
 import memory.reads as reads
@@ -438,7 +441,18 @@ class TestContextFilters:
         assert FieldCondition(key="user_id", match=MatchValue(value="alice")) in own.must
         assert FieldCondition(key="metadata.project_id", match=MatchValue(value="proj")) in shared.must
         assert FieldCondition(key="metadata.visibility", match=MatchValue(value="shared")) in shared.must
-        inner = [c for c in own.must if isinstance(c, Filter)][0]
+        # own rows: the caller's rows in the default ("memory") workspace only
+        # (reference-workspace rows stay out of session-start context), plus
+        # a scope=global-or-this-project branch. Order: user, workspace, scope.
+        assert len(own.must) == 3
+        ws_fence, inner = own.must[1], own.must[2]
+        assert isinstance(ws_fence, Filter) and isinstance(inner, Filter)
+        assert IsEmptyCondition(is_empty=PayloadField(key="metadata.workspace")) in ws_fence.should
+        assert FieldCondition(key="metadata.workspace", match=MatchValue(value="memory")) in ws_fence.should
+        assert FieldCondition(key="metadata.workspace", match=MatchValue(value="")) in ws_fence.should
+        assert not any(
+            isinstance(c, FieldCondition) and isinstance(c.match, MatchAny) for c in ws_fence.should
+        ), "no reference workspace may be admitted"
         assert FieldCondition(key="metadata.project_id", match=MatchValue(value="proj")) in inner.should
         assert FieldCondition(key="metadata.scope", match=MatchValue(value="global")) in inner.should
 
