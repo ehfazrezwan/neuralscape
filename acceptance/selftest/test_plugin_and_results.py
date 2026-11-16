@@ -125,7 +125,7 @@ def test_list_writes_inventory_without_running(scen):
     listing = scen.path / "inv.json"
     scen.runpytest_subprocess("-p", "nsaccept.pytest_plugin", "--ns-list-out", str(listing), "-p", "no:cacheprovider")
     inv = {i["id"]: i for i in json.loads(listing.read_text())}
-    assert len(inv) == 7  # every scenario, regardless of profile
+    assert len(inv) == 8  # every scenario, regardless of profile
     assert inv["test_scen::test_only_flagx"]["profiles"] == ["flagx"]
     assert inv["test_scen::test_default_pass"]["profiles"] == ["default"]
     assert inv["test_scen::test_default_pass"]["proves"] == ["x.one", "x.two"]
