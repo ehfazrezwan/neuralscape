@@ -29,6 +29,7 @@ from __future__ import annotations
 import third_party_telemetry  # noqa: F401  (telemetry guard; must precede mem0/graphiti imports)
 
 import asyncio
+import contextlib
 import json
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -92,6 +93,42 @@ class _Source:
         self.server.server_close()
 
 
+@contextlib.contextmanager
+def _restoring_app_state(main):
+    """Put back what a real startup leaves on the shared app.
+
+    The lifespan mounts the extension routes on the process-wide ``main.app`` and injects the task manager
+    into the extension instances. Left in place, those mounted routes shadow the router another test
+    builds for itself on the same paths (``test_extension_route_identity_redis``), so snapshot and restore
+    the router's route list, the OpenAPI cache, the module globals the lifespan assigns, and the
+    extensions' injected task manager.
+    """
+
+    app = main.app
+    registry = main._extension_registry
+    extensions = dict(registry._extensions)
+    injected = {name: getattr(e.instance, "_task_manager", None) for name, e in extensions.items()}
+    saved = (list(app.router.routes), app.openapi_schema, main._vault, main._task_manager, registry)
+    try:
+        yield
+    finally:
+        app.router.routes[:] = saved[0]
+        app.openapi_schema = saved[1]
+        main._vault, main._task_manager, main._extension_registry = saved[2], saved[3], saved[4]
+        registry._extensions.clear()
+        registry._extensions.update(extensions)
+        for name, e in extensions.items():
+            if hasattr(e.instance, "_task_manager"):
+                e.instance._task_manager = injected[name]
+
+
+@contextlib.contextmanager
+def _real_startup(main):
+    """``TestClient(main.app)`` running the app's real lifespan, with the shared app restored afterwards."""
+    with _restoring_app_state(main), TestClient(main.app) as client:
+        yield client
+
+
 class _FakeRedis:
     async def enqueue_job(self, *args, **kwargs):
         return SimpleNamespace(job_id="job")
@@ -149,6 +186,8 @@ def env(flags, stores, llm_key, unique_ns, monkeypatch):
     alice, bob = unique_ns.user_id, unique_ns.user_id + "-bob"
     cid = f"nsit-conn-{unique_ns.user_id[-10:]}"
     source = _Source()
+    # The destination guard stays real: an operator allows this loopback http source by host:port.
+    flags(connector_allowed_hosts=source.url.split("/")[2])
 
     def cleanup():
         source.close()
@@ -275,7 +314,7 @@ def test_flag_off_the_real_startup_builds_no_vault_and_every_route_is_503(env, f
     flags(connectors_enabled=False)
     monkeypatch.setattr(main, "_vault", None)
     h = _bearer(env.alice)
-    with TestClient(main.app) as c:
+    with _real_startup(main) as c:
         assert main._vault is None
         assert c.get("/v1/connectors", headers=h).status_code == 503
         assert c.get(f"/v1/connectors/{env.cid}", headers=h).status_code == 503
@@ -292,7 +331,36 @@ def test_flag_on_the_real_startup_builds_the_vault_and_the_routes_answer(env, fl
 
     flags(connectors_enabled=True)
     monkeypatch.setattr(main, "_vault", None)
-    with TestClient(main.app) as c:
+    with _real_startup(main) as c:
         assert main._vault is not None, "startup did not build the vault with CONNECTORS_ENABLED and a valid key"
         r = c.get("/v1/connectors", headers=_bearer(env.alice))
         assert r.status_code == 200 and r.json() == {"connectors": []}
+
+
+def test_real_startup_helper_leaves_no_mounted_routes_or_globals_behind(monkeypatch):
+    """Store-free: what a real startup does to the shared app is undone when the helper exits."""
+    import main
+    from fastapi import APIRouter
+
+    sentinel_tm, sentinel_vault = object(), object()
+    monkeypatch.setattr(main, "_task_manager", sentinel_tm)
+    monkeypatch.setattr(main, "_vault", sentinel_vault)
+    routes_before = list(main.app.router.routes)
+    schema_before = main.app.openapi_schema
+    extensions_before = dict(main._extension_registry._extensions)
+
+    with _restoring_app_state(main):
+        # what the lifespan does, minus the stores it needs
+        router = APIRouter()
+        router.add_api_route("/v1/extensions/real-startup-probe/x", lambda: None, methods=["POST"])
+        main.app.include_router(router)
+        main.app.openapi_schema = {"stale": True}
+        main._vault, main._task_manager = None, object()
+        main._extension_registry._extensions["probe"] = object()
+        main._extension_registry._extensions.pop(next(iter(extensions_before), "none"), None)
+        assert len(main.app.router.routes) > len(routes_before)
+
+    assert main.app.router.routes == routes_before
+    assert main.app.openapi_schema is schema_before
+    assert main._vault is sentinel_vault and main._task_manager is sentinel_tm
+    assert main._extension_registry._extensions == extensions_before
