@@ -1,8 +1,11 @@
 """Flag-on proof: the strategy-playbook synthesizer cron against real stores.
 
-``STRATEGY_SYNTHESIZER_ENABLED`` on. Real Qdrant (throwaway collection), the real
-embedder, the real Gemini merge call (``llm_key``) and Graphiti's Neo4j for the
-back-reference patch; the vault is a temp directory. Two trading rule memories
+``STRATEGY_SYNTHESIZER_ENABLED`` on (the synthesizer's own settings object, which
+the ``flags`` fixture does not cover, so it is set with ``monkeypatch``). Real
+Qdrant (throwaway collection), the real embedder, the real Gemini merge call
+(``llm_key``) and real Neo4j: graph nodes carrying the source ``memory_id`` are
+seeded and must come back stamped with ``strategy_playbook_path`` /
+``strategy_synthesized_at``; the vault is a temp directory. Two trading rule memories
 tagged ``strategy:<name>`` are written through the real ``store_raw``; the cron
 function must write ``Playbooks/<owner>/<name>.md`` (version 1, both source ids,
 a body from the model), skip an unchanged second run, and a memory with no
@@ -46,6 +49,15 @@ def _rule(svc, uid, text, category, tags):
     return out[0].id
 
 
+def _cypher(svc, query, **params):
+    async def _run():
+        async with svc._graphiti.driver.session() as session:
+            result = await session.run(query, **params)
+            return await result.data()
+
+    return svc._run_on_bridge(_run(), timeout=60.0)
+
+
 def _cron(svc):
     import worker
 
@@ -54,7 +66,11 @@ def _cron(svc):
 
 def test_flag_on_writes_a_versioned_playbook_and_skips_an_unchanged_rerun(svc, unique_ns):
     from extensions.strategy_synthesizer.config import strategy_synthesizer_settings as s
-    from extensions.strategy_synthesizer.playbook_renderer import split_existing_page
+    from extensions.strategy_synthesizer.playbook_renderer import (
+        playbook_page_path,
+        playbook_rel_path,
+        split_existing_page,
+    )
 
     uid = unique_ns.user_id
     name = f"it-{uuid.uuid4().hex[:8]}"
@@ -63,17 +79,34 @@ def test_flag_on_writes_a_versioned_playbook_and_skips_an_unchanged_rerun(svc, u
     b = _rule(svc, uid, "Place the stop 5 pips below the tail low (Ch4 p.53).", "stop_rule", [f"strategy:{name}"])
     untagged = _rule(svc, uid, "A stray take-profit rule with no strategy tag.", "take_profit_rule", None)
 
+    # Graph nodes the synthesizer's graph_patcher must stamp (matched by memory_id), plus one it must not touch.
+    node_a, node_b, node_other = (f"{unique_ns.group_prefix}-n-{i}" for i in "abx")
+    for uuid_, mid in ((node_a, a), (node_b, b), (node_other, untagged)):
+        _cypher(svc, "CREATE (:Entity {uuid: $u, name: $u, group_id: $g, memory_id: $m})",
+                u=uuid_, g=f"user--{uid}", m=mid)
+    unique_ns.on_cleanup(lambda: _cypher(svc, "MATCH (n:Entity {group_id: $g}) DETACH DELETE n", g=f"user--{uid}"))
+
     out = _cron(svc)
     assert out["playbooks_created"] == 1 and out["errors"] == [], out
 
-    page = s.playbook_dir / uid / f"{name}.md"
+    page = playbook_page_path(s.playbook_dir, uid, name)
     assert page.exists(), list(s.playbook_dir.rglob("*"))
     fm, body = split_existing_page(page.read_text())
-    assert int(fm["version_number"]) == 1
-    assert a in fm["source_memory_ids"] and b in fm["source_memory_ids"]
-    assert untagged not in fm["source_memory_ids"]
-    assert body.strip(), "the model produced a playbook body"
+    assert fm["kind"] == "strategy_playbook" and fm["strategy_name"] == name and fm["owner"] == uid
+    assert int(fm["version_number"]) == 1 and int(fm["source_count"]) == 2
+    ids = {i.strip() for i in fm["source_memory_ids"].strip("[]").split(",")}
+    assert ids == {a, b}, ids  # the untagged memory is not a source
+    assert "p.52" in body and "p.53" in body, f"the merged body must keep both rules' citations:\n{body}"
     assert len(list(s.playbook_dir.rglob("*.md"))) == 1  # the untagged memory made no playbook
+
+    # The Neo4j back-reference: the contributing nodes are stamped, the unrelated one is not.
+    rel = playbook_rel_path(uid, name)
+    stamped = {r["u"]: r for r in _cypher(
+        svc, "MATCH (n:Entity {group_id: $g}) RETURN n.uuid AS u, n.strategy_playbook_path AS p, "
+             "n.strategy_synthesized_at AS t", g=f"user--{uid}")}
+    for node in (node_a, node_b):
+        assert stamped[node]["p"] == rel and stamped[node]["t"], stamped[node]
+    assert stamped[node_other]["p"] is None
 
     again = _cron(svc)
     assert again["playbooks_skipped_unchanged"] == 1 and again["playbooks_created"] == 0
