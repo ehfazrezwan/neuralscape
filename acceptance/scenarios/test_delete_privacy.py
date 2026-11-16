@@ -41,39 +41,28 @@ def _require(cond: bool, msg: str) -> None:
 
 # Isolation: every read below is made by a per-run user (acc-<runid>-a/-b) and the
 # server scopes it by the token's identity, so the fixed letters-only markers can
-# never match another run's data. Reads cover BOTH the per-run project and the
-# user-wide (global) pool: the extractor may file a personal fact (the dog's name)
-# as global scope, which a project-filtered read would not see.
+# never match another run's data. Listing, episodes and graph search stay filtered
+# to the per-run project (the write path keeps metadata.project_id even on
+# global-scope facts, and the bulk delete wipes only this project); the search
+# absence checks additionally look at the user-wide view, by id and by word.
 
 
 def _memories(client, project_id):
-    rows, seen = [], set()
-    for params in ({"project_id": project_id, "limit": 100}, {"limit": 100}):
-        r = client.get("/v1/memories", params=params)
-        assert r.status_code == 200, f"GET /v1/memories {params} -> {r.status_code}"
-        for m in r.json():
-            if m.get("id") not in seen:
-                seen.add(m.get("id"))
-                rows.append(m)
-    return rows
+    r = client.get("/v1/memories", params={"project_id": project_id, "limit": 100})
+    assert r.status_code == 200, f"GET /v1/memories -> {r.status_code}"
+    return r.json()
 
 
 def _episodes_text(client, project_id) -> str:
-    out = []
-    for params in ({"project_id": project_id, "limit": 100}, {"limit": 100}):
-        r = client.get("/v1/graph/episodes", params=params)
-        assert r.status_code == 200, f"GET /v1/graph/episodes {params} -> {r.status_code}"
-        out.append(r.text)
-    return "\n".join(out)
+    r = client.get("/v1/graph/episodes", params={"project_id": project_id, "limit": 100})
+    assert r.status_code == 200, f"GET /v1/graph/episodes -> {r.status_code}"
+    return r.text
 
 
 def _graph_search_text(client, project_id, query) -> str:
-    out = []
-    for body in ({"query": query, "project_id": project_id, "limit": 20}, {"query": query, "limit": 20}):
-        r = client.post("/v1/graph/search", json=body)
-        assert r.status_code == 200, f"POST /v1/graph/search -> {r.status_code}"
-        out.append(r.text)
-    return "\n".join(out)
+    r = client.post("/v1/graph/search", json={"query": query, "project_id": project_id, "limit": 20})
+    assert r.status_code == 200, f"POST /v1/graph/search -> {r.status_code}"
+    return r.text
 
 
 @pytest.fixture(scope="module")
