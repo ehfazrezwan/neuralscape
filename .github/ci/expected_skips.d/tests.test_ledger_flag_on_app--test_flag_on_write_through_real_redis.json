@@ -1,9 +1,0 @@
-{
-  "test": "tests.test_ledger_flag_on_app::test_flag_on_write_through_real_redis",
-  "reason_contains": "LEDGER_TEST_REDIS_URL not set (ledger flag-on real Redis",
-  "profiles": [
-    "container",
-    "host"
-  ],
-  "why": "missing infrastructure: needs real Redis (LEDGER_TEST_REDIS_URL); belongs under integration_tests/ with the stores fixture"
-}
