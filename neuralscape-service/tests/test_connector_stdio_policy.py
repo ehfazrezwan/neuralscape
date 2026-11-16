@@ -137,7 +137,13 @@ class TestRegisterRoute:
             {"transport": "stdio", "command": "/opt/ok/server", "args": ["--readonly"], "env": {"PATH": "/tmp"}}))
         assert r.status_code == 422
 
-    def test_unknown_transport_refused_and_http_unaffected(self, client):
+    def test_unknown_transport_refused_and_http_unaffected(self, client, monkeypatch):
+        import connectors.destination as destination
+
+        async def public(host, port):
+            return ["93.184.216.34"]
+
+        monkeypatch.setattr(destination, "resolve_host", public)
         assert client.post("/v1/connectors", json=_body({"transport": "pipe"})).status_code == 422
         assert client.post("/v1/connectors", json=_body({"url": "https://x/mcp"})).status_code == 201
 

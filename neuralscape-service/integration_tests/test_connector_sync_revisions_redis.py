@@ -80,6 +80,9 @@ def test_second_sync_skips_unchanged_items_and_reingests_only_the_changed_one(fl
     monkeypatch.setattr(worker, "_enqueue_graph_jobs", no_graph_jobs)
 
     source = _Source()
+    # The sink is an in-test loopback http server: allow exactly its host:port, as the
+    # destination policy requires for any internal or plain-http connector target.
+    flags(connector_allowed_hosts=source.url.split("/")[2])
 
     async def scenario():
         store = aioredis.Redis.from_url(stores.redis_url, decode_responses=True)

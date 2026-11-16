@@ -442,6 +442,10 @@ class Settings(BaseSettings):
     # stdio entirely. Allowlisting a general interpreter
     # (python, node, npx, sh ...) is equivalent to allowing arbitrary code.
     connector_stdio_commands: str = ""
+    # Comma-separated exact hostnames (optionally host:port) a connector may fetch
+    # even though they are internal (loopback / private / link-local) or plain http.
+    # Empty (default): connectors may only reach public hosts over https.
+    connector_allowed_hosts: str = ""
 
     # ── Document/file ingestion ───────────────────────────────────────
     # Rich formats (PDF, MS Office docx/xlsx/pptx, HTML, …) are converted to
@@ -1175,6 +1179,12 @@ class Settings(BaseSettings):
             if parts:
                 out.add(shlex.join(parts))
         return out
+
+    def connector_allowed_hosts_set(self) -> frozenset[str]:
+        """Parsed CSV of hosts connectors may reach despite the destination policy."""
+        from connectors.destination import parse_allowed_hosts
+
+        return parse_allowed_hosts(self.connector_allowed_hosts)
 
     # ── sensitivity gate helpers ──────────────────────────────────────────
     def sensitivity_private_classes_set(self) -> set[str]:
