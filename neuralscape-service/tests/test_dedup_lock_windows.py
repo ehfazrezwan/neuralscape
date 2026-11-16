@@ -291,6 +291,9 @@ class TestRedisUnreachable:
         removed = _tombstoned(service) if dreaming else _deleted(service)
         assert removed == ["b_old"], "page 1 skipped (never unlocked), page 2 done under the lock"
         assert "1 page" in res["semantic_skipped"] and "unavailable" in res["semantic_skipped"]
+        assert res["lock_store_unreachable_skipped"] == 1
+        assert sredis.sets >= 1, "page 2 was done under the pool lock once Redis answered"
+        assert sredis.keys == {}, "and the lock was released"
 
     def test_an_exact_group_is_skipped_and_the_next_group_probes_again(self, service, sredis, dreaming):
         fake = _FakeQdrant(service, [
@@ -309,6 +312,9 @@ class TestRedisUnreachable:
 
         assert _deleted(service) == ["y1"], "group x skipped, group y done under the lock"
         assert res["exact_groups_abandoned"] == 1 and res["exact_duplicates_removed"] == 1
+        assert res["lock_store_unreachable_skipped"] == 1
+        assert sredis.sets >= 1, "group y was deleted under the pool lock once Redis answered"
+        assert sredis.keys == {}, "and the lock was released"
 
     def test_an_exact_group_is_not_deleted_while_a_sweep_that_took_the_lock_first_still_runs(
         self, service, sredis, dreaming

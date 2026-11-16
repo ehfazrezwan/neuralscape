@@ -207,12 +207,21 @@ def _entries_to_text(entries: list[dict]) -> str:
     return "\n".join(lines)
 
 
+_LOCK_STORE_DOWN = "lock store unreachable"
+
+
+def _count(result: object, key: str) -> int:
+    """An int counter from a ``dedup_memories`` result (0 when absent or not a number)."""
+    value = result.get(key) if isinstance(result, dict) else 0
+    return value if isinstance(value, int) and not isinstance(value, bool) else 0
+
+
 async def _dedup_compiled_users(
     service: MemoryService,
     entries: list[dict],
     fallback_user_id: str,
     include_requester: bool = False,
-) -> tuple[bool, int, int]:
+) -> tuple[bool, int, int, dict]:
     """Run post-compile dedup for each user that owns a compiled entry.
 
     ``include_requester`` adds ``fallback_user_id`` (the user the compile was
@@ -226,7 +235,10 @@ async def _dedup_compiled_users(
     worker thread (issue #213: running it inline blocked the API event loop).
     One user's failure never stops the others. Returns True when every
     attempted dedup succeeded, plus the sibling graph jobs enqueued / not
-    enqueued from the ``graph_jobs`` the dedup runs returned.
+    enqueued from the ``graph_jobs`` the dedup runs returned, plus the skip
+    summary (``skipped`` / ``exact_groups_abandoned`` / ``reason``) summed over
+    the users: with Redis unreachable dedup skips every pooled group and page
+    rather than run unlocked, and that must stay visible to the caller.
     """
     users = {e["user_id"] for e in entries if e.get("user_id")}
     if include_requester or not users or any(not e.get("user_id") for e in entries):
@@ -234,9 +246,12 @@ async def _dedup_compiled_users(
     semantic = _semantic_dedup_enabled()
     ok = True
     enqueued = failed = 0
+    skip = {"skipped": 0, "exact_groups_abandoned": 0, "reason": None}
     for uid in sorted(users):
         try:
             result = await asyncio.to_thread(service.dedup_memories, uid, semantic=semantic)
+            skip["skipped"] += _count(result, "lock_store_unreachable_skipped")
+            skip["exact_groups_abandoned"] += _count(result, "exact_groups_abandoned")
             jobs = (result or {}).get("graph_jobs") or []
             if jobs:
                 e, f = await _enqueue_sibling_jobs(jobs)
@@ -245,7 +260,13 @@ async def _dedup_compiled_users(
         except Exception:
             ok = False
             logger.warning("Post-compile dedup failed (non-critical)", user_id=uid)
-    return ok, enqueued, failed
+    if skip["skipped"]:
+        skip["reason"] = _LOCK_STORE_DOWN
+        logger.warning(
+            "Post-compile dedup skipped work: lock store unreachable (non-critical)",
+            skipped=skip["skipped"],
+        )
+    return ok, enqueued, failed, skip
 
 
 async def _enqueue_sibling_jobs(jobs: list[dict]) -> tuple[int, int]:
@@ -303,10 +324,15 @@ async def compile_date(
         logger.info("No entries found for date", date=date)
         if not dedup_when_empty:
             return CompileResult(date=date)
-        dedup_ok, sibling_enqueued, sibling_failed = await _dedup_compiled_users(service, [], user_id)
+        dedup_ok, sibling_enqueued, sibling_failed, skip = await _dedup_compiled_users(
+            service, [], user_id
+        )
         return CompileResult(
             date=date,
-            dedup_triggered=dedup_ok,
+            dedup_triggered=dedup_ok and not skip["skipped"],
+            dedup_skipped=skip["skipped"],
+            dedup_exact_groups_abandoned=skip["exact_groups_abandoned"],
+            dedup_skipped_reason=skip["reason"],
             dedup_graph_jobs_enqueued=sibling_enqueued,
             dedup_graph_jobs_not_enqueued=sibling_failed,
         )
@@ -424,7 +450,7 @@ async def compile_date(
     # several users; each entry records its owner. Entries written before
     # owners were recorded fall back to the ``user_id`` the compile was
     # requested for. Sibling graph jobs the dedup returns are enqueued.
-    dedup_triggered, sibling_enqueued, sibling_failed = await _dedup_compiled_users(
+    dedup_ok, sibling_enqueued, sibling_failed, skip = await _dedup_compiled_users(
         service, entries, user_id, include_requester=dedup_when_empty
     )
 
@@ -432,7 +458,10 @@ async def compile_date(
         date=date,
         articles=articles,
         entries_compiled=entries_compiled,
-        dedup_triggered=dedup_triggered,
+        dedup_triggered=dedup_ok and not skip["skipped"],
+        dedup_skipped=skip["skipped"],
+        dedup_exact_groups_abandoned=skip["exact_groups_abandoned"],
+        dedup_skipped_reason=skip["reason"],
         dedup_graph_jobs_enqueued=sibling_enqueued,
         dedup_graph_jobs_not_enqueued=sibling_failed,
     )
@@ -442,6 +471,9 @@ async def compile_date(
         date=date,
         articles=len(articles),
         entries_compiled=entries_compiled,
+        dedup_triggered=result.dedup_triggered,
+        dedup_skipped=result.dedup_skipped,
+        dedup_skipped_reason=result.dedup_skipped_reason,
     )
 
     return result

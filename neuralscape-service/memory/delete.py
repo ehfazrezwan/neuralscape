@@ -1116,8 +1116,10 @@ class DeleteMixin:
         and renews ALL of its pools' locks before each delete, and re-reads its
         survivor (live, same key, same pool) as well: a group that fails either
         check is abandoned with no further write. Redis unreachable: nothing
-        destructive runs, whatever the dreaming setting (a sweep that took its
-        lock before the failed probe may still be running). A failed probe is not
+        destructive runs for a pool that has a dream lock (dreaming rows) or a
+        semantic page, whatever the dreaming setting (a sweep that took its
+        lock before the failed probe may still be running); standard-tier exact
+        groups, which no sweep touches, still run. A failed probe is not
         remembered, Redis is asked again for every duplicate group and every
         phase-2 page; while it does not answer, the exact group is skipped
         (counted in ``exact_groups_abandoned``) and the phase-2 page is skipped
@@ -1142,7 +1144,10 @@ class DeleteMixin:
         Returns:
             Dict with user_id, exact_duplicates_removed, semantic_duplicates_removed,
             total_checked, plus ``exact_skipped_locked_pools`` /
-            ``semantic_skipped_locked_pools`` / ``lock_lost_pools`` (counts).
+            ``semantic_skipped_locked_pools`` / ``lock_lost_pools`` (counts),
+            ``exact_groups_abandoned`` (survivor changed under the lock, or Redis did not
+            answer) and ``lock_store_unreachable_skipped`` (exact groups plus semantic pages
+            skipped because Redis did not answer; the only Redis-down counter).
         """
         m = self._get_memory()
         threshold = settings.dedup_similarity_threshold
@@ -1157,6 +1162,7 @@ class DeleteMixin:
         # groups dropped because their survivor changed under the lock, or Redis did not answer
         exact_abandoned = 0
         semantic_pages_unlocked_skipped = 0  # pages skipped: Redis did not answer
+        lock_store_skipped = 0  # exact groups + semantic pages skipped: Redis did not answer
 
         def lock_fields() -> dict:
             return {
@@ -1164,6 +1170,7 @@ class DeleteMixin:
                 "semantic_skipped_locked_pools": len(semantic_locked),
                 "lock_lost_pools": len(lock_lost),
                 "exact_groups_abandoned": exact_abandoned,
+                "lock_store_unreachable_skipped": lock_store_skipped,
             }
 
         # The pool is streamed page by page; nothing below holds all of it.
@@ -1218,6 +1225,7 @@ class DeleteMixin:
                         # the failed probe may still be running, so a delete here
                         # could remove the last live copy. Nothing runs unlocked.
                         exact_abandoned += 1
+                        lock_store_skipped += 1
                         continue
                     busy = []
                     for p in pools:
@@ -1289,6 +1297,9 @@ class DeleteMixin:
                         except Exception as e:
                             logger.warning(f"Failed to delete exact dup {mid}: {e}")
                     if reinforcement:
+                        # (The survivor was re-read before the last delete; an owner
+                        # change after that is not seen. Not reachable today:
+                        # owner_user_id is written only when a row is created.)
                         if held:
                             locks.require(_dream_pool_of(survivor["payload"]))
                         self._bump_times_derived(survivor["id"], reinforcement)
@@ -1305,8 +1316,9 @@ class DeleteMixin:
             logger.info(
                 "dedup run user=%s scanned=%d exact_removed=%d semantic=skipped "
                 "(caller skipped the semantic phase) exact_skipped_locked_pools=%d "
-                "lock_lost_pools=%d",
+                "lock_lost_pools=%d exact_groups_abandoned=%d lock_store_unreachable_skipped=%d",
                 user_id, total_checked, exact_removed, len(exact_locked), len(lock_lost),
+                exact_abandoned, lock_store_skipped,
             )
             return {
                 "user_id": user_id,
@@ -1334,6 +1346,7 @@ class DeleteMixin:
             lock_redis = locks.redis()
             if lock_redis is None:
                 semantic_pages_unlocked_skipped += 1
+                lock_store_skipped += 1
                 continue
             chunk = [
                 mem for mem in page
@@ -1379,10 +1392,12 @@ class DeleteMixin:
         logger.info(
             "dedup run user=%s scanned=%d exact_removed=%d semantic_pairs_merged=%d "
             "semantic_mode=%s threshold=%s exact_skipped_locked_pools=%d "
-            "semantic_skipped_locked_pools=%d lock_lost_pools=%d",
+            "semantic_skipped_locked_pools=%d lock_lost_pools=%d "
+            "exact_groups_abandoned=%d lock_store_unreachable_skipped=%d",
             user_id, total_checked, exact_removed, semantic_removed,
             "tombstone" if settings.dedup_semantic_tombstone_enabled else "delete", threshold,
             len(exact_locked), len(semantic_locked), len(lock_lost),
+            exact_abandoned, lock_store_skipped,
         )
         result = {
             "user_id": user_id,
@@ -1439,7 +1454,8 @@ class DeleteMixin:
         lock covers one pool, and the sweep may be working on the other. The
         dedup partition normally lies inside one pool; the two differ only for
         rows whose ``owner_user_id`` is not their ``user_id``. Left at the
-        default no pool check is made (no lock is held: Redis unreachable, dreaming off).
+        default no pool check is made (the sentinel is no longer used by ``dedup_memories``:
+        a page whose lock cannot be taken is skipped, never run unlocked).
         ``lock_guard`` (called before every delete or tombstone) verifies the lock
         is still this run's and raises ``_PoolLockLost`` when it is not.
 
