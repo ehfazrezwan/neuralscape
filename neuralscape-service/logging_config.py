@@ -11,7 +11,7 @@ import uuid
 
 import structlog
 
-from config import settings
+from config import process_env_or, settings
 
 REQUEST_ID_HEADER = "X-Request-ID"
 # An incoming id is echoed into logs and a response header, so accept only a
@@ -85,8 +85,10 @@ def configure_logging(*, worker: bool = False) -> None:
     ``worker=True`` (ARQ processes) also drops ARQ's own log handlers so its
     lines flow through the same renderer once, with the bound job id.
     """
-    log_level = settings.log_level.strip().upper()
-    log_format = settings.log_format.strip().lower()
+    # The process environment wins (read now, as before); otherwise the setting, which
+    # also covers a service .env (pydantic-settings does not populate os.environ).
+    log_level = process_env_or("LOG_LEVEL", settings.log_level).strip().upper()
+    log_format = process_env_or("LOG_FORMAT", settings.log_format).strip().lower()
 
     shared_processors: list[structlog.types.Processor] = [
         structlog.contextvars.merge_contextvars,
