@@ -366,6 +366,41 @@ someone else cannot be completed in a victim's browser (login CSRF).
   enabled. Starting a second login in another tab replaces the cookie, so only
   the most recent tab can finish.
 
+### Redirect host allowlist (`OAUTH_REDIRECT_HOST_ALLOWLIST`)
+
+`POST /oauth/register` is open: anyone may register a client, so by default any
+https redirect URI is accepted, and so is a phishing client that would receive a
+victim's authorization code. The consent page shows the redirect host so the
+person logging in can see where access goes. To close the door, list the hosts
+you really connect from:
+
+```
+OAUTH_REDIRECT_HOST_ALLOWLIST=claude.ai
+```
+
+- **Empty (the default) changes nothing**: any https redirect URI, or http to a
+  loopback host, as before.
+- Comma-separated, case-insensitive entries: `host` or `host:port`. Entries are
+  exact hostnames (no wildcards, no suffix matching). A bare `host` matches the
+  scheme's default port only (`https://claude.ai` and `https://claude.ai:443`,
+  not `https://claude.ai:8443`); write `claude.ai:8443` to allow that port. A
+  `host:port` entry does not also open the default port.
+- **Loopback stays allowed** (`127.0.0.1`, `::1`, `localhost`, http or https)
+  even when the list is set. Native clients (RFC 8252 section 7.3) listen on an
+  ephemeral loopback port, so no list could name it. A loopback redirect only
+  ever reaches the user's own machine.
+- It sits on top of the existing rules and never widens them: http to a
+  non-loopback host, userinfo, fragments and non-ASCII or percent-encoded hosts
+  stay refused.
+- Enforced at `POST /oauth/register` (400 `invalid_redirect_uri`; every URI in
+  the request must pass) **and again** at `GET` and `POST /oauth/authorize`
+  (400 `invalid_request`, `redirect_uri mismatch`, no redirect and no code). A
+  client registered before the list was set is therefore refused once its host
+  is not listed. Authorization codes already issued run out in 5 minutes.
+- Recommendation for production: set it to the callback hosts you use (for
+  example the Claude connector's). Setting it is a deployment step; the default
+  stays empty.
+
 ---
 
 ## Endpoint reference
