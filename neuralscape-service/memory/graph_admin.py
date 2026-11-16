@@ -595,10 +595,10 @@ class GraphAdminMixin:
                 break
 
             for point in points:
-                scanned += 1
-                if max_rows and scanned > max_rows:
+                if max_rows and scanned >= max_rows:
                     logger.info(f"Hit max_rows cap ({max_rows}), stopping")
                     break
+                scanned += 1
 
                 try:
                     # Extract fields from the Qdrant point payload
