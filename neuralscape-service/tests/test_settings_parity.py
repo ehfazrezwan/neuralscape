@@ -31,6 +31,15 @@ ROOT = SERVICE.parent
 ENV_EXAMPLE = ROOT / ".env.example"
 ENV_PRODUCTION = ROOT / ".env.production"
 COMPOSE_FILES = sorted(ROOT.glob("docker-compose*.yml"))
+# The packaged test image holds the service tree and the two env templates only, not the
+# repo-root compose files: the compose checks skip there with this reason (declared for the
+# container profile in .github/ci/expected_skips.d/) and run in the host suite.
+NO_COMPOSE_FILES = "repo-root compose files are not in the packaged test image"
+
+
+def _require_compose_files() -> None:
+    if not (ROOT / "docker-compose.yml").is_file():
+        pytest.skip(NO_COMPOSE_FILES)
 
 # Settings fields (env name) deliberately absent from .env.example, with the reason. Empty: every
 # field is listed there, commented out at its default unless it needs a value.
@@ -189,8 +198,18 @@ def _compose_env(path: Path):
             yield str(key), None if value is None else str(value)
 
 
-@pytest.mark.parametrize("compose", COMPOSE_FILES, ids=lambda p: p.name)
-def test_compose_does_not_restate_a_different_default(compose, monkeypatch):
+def test_compose_does_not_restate_a_different_default(monkeypatch):
+    _require_compose_files()
+    assert COMPOSE_FILES, "no docker-compose*.yml found at the repo root"
+    differing = {}
+    for compose in COMPOSE_FILES:
+        found = _compose_differences(compose, monkeypatch)
+        if found:
+            differing[compose.name] = found
+    assert not differing, f"compose files restate defaults that differ from config.py: {differing}"
+
+
+def _compose_differences(compose: Path, monkeypatch) -> list[str]:
     differing = []
     for key, value in _compose_env(compose):
         if (value is None or _field_for(key) is None or key in COMPOSE_NONE_DEFAULT_IS_OFF
@@ -210,15 +229,17 @@ def test_compose_does_not_restate_a_different_default(compose, monkeypatch):
             continue
         if not same:
             differing.append(f"{key}: {value}")
-    assert not differing, f"{compose.name} restates defaults that differ from config.py: {differing}"
+    return differing
 
 
 def test_compose_pins_cover_the_drifted_keys():
     """The drifted keys are really present in the base compose file (so the check above bites)."""
+    _require_compose_files()
     seen = {k for k, _ in _compose_env(ROOT / "docker-compose.yml")}
     assert {"GEMINI_LLM_MODEL", "MCP_TRANSPORT", "NEO4J_DATABASE"} <= seen
 
 
 def test_compose_exclusions_are_live():
+    _require_compose_files()
     for (compose, key), _why in COMPOSE_VALUES_THAT_DIFFER.items():
         assert key in {k for k, _ in _compose_env(ROOT / compose)}, (compose, key)
