@@ -619,38 +619,6 @@ async def find_contradicted_edges(
         return []
 
 
-async def count_live_edges_by_episode(
-    driver: Any,
-    *,
-    group_id: str,
-    episode_uuids: list[str],
-) -> dict[str, int]:
-    """Live (neither invalid nor expired) RELATES_TO edge count per episode.
-
-    An episode that appears in ``episode_uuids`` but has no live edge maps to
-    ``0``. Raises on driver errors — the caller decides how to degrade (the
-    supersession hook treats a failure as "leave rows alone").
-    """
-    counts = {ep: 0 for ep in episode_uuids}
-    if not group_id or not episode_uuids:
-        return counts
-    cypher = """
-    MATCH ()-[r:RELATES_TO]->()
-    WHERE r.group_id = $group_id
-      AND r.invalid_at IS NULL
-      AND r.expired_at IS NULL
-    UNWIND [ep IN coalesce(r.episodes, []) WHERE ep IN $episode_uuids] AS ep
-    RETURN ep AS episode_uuid, count(r) AS live
-    """
-    async with driver.session() as session:
-        result = await session.run(
-            cypher, group_id=group_id, episode_uuids=list(episode_uuids)
-        )
-        for row in await result.data():
-            counts[row["episode_uuid"]] = int(row["live"])
-    return counts
-
-
 async def episode_edge_counts(
     driver: Any,
     *,
@@ -677,3 +645,34 @@ async def episode_edge_counts(
         rows = await result.data()
     row = rows[0] if rows else {}
     return {"total": int(row.get("total") or 0), "live": int(row.get("live") or 0)}
+
+
+async def live_edge_facts_by_episode(
+    driver: Any,
+    *,
+    group_id: str,
+    episode_uuids: list[str],
+) -> dict[str, list[str]]:
+    """Facts of the LIVE (neither invalid nor expired) RELATES_TO edges per episode.
+
+    An episode with no live edge maps to ``[]``. Raises on driver errors; the
+    supersession hook swallows them (rows stay live).
+    """
+    facts: dict[str, list[str]] = {ep: [] for ep in episode_uuids}
+    if not group_id or not episode_uuids:
+        return facts
+    cypher = """
+    MATCH ()-[r:RELATES_TO]->()
+    WHERE r.group_id = $group_id
+      AND r.invalid_at IS NULL
+      AND r.expired_at IS NULL
+    UNWIND [ep IN coalesce(r.episodes, []) WHERE ep IN $episode_uuids] AS ep
+    RETURN ep AS episode_uuid, collect(r.fact) AS facts
+    """
+    async with driver.session() as session:
+        result = await session.run(
+            cypher, group_id=group_id, episode_uuids=list(episode_uuids)
+        )
+        for row in await result.data():
+            facts[row["episode_uuid"]] = [f or "" for f in (row.get("facts") or [])]
+    return facts
