@@ -1,5 +1,7 @@
 # Finding: native engine has no index/impact trigger surface (plan-premise gap)
 
+> **Status (as of 2026-11-16, dev 6a81341f):** historical. This finding is closed. The gap it reports (no invocation surface for `index`, impact analysis and similar engine operations) was fixed after it was written: the MCP tools `code_graph_index`, `code_impact` and `locate` and the REST route `POST /v1/code-graph/index` now exist, alongside `adapters/code_graph/native_index_cli.py`.
+
 **Discovered:** 2026-07-08, executor, during H1 (harness) design, static analysis
 of ice/benchmark @ 51b176d (post-I1).
 

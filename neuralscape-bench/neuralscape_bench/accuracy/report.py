@@ -123,7 +123,8 @@ def _fmt_pct(x) -> str:
 
 
 def render_battery_markdown(results_by_suite: dict[str, dict | None], *,
-                            config_note: str = "") -> str:
+                            config_note: str = "",
+                            manifest_identities: dict[str, list[str]] | None = None) -> str:
     """Markdown battery summary. Suites with ``None`` render as *not yet run*."""
     lines = [
         "# Neuralscape memory-accuracy battery",
@@ -180,13 +181,19 @@ def render_battery_markdown(results_by_suite: dict[str, dict | None], *,
         for t, m in (res["metrics"].get("by_type") or {}).items():
             lines.append(f"| {t} | {m['n']} | {m['judged']} | {_fmt_pct(m['accuracy'])} |")
         lines.append("")
+    if manifest_identities:
+        lines += ["## Run manifests", ""]
+        for suite, ident in manifest_identities.items():
+            lines += [f"### {suite}", ""] + [f"- {line}" for line in ident] + [""]
     return "\n".join(lines)
 
 
 def save_battery_markdown(results_by_suite: dict[str, dict | None], *,
                           config_note: str = "",
+                          manifest_identities: dict[str, list[str]] | None = None,
                           results_dir: Path = RESULTS_DIR) -> Path:
     results_dir.mkdir(exist_ok=True)
     path = results_dir / f"accuracy-battery-{_ts()}.md"
-    path.write_text(render_battery_markdown(results_by_suite, config_note=config_note))
+    path.write_text(render_battery_markdown(results_by_suite, config_note=config_note,
+                                            manifest_identities=manifest_identities))
     return path
