@@ -89,8 +89,8 @@ async def retrieve_episodes(
         list[EpisodicNode]: A list of EpisodicNode objects representing the retrieved episodes.
     """
     # NEURALSCAPE PATCH (re-apply after upstream subtree syncs): an explicit
-    # empty group list means "no groups", not "no group filter" (which the
-    # truthiness check below would turn it into). ``None`` stays unscoped.
+    # empty group list returns no episodes. ``None`` keeps its meaning (no
+    # group filter).
     if group_ids is not None and len(group_ids) == 0:
         return []
 

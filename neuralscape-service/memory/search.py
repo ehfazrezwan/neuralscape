@@ -1317,8 +1317,7 @@ class SearchMixin:
         if g is None:
             return {"edges": [], "nodes": [], "episodes": [], "communities": []}
 
-        # Fail closed: Graphiti reads an empty group list as "no group
-        # filter". No groups means no results, and no graph call.
+        # No groups means no results, and no graph call.
         group_ids = _scoped_groups(group_ids)
         if not group_ids:
             return {"edges": [], "nodes": [], "episodes": [], "communities": []}

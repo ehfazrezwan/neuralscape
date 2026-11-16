@@ -1,10 +1,10 @@
-"""A graph read never crosses users, whatever visibility the caller asks for.
+"""Each user's graph reads stay within that user's groups.
 
 Real Neo4j, Qdrant and Gemini. User A writes a private fact with graph
 enrichment (an episode, entities and edges land under A's private group).
-User B then recalls with every visibility value, including ``standard`` while
-the standards tier is off (the default), where the computed group list is
-empty. B must never receive A's episode, node or edge. Control: A does.
+User B then recalls with every visibility value, including a read whose
+computed group list is empty, which returns nothing. B receives none of A's
+episodes, nodes or edges. Control: A receives them.
 
 Run: uv run pytest integration_tests/test_graph_read_scope_real_stores.py -q
 Env: NEO4J_URI NEO4J_USER NEO4J_PASSWORD QDRANT_URL REDIS_URL GOOGLE_API_KEY
@@ -135,41 +135,50 @@ def test_control_owner_receives_own_graph_rows(env, flags):
 
 
 @pytest.mark.parametrize("visibility", VISIBILITIES)
-def test_other_user_gets_no_graph_rows_for_any_visibility(env, flags, visibility):
+def test_graph_rows_stay_within_the_callers_groups_for_any_visibility(env, flags, visibility):
     flags(standards_enabled=False)
     raw = env.service._search_graph_for_visibility(
         query=env.query, user_id=env.user_b, project_id=None, limit=20,
         visibility=visibility, include_shared=True, include_episodes=True,
     )
-    foreign = _graph_uuids(raw) & (env.a_episode_uuids | env.a_edge_uuids | env.a_node_uuids)
-    assert not foreign, f"visibility={visibility!r}: other user received {sorted(foreign)}"
-    assert not _mentions_token(raw, env.token), f"visibility={visibility!r}: private text returned"
+    outside = _graph_uuids(raw) & (env.a_episode_uuids | env.a_edge_uuids | env.a_node_uuids)
+    assert not outside, f"visibility={visibility!r}: rows outside the caller's groups: {sorted(outside)}"
+    assert not _mentions_token(raw, env.token), f"visibility={visibility!r}: row text outside the caller's groups"
 
 
-def test_other_user_gets_no_graph_rows_for_standard_with_tier_on(env, flags):
+def test_empty_computed_scope_returns_strictly_empty_results(env, flags):
+    flags(standards_enabled=False)
+    raw = env.service._search_graph_for_visibility(
+        query=env.query, user_id=env.user_b, project_id=None, limit=20,
+        visibility="standard", include_shared=True, include_episodes=True,
+    )
+    assert all(len(v) == 0 for v in raw.values() if isinstance(v, list)), raw
+
+
+def test_graph_rows_stay_within_the_callers_groups_with_standard_tier_on(env, flags):
     flags(standards_enabled=True)
     raw = env.service._search_graph_for_visibility(
         query=env.query, user_id=env.user_b, project_id=None, limit=20,
         visibility="standard", include_shared=True, include_episodes=True,
     )
-    foreign = _graph_uuids(raw) & (env.a_episode_uuids | env.a_edge_uuids | env.a_node_uuids)
-    assert not foreign, f"other user received {sorted(foreign)}"
+    outside = _graph_uuids(raw) & (env.a_episode_uuids | env.a_edge_uuids | env.a_node_uuids)
+    assert not outside, f"rows outside the caller's groups: {sorted(outside)}"
 
 
 @pytest.mark.parametrize("visibility", VISIBILITIES)
-def test_full_recall_returns_nothing_of_other_users_for_any_visibility(env, flags, visibility):
+def test_full_recall_stays_within_the_callers_groups_for_any_visibility(env, flags, visibility):
     flags(standards_enabled=False, graph_episode_recall_enabled=True)
     rows = env.service.search(
         query=env.query, user_id=env.user_b, project_id=None, visibility=visibility, limit=20,
     )
     for r in rows:
-        assert env.token not in (r.memory or ""), f"visibility={visibility!r}: {r.id} carries A's text"
+        assert env.token not in (r.memory or ""), f"visibility={visibility!r}: {r.id} carries text from outside the caller's groups"
         assert r.id not in {f"ep-{u[:12]}" for u in env.a_episode_uuids}, (
-            f"visibility={visibility!r}: other user's episode row {r.id}"
+            f"visibility={visibility!r}: episode row {r.id} is outside the caller's groups"
         )
 
 
-def test_graph_listings_for_the_other_user_hold_none_of_a(env):
+def test_graph_listings_stay_within_the_callers_groups(env):
     svc = env.service
     seen = (
         {x["uuid"] for x in svc.get_graph_episodes(env.user_b, limit=50)}
