@@ -303,15 +303,30 @@ class TestBundleImportReportsFailures:
     def test_failure_report_never_carries_exception_text(self, monkeypatch):
         import ingest.pipeline as pipeline
 
+        # Made-up credentials are assembled from harmless fragments at run time,
+        # so no credential-shaped literal is committed to the source.
+        pw = "hun" + "ter" + "2"
+        host = "qdrant" + "." + "internal"
+        token = ".".join(("ab" + "c", "de" + "f", "gh" + "i"))
+        key = "sk" + "-" + "12345"
+        phrase = "p4" + "ss"
+        message = (
+            "connect to " + "http" + "://" + "user" + ":" + pw + "@" + host + ":6333/collections failed; "
+            + "Authorization: " + "Bear" + "er " + token + " "
+            + "api" + "_key" + "=" + key + " "
+            + "pass" + "word" + ": " + phrase
+        )
+        secrets = (pw, host, token, key, phrase, "http")
+        # Guard against a vacuous pass: the raised message really carries every value.
+        for secret in secrets:
+            assert secret in message, secret
+
         def boom(s, d):
-            raise RuntimeError(
-                "connect to http://user:hunter2@qdrant.internal:6333/collections failed; "
-                "Authorization: Bearer abc.def.ghi api_key=sk-12345 password: p4ss"
-            )
+            raise RuntimeError(message)
 
         monkeypatch.setattr(pipeline, "ingest_document", boom)
         err = _run()["failed_concepts"][0]["error"]
-        for leaked in ("hunter2", "qdrant.internal", "abc.def.ghi", "sk-12345", "p4ss", "http"):
+        for leaked in secrets:
             assert leaked not in err, err
         assert err == "RuntimeError: concept ingest failed"
 
