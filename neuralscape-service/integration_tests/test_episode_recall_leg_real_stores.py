@@ -82,3 +82,44 @@ def test_episode_row_survives_a_full_scored_list(svc, unique_ns, flags):
     assert len(results) <= LIMIT
     assert episodes[0].score is None
     assert results[-1].source == "episode", "unscored rows rank after every scored row"
+
+
+def test_episode_row_is_found_on_a_default_recall_across_all_groups(svc, unique_ns, flags):
+    """The request shape of the REST route with only ``query``, ``project_id`` and ``limit``: no scope, no
+    visibility, shared pool included, so the graph legs search the caller's private, shared and project
+    groups together. The fulltext group filter used to require only the LAST group of that list, so an
+    episode in the caller's private project group never matched."""
+    from memory.groups import _build_group_id, _get_group_ids
+
+    flags(graph_episode_recall_enabled=True)
+    user, project = unique_ns.user_id, unique_ns.project_id
+    token = f"Marblequill{uuid.uuid4().hex[:8]}"
+    fact = f"The {token} gateway terminates its tunnels in the Oslo region."
+    group = _build_group_id("private", user, project)
+    unique_ns.on_cleanup(lambda: (
+        svc.delete_memories(user_id=user, include_shared=True),
+        _cypher(svc, "MATCH (n {group_id: $g}) DETACH DELETE n", g=group),
+    ))
+
+    stored, created = svc.store_raw(
+        content=fact, user_id=user, category="tech_stack", visibility="private", project_id=project,
+        add_to_graph=False, return_created=True,
+    )
+    assert created and stored
+    assert svc.enrich_graph(content=fact, user_id=user, project_id=project, visibility="private",
+                            memory_id=stored[0].id) is True
+    assert _cypher(svc, "MATCH (e:Episodic {group_id: $g}) WHERE e.content CONTAINS $t RETURN e.uuid AS u",
+                   g=group, t=token), "the episode was not written to the graph"
+    groups = _get_group_ids(user, project)
+    assert group in groups and groups[-1] != group, "precondition: the episode's group is not the last one searched"
+
+    deadline = time.monotonic() + 30
+    while True:
+        results = svc.search(fact, user_id=user, project_id=project, limit=30)
+        episodes = [r for r in results if r.source == "episode" and token in r.memory]
+        if episodes or time.monotonic() > deadline:
+            break
+        time.sleep(2)
+
+    assert episodes, f"no episode row among {len(results)} results {[r.source for r in results]}"
+    assert episodes[0].score is None
