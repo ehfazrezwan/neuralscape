@@ -366,3 +366,36 @@ def test_run_sh_refuses_a_compose_profile_without_a_compose_project():
     r = subprocess.run([sh, "http://127.0.0.1:18200", "--profile", "flags-on", "--compose-project", " NeuralScape "], capture_output=True, text=True, env=env)
     assert r.returncode == 2 and "production" in r.stderr, r.stderr
     assert profile.load(ACCEPTANCE / "profiles" / "flags-on.env").headers["requires"] == ["compose"]
+
+
+# ── negative controls state their precondition ───────────────────
+
+
+def test_a_negative_control_whose_precondition_fails_reports_the_precondition_not_a_vacuous_pass():
+    from nsaccept import expect_check_fails, precondition
+
+    def check(indexed: bool):
+        assert indexed, "nothing is indexed"
+
+    with pytest.raises(AssertionError, match=r"PRECONDITION FAILED \(the index exists\)"):
+        # setup failed: the check fails with the RIGHT input too, so "fails with the wrong input" would be vacuous
+        precondition(check, False, what="the index exists")
+        expect_check_fails(check, False)
+    precondition(check, True, what="the index exists")  # a healthy setup passes through
+    expect_check_fails(check, False)
+
+
+def test_every_negative_control_in_the_flag_scenarios_states_a_precondition():
+    import re as _re
+
+    flagged = ["test_dreaming", "test_standards", "test_connectors", "test_webhook", "test_code_graph", "test_code_graph_cbm",
+               "test_oauth", "test_speaker", "test_exemplars"]
+    # controls that cannot state one: the framing check compares against an ordinary page (the product header is what is under test)
+    exempt = {"test_frame_check_fails_for_a_page_without_the_headers"}
+    missing = []
+    for mod in flagged:
+        src = (ACCEPTANCE / "scenarios" / f"{mod}.py").read_text()
+        for m in _re.finditer(r"@negative_control\n(?:@[^\n]*\n)*def (test_\w+)\(.*?(?=\n@proves|\n@profiles|\n@needs|\n@negative_control|\Z)", src, _re.S):
+            if m.group(1) not in exempt and "precondition" not in m.group(0) and "PRECONDITION" not in m.group(0):
+                missing.append(f"{mod}::{m.group(1)}")
+    assert missing == [], f"negative controls without a precondition: {missing}"

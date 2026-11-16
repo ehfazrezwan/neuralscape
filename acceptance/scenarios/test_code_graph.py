@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 
 import pytest
 
-from nsaccept import eventually, expect_check_fails, negative_control, profiles, proves
+from nsaccept import eventually, expect_check_fails, negative_control, precondition, profiles, proves
 from nsaccept.mcp import MCPClient
 
 from cg_helpers import CALLEE, SYMBOL, cg_get, check_mentions, mcp_text
@@ -43,6 +43,7 @@ class Native:
     project: str
     repo_source: str
     index: dict = field(default_factory=dict)
+    deleted_nodes: int = 0
     error: str = ""
 
 
@@ -92,16 +93,20 @@ def test_the_native_engine_is_registered_and_the_through_ns_index_builds_a_graph
 
 @proves("knowledge.native-engine", "knowledge.code-index-pipeline")
 @negative_control
-def test_index_pipeline_reports_an_unconfigured_repo_as_not_indexed(ctx, a):
+def test_index_pipeline_reports_an_unconfigured_repo_as_not_indexed(ctx, a, native: Native):
+    n = _ready(native)
+
+    def check(index_result: dict, what: str):
+        assert index_result.get("ok") is True, f"index of {what}: {index_result}"
+
+    precondition(check, n.index, "the configured repo", what="the configured repo was indexed")
     r = a.post("/v1/code-graph/index", json={"repo_source": "/nowhere", "system": SYSTEM, "code_space": f"code--{ctx.user_a}--not-configured"})
-    assert r.status_code == 202, f"index request -> {r.status_code}"  # accepted, then answered honestly by the worker
-    st = a.poll_task(r.json()["task_id"], timeout=300)
-    indexed = st.get("status") == "completed" and (st.get("result") or {}).get("ok") is True
-
-    def check():
-        assert indexed, f"index of an unconfigured repo ended as {st.get('status')}: {st.get('error') or st.get('result')}"
-
-    expect_check_fails(check)  # the "it was indexed" check cannot pass for a repo that is not in CODE_REPOS
+    if r.status_code == 202:  # accepted, then answered honestly by the worker ...
+        st = a.poll_task(r.json()["task_id"], timeout=300)
+        outcome = (st.get("result") or {}) if st.get("status") == "completed" else {"ok": False, "status": st.get("status"), "error": st.get("error")}
+    else:  # ... or refused up front: either way it was not indexed
+        outcome = {"ok": False, "http": r.status_code, "body": r.text[:120]}
+    expect_check_fails(check, outcome, "an unconfigured repo")  # the "it was indexed" check cannot pass for a repo that is not in CODE_REPOS
 
 
 # ── query tools ──────────────────────────────────────────────────
@@ -121,6 +126,8 @@ def test_query_finds_a_symbol_over_rest_and_mcp(ctx, a, mcp_a, native: Native):
 @negative_control
 def test_query_check_fails_for_a_symbol_that_does_not_exist(ctx, a, native: Native):
     n = _ready(native)
+    good = cg_get(a, "query", question=SYMBOL, graph_id=n.code_space, knowledge_system=SYSTEM)
+    precondition(check_mentions, good["result"], SYMBOL, what="querying the real symbol finds it")
     body = cg_get(a, "query", question=f"zq_{ctx.run_id}_no_such_symbol", graph_id=n.code_space, knowledge_system=SYSTEM)
     expect_check_fails(check_mentions, body["result"], SYMBOL)
 
@@ -142,6 +149,7 @@ def test_neighbors_and_path_follow_a_real_call_edge(a, mcp_a, native: Native):
 @negative_control
 def test_neighbors_check_fails_for_a_symbol_it_does_not_call(a, native: Native):
     n = _ready(native)
+    precondition(check_mentions, cg_get(a, "neighbors", label=SYMBOL, graph_id=n.code_space, knowledge_system=SYSTEM)["result"], CALLEE, what="resolve_systems has its callee as a neighbour")
     nb = cg_get(a, "neighbors", label=CALLEE, graph_id=n.code_space, knowledge_system=SYSTEM)
     expect_check_fails(check_mentions, nb["result"], "get_project_config")  # a real symbol of the package, but not a neighbour
 
@@ -173,6 +181,7 @@ def test_locate_finds_a_symbol_by_name_and_by_its_docstring(a, mcp_a, native: Na
 @negative_control
 def test_locate_check_fails_for_an_unrelated_query(ctx, a, native: Native):
     n = _ready(native)
+    precondition(check_located, cg_get(a, "locate", query=SYMBOL, graph_id=n.code_space, knowledge_system=SYSTEM, k=5), SYMBOL, what="locating the real symbol finds it")
     body = cg_get(a, "locate", query=f"zq{ctx.run_id}unrelated", graph_id=n.code_space, knowledge_system=SYSTEM, k=5)
     expect_check_fails(check_located, body, SYMBOL)
 
@@ -190,6 +199,7 @@ def test_impact_lists_the_caller_of_a_symbol(a, mcp_a, native: Native):
 @negative_control
 def test_impact_check_fails_for_a_symbol_nothing_calls_it_through(a, native: Native):
     n = _ready(native)
+    precondition(check_mentions, cg_get(a, "impact", symbol=CALLEE, graph_id=n.code_space, knowledge_system=SYSTEM, max_hops=3)["text"], SYMBOL, what="the callee's impact lists its caller")
     body = cg_get(a, "impact", symbol=SYMBOL, graph_id=n.code_space, knowledge_system=SYSTEM, max_hops=1)
     expect_check_fails(check_mentions, body["text"], "get_system_that_does_not_exist")
 
@@ -217,13 +227,15 @@ def test_auto_routing_picks_a_healthy_engine_per_operation_and_says_which(a, mcp
 
 @proves("knowledge.autoroute")
 @negative_control
-def test_auto_routing_refuses_a_code_space_nobody_indexed(ctx, a):
-    r = a.get("/v1/code-graph/query", params={"question": SYMBOL, "graph_id": f"code--{ctx.user_a}--never-indexed", "knowledge_system": "auto"})
+def test_auto_routing_refuses_a_code_space_nobody_indexed(ctx, a, native: Native):
+    n = _ready(native)
 
-    def check():
-        assert r.status_code == 200 and SYMBOL in r.text, f"auto-routed query over an unindexed space: {r.status_code} {r.text[:160]}"
+    def check(space: str):
+        r = a.get("/v1/code-graph/query", params={"question": SYMBOL, "graph_id": space, "knowledge_system": "auto"})
+        assert r.status_code == 200 and "router.py" in r.text, f"auto-routed query over {space}: {r.status_code} {r.text[:160]}"
 
-    expect_check_fails(check)
+    precondition(check, n.code_space, what="auto-routing answers over the indexed space")
+    expect_check_fails(check, f"code--{ctx.user_a}--never-indexed")
 
 
 # ── memory fusion ────────────────────────────────────────────────
@@ -276,6 +288,8 @@ def test_recall_fuses_a_code_hit_with_memories_when_the_project_is_configured_fo
 def test_fusion_check_fails_for_prose_recall_and_for_a_plain_list(ctx, a, mcp_a, native: Native):
     n = _ready(native)
     mcp_a.initialize()
+    coding = fused_recall(mcp_a, n.project, f"callers of `{SYMBOL}`")
+    assert isinstance(coding, dict) and coding.get("fused") is True, f"PRECONDITION FAILED (a coding query on the configured project fuses): {str(coding)[:200]}"
     prose = fused_recall(mcp_a, n.project, "what colour is the lighthouse lamp")  # no coding signal: the router keeps it base-only
     expect_check_fails(check_fused, prose, symbol=SYMBOL, marker="x")
     expect_check_fails(check_fused, [], symbol=SYMBOL, marker="x")
@@ -307,8 +321,9 @@ def test_a_memory_anchored_to_a_symbol_comes_back_with_the_symbol(ctx, a, mcp_a,
 
 @proves("knowledge.code-anchors")
 @negative_control
-def test_anchor_check_fails_for_another_user(ctx, b, native: Native):
-    _ready(native)
+def test_anchor_check_fails_for_another_user(ctx, a, b, native: Native):
+    n = _ready(native)
+    precondition(check_mentions, cg_get(a, "neighbors", label=SYMBOL, graph_id=n.code_space, knowledge_system=SYSTEM)["result"], f"zq-{ctx.run_id}-anchor", what="the anchored memory shows up for its author")
     nb = cg_get(b, "neighbors", label=SYMBOL, graph_id=f"code--{ctx.user_b}--svc", knowledge_system=SYSTEM)
     expect_check_fails(check_mentions, nb["result"], f"zq-{ctx.run_id}-anchor")
 
@@ -320,12 +335,13 @@ def test_anchor_check_fails_for_another_user(ctx, b, native: Native):
 def test_deleting_the_code_space_empties_it_and_keeps_the_memories(ctx, a, mcp_a, native: Native):
     n = _ready(native)
     before = cg_get(a, "query", question=SYMBOL, graph_id=n.code_space, knowledge_system=SYSTEM)["result"]
-    check_mentions(before, SYMBOL)
+    check_mentions(before, SYMBOL, "router.py")  # a located hit names its file; an empty answer only echoes the question
     r = a.delete("/v1/code-graph/graph", params={"graph_id": n.code_space, "system": SYSTEM})
     assert r.status_code == 200 and r.json().get("deleted") is True, f"DELETE /v1/code-graph/graph -> {r.status_code}: {r.text[:200]}"
     assert r.json()["engine_result"]["nodes_deleted"] > 0, f"nothing was deleted from the indexed space: {r.json()}"
     after = cg_get(a, "query", question=SYMBOL, graph_id=n.code_space, knowledge_system=SYSTEM)["result"]
-    expect_check_fails(check_mentions, after, SYMBOL)  # the graph is gone
+    n.deleted_nodes = r.json()["engine_result"]["nodes_deleted"]
+    expect_check_fails(check_mentions, after, "router.py")  # the graph is gone (an empty answer still echoes the symbol name)
     anchored = [h for h in a.search(f"zq-{ctx.run_id}-anchor resolve_systems side-effect free", project_id=n.project) if f"zq-{ctx.run_id}-anchor" in h.get("memory", "")]
     assert anchored, "deleting the code graph deleted the memory anchored to it"
     again = a.delete("/v1/code-graph/graph", params={"graph_id": n.code_space, "system": SYSTEM})
@@ -335,9 +351,14 @@ def test_deleting_the_code_space_empties_it_and_keeps_the_memories(ctx, a, mcp_a
     assert "error" not in out, f"MCP code_graph_delete: {out}"
 
 
+def _positive_delete(n: Native) -> None:
+    assert n.deleted_nodes > 0, "the indexed space's delete removed no nodes (or its test did not run first)"
+
+
 @proves("knowledge.code-graph-delete")
 @negative_control
-def test_delete_check_fails_for_a_space_that_was_never_there(ctx, b):
+def test_delete_check_fails_for_a_space_that_was_never_there(ctx, b, native: Native):
+    precondition(lambda: _positive_delete(native), what="deleting the indexed space removed nodes")
     r = b.delete("/v1/code-graph/graph", params={"graph_id": f"code--{ctx.user_b}--svc", "system": SYSTEM})
     assert r.status_code == 200, f"DELETE of an unindexed space -> {r.status_code}"
 
