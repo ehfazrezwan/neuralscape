@@ -8,6 +8,7 @@ without the checkpoint environment (the helpers are called with a stand-in worke
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 from types import SimpleNamespace
 
 from config import settings
@@ -16,7 +17,8 @@ from config import settings
 def test_checkpoint_workers_use_the_redis_url_in_force_when_they_start(monkeypatch) -> None:
     import arq.worker
     import worker as worker_module  # noqa: F401  (imported first, with the URL set before this test)
-    from tests import test_checkpoint_v1 as checkpoint
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parent.parent / "integration_tests"))
+    import test_checkpoint_v1 as checkpoint  # the scenario helpers live with the real-store tests
 
     started = []
 
