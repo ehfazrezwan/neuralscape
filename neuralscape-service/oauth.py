@@ -119,6 +119,12 @@ def _is_valid_redirect_uri(uri: str) -> bool:
     # so the consent page can always show the destination intact.
     if _BAD_HOST_CHARS.search(parsed.netloc) or len(parsed.hostname or "") > 253:
         return False
+    # ASCII host, no percent-escapes: what we display must be exactly where the
+    # browser goes. Browsers apply UTS 46 (not Python's IDNA 2003) to non-ASCII
+    # hosts and percent-decode them, so those can differ from any text we show.
+    # A client that needs an IDN host registers its punycode (xn--) form.
+    if "%" in parsed.netloc or not parsed.netloc.isascii():
+        return False
     host = (parsed.hostname or "").lower()
     if parsed.scheme == "https":
         return True
@@ -522,14 +528,11 @@ def _render_consent(
 
 
 def _display_host(uri: str) -> str:
-    """The destination host for the consent page: hostname only (never userinfo),
-    in IDNA/punycode form so homograph hosts are visible, plus a non-default port."""
+    """The destination for the consent page, exactly as the browser will use it:
+    the lower-cased hostname (never userinfo; ASCII only, enforced at
+    registration, so IDN hosts appear in their xn-- form) plus a non-default port."""
     parsed = urlparse(uri)
     host = parsed.hostname or ""
-    try:
-        host = host.encode("idna").decode("ascii")
-    except UnicodeError:
-        pass
     if ":" in host:
         host = f"[{host}]"
     try:

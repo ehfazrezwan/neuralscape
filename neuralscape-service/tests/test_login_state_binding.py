@@ -425,6 +425,10 @@ def _register(client, uri):
     'https://a"b.example.net/cb',
     "https://a b.example.net/cb",
     "https://" + "a" * 254 + ".example/cb",
+    "https://clau\u00dfic.example/cb",  # sharp s: IDNA 2003 shows "classic", browsers go elsewhere
+    "https://\u03c3\u03bf\u03c2.example/cb",  # final sigma
+    "https://claude.ai%e3%80%82attacker.net/cb",  # percent-encoded ideographic full stop
+    "https://\u0441laude.ai/cb",  # Cyrillic homograph: register the xn-- form instead
 ])
 def test_registration_refuses_spoofable_redirect_uris(env, uri):
     assert _register(_client(), uri).status_code == 400
@@ -446,19 +450,29 @@ def test_display_host_strips_userinfo_port_and_shows_punycode():
     assert d("https://attacker.example.net:8443/cb") == "attacker.example.net:8443"
     assert d("https://attacker.example.net:443/cb") == "attacker.example.net"
     assert d("https://claude.ai@attacker.example.net/cb") == "attacker.example.net"  # defence in depth
-    assert d("https://\u0441laude.ai/cb") == "xn--laude-0ye.ai"  # Cyrillic es, not Latin c
+    assert d("https://XN--laude-0ye.ai/cb") == "xn--laude-0ye.ai"  # punycode shown as is, lower-cased
     assert d("http://[::1]:7777/cb") == "[::1]:7777"
 
 
-def test_cyrillic_homograph_shown_as_punycode_on_consent_page(provider):
-    uri = "https://\u0441laude.ai/cb"
+def test_punycode_host_accepted_and_shown_as_is(provider):
+    uri = "https://xn--laude-0ye.ai/cb"
     client = _client()
     cid = _register(client, uri).json()["client_id"]
     _, challenge = _pkce()
     page = client.get("/oauth/authorize", params={
         "response_type": "code", "client_id": cid, "redirect_uri": uri,
         "code_challenge": challenge, "code_challenge_method": "S256"})
-    assert "<b>xn--laude-0ye.ai</b>" in page.text
+    assert page.status_code == 200 and "<b>xn--laude-0ye.ai</b>" in page.text
+
+
+def test_authorize_refuses_legacy_client_with_non_ascii_or_percent_host(provider, env):
+    _, challenge = _pkce()
+    for bad in ("https://clau\u00dfic.example/cb", "https://claude.ai%e3%80%82attacker.net/cb"):
+        cid = sign_payload({"typ": "client", "redirect_uris": [bad], "iat": int(time.time())}, env["secret"])
+        r = _client().get("/oauth/authorize", params={
+            "response_type": "code", "client_id": cid, "redirect_uri": bad,
+            "code_challenge": challenge, "code_challenge_method": "S256"})
+        assert r.status_code == 400
 
 
 def test_consent_page_escapes_destination_host():
