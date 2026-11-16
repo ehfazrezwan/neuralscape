@@ -256,7 +256,16 @@ class LiveApi:
 
     url: str
     user_id: str
-    headers: dict = field(default_factory=dict, repr=False)
+    _static_headers: dict = field(default_factory=dict, repr=False)
+    identity: Any = field(default=None, repr=False)  # an ApiIdentity: bearer minted per access
+
+    @property
+    def headers(self) -> dict:
+        """Request headers; a minted bearer is created on each access (runs outlast a token)."""
+
+        if self.identity is not None and self.identity.token:
+            return self.identity.headers
+        return dict(self._static_headers)
 
     def __repr__(self) -> str:  # never show the token
         return f"LiveApi(url={redact(self.url)}, user_id={self.user_id!r})"
@@ -301,8 +310,7 @@ def live_api(api_user) -> LiveApi:
         error = f"{type(exc).__name__}: {exc}"
     if error:
         unavailable(f"the API at {url} is unreachable ({error})")
-    headers = api_user.headers if api_user.token else {}
-    return LiveApi(url=url, user_id=api_user.user_id, headers=headers)
+    return LiveApi(url=url, user_id=api_user.user_id, identity=api_user)
 
 
 # --------------------------------------------------------------------------
