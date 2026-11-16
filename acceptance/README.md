@@ -111,7 +111,7 @@ file, each preceded by a stack restart with that file's lines added to the API a
 |---|---|---|
 | `flags-on` | dreaming, standards, processes, dictator, connectors (+stdio allowlist), queue-empty webhook, native code graph, OAuth server (token login), speaker-aware extraction, strategy synthesizer | `test_dreaming`, `test_standards`, `test_connectors`, `test_webhook`, `test_code_graph`, `test_oauth`, `test_speaker` |
 | `oauth-google` | `AUTH_PROVIDER=google` (placeholder client id) | `test_oauth` (provider part) |
-| `oauth-supabase` | `AUTH_PROVIDER=supabase` (placeholder project URL) | `test_oauth` (provider part) |
+| `oauth-supabase` | `AUTH_PROVIDER=supabase` against a fake Supabase auth service (sidecar `nsc-acc-supabase` serving the project's JWKS), plus the domain and exact-address sign-in allowlists | `test_oauth` (provider part), `test_oauth_supabase_login` (end-to-end sign-in) |
 | `cbm` | `CBM_ENABLED`, service `cbm-bridge` | `test_code_graph_cbm` |
 | `docling` | Docling + `EXEMPLAR_STORE_ENABLED` + `DOCLING_EXTRACT_IMAGES` | `test_ingest` (Docling), `test_exemplars` |
 | `legacy-key` | `NEURALSCAPE_API_KEY=<generate:hex32>` + `NEURALSCAPE_API_KEY_USER_ID=acc-legacy`; the gate exports the key as `NS_LEGACY_KEY`; **own stack restart** | `test_legacy_key` |

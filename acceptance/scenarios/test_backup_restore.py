@@ -461,9 +461,9 @@ def test_layout_check_fails_for_partial_empty_or_incomplete_backups(tmp_path):
     expect_check_fails(check_backup_layout, root)  # neo4j missing from the manifest
     (good / "MANIFEST.txt").write_text("parts=redis qdrant files neo4j\n")
     assert check_backup_layout(root) == good  # complete: passes
-    (good / "redis" / "dump.rdb").write_text("")
     assert check_backup_layout(root, collection="c") == good
     expect_check_fails(check_backup_layout, root, "memory", "neuralscape_memories")  # the memories collection is not in the backup
+    (good / "redis" / "dump.rdb").write_text("")
     expect_check_fails(check_backup_layout, root)  # an empty part
     (good / "redis" / "dump.rdb").write_text("r")
     (good / "qdrant" / "c.snap").unlink()

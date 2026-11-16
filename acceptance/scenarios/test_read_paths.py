@@ -22,7 +22,7 @@ from nsaccept.helpers import Written, list_rows, mcp_json, rows_with, write_raw
 from nsaccept.probe import probe_route
 
 from route_table import (
-    COVERED_ELSEWHERE, EXCLUDED_PREFIXES, MCP_CODE_TOOLS, MCP_CORE_TOOLS, PROBES,
+    COVERED_ELSEWHERE, EXCLUDED_PREFIXES, FLAG_GATED_STATUSES, MCP_CODE_TOOLS, MCP_CORE_TOOLS, PROBES,
 )
 
 PARAPHRASE = "which tool builds our artifacts each night on the staging cluster"
@@ -161,11 +161,24 @@ def check_meter_belongs_to(client: NSClient, user_id: str) -> None:
 
 
 LEGS_TEXT = "Quokkaforge compiles artefacts nightly on the staging cluster."
-LEGS_QUERY = "which utility assembles our deliverables each evening inside a rehearsal environment"
+LEGS_QUERY = "which utility assembles our deliverables each evening inside pre-release sandboxes"
 
 
 def _words(text: str) -> set[str]:
     return set(re.findall(r"[a-z0-9]+", text.lower()))
+
+
+def _stems(text: str) -> set[str]:
+    """Crude stem keys: a 5-letter prefix per word of 5+ letters ("rehearsal" and "rehearses" collide)."""
+    return {w[:5] for w in _words(text) if len(w) >= 5}
+
+
+LEGS_DECOYS = (
+    "The orchard gate is painted green and squeaks in winter.",
+    "Grandmother's recipe needs two cups of oat flour and a pinch of salt.",
+    "The choir rehearses on Thursdays in the old chapel.",
+    "A heron nests near the third bridge every spring.",
+)
 
 
 @pytest.fixture(scope="module")
@@ -181,12 +194,7 @@ def legs(ctx, a) -> dict:
             a, f"zq-{ctx.run_id}-decoy{i} {text}", "tech_stack", marker=f"zq-{ctx.run_id}-decoy{i}",
             scope="project", project_id=project, visibility="private",
         )
-        for i, text in enumerate((
-            "The orchard gate is painted green and squeaks in winter.",
-            "Grandmother's recipe needs two cups of oat flour and a pinch of salt.",
-            "The choir rehearses on Thursdays in the old chapel.",
-            "A heron nests near the third bridge every spring.",
-        ))
+        for i, text in enumerate(LEGS_DECOYS)
     ]
     return {"w": w, "project": project, "marker": marker, "decoys": decoys}
 
@@ -201,6 +209,10 @@ def test_query_with_no_shared_word_recalls_the_fact_through_the_dense_leg(a, leg
         d.require()
     shared = _words(LEGS_QUERY) & _words(f"{legs['marker']} {LEGS_TEXT}")
     assert not shared, f"test data bug: query and fact share words {sorted(shared)}"
+    # The keyword leg stems: a shared word OR stem with any text in the project would let BM25 rank it.
+    for label, text in (("the fact", LEGS_TEXT), *((f"decoy {i}", d) for i, d in enumerate(LEGS_DECOYS))):
+        assert not _words(LEGS_QUERY) & _words(text), f"test data bug: query shares words with {label}: {sorted(_words(LEGS_QUERY) & _words(text))}"
+        assert not _stems(LEGS_QUERY) & _stems(text), f"test data bug: query shares a 5-letter stem with {label}: {sorted(_stems(LEGS_QUERY) & _stems(text))}"
     eventually(
         lambda: check_search_finds(a, legs["marker"], LEGS_QUERY, legs["project"]),
         timeout=90, what="the fact is searchable at all",
@@ -653,7 +665,11 @@ def test_every_v1_route_is_mounted_and_answers_without_a_server_error(ctx, anon,
     for method, path, kw in PROBES:
         client = anon if path.startswith("/health") else b
         probe = probe_route(client, method, _resolve(path, ctx, str(uuid.uuid4()), shared_fact.memory_id), **kw)
-        if not probe.present:
+        gated = FLAG_GATED_STATUSES.get((method, path))
+        if gated is not None:  # the flag-off 404 looks unrouted by design: accept only the documented statuses
+            if probe.status not in gated:
+                failures.append(f"{probe.line()}, expected one of {sorted(gated)}")
+        elif not probe.present:
             failures.append(probe.line())
     assert not failures, "routes missing or erroring:\n  " + "\n  ".join(failures)
 
