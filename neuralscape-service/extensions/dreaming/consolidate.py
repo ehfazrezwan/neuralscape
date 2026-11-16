@@ -599,22 +599,44 @@ def _rewrite_content(
     derived_from_add: list[str] | None = None,
     extra_meta: dict | None = None,
 ) -> None:
-    """Update a memory's text in place: re-embed + overwrite payload data.
+    """Update a memory's text in place: re-embed + re-encode BM25 + patch.
 
-    Atomic from the reader's perspective (single upsert). ``updated_at``
-    and the dreaming provenance markers ride along in metadata.
+    Never a whole-point upsert. An upsert replaces the point, which (1)
+    dropped the BM25 sparse vector the write path stores next to the dense
+    one (``{"": dense, "bm25": sparse}``), so every rewritten row lost its
+    lexical retrieval leg, and (2) overwrote the whole payload from a stale
+    snapshot, losing a concurrent ``times_derived`` bump or tombstone.
+    Instead, mirroring ``_tombstone`` / ``_revive_if_tombstoned``:
+
+    * nested-key ``set_payload(key="metadata")`` merges ONLY the keys this
+      rewrite owns (undo stash, markers, derived_from union, ``extra_meta``);
+    * top-level ``set_payload`` sets ``data`` / ``hash`` / ``updated_at``;
+    * ``update_vectors`` replaces the dense vector and, when the collection
+      has the slot, the BM25 sparse vector, via the vector store's own
+      ``_encode_bm25`` (no re-implementation of the encoding).
+
     ``derived_from_add`` (MERGE) unions premise ids into the survivor's
-    ``metadata.derived_from`` — read-merge-write like ``_tombstone``, but
-    folded into this upsert so provenance and content land atomically.
-    Any ``extra_meta`` patch (e.g. the merge branch's summed
-    ``times_derived``) lands in the same upsert too.
+    ``metadata.derived_from`` (read once, written as a single key). The
+    merge branch's summed ``times_derived`` arrives through ``extra_meta``.
+    The metadata patch lands first so the undo stash exists before the
+    visible text flips; ``data`` is written last.
+
+    Atomicity is per key, not one transaction: the steps are separate Qdrant
+    calls, so a failure part-way leaves a partly updated row (for example a
+    new undo stash with the old text). Every step only adds or replaces keys
+    this rewrite owns, so a retry (the sweep re-flags the row) converges and
+    nothing another writer set is ever overwritten. If no BM25 encoder is
+    available the row's sparse vector is deleted rather than left matching
+    the old text.
     """
     from config import settings as core_settings
 
     m = service._get_memory()
-    client = m.vector_store.client
+    vs = m.vector_store
+    client = vs.client
+    collection = core_settings.qdrant_collection
     points = client.retrieve(
-        collection_name=core_settings.qdrant_collection,
+        collection_name=collection,
         ids=[memory_id],
         with_payload=True,
         with_vectors=False,
@@ -622,25 +644,25 @@ def _rewrite_content(
     if not points:
         raise ValueError(f"memory {memory_id} not found for rewrite")
     payload = dict(points[0].payload or {})
-    meta = dict(payload.get("metadata") or {})
+    existing_meta = payload.get("metadata") or {}
+    patch: dict = {}
     # Audit 27 #26: rewrites must be reversible. Stash the pre-rewrite text
     # as one level of undo (a newer rewrite overwrites an older stash). A
     # no-op rewrite (identical text) keeps the existing stash — clobbering
     # it with a copy of the current text would destroy the undo point.
     prev_content = payload.get("data")
     if prev_content and prev_content != new_content:
-        meta["dream_prev_content"] = prev_content
-    meta["dream_rewritten_at"] = datetime.now(timezone.utc).isoformat()
+        patch["dream_prev_content"] = prev_content
+    patch["dream_rewritten_at"] = datetime.now(timezone.utc).isoformat()
     if reframed:
-        meta["dream_temporal_reframed"] = True
+        patch["dream_temporal_reframed"] = True
     if derived_from_add:
-        existing = meta.get("derived_from") or []
+        existing = existing_meta.get("derived_from") or []
         # union, order-preserving (existing premises first), dedup'd
-        meta["derived_from"] = list(dict.fromkeys([*existing, *derived_from_add]))
+        patch["derived_from"] = list(dict.fromkeys([*existing, *derived_from_add]))
     if extra_meta:
-        meta.update(extra_meta)
-    payload["metadata"] = meta
-    payload["data"] = new_content
+        patch.update(extra_meta)
+
     # Audit 27 #6: the content hash MUST follow the content. A stale hash
     # corrupts write-path dedup (a re-store of the new text isn't caught;
     # a re-store of the OLD text wrongly short-circuits onto this row) and
@@ -648,15 +670,51 @@ def _rewrite_content(
     # "duplicates". Same helper as store_raw — never a re-implementation.
     from memory_service import content_hash
 
-    payload["hash"] = content_hash(new_content)
-    payload["updated_at"] = datetime.now(timezone.utc).isoformat()
-    vector = m.embedding_model.embed(new_content, memory_action="update")
-    from qdrant_client.models import PointStruct
+    top_level = {
+        "data": new_content,
+        "hash": content_hash(new_content),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    dense = m.embedding_model.embed(new_content, memory_action="update")
 
-    client.upsert(
-        collection_name=core_settings.qdrant_collection,
-        points=[PointStruct(id=memory_id, vector=vector, payload=payload)],
+    from qdrant_client.models import PointVectors
+
+    drop_stale_bm25 = False
+    if getattr(vs, "_has_bm25_slot", False) is True:
+        named: dict = {"": dense}
+        sparse = vs._encode_bm25(new_content)
+        if sparse is not None:
+            named["bm25"] = sparse
+        else:
+            # No encoder: the OLD text's sparse vector must not keep the row
+            # keyword-findable by words it no longer contains (privacy).
+            drop_stale_bm25 = True
+            logger.warning(
+                "BM25 encoding unavailable for rewrite of %s; dropping its sparse vector",
+                memory_id,
+            )
+        vector = named
+    else:
+        vector = dense
+
+    client.set_payload(
+        collection_name=collection, payload=patch, points=[memory_id], key="metadata",
     )
+    client.update_vectors(
+        collection_name=collection,
+        points=[PointVectors(id=memory_id, vector=vector)],
+    )
+    if drop_stale_bm25:
+        client.delete_vectors(
+            collection_name=collection, points=[memory_id], vector=["bm25"],
+        )
+    if "text_lemmatized" in payload:
+        # The lemmatized shadow of the OLD text would otherwise feed the
+        # next BM25 re-encode (the store prefers it over ``data``).
+        client.delete_payload(
+            collection_name=collection, keys=["text_lemmatized"], points=[memory_id],
+        )
+    client.set_payload(collection_name=collection, payload=top_level, points=[memory_id])
 
 
 def _tombstone(
