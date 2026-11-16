@@ -26,7 +26,7 @@ from extensions.dreaming import gate
 from extensions.dreaming.card import build_card_view, load_card, resolve_card_pool
 from extensions.dreaming.reflect import diary_page_path
 from extensions.dreaming.sweep import _STAGED_IDS_KEY, dream_all, get_last_run
-from integration_tests._dreaming_support import dream_env  # noqa: F401  (fixture)
+from integration_tests._dreaming_support import dream_env, marker_hits, timed  # noqa: F401  (fixture)
 
 pytestmark = pytest.mark.integration
 
@@ -43,9 +43,8 @@ SEED = {
     "secret": ("task_context", "The staging API key is sk-e2e-FAKE-abc123456789 for testing"),
     "live": ("task_context", "The payment module validates cards through validate_card() in billing.py"),
 }
-OTHER_SEED = [
+OTHER_SEED = [  # minimum for a second pool that still reaches the reflection pass
     ("preference", "User prefers Rust for systems work and keeps a {tok} cheat sheet"),
-    ("preference", "The user likes using Rust for low-level systems programming"),
     ("workflow", "The user profiles every release build before shipping"),
     ("workflow", "The user benchmarks the hot path after each refactor"),
     ("workflow", "The user reviews flamegraphs before merging performance changes"),
@@ -81,18 +80,22 @@ def swept(dream_env):
     env.clear_pool_state()
 
     client = env.service._memory.vector_store.client
-    client.set_payload(
-        collection_name=env.collection,
-        payload={"code_liveness_stale": True, "code_liveness_reason": "anchor validate_card was removed",
-                 "code_liveness_anchor": "billing.py::validate_card"},
-        points=[ids["live"]], key="metadata",
-    )
+    with timed(env, "set_payload (liveness flag)"):
+        client.set_payload(
+            collection_name=env.collection,
+            payload={"code_liveness_stale": True, "code_liveness_reason": "anchor validate_card was removed",
+                     "code_liveness_anchor": "billing.py::validate_card"},
+            points=[ids["live"]], key="metadata",
+        )
     settings = env.sweep_settings()
     before_noise = env.meta(ids["noise"]).get("dream_tombstoned")
 
-    dry = asyncio.run(dream_all(service=env.service, settings=settings, dry_run=True, force=True))
-    after_dry = {n: env.payload(i) for n, i in ids.items()}
-    real = asyncio.run(dream_all(service=env.service, settings=settings, dry_run=False, force=True))
+    with timed(env, "dream_all dry run (enumerate + hydrate + LLM)"):
+        dry = asyncio.run(dream_all(service=env.service, settings=settings, dry_run=True, force=True))
+    with timed(env, "read back seeded rows"):
+        after_dry = {n: env.payload(i) for n, i in ids.items()}
+    with timed(env, "dream_all real sweep (apply + reflect + vault)"):
+        real = asyncio.run(dream_all(service=env.service, settings=settings, dry_run=False, force=True))
     reports = {p.pool: p for p in real.pools}
     return SimpleNamespace(
         ids=ids, proj_ids=proj_ids, other_user=other_user, other_tok=other_tok,
@@ -231,12 +234,22 @@ def test_reflections_stored_with_provenance_and_diary_written(dream_env, swept):
         scroll_filter=Filter(must=[FieldCondition(key="metadata.source_type", match=MatchValue(value="dream"))]),
     )
     assert recs, "insights reported stored but none carries source_type=dream"
-    seeded = set(swept.ids.values())
+    # The collection also holds the second user's insights (the sweep covers
+    # every pool), which legitimately cite that user's rows. Each insight must
+    # cite only rows of its own pool: pick the allowed set by owner, so a
+    # cross-pool citation still fails (the owner-keyed isolation test covers
+    # the reverse direction).
+    own_pool_ids = set(swept.ids.values()) | set(swept.proj_ids)
+    other_pool_ids = set(swept.other_ids)
+    assert any(r.payload["metadata"].get("owner_user_id") != swept.other_user for r in recs), (
+        "no insight of the operator pools was stored"
+    )
     for r in recs:
         md = r.payload["metadata"]
         assert md.get("epistemic_level") in ("deductive", "inductive", "reflection"), md.get("epistemic_level")
         derived = md.get("derived_from") or []
-        assert derived and set(derived) <= seeded | set(swept.proj_ids), f"bad derived_from {derived}"
+        allowed = other_pool_ids if md.get("owner_user_id") == swept.other_user else own_pool_ids
+        assert derived and set(derived) <= allowed, f"bad derived_from {derived} (owner {md.get('owner_user_id')})"
         env.seeded_ids.add(str(r.id))
     assert diary_page_path(env.sweep_settings().dreams_dir, env.pool).exists()
     assert "Reflections" in _diary(env)
@@ -292,9 +305,17 @@ def test_vault_topic_pages_home_and_hub_written(dream_env, swept):
     assert prep.status == "dreamt", f"{prep.status}: {prep.reason} {prep.errors}"
     hub = vault / "Projects" / swept.pid / f"{swept.pid}.md"
     assert prep.pages_written > 0 and hub.exists(), f"project hub missing: {hub}"
-    topics = [p for p in (vault / "Projects" / swept.pid).glob("*.md") if p.stem not in (swept.pid, "Card")]
+    # index.md / log.md are OKF bundle files (standard markdown links, written
+    # by refresh_bundle_indexes), not librarian topic pages: exclude them.
+    from okf.translate import is_reserved_filename
+
+    topics = [
+        p for p in (vault / "Projects" / swept.pid).glob("*.md")
+        if p.stem not in (swept.pid, "Card") and not is_reserved_filename(p.name)
+    ]
     assert topics, "no project topic pages"
-    assert f"[[{swept.pid}]]" in topics[0].read_text(encoding="utf-8"), "topic page does not link its hub"
+    for page in topics:
+        assert f"[[{swept.pid}]]" in page.read_text(encoding="utf-8"), f"topic page {page.name} does not link its hub"
 
 
 # ── recall traces ───────────────────────────────────────────────────
@@ -399,9 +420,49 @@ def test_unchanged_staged_id_set_is_skipped_without_llm_work(dream_env, swept):
 # ── multi-user isolation (privacy) ──────────────────────────────────
 
 
-def _vault_text(env) -> str:
+def _is_pool_diary(env, path) -> bool:
+    """Exactly the per-pool diary pages ``Dreams/<pool>.md`` of the pools this module swept."""
+    from extensions.dreaming.reflect import diary_page_path
+
+    dreams = env.vault / "Dreams"
+    names = {diary_page_path(dreams, p).name for p in (env.pool, *env.extra_pools)}
+    return path.parent == dreams and path.name in names
+
+
+# Pool-IDENTIFYING surfaces: the sweep names every pool it dreamt (user id in the
+# pool key) in the bundle log and the Dreams index entry for its diary. They carry
+# a pool NAME, never the pool's memory text, so they are scanned for content
+# markers but not for the other user's id.
+_POOL_NAME_SURFACES = ("log.md", "Dreams/index.md")
+
+
+def _vault_text(env, *, include_diaries: bool = False) -> str:
+    """Every vault file except the per-pool diary pages ``Dreams/<pool>.md``.
+
+    Those are written for EVERY pool, other users' private pools included, and
+    cite their insight text: the owner accepted that as single-operator by
+    design. Everything else, ``Dreams/index.md`` included, must never carry
+    another user's private content.
+    """
     return "\n".join(
-        p.read_text(encoding="utf-8", errors="ignore") for p in env.vault.rglob("*") if p.is_file()
+        p.read_text(encoding="utf-8", errors="ignore")
+        for p in sorted(env.vault.rglob("*"))
+        if p.is_file() and (include_diaries or not _is_pool_diary(env, p))
+    )
+
+
+def _content_hits(env, markers) -> list[str]:
+    """``path:line: text`` of every non-diary vault file holding a content marker."""
+    return marker_hits(
+        env.vault, markers, skip=lambda rel: _is_pool_diary(env, env.vault / rel),
+    )
+
+
+def _pool_id_hits(env, marker) -> list[str]:
+    """Where the other user's id appears outside the diaries and the pool-name surfaces."""
+    return marker_hits(
+        env.vault, [marker],
+        skip=lambda rel: _is_pool_diary(env, env.vault / rel) or rel in _POOL_NAME_SURFACES,
     )
 
 
@@ -410,24 +471,88 @@ def test_other_users_private_pool_swept_but_never_leaks(dream_env, swept):
     rep = swept.reports.get(swept.other_pool)
     assert rep is not None and rep.status == "dreamt", f"other pool not swept: {rep}"
     # never rendered into the operator's vault (pool isolation)
-    vault = _vault_text(env)
-    assert swept.other_tok not in vault, "other user's private content leaked into the operator vault"
-    assert "Rust" not in vault, "other user's private topic leaked into the operator vault"
+    hits = _content_hits(env, [swept.other_tok, "Rust"])
+    assert not hits, "other user's private content in the operator vault:\n" + "\n".join(hits)
     # their card exists but is refused to this user, and unreadable via REST identity
     assert load_card(env.redis, swept.other_pool), "other user's card was not produced"
     view = build_card_view(swept.other_pool, env.user, is_dictator=False, redis=env.redis)
     assert view["status"] == "forbidden"
-    # recall is user-scoped both ways
+    # recall is user-scoped both ways. Match by id and by whole word: the shared
+    # project pool is team-wide BY DESIGN (it mentions FastAPI and is visible to
+    # every user), and "rust" as a substring also matches "trust"/"robust".
+    import re
+
+    other_ids, mine_ids = set(swept.other_ids), set(swept.ids.values())
     mine = env.service.search(query=f"Rust systems {swept.other_tok}", user_id=env.user, limit=20)
-    assert not [h for h in mine if swept.other_tok in h.memory or "rust" in h.memory.lower()]
+    leaked = [h for h in mine if str(h.id) in other_ids or swept.other_tok in h.memory
+              or re.search(r"\brust\b", h.memory, re.I)]
+    assert not leaked, [(str(h.id), h.memory[:80]) for h in leaked]
     theirs = env.service.search(query="Python FastAPI backend", user_id=swept.other_user, limit=20)
-    assert not [h for h in theirs if "fastapi" in h.memory.lower()]
+    leaked = [h for h in theirs if str(h.id) in mine_ids]
+    assert not leaked, [(str(h.id), h.memory[:80]) for h in leaked]
 
 
-def test_insights_only_cite_their_own_pool(dream_env, swept):
-    from qdrant_client.models import FieldCondition, Filter, MatchValue
+def test_leak_scan_covers_the_dreams_index_but_not_the_pool_diaries(dream_env, swept):
+    env = dream_env
+    diary = env.vault / "Dreams" / "index.md"
+    assert diary.exists(), "Dreams/index.md missing: the scan's coverage cannot be shown"
+    assert not _is_pool_diary(env, diary)
+    others = [p for p in (env.vault / "Dreams").glob("*.md") if p.name != "index.md"]
+    assert others and all(_is_pool_diary(env, p) for p in others)
+    assert diary.read_text(encoding="utf-8") in _vault_text(env), "Dreams/index.md is not scanned"
+
+
+def test_dream_diary_is_written_for_every_pool_by_design(dream_env, swept):
+    """Documented contract (single-operator vault): a ``Dreams/<pool>.md`` exists for EVERY
+    swept pool, another user's private pool included, and cites that pool's content.
+
+    Pinned so a policy change is a visible test change.
+    """
+    from extensions.dreaming.reflect import diary_page_path
 
     env = dream_env
+    dreams = env.sweep_settings().dreams_dir
+    for pool in (env.pool, swept.other_pool, swept.project_pool):
+        page = diary_page_path(dreams, pool)
+        assert page.exists(), f"no dream diary page for {pool}"
+        assert pool in page.read_text(encoding="utf-8"), f"diary for {pool} does not name its pool"
+
+
+def test_insights_only_cite_their_own_pool(dream_env, swept, monkeypatch):
+    from qdrant_client.models import FieldCondition, Filter, MatchValue
+
+    from extensions.dreaming import reflect as reflect_mod
+
+    env = dream_env
+
+    # The reflection LLM is the only nondeterministic step this test depends on
+    # (it may legitimately return no insight). Pin that single seam: for each pool
+    # the stub cites the pool's OWN staged memories, exactly the shape a model
+    # reply would be validated into. Sweep, hydrate, store_insights, Qdrant and the
+    # provenance fields stay real, so the isolation property is still what is tested.
+    async def _stub_reflect(batch, llm_call, *, max_insights, surprisal_top_k=0):
+        ids = [m["memory_id"] for m in batch.memories
+               if m.get("source_type") != "dream" and not m.get("dream_tombstoned")]
+        assert len(ids) >= 2, f"pool {batch.pool} has too few live memories to cite: {ids}"
+        return [{
+            "content": f"Deterministic isolation probe insight for {batch.pool} {uuid.uuid4().hex[:8]}",
+            "source_memory_ids": ids[:3], "category": "domain_knowledge", "lens": "pattern",
+            "epistemic_level": "inductive", "confidence": 0.8,
+        }]
+
+    monkeypatch.setattr(reflect_mod, "reflect", _stub_reflect)
+    for pool in (env.pool, swept.other_pool):
+        # The `swept` fixture already dreamt every pool, which recorded each pool's
+        # last_dreamt_at. A second sweep stages only rows that changed since then (or
+        # have decayed), and a pool's fresh, strong rows are neither, so it would stage
+        # nothing and there would be nothing for the stub to cite. Forget the dreamt
+        # state (not the rows) so this sweep stages the pool's rows again.
+        env.clear_pool_state()
+        run = asyncio.run(dream_all(service=env.service, settings=swept.settings, dry_run=False,
+                                    only_pool=pool, force=True))
+        assert run.pools and run.pools[0].status == "dreamt", run.pools
+        assert run.pools[0].insights >= 1, f"stubbed reflection stored nothing for {pool}: {run.pools[0]}"
+
     client = env.service._memory.vector_store.client
     recs, _ = client.scroll(
         collection_name=env.collection, limit=100, with_payload=True, with_vectors=False,
@@ -438,7 +563,7 @@ def test_insights_only_cite_their_own_pool(dream_env, swept):
     for want in (env.user, swept.other_user):
         assert want in owners, (
             f"no insight produced for {want} (insight owners: {sorted(o for o in owners if o)}); "
-            "the LLM produced no reflection, so citation isolation is unproven"
+            "the stubbed reflection stored nothing for this pool"
         )
     for r in recs:
         md = r.payload["metadata"]
@@ -465,6 +590,7 @@ def test_bridges_pass_runs_with_flag_on(dream_env, swept):
     # can be linked or rendered. (Proving a *bridged* page needs graph entities
     # shared across hubs, which the graph LLM extracts nondeterministically:
     # out of scope here.)
-    vault = _vault_text(env)
-    assert swept.other_tok not in vault and "Rust" not in vault
-    assert swept.other_pool.split("--", 1)[1] not in vault
+    hits = _content_hits(env, [swept.other_tok, "Rust"])
+    assert not hits, "other user's private content after the bridges pass:\n" + "\n".join(hits)
+    hits = _pool_id_hits(env, swept.other_pool.split("--", 1)[1])
+    assert not hits, "other user's id outside the diaries, log.md and Dreams/index.md:\n" + "\n".join(hits)
