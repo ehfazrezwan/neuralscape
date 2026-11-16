@@ -13,7 +13,7 @@
 
 (class_declaration
   name: (type_identifier) @class.def
-  heritage: (class_heritage)? @class.heritage
+  (class_heritage)? @class.heritage
 ) @class.scope
 
 (interface_declaration

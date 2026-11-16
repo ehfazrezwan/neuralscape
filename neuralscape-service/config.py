@@ -16,6 +16,15 @@ _logger = logging.getLogger(__name__)
 _LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1", "[::1]"}
 
 
+# Dimension of the mem0 / Qdrant vectors (embedder ``embedding_dims`` and the
+# collection's ``embedding_model_dims``). The Graphiti store is configured
+# separately via ``Settings.graphiti_embedding_dim``.
+VECTOR_EMBEDDING_DIMS = 768
+
+# (ambient EMBEDDING_DIM, GRAPHITI_EMBEDDING_DIM) pairs already warned about.
+_AMBIENT_DIM_WARNED: set = set()
+
+
 class Settings(BaseSettings):
     # Logging (read by logging_config.configure_logging; `.env` values count)
     log_level: str = "INFO"
@@ -26,6 +35,14 @@ class Settings(BaseSettings):
     gemini_llm_model: str = "gemini-3.1-flash-lite"
     gemini_llm_fallback_model: str = "gemini-2.5-flash"
     gemini_embedder_model: str = "gemini-embedding-001"
+    # Dimension of the embeddings Graphiti stores on Entity.name_embedding and
+    # RELATES_TO.fact_embedding (env GRAPHITI_EMBEDDING_DIM). Passed explicitly
+    # to the Graphiti embedder instead of relying on the ambient EMBEDDING_DIM
+    # env. Default 1024 = what existing graph data is already stored at, so no
+    # stored vector changes unless the owner opts in. The mem0/Qdrant side is
+    # fixed at VECTOR_EMBEDDING_DIMS; recall compares the two on the common
+    # Matryoshka prefix (see docs/GRAPH_EMBEDDING_DIMENSION.md).
+    graphiti_embedding_dim: int = Field(default=1024, ge=1)
 
     # Hybrid experiments are independently opt-in; each needs its flag plus an endpoint and key.
     hybrid_inference_api_key: str = Field(default="", repr=False)
@@ -741,6 +758,20 @@ class Settings(BaseSettings):
             raise ValueError("OAuth token TTLs must be > 0 seconds")
         return value
 
+    @field_validator("code_repos", mode="after")
+    @classmethod
+    def _drop_blank_code_repos(cls, v: dict[str, str]) -> dict[str, str]:
+        """A blank CODE_REPOS directory would resolve to the process cwd; drop it with a warning."""
+        clean = {}
+        for name, path in (v or {}).items():
+            if not str(path or "").strip():
+                logging.getLogger(__name__).warning(
+                    "CODE_REPOS entry %r has an empty path; ignoring it", name
+                )
+                continue
+            clean[name] = path
+        return clean
+
     @field_validator("code_op_preference", mode="before")
     @classmethod
     def _parse_op_preference(cls, value):
@@ -812,6 +843,28 @@ class Settings(BaseSettings):
             if s and s not in seen:
                 seen.append(s)
         return seen
+
+    @model_validator(mode="after")
+    def _warn_ambient_embedding_dim(self) -> "Settings":
+        # The Graphiti embedder dimension used to come from the ambient
+        # EMBEDDING_DIM env (Graphiti's default 1024). GRAPHITI_EMBEDDING_DIM
+        # now wins; say so when an operator's old variable disagrees.
+        ambient = os.environ.get("EMBEDDING_DIM", "").strip()
+        key = (ambient, self.graphiti_embedding_dim)
+        if ambient and ambient != str(self.graphiti_embedding_dim) and key not in _AMBIENT_DIM_WARNED:
+            _AMBIENT_DIM_WARNED.add(key)  # once per process, not per Settings()
+            logging.getLogger(__name__).warning(
+                "EMBEDDING_DIM=%s is set but GRAPHITI_EMBEDDING_DIM=%s is what "
+                "the Graphiti embedder now uses (new graph vectors are written "
+                "at %s). If your stored graph vectors are %s-d, set "
+                "GRAPHITI_EMBEDDING_DIM=%s; see docs/GRAPH_EMBEDDING_DIMENSION.md.",
+                ambient,
+                self.graphiti_embedding_dim,
+                self.graphiti_embedding_dim,
+                ambient,
+                ambient,
+            )
+        return self
 
     @model_validator(mode="after")
     def _validate_extraction_windowing(self) -> "Settings":
@@ -1088,6 +1141,7 @@ class Settings(BaseSettings):
             "graphiti_embedder_provider": "gemini",
             "graphiti_embedder_model": self.gemini_embedder_model,
             "graphiti_embedder_api_key": self.google_api_key,
+            "graphiti_embedding_dim": self.graphiti_embedding_dim,
             "graphiti_reranker_provider": "gemini",
         }
 
@@ -1105,6 +1159,7 @@ class Settings(BaseSettings):
             "graphiti_embedder_provider": "gemini",
             "graphiti_embedder_model": self.gemini_embedder_model,
             "graphiti_embedder_api_key": self.google_api_key,
+            "graphiti_embedding_dim": self.graphiti_embedding_dim,
             "graphiti_reranker_provider": "openai",
         }
 
@@ -1119,7 +1174,7 @@ class Settings(BaseSettings):
         # Qdrant: server mode (url) or local on-disk mode (path)
         qdrant_config: dict = {
             "collection_name": self.qdrant_collection,
-            "embedding_model_dims": 768,
+            "embedding_model_dims": VECTOR_EMBEDDING_DIMS,
         }
         if self.qdrant_url:
             qdrant_config["url"] = self.qdrant_url
@@ -1154,7 +1209,7 @@ class Settings(BaseSettings):
                     "model": self.llm_gateway_embedder_model,
                     "api_key": self.llm_gateway_api_key,
                     "openai_base_url": gw,
-                    "embedding_dims": 768,
+                    "embedding_dims": VECTOR_EMBEDDING_DIMS,
                     # The gateway's Vertex embedding endpoint accepts only one
                     # input per request → embed per item unless overridden.
                     "embedding_batch_size": self.embedder_max_batch_size or 1,
@@ -1182,7 +1237,7 @@ class Settings(BaseSettings):
                 "config": {
                     "model": self.gemini_embedder_model,
                     "api_key": self.google_api_key,
-                    "embedding_dims": 768,
+                    "embedding_dims": VECTOR_EMBEDDING_DIMS,
                 },
             }
             graphiti_models = self._graphiti_ai_studio_models()
