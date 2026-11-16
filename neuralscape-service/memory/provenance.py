@@ -118,11 +118,11 @@ class ProvenanceMixin:
             if episode_uuid:
                 found = self._lookup_episode(group_id, "uuid", episode_uuid)
             # Content before name: the single-fact write path (write.py
-            # ::enrich_graph) does NOT name its episode deterministically —
-            # MemoryGraph.add() mints `mem0_episode_{now.isoformat()}` when no
-            # episode_name is supplied, so a caller can never RECOMPUTE the
-            # name, only replay whatever got persisted onto the Qdrant row at
-            # write time (write.py::_persist_graph_episode_ref). Content is
+            # ::enrich_graph) names its episode deterministically from the
+            # memory id + content + group, but a row written before that (or by
+            # an older worker) carries a timestamp-based name that can only be
+            # replayed from what was persisted onto the Qdrant row
+            # (write.py::_persist_graph_episode_ref). Content is
             # the more universally trustworthy signal — it's a plain exact
             # match (never a prefix/fuzzy match, so two episodes written in
             # the same session can't collide) and works even for rows

@@ -656,39 +656,54 @@ class WriteMixin:
         stats["created_ids"] = sorted(newly_created_ids)
         return (stored, stats) if return_stats else stored
 
-    def _stale_episode_seed(self, memory_id: str, group_id: str) -> str:
-        """The row's recorded episode uuid when that episode is STALE, else ''.
+    def _episode_is_dead(self, group_id: str, episode_uuid: str) -> bool:
+        """True when the episode has edges and EVERY one is invalidated/expired.
 
-        Seeds the single-fact episode name. A repeat or retry of the same
-        enrichment (row has no episode, or its episode is live) seeds '' and so
-        re-derives the same name, which the idempotency probe finds. A
-        deliberate re-enrichment of a row whose episode went stale (every edge
-        invalidated) seeds that episode's uuid, hence a new name and a new
-        episode. Fail-soft: '' on any error (the add is then skipped only if the
-        base-named episode already exists).
+        The same liveness the stale-graph check uses (``total > 0 and live ==
+        0``). Fail-safe: any probe error reads as "not dead" (reuse, no LLM).
         """
         try:
-            pts = self._memory.vector_store.client.retrieve(
-                collection_name=settings.qdrant_collection,
-                ids=[memory_id],
-                with_payload=True,
-                with_vectors=False,
-            )
-            meta = ((pts[0].payload or {}).get("metadata") or {}) if pts else {}
-            ref = meta.get("graph_episode_uuid")
-            if not isinstance(ref, str) or not ref:
-                return ""
             from extensions.dreaming.graph_patcher import episode_edge_counts
 
-            coro = episode_edge_counts(self._graphiti.driver, group_id=group_id, episode_uuid=ref)
+            coro = episode_edge_counts(
+                self._graphiti.driver, group_id=group_id, episode_uuid=episode_uuid
+            )
             try:
                 counts = self._run_on_bridge(coro, timeout=10.0)
             except Exception:
                 coro.close()
                 raise
-            return ref if counts["total"] > 0 and counts["live"] == 0 else ""
-        except Exception:  # noqa: BLE001 — a missing seed only weakens dedup
-            return ""
+            return counts["total"] > 0 and counts["live"] == 0
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _resolve_single_fact_episode(
+        self, memory_id: str, content: str, group_id: str
+    ) -> tuple[str, str | None]:
+        """``(episode_name, existing_uuid)`` for a single-fact enrichment.
+
+        The name is deterministic in (memory id, content, group). If an episode
+        with that name exists it is reused (``existing_uuid`` set: a repeated or
+        retried job skips the second LLM-priced add) — unless stale repair is
+        enabled (``GRAPH_SUPERSESSION_ENABLED``) and that episode is DEAD, in
+        which case the name is re-seeded with the dead episode's uuid and the
+        chain is followed: base -> dead ep1 -> name(ep1) -> ... until a name is
+        free (add a new episode) or a live episode is found (reuse it). This
+        resolves the same episode for every retry, so a repaired row never
+        flip-flops back to the dead one. With the flag off there is no repair, so
+        the first existing episode is reused with no liveness probe.
+        """
+        seed = ""
+        for _ in range(5):
+            key = hashlib.sha256("\n".join((memory_id, content, group_id, seed)).encode()).hexdigest()
+            name = f"mem0_episode_{key[:32]}"
+            found = self._graph_episode_uuid(group_id, name)
+            if not found:
+                return name, None
+            if not settings.graph_supersession_enabled or not self._episode_is_dead(group_id, found):
+                return name, found
+            seed = found
+        return name, found
 
     def _graph_episode_uuid(self, group_id: str, episode_name: str) -> str | None:
         """uuid of the Episodic node with this name in the group, else None.
@@ -1352,12 +1367,11 @@ class WriteMixin:
         value is unchanged.
 
         Idempotency: the episode is named deterministically from the memory id,
-        content, group and (only when the row's recorded episode is stale) that
-        episode's uuid. A repeated or retried job (the
-        first attempt wrote the episode but died before recording it) finds
-        the existing episode, skips the second LLM-priced add and re-runs only
-        the attach/persist steps. A deliberate re-enrichment of a row whose
-        episode went stale gets a new name and a new episode.
+        content and group (see :meth:`_resolve_single_fact_episode`). A repeated
+        or retried job (the first attempt wrote the episode but died before
+        recording it) finds the existing LIVE episode, skips the second
+        LLM-priced add and re-runs only the attach/persist steps. With stale
+        repair on, a dead episode is not reused: a new one is added.
         """
         if not (self._graphiti and self._bridge):
             return False
@@ -1367,13 +1381,7 @@ class WriteMixin:
         group_id = _build_group_id(visibility, user_id, project_id, workspace)
         graph_write_started_at = datetime.now(timezone.utc)
         try:
-            episode_key = hashlib.sha256(
-                "\n".join(
-                    (memory_id, content, group_id, self._stale_episode_seed(memory_id, group_id))
-                ).encode()
-            ).hexdigest()
-            episode_name = f"mem0_episode_{episode_key[:32]}"
-            existing_uuid = self._graph_episode_uuid(group_id, episode_name)
+            episode_name, existing_uuid = self._resolve_single_fact_episode(memory_id, content, group_id)
             if existing_uuid:
                 logger.info(
                     f"Skipping graph add for memory {memory_id} — episode "

@@ -51,6 +51,7 @@ WRITE_WINDOW_SECONDS = 120
 # Node kinds Graphiti stores that carry ``group_id`` and that our stamps reach.
 # A label-less ``MATCH (n)`` cannot use Graphiti's label-scoped indexes and
 # scans every node in the database; these queries name the kinds explicitly.
+# (Saga nodes, which NS does not use, are not covered.)
 _NODE_KINDS = ("Entity", "Episodic", "Community")
 
 
@@ -67,25 +68,33 @@ def _any_kind(where: str) -> str:
     return f"CALL {{\n{branches}\n    }}"
 
 
-# The episode's own node plus every entity it mentions: exactly the nodes one
-# write produced or touched, whatever else is writing to the group at once.
+# The episode's own node, every entity it mentions and the communities those
+# entities belong to (the old window stamped communities too): exactly the nodes
+# one write produced or touched, whatever else is writing to the group at once.
+# Rows are ordered by uuid before any write so two jobs sharing entities take
+# their node locks in the same order (no lock-order deadlock). ``@@S@@`` is
+# filled with ``s, `` when a MERGEd ``s`` must survive the WITH clauses.
 _EPISODE_NODES_BY_UUID = """
     MATCH (ep:Episodic {group_id: $group_id}) WHERE ep.uuid = $episode_uuid
     OPTIONAL MATCH (ep)-[:MENTIONS]->(e:Entity) WHERE e.group_id = $group_id
-    WITH collect(DISTINCT ep) + collect(DISTINCT e) AS nodes
+    OPTIONAL MATCH (c:Community {group_id: $group_id})-[:HAS_MEMBER]->(e)
+    WITH @@S@@collect(DISTINCT ep) + collect(DISTINCT e) + collect(DISTINCT c) AS nodes
     UNWIND nodes AS n
+    WITH @@S@@n ORDER BY n.uuid
 """
 _EPISODE_NODES_BY_NAME = _EPISODE_NODES_BY_UUID.replace(
     "ep.uuid = $episode_uuid", "ep.name = $episode_name"
 )
 
 
-def _episode_selector(episode_uuid: str | None, episode_name: str | None) -> tuple[str, dict] | None:
+def _episode_selector(
+    episode_uuid: str | None, episode_name: str | None, carry: str = ""
+) -> tuple[str, dict] | None:
     """Cypher prefix + params selecting a write's own nodes, or None (no ref)."""
     if episode_uuid:
-        return _EPISODE_NODES_BY_UUID, {"episode_uuid": episode_uuid}
+        return _EPISODE_NODES_BY_UUID.replace("@@S@@", carry), {"episode_uuid": episode_uuid}
     if episode_name:
-        return _EPISODE_NODES_BY_NAME, {"episode_name": episode_name}
+        return _EPISODE_NODES_BY_NAME.replace("@@S@@", carry), {"episode_name": episode_name}
     return None
 
 
@@ -168,11 +177,22 @@ async def attach_memory_id(
             _any_kind("n.group_id = $group_id AND n.created_at >= datetime($lower_bound)")
             + set_clause
         )
+    from neo4j.exceptions import TransientError
+
     try:
-        async with driver.session() as session:
-            result = await session.run(cypher, **params)
-            record = await result.single()
-            return int(record["patched"]) if record else 0
+        # Two jobs can still cross locks on a shared node; Neo4j aborts one with
+        # a TransientError (deadlock). Retry after a jittered backoff so the
+        # stamp is not silently lost (same remedy as attach_source_ref).
+        for attempt in range(_SOURCE_ATTACH_RETRIES + 1):
+            try:
+                async with driver.session() as session:
+                    result = await session.run(cypher, **params)
+                    record = await result.single()
+                    return int(record["patched"]) if record else 0
+            except TransientError:
+                if attempt == _SOURCE_ATTACH_RETRIES:
+                    raise
+                await _backoff_sleep(0.2 * (2**attempt) + random.uniform(0, 0.2))
     except Exception:
         logger.warning(
             "attach_memory_id failed for memory_id=%s group_id=%s (non-fatal)",
@@ -248,10 +268,9 @@ async def attach_source_ref(
     if selector is not None:
         prefix, extra = selector
         # ``s`` must survive the WITH in the node selector.
-        cypher = merge_source + prefix.replace(
-            "WITH collect(DISTINCT ep) + collect(DISTINCT e) AS nodes",
-            "WITH s, collect(DISTINCT ep) + collect(DISTINCT e) AS nodes",
-        ) + stamp
+        cypher = merge_source + _episode_selector(
+            episode_uuid, episode_name, carry="s, "
+        )[0] + stamp
         params.update(extra)
     else:
         logger.warning(

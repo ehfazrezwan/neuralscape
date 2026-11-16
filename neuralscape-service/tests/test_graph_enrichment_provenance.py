@@ -23,6 +23,7 @@ import pytest
 
 from extensions.dreaming import graph_patcher as gp
 from extensions.strategy_synthesizer import graph_patcher as sp
+from config import settings
 from memory_service import MemoryService
 
 
@@ -179,7 +180,7 @@ class _Graph:
         return {"episode_uuid": f"uuid-{n}", "episode_name": kw.get("episode_name")}
 
 
-def _svc(row_ref=""):
+def _svc():
     svc = object.__new__(MemoryService)
     graph = _Graph()
     svc._memory = SimpleNamespace(graph=graph)
@@ -189,10 +190,16 @@ def _svc(row_ref=""):
     svc._attach_memory_id_to_graph_nodes = lambda **kw: svc.attached.append(kw)
     svc._persist_graph_episode_ref = lambda *a, **k: None
     svc._maybe_supersede_contradicted = lambda **k: None
-    svc._stale_episode_seed = lambda mid, gid: svc.row_ref
-    svc.row_ref = row_ref
     svc.exists: dict[str, str] = {}
+    svc.dead: set[str] = set()
+    svc.liveness_probes: list[str] = []
+
+    def _dead(gid, uuid_):
+        svc.liveness_probes.append(uuid_)
+        return uuid_ in svc.dead
+
     svc._graph_episode_uuid = lambda gid, name: svc.exists.get(name)
+    svc._episode_is_dead = _dead
     return svc, graph
 
 
@@ -217,14 +224,38 @@ def test_retried_enrichment_does_not_add_a_second_episode():
     assert svc.attached[-1]["episode_uuid"] == "uuid-1"
 
 
-def test_deliberate_reenrichment_of_a_stale_episode_gets_a_new_name():
+def test_stale_repair_adds_a_new_episode_and_a_retry_reuses_the_live_one(monkeypatch):
+    monkeypatch.setattr(settings, "graph_supersession_enabled", True)
     svc, graph = _svc()
     _enrich(svc)
-    svc.exists[graph.adds[0]["episode_name"]] = "uuid-1"
-    svc.row_ref = "uuid-1"  # the row's recorded episode is stale (all edges dead)
+    base = graph.adds[0]["episode_name"]
+    svc.exists[base] = "ep1"
+    svc.dead.add("ep1")  # every edge of the first episode was invalidated
+    out: dict = {}
+    _enrich(svc, result_out=out)  # deliberate repair: dead episode is not reused
+    assert len(graph.adds) == 2 and graph.adds[1]["episode_name"] != base
+    svc.exists[graph.adds[1]["episode_name"]] = "ep2"
+    out2: dict = {}
+    _enrich(svc, result_out=out2)  # retry / duplicate job: base is dead, the chain leads to live ep2
+    assert len(graph.adds) == 2, "retry minted a third episode"
+    assert out2["episode_uuid"] == "ep2", "retry flip-flopped back to the dead episode"
+
+
+def test_flag_off_reuses_an_existing_episode_without_any_liveness_probe(monkeypatch):
+    monkeypatch.setattr(settings, "graph_supersession_enabled", False)
+    svc, graph = _svc()
     _enrich(svc)
-    assert len(graph.adds) == 2
-    assert graph.adds[0]["episode_name"] != graph.adds[1]["episode_name"]
+    svc.exists[graph.adds[0]["episode_name"]] = "ep1"
+    svc.dead.add("ep1")
+    _enrich(svc)
+    assert len(graph.adds) == 1 and svc.liveness_probes == []
+
+
+def test_first_enrichment_pays_no_probe_beyond_the_name_lookup(monkeypatch):
+    monkeypatch.setattr(settings, "graph_supersession_enabled", True)
+    svc, graph = _svc()
+    _enrich(svc)
+    assert len(graph.adds) == 1 and svc.liveness_probes == []
 
 
 def test_enrich_graph_passes_episode_to_the_attach_hook_and_reports_it():
@@ -309,28 +340,47 @@ def test_graph_index_failure_does_not_break_startup():
     svc._index_ensure_thread.join(5)  # must not raise
 
 
-# ── stale-episode seed ───────────────────────────────────────────────
+# ── deadlock retry + community provenance ────────────────────────────
 
 
-@pytest.mark.parametrize(
-    "ref,counts,expected",
-    [
-        (None, None, ""),                                   # no episode recorded
-        ("ep-1", {"total": 2, "live": 1}, ""),              # live episode: repeat/retry is a no-op
-        ("ep-1", {"total": 0, "live": 0}, ""),              # produced no edges: nothing contradicted
-        ("ep-1", {"total": 2, "live": 0}, "ep-1"),          # every edge dead: re-enrich anew
-    ],
-)
-def test_stale_episode_seed(monkeypatch, ref, counts, expected):
-    svc = object.__new__(MemoryService)
-    meta = {"graph_episode_uuid": ref} if ref else {}
-    client = SimpleNamespace(retrieve=lambda **k: [SimpleNamespace(payload={"metadata": meta})])
-    svc._memory = SimpleNamespace(vector_store=SimpleNamespace(client=client))
-    svc._graphiti = SimpleNamespace(driver=object())
+def test_attach_memory_id_retries_a_transient_deadlock(monkeypatch):
+    from neo4j.exceptions import TransientError
 
-    async def fake_counts(driver, **kw):
-        return counts
+    monkeypatch.setattr(gp, "_backoff_sleep", lambda *_: asyncio.sleep(0))
+    d = _Driver()
+    real_run = _Session.run
+    state = {"n": 0}
 
-    monkeypatch.setattr(gp, "episode_edge_counts", fake_counts)
-    svc._run_on_bridge = lambda coro, timeout=10.0: asyncio.run(coro)
-    assert svc._stale_episode_seed("m1", "g") == expected
+    async def flaky(self, cypher, **params):
+        state["n"] += 1
+        if state["n"] == 1:
+            raise TransientError("deadlock detected")
+        return await real_run(self, cypher, **params)
+
+    monkeypatch.setattr(_Session, "run", flaky)
+    assert _run(gp.attach_memory_id(d, episode_uuid="ep-1", **KW)) == 3
+    assert state["n"] == 2, "the stamp was lost instead of retried"
+
+
+def test_attach_memory_id_gives_up_after_the_retries_without_raising(monkeypatch):
+    from neo4j.exceptions import TransientError
+
+    monkeypatch.setattr(gp, "_backoff_sleep", lambda *_: asyncio.sleep(0))
+
+    async def always(self, cypher, **params):
+        raise TransientError("deadlock detected")
+
+    monkeypatch.setattr(_Session, "run", always)
+    assert _run(gp.attach_memory_id(_Driver(), episode_uuid="ep-1", **KW)) == 0
+
+
+def test_locks_are_taken_in_a_stable_order_and_communities_are_stamped():
+    d = _Driver()
+    _run(gp.attach_memory_id(d, episode_uuid="ep-1", **KW))
+    cypher, _ = d.calls[0]
+    assert "(c:Community {group_id: $group_id})-[:HAS_MEMBER]->(e)" in cypher
+    assert cypher.index("ORDER BY n.uuid") < cypher.index("SET n.ns_attach_lock")
+    _run(gp.attach_source_ref(d, group_id="g", memory_id="m", source_ref={"connector_id": "c"},
+                              write_started_at=NOW, episode_uuid="ep-1"))
+    src = d.calls[1][0]
+    assert "WITH s, n ORDER BY n.uuid" in src and "HAS_MEMBER" in src
