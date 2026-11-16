@@ -71,7 +71,7 @@ function inboundStem(raw: Record<string, unknown>, ctx: OpenClawContext): string
  * `.lastturn`, so the SessionStart orphan sweep ages them out.
  */
 async function rememberInbound(raw: Record<string, unknown>, ctx: OpenClawContext): Promise<void> {
-  const text = redactPrivate(ctx.content || "");
+  const text = redactPrivate(ctx.content || "", { failClosed: true });
   if (!text.trim()) return;
   try {
     const dir = getObservationDir();
