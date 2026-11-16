@@ -405,33 +405,38 @@ class EditMixin:
     _ACCESS_KEYS = ("visibility", "project_id", "scope", "category")
     _VISIBILITY_RANK = {"private": 0, "shared": 1, "standard": 2}
 
-    def _narrow_access_before_text(self, m, memory_id, new_meta, stored_meta, current_revision, parent_key) -> None:
-        """Move the access-control keys BEFORE the text lands when a content edit does not widen the audience.
+    def _narrow_access_before_text(self, m, memory_id, new_meta, stored_meta, current_revision, parent_key) -> dict:
+        """Move the access-control keys BEFORE the commit when an edit does not widen the audience; returns what was written.
 
         The text commit and the nested metadata apply are separate calls, and every pool filter reads
         ``metadata.visibility`` / ``project_id`` / ``scope``: a narrowing edit (shared -> private, or a project move)
         must not expose its NEW text to the OLD audience for the instant (or, on a failed apply, the hours until
         repair) between them. So those keys are written first, conditional on the same revision. An edit that WIDENS
         visibility keeps them deferred (the old text reaching the wider audience first is what the owner is
-        sharing anyway). Known edge: if the commit then loses the race the narrowing stays applied (the fail-closed
-        direction).
+        sharing anyway). Applies to metadata-only edits too: their deferred apply can fail as well, and a failed
+        narrowing must not report success while the row stays readable. A project/scope move with the SAME
+        visibility is written first as well; that is safe: it does not widen who may read the memory (visibility is
+        unchanged), the destination pool's readers see the memory they were meant to see, and what leaves is the
+        old pool's access. Known edge: if the commit then loses the race the narrowing stays applied (the
+        fail-closed direction; it is logged).
         """
         delta = {
             k: new_meta.get(k) for k in self._ACCESS_KEYS if new_meta.get(k) != stored_meta.get(k)
         }
         if not delta:
-            return
+            return {}
         rank = self._VISIBILITY_RANK
         old_rank = rank.get(str(stored_meta.get("visibility") or "private"), 0)
         new_rank = rank.get(str(new_meta.get("visibility") or "private"), 0)
         if new_rank > old_rank:
-            return
+            return {}
         m.vector_store.client.set_payload(
             collection_name=settings.qdrant_collection,
             payload=delta,
             points=_cas_filter(memory_id, current_revision, parent_key),
             key=parent_key,
         )
+        return delta
 
     @staticmethod
     def _apply_pending_meta(client, collection, memory_id, revision, token, delta, parent_key) -> None:
@@ -830,16 +835,26 @@ class EditMixin:
         # Store-level compare-and-set (see ``_cas_set_payload``): metadata delta + revision first, then
         # the text fields, both filter-scoped. Not applied -> RevisionConflict, nothing written.
         text_fields: dict = {"updated_at": now_iso}
+        # Access-control keys that do not widen the audience are written FIRST for every edit (content or
+        # metadata-only): a deferred apply that fails must never leave the row readable by the old audience.
+        narrowed = self._narrow_access_before_text(
+            m, memory_id, new_meta, stored_meta, current_revision, parent_key
+        )
         if edits_content:
-            self._narrow_access_before_text(
-                m, memory_id, new_meta, stored_meta, current_revision, parent_key
-            )
             text_fields.update(self._text_fields(changes["content"], now_iso))
             text_fields["vector_pending"] = True            # cleared once the vector matches this text
             text_fields["vector_pending_at"] = _now_epoch()
-        self._cas_set_payload(
-            m, memory_id, text_fields, new_meta, stored_meta, payload, current_revision, expected_revision, parent_key
-        )
+        try:
+            self._cas_set_payload(
+                m, memory_id, text_fields, new_meta, stored_meta, payload, current_revision, expected_revision, parent_key
+            )
+        except RevisionConflict:
+            if narrowed:
+                logger.warning(
+                    "Edit of %s lost the race AFTER its access-control keys were narrowed (fail-closed): the row "
+                    "keeps the narrower access %s although its edit was rejected", memory_id, narrowed,
+                )
+            raise
         if edits_content:
             self._record_edit_history(m, memory_id, payload, changes["content"], now_iso)
             # The edit is COMMITTED: a failure in the vector sync must never turn the response into

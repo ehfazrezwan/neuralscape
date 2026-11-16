@@ -1014,6 +1014,13 @@ class TestReasoningChainReadGate:
         assert chain["children"][0]["content"] == "alice's private premise"
 
 
+
+def _applied_meta_delta(service):
+    """The deferred nested metadata apply (the LAST ``key="metadata"`` write; an access-control narrowing may precede the commit)."""
+    nested = [c for c in service._memory.vector_store.client.set_payload.call_args_list if c.kwargs.get("key") == "metadata"]
+    return nested[-1].kwargs["payload"]
+
+
 class TestPatchMemory:
     @pytest.fixture(autouse=True)
     def _stub_response(self, service):
@@ -1045,9 +1052,9 @@ class TestPatchMemory:
         service._memory.vector_store.get.return_value = _edit_point(meta=meta)
         service.patch_memory('m1', 'ehfaz', changes)
         if 'content' in changes:
-            stored = service._memory.vector_store.client.set_payload.call_args_list[1].kwargs['payload']
+            stored = _applied_meta_delta(service)
         else:
-            stored = service._memory.vector_store.client.set_payload.call_args_list[1].kwargs['payload']
+            stored = _applied_meta_delta(service)
         assert stored.get('category_evidence') is None and 'category_evidence' in stored   # removed key written as null
         assert 'visibility' not in stored and 'owner_user_id' not in stored            # untouched keys not rewritten
 
@@ -1122,7 +1129,7 @@ class TestPatchMemory:
         meta = {"category": "decision", "owner_user_id": "ehfaz", "visibility": "private"}
         service._memory.vector_store.get.return_value = _edit_point(meta=meta)
         service.patch_memory("m1", "ehfaz", {"category": "tech_stack", "project_id": "p1"})
-        new_meta = service._memory.vector_store.client.set_payload.call_args_list[1].kwargs["payload"]
+        new_meta = _applied_meta_delta(service)
         assert new_meta["scope"] == "project" and new_meta["project_id"] == "p1"
 
     def test_clearing_project_id_flips_flexible_scope_to_global(self, service):
@@ -1136,7 +1143,7 @@ class TestPatchMemory:
                           "edges_expired": 0, "nodes_removed": 0, "summaries_cleared": 0}
         )
         result = service.patch_memory("m1", "ehfaz", {"project_id": None})
-        new_meta = service._memory.vector_store.client.set_payload.call_args_list[1].kwargs["payload"]
+        new_meta = _applied_meta_delta(service)
         assert new_meta["scope"] == "global" and new_meta["project_id"] is None
         # private user--ehfaz--project--neuralscape → user--ehfaz: partition moved
         assert result["graph"] == "migration_pending"

@@ -876,3 +876,34 @@ def test_meta_repair_has_an_attempt_budget_and_reports_what_it_applied(world, mo
     world.fake.points[M1]["ns_meta_repair_attempts"] = 0
     assert world.repair_stale_vectors(min_age_s=0)["meta_repaired"] == 1
     assert world.fake.points[M1]["metadata"]["tags"] == ["x"]
+
+
+def test_a_METADATA_ONLY_narrowing_edit_is_narrowed_before_the_commit_even_when_the_deferred_apply_fails(world, monkeypatch):
+    _seed_shared(world)
+
+    def boom(*a, **k):
+        raise ConnectionError("apply failed")
+
+    monkeypatch.setattr(MemoryService, "_apply_pending_meta", staticmethod(boom))
+    world.patch_memory(M1, "ehfaz", {"visibility": "private"}, expected_revision="0")
+    assert world.fake.points[M1]["metadata"]["visibility"] == "private"      # not "success while still shared"
+
+
+def test_a_project_move_with_the_same_visibility_is_written_before_the_commit_and_a_lost_race_is_logged(world, caplog):
+    seen = {}
+    _hook_before_nth_set_payload(world, 2, lambda: seen.setdefault("p", world.fake.points[M1]["metadata"].get("project_id")))
+    world.patch_memory(M1, "ehfaz", {"project_id": "proj-2"}, expected_revision="0")
+    assert seen["p"] == "proj-2"                                             # call 1 = the move, call 2 = the commit
+
+    world.fake.add(M2)
+    world.fake.points[M2]["metadata"]["visibility"] = "shared"
+
+    def interloper(fake):
+        fake.points[M2]["metadata"]["revision"] = 1
+
+    world.fake.before_filtered_write = None
+    _hook_before_nth_set_payload(world, 2, lambda: interloper(world.fake))      # the commit then loses the race
+    with caplog.at_level("WARNING"):
+        with pytest.raises(RevisionConflict):
+            world.patch_memory(M2, "ehfaz", {"content": "x", "visibility": "private"}, expected_revision="0")
+    assert any("AFTER its access-control keys were narrowed" in r.message for r in caplog.records)
