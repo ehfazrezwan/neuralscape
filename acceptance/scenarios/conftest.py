@@ -25,6 +25,7 @@ RUN_LAST = {
     "test_edit_delete": 2,
     "test_delete_privacy": 3,  # bulk-deletes ctx.project_id
     "test_fault_injection": 4,
+    "test_graph_leg_budget": 5,  # pauses Neo4j briefly
 }
 
 

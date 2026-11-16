@@ -29,7 +29,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["neuralscape_bench", "icebench"]
+packages = ["neuralscape_bench", "icebench", "trackb"]
 
 [tool.hatch.build.targets.wheel.force-include]
 "static" = "neuralscape_bench/static"
@@ -39,7 +39,21 @@ packages = ["neuralscape_bench", "icebench"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
-testpaths = ["tests", "icebench/tests", "icebench/trackq/tests", "icebench/tokensave/tests"]
+testpaths = [
+    "tests",
+    "icebench/tests",
+    "icebench/trackq/tests",
+    "icebench/tokensave/tests",
+    "icebench/report/test_generator.py",
+    "icebench/systems/cbm_standalone/test_adapter.py",
+    "icebench/systems/graphify_standalone/test_adapter.py",
+    "trackb/longmemeval_ref/tests/test_answer.py",
+    "trackb/longmemeval_ref/tests/test_grade.py",
+    "trackb/longmemeval_ref/tests/test_ingest.py",
+    "trackb/longmemeval_ref/tests/test_report.py",
+    "trackb/mem0_locomo/tests",
+    "trackb/mem0_tracka/tests",
+]
 
 [dependency-groups]
 dev = [

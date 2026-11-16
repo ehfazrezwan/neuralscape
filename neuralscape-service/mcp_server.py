@@ -1476,6 +1476,13 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
     arguments = arguments or {}
     user_id = current_user_id.get() or arguments.get("user_id") or settings.default_user_id
 
+    # Explicit action policy (NS_POLICY_MODE; a no-op while it is "off").
+    from policy_enforcement import enforce_mcp_call
+
+    _policy_denial = await asyncio.to_thread(enforce_mcp_call, name, arguments)
+    if _policy_denial is not None:
+        return [TextContent(type="text", text=json.dumps(_policy_denial))]
+
     try:
         if name == "recall_memories":
             # Phase E: fusion — when the router says code leg is warranted, execute
