@@ -791,3 +791,75 @@ async def test_connect_has_one_overall_deadline_not_one_per_address():
     assert time.monotonic() - started < 0.3  # not 4 x 0.15
     assert len(inner.connected) < 4  # the budget ran out before the cap did
     assert inner.timeouts[0] <= 0.15 and all(b < a for a, b in zip(inner.timeouts, inner.timeouts[1:]))
+
+
+# ── slot accounting, more embeddings, scope ids, deadline start ─────────────
+
+
+@pytest.mark.asyncio
+async def test_cancelled_queued_lookups_return_their_slots(monkeypatch):
+    """12 lookups, 4 threads: the queued ones time out and are cancelled before they ever run."""
+    monkeypatch.setattr(destination, "_RESOLVER_MAX_INFLIGHT", 12)
+    monkeypatch.setattr(destination.socket, "getaddrinfo", lambda *a, **k: time.sleep(0.8) or [(2, 1, 6, "", (PUBLIC, 443))])
+    tasks = [asyncio.ensure_future(asyncio.wait_for(REAL_RESOLVE_HOST(f"h{i}.example.com", 443), 0.2)) for i in range(12)]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    assert all(isinstance(r, asyncio.TimeoutError) for r in results), results
+    deadline = time.monotonic() + 3
+    while destination._inflight and time.monotonic() < deadline:  # the 4 running lookups finish
+        await asyncio.sleep(0.05)
+    assert destination._inflight == 0
+
+
+def _v6(prefix_hex: str, v4: str) -> str:
+    return str(ipaddress.IPv6Address(bytes.fromhex(prefix_hex) + ipaddress.IPv4Address(v4).packed))
+
+
+@pytest.mark.parametrize("v4", ["169.254.169.254", "168.63.129.16", "100.100.100.200"])
+@pytest.mark.asyncio
+async def test_siit_and_local_use_nat64_forms_of_metadata_refused_even_when_allowlisted(v4):
+    siit = _v6("0000000000000000ffff0000", v4)  # ::ffff:0:a.b.c.d
+    n = ipaddress.IPv4Address(v4).packed
+    local_nat64 = str(ipaddress.IPv6Address(bytes.fromhex("0064ff9b0001") + n[:2] + b"\x00" + n[2:] + bytes(5)))  # RFC 8215 /48
+    assert siit.startswith("::ffff:0:") or ":ffff:0:" in siit
+    for addr in (siit, local_nat64):
+        assert ipaddress.IPv4Address(v4) in destination._embedded_ipv4(ipaddress.IPv6Address(addr)), addr
+        assert destination._never_allowed(ipaddress.ip_address(addr)), addr
+        dns = fake_dns({"h.corp": [addr]})
+        for allow in (NO_ALLOW, parse_allowed_hosts("h.corp")):
+            with pytest.raises(DestinationRefused):
+                await validate_url("https://h.corp/", allow, dns)
+
+
+@pytest.mark.parametrize("addr", ["fd20:ce::254%eth0", "fd00:ec2::254%lo", "fe80::1%eth0", "::1%lo"])
+@pytest.mark.asyncio
+async def test_zone_scoped_literals_do_not_defeat_the_checks(addr):
+    ip = ipaddress.ip_address(addr)
+    assert ip.scope_id  # the stdlib keeps the scope, so plain equality with the metadata set fails
+    assert destination._non_public(ip)
+    if not addr.startswith("::1"):
+        assert destination._never_allowed(ip)
+    dns = fake_dns({"h.corp": [addr]})
+    for allow in (NO_ALLOW, parse_allowed_hosts("h.corp")):
+        if addr.startswith("::1"):
+            continue
+        with pytest.raises(DestinationRefused):
+            await validate_url("https://h.corp/", allow, dns)
+
+
+@pytest.mark.asyncio
+async def test_connect_deadline_starts_before_the_lookup():
+    async def slow_dns(host, port):
+        await asyncio.sleep(0.1)
+        return [PUBLIC]
+
+    class Rec(FakeInner):
+        timeouts: list = []
+
+        async def connect_tcp(self, host, port, timeout=None, **kw):
+            self.timeouts.append(timeout)
+            return object()
+
+    inner = Rec()
+    inner.timeouts = []
+    await _GuardedBackend(NO_ALLOW, slow_dns, inner).connect_tcp("h.example.com", 443, timeout=0.5)
+    assert inner.timeouts[0] <= 0.42  # the 0.1 s lookup was charged against the 0.5 s budget

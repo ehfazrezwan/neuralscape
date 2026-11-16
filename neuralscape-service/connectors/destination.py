@@ -114,21 +114,20 @@ async def resolve_host(host: str, port: int) -> list[str]:
             raise DestinationRefused(_NOT_PERMITTED, "resolver_busy")
         _inflight += 1
 
-    def lookup():
+    def release(_future) -> None:
+        # Fires when the lookup finishes AND when it is cancelled while still queued
+        # (it then never runs), so a slot can never leak.
         global _inflight
-        try:
-            return socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
-        finally:
-            with _inflight_lock:
-                _inflight -= 1
-
-    try:
-        future = asyncio.get_running_loop().run_in_executor(_resolver_pool, lookup)
-    except BaseException:
         with _inflight_lock:
             _inflight -= 1
+
+    try:
+        future = _resolver_pool.submit(lambda: socket.getaddrinfo(host, port, type=socket.SOCK_STREAM))
+    except BaseException:
+        release(None)
         raise
-    infos = await future
+    future.add_done_callback(release)
+    infos = await asyncio.wrap_future(future)
     return list(dict.fromkeys(info[4][0].split("%", 1)[0] for info in infos))
 
 
@@ -163,6 +162,13 @@ def _literal_ip(host: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | No
     return None
 
 
+def _unscoped(ip):
+    """``fd20:ce::254%eth0`` is the same host as ``fd20:ce::254``; scope ids must not defeat comparisons."""
+    if isinstance(ip, ipaddress.IPv6Address) and ip.scope_id:
+        return ipaddress.IPv6Address(ip.packed)
+    return ip
+
+
 def _embedded_ipv4(ip: ipaddress.IPv6Address) -> list[ipaddress.IPv4Address]:
     """IPv4 addresses an IPv6 address carries (they decide where traffic really goes)."""
     found: list[ipaddress.IPv4Address] = []
@@ -177,17 +183,25 @@ def _embedded_ipv4(ip: ipaddress.IPv6Address) -> list[ipaddress.IPv4Address]:
         found.append(ipaddress.IPv4Address(packed[12:]))  # IPv4-compatible ::a.b.c.d
     if packed[:12] == bytes.fromhex("0064ff9b0000000000000000"):
         found.append(ipaddress.IPv4Address(packed[12:]))  # NAT64 64:ff9b::/96
+    if packed[:12] == bytes.fromhex("0000000000000000ffff0000"):
+        found.append(ipaddress.IPv4Address(packed[12:]))  # SIIT ::ffff:0:a.b.c.d
+    if packed[:6] == bytes.fromhex("0064ff9b0001"):
+        # RFC 8215 local-use NAT64 64:ff9b:1::/48, RFC 6052 /48 layout: the IPv4 address
+        # sits in bytes 6-7 and 9-10 (byte 8 is the reserved "u" octet).
+        found.append(ipaddress.IPv4Address(packed[6:8] + packed[9:11]))
     return found
 
 
 def _never_allowed(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
     """Link-local and cloud-metadata addresses: refused for everyone, allowlist or not."""
+    ip = _unscoped(ip)
     if isinstance(ip, ipaddress.IPv6Address) and any(_never_allowed(v4) for v4 in _embedded_ipv4(ip)):
         return True
     return ip.is_link_local or ip in _METADATA
 
 
 def _non_public(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    ip = _unscoped(ip)
     if isinstance(ip, ipaddress.IPv6Address) and any(_non_public(v4) for v4 in _embedded_ipv4(ip)):
         return True
     return bool(
