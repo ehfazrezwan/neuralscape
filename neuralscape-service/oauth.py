@@ -57,11 +57,13 @@ import identity_store
 from login_providers import (
     AuthorizeContext,
     GoogleProvider,
+    IdentityStoreUnavailable,
     LoginError,
     LoginNeedsLink,
     SupabaseProvider,
     _supabase_finish_page,
     get_login_provider,
+    provision_user_id,
     sign_link_ticket,
     verify_link_ticket,
 )
@@ -772,6 +774,14 @@ async def oauth_link(
         user_id = claims.get("suggested_user_id") or ""
         if not user_id:
             return _login_error_page(LoginError("Could not determine an account id.", 400))
+        # The slug may have been claimed by someone else since the page was
+        # shown (or the legacy slug collides): never silently share an id.
+        try:
+            user_id = await provision_user_id(user_id, sub, email, reserve=True)
+        except IdentityStoreUnavailable:
+            return _login_error_page(
+                LoginError("Identity store unavailable. Please try signing in again shortly.", 503)
+            )
 
     await identity_store.link(user_id, sub=sub, email=email)
     return _issue_code_and_redirect(ctx, user_id)

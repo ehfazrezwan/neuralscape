@@ -49,7 +49,7 @@ export interface CompactSnapshotInputs {
 
 /** Squash a message to a single redacted line, bounded to `maxChars`. */
 function squashMessage(text: string, maxChars = MAX_MESSAGE_CHARS): string {
-  const clean = redactPrivate(text).replace(/\s+/g, " ").trim();
+  const clean = redactPrivate(text, { failClosed: true }).replace(/\s+/g, " ").trim();
   if (clean.length <= maxChars) return clean;
   return clean.slice(0, maxChars - 1).trimEnd() + "…";
 }
