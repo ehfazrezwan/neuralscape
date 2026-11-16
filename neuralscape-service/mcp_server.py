@@ -1151,7 +1151,7 @@ async def list_tools() -> list[Tool]:
                     },
                     "project_id": {
                         "type": "string",
-                        "description": "Default project for the session note (items carry their own project_id)",
+                        "description": "Default project for the note; project-category items without their own inherit it",
                     },
                     "user_id": {
                         "type": "string",
