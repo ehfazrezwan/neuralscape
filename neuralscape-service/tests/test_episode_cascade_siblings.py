@@ -1416,3 +1416,68 @@ class TestTtlSweep:
             worker._enqueue_graph_jobs = orig
         assert sorted(j["memory_id"] for j in enqueued) == sorted(conv.ids[1:])
         assert out["graph_jobs_enqueued"] == 2 and "graph_jobs" not in out
+
+
+class TestTtlSweepEdges:
+    def test_a_failing_graph_cleanup_leaves_vectors_deleted_and_is_reported(self, world):
+        w = world
+        conv = seed_conversation(w, n=3)
+        _expire(w, conv.ids[0])
+        w.svc._bulk_graph_cleanup = MagicMock(side_effect=RuntimeError("neo4j down"))
+        out = w.svc.expire_old_memories(batch_size=100)
+        assert out["deleted_count"] == 1 and conv.ids[0] not in w.q.points
+        assert out["graph_cascade_unresolved_ids"] == [conv.ids[0]]
+        assert out["graph_jobs"] == [] and out["graph_jobs_count"] == 0
+
+    def test_sibling_repair_never_crosses_users(self, world):
+        """Episodes are per-user, but a row of another user carrying the same episode ref must not be repaired."""
+        w = world
+        conv = seed_conversation(w, n=2)                       # alice: ids[0] expires, ids[1] is the sibling
+        w.q.add(rid(77, 2), "bob row", user_id=OTHER, graph_episode_uuid=conv.uuid, graph_episode_name=conv.name)
+        _expire(w, conv.ids[0])
+        out = w.svc.expire_old_memories(batch_size=100)
+        assert {j["memory_id"] for j in out["graph_jobs"]} == {conv.ids[1]}
+        assert w.q.meta(rid(77, 2))["graph_episode_uuid"] == conv.uuid       # untouched
+
+    def test_two_users_expiring_in_one_sweep_are_repaired_separately(self, world):
+        w = world
+        a = seed_conversation(w, n=2, tag="ca", start=1)
+        b = seed_conversation(w, n=2, tag="cb", user=OTHER, start=50)
+        _expire(w, a.ids[0], b.ids[0])
+        out = w.svc.expire_old_memories(batch_size=100)
+        assert out["per_user"] == {OWNER: 1, OTHER: 1}
+        assert {j["memory_id"] for j in out["graph_jobs"]} == {a.ids[1], b.ids[1]}
+        assert {j["user_id"] for j in out["graph_jobs"]} == {OWNER, OTHER}
+
+    def test_cron_logs_ids_unrepaired_siblings_and_repair_failure(self, world, caplog):
+        import logging
+
+        import worker
+
+        w = world
+        w.svc.expire_old_memories = MagicMock(return_value={
+            "deleted_count": 2, "per_user": {OWNER: 2}, "graph_jobs": [],
+            "graph_cascade_unresolved_ids": ["u1", "u2"],
+            "graph_sibling_unrepaired_ids": ["s1"], "graph_sibling_repair_failed": True,
+        })
+        with caplog.at_level(logging.WARNING, logger="worker"):
+            asyncio.run(worker.expire_old_memories_cron({"service": w.svc}))
+        text = caplog.text
+        assert "unresolved for 2 expired" in text and "u1" in text and "u2" in text
+        assert "1 sibling memories could not be repaired" in text and "s1" in text
+        assert "sibling lookup failed" in text
+
+    def test_cron_is_quiet_when_graph_cleanup_was_clean(self, world, caplog):
+        import logging
+
+        import worker
+
+        w = world
+        w.svc.expire_old_memories = MagicMock(return_value={
+            "deleted_count": 1, "per_user": {OWNER: 1}, "graph_jobs": [],
+            "graph_cascade_unresolved_ids": [], "graph_sibling_unrepaired_ids": [],
+            "graph_sibling_repair_failed": False,
+        })
+        with caplog.at_level(logging.WARNING, logger="worker"):
+            asyncio.run(worker.expire_old_memories_cron({"service": w.svc}))
+        assert "Expiry cron: graph cleanup" not in caplog.text and "could not be repaired" not in caplog.text
