@@ -2854,15 +2854,17 @@ async def v1_export_okf(
     filename = f"okf-bundle-{stamp}.zip"
     from fastapi.responses import Response as FastAPIResponse
 
-    return FastAPIResponse(
-        content=data,
-        media_type="application/zip",
-        headers={
-            "Content-Disposition": f'attachment; filename="{filename}"',
-            "X-OKF-Concepts": str(stats["concepts"]),
-            "X-OKF-Files": str(stats["files"]),
-        },
-    )
+    headers = {
+        "Content-Disposition": f'attachment; filename="{filename}"',
+        "X-OKF-Concepts": str(stats["concepts"]),
+        "X-OKF-Files": str(stats["files"]),
+        # Never a silent cut: a pool larger than the export cap says so.
+        "X-OKF-Truncated": "true" if stats.get("truncated") else "false",
+    }
+    for pool, cut in (stats.get("truncated_pools") or {}).items():
+        headers[f"X-OKF-{pool.capitalize()}-Exported"] = str(cut["exported"])
+        headers[f"X-OKF-{pool.capitalize()}-Total"] = str(cut["total"])
+    return FastAPIResponse(content=data, media_type="application/zip", headers=headers)
 
 
 @v1_router.get("/memories", response_model=list[MemoryResponse])
