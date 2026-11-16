@@ -10,6 +10,7 @@ import logging
 import time
 
 from arq.connections import ArqRedis, create_pool
+from arq.constants import result_key_prefix
 from arq.jobs import Job, JobStatus
 
 from config import parse_redis_settings, settings
@@ -481,6 +482,35 @@ class TaskManager:
         await self._track_task(payload.get("user_id"), task_id)
         return task_id
 
+    async def _enqueue_sync_job(self, connector_id: str, generation: str | None, job_id: str):
+        """Enqueue a sync under ``job_id``, coalescing only with a run still in flight.
+
+        ARQ refuses to enqueue a job id whose result is still cached (an hour
+        after it finished), so with a deterministic id a second sync requested
+        after the first completed would be dropped and the caller would poll
+        the first run's result as if it were the new one. A sync that is
+        queued, deferred or running is still coalesced; for a finished one the
+        cached result is cleared and a fresh job is enqueued.
+        """
+
+        async def _enqueue():
+            return await self.pool.enqueue_job(
+                "process_connector_sync",
+                connector_id,
+                generation,
+                _job_id=job_id,
+                _queue_name=settings.ingest_queue_name,
+            )
+
+        job = await _enqueue()
+        if job is not None:
+            return job
+        status = await Job(job_id, self.pool, _queue_name=settings.ingest_queue_name).status()
+        if status != JobStatus.complete:
+            return None  # queued / deferred / running: coalesce onto it
+        await self.pool.delete(result_key_prefix + job_id)
+        return await _enqueue()
+
     async def enqueue_connector_sync(
         self,
         connector_id: str,
@@ -503,13 +533,7 @@ class TaskManager:
         cached job, result or read grant with the previous instance.
         """
         job_id = connector_sync_job_id(connector_id, user_id, generation)
-        job = await self.pool.enqueue_job(
-            "process_connector_sync",
-            connector_id,
-            generation,
-            _job_id=job_id,
-            _queue_name=settings.ingest_queue_name,
-        )
+        job = await self._enqueue_sync_job(connector_id, generation, job_id)
         task_id = job_id if job is None else job.job_id
         await self._track_task(user_id, task_id)
         return task_id
