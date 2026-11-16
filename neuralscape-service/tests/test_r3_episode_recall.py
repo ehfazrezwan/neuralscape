@@ -350,6 +350,55 @@ class TestR3EpisodeRowsSurviveTruncation:
         assert len(results) == 5 and {r.source for r in results} == {"graph"}
 
 
+class TestTruncateKeepingEpisodeRowsDirect:
+    """The helper on explicit row lists: rows inside the head keep their place and order."""
+
+    @staticmethod
+    def _row(rid: str) -> MemoryResponse:
+        src = "episode" if rid.startswith("ep") else "graph"
+        return MemoryResponse(id=rid, memory=rid, source=src, score=None if src == "episode" else 0.5)
+
+    def _run(self, ids: list[str], limit: int) -> list[str]:
+        rows = [self._row(i) for i in ids]
+        return [r.id for r in MemoryService._truncate_keeping_episode_rows(rows, limit)]
+
+    def test_episode_already_in_the_head_is_left_exactly_where_it_is(self):
+        # limit 8 -> quota 2; ep1 is in the head, so only 1 slot is left for the cut ep2
+        ids = ["s1", "ep1", "s2", "s3", "s4", "s5", "s6", "s7", "ep2"]
+        assert self._run(ids, 8) == ["s1", "ep1", "s2", "s3", "s4", "s5", "s6", "ep2"]
+
+    def test_episode_in_head_and_nothing_cut_is_unchanged(self):
+        ids = ["s1", "ep1", "s2", "s3", "s4", "s5"]
+        assert self._run(ids, 4) == ["s1", "ep1", "s2", "s3"]
+
+    def test_episode_in_head_with_no_quota_left_is_the_plain_slice(self):
+        ids = ["s1", "ep1", "s2", "s3", "ep2"]  # limit 4 -> quota 1, taken by ep1
+        assert self._run(ids, 4) == ["s1", "ep1", "s2", "s3"]
+
+    def test_episodes_only_beyond_the_limit_are_appended_at_the_tail(self):
+        ids = [f"s{i}" for i in range(1, 9)] + ["ep1"]
+        assert self._run(ids, 8) == ["s1", "s2", "s3", "s4", "s5", "s6", "s7", "ep1"]
+
+    def test_more_cut_episodes_than_the_quota_are_capped(self):
+        ids = [f"s{i}" for i in range(1, 11)] + ["ep1", "ep2", "ep3"]
+        out = self._run(ids, 10)  # quota 10 // 4 = 2
+        assert out == [f"s{i}" for i in range(1, 9)] + ["ep1", "ep2"]
+        assert len(out) == 10
+
+    def test_no_episodes_is_the_plain_slice(self):
+        ids = [f"s{i}" for i in range(1, 9)]
+        assert self._run(ids, 5) == ["s1", "s2", "s3", "s4", "s5"]
+
+    @pytest.mark.parametrize("limit", [1, 2, 3])
+    def test_a_limit_under_four_has_no_quota(self, limit):
+        ids = ["s1", "s2", "s3", "s4", "ep1", "ep2"]
+        assert self._run(ids, limit) == ids[:limit]
+
+    def test_limit_four_gives_exactly_one_slot(self):
+        ids = ["s1", "s2", "s3", "s4", "ep1", "ep2"]
+        assert self._run(ids, 4) == ["s1", "s2", "s3", "ep1"]
+
+
 class TestR3AskEvidenceCap:
     """Test that ask evidence caps episode rows at 3 total."""
 
@@ -475,6 +524,45 @@ def _admissible_groups(lucene: str) -> set[str]:
     if admissible is None:  # no required group clause: nothing narrows the search
         admissible = set(re.findall(r'group_id:"([^"]+)"', lucene))
     return admissible
+
+
+class TestFulltextQueryExactShape:
+    """The exact Lucene string is pinned: the group clause is required, parenthesised and joined
+    with AND. An empty or missing group list yields a query WITHOUT any group clause."""
+
+    @staticmethod
+    def _build(builder, q, groups):
+        if builder == "search_utils":
+            from graphiti_core.search.search_utils import fulltext_query
+
+            return fulltext_query(q, groups, SimpleNamespace(provider="neo4j", fulltext_syntax=""))
+        from graphiti_core.driver.neo4j.operations.search_ops import _build_neo4j_fulltext_query
+
+        return _build_neo4j_fulltext_query(q, groups)
+
+    @pytest.mark.parametrize("builder", ["search_utils", "neo4j_ops"])
+    def test_several_groups(self, builder):
+        assert self._build(builder, "alpha beta", ["g1", "g2", "g3"]) == (
+            '(group_id:"g1" OR group_id:"g2" OR group_id:"g3") AND (alpha beta)'
+        )
+
+    @pytest.mark.parametrize("builder", ["search_utils", "neo4j_ops"])
+    def test_one_group(self, builder):
+        assert self._build(builder, "alpha beta", ["g1"]) == '(group_id:"g1") AND (alpha beta)'
+
+    @pytest.mark.parametrize("builder", ["search_utils", "neo4j_ops"])
+    def test_empty_group_list_emits_no_group_clause(self, builder):
+        assert self._build(builder, "alpha beta", []) == "(alpha beta)"
+
+    @pytest.mark.parametrize("builder", ["search_utils", "neo4j_ops"])
+    def test_missing_group_list_emits_no_group_clause(self, builder):
+        assert self._build(builder, "alpha beta", None) == "(alpha beta)"
+
+    def test_search_utils_honours_the_driver_fulltext_syntax_prefix(self):
+        from graphiti_core.search.search_utils import fulltext_query
+
+        driver = SimpleNamespace(provider="neo4j", fulltext_syntax="@")
+        assert fulltext_query("alpha", ["g1", "g2"], driver) == '(@group_id:"g1" OR @group_id:"g2") AND (alpha)'
 
 
 class TestFulltextGroupFilterCoversEveryGroup:

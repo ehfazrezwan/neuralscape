@@ -1790,21 +1790,25 @@ class SearchMixin:
         usual case on a populated project) a plain slice dropped every episode
         row and the leg never surfaced. The leg is additive and capped (at
         most 3 rows), so the rows that would have been cut are kept in the tail
-        and the scored rows give up that many slots: the list never grows past
-        ``limit``, and at most ``limit // 4`` slots are ever handed over, so a
+        and the lowest-ranked scored rows give up that many slots (rows already
+        inside the head stay where they are, the kept head order is unchanged):
+        the list never grows past ``limit``, and at most ``limit // 4`` slots are ever handed over, so a
         small ``limit`` keeps its scored hits.
         """
         head = combined[:limit]
-        if not any(r.source == "episode" for r in combined[limit:]):
+        cut_episodes = [r for r in combined[limit:] if r.source == "episode"]
+        if not cut_episodes:
             return head
-        episodes = [r for r in combined if r.source == "episode"]
-        reserve = min(len(episodes), max(0, limit // 4))
-        if reserve == 0:
+        in_head = sum(1 for r in head if r.source == "episode")
+        quota = max(0, limit // 4 - in_head)
+        # Rows already inside the head keep their place; only cut episode rows
+        # are appended, each taking the slot of the lowest-ranked scored row.
+        scored_positions = [i for i, r in enumerate(head) if r.source != "episode"]
+        n = min(len(cut_episodes), quota, len(scored_positions))
+        if n == 0:
             return head
-        keep = episodes[:reserve]
-        keep_ids = {id(r) for r in keep}
-        rest = [r for r in combined if id(r) not in keep_ids]
-        return rest[: limit - reserve] + keep
+        drop = set(scored_positions[-n:])
+        return [r for i, r in enumerate(head) if i not in drop] + cut_episodes[:n]
 
     def _merge_results(self, *result_sets) -> list[dict]:
         """Merge multiple result sets, deduplicate by ID, sort by score descending."""
