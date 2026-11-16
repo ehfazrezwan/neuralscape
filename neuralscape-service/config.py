@@ -139,6 +139,11 @@ class Settings(BaseSettings):
     gemini_llm_model: str = "gemini-3.1-flash-lite"
     gemini_llm_fallback_model: str = "gemini-2.5-flash"
     gemini_embedder_model: str = "gemini-embedding-001"
+    # Per-request timeout (seconds) on every Gemini client the service builds or causes to be
+    # built (its own extraction/compile clients and mem0's Gemini LLM/embedder; graphiti's clients
+    # keep their own 60 s). Without it an endpoint that accepts the connection and never answers
+    # blocks the calling request or worker job indefinitely.
+    gemini_request_timeout_s: float = Field(default=120.0, gt=0)
     # Dimension of the embeddings Graphiti stores on Entity.name_embedding and
     # RELATES_TO.fact_embedding (env GRAPHITI_EMBEDDING_DIM). Passed explicitly
     # to the Graphiti embedder instead of relying on the ambient EMBEDDING_DIM
@@ -1535,6 +1540,12 @@ class Settings(BaseSettings):
             "graphiti_reranker_provider": "openai",
         }
 
+    def gemini_http_options(self):
+        """``HttpOptions`` carrying the Gemini request timeout (SDK unit: milliseconds)."""
+        from google.genai import types
+
+        return types.HttpOptions(timeout=max(1, int(self.gemini_request_timeout_s * 1000)))
+
     def get_mem0_config(self) -> dict:
         """Build mem0 config dict for Memory(config=...).
 
@@ -1603,6 +1614,7 @@ class Settings(BaseSettings):
                 "config": {
                     "model": self.gemini_llm_model,
                     "api_key": self.google_api_key,
+                    "request_timeout_s": self.gemini_request_timeout_s,
                 },
             }
             embedder_block = {
@@ -1611,6 +1623,7 @@ class Settings(BaseSettings):
                     "model": self.gemini_embedder_model,
                     "api_key": self.google_api_key,
                     "embedding_dims": VECTOR_EMBEDDING_DIMS,
+                    "request_timeout_s": self.gemini_request_timeout_s,
                 },
             }
             graphiti_models = self._graphiti_ai_studio_models()

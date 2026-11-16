@@ -45,6 +45,8 @@ class BaseEmbedderConfig(ABC):
         # accept only one input per request (e.g. a Vertex gemini-embedding-001
         # gateway endpoint).
         embedding_batch_size: Optional[int] = None,
+        # NEURALSCAPE PATCH: per-request timeout in seconds for providers that honour it (gemini).
+        request_timeout_s: Optional[float] = None,
     ):
         """
         Initializes a configuration class instance for the Embeddings.
@@ -115,4 +117,5 @@ class BaseEmbedderConfig(ABC):
 
         # NEURALSCAPE PATCH: embed_batch chunk size (see param doc above)
         self.embedding_batch_size = embedding_batch_size
+        self.request_timeout_s = request_timeout_s  # NEURALSCAPE PATCH
 
