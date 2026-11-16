@@ -7,7 +7,7 @@ Audience: Neuralscape maintainers and deployment operators.
 
 ## Implementation status on dev
 
-Verified 2026-11-16 against `dev` at `3d000ae1`. Evidence is by path under `neuralscape-service/`; the design text below is unchanged except where noted.
+Status as of 2026-11-16, verified against `dev` at `3d000ae1` (verification date 2026-11-16). Evidence is by path under `neuralscape-service/`; the design text below is unchanged except where noted.
 
 | Phase | Status | Evidence on dev |
 |---|---|---|
@@ -103,7 +103,7 @@ flowchart TB
     style G fill:#d2990022,stroke:#d29900
 ```
 
-**Identity binding.** `main.py::_resolve_user_id(request, body_user_id)` is the single resolution point. With a verified per-user HMAC token, `request.state.user_id` wins and a disagreeing body/query id is a 400. Without `neuralscape_user_token_secret`, the deployment is in legacy single-key mode and the body's `user_id` is trusted.
+**Identity binding.** `main.py::_resolve_user_id(request, body_user_id)` is the single resolution point. With a verified per-user HMAC token, `request.state.user_id` wins and a disagreeing body/query id is a 400. Without `neuralscape_user_token_secret`, the deployment is in legacy single-key mode. A shared-key caller is bound to `neuralscape_api_key_user_id` (or `default_user_id`), and a disagreeing body id is a 400. A body `user_id` is trusted only when there is no token secret and the shared key has been opted out of binding with `neuralscape_legacy_key_trust_body_user_id`.
 
 **Partition.** `memory/groups.py::_build_group_id(visibility, user_id, project_id, workspace)` maps a write's access attributes to exactly one `group_id`:
 
@@ -192,7 +192,7 @@ flowchart TB
 
 1. With `neuralscape_user_token_secret` configured, `request.state.user_id` is authoritative on **every** route — v1, legacy root, MCP, admin. A disagreeing body/query id is a 400, never a silent override.
 2. MCP tools operating on the caller's own memory take **no** user/graph/project argument; the target is fixed by the authenticated identity. (Comparable Graphiti-based platforms scope their MCP surface the same way, precisely so one person's token cannot select another person's memory.)
-3. Legacy single-shared-key mode stays supported but is documented as **single-tenant only**, with a startup warning: a deployment with more than one seat and no token secret has no meaningful access control.
+3. Legacy single-shared-key mode stays supported but is documented as **single-tenant only**, with a startup warning (proposed): a deployment with more than one seat and no token secret has no meaningful access control.
 4. An operation on another principal's data (admin remediation, cross-seat audit) is never "pass a different user_id". It is a distinct, role-gated endpoint with an explicit, audited subject.
 
 ### L1 — Partition (an optimization, not the boundary)
