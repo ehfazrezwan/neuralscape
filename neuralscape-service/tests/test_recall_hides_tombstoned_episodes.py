@@ -7,6 +7,7 @@ tombstones on the Qdrant pools only: the older copy's episode came back as a
 ``[verbatim session excerpt]`` row with ``category None``. The link from an
 episode to its memory is ``metadata.graph_episode_uuid`` on the Qdrant rows.
 """
+import logging
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -33,6 +34,7 @@ class FakeQdrant:
     def __init__(self, rows):
         self.rows = rows
         self.scrolls = 0
+        self.filters = []
 
     @staticmethod
     def _ok(row, cond):
@@ -44,6 +46,7 @@ class FakeQdrant:
 
     def scroll(self, collection_name, scroll_filter, limit, offset, with_payload, with_vectors):
         self.scrolls += 1
+        self.filters.append(scroll_filter)
         must = scroll_filter.must or []
         must_not = scroll_filter.must_not or []
         hit = [
@@ -115,15 +118,31 @@ class TestRecall:
         assert [r.id for r in out if r.source == "episode"] == [f"ep-{EP_ORPHAN[:12]}"]
 
     def test_one_batched_lookup_per_recall_not_one_per_row(self):
-        svc = _svc([])
-        _recall(svc, _graph([_ep(EP_OLD), _ep(EP_NEW), _ep(EP_CONV)]))
-        assert svc._fake_qdrant.scrolls == 1  # no tombstone found: a single filtered scroll
+        # Live rows for every episode: the probe must stay ONE scroll that finds no
+        # tombstoned candidate. Without the tombstone condition it would read every
+        # live source row as a candidate and need the second (live-rows) scroll.
+        svc = _svc([_row("m-old", EP_OLD), _row("m-new", EP_NEW), _row("m-conv", EP_CONV)])
+        out = _recall(svc, _graph([_ep(EP_OLD), _ep(EP_NEW), _ep(EP_CONV)]))
+        assert svc._fake_qdrant.scrolls == 1
+        assert {k.key for k in svc._fake_qdrant.filters[0].must} == {
+            "metadata.graph_episode_uuid", "metadata.dream_tombstoned"
+        }
+        assert len([r for r in out if r.source == "episode"]) == 3, "live episodes all stay"
 
     def test_lookup_failure_never_breaks_the_read(self):
         svc = _svc([])
         svc._fake_qdrant.scroll = MagicMock(side_effect=RuntimeError("qdrant down"))
         out = _recall(svc, _graph([_ep(EP_OLD)]))
         assert [r.id for r in out if r.source == "episode"] == [f"ep-{EP_OLD[:12]}"]
+
+    def test_lookup_failure_is_a_single_warning_without_memory_text(self, caplog):
+        svc = _svc([])
+        svc._fake_qdrant.scroll = MagicMock(side_effect=RuntimeError("qdrant down"))
+        with caplog.at_level(logging.DEBUG, logger="memory.search"):
+            _recall(svc, _graph([_ep(EP_OLD, "SECRET older copy text")]))
+        recs = [r for r in caplog.records if "tombstoned-episode lookup" in r.getMessage()]
+        assert [r.levelno for r in recs] == [logging.WARNING]
+        assert "SECRET" not in recs[0].getMessage() and EP_OLD not in recs[0].getMessage()
 
 
 class TestFactRows:
@@ -138,8 +157,11 @@ class TestFactRows:
         assert [r.id for r in out if r.source == "graph"] == ["e1"]
 
     def test_fact_with_no_known_support_stays(self):
+        # A hidden episode is in the result, so the hidden set is non-empty: the
+        # unsupported fact must stay anyway (without the ``sup`` guard
+        # ``all([])`` would hide it).
         svc = _svc([_row("m-old", EP_OLD, tombstoned=True)])
-        out = _recall(svc, _graph(edges=[_edge("e1", "unlinked fact", [])]))
+        out = _recall(svc, _graph([_ep(EP_OLD)], edges=[_edge("e1", "unlinked fact", [])]))
         assert [r.id for r in out if r.source == "graph"] == ["e1"]
 
 

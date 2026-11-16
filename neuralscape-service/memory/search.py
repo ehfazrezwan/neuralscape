@@ -1334,7 +1334,16 @@ class SearchMixin:
         when ALL of them are tombstoned. An episode with no Qdrant row at all
         is never hidden (nothing says it was). Restoring the tombstone clears
         the flag, so the episode is visible again on the next read. Any
-        failure returns an empty set: a read is never broken by this check.
+        failure returns an empty set (logged once at WARNING, no memory text):
+        a read is never broken by this check, and a tombstone is a reversible
+        system hide, not access control.
+
+        Matching reads the outer ``metadata`` keys only, like the recall pools'
+        own tombstone filters (a double-wrapped ``metadata.metadata`` row is not
+        matched). The lookup is keyed by episode uuid and not owner-filtered:
+        episodes already come from the requester's groups, so on an episode
+        shared by several members' rows the requester's view depends on all
+        of them (intended: hidden only when every source row is tombstoned).
         """
         uuids = sorted({u for u in (episode_uuids or []) if isinstance(u, str) and u})
         if not uuids:
@@ -1378,7 +1387,10 @@ class SearchMixin:
             live = _scan([_ep(sorted(candidates))], [tomb])
             return candidates - live
         except Exception as e:
-            logger.debug(f"tombstoned-episode lookup skipped: {e}")
+            logger.warning(
+                "tombstoned-episode lookup failed (non-critical): tombstoned rows "
+                f"may reappear in this read ({type(e).__name__})"
+            )
             return set()
 
     def _do_graph_search(
@@ -1471,7 +1483,7 @@ class SearchMixin:
                     "created_at": _dt_to_iso(getattr(ep, "created_at", None)),
                     "valid_at": _dt_to_iso(getattr(ep, "valid_at", None)),
                 }
-                for ep in results.episodes[:3]
+                for ep in results.episodes[:3]  # capped before the tombstone hide (the caller's lookup), so a hidden one takes a slot
             ]
             communities = [
                 {"uuid": c.uuid, "name": c.name} for c in results.communities
