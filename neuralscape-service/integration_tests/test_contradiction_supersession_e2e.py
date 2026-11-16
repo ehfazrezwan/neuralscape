@@ -142,7 +142,10 @@ def test_contradicting_fact_supersedes_old_row_and_reassertion_revives_it(svc):
 
 
 COMPOUND = "Alice lives in Paris and works at Acme Corp."
-JOB_ENDED = "Alice left Acme Corp and no longer works there."
+# A positive replacement (new value for the same relation), like the Paris case:
+# a bare negation makes Graphiti mint a new "no longer works" edge instead of
+# invalidating the old job edge.
+JOB_ENDED = "Alice now works at Globex Corp; she left Acme Corp."
 
 
 def test_compound_row_whose_job_edge_dies_is_not_superseded(svc):
@@ -170,6 +173,7 @@ def test_compound_row_whose_job_edge_dies_is_not_superseded(svc):
             "compound row was superseded although a true claim (residence) stays live; real "
             f"embedding cosines decided it: {decisions!r} edges={edges}"
         )
+        print(f"compound-row decision cosines (calibration): {decisions!r}")
         assert not _meta(svc, row.id).get("dream_tombstoned"), f"row tombstoned: {decisions!r}"
         listed, _ = _live_ids(svc, user, "Where does Alice live and work?")
         assert row.id in listed
