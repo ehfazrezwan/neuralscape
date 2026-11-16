@@ -27,7 +27,7 @@ import time
 import httpx
 import pytest
 
-from nsaccept import eventually, expect_check_fails, needs, negative_control, proves
+from nsaccept import eventually, expect_check_fails, guard, needs, negative_control, proves
 from nsaccept.client import NSClient
 from nsaccept.helpers import Written, memory_ids_in, rows_with, list_rows
 from nsaccept.runctx import container_restart_count, parse_ps_json
@@ -218,14 +218,15 @@ def check_stack_stable(rows: list[dict], restarts: dict[str, int], services: lis
 @needs("compose")
 def test_api_and_workers_started_together_on_empty_collections_stay_up(ctx, a, restore_stack):
     """DESTRUCTIVE: wipes the vector store. Runs only with NS_ALLOW_DESTRUCTIVE=1 and a
-    compose project named nscampaign*.
+    compose project that passes the disposable-prefix allowlist (guard.py).
 
     Stop the API and the three workers, delete both Qdrant collections, start all
     four at once (they race to create the collections), then require: all running,
     zero exits and restarts after 90 s, and a write that works and is recalled.
     Three cycles."""
-    if os.environ.get("NS_ALLOW_DESTRUCTIVE") != "1" or not (ctx.compose_project or "").startswith("nscampaign"):
-        pytest.skip("destructive: needs NS_ALLOW_DESTRUCTIVE=1 and a compose project named nscampaign*")
+    if os.environ.get("NS_ALLOW_DESTRUCTIVE") != "1" or not ctx.compose_project:
+        pytest.skip("destructive: needs NS_ALLOW_DESTRUCTIVE=1 and a compose project")
+    guard.check_compose_project(ctx.compose_project)  # refuses anything outside the allowlist
     for cycle in range(1, COLD_CYCLES + 1):
         ctx.compose("stop", *APP_SERVICES)
         for name in COLLECTIONS:

@@ -30,6 +30,10 @@ class FakeQdrantClient:
         self.indexes: dict[str, object] = {}
         self.calls = 0
 
+    def get_collections(self):
+        """The /health readiness probe makes this real round trip."""
+        return []
+
     def create_payload_index(self, collection_name, field_name, field_schema, wait=True):
         self.calls += 1
         self.indexes[field_name] = field_schema

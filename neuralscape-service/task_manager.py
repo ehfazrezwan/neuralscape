@@ -10,6 +10,7 @@ import logging
 import time
 
 from arq.connections import ArqRedis, create_pool
+from arq.constants import result_key_prefix
 from arq.jobs import Job, JobStatus
 
 from config import parse_redis_settings, settings
@@ -503,13 +504,7 @@ class TaskManager:
         cached job, result or read grant with the previous instance.
         """
         job_id = connector_sync_job_id(connector_id, user_id, generation)
-        job = await self.pool.enqueue_job(
-            "process_connector_sync",
-            connector_id,
-            generation,
-            _job_id=job_id,
-            _queue_name=settings.ingest_queue_name,
-        )
+        job = await enqueue_connector_sync_job(self.pool, connector_id, generation, job_id)
         task_id = job_id if job is None else job.job_id
         await self._track_task(user_id, task_id)
         return task_id
@@ -728,6 +723,35 @@ class TaskManager:
             "error": error,
         }
 
+    def job_owner(self, tenant_id: str, task_id: str):
+        """The principal an accepted job is bound to (synchronous; used by the enforcer).
+
+        A durable intent names its submitting subject in the ledger (only on the
+        governed path, where intents carry the bound principal).  A legacy queue job
+        is mapped to the submitting user through the short-lived task→user key the
+        enqueue path records.  Unknown or unreadable is ``None`` (no access through it).
+        """
+
+        from policy_enforcement import JobOwner
+
+        if task_id.startswith("intent-"):
+            producer = self.producer
+            if self.ledger is None or producer is None or producer.principals is None:
+                return None
+            stored = self.ledger.get_intent(tenant_id, task_id)
+            return None if stored is None else JobOwner(subject_id=stored.intent.actor_id)
+        import redis
+
+        client = self._owner_client
+        if client is None:
+            client = self._owner_client = redis.Redis.from_url(
+                settings.redis_url, socket_timeout=2, socket_connect_timeout=2
+            )
+        user = client.get(_task_user_key(task_id))
+        if not user:
+            return None
+        return JobOwner(user_id=user.decode() if isinstance(user, bytes) else str(user))
+
     async def wait_for_result(self, task_id: str, timeout: float = 300.0) -> dict:
         """Wait for a task to complete and return its status.
 
@@ -824,6 +848,38 @@ class TaskManager:
             if self.authority is not None:
                 await asyncio.to_thread(self.authority.close)
             self.producer = self.ledger = self.authority = None
+
+
+async def enqueue_connector_sync_job(pool, connector_id: str, generation: str | None, job_id: str):
+    """Enqueue a connector sync under ``job_id``, coalescing only with a run still in flight.
+
+    Returns the new job, or ``None`` when the sync was coalesced onto a run that
+    is queued, deferred or running. ARQ refuses an id whose result is still
+    cached (an hour after it finished), so with a deterministic id a sync
+    requested after the previous one completed would be silently dropped and a
+    poller would read the previous run's result. For a finished run the cached
+    result is cleared and a fresh job is enqueued; a client still polling the
+    old run with the same id sees the new run's state instead of the old result.
+    Shared by ``TaskManager.enqueue_connector_sync`` and ``connector_sync_cron``.
+    """
+
+    async def _enqueue():
+        return await pool.enqueue_job(
+            "process_connector_sync",
+            connector_id,
+            generation,
+            _job_id=job_id,
+            _queue_name=settings.ingest_queue_name,
+        )
+
+    job = await _enqueue()
+    if job is not None:
+        return job
+    status = await Job(job_id, pool, _queue_name=settings.ingest_queue_name).status()
+    if status != JobStatus.complete:
+        return None  # queued / deferred / running: coalesce onto it
+    await pool.delete(result_key_prefix + job_id)
+    return await _enqueue()
 
 
 def connector_sync_job_id(

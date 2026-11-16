@@ -21,7 +21,9 @@ Everything is signed with the existing ``NEURALSCAPE_USER_TOKEN_SECRET`` via
 ``tokens.sign_payload`` and distinguished by a ``typ`` claim:
 
 * ``typ="client"``  → the Dynamic-Client-Registration ``client_id`` itself
-  (encodes the registered ``redirect_uris``; no server-side client store).
+  (encodes the registered ``redirect_uris`` plus a random ``jti`` so every
+  registration is a distinct client; no server-side client store. Client ids
+  issued before the ``jti`` existed still decode).
 * ``typ="code"``    → an authorization code (encodes user_id, client_id,
   redirect_uri, PKCE challenge; ~5 min TTL; single-use via Redis).
 * ``typ="access"``  → the Bearer access token. Identical in shape to an
@@ -67,7 +69,17 @@ from login_providers import (
     sign_link_ticket,
     verify_link_ticket,
 )
-from tokens import issue_user_token, sign_payload, verify_payload, verify_user_token
+from tokens import (
+    identity_fingerprint,
+    issue_user_token,
+    refresh_revocations,
+    revocation_cold_unavailable,
+    sign_payload,
+    token_fingerprint,
+    verify_payload,
+    verify_user_token,
+)
+import tokens as _tokens
 
 logger = logging.getLogger(__name__)
 
@@ -132,6 +144,10 @@ def _b64url(data: bytes) -> str:
 def _verify_pkce(code_verifier: str, code_challenge: str) -> bool:
     """RFC 7636 S256: BASE64URL(SHA256(verifier)) == challenge."""
     if not code_verifier or not code_challenge:
+        return False
+    # A verifier is unreserved ASCII (RFC 7636 4.1): anything else cannot match, and would make
+    # ``encode("ascii")`` / ``compare_digest`` raise (a server error) instead of failing the check.
+    if not code_verifier.isascii() or not code_challenge.isascii():
         return False
     digest = hashlib.sha256(code_verifier.encode("ascii")).digest()
     return secrets.compare_digest(_b64url(digest), code_challenge)
@@ -217,6 +233,37 @@ _HTML_SECURITY_HEADERS = {
     "X-Content-Type-Options": "nosniff",
     "Cache-Control": "no-store",
 }
+
+
+def _revocation_cold_refusal() -> JSONResponse | None:
+    """503 while the Redis revocation set has not loaded once (cold start).
+
+    A pasted/redeemed credential cannot be checked against live revocations
+    yet, so refuse (clients retry) rather than accept or reject it.
+    """
+    if not revocation_cold_unavailable():
+        return None
+    return JSONResponse(
+        status_code=503,
+        headers={"Retry-After": "1"},
+        content={
+            "error": "temporarily_unavailable",
+            "error_description": "token revocation state is unavailable; retry shortly",
+        },
+    )
+
+
+def _src_revoked(src) -> bool:
+    """True when a session's source credential/identity digest is revoked."""
+    if not isinstance(src, str) or not src:
+        return False
+    digests = _tokens._revoked_digests()
+    return digests is None or src.lower() in digests
+
+
+def _digest_revoked(token: str) -> bool:
+    digests = _tokens._revoked_digests()
+    return digests is None or token_fingerprint(token) in digests
 
 
 def _html_response(content: str, status_code: int = 200) -> HTMLResponse:
@@ -313,8 +360,17 @@ async def register(request: Request) -> JSONResponse:
         )
 
     issued_at = int(time.time())
+    # A random jti makes every registration a distinct client. Without it the
+    # signed client_id was a pure function of (redirect_uris, issue second), so
+    # two registrations with the same redirect URIs in the same second got the
+    # SAME client_id and could redeem each other's codes and refresh tokens.
     client_id = sign_payload(
-        {"typ": "client", "redirect_uris": redirect_uris, "iat": issued_at},
+        {
+            "typ": "client",
+            "redirect_uris": redirect_uris,
+            "iat": issued_at,
+            "jti": secrets.token_urlsafe(12),
+        },
         _secret(),
     )
     return JSONResponse(
@@ -554,6 +610,9 @@ async def authorize_submit(
         )
 
     # "Login": the pasted credential is an admin-issued per-user token.
+    await refresh_revocations()
+    if (cold := _revocation_cold_refusal()) is not None:
+        return cold
     payload = verify_user_token(token.strip(), _secret()) if token.strip() else None
     if payload is None:
         return _render_consent(
@@ -575,10 +634,15 @@ async def authorize_submit(
         code_challenge_method=code_challenge_method,
         resource=resource,
     )
-    return _issue_code_and_redirect(ctx, payload["user_id"])
+    # ``src`` ties every session minted here to the pasted credential: revoking
+    # it ends them all. (Pasting an OAuth access token keeps its original src.)
+    src = payload.get("src") or token_fingerprint(token.strip())
+    return _issue_code_and_redirect(ctx, payload["user_id"], src=src)
 
 
-def _issue_code_and_redirect(ctx: AuthorizeContext, user_id: str) -> RedirectResponse:
+def _issue_code_and_redirect(
+    ctx: AuthorizeContext, user_id: str, src: str | None = None
+) -> RedirectResponse:
     """Mint a PKCE-bound authorization code for ``user_id`` and 303 back to the
     MCP client's redirect_uri. Shared by every login provider — the only thing
     that varies upstream is how ``user_id`` was authenticated."""
@@ -590,6 +654,7 @@ def _issue_code_and_redirect(ctx: AuthorizeContext, user_id: str) -> RedirectRes
             "redirect_uri": ctx.redirect_uri,
             "code_challenge": ctx.code_challenge,
             "jti": secrets.token_urlsafe(12),
+            **({"src": src} if src else {}),
             "exp": int(time.time()) + _CODE_TTL,
         },
         _secret(),
@@ -695,7 +760,11 @@ async def _finish_login(result) -> HTMLResponse | RedirectResponse:
     if isinstance(result, LoginNeedsLink):
         ticket = sign_link_ticket(result, _secret())
         return _render_link_page(ticket, result.email, result.suggested_user_id)
-    return _issue_code_and_redirect(result.ctx, result.user_id)
+    return _issue_code_and_redirect(
+        result.ctx,
+        result.user_id,
+        src=identity_fingerprint(settings.auth_provider, result.user_id),
+    )
 
 
 # ── federated login callbacks (google / supabase) ────────────────────────
@@ -757,7 +826,11 @@ async def oauth_link(
     sub = claims.get("sub") or None
     email = claims.get("email") or None
 
+    src = None
     if action == "link":
+        await refresh_revocations()
+        if (cold := _revocation_cold_refusal()) is not None:
+            return cold
         payload = verify_user_token(token.strip(), _secret()) if token.strip() else None
         if payload is None:
             return _render_link_page(
@@ -766,6 +839,8 @@ async def oauth_link(
                 status_code=400,
             )
         user_id = payload["user_id"]
+        # The session descends from the pasted credential: revoking it ends it.
+        src = payload.get("src") or token_fingerprint(token.strip())
     else:
         user_id = claims.get("suggested_user_id") or ""
         if not user_id:
@@ -778,17 +853,22 @@ async def oauth_link(
             return _login_error_page(
                 LoginError("Identity store unavailable. Please try signing in again shortly.", 503)
             )
+        # Computed after provisioning: the id may differ from the suggested slug.
+        src = identity_fingerprint(settings.auth_provider, user_id)
 
     await identity_store.link(user_id, sub=sub, email=email)
-    return _issue_code_and_redirect(ctx, user_id)
+    return _issue_code_and_redirect(ctx, user_id, src=src)
 
 
 # ── token endpoint ───────────────────────────────────────────────────────
 
 
-def _token_response(user_id: str, client_id: str, family: str | None = None) -> JSONResponse:
+def _token_response(
+    user_id: str, client_id: str, family: str | None = None, src: str | None = None
+) -> JSONResponse:
+    src_claim = {"src": src} if src else {}
     access = issue_user_token(
-        user_id, _secret(), settings.oauth_access_ttl, typ="access"
+        user_id, _secret(), settings.oauth_access_ttl, typ="access", extra_claims=src_claim
     )
     # The refresh token is single-use (rotate-and-consume via its jti) and
     # bound to the client it was issued to (RFC 6749 §6).
@@ -801,6 +881,7 @@ def _token_response(user_id: str, client_id: str, family: str | None = None) -> 
             # old token can revoke the whole chain.
             "fam": family or secrets.token_urlsafe(12),
             "jti": secrets.token_urlsafe(16),
+            **src_claim,
             "exp": int(time.time()) + settings.oauth_refresh_ttl,
         },
         _secret(),
@@ -845,6 +926,10 @@ async def token(
     if not oauth_enabled():
         return _not_configured()
 
+    await refresh_revocations()
+    if (cold := _revocation_cold_refusal()) is not None:
+        return cold
+
     if grant_type == "authorization_code":
         claims = verify_payload(code, _secret())
         if claims is None or claims.get("typ") != "code":
@@ -865,13 +950,15 @@ async def token(
         user_id = claims.get("user_id")
         if not isinstance(user_id, str) or not user_id:
             return _token_error("invalid_grant", "code missing user")
+        if _src_revoked(claims.get("src")):
+            return _token_error("invalid_grant", "code is invalid or expired")
         try:
             first_use = await _consume_code_jti(jti)
         except _ReplayGuardUnavailable:
             return _guard_unavailable()
         if not first_use:
             return _token_error("invalid_grant", "authorization code already used")
-        return _token_response(user_id, client_id)
+        return _token_response(user_id, client_id, src=claims.get("src"))
 
     if grant_type == "refresh_token":
         claims = verify_payload(refresh_token, _secret())
@@ -888,13 +975,28 @@ async def token(
         bound_client = claims.get("client_id")
         if not all(isinstance(v, str) and v for v in (jti, fam, bound_client)):
             return _token_error("invalid_grant", "refresh_token is invalid or expired")
-        # Checked before consuming so a wrong client cannot burn the real
-        # client's token. Compare bytes: compare_digest rejects non-ASCII str.
-        if not client_id or not secrets.compare_digest(
+        # The refresh token is bound to the client it was issued to. A public
+        # client MAY omit client_id on the refresh grant (RFC 6749 3.2.1 and 6;
+        # OAuth 2.1 4.3.1); the bound client then continues the session. When a
+        # client_id IS sent it must match exactly, checked before consuming so a
+        # wrong client cannot burn the real client's token. Compare bytes:
+        # compare_digest rejects non-ASCII str. (Requiring client_id would add
+        # no security for a public client: client_id is not a secret.)
+        if client_id and not secrets.compare_digest(
             bound_client.encode("utf-8"), client_id.encode("utf-8")
         ):
             return _token_error("invalid_grant", "client mismatch")
         remaining = int(claims.get("exp", 0)) - int(time.time())
+        # Revoked directly (its own digest) or via the credential/identity it
+        # descends from. Direct revocation also kills the whole family.
+        if _digest_revoked(refresh_token):
+            try:
+                await _revoke_family(fam, max(1, remaining))
+            except _ReplayGuardUnavailable:
+                return _guard_unavailable()
+            return _token_error("invalid_grant", "refresh_token is invalid or expired")
+        if _src_revoked(claims.get("src")):
+            return _token_error("invalid_grant", "refresh_token is invalid or expired")
         try:
             if await _family_revoked(fam):
                 return _token_error("invalid_grant", "refresh_token is invalid or expired")
@@ -914,6 +1016,7 @@ async def token(
             except _ReplayGuardUnavailable:
                 return _guard_unavailable()
             return _token_error("invalid_grant", "refresh_token already used")
-        return _token_response(user_id, client_id, family=fam)
+        # Rotate within the client the token is bound to (client_id may be omitted).
+        return _token_response(user_id, bound_client, family=fam, src=claims.get("src"))
 
     return _token_error("unsupported_grant_type", f"grant_type '{grant_type}' not supported")

@@ -62,12 +62,24 @@ class _FakeOpenAIClient:
     exercises real threads, so counting must be locked.
     """
 
-    def __init__(self, latency: float = 0.0, failures: dict[str, int] | None = None):
+    def __init__(
+        self,
+        latency: float = 0.0,
+        failures: dict[str, int] | None = None,
+        rendezvous: int = 0,
+    ):
         self.latency = latency
+        # With ``rendezvous=N`` every call waits until N calls are in flight at
+        # once (a barrier), so a test can PROVE concurrency without a clock: a
+        # serial implementation never gets N in flight and the barrier times out.
+        self._gate = threading.Barrier(rendezvous) if rendezvous else None
         self.failures = dict(failures or {})  # text -> remaining failures
         self.calls: list[list[str]] = []
         self._lock = threading.Lock()
         self.embeddings = _FakeEmbeddingsAPI(self)
+        # Counted work instead of wall time: how many calls were in flight at once.
+        self._in_flight = 0
+        self.peak_in_flight = 0
 
     def _create(self, **kwargs):
         inputs = list(kwargs["input"])
@@ -77,8 +89,17 @@ class _FakeOpenAIClient:
                 if self.failures.get(t, 0) > 0:
                     self.failures[t] -= 1
                     raise Exception(f"Error code: 503 - transient for {t!r}")
-        if self.latency:
-            time.sleep(self.latency)
+        with self._lock:
+            self._in_flight += 1
+            self.peak_in_flight = max(self.peak_in_flight, self._in_flight)
+        try:
+            if self._gate is not None:
+                self._gate.wait(timeout=10)
+            if self.latency:
+                time.sleep(self.latency)
+        finally:
+            with self._lock:
+                self._in_flight -= 1
         return SimpleNamespace(
             data=[SimpleNamespace(index=i, embedding=_vec(t)) for i, t in enumerate(inputs)]
         )
@@ -97,13 +118,43 @@ def _embedder(client: _FakeOpenAIClient, **config_kwargs) -> OpenAIEmbedding:
     return emb
 
 
+def _openai_mod():
+    """The module that actually defines the embedder under test.
+
+    Resolved from the class rather than re-imported by name, so a test that
+    pruned ``sys.modules`` earlier in the session cannot make the fixtures
+    patch a different copy of the module than the one ``OpenAIEmbedding`` uses.
+    """
+    import sys
+
+    return sys.modules[OpenAIEmbedding.__module__]
+
+
 @pytest.fixture(autouse=True)
 def _fast_embed_retry(monkeypatch):
     """Zero the per-item retry backoff so retry tests don't sleep."""
-    import mem0.embeddings.openai as openai_mod
+    mod = _openai_mod()
+    if hasattr(mod, "_EMBED_RETRY_BACKOFF_S"):
+        monkeypatch.setattr(mod, "_EMBED_RETRY_BACKOFF_S", 0.0)
 
-    if hasattr(openai_mod, "_EMBED_RETRY_BACKOFF_S"):
-        monkeypatch.setattr(openai_mod, "_EMBED_RETRY_BACKOFF_S", 0.0)
+
+@pytest.fixture(autouse=True)
+def _private_embed_pool(monkeypatch):
+    """Give every test its own per-item embed pool.
+
+    The embedder normally fans out onto ONE module-level pool shared by the
+    whole process. Tasks a failed batch leaves running (``Executor.map`` does
+    not cancel the rest when one item raises), or a pool another test shut
+    down, would otherwise leak into the next test: they hold workers the
+    next test counts on and can fail it for reasons that depend on timing.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    mod = _openai_mod()
+    pool = ThreadPoolExecutor(max_workers=mod._PARALLEL_EMBED_MAX_WORKERS, thread_name_prefix="test-embed")
+    monkeypatch.setattr(mod, "_parallel_embed_pool", pool)
+    yield pool
+    pool.shutdown(wait=True, cancel_futures=True)
 
 
 # ──────────────────────────────────────────────
@@ -117,17 +168,20 @@ class TestParallelGatewayEmbeds:
         time — NOT 16 serial round trips."""
         latency = 0.15
         texts = [f"fact number {i}" for i in range(16)]
-        emb = _embedder(_FakeOpenAIClient(latency=latency), embedding_batch_size=1)
+        emb = _embedder(_FakeOpenAIClient(latency=latency, rendezvous=8), embedding_batch_size=1)
 
-        start = time.monotonic()
         result = emb.embed_batch(texts)
-        elapsed = time.monotonic() - start
 
         assert result == [_vec(t) for t in texts]  # order preserved
         assert len(emb.client.calls) == 16
         assert all(len(c) == 1 for c in emb.client.calls)
-        # Serial would be 16 * 0.15 = 2.4s; two 8-wide waves ≈ 0.3s.
-        assert elapsed < 1.2, f"per-item embeds still serial ({elapsed:.2f}s)"
+        # Counted work, not wall time (a loaded machine stretches every
+        # sleep): the fake's barrier only releases when 8 calls are in flight
+        # at once, so a serial implementation times out; the bounded pool
+        # reaches exactly 8 and never more.
+        assert emb.client.peak_in_flight == 8, (
+            f"per-item embeds not fanned out on the bounded pool (peak in flight {emb.client.peak_in_flight})"
+        )
 
     def test_single_text_stays_direct(self):
         emb = _embedder(_FakeOpenAIClient(), embedding_batch_size=1)
@@ -167,14 +221,15 @@ class TestParallelGatewayEmbeds:
                     )
                 return super()._create(**kwargs)
 
-        emb = _embedder(_RejectBatches(latency=latency))  # default batching
-        start = time.monotonic()
+        emb = _embedder(_RejectBatches(latency=latency, rendezvous=8))  # default batching
         result = emb.embed_batch(texts)
-        elapsed = time.monotonic() - start
         assert result == [_vec(t) for t in texts]
-        # 1 rejected batch + 8 per-item calls, one 8-wide wave ≈ 0.15s
+        # 1 rejected batch + 8 per-item calls
         assert len(emb.client.calls) == 9
-        assert elapsed < 0.9, f"fallback still serial ({elapsed:.2f}s)"
+        # Counted work, not wall time: the per-item fallback calls overlap.
+        assert emb.client.peak_in_flight == 8, (
+            f"fallback still serial (peak in flight {emb.client.peak_in_flight})"
+        )
 
 
 # ──────────────────────────────────────────────
@@ -605,8 +660,8 @@ class TestStoreRawBatchTwoPass:
             for i in (2, 7)
         }
         service._find_by_content_hash = (
-            lambda user_id, content_hash, scope, project_id=None, visibility=None, workspace=None:
-            dup_rows.get(content_hash)
+            lambda user_id, content_hash, scope, project_id=None, visibility=None, workspace=None,
+            category=None: dup_rows.get(content_hash)
         )
         service._bump_times_derived = MagicMock()
         service._revive_if_tombstoned = MagicMock(return_value=False)

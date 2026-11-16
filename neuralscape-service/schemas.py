@@ -348,6 +348,27 @@ def validate_adapter_name(v: str) -> str:
     return v
 
 
+MAX_RECALL_WORKSPACES = 10
+
+
+def validate_workspace_names(v: list[str] | None) -> list[str] | None:
+    """Validate a recall ``workspaces`` list: names match the write-side
+    ``workspace`` pattern, at most MAX_RECALL_WORKSPACES entries, duplicates
+    collapsed. ``[]`` maps to ``None`` (the default)."""
+    import re
+
+    if v is None:
+        return None
+    if v == []:
+        return None  # empty list = default (memory workspace only)
+    if not isinstance(v, list) or len(v) > MAX_RECALL_WORKSPACES:
+        raise ValueError(f"workspaces must list at most {MAX_RECALL_WORKSPACES} workspace names")
+    for name in v:
+        if not isinstance(name, str) or len(name) > 100 or not re.fullmatch(_ID_PATTERN, name):
+            raise ValueError(f"Invalid workspace name {name!r}: use letters, digits, '_', '.', '-' (max 100)")
+    return list(dict.fromkeys(v))
+
+
 # Event time (occurred_at): allow modest client clock skew when rejecting
 # "future" event times — an importer whose clock runs slightly ahead must not
 # be rejected, but a genuinely future date is a caller bug (events haven't
@@ -840,6 +861,20 @@ class SearchMemoryRequest(BaseModel):
         ),
     )
 
+    workspaces: list[str] | None = Field(
+        default=None,
+        description=(
+            "Workspaces to search. Absent = the memory workspace only (default). "
+            "Reference content ingested with a non-default adapter lives in "
+            "'ref-<adapter>[--<title>]'; name it here to recall it."
+        ),
+    )
+
+    @field_validator("workspaces")
+    @classmethod
+    def _validate_workspaces(cls, v: list[str] | None) -> list[str] | None:
+        return validate_workspace_names(v)
+
     @field_validator("domain")
     @classmethod
     def _validate_domain(cls, v: str | None) -> str | None:
@@ -922,6 +957,16 @@ class PatchMemoryRequest(BaseModel):
     concepts: list[str] | None = Field(default=None, max_length=5)
     confidence: float | None = Field(default=None, ge=0.0, le=1.0)
     expires_at: datetime | None = None
+
+    # Optimistic-concurrency precondition (not an editable field): the
+    # ``revision`` a read of this memory returned. When sent and no longer
+    # current the PATCH is refused with 409 and nothing is written; absent keeps
+    # last-writer-wins.
+    expected_revision: str | None = Field(
+        default=None,
+        max_length=32,
+        description="Revision token from a read of the memory; stale => 409, nothing written",
+    )
 
     @field_validator("domain")
     @classmethod
@@ -1158,8 +1203,11 @@ class MemoryResponse(BaseModel):
 
     Memory-model v2 fields render as nulls for legacy memories that didn't store them.
     Multi-user fields (`visibility`, `owner_user_id`) likewise render as null on
-    pre-multi-user memories — clients should treat null `visibility` as 'private'
-    and null `owner_user_id` as 'unknown / pre-multi-user write'.
+    pre-multi-user memories — clients should treat null `visibility` as 'private'.
+    A null `owner_user_id` in metadata is filled from the row's top-level `user_id`
+    when the memory is read, so it is only null when the row records neither
+    (pre-multi-user write). Conversation-extracted rows are stamped with both
+    (`owner_user_id`, `visibility=private`) at write time.
     """
     id: str
     memory: str
@@ -1218,6 +1266,11 @@ class MemoryResponse(BaseModel):
     # Multi-user model
     visibility: str | None = None
     owner_user_id: str | None = None
+
+    # Optimistic-concurrency token: echo it as ``expected_revision`` on a PATCH
+    # to refuse the edit if the row changed since this read. "0" for rows that
+    # have never been patched.
+    revision: str | None = None
 
     # Sensitivity gate provenance — stamped whenever the content matched a
     # gated class (memory/sensitivity.py), whether the gate FORCED

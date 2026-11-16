@@ -1,5 +1,11 @@
 """Delete path: single/bulk deletes, graph-edge expiry, and the dedup cron.
 
+BULK-DELETE INVARIANT (``delete_memories``, every sweep; tests in
+``tests/test_bulk_delete_honesty.py``): a sweep either deletes NOTHING and raises
+``MemoryListingFailed`` (REST 503), or reports exactly what it deleted, what failed
+(``failed_ids``) and whether it is incomplete (``truncated`` / ``listing_failed``,
+REST 207); and graph cleanup runs only for rows whose vector delete succeeded.
+
 Mechanically extracted from memory_service.py (mixins-with-facade split);
 code is verbatim — behavior unchanged.
 """
@@ -9,12 +15,37 @@ import uuid
 
 from datetime import datetime, timezone
 from config import settings
-from schemas import MemoryVisibility
+from schemas import MemoryVisibility, normalize_visibility
 from memory.groups import _build_group_id
 from memory.junk import _deleted_msg
-from memory.ranking import _times_derived_from_metadata
+from memory.ranking import _mem_is_tombstoned, _times_derived_from_metadata
 
 logger = logging.getLogger(__name__)
+
+
+# Bulk-delete listing page and the cap on listing rounds: a filtered sweep keeps
+# re-listing (deleted rows drop out of the next listing) until nothing new is
+# left; if rows remain unseen when the cap is hit the result says ``truncated``.
+_BULK_PAGE = 500
+_BULK_MAX_ROUNDS = 40
+
+
+def _tombstones_note(n: int) -> str:
+    """Message suffix saying how many of the erased rows were hidden tombstones."""
+    return f" (including {n} tombstoned)" if n else ""
+
+
+def _bulk_partial_fields(failed_ids: list[str], truncated: bool) -> dict:
+    """Honest-status keys every bulk delete returns (``failed_ids`` empty / ``truncated`` False when clean)."""
+    return {"failed_ids": list(failed_ids), "failed": len(failed_ids), "truncated": bool(truncated)}
+
+
+class MemoryListingFailed(RuntimeError):
+    """A bulk delete could not list the caller's memories, so it deleted NOTHING.
+
+    Raised (instead of returning a message) so a caller can never mistake a
+    failed listing for a completed delete; the REST routes answer 503.
+    """
 
 
 def _is_valid_point_id(memory_id: str) -> bool:
@@ -32,6 +63,24 @@ def _dedup_meta(payload: dict) -> tuple[dict, bool]:
     if isinstance(meta.get("metadata"), dict):
         return meta["metadata"], True
     return meta, False
+
+
+def _dedup_visibility(meta: dict) -> str | None:
+    """Visibility as the dedup partition sees it: an absent stamp is private.
+
+    Conversation-extracted rows used to carry no ``metadata.visibility`` and
+    are now stamped ``private``; every reader already treats an absent value as
+    de-facto private, so the two must share one partition or dedup would stop
+    merging a new row with its legacy twin. An unrecognised value stays its own
+    (raw) partition — stricter, never a cross-partition merge.
+    """
+    vis = meta.get("visibility")
+    if vis is None or vis == "":
+        return MemoryVisibility.PRIVATE.value
+    try:
+        return normalize_visibility(vis)
+    except (ValueError, TypeError):
+        return vis
 
 
 def _dedup_partition(payload: dict) -> tuple:
@@ -55,7 +104,7 @@ def _dedup_partition(payload: dict) -> tuple:
         payload.get("user_id"),
         meta.get("scope"),
         meta.get("project_id") or None,
-        meta.get("visibility"),
+        _dedup_visibility(meta),
         workspace,
     )
 
@@ -97,6 +146,27 @@ def _is_tombstoned(payload: dict) -> bool:
 # cannot always exclude) cannot crowd an in-partition duplicate out of the
 # result. The last size is the hard cap per row.
 _DEDUP_TOP_K_STEPS = (10, 40, 160)
+
+
+def _exact_category(payload: dict):
+    """Category component of the exact-phase group key (same hash, other category: not a duplicate)."""
+    return _dedup_meta(payload)[0].get("category")
+
+
+def _differs_only_by_category(a: dict, b: dict) -> bool:
+    """True for two rows with the SAME text hash but different categories.
+
+    Such a pair can only exist because someone wrote the same text on purpose
+    under two categories (the explicit write path keys on the category), so
+    no dedup phase may merge them. Near-duplicates with different hashes are
+    unaffected and still merge across categories.
+    """
+    ha, hb = a.get("hash"), b.get("hash")
+    if not ha or ha != hb:
+        return False
+    ca = _dedup_meta(a)[0].get("category")
+    cb = _dedup_meta(b)[0].get("category")
+    return ca != cb
 
 
 def _dense_vector(vector) -> list[float] | None:
@@ -141,6 +211,11 @@ class DeleteMixin:
             if not _is_valid_point_id(memory_id):
                 raise LookupError(f"Memory {memory_id} not found") from None
             raise
+        if mem is None:
+            # A well-formed id that names no stored point: not found, not a
+            # server fault (the route maps LookupError to 404; a genuine
+            # store failure raised above and still propagates).
+            raise LookupError(f"Memory {memory_id} not found")
 
         # Permission gate: enforce ownership/visibility rules when caller_user_id
         # is provided (backward-compatible: None skips the gate, existing tests).
@@ -243,6 +318,10 @@ class DeleteMixin:
         can trigger via the MCP tool). Pass ``include_shared=True`` to
         also delete the caller's shared writes (admin-style nuke).
 
+        Every sweep erases the caller's tombstoned rows (dreaming / semantic-dedup
+        / supersession tombstones) like any other row, under the same
+        shared/standard rules and graph cascade; the count includes them.
+
         Single-memory delete by ID is unaffected — that path is always
         an intentional action against a specific memory.
         """
@@ -261,7 +340,10 @@ class DeleteMixin:
                 )
                 unresolved_ids: list[str] = []
                 if self._graphiti and self._bridge:
-                    unresolved_ids = self._expire_user_graph_writes(user_id)
+                    # strict: if the user's rows cannot be listed the graph
+                    # cleanup cannot run — refuse BEFORE delete_all rather than
+                    # delete the vectors and silently leave their graph facts live.
+                    unresolved_ids = self._expire_user_graph_writes(user_id, strict=True)
                 m.delete_all(user_id=user_id)
                 return {
                     "message": "All memories deleted (including shared)",
@@ -275,76 +357,150 @@ class DeleteMixin:
             )
             return self._delete_private_only(user_id)
 
+        deleted_count = 0
+        tombstones_erased = 0
+        skipped_shared = 0
+        skipped_standard = 0
+        # Rows whose vector delete succeeded; the graph cascade runs once
+        # per distinct episode over all of them afterwards.
+        cascade_rows: list[dict] = []
+        failed_ids: list[str] = []
+        seen: set[str] = set()
+
+        listing_failed = False
+        # Widest raw window a sweep may ask for; beyond it the result says ``truncated``.
+        cap = _BULK_PAGE * _BULK_MAX_ROUNDS
+
+        def _sweep(fetch, row_id, handle) -> bool:
+            """Page a sweep: returns True when it stopped early (truncated or a mid-sweep listing failure).
+
+            ``fetch(limit)`` returns the RAW rows (tombstones included); exhaustion is
+            judged from that raw size, never from a post-filter length. Rows already
+            handled (deleted, failed, or preserved shared/standard) stay in the next
+            listing, so when a round makes no progress the window is DOUBLED to reach
+            rows behind them, up to ``cap``.
+            """
+            nonlocal listing_failed
+            limit = _BULK_PAGE
+            for round_no in range(_BULK_MAX_ROUNDS):
+                try:
+                    batch = fetch(limit)
+                except Exception as e:
+                    if deleted_count == 0:   # nothing deleted at all (preserved rows and failed rows delete nothing)
+                        raise MemoryListingFailed(
+                            "Memories could not be listed; nothing was deleted. Retry."
+                        ) from e
+                    logger.warning(f"Bulk delete listing failed after partial progress: {e}")
+                    listing_failed = True
+                    return True
+                fresh = [x for x in batch if row_id(x) not in seen]
+                for row in fresh:
+                    seen.add(row_id(row))
+                    handle(row)
+                if len(batch) < limit:
+                    return False  # a short RAW page: everything that matched has been seen
+                if not fresh:
+                    if limit >= cap:
+                        return True
+                    limit = min(limit * 2, cap)
+            return True
+
         if filter_null_category:
-            memories_to_delete = self._list_null_category_memories(
-                user_id=user_id, scope=scope, project_id=project_id,
-            )
-            deleted_count = 0
-            skipped_shared = 0
-            skipped_standard = 0
-            # Rows whose vector delete succeeded; the graph cascade runs once
-            # per distinct episode over all of them afterwards.
-            cascade_rows: list[dict] = []
-            for mem_info in memories_to_delete:
+            def _handle_null(mem_info):
+                nonlocal deleted_count, tombstones_erased, skipped_shared, skipped_standard
                 meta = mem_info.get("metadata", {}) or {}
                 if isinstance(meta.get("metadata"), dict):
                     meta = meta["metadata"]
                 if not include_shared and meta.get("visibility") == MemoryVisibility.SHARED.value:
                     skipped_shared += 1
-                    continue
+                    return
                 if meta.get("visibility") == MemoryVisibility.STANDARD.value and not settings.is_dictator(user_id):
                     skipped_standard += 1
-                    continue
+                    return
                 mid = mem_info["id"]
                 try:
                     m.vector_store.delete(mid)
                     cascade_rows.append({
                         "id": mid,
                         "mem": {"memory": mem_info.get("data", ""), "metadata": meta},
+                        "user_id": user_id,
                         "group_id": None,
                     })
                     deleted_count += 1
+                    if _mem_is_tombstoned(mem_info):
+                        tombstones_erased += 1
                 except Exception as e:
+                    failed_ids.append(mid)
                     logger.warning(f"Failed to delete null-category memory {mid}: {e}")
+
+            truncated = _sweep(
+                lambda lim: self._list_null_category_memories(
+                    user_id=user_id, scope=scope, project_id=project_id, limit=lim,
+                ),
+                lambda x: x["id"],
+                _handle_null,
+            )
+            # Cleanup runs for what WAS deleted even if the sweep stopped early.
             graph = self._bulk_graph_cleanup(cascade_rows, "null-category")
             return {
-                "message": _deleted_msg("null-category memories", deleted_count, skipped_shared, skipped_standard),
+                "message": _deleted_msg("null-category memories", deleted_count, skipped_shared, skipped_standard)
+                + _tombstones_note(tombstones_erased)
+                + (f" ({len(failed_ids)} failed)" if failed_ids else ""),
                 **graph,
+                **_bulk_partial_fields(failed_ids, truncated),
+                **({"listing_failed": True} if listing_failed else {}),
             }
 
         # For filtered deletes, we need to list then delete individually
-        memories = self.list_memories(
-            user_id=user_id,
-            scope=scope,
-            category=category,
-            project_id=project_id,
-        )
+        def _fetch_raw(limit):
+            """The filtered listing as RAW mem0 dicts (tombstones included) so the page size is the raw size."""
+            self._ensure_filter_indexes()
+            filters: dict = {"user_id": user_id}
+            if scope:
+                filters["metadata.scope"] = scope
+            if category:
+                filters["metadata.category"] = category
+            if project_id:
+                filters["metadata.project_id"] = project_id
+            return self._extract_memory_list(m.get_all(filters=filters, top_k=limit))
 
-        deleted_count = 0
-        skipped_shared = 0
-        skipped_standard = 0
-        cascade_rows = []
-        for mem in memories:
-            if not include_shared and getattr(mem, "visibility", None) == MemoryVisibility.SHARED.value:
+        def _handle_row(mem):
+            nonlocal deleted_count, tombstones_erased, skipped_shared, skipped_standard
+            # Tombstoned rows (dreaming / semantic-dedup / supersession) are erased
+            # like any other row of the caller, under the same shared/standard rules.
+            meta = mem.get("metadata") or {}
+            if isinstance(meta.get("metadata"), dict):
+                meta = meta["metadata"]
+            visibility = meta.get("visibility")
+            if not include_shared and visibility == MemoryVisibility.SHARED.value:
                 skipped_shared += 1
-                continue
-            if getattr(mem, "visibility", None) == MemoryVisibility.STANDARD.value and not settings.is_dictator(user_id):
+                return
+            if visibility == MemoryVisibility.STANDARD.value and not settings.is_dictator(user_id):
                 skipped_standard += 1
-                continue
+                return
+            mid = mem.get("id")
             try:
                 # Get full memory for graph cleanup before deleting
-                full_mem = m.get(mem.id)
-                m.delete(mem.id)
+                full_mem = m.get(mid)
+                m.delete(mid)
                 if full_mem:
-                    cascade_rows.append({"id": mem.id, "mem": full_mem, "group_id": None})
+                    cascade_rows.append({"id": mid, "mem": full_mem, "group_id": None})
                 deleted_count += 1
+                if _mem_is_tombstoned(mem):
+                    tombstones_erased += 1
             except Exception as e:
-                logger.warning(f"Failed to delete memory {mem.id}: {e}")
+                failed_ids.append(mid)
+                logger.warning(f"Failed to delete memory {mid}: {e}")
 
+        truncated = _sweep(_fetch_raw, lambda x: x.get("id"), _handle_row)
         graph = self._bulk_graph_cleanup(cascade_rows, "filtered")
         return {
-            "message": _deleted_msg("memories", deleted_count, skipped_shared, skipped_standard),
+            "message": _deleted_msg("memories", deleted_count, skipped_shared, skipped_standard)
+            + _tombstones_note(tombstones_erased)
+            + (f" ({len(failed_ids)} failed)" if failed_ids else ""),
             **graph,
+            **_bulk_partial_fields(failed_ids, truncated),
+            **({"listing_failed": True} if listing_failed else {}),
         }
 
     def _bulk_graph_cleanup(
@@ -407,11 +563,14 @@ class DeleteMixin:
             all_memories = self._scroll_all_user_memories(user_id)
         except Exception as e:
             logger.warning(f"Failed to scroll memories for private-only delete: {e}")
-            return {"message": "No memories deleted (scroll failed)"}
+            raise MemoryListingFailed(
+                "Memories could not be listed; nothing was deleted. Retry."
+            ) from e
 
         # (memory_id, payload, metadata) for every non-shared row.
         private_rows: list[tuple[str, dict, dict]] = []
         private_groups: set[str] = set()
+        row_groups: dict[str, str] = {}
         shared_preserved = 0
         standard_preserved = 0
         for mem in all_memories:
@@ -430,19 +589,11 @@ class DeleteMixin:
                 standard_preserved += 1
                 continue
             private_rows.append((mem["id"], payload, metadata))
-            private_groups.add(
-                _build_group_id(
-                    visibility, user_id, metadata.get("project_id"), metadata.get("workspace")
-                )
+            row_group = _build_group_id(
+                visibility, user_id, metadata.get("project_id"), metadata.get("workspace")
             )
-
-        # Cheap backstop: bulk-expire every edge in the private groups
-        # (ONE Cypher statement per call, not a per-edge write loop).
-        if self._graphiti and self._bridge and private_groups:
-            try:
-                self._expire_graph_edges_for_groups(sorted(private_groups))
-            except Exception as e:
-                logger.warning(f"Graph cleanup for private groups failed: {e}")
+            private_groups.add(row_group)
+            row_groups[mem["id"]] = row_group
 
         # Vectors FIRST (NS issue #176): the store must never be left
         # partially deleted by a slow/failed graph step — an interrupted or
@@ -450,14 +601,31 @@ class DeleteMixin:
         # half-deleted points. Once every vector is gone the graph work is
         # best-effort and fully reportable.
         deleted = 0
+        tombstones_erased = 0
         deleted_ids: set[str] = set()
+        failed_ids: list[str] = []
         for mid, payload, _ in private_rows:
             try:
                 self._memory.vector_store.delete(mid)
                 deleted += 1
                 deleted_ids.add(mid)
+                if _is_tombstoned(payload):
+                    tombstones_erased += 1
             except Exception as e:
+                failed_ids.append(mid)
                 logger.warning(f"Failed to delete private memory {mid}: {e}")
+
+        # Cheap backstop: bulk-expire every edge in a private group (ONE Cypher
+        # statement per call, not a per-edge write loop) — only AFTER the vector
+        # deletes and only for groups whose rows ALL went: a row that failed to
+        # delete is still live in Qdrant and must keep its graph facts.
+        failed_groups = {row_groups[f] for f in failed_ids}
+        clean_groups = sorted(private_groups - failed_groups)
+        if self._graphiti and self._bridge and clean_groups:
+            try:
+                self._expire_graph_edges_for_groups(clean_groups)
+            except Exception as e:
+                logger.warning(f"Graph cleanup for private groups failed: {e}")
 
         # Provenance-exact cascade (episodes + node summaries), ONCE per
         # distinct episode and bounded to the rows just scrolled — never an
@@ -468,20 +636,24 @@ class DeleteMixin:
                 {
                     "id": mid,
                     "mem": {"memory": payload.get("data", ""), "metadata": metadata},
+                    "user_id": user_id,
                     "group_id": None,
                 }
                 for mid, payload, metadata in private_rows
+                if mid in deleted_ids      # a row that failed to delete is still live: no graph state is touched for it
             ],
             "private-only",
             deleted_ids=deleted_ids,
         )
 
-        msg = f"Deleted {deleted} private memories"
+        msg = f"Deleted {deleted} private memories" + _tombstones_note(tombstones_erased)
         if shared_preserved:
             msg += f" (preserved {shared_preserved} shared)"
         if standard_preserved:
             msg += f" (preserved {standard_preserved} standard)"
-        return {"message": msg, **graph}
+        if failed_ids:
+            msg += f" ({len(failed_ids)} failed)"
+        return {"message": msg, **graph, **_bulk_partial_fields(failed_ids, False)}
 
     def _expire_graph_edges_for_memory(self, mem: dict) -> None:
         """Soft-delete graph edges related to a memory by setting expired_at."""
@@ -527,7 +699,7 @@ class DeleteMixin:
         except Exception as e:
             logger.warning(f"Graph edge expiration failed (non-critical): {e}")
 
-    def _expire_user_graph_writes(self, user_id: str) -> list[str]:
+    def _expire_user_graph_writes(self, user_id: str, *, strict: bool = False) -> list[str]:
         """Expire graph edges/episodes/summaries across every group_id this
         user authored.
 
@@ -543,10 +715,20 @@ class DeleteMixin:
         Returns the memory ids whose episode could not be resolved/verified
         (zero-effect detection, private or shared) — never silently
         dropped, so the caller can report them.
+
+        ``strict=True`` (the bulk-delete caller) raises ``MemoryListingFailed``
+        when the rows cannot be listed instead of returning ``[]`` — an empty
+        list reads as "nothing to clean up", which is wrong when the listing
+        itself failed.
         """
         try:
             user_memories = self._scroll_all_user_memories(user_id)
         except Exception as e:
+            if strict:
+                logger.warning(f"Failed to scroll memories for graph cleanup: {e}")
+                raise MemoryListingFailed(
+                    "Memories could not be listed; nothing was deleted. Retry."
+                ) from e
             logger.warning(f"Failed to scroll memories for graph cleanup (non-critical): {e}")
             return []
 
@@ -587,7 +769,7 @@ class DeleteMixin:
         # there are no surviving siblings to repair — only dedupe the cascade
         # to once per distinct episode.
         rows = [
-            {"id": mem.get("id", ""), "mem": mem, "group_id": None}
+            {"id": mem.get("id", ""), "mem": mem, "user_id": user_id, "group_id": None}
             for mem in private_memories + shared_memories
         ]
         batch = self._cascade_rows_once(
@@ -727,13 +909,15 @@ class DeleteMixin:
                 mem = {
                     "memory": payload.get("data", ""),
                     "metadata": payload.get("metadata", {}),
+                    "user_id": payload.get("user_id"),
                 }
                 if collector is None:
                     self._cascade_or_fallback_expire(mem, memory_id=memory_id)
                     return
                 collector.setdefault("deleted", set()).add(memory_id)
                 batch = self._cascade_rows_once(
-                    [{"id": memory_id, "mem": mem, "group_id": None}],
+                    [{"id": memory_id, "mem": mem, "user_id": payload.get("user_id"),
+                      "group_id": None}],
                     deleted_ids=collector["deleted"],
                 )
                 collector.setdefault("graph_jobs", []).extend(batch["graph_jobs"])
@@ -803,7 +987,7 @@ class DeleteMixin:
             for mem in page:
                 h = mem["payload"].get("hash")
                 if h and not _is_tombstoned(mem["payload"]):
-                    key = (h, _dedup_partition(mem["payload"]))
+                    key = (h, _dedup_partition(mem["payload"]), _exact_category(mem["payload"]))
                     key_counts[key] = key_counts.get(key, 0) + 1
 
         exact_removed = 0
@@ -814,7 +998,7 @@ class DeleteMixin:
                     h = mem["payload"].get("hash")
                     if not h or _is_tombstoned(mem["payload"]):
                         continue
-                    key = (h, _dedup_partition(mem["payload"]))
+                    key = (h, _dedup_partition(mem["payload"]), _exact_category(mem["payload"]))
                     if key_counts.get(key, 0) > 1:
                         hash_groups.setdefault(key, []).append(mem)
         del key_counts
@@ -1026,6 +1210,8 @@ class DeleteMixin:
             if _dedup_partition(hit_payload) != partition:
                 continue
             if _is_tombstoned(hit_payload):
+                continue
+            if _differs_only_by_category(payload, hit_payload):
                 continue
             out.append(hit)
         return out

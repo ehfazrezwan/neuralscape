@@ -18,6 +18,7 @@ from pydantic import ValidationError
 
 from extensions.dreaming import consolidate, reflect
 from extensions.dreaming.consolidate import PoolBatch
+from tests.test_dreaming_rewrite_atomic import rewrite_view
 from memory_service import MemoryService
 from schemas import EPISTEMIC_LEVEL_VOCAB, RawMemoryRequest
 
@@ -170,12 +171,16 @@ async def test_merge_stamps_survivor_with_loser_ids():
         dry_run=False,
     )
     assert not result.errors
-    point = client.upsert.call_args[1]["points"][0]
-    assert point.payload["metadata"]["derived_from"] == ["l1", "l2"]
-    assert point.payload["data"] == "merged"
+    client.upsert.assert_not_called()  # atomic patches, never a whole-point upsert
+    point = rewrite_view(client, "surv")
+    assert point["metadata"]["derived_from"] == ["l1", "l2"]
+    assert point["data"] == "merged"
     # losers tombstoned toward the survivor (nested-key patch, audit 27 #30)
-    tombstoned = [c[1]["payload"] for c in client.set_payload.call_args_list]
-    assert all(c[1]["key"] == "metadata" for c in client.set_payload.call_args_list)
+    loser_calls = [c for c in client.set_payload.call_args_list
+                   if c[1]["points"] != ["surv"]]
+    tombstoned = [c[1]["payload"] for c in loser_calls]
+    assert len(loser_calls) == 2
+    assert all(c[1]["key"] == "metadata" for c in loser_calls)
     assert all(meta["dream_tombstoned"] and meta["superseded_by"] == "surv"
                for meta in tombstoned)
 
@@ -196,9 +201,9 @@ async def test_merge_unions_with_existing_derived_from():
           "survivor_id": "surv", "content": "merged again", "confidence": 0.9}],
         dry_run=False,
     )
-    point = client.upsert.call_args[1]["points"][0]
+    point = rewrite_view(client, "surv")
     # union: existing premises kept (order preserved), only l2 is new
-    assert point.payload["metadata"]["derived_from"] == ["seed", "l1", "l2"]
+    assert point["metadata"]["derived_from"] == ["seed", "l1", "l2"]
 
 
 @pytest.mark.asyncio
