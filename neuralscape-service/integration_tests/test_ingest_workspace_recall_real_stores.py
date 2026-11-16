@@ -22,7 +22,7 @@ pytestmark = pytest.mark.integration
 SECRET = "nsit-" + "s" * 32
 
 
-def test_ingest_text_workspace_is_recalled_only_when_that_workspace_is_asked_for(flags, stores, llm_key, unique_ns):
+def test_ingest_text_workspace_is_recalled_only_when_that_workspace_is_asked_for(flags, stores, llm_key, unique_ns, monkeypatch):
     from arq.worker import Worker
     from fastapi.testclient import TestClient
     from qdrant_client import QdrantClient
@@ -99,8 +99,8 @@ def test_ingest_text_workspace_is_recalled_only_when_that_workspace_is_asked_for
 
     app_tm = TaskManager()
     app_tm.pool = PerCallPool()
-    main._task_manager = app_tm
-    main._service = service
+    monkeypatch.setattr(main, "_task_manager", app_tm)
+    monkeypatch.setattr(main, "_service", service)
     client = TestClient(main.app)
     resp = client.post("/v1/ingest/text", json={"content": text, "workspace": ws}, headers=headers)
     assert resp.status_code == 202, resp.text
