@@ -2874,7 +2874,7 @@ async def v1_export_okf(
     }
     for pool, cut in (stats.get("truncated_pools") or {}).items():
         headers[f"X-OKF-{pool.capitalize()}-Exported"] = str(cut["exported"])
-        headers[f"X-OKF-{pool.capitalize()}-Total"] = str(cut["total"])
+        headers[f"X-OKF-{pool.capitalize()}-Total"] = str(cut["total"]) if cut["total"] is not None else "unknown"
     return FastAPIResponse(content=data, media_type="application/zip", headers=headers)
 
 
