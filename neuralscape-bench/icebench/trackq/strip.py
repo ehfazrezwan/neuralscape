@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import ast
 import dataclasses
+import hashlib
 import json
 import logging
 import re
@@ -41,7 +42,7 @@ from icebench.adapters.base import Corpus
 logger = logging.getLogger(__name__)
 
 # Bump when the stripping behaviour changes (invalidates cached copies).
-STRIPPER_VERSION = 1
+STRIPPER_VERSION = 2
 
 # Marker file written into a finished stripped copy.
 MARKER_NAME = ".ice-docstrings-stripped.json"
@@ -49,13 +50,25 @@ MARKER_NAME = ".ice-docstrings-stripped.json"
 # Languages the stripper handles (matches what nl_locate generation supports).
 LANGUAGES_COVERED = ("python", "go")
 
-# Never copied into the stripped tree: per-system output written by adapters
-# into the corpus directory, which must not leak between systems or runs.
-_SKIP_NAMES = {"graphify-out", MARKER_NAME}
+# Never copied into the stripped tree (corpus ROOT only, so a nested
+# pkg/snapshot-helpers.py is kept): per-system output written by adapters into
+# the corpus directory, which must not leak between systems or runs, and .git.
+_SKIP_NAMES = {"graphify-out", MARKER_NAME, ".git"}
 _SKIP_PREFIXES = ("snapshot-",)
 
 PROTOCOL_STRIPPED = "docstring-stripped corpus"
 PROTOCOL_LEAKED = "upper bound, leaked (docstrings NOT stripped from the indexed corpus)"
+
+
+def protocol_for(reports: list["StripReport"]) -> str:
+    """Label for a stripped run: downgraded if any file or query still leaks."""
+    files = sum(len(r.unstripped_files) for r in reports)
+    leaks = sum(r.residual_query_leaks or 0 for r in reports)
+    if files or leaks:
+        return f"partially stripped ({files} files unstripped, {leaks} leaking queries)"
+    return PROTOCOL_STRIPPED
+
+
 PROTOCOL_UNKNOWN = (
     "unknown: run predates docstring stripping; treat nl_locate as upper bound, leaked"
 )
@@ -131,7 +144,11 @@ def strip_python_source(source: str) -> tuple[str, int]:
         if full_line and (is_module or not is_sole):
             repl = b""  # blank line(s); nothing else needs the statement
         elif full_line:
-            repl = b"pass"  # sole body statement of a def/class
+            # Sole body statement of a def/class: `pass` goes on the docstring's
+            # LAST line (earlier lines blank) so the def's end_lineno is kept.
+            new = b"\n" * n_nl + head + b"pass" + tail
+            lines[l0 : l1 + 1] = new.split(b"\n")
+            continue
         else:
             # Shares a line with other code: keep it a valid expression
             # statement spanning the same lines.
@@ -236,6 +253,17 @@ def _skip(name: str) -> bool:
     return name in _SKIP_NAMES or name.startswith(_SKIP_PREFIXES)
 
 
+def _manifest(root: Path, ext: str) -> dict[str, str]:
+    """sha256 of every source file under root (relative path -> digest)."""
+    out: dict[str, str] = {}
+    for path in sorted(root.rglob(f"*{ext}")):
+        rel = path.relative_to(root)
+        if not path.is_file() or path.is_symlink() or ".git" in rel.parts:
+            continue
+        out[rel.as_posix()] = hashlib.sha256(path.read_bytes()).hexdigest()
+    return out
+
+
 def _load_marker(dest: Path) -> dict | None:
     try:
         return json.loads((dest / MARKER_NAME).read_text())
@@ -265,9 +293,13 @@ def build_stripped_corpus(corpus: Corpus) -> tuple[Corpus, StripReport]:
         )
 
     marker = _load_marker(dest)
-    if marker and marker.get("stripper_version") == STRIPPER_VERSION and marker.get(
-        "repo_sha"
-    ) == corpus.repo_sha:
+    if (
+        marker
+        and marker.get("stripper_version") == STRIPPER_VERSION
+        and marker.get("repo_sha") == corpus.repo_sha
+        and marker.get("manifest", {}).get("src") == _manifest(src, ext)
+        and marker.get("manifest", {}).get("dest") == _manifest(dest, ext)
+    ):
         report = StripReport(**{**marker["report"], "status": "reused"})
         return dataclasses.replace(corpus, path=str(dest)), report
 
@@ -275,7 +307,9 @@ def build_stripped_corpus(corpus: Corpus) -> tuple[Corpus, StripReport]:
         shutil.rmtree(dest)
     shutil.copytree(
         src, dest, symlinks=True,
-        ignore=lambda _d, names: [n for n in names if _skip(n)],
+        ignore=lambda d, names: (
+            [n for n in names if _skip(n)] if Path(d) == src else []
+        ),
     )
 
     report = StripReport(
@@ -321,6 +355,7 @@ def build_stripped_corpus(corpus: Corpus) -> tuple[Corpus, StripReport]:
                 "stripper_version": STRIPPER_VERSION,
                 "repo_sha": corpus.repo_sha,
                 "report": report.to_dict(),
+                "manifest": {"src": _manifest(src, ext), "dest": _manifest(dest, ext)},
             },
             indent=2,
         )
@@ -333,10 +368,22 @@ def count_residual_leaks(original: Corpus, stripped: Corpus) -> tuple[int, int]:
     Count nl_locate queries whose text still occurs in their gold file in the
     stripped copy. Returns ``(leaks, candidates)``. A non-zero count is
     reported in the run metadata rather than hidden.
+
+    Limit: the Go extractor space-joins multi-line ``//`` comments into one
+    query, so a substring check cannot see those queries leaking; for Go this
+    count is a lower bound (the stripper itself blanks the whole run).
     """
     from icebench.trackq.generate import generate_specs
 
-    specs = generate_specs("nl_locate", original, n=10**9, seed=0)
+    # generate_specs logs an UNDER-SIZED warning for small corpora; the real
+    # generation already does, so keep this internal pass quiet.
+    gen_logger = logging.getLogger("icebench.trackq.generate")
+    prior_level = gen_logger.level
+    gen_logger.setLevel(logging.ERROR)
+    try:
+        specs = generate_specs("nl_locate", original, n=10**9, seed=0)
+    finally:
+        gen_logger.setLevel(prior_level)
     leaks = 0
     root = Path(stripped.path)
     for spec in specs:

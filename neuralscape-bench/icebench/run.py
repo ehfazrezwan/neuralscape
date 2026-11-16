@@ -30,8 +30,8 @@ from icebench.adapters.base import SystemAdapter, Corpus
 from icebench.trackq.strip import (
     LANGUAGES_COVERED,
     PROTOCOL_LEAKED,
-    PROTOCOL_STRIPPED,
     build_stripped_corpus,
+    protocol_for,
 )
 
 
@@ -121,7 +121,11 @@ def _prep_sidecar(run_id: str) -> Path:
 
 
 def _prepare_corpora(
-    run_id: str, corpora: list[Corpus], strip: bool
+    run_id: str,
+    corpora: list[Corpus],
+    strip: bool | None,
+    *,
+    require_explicit: bool = False,
 ) -> list[tuple[Corpus, Corpus]] | None:
     """
     Return ``(original, indexed)`` pairs for a run, or None on a protocol clash.
@@ -134,11 +138,26 @@ def _prepare_corpora(
     agree on it.
     """
     sidecar = _prep_sidecar(run_id)
+    prior: dict = {}
     if sidecar.exists():
         try:
             prior = json.loads(sidecar.read_text())
         except ValueError:
             prior = {}
+    if strip is None:
+        if prior.get("strip_docstrings") is not None:
+            strip = bool(prior["strip_docstrings"])  # resume with the run's choice
+        elif require_explicit:
+            print(
+                f"ERROR: run {run_id} has no recorded docstring-stripping choice "
+                f"({sidecar.name} missing); pass --strip-docstrings or "
+                f"--no-strip-docstrings explicitly (it must match the index phase).",
+                file=sys.stderr,
+            )
+            return None
+        else:
+            strip = True
+    if sidecar.exists():
         if prior.get("strip_docstrings") not in (None, strip):
             print(
                 f"ERROR: run {run_id} was started with strip_docstrings="
@@ -150,10 +169,12 @@ def _prepare_corpora(
 
     pairs: list[tuple[Corpus, Corpus]] = []
     reports = []
+    stripped_reports = []
     for corpus in corpora:
         if strip:
             indexed, report = build_stripped_corpus(corpus)
             reports.append(report.to_dict())
+            stripped_reports.append(report)
             print(f"  corpus {corpus.name}: docstrings {report.status} -> {indexed.path}")
         else:
             indexed = corpus
@@ -169,7 +190,9 @@ def _prepare_corpora(
         json.dumps(
             {
                 "strip_docstrings": strip,
-                "nl_locate_protocol": PROTOCOL_STRIPPED if strip else PROTOCOL_LEAKED,
+                "nl_locate_protocol": (
+                    protocol_for(stripped_reports) if strip else PROTOCOL_LEAKED
+                ),
                 "languages_covered": list(LANGUAGES_COVERED),
                 "corpora": reports,
             },
@@ -226,7 +249,7 @@ def cmd_index(args: argparse.Namespace) -> int:
         print("No corpora available (run 'corpora' subcommand first)", file=sys.stderr)
         return 1
     pairs = _prepare_corpora(
-        args.run_id, corpora, getattr(args, "strip_docstrings", True)
+        args.run_id, corpora, getattr(args, "strip_docstrings", None)
     )
     if pairs is None:
         return 2
@@ -478,7 +501,10 @@ def cmd_query(args: argparse.Namespace) -> int:
     # Load corpora
     corpora = list(iter_corpora())
     pairs = _prepare_corpora(
-        args.run_id, corpora, getattr(args, "strip_docstrings", True)
+        args.run_id,
+        corpora,
+        getattr(args, "strip_docstrings", None),
+        require_explicit=True,
     )
     if pairs is None:
         return 2
@@ -744,12 +770,15 @@ def main() -> int:
     index_parser.add_argument(
         "--timeout-seconds", type=int, default=3600, help="Timeout in seconds"
     )
-    index_parser.add_argument(
-        "--no-strip-docstrings",
-        dest="strip_docstrings",
-        action="store_false",
+    index_strip = index_parser.add_mutually_exclusive_group()
+    index_strip.add_argument(
+        "--strip-docstrings", dest="strip_docstrings", action="store_true",
+        default=None, help="Index a docstring-stripped corpus copy (the default).",
+    )
+    index_strip.add_argument(
+        "--no-strip-docstrings", dest="strip_docstrings", action="store_false",
         help="Index the corpus WITH docstrings (nl_locate becomes an 'upper bound, "
-        "leaked' measurement; recorded in the run metadata). Default: strip.",
+        "leaked' measurement; recorded in the run metadata).",
     )
 
     # query subcommand
@@ -763,11 +792,15 @@ def main() -> int:
     )
     query_parser.add_argument("--n-queries", type=int, default=200, help="Queries per op")
     query_parser.add_argument("--seed", type=int, default=42, help="Random seed")
-    query_parser.add_argument(
-        "--no-strip-docstrings",
-        dest="strip_docstrings",
-        action="store_false",
-        help="Must match the index phase. See 'index --no-strip-docstrings'.",
+    query_strip = query_parser.add_mutually_exclusive_group()
+    query_strip.add_argument(
+        "--strip-docstrings", dest="strip_docstrings", action="store_true",
+        default=None,
+        help="Must match the index phase. Required if the run has no sidecar.",
+    )
+    query_strip.add_argument(
+        "--no-strip-docstrings", dest="strip_docstrings", action="store_false",
+        help="Must match the index phase. Required if the run has no sidecar.",
     )
 
     # score subcommand

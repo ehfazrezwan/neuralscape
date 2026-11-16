@@ -18,7 +18,9 @@ from icebench.trackq.strip import (
     PROTOCOL_LEAKED,
     PROTOCOL_STRIPPED,
     PROTOCOL_UNKNOWN,
+    StripReport,
     build_stripped_corpus,
+    protocol_for,
     strip_go_source,
     strip_python_source,
 )
@@ -214,6 +216,7 @@ class _RecordingAdapter:
 
 
 def _query_args(**kw):
+    kw.setdefault("strip_docstrings", True)
     return argparse.Namespace(run_id="r1", systems=["rec"], n_queries=3, seed=7, **kw)
 
 
@@ -306,3 +309,140 @@ def test_score_metadata_records_stripping(tmp_path):
     assert leak["docstrings_stripped"] is False and "leaked" in leak["protocol"]
     legacy = _nl_locate_corpus_metadata(tmp_path, "missing")
     assert legacy == {"docstrings_stripped": None, "protocol": PROTOCOL_UNKNOWN}
+
+
+MULTI_SRC = '''class Only:
+    """Class whose body is only this docstring.
+
+    It spans several lines and describes the only thing here.
+    """
+
+
+def lone(x):
+    """Function whose body is only a docstring.
+
+    More text on a second paragraph line.
+    """
+'''
+
+
+def test_multiline_sole_docstring_is_stripped_and_spans_hold():
+    """Review finding 1: `pass` on the FIRST docstring line moved end_lineno, the
+    span check rejected the file and left it fully unstripped (returned -1)."""
+    out, n = strip_python_source(MULTI_SRC)
+    assert n == 2, "file must be stripped, not rejected"
+    assert "only thing here" not in out and "second paragraph" not in out
+    assert out.count("\n") == MULTI_SRC.count("\n")
+    assert _spans(out) == _spans(MULTI_SRC)
+
+
+def test_multiline_sole_docstring_corpus_has_no_leaks(tmp_path):
+    corpus = _make_corpus(tmp_path)
+    (tmp_path / "corpora" / "demo@abc123" / "multi.py").write_text(MULTI_SRC)
+    indexed, report = build_stripped_corpus(corpus)
+    assert report.unstripped_files == []
+    assert report.residual_query_leaks == 0
+
+
+def test_partial_strip_downgrades_the_protocol_label():
+    clean = StripReport("c", "python", "stripped", "a", "b")
+    assert protocol_for([clean]) == PROTOCOL_STRIPPED
+    dirty = StripReport(
+        "c", "python", "stripped", "a", "b",
+        unstripped_files=["x.py", "y.py"], residual_query_leaks=3,
+    )
+    label = protocol_for([clean, dirty])
+    assert label != PROTOCOL_STRIPPED
+    assert label == "partially stripped (2 files unstripped, 3 leaking queries)"
+
+
+def test_unstrippable_file_is_recorded_and_label_downgraded(tmp_path):
+    corpus = _make_corpus(tmp_path)
+    root = tmp_path / "corpora" / "demo@abc123"
+    # parses nowhere, but the regex extractor still samples its docstring
+    (root / "broken.py").write_text(
+        'def lost(x):\n    """Docstring inside an unparseable file."""\n    return x)\n'
+    )
+    results = tmp_path / "results"
+    with patch.object(run_mod, "RESULTS_DIR", results), patch.object(
+        run_mod, "iter_corpora", return_value=[corpus]
+    ), patch.object(run_mod, "_load_systems", return_value=[_RecordingAdapter()]):
+        assert run_mod.cmd_query(_query_args()) == 0
+    prep = json.loads((results / "r1.corpus-prep.json").read_text())
+    assert prep["corpora"][0]["unstripped_files"] == ["broken.py"]
+    assert prep["nl_locate_protocol"].startswith("partially stripped (1 files unstripped")
+
+
+def test_skip_names_apply_at_corpus_root_only_and_git_is_excluded(tmp_path):
+    corpus = _make_corpus(tmp_path)
+    root = tmp_path / "corpora" / "demo@abc123"
+    (root / "pkg").mkdir()
+    (root / "pkg" / "snapshot-helpers.py").write_text("def h():\n    return 1\n")
+    (root / "pkg" / "graphify-out").mkdir()
+    (root / "pkg" / "graphify-out" / "keep.py").write_text("x = 1\n")
+    (root / "snapshot-root.db").write_text("x")
+    (root / ".git").mkdir()
+    (root / ".git" / "HEAD").write_text("ref")
+    build_stripped_corpus(corpus)
+    out = tmp_path / "corpora" / "demo@abc123-nodoc"
+    assert (out / "pkg" / "snapshot-helpers.py").exists()
+    assert (out / "pkg" / "graphify-out" / "keep.py").exists()
+    assert not (out / "snapshot-root.db").exists()
+    assert not (out / "graphify-out").exists()
+    assert not (out / ".git").exists()
+
+
+def test_mutated_copy_or_source_is_not_reused(tmp_path):
+    corpus = _make_corpus(tmp_path)
+    root = tmp_path / "corpora" / "demo@abc123"
+    out = tmp_path / "corpora" / "demo@abc123-nodoc"
+    assert build_stripped_corpus(corpus)[1].status == "stripped"
+    assert build_stripped_corpus(corpus)[1].status == "reused"
+    (out / "mod.py").write_text((out / "mod.py").read_text() + "# touched\n")
+    assert build_stripped_corpus(corpus)[1].status == "stripped"
+    assert build_stripped_corpus(corpus)[1].status == "reused"
+    (root / "mod.py").write_text(PY_SRC + "# edited\n")
+    assert build_stripped_corpus(corpus)[1].status == "stripped"
+
+
+def _run_query(tmp_path, corpus, **kw):
+    results = tmp_path / "results"
+    with patch.object(run_mod, "RESULTS_DIR", results), patch.object(
+        run_mod, "iter_corpora", return_value=[corpus]
+    ), patch.object(run_mod, "_load_systems", return_value=[_RecordingAdapter()]):
+        args = argparse.Namespace(run_id="r1", systems=["rec"], n_queries=3, seed=7, **kw)
+        return run_mod.cmd_query(args)
+
+
+def test_query_without_sidecar_requires_an_explicit_choice(tmp_path):
+    corpus = _make_corpus(tmp_path)
+    assert _run_query(tmp_path, corpus, strip_docstrings=None) == 2
+    assert not (tmp_path / "corpora" / "demo@abc123-nodoc").exists()
+    assert _run_query(tmp_path, corpus, strip_docstrings=True) == 0
+    # resuming now adopts the recorded choice without a flag
+    assert _run_query(tmp_path, corpus, strip_docstrings=None) == 0
+    # and a conflicting explicit choice is refused
+    assert _run_query(tmp_path, corpus, strip_docstrings=False) == 2
+
+
+def test_report_shows_the_nl_locate_protocol(tmp_path):
+    from icebench.report.generator import ReportConfig, generate_report
+    from icebench.schema import ResultRow, write_row
+
+    results = tmp_path / "r.jsonl"
+    write_row(results, ResultRow(
+        schema="icebench-v1", kind="index", system="s", system_version="1",
+        corpus="c", repo_sha="x", op="index_cold", rep=0, seed=1, wall_s=1.0,
+        peak_rss_mb=1.0, cpu_s=1.0, ok=True,
+    ))
+    for label, expected in ((PROTOCOL_LEAKED, "upper bound, leaked"), (None, "unknown")):
+        score = tmp_path / "score.json"
+        meta = {"nl_locate_corpus": {"protocol": label}} if label else {}
+        score.write_text(json.dumps({"scores": [], "metadata": meta}))
+        cfg = ReportConfig(
+            results_jsonl=results, score_report_json=score,
+            markdown_output=tmp_path / "r.md", html_output=tmp_path / "r.html",
+        )
+        generate_report(cfg)
+        assert expected in (tmp_path / "r.md").read_text()
+        assert expected in (tmp_path / "r.html").read_text()
