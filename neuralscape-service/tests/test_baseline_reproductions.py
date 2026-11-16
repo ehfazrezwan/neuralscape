@@ -67,15 +67,50 @@ def test_ordinary_namespace_tuples_stay_distinct() -> None:
     assert _build_group_id("private", "alice") == "user--alice"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason="legacy email slugging collapses every disallowed run to one '-', so distinct emails can share a user id",
-)
-def test_distinct_emails_have_distinct_user_ids() -> None:
-    from identity import derive_user_id
+def test_distinct_emails_have_distinct_user_ids(monkeypatch) -> None:
+    """Fixed at first login (not in ``slugify_email``, whose output must not
+    change for existing users): the second person whose slug is already
+    claimed gets a hash-suffixed id, and both stay stable on re-login."""
+    import identity_store
+    from config import settings
+    from login_providers import resolve_login_identity
 
-    assert derive_user_id("a+b@example.com", {}) != derive_user_id("a-b@example.com", {})
+    hashes: dict[str, dict[str, str]] = {}
+
+    class _Redis:
+        async def hget(self, h, k):
+            return hashes.get(h, {}).get(k)
+
+        async def hset(self, h, k, v):
+            hashes.setdefault(h, {})[k] = v
+
+        async def hgetall(self, h):
+            return dict(hashes.get(h, {}))
+
+        async def hsetnx(self, h, k, v):
+            if k in hashes.setdefault(h, {}):
+                return 0
+            hashes[h][k] = v
+            return 1
+
+        async def aclose(self):
+            return None
+
+    monkeypatch.setattr(identity_store, "_client", lambda: _Redis())
+    monkeypatch.setattr(settings, "auth_identity_map", "")
+
+    async def first_login(sub, email):
+        uid, linked = await resolve_login_identity(sub, email)
+        assert not linked
+        await identity_store.link(uid, sub=sub, email=email)  # what /oauth/link action=new does
+        return uid
+
+    first = _run(first_login("s1", "a-b@example.com"))
+    second = _run(first_login("s2", "a+b@example.com"))
+
+    assert first == "a-b-example.com"  # existing ids never change
+    assert second != first
+    assert _run(resolve_login_identity("s2", "a+b@example.com")) == (second, True)
 
 
 def test_ordinary_emails_slug_deterministically() -> None:
@@ -157,7 +192,7 @@ def test_queued_graph_job_with_unchanged_visibility_enriches() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Job keys omit semantic options
+# Job keys cover semantic options (defects fixed; these are now controls)
 # ---------------------------------------------------------------------------
 
 
@@ -205,14 +240,6 @@ def _raw_id(**kwargs) -> str:
     return _run(manager.enqueue_raw(**arguments))
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason=(
-        "the extraction job id is built from message text and event time only, so the same text "
-        "sent to a different project, agent or run coalesces onto one job and the later write is dropped"
-    ),
-)
 def test_store_job_id_depends_on_project_and_agent_scope() -> None:
     base = _store_id(project_id="alpha")
 
@@ -221,20 +248,16 @@ def test_store_job_id_depends_on_project_and_agent_scope() -> None:
     assert _store_id(project_id="alpha", run_id="run-2") != base
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason=(
-        "the raw-write job id covers visibility, scope, project and the sensitivity override but "
-        "not category, tags or agent, so writes differing only in those options coalesce"
-    ),
-)
 def test_raw_job_id_depends_on_category_and_tags() -> None:
     base = _raw_id()
 
     assert _raw_id(category="preference") != base
     assert _raw_id(tags=["release"]) != base
     assert _raw_id(agent_id="agent-2") != base
+    assert _raw_id(run_id="run-2") != base
+    assert _raw_id(domain="ops") != base
+    # Tags are a set: order and repeats do not make a different write.
+    assert _raw_id(tags=["a", "b"]) == _raw_id(tags=["b", "a", "a"])
 
 
 def test_job_ids_are_stable_and_user_scoped() -> None:
@@ -443,15 +466,9 @@ def _compose_volumes() -> set[str]:
     return names
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason=(
-        "the compose profile ships no backup tooling that names its persistent volumes; the only "
-        "backup definition is an opt-in cluster add-on, and the deployment guide still lists backups as to-do"
-    ),
-)
 def test_compose_backup_tooling_covers_every_persistent_volume() -> None:
+    if not (REPO_ROOT / "scripts").is_dir():  # the packaged test image carries only the service tree
+        return
     tooling = [
         path
         for directory in ("scripts", "deploy")

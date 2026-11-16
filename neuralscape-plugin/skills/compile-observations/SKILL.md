@@ -10,8 +10,7 @@ description: Read a JSONL buffer of captured tool observations and extract signi
 Invoked by:
 
 - The **UserPromptSubmit hook** when the per-session buffer reaches the compile threshold (default: 25 observations or 30 minutes since the oldest entry).
-- The **SessionStart hook** when there are unprocessed buffers from prior sessions.
-- The **Stop hook's stale-marker handoff** — picked up at the next SessionStart.
+- The **SessionStart hook** when there are unprocessed buffers from sessions that are over: ones the SessionEnd hook marked ended (an `<id>.jsonl.ended` marker written once, when the session exits or is cleared), or ones nobody has written to for 12 hours (a crashed session; the window is the `PENDING_IDLE_HOURS` setting). A buffer another terminal is still writing to is never offered.
 - The user manually via **`/neuralscape:capture`**.
 
 The trigger always supplies the path(s) to one or more JSONL files to process.
@@ -29,7 +28,7 @@ The trigger always supplies the path(s) to one or more JSONL files to process.
 4. **For each significant work unit, write ONE memory.** Submit via the MCP tools only (never curl):
    - **3 or more memories** from this compile → ONE `mcp__plugin_neuralscape_neuralscape__checkpoint` call with all of them in the `memories` array (each item carries the same v2 fields listed below). One tool call, instant per-item dedup verdicts, one background batch.
    - **1–2 memories** → individual `mcp__plugin_neuralscape_neuralscape__remember` calls.
-5. **After all calls succeed, truncate every buffer file that was processed** by using the `Write` tool with the buffer's absolute path and content `""`. (This preserves the file for next session writes; the `Write` tool accepts only `file_path` and `content`.)
+5. **After all calls succeed, truncate every buffer file that was processed** by using the `Write` tool with the buffer's absolute path and content `""`. (This preserves the file for next session writes; the `Write` tool accepts only `file_path` and `content`, and cannot delete files.)
 
 ## Quality rubric — keep these
 
@@ -107,9 +106,9 @@ A typical session of 50–100 captured rows should yield **3–10 memories**, no
 
 ## After compile
 
-After every successful set of `remember` calls for a buffer file:
+After every successful set of memory calls for a buffer file (`checkpoint` for 3 or more memories, `remember` for 1-2, as in step 4):
 
 1. Use the `Write` tool with the buffer's full path and content `""` to truncate it (do NOT delete — the next session may write to it).
-2. The `.stale` marker file (if present) is removed automatically by the next `truncateBuffer` write — but if the skill is called outside that path, also remove `<buffer_path>.stale` if it exists.
+2. Leave the `<buffer_path>.ended` marker alone if there is one: the `Write` tool cannot delete files, and an empty buffer's marker is removed automatically by the next SessionStart. (Older plugin versions also left `<buffer_path>.stale` markers; they carry no information and are removed the same way.)
 
 If a buffer is empty or the rubric finds zero significant memories, that's a normal outcome — truncate the file and move on.

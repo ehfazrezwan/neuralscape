@@ -115,3 +115,83 @@ def test_results_record_commit_stack_commit_and_profile(pytester, monkeypatch, s
     import hashlib
     assert doc["profile_flags"] == {}  # default.env carries no flags
     assert doc["profile_sha256"] == hashlib.sha256((ACCEPTANCE / "profiles" / "default.env").read_bytes()).hexdigest()
+
+
+@pytest.mark.parametrize("name", ["neuralscape", " neuralscape ", "NeuralScape", "NEURALSCAPE\t"])
+def test_production_project_refused_in_every_spelling(name):
+    with pytest.raises(guard.GuardError, match="production"):
+        guard.check_compose_project(name, env={})
+
+
+@pytest.mark.parametrize("name", ["neuralscape-prod", "prod", "myproject", "nscamp", "xnscampaign", "nstest", ""])
+def test_non_disposable_projects_refused(name):
+    with pytest.raises(guard.GuardError):
+        guard.check_compose_project(name, env={})
+
+
+@pytest.mark.parametrize("name", ["nscampaign", "nscampaign2", " NSCampaign-x ", "nstest-a", "nstest-"])
+def test_disposable_projects_pass_and_are_normalised(name):
+    assert guard.check_compose_project(name, env={}) == name.strip()
+
+
+def test_allowlist_is_overridable_only_by_env():
+    env = {"NS_COMPOSE_ALLOWLIST": "lab-, Scratch"}
+    assert guard.check_compose_project("lab-1", env=env) == "lab-1"
+    assert guard.check_compose_project("scratch9", env=env) == "scratch9"
+    with pytest.raises(guard.GuardError):
+        guard.check_compose_project("nscampaign", env=env)
+    with pytest.raises(guard.GuardError, match="production"):
+        guard.check_compose_project("neuralscape", env={"NS_COMPOSE_ALLOWLIST": "neural"})
+
+
+def test_every_compose_entry_point_uses_the_shared_rule():
+    import subprocess
+    from nsaccept import tokens
+
+    ok = lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, "aaaaaaaaaaaaaaaaaaaa.bbbbbbbbbbbbbbbbbbbb\n", "")  # noqa: E731
+    for name in (" neuralscape ", "prodish"):
+        with pytest.raises(guard.GuardError):
+            runctx.run_compose(name, "ps", run=ok)
+        with pytest.raises(tokens.TokenError):
+            tokens.mint_via_compose(name, "u", run=ok)
+        with pytest.raises(tokens.TokenError):
+            tokens.mint_via_compose_python(name, "u", 60, run=ok)
+        with pytest.raises(guard.GuardError):
+            guard.check("http://127.0.0.1:18199", name, env={})
+    assert tokens.mint_via_compose(" nstest-a ", "u", run=ok)
+
+
+@pytest.mark.parametrize("name", ["neuralscape", " NeuralScape ", "prodish", "nscamp"])
+def test_run_sh_refuses_non_disposable_projects(name, tmp_path):
+    import subprocess
+    env = {**os.environ, "NS_TOKEN_SECRET": "s"}
+    r = subprocess.run([str(ACCEPTANCE / "run.sh"), "http://127.0.0.1:18199", "--compose-project", name],
+                       env=env, capture_output=True, text=True, timeout=120)
+    assert r.returncode == 2 and "refusing compose project" in r.stderr, (name, r.returncode, r.stderr[-200:])
+
+
+def test_run_sh_uses_uv_when_it_is_the_only_python_tooling(tmp_path):
+    import subprocess
+    shim = tmp_path / "uv"
+    shim.write_text("#!/bin/sh\necho 'uv 0.0-shim'\n")
+    shim.chmod(0o755)
+    bins = tmp_path / "bin"
+    bins.mkdir()
+    for tool in ("bash", "dirname", "tr", "sed", "cat", "env", "sh"):
+        for d in ("/usr/bin", "/bin"):
+            if (Path(d) / tool).exists():
+                (bins / tool).symlink_to(Path(d) / tool)
+                break
+    for var, path in (("PATH", f"{tmp_path}:{bins}"),):
+        env = {"PATH": path, "HOME": str(tmp_path), "NS_ENV_SELECT_ONLY": "1"}
+        r = subprocess.run([str(bins / "bash"), str(ACCEPTANCE / "run.sh"), "http://127.0.0.1:1", "--list"],
+                           env=env, capture_output=True, text=True, timeout=60)
+        assert r.returncode == 0, r.stderr
+        lines = r.stdout.split()
+        assert lines[0] == "uv" and "--python" in lines and "3.12" in lines and "--no-python-downloads" not in lines, r.stdout
+        assert not (tmp_path / ".cache").exists(), "the venv branch was taken"
+    # $NS_UV selects a standalone binary that is not on PATH
+    env = {"PATH": str(bins), "HOME": str(tmp_path), "NS_ENV_SELECT_ONLY": "1", "NS_UV": str(shim)}
+    r = subprocess.run([str(bins / "bash"), str(ACCEPTANCE / "run.sh"), "http://127.0.0.1:1", "--list"],
+                       env=env, capture_output=True, text=True, timeout=60)
+    assert r.stdout.split()[0] == str(shim), r.stdout

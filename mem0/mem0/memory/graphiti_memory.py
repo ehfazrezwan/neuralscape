@@ -1,5 +1,7 @@
 import asyncio
+import concurrent.futures
 import logging
+import os
 import threading
 from datetime import datetime, timezone
 
@@ -75,26 +77,38 @@ def _create_llm_client(
         raise ValueError(f"Unsupported Graphiti LLM provider: {provider}")
 
 
-def _create_embedder(provider: str, model: str | None, api_key: str | None):
-    """Create a Graphiti embedder client based on provider name."""
+def _create_embedder(
+    provider: str,
+    model: str | None,
+    api_key: str | None,
+    embedding_dim: int | None = None,
+):
+    """Create a Graphiti embedder client based on provider name.
+
+    NEURALSCAPE PATCH: ``embedding_dim`` is passed explicitly. Without it the
+    config inherits Graphiti's ambient ``EMBEDDING_DIM`` env default (1024),
+    which nothing in the deployment sets, so the stored graph vector size was
+    an accident of the environment. ``None`` keeps that legacy behaviour.
+    """
+    dim_kwargs = {"embedding_dim": int(embedding_dim)} if embedding_dim else {}
     if provider == "gemini":
         from graphiti_core.embedder.gemini import GeminiEmbedder, GeminiEmbedderConfig
 
-        config = GeminiEmbedderConfig(api_key=api_key)
+        config = GeminiEmbedderConfig(api_key=api_key, **dim_kwargs)
         if model:
             config.embedding_model = model
         return GeminiEmbedder(config=config)
     elif provider == "openai":
         from graphiti_core.embedder.openai import OpenAIEmbedder, OpenAIEmbedderConfig
 
-        config = OpenAIEmbedderConfig(api_key=api_key)
+        config = OpenAIEmbedderConfig(api_key=api_key, **dim_kwargs)
         if model:
             config.embedding_model = model
         return OpenAIEmbedder(config=config)
     elif provider == "voyage":
         from graphiti_core.embedder.voyage import VoyageEmbedder, VoyageEmbedderConfig
 
-        config = VoyageEmbedderConfig(api_key=api_key)
+        config = VoyageEmbedderConfig(api_key=api_key, **dim_kwargs)
         if model:
             config.embedding_model = model
         return VoyageEmbedder(config=config)
@@ -126,6 +140,25 @@ def _create_cross_encoder(provider: str | None, api_key: str | None, model: str 
         raise ValueError(f"Unsupported Graphiti reranker provider: {provider}")
 
 
+# NEURALSCAPE PATCH: upper bound on one bridge call. Graph writes legitimately
+# take minutes (LLM extraction), so this is a hang guard, not a latency target.
+# It must never undercut the longest worker job that runs graph work: the graph
+# and ingest workers use ``job_timeout = 900`` (neuralscape-service/worker.py),
+# so the default is 900 s plus a 60 s margin. Before this patch the wait was
+# unbounded. Override per process with GRAPHITI_BRIDGE_TIMEOUT_S, or per call
+# with ``_AsyncBridge.run(timeout=...)``.
+DEFAULT_BRIDGE_TIMEOUT_S = 960.0
+
+
+def _bridge_timeout_from_env() -> float:
+    raw = os.environ.get("GRAPHITI_BRIDGE_TIMEOUT_S", "").strip()
+    try:
+        value = float(raw) if raw else DEFAULT_BRIDGE_TIMEOUT_S
+    except ValueError:
+        return DEFAULT_BRIDGE_TIMEOUT_S
+    return value if value > 0 else DEFAULT_BRIDGE_TIMEOUT_S
+
+
 class _AsyncBridge:
     """Runs a dedicated event loop in a background thread.
 
@@ -143,10 +176,56 @@ class _AsyncBridge:
         asyncio.set_event_loop(self._loop)
         self._loop.run_forever()
 
-    def run(self, coro):
-        """Submit a coroutine to the background loop and wait for the result."""
+    def run(self, coro, timeout: float | None = None):
+        """Submit a coroutine to the background loop and wait for the result.
+
+        NEURALSCAPE PATCH: the wait is bounded. Upstream waited forever, so a
+        stalled Neo4j or LLM call parked the calling worker slot for good.
+        ``timeout`` (seconds) wins; otherwise ``GRAPHITI_BRIDGE_TIMEOUT_S``;
+        otherwise ``DEFAULT_BRIDGE_TIMEOUT_S``. On expiry the coroutine is
+        cancelled on the loop and ``TimeoutError`` is raised, which the
+        service's graph callers already log and treat as non-critical.
+        """
+        limit = timeout if timeout is not None and timeout > 0 else _bridge_timeout_from_env()
         future = asyncio.run_coroutine_threadsafe(coro, self._loop)
-        return future.result()
+        try:
+            return future.result(timeout=limit)
+        except concurrent.futures.TimeoutError:
+            if future.done():
+                # The coroutine itself raised TimeoutError (driver/LLM timeout,
+                # or it finished in the same instant): propagate it unchanged
+                # so its message and the service's transient retry still apply.
+                return future.result()
+            future.cancel()
+            # No "timed out"/"timeout" wording: the service's transient-error
+            # retry matches on those and would re-run a call that just hung.
+            raise TimeoutError(
+                f"Graphiti bridge call did not finish within {limit:g}s and was cancelled"
+            ) from None
+
+
+def _hybrid_egress_ok(text: str) -> bool:
+    """NEURALSCAPE PATCH: text matching a sensitivity class never goes to the
+    optional hybrid decision endpoint (the service's regex floor, no LLM)."""
+    try:
+        from memory.sensitivity import classify_sensitivity
+    except ImportError:  # library used outside the service: no gate available
+        return True
+    return classify_sensitivity(text) is None
+
+
+def _build_hybrid_decisions(graph_config):
+    """NEURALSCAPE PATCH: the optional decision client, always built WITH the egress gate."""
+    from graphiti_core.llm_client.hybrid_decision_client import HybridDecisions
+
+    return HybridDecisions(
+        graph_config.graphiti_hybrid_api_key,
+        endpoint=graph_config.graphiti_hybrid_endpoint,
+        model=graph_config.graphiti_hybrid_model,
+        threshold=graph_config.graphiti_hybrid_threshold,
+        timeout=graph_config.graphiti_hybrid_timeout,
+        egress_check=_hybrid_egress_ok,
+    )
 
 
 class MemoryGraph:
@@ -182,7 +261,13 @@ class MemoryGraph:
             provider=graph_config.graphiti_embedder_provider,
             model=graph_config.graphiti_embedder_model,
             api_key=graph_config.graphiti_embedder_api_key,
+            embedding_dim=getattr(graph_config, "graphiti_embedding_dim", None),
         )
+
+        # NEURALSCAPE PATCH: attach the optional decision client only when the
+        # graph flag is on; flag off constructs nothing.
+        if getattr(graph_config, "graphiti_hybrid_enabled", False):
+            llm_client.decision_client = _build_hybrid_decisions(graph_config)
 
         cross_encoder = _create_cross_encoder(
             provider=graph_config.graphiti_reranker_provider,
@@ -442,6 +527,10 @@ class MemoryGraph:
 
         Returns:
             list[dict]: List of {"source", "relationship", "destination"} triples.
+
+        Raises:
+            Exception: whatever the Graphiti bridge raised (never disguised as
+            an empty result).
         """
         self._ensure_indices()
         group_ids = self._get_group_ids(filters)
@@ -459,8 +548,11 @@ class MemoryGraph:
             logger.info(f"Graphiti search returned {len(results)} results")
             return results
         except Exception as e:
-            logger.error(f"Graphiti search failed: {e}")
-            return []
+            # NEURALSCAPE PATCH: a broken bridge must not look like an empty
+            # graph. Log with the traceback and let the caller decide whether
+            # to degrade.
+            logger.error(f"Graphiti search failed: {e}", exc_info=True)
+            raise
 
     def delete_all(self, filters):
         """Delete all graph data for a user/group via Graphiti.
@@ -491,6 +583,9 @@ class MemoryGraph:
 
         Returns:
             list[dict]: List of {"source", "relationship", "target"} triples.
+
+        Raises:
+            Exception: whatever the Graphiti bridge raised (see search()).
         """
         self._ensure_indices()
         group_ids = self._get_group_ids(filters)
@@ -520,5 +615,6 @@ class MemoryGraph:
             logger.info(f"Graphiti get_all returned {len(results)} relationships")
             return results
         except Exception as e:
-            logger.error(f"Graphiti get_all failed: {e}")
-            return []
+            # NEURALSCAPE PATCH: see search() — surface the failure.
+            logger.error(f"Graphiti get_all failed: {e}", exc_info=True)
+            raise

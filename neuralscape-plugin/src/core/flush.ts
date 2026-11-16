@@ -6,7 +6,12 @@
  * a future agent framework.
  */
 
+import { createHash } from "node:crypto";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { join as pathJoin } from "node:path";
+
 import {
+  getObservationDir,
   isHeartbeat,
   isNoReply,
   isSystemMessage,
@@ -54,6 +59,42 @@ export function shouldSkipTurn(turn: ConversationTurn): boolean {
 }
 
 /**
+ * Clients without a transcript have no delivery cursor, and two hooks can see the same turn
+ * (the generic conversation-turn hook and PreCompact). The hash of the last turn delivered
+ * for a session is kept next to the observation buffers, and an identical turn is not sent
+ * twice in a row. Claude Code turns have a cursor and are never filtered here.
+ */
+export const LAST_TURN_SUFFIX = ".lastturn";
+
+function lastTurnPath(sessionId: string): string {
+  const safe = sessionId.replace(/[^A-Za-z0-9._-]/g, "_") || "unknown";
+  return pathJoin(getObservationDir(), `${safe}${LAST_TURN_SUFFIX}`);
+}
+
+function turnHash(turn: ConversationTurn): string {
+  return createHash("sha256").update(`${turn.userMessage}\u0000${turn.assistantResponse}`).digest("hex");
+}
+
+async function isRepeatOfLastTurn(turn: ConversationTurn): Promise<boolean> {
+  if (turn.channel === "claude-code") return false;
+  try {
+    return (await readFile(lastTurnPath(turn.sessionId), "utf-8")).trim() === turnHash(turn);
+  } catch {
+    return false;
+  }
+}
+
+async function rememberDeliveredTurn(turn: ConversationTurn): Promise<void> {
+  if (turn.channel === "claude-code") return;
+  try {
+    await mkdir(getObservationDir(), { recursive: true });
+    await writeFile(lastTurnPath(turn.sessionId), turnHash(turn), "utf-8");
+  } catch {
+    // best effort: worst case a repeat is delivered once more
+  }
+}
+
+/**
  * Delivery accounting for a flush (audit 27 #34b): callers that maintain a
  * transcript cursor must advance it only past the successfully-delivered
  * prefix, so the result reports where delivery stopped.
@@ -95,6 +136,8 @@ export async function flushTurns(
     const turn = turns[i];
     // Noise counts as delivered: there is nothing to re-flush later.
     if (shouldSkipTurn(turn)) continue;
+    // Already delivered by another hook (no cursor to tell us): counts as delivered.
+    if (await isRepeatOfLastTurn(turn)) continue;
 
     // The caller's lock may have been lost (an abandoned-lock recovery disturbed it): stop before this POST.
     if (options.proceed !== undefined && !(await options.proceed())) {
@@ -105,8 +148,8 @@ export async function flushTurns(
     try {
       // <private>…</private> spans never leave the machine (D4).
       await neuralscapePost("/v1/extensions/conversation-compiler/flush", {
-        user_message: boundText(redactPrivate(turn.userMessage)),
-        assistant_response: boundText(redactPrivate(turn.assistantResponse)),
+        user_message: boundText(redactPrivate(turn.userMessage, { failClosed: true })),
+        assistant_response: boundText(redactPrivate(turn.assistantResponse, { failClosed: true })),
         session_id: turn.sessionId,
         channel: turn.channel,
         timestamp: turn.timestamp,
@@ -114,6 +157,7 @@ export async function flushTurns(
         user_id: turn.userId,
       });
       flushed++;
+      await rememberDeliveredTurn(turn);
     } catch (error) {
       logError(`Failed to flush conversation turn ${i + 1}/${turns.length}; leaving the rest for the next flush`, error);
       return { attempted: turns.length, flushed, firstFailedIndex: i };

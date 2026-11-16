@@ -11,6 +11,20 @@ from adapters.code_graph.engine import EngineCapabilityError, LocateHit
 from adapters.code_graph.native_engine import NativeEngine
 
 
+
+def _qdrant_404():
+    """What a real Qdrant client raises for a missing collection."""
+    import httpx
+    from qdrant_client.http.exceptions import UnexpectedResponse
+
+    return UnexpectedResponse(
+        status_code=404,
+        reason_phrase="Not Found",
+        content=b"Not found: Collection `code_index` doesn't exist!",
+        headers=httpx.Headers(),
+    )
+
+
 @pytest.fixture
 def mock_bridge():
     """Mock Graphiti bridge with a fake Neo4j driver."""
@@ -91,7 +105,7 @@ def mock_memory_service():
     }
 
     qdrant_client.query_points = Mock(return_value=Mock(points=[mock_hit]))
-    qdrant_client.get_collection = Mock(side_effect=Exception("Not found"))
+    qdrant_client.get_collection = Mock(side_effect=_qdrant_404())
     qdrant_client.create_collection = Mock()
     qdrant_client.upsert = Mock()
 

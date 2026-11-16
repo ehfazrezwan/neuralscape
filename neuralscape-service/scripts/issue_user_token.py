@@ -4,6 +4,11 @@
 Usage:
     python scripts/issue_user_token.py --user alice --days 30
     python scripts/issue_user_token.py --user bob --days 365 --secret-env MY_SECRET
+    python scripts/issue_user_token.py --user ci-bot --no-expiry   # never expires
+
+A token with no expiry needs the explicit `--no-expiry` flag; `--days 0` is an
+error. To revoke an issued token, print its digest with
+`python scripts/revoke_token.py` and add it to `NEURALSCAPE_REVOKED_TOKENS`.
 
 The signing secret defaults to the `NEURALSCAPE_USER_TOKEN_SECRET` env var.
 Override with `--secret-env <NAME>` to read from a different variable, or
@@ -43,10 +48,17 @@ def main(argv: list[str] | None = None) -> int:
         type=int,
         default=30,
         help=(
-            "Token lifetime in days (default: 30). Pass 0 to issue a "
-            "non-expiring token (the `exp` claim is omitted). Non-expiring "
-            "tokens are powerful — prefer short TTLs with an automated "
-            "rotation flow for production."
+            "Token lifetime in days (default: 30, must be >= 1). For a "
+            "token that never expires use --no-expiry instead."
+        ),
+    )
+    parser.add_argument(
+        "--no-expiry",
+        action="store_true",
+        help=(
+            "Issue a non-expiring token (the `exp` claim is omitted). Powerful: "
+            "a leak is valid until you revoke it via NEURALSCAPE_REVOKED_TOKENS. "
+            "Prefer short TTLs with an automated rotation flow for production."
         ),
     )
     parser.add_argument(
@@ -80,9 +92,20 @@ def main(argv: list[str] | None = None) -> int:
     # sign with the same algorithm the server verifies with.
     from tokens import issue_user_token  # noqa: E402
 
-    # `--days 0` → ttl=None, which makes issue_user_token omit the `exp`
-    # claim and verify_user_token treats the token as non-expiring.
-    ttl = args.days * 86400 if args.days > 0 else None
+    if args.no_expiry and args.days != parser.get_default("days"):
+        print("error: --no-expiry and --days are mutually exclusive.", file=sys.stderr)
+        return 2
+    if args.days < 1 and not args.no_expiry:
+        print(
+            "error: --days must be >= 1. A non-expiring token must be requested "
+            "explicitly with --no-expiry.",
+            file=sys.stderr,
+        )
+        return 2
+
+    # ttl=None makes issue_user_token omit the `exp` claim, and
+    # verify_user_token then treats the token as non-expiring.
+    ttl = None if args.no_expiry else args.days * 86400
     token = issue_user_token(args.user.strip(), secret, ttl)
     print(token)
     return 0

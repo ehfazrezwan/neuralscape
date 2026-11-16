@@ -34,11 +34,15 @@ from pathlib import Path
 
 import networkx as nx
 
-from adapters.code_graph.engine import CodeIntelEngine
+from adapters.code_graph.engine import CODE_REPOS_REQUIREMENT, CodeIntelEngine
 from adapters.code_graph.graphify_engine import GraphifyJsonEngine
 from adapters.code_graph.semantic import CodeGraphError, load_code_graph
 
 logger = logging.getLogger(__name__)
+
+
+class CodeSpaceForbidden(CodeGraphError):
+    """The caller does not own the requested code_space (and is not an admin)."""
 
 
 class CodeGraphNotConfigured(CodeGraphError):
@@ -105,6 +109,15 @@ def get_engine(graph_id: str | None, user_id: str, settings) -> CodeIntelEngine:
         CodeGraphNotConfigured: No graph_id and no default configured.
         CodeGraphError: graph_id doesn't resolve or repo path not found.
     """
+    # A code_space belongs to its <owner> segment: only the owner or an admin
+    # may read it (repo:<name> refs are scoped to the caller by construction).
+    if graph_id:
+        from knowledge.code_dispatch import code_space_access_error
+
+        denied = code_space_access_error(graph_id, user_id)
+        if denied:
+            raise CodeSpaceForbidden(denied)
+
     # Phase F: detect lib:<code_space> refs (GraphifyLibEngine in-process)
     if graph_id and graph_id.startswith("lib:"):
         code_space = graph_id.removeprefix("lib:")
@@ -160,13 +173,13 @@ def _get_native_engine(repo_name: str, user_id: str, settings) -> CodeIntelEngin
     if not repos:
         raise CodeGraphError(
             "No code_repos configured. Set CODE_REPOS env var (JSON dict) "
-            "mapping repo names to filesystem paths."
+            "mapping repo names to filesystem paths. " + CODE_REPOS_REQUIREMENT
         )
     repo_path = repos.get(repo_name)
     if not repo_path:
         raise CodeGraphError(
             f"No repo configured with name {repo_name!r}. "
-            f"Available repos: {', '.join(repos.keys())}"
+            f"Available repos: {', '.join(repos.keys())}. " + CODE_REPOS_REQUIREMENT
         )
     repo_path = Path(os.path.expanduser(repo_path))
     if not repo_path.is_dir():
@@ -288,13 +301,13 @@ def _get_graphify_lib_engine(code_space: str, user_id: str, settings) -> CodeInt
         if not repos:
             raise CodeGraphError(
                 "No code_repos configured. Set CODE_REPOS env var (JSON dict) "
-                "mapping repo names to filesystem paths."
+                "mapping repo names to filesystem paths. " + CODE_REPOS_REQUIREMENT
             )
         repo_path = repos.get(repo_name)
         if not repo_path:
             raise CodeGraphError(
                 f"No repo configured with name {repo_name!r}. "
-                f"Available repos: {', '.join(repos.keys())}"
+                f"Available repos: {', '.join(repos.keys())}. " + CODE_REPOS_REQUIREMENT
             )
         repo_path = Path(os.path.expanduser(repo_path))
         if not repo_path.is_dir():

@@ -19,10 +19,10 @@ The compose file at `docker-compose.yml:1-159` defines five services. All use js
 
 | Service | Image | Ports | Memory | Healthcheck |
 |---------|-------|-------|--------|-------------|
-| neo4j | `neo4j:5-community` | 7474, 7687 | 2G | `cypher-shell ... RETURN 1` (`docker-compose.yml:23`) |
-| redis | `redis:7-alpine` | 6379 | 512M | `redis-cli ping` (`docker-compose.yml:45`) |
-| qdrant | `qdrant/qdrant:v1.15.0` | 6333, 6334 | 2G | TCP probe on 6333 (`docker-compose.yml:68`) |
-| neuralscape | local Dockerfile | 8199 | 2G | urllib GET `/health` (`docker-compose.yml:110`) |
+| neo4j | `neo4j:5-community` | 127.0.0.1:7474, 127.0.0.1:7687 | 2G | `cypher-shell ... RETURN 1` (`docker-compose.yml:23`) |
+| redis | `redis:7-alpine` | 127.0.0.1:6379 | 512M | `redis-cli ping` (`docker-compose.yml:45`) |
+| qdrant | `qdrant/qdrant:v1.15.0` | 127.0.0.1:6333, 127.0.0.1:6334 | 2G | TCP probe on 6333 (`docker-compose.yml:68`) |
+| neuralscape | local Dockerfile | 127.0.0.1:8199 | 2G | urllib GET `/health` (`docker-compose.yml:110`) |
 | neuralscape-worker | same Dockerfile | none | 2G | `python -c "sys.exit(0)"` (`docker-compose.yml:150`) |
 
 ### Volumes
@@ -35,7 +35,7 @@ Both app services pull from `.env` and override container-network values inline 
 
 ```yaml
 NEO4J_URI: neo4j://neo4j:7687
-NEO4J_PASSWORD: ${NEO4J_PASSWORD:-neuralscape}
+NEO4J_PASSWORD: ${NEO4J_PASSWORD:?set NEO4J_PASSWORD in .env}
 NEO4J_DATABASE: ${NEO4J_DATABASE:-memory}
 QDRANT_URL: http://qdrant:6333
 REDIS_URL: redis://redis:6379
@@ -53,7 +53,7 @@ Both app services declare `depends_on` with `condition: service_healthy` for all
 
 Two-stage build at `neuralscape-service/Dockerfile:1-56`. Both stages use `python:3.12-slim`.
 
-**Builder (`Dockerfile:1-21`)** pulls the `uv` binary from `ghcr.io/astral-sh/uv:latest`, copies dependency manifests for graphiti, mem0, and neuralscape-service (`Dockerfile:10-12`), copies the source for the editable subtree packages (`Dockerfile:15-18`), then runs `uv sync --frozen --no-dev` (`Dockerfile:21`) to materialize a `.venv`.
+**Builder (`Dockerfile:1-21`)** pulls the `uv` binary from `ghcr.io/astral-sh/uv`, pinned to an exact version and digest, copies dependency manifests for graphiti, mem0, and neuralscape-service (`Dockerfile:10-12`), copies the source for the editable subtree packages (`Dockerfile:15-18`), then runs `uv sync --frozen --no-dev` (`Dockerfile:21`) to materialize a `.venv`.
 
 **Runtime (`Dockerfile:23-56`)** copies the venv from the builder (`Dockerfile:29`) and re-copies just the source needed at runtime. It puts the venv on PATH (`Dockerfile:40`), sets container-default env vars `NEO4J_URI=neo4j://neo4j:7687` and `QDRANT_PATH=/data/qdrant` (`Dockerfile:43-44`), creates a non-root `appuser` (uid 1000) with `/data/{qdrant,vault}` writable (`Dockerfile:49-50`), exposes 8199, and starts uvicorn:
 
@@ -99,6 +99,9 @@ All settings live in `neuralscape-service/config.py` as a Pydantic `BaseSettings
 | `dedup_batch_size` | `100` | `config.py:44` |
 | `dedup_cron_hours` | `{0, 6, 12, 18}` | `config.py:45` |
 | `neuralscape_api_key` | empty (startup refuses unless a secret or `NEURALSCAPE_AUTH_DISABLED=true` is set; see AUTH.md) | `config.py` |
+| `neuralscape_api_key_user_id` | empty (the shared key acts as `default_user_id`; see AUTH.md) | `config.py` |
+| `neuralscape_legacy_key_trust_body_user_id` | `false` (`true` lets the shared key act as any body `user_id`) | `config.py` |
+| `neuralscape_revoked_tokens` | empty (CSV of SHA-256 digests of revoked per-user tokens) | `config.py` |
 | `host` / `port` | `0.0.0.0` / `8199` | `config.py:51-52` |
 | `default_user_id` | `default_user` | `config.py:53` |
 | `mcp_transport` | `stdio` | `config.py:55` |
@@ -148,7 +151,8 @@ There is no `.github/workflows/` directory at the repo root — neuralscape itse
 
 ## Production gotchas
 
-- **Default Neo4j credentials.** docker-compose sets `neo4j/neuralscape` if `NEO4J_PASSWORD` is unset (`docker-compose.yml:8`). Always override before exposing the bolt port.
+- **Neo4j credentials.** There is no default password: `docker compose` refuses to start until `NEO4J_PASSWORD` is set in `.env`. Set it before the first start (Neo4j keeps the password it was first started with in `neo4j_data`). Every published port is bound to `127.0.0.1`.
+- **Backups.** `scripts/backup-volumes.sh` takes a consistent backup of all five data volumes (offline Neo4j dump, Qdrant snapshots, Redis BGSAVE, ingest/exemplar tar) with retention; its `--help` text carries the restore steps.
 - **Neo4j database name.** Defaults to `memory` (`docker-compose.yml:9`); the database must exist or Graphiti writes will fail with `DatabaseNotFound`.
 - **Qdrant collection.** Auto-created on first write — pre-create only if you want non-default HNSW params.
 - **Gemini quotas.** Free-tier limits are tight (~10 req/min). On 429/503, `memory_service.py` retries with exponential backoff capped at `llm_retry_max_delay` (default 30s) and falls back to `gemini-2.5-flash`. Bump the cap if you keep exhausting budget. See [05-llm-extraction](./05-llm-extraction.md).
@@ -162,7 +166,7 @@ There is no `.github/workflows/` directory at the repo root — neuralscape itse
 
 ```bash
 git clone <repo> neuralscape && cd neuralscape
-cp .env.example .env  # set GOOGLE_API_KEY, override NEO4J_PASSWORD
+cp .env.example .env  # set GOOGLE_API_KEY and a strong NEO4J_PASSWORD (required)
 mkdir -p vault
 docker compose up --build -d
 curl http://localhost:8199/health  # {"status":"ok"}

@@ -20,11 +20,15 @@
 
 import {
   type ContextResponse,
+  type LocalCompactSnapshot,
+  type FailureKind,
   type NeuralscapeMemory,
   MalformedHookInputError,
   getFailLoudThreshold,
   getProjectId,
+  getServiceUrl,
   getUserId,
+  getUserIdSource,
   hasUserId,
   isProjectExcluded,
   listPendingBuffers,
@@ -34,7 +38,9 @@ import {
   outputWithContext,
   parseStdinStrict,
   readConfig,
-  recordTransportFailure,
+  readLocalCompactSnapshot,
+  readPredecessorSessionIds,
+  recordFailure,
   resetTransportFailures,
 } from "../utils.js";
 
@@ -52,6 +58,7 @@ import {
   toIndexEntry,
 } from "../core/disclosure.js";
 
+import { COMPACT_SNAPSHOT_SESSION_TAG_PREFIX, COMPACT_SNAPSHOT_TAG } from "../core/compact.js";
 import { CATEGORY_LABELS, CATEGORY_ORDER } from "../types.js";
 
 // Target max chars for legacy full-content injection (~4 chars per token)
@@ -95,6 +102,69 @@ export function buildUnreachableNotice(count: number, threshold: number): string
     );
   }
   return "[neuralscape] memory service unreachable — continuing without memory context.";
+}
+
+/**
+ * The notice for a failed context fetch, by failure kind. Only `network` and
+ * `server` are "unreachable" (and counted: see recordFailure); the others mean
+ * the service answered and the plugin's setup is wrong, so they say what to fix.
+ * Never includes the token or the URL.
+ */
+export function buildFailureNotice(
+  kind: FailureKind,
+  count: number | null,
+  threshold: number,
+): string {
+  switch (kind) {
+    case "auth":
+      return (
+        "[neuralscape] the memory service rejected the API key (HTTP 401/403) — " +
+        "the token is missing, expired or revoked. Update API_KEY with " +
+        "`/plugin config neuralscape@neuralscape-plugins`. Continuing without memory context."
+      );
+    case "not_found":
+      return (
+        "[neuralscape] the memory service answered 404 for the context route — " +
+        "the service URL is probably wrong or points at an incompatible version. " +
+        "Check URL in `/plugin config neuralscape@neuralscape-plugins`. Continuing without memory context."
+      );
+    case "client":
+      return (
+        "[neuralscape] the memory service rejected the context request (HTTP 4xx) — " +
+        "check the plugin URL, user id and service version. Continuing without memory context."
+      );
+    default:
+      return buildUnreachableNotice(count ?? 1, threshold);
+  }
+}
+
+const LOCAL_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]", "::1"]);
+
+/** True when the service URL points at this machine (or does not parse). */
+export function isLocalServiceUrl(url: string): boolean {
+  try {
+    return LOCAL_HOSTS.has(new URL(url).hostname.toLowerCase());
+  } catch {
+    return true;
+  }
+}
+
+/**
+ * One line shown when this install identifies as the OS login name (USER_ID
+ * unset) against a non-local service: the fallback is deliberate (see utils.ts)
+ * but the user should know which id their memories are filed under. Empty
+ * otherwise. Does not name the service host.
+ */
+export function buildIdentityNotice(
+  userId: string,
+  source: "config" | "os" | "none",
+  serviceUrl: string,
+): string {
+  if (source !== "os" || !userId || isLocalServiceUrl(serviceUrl)) return "";
+  return (
+    `[neuralscape] USER_ID is not set, so memories are filed under your OS login name "${userId}" ` +
+    "on a remote memory service. Set USER_ID with `/plugin config neuralscape@neuralscape-plugins` to choose the id."
+  );
 }
 
 // ── Legacy full-content formatting (CONTEXT_MODE=full) ───────────
@@ -160,10 +230,14 @@ export interface IndexModeInputs {
   now?: Date;
   /**
    * SessionStart `source` from Claude Code: "startup" | "resume" | "clear"
-   * | "compact". On "compact"/"resume" the recent compact snapshots render
-   * full-content under "## Resuming after compaction".
+   * | "compact" | "fork". On "compact"/"resume"/"fork" the compact snapshots
+   * render full-content under "## Resuming after compaction".
    */
   source?: string;
+  /** The starting session's id: on compact/resume only its own snapshots render (see renderResumeAfterCompact). */
+  sessionId?: string;
+  /** Resume/fork: the earlier session id(s) read from the transcript head (see readPredecessorSessionIds). */
+  predecessorIds?: string[];
 }
 
 /**
@@ -171,9 +245,19 @@ export interface IndexModeInputs {
  * Standards stay a binding block outside the budget; the session note that
  * feeds "Previously…" is excluded from the index table (no double render).
  */
-export function buildIndexContext(inputs: IndexModeInputs): string {
-  const { context, cards, codeGraphAvailable, budgetTokens } = inputs;
-  const now = inputs.now ?? new Date();
+/**
+ * The blocks both modes share, in order: binding standards, identity cards,
+ * the resume-after-compaction block (compact/resume/fork only) and the
+ * "Previously…" block. Also returns the ids rendered so the caller keeps them
+ * out of its memory listing (no double render).
+ */
+function buildContinuitySections(inputs: IndexModeInputs, now: Date): {
+  sections: string[];
+  cardBlock: string;
+  resumeIds: Set<string>;
+  previouslyId: string | null;
+} {
+  const { context, cards } = inputs;
   const categories = context.categories || {};
 
   const sections: string[] = [];
@@ -186,10 +270,15 @@ export function buildIndexContext(inputs: IndexModeInputs): string {
 
   // Compact-resilience: after a compaction (or --resume), re-anchor the
   // session with the pre-compact snapshots the PreCompact hook stored.
-  // Rendered full-content here, excluded from the index table below.
+  // Rendered full-content here, excluded from the listing below.
   const resumeIds = new Set<string>();
-  if (inputs.source === "compact" || inputs.source === "resume") {
-    const resume = renderResumeAfterCompact(categories, { now });
+  if (isResumeSource(inputs.source)) {
+    const resume = renderResumeAfterCompact(categories, {
+      now,
+      sessionId: inputs.sessionId,
+      source: inputs.source,
+      predecessorIds: inputs.predecessorIds,
+    });
     if (resume.block) {
       sections.push(resume.block);
       for (const id of resume.ids) resumeIds.add(id);
@@ -212,6 +301,38 @@ export function buildIndexContext(inputs: IndexModeInputs): string {
       }
     }
   }
+  return { sections, cardBlock, resumeIds, previouslyId };
+}
+
+/**
+ * CONTEXT_MODE=full: the same continuity blocks as index mode (standards,
+ * identity cards, "Resuming after compaction", "Previously…"), then the full
+ * text of the remaining memories under the legacy MAX_CHARS budget. The
+ * resume snapshot and the session note are rendered once, above, and left
+ * out of the listing.
+ */
+export function buildFullContext(inputs: IndexModeInputs): string {
+  const now = inputs.now ?? new Date();
+  const { sections, resumeIds, previouslyId } = buildContinuitySections(inputs, now);
+
+  const remaining: Record<string, NeuralscapeMemory[]> = {};
+  for (const [cat, mems] of Object.entries(inputs.context.categories || {})) {
+    const kept = (mems ?? []).filter((m) => m.id !== previouslyId && !resumeIds.has(m.id));
+    if (kept.length > 0) remaining[cat] = kept;
+  }
+  const formatted = formatMemories(remaining);
+  if (formatted) sections.push(formatted);
+
+  if (sections.length === 0) return "";
+  return sections.join("\n\n---\n\n");
+}
+
+export function buildIndexContext(inputs: IndexModeInputs): string {
+  const { context, codeGraphAvailable, budgetTokens } = inputs;
+  const now = inputs.now ?? new Date();
+  const categories = context.categories || {};
+
+  const { sections, cardBlock, resumeIds, previouslyId } = buildContinuitySections(inputs, now);
 
   // D1: day-grouped index of everything else.
   const memories: NeuralscapeMemory[] = [];
@@ -247,6 +368,89 @@ export function buildIndexContext(inputs: IndexModeInputs): string {
 
   if (sections.length === 0) return "";
   return `# Neuralscape Memory\n\n${sections.join("\n\n---\n\n")}`;
+}
+
+/** SessionStart sources that continue earlier work and so get the compact snapshots. */
+export function isResumeSource(source: string | undefined): boolean {
+  return source === "compact" || source === "resume" || source === "fork";
+}
+
+/**
+ * Turn the local copy of this session's compact snapshot into a memory the
+ * disclosure renderer understands.
+ */
+export function localSnapshotMemory(snap: LocalCompactSnapshot): NeuralscapeMemory {
+  return {
+    id: `local-compact-${snap.sessionId}`,
+    memory: snap.content,
+    category: "task_context",
+    project_id: snap.projectId,
+    tags: [COMPACT_SNAPSHOT_TAG, `${COMPACT_SNAPSHOT_SESSION_TAG_PREFIX}${snap.sessionId}`],
+    created_at: snap.createdAt,
+  };
+}
+
+/**
+ * Add this session's local compact snapshot to the fetched context unless the
+ * service already returned that very snapshot (same content). Only after a
+ * compaction: the session id is unchanged by compaction, so the id names the
+ * file; resume/fork get a new id and have no local copy.
+ */
+export async function withLocalCompactSnapshot(
+  context: ContextResponse,
+  input: { source?: string; session_id?: string },
+): Promise<ContextResponse> {
+  if (input.source !== "compact" || !input.session_id) return context;
+  const snap = await readLocalCompactSnapshot(input.session_id);
+  if (!snap) return context;
+  const categories = context.categories || {};
+  for (const memories of Object.values(categories)) {
+    if ((memories ?? []).some((m) => (m.memory ?? "").trim() === snap.content.trim())) return context;
+  }
+  return {
+    ...context,
+    categories: {
+      ...categories,
+      task_context: [...(categories.task_context ?? []), localSnapshotMemory(snap)],
+    },
+  };
+}
+
+/** The "Resuming after compaction" block from the local snapshot alone (service unreachable). */
+async function localResumeBlock(input: { source?: string; session_id?: string }): Promise<string> {
+  const context = await withLocalCompactSnapshot({ categories: {} } as ContextResponse, input);
+  return renderResumeAfterCompact(context.categories || {}, {
+    sessionId: input.session_id,
+    source: input.source,
+  }).block;
+}
+
+/**
+ * The "compile these buffers first" note for buffers left by sessions that
+ * are over (see listPendingBuffers). Empty string when there are none.
+ * Independent of the service: it only reads local files, so it is also
+ * appended to the unreachable notice.
+ */
+export async function buildPendingNote(currentSessionId?: string): Promise<string> {
+  try {
+    const pending = await listPendingBuffers(currentSessionId);
+    if (pending.length === 0) return "";
+    const totalRows = pending.reduce((s, b) => s + b.lineCount, 0);
+    const paths = pending.map((b) => `\`${b.path}\``).join(", ");
+    return (
+      `\n\n# Neuralscape — Pending Observations\n\n` +
+      `${pending.length} buffer file(s) from prior sessions hold ` +
+      `${totalRows} unprocessed tool observations: ${paths}.\n\n` +
+      `**Before responding to the user's first prompt**, run the ` +
+      `\`compile-observations\` skill on each of these paths to extract ` +
+      `significant memories using the v2 memory model. Skip noise ` +
+      `(routine reads/edits/searches). After memories submit successfully, ` +
+      `truncate each buffer file. Then continue with the user's request.`
+    );
+  } catch (error) {
+    logError("listPendingBuffers failed (non-critical)", error);
+    return "";
+  }
 }
 
 /* v8 ignore start — I/O paths below are exercised by the E2E dry-run script */
@@ -355,48 +559,52 @@ async function main(): Promise<void> {
     let context: ContextResponse;
     try {
       context = await contextPromise;
-    } catch {
-      // NS unreachable — never block session start: one-line notice, exit 0.
-      // The consecutive-failure counter upgrades the notice to fail-loud
-      // once the streak crosses FAIL_LOUD_THRESHOLD (D4).
-      const count = await recordTransportFailure();
-      outputWithContext(buildUnreachableNotice(count, getFailLoudThreshold()));
+    } catch (error) {
+      // Never block session start: one-line notice, exit 0. Only a down/failing
+      // service (network, 5xx) counts toward the consecutive-failure counter,
+      // which upgrades the notice to fail-loud at FAIL_LOUD_THRESHOLD (D4);
+      // auth / 404 / other 4xx get a notice naming what to fix instead.
+      const { kind, count } = await recordFailure(error);
+      logError(`context fetch failed (${kind})`, error);
+      // Local-only parts still apply: buffers left by finished sessions keep
+      // piling up during an outage unless this session is told about them,
+      // and the local copy of the compact snapshot needs no service.
+      const localResume = await localResumeBlock(input);
+      const pendingDuringOutage = await buildPendingNote(input.session_id);
+      outputWithContext(
+        buildFailureNotice(kind, count, getFailLoudThreshold()) +
+          (localResume ? `\n\n${localResume}` : "") +
+          pendingDuringOutage,
+      );
       return;
     }
     await resetTransportFailures();
 
     // Detect any unprocessed observation buffers left behind by prior sessions
     // and ask Claude to compile them before responding to the user.
-    let pendingNote = "";
-    try {
-      const pending = await listPendingBuffers(input.session_id);
-      if (pending.length > 0) {
-        const totalRows = pending.reduce((s, b) => s + b.lineCount, 0);
-        const paths = pending.map((b) => `\`${b.path}\``).join(", ");
-        pendingNote =
-          `\n\n# Neuralscape — Pending Observations\n\n` +
-          `${pending.length} buffer file(s) from prior sessions hold ` +
-          `${totalRows} unprocessed tool observations: ${paths}.\n\n` +
-          `**Before responding to the user's first prompt**, run the ` +
-          `\`compile-observations\` skill on each of these paths to extract ` +
-          `significant memories using the v2 memory model. Skip noise ` +
-          `(routine reads/edits/searches). After memories submit successfully, ` +
-          `truncate each buffer file. Then continue with the user's request.`;
-      }
-    } catch (error) {
-      logError("listPendingBuffers failed (non-critical)", error);
-    }
+    const pendingNote = await buildPendingNote(input.session_id);
+
+    // After a compaction the stored snapshot may not be searchable yet (the raw
+    // write is queued): merge the local copy the PreCompact hook left behind.
+    context = await withLocalCompactSnapshot(context, input);
 
     let contextBody: string;
     if (mode === "full") {
-      // Legacy full-content injection, standards prepended unbudgeted.
-      const standardsBlock = formatStandards(context.standards);
-      const formatted = formatMemories(context.categories || {});
-      contextBody = standardsBlock
-        ? formatted
-          ? `${standardsBlock}\n\n---\n\n${formatted}`
-          : standardsBlock
-        : formatted;
+      // Legacy full-content injection plus the continuity blocks (resume,
+      // Previously, cards): see buildFullContext.
+      const settled = await Promise.all(cardPromises.map((p) => p.catch(() => null)));
+      contextBody = buildFullContext({
+        context,
+        cards: settled.filter((c): c is { label: string; lines: string[] } => c !== null),
+        codeGraphAvailable: false,
+        budgetTokens: getIndexBudgetTokens(),
+        source: input.source,
+        sessionId: input.session_id,
+        predecessorIds:
+          input.source === "resume" || input.source === "fork"
+            ? await readPredecessorSessionIds(input.transcript_path, input.session_id)
+            : undefined,
+      });
     } else {
       const settled = await Promise.all(
         cardPromises.map((p) => p.catch(() => null)),
@@ -411,10 +619,17 @@ async function main(): Promise<void> {
         codeGraphAvailable,
         budgetTokens: getIndexBudgetTokens(),
         source: input.source,
+        sessionId: input.session_id,
+        predecessorIds:
+          input.source === "resume" || input.source === "fork"
+            ? await readPredecessorSessionIds(input.transcript_path, input.session_id)
+            : undefined,
       });
     }
 
-    const combined = (contextBody || "") + pendingNote;
+    const identityNotice = buildIdentityNotice(userId, getUserIdSource(), getServiceUrl());
+    const combined =
+      (contextBody || "") + pendingNote + (identityNotice ? `\n\n${identityNotice}` : "");
     if (combined.trim()) {
       outputWithContext(combined);
     } else {

@@ -1,17 +1,28 @@
 import json
 import logging
+import math
 import os
+import re
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Literal
 from urllib.parse import urlparse
 
 from arq.connections import RedisSettings
-from pydantic import field_validator, model_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode
 
 _logger = logging.getLogger(__name__)
 
 _LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1", "[::1]"}
+
+
+# Dimension of the mem0 / Qdrant vectors (embedder ``embedding_dims`` and the
+# collection's ``embedding_model_dims``). The Graphiti store is configured
+# separately via ``Settings.graphiti_embedding_dim``.
+VECTOR_EMBEDDING_DIMS = 768
+
+# (ambient EMBEDDING_DIM, GRAPHITI_EMBEDDING_DIM) pairs already warned about.
+_AMBIENT_DIM_WARNED: set = set()
 
 
 class Settings(BaseSettings):
@@ -20,7 +31,29 @@ class Settings(BaseSettings):
     gemini_llm_model: str = "gemini-3.1-flash-lite"
     gemini_llm_fallback_model: str = "gemini-2.5-flash"
     gemini_embedder_model: str = "gemini-embedding-001"
+    # Dimension of the embeddings Graphiti stores on Entity.name_embedding and
+    # RELATES_TO.fact_embedding (env GRAPHITI_EMBEDDING_DIM). Passed explicitly
+    # to the Graphiti embedder instead of relying on the ambient EMBEDDING_DIM
+    # env. Default 1024 = what existing graph data is already stored at, so no
+    # stored vector changes unless the owner opts in. The mem0/Qdrant side is
+    # fixed at VECTOR_EMBEDDING_DIMS; recall compares the two on the common
+    # Matryoshka prefix (see docs/GRAPH_EMBEDDING_DIMENSION.md).
+    graphiti_embedding_dim: int = Field(default=1024, ge=1)
 
+    # Hybrid experiments are independently opt-in; each needs its flag plus an endpoint and key.
+    hybrid_inference_api_key: str = Field(default="", repr=False)
+    # No default endpoint or model: a flag alone, or a key alone, activates nothing.
+    hybrid_inference_endpoint: str = ""
+    hybrid_inference_model: str = ""
+    hybrid_threshold: float = Field(default=0.9, ge=0.5, le=1)
+    hybrid_timeout_s: float = Field(default=2.0, gt=0, le=30)
+    hybrid_graph_enabled: bool = False
+    hybrid_categories_enabled: bool = False
+    hybrid_extraction_enabled: bool = False
+    hybrid_extraction_deadline_s: float = Field(default=2.5, gt=0, le=30)
+    hybrid_rerank_enabled: bool = False
+    hybrid_rerank_limit: int = Field(default=32, ge=1, le=64)
+    hybrid_rerank_policy: str = "Prefer direct evidence answering the query; respect explicit versions and dates in the query. Do not confuse topical overlap with an answer."
     # ── LLM gateway (OpenAI-compatible) ───────────────────────────────
     # When enabled, the LLM + embedder (and the graphiti reranker) route
     # through an OpenAI-compatible gateway (e.g. an internal Vertex-via-ADC
@@ -99,6 +132,13 @@ class Settings(BaseSettings):
     ingest_queue_name: str = "neuralscape:ingest"
     arq_max_retries: int = 3
     arq_job_timeout: int = 300  # 5 min max per task
+    # Concurrent jobs per worker process (ARQ ``max_jobs``), one knob per
+    # worker class. The graph worker's default is low to cap concurrent Gemini
+    # extraction (AI-Studio throttling); the ingest worker's bounds parse /
+    # embed memory. Env: ARQ_MAX_JOBS / GRAPH_MAX_JOBS / INGEST_MAX_JOBS.
+    arq_max_jobs: int = Field(default=10, ge=1)
+    graph_max_jobs: int = Field(default=4, ge=1)
+    ingest_max_jobs: int = Field(default=3, ge=1)
     # Override the global ThreadPoolExecutor used by asyncio.to_thread (batch-get,
     # code-graph reads). 0 = use Python default (min(32, cpu+4)); >0 sets explicit
     # size. The stdlib default silently caps concurrent to_thread calls, which
@@ -111,9 +151,29 @@ class Settings(BaseSettings):
     llm_retry_base_delay: float = 1.0  # seconds
     llm_retry_max_delay: float = 30.0  # seconds
 
+    # ── Graph-contradiction supersession (flag, default OFF) ──────────
+    # When Graphiti's add_episode invalidates an older RELATES_TO edge, mark
+    # the Qdrant row that edge came from with a reversible tombstone
+    # (metadata.dream_tombstoned + superseded_* keys) so recall stops serving
+    # the contradicted fact, and let a dedup-hit that revived a tombstoned row
+    # re-enter graph enrichment. Env: GRAPH_SUPERSESSION_ENABLED. Off ⇒ the
+    # write path is byte-identical to before (no Cypher probe, no payload
+    # change, no extra enqueue). Multi-row (conversation) episodes only
+    # supersede a row whose stored vector matches the invalidated edge's fact
+    # at >= min_similarity AND beats the runner-up by >= margin.
+    graph_supersession_enabled: bool = False
+    graph_supersession_min_similarity: float = 0.85
+    graph_supersession_margin: float = 0.05
+
     # Dedup cron
     dedup_similarity_threshold: float = 0.95
     dedup_batch_size: int = 100
+    # Semantic dedup (phase 2 of the dedup cron and of post-compile dedup).
+    # False (default): the older near-duplicate is hard-deleted, with the graph
+    # cascade and sibling re-ingest jobs. True: it is tombstoned instead
+    # (reversible: recall hides it, the row stays, re-deriving it revives it)
+    # and nothing cascades. Env: DEDUP_SEMANTIC_TOMBSTONE_ENABLED.
+    dedup_semantic_tombstone_enabled: bool = False
     dedup_cron_hours: set = {0, 6, 12, 18}
 
     # ── Reinforcement-aware recall boost (times_derived) ──────────────
@@ -275,6 +335,13 @@ class Settings(BaseSettings):
     connectors_enabled: bool = False
     vault_key: str = ""  # NEURALSCAPE_VAULT_KEY — required when connectors_enabled
     connector_sync_cron_hours: int = 6  # interval (hours) the sync cron fires
+    # Comma-separated exact command lines an MCP connector may spawn on the
+    # worker over the stdio transport (so an entry cannot itself contain a comma).
+    # Each entry is shell-quoted; it is normalised (shlex split + join) before
+    # comparison with the connector's command + args. Empty (default) disables
+    # stdio entirely. Allowlisting a general interpreter
+    # (python, node, npx, sh ...) is equivalent to allowing arbitrary code.
+    connector_stdio_commands: str = ""
 
     # ── Document/file ingestion ───────────────────────────────────────
     # Rich formats (PDF, MS Office docx/xlsx/pptx, HTML, …) are converted to
@@ -445,6 +512,18 @@ class Settings(BaseSettings):
     # all requests must present this exact token in `Authorization: Bearer ...` and
     # user_id is taken from the request body (trust-based, single-team or single-user).
     neuralscape_api_key: str = ""
+    # Identity the legacy shared key acts as (NEURALSCAPE_API_KEY_USER_ID). Empty
+    # means `default_user_id`. A caller presenting the shared key is bound to this
+    # one user: a body/query user_id naming anyone else gets HTTP 400, and MCP
+    # ignores `arguments["user_id"]` (same as for per-user tokens).
+    neuralscape_api_key_user_id: str = ""
+    # Opt-out (NEURALSCAPE_LEGACY_KEY_TRUST_BODY_USER_ID=true): restore the
+    # pre-binding behaviour where a shared-key caller may act as any body user_id.
+    neuralscape_legacy_key_trust_body_user_id: bool = False
+    # Revoked per-user tokens (NEURALSCAPE_REVOKED_TOKENS): CSV of SHA-256 hex
+    # digests of tokens to reject with 401. Get a digest with
+    # `python scripts/revoke_token.py <token>`. Empty = no revocation.
+    neuralscape_revoked_tokens: str = ""
     # Multi-user HMAC-signed tokens. When set, the server also accepts tokens of the
     # form `{base64url(payload)}.{hmac_sha256(secret, payload)}` where payload is
     # `{"user_id": "...", "exp": <unix-ts>}`. The verified user_id is attached to
@@ -558,6 +637,38 @@ class Settings(BaseSettings):
     sensitivity_gate_enabled: bool = True
     sensitivity_private_classes: str = "financial,equity_compensation,client_commercial,credentials_pii"
 
+    # ── Durable ledger (intent/outbox acceptance) ─────────────────────────
+    # Off by default: no code path consults the ledger unless enabled.
+    #   ledger_backend       → "sqlite" (self-hosted default: embedded, single
+    #     owning host, local filesystem, WAL, synchronous FULL, no new service)
+    #     or "postgres" (hosted tenant cells; optional for self-hosters). The
+    #     ledger stays disabled until explicitly enabled.
+    #   ledger_sqlite_path   → database file on a local filesystem.
+    #   ledger_postgres_dsn  → libpq connection string for the cell database.
+    ledger_enabled: bool = False
+    #   ledger_retention_postgres_dsn → a maintenance role that may delete aged tombstones (PostgreSQL only;
+    #     the runtime role cannot).  Used only by the tombstone retention
+    #     job (PostgreSQL), which a later slice adds.
+    ledger_retention_postgres_dsn: str = ""
+    ledger_backend: str = "sqlite"
+    ledger_sqlite_path: str = ""
+    ledger_postgres_dsn: str = ""
+    #   ledger_postgres_migrate_on_open → True (default) opens as the schema owner and applies migrations.
+    #     False opens as a least-privilege runtime role: it must not be a superuser or BYPASSRLS and the
+    #     schema must already be migrated and granted (``PostgresLedger(dsn)`` as the owner, then
+    #     ``ledger.postgres.grant_runtime_role``).
+    ledger_postgres_migrate_on_open: bool = True
+    # ── Tenant admission control (cell edge; every limit unset = unlimited) ───
+    # Mechanism only: no default numbers, no advertised quota (that policy is
+    # not selected).  Used by ``tenant_admission`` (ASGI middleware or the edge
+    # proxy).  Rate refusals and concurrency/queue refusals are HTTP 429 with a
+    # Retry-After; a cell whose required capability is not ready answers 503.
+    tenant_admission_enabled: bool = False
+    tenant_admission_rate_per_second: float | None = None
+    tenant_admission_burst: int | None = None
+    tenant_admission_max_concurrency: int | None = None
+    tenant_admission_max_queue_depth: int | None = None
+
     # Service
     host: str = "0.0.0.0"
     port: int = 8199
@@ -591,12 +702,71 @@ class Settings(BaseSettings):
             raise ValueError("NEURALSCAPE_PUBLIC_URL must use https:// (except loopback hosts)")
         return value.rstrip("/")
 
+    @field_validator("ledger_backend")
+    @classmethod
+    def _validate_ledger_backend(cls, value: str) -> str:
+        backend = value.strip().lower()
+        if backend not in ("sqlite", "postgres"):
+            raise ValueError("LEDGER_BACKEND must be 'sqlite' or 'postgres'")
+        return backend
+
+    @model_validator(mode="after")
+    def _validate_ledger_target(self) -> "Settings":
+        # Fail at startup, not at the first write, when the ledger is on but has nowhere to live.
+        if not self.ledger_enabled:
+            return self
+        if self.ledger_backend == "sqlite" and not self.ledger_sqlite_path.strip():
+            raise ValueError("LEDGER_ENABLED with LEDGER_BACKEND=sqlite requires LEDGER_SQLITE_PATH")
+        if self.ledger_backend == "postgres" and not self.ledger_postgres_dsn.strip():
+            raise ValueError("LEDGER_ENABLED with LEDGER_BACKEND=postgres requires LEDGER_POSTGRES_DSN")
+        return self
+
+    @field_validator("tenant_admission_rate_per_second")
+    @classmethod
+    def _validate_admission_rate(cls, value: float | None) -> float | None:
+        # Unset means unlimited; a set rate must be a finite positive number.
+        # NaN and infinity would otherwise reach the edge and crash it on start.
+        if value is not None and not (math.isfinite(value) and value > 0):
+            raise ValueError("TENANT_ADMISSION_RATE_PER_SECOND must be a finite positive number")
+        return value
+
+    @field_validator(
+        "tenant_admission_burst",
+        "tenant_admission_max_concurrency",
+    )
+    @classmethod
+    def _validate_admission_positive_int(cls, value: int | None) -> int | None:
+        if value is not None and value <= 0:
+            raise ValueError("admission burst and concurrency must be positive when set")
+        return value
+
+    @field_validator("tenant_admission_max_queue_depth")
+    @classmethod
+    def _validate_admission_queue(cls, value: int | None) -> int | None:
+        if value is not None and value < 0:
+            raise ValueError("TENANT_ADMISSION_MAX_QUEUE_DEPTH must not be negative")
+        return value
+
     @field_validator("oauth_access_ttl", "oauth_refresh_ttl")
     @classmethod
     def _validate_positive_ttl(cls, value: int) -> int:
         if value <= 0:
             raise ValueError("OAuth token TTLs must be > 0 seconds")
         return value
+
+    @field_validator("code_repos", mode="after")
+    @classmethod
+    def _drop_blank_code_repos(cls, v: dict[str, str]) -> dict[str, str]:
+        """A blank CODE_REPOS directory would resolve to the process cwd; drop it with a warning."""
+        clean = {}
+        for name, path in (v or {}).items():
+            if not str(path or "").strip():
+                logging.getLogger(__name__).warning(
+                    "CODE_REPOS entry %r has an empty path; ignoring it", name
+                )
+                continue
+            clean[name] = path
+        return clean
 
     @field_validator("code_op_preference", mode="before")
     @classmethod
@@ -669,6 +839,28 @@ class Settings(BaseSettings):
             if s and s not in seen:
                 seen.append(s)
         return seen
+
+    @model_validator(mode="after")
+    def _warn_ambient_embedding_dim(self) -> "Settings":
+        # The Graphiti embedder dimension used to come from the ambient
+        # EMBEDDING_DIM env (Graphiti's default 1024). GRAPHITI_EMBEDDING_DIM
+        # now wins; say so when an operator's old variable disagrees.
+        ambient = os.environ.get("EMBEDDING_DIM", "").strip()
+        key = (ambient, self.graphiti_embedding_dim)
+        if ambient and ambient != str(self.graphiti_embedding_dim) and key not in _AMBIENT_DIM_WARNED:
+            _AMBIENT_DIM_WARNED.add(key)  # once per process, not per Settings()
+            logging.getLogger(__name__).warning(
+                "EMBEDDING_DIM=%s is set but GRAPHITI_EMBEDDING_DIM=%s is what "
+                "the Graphiti embedder now uses (new graph vectors are written "
+                "at %s). If your stored graph vectors are %s-d, set "
+                "GRAPHITI_EMBEDDING_DIM=%s; see docs/GRAPH_EMBEDDING_DIMENSION.md.",
+                ambient,
+                self.graphiti_embedding_dim,
+                self.graphiti_embedding_dim,
+                ambient,
+                ambient,
+            )
+        return self
 
     @model_validator(mode="after")
     def _validate_extraction_windowing(self) -> "Settings":
@@ -797,10 +989,36 @@ class Settings(BaseSettings):
         """True iff `user_id` is an authorized dictator (may write standards)."""
         return bool(user_id) and user_id in self.dictator_user_ids_set()
 
+    def connector_stdio_commands_set(self) -> set[str]:
+        """Parsed CSV of exact stdio command lines connectors may spawn."""
+        import shlex
+
+        out: set[str] = set()
+        for entry in self.connector_stdio_commands.split(","):
+            try:
+                parts = shlex.split(entry)
+            except ValueError:
+                continue  # unbalanced quote: never matches rather than matching loosely
+            if parts:
+                out.add(shlex.join(parts))
+        return out
+
     # ── sensitivity gate helpers ──────────────────────────────────────────
     def sensitivity_private_classes_set(self) -> set[str]:
         """Parsed CSV of sensitivity classes that force `visibility=private`."""
         return {c.strip() for c in self.sensitivity_private_classes.split(",") if c.strip()}
+
+    def legacy_key_identity(self) -> str:
+        """User id the legacy shared key is bound to (empty setting -> default user)."""
+        return self.neuralscape_api_key_user_id.strip() or self.default_user_id
+
+    def revoked_token_digests(self) -> set[str]:
+        """Parsed ``NEURALSCAPE_REVOKED_TOKENS`` (lowercased SHA-256 hex digests)."""
+        return {
+            d.strip().lower()
+            for d in self.neuralscape_revoked_tokens.split(",")
+            if d.strip()
+        }
 
     def validate_required(self) -> None:
         """Validate that all required configuration fields are set.
@@ -854,6 +1072,13 @@ class Settings(BaseSettings):
                 errors.append(
                     "SUPABASE_URL and SUPABASE_ANON_KEY are required when AUTH_PROVIDER=supabase"
                 )
+        if self.neuralscape_api_key_user_id.strip() and not re.match(
+            r"^[a-zA-Z0-9_.\-]{1,100}$", self.neuralscape_api_key_user_id.strip()
+        ):
+            errors.append(
+                "NEURALSCAPE_API_KEY_USER_ID must be 1-100 characters of letters, "
+                "digits, '_', '.' or '-'"
+            )
         # Auth is fail-closed: with no credential configured, the API would be
         # open to anyone who can reach it, so refuse to start unless the
         # operator explicitly opted out.
@@ -877,7 +1102,14 @@ class Settings(BaseSettings):
                 "on a trusted local machine; set NEURALSCAPE_USER_TOKEN_SECRET for any "
                 "shared or network-reachable deployment."
             )
-        elif self.neuralscape_auth_disabled:
+        if self.neuralscape_api_key and self.neuralscape_legacy_key_trust_body_user_id:
+            _logger.warning(
+                "NEURALSCAPE_LEGACY_KEY_TRUST_BODY_USER_ID=true: the legacy shared "
+                "NEURALSCAPE_API_KEY may act as ANY user named in a request body or "
+                "query. Prefer per-user tokens, or leave this off so the key is bound "
+                "to NEURALSCAPE_API_KEY_USER_ID (default: DEFAULT_USER_ID). See AUTH.md"
+            )
+        if auth_configured and self.neuralscape_auth_disabled:
             _logger.warning(
                 "NEURALSCAPE_AUTH_DISABLED=true is ignored because an auth secret is "
                 "configured; authentication stays enabled."
@@ -905,6 +1137,7 @@ class Settings(BaseSettings):
             "graphiti_embedder_provider": "gemini",
             "graphiti_embedder_model": self.gemini_embedder_model,
             "graphiti_embedder_api_key": self.google_api_key,
+            "graphiti_embedding_dim": self.graphiti_embedding_dim,
             "graphiti_reranker_provider": "gemini",
         }
 
@@ -922,6 +1155,7 @@ class Settings(BaseSettings):
             "graphiti_embedder_provider": "gemini",
             "graphiti_embedder_model": self.gemini_embedder_model,
             "graphiti_embedder_api_key": self.google_api_key,
+            "graphiti_embedding_dim": self.graphiti_embedding_dim,
             "graphiti_reranker_provider": "openai",
         }
 
@@ -936,7 +1170,7 @@ class Settings(BaseSettings):
         # Qdrant: server mode (url) or local on-disk mode (path)
         qdrant_config: dict = {
             "collection_name": self.qdrant_collection,
-            "embedding_model_dims": 768,
+            "embedding_model_dims": VECTOR_EMBEDDING_DIMS,
         }
         if self.qdrant_url:
             qdrant_config["url"] = self.qdrant_url
@@ -971,7 +1205,7 @@ class Settings(BaseSettings):
                     "model": self.llm_gateway_embedder_model,
                     "api_key": self.llm_gateway_api_key,
                     "openai_base_url": gw,
-                    "embedding_dims": 768,
+                    "embedding_dims": VECTOR_EMBEDDING_DIMS,
                     # The gateway's Vertex embedding endpoint accepts only one
                     # input per request → embed per item unless overridden.
                     "embedding_batch_size": self.embedder_max_batch_size or 1,
@@ -999,7 +1233,7 @@ class Settings(BaseSettings):
                 "config": {
                     "model": self.gemini_embedder_model,
                     "api_key": self.google_api_key,
-                    "embedding_dims": 768,
+                    "embedding_dims": VECTOR_EMBEDDING_DIMS,
                 },
             }
             graphiti_models = self._graphiti_ai_studio_models()
@@ -1019,6 +1253,12 @@ class Settings(BaseSettings):
                     "password": self.neo4j_password,
                     "database": self.neo4j_database,
                     **graphiti_models,
+                    "graphiti_hybrid_enabled": self.hybrid_graph_enabled,
+                    "graphiti_hybrid_api_key": self.hybrid_inference_api_key,
+                    "graphiti_hybrid_endpoint": self.hybrid_inference_endpoint,
+                    "graphiti_hybrid_model": self.hybrid_inference_model,
+                    "graphiti_hybrid_threshold": self.hybrid_threshold,
+                    "graphiti_hybrid_timeout": self.hybrid_timeout_s,
                     "store_raw_episode_content": self.store_raw_episode_content,
                     "update_communities": self.update_communities,
                 },

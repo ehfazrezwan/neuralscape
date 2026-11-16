@@ -360,9 +360,9 @@ SCENARIOS: tuple[Scenario, ...] = (
     Scenario("group-id-distinct-controls", "control", ("A1.02", "A1.03"),
              "test_ordinary_namespace_tuples_stay_distinct", False,
              "Ordinary tuples remain distinct."),
-    Scenario("email-slug-collision", "expected-failure", ("G1.04",),
+    Scenario("email-slug-collision", "control", ("G1.04",),
              "test_distinct_emails_have_distinct_user_ids", False,
-             "Distinct emails can slug to the same user id."),
+             "A second email whose slug is already claimed gets a hash-suffixed user id at first login."),
     Scenario("email-slug-controls", "control", ("G1.04",),
              "test_ordinary_emails_slug_deterministically", False,
              "Ordinary emails slug deterministically and distinctly."),
@@ -375,12 +375,15 @@ SCENARIOS: tuple[Scenario, ...] = (
     Scenario("queued-job-same-visibility-control", "control", ("A7.01",),
              "test_queued_graph_job_with_unchanged_visibility_enriches", False,
              "An unchanged visibility is passed through."),
-    Scenario("job-key-omits-store-scope", "expected-failure", ("A6.02", "D2.07"),
-             "test_store_job_id_depends_on_project_and_agent_scope", True,
-             "The extraction job id ignores project, agent and run, so identical text coalesces across destinations."),
-    Scenario("job-key-omits-raw-options", "expected-failure", ("A6.02", "D2.07"),
-             "test_raw_job_id_depends_on_category_and_tags", True,
-             "The raw-write job id ignores category, tags and agent, so different options coalesce."),
+    # Fixed: the two job-key defects (identical text coalescing across
+    # project/agent/run, and across raw-write category/tags/agent) are now
+    # ordinary controls.
+    Scenario("job-key-store-scope-control", "control", ("A6.02", "D2.07"),
+             "test_store_job_id_depends_on_project_and_agent_scope", False,
+             "The extraction job id covers project, agent and run, so identical text sent to another destination is its own job."),
+    Scenario("job-key-raw-options-control", "control", ("A6.02", "D2.07"),
+             "test_raw_job_id_depends_on_category_and_tags", False,
+             "The raw-write job id covers category, tags and agent, so writes differing in those options are distinct jobs."),
     Scenario("job-key-controls", "control", ("A6.02", "D2.07"),
              "test_job_ids_are_stable_and_user_scoped", False,
              "Same inputs give one id and different users give different ids."),
@@ -402,9 +405,12 @@ SCENARIOS: tuple[Scenario, ...] = (
     Scenario("readiness-controls", "control", ("G2.03",),
              "test_health_reports_an_uninitialized_vector_store_as_degraded", False,
              "An uninitialized store and an unreachable queue are already reported."),
-    Scenario("backup-covers-compose-volumes", "expected-failure", ("G3.05", "G3.06"),
+    # Fixed by scripts/backup-volumes.sh: the former expected failure is now a
+    # passing control. needs_real_service stays True until the script has run
+    # against real stores (VPS gate / batch verification).
+    Scenario("backup-covers-compose-volumes", "control", ("G3.05", "G3.06"),
              "test_compose_backup_tooling_covers_every_persistent_volume", True,
-             "No compose backup tooling names the persistent volumes."),
+             "Compose backup tooling (scripts/backup-volumes.sh) names every persistent volume."),
     Scenario("backup-volume-controls", "control", ("G3.05",),
              "test_compose_declares_the_persistent_volumes", False,
              "The compose file declares the stores a backup must cover."),
