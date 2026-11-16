@@ -200,6 +200,9 @@ class GraphAdminMixin:
             # No-op for an awaited coroutine; prevents "never awaited"
             # leaks when the bridge is mocked or fails before scheduling.
             coro.close()
+        # A reversible tombstone hides the memory's vector row only: its
+        # episode must not feed ask evidence either.
+        hidden = self._tombstoned_episode_uuids([rec.get("uuid") for rec in records])
         return [
             {
                 "uuid": rec.get("uuid"),
@@ -208,7 +211,7 @@ class GraphAdminMixin:
                 "score": rec.get("score"),
             }
             for rec in records
-            if rec.get("content")
+            if rec.get("content") and rec.get("uuid") not in hidden
         ]
 
     def get_graph_episodes(

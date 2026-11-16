@@ -70,6 +70,13 @@ _graph_leg_budget_timeouts = 0
 _graph_leg_budget_lock = _threading.Lock()
 
 
+def _episode_uuid_list(value) -> list[str]:
+    """Supporting-episode uuids of a Graphiti edge as a plain list of strings."""
+    if not isinstance(value, (list, tuple)):
+        return []
+    return [u for u in value if isinstance(u, str) and u]
+
+
 def _degraded_graph_result() -> dict:
     """Empty graph-search result marked as an outage, not as "no facts"."""
     return {
@@ -754,7 +761,17 @@ class SearchMixin:
                 else:
                     graph_wait_s = _GRAPH_SEARCH_JOIN_TIMEOUT_S
                 graph_results = graph_future.result(timeout=graph_wait_s)
+                # Reversible tombstones hide a memory's vector row only; its
+                # graph episode, and a fact supported solely by such episodes,
+                # must not come back through the graph legs.
+                hidden_eps = self._tombstoned_episode_uuids(
+                    [str(ep.get("uuid") or "") for ep in graph_results.get("episodes", [])]
+                    + [u for e in graph_results.get("edges", []) for u in (e.get("episodes") or [])]
+                )
                 for edge in graph_results.get("edges", []):
+                    sup = edge.get("episodes") or []
+                    if hidden_eps and sup and all(u in hidden_eps for u in sup):
+                        continue
                     # Graph as a ranked leg: score each edge with its STORED
                     # fact_embedding (piggybacked on the enrichment Cypher in
                     # _enrich_graph_results) against the query vector computed
@@ -796,6 +813,8 @@ class SearchMixin:
                 if settings.graph_episode_recall_enabled:
                     for ep in graph_results.get("episodes", []):
                         ep_uuid = str(ep.get("uuid") or "")
+                        if ep_uuid in hidden_eps:
+                            continue
                         ep_content = str(ep.get("content") or "")
                         # Clip each recall episode snippet to a bounded length.
                         # (Not the same as ask.py's _clip_content, which clips at
@@ -1298,6 +1317,70 @@ class SearchMixin:
             query=query, group_ids=group_ids, limit=limit, include_episodes=include_episodes
         )
 
+    def _tombstoned_episode_uuids(self, episode_uuids) -> set[str]:
+        """Episode uuids whose every source memory is a reversible tombstone.
+
+        A dedup/dream/supersession tombstone hides a memory's Qdrant row only
+        (nothing is deleted from the graph, so the tombstone stays
+        reversible). The graph episode written for that memory stays
+        searchable, so recall must drop it here or the hidden text keeps
+        coming back as a ``[verbatim session excerpt]`` row. The link is
+        ``metadata.graph_episode_uuid`` on the Qdrant rows (indexed keyword).
+
+        One batched lookup per recall: first the tombstoned rows among the
+        given episodes (empty in the common case: a single cheap filtered
+        scroll), and only when some exist, the live rows of those episodes. A
+        conversation episode is shared by several fact rows and is hidden only
+        when ALL of them are tombstoned. An episode with no Qdrant row at all
+        is never hidden (nothing says it was). Restoring the tombstone clears
+        the flag, so the episode is visible again on the next read. Any
+        failure returns an empty set: a read is never broken by this check.
+        """
+        uuids = sorted({u for u in (episode_uuids or []) if isinstance(u, str) and u})
+        if not uuids:
+            return set()
+        try:
+            from qdrant_client.models import FieldCondition, Filter, MatchAny, MatchValue
+
+            client = self._get_memory().vector_store.client
+
+            def _scan(must: list, must_not: list | None = None) -> set[str]:
+                found: set[str] = set()
+                offset = None
+                while True:
+                    points, offset = client.scroll(
+                        collection_name=settings.qdrant_collection,
+                        scroll_filter=Filter(must=must, must_not=must_not or None),
+                        limit=256,
+                        offset=offset,
+                        with_payload=["metadata.graph_episode_uuid"],
+                        with_vectors=False,
+                    )
+                    for pt in points or []:
+                        meta = (pt.payload or {}).get("metadata") or {}
+                        ep = meta.get("graph_episode_uuid")
+                        if isinstance(ep, str):
+                            found.add(ep)
+                    if offset is None:
+                        return found
+
+            def _ep(values: list[str]):
+                return FieldCondition(
+                    key="metadata.graph_episode_uuid", match=MatchAny(any=values)
+                )
+
+            tomb = FieldCondition(
+                key="metadata.dream_tombstoned", match=MatchValue(value=True)
+            )
+            candidates = _scan([_ep(uuids), tomb])
+            if not candidates:
+                return set()
+            live = _scan([_ep(sorted(candidates))], [tomb])
+            return candidates - live
+        except Exception as e:
+            logger.debug(f"tombstoned-episode lookup skipped: {e}")
+            return set()
+
     def _do_graph_search(
         self,
         query: str,
@@ -1362,6 +1445,9 @@ class SearchMixin:
                     "valid_at": _dt_to_iso(getattr(e, "valid_at", None)),
                     "invalid_at": _dt_to_iso(getattr(e, "invalid_at", None)),
                     "created_at": _dt_to_iso(getattr(e, "created_at", None)),
+                    # Supporting episodes: recall hides a fact whose every
+                    # supporting episode belongs to a tombstoned memory.
+                    "episodes": _episode_uuid_list(getattr(e, "episodes", None)),
                 }
                 for e in results.edges
                 # Belt-and-suspenders: some drivers/recipes skip the Cypher
@@ -1547,6 +1633,15 @@ class SearchMixin:
             logger.error(f"Graph search failed: {e}")
             return _degraded_graph_result()
 
+        hidden_eps = self._tombstoned_episode_uuids(
+            [ep.uuid for ep in results.episodes]
+            + [u for e in results.edges for u in _episode_uuid_list(getattr(e, "episodes", None))]
+        )
+
+        def _hidden_edge(e) -> bool:
+            sup = _episode_uuid_list(getattr(e, "episodes", None))
+            return bool(hidden_eps and sup and all(u in hidden_eps for u in sup))
+
         return {
             "edges": [
                 {
@@ -1558,6 +1653,7 @@ class SearchMixin:
                     "created_at": _dt_to_iso(getattr(e, "created_at", None)),
                 }
                 for e in results.edges
+                if not _hidden_edge(e)
             ],
             "nodes": [
                 {"uuid": n.uuid, "name": n.name, "summary": n.summary}
@@ -1566,6 +1662,7 @@ class SearchMixin:
             "episodes": [
                 {"uuid": ep.uuid, "name": ep.name, "content": ep.content}
                 for ep in results.episodes
+                if ep.uuid not in hidden_eps
             ],
             "communities": [
                 {"uuid": c.uuid, "name": c.name}
