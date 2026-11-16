@@ -13,13 +13,11 @@ from pathlib import Path
 
 import pytest
 
-import hashlib
-
 import httpx
 
-from . import caps, guard, runctx
+from . import caps, guard, profile as profile_mod, runctx
 from .decor import DEFAULT_PROFILES
-from .fixtures import a, anon, b, bad, ctx, mcp_a, mcp_b  # noqa: F401  (registered as fixtures)
+from .fixtures import a, anon, b, bad, ctx, dictator, mcp_a, mcp_b, mcp_dictator, sink  # noqa: F401  (registered as fixtures)
 from .tokens import scrub
 
 ACCEPTANCE_DIR = Path(__file__).resolve().parents[1]
@@ -40,12 +38,18 @@ def pytest_addoption(parser):
     )
 
 
+def _expected_red(item) -> str | None:
+    marker = item.get_closest_marker("ns_expected_red")
+    return str(marker.args[0]) if marker and marker.args else None
+
+
 def pytest_configure(config):
     for name, doc in (
         ("ns_proves", "atlas node ids this scenario is evidence for"),
         ("ns_profiles", "profiles this scenario runs under (default: default)"),
         ("ns_needs", "capabilities required; scenario skips when absent"),
         ("ns_negative_control", "scenario is a negative control"),
+        ("ns_expected_red", "scenario is known to fail until the referenced PR lands"),
     ):
         config.addinivalue_line("markers", f"{name}: {doc}")
     config._ns_state = {}
@@ -102,6 +106,7 @@ def pytest_collection_modifyitems(config, items):
                 "proves": _marker_args(it, "ns_proves"),
                 "profiles": list(item_profiles(it)),
                 "negative_control": it.get_closest_marker("ns_negative_control") is not None,
+                "expected_red": _expected_red(it),
                 "needs": _marker_args(it, "ns_needs"),
             }
             for it in items
@@ -120,18 +125,11 @@ def pytest_collection_modifyitems(config, items):
 
 
 def _profile_info(profile: str) -> tuple[dict, str | None]:
-    path = ACCEPTANCE_DIR / "profiles" / f"{profile}.env"
-    if not path.is_file():
+    """(flags as recorded, sha256 of the file). Secrets appear only as ``<generate:...>`` placeholders."""
+    prof = profile_mod.load(ACCEPTANCE_DIR / "profiles" / f"{profile}.env")
+    if prof is None:
         return {}, None
-    raw = path.read_bytes()
-    flags: dict[str, str] = {}
-    for line in raw.decode("utf-8", "replace").splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, _, value = line.partition("=")
-        flags[key.strip()] = value.strip()
-    return flags, hashlib.sha256(raw).hexdigest()
+    return prof.flags, prof.sha256
 
 
 def _probe_stack_commit(base_url: str) -> str | None:
@@ -177,12 +175,22 @@ def pytest_collection_finish(session):
             returncode=2,
         )
     config._ns_stack_commit = stack
+    flags, _ = _profile_info(config.getoption("--ns-profile"))
+    dictator_ids = [u.strip() for u in flags.get("DICTATOR_USER_IDS", "").split(",") if u.strip()]
     try:
         config._ns_ctx = runctx.build(
-            base, config.getoption("--ns-profile"), config.getoption("--ns-compose-project")
+            base,
+            config.getoption("--ns-profile"),
+            config.getoption("--ns-compose-project"),
+            profile_flags=flags,
+            dictator_user=dictator_ids[0] if dictator_ids else None,
         )
     except runctx.ConfigError as exc:
         pytest.exit(f"harness misconfiguration: {scrub(str(exc))}", returncode=2)
+    if config._ns_ctx.compose_project:
+        os.environ["NS_HAVE_COMPOSE"] = "1"  # capability for @needs("compose")
+    if config._ns_ctx.token_dictator:
+        os.environ["NS_HAVE_DICTATOR"] = "1"  # capability for @needs("dictator")
 
 
 # ── @needs ──────────────────────────────────────────────────────
@@ -214,6 +222,8 @@ def pytest_runtest_makereport(item, call):
             "negative_control": item.get_closest_marker("ns_negative_control") is not None,
         },
     )
+    if _expected_red(item):
+        state["expected_red"] = _expected_red(item)  # only marked rows carry the key: a known red is not evidence
     state["seconds"] += rep.duration
     if rep.passed:
         return

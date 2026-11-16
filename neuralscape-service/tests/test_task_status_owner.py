@@ -157,6 +157,10 @@ class TestSharedKeyStatus:
     async def test_shared_key_reads_any_task(self, tm, monkeypatch, route):
         monkeypatch.setattr(settings, "neuralscape_user_token_secret", SECRET)
         monkeypatch.setattr(settings, "neuralscape_api_key", SHARED_KEY)
+        # These tests cover the shared key WITHOUT a bound identity, i.e. the
+        # NEURALSCAPE_LEGACY_KEY_TRUST_BODY_USER_ID opt-out. The default
+        # (bound identity) is covered in tests/test_legacy_key_identity.py.
+        monkeypatch.setattr(settings, "neuralscape_legacy_key_trust_body_user_id", True)
         task_id = await _alice_task(tm)
         resp = TestClient(app).get(route.format(task_id), headers={"Authorization": f"Bearer {SHARED_KEY}"})
         assert resp.status_code == 200
@@ -410,6 +414,10 @@ class TestConversationCompilerTasks:
     async def test_shared_key_records_body_user(self, compiler, monkeypatch):
         monkeypatch.setattr(settings, "neuralscape_user_token_secret", SECRET)
         monkeypatch.setattr(settings, "neuralscape_api_key", SHARED_KEY)
+        # These tests cover the shared key WITHOUT a bound identity, i.e. the
+        # NEURALSCAPE_LEGACY_KEY_TRUST_BODY_USER_ID opt-out. The default
+        # (bound identity) is covered in tests/test_legacy_key_identity.py.
+        monkeypatch.setattr(settings, "neuralscape_legacy_key_trust_body_user_id", True)
         resp = TestClient(app).post(
             self.PREFIX + "/flush",
             json={**self.FLUSH, "user_id": "alice"},
@@ -485,6 +493,8 @@ def _shared_key_auth(monkeypatch):
     """Shared key and per-user tokens both accepted (a mixed deployment)."""
     monkeypatch.setattr(settings, "neuralscape_user_token_secret", SECRET)
     monkeypatch.setattr(settings, "neuralscape_api_key", SHARED_KEY)
+    # Opt-out: the shared key trusts the body user_id (no bound identity).
+    monkeypatch.setattr(settings, "neuralscape_legacy_key_trust_body_user_id", True)
     return {"Authorization": f"Bearer {SHARED_KEY}"}
 
 
@@ -620,7 +630,17 @@ class TestConnectorSyncIdentity:
                 return FakeJob(None), JobStatus.not_found
             return FakeJob(results.get(task_id)), JobStatus.complete
 
+        class _InFlight:
+            """A retained id is a run still in flight (queued): the sync coalesces onto it."""
+
+            def __init__(self, *a, **kw):
+                pass
+
+            async def status(self):
+                return JobStatus.queued
+
         ptm.pool.enqueue_job = enqueue_job
+        monkeypatch.setattr("task_manager.Job", _InFlight)
         monkeypatch.setattr(ptm, "_find_job", find_job)
         ptm.seen, ptm.results = seen, results
         return ptm
@@ -971,6 +991,7 @@ class TestConnectorSyncIdentity:
         class Pool:
             async def enqueue_job(self, fn, *args, _job_id=None, **kw):
                 seen.append(_job_id)
+                return MagicMock(job_id=_job_id)
 
         monkeypatch.setattr(settings, "connectors_enabled", True)
         await worker.connector_sync_cron({"vault": vault, "redis": Pool()})

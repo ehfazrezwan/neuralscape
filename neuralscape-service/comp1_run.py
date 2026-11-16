@@ -1,0 +1,429 @@
+"""Feature-preservation comparison: run preserved oracles against a baseline and a candidate tree.
+
+  python comp1_run.py run --baseline DIR --baseline-ref REF --candidate DIR --candidate-ref REF \
+      --inputs INPUTS_DIR --out OUT_DIR --run-id ID [--compose-project-baseline P --compose-project-candidate P
+      --compose-file FILE]
+
+Inputs (``INPUTS_DIR``) are the preserved oracles, copied byte for byte from their owner's branch:
+``evidence_registry.py`` (leaves and scenarios) and ``test_baseline_reproductions.py`` (strict expected
+failures and passing controls).  Nothing here edits an oracle: a tree that already carries one must carry
+the identical bytes, or that tree's run is an invalid attempt.
+
+Per tree it records, through the append-only ``EvidenceWriter``:
+
+* every registry scenario, judged from the pytest outcome of its named test, run in the tree's own
+  interpreter (``baseline_pass``/``known_failure`` on the baseline; ``candidate_pass`` or
+  ``unexpected_failure`` on a candidate; ``invalid_attempt`` when the run could not observe);
+* the persona scenarios (``persona_evidence``), unchanged;
+* the real-service scenarios (``comp1_realservice``) when compose projects are given, judged by their
+  own manifest-checked oracles, and a ``deferred`` record for every scenario that needs real stores
+  but cannot be observed without a live provider;
+* a surface inventory (REST routes, MCP tools, default-off flags) written beside the evidence.
+
+It computes no pass percentage.  The exit status is 0 whatever the verdicts (they are in the evidence file);
+``--fail-on-unexpected`` (off by default) makes it 1 when this run recorded an ``unexpected_failure``.  A usage
+problem, an oracle or identity refusal, or a compose project that is not disposable exits 2.
+
+A compose project is the parameter ``--compose-project-*``.  It is refused when it is the production project (any
+case, after trimming) or does not equal or start with a disposable prefix: ``nstest-`` or ``comp1-`` built in, more
+only by repeating ``--allow-project-prefix`` (never by environment; a prefix under 3 characters or one that could
+match ``neuralscape`` is refused).  The readiness probe stops and starts the vector store, so it runs only on a
+``comp1-`` project unless ``--allow-destructive-on-project`` is given (default off); otherwise it is recorded as an
+invalid attempt and no docker call is made.  Every docker call is scoped to the project
+with ``-p`` and the harness lists, inspects and reads stats of no other container.  Every
+address the real-service probe connects to must be loopback.  Both are refused before any docker or HTTP call.  Partial and invalid attempts are kept as records.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import importlib.util
+import json
+import os
+import shutil
+import subprocess
+import sys
+import xml.etree.ElementTree as ET
+from pathlib import Path
+
+import comp1_realservice
+import persona_evidence
+from evidence_records import EvidenceRecord, EvidenceWriter, RecordConflict, UnsafePath, compare, facts, render_report
+
+HERE = Path(__file__).resolve().parent
+REPRODUCTIONS = "test_baseline_reproductions.py"
+REALSERVICE_ORACLES = HERE / "tests" / "fixtures" / "realservice_oracles"
+PERSONA_ORACLES = HERE / "tests" / "fixtures" / "persona_oracles"
+
+# Scenarios that need real stores and a live provider (extraction, embeddings or graph episodes);
+# observed only at unit level here.  The backup scenario reads repository files and has no service.
+NEEDS_PROVIDER = {
+    "group-id-tuple-collision": "graph namespaces need graph episodes (live provider)",
+    "queued-visibility-publication": "graph enrichment needs a worker and a live provider",
+    "stale-revision-edit": "a concurrent edit needs a stored memory (live embeddings)",
+    "graph-removal-shared-support": "episode removal needs graph episodes (live provider)",
+}
+STATIC_ONLY = {"backup-covers-compose-volumes": "a repository check; there is no service to observe"}
+# Under the governed profile (ledger, authority store, enforcing policy) these legacy paths are
+# not the paths a write takes; the oracle is recorded as not applicable, naming the replacement
+# whose own tests are run and reported beside it.  Only paths shown to be replaced are listed.
+GOVERNED_REPLACED = {
+    "queued-visibility-publication": (
+        "governed writes publish through the publication fence, which re-reads the source's current visibility",
+        ("tests/test_v1_governed_memory.py::test_privacy_narrowing_between_stages_denies_only_the_derivative",
+         "tests/test_publication_fence.py"),
+    ),
+    "stale-revision-edit": (
+        "governed edits require If-Match with the expected revision; a stale one is refused",
+        ("tests/test_v1_governed_memory.py::test_a_stale_expected_revision_is_refused_and_writes_nothing",
+         "tests/test_v1_governed_memory.py::test_two_edits_naming_the_same_revision_cannot_both_commit"),
+    ),
+}
+
+
+def _python(tree: Path) -> str:
+    """The tree's own interpreter when it has one, else the harness's (a plain checkout or fixture tree)."""
+
+    own = tree / ".venv" / "bin" / "python"
+    return str(own) if own.exists() else sys.executable
+
+
+def _limited(command: list[str]) -> list[str]:
+    """Cap the child's address space where ``prlimit`` exists (Linux); elsewhere run it as given."""
+
+    return ["prlimit", "--as=8589934592", "--", *command] if shutil.which("prlimit") else command
+
+
+def sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def load_registry(inputs: Path):
+    spec = importlib.util.spec_from_file_location("comp1_registry", inputs / "evidence_registry.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)  # type: ignore[union-attr]
+    return module
+
+
+# ------------------------------------------------------------------ registry reproductions
+
+
+def _outcomes(junit: Path) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for case in ET.parse(junit).getroot().iter("testcase"):
+        name = case.get("name", "")
+        skipped, failure, error = case.find("skipped"), case.find("failure"), case.find("error")
+        if error is not None:
+            out[name] = "error"
+        elif failure is not None:
+            out[name] = "xpassed" if "XPASS(strict)" in (failure.get("message") or "") else "failed"
+        elif skipped is not None:
+            out[name] = "xfailed" if skipped.get("type") == "pytest.xfail" else "skipped"
+        else:
+            out[name] = "passed"
+    return out
+
+
+def run_replacements(tree: Path, test_ids: tuple[str, ...]) -> str:
+    """Run a replacement's own tests in ``tree``; returns a short outcome token.
+
+    The tests configure their own stores and settings, so they run without the profile's
+    environment (passing it in makes their fixtures see a second, conflicting configuration).
+    """
+
+    try:
+        done = subprocess.run(
+            _limited([_python(tree), "-m", "pytest", *test_ids, "-q", "-p", "no:cacheprovider"]),
+            cwd=str(tree), capture_output=True, text=True, timeout=900,
+        )
+    except subprocess.TimeoutExpired:
+        return "fail:timeout"
+    if not done.stdout.strip():
+        return "fail:no-output"  # a replacement that reports nothing is a failure, whatever its exit status
+    tail = done.stdout.strip().splitlines()[-1]
+    counts = "_".join(part.replace(" ", "-") for part in tail.split(" in ")[0].split(", "))
+    return ("pass" if done.returncode == 0 else "fail") + ":" + counts[:60]
+
+
+def run_reproductions(tree: Path, inputs: Path, junit: Path, env: dict[str, str] | None = None) -> tuple[dict[str, str], str]:
+    """Run the preserved reproductions inside ``tree``; returns (outcome per test, setup note)."""
+
+    source = inputs / REPRODUCTIONS
+    target = tree / "tests" / REPRODUCTIONS
+    placed = False
+    if not (tree / "tests").is_dir():
+        return {}, "the tree has no tests directory: not run"
+    if target.exists():
+        if sha256(target) != sha256(source):
+            return {}, "the tree carries a different copy of the reproductions (oracle edited): not run"
+    else:
+        shutil.copyfile(source, target)  # untracked copy in a disposable checkout, removed below
+        placed = True
+    try:
+        junit.unlink(missing_ok=True)  # a report left by an earlier run must never be read as this run's
+        try:
+            subprocess.run(
+                _limited([_python(tree), "-m", "pytest", f"tests/{REPRODUCTIONS}", "-q", "-p", "no:cacheprovider",
+                          f"--junitxml={junit}"]),
+                cwd=str(tree), capture_output=True, text=True, timeout=900, env={**os.environ, **(env or {})},
+            )
+        except subprocess.TimeoutExpired:
+            return {}, "pytest timed out"
+        if not junit.exists():
+            return {}, "pytest produced no report"
+        try:
+            return _outcomes(junit), ""
+        except ET.ParseError:
+            return {}, "pytest report unreadable"
+    finally:
+        if placed:
+            target.unlink()
+
+
+def judge_replaced(reason: str, test_ids: tuple[str, ...], outcome: str) -> tuple[str, str]:
+    """The verdict for an oracle whose legacy path the profile replaces.
+
+    It is ``not_applicable`` only while the replacement's own tests pass; a replacement that
+    fails (or reports nothing) is an ``unexpected_failure``, so a broken replacement can never
+    read as "legacy path replaced".
+    """
+
+    if outcome.startswith("pass:"):
+        return "not_applicable", (reason + "; replacement: " + ", ".join(test_ids))[:300]
+    return "unexpected_failure", (
+        f"the replacement tests fail ({outcome}): investigate; replacement: " + ", ".join(test_ids)
+    )[:300]
+
+
+def judge_reproduction(kind: str, role: str, outcome: str | None) -> tuple[str, str]:
+    if outcome is None:
+        return "invalid_attempt", "the scenario's test did not run"
+    if outcome in ("error", "skipped"):
+        return "invalid_attempt", f"pytest outcome {outcome}"
+    if kind == "expected-failure":
+        if role == "baseline":
+            return ("known_failure", "") if outcome == "xfailed" else (
+                "unexpected_failure", "the baseline no longer shows the documented failure: investigate")
+        if outcome == "xpassed":
+            return "candidate_pass", "the documented defect no longer reproduces (strict xfail passed)"
+        return "unexpected_failure", "the documented defect still reproduces on this candidate (not fixed here)"
+    if outcome == "passed":
+        return ("baseline_pass" if role == "baseline" else "candidate_pass"), ""
+    return "unexpected_failure", "a passing control fails: investigate, do not relabel"
+
+
+# ------------------------------------------------------------------ surface inventory
+
+_SURFACE_PROBE = r"""
+import json, os, sys, inspect
+sys.path.insert(0, os.getcwd())
+os.environ.setdefault("GOOGLE_API_KEY", "comp1-no-provider")
+os.environ.setdefault("NEO4J_PASSWORD", "comp1-no-store")
+out = {"rest": [], "mcp": [], "flags": {}, "errors": []}
+try:
+    import main
+    for route in main.app.routes:
+        methods = sorted(getattr(route, "methods", None) or [])
+        endpoint = getattr(route, "endpoint", None)
+        out["rest"].append({"path": getattr(route, "path", ""), "methods": methods,
+                            "endpoint": getattr(endpoint, "__name__", type(route).__name__)})
+except Exception as error:
+    out["errors"].append("main: " + type(error).__name__ + ": " + str(error)[:160])
+try:
+    import asyncio, mcp_server
+    lister = getattr(mcp_server, "list_tools", None)  # the low-level server's registered handler
+    if lister is None and getattr(mcp_server, "mcp", None) is not None:
+        lister = mcp_server.mcp.list_tools
+    tools = asyncio.run(lister()) if lister is not None else []
+    out["mcp"] = sorted(getattr(tool, "name", str(tool)) for tool in tools)
+    if not out["mcp"]:
+        out["errors"].append("mcp: no tool list found")
+except Exception as error:
+    out["errors"].append("mcp: " + type(error).__name__ + ": " + str(error)[:160])
+try:
+    from config import Settings
+    for name, field in Settings.model_fields.items():
+        if field.annotation is bool:
+            out["flags"][name] = field.default
+except Exception as error:
+    out["errors"].append("config: " + type(error).__name__ + ": " + str(error)[:160])
+print(json.dumps(out, sort_keys=True))
+"""
+
+
+def surface(tree: Path) -> dict:
+    try:
+        done = subprocess.run(
+            _limited([_python(tree), "-c", _SURFACE_PROBE]),
+            cwd=str(tree), capture_output=True, text=True, timeout=300,
+        )
+    except subprocess.TimeoutExpired:
+        return {"errors": ["surface probe timed out"]}
+    lines = [line for line in done.stdout.splitlines() if line.startswith("{")]
+    try:
+        return json.loads(lines[-1]) if lines else {"errors": ["surface probe failed: " + done.stderr[-300:]]}
+    except ValueError:
+        return {"errors": ["surface probe printed an unreadable result"]}
+
+
+# ------------------------------------------------------------------ runner
+
+
+def run(args: argparse.Namespace) -> list[EvidenceRecord]:
+    inputs, out = Path(args.inputs).resolve(), Path(args.out).resolve()  # children run in other directories
+    out.mkdir(parents=True, exist_ok=True)
+    registry = load_registry(inputs)
+    writer = EvidenceWriter(out / "evidence.jsonl", protected=[inputs / "evidence_registry.py", inputs / REPRODUCTIONS])
+    repro_sha = sha256(inputs / REPRODUCTIONS)
+    registry_sha = sha256(inputs / "evidence_registry.py")
+    trees = (("baseline", Path(args.baseline).resolve(), args.baseline_ref, args.compose_project_baseline),
+             ("candidate", Path(args.candidate).resolve(), args.candidate_ref, args.compose_project_candidate))
+    rs_oracles = persona_evidence.load_oracles(REALSERVICE_ORACLES)
+    candidate_env = dict(item.split("=", 1) for item in args.candidate_env)
+    governed = args.profile == "governed"
+    for role, tree, ref, project in trees:
+        env = candidate_env if role == "candidate" else {}
+        junit = out / f"reproductions-{role}.xml"
+        outcomes, setup_note = run_reproductions(tree, inputs, junit, env)
+        for scenario in registry.SCENARIOS:
+            verdict, note = judge_reproduction(scenario.kind, role, outcomes.get(scenario.test))
+            seen = {"pytest_outcome": outcomes.get(scenario.test, "not_run"), "stores": "unit_fakes",
+                    "profile": args.profile if role == "candidate" else "default"}
+            replaced = GOVERNED_REPLACED.get(scenario.id) if governed and role == "candidate" else None
+            if replaced is not None:
+                reason, test_ids = replaced
+                outcome = run_replacements(tree, test_ids) or "fail:no-output"
+                seen["replacement_tests"] = outcome
+                verdict, note = judge_replaced(reason, test_ids, outcome)
+            writer.write(EvidenceRecord(
+                schema_version="candidate-v1", record_id=f"{args.run_id}.{role}.{scenario.id}",
+                scenario_id=scenario.id, run_id=args.run_id, role=role, subject_ref=ref,
+                oracle_version=f"reproductions-{repro_sha[:12]}", oracle_sha256=repro_sha, verdict=verdict,
+                observed=facts(seen), note=(setup_note or note)[:300],
+            ))
+            reason = NEEDS_PROVIDER.get(scenario.id) or STATIC_ONLY.get(scenario.id)
+            if reason:
+                writer.write(EvidenceRecord(
+                    schema_version="candidate-v1", record_id=f"{args.run_id}.{role}.live-{scenario.id}",
+                    scenario_id=f"live-{scenario.id}", run_id=args.run_id, role=role, subject_ref=ref,
+                    oracle_version="registry-scenario", oracle_sha256=registry_sha,
+                    verdict="not_applicable" if scenario.id in STATIC_ONLY else "deferred",
+                    observed=facts({"real_service": "not_observed"}), note=reason,
+                ))
+        persona_evidence.run(tree, role, ref, PERSONA_ORACLES, out / "evidence.jsonl", args.run_id)
+        if project:
+            extra = args.candidate_realservice_args.split() if role == "candidate" else []
+            for prefix in args.allow_project_prefix:
+                extra += ["--allow-project-prefix", prefix]
+            if args.allow_destructive_on_project:
+                extra += ["--allow-destructive-on-project"]
+            observed = realservice(tree, project, args.compose_file, extra)
+            (out / f"realservice-{role}.json").write_text(json.dumps(observed, indent=1, sort_keys=True))
+            for scenario_id, (oracle, digest) in sorted(rs_oracles.items()):
+                key = scenario_id.removeprefix("rs-").replace("-", "_")
+                verdict, seen, note = persona_evidence.judge(role, observed.get(key, {"error": "not observed"}), oracle)
+                writer.write(EvidenceRecord(
+                    schema_version="candidate-v1", record_id=f"{args.run_id}.{role}.{scenario_id}",
+                    scenario_id=scenario_id, run_id=args.run_id, role=role, subject_ref=ref,
+                    oracle_version=oracle["oracle_version"], oracle_sha256=digest, verdict=verdict,
+                    observed=facts(seen), expected=facts(oracle["expected"][role]["facts"]), note=note,
+                ))
+        (out / f"surface-{role}.json").write_text(json.dumps(surface(tree), indent=1, sort_keys=True))
+    read = writer.read()
+    text = render_report(compare(read.records))
+    if read.invalid_lines or read.partial_tail:  # a damaged file must not read as a clean comparison
+        notes = ["", "## Evidence integrity", ""]
+        if read.invalid_lines:
+            notes.append(f"- {len(read.invalid_lines)} invalid line(s) at line number(s) "
+                         f"{', '.join(map(str, read.invalid_lines[:20]))}")
+        if read.partial_tail:
+            notes.append("- partial tail: the file ends without a newline (an interrupted append)")
+        notes.append("- this comparison is built from the valid records only and is incomplete")
+        text = text.rstrip("\n") + "\n" + "\n".join(notes) + "\n"
+    (out / "comparison.md").write_text(text)
+    return [record for record in read.records if record.run_id == args.run_id]
+
+
+def realservice(tree: Path, project: str, compose_file: str, extra: list[str] | None = None) -> dict:
+    try:
+        done = subprocess.run(
+            [sys.executable, str(HERE / "comp1_realservice.py"), "--service-dir", str(tree),
+             "--compose-project", project, "--compose-file", compose_file, *(extra or [])],
+            capture_output=True, text=True, timeout=900,
+        )
+    except subprocess.TimeoutExpired:
+        return {"job_keys": {"error": "probe timed out"}, "readiness": {"error": "probe timed out"}}
+    lines = [line for line in done.stdout.splitlines() if line.startswith("{")]
+    try:
+        return json.loads(lines[-1]) if lines else {"job_keys": {"error": "probe failed"}, "readiness": {"error": "probe failed"}}
+    except ValueError:
+        return {"job_keys": {"error": "probe failed"}, "readiness": {"error": "probe failed"}}
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser()
+    sub = parser.add_subparsers(dest="command", required=True)
+    runner = sub.add_parser("run")
+    for name in ("--baseline", "--baseline-ref", "--candidate", "--candidate-ref", "--inputs", "--out", "--run-id"):
+        runner.add_argument(name, required=True)
+    runner.add_argument("--compose-project-baseline")
+    runner.add_argument("--compose-project-candidate")
+    runner.add_argument("--compose-file")
+    runner.add_argument("--allow-project-prefix", action="append", default=[],
+                        help="an extra disposable compose-project prefix (repeatable; the built-in ones are "
+                             + ", ".join(comp1_realservice.DEFAULT_PROJECT_PREFIXES) + ")")
+    runner.add_argument("--allow-destructive-on-project", action="store_true",
+                        help="let the readiness probe stop and start the vector store of a project not named "
+                             + comp1_realservice.OWNED_PREFIX + "* (default: off; it is then recorded as an invalid attempt)")
+    runner.add_argument("--fail-on-unexpected", action="store_true",
+                        help="exit 1 when this run recorded an unexpected_failure (default: exit 0)")
+    runner.add_argument("--profile", default="default", choices=["default", "governed"])
+    runner.add_argument("--candidate-env", action="append", default=[], help="KEY=VALUE for the candidate")
+    runner.add_argument("--candidate-realservice-args", default="", help="extra probe arguments for the candidate")
+    args = parser.parse_args(argv)
+    problem = _check(args)
+    if problem:
+        print(f"error: {problem}", file=sys.stderr)
+        return 2
+    try:
+        records = run(args)
+    except (persona_evidence.RunIdentityConflict, persona_evidence.OracleError, RecordConflict, UnsafePath) as refusal:
+        print(f"error: {type(refusal).__name__}: {refusal}", file=sys.stderr)
+        return 2
+    if args.fail_on_unexpected and any(record.verdict == "unexpected_failure" for record in records):
+        return 1
+    return 0
+
+
+def _check(args: argparse.Namespace) -> str:
+    """The reason the arguments cannot be run, or an empty string."""
+
+    inputs = Path(args.inputs)
+    for name in ("evidence_registry.py", REPRODUCTIONS):
+        if not (inputs / name).is_file():
+            return f"the inputs directory has no {name}"
+    for name in ("baseline", "candidate"):
+        if not Path(getattr(args, name)).is_dir():
+            return f"--{name} is not a directory: {getattr(args, name)}"
+    for prefix in args.allow_project_prefix:
+        try:
+            comp1_realservice.check_prefix(prefix)
+        except comp1_realservice.UnsafeTarget as refusal:
+            return str(refusal)
+    for project in (args.compose_project_baseline, args.compose_project_candidate):
+        if project is not None:
+            try:
+                comp1_realservice.check_project(project, args.allow_project_prefix)
+            except comp1_realservice.UnsafeTarget as refusal:
+                return str(refusal)
+    for item in args.candidate_env:
+        if "=" not in item:
+            return f"--candidate-env needs KEY=VALUE, got {item!r}"
+    if (args.compose_project_baseline or args.compose_project_candidate) and not args.compose_file:
+        return "--compose-file is required with a compose project"
+    return ""
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

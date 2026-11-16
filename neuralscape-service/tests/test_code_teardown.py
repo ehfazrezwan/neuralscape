@@ -144,7 +144,7 @@ def test_teardown_code_space_routes_and_evicts_cache():
     try:
         with patch.object(code_dispatch, "resolve_code_engine", return_value=fake_engine):
             res = code_dispatch.teardown_code_space(
-                "code-native", "code--o--r", "u1", SimpleNamespace()
+                "code-native", "code--o--r", "o", SimpleNamespace()
             )
         assert res["deleted"] is True
         assert res["engine_result"] == {"nodes_deleted": 7}
@@ -163,7 +163,7 @@ def test_teardown_code_space_honors_engine_deleted_false():
     fake_engine.teardown.return_value = {"deleted": False, "reason": "no bound project"}
     with patch.object(code_dispatch, "resolve_code_engine", return_value=fake_engine):
         res = code_dispatch.teardown_code_space(
-            "code-cbm", "code--o--r", "u1", SimpleNamespace()
+            "code-cbm", "code--o--r", "o", SimpleNamespace()
         )
     assert res["deleted"] is False
     assert res["engine_result"]["reason"] == "no bound project"
@@ -174,6 +174,6 @@ def test_teardown_code_space_unbindable():
 
     with patch.object(code_dispatch, "resolve_code_engine", return_value=None):
         res = code_dispatch.teardown_code_space(
-            "code-native", "code--o--missing", "u1", SimpleNamespace()
+            "code-native", "code--o--missing", "o", SimpleNamespace()
         )
     assert res["deleted"] is False and "unbindable" in res["reason"]

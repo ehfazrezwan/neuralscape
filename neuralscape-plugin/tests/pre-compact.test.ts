@@ -132,6 +132,12 @@ describe("buildCompactSnapshotPayload", () => {
     expect(payload.source_type).toBe("tool_extraction");
   });
 
+  it("adds a session:<id> tag when the session is known, so a compaction finds its own snapshot", () => {
+    const payload = buildCompactSnapshotPayload("c", "user-1", "proj-1", WHEN, "sess-9");
+    expect(payload.tags).toEqual([COMPACT_SNAPSHOT_TAG, "session:sess-9"]);
+    expect(buildCompactSnapshotPayload("c", "user-1", "proj-1", WHEN, "unknown").tags).toEqual([COMPACT_SNAPSHOT_TAG]);
+  });
+
   it("scopes to project when a project id is present", () => {
     const payload = buildCompactSnapshotPayload("c", "user-1", "proj-1", WHEN);
     expect(payload.scope).toBe("project");

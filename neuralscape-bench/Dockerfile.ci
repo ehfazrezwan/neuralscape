@@ -8,7 +8,9 @@ WORKDIR /build
 COPY pyproject.toml README.md ./
 COPY neuralscape_bench ./neuralscape_bench
 COPY icebench ./icebench
+COPY trackb ./trackb
 COPY static ./static
+COPY scripts/service_baseline ./scripts/service_baseline
 
 RUN python -m pip install --no-cache-dir build \
     && python -m build --wheel --outdir /tmp/wheels \
@@ -40,12 +42,17 @@ RUN python -m pip install --no-cache-dir \
     "pytest>=8.0.0" \
     "pytest-asyncio>=0.23.0"
 
-# Only tests and their fixtures are copied. Package imports must resolve from
+# Only tests and their fixtures are copied (suites that live inside a package
+# and use relative imports run from the installed wheel instead; see
+# scripts/ci_run_suite.sh). Package imports must resolve from
 # the wheel installed in the runtime stage, never from a source checkout.
 COPY tests /test-suite/tests
 COPY icebench/tests /test-suite/icebench/tests
 COPY icebench/trackq/tests /test-suite/icebench/trackq/tests
 COPY icebench/tokensave/tests /test-suite/icebench/tokensave/tests
+# The skip gate, its manifest and the shared suite runner (see scripts/ci_run_suite.sh).
+COPY ci /test-suite/ci
+COPY scripts/ci_skip_gate.py scripts/ci_run_suite.sh /test-suite/scripts/
 
 WORKDIR /test-suite
-CMD ["sh", "-c", "set -eu; python -m pytest -q -p no:cacheprovider --import-mode=importlib -o asyncio_mode=auto --strict-config --strict-markers --junitxml=/tmp/bench-junit.xml tests icebench/tests icebench/trackq/tests icebench/tokensave/tests; python /usr/local/libexec/ci_wheel_smoke.py --assert-junit /tmp/bench-junit.xml"]
+CMD ["sh", "scripts/ci_run_suite.sh", "/tmp/bench-junit.xml", "/usr/local/libexec/ci_wheel_smoke.py"]

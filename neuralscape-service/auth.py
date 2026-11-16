@@ -10,9 +10,14 @@ Supports two token formats simultaneously:
 
 2. **Legacy shared API key** (single-user / pre-multi-user installs):
    one segment, opaque string. Validated against ``NEURALSCAPE_API_KEY``.
-   When this path matches, ``request.state.user_id`` is **not** set
-   (routes must fall back to body ``user_id``), and a deprecation
-   warning header is added to the response.
+   When this path matches, the key acts as ONE identity:
+   ``NEURALSCAPE_API_KEY_USER_ID`` if set, else ``DEFAULT_USER_ID``. That user
+   is attached to ``request.state.user_id`` and ``current_user_id`` just like a
+   per-user token, so a body/query ``user_id`` naming anyone else gets HTTP 400
+   and MCP ignores ``arguments["user_id"]``. Setting
+   ``NEURALSCAPE_LEGACY_KEY_TRUST_BODY_USER_ID=true`` restores the old
+   behaviour (``request.state.user_id`` not set; routes trust the body). A
+   deprecation warning header is added to every legacy-key response.
 
 Auth is fail-closed. When neither secret is configured, startup refuses
 (``Settings.validate_required``) and this middleware rejects every non-public
@@ -24,6 +29,7 @@ Public paths (``/health``, ``/health/live``, ``/.well-known/*``, ``/oauth/*``)
 always bypass auth.
 """
 
+import asyncio
 import hmac
 import logging
 from contextvars import ContextVar
@@ -33,7 +39,12 @@ from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from config import settings
-from tokens import issue_user_token, verify_user_token  # noqa: F401 (re-export)
+from tokens import (  # noqa: F401 (re-export)
+    issue_user_token,
+    refresh_revocations,
+    revocation_cold_unavailable,
+    verify_user_token,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -41,11 +52,17 @@ logger = logging.getLogger(__name__)
 # is verified. Lets the MCP tool layer — which only receives a tool-arguments
 # dict, not the HTTP request — scope operations to the authenticated user
 # without the model having to pass `user_id`. Default None = unauthenticated
-# or legacy shared-key (fall back to the request body / arguments).
+# (or the legacy-key opt-out): fall back to the request body / arguments.
 current_user_id: ContextVar[str | None] = ContextVar("current_user_id", default=None)
+# True while a request authenticated with the legacy shared key is being served, so the MCP layer (which
+# only sees ``current_user_id``) can tell that identity from a per-user token's.
+current_legacy_shared: ContextVar[bool] = ContextVar("current_legacy_shared", default=False)
 
 # Paths that never require authentication
-PUBLIC_PATHS = {"/health", "/health/live"}
+# The refresh endpoint authenticates by the single-use refresh token in its body
+# (an expired access token cannot be required to obtain a new one); the handler
+# is a 404 (not 401) unless CREDENTIALS_ENABLED and NS_POLICY_MODE=enforce.
+PUBLIC_PATHS = {"/health", "/health/live", "/v1/credentials/refresh"}
 # Path prefixes that never require auth: OAuth discovery metadata and the
 # Authorization Server endpoints themselves (the consent page, DCR, token
 # exchange). These are the public front door of the OAuth flow.
@@ -119,7 +136,12 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
         token_secret = settings.neuralscape_user_token_secret
         legacy_key = settings.neuralscape_api_key
         path = request.url.path
-        if not token_secret and not legacy_key:
+        # Scoped credentials (off unless CREDENTIALS_ENABLED and policy
+        # enforcement is on) make authentication mandatory.
+        import credentials
+
+        scoped_enabled = credentials.accepts_scoped_credentials()
+        if not token_secret and not legacy_key and not scoped_enabled:
             # The ONLY unauthenticated pass-through: an explicit operator
             # opt-out (startup logs a WARNING for it). Never a silent default.
             if settings.neuralscape_auth_disabled:
@@ -143,6 +165,12 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
             return self._unauthorized(request, "Missing or invalid Authorization header")
         token = auth_header[7:]  # strip "Bearer "
 
+        # New scoped credential format, alongside the existing tokens.  A token
+        # in this format that does not verify is rejected outright; it never
+        # falls through to the shared-key comparison.
+        if scoped_enabled and token.startswith(credentials.ACCESS_PREFIX):
+            return await self._scoped_credential(request, call_next, token)
+
         # Try the per-user HMAC token path first (preferred). The token
         # carries the user_id we attach to request.state for downstream
         # routes to use authoritatively. If verification fails (bad
@@ -151,7 +179,22 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
         # legacy shared keys that happen to contain a `.` character
         # (the only signal we use to detect token shape).
         if token_secret and "." in token:
+            # Pick up revocations written to Redis since the last request
+            # (cached; at most one Redis read per REVOCATION_REFRESH_INTERVAL_SECONDS).
+            await refresh_revocations()
             payload = verify_user_token(token, token_secret)
+            if payload is not None and revocation_cold_unavailable():
+                # A valid, env-list-clean token but no successful Redis load yet:
+                # we cannot tell whether it was revoked live. Refuse with 503
+                # (retry), never 401, so clients keep their credentials.
+                return JSONResponse(
+                    status_code=503,
+                    headers={"Retry-After": "1"},
+                    content={
+                        "detail": "Token revocation state is unavailable (the revocation "
+                        "store has not been reachable since startup); retry shortly."
+                    },
+                )
             if payload is not None:
                 request.state.user_id = payload["user_id"]
                 request.state.auth_mode = "user_token"
@@ -163,16 +206,66 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
                     current_user_id.reset(ctx_token)
             # else: HMAC verify failed — fall through to legacy check.
 
-        # Fall back to the legacy shared API key. user_id is NOT set on
-        # request.state — routes must read it from the request body
-        # (trust-based, pre-multi-user behavior).
-        if legacy_key and hmac.compare_digest(token, legacy_key):
+        # Fall back to the legacy shared API key. By default the key acts as
+        # ONE identity (NEURALSCAPE_API_KEY_USER_ID, else DEFAULT_USER_ID): that
+        # user is bound to request.state and the MCP ContextVar exactly like a
+        # per-user token, so a body/query user_id naming anyone else is a 400.
+        # NEURALSCAPE_LEGACY_KEY_TRUST_BODY_USER_ID=true restores the old
+        # trust-the-body behaviour (no identity bound).
+        # Compare as bytes: compare_digest on str raises TypeError for non-ASCII.
+        if legacy_key and hmac.compare_digest(
+            token.encode("utf-8"), legacy_key.encode("utf-8")
+        ):
             request.state.auth_mode = "legacy_shared"
-            response = await call_next(request)
+            shared_token = current_legacy_shared.set(True)
+            try:
+                if settings.neuralscape_legacy_key_trust_body_user_id:
+                    response = await call_next(request)
+                else:
+                    bound_user_id = settings.legacy_key_identity()
+                    request.state.user_id = bound_user_id
+                    ctx_token = current_user_id.set(bound_user_id)
+                    try:
+                        response = await call_next(request)
+                    finally:
+                        current_user_id.reset(ctx_token)
+            finally:
+                current_legacy_shared.reset(shared_token)
             response.headers[DEPRECATION_HEADER] = DEPRECATION_MSG
             return response
 
         return self._unauthorized(request, "Invalid or expired token")
+
+    async def _scoped_credential(self, request: Request, call_next, token: str):
+        import credentials
+
+        service = credentials.get_service()
+        if service is None:
+            return JSONResponse(status_code=503, content={"detail": "credential service unavailable"})
+        try:
+            # Synchronous SQLite/psycopg I/O: off the event loop.
+            verified = await asyncio.to_thread(service.verify_access, token)
+        except credentials.AuthorityUnavailable:
+            return JSONResponse(status_code=503, content={"detail": "credential service unavailable"})
+        if verified is None:
+            return self._unauthorized(request, "Invalid or expired token")
+        # Downstream code (memory reads and writes, task ownership) sees the ``user_id`` the subject's
+        # rows are keyed by: the bound legacy id, or the subject id itself when there is none.  The
+        # policy layer still identifies the principal by ``request.state.credential``.
+        try:
+            memory_user = await asyncio.to_thread(service.memory_user_id, verified.subject_id)
+        except credentials.AuthorityUnavailable:
+            return JSONResponse(status_code=503, content={"detail": "credential service unavailable"})
+        request.state.user_id = memory_user
+        request.state.auth_mode = "scoped_credential"
+        request.state.credential = verified
+        user_token = current_user_id.set(memory_user)
+        credential_token = credentials.current_credential.set(verified)
+        try:
+            return await call_next(request)
+        finally:
+            credentials.current_credential.reset(credential_token)
+            current_user_id.reset(user_token)
 
     def _unauthorized(self, request: Request, detail: str) -> JSONResponse:
         """401 response, carrying an RFC 9728 ``WWW-Authenticate`` header.

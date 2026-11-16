@@ -10,7 +10,7 @@ The service **refuses to start** unless one of these is set:
 | Setting | Use |
 |---|---|
 | `NEURALSCAPE_USER_TOKEN_SECRET` | Per-user HMAC tokens (recommended; also enables the OAuth connector with `NEURALSCAPE_PUBLIC_URL`) |
-| `NEURALSCAPE_API_KEY` | Legacy single shared key (deprecated, still honoured) |
+| `NEURALSCAPE_API_KEY` | Legacy single shared key (deprecated, still honoured; acts as one bound identity, see [Legacy shared key](#legacy-shared-key-one-identity)) |
 | `NEURALSCAPE_AUTH_DISABLED=true` | No authentication at all. Trusted local machine only |
 
 With neither secret set and no opt-out, startup fails with
@@ -33,6 +33,14 @@ it. The ARQ workers likewise open no inbound port.
    discovery metadata. This is what Claude Cowork / claude.ai talk to (the
    connector UI is OAuth-only). **It does not change** when you switch login
    providers.
+
+   Refresh tokens are single-use and bound to the client that got them. Each
+   refresh returns a new token in the same family. If an already-used refresh
+   token is presented again, the whole family is revoked and the user reconnects.
+   There is no grace window, so a client that retries a refresh after a lost
+   response also has its session revoked (OAuth 2.0 Security BCP reuse
+   detection). The single-use and revocation markers live in Redis; if Redis is
+   down, `/oauth/token` answers 503 `temporarily_unavailable` and issues nothing.
 
 2. **The human-login step** — the one screen inside `/oauth/authorize` where a
    person proves who they are. This is the *only* thing `AUTH_PROVIDER` swaps.
@@ -83,6 +91,22 @@ hidden and `POST /oauth/authorize` rejects token submits). It's always shown for
    to an existing id, **preserving memories already stored under that id**.
 2. **Slug** — everyone else gets a deterministic slug:
    `alice.smith@example.com` → `alice.smith-example.com`.
+   The slug is lossy (`a+b@x.com` and `a-b@x.com` both give `a-b-x.com`), so a
+   **first login whose slug is already linked to a different sub/email (or seeded
+   in `AUTH_IDENTITY_MAP` for another email) gets `<slug>-<8 hex of sha256(email)>`
+   instead** (`login_providers.provision_user_id`, checked when the link page is
+   shown and again when `/oauth/link` provisions it). Existing links and the
+   first claimant keep the plain slug, so no existing id changes. The claim is
+   reserved atomically in Redis (`ns:identity:owner`, HSETNX), so two simultaneous
+   first logins cannot both take one slug. **Fails closed:** if Redis is
+   unreachable, a login that is not already resolved by the `AUTH_IDENTITY_MAP`
+   seed gets a 503 "identity store unavailable, try again" page (already-linked
+   users also wait, since the link lives in the same Redis); nobody is guessed
+   onto a plain slug. The check sees links, reservations and the seed, not
+   memories, so **before enabling**, backfill users who have memories under a slug
+   but were never linked:
+   `uv run python scripts/identity.py backfill --from-env --file users.txt`
+   (lines `email:user_id`; dry-run by default, add `--apply`).
 
 > **Migration:** if memories are already keyed by short ids (e.g. `alice`),
 > map those people in `AUTH_IDENTITY_MAP` before flipping a provider on, or
@@ -100,6 +124,134 @@ is tolerated. **An empty allowlist denies everyone (fail-closed).**
   applied as an *extra* gate only when configured.
 
 ---
+
+## Legacy shared key: one identity
+
+`NEURALSCAPE_API_KEY` is **deprecated** (no removal date is set). Every response
+to a caller using it carries an `X-Neuralscape-Deprecation` header. Prefer
+per-user tokens.
+
+The shared key acts as **one user**, not as anyone the caller names:
+
+| Setting | Meaning |
+|---|---|
+| `NEURALSCAPE_API_KEY_USER_ID` | The user the key acts as. Empty means `DEFAULT_USER_ID`. |
+| `NEURALSCAPE_LEGACY_KEY_TRUST_BODY_USER_ID` | `true` restores the old behaviour (key may act as any body/query `user_id`). Default `false`. A WARNING is logged at startup when on. |
+
+With the default, the middleware binds the key to that user exactly like a
+per-user token: a request whose body or query `user_id` names anyone else gets
+**HTTP 400**; a request with no `user_id` acts as the bound user; MCP ignores
+`arguments["user_id"]`; task status is readable only for tasks that user
+enqueued. The key holder is also an admin when `DICTATOR_USER_IDS` is empty and
+the bound user is the default user.
+
+> **Upgrade note.** Before upgrading, operators who use the shared key on
+> behalf of a specific user (for example a plugin whose configured user id is
+> `alice`) must set `NEURALSCAPE_API_KEY_USER_ID=alice`, otherwise the key is
+> bound to `DEFAULT_USER_ID` and calls naming `alice` fail with 400. If one key
+> serves several users, set `NEURALSCAPE_LEGACY_KEY_TRUST_BODY_USER_ID=true`
+> until each user has their own token (`scripts/issue_user_token.py`).
+
+## Token revocation
+
+A per-user token is valid until it expires (forever, for one issued with
+`--no-expiry`). Revoking works on the token's SHA-256 digest; the token itself
+is never stored or printed. Two lists are enforced together (their union):
+
+1. **Live, no restart: the Redis set `ns:auth:revoked_tokens`.**
+
+   ```bash
+   printf '%s' "$LEAKED_TOKEN" | python scripts/revoke_token.py --redis      # revoke
+   printf '%s' "$LEAKED_TOKEN" | python scripts/revoke_token.py --unrevoke   # undo
+   python scripts/revoke_token.py --digest <sha256-hex> --unrevoke          # undo without the token
+   python scripts/revoke_token.py --list                                    # show revoked digests
+   ```
+
+   The script uses `REDIS_URL`. Every API process re-reads the set at most every
+   `REVOCATION_REFRESH_INTERVAL_SECONDS` (default 5; 0 = on every request), so a
+   revocation takes effect on all instances within that many seconds, and a
+   request costs no Redis round trip while the cached snapshot is fresh.
+2. **Static fallback: `NEURALSCAPE_REVOKED_TOKENS=<digest>[,<digest>...]`**
+   (digest printed by `python scripts/revoke_token.py`; needs a restart). It is
+   always honoured, whatever state Redis is in.
+
+A revoked token is rejected with 401 on REST and MCP, and cannot be pasted into
+the OAuth consent screen. If the env list cannot be parsed, per-user tokens are
+rejected (fail closed).
+
+**When Redis is unreachable** (exact semantics):
+
+- The env list is still enforced.
+- After at least one successful read, the in-process snapshot keeps being
+  enforced: everything revoked up to the outage stays revoked. A revocation
+  made during the outage is not seen until Redis is back (at most one interval
+  after it returns).
+- **Cold start** (the process has not yet completed one successful read of the
+  Redis set): by default (`REVOCATION_FAIL_CLOSED_ON_COLD_START=true`) a valid
+  per-user token gets **503 with `Retry-After: 1`**, not 401, so clients retry
+  and keep their credentials. A token on the env list is still 401, an invalid
+  token still 401, and the public paths (`/health`, `/health/live`,
+  `/.well-known/*`, `/oauth/*`) and the legacy shared key are unaffected. The
+  first load is attempted at startup in the background with a short backoff
+  (and again by requests every `REVOCATION_COLD_RETRY_SECONDS`, default 1), so a
+  start where Redis is healthy never shows the 503 window. Once one load has
+  succeeded, a later outage keeps the last snapshot (above). The detailed
+  `/health` reports `checks.revocation`: `ok`, `unavailable` (cold start, no load
+  yet) or `stale` (loaded, Redis down now). The key is absent only when no
+  per-user token secret is set or `REDIS_URL` is explicitly empty; note that
+  `REDIS_URL` defaults to `redis://localhost:6379`, so a deployment with per-user
+  tokens and no Redis at all gets 503 on every per-user call (Redis is required
+  anyway). Set `REVOCATION_FAIL_CLOSED_ON_COLD_START=false` for such a setup.
+  The OAuth consent paste, the link step and token redemption (code and refresh
+  grants) refuse with 503 `temporarily_unavailable` (same `Retry-After`) during
+  the cold-start window too, so a token revoked in Redis cannot be pasted before
+  the first load.
+  Startup logs a WARNING when it begins without revocation state and another when
+  the first load succeeds. Set the flag to `false` to fail open on the Redis list
+  instead (warning only, env list still enforced).
+- After a failed read the next attempt waits one interval, so an outage adds one
+  short connect timeout (`REVOCATION_REDIS_TIMEOUT_SECONDS`, default 1) per
+  interval, not per request. The warning is logged once per outage window.
+
+Staleness bound: a revocation is enforced at most
+`REVOCATION_REFRESH_INTERVAL_SECONDS` after it is written (plus the request
+that triggers the refresh), per API process.
+
+**OAuth sessions.** Authorization codes, access tokens and refresh tokens carry a
+`src` claim: the digest of the credential the human logged in with (the pasted
+token) or, for Google/Supabase logins, of the identity (`identity_fingerprint`,
+printed by `revoke_token.py --identity <provider>:<user_id>`). `src` is carried
+across refresh rotation. Revoking that digest (live or env list) ends every
+session minted from it: access tokens are 401, refresh and code grants are
+`invalid_grant`. Revoking an OAuth access or refresh token directly works by its
+own digest; revoking a refresh token also revokes its family (the same
+`oauth:revoked_family:<fam>` key #495 uses on reuse), so its successors die too.
+Sessions minted before this change carry no `src` and are covered only by their
+own digests. Unrevoking a refresh token does not resurrect its family.
+
+**Redis durability.** The live denylist exists only in Redis. If Redis loses
+its data (restart without persistence, a flush, a replaced volume), every live
+revocation is forgotten and those tokens work again (API processes drop them
+once their snapshot is refreshed from the now-empty set, or keep them until
+restart if Redis stays down). Run Redis with persistence (`appendonly yes`, or
+RDB snapshots) if you rely on live revocation, and put any digest that must
+never come back in `NEURALSCAPE_REVOKED_TOKENS`: the env list is the durable
+fallback and survives Redis loss. `revoke_token.py --list` shows what the set
+holds.
+
+**The legacy shared key is not covered.** Digest revocation applies to per-user
+tokens (and the OAuth sessions derived from them). A leaked
+`NEURALSCAPE_API_KEY` cannot be revoked by digest: rotate the key and restart.
+
+Limits, plainly:
+
+- It covers the exact token string only (a fresh token for the same user is a
+  different token), plus every OAuth session derived from it (below).
+- Rotate `NEURALSCAPE_USER_TOKEN_SECRET` to invalidate every token.
+- Existing non-expiring tokens keep verifying unless revoked or the secret rotates.
+
+`scripts/issue_user_token.py --days N` requires `N >= 1`; a token with no
+expiry needs the explicit `--no-expiry` flag.
 
 ## Setup: `AUTH_PROVIDER=token` (default)
 
@@ -142,7 +294,10 @@ docker compose exec neuralscape python scripts/issue_user_token.py --user alice 
 2. **Allowlist hook:** run [`neuralscape-service/supabase/allowlist_hook.sql`](neuralscape-service/supabase/allowlist_hook.sql)
    in the SQL editor. It creates `signup_email_domains` / `signup_email_addresses`,
    seeds a placeholder `example.com` (replace it), and defines
-   `public.hook_restrict_signup` (default-deny). Then **Authentication → Hooks → Before User Created →
+   `public.hook_restrict_signup` (default-deny). Both tables have row-level
+   security on and no `anon`/`authenticated` access (PostgREST cannot read or
+   edit the allowlist); re-running the script on an older install applies this.
+   Then **Authentication → Hooks → Before User Created →
    Postgres → select `hook_restrict_signup` → Enable.**
    - Add/remove access later with plain SQL — no redeploy:
      ```sql

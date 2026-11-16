@@ -28,6 +28,10 @@ class Suite:
     source: str                     # canonical dataset origin (URL / repo)
     license_note: str = ""
     default_options: dict = field(default_factory=dict)
+    # Non-empty ⇒ retrieval R@k cannot be measured on this suite (the dataset
+    # carries no session-level evidence the lexical attribution can match).
+    # Reports print "n/a (incompatible: <reason>)" instead of a number.
+    retrieval_incompatible: str = ""
 
 
 def get_suite(name: str) -> Suite:

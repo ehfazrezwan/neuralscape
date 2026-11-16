@@ -17,6 +17,8 @@ annotations exist → retrieval R@k is skipped for this suite.
 
 from __future__ import annotations
 
+import re
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from neuralscape_bench.accuracy.download import fetch_file, hf_resolve_url, read_jsonl
@@ -26,6 +28,27 @@ from neuralscape_bench.accuracy.suites import Suite
 
 HF_REPO = "MemGPT/MSC-Self-Instruct"
 FILENAME = "msc_self_instruct.jsonl"
+
+# Deterministic event-time anchor for the FINAL session of every DMR
+# conversation. A fixed past constant (not ingest-time "now") so occurred_at
+# — which participates in the service's deterministic enqueue job key — is
+# identical across resumes and re-runs. Previous sessions sit time_back
+# earlier, per dataset semantics ("N hours/days ago" relative to the final
+# session).
+DMR_ANCHOR = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+
+# "ago" optional: the dataset writes "3 days ago", some records just "3 days".
+_TIME_BACK = re.compile(r"(\d+)\s*(hour|day|week|month|year)s?(?:\s*ago)?", re.I)
+_UNIT_HOURS = {"hour": 1, "day": 24, "week": 24 * 7, "month": 24 * 30, "year": 24 * 365}
+
+
+def _occurred_at_from(time_back: str | None) -> str:
+    """Anchor-relative ISO event time; unparseable/absent ⇒ the anchor itself."""
+    m = _TIME_BACK.search(str(time_back or ""))
+    if not m:
+        return DMR_ANCHOR.isoformat()
+    hours = int(m.group(1)) * _UNIT_HOURS[m.group(2).lower()]
+    return (DMR_ANCHOR - timedelta(hours=hours)).isoformat()
 
 
 def fetch(dest_dir: Path) -> dict:
@@ -44,9 +67,13 @@ def _turns_from(dialog: list[dict]) -> list[Turn]:
         if not text:
             continue
         speaker = t.get("id") or ("Speaker 1" if i % 2 == 0 else "Speaker 2")
+        # Identity travels on the role field only. Prefixing the text with
+        # "Speaker N:" too gave the extractor a second, literal channel it
+        # sometimes latched onto, distilling unresolvable "Speaker 2 ..."
+        # memories (run-3 failure analysis, 2026-07-05).
         turns.append(Turn(
             role="user" if speaker == "Speaker 1" else "assistant",
-            content=f"{speaker}: {text}",
+            content=text,
             speaker=speaker,
         ))
     return turns
@@ -66,10 +93,14 @@ def parse(records: list[dict]) -> SuiteData:
                     session_id=f"s{si + 1}",
                     turns=tuple(turns),
                     date=f"{time_back} before the final session" if time_back else None,
+                    occurred_at=_occurred_at_from(time_back),
                 ))
         final = _turns_from(rec.get("dialog", []))
         if final:
-            sessions.append(Session(session_id=f"s{len(sessions) + 1}", turns=tuple(final)))
+            sessions.append(Session(
+                session_id=f"s{len(sessions) + 1}", turns=tuple(final),
+                occurred_at=DMR_ANCHOR.isoformat(),
+            ))
 
         si_pair = rec.get("self_instruct", {}) or {}
         question = (si_pair.get("B") or "").strip()

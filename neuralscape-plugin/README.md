@@ -6,6 +6,14 @@ Persistent agentic memory for **Claude Code** and **Claude Cowork**, backed by y
 - **Where it stores:** in your own Neuralscape deployment. The plugin never sends data anywhere else.
 - **Cost:** zero additional. The plugin is a thin client over your service.
 
+> **Forking or self-hosting? Read this first.** The connector URL baked into
+> `.mcp.json` in this repository is the upstream channel's service. A fork or a
+> copy installed as is talks to *that* URL by default. Before you publish or
+> install your own copy, bake your URL: `npm run bake -- --url https://your-host`
+> (see **Distribution & self-hosting** below), and verify what is baked with
+> `npm run bake -- --check`. If `USER_ID` is unset the hooks identify as your OS
+> login name; against a non-local service SessionStart tells you so.
+
 ## 60-second install (Claude Code)
 
 ```text
@@ -83,6 +91,14 @@ npm run bake -- --url https://your-host --marketplace-name acme-plugins --owner 
 Then commit the result to your channel's repo (marketplace installs pull raw
 from git — there's no build step, so the baked value must be committed).
 
+**Verify what is baked** (writes nothing; shows the connector URL and the API
+base the hooks derive from it):
+
+```bash
+npm run bake -- --check
+npm run bake -- --check --expect https://your-host   # exit 1 if it differs (for your fork's CI)
+```
+
 **Enable OAuth on your service** (required; the connector is OAuth-only, no API
 key). It's a thin wrapper over the token you already issue — no user database,
 no OAuth app registration:
@@ -97,12 +113,12 @@ dynamic client registration and PKCE are automatic.
 ## What gets installed
 
 ```
-.claude/plugins/cache/neuralscape-plugins/neuralscape/2.4.0/
+.claude/plugins/cache/neuralscape-plugins/neuralscape/<version>/
 ├── .claude-plugin/plugin.json    manifest with userConfig (hooks) prompts
 ├── .mcp.json                      bundled OAuth MCP connector at the baked <URL>/mcp/
-├── hooks/hooks.json               SessionStart, PreToolUse (Read), PostToolUse, UserPromptSubmit, Stop, SessionEnd
-├── skills/{recall,remember,save-session,project,search,ns-status,ns-config,sync,capture,compile-observations}/SKILL.md
-├── scripts/                       built hook bundles
+├── hooks/hooks.json               seven events: SessionStart, PreToolUse (Read), PostToolUse, UserPromptSubmit, PreCompact, Stop, SessionEnd
+├── skills/{recall,remember,save-session,project,search,ns-status,ns-config,sync,capture,compile-observations,ingest,process}/SKILL.md
+├── scripts/                       built hook bundles (eight: one per hook, plus conversation-turn for OpenClaw/generic clients)
 └── LICENSE / CHANGELOG.md
 ```
 
@@ -110,15 +126,15 @@ The plugin reaches your service via these calls:
 
 | Trigger | Endpoint | Purpose |
 |---|---|---|
-| SessionStart | `GET /v1/context/{project_id}` or `/v1/context/global` (+ `GET /v1/extensions/dreaming/card`, `GET /v1/code-graph/query` probe) | **Index mode (default):** inject a day-grouped, budget-bounded memory *index* (`#id \| time \| type \| title \| ~tokens`) with a savings header, the identity card(s) when the dreaming sweep has built them, a "Previously…" block from the last session note, and an escalation footer teaching `recall_memories(index_only=true)` → `get_memories(ids=[...])` → `timeline`. `CONTEXT_MODE=full` restores legacy full-content injection. Also flags any pending observation buffers from prior sessions. |
+| SessionStart | `GET /v1/context/{project_id}` or `/v1/context/global` (+ `GET /v1/extensions/dreaming/card`, `GET /v1/code-graph/query` probe) | **Index mode (default):** inject a day-grouped, budget-bounded memory *index* (`#id \| time \| type \| title \| ~tokens`) with a savings header, the identity card(s) when the dreaming sweep has built them, a "Previously…" block from the last session note, and an escalation footer teaching `recall_memories(index_only=true)` → `get_memories(ids=[...])` → `timeline`. `CONTEXT_MODE=full` restores legacy full-content injection. `CONTEXT_MODE=assemble` (opt-in) also calls `POST /v1/context/assemble` for a token-budgeted bundle (identity card, session summary, recent session messages, relevant-memory rows) shown under "Session context (assembled…)"; standards, "Resuming after compaction" and "Previously…" are unchanged, the cards and the rows the bundle already shows are not repeated in the index, and any failure of the route (older server 404, 4xx, 5xx, network) falls back to the plain index. Also flags pending observation buffers from other sessions, but only finished ones: a buffer is offered for compilation when its session wrote a `.ended` marker (SessionEnd) that is not older than the buffer's last write, or when it has been idle for 12 hours (`PENDING_IDLE_HOURS`; covers crashed sessions). A live buffer of another terminal is never offered. Markers left by plugin versions up to 2.9.3 (`.stale`) are ignored and removed. |
 | PreToolUse (Read) | `GET /v1/memories?fields=index` (newest-first, project-scoped, once per session) | **File Read Gate (steering):** when the target file is larger than `READ_GATE_MIN_BYTES` and stored memories reference it (path-tail match, at least `dir/basename`), the hook injects `additionalContext` with a ranked per-file memory timeline (`#id \| when \| title \| ~tokens`) plus an escalation menu (`get_memories` → `timeline`) — **the Read always proceeds**. The index fetch happens at most once per session (cached), under a hard time budget; steering fires at most once per file per session. |
 | PostToolUse | (none — local file write) | Append `{tool, input, output, ts, project_id}` to per-session JSONL buffer. Filters read-only tools, harness plumbing (`SKIP_TOOLS`), and trivial Bash commands; truncates large outputs. |
 | UserPromptSubmit | (none — local check) | When the buffer crosses the threshold (default 25 obs or 30 min old), prepends an `additionalContext` instruction asking Claude to compile the buffer using the `compile-observations` skill before responding. |
 | compile-observations skill | `POST /v1/memories/raw` (via `mcp__plugin_neuralscape_neuralscape__remember`) | Claude reads the buffer, applies the quality rubric, and submits one wiki-quality memory per significant work unit. Backend embeds and stores — **no Gemini call**. |
 | Stop (per turn) | `POST /v1/extensions/conversation-compiler/flush` | Stream each user/assistant pair to Gemini extraction (legacy conversation-driven memory). |
 | Stop (after flush) | `POST /v1/extensions/conversation-compiler/compile` | Synthesize the day's facts into Sessions/Decisions/Research articles. |
-| Stop (after compile) | (none — local marker) | Drop a `.stale` marker next to any non-empty observation buffer so the next SessionStart compiles it even if no further user prompts were sent. |
-| SessionEnd | `POST /v1/checkpoint` | Distill the whole session (transcript + observation buffer, deterministic — no LLM) into a structured `{request, investigated, learned, completed, next_steps}` note and store it as ONE checkpoint `session_note`. The next SessionStart renders it as the "Previously…" block, next steps first. Fires once per session (clear/logout/exit), not per turn. |
+| PreCompact | `POST /v1/memories/raw` (+ local copy) | Store ONE small `task_context` "compact snapshot" memory (tagged `compact_snapshot` and `session:<id>`) and keep a copy next to the observation buffers as `<session>.compact-snapshot.json`. The following SessionStart (`compact` / `resume` / `fork`) renders only that session's own (or its predecessor session's) snapshots under "Resuming after compaction". Never blocks the compact. |
+| SessionEnd | `POST /v1/checkpoint` (+ local marker) | Write the `<buffer>.jsonl.ended` marker next to the session's observation buffer (once, before any network call), then distill the whole session (transcript + observation buffer, deterministic — no LLM) into a structured `{request, investigated, learned, completed, next_steps}` note and store it as ONE checkpoint `session_note`. The next SessionStart renders it as the "Previously…" block, next steps first. Fires once per session (clear/logout/exit), not per turn. |
 
 ### Where extraction happens
 
@@ -146,7 +162,7 @@ Claude Cowork loads plugin **skills** but runs no hooks. The MCP-driven skills a
 
 ## MCP tools (auto-wired)
 
-Installing the plugin enables eight MCP tools backed by your Neuralscape service:
+Installing the plugin connects your client to your Neuralscape service's MCP server, which exposes 26 core tools (plus 7 code-graph tools when the server has the optional `code-graph` extra installed; run `tools/list` for the live set). The most-used ones:
 
 | Tool | Purpose |
 |---|---|
@@ -161,16 +177,63 @@ Installing the plugin enables eight MCP tools backed by your Neuralscape service
 
 These are reachable from any MCP client that picks up your plugin's `.mcp.json`. The transport is Streamable HTTP at `<URL>/mcp/`; the API key (if set) is sent as a Bearer token.
 
+## Server endpoints the plugin calls
+
+Everything the plugin does against the service goes through the MCP tools above, except these REST calls. A test (`tests/server-endpoints.test.ts`) fails when this list and the code disagree, so adding or dropping a call means updating this section.
+
+### From the hooks (src/)
+
+| Call | Hook | Purpose |
+|---|---|---|
+| `GET /v1/context/{project_id}` | SessionStart | Project context (own + team-shared memories), newest first, `limit=200` |
+| `GET /v1/context/global` | SessionStart | Global context when no project resolves |
+| `GET /v1/extensions/dreaming/card` | SessionStart | Identity cards (optional; 404 is fine) |
+| `GET /v1/code-graph/query` | SessionStart | Probe: is a code graph available |
+| `POST /v1/context/assemble` | SessionStart (`CONTEXT_MODE=assemble` only) | Token-budgeted session bundle; failure falls back to the index |
+| `GET /v1/memories` | PreToolUse (read gate) | File-memory lookup for the read gate |
+| `POST /v1/memories/raw` | PreCompact | Store the compact snapshot |
+| `POST /v1/checkpoint` | SessionEnd | Store the structured session note |
+| `POST /v1/extensions/conversation-compiler/flush` | Stop, SessionEnd (a final turn the Stop hooks left pending), PreCompact, framework adapter `message:sent` | Deliver a conversation turn |
+| `POST /v1/extensions/conversation-compiler/compile` | Stop (at most once per compile interval), SessionEnd (what is left), framework adapter `session:end` | Compile the day's turns |
+
+### From the skills (REST, via curl)
+
+Only where no MCP equivalent exists (or as the documented fallback), Claude Code only. `ns-status` also probes `GET /health`.
+
+| Call | Skill |
+|---|---|
+| `POST /v1/ingest/files` | `ingest` (binary uploads) |
+| `GET /v1/ingest/artifacts/{file_id}` | `ingest` (retrieve the stored original) |
+| `POST /v1/search` | `search` (fallback when MCP is absent) |
+| `POST /v1/extensions/conversation-compiler/flush` | `sync` |
+| `POST /v1/extensions/conversation-compiler/compile` | `sync` |
+
+Server routes and MCP tools the plugin does not call are served for other clients (REST/MCP integrations); the plugin not calling them is not a defect.
+
 ## OpenClaw integration (manual)
 
-OpenClaw doesn't share Claude Code's marketplace. Install the OpenClaw hook manifest at `~/.openclaw/hooks/neuralscape/`:
+The plugin's conversation capture also understands OpenClaw events. OpenClaw doesn't share Claude Code's marketplace, so this is a manual install.
 
 1. Build the plugin from source (see **Development** below).
-2. Copy `hooks/openclaw-hooks.json` and the `scripts/` directory into `~/.openclaw/hooks/neuralscape/`.
-3. Set `NEURALSCAPE_URL`, `NEURALSCAPE_USER_ID`, and (optional) `NEURALSCAPE_API_KEY` in OpenClaw's hook env.
-4. Restart OpenClaw — `message:sent` and `session:end` will start firing.
+2. Copy `hooks/openclaw-hooks.json` and the `scripts/` directory into `~/.openclaw/hooks/neuralscape/` (so the scripts sit at `~/.openclaw/hooks/neuralscape/scripts/`).
+3. Set `NEURALSCAPE_URL`, `NEURALSCAPE_USER_ID`, and (optional) `NEURALSCAPE_API_KEY` in OpenClaw's hook env. To file turns under a project, also set `NEURALSCAPE_PROJECT_ID` (see below).
+4. Register the three commands from the manifest with OpenClaw (`message:received`, `message:sent`, `session:end`).
 
-> **Note:** the OpenClaw hook manifest still uses `${PLUGIN_ROOT}` rather than `${CLAUDE_PLUGIN_ROOT}` because OpenClaw's expansion convention hasn't been confirmed against the Claude Code spec. If your OpenClaw build complains, swap to whichever variable it does export — the rest of the script is platform-agnostic.
+What the adapter does with the events:
+
+- `message:received` is remembered (the user's text, with `<private>` spans redacted before it is written, one 0600 file per message, consumed by the next reply), `message:sent` is the assistant's reply: the two are paired into one turn, because OpenClaw's documented `message:sent` context (`to`, `content`, `success`, `channelId`) carries no user message. A payload that does carry `userMessage` / `user_message` is used as is.
+- Project: the documented `message:sent` / `message:received` contexts carry no working directory, so turns are **global scope** unless you set the `PROJECT_ID` setting (`NEURALSCAPE_PROJECT_ID`), or the payload carries a `workspaceDir` / `cwd`, which is resolved like Claude Code's `cwd`.
+- `session:end` triggers the day's compile unless the payload reports fewer than 2 messages.
+- Excluded projects (`EXCLUDED_PROJECTS`) are checked against the same project the adapter files the turn under (workspace directory or `PROJECT_ID` override), not the hook runner's directory.
+
+**Unverified against a live OpenClaw.** Nothing here has been run on a real OpenClaw instance. Read from its public docs ([hooks](https://docs.openclaw.ai/automation/hooks.md), [event types](https://docs.openclaw.ai/automation/hooks/event-types.md), [writing hooks](https://docs.openclaw.ai/automation/hooks/writing-hooks.md)): internal hooks are described as a directory with `HOOK.md` plus a JavaScript/TypeScript handler running in the gateway process, not as a JSON command manifest; no environment variable for a hook's install directory is documented; and no `session:end` internal event is listed (`session_end` is a typed plugin hook). So, plainly:
+
+- **The command manifest itself** (`hooks/openclaw-hooks.json`) is this plugin's own format; whether OpenClaw reads it is unconfirmed.
+- **`$HOME` expansion** in the manifest's command strings is unconfirmed (the manifest avoids an unconfirmed `${PLUGIN_ROOT}` by using the absolute `$HOME/.openclaw/hooks/neuralscape/...` path, but the framework may or may not run commands through a shell). If it does not expand `$HOME`, write the absolute path.
+- **The `message:received` event name** and its `from` / `content` / `channelId` context are taken from the event-types page above; the pairing depends on that event firing before `message:sent`.
+- **The `session:end` payload** is unconfirmed.
+
+The payload shapes the adapter reads follow the documented event contexts and are covered by tests against fixture payloads, which prove the plugin side only. If your build wants a `HOOK.md` handler, write a thin handler that spawns the same `scripts/*.js` with the event JSON on stdin.
 
 ## Configuration
 
@@ -184,8 +247,11 @@ The plugin reads from `userConfig` prompts (modern) or env vars (legacy fallback
 |  | *Default when unset:* the hooks fall back to the **OS username** (`$USER` / `$USERNAME`) so zero-config local installs keep a stable identity. Set it explicitly on shared machines or if your OS username isn't the id you want memories filed under. Servers with token auth derive identity from the Bearer token and ignore client-claimed ids. | |
 | Compile threshold (obs) | `CLAUDE_PLUGIN_OPTION_COMPILE_THRESHOLD` (default `25`) | `NEURALSCAPE_COMPILE_THRESHOLD` |
 | Compile age (minutes) | `CLAUDE_PLUGIN_OPTION_COMPILE_AGE_MIN` (default `30`) | `NEURALSCAPE_COMPILE_AGE_MIN` |
-| SessionStart context mode | `CLAUDE_PLUGIN_OPTION_CONTEXT_MODE` (`index` default \| `full` legacy) | `NEURALSCAPE_CONTEXT_MODE` |
+| Conversation compile interval (minutes) | `CLAUDE_PLUGIN_OPTION_COMPILE_INTERVAL_MIN` (default `15`; `0` = after every Stop that delivered a turn) | `NEURALSCAPE_COMPILE_INTERVAL_MIN` |
+| SessionStart context mode | `CLAUDE_PLUGIN_OPTION_CONTEXT_MODE` (`index` default \| `full` legacy \| `assemble` opt-in) | `NEURALSCAPE_CONTEXT_MODE` |
 | Index budget (tokens) | `CLAUDE_PLUGIN_OPTION_INDEX_BUDGET_TOKENS` (default `1500`) | `NEURALSCAPE_INDEX_BUDGET_TOKENS` |
+| Assemble budget (tokens), `CONTEXT_MODE=assemble` only | `CLAUDE_PLUGIN_OPTION_ASSEMBLE_BUDGET_TOKENS` (default `1500`, clamped to the route's 100 to 1000000) | `NEURALSCAPE_ASSEMBLE_BUDGET_TOKENS` |
+| Assemble query, `CONTEXT_MODE=assemble` only | `CLAUDE_PLUGIN_OPTION_ASSEMBLE_QUERY` (default empty: the last user prompt on resume/compact/fork, none on a fresh session) | `NEURALSCAPE_ASSEMBLE_QUERY` |
 | Code-graph deferral | `CLAUDE_PLUGIN_OPTION_CODE_GRAPH` (`auto` default \| `on` \| `off`) | `NEURALSCAPE_CODE_GRAPH` |
 | File read gate | `CLAUDE_PLUGIN_OPTION_READ_GATE_ENABLED` (default `true`) | `NEURALSCAPE_READ_GATE_ENABLED` |
 | Read gate min size (bytes) | `CLAUDE_PLUGIN_OPTION_READ_GATE_MIN_BYTES` (default `1500`) | `NEURALSCAPE_READ_GATE_MIN_BYTES` |
@@ -280,9 +346,26 @@ as an env-var alias.
 Wrap anything in `<private>…</private>` and the plugin will never store or
 transmit it: the spans are replaced with `[redacted]` **before** observation
 rows hit disk, before conversation turns are flushed to the compiler, and
-before session-note fields go into a checkpoint. Redaction is case-insensitive
-and fail-closed — an unclosed `<private>` redacts to the end of the text. The
-compile-observations skill additionally skips any work unit containing
+before session-note fields go into a checkpoint.
+
+- **Fail-closed.** Text that leaves the machine or is written to disk is
+  redacted fail-closed: an unclosed `<private>` redacts to the end of the text
+  (so a multi-line private span cannot leak its later lines), and a closing tag
+  with no opener redacts back to the start of the text. The cost is that prose
+  which merely *mentions* the tag loses what follows it.
+- **Nesting.** Spans nest: the span ends at the closing tag that balances the
+  outermost opener, and everything between inner and outer closers stays inside.
+- **Spelling.** The tag is matched case-insensitively and tolerates whitespace and
+  attributes (`< private >`, `<PRIVATE reason="draft">`, `</ private >`) and the
+  HTML-escaped form (`&lt;private&gt;` … `&lt;/private&gt;`). Other encodings
+  (numeric entities such as `&#60;private&#62;`, URL-encoded or Unicode look-alike
+  characters, full-width `＜private＞` or zero-width-joined look-alikes) are **not** recognised: use the literal ASCII tag. A tag whose closing `>` is missing (`<private` at the end of a text, `<private foo` with no `>`) counts as an opener when redacting fail-closed. A word that only starts
+  with `private` (`<privateer>`, `<private-note>`) is not a tag.
+- **Across entries.** A span may open in the prompt and close in the answer, or
+  open in one assistant message and close in a later one: the session note and the
+  flushed turn are redacted over the whole turn.
+
+The compile-observations skill additionally skips any work unit containing
 `<private>` content entirely.
 
 ## Hook failure taxonomy (never-block contract)
@@ -292,7 +375,8 @@ code:
 
 | Failure | Behavior | Exit code |
 |---|---|---|
-| Neuralscape unreachable / transport error | Continue without memory. SessionStart injects a one-line `[neuralscape] memory service unreachable` notice; other hooks log to stderr; the read gate allows the read. The session is NEVER blocked. | `0` |
+| Neuralscape answers 401/403 (bad or expired API key) or 404 (wrong URL) | The service is reachable, so this is not "unreachable": SessionStart injects a notice saying the key was rejected (fix `API_KEY`) or the URL is wrong (fix `URL`), never printing the key. These do not count toward the fail-loud streak. | `0` |
+| Neuralscape unreachable / transport error / 5xx | Continue without memory. SessionStart injects a one-line `[neuralscape] memory service unreachable` notice; other hooks log to stderr; the read gate allows the read. The session is NEVER blocked. | `0` |
 | Neuralscape unreachable for `FAIL_LOUD_THRESHOLD` (default 3) **consecutive** events | Fail loud instead of staying quietly degraded: the next SessionStart notice names the streak — `unreachable for N consecutive events — check docker compose ps`. Any successful call resets the counter. | `0` |
 | Malformed hook stdin (not valid JSON — a client bug) | Fail loud so the bug is visible instead of silently swallowed. | `2` on hooks where exit 2 cannot block (`SessionStart`, `SessionEnd`, `PostToolUse`) |
 | Malformed stdin on `Stop` / `UserPromptSubmit` / `PreToolUse` | Exit 2 has *blocking* semantics on these events (it would force Claude to continue, erase the user's prompt, or deny the tool call), so the never-block principle wins: log to stderr, exit `0`. | `0` |

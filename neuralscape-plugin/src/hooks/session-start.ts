@@ -20,11 +20,15 @@
 
 import {
   type ContextResponse,
+  type LocalCompactSnapshot,
+  type FailureKind,
   type NeuralscapeMemory,
   MalformedHookInputError,
   getFailLoudThreshold,
   getProjectId,
+  getServiceUrl,
   getUserId,
+  getUserIdSource,
   hasUserId,
   isProjectExcluded,
   listPendingBuffers,
@@ -34,7 +38,12 @@ import {
   outputWithContext,
   parseStdinStrict,
   readConfig,
-  recordTransportFailure,
+  readLocalCompactSnapshot,
+  readPredecessorSessionIds,
+  recordFailure,
+  classifyFailure,
+  neuralscapePost,
+  redactPrivate,
   resetTransportFailures,
 } from "../utils.js";
 
@@ -52,6 +61,8 @@ import {
   toIndexEntry,
 } from "../core/disclosure.js";
 
+import { extractRecentUserPrompts } from "../adapters/claude-code.js";
+import { COMPACT_SNAPSHOT_SESSION_TAG_PREFIX, COMPACT_SNAPSHOT_TAG } from "../core/compact.js";
 import { CATEGORY_LABELS, CATEGORY_ORDER } from "../types.js";
 
 // Target max chars for legacy full-content injection (~4 chars per token)
@@ -63,9 +74,114 @@ const INDEX_FETCH_LIMIT = 200;
 
 // ── Config knobs ─────────────────────────────────────────────────
 
-export function getContextMode(): "index" | "full" {
+export function getContextMode(): "index" | "full" | "assemble" {
   const raw = readConfig("CONTEXT_MODE", "index").toLowerCase();
-  return raw === "full" ? "full" : "index";
+  return raw === "full" || raw === "assemble" ? raw : "index";
+}
+
+/** Bounds of `budget_tokens` on `POST /v1/context/assemble` (schemas.AssembleContextRequest). */
+export const ASSEMBLE_MIN_BUDGET = 100;
+export const ASSEMBLE_MAX_BUDGET = 1_000_000;
+export const DEFAULT_ASSEMBLE_BUDGET_TOKENS = 1500;
+const ASSEMBLE_QUERY_MAX = 2000;
+const ASSEMBLE_SESSION_ID_MAX = 100;
+
+/** Token budget sent to the assemble route (`ASSEMBLE_BUDGET_TOKENS`), clamped to the route's bounds. */
+export function getAssembleBudgetTokens(): number {
+  const parsed = parseInt(readConfig("ASSEMBLE_BUDGET_TOKENS", ""), 10);
+  if (!Number.isFinite(parsed) || parsed <= 0) return DEFAULT_ASSEMBLE_BUDGET_TOKENS;
+  return Math.min(ASSEMBLE_MAX_BUDGET, Math.max(ASSEMBLE_MIN_BUDGET, parsed));
+}
+
+/** An optional fixed query for the assembled bundle's relevant-memory rows (`ASSEMBLE_QUERY`). */
+export function getAssembleQuery(): string | undefined {
+  const raw = readConfig("ASSEMBLE_QUERY", "").trim();
+  return raw ? raw.slice(0, ASSEMBLE_QUERY_MAX) : undefined;
+}
+
+/** The request body for `POST /v1/context/assemble` (format is always plain: the bundle is injected as text). */
+export function buildAssembleRequest(opts: {
+  budgetTokens: number;
+  userId: string;
+  sessionId?: string;
+  projectId?: string;
+  query?: string;
+}): Record<string, unknown> {
+  const body: Record<string, unknown> = {
+    budget_tokens: Math.min(ASSEMBLE_MAX_BUDGET, Math.max(ASSEMBLE_MIN_BUDGET, Math.trunc(opts.budgetTokens))),
+    format: "plain",
+    user_id: opts.userId,
+  };
+  if (opts.sessionId) body.session_id = opts.sessionId.slice(0, ASSEMBLE_SESSION_ID_MAX);
+  if (opts.projectId) body.project_id = opts.projectId;
+  if (opts.query && opts.query.trim()) body.query = opts.query.slice(0, ASSEMBLE_QUERY_MAX);
+  return body;
+}
+
+export interface AssembledBundle {
+  text: string;
+  usedTokens: number;
+  budgetTokens: number;
+}
+
+/** The plain bundle out of an assemble response, or null when it carries no text. */
+export function parseAssembleResponse(resp: unknown): AssembledBundle | null {
+  const r = resp as { bundle?: { text?: unknown }; used_tokens?: unknown; budget_tokens?: unknown } | null;
+  const text = r?.bundle?.text;
+  if (typeof text !== "string" || !text.trim()) return null;
+  return {
+    text: text.trim(),
+    usedTokens: typeof r?.used_tokens === "number" ? r.used_tokens : 0,
+    budgetTokens: typeof r?.budget_tokens === "number" ? r.budget_tokens : 0,
+  };
+}
+
+/** Memory ids the bundle's relevant-memory rows already show (`- [<id>] ...`), so the index table does not repeat them. */
+export function assembledMemoryIds(text: string): Set<string> {
+  const ids = new Set<string>();
+  for (const m of text.matchAll(/^- \[([^\]\s]+)\]/gm)) ids.add(m[1]);
+  return ids;
+}
+
+/**
+ * The assemble query: the `ASSEMBLE_QUERY` setting, else (on resume/compact/fork, where the session is
+ * continuing) the last user prompt of the transcript, else none (a fresh session has nothing to rank by).
+ */
+export async function resolveAssembleQuery(input: {
+  source?: string;
+  transcript_path?: string;
+}): Promise<string | undefined> {
+  const fixed = getAssembleQuery();
+  if (fixed) return fixed;
+  if (!isResumeSource(input.source) || !input.transcript_path) return undefined;
+  const [last] = await extractRecentUserPrompts({ transcript_path: input.transcript_path }, 1);
+  const clean = last ? redactPrivate(last, { failClosed: true }).trim() : "";
+  return clean ? clean.slice(0, ASSEMBLE_QUERY_MAX) : undefined;
+}
+
+/**
+ * Call the assemble route. Resolves null for "use the index instead": a 404 (an older server without the
+ * route) quietly; any other failure with its #500 kind logged. Never throws.
+ */
+export async function fetchAssembledBundle(body: Record<string, unknown>): Promise<{
+  bundle: AssembledBundle | null;
+  notice: string;
+}> {
+  try {
+    const bundle = parseAssembleResponse(await neuralscapePost("/v1/context/assemble", body));
+    return { bundle, notice: "" };
+  } catch (error) {
+    const kind = classifyFailure(error);
+    if (kind === "not_found") return { bundle: null, notice: "" };
+    logError(`context assemble failed (${kind}); using the index`, error);
+    // Network and server failures hit the index fetch too, which reports them; a rejected key or request is
+    // specific to this call (or its settings) and would otherwise be invisible.
+    const notice =
+      kind === "auth" || kind === "client"
+        ? `[neuralscape] CONTEXT_MODE=assemble was rejected by the service (${kind === "auth" ? "HTTP 401/403" : "HTTP 4xx"}); showing the index instead.`
+        : "";
+    return { bundle: null, notice };
+  }
 }
 
 export function getIndexBudgetTokens(): number {
@@ -95,6 +211,69 @@ export function buildUnreachableNotice(count: number, threshold: number): string
     );
   }
   return "[neuralscape] memory service unreachable — continuing without memory context.";
+}
+
+/**
+ * The notice for a failed context fetch, by failure kind. Only `network` and
+ * `server` are "unreachable" (and counted: see recordFailure); the others mean
+ * the service answered and the plugin's setup is wrong, so they say what to fix.
+ * Never includes the token or the URL.
+ */
+export function buildFailureNotice(
+  kind: FailureKind,
+  count: number | null,
+  threshold: number,
+): string {
+  switch (kind) {
+    case "auth":
+      return (
+        "[neuralscape] the memory service rejected the API key (HTTP 401/403) — " +
+        "the token is missing, expired or revoked. Update API_KEY with " +
+        "`/plugin config neuralscape@neuralscape-plugins`. Continuing without memory context."
+      );
+    case "not_found":
+      return (
+        "[neuralscape] the memory service answered 404 for the context route — " +
+        "the service URL is probably wrong or points at an incompatible version. " +
+        "Check URL in `/plugin config neuralscape@neuralscape-plugins`. Continuing without memory context."
+      );
+    case "client":
+      return (
+        "[neuralscape] the memory service rejected the context request (HTTP 4xx) — " +
+        "check the plugin URL, user id and service version. Continuing without memory context."
+      );
+    default:
+      return buildUnreachableNotice(count ?? 1, threshold);
+  }
+}
+
+const LOCAL_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]", "::1"]);
+
+/** True when the service URL points at this machine (or does not parse). */
+export function isLocalServiceUrl(url: string): boolean {
+  try {
+    return LOCAL_HOSTS.has(new URL(url).hostname.toLowerCase());
+  } catch {
+    return true;
+  }
+}
+
+/**
+ * One line shown when this install identifies as the OS login name (USER_ID
+ * unset) against a non-local service: the fallback is deliberate (see utils.ts)
+ * but the user should know which id their memories are filed under. Empty
+ * otherwise. Does not name the service host.
+ */
+export function buildIdentityNotice(
+  userId: string,
+  source: "config" | "os" | "none",
+  serviceUrl: string,
+): string {
+  if (source !== "os" || !userId || isLocalServiceUrl(serviceUrl)) return "";
+  return (
+    `[neuralscape] USER_ID is not set, so memories are filed under your OS login name "${userId}" ` +
+    "on a remote memory service. Set USER_ID with `/plugin config neuralscape@neuralscape-plugins` to choose the id."
+  );
 }
 
 // ── Legacy full-content formatting (CONTEXT_MODE=full) ───────────
@@ -160,10 +339,21 @@ export interface IndexModeInputs {
   now?: Date;
   /**
    * SessionStart `source` from Claude Code: "startup" | "resume" | "clear"
-   * | "compact". On "compact"/"resume" the recent compact snapshots render
-   * full-content under "## Resuming after compaction".
+   * | "compact" | "fork". On "compact"/"resume"/"fork" the compact snapshots
+   * render full-content under "## Resuming after compaction".
    */
   source?: string;
+  /** The starting session's id: on compact/resume only its own snapshots render (see renderResumeAfterCompact). */
+  sessionId?: string;
+  /** Resume/fork: the earlier session id(s) read from the transcript head (see readPredecessorSessionIds). */
+  predecessorIds?: string[];
+  /**
+   * CONTEXT_MODE=assemble: the bundle `POST /v1/context/assemble` returned. It already carries the identity
+   * card(s), the session summary / recent messages and (with a query) relevant-memory rows, so the cards are
+   * not rendered again and the index table leaves out the rows the bundle shows. Standards, "Resuming after
+   * compaction" and "Previously…" come from the context fetch and are unchanged.
+   */
+  assembled?: AssembledBundle;
 }
 
 /**
@@ -171,9 +361,19 @@ export interface IndexModeInputs {
  * Standards stay a binding block outside the budget; the session note that
  * feeds "Previously…" is excluded from the index table (no double render).
  */
-export function buildIndexContext(inputs: IndexModeInputs): string {
-  const { context, cards, codeGraphAvailable, budgetTokens } = inputs;
-  const now = inputs.now ?? new Date();
+/**
+ * The blocks both modes share, in order: binding standards, identity cards,
+ * the resume-after-compaction block (compact/resume/fork only) and the
+ * "Previously…" block. Also returns the ids rendered so the caller keeps them
+ * out of its memory listing (no double render).
+ */
+function buildContinuitySections(inputs: IndexModeInputs, now: Date): {
+  sections: string[];
+  cardBlock: string;
+  resumeIds: Set<string>;
+  previouslyId: string | null;
+} {
+  const { context, cards } = inputs;
   const categories = context.categories || {};
 
   const sections: string[] = [];
@@ -181,15 +381,28 @@ export function buildIndexContext(inputs: IndexModeInputs): string {
   const standardsBlock = formatStandards(context.standards);
   if (standardsBlock) sections.push(standardsBlock);
 
-  const cardBlock = renderCardBlock(cards);
+  if (inputs.assembled) {
+    const a = inputs.assembled;
+    sections.push(
+      `## Session context (assembled, ~${a.usedTokens} of ${a.budgetTokens} tokens)\n\n${a.text}`,
+    );
+  }
+
+  // The assembled bundle already holds the identity card(s).
+  const cardBlock = inputs.assembled ? "" : renderCardBlock(cards);
   if (cardBlock) sections.push(cardBlock);
 
   // Compact-resilience: after a compaction (or --resume), re-anchor the
   // session with the pre-compact snapshots the PreCompact hook stored.
-  // Rendered full-content here, excluded from the index table below.
+  // Rendered full-content here, excluded from the listing below.
   const resumeIds = new Set<string>();
-  if (inputs.source === "compact" || inputs.source === "resume") {
-    const resume = renderResumeAfterCompact(categories, { now });
+  if (isResumeSource(inputs.source)) {
+    const resume = renderResumeAfterCompact(categories, {
+      now,
+      sessionId: inputs.sessionId,
+      source: inputs.source,
+      predecessorIds: inputs.predecessorIds,
+    });
     if (resume.block) {
       sections.push(resume.block);
       for (const id of resume.ids) resumeIds.add(id);
@@ -212,13 +425,47 @@ export function buildIndexContext(inputs: IndexModeInputs): string {
       }
     }
   }
+  return { sections, cardBlock, resumeIds, previouslyId };
+}
+
+/**
+ * CONTEXT_MODE=full: the same continuity blocks as index mode (standards,
+ * identity cards, "Resuming after compaction", "Previously…"), then the full
+ * text of the remaining memories under the legacy MAX_CHARS budget. The
+ * resume snapshot and the session note are rendered once, above, and left
+ * out of the listing.
+ */
+export function buildFullContext(inputs: IndexModeInputs): string {
+  const now = inputs.now ?? new Date();
+  const { sections, resumeIds, previouslyId } = buildContinuitySections(inputs, now);
+
+  const remaining: Record<string, NeuralscapeMemory[]> = {};
+  for (const [cat, mems] of Object.entries(inputs.context.categories || {})) {
+    const kept = (mems ?? []).filter((m) => m.id !== previouslyId && !resumeIds.has(m.id));
+    if (kept.length > 0) remaining[cat] = kept;
+  }
+  const formatted = formatMemories(remaining);
+  if (formatted) sections.push(formatted);
+
+  if (sections.length === 0) return "";
+  return sections.join("\n\n---\n\n");
+}
+
+export function buildIndexContext(inputs: IndexModeInputs): string {
+  const { context, codeGraphAvailable, budgetTokens } = inputs;
+  const now = inputs.now ?? new Date();
+  const categories = context.categories || {};
+
+  const { sections, cardBlock, resumeIds, previouslyId } = buildContinuitySections(inputs, now);
 
   // D1: day-grouped index of everything else.
   const memories: NeuralscapeMemory[] = [];
+  const inBundle = inputs.assembled ? assembledMemoryIds(inputs.assembled.text) : new Set<string>();
   for (const cat of Object.keys(categories)) {
     for (const mem of categories[cat] ?? []) {
       if (mem.id === previouslyId) continue;
       if (resumeIds.has(mem.id)) continue;
+      if (inBundle.has(mem.id)) continue;
       memories.push(mem);
     }
   }
@@ -247,6 +494,89 @@ export function buildIndexContext(inputs: IndexModeInputs): string {
 
   if (sections.length === 0) return "";
   return `# Neuralscape Memory\n\n${sections.join("\n\n---\n\n")}`;
+}
+
+/** SessionStart sources that continue earlier work and so get the compact snapshots. */
+export function isResumeSource(source: string | undefined): boolean {
+  return source === "compact" || source === "resume" || source === "fork";
+}
+
+/**
+ * Turn the local copy of this session's compact snapshot into a memory the
+ * disclosure renderer understands.
+ */
+export function localSnapshotMemory(snap: LocalCompactSnapshot): NeuralscapeMemory {
+  return {
+    id: `local-compact-${snap.sessionId}`,
+    memory: snap.content,
+    category: "task_context",
+    project_id: snap.projectId,
+    tags: [COMPACT_SNAPSHOT_TAG, `${COMPACT_SNAPSHOT_SESSION_TAG_PREFIX}${snap.sessionId}`],
+    created_at: snap.createdAt,
+  };
+}
+
+/**
+ * Add this session's local compact snapshot to the fetched context unless the
+ * service already returned that very snapshot (same content). Only after a
+ * compaction: the session id is unchanged by compaction, so the id names the
+ * file; resume/fork get a new id and have no local copy.
+ */
+export async function withLocalCompactSnapshot(
+  context: ContextResponse,
+  input: { source?: string; session_id?: string },
+): Promise<ContextResponse> {
+  if (input.source !== "compact" || !input.session_id) return context;
+  const snap = await readLocalCompactSnapshot(input.session_id);
+  if (!snap) return context;
+  const categories = context.categories || {};
+  for (const memories of Object.values(categories)) {
+    if ((memories ?? []).some((m) => (m.memory ?? "").trim() === snap.content.trim())) return context;
+  }
+  return {
+    ...context,
+    categories: {
+      ...categories,
+      task_context: [...(categories.task_context ?? []), localSnapshotMemory(snap)],
+    },
+  };
+}
+
+/** The "Resuming after compaction" block from the local snapshot alone (service unreachable). */
+async function localResumeBlock(input: { source?: string; session_id?: string }): Promise<string> {
+  const context = await withLocalCompactSnapshot({ categories: {} } as ContextResponse, input);
+  return renderResumeAfterCompact(context.categories || {}, {
+    sessionId: input.session_id,
+    source: input.source,
+  }).block;
+}
+
+/**
+ * The "compile these buffers first" note for buffers left by sessions that
+ * are over (see listPendingBuffers). Empty string when there are none.
+ * Independent of the service: it only reads local files, so it is also
+ * appended to the unreachable notice.
+ */
+export async function buildPendingNote(currentSessionId?: string): Promise<string> {
+  try {
+    const pending = await listPendingBuffers(currentSessionId);
+    if (pending.length === 0) return "";
+    const totalRows = pending.reduce((s, b) => s + b.lineCount, 0);
+    const paths = pending.map((b) => `\`${b.path}\``).join(", ");
+    return (
+      `\n\n# Neuralscape — Pending Observations\n\n` +
+      `${pending.length} buffer file(s) from prior sessions hold ` +
+      `${totalRows} unprocessed tool observations: ${paths}.\n\n` +
+      `**Before responding to the user's first prompt**, run the ` +
+      `\`compile-observations\` skill on each of these paths to extract ` +
+      `significant memories using the v2 memory model. Skip noise ` +
+      `(routine reads/edits/searches). After memories submit successfully, ` +
+      `truncate each buffer file. Then continue with the user's request.`
+    );
+  } catch (error) {
+    logError("listPendingBuffers failed (non-critical)", error);
+    return "";
+  }
 }
 
 /* v8 ignore start — I/O paths below are exercised by the E2E dry-run script */
@@ -350,53 +680,75 @@ async function main(): Promise<void> {
     );
 
     const mode = getContextMode();
-    const codeGraphPromise = mode === "index" ? probeCodeGraph(userId) : Promise.resolve(false);
+    const codeGraphPromise = mode !== "full" ? probeCodeGraph(userId) : Promise.resolve(false);
+
+    // CONTEXT_MODE=assemble: the budgeted bundle is fetched alongside the context; any failure leaves null and
+    // the index below is rendered as usual. The route is never called in the other modes.
+    const assemblePromise: Promise<{ bundle: AssembledBundle | null; notice: string }> =
+      mode === "assemble"
+        ? resolveAssembleQuery(input).then((query) =>
+            fetchAssembledBundle(
+              buildAssembleRequest({
+                budgetTokens: getAssembleBudgetTokens(),
+                userId,
+                sessionId: input.session_id,
+                projectId,
+                query,
+              }),
+            ),
+          )
+        : Promise.resolve({ bundle: null, notice: "" });
 
     let context: ContextResponse;
     try {
       context = await contextPromise;
-    } catch {
-      // NS unreachable — never block session start: one-line notice, exit 0.
-      // The consecutive-failure counter upgrades the notice to fail-loud
-      // once the streak crosses FAIL_LOUD_THRESHOLD (D4).
-      const count = await recordTransportFailure();
-      outputWithContext(buildUnreachableNotice(count, getFailLoudThreshold()));
+    } catch (error) {
+      // Never block session start: one-line notice, exit 0. Only a down/failing
+      // service (network, 5xx) counts toward the consecutive-failure counter,
+      // which upgrades the notice to fail-loud at FAIL_LOUD_THRESHOLD (D4);
+      // auth / 404 / other 4xx get a notice naming what to fix instead.
+      const { kind, count } = await recordFailure(error);
+      logError(`context fetch failed (${kind})`, error);
+      // Local-only parts still apply: buffers left by finished sessions keep
+      // piling up during an outage unless this session is told about them,
+      // and the local copy of the compact snapshot needs no service.
+      const localResume = await localResumeBlock(input);
+      const pendingDuringOutage = await buildPendingNote(input.session_id);
+      outputWithContext(
+        buildFailureNotice(kind, count, getFailLoudThreshold()) +
+          (localResume ? `\n\n${localResume}` : "") +
+          pendingDuringOutage,
+      );
       return;
     }
     await resetTransportFailures();
 
     // Detect any unprocessed observation buffers left behind by prior sessions
     // and ask Claude to compile them before responding to the user.
-    let pendingNote = "";
-    try {
-      const pending = await listPendingBuffers(input.session_id);
-      if (pending.length > 0) {
-        const totalRows = pending.reduce((s, b) => s + b.lineCount, 0);
-        const paths = pending.map((b) => `\`${b.path}\``).join(", ");
-        pendingNote =
-          `\n\n# Neuralscape — Pending Observations\n\n` +
-          `${pending.length} buffer file(s) from prior sessions hold ` +
-          `${totalRows} unprocessed tool observations: ${paths}.\n\n` +
-          `**Before responding to the user's first prompt**, run the ` +
-          `\`compile-observations\` skill on each of these paths to extract ` +
-          `significant memories using the v2 memory model. Skip noise ` +
-          `(routine reads/edits/searches). After memories submit successfully, ` +
-          `truncate each buffer file. Then continue with the user's request.`;
-      }
-    } catch (error) {
-      logError("listPendingBuffers failed (non-critical)", error);
-    }
+    const pendingNote = await buildPendingNote(input.session_id);
+
+    // After a compaction the stored snapshot may not be searchable yet (the raw
+    // write is queued): merge the local copy the PreCompact hook left behind.
+    context = await withLocalCompactSnapshot(context, input);
 
     let contextBody: string;
+    let assembleNotice = "";
     if (mode === "full") {
-      // Legacy full-content injection, standards prepended unbudgeted.
-      const standardsBlock = formatStandards(context.standards);
-      const formatted = formatMemories(context.categories || {});
-      contextBody = standardsBlock
-        ? formatted
-          ? `${standardsBlock}\n\n---\n\n${formatted}`
-          : standardsBlock
-        : formatted;
+      // Legacy full-content injection plus the continuity blocks (resume,
+      // Previously, cards): see buildFullContext.
+      const settled = await Promise.all(cardPromises.map((p) => p.catch(() => null)));
+      contextBody = buildFullContext({
+        context,
+        cards: settled.filter((c): c is { label: string; lines: string[] } => c !== null),
+        codeGraphAvailable: false,
+        budgetTokens: getIndexBudgetTokens(),
+        source: input.source,
+        sessionId: input.session_id,
+        predecessorIds:
+          input.source === "resume" || input.source === "fork"
+            ? await readPredecessorSessionIds(input.transcript_path, input.session_id)
+            : undefined,
+      });
     } else {
       const settled = await Promise.all(
         cardPromises.map((p) => p.catch(() => null)),
@@ -405,16 +757,29 @@ async function main(): Promise<void> {
         (c): c is { label: string; lines: string[] } => c !== null,
       );
       const codeGraphAvailable = await codeGraphPromise.catch(() => false);
+      const assembled = await assemblePromise.catch(() => ({ bundle: null, notice: "" }));
+      assembleNotice = assembled.notice;
       contextBody = buildIndexContext({
         context,
         cards,
         codeGraphAvailable,
+        assembled: assembled.bundle ?? undefined,
         budgetTokens: getIndexBudgetTokens(),
         source: input.source,
+        sessionId: input.session_id,
+        predecessorIds:
+          input.source === "resume" || input.source === "fork"
+            ? await readPredecessorSessionIds(input.transcript_path, input.session_id)
+            : undefined,
       });
     }
 
-    const combined = (contextBody || "") + pendingNote;
+    const identityNotice = buildIdentityNotice(userId, getUserIdSource(), getServiceUrl());
+    const combined =
+      (contextBody || "") +
+      pendingNote +
+      (identityNotice ? `\n\n${identityNotice}` : "") +
+      (assembleNotice ? `\n\n${assembleNotice}` : "");
     if (combined.trim()) {
       outputWithContext(combined);
     } else {

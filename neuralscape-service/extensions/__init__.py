@@ -16,7 +16,6 @@ Usage in main.py:
 
 import importlib
 import logging
-import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -87,8 +86,10 @@ class ExtensionRegistry:
             self._load_extension_module(module_name, source=f"local:{item.name}")
 
     def _discover_env(self) -> None:
-        """Discover extensions from NEURALSCAPE_EXTENSIONS env var."""
-        env_extensions = os.environ.get("NEURALSCAPE_EXTENSIONS", "").strip()
+        """Discover extensions from NEURALSCAPE_EXTENSIONS (process env, else the setting)."""
+        from config import process_env_or, settings
+
+        env_extensions = process_env_or("NEURALSCAPE_EXTENSIONS", settings.neuralscape_extensions).strip()
         if not env_extensions:
             return
         for import_path in env_extensions.split(","):

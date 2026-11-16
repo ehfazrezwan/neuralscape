@@ -1,8 +1,8 @@
 # Neuralscape in Claude Cowork
 
-Neuralscape was built for Claude Code CLI, where four plugin lifecycle hooks
-(`SessionStart`, `PostToolUse`, `UserPromptSubmit`, `Stop`) make memory
-fully automatic. **Claude Cowork does not run plugin hooks**, so that
+Neuralscape was built for Claude Code CLI, where seven plugin lifecycle hooks
+(`SessionStart`, `PreToolUse`, `PostToolUse`, `UserPromptSubmit`, `PreCompact`,
+`Stop`, `SessionEnd`) make memory fully automatic. **Claude Cowork does not run plugin hooks**, so that
 automatic loop does not fire there. This document is how you get a
 first-class memory experience in Cowork anyway.
 
@@ -48,7 +48,7 @@ exactly that and nothing else. We do **not** rely on hooks firing, on
 
 | Capability | Claude Code CLI | Claude Cowork |
 |---|---|---|
-| 8 MCP tools (recall/remember/search/projects/…) | ✅ hooks + MCP | ✅ MCP connector |
+| Neuralscape MCP tools (recall/remember/search/projects/…; 26 core, plus 7 code-graph tools when the server has the optional `code-graph` extra) | ✅ hooks + MCP | ✅ MCP connector |
 | Recall context at task start | ✅ automatic (`SessionStart`) | ✅ **instructed / on-demand** (standing context or `/neuralscape:recall` → `get_project_context`/`recall_memories`) |
 | Save memories at task end | ✅ automatic (`Stop`) | ✅ **instructed / on-demand** (standing context or `/neuralscape:save-session` → `remember`/`remember_conversation`) |
 | Pick a project (no working dir in Cowork) | ✅ from `cwd` | ✅ `/neuralscape:project` → `list_projects` |
@@ -121,7 +121,7 @@ URL to type). Install the plugin from your channel's marketplace, then:
 > `https://<your-host>/mcp/` → **Connect**. Bake your URL into the plugin (see
 > the README's *Distribution & self-hosting*) to make it the bundled default.
 
-After connecting, the 8 Neuralscape MCP tools appear in Cowork. The server
+After connecting, the Neuralscape MCP tools (26 core, plus 7 code-graph tools when the server has the optional `code-graph` extra) appear in Cowork. The server
 reads your identity from the OAuth token, so the `user_id` you pass is
 ignored over the connector. A few tools mark `user_id` as required in their
 schema (`recall_memories`, `remember`, `remember_conversation`) — pass a

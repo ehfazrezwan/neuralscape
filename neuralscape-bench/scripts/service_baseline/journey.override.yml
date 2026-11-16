@@ -1,0 +1,16 @@
+# Adds persistent named volumes to the datastores so image changes can be tried against
+# existing data (install, upgrade, rollback, uninstall journeys). Used with compose.yml.
+services:
+  neo4j:
+    volumes: ["neo4j_data:/data"]
+  qdrant:
+    volumes: ["qdrant_data:/qdrant/storage"]
+  redis:
+    volumes: ["redis_data:/data"]
+  pg:
+    volumes: ["pg_data:/var/lib/postgresql/data"]
+volumes:
+  neo4j_data: {}
+  qdrant_data: {}
+  redis_data: {}
+  pg_data: {}

@@ -3,7 +3,7 @@
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, Field, field_validator, model_serializer, model_validator
 
 
 # ──────────────────────────────────────────────
@@ -137,14 +137,24 @@ CORE_MEMORY_CATEGORIES: dict[str, str] = {
 # fact parser consult (i.e. validation ACCEPTS adapter categories).
 MEMORY_CATEGORIES: dict[str, str] = dict(CORE_MEMORY_CATEGORIES)
 
-# Categories that default to global scope
-GLOBAL_CATEGORIES = {"preference", "personal_fact", "technical_skill", "domain_knowledge"}
+# Categories that always store global scope, even with an explicit project_id
+GLOBAL_CATEGORIES = {"preference", "personal_fact", "technical_skill"}
 
 # Categories that require project_id and default to project scope
 PROJECT_CATEGORIES = {"tech_stack", "convention", "architecture", "dependency"}
 
-# Categories that can be either scope
-FLEXIBLE_CATEGORIES = {"decision", "interaction", "workflow", "procedure", "task_context"}
+# Categories that can be either scope: follow the caller's project_id (global
+# when none). ``domain_knowledge`` is flexible so ingested/remembered knowledge
+# given a project_id stays in that project instead of leaking into every
+# project's context (#224).
+FLEXIBLE_CATEGORIES = {
+    "domain_knowledge",
+    "decision",
+    "interaction",
+    "workflow",
+    "procedure",
+    "task_context",
+}
 
 
 def default_scope_for_category(category: str) -> MemoryScope:
@@ -336,6 +346,27 @@ def validate_adapter_name(v: str) -> str:
     if v not in known:
         raise ValueError(f"Unknown adapter '{v}'. Available: {known}")
     return v
+
+
+MAX_RECALL_WORKSPACES = 10
+
+
+def validate_workspace_names(v: list[str] | None) -> list[str] | None:
+    """Validate a recall ``workspaces`` list: names match the write-side
+    ``workspace`` pattern, at most MAX_RECALL_WORKSPACES entries, duplicates
+    collapsed. ``[]`` maps to ``None`` (the default)."""
+    import re
+
+    if v is None:
+        return None
+    if v == []:
+        return None  # empty list = default (memory workspace only)
+    if not isinstance(v, list) or len(v) > MAX_RECALL_WORKSPACES:
+        raise ValueError(f"workspaces must list at most {MAX_RECALL_WORKSPACES} workspace names")
+    for name in v:
+        if not isinstance(name, str) or len(name) > 100 or not re.fullmatch(_ID_PATTERN, name):
+            raise ValueError(f"Invalid workspace name {name!r}: use letters, digits, '_', '.', '-' (max 100)")
+    return list(dict.fromkeys(v))
 
 
 # Event time (occurred_at): allow modest client clock skew when rejecting
@@ -830,6 +861,20 @@ class SearchMemoryRequest(BaseModel):
         ),
     )
 
+    workspaces: list[str] | None = Field(
+        default=None,
+        description=(
+            "Workspaces to search. Absent = the memory workspace only (default). "
+            "Reference content ingested with a non-default adapter lives in "
+            "'ref-<adapter>[--<title>]'; name it here to recall it."
+        ),
+    )
+
+    @field_validator("workspaces")
+    @classmethod
+    def _validate_workspaces(cls, v: list[str] | None) -> list[str] | None:
+        return validate_workspace_names(v)
+
     @field_validator("domain")
     @classmethod
     def _validate_domain(cls, v: str | None) -> str | None:
@@ -912,6 +957,16 @@ class PatchMemoryRequest(BaseModel):
     concepts: list[str] | None = Field(default=None, max_length=5)
     confidence: float | None = Field(default=None, ge=0.0, le=1.0)
     expires_at: datetime | None = None
+
+    # Optimistic-concurrency precondition (not an editable field): the
+    # ``revision`` a read of this memory returned. When sent and no longer
+    # current the PATCH is refused with 409 and nothing is written; absent keeps
+    # last-writer-wins.
+    expected_revision: str | None = Field(
+        default=None,
+        max_length=32,
+        description="Revision token from a read of the memory; stale => 409, nothing written",
+    )
 
     @field_validator("domain")
     @classmethod
@@ -1148,12 +1203,28 @@ class MemoryResponse(BaseModel):
 
     Memory-model v2 fields render as nulls for legacy memories that didn't store them.
     Multi-user fields (`visibility`, `owner_user_id`) likewise render as null on
-    pre-multi-user memories — clients should treat null `visibility` as 'private'
-    and null `owner_user_id` as 'unknown / pre-multi-user write'.
+    pre-multi-user memories — clients should treat null `visibility` as 'private'.
+    A null `owner_user_id` in metadata is filled from the row's top-level `user_id`
+    when the memory is read, so it is only null when the row records neither
+    (pre-multi-user write). Conversation-extracted rows are stamped with both
+    (`owner_user_id`, `visibility=private`) at write time.
     """
     id: str
     memory: str
     category: str | None = None
+    # Model scores for relevance only, bound to content/category by the service.
+    # These never authorize sharing or change strict category filter semantics.
+    category_evidence: dict | None = None
+
+    @model_serializer(mode="wrap")
+    def _omit_absent_category_evidence(self, handler):
+        # Flag off (the default), no row carries evidence: omit the key so the
+        # wire shape is byte-identical to before the field existed.
+        data = handler(self)
+        if isinstance(data, dict) and data.get("category_evidence") is None:
+            data.pop("category_evidence", None)
+        return data
+
     scope: str | None = None
     project_id: str | None = None
     tags: list[str] | None = None
@@ -1195,6 +1266,11 @@ class MemoryResponse(BaseModel):
     # Multi-user model
     visibility: str | None = None
     owner_user_id: str | None = None
+
+    # Optimistic-concurrency token: echo it as ``expected_revision`` on a PATCH
+    # to refuse the edit if the row changed since this read. "0" for rows that
+    # have never been patched.
+    revision: str | None = None
 
     # Sensitivity gate provenance — stamped whenever the content matched a
     # gated class (memory/sensitivity.py), whether the gate FORCED

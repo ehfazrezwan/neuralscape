@@ -12,6 +12,10 @@
  * `session_note`; the next SessionStart parses it back into the
  * "Previously…" block.
  *
+ * It also writes the "session ended" marker next to the observation buffer
+ * (before any network I/O) so the next SessionStart knows the buffer is ready
+ * to compile; Stop cannot do this because it fires after every turn.
+ *
  * Failure taxonomy (D4): transport failure → notice on stderr, exit 0
  * (never block session teardown); malformed stdin → exit 2 (client bug —
  * SessionEnd exit 2 only surfaces stderr, it cannot block anything).
@@ -20,6 +24,8 @@
 import { readFile } from "node:fs/promises";
 
 import { extractAllTurnPairs } from "../adapters/claude-code.js";
+import { compileForSession } from "../core/compile.js";
+import { deliverClaudeCodeTurns } from "../core/deliver.js";
 import {
   type ObservationRow,
   buildCheckpointPayload,
@@ -28,15 +34,17 @@ import {
 import {
   MalformedHookInputError,
   getBufferPath,
+  getBufferStats,
   getProjectId,
   getUserId,
   hasUserId,
   isProjectExcluded,
   logError,
+  markBufferEnded,
   neuralscapePost,
   outputContinue,
   parseStdinStrict,
-  recordTransportFailure,
+  recordFailure,
   resetTransportFailures,
 } from "../utils.js";
 
@@ -77,13 +85,35 @@ async function main(): Promise<void> {
   }
 
   try {
+    const sessionId = (raw.session_id as string | undefined) || "unknown";
+
+    // The session is over: tell the next SessionStart (in any terminal) that
+    // this buffer is ready to compile. Local-only, so it comes before any
+    // network I/O and does not depend on the service or on a user id; a buffer
+    // with nothing in it needs no marker.
+    if ((await getBufferStats(getBufferPath(sessionId))).lineCount > 0) {
+      await markBufferEnded(sessionId);
+    }
+
     if (!hasUserId()) return;
 
-    const sessionId = (raw.session_id as string | undefined) || "unknown";
     const projectId = getProjectId(raw.cwd as string | undefined);
 
     // Excluded projects (D4): no session note leaves an excluded project.
     if (isProjectExcluded(projectId)) return;
+
+    // Last chance for the turns the Stop hooks left pending (a final answer whose transcript entry had not been
+    // written yet when its Stop ran), then compile what is still uncompiled: the Stop compile is windowed.
+    try {
+      const delivered = raw.transcript_path ? await deliverClaudeCodeTurns(raw) : 0;
+      await compileForSession(
+        sessionId,
+        { date: new Date().toISOString().split("T")[0], userId: getUserId(), shouldCompile: true },
+        { delivered, final: true, lockPath: raw.transcript_path as string | undefined },
+      );
+    } catch (error) {
+      logError("session-end final flush failed (non-critical)", error);
+    }
 
     const turns = await extractAllTurnPairs(raw);
     const observations = await readObservationRows(sessionId);
@@ -102,8 +132,8 @@ async function main(): Promise<void> {
     } catch (error) {
       // Transport failure → notice + exit 0 (never block session teardown).
       // Counted toward the fail-loud threshold surfaced at next SessionStart.
-      await recordTransportFailure();
-      logError("session summary checkpoint failed (service unreachable?)", error);
+      const { kind } = await recordFailure(error);
+      logError(`session summary checkpoint failed (${kind})`, error);
       return;
     }
   } catch (error) {

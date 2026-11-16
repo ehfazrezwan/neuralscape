@@ -286,7 +286,9 @@ class GraphAdminMixin:
             project_id: Optional project scope for authorization.
 
         Returns:
-            Dict with message or error. Raises PermissionError if the episode
+            Dict with message or error (``not_found: True`` alongside the error
+            when no such episode exists, so callers can answer 404 and keep 500
+            for real backend failures). Raises PermissionError if the episode
             is not in the caller's readable group_ids (same pool rules as reads).
         """
         g = self._get_graphiti()
@@ -322,7 +324,7 @@ class GraphAdminMixin:
                     )
                     records = await check.data()
                     if not records:
-                        return {"error": f"Episode {episode_uuid} not found"}
+                        return {"error": f"Episode {episode_uuid} not found", "not_found": True}
                     ep_group = records[0].get("group_id")
                     if ep_group not in group_ids:
                         raise PermissionError(

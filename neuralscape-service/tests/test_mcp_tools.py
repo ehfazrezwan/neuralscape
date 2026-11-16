@@ -180,6 +180,13 @@ class TestRecallMemoriesTool:
         assert call_kwargs["categories"] == ["preference", "convention"]
 
 
+async def mock_call(category, project_id):
+    args = {"content": "Kelly sizing caps risk", "user_id": "ehfaz", "category": category}
+    if project_id:
+        args["project_id"] = project_id
+    return await mcp_server.call_tool("remember", args)
+
+
 class TestRememberTool:
     @pytest.mark.asyncio
     async def test_stores_fact(self, mock_mcp_service, mock_task_manager):
@@ -204,6 +211,32 @@ class TestRememberTool:
         call_kwargs = mock_task_manager.enqueue_raw.call_args[1]
         assert call_kwargs["scope"] == "project"
         assert call_kwargs["project_id"] == "my-project"
+
+    @pytest.mark.asyncio
+    async def test_domain_knowledge_with_project_id_is_project_scoped(
+        self, mock_mcp_service, mock_task_manager
+    ):
+        """#224: domain_knowledge used to be forced global even with an
+        explicit project_id (while metadata.project_id was still stamped)."""
+        await mock_call("domain_knowledge", "my-project")
+        call_kwargs = mock_task_manager.enqueue_raw.call_args[1]
+        assert call_kwargs["scope"] == "project"
+        assert call_kwargs["project_id"] == "my-project"
+
+    @pytest.mark.asyncio
+    async def test_domain_knowledge_without_project_id_stays_global(
+        self, mock_mcp_service, mock_task_manager
+    ):
+        await mock_call("domain_knowledge", None)
+        call_kwargs = mock_task_manager.enqueue_raw.call_args[1]
+        assert call_kwargs["scope"] == "global"
+
+    @pytest.mark.asyncio
+    async def test_preference_with_project_id_stays_global(
+        self, mock_mcp_service, mock_task_manager
+    ):
+        await mock_call("preference", "my-project")
+        assert mock_task_manager.enqueue_raw.call_args[1]["scope"] == "global"
 
     @pytest.mark.asyncio
     async def test_v2_fields_forwarded_to_enqueue(self, mock_mcp_service, mock_task_manager):
@@ -478,6 +511,60 @@ class TestEditMemoryTool:
         })
         data = json.loads(result[0].text)
         assert "owner" in data["error"]
+
+    @pytest.mark.asyncio
+    async def test_edit_forwards_expected_revision(self, mock_mcp_service):
+        mock_mcp_service.patch_memory.return_value = {
+            "memory": None, "graph_job": None, "graph": "unchanged",
+        }
+        await mcp_server.call_tool("edit_memory", {
+            "memory_id": "m1", "user_id": "e", "tags": ["x"], "expected_revision": "2",
+        })
+        call = mock_mcp_service.patch_memory.call_args
+        assert call.args == ("m1", "e", {"tags": ["x"]})
+        assert call.kwargs == {"expected_revision": "2"}
+
+    @pytest.mark.asyncio
+    async def test_edit_without_expected_revision_is_unchanged(self, mock_mcp_service):
+        mock_mcp_service.patch_memory.return_value = {
+            "memory": None, "graph_job": None, "graph": "unchanged",
+        }
+        await mcp_server.call_tool("edit_memory", {"memory_id": "m1", "user_id": "e", "tags": ["x"]})
+        assert mock_mcp_service.patch_memory.call_args.kwargs == {}
+
+    @pytest.mark.asyncio
+    async def test_edit_stale_revision_is_a_clear_error(self, mock_mcp_service):
+        from memory.edit import RevisionConflict
+
+        mock_mcp_service.patch_memory.side_effect = RevisionConflict("m1", "1", "3")
+        result = await mcp_server.call_tool("edit_memory", {
+            "memory_id": "m1", "user_id": "e", "tags": ["x"], "expected_revision": "1",
+        })
+        data = json.loads(result[0].text)
+        assert data["code"] == "revision_conflict"
+        assert data["current_revision"] == "3"
+        assert "modified since" in data["error"]
+
+    @pytest.mark.asyncio
+    async def test_bulk_delete_listing_failure_is_an_error_not_ok(self, mock_mcp_service):
+        from memory.delete import MemoryListingFailed
+
+        mock_mcp_service.delete_memories.side_effect = MemoryListingFailed("could not be listed; nothing was deleted")
+        result = await mcp_server.call_tool("delete_memories", {"user_id": "e"})
+        data = json.loads(result[0].text)
+        assert data["code"] == "listing_failed" and data["deleted"] == 0
+        assert "message" not in data
+
+    @pytest.mark.asyncio
+    async def test_edit_busy_and_lock_unavailable_are_clear_errors(self, mock_mcp_service):
+        from memory.edit import EditBusy, EditLockUnavailable
+
+        mock_mcp_service.patch_memory.side_effect = EditBusy("m1")
+        data = json.loads((await mcp_server.call_tool("edit_memory", {"memory_id": "m1", "user_id": "e", "tags": ["x"]}))[0].text)
+        assert data["code"] == "edit_busy"
+        mock_mcp_service.patch_memory.side_effect = EditLockUnavailable("nothing was written")
+        data = json.loads((await mcp_server.call_tool("edit_memory", {"memory_id": "m1", "user_id": "e", "tags": ["x"], "expected_revision": "0"}))[0].text)
+        assert data["code"] == "edit_lock_unavailable"
 
     @pytest.mark.asyncio
     async def test_edit_no_fields_rejected(self, mock_mcp_service):
