@@ -22,6 +22,7 @@ so recovery from that live 500 remains unproven.
 from __future__ import annotations
 
 import os
+import sys
 import time
 
 import httpx
@@ -297,7 +298,19 @@ def test_graph_search_reports_degraded_while_neo4j_is_paused(ctx, a, restore_sta
     try:
         check_graph_search_degraded(a, ctx.project_id, want=True)  # waits out the bridge timeout (~30 s)
     finally:
-        ctx.compose("unpause", NEO4J, check=False)
+        # Restore loudly, without masking a failure already propagating.
+        restore_error = None
+        try:
+            ctx.compose("unpause", NEO4J)
+            rows = parse_ps_json(ctx.compose("ps", "--all", "--format", "json", NEO4J).stdout or "")
+            states = {r.get("State") for r in rows}
+            assert states == {"running"}, f"neo4j not running after unpause: {states or 'no container'}"
+        except Exception as exc:  # noqa: BLE001
+            restore_error = exc
+        if restore_error is not None and sys.exc_info()[0] is None:
+            raise restore_error
+        if restore_error is not None:
+            print(f"WARNING: neo4j restore failed while the scenario was already failing: {restore_error!r}")
     eventually(lambda: check_graph_search_degraded(a, ctx.project_id, want=False), timeout=120, what="graph search healthy again")
 
 

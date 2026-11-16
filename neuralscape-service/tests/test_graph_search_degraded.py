@@ -46,6 +46,21 @@ EMPTY = {"edges": [], "nodes": [], "episodes": [], "communities": []}
 
 
 class TestServiceMarker:
+    def test_graph_configured_but_init_failed_is_degraded(self):
+        svc = _service(graphiti=False)
+        svc._graph_init_error = "ConnectionError: neo4j down at startup"
+        out = svc.search_graph("q", "u1")
+        assert out["degraded"] is True and out["error"] == "graph_unavailable"
+
+    def test_mapping_bug_is_not_reported_as_an_outage(self):
+        svc = _service()
+        bad = MagicMock()
+        bad.edges = [object()]  # no .uuid etc: a result-mapping defect
+        bad.nodes = bad.episodes = bad.communities = []
+        svc._run_on_bridge = lambda coro, timeout=30.0: bad
+        with pytest.raises(AttributeError):
+            svc.search_graph("q", "u1")
+
     def test_graph_failure_is_marked_degraded(self):
         out = _service(fail=ConnectionError("neo4j down")).search_graph("q", "u1")
         assert out["degraded"] is True
@@ -103,3 +118,39 @@ class TestMcp:
         swap_services(_service())
         result = await mcp_server.call_tool("search_knowledge_graph", {"query": "q", "user_id": "u1"})
         assert json.loads(result[0].text) == EMPTY
+
+
+class TestInitFailureIsRecorded:
+    def _init(self, monkeypatch, graph_store_cfg, factory_exc=None):
+        import memory.core as core
+
+        svc = MemoryService()
+        monkeypatch.setattr(svc, "_ensure_indexes_at_startup", lambda: None)
+        monkeypatch.setattr(svc, "_retry_index_ensure", lambda: None, raising=False)
+        monkeypatch.setattr(core, "_memory_from_config", lambda cls, cfg: MagicMock(spec=[]))
+        cfg = {"graph_store": graph_store_cfg} if graph_store_cfg else {}
+        fake = MagicMock()
+        fake.get_mem0_config.return_value = cfg
+        monkeypatch.setattr(core, "settings", fake)
+        if factory_exc is not None:
+            import mem0.utils.factory as factory
+
+            def boom(provider, shim):
+                raise factory_exc
+
+            monkeypatch.setattr(factory.GraphStoreFactory, "create", staticmethod(boom))
+        svc._filter_indexes_ok = True
+        svc._created_at_index_ok = True
+        svc._get_memory()
+        return svc
+
+    def test_configured_graph_that_fails_to_attach_reads_degraded(self, monkeypatch):
+        svc = self._init(monkeypatch, {"provider": "graphiti", "config": {}}, ConnectionError("bolt refused"))
+        assert svc._graph_init_error and "bolt refused" in svc._graph_init_error
+        out = svc.search_graph("q", "u1")
+        assert out["degraded"] is True and out["error"] == "graph_unavailable"
+
+    def test_graph_not_configured_stays_plain(self, monkeypatch):
+        svc = self._init(monkeypatch, None)
+        assert svc._graph_init_error is None
+        assert svc.search_graph("q", "u1") == EMPTY

@@ -66,7 +66,20 @@ _GRAPH_SEARCH_JOIN_TIMEOUT_S = 45.0
 import threading as _threading
 
 _graph_leg_budget_timeouts = 0
+
 _graph_leg_budget_lock = _threading.Lock()
+
+
+def _degraded_graph_result() -> dict:
+    """Empty graph-search result marked as an outage, not as "no facts"."""
+    return {
+        "edges": [],
+        "nodes": [],
+        "episodes": [],
+        "communities": [],
+        "degraded": True,
+        "error": "graph_unavailable",
+    }
 
 
 def _note_graph_leg_budget_timeout() -> int:
@@ -1477,6 +1490,9 @@ class SearchMixin:
         """
         g = self._get_graphiti()
         if g is None:
+            if getattr(self, "_graph_init_error", None):
+                # Configured but failed to initialise: an outage, not "off".
+                return _degraded_graph_result()
             return {"edges": [], "nodes": [], "episodes": [], "communities": []}
 
         from graphiti_core.search.search_config import SearchConfig
@@ -1511,45 +1527,38 @@ class SearchMixin:
                     search_filter=_live_edges_filter(),
                 )
             )
-
-            return {
-                "edges": [
-                    {
-                        "uuid": e.uuid,
-                        "name": e.name,
-                        "fact": e.fact,
-                        "valid_at": _dt_to_iso(getattr(e, "valid_at", None)),
-                        "invalid_at": _dt_to_iso(getattr(e, "invalid_at", None)),
-                        "created_at": _dt_to_iso(getattr(e, "created_at", None)),
-                    }
-                    for e in results.edges
-                ],
-                "nodes": [
-                    {"uuid": n.uuid, "name": n.name, "summary": n.summary}
-                    for n in results.nodes
-                ],
-                "episodes": [
-                    {"uuid": ep.uuid, "name": ep.name, "content": ep.content}
-                    for ep in results.episodes
-                ],
-                "communities": [
-                    {"uuid": c.uuid, "name": c.name}
-                    for c in results.communities
-                ],
-            }
         except Exception as e:
             # An outage (Neo4j down, bridge timeout, Graphiti error) must not
             # read as "no facts": mark the empty result degraded so REST and
             # MCP callers can tell the two apart.
             logger.error(f"Graph search failed: {e}")
-            return {
-                "edges": [],
-                "nodes": [],
-                "episodes": [],
-                "communities": [],
-                "degraded": True,
-                "error": "graph_unavailable",
-            }
+            return _degraded_graph_result()
+
+        return {
+            "edges": [
+                {
+                    "uuid": e.uuid,
+                    "name": e.name,
+                    "fact": e.fact,
+                    "valid_at": _dt_to_iso(getattr(e, "valid_at", None)),
+                    "invalid_at": _dt_to_iso(getattr(e, "invalid_at", None)),
+                    "created_at": _dt_to_iso(getattr(e, "created_at", None)),
+                }
+                for e in results.edges
+            ],
+            "nodes": [
+                {"uuid": n.uuid, "name": n.name, "summary": n.summary}
+                for n in results.nodes
+            ],
+            "episodes": [
+                {"uuid": ep.uuid, "name": ep.name, "content": ep.content}
+                for ep in results.episodes
+            ],
+            "communities": [
+                {"uuid": c.uuid, "name": c.name}
+                for c in results.communities
+            ],
+        }
 
     def keyword_search(
         self,

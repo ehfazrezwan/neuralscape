@@ -3,8 +3,8 @@
 Real: the MemoryService, its Graphiti bridge and the Neo4j driver.  The outage
 is a real one: the live Neo4j driver is closed under the service, so the next
 graph search fails inside Graphiti exactly as it would with the database
-unreachable.  No data is written (nothing to clean in Neo4j) and no LLM tokens
-are spent on the search itself.
+unreachable.  No data is written (nothing to clean in Neo4j) and the query is embedded once
+(one small embedding call) and nothing else spends tokens.
 
 Fails if the degraded marker is removed: the outage case then returns the
 plain empty lists, indistinguishable from the healthy case.
