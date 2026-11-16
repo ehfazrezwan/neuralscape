@@ -184,8 +184,9 @@ def test_stop_delivers_the_real_turn_once_and_only_the_turn(lane):
     assert s.offset() == 6
     s.stop(final)
     check_sent_exactly_once(proxy, "zq-code")  # nothing new: nothing sent
-    # compile frequency is plugin policy (windowed per session since 2.9.8), not under test here
-    assert len(proxy.calls(COMPILE)) >= 1
+    # Compile is windowed per session (plugin 2.9.8, #514): the first Stop delivered turns and is due, so it
+    # compiles once; the second Stop delivers nothing, so it sends no compile. Exactly one, deterministically.
+    assert len(proxy.calls(COMPILE)) == 1
 
 
 @needs_node
