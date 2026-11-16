@@ -204,6 +204,17 @@ def test_no_floating_latest_image_tag():
             assert not re.search(r"image:.*:latest\b", line), f"k8s/{path.name}: {line.strip()}"
 
 
+def test_docling_image_matches_compose_tag_and_digest():
+    if not _present():
+        return
+    docling = _values()["docling"]["image"]
+    chart_ref = f"{docling['repository']}:{docling['tag']}"
+    compose = yaml.safe_load((REPO_ROOT / "docker-compose.yml").read_text())
+    compose_ref = compose["services"]["docling"]["image"]
+    assert "@sha256:" in compose_ref, "compose pins Docling by digest; the chart follows it"
+    assert chart_ref == compose_ref, f"chart Docling image {chart_ref} != compose {compose_ref}"
+
+
 # ── removed settings / stale text ───────────────────────────────────
 
 

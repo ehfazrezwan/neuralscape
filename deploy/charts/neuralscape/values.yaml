@@ -7,8 +7,11 @@
 # a private overlay / terraform.tfvars — never committed to this public repo.
 
 image:
+  # Placeholder: CI publishes to ghcr.io/<owner>/neuralscape (tags sha-<12>).
+  # A real install sets repository and tag to the image it pushed.
   repository: neuralscape/neuralscape
-  # Pinned image tag. Empty = use the chart's appVersion (Chart.yaml). A floating
+  # Pinned image tag. Empty = use the chart's appVersion (Chart.yaml), an
+  # unpublished placeholder that only keeps a bare lint/template rendering. A floating
   # "latest" is rejected at render time (see _helpers.tpl). Deployments set an
   # explicit immutable tag (deploy/terraform passes image_tag; the CI image is
   # published as sha-<12>).
@@ -121,8 +124,8 @@ docling:
   enabled: true
   image:
     repository: ghcr.io/docling-project/docling-serve
-    # Same pinned release the compose stack runs; never a floating tag.
-    tag: v1.38.2
+    # Same pinned release and digest the compose stack runs; never a floating tag.
+    tag: v1.38.2@sha256:8a5fbc993da9dec17c53880e2445834591ad26800ef698ca64096bef29671808
     pullPolicy: IfNotPresent
   replicaCount: 1
   port: 5001

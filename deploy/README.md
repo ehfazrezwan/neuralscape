@@ -66,12 +66,20 @@ deploy/build-and-push.sh REGION-docker.pkg.dev/PROJECT/REPO/neuralscape:v1
 
 **Image tag policy.** The chart never deploys a floating tag. `image.tag` is
 used as given; when it is empty the chart falls back to `Chart.yaml`'s
-`appVersion`, and rendering fails if the result is empty or `latest`. We keep
-that fallback (rather than a `required` tag with no default) so a bare
-`helm lint` / `helm template` of the chart, which CI runs without values, still
-renders. The Terraform `image_tag` variable has no default, so a Terraform
-deploy always pins an explicit immutable tag (the one you pushed above). The
-Docling image is pinned to a release in `values.yaml` as well.
+`appVersion`, and rendering fails if the result is empty or `latest`.
+The defaults are **unpublished placeholders**: no image is published under
+`appVersion` (`0.1.0`), and the default `image.repository`
+(`neuralscape/neuralscape`) is not where CI publishes (CI pushes
+`ghcr.io/<owner>/neuralscape:sha-<12>`). A bare `helm install` therefore renders
+and then fails to pull. The fallback exists only so a bare `helm lint` /
+`helm template` of the chart, which CI runs without values, still renders.
+**A real install must set `image.repository` and `image.tag`** to the image it
+pushed (for example `--set image.repository=ghcr.io/<owner>/neuralscape
+--set image.tag=sha-<12>`). The Terraform `image_tag` variable has no default,
+so a Terraform deploy always pins an explicit immutable tag (the one you pushed
+above); set the repository in your private values as well. The Docling image is
+pinned by release tag and digest in `values.yaml`, the same reference the
+compose stack runs.
 
 **Configuration policy.** `values.yaml` `config:` carries only what a cluster
 must set (backend addresses, mount paths, telemetry opt-out) and each key must
