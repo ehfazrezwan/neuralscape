@@ -159,3 +159,27 @@ async def test_sync_requested_while_one_is_queued_coalesces():
         await tm.enqueue_connector_sync("rest-1", "alice", generation="g1")
         await tm.enqueue_connector_sync("rest-1", "alice", generation="g1")
     assert len(tm.pool.enqueued) == 1
+
+
+@pytest.mark.asyncio
+async def test_cron_past_a_finished_run_enqueues_again_and_counts_it(monkeypatch):
+    """The hourly cron must not be dropped (and counted) because the last run's result is cached."""
+    import worker
+    from config import settings
+
+    pool = _ArqLikePool()
+    vault = ConnectorVault(FakeVaultStore(), Fernet(Fernet.generate_key()))
+    await vault.put(
+        {"connector_id": "rest-1", "connector_type": "generic_rest", "owner_user_id": "alice",
+         "credentials": {}, "config": CONFIG}
+    )
+    monkeypatch.setattr(settings, "connectors_enabled", True)
+    ctx = {"vault": vault, "redis": pool}
+    with patch("task_manager.Job", side_effect=_status_of(pool)):
+        assert (await worker.connector_sync_cron(ctx))["enqueued"] == 1
+        # still queued: coalesced, not counted
+        assert (await worker.connector_sync_cron(ctx))["enqueued"] == 0
+        (job_id,) = pool.queued
+        pool.finish(job_id)
+        assert (await worker.connector_sync_cron(ctx))["enqueued"] == 1
+    assert len(pool.enqueued) == 2
