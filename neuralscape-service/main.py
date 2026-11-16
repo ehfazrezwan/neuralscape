@@ -12,6 +12,7 @@ import hashlib
 import json
 import logging
 import time
+from typing import Any
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
@@ -155,6 +156,7 @@ def _install_graph_reenrich_dispatch() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("Starting Neuralscape Service...")
+    logger.info(third_party_telemetry.startup_log_line())
 
     # Validate required configuration before anything else
     settings.validate_required()
@@ -396,7 +398,7 @@ async def health():
     Phase B addition: includes knowledge_systems section aggregating each
     registered system's health + info (purely additive; no existing keys changed).
     """
-    checks: dict[str, str] = {}
+    checks: dict[str, Any] = {}
 
     # Check Redis (task queue)
     try:
@@ -434,6 +436,9 @@ async def health():
             checks["graph_store"] = "not_initialized"
     except Exception:
         checks["graph_store"] = "unreachable"
+
+    # Effective third-party telemetry (on/off only; no endpoint, key or id).
+    checks["third_party_telemetry"] = third_party_telemetry.effective_labels()
 
     # Phase B: aggregate knowledge systems health (additive only)
     knowledge_systems = []
@@ -483,7 +488,7 @@ async def health():
         return JSONResponse(status_code=503, content=response_data)
 
     overall = "ok"
-    if any(v != "ok" for v in checks.values()):
+    if any(v != "ok" for k, v in checks.items() if k != "third_party_telemetry"):
         overall = "degraded"
 
     response_data = {
@@ -762,7 +767,7 @@ async def advanced_graph_search_legacy(req: LegacyGraphSearchRequest, request: R
             limit=req.limit,
             search_config=req.search_config,
         )
-        return {"status": "ok", **results}
+        return {"status": "degraded" if results.get("degraded") else "ok", **results}
     except HTTPException:
         raise
     except Exception:
@@ -2516,7 +2521,7 @@ async def v1_graph_search(req: GraphSearchRequest, request: Request):
             limit=req.limit,
             search_config=req.search_config,
         )
-        return {"status": "ok", **results}
+        return {"status": "degraded" if results.get("degraded") else "ok", **results}
     except HTTPException:
         raise
     except Exception as e:

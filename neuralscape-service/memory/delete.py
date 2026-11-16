@@ -30,6 +30,11 @@ _BULK_PAGE = 500
 _BULK_MAX_ROUNDS = 40
 
 
+def _tombstones_note(n: int) -> str:
+    """Message suffix saying how many of the erased rows were hidden tombstones."""
+    return f" (including {n} tombstoned)" if n else ""
+
+
 def _bulk_partial_fields(failed_ids: list[str], truncated: bool) -> dict:
     """Honest-status keys every bulk delete returns (``failed_ids`` empty / ``truncated`` False when clean)."""
     return {"failed_ids": list(failed_ids), "failed": len(failed_ids), "truncated": bool(truncated)}
@@ -313,6 +318,10 @@ class DeleteMixin:
         can trigger via the MCP tool). Pass ``include_shared=True`` to
         also delete the caller's shared writes (admin-style nuke).
 
+        Every sweep erases the caller's tombstoned rows (dreaming / semantic-dedup
+        / supersession tombstones) like any other row, under the same
+        shared/standard rules and graph cascade; the count includes them.
+
         Single-memory delete by ID is unaffected — that path is always
         an intentional action against a specific memory.
         """
@@ -349,6 +358,7 @@ class DeleteMixin:
             return self._delete_private_only(user_id)
 
         deleted_count = 0
+        tombstones_erased = 0
         skipped_shared = 0
         skipped_standard = 0
         # Rows whose vector delete succeeded; the graph cascade runs once
@@ -397,7 +407,7 @@ class DeleteMixin:
 
         if filter_null_category:
             def _handle_null(mem_info):
-                nonlocal deleted_count, skipped_shared, skipped_standard
+                nonlocal deleted_count, tombstones_erased, skipped_shared, skipped_standard
                 meta = mem_info.get("metadata", {}) or {}
                 if isinstance(meta.get("metadata"), dict):
                     meta = meta["metadata"]
@@ -417,6 +427,8 @@ class DeleteMixin:
                         "group_id": None,
                     })
                     deleted_count += 1
+                    if _mem_is_tombstoned(mem_info):
+                        tombstones_erased += 1
                 except Exception as e:
                     failed_ids.append(mid)
                     logger.warning(f"Failed to delete null-category memory {mid}: {e}")
@@ -432,6 +444,7 @@ class DeleteMixin:
             graph = self._bulk_graph_cleanup(cascade_rows, "null-category")
             return {
                 "message": _deleted_msg("null-category memories", deleted_count, skipped_shared, skipped_standard)
+                + _tombstones_note(tombstones_erased)
                 + (f" ({len(failed_ids)} failed)" if failed_ids else ""),
                 **graph,
                 **_bulk_partial_fields(failed_ids, truncated),
@@ -452,9 +465,9 @@ class DeleteMixin:
             return self._extract_memory_list(m.get_all(filters=filters, top_k=limit))
 
         def _handle_row(mem):
-            nonlocal deleted_count, skipped_shared, skipped_standard
-            if _mem_is_tombstoned(mem):
-                return  # reversible dream tombstones are not touched by a filtered sweep (they never were)
+            nonlocal deleted_count, tombstones_erased, skipped_shared, skipped_standard
+            # Tombstoned rows (dreaming / semantic-dedup / supersession) are erased
+            # like any other row of the caller, under the same shared/standard rules.
             meta = mem.get("metadata") or {}
             if isinstance(meta.get("metadata"), dict):
                 meta = meta["metadata"]
@@ -473,6 +486,8 @@ class DeleteMixin:
                 if full_mem:
                     cascade_rows.append({"id": mid, "mem": full_mem, "group_id": None})
                 deleted_count += 1
+                if _mem_is_tombstoned(mem):
+                    tombstones_erased += 1
             except Exception as e:
                 failed_ids.append(mid)
                 logger.warning(f"Failed to delete memory {mid}: {e}")
@@ -481,6 +496,7 @@ class DeleteMixin:
         graph = self._bulk_graph_cleanup(cascade_rows, "filtered")
         return {
             "message": _deleted_msg("memories", deleted_count, skipped_shared, skipped_standard)
+            + _tombstones_note(tombstones_erased)
             + (f" ({len(failed_ids)} failed)" if failed_ids else ""),
             **graph,
             **_bulk_partial_fields(failed_ids, truncated),
@@ -585,6 +601,7 @@ class DeleteMixin:
         # half-deleted points. Once every vector is gone the graph work is
         # best-effort and fully reportable.
         deleted = 0
+        tombstones_erased = 0
         deleted_ids: set[str] = set()
         failed_ids: list[str] = []
         for mid, payload, _ in private_rows:
@@ -592,6 +609,8 @@ class DeleteMixin:
                 self._memory.vector_store.delete(mid)
                 deleted += 1
                 deleted_ids.add(mid)
+                if _is_tombstoned(payload):
+                    tombstones_erased += 1
             except Exception as e:
                 failed_ids.append(mid)
                 logger.warning(f"Failed to delete private memory {mid}: {e}")
@@ -627,7 +646,7 @@ class DeleteMixin:
             deleted_ids=deleted_ids,
         )
 
-        msg = f"Deleted {deleted} private memories"
+        msg = f"Deleted {deleted} private memories" + _tombstones_note(tombstones_erased)
         if shared_preserved:
             msg += f" (preserved {shared_preserved} shared)"
         if standard_preserved:

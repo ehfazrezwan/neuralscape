@@ -104,6 +104,9 @@ class CoreMixin:
         self._memory = None
         self._graphiti = None
         self._bridge = None
+        # Set when the graph store was configured but its adapter failed to
+        # attach (service runs vector-only); None when graph is simply off.
+        self._graph_init_error: str | None = None
         self._genai_model = None
         self._init_lock = threading.Lock()
 
@@ -180,6 +183,7 @@ class CoreMixin:
                                 provider,
                             )
                         except Exception as e:
+                            self._graph_init_error = f"{type(e).__name__}: {e}"
                             logger.warning(
                                 f"Graphiti adapter init failed (non-critical): {e}"
                             )
