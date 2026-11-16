@@ -80,7 +80,10 @@ def fake(monkeypatch):
     index_store._reset_for_tests()
     router._PROJECT_CONFIGS.clear()
     r = FakeRedis()
+    # Config WRITES use _redis(), config READS use the separate short-timeout _redis_read()
+    # client: route both to the fake, or reads fall through to a real (absent) Redis.
     monkeypatch.setattr(index_store, "_redis", lambda: r)
+    monkeypatch.setattr(index_store, "_redis_read", lambda: r)
     yield r
     index_store._reset_for_tests()
     router._PROJECT_CONFIGS.clear()
@@ -263,3 +266,29 @@ def test_engines_without_a_caller_parameter_are_called_unchanged():
     sysm = _system(_PlainEngine())
     assert sysm.recall(RecallRequest(query="q", user_id="alice", operation="neighbors", label="f")).content == "Neighbors"
     sysm.recall(RecallRequest(query="q", user_id="alice", operation="locate"))
+
+
+# ── a write is visible to the next read in the SAME process ──────────
+# index_store negative-caches a miss and backs off after a failed read, each for one TTL.
+# That bounds staleness against OTHER processes' writes; this process's own writes must
+# never be hidden by it.
+
+
+def _prime_miss_and_down(fake):
+    assert router.get_project_config("p1") is None  # authoritative miss -> negative-cached
+    assert "p1" in index_store._mem_cfg_miss_at
+    index_store._cfg_down_until = 10**12  # and a failed read -> process-wide backoff
+
+
+def test_merge_after_cached_miss_and_backoff_is_visible_immediately(fake):
+    _prime_miss_and_down(fake)
+    assert worker._merge_index_into_project_config("p1", "code-native", "code--u--svc") == (True, "")
+    assert router.get_project_config("p1").code_space == "code--u--svc"
+    assert index_store.load_project_config("p1")["code_space"] == "code--u--svc"
+
+
+def test_set_project_config_after_cached_miss_and_backoff_is_visible_immediately(fake):
+    _prime_miss_and_down(fake)
+    router.set_project_config(router.ProjectKnowledgeConfig(project_id="p1", code_systems=["code-cbm"]))
+    assert router.get_project_config("p1").code_systems == ["code-cbm"]
+    assert index_store.load_project_config("p1")["code_systems"] == ["code-cbm"]
