@@ -26,6 +26,9 @@ def flag_on(monkeypatch, tmp_path):
     monkeypatch.setattr(settings, "ledger_sqlite_path", str(tmp_path / "ledger.db"))
     monkeypatch.setattr(settings, "neuralscape_user_token_secret", "")
     monkeypatch.setattr(settings, "neuralscape_api_key", "")
+    # Auth is fail-closed (#456).  tests/conftest.py gives every unit test the explicit opt-out; this
+    # directory's conftest does not, so ask for it here, exactly as a trusted local machine would.
+    monkeypatch.setattr(settings, "neuralscape_auth_disabled", True)
 
 
 @pytest.fixture()

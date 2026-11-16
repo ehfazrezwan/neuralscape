@@ -10,15 +10,12 @@ never contain ``@``. Two-step resolution:
 2. **Slug** — everyone else gets a deterministic slug of their email, so the
    same person always resolves to the same id across sessions.
 
-The legacy slug folds every run of disallowed characters to one ``-``, so
-distinct emails can share an id (``a+b@x.com`` and ``a-b@x.com``).  Under the
-enforced auth profile (``NS_AUTH_PROFILE=enforced``, opt-in: the setting
-defaults to ``legacy_compat``) a fresh identity gets :func:`collision_free_user_id` instead: the
-same slug whenever the slug can be read back to exactly one email, otherwise an
-id no slug can produce.  ``legacy_compat`` keeps the legacy slug byte for byte.  Switching an existing
-deployment to ``enforced`` also re-keys graph group ids (see
-``docs/neuralscape/03-memory-model.md``): data under a legacy name that the new
-names no longer match stops being read.
+The slug is lossy (``a+b@x.com`` and ``a-b@x.com`` both give ``a-b-x.com``) and
+existing users' ids must never change, so ``slugify_email`` is left as is and a
+collision is resolved at first login instead: when the slug is already claimed
+by a different identity, the newcomer gets ``disambiguate_user_id(slug, email)``
+(slug + short hash of the normalised email). See
+``login_providers.provision_user_id``.
 """
 
 from __future__ import annotations
@@ -52,55 +49,29 @@ def slugify_email(email: str) -> str:
     return slug
 
 
-# Emails whose legacy slug reads back to exactly one address: the local part has no
-# ``-`` (so the first ``-`` of the slug is the ``@``), nothing is folded, and no edge
-# character is trimmed.
-_SLUG_SAFE_EMAIL = re.compile(r"[a-z0-9][a-z0-9_.]*@[a-z0-9_.\-]*[a-z0-9]")
-# Ids no slug can start with (a slug starts with a letter or digit): ``_x`` carries
-# the address itself, hex-encoded; ``_h`` a SHA-256 digest when that would be too long.
-_ENCODED_PREFIX = "_x"
-_DIGEST_PREFIX = "_h"
-
-
-def collision_free_ids_enabled() -> bool:
-    """Whether new ids and storage namespaces use the collision-free encodings.
-
-    On under the enforced auth profile only: ``legacy_compat`` (the default for
-    upgraded deployments) keeps every id and group id it already stored.
-    """
-    from config import settings
-
-    return settings.ns_auth_profile == "enforced"
-
-
-def collision_free_user_id(email: str) -> str:
-    """A pattern-valid ``user_id`` that differs for every distinct normalized email.
-
-    An address whose legacy slug is unambiguous keeps that slug
-    (``alice.smith@example.com`` -> ``alice.smith-example.com``).  Any other
-    address gets ``_x`` + its UTF-8 hex when that fits the 100-character limit,
-    else ``_h`` + its SHA-256 hex digest; a slug never starts with ``_``.
-    """
-    norm = (email or "").strip().lower()
-    if _SLUG_SAFE_EMAIL.fullmatch(norm) and len(norm) <= _MAX_LEN:
-        return norm.replace("@", "-", 1)
-    encoded = norm.encode("utf-8").hex()
-    if len(_ENCODED_PREFIX) + len(encoded) <= _MAX_LEN:
-        return _ENCODED_PREFIX + encoded
-    return _DIGEST_PREFIX + hashlib.sha256(norm.encode("utf-8")).hexdigest()
-
-
-def unlinked_user_id(email: str) -> str:
-    """The id a fresh, unlinked identity is offered: legacy slug or collision-free id."""
-    if collision_free_ids_enabled():
-        return collision_free_user_id(email)
-    return slugify_email(email)
-
-
 def derive_user_id(email: str, identity_map: dict[str, str]) -> str:
     """Resolve an email to a user_id: override map first, else a slug."""
     norm = (email or "").strip().lower()
     mapped = identity_map.get(norm)
     if mapped:
         return mapped
-    return unlinked_user_id(norm)
+    return slugify_email(norm)
+
+
+def disambiguate_user_id(slug: str, email: str, *, hex_len: int = 8) -> str:
+    """Return ``slug`` made unique to ``email``: ``<slug>-<sha256(email)[:n]>``.
+
+    Deterministic, pattern-valid and capped at 100 chars (the slug is trimmed
+    to make room for the suffix). Idempotent: a slug that already carries this
+    email's suffix (of any length) is re-suffixed, never double-suffixed.
+    Only used when the plain slug is already claimed by someone else.
+    """
+    norm = (email or "").strip().lower()
+    digest = hashlib.sha256(norm.encode("utf-8")).hexdigest()
+    for n in (64, 16, 8):
+        if slug.endswith("-" + digest[:n]) and len(slug) > n + 1:
+            slug = slug[: -(n + 1)]
+            break
+    suffix = digest[:hex_len]
+    head = _EDGE.sub("", slug[: _MAX_LEN - len(suffix) - 1])
+    return f"{head}-{suffix}" if head else f"user-{suffix}"

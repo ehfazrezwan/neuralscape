@@ -64,14 +64,14 @@ class WorkerSettings:
     ]
     redis_settings = parse_redis_settings()
     queue_name = settings.arq_queue_name        # "neuralscape:queue"
-    max_jobs = 10
+    max_jobs = settings.arq_max_jobs            # 10 default (ARQ_MAX_JOBS)
     job_timeout = settings.arq_job_timeout      # 300s default
     max_tries = settings.arq_max_retries        # 3 default
 ```
 
 Key knobs:
 
-- `max_jobs = 10` — ten task coroutines run concurrently per worker process. Scale by adding worker replicas, not by raising this.
+- `max_jobs` (`ARQ_MAX_JOBS`, default 10) — task coroutines run concurrently per worker process. The graph worker reads `GRAPH_MAX_JOBS` (default 4) and the ingest worker `INGEST_MAX_JOBS` (default 3). Prefer adding worker replicas to raising these.
 - `job_timeout = 300s` — a single task that exceeds 5 minutes is killed and counted as a failure (subject to `max_tries`).
 - `max_tries = 3` — if the task raises any uncaught exception, ARQ re-enqueues it up to two more times with default backoff. After the third failure the job is marked permanently failed.
 - `queue_name = "neuralscape:queue"` — the API and worker must agree on this. Mismatched queue names silently mean enqueued jobs never run.

@@ -31,8 +31,12 @@ Everything is signed with the existing ``NEURALSCAPE_USER_TOKEN_SECRET`` via
 ``verify_user_token`` only accepts ``typ`` in {absent, "access"}, so codes /
 refresh / client tokens can never be replayed as a Bearer credential.
 
-The single piece of real state is a short-TTL Redis key per consumed auth
-code (replay protection); it degrades to best-effort if Redis is down.
+The only real state is a Redis key per consumed single-use credential: one per
+auth code (``oauth:code:<jti>``) and one per redeemed refresh token
+(``oauth:refresh:<jti>``, rotate-and-consume) plus
+``oauth:revoked_family:<fam>`` set when a rotated token is replayed. Both guards fail CLOSED: when
+Redis is unreachable the token endpoint answers 503 ``temporarily_unavailable``
+and issues nothing.
 """
 
 from __future__ import annotations
@@ -53,11 +57,13 @@ import identity_store
 from login_providers import (
     AuthorizeContext,
     GoogleProvider,
+    IdentityStoreUnavailable,
     LoginError,
     LoginNeedsLink,
     SupabaseProvider,
     _supabase_finish_page,
     get_login_provider,
+    provision_user_id,
     sign_link_ticket,
     verify_link_ticket,
 )
@@ -135,26 +141,94 @@ def _verify_pkce(code_verifier: str, code_challenge: str) -> bool:
     return secrets.compare_digest(_b64url(digest), code_challenge)
 
 
-async def _consume_code_jti(jti: str) -> bool:
-    """Mark an auth-code id used. Returns True if this is the first use.
+class _ReplayGuardUnavailable(Exception):
+    """Redis could not be reached, so single-use cannot be enforced."""
 
-    Backed by Redis ``SET NX EX`` for replay protection. If Redis is
-    unavailable we log and allow the exchange (best-effort) rather than
-    breaking login — the code is already single-client, PKCE-bound, and
-    short-lived, so the residual replay window is small.
-    """
+
+_REDIS_TIMEOUT = 2  # seconds; a hung Redis must fail closed promptly, not stall /oauth/token
+
+
+async def _redis_op(op):
+    """Run ``op(client)`` against Redis with short timeouts. Any failure raises
+    ``_ReplayGuardUnavailable``: callers must refuse (fail closed) rather than
+    let a single-use credential be redeemed more than once."""
     try:
         import redis.asyncio as aioredis
 
-        client = aioredis.from_url(settings.redis_url)
+        client = aioredis.from_url(
+            settings.redis_url,
+            socket_connect_timeout=_REDIS_TIMEOUT,
+            socket_timeout=_REDIS_TIMEOUT,
+        )
         try:
-            ok = await client.set(f"oauth:code:{jti}", "1", nx=True, ex=_CODE_TTL)
-            return bool(ok)
+            return await op(client)
         finally:
             await client.aclose()
-    except Exception as e:  # noqa: BLE001 — best-effort guard
-        logger.warning("OAuth code replay-guard unavailable (%s); allowing", e)
-        return True
+    except Exception as e:  # noqa: BLE001 — any store failure means fail closed
+        logger.warning("OAuth single-use guard unavailable (%s); refusing", e)
+        raise _ReplayGuardUnavailable() from e
+
+
+async def _consume_once(key: str, ttl: int) -> bool:
+    """Atomically claim ``key`` (Redis ``SET NX EX``). True on the first claim,
+    False if it was already claimed."""
+
+    async def op(client):
+        return bool(await client.set(key, "1", nx=True, ex=max(1, int(ttl))))
+
+    return await _redis_op(op)
+
+
+async def _family_revoked(fam: str) -> bool:
+    """True if reuse of a token in this family was detected earlier."""
+
+    async def op(client):
+        return bool(await client.exists(f"oauth:revoked_family:{fam}"))
+
+    return await _redis_op(op)
+
+
+async def _revoke_family(fam: str, ttl: int) -> None:
+    """Revoke every refresh token in a family (TTL = the refresh lifetime)."""
+
+    async def op(client):
+        await client.set(f"oauth:revoked_family:{fam}", "1", ex=max(1, int(ttl)))
+
+    await _redis_op(op)
+
+
+async def _consume_code_jti(jti: str) -> bool:
+    """Mark an auth-code id used. True if this is the first use."""
+    return await _consume_once(f"oauth:code:{jti}", _CODE_TTL)
+
+
+async def _consume_refresh_jti(jti: str, ttl: int) -> bool:
+    """Mark a refresh-token id redeemed. ``ttl`` is the token's remaining life,
+    so the marker outlives the token and a replay can never slip through."""
+    return await _consume_once(f"oauth:refresh:{jti}", ttl)
+
+
+# ── HTML responses: anti-framing + hardening headers ─────────────────────
+
+_HTML_SECURITY_HEADERS = {
+    "X-Frame-Options": "DENY",
+    # frame-ancestors is the modern equivalent of X-Frame-Options. The pages
+    # use inline CSS/JS and the Supabase page loads a CDN module, so no
+    # script/style policy is imposed here; only the directives that cannot
+    # break them.
+    "Content-Security-Policy": "frame-ancestors 'none'; base-uri 'none'; object-src 'none'",
+    "Referrer-Policy": "no-referrer",
+    "X-Content-Type-Options": "nosniff",
+    "Cache-Control": "no-store",
+}
+
+
+def _html_response(content: str, status_code: int = 200) -> HTMLResponse:
+    """Every HTML page served under /oauth/* goes through here so none can be
+    framed (clickjacking of the consent button) or leak the URL via Referer."""
+    return HTMLResponse(
+        content=content, status_code=status_code, headers=dict(_HTML_SECURITY_HEADERS)
+    )
 
 
 # ── discovery metadata ───────────────────────────────────────────────────
@@ -279,10 +353,11 @@ _CONSENT_PAGE = """<!doctype html>
 <title>Connect Neuralscape</title>
 <style>
   :root {{ color-scheme: light dark; }}
+  *, *::before, *::after {{ box-sizing: border-box; }}
   body {{ font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
          margin: 0; min-height: 100vh; display: grid; place-items: center;
-         background: #0b0d12; color: #e7e9ee; }}
-  .card {{ width: min(440px, 92vw); background: #151821; border: 1px solid #262b38;
+         background: #0b0d12; color: #e7e9ee; overflow-wrap: anywhere; }}
+  .card {{ width: min(440px, 92vw); max-width: 100%; min-width: 0; background: #151821; border: 1px solid #262b38;
           border-radius: 16px; padding: 28px 28px 24px; box-shadow: 0 12px 40px rgba(0,0,0,.45); }}
   h1 {{ font-size: 19px; margin: 0 0 4px; }}
   p  {{ font-size: 14px; line-height: 1.5; color: #aab1c2; margin: 8px 0; }}
@@ -293,12 +368,13 @@ _CONSENT_PAGE = """<!doctype html>
              background:#0d0f16; color:#e7e9ee; border:1px solid #2c3242; border-radius:10px;
              padding:10px; }}
   button {{ margin-top: 18px; width: 100%; padding: 12px; font-size: 15px; font-weight: 600;
-           border: 0; border-radius: 10px; background: #5b7cfa; color: #fff; cursor: pointer; }}
-  button:hover {{ background: #4f70ee; }}
+           border: 0; border-radius: 10px; background: #3b5bdb; color: #fff; cursor: pointer; }}
+  button:hover {{ background: #364fc7; }}
   .err {{ background: #2a1518; border: 1px solid #5b2a2f; color: #ffb4b4; font-size: 13px;
          border-radius: 10px; padding: 10px 12px; margin: 14px 0 0; }}
-  .hint {{ font-size: 12px; color: #7b8198; }}
-  code {{ background:#0d0f16; padding:1px 5px; border-radius:5px; font-size:12px; }}
+  .hint {{ font-size: 12px; color: #7b8198; overflow-wrap: anywhere; }}
+  code {{ background:#0d0f16; padding:1px 5px; border-radius:5px; font-size:12px;
+         overflow-wrap:anywhere; word-break:break-word; }}
   .provider-btn {{ display:flex; align-items:center; justify-content:center; gap:8px;
            width:100%; box-sizing:border-box; margin-top:8px; padding:11px; font-size:14px;
            font-weight:600; text-decoration:none; border-radius:10px; background:#fff;
@@ -378,7 +454,7 @@ def _render_consent(
         .replace("<!--DIVIDER-->", divider)
         .replace("<!--TOKEN_FORM-->", token_form)
     )
-    return HTMLResponse(content=page, status_code=status_code)
+    return _html_response(page, status_code)
 
 
 @router.get("/oauth/authorize", response_model=None)
@@ -543,15 +619,16 @@ def _login_error_page(err: LoginError) -> HTMLResponse:
         "<meta name='viewport' content='width=device-width, initial-scale=1'>"
         "<title>Sign-in failed</title><style>"
         ":root{color-scheme:light dark;}"
-        "body{font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,sans-serif;"
+        "*,*::before,*::after{box-sizing:border-box;}"
+        "body{overflow-wrap:anywhere;font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,sans-serif;"
         "margin:0;min-height:100vh;display:grid;place-items:center;background:#0b0d12;color:#e7e9ee;}"
-        ".card{width:min(440px,92vw);background:#151821;border:1px solid #262b38;border-radius:16px;"
+        ".card{width:min(440px,92vw);max-width:100%;min-width:0;background:#151821;border:1px solid #262b38;border-radius:16px;"
         "padding:28px;box-shadow:0 12px 40px rgba(0,0,0,.45);}"
         "h1{font-size:19px;margin:0 0 8px;}p{font-size:14px;color:#aab1c2;}"
         "</style></head><body><div class='card'><h1>Sign-in failed</h1>"
         f"<p>{safe}</p></div></body></html>"
     )
-    return HTMLResponse(content=page, status_code=err.status)
+    return _html_response(page, err.status)
 
 
 # ── self-service link (claim an existing account) ─────────────────────────
@@ -560,9 +637,11 @@ _LINK_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Link your Neuralscape account</title><style>
   :root {{ color-scheme: light dark; }}
+  *, *::before, *::after {{ box-sizing: border-box; }}
   body {{ font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
-         margin:0; min-height:100vh; display:grid; place-items:center; background:#0b0d12; color:#e7e9ee; }}
-  .card {{ width:min(460px,92vw); background:#151821; border:1px solid #262b38; border-radius:16px;
+         margin:0; min-height:100vh; display:grid; place-items:center; background:#0b0d12; color:#e7e9ee;
+         overflow-wrap:anywhere; }}
+  .card {{ width:min(460px,92vw); max-width:100%; min-width:0; background:#151821; border:1px solid #262b38; border-radius:16px;
           padding:28px; box-shadow:0 12px 40px rgba(0,0,0,.45); }}
   h1 {{ font-size:19px; margin:0 0 4px; }}
   p {{ font-size:14px; line-height:1.5; color:#aab1c2; margin:8px 0; }}
@@ -572,12 +651,13 @@ _LINK_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
              color:#e7e9ee; border:1px solid #2c3242; border-radius:10px; padding:10px; }}
   button {{ margin-top:12px; width:100%; padding:11px; font-size:14px; font-weight:600; border:0;
            border-radius:10px; cursor:pointer; }}
-  .primary {{ background:#5b7cfa; color:#fff; }} .primary:hover {{ background:#4f70ee; }}
+  .primary {{ background:#3b5bdb; color:#fff; }} .primary:hover {{ background:#364fc7; }}
   .secondary {{ background:#fff; color:#1f2330; border:1px solid #d6d9e0; }}
   .divider {{ display:flex; align-items:center; color:#7b8198; font-size:12px; margin:20px 0 6px; }}
   .divider::before, .divider::after {{ content:""; flex:1; border-top:1px solid #262b38; }}
   .divider span {{ padding:0 10px; }}
-  .hint {{ font-size:12px; color:#7b8198; }} code {{ background:#0d0f16; padding:1px 5px; border-radius:5px; }}
+  .hint {{ font-size:12px; color:#7b8198; }} code {{ background:#0d0f16; padding:1px 5px; border-radius:5px;
+         overflow-wrap:anywhere; word-break:break-word; }}
   .err {{ background:#2a1518; border:1px solid #5b2a2f; color:#ffb4b4; font-size:13px;
          border-radius:10px; padding:10px 12px; margin:14px 0 0; }}
 </style></head><body><div class="card">
@@ -608,7 +688,7 @@ def _render_link_page(ticket: str, email: str, suggested: str,
         email=html.escape(email), ticket=html.escape(ticket),
         suggested=html.escape(suggested), error_html=error_html,
     )
-    return HTMLResponse(content=page, status_code=status_code)
+    return _html_response(page, status_code)
 
 
 async def _finish_login(result) -> HTMLResponse | RedirectResponse:
@@ -644,7 +724,7 @@ async def supabase_callback_get(request: Request) -> HTMLResponse | JSONResponse
         return _not_configured()
     if settings.auth_provider != "supabase":
         return JSONResponse(status_code=404, content={"detail": "supabase login not enabled"})
-    return HTMLResponse(_supabase_finish_page())
+    return _html_response(_supabase_finish_page())
 
 
 @router.post("/oauth/supabase/callback", response_model=None)
@@ -694,6 +774,14 @@ async def oauth_link(
         user_id = claims.get("suggested_user_id") or ""
         if not user_id:
             return _login_error_page(LoginError("Could not determine an account id.", 400))
+        # The slug may have been claimed by someone else since the page was
+        # shown (or the legacy slug collides): never silently share an id.
+        try:
+            user_id = await provision_user_id(user_id, sub, email, reserve=True)
+        except IdentityStoreUnavailable:
+            return _login_error_page(
+                LoginError("Identity store unavailable. Please try signing in again shortly.", 503)
+            )
 
     await identity_store.link(user_id, sub=sub, email=email)
     return _issue_code_and_redirect(ctx, user_id)
@@ -702,14 +790,21 @@ async def oauth_link(
 # ── token endpoint ───────────────────────────────────────────────────────
 
 
-def _token_response(user_id: str) -> JSONResponse:
+def _token_response(user_id: str, client_id: str, family: str | None = None) -> JSONResponse:
     access = issue_user_token(
         user_id, _secret(), settings.oauth_access_ttl, typ="access"
     )
+    # The refresh token is single-use (rotate-and-consume via its jti) and
+    # bound to the client it was issued to (RFC 6749 §6).
     refresh = sign_payload(
         {
             "typ": "refresh",
             "user_id": user_id,
+            "client_id": client_id,
+            # ``fam`` ties every rotation of one grant together so reuse of any
+            # old token can revoke the whole chain.
+            "fam": family or secrets.token_urlsafe(12),
+            "jti": secrets.token_urlsafe(16),
             "exp": int(time.time()) + settings.oauth_refresh_ttl,
         },
         _secret(),
@@ -730,6 +825,14 @@ def _token_error(error: str, description: str = "", status_code: int = 400) -> J
     if description:
         body["error_description"] = description
     return JSONResponse(status_code=status_code, content=body)
+
+
+def _guard_unavailable() -> JSONResponse:
+    return _token_error(
+        "temporarily_unavailable",
+        "single-use check is unavailable; retry shortly",
+        status_code=503,
+    )
 
 
 @router.post("/oauth/token")
@@ -760,13 +863,19 @@ async def token(
             return _token_error("invalid_grant", "redirect_uri mismatch")
         if not _verify_pkce(code_verifier, claims.get("code_challenge", "")):
             return _token_error("invalid_grant", "PKCE verification failed")
-        jti = claims.get("jti", "")
-        if jti and not await _consume_code_jti(jti):
-            return _token_error("invalid_grant", "authorization code already used")
+        jti = claims.get("jti")
+        if not isinstance(jti, str) or not jti:
+            return _token_error("invalid_grant", "code is invalid or expired")
         user_id = claims.get("user_id")
         if not isinstance(user_id, str) or not user_id:
             return _token_error("invalid_grant", "code missing user")
-        return _token_response(user_id)
+        try:
+            first_use = await _consume_code_jti(jti)
+        except _ReplayGuardUnavailable:
+            return _guard_unavailable()
+        if not first_use:
+            return _token_error("invalid_grant", "authorization code already used")
+        return _token_response(user_id, client_id)
 
     if grant_type == "refresh_token":
         claims = verify_payload(refresh_token, _secret())
@@ -775,6 +884,40 @@ async def token(
         user_id = claims.get("user_id")
         if not isinstance(user_id, str) or not user_id:
             return _token_error("invalid_grant", "refresh_token missing user")
-        return _token_response(user_id)
+        # Refresh tokens minted before rotation/families shipped carry no
+        # jti/client_id/fam. They cannot be made single-use or revoked, so they
+        # are refused and the user reconnects once.
+        jti = claims.get("jti")
+        fam = claims.get("fam")
+        bound_client = claims.get("client_id")
+        if not all(isinstance(v, str) and v for v in (jti, fam, bound_client)):
+            return _token_error("invalid_grant", "refresh_token is invalid or expired")
+        # Checked before consuming so a wrong client cannot burn the real
+        # client's token. Compare bytes: compare_digest rejects non-ASCII str.
+        if not client_id or not secrets.compare_digest(
+            bound_client.encode("utf-8"), client_id.encode("utf-8")
+        ):
+            return _token_error("invalid_grant", "client mismatch")
+        remaining = int(claims.get("exp", 0)) - int(time.time())
+        try:
+            if await _family_revoked(fam):
+                return _token_error("invalid_grant", "refresh_token is invalid or expired")
+            first_use = await _consume_refresh_jti(jti, remaining)
+        except _ReplayGuardUnavailable:
+            return _guard_unavailable()
+        if not first_use:
+            # Strict by design, no grace window (OAuth 2.0 Security BCP reuse
+            # detection): a legitimate client retrying after a lost response
+            # lands here too and must reconnect.
+            # A rotated token was replayed: someone holds a copy. Revoke the
+            # whole family so the successor (possibly held by the thief) dies
+            # too; the legitimate client reconnects.
+            logger.warning("OAuth refresh token reuse: revoking family (user=%s)", user_id)
+            try:
+                await _revoke_family(fam, settings.oauth_refresh_ttl)
+            except _ReplayGuardUnavailable:
+                return _guard_unavailable()
+            return _token_error("invalid_grant", "refresh_token already used")
+        return _token_response(user_id, client_id, family=fam)
 
     return _token_error("unsupported_grant_type", f"grant_type '{grant_type}' not supported")

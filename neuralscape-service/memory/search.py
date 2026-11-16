@@ -12,13 +12,14 @@ from memory.groups import _build_group_id, _edge_is_invalidated, _get_group_ids,
 from memory.ranking import (
     RRF_K,
     _dense_score_floor,
+    _fit_vector_to_collection,
     _fused_order_keys,
+    _graph_edge_cosine,
     _record_order_key,
     _reinforcement_boost,
     _resolve_order_keys,
     _rrf_fuse,
     _salience_tiebreak,
-    _unit_cosine,
 )
 
 logger = logging.getLogger(__name__)
@@ -739,8 +740,11 @@ class SearchMixin:
                     # fact_embedding (piggybacked on the enrichment Cypher in
                     # _enrich_graph_results) against the query vector computed
                     # once above — local cosine in the same Gemini space as
-                    # the vector rows, clamped to [0, 1]. Edges without a
-                    # stored embedding stay unscored (rank last on merit).
+                    # the vector rows, clamped to [0, 1]. The graph store may
+                    # hold longer vectors than Qdrant (same MRL model, bigger
+                    # output_dimensionality): those compare on the common
+                    # prefix (_graph_edge_cosine). Edges without a stored
+                    # embedding stay unscored (rank last on merit).
                     emb = edge.get("fact_embedding") or None
                     graph_responses.append(
                         MemoryResponse(
@@ -748,7 +752,7 @@ class SearchMixin:
                             memory=edge.get("fact", edge.get("name", "")),
                             source="graph",
                             score=(
-                                _unit_cosine(query_embedding, emb)
+                                _graph_edge_cosine(query_embedding, emb)
                                 if emb is not None
                                 else None
                             ),
@@ -987,7 +991,13 @@ class SearchMixin:
             if edge_embeddings:
                 for i, _ in enrichable:
                     if i < len(edge_embeddings) and edge_embeddings[i]:
-                        provided[i] = edge_embeddings[i]
+                        # The graph store may be wider than the Qdrant
+                        # collection: truncate (same MRL model) or drop to
+                        # the embed fallback — never send a wrong-length
+                        # query vector.
+                        fitted = _fit_vector_to_collection(edge_embeddings[i])
+                        if fitted:
+                            provided[i] = fitted
             missing = [(i, text) for i, text in enrichable if i not in provided]
             if missing and not allow_embed_fallback:
                 # Plain-search hot path: rows without a stored embedding

@@ -655,6 +655,13 @@ class ProvenanceMixin:
         for row in rows:
             mid = str(row.get("id") or "")
             mem = row.get("mem") or {}
+            # Conversation-extracted rows carry no ``owner_user_id`` in their
+            # metadata (only the Qdrant payload's top-level ``user_id``), and
+            # the bulk paths hand us ``{"memory", "metadata"}`` without it. With
+            # no owner the group derives as ``user--`` and the episode is never
+            # found — so callers pass the row owner and it is injected here.
+            if row.get("user_id") and not mem.get("user_id"):
+                mem = dict(mem, user_id=row["user_id"])
             pinned_group = row.get("group_id")
             meta = self._row_meta(mem)
             group = pinned_group or _build_group_id(

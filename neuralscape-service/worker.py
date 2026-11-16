@@ -10,7 +10,9 @@ import hashlib
 import logging
 from datetime import datetime
 
+import structlog
 from arq.cron import cron
+from arq.jobs import Job
 
 import adapters  # noqa: F401 — registers knowledge-adapter taxonomies at import (deterministic MEMORY_CATEGORIES across all workers)
 from config import parse_redis_settings, settings
@@ -155,6 +157,61 @@ async def process_memory_store(
     return result
 
 
+_STALE_CHECK_COALESCE_TTL_S = 300
+
+
+async def _enqueue_stale_graph_check(
+    ctx: dict, mem, content: str, user_id: str, project_id: str | None
+) -> None:
+    """Dedup hit on an existing row: queue a cheap graph-staleness check.
+
+    A content-hash/semantic dedup hit used to return without ever touching the
+    graph, so a fact Graphiti had since invalidated (row live, edges dead)
+    stayed contradicted even though the user just re-asserted it. The check
+    runs on the GRAPH queue (never the fast path): one Cypher probe, and an
+    LLM enrichment only when the row has no episode ref or all its episode's
+    edges are dead. Deterministic job id per (memory_id, content hash) so a
+    burst of repeated hits coalesces onto one job. Best-effort.
+    """
+    from memory.hashing import content_hash
+
+    # Part of the flagged supersession feature: off => dedup hits enqueue
+    # nothing (pre-existing behaviour).
+    if not settings.graph_supersession_enabled:
+        return
+    # Vector-only rows never reach the graph by design: nothing to check.
+    if getattr(mem, "memory_kind", None) == "passage" or getattr(mem, "workspace", None) not in (None, "memory"):
+        return
+    redis = ctx["redis"]
+    # Coalescing: a short-lived NX marker per (memory, content hash) so a burst
+    # of repeated hits queues ONE check even after arq has dropped the finished
+    # job's result (the _job_id below only dedups while the result is retained).
+    # Fail-open: any Redis error just means we may queue a duplicate (the job
+    # itself is idempotent and cheap).
+    try:
+        marker = f"graph-stale-check-lock:{mem.id}:{content_hash(content)}"
+        if not await redis.set(marker, "1", nx=True, ex=_STALE_CHECK_COALESCE_TTL_S):
+            return
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        await ctx["redis"].enqueue_job(
+            "process_graph_enrichment",
+            mem.id,
+            content,
+            user_id,
+            project_id,
+            getattr(mem, "visibility", None),
+            None,
+            None,
+            True,
+            _queue_name=settings.graph_queue_name,
+            _job_id=f"graph-stale-check:{mem.id}:{content_hash(content)}",
+        )
+    except Exception as e:  # noqa: BLE001 — the check is best-effort
+        logger.warning(f"Stale-graph check enqueue failed for {getattr(mem, 'id', '?')}: {e}")
+
+
 async def process_memory_raw(
     ctx: dict,
     content: str,
@@ -218,6 +275,7 @@ async def process_memory_raw(
                 and getattr(mem, "visibility", None) == _eff_req_vis
             ):
                 logger.info(f"Skipping duplicate memory for user {user_id}: {content[:50]}...")
+                await _enqueue_stale_graph_check(ctx, mem, content, user_id, project_id)
                 return {"memories": [mem.model_dump(exclude_none=True)], "deduplicated": True}
     except Exception as e:
         logger.warning(f"Idempotency check failed (proceeding with store): {e}")
@@ -266,7 +324,19 @@ async def process_memory_raw(
 
     # Defer graph enrichment for newly-created rows onto the graph queue. Skip
     # for content-hash dedup hits (created=False) — they're already in the graph.
-    if created and memories:
+    # Exception (GRAPH_SUPERSESSION_ENABLED): a dedup hit that REVIVED a
+    # tombstoned row is a re-assertion of that fact, so it re-enters the graph
+    # (and Graphiti's contradiction engine) like a fresh write.
+    revived = bool(
+        settings.graph_supersession_enabled
+        and memories
+        and getattr(memories[0], "revived", None)
+    )
+    if memories and not created and not revived:
+        # Plain dedup hit: not re-enriched, but check whether the graph has
+        # since gone stale for this row (flagged: GRAPH_SUPERSESSION_ENABLED).
+        await _enqueue_stale_graph_check(ctx, memories[0], content, user_id, project_id)
+    if (created or revived) and memories:
         mem = memories[0]
         try:
             await ctx["redis"].enqueue_job(
@@ -332,7 +402,19 @@ async def process_memory_raw_batch(ctx: dict, items: list[dict]) -> dict:
     """
     service: MemoryService = ctx["service"]
 
-    memories = await asyncio.to_thread(service.store_raw_batch, items)
+    dedup_ids: set[str] = set()
+    memories = await asyncio.to_thread(service.store_raw_batch, items, dedup_ids=dedup_ids)
+
+    # Dedup survivors weren't re-enriched: queue the cheap stale-graph check
+    # for each (same semantics as process_memory_raw's dedup hits).
+    if dedup_ids:
+        item_by_content = {i.get("content"): i for i in items if i.get("content")}
+        for mem in memories:
+            if mem.id in dedup_ids:
+                src = item_by_content.get(mem.memory) or {}
+                await _enqueue_stale_graph_check(
+                    ctx, mem, mem.memory, src.get("user_id", ""), src.get("project_id")
+                )
 
     # Emit memory_stored events for each successful store so extensions can
     # write to vault. We attribute each event to the originating item's
@@ -832,12 +914,35 @@ async def process_code_index(ctx: dict, payload: dict) -> dict:
     if not code_graph_available():
         return {"ok": False, "error": "code-graph extra not installed", "code_space": code_space}
 
+    # Operator-side only: the source must sit inside a CODE_REPOS directory, for
+    # every engine, and the caller must own the target code_space (or be admin).
+    from knowledge.code_dispatch import (
+        code_space_access_error,
+        code_space_shape_error,
+        repo_source_error,
+    )
+
+    denied = code_space_shape_error(code_space) or code_space_access_error(code_space, user_id)
+    if denied:
+        return {"ok": False, "error": denied, "code_space": code_space, "system": system}
+    refused = repo_source_error(repo_source, settings)
+    if refused:
+        return {"ok": False, "error": refused, "code_space": code_space, "system": system}
+    # Index the path that was checked (resolved once), not the caller's string:
+    # closes the window where a symlink is swapped after the check.
+    import os as _os
+
+    repo_source = _os.path.realpath(_os.path.expanduser(str(repo_source)))
+
     engine = resolve_code_engine(system, code_space, user_id, settings, for_index=True)
     if engine is None:
+        from knowledge.code_dispatch import code_repos_error
+
+        # Operator-side by design: name CODE_REPOS when the repo is not on the server.
+        reason = code_repos_error(code_space, settings) or "the engine's backend (e.g. the CBM bridge) is unreachable"
         return {
             "ok": False,
-            "error": f"could not resolve engine for system={system!r} code_space={code_space!r} "
-                     "(repo not in CODE_REPOS / bridge down)",
+            "error": f"could not resolve engine for system={system!r} code_space={code_space!r}: {reason}",
             "code_space": code_space,
             "system": system,
         }
@@ -936,8 +1041,13 @@ async def process_graph_enrichment(
     visibility: str | None = None,
     source_ref: dict | None = None,
     adapter: str | None = None,
+    only_if_stale: bool = False,
 ) -> dict:
     """Background task: add a stored memory's content to the knowledge graph.
+
+    ``only_if_stale=True`` (dedup-hit re-assertions): enrich only when the row
+    has no graph episode ref or every edge of its episode is dead; otherwise
+    return ``skipped: graph_current`` with no LLM call.
 
     This is the slow half of a write (Graphiti entity extraction, ~minutes,
     Gemini-gated) split out of the synchronous vector store so it runs on the
@@ -974,6 +1084,24 @@ async def process_graph_enrichment(
     # occurred_at as a top-level MemoryResponse field (mapped from the payload
     # metadata in _mem_to_response), so read it directly.
     occurred_at = getattr(mem, "occurred_at", None)
+    if only_if_stale:
+        # Re-enrichment must reproduce the original write: carry the row's
+        # connector provenance. Reference-workspace / adapter rows (their
+        # ontology is not recoverable from the row) and passages are
+        # vector-only by design and never re-enriched here.
+        if getattr(mem, "memory_kind", None) == "passage" or getattr(mem, "workspace", None) not in (None, "memory"):
+            return {"memory_id": memory_id, "enriched": False, "skipped": "vector_only"}
+        source_ref = source_ref or getattr(mem, "source_ref", None)
+        stale = await asyncio.to_thread(
+            service.graph_row_is_stale,
+            memory_id,
+            user_id,
+            project_id,
+            visibility or getattr(mem, "visibility", None) or "private",
+            getattr(mem, "workspace", None),
+        )
+        if not stale:
+            return {"memory_id": memory_id, "enriched": False, "skipped": "graph_current"}
     graph_ontology = None
     if adapter:
         # Strict resolution (audit 27 #36): a queued job carrying an adapter
@@ -1222,6 +1350,9 @@ async def auto_compile_check(ctx: dict) -> dict | None:
     writer: ObsidianWriter = ctx.get("compiler_writer") or ObsidianWriter()
     ctx.setdefault("compiler_writer", writer)
 
+    # The vault is one shared tree and every daily-log entry records its owner, so
+    # post-compile dedup runs for each user whose entries were compiled;
+    # ``default_user_id`` only covers entries written before owners were recorded.
     results = await compile_all_pending(service, writer, user_id=settings.default_user_id)
     if results:
         writer.append_log(f"Auto-compiled {len(results)} date(s) via cron")
@@ -1415,6 +1546,30 @@ def _connector_sync_cron_hours() -> list[int]:
     return list(range(0, 24, interval))
 
 
+def _make_on_job_start(queue_name: str):
+    """Build the per-queue ``on_job_start`` hook: bind job context to the logs.
+
+    ARQ runs every job in its own asyncio task, so the contextvars bound here
+    reach every log line the job emits (structlog ``merge_contextvars``) and
+    never leak into another job. The function name is not in ARQ's job
+    context, so it is read from the queued job record; failing to read it
+    only leaves ``function`` off the log lines.
+    """
+    async def on_job_start(ctx: dict) -> None:
+        try:
+            bound = {"job_id": ctx.get("job_id"), "job_try": ctx.get("job_try"), "queue": queue_name}
+            structlog.contextvars.bind_contextvars(**{k: v for k, v in bound.items() if v is not None})
+            redis = ctx.get("redis")
+            if redis is not None and ctx.get("job_id"):
+                info = await Job(ctx["job_id"], redis, _queue_name=queue_name).info()
+                if info is not None and info.function:
+                    structlog.contextvars.bind_contextvars(function=info.function)
+        except Exception:  # noqa: BLE001 — observability must never fail a job
+            logger.debug("binding job log context failed (non-fatal)", exc_info=True)
+
+    return on_job_start
+
+
 def _make_after_job_end(queue_name: str):
     """Build the per-queue ``after_job_end`` hook: queue.empty webhook (C4).
 
@@ -1429,6 +1584,12 @@ def _make_after_job_end(queue_name: str):
     error — observability must never fail a job.
     """
     async def after_job_end(ctx: dict) -> None:
+        try:
+            await _queue_empty_webhook(ctx)
+        finally:
+            structlog.contextvars.unbind_contextvars("job_id", "job_try", "queue", "function")
+
+    async def _queue_empty_webhook(ctx: dict) -> None:
         url = settings.webhook_queue_empty_url
         if not url:
             return
@@ -1467,6 +1628,9 @@ def _make_after_job_end(queue_name: str):
 
 async def startup(ctx: dict) -> None:
     """Worker startup: initialize MemoryService + extension registry."""
+    from logging_config import configure_logging
+
+    configure_logging(worker=True)
     logger.info("ARQ worker starting up...")
     # Durable usage capture (off unless USAGE_STORE_ENABLED).  The recorder must
     # exist before the service builds its provider clients so they are wrapped.
@@ -1577,8 +1741,9 @@ class WorkerSettings:
     on_shutdown = shutdown
     redis_settings = parse_redis_settings()
     queue_name = settings.arq_queue_name
+    on_job_start = _make_on_job_start(settings.arq_queue_name)
     after_job_end = _make_after_job_end(settings.arq_queue_name)
-    max_jobs = 10
+    max_jobs = settings.arq_max_jobs
     job_timeout = settings.arq_job_timeout
     max_tries = settings.arq_max_retries  # keep light-queue retry behavior unchanged
 
@@ -1630,8 +1795,9 @@ class GraphWorkerSettings:
     on_shutdown = shutdown
     redis_settings = parse_redis_settings()
     queue_name = settings.graph_queue_name
+    on_job_start = _make_on_job_start(settings.graph_queue_name)
     after_job_end = _make_after_job_end(settings.graph_queue_name)
-    max_jobs = 4
+    max_jobs = settings.graph_max_jobs
     job_timeout = 900  # graph.add + entity extraction can run several minutes
     max_tries = settings.arq_max_retries
 
@@ -1667,7 +1833,8 @@ class IngestWorkerSettings:
     on_shutdown = shutdown
     redis_settings = parse_redis_settings()
     queue_name = settings.ingest_queue_name
+    on_job_start = _make_on_job_start(settings.ingest_queue_name)
     after_job_end = _make_after_job_end(settings.ingest_queue_name)
-    max_jobs = 3
+    max_jobs = settings.ingest_max_jobs
     job_timeout = 900  # a large PDF parse + fact extraction can run minutes
     max_tries = settings.arq_max_retries
