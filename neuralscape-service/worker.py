@@ -10,7 +10,9 @@ import hashlib
 import logging
 from datetime import datetime
 
+import structlog
 from arq.cron import cron
+from arq.jobs import Job
 
 import adapters  # noqa: F401 — registers knowledge-adapter taxonomies at import (deterministic MEMORY_CATEGORIES across all workers)
 from config import parse_redis_settings, settings
@@ -912,12 +914,35 @@ async def process_code_index(ctx: dict, payload: dict) -> dict:
     if not code_graph_available():
         return {"ok": False, "error": "code-graph extra not installed", "code_space": code_space}
 
+    # Operator-side only: the source must sit inside a CODE_REPOS directory, for
+    # every engine, and the caller must own the target code_space (or be admin).
+    from knowledge.code_dispatch import (
+        code_space_access_error,
+        code_space_shape_error,
+        repo_source_error,
+    )
+
+    denied = code_space_shape_error(code_space) or code_space_access_error(code_space, user_id)
+    if denied:
+        return {"ok": False, "error": denied, "code_space": code_space, "system": system}
+    refused = repo_source_error(repo_source, settings)
+    if refused:
+        return {"ok": False, "error": refused, "code_space": code_space, "system": system}
+    # Index the path that was checked (resolved once), not the caller's string:
+    # closes the window where a symlink is swapped after the check.
+    import os as _os
+
+    repo_source = _os.path.realpath(_os.path.expanduser(str(repo_source)))
+
     engine = resolve_code_engine(system, code_space, user_id, settings, for_index=True)
     if engine is None:
+        from knowledge.code_dispatch import code_repos_error
+
+        # Operator-side by design: name CODE_REPOS when the repo is not on the server.
+        reason = code_repos_error(code_space, settings) or "the engine's backend (e.g. the CBM bridge) is unreachable"
         return {
             "ok": False,
-            "error": f"could not resolve engine for system={system!r} code_space={code_space!r} "
-                     "(repo not in CODE_REPOS / bridge down)",
+            "error": f"could not resolve engine for system={system!r} code_space={code_space!r}: {reason}",
             "code_space": code_space,
             "system": system,
         }
@@ -1521,6 +1546,30 @@ def _connector_sync_cron_hours() -> list[int]:
     return list(range(0, 24, interval))
 
 
+def _make_on_job_start(queue_name: str):
+    """Build the per-queue ``on_job_start`` hook: bind job context to the logs.
+
+    ARQ runs every job in its own asyncio task, so the contextvars bound here
+    reach every log line the job emits (structlog ``merge_contextvars``) and
+    never leak into another job. The function name is not in ARQ's job
+    context, so it is read from the queued job record; failing to read it
+    only leaves ``function`` off the log lines.
+    """
+    async def on_job_start(ctx: dict) -> None:
+        try:
+            bound = {"job_id": ctx.get("job_id"), "job_try": ctx.get("job_try"), "queue": queue_name}
+            structlog.contextvars.bind_contextvars(**{k: v for k, v in bound.items() if v is not None})
+            redis = ctx.get("redis")
+            if redis is not None and ctx.get("job_id"):
+                info = await Job(ctx["job_id"], redis, _queue_name=queue_name).info()
+                if info is not None and info.function:
+                    structlog.contextvars.bind_contextvars(function=info.function)
+        except Exception:  # noqa: BLE001 — observability must never fail a job
+            logger.debug("binding job log context failed (non-fatal)", exc_info=True)
+
+    return on_job_start
+
+
 def _make_after_job_end(queue_name: str):
     """Build the per-queue ``after_job_end`` hook: queue.empty webhook (C4).
 
@@ -1535,6 +1584,12 @@ def _make_after_job_end(queue_name: str):
     error — observability must never fail a job.
     """
     async def after_job_end(ctx: dict) -> None:
+        try:
+            await _queue_empty_webhook(ctx)
+        finally:
+            structlog.contextvars.unbind_contextvars("job_id", "job_try", "queue", "function")
+
+    async def _queue_empty_webhook(ctx: dict) -> None:
         url = settings.webhook_queue_empty_url
         if not url:
             return
@@ -1573,6 +1628,9 @@ def _make_after_job_end(queue_name: str):
 
 async def startup(ctx: dict) -> None:
     """Worker startup: initialize MemoryService + extension registry."""
+    from logging_config import configure_logging
+
+    configure_logging(worker=True)
     logger.info("ARQ worker starting up...")
     service = MemoryService()
     service._get_memory()  # warm up connections
@@ -1660,6 +1718,7 @@ class WorkerSettings:
     on_shutdown = shutdown
     redis_settings = parse_redis_settings()
     queue_name = settings.arq_queue_name
+    on_job_start = _make_on_job_start(settings.arq_queue_name)
     after_job_end = _make_after_job_end(settings.arq_queue_name)
     max_jobs = settings.arq_max_jobs
     job_timeout = settings.arq_job_timeout
@@ -1713,6 +1772,7 @@ class GraphWorkerSettings:
     on_shutdown = shutdown
     redis_settings = parse_redis_settings()
     queue_name = settings.graph_queue_name
+    on_job_start = _make_on_job_start(settings.graph_queue_name)
     after_job_end = _make_after_job_end(settings.graph_queue_name)
     max_jobs = settings.graph_max_jobs
     job_timeout = 900  # graph.add + entity extraction can run several minutes
@@ -1750,6 +1810,7 @@ class IngestWorkerSettings:
     on_shutdown = shutdown
     redis_settings = parse_redis_settings()
     queue_name = settings.ingest_queue_name
+    on_job_start = _make_on_job_start(settings.ingest_queue_name)
     after_job_end = _make_after_job_end(settings.ingest_queue_name)
     max_jobs = settings.ingest_max_jobs
     job_timeout = 900  # a large PDF parse + fact extraction can run minutes

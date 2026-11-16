@@ -14,7 +14,7 @@ use no mocks. Python + pytest + httpx (pinned in `requirements.txt`).
 ## Run
 
 ```bash
-acceptance/run.sh http://127.0.0.1:18199 --compose-project nscampaign
+acceptance/run.sh http://127.0.0.1:18199 --compose-project nstest-acceptance
 acceptance/run.sh http://127.0.0.1:18199 --profile default --out /tmp/default.json
 acceptance/run.sh http://127.0.0.1:18199 -k remember          # subset
 acceptance/run.sh http://127.0.0.1:1 --list                  # inventory JSON, no stack contact
@@ -55,7 +55,7 @@ results; default `git rev-parse HEAD` of the repo holding `acceptance/`),
 Run on the host where the throwaway stack runs, once per file in `profiles/`:
 
 ```bash
-NS_COMMIT=<sha> acceptance/run.sh http://127.0.0.1:18199 --compose-project nscampaign --profile <name> --out <file>
+NS_COMMIT=<sha> acceptance/run.sh http://127.0.0.1:18199 --compose-project <disposable project> --profile <name> --out <file>
 ```
 
 `NS_COMMIT` is the commit the stack image was built from; it is recorded as
@@ -80,7 +80,7 @@ only reads `KEY=value` lines (recorded as `profile_flags`, plus the file's
   with `NS_ALLOW_PROD_PORT=1`) and any non-loopback host (override only with
   `NS_ALLOW_REMOTE=1`). Never point it at production.
 - **No cleanup.** `acc-<runid>-*` users, projects and memories are never
-  removed; run against throwaway volumes (the gate's `nscampaign` project).
+  removed; run against throwaway volumes (the gate's own disposable compose project).
 - **Compose token minting.** `docker compose -p <project> exec` without `-f`
   finds the project's existing containers by their compose labels, so it must run
   on the host where that project is running.
@@ -150,7 +150,7 @@ the seeds on the single graph worker) and the native index; budget about 15 minu
   `--compose-project` rather than skipping the compose-only scenarios. A skipped scenario never counts as proof.
 - **Compose projects.** Every entry point that touches Docker (`ctx.compose`, token minting, the sink) goes through
   one function, `guard.check_compose_project`: case-insensitive after strip, refuses `neuralscape`, and refuses any name
-  outside the disposable prefixes `nscampaign` and `nstest-` (override only with `NS_COMPOSE_ALLOWLIST`).
+  outside the disposable prefix `nstest-` (add prefixes only with `NS_COMPOSE_ALLOWLIST`).
   Only two read-only `exec` forms exist besides the Qdrant one: vault `grep -rl` under `/data/vault` and
   `redis-cli GET ns:connector:<id>`.
 - **LLM-dependent assertions** (an LLM decision, not wording, but a decision nonetheless): the contradicting fact is
@@ -309,8 +309,8 @@ everything, so the hook-side assertions are checked without a stack (needs `node
 
 `test_fault_injection::test_api_and_workers_started_together_on_empty_collections_stay_up`
 **wipes the Qdrant collections** (every memory on the stack) three times. It runs only
-when `NS_ALLOW_DESTRUCTIVE=1` is set and the compose project name starts with
-`nscampaign`; otherwise it skips with that reason. The gate sets
+when `NS_ALLOW_DESTRUCTIVE=1` is set and a compose project is given that passes the
+allowlist below; otherwise it skips (or is refused) with that reason. The gate sets
 `NS_ALLOW_DESTRUCTIVE=1` on its throwaway stack only; never set it elsewhere.
 
 
@@ -318,8 +318,9 @@ when `NS_ALLOW_DESTRUCTIVE=1` is set and the compose project name starts with
 
 Every compose project name the harness touches (`run.sh`, `guard.check`, `ctx.compose`,
 token minting) goes through `guard.check_compose_project`: stripped and lower-cased,
-`neuralscape` is always refused, and only disposable prefixes pass (default `nscampaign`
-and `nstest-`; override only with `NS_COMPOSE_ALLOWLIST=prefix1,prefix2`). Container
+`neuralscape` is always refused, and only disposable prefixes pass (default `nstest-`;
+`NS_COMPOSE_ALLOWLIST=prefix1,prefix2` is the only way to add one, e.g. the gate exports
+its own project's prefix). Container
 listing is always `docker compose -p <project> ps`, never global `docker ps`.
 
 `run.sh` needs only `uv`: it runs `uv run --no-project --python 3.12 --with-requirements ...`

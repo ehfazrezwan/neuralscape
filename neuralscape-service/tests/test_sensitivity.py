@@ -335,16 +335,17 @@ class TestBatchStoreFactsSensitivityGate:
         )
         assert resp.visibility == "private"
 
-    def test_non_sensitive_fact_visibility_untouched(self, service):
-        # Conversation-extracted facts never stamp metadata.visibility unless
-        # the gate fires — the response's visibility stays None (unset),
-        # not forced to any value, preserving pre-gate behavior exactly.
+    def test_non_sensitive_fact_is_private_by_default(self, service):
+        # Conversation extractions are private by default; the tier is now
+        # stamped explicitly (it used to be left unset, which every reader
+        # treated as de-facto private). The gate only matters for forcing
+        # a sensitive fact private when a caller could have chosen otherwise.
         service._memory.embedding_model.embed_batch.return_value = [[0.1] * 8]
         [resp] = service._batch_store_facts(
             facts=[("decision", "Decided to use PostgreSQL for better JSONB support")],
             user_id="alice",
         )
-        assert resp.visibility is None
+        assert resp.visibility == "private"
 
     def test_llm_sensitivity_hint_used_when_regex_floor_misses(self, service):
         # Content with no regex-floor trigger, but the LLM tagged it —
@@ -364,7 +365,9 @@ class TestBatchStoreFactsSensitivityGate:
             facts=[("decision", "Approved a $50,000 client contract renewal")],
             user_id="alice",
         )
-        assert resp.visibility is None
+        # gate off: no forcing, but the conversation default (private) is stamped
+        assert resp.visibility == "private"
+        assert resp.sensitivity is None
 
 
 class TestWriteThenReadSurfacesSensitivity:
