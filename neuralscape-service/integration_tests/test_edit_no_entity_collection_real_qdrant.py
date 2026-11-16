@@ -20,6 +20,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from integration_tests.conftest import unavailable
+
 DIMS = 768  # embedding_dims in Settings.get_mem0_config()
 
 
@@ -75,7 +77,28 @@ def _collections(client) -> set[str]:
     return {c.name for c in client.get_collections().collections}
 
 
+NEW_TEXT = "Bob Smith left Globex Industries for Tokyo"
+
+
+def _require_entity_extraction(text: str) -> None:
+    """Precondition: mem0's entity extraction finds entities in ``text`` in this environment.
+
+    It returns nothing when the spaCy model is missing, and then the unfixed edit path would not create
+    the entity collection either, so the test below would pass without proving anything.
+    """
+    try:
+        from mem0.utils.entity_extraction import extract_entities
+
+        found = extract_entities(text)
+    except Exception as exc:  # noqa: BLE001 - a missing model/library is an environment gap
+        unavailable(f"mem0 entity extraction cannot run here ({type(exc).__name__}: {exc}); the entity-collection test would pass vacuously")
+        return
+    if not found:
+        unavailable("mem0 entity extraction returned no entities for the edited text (spaCy model missing?); the entity-collection test would pass vacuously")
+
+
 def test_content_edit_and_delete_never_create_the_entity_collection(world, unique_ns):
+    _require_entity_extraction(NEW_TEXT)
     entities = f"{unique_ns.qdrant_collection}_entities"
     vs = world._memory.vector_store
     client = vs.client
@@ -94,7 +117,7 @@ def test_content_edit_and_delete_never_create_the_entity_collection(world, uniqu
     )
     assert entities not in _collections(client)
 
-    out = world.patch_memory(pid, owner, {"content": "Bob Smith left Globex Industries for Tokyo"})
+    out = world.patch_memory(pid, owner, {"content": NEW_TEXT})
     assert out["memory"].memory.startswith("Bob Smith")
     assert entities not in _collections(client), "a content edit created mem0's unread entity collection"
 
