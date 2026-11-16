@@ -122,8 +122,33 @@ def test_flag_off_contrast_refuses_writes_and_injects_nothing(svc, unique_ns, fl
     assert svc._get_standards(critical_only=False) == []
     with pytest.raises(PermissionError, match="disabled"):
         _standard(svc, me, f"Another rule zq{tok}.")
-    hits = svc.search(query=f"Critical rule zq{tok}", user_id=me, limit=10)
-    assert sid not in _ids(hits), "the standard pool must not be searched when the tier is off"
+    # The writer's OWN row legitimately comes back through the personal pool
+    # (user_id filter, any visibility), so an id check on the writer proves
+    # nothing about the standard pool. Assert by pool instead:
+    #  1. the standard pool leg is never queried, and
+    #  2. a different user (who owns no row; the shared pool only matches
+    #     visibility=shared) gets nothing: the standard pool is the only way
+    #     they could have reached it.
+    other = unique_ns.user_id + "-reader"
+    standard_pool_calls = []
+    real_pool = svc._search_standard_pool
+
+    def spy(**kwargs):
+        standard_pool_calls.append(kwargs)
+        return real_pool(**kwargs)
+
+    svc._search_standard_pool = spy
+    svc.search(query=f"Critical rule zq{tok}", user_id=me, limit=10)
+    other_hits = svc.search(query=f"Critical rule zq{tok}", user_id=other, limit=10)
+    assert standard_pool_calls == [], "the standard pool must not be searched when the tier is off"
+    assert sid not in _ids(other_hits), "a non-writer must not reach a standard when the tier is off"
+
+    # Same probe with the tier back on: the spy and the reader both see it,
+    # so the two assertions above are not vacuous.
+    flags(standards_enabled=True)
+    on_hits = svc.search(query=f"Critical rule zq{tok}", user_id=other, limit=10)
+    assert standard_pool_calls, "tier on: the standard pool leg must be queried"
+    assert sid in _ids(on_hits), "tier on: a non-writer must reach the standard"
 
 
 def test_process_registry_lists_and_serves_a_bundle_for_any_caller(svc, unique_ns):

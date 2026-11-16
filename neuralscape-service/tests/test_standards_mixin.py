@@ -236,3 +236,51 @@ def test_get_process_splits_definition_steps_and_guidelines(monkeypatch):
 def test_get_process_unknown_slug_is_none(monkeypatch):
     monkeypatch.setattr(settings, "processes_enabled", True)
     assert _svc([[]]).get_process("nope") is None
+
+
+# ── search(): the standard pool is gated by the tier flag, the personal pool is not ──
+
+
+def _search_with_pools(monkeypatch, enabled):
+    """Run ``search()`` as the standard's own writer with every pool stubbed.
+
+    The personal pool returns the writer's own ``visibility=standard`` row, as the
+    real store does (it filters on ``user_id`` only, "regardless of visibility").
+    Returns (ids returned, standard-pool calls).
+    """
+    from unittest.mock import MagicMock
+
+    from schemas import MemoryResponse
+
+    monkeypatch.setattr(settings, "standards_enabled", enabled)
+    svc = MemoryService()
+    svc._memory = MagicMock(name="Memory")
+    svc._memory.embedding_model.embed.return_value = [0.1] * 8
+    own = MemoryResponse(id="own-standard", memory="Critical rule", score=0.9, source="vector")
+    standard_calls: list[dict] = []
+    monkeypatch.setattr(svc, "_search_personal_pool", lambda **kw: [own])
+    monkeypatch.setattr(svc, "_search_shared_pool", lambda **kw: [])
+    monkeypatch.setattr(
+        svc, "_search_standard_pool", lambda **kw: standard_calls.append(kw) or []
+    )
+    monkeypatch.setattr(
+        svc, "_search_graph_for_visibility",
+        lambda **kw: {"edges": [], "nodes": [], "episodes": [], "communities": []},
+    )
+    hits = svc.search(query="Critical rule", user_id="writer", limit=5)
+    return {h.id for h in hits}, standard_calls
+
+
+def test_search_never_queries_the_standard_pool_when_the_tier_is_off(monkeypatch):
+    ids, standard_calls = _search_with_pools(monkeypatch, enabled=False)
+    assert standard_calls == []
+    # The writer's own row still comes back via the PERSONAL pool: an id alone is
+    # not evidence of a standard-pool read, which is why the integration contrast
+    # checks the pool (and a non-writer reader), not just the id.
+    assert ids == {"own-standard"}
+
+
+def test_search_queries_the_standard_pool_when_the_tier_is_on(monkeypatch):
+    _ids, standard_calls = _search_with_pools(monkeypatch, enabled=True)
+    assert len(standard_calls) == 1
+    assert standard_calls[0]["project_id"] is None and standard_calls[0]["scope"] is None
