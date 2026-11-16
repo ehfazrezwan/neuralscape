@@ -223,6 +223,9 @@ def _prove_gone(a: NSClient, story: Story) -> None:
     # An unknown task is a 404 on the status route ("404 when unknown or not theirs"); a 200 body saying
     # not_found is the same answer. Anything else means the task is still known.
     resp = a.get(f"/v1/memories/status/{story.task_ids['m1']}")
+    if resp.status_code == 404:  # the status route's own wording; a 404 from a wrong URL says something else
+        detail = str(resp.json().get("detail", "")) if resp.headers.get("content-type", "").startswith("application/json") else ""
+        assert "not found" in detail.lower() and story.task_ids["m1"] in detail, f"task status 404 is not the handler's 'Task <id> not found': {resp.text[:160]}"
     state = "not_found" if resp.status_code == 404 else (resp.json().get("status") if resp.status_code == 200 else f"HTTP {resp.status_code}")
     assert state == "not_found", f"task status after FLUSHALL is {state!r}, want not_found (404)"
     code = a.get(f"/v1/ingest/artifacts/{story.file_id}").status_code

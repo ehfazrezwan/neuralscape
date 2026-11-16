@@ -9,6 +9,8 @@ names are cache-path-prefixed, so the assertions look for the symbol's bare name
 from __future__ import annotations
 
 import json
+import os
+import re
 from dataclasses import dataclass, field
 
 import pytest
@@ -98,8 +100,14 @@ def test_deleting_the_cbm_project_empties_it(a, cbm: Cbm):
     # is really empty is the query below.
     engine = r.json().get("engine_result") or {}
     assert engine.get("deleted") is True, f"the delete reports nothing removed: {engine}"
-    assert engine.get("project"), f"the delete names no project: {engine}"
-    assert engine.get("status") in (None, "deleted"), f"the bridge's delete status is {engine.get('status')!r}: {engine}"
+    # The API does not expose the slug CBM bound at index time (the index result and the status routes omit
+    # it), so "the one this scenario indexed" is checked through what CBM derives it from: the repo path. The
+    # slug is that path flattened, so it must contain the indexed repo's directory name.
+    project = engine.get("project")
+    assert isinstance(project, str) and project, f"the delete names no project: {engine}"
+    repo_name = re.sub(r"[^a-z0-9]+", "-", os.path.basename(c.repo_source.rstrip("/")).lower()).strip("-")
+    assert repo_name in re.sub(r"[^a-z0-9]+", "-", project.lower()), f"the delete names project {project!r}, not the one indexed from {c.repo_source!r}: {engine}"
+    assert engine.get("status") == "deleted", f"the bridge's delete status is {engine.get('status')!r}, want 'deleted': {engine}"
     after = a.get("/v1/code-graph/query", params={"question": SYMBOL, "graph_id": c.code_space, "knowledge_system": SYSTEM})
     # the project is gone: the service answers 200 with no hit (never a 5xx, never the symbol)
     assert after.status_code == 200, f"query after delete -> {after.status_code}: {after.text[:200]}"

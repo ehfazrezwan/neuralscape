@@ -50,20 +50,15 @@ def check_gone(client: NSClient, marker: str) -> None:
 
 
 def check_episode_present(client: NSClient, marker: str) -> None:
-    episodes = [e for e in graph_listing(client, "episodes") if marker in (e.get("content") or "")]
-    assert episodes, f"no graph episode carries {marker}"
-
-
-def check_every_memory_has_an_episode(client: NSClient, marker: str, memories: list[dict]) -> None:
-    """The write's graph enrichment finished: its conversation episode is listed.
+    """The write's graph enrichment finished: the episode holding its transcript is listed.
 
     A conversation write stores ONE graph episode for the whole exchange, whose body is the raw transcript
-    (carrying the marker), not the extracted facts; every memory the write stored shares it, and no memory
-    text or id appears in the episode listing. So the real link is "the episode holding the transcript".
+    (carrying the marker), not the extracted facts; every memory the write stored shares it. No memory text
+    or id appears in the episode listing, and the memory rows the API returns carry no episode reference, so
+    this is a wait on the marker episode, not a per-memory check.
     """
-    assert memories, "the write produced no memories to wait for"
     episodes = [e for e in graph_listing(client, "episodes") if marker in (e.get("content") or "")]
-    assert episodes, f"{len(memories)} memories stored, but no graph episode carries {marker} yet (the conversation episode is the one all of them share)"
+    assert episodes, f"no graph episode carries {marker}"
 
 
 # ── extension route identity ─────────────────────────────────────
@@ -150,7 +145,7 @@ def test_recall_and_gone_checks_fail_where_they_should(ctx, a, c):
     eventually(lambda: check_recalls(c, marker), timeout=90, what="control write recalled")
     expect_check_fails(check_recalls, a, marker)  # A cannot see the third identity's memory
     expect_check_fails(check_gone, c, marker)  # and the "deleted" check cannot pass while it exists
-    expect_check_fails(check_every_memory_has_an_episode, c, f"{marker}-never-written", [{"id": "00000000-0000-0000-0000-000000000000", "memory": "a fact"}])  # a memory with no episode is not "enriched"
+    expect_check_fails(check_episode_present, c, f"{marker}-never-written")  # a marker no episode carries is not "enriched"
 
 
 @proves("delete.legacy-passthrough")
@@ -165,9 +160,11 @@ def test_legacy_delete_naming_another_user_is_refused_and_touches_nothing(ctx, a
 def test_legacy_delete_removes_the_callers_memories_and_graph_facts_and_nobody_elses(ctx, a, c, legacy, a_fact):
     assert not legacy["error"], legacy["error"]
     assert a_fact.visible_to_a, "precondition: A's fact never became searchable"
-    # The write produced more than one memory: deleting while a later one is still being enriched leaves the
-    # delete's graph cascade nothing to resolve for it, so wait until EVERY memory has its episode.
-    eventually(lambda: check_every_memory_has_an_episode(c, legacy["marker"], legacy["memories"]), timeout=180, interval=5, what="every memory's graph episode before the delete")
+    # Deleting before the write's graph enrichment finished leaves the delete's graph cascade nothing to
+    # resolve, so wait until the write's (single, shared) conversation episode is listed. The API exposes no
+    # per-memory episode reference, so this cannot be narrowed to each memory.
+    assert legacy["memories"], "the write produced no memories"
+    eventually(lambda: check_episode_present(c, legacy["marker"]), timeout=180, interval=5, what="the write's graph episode before the delete")
     r = c.delete("/memories", timeout=300)
     assert r.status_code == 200, f"DELETE /memories -> {r.status_code}: {r.text[:200]}"
     assert r.json().get("status") == "ok", f"legacy delete answered {str(r.json())[:200]}"
