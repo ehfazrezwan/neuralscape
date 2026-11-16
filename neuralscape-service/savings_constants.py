@@ -44,7 +44,9 @@ They are measured, checked-in constants, not runtime estimates:
 # branches, each measuring its own delta against the shared 11141 base; 11606 is
 # the re-measured total of the merged tool surface (33 tools), which happens to
 # equal 11141 + 142 + 323 exactly.
-MCP_TOOL_SCHEMA_OVERHEAD_TOKENS = 11606
+# Then +155 for the recall_memories `workspaces` property and its description
+# sentence (read-side workspace recall). Intentional, per the acceptance rule.
+MCP_TOOL_SCHEMA_OVERHEAD_TOKENS = 11761
 
 # Rendered savings line + detail fields on one response (measured: 67).
 SAVINGS_LINE_OVERHEAD_TOKENS = 70
