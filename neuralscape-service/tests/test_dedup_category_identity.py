@@ -3,7 +3,9 @@
 The content hash covers text only, and ``_find_by_content_hash`` used to ignore
 the category, so a "convention" written after a "preference" of the same text
 was absorbed into the old row. The lookup now filters on ``metadata.category``
-(rows keep their hashes), and the dedup cron's partition carries the category.
+(rows keep their hashes) on the explicit (raw) write path only: extraction stays
+category-agnostic, and the dedup cron never merges a same-hash pair whose
+categories differ.
 """
 
 from types import SimpleNamespace
@@ -102,61 +104,95 @@ class TestLookup:
         assert _condition_value(flt, "metadata.category") is None
 
 
-class TestConversationPath:
-    def test_batch_facts_dedup_per_category(self, service):
+class TestConversationPathStaysCategoryAgnostic:
+    """A model-assigned category is a guess, not intent: extraction dedups on text alone."""
+
+    def test_exact_duplicate_under_another_extracted_category_dedups(self, service):
         service._get_memory = MagicMock(return_value=service._memory)
         first = service._batch_store_facts(facts=[("preference", TEXT)], user_id="u1")
-        second = service._batch_store_facts(facts=[("convention", TEXT)], user_id="u1")
-        again = service._batch_store_facts(facts=[("preference", TEXT)], user_id="u1")
-        assert first[0].id != second[0].id
+        again = service._batch_store_facts(facts=[("convention", TEXT)], user_id="u1")
         assert again[0].id == first[0].id
-        assert len(service.store) == 2
+        assert len(service.store) == 1
 
-    def test_same_text_two_categories_in_one_batch_are_both_kept(self, service):
+    def test_same_text_two_categories_in_one_batch_collapse(self, service):
         service._get_memory = MagicMock(return_value=service._memory)
         out = service._batch_store_facts(facts=[("preference", TEXT), ("convention", TEXT)], user_id="u1")
-        assert len({m.id for m in out}) == 2 and len(service.store) == 2
+        assert len({m.id for m in out}) == 1 and len(service.store) == 1
 
 
-class TestDedupCronPartition:
-    def test_category_is_part_of_the_partition(self):
+def _scroll_rows(service, rows):
+    service._memory.vector_store.client.scroll.side_effect = None
+    service._memory.vector_store.client.scroll.return_value = (
+        [SimpleNamespace(id=pid, payload=payload) for pid, payload in rows], None
+    )
+
+
+class TestDedupCron:
+    def test_partition_is_unchanged_by_category(self):
         a = _row("a", "preference")[1]
         b = _row("b", "convention")[1]
-        assert _dedup_partition(a) != _dedup_partition(b)
-        assert _dedup_partition(a) == _dedup_partition(_row("c", "preference")[1])
+        assert _dedup_partition(a) == _dedup_partition(b)
+        assert "metadata.category" not in _dedup_partition_filters("u1", a)
 
-    def test_category_is_pushed_down_to_the_search_filter(self):
-        filters = _dedup_partition_filters("u1", _row("a", "convention")[1])
-        assert filters["metadata.category"] == "convention"
-
-    @pytest.mark.parametrize("semantic", [False, True])
-    def test_cron_does_not_merge_rows_that_differ_only_in_category(self, service, semantic):
-        rows = [
+    def test_exact_phase_keeps_a_same_hash_pair_under_two_categories(self, service):
+        _scroll_rows(service, [
             _row("p1", "preference", created_at="2025-01-01T00:00:00"),
             _row("p2", "convention", created_at="2025-06-01T00:00:00"),
-        ]
-        service._memory.vector_store.client.scroll.side_effect = None
-        service._memory.vector_store.client.scroll.return_value = (
-            [SimpleNamespace(id=pid, payload=payload) for pid, payload in rows], None
-        )
+        ])
         service._memory.vector_store.search.return_value = []
 
-        result = service.dedup_memories("u1", semantic=semantic)
+        result = service.dedup_memories("u1", semantic=False)
 
         assert result["exact_duplicates_removed"] == 0
         service._memory.vector_store.delete.assert_not_called()
 
-    def test_cron_still_merges_same_text_same_category(self, service):
+    def test_semantic_phase_keeps_a_same_hash_pair_under_two_categories(self, service):
         rows = [
             _row("p1", "preference", created_at="2025-01-01T00:00:00"),
-            _row("p2", "preference", created_at="2025-06-01T00:00:00"),
+            _row("p2", "convention", created_at="2025-06-01T00:00:00"),
         ]
-        service._memory.vector_store.client.scroll.side_effect = None
-        service._memory.vector_store.client.scroll.return_value = (
-            [SimpleNamespace(id=pid, payload=payload) for pid, payload in rows], None
-        )
+        _scroll_rows(service, rows)
+        # the search finds the twin with a perfect score: only the same-hash guard can stop the merge
+        service._memory.vector_store.search.side_effect = lambda **kw: [
+            SimpleNamespace(id=pid, score=1.0, payload=payload) for pid, payload in rows
+        ]
+
+        result = service.dedup_memories("u1", semantic=True)
+
+        assert result["semantic_duplicates_removed"] == 0 and result["exact_duplicates_removed"] == 0
+        service._memory.vector_store.delete.assert_not_called()
+
+    def test_semantic_near_duplicates_with_different_hashes_still_merge_across_categories(self, service):
+        older = ("p1", {**_row("p1", "preference", text="Deploys freeze on Fridays")[1], "hash": "h-1"})
+        newer = ("p2", {**_row("p2", "convention", text="Deploys freeze on Fridays.",
+                               created_at="2025-06-01T00:00:00")[1], "hash": "h-2"})
+        _scroll_rows(service, [older, newer])
+        service._memory.vector_store.search.side_effect = lambda **kw: [
+            SimpleNamespace(id=pid, score=0.99, payload=payload) for pid, payload in (older, newer)
+        ]
+
+        result = service.dedup_memories("u1", semantic=True)
+
+        assert result["semantic_duplicates_removed"] == 1
+        service._memory.vector_store.delete.assert_called_once_with("p1")
+
+    def test_cron_still_merges_same_text_same_category(self, service):
+        _scroll_rows(service, [
+            _row("p1", "preference", created_at="2025-01-01T00:00:00"),
+            _row("p2", "preference", created_at="2025-06-01T00:00:00"),
+        ])
 
         result = service.dedup_memories("u1", semantic=False)
 
         assert result["exact_duplicates_removed"] == 1
         service._memory.vector_store.delete.assert_called_once_with("p1")
+
+    def test_legacy_rows_without_a_category_still_dedup(self, service):
+        def legacy(pid, created):
+            _, payload = _row(pid, None, created_at=created)
+            payload["metadata"].pop("category")
+            return pid, payload
+
+        _scroll_rows(service, [legacy("p1", "2025-01-01T00:00:00"), legacy("p2", "2025-06-01T00:00:00")])
+        result = service.dedup_memories("u1", semantic=False)
+        assert result["exact_duplicates_removed"] == 1

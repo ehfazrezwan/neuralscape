@@ -37,7 +37,7 @@ def _dedup_meta(payload: dict) -> tuple[dict, bool]:
 def _dedup_partition(payload: dict) -> tuple:
     """Partition identity a semantic near-duplicate must share to be merged.
 
-    (user_id, scope, project_id, visibility, workspace, category). Mirrors the write
+    (user_id, scope, project_id, visibility, workspace). Mirrors the write
     path's partitioning (``memory/write.py`` content-hash identity and
     ``memory/groups.py::_build_group_id``): the same text in two projects,
     at two visibility tiers, or in a reference workspace vs the memory
@@ -57,10 +57,6 @@ def _dedup_partition(payload: dict) -> tuple:
         meta.get("project_id") or None,
         meta.get("visibility"),
         workspace,
-        # Same text under another category is a distinct memory (the write
-        # path's dedup key carries the category too); an absent category is
-        # its own partition, like visibility.
-        meta.get("category"),
     )
 
 
@@ -76,7 +72,7 @@ def _dedup_partition_filters(user_id: str, payload: dict) -> dict:
     meta, wrapped = _dedup_meta(payload)
     prefix = "metadata.metadata." if wrapped else "metadata."
     filters: dict = {"user_id": user_id}
-    for field in ("scope", "project_id", "visibility", "workspace", "category"):
+    for field in ("scope", "project_id", "visibility", "workspace"):
         value = meta.get(field)
         if field == "workspace" and value == "memory":
             continue  # default workspace: absent OR "memory" — post-filtered
@@ -101,6 +97,27 @@ def _is_tombstoned(payload: dict) -> bool:
 # cannot always exclude) cannot crowd an in-partition duplicate out of the
 # result. The last size is the hard cap per row.
 _DEDUP_TOP_K_STEPS = (10, 40, 160)
+
+
+def _exact_category(payload: dict):
+    """Category component of the exact-phase group key (same hash, other category: not a duplicate)."""
+    return _dedup_meta(payload)[0].get("category")
+
+
+def _differs_only_by_category(a: dict, b: dict) -> bool:
+    """True for two rows with the SAME text hash but different categories.
+
+    Such a pair can only exist because someone wrote the same text on purpose
+    under two categories (the explicit write path keys on the category), so
+    no dedup phase may merge them. Near-duplicates with different hashes are
+    unaffected and still merge across categories.
+    """
+    ha, hb = a.get("hash"), b.get("hash")
+    if not ha or ha != hb:
+        return False
+    ca = _dedup_meta(a)[0].get("category")
+    cb = _dedup_meta(b)[0].get("category")
+    return ca != cb
 
 
 def _dense_vector(vector) -> list[float] | None:
@@ -807,7 +824,7 @@ class DeleteMixin:
             for mem in page:
                 h = mem["payload"].get("hash")
                 if h and not _is_tombstoned(mem["payload"]):
-                    key = (h, _dedup_partition(mem["payload"]))
+                    key = (h, _dedup_partition(mem["payload"]), _exact_category(mem["payload"]))
                     key_counts[key] = key_counts.get(key, 0) + 1
 
         exact_removed = 0
@@ -818,7 +835,7 @@ class DeleteMixin:
                     h = mem["payload"].get("hash")
                     if not h or _is_tombstoned(mem["payload"]):
                         continue
-                    key = (h, _dedup_partition(mem["payload"]))
+                    key = (h, _dedup_partition(mem["payload"]), _exact_category(mem["payload"]))
                     if key_counts.get(key, 0) > 1:
                         hash_groups.setdefault(key, []).append(mem)
         del key_counts
@@ -1030,6 +1047,8 @@ class DeleteMixin:
             if _dedup_partition(hit_payload) != partition:
                 continue
             if _is_tombstoned(hit_payload):
+                continue
+            if _differs_only_by_category(payload, hit_payload):
                 continue
             out.append(hit)
         return out

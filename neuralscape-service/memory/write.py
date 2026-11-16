@@ -1359,7 +1359,10 @@ class WriteMixin:
         "preference" that read alike are different facts), so it must not be
         absorbed into the old row. It is a lookup filter on ``metadata.category``
         rather than part of the hash, so every existing row keeps its hash.
-        ``None`` (omitted) keeps the category-agnostic lookup.
+        ``None`` (omitted) keeps the category-agnostic lookup. Only the explicit
+        (raw) write path passes it, where the caller chose the category; the
+        conversation-extraction path leaves it out because a model-assigned
+        category is a guess, not intent.
         """
         try:
             from qdrant_client.models import FieldCondition, Filter, IsEmptyCondition, MatchValue, PayloadField
@@ -1931,7 +1934,7 @@ class WriteMixin:
 
             # In-batch duplicate (extraction-window overlap): keep the first.
             # WT6: workspace is part of the batch key too.
-            batch_key = (chash, scope_val, fact_project_id, speaker, workspace, category)
+            batch_key = (chash, scope_val, fact_project_id, speaker, workspace)
             if batch_key in seen_in_batch:
                 continue
             seen_in_batch.add(batch_key)
@@ -1947,7 +1950,6 @@ class WriteMixin:
                 project_id=fact_project_id,
                 visibility=None,
                 workspace=workspace,
-                category=category,
             )
             existing = (
                 self._find_by_content_hash(**lookup_kwargs)
@@ -1962,7 +1964,6 @@ class WriteMixin:
                     project_id=fact_project_id,
                     visibility=None,
                     speaker=None,
-                    category=category,
                 )
                 if existing is not None and self._backfill_speaker_on_existing_memory(
                     memory_id=existing.id,
