@@ -88,6 +88,12 @@ async def retrieve_episodes(
     Returns:
         list[EpisodicNode]: A list of EpisodicNode objects representing the retrieved episodes.
     """
+    # NEURALSCAPE PATCH (re-apply after upstream subtree syncs): an explicit
+    # empty group list returns no episodes. ``None`` keeps its meaning (no
+    # group filter).
+    if group_ids is not None and len(group_ids) == 0:
+        return []
+
     if driver.graph_operations_interface:
         try:
             return await driver.graph_operations_interface.retrieve_episodes(
