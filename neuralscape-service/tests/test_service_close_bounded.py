@@ -239,6 +239,7 @@ def test_close_waits_for_a_build_in_progress_and_then_closes_what_it_built():
 
 
 def test_close_on_a_stopped_loop_leaves_no_unawaited_close_coroutine():
+    # The bridge (not close()) cancels the submitted coroutine when its loop is stopped.
     bridge = _AsyncBridge()
     bridge._loop.call_soon_threadsafe(bridge._loop.stop)
     bridge._thread.join(5)
@@ -253,6 +254,24 @@ def test_close_on_a_stopped_loop_leaves_no_unawaited_close_coroutine():
     with patch("memory.core._CLOSE_DRIVER_TIMEOUT_S", BOUND_S):
         _close_within_wall(svc)
     assert made and inspect.getcoroutinestate(made[0]) == inspect.CORO_CLOSED
+
+
+def test_close_with_no_memory_never_closes_the_clients_of_a_memory_built_in_between():
+    """close() snapshots the memory under the lock; with none to close it must not fall
+    back to ``self._memory``, which a concurrent first use may have built meanwhile."""
+    rebuilt = Mock()
+    svc = _fresh_service()
+    svc._genai_model = object()  # the only thing close() has to release
+
+    class Bridge:
+        def shutdown(self):
+            svc._memory = rebuilt  # a concurrent use builds its memory while close() runs
+
+    svc._bridge = Bridge()
+    svc.close()
+    rebuilt.close.assert_not_called()
+    rebuilt.vector_store.client.close.assert_not_called()
+    rebuilt.embedding_model.client.close.assert_not_called()
 
 
 def test_worker_shutdown_runs_the_blocking_close_off_the_event_loop():
