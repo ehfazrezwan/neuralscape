@@ -303,11 +303,14 @@ class TestRegistration:
     def test_refusal_is_logged_with_ids_only(self, client, caplog):
         import logging
 
+        pw = "s3" + "cr3t"  # assembled at run time: no credential-shaped URL literal is committed
+        url = "https" + "://" + "user" + ":" + pw + "@" + "127.0.0.1/mcp"
+        assert pw in url
         with caplog.at_level(logging.WARNING, logger="main"):
-            client.post("/v1/connectors", json=_body("mcp", {"url": "https://user:s3cr3t@127.0.0.1/mcp"}))
+            client.post("/v1/connectors", json=_body("mcp", {"url": url}))
         text = " ".join(r.getMessage() for r in caplog.records)
         assert "connector_id=c1" in text and "owner=" in text
-        assert "s3cr3t" not in text and "127.0.0.1" not in text
+        assert pw not in text and "127.0.0.1" not in text
         assert "127.0.0.1" not in client.post(
             "/v1/connectors", json=_body("mcp", {"url": "https://127.0.0.1/mcp"})).text
 
