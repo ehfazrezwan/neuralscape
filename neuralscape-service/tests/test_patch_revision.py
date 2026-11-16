@@ -165,9 +165,11 @@ class FakeQdrant:
         p = self.points.get(pid)
         if p is None:
             return None
+        # mem0's own ``get`` shape: every non-core payload key lands in the outer metadata dict
+        outer = {k: v for k, v in p.items() if k not in ("data", "hash", "created_at", "updated_at", "user_id")}
         return {"id": pid, "memory": p["data"], "user_id": p["user_id"],
                 "created_at": "2026-01-01T00:00:00+00:00", "updated_at": p.get("updated_at"),
-                "metadata": p["metadata"]}
+                "metadata": outer}
 
 
 @pytest.fixture
@@ -354,7 +356,7 @@ def test_I2_a_committed_edit_survives_seventy_successors_landing_before_its_read
     state = {"done": False}
 
     def retrieve_after_successors(collection_name, ids, with_payload=True, with_vectors=False):
-        if not state["done"] and world.fake.points[M1]["metadata"].get("revision") == 1:
+        if not state["done"] and world.fake.points[M1].get("ns_revision") == 1:
             state["done"] = True
             for r in range(1, 71):
                 world.patch_memory(M1, "ehfaz", {"tags": [f"s{r}"]}, expected_revision=str(r))
@@ -487,13 +489,13 @@ def test_retag_skips_a_row_a_patch_changed_since_the_scroll(world):
 
 
 def test_a_vector_sync_failure_after_the_commit_still_runs_the_cascade_and_answers_success(world):
-    """Fault injection: the 3rd ``retrieve`` (inside the vector sync) raises AFTER the text CAS committed."""
+    """Fault injection: the 2nd ``retrieve`` (inside the vector sync) raises AFTER the text CAS committed."""
     real = world.fake.retrieve
     calls = {"n": 0}
 
     def flaky(collection_name, ids, with_payload=True, with_vectors=False):
         calls["n"] += 1
-        if calls["n"] == 3:
+        if calls["n"] == 2:
             raise ConnectionError("qdrant blip")
         return real(collection_name, ids, with_payload, with_vectors)
 
@@ -517,21 +519,48 @@ def test_the_metadata_write_is_a_nested_delta_so_an_interleaved_nested_writer_is
     assert meta["graph_episode_uuid"] == "ep-written-meanwhile"                # survived: the CAS wrote only its delta
 
 
-def test_a_removed_key_is_written_as_null_not_left_stale(world):
+def test_a_removed_key_is_written_as_null_in_the_nested_delta_not_left_stale(world):
     world.fake.points[M1]["metadata"]["domain"] = "work"
+    calls = []
+    real = world.fake.set_payload
+
+    def recording(collection_name, payload, points, key=None):
+        calls.append((dict(payload), key))
+        return real(collection_name, payload, points, key)
+
+    world.fake.set_payload = recording
     world.patch_memory(M1, "ehfaz", {"domain": None}, expected_revision="0")
+    nested = [(p, k) for p, k in calls if k == "metadata"]
+    assert nested and nested[0][0]["domain"] is None and "tags" not in nested[0][0]   # null for the removed key only
     assert world.fake.points[M1]["metadata"].get("domain") is None
 
 
-def test_text_is_written_only_after_the_metadata_cas_applied_so_a_rejected_edit_leaks_no_text(world):
-    def interloper(fake):
-        fake.points[M1]["metadata"]["revision"] = 1
+def test_text_and_revision_are_ONE_top_level_call_and_a_rejected_edit_leaks_nothing(world):
+    calls = []
+    real = world.fake.set_payload
 
+    def recording(collection_name, payload, points, key=None):
+        calls.append((dict(payload), key))
+        return real(collection_name, payload, points, key)
+
+    world.fake.set_payload = recording
+    world.patch_memory(M1, "ehfaz", {"content": "landed", "tags": ["x"]}, expected_revision="0")
+    commit, key = calls[0]
+    assert key is None and {"data", "hash", "ns_revision", "ns_token", "updated_at"} <= set(commit)   # ONE call
+    assert commit["data"] == "landed" and commit["ns_revision"] == 1
+    assert calls[1][1] == "metadata" and calls[1][0]["tags"] == ["x"]                                # derived delta, after
+    assert "data" not in calls[1][0]
+
+    def interloper(fake):
+        fake.points[M2]["metadata"]["revision"] = 1
+
+    world.fake.add(M2)
+    calls.clear()
     world.fake.before_filtered_write = interloper
     with pytest.raises(RevisionConflict):
-        world.patch_memory(M1, "ehfaz", {"content": "must not land"}, expected_revision="0")
-    assert world.fake.points[M1]["data"] == "Old content"
-    assert not any(w == f"update_vectors:{M1}" for w in world.fake.writes)
+        world.patch_memory(M2, "ehfaz", {"content": "must not land"}, expected_revision="0")
+    assert world.fake.points[M2]["data"] == "Old content"
+    assert not any(w == f"update_vectors:{M2}" for w in world.fake.writes)
 
 
 def test_a_writer_stalled_before_its_vector_write_adopts_the_later_text_and_reasserts_the_marker(world):
@@ -550,15 +579,19 @@ def test_a_writer_stalled_before_its_vector_write_adopts_the_later_text_and_reas
     assert world.fake.points[M1].get("vector_pending") is None
 
 
-def test_repair_also_fixes_a_row_whose_vector_revision_lags_its_revision_without_a_marker(world):
+def test_repair_fixes_a_text_revision_mismatch_but_not_a_healthy_row_after_a_metadata_only_edit(world):
     world.patch_memory(M1, "ehfaz", {"content": "newer"}, expected_revision="0")
-    world.patch_memory(M1, "ehfaz", {"tags": ["x"]}, expected_revision="1")      # revision 2; vector_revision still 1
+    world.patch_memory(M1, "ehfaz", {"tags": ["x"]}, expected_revision="1")      # revision 2, TEXT revision still 1
     point = world.fake.points[M1]
-    point["vector_revision"] = 1
-    world.fake.vectors[M1] = [9.0, 9.0, 0.0, 0.0]                                 # stale vector, marker clean
+    assert point["ns_revision"] == 2 and point["ns_text_revision"] == 1 and point["vector_revision"] == 1
+    embeds = world._memory.embedding_model.embed.call_count
+    assert world.repair_stale_vectors(min_age_s=0)["scanned"] == 0                # healthy: no needless re-embed
+    assert world._memory.embedding_model.embed.call_count == embeds
+    point["vector_revision"] = 0                                                  # a mismatch the marker missed
+    world.fake.vectors[M1] = [9.0, 9.0, 0.0, 0.0]
     out = world.repair_stale_vectors(min_age_s=0)
     assert out["repaired"] == 1
-    assert world.fake.vectors[M1] == world.fake.embed("newer", "update") and point["vector_revision"] == 2
+    assert world.fake.vectors[M1] == world.fake.embed("newer", "update") and point["vector_revision"] == 1
 
 
 def test_repair_stops_retrying_a_persistently_failing_row(world):
@@ -604,3 +637,153 @@ def test_one_shared_redis_client_is_reused(monkeypatch):
     a = _ORIGINAL_REDIS_CLIENT()
     b = _ORIGINAL_REDIS_CLIENT()
     assert a is b and len(created) == 1
+
+
+# ── single-call guarantee: the revision lives next to the text (ns_revision) ───────────
+
+
+def _hook_before_nth_set_payload(world, n, fn):
+    real = world.fake.set_payload
+    count = {"n": 0}
+
+    def wrapped(collection_name, payload, points, key=None):
+        count["n"] += 1
+        if count["n"] == n:
+            fn()
+        return real(collection_name, payload, points, key)
+
+    world.fake.set_payload = wrapped
+
+
+def test_a_reader_never_sees_a_new_revision_with_the_old_text(world):
+    seen = []
+    _hook_before_nth_set_payload(world, 1, lambda: seen.append(("before commit", world.get_memory(M1))))
+    world.patch_memory(M1, "ehfaz", {"content": "new text"}, expected_revision="0")
+    # now observe the window between the commit call and the derived-metadata call
+    world.fake.add(M2)
+    window = []
+    real = world.fake.set_payload
+    calls = {"n": 0}
+
+    def wrapped(collection_name, payload, points, key=None):
+        calls["n"] += 1
+        if calls["n"] == 2:                      # B (derived metadata) is about to run: the commit already landed
+            window.append(world.get_memory(M2))
+        return real(collection_name, payload, points, key)
+
+    world.fake.set_payload = wrapped
+    world.patch_memory(M2, "ehfaz", {"content": "text two"}, expected_revision="0")
+    assert (window[0].memory, window[0].revision) == ("text two", "1")           # revision and text change TOGETHER
+    assert (seen[0][1].memory, seen[0][1].revision) == ("Old content", "0")      # and before the commit: old + old
+
+
+def test_a_nested_writer_interleaved_between_the_commit_and_the_metadata_apply_survives(world):
+    def nested_writer():
+        world.fake.points[M1]["metadata"]["graph_episode_uuid"] = "ep-between"
+
+    _hook_before_nth_set_payload(world, 2, nested_writer)                       # right before call B
+    world.patch_memory(M1, "ehfaz", {"tags": ["x"]}, expected_revision="0")
+    meta = world.fake.points[M1]["metadata"]
+    assert meta["tags"] == ["x"] and meta["revision"] == 1 and meta["graph_episode_uuid"] == "ep-between"
+
+
+class _Crash2(BaseException):
+    pass
+
+
+def test_a_crash_between_the_commit_and_the_metadata_apply_is_detected_and_repaired(world, monkeypatch):
+    def crash(*a, **k):
+        raise _Crash2()
+
+    monkeypatch.setattr(MemoryService, "_apply_pending_meta", staticmethod(crash))
+    with pytest.raises(_Crash2):
+        world.patch_memory(M1, "ehfaz", {"content": "committed", "tags": ["x"]}, expected_revision="0")
+    point = world.fake.points[M1]
+    assert point["ns_revision"] == 1 and point["data"] == "committed"            # the commit landed, text + revision together
+    assert point["ns_meta_pending"] is True and point["ns_meta_delta"]["tags"] == ["x"]
+    assert point["metadata"]["tags"] == ["t0"]                                   # derived metadata still lags: detectable
+    assert world.get_memory(M1).revision == "1"                                  # the revision shown matches the text shown
+    monkeypatch.undo()
+    out = world.repair_stale_vectors(min_age_s=0)
+    assert out["meta_repaired"] == 1
+    assert point["metadata"]["tags"] == ["x"] and point["metadata"]["revision"] == 1 and point.get("ns_meta_pending") is None
+
+
+def test_a_later_edit_folds_a_crash_pending_metadata_delta_into_its_own_base(world, monkeypatch):
+    def crash(*a, **k):
+        raise _Crash2()
+
+    monkeypatch.setattr(MemoryService, "_apply_pending_meta", staticmethod(crash))
+    with pytest.raises(_Crash2):
+        world.patch_memory(M1, "ehfaz", {"tags": ["from-the-crashed-edit"]}, expected_revision="0")
+    monkeypatch.undo()
+    world.patch_memory(M1, "ehfaz", {"domain": "work"}, expected_revision="1")    # a later edit; its base includes the pending delta
+    meta = world.fake.points[M1]["metadata"]
+    assert meta["tags"] == ["from-the-crashed-edit"] and meta["domain"] == "work" and meta["revision"] == 2
+
+
+def test_exactly_one_of_n_concurrent_edits_wins_on_a_MIGRATED_row_too(world):
+    import threading
+
+    world.patch_memory(M1, "ehfaz", {"tags": ["migrate"]}, expected_revision="0")      # row now carries ns_revision
+    assert world.fake.points[M1]["ns_revision"] == 1
+    n = 8
+    barrier = threading.Barrier(n)
+    results = []
+
+    def attempt(i):
+        barrier.wait()
+        try:
+            world.patch_memory(M1, "ehfaz", {"content": f"writer {i}"}, expected_revision="1")
+            results.append(("win", i))
+        except RevisionConflict:
+            results.append(("lose", i))
+
+    threads = [threading.Thread(target=attempt, args=(i,)) for i in range(n)]
+    [t.start() for t in threads]
+    [t.join(timeout=30) for t in threads]
+    wins = [i for kind, i in results if kind == "win"]
+    assert len(wins) == 1 and world.fake.points[M1]["data"] == f"writer {wins[0]}"
+
+
+def test_the_exact_probe_a_content_edit_then_a_metadata_only_edit_never_loses_the_text(world):
+    """A commits text + revision in ONE call; B (metadata-only, at A's revision) lands before A's derived-metadata
+    call. A's later call is a no-op, A reports success, the text is A's (old design left it stale) AND both edits'
+    metadata survive (B folds A's parked delta)."""
+    def b_lands():
+        world.patch_memory(M1, "ehfaz", {"domain": "work"}, expected_revision="1")
+
+    _hook_before_nth_set_payload(world, 2, b_lands)         # before A's call B
+    out = world.patch_memory(M1, "ehfaz", {"content": "A's text", "tags": ["from-A"]}, expected_revision="0")
+    assert out["memory"] is not None
+    point = world.fake.points[M1]
+    assert point["data"] == "A's text"                      # the text stands
+    assert point["ns_revision"] == 2
+    assert point["metadata"]["tags"] == ["from-A"] and point["metadata"]["domain"] == "work"
+
+
+def test_writer_tokens_and_revision_bookkeeping_never_reach_an_api_response(world):
+    world.patch_memory(M1, "ehfaz", {"content": "x"}, expected_revision="0")
+    dumped = str(world.get_memory(M1).model_dump())
+    for leaked in ("ns_token", "ns_nonces", "edit_token", "revision_nonces", "ns_meta_delta"):
+        assert leaked not in dumped
+    assert world.get_memory(M1).revision == "1"
+
+
+def test_repair_honours_the_attempt_budget_for_rows_that_also_carry_a_vector_revision(world):
+    world.patch_memory(M1, "ehfaz", {"content": "x"}, expected_revision="0")
+    point = world.fake.points[M1]
+    assert point["vector_revision"] == 1
+    point["vector_pending"] = True
+    point["vector_pending_at"] = 0.0
+    world.fake.update_vectors = lambda collection_name, points: (_ for _ in ()).throw(ConnectionError("down"))
+    for _ in range(8):
+        world.repair_stale_vectors(min_age_s=0, max_attempts=2)
+    assert point["vector_repair_attempts"] == 2             # not 8: pass 2 no longer bypasses the budget
+
+
+def test_a_new_edit_resets_the_repair_attempt_budget(world):
+    world.patch_memory(M1, "ehfaz", {"content": "x"}, expected_revision="0")
+    world.fake.points[M1]["vector_repair_attempts"] = 4
+    world.patch_memory(M1, "ehfaz", {"content": "y"}, expected_revision="1")
+    assert world.fake.points[M1].get("vector_repair_attempts") is None

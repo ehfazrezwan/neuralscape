@@ -1028,13 +1028,15 @@ class TestPatchMemory:
         result = service.patch_memory("m1", "robb", {"tags": ["project:bon002"]})
 
         service._memory.vector_store.client.update_vectors.assert_not_called()   # metadata-only: no vector work
-        first, second = service._memory.vector_store.client.set_payload.call_args_list
-        assert first.kwargs["points"] is not None and first.kwargs["key"] == "metadata"   # nested, filter-scoped CAS
-        delta = first.kwargs["payload"]
+        commit, apply_meta, clear = service._memory.vector_store.client.set_payload.call_args_list
+        assert commit.kwargs["points"] is not None and "key" not in commit.kwargs     # ONE top-level filter-scoped commit
+        assert commit.kwargs["payload"]["ns_revision"] == 1 and "updated_at" in commit.kwargs["payload"]
+        assert apply_meta.kwargs["key"] == "metadata"                                 # derived metadata: nested delta
+        delta = apply_meta.kwargs["payload"]
         assert delta["tags"] == ["project:bon002"] and delta["revision"] == 1
         # untouched keys are NOT rewritten (so concurrent nested writers' keys survive)
         assert "owner_user_id" not in delta and "visibility" not in delta and "category" not in delta
-        assert "updated_at" in second.kwargs["payload"]
+        assert clear.kwargs["payload"]["ns_meta_pending"] is None
         assert result["graph"] == "unchanged" and result["graph_job"] is None
 
     @pytest.mark.parametrize('changes', [{'content': 'New content'}, {'category': 'interaction'}])
@@ -1043,9 +1045,9 @@ class TestPatchMemory:
         service._memory.vector_store.get.return_value = _edit_point(meta=meta)
         service.patch_memory('m1', 'ehfaz', changes)
         if 'content' in changes:
-            stored = service._memory.vector_store.client.set_payload.call_args_list[0].kwargs['payload']
+            stored = service._memory.vector_store.client.set_payload.call_args_list[1].kwargs['payload']
         else:
-            stored = service._memory.vector_store.client.set_payload.call_args_list[0].kwargs['payload']
+            stored = service._memory.vector_store.client.set_payload.call_args_list[1].kwargs['payload']
         assert stored.get('category_evidence') is None and 'category_evidence' in stored   # removed key written as null
         assert 'visibility' not in stored and 'owner_user_id' not in stored            # untouched keys not rewritten
 
@@ -1060,9 +1062,10 @@ class TestPatchMemory:
         service._cascade_or_fallback_expire = MagicMock(return_value={"resolved": True})
         result = service.patch_memory("m1", "ehfaz", {"content": "New content"})
 
-        first, second = service._memory.vector_store.client.set_payload.call_args_list
-        assert second.kwargs["payload"]["data"] == "New content"        # text fields: second filter-scoped call
-        delta = first.kwargs["payload"]                                  # metadata: ONLY the changed keys, nested
+        commit, apply_meta, _clear = service._memory.vector_store.client.set_payload.call_args_list
+        assert commit.kwargs["payload"]["data"] == "New content"        # text + revision: ONE commit call
+        assert commit.kwargs["payload"]["ns_revision"] == 1
+        delta = apply_meta.kwargs["payload"]                            # metadata: ONLY the changed keys, nested
         assert delta["revision"] == 1 and delta["title"] and "token_estimate" in delta
         # untouched metadata (category, owner, visibility, tags) is not rewritten, so it survives intact
         for untouched in ("category", "owner_user_id", "visibility", "tags"):
@@ -1119,7 +1122,7 @@ class TestPatchMemory:
         meta = {"category": "decision", "owner_user_id": "ehfaz", "visibility": "private"}
         service._memory.vector_store.get.return_value = _edit_point(meta=meta)
         service.patch_memory("m1", "ehfaz", {"category": "tech_stack", "project_id": "p1"})
-        new_meta = service._memory.vector_store.client.set_payload.call_args_list[0].kwargs["payload"]
+        new_meta = service._memory.vector_store.client.set_payload.call_args_list[1].kwargs["payload"]
         assert new_meta["scope"] == "project" and new_meta["project_id"] == "p1"
 
     def test_clearing_project_id_flips_flexible_scope_to_global(self, service):
@@ -1133,7 +1136,7 @@ class TestPatchMemory:
                           "edges_expired": 0, "nodes_removed": 0, "summaries_cleared": 0}
         )
         result = service.patch_memory("m1", "ehfaz", {"project_id": None})
-        new_meta = service._memory.vector_store.client.set_payload.call_args_list[0].kwargs["payload"]
+        new_meta = service._memory.vector_store.client.set_payload.call_args_list[1].kwargs["payload"]
         assert new_meta["scope"] == "global" and new_meta["project_id"] is None
         # private user--ehfaz--project--neuralscape → user--ehfaz: partition moved
         assert result["graph"] == "migration_pending"
@@ -1252,7 +1255,7 @@ class TestRetagMemories:
         )
         assert result["matched"] == 2 and result["updated"] == 2
         payloads = [c.kwargs["payload"] for c in
-                    service._memory.vector_store.client.set_payload.call_args_list[0::2]]   # per row: metadata call, text call
+                    service._memory.vector_store.client.set_payload.call_args_list[1::3]]   # per row: commit, metadata, clear
         assert payloads[0]["tags"] == ["project:bon002"]
         assert payloads[1]["tags"] == ["keep", "project:bon002"]
         assert result["graph_jobs"] == []  # no project change → no graph work

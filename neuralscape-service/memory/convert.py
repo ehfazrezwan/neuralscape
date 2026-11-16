@@ -47,6 +47,7 @@ class ConvertMixin:
                 "id": str(getattr(point, "id", "")),
                 "memory": payload.get("data", ""),
                 "metadata": payload.get("metadata", {}) or {},
+                "ns_revision": payload.get("ns_revision"),
                 "created_at": payload.get("created_at"),
                 "updated_at": payload.get("updated_at"),
             }
@@ -79,6 +80,9 @@ class ConvertMixin:
         memories that didn't store them — no migration needed.
         """
         metadata = mem.get("metadata", {}) or {}
+        # The revision is a TOP-LEVEL payload field (``ns_revision``) next to the text it versions: a mem0 result
+        # carries it in the outer metadata dict, a raw point path passes it as ``ns_revision``.
+        top_revision = mem.get("ns_revision", metadata.get("ns_revision"))
         if isinstance(metadata.get("metadata"), dict):
             metadata = metadata["metadata"]
         from category_evidence import validated_evidence
@@ -110,7 +114,7 @@ class ConvertMixin:
             source_ref=metadata.get("source_ref"),
             visibility=metadata.get("visibility"),
             owner_user_id=metadata.get("owner_user_id"),
-            revision=revision_of(metadata),
+            revision=revision_of(metadata, top_revision),
             workspace=metadata.get("workspace"),
             sensitivity=metadata.get("sensitivity"),
             sensitivity_source=metadata.get("sensitivity_source"),

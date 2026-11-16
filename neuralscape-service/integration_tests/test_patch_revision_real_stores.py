@@ -323,3 +323,104 @@ def test_the_edit_commits_with_the_lock_held_by_someone_else_and_with_redis_unre
     with pytest.raises(RevisionConflict):
         world.patch_memory(pid, world.owner, {"content": "stale"}, expected_revision="1")
     assert _stored(world, pid)["data"] == "committed with redis down"
+
+
+# ── the single-call guarantee on the real server (ns_revision beside the text) ──
+
+
+def test_a_legacy_row_matches_the_should_clause_exactly_once_on_the_real_server(world):
+    """IsEmpty(ns_revision) AND the metadata mirror: a legacy row is matched once, then carries ns_revision."""
+    from memory.edit import RevisionConflict
+
+    pid = _seed(world)
+    assert "ns_revision" not in _stored(world, pid)
+    world.patch_memory(pid, world.owner, {"content": "first"}, expected_revision="0")
+    with pytest.raises(RevisionConflict):
+        world.patch_memory(pid, world.owner, {"content": "same revision again"}, expected_revision="0")
+    assert _stored(world, pid)["ns_revision"] == 1 and _stored(world, pid)["data"] == "first"
+
+
+def test_exactly_one_of_n_concurrent_edits_wins_on_a_migrated_row_on_the_real_server(world):
+    from memory.edit import RevisionConflict
+
+    for round_no in range(10):
+        pid = _seed(world)
+        world.patch_memory(pid, world.owner, {"tags": ["migrate"]}, expected_revision="0")
+        n = 10
+        barrier = threading.Barrier(n)
+        outcomes: list = []
+        lock = threading.Lock()
+
+        def attempt(i: int) -> None:
+            barrier.wait()
+            try:
+                world.patch_memory(pid, world.owner, {"content": f"writer {i} round {round_no}"}, expected_revision="1")
+                result = ("win", i)
+            except RevisionConflict:
+                result = ("lose", i)
+            with lock:
+                outcomes.append(result)
+
+        threads = [threading.Thread(target=attempt, args=(i,)) for i in range(n)]
+        [t.start() for t in threads]
+        [t.join(timeout=60) for t in threads]
+        wins = [i for kind, i in outcomes if kind == "win"]
+        assert len(wins) == 1 and _stored(world, pid)["data"] == f"writer {wins[0]} round {round_no}"
+
+
+def test_a_reader_never_sees_a_new_revision_with_the_old_text_on_the_real_server(world, monkeypatch):
+    pid = _seed(world)
+    real = world.client.set_payload
+    seen = {"calls": 0}
+
+    def wrapped(collection_name, payload, points, key=None):
+        seen["calls"] += 1
+        if seen["calls"] == 2:           # between the commit (one top-level call) and the derived-metadata call
+            p = _stored(world, pid)
+            seen["window"] = (p["data"], p["ns_revision"])
+        return real(collection_name, payload=payload, points=points, key=key)
+
+    monkeypatch.setattr(world.client, "set_payload", wrapped)
+    world.patch_memory(pid, world.owner, {"content": "new text"}, expected_revision="0")
+    assert seen["window"] == ("new text", 1)
+
+
+def test_the_exact_probe_content_edit_then_metadata_only_edit_keeps_the_text_on_the_real_server(world, monkeypatch):
+    pid = _seed(world)
+    real = world.client.set_payload
+    state = {"calls": 0}
+
+    def wrapped(collection_name, payload, points, key=None):
+        state["calls"] += 1
+        if state["calls"] == 2:
+            world.patch_memory(pid, world.owner, {"domain": "work"}, expected_revision="1")
+        return real(collection_name, payload=payload, points=points, key=key)
+
+    monkeypatch.setattr(world.client, "set_payload", wrapped)
+    world.patch_memory(pid, world.owner, {"content": "A's text", "tags": ["from-A"]}, expected_revision="0")
+    p = _stored(world, pid)
+    assert p["data"] == "A's text" and p["ns_revision"] == 2
+    assert p["metadata"]["tags"] == ["from-A"] and p["metadata"]["domain"] == "work"
+
+
+def test_a_crash_between_the_commit_and_the_metadata_apply_is_repaired_on_the_real_server(world, monkeypatch):
+    from memory_service import MemoryService
+    import memory.edit as edit
+
+    pid = _seed(world)
+
+    class _Crash(BaseException):
+        pass
+
+    def crash(*a, **k):
+        raise _Crash()
+
+    monkeypatch.setattr(MemoryService, "_apply_pending_meta", staticmethod(crash))
+    with pytest.raises(_Crash):
+        world.patch_memory(pid, world.owner, {"tags": ["x"]}, expected_revision="0")
+    p = _stored(world, pid)
+    assert p["ns_revision"] == 1 and p["ns_meta_pending"] is True and p["metadata"]["tags"] == ["t0"]
+    monkeypatch.setattr(MemoryService, "_apply_pending_meta", staticmethod(edit.EditMixin._apply_pending_meta))
+    assert world.repair_stale_vectors(min_age_s=0)["meta_repaired"] >= 1
+    p = _stored(world, pid)
+    assert p["metadata"]["tags"] == ["x"] and p["metadata"]["revision"] == 1 and p.get("ns_meta_pending") is None

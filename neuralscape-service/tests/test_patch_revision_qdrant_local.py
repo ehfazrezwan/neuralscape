@@ -233,7 +233,120 @@ def test_a_nested_writer_that_does_not_bump_the_revision_is_not_erased_by_the_ed
     assert meta["owner_user_id"] == "u" and meta["visibility"] == "private"      # untouched keys intact
 
 
-def test_a_removed_key_is_written_as_null_on_the_real_engine(world):
+def test_a_removed_key_is_written_as_null_in_the_nested_delta_on_the_real_engine(world, monkeypatch):
     world.patch_memory(world.pid, "u", {"project_id": "p1", "category": "tech_stack"}, expected_revision="0")
+    real = world.client.set_payload
+    captured = []
+
+    def recording(collection_name, payload, points, key=None):
+        captured.append((dict(payload), key))
+        return real(collection_name, payload=payload, points=points, key=key)
+
+    monkeypatch.setattr(world.client, "set_payload", recording)
     world.patch_memory(world.pid, "u", {"project_id": None, "category": "personal_fact"}, expected_revision="1")
+    nested = [(p, k) for p, k in captured if k == "metadata"]
+    assert nested and nested[0][0]["project_id"] is None and "owner_user_id" not in nested[0][0]
     assert _payload(world)["metadata"].get("project_id") is None
+
+
+def test_the_exact_probe_content_edit_then_a_metadata_only_edit_keeps_the_text_on_the_real_engine(world, monkeypatch):
+    real = world.client.set_payload
+    state = {"calls": 0}
+
+    def wrapped(collection_name, payload, points, key=None):
+        state["calls"] += 1
+        if state["calls"] == 2:          # right before A's derived-metadata call, B (metadata-only) commits
+            world.patch_memory(world.pid, "u", {"domain": "work"}, expected_revision="1")
+        return real(collection_name, payload=payload, points=points, key=key)
+
+    monkeypatch.setattr(world.client, "set_payload", wrapped)
+    world.patch_memory(world.pid, "u", {"content": "A's text", "tags": ["from-A"]}, expected_revision="0")
+    p = _payload(world)
+    assert p["data"] == "A's text" and p["ns_revision"] == 2
+    assert p["metadata"]["tags"] == ["from-A"] and p["metadata"]["domain"] == "work"
+
+
+
+# ── the single-call guarantee on the real engine (ns_revision beside the text) ──
+
+
+def test_legacy_row_matches_the_should_clause_exactly_once_then_carries_ns_revision(world):
+    """The row has NO ns_revision: it matches through its metadata mirror, once; afterwards through ns_revision."""
+    assert "ns_revision" not in _payload(world)
+    world.patch_memory(world.pid, "u", {"content": "first"}, expected_revision="0")
+    with pytest.raises(RevisionConflict):
+        world.patch_memory(world.pid, "u", {"content": "again with the same revision"}, expected_revision="0")
+    p = _payload(world)
+    assert p["ns_revision"] == 1 and p["data"] == "first"
+    world.patch_memory(world.pid, "u", {"content": "second"}, expected_revision="1")
+    assert _payload(world)["ns_revision"] == 2
+
+
+def test_a_reader_never_sees_a_new_revision_with_the_old_text_on_the_real_engine(world, monkeypatch):
+    real = world.client.set_payload
+    seen = {"calls": 0}
+
+    def wrapped(collection_name, payload, points, key=None):
+        seen["calls"] += 1
+        if seen["calls"] == 2:          # between the commit (call 1) and the derived-metadata call (call 2)
+            p = _payload(world)
+            seen["window"] = (p["data"], p["ns_revision"])
+        return real(collection_name, payload=payload, points=points, key=key)
+
+    monkeypatch.setattr(world.client, "set_payload", wrapped)
+    world.patch_memory(world.pid, "u", {"content": "new text"}, expected_revision="0")
+    assert seen["window"] == ("new text", 1)         # text and revision changed in the SAME call
+
+
+def test_a_crash_between_the_commit_and_the_metadata_apply_is_repaired_on_the_real_engine(world, monkeypatch):
+    import memory.edit as edit
+
+    def crash(*a, **k):
+        raise _Crash()
+
+    monkeypatch.setattr(MemoryService, "_apply_pending_meta", staticmethod(crash))
+    with pytest.raises(_Crash):
+        world.patch_memory(world.pid, "u", {"tags": ["x"]}, expected_revision="0")
+    p = _payload(world)
+    assert p["ns_revision"] == 1 and p["ns_meta_pending"] is True and p["metadata"]["tags"] == ["t0"]
+    monkeypatch.setattr(MemoryService, "_apply_pending_meta", staticmethod(edit.EditMixin._apply_pending_meta))
+    assert world.repair_stale_vectors(min_age_s=0)["meta_repaired"] == 1
+    p = _payload(world)
+    assert p["metadata"]["tags"] == ["x"] and p["metadata"]["revision"] == 1 and p.get("ns_meta_pending") is None
+
+
+def test_exactly_one_of_n_concurrent_edits_wins_on_a_migrated_row_on_the_real_engine(world):
+    world.patch_memory(world.pid, "u", {"tags": ["migrate"]}, expected_revision="0")
+    n = 6
+    barrier = threading.Barrier(n)
+    results = []
+
+    def attempt(i):
+        barrier.wait()
+        try:
+            world.patch_memory(world.pid, "u", {"content": f"writer {i}"}, expected_revision="1")
+            results.append(("win", i))
+        except RevisionConflict:
+            results.append(("lose", i))
+
+    threads = [threading.Thread(target=attempt, args=(i,)) for i in range(n)]
+    [t.start() for t in threads]
+    [t.join(timeout=60) for t in threads]
+    wins = [i for kind, i in results if kind == "win"]
+    assert len(wins) == 1 and _payload(world)["data"] == f"writer {wins[0]}"
+
+
+def test_a_nested_writer_between_the_commit_and_the_metadata_apply_survives_on_the_real_engine(world, monkeypatch):
+    real = world.client.set_payload
+    state = {"calls": 0}
+
+    def wrapped(collection_name, payload, points, key=None):
+        state["calls"] += 1
+        if state["calls"] == 2:
+            real(collection_name, payload={"graph_episode_uuid": "ep-between"}, points=[world.pid], key="metadata")
+        return real(collection_name, payload=payload, points=points, key=key)
+
+    monkeypatch.setattr(world.client, "set_payload", wrapped)
+    world.patch_memory(world.pid, "u", {"tags": ["x"]}, expected_revision="0")
+    meta = _payload(world)["metadata"]
+    assert meta["tags"] == ["x"] and meta["graph_episode_uuid"] == "ep-between" and meta["revision"] == 1

@@ -3,24 +3,24 @@
 Mechanically extracted from memory_service.py (mixins-with-facade split);
 the revision precondition and the store-level compare-and-set were added on top.
 
-GUARANTEE (what correctness rests on): an edit is two filter-scoped ``set_payload`` calls.
-(1) The metadata DELTA (only the keys this edit changed, written as a nested
-``set_payload(key="metadata")``; a removed key is written as ``null``) plus ``revision+1``, the
-writer ``edit_token`` and its ``revision_nonces`` entry, filtered on
-``id == <memory> AND metadata.revision == <expected>``. Qdrant applies it only to a point that exists
-and still matches, so a stale writer cannot overwrite a later edit, a deleted point cannot be
-re-created, and metadata keys written by other writers that do not bump the revision
-(``graph_episode_uuid``, ``times_derived``, tombstones, ...) are never overwritten from a stale
-snapshot. Whether it applied is read back: the stored ``revision_nonces[<new revision>]`` holds OUR
-token (kept by time, so successor commits cannot evict it). Not applied -> ``RevisionConflict``
-(REST 409) and NOTHING was written, not even text. (2) Then the text fields (``data``, ``hash``,
-``text_lemmatized``, ``updated_at``, the vector marker) are written with a filter that requires the
-revision we just created AND our ``edit_token``: it can only apply to the state call (1) created, and
-a successor that already moved on makes it a no-op (its text stands). Metadata first, text second,
-so a rejected edit never leaks text. Neither a lock nor a TTL is part of this guarantee.
-Honest limits of the two-call shape: for the instant between (1) and (2) a reader sees the new
-revision with the previous text; a process killed exactly between them leaves the new revision with
-the old text and no marker (the client saw a failure and re-reads; nothing is corrupted).
+GUARANTEE (what correctness rests on): the text and its revision change in ONE call. The commit is a
+single TOP-LEVEL ``set_payload`` carrying ``data``/``hash``/``text_lemmatized``/``updated_at`` together with
+``ns_revision`` (= revision+1; the revision lives beside the text it versions), the writer ``ns_token``,
+the ``ns_nonces`` entry and the metadata delta parked in ``ns_meta_delta`` (``ns_meta_pending``), filtered on
+``id == <memory> AND ns_revision == <expected>`` (a legacy row without ``ns_revision`` matches through its
+``metadata.revision`` mirror, or the absence of both for revision 0). Qdrant applies it only to a point that
+exists and still matches: a stale writer cannot overwrite a later edit, a deleted point cannot be re-created,
+and a top-level merge cannot erase nested metadata written by other writers (``graph_episode_uuid``,
+``times_derived``, tombstones, ...). Whether it applied is read back from our nonce entry (kept by time, so
+successor commits cannot evict it). Not applied -> ``RevisionConflict`` (REST 409) and NOTHING was written.
+Neither a lock nor a TTL is part of this guarantee, and a reader never sees a revision that does not match
+the text it sees (``revision_of(meta, top)`` reads ``ns_revision`` first).
+The DERIVED metadata follows in two filter-scoped calls (filter: ``ns_revision == new AND ns_token == ours``):
+a nested ``set_payload(key="metadata")`` of only the changed keys (a removed key is written as ``null``; the
+engine does not clear nested keys through ``delete_payload``) plus the ``metadata.revision`` mirror, then
+clearing ``ns_meta_pending``. If the process dies between the calls the parked delta stays pending:
+``repair_stale_vectors`` finishes it, and any later edit folds a pending delta into its own base, so it is
+never lost; until then the nested metadata lags the text (like the vector).
 
 The VECTOR (dense + BM25) is derived data (``embed(text)``). It may lag the text
 for a moment but converges: after the text CAS the writer writes the vectors with
@@ -44,11 +44,16 @@ INVARIANTS of an edit (tests: ``tests/test_patch_revision.py``,
 * I4 - the final vector is the embedding of the final text (convergence), and a
   delete during an edit is never resurrected.
 
-DOCUMENTED LIMITS: (1) the dense/BM25 vector is eventually consistent with the
-text (a reader can briefly see new text with the previous vector); a mismatch is
-detectable (``vector_pending``) and repaired. (2) Writers that bypass
-``patch_memory`` (dedup counters, the dreaming graph patcher) do not bump the
-revision; they never change the patchable fields a revision guards.
+DOCUMENTED LIMITS: (1) the dense/BM25 vector and the nested metadata are eventually consistent with the
+text (a reader can briefly see new text with the previous vector, or with the previous nested metadata);
+a mismatch is detectable (``vector_pending``, ``ns_meta_pending``) and repaired. A crash inside the few
+milliseconds between a stale vector write and its post-check is not detectable. (2) Writers that bypass
+``patch_memory`` (dedup counters, the dreaming graph patcher) do not bump the revision; they never change the
+patchable fields a revision guards. (3) The repair scans filter on fields that are not payload-indexed (the
+index entries are waiting for the owner), so each scan reads the collection; rows PROCESSED per run are bounded
+(500) and a failing row stops being retried after 5 attempts. (4) The search paths that build responses from
+raw points (``memory/search.py``) report the ``metadata.revision`` mirror, which can only LAG the true
+revision (the safe direction: a conditional writer holding it is refused).
 """
 
 import logging
@@ -82,21 +87,49 @@ class RevisionConflict(Exception):
         )
 
 
-def revision_of(meta: dict | None) -> str:
-    """The row's revision token: a per-memory write counter kept in ``metadata.revision``.
+def revision_of(meta: dict | None, top=None) -> str:
+    """The row's revision token (a per-memory write counter).
 
-    Rows written before this existed carry no counter and read as ``"0"``. The
-    counter is bumped by every ``patch_memory`` and ``retag_memories`` write, so
-    a client holding a stale revision is refused. Guarantee boundary: a revision
-    names ONE state among writers that take the per-memory edit lock
-    (``patch_memory``, conditional or not, and ``retag_memories``); see the
-    module docstring for the protocol, the lock's expiry behaviour and the
-    writers that do not take it (dedup counters, the dreaming graph patcher).
+    ``top`` is the TOP-LEVEL payload field ``ns_revision``, which lives next to the text it versions
+    (``data``/``hash``) and is written in the same single call; it wins when present. Rows that
+    predate it fall back to the ``metadata.revision`` mirror, and rows with neither read as ``"0"``.
+    Every read path that reports a revision passes ``top`` when it has the top-level payload, so the
+    revision shown always matches the text shown (module docstring has the protocol and the limits).
+    """
+    for value in (top, (meta or {}).get("revision")):
+        if value is None:
+            continue
+        try:
+            return str(max(int(value), 0))
+        except (TypeError, ValueError):
+            continue
+    return "0"
+
+
+def _text_revision(payload: dict) -> int:
+    """The revision at which the TEXT last changed (``ns_text_revision``); a metadata-only edit does not move it.
+
+    Rows whose text predates this field (never edited through this path) fall back to the row revision.
     """
     try:
-        return str(max(int((meta or {}).get("revision") or 0), 0))
+        return int(payload.get("ns_text_revision"))
     except (TypeError, ValueError):
-        return "0"
+        return int(_payload_revision(payload))
+
+
+def _text_filter(memory_id: str, text_revision: int):
+    """Filter selecting this point while its text is still the one written at ``text_revision``."""
+    from qdrant_client.models import FieldCondition, Filter, HasIdCondition, MatchValue
+
+    return Filter(must=[
+        HasIdCondition(has_id=[memory_id]),
+        FieldCondition(key="ns_text_revision", match=MatchValue(value=int(text_revision))),
+    ])
+
+
+def _payload_revision(payload) -> str:
+    """Revision of a raw Qdrant payload (top-level ``ns_revision``, else the ``metadata.revision`` mirror)."""
+    return revision_of(_unwrap_meta(payload), (payload or {}).get("ns_revision"))
 
 
 def normalize_expected_revision(value) -> str | None:
@@ -187,22 +220,29 @@ class _EditLock:
 def _cas_filter(memory_id: str, revision: str, parent_key: str = "metadata", token: str | None = None):
     """Filter selecting exactly this point at exactly this revision (a missing point matches nothing).
 
-    With ``token`` it additionally requires ``metadata.edit_token == token``: the second call of an
-    edit applies only to the row state THIS writer's first call created.
+    The revision lives at the TOP level (``ns_revision``); a legacy row that has none matches through
+    its ``metadata.revision`` mirror (or the absence of both, for revision 0). With ``token`` it also
+    requires ``ns_token == token``: the follow-up calls of an edit apply only to the state THIS
+    writer's first call created.
     """
     from qdrant_client.models import FieldCondition, Filter, HasIdCondition, IsEmptyCondition, MatchValue, PayloadField
 
-    key = f"{parent_key}.revision"
-    if int(revision) == 0:
-        at_revision = Filter(should=[
-            IsEmptyCondition(is_empty=PayloadField(key=key)),
-            FieldCondition(key=key, match=MatchValue(value=0)),
+    rev = int(revision)
+    legacy_mirror = (
+        Filter(should=[
+            IsEmptyCondition(is_empty=PayloadField(key=f"{parent_key}.revision")),
+            FieldCondition(key=f"{parent_key}.revision", match=MatchValue(value=0)),
         ])
-    else:
-        at_revision = Filter(must=[FieldCondition(key=key, match=MatchValue(value=int(revision)))])
+        if rev == 0
+        else Filter(must=[FieldCondition(key=f"{parent_key}.revision", match=MatchValue(value=rev))])
+    )
+    at_revision = Filter(should=[
+        FieldCondition(key="ns_revision", match=MatchValue(value=rev)),
+        Filter(must=[IsEmptyCondition(is_empty=PayloadField(key="ns_revision")), legacy_mirror]),
+    ])
     must = [HasIdCondition(has_id=[memory_id]), at_revision]
     if token is not None:
-        must.append(FieldCondition(key=f"{parent_key}.edit_token", match=MatchValue(value=token)))
+        must.append(FieldCondition(key="ns_token", match=MatchValue(value=token)))
     return Filter(must=must)
 
 
@@ -282,64 +322,86 @@ class EditMixin:
             "text_lemmatized": lemmatize_for_bm25(text),
         }
 
+    @staticmethod
+    def _effective_meta(payload: dict) -> tuple[dict, dict]:
+        """(stored nested metadata, effective metadata = stored + a pending, not-yet-applied delta)."""
+        stored = dict(_unwrap_meta(payload))
+        eff = dict(stored)
+        if payload.get("ns_meta_pending") and isinstance(payload.get("ns_meta_delta"), dict):
+            for k, v in payload["ns_meta_delta"].items():
+                if v is None:
+                    eff.pop(k, None)
+                else:
+                    eff[k] = v
+        return stored, eff
+
     def _cas_set_payload(
-        self, m, memory_id: str, text_fields: dict | None, new_meta: dict, old_meta: dict,
+        self, m, memory_id: str, text_fields: dict | None, new_meta: dict, stored_meta: dict, payload: dict,
         current_revision: str, expected_revision: str | None, parent_key: str,
     ) -> None:
-        """The compare-and-set, in two filter-scoped calls (the second cannot apply without the first).
+        """The compare-and-set: ONE top-level filter-scoped ``set_payload`` carries text AND revision.
 
-        1. ``set_payload(key=<metadata>)`` writes ONLY the metadata keys this edit changed (plus
-           ``revision``, the writer ``edit_token`` and the ``revision_nonces`` entry), filtered on
-           ``id == memory AND revision == current``. Keys it did not touch (``graph_episode_uuid``,
-           ``times_derived``, tombstones, ...) are therefore never overwritten from a stale snapshot,
-           and a removed key is written as ``null`` (the engine does not clear nested keys through
-           ``delete_payload``). Applied-or-not is read back from the writer's nonce entry.
-        2. The top-level fields (text, hash, ``text_lemmatized``, ``updated_at``, the vector marker)
-           are written with a filter requiring the revision we just created AND our ``edit_token``:
-           it can only apply to the state call 1 created, and a successor that already moved on
-           simply makes it a no-op (its text stands). Metadata first, text second, so an edit that
-           loses call 1 changes nothing at all (no text of a rejected edit ever lands).
+        Call A (the commit): ``data``/``hash``/``text_lemmatized``/``updated_at``, ``ns_revision`` = revision+1,
+        the writer ``ns_token``, the ``ns_nonces`` entry, and the metadata delta parked in ``ns_meta_delta`` with
+        ``ns_meta_pending`` set, filtered on ``id == memory AND revision == current`` (the revision is the TOP-LEVEL
+        ``ns_revision``; legacy rows match through their ``metadata.revision`` mirror). Top-level ``set_payload``
+        merges keys, so it can never erase nested metadata written by other writers. Applied-or-not is read back
+        from our nonce entry (kept by time, so successors cannot evict it); not applied -> ``RevisionConflict``
+        and nothing was written.
+        Then the DERIVED metadata is applied, filtered on ``ns_revision == new AND ns_token == ours``:
+        B writes only the changed keys (nested ``set_payload(key="metadata")``, removed keys as ``null``, plus the
+        ``metadata.revision`` mirror) and C clears the pending marker. A crash between the calls leaves
+        ``ns_meta_pending`` + the parked delta, which ``repair_stale_vectors`` finishes, and any later edit folds the
+        pending delta into its own base, so it is never lost. A reader never sees a revision that does not match its text.
         """
         client = m.vector_store.client
         collection = settings.qdrant_collection
         token = uuid.uuid4().hex
         new_revision = int(current_revision) + 1
         now = _now_epoch()
-        nonces = dict(old_meta.get("revision_nonces") or {})
+        nonces = dict(payload.get("ns_nonces") or {})
         nonces[str(new_revision)] = {"n": token, "t": now}
         nonces = {r: e for r, e in nonces.items() if isinstance(e, dict) and e.get("t", 0) >= now - _NONCE_TTL_S}
         for old in sorted(nonces, key=int)[:-_NONCE_CAP]:
             del nonces[old]
         new_meta["revision"] = new_revision
-        new_meta["revision_nonces"] = nonces
-        new_meta["edit_token"] = token
-        for stale in ("revision_pending", "revision_pending_at", "revision_nonce"):
+        for stale in ("revision_pending", "revision_pending_at", "revision_nonce", "revision_nonces", "edit_token"):
             new_meta.pop(stale, None)
-        delta = {k: v for k, v in new_meta.items() if old_meta.get(k) != v}
-        delta.update({k: None for k in old_meta if k not in new_meta})       # removed keys -> null
+        delta = {k: v for k, v in new_meta.items() if stored_meta.get(k) != v}
+        delta.update({k: None for k in stored_meta if k not in new_meta})       # removed keys -> null
+        fields = dict(text_fields or {})
+        if "data" in fields:                                  # a content edit: the TEXT revision moves
+            fields["ns_text_revision"] = new_revision
+            fields["vector_repair_attempts"] = None           # a new edit resets the repair retry budget
+        fields.update({
+            "ns_revision": new_revision, "ns_token": token, "ns_nonces": nonces,
+            "ns_meta_pending": True, "ns_meta_pending_at": now, "ns_meta_delta": delta,
+        })
         client.set_payload(
-            collection_name=collection,
-            payload=delta,
+            collection_name=collection, payload=fields,
             points=_cas_filter(memory_id, current_revision, parent_key),
-            key=parent_key,
         )
-        points = client.retrieve(
-            collection_name=collection, ids=[memory_id], with_payload=True, with_vectors=False
-        )
+        points = client.retrieve(collection_name=collection, ids=[memory_id], with_payload=True, with_vectors=False)
         if not points:
             raise LookupError(f"Memory {memory_id} not found")
         stored_payload = points[0].payload
-        if isinstance(stored_payload, dict):
-            stored = _unwrap_meta(stored_payload)
-            entry = (stored.get("revision_nonces") or {}).get(str(new_revision))
+        if isinstance(stored_payload, dict):             # (a non-store double in unit tests has nothing to read back)
+            entry = (stored_payload.get("ns_nonces") or {}).get(str(new_revision))
             if not isinstance(entry, dict) or entry.get("n") != token:
-                raise RevisionConflict(memory_id, expected_revision or current_revision, revision_of(stored))
-        if text_fields:
-            client.set_payload(
-                collection_name=collection,
-                payload=text_fields,
-                points=_cas_filter(memory_id, str(new_revision), parent_key, token=token),
-            )
+                raise RevisionConflict(memory_id, expected_revision or current_revision, _payload_revision(stored_payload))
+        self._apply_pending_meta(client, collection, memory_id, new_revision, token, delta, parent_key)
+
+    @staticmethod
+    def _apply_pending_meta(client, collection, memory_id, revision, token, delta, parent_key) -> None:
+        """B + C: apply the parked metadata delta to the row state (revision, token) and clear the marker."""
+        flt = _cas_filter(memory_id, str(revision), parent_key, token=token)
+        if delta:
+            client.set_payload(collection_name=collection, payload=delta, points=flt, key=parent_key)
+        client.set_payload(
+            collection_name=collection,
+            payload={"ns_meta_pending": None, "ns_meta_pending_at": None, "ns_meta_delta": None},
+            points=flt,
+        )
 
     @staticmethod
     def _record_edit_history(m, memory_id: str, old_payload: dict, text: str, now_iso: str) -> None:
@@ -371,12 +433,14 @@ class EditMixin:
     def _sync_vector(self, m, memory_id: str, text: str, embedding, text_revision: int, parent_key: str) -> bool:
         """Make the stored vector (dense + BM25) match the CURRENT text; returns True when converged.
 
-        ``update_vectors`` cannot create a point, so a memory deleted meanwhile is never resurrected.
-        Before each write the revision is checked: if a later edit already committed (and may have
-        cleared the marker), THAT text is embedded and the marker is re-asserted first. After each
-        write the revision is re-read once more; the marker is cleared (and ``vector_revision``
-        recorded) by a write filtered on the revision, so it never overwrites a newer state.
-        Returns False (marker left set) when the BM25 encoder is unavailable or retries ran out.
+        ``text_revision`` is the revision at which ``text`` was written (``ns_text_revision``): a
+        metadata-only edit does not move it, so it never triggers a needless re-embed. ``update_vectors``
+        cannot create a point, so a memory deleted meanwhile is never resurrected. Before each write the
+        text revision is checked: if a later CONTENT edit already committed (and may have cleared the
+        marker), THAT text is embedded and the marker re-asserted first. After each write it is re-read
+        once more; the marker is cleared (and ``vector_revision`` recorded) by a write filtered on the
+        text revision, so it never overwrites a newer state. Returns False (marker left set) when the BM25
+        encoder is unavailable or retries ran out.
         """
         from qdrant_client.models import PointVectors
 
@@ -388,14 +452,14 @@ class EditMixin:
                 return True                                  # deleted: nothing to write, nothing resurrected
             stored_payload = points[0].payload
             if isinstance(stored_payload, dict):
-                revision = int(revision_of(_unwrap_meta(stored_payload)))
-                if revision != text_revision:                # a later edit committed: adopt ITS text
-                    text, text_revision = stored_payload.get("data", ""), revision
+                current = _text_revision(stored_payload)
+                if current != text_revision:                 # a later content edit committed: adopt ITS text
+                    text, text_revision = stored_payload.get("data", ""), current
                     embedding = m.embedding_model.embed(text, "update")
                     client.set_payload(                      # its writer may have cleared the marker already
                         collection_name=collection,
                         payload={"vector_pending": True, "vector_pending_at": _now_epoch()},
-                        points=_cas_filter(memory_id, str(revision), parent_key),
+                        points=_text_filter(memory_id, current),
                     )
             vector = {"": embedding}
             if getattr(m.vector_store, "_has_bm25_slot", False):
@@ -418,47 +482,80 @@ class EditMixin:
             stored_payload = points[0].payload
             if not isinstance(stored_payload, dict):
                 return True                                  # non-store double
-            revision = int(revision_of(_unwrap_meta(stored_payload)))
-            if revision == text_revision:
+            if _text_revision(stored_payload) == text_revision:
                 client.set_payload(
                     collection_name=collection,
-                    payload={"vector_revision": revision, "vector_pending": None, "vector_pending_at": None,
+                    payload={"vector_revision": text_revision, "vector_pending": None, "vector_pending_at": None,
                              "vector_repair_attempts": None},
-                    points=_cas_filter(memory_id, str(revision), parent_key),
+                    points=_text_filter(memory_id, text_revision),
                 )
                 return True
-            # A later edit committed during our write: loop re-reads, adopts its text and re-asserts the marker.
+            # A later content edit committed during our write: loop re-reads, adopts its text, re-asserts the marker.
         return False                                         # still pending: repair_stale_vectors converges it
 
     def repair_stale_vectors(self, limit: int = 500, min_age_s: float = 60.0, max_attempts: int = 5) -> dict:
-        """Converge vectors that did not finish after an edit. Bounded, paginated, with a per-row retry budget.
+        """Converge what an edit left unfinished. Bounded per run, paginated, with a per-row retry budget.
 
-        1. rows still ``vector_pending`` (a crash or a stalled writer), older than ``min_age_s``, whose
-           ``vector_repair_attempts`` is below ``max_attempts`` (a persistent failure stops being rescanned first);
-        2. rows whose recorded ``vector_revision`` differs from their ``revision`` (a mismatch the marker missed),
-           scanned up to ``limit`` rows per run.
+        COST (stated honestly): ``vector_pending`` / ``vector_revision`` / ``ns_*`` are not payload-indexed (the
+        index entries wait for the owner), so each filtered scroll below scans the collection; the number of ROWS it
+        processes per run is bounded by ``limit`` (500) and each failing row stops being retried after
+        ``max_attempts``. On a healthy store every scan is empty and nothing is embedded.
+
+        0. rows whose derived metadata was parked (``ns_meta_pending``) and not applied (a crash between an edit's
+           calls): finish them from the parked delta (idempotent, filtered on the row's own revision + token);
+        1. rows still ``vector_pending`` (a crash or a stalled writer) older than ``min_age_s``;
+        2. rows whose ``vector_revision`` differs from their TEXT revision (``ns_text_revision``; a metadata-only edit
+           does not move it) that the marker missed, scanned from a rotating cursor so healthy rows do not eat the
+           budget every run.
+        Both vector passes honour ``max_attempts``; a row that exhausts it is logged.
         """
         from qdrant_client.models import FieldCondition, Filter, IsEmptyCondition, MatchValue, PayloadField, Range
 
         m = self._get_memory()
         client = m.vector_store.client
         collection = settings.qdrant_collection
+        attempts_ok = Filter(should=[
+            IsEmptyCondition(is_empty=PayloadField(key="vector_repair_attempts")),
+            FieldCondition(key="vector_repair_attempts", range=Range(lt=max_attempts)),
+        ])
         pending_filter = Filter(must=[
             FieldCondition(key="vector_pending", match=MatchValue(value=True)),
             FieldCondition(key="vector_pending_at", range=Range(lt=_now_epoch() - min_age_s)),
-            Filter(should=[
-                IsEmptyCondition(is_empty=PayloadField(key="vector_repair_attempts")),
-                FieldCondition(key="vector_repair_attempts", range=Range(lt=max_attempts)),
-            ]),
+            attempts_ok,
         ])
-        mismatch_filter = Filter(must_not=[IsEmptyCondition(is_empty=PayloadField(key="vector_revision"))])
+        mismatch_filter = Filter(
+            must=[attempts_ok], must_not=[IsEmptyCondition(is_empty=PayloadField(key="vector_revision"))]
+        )
+        meta_filter = Filter(must=[
+            FieldCondition(key="ns_meta_pending", match=MatchValue(value=True)),
+            FieldCondition(key="ns_meta_pending_at", range=Range(lt=_now_epoch() - min_age_s)),
+        ])
+        meta_repaired = 0
+        points, _ = client.scroll(
+            collection_name=collection, scroll_filter=meta_filter, limit=min(100, limit),
+            with_payload=True, with_vectors=False,
+        )
+        for pt in points:
+            payload = pt.payload or {}
+            parent = "metadata.metadata" if isinstance((payload.get("metadata") or {}).get("metadata"), dict) else "metadata"
+            try:
+                self._apply_pending_meta(
+                    client, collection, str(pt.id), int(payload.get("ns_revision") or 0),
+                    payload.get("ns_token"), payload.get("ns_meta_delta") or {}, parent,
+                )
+                meta_repaired += 1
+            except Exception as e:  # noqa: BLE001
+                logger.warning("Metadata repair failed for %s: %s", pt.id, e)
+
         scanned = repaired = failed = 0
         seen: set[str] = set()
+        cursor = getattr(self, "_repair_cursor", None)
         for flt, only_mismatch in ((pending_filter, False), (mismatch_filter, True)):
-            offset = None
+            offset = cursor if only_mismatch else None
             budget = limit
+            wrapped = False
             while budget > 0:
-                points, offset = client.scroll(
+                points, next_offset = client.scroll(
                     collection_name=collection, scroll_filter=flt, limit=min(100, budget),
                     offset=offset, with_payload=True, with_vectors=False,
                 )
@@ -467,36 +564,42 @@ class EditMixin:
                     payload = pt.payload or {}
                     if str(pt.id) in seen:
                         continue
-                    revision = int(revision_of(_unwrap_meta(payload)))
-                    if only_mismatch and payload.get("vector_revision") == revision and not payload.get("vector_pending"):
-                        continue
+                    text_rev = _text_revision(payload)
+                    if only_mismatch and payload.get("vector_revision") == text_rev and not payload.get("vector_pending"):
+                        continue                                  # healthy: its vector matches its text
                     seen.add(str(pt.id))
                     scanned += 1
                     parent_key = "metadata.metadata" if isinstance((payload.get("metadata") or {}).get("metadata"), dict) else "metadata"
                     try:
                         text = payload.get("data", "")
                         embedding = m.embedding_model.embed(text, "update")
-                        ok = self._sync_vector(m, str(pt.id), text, embedding, revision, parent_key)
+                        ok = self._sync_vector(m, str(pt.id), text, embedding, text_rev, parent_key)
                     except Exception as e:  # noqa: BLE001
                         logger.warning("Vector repair failed for %s: %s", pt.id, e)
                         ok = False
                     if ok:
                         repaired += 1
-                    else:
-                        failed += 1
-                        attempts = int(payload.get("vector_repair_attempts") or 0) + 1
-                        try:
-                            client.set_payload(
-                                collection_name=collection,
-                                payload={"vector_repair_attempts": attempts, "vector_pending": True,
-                                         "vector_pending_at": _now_epoch()},
-                                points=_cas_filter(str(pt.id), str(revision), parent_key),
-                            )
-                        except Exception:  # noqa: BLE001
-                            pass
+                        continue
+                    failed += 1
+                    attempts = int(payload.get("vector_repair_attempts") or 0) + 1
+                    if attempts >= max_attempts:
+                        logger.error("Vector repair attempts exhausted for %s (%d); it stays pending for an operator", pt.id, attempts)
+                    try:
+                        client.set_payload(
+                            collection_name=collection,
+                            payload={"vector_repair_attempts": attempts, "vector_pending": True,
+                                     "vector_pending_at": _now_epoch()},
+                            points=_text_filter(str(pt.id), text_rev),
+                        )
+                    except Exception:  # noqa: BLE001
+                        pass
+                offset = next_offset
                 if offset is None or not points:
+                    wrapped = True
                     break
-        return {"scanned": scanned, "repaired": repaired, "failed": failed}
+            if only_mismatch:
+                self._repair_cursor = None if wrapped else offset      # resume where this run stopped
+        return {"scanned": scanned, "repaired": repaired, "failed": failed, "meta_repaired": meta_repaired}
 
     def patch_memory(
         self,
@@ -576,7 +679,9 @@ class EditMixin:
         # mem0 sometimes double-wraps metadata; unwrap before reading
         if isinstance(meta.get("metadata"), dict):
             meta = meta["metadata"]
-        meta = dict(meta)
+        # ``stored_meta`` = what is on disk; ``meta`` = stored + a crash-pending metadata delta from an
+        # earlier edit (so a later edit never loses it).
+        stored_meta, meta = self._effective_meta(payload)
         expected_revision = normalize_expected_revision(expected_revision)
 
         for key in ("content", "category", "visibility"):
@@ -595,7 +700,7 @@ class EditMixin:
 
         # Precondition (after the permission gate so a caller who may not edit
         # never learns the row's revision from a refusal).
-        current_revision = revision_of(meta)
+        current_revision = revision_of(meta, payload.get("ns_revision"))
         if expected_revision is not None and expected_revision != current_revision:
             raise RevisionConflict(memory_id, expected_revision, current_revision)
 
@@ -665,7 +770,7 @@ class EditMixin:
             text_fields["vector_pending"] = True            # cleared once the vector matches this text
             text_fields["vector_pending_at"] = _now_epoch()
         self._cas_set_payload(
-            m, memory_id, text_fields, new_meta, meta, current_revision, expected_revision, parent_key
+            m, memory_id, text_fields, new_meta, stored_meta, payload, current_revision, expected_revision, parent_key
         )
         if edits_content:
             self._record_edit_history(m, memory_id, payload, changes["content"], now_iso)
@@ -853,10 +958,7 @@ class EditMixin:
             for pt in points:
                 matched += 1
                 payload = pt.payload or {}
-                meta = payload.get("metadata") or {}
-                if isinstance(meta.get("metadata"), dict):
-                    meta = meta["metadata"]
-                meta = dict(meta)
+                stored_meta, meta = self._effective_meta(payload)
                 try:
                     _check_edit_permission(
                         meta, payload.get("user_id", ""), caller_user_id,
@@ -926,8 +1028,8 @@ class EditMixin:
                     with _EditLock(str(pt.id)):
                         self._cas_set_payload(
                             m, str(pt.id),
-                            {"updated_at": now_iso}, new_meta, meta,
-                            revision_of(meta), None, parent_key,
+                            {"updated_at": now_iso}, new_meta, stored_meta, payload,
+                            revision_of(meta, payload.get("ns_revision")), None, parent_key,
                         )
                 except (RevisionConflict, LookupError):
                     busy = True        # the row moved on (or is gone) since the scroll: not retagged, reported
