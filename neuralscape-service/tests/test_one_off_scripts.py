@@ -18,45 +18,110 @@ from schemas import MemoryResponse
 # ── migrate_graph_groups ──
 
 
-class FakeNeo4j:
-    """Just enough of a Neo4j session for the legacy-group scan and rewrite."""
+KINDS = ("Episodic", "Entity", "Community", "Saga", "RELATES_TO", "MENTIONS", "HAS_MEMBER", "HAS_EPISODE", "NEXT_EPISODE")
 
-    def __init__(self, rows: dict[str, dict[str, int]]):
+
+class FakeNeo4j:
+    """Just enough of a Neo4j session for the legacy-group scan, rewrite, transaction and verify."""
+
+    def __init__(self, rows: dict[str, dict[str, int]], fail_on_kind: str | None = None, skip_rewrite_of: str | None = None):
         self.rows = {k: dict(v) for k, v in rows.items()}  # kind -> {group_id: count}
         self.writes: list[tuple[str, dict]] = []
+        self.commits = self.rollbacks = 0
+        self.fail_on_kind, self.skip_rewrite_of = fail_on_kind, skip_rewrite_of
+
+    def _kind(self, cypher):
+        return next((k for k in KINDS if f":{k} " in cypher or f":{k})" in cypher or f"[x:{k}" in cypher), None)
 
     def run(self, cypher, **params):
-        kind = next((k for k in ("Episodic", "Entity", "Community", "RELATES_TO", "MENTIONS", "HAS_MEMBER") if f":{k} " in cypher or f":{k})" in cypher or f"[x:{k}" in cypher), None)
+        kind = self._kind(cypher)
         if "SET x.group_id" in cypher:
             old, new = params["old"], params["new"]
-            n = self.rows.get(kind, {}).pop(old, 0)
-            self.rows.setdefault(kind, {})[new] = self.rows.get(kind, {}).get(new, 0) + n
+            if kind == self.fail_on_kind:
+                raise RuntimeError("boom")
+            n = self.rows.get(kind, {}).get(old, 0)
+            if old != self.skip_rewrite_of:
+                self.rows.get(kind, {}).pop(old, None)
+                self.rows.setdefault(kind, {})[new] = self.rows.get(kind, {}).get(new, 0) + n
             self.writes.append((kind, params))
             return SimpleNamespace(single=lambda: {"c": n})
+        if kind is None and "WHERE x.group_id = $old" in cypher:
+            kinds = [k for k in KINDS if (k in ("Episodic", "Entity", "Community", "Saga")) == ("MATCH (x)" in cypher)]
+            c = sum(self.rows.get(k, {}).get(params["old"], 0) for k in kinds)
+            return SimpleNamespace(single=lambda: {"c": c})
         return [{"g": g, "c": c} for g, c in self.rows.get(kind, {}).items()
                 if g == "global" or g.startswith("project--")]
 
+    def begin_transaction(self):
+        import copy
+
+        outer = self
+        snapshot = copy.deepcopy(self.rows)
+
+        class Tx:
+            def __enter__(self_):
+                return self_
+
+            def __exit__(self_, exc_type, *a):
+                if exc_type is not None:
+                    outer.rows = snapshot
+                    outer.rollbacks += 1
+                return False
+
+            def run(self_, cypher, **params):
+                return outer.run(cypher, **params)
+
+            def commit(self_):
+                outer.commits += 1
+
+        return Tx()
+
 
 class TestMigrateGraphGroups:
-    def test_rewrite_target_uses_the_service_group_id_builder(self):
-        from memory.groups import _build_group_id
+    def test_rewrite_target_is_explicit_about_the_format(self):
+        from config import settings
         from scripts.migrate_graph_groups import rewrite_target
 
-        assert rewrite_target("global", "alice") == _build_group_id("private", "alice", None, None) == "user--alice"
-        assert rewrite_target("project--payroll", "alice") == "user--alice--project--payroll"
+        assert rewrite_target("global", "alice", "legacy") == "user--alice"
+        assert rewrite_target("project--payroll", "alice", "legacy") == "user--alice--project--payroll"
         for current in ("user--alice", "shared", "shared--project--x", "standard", "project--", ""):
-            assert rewrite_target(current, "alice") is None
+            assert rewrite_target(current, "alice", "legacy") is None
+        # a project id the legacy format cannot name unambiguously: the two formats disagree
+        legacy = rewrite_target("project--a.b", "alice", "legacy")
+        injective = rewrite_target("project--a.b", "alice", "injective")
+        assert legacy == "user--alice--project--a.b" and injective.startswith("nsg1--") and legacy != injective
+        # the result never depends on, and never leaks, the process's flag state
+        assert settings.graph_group_id_injective_enabled is False
+        settings.graph_group_id_injective_enabled = True
+        try:
+            assert rewrite_target("project--a.b", "alice", "legacy") == legacy
+            assert rewrite_target("project--a.b", "alice", "injective") == injective
+            assert settings.graph_group_id_injective_enabled is True
+        finally:
+            settings.graph_group_id_injective_enabled = False
+        with pytest.raises(ValueError):
+            rewrite_target("global", "alice", "bogus")
 
     def test_scan_covers_nodes_and_every_edge_relationship_type(self):
         from scripts.migrate_graph_groups import scan_legacy_groups
 
         session = FakeNeo4j({"Entity": {"global": 2}, "RELATES_TO": {"global": 5, "project--p": 1}, "MENTIONS": {"global": 3},
+                             "Saga": {"global": 1}, "HAS_EPISODE": {"global": 4}, "NEXT_EPISODE": {"project--p": 2},
                              "Episodic": {"user--alice": 9}})
         plan = scan_legacy_groups(session, "alice")
         assert plan["RELATES_TO"] == [("global", "user--alice", 5), ("project--p", "user--alice--project--p", 1)]
         assert plan["MENTIONS"] == [("global", "user--alice", 3)]
         assert plan["Entity"] == [("global", "user--alice", 2)]
+        assert plan["Saga"] == [("global", "user--alice", 1)] and plan["HAS_EPISODE"] == [("global", "user--alice", 4)]
+        assert plan["NEXT_EPISODE"] == [("project--p", "user--alice--project--p", 2)]
         assert plan["Episodic"] == [] and plan["Community"] == [] and plan["HAS_MEMBER"] == []
+
+    def test_scan_names_targets_in_the_requested_format(self):
+        from scripts.migrate_graph_groups import scan_legacy_groups
+
+        session = FakeNeo4j({"Entity": {"project--a.b": 1}})
+        assert scan_legacy_groups(session, "alice", "legacy")["Entity"] == [("project--a.b", "user--alice--project--a.b", 1)]
+        assert scan_legacy_groups(session, "alice", "injective")["Entity"][0][1].startswith("nsg1--")
 
     def test_apply_rewrites_edges_not_only_nodes_and_is_idempotent(self):
         from scripts.migrate_graph_groups import apply_rewrites, scan_legacy_groups
@@ -68,15 +133,44 @@ class TestMigrateGraphGroups:
         again = scan_legacy_groups(session, "alice")
         assert all(not per for per in again.values())
 
+    def test_one_transaction_per_legacy_group_across_all_kinds(self):
+        from scripts.migrate_graph_groups import apply_rewrites, scan_legacy_groups
+
+        session = FakeNeo4j({"Entity": {"global": 2, "project--p": 1}, "RELATES_TO": {"global": 5}})
+        apply_rewrites(session, scan_legacy_groups(session, "alice"), print_fn=lambda *_: None)
+        assert session.commits == 2  # 'global' and 'project--p'
+
+    def test_a_failure_rolls_the_group_back_and_stops(self):
+        from scripts.migrate_graph_groups import apply_rewrites, scan_legacy_groups
+
+        session = FakeNeo4j({"Entity": {"global": 2}, "RELATES_TO": {"global": 5}}, fail_on_kind="RELATES_TO")
+        with pytest.raises(RuntimeError, match="boom"):
+            apply_rewrites(session, scan_legacy_groups(session, "alice"), print_fn=lambda *_: None)
+        assert session.rollbacks == 1 and session.rows["Entity"] == {"global": 2}   # nothing half-renamed
+
+    def test_verification_fails_loudly_when_rows_keep_the_old_group(self):
+        from scripts.migrate_graph_groups import apply_rewrites, scan_legacy_groups
+
+        session = FakeNeo4j({"Entity": {"global": 2}}, skip_rewrite_of="global")
+        with pytest.raises(RuntimeError, match="verification failed"):
+            apply_rewrites(session, scan_legacy_groups(session, "alice"), print_fn=lambda *_: None)
+
     def test_cypher_targets_relationships_with_a_relationship_pattern(self):
         from scripts.migrate_graph_groups import apply_rewrites
 
         seen = []
 
-        class S:
-            def run(self, cypher, **p):
+        class Tx:
+            def __enter__(s): return s
+            def __exit__(s, *a): return False
+            def run(s, cypher, **p):
                 seen.append(cypher)
                 return SimpleNamespace(single=lambda: {"c": 1})
+            def commit(s): pass
+
+        class S:
+            def begin_transaction(self): return Tx()
+            def run(self, cypher, **p): return SimpleNamespace(single=lambda: {"c": 0})
 
         apply_rewrites(S(), {"RELATES_TO": [("global", "user--a", 1)], "Entity": [("global", "user--a", 1)]}, print_fn=lambda *_: None)
         assert any("()-[x:RELATES_TO" in c for c in seen) and any("(x:Entity" in c for c in seen)
@@ -89,6 +183,57 @@ class TestMigrateGraphGroups:
                SimpleNamespace(id="2", payload={"user_id": "a--b", "metadata": {"visibility": "private"}})]
         rows = changed_group_rows(pts)
         assert [r["id"] for r in rows] == ["2"] and rows[0]["new_group_id"].startswith("nsg1--")
+
+    # ── main(): dry run by default, explicit format, refusal on a mismatch ──
+
+    @pytest.fixture
+    def neo(self, monkeypatch):
+        import config
+        import neo4j
+
+        session = FakeNeo4j({"Entity": {"global": 2}, "RELATES_TO": {"global": 5}})
+
+        class Ctx:
+            def __enter__(s): return session
+            def __exit__(s, *a): return False
+
+        driver = SimpleNamespace(session=lambda database=None: Ctx(), close=lambda: None)
+        monkeypatch.setattr(neo4j.GraphDatabase, "driver", lambda *a, **k: driver)
+        monkeypatch.setattr(config.settings, "neo4j_password", "pw")
+        return session
+
+    def test_default_is_a_dry_run_that_changes_nothing(self, neo, capsys):
+        from scripts.migrate_graph_groups import main
+
+        assert main(["--owner", "alice", "--target-format", "legacy"]) == 0
+        assert neo.writes == [] and neo.commits == 0
+        out = capsys.readouterr().out
+        assert "Dry-run only" in out and "Target format: legacy" in out and "7 rows to rewrite" in out
+
+    def test_apply_rewrites_and_warns_that_everything_becomes_private(self, neo, capsys):
+        from scripts.migrate_graph_groups import main
+
+        assert main(["--owner", "alice", "--target-format", "legacy", "--apply"]) == 0
+        assert neo.rows["RELATES_TO"] == {"user--alice": 5}
+        assert "PRIVATE to 'alice'" in capsys.readouterr().out
+
+    def test_target_format_is_required(self, neo):
+        from scripts.migrate_graph_groups import main
+
+        with pytest.raises(SystemExit) as exc:
+            main(["--owner", "alice"])
+        assert exc.value.code == 2 and neo.writes == []
+
+    def test_a_format_that_disagrees_with_the_service_is_refused_even_with_apply(self, neo, capsys):
+        from scripts.migrate_graph_groups import main
+
+        assert main(["--owner", "alice", "--target-format", "injective", "--apply"]) == 2
+        assert neo.writes == [] and "refusing" in capsys.readouterr().err
+
+    def test_force_overrides_the_refusal(self, neo):
+        from scripts.migrate_graph_groups import main
+
+        assert main(["--owner", "alice", "--target-format", "injective", "--force"]) == 0
 
 
 # ── scrub_qdrant_visibility ──
