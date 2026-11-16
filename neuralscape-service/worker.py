@@ -959,8 +959,6 @@ async def process_code_index(ctx: dict, payload: dict) -> dict:
     repo_sha = await asyncio.to_thread(_git_head_sha, repo_source)
     indexed_at = time.time()
     from knowledge import index_store
-    from knowledge.router import ProjectKnowledgeConfig, set_project_config
-
     meta = {
         "system": system,
         "repo_source": repo_source,
@@ -974,16 +972,7 @@ async def process_code_index(ctx: dict, payload: dict) -> dict:
     }
     await asyncio.to_thread(index_store.record_index, code_space, meta)
     if project_id:
-        await asyncio.to_thread(
-            set_project_config,
-            ProjectKnowledgeConfig(
-                project_id=project_id,
-                code_systems=[system],
-                fuse_code_into_recall=True,
-                default_engine=system,
-                code_space=code_space,
-            ),
-        )
+        await asyncio.to_thread(_merge_index_into_project_config, project_id, system, code_space)
 
     # 3. External-engine liveness diff → dreaming consumer (best-effort).
     liveness = {"events": [], "flagged": 0, "summary": "skipped"}
@@ -1014,6 +1003,46 @@ async def process_code_index(ctx: dict, payload: dict) -> dict:
         "indexed_at": indexed_at,
         "liveness": {"flagged": liveness.get("flagged", 0), "summary": liveness.get("summary", "")},
     }
+
+
+def _merge_index_into_project_config(project_id: str, system: str, code_space: str) -> None:
+    """Record an index in the project's knowledge config WITHOUT replacing the config.
+
+    An index adds its system to ``code_systems`` and records ``code_space``; every
+    other stored field an admin set (``fuse_code_into_recall``, ``op_preference``,
+    an existing ``default_engine``, systems from earlier indexes) is kept. The
+    stored copy is read straight from Redis first so a config an API process
+    wrote a moment ago is not overwritten with a stale cached copy.
+    """
+    import json as _json
+
+    from knowledge import index_store
+    from knowledge.router import ProjectKnowledgeConfig, set_project_config
+
+    raw = None
+    client = index_store._redis()
+    if client is not None:
+        try:
+            blob = client.get(index_store._CFG_PREFIX + project_id)
+            raw = _json.loads(blob) if blob else None
+        except Exception:  # noqa: BLE001 - fall back to the cached read
+            raw = None
+    if raw is None:
+        raw = index_store.load_project_config(project_id)
+    raw = raw or {}
+    systems = list(raw.get("code_systems") or [])
+    if system not in systems:
+        systems.append(system)
+    set_project_config(
+        ProjectKnowledgeConfig(
+            project_id=project_id,
+            code_systems=systems,
+            fuse_code_into_recall=bool(raw.get("fuse_code_into_recall", True)),
+            default_engine=raw.get("default_engine") or system,
+            code_space=code_space,
+            op_preference=raw.get("op_preference"),
+        )
+    )
 
 
 def _git_head_sha(repo_path: str) -> str | None:
