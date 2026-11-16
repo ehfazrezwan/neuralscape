@@ -112,6 +112,35 @@ def _legacy_counts(cy) -> dict[str, int]:
     return counts
 
 
+def _foreign_legacy_count(cy, run: str) -> int:
+    """Legacy-id nodes and relationships NOT seeded by this run (the migration would rewrite them)."""
+    pred = "{v}.group_id STARTS WITH 'project:' OR {v}.group_id STARTS WITH 'project--'"
+    nodes = cy(
+        f"MATCH (n) WHERE ({pred.format(v='n')}) AND (n.run IS NULL OR n.run <> $run) "
+        "RETURN count(n) AS c", run=run,
+    )[0]["c"]
+    rels = cy(
+        f"MATCH ()-[r]->() WHERE ({pred.format(v='r')}) AND (r.run IS NULL OR r.run <> $run) "
+        "RETURN count(r) AS c", run=run,
+    )[0]["c"]
+    return nodes + rels
+
+
+def _assert_no_foreign_legacy_rows(cy, run: str) -> None:
+    n = _foreign_legacy_count(cy, run)
+    if n:
+        pytest.fail(
+            f"{n} legacy-id node(s)/relationship(s) not seeded by this test exist in the target "
+            "database; the migration would rewrite them. Point NEO4J_* at a disposable database.",
+            pytrace=False,
+        )
+
+
+def test_target_database_holds_no_foreign_legacy_rows(graph):
+    cy, run = graph
+    assert _foreign_legacy_count(cy, run) == 0
+
+
 def _run_file(cy, target_prefix: str) -> dict[str, int]:
     """Execute the file statement by statement; return {label: migrated} plus the verify counts."""
     migrated: dict[str, int] = {}
@@ -132,6 +161,7 @@ def _run_file(cy, target_prefix: str) -> dict[str, int]:
 def test_cypher_rewrites_every_label_and_relationship_exactly(graph, target):
     cy, run = graph
     pid, uid = f"p{uuid.uuid4().hex[:6]}", "u1"
+    _assert_no_foreign_legacy_rows(cy, run)
     _seed(cy, run, pid, uid)
     before = _legacy_counts(cy)
     # at least the seeded legacy rows: 2 per label, 2 per relationship type
@@ -177,7 +207,7 @@ def test_cypher_rewrites_every_label_and_relationship_exactly(graph, target):
 
 
 @pytest.mark.parametrize(
-    "bad", ["", "shared-project--", "project--", "user----project--", "user--u--project", "shared--project", "x"]
+    "bad", ["", "shared-project--", "project--", "user----project--", "user--u--project", "user--x--ws--project--", "shared--project", "x"]
 )
 def test_cypher_rejects_bad_target_prefix_before_writing(graph, bad):
     cy, run = graph

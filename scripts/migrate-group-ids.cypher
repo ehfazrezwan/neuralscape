@@ -35,8 +35,13 @@
 // row is rewritten by either, the other no longer matches it.
 //
 // Required parameter (the script aborts, before changing anything, unless it
-// is exactly 'shared--project--' or looks like 'user--<uid>--project--'):
+// is exactly 'shared--project--' or looks like 'user--<uid>--project--', with no '--' inside <uid>):
 //   target_prefix
+//
+// NOTE: this targets the current (non-injective, `--`-joined) group-id builder in
+// memory/groups.py. Ids would differ if GRAPH_GROUP_ID_INJECTIVE_ENABLED were on
+// (config currently refuses it); re-check the target format before using this
+// file if that flag is ever enabled.
 //
 // BACK UP FIRST (the rewrite is irreversible), e.g. neo4j-admin database dump
 // or a volume snapshot, then take the dry run below and compare counts.
@@ -62,7 +67,7 @@
 
 // --- Guard: abort on a bad target_prefix (1/0 raises, cypher-shell stops) ---
 WITH $target_prefix AS p
-WITH CASE WHEN p IS NOT NULL AND (p = 'shared--project--' OR p =~ '^user--[^-].*--project--$') THEN 1 ELSE 0 END AS ok
+WITH CASE WHEN p IS NOT NULL AND (p = 'shared--project--' OR p =~ '^user--[^-]+(-[^-]+)*--project--$') THEN 1 ELSE 0 END AS ok
 RETURN 1 / ok AS target_prefix_valid;
 
 // --- Migrate Episodic group_ids ---

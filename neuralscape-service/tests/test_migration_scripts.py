@@ -170,7 +170,7 @@ def test_cypher_guards_target_prefix_before_any_write():
         return
     first = _statements()[0]
     assert "$target_prefix" in first and "1 / ok" in first and "SET " not in first
-    assert "shared--project--" in first and "^user--[^-].*--project--$" in first
+    assert "shared--project--" in first and "^user--[^-]+(-[^-]+)*--project--$" in first
     assert "target_prefix" in _migrations()[0]
 
 
@@ -181,3 +181,17 @@ def test_graph_groups_script_header_points_at_the_cypher_file():
     doc = script.read_text().split('"""')[1]
     assert "migrate-group-ids.cypher" in doc
     assert "user--<owner>--project--" in doc
+
+
+def test_cypher_guard_regex_rejects_double_dash_inside_uid():
+    if not CYPHER.is_file():
+        return
+    m = re.search(r"p =~ '([^']+)'", _statements()[0])
+    assert m
+    pattern = re.compile(m.group(1))
+    for ok in ("user--u1--project--", "user--a-b--project--"):
+        assert pattern.fullmatch(ok), ok
+    for bad in ("user--x--ws--project--", "user----project--", "user--u--project", "user--x--y--project--", ""):
+        assert not pattern.fullmatch(bad), bad
+    header = "\n".join(l for l in CYPHER.read_text().splitlines() if l.startswith("//"))
+    assert "GRAPH_GROUP_ID_INJECTIVE_ENABLED" in header
