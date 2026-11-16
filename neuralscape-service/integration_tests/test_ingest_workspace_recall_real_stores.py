@@ -138,7 +138,7 @@ def test_ingest_text_workspace_is_recalled_only_when_that_workspace_is_asked_for
     def search(**extra):
         resp = client.post("/v1/search", json={"query": f"tide table pilot hut {tag}", "limit": 20, **extra}, headers=headers)
         assert resp.status_code == 200, resp.text
-        return resp.json()["memories"]
+        return resp.json()["results"]
 
     in_ws = search(workspaces=[ws])
     assert in_ws and all((m.get("workspace") == ws) for m in in_ws), in_ws
