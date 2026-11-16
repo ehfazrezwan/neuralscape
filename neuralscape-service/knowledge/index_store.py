@@ -29,7 +29,9 @@ _KEY_PREFIX = "ns:code-index:"          # + code_space  → metadata hash (JSON)
 _CFG_PREFIX = "ns:code-projcfg:"        # + project_id  → project config (JSON)
 
 # Bounded so a wedged Redis can't stall the request path (router <1ms budget).
-_SOCKET_TIMEOUT = 1.0
+# Payloads are tiny JSON blobs, so a healthy Redis answers in well under a
+# millisecond; 0.25 s is the worst-case cost of ONE failed read/connect.
+_SOCKET_TIMEOUT = 0.25
 
 # In-memory L1 (also the sole store when Redis is unavailable). Entries carry a
 # monotonic write time; when Redis is up, a positive hit older than _L1_TTL is
@@ -38,6 +40,14 @@ _SOCKET_TIMEOUT = 1.0
 _mem_meta: dict[str, dict] = {}
 _mem_cfg: dict[str, dict] = {}
 _mem_cfg_at: dict[str, float] = {}
+# project_id -> monotonic time of the last authoritative "no config" answer.
+# Without it every recall for an unconfigured project (the common case) pays a
+# Redis GET. Valid for one config_ttl(); cleared by a local save.
+_mem_cfg_miss_at: dict[str, float] = {}
+# Process-wide: after a failed Redis config read (down, timeout, error), skip
+# Redis for config reads until this monotonic time, so a wedged Redis costs at
+# most ONE bounded read per config_ttl() per process, not one per project.
+_cfg_down_until = 0.0
 _L1_TTL = 30.0  # fallback when settings are unavailable
 
 
@@ -140,6 +150,7 @@ def save_project_config(project_id: str, config: dict) -> None:
 
     _mem_cfg[project_id] = dict(config)
     _mem_cfg_at[project_id] = _t.monotonic()
+    _mem_cfg_miss_at.pop(project_id, None)
     r = _redis()
     if r is None:
         return
@@ -176,23 +187,40 @@ def refresh_project_config(project_id: str) -> tuple[bool, dict | None]:
 
 
 def _load_project_config(project_id: str, max_age: float | None) -> tuple[bool, dict | None]:
+    """Worst case per call: one Redis read bounded by ``_SOCKET_TIMEOUT``; after a
+    failure no further Redis read for ``config_ttl()`` seconds (process-wide)."""
+    global _cfg_down_until
     import time as _t
 
     ttl = config_ttl() if max_age is None else max_age
+    now = _t.monotonic()
     hit = _mem_cfg.get(project_id)
-    if hit is not None and (_t.monotonic() - _mem_cfg_at.get(project_id, 0.0)) < ttl:
+    if hit is not None and (now - _mem_cfg_at.get(project_id, 0.0)) < ttl:
         return False, hit
+    if hit is None and max_age is None:
+        missed_at = _mem_cfg_miss_at.get(project_id)
+        if missed_at is not None and (now - missed_at) < ttl:
+            return False, None  # negative-cached: no Redis I/O
+    if now < _cfg_down_until:
+        return False, hit  # Redis failed recently: serve L1 without retrying
+
+    def _down() -> tuple[bool, dict | None]:
+        global _cfg_down_until
+        _cfg_down_until = _t.monotonic() + max(config_ttl(), 1.0)
+        return False, hit
+
     r = _redis()
     if r is None:
-        return False, hit  # Redis down → serve the (possibly stale) L1 value, if any
+        return _down()  # Redis down → serve the (possibly stale) L1 value, if any
     try:
         raw = r.get(_CFG_PREFIX + project_id)
     except Exception:  # noqa: BLE001
-        return False, hit
+        return _down()
     if not raw:
         # Redis answered and the key is absent: authoritative, drop L1.
         _mem_cfg.pop(project_id, None)
         _mem_cfg_at.pop(project_id, None)
+        _mem_cfg_miss_at[project_id] = _t.monotonic()
         return True, None
     try:
         cfg = json.loads(raw)
@@ -200,14 +228,17 @@ def _load_project_config(project_id: str, max_age: float | None) -> tuple[bool, 
         return False, hit
     _mem_cfg[project_id] = cfg
     _mem_cfg_at[project_id] = _t.monotonic()
+    _mem_cfg_miss_at.pop(project_id, None)
     return True, cfg
 
 
 def _reset_for_tests() -> None:
     """Clear in-memory caches + force client re-resolution (test hook)."""
-    global _client, _client_probe_at
+    global _client, _client_probe_at, _cfg_down_until
     _mem_meta.clear()
     _mem_cfg.clear()
     _mem_cfg_at.clear()
+    _mem_cfg_miss_at.clear()
+    _cfg_down_until = 0.0
     _client = None
     _client_probe_at = 0.0
