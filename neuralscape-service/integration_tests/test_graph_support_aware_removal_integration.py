@@ -456,10 +456,12 @@ def test_until_re_enrichment_runs_the_sibling_waits_marked_and_its_facts_are_abs
     install_graph_add(service, graph, ids)
     jobs = []
     service.set_graph_reenrich_dispatch(jobs.append)
+    assert service._memory.meta(MEM_C)["graph_episode_uuid"] == ids["EA"]  # the sibling starts out on the shared episode
     delete_through_the_api(service, monkeypatch, flags, MEM_A)
     assert [job["memory_id"] for job in jobs] == [MEM_C] and jobs[0]["removed_episode"] == ids["EA"]
     row = service._memory.meta(MEM_C)
-    assert row["graph_reenrich_pending"] == ids["EA"] and row["graph_episode_uuid"] is None
+    # The row's episode reference is cleared (Qdrant may drop the key or keep it null): read it with ``get``.
+    assert row["graph_reenrich_pending"] == ids["EA"] and row.get("graph_episode_uuid") is None
     assert not exists(graph, "Episodic", ids["EA"]) and facts(graph, "tea in the evening") == []
     assert service.reenrich_memory_graph(MEM_C) == {"memory_ids": [MEM_C]}  # the job, when it runs
     assert_the_shared_episode_is_gone_and_the_sibling_is_back(service, graph, ids)
@@ -554,14 +556,20 @@ def episodes_with(graph, text):
 DELETED_TEXT = "oolong in the afternoon"
 
 
-def arm_the_delete_during_extraction(service, graph, ids):
-    """The user deletes the memory while the graph write runs: the delete finds no episode yet, so it removes nothing."""
+def arm_the_delete_during_extraction(service, graph, ids, after_the_delete=None):
+    """The user deletes the memory while the graph write runs: the delete finds no episode yet, so it removes nothing.
+
+    That delete itself takes the lossy substring fallback (nothing to resolve); ``after_the_delete`` is called
+    once it has returned, so a test can start counting fallbacks from what the job does afterwards.
+    """
     service._memory.put(MEM_NEW, DELETED_TEXT, {"owner_user_id": OWNER, "visibility": "private"})
     graphiti, bridge = graph
 
     def add_while_the_user_deletes(**kwargs):
         result = service.delete_memory(MEM_NEW)
         assert result.get("graph_cascade") == "unresolved"
+        if after_the_delete is not None:
+            after_the_delete()
         episode = str(uuid.uuid4())
         q(graphiti, bridge, """
             MATCH (x:Entity {uuid: $X})
@@ -593,8 +601,9 @@ def test_a_memory_deleted_during_its_graph_job_leaves_no_episode_and_the_job_res
     flags(graph_support_aware_removal_enabled=support_aware, graph_delete_race_cleanup_enabled=race_cleanup)
     ids = seed(*graph)
     service = make_service(graph, ids, rows_collection)
-    arm_the_delete_during_extraction(service, graph, ids)
     substring_fallbacks = []
+    # The user's own delete (nothing to resolve yet) uses the fallback; only what the job does afterwards counts.
+    arm_the_delete_during_extraction(service, graph, ids, after_the_delete=substring_fallbacks.clear)
     monkeypatch.setattr(service, "_expire_graph_edges_for_memory", lambda mem: substring_fallbacks.append(mem))
     outcome = asyncio.run(worker.process_graph_enrichment({"service": service}, MEM_NEW, DELETED_TEXT, OWNER, None, "private"))
     assert outcome == {"memory_id": MEM_NEW, "enriched": False, "skipped": "changed_during_enrichment"}

@@ -106,12 +106,12 @@ def _events(store, tenant, task_id=None):
     return list(store.events(tenant, task_id))
 
 
-def _remember_through_the_worker(service, stores, user_id, job_id, graph_queue):
+def _remember_through_the_worker(service, stores, user_id, job_id):
     """The worker path: ``on_job_start`` binds the job to its owner, ``process_memory_store`` extracts and stores.
 
-    ``ctx["redis"]`` is the ARQ pool the worker really has, so the graph enrichment is deferred to a graph-queue
-    job (``graph_queue``, a queue nothing consumes) as in production, not run inline; the queued job is removed
-    afterwards.  Returns the job's result and the number of graph jobs it queued.
+    ``ctx["redis"]`` is the ARQ pool the worker really has; the job's owner is read from the enqueue-time record
+    in Redis.  A conversation write writes its graph episode inside the extraction (it is not a deferred graph
+    job), so the graph provider calls are part of this job too.
     """
     from arq import create_pool
     from arq.connections import RedisSettings
@@ -126,32 +126,25 @@ def _remember_through_the_worker(service, stores, user_id, job_id, graph_queue):
             ctx = {"job_id": job_id, "job_try": 1, "redis": pool, "service": service, "extension_registry": None}
             await worker._make_on_job_start("nsit")(ctx)
             try:
-                result = await worker.process_memory_store(ctx, FACT_MESSAGES, user_id)
+                return await worker.process_memory_store(ctx, FACT_MESSAGES, user_id)
             finally:
                 await worker._make_after_job_end("nsit")(ctx)
-            queued = await pool.zrange(graph_queue, 0, -1)
-            return result, len(queued)
         finally:
-            for member in await pool.zrange(graph_queue, 0, -1):
-                await pool.delete(b"arq:job:" + (member if isinstance(member, bytes) else member.encode()))
-            await pool.delete(graph_queue, _task_user_key(job_id))
+            await pool.delete(_task_user_key(job_id))
             await pool.aclose()
 
     return asyncio.run(run())
 
 
-def test_remember_search_and_ask_are_recorded_for_the_person_without_content(flag_on, flags, stores, unique_ns):
+def test_remember_search_and_ask_are_recorded_for_the_person_without_content(flag_on, stores, unique_ns):
     from ask import ask_memory
 
     service, store = flag_on
     user, job_id = unique_ns.user_id, f"nsit-job-{uuid.uuid4().hex[:10]}"
-    graph_queue = f"nsit-graph-{uuid.uuid4().hex[:8]}"
-    flags(graph_queue_name=graph_queue)
 
     # -- remember: the worker's job context + real extraction and embedding -------------------------------
-    result, queued = _remember_through_the_worker(service, stores, user, job_id, graph_queue)
+    result = _remember_through_the_worker(service, stores, user, job_id)
     assert result["memories"], "the extraction stored nothing; the real model returned no facts"
-    assert queued >= 1, "the graph enrichment was not deferred to the graph queue (it ran inline)"
     stored = _events(store, user, job_id)
     operations = {event.operation for event in stored}
     assert "llm_extraction" in operations, operations
@@ -270,12 +263,15 @@ def test_the_same_calls_record_nothing_with_the_flag_off(flags, stores, isolated
         probe.close()
 
 
-def test_the_rest_app_opens_the_store_and_records_search_and_ask(flags, usage_pg, isolated_stores, llm_key, unique_ns):
+def test_the_rest_app_opens_the_store_and_records_search_and_ask(
+    flags, usage_pg, isolated_stores, llm_key, unique_ns, monkeypatch
+):
     """The real FastAPI app and its lifespan: the API process installs the recorder; two real requests are recorded."""
     from fastapi.testclient import TestClient
 
     import main
     from config import settings
+    from memory_service import MemoryService
     from usage_store import PostgresUsageStore
 
     user = unique_ns.user_id
@@ -285,6 +281,10 @@ def test_the_rest_app_opens_the_store_and_records_search_and_ask(flags, usage_pg
         default_user_id=user,
     )
     probe = None
+    # A service of its own for this app start (built by the lifespan after it installed the recorder, on the
+    # isolated collection): the process-wide one may already be built unwrapped and on another collection from an
+    # earlier test, and an earlier app shutdown closes it.
+    monkeypatch.setattr(main, "_service", MemoryService())
     with TestClient(main.app) as client:
         isolated_stores["service"] = main._service
         assert isinstance(uc.get_usage_recorder(), uc.DurableUsageRecorder)  # the lifespan installed it
@@ -303,13 +303,17 @@ def test_the_rest_app_opens_the_store_and_records_search_and_ask(flags, usage_pg
     assert {"mem0_embedding", "llm_ask"} <= operations, operations
 
 
-def test_the_rest_app_with_the_flag_off_installs_nothing(flags, usage_pg, isolated_stores, llm_key, unique_ns):
+def test_the_rest_app_with_the_flag_off_installs_nothing(
+    flags, usage_pg, isolated_stores, llm_key, unique_ns, monkeypatch
+):
     from fastapi.testclient import TestClient
 
     import main
+    from memory_service import MemoryService
 
     flags(usage_store_enabled=False, neuralscape_auth_disabled=True, neuralscape_user_token_secret="",
           neuralscape_api_key="", default_user_id=unique_ns.user_id)
+    monkeypatch.setattr(main, "_service", MemoryService())  # see the test above: one service per app start
     with TestClient(main.app) as client:
         isolated_stores["service"] = main._service
         assert uc.get_usage_recorder() is None

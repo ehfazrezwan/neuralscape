@@ -442,7 +442,7 @@ SERVICE_PATH_SCENARIOS: tuple[ServicePathScenario, ...] = (
     ServicePathScenario(
         "graph-removal-service-path", "graph-removal-shared-support", ("A7.02", "A7.03"),
         "integration_tests/test_graph_support_aware_removal_integration.py",
-        "85b13542b4834f2d458c5354d049071363234cfe21d863575379032d9a27b1ef",
+        "92c0b8ac9958639c53473dc774163138ba944fb2f0505edc609b547baeb7d54e",
         (
             "test_api_delete_keeps_a_fact_another_memory_still_supports",
             "test_a_correction_replaces_the_superseded_episode_and_keeps_still_asserted_facts",

@@ -206,7 +206,7 @@ def test_the_re_enrichment_job_reads_the_row_and_raises_when_enrichment_does_not
     monkeypatch.setattr(service, "enrich_graph", lambda **kw: calls.append(kw) or True)
     assert service.reenrich_memory_graph("m2") == {"memory_ids": ["m2"]}
     assert calls == [dict(content="fact two", user_id="u", project_id="p", visibility="private", memory_id="m2",
-                          occurred_at="t", workspace="ref")]
+                          occurred_at="t", workspace="ref", outcome={}, result_out={})]
     monkeypatch.setattr(service, "enrich_graph", lambda **kw: False)
     with pytest.raises(RuntimeError, match="did not complete"):
         service.reenrich_memory_graph("m2")
@@ -330,3 +330,40 @@ def test_the_graph_queue_runs_the_re_enrichment_job_the_queue_dispatch_enqueues(
     service.reenrich_memory_graph.side_effect = RuntimeError("graph re-enrichment of m2 did not complete")
     with pytest.raises(RuntimeError):  # raised, so ARQ retries it
         asyncio.run(worker.process_graph_reenrich({"service": service}, "m2"))
+
+
+def _survivor_row():
+    return {"memory": "fact two", "user_id": "u", "metadata": {
+        "owner_user_id": "u", "visibility": "private", "project_id": None, "workspace": None}}
+
+
+def test_a_survivor_deleted_while_its_re_enrichment_runs_has_the_new_episode_removed(service, monkeypatch):
+    """The row is read, the graph write runs, and the row is gone afterwards: the episode just written goes too."""
+    reads = iter([_survivor_row(), None])
+    service._memory.get.side_effect = lambda memory_id: next(reads)
+    monkeypatch.setattr(
+        service, "enrich_graph",
+        lambda **kw: kw["result_out"].update(episode_uuid="ep-new", episode_name="ep-new-name") or True,
+    )
+    removed = []
+    monkeypatch.setattr(service, "_cascade_expire_episode",
+                        lambda group, **kw: removed.append((group, kw)) or {"resolved": True})
+    assert service.reenrich_memory_graph("m2") == {"skipped": True, "reason": "memory_deleted_during_enrichment"}
+    assert removed == [("user--u", {"episode_uuid": "ep-new"})]
+
+
+def test_an_unresolved_cleanup_of_a_survivor_deleted_meanwhile_fails_the_job_visibly(service, monkeypatch):
+    reads = iter([_survivor_row(), None])
+    service._memory.get.side_effect = lambda memory_id: next(reads)
+    monkeypatch.setattr(service, "enrich_graph", lambda **kw: kw["result_out"].update(episode_uuid="ep-new") or True)
+    monkeypatch.setattr(service, "_cascade_expire_episode", lambda group, **kw: {"resolved": False})
+    with pytest.raises(RuntimeError, match="graph cleanup unresolved for deleted memory m2"):
+        service.reenrich_memory_graph("m2")
+
+
+def test_a_survivor_still_present_after_its_re_enrichment_is_left_alone(service, monkeypatch):
+    service._memory.get.side_effect = lambda memory_id: _survivor_row()
+    monkeypatch.setattr(service, "enrich_graph", lambda **kw: kw["result_out"].update(episode_uuid="ep-new") or True)
+    monkeypatch.setattr(service, "_cascade_expire_episode",
+                        lambda *a, **kw: pytest.fail("a live memory's episode must not be removed"))
+    assert service.reenrich_memory_graph("m2") == {"memory_ids": ["m2"]}

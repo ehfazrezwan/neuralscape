@@ -522,17 +522,41 @@ class ProvenanceMixin:
             meta = meta["metadata"]
         if meta.get("dream_tombstoned"):
             return {"skipped": True, "reason": "memory_tombstoned"}
+        owner = meta.get("owner_user_id") or row.get("user_id", "")
+        visibility = meta.get("visibility") or MemoryVisibility.PRIVATE.value
+        written: dict = {}
+        outcome: dict = {}
         enriched = self.enrich_graph(
             content=row.get("memory", ""),
-            user_id=meta.get("owner_user_id") or row.get("user_id", ""),
+            user_id=owner,
             project_id=meta.get("project_id"),
-            visibility=meta.get("visibility") or MemoryVisibility.PRIVATE.value,
+            visibility=visibility,
             memory_id=memory_id,
             occurred_at=meta.get("occurred_at"),
             workspace=meta.get("workspace"),
+            outcome=outcome,
+            result_out=written,
         )
         if not enriched:
             raise RuntimeError(f"graph re-enrichment of {memory_id} did not complete")
+        if not outcome.get("cleaned_up") and self._row_deleted_during_enrichment(memory_id):
+            # The survivor was deleted while its job extracted: the delete found no episode yet (the row
+            # carried none, the old one was removed), so the episode just written would keep the deleted
+            # text in the graph.  Remove it by uuid, as the graph enrichment job does for a deleted memory.
+            group_id = _build_group_id(visibility, owner, meta.get("project_id"), meta.get("workspace"))
+            episode_uuid = written.get("episode_uuid")
+            if episode_uuid:
+                removal = self._cascade_expire_episode(group_id, episode_uuid=episode_uuid)
+            else:
+                removal = self._cascade_expire_episode(
+                    group_id, episode_name=written.get("episode_name"), content=row.get("memory", ""),
+                )
+            if not (isinstance(removal, dict) and removal.get("resolved")):
+                raise RuntimeError(
+                    f"graph cleanup unresolved for deleted memory {memory_id}: group_id={group_id!r} "
+                    f"episode_uuid={episode_uuid!r}; re-run the episode cascade for this group/episode"
+                )
+            return {"skipped": True, "reason": "memory_deleted_during_enrichment"}
         return {"memory_ids": [memory_id]}
 
     def _episode_groups(self, episode_uuids: list[str]) -> dict[str, tuple[str, str | None]] | None:
