@@ -24,7 +24,19 @@ from conftest import unavailable
 from neo4j import GraphDatabase
 from neo4j.exceptions import ClientError
 
-CYPHER = Path(__file__).resolve().parents[2] / "scripts" / "migrate-group-ids.cypher"
+_HERE = Path(__file__).resolve().parent
+# Checkout: repo-level scripts/. Packaged test image: copied by the Dockerfile test stage.
+CYPHER = next(
+    (
+        p
+        for p in (
+            _HERE.parents[1] / "scripts" / "migrate-group-ids.cypher",
+            _HERE / "repo_scripts" / "migrate-group-ids.cypher",
+        )
+        if p.is_file()
+    ),
+    _HERE.parents[1] / "scripts" / "migrate-group-ids.cypher",
+)
 
 NODE_LABELS = ["Entity", "Episodic", "Community", "Saga"]
 # (relationship type, start label, end label)

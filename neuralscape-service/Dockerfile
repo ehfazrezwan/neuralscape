@@ -173,10 +173,11 @@ COPY neuralscape-service/tests/ neuralscape-service/tests/
 COPY neuralscape-service/integration_tests/ neuralscape-service/integration_tests/
 COPY neuralscape-service/scripts/ neuralscape-service/scripts/
 # The repo-level group-id migration is exercised against real Neo4j by
-# integration_tests/test_migrate_group_ids_neo4j.py: that one file (not the
-# whole repo-level scripts/ dir, whose other tests must keep returning early
-# here) is test input. Test stage only; the runtime image never gets it.
-COPY scripts/migrate-group-ids.cypher scripts/migrate-group-ids.cypher
+# integration_tests/test_migrate_group_ids_neo4j.py. Copy just that file, into
+# integration_tests/ (NOT a repo-level /app/scripts/: other tests treat the
+# presence of that directory as "full checkout" and would then run host-only
+# checks). Test stage only; the runtime image never gets it.
+COPY scripts/migrate-group-ids.cypher neuralscape-service/integration_tests/repo_scripts/migrate-group-ids.cypher
 # The env templates (no secrets) are test inputs: tests/test_env_templates.py loads
 # each as the service .env.
 COPY .env.example .env.production ./
