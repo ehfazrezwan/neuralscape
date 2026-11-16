@@ -335,8 +335,9 @@ def _remove_episode(monkeypatch, episode_uuid: str, edges: list):
     strict=True,
     raises=AssertionError,
     reason=(
-        "removing an episode deletes every edge whose first supporting episode is the removed one, "
-        "even when other episodes still support the edge (reproduced on a real graph by the engines lane)"
+        "library observation (oracle v3): the vendored library's episode removal deletes every edge whose first "
+        "supporting episode is the removed one, even when other episodes still support the edge; the service "
+        "removes episodes through the graph adapter, so this no longer stands for the product requirement"
     ),
 )
 def test_graph_removal_keeps_edges_supported_by_other_episodes(monkeypatch) -> None:

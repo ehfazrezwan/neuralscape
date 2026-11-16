@@ -143,6 +143,16 @@ def _configure_to_thread_executor(loop) -> int | None:
     return None
 
 
+def _install_graph_reenrich_dispatch() -> None:
+    """Survivor re-enrichment after a shared episode is removed: ledger job, else graph-queue job."""
+    from memory.provenance import ledger_reenrich_dispatch, queue_reenrich_dispatch
+
+    if getattr(_task_manager, "producer", None) is not None:
+        _service.set_graph_reenrich_dispatch(ledger_reenrich_dispatch(_task_manager.producer))
+    elif getattr(_task_manager, "pool", None) is not None:
+        _service.set_graph_reenrich_dispatch(queue_reenrich_dispatch(_task_manager.pool, asyncio.get_running_loop()))
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("Starting Neuralscape Service...")
@@ -160,6 +170,15 @@ async def lifespan(app: FastAPI):
 
     revocation_warm_task = asyncio.create_task(warm_revocations())
 
+    # Durable usage capture (off unless USAGE_STORE_ENABLED).  The recorder must exist before the
+    # service builds its provider clients so they are wrapped.
+    usage_store = None
+    if settings.usage_store_enabled:
+        from usage_store import install_usage_capture
+
+        usage_store = install_usage_capture(settings)
+        logger.info("Durable usage store opened (backend=%s)", settings.usage_store_backend)
+
     # Initialize the service (this also initializes mem0 + Graphiti)
     _service._get_memory()
     # Action policy: build the enforcer from settings (a no-op unless enabled).  In
@@ -169,6 +188,7 @@ async def lifespan(app: FastAPI):
     await asyncio.to_thread(warmup_extraction)
     # Connect task manager to Redis
     await _task_manager.connect()
+    _install_graph_reenrich_dispatch()
     # The routed vector engine (off unless ENGINE_ROUTING_ENABLED): built over the ledger just opened.
     await _start_engine_switch()
 
@@ -224,6 +244,10 @@ async def lifespan(app: FastAPI):
 
     await _stop_engine_switch()
     await _task_manager.close()
+    if usage_store is not None:
+        from usage_store import uninstall_usage_capture
+
+        await asyncio.to_thread(uninstall_usage_capture, usage_store)
     logger.info("Neuralscape Service stopped.")
 
 
