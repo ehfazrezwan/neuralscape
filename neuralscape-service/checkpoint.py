@@ -22,14 +22,13 @@ from __future__ import annotations
 import logging
 
 from config import settings
+from memory.sensitivity import resolve_gated_visibility
 from memory_service import content_hash
 from schemas import (
     GLOBAL_CATEGORIES,
     CheckpointRequest,
     MemoryVisibility,
     default_scope_for_category,
-    default_visibility_for_category,
-    normalize_visibility,
 )
 
 logger = logging.getLogger(__name__)
@@ -52,7 +51,8 @@ def effective_storage_key(item: dict) -> tuple[str, str, str | None]:
     The dedup pre-check must probe the SAME key store_raw's content-hash
     dedup uses, or the verdicts would disagree with what the worker later
     does. Mirrors store_raw: explicit scope wins; otherwise category default
-    with a project override; ``standard`` visibility forces global scope
+    with a project override; visibility is the sensitivity-gated value;
+    ``standard`` visibility forces global scope
     with no project.
     """
     category = item["category"]
@@ -62,10 +62,16 @@ def effective_storage_key(item: dict) -> tuple[str, str, str | None]:
         scope = default_scope_for_category(category).value
         if project_id and category not in GLOBAL_CATEGORIES:
             scope = "project"
-    visibility = (
-        normalize_visibility(item.get("visibility"))
-        if item.get("visibility")
-        else default_visibility_for_category(category).value
+    # The same sensitivity-gated visibility store_raw lands at (shared with
+    # worker.py's pre-store dedup, F7): sensitive content is forced private
+    # unless the caller gave an explicit visibility AND sensitivity_override.
+    # Without this a sensitive item matched a SHARED row it would never be
+    # stored beside, and was dropped as a "duplicate".
+    visibility, _, _, _ = resolve_gated_visibility(
+        item.get("content") or "",
+        category,
+        item.get("visibility") or None,
+        bool(item.get("sensitivity_override")),
     )
     if visibility == MemoryVisibility.STANDARD.value:
         scope = "global"

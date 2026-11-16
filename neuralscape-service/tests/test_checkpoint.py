@@ -427,3 +427,88 @@ class TestCheckpointMcpTool:
         data = json.loads(result[0].text)
         assert data["status"] == "ok" and data["task_id"] is None
         self.tm.enqueue_raw_batch.assert_not_awaited()
+
+
+# ──────────────────────────────────────────────
+# Sensitivity gate: the verdict key must be the visibility store_raw lands at
+# ──────────────────────────────────────────────
+
+SENSITIVE = "Quarterly revenue for the Acme account was $2.4M."
+CLEAN = "The deploy window is Tuesday at noon."
+
+
+class TestSensitivityGatedKey:
+    def test_sensitive_item_with_shared_default_category_is_forced_private(self):
+        _, vis, _ = effective_storage_key({"content": SENSITIVE, "category": "decision", "project_id": "p1"})
+        assert vis == "private"
+
+    def test_explicit_shared_without_override_is_still_forced_private(self):
+        _, vis, _ = effective_storage_key(
+            {"content": SENSITIVE, "category": "decision", "visibility": "shared"}
+        )
+        assert vis == "private"
+
+    def test_explicit_visibility_with_override_is_kept(self):
+        _, vis, _ = effective_storage_key(
+            {"content": SENSITIVE, "category": "decision", "visibility": "shared", "sensitivity_override": True}
+        )
+        assert vis == "shared"
+
+    def test_override_without_explicit_visibility_does_not_bypass(self):
+        _, vis, _ = effective_storage_key(
+            {"content": SENSITIVE, "category": "decision", "sensitivity_override": True}
+        )
+        assert vis == "private"
+
+    def test_clean_item_keeps_the_category_default(self):
+        _, vis, _ = effective_storage_key({"content": CLEAN, "category": "decision"})
+        assert vis == "shared"
+
+    def test_sensitive_standard_request_is_gated_like_store_raw(self):
+        scope, vis, pid = effective_storage_key(
+            {"content": SENSITIVE, "category": "convention", "project_id": "p1", "visibility": "standard"}
+        )
+        assert (vis, pid) == ("private", "p1") and scope == "project"
+
+    def test_verdict_probes_private_partition_so_a_shared_twin_is_not_a_duplicate(self):
+        """A shared row with the same text lives in the shared partition; the sensitive item is stored private."""
+        shared_row = _existing("shared-1")
+
+        def find(*, user_id, content_hash, scope, project_id, visibility):
+            return shared_row if visibility == "shared" else None
+
+        svc = MagicMock()
+        svc._find_by_content_hash.side_effect = find
+        items = [
+            {"content": SENSITIVE, "category": "decision", "user_id": "u"},
+            {"content": CLEAN, "category": "decision", "user_id": "u"},
+        ]
+        verdicts = dedup_verdicts(svc, items)
+        assert verdicts[0]["verdict"] == "new"          # sensitive -> private partition, no twin
+        assert verdicts[1]["verdict"] == "duplicate"    # clean -> shared partition, as before
+
+    def test_override_with_explicit_shared_still_dedups_against_the_shared_row(self):
+        svc = MagicMock()
+        svc._find_by_content_hash.side_effect = (
+            lambda *, user_id, content_hash, scope, project_id, visibility:
+            _existing("shared-1") if visibility == "shared" else None
+        )
+        v = dedup_verdicts(svc, [{
+            "content": SENSITIVE, "category": "decision", "user_id": "u",
+            "visibility": "shared", "sensitivity_override": True,
+        }])
+        assert v[0]["verdict"] == "duplicate"
+
+    def test_prepare_checkpoint_enqueues_a_sensitive_item_matching_a_shared_row(self):
+        svc = MagicMock()
+        svc._find_by_content_hash.side_effect = (
+            lambda *, user_id, content_hash, scope, project_id, visibility:
+            _existing("shared-1") if visibility == "shared" else None
+        )
+        req = CheckpointRequest(memories=[
+            {"content": SENSITIVE, "category": "decision"},
+            {"content": CLEAN, "category": "decision"},
+        ])
+        out = prepare_checkpoint(svc, req, "u")
+        assert [v["verdict"] for v in out["verdicts"]] == ["new", "duplicate"]
+        assert [m["content"] for m in out["to_enqueue"]] == [SENSITIVE]
