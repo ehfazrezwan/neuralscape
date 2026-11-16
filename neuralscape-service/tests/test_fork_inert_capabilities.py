@@ -163,38 +163,72 @@ def test_add_episode_without_the_flag_never_touches_communities(monkeypatch):
 # --------------------------------------------------------------------------
 
 
-def _community_stubs(monkeypatch, *, existing, built_nodes):
-    """Patch the three calls ``_ensure_group_communities`` makes; return what they saw."""
+class _FakeNeo4j:
+    """In-memory stand-in for the Community/HAS_MEMBER part of Neo4j (MERGE on uuid, like Graphiti's saves)."""
 
-    from graphiti_core.nodes import CommunityNode
+    def __init__(self):
+        self.communities: dict[str, dict] = {}  # uuid -> {group_id, name}
+        self.members: dict[str, dict] = {}  # edge uuid -> {community, entity}
+        self.queries: list[str] = []
+
+    async def execute_query(self, query, **params):
+        self.queries.append(query)
+        group = params["g"]
+        mine = {u: c for u, c in self.communities.items() if c["group_id"] == group}
+        if query.lstrip().startswith("MATCH (c:Community {group_id: $g}) RETURN"):
+            populated = {m["community"] for m in self.members.values()}
+            return [{"uuid": u, "populated": u in populated} for u in mine], None, None
+        if "DETACH DELETE" in query:
+            populated = {m["community"] for m in self.members.values()}
+            for u in mine:
+                if u not in populated:
+                    del self.communities[u]
+            return [], None, None
+        raise AssertionError(f"unexpected query: {query}")
+
+
+def _community_stubs(monkeypatch, driver, *, clusters):
+    """Patch the Graphiti calls ``_ensure_group_communities`` makes; ``clusters`` is a list of member-uuid lists."""
+
     import graphiti_core.utils.maintenance.community_operations as ops
+    from graphiti_core.edges import CommunityEdge
+    from graphiti_core.nodes import CommunityNode
+    from graphiti_core.utils.datetime_utils import utc_now
 
-    seen: dict = {"lookups": [], "builds": [], "saved": [], "embedded": []}
+    seen: dict = {"builds": [], "embedded": []}
 
-    async def get_by_group_ids(driver, group_ids, limit=None, uuid_cursor=None):
-        seen["lookups"].append(list(group_ids))
-        return list(existing)
-
-    async def build(driver, llm_client, group_ids):
+    async def build(drv, llm_client, group_ids):
         seen["builds"].append(list(group_ids))
-        return built_nodes, []
+        await asyncio.sleep(0)  # let a concurrent builder interleave, as two workers would
+        nodes, edges = [], []
+        for i, members in enumerate(clusters):
+            node = CommunityNode(name=f"c{i}", group_id=group_ids[0], labels=["Community"])
+            nodes.append(node)
+            edges += [
+                CommunityEdge(source_node_uuid=node.uuid, target_node_uuid=m, group_id=group_ids[0], created_at=utc_now())
+                for m in members
+            ]
+        return nodes, edges
 
-    monkeypatch.setattr(CommunityNode, "get_by_group_ids", classmethod(lambda cls, *a, **k: get_by_group_ids(*a, **k)))
-    monkeypatch.setattr(ops, "build_communities", build)
+    async def save_node(self, drv):
+        driver.communities[self.uuid] = {"group_id": self.group_id, "name": self.name}
 
-    async def save(self, driver):
-        seen["saved"].append(self.name)
+    async def save_edge(self, drv):
+        driver.members[self.uuid] = {"community": self.source_node_uuid, "entity": self.target_node_uuid}
 
     async def embed(self, embedder):
         seen["embedded"].append(self.name)
 
-    monkeypatch.setattr(CommunityNode, "save", save)
+    monkeypatch.setattr(ops, "build_communities", build)
+    monkeypatch.setattr(CommunityNode, "save", save_node)
+    monkeypatch.setattr(CommunityEdge, "save", save_edge)
     monkeypatch.setattr(CommunityNode, "generate_name_embedding", embed)
     return seen
 
 
-def _graphiti_double():
+def _graphiti_double(driver=None):
     g = MagicMock()
+    g.driver = driver or _FakeNeo4j()
     g.add_episode = AsyncMock(return_value=_episode_result())
     # The global wipe in Graphiti.build_communities must never be used.
     g.build_communities = AsyncMock(side_effect=AssertionError("Graphiti.build_communities wipes every group"))
@@ -203,57 +237,91 @@ def _graphiti_double():
 
 
 def test_flag_on_builds_the_first_communities_for_this_group_only(monkeypatch):
-    from graphiti_core.nodes import CommunityNode
-
-    built = [CommunityNode(name="c1", group_id="grp", labels=["Community"])]
-    seen = _community_stubs(monkeypatch, existing=[], built_nodes=built)
     g = _graphiti_double()
+    seen = _community_stubs(monkeypatch, g.driver, clusters=[["e1", "e2"], ["e3"]])
     mg = _graph(update_communities=True, graphiti=g)
 
     out = mg.add(data="Alice works at Acme", filters={"user_id": "u", "group_id": "grp"})
 
     assert out["episode_uuid"] == "ep-1"
     assert g.add_episode.await_args.kwargs["update_communities"] is True
-    assert seen["lookups"] == [["grp"]]
     assert seen["builds"] == [["grp"]], "the clustering pass must be scoped to the written group"
-    assert seen["embedded"] == ["c1"] and seen["saved"] == ["c1"]
+    assert len(g.driver.communities) == 2 and len(g.driver.members) == 3
     g.build_communities.assert_not_called()
 
 
 def test_flag_on_does_not_rebuild_when_the_group_already_has_communities(monkeypatch):
-    from graphiti_core.nodes import CommunityNode
+    g = _graphiti_double()
+    seen = _community_stubs(monkeypatch, g.driver, clusters=[["e1"]])
+    mg = _graph(update_communities=True, graphiti=g)
 
-    existing = [CommunityNode(name="old", group_id="grp", labels=["Community"])]
-    seen = _community_stubs(monkeypatch, existing=existing, built_nodes=[])
-    mg = _graph(update_communities=True, graphiti=_graphiti_double())
+    mg.add(data="one", filters={"user_id": "u", "group_id": "grp"})
+    mg.add(data="two", filters={"user_id": "u", "group_id": "grp"})
 
-    mg.add(data="more facts", filters={"user_id": "u", "group_id": "grp"})
-
-    assert seen["lookups"] == [["grp"]]
-    assert seen["builds"] == [] and seen["saved"] == []
+    assert seen["builds"] == [["grp"]]
 
 
 def test_flag_off_never_looks_at_communities(monkeypatch):
-    seen = _community_stubs(monkeypatch, existing=[], built_nodes=[])
     g = _graphiti_double()
+    seen = _community_stubs(monkeypatch, g.driver, clusters=[["e1"]])
     mg = _graph(update_communities=False, graphiti=g)
 
     mg.add(data="facts", filters={"user_id": "u", "group_id": "grp"})
 
     assert g.add_episode.await_args.kwargs["update_communities"] is False
-    assert seen["lookups"] == [] and seen["builds"] == []
+    assert seen["builds"] == [] and g.driver.queries == []
+
+
+def test_two_concurrent_builders_leave_one_community_per_cluster(monkeypatch):
+    """Two graph workers (two adapter instances, no shared lock) writing a group's first episodes."""
+
+    g = _graphiti_double()
+    seen = _community_stubs(monkeypatch, g.driver, clusters=[["e1", "e2"], ["e3"]])
+    a = _graph(update_communities=True, graphiti=g)
+    b = _graph(update_communities=True, graphiti=g)
+
+    async def both():
+        await asyncio.gather(a._ensure_group_communities("grp"), b._ensure_group_communities("grp"))
+
+    asyncio.run(both())
+
+    assert len(seen["builds"]) == 2, "both builders must have raced (the check passes for each before either saves)"
+    assert len(g.driver.communities) == 2, f"duplicate communities: {g.driver.communities}"
+    assert len(g.driver.members) == 3, f"duplicate memberships: {g.driver.members}"
+
+
+def test_a_memberless_community_is_rebuilt_by_the_next_write(monkeypatch):
+    g = _graphiti_double()
+    g.driver.communities["orphan"] = {"group_id": "grp", "name": "half-saved"}  # node saved, edges never were
+    seen = _community_stubs(monkeypatch, g.driver, clusters=[["e1", "e2"]])
+    mg = _graph(update_communities=True, graphiti=g)
+
+    mg.add(data="more", filters={"user_id": "u", "group_id": "grp"})
+
+    assert seen["builds"] == [["grp"]]
+    assert "orphan" not in g.driver.communities
+    assert len(g.driver.communities) == 1 and len(g.driver.members) == 2
+
+
+def test_a_community_build_for_one_group_leaves_other_groups_alone(monkeypatch):
+    g = _graphiti_double()
+    g.driver.communities["other"] = {"group_id": "elsewhere", "name": "keep me"}
+    _community_stubs(monkeypatch, g.driver, clusters=[["e1"]])
+    _graph(update_communities=True, graphiti=g).add(data="x", filters={"user_id": "u", "group_id": "grp"})
+    assert "other" in g.driver.communities
 
 
 def test_a_failing_community_build_does_not_fail_the_write(monkeypatch, caplog):
     import graphiti_core.utils.maintenance.community_operations as ops
 
-    _community_stubs(monkeypatch, existing=[], built_nodes=[])
+    g = _graphiti_double()
+    _community_stubs(monkeypatch, g.driver, clusters=[])
 
     async def boom(*a, **k):
         raise RuntimeError("llm down")
 
     monkeypatch.setattr(ops, "build_communities", boom)
-    mg = _graph(update_communities=True, graphiti=_graphiti_double())
+    mg = _graph(update_communities=True, graphiti=g)
 
     with caplog.at_level(logging.WARNING):
         out = mg.add(data="facts", filters={"user_id": "u", "group_id": "grp"})

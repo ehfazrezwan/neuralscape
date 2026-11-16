@@ -549,31 +549,59 @@ class MemoryGraph:
         communities that already exist (``update_community`` returns nothing
         when there is none to join), and nothing else ever creates the first
         one, so with the flag on ``GET /v1/graph/communities`` stayed empty
-        forever. When the flag is on and this group has no community yet, build
-        them once with Graphiti's clustering, scoped to THIS group only
-        (``Graphiti.build_communities`` calls ``remove_communities``, which
-        deletes every community of every group, so it is deliberately not
+        forever. When the flag is on and this group has no *populated*
+        community yet, build them with Graphiti's clustering, scoped to THIS
+        group only (``Graphiti.build_communities`` calls ``remove_communities``,
+        which deletes every community of every group, so it is deliberately not
         used). Later episodes grow them through ``update_community``.
 
+        Safe across processes: community and membership uuids are derived from
+        the group and the cluster (smallest member uuid), and Graphiti saves
+        with ``MERGE`` on uuid, so two workers that build at the same moment
+        write the same nodes and edges instead of duplicates. A community
+        without any ``HAS_MEMBER`` edge (a build that died between the node and
+        edge saves) counts as "not built": it is removed and rebuilt by the
+        next write. The in-process lock is per group.
+
         Best-effort: the episode is already stored, so a failure here is logged
-        and never fails the write. Serialised per adapter so two concurrent
-        writes cannot build the same group twice.
+        and never fails the write.
         """
+        import uuid as _uuid
+
         from graphiti_core.helpers import semaphore_gather
-        from graphiti_core.nodes import CommunityNode
         from graphiti_core.utils.maintenance.community_operations import build_communities
 
-        lock = self.__dict__.get("_communities_lock")
+        locks = self.__dict__.setdefault("_communities_locks", {})
+        lock = locks.get(group_id)
         if lock is None:
-            lock = self.__dict__.setdefault("_communities_lock", asyncio.Lock())
+            lock = locks.setdefault(group_id, asyncio.Lock())
         async with lock:
             try:
                 g = self.graphiti
-                if await CommunityNode.get_by_group_ids(g.driver, [group_id], limit=1):
+                records, _, _ = await g.driver.execute_query(
+                    "MATCH (c:Community {group_id: $g}) "
+                    "RETURN c.uuid AS uuid, EXISTS { (c)-[:HAS_MEMBER]->() } AS populated",
+                    g=group_id,
+                )
+                if any(r["populated"] for r in records):
                     return
+                if records:
+                    await g.driver.execute_query(
+                        "MATCH (c:Community {group_id: $g}) WHERE NOT EXISTS { (c)-[:HAS_MEMBER]->() } "
+                        "DETACH DELETE c",
+                        g=group_id,
+                    )
                 nodes, edges = await build_communities(g.driver, g.llm_client, [group_id])
                 if not nodes:
                     return
+                for node in nodes:
+                    members = sorted(e.target_node_uuid for e in edges if e.source_node_uuid == node.uuid)
+                    old = node.uuid
+                    node.uuid = str(_uuid.uuid5(_uuid.NAMESPACE_URL, f"ns-community:{group_id}:{members[0] if members else old}"))
+                    for e in edges:
+                        if e.source_node_uuid == old:
+                            e.source_node_uuid = node.uuid
+                            e.uuid = str(_uuid.uuid5(_uuid.NAMESPACE_URL, f"ns-community-member:{node.uuid}:{e.target_node_uuid}"))
                 await semaphore_gather(
                     *[n.generate_name_embedding(g.embedder) for n in nodes],
                     max_coroutines=g.max_coroutines,

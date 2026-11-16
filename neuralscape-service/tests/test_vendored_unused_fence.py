@@ -321,7 +321,7 @@ def test_the_fenced_provider_modules_are_not_loaded_by_building_the_adapter_clie
     )
     out = subprocess.run(
         [sys.executable, "-c", code], cwd=SERVICE, capture_output=True, text=True, timeout=120,
-        env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "PYTHONPATH": str(SERVICE),
+        env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "PYTHONPATH": os.pathsep.join([str(SERVICE), str(SERVICE.parent / "mem0"), str(SERVICE.parent / "graphiti")]),
              "HOME": os.environ.get("HOME", "/tmp"), "MEM0_TELEMETRY": "false", "ANONYMIZED_TELEMETRY": "False"},
     )
     assert out.returncode == 0, out.stderr[-2000:]
