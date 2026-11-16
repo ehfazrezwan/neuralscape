@@ -26,7 +26,7 @@ from extensions.dreaming import gate
 from extensions.dreaming.card import build_card_view, load_card, resolve_card_pool
 from extensions.dreaming.reflect import diary_page_path
 from extensions.dreaming.sweep import _STAGED_IDS_KEY, dream_all, get_last_run
-from integration_tests._dreaming_support import dream_env  # noqa: F401  (fixture)
+from integration_tests._dreaming_support import dream_env, marker_hits  # noqa: F401  (fixture)
 
 pytestmark = pytest.mark.integration
 
@@ -408,6 +408,13 @@ def _is_pool_diary(env, path) -> bool:
     return path.parent == dreams and path.name in names
 
 
+# Pool-IDENTIFYING surfaces: the sweep names every pool it dreamt (user id in the
+# pool key) in the bundle log and the Dreams index entry for its diary. They carry
+# a pool NAME, never the pool's memory text, so they are scanned for content
+# markers but not for the other user's id.
+_POOL_NAME_SURFACES = ("log.md", "Dreams/index.md")
+
+
 def _vault_text(env, *, include_diaries: bool = False) -> str:
     """Every vault file except the per-pool diary pages ``Dreams/<pool>.md``.
 
@@ -423,23 +430,45 @@ def _vault_text(env, *, include_diaries: bool = False) -> str:
     )
 
 
+def _content_hits(env, markers) -> list[str]:
+    """``path:line: text`` of every non-diary vault file holding a content marker."""
+    return marker_hits(
+        env.vault, markers, skip=lambda rel: _is_pool_diary(env, env.vault / rel),
+    )
+
+
+def _pool_id_hits(env, marker) -> list[str]:
+    """Where the other user's id appears outside the diaries and the pool-name surfaces."""
+    return marker_hits(
+        env.vault, [marker],
+        skip=lambda rel: _is_pool_diary(env, env.vault / rel) or rel in _POOL_NAME_SURFACES,
+    )
+
+
 def test_other_users_private_pool_swept_but_never_leaks(dream_env, swept):
     env = dream_env
     rep = swept.reports.get(swept.other_pool)
     assert rep is not None and rep.status == "dreamt", f"other pool not swept: {rep}"
     # never rendered into the operator's vault (pool isolation)
-    vault = _vault_text(env)
-    assert swept.other_tok not in vault, "other user's private content leaked into the operator vault"
-    assert "Rust" not in vault, "other user's private topic leaked into the operator vault"
+    hits = _content_hits(env, [swept.other_tok, "Rust"])
+    assert not hits, "other user's private content in the operator vault:\n" + "\n".join(hits)
     # their card exists but is refused to this user, and unreadable via REST identity
     assert load_card(env.redis, swept.other_pool), "other user's card was not produced"
     view = build_card_view(swept.other_pool, env.user, is_dictator=False, redis=env.redis)
     assert view["status"] == "forbidden"
-    # recall is user-scoped both ways
+    # recall is user-scoped both ways. Match by id and by whole word: the shared
+    # project pool is team-wide BY DESIGN (it mentions FastAPI and is visible to
+    # every user), and "rust" as a substring also matches "trust"/"robust".
+    import re
+
+    other_ids, mine_ids = set(swept.other_ids), set(swept.ids.values())
     mine = env.service.search(query=f"Rust systems {swept.other_tok}", user_id=env.user, limit=20)
-    assert not [h for h in mine if swept.other_tok in h.memory or "rust" in h.memory.lower()]
+    leaked = [h for h in mine if str(h.id) in other_ids or swept.other_tok in h.memory
+              or re.search(r"\brust\b", h.memory, re.I)]
+    assert not leaked, [(str(h.id), h.memory[:80]) for h in leaked]
     theirs = env.service.search(query="Python FastAPI backend", user_id=swept.other_user, limit=20)
-    assert not [h for h in theirs if "fastapi" in h.memory.lower()]
+    leaked = [h for h in theirs if str(h.id) in mine_ids]
+    assert not leaked, [(str(h.id), h.memory[:80]) for h in leaked]
 
 
 def test_leak_scan_covers_the_dreams_index_but_not_the_pool_diaries(dream_env, swept):
@@ -509,6 +538,7 @@ def test_bridges_pass_runs_with_flag_on(dream_env, swept):
     # can be linked or rendered. (Proving a *bridged* page needs graph entities
     # shared across hubs, which the graph LLM extracts nondeterministically:
     # out of scope here.)
-    vault = _vault_text(env)
-    assert swept.other_tok not in vault and "Rust" not in vault
-    assert swept.other_pool.split("--", 1)[1] not in vault
+    hits = _content_hits(env, [swept.other_tok, "Rust"])
+    assert not hits, "other user's private content after the bridges pass:\n" + "\n".join(hits)
+    hits = _pool_id_hits(env, swept.other_pool.split("--", 1)[1])
+    assert not hits, "other user's id outside the diaries, log.md and Dreams/index.md:\n" + "\n".join(hits)

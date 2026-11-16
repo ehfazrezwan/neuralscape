@@ -199,6 +199,26 @@ def _teardown(env: DreamEnv, prior_last_run, stores) -> list[str]:
     return errors
 
 
+def marker_hits(vault: Path, markers, *, skip=lambda rel: False) -> list[str]:
+    """Every ``<vault-relative path>:<line>: <text>`` that contains a marker.
+
+    ``skip(rel)`` receives the vault-relative POSIX path. Used by the leak
+    assertions so a failure names the exact files and lines that carry the
+    private marker instead of dumping the whole vault.
+    """
+    hits: list[str] = []
+    for path in sorted(Path(vault).rglob("*")):
+        if not path.is_file():
+            continue
+        rel = path.relative_to(vault).as_posix()
+        if skip(rel):
+            continue
+        for n, line in enumerate(path.read_text(encoding="utf-8", errors="ignore").splitlines(), 1):
+            if any(m in line for m in markers):
+                hits.append(f"{rel}:{n}: {line.strip()[:160]}")
+    return hits
+
+
 def dumps_for_msg(obj) -> str:
     try:
         return json.dumps(obj, default=str)[:600]
