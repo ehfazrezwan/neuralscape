@@ -294,10 +294,10 @@ one-to-one: user `alice--project--payroll` and user `alice` in project
 folds every run of disallowed characters to one `-`, so `a+b@example.com` and
 `a-b@example.com` both slug to `a-b-example.com`.
 
-- **Group ids.** Injective (collision-free) graph group ids (`nsg1--<hex>`) are behind `GRAPH_GROUP_ID_INJECTIVE_ENABLED`, default off, and not part of the authority slice. Until they can be enabled the legacy names still collide for ids containing `--`. The policy layer does not depend on it: it keys pools by the structured `ns1` namespace, never by a group name.
+- **Group ids.** Injective (collision-free) graph group ids (`nsg1--<hex>`) are behind `GRAPH_GROUP_ID_INJECTIVE_ENABLED`, default off. Until they can be enabled the legacy names still collide for ids containing `--`. The policy layer does not depend on it: it keys pools by a structured namespace, never by a group name.
 - **Fresh login ids.** The email slug is lossy; a collision between two different emails is resolved at first
   login (a hash-suffixed id for the newcomer, `login_providers.provision_user_id`), not by this slice. The
-  profile-gated `_x`/`_h` derivation that the authority slice carried is deferred.
+  profile-gated `_x`/`_h` derivation is deferred.
 
 **Migration:**
 

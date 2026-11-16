@@ -39,7 +39,7 @@ The prompt then issues eight rules. Rules 1-6 are about quality (factual only, s
    context (e.g., "currently running tests", "just fixed a bug in X file").
 ```
 
-These two rules exist because the upstream conversation feed for an AI coding assistant is dominated by tool-call traces. Without explicit instruction the model happily turns "Ran command: pytest" into a "fact". Rules 7-8 are the first line of defence; the regex junk filter in `memory_service.py` is the second.
+These two rules exist because the upstream conversation feed for an AI coding assistant is dominated by tool-call traces. Without explicit instruction the model happily turns "Ran command: pytest" into a "fact". Rules 7-8 are the first line of defence; the regex junk filter in `memory/junk.py` is the second.
 
 The prompt closes by demanding a JSON envelope of the form `{"facts": ["[category] fact", ...]}` and explicitly permits `{"facts": []}` when nothing memorable is present. The conversation messages are appended verbatim after the prompt by `build_extraction_messages()` (`prompts.py`), which simply concatenates `role: content\n` lines.
 
@@ -119,7 +119,7 @@ Embeddings use Gemini's `gemini-embedding-001` at 768 dimensions. The dimension 
 
 There are three embedding code paths:
 
-- **Write path (batch).** After extraction and junk filtering, `_batch_store_facts` issues a single `m.embedding_model.embed_batch(texts, memory_action="add")` call (in `_batch_store_facts`, `memory/write.py`) for every fact in the conversation, followed by one Qdrant upsert at line 549. This is the cost-critical path: N facts cost one HTTP round trip, not N.
+- **Write path (batch).** After extraction and junk filtering, `_batch_store_facts` issues a single `m.embedding_model.embed_batch(texts, memory_action="add")` call (in `_batch_store_facts`, `memory/write.py`) for every fact in the conversation, followed by one Qdrant upsert. This is the cost-critical path: N facts cost one HTTP round trip, not N.
 - **Read path (per query).** `MemoryService.search()` delegates to `m.search()`, which embeds the query string itself (in `search`, `memory/search.py`). One query, one embedding call.
 - **Dedup path (per memory).** The dedup cron embeds each candidate memory individually via `m.embedding_model.embed(text)` (in `dedup_memories`, `memory/delete.py`). This is acceptable because dedup runs at most every 6 hours and operates on a bounded batch.
 
