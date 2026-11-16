@@ -194,10 +194,19 @@ class QdrantVectorAdapter:
             stored_revision, removed, _payload = row
             if record.revision < stored_revision:
                 raise PortFailure(InternalErrorCode.STALE_REVISION)
-            if record.revision == stored_revision and (
-                removed or record != self._stored(record.tenant_id, record.record_id)
-            ):
-                raise PortFailure(InternalErrorCode.IDEMPOTENCY_CONFLICT)
+            if record.revision == stored_revision:
+                stored = None if removed else self._stored(record.tenant_id, record.record_id)
+                if stored is None or stored.text != record.text:
+                    raise PortFailure(InternalErrorCode.IDEMPOTENCY_CONFLICT)
+                if stored.labels != tuple(record.labels):
+                    # Same revision and text, other labels: a relabel.  Only the payload changes; the
+                    # vector (and so any embedding call) is left alone.
+                    self._store.client.set_payload(
+                        collection_name=self._store.collection_name,
+                        payload={"labels": list(record.labels)},
+                        points=[self._point_id(record.tenant_id, record.record_id)],
+                    )
+                return self._receipt(record.record_id, record.revision, "applied")
         self._store.insert(
             vectors=[self._embed(record.text)],
             ids=[self._point_id(record.tenant_id, record.record_id)],

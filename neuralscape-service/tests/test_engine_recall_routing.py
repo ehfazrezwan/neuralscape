@@ -217,11 +217,9 @@ def test_the_engine_adds_a_project_free_leg_only_when_asked():
     assert searches == [(("owner:alice", "project:p1"), 5)]
     searches.clear()
     hits = switch.recall("alice", "q", 5, project_id="p1", visibility="private", include_global=True)
-    # the global leg is restricted by label in the engine; it returned fewer than the limit, so the
-    # pre-label (legacy) project-free search runs as a fallback
-    assert searches == [(("owner:alice", "project:p1"), 5), (("owner:alice", "scope:global"), 5),
-                        (("owner:alice",), 20)]
-    assert len(hits) == 3
+    # the global leg is restricted by label in the engine; no project-free search follows it
+    assert searches == [(("owner:alice", "project:p1"), 5), (("owner:alice", "scope:global"), 5)]
+    assert len(hits) == 2
     searches.clear()
     switch.recall("alice", "q", 5, visibility="private", include_global=True)  # no project: nothing to widen
     assert searches == [(("owner:alice",), 5)]
@@ -255,34 +253,15 @@ def test_other_projects_rows_cannot_fill_the_global_leg_and_displace_global_or_p
     assert {"proj-1", "glob-1", "glob-2"} <= set(ids)
 
 
-def test_a_global_row_projected_before_the_scope_label_still_comes_back_through_the_fallback():
+# ---- round 4: label by scope, merge the legs by score, no legacy fallback -----------------------------------
+
+PROJECT_LOW, GLOBAL_IN_P9 = str(uuid.uuid4()), str(uuid.uuid4())
+
+
+def _score_aware_switch(rows):
+    """A real ``EngineSwitch`` over a router whose engine filters by label and limits after the filter."""
     from engine_adapters_switch import EngineSwitch
 
-    legacy = ("owner:alice", "vis:private")  # a projection from before the scope label existed
-
-    class Router:
-        def route(self):
-            return "token"
-
-        def search(self, token, ctx, query, flt, n):
-            if set(flt.labels_all) <= set(legacy):
-                return [SimpleNamespace(record_id="legacy-global", revision=1, score=0.7)]
-            return []
-
-    switch = EngineSwitch(Router(), ledger=None, service=None, tenant_for=lambda user: "t")
-    hits = switch.recall("alice", "q", 5, project_id="p1", visibility="private", include_global=True)
-    assert [h.record_id for h in hits] == ["legacy-global"]
-
-
-def test_an_unlabelled_global_row_behind_more_than_four_times_the_limit_of_other_project_rows_is_found():
-    """Before: the legacy fallback was ``4 x limit`` deep over every project, so that many higher-scoring rows
-    of another project pushed a global row projected before the scope label out of it."""
-    from engine_adapters_switch import EngineSwitch, _FALLBACK_MAX_HITS, labels_for
-
-    limit = 5
-    legacy = ("owner:alice", "vis:private")  # a projection made before the scope label existed
-    rows = {f"other-{i}": (labels_for("alice", "private", "p2"), 0.99 - i / 1000) for i in range(4 * limit + 10)}
-    rows["legacy-global"] = (legacy, 0.2)
     searches = []
 
     class Router:
@@ -290,13 +269,66 @@ def test_an_unlabelled_global_row_behind_more_than_four_times_the_limit_of_other
             return "token"
 
         def search(self, token, ctx, query, flt, n):
-            searches.append(n)
+            searches.append((flt.labels_all, n))
             hits = [SimpleNamespace(record_id=rid, revision=1, score=score)
                     for rid, (labels, score) in rows.items() if set(flt.labels_all) <= set(labels)]
             return sorted(hits, key=lambda h: -h.score)[:n]
 
     switch = EngineSwitch(Router(), ledger=None, service=None, tenant_for=lambda user: "t")
-    ids = [h.record_id for h in switch.recall("alice", "q", limit, project_id="p1", visibility="private",
+    switch.searches = searches
+    return switch
+
+
+def test_a_global_category_row_written_in_another_project_is_labelled_global_and_keeps_its_project():
+    from engine_adapters_switch import labels_for
+
+    # a preference written while working in p9 keeps project_id p9 but has scope global
+    assert labels_for("alice", "private", "p9", "global") == ("owner:alice", "vis:private", "project:p9", "scope:global")
+    assert labels_for("alice", "private", "p9", "project") == ("owner:alice", "vis:private", "project:p9")
+    assert labels_for("alice", "private", None, None) == ("owner:alice", "vis:private", "scope:global")  # unknown scope
+    assert labels_for("alice", "private", None, "global") == ("owner:alice", "vis:private", "scope:global")
+
+
+def test_a_global_row_carrying_another_projects_id_is_found_when_the_labelled_leg_is_full():
+    """Before: it was labelled ``project:p9`` only, so the global leg never saw it and five lower-scoring global
+    rows filled the leg."""
+    from engine_adapters_switch import labels_for
+
+    rows = {f"g{i}": (labels_for("alice", "private", None, "global"), 0.3 - i / 100) for i in range(5)}
+    rows["pref-in-p9"] = (labels_for("alice", "private", "p9", "global"), 0.95)
+    switch = _score_aware_switch(rows)
+    ids = [h.record_id for h in switch.recall("alice", "q", 5, project_id="p1", visibility="private",
                                               include_global=True)]
-    assert "legacy-global" in ids
-    assert max(searches) == _FALLBACK_MAX_HITS  # the deeper search is bounded
+    assert "pref-in-p9" in ids and ids[0] == "pref-in-p9"
+
+
+def test_the_legs_are_merged_by_score_before_the_limit_through_search(service, routed, monkeypatch):
+    """A 0.5 project hit must not displace a 0.95 global hit at limit=1 (the global row was written in p9)."""
+    from engine_adapters_switch import labels_for
+
+    monkeypatch.setitem(POINTS, PROJECT_LOW, _point(PROJECT_LOW, owner="alice", project="p1", text="project low"))
+    monkeypatch.setitem(
+        POINTS, GLOBAL_IN_P9, _point(GLOBAL_IN_P9, owner="alice", project="p9", scope="global", text="a preference"))
+    rows = {
+        PROJECT_LOW: (labels_for("alice", "private", "p1", "project"), 0.5),
+        GLOBAL_IN_P9: (labels_for("alice", "private", "p9", "global"), 0.95),
+    }
+    routed(_score_aware_switch(rows))
+    results = service.search(query="q", user_id="alice", project_id="p1", limit=1)
+    assert [r.id for r in results] == [GLOBAL_IN_P9]
+    assert not _normal_path_ran(service)
+    assert [r.id for r in service.search(query="q", user_id="alice", project_id="p1", limit=2)] == [
+        GLOBAL_IN_P9, PROJECT_LOW]
+
+
+def test_there_is_no_project_free_fallback_search_any_more():
+    """An unlabelled projection is relabelled by a backfill, not searched for: exactly two searches per pool."""
+    from engine_adapters_switch import labels_for
+
+    legacy = ("owner:alice", "vis:private")  # a projection from before the scope label existed
+    rows = {"legacy-global": (legacy, 0.9), "proj": (labels_for("alice", "private", "p1", "project"), 0.5)}
+    switch = _score_aware_switch(rows)
+    ids = [h.record_id for h in switch.recall("alice", "q", 5, project_id="p1", visibility="private",
+                                              include_global=True)]
+    assert ids == ["proj"]  # until a backfill has relabelled it, the unlabelled row is not returned
+    assert [labels for labels, _n in switch.searches] == [("owner:alice", "project:p1"), ("owner:alice", "scope:global")]

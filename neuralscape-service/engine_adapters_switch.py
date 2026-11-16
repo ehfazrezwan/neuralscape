@@ -49,25 +49,30 @@ from engine_routing import (
 
 logger = logging.getLogger("neuralscape.engine_switch")
 
-_GLOBAL_OVERFETCH = 4  # depth of the project-free leg of a routed project recall, in multiples of the limit
-# Hard bound on the legacy project-free fallback of a routed project recall (see ``EngineSwitch.recall``): when
-# the first, ``4 x limit`` deep window comes back full, one deeper search of this many hits runs per pool.
-_FALLBACK_MAX_HITS = 512
 CANONICAL_PAGE_SIZE = 500  # ledger rows read per page by a catch-up or backfill
 
 
 GLOBAL_SCOPE_LABEL = "scope:global"
 
 
-def labels_for(user_id: str, visibility: Optional[str], project_id: Optional[str]) -> tuple[str, ...]:
-    """Filter labels that let recall reproduce the personal and shared pools."""
+def labels_for(
+    user_id: str, visibility: Optional[str], project_id: Optional[str], scope: Optional[str] = None
+) -> tuple[str, ...]:
+    """Filter labels that let recall reproduce the personal and shared pools.
+
+    ``scope:global`` follows the memory's *scope*: a global-category fact (preference, personal_fact,
+    technical_skill, ...) keeps the ``project_id`` of the project it was written in, yet it belongs to the
+    caller's global rows, which the normal path returns for every project.  Such a row carries both labels:
+    ``project:<id>`` stays (reads that ask for the project's rows alone still find it) and ``scope:global``
+    is added.  When the scope is not known (``None``) a row without a project is global, as before.
+    """
 
     labels = [f"owner:{user_id}", f"vis:{visibility or 'private'}"]
     if project_id:
         labels.append(f"project:{project_id}")
-    else:
-        # A row with no project is global; the label lets recall ask the engine for global rows only,
-        # before ranking and limiting, instead of filtering other projects' rows out afterwards.
+    if scope == "global" or (scope is None and not project_id):
+        # Lets recall ask the engine for global rows only, before ranking and limiting, instead of
+        # filtering other projects' rows out afterwards.
         labels.append(GLOBAL_SCOPE_LABEL)
     return tuple(label[:256] for label in labels)
 
@@ -229,6 +234,7 @@ class EngineSwitch:
             getattr(row, "owner_user_id", None) or "unknown",
             getattr(row, "visibility", None),
             getattr(row, "project_id", None),
+            getattr(row, "scope", None),
         )
 
     def canonical_source(self) -> CanonicalSource:
@@ -251,6 +257,7 @@ class EngineSwitch:
         user_id: str,
         visibility: Optional[str] = None,
         project_id: Optional[str] = None,
+        scope: Optional[str] = None,
         revision: Optional[int] = None,
     ) -> None:
         applied_revision = revision if revision is not None else self._revision(tenant_id, memory_id)
@@ -262,7 +269,7 @@ class EngineSwitch:
             revision=applied_revision,
             tenant_id=tenant_id,
             text=text,
-            labels=labels_for(user_id, visibility, project_id),
+            labels=labels_for(user_id, visibility, project_id, scope),
         )
         router = self.router  # one router for the token and the call
         try:
@@ -281,6 +288,7 @@ class EngineSwitch:
         self.project_apply(
             tenant_id, memory_id, text=row.memory, user_id=getattr(row, "owner_user_id", None) or "unknown",
             visibility=getattr(row, "visibility", None), project_id=getattr(row, "project_id", None),
+            scope=getattr(row, "scope", None),
         )
 
     def project_remove(self, tenant_id: str, memory_id: str) -> None:
@@ -309,15 +317,15 @@ class EngineSwitch:
     ) -> list[SearchHit]:
         """Vector recall from the serving engine: the caller's own rows plus the shared pool.
 
-        With a ``project_id`` the project's rows carry its label, but the caller's global rows (no
-        project) do not, so ``include_global`` adds a second, project-free search per pool and
-        returns the union: the project-free search is restricted to the ``scope:global`` label (in the engine,
-        before its limit).  The caller keeps only rows of the project or of global scope.
+        With a ``project_id`` the project's rows carry its label, but the caller's global rows may not
+        (a global row carries ``scope:global`` and, when written inside a project, that project's label
+        too), so ``include_global`` adds a second search per pool restricted to the ``scope:global`` label
+        (in the engine, before its limit).  Both legs are merged by score and only then limited, so a
+        lower-scoring project hit never displaces a higher-scoring global hit.  The caller keeps only rows
+        of the project or of global scope.
 
-        A projection made before the scope label existed carries no ``scope:global`` label.  When the
-        label leg is short of its limit the old project-free search runs too, ``4 x limit`` deep and, if that
-        window is full, once more ``_FALLBACK_MAX_HITS`` deep.  An unlabelled global row ranked deeper than
-        that is not found (projecting the row again, as an edit does, labels it).
+        A projection made before the scope label existed carries no ``scope:global`` label and is not found
+        by the global leg: one backfill run (``catch_up`` with no window open) relabels such rows.
         """
 
         tenant_id = self._tenant_for(user_id)
@@ -332,39 +340,20 @@ class EngineSwitch:
         if include_shared and visibility != "private":
             pools.append(("vis:shared",))
         wide = bool(project_id and include_global)
-        primary: dict[str, SearchHit] = {}
-        fallback: dict[str, SearchHit] = {}
 
-        def _search(target: dict, leg_labels: tuple, leg_limit: int) -> list:
+        def _search(leg_labels: tuple) -> None:
             flt = TenantFilter(tenant_id=tenant_id, labels_all=leg_labels)
-            hits = router.search(token, _ctx(tenant_id), query, flt, leg_limit)
-            for hit in hits:
-                if hit.record_id not in target or hit.score > target[hit.record_id].score:
-                    target[hit.record_id] = hit
-            return hits
+            for hit in router.search(token, _ctx(tenant_id), query, flt, limit):
+                if hit.record_id not in seen or hit.score > seen[hit.record_id].score:
+                    seen[hit.record_id] = hit
 
         for labels in pools:
-            _search(primary, labels + ((_bounded(f"project:{project_id}"),) if project_id else ()), limit)
+            _search(labels + ((_bounded(f"project:{project_id}"),) if project_id else ()))
             if wide:
                 # Global rows only (filtered by the engine before its limit), so other projects' rows can
                 # never fill the leg and displace them.
-                global_hits = _search(primary, labels + (GLOBAL_SCOPE_LABEL,), limit)
-                if len(global_hits) < limit:
-                    # Projections made before the scope label existed carry none: a leg short of its limit
-                    # may be missing such rows, so the old project-free search runs too.  Its rows only
-                    # follow the primary ones (they may belong to other projects; hydration drops those).
-                    window = limit * _GLOBAL_OVERFETCH
-                    first = _search(fallback, labels, window)
-                    if len(first) >= window and _FALLBACK_MAX_HITS > window:
-                        # The window came back full: an unlabelled global row may rank behind more than
-                        # ``4 x limit`` rows of other projects.  One deeper search, to a hard bound, looks
-                        # for it (hydration drops every row that is not the project's or global).
-                        _search(fallback, labels, _FALLBACK_MAX_HITS)
-        ordered = sorted(primary.values(), key=lambda h: (-h.score, h.record_id))
-        extra = sorted(
-            (h for rid, h in fallback.items() if rid not in primary), key=lambda h: (-h.score, h.record_id)
-        )
-        ordered += extra[:_FALLBACK_MAX_HITS]
+                _search(labels + (GLOBAL_SCOPE_LABEL,))
+        ordered = sorted(seen.values(), key=lambda h: (-h.score, h.record_id))
         return ordered if wide else ordered[:limit]
 
     def recall_ready(self) -> tuple[bool, Optional[str]]:
@@ -429,6 +418,7 @@ class EngineSwitch:
             )
         return {**self.status(), "backfilled": backfilled, "report": {
             "copied": report.copied, "tombstoned": report.tombstoned, "superseded": report.superseded,
+            "relabeled": report.relabeled, "unchanged": report.unchanged,
             "replayed": report.replayed, "repaired_dirty": report.repaired_dirty, "conflicts": len(report.conflicts),
         }}
 

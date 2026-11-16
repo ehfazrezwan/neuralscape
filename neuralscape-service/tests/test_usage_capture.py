@@ -520,3 +520,26 @@ def test_claimed_gap_counts_are_never_dropped_when_concurrent_failures_fill_the_
     recorder.flush_gaps()
     assert recorder.unrecorded[("t", "claimed")] == 4
     assert recorder.gaps_overflowed == 0
+
+
+def test_the_store_signature_is_read_once_per_method_not_on_every_write(monkeypatch):
+    """Before: ``inspect.signature`` ran on every append and gap write on the provider-call path."""
+    import inspect
+
+    class Store:
+        def append(self, event, *, budget_s=None, ledger_attempt=None):
+            return budget_s
+
+        def legacy(self, event):
+            return "legacy"
+
+    store = Store()
+    reads = []
+    real = inspect.signature
+    monkeypatch.setattr(inspect, "signature", lambda m, *a, **k: reads.append(m) or real(m, *a, **k))
+    call = uc.DurableUsageRecorder._store_call
+    assert [call(store.append, "e", budget_s=0.5) for _ in range(5)] == [0.5] * 5
+    assert call(store.legacy, "e", budget_s=0.5) == "legacy"  # a store without budget_s is not given one
+    assert call(store.legacy, "e", budget_s=0.5) == "legacy"
+    assert call(store.append, "e") is None  # no budget asked for: none passed
+    assert len(reads) == 2  # one read per method, however many writes

@@ -487,10 +487,12 @@ class ProvenanceMixin:
         """A row recording the episode by its uuid, or by name from the very group the episode lives in."""
 
         meta = payload.get("metadata") or {}
+        if meta.get("graph_episode_uuid") == episode_uuid:
+            return True  # the reference is written at the outer depth, whatever the row's own depth
         if isinstance(meta.get("metadata"), dict):
             meta = meta["metadata"]
-        if meta.get("graph_episode_uuid") == episode_uuid:
-            return True
+            if meta.get("graph_episode_uuid") == episode_uuid:
+                return True
         row_group = _build_group_id(
             meta.get("visibility") or MemoryVisibility.PRIVATE.value,
             meta.get("owner_user_id") or payload.get("user_id") or "",
@@ -534,27 +536,51 @@ class ProvenanceMixin:
                 "workspace": meta.get("workspace"),
                 "removed_episode": removed_episode,
             }
-            # What the row recorded when it was read: the update applies only while that still holds.
+            # What the row recorded when it was read: the update applies only while that still holds.  The
+            # episode reference is looked for at the depth that holds it: ``_persist_graph_episode_ref``
+            # writes it at the outer metadata, even for a row whose metadata is wrapped one level deeper,
+            # while the row's own fields (and the re-enrichment marker the readers look for) sit at ``parent``.
+            ref_parent, ref_meta = parent, meta
+            for cand_parent, cand in (("metadata", outer), ("metadata.metadata", outer.get("metadata"))):
+                if isinstance(cand, dict) and cand.get("graph_episode_uuid") == removed_episode:
+                    ref_parent, ref_meta = cand_parent, cand
+                    break
+            else:
+                for cand_parent, cand in (("metadata", outer), ("metadata.metadata", outer.get("metadata"))):
+                    if isinstance(cand, dict) and cand.get("graph_episode_name") and not cand.get("graph_episode_uuid"):
+                        ref_parent, ref_meta = cand_parent, cand
+                        break
             uuid_absent = None
-            if meta.get("graph_episode_uuid") == removed_episode or not meta.get("graph_episode_name"):
+            if ref_meta.get("graph_episode_uuid") == removed_episode or not ref_meta.get("graph_episode_name"):
                 recorded = FieldCondition(
-                    key=f"{parent}.graph_episode_uuid", match=MatchValue(value=removed_episode))
+                    key=f"{ref_parent}.graph_episode_uuid", match=MatchValue(value=removed_episode))
             else:
                 # Name-only row: the update also needs the uuid to still be absent, so a concurrent write
                 # that added a uuid under the same name is not cleared.
                 recorded = FieldCondition(
-                    key=f"{parent}.graph_episode_name", match=MatchValue(value=meta["graph_episode_name"]))
-                uuid_absent = IsEmptyCondition(is_empty=PayloadField(key=f"{parent}.graph_episode_uuid"))
+                    key=f"{ref_parent}.graph_episode_name", match=MatchValue(value=ref_meta["graph_episode_name"]))
+                uuid_absent = IsEmptyCondition(is_empty=PayloadField(key=f"{ref_parent}.graph_episode_uuid"))
+            only_if_recorded = Filter(must=[HasIdCondition(has_id=[memory_id]), recorded,
+                                            *([uuid_absent] if uuid_absent is not None else [])])
             try:
-                client.set_payload(
-                    collection_name=settings.qdrant_collection,
-                    payload={"graph_episode_uuid": None, "graph_episode_name": None,
-                             REENRICH_PENDING_KEY: removed_episode,
-                             REENRICH_PENDING_AT_KEY: time.time(), REENRICH_ATTEMPTS_KEY: 0},
-                    points=Filter(must=[HasIdCondition(has_id=[memory_id]), recorded,
-                                        *([uuid_absent] if uuid_absent is not None else [])]),
-                    key=parent,
-                )
+                marker = {REENRICH_PENDING_KEY: removed_episode,
+                          REENRICH_PENDING_AT_KEY: time.time(), REENRICH_ATTEMPTS_KEY: 0}
+                cleared = {"graph_episode_uuid": None, "graph_episode_name": None}
+                if ref_parent == parent:
+                    # Reference and marker at one depth: one conditional update.
+                    client.set_payload(
+                        collection_name=settings.qdrant_collection, payload={**cleared, **marker},
+                        points=only_if_recorded, key=parent,
+                    )
+                else:
+                    # The reference is at the other depth than the row's own fields.  The marker goes first,
+                    # at the row's own depth, and only while the row still records the removed episode; the
+                    # reference is cleared under the same condition after it.  A failure between the two
+                    # leaves a visible marker (the sweep retries) rather than a cleared reference with none.
+                    client.set_payload(
+                        collection_name=settings.qdrant_collection, payload=marker,
+                        points=only_if_recorded, key=parent,
+                    )
                 if not self._row_marked_for_reenrichment(memory_id, removed_episode):
                     # The row no longer records the removed episode (a correction moved it on): nothing
                     # of it is lost, and the row's own newer episode is left as it is.
@@ -563,6 +589,11 @@ class ProvenanceMixin:
                         memory_id, removed_episode,
                     )
                     continue
+                if ref_parent != parent:
+                    client.set_payload(
+                        collection_name=settings.qdrant_collection, payload=cleared,
+                        points=only_if_recorded, key=ref_parent,
+                    )
                 dispatch = getattr(self, "_graph_reenrich_dispatch", None)
                 if dispatch is not None:
                     dispatch(job)

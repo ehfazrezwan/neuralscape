@@ -864,3 +864,82 @@ def test_a_persistent_read_failure_after_the_enrichment_leaves_the_marker_for_th
     service._memory.graph.add.side_effect = lambda **kw: {"episode_uuid": "ep-new", "episode_name": "ep-name"}
     assert service.reenrich_memory_graph("m1") == {"memory_ids": ["m1"]}
     assert not qdrant.rows["m1"].get("graph_reenrich_pending")  # cleared only after the row was verified
+
+
+# ---- a wrapped row, on a store that honours nested keys ------------------------------------------------------
+
+
+def _local_store_service():
+    from qdrant_client import QdrantClient
+    from qdrant_client.models import Distance, PointStruct, VectorParams
+
+    from config import settings
+    from memory.provenance import ProvenanceMixin
+
+    client = QdrantClient(":memory:")
+    client.create_collection(settings.qdrant_collection, vectors_config=VectorParams(size=2, distance=Distance.COSINE))
+
+    class S(ProvenanceMixin):
+        pass
+
+    svc = S()
+    svc._memory = SimpleNamespaceFor(vector_store=SimpleNamespaceFor(client=client))
+    svc.jobs = []
+    svc._graph_reenrich_dispatch = svc.jobs.append
+
+    def put(point_id, metadata):
+        client.upsert(settings.qdrant_collection, [PointStruct(id=point_id, vector=[1.0, 0.0], payload={
+            "data": "fact", "user_id": "u", "metadata": metadata})])
+
+    def get(point_id):
+        return client.retrieve(settings.qdrant_collection, [point_id], with_payload=True)[0].payload
+
+    return svc, put, get
+
+
+from types import SimpleNamespace as SimpleNamespaceFor  # noqa: E402
+
+WRAPPED_ID = "11111111-1111-1111-1111-111111111111"
+
+
+def test_a_wrapped_survivor_whose_episode_reference_sits_at_the_outer_depth_is_re_enriched():
+    """Before: the reference was looked for (and cleared) at ``metadata.metadata`` while it is written at the outer
+    ``metadata``, so the conditional update matched nothing: no marker, no job, and the dangling reference stayed."""
+    svc, put, get = _local_store_service()
+    put(WRAPPED_ID, {"graph_episode_uuid": "ep-1", "metadata": {"owner_user_id": "u", "visibility": "private"}})
+    assert svc._reenrich_survivors([(WRAPPED_ID, get(WRAPPED_ID))], "ep-1") == 1
+    assert [job["memory_id"] for job in svc.jobs] == [WRAPPED_ID]
+    row = get(WRAPPED_ID)["metadata"]
+    assert row["graph_episode_uuid"] is None  # the dangling reference is gone, at the depth that held it
+    assert row["metadata"]["graph_reenrich_pending"] == "ep-1"  # the marker sits at the row's own depth
+    assert row["metadata"]["owner_user_id"] == "u"
+    assert "graph_reenrich_pending" not in row  # not at the outer depth (the readers look at the row's own)
+
+
+def test_a_wrapped_survivor_that_moved_to_a_newer_episode_is_left_alone():
+    svc, put, get = _local_store_service()
+    put(WRAPPED_ID, {"graph_episode_uuid": "ep-2", "metadata": {"owner_user_id": "u"}})
+    stale = (WRAPPED_ID, {"data": "fact", "metadata": {"graph_episode_uuid": "ep-1", "metadata": {"owner_user_id": "u"}}})
+    assert svc._reenrich_survivors([stale], "ep-1") == 0
+    assert svc.jobs == [] and get(WRAPPED_ID)["metadata"]["graph_episode_uuid"] == "ep-2"
+    assert "graph_reenrich_pending" not in get(WRAPPED_ID)["metadata"].get("metadata", {})
+
+
+def test_a_wrapped_survivor_with_the_reference_at_its_own_depth_still_works_and_a_flat_row_too():
+    svc, put, get = _local_store_service()
+    put(WRAPPED_ID, {"metadata": {"owner_user_id": "u", "graph_episode_uuid": "ep-1"}})
+    flat = "22222222-2222-2222-2222-222222222222"
+    put(flat, {"owner_user_id": "u", "graph_episode_uuid": "ep-1"})
+    assert svc._reenrich_survivors([(WRAPPED_ID, get(WRAPPED_ID)), (flat, get(flat))], "ep-1") == 2
+    assert get(WRAPPED_ID)["metadata"]["metadata"]["graph_reenrich_pending"] == "ep-1"
+    assert get(flat)["metadata"]["graph_reenrich_pending"] == "ep-1" and get(flat)["metadata"]["graph_episode_uuid"] is None
+
+
+def test_the_episode_group_check_reads_the_reference_at_either_depth():
+    from memory.provenance import ProvenanceMixin
+
+    outer_ref = {"user_id": "u", "metadata": {"graph_episode_uuid": "ep-1", "metadata": {"owner_user_id": "other"}}}
+    assert ProvenanceMixin._row_records_episode_in_group(outer_ref, "ep-1", "no-such-group") is True
+    inner_ref = {"user_id": "u", "metadata": {"metadata": {"graph_episode_uuid": "ep-1"}}}
+    assert ProvenanceMixin._row_records_episode_in_group(inner_ref, "ep-1", "no-such-group") is True
+    assert ProvenanceMixin._row_records_episode_in_group(inner_ref, "ep-9", "no-such-group") is False

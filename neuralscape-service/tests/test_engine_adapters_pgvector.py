@@ -141,7 +141,7 @@ def test_stale_and_conflicting_revisions_are_typed_and_write_nothing():
         a.apply(ctx(), EngineRecord(record_id="r", revision=5, tenant_id="tenant-a", text="other", labels=("a",)))
     assert conflict.value.code is InternalErrorCode.IDEMPOTENCY_CONFLICT
     a.apply(ctx(), EngineRecord(record_id="r", revision=5, tenant_id="tenant-a", text="same", labels=("a",)))  # replay
-    assert sum(1 for sql, _ in conn.statements if sql.startswith("INSERT")) == 1
+    assert not [sql for sql, _ in conn.statements if sql.startswith(("INSERT", "UPDATE"))]  # a replay writes nothing
 
 
 def test_remove_tombstones_without_content_and_rejects_stale_or_missing():

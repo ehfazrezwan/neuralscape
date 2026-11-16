@@ -280,3 +280,69 @@ def test_failed_flush_cycles_do_not_grow_the_gap_map_past_its_key_bound():
         recorder.flush_gaps()
         assert len(recorder.unrecorded) <= 3
     assert recorder.gaps_overflowed > 0  # the new keys were counted as dropped, not silently admitted
+
+
+def _blocking_gap_write(monkeypatch):
+    """A write the server cancels only when its statement_timeout expires (a blocked row lock)."""
+
+    class Cancelled(Exception):
+        pass
+
+    real = Conn.execute
+    seen = {"timeouts": []}
+
+    def execute(self, sql, params=None):
+        if "set_config('statement_timeout'" in sql:
+            self.stmt_ms = int(params[0].rstrip("ms"))
+            seen["timeouts"].append(self.stmt_ms)
+        if sql.startswith("INSERT INTO usage_gaps") and getattr(self.world, "block", False):
+            time.sleep(self.stmt_ms / 1000.0)
+            raise Cancelled("canceling statement due to statement timeout")
+        return real(self, sql, params)
+
+    monkeypatch.setattr(Conn, "execute", execute)
+    return Cancelled, seen
+
+
+def test_a_gap_write_after_a_slow_successful_reconnect_stays_inside_the_deadline(monkeypatch):
+    """Before: the statement budget was computed before the reconnect (and floored at 100 ms), so a reconnect that
+    took most of the budget was followed by a statement allowed to run for the whole original budget."""
+    cancelled, seen = _blocking_gap_write(monkeypatch)
+    world = World()
+    store = make_store(world, monkeypatch, append_budget_s=0.5)
+    real_connect = world.connect
+
+    def slow(dsn, **kwargs):
+        time.sleep(0.35)  # succeeds, but spends most of the budget
+        return real_connect(dsn, **kwargs)
+
+    world.connect = slow
+    store._psycopg = world.module()
+    world.block = True
+    store._conn.killed = True
+    started = time.monotonic()
+    with pytest.raises(cancelled):
+        store.record_gap(TENANT, "task-1", 1)
+    elapsed = time.monotonic() - started
+    assert elapsed < 0.5 + 0.15, elapsed
+    assert seen["timeouts"] and seen["timeouts"][-1] <= 160  # what was left after the reconnect, not 499 ms
+
+
+def test_a_reconnect_that_spends_the_whole_budget_fails_before_any_statement_runs(monkeypatch):
+    cancelled, seen = _blocking_gap_write(monkeypatch)
+    world = World()
+    clock = {"now": 100.0}
+    store = make_store(world, monkeypatch, append_budget_s=0.5, monotonic=lambda: clock["now"])
+    real_connect = world.connect
+
+    def spend(dsn, **kwargs):
+        clock["now"] += 0.6  # the connect itself used up the budget (on the store's clock)
+        return real_connect(dsn, **kwargs)
+
+    world.connect = spend
+    store._psycopg = world.module()
+    world.block = True
+    store._conn.killed = True
+    with pytest.raises(usage_store.UsageStoreError, match="budget"):
+        store.record_gap(TENANT, "task-1", 1)
+    assert seen["timeouts"] == [500]  # only the first try (on the killed connection); none after the spent reconnect

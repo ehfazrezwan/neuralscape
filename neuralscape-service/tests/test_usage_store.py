@@ -501,7 +501,12 @@ def test_the_recorder_stays_inside_its_budget_while_another_connection_holds_a_r
     import time
 
     path = str(tmp_path / "usage.db")
-    store = SqliteUsageStore(path, append_budget_s=5.0)  # the recorder's budget is the tighter bound
+    # A short per-write budget, so the lock-held append gives up well inside the recorder's budget and the
+    # recorder retries it; the attempts are counted to show the retry really happens.
+    store = SqliteUsageStore(path, append_budget_s=0.15)
+    attempts = []
+    real_append = store.append
+    store.append = lambda ev, **kw: attempts.append(kw.get("budget_s")) or real_append(ev, **kw)
     recorder = uc.DurableUsageRecorder(store, retries=3, retry_delay=0.05, record_budget_s=0.6)
     other = sqlite3.connect(path, isolation_level=None)
     other.execute("BEGIN IMMEDIATE")  # a second writer holds the write lock for the whole call
@@ -512,8 +517,10 @@ def test_the_recorder_stays_inside_its_budget_while_another_connection_holds_a_r
     finally:
         other.execute("ROLLBACK")
         other.close()
+    assert len(attempts) >= 2, attempts  # the append was retried while the lock was held
     assert elapsed < 0.6 + 0.4, elapsed
     assert recorder.unrecorded == {(TENANT, "task-1"): 1}
     assert store._conn.execute("PRAGMA busy_timeout").fetchone()[0] == 30_000  # restored after the bounded waits
+    attempts.clear()
     assert recorder.record(event("e2", task="task-1")) is True  # the lock is gone: stored, and the gap flushed
     assert recorder.unrecorded == {} and store.gaps(TENANT, "task-1") == 1

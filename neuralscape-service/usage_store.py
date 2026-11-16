@@ -585,9 +585,13 @@ class PostgresUsageStore(_SqlUsageStore):
             if not self._lock.acquire(timeout=remaining):
                 raise UsageStoreError("usage store busy: the append budget was spent waiting for the connection")
             try:
-                budget_ms = max(100, int((deadline - self._monotonic()) * 1000))
                 try:
                     with self._txn(deadline) as c:
+                        # The statement budget is what is left after the (re)connect, not before it.
+                        left = deadline - self._monotonic()
+                        if left <= 0:
+                            raise UsageStoreError("usage store append budget spent connecting")
+                        budget_ms = max(1, int(left * 1000))
                         c.execute(
                             "SELECT set_config('statement_timeout', %s, true),"
                             " set_config('lock_timeout', %s, true)",

@@ -23,6 +23,7 @@ import hashlib
 import itertools
 import logging
 import uuid
+import weakref
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
@@ -758,18 +759,34 @@ class DurableUsageRecorder:
         logger.error("durable usage write failed for %s", event.event_id, exc_info=True)
         return False
 
-    @staticmethod
-    def _store_call(method: Any, *args: Any, budget_s: float | None = None, **kwargs: Any) -> Any:
-        """Call a store write with the caller's remaining budget when the store accepts one."""
+    # Whether a store method takes ``budget_s``, by the underlying function (the signature is read once).
+    _BUDGET_PARAM: "weakref.WeakKeyDictionary[Any, bool]" = weakref.WeakKeyDictionary()
+
+    @classmethod
+    def _accepts_budget(cls, method: Any) -> bool:
+        key = getattr(method, "__func__", method)
+        try:
+            return cls._BUDGET_PARAM[key]
+        except (KeyError, TypeError):
+            pass
         import inspect
 
-        if budget_s is not None:
-            try:
-                params = inspect.signature(method).parameters
-            except (TypeError, ValueError):
-                params = {}
-            if "budget_s" in params or any(p.kind is p.VAR_KEYWORD for p in params.values()):
-                kwargs["budget_s"] = budget_s
+        try:
+            params = inspect.signature(method).parameters
+        except (TypeError, ValueError):
+            params = {}
+        accepts = "budget_s" in params or any(p.kind is p.VAR_KEYWORD for p in params.values())
+        try:
+            cls._BUDGET_PARAM[key] = accepts
+        except TypeError:  # not weak-referenceable: read again next time
+            pass
+        return accepts
+
+    @classmethod
+    def _store_call(cls, method: Any, *args: Any, budget_s: float | None = None, **kwargs: Any) -> Any:
+        """Call a store write with the caller's remaining budget when the store accepts one."""
+        if budget_s is not None and cls._accepts_budget(method):
+            kwargs["budget_s"] = budget_s
         return method(*args, **kwargs)
 
     def flush_gaps(self, max_s: float | None = None) -> None:

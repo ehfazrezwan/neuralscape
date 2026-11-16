@@ -131,7 +131,8 @@ def test_dual_write_reaches_both_and_catch_up_copies_prewindow_state_from_canoni
         CanonicalState("tenant-a", "gone", 2, True),
         CanonicalState("tenant-a", "live", 1, False, "during window"),
     ))
-    assert report.copied == 2 and report.tombstoned == 1 and not report.conflicts
+    assert report.copied == 1 and report.unchanged == 1 and report.tombstoned == 1 and not report.conflicts
+    # 'live' reached the shadow through the dual write: it is already canonical, so nothing was written for it
     assert router.lag() == 0
     ids = ["old", "gone", "live"]
     assert state(a, ids) == state(b, ids)
