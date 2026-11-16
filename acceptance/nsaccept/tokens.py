@@ -19,6 +19,7 @@ import time
 from typing import Callable
 
 
+
 class TokenError(RuntimeError):
     """Raised when a token cannot be obtained (harness misconfiguration)."""
 

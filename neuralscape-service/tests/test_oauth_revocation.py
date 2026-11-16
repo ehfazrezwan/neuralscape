@@ -282,6 +282,11 @@ class TestLinkFlow:
     @pytest.fixture(autouse=True)
     def no_identity_store(self, monkeypatch):
         monkeypatch.setattr(oauth.identity_store, "link", AsyncMock())
+
+        async def provision(user_id, sub, email, reserve=False):
+            return user_id
+
+        monkeypatch.setattr(oauth, "provision_user_id", provision)
         monkeypatch.setattr(settings, "auth_provider", "google")
 
     def test_revoked_token_cannot_be_used_to_link(self, client, monkeypatch):

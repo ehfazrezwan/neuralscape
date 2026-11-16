@@ -91,6 +91,22 @@ hidden and `POST /oauth/authorize` rejects token submits). It's always shown for
    to an existing id, **preserving memories already stored under that id**.
 2. **Slug** — everyone else gets a deterministic slug:
    `alice.smith@example.com` → `alice.smith-example.com`.
+   The slug is lossy (`a+b@x.com` and `a-b@x.com` both give `a-b-x.com`), so a
+   **first login whose slug is already linked to a different sub/email (or seeded
+   in `AUTH_IDENTITY_MAP` for another email) gets `<slug>-<8 hex of sha256(email)>`
+   instead** (`login_providers.provision_user_id`, checked when the link page is
+   shown and again when `/oauth/link` provisions it). Existing links and the
+   first claimant keep the plain slug, so no existing id changes. The claim is
+   reserved atomically in Redis (`ns:identity:owner`, HSETNX), so two simultaneous
+   first logins cannot both take one slug. **Fails closed:** if Redis is
+   unreachable, a login that is not already resolved by the `AUTH_IDENTITY_MAP`
+   seed gets a 503 "identity store unavailable, try again" page (already-linked
+   users also wait, since the link lives in the same Redis); nobody is guessed
+   onto a plain slug. The check sees links, reservations and the seed, not
+   memories, so **before enabling**, backfill users who have memories under a slug
+   but were never linked:
+   `uv run python scripts/identity.py backfill --from-env --file users.txt`
+   (lines `email:user_id`; dry-run by default, add `--apply`).
 
 > **Migration:** if memories are already keyed by short ids (e.g. `alice`),
 > map those people in `AUTH_IDENTITY_MAP` before flipping a provider on, or
@@ -260,7 +276,10 @@ docker compose exec neuralscape python scripts/issue_user_token.py --user alice 
 2. **Allowlist hook:** run [`neuralscape-service/supabase/allowlist_hook.sql`](neuralscape-service/supabase/allowlist_hook.sql)
    in the SQL editor. It creates `signup_email_domains` / `signup_email_addresses`,
    seeds a placeholder `example.com` (replace it), and defines
-   `public.hook_restrict_signup` (default-deny). Then **Authentication → Hooks → Before User Created →
+   `public.hook_restrict_signup` (default-deny). Both tables have row-level
+   security on and no `anon`/`authenticated` access (PostgREST cannot read or
+   edit the allowlist); re-running the script on an older install applies this.
+   Then **Authentication → Hooks → Before User Created →
    Postgres → select `hook_restrict_signup` → Enable.**
    - Add/remove access later with plain SQL — no redeploy:
      ```sql
