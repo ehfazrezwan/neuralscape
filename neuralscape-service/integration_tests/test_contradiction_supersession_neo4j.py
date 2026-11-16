@@ -236,3 +236,24 @@ def test_stale_check_episode_with_no_edges_is_current(graph_env):
     counts, stale = _stale_case(graph_env, [])
     assert counts == {"total": 0, "live": 0}
     assert stale is False
+
+
+def test_live_edge_facts_and_dominance_on_the_one_fact_two_edges_shape(graph_env):
+    """Gate shape: one episode yields a residence edge (now invalidated) and an
+    incidental edge (still live). Real Cypher must report the live fact, and the
+    probe must still find the dead edge by its single episode."""
+    from extensions.dreaming.graph_patcher import find_contradicted_edges, live_edge_facts_by_episode
+
+    svc, qdrant, collection, group, cypher = graph_env
+    start = datetime.now(timezone.utc) - timedelta(seconds=1)
+    _seed_edge(cypher, group, "g-dead", "Alice resides in the city of Paris.", ["ep-one"],
+               invalid=True, expired=True)
+    _seed_edge(cypher, group, "g-live", "Paris is a city situated in France.", ["ep-one"])
+
+    live = svc._run_on_bridge(
+        live_edge_facts_by_episode(svc._graphiti.driver, group_id=group, episode_uuids=["ep-one", "ep-none"]))
+    assert live == {"ep-one": ["Paris is a city situated in France."], "ep-none": []}
+    dead = svc._run_on_bridge(
+        find_contradicted_edges(svc._graphiti.driver, group_id=group, write_started_at=start,
+                                new_episode_uuid="ep-new"))
+    assert [(e["uuid"], e["episodes"]) for e in dead] == [("g-dead", ["ep-one"])]

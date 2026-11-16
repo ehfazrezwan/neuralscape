@@ -19,6 +19,9 @@ Migrated pages carry ``migrated: true`` and the union of their scope's
 legacy ``source_memory_ids`` — the first real dream sweep re-anchors
 each topic to its precise live memory set.
 
+Run it once, on a vault that still has a legacy ``Wiki/`` tree (written by the
+retired wiki synthesizer); a vault without one reports "nothing to migrate".
+
 Usage:
     uv run python scripts/migrate_wiki_to_topics.py --vault /path/to/vault           # dry run
     uv run python scripts/migrate_wiki_to_topics.py --vault /path/to/vault --apply
