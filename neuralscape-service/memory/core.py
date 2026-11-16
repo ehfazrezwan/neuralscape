@@ -104,6 +104,9 @@ class CoreMixin:
         self._memory = None
         self._graphiti = None
         self._bridge = None
+        # Set when the graph store was configured but its adapter failed to
+        # attach (service runs vector-only); None when graph is simply off.
+        self._graph_init_error: str | None = None
         self._genai_model = None
         self._init_lock = threading.Lock()
 
@@ -167,6 +170,7 @@ class CoreMixin:
                                 provider,
                             )
                         except Exception as e:
+                            self._graph_init_error = f"{type(e).__name__}: {e}"
                             logger.warning(
                                 f"Graphiti adapter init failed (non-critical): {e}"
                             )
@@ -257,8 +261,15 @@ class CoreMixin:
 
     def close(self):
         """Clean up resources."""
-        if self._graphiti and self._bridge:
-            self._bridge.run(self._graphiti.close())
+        try:
+            if self._graphiti and self._bridge:
+                self._bridge.run(self._graphiti.close())
+        finally:
+            # Stop the bridge loop AFTER the driver closed on it (even when that
+            # close raised), so no task or driver outlives its loop.
+            shutdown = getattr(self._bridge, "shutdown", None)
+            if callable(shutdown):
+                shutdown()
 
     def _ensure_created_at_index(self) -> None:
         """Best-effort: ensure a DATETIME payload index on ``created_at``.

@@ -39,6 +39,7 @@ def check_graph_row_has_numeric_score(client, fact: Fact) -> None:
     "graph.embedder-client",
     "fork.graphiti.graph-embedder",
     "fork.mem0.gemini-embedder",
+    "read.graph-hybrid-leg",
 )
 def test_graph_rows_get_numeric_scores(a, a_fact):
     assert a_fact.visible_to_a, "precondition: A's fact never became searchable"

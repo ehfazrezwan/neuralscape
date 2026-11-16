@@ -1,5 +1,7 @@
 # Engine-Maximization Implementation Spec (Handoff)
 
+> **Status (as of 2026-11-16, dev 6a81341f):** snapshot. A work list written on 2026-06-22; it is not a current plan. Some items landed in a different form (typed graph ontology via `entity_types` in `graphiti_memory.py`, used by `adapters/trading/ontology.py`; a BM25 lexical leg in `memory/search.py`), and the status of the others (M1-M3, G1-G4) has not been re-verified here. Check the code before treating any item as open. Line numbers in this page are as of the snapshot and refer to the pre-split `memory_service.py`; that code now lives in the `memory/` package (`write.py`, `search.py`, `reads.py`, `edit.py`, `delete.py`, `graph_admin.py`, `core.py`, `groups.py`, `junk.py`, `retry.py`, `ranking.py`), with `memory_service.py` as a thin facade.
+
 *Status: ready for an implementing agent. Created 2026-06-22. Verified against vendored **mem0 2.0.2** and **graphiti 0.28.2** (the trees NS ships) — every change below works on the vendored versions, **no upstream sync required**. Builds on docs 15 (parity), 16 (pluggable design — separate effort), 17 (rewire feasibility).*
 
 ## 0. How to use this document
