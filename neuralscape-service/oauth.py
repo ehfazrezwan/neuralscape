@@ -45,6 +45,7 @@ import base64
 import hashlib
 import html
 import logging
+import re
 import secrets
 import time
 from urllib.parse import urlencode, urlparse
@@ -96,6 +97,9 @@ _CLIENT_TTL: int | None = None  # client_id registrations don't expire
 _LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1"}
 
 
+_BAD_HOST_CHARS = re.compile(r"[\s\x00-\x1f\x7f<>\"'`\\{}|^]")
+
+
 def _is_valid_redirect_uri(uri: str) -> bool:
     """Accept only absolute https:// URIs (or http:// to a loopback host) with
     no fragment. These are signed into the client_id and later trusted by
@@ -105,6 +109,15 @@ def _is_valid_redirect_uri(uri: str) -> bool:
         return False
     parsed = urlparse(uri)
     if not parsed.netloc or parsed.fragment:
+        return False
+    # userinfo (https://claude.ai@evil.example/cb) is a classic spoof of the
+    # displayed destination and has no legitimate use in a redirect URI.
+    if "@" in parsed.netloc:
+        return False
+    # Characters that can never appear in a host (markup, quotes, whitespace,
+    # control characters) and over-long hosts (DNS caps a name at 253): refused
+    # so the consent page can always show the destination intact.
+    if _BAD_HOST_CHARS.search(parsed.netloc) or len(parsed.hostname or "") > 253:
         return False
     host = (parsed.hostname or "").lower()
     if parsed.scheme == "https":
@@ -481,7 +494,7 @@ def _render_consent(
     them when both are present."""
     error_html = f'<div class="err">{html.escape(error)}</div>' if error else ""
     page = _CONSENT_PAGE.format(
-        redirect_host=html.escape(urlparse(redirect_uri).netloc or "an unknown address"),
+        redirect_host=html.escape(_display_host(redirect_uri)),
         client_label=html.escape(client_label),
         error_html=error_html,
     )
@@ -506,6 +519,26 @@ def _render_consent(
         .replace("<!--TOKEN_FORM-->", token_form)
     )
     return _html_response(page, status_code)
+
+
+def _display_host(uri: str) -> str:
+    """The destination host for the consent page: hostname only (never userinfo),
+    in IDNA/punycode form so homograph hosts are visible, plus a non-default port."""
+    parsed = urlparse(uri)
+    host = parsed.hostname or ""
+    try:
+        host = host.encode("idna").decode("ascii")
+    except UnicodeError:
+        pass
+    if ":" in host:
+        host = f"[{host}]"
+    try:
+        port = parsed.port
+    except ValueError:
+        port = None
+    if port is not None and port != {"https": 443, "http": 80}.get(parsed.scheme):
+        host = f"{host}:{port}"
+    return host or "an unknown address"
 
 
 def _cookie_secure() -> bool:
@@ -567,7 +600,7 @@ async def authorize(request: Request) -> HTMLResponse | JSONResponse:
     client = _decode_client(client_id)
     if client is None:
         return JSONResponse(status_code=400, content={"error": "invalid_client"})
-    if redirect_uri not in client.get("redirect_uris", []):
+    if not _is_valid_redirect_uri(redirect_uri) or redirect_uri not in client.get("redirect_uris", []):
         # Never redirect to an unregistered URI — surface the error locally.
         return JSONResponse(
             status_code=400,
@@ -644,7 +677,7 @@ async def authorize_submit(
     client = _decode_client(client_id)
     if client is None:
         return JSONResponse(status_code=400, content={"error": "invalid_client"})
-    if redirect_uri not in client.get("redirect_uris", []):
+    if not _is_valid_redirect_uri(redirect_uri) or redirect_uri not in client.get("redirect_uris", []):
         return JSONResponse(
             status_code=400,
             content={"error": "invalid_request", "error_description": "redirect_uri mismatch"},

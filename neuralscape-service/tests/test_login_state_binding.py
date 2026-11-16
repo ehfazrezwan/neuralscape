@@ -28,6 +28,7 @@ from fastapi.testclient import TestClient
 import login_providers as lp
 import oauth
 from config import settings
+import oauth as oauth_mod
 from main import app
 from tokens import sign_payload
 
@@ -284,7 +285,9 @@ def test_victim_without_any_cookie_cannot_complete_attacker_state(provider):
 def test_replayed_state_refused(provider):
     state, cookie, *_ = _start_login(provider)
     assert _callback(provider, state, cookie).status_code == 303
-    _assert_refused(_callback(provider, state, cookie))  # same cookie value presented again
+    again = _callback(provider, state, cookie)  # same cookie value presented again
+    _assert_refused(again)
+    assert "max-age=0" in again.headers["set-cookie"].lower()  # spent nonce: cookie cleared
 
 
 def test_expired_cookie_refused(provider, env):
@@ -406,3 +409,76 @@ def test_consent_page_shows_redirect_host_prominently(provider):
         "code_challenge": challenge, "code_challenge_method": "S256"})
     assert '<p class="dest">' in page.text and "<b>attacker.example.net</b>" in page.text
     assert page.text.index("attacker.example.net") < page.text.index("requesting access")
+
+
+# ── redirect URI validation + destination display ──
+
+
+def _register(client, uri):
+    return client.post("/oauth/register", json={"redirect_uris": [uri]})
+
+
+@pytest.mark.parametrize("uri", [
+    "https://claude.ai@attacker.example.net/cb",
+    "https://user:pass@attacker.example.net/cb",
+    "https://a<b>c.example.net/cb",
+    'https://a"b.example.net/cb',
+    "https://a b.example.net/cb",
+    "https://" + "a" * 254 + ".example/cb",
+])
+def test_registration_refuses_spoofable_redirect_uris(env, uri):
+    assert _register(_client(), uri).status_code == 400
+
+
+def test_authorize_refuses_legacy_client_with_userinfo_redirect(provider, env):
+    bad = "https://claude.ai@attacker.example.net/cb"
+    cid = sign_payload({"typ": "client", "redirect_uris": [bad], "iat": int(time.time())}, env["secret"])
+    _, challenge = _pkce()
+    r = _client().get("/oauth/authorize", params={
+        "response_type": "code", "client_id": cid, "redirect_uri": bad,
+        "code_challenge": challenge, "code_challenge_method": "S256"})
+    assert r.status_code == 400
+
+
+def test_display_host_strips_userinfo_port_and_shows_punycode():
+    d = oauth_mod._display_host
+    assert d("https://attacker.example.net/cb") == "attacker.example.net"
+    assert d("https://attacker.example.net:8443/cb") == "attacker.example.net:8443"
+    assert d("https://attacker.example.net:443/cb") == "attacker.example.net"
+    assert d("https://claude.ai@attacker.example.net/cb") == "attacker.example.net"  # defence in depth
+    assert d("https://\u0441laude.ai/cb") == "xn--laude-0ye.ai"  # Cyrillic es, not Latin c
+    assert d("http://[::1]:7777/cb") == "[::1]:7777"
+
+
+def test_cyrillic_homograph_shown_as_punycode_on_consent_page(provider):
+    uri = "https://\u0441laude.ai/cb"
+    client = _client()
+    cid = _register(client, uri).json()["client_id"]
+    _, challenge = _pkce()
+    page = client.get("/oauth/authorize", params={
+        "response_type": "code", "client_id": cid, "redirect_uri": uri,
+        "code_challenge": challenge, "code_challenge_method": "S256"})
+    assert "<b>xn--laude-0ye.ai</b>" in page.text
+
+
+def test_consent_page_escapes_destination_host():
+    """Registration refuses markup in a host; the renderer must still escape it."""
+    page = oauth_mod._render_consent(
+        client_id="c", redirect_uri='https://a<b>"c.example/cb', state="", code_challenge="x",
+        code_challenge_method="S256", resource="").body.decode()
+    assert "a&lt;b&gt;&quot;c.example" in page
+    assert "<b>a<b>" not in page and 'a<b>"c' not in page.split('class="dest"')[1].split("</p>")[0]
+
+
+def test_consent_page_stays_intact_with_very_long_host(provider):
+    host = ".".join(["a" * 60] * 4) + ".example"  # 252 chars, valid
+    uri = f"https://{host}/cb"
+    client = _client()
+    cid = _register(client, uri).json()["client_id"]
+    _, challenge = _pkce()
+    page = client.get("/oauth/authorize", params={
+        "response_type": "code", "client_id": cid, "redirect_uri": uri,
+        "code_challenge": challenge, "code_challenge_method": "S256"})
+    assert page.status_code == 200
+    assert f"<b>{host}</b>" in page.text
+    assert "overflow-wrap" in page.text and page.text.rstrip().endswith("</html>")
