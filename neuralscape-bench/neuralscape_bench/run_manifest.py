@@ -153,13 +153,16 @@ class ObservationKind(str, Enum):
 class BuildIdentity(_ManifestContract):
     """Immutable source and image identities used by a run.
 
-    ``None`` means the identity is unknown to the driver (for example a client
-    that talks to a stack it did not build).  It is never a placeholder digest.
+    Each key must be present.  An explicit ``null`` means the identity is
+    unknown to the driver (a client that talks to a stack it did not build) and
+    is accepted only for the workloads in ``UNKNOWN_IDENTITY_WORKLOADS``
+    (checked by ``RunManifest``); it is never a placeholder digest, and an
+    omitted key is always rejected.
     """
 
-    git_commit: str | None = Field(default=None, pattern=r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
-    image_digest: str | None = Field(default=None, pattern=r"^sha256:[0-9a-f]{64}$")
-    dependency_lock_sha256: str | None = Field(default=None, pattern=r"^sha256:[0-9a-f]{64}$")
+    git_commit: str | None = Field(pattern=r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
+    image_digest: str | None = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    dependency_lock_sha256: str | None = Field(pattern=r"^sha256:[0-9a-f]{64}$")
 
 
 class WorkloadIdentity(_ManifestContract):
@@ -378,6 +381,12 @@ def _open_validation_scope(value: Any, handler: Any) -> Any:
         _TIMESTAMP_PINS.reset(token)
 
 
+# Workloads whose driver does not own the stack it measures, so it may declare
+# an unknown build identity (explicit null) or an unknown cache condition.
+# Every other run kind must carry a full identity and a cold/warm declaration.
+UNKNOWN_IDENTITY_WORKLOADS = frozenset({"accuracy-battery"})
+
+
 class RunManifest(_ManifestContract):
     """A reproducible benchmark run envelope with explicit evidence state."""
 
@@ -432,6 +441,12 @@ class RunManifest(_ManifestContract):
 
     @model_validator(mode="after")
     def validate_run_evidence(self) -> Self:
+        if self.workload.workload_id not in UNKNOWN_IDENTITY_WORKLOADS:
+            if None in (self.build.git_commit, self.build.image_digest,
+                        self.build.dependency_lock_sha256):
+                raise ValueError("this run kind requires a fully known build identity")
+            if self.cache_condition is CacheCondition.UNKNOWN:
+                raise ValueError("this run kind requires a cold or warm cache condition")
         if not self.concurrency:
             raise ValueError("at least one concurrency setting is required")
         concurrency_scopes = [item.scope for item in self.concurrency]

@@ -36,9 +36,11 @@ def _data() -> SuiteData:
 def _judged(**extra) -> list[dict]:
     base = [
         {"qa_id": "q1", "qtype": "single-hop", "correct": True, "retrieval_hit": True,
-         "ask_ms": 120.5, "retrieval_ms": 30.0},
+         "ask_ms": 120.5, "retrieval_ms": 30.0,
+         "at": "2026-11-10T10:00:00+00:00"},
         {"qa_id": "q2", "qtype": "single-hop", "correct": False, "retrieval_hit": False,
-         "ask_ms": 99.0, "retrieval_ms": 25.0},
+         "ask_ms": 99.0, "retrieval_ms": 25.0,
+         "at": "2026-11-10T10:05:00+00:00"},
     ]
     return [{**r, **extra} for r in base]
 
@@ -86,7 +88,9 @@ def test_flag_writes_a_file_the_module_loader_accepts(env):
     manifest = validate_run_manifest_json(json.dumps(doc["run_manifest"]))
     assert isinstance(manifest, RunManifest)
     assert manifest.state is RunState.COMPLETED
-    assert manifest.started_at <= manifest.finished_at
+    # Derived from the recorded activity, not from the clock of this invocation.
+    assert manifest.started_at == datetime(2026, 11, 10, 10, 0, tzinfo=timezone.utc)
+    assert manifest.finished_at == datetime(2026, 11, 10, 10, 5, tzinfo=timezone.utc)
     assert {m.name for m in manifest.measurements} == {"answer-ask", "answer-retrieval-probe"}
     assert all(m.attempted_sample_count == m.included_sample_count == 2
                for m in manifest.measurements)
@@ -117,6 +121,7 @@ def test_unknown_values_stay_unknown_never_zero(env):
     (mem,) = manifest.resources
     assert mem.observation_kind is ObservationKind.UNKNOWN
     assert mem.observed_value is None and mem.unknown_reason
+    assert manifest.build.git_commit is None  # explicit null, named in battery.unknown
     assert battery["models"] == {"judge": None, "answer": None}
     assert battery["ingest"] is None  # nothing ingested: not "0 sessions, 0 s"
     assert battery["dataset"]["sampling"] == {"mode": "full", "n": None, "seed": None}
@@ -246,16 +251,158 @@ def test_failed_answers_are_failures_not_dropped(env):
     assert [(f.kind, f.count) for f in ask.failure_outcomes] == [("error", 1)]
 
 
-def test_a_run_with_no_timed_evidence_is_aborted_not_completed(env):
+def test_a_run_with_no_recorded_evidence_is_planned_with_unknown_times(env):
     from neuralscape_bench.accuracy.run_record import load_battery_manifest
     from neuralscape_bench.run_manifest import RunState
 
     out = env.tmp / "m.json"
     _report("--manifest", str(out))  # no judged records at all
     manifest, battery = load_battery_manifest(out)
+    assert manifest.state is RunState.PLANNED
+    assert manifest.started_at is None and manifest.finished_at is None
+    assert {"started_at", "finished_at"} <= set(battery["unknown"])
+    assert battery["coverage"]["complete"] is False
+
+
+def test_every_ask_failing_is_aborted_not_completed(env):
+    from neuralscape_bench.accuracy.run_record import load_battery_manifest
+    from neuralscape_bench.run_manifest import RunState
+
+    recs = _judged()
+    for r in recs:
+        r.pop("ask_ms"), r.pop("retrieval_ms")
+        r["ask_error"] = r["retrieval_error"] = "boom"
+    env.write_judged(recs)
+    out = env.tmp / "m.json"
+    _report("--manifest", str(out))
+    manifest, _ = load_battery_manifest(out)
+    assert sum(m.included_sample_count for m in manifest.measurements) == 0
     assert manifest.state is RunState.ABORTED
-    assert manifest.measurements == ()
-    assert battery["counts"]["records"] == 0
+
+
+def test_half_judged_run_is_not_complete(env):
+    from neuralscape_bench.accuracy.run_record import load_battery_manifest
+    from neuralscape_bench.run_manifest import RunState
+
+    env.write_judged(_judged()[:1])
+    out = env.tmp / "m.json"
+    _report("--manifest", str(out))
+    manifest, battery = load_battery_manifest(out)
+    assert manifest.state is RunState.ABORTED
+    assert battery["coverage"] == {"expected": 2, "observed": 1, "judged": 1, "complete": False}
+
+
+def test_foreign_and_duplicate_records_are_not_counted(env):
+    from neuralscape_bench.accuracy.run_record import load_battery_manifest
+
+    recs = _judged()
+    env.write_judged(recs + recs + [{**recs[0], "qa_id": "other", "qtype": "x"}])
+    out = env.tmp / "m.json"
+    _report("--manifest", str(out))
+    manifest, battery = load_battery_manifest(out)
+    assert battery["coverage"]["observed"] == 2 and battery["counts"]["records"] == 2
+    assert all(m.attempted_sample_count == 2 for m in manifest.measurements)
+    assert battery["coverage"]["complete"] is True
+
+
+def test_ingest_is_scoped_to_the_dataset_and_unrecorded_totals_are_unknown(env):
+    from neuralscape_bench.accuracy.run_record import load_battery_manifest
+
+    env.write_judged(_judged())
+    ing = IngestManifest.for_run("locomo", run_mod.manifest_label("http://localhost:8398", None))
+    ing.mark_session("c1", "s1", elapsed_s=4.0, est_tokens=10)
+    ing.mark_session("c1", "s2", elapsed_s=None, est_tokens=5)
+    ing.mark_session("other-conv", "z9", elapsed_s=99.0, est_tokens=999)
+    out = env.tmp / "m.json"
+    _report("--manifest", str(out))
+    manifest, battery = load_battery_manifest(out)
+    (m,) = [m for m in manifest.measurements if m.name == "ingest-session"]
+    assert m.attempted_sample_count == 2  # the foreign session is not ours
+    assert battery["ingest"]["sessions"] == 2
+    assert battery["ingest"]["ingest_wall_s"] is None  # one unrecorded: unknown, not 4.0
+    assert battery["ingest"]["est_tokens"] == 15
+
+
+def test_totals_keep_unrecorded_components_unknown(tmp_path):
+    m = IngestManifest(tmp_path / "i.json")
+    m.mark_session("c1", "s1", elapsed_s=1.0, est_tokens=None)
+    t = m.totals()
+    assert t["ingest_wall_s"] == 1.0 and t["est_tokens"] is None
+
+
+def test_timestamps_are_utc_aware(env):
+    from neuralscape_bench.accuracy.run_record import load_battery_manifest
+
+    env.write_judged(_judged())
+    out = env.tmp / "m.json"
+    _report("--manifest", str(out))
+    manifest, _ = load_battery_manifest(out)
+    assert manifest.started_at.utcoffset() == timezone.utc.utcoffset(datetime.now())
+
+
+def test_stray_commit_env_does_not_break_runs_without_the_flag(env, monkeypatch):
+    env.write_judged(_judged())
+    monkeypatch.setenv("BENCH_NS_COMMIT", "abc123")
+    assert _report() == 0
+    with pytest.raises(SystemExit):
+        _report("--manifest", str(env.tmp / "m.json"))
+
+
+def test_manifest_without_report_phase_exits_2(env, capsys):
+    with pytest.raises(SystemExit) as e:
+        run_mod.main(["--suite", "locomo", "--phase", "answer",
+                      "--manifest", str(env.tmp / "m.json")])
+    assert e.value.code == 2
+    assert "report" in capsys.readouterr().err
+
+
+def test_manifest_path_is_checked_before_any_phase_runs(env):
+    env.write_judged(_judged())
+    with pytest.raises(SystemExit) as e:
+        _report("--manifest", str(env.tmp))  # a directory
+    assert e.value.code == 2
+    existing = env.tmp / "m.json"
+    existing.write_text("keep")
+    with pytest.raises(SystemExit) as e:
+        _report("--manifest", str(existing))
+    assert e.value.code == 2 and existing.read_text() == "keep"
+    assert not list(env.results.glob("accuracy-locomo-*.json"))  # refused up front
+    assert _report("--manifest", str(existing), "--manifest-overwrite") == 0
+    assert existing.read_text() != "keep"
+
+
+def test_loader_reports_a_malformed_battery_clearly(env):
+    from neuralscape_bench.accuracy.run_record import load_battery_manifest
+
+    env.write_judged(_judged())
+    out = env.tmp / "m.json"
+    _report("--manifest", str(out))
+    good = json.loads(out.read_text())
+
+    broken = json.loads(json.dumps(good))
+    del broken["battery"]["models"]
+    out.write_text(json.dumps(broken))
+    with pytest.raises(ValueError, match="battery section is missing: models"):
+        load_battery_manifest(out)
+
+    liar = json.loads(json.dumps(good))
+    liar["battery"]["unknown"].remove("build.git_commit")  # null but not named
+    out.write_text(json.dumps(liar))
+    with pytest.raises(ValueError, match="does not match the null fields"):
+        load_battery_manifest(out)
+
+
+def test_omitted_build_keys_in_a_battery_file_are_rejected(env):
+    from neuralscape_bench.accuracy.run_record import load_battery_manifest
+
+    env.write_judged(_judged())
+    out = env.tmp / "m.json"
+    _report("--manifest", str(out))
+    doc = json.loads(out.read_text())
+    del doc["run_manifest"]["build"]["image_digest"]
+    out.write_text(json.dumps(doc))
+    with pytest.raises(Exception):
+        load_battery_manifest(out)
 
 
 def test_workload_hash_tracks_sampling_and_corpus():
@@ -270,13 +417,3 @@ def test_workload_hash_tracks_sampling_and_corpus():
             Session(session_id="s1", turns=(Turn(role="user", content="different"),)),))])
     assert a[1] != workload_hashes(other, sample=None, seed=1, options={})[1]
     assert a[0] == workload_hashes(other, sample=None, seed=1, options={})[0]
-
-
-def test_timestamps_are_utc_aware(env):
-    from neuralscape_bench.accuracy.run_record import load_battery_manifest
-
-    env.write_judged(_judged())
-    out = env.tmp / "m.json"
-    _report("--manifest", str(out))
-    manifest, _ = load_battery_manifest(out)
-    assert manifest.started_at.utcoffset() == timezone.utc.utcoffset(datetime.now())

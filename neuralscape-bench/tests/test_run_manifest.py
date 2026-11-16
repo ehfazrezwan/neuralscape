@@ -6523,28 +6523,65 @@ def test_a_self_iterating_inventory_over_the_bound_is_still_refused_after_one_it
     assert str(caught.value) == run_manifest_module.SNAPSHOT_BUDGET_MESSAGE and inventory.iter_calls == 1
 
 
-# ── an identity the driver does not know is unknown, not a placeholder ──
+# ── an identity the driver does not know is an explicit null, for declared workloads only ──
 
 
-def test_unknown_build_identity_and_cache_condition_round_trip():
-    from neuralscape_bench.run_manifest import serialize_run_manifest, validate_run_manifest_json
-
-    planned = RunManifest(
+def _unknown_build_manifest(workload_id: str, condition=CacheCondition.UNKNOWN,
+                            build=None) -> RunManifest:
+    return RunManifest(
         schema_version=VERSION,
         run_id="run-unknown",
         state=RunState.PLANNED,
-        build=BuildIdentity(schema_version=VERSION),
-        workload=workload_identity(),
-        cache_condition=CacheCondition.UNKNOWN,
+        build=build or BuildIdentity(schema_version=VERSION, git_commit=None,
+                                     image_digest=None, dependency_lock_sha256=None),
+        workload=WorkloadIdentity(schema_version=VERSION, workload_id=workload_id,
+                                  workload_sha256=SHA_B, corpus_sha256=SHA_C),
+        cache_condition=condition,
         concurrency=concurrency(),
         resources=(pending_memory(),),
     )
-    assert (planned.build.git_commit, planned.build.image_digest,
-            planned.build.dependency_lock_sha256) == (None, None, None)
+
+
+def test_explicit_null_build_identity_round_trips_for_the_battery_workload():
+    from neuralscape_bench.run_manifest import serialize_run_manifest, validate_run_manifest_json
+
+    planned = _unknown_build_manifest("accuracy-battery")
     payload = json.loads(serialize_run_manifest(planned))
     assert payload["build"] == {"schema_version": VERSION, "git_commit": None,
                                 "image_digest": None, "dependency_lock_sha256": None}
     assert validate_run_manifest_json(json.dumps(payload)) == planned
+
+
+@pytest.mark.parametrize("field", ["git_commit", "image_digest", "dependency_lock_sha256"])
+def test_omitted_build_identity_keys_are_rejected_for_every_kind(field):
+    from neuralscape_bench.run_manifest import serialize_run_manifest, validate_run_manifest_json
+
+    for manifest in (planned_manifest(), _unknown_build_manifest("accuracy-battery")):
+        payload = json.loads(serialize_run_manifest(manifest))
+        del payload["build"][field]
+        with pytest.raises(ValidationError):
+            validate_run_manifest_json(json.dumps(payload))
+    with pytest.raises(ValidationError):
+        BuildIdentity.model_validate({k: v for k, v in build_identity().model_dump().items()
+                                      if k != field})
+
+
+def test_null_build_identity_is_rejected_for_other_run_kinds():
+    with pytest.raises(ValidationError, match="fully known build identity"):
+        _unknown_build_manifest("service-baseline-v1")
+    partial = BuildIdentity(schema_version=VERSION, git_commit="d" * 40,
+                            image_digest=None, dependency_lock_sha256=SHA_B)
+    with pytest.raises(ValidationError, match="fully known build identity"):
+        _unknown_build_manifest("synthetic-read-v1", CacheCondition.WARM, partial)
+
+
+def test_unknown_cache_condition_is_rejected_for_other_run_kinds():
+    with pytest.raises(ValidationError, match="cold or warm"):
+        RunManifest(
+            schema_version=VERSION, run_id="r", state=RunState.PLANNED,
+            build=build_identity(), workload=workload_identity(),
+            cache_condition=CacheCondition.UNKNOWN, concurrency=concurrency(),
+            resources=(pending_memory(),))
 
 
 @pytest.mark.parametrize("field,value", [
@@ -6553,6 +6590,8 @@ def test_unknown_build_identity_and_cache_condition_round_trip():
     ("image_digest", ""),
     ("dependency_lock_sha256", "sha256:" + "a" * 63),
 ])
-def test_a_supplied_identity_is_still_validated_even_though_none_is_allowed(field, value):
+def test_a_supplied_identity_is_still_validated_even_though_null_is_allowed(field, value):
+    data = build_identity().model_dump()
+    data[field] = value
     with pytest.raises(ValidationError):
-        BuildIdentity(schema_version=VERSION, **{field: value})
+        BuildIdentity.model_validate(data)

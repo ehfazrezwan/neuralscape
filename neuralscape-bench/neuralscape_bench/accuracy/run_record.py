@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 from datetime import datetime, timezone
 from pathlib import Path
@@ -131,21 +132,62 @@ def build_measurements(judged: list[dict],
     return tuple(m for m in found if m is not None)
 
 
+def dataset_session_pairs(data: SuiteData) -> set[tuple[str, str]]:
+    return {(c.conv_id, s.session_id) for c in data.conversations for s in c.sessions}
+
+
+def scope_records(data: SuiteData, judged: list[dict]) -> list[dict]:
+    """Judged records that belong to this dataset/sample, one per ``(qa_id, qtype)``.
+
+    Foreign records (another sample, another suite sharing the file) and
+    re-appended duplicates are dropped; the first record wins, as in the
+    judge's own resume.
+    """
+    wanted = {(qa.qa_id, qa.qtype) for qa in data.qa_items}
+    seen: set[tuple] = set()
+    out = []
+    for r in judged:
+        key = (r.get("qa_id"), r.get("qtype"))
+        if key in wanted and key not in seen:
+            seen.add(key)
+            out.append(r)
+    return out
+
+
+def _stamps(records: list[dict]) -> list[datetime]:
+    out = []
+    for r in records:
+        try:
+            t = datetime.fromisoformat(r["at"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if t.tzinfo is not None:
+            out.append(t)
+    return out
+
+
 def build_battery_manifest(
     *, suite: str, display: str, phases: list[str], data: SuiteData, config: dict,
     judged: list[dict], ingest_metas: list[dict], ingest_totals: dict,
-    metrics: dict, concurrency: int, started_at: datetime, finished_at: datetime,
-    ns_commit: str | None = None, run_label: str | None = None,
+    metrics: dict, concurrency: int, ns_commit: str | None = None,
+    run_label: str | None = None, run_stamp: datetime | None = None,
 ) -> dict:
     """The envelope document (a plain dict) for one suite's run.
 
-    ``config`` is the same dict the suite result records (target, k,
-    reasoning_level, judge_model, sample, seed, suite_options).
+    ``judged`` must already be scoped with :func:`scope_records` and
+    ``ingest_metas`` to the dataset's sessions. ``config`` is the dict the suite
+    result records. ``started_at``/``finished_at`` come from the on-disk
+    evidence: earliest to latest recorded ingest/answer activity (the judge
+    does not stamp its records, so judge time is not included); with none, the
+    run is recorded as ``planned`` and both are unknown.
     """
     workload_sha, corpus_sha = workload_hashes(
         data, sample=config.get("sample"), seed=config.get("seed", 0),
         options=config.get("suite_options") or {})
-    stamp = finished_at.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    stamps = _stamps(judged) + _stamps(ingest_metas)
+    started_at, finished_at = (min(stamps), max(stamps)) if stamps else (None, None)
+    stamp = (finished_at or run_stamp or datetime.now(timezone.utc)).astimezone(
+        timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     run_id = f"accuracy-{suite}{'-' + run_label if run_label else ''}-{stamp}"
 
     unknown_resource = dict(
@@ -153,7 +195,8 @@ def build_battery_manifest(
         limit_kind=LimitKind.UNKNOWN)
     planned = RunManifest(
         schema_version=SCHEMA, run_id=run_id, state=RunState.PLANNED,
-        build=BuildIdentity(schema_version=SCHEMA, git_commit=parse_commit(ns_commit)),
+        build=BuildIdentity(schema_version=SCHEMA, git_commit=parse_commit(ns_commit),
+                            image_digest=None, dependency_lock_sha256=None),
         workload=WorkloadIdentity(schema_version=SCHEMA, workload_id=WORKLOAD_ID,
                                   workload_sha256=workload_sha, corpus_sha256=corpus_sha),
         cache_condition=CacheCondition.UNKNOWN,
@@ -162,18 +205,26 @@ def build_battery_manifest(
         resources=(ResourceReading(**unknown_resource, observation_kind=ObservationKind.PENDING),),
     )
     measurements = build_measurements(judged, ingest_metas)
-    manifest = finish_run(
-        planned,
-        # A run with no timed samples at all produced no evidence: ABORTED, not COMPLETED.
-        state=RunState.COMPLETED if measurements else RunState.ABORTED,
-        started_at=started_at, finished_at=finished_at,
-        resources=(ResourceReading(**unknown_resource, observation_kind=ObservationKind.UNKNOWN,
-                                   unknown_reason="not_collected_by_accuracy_battery"),),
-        measurements=measurements,
-    )
+    overall = (metrics or {}).get("overall") or {}
+    expected = len(data.qa_items)
+    complete = len(judged) == expected and overall.get("judged") == expected
+    included = sum(m.included_sample_count for m in measurements)
+    if started_at is None:
+        manifest = planned  # nothing recorded yet: a plan, with unknown timestamps
+    else:
+        manifest = finish_run(
+            planned,
+            # COMPLETED only for a fully judged workload with at least one valid timed
+            # sample; a partial or all-failed run is ABORTED, never "completed".
+            state=RunState.COMPLETED if included > 0 and complete else RunState.ABORTED,
+            started_at=started_at, finished_at=finished_at,
+            resources=(ResourceReading(**unknown_resource,
+                                       observation_kind=ObservationKind.UNKNOWN,
+                                       unknown_reason="not_collected_by_accuracy_battery"),),
+            measurements=measurements,
+        )
 
     judge_models = sorted({r["judge_model"] for r in judged if r.get("judge_model")})
-    overall = (metrics or {}).get("overall") or {}
     sample = config.get("sample")
     battery = {
         "suite": suite,
@@ -192,8 +243,10 @@ def build_battery_manifest(
             "answer": None,
         },
         "settings": {"k": config.get("k"), "reasoning_level": config.get("reasoning_level")},
+        "coverage": {"expected": expected, "observed": len(judged),
+                     "judged": overall.get("judged"), "complete": complete},
         "counts": {
-            "qa_items": len(data.qa_items),
+            "qa_items": expected,
             "records": len(judged),
             "judged": overall.get("judged"),
             "correct": overall.get("correct"),
@@ -201,18 +254,34 @@ def build_battery_manifest(
         "metrics": {"overall": overall or None,
                     "retrieval": {k: v for k, v in (metrics or {}).items()
                                   if k == "retrieval" or k.startswith("retrieval_recall_at_")} or None},
-        # Ingest wall time and token estimate exist only when sessions were ingested.
+        # Ingest totals exist only when sessions of this dataset were ingested.
         "ingest": ingest_totals if ingest_totals.get("sessions") else None,
     }
-    unknown = ["build.image_digest", "build.dependency_lock_sha256",
-               "cache_condition", "resources.memory", "models.answer"]
-    if manifest.build.git_commit is None:
-        unknown.append("build.git_commit")
-    if not judge_models:
-        unknown.append("models.judge")
-    battery["unknown"] = sorted(unknown)
+    battery["unknown"] = expected_unknown(manifest, battery)
     return {"kind": KIND, "run_manifest": json.loads(serialize_run_manifest(manifest)),
             "battery": battery}
+
+
+def expected_unknown(manifest: RunManifest, battery: dict) -> list[str]:
+    """Names of every null/unknown field of this document (sorted)."""
+    names = ["resources.memory"]  # the battery never collects stack memory
+    if manifest.build.git_commit is None:
+        names.append("build.git_commit")
+    if manifest.build.image_digest is None:
+        names.append("build.image_digest")
+    if manifest.build.dependency_lock_sha256 is None:
+        names.append("build.dependency_lock_sha256")
+    if manifest.cache_condition is CacheCondition.UNKNOWN:
+        names.append("cache_condition")
+    if manifest.started_at is None:
+        names.append("started_at")
+    if manifest.finished_at is None:
+        names.append("finished_at")
+    if battery["models"]["judge"] is None:
+        names.append("models.judge")
+    if battery["models"]["answer"] is None:
+        names.append("models.answer")
+    return sorted(names)
 
 
 def manifest_path_for(template: str, suite: str) -> Path:
@@ -220,7 +289,23 @@ def manifest_path_for(template: str, suite: str) -> Path:
     return Path(template.replace("{suite}", suite))
 
 
-def write_battery_manifest(path: Path, document: dict) -> Path:
+def check_manifest_target(path: Path, *, overwrite: bool) -> None:
+    """Fail before any paid phase if the manifest cannot be written (ValueError)."""
+    if path.is_dir():
+        raise ValueError(f"--manifest {path} is a directory")
+    if path.exists() and not overwrite:
+        raise ValueError(f"--manifest {path} already exists (pass --manifest-overwrite)")
+    anchor = path.parent
+    while not anchor.exists():
+        anchor = anchor.parent
+    if not anchor.is_dir() or not os.access(anchor, os.W_OK | os.X_OK):
+        raise ValueError(f"--manifest {path}: {anchor} is not a writable directory")
+    if path.exists() and not os.access(path, os.W_OK):
+        raise ValueError(f"--manifest {path} is not writable")
+
+
+def write_battery_manifest(path: Path, document: dict, *, overwrite: bool = False) -> Path:
+    check_manifest_target(path, overwrite=overwrite)
     # Round-trip through the strict loader first: never write a file the reader would reject.
     _validate_document(document)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -231,13 +316,33 @@ def write_battery_manifest(path: Path, document: dict) -> Path:
     return path
 
 
+_BATTERY_KEYS = ("suite", "display", "phases", "dataset", "models", "settings",
+                 "coverage", "counts", "metrics", "unknown")
+
+
 def _validate_document(document: dict) -> tuple[RunManifest, dict]:
     if not isinstance(document, dict) or document.get("kind") != KIND:
         raise ValueError(f"not an accuracy battery manifest (kind != {KIND!r})")
     battery = document.get("battery")
     if not isinstance(battery, dict):
         raise ValueError("battery section missing")
+    missing = [k for k in _BATTERY_KEYS if k not in battery]
+    if missing:
+        raise ValueError(f"battery section is missing: {', '.join(missing)}")
+    for section, keys in (("dataset", ("stats", "sampling")), ("models", ("judge", "answer")),
+                          ("coverage", ("expected", "observed", "complete"))):
+        if not isinstance(battery[section], dict) or any(k not in battery[section] for k in keys):
+            raise ValueError(f"battery.{section} is malformed (needs {', '.join(keys)})")
+    if not isinstance(battery["unknown"], list) or not isinstance(battery["phases"], list):
+        raise ValueError("battery.unknown and battery.phases must be lists")
     manifest = validate_run_manifest_json(json.dumps(document.get("run_manifest")))
+    if manifest.workload.workload_id != WORKLOAD_ID:
+        raise ValueError("run_manifest is not an accuracy battery workload")
+    # Every null/unknown field must be named, and nothing may be named that is known.
+    expected = expected_unknown(manifest, battery)
+    if sorted(battery["unknown"]) != expected:
+        raise ValueError(f"battery.unknown {sorted(battery['unknown'])} does not match "
+                         f"the null fields {expected}")
     return manifest, battery
 
 
@@ -274,5 +379,8 @@ def describe_manifest(manifest: RunManifest, battery: dict) -> list[str]:
         f"NS commit {show(manifest.build.git_commit)}, image {show(manifest.build.image_digest)}",
         f"judge model {', '.join(judge) if judge else 'unknown'}, answer model "
         f"{show(battery['models']['answer'])}",
+        f"coverage {battery['coverage']['observed']}/{battery['coverage']['expected']} "
+        f"questions, judged {show(battery['coverage']['judged'])}, "
+        f"{'complete' if battery['coverage']['complete'] else 'INCOMPLETE'}",
         f"unknown: {', '.join(battery['unknown']) or 'none'}",
     ]

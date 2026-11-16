@@ -61,19 +61,33 @@ class IngestManifest:
         self._data["stats"].update(kw)
         self.save()
 
-    def session_metas(self) -> list[dict]:
-        """Per-session ingest records (``elapsed_s`` is None when not recorded)."""
-        return [m for c in self._data["conversations"].values()
-                for m in c.get("sessions_meta", {}).values()]
+    def session_metas(self, pairs: set[tuple[str, str]] | None = None) -> list[dict]:
+        """Per-session ingest records (``elapsed_s`` is None when not recorded).
 
-    def totals(self) -> dict:
-        convs = self._data["conversations"]
-        metas = [m for c in convs.values() for m in c.get("sessions_meta", {}).values()]
+        ``pairs`` restricts to ``(conv_id, session_id)`` pairs, so a shared
+        state file never leaks sessions of other datasets or samples.
+        """
+        out = []
+        for conv_id, c in self._data["conversations"].items():
+            for session_id, meta in c.get("sessions_meta", {}).items():
+                if pairs is None or (conv_id, session_id) in pairs:
+                    out.append({**meta, "conv_id": conv_id, "session_id": session_id})
+        return out
+
+    def totals(self, pairs: set[tuple[str, str]] | None = None) -> dict:
+        """Ingest totals. A total with any unrecorded component is ``None``
+        (unknown), never a partial sum or zero."""
+        metas = self.session_metas(pairs)
+        done = {(cid, sid) for cid, c in self._data["conversations"].items()
+                for sid in c.get("sessions_done", [])
+                if pairs is None or (cid, sid) in pairs}
+        wall = [m.get("elapsed_s") for m in metas]
+        toks = [m.get("est_tokens") for m in metas]
         return {
-            "conversations": len(convs),
-            "sessions": sum(len(c.get("sessions_done", [])) for c in convs.values()),
-            "ingest_wall_s": round(sum(m.get("elapsed_s") or 0 for m in metas), 1),
-            "est_tokens": sum(m.get("est_tokens") or 0 for m in metas),
+            "conversations": len({cid for cid, _ in done}),
+            "sessions": len(done),
+            "ingest_wall_s": None if None in wall else round(sum(wall), 1),
+            "est_tokens": None if None in toks else sum(toks),
         }
 
     def save(self) -> None:

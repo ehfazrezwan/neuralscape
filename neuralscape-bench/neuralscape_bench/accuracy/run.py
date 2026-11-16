@@ -31,7 +31,6 @@ import asyncio
 import json
 import os
 import sys
-from datetime import datetime, timezone
 from pathlib import Path
 
 from neuralscape_bench.accuracy.costs import CostModel, estimate_suite_cost
@@ -41,8 +40,9 @@ from neuralscape_bench.accuracy.report import (
     RESULTS_DIR, build_suite_result, save_battery_markdown, save_suite_result,
 )
 from neuralscape_bench.accuracy.run_record import (
-    build_battery_manifest, describe_manifest, load_battery_manifest,
-    manifest_path_for, parse_commit, write_battery_manifest,
+    build_battery_manifest, check_manifest_target, dataset_session_pairs,
+    describe_manifest, load_battery_manifest, manifest_path_for, parse_commit,
+    scope_records, write_battery_manifest,
 )
 from neuralscape_bench.accuracy.suites import all_suite_names, get_suite
 
@@ -137,7 +137,6 @@ async def _run_paid(args, suite_name: str) -> Path | None:
     from neuralscape_bench.accuracy.ingest import ingest_suite
     from neuralscape_bench.accuracy.judge import GeminiJudge, judge_suite
 
-    started_at = datetime.now(timezone.utc)
     data = _load(args, suite_name)
     target_label = manifest_label(args.target, args.user_namespace)
     answers_path, judged_path = raw_paths(suite_name, args.run_label)
@@ -200,14 +199,22 @@ async def _run_paid(args, suite_name: str) -> Path | None:
         path = save_suite_result(result)
         _log(f"[report] {suite_name} → {path}")
         if args.manifest:
+            pairs = dataset_session_pairs(data)
+            scoped = scope_records(data, judged)
+            scoped_metrics = build_suite_result(
+                suite_name, scoped, config=result["config"], suite_stats=result["dataset"],
+                run_stats=result["run"])["metrics"]
             document = build_battery_manifest(
                 suite=suite_name, display=result["display"], phases=list(args.phase),
-                data=data, config=result["config"], judged=judged,
-                ingest_metas=manifest.session_metas(), ingest_totals=result["run"],
-                metrics=result["metrics"], concurrency=args.concurrency,
-                started_at=started_at, finished_at=datetime.now(timezone.utc),
+                data=data, config=result["config"],
+                judged=scoped,
+                ingest_metas=manifest.session_metas(pairs),
+                ingest_totals=manifest.totals(pairs),
+                metrics=scoped_metrics,
+                concurrency=args.concurrency,
                 ns_commit=args.ns_commit, run_label=args.run_label)
-            written = write_battery_manifest(manifest_path_for(args.manifest, suite_name), document)
+            written = write_battery_manifest(manifest_path_for(args.manifest, suite_name), document,
+                                             overwrite=args.manifest_overwrite)
             _log(f"[manifest] {suite_name} → {written}")
             return written
     return None
@@ -277,6 +284,8 @@ def main(argv: list[str] | None = None) -> int:
                          "and print it back in the battery report. '{suite}' in PATH "
                          "expands per suite (required for more than one suite). "
                          "Default: off, nothing is written.")
+    ap.add_argument("--manifest-overwrite", action="store_true",
+                    help="Allow --manifest to replace an existing file (default: refuse).")
     ap.add_argument("--ns-commit", default=os.environ.get("BENCH_NS_COMMIT"),
                     help="Full git commit of the stack under test, recorded in the "
                          "manifest. Default $BENCH_NS_COMMIT; unset = unknown.")
@@ -298,13 +307,22 @@ def main(argv: list[str] | None = None) -> int:
     if "all" in suites:
         suites = all_suite_names()
     args.phase = args.phase or ["fetch"]
-    try:
-        args.ns_commit = parse_commit(args.ns_commit)
-    except ValueError as e:
-        ap.error(f"--ns-commit: {e}")
-    if args.manifest and "report" in args.phase and len(suites) > 1 \
-            and "{suite}" not in args.manifest:
-        ap.error("--manifest needs '{suite}' in PATH when more than one suite runs")
+    if args.manifest:
+        if "report" not in args.phase:
+            ap.error("--manifest is written at the report phase; add --phase report")
+        try:
+            args.ns_commit = parse_commit(args.ns_commit)
+        except ValueError as e:
+            ap.error(f"--ns-commit / $BENCH_NS_COMMIT: {e}")
+        if len(suites) > 1 and "{suite}" not in args.manifest:
+            ap.error("--manifest needs '{suite}' in PATH when more than one suite runs")
+        if not args.dry_run:
+            for suite_name in suites:
+                try:
+                    check_manifest_target(manifest_path_for(args.manifest, suite_name),
+                                          overwrite=args.manifest_overwrite)
+                except ValueError as e:
+                    ap.error(str(e))
 
     estimates = []
     manifest_paths: list[Path] = []
