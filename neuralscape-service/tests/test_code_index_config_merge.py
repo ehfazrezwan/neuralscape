@@ -100,7 +100,7 @@ def _stored(r, project="p1"):
 
 def test_reindex_keeps_admin_set_fields_and_adds_the_new_system(fake):
     _store(fake, default_engine="code-native", code_systems=["code-native"])
-    assert worker._merge_index_into_project_config("p1", "code-native", "code--u--svc") is True
+    assert worker._merge_index_into_project_config("p1", "code-native", "code--u--svc") == (True, "")
     cfg = _stored(fake)
     assert cfg["fuse_code_into_recall"] is False  # admin's switch survives
     assert cfg["op_preference"] == {"locate": ["code-native"]}
@@ -141,7 +141,8 @@ def test_no_redis_means_no_write_and_a_warning(monkeypatch, caplog):
     index_store._mem_cfg["p1"] = {"project_id": "p1", "fuse_code_into_recall": False}
     index_store._mem_cfg_at["p1"] = 10**12
     with caplog.at_level("WARNING"):
-        assert worker._merge_index_into_project_config("p1", "code-native", "code--u--svc") is False
+        updated, reason = worker._merge_index_into_project_config("p1", "code-native", "code--u--svc")
+    assert updated is False and "Redis unavailable" in reason
     assert "Redis unavailable" in caplog.text
     assert index_store._mem_cfg["p1"] == {"project_id": "p1", "fuse_code_into_recall": False}  # untouched
     index_store._reset_for_tests()
@@ -150,7 +151,7 @@ def test_no_redis_means_no_write_and_a_warning(monkeypatch, caplog):
 def test_concurrent_edit_during_the_merge_is_retried_not_lost(fake):
     _store(fake)
     fake.conflicts_to_inject = 2
-    assert worker._merge_index_into_project_config("p1", "code-native", "code--u--svc") is True
+    assert worker._merge_index_into_project_config("p1", "code-native", "code--u--svc") == (True, "")
     assert fake.executes == 3  # two watch conflicts, then success
     assert _stored(fake)["fuse_code_into_recall"] is False
 
@@ -176,8 +177,50 @@ async def test_process_code_index_does_not_replace_the_config(fake, monkeypatch,
              "project_id": "p1", "user_id": "u"},
         )
     assert out["ok"] is True
+    assert out["config_updated"] is True and out["config_reason"] == ""
     cfg = _stored(fake)
     assert cfg["fuse_code_into_recall"] is False and cfg["op_preference"] == {"locate": ["code-native"]}
+
+
+@pytest.mark.asyncio
+async def test_process_code_index_reports_a_skipped_config_update(monkeypatch, tmp_path):
+    repo = tmp_path / "svc"
+    repo.mkdir()
+    monkeypatch.setattr(worker.settings, "code_repos", {"svc": str(repo)})
+    index_store._reset_for_tests()
+    monkeypatch.setattr(index_store, "_redis", lambda: None)
+    engine = MagicMock()
+    engine.index.return_value = IndexReport(files_indexed=1, symbols_indexed=1, edges_indexed=0,
+                                            incremental=False, duration_s=0.0)
+    with patch("adapters.code_graph.code_graph_available", return_value=True), patch(
+        "knowledge.code_dispatch.resolve_code_engine", return_value=engine
+    ), patch("worker._git_head_sha", return_value=None), patch("knowledge.index_store.record_index"), patch(
+        "extensions.dreaming.liveness.detect_inventory_diff_liveness",
+        return_value={"events": [], "flagged": 0, "summary": ""},
+    ):
+        out = await worker.process_code_index(
+            {"service": MagicMock()},
+            {"system": "code-native", "repo_source": str(repo), "code_space": "code--u--svc",
+             "project_id": "p1", "user_id": "u"},
+        )
+    assert out["ok"] is True  # the index itself succeeded
+    assert out["config_updated"] is False and "Redis unavailable" in out["config_reason"]
+
+
+def test_merge_refreshes_this_processs_caches(fake):
+    """Prime the index_store L1 and the router mirror with the OLD copy; after the merge the
+    same process must read the merged config (fails if the mirror refresh is removed)."""
+    _store(fake, default_engine="code-native", code_systems=["code-native"], code_space="code--u--old",
+           fuse_code_into_recall=True)
+    old = router.get_project_config("p1")  # primes router mirror + index_store L1
+    assert old.code_space == "code--u--old"
+    # The mirror/L1 are "fresh" for a long time, so only an explicit refresh can change them.
+    router._PROJECT_CONFIG_AT["p1"] = (10**12, router._PROJECT_CONFIGS["p1"])
+    index_store._mem_cfg_at["p1"] = 10**12
+    worker._merge_index_into_project_config("p1", "code-native", "code--u--new")
+    cfg = router.get_project_config("p1")
+    assert cfg.code_space == "code--u--new"
+    assert index_store._mem_cfg["p1"]["code_space"] == "code--u--new"
 
 
 # ── the code system hands the caller to engines that take it ─────────

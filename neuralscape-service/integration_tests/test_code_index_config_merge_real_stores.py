@@ -200,6 +200,14 @@ def test_index_keeps_admin_config_and_private_anchor_reaches_neighbors_for_its_a
             RecallRequest(query="parse_arguments", user_id=user_id, operation="neighbors", label="parse_arguments")
         ).content
 
+    def locate(user_id):
+        bound = code_dispatch.resolve_bound_code_system("code-native", code_space, user_id, code_repos)
+        return bound.recall(
+            RecallRequest(query="parse raw strings into Argument objects", user_id=user_id, operation="locate", limit=5)
+        )
+
+    located = locate(author)
+    assert any(h["fqn"] == TARGET_FQN for h in located.hits), located.content  # locate carries the caller too
     mine = neighbors(author)
     assert marker in mine, f"the author's own private anchor must be attached: {mine[:300]}"
     flags(dictator_user_ids=other)  # an admin reader may bind the author's space

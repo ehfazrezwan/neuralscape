@@ -47,7 +47,7 @@ async def test_process_code_index_indexes_records_and_runs_liveness(ctx):
          patch("knowledge.code_dispatch.resolve_code_engine", return_value=fake_engine), \
          patch("worker._git_head_sha", return_value="deadbeef"), \
          patch("knowledge.index_store.record_index") as rec, \
-         patch("worker._merge_index_into_project_config") as setcfg, \
+         patch("worker._merge_index_into_project_config", return_value=(True, "")) as setcfg, \
          patch("extensions.dreaming.liveness.detect_inventory_diff_liveness",
                return_value={"events": [], "flagged": 2, "summary": "2 flagged"}) as live:
         result = await worker.process_code_index(ctx, payload)
@@ -99,7 +99,7 @@ async def test_process_code_index_liveness_failure_is_nonfatal(ctx):
          patch("knowledge.code_dispatch.resolve_code_engine", return_value=fake_engine), \
          patch("worker._git_head_sha", return_value=None), \
          patch("knowledge.index_store.record_index"), \
-         patch("worker._merge_index_into_project_config"), \
+         patch("worker._merge_index_into_project_config", return_value=(True, "")), \
          patch("extensions.dreaming.liveness.detect_inventory_diff_liveness",
                side_effect=RuntimeError("boom")):
         result = await worker.process_code_index(ctx, payload)
