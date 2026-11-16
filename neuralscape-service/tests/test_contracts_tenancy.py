@@ -561,12 +561,14 @@ def test_valid_operation_progress_is_accepted() -> None:
 
 
 @pytest.mark.parametrize(
-    ("callback_kind", "expected_calls"),
-    [("stored-name", 2), ("tuple", 1)],
+    ("callback_kind", "expected_calls", "attacked_child_id"),
+    # A stored field name is reduced to plain text before use, so its own hooks never run.
+    [("stored-name", 0, ""), ("tuple", 1, "primary")],
 )
 def test_transition_freezes_current_before_previous_callbacks(
     callback_kind: str,
     expected_calls: int,
+    attacked_child_id: str,
 ) -> None:
     def invalid_current() -> tuple[TenantOperationState, ResourceManifestReference]:
         current = operation(observed_state="running")
@@ -606,7 +608,7 @@ def test_transition_freezes_current_before_previous_callbacks(
 
     assert callback_error.value.errors() == ordinary_error.value.errors()
     assert callback.calls == expected_calls
-    assert attacked_child.manifest_id == "primary"
+    assert attacked_child.manifest_id == attacked_child_id
 
     valid_current = operation(observed_state="running")
     valid_child = valid_current.resource_manifests[0]
@@ -1855,8 +1857,8 @@ def test_tenancy_boundaries_freeze_nested_models_before_stored_name_hooks(
     with pytest.raises(ValidationError):
         invoke(candidate)
 
-    assert name.calls > 0
-    assert child.manifest_id == "primary"
+    assert name.calls == 0  # the stored name is read as plain text: its hook never runs
+    assert child.manifest_id == ""
 
 
 @pytest.mark.parametrize("boundary", ["operation", "placement"])
@@ -1950,8 +1952,8 @@ def test_tenancy_boundaries_retain_invalid_root_before_name_hook_repair(
     with pytest.raises(ValidationError):
         invoke(candidate)
 
-    assert name.calls > 0
-    assert candidate.tenant_id == "tenant-a"
+    assert name.calls == 0
+    assert candidate.tenant_id == ""
 
 
 @pytest.mark.parametrize("boundary", ["operation", "placement"])
@@ -2020,8 +2022,8 @@ def test_tenancy_boundaries_freeze_later_model_edge_before_name_callback(
     with pytest.raises(ValidationError):
         invoke(candidate)
 
-    assert name.calls > 0
-    assert candidate.resource_manifests == ()
+    assert name.calls == 0
+    assert candidate.resource_manifests is original_edge
     assert original_edge[0].manifest_id == ""
 
 
@@ -2035,7 +2037,34 @@ def test_tenancy_boundaries_preserve_benign_string_subclass_names(
     result = invoke(candidate)
 
     assert result.tenant_id == "tenant-a"
-    assert name.calls > 0
+    assert name.calls == 0
+
+
+class _ImpersonatingName(str):
+    """Reads as undeclared text but hashes and compares equal to a declared field name."""
+
+    def __hash__(self) -> int:
+        return hash("schema_version")
+
+    def __eq__(self, other: object) -> bool:
+        return other == "schema_version" or str.__eq__(self, other)
+
+    def __ne__(self, other: object) -> bool:
+        return not self.__eq__(other)
+
+
+@pytest.mark.parametrize("boundary", ["operation", "placement"])
+def test_tenancy_boundaries_refuse_a_stored_name_that_impersonates_a_declared_field(
+    boundary: str,
+) -> None:
+    candidate, _child, invoke = _tenancy_nested_boundary_case(boundary)
+    native = PYDANTIC_DICT_DESCRIPTOR.__get__(candidate, BaseModel)
+    stored_value = dict.__getitem__(native, "schema_version")
+    dict.__delitem__(native, "schema_version")
+    dict.__setitem__(native, _ImpersonatingName("not_a_declared_field"), stored_value)
+
+    with pytest.raises(ValueError, match="undeclared fields"):
+        invoke(candidate)
 
 
 @pytest.mark.parametrize("boundary", ["operation", "placement"])
@@ -2090,14 +2119,14 @@ def test_public_first_lazy_child_is_captured_at_first_observation_not_entry(
     candidate, child, divergent, invoke = _public_only_invalid_manifest_case(
         boundary
     )
-    name = _install_repairing_stored_name(
-        candidate,
-        lambda: _set_native_field(child, "manifest_id", "primary"),
+    extras = RepairingEmptyExtraMapping(
+        lambda: _set_native_field(child, "manifest_id", "primary")
     )
+    PYDANTIC_EXTRA_DESCRIPTOR.__set__(candidate, extras)
 
     result = invoke(candidate)
 
-    assert name.calls > 0
+    assert extras.calls > 0
     assert divergent.calls == 1
     assert result.resource_manifests[0].manifest_id == "primary"
 
@@ -2109,15 +2138,15 @@ def test_public_first_lazy_child_is_frozen_once_first_observed(
     candidate, child, divergent, invoke = _public_only_invalid_manifest_case(
         boundary
     )
-    name = _install_repairing_stored_name(
-        child,
-        lambda: _set_native_field(child, "manifest_id", "primary"),
+    extras = RepairingEmptyExtraMapping(
+        lambda: _set_native_field(child, "manifest_id", "primary")
     )
+    PYDANTIC_EXTRA_DESCRIPTOR.__set__(child, extras)
 
     with pytest.raises(ValidationError):
         invoke(candidate)
 
-    assert name.calls > 0
+    assert extras.calls > 0
     assert divergent.calls == 1
     assert child.manifest_id == "primary"
 

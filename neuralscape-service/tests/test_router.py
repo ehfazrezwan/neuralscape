@@ -387,8 +387,20 @@ def test_default_base_only(mock_registry):
 # ── Router overhead test (<1 ms) ──
 
 
-def test_router_overhead(mock_registry):
-    """Router overhead must be <1 ms (budget from PLAN §4)."""
+def test_router_overhead(mock_registry, monkeypatch):
+    """Router overhead must be <1 ms (budget from PLAN §4).
+
+    Measures routing only: the project-config read (in-process mirror, then the
+    Redis-backed store on a miss or TTL expiry) is stubbed out. Otherwise one
+    store connect/probe landing inside the timed loop (a slow or wedged Redis,
+    a saturated runner) dominates the 100-call average. The store's own worst
+    case is bounded in tests/test_router_redis_bound.py.
+    """
+    from knowledge import index_store
+
+    monkeypatch.setattr(index_store, "load_project_config", lambda *a, **k: None)
+    monkeypatch.setattr(index_store, "refresh_project_config", lambda *a, **k: (False, None))
+    monkeypatch.setattr(index_store, "_redis", lambda: None)
     # Warm up (JIT, cache, etc.)
     for _ in range(10):
         resolve_systems(query="Who calls foo.bar()?", project_id="test")
