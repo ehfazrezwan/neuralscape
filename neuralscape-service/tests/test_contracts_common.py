@@ -690,7 +690,7 @@ def test_snapshot_contract_graph_preserves_published_model_prefix_order(
     assert receiver.model_validate(valid_snapshot, strict=True)
     assert valid_sequence.iteration_calls == 1
 
-    value, child, sequence, _ = _public_only_invalid_child_envelope(sequence_kind)
+    value, child, sequence, receiver = _public_only_invalid_child_envelope(sequence_kind)
     native = _BASE_MODEL_DICT_DESCRIPTOR.__get__(value, BaseModel)
     repair_calls = 0
 
@@ -711,10 +711,29 @@ def test_snapshot_contract_graph_preserves_published_model_prefix_order(
         stored_value = dict.pop(native, "trigger")
         dict.__setitem__(native, stored_name, stored_value)
         stored_name.armed = True
+        stored_name.hash_calls = 0  # setup hashed the name once
+        stored_name.equality_calls = 0
 
     snapshot = snapshot_contract_graph(value)
 
     assert sequence.iteration_calls == 1
+    if stored_name is not None:
+        # A ``str``-subclass stored name is read as its text: its hash and
+        # equality hooks never run, so they cannot repair the child before the
+        # sequence's public view is read.  The child is judged as the caller
+        # left it, exactly as in the ordinary control above.
+        assert stored_name.hash_calls == 0
+        assert stored_name.equality_calls == 0
+        assert repair_calls == 0
+        assert child.count == -1
+        assert snapshot["children"] == (
+            ({"count": -1},) if sequence_kind == "tuple" else [{"count": -1}]
+        )
+        with pytest.raises(ValidationError) as stored_error:
+            receiver.model_validate(snapshot, strict=True)
+        assert stored_error.value.errors()[0]["type"] == "greater_than_equal"
+        assert stored_error.value.errors()[0]["loc"] == ("children", 0, "count")
+        return
     assert repair_calls == 1
     assert child.count == 1
     expected_children = (
@@ -723,14 +742,8 @@ def test_snapshot_contract_graph_preserves_published_model_prefix_order(
         else [{"count": 1}]
     )
     assert snapshot["children"] == expected_children
-    if extras is not None:
-        assert extras.item_reads == 1
-    elif earlier_callback == "stored-hash":
-        assert stored_name is not None
-        assert stored_name.hash_calls > 0
-    else:
-        assert stored_name is not None
-        assert stored_name.equality_calls > 0
+    assert extras is not None
+    assert extras.item_reads == 1
     assert receiver.model_validate(snapshot, strict=True)
 
 
