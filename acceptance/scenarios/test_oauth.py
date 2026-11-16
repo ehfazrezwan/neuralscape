@@ -26,7 +26,7 @@ from urllib.parse import parse_qs, urlparse
 
 import pytest
 
-from nsaccept import expect_check_fails, negative_control, profiles, proves
+from nsaccept import expect_check_fails, negative_control, precondition, profiles, proves
 from nsaccept.client import NSClient
 from nsaccept.helpers import list_rows
 from nsaccept.mcp import MCPClient
@@ -194,6 +194,7 @@ def test_discovery_metadata_names_this_server_as_issuer(ctx, anon):
 @negative_control
 def test_metadata_check_fails_for_another_issuer_and_missing_pkce(ctx, anon):
     meta = anon.get("/.well-known/oauth-authorization-server").json()
+    precondition(check_as_metadata, meta, public_url(ctx), what="the served metadata names this server")
     expect_check_fails(check_as_metadata, meta, "https://elsewhere.example")
     expect_check_fails(check_as_metadata, {**meta, "code_challenge_methods_supported": ["plain"]}, public_url(ctx))
 
@@ -218,7 +219,9 @@ def test_the_consent_page_offers_the_token_login_and_validates_the_request(ctx, 
     assert page.status_code == 200 and "text/html" in page.headers["content-type"], f"consent page: {page.status_code} {page.headers.get('content-type')}"
     for needle in ('action="/oauth/authorize"', 'name="token"', f'value="{html.escape(client_id)}"', 'name="code_challenge"', "Connect Neuralscape"):
         assert needle in page.text, f"consent page lacks {needle!r}"
-    assert "provider-btn" not in page.text, "token mode shows a provider button"
+    # the stylesheet always defines .provider-btn, so look for an ELEMENT using it, or a link to a provider
+    assert not re.search(r"""<(a|button)\b[^>]*class=["'][^"']*\bprovider-btn\b""", page.text), "token mode shows a provider button element"
+    assert "accounts.google.com/o/oauth2" not in page.text and "ns-google-btn" not in page.text, "token mode links to an identity provider"
     bad_cases = {
         "response_type": {**authorize_url_params(client_id, challenge, "s"), "response_type": "token"},
         "unknown client": {**authorize_url_params("not-a-client", challenge, "s")},
@@ -295,15 +298,16 @@ def test_an_authorization_code_redeems_once(login: Login):
 @proves("auth.oauth-server")
 def test_the_access_token_is_a_bearer_for_rest_and_mcp_and_identifies_the_user(ctx, a, login: Login):
     lg = _ok(login)
-    check_bearer_identifies(ctx.base_url, lg.tokens["access_token"], ctx.user_a, a, f"zq-{ctx.run_id}-oauth")
+    check_bearer_identifies(ctx.base_url, lg.tokens["access_token"], ctx.user_a, a, f"zq-{ctx.run_id}-bearerlogin")
     check_mcp_accepts(ctx.base_url, lg.tokens["access_token"])
 
 
 @profiles("flags-on")
 @proves("auth.oauth-server")
 @negative_control
-def test_bearer_check_fails_for_a_token_signed_with_the_wrong_secret(ctx, a):
-    expect_check_fails(check_bearer_identifies, ctx.base_url, ctx.bad_token, ctx.user_a, a, f"zq-{ctx.run_id}-oauth0")
+def test_bearer_check_fails_for_a_token_signed_with_the_wrong_secret(ctx, a, login: Login):
+    precondition(check_bearer_identifies, ctx.base_url, _ok(login).tokens["access_token"], ctx.user_a, a, f"zq-{ctx.run_id}-bearerpre", what="a real access token identifies A")
+    expect_check_fails(check_bearer_identifies, ctx.base_url, ctx.bad_token, ctx.user_a, a, f"zq-{ctx.run_id}-bearerwrong")
 
 
 @profiles("flags-on")
@@ -312,7 +316,7 @@ def test_a_refresh_token_yields_a_working_access_token_for_the_same_user(ctx, a,
     lg = _ok(login)
     new = lg.refreshed
     assert new["access_token"] and new["access_token"] != lg.tokens["access_token"], "refresh returned the same access token"
-    check_bearer_identifies(ctx.base_url, new["access_token"], ctx.user_a, a, f"zq-{ctx.run_id}-oauth2")
+    check_bearer_identifies(ctx.base_url, new["access_token"], ctx.user_a, a, f"zq-{ctx.run_id}-bearerrefreshed")
 
 
 @profiles("flags-on")
@@ -330,7 +334,8 @@ def test_a_refresh_token_is_consumed_when_it_rotates(anon, login: Login):
 @profiles("flags-on")
 @proves("auth.oauth-server")
 @negative_control
-def test_refused_check_fails_for_a_successful_redemption(ctx, anon):
+def test_refused_check_fails_for_a_successful_redemption(ctx, anon, login: Login):
+    precondition(check_refused, _ok(login).replay_code, "a replayed code", what="a replayed code is refused")
     client_id, verifier, _, code = get_code(anon, ctx.token_a)
     expect_check_fails(check_refused, exchange(anon, client_id, verifier, code), "a good redemption")
 
@@ -383,13 +388,12 @@ def test_a_pasted_token_still_logs_in_under_the_google_provider(ctx, anon):
 @proves("auth.consent-page")
 @negative_control
 def test_provider_button_check_fails_for_the_token_consent_page(anon):
+    def check(page: str):
+        assert "accounts.google.com/o/oauth2" in page or "ns-google-btn" in page, "no provider login control"
+
+    precondition(lambda: check(consent_with_provider(anon)), what="this profile's consent page shows its provider control")
     # the discovery document is not a consent page and has no provider button
-    page = anon.get("/.well-known/oauth-authorization-server").text
-
-    def check():
-        assert "accounts.google.com" in page or "ns-google-btn" in page, "no provider login control"
-
-    expect_check_fails(check)
+    expect_check_fails(check, anon.get("/.well-known/oauth-authorization-server").text)
 
 
 @profiles("oauth-supabase")
@@ -419,3 +423,20 @@ def test_supabase_callback_refuses_a_login_without_a_valid_signed_state(anon):
 @proves("auth.oauth-server")
 def test_a_pasted_token_still_logs_in_under_the_supabase_provider(ctx, anon):
     get_code(anon, ctx.token_a)
+
+
+@profiles("oauth-google", "oauth-supabase")
+@proves("auth.consent-page")
+def test_the_authorize_response_binds_the_login_to_the_browser_that_started_it(anon):
+    """EXPECTED RED UNTIL PR #536 merges (login-state binding; the expected-red marker is not on dev yet, so
+    the assertion is plain). GET /oauth/authorize must set the login-binding cookie: HttpOnly, SameSite=Lax,
+    named ns_login_bind (plain http) or __Host-ns_login_bind (https public URL), so a login state built by
+    someone else cannot be completed in a victim's browser."""
+    client_id = register(anon)
+    _, challenge = pkce()
+    r = anon.get("/oauth/authorize", params=authorize_url_params(client_id, challenge, "st-bind"))
+    assert r.status_code == 200, f"GET /oauth/authorize -> {r.status_code}"
+    cookies = [c for c in r.headers.get_list("set-cookie") if "ns_login_bind=" in c]
+    assert len(cookies) == 1, f"the authorize response sets {len(cookies)} login-binding cookies (want 1): {r.headers.get_list('set-cookie')}"
+    low = cookies[0].lower()
+    assert "httponly" in low and "samesite=lax" in low, f"binding cookie attributes: {cookies[0].split('=')[0]}; {low.split(';', 1)[1] if ';' in low else ''}"
