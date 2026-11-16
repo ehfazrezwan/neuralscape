@@ -62,15 +62,53 @@ def test_ingest_text_workspace_is_recalled_only_when_that_workspace_is_asked_for
     ws = "ref-nsit-harbour"
     headers = {"Authorization": f"Bearer {issue_user_token(uid, SECRET, 3600)}"}
 
-    async def ingest():
+    class PerCallPool:
+        """TestClient serves each request on its own anyio portal loop, and an arq/redis pool is
+        bound to the loop that created it. So the app under test gets a pool that opens a
+        short-lived connection on whichever loop calls it (same wiring as
+        test_extension_route_identity_redis.py); the worker and status poll below use a real
+        TaskManager made on their own loop."""
+
+        def pipeline(self, *args, **kwargs):
+            import contextlib
+
+            from arq.connections import create_pool
+
+            @contextlib.asynccontextmanager
+            async def scope():
+                pool = await create_pool(parse_redis_settings(), default_queue_name=queue)
+                try:
+                    async with pool.pipeline(*args, **kwargs) as pipe:
+                        yield pipe
+                finally:
+                    await pool.aclose()
+
+            return scope()
+
+        def __getattr__(self, name):
+            async def call(*args, **kwargs):
+                from arq.connections import create_pool
+
+                pool = await create_pool(parse_redis_settings(), default_queue_name=queue)
+                try:
+                    return await getattr(pool, name)(*args, **kwargs)
+                finally:
+                    await pool.aclose()
+
+            return call
+
+    app_tm = TaskManager()
+    app_tm.pool = PerCallPool()
+    main._task_manager = app_tm
+    main._service = service
+    client = TestClient(main.app)
+    resp = client.post("/v1/ingest/text", json={"content": text, "workspace": ws}, headers=headers)
+    assert resp.status_code == 202, resp.text
+    task_id = resp.json()["task_id"]
+
+    async def drain():
         tm = TaskManager()
         await tm.connect()
-        main._task_manager = tm
-        main._service = service
-        client = TestClient(main.app)
-        resp = client.post("/v1/ingest/text", json={"content": text, "workspace": ws}, headers=headers)
-        assert resp.status_code == 202, resp.text
-        task_id = resp.json()["task_id"]
         try:
             w = Worker(
                 functions=[worker.process_ingest_document],
@@ -85,7 +123,7 @@ def test_ingest_text_workspace_is_recalled_only_when_that_workspace_is_asked_for
                 await w.main()
             finally:
                 await w.close()
-            return client, await tm.get_status(task_id)
+            return await tm.get_status(task_id)
         finally:
             leftovers = [f"arq:result:{task_id}", queue, ingest_queue, graph_queue]
             for jid in await tm.pool.zrange(graph_queue, 0, -1):
@@ -93,7 +131,7 @@ def test_ingest_text_workspace_is_recalled_only_when_that_workspace_is_asked_for
             await tm.pool.delete(*leftovers)
             await tm.pool.aclose()
 
-    client, status = asyncio.run(ingest())
+    status = asyncio.run(drain())
     assert status["status"] == "completed", status
     assert status["result"]["passages"] >= 1
 
