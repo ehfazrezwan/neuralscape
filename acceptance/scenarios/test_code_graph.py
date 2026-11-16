@@ -264,11 +264,14 @@ def test_recall_fuses_a_code_hit_with_memories_when_the_project_is_configured_fo
         # the project's own switch: off -> plain memory recall, on -> fused again
         off = mcp_dictator.call_tool("set_project_knowledge_config", {"project_id": n.project, "code_systems": [SYSTEM], "fuse_code_into_recall": False, "default_engine": SYSTEM})
         assert "error" not in json.loads(MCPClient.result_text(off)), f"dictator could not switch fusion off: {MCPClient.result_text(off)[:160]}"
+        edited = a.get(f"/v1/projects/{n.project}/knowledge-config").json()  # the edit must not erase what the index recorded
+        assert edited["code_space"] == n.code_space and edited["fuse_code_into_recall"] is False, f"config after the edit: {edited}"
         plain = fused_recall(mcp_a, n.project, query)
         assert not (isinstance(plain, dict) and plain.get("fused")), "recall still fused with fuse_code_into_recall=false"
     finally:
         mcp_dictator.call_tool("set_project_knowledge_config", {"project_id": n.project, "code_systems": [SYSTEM], "fuse_code_into_recall": True, "default_engine": SYSTEM})
     eventually(fused, timeout=60, interval=3, what="fusion back on")
+    assert a.get(f"/v1/projects/{n.project}/knowledge-config").json()["code_space"] == n.code_space, "code_space lost after the config edits"
 
 
 @proves("read.recall-code-fusion", "knowledge.fusion")

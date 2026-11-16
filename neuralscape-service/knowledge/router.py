@@ -30,6 +30,7 @@ the latency floor and keeps D/E separable.
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 from dataclasses import dataclass, field
@@ -122,6 +123,67 @@ def set_project_config(config: ProjectKnowledgeConfig) -> None:
             "op_preference": config.op_preference,
         },
     )
+
+
+_MERGEABLE_FIELDS = frozenset(
+    {"code_systems", "fuse_code_into_recall", "default_engine", "code_space", "op_preference"}
+)
+# Fields that cannot be cleared to None (None means "caller did not supply it").
+_NON_NULLABLE_FIELDS = frozenset({"code_systems", "fuse_code_into_recall"})
+
+
+def merge_project_config(project_id: str, **updates) -> ProjectKnowledgeConfig:
+    """Apply ``updates`` onto the project's stored config and persist the result.
+
+    Only the fields named in ``updates`` change; every other stored field
+    (notably ``code_space``, set by indexing, and ``op_preference``) is kept, so
+    an edit through REST/MCP cannot silently drop what indexing recorded. With no
+    stored config the defaults apply. ``code_systems`` and
+    ``fuse_code_into_recall`` given as None are treated as not supplied;
+    ``default_engine``, ``code_space`` and ``op_preference`` may be set to None
+    to clear them. Reads Redis directly (bypassing the store's 30s in-process
+    cache) so a config a worker wrote moments ago is not overwritten with a stale copy.
+    """
+    unknown = set(updates) - _MERGEABLE_FIELDS
+    if unknown:
+        raise ValueError(f"unknown project knowledge config field(s): {sorted(unknown)}")
+    from knowledge import index_store
+
+    raw = None
+    client = index_store._redis()
+    if client is not None:
+        try:
+            blob = client.get(index_store._CFG_PREFIX + project_id)
+            raw = json.loads(blob) if blob else None
+        except Exception:  # noqa: BLE001 — fall back to the cached read below
+            raw = None
+    if raw is None:
+        raw = index_store.load_project_config(project_id)
+    if raw:
+        current = ProjectKnowledgeConfig(
+            project_id=project_id,
+            code_systems=list(raw.get("code_systems") or []),
+            fuse_code_into_recall=bool(raw.get("fuse_code_into_recall", True)),
+            default_engine=raw.get("default_engine"),
+            code_space=raw.get("code_space"),
+            op_preference=raw.get("op_preference"),
+        )
+    else:
+        current = _PROJECT_CONFIGS.get(project_id) or ProjectKnowledgeConfig(project_id=project_id)
+    merged = ProjectKnowledgeConfig(
+        project_id=project_id,
+        code_systems=list(current.code_systems or []),
+        fuse_code_into_recall=current.fuse_code_into_recall,
+        default_engine=current.default_engine,
+        code_space=current.code_space,
+        op_preference=current.op_preference,
+    )
+    for key, value in updates.items():
+        if value is None and key in _NON_NULLABLE_FIELDS:
+            continue
+        setattr(merged, key, list(value) if key == "code_systems" else value)
+    set_project_config(merged)
+    return merged
 
 
 # ── Query-shape coding-signal gate (layer 3) ──

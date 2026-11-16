@@ -3428,7 +3428,7 @@ class ProjectKnowledgeConfigRequest(BaseModel):
 
     project_id: str
     code_systems: list[str] | None = None
-    fuse_code_into_recall: bool = True  # DEFAULT TRUE per decision #3
+    fuse_code_into_recall: bool | None = None  # unset keeps the stored value (default TRUE)
     default_engine: str | None = None
 
 
@@ -3439,6 +3439,8 @@ class ProjectKnowledgeConfigResponse(BaseModel):
     code_systems: list[str]
     fuse_code_into_recall: bool
     default_engine: str | None
+    code_space: str | None = None  # set by indexing; read-only here
+    op_preference: dict[str, list[str]] | None = None
 
 
 @v1_router.get("/projects/{project_id}/knowledge-config", response_model=ProjectKnowledgeConfigResponse)
@@ -3460,6 +3462,8 @@ async def v1_get_project_knowledge_config(project_id: str):
         code_systems=config.code_systems,
         fuse_code_into_recall=config.fuse_code_into_recall,
         default_engine=config.default_engine,
+        code_space=config.code_space,
+        op_preference=config.op_preference,
     )
 
 
@@ -3478,20 +3482,18 @@ async def v1_set_project_knowledge_config(
             status_code=403,
             detail=f"User {user_id!r} is not authorized to set project knowledge config.",
         )
-    from knowledge.router import ProjectKnowledgeConfig, set_project_config
+    from knowledge.router import merge_project_config
 
-    config = ProjectKnowledgeConfig(
-        project_id=project_id,
-        code_systems=req.code_systems or [],
-        fuse_code_into_recall=req.fuse_code_into_recall,
-        default_engine=req.default_engine,
-    )
-    set_project_config(config)
+    # Only the fields the caller sent change; code_space/op_preference survive.
+    sent = req.model_dump(exclude_unset=True, exclude={"project_id"})
+    config = merge_project_config(project_id, **sent)
     return ProjectKnowledgeConfigResponse(
         project_id=config.project_id,
         code_systems=config.code_systems,
         fuse_code_into_recall=config.fuse_code_into_recall,
         default_engine=config.default_engine,
+        code_space=config.code_space,
+        op_preference=config.op_preference,
     )
 
 
