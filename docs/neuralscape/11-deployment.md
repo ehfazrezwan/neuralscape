@@ -74,7 +74,7 @@ The compose workers override the command: `["arq", "worker.WorkerSettings"]`, `[
 
 ## Configuration
 
-All settings live in `neuralscape-service/config.py` as a Pydantic `BaseSettings` class loading `.env`. The tables below list the long-standing core settings only; `config.py` is the source of truth, and it has many more (feature flags, queues, auth, ingest, code-intel). `Settings.validate_required()` in `config.py` is called once at startup from `main.py` and aborts boot if any of the four required vars are missing.
+All settings live in `neuralscape-service/config.py` as a Pydantic `BaseSettings` class loading `.env`. The tables below list the long-standing core settings only; `config.py` is the source of truth, and it has many more (feature flags, queues, auth, ingest, code-intel). `Settings.validate_required()` in `config.py` is called once at startup from `main.py` and aborts boot if any of the four required vars below is missing. It also aborts on a missing auth configuration, on missing LLM-gateway settings when the gateway is enabled, and on a missing connector vault key when connectors are enabled; read the method for the full list.
 
 ### Required (validated at boot)
 
