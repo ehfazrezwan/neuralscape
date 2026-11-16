@@ -152,6 +152,12 @@ async def lifespan(app: FastAPI):
     # Configure asyncio.to_thread executor when TO_THREAD_MAX_WORKERS>0
     _configure_to_thread_executor(asyncio.get_running_loop())
 
+    # Load the Redis token-revocation set in the background (short retry
+    # backoff), so a start where Redis is up never shows the cold-start 503.
+    from tokens import warm_revocations
+
+    revocation_warm_task = asyncio.create_task(warm_revocations())
+
     # Initialize the service (this also initializes mem0 + Graphiti)
     _service._get_memory()
     # Action policy: build the enforcer from settings (a no-op unless enabled).  In
@@ -187,6 +193,8 @@ async def lifespan(app: FastAPI):
         await mcp_task_manager.close()
     else:
         yield
+
+    revocation_warm_task.cancel()
 
     # Shutdown extensions with timeout to prevent hanging on misbehaving extensions
     try:
@@ -372,6 +380,13 @@ async def health():
             checks["redis"] = "not_connected"
     except Exception:
         checks["redis"] = "unreachable"
+
+    # Token revocation state (Redis denylist snapshot): reported only when in use.
+    from tokens import revocation_state
+
+    _revocation = revocation_state()
+    if _revocation != "not_configured":
+        checks["revocation"] = _revocation
 
     # Check vector store (Qdrant via mem0): a real, bounded round trip, off the event loop.
     try:
