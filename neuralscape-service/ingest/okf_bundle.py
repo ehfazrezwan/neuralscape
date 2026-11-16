@@ -45,15 +45,6 @@ _SECRET_RE = re.compile(
 _BEARER_RE = re.compile(r"(?i)\bBearer\s+\S+")
 
 
-def safe_error(exc: BaseException, limit: int = 200) -> str:
-    """``ClassName: message`` with URLs and credential-looking values removed, bounded.
-
-    Failure reports travel to API clients (task status), so a backend error that
-    embeds a store URL with a password or a bearer token must not leak it.
-    """
-    return f"{type(exc).__name__}: {_scrub(str(exc), limit)}"
-
-
 def _scrub(text: str, limit: int = 200) -> str:
     text = _BEARER_RE.sub("Bearer <redacted>", text)
     text = _SECRET_RE.sub(lambda m: f"{m.group(1)}{m.group(2)}<redacted>", text)
@@ -385,7 +376,7 @@ def ingest_okf_bundle(
     ``completed``, ``partial`` or ``failed``.
     """
     from ingest.chunking_strategies import OkfFrontmatterStrategy
-    from ingest.pipeline import IngestDoc, ingest_document
+    from ingest.pipeline import IngestDoc, ingest_document, sanitized_error
 
     bundle_name = (
         Path(bundle_uri.rstrip("/")).stem or "okf-bundle"
@@ -435,8 +426,8 @@ def ingest_okf_bundle(
             summary["failed"] += 1
             summary["failed_concepts"].append({
                 "concept_id": concept.concept_id,
-                # class + a bounded message: enough to act on, never a payload dump
-                "error": safe_error(exc),
+                # class + fixed message only; raw text is in the server log above
+                "error": sanitized_error(exc, "concept"),
             })
             continue
         # ingest_document tolerates per-chunk store errors (and logs them); it
@@ -449,7 +440,7 @@ def ingest_okf_bundle(
             summary["failed_concepts"].append({
                 "concept_id": concept.concept_id,
                 "error": _scrub(store_errors[0]),
-                "stores_failed": len(store_errors),
+                "stores_failed": result.get("stores_failed", len(store_errors)),
                 "stores_succeeded": result.get("stores_succeeded", 0),
             })
         else:

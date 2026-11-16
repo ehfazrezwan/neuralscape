@@ -238,7 +238,7 @@ class TestBundleImportReportsFailures:
         assert out["concepts"] == 2 and out["failed"] == 1
         (failure,) = out["failed_concepts"]
         assert failure["concept_id"] == "b"
-        assert failure["error"].startswith("RuntimeError: embedding backend unavailable")
+        assert failure["error"] == "RuntimeError: concept ingest failed"  # class + fixed text, never the message
 
     def test_swallowed_store_failures_on_the_real_ingest_path_are_reported(self):
         """Real ingest_document (not mocked): store_raw raising is swallowed per
@@ -300,7 +300,7 @@ class TestBundleImportReportsFailures:
         out = _run({**FILES, "d.md": "---\ntype: Topic\ntitle: Empty\n---\n\n"})
         assert out["status"] == "completed" and out["failed"] == 0
 
-    def test_urls_and_credentials_are_scrubbed_from_the_failure_report(self, monkeypatch):
+    def test_failure_report_never_carries_exception_text(self, monkeypatch):
         import ingest.pipeline as pipeline
 
         def boom(s, d):
@@ -311,15 +311,15 @@ class TestBundleImportReportsFailures:
 
         monkeypatch.setattr(pipeline, "ingest_document", boom)
         err = _run()["failed_concepts"][0]["error"]
-        for leaked in ("hunter2", "qdrant.internal", "abc.def.ghi", "sk-12345", "p4ss"):
+        for leaked in ("hunter2", "qdrant.internal", "abc.def.ghi", "sk-12345", "p4ss", "http"):
             assert leaked not in err, err
-        assert err.startswith("RuntimeError:") and "<url>" in err
+        assert err == "RuntimeError: concept ingest failed"
 
     def test_error_text_is_bounded(self, monkeypatch):
         import ingest.pipeline as pipeline
 
         monkeypatch.setattr(pipeline, "ingest_document", lambda s, d: (_ for _ in ()).throw(RuntimeError("x" * 5000)))
-        assert len(_run()["failed_concepts"][0]["error"]) < 260
+        assert len(_run()["failed_concepts"][0]["error"]) < 130
 
 
 def _zip(files) -> str:
