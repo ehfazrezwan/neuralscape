@@ -1,0 +1,220 @@
+"""A queued graph job enriches the memory's CURRENT state, not the state it was enqueued with.
+
+Graph enrichment runs minutes after the write. Whatever the owner did meanwhile
+(narrow shared -> private, move project, rewrite the text) must win over the
+values frozen in the job: publishing the queued ones can put a memory into a
+shared graph group its owner has since withdrawn it from.
+"""
+
+import asyncio
+
+import pytest
+from types import SimpleNamespace
+
+from worker import process_graph_enrichment
+
+
+class Service:
+    def __init__(self, **row):
+        self.row = SimpleNamespace(id="m1", occurred_at=None, **row) if row is not None else None
+        self.enrich_calls: list[dict] = []
+
+    def get_memory(self, memory_id):
+        return self.row
+
+    def enrich_graph(self, **kwargs):
+        self.enrich_calls.append(kwargs)
+        return True
+
+
+def _run(service, *, content="the text", visibility="shared", project_id=None):
+    return asyncio.run(process_graph_enrichment(
+        {"service": service}, "m1", content, "alice", project_id, visibility,
+    ))
+
+
+def test_narrowed_to_private_while_queued_publishes_private():
+    svc = Service(visibility="private", project_id=None, memory="the text", workspace=None)
+    out = _run(svc, visibility="shared")
+    assert out["enriched"] is True
+    assert svc.enrich_calls[0]["visibility"] == "private"
+
+
+def test_widened_while_queued_publishes_the_current_wider_visibility():
+    svc = Service(visibility="shared", project_id=None, memory="the text", workspace=None)
+    _run(svc, visibility="private")
+    assert svc.enrich_calls[0]["visibility"] == "shared"
+
+
+def test_project_moved_while_queued_uses_the_current_project():
+    svc = Service(visibility="private", project_id="new-proj", memory="the text", workspace=None)
+    _run(svc, project_id="old-proj", visibility="private")
+    assert svc.enrich_calls[0]["project_id"] == "new-proj"
+
+
+def test_project_cleared_while_queued_is_honoured():
+    svc = Service(visibility="private", project_id=None, memory="the text", workspace=None)
+    _run(svc, project_id="old-proj", visibility="private")
+    assert svc.enrich_calls[0]["project_id"] is None
+
+
+def test_workspace_comes_from_the_row():
+    svc = Service(visibility="private", project_id=None, memory="the text", workspace="reference")
+    _run(svc, visibility="private")
+    assert svc.enrich_calls[0]["workspace"] == "reference"
+
+
+def test_legacy_row_without_visibility_is_treated_as_private():
+    svc = Service(visibility=None, project_id=None, memory="the text", workspace=None)
+    _run(svc, visibility="shared")
+    assert svc.enrich_calls[0]["visibility"] == "private"
+
+
+def test_content_rewritten_while_queued_is_skipped_not_published():
+    svc = Service(visibility="private", project_id=None, memory="rewritten text", workspace=None)
+    out = _run(svc, content="the old text", visibility="private")
+    assert out == {"memory_id": "m1", "enriched": False, "skipped": "content_changed"}
+    assert svc.enrich_calls == []
+
+
+def test_whitespace_only_difference_is_not_a_content_change():
+    svc = Service(visibility="private", project_id=None, memory="the  text\n", workspace=None)
+    out = _run(svc, content="the text", visibility="private")
+    assert out["enriched"] is True
+
+
+def test_unchanged_row_enriches_exactly_as_queued():
+    svc = Service(visibility="shared", project_id="p", memory="the text", workspace=None)
+    out = _run(svc, visibility="shared", project_id="p")
+    assert out["enriched"] is True
+    call = svc.enrich_calls[0]
+    assert (call["visibility"], call["project_id"], call["user_id"]) == ("shared", "p", "alice")
+
+
+# ── a change that lands DURING extraction ─────────────────────────────
+
+
+class DuringService(Service):
+    """get_memory returns the queued state first, then ``after`` (what the row became mid-extraction)."""
+
+    def __init__(self, after, **row):
+        super().__init__(**row)
+        self.after = after
+        self.reads = 0
+        self.expired: list[tuple] = []
+
+    def get_memory(self, memory_id):
+        self.reads += 1
+        return self.row if self.reads == 1 else self.after
+
+    resolved_results = None   # optional list of results to return per attempt
+
+    def _cascade_or_fallback_expire(self, mem, *, group_id=None, memory_id=""):
+        self.expired.append((mem, group_id, memory_id))
+        if self.resolved_results:
+            return self.resolved_results.pop(0)
+        return {"resolved": True}
+
+
+def _row_like(**kw):
+    return SimpleNamespace(id="m1", occurred_at=None, **kw)
+
+
+def test_memory_deleted_during_enrichment_has_its_episode_expired():
+    svc = DuringService(None, visibility="private", project_id=None, memory="the text", workspace=None)
+    out = _run(svc, visibility="private")
+    assert out["skipped"] == "changed_during_enrichment" and out["enriched"] is False
+    (mem, group, mid), = svc.expired
+    assert group == "user--alice" and mid == "m1" and mem["memory"] == "the text"
+
+
+def test_memory_narrowed_during_enrichment_has_the_shared_episode_expired():
+    after = _row_like(visibility="private", project_id=None, memory="the text", workspace=None)
+    svc = DuringService(after, visibility="shared", project_id=None, memory="the text", workspace=None)
+    out = _run(svc, visibility="shared")
+    assert out["skipped"] == "changed_during_enrichment"
+    assert svc.expired[0][1] == "shared"          # the group the job wrote to, not the new one
+
+
+def test_unchanged_row_after_enrichment_expires_nothing():
+    after = _row_like(visibility="shared", project_id=None, memory="the text", workspace=None)
+    svc = DuringService(after, visibility="shared", project_id=None, memory="the text", workspace=None)
+    assert _run(svc, visibility="shared")["enriched"] is True
+    assert svc.expired == []
+
+
+# ── the expiry is pinned to the episode THIS job wrote ────────────────
+
+
+class EpisodeRows(DuringService):
+    """A service whose Qdrant row reports an episode ref that changes across our enrich call."""
+
+    def __init__(self, refs, after, **row):
+        super().__init__(after, **row)
+        self.refs = list(refs)
+        self._memory = SimpleNamespace(vector_store=SimpleNamespace(get=self._get))
+
+    def _get(self, vector_id):
+        ref = self.refs.pop(0) if len(self.refs) > 1 else self.refs[0]
+        return SimpleNamespace(payload={"metadata": {"graph_episode_uuid": ref}})
+
+
+def test_expiry_resolves_by_the_episode_uuid_this_job_wrote():
+    svc = EpisodeRows([None, "ep-ours"], None, visibility="private", project_id=None, memory="the text", workspace=None)
+    _run(svc, visibility="private")
+    (mem, group, mid), = svc.expired
+    assert mem["metadata"] == {"graph_episode_uuid": "ep-ours"}     # uuid first: a newer episode (same text/group) survives
+
+
+def test_expiry_falls_back_to_content_when_the_episode_cannot_be_told_apart():
+    svc = EpisodeRows(["ep-old", "ep-old"], None, visibility="private", project_id=None, memory="the text", workspace=None)
+    _run(svc, visibility="private")
+    assert svc.expired[0][0]["metadata"] == {}
+
+
+def test_the_cascade_prefers_the_uuid_over_a_newer_same_content_episode():
+    """Provenance: uuid lookup runs first, content only if the uuid misses."""
+    from memory_service import MemoryService
+
+    s = MemoryService()
+    s._get_graphiti = lambda: object()
+    s._bridge = object()
+    seen = []
+
+    def lookup(group, field, value):
+        seen.append(field)
+        return {"uuid": "ep-ours", "name": "n"} if field == "uuid" else {"uuid": "ep-newer", "name": "n2"}
+
+    s._lookup_episode = lookup
+    s._expire_episode_edges = lambda *a, **k: 0
+    s._clear_or_remove_episode_entities = lambda *a, **k: {"nodes_removed": 0, "summaries_cleared": 0}
+    s._delete_episode_node = lambda *a, **k: None
+    out = s._cascade_expire_episode("g", episode_uuid="ep-ours", content="the text")
+    assert out["episode_uuid"] == "ep-ours" and seen == ["uuid"]
+
+
+def _no_sleep(monkeypatch):
+    async def instant(_):
+        return None
+
+    monkeypatch.setattr("worker.asyncio.sleep", instant)
+
+
+def test_unresolved_cleanup_fails_the_job_visibly_with_the_identity_to_retry(monkeypatch):
+    """Finding 7: a shared episode of a now-private memory must not stay readable unnoticed."""
+    _no_sleep(monkeypatch)
+    after = _row_like(visibility="private", project_id=None, memory="the text", workspace=None)
+    svc = DuringService(after, visibility="shared", project_id=None, memory="the text", workspace=None)
+    svc.resolved_results = [{"resolved": False}] * 3
+    with pytest.raises(RuntimeError, match="graph cleanup unresolved for memory m1.*group_id='shared'"):
+        _run(svc, visibility="shared")
+    assert len(svc.expired) == 3                      # retried before giving up
+
+
+def test_cleanup_that_resolves_on_a_retry_is_a_normal_skip(monkeypatch):
+    _no_sleep(monkeypatch)
+    after = _row_like(visibility="private", project_id=None, memory="the text", workspace=None)
+    svc = DuringService(after, visibility="shared", project_id=None, memory="the text", workspace=None)
+    svc.resolved_results = [{"resolved": False}, {"resolved": True}]
+    out = _run(svc, visibility="shared")
+    assert out["skipped"] == "changed_during_enrichment" and len(svc.expired) == 2
