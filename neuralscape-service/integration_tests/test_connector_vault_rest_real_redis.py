@@ -18,7 +18,7 @@ revision bookkeeping (it replaces the ingest); this one covers what that leaves:
 * a sync run decrypts the credentials, sends them to the source, ingests the items
   into the owner's memory with ``source_ref`` pointing at the connector, and leaves
   the stored credentials encrypted;
-* with the flag off every route is a 503.
+* with the flag off the app's real startup builds no vault and every route is a 503 (and with it on, it does).
 
 Flag used: ``connectors_enabled`` (+ ``vault_key``). Needs Redis, Qdrant, Neo4j (service
 init) and GOOGLE_API_KEY.
@@ -227,7 +227,9 @@ def test_another_user_cannot_get_delete_sync_or_take_over_and_the_record_is_unto
     for r in (get, delete, sync, takeover):
         assert r.status_code == 404, (r.request.method, r.request.url, r.status_code, r.text)
     assert missing.status_code == 404
-    assert get.json() == missing.json() or get.json().get("detail", "").startswith("Connector")   # same shape as "no such id"
+    # no oracle: the answer for a foreign id is the answer for a missing id, apart from the id echoed back
+    assert get.json()["detail"].replace(env.cid, "<id>") == missing.json()["detail"].replace("nsit-no-such-connector", "<id>")
+    assert delete.json()["detail"] == get.json()["detail"] and sync.json()["detail"] == get.json()["detail"]
     assert _raw(env) == before, "a non-owner changed the stored record"
     assert env.client.get(f"/v1/connectors/{env.cid}", headers=_bearer(env.alice)).status_code == 200
     assert "attacker-secret" not in (_raw(env) or "")
@@ -266,15 +268,31 @@ def test_a_sync_decrypts_ingests_into_the_owners_memory_and_keeps_credentials_en
     assert BEARER not in after and json.loads(after)["last_revision_by_id"] == {"doc-1": "1", "doc-2": "1"}
 
 
-def test_flag_off_every_connector_route_is_503(env, monkeypatch):
+def test_flag_off_the_real_startup_builds_no_vault_and_every_route_is_503(env, flags, monkeypatch):
+    """Runs the app's real lifespan: with the flag off it leaves no vault, so every connector route is a 503."""
     import main
 
-    monkeypatch.setattr(main, "_vault", None)      # what startup leaves when connectors are disabled
-    c = env.client
+    flags(connectors_enabled=False)
+    monkeypatch.setattr(main, "_vault", None)
     h = _bearer(env.alice)
-    assert c.get("/v1/connectors", headers=h).status_code == 503
-    assert c.get(f"/v1/connectors/{env.cid}", headers=h).status_code == 503
-    assert c.delete(f"/v1/connectors/{env.cid}", headers=h).status_code == 503
-    assert c.post(f"/v1/connectors/{env.cid}/sync", headers=h).status_code == 503
-    assert _register(env, env.alice).status_code == 503
+    with TestClient(main.app) as c:
+        assert main._vault is None
+        assert c.get("/v1/connectors", headers=h).status_code == 503
+        assert c.get(f"/v1/connectors/{env.cid}", headers=h).status_code == 503
+        assert c.delete(f"/v1/connectors/{env.cid}", headers=h).status_code == 503
+        assert c.post(f"/v1/connectors/{env.cid}/sync", headers=h).status_code == 503
+        reg = c.post("/v1/connectors", headers=h, json={
+            "connector_id": env.cid, "connector_type": "generic_rest", "credentials": {"bearer": BEARER}})
+        assert reg.status_code == 503
     assert _raw(env) is None
+
+
+def test_flag_on_the_real_startup_builds_the_vault_and_the_routes_answer(env, flags, monkeypatch):
+    import main
+
+    flags(connectors_enabled=True)
+    monkeypatch.setattr(main, "_vault", None)
+    with TestClient(main.app) as c:
+        assert main._vault is not None, "startup did not build the vault with CONNECTORS_ENABLED and a valid key"
+        r = c.get("/v1/connectors", headers=_bearer(env.alice))
+        assert r.status_code == 200 and r.json() == {"connectors": []}
