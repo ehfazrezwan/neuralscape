@@ -102,9 +102,8 @@ def test_contradicting_fact_supersedes_old_row_and_reassertion_revives_it(svc):
             "Paris row was not superseded. Either the LLM judged the facts non-contradictory "
             "or the invalidation shape changed. RELATES_TO edges in the group: "
             f"{_edge_dump(svc, group)}"
-            f" | supersession step error: {getattr(svc, '_supersession_error', None)!r}"
-            f" | supersession decision trace (probe result, row lookup, per-row decision): "
-            f"{getattr(svc, '_supersession_trace', None)!r}"
+            f" | supersession diagnostics (step error + decision trace: probe result, row "
+            f"lookup, per-row decision): {getattr(svc, '_supersession_diag', {}).get(london.id)!r}"
             f" | paris row metadata: {meta!r}"
         )
         assert meta["superseded_reason"] == "graph_contradiction"

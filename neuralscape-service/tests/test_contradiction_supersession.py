@@ -373,8 +373,74 @@ class TestSingleRowEpisode:
 
         assert qdrant.meta("old")["dream_tombstoned"] is True
         assert qdrant.meta("old")["superseded_edge_uuids"] == ["E1"]
-        decide = [t for t in svc._supersession_trace if t["stage"] == "decide"]
+        decide = [t for t in svc._supersession_diag["new"]["trace"] if t["stage"] == "decide"]
         assert decide and decide[0]["mode"] == "single_fact_partial" and decide[0]["supersede"] is True
+
+    def _partial_setup(self, env, dead_vec, live_vec, row_vec=(1.0, 0.0, 0.0)):
+        svc, qdrant, graph = env
+        qdrant.add("old", user="u1", data="Alice lives in Paris and works at Acme.",
+                   metadata={"graph_episode_uuid": "ep-old", "graph_episode_kind": "fact"},
+                   vector=list(row_vec))
+        qdrant.add("new", user="u1", data="x")
+        graph.add_edge("E1", "Alice works at Acme.", ["ep-old"])  # dead
+        graph.add_edge("E2", "Alice resides in Paris.", ["ep-old"])  # live
+        svc._embed_map["Alice works at Acme."] = list(dead_vec)
+        svc._embed_map["Alice resides in Paris."] = list(live_vec)
+        svc._memory.graph.add.side_effect = _graph_add(graph, episode_uuid="ep-new", invalidate=["E1"])
+        return svc, qdrant
+
+    def test_compound_row_with_realistic_close_cosines_is_left_alone(self, env):
+        """Both edges ~0.85-0.9 to the row, inside the margin: embedding noise."""
+        svc, qdrant = self._partial_setup(env, [0.88, 0.47, 0.0], [0.86, 0.0, 0.51])
+        _enrich(svc)
+        assert not qdrant.meta("old").get("dream_tombstoned")
+
+    def test_dead_edge_clearly_above_floor_and_margin_supersedes(self, env):
+        svc, qdrant = self._partial_setup(env, [0.95, 0.31, 0.0], [0.5, 0.0, 0.87])
+        _enrich(svc)
+        assert qdrant.meta("old")["dream_tombstoned"] is True
+
+    def test_dead_edge_below_the_floor_is_not_enough_even_with_margin(self, env):
+        """Beats the live edge by far but only cos 0.5 to the row: not its claim."""
+        svc, qdrant = self._partial_setup(env, [0.5, 0.87, 0.0], [0.0, 0.0, 1.0])
+        _enrich(svc)
+        assert not qdrant.meta("old").get("dream_tombstoned")
+
+    def test_embedder_failure_leaves_the_row(self, env):
+        svc, qdrant = self._partial_setup(env, [1.0, 0.0, 0.0], [0.0, 0.0, 1.0])
+        svc._memory.embedding_model.embed.side_effect = RuntimeError("embed down")
+        assert _enrich(svc) is True
+        assert not qdrant.meta("old").get("dream_tombstoned")
+
+    def test_vector_length_mismatch_leaves_the_row(self, env):
+        svc, qdrant = self._partial_setup(env, [1.0, 0.0], [0.0, 0.0, 1.0])
+        _enrich(svc)
+        assert not qdrant.meta("old").get("dream_tombstoned")
+        ev = [t for t in svc._supersession_diag["new"]["trace"] if t["stage"] == "decide"][0]
+        assert "mismatch" in ev["error"]
+
+    def test_missing_stored_vector_falls_back_to_embedding_the_row_text(self, env):
+        svc, qdrant = self._partial_setup(env, [0.95, 0.31, 0.0], [0.5, 0.0, 0.87])
+        svc._embed_map["Alice lives in Paris and works at Acme."] = [1.0, 0.0, 0.0]
+        svc._fetch_dense_vectors = MagicMock(return_value={})
+        _enrich(svc)
+        assert qdrant.meta("old")["dream_tombstoned"] is True
+
+    def test_embeddings_are_cached_per_call(self, env):
+        svc, qdrant = self._partial_setup(env, [0.95, 0.31, 0.0], [0.5, 0.0, 0.87])
+        _enrich(svc)
+        texts = [c.args[0] for c in svc._memory.embedding_model.embed.call_args_list]
+        assert len(texts) == len(set(texts))  # no fact embedded twice
+
+    def test_diagnostics_are_per_call_not_a_shared_singleton(self, env):
+        svc, qdrant, graph = env
+        qdrant.add("new", user="u1", data="x")
+        svc._memory.graph.add.side_effect = _graph_add(graph, episode_uuid="ep-a")
+        _enrich(svc, memory_id="new")
+        qdrant.add("new2", user="u1", data="y")
+        svc._memory.graph.add.side_effect = _graph_add(graph, episode_uuid="ep-b")
+        _enrich(svc, memory_id="new2")
+        assert set(svc._supersession_diag) == {"new", "new2"}
 
     def test_dead_edge_that_is_not_the_rows_main_claim_leaves_the_row(self, env):
         svc, qdrant, graph = env

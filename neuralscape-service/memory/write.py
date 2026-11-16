@@ -202,9 +202,11 @@ class WriteMixin:
                 )
             except Exception as e:  # noqa: BLE001
                 logger.warning(f"Stamping graph_episode_kind failed (non-fatal): {e}")
-        # Diagnostics for integration failures: what the step saw / why it died.
-        self._supersession_trace = None
-        self._supersession_error = None
+        # Per-call diagnostics (what the step saw / why it died), keyed by this
+        # write's memory/episode id in a small bounded dict. Holds fact text:
+        # never logged, only read by integration-test failure messages.
+        diag: dict = {"trace": [], "error": None}
+        key = superseded_by or episode_uuid or ""
         try:
             from memory.supersession import supersede_contradicted_rows
 
@@ -216,10 +218,16 @@ class WriteMixin:
                 new_episode_uuid=episode_uuid,
                 new_memory_ids=new_memory_ids,
                 superseded_by=superseded_by,
+                trace=diag["trace"],
             )
         except Exception as e:  # noqa: BLE001 — supersession is best-effort
-            self._supersession_error = repr(e)
+            diag["error"] = repr(e)
             logger.warning(f"Graph-contradiction supersession failed (non-critical): {e}")
+        finally:
+            store = self.__dict__.setdefault("_supersession_diag", {})
+            store[key] = diag
+            while len(store) > 32:
+                store.pop(next(iter(store)), None)
 
     def _attach_memory_id_to_graph_nodes(
         self,

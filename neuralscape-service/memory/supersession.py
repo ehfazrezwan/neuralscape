@@ -18,9 +18,12 @@ Flow (all best-effort, driven from ``memory/write.py`` behind
    written.
 3. Decide per row:
    - episode is a single-fact episode (``graph_episode_kind="fact"``, stamped
-     by ``enrich_graph``) with ONE live row: supersede only if every RELATES_TO edge
-     citing that episode is now dead (a partially contradicted row still
-     holds true facts);
+     by ``enrich_graph``) with ONE live row: supersede if every edge citing
+     the episode is dead; if some are still live (one fact yields several
+     edges), only when the contradicted edge matches the row at
+     ``graph_supersession_partial_min_similarity`` AND beats every live edge
+     by ``graph_supersession_margin`` (a compound row whose live edge is as
+     close as the dead one is left alone);
    - any other episode (conversation / unstamped, one or several rows): supersede the row
      whose stored dense vector best matches the embedded edge ``fact``, only
      if it clears ``graph_supersession_min_similarity`` and beats the
@@ -147,29 +150,49 @@ def _best_row_for_fact(
 
 
 def _dead_edge_dominates(
-    service, row_id: str, row_payload: dict, dead_fact: str, live_facts: list[str]
+    service,
+    row_id: str,
+    row_payload: dict,
+    dead_fact: str,
+    live_facts: list[str],
+    cache: dict[str, list[float]] | None = None,
 ) -> tuple[bool, dict]:
     """Is the contradicted edge the row's MAIN claim, not an incidental one?
 
     One stored fact routinely yields several edges (e.g. "Alice lives in
     Paris, France" -> "Alice resides in Paris" + "Paris is a city in
     France"). Requiring every edge to be dead would never supersede such a
-    row. Instead the dead edge must be a clearly better match to the row
-    than every still-live edge of the same episode (cosine on the stored
-    dense vector, margin ``graph_supersession_margin``). Any embedding
-    failure leaves the row alone. Returns ``(decision, evidence)``.
+    row. Instead the dead edge must (1) match the row at
+    ``graph_supersession_partial_min_similarity`` and (2) beat every
+    still-live edge of the episode by ``graph_supersession_margin``
+    (cosine on the stored dense vector). Any embedding failure, missing or
+    mismatched vector leaves the row alone. ``cache`` memoises embeddings of
+    fact strings for the duration of one supersession call. Returns
+    ``(decision, evidence)``.
     """
     margin = settings.graph_supersession_margin
-    evidence: dict = {"dead_sim": None, "best_live_sim": None, "margin": margin}
+    floor = settings.graph_supersession_partial_min_similarity
+    evidence: dict = {"dead_sim": None, "best_live_sim": None, "margin": margin, "floor": floor}
+    cache = cache if cache is not None else {}
     try:
         embedder = service._get_memory().embedding_model
+
+        def _embed(text: str) -> list[float]:
+            if text not in cache:
+                cache[text] = list(embedder.embed(text, memory_action="add"))
+            return cache[text]
+
         row_vec = service._fetch_dense_vectors([row_id]).get(row_id)
         if row_vec is None:
-            row_vec = embedder.embed(row_payload.get("data") or "", memory_action="add")
-        dead = _cosine(list(row_vec), list(embedder.embed(dead_fact, memory_action="add")))
+            row_vec = _embed(row_payload.get("data") or "")
+        row_vec = list(row_vec)
+        dead_vec = _embed(dead_fact)
+        if len(dead_vec) != len(row_vec):
+            evidence["error"] = f"vector length mismatch ({len(dead_vec)} vs {len(row_vec)})"
+            return False, evidence
+        dead = _cosine(row_vec, dead_vec)
         live = [
-            _cosine(list(row_vec), list(embedder.embed(f, memory_action="add")))
-            for f in live_facts
+            _cosine(row_vec, _embed(f)) for f in live_facts if f and f.strip()
         ]
     except Exception as e:  # noqa: BLE001
         logger.warning(f"Supersession dominance check failed (leaving row): {e}")
@@ -177,7 +200,7 @@ def _dead_edge_dominates(
         return False, evidence
     best_live = max(live) if live else 0.0
     evidence.update(dead_sim=round(dead, 4), best_live_sim=round(best_live, 4))
-    return (dead - best_live) >= margin, evidence
+    return (dead >= floor and (dead - best_live) >= margin), evidence
 
 
 def supersede_contradicted_rows(
@@ -189,8 +212,13 @@ def supersede_contradicted_rows(
     new_episode_uuid: str | None,
     new_memory_ids: set[str],
     superseded_by: str | None = None,
+    trace: list[dict] | None = None,
 ) -> list[str]:
     """Tombstone rows whose graph edges the write just invalidated.
+
+    ``trace`` (optional, caller-owned list) receives the decision trace:
+    probe result, row lookup, per-row evidence. It carries fact text, is
+    never logged, and is only surfaced by tests' failure messages.
 
     Returns the ids tombstoned. Raises on infrastructure errors; the caller
     (``WriteMixin._maybe_supersede_contradicted``) swallows them so a failed
@@ -201,10 +229,9 @@ def supersede_contradicted_rows(
         live_edge_facts_by_episode,
     )
 
-    # Decision trace for diagnostics (kept on the service so an integration
-    # test can print what the probe saw and why each row was/wasn't superseded).
-    trace: list[dict] = []
-    service._supersession_trace = trace
+    if trace is None:
+        trace = []
+    embed_cache: dict[str, list[float]] = {}
     trace.append({
         "stage": "start", "group_id": group_id, "owner": owner_user_id,
         "new_episode": new_episode_uuid, "write_started_at": write_started_at.isoformat(),
@@ -276,7 +303,7 @@ def supersede_contradicted_rows(
                 pid = ep_rows[0][0]
                 if still_live:
                     ok, evidence = _dead_edge_dominates(
-                        service, pid, ep_rows[0][1], fact, still_live
+                        service, pid, ep_rows[0][1], fact, still_live, embed_cache
                     )
                     trace.append({"stage": "decide", "row": pid, "episode": ep,
                                   "mode": "single_fact_partial", "dead_fact": fact,
