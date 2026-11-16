@@ -314,7 +314,7 @@ docker CLI; otherwise its stack scenarios skip with that reason.
 
 What the gate must provide:
 
-- `NS_ALLOW_DESTRUCTIVE=1` (throwaway stack only).
+- `NS_ALLOW_DESTRUCTIVE=1`, set **only for a dedicated run** of this module on a throwaway stack (never for the ordinary acceptance run).
 - `NS_COMPOSE_FILES=docker-compose.yml:<the gate's override file>` (colon separated, the `COMPOSE_FILE`
   convention; relative paths resolve against `NS_REPO_ROOT`, default the checkout holding `acceptance/`).
   Each entry becomes `-f <file>` on the backup script **and on every `docker compose` call the harness
@@ -324,6 +324,16 @@ What the gate must provide:
 - The backup destination is a fresh `nsc-backup-*` directory the scenario creates under the temp dir
   (anything else is refused) and removes afterwards. The temp dir must be on the docker host's filesystem
   (the restore bind-mounts it).
+
+Before anything is wiped a preflight proves the restore can run (any failure aborts with no wipe, and every
+scenario then fails citing it): `compose config -q` with the same `-f` files, `neo4j-admin --version` in the
+neo4j image, `tar --version` in the API image, Qdrant reachable from the API container, the backup script
+present. If a wipe happened and the restore fails (it is retried once) the backup directory is **kept** and its
+path is in the failure detail; it is deleted only after a successful restore (or when no wipe happened).
+
+Note the graph wipe is **logical**: a bulk delete through the API removes the project's episodes; the Neo4j volume
+is not physically emptied. The graph part is proven by the after-backup marker (written to Neo4j after the backup)
+being absent once `neo4j-admin database load` has run.
 
 Flow (one module fixture records, the scenarios assert): seed (raw memory -> vector search -> graph
 episode; a small uploaded file -> artifact bytes + passage; the memory's task id) -> backup (exit 0, one

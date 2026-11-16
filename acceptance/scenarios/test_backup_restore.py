@@ -42,6 +42,7 @@ import pytest
 
 from nsaccept import eventually, expect_check_fails, needs, negative_control, proves
 from nsaccept import restore, stack
+from nsaccept.flow import Flow, run_flow
 from nsaccept.client import NSClient
 from nsaccept.helpers import blob_has, graph_listing, memory_ids_in
 from nsaccept.runctx import app_services
@@ -136,29 +137,13 @@ class Story:
     file_bytes: bytes = b""
     root: Path | None = None
     backup_dir: Path | None = None
-    steps: dict = field(default_factory=dict)  # name -> "" (ok) or the failure text
+    steps: dict = field(default_factory=dict)  # the Flow's recorded results (name -> "" or failure text)
     backup_exit: int | None = None
     backup_tail: str = ""
     restarts_before: dict = field(default_factory=dict)
     restarts_after: dict = field(default_factory=dict)
     ran_wipe: bool = False
     ran_restore: bool = False
-
-    def ok(self, name: str) -> bool:
-        return name in self.steps and not self.steps[name]
-
-
-def _step(story: Story, name: str, fn) -> bool:
-    """Run one step, recording instead of raising (the scenarios assert)."""
-    try:
-        fn()
-        story.steps[name] = ""
-        return True
-    except pytest.fail.Exception as exc:  # a stack that will not come back is recorded, then the next step fails
-        story.steps[name] = f"stack: {str(exc)[:300]}"
-    except Exception as exc:  # noqa: BLE001  (AssertionError, httpx errors, docker errors: all recorded)
-        story.steps[name] = scrub(f"{type(exc).__name__}: {exc}")[:400]
-    return False
 
 
 def _write_memory(a: NSClient, story: Story, key: str, project_id: str) -> None:
@@ -310,17 +295,25 @@ def _after_backup_marker(ctx, a: NSClient, story: Story) -> None:
 
 
 def _gate(ctx) -> None:
-    if os.environ.get("NS_ALLOW_DESTRUCTIVE") != "1":
-        pytest.skip("destructive: needs NS_ALLOW_DESTRUCTIVE=1 (wipes every memory on the stack, then restores a backup)")
-    if not ctx.compose_project:
-        pytest.skip("destructive: needs --compose-project")
-    from nsaccept import guard
-
-    guard.check_compose_project(ctx.compose_project)  # refuses the production name and anything off the allowlist
+    reason = restore.gate_reason(os.environ, ctx.compose_project)  # raises for prod / off-allowlist names
+    if reason:
+        pytest.skip(reason)
     try:
         restore.compose_file_args()
     except restore.RestoreRefused as exc:
         pytest.fail(f"NS_COMPOSE_FILES: {exc}")
+
+
+def _preflight(ctx, a: NSClient, story: Story) -> None:
+    """Before anything is wiped: prove every command shape the restore needs can run."""
+    stack.wait_ready(ctx, a, "before the backup scenario")
+    restore.backup_command(ctx.compose_project, story.root)  # script present, destination fresh, project allowed
+    root = str(story.root)
+    ctx.compose("config", "-q")
+    ctx.compose("run", "--rm", "--no-deps", "-T", restore.neo4j_service(), "neo4j-admin", "--version", backup_root=root, timeout=300)
+    ctx.compose("run", "--rm", "--no-deps", "-T", "--entrypoint", "tar", restore.api_service(), "--version", backup_root=root, timeout=300)
+    ctx.compose("run", "--rm", "--no-deps", "-T", restore.api_service(), "python", "-c", restore.QDRANT_PING_SCRIPT, backup_root=root, timeout=300)
+    story.restarts_before = stack.restart_counts(ctx)
 
 
 @pytest.fixture(scope="module")
@@ -329,33 +322,49 @@ def story(ctx, a):
     s = Story(project_id=f"{ctx.project_id}-bkp")
     s.markers = {k: f"zq-{ctx.run_id}-bk{k}" for k in ("m1", "m2", "m3", "file")}
     s.root = restore.make_backup_root()
+    flow = Flow()
+    s.steps = flow.steps
+
+    def wipe():
+        s.ran_wipe = True
+        _wipe(ctx, a, s)
+
+    def do_restore():
+        s.ran_restore = True
+        _restore(ctx, a, s)
+
+    fns = {
+        "preflight": lambda: _preflight(ctx, a, s),
+        "seed": lambda: _seed(ctx, a, s),
+        "backup": lambda: _backup(ctx, s),
+        "after_backup_write": lambda: _after_backup_marker(ctx, a, s),
+        "wipe": wipe,
+        "gone": lambda: _prove_gone(a, s),
+        "restore": do_restore,
+        "post_vector": lambda: _post_restore(a, s),
+        "post_graph": lambda: _post_graph(a, s),
+        "post_task": lambda: _post_task(a, s),
+        "post_artifact": lambda: _post_artifact(a, s),
+        "restarts": lambda: setattr(s, "restarts_after", stack.restart_counts(ctx)),
+        "fresh_write": lambda: _fresh_write(a, s),
+    }
     try:
-        stack.wait_ready(ctx, a, "before the backup scenario")
-        s.restarts_before = stack.restart_counts(ctx)
-        seeded = _step(s, "seed", lambda: _seed(ctx, a, s))
-        backed_up = seeded and _step(s, "backup", lambda: _backup(ctx, s))
-        if backed_up:
-            _step(s, "after_backup_write", lambda: _after_backup_marker(ctx, a, s))
-            wiped = _step(s, "wipe", lambda: _wipe(ctx, a, s))
-            if wiped:
-                _step(s, "gone", lambda: _prove_gone(a, s))
-            # Restore even when a wipe step failed half way: the stack must end up on the backup.
-            if _step(s, "restore", lambda: _restore(ctx, a, s)):
-                _step(s, "post_vector", lambda: _post_restore(a, s))
-                _step(s, "post_graph", lambda: _post_graph(a, s))
-                _step(s, "post_task", lambda: _post_task(a, s))
-                _step(s, "post_artifact", lambda: _post_artifact(a, s))
-                _step(s, "restarts", lambda: setattr(s, "restarts_after", stack.restart_counts(ctx)))
-                _step(s, "fresh_write", lambda: _fresh_write(a, s))
+        run_flow(flow, fns)
+        if flow.keep_backup:
+            # The backup is the only copy of the data: leave it for the operator, say where.
+            note = f"; the backup is KEPT at {s.root} (restore it by hand per scripts/backup-volumes.sh)"
+            s.steps["restore"] = (s.steps.get("restore") or "restore did not run") + note
         yield s
     finally:
         try:
             stack.ensure_running(ctx, a, "the backup/restore finalizer")
         finally:
-            shutil.rmtree(s.root, ignore_errors=True)
+            if not flow.keep_backup:
+                shutil.rmtree(s.root, ignore_errors=True)
 
 
 def require(story: Story, *names: str) -> None:
+    assert not story.steps.get("preflight", ""), f"preflight failed, nothing was wiped: {story.steps.get('preflight')}"
     for n in names:
         assert n in story.steps, f"step {n!r} never ran (an earlier step failed: {story.steps})"
         assert not story.steps[n], f"step {n!r} failed: {story.steps[n]}"

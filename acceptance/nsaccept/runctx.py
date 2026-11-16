@@ -90,7 +90,7 @@ def parse_ps_json(text: str) -> list[dict]:
     return [json.loads(line) for line in text.splitlines() if line.strip()]
 
 
-COMPOSE_VERBS = frozenset({"pause", "unpause", "stop", "start", "restart", "ps", "logs", "top", "exec", "up", "run", "cp"})
+COMPOSE_VERBS = frozenset({"pause", "unpause", "stop", "start", "restart", "ps", "logs", "top", "exec", "up", "run", "cp", "config"})
 # `up` may only start existing containers: detached, no build, no recreate.
 UP_REQUIRED_FLAGS = ("-d", "--no-build", "--no-recreate")
 UP_ALLOWED_FLAGS = UP_REQUIRED_FLAGS + ("--no-deps",)
@@ -152,7 +152,7 @@ def run_compose(
                 "or redis-cli FLUSHALL with NS_ALLOW_DESTRUCTIVE=1"
             )
     stdin_fh = None
-    if args[0] in ("run", "cp"):
+    if args[0] in ("run", "cp", "config"):
         try:
             restore.validate_restore_args(args, backup_root, stdin_path)
         except restore.RestoreRefused as exc:

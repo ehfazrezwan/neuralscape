@@ -56,6 +56,12 @@ for name, fname in sorted(index.items()):
     print(f"restored collection {name}", file=sys.stderr)
 '''
 
+# Preflight: the Qdrant upload path (API container -> QDRANT_URL) answers before anything is wiped.
+QDRANT_PING_SCRIPT = (
+    "import os, urllib.request; "
+    "urllib.request.urlopen(os.environ['QDRANT_URL'].rstrip('/') + '/collections', timeout=30).read()"
+)
+
 # Wipes the ingest artifacts (the scenario's proof that the files part is restored
 # from the backup, not left behind).
 WIPE_INGEST_SCRIPT = "find /data/ingest -mindepth 1 -delete"
@@ -183,8 +189,16 @@ def validate_restore_args(
     """
     a = tuple(args)
     verb = a[0] if a else ""
+    if a == ("config", "-q"):  # preflight: the -f files parse
+        return
     if verb not in ("run", "cp"):
         raise RestoreRefused(f"{verb!r} is not a restore verb")
+    if verb == "run" and a[:4] == ("run", "--rm", "--no-deps", "-T") and a[4:] in (  # preflight: no-op probes
+        (neo4j_service(), "neo4j-admin", "--version"),
+        ("--entrypoint", "tar", api_service(), "--version"),
+        (api_service(), "python", "-c", QDRANT_PING_SCRIPT),
+    ):
+        return
     if backup_root is None:
         raise RestoreRefused("restore commands need the scenario's backup root")
     root = check_backup_root(backup_root)
@@ -229,6 +243,20 @@ def validate_restore_args(
             raise RestoreRefused("wiping the ingest volume needs NS_ALLOW_DESTRUCTIVE=1")
         return
     raise RestoreRefused(f"run shape refused: {rest[:4]}")
+
+
+# ── opt-in gate ──────────────────────────────────────────────────
+
+
+def gate_reason(env: dict, compose_project: str | None) -> str | None:
+    """Why the destructive scenario must skip (None = it may run). Raises GuardError for
+    the production name or a project off the allowlist."""
+    if env.get("NS_ALLOW_DESTRUCTIVE") != "1":
+        return "destructive: needs NS_ALLOW_DESTRUCTIVE=1 (wipes every memory on the stack, then restores a backup)"
+    if not compose_project:
+        return "destructive: needs --compose-project"
+    guard.check_compose_project(compose_project, env)
+    return None
 
 
 # ── the backup script ────────────────────────────────────────────

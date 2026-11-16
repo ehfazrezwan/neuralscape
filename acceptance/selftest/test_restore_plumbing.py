@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from nsaccept import guard, restore, runctx, stack
+from nsaccept import flow as flow_mod, guard, restore, runctx, stack
 
 STAMP = "ns-backup-20260101T000000Z"
 
@@ -268,3 +268,95 @@ def test_rows_ready_names_the_first_service_that_is_not_ready():
     assert "c missing" in stack.rows_ready(rows, ["a", "c"])
     assert "exited" in stack.rows_ready([{"Service": "a", "State": "exited"}], ["a"])
     assert "starting" in stack.rows_ready([{"Service": "a", "State": "running", "Health": "starting"}], ["a"])
+
+
+# ── opt-in gate, preflight shapes, step ordering ─────────────────
+
+
+def test_the_destructive_gate_needs_the_switch_a_project_and_an_allowlisted_name():
+    assert "NS_ALLOW_DESTRUCTIVE=1" in restore.gate_reason({}, "nstest-x")
+    assert "NS_ALLOW_DESTRUCTIVE=1" in restore.gate_reason({"NS_ALLOW_DESTRUCTIVE": "0"}, "nstest-x")
+    assert "--compose-project" in restore.gate_reason({"NS_ALLOW_DESTRUCTIVE": "1"}, None)
+    assert restore.gate_reason({"NS_ALLOW_DESTRUCTIVE": "1"}, "nstest-x") is None
+    for bad in ("neuralscape", " NeuralScape ", "production"):
+        with pytest.raises(guard.GuardError):
+            restore.gate_reason({"NS_ALLOW_DESTRUCTIVE": "1"}, bad)
+    with pytest.raises(guard.GuardError):  # the allowlist override cannot admit another name
+        restore.gate_reason({"NS_ALLOW_DESTRUCTIVE": "1", "NS_COMPOSE_ALLOWLIST": "bench-"}, "nstest-x")
+
+
+def test_preflight_probe_shapes_run_and_nothing_else_slips_through(root):
+    calls = []
+    for args in (("config", "-q"),
+                 ("run", "--rm", "--no-deps", "-T", "neo4j", "neo4j-admin", "--version"),
+                 ("run", "--rm", "--no-deps", "-T", "--entrypoint", "tar", "neuralscape", "--version"),
+                 ("run", "--rm", "--no-deps", "-T", "neuralscape", "python", "-c", restore.QDRANT_PING_SCRIPT)):
+        runctx.run_compose("nstest-x", *args, run=fake(calls))
+    assert len(calls) == 4
+    for args in (("config",), ("config", "-q", "--no-interpolate"), ("config", "--volumes"),
+                 ("run", "--rm", "--no-deps", "-T", "neo4j", "neo4j-admin", "database", "load", "memory"),
+                 ("run", "--rm", "--no-deps", "-T", "neuralscape", "python", "-c", "print(1)"),
+                 ("run", "--rm", "--no-deps", "-T", "--entrypoint", "tar", "neuralscape", "-xf", "/etc/x")):
+        with pytest.raises(runctx.ConfigError):
+            runctx.run_compose("nstest-x", *args, run=fake(calls))
+    assert len(calls) == 4
+
+
+def _fns(log, fail=(), restore_fails=0):
+    left = {"restore": restore_fails}
+
+    def mk(name):
+        def fn():
+            log.append(name)
+            if name in fail:
+                raise AssertionError(f"{name} broke")
+            if name == "restore" and left["restore"] > 0:
+                left["restore"] -= 1
+                raise AssertionError("restore broke")
+        return fn
+    names = ["preflight", "seed", "backup", "after_backup_write", "wipe", "gone", "restore", *flow_mod.POST_STEPS]
+    return {n: mk(n) for n in names}
+
+
+def test_the_happy_path_runs_every_step_in_order():
+    log = []
+    f = flow_mod.run_flow(flow_mod.Flow(), _fns(log))
+    assert log == ["preflight", "seed", "backup", "after_backup_write", "wipe", "gone", "restore", *flow_mod.POST_STEPS]
+    assert f.order == log and not f.keep_backup and all(v == "" for v in f.steps.values())
+
+
+@pytest.mark.parametrize("broken", ["preflight", "seed", "backup"])
+def test_nothing_is_wiped_unless_preflight_seed_and_backup_succeeded(broken):
+    log = []
+    f = flow_mod.run_flow(flow_mod.Flow(), _fns(log, fail=(broken,)))
+    assert "wipe" not in log and "restore" not in log and not f.keep_backup
+    assert log[-1] == broken
+
+
+def test_a_failed_wipe_is_still_followed_by_a_restore_and_the_proof_is_skipped():
+    log = []
+    f = flow_mod.run_flow(flow_mod.Flow(), _fns(log, fail=("wipe",)))
+    assert log.index("restore") == log.index("wipe") + 1 and "gone" not in log
+
+
+def test_post_checks_only_after_a_successful_restore_and_the_backup_is_kept_otherwise():
+    log = []
+    f = flow_mod.run_flow(flow_mod.Flow(), _fns(log, restore_fails=2))
+    assert log.count("restore") == 2 and not any(n in log for n in flow_mod.POST_STEPS)
+    assert f.keep_backup and not f.restore_ok
+
+
+def test_one_retry_of_the_restore_recovers_and_the_first_failure_is_recorded():
+    log = []
+    f = flow_mod.run_flow(flow_mod.Flow(), _fns(log, restore_fails=1))
+    assert log.count("restore") == 2 and log[-1] == "fresh_write"
+    assert f.restore_ok and not f.keep_backup and "broke" in f.steps["restore_first_attempt"]
+
+
+def test_the_backup_is_removed_only_when_no_wipe_happened_or_the_restore_succeeded():
+    f = flow_mod.Flow()
+    assert not f.keep_backup  # never wiped
+    f.order.append("wipe")
+    assert f.keep_backup  # wiped, not restored
+    f.steps["restore"] = ""
+    assert not f.keep_backup
