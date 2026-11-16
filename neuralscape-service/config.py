@@ -172,7 +172,10 @@ class Settings(BaseSettings):
     # results are already in hand. On: the join waits at most
     # GRAPH_LEG_BUDGET_S seconds measured from when the leg was SUBMITTED,
     # then the recall returns the vector-only results and logs one warning.
-    # The late leg is left to finish on its own pool thread.
+    # The late leg is left to finish on its own pool thread. Caveat: after a
+    # sustained slow graph, stuck legs (up to the 30 s bridge timeout + 10 s
+    # enrichment) can hold all 16 pool threads, so searches stay vector-only
+    # until threads free, i.e. within ~40 s of the graph recovering.
     # Env: GRAPH_LEG_BUDGET_ENABLED, GRAPH_LEG_BUDGET_S.
     graph_leg_budget_enabled: bool = False
     graph_leg_budget_s: float = 4.0

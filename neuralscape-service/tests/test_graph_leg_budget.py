@@ -118,6 +118,28 @@ class TestBudgetOn:
         assert {r.id for r in results if r.source == "graph"} == {"g0", "g1"}
         assert search_mod._graph_leg_budget_timeouts == before
 
+    def test_saturated_pool_queues_the_leg_and_the_budget_still_holds(self, service, monkeypatch):
+        """Stuck legs holding every pool thread: a new leg only queues, the recall stays vector-only
+        within budget (measured from submit), and the queued leg is cancelled, never run late."""
+        from concurrent.futures import ThreadPoolExecutor
+
+        pool = ThreadPoolExecutor(max_workers=1)
+        release = threading.Event()
+        pool.submit(release.wait, 10)  # occupies the only worker
+        monkeypatch.setattr(search_mod, "_GRAPH_SEARCH_POOL", pool)
+        monkeypatch.setattr(settings, "graph_leg_budget_enabled", True)
+        monkeypatch.setattr(settings, "graph_leg_budget_s", 0.4)
+        ran = []
+        with patch.object(service, "_search_graph_for_visibility", side_effect=lambda *a, **k: ran.append(1)):
+            t0 = time.monotonic()
+            results = service.search(query="q", user_id="u1", limit=5)
+            elapsed = time.monotonic() - t0
+        release.set()
+        pool.shutdown(wait=True)
+        assert elapsed < 0.4 + 1.0
+        assert [r.id for r in results] == ["v0"]
+        assert ran == [], "a cancelled queued leg must never run"
+
     def test_next_search_after_a_timeout_is_unaffected(self, service, monkeypatch):
         monkeypatch.setattr(settings, "graph_leg_budget_enabled", True)
         monkeypatch.setattr(settings, "graph_leg_budget_s", 0.3)
