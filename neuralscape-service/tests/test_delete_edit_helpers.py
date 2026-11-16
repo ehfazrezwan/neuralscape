@@ -44,7 +44,7 @@ class TestDedupPartition:
         a = _dedup_partition({"user_id": "u", "metadata": {"scope": "global", "visibility": "private"}})
         b = _dedup_partition({"user_id": "u", "metadata": {"scope": "global", "visibility": "private",
                                                             "workspace": "memory"}})
-        assert a == b == ("u", "global", None, "private", None)
+        assert a == b == ("u", "global", None, "private", None, None)
 
     def test_reference_workspace_is_distinct(self):
         base = {"user_id": "u", "metadata": {"scope": "global", "visibility": "private"}}
@@ -63,7 +63,7 @@ class TestDedupPartition:
 
     def test_double_wrapped_metadata_read(self):
         p = {"user_id": "u", "metadata": {"metadata": {"scope": "global", "visibility": "shared"}}}
-        assert _dedup_partition(p) == ("u", "global", None, "shared", None)
+        assert _dedup_partition(p) == ("u", "global", None, "shared", None, None)
 
 
 class TestDedupPartitionFilters:

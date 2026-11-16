@@ -37,7 +37,7 @@ def _dedup_meta(payload: dict) -> tuple[dict, bool]:
 def _dedup_partition(payload: dict) -> tuple:
     """Partition identity a semantic near-duplicate must share to be merged.
 
-    (user_id, scope, project_id, visibility, workspace). Mirrors the write
+    (user_id, scope, project_id, visibility, workspace, category). Mirrors the write
     path's partitioning (``memory/write.py`` content-hash identity and
     ``memory/groups.py::_build_group_id``): the same text in two projects,
     at two visibility tiers, or in a reference workspace vs the memory
@@ -57,6 +57,10 @@ def _dedup_partition(payload: dict) -> tuple:
         meta.get("project_id") or None,
         meta.get("visibility"),
         workspace,
+        # Same text under another category is a distinct memory (the write
+        # path's dedup key carries the category too); an absent category is
+        # its own partition, like visibility.
+        meta.get("category"),
     )
 
 
@@ -72,7 +76,7 @@ def _dedup_partition_filters(user_id: str, payload: dict) -> dict:
     meta, wrapped = _dedup_meta(payload)
     prefix = "metadata.metadata." if wrapped else "metadata."
     filters: dict = {"user_id": user_id}
-    for field in ("scope", "project_id", "visibility", "workspace"):
+    for field in ("scope", "project_id", "visibility", "workspace", "category"):
         value = meta.get(field)
         if field == "workspace" and value == "memory":
             continue  # default workspace: absent OR "memory" — post-filtered

@@ -1021,7 +1021,7 @@ class WriteMixin:
         existing = self._find_by_content_hash(
             user_id=user_id, content_hash=chash, scope=scope,
             project_id=project_id, visibility=effective_visibility,
-            workspace=effective_workspace,
+            workspace=effective_workspace, category=category,
         )
         if existing is not None:
             logger.info(
@@ -1332,8 +1332,9 @@ class WriteMixin:
         visibility: str | None = None,
         speaker: str | None | object = _SPEAKER_UNSET,
         workspace: str | None = None,
+        category: str | None = None,
     ) -> MemoryResponse | None:
-        """Look up a memory by (user_id, hash, scope, visibility, speaker, workspace) for dedup.
+        """Look up a memory by (user_id, hash, scope, visibility, speaker, workspace, category) for dedup.
 
         Returns the existing MemoryResponse on hit, or None if not found.
         Failures here are non-fatal — we'd rather risk a duplicate than
@@ -1352,6 +1353,13 @@ class WriteMixin:
         ``workspace`` (WT6) is also part of the key: the same sentence in a
         reference book vs. a user note are distinct memories. Absent/None =
         memory type (default); matches rows with workspace absent/None/"memory".
+
+        ``category`` is part of the key when given: the same text stored under
+        another category is a distinct memory (a "convention" and a
+        "preference" that read alike are different facts), so it must not be
+        absorbed into the old row. It is a lookup filter on ``metadata.category``
+        rather than part of the hash, so every existing row keeps its hash.
+        ``None`` (omitted) keeps the category-agnostic lookup.
         """
         try:
             from qdrant_client.models import FieldCondition, Filter, IsEmptyCondition, MatchValue, PayloadField
@@ -1364,6 +1372,8 @@ class WriteMixin:
             ]
             if visibility is not None:
                 must.append(FieldCondition(key="metadata.visibility", match=MatchValue(value=visibility)))
+            if category is not None:
+                must.append(FieldCondition(key="metadata.category", match=MatchValue(value=category)))
             if scope == "project" and project_id:
                 must.append(FieldCondition(key="metadata.project_id", match=MatchValue(value=project_id)))
             if speaker is None:
@@ -1921,7 +1931,7 @@ class WriteMixin:
 
             # In-batch duplicate (extraction-window overlap): keep the first.
             # WT6: workspace is part of the batch key too.
-            batch_key = (chash, scope_val, fact_project_id, speaker, workspace)
+            batch_key = (chash, scope_val, fact_project_id, speaker, workspace, category)
             if batch_key in seen_in_batch:
                 continue
             seen_in_batch.add(batch_key)
@@ -1937,6 +1947,7 @@ class WriteMixin:
                 project_id=fact_project_id,
                 visibility=None,
                 workspace=workspace,
+                category=category,
             )
             existing = (
                 self._find_by_content_hash(**lookup_kwargs)
@@ -1951,6 +1962,7 @@ class WriteMixin:
                     project_id=fact_project_id,
                     visibility=None,
                     speaker=None,
+                    category=category,
                 )
                 if existing is not None and self._backfill_speaker_on_existing_memory(
                     memory_id=existing.id,

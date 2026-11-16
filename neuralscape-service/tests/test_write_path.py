@@ -225,13 +225,20 @@ def _stateful_hash_dedup(service):
     dedup behaves like a real Qdrant collection across calls."""
     store: dict[tuple, MemoryResponse] = {}
 
-    def fake_find(user_id, content_hash, scope, project_id=None, visibility=None, workspace=None):
-        return store.get((user_id, content_hash, scope, project_id, workspace))
+    def fake_find(user_id, content_hash, scope, project_id=None, visibility=None, workspace=None,
+                  category=None, speaker=None):
+        # category=None is the category-agnostic lookup, like the real one.
+        for (uid, h, sc, pid, ws, cat), hit in store.items():
+            if (uid, h, sc, pid, ws) == (user_id, content_hash, scope, project_id, workspace) and (
+                category is None or cat == category
+            ):
+                return hit
+        return None
 
     def record_insert(vectors, ids, payloads):
         for mid, p in zip(ids, payloads):
             meta = p["metadata"]
-            store[(p["user_id"], p["hash"], meta["scope"], meta["project_id"], meta.get("workspace"))] = (
+            store[(p["user_id"], p["hash"], meta["scope"], meta["project_id"], meta.get("workspace"), meta["category"])] = (
                 MemoryResponse(
                     id=mid,
                     memory=p["data"],
@@ -605,8 +612,8 @@ class TestStoreRawBatchTwoPass:
             for i in (2, 7)
         }
         service._find_by_content_hash = (
-            lambda user_id, content_hash, scope, project_id=None, visibility=None, workspace=None:
-            dup_rows.get(content_hash)
+            lambda user_id, content_hash, scope, project_id=None, visibility=None, workspace=None,
+            category=None: dup_rows.get(content_hash)
         )
         service._bump_times_derived = MagicMock()
         service._revive_if_tombstoned = MagicMock(return_value=False)
