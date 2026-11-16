@@ -61,9 +61,9 @@ spec:
             timeoutSeconds: 15
             failureThreshold: 5
       volumes:
-        # Conversation-compiler / wiki-synth scratch space. emptyDir is fine while
-        # WIKI_SYNTHESIZER_ENABLED=false; switch to a Filestore (RWX) PVC if you
-        # enable the synthesizer and want the vault shared + persistent.
+        # Conversation-compiler vault scratch space (OBSIDIAN_VAULT_PATH). emptyDir
+        # is fine for a stateless deploy; switch to a Filestore (RWX) PVC if you want
+        # the vault shared + persistent.
         - name: vault
           emptyDir: {}
         {{- include "neuralscape.ingestVolume" . | nindent 8 }}
