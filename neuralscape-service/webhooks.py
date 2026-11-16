@@ -111,7 +111,7 @@ def _resolve(host: str, port: int) -> list[str]:
     def lookup() -> None:
         try:
             box["infos"] = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
-        except OSError as exc:
+        except (OSError, UnicodeError) as exc:  # UnicodeError: an IDNA-invalid name
             box["error"] = exc
         finally:
             _resolver_slots.release()
@@ -142,7 +142,7 @@ def _validated_addresses(url: str) -> list[str] | None:
     literal = _literal_ip(host)
     try:
         addresses = [str(literal)] if literal is not None else _resolve(host, port)
-    except (OSError, TimeoutError) as exc:
+    except (OSError, TimeoutError, UnicodeError) as exc:
         logger.warning("queue.empty webhook not sent: could not resolve host %s (%s)", host, type(exc).__name__)
         return None
     if not addresses:

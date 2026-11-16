@@ -272,3 +272,39 @@ def test_concurrent_lookups_are_bounded_and_the_overflow_is_refused(monkeypatch)
             __import__("time").sleep(0.05)
     else:
         pytest.fail("resolver slots were never released")
+
+
+# --- IDNA-invalid names and the fail-closed pin ------------------------------------------------
+
+
+def test_idna_invalid_host_is_refused_cleanly(sink, caplog, no_connection):
+    host = "a" * 70 + ".example.test"  # a label over 63 octets: getaddrinfo raises UnicodeError
+    crashes = []
+    old_hook = threading.excepthook
+    threading.excepthook = lambda args: crashes.append(args)
+    try:
+        with caplog.at_level(logging.WARNING, logger="webhooks"):
+            webhooks._post(f"http://{host}/x?token=zzz", PAYLOAD)
+    finally:
+        threading.excepthook = old_hook
+    assert crashes == []  # the lookup thread did not die with a traceback
+    assert no_connection == []
+    assert "could not resolve" in caplog.text
+    assert "token=zzz" not in caplog.text
+
+
+def test_pin_fails_closed_when_httpx_internals_change(sink, monkeypatch, caplog):
+    import httpx
+
+    class Changed(httpx.HTTPTransport):
+        def __init__(self, *a, **k):
+            super().__init__(*a, **k)
+            del self._pool  # the attribute the pin relies on is gone
+
+    monkeypatch.setattr(httpx, "HTTPTransport", Changed)
+    with pytest.raises(RuntimeError, match="cannot pin"):
+        webhooks._pinned_transport(["127.0.0.1"])
+    with caplog.at_level(logging.WARNING, logger="webhooks"):
+        webhooks._post(f"http://127.0.0.1:{sink.port}/hook", PAYLOAD)
+    assert sink.requests == []  # refused, never sent unpinned
+    assert "delivery failed" in caplog.text
