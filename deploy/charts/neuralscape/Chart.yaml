@@ -1,7 +1,9 @@
 apiVersion: v2
 name: neuralscape
-description: Neuralscape application tier (FastAPI API + ARQ fast worker + graph worker)
+description: Neuralscape application tier (FastAPI API + ARQ fast, graph and ingest workers + Docling converter)
 type: application
 version: 0.1.0
-# appVersion tracks the container image tag deployed by default (overridable).
-appVersion: "latest"
+# appVersion is the image tag used when values `image.tag` is empty. It must stay
+# a pinned, non-floating tag (the chart refuses "latest"); deployments should set
+# image.tag explicitly to the immutable tag they pushed.
+appVersion: "0.1.0"

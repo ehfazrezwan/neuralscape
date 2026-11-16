@@ -8,7 +8,11 @@
 
 image:
   repository: neuralscape/neuralscape
-  tag: latest
+  # Pinned image tag. Empty = use the chart's appVersion (Chart.yaml). A floating
+  # "latest" is rejected at render time (see _helpers.tpl). Deployments set an
+  # explicit immutable tag (deploy/terraform passes image_tag; the CI image is
+  # published as sha-<12>).
+  tag: ""
   pullPolicy: IfNotPresent
 
 serviceAccount:
@@ -21,34 +25,37 @@ serviceAccount:
 # Empty = schedule anywhere. Set via a private overlay to pin to a pool.
 nodeSelector: {}
 
-# In-cluster backend addresses (match the Services in deploy/k8s/).
+# App configuration (rendered into the `neuralscape-config` ConfigMap).
+#
+# Deliberately SPARSE: every key here must be a real Settings field of
+# neuralscape-service/config.py (or a documented extension key), and this chart
+# carries NO second copy of config.py's defaults. Anything not set here falls
+# through to config.py (model names, log level/format, auth provider, Neo4j user
+# and database, ...). Set a key here only to override config.py for a cluster.
+# A test (tests/test_deploy_chart_parity.py) enforces this.
 config:
+  # In-cluster backend addresses (match the Services in deploy/k8s/).
   NEO4J_URI: "neo4j://neo4j:7687"
-  NEO4J_USER: "neo4j"
-  NEO4J_DATABASE: "memory"
   QDRANT_URL: "http://qdrant:6333"
   REDIS_URL: "redis://redis:6379"
+  # The container serves MCP over HTTP (config.py defaults to stdio for the CLI).
   MCP_TRANSPORT: "http"
-  LOG_LEVEL: "INFO"
-  LOG_FORMAT: "json"
-  GEMINI_LLM_MODEL: "gemini-3-flash-preview"
-  GEMINI_LLM_FALLBACK_MODEL: "gemini-2.5-flash"
-  GEMINI_EMBEDDER_MODEL: "gemini-embedding-001"
-  # Document/file ingestion: artifact storage volume + Docling converter.
+  # Mount path of the shared artifact volume (INGEST_STORAGE_ENABLED, DOCLING_ENABLED
+  # and DOCLING_URL are derived in templates/configmap.yaml from ingestStorage.* and
+  # docling.*; a key set here wins for the Docling pair).
   INGEST_STORAGE_DIR: "/data/ingest"
-  DOCLING_ENABLED: "true"
-  DOCLING_URL: "http://docling:5001"
-  # Auth. Default is token-paste (no external IdP). Set AUTH_PROVIDER=google and
-  # AUTH_ALLOWED_DOMAINS in a private overlay for consent-screen login.
-  AUTH_PROVIDER: "token"
-  # Public HTTPS URL (must match the ingress host). Enables the OAuth AS when set
-  # together with the user-token secret.
-  NEURALSCAPE_PUBLIC_URL: "https://neuralscape.example.com"
+  # Vault scratch mount (conversation-compiler extension setting).
   OBSIDIAN_VAULT_PATH: "/data/vault"
   # Vendored mem0/Graphiti send anonymous usage telemetry to an external host
-  # unless disabled. Off by default; set "true" here to opt in.
+  # unless disabled. Off by default (config.py leaves it unset); set "true" to opt in.
   MEM0_TELEMETRY: "false"
   GRAPHITI_TELEMETRY_ENABLED: "false"
+  # Public HTTPS URL (must match the ingress host). Enables the OAuth AS when set
+  # together with the user-token secret. Unset here on purpose; deploy/terraform
+  # sets it from `neuralscape_domain`, a bare chart install leaves OAuth off.
+  # NEURALSCAPE_PUBLIC_URL: "https://neuralscape.example.com"
+  # Auth defaults to config.py's AUTH_PROVIDER (token-paste). Set AUTH_PROVIDER=google
+  # and AUTH_ALLOWED_DOMAINS in a private overlay for consent-screen login.
 
 # Keys read from the ESO-synced `neuralscape-secrets` Secret (deploy/k8s/).
 secretName: neuralscape-secrets
@@ -109,7 +116,8 @@ docling:
   enabled: true
   image:
     repository: ghcr.io/docling-project/docling-serve
-    tag: latest
+    # Same pinned release the compose stack runs; never a floating tag.
+    tag: v1.38.2
     pullPolicy: IfNotPresent
   replicaCount: 1
   port: 5001
