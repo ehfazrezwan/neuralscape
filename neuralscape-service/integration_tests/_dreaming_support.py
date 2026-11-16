@@ -18,9 +18,45 @@ import json
 import os
 import time
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
+
+def _is_timeout(exc: BaseException) -> bool:
+    seen = set()
+    while exc is not None and id(exc) not in seen:
+        seen.add(id(exc))
+        if "timeout" in type(exc).__name__.lower() or "timed out" in str(exc).lower():
+            return True
+        exc = exc.__cause__ or exc.__context__
+    return False
+
+
+@contextmanager
+def timed(env, label: str):
+    """Time one setup call; on a timeout say WHICH call and after how long.
+
+    The service's own Qdrant client is used unchanged (default 5 s timeout), so a
+    timeout here is real slowness of that call on this box, not a test artifact. If
+    the same call would run in a production sweep, it is a product finding.
+    """
+    start = time.monotonic()
+    try:
+        yield
+    except Exception as exc:
+        took = time.monotonic() - start
+        if _is_timeout(exc):
+            slow = sorted(env.timings, key=lambda t: -t[1])[:3]
+            raise pytest.fail.Exception(
+                f"{label} timed out after {took:.1f}s ({type(exc).__name__}); "
+                f"{len(env.timings)} earlier calls ok, slowest: "
+                + ", ".join(f"{n} {d:.2f}s" for n, d in slow),
+            ) from exc
+        raise
+    finally:
+        env.timings.append((label, time.monotonic() - start))
+
 
 class DreamEnv:
     """Handle returned by the ``dream_env`` fixture."""
@@ -34,6 +70,7 @@ class DreamEnv:
         self.redis = redis
         self.seeded_ids: set[str] = set()
         self.extra_pools: list[str] = []
+        self.timings: list[tuple[str, float]] = []
 
     # ── settings ──
     def sweep_settings(self, **overrides):
@@ -52,11 +89,12 @@ class DreamEnv:
 
     # ── store helpers ──
     def store(self, content: str, category: str = "preference", *, user: str | None = None) -> str:
-        res = self.service.store_raw(
-            content=content, user_id=user or self.user, category=category,
-            scope="global", source_type="explicit", confidence=0.9,
-            visibility="private", add_to_graph=False,
-        )
+        with timed(self, f"store_raw #{len(self.seeded_ids) + 1} ({category})"):
+            res = self.service.store_raw(
+                content=content, user_id=user or self.user, category=category,
+                scope="global", source_type="explicit", confidence=0.9,
+                visibility="private", add_to_graph=False,
+            )
         if isinstance(res, tuple):
             res = res[0]
         mid = res[0].id
@@ -95,11 +133,12 @@ class DreamEnv:
 
     def store_project(self, content: str, project_id: str, category: str = "tech_stack") -> str:
         """A shared project-pool row (``shared--project--<pid>``)."""
-        res = self.service.store_raw(
-            content=content, user_id=self.user, category=category,
-            scope="project", project_id=project_id, source_type="explicit",
-            confidence=0.9, visibility="shared", add_to_graph=False,
-        )
+        with timed(self, f"store_raw project #{len(self.seeded_ids) + 1} ({category})"):
+            res = self.service.store_raw(
+                content=content, user_id=self.user, category=category,
+                scope="project", project_id=project_id, source_type="explicit",
+                confidence=0.9, visibility="shared", add_to_graph=False,
+            )
         if isinstance(res, tuple):
             res = res[0]
         mid = res[0].id
@@ -149,8 +188,10 @@ def dream_env(tmp_path_factory, stores, llm_key):
     prior_last_run = r.get("dreaming:last_run")
 
     service = MemoryService()
-    service._get_memory()
     env = DreamEnv(service=service, collection=collection, user=user, vault=vault, redis=r)
+    with timed(env, "service init (collection + payload indexes)"):
+        service._get_memory()
+    _wait_collection_ready(env)
     try:
         yield env
     finally:
@@ -158,6 +199,28 @@ def dream_env(tmp_path_factory, stores, llm_key):
         mp.undo()
         if errors:
             pytest.fail(f"dream_env cleanup failed (leaked data): {errors}", pytrace=False)
+
+
+def _wait_collection_ready(env: DreamEnv, deadline_s: float = 60.0) -> None:
+    """Explicit readiness: the throwaway collection answers and reports green.
+
+    One timed span for the whole wait; a poll that times out is retried until the
+    deadline (that is the point of waiting), so only the total is reported.
+    """
+    client = env.service._memory.vector_store.client
+    with timed(env, f"wait for collection green (<= {deadline_s:.0f}s)"):
+        end = time.monotonic() + deadline_s
+        last = "no answer"
+        while time.monotonic() < end:
+            try:
+                status = str(client.get_collection(env.collection).status).lower()
+                if "green" in status:
+                    return
+                last = status
+            except Exception as exc:  # noqa: BLE001
+                last = type(exc).__name__
+            time.sleep(1.0)
+        pytest.fail(f"collection {env.collection} not green after {deadline_s:.0f}s (last: {last})")
 
 
 def _teardown(env: DreamEnv, prior_last_run, stores) -> list[str]:
