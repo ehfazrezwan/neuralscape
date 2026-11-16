@@ -64,6 +64,11 @@ def test_compile_on_a_day_with_other_users_entries_still_dedups_the_requester(
     from extensions.dreaming.config import dreaming_settings
 
     monkeypatch.setattr(dreaming_settings, "enabled", dreaming_on)
+    if dreaming_on:
+        # dedup holds the pool's dream lock: the real Redis the stack uses must answer
+        from extensions.dreaming.sweep import _get_redis
+
+        _get_redis().ping()
     from extensions.conversation_compiler.compile import compile_date
     from extensions.conversation_compiler.obsidian_writer import ObsidianWriter
 
@@ -75,6 +80,15 @@ def test_compile_on_a_day_with_other_users_entries_still_dedups_the_requester(
     time.sleep(1.1)
     new_id = _store(svc, uid, f"{older}.", project)
     assert {old_id, new_id} <= _recalled(svc, uid, f"zq-{tag} nightly report", project)
+    # Precondition: with the real embedder the two texts must clear the dedup threshold,
+    # else "not tombstoned" below would prove nothing (and a pass would be a coincidence).
+    from config import settings
+
+    embed = svc._memory.embedding_model.embed
+    va, vb = embed(older, memory_action="add"), embed(f"{older}.", memory_action="add")
+    dot = sum(x * y for x, y in zip(va, vb))
+    cosine = dot / ((sum(x * x for x in va) ** 0.5) * (sum(y * y for y in vb) ** 0.5))
+    assert cosine >= settings.dedup_similarity_threshold, cosine
 
     writer = ObsidianWriter(vault_path=tmp_path / "vault")
     writer.append_daily_log(

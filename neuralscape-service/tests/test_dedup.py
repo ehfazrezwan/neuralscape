@@ -984,6 +984,10 @@ class TestDreamingOnSemanticPhase:
         from extensions.dreaming.config import dreaming_settings
 
         monkeypatch.setattr(dreaming_settings, "enabled", True)
+        # dedup takes the pool's dream lock here: a stand-in for the Redis the stack runs
+        from tests.test_dedup_dream_exclusion import _FakeRedis
+
+        monkeypatch.setattr("extensions.dreaming.sweep._get_redis", lambda r=_FakeRedis(): r)
         fake = self._pair(service)
 
         result = self._compile(service, tmp_path)

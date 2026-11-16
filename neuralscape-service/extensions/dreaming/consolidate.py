@@ -512,22 +512,35 @@ async def apply_actions(
                 result.applied.append({**act, "dry_run": True})
                 continue
             a_type = act["type"]
-            if a_type == "merge":
-                survivor = act["survivor_id"]
-                losers = [m for m in act["memory_ids"] if m != survivor]
-                # Re-read the tombstone state right before applying: another
-                # writer (semantic dedup) may have tombstoned a row since the
-                # action was staged, and folding content into / out of a hidden
-                # row would bury the merged text.
-                hidden = await asyncio.to_thread(
-                    _tombstoned_ids, service, [survivor, *losers]
-                )
+            # Re-read the tombstone state of every row this action writes to,
+            # right before applying: another writer (semantic dedup) may have
+            # tombstoned one since the action was staged, and writing into a
+            # hidden row (a reframe, a merge) or re-tombstoning it (overwriting
+            # dedup's superseded_by pointer) would undo or bury dedup's work.
+            # The one exemption is the hard delete of a gate-cleared secret.
+            if not (
+                a_type == "prune"
+                and act.get("contains_secret")
+                and not act.get("secret_claim_downgraded")
+            ):
+                touched = list(dict.fromkeys([
+                    *(act.get("memory_ids") or []),
+                    *([act["survivor_id"]] if a_type == "merge" else []),
+                    # an invalidate points its rows at the row that replaces them
+                    *([act["superseded_by_id"]]
+                      if a_type == "invalidate" and act.get("superseded_by_id") else []),
+                ]))
+                hidden = await asyncio.to_thread(_tombstoned_ids, service, touched)
                 if hidden:
                     result.skipped.append({
-                        **act,
+                        "type": a_type,
+                        "memory_ids": list(act.get("memory_ids") or []),
                         "skip_reason": "tombstoned since staging: " + ",".join(sorted(hidden)),
                     })
                     continue
+            if a_type == "merge":
+                survivor = act["survivor_id"]
+                losers = [m for m in act["memory_ids"] if m != survivor]
                 # Reinforcement-aware merge (A2): the survivor's counter
                 # becomes the SUM of every merged row's times_derived —
                 # folding N observations into one row must not forget that
