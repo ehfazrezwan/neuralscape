@@ -288,7 +288,8 @@ def test_a_new_deployment_never_receives_the_legacy_dictator_grants(tmp_path, mo
             return enforcer.decide(op, RequestContext(user_id=caller, **ctx), mode="enforce", profile="legacy_compat").allowed
         assert not decide("rest:DELETE /v1/memories/{memory_id}", "carol", path_params={"memory_id": "r-priv-alice"})
         assert decide("rest:DELETE /v1/memories/{memory_id}", "alice", path_params={"memory_id": "r-priv-alice"})
-        assert not [s for s in store.current_policy(T).statements if s.origin]
+        # The shared key's administrator grant (origin legacy_admin) is independent of the dictator grants.
+        assert not [s for s in store.current_policy(T).statements if s.origin == pm.LEGACY_DICTATOR_ORIGIN]
     finally:
         store.close()
 
