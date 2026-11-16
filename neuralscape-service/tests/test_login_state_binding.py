@@ -496,3 +496,36 @@ def test_consent_page_stays_intact_with_very_long_host(provider):
     assert page.status_code == 200
     assert f"<b>{host}</b>" in page.text
     assert "overflow-wrap" in page.text and page.text.rstrip().endswith("</html>")
+
+
+# ── malformed redirect URIs are a 400, never a 500 ──
+
+_MALFORMED = ["https://[::1", "https://[claude.ai]/cb", "https://:443/cb", "https://host.example:443abc/cb"]
+
+
+@pytest.mark.parametrize("uri", _MALFORMED)
+def test_malformed_redirect_uri_is_400_everywhere(env, uri):
+    client = _client()
+    assert _register(client, uri).status_code == 400
+    cid = sign_payload({"typ": "client", "redirect_uris": [uri], "iat": int(time.time())}, env["secret"])
+    _, challenge = _pkce()
+    got = client.get("/oauth/authorize", params={
+        "response_type": "code", "client_id": cid, "redirect_uri": uri,
+        "code_challenge": challenge, "code_challenge_method": "S256"})
+    assert got.status_code == 400
+    posted = client.post("/oauth/authorize", data={
+        "client_id": cid, "redirect_uri": uri, "code_challenge": challenge,
+        "code_challenge_method": "S256", "token": "x"}, follow_redirects=False)
+    assert posted.status_code == 400
+
+
+def test_post_authorize_refuses_userinfo_redirect(env, monkeypatch):
+    """Pins the redirect validity check on the token-paste POST handler."""
+    monkeypatch.setattr(settings, "auth_provider", "token")
+    bad = "https://claude.ai@attacker.example.net/cb"
+    cid = sign_payload({"typ": "client", "redirect_uris": [bad], "iat": int(time.time())}, env["secret"])
+    _, challenge = _pkce()
+    r = _client().post("/oauth/authorize", data={
+        "client_id": cid, "redirect_uri": bad, "code_challenge": challenge,
+        "code_challenge_method": "S256", "token": "x"}, follow_redirects=False)
+    assert r.status_code == 400 and r.json()["error"] == "invalid_request"
