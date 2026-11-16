@@ -262,3 +262,63 @@ async def test_the_enqueue_failure_fallback_skips_reference_rows(ctx):
     assert enriched == ["m-mem"], "the reference row must not be enriched, even by the fallback"
     queued = [c.args[1] for c in ctx["redis"].enqueue_job.call_args_list]
     assert "m-ref" not in queued
+
+
+# ── checkpoint -> batch -> store_raw_batch, reference workspace, store-free ──
+
+
+def _hash_index_service(service, existing):
+    """Fake ``_find_by_content_hash`` honouring workspace: ``existing`` is {(hash, workspace)}."""
+    from memory_service import content_hash
+
+    def find(**kw):
+        ws = kw.get("workspace")
+        if (kw["content_hash"], ws) in existing:
+            return MemoryResponse(id=f"old-{ws}", memory="x", category="preference")
+        return None
+
+    service._find_by_content_hash = find
+    return content_hash
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_reference_item_with_a_twin_in_another_workspace_is_stored_in_its_workspace(service, ctx):
+    from checkpoint import prepare_checkpoint
+    from memory_service import content_hash
+
+    text = "estuary tide tables passage"
+    # The same text already exists in the default workspace (None) only.
+    existing = {(content_hash(text), None)}
+    _hash_index_service(service, existing)
+
+    req = CheckpointRequest(memories=[
+        {"content": text, "category": "preference", "workspace": "ref-books"},
+        {"content": "alpine pilot huts fact", "category": "preference"},
+    ])
+    prepared = prepare_checkpoint(service, req, "alice")
+    # Not a dedup hit against the default-workspace twin.
+    assert [v["verdict"] for v in prepared["verdicts"]] == ["new", "new"]
+    assert prepared["to_enqueue"][0]["workspace"] == "ref-books"
+
+    ctx["service"] = service
+    out = await worker.process_memory_raw_batch(ctx, prepared["to_enqueue"])
+
+    assert len(out["memories"]) == 2
+    stored = {p["data"]: p["metadata"].get("workspace") for p in _payloads(service)}
+    assert stored[text] == "ref-books"
+    # Reference rows are vector-only: one job (the memory row), none inline.
+    assert out["graph_jobs_enqueued"] == 1
+    service.enrich_graph.assert_not_called()
+    assert [c.args[0] for c in ctx["redis"].enqueue_job.call_args_list] == ["process_graph_enrichment"]
+
+
+def test_checkpoint_dedups_against_a_twin_in_the_same_reference_workspace(service):
+    from checkpoint import prepare_checkpoint
+    from memory_service import content_hash
+
+    text = "estuary tide tables passage"
+    _hash_index_service(service, {(content_hash(text), "ref-books")})
+    req = CheckpointRequest(memories=[{"content": text, "category": "preference", "workspace": "ref-books"}])
+    prepared = prepare_checkpoint(service, req, "alice")
+    assert [v["verdict"] for v in prepared["verdicts"]] == ["duplicate"]
+    assert prepared["to_enqueue"] == []
