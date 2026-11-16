@@ -165,7 +165,8 @@ class KnowledgeConfigStoreError(RuntimeError):
     race with another writer, so the merge was refused and nothing was changed."""
 
 
-_MERGE_RETRIES = 5
+# Shared with any other read-modify-write of this record (e.g. the worker's index-time write).
+MERGE_RETRIES = 10
 
 
 def _payload(config: ProjectKnowledgeConfig) -> dict:
@@ -226,7 +227,7 @@ def merge_project_config(project_id: str, **updates) -> ProjectKnowledgeConfig:
             pass
 
     key = index_store._CFG_PREFIX + project_id
-    for _ in range(_MERGE_RETRIES):
+    for _ in range(MERGE_RETRIES):
         try:
             with client.pipeline() as pipe:
                 pipe.watch(key)

@@ -144,6 +144,7 @@ class FakePipe:
     def __init__(self, r):
         self.r = r
         self.queued = []
+        self.watched = {}
 
     def __enter__(self):
         return self
@@ -152,7 +153,7 @@ class FakePipe:
         return False
 
     def watch(self, key):
-        self.r.watched = key
+        self.watched = {key: self.r.versions.get(key, 0)}
 
     def get(self, key):
         if self.r.fail_get:
@@ -172,9 +173,13 @@ class FakePipe:
             raise ConnectionError("redis write failed")
         if self.r.before_exec:
             self.r.before_exec.pop(0)()  # a concurrent writer sneaks in
-            raise WatchError("watched key changed")
+        # Real WATCH semantics: abort only if a watched key changed since watch();
+        # a transaction that never called watch() is not protected.
+        for k, ver in self.watched.items():
+            if self.r.versions.get(k, 0) != ver:
+                raise WatchError("watched key changed")
         for k, v in self.queued:
-            self.r.data[k] = v
+            self.r.set(k, v)
 
 
 class FakeRedis:
@@ -183,7 +188,7 @@ class FakeRedis:
         self.fail_get = False
         self.fail_set = False
         self.before_exec = []
-        self.watched = None
+        self.versions = {}
 
     def get(self, key):
         if self.fail_get:
@@ -192,6 +197,7 @@ class FakeRedis:
 
     def set(self, key, value):
         self.data[key] = value
+        self.versions[key] = self.versions.get(key, 0) + 1
 
     def pipeline(self):
         return FakePipe(self)
@@ -288,7 +294,7 @@ def test_a_concurrent_write_between_read_and_write_is_not_lost(fake_redis):
     def worker_write():
         rec = json.loads(fake_redis.data[key])
         rec["code_space"] = "code--alice--worker-new"
-        fake_redis.data[key] = json.dumps(rec)
+        fake_redis.set(key, json.dumps(rec))
 
     fake_redis.before_exec = [worker_write]
     cfg = kr.merge_project_config(PID, fuse_code_into_recall=False)
@@ -300,7 +306,8 @@ def test_a_concurrent_write_between_read_and_write_is_not_lost(fake_redis):
 def test_endless_write_conflicts_give_up_without_writing(fake_redis):
     _indexed()
     before = dict(fake_redis.data)
-    fake_redis.before_exec = [lambda: None] * 10
+    key = index_store._CFG_PREFIX + PID
+    fake_redis.before_exec = [lambda: fake_redis.set(key, fake_redis.data[key])] * 20
     with pytest.raises(kr.KnowledgeConfigStoreError, match="concurrently"):
         kr.merge_project_config(PID, fuse_code_into_recall=False)
     assert fake_redis.data == before
