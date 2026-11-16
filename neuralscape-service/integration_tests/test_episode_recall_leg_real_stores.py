@@ -122,7 +122,7 @@ def test_episode_row_is_found_on_a_default_recall_across_all_groups(svc, unique_
     # Precondition: no stored memory is a content twin of the episode row recall would build from it. A
     # verbatim extraction would make recall drop the episode row as a twin of the memory row and this test
     # would fail for a reason that has nothing to do with the group filter.
-    episode_text = svc.normalize_memory_content(f"[verbatim session excerpt] {episode_rows[0]['c']}")
+    episode_text = svc.normalize_memory_content(f"[verbatim session excerpt] {episode_rows[0]['c'][:600]}")
     for memory in stored:
         twin = svc.find_duplicate_content(svc.normalize_memory_content(memory.memory), [episode_text])
         assert twin is None, (
