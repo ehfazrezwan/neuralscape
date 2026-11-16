@@ -1,5 +1,7 @@
 # Upstream Edge Experiments — unused mem0/graphiti capability worth mining
 
+> **Status (as of 2026-11-16, dev 6a81341f):** design, not built. None of the experiments below (E-1 and onward) has been started as written, and none of the proposed flags exists in `config.py` or the `memory/` package. Related work that is not these experiments: an LLM rerank of the fused list exists behind `HYBRID_RERANK_ENABLED` (default off), and `update_communities` is a setting (`UPDATE_COMMUNITIES`, default off). Treat this as a plan, not a description of the code. The upstream-delta facts it relies on are in [14-upstream-delta-report](./neuralscape/14-upstream-delta-report.md). Plan-named work that was never started.
+
 Status: **planned, not started** (2026-07-05). This is the follow-up plan from
 the subtree audit: NS uses ~4% of the vendored code by volume, and — more
 interestingly — **1 of graphiti's 16 search recipes and none of its reranking
