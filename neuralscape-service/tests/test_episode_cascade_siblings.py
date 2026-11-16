@@ -311,8 +311,12 @@ class FakeGraph:
 
 
 @pytest.fixture
-def world():
+def world(monkeypatch):
     from memory_service import MemoryService
+    from tests.test_dedup import _UpRedis
+
+    up = _UpRedis()  # dedup takes pool locks and does nothing destructive without Redis
+    monkeypatch.setattr("extensions.dreaming.sweep._get_redis", lambda: up)
 
     q = FakeQdrant()
     g = FakeGraph()
