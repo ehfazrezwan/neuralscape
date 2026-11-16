@@ -103,7 +103,7 @@ def test_cypher_targets_real_graphiti_labels():
     for stale in ("EpisodicNode", "EntityNode", "CommunityNode"):
         assert stale not in text, f"{stale} is not a Graphiti label"
     labels = set(re.findall(r"MATCH \(n:(\w+)\)", text))
-    assert labels == {"Episodic", "Entity", "Community"}
+    assert labels == {"Episodic", "Entity", "Community", "Saga"}
     if GRAPHITI_NODE_QUERIES.is_file():
         queries = GRAPHITI_NODE_QUERIES.read_text()
         for label in labels:
@@ -116,7 +116,7 @@ def test_cypher_rewrite_matches_current_group_id_builder():
     from memory.groups import _build_group_id
 
     migrations = _migrations()
-    assert len(migrations) == 4  # Episodic, Entity, Community, relationships
+    assert len(migrations) == 5  # Episodic, Entity, Community, Saga, relationships
     for pid in ("neuralscape", "my-app", "a:b"):
         shared_target = _build_group_id("shared", "u1", pid)[: -len(pid)]
         private_target = _build_group_id("private", "u1", pid)[: -len(pid)]
@@ -158,4 +158,26 @@ def test_cypher_header_names_today_formats_and_the_parameter():
     assert "shared--project--{id}" in header
     assert "user--{user_id}--project--{id}" in header
     assert "target_prefix" in header
+    assert "Saga" in header and "HAS_EPISODE" in header and "NEXT_EPISODE" in header
+    assert "Neo4j graph only" in header or "graph only" in header
+    assert "migrate_graph_groups.py" in header
+    assert "BACK UP" in header
     assert "EpisodicNode" not in header
+
+
+def test_cypher_guards_target_prefix_before_any_write():
+    if not CYPHER.is_file():
+        return
+    first = _statements()[0]
+    assert "$target_prefix" in first and "1 / ok" in first and "SET " not in first
+    assert "shared--project--" in first and "^user--[^-].*--project--$" in first
+    assert "target_prefix" in _migrations()[0]
+
+
+def test_graph_groups_script_header_points_at_the_cypher_file():
+    script = REPO / "neuralscape-service" / "scripts" / "migrate_graph_groups.py"
+    if not script.is_file():
+        return
+    doc = script.read_text().split('"""')[1]
+    assert "migrate-group-ids.cypher" in doc
+    assert "user--<owner>--project--" in doc
