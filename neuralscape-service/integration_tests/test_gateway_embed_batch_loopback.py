@@ -109,6 +109,8 @@ def make_svc(flags, stores, llm_key, unique_ns, stub, monkeypatch):
         lambda: QdrantClient(url=stores.qdrant_url).delete_collection(unique_ns.qdrant_collection)
     )
 
+    built: list = []
+
     def build(*, gateway: bool = True, batch_size: int = 0):
         flags(
             qdrant_collection=unique_ns.qdrant_collection,
@@ -122,11 +124,28 @@ def make_svc(flags, stores, llm_key, unique_ns, stub, monkeypatch):
 
         svc = MemoryService()
         svc._get_memory()
-        svc._graphiti = None  # raw writes only: no graph episode, no extraction LLM
+        # Raw writes only: no graph episode, no extraction LLM. Detach the graph
+        # handles for the test body but remember them, so teardown can close the
+        # Neo4j driver and stop the bridge loop thread (dropping them leaks a
+        # thread, an event loop and driver sockets per service).
+        built.append((svc, svc._graphiti, svc._bridge))
+        svc._graphiti = None
         svc._bridge = None
         return svc
 
-    return build
+    yield build
+
+    for svc, graphiti, bridge in built:
+        svc._graphiti, svc._bridge = graphiti, bridge
+        for close in (
+            svc.close,  # graphiti driver + bridge loop
+            svc._memory.vector_store.client.close,  # Qdrant HTTP client
+            svc._memory.embedding_model.client.close,  # gateway/OpenAI HTTP client pool
+        ):
+            try:
+                close()
+            except Exception:  # noqa: BLE001 - teardown is best effort
+                pass
 
 
 def _items(uid, texts):
