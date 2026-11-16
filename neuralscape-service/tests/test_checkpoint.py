@@ -474,7 +474,7 @@ class TestSensitivityGatedKey:
         """A shared row with the same text lives in the shared partition; the sensitive item is stored private."""
         shared_row = _existing("shared-1")
 
-        def find(*, user_id, content_hash, scope, project_id, visibility, category=None):
+        def find(*, user_id, content_hash, scope, project_id, visibility, category=None, workspace=None):
             return shared_row if visibility == "shared" else None
 
         svc = MagicMock()
@@ -490,7 +490,7 @@ class TestSensitivityGatedKey:
     def test_override_with_explicit_shared_still_dedups_against_the_shared_row(self):
         svc = MagicMock()
         svc._find_by_content_hash.side_effect = (
-            lambda *, user_id, content_hash, scope, project_id, visibility, category=None:
+            lambda *, user_id, content_hash, scope, project_id, visibility, category=None, workspace=None:
             _existing("shared-1") if visibility == "shared" else None
         )
         v = dedup_verdicts(svc, [{
@@ -502,7 +502,7 @@ class TestSensitivityGatedKey:
     def test_prepare_checkpoint_enqueues_a_sensitive_item_matching_a_shared_row(self):
         svc = MagicMock()
         svc._find_by_content_hash.side_effect = (
-            lambda *, user_id, content_hash, scope, project_id, visibility, category=None:
+            lambda *, user_id, content_hash, scope, project_id, visibility, category=None, workspace=None:
             _existing("shared-1") if visibility == "shared" else None
         )
         req = CheckpointRequest(memories=[
@@ -579,7 +579,7 @@ class TestDedupProbeIncludesCategory:
         assert svc._find_by_content_hash.call_args.kwargs["category"] == "convention"
 
     def test_same_text_in_another_category_is_new(self):
-        def find(*, user_id, content_hash, scope, project_id, visibility, category=None):
+        def find(*, user_id, content_hash, scope, project_id, visibility, category=None, workspace=None):
             return _existing("pref-1") if category == "preference" else None
 
         svc = MagicMock()
@@ -589,3 +589,38 @@ class TestDedupProbeIncludesCategory:
             {"content": CLEAN, "category": "preference", "user_id": "u"},
         ])
         assert [x["verdict"] for x in v] == ["new", "duplicate"]
+
+
+class TestDedupProbeIncludesWorkspace:
+    @staticmethod
+    def _svc_with_row_in(workspace):
+        def find(*, user_id, content_hash, scope, project_id, visibility, category=None, workspace=None):
+            return _existing("row-1") if workspace == _ROW_WS.get("ws") else None
+
+        _ROW_WS["ws"] = workspace
+        svc = MagicMock()
+        svc._find_by_content_hash.side_effect = find
+        return svc
+
+    def test_same_text_in_a_reference_workspace_is_new_against_a_memory_row(self):
+        svc = self._svc_with_row_in(None)      # the existing row is in the memory workspace
+        v = dedup_verdicts(svc, [{"content": CLEAN, "category": "decision", "user_id": "u", "workspace": "book-1"}])
+        assert v[0]["verdict"] == "new"
+        assert svc._find_by_content_hash.call_args.kwargs["workspace"] == "book-1"
+
+    def test_same_text_same_workspace_is_a_duplicate(self):
+        svc = self._svc_with_row_in("book-1")
+        v = dedup_verdicts(svc, [{"content": CLEAN, "category": "decision", "user_id": "u", "workspace": "book-1"}])
+        assert v[0]["verdict"] == "duplicate"
+
+    @pytest.mark.parametrize("ws", [None, "", "memory"])
+    def test_absent_or_memory_workspace_probes_the_memory_workspace(self, ws):
+        svc = self._svc_with_row_in(None)
+        item = {"content": CLEAN, "category": "decision", "user_id": "u"}
+        if ws is not None:
+            item["workspace"] = ws
+        assert dedup_verdicts(svc, [item])[0]["verdict"] == "duplicate"
+        assert svc._find_by_content_hash.call_args.kwargs["workspace"] is None
+
+
+_ROW_WS: dict = {}
