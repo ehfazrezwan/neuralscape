@@ -651,6 +651,9 @@ class WriteMixin:
         except Exception as e:
             logger.warning(f"Graph storage failed (non-critical): {e}")
 
+        # Which returned rows THIS extraction created (the rest are content-hash
+        # dedup survivors: pre-existing rows, possibly explicit/private writes).
+        stats["created_ids"] = sorted(newly_created_ids)
         return (stored, stats) if return_stats else stored
 
     def _episode_is_dead(self, group_id: str, episode_uuid: str) -> bool:
