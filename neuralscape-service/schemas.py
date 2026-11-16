@@ -348,6 +348,27 @@ def validate_adapter_name(v: str) -> str:
     return v
 
 
+MAX_RECALL_WORKSPACES = 10
+
+
+def validate_workspace_names(v: list[str] | None) -> list[str] | None:
+    """Validate a recall ``workspaces`` list: names match the write-side
+    ``workspace`` pattern, at most MAX_RECALL_WORKSPACES entries, duplicates
+    collapsed. ``[]`` maps to ``None`` (the default)."""
+    import re
+
+    if v is None:
+        return None
+    if v == []:
+        return None  # empty list = default (memory workspace only)
+    if not isinstance(v, list) or len(v) > MAX_RECALL_WORKSPACES:
+        raise ValueError(f"workspaces must list at most {MAX_RECALL_WORKSPACES} workspace names")
+    for name in v:
+        if not isinstance(name, str) or len(name) > 100 or not re.fullmatch(_ID_PATTERN, name):
+            raise ValueError(f"Invalid workspace name {name!r}: use letters, digits, '_', '.', '-' (max 100)")
+    return list(dict.fromkeys(v))
+
+
 # Event time (occurred_at): allow modest client clock skew when rejecting
 # "future" event times — an importer whose clock runs slightly ahead must not
 # be rejected, but a genuinely future date is a caller bug (events haven't
@@ -839,6 +860,20 @@ class SearchMemoryRequest(BaseModel):
             "via POST /v1/memories/batch-get."
         ),
     )
+
+    workspaces: list[str] | None = Field(
+        default=None,
+        description=(
+            "Workspaces to search. Absent = the memory workspace only (default). "
+            "Reference content ingested with a non-default adapter lives in "
+            "'ref-<adapter>[--<title>]'; name it here to recall it."
+        ),
+    )
+
+    @field_validator("workspaces")
+    @classmethod
+    def _validate_workspaces(cls, v: list[str] | None) -> list[str] | None:
+        return validate_workspace_names(v)
 
     @field_validator("domain")
     @classmethod
