@@ -141,6 +141,11 @@ class DeleteMixin:
             if not _is_valid_point_id(memory_id):
                 raise LookupError(f"Memory {memory_id} not found") from None
             raise
+        if mem is None:
+            # A well-formed id that names no stored point: not found, not a
+            # server fault (the route maps LookupError to 404; a genuine
+            # store failure raised above and still propagates).
+            raise LookupError(f"Memory {memory_id} not found")
 
         # Permission gate: enforce ownership/visibility rules when caller_user_id
         # is provided (backward-compatible: None skips the gate, existing tests).
