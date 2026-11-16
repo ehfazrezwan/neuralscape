@@ -1,0 +1,110 @@
+"""Batch store: item ``workspace`` is honoured, and graph enrichment is deferred to the graph queue."""
+
+from __future__ import annotations
+
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+
+import worker
+from config import settings
+from memory_service import MemoryService
+from schemas import CheckpointRequest, MemoryResponse
+
+
+@pytest.fixture
+def service():
+    svc = MemoryService()
+    svc._memory = MagicMock(name="Memory")
+    svc._graphiti = MagicMock(name="Graphiti")
+    svc._bridge = MagicMock(name="AsyncBridge")
+    svc._memory.graph = MagicMock()
+    svc._memory.embedding_model.embed_batch.side_effect = lambda texts, **kw: [[0.1] * 8 for _ in texts]
+    svc._attach_memory_id_to_graph_nodes = MagicMock(name="attach")
+    svc._find_by_content_hash = lambda **kw: None
+    svc._revive_if_tombstoned = MagicMock(return_value=False)
+    svc.enrich_graph = MagicMock(name="enrich_graph", return_value=True)
+    return svc
+
+
+def _items(workspace=None):
+    base = {"user_id": "alice", "category": "preference"}
+    ws = {"workspace": workspace} if workspace else {}
+    return [{"content": f"batch fact {n} about harbours", **base, **ws} for n in (1, 2)]
+
+
+def _payloads(service):
+    return [c.kwargs["payloads"][0] for c in service._memory.vector_store.insert.call_args_list]
+
+
+def test_item_workspace_is_stored_in_that_workspace(service):
+    out = service.store_raw_batch(_items("ref-books"))
+    assert len(out) == 2
+    assert [p["metadata"].get("workspace") for p in _payloads(service)] == ["ref-books", "ref-books"]
+
+
+def test_same_text_in_two_workspaces_is_two_rows_not_a_batch_duplicate(service):
+    items = [
+        {"content": "same text", "user_id": "alice", "category": "preference"},
+        {"content": "same text", "user_id": "alice", "category": "preference", "workspace": "ref-a"},
+    ]
+    service.store_raw_batch(items)
+    assert service._memory.vector_store.insert.call_count == 2
+
+
+def test_graph_jobs_replace_inline_enrichment(service):
+    jobs: list[dict] = []
+    out = service.store_raw_batch(_items("ref-books"), graph_jobs=jobs)
+    service.enrich_graph.assert_not_called()
+    assert [j["memory_id"] for j in jobs] == [m.id for m in out]
+    assert {j["workspace"] for j in jobs} == {"ref-books"}
+    assert all(j["user_id"] == "alice" and j["content"] and j["visibility"] for j in jobs)
+
+
+def test_without_graph_jobs_enrichment_stays_inline(service):
+    service.store_raw_batch(_items())
+    assert service.enrich_graph.call_count == 2
+
+
+@pytest.fixture
+def ctx():
+    redis = MagicMock()
+    redis.enqueue_job = AsyncMock()
+    return {"service": MagicMock(), "redis": redis}
+
+
+@pytest.mark.asyncio
+async def test_batch_job_enqueues_one_graph_job_per_row_on_the_graph_queue(ctx):
+    def store(items, dedup_ids=None, graph_jobs=None):
+        assert graph_jobs is not None, "the batch job must defer graph work"
+        graph_jobs.extend(
+            {"memory_id": f"m{i}", "content": it["content"], "user_id": "alice", "project_id": None,
+             "visibility": "private", "source_ref": None, "workspace": None}
+            for i, it in enumerate(items)
+        )
+        return [MemoryResponse(id=f"m{i}", memory=it["content"], category="preference") for i, it in enumerate(items)]
+
+    ctx["service"].store_raw_batch.side_effect = store
+    out = await worker.process_memory_raw_batch(ctx, _items())
+    calls = ctx["redis"].enqueue_job.call_args_list
+    assert [c.args[0] for c in calls] == ["process_graph_enrichment"] * 2
+    assert all(c.kwargs["_queue_name"] == settings.graph_queue_name for c in calls)
+    assert out["graph_jobs_enqueued"] == 2
+    ctx["service"].enrich_graph.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_batch_runs_end_to_end_with_no_inline_graph_calls(service, ctx):
+    from checkpoint import prepare_checkpoint
+
+    req = CheckpointRequest(
+        memories=[{"content": f"checkpoint fact {n}", "category": "preference"} for n in range(5)],
+        session_note={"learned": "a lot"},
+    )
+    prepared = prepare_checkpoint(service, req, "alice")
+    ctx["service"] = service
+    out = await worker.process_memory_raw_batch(ctx, prepared["to_enqueue"])
+    assert len(out["memories"]) == len(prepared["to_enqueue"]) == 6
+    service.enrich_graph.assert_not_called()
+    assert out["graph_jobs_enqueued"] == 6
+    assert ctx["redis"].enqueue_job.await_count == 6
