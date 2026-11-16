@@ -227,3 +227,12 @@ describe("request and upload carry the Bearer token to the resolved URL", () => 
     expect((await run(["bogus"], "", withUrl())).code).toBe(2);
   });
 });
+
+describe("the skills use the helper, not hand-written curl", () => {
+  it.each(["sync", "ingest", "search"])("%s names the helper and has no curl command", async (skill) => {
+    const { readFileSync } = await import("node:fs");
+    const text = readFileSync(join(PLUGIN_ROOT, "skills", skill, "SKILL.md"), "utf8");
+    expect(text).toContain("scripts/sync.js");
+    expect(text).not.toMatch(/curl\s+-/);
+  });
+});
