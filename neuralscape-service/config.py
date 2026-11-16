@@ -723,6 +723,13 @@ class Settings(BaseSettings):
     # Format: "alice@example.com:alice,ops@example.com:ops-bot"
     auth_identity_map: str = ""
 
+    # Optional allowlist of hosts an OAuth client may register as a redirect
+    # target (comma-separated, case-insensitive; "host" or "host:port"). Empty
+    # (the default) keeps today's rule: any https URI, or http to loopback.
+    # A bare host matches the scheme's default port only. Loopback hosts stay
+    # allowed for native clients even when this is set (RFC 8252 section 7.3).
+    oauth_redirect_host_allowlist: str = ""
+
     # ── Dictator role + authoritative "standard" memory tier ─────────────
     # Feature-flagged OFF by default so the public/generic build behaves
     # identically until a deployment opts in.
@@ -1136,6 +1143,14 @@ class Settings(BaseSettings):
         return {
             e.strip().lower()
             for e in self.auth_email_allowlist.split(",")
+            if e.strip()
+        }
+
+    def oauth_redirect_host_allowlist_set(self) -> set[str]:
+        """Lowercased ``host`` / ``host:port`` entries of the redirect-host allowlist."""
+        return {
+            e.strip().lower()
+            for e in self.oauth_redirect_host_allowlist.split(",")
             if e.strip()
         }
 
