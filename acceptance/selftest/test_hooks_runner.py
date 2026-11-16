@@ -39,10 +39,10 @@ def test_run_hook_passes_stdin_and_plugin_env(tmp_path):
 
 def test_run_hook_reports_exit_code_and_non_json(tmp_path):
     (tmp_path / "bad.js").write_text("process.stdout.write('not json'); process.exit(2);")
-    res = run_hook("bad", {}, base_url="http://x", token=None, user_id="u", scripts_dir=tmp_path)
+    res = run_hook("bad", {}, base_url="http://127.0.0.1:9", token=None, user_id="u", scripts_dir=tmp_path)
     assert res.returncode == 2 and res.data is None and res.stdout == "not json"
 
 
 def test_missing_script_raises(tmp_path):
     with pytest.raises(FileNotFoundError):
-        run_hook("nope", {}, base_url="http://x", token=None, user_id="u", scripts_dir=tmp_path)
+        run_hook("nope", {}, base_url="http://127.0.0.1:9", token=None, user_id="u", scripts_dir=tmp_path)

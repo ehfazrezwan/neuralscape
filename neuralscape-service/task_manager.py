@@ -10,6 +10,7 @@ import logging
 import time
 
 from arq.connections import ArqRedis, create_pool
+from arq.constants import result_key_prefix
 from arq.jobs import Job, JobStatus
 
 from config import parse_redis_settings, settings
@@ -503,13 +504,7 @@ class TaskManager:
         cached job, result or read grant with the previous instance.
         """
         job_id = connector_sync_job_id(connector_id, user_id, generation)
-        job = await self.pool.enqueue_job(
-            "process_connector_sync",
-            connector_id,
-            generation,
-            _job_id=job_id,
-            _queue_name=settings.ingest_queue_name,
-        )
+        job = await enqueue_connector_sync_job(self.pool, connector_id, generation, job_id)
         task_id = job_id if job is None else job.job_id
         await self._track_task(user_id, task_id)
         return task_id
@@ -853,6 +848,38 @@ class TaskManager:
             if self.authority is not None:
                 await asyncio.to_thread(self.authority.close)
             self.producer = self.ledger = self.authority = None
+
+
+async def enqueue_connector_sync_job(pool, connector_id: str, generation: str | None, job_id: str):
+    """Enqueue a connector sync under ``job_id``, coalescing only with a run still in flight.
+
+    Returns the new job, or ``None`` when the sync was coalesced onto a run that
+    is queued, deferred or running. ARQ refuses an id whose result is still
+    cached (an hour after it finished), so with a deterministic id a sync
+    requested after the previous one completed would be silently dropped and a
+    poller would read the previous run's result. For a finished run the cached
+    result is cleared and a fresh job is enqueued; a client still polling the
+    old run with the same id sees the new run's state instead of the old result.
+    Shared by ``TaskManager.enqueue_connector_sync`` and ``connector_sync_cron``.
+    """
+
+    async def _enqueue():
+        return await pool.enqueue_job(
+            "process_connector_sync",
+            connector_id,
+            generation,
+            _job_id=job_id,
+            _queue_name=settings.ingest_queue_name,
+        )
+
+    job = await _enqueue()
+    if job is not None:
+        return job
+    status = await Job(job_id, pool, _queue_name=settings.ingest_queue_name).status()
+    if status != JobStatus.complete:
+        return None  # queued / deferred / running: coalesce onto it
+    await pool.delete(result_key_prefix + job_id)
+    return await _enqueue()
 
 
 def connector_sync_job_id(

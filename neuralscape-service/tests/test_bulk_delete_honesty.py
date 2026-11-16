@@ -116,15 +116,15 @@ def test_a_private_row_behind_many_preserved_shared_rows_is_still_reached(svc):
     assert "Deleted 1 memories" in out["message"] and "preserved" in out["message"]
 
 
-def test_a_tombstoned_row_survives_a_filtered_delete_while_exhaustion_is_still_raw(svc):
-    """Dream tombstones are reversible and a filtered sweep never touched them; raw page size still decides exhaustion."""
+def test_tombstoned_rows_are_erased_by_a_filtered_delete_and_exhaustion_is_still_raw(svc):
+    """Tombstones are erased like any row (see test_bulk_delete_tombstones); raw page size still decides exhaustion."""
     rows = [_raw(f"t{i}", tombstoned=True) for i in range(_BULK_PAGE)] + [_raw("live")]
     _wire_listing(svc, rows)
     svc._memory.delete.side_effect = _deleting(rows)
     out = svc.delete_memories(user_id="u", category="tech_stack")
-    ids = [r["id"] for r in rows]
-    assert "live" not in ids and all(f"t{i}" in ids for i in range(_BULK_PAGE))    # tombstones kept, live row reached
+    assert rows == []                                   # tombstones erased, live row reached
     assert out["truncated"] is False
+    assert f"Deleted {_BULK_PAGE + 1} memories" in out["message"]
 
 
 def test_listing_failure_before_any_deletion_raises(svc):
