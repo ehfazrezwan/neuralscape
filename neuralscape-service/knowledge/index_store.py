@@ -171,6 +171,14 @@ def get_index(code_space: str) -> dict | None:
 # ── Project routing config ──────────────────────────────────────────
 
 
+def cache_project_config(project_id: str, config: dict) -> None:
+    """Refresh the in-process L1 after a write that already reached Redis."""
+    import time as _t
+
+    _mem_cfg[project_id] = dict(config)
+    _mem_cfg_at[project_id] = _t.monotonic()
+
+
 def save_project_config(project_id: str, config: dict) -> None:
     """Persist a project's routing config (best-effort; never raises)."""
     import time as _t
