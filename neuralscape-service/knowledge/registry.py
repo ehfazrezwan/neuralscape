@@ -70,6 +70,43 @@ def list_systems() -> list[str]:
     return sorted(KNOWLEDGE_REGISTRY.keys())
 
 
+def code_space_matches_project(code_space: str | None, project_id: str) -> tuple[bool, str]:
+    """Does ``code_space`` (``code--owner--repo``) belong to ``project_id``'s repo?
+
+    The project's repo is the ``code_space`` recorded in its knowledge config at
+    index time. A match is the same code_space, or two code_spaces that
+    ``CODE_REPOS`` maps to the same directory. A project with no recorded
+    code_space has no repo to compare against, so it is not constrained. Never
+    raises: any lookup failure leaves the system eligible (the older behavior).
+    Returns ``(ok, reason)``; ``reason`` explains a refusal.
+    """
+    try:
+        from knowledge.router import get_project_config
+
+        cfg = get_project_config(project_id)
+    except Exception:  # noqa: BLE001 - config store trouble must not break routing
+        logger.debug("project config lookup failed for %s", project_id, exc_info=True)
+        return True, ""
+    project_space = getattr(cfg, "code_space", None) if cfg is not None else None
+    if not project_space:
+        return True, ""
+    if code_space == project_space:
+        return True, ""
+    try:
+        from config import settings
+        from knowledge.code_dispatch import repo_path_for_code_space
+
+        engine_path = repo_path_for_code_space(code_space or "", settings)
+        project_path = repo_path_for_code_space(project_space, settings)
+        if engine_path and engine_path == project_path:
+            return True, ""
+    except Exception:  # noqa: BLE001
+        logger.debug("repo path comparison failed", exc_info=True)
+    return False, (
+        f"code_space {code_space!r} does not match project repo {project_space!r}"
+    )
+
+
 def eligible_systems(
     project_id: str | None = None,
     operation: str | None = None,
@@ -156,9 +193,16 @@ def eligible_systems(
                         project_id,
                     )
                     continue
-                # TODO Phase G: Also check if code_space matches the project's repo
-                # (e.g. code--owner--{project_repo}). For now, any non-placeholder
-                # indexed engine is eligible.
+                # A code_space bound to a project must be that project's repo.
+                ok, reason = code_space_matches_project(code_space, project_id)
+                if not ok:
+                    logger.debug(
+                        "System %s ineligible for project %s: %s",
+                        name,
+                        project_id,
+                        reason,
+                    )
+                    continue
 
         eligible.append(system)
 
