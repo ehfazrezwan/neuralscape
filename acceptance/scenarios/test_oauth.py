@@ -8,10 +8,11 @@ the consent page, a login by pasting an admin-issued token, the PKCE code exchan
 used as a Bearer on REST and MCP, refresh, and replay protection.
 
 Profiles ``oauth-google`` and ``oauth-supabase`` prove everything up to the external identity
-provider and STOP there: the consent page offers the provider's button wired to the configured
-client, and the provider callbacks refuse a login whose signed state is missing or invalid. What
-needs a real identity provider (the redirect to Google/Supabase and the identity token coming
-back) is not exercised, so ``auth.login-google`` / ``auth.login-supabase`` are not claimed.
+provider: the consent page offers the provider's button wired to the configured client, and the
+provider callbacks refuse a login whose signed state is missing or invalid. Google stops there (it
+needs a real identity provider; the redirect to Google and the identity token coming back are not
+exercised), so ``auth.login-google`` is not claimed. Supabase is proven end to end against a fake
+Supabase auth service in ``test_oauth_supabase_login.py``, which claims ``auth.login-supabase``.
 """
 
 from __future__ import annotations
@@ -21,6 +22,7 @@ import hashlib
 import html
 import re
 import secrets
+import time
 from dataclasses import dataclass, field
 from urllib.parse import parse_qs, urlparse
 
@@ -160,6 +162,7 @@ def login(ctx, anon) -> Login:
         assert r.status_code == 200, f"POST /oauth/token (code) -> {r.status_code}: {r.text[:200]}"
         lg.tokens = r.json()
         lg.replay_code = exchange(anon, lg.client_id, lg.verifier, lg.code)
+        time.sleep(1.1)  # access tokens are stateless with 1 s granularity: a same-second refresh can return identical bytes
         rf = anon.post("/oauth/token", data={"grant_type": "refresh_token", "refresh_token": lg.tokens["refresh_token"]})
         assert rf.status_code == 200, f"POST /oauth/token (refresh) -> {rf.status_code}: {rf.text[:200]}"
         lg.refreshed = rf.json()
@@ -428,8 +431,7 @@ def test_a_pasted_token_still_logs_in_under_the_supabase_provider(ctx, anon):
 @profiles("oauth-google", "oauth-supabase")
 @proves("auth.consent-page")
 def test_the_authorize_response_binds_the_login_to_the_browser_that_started_it(anon):
-    """EXPECTED RED UNTIL PR #536 merges (login-state binding; the expected-red marker is not on dev yet, so
-    the assertion is plain). GET /oauth/authorize must set the login-binding cookie: HttpOnly, SameSite=Lax,
+    """Login-state binding. GET /oauth/authorize must set the login-binding cookie: HttpOnly, SameSite=Lax,
     named ns_login_bind (plain http) or __Host-ns_login_bind (https public URL), so a login state built by
     someone else cannot be completed in a victim's browser."""
     client_id = register(anon)

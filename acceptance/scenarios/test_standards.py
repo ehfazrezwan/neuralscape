@@ -287,7 +287,12 @@ def test_admin_open_check_fails_for_a_non_dictator(ctx, a, dictator):
 
 
 def check_config(body: dict, project: str, systems: list[str], fuse: bool, engine: str | None) -> None:
-    assert body == {"project_id": project, "code_systems": systems, "fuse_code_into_recall": fuse, "default_engine": engine}, f"config: {body}"
+    # code_space / op_preference are read-only here (the PUT body cannot set them; only indexing does), and
+    # this project is never indexed, so both stay None through every write and read.
+    assert body == {
+        "project_id": project, "code_systems": systems, "fuse_code_into_recall": fuse, "default_engine": engine,
+        "code_space": None, "op_preference": None,
+    }, f"config: {body}"
 
 
 @proves("knowledge.router", "auth.dictator-role")
