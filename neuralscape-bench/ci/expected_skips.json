@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "comment": "Skips the bench suites are expected to produce in CI. The gate (scripts/ci_skip_gate.py) fails on any skip not listed here and on any listed skip that did not happen. Test ids are '<junit classname>::<name>', relative to the copied suite root.",
+  "skips": [
+    {
+      "test": "icebench.tests.test_corpora::test_fetch_corpus_mock",
+      "reason_contains": "Skipping network fetch in unit tests",
+      "why": "unconditional pytest.skip: the test would fetch a corpus over the network and CI runs the container with --network none"
+    },
+    {
+      "test": "icebench.systems.cbm_standalone.test_adapter::test_live_index_query_teardown",
+      "reason_contains": "cbm binary not installed",
+      "why": "needs the codebase-memory-mcp binary at a fixed host path that CI images do not carry"
+    },
+    {
+      "test": "icebench.systems.graphify_standalone.test_adapter::test_live_index_and_query",
+      "reason_contains": "graphify not installed",
+      "why": "needs a graphify install at a fixed host path that CI images do not carry"
+    }
+  ]
+}

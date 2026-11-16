@@ -53,23 +53,26 @@ jobs:
       - name: Copy only declared test fixtures
         run: |
           set -eu
+          n=neuralscape-bench
           suite="$RUNNER_TEMP/bench-test-suite"
-          mkdir -p "$suite/icebench/trackq" "$suite/icebench/tokensave"
-          cp -R neuralscape-bench/tests "$suite/tests"
-          cp -R neuralscape-bench/icebench/tests "$suite/icebench/tests"
-          cp -R neuralscape-bench/icebench/trackq/tests "$suite/icebench/trackq/tests"
-          cp -R neuralscape-bench/icebench/tokensave/tests "$suite/icebench/tokensave/tests"
+          mkdir -p "$suite/icebench/trackq" "$suite/icebench/tokensave" "$suite/scripts"
+          cp -R $n/tests "$suite/tests"
+          cp -R $n/icebench/tests "$suite/icebench/tests"
+          cp -R $n/icebench/trackq/tests "$suite/icebench/trackq/tests"
+          cp -R $n/icebench/tokensave/tests "$suite/icebench/tokensave/tests"
+          cp -R $n/ci "$suite/ci"
+          cp $n/scripts/ci_skip_gate.py $n/scripts/ci_run_suite.sh "$suite/scripts/"
+      # scripts/ci_run_suite.sh lists every suite. Suites inside a package that use relative
+      # imports (icebench/report, the *_standalone adapters, trackb/*) run from the INSTALLED
+      # wheel via --pyargs (trackb is packaged for that); they cannot be copied out of their
+      # package. Not run: trackb/longmemeval_ref test_loader (needs the runtime-downloaded
+      # LongMemEval dataset). The runner also asserts every suite ran and applies the skip gate
+      # (neuralscape-bench/ci/expected_skips.json).
       - name: Run complete declared bench tests
         working-directory: ${{ runner.temp }}/bench-test-suite
         run: |
-          set -eu
-          python -m pytest -q -p no:cacheprovider --import-mode=importlib \
-            -o asyncio_mode=auto \
-            --strict-config --strict-markers \
-            --junitxml="$RUNNER_TEMP/bench-host-junit.xml" \
-            tests icebench/tests icebench/trackq/tests icebench/tokensave/tests
-          python "$GITHUB_WORKSPACE/neuralscape-bench/scripts/ci_wheel_smoke.py" \
-            --assert-junit "$RUNNER_TEMP/bench-host-junit.xml"
+          sh scripts/ci_run_suite.sh "$RUNNER_TEMP/bench-host-junit.xml" \
+            "$GITHUB_WORKSPACE/neuralscape-bench/scripts/ci_wheel_smoke.py"
 
   container-wheel-tests:
     runs-on: ubuntu-latest
