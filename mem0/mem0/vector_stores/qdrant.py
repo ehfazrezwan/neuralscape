@@ -38,6 +38,7 @@ class Qdrant(VectorStoreBase):
         url: str = None,
         api_key: str = None,
         on_disk: bool = False,
+        timeout: Optional[int] = None,  # NEURALSCAPE PATCH
     ):
         """
         Initialize the Qdrant vector store.
@@ -53,6 +54,8 @@ class Qdrant(VectorStoreBase):
             api_key (str, optional): API key for Qdrant server. Defaults to None.
             on_disk (bool, optional): Enables persistent storage. Vectors are stored on disk (True) or in memory (False).
                 Does not delete the local database path. Defaults to False.
+            timeout (int, optional): Per-request timeout in seconds passed to QdrantClient
+                (NEURALSCAPE PATCH). None keeps qdrant-client's default.
         """
         if client:
             self.client = client
@@ -72,6 +75,11 @@ class Qdrant(VectorStoreBase):
                 self.is_local = True
             else:
                 self.is_local = False
+
+            # NEURALSCAPE PATCH: honour a configured request timeout (qdrant-client's
+            # default of ~5 s is too short for large scrolls on a loaded host).
+            if timeout is not None:
+                params["timeout"] = timeout
 
             self.client = QdrantClient(**params)
 
