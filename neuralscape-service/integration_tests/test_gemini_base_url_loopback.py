@@ -10,6 +10,7 @@ per connection), the SDK client is closed, and the process-wide override is undo
 
 from __future__ import annotations
 
+import gc
 import json
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -82,26 +83,66 @@ def stand_in():
         assert not thread.is_alive(), "the loopback stand-in did not stop"
 
 
+def _close_clients(service) -> None:
+    """Close every Gemini client the service built, on the loop that owns it, then collect garbage.
+
+    The vendored clients own async HTTP pools bound to the service's bridge loop.  Left to the garbage
+    collector, their finalisers could fire later inside a loop that belongs to another test and schedule
+    a close of connections that belong to a loop that is gone.  Closing them here, while their loop still
+    runs, and collecting with no loop running, leaves nothing that refers to the stand-in.
+    """
+
+    graphiti = getattr(service, "_graphiti", None)
+    embedder = getattr(graphiti, "embedder", None)
+    aio = getattr(getattr(embedder, "client", None), "aio", None)
+    if aio is not None:
+        try:
+            service._run_on_bridge(aio.aclose(), timeout=10.0)
+        except Exception:  # noqa: BLE001 - teardown must go on
+            pass
+    memory = getattr(service, "_memory", None)
+    for client in (
+        getattr(getattr(memory, "embedding_model", None), "client", None),
+        getattr(embedder, "client", None),
+        service._genai_model,
+    ):
+        close = getattr(client, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:  # noqa: BLE001
+                pass
+    service.close()
+    gc.collect()
+
+
 @pytest.fixture()
 def routed_service(flags, stores, unique_ns, stand_in):
-    """The real service, built after the override is set, over a Qdrant collection of its own."""
+    """The real service, built after the override is set, over a Qdrant collection of its own.
+
+    The override patches the SDK client class for the whole process, so it is undone in a ``finally``
+    that covers everything after it can be applied (a service that fails to build included), and the
+    settings and environment go back through ``flags`` (monkeypatch).
+    """
     from qdrant_client import QdrantClient
 
     from memory_service import MemoryService
 
-    provider_routing.reset()  # the override patches the SDK class for the whole process
-    url = f"http://127.0.0.1:{stand_in.server_address[1]}"
-    flags(ns_gemini_base_url=url, google_api_key="nsit-not-a-real-key", qdrant_collection=unique_ns.qdrant_collection)
-    service = MemoryService()
-    unique_ns.on_cleanup(lambda: QdrantClient(url=stores.qdrant_url).delete_collection(unique_ns.qdrant_collection))
+    provider_routing.reset()
+    service = None
     try:
+        url = f"http://127.0.0.1:{stand_in.server_address[1]}"
+        flags(ns_gemini_base_url=url, google_api_key="nsit-not-a-real-key", qdrant_collection=unique_ns.qdrant_collection)
+        unique_ns.on_cleanup(lambda: QdrantClient(url=stores.qdrant_url).delete_collection(unique_ns.qdrant_collection))
+        service = MemoryService()
         yield service
     finally:
-        client = service._genai_model
-        if client is not None:
-            client.close()
-        service.close()
-        provider_routing.reset()
+        try:
+            if service is not None:
+                _close_clients(service)
+        finally:
+            provider_routing.reset()
+            assert not provider_routing._APPLIED
 
 
 def test_every_gemini_client_the_service_builds_reaches_the_configured_endpoint(routed_service, stand_in):
