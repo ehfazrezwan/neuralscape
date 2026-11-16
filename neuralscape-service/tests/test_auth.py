@@ -155,6 +155,15 @@ class TestAuthEnabled:
         )
         assert resp.status_code == 200
 
+    @pytest.mark.parametrize("token", ["éé".encode("latin-1"), "key\xff".encode("latin-1")])
+    def test_a_non_ascii_token_is_refused_as_invalid_not_a_server_error(self, token):
+        """The shared-key comparison is made on bytes: a token with non-ASCII characters is just wrong."""
+        client = TestClient(app, raise_server_exceptions=False)
+        resp = client.get("/v1/memories", params={"user_id": "test"},
+                          headers={"Authorization": b"Bearer " + token})
+        assert resp.status_code == 401
+        assert "Invalid" in resp.json()["detail"]
+
     def test_legacy_endpoint_requires_auth(self):
         client = TestClient(app, raise_server_exceptions=False)
         resp = client.get("/memories", params={"user_id": "test"})

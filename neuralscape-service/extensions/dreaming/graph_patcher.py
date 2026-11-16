@@ -489,8 +489,13 @@ async def find_contradicted_edges(
     (the new edge's ``valid_at``) and ``expired_at`` (now) on an older edge.
     Requiring ``invalid_at`` excludes the episode-delete cascade, which only
     sets ``expired_at``. ``expired_at >= write_started_at`` bounds the probe
-    to this write's window, and ``NOT new_episode_uuid IN episodes`` drops the
-    new episode's own edges (an out-of-order new edge is born expired).
+    to this write's window. The edge must cite SOME episode other than the new
+    one: an edge born expired by the new episode cites only it (drop), but when
+    Graphiti resolves the new episode's extracted edge as a duplicate of an
+    existing one it APPENDS the new episode to that edge's ``episodes`` and
+    then invalidates it, so the invalidated old edge cites ``[old, new]``
+    (the old ``NOT new IN episodes`` predicate wrongly dropped exactly that
+    case). ``episodes`` in the result excludes the new episode.
 
     Returns ``[{"uuid", "fact", "episodes": [...]}]``. Best-effort — logs and
     returns ``[]`` on any driver error (never raises).
@@ -502,7 +507,7 @@ async def find_contradicted_edges(
     WHERE r.group_id = $group_id
       AND r.invalid_at IS NOT NULL
       AND r.expired_at >= datetime($since)
-      AND NOT $new_episode_uuid IN coalesce(r.episodes, [])
+      AND any(ep IN coalesce(r.episodes, []) WHERE ep <> $new_episode_uuid)
     RETURN r.uuid AS uuid, r.fact AS fact, coalesce(r.episodes, []) AS episodes
     """
     try:
@@ -513,7 +518,12 @@ async def find_contradicted_edges(
                 since=write_started_at.astimezone(timezone.utc).isoformat(),
                 new_episode_uuid=new_episode_uuid,
             )
-            return list(await result.data())
+            rows = list(await result.data())
+            for row in rows:
+                row["episodes"] = [
+                    ep for ep in (row.get("episodes") or []) if ep != new_episode_uuid
+                ]
+            return rows
     except Exception:
         logger.warning(
             "find_contradicted_edges failed for group_id=%s (non-fatal)",

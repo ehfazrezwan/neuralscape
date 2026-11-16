@@ -190,6 +190,26 @@ class NativeEdgeEnvelope(ContractModel):
     children: list[ExampleContract]
 
 
+class PublicTupleEdgeEnvelope(ContractModel):
+    trigger: tuple[int, ...]
+    children: tuple[ExampleContract, ...]
+
+
+class PublicNestedSequenceEnvelope(ContractModel):
+    primary: tuple[tuple[ExampleContract, ...], ...]
+    sibling: tuple[int, ...]
+
+
+class ExtraSequenceEnvelope(ContractModel):
+    count: SafeCounter
+    trigger: tuple[int, ...]
+
+
+class AliasedSequenceEnvelope(ContractModel):
+    count: SafeCounter = Field(alias="n")
+    trigger: tuple[int, ...]
+
+
 class TenantTargetEnvelope(ContractModel):
     tenant_id: OpaqueId
     target_refs: tuple[ReferenceHandle, ...]
@@ -454,6 +474,17 @@ class RepairingList(list[int]):
         return list.__iter__(self)
 
 
+class RaisingTuple(tuple[int, ...]):
+    def __new__(cls, values: tuple[int, ...]) -> "RaisingTuple":
+        instance = tuple.__new__(cls, values)
+        instance.iteration_calls = 0
+        return instance
+
+    def __iter__(self):  # type: ignore[no-untyped-def]
+        self.iteration_calls += 1
+        raise RuntimeError("sequence sentinel")
+
+
 class DivergentTuple(tuple[object, ...]):
     def __new__(
         cls,
@@ -586,6 +617,270 @@ def test_snapshot_contract_graph_preserves_sequence_subclass_public_view(
     assert type(snapshot) is type(expected)
     assert value.iteration_calls == 1
     assert adapter.validate_python(snapshot, strict=True) == expected
+
+
+def _public_only_invalid_child_envelope(
+    sequence_kind: str,
+) -> tuple[
+    NativeEdgeEnvelope | PublicTupleEdgeEnvelope,
+    ExampleContract,
+    DivergentTuple | DivergentList,
+    type[NativeEdgeEnvelope] | type[PublicTupleEdgeEnvelope],
+]:
+    child = ExampleContract(count=1).model_copy(update={"count": -1})
+    if sequence_kind == "tuple":
+        sequence: DivergentTuple | DivergentList = DivergentTuple((), (child,))
+        value: NativeEdgeEnvelope | PublicTupleEdgeEnvelope = (
+            PublicTupleEdgeEnvelope(trigger=(), children=())
+        )
+        receiver: type[NativeEdgeEnvelope] | type[PublicTupleEdgeEnvelope] = (
+            PublicTupleEdgeEnvelope
+        )
+    else:
+        sequence = DivergentList([], [child])
+        value = NativeEdgeEnvelope(trigger=(), children=[])
+        receiver = NativeEdgeEnvelope
+    native = _BASE_MODEL_DICT_DESCRIPTOR.__get__(value, BaseModel)
+    dict.__setitem__(native, "children", sequence)
+    return value, child, sequence, receiver
+
+
+@pytest.mark.parametrize("sequence_kind", ["tuple", "list"])
+@pytest.mark.parametrize(
+    "earlier_callback",
+    ["stored-hash", "stored-equality", "custom-extra"],
+)
+def test_snapshot_contract_graph_preserves_published_model_prefix_order(
+    sequence_kind: str,
+    earlier_callback: str,
+) -> None:
+    """Model names/extras remain authoritative before public field views."""
+
+    # The published receiver observes model-name and custom-extra protocols
+    # before a field's subclass iterator. A child exposed only by that later
+    # iterator has no recoverable pre-callback state, so this is intentionally
+    # an acceptance control rather than a simultaneous-history guarantee.
+
+    ordinary, _, ordinary_sequence, receiver = (
+        _public_only_invalid_child_envelope(sequence_kind)
+    )
+    ordinary_snapshot = snapshot_contract_graph(ordinary)
+    with pytest.raises(ValidationError) as ordinary_error:
+        receiver.model_validate(ordinary_snapshot, strict=True)
+    assert ordinary_error.value.errors()[0]["type"] == "greater_than_equal"
+    assert ordinary_error.value.errors()[0]["loc"] == ("children", 0, "count")
+    assert ordinary_error.value.errors()[0]["input"] == -1
+    assert ordinary_sequence.iteration_calls == 1
+
+    valid_child = ExampleContract(count=1)
+    if sequence_kind == "tuple":
+        valid_sequence: DivergentTuple | DivergentList = DivergentTuple(
+            (),
+            (valid_child,),
+        )
+        valid: NativeEdgeEnvelope | PublicTupleEdgeEnvelope = (
+            PublicTupleEdgeEnvelope(trigger=(), children=())
+        )
+    else:
+        valid_sequence = DivergentList([], [valid_child])
+        valid = NativeEdgeEnvelope(trigger=(), children=[])
+    valid_native = _BASE_MODEL_DICT_DESCRIPTOR.__get__(valid, BaseModel)
+    dict.__setitem__(valid_native, "children", valid_sequence)
+    valid_snapshot = snapshot_contract_graph(valid)
+    assert receiver.model_validate(valid_snapshot, strict=True)
+    assert valid_sequence.iteration_calls == 1
+
+    value, child, sequence, receiver = _public_only_invalid_child_envelope(sequence_kind)
+    native = _BASE_MODEL_DICT_DESCRIPTOR.__get__(value, BaseModel)
+    repair_calls = 0
+
+    def repair_child() -> None:
+        nonlocal repair_calls
+        repair_calls += 1
+        child_native = _BASE_MODEL_DICT_DESCRIPTOR.__get__(child, BaseModel)
+        dict.__setitem__(child_native, "count", 1)
+
+    stored_name = None
+    extras = None
+    if earlier_callback == "custom-extra":
+        extras = RepairingMapping(repair_child)
+        _BASE_MODEL_EXTRA_DESCRIPTOR.__set__(value, extras)
+    else:
+        hook = earlier_callback.removeprefix("stored-")
+        stored_name = RepairingStoredName("trigger", repair_child, hook)
+        stored_value = dict.pop(native, "trigger")
+        dict.__setitem__(native, stored_name, stored_value)
+        stored_name.armed = True
+        stored_name.hash_calls = 0  # setup hashed the name once
+        stored_name.equality_calls = 0
+
+    snapshot = snapshot_contract_graph(value)
+
+    assert sequence.iteration_calls == 1
+    if stored_name is not None:
+        # A ``str``-subclass stored name is read as its text: its hash and
+        # equality hooks never run, so they cannot repair the child before the
+        # sequence's public view is read.  The child is judged as the caller
+        # left it, exactly as in the ordinary control above.
+        assert stored_name.hash_calls == 0
+        assert stored_name.equality_calls == 0
+        assert repair_calls == 0
+        assert child.count == -1
+        assert snapshot["children"] == (
+            ({"count": -1},) if sequence_kind == "tuple" else [{"count": -1}]
+        )
+        with pytest.raises(ValidationError) as stored_error:
+            receiver.model_validate(snapshot, strict=True)
+        assert stored_error.value.errors()[0]["type"] == "greater_than_equal"
+        assert stored_error.value.errors()[0]["loc"] == ("children", 0, "count")
+        return
+    assert repair_calls == 1
+    assert child.count == 1
+    expected_children = (
+        ({"count": 1},)
+        if sequence_kind == "tuple"
+        else [{"count": 1}]
+    )
+    assert snapshot["children"] == expected_children
+    assert extras is not None
+    assert extras.item_reads == 1
+    assert receiver.model_validate(snapshot, strict=True)
+
+
+@pytest.mark.parametrize("sequence_kind", ["tuple", "list"])
+def test_snapshot_contract_graph_preserves_late_discovered_public_sequence_view(
+    sequence_kind: str,
+) -> None:
+    if sequence_kind == "tuple":
+        sequence: DivergentTuple | DivergentList = DivergentTuple((1,), (2,))
+        expected: tuple[int, ...] | list[int] = (2,)
+    else:
+        sequence = DivergentList([1], [2])
+        expected = [2]
+    extras = SingleReadMapping({"future_sequence": sequence})
+    value = ExampleContract(count=1)
+    _BASE_MODEL_EXTRA_DESCRIPTOR.__set__(value, extras)
+
+    snapshot = snapshot_contract_graph(value)
+
+    assert snapshot == {"count": 1, "future_sequence": expected}
+    assert extras.item_reads == 1
+    assert sequence.iteration_calls == 1
+
+
+def test_snapshot_contract_graph_drains_nested_public_sequence_before_sibling() -> None:
+    ordinary_child = ExampleContract(count=1).model_copy(update={"count": -1})
+    ordinary_nested = DivergentTuple((), (ordinary_child,))
+    ordinary_outer = DivergentTuple((), (ordinary_nested,))
+    ordinary = PublicNestedSequenceEnvelope(primary=(), sibling=())
+    ordinary_native = _BASE_MODEL_DICT_DESCRIPTOR.__get__(ordinary, BaseModel)
+    dict.__setitem__(ordinary_native, "primary", ordinary_outer)
+    ordinary_snapshot = snapshot_contract_graph(ordinary)
+    with pytest.raises(ValidationError) as ordinary_error:
+        PublicNestedSequenceEnvelope.model_validate(ordinary_snapshot, strict=True)
+
+    child = ExampleContract(count=1).model_copy(update={"count": -1})
+    nested = DivergentTuple((), (child,))
+    outer = DivergentTuple((), (nested,))
+
+    def repair_child() -> None:
+        child_native = _BASE_MODEL_DICT_DESCRIPTOR.__get__(child, BaseModel)
+        dict.__setitem__(child_native, "count", 1)
+
+    sibling = RepairingTuple((), repair_child)
+    value = PublicNestedSequenceEnvelope(primary=(), sibling=())
+    native = _BASE_MODEL_DICT_DESCRIPTOR.__get__(value, BaseModel)
+    dict.__setitem__(native, "primary", outer)
+    dict.__setitem__(native, "sibling", sibling)
+
+    snapshot = snapshot_contract_graph(value)
+
+    assert outer.iteration_calls == 1
+    assert nested.iteration_calls == 1
+    assert sibling.iteration_calls == 1
+    assert child.count == 1
+    assert snapshot["primary"] == (({"count": -1},),)
+    with pytest.raises(ValidationError) as repaired_error:
+        PublicNestedSequenceEnvelope.model_validate(snapshot, strict=True)
+    assert repaired_error.value.errors() == ordinary_error.value.errors()
+
+
+@pytest.mark.parametrize(
+    ("extra", "expected_message"),
+    [
+        (
+            {"count": 9},
+            "contract input contains conflicting declared and extra fields",
+        ),
+        ({"future_state": "deny"}, None),
+    ],
+    ids=["declared-overlap", "unknown-extra"],
+)
+def test_snapshot_contract_graph_captures_custom_extra_before_sequence_deletion(
+    extra: dict[str, object],
+    expected_message: str | None,
+) -> None:
+    ordinary_mapping = SingleReadMapping(dict(extra))
+    ordinary = ExtraSequenceEnvelope(count=1, trigger=())
+    _BASE_MODEL_EXTRA_DESCRIPTOR.__set__(ordinary, ordinary_mapping)
+
+    if expected_message is not None:
+        with pytest.raises(ValueError) as ordinary_error:
+            snapshot_contract_graph(ordinary)
+        assert str(ordinary_error.value) == expected_message
+        ordinary_snapshot = None
+    else:
+        ordinary_snapshot = snapshot_contract_graph(ordinary)
+        with pytest.raises(ValidationError) as ordinary_validation:
+            ExtraSequenceEnvelope.model_validate(ordinary_snapshot, strict=True)
+
+    mutable_extra = dict(extra)
+    mapping = SingleReadMapping(mutable_extra)
+    trigger = RepairingTuple((), mutable_extra.clear)
+    value = ExtraSequenceEnvelope(count=1, trigger=())
+    native = _BASE_MODEL_DICT_DESCRIPTOR.__get__(value, BaseModel)
+    dict.__setitem__(native, "trigger", trigger)
+    _BASE_MODEL_EXTRA_DESCRIPTOR.__set__(value, mapping)
+
+    if expected_message is not None:
+        with pytest.raises(ValueError) as repaired_error:
+            snapshot_contract_graph(value)
+        assert str(repaired_error.value) == str(ordinary_error.value)
+    else:
+        snapshot = snapshot_contract_graph(value)
+        assert snapshot == ordinary_snapshot
+        with pytest.raises(ValidationError) as repaired_validation:
+            ExtraSequenceEnvelope.model_validate(snapshot, strict=True)
+        assert repaired_validation.value.errors() == ordinary_validation.value.errors()
+
+    assert mapping.item_reads == 1
+    assert trigger.iteration_calls == 1
+    assert mutable_extra == {}
+
+
+def test_snapshot_contract_graph_preserves_alias_guard_before_raising_sequence() -> None:
+    ordinary = AliasedSequenceEnvelope(n=1, trigger=())
+    ordinary_native = _BASE_MODEL_DICT_DESCRIPTOR.__get__(ordinary, BaseModel)
+    count = dict.pop(ordinary_native, "count")
+    dict.__setitem__(ordinary_native, "n", count)
+    with pytest.raises(ValueError) as ordinary_error:
+        snapshot_contract_graph(ordinary)
+    assert str(ordinary_error.value) == (
+        "contract input contains conflicting declared and extra fields"
+    )
+
+    raising = RaisingTuple(())
+    value = AliasedSequenceEnvelope(n=1, trigger=())
+    native = _BASE_MODEL_DICT_DESCRIPTOR.__get__(value, BaseModel)
+    count = dict.pop(native, "count")
+    dict.__setitem__(native, "n", count)
+    dict.__setitem__(native, "trigger", raising)
+
+    with pytest.raises(ValueError) as raised:
+        snapshot_contract_graph(value)
+
+    assert str(raised.value) == str(ordinary_error.value)
+    assert raising.iteration_calls == 0
 
 
 def test_snapshot_contract_graph_exposes_hidden_cross_tenant_target() -> None:

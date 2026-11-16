@@ -34,16 +34,13 @@ def _run(coro):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason=(
-        "legacy group ids join user and project with a delimiter that legal ids "
-        "may contain, so different (user, project) tuples can share one namespace"
-    ),
-)
-def test_distinct_namespace_tuples_have_distinct_group_ids() -> None:
+def test_distinct_namespace_tuples_have_distinct_group_ids(monkeypatch) -> None:
+    # Injective group ids are flag-gated (default off); the fix is pinned in its
+    # flag-ON mode, which is the mode this reproduction asserts.
+    from config import settings
     from memory.groups import _build_group_id
+
+    monkeypatch.setattr(settings, "graph_group_id_injective_enabled", True)
 
     colliding_user = _build_group_id("private", "alice--project--payroll")
     plain_project = _build_group_id("private", "alice", project_id="payroll")
@@ -123,7 +120,7 @@ def test_ordinary_emails_slug_deterministically() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Queued graph publication uses the visibility captured at enqueue time
+# Queued graph publication uses the memory's CURRENT visibility
 # ---------------------------------------------------------------------------
 
 
@@ -157,14 +154,6 @@ def _enrich(service: _GraphService, queued_visibility: str) -> dict:
     )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason=(
-        "the graph job publishes the visibility it was enqueued with and never re-reads the "
-        "memory's current visibility, so narrowing a memory while a job is queued is not honored"
-    ),
-)
 def test_queued_graph_job_publishes_current_visibility() -> None:
     service = _GraphService(current_visibility="private")  # narrowed after enqueue
 
@@ -276,11 +265,6 @@ def test_job_ids_are_stable_and_user_scoped() -> None:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason="the edit request has no revision or etag precondition, so a stale edit cannot be refused (schema-level; concurrent-edit reproduction needs real stores)",
-)
 def test_patch_request_carries_an_expected_revision() -> None:
     from schemas import PatchMemoryRequest
 
@@ -389,6 +373,13 @@ class _Pool:
         return True
 
 
+class _ReachableQdrantMemory:
+    """An initialized client whose backing vector store answers."""
+
+    def __init__(self) -> None:
+        self.vector_store = SimpleNamespace(client=SimpleNamespace(get_collections=lambda: []))
+
+
 class _UnreachableQdrantMemory:
     """An initialized client whose backing vector store cannot be reached."""
 
@@ -411,19 +402,12 @@ def _health(monkeypatch, *, memory, pool_reachable: bool = True) -> dict:
     return {"status_code": 200, **response}
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason=(
-        "health marks the vector store 'ok' once its client object exists and never probes the store, "
-        "so an unreachable store is reported healthy"
-    ),
-)
 def test_health_reports_an_unreachable_vector_store(monkeypatch) -> None:
     report = _health(monkeypatch, memory=_UnreachableQdrantMemory())
 
-    assert report["status"] != "ok"
-    assert report["checks"]["vector_store"] != "ok"
+    assert report["status_code"] == 503
+    assert report["status"] == "unhealthy"
+    assert report["checks"]["vector_store"] == "unreachable"
 
 
 def test_health_reports_an_uninitialized_vector_store_as_degraded(monkeypatch) -> None:
@@ -431,11 +415,11 @@ def test_health_reports_an_uninitialized_vector_store_as_degraded(monkeypatch) -
     assert report["status"] == "degraded"
     assert report["checks"]["vector_store"] == "not_initialized"
 
-    unreachable_queue = _health(monkeypatch, memory=object(), pool_reachable=False)
+    unreachable_queue = _health(monkeypatch, memory=_ReachableQdrantMemory(), pool_reachable=False)
     assert unreachable_queue["status"] == "degraded"
     assert unreachable_queue["checks"]["redis"] == "unreachable"
 
-    healthy = _health(monkeypatch, memory=object())
+    healthy = _health(monkeypatch, memory=_ReachableQdrantMemory())
     assert healthy["status"] == "ok"
 
 
