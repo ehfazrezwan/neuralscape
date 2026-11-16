@@ -33,7 +33,8 @@ are not modified.
 from __future__ import annotations
 
 import os
-from collections.abc import MutableMapping
+import sys
+from collections.abc import Mapping, MutableMapping
 from typing import Optional
 
 from dotenv import dotenv_values
@@ -73,6 +74,49 @@ def apply_defaults(
     from_file = _explicit_in_env_file(env_file) if env_file else {}
     for name in missing:
         environ[name] = from_file.get(name, DEFAULTS[name])
+
+
+_TRUTHY = ("true", "1", "yes")
+_GRAPHITI_TRUTHY = ("true", "1", "yes", "on")
+
+
+def effective_state(environ: Optional[Mapping[str, str]] = None) -> dict[str, bool]:
+    """Whether each library would send telemetry, decided the way the library decides.
+
+    Returns only ``{"mem0": bool, "graphiti": bool}``: never an endpoint, key or id.
+
+    * mem0 reads ``MEM0_TELEMETRY`` once, at import (unset means on; ``true``/``1``/``yes``,
+      case-insensitive, mean on). When called with no ``environ`` and mem0's telemetry module
+      is already imported, its latched value is returned, because that is what is in force
+      even if the environment changed afterwards. Otherwise the value is computed from the
+      environment.
+    * Graphiti reads ``GRAPHITI_TELEMETRY_ENABLED`` on every event (unset means on;
+      ``true``/``1``/``yes``/``on`` mean on). Graphiti also switches itself off whenever
+      ``pytest`` is imported; that is deliberately NOT reflected here, so under a test run
+      this reports what the library would do in a real process.
+    """
+    env = os.environ if environ is None else environ
+    mem0_on: Optional[bool] = None
+    if environ is None:
+        module = sys.modules.get("mem0.memory.telemetry")
+        latched = getattr(module, "MEM0_TELEMETRY", None)
+        if isinstance(latched, bool):
+            mem0_on = latched
+    if mem0_on is None:
+        mem0_on = str(env.get("MEM0_TELEMETRY", "True")).lower() in _TRUTHY
+    graphiti_on = str(env.get("GRAPHITI_TELEMETRY_ENABLED", "true")).lower() in _GRAPHITI_TRUTHY
+    return {"mem0": mem0_on, "graphiti": graphiti_on}
+
+
+def effective_labels(environ: Optional[Mapping[str, str]] = None) -> dict[str, str]:
+    """``effective_state`` as ``"on"``/``"off"`` strings (for /health and log lines)."""
+    return {name: "on" if on else "off" for name, on in effective_state(environ).items()}
+
+
+def startup_log_line(environ: Optional[Mapping[str, str]] = None) -> str:
+    """The one startup line: ``third_party_telemetry mem0=off graphiti=off``."""
+    labels = effective_labels(environ)
+    return f"third_party_telemetry mem0={labels['mem0']} graphiti={labels['graphiti']}"
 
 
 apply_defaults()
