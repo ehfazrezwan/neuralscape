@@ -29,8 +29,8 @@ spec:
           image: {{ include "neuralscape.image" . }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           # Slow graph queue (GRAPH_QUEUE_NAME): Graphiti enrichment, dedup +
-          # wiki-synth crons. Isolated so heavy graph work can't starve the fast
-          # worker/reads.
+          # dreaming-sweep + strategy-playbook crons. Isolated so heavy graph work
+          # can't starve the fast worker/reads.
           command: ["arq", "worker.GraphWorkerSettings"]
           {{- include "neuralscape.env" . | nindent 10 }}
           volumeMounts:
