@@ -97,6 +97,9 @@ def dedup_verdicts(service, items: list[dict]) -> list[dict]:
             project_id=project_id,
             visibility=visibility,
             category=item["category"],  # store_raw's dedup key includes it (#535)
+            # Workspace is part of the key too: absent / "memory" is the memory
+            # workspace, any other value a reference workspace (distinct rows).
+            workspace=(item.get("workspace") if item.get("workspace") not in (None, "", "memory") else None),
         )
         if existing is not None:
             verdicts.append(
