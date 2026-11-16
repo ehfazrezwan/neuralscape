@@ -120,6 +120,13 @@ def pair(ctx, a, b) -> Pair:
             continue
         for label, method, path, kw in path_calls:
             s[f"cred {name} {label}"] = call(f"cred {name} {label}", client, method, path, poll=False, **kw)
+    # retire the read credential, then use it again
+    issue, client = p.credentials["a read"]
+    credential_id = (issue.body or {}).get("credential_id") if isinstance(issue.body, dict) else None
+    if client is not None and credential_id:
+        s["revoke a read"] = call("revoke a read", a, "POST", "/v1/credentials/revoke", poll=False, json={"credential_id": credential_id})
+        s["cred a read search after revoke"] = call("cred a read search after revoke", client, "POST", "/v1/search", poll=False,
+                                                    json={"query": p.query, "limit": 20})
     return p
 
 
@@ -287,6 +294,16 @@ def test_a_credential_issued_to_b_cannot_reach_a_record_job_or_search_hit_of_a(p
     assert _denied(s["cred b read by id"]), s["cred b read by id"].describe()
     assert _denied(s["cred b read status"]), s["cred b read status"].describe()
     assert s["cred b read search"].ok and _no_marker(s["cred b read search"], pair.marker), s["cred b read search"].describe()
+
+
+@proves("contracts.policy", "archive.phase2-pol")
+@expected_red(RED_MEMBERSHIP)
+def test_a_revoked_credential_stops_working(pair):
+    _issued(pair, "a read")
+    s = steps(pair)
+    assert s["revoke a read"].status == 200 and (s["revoke a read"].body or {}).get("revoked") is True, s["revoke a read"].describe()
+    after = s["cred a read search after revoke"]
+    assert after.status in (401, 403, 404), f"the revoked credential still works: {after.describe()}"
 
 
 @proves("contracts.policy", "archive.phase2-pol")

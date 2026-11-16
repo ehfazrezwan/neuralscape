@@ -16,6 +16,7 @@ slice and its lane: they run, they fail honestly today, and they are never skipp
 from __future__ import annotations
 
 import io
+import os
 import time
 import zipfile
 from dataclasses import dataclass, field
@@ -70,6 +71,8 @@ class Story:
     b_blind_restored: str = ""
     portable: Step = field(default_factory=lambda: Step("portable_export"))
     portable_download: Step = field(default_factory=lambda: Step("portable_download"))
+    restart_error: str = ""  # "" = the API restarted and answered /health again
+    status_after_restart: Step = field(default_factory=lambda: Step("status_after_restart"))
 
     @property
     def q_old(self) -> str:
@@ -202,7 +205,31 @@ def story(ctx, a, b) -> Story:
             s.portable_download = Step("portable_download", r.status_code, None, "", {"bytes": len(r.content)})
         except Exception as exc:  # noqa: BLE001
             s.portable_download = Step("portable_download", error=f"{type(exc).__name__}: {exc}"[:200])
+
+    # 9. the accepted work survives a restart of the API (last step: later modules wait for /health themselves)
+    s.restart_error = _restart_api(ctx, a)
+    if not s.restart_error:
+        s.status_after_restart = call("status_after_restart", a, "GET", f"/v1/memories/status/{s.save.task_id}", poll=False)
     return s
+
+
+def _restart_api(ctx, client) -> str:
+    """Restart the API service of the compose project and wait for it; '' when it is back, else why not."""
+    if not ctx.compose_project:
+        return "no compose project: a restart needs --compose-project"
+    try:
+        ctx.compose("restart", os.environ.get("NS_API_SERVICE", "neuralscape"), timeout=240)
+    except Exception as exc:  # noqa: BLE001
+        return f"restart failed: {type(exc).__name__}: {exc}"[:200]
+    deadline = time.monotonic() + 180
+    while time.monotonic() < deadline:
+        try:
+            if client.get("/health").status_code == 200:
+                return ""
+        except Exception:  # noqa: BLE001 - still coming up
+            pass
+        time.sleep(3)
+    return "the API did not answer /health within 180s of the restart"
 
 
 # ── step 1: save ─────────────────────────────────────────────────
@@ -406,6 +433,18 @@ def test_the_record_restored_from_the_bundle_is_the_corrected_one_and_stays_priv
 @negative_control
 def test_restore_check_fails_for_the_user_the_record_was_never_shared_with(b, story):
     expect_check_fails(check_recalled, b, story.new, story.q_new)
+
+
+@proves("archive.phase2-led-a", "archive.phase2-led-b", "contracts.lifecycle")
+@expected_red(RED_DURABLE_WRITES)
+def test_the_accepted_write_and_its_receipt_survive_a_restart_of_the_api(story):
+    assert not story.restart_error, story.restart_error
+    st = story.status_after_restart
+    assert st.status == 200 and isinstance(st.body, dict), st.describe()
+    assert story.save.task_id.startswith("intent-"), f"the write was accepted as {story.save.task_id!r}, not as a durable intent"
+    assert st.body.get("status") == "completed" and receipt_of(st.body) == receipt_of(story.save.final), (
+        f"receipt after the restart differs: {str(st.body)[:200]}"
+    )
 
 
 @proves("archive.phase2-port", "contracts.portability")

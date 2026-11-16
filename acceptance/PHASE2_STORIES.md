@@ -26,8 +26,8 @@ Files: `profiles/phase2.env`, `scenarios/test_p2_durable_write_story.py`, `test_
 
 | Story | Scenario file | Steps | Surfaces |
 |---|---|---|---|
-| Durable write | `test_p2_durable_write_story` | save, accepted receipt, current recall, correction, privacy narrowing, stale replay denied, export, restore | `POST /v1/memories/raw`, `GET /v1/memories/status/{id}`, `POST /v1/search`, `PATCH /v1/memories/{id}`, `GET /v1/export/okf`, `POST /v1/ingest/files`, `POST /v1/portability/exports` |
-| Two principals | `test_p2_two_principal` | outsider, user B and scoped credentials denied at request, job-status and export boundaries | `GET/PATCH/DELETE /v1/memories/{id}`, `POST /v1/search`, `GET /v1/memories/status/{id}`, `GET /v1/export/okf`, `POST /v1/credentials` |
+| Durable write | `test_p2_durable_write_story` | save, accepted receipt, current recall, correction, privacy narrowing, stale replay denied, export, restore, restart keeps the accepted work | `POST /v1/memories/raw`, `GET /v1/memories/status/{id}`, `POST /v1/search`, `PATCH /v1/memories/{id}`, `GET /v1/export/okf`, `POST /v1/ingest/files`, `POST /v1/portability/exports` |
+| Two principals | `test_p2_two_principal` | outsider, user B and scoped credentials denied at request, job-status and export boundaries; a revoked credential stops working | `GET/PATCH/DELETE /v1/memories/{id}`, `POST /v1/search`, `GET /v1/memories/status/{id}`, `GET /v1/export/okf`, `POST /v1/credentials` |
 | Member journey (gap O-18) | `test_p2_member_and_tenant` | invite, join, list, the member's default capture stays private | `POST /v1/members/invites`, `POST /v1/members/join`, `GET /v1/members`, `POST /v1/memories/raw` |
 | Two real tenants (gap E-06) | `test_p2_member_and_tenant` | another tenant's person sees nothing of tenant one over REST and MCP | the same read, status and export routes, MCP `recall_memories` |
 | Project-less shared facts (gap E-05) | `test_p2_shared_pool_gate` | a project-less shared fact is recalled from any project; a project's shared fact only from that project | `POST /v1/memories/raw`, `POST /v1/ingest/text`, `POST /v1/search` |
@@ -46,9 +46,9 @@ not a slice plus a known lane.
 
 | Reason | Lane | Scenarios that stay red until it lands |
 |---|---|---|
-| durable write cutover | p2-05 | accepted receipt; correction names and returns a revision; replay of the original write; stale edit refused |
+| durable write cutover | p2-05 | accepted receipt; correction names and returns a revision; replay of the original write; stale edit refused; the receipt survives an API restart |
 | portable export and import | p2-10 | tenant export is a verified bundle only its owner downloads |
-| membership and onboarding | p2-07 | four scoped-credential scenarios (issuing needs `manage_credentials`); invite, join and list |
+| membership and onboarding | p2-07 | five scoped-credential scenarios, including revoke (issuing needs `manage_credentials`); invite, join and list |
 | onboarding policy lineage | p2-19 | a member's default capture is private |
 | tenant cells | p2-08 | two real tenants (needs `NS_TOKEN_T2` and `NS_USER_T2`) |
 
@@ -78,3 +78,7 @@ administrator (membership slice), and export `NS_TOKEN_T2` / `NS_USER_T2` for a 
 * Driving the plugin's own hooks as a joined member: the capture step uses the REST write the plugin makes
   for a team-default category. The hook-level capture scenarios belong to the plugin family.
 * Adversarial and qualification scenarios, and persona agents: out of scope for this PR.
+
+The durable write story restarts the API service once, as its last fixture step (`ctx.compose("restart", ...)`,
+allowed by the harness), to show the accepted work survives it; later modules wait for `/health` before they
+start.
