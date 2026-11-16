@@ -1863,7 +1863,9 @@ class WriteMixin:
         deployments we'd switch to a numeric epoch field.
 
         Returns:
-            Dict with deleted_count and per-user breakdown.
+            Dict with deleted_count, the per-user breakdown, and the graph
+            cleanup summary (``graph_cascade_unresolved_ids`` and the sibling
+            repair keys; ``graph_jobs`` are for the cron to enqueue).
         """
         # Ensure mem0/Qdrant client is initialized — the nightly cron can
         # fire on a cold-started worker before any request has touched
@@ -1875,6 +1877,7 @@ class WriteMixin:
 
         deleted_count = 0
         per_user: dict[str, int] = {}
+        cascade_rows: list[dict] = []
         offset = None
         while True:
             points, next_offset = client.scroll(
@@ -1903,19 +1906,43 @@ class WriteMixin:
                 if expires_dt >= now_dt:
                     continue  # not yet expired
                 try:
-                    self._delete_qdrant_memory_with_graph_cleanup(str(pt.id), payload)
+                    # Vectors first; the graph cascade runs once for the whole
+                    # sweep below (one cascade per distinct episode, siblings
+                    # repaired), like a bulk delete.
+                    m.vector_store.delete(str(pt.id))
                     uid = payload.get("user_id", "unknown")
                     per_user[uid] = per_user.get(uid, 0) + 1
                     deleted_count += 1
+                    cascade_rows.append({
+                        "id": str(pt.id),
+                        "mem": {"memory": payload.get("data", ""), "metadata": metadata},
+                        "user_id": payload.get("user_id"),
+                        "group_id": None,
+                    })
                 except Exception as e:
                     logger.warning(f"Failed to expire memory {pt.id}: {e}")
             if next_offset is None:
                 break
             offset = next_offset
 
+        # Graph half over every row whose vector is gone. Non-critical: a
+        # failure is logged and reported, never raised, and the vectors stay
+        # deleted. ``deleted_ids`` spans the WHOLE sweep so a sibling that
+        # expires later in the same sweep is never "repaired".
+        graph = {
+            "graph_cascade_unresolved_ids": [], "graph_jobs": [], "graph_jobs_count": 0,
+            "graph_sibling_unrepaired_ids": [], "graph_sibling_repair_failed": False,
+        }
+        if cascade_rows:
+            try:
+                graph = self._bulk_graph_cleanup(cascade_rows, "ttl-expiry")
+            except Exception as e:
+                logger.warning(f"expire_old_memories: graph cleanup failed (non-critical): {e}")
+                graph = {**graph, "graph_cascade_unresolved_ids": [r["id"] for r in cascade_rows]}
+
         if deleted_count:
             logger.info(f"expire_old_memories: deleted {deleted_count} expired memories")
-        return {"deleted_count": deleted_count, "per_user": per_user}
+        return {"deleted_count": deleted_count, "per_user": per_user, **graph}
 
     def _batch_store_facts(
         self,
