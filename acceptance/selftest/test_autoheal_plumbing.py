@@ -105,6 +105,32 @@ def test_the_stall_forms_refuse_every_other_shape(monkeypatch, args):
         runctx.run_compose("nstest-acceptance", *args, run=fake([]))
 
 
+@pytest.mark.parametrize("destructive", [True, False])
+@pytest.mark.parametrize("tail", [("touch", STALL), ("rm", "-f", STALL)])
+@pytest.mark.parametrize("head", [
+    ("exec", "neuralscape-worker"),  # no -T
+    ("exec", "-T", "--privileged", "neuralscape-worker"),
+    ("exec", "--privileged", "-T", "neuralscape-worker"),
+    ("exec", "-d", "-T", "neuralscape-worker"),
+    ("exec", "-T", "-d", "neuralscape-worker"),
+    ("exec", "-T", "-u", "root", "neuralscape-worker"),
+    ("exec", "-u", "root", "-T", "neuralscape-worker"),
+    ("exec", "-T", "-e", "X=1", "neuralscape-worker"),
+    ("exec", "-T", "-T", "neuralscape-worker"),
+    ("exec", "-T", "--user=root", "neuralscape-worker"),
+    ("exec", "-i", "neuralscape-worker"),
+    ("exec", "-t", "neuralscape-worker"),
+])
+def test_the_stall_forms_need_exactly_exec_dash_T_and_no_other_flag(monkeypatch, head, tail, destructive):
+    if destructive:
+        monkeypatch.setenv("NS_ALLOW_DESTRUCTIVE", "1")
+    calls = []
+    with pytest.raises(runctx.ConfigError):
+        runctx.run_compose("nstest-acceptance", *head, *tail, run=fake(calls))
+    assert calls == []
+    assert not restore.stall_exec(head + tail)
+
+
 @pytest.mark.parametrize("project", ["neuralscape", " NeuralScape ", "NEURALSCAPE", "prod", "nsother-x"])
 def test_the_stall_forms_are_refused_for_the_production_project_and_foreign_projects(monkeypatch, project):
     monkeypatch.setenv("NS_ALLOW_DESTRUCTIVE", "1")
