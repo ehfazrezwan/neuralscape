@@ -56,3 +56,9 @@ def test_mcp_retag_calls_use_the_tools_flat_arguments():
         assert not keys & {"filters", "ops"}, (
             f"{name}: MCP retag_memories takes flat filter/op arguments, not REST's filters/ops: {sorted(keys)}"
         )
+        assert keys & {"scope", "category", "project_id", "visibility", "tags_contains"}, (
+            f"{name}: MCP retag_memories call has no filter argument: {sorted(keys)}"
+        )
+        assert keys & {"add_tags", "remove_tags", "set_category", "set_project_id"}, (
+            f"{name}: MCP retag_memories call has no operation argument: {sorted(keys)}"
+        )
