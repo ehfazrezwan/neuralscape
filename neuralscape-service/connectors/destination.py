@@ -186,10 +186,24 @@ def _embedded_ipv4(ip: ipaddress.IPv6Address) -> list[ipaddress.IPv4Address]:
     if packed[:12] == bytes.fromhex("0000000000000000ffff0000"):
         found.append(ipaddress.IPv4Address(packed[12:]))  # SIIT ::ffff:0:a.b.c.d
     if packed[:6] == bytes.fromhex("0064ff9b0001"):
-        # RFC 8215 local-use NAT64 64:ff9b:1::/48, RFC 6052 /48 layout: the IPv4 address
-        # sits in bytes 6-7 and 9-10 (byte 8 is the reserved "u" octet).
-        found.append(ipaddress.IPv4Address(packed[6:8] + packed[9:11]))
+        # RFC 8215 local-use NAT64 64:ff9b:1::/48. The operator's translator may use any
+        # RFC 6052 prefix length, and the address alone does not say which, so every layout
+        # is decoded and each candidate is checked (byte 8 is the reserved "u" octet).
+        found.extend(ipaddress.IPv4Address(bytes(packed[i] for i in idx)) for idx in _RFC6052_LAYOUTS)
     return found
+
+
+# RFC 6052 section 2.2: the byte positions of the embedded IPv4 address for the prefix
+# lengths a translator can use inside 64:ff9b:1::/48 (/48, /56, /64, /96). The /32 and /40
+# layouts would need a prefix shorter than the /48 itself; decoded anyway they read the
+# fixed prefix bytes 0x00 0x01 as the leading octets (0.1.x.x or 1.x.x.x), which are never
+# link-local or metadata addresses, so they add nothing.
+_RFC6052_LAYOUTS = (
+    (6, 7, 9, 10),
+    (7, 9, 10, 11),
+    (9, 10, 11, 12),
+    (12, 13, 14, 15),
+)
 
 
 def _never_allowed(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
