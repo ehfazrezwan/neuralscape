@@ -877,6 +877,65 @@ def test_accepts_names_similar_to_windows_devices(safe_path: str) -> None:
     assert manifest.files[0].path == safe_path
 
 
+_RESERVED_STEMS = (
+    ["CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"]
+    + [f"COM{digit}" for digit in "123456789\u00b9\u00b2\u00b3"]
+    + [f"LPT{digit}" for digit in "123456789\u00b9\u00b2\u00b3"]
+)
+
+
+@pytest.mark.parametrize("stem", _RESERVED_STEMS)
+@pytest.mark.parametrize(
+    "decoration",
+    [
+        "{}",
+        "{lower}",
+        "{mixed}",
+        "{}.txt",
+        "{lower}.tar.gz",
+        "{}.",
+        "{} ",
+        "{} .txt",
+        "{}..",
+        "{}:stream",
+    ],
+)
+def test_reserved_device_name_table_is_explicit_and_case_blind(stem: str, decoration: str) -> None:
+    from contracts_portability import _is_windows_reserved_name
+
+    name = decoration.format(
+        stem, lower=stem.lower(), mixed=stem[0].lower() + stem[1:].upper() if len(stem) > 1 else stem
+    )
+
+    assert _is_windows_reserved_name(name)
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["COM0", "LPT0", "COM10", "LPT10", "CONSOLE", "NULL", "AUXILIARY", "PRN1", "CO", "COM", "LPT", "x.CON", "xNUL.txt", ""],
+)
+def test_names_outside_the_reserved_table_are_not_reserved(name: str) -> None:
+    from contracts_portability import _is_windows_reserved_name
+
+    assert not _is_windows_reserved_name(name)
+
+
+def test_reserved_name_check_does_not_use_the_deprecated_pathlib_api(monkeypatch) -> None:
+    import pathlib
+
+    def removed(self):  # the API is gone in Python 3.15
+        raise AssertionError("PureWindowsPath.is_reserved must not be called")
+
+    monkeypatch.setattr(pathlib.PureWindowsPath, "is_reserved", removed, raising=False)
+    document = valid_manifest()
+    document["files"][0]["path"] = "files/CON.txt"
+    with pytest.raises(ValidationError, match="Windows reserved device name"):
+        validate_portable_manifest(document)
+
+    document["files"][0]["path"] = "files/console.txt"
+    assert validate_portable_manifest(document).files[0].path == "files/console.txt"
+
+
 @pytest.mark.parametrize("reserved_path", ["keys/NUL.bin", "CON/envelope.bin"])
 def test_rejects_windows_reserved_envelope_paths(reserved_path: str) -> None:
     document = valid_manifest()

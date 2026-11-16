@@ -1,0 +1,42 @@
+{
+  "event": {
+    "cwd": "/home/user/sample-project",
+    "hook_event_name": "PostToolUse",
+    "permission_mode": "default",
+    "session_id": "sess-0001",
+    "tool_input": {
+      "file_path": "/home/user/sample-project/src/app.ts",
+      "new_string": "const retries = 3",
+      "old_string": "const retries = 1"
+    },
+    "tool_name": "Edit",
+    "tool_response": {
+      "filePath": "/home/user/sample-project/src/app.ts",
+      "newString": "const retries = 3",
+      "oldString": "const retries = 1",
+      "structuredPatch": [
+        {
+          "lines": [
+            "-const retries = 1",
+            "+const retries = 3"
+          ],
+          "newLines": 1,
+          "newStart": 4,
+          "oldLines": 1,
+          "oldStart": 4
+        }
+      ],
+      "userModified": false
+    },
+    "tool_use_id": "toolu_edit-s",
+    "transcript_path": "/home/user/.claude/projects/sample/sess-0001.jsonl"
+  },
+  "fixture": "edit-structured",
+  "provenance": {
+    "client": "claude-code",
+    "client_version_tag": "hook-shape-v1 (documented PostToolUse/transcript shapes)",
+    "contains_real_data": false,
+    "kind": "synthetic-sanitized",
+    "replace_with": "a sanitized capture when one is available; keep the tag and expected file"
+  }
+}
