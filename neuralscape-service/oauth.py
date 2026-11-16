@@ -107,7 +107,15 @@ def _is_valid_redirect_uri(uri: str) -> bool:
     registration time to avoid open-redirect / token-leak to plaintext hosts."""
     if not isinstance(uri, str) or not uri:
         return False
-    parsed = urlparse(uri)
+    try:
+        parsed = urlparse(uri)
+        # Malformed bracketed hosts make urlparse raise; an empty host or a
+        # non-numeric port is just as unusable. All are plain refusals (400).
+        if not parsed.hostname:
+            return False
+        parsed.port  # noqa: B018 - raises ValueError on an invalid port
+    except ValueError:
+        return False
     if not parsed.netloc or parsed.fragment:
         return False
     # userinfo (https://claude.ai@evil.example/cb) is a classic spoof of the
