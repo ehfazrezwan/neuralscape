@@ -474,7 +474,7 @@ class TestSensitivityGatedKey:
         """A shared row with the same text lives in the shared partition; the sensitive item is stored private."""
         shared_row = _existing("shared-1")
 
-        def find(*, user_id, content_hash, scope, project_id, visibility):
+        def find(*, user_id, content_hash, scope, project_id, visibility, category=None):
             return shared_row if visibility == "shared" else None
 
         svc = MagicMock()
@@ -490,7 +490,7 @@ class TestSensitivityGatedKey:
     def test_override_with_explicit_shared_still_dedups_against_the_shared_row(self):
         svc = MagicMock()
         svc._find_by_content_hash.side_effect = (
-            lambda *, user_id, content_hash, scope, project_id, visibility:
+            lambda *, user_id, content_hash, scope, project_id, visibility, category=None:
             _existing("shared-1") if visibility == "shared" else None
         )
         v = dedup_verdicts(svc, [{
@@ -502,7 +502,7 @@ class TestSensitivityGatedKey:
     def test_prepare_checkpoint_enqueues_a_sensitive_item_matching_a_shared_row(self):
         svc = MagicMock()
         svc._find_by_content_hash.side_effect = (
-            lambda *, user_id, content_hash, scope, project_id, visibility:
+            lambda *, user_id, content_hash, scope, project_id, visibility, category=None:
             _existing("shared-1") if visibility == "shared" else None
         )
         req = CheckpointRequest(memories=[
@@ -512,3 +512,80 @@ class TestSensitivityGatedKey:
         out = prepare_checkpoint(svc, req, "u")
         assert [v["verdict"] for v in out["verdicts"]] == ["new", "duplicate"]
         assert [m["content"] for m in out["to_enqueue"]] == [SENSITIVE]
+
+
+class TestSensitivityGateOnPrepare:
+    """prepare_checkpoint's behaviour on the gated path (review fixes)."""
+
+    @pytest.fixture(autouse=True)
+    def _standards(self, monkeypatch):
+        from config import settings
+
+        monkeypatch.setattr(settings, "standards_enabled", True)
+        monkeypatch.setattr(settings, "dictator_user_ids", "mark")
+
+    @staticmethod
+    def _svc():
+        svc = MagicMock()
+        svc._find_by_content_hash.return_value = None
+        return svc
+
+    def test_non_dictator_sensitive_standard_with_override_is_forbidden(self):
+        req = CheckpointRequest(memories=[{
+            "content": SENSITIVE, "category": "convention", "project_id": "p1",
+            "visibility": "standard", "sensitivity_override": True,
+        }])
+        with pytest.raises(PermissionError):
+            prepare_checkpoint(self._svc(), req, "alice")
+
+    def test_non_dictator_sensitive_standard_without_override_is_accepted_private(self):
+        req = CheckpointRequest(memories=[{
+            "content": SENSITIVE, "category": "convention", "project_id": "p1",
+            "visibility": "standard",
+        }])
+        out = prepare_checkpoint(self._svc(), req, "alice")
+        assert [v["verdict"] for v in out["verdicts"]] == ["new"]
+        assert len(out["to_enqueue"]) == 1 and out["to_enqueue"][0]["scope"] == "project"
+
+    def test_sensitive_standard_probe_uses_private_visibility(self):
+        svc = self._svc()
+        req = CheckpointRequest(memories=[{
+            "content": SENSITIVE, "category": "convention", "project_id": "p1", "visibility": "standard",
+        }])
+        prepare_checkpoint(svc, req, "alice")
+        assert svc._find_by_content_hash.call_args.kwargs["visibility"] == "private"
+
+    def test_sensitive_standard_project_category_without_project_id_is_refused(self):
+        """Gated private => scope is no longer forced global; the worker would reject it after a 202."""
+        req = CheckpointRequest(memories=[{
+            "content": SENSITIVE, "category": "convention", "visibility": "standard",
+        }])
+        with pytest.raises(ValueError, match="project_id is required"):
+            prepare_checkpoint(self._svc(), req, "alice")
+
+    def test_dictator_standard_without_project_id_is_still_global(self):
+        req = CheckpointRequest(memories=[{
+            "content": CLEAN, "category": "convention", "visibility": "standard",
+        }])
+        out = prepare_checkpoint(self._svc(), req, "mark")
+        assert out["to_enqueue"][0]["scope"] == "global"
+
+
+class TestDedupProbeIncludesCategory:
+    def test_probe_passes_the_items_category(self):
+        svc = MagicMock()
+        svc._find_by_content_hash.return_value = None
+        dedup_verdicts(svc, [{"content": CLEAN, "category": "convention", "user_id": "u", "project_id": "p"}])
+        assert svc._find_by_content_hash.call_args.kwargs["category"] == "convention"
+
+    def test_same_text_in_another_category_is_new(self):
+        def find(*, user_id, content_hash, scope, project_id, visibility, category=None):
+            return _existing("pref-1") if category == "preference" else None
+
+        svc = MagicMock()
+        svc._find_by_content_hash.side_effect = find
+        v = dedup_verdicts(svc, [
+            {"content": CLEAN, "category": "convention", "user_id": "u"},
+            {"content": CLEAN, "category": "preference", "user_id": "u"},
+        ])
+        assert [x["verdict"] for x in v] == ["new", "duplicate"]

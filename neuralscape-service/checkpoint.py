@@ -96,6 +96,7 @@ def dedup_verdicts(service, items: list[dict]) -> list[dict]:
             scope=scope,
             project_id=project_id,
             visibility=visibility,
+            category=item["category"],  # store_raw's dedup key includes it (#535)
         )
         if existing is not None:
             verdicts.append(
@@ -162,6 +163,11 @@ def prepare_checkpoint(service, req: CheckpointRequest, user_id: str) -> dict:
             {**d, "scope": d.get("scope") if "scope" in item.model_fields_set else None}
         )
         d["scope"] = scope
+        # Mirrors store_raw: a project-scoped item needs a project_id. A sensitive
+        # item asking for 'standard' is gated private, so scope is no longer forced
+        # global; without this the worker would reject it AFTER a 202 "new".
+        if scope == "project" and not project_id:
+            raise ValueError(f"Item {idx}: project_id is required when scope='project'")
         # Standard-tier write gate (mirrors _authorize_standard_write).
         if visibility == MemoryVisibility.STANDARD.value:
             if not settings.standards_enabled:
