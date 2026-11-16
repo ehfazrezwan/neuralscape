@@ -400,8 +400,12 @@ def test_unchanged_staged_id_set_is_skipped_without_llm_work(dream_env, swept):
 
 
 def _is_pool_diary(env, path) -> bool:
-    """Exactly the per-pool diary pages ``Dreams/<pool>.md`` (not ``Dreams/index.md``)."""
-    return path.parent == env.vault / "Dreams" and path.name != "index.md"
+    """Exactly the per-pool diary pages ``Dreams/<pool>.md`` of the pools this module swept."""
+    from extensions.dreaming.reflect import diary_page_path
+
+    dreams = env.vault / "Dreams"
+    names = {diary_page_path(dreams, p).name for p in (env.pool, *env.extra_pools)}
+    return path.parent == dreams and path.name in names
 
 
 def _vault_text(env, *, include_diaries: bool = False) -> str:
@@ -446,20 +450,6 @@ def test_leak_scan_covers_the_dreams_index_but_not_the_pool_diaries(dream_env, s
     others = [p for p in (env.vault / "Dreams").glob("*.md") if p.name != "index.md"]
     assert others and all(_is_pool_diary(env, p) for p in others)
     assert diary.read_text(encoding="utf-8") in _vault_text(env), "Dreams/index.md is not scanned"
-
-
-def test_dream_diary_is_written_for_every_pool_by_design(dream_env, swept):
-    """Documented contract (single-operator vault): the diary covers other users' pools too.
-
-    Pinned so a policy change is a visible test change, and so the leak check
-    above is not silently blind to the one place the content is expected.
-    """
-    from extensions.dreaming.reflect import diary_page_path
-
-    env = dream_env
-    page = diary_page_path(env.sweep_settings().dreams_dir, swept.other_pool)
-    assert page.exists(), f"no dream diary for {swept.other_pool}"
-    assert swept.other_pool in page.read_text(encoding="utf-8")
 
 
 def test_dream_diary_is_written_for_every_pool_by_design(dream_env, swept):
