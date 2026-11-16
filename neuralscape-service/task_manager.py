@@ -277,7 +277,7 @@ class TaskManager:
         # Data-layer connectors
         memory_kind: str | None = None,
         source_ref: dict | None = None,
-        # Workspace partition (WT6): absent / "memory" = memory workspace.
+        # Workspace partition: absent / "memory" = memory workspace.
         workspace: str | None = None,
         # Durable path only (LEDGER_ENABLED): accepted and unused until writes use the ledger.
         idempotency_key: str | None = None,

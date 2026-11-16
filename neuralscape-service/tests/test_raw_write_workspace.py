@@ -101,3 +101,59 @@ async def test_mcp_remember_still_enqueues_against_the_real_signature(tm, monkey
     )
     body = json.loads(out[0].text)
     assert body["status"] == "accepted", body
+
+
+@pytest.mark.asyncio
+async def test_memory_workspace_write_still_runs_the_dupe_probe(ctx):
+    """Control: the near-duplicate probe is only skipped for reference workspaces."""
+    ctx["service"].search.return_value = [
+        MemoryResponse(id="old", memory="x", category="preference", visibility="private")
+    ]
+    for extras in (None, {}, {"workspace": "memory"}):
+        ctx["service"].search.reset_mock()
+        ctx["service"].store_raw.reset_mock()
+        out = await worker.process_memory_raw(ctx, "x", "alice", "preference", v2_extras=extras)
+        ctx["service"].search.assert_called_once()
+        assert out["deduplicated"] is True
+        ctx["service"].store_raw.assert_not_called()
+
+
+def _created(ctx):
+    ctx["service"].store_raw.return_value = (
+        [MemoryResponse(id="m1", memory="x", category="preference", visibility="private")], True
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_reference_workspace_raw_write_is_not_graph_enriched(ctx):
+    _created(ctx)
+    await worker.process_memory_raw(ctx, "x", "alice", "preference", v2_extras={"workspace": "ref-books"})
+    names = [c.args[0] for c in ctx["redis"].enqueue_job.call_args_list]
+    assert "process_graph_enrichment" not in names
+    ctx["service"].enrich_graph.assert_not_called()  # nor inline
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("extras", [None, {}, {"workspace": "memory"}])
+async def test_a_memory_workspace_raw_write_still_enqueues_graph_enrichment(ctx, extras):
+    _created(ctx)
+    await worker.process_memory_raw(ctx, "x", "alice", "preference", v2_extras=extras)
+    names = [c.args[0] for c in ctx["redis"].enqueue_job.call_args_list]
+    assert names == ["process_graph_enrichment"]
+
+
+@pytest.mark.asyncio
+async def test_the_no_workspace_job_identity_is_the_pre_workspace_one(tm):
+    """A write without a workspace derives the id it derived before the field existed."""
+    import task_manager as tmod
+
+    await tm.enqueue_raw(content="same", user_id="alice", category="preference", tags=["b", "a"])
+    got = tm.pool.enqueue_job.call_args.kwargs["_job_id"]
+    options = tmod._scope_key(
+        category="preference", tags=["a", "b"], agent_id=None, run_id=None, domain=None,
+        observation_type=None, concepts=None, source_type=None, related_memory_ids=None,
+        confidence=None, expires_at=None, occurred_at=None, derived_from=None,
+        epistemic_level=None, memory_kind=None, source_ref=None,
+    )  # note: no workspace key at all, exactly as before the field existed
+    expected = tmod._generate_job_id(f"raw:None:global:None:False:{options}:same", "alice")
+    assert got == expected
