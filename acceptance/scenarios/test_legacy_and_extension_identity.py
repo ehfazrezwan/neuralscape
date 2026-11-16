@@ -22,7 +22,7 @@ import pytest
 from conftest import check_search_finds_marker
 from nsaccept import eventually, expect_check_fails, negative_control, proves
 from nsaccept.client import NSClient
-from nsaccept.helpers import blob_has, graph_listing, list_rows, rows_with, write_raw
+from nsaccept.helpers import graph_listing, list_rows, rows_with, write_raw
 from nsaccept.tokens import mint_local, mint_via_compose
 
 PREFIX = "/v1/extensions/conversation-compiler"
@@ -54,19 +54,16 @@ def check_episode_present(client: NSClient, marker: str) -> None:
     assert episodes, f"no graph episode carries {marker}"
 
 
-def check_every_memory_has_an_episode(client: NSClient, memories: list[dict]) -> None:
-    """Each stored memory (its id or its text) is carried by some graph episode: its graph enrichment finished."""
+def check_every_memory_has_an_episode(client: NSClient, marker: str, memories: list[dict]) -> None:
+    """The write's graph enrichment finished: its conversation episode is listed.
+
+    A conversation write stores ONE graph episode for the whole exchange, whose body is the raw transcript
+    (carrying the marker), not the extracted facts; every memory the write stored shares it, and no memory
+    text or id appears in the episode listing. So the real link is "the episode holding the transcript".
+    """
     assert memories, "the write produced no memories to wait for"
-    episodes = graph_listing(client, "episodes")
-    waiting = [
-        m.get("id") or m.get("memory", "")[:40]
-        for m in memories
-        if not any(
-            (m.get("memory") and m["memory"] in (e.get("content") or "")) or (m.get("id") and blob_has(e, str(m["id"])))
-            for e in episodes
-        )
-    ]
-    assert not waiting, f"{len(waiting)} of {len(memories)} memories have no graph episode yet: {waiting}"
+    episodes = [e for e in graph_listing(client, "episodes") if marker in (e.get("content") or "")]
+    assert episodes, f"{len(memories)} memories stored, but no graph episode carries {marker} yet (the conversation episode is the one all of them share)"
 
 
 # ── extension route identity ─────────────────────────────────────
@@ -153,7 +150,7 @@ def test_recall_and_gone_checks_fail_where_they_should(ctx, a, c):
     eventually(lambda: check_recalls(c, marker), timeout=90, what="control write recalled")
     expect_check_fails(check_recalls, a, marker)  # A cannot see the third identity's memory
     expect_check_fails(check_gone, c, marker)  # and the "deleted" check cannot pass while it exists
-    expect_check_fails(check_every_memory_has_an_episode, c, [{"id": "00000000-0000-0000-0000-000000000000", "memory": f"{marker} no episode holds this text"}])  # a memory with no episode is not "enriched"
+    expect_check_fails(check_every_memory_has_an_episode, c, f"{marker}-never-written", [{"id": "00000000-0000-0000-0000-000000000000", "memory": "a fact"}])  # a memory with no episode is not "enriched"
 
 
 @proves("delete.legacy-passthrough")
@@ -170,7 +167,7 @@ def test_legacy_delete_removes_the_callers_memories_and_graph_facts_and_nobody_e
     assert a_fact.visible_to_a, "precondition: A's fact never became searchable"
     # The write produced more than one memory: deleting while a later one is still being enriched leaves the
     # delete's graph cascade nothing to resolve for it, so wait until EVERY memory has its episode.
-    eventually(lambda: check_every_memory_has_an_episode(c, legacy["memories"]), timeout=180, interval=5, what="every memory's graph episode before the delete")
+    eventually(lambda: check_every_memory_has_an_episode(c, legacy["marker"], legacy["memories"]), timeout=180, interval=5, what="every memory's graph episode before the delete")
     r = c.delete("/memories", timeout=300)
     assert r.status_code == 200, f"DELETE /memories -> {r.status_code}: {r.text[:200]}"
     assert r.json().get("status") == "ok", f"legacy delete answered {str(r.json())[:200]}"

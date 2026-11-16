@@ -217,11 +217,14 @@ def _prove_gone(a: NSClient, story: Story) -> None:
     """Before restoring: every marker is unreachable through every surface."""
     pid = story.project_id
     # The surfaces must ANSWER (a 5xx would also make a check "fail"): search 200, graph listing 200,
-    # the task status endpoint says not_found, the artifact download says 404.
+    # the task status endpoint answers 404/not_found, the artifact download says 404.
     a.search("readiness probe", project_id=pid, limit=1)
     graph_listing(a, "episodes", pid)
-    state = a.task_status(story.task_ids["m1"]).get("status")
-    assert state == "not_found", f"task status after FLUSHALL is {state!r}, want not_found"
+    # An unknown task is a 404 on the status route ("404 when unknown or not theirs"); a 200 body saying
+    # not_found is the same answer. Anything else means the task is still known.
+    resp = a.get(f"/v1/memories/status/{story.task_ids['m1']}")
+    state = "not_found" if resp.status_code == 404 else (resp.json().get("status") if resp.status_code == 200 else f"HTTP {resp.status_code}")
+    assert state == "not_found", f"task status after FLUSHALL is {state!r}, want not_found (404)"
     code = a.get(f"/v1/ingest/artifacts/{story.file_id}").status_code
     assert code == 404, f"artifact download after the wipe -> {code}, want 404"
     for key in ("m1", "m2"):

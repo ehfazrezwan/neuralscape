@@ -319,8 +319,8 @@ def test_the_dictator_may_set_a_projects_knowledge_config_and_others_may_not(ctx
 @proves("knowledge.router")
 @negative_control
 def test_config_check_fails_for_the_default_config(ctx):
-    precondition(check_config, {"project_id": "p", "code_systems": ["code-native"], "fuse_code_into_recall": False, "default_engine": "code-native"}, "p", ["code-native"], False, "code-native", what="a matching config passes")
-    expect_check_fails(check_config, {"project_id": "p", "code_systems": [], "fuse_code_into_recall": True, "default_engine": None}, "p", ["code-native"], False, "code-native")
+    precondition(check_config, {"project_id": "p", "code_systems": ["code-native"], "fuse_code_into_recall": False, "default_engine": "code-native", "code_space": None, "op_preference": None}, "p", ["code-native"], False, "code-native", what="a matching config passes")
+    expect_check_fails(check_config, {"project_id": "p", "code_systems": [], "fuse_code_into_recall": True, "default_engine": None, "code_space": None, "op_preference": None}, "p", ["code-native"], False, "code-native")
 
 
 def check_instructions(client: NSClient, project: str, text: str | None) -> None:
