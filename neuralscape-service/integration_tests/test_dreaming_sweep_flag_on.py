@@ -399,9 +399,19 @@ def test_unchanged_staged_id_set_is_skipped_without_llm_work(dream_env, swept):
 # ── multi-user isolation (privacy) ──────────────────────────────────
 
 
-def _vault_text(env) -> str:
+def _vault_text(env, *, include_dreams: bool = False) -> str:
+    """Every vault file except ``Dreams/`` (the per-pool review diary).
+
+    ``Dreams/<pool>.md`` is written for EVERY pool, other users' private pools
+    included, and cites their insight text: the owner accepted that as
+    single-operator by design. Everything else (Home, Me/, Knowledge/, Projects/,
+    cards, the OKF index files) must never carry another user's private content.
+    """
+    dreams = env.vault / "Dreams"
     return "\n".join(
-        p.read_text(encoding="utf-8", errors="ignore") for p in env.vault.rglob("*") if p.is_file()
+        p.read_text(encoding="utf-8", errors="ignore")
+        for p in sorted(env.vault.rglob("*"))
+        if p.is_file() and (include_dreams or dreams not in p.parents)
     )
 
 
@@ -422,6 +432,20 @@ def test_other_users_private_pool_swept_but_never_leaks(dream_env, swept):
     assert not [h for h in mine if swept.other_tok in h.memory or "rust" in h.memory.lower()]
     theirs = env.service.search(query="Python FastAPI backend", user_id=swept.other_user, limit=20)
     assert not [h for h in theirs if "fastapi" in h.memory.lower()]
+
+
+def test_dream_diary_is_written_for_every_pool_by_design(dream_env, swept):
+    """Documented contract (single-operator vault): the diary covers other users' pools too.
+
+    Pinned so a policy change is a visible test change, and so the leak check
+    above is not silently blind to the one place the content is expected.
+    """
+    from extensions.dreaming.reflect import diary_page_path
+
+    env = dream_env
+    page = diary_page_path(env.sweep_settings().dreams_dir, swept.other_pool)
+    assert page.exists(), f"no dream diary for {swept.other_pool}"
+    assert swept.other_pool in page.read_text(encoding="utf-8")
 
 
 def test_insights_only_cite_their_own_pool(dream_env, swept):
