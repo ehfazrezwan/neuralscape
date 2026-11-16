@@ -35,7 +35,10 @@ PUBLIC_URL = "https://neuralscape.example.com"
 REDIRECT = "https://claude.ai/api/mcp/auth_callback"
 ATTACKER_REDIRECT = "https://attacker.example.net/cb"
 VICTIM = "victim-user"
-COOKIE = lp.LOGIN_BINDING_COOKIE
+
+
+def _name() -> str:
+    return lp.login_binding_cookie_name()
 
 
 def _b64url(data: bytes) -> str:
@@ -155,13 +158,13 @@ def _start_login(provider: str, redirect_uri: str = REDIRECT):
     else:
         state = re.search(r"supabase/callback\?state=([A-Za-z0-9_.\-=]+)", body)[1]
     set_cookie = page.headers["set-cookie"]
-    cookie = re.match(rf"{COOKIE}=([^;]+)", set_cookie)[1]
+    cookie = re.match(rf"{re.escape(_name())}=([^;]+)", set_cookie)[1]
     return state, cookie, set_cookie, verifier, client_id
 
 
 def _callback(provider: str, state: str, cookie: str | None):
     """The IdP sends the browser back to us. ``cookie`` is what that browser holds."""
-    headers = {"cookie": f"{COOKIE}={cookie}"} if cookie is not None else {}
+    headers = {"cookie": f"{_name()}={cookie}"} if cookie is not None else {}
     client = _client()
     if provider == "google":
         return client.get(
@@ -201,7 +204,8 @@ def test_login_start_sets_hardened_binding_cookie(provider):
     assert "httponly" in attrs
     assert "secure" in attrs
     assert "samesite=lax" in attrs
-    assert "path=/oauth" in attrs
+    assert "path=/;" in attrs + ";" and "domain" not in attrs  # __Host- requires Path=/ and no Domain
+    assert set_cookie.startswith("__Host-ns_login_bind=")
     assert f"max-age={lp.LOGIN_BINDING_MAX_AGE}" in attrs
     assert lp.verify_login_binding(cookie, settings.neuralscape_user_token_secret)
 
@@ -216,7 +220,9 @@ def test_cookie_not_secure_on_plain_http_deployment(provider, monkeypatch):
         params={"response_type": "code", "client_id": cid, "redirect_uri": REDIRECT,
                 "code_challenge": challenge, "code_challenge_method": "S256"},
     )
-    assert "secure" not in page.headers["set-cookie"].lower()
+    sc = page.headers["set-cookie"].lower()
+    assert "secure" not in sc
+    assert sc.startswith("ns_login_bind=") and "path=/oauth" in sc  # plain name + narrow path off https
 
 
 # ── happy path: same browser, code bound to the original PKCE challenge ──
@@ -231,8 +237,8 @@ def test_same_browser_login_issues_code_and_clears_cookie(provider):
     q = parse_qs(loc.query)
     assert q["state"] == ["clientstate"]
     cleared = resp.headers["set-cookie"].lower()
-    assert f"{COOKIE}=" in cleared and ("max-age=0" in cleared or "expires=" in cleared)
-    assert "path=/oauth" in cleared
+    assert f"{_name().lower()}=" in cleared and ("max-age=0" in cleared or "expires=" in cleared)
+    assert "path=/" in cleared
 
     # The code is bound to the ORIGINAL authorize request's S256 challenge.
     code = q["code"][0]
@@ -327,3 +333,76 @@ def test_login_state_without_nonce_refused(provider, env):
     claims = lp.verify_payload(state, env["secret"])
     claims.pop("nonce")
     _assert_refused(_callback(provider, sign_payload(claims, env["secret"]), cookie), status=400)
+
+
+# ── cookie tossing: a sibling subdomain / plain-http origin plants its own cookie ──
+
+
+def _raw_callback(provider, state, cookie_header):
+    client = _client()
+    headers = {"cookie": cookie_header}
+    if provider == "google":
+        return client.get("/oauth/google/callback", params={"code": "idp-code", "state": state},
+                          headers=headers, follow_redirects=False)
+    return client.post("/oauth/supabase/callback", data={"access_token": _sb(), "state": state},
+                       headers=headers, follow_redirects=False)
+
+
+def test_planted_duplicate_cookie_refused(provider):
+    """Attacker's validly signed cookie planted next to the victim's: two entries of the name."""
+    attacker_state, attacker_cookie, *_ = _start_login(provider, ATTACKER_REDIRECT)
+    _vs, victim_cookie, *_ = _start_login(provider)
+    for header in (
+        f"{_name()}={victim_cookie}; {_name()}={attacker_cookie}",
+        f"{_name()}={attacker_cookie}; {_name()}={victim_cookie}",
+        f"{_name()}={attacker_cookie}; {_name()}={attacker_cookie}",
+    ):
+        _assert_refused(_raw_callback(provider, attacker_state, header))
+
+
+def test_unprefixed_cookie_on_https_ignored(provider):
+    """A subdomain/http origin can only plant the NON-prefixed name; it must not be read on https."""
+    attacker_state, attacker_cookie, *_ = _start_login(provider, ATTACKER_REDIRECT)
+    _assert_refused(_raw_callback(provider, attacker_state, f"ns_login_bind={attacker_cookie}"))
+
+
+def test_forged_callback_shapes_keep_genuine_cookie(provider):
+    """Junk state / provider error from a forged hit must not clear the victim's cookie."""
+    _s, cookie, *_ = _start_login(provider)
+    client = _client()
+    hdr = {"cookie": f"{_name()}={cookie}"}
+    if provider == "google":
+        resps = [
+            client.get("/oauth/google/callback", params={"error": "x"}, headers=hdr, follow_redirects=False),
+            client.get("/oauth/google/callback", params={"state": "junk", "code": "c"}, headers=hdr, follow_redirects=False),
+        ]
+    else:
+        resps = [client.post("/oauth/supabase/callback", data={"access_token": _sb(), "state": "junk"},
+                             headers=hdr, follow_redirects=False)]
+    for r in resps:
+        assert r.status_code == 400
+        assert "set-cookie" not in r.headers, r.headers.get("set-cookie")
+
+
+def test_failure_after_binding_clears_cookie(provider, monkeypatch):
+    """Once the binding succeeded, a later failure (here an IdP rejection) spends the cookie."""
+    state, cookie, *_ = _start_login(provider)
+    monkeypatch.setattr(lp, "_verify_oidc_jwt", lambda *a, **k: None)
+    monkeypatch.setattr(lp, "_verify_supabase_jwt", lambda *a, **k: None)
+    r = _callback(provider, state, cookie)
+    assert r.status_code == 401
+    assert "max-age=0" in r.headers["set-cookie"].lower()
+
+
+# ── consent page names the destination ──
+
+
+def test_consent_page_shows_redirect_host_prominently(provider):
+    client = _client()
+    cid = client.post("/oauth/register", json={"redirect_uris": [ATTACKER_REDIRECT]}).json()["client_id"]
+    _, challenge = _pkce()
+    page = client.get("/oauth/authorize", params={
+        "response_type": "code", "client_id": cid, "redirect_uri": ATTACKER_REDIRECT,
+        "code_challenge": challenge, "code_challenge_method": "S256"})
+    assert '<p class="dest">' in page.text and "<b>attacker.example.net</b>" in page.text
+    assert page.text.index("attacker.example.net") < page.text.index("requesting access")

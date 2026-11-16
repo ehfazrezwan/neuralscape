@@ -56,10 +56,10 @@ from config import settings
 import identity_store
 from login_providers import (
     AuthorizeContext,
+    login_binding_cookie_name,
+    login_binding_cookie_path,
     GoogleProvider,
     IdentityStoreUnavailable,
-    LOGIN_BINDING_COOKIE,
-    LOGIN_BINDING_COOKIE_PATH,
     LOGIN_BINDING_MAX_AGE,
     LoginError,
     LoginNeedsLink,
@@ -367,6 +367,9 @@ _CONSENT_PAGE = """<!doctype html>
   h1 {{ font-size: 19px; margin: 0 0 4px; }}
   p  {{ font-size: 14px; line-height: 1.5; color: #aab1c2; margin: 8px 0; }}
   .who {{ font-size: 13px; color: #8b93a7; margin-bottom: 18px; }}
+  .dest {{ font-size: 15px; color: #e7e9ee; background: #0d0f16; border: 1px solid #3b5bdb;
+          border-radius: 10px; padding: 10px 12px; margin: 10px 0 6px; }}
+  .dest b {{ font-size: 17px; overflow-wrap: anywhere; }}
   label {{ display:block; font-size: 13px; color:#cbd2e1; margin: 16px 0 6px; }}
   textarea {{ width: 100%; box-sizing: border-box; min-height: 84px; resize: vertical;
              font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px;
@@ -394,7 +397,8 @@ _CONSENT_PAGE = """<!doctype html>
 <body>
   <div class="card">
     <h1>Connect Neuralscape memory</h1>
-    <p class="who">{client_label} is requesting access to your Neuralscape memories.</p>
+    <p class="dest">After you sign in, access is granted to <b>{redirect_host}</b></p>
+    <p class="who">The app calls itself &ldquo;{client_label}&rdquo; and is requesting access to your Neuralscape memories. Only continue if you recognise the address above.</p>
     {error_html}
     <!--PROVIDER_BLOCK-->
     <!--DIVIDER-->
@@ -436,6 +440,7 @@ def _render_consent(
     them when both are present."""
     error_html = f'<div class="err">{html.escape(error)}</div>' if error else ""
     page = _CONSENT_PAGE.format(
+        redirect_host=html.escape(urlparse(redirect_uri).netloc or "an unknown address"),
         client_label=html.escape(client_label),
         error_html=error_html,
     )
@@ -477,10 +482,10 @@ def _set_login_binding_cookie(response, nonce: str) -> None:
     the login state.
     """
     response.set_cookie(
-        LOGIN_BINDING_COOKIE,
+        login_binding_cookie_name(),
         sign_login_binding(nonce, _secret()),
         max_age=LOGIN_BINDING_MAX_AGE,
-        path=LOGIN_BINDING_COOKIE_PATH,
+        path=login_binding_cookie_path(),
         secure=_cookie_secure(),
         httponly=True,
         samesite="lax",
@@ -489,8 +494,8 @@ def _set_login_binding_cookie(response, nonce: str) -> None:
 
 def _clear_login_binding_cookie(response) -> None:
     response.delete_cookie(
-        LOGIN_BINDING_COOKIE,
-        path=LOGIN_BINDING_COOKIE_PATH,
+        login_binding_cookie_name(),
+        path=login_binding_cookie_path(),
         secure=_cookie_secure(),
         httponly=True,
         samesite="lax",

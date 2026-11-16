@@ -22,6 +22,7 @@ setting, so CLI/CI/e2e are unaffected.
 
 from __future__ import annotations
 
+import contextvars
 import hmac
 import html
 import logging
@@ -87,6 +88,34 @@ LOGIN_BINDING_COOKIE = "ns_login_bind"
 # The IdP callbacks and the link page all live under /oauth.
 LOGIN_BINDING_COOKIE_PATH = "/oauth"
 LOGIN_BINDING_MAX_AGE = _LOGIN_STATE_TTL
+# Over https the cookie carries the __Host- prefix (Secure, Path=/, no Domain):
+# browsers refuse to let a sibling subdomain, or plain http, plant or overwrite a
+# __Host- cookie, which closes cookie tossing of an attacker's own signed cookie.
+HOST_PREFIX = "__Host-"
+
+
+def _public_https() -> bool:
+    return settings.neuralscape_public_url.strip().lower().startswith("https://")
+
+
+def login_binding_cookie_name() -> str:
+    """``__Host-ns_login_bind`` on an https deployment, else ``ns_login_bind``."""
+    return (HOST_PREFIX + LOGIN_BINDING_COOKIE) if _public_https() else LOGIN_BINDING_COOKIE
+
+
+def login_binding_cookie_path() -> str:
+    """``/`` (required by __Host-) on https, ``/oauth`` for plain-http dev."""
+    return "/" if _public_https() else LOGIN_BINDING_COOKIE_PATH
+
+
+def _cookie_name_count(request, name: str) -> int:
+    """How many times ``name`` appears in the RAW Cookie header(s). A framework
+    cookie dict keeps only one value per name, hiding a planted duplicate."""
+    headers = getattr(request, "headers", None)
+    if headers is None:
+        return 1 if name in getattr(request, "cookies", {}) else 0
+    raw = headers.get("cookie", "") if hasattr(headers, "get") else ""
+    return sum(1 for part in raw.split(";") if part.strip().split("=", 1)[0].strip() == name)
 
 _BINDING_REFUSED = (
     "This sign-in was not started in this browser, or it has expired. "
@@ -195,7 +224,14 @@ async def bind_login(request: Request, state_token: str) -> "AuthorizeContext | 
     if parsed is None:
         return LoginError("Login session expired or invalid. Try again.", 400)
     ctx, state_nonce = parsed
-    cookie_nonce = verify_login_binding(request.cookies.get(LOGIN_BINDING_COOKIE, ""), secret)
+    name = login_binding_cookie_name()
+    # Exactly one cookie of this name, read under the name for this deployment's
+    # scheme only (a non-prefixed cookie on https is attacker-plantable: ignored).
+    cookie_nonce = (
+        verify_login_binding(request.cookies.get(name, ""), secret)
+        if _cookie_name_count(request, name) == 1
+        else None
+    )
     if cookie_nonce is None or not hmac.compare_digest(
         cookie_nonce.encode("utf-8"), state_nonce.encode("utf-8")
     ):
@@ -209,8 +245,26 @@ async def bind_login(request: Request, state_token: str) -> "AuthorizeContext | 
             "Sign-in is temporarily unavailable. Please try again shortly.", 503, keep_cookie=True
         )
     if not first_use:
-        return LoginError(_BINDING_REFUSED, 403)
+        return LoginError(_BINDING_REFUSED, 403, keep_cookie=False)
+    _binding_ok.set(True)
     return ctx
+
+
+_binding_ok: contextvars.ContextVar[bool] = contextvars.ContextVar("login_binding_ok", default=False)
+
+
+async def _complete_tracking_binding(coro_fn, request):
+    """Run a provider's ``_complete``; a LoginError raised AFTER the binding
+    succeeded belongs to this browser's own spent login, so its cookie may be
+    cleared. Failures before that (junk state, forged callback) keep it."""
+    token = _binding_ok.set(False)
+    try:
+        res = await coro_fn(request)
+        if isinstance(res, LoginError) and _binding_ok.get():
+            res.keep_cookie = False
+        return res
+    finally:
+        _binding_ok.reset(token)
 
 
 # ── login results ────────────────────────────────────────────────────────
@@ -230,9 +284,11 @@ class LoginError:
 
     message: str
     status: int = 400
-    # True when the login binding cookie must stay in the browser (a refused or
-    # retryable callback must not destroy the user's genuine in-flight login).
-    keep_cookie: bool = False
+    # True (default) keeps the login binding cookie in the browser: a refused,
+    # junk or retryable callback must not destroy the user's genuine in-flight
+    # login. It is cleared only once the binding itself succeeded (see
+    # ``_after_binding``) or the nonce was already spent.
+    keep_cookie: bool = True
 
 
 @dataclass
@@ -441,6 +497,9 @@ class GoogleProvider(LoginProvider):
         return f'<a class="provider-btn" href="{url}">Sign in with Google</a>'
 
     async def complete(self, request: Request) -> LoginResult | LoginError:
+        return await _complete_tracking_binding(self._complete, request)
+
+    async def _complete(self, request: Request) -> LoginResult | LoginError:
         q = request.query_params
         if q.get("error"):
             return LoginError(f"Google sign-in failed: {q.get('error')}", 400)
@@ -520,6 +579,9 @@ document.getElementById('ns-google-btn').addEventListener('click', async () => {
 </script>"""
 
     async def complete(self, request: Request) -> LoginResult | LoginError:
+        return await _complete_tracking_binding(self._complete, request)
+
+    async def _complete(self, request: Request) -> LoginResult | LoginError:
         form = await request.form()
         access_token = (form.get("access_token") or "").strip()
         state = (form.get("state") or "").strip()
@@ -689,7 +751,7 @@ __all__ = [
     "AuthorizeContext", "LoginResult", "LoginError", "LoginNeedsLink",
     "LoginProvider", "get_login_provider", "sign_login_state", "verify_login_state",
     "verify_login_state_nonce", "new_login_nonce", "sign_login_binding", "verify_login_binding",
-    "bind_login", "LOGIN_BINDING_COOKIE", "LOGIN_BINDING_COOKIE_PATH", "LOGIN_BINDING_MAX_AGE",
+    "bind_login", "login_binding_cookie_name", "login_binding_cookie_path", "LOGIN_BINDING_COOKIE", "LOGIN_BINDING_COOKIE_PATH", "LOGIN_BINDING_MAX_AGE",
     "sign_link_ticket", "verify_link_ticket", "resolve_login_identity", "provision_user_id", "IdentityStoreUnavailable",
     "verify_user_token",
 ]

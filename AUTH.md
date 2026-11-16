@@ -260,9 +260,13 @@ The signed `login_state` that carries the authorize request across the IdP
 redirect is bound to the browser that started the login, so a state URL built by
 someone else cannot be completed in a victim's browser (login CSRF).
 
-- `GET /oauth/authorize` sets a cookie `ns_login_bind` (HttpOnly, `Secure` when
-  `NEURALSCAPE_PUBLIC_URL` is https, `SameSite=Lax`, `Path=/oauth`, 10 minutes).
-  Its signed value holds the same nonce as the `login_state`.
+- `GET /oauth/authorize` sets the binding cookie: HttpOnly, `SameSite=Lax`,
+  10 minutes. Its signed value holds the same nonce as the `login_state`. When
+  `NEURALSCAPE_PUBLIC_URL` is https it is `__Host-ns_login_bind` (Secure,
+  `Path=/`, no Domain), so a sibling subdomain or a plain-http origin cannot
+  plant an attacker's cookie; the plain name is then ignored, and a request
+  carrying the cookie name more than once is refused. On plain http (loopback
+  dev) it is `ns_login_bind` with `Path=/oauth`.
 - The callback (`GET /oauth/google/callback`, `POST /oauth/supabase/callback`)
   requires the cookie, a valid signature and expiry, and
   `state.nonce == cookie.nonce`. The nonce is then claimed once in Redis
@@ -273,6 +277,13 @@ someone else cannot be completed in a victim's browser (login CSRF).
 - `SameSite=Lax` is sufficient: Google returns by a top-level GET, and the
   Supabase finisher POSTs from this origin. `Strict` would drop the cookie on the
   cross-site GET.
+- Operator notes: the https cookie is `Secure`, so reaching the app over plain
+  http while `NEURALSCAPE_PUBLIC_URL` is https (a tunnel or port-forward) drops
+  it and every federated login is refused; use the https URL, or set the public
+  URL to the http address you really use. The `__Host-` cookie has `Path=/`, so a
+  reverse proxy that serves the app under a path prefix still works if it
+  forwards the `Cookie` header and `Set-Cookie` unmodified; a proxy that rewrites
+  cookie paths or strips `Set-Cookie`/`Cookie` breaks it.
 - Users must finish the login in the same browser that started it, with cookies
   enabled. Starting a second login in another tab replaces the cookie, so only
   the most recent tab can finish.

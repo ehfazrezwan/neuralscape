@@ -36,7 +36,6 @@ from tokens import verify_payload
 PUBLIC_URL = "https://neuralscape.example.com"
 REDIRECT = "https://claude.ai/api/mcp/auth_callback"
 ATTACKER_REDIRECT = "https://attacker.example.net/cb"
-COOKIE = lp.LOGIN_BINDING_COOKIE
 
 
 def _b64url(data: bytes) -> str:
@@ -154,13 +153,13 @@ def _start_login(stack, redirect_uri=REDIRECT):
         state = parse_qs(urlparse(link).query)["state"][0]
     else:
         state = re.search(r"supabase/callback\?state=([A-Za-z0-9_.\-=]+)", html.unescape(page.text))[1]
-    cookie = re.match(rf"{COOKIE}=([^;]+)", page.headers["set-cookie"])[1]
+    cookie = re.match(rf"{re.escape(lp.login_binding_cookie_name())}=([^;]+)", page.headers["set-cookie"])[1]
     stack.track(state=state)
     return state, cookie, verifier, client_id
 
 
 def _callback(stack, state, cookie):
-    headers = {"cookie": f"{COOKIE}={cookie}"} if cookie is not None else {}
+    headers = {"cookie": f"{lp.login_binding_cookie_name()}={cookie}"} if cookie is not None else {}
     client = _client()
     if stack.name == "google":
         return client.get("/oauth/google/callback", params={"code": "idp-code", "state": state},

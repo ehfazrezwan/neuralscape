@@ -109,9 +109,10 @@ class _Req:
                 (self.query_params.get("state") or self._form.get("state") or ""), _SECRET
             )
             cookies = (
-                {lp.LOGIN_BINDING_COOKIE: lp.sign_login_binding(parsed[1], _SECRET)} if parsed else {}
+                {lp.login_binding_cookie_name(): lp.sign_login_binding(parsed[1], _SECRET)} if parsed else {}
             )
         self.cookies = cookies
+        self.headers = {"cookie": "; ".join(f"{k}={v}" for k, v in cookies.items())}
 
     async def form(self):
         return self._form
