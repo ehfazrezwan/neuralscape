@@ -735,7 +735,7 @@ async def advanced_graph_search_legacy(req: LegacyGraphSearchRequest, request: R
             limit=req.limit,
             search_config=req.search_config,
         )
-        return {"status": "ok", **results}
+        return {"status": "degraded" if results.get("degraded") else "ok", **results}
     except HTTPException:
         raise
     except Exception:
@@ -2489,7 +2489,7 @@ async def v1_graph_search(req: GraphSearchRequest, request: Request):
             limit=req.limit,
             search_config=req.search_config,
         )
-        return {"status": "ok", **results}
+        return {"status": "degraded" if results.get("degraded") else "ok", **results}
     except HTTPException:
         raise
     except Exception as e:

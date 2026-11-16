@@ -81,7 +81,7 @@ def test_registry_check_fails_without_the_compiler(a):
     expect_check_fails(check_extension_list, body)
 
 
-@proves("ext.extension-registry", "auth.request-identity-resolution")
+@proves("ext.extension-registry", "auth.request-identity-resolution", "auth.extension-route-identity")
 def test_events_are_accepted_for_the_caller_and_refused_for_another_user(ctx, a):
     kind = f"zq_{ctx.run_id}_probe"
     own = a.post("/v1/extensions/events", json={"event_type": kind, "payload": {"note": "acceptance"}})
@@ -93,7 +93,7 @@ def test_events_are_accepted_for_the_caller_and_refused_for_another_user(ctx, a)
     assert bad.status_code == 422, f"known event with an invalid payload -> {bad.status_code} (want 422)"
 
 
-@proves("ext.extension-registry", "auth.request-identity-resolution")
+@proves("ext.extension-registry", "auth.request-identity-resolution", "auth.extension-route-identity")
 def test_compiler_flush_is_bound_to_the_token_identity(ctx, a):
     r = a.post(
         "/v1/extensions/conversation-compiler/flush",
@@ -221,7 +221,7 @@ def check_default_config(body: dict, project_id: str) -> None:
     )
 
 
-@proves("knowledge.router")
+@proves("knowledge.router", "auth.knowledge-config-authz")
 def test_project_knowledge_config_defaults_and_is_admin_write_only(ctx, a, b, mcp_a):
     path = f"/v1/projects/{ctx.project_id}/knowledge-config"
     check_default_config(a.get(path).json(), ctx.project_id)
