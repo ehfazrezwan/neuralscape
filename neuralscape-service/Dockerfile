@@ -174,6 +174,9 @@ RUN cd neuralscape-service && \
 COPY neuralscape-service/tests/ neuralscape-service/tests/
 COPY neuralscape-service/integration_tests/ neuralscape-service/integration_tests/
 COPY neuralscape-service/scripts/ neuralscape-service/scripts/
+# The env templates (no secrets) are test inputs: tests/test_env_templates.py loads
+# each as the service .env.
+COPY .env.example .env.production ./
 
 ENV PATH="/app/neuralscape-service/.venv/bin:$PATH"
 ENV NEO4J_URI=neo4j://neo4j:7687 \
