@@ -161,6 +161,7 @@ the seeds on the single graph worker) and the native index; budget about 15 minu
   read what it recorded, so they do not depend on each other's order; the exceptions are the last test of
   `test_code_graph` / `test_code_graph_cbm` (they delete the code space) and `test_connectors`' delete test, which
   use only objects they create. Do not run a single test of those modules with `-k` after a previous run on the same stack.
+- **`@expected_red("#<pr>")`** labels a scenario that is known to fail until that PR lands. It is not an xfail: the scenario runs, a failure is reported as `fail`, and the results JSON carries `expected_red` (the reference, else null) so known reds can be told from new ones. Nodes deliberately not covered by any scenario are listed with a reason in `COVERAGE.md`.
 - **Expected red until PR 495 (sec-03):** the consent-page framing headers and refresh-token rotation in `test_oauth`.
 - **Coverage of the old blind e2e scripts is partial** (see the PR body's disposition table): they stay in the repo
   for the parts not ported.
@@ -327,6 +328,7 @@ listing is always `docker compose -p <project> ps`, never global `docker ps`.
 (uv may download a managed CPython; downloads are allowed). Set `NS_UV=/path/to/uv` for a
 standalone binary that is not on `PATH`. Without uv it falls back to python3 >= 3.10 + venv.
 
+**Evidence rule.** A results row is node evidence only when `evidence` is true: rows from `@negative_control` or `@expected_red` scenarios are never evidence (`evidence: false`). An expected-red scenario that passes is flagged `unexpected_pass: true` and named in the run summary, so the marker can be dropped.
 
 ## Backup then restore (destructive; `test_backup_restore.py`)
 

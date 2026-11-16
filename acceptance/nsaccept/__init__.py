@@ -6,10 +6,11 @@ anything from neuralscape-service or the plugin source.
 """
 
 from .checks import eventually, expect_check_fails
-from .decor import needs, negative_control, profiles, proves
+from .decor import expected_red, needs, negative_control, profiles, proves
 
 __all__ = [
     "eventually",
+    "expected_red",
     "expect_check_fails",
     "needs",
     "negative_control",

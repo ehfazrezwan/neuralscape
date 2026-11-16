@@ -220,6 +220,7 @@ def pytest_runtest_makereport(item, call):
             "seconds": 0.0,
             "detail": "",
             "negative_control": item.get_closest_marker("ns_negative_control") is not None,
+            "expected_red": _expected_red(item),
         },
     )
     if _expected_red(item):
@@ -256,6 +257,25 @@ def _results_path(config, commit: str) -> Path:
     return ACCEPTANCE_DIR / "results" / f"{profile}-{commit[:12]}.json"
 
 
+def _finalize(s: dict) -> dict:
+    """Per-scenario evidence rules for the results JSON: expected-red and negative-control rows are never
+    node evidence; an expected-red scenario that passes is flagged."""
+    out = dict(s)
+    out["seconds"] = round(out["seconds"], 2)
+    out["evidence"] = not (out.get("expected_red") or out.get("negative_control"))
+    out["unexpected_pass"] = bool(out.get("expected_red")) and out.get("result") == "pass"
+    return out
+
+
+def pytest_terminal_summary(terminalreporter, config):
+    state = getattr(config, "_ns_state", None) or {}
+    unexpected = [s["id"] for s in state.values() if s.get("expected_red") and s.get("result") == "pass"]
+    if unexpected:
+        terminalreporter.write_line(
+            f"ns: {len(unexpected)} expected-red scenario(s) PASSED (drop the marker?): " + ", ".join(unexpected)
+        )
+
+
 def pytest_sessionfinish(session, exitstatus):
     config = session.config
     if config.getoption("--ns-list-out") or not config._ns_state:
@@ -272,7 +292,7 @@ def pytest_sessionfinish(session, exitstatus):
         "started": _utc(config._ns_started),
         "finished": _utc(_dt.datetime.now(_dt.timezone.utc)),
         "scenarios": [
-            {**s, "seconds": round(s["seconds"], 2)} for s in config._ns_state.values()
+            _finalize(s) for s in config._ns_state.values()
         ],
     }
     path = _results_path(config, commit)
