@@ -123,11 +123,12 @@ _PROVIDER_FENCE = tuple(
 # mem0 ``Memory`` methods that make up its native add/search pipeline. The
 # service writes and reads Qdrant itself; the only Memory methods it calls are
 # get / get_all / delete / delete_all / _update_memory (+ vector_store, db,
-# embedding_model attributes).
+# embedding_model attributes). ``memory/edit.py`` also mirrors mem0's own update upkeep
+# by calling ``_remove_memory_from_entity_store`` / ``_link_entities_for_memory`` after
+# its text CAS, so those two entity-store helpers are deliberately reachable.
 FORBIDDEN_MEMORY_METHODS = {
     "add", "search", "update", "chat", "history", "reset", "entity_store",
     "_search_vector_store", "_add_to_vector_store", "_create_memory",
-    "_link_entities_for_memory", "_remove_memory_from_entity_store",
 }
 
 
