@@ -30,12 +30,23 @@ def test_colliding_pool_ids_get_distinct_files_and_text_stays_apart(tmp_path):
         assert f"SECRET-{second}" in t2 and f"SECRET-{first}" not in t2
 
 
+def test_case_differing_ids_get_distinct_files(tmp_path):
+    """The hash must not fold case: distinct on case-insensitive filesystems too."""
+    dreams = tmp_path / "Dreams"
+    upper, lower = "user--Alice", "user--alice"
+    pu, pl = reflect.diary_page_path(dreams, upper), reflect.diary_page_path(dreams, lower)
+    assert pu != pl and pu.name.lower() != pl.name.lower()
+    _write(dreams, upper, "SECRET-upper")
+    _write(dreams, lower, "SECRET-lower")
+    assert "SECRET-lower" not in pu.read_text() and "SECRET-upper" not in pl.read_text()
+
+
 def test_name_is_stable_and_readable():
     p1 = reflect.diary_page_path(reflect.Path("/v/Dreams"), A)
     assert p1 == reflect.diary_page_path(reflect.Path("/v/Dreams"), A)
     assert p1.name.startswith("user-a-b-") and p1.name.endswith(".md")
-    assert p1.name == "user-a-b-" + p1.name.split("-")[-1]  # slug + 10-hex digest
-    assert len(p1.stem.rsplit("-", 1)[1]) == 10
+    assert p1.name == "user-a-b-" + p1.name.split("-")[-1]  # slug + 16-hex digest
+    assert len(p1.stem.rsplit("-", 1)[1]) == 16
 
 
 def test_index_links_resolve(tmp_path):
@@ -74,3 +85,42 @@ def test_legacy_file_of_another_pool_never_receives_text(tmp_path):
     assert legacy.read_text() == before and "A-text" not in before
     assert "A-text" in reflect.diary_page_path(dreams, A).read_text()
     assert "B-text" not in reflect.diary_page_path(dreams, A).read_text()
+
+
+def _strand_legacy(dreams, owner):
+    """Write ``owner``'s diary, then park it under the shared pre-fix name."""
+    _write(dreams, owner, f"PRIVATE-{owner}")
+    legacy = reflect.legacy_diary_page_path(dreams, owner)
+    reflect.diary_page_path(dreams, owner).replace(legacy)
+    return legacy
+
+
+def test_legacy_quote_lookalike_pool_is_not_migrated_into_other_pool(tmp_path):
+    dreams = tmp_path / "Dreams"
+    x, y = "user--a'", "user--a"
+    legacy = _strand_legacy(dreams, x)
+    assert reflect.legacy_diary_page_path(dreams, y) == legacy
+    before = legacy.read_text()
+    _write(dreams, y, "Y-text")
+    assert legacy.read_text() == before
+    assert "PRIVATE" not in reflect.diary_page_path(dreams, y).read_text()
+
+
+def test_legacy_whitespace_lookalike_pool_is_not_migrated_into_other_pool(tmp_path):
+    dreams = tmp_path / "Dreams"
+    x, y = "user--p  q", "user--p q"
+    legacy = _strand_legacy(dreams, x)
+    assert reflect.legacy_diary_page_path(dreams, y) == legacy
+    before = legacy.read_text()
+    _write(dreams, y, "Y-text")
+    assert legacy.read_text() == before
+    assert "PRIVATE" not in reflect.diary_page_path(dreams, y).read_text()
+
+
+def test_unmigratable_legacy_does_not_break_write(tmp_path):
+    dreams = tmp_path / "Dreams"
+    # lone surrogate cannot be utf-8 encoded: write_diary must return None, not raise
+    assert _write(dreams, "user--bad\ud800", "x") is None
+    # legacy name over 255 bytes makes exists() raise ENAMETOOLONG on Linux; must not raise
+    long_pool = "user--" + "x" * 300
+    _write(dreams, long_pool, "x")  # must not raise

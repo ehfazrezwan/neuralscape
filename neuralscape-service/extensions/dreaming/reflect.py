@@ -139,15 +139,16 @@ def diary_page_path(dreams_dir: Path, pool: str) -> Path:
 
     The slug alone is lossy (``--``/``_`` collapse, 80-char truncation), so
     two different pools could share one file and mix private text. The
-    10-hex SHA-256 suffix of the unmodified pool id keeps names distinct and
-    stable across runs. This is the only place a diary name is computed.
+    16-hex (64-bit) SHA-256 suffix of the unmodified, case-preserving pool id
+    keeps names distinct and stable across runs. This is the only place a
+    diary name is computed.
     """
     import hashlib
 
     from extensions.conversation_compiler.obsidian_writer import _slugify
 
     slug = (_slugify(pool) or "pool")[:48].strip("-") or "pool"
-    digest = hashlib.sha256(pool.encode("utf-8")).hexdigest()[:10]
+    digest = hashlib.sha256(pool.encode("utf-8")).hexdigest()[:16]
     return dreams_dir / f"{slug}-{digest}.md"
 
 
@@ -158,22 +159,44 @@ def legacy_diary_page_path(dreams_dir: Path, pool: str) -> Path:
     return dreams_dir / f"{_slugify(pool) or 'pool'}.md"
 
 
+def _legacy_diary_is_provably(text: str, pool: str) -> bool:
+    """True only when ``text`` could have been written for exactly ``pool``.
+
+    Frontmatter normalises whitespace and the parser unquotes, so the
+    ``pool`` value alone cannot tell ``user--p  q`` from ``user--p q``. The
+    page's H1 is written verbatim from the pool id, so both must match
+    exactly, and the pool id must survive the frontmatter writer/parser
+    unchanged. Anything else is treated as not-this-pool.
+    """
+    if "\n" in pool or "\r" in pool:
+        return False
+    probe, _ = okf_translate.parse_document(okf_translate.render_frontmatter({"pool": pool}) + "\n")
+    if probe.get("pool") != pool:
+        return False
+    fm, body = okf_translate.parse_document(text)
+    if fm.get("pool") != pool:
+        return False
+    first = next((ln for ln in body.splitlines() if ln.strip()), "")
+    return first == f"# Dreams \u2014 {pool}"
+
+
 def _migrate_legacy_diary(dreams_dir: Path, pool: str, path: Path) -> None:
     """Move the old slug-only diary to the new name when it is provably this pool's.
 
-    The old file's ``pool`` frontmatter must equal ``pool`` exactly. A file
-    that belongs to another pool (a collision) or carries no pool stays where
-    it is and is never written again.
+    The old file's ``pool`` frontmatter and H1 must equal ``pool`` exactly
+    (no stripping or normalising). A file that belongs to another pool, carries
+    no pool, or whose pool id does not round-trip through the frontmatter
+    stays where it is and is never written again.
+
+    A legacy file already mixed by a past collision names only its last
+    writer; the sweep does not know the other pools, so it cannot be told
+    apart here. Such files may hold mixed text and need manual review.
     """
     old = legacy_diary_page_path(dreams_dir, pool)
     if old == path or not old.exists() or path.exists():
         return
-    try:
-        fm, _ = okf_translate.parse_document(old.read_text(encoding="utf-8"))
-        if str(fm.get("pool", "")).strip().strip("'\"") == pool:
-            old.replace(path)
-    except Exception:
-        logger.warning("legacy diary migration failed for %s (non-fatal)", pool, exc_info=True)
+    if _legacy_diary_is_provably(old.read_text(encoding="utf-8"), pool):
+        old.replace(path)
 
 
 def render_diary_entry(
@@ -231,8 +254,15 @@ def write_diary(
     """
     from extensions.conversation_compiler.obsidian_writer import _atomic_write
 
-    path = diary_page_path(dreams_dir, pool)
-    _migrate_legacy_diary(dreams_dir, pool, path)
+    try:
+        path = diary_page_path(dreams_dir, pool)
+    except Exception:
+        logger.warning("diary path failed for %s (non-fatal)", pool, exc_info=True)
+        return None
+    try:
+        _migrate_legacy_diary(dreams_dir, pool, path)
+    except Exception:
+        logger.warning("legacy diary migration failed for %s (non-fatal)", pool, exc_info=True)
     title = f"Dreams — {pool}"
     try:
         existing = path.read_text(encoding="utf-8") if path.exists() else ""
