@@ -24,13 +24,19 @@ def normalize_email(email: str | None) -> str:
 def email_domain(email: str) -> str:
     """The domain part of a normalized email, or '' if malformed.
 
-    Requires a non-empty local-part AND domain, so addresses like
-    ``@example.com`` (empty local-part) or ``a@`` are rejected — important
-    because this feeds the allowlist's domain gate.
+    Requires exactly one ``@`` with a non-empty local-part AND domain, and no
+    whitespace or control characters anywhere, so ``@example.com``, ``a@`` and
+    ``x@evil.com@example.com`` are all rejected — important because this feeds
+    the allowlist's domain gate. Kept in step with the Supabase hook SQL
+    (``supabase/allowlist_hook.sql``), which also rejects more than one ``@``.
     """
     norm = normalize_email(email)
-    local, sep, domain = norm.rpartition("@")
-    if not sep or not local or not domain:
+    if any(ch.isspace() or not ch.isprintable() for ch in norm):
+        return ""
+    if norm.count("@") != 1:
+        return ""
+    local, _, domain = norm.partition("@")
+    if not local or not domain:
         return ""
     return domain
 

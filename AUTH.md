@@ -117,7 +117,9 @@ hidden and `POST /oauth/authorize` rejects token submits). It's always shown for
 A login is accepted only when the email is **verified** AND
 (`domain ∈ AUTH_ALLOWED_DOMAINS` OR `email ∈ AUTH_EMAIL_ALLOWLIST`).
 Both lists are comma-separated and case-insensitive; a leading `@` on a domain
-is tolerated. **An empty allowlist denies everyone (fail-closed).**
+is tolerated. An address must contain exactly one `@` (non-empty local part and
+domain, no whitespace or control characters) or it is denied, matching the
+Supabase hook. **An empty allowlist denies everyone (fail-closed).**
 
 - `google`: this env allowlist is the sole gate (must be configured).
 - `supabase`: the Supabase hook is the canonical gate; the env allowlist is
