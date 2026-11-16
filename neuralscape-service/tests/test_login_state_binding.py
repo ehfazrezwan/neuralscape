@@ -529,3 +529,25 @@ def test_post_authorize_refuses_userinfo_redirect(env, monkeypatch):
         "client_id": cid, "redirect_uri": bad, "code_challenge": challenge,
         "code_challenge_method": "S256", "token": "x"}, follow_redirects=False)
     assert r.status_code == 400 and r.json()["error"] == "invalid_request"
+
+
+# ── redirect host allowlist re-checked at federated code issuance ─────────
+
+
+def test_callback_refuses_a_login_started_before_the_allowlist_was_set(provider, monkeypatch):
+    """The signed login state predates the list: the callback must not mint a code
+    for a host that is no longer listed."""
+    state, cookie, _set_cookie, _verifier, _cid = _start_login(provider)  # list empty
+    monkeypatch.setattr(settings, "oauth_redirect_host_allowlist", "other.example.org")
+    resp = _callback(provider, state, cookie)
+    assert resp.status_code == 400
+    assert "location" not in resp.headers
+    assert "code=" not in resp.text
+    assert "redirect host is not allowed" in resp.text
+
+
+def test_callback_still_issues_a_code_for_a_listed_host(provider, monkeypatch):
+    state, cookie, _set_cookie, _verifier, _cid = _start_login(provider)
+    monkeypatch.setattr(settings, "oauth_redirect_host_allowlist", "claude.ai")
+    resp = _callback(provider, state, cookie)
+    assert resp.status_code == 303 and resp.headers["location"].startswith(REDIRECT)

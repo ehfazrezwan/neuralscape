@@ -883,6 +883,40 @@ class Settings(BaseSettings):
             raise ValueError("NEURALSCAPE_PUBLIC_URL must use https:// (except loopback hosts)")
         return value.rstrip("/")
 
+    @field_validator("oauth_redirect_host_allowlist")
+    @classmethod
+    def _validate_oauth_redirect_host_allowlist(cls, value: str) -> str:
+        """Reject malformed entries at startup instead of ignoring them.
+
+        A bad entry silently dropped (or a value of only separators, which would
+        parse to an empty list = allow everything) would leave the operator
+        believing a restriction is in force when it is not.
+        """
+        import re
+
+        raw = (value or "").strip()
+        if not raw:
+            return ""
+        host_re = re.compile(r"^[a-z0-9]([a-z0-9.-]{0,251}[a-z0-9])?$")
+        out: list[str] = []
+        for part in raw.split(","):
+            entry = part.strip().lower()
+            if not entry:
+                raise ValueError(
+                    "OAUTH_REDIRECT_HOST_ALLOWLIST has an empty entry (stray or doubled comma); "
+                    "list hostnames as 'host' or 'host:port'"
+                )
+            host, sep, port = entry.partition(":")
+            bad_port = sep and not (port.isascii() and port.isdigit() and 0 < int(port) <= 65535)
+            if not entry.isascii() or not host_re.match(host) or bad_port:
+                raise ValueError(
+                    f"OAUTH_REDIRECT_HOST_ALLOWLIST entry {part.strip()!r} is not a valid "
+                    "'host' or 'host:port' (ASCII hostname, no scheme, path, userinfo or "
+                    "brackets; port 1-65535; use the punycode form for an IDN host)"
+                )
+            out.append(entry)
+        return ",".join(out)
+
     @field_validator("ledger_backend")
     @classmethod
     def _validate_ledger_backend(cls, value: str) -> str:

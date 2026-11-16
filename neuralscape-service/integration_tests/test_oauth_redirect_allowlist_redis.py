@@ -22,6 +22,7 @@ from urllib.parse import parse_qs, urlparse
 import pytest
 from fastapi.testclient import TestClient
 
+import config
 from main import app
 from tokens import issue_user_token, verify_payload
 
@@ -39,7 +40,7 @@ def _b64url(data: bytes) -> str:
 
 
 @pytest.fixture()
-def oauth(stores, unique_ns, flags):
+def oauth_stack(stores, unique_ns, flags):
     secret = secrets.token_hex(32)
     flags(
         neuralscape_user_token_secret=secret,
@@ -80,6 +81,7 @@ def oauth(stores, unique_ns, flags):
         def login_token() -> str:
             return issue_user_token(unique_ns.user_id, secret, 600)
 
+    Ctx.redis_url = stores.redis_url
     return Ctx
 
 
@@ -129,41 +131,73 @@ def _full_flow(ctx, redirect_uri):
     )
 
 
-def test_listed_host_completes_the_full_flow(oauth):
-    oauth.set_list("claude.ai")
-    tok = _full_flow(oauth, LISTED)
+def test_listed_host_completes_the_full_flow(oauth_stack):
+    oauth_stack.set_list("claude.ai")
+    tok = _full_flow(oauth_stack, LISTED)
     assert tok.status_code == 200, tok.text
     hdr = {"Authorization": f"Bearer {tok.json()['access_token']}"}
     # The token carries the logged-in identity: asking for someone else is refused.
-    mismatch = oauth.web.get(f"{PROTECTED}?user_id=someone-else", headers=hdr)
-    assert mismatch.status_code == 400 and oauth.user in mismatch.text
+    mismatch = oauth_stack.web.get(f"{PROTECTED}?user_id=someone-else", headers=hdr)
+    assert mismatch.status_code == 400 and oauth_stack.user in mismatch.text
 
 
-def test_loopback_native_client_completes_the_flow_with_the_list_set(oauth):
-    oauth.set_list("claude.ai")
-    tok = _full_flow(oauth, LOOPBACK)
+def test_loopback_native_client_completes_the_flow_with_the_list_set(oauth_stack):
+    oauth_stack.set_list("claude.ai")
+    tok = _full_flow(oauth_stack, LOOPBACK)
     assert tok.status_code == 200, tok.text
 
 
-def test_unlisted_host_is_refused_end_to_end(oauth):
+def test_unlisted_host_is_refused_end_to_end(oauth_stack):
     # Registered while the list was empty (an attacker-registered or older client).
-    reg = oauth.web.post("/oauth/register", json={"redirect_uris": [UNLISTED]})
+    reg = oauth_stack.web.post("/oauth/register", json={"redirect_uris": [UNLISTED]})
     assert reg.status_code == 201
     client_id = reg.json()["client_id"]
     _verifier, challenge = _pkce()
     params = _authorize_params(client_id, UNLISTED, challenge)
 
-    oauth.set_list("claude.ai")
+    oauth_stack.set_list("claude.ai")
 
     # A fresh registration for the same host is refused.
-    refused = oauth.web.post("/oauth/register", json={"redirect_uris": [UNLISTED]})
+    refused = oauth_stack.web.post("/oauth/register", json={"redirect_uris": [UNLISTED]})
     assert refused.status_code == 400 and refused.json()["error"] == "invalid_redirect_uri"
 
     # The earlier client cannot reach consent or log in.
-    page = oauth.web.get("/oauth/authorize", params={"response_type": "code", **params})
+    page = oauth_stack.web.get("/oauth/authorize", params={"response_type": "code", **params})
     assert page.status_code == 400 and page.json()["error"] == "invalid_request"
-    resp = oauth.web.post(
-        "/oauth/authorize", data={**params, "token": oauth.login_token()}, follow_redirects=False
+    resp = oauth_stack.web.post(
+        "/oauth/authorize", data={**params, "token": oauth_stack.login_token()}, follow_redirects=False
     )
     assert resp.status_code == 400
     assert "location" not in resp.headers  # no authorization code was issued
+
+
+def test_code_issued_before_the_list_is_not_redeemable_and_leaves_redis_untouched(oauth_stack):
+    """A code minted while the list was empty is refused at exchange once the host is
+    unlisted, and the refusal happens before the single-use marker is written to Redis
+    (so the marker key must not exist afterwards)."""
+    import redis
+
+    client_id = oauth_stack.web.post("/oauth/register", json={"redirect_uris": [UNLISTED]}).json()["client_id"]
+    verifier, challenge = _pkce()
+    params = _authorize_params(client_id, UNLISTED, challenge)
+    resp = oauth_stack.web.post(
+        "/oauth/authorize", data={**params, "token": oauth_stack.login_token()}, follow_redirects=False
+    )
+    assert resp.status_code == 303
+    code = parse_qs(urlparse(resp.headers["location"]).query)["code"][0]
+    oauth_stack.track(code)
+    jti = verify_payload(code, config.settings.neuralscape_user_token_secret)["jti"]
+
+    oauth_stack.set_list("claude.ai")
+    tok = oauth_stack.web.post(
+        "/oauth/token",
+        data=dict(grant_type="authorization_code", code=code, code_verifier=verifier,
+                  redirect_uri=UNLISTED, client_id=client_id),
+    )
+    assert tok.status_code == 400 and tok.json()["error"] == "invalid_grant"
+
+    client = redis.Redis.from_url(oauth_stack.redis_url)
+    try:
+        assert client.exists(f"oauth:code:{jti}") == 0
+    finally:
+        client.close()

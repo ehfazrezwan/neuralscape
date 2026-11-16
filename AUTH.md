@@ -385,18 +385,32 @@ OAUTH_REDIRECT_HOST_ALLOWLIST=claude.ai
   scheme's default port only (`https://claude.ai` and `https://claude.ai:443`,
   not `https://claude.ai:8443`); write `claude.ai:8443` to allow that port. A
   `host:port` entry does not also open the default port.
-- **Loopback stays allowed** (`127.0.0.1`, `::1`, `localhost`, http or https)
-  even when the list is set. Native clients (RFC 8252 section 7.3) listen on an
-  ephemeral loopback port, so no list could name it. A loopback redirect only
-  ever reaches the user's own machine.
+- **Loopback exemption.** Redirect hosts `127.0.0.1`, `localhost` and IPv6 `[::1]`
+  (written `http://[::1]:PORT/cb` in a URI) stay allowed, with any port and
+  either scheme, even when the list is set. Native clients (RFC 8252 section
+  7.3) listen on an ephemeral loopback port, so no list could name it, and such a
+  redirect only reaches the user's own machine. Loopback entries are never needed
+  in the list. Other IPv6 literals cannot be listed (entries with brackets or
+  colons other than a port are rejected at startup).
 - It sits on top of the existing rules and never widens them: http to a
   non-loopback host, userinfo, fragments and non-ASCII or percent-encoded hosts
   stay refused.
-- Enforced at `POST /oauth/register` (400 `invalid_redirect_uri`; every URI in
-  the request must pass) **and again** at `GET` and `POST /oauth/authorize`
-  (400 `invalid_request`, `redirect_uri mismatch`, no redirect and no code). A
-  client registered before the list was set is therefore refused once its host
-  is not listed. Authorization codes already issued run out in 5 minutes.
+- **Startup validation.** A malformed value stops the service at startup with a
+  clear error instead of being ignored (an ignored list would fail open): empty
+  entries (doubled or trailing comma, or a value of only separators), a scheme,
+  path, userinfo or wildcard, non-ASCII (use the punycode form), or a port that is
+  not 1-65535.
+- **Where it is enforced.** At `POST /oauth/register` (400
+  `invalid_redirect_uri`; every URI in the request must pass); at `GET` and
+  `POST /oauth/authorize` (400 `invalid_request`, `redirect_uri mismatch`); at
+  every code issuance (`_issue_code_and_redirect`: token paste, the Google and
+  Supabase callbacks, and `/oauth/link`, which refuses before persisting
+  anything), where a refusal renders a "Sign-in failed" page and issues no code;
+  and at `POST /oauth/token`, which refuses to redeem a code whose redirect host
+  is no longer listed (`invalid_grant`). So a client registered, a login started,
+  a link ticket minted or a code issued before the list was set stops working
+  once its host is not listed. Access and refresh tokens already issued are not
+  touched: end those with token revocation.
 - Recommendation for production: set it to the callback hosts you use (for
   example the Claude connector's). Setting it is a deployment step; the default
   stays empty.
