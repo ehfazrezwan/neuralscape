@@ -47,7 +47,7 @@ async def test_process_code_index_indexes_records_and_runs_liveness(ctx):
          patch("knowledge.code_dispatch.resolve_code_engine", return_value=fake_engine), \
          patch("worker._git_head_sha", return_value="deadbeef"), \
          patch("knowledge.index_store.record_index") as rec, \
-         patch("knowledge.router.set_project_config") as setcfg, \
+         patch("worker._merge_index_into_project_config") as setcfg, \
          patch("extensions.dreaming.liveness.detect_inventory_diff_liveness",
                return_value={"events": [], "flagged": 2, "summary": "2 flagged"}) as live:
         result = await worker.process_code_index(ctx, payload)
@@ -65,10 +65,7 @@ async def test_process_code_index_indexes_records_and_runs_liveness(ctx):
     assert rec.call_args.args[0] == "code--ice-bench--smallpy"
     assert rec.call_args.args[1]["repo_sha"] == "deadbeef"
     # Routing config set with the indexed system + code_space
-    setcfg.assert_called_once()
-    cfg = setcfg.call_args.args[0]
-    assert cfg.default_engine == "code-cbm"
-    assert cfg.code_space == "code--ice-bench--smallpy"
+    setcfg.assert_called_once_with("proj1", "code-cbm", "code--ice-bench--smallpy")
     # External-engine liveness diff actually ran (its production caller)
     live.assert_called_once()
 
@@ -102,7 +99,7 @@ async def test_process_code_index_liveness_failure_is_nonfatal(ctx):
          patch("knowledge.code_dispatch.resolve_code_engine", return_value=fake_engine), \
          patch("worker._git_head_sha", return_value=None), \
          patch("knowledge.index_store.record_index"), \
-         patch("knowledge.router.set_project_config"), \
+         patch("worker._merge_index_into_project_config"), \
          patch("extensions.dreaming.liveness.detect_inventory_diff_liveness",
                side_effect=RuntimeError("boom")):
         result = await worker.process_code_index(ctx, payload)

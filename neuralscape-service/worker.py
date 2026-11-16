@@ -1005,44 +1005,81 @@ async def process_code_index(ctx: dict, payload: dict) -> dict:
     }
 
 
-def _merge_index_into_project_config(project_id: str, system: str, code_space: str) -> None:
-    """Record an index in the project's knowledge config WITHOUT replacing the config.
+def _merge_index_config_dict(raw: dict | None, project_id: str, system: str, code_space: str) -> dict:
+    """The project config after an index of ``system`` into ``code_space`` (pure).
 
-    An index adds its system to ``code_systems`` and records ``code_space``; every
-    other stored field an admin set (``fuse_code_into_recall``, ``op_preference``,
-    an existing ``default_engine``, systems from earlier indexes) is kept. The
-    stored copy is read straight from Redis first so a config an API process
-    wrote a moment ago is not overwritten with a stale cached copy.
+    Adds ``system`` to ``code_systems`` and keeps every admin-set field. A pinned
+    ``default_engine`` is kept; ``code_space`` follows the effective default engine
+    (the pinned one, else the system just indexed), so indexing a native space for a
+    project pinned to another engine does not point that engine at the native space.
     """
-    import json as _json
-
-    from knowledge import index_store
-    from knowledge.router import ProjectKnowledgeConfig, set_project_config
-
-    raw = None
-    client = index_store._redis()
-    if client is not None:
-        try:
-            blob = client.get(index_store._CFG_PREFIX + project_id)
-            raw = _json.loads(blob) if blob else None
-        except Exception:  # noqa: BLE001 - fall back to the cached read
-            raw = None
-    if raw is None:
-        raw = index_store.load_project_config(project_id)
-    raw = raw or {}
+    raw = dict(raw or {})
     systems = list(raw.get("code_systems") or [])
     if system not in systems:
         systems.append(system)
-    set_project_config(
-        ProjectKnowledgeConfig(
-            project_id=project_id,
-            code_systems=systems,
-            fuse_code_into_recall=bool(raw.get("fuse_code_into_recall", True)),
-            default_engine=raw.get("default_engine") or system,
-            code_space=code_space,
-            op_preference=raw.get("op_preference"),
+    effective_default = raw.get("default_engine") or system
+    code_space_out = code_space if system == effective_default else raw.get("code_space")
+    return {
+        "project_id": project_id,
+        "code_systems": systems,
+        "fuse_code_into_recall": bool(raw.get("fuse_code_into_recall", True)),
+        "default_engine": effective_default,
+        "code_space": code_space_out,
+        "op_preference": raw.get("op_preference"),
+    }
+
+
+def _merge_index_into_project_config(project_id: str, system: str, code_space: str) -> bool:
+    """Record an index in the project's knowledge config WITHOUT replacing the config.
+
+    Read-modify-write under Redis WATCH/MULTI on the config key, so a concurrent
+    admin edit is retried over, never lost. The stored copy is read from Redis, never
+    from the in-process cache: with Redis unavailable the write is skipped (and
+    logged) rather than saving a possibly stale cached copy over the real one.
+    Returns True when the config was written.
+    """
+    import json as _json
+    import time as _time
+
+    from knowledge import index_store
+    from knowledge.router import _PROJECT_CONFIGS
+
+    client = index_store._redis()
+    if client is None:
+        logger.warning(
+            "project config for %s not updated after indexing %s: Redis unavailable "
+            "(not writing from a possibly stale cache)", project_id, code_space,
         )
-    )
+        return False
+    key = index_store._CFG_PREFIX + project_id
+    try:
+        import redis as _redis_mod
+
+        watch_error = _redis_mod.WatchError
+    except Exception:  # noqa: BLE001
+        watch_error = ()
+    for _ in range(10):
+        try:
+            with client.pipeline() as pipe:
+                pipe.watch(key)
+                blob = pipe.get(key)
+                raw = _json.loads(blob) if blob else None
+                merged = _merge_index_config_dict(raw, project_id, system, code_space)
+                pipe.multi()
+                pipe.set(key, _json.dumps(merged, default=str))
+                pipe.execute()
+        except watch_error:
+            continue  # someone changed the config between read and write: redo on the new value
+        except Exception:  # noqa: BLE001
+            logger.warning("project config for %s not updated (Redis error)", project_id, exc_info=True)
+            return False
+        # Refresh this process's caches from what was just stored.
+        index_store._mem_cfg[project_id] = dict(merged)
+        index_store._mem_cfg_at[project_id] = _time.monotonic()
+        _PROJECT_CONFIGS.pop(project_id, None)
+        return True
+    logger.warning("project config for %s not updated: too many concurrent edits", project_id)
+    return False
 
 
 def _git_head_sha(repo_path: str) -> str | None:
