@@ -320,7 +320,7 @@ services:
       # every 10s (worker_liveness.py); fail when it is missing or >120s old.
       # Reads one mtime: no service import, no Redis/Qdrant/Neo4j/LLM. Long jobs
       # run in threads, so only a blocked loop (a wedged worker) lets it go stale.
-      test: ["CMD", "python", "-c", "import os,sys,time; sys.exit(0 if time.time()-os.stat('/tmp/ns-worker.heartbeat').st_mtime<120 else 1)"]
+      test: ["CMD", "python", "-c", "import os,sys,time; sys.exit(0 if time.time()-os.stat(os.environ.get('NS_WORKER_HEARTBEAT_FILE','/tmp/ns-worker.heartbeat')).st_mtime<120 else 1)"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -387,7 +387,7 @@ services:
       # every 10s (worker_liveness.py); fail when it is missing or >120s old.
       # Reads one mtime: no service import, no Redis/Qdrant/Neo4j/LLM. Long jobs
       # run in threads, so only a blocked loop (a wedged worker) lets it go stale.
-      test: ["CMD", "python", "-c", "import os,sys,time; sys.exit(0 if time.time()-os.stat('/tmp/ns-worker.heartbeat').st_mtime<120 else 1)"]
+      test: ["CMD", "python", "-c", "import os,sys,time; sys.exit(0 if time.time()-os.stat(os.environ.get('NS_WORKER_HEARTBEAT_FILE','/tmp/ns-worker.heartbeat')).st_mtime<120 else 1)"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -460,7 +460,7 @@ services:
       # every 10s (worker_liveness.py); fail when it is missing or >120s old.
       # Reads one mtime: no service import, no Redis/Qdrant/Neo4j/LLM. Long jobs
       # run in threads, so only a blocked loop (a wedged worker) lets it go stale.
-      test: ["CMD", "python", "-c", "import os,sys,time; sys.exit(0 if time.time()-os.stat('/tmp/ns-worker.heartbeat').st_mtime<120 else 1)"]
+      test: ["CMD", "python", "-c", "import os,sys,time; sys.exit(0 if time.time()-os.stat(os.environ.get('NS_WORKER_HEARTBEAT_FILE','/tmp/ns-worker.heartbeat')).st_mtime<120 else 1)"]
       interval: 30s
       timeout: 10s
       retries: 3

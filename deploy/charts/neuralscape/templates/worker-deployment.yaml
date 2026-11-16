@@ -38,10 +38,18 @@ spec:
             {{- toYaml .Values.worker.resources | nindent 12 }}
           # Liveness only: the worker event loop touches the heartbeat file
           # (worker_liveness.py); fail when it is missing or >120s old.
+          # startupProbe gates the liveness probe: a slow cold start (model load,
+          # backend connect) gets up to 30 x 10s = 300s before liveness applies.
+          startupProbe:
+            exec:
+              command: ["python", "-c", "import os,sys,time; sys.exit(0 if time.time()-os.stat(os.environ.get('NS_WORKER_HEARTBEAT_FILE','/tmp/ns-worker.heartbeat')).st_mtime<120 else 1)"]
+            periodSeconds: 10
+            timeoutSeconds: 10
+            failureThreshold: 30
           livenessProbe:
             exec:
-              command: ["python", "-c", "import os,sys,time; sys.exit(0 if time.time()-os.stat('/tmp/ns-worker.heartbeat').st_mtime<120 else 1)"]
-            initialDelaySeconds: 180
+              command: ["python", "-c", "import os,sys,time; sys.exit(0 if time.time()-os.stat(os.environ.get('NS_WORKER_HEARTBEAT_FILE','/tmp/ns-worker.heartbeat')).st_mtime<120 else 1)"]
+            initialDelaySeconds: 0
             periodSeconds: 30
             timeoutSeconds: 10
             failureThreshold: 3

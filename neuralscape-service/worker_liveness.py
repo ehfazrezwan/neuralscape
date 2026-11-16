@@ -17,12 +17,15 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import os
+import logging
 import time
 
 HEARTBEAT_FILE = os.environ.get("NS_WORKER_HEARTBEAT_FILE", "/tmp/ns-worker.heartbeat")  # noqa: S108
 HEARTBEAT_INTERVAL_S = 10.0
 # Twelve missed beats. Compose adds interval*retries on top before a restart.
 HEARTBEAT_MAX_AGE_S = 120
+
+logger = logging.getLogger(__name__)
 
 _CTX_KEY = "_liveness_task"
 
@@ -42,8 +45,8 @@ async def heartbeat_loop(path: str | None = None, interval: float = HEARTBEAT_IN
     while True:
         try:
             beat(path)
-        except OSError:
-            pass  # an unwritable /tmp must not kill the worker; the check will go stale
+        except Exception:  # noqa: BLE001 - never let the beat task die silently
+            logger.warning("worker heartbeat write failed; the liveness check will go stale", exc_info=True)
         await asyncio.sleep(interval)
 
 
@@ -52,11 +55,16 @@ def start_heartbeat(ctx: dict, path: str | None = None, interval: float = HEARTB
     task = ctx.get(_CTX_KEY)
     if task is not None and not task.done():
         return
-    with contextlib.suppress(OSError):
+    with contextlib.suppress(Exception):
         beat(path)
-    ctx[_CTX_KEY] = asyncio.get_running_loop().create_task(
-        heartbeat_loop(path, interval), name="ns-worker-heartbeat"
-    )
+    task = asyncio.get_running_loop().create_task(heartbeat_loop(path, interval), name="ns-worker-heartbeat")
+    task.add_done_callback(_log_if_died)
+    ctx[_CTX_KEY] = task
+
+
+def _log_if_died(task: asyncio.Task) -> None:
+    if not task.cancelled() and task.exception() is not None:
+        logger.error("worker heartbeat task died: %r", task.exception())
 
 
 async def stop_heartbeat(ctx: dict) -> None:

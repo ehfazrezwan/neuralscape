@@ -81,23 +81,17 @@ def _compose_check_command() -> list[str] | None:
     return [sys.executable, "-I", *test[2:]]
 
 
-def test_compose_check_command_passes_fresh_and_fails_stale_or_missing():
+def test_compose_check_command_passes_fresh_and_fails_stale_or_missing(tmp_path):
     cmd = _compose_check_command()
     if cmd is None:
         return
-    hb = Path(re.search(r"'(/tmp/[^']+)'", cmd[-1]).group(1))
-    backup = hb.read_bytes() if hb.exists() else None
-    try:
-        hb.unlink(missing_ok=True)
-        assert subprocess.run(cmd, capture_output=True).returncode != 0  # missing
-        hb.touch()
-        assert subprocess.run(cmd, capture_output=True).returncode == 0  # fresh
-        _age(hb, 600)
-        assert subprocess.run(cmd, capture_output=True).returncode != 0  # stale
-    finally:
-        hb.unlink(missing_ok=True)
-        if backup is not None:
-            hb.write_bytes(backup)
+    hb = tmp_path / "hb"
+    env = {**os.environ, "NS_WORKER_HEARTBEAT_FILE": str(hb)}  # never touch the real /tmp file
+    assert subprocess.run(cmd, capture_output=True, env=env).returncode != 0  # missing
+    hb.touch()
+    assert subprocess.run(cmd, capture_output=True, env=env).returncode == 0  # fresh
+    _age(hb, 600)
+    assert subprocess.run(cmd, capture_output=True, env=env).returncode != 0  # stale
 
 
 def test_check_command_bound_matches_module_constant():
@@ -106,6 +100,17 @@ def test_check_command_bound_matches_module_constant():
         return
     assert f"<{wl.HEARTBEAT_MAX_AGE_S} " in cmd[-1]
     assert wl.HEARTBEAT_FILE.endswith("ns-worker.heartbeat") and "ns-worker.heartbeat" in cmd[-1]
+    assert "NS_WORKER_HEARTBEAT_FILE" in cmd[-1]
+
+
+def test_heartbeat_file_path_is_configurable_by_env(tmp_path):
+    code = "import worker_liveness as w; print(w.HEARTBEAT_FILE)"
+    out = subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True, text=True, env={**os.environ, "NS_WORKER_HEARTBEAT_FILE": str(tmp_path / "x")},
+        cwd=str(Path(__file__).resolve().parents[1]),
+    )
+    assert out.stdout.strip() == str(tmp_path / "x")
 
 
 @pytest.mark.asyncio
@@ -145,3 +150,123 @@ async def test_startup_starts_the_heartbeat_and_shutdown_cancels_it(tmp_path, mo
 def test_all_three_worker_settings_use_the_heartbeat_hooks():
     for cls in (worker.WorkerSettings, worker.GraphWorkerSettings, worker.IngestWorkerSettings):
         assert cls.on_startup is worker.startup and cls.on_shutdown is worker.shutdown
+
+
+# ── the beat survives a slow sync call inside each wrapped task ──────
+
+
+async def _beats_during(tmp_path, coro_factory, slow_s=0.4):
+    """Run ``coro_factory()`` and count heartbeat mtime changes while it runs."""
+    hb = tmp_path / "hb"
+    ctx: dict = {}
+    wl.start_heartbeat(ctx, str(hb), interval=0.02)
+    mtimes = set()
+
+    async def watch():
+        while True:
+            mtimes.add(hb.stat().st_mtime_ns)
+            await asyncio.sleep(0.01)
+
+    watcher = asyncio.get_running_loop().create_task(watch())
+    try:
+        await coro_factory()
+    finally:
+        watcher.cancel()
+        await wl.stop_heartbeat(ctx)
+    return len(mtimes)
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_continues_while_startup_warmup_blocks(tmp_path, monkeypatch):
+    monkeypatch.setattr(wl, "HEARTBEAT_FILE", str(tmp_path / "hb"))
+    monkeypatch.setattr(wl, "HEARTBEAT_INTERVAL_S", 0.02)
+    monkeypatch.setattr(wl.start_heartbeat, "__defaults__", (None, 0.02))
+
+    class Slow:
+        def _get_memory(self):
+            time.sleep(0.4)
+
+        def close(self):
+            pass
+
+    import extensions
+    import hybrid_inference
+
+    monkeypatch.setattr(worker, "MemoryService", Slow)
+    monkeypatch.setattr(worker.settings, "connectors_enabled", False, raising=False)
+    monkeypatch.setattr(hybrid_inference, "warmup_extraction", lambda: None)
+
+    class Reg:
+        async def discover(self): ...
+        async def startup_all(self): ...
+        async def shutdown_all(self): ...
+
+    monkeypatch.setattr(extensions, "ExtensionRegistry", Reg)
+    ctx: dict = {}
+    hb = tmp_path / "hb"
+    seen = set()
+
+    async def watch():
+        while True:
+            if hb.exists():
+                seen.add(hb.stat().st_mtime_ns)
+            await asyncio.sleep(0.01)
+
+    watcher = asyncio.get_running_loop().create_task(watch())
+    await worker.startup(ctx)
+    watcher.cancel()
+    await worker.shutdown(ctx)
+    assert len(seen) >= 5, "heartbeat stalled during the sync warm-up"
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_continues_during_slow_raw_write_dedup_search(tmp_path):
+    from unittest.mock import AsyncMock, MagicMock
+
+    svc = MagicMock()
+    svc.search.side_effect = lambda **kw: (time.sleep(0.4), [])[1]  # retry_transient-style sleep
+    svc.store_raw.return_value = ([], False)
+    ctx = {"service": svc, "redis": MagicMock(enqueue_job=AsyncMock())}
+    n = await _beats_during(
+        tmp_path, lambda: worker.process_memory_raw(ctx, content="x", user_id="u", category="task_context")
+    )
+    assert n >= 5, "heartbeat stalled while service.search ran"
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_continues_during_graph_enrichment_row_lookup(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    class Svc:
+        def get_memory(self, memory_id):
+            return SimpleNamespace(id=memory_id, visibility="private", occurred_at=None)
+
+        def enrich_graph(self, **kw):
+            return True
+
+    def slow_lookup(service, memory_id):
+        time.sleep(0.4)
+
+    monkeypatch.setattr(worker, "_row_episode_uuid", slow_lookup)
+    n = await _beats_during(
+        tmp_path,
+        lambda: worker.process_graph_enrichment({"service": Svc()}, "m1", "c", "alice", None, "private"),
+    )
+    assert n >= 5, "heartbeat stalled during the Qdrant row lookup"
+
+
+@pytest.mark.asyncio
+async def test_beat_task_survives_unexpected_errors_and_logs(tmp_path, monkeypatch, caplog):
+    calls = {"n": 0}
+
+    def flaky(path=None):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("boom")
+
+    monkeypatch.setattr(wl, "beat", flaky)
+    ctx: dict = {}
+    wl.start_heartbeat(ctx, str(tmp_path / "hb"), interval=0.02)
+    await asyncio.sleep(0.15)
+    assert calls["n"] >= 3 and not ctx["_liveness_task"].done()
+    await wl.stop_heartbeat(ctx)
