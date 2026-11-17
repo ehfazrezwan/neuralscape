@@ -137,6 +137,9 @@ class FakeGraph:
 
     def __init__(self):
         self.edges: dict[str, dict] = {}
+        # Episodic node uuid -> ``entity_edges`` (what Graphiti stores for an episode:
+        # the uuids of the edges it resolved and the edges it invalidated)
+        self.episodes: dict[str, list[str]] = {}
         self.calls: list[str] = []
         self.driver = self
 
@@ -146,11 +149,15 @@ class FakeGraph:
             "invalid_at": None, "expired_at": None,
         }
 
-    def invalidate(self, *uuids):
+    def invalidate(self, *uuids, by=None):
+        """Invalidate edges; ``by`` is the episode that did it (Graphiti lists
+        the invalidated edges in that episode's ``entity_edges``)."""
         now = datetime.now(timezone.utc)
         for u in uuids:
             self.edges[u]["invalid_at"] = now
             self.edges[u]["expired_at"] = now
+            if by is not None:
+                self.episodes.setdefault(by, []).append(u)
 
     def delete_cascade(self, *uuids):
         """Episode-delete cascade: expired_at only, invalid_at untouched."""
@@ -199,19 +206,23 @@ class FakeGraph:
                         1 for e in eps if e["invalid_at"] is None and e["expired_at"] is None
                     )
                     rows = [{"total": len(eps), "live": live}]
-                elif "RETURN n.valid_at AS valid_at" in cypher:
-                    # attribution probe: these fake edges carry no valid_at, so nothing is dated
-                    # and the probe falls back to the window (covered in test_supersession_probe_attribution).
-                    rows = []
                 elif "invalid_at IS NOT NULL" in cypher:
                     since = datetime.fromisoformat(params["since"])
+                    # the probe keeps only edges listed in the probing episode's own
+                    # ``entity_edges``; evaluated from the query text, so a query
+                    # without that clause lets every edge in the window through
+                    attributed = None
+                    if "r.uuid IN coalesce(new_ep.entity_edges, [])" in cypher:
+                        assert "(new_ep:Episodic {uuid: $new_episode_uuid" in cypher
+                        attributed = set(graph.episodes.get(params["new_episode_uuid"], []))
                     rows = [
-                        {"uuid": e["uuid"], "fact": e["fact"], "episodes": e["episodes"], "invalid_at": e["invalid_at"]}
+                        {"uuid": e["uuid"], "fact": e["fact"], "episodes": e["episodes"]}
                         for e in graph.edges.values()
                         if e["group_id"] == params["group_id"]
                         and e["invalid_at"] is not None
                         and e["expired_at"] >= since
                         and graph._episode_clause(cypher, e["episodes"], params["new_episode_uuid"])
+                        and (attributed is None or e["uuid"] in attributed)
                     ]
                 else:
                     counts: dict[str, int] = {}
@@ -258,7 +269,7 @@ def _graph_add(graph, *, episode_uuid, invalidate=()):
     """graph.add stand-in: invalidates edges (as Graphiti would mid-write)."""
 
     def _add(**kwargs):
-        graph.invalidate(*invalidate)
+        graph.invalidate(*invalidate, by=episode_uuid)
         return {"episode_uuid": episode_uuid, "episode_name": f"name-{episode_uuid}"}
 
     return _add
@@ -334,7 +345,7 @@ class TestSingleRowEpisode:
 
         def _add(**kw):
             graph.edges["E1"]["episodes"].append("ep-new")  # dedup appends the new episode
-            graph.invalidate("E1")
+            graph.invalidate("E1", by="ep-new")
             return {"episode_uuid": "ep-new", "episode_name": "n"}
 
         svc._memory.graph.add.side_effect = _add
@@ -353,7 +364,7 @@ class TestSingleRowEpisode:
         graph.add_edge("E2", "born expired", ["ep-new"])
 
         def _add(**kw):
-            graph.invalidate("E2")
+            graph.invalidate("E2", by="ep-new")
             return {"episode_uuid": "ep-new", "episode_name": "n"}
 
         svc._memory.graph.add.side_effect = _add
