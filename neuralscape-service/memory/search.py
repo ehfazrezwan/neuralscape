@@ -10,7 +10,7 @@ import time
 import uuid
 
 from config import settings
-from schemas import MemoryResponse, MemoryVisibility
+from schemas import MemoryResponse, MemoryVisibility, RecallResults
 from usage_capture import attributed
 from memory.groups import (
     _build_group_id,
@@ -645,6 +645,9 @@ class SearchMixin:
         # overlaps the vector pool queries below (the legs are independent —
         # Graphiti embeds the query itself). Joined right before the weave.
         graph_future = None
+        # Why the graph leg did not contribute (None = it did, or it was off):
+        # surfaced on the returned list so REST and MCP can say so.
+        graph_leg_status: str | None = None
         graph_submitted_at = time.monotonic()
         if not vector_only:
             try:
@@ -664,6 +667,7 @@ class SearchMixin:
                 )
             except Exception as e:
                 logger.warning(f"Graph search submit failed (non-critical): {e}")
+                graph_leg_status = "skipped"
 
         vector_responses: list[MemoryResponse] = []
         # Per-row fused-order keys recorded by the pool helpers (see
@@ -883,6 +887,8 @@ class SearchMixin:
                 else:
                     graph_wait_s = _GRAPH_SEARCH_JOIN_TIMEOUT_S
                 graph_results = graph_future.result(timeout=graph_wait_s)
+                if graph_results.get("degraded"):
+                    graph_leg_status = "failed"
                 # Reversible tombstones hide a memory's vector row only; its
                 # graph episode, and a fact supported solely by such episodes,
                 # must not come back through the graph legs.
@@ -954,6 +960,7 @@ class SearchMixin:
                             )
                         )
             except _FuturesTimeoutError:
+                graph_leg_status = "timed_out"
                 if not settings.graph_leg_budget_enabled:
                     # Flag off: identical to the pre-budget handling.
                     logger.warning(
@@ -978,6 +985,7 @@ class SearchMixin:
                 episodes_for_later = []
             except Exception as e:
                 logger.warning(f"Graph search failed during recall (non-critical): {e}")
+                graph_leg_status = "failed"
                 episodes_for_later = []
 
         # Enrich graph rows with metadata from their nearest source memory
@@ -1086,7 +1094,7 @@ class SearchMixin:
             except Exception:
                 pass
 
-        return results
+        return RecallResults(results, graph_leg=graph_leg_status)
 
     # Minimum vector similarity for graph→source enrichment to be trusted.
     # Below this, the "source" is just the nearest unrelated memory and we
@@ -1528,6 +1536,9 @@ class SearchMixin:
         """Internal: run a graph search across the given group_ids."""
         g = self._get_graphiti()
         if g is None:
+            if getattr(self, "_graph_init_error", None):
+                # Configured but failed to initialise: an outage, not "off".
+                return _degraded_graph_result()
             return {"edges": [], "nodes": [], "episodes": [], "communities": []}
 
         # No groups means no results, and no graph call.
@@ -1629,7 +1640,8 @@ class SearchMixin:
             }
         except Exception as e:
             logger.error(f"Graph search failed: {e}")
-            return {"edges": [], "nodes": [], "episodes": [], "communities": []}
+            # Marked, so hybrid recall can tell an outage from "no facts".
+            return _degraded_graph_result()
 
     def _enrich_graph_results(
         self,
