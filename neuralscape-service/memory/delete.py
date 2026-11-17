@@ -252,6 +252,31 @@ def _is_tombstoned(payload: dict) -> bool:
 # result. The last size is the hard cap per row.
 _DEDUP_TOP_K_STEPS = (10, 40, 160)
 
+# Reasons the semantic phase leaves a candidate or a neighbour alone without
+# merging it. Counted per run (the "dedup run" log line and the result's
+# ``semantic_declined``) so a pair that scores above the threshold but is not
+# merged is never silent. Pure observability: no decline changes behaviour.
+_DECLINE_REASONS = (
+    "neighbour_other_partition",    # above threshold, but another user/scope/project/visibility/workspace
+    "neighbour_tombstoned",         # above threshold, but the neighbour is already hidden
+    "neighbour_category_twin",      # above threshold, same hash under two categories on purpose
+    "neighbour_other_pool",         # in the partition but in a dream pool whose lock this page does not hold
+    "neighbour_already_merged",     # neighbour or older side already merged away earlier in this run
+    "row_gone_before_compare",      # row deleted/tombstoned between the page read and the pool lock
+    "row_without_text",             # nothing to compare
+    "search_failed",                # embedding or neighbour search raised (logged as a warning)
+    "merge_failed",                 # tombstone/delete raised (logged as a warning)
+)
+
+
+def _decline(declines: dict | None, reason: str, n: int = 1) -> None:
+    if declines is not None and n:
+        declines[reason] = declines.get(reason, 0) + n
+
+
+def _hit_score(hit):
+    return hit["score"] if isinstance(hit, dict) else getattr(hit, "score", None)
+
 
 def _exact_category(payload: dict):
     """Category component of the exact-phase group key (same hash, other category: not a duplicate)."""
@@ -1165,6 +1190,7 @@ class DeleteMixin:
         locks = _DedupLocks(self)
         exact_locked: set[str] = set()
         semantic_locked: set[str] = set()
+        declines: dict[str, int] = {}
         lock_lost: set[str] = set()
         # groups dropped because their survivor changed under the lock, or Redis did not answer
         exact_abandoned = 0
@@ -1379,7 +1405,9 @@ class DeleteMixin:
                         # Rows may have been tombstoned or merged by a sweep that
                         # ran between reading the page and taking the lock: from
                         # here on only the fresh rows are used.
-                        rows = self._live_rows(rows)
+                        fresh_rows = self._live_rows(rows)
+                        _decline(declines, "row_gone_before_compare", len(rows) - len(fresh_rows))
+                        rows = fresh_rows
                         if not rows:
                             continue
                     stored_vectors = self._fetch_dense_vectors([mem["id"] for mem in rows])
@@ -1387,6 +1415,7 @@ class DeleteMixin:
                         semantic_removed += self._semantic_dedup_one(
                             m, user_id, mem, stored_vectors.get(mem["id"]), threshold,
                             deleted_ids, collector=collector,
+                            declines=declines,
                             held_pool=pool,
                             lock_guard=(lambda p=pool: locks.require(p)) if token else None,
                         )
@@ -1400,11 +1429,12 @@ class DeleteMixin:
             "dedup run user=%s scanned=%d exact_removed=%d semantic_pairs_merged=%d "
             "semantic_mode=%s threshold=%s exact_skipped_locked_pools=%d "
             "semantic_skipped_locked_pools=%d lock_lost_pools=%d "
-            "exact_groups_abandoned=%d lock_store_unreachable_skipped=%d",
+            "exact_groups_abandoned=%d lock_store_unreachable_skipped=%d %s",
             user_id, total_checked, exact_removed, semantic_removed,
             "tombstone" if settings.dedup_semantic_tombstone_enabled else "delete", threshold,
             len(exact_locked), len(semantic_locked), len(lock_lost),
             exact_abandoned, lock_store_skipped,
+            " ".join(f"declined_{r}={declines.get(r, 0)}" for r in _DECLINE_REASONS),
         )
         result = {
             "user_id": user_id,
@@ -1412,6 +1442,7 @@ class DeleteMixin:
             "semantic_duplicates_removed": semantic_removed,
             "semantic_mode": "tombstone" if settings.dedup_semantic_tombstone_enabled else "delete",
             "total_checked": total_checked,
+            "semantic_declined": {r: declines.get(r, 0) for r in _DECLINE_REASONS},
             **lock_fields(),
             **self._dedup_graph_summary(collector, deleted_ids),
         }
@@ -1453,6 +1484,7 @@ class DeleteMixin:
         collector: dict | None = None,
         held_pool: str | None = _NO_POOL_GUARD,
         lock_guard=None,
+        declines: dict | None = None,
     ) -> int:
         """Phase 2 for one memory: merge near-duplicates in its own partition.
 
@@ -1479,6 +1511,7 @@ class DeleteMixin:
 
         text = mem["payload"].get("data", "")
         if not text:
+            _decline(declines, "row_without_text")
             return 0
         partition = _dedup_partition(mem["payload"])
 
@@ -1488,19 +1521,25 @@ class DeleteMixin:
                 # query lives in the same space as the rows it is compared to.
                 vector = m.embedding_model.embed(text, memory_action="add")
             hits = self._partition_neighbours(
-                m, user_id, mem["payload"], text, vector, threshold, partition
+                m, user_id, mem["payload"], text, vector, threshold, partition,
+                declines=declines,
             )
         except Exception as e:
             logger.warning(f"Semantic search failed for {mid}: {e}")
+            _decline(declines, "search_failed")
             return 0
 
         for hit in hits:
             hit_id = str(hit["id"]) if isinstance(hit, dict) else str(hit.id)
             hit_payload = hit.get("payload", {}) if isinstance(hit, dict) else (hit.payload or {})
 
-            if hit_id == mid or hit_id in deleted_ids:
+            if hit_id == mid:
+                continue
+            if hit_id in deleted_ids:
+                _decline(declines, "neighbour_already_merged")
                 continue
             if held_pool is not _NO_POOL_GUARD and _dream_pool_of(hit_payload) != held_pool:
+                _decline(declines, "neighbour_other_pool")
                 continue
 
             # Merge the older one into the newer
@@ -1513,6 +1552,7 @@ class DeleteMixin:
             )
 
             if older_id in deleted_ids:
+                _decline(declines, "neighbour_already_merged")
                 continue
             if lock_guard is not None:
                 lock_guard()  # raises _PoolLockLost: the lock is no longer ours, write nothing
@@ -1525,6 +1565,11 @@ class DeleteMixin:
                     )
                 deleted_ids.add(older_id)
                 removed += 1
+                logger.info(
+                    "dedup semantic merge user=%s older=%s newer=%s score=%s mode=%s",
+                    user_id, older_id, newer_id, _hit_score(hit),
+                    "tombstone" if settings.dedup_semantic_tombstone_enabled else "delete",
+                )
                 # Same reinforcement transfer as the exact phase: the
                 # near-duplicate we just merged away was a repeated
                 # observation — its counter moves to the survivor.
@@ -1533,6 +1578,7 @@ class DeleteMixin:
                 )
             except Exception as e:
                 logger.warning(f"Failed to merge semantic dup {older_id}: {e}")
+                _decline(declines, "merge_failed")
 
             # If we merged ourselves away, stop checking this memory
             if older_id == mid:
@@ -1541,7 +1587,8 @@ class DeleteMixin:
         return removed
 
     def _partition_neighbours(
-        self, m, user_id: str, payload: dict, text: str, vector, threshold: float, partition: tuple
+        self, m, user_id: str, payload: dict, text: str, vector, threshold: float, partition: tuple,
+        declines: dict | None = None,
     ) -> list:
         """Live same-partition rows scoring at/above ``threshold``, best first.
 
@@ -1580,10 +1627,13 @@ class DeleteMixin:
             # shared note is not) or workspace (a reference passage vs a
             # memory) is a distinct memory, not a duplicate.
             if _dedup_partition(hit_payload) != partition:
+                _decline(declines, "neighbour_other_partition")
                 continue
             if _is_tombstoned(hit_payload):
+                _decline(declines, "neighbour_tombstoned")
                 continue
             if _differs_only_by_category(payload, hit_payload):
+                _decline(declines, "neighbour_category_twin")
                 continue
             out.append(hit)
         return out

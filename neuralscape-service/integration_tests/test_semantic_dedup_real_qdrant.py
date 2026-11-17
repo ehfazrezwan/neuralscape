@@ -153,3 +153,24 @@ def test_semantic_dedup_flag_off_hard_deletes_the_older_row(flags, svc, user):
     assert result["semantic_duplicates_removed"] >= 1, result
     ids = {r["id"] for r in svc._scroll_all_user_memories(user)}
     assert old_id not in ids and new_id in ids
+
+
+def test_dedup_summary_counts_declines_and_names_the_merged_pair(flags, svc, user, caplog):
+    """The run reports every decline reason (zero here) and logs the merged pair's ids."""
+    import logging
+
+    flags(dedup_semantic_tombstone_enabled=True)
+    tag = uuid.uuid4().hex[:6]
+    older = f"The deploy window for the zq{tag} billing service is Friday at 5pm."
+    newer = f"The deploy window for the zq{tag} billing service is Friday 5pm."
+    old_id = _store(svc, user, older)
+    time.sleep(1.1)
+    new_id = _store(svc, user, newer)
+
+    with caplog.at_level(logging.INFO):
+        result = svc.dedup_memories(user)
+
+    assert result["semantic_duplicates_removed"] >= 1, result
+    declined = result["semantic_declined"]
+    assert declined["search_failed"] == 0 and declined["merge_failed"] == 0, declined
+    assert f"older={old_id} newer={new_id}" in caplog.text
