@@ -63,7 +63,8 @@ def flushed(ctx, a):
 
 def _hits(client, marker, project_id, out=None):
     results = client.search(marker, project_id=project_id)
-    hits = [r for r in results if marker in r.get("memory", "")]
+    # Memory rows only: a verbatim-episode or graph row that quotes the marker has no category by design.
+    hits = [r for r in results if marker in r.get("memory", "") and r.get("source") not in ("graph", "episode")]
     if out is not None:
         out["hits"] = hits
     assert hits, f"{marker} not in {len(results)} search results"
