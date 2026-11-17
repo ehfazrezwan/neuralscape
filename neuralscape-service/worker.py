@@ -1835,10 +1835,6 @@ async def process_connector_sync(
     finally:
         await adapter.aclose()
 
-    if failed:
-        # Keep the cursor where this run started so a failed resource is listed again.
-        next_cursor = cursor
-
     # Atomic, field-scoped and bound to the instance read above: a connector
     # deleted, re-created or re-owned meanwhile keeps its own state.
     written = await vault.update_sync_state(
