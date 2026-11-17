@@ -29,6 +29,7 @@ from cryptography.fernet import Fernet
 
 logger = logging.getLogger(__name__)
 
+_SCAN_COUNT = 200
 _KEY_PREFIX = "ns:connector:"
 
 # Fields that must never leave the vault decrypted via list/get-for-display.
@@ -276,9 +277,19 @@ class ConnectorVault:
 
     # ── helpers ──
     async def _keys(self) -> list[str]:
-        keys = await self._store.keys(_KEY_PREFIX + "*")
-        # redis returns bytes when decode_responses is off; normalize to str.
-        return [k.decode() if isinstance(k, bytes) else k for k in keys]
+        # Incremental SCAN, never the blocking KEYS: KEYS holds Redis for the
+        # whole keyspace. SCAN may return a key more than once, so de-dupe;
+        # ``list()`` sorts, so no order is promised here.
+        seen: dict[str, None] = {}
+        cursor: Any = 0
+        while True:
+            cursor, page = await self._store.scan(cursor=cursor, match=_KEY_PREFIX + "*", count=_SCAN_COUNT)
+            for k in page:
+                # redis returns bytes when decode_responses is off; normalize to str.
+                seen[k.decode() if isinstance(k, bytes) else k] = None
+            if int(cursor) == 0:
+                break
+        return list(seen)
 
     @staticmethod
     def _redact(raw: dict) -> dict:

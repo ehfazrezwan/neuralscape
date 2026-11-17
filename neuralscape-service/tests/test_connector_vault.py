@@ -289,3 +289,39 @@ class TestVaultConstruction:
     def test_generate_key_is_valid(self):
         key = ConnectorVault.generate_key()
         Fernet(key.encode())  # does not raise
+
+
+class TestVaultListUsesScan:
+    @pytest.mark.asyncio
+    async def test_list_never_sends_keys_and_walks_every_scan_page(self):
+        store = FakeStore()
+        store.scan_page_size = 3
+        v = ConnectorVault(store, Fernet(Fernet.generate_key()))
+        for i in range(8):
+            await v.put(_record(connector_id=f"conn-{i}"))
+        store.d["unrelated:key"] = "x"
+
+        listed = await v.list()
+
+        assert "KEYS" not in store.commands
+        assert store.commands.count("SCAN") == 3
+        ids = [r["connector_id"] for r in listed]
+        assert ids == sorted(f"conn-{i}" for i in range(8))
+        assert len(set(ids)) == 8
+
+    @pytest.mark.asyncio
+    async def test_list_dedupes_a_key_returned_on_two_pages(self):
+        store = FakeStore()
+        v = ConnectorVault(store, Fernet(Fernet.generate_key()))
+        await v.put(_record(connector_id="dup"))
+        real_scan = store.scan
+        calls = {"n": 0}
+
+        async def scan_twice(cursor=0, match=None, count=None):
+            calls["n"] += 1
+            nxt, page = await real_scan(cursor, match, count)
+            return (7 if calls["n"] == 1 else 0), page
+
+        store.scan = scan_twice
+        listed = await v.list()
+        assert [r["connector_id"] for r in listed] == ["dup"]
