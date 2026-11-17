@@ -147,8 +147,12 @@ def dream(ctx, a, b, dictator) -> Dream:
         f"The {depot} depot dashboard polls the tide gauge API every thirty seconds",
         f"Deploys of the {depot} depot dashboard go out through the pier pipeline on Fridays",
         f"The {depot} depot dashboard keeps its alerts in a small SQLite file on the pilot hut host",
+        # two facts about other subjects of the same project: a sweep that folds the dashboard facts into one
+        # row must still leave two live rows for the librarian (a topic page needs two)
+        f"The {depot} depot ferry timetable is imported every night at two o'clock from the harbour authority CSV export",
+        f"Access to the {depot} depot admin pages is limited to members of the quay supervisors group",
     ), start=1):
-        _w(a, d, f"sh{i}", f"{mk(f'sh{i}')} {text}.", ["architecture", "decision", "workflow", "tech_stack"][i - 1], **shared)
+        _w(a, d, f"sh{i}", f"{mk(f'sh{i}')} {text}.", ["architecture", "decision", "workflow", "tech_stack", "workflow", "convention"][i - 1], **shared)
     # B: its own private pool
     _w(b, d, "b1", f"{mk('b1')} The operator is called {d.name_b} and works as a harbour pilot.", "personal_fact", **priv)
     _w(b, d, "b2", f"{mk('b2')} {d.name_b} prefers coffee over tea and answers messages in the evening.", "preference", **priv)
@@ -182,6 +186,11 @@ def _finish(dictator: NSClient, job_id: str) -> dict:
     return st["result"]
 
 
+def _shared_ids(d: Dream) -> list[str]:
+    """Ids of the rows written into the shared project pool (keys ``sh1``..``sh6``)."""
+    return [d.ids[k] for k in d.written if k.startswith("sh") and d.ids.get(k)]
+
+
 def _ready(d: Dream) -> Dream:
     assert not d.error, d.error
     return d
@@ -193,7 +202,7 @@ def _ready(d: Dream) -> Dream:
 @proves("ext.dreaming-sweep")
 def test_the_sweep_dreams_every_pool_and_reports_it(ctx, dictator, a, dream: Dream):
     _ready(dream)
-    for pool, floor in ((dream.pool_a, 8), (dream.pool_b, 2), (dream.pool_p, 4)):
+    for pool, floor in ((dream.pool_a, 8), (dream.pool_b, 2), (dream.pool_p, 6)):
         check_dreamt(dream.results[pool], pool, min_staged=floor)
     totals = dream.results[dream.pool_a]["totals"]
     assert totals["pools_dreamt"] == 1 and totals["pools_failed"] == 0, f"totals: {totals}"
@@ -390,12 +399,21 @@ def test_hook_card_check_fails_for_user_b(ctx, dream: Dream):
 
 @needs("compose")
 @proves("ext.dreaming-librarian-vault")
-def test_the_shared_pool_is_rendered_as_vault_pages_and_the_private_pool_is_not(ctx, dream: Dream):
+def test_the_shared_pool_is_rendered_as_vault_pages_and_the_private_pool_is_not(ctx, a, dream: Dream):
     _ready(dream)
     safe = re.sub(r"[^\w-]", "-", dream.project).strip("-")
     page_dir = f"/data/vault/Projects/{safe}"
-    sources = [vault_grep(ctx, dream.ids[k], page_dir) for k in ("sh1", "sh2", "sh3", "sh4")]
-    assert any(sources), f"no topic page under {page_dir} lists any of the shared memories as a source"
+    shared_ids = _shared_ids(dream)
+    sources = [vault_grep(ctx, i, page_dir) for i in shared_ids]
+    if not any(sources):
+        live = [r["id"] for r in list_rows(a, project_id=dream.project) if r["id"] in shared_ids]
+        rep = pool_report(dream.results[dream.pool_p], dream.pool_p)
+        raise AssertionError(
+            f"no topic page under {page_dir} lists any of the shared memories as a source: the sweep staged {rep['staged']} "
+            f"rows, applied {rep['applied']} actions, wrote {rep.get('pages_written')} pages and left {len(live)} of "
+            f"{len(shared_ids)} shared rows live (the librarian needs two live rows; when the model folded the pool "
+            f"into fewer, no page is the correct output and the seeds need more distinct facts)"
+        )
     pages = {p for hits in sources for p in hits}
     assert all(p.endswith(".md") for p in pages), f"non-markdown vault files: {sorted(pages)[:3]}"
     cards = [p for p in vault_grep(ctx, "Maintained by the dreaming sweep", page_dir) if p.endswith("/Card.md")]
@@ -417,9 +435,9 @@ def test_vault_check_fails_in_a_directory_that_holds_no_pages(ctx, dream: Dream)
     safe = re.sub(r"[^\w-]", "-", dream.project).strip("-")
 
     def check(directory):
-        assert vault_grep(ctx, dream.ids["sh1"], directory), "no page lists the memory"
+        assert any(vault_grep(ctx, i, directory) for i in _shared_ids(dream)), "no page lists any shared memory"
 
-    precondition(check, f"/data/vault/Projects/{safe}", what="the project's own pages list the shared memory")
+    precondition(check, f"/data/vault/Projects/{safe}", what="the project's own pages list a shared memory")
     expect_check_fails(check, "/data/vault/Projects/acc-no-such-project")
 
 
@@ -479,7 +497,7 @@ def check_keyword_finds(client: NSClient, rows: list[dict], marker_of: dict[str,
 
 
 def _project_rows(d: Dream) -> dict[str, str]:
-    """Row id -> project for the rows written into the shared project pool (keys ``sh1``..``sh4``)."""
+    """Row id -> project for the rows written into the shared project pool (keys ``sh1``..``sh6``)."""
     return {w.memory_id: d.project for k, w in d.written.items() if k.startswith("sh") and w.memory_id}
 
 
