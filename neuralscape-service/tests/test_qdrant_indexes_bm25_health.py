@@ -308,10 +308,12 @@ def test_health_endpoint_reports_bm25_without_failing(has_slot):
     svc._graphiti = MagicMock()
     orig_tm, orig_svc = main._task_manager, main._service
     main._task_manager, main._service = tm, svc
+    orig_probe, main._probe_graph_store = main._probe_graph_store, AsyncMock(return_value=None)
     try:
         resp = TestClient(main.app, raise_server_exceptions=False).get("/health")
     finally:
         main._task_manager, main._service = orig_tm, orig_svc
+        main._probe_graph_store = orig_probe
     assert resp.status_code == 200
     body = resp.json()
     assert body["status"] == "ok"

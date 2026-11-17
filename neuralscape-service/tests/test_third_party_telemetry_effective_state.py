@@ -164,6 +164,7 @@ def test_telemetry_field_alone_does_not_turn_a_healthy_service_degraded(monkeypa
     monkeypatch.setattr(main._service, "_memory", object(), raising=False)
     monkeypatch.setattr(main._service, "_graphiti", object(), raising=False)
     monkeypatch.setattr(main, "_probe_vector_store", AsyncMock(return_value=None))
+    monkeypatch.setattr(main, "_probe_graph_store", AsyncMock(return_value=None))
     resp = _health(monkeypatch, mem0=True, graphiti="true")
     body = resp.json()
     assert resp.status_code == 200

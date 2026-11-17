@@ -379,6 +379,53 @@ async def _probe_vector_store(memory) -> None:
     await asyncio.wait_for(asyncio.shield(task), timeout=_VECTOR_STORE_PROBE_TIMEOUT_S)
 
 
+_GRAPH_STORE_PROBE_TIMEOUT_S = 2.0
+_GRAPH_STORE_PROBE_TTL_S = 3.0
+_graph_probe: dict = {"graphiti": None, "loop": None, "at": None, "error": None, "task": None}
+
+
+def _graph_driver_check(service) -> None:
+    """Blocking: one Neo4j round trip on the Graphiti bridge loop, bounded by the probe timeout."""
+    driver = service._graphiti.driver
+    coro = driver.health_check()
+    try:
+        service._run_on_bridge(coro, _GRAPH_STORE_PROBE_TIMEOUT_S)
+    except BaseException:
+        coro.close()  # never scheduled (bridge not ready): do not leak an un-awaited coroutine
+        raise
+
+
+async def _probe_graph_store(service) -> None:
+    """Raise if Neo4j does not answer within the probe timeout.
+
+    Same shape as ``_probe_vector_store``: the round trip runs on a worker thread (never on the
+    API event loop), is single-flight, and a fresh answer is cached for a few seconds, so
+    frequent readiness polls cost one bounded Neo4j call per TTL and a hung call holds one
+    thread instead of piling up a new one per request.
+    """
+    st = _graph_probe
+    graphiti = service._graphiti
+    loop = asyncio.get_running_loop()
+    if st["graphiti"] is not graphiti or st["loop"] is not loop:
+        st.update(graphiti=graphiti, loop=loop, at=None, error=None, task=None)
+    task = st["task"]
+    if task is None:
+        if st["at"] is not None and time.monotonic() - st["at"] < _GRAPH_STORE_PROBE_TTL_S:
+            if st["error"] is not None:
+                raise st["error"]
+            return
+        task = asyncio.ensure_future(asyncio.to_thread(_graph_driver_check, service))
+        st["task"] = task
+
+        def _record(done: asyncio.Future) -> None:
+            error = asyncio.CancelledError() if done.cancelled() else done.exception()
+            if st["task"] is done:
+                st.update(task=None, at=time.monotonic(), error=error)
+
+        task.add_done_callback(_record)
+    await asyncio.wait_for(asyncio.shield(task), timeout=_GRAPH_STORE_PROBE_TIMEOUT_S + 1.0)
+
+
 def _vector_store_capabilities() -> dict:
     """Non-failing /health field: what the vector store can do (BM25 slot)."""
     try:
@@ -430,9 +477,11 @@ async def health():
     except Exception:
         checks["vector_store"] = "unreachable"
 
-    # Check graph store (Neo4j/Graphiti)
+    # Check graph store (Neo4j/Graphiti): a real, bounded round trip. A failure only marks the
+    # component (overall "degraded", still 200); the 503 rule below stays vector-store-only.
     try:
         if _service._graphiti is not None:
+            await _probe_graph_store(_service)
             checks["graph_store"] = "ok"
         else:
             checks["graph_store"] = "not_initialized"

@@ -20,6 +20,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from unittest.mock import AsyncMock
 
 SERVICE_DIR = Path(__file__).resolve().parents[1]
 REPO_ROOT = SERVICE_DIR.parent
@@ -394,6 +395,7 @@ def _health(monkeypatch, *, memory, pool_reachable: bool = True) -> dict:
 
     monkeypatch.setattr(knowledge, "list_systems", lambda: [])
     monkeypatch.setattr(main, "_service", SimpleNamespace(_memory=memory, _graphiti=object()))
+    monkeypatch.setattr(main, "_probe_graph_store", AsyncMock(return_value=None))  # these tests are about the vector store/queue
     monkeypatch.setattr(main, "_task_manager", SimpleNamespace(pool=_Pool(pool_reachable)))
     response = _run(main.health())
     if hasattr(response, "body"):

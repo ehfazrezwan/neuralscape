@@ -1278,10 +1278,12 @@ class WriteMixin:
             "payload": payload,
             "response": response,
             "now_iso": now_iso,
-            # (user, hash, scope, project, visibility, workspace) — the dedup identity,
-            # exposed so store_raw_batch can collapse in-batch duplicates. Workspace
-            # is part of the identity: same content in memory vs reference = distinct (WT6).
-            "dedup_key": (user_id, chash, scope, project_id, effective_visibility, effective_workspace),
+            # (user, hash, scope, project, visibility, workspace, category) — the dedup
+            # identity, exposed so store_raw_batch can collapse in-batch duplicates. It
+            # is the same partition _find_by_content_hash filters on above: workspace is
+            # part of it (same content in memory vs reference = distinct, WT6) and so is
+            # category (same text under two categories = two rows).
+            "dedup_key": (user_id, chash, scope, project_id, effective_visibility, effective_workspace, category),
             # Fields _finalize_raw_store needs for the graph write.
             "user_id": user_id,
             "project_id": project_id,

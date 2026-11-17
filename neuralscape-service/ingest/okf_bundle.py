@@ -374,7 +374,9 @@ def ingest_okf_bundle(
 
     The summary reports per-concept outcomes: ``failed`` / ``failed_concepts``
     (``[{concept_id, error}]``) / ``skipped`` and a ``status`` of
-    ``completed``, ``partial`` or ``failed``.
+    ``completed``, ``partial`` or ``failed``. Cross-link memories that fail to
+    store are counted in ``link_failures`` / ``failed_links`` and never change
+    ``status``.
     """
     from ingest.chunking_strategies import OkfFrontmatterStrategy
     from ingest.pipeline import IngestDoc, ingest_document, sanitized_error
@@ -399,6 +401,10 @@ def ingest_okf_bundle(
         "skipped": 0,
         "failed": 0,
         "failed_concepts": [],
+        # Cross-link (relationship) memories that could not be stored. Additive:
+        # they do not change ``status`` (a link is a hint on top of ingested concepts).
+        "link_failures": 0,
+        "failed_links": [],
     }
     anchor_ids: dict[str, str] = {}  # concept_id → one stored memory id
 
@@ -501,11 +507,17 @@ def ingest_okf_bundle(
                 return_created=True,
                 workspace=normalize_workspace(workspace),
             )
-        except Exception:
+        except Exception as exc:
             logger.warning(
                 "OKF link memory store failed for %s (non-fatal)",
                 concept.concept_id, exc_info=True,
             )
+            summary["link_failures"] += 1
+            summary["failed_links"].append({
+                "concept_id": concept.concept_id,
+                # class + fixed message only; raw text is in the server log above
+                "error": sanitized_error(exc, "link"),
+            })
             continue
         if stored:
             summary["memory_ids"].extend(m.id for m in stored)
