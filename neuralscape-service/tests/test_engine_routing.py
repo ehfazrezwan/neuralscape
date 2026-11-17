@@ -131,7 +131,8 @@ def test_dual_write_reaches_both_and_catch_up_copies_prewindow_state_from_canoni
         CanonicalState("tenant-a", "gone", 2, True),
         CanonicalState("tenant-a", "live", 1, False, "during window"),
     ))
-    assert report.copied == 2 and report.tombstoned == 1 and not report.conflicts
+    assert report.copied == 1 and report.unchanged == 1 and report.tombstoned == 1 and not report.conflicts
+    # 'live' reached the shadow through the dual write: it is already canonical, so nothing was written for it
     assert router.lag() == 0
     ids = ["old", "gone", "live"]
     assert state(a, ids) == state(b, ids)
@@ -647,3 +648,17 @@ def test_backfill_is_refused_while_a_window_is_open():
     router.begin_dual_write(Backend("b", ReferenceVectorStore("b")))
     with pytest.raises(RoutingError):
         router.backfill(Canonical())
+
+
+def test_catch_up_reports_the_keys_its_canonical_source_could_not_read():
+    """Before: backfill copied ``source.skipped`` into the report and catch-up did not, so a dual-write
+    catch-up reported ``skipped == 0`` for keys no projection was written for."""
+    router, a, b = make()
+    router.apply(router.route(), ctx(), rec("old", 1, "before window"))
+    router.begin_dual_write(Backend("b", b))
+
+    class Source(Canonical):
+        skipped = 2
+
+    report = router.catch_up(Source(CanonicalState("tenant-a", "old", 1, False, "before window")))
+    assert report.skipped == 2

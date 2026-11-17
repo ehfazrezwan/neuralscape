@@ -142,7 +142,7 @@ def _register(stack, memory_id: str, text: str, revision: int = 1) -> None:
     stack.ledger.put_object_ref(ObjectRef(TENANT, memory_id, revision, 1))
 
 
-def test_flag_on_cycle_through_the_admin_routes_on_real_stores(stack):
+def test_flag_on_cycle_through_the_admin_routes_on_real_stores(stack, monkeypatch):
     from fastapi.testclient import TestClient
 
     client = TestClient(stack.main.app)
@@ -151,6 +151,14 @@ def test_flag_on_cycle_through_the_admin_routes_on_real_stores(stack):
     status = client.get(f"{BASE}/status")
     assert status.status_code == 200, status.text
     assert (status.json()["generation"], status.json()["phase"], status.json()["active"]) == (1, "steady", "qdrant")
+    # No projection producer is wired in this revision: routed recall is refused with its own reason.
+    assert status.json()["recall_ready"] is False
+    assert status.json()["recall_blocked_reason"] == "projection_producer_inactive"
+    # The readiness logic past that gate (a producer is assumed active for the rest of the test).
+    import engine_adapters_switch
+
+    monkeypatch.setattr(engine_adapters_switch, "PROJECTION_PRODUCER_ACTIVE", True)
+    status = client.get(f"{BASE}/status")
     assert status.json()["recall_ready"] is False  # nothing projected yet: routed recall is refused with a reason
     assert status.json()["recall_blocked_reason"] == "projection_not_synced"
 
@@ -168,17 +176,17 @@ def test_flag_on_cycle_through_the_admin_routes_on_real_stores(stack):
 
     # A real write during the window reaches BOTH real engines.
     _register(stack, "m-new", "a newer memory about harbour cranes")
-    switch.project_apply(TENANT, "m-new", text="a newer memory about harbour cranes", user_id=ADMIN)
+    switch.project_apply(TENANT, "m-new", text="a newer memory about harbour cranes", user_id=ADMIN, scope="global")
     assert _qdrant_has(stack, "m-new")
     assert _pg_count(schema, "m-new") == 1
 
     # An erased record is fenced on both engines and never resurrected by a late projection.
     _register(stack, "m-gone", "a memory that will be erased")
-    switch.project_apply(TENANT, "m-gone", text="a memory that will be erased", user_id=ADMIN)
+    switch.project_apply(TENANT, "m-gone", text="a memory that will be erased", user_id=ADMIN, scope="global")
     assert _pg_count(schema, "m-gone") == 1
     stack.ledger.tombstone(TENANT, "m-gone", 1, "test_erasure")
     switch.project_remove(TENANT, "m-gone")
-    switch.project_apply(TENANT, "m-gone", text="a memory that will be erased", user_id=ADMIN, revision=1)
+    switch.project_apply(TENANT, "m-gone", text="a memory that will be erased", user_id=ADMIN, scope="global", revision=1)
     assert _pg_count(schema, "m-gone") == 0 and not _qdrant_has(stack, "m-gone")
 
     # Catch-up copies the pre-window memory to the shadow; then flip.
@@ -196,7 +204,7 @@ def test_flag_on_cycle_through_the_admin_routes_on_real_stores(stack):
 
     # A write after the flip lands on pgvector only (the old engine is kept for rollback); the read is served by it.
     _register(stack, "m-after", "a memory written after the flip about glacier surveys")
-    switch.project_apply(TENANT, "m-after", text="a memory written after the flip about glacier surveys", user_id=ADMIN)
+    switch.project_apply(TENANT, "m-after", text="a memory written after the flip about glacier surveys", user_id=ADMIN, scope="global")
     assert _pg_count(schema, "m-after") == 1 and not _qdrant_has(stack, "m-after")
     hits = switch.recall(ADMIN, "glacier surveys", 5)
     assert hits and hits[0].record_id == "m-after"

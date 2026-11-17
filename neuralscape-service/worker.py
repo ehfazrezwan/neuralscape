@@ -13,6 +13,7 @@ from datetime import datetime
 import structlog
 from arq.cron import cron
 from arq.jobs import Job
+from arq.worker import Retry
 
 import adapters  # noqa: F401 — registers knowledge-adapter taxonomies at import (deterministic MEMORY_CATEGORIES across all workers)
 from config import parse_redis_settings, settings
@@ -1279,6 +1280,12 @@ async def process_graph_enrichment(
 
         graph_ontology = require_adapter(adapter).graph_ontology_kwargs()
     episode_before = await asyncio.to_thread(_row_episode_uuid, service, memory_id)
+    enrich_kwargs: dict = {}
+    race_outcome: dict | None = None
+    if getattr(settings, "graph_delete_race_cleanup_enabled", False) is True:
+        # enrich_graph removes the episode itself when the row was deleted mid-write and says so here.
+        race_outcome = {}
+        enrich_kwargs["outcome"] = race_outcome
     # enrich_graph reports the episode it wrote through this out-parameter so
     # stale-job expiry can pin it directly (no before/after diff of the row ref).
     graph_written: dict = {}
@@ -1294,7 +1301,14 @@ async def process_graph_enrichment(
         occurred_at=occurred_at,
         workspace=current_workspace,
         result_out=graph_written,
+        **enrich_kwargs,
     )
+    if enriched and race_outcome and race_outcome.get("cleaned_up"):
+        logger.warning(
+            "Memory %s was deleted while its graph enrichment ran; the episode just written was "
+            "already removed by the enrichment.", memory_id,
+        )
+        return {"memory_id": memory_id, "enriched": False, "skipped": "changed_during_enrichment"}
     episode_after = await asyncio.to_thread(_row_episode_uuid, service, memory_id) if enriched else None
     if enriched:
         # The first check above only covers the time the job sat in the queue.
@@ -1365,6 +1379,46 @@ async def process_graph_enrichment(
             memory_id,
         )
     return {"memory_id": memory_id, "enriched": enriched}
+
+
+async def process_graph_reenrich(ctx: dict, memory_id: str) -> dict:
+    """Background task: re-enrich one memory into a fresh episode after its shared episode was removed.
+
+    Enqueued by the support-aware removal (``GRAPH_SUPPORT_AWARE_REMOVAL_ENABLED``) for every memory that
+    recorded the removed episode, when no ledger producer is installed.  The job carries only the memory id and
+    re-reads the owner, project and visibility from the row; a memory deleted meanwhile is skipped, and an
+    enrichment that does not complete raises so ARQ retries the job (the row keeps ``graph_reenrich_pending``
+    until it has run).
+    """
+    service: MemoryService = ctx["service"]
+    try:
+        return await asyncio.to_thread(service.reenrich_memory_graph, memory_id)
+    except Exception as exc:
+        # ARQ re-runs a job only when it raises ``Retry``: any other exception marks it failed for good and the
+        # row would stay pending until the sweep (``graph_reenrich_sweep_cron``) or a later write found it.
+        tries = int(ctx.get("job_try") or 1)
+        logger.warning(
+            "Graph re-enrichment of memory %s failed (try %d); retrying in %ds: %s",
+            memory_id, tries, _REENRICH_RETRY_BASE_S * tries, exc,
+        )
+        raise Retry(defer=_REENRICH_RETRY_BASE_S * tries) from exc
+
+
+_REENRICH_RETRY_BASE_S = 30  # seconds of back-off per try for a failed survivor re-enrichment
+
+
+async def graph_reenrich_sweep_cron(ctx: dict) -> dict:
+    """Cron job: re-run the re-enrichment of rows left marked ``graph_reenrich_pending``.
+
+    The marker survives a lost dispatch (queue or ledger down) and a job that used up its tries; this is the
+    retry.  Bounded per run; the enrichment clears the marker itself.  A no-op unless
+    ``GRAPH_SUPPORT_AWARE_REMOVAL_ENABLED`` is on.
+    """
+    service: MemoryService = ctx["service"]
+    result = await asyncio.to_thread(service.sweep_pending_reenrichments)
+    if result.get("reenriched") or result.get("failed"):
+        logger.info(f"Re-enrichment sweep cron: {result}")
+    return result
 
 
 _EXPIRY_LOG_ID_CAP = 20
@@ -1894,6 +1948,7 @@ def _make_on_job_start(queue_name: str):
     only leaves ``function`` off the log lines.
     """
     async def on_job_start(ctx: dict) -> None:
+        info = None
         try:
             bound = {"job_id": ctx.get("job_id"), "job_try": ctx.get("job_try"), "queue": queue_name}
             structlog.contextvars.bind_contextvars(**{k: v for k, v in bound.items() if v is not None})
@@ -1904,8 +1959,52 @@ def _make_on_job_start(queue_name: str):
                     structlog.contextvars.bind_contextvars(function=info.function)
         except Exception:  # noqa: BLE001 — observability must never fail a job
             logger.debug("binding job log context failed (non-fatal)", exc_info=True)
+        await _bind_usage_attempt(ctx, info)
 
     return on_job_start
+
+
+def _multi_writer_batch(info) -> bool:
+    """Whether the job is a raw batch holding items of more than one user."""
+    try:
+        if getattr(info, "function", None) != "process_memory_raw_batch":
+            return False
+        items = (getattr(info, "args", None) or (None,))[0]
+        if not isinstance(items, list):
+            return False
+        return len({i.get("user_id") for i in items if isinstance(i, dict) and i.get("user_id")}) > 1
+    except Exception:  # noqa: BLE001
+        return False
+
+
+async def _bind_usage_attempt(ctx: dict, info=None) -> None:
+    """Attribute the provider calls this job makes to the person it serves (only when usage capture is on).
+
+    The person is read from the enqueue-time ``task -> user`` record; a job without one (a cron, a job
+    enqueued by another job) is recorded as unattributed rather than dropped.  The context lives as long as
+    the job's own asyncio task, and threads the job starts inherit it.  Never fails a job.
+    """
+    try:
+        import usage_capture
+
+        job_id = ctx.get("job_id")
+        if usage_capture.get_usage_recorder() is None or not job_id:
+            return
+        from task_manager import _task_user_key
+
+        tenant = None
+        redis = ctx.get("redis")
+        if redis is not None:
+            raw = await redis.get(_task_user_key(job_id))
+            if raw:
+                tenant = raw.decode() if isinstance(raw, bytes) else str(raw)
+        if tenant is not None and _multi_writer_batch(info):
+            # The enqueue-time record keeps only the last writer of a mixed-user batch: billing the whole
+            # batch to that one person would be wrong, so it is recorded as unattributed.
+            tenant = None
+        usage_capture.bind_job_attempt(tenant, job_id, ctx.get("job_try"))
+    except Exception:  # noqa: BLE001 — capture must never fail a job
+        logger.debug("binding the usage attempt failed (non-fatal)", exc_info=True)
 
 
 def _make_after_job_end(queue_name: str):
@@ -1926,6 +2025,12 @@ def _make_after_job_end(queue_name: str):
             await _queue_empty_webhook(ctx)
         finally:
             structlog.contextvars.unbind_contextvars("job_id", "job_try", "queue", "function")
+            try:
+                import usage_capture
+
+                usage_capture.unbind_job_attempt()
+            except Exception:  # noqa: BLE001
+                pass
 
     async def _queue_empty_webhook(ctx: dict) -> None:
         url = settings.webhook_queue_empty_url
@@ -1976,6 +2081,16 @@ async def startup(ctx: dict) -> None:
 
     start_heartbeat(ctx)
     logger.info(third_party_telemetry.startup_log_line())
+    # Durable usage capture (off unless USAGE_STORE_ENABLED).  The recorder must
+    # exist before the service builds its provider clients so they are wrapped.
+    if settings.usage_store_enabled:
+        from usage_store import install_usage_capture
+
+        ctx["usage_store"] = install_usage_capture(settings)
+        logger.info("Durable usage store opened (backend=%s)", settings.usage_store_backend)
+    from provider_routing import apply_gemini_base_url
+
+    apply_gemini_base_url(settings.ns_gemini_base_url)  # must precede the first client
     service = MemoryService()
     # Off the loop so the liveness heartbeat keeps beating through a slow cold start.
     await asyncio.to_thread(service._get_memory)  # warm up connections
@@ -2022,6 +2137,11 @@ async def shutdown(ctx: dict) -> None:
         # task cancel + 10 s thread join), a moment when healthy: keep it
         # off the worker's event loop.
         await asyncio.to_thread(service.close)
+    usage_store = ctx.get("usage_store")
+    if usage_store is not None:
+        from usage_store import uninstall_usage_capture
+
+        uninstall_usage_capture(usage_store)
     logger.info("ARQ worker stopped.")
 
 
@@ -2088,6 +2208,7 @@ class GraphWorkerSettings:
     """
     functions = [
         process_graph_enrichment,
+        process_graph_reenrich,
         run_dream_sweep,
         # Session summary refreshes (audit 27 #24): Gemini-bound, no latency
         # SLO — enqueued by _note_session_messages onto the graph queue.
@@ -2098,6 +2219,14 @@ class GraphWorkerSettings:
             repair_stale_vectors_cron,
             minute=20,          # hourly; a no-op scroll when no row is pending
             timeout=900,
+            unique=True,
+            max_tries=1,
+            run_at_startup=False,
+        ),
+        cron(
+            graph_reenrich_sweep_cron,
+            minute=25,          # hourly; a no-op scroll when no row awaits re-enrichment
+            timeout=3600,
             unique=True,
             max_tries=1,
             run_at_startup=False,

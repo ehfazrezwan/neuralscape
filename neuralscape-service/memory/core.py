@@ -201,12 +201,25 @@ class CoreMixin:
         if self._memory is None:
             with self._init_lock:
                 if self._memory is None:
+                    # Every Gemini client the vendored libraries build must reach the configured endpoint
+                    # (unset: unchanged), in the API, every worker queue and a stdio MCP process alike.
+                    from provider_routing import apply_from_settings
+
+                    apply_from_settings(settings)
                     # The one place `_closed` is cleared, exactly once per rebuild.
                     self._note_reopen_if_closed(clear=True)
                     from mem0 import Memory
 
                     config = settings.get_mem0_config()
                     self._memory = _memory_from_config(Memory, config)
+                    # Capture provider usage only when a recorder is installed.
+                    from usage_capture import get_usage_recorder
+
+                    capture_usage = get_usage_recorder() is not None
+                    if capture_usage:
+                        from usage_wrappers import install_mem0_wrappers
+
+                        install_mem0_wrappers(self._memory)
 
                     # Re-attach the Graphiti adapter mem0 v2.0.2 stopped
                     # auto-creating. The MemoryGraph constructor in
@@ -251,6 +264,10 @@ class CoreMixin:
                     if hasattr(self._memory, "graph") and hasattr(self._memory.graph, "graphiti"):
                         self._graphiti = self._memory.graph.graphiti
                         self._bridge = self._memory.graph._bridge
+                        if capture_usage:
+                            from usage_wrappers import install_graphiti_wrappers
+
+                            install_graphiti_wrappers(self._graphiti)
 
                     self._ensure_indexes_at_startup()
 
@@ -329,6 +346,11 @@ class CoreMixin:
         if self._genai_model is None:
             with self._init_lock:
                 if self._genai_model is None:
+                    # The configured endpoint (unset: unchanged) is applied to the client class, so this
+                    # client and every one the libraries build reach it.
+                    from provider_routing import apply_from_settings
+
+                    apply_from_settings(settings)
                     # close() dropped the old client; a rebuild after it is visible
                     # in the log. `_closed` stays set: only the memory rebuild clears it.
                     self._note_reopen_if_closed(clear=False)

@@ -2,7 +2,7 @@
 
 The memory service's own vector store (mem0 over Qdrant) stays the system of
 record for memory rows in V1.  This module adds a *routed engine projection*
-beside it: the ledger's vector stage projects every accepted write, edit and
+beside it: a projection producer (not wired yet, see below) is meant to project every accepted write, edit and
 delete into an ``EngineRouter`` whose generation 1 is a Qdrant projection
 collection and whose shadow can be pgvector.  An operator moves traffic with
 dual-write -> catch-up -> flip (and rollback); recall can then be served from
@@ -15,6 +15,8 @@ the memory service; never the engine being replaced.
 
 Honest limits (also in the report):
 
+* no producer calls ``project_apply`` / ``project_remove`` yet (``PROJECTION_PRODUCER_ACTIVE`` is false), so
+  the routed engine is not kept current by any write and routed recall is refused until one is wired;
 * the router keeps its phase and generation in one process; run it where the
   API and the ledger worker share a process until a durable control record
   exists;
@@ -52,12 +54,39 @@ logger = logging.getLogger("neuralscape.engine_switch")
 CANONICAL_PAGE_SIZE = 500  # ledger rows read per page by a catch-up or backfill
 
 
-def labels_for(user_id: str, visibility: Optional[str], project_id: Optional[str]) -> tuple[str, ...]:
-    """Filter labels that let recall reproduce the personal and shared pools."""
+GLOBAL_SCOPE_LABEL = "scope:global"
+
+# Whether a producer keeps the routed engine current: the ledger's vector stage calling ``project_apply``
+# and ``project_remove`` for every write, edit and delete.  At this revision NOTHING outside tests does, so
+# a backfilled engine goes stale on the next write; routed recall is therefore refused (``recall_ready``
+# reports ``projection_producer_inactive``) and the ordinary recall path serves.  The change that wires the
+# producer sets this to ``True``; it is the only place that decides.
+PROJECTION_PRODUCER_ACTIVE = False
+
+
+def projection_producer_active() -> bool:
+    return PROJECTION_PRODUCER_ACTIVE is True
+
+
+def labels_for(
+    user_id: str, visibility: Optional[str], project_id: Optional[str], scope: Optional[str] = None
+) -> tuple[str, ...]:
+    """Filter labels that let recall reproduce the personal and shared pools.
+
+    ``scope:global`` follows the memory's *scope*: a global-category fact (preference, personal_fact,
+    technical_skill, ...) keeps the ``project_id`` of the project it was written in, yet it belongs to the
+    caller's global rows, which the normal path returns for every project.  Such a row carries both labels:
+    ``project:<id>`` stays (reads that ask for the project's rows alone still find it) and ``scope:global``
+    is added.  When the scope is not known (``None``) a row without a project is global, as before.
+    """
 
     labels = [f"owner:{user_id}", f"vis:{visibility or 'private'}"]
     if project_id:
         labels.append(f"project:{project_id}")
+    if scope == "global" or (scope is None and not project_id):
+        # Lets recall ask the engine for global rows only, before ranking and limiting, instead of
+        # filtering other projects' rows out afterwards.
+        labels.append(GLOBAL_SCOPE_LABEL)
     return tuple(label[:256] for label in labels)
 
 
@@ -76,6 +105,10 @@ class LedgerCanonicalSource:
 
     def __init__(self, ledger: Any, service: Any, labeler: Callable[[Any], tuple[str, ...]]) -> None:
         self._ledger, self._service, self._labeler = ledger, service, labeler
+        # Keys listed by the ledger whose row could not be read in the latest ``states()`` walk (neither
+        # tombstoned nor readable): nothing is projected for them and a backfill reports the count.  Memories
+        # that were never registered in the ledger are not listed at all, so they cannot be counted here.
+        self.skipped = 0
 
     def state_for(self, tenant_id: str, record_id: str) -> Optional[CanonicalState]:
         """One key's canonical state, for repairs that do not need a full pass."""
@@ -94,6 +127,7 @@ class LedgerCanonicalSource:
         return CanonicalState(tenant_id, record_id, revision, False, row.memory, self._labeler(row))
 
     def states(self) -> Iterable[CanonicalState]:
+        self.skipped = 0
         heads = getattr(self._ledger, "object_heads", None)
         tombstones = getattr(self._ledger, "tombstone_heads", None)
         if callable(heads) and callable(tombstones):
@@ -119,6 +153,7 @@ class LedgerCanonicalSource:
                     continue
                 row = self._service.get_memory(record_id)
                 if row is None:
+                    self.skipped += 1
                     continue  # neither tombstoned nor readable: nothing to project
                 yield CanonicalState(tenant, record_id, revision, False, row.memory, self._labeler(row))
             after = page[-1][:2]
@@ -142,6 +177,7 @@ class LedgerCanonicalSource:
                 continue
             row = self._service.get_memory(record_id)
             if row is None:
+                self.skipped += 1
                 continue  # neither tombstoned nor readable: nothing to project
             yield CanonicalState(tenant, record_id, revision, False, row.memory, self._labeler(row))
         for (tenant, record_id), revision in sorted(tombstones.items()):
@@ -218,6 +254,7 @@ class EngineSwitch:
             getattr(row, "owner_user_id", None) or "unknown",
             getattr(row, "visibility", None),
             getattr(row, "project_id", None),
+            getattr(row, "scope", None),
         )
 
     def canonical_source(self) -> CanonicalSource:
@@ -240,6 +277,7 @@ class EngineSwitch:
         user_id: str,
         visibility: Optional[str] = None,
         project_id: Optional[str] = None,
+        scope: Optional[str],
         revision: Optional[int] = None,
     ) -> None:
         applied_revision = revision if revision is not None else self._revision(tenant_id, memory_id)
@@ -251,7 +289,7 @@ class EngineSwitch:
             revision=applied_revision,
             tenant_id=tenant_id,
             text=text,
-            labels=labels_for(user_id, visibility, project_id),
+            labels=labels_for(user_id, visibility, project_id, scope),
         )
         router = self.router  # one router for the token and the call
         try:
@@ -270,6 +308,7 @@ class EngineSwitch:
         self.project_apply(
             tenant_id, memory_id, text=row.memory, user_id=getattr(row, "owner_user_id", None) or "unknown",
             visibility=getattr(row, "visibility", None), project_id=getattr(row, "project_id", None),
+            scope=getattr(row, "scope", None),
         )
 
     def project_remove(self, tenant_id: str, memory_id: str) -> None:
@@ -294,8 +333,20 @@ class EngineSwitch:
         project_id: Optional[str] = None,
         include_shared: bool = True,
         visibility: Optional[str] = None,
+        include_global: bool = False,
     ) -> list[SearchHit]:
-        """Vector recall from the serving engine: the caller's own rows plus the shared pool."""
+        """Vector recall from the serving engine: the caller's own rows plus the shared pool.
+
+        With a ``project_id`` the project's rows carry its label, but the caller's global rows may not
+        (a global row carries ``scope:global`` and, when written inside a project, that project's label
+        too), so ``include_global`` adds a second search per pool restricted to the ``scope:global`` label
+        (in the engine, before its limit).  Both legs are merged by score and only then limited, so a
+        lower-scoring project hit never displaces a higher-scoring global hit.  The caller keeps only rows
+        of the project or of global scope.
+
+        A projection made before the scope label existed carries no ``scope:global`` label and is not found
+        by the global leg: one backfill run (``catch_up`` with no window open) relabels such rows.
+        """
 
         tenant_id = self._tenant_for(user_id)
         if tenant_id is None:
@@ -308,26 +359,40 @@ class EngineSwitch:
             pools.append((_bounded(f"owner:{user_id}"),))
         if include_shared and visibility != "private":
             pools.append(("vis:shared",))
-        for labels in pools:
-            flt = TenantFilter(
-                tenant_id=tenant_id,
-                labels_all=labels + ((_bounded(f"project:{project_id}"),) if project_id else ()),
-            )
+        wide = bool(project_id and include_global)
+
+        def _search(leg_labels: tuple) -> None:
+            flt = TenantFilter(tenant_id=tenant_id, labels_all=leg_labels)
             for hit in router.search(token, _ctx(tenant_id), query, flt, limit):
                 if hit.record_id not in seen or hit.score > seen[hit.record_id].score:
                     seen[hit.record_id] = hit
-        return sorted(seen.values(), key=lambda h: (-h.score, h.record_id))[:limit]
+
+        for labels in pools:
+            _search(labels + ((_bounded(f"project:{project_id}"),) if project_id else ()))
+            if wide:
+                # Global rows only (filtered by the engine before its limit), so other projects' rows can
+                # never fill the leg and displace them.
+                _search(labels + (GLOBAL_SCOPE_LABEL,))
+        ordered = sorted(seen.values(), key=lambda h: (-h.score, h.record_id))
+        return ordered if wide else ordered[:limit]
 
     def recall_ready(self) -> tuple[bool, Optional[str]]:
-        """Whether routed recall may serve: enabled, and the engine holds canonical state.
+        """Whether routed recall may serve: enabled, kept current, and the engine holds canonical state.
 
-        An engine that has not been brought to canonical state (memories written
-        before routing, or by pipelines that do not project) would silently hide
-        those memories, so routed recall is refused with a reason instead.
+        Refused, with a reason, whenever the engine could silently hide or misreport a memory:
+
+        * ``recall_disabled``: the recall flag is off;
+        * ``projection_producer_inactive``: no producer keeps the engine current (see
+          ``PROJECTION_PRODUCER_ACTIVE``), so every memory written, edited or deleted after a backfill
+          would be missing or stale;
+        * ``no_serving_router``: a migration controller has no serving router;
+        * ``projection_not_synced``: the engine has not been brought to canonical state by a clean backfill.
         """
 
         if not self.recall_enabled:
             return False, "recall_disabled"
+        if not projection_producer_active():
+            return False, "projection_producer_inactive"
         try:
             synced = self.router.active_synced
         except RoutingError:
@@ -380,6 +445,7 @@ class EngineSwitch:
             )
         return {**self.status(), "backfilled": backfilled, "report": {
             "copied": report.copied, "tombstoned": report.tombstoned, "superseded": report.superseded,
+            "relabeled": report.relabeled, "unchanged": report.unchanged, "skipped": report.skipped,
             "replayed": report.replayed, "repaired_dirty": report.repaired_dirty, "conflicts": len(report.conflicts),
         }}
 
@@ -503,12 +569,15 @@ def recall_switch(settings: Any) -> Optional[EngineSwitch]:
         if reason is not None and reason not in _refusal_logged:
             _refusal_logged.add(reason)
             logger.warning(
-                "routed recall is refused (%s): the serving engine has not been brought to canonical state; "
-                "the legacy path keeps serving. Run catch-up with no dual-write window open to backfill it.",
+                "routed recall is refused (%s): %s; the ordinary recall path keeps serving.",
                 reason,
+                "no projection producer keeps the routed engine current yet"
+                if reason == "projection_producer_inactive"
+                else "the serving engine has not been brought to canonical state (run catch-up with no "
+                "dual-write window open to backfill it)",
             )
         return None
-    _refusal_logged.discard("projection_not_synced")  # a later regression is flagged again
+    _refusal_logged.clear()  # a later regression is flagged again
     return switch
 
 
@@ -574,6 +643,9 @@ __all__ = [
     "configure",
     "get_switch",
     "labels_for",
+    "GLOBAL_SCOPE_LABEL",
+    "PROJECTION_PRODUCER_ACTIVE",
+    "projection_producer_active",
     "projection_switch",
     "recall_switch",
     "start",

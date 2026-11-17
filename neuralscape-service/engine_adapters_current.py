@@ -194,10 +194,15 @@ class QdrantVectorAdapter:
             stored_revision, removed, _payload = row
             if record.revision < stored_revision:
                 raise PortFailure(InternalErrorCode.STALE_REVISION)
-            if record.revision == stored_revision and (
-                removed or record != self._stored(record.tenant_id, record.record_id)
-            ):
-                raise PortFailure(InternalErrorCode.IDEMPOTENCY_CONFLICT)
+            if record.revision == stored_revision:
+                stored = None if removed else self._stored(record.tenant_id, record.record_id)
+                if stored is None or stored.text != record.text:
+                    raise PortFailure(InternalErrorCode.IDEMPOTENCY_CONFLICT)
+                if stored.labels != tuple(record.labels):
+                    # Same revision and text, other labels: a relabel.  Only the payload changes; the
+                    # vector (and so any embedding call) is left alone.
+                    self._relabel(record)
+                return self._receipt(record.record_id, record.revision, "applied")
         self._store.insert(
             vectors=[self._embed(record.text)],
             ids=[self._point_id(record.tenant_id, record.record_id)],
@@ -212,6 +217,36 @@ class QdrantVectorAdapter:
             ],
         )
         return self._receipt(record.record_id, record.revision, "applied")
+
+    def _relabel(self, record: EngineRecord) -> None:
+        """Replace the labels of the point at exactly this revision, fenced in the store.
+
+        The revision check in ``apply`` and this write are two calls, so a newer revision (or a removal)
+        can land in between, from this process or another.  The write therefore carries its own
+        condition: the point must still be at ``record.revision`` and not removed, evaluated by the
+        store in the same call.  When the condition no longer holds nothing is written, and the point
+        is read again to say why: a newer revision is stale for this write, a removal is a conflict.
+        """
+
+        from qdrant_client import models
+
+        point_id = self._point_id(record.tenant_id, record.record_id)
+        self._store.client.set_payload(
+            collection_name=self._store.collection_name,
+            payload={"labels": list(record.labels)},
+            points=models.Filter(
+                must=[
+                    models.HasIdCondition(has_id=[point_id]),
+                    models.FieldCondition(key="revision", match=models.MatchValue(value=record.revision)),
+                ],
+                must_not=[models.FieldCondition(key="removed", match=models.MatchValue(value=True))],
+            ),
+        )
+        now = self._row(record.tenant_id, record.record_id)
+        if now is None or now[1]:
+            raise PortFailure(InternalErrorCode.IDEMPOTENCY_CONFLICT)
+        if now[0] > record.revision:
+            raise PortFailure(InternalErrorCode.STALE_REVISION)
 
     def remove(
         self, ctx: OperationContext, record_id: str, revision: int

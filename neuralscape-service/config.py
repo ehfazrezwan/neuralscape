@@ -285,6 +285,11 @@ class Settings(BaseSettings):
     llm_retry_base_delay: float = 1.0  # seconds
     llm_retry_max_delay: float = 30.0  # seconds
 
+    # Optional Gemini endpoint override (e.g. an egress proxy or regional endpoint, or a deterministic
+    # local stand-in for offline runs). Empty ⇒ the SDK default. When set, every Gemini client the
+    # process builds (the service's own and the ones mem0 and Graphiti build) is routed to it.
+    ns_gemini_base_url: str = ""
+
     # ── pgvector direct-store adapter (default OFF) ──
     # Used as the shadow backend of the engine switch (build_default_switch) when ENGINE_ROUTING_ENABLED.
     # Like the ENGINE_ROUTING_* settings below it has no effect until a later change wires the ledger producer.
@@ -294,12 +299,14 @@ class Settings(BaseSettings):
     engine_pgvector_dimensions: int = 0
 
     # ── Engine routing (V3 switch; default OFF) ───────────────────────────
-    # When enabled, the vector stage of ledger writes/edits/deletes also projects
-    # the memory into a routed engine (generation 1 = a Qdrant projection
-    # collection), an operator can run dual-write/catch-up/flip/rollback through
-    # the dictator-only /v1/admin/engine-switch/* routes, and, if
-    # ENGINE_ROUTING_RECALL_ENABLED, /v1/search serves its vector recall from the
-    # routed engine.  The router keeps its state in one process: enable only
+    # When enabled, an operator can run dual-write/catch-up/flip/rollback of a routed engine
+    # (generation 1 = a Qdrant projection collection) through the dictator-only
+    # /v1/admin/engine-switch/* routes.  NOTHING in this revision projects ledger writes, edits or
+    # deletes into that engine: the producer is a later change.  Until it lands, the routed engine
+    # holds only what a backfill copied, so ENGINE_ROUTING_RECALL_ENABLED is INERT: /v1/search keeps
+    # serving from the ordinary path and the engine reports routed recall as refused
+    # (projection_producer_inactive).  Once a producer exists, recall is served from the routed
+    # engine only after a clean backfill.  The router keeps its state in one process: enable only
     # where the API and the ledger worker share a process.
     engine_routing_enabled: bool = False
     engine_routing_recall_enabled: bool = False
@@ -490,6 +497,29 @@ class Settings(BaseSettings):
     # bm25 episode snippets from Graphiti; additive+capped; flip off if the
     # read-latency floor is breached (mission constraint: ≤+20%).
     graph_episode_recall_enabled: bool = True
+    # Support-aware graph removal on delete and correction: removing one memory's
+    # episode keeps every edge another live episode still supports, removes an edge
+    # (and an entity nothing else references) only when its last support goes, and
+    # removes a corrected memory's superseded episode after re-enrichment.  An
+    # episode several memories share (one conversation, several extracted facts)
+    # is removed with the deleted or corrected memory, and the surviving memories
+    # are re-enriched into fresh episodes of their own through the durable path
+    # (a ledger job, or the graph queue), so their facts return and the removed
+    # memory's do not; until then their facts may be absent and their rows carry
+    # graph_reenrich_pending.  Each survivor is re-enriched from its own fact
+    # text, so relations that only the whole conversation expressed do not come
+    # back.  A superseded episode that cannot be removed is
+    # recorded on the row and retried by the next correction or the delete.  An edge that loses its last support is deleted, not soft-expired,
+    # so views listing expired edges no longer show it.  Off = the legacy
+    # most-restrictive cascade (an edge is expired even when another live
+    # episode supports it).  The governed profile turns it on.
+    graph_support_aware_removal_enabled: bool = False
+    # A memory deleted while its graph episode is being written has that episode removed again
+    # (its delete ran before the episode existed and found nothing to remove).  The graph worker
+    # recognises the cleanup as done and does not repeat it.  Off = the worker's own post-enrichment
+    # check alone handles a delete that lands mid-enrichment.
+    graph_delete_race_cleanup_enabled: bool = False
+
     # Injective graph group ids (env GRAPH_GROUP_ID_INJECTIVE_ENABLED). Off (the
     # default): group ids are exactly the legacy delimiter-joined names, byte for
     # byte, for every id. On: a tuple with a component containing "--", "." or
@@ -926,6 +956,17 @@ class Settings(BaseSettings):
     authority_postgres_dsn: str = ""
     #   authority_postgres_migrate_on_open → as for the ledger: False is the least-privilege runtime role.
     authority_postgres_migrate_on_open: bool = True
+
+    # ── Durable usage events ───────────────────────────────────────────────
+    # Off by default: no usage event is persisted unless enabled.
+    #   usage_store_backend      → "sqlite" (single-node, WAL, synchronous=FULL) or
+    #                              "postgres".
+    #   usage_store_sqlite_path  → database file on a local filesystem.
+    #   usage_store_postgres_dsn → libpq connection string for the cell database.
+    usage_store_enabled: bool = False
+    usage_store_backend: str = "sqlite"
+    usage_store_sqlite_path: str = "data/usage.sqlite3"
+    usage_store_postgres_dsn: str = ""
 
     # Service
     host: str = "0.0.0.0"
@@ -1440,6 +1481,12 @@ class Settings(BaseSettings):
                 errors.append("LLM_GATEWAY_BASE_URL is required when LLM_GATEWAY_ENABLED is true")
             if not self.llm_gateway_api_key:
                 errors.append("LLM_GATEWAY_API_KEY is required when LLM_GATEWAY_ENABLED is true")
+        if self.ns_gemini_base_url:
+            from urllib.parse import urlsplit
+
+            parts = urlsplit(self.ns_gemini_base_url)
+            if parts.scheme not in ("http", "https") or not parts.hostname or parts.username or parts.password:
+                errors.append("NS_GEMINI_BASE_URL must be an http(s) URL without embedded credentials")
         if self.connectors_enabled and not self.vault_key:
             errors.append("NEURALSCAPE_VAULT_KEY is required when CONNECTORS_ENABLED is true")
         # Federated login: a non-token provider needs the OAuth AS turned on
