@@ -18,6 +18,11 @@ import fnmatch
 class FakeVaultStore:
     def __init__(self):
         self.d: dict[str, str] = {}
+        # Every command the vault sends, in order (``KEYS``/``SCAN``/...),
+        # and how many keys one SCAN page returns (small, so a test can
+        # force a multi-page cursor walk).
+        self.commands: list[str] = []
+        self.scan_page_size = 1000
         self._pause_key: str | None = None
         self.paused = asyncio.Event()
         self.resume = asyncio.Event()
@@ -41,7 +46,17 @@ class FakeVaultStore:
         return 1 if self.d.pop(k, None) is not None else 0
 
     async def keys(self, pattern):
+        self.commands.append("KEYS")
         return [k for k in self.d if fnmatch.fnmatch(k, pattern)]
+
+    async def scan(self, cursor=0, match=None, count=None):
+        """Redis SCAN: ``(next_cursor, keys)``; cursor 0 means done."""
+        self.commands.append("SCAN")
+        names = [k for k in self.d if match is None or fnmatch.fnmatch(k, match)]
+        start = int(cursor)
+        page = names[start : start + self.scan_page_size]
+        nxt = start + self.scan_page_size
+        return (0 if nxt >= len(names) else nxt), page
 
     async def eval(self, script, numkeys, *args):
         keys, argv = list(args[:numkeys]), list(args[numkeys:])

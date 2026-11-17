@@ -1213,7 +1213,7 @@ class ProvenanceMixin:
         read-modify-write of the whole payload). Any failure is returned in
         ``unrepaired_ids`` — a sibling is never silently dropped. Never raises.
         """
-        out: dict = {"graph_jobs": [], "unrepaired_ids": []}
+        out: dict = {"graph_jobs": [], "unrepaired_ids": [], "clear_failed_ids": []}
         try:
             from qdrant_client.models import FieldCondition, Filter, MatchAny, MatchValue
 
@@ -1296,6 +1296,7 @@ class ProvenanceMixin:
                     failed.add(sid)
         if failed:
             out["unrepaired_ids"].extend(sorted(failed))
+            out["clear_failed_ids"].extend(sorted(failed))  # additive: only the rows whose ref stayed
             siblings = [t for t in siblings if t[0] not in failed]
 
         for sid, payload, meta, _ in siblings:

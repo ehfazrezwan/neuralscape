@@ -29,6 +29,7 @@ from cryptography.fernet import Fernet
 
 logger = logging.getLogger(__name__)
 
+_SCAN_COUNT = 200
 _KEY_PREFIX = "ns:connector:"
 
 # Fields that must never leave the vault decrypted via list/get-for-display.
@@ -220,7 +221,7 @@ class ConnectorVault:
         self,
         connector_id: str,
         *,
-        cursor: str | None = None,
+        cursor: Any = _UNSET,
         last_synced_at: str | None = None,
         revisions: dict | None = None,
         generation: Any = _UNSET,
@@ -228,6 +229,9 @@ class ConnectorVault:
         expected_revisions: Any = _UNSET,
     ) -> bool:
         """Persist sync progress (cursor, timestamp, per-resource revisions).
+
+        ``cursor`` left out keeps the stored cursor; ``cursor=None`` resets it (the next sync
+        starts from the first page).
 
         Only the sync-state fields change; owner, generation, credentials
         and config are written back exactly as stored. The write is a
@@ -256,7 +260,7 @@ class ConnectorVault:
                 return False
             if expected_revisions is not _UNSET and (raw.get("last_revision_by_id") or {}) != (expected_revisions or {}):
                 return False
-            if cursor is not None:
+            if cursor is not _UNSET:  # an explicit None resets it; omitting the argument keeps it
                 raw["cursor"] = cursor
             if last_synced_at is not None:
                 raw["last_synced_at"] = last_synced_at
@@ -276,9 +280,19 @@ class ConnectorVault:
 
     # ── helpers ──
     async def _keys(self) -> list[str]:
-        keys = await self._store.keys(_KEY_PREFIX + "*")
-        # redis returns bytes when decode_responses is off; normalize to str.
-        return [k.decode() if isinstance(k, bytes) else k for k in keys]
+        # Incremental SCAN, never the blocking KEYS: KEYS holds Redis for the
+        # whole keyspace. SCAN may return a key more than once, so de-dupe;
+        # ``list()`` sorts, so no order is promised here.
+        seen: dict[str, None] = {}
+        cursor: Any = 0
+        while True:
+            cursor, page = await self._store.scan(cursor=cursor, match=_KEY_PREFIX + "*", count=_SCAN_COUNT)
+            for k in page:
+                # redis returns bytes when decode_responses is off; normalize to str.
+                seen[k.decode() if isinstance(k, bytes) else k] = None
+            if int(cursor) == 0:
+                break
+        return list(seen)
 
     @staticmethod
     def _redact(raw: dict) -> dict:

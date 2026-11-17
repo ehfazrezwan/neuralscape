@@ -183,3 +183,84 @@ async def test_cron_past_a_finished_run_enqueues_again_and_counts_it(monkeypatch
         pool.finish(job_id)
         assert (await worker.connector_sync_cron(ctx))["enqueued"] == 1
     assert len(pool.enqueued) == 2
+
+
+@pytest.mark.asyncio
+async def test_resource_whose_chunks_failed_to_store_is_not_marked_synced(harness, monkeypatch):
+    worker, vault, _state, ingested, ctx = harness
+    gen = await _register(vault)
+    failing = {"b"}
+
+    def flaky_ingest(service, doc):
+        rid = doc.source["external_id"]
+        ingested.append(rid)
+        if rid in failing:
+            return {"graph_jobs": [], "stores_failed": 2, "store_errors": ["RuntimeError: store down"]}
+        return {"graph_jobs": [], "stores_failed": 0, "store_errors": []}
+
+    monkeypatch.setattr("ingest.pipeline.ingest_document", flaky_ingest)
+
+    first = await worker.process_connector_sync(ctx, "rest-1", gen)
+    assert (first["synced"], first["skipped"], first["failed"]) == (1, 0, 1)
+    # Only the resource that stored fully is remembered; the failed one stays eligible.
+    assert (await vault.get("rest-1"))["last_revision_by_id"] == {"a": "1"}
+    assert (await vault.get("rest-1"))["cursor"] is None
+
+    ingested.clear()
+    failing.clear()
+    second = await worker.process_connector_sync(ctx, "rest-1", gen)
+    assert (second["synced"], second["skipped"], second["failed"]) == (1, 1, 0)
+    assert ingested == ["b"]
+    assert (await vault.get("rest-1"))["last_revision_by_id"] == {"a": "1", "b": "1"}
+
+
+@pytest.mark.asyncio
+async def test_failed_resource_on_page_one_is_retried_after_the_listing_wraps(harness, monkeypatch):
+    worker, vault, _state, ingested, ctx = harness
+    pages = {None: (_items({"a": "1", "b": "1"}), "p2"), "p2": (_items({"c": "1"}), None)}
+
+    def build(record):
+        adapter = GenericRestAdapter(record["connector_id"], record.get("credentials", {}), record.get("config", {}))
+
+        async def list_resources(cursor=None):
+            rows, nxt = pages[cursor]
+            real = await GenericRestAdapter.list_resources(adapter, cursor)
+            return [r for r in real[0] if r.external_id in {x["id"] for x in rows}], nxt
+
+        adapter._http = httpx.AsyncClient(
+            transport=httpx.MockTransport(
+                lambda req: httpx.Response(200, json={"items": _items({"a": "1", "b": "1", "c": "1"})})
+            )
+        )
+        adapter.list_resources = list_resources
+        return adapter
+
+    monkeypatch.setattr("connectors.registry.build_adapter", build)
+    store_ok = {"b": False}
+
+    def flaky(service, doc):
+        rid = doc.source["external_id"]
+        ingested.append(rid)
+        return {"graph_jobs": [], "stores_failed": 0 if store_ok.get(rid, True) else 1}
+
+    monkeypatch.setattr("ingest.pipeline.ingest_document", flaky)
+    gen = await _register(vault)
+
+    first = await worker.process_connector_sync(ctx, "rest-1", gen)  # page 1: a stored, b fails
+    assert (first["synced"], first["failed"]) == (1, 1)
+    assert (await vault.get("rest-1"))["cursor"] == "p2"  # the failed resource does not pin the cursor
+    second = await worker.process_connector_sync(ctx, "rest-1", gen)  # page 2: c stored, listing ends
+    assert (second["synced"], second["failed"]) == (1, 0)
+    assert (await vault.get("rest-1"))["cursor"] is None  # the end of the listing resets the cursor
+    assert (await vault.get("rest-1"))["last_revision_by_id"] == {"a": "1", "c": "1"}
+
+    store_ok["b"] = True  # the store recovers
+    ingested.clear()
+    third = await worker.process_connector_sync(ctx, "rest-1", gen)  # back on page 1
+    assert ingested == ["b"]  # retried; a is not stored again
+    assert (third["synced"], third["skipped"], third["failed"]) == (1, 1, 0)
+    assert (await vault.get("rest-1"))["last_revision_by_id"] == {"a": "1", "b": "1", "c": "1"}
+    ingested.clear()
+    await worker.process_connector_sync(ctx, "rest-1", gen)
+    await worker.process_connector_sync(ctx, "rest-1", gen)
+    assert ingested == []  # everything synced: nothing is stored again
