@@ -325,3 +325,15 @@ class TestVaultListUsesScan:
         store.scan = scan_twice
         listed = await v.list()
         assert [r["connector_id"] for r in listed] == ["dup"]
+
+
+class TestCursorSentinel:
+    @pytest.mark.asyncio
+    async def test_omitted_cursor_keeps_it_and_none_resets_it(self):
+        v = _vault()
+        await v.put(_record())
+        await v.update_sync_state("notion-personal", cursor="c5")
+        await v.update_sync_state("notion-personal", revisions={"x": "1"})
+        assert (await v.get("notion-personal"))["cursor"] == "c5"
+        await v.update_sync_state("notion-personal", cursor=None)
+        assert (await v.get("notion-personal"))["cursor"] is None

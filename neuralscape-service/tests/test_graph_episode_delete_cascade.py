@@ -267,3 +267,34 @@ def test_junk_sweep_skips_a_refused_episode_and_continues(world, monkeypatch):
     assert out["skipped_count"] == 1 and out["skipped_uuids"] == ["ep-shj"]
     assert mine1.uuid not in w.g.episodes and mine2.uuid not in w.g.episodes
     assert "ep-shj" in w.g.episodes
+
+
+def test_gate_refuses_another_users_encoded_private_group_directly(world, monkeypatch):
+    from memory.groups import _build_group_id
+
+    monkeypatch.setattr("config.settings.graph_group_id_injective_enabled", True)
+    g = _build_group_id("private", OTHER, "a.b")
+    assert g.startswith("nsg1--")
+    with pytest.raises(PermissionError, match="another user's private group"):
+        world.svc._check_episode_delete_permission("ep", g, OWNER)
+
+
+def test_gate_refuses_an_unclassifiable_group_name_directly(world):
+    with pytest.raises(PermissionError, match="cannot be classified"):
+        world.svc._check_episode_delete_permission("ep", "mystery-group", OWNER)
+
+
+def test_junk_dry_run_count_matches_what_a_real_run_deletes(world, monkeypatch):
+    w = world
+    monkeypatch.setattr(type(settings), "known_projects", property(lambda self: []))
+    mine = seed_conversation(w, n=1, tag="d1", start=90)
+    _seed_shared(w, owner=OTHER, uuid="ep-shd")
+    w.svc.get_graph_episodes = lambda **k: [
+        {"uuid": mine.uuid, "content": "assistant: junk"},
+        {"uuid": "ep-shd", "content": "assistant: junk"},
+    ]
+    dry = w.svc.delete_junk_episodes(OWNER, dry_run=True)
+    assert dry["junk_count"] == 1
+    assert dry["skipped_count"] == 1 and dry["skipped_uuids"] == ["ep-shd"]
+    real = w.svc.delete_junk_episodes(OWNER)
+    assert real["deleted_count"] == dry["junk_count"]

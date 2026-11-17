@@ -444,6 +444,30 @@ class GraphAdminMixin:
         for _, payload in rows:
             _gate(self._effective_meta(payload)[1], payload.get("user_id", ""))
 
+    def _may_delete_episode(self, episode_uuid: str, user_id: str) -> bool:
+        """Whether a delete of this episode by ``user_id`` would pass the permission gate."""
+        g = self._get_graphiti()
+        if g is None:
+            return True
+
+        async def _group():
+            async with g.driver.session() as session:
+                res = await session.run(
+                    "MATCH (e:Episodic {uuid: $uuid}) RETURN e.group_id AS group_id", uuid=episode_uuid
+                )
+                return await res.data()
+
+        try:
+            rows = self._run_on_bridge(_group())
+            if not rows:
+                return True
+            self._check_episode_delete_permission(episode_uuid, rows[0].get("group_id"), user_id)
+            return True
+        except PermissionError:
+            return False
+        except Exception:
+            return True
+
     def _find_junk_episodes(self, episodes: list[dict]) -> list[dict]:
         """Filter a list of episodes to only those matching junk patterns."""
         junk = []
@@ -498,7 +522,15 @@ class GraphAdminMixin:
             total_junk += len(junk_episodes)
 
             if dry_run:
+                # Report what a real run would skip separately, so junk_count is what it deletes.
+                would_skip = [ep["uuid"] for ep in junk_episodes if not self._may_delete_episode(ep["uuid"], user_id)]
+                junk_episodes = [ep for ep in junk_episodes if ep["uuid"] not in set(would_skip)]
+                total_junk -= len(would_skip)
                 breakdown[group_label] = {"junk_count": len(junk_episodes)}
+                if would_skip:
+                    breakdown[group_label]["skipped_count"] = len(would_skip)
+                    breakdown[group_label]["skipped_uuids"] = would_skip
+                    all_skipped.extend(would_skip)
                 all_samples.extend(
                     {"uuid": ep["uuid"], "group": group_label, "content": ep["content"][:120]}
                     for ep in junk_episodes[:5]
@@ -529,12 +561,16 @@ class GraphAdminMixin:
                 )
 
         if dry_run:
-            return {
+            out = {
                 "dry_run": True,
                 "junk_count": total_junk,
                 "breakdown": breakdown,
                 "samples": all_samples[:15],
             }
+            if all_skipped:
+                out["skipped_count"] = len(all_skipped)
+                out["skipped_uuids"] = all_skipped
+            return out
 
         out = {
             "deleted_count": total_deleted,

@@ -215,7 +215,7 @@ async def test_resource_whose_chunks_failed_to_store_is_not_marked_synced(harnes
 
 
 @pytest.mark.asyncio
-async def test_paginated_sync_keeps_going_past_a_failed_resource_and_does_not_restore_successes(harness, monkeypatch):
+async def test_failed_resource_on_page_one_is_retried_after_the_listing_wraps(harness, monkeypatch):
     worker, vault, _state, ingested, ctx = harness
     pages = {None: (_items({"a": "1", "b": "1"}), "p2"), "p2": (_items({"c": "1"}), None)}
 
@@ -228,33 +228,39 @@ async def test_paginated_sync_keeps_going_past_a_failed_resource_and_does_not_re
             return [r for r in real[0] if r.external_id in {x["id"] for x in rows}], nxt
 
         adapter._http = httpx.AsyncClient(
-            transport=httpx.MockTransport(lambda req: httpx.Response(200, json={"items": _items({"a": "1", "b": "1", "c": "1"})}))
+            transport=httpx.MockTransport(
+                lambda req: httpx.Response(200, json={"items": _items({"a": "1", "b": "1", "c": "1"})})
+            )
         )
         adapter.list_resources = list_resources
         return adapter
 
     monkeypatch.setattr("connectors.registry.build_adapter", build)
+    store_ok = {"b": False}
 
     def flaky(service, doc):
         rid = doc.source["external_id"]
         ingested.append(rid)
-        return {"graph_jobs": [], "stores_failed": 1 if rid == "b" else 0}
+        return {"graph_jobs": [], "stores_failed": 0 if store_ok.get(rid, True) else 1}
 
     monkeypatch.setattr("ingest.pipeline.ingest_document", flaky)
     gen = await _register(vault)
 
-    first = await worker.process_connector_sync(ctx, "rest-1", gen)
+    first = await worker.process_connector_sync(ctx, "rest-1", gen)  # page 1: a stored, b fails
     assert (first["synced"], first["failed"]) == (1, 1)
     assert (await vault.get("rest-1"))["cursor"] == "p2"  # the failed resource does not pin the cursor
-    second = await worker.process_connector_sync(ctx, "rest-1", gen)
-    assert (second["synced"], second["failed"]) == (1, 0)  # page 2 synced
+    second = await worker.process_connector_sync(ctx, "rest-1", gen)  # page 2: c stored, listing ends
+    assert (second["synced"], second["failed"]) == (1, 0)
+    assert (await vault.get("rest-1"))["cursor"] is None  # the end of the listing resets the cursor
     assert (await vault.get("rest-1"))["last_revision_by_id"] == {"a": "1", "c": "1"}
-    ingested.clear()
-    import json
 
-    raw = json.loads(vault._store.d["ns:connector:rest-1"])
-    raw["cursor"] = None  # a full re-sync: the listing is back on page 1
-    vault._store.d["ns:connector:rest-1"] = json.dumps(raw)
+    store_ok["b"] = True  # the store recovers
+    ingested.clear()
+    third = await worker.process_connector_sync(ctx, "rest-1", gen)  # back on page 1
+    assert ingested == ["b"]  # retried; a is not stored again
+    assert (third["synced"], third["skipped"], third["failed"]) == (1, 1, 0)
+    assert (await vault.get("rest-1"))["last_revision_by_id"] == {"a": "1", "b": "1", "c": "1"}
+    ingested.clear()
     await worker.process_connector_sync(ctx, "rest-1", gen)
-    assert "a" not in ingested and "c" not in ingested  # successes are not stored again
-    assert ingested == ["b"]  # the failed resource is retried
+    await worker.process_connector_sync(ctx, "rest-1", gen)
+    assert ingested == []  # everything synced: nothing is stored again
