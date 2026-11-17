@@ -17,19 +17,15 @@ import pytest
 
 
 @pytest.fixture
-def service(stores, llm_key, unique_ns, monkeypatch):
-    import config
-
-    s = config.settings
-    for name, value in {
-        "qdrant_url": stores.qdrant_url,
-        "qdrant_collection": unique_ns.qdrant_collection,
-        "neo4j_uri": stores.neo4j_uri,
-        "neo4j_user": stores.neo4j_user,
-        "neo4j_password": stores.neo4j_password,
-        "neo4j_database": stores.neo4j_database,
-    }.items():
-        monkeypatch.setattr(s, name, value)
+def service(stores, llm_key, unique_ns, flags):
+    flags(
+        qdrant_url=stores.qdrant_url,
+        qdrant_collection=unique_ns.qdrant_collection,
+        neo4j_uri=stores.neo4j_uri,
+        neo4j_user=stores.neo4j_user,
+        neo4j_password=stores.neo4j_password,
+        neo4j_database=stores.neo4j_database,
+    )
 
     from memory_service import MemoryService
     from qdrant_client import QdrantClient

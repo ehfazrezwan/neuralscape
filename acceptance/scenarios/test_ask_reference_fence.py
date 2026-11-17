@@ -1,8 +1,8 @@
 """``ask`` at the medium tier does not pull the caller's reference-workspace rows into its evidence.
 
 The keyword pass of ``/v1/ask`` (medium and high) is a store-wide scan; like recall and the session-start
-context it must leave reference workspaces (content ingested through a non-default adapter) out. A memory
-row carrying the same rare words is still found and cited. The ingest runs with extract_facts=false, so only
+context it must leave reference workspaces (content ingested through a non-default adapter) out. The only hard assertion is that the reference passage is neither cited nor quoted; the real-store
+integration test proves the scan itself. The ingest runs with extract_facts=false, so only
 a verbatim passage is stored in the reference workspace.
 """
 
@@ -47,7 +47,14 @@ def _ids(rows: list[dict], text: str) -> set[str]:
     return {r["id"] for r in rows if text in r.get("memory", "")}
 
 
-def check_ask_cites_only_memory_rows(client, ctx, fence, level: str = "medium") -> None:
+def check_no_reference_row_used(body: dict, ref_ids: set[str]) -> None:
+    """The deterministic half: a fenced reference row can neither be cited nor quoted."""
+    leaked = ref_ids & set(body["citations"])
+    assert not leaked, f"ask cited reference-workspace rows {sorted(leaked)}: {body['citations']}"
+    assert "tolerance bands" not in body["answer"], f"ask quoted the reference passage: {body['answer'][:160]!r}"
+
+
+def check_ask_leaves_reference_rows_out(client, ctx, fence, level: str = "medium") -> None:
     rare = fence["rare"]
     ref_rows = client.search(rare, project_id=ctx.project_id, workspaces=[fence["workspace"]])
     ref_ids = _ids(ref_rows, "handbook chapter")
@@ -59,23 +66,19 @@ def check_ask_cites_only_memory_rows(client, ctx, fence, level: str = "medium") 
     assert r.status_code == 200, f"POST /v1/ask -> {r.status_code}: {r.text[:200]}"
     body = r.json()
     assert any(s.startswith("keyword:") for s in body["searches"]), f"no keyword pass among {body['searches']}"
-    leaked = ref_ids & set(body["citations"])
-    assert not leaked, f"ask cited reference-workspace rows {sorted(leaked)}: {body['citations']}"
-    assert fence["mem"].memory_id in body["citations"] or "Thursday" in body["answer"], (
-        f"ask did not use the memory row: {body['answer'][:160]!r} {body['citations']}"
-    )
+    check_no_reference_row_used(body, ref_ids)
 
 
-@proves("read.keyword-scan", "read.ask-tiers")
+@proves("read.ask-tiers")
 def test_ask_medium_keyword_pass_leaves_reference_rows_out(ctx, a, fence):
     fence["mem"].require()
     eventually(
-        lambda: check_ask_cites_only_memory_rows(a, ctx, fence), timeout=120, what="ask cites only the memory row",
+        lambda: check_ask_leaves_reference_rows_out(a, ctx, fence), timeout=120, what="ask leaves the reference row out",
     )
 
 
-@proves("read.keyword-scan")
+@proves("read.ask-tiers")
 @negative_control
-def test_ask_fence_check_fails_for_user_b(ctx, b, fence):
-    fence["mem"].require()
-    expect_check_fails(check_ask_cites_only_memory_rows, b, ctx, fence)
+def test_reference_row_check_fails_when_a_reference_row_is_cited():
+    expect_check_fails(check_no_reference_row_used, {"citations": ["ref-1"], "answer": ""}, {"ref-1"})
+    expect_check_fails(check_no_reference_row_used, {"citations": [], "answer": "see tolerance bands"}, {"ref-1"})

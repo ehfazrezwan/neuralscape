@@ -197,7 +197,7 @@ async def list_tools() -> list[Tool]:
                 "so when a title looks even plausibly relevant, fetch its full content rather than "
                 "ruling it out from the title alone — a full payload costs ~5-20x an index row, cheap "
                 "next to missing the memory you needed. "
-                "If the graph leg was lost, a second block {\"degraded\",\"graph_leg\"} follows. "
+                "If the graph leg is lost, degraded/graph_leg is added (a second block, or object keys). "
                 "When project_id is provided, searches both global user memories and project-specific memories, "
                 "returning the most relevant results sorted by relevance score. "
                 "Full (non-index) results include a 'source' field: 'graph' results come from the knowledge "
