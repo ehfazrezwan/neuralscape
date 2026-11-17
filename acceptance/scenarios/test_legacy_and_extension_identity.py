@@ -145,6 +145,10 @@ def test_recall_and_gone_checks_fail_where_they_should(ctx, a, c):
     eventually(lambda: check_recalls(c, marker), timeout=90, what="control write recalled")
     expect_check_fails(check_recalls, a, marker)  # A cannot see the third identity's memory
     expect_check_fails(check_gone, c, marker)  # and the "deleted" check cannot pass while it exists
+    # The legacy delete wipes EVERY private row of this identity, so this write's deferred graph enrichment must
+    # be finished before the next test deletes it: an in-flight enrichment leaves the delete's cascade nothing to
+    # resolve and the delete honestly answers "partial" (the service then expires the late episode itself).
+    eventually(lambda: check_episode_present(c, marker), timeout=180, interval=5, what="the control write's graph episode")
     expect_check_fails(check_episode_present, c, f"{marker}-never-written")  # a marker no episode carries is not "enriched"
 
 
