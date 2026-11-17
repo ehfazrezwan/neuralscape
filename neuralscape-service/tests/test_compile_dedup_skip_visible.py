@@ -14,6 +14,8 @@ from datetime import datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+import structlog
+import structlog.testing
 
 pytest.importorskip("fcntl")
 
@@ -67,20 +69,23 @@ def redis_down(monkeypatch, service):  # noqa: F811
 
 def _assert_skip_visible(result: dict) -> None:
     assert result["dedup_triggered"] is False, "dedup did no work: it must not say it was triggered"
-    assert result["dedup_skipped"] >= 2  # the exact group and the semantic page
+    assert result["dedup_skipped"] == 2  # the exact group and the semantic page
     assert result["dedup_exact_groups_abandoned"] == 1
     assert result["dedup_skipped_reason"] == REASON
 
 
 @pytest.mark.asyncio
-async def test_compile_date_reports_the_skip_and_logs_it(writer, redis_down, capsys):
-    result = await compile_date(DATE, redis_down, writer, user_id="u1")
+async def test_compile_date_reports_the_skip_and_logs_it(writer, redis_down):
+    with structlog.testing.capture_logs() as logs:
+        result = await compile_date(DATE, redis_down, writer, user_id="u1")
 
     _assert_skip_visible(result.model_dump())
     assert _deleted(redis_down) == [], "nothing destructive ran"
-    final = [ln for ln in capsys.readouterr().out.splitlines() if "Compilation complete" in ln]
-    assert final and "dedup_triggered=False" in final[0] and "dedup_skipped=2" in final[0] and REASON in final[0]
-
+    final = [rec for rec in logs if rec["event"] == "Compilation complete"]
+    assert len(final) == 1
+    assert final[0]["dedup_triggered"] is False
+    assert final[0]["dedup_skipped"] == 2
+    assert final[0]["dedup_skipped_reason"] == REASON
 
 @pytest.mark.asyncio
 async def test_post_compile_synchronous_fallback_reports_the_skip(writer, redis_down):
