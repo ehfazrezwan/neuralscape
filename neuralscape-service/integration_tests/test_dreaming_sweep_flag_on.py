@@ -56,11 +56,20 @@ OTHER_SEED = [
     ("workflow", "The user profiles every release build before shipping"),
     ("decision", "The user chose a standing desk with a walnut top for the home office"),
 ]
+# The shared project pool. The first four facts are close relatives (one stack, one
+# pipeline), so the consolidation stage may legitimately fold them into one row. The
+# librarian writes a topic page only from two or more live rows, so the pool also holds
+# three facts on clearly different subjects of the same project (a nightly import, who
+# may use the admin pages, how long logs are kept): a merge of the first four still
+# leaves at least three live rows for a topic page and the hub.
 PROJECT_SEED = [
-    "The project backend is a FastAPI service using Python 3.12",
-    "The project stores vectors in Qdrant and graph facts in Neo4j",
-    "The project convention is to run the full unit suite before every merge",
-    "The project deploys through a container image built in CI",
+    ("tech_stack", "The project backend is a FastAPI service using Python 3.12"),
+    ("tech_stack", "The project stores vectors in Qdrant and graph facts in Neo4j"),
+    ("convention", "The project convention is to run the full unit suite before every merge"),
+    ("workflow", "The project deploys through a container image built in CI"),
+    ("workflow", "The project imports the partner price list every night at two o'clock from an SFTP drop"),
+    ("decision", "Access to the project admin pages is limited to members of the finance operations group"),
+    ("convention", "The project keeps audit logs for ninety days and then archives them to cold storage"),
 ]
 
 
@@ -77,7 +86,7 @@ def swept(dream_env):
     env.clear_pool_state()
     ids = {name: env.store(text, cat) for name, (cat, text) in SEED.items()}
     pid = f"nsit-proj-{uuid.uuid4().hex[:6]}"
-    proj_ids = [env.store_project(t, pid) for t in PROJECT_SEED]
+    proj_ids = [env.store_project(t, pid, cat) for cat, t in PROJECT_SEED]
     # A second private user in the same collection: isolation fixtures.
     other_user = env.user + "-other"
     other_tok = "zq" + uuid.uuid4().hex[:10]
@@ -110,6 +119,11 @@ def swept(dream_env):
         settings=settings, dry=dry, real=real, reports=reports,
         before_noise=before_noise, after_dry=after_dry,
     )
+
+
+def _live_project_rows(env, swept) -> int:
+    """Seeded rows of the shared project pool that are neither deleted nor tombstoned."""
+    return sum(1 for i in swept.proj_ids if env.payload(i) and not _tombstoned(env, i))
 
 
 def _tombstoned(env, mid) -> bool:
@@ -311,7 +325,15 @@ def test_vault_topic_pages_home_and_hub_written(dream_env, swept):
     assert prep is not None, f"project pool not swept: {list(swept.reports)}"
     assert prep.status == "dreamt", f"{prep.status}: {prep.reason} {prep.errors}"
     hub = vault / "Projects" / swept.pid / f"{swept.pid}.md"
-    assert prep.pages_written > 0 and hub.exists(), f"project hub missing: {hub}"
+    # The librarian needs two live rows for a topic; say what the sweep did to the pool
+    # so a miss can be told apart (rows folded away by consolidation vs a writer defect).
+    assert prep.pages_written > 0 and hub.exists(), (
+        f"project hub missing: {hub}; sweep report for {swept.project_pool}: staged={prep.staged} "
+        f"applied={prep.applied} reported={prep.reported} pages_written={prep.pages_written} "
+        f"pages_skipped={prep.pages_skipped} errors={prep.errors}; live seeded rows in the pool: "
+        f"{_live_project_rows(env, swept)} of {len(swept.proj_ids)} (the librarian needs at least two; "
+        f"fewer means consolidation folded the pool, more means the page writer missed)"
+    )
     # index.md / log.md are OKF bundle files (standard markdown links, written
     # by refresh_bundle_indexes), not librarian topic pages: exclude them.
     from okf.translate import is_reserved_filename
