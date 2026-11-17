@@ -16,6 +16,7 @@ count or a grammar is asserted; a paraphrase never is.
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import time
@@ -23,7 +24,7 @@ from dataclasses import dataclass, field
 
 import pytest
 
-from nsaccept import eventually, expect_check_fails, needs, negative_control, precondition, profiles, proves
+from nsaccept import eventually, expect_check_fails, needs, negative_control, precondition, profiles, proves, stack
 from nsaccept.client import NSClient
 from nsaccept.helpers import list_rows, mcp_json, write_raw
 from nsaccept.hooks import run_hook
@@ -33,6 +34,7 @@ pytestmark = [profiles("flags-on"), needs("dictator")]
 SWEEP_WAIT = 900
 CARD_LINE_RE = re.compile(r"^(IDENTITY|ATTRIBUTE|RELATIONSHIP|INSTRUCTION): .+$")
 API_SERVICE = os.environ.get("NS_API_SERVICE", "neuralscape")
+QDRANT_COLLECTION = os.environ.get("NS_QDRANT_COLLECTION", "neuralscape_memories")
 
 
 # ── the real checks ──────────────────────────────────────────────
@@ -454,27 +456,63 @@ def test_mirror_check_fails_for_the_private_marker(ctx, dream: Dream):
 # ── rewrites keep their lexical (BM25) leg ───────────────────────
 
 
-def check_keyword_finds(client: NSClient, rows: list[dict], marker_of: dict[str, str], project_of: "dict[str, str] | None" = None) -> int:
-    """Every live row that still carries its rare marker is found by a marker-only search (top 3).
+def bm25_vector_of(ctx, memory_id: str) -> "dict | None":
+    """The ``bm25`` sparse vector (``{"indices": [...], "values": [...]}``) stored on a memory's Qdrant point.
+
+    Read straight from Qdrant's REST API inside its own container: ``/v1/search`` cannot tell a row that has
+    its lexical leg from a dense-only row (the dense leg returns the row too), so only the point itself can.
+    """
+    body = stack.qdrant_http(ctx, "GET", f"/collections/{QDRANT_COLLECTION}/points/{memory_id}")
+    start = body.find("{")
+    assert start >= 0, f"Qdrant answered no JSON for point {memory_id}: {body[:160]!r}"
+    try:
+        doc, _ = json.JSONDecoder().raw_decode(body[start:])
+    except ValueError:
+        raise AssertionError(f"Qdrant answered unparsable JSON for point {memory_id}: {body[start:start + 160]!r}") from None
+    vector = (doc.get("result") or {}).get("vector")
+    assert vector is not None, f"Qdrant has no point {memory_id} (or returned no vectors): {body[start:start + 160]!r}"
+    sparse = vector.get("bm25") if isinstance(vector, dict) else None
+    return sparse if isinstance(sparse, dict) else None
+
+
+def check_bm25_vector(ctx, memory_id: str) -> None:
+    sparse = bm25_vector_of(ctx, memory_id)
+    assert sparse and sparse.get("indices"), f"point {memory_id} has no bm25 sparse vector (lost its lexical leg): {sparse!r}"
+    assert len(sparse["indices"]) == len(sparse.get("values") or []), f"point {memory_id}: bm25 indices/values differ in length"
+
+
+def check_keyword_finds(ctx, client: NSClient, rows: list[dict], marker_of: dict[str, str], project_of: "dict[str, str] | None" = None) -> int:
+    """Every live row that still carries its rare marker keeps its lexical (BM25) leg and is found by its marker.
 
     A dream rewrite once upserted a dense-only point, dropping the bm25 sparse vector, so a
     merged/rewritten row stopped matching by keyword. Returns how many rows were checked.
 
-    ``project_of`` maps a row id to its project: a project row is searched inside its own project, because an
-    unfiltered top-3 competes with every look-alike marker row the other scenarios of the run wrote for the
-    same user (all share the ``zq-<run>-`` tokens) and a rank-one lexical hit can lose that fused top-3.
+    Two checks per row, neither of which another row can crowd out:
+
+    * the row's Qdrant point carries a non-empty ``bm25`` sparse vector. This is the lexical-leg promise itself;
+      a ranked search cannot prove it, because the fused ranking is shared with the dense leg and the graph legs
+      and a rank-one lexical hit can still lose a top-3 against look-alike rows (every row the run wrote for the
+      same user shares the ``zq-<run>-`` tokens).
+    * a marker-only search, inside the row's own project when it has one, at the API's largest page (100) and
+      before graph/episode hits are dropped, returns the row (retrieval works end to end for the user who owns it).
     """
-    checked, missed = 0, []
+    checked, missed, lost = 0, [], []
     for row in rows:
         marker = marker_of.get(row["id"])
         if not marker or marker not in (row.get("memory") or row.get("content") or ""):
             continue  # the sweep rewrote the text without the marker: nothing lexical to check
         checked += 1
-        found = [h for h in client.search(marker, limit=3, **({"project_id": project_of[row["id"]]} if project_of and row["id"] in project_of else {})) if h.get("source") not in ("graph", "episode")]  # the row's own (dense+BM25) legs
+        scope = {"project_id": project_of[row["id"]]} if project_of and row["id"] in project_of else {}
+        found = [h for h in client.search(marker, limit=100, **scope) if h.get("source") not in ("graph", "episode")]  # the row's own (dense+BM25) legs
         if row["id"] not in {h.get("id") for h in found}:
-            missed.append(f"{row['id']} (top rows: {[(str(h.get('id'))[:8], h.get('source')) for h in found]})")
+            missed.append(f"{row['id']} ({len(found)} vector rows returned)")
+        try:
+            check_bm25_vector(ctx, row["id"])
+        except AssertionError as exc:
+            lost.append(str(exc)[:200])
     assert checked >= 3, f"only {checked} live rows still carry their marker; keyword check is not meaningful"
-    assert not missed, f"marker-only search misses {len(missed)} of {checked} live rows (lost bm25 vector?): {missed[:3]}"
+    assert not lost, f"{len(lost)} of {checked} live rows lost their bm25 vector: {lost[:3]}"
+    assert not missed, f"marker-only search misses {len(missed)} of {checked} live rows: {missed[:3]}"
     return checked
 
 
@@ -483,6 +521,7 @@ def _project_rows(d: Dream) -> dict[str, str]:
     return {w.memory_id: d.project for k, w in d.written.items() if k.startswith("sh") and w.memory_id}
 
 
+@needs("compose")
 @proves("ext.dreaming-deep-consolidate")
 def test_keyword_only_search_still_finds_swept_rows(ctx, a, dream: Dream):
     _ready(dream)
@@ -490,9 +529,10 @@ def test_keyword_only_search_still_finds_swept_rows(ctx, a, dream: Dream):
     project_of = _project_rows(dream)
     rows = [r for r in list_rows(a) + list_rows(a, project_id=dream.project) if r["id"] in marker_of]
     rows = list({r["id"]: r for r in rows}.values())
-    eventually(lambda: check_keyword_finds(a, rows, marker_of, project_of), timeout=60, interval=3, what="keyword search over swept rows")
+    eventually(lambda: check_keyword_finds(ctx, a, rows, marker_of, project_of), timeout=60, interval=3, what="keyword search over swept rows")
 
 
+@needs("compose")
 @proves("ext.dreaming-deep-consolidate")
 @negative_control
 def test_keyword_check_fails_for_user_b(ctx, a, b, dream: Dream):
@@ -501,5 +541,7 @@ def test_keyword_check_fails_for_user_b(ctx, a, b, dream: Dream):
     project_of = _project_rows(dream)
     rows = [r for r in list_rows(a) + list_rows(a, project_id=dream.project) if r["id"] in marker_of]
     rows = list({r["id"]: r for r in rows}.values())
-    precondition(check_keyword_finds, a, rows, marker_of, project_of, what="A's keyword search finds A's swept rows")
-    expect_check_fails(check_keyword_finds, b, rows, marker_of, project_of)
+    precondition(check_keyword_finds, ctx, a, rows, marker_of, project_of, what="A's keyword search finds A's swept rows")
+    expect_check_fails(check_keyword_finds, ctx, b, rows, marker_of, project_of)  # B cannot see A's rows
+    precondition(check_bm25_vector, ctx, rows[0]["id"], what="a swept row has its bm25 vector")
+    expect_check_fails(check_bm25_vector, ctx, "00000000-0000-0000-0000-000000000000")  # no such point
