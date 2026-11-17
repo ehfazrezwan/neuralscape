@@ -1698,15 +1698,16 @@ async def auto_compile_check(ctx: dict) -> dict | None:
 async def dedup_all_memories(ctx: dict) -> dict:
     """Cron job: deduplicate Qdrant memories for every user.
 
-    When dreaming is enabled the lossy semantic phase is skipped — the
+    When dreaming is enabled the lossy semantic phase is skipped (unless
+    DEDUP_SEMANTIC_TOMBSTONE_ENABLED makes it reversible) — the
     dream sweep's MERGE action supersedes it (folds unique details into
     the survivor instead of hard-deleting the older near-duplicate). The
     lossless exact-hash phase always runs.
     """
-    from extensions.dreaming.config import dreaming_settings
+    from memory.delete import semantic_dedup_phase_enabled
 
     service: MemoryService = ctx["service"]
-    semantic = not dreaming_settings.enabled
+    semantic = semantic_dedup_phase_enabled()
     user_ids = await asyncio.to_thread(service.get_all_user_ids, batch_size=settings.dedup_batch_size)
     logger.info(
         f"Dedup cron: found {len(user_ids)} users (semantic phase "

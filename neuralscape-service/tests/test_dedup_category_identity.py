@@ -32,7 +32,11 @@ def _condition_value(scroll_filter, key):
 
 
 @pytest.fixture
-def service():
+def service(monkeypatch):
+    from tests.test_dedup import _UpRedis
+
+    up = _UpRedis()  # dedup takes pool locks and does nothing destructive without Redis
+    monkeypatch.setattr("extensions.dreaming.sweep._get_redis", lambda: up)
     svc = MemoryService()
     svc._memory = MagicMock(name="Memory")
     svc._memory.embedding_model.embed.return_value = [0.1] * 8
@@ -122,8 +126,11 @@ class TestConversationPathStaysCategoryAgnostic:
 
 def _scroll_rows(service, rows):
     service._memory.vector_store.client.scroll.side_effect = None
-    service._memory.vector_store.client.scroll.return_value = (
-        [SimpleNamespace(id=pid, payload=payload) for pid, payload in rows], None
+    points = [SimpleNamespace(id=pid, payload=payload) for pid, payload in rows]
+    service._memory.vector_store.client.scroll.return_value = (points, None)
+    # the re-read after a pool lock sees the same rows
+    service._memory.vector_store.client.retrieve.side_effect = (
+        lambda collection_name=None, ids=None, **kw: [p for p in points if p.id in set(ids or [])]
     )
 
 

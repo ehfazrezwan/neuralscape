@@ -43,6 +43,8 @@ class PoolReport:
     staged: int = 0
     applied: int = 0
     reported: int = 0
+    skipped: int = 0                  # staged actions not applied: rows changed under the sweep
+    skip_reasons: list[str] = field(default_factory=list)
     insights: int = 0
     pages_written: int = 0
     pages_skipped: int = 0
@@ -80,6 +82,7 @@ class DreamRun:
                 ),
                 "actions_applied": sum(p.applied for p in self.pools),
                 "actions_reported": sum(p.reported for p in self.pools),
+                "actions_skipped": sum(p.skipped for p in self.pools),
                 "insights_stored": sum(p.insights for p in self.pools),
                 "errors": sum(len(p.errors) for p in self.pools),
             },
@@ -394,6 +397,16 @@ async def dream_all(
         totals["pools_failed"], totals["actions_applied"],
         totals["actions_reported"], totals["insights_stored"], totals["errors"],
     )
+    skip_counts: dict[str, int] = {}
+    for p in run.pools:
+        for reason in p.skip_reasons:
+            kind = ":".join(reason.split(":")[:2])  # "<action>: <why>", ids dropped
+            skip_counts[kind] = skip_counts.get(kind, 0) + 1
+    if totals["actions_skipped"]:
+        logger.info(
+            "dream sweep %s skipped %d staged action(s) (rows changed since staging): %s",
+            run.run_id, totals["actions_skipped"], skip_counts,
+        )
     return run
 
 
@@ -517,6 +530,10 @@ async def _dream_pool(
         applied = await consolidate.apply_actions(service, batch, to_apply, dry_run=dry_run)
         report.applied = len(applied.applied)
         report.reported = len(to_report)
+        report.skipped = len(applied.skipped)
+        report.skip_reasons = [
+            f"{s.get('type')}: {s.get('skip_reason', '')}" for s in applied.skipped
+        ]
         report.errors.extend(applied.errors)
 
         # 6b. Clear code-liveness flags ONLY for reframes that actually applied
