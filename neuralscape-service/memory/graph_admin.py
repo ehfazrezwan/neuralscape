@@ -406,17 +406,34 @@ class GraphAdminMixin:
         the owner of every memory row that references it. If those rows cannot be found or
         read, the delete is refused.
         """
-        from memory.groups import _check_edit_permission
+        from memory.groups import _build_group_id, _check_edit_permission, decode_group_id
 
         def _gate(meta: dict, payload_user: str) -> None:
             _check_edit_permission(
                 meta, payload_user, user_id, edits_content=True, edits_visibility=False
             )
 
-        if ep_group.startswith("standard"):
+        # The tier comes from the group's placement: decoded for an injectively encoded name,
+        # the plain-name layout otherwise. Private counts only for the caller's own groups.
+        key = decode_group_id(ep_group)
+        if key is not None:
+            tier, owner = key.pool, key.owner
+        elif ep_group == "standard" or ep_group.startswith("standard--"):
+            tier, owner = "standard", None
+        elif ep_group == "shared" or ep_group.startswith("shared--"):
+            tier, owner = "shared", None
+        else:
+            own = _build_group_id("private", user_id)
+            tier = "private" if ep_group == own or ep_group.startswith(own + "--") else None
+            owner = user_id
+        if tier == "standard":
             return _gate({"visibility": "standard"}, "")
-        if not ep_group.startswith("shared"):
+        if tier == "private":
+            if owner != user_id:
+                raise PermissionError(f"Episode {episode_uuid} is in another user's private group.")
             return _gate({"visibility": "private", "owner_user_id": user_id}, user_id)
+        if tier != "shared":
+            raise PermissionError(f"Episode {episode_uuid} is in a group that cannot be classified.")
         if settings.is_dictator(user_id):
             return
         rows = self._episode_survivors(episode_uuid, None, ())
@@ -425,7 +442,7 @@ class GraphAdminMixin:
                 f"Episode {episode_uuid} is in a shared group and its owner cannot be established."
             )
         for _, payload in rows:
-            _gate(self._row_meta({"metadata": payload.get("metadata")}), payload.get("user_id", ""))
+            _gate(self._effective_meta(payload)[1], payload.get("user_id", ""))
 
     def _find_junk_episodes(self, episodes: list[dict]) -> list[dict]:
         """Filter a list of episodes to only those matching junk patterns."""
@@ -471,6 +488,7 @@ class GraphAdminMixin:
         breakdown = {}
         total_junk = 0
         total_deleted = 0
+        all_skipped: list[str] = []
         all_samples = []
 
         for pid in project_ids_to_scan:
@@ -487,15 +505,24 @@ class GraphAdminMixin:
                 )
             else:
                 deleted_uuids = []
+                skipped_uuids = []
                 for ep in junk_episodes:
-                    result = self.delete_episode(ep["uuid"], user_id=user_id, project_id=pid)
+                    try:
+                        result = self.delete_episode(ep["uuid"], user_id=user_id, project_id=pid)
+                    except PermissionError:
+                        skipped_uuids.append(ep["uuid"])  # not the caller's to delete: skip, keep going
+                        continue
                     if "error" not in result:
                         deleted_uuids.append(ep["uuid"])
                 breakdown[group_label] = {
                     "deleted_count": len(deleted_uuids),
                     "deleted_uuids": deleted_uuids,
                 }
+                if skipped_uuids:
+                    breakdown[group_label]["skipped_count"] = len(skipped_uuids)
+                    breakdown[group_label]["skipped_uuids"] = skipped_uuids
                 total_deleted += len(deleted_uuids)
+                all_skipped.extend(skipped_uuids)
                 all_samples.extend(
                     {"uuid": ep["uuid"], "group": group_label, "content": ep["content"][:120]}
                     for ep in junk_episodes[:3]
@@ -509,11 +536,15 @@ class GraphAdminMixin:
                 "samples": all_samples[:15],
             }
 
-        return {
+        out = {
             "deleted_count": total_deleted,
             "breakdown": breakdown,
             "samples": all_samples[:15],
         }
+        if all_skipped:
+            out["skipped_count"] = len(all_skipped)
+            out["skipped_uuids"] = all_skipped
+        return out
 
     def rebuild_graph_from_vectors(
         self,

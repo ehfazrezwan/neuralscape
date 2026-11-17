@@ -250,5 +250,11 @@ async def test_paginated_sync_keeps_going_past_a_failed_resource_and_does_not_re
     assert (second["synced"], second["failed"]) == (1, 0)  # page 2 synced
     assert (await vault.get("rest-1"))["last_revision_by_id"] == {"a": "1", "c": "1"}
     ingested.clear()
+    import json
+
+    raw = json.loads(vault._store.d["ns:connector:rest-1"])
+    raw["cursor"] = None  # a full re-sync: the listing is back on page 1
+    vault._store.d["ns:connector:rest-1"] = json.dumps(raw)
     await worker.process_connector_sync(ctx, "rest-1", gen)
     assert "a" not in ingested and "c" not in ingested  # successes are not stored again
+    assert ingested == ["b"]  # the failed resource is retried

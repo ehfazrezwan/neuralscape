@@ -17,6 +17,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from config import settings
 from tests.test_episode_cascade_siblings import OTHER, OWNER, FakeGraph, FakeQdrant, seed_conversation
 
 
@@ -172,3 +173,97 @@ def test_unresolved_cascade_says_edges_were_left(world):
     out = w.svc.delete_episode(conv.uuid, user_id=OWNER)
     assert out["graph_cascade"] == {"resolved": False, "edges_left": True}
     assert conv.uuid not in w.g.episodes
+
+
+def test_shared_episode_referenced_by_rows_of_two_users_is_refused_for_each(world):
+    w = world
+    uuid = _seed_shared(w, owner=OWNER)
+    w.q.add("00000000-0000-4000-8000-0000000000ab", "shared fact", user_id=OTHER,
+            visibility="shared", graph_episode_uuid=uuid)
+    for caller in (OWNER, OTHER):
+        with pytest.raises(PermissionError):
+            w.svc.delete_episode(uuid, user_id=caller)
+    assert uuid in w.g.episodes and w.removals == []
+
+
+def test_shared_episode_with_no_referencing_row_needs_a_dictator(world, monkeypatch):
+    w = world
+    w.g.add_episode("ep-orphan", "n", "shared", "x")
+    with pytest.raises(PermissionError):
+        w.svc.delete_episode("ep-orphan", user_id=OWNER)
+    monkeypatch.setattr(type(settings), "is_dictator", lambda self, u: u == OWNER)
+    w.svc.delete_episode("ep-orphan", user_id=OWNER)
+    assert "ep-orphan" not in w.g.episodes
+
+
+class TestEncodedGroupNames:
+    """GRAPH_GROUP_ID_INJECTIVE_ENABLED on, with a dotted project id that yields ``nsg1--`` pool names."""
+
+    PROJECT = "a.b"
+
+    @pytest.fixture(autouse=True)
+    def _flag(self, monkeypatch):
+        monkeypatch.setattr("config.settings.graph_group_id_injective_enabled", True)
+        monkeypatch.setattr("config.settings.standards_enabled", True)
+
+    def _group(self, vis, user=""):
+        from memory.groups import _build_group_id
+
+        g = _build_group_id(vis, user, self.PROJECT)
+        assert g.startswith("nsg1--")
+        return g
+
+    def test_encoded_shared_pool_is_refused_for_a_non_owner(self, world):
+        w = world
+        g = self._group("shared")
+        w.g.add_episode("ep-es", "n", g, "fact", edge_uuids=["e-es"])
+        w.g.add_edge("e-es", g, ["ep-es"])
+        w.q.add("00000000-0000-4000-8000-0000000000ac", "fact", user_id=OWNER, visibility="shared",
+                project_id=self.PROJECT, graph_episode_uuid="ep-es")
+        with pytest.raises(PermissionError):
+            w.svc.delete_episode("ep-es", user_id=OTHER, project_id=self.PROJECT)
+        assert "ep-es" in w.g.episodes and w.g.live_edges(g) == ["e-es"] and w.removals == []
+        assert w.q.meta("00000000-0000-4000-8000-0000000000ac")["graph_episode_uuid"] == "ep-es"
+
+    def test_encoded_standard_pool_is_refused_for_a_non_dictator(self, world):
+        w = world
+        g = self._group("standard")
+        w.g.add_episode("ep-est", "n", g, "rule")
+        with pytest.raises(PermissionError, match="dictator"):
+            w.svc.delete_episode("ep-est", user_id=OWNER, project_id=self.PROJECT)
+        assert "ep-est" in w.g.episodes and w.removals == []
+
+    def test_the_callers_own_encoded_private_group_is_allowed(self, world):
+        w = world
+        g = self._group("private", OWNER)
+        w.g.add_episode("ep-ep", "n", g, "mine", edge_uuids=["e-ep"])
+        w.g.add_edge("e-ep", g, ["ep-ep"])
+        out = w.svc.delete_episode("ep-ep", user_id=OWNER, project_id=self.PROJECT)
+        assert out["message"] == "Episode ep-ep deleted"
+        assert "ep-ep" not in w.g.episodes and w.removals == [(g, ["ep-ep"])]
+
+    def test_another_users_encoded_private_group_is_refused(self, world):
+        w = world
+        g = self._group("private", OTHER)
+        w.g.add_episode("ep-eo", "n", g, "theirs")
+        with pytest.raises(PermissionError):
+            w.svc.delete_episode("ep-eo", user_id=OWNER, project_id=self.PROJECT)
+        assert "ep-eo" in w.g.episodes
+
+
+def test_junk_sweep_skips_a_refused_episode_and_continues(world, monkeypatch):
+    w = world
+    monkeypatch.setattr(type(settings), "known_projects", property(lambda self: []))
+    mine1 = seed_conversation(w, n=1, tag="j1", start=70)
+    mine2 = seed_conversation(w, n=1, tag="j2", start=80)
+    _seed_shared(w, owner=OTHER, uuid="ep-shj")
+    w.svc.get_graph_episodes = lambda **k: [
+        {"uuid": mine1.uuid, "content": "assistant: junk"},
+        {"uuid": "ep-shj", "content": "assistant: junk"},
+        {"uuid": mine2.uuid, "content": "assistant: junk"},
+    ]
+    out = w.svc.delete_junk_episodes(OWNER)
+    assert out["deleted_count"] == 2
+    assert out["skipped_count"] == 1 and out["skipped_uuids"] == ["ep-shj"]
+    assert mine1.uuid not in w.g.episodes and mine2.uuid not in w.g.episodes
+    assert "ep-shj" in w.g.episodes
