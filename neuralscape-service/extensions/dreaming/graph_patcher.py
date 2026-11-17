@@ -581,6 +581,25 @@ async def patch_dream_path_by_memory_ids(
         return 0
 
 
+def _instant_key(value: Any) -> str | None:
+    """A comparable key for a Neo4j temporal value, a ``datetime`` or an ISO string."""
+    if value is None:
+        return None
+    to_native = getattr(value, "to_native", None)
+    if callable(to_native):
+        value = to_native()
+    if isinstance(value, str):
+        try:
+            value = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return value
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc).isoformat()
+    return str(value)
+
+
 async def find_contradicted_edges(
     driver: Any,
     *,
@@ -613,7 +632,23 @@ async def find_contradicted_edges(
       AND r.invalid_at IS NOT NULL
       AND r.expired_at >= datetime($since)
       AND any(ep IN coalesce(r.episodes, []) WHERE ep <> $new_episode_uuid)
-    RETURN r.uuid AS uuid, r.fact AS fact, coalesce(r.episodes, []) AS episodes
+    RETURN r.uuid AS uuid, r.fact AS fact, coalesce(r.episodes, []) AS episodes,
+           r.invalid_at AS invalid_at
+    """
+    # The time window above also covers edges that a CONCURRENT write in the
+    # same group invalidated (several enrichment jobs of one user run at once).
+    # Graphiti sets ``invalid_at`` to the ``valid_at`` of the invalidating edge,
+    # and that edge cites the invalidating episode (a dedup-resolved edge gets
+    # the new episode appended), so only an edge whose ``invalid_at`` equals
+    # the ``valid_at`` of an edge citing THIS episode was invalidated by this
+    # write. When this episode cites no dated edge at all, nothing can be
+    # attributed and the window is the only evidence (kept as before).
+    own_valid_cypher = """
+    MATCH ()-[n:RELATES_TO]->()
+    WHERE n.group_id = $group_id
+      AND $new_episode_uuid IN coalesce(n.episodes, [])
+      AND n.valid_at IS NOT NULL
+    RETURN n.valid_at AS valid_at
     """
     try:
         async with driver.session() as session:
@@ -624,7 +659,16 @@ async def find_contradicted_edges(
                 new_episode_uuid=new_episode_uuid,
             )
             rows = list(await result.data())
+            if rows:
+                own = await session.run(
+                    own_valid_cypher, group_id=group_id, new_episode_uuid=new_episode_uuid
+                )
+                own_valid = {_instant_key(r.get("valid_at")) for r in await own.data()}
+                own_valid.discard(None)
+                if own_valid:
+                    rows = [r for r in rows if _instant_key(r.get("invalid_at")) in own_valid]
             for row in rows:
+                row.pop("invalid_at", None)
                 row["episodes"] = [
                     ep for ep in (row.get("episodes") or []) if ep != new_episode_uuid
                 ]
