@@ -1832,6 +1832,9 @@ class SearchMixin:
         path runs this exact pass *before* semantic search and dedups the
         union.
 
+        Reference workspaces are fenced out (memory workspace only), as in
+        default recall and the session-start context.
+
         Visibility mirrors search's pool union (caller's own rows at any
         visibility + shared + standard-when-enabled; ``project_id`` adds the
         project+global dual scope) and dream-tombstoned rows are excluded —
@@ -1883,6 +1886,10 @@ class SearchMixin:
                     ]
                 )
             )
+        # Reference workspaces stay out of the scan, exactly as they stay out
+        # of default recall and the session-start context: the same
+        # Qdrant-side condition, so the scan's point cap is never spent on them.
+        must.append(_workspace_filter(_effective_workspaces(None)))
         flt = Filter(
             must=must,
             must_not=[
