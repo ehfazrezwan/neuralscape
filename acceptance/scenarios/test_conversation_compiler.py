@@ -115,10 +115,22 @@ def check_both_copies_recalled(client, marker, project_id):
     assert len(_marker_hits(client, marker, project_id)) == 2, "both copies not searchable yet"
 
 
+def _describe_hits(hits):
+    """One compact line per hit: id, source (the response's own leg marker; None = vector pool), created_at, score, text head."""
+    lines = []
+    for h in hits:
+        text = str(h.get("memory", ""))[:80].replace("\n", " ")
+        lines.append(
+            f"id={h.get('id')} source={h.get('source')!r} created_at={h.get('created_at')} "
+            f"score={h.get('score')} text={text!r}"
+        )
+    return "; ".join(lines)
+
+
 def check_pair_collapsed_to_the_newer(client, marker, project_id):
     """Exactly one of the near-duplicate pair is recalled, and it is the newer one."""
     hits = _marker_hits(client, marker, project_id)
-    assert len(hits) == 1, f"expected one recalled copy, got {len(hits)}"
+    assert len(hits) == 1, f"expected one recalled copy, got {len(hits)}: {_describe_hits(hits)}"
     assert hits[0]["memory"].endswith("."), "the survivor should be the newer (second) write"
 
 
