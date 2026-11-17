@@ -516,9 +516,9 @@ class _ReferenceRecordStore:
             stored, removed = existing
             if record.revision < stored.revision:
                 raise PortFailure(InternalErrorCode.STALE_REVISION)
-            if record.revision == stored.revision and (
-                removed or record != stored
-            ):
+            # The same revision with the same text and other labels is a relabel (the projection's labels
+            # are derived from the memory row and may be corrected); other text at the revision is a conflict.
+            if record.revision == stored.revision and (removed or record.text != stored.text):
                 raise PortFailure(InternalErrorCode.IDEMPOTENCY_CONFLICT)
         self._rows[key] = (record, False)
         return self._receipt(record.record_id, record.revision, "applied")

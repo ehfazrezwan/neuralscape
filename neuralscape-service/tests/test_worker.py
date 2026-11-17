@@ -631,3 +631,15 @@ class TestVectorRepairCron:
         ctx["service"].repair_stale_vectors.return_value = {"scanned": 2, "repaired": 2, "failed": 0}
         assert await worker.repair_stale_vectors_cron(ctx) == {"scanned": 2, "repaired": 2, "failed": 0}
         ctx["service"].repair_stale_vectors.assert_called_once()
+
+
+class TestReenrichSweepCron:
+    def test_registered_on_the_graph_worker_only(self):
+        assert "graph_reenrich_sweep_cron" in {c.coroutine.__name__ for c in worker.GraphWorkerSettings.cron_jobs}
+        assert "graph_reenrich_sweep_cron" not in {c.coroutine.__name__ for c in worker.WorkerSettings.cron_jobs}
+
+    @pytest.mark.asyncio
+    async def test_calls_the_service_sweep(self, ctx):
+        ctx["service"].sweep_pending_reenrichments.return_value = {"scanned": 3, "reenriched": 2, "failed": 1}
+        assert await worker.graph_reenrich_sweep_cron(ctx) == {"scanned": 3, "reenriched": 2, "failed": 1}
+        ctx["service"].sweep_pending_reenrichments.assert_called_once()

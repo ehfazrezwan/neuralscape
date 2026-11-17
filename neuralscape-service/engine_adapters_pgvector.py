@@ -289,7 +289,6 @@ class PgVectorAdapter:
     def apply(self, ctx: OperationContext, record: EngineRecord) -> ProjectionReceipt:
         _check_tenant(ctx, record.tenant_id)
         _no_nul(record.record_id, record.text, *record.labels)
-        vector = self._vector(record.text)
         with self._db(ctx) as conn:
             self._lock(conn, record.tenant_id, record.record_id)
             row = conn.execute(
@@ -301,10 +300,19 @@ class PgVectorAdapter:
                 stored_revision, removed, body, labels = row
                 if record.revision < stored_revision:
                     raise PortFailure(InternalErrorCode.STALE_REVISION)
-                if record.revision == stored_revision and (
-                    removed or body != record.text or tuple(labels) != tuple(record.labels)
-                ):
-                    raise PortFailure(InternalErrorCode.IDEMPOTENCY_CONFLICT)
+                if record.revision == stored_revision:
+                    if removed or body != record.text:
+                        raise PortFailure(InternalErrorCode.IDEMPOTENCY_CONFLICT)
+                    if tuple(labels) != tuple(record.labels):
+                        # Same revision and text, other labels: a relabel (the embedding stays as it is).
+                        conn.execute(
+                            f"UPDATE {self._schema}.records SET labels = %s "
+                            "WHERE tenant = %s AND record_id = %s AND revision = %s AND NOT removed",
+                            (list(record.labels), record.tenant_id, record.record_id, record.revision),
+                        )
+                    return self._receipt(record.record_id, record.revision, "applied")
+            # Only a write that stores a vector pays for one: a relabel or a replay (above) never embeds.
+            vector = self._vector(record.text)
             conn.execute(
                 f"INSERT INTO {self._schema}.records (tenant, record_id, revision, removed, body, labels, embedding) "
                 "VALUES (%s, %s, %s, false, %s, %s, %s::vector) "

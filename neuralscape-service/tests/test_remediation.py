@@ -194,7 +194,7 @@ class TestRescopeNonDryRun:
         assert result["nodes_removed"] == 0
         assert result["edge_uuids"] == ["edge-1"]
         assert result["episode_uuids"] == ["ep-1"]
-        service._cascade_expire_episode.assert_called_once_with("shared", episode_uuid="ep-1")
+        service._cascade_expire_episode.assert_called_once_with("shared", episode_uuid="ep-1", support_aware=False)  # remediation stays most-restrictive
         # Re-enrichment queued: cascade removed a shared derivation and the
         # private group has no episode of its own for this memory.
         assert result["graph_jobs"] == [{
@@ -345,7 +345,7 @@ class TestSafetyCrossUserIsolation:
         service.rescope_private_derivatives("alice", dry_run=False)
 
         service._cascade_expire_episode.assert_called_once_with(
-            "shared", episode_uuid="ep-mine"
+            "shared", episode_uuid="ep-mine", support_aware=False  # remediation stays most-restrictive
         )
 
 
