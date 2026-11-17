@@ -11,6 +11,10 @@ ingest path (fact extraction off, so no extraction LLM spend).
 * A bundle with one deliberately broken concept imports the rest and reports
   ``partial`` with the broken concept's id; a bundle of only broken concepts
   reports ``failed``.
+* Cross-link memories that fail to store are counted (``link_failures`` /
+  ``failed_links``) in the import status, on the real ingest path and through the
+  worker job that produces the task result, without failing the import or changing
+  its ``status``; the same bundle with a healthy store reports no link failures.
 """
 
 from __future__ import annotations
@@ -133,3 +137,74 @@ def test_bundle_of_only_broken_concepts_is_failed(svc, unique_ns):
         extract_facts=False, llm_call=lambda p: "{}",
     )
     assert out["status"] == "failed" and out["concepts"] == 0 and out["failed"] == 2
+
+
+LINK_MARKER = "references and relates to"  # the sentence every cross-link memory carries
+
+
+def _linked_bundle(tag):
+    """a -> b and b -> c cross-links; c links nowhere. Two concepts therefore get a link memory."""
+    files = {"index.md": "---\nokf_version: 0.1\n---\n"}
+    bodies = {
+        "alpha": f"Alpha knowledge zq{tag} about queues. See [beta](beta.md).",
+        "beta": f"Beta knowledge zq{tag} about caches. See [gamma](gamma.md).",
+        "gamma": f"Gamma knowledge zq{tag} about locks.",
+    }
+    for name, body in bodies.items():
+        files[f"{name}.md"] = f"---\ntype: Topic\ntitle: {name}\n---\n\n{body}\n"
+    return files
+
+
+def test_bundle_cross_links_that_fail_to_store_are_counted_without_failing_the_import(svc, unique_ns):
+    from ingest.okf_bundle import ingest_okf_bundle
+
+    tag = uuid.uuid4().hex[:6]
+    out = ingest_okf_bundle(
+        svc, files=_linked_bundle(tag), bundle_uri="it.zip", user_id=unique_ns.user_id,
+        extract_facts=False, llm_call=lambda p: "{}",
+    )
+    # Control: with a healthy store the same bundle stores its cross-links and reports no failure.
+    assert out["status"] == "completed" and out["concepts"] == 3, out
+    assert out["link_failures"] == 0 and out["failed_links"] == [] and out["links"] == 2, out
+
+    _break_on(svc, LINK_MARKER)
+    tag2 = uuid.uuid4().hex[:6]
+    out = ingest_okf_bundle(
+        svc, files=_linked_bundle(tag2), bundle_uri="it2.zip", user_id=unique_ns.user_id,
+        extract_facts=False, llm_call=lambda p: "{}",
+    )
+    assert out["status"] == "completed", out  # a link is a hint on top of ingested concepts
+    assert out["concepts"] == 3 and out["failed"] == 0, out
+    assert out["link_failures"] == 2, out
+    assert sorted(f["concept_id"] for f in out["failed_links"]) == ["alpha", "beta"], out["failed_links"]
+    assert out["links"] == 0, out
+    assert all("store rejected" not in f["error"] for f in out["failed_links"]), "raw exception text must not be reported"
+
+
+def test_the_import_job_result_carries_the_link_failures(svc, unique_ns, monkeypatch):
+    import asyncio
+    import base64
+
+    import worker
+
+    async def no_graph_jobs(*args, **kwargs):
+        return 0
+
+    monkeypatch.setattr(worker, "_enqueue_graph_jobs", no_graph_jobs)
+    _break_on(svc, LINK_MARKER)
+    tag = uuid.uuid4().hex[:6]
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        for name, text in _linked_bundle(tag).items():
+            zf.writestr(name, text)
+    payload = {
+        "filename": "linked.zip",
+        "data_b64": base64.b64encode(buf.getvalue()).decode(),
+        "user_id": unique_ns.user_id,
+        "options": {"extract_facts": False},
+    }
+    result = asyncio.run(worker.process_ingest_okf_bundle({"service": svc}, payload))
+
+    assert result["status"] == "completed" and result["concepts"] == 3, result
+    assert result["link_failures"] == 2, result
+    assert sorted(f["concept_id"] for f in result["failed_links"]) == ["alpha", "beta"], result["failed_links"]
