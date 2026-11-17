@@ -725,6 +725,12 @@ class DurableUsageRecorder:
         with self._lock:
             return dict(self._unrecorded)
 
+    @property
+    def claimed_tasks(self) -> int:
+        """Tasks whose gap counts a running flush cycle holds right now (the counts are the cycle's own)."""
+        with self._lock:
+            return len(self._in_flight)
+
     def record(self, event: UsageEvent) -> bool:
         """Store ``event``; ``False`` when it could not be stored (never raises)."""
         from usage_store import UsageEventConflict

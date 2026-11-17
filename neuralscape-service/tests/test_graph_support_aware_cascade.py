@@ -990,35 +990,74 @@ def test_a_wrapped_survivor_with_a_name_only_outer_reference_is_re_enriched_and_
     assert get2(WRAPPED_ID)["metadata"]["graph_episode_uuid"] == "ep-9" and svc2.jobs == []
 
 
-# ── review round 8: an outer-only tombstone on a wrapped row hides it from every re-enrichment path ──
+# ── review round 8: a tombstone at either depth of a wrapped row hides it from every re-enrichment path ──
+# Rows are built in the shape each path really holds: the job and the sweep read through mem0's ``Memory.get``
+# (which nests the payload's metadata one level deeper: ``row["metadata"] == {"metadata": payload["metadata"]}``);
+# survivors and cascade siblings are raw store payloads.
 
 
-def _outer_tombstoned_wrapped_row():
-    return {"memory": "deleted text", "user_id": "u", "metadata": {
-        "dream_tombstoned": True,
-        "metadata": {"owner_user_id": "u", "visibility": "private", "graph_reenrich_pending": "ep-1"}}}
+def _wrapped_payload(depth):
+    """A wrapped store payload tombstoned at the outer (``metadata``) or the inner (``metadata.metadata``) depth."""
+    inner = {"owner_user_id": "u", "visibility": "private", "graph_reenrich_pending": "ep-1"}
+    if depth == "inner":
+        return {"data": "deleted text", "user_id": "u", "metadata": {"metadata": {**inner, "dream_tombstoned": True}}}
+    return {"data": "deleted text", "user_id": "u", "metadata": {"dream_tombstoned": True, "metadata": inner}}
 
 
-def test_the_re_enrichment_job_skips_a_wrapped_row_tombstoned_at_the_outer_depth(service, monkeypatch):
-    service._memory.get.return_value = _outer_tombstoned_wrapped_row()
+def _mem0_get(payload):
+    """What mem0's real ``Memory.get`` returns for a store payload."""
+    from unittest import mock
+
+    import mem0.memory.main as mm
+
+    fake = SimpleNamespaceFor(vector_store=SimpleNamespaceFor(
+        get=lambda vector_id: SimpleNamespaceFor(id="m2", payload=payload)))
+    with mock.patch.object(mm, "capture_event", lambda *a, **k: None):
+        return mm.Memory.get(fake, "m2")
+
+
+@pytest.mark.parametrize("depth", ["outer", "inner"])
+def test_the_re_enrichment_job_skips_a_wrapped_row_tombstoned_at_either_depth(service, monkeypatch, depth):
+    """Before: the check saw only ``payload.metadata`` of the row ``Memory.get`` returns, so an inner-only
+    tombstone sent the deleted text to ``enrich_graph``."""
+    service._memory.get.return_value = _mem0_get(_wrapped_payload(depth))
     monkeypatch.setattr(service, "enrich_graph", lambda **kw: pytest.fail("a deleted row's text must not reach the graph"))
     assert service.reenrich_memory_graph("m2") == {"skipped": True, "reason": "memory_tombstoned"}
 
 
-def test_survivors_skip_a_wrapped_row_tombstoned_at_the_outer_depth(service):
-    jobs = []
-    service.set_graph_reenrich_dispatch(jobs.append)
-    row = _outer_tombstoned_wrapped_row()
-    assert service._reenrich_survivors([("m2", {"data": row["memory"], "metadata": row["metadata"]})], "ep-1") == 0
-    assert jobs == []
-    service._memory.vector_store.client.set_payload.assert_not_called()
+@pytest.mark.parametrize("depth", ["outer", "inner"])
+def test_survivors_skip_a_wrapped_row_tombstoned_at_either_depth(depth):
+    svc, put, get = _local_store_service()
+    payload = _wrapped_payload(depth)
+    meta = payload["metadata"]
+    meta["graph_episode_uuid"] = "ep-1"
+    client = svc._memory.vector_store.client
+    from config import settings as _settings
+    from qdrant_client.models import PointStruct
+
+    client.upsert(_settings.qdrant_collection, [PointStruct(id=WRAPPED_ID, vector=[1.0, 0.0], payload=payload)])
+    assert svc._reenrich_survivors([(WRAPPED_ID, get(WRAPPED_ID))], "ep-1") == 0
+    assert svc.jobs == []
 
 
-def test_the_sweep_never_writes_an_outer_tombstoned_wrapped_rows_text_to_the_graph(service, monkeypatch):
+@pytest.mark.parametrize("depth", ["outer", "inner"])
+def test_cascade_siblings_skip_a_wrapped_row_tombstoned_at_either_depth(service, monkeypatch, depth):
+    payload = _wrapped_payload(depth)
+    payload["metadata"]["graph_episode_uuid"] = "ep-1"
+    monkeypatch.setattr(service, "_ensure_filter_indexes", lambda: None)
+    point = SimpleNamespaceFor(id="m2", payload=payload)
+    service._memory.vector_store.client.scroll.side_effect = [([point], None)]
+    out = service._repair_episode_siblings("u", {"ep-1"}, set(), deleted_ids=set(), skip_job_ids=set())
+    assert out["graph_jobs"] == []
+
+
+@pytest.mark.parametrize("depth", ["outer", "inner"])
+def test_the_sweep_never_writes_a_tombstoned_wrapped_rows_text_to_the_graph(service, monkeypatch, depth):
     monkeypatch.setattr(settings, "graph_support_aware_removal_enabled", True)
-    point = SimpleNamespaceFor(id="m2", payload={"data": "deleted text", "metadata": _outer_tombstoned_wrapped_row()["metadata"]})
-    service._memory.vector_store.client.scroll.side_effect = [([point], None), ([], None)]
-    service._memory.get.return_value = _outer_tombstoned_wrapped_row()
+    payload = _wrapped_payload(depth)
+    point = SimpleNamespaceFor(id="m2", payload=payload)
+    service._memory.vector_store.client.scroll.side_effect = [([point], None), ([], None)] * 2
+    service._memory.get.return_value = _mem0_get(payload)
     monkeypatch.setattr(service, "enrich_graph", lambda **kw: pytest.fail("a deleted row's text must not reach the graph"))
     cleared = []
     monkeypatch.setattr(service, "_clear_reenrich_pending", cleared.append)
@@ -1141,3 +1180,111 @@ def test_an_enrichment_retires_the_episode_a_concurrent_enrichment_recorded_mean
     monkeypatch.setattr(service, "_retire_episodes", lambda ids, uuids, owner_user_id=None: retired.append(uuids) or [])
     assert service.enrich_graph(content="t", user_id="u", project_id=None, visibility="private", memory_id="m1")
     assert retired == [["ep-0", "ep-A"]]
+
+
+# ── review round 9: a job that finished after a newer one must not retire the newer job's episode ──
+
+
+class _GraphHarness:
+    """A row (text + episode reference), a set of graph episodes and what the worker's post-write check does.
+
+    ``enrich`` runs one job the way the graph worker does: ``enrich_graph`` for the text the job was queued with,
+    then, when the row no longer holds that text, the expiry of the episode the job wrote.
+    """
+
+    def __init__(self, service, monkeypatch):
+        self.row = {"text": "T0", "ref": "ep-0", "marker": None}
+        self.episodes = {"ep-0": "T0"}  # live episodes: uuid -> text
+        self.n = 0
+        self.during_add = None
+        svc = service
+        svc._memory.get.side_effect = lambda memory_id: {
+            "memory": self.row["text"], "user_id": "u",
+            "metadata": {"owner_user_id": "u", "visibility": "private", "graph_episode_uuid": self.row["ref"]}}
+        svc._memory.graph.add.side_effect = self._add
+        monkeypatch.setattr(svc, "_resolve_single_fact_episode", lambda *a: ("name", None))
+        monkeypatch.setattr(svc, "_attach_memory_id_to_graph_nodes", lambda **kw: None)
+        monkeypatch.setattr(svc, "_maybe_supersede_contradicted", lambda **kw: None)
+        monkeypatch.setattr(svc, "_persist_graph_episode_ref", lambda mid, uuid, name: self.row.update(ref=uuid))
+        monkeypatch.setattr(svc, "_retire_episodes", self._retire)
+        self.svc = svc
+
+    def _add(self, **kw):
+        if self.during_add:
+            hook, self.during_add = self.during_add, None
+            hook()
+        self.n += 1
+        uuid = f"ep-{kw['data']}"
+        self.episodes[uuid] = kw["data"]
+        return {"episode_uuid": uuid, "episode_name": f"name-{uuid}"}
+
+    def _retire(self, exclude, uuids, owner_user_id=None):
+        for u in uuids:
+            self.episodes.pop(u, None)
+        return []
+
+    def enrich(self, text):
+        written = {}
+        assert self.svc.enrich_graph(content=text, user_id="u", project_id=None, visibility="private",
+                                     memory_id="m1", result_out=written)
+        if self.row["text"] != text or self.row.get("scope"):  # the worker's post-write check (text or group moved)
+            self.episodes.pop(written["episode_uuid"], None)
+
+    def assert_row_is_consistent(self):
+        ref, text = self.row["ref"], self.row["text"]
+        assert self.row["marker"] or (ref in self.episodes and self.episodes[ref] == text), (
+            f"row holds {text!r} but references {ref!r}; live episodes: {self.episodes}")
+
+
+def test_an_older_job_that_finishes_after_the_newer_one_leaves_the_newer_episode_alone(service, monkeypatch):
+    """Before: the older job (text T1) re-read the reference the newer job (T2, the row's current text) had just
+    recorded, retired that episode and recorded its own, which the worker's check then removed: the row ended
+    referencing a removed episode, with no marker, and nothing in the graph for its current text."""
+    monkeypatch.setattr(settings, "graph_support_aware_removal_enabled", True)
+    h = _GraphHarness(service, monkeypatch)
+    h.row["text"] = "T1"
+
+    def newer_job_finishes():
+        h.row["text"] = "T2"  # an edit landed, and its job ran to the end while the older one extracted
+        h.row["ref"] = "ep-T2"
+        h.episodes["ep-T2"] = "T2"
+        h.episodes.pop("ep-0", None)
+
+    h.during_add = newer_job_finishes
+    h.enrich("T1")
+    h.assert_row_is_consistent()
+    assert h.row["ref"] == "ep-T2"
+
+
+def test_a_newer_job_that_finishes_last_retires_the_episode_of_the_job_that_finished_first(service, monkeypatch):
+    monkeypatch.setattr(settings, "graph_support_aware_removal_enabled", True)
+    h = _GraphHarness(service, monkeypatch)
+    h.row["text"] = "T1"
+
+    def older_job_finishes():
+        h.enrich("T1")  # the row still holds T1: its episode is recorded
+        h.row["text"] = "T2"  # then the edit lands, while the newer job is still extracting
+
+    h.during_add = older_job_finishes
+    h.enrich("T2")
+    h.assert_row_is_consistent()
+    assert h.row["ref"] == "ep-T2" and set(h.episodes) == {"ep-T2"}  # nothing of T1 or T0 is left behind
+
+
+def test_a_job_whose_row_moved_to_another_group_does_not_retire_the_episode_recorded_there(service, monkeypatch):
+    monkeypatch.setattr(settings, "graph_support_aware_removal_enabled", True)
+    h = _GraphHarness(service, monkeypatch)
+    h.row["text"] = "T1"
+    h.row["scope"] = {}
+    service._memory.get.side_effect = lambda memory_id: {
+        "memory": h.row["text"], "user_id": "u",
+        "metadata": {"owner_user_id": "u", "visibility": "private", "graph_episode_uuid": h.row["ref"], **h.row["scope"]}}
+
+    def row_moves_and_is_re_enriched():
+        h.row["scope"] = {"visibility": "shared", "project_id": "p"}  # same text, another graph group
+        h.row["ref"] = "ep-moved"
+        h.episodes["ep-moved"] = "T1"
+
+    h.during_add = row_moves_and_is_re_enriched
+    h.enrich("T1")
+    assert "ep-moved" in h.episodes and h.row["ref"] == "ep-moved"

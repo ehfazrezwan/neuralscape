@@ -804,10 +804,11 @@ def uninstall_usage_capture(store: _SqlUsageStore | None) -> None:
         if hasattr(recorder, "flush_gaps"):
             recorder.flush_gaps(max_s=max(0.0, deadline - time.monotonic()))
         left = dict(getattr(recorder, "unrecorded", None) or {})
-        if left:
+        claimed = int(getattr(recorder, "claimed_tasks", 0) or 0)  # a cycle still running holds these counts
+        if left or claimed:
             logger.error(
                 "usage gaps left unpersisted at shutdown (their task counts are lost)",
-                tasks=len(left), events=sum(left.values()),
+                tasks=len(left), events=sum(left.values()), claimed_tasks=claimed,
             )
     except Exception:
         pass

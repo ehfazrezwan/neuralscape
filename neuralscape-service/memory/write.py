@@ -1462,15 +1462,22 @@ class WriteMixin:
             # the graph result.
             episode_uuid = (graph_result or {}).get("episode_uuid")
             episode_name = (graph_result or {}).get("episode_name")
+            row_superseded = False
             if support_aware and (episode_uuid or episode_name):
                 # Another enrichment of this memory may have recorded its episode while this one extracted
                 # (the graph worker runs several jobs at once): retire against the row's reference as it is
                 # NOW, not only the one read before the write, or the other job's episode is left behind with
                 # nothing pointing at it.  (The window that remains is the time between this read and the write.)
-                current = self._previous_graph_episodes(memory_id)
+                # Only while the row still holds THIS job's text and group: when a newer job (or an edit) has
+                # taken over, the reference on the row is the newer one's and is left alone (the episode this
+                # job wrote is neither recorded nor retired against; the worker's post-write check removes it).
+                current = self._previous_graph_episodes(memory_id, holds=(content, group_id))
                 if current is not None:
-                    previous_episodes = list(dict.fromkeys([*previous_episodes, *current[0]]))
-            if episode_uuid or episode_name:
+                    if current[2]:
+                        previous_episodes = list(dict.fromkeys([*previous_episodes, *current[0]]))
+                    else:
+                        row_superseded = True
+            if (episode_uuid or episode_name) and not row_superseded:
                 self._persist_graph_episode_ref(memory_id, episode_uuid, episode_name)
             if (
                 getattr(settings, "graph_delete_race_cleanup_enabled", False) is True
@@ -1528,13 +1535,17 @@ class WriteMixin:
             logger.debug("post-enrichment row check failed for %s", memory_id, exc_info=True)
             return False
 
-    def _previous_graph_episodes(self, memory_id: str) -> tuple[list[str], bool] | None:
+    def _previous_graph_episodes(self, memory_id: str, holds: tuple[str, str] | None = None):
         """The episodes recorded on the memory's row before a re-enrichment (its current episode
         and any superseded one an earlier correction could not remove), and whether the row
         awaits re-enrichment after its shared episode was removed.
 
         ``None`` when the row could not be read: that is not the same as a row with no earlier
         episode, and the caller must not write over a reference it cannot see.
+
+        With ``holds=(text, group_id)`` a third item says whether the row still holds that text in
+        that group (the caller is a job that enriched them): a row that no longer does has moved on
+        to a newer job's text or another group, and its reference is not this job's to retire.
         """
 
         try:
@@ -1558,7 +1569,22 @@ class WriteMixin:
                 ref_uuid = found["uuid"] if found else None
             values = [ref_uuid, *(superseded if isinstance(superseded, list) else [])]
             episodes = list(dict.fromkeys(v for v in values if isinstance(v, str) and v))
-            return episodes, bool(metadata.get(REENRICH_PENDING_KEY))
+            if holds is None:
+                return episodes, bool(metadata.get(REENRICH_PENDING_KEY))
+            # The row's own fields sit at the deepest metadata (a wrapped payload read through ``Memory.get``
+            # is nested twice); the group is the one its owner/visibility/project/workspace name.
+            own = outer
+            for _ in range(2):
+                if isinstance(own.get("metadata"), dict):
+                    own = own["metadata"]
+            text, group_id = holds
+            row_group = _build_group_id(
+                own.get("visibility") or MemoryVisibility.PRIVATE.value,
+                own.get("owner_user_id") or row.get("user_id", ""), own.get("project_id"), own.get("workspace"),
+            )
+            row_text = row.get("memory")
+            same_text = isinstance(row_text, str) and " ".join(row_text.split()) == " ".join(text.split())
+            return episodes, bool(metadata.get(REENRICH_PENDING_KEY)), bool(row) and same_text and row_group == group_id
         except Exception:
             logger.warning("previous graph episode lookup failed for %s", memory_id, exc_info=True)
             return None

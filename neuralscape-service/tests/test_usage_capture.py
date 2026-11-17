@@ -689,3 +689,42 @@ def test_the_shutdown_drain_is_bounded_as_a_whole_and_reports_what_it_left(monke
     assert store.closed
     (message, fields), = logged
     assert "unpersisted" in message and fields["tasks"] == len(left) and fields["events"] == 2 * len(left)
+
+
+def test_the_shutdown_error_counts_the_gaps_a_still_running_cycle_had_claimed(monkeypatch):
+    """Before: when the wait for a running flush cycle timed out, the counts that cycle had claimed were in
+    neither the unrecorded map nor the ERROR line, although they are lost when the store closes under it."""
+    import threading
+
+    import usage_capture
+    import usage_store
+    from usage_capture import DurableUsageRecorder
+
+    class Store:
+        def close(self):
+            pass
+
+    recorder = DurableUsageRecorder(Store())
+    release = threading.Event()
+    thread = threading.Thread(target=release.wait, daemon=True)
+    thread.start()
+    recorder._flusher = thread  # a background cycle that outlives the shutdown wait
+    recorder._in_flight[("t", "task-claimed")] = 1
+    recorder._unrecorded[("t", "task-left")] = 3
+    monkeypatch.setattr(usage_store, "SHUTDOWN_DRAIN_BUDGET_S", 0.2)
+    logged = []
+
+    class Log:
+        def error(self, message, *args, **kwargs):
+            logged.append((message, kwargs))
+
+    monkeypatch.setattr(usage_store, "logger", Log())
+    usage_capture.set_usage_recorder(recorder)
+    try:
+        usage_store.uninstall_usage_capture(Store())
+    finally:
+        release.set()
+        usage_capture.set_usage_recorder(None)
+    (message, fields), = logged
+    assert fields["tasks"] == 1 and fields["events"] == 3
+    assert fields["claimed_tasks"] == 1  # the running cycle's task, whose event count only that cycle holds

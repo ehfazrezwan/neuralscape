@@ -645,7 +645,8 @@ class ProvenanceMixin:
         marker on the row; this is its retry.  Bounded per run (``limit`` rows, each a full
         enrichment); a row whose marker is younger than ``min_age_s`` is left to the job that may
         still be running.  The marker is cleared by the enrichment itself once the new episode is
-        recorded, never here.  Only when ``GRAPH_SUPPORT_AWARE_REMOVAL_ENABLED`` is on (the marker
+        recorded; the one exception is a tombstoned row, whose marker is cleared here without any
+        enrichment (its text must not reach the graph; reviving the row later does not re-enrich it).  Only when ``GRAPH_SUPPORT_AWARE_REMOVAL_ENABLED`` is on (the marker
         is only cleared then).
         """
         out = {"scanned": 0, "reenriched": 0, "failed": 0}
@@ -761,7 +762,9 @@ class ProvenanceMixin:
             meta = row.get("metadata") or {}
             if isinstance(meta.get("metadata"), dict):
                 meta = meta["metadata"]
-            if _is_tombstoned(row):
+            # ``Memory.get`` nests the payload's metadata one level deeper, so ``meta`` (once unwrapped) is the
+            # payload's own metadata: the shared check looks at it and at the metadata wrapped inside it.
+            if _is_tombstoned({"metadata": meta}):
                 return {"skipped": True, "reason": "memory_tombstoned"}
             owner = meta.get("owner_user_id") or row.get("user_id", "")
             visibility = meta.get("visibility") or MemoryVisibility.PRIVATE.value
