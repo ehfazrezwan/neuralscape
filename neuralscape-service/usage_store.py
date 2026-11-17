@@ -121,20 +121,25 @@ class _WriteDeadline:
     ``Timer.cancel`` cannot stop a callback that has already started, so a callback can run after its
     attempt ended.  The attempt marks itself ``done`` under ``lock`` before it releases the connection;
     a callback that gets the lock after that does nothing, and one that gets it first has ``fired`` set
-    before the attempt looks, so the attempt drops the connection it may be cancelling."""
+    before the attempt looks, so the attempt drops the connection it may be cancelling.  The callback also
+    reads the connection to cancel under ``lock`` (``fire``): while the attempt is not ``done`` it still
+    holds the store's connection lock, so that is the attempt's own connection, and the callback keeps
+    that object however long it is then descheduled."""
 
     def __init__(self) -> None:
         self.lock = threading.Lock()
         self.done = False
         self.fired = False
 
-    def fire(self) -> bool:
-        """Timer side: ``True`` when the attempt is still running (and is now marked fired)."""
+    def fire(self, read: Callable[[], Any]) -> tuple[bool, Any]:
+        """Timer side: ``(True, read())`` when the attempt is still running (and is now marked fired).
+
+        ``read`` runs under the guard lock, so what it returns belongs to this attempt."""
         with self.lock:
             if self.done:
-                return False
+                return False, None
             self.fired = True
-            return True
+            return True, read()
 
     def was_fired(self) -> bool:
         with self.lock:
@@ -457,7 +462,9 @@ class PostgresUsageStore(_SqlUsageStore):
     statement and one reconnect-and-retry (the insert is idempotent), so a slow or absent database costs
     the provider-call thread at most that budget while the server can be reached.  When it cannot (the cancel
     fails), the call ends at ``tcp_user_timeout`` (unacknowledged data) or, after the server acknowledged
-    the request, at the TCP keepalive detection time; both are a few seconds beyond the budget.
+    the request, at the TCP keepalive detection time.  The keepalive bound is a few seconds beyond the budget
+    on every platform; ``tcp_user_timeout`` (budget plus 1 s) is ignored by libpq on some platforms (macOS), where
+    only the keepalives bound the call.
 
     The budget is enforced in three layers: the connection's *session* ``statement_timeout`` and
     ``lock_timeout`` are the append budget, so even ``BEGIN`` and the timeout statement are bounded by the
@@ -650,12 +657,13 @@ class PostgresUsageStore(_SqlUsageStore):
         (the driver's blocking call cannot be interrupted from here); the write's thread then sees the
         cancelled statement and raises :class:`UsageStoreError`."""
 
-        if not guard.fire():
+        # The connection is read inside the guard: the attempt holds the store's connection lock until it
+        # has marked itself done, so until then ``self._conn`` is this attempt's own connection.  The
+        # callback may be descheduled after this line for as long as it likes; the object it holds is
+        # dropped by the attempt (``fired``) and never reused, so this cancel cannot reach another call.
+        running, conn = guard.fire(lambda: self._conn)
+        if not running:
             return  # the attempt already ended: a late callback must not touch the next call's statement
-        # The attempt holds the connection lock until it has marked itself done, so a callback that got
-        # past ``fire`` sees this attempt's connection; it is dropped by the attempt (``fired``) and never
-        # reused, so this cancel cannot reach another call.
-        conn = self._conn
         if conn is None:
             return
         try:

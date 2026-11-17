@@ -498,3 +498,106 @@ def test_a_cancel_that_cannot_be_sent_is_logged_at_warning(monkeypatch):
 
     warned = [r for r in logs if r["log_level"] == "warning"]
     assert len(warned) == 1 and "cancel" in warned[0]["event"]
+
+
+# -- a callback that is already past the guard must still cancel only ITS attempt's connection -------------------------
+
+
+class _PausedCallback:
+    """Drives the narrow window between the deadline callback leaving the guard and cancelling.
+
+    The timer of write N fires while N's statement is still returning, then the timer thread is
+    descheduled right after it passed the guard.  N finishes (and, as it was fired, drops its
+    connection), call N+1 reconnects and starts its statement, and only then does the callback resume.
+    """
+
+    def __init__(self, monkeypatch):
+        self.timers: list = []
+        self.passed_guard = threading.Event()
+        self.resume = threading.Event()
+        self.thread: threading.Thread | None = None
+        self.phase = "N"
+        self.conns: list = []
+        original = usage_store._WriteDeadline.fire
+        owner = self
+
+        class Timer(_SilentTimer):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                owner.timers.append(self)
+
+        def fire(guard, *args, **kwargs):
+            result = original(guard, *args, **kwargs)
+            running, _conn = result
+            if running and threading.current_thread() is owner.thread:
+                owner.passed_guard.set()
+                owner.resume.wait(10)  # descheduled between the guard and the cancel
+            return result
+
+        class PausedConn(Conn):
+            def __init__(self, world):
+                super().__init__(world)
+                self.cancel_calls = 0
+                owner.conns.append(self)
+
+            def cancel_safe(self, timeout=30.0):
+                self.cancel_calls += 1
+                super().cancel_safe(timeout)
+
+            def execute(self, sql, params=None):
+                if sql.startswith("INSERT INTO usage_events") and owner.phase == "N":
+                    result = super().execute(sql, params)
+                    owner.start_stale_callback()  # the deadline is reached as the statement returns
+                    return result
+                if owner.phase == "N+1" and "set_config" in sql and ", true)" in sql:
+                    owner.resume.set()  # the stale callback resumes while N+1's statement is starting
+                    owner.thread.join(5)
+                return super().execute(sql, params)
+
+        monkeypatch.setattr(usage_store.threading, "Timer", Timer)
+        monkeypatch.setattr(usage_store._WriteDeadline, "fire", fire)
+        monkeypatch.setitem(globals(), "Conn", PausedConn)
+
+    def start_stale_callback(self):
+        late = self.timers[-1]
+        self.thread = threading.Thread(target=late.function, args=late.args, daemon=True)
+        self.thread.start()
+        assert self.passed_guard.wait(5), "the callback never passed the guard"
+
+
+@pytest.mark.parametrize("next_call", ["append", "read"])
+def test_a_callback_paused_after_the_guard_cannot_cancel_the_next_calls_statement(monkeypatch, next_call):
+    world = World()
+    paused = _PausedCallback(monkeypatch)
+    store = make_store(world, monkeypatch, append_budget_s=1.0)
+    first_conn = store._conn
+    assert store.append(event("e1")) is True  # N: finished, but its timer had already fired
+    assert store._conn is None and first_conn.closed  # a fired attempt never keeps its connection
+    paused.phase = "N+1"
+
+    if next_call == "append":
+        assert store.append(event("e2")) is True
+        assert world.stored == ["e1", "e2"]
+    else:
+        assert store.schema_version() is not None
+
+    next_conn = store._conn
+    assert next_conn is not first_conn and world.opened == 2  # one reconnect: no retry was needed
+    assert next_conn.cancel_calls == 0  # the late callback cancelled the connection it was armed for
+    assert first_conn.cancel_calls == 1
+
+
+def test_a_write_whose_timer_fired_drops_its_connection_even_when_the_statement_succeeded(monkeypatch):
+    """Nothing else drops it: the statement returned normally, so no error marks the connection broken."""
+    world = World()
+    paused = _PausedCallback(monkeypatch)
+    store = make_store(world, monkeypatch, append_budget_s=1.0)
+    first_conn = store._conn
+    assert store.append(event("e1")) is True
+    paused.resume.set()
+    paused.thread.join(5)
+
+    assert store._conn is None and first_conn.closed
+    paused.phase = "N+1"
+    assert store.append(event("e2")) is True
+    assert world.opened == 2 and store._conn is not first_conn
