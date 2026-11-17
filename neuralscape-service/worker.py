@@ -2132,7 +2132,10 @@ async def shutdown(ctx: dict) -> None:
         await registry.shutdown_all()
     service: MemoryService = ctx.get("service")
     if service:
-        service.close()
+        # close() can take up to ~25 s on a wedged bridge loop (5 s driver close + 10 s
+        # task cancel + 10 s thread join), a moment when healthy: keep it
+        # off the worker's event loop.
+        await asyncio.to_thread(service.close)
     usage_store = ctx.get("usage_store")
     if usage_store is not None:
         from usage_store import uninstall_usage_capture
