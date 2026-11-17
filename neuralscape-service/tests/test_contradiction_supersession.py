@@ -199,10 +199,14 @@ class FakeGraph:
                         1 for e in eps if e["invalid_at"] is None and e["expired_at"] is None
                     )
                     rows = [{"total": len(eps), "live": live}]
+                elif "RETURN n.valid_at AS valid_at" in cypher:
+                    # attribution probe: these fake edges carry no valid_at, so nothing is dated
+                    # and the probe falls back to the window (covered in test_supersession_probe_attribution).
+                    rows = []
                 elif "invalid_at IS NOT NULL" in cypher:
                     since = datetime.fromisoformat(params["since"])
                     rows = [
-                        {"uuid": e["uuid"], "fact": e["fact"], "episodes": e["episodes"]}
+                        {"uuid": e["uuid"], "fact": e["fact"], "episodes": e["episodes"], "invalid_at": e["invalid_at"]}
                         for e in graph.edges.values()
                         if e["group_id"] == params["group_id"]
                         and e["invalid_at"] is not None
