@@ -155,6 +155,8 @@ def test_flag_on_cycle_through_the_admin_routes_on_real_stores(stack, monkeypatc
     assert status.json()["recall_ready"] is False
     assert status.json()["recall_blocked_reason"] == "projection_producer_inactive"
     # The readiness logic past that gate (a producer is assumed active for the rest of the test).
+    import engine_adapters_switch
+
     monkeypatch.setattr(engine_adapters_switch, "PROJECTION_PRODUCER_ACTIVE", True)
     status = client.get(f"{BASE}/status")
     assert status.json()["recall_ready"] is False  # nothing projected yet: routed recall is refused with a reason

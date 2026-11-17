@@ -131,3 +131,26 @@ def test_the_worker_start_up_routes_before_the_service_exists():
 
     source = inspect.getsource(worker.startup)
     assert source.index("apply_gemini_base_url") < source.index("MemoryService()")
+
+
+DEFAULT_ENDPOINT = "https://generativelanguage.googleapis.com/"
+
+
+def test_a_wrapper_that_outlives_reset_is_inert():
+    """A stale reference to the routing constructor (put back after the undo) must not route anything."""
+
+    provider_routing.apply_gemini_base_url("http://127.0.0.1:9")
+    stale = genai.Client.__init__
+    provider_routing.reset()
+    genai.Client.__init__ = stale  # what a lingering holder of the wrapper can do
+    assert _base_url(genai.Client(api_key="k")) == DEFAULT_ENDPOINT
+
+
+def test_reset_unwraps_even_when_the_applied_list_is_empty():
+    """The undo goes by what is installed, not by the bookkeeping list."""
+
+    provider_routing.apply_gemini_base_url("http://127.0.0.1:9")
+    provider_routing._APPLIED.clear()  # the state a racing start-up or a partial teardown can leave
+    provider_routing.reset()
+    assert _base_url(genai.Client(api_key="k")) == DEFAULT_ENDPOINT
+    assert not hasattr(genai.Client.__init__, "__ns_routing_original__")

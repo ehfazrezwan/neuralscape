@@ -10,11 +10,14 @@ of its own keeps it.
 from __future__ import annotations
 
 import logging
+import threading
 
 logger = logging.getLogger(__name__)
 
 _APPLIED: list[str] = []
 _ORIGINAL_INIT: list = []
+_LOCK = threading.RLock()
+_MARK = "__ns_routing_original__"
 
 
 def apply_gemini_base_url(base_url: str) -> bool:
@@ -25,6 +28,11 @@ def apply_gemini_base_url(base_url: str) -> bool:
         return False
     if not base_url.startswith(("http://", "https://")):
         raise ValueError("NS_GEMINI_BASE_URL must be an http:// or https:// URL")
+    with _LOCK:
+        return _apply_locked(base_url)
+
+
+def _apply_locked(base_url: str) -> bool:
     if _APPLIED:
         if _APPLIED[0] != base_url:
             raise ValueError("NS_GEMINI_BASE_URL cannot change once applied")
@@ -36,6 +44,11 @@ def apply_gemini_base_url(base_url: str) -> bool:
     _ORIGINAL_INIT.append(original)
 
     def routed(self, *args, **kwargs):
+        # The override is live only while it is applied: a wrapper that outlives ``reset`` (a stale
+        # reference, a second layer stacked by a racing start-up) passes every call through untouched.
+        if not _APPLIED or _APPLIED[0] != base_url:
+            original(self, *args, **kwargs)
+            return
         # Fill the address in only where the caller named none: a client built for a specific
         # endpoint (a library's own default for another provider, an explicit gateway) keeps it.
         options = kwargs.get("http_options")
@@ -50,6 +63,7 @@ def apply_gemini_base_url(base_url: str) -> bool:
             kwargs["http_options"] = options.model_copy(update={"base_url": base_url})
         original(self, *args, **kwargs)
 
+    setattr(routed, _MARK, original)
     genai.Client.__init__ = routed  # type: ignore[method-assign]
     _APPLIED.append(base_url)
     logger.info("Gemini API calls are routed to a configured base URL")
@@ -69,15 +83,22 @@ def apply_from_settings(settings) -> bool:
 
 
 def reset() -> None:
-    """Undo the override (tests only): restore the SDK's own constructor."""
+    """Undo the override (tests only): restore the SDK's own constructor.
 
-    if not _APPLIED:
-        return
-    from google import genai
+    Unwraps by the marker each wrapper carries, not by the applied list, so a wrapper installed while
+    the list was empty (or stacked over another) is removed too.
+    """
 
-    genai.Client.__init__ = _ORIGINAL_INIT[0]  # type: ignore[method-assign]
-    _APPLIED.clear()
-    _ORIGINAL_INIT.clear()
+    with _LOCK:
+        from google import genai
+
+        while True:
+            original = getattr(genai.Client.__init__, _MARK, None)
+            if original is None:
+                break
+            genai.Client.__init__ = original  # type: ignore[method-assign]
+        _APPLIED.clear()
+        _ORIGINAL_INIT.clear()
 
 
 __all__ = ["apply_from_settings", "apply_gemini_base_url", "reset"]

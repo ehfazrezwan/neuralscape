@@ -10,6 +10,8 @@ per connection), the SDK client is closed, and the process-wide override is undo
 
 from __future__ import annotations
 
+import third_party_telemetry  # noqa: F401  (telemetry guard; must precede mem0/graphiti imports)
+
 import gc
 import json
 import threading
@@ -116,6 +118,23 @@ def _close_clients(service) -> None:
     gc.collect()
 
 
+def _assert_default_endpoint() -> None:
+    """A client built now, by anyone in this process, must not be pointed at a loopback stand-in."""
+
+    import os
+
+    from google import genai
+    from graphiti_core.embedder.gemini import GeminiEmbedder, GeminiEmbedderConfig
+
+    assert not os.environ.get("GOOGLE_GEMINI_BASE_URL"), "the SDK's environment default points somewhere"
+    for client in (
+        genai.Client(api_key="nsit-not-a-real-key"),
+        GeminiEmbedder(GeminiEmbedderConfig(api_key="nsit-not-a-real-key")).client,
+    ):
+        base = client._api_client._http_options.base_url or ""
+        assert "127.0.0.1" not in base and "localhost" not in base, f"a fresh client is routed to {base}"
+
+
 @pytest.fixture()
 def routed_service(flags, stores, unique_ns, stand_in):
     """The real service, built after the override is set, over a Qdrant collection of its own.
@@ -141,8 +160,12 @@ def routed_service(flags, stores, unique_ns, stand_in):
             if service is not None:
                 _close_clients(service)
         finally:
+            # The address goes out of the settings first: nothing that runs after the undo (a late
+            # lazy client build, a cleanup) can apply it again while the test's flags are still on.
+            flags(ns_gemini_base_url="")
             provider_routing.reset()
             assert not provider_routing._APPLIED
+            _assert_default_endpoint()
 
 
 def test_every_gemini_client_the_service_builds_reaches_the_configured_endpoint(routed_service, stand_in):
@@ -171,3 +194,11 @@ def test_the_override_is_the_configured_address_and_nothing_else_is_contacted(ro
     routed_service._get_memory()
     port = stand_in.server_address[1]
     assert provider_routing._APPLIED == [f"http://127.0.0.1:{port}"]
+
+
+def test_after_the_loopback_tests_a_fresh_default_client_is_not_routed_to_the_stand_in():
+    """Runs last in this file, with no fixture: later tests in the process build bare Gemini clients."""
+
+    assert provider_routing._APPLIED == []
+    assert not hasattr(__import__("google.genai", fromlist=["Client"]).Client.__init__, "__ns_routing_original__")
+    _assert_default_endpoint()

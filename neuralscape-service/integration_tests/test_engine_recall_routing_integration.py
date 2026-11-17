@@ -232,9 +232,19 @@ def test_a_global_row_written_inside_a_project_is_found_by_another_projects_reca
 
 
 def test_a_global_row_projected_before_the_scope_label_is_found_after_the_backfill_relabelled_it(stack):
-    assert stack.backfill["report"]["relabeled"] == 1  # asserted where the backfill ran; the second run writes nothing
+    assert stack.backfill["report"]["relabeled"] == 1  # asserted where the backfill ran
+    adapter = stack.switch.router._active.adapter
+    # The relabel really reached the stored point on the real server (read back, not just counted).
+    assert "scope:global" in adapter.get(stack.engine_ctx(), A_GLOBAL_LEGACY).labels
+    # The fixture then withdrew one projected row from the shared pool (B_STALE: vis:shared -> vis:private)
+    # on purpose, so a second backfill has exactly that one canonical label change to apply and nothing
+    # else: the relabelled row is already canonical and nothing is copied again.
     again = stack.switch.catch_up()
-    assert again["report"]["relabeled"] == 0 and again["report"]["copied"] == 0
+    assert again["report"]["copied"] == 0 and again["report"]["relabeled"] == 1, again
+    assert "vis:private" in adapter.get(stack.engine_ctx(), B_STALE).labels
+    assert "scope:global" in adapter.get(stack.engine_ctx(), A_GLOBAL_LEGACY).labels
+    third = stack.switch.catch_up()
+    assert third["report"]["copied"] == 0 and third["report"]["relabeled"] == 0, third  # now it writes nothing
     results = stack.service.search(query=QUERY, user_id=ALICE, project_id="p1", limit=10)
     assert len(stack.calls) == 1 and A_GLOBAL_LEGACY in _ids(results)
 
