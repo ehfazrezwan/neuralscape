@@ -19,7 +19,7 @@ Both counts include CI, bot and dependency-bump commits; they say "how stale", n
 
 ### 2.1 graphiti: small, fully marked
 
-`git diff 9cb6dc1b:graphiti_core HEAD:graphiti/graphiti_core` (`9cb6dc1b` is the squash of upstream `feafc422`, the last Graphiti sync) touched **11 files** (10 patched, 1 NS-owned) once the fork-marker change (PR #475) landed; `scripts/upstream-patches.txt` is the authoritative patched-file list (a test re-derives the graphiti set from this diff) and supersedes this table:
+`git diff 9cb6dc1b:graphiti_core HEAD:graphiti/graphiti_core` (`9cb6dc1b` is the squash of upstream `feafc422`, the last Graphiti sync) touched **13 files** (12 patched, 1 NS-owned) once the fork-marker change (PR #475) landed; `scripts/upstream-patches.txt` is the authoritative patched-file list (a test re-derives the graphiti set from this diff) and supersedes this table:
 
 | File | What the delta does | Marker |
 |---|---|---|
@@ -31,6 +31,7 @@ Both counts include CI, bot and dependency-bump commits; they say "how stale", n
 | `graphiti_core/graphiti.py` | `add_episode(update_communities=True)` flattens the per-node `(communities, edges)` results instead of unpacking N pairs into two names (upstream raised `ValueError` after the episode was stored unless exactly two entities resolved) | `NEURALSCAPE PATCH` |
 | `graphiti_core/driver/neo4j_driver.py` | `kwargs.setdefault('database_', ...)` so queries run on the configured database (upstream put it in `params`) | `NEURALSCAPE PATCH` |
 | `graphiti_core/search/search.py` | `search()` returns empty results, and runs no query, for an empty group list (`[]` or `['']`); `None` keeps its meaning (no group filter). Upstream treated `['']` like `None`, so a caller on Graphiti's default `''` group sees empty results from this entry point; NS never uses the `''` group | `NEURALSCAPE PATCH` |
+| `graphiti_core/search/search_utils.py`, `graphiti_core/driver/neo4j/operations/search_ops.py` | the OR of group filters in a fulltext query is parenthesised before `AND (query)`. Lucene reads `a OR b AND (q)` as `a +b +(q)`, so with several group ids only the last one had to match and a fulltext leg missed every document in the other groups | `NEURALSCAPE PATCH` |
 | `graphiti_core/utils/maintenance/graph_data_operations.py` | `retrieve_episodes()` returns no episodes for an empty group list; `None` keeps its meaning (no group filter) | `NEURALSCAPE PATCH` |
 
 The saga lifecycle, `reference_time` edge field, extraction/dedup prompt patches and `summarize_sagas.py` that the 2026-06-22 edition listed are **not in the tree**: the April sync took upstream's own implementations, and the diff above proves it. There is no saga or prompt conflict cluster to resolve on a sync. `graphiti/` is pruned to `graphiti_core` plus packaging (`d3978abe`, 2026-07-05).
@@ -100,7 +101,7 @@ Retained from the previous edition. Re-verify against the versions in section 1 
 
 **Attribute/group_id safety** — **[WIN, protective] #1498** — attribute write changed to guarded `if k not in entity_data` (`nodes.py:567`, `edges.py:362`), so a hallucinated `group_id` attribute can't overwrite the core field. NS not exposed today (passes `group_id` as first-class kwarg). Resolves prior open question.
 
-**Search** — **[NEUTRAL]** `search.py` +677/−323 is **entirely OpenTelemetry tracing** (`NoOpTracer` default). `search_config.py`, `search_config_recipes.py`, `search_filters.py`, `search_helpers.py`, `search_utils.py` all **byte-identical**. No recipe/RRF/MMR/reranker algorithm changed.
+**Search** — **[NEUTRAL]** `search.py` +677/−323 is **entirely OpenTelemetry tracing** (`NoOpTracer` default). `search_config.py`, `search_config_recipes.py`, `search_filters.py`, `search_helpers.py` all **byte-identical**; `search_utils.py` differs only by the group-filter parenthesis patch listed in §2.1. No recipe/RRF/MMR/reranker algorithm changed.
 
 **LLM providers** — **[NEUTRAL] #1551** default → `gpt-5.5`; **#1537** OpenAIGenericClient json_schema default. NS not exposed (explicitly sets gemini models, builds `OpenAIClient` directly). But #1537's json_schema mode is the one lever toward gateway-routing graphiti's LLM.
 
