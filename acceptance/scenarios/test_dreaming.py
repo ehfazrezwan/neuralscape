@@ -454,11 +454,15 @@ def test_mirror_check_fails_for_the_private_marker(ctx, dream: Dream):
 # ── rewrites keep their lexical (BM25) leg ───────────────────────
 
 
-def check_keyword_finds(client: NSClient, rows: list[dict], marker_of: dict[str, str]) -> int:
+def check_keyword_finds(client: NSClient, rows: list[dict], marker_of: dict[str, str], project_of: "dict[str, str] | None" = None) -> int:
     """Every live row that still carries its rare marker is found by a marker-only search (top 3).
 
     A dream rewrite once upserted a dense-only point, dropping the bm25 sparse vector, so a
     merged/rewritten row stopped matching by keyword. Returns how many rows were checked.
+
+    ``project_of`` maps a row id to its project: a project row is searched inside its own project, because an
+    unfiltered top-3 competes with every look-alike marker row the other scenarios of the run wrote for the
+    same user (all share the ``zq-<run>-`` tokens) and a rank-one lexical hit can lose that fused top-3.
     """
     checked, missed = 0, []
     for row in rows:
@@ -466,7 +470,7 @@ def check_keyword_finds(client: NSClient, rows: list[dict], marker_of: dict[str,
         if not marker or marker not in (row.get("memory") or row.get("content") or ""):
             continue  # the sweep rewrote the text without the marker: nothing lexical to check
         checked += 1
-        found = [h for h in client.search(marker, limit=3) if h.get("source") not in ("graph", "episode")]  # the row's own (dense+BM25) legs
+        found = [h for h in client.search(marker, limit=3, **({"project_id": project_of[row["id"]]} if project_of and row["id"] in project_of else {})) if h.get("source") not in ("graph", "episode")]  # the row's own (dense+BM25) legs
         if row["id"] not in {h.get("id") for h in found}:
             missed.append(f"{row['id']} (top rows: {[(str(h.get('id'))[:8], h.get('source')) for h in found]})")
     assert checked >= 3, f"only {checked} live rows still carry their marker; keyword check is not meaningful"
@@ -474,12 +478,19 @@ def check_keyword_finds(client: NSClient, rows: list[dict], marker_of: dict[str,
     return checked
 
 
+def _project_rows(d: Dream) -> dict[str, str]:
+    """Row id -> project for the rows written into the shared project pool (keys ``sh1``..``sh4``)."""
+    return {w.memory_id: d.project for k, w in d.written.items() if k.startswith("sh") and w.memory_id}
+
+
 @proves("ext.dreaming-deep-consolidate")
 def test_keyword_only_search_still_finds_swept_rows(ctx, a, dream: Dream):
     _ready(dream)
     marker_of = {w.memory_id: f"zq-{ctx.run_id}-{k}" for k, w in dream.written.items() if w.memory_id}
-    rows = [r for r in list_rows(a) if r["id"] in marker_of]
-    eventually(lambda: check_keyword_finds(a, rows, marker_of), timeout=60, interval=3, what="keyword search over swept rows")
+    project_of = _project_rows(dream)
+    rows = [r for r in list_rows(a) + list_rows(a, project_id=dream.project) if r["id"] in marker_of]
+    rows = list({r["id"]: r for r in rows}.values())
+    eventually(lambda: check_keyword_finds(a, rows, marker_of, project_of), timeout=60, interval=3, what="keyword search over swept rows")
 
 
 @proves("ext.dreaming-deep-consolidate")
@@ -487,6 +498,8 @@ def test_keyword_only_search_still_finds_swept_rows(ctx, a, dream: Dream):
 def test_keyword_check_fails_for_user_b(ctx, a, b, dream: Dream):
     _ready(dream)
     marker_of = {w.memory_id: f"zq-{ctx.run_id}-{k}" for k, w in dream.written.items() if w.memory_id}
-    rows = [r for r in list_rows(a) if r["id"] in marker_of]
-    precondition(check_keyword_finds, a, rows, marker_of, what="A's keyword search finds A's swept rows")
-    expect_check_fails(check_keyword_finds, b, rows, marker_of)
+    project_of = _project_rows(dream)
+    rows = [r for r in list_rows(a) + list_rows(a, project_id=dream.project) if r["id"] in marker_of]
+    rows = list({r["id"]: r for r in rows}.values())
+    precondition(check_keyword_finds, a, rows, marker_of, project_of, what="A's keyword search finds A's swept rows")
+    expect_check_fails(check_keyword_finds, b, rows, marker_of, project_of)

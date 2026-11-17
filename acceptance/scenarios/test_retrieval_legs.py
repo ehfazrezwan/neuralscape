@@ -170,10 +170,12 @@ def check_ask_used_episodes(body: dict) -> None:
 def episode_conv(ctx, a, graph_seed) -> dict:
     """One conversation written through ``POST /v1/memories`` (LLM extraction): its episode is the transcript,
     its memories are distilled facts. The transcript line is chatty on purpose, so no extracted fact is a
-    substring of it (``twin`` lists any that is: a precondition the scenarios assert)."""
+    substring of it (``twin`` lists any that is: a precondition the scenarios assert). The marker is the NAME of
+    something the speaker decided, because the extractor keeps decided names verbatim but paraphrases away a
+    nickname or an aside (the previous wording, a cat that "answers to" the marker, produced one fact without it)."""
     project = f"{ctx.project_id}-epconv"
     marker = f"zq-{ctx.run_id}-epc"
-    line = f"Funny story: the little tabby we took in last spring answers to {marker}, although honestly she ignores everybody."
+    line = f"Funny story: after weeks of arguing we decided the new ferry timetable app will be called {marker}, although honestly nobody likes the name."
     out: dict = {"project": project, "marker": marker, "line": line, "ids": [], "facts": [], "twin": [], "error": ""}
     try:
         resp = a.post(
@@ -187,9 +189,11 @@ def episode_conv(ctx, a, graph_seed) -> dict:
         assert resp.status_code == 202, f"POST /v1/memories -> {resp.status_code}: {resp.text[:200]}"
         status = a.poll_task(resp.json()["task_id"], timeout=240)
         assert status.get("status") == "completed", f"conversation write ended as {status}"
+        produced = len(((status.get("result") or {}).get("memories")) or [])
+
         def extracted():
             rows = [r for r in list_rows(a, project_id=project) if marker in (r.get("memory") or "")]
-            assert rows, "no extracted memory carries the marker yet"
+            assert rows, f"no extracted memory carries the marker yet (the write reported {produced} stored fact(s))"
             return rows
 
         carrying = eventually(extracted, timeout=90, what="extracted memory carrying the marker")
